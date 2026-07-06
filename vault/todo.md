@@ -20,7 +20,6 @@ Backlog:
 - admin-agent: type-aware tool-output formatting — diff view, tables, syntax highlighting, collapsible JSON ([PHO-12937](https://linear.app/phoebe/issue/PHO-12937))
 - admin-agent: core accounts API query capability — owner filter, pagination, projection ([PHO-12980](https://linear.app/phoebe/issue/PHO-12980))
 - admin-agent: re-triage Slack-thread alert investigation — close or narrow to mention-gated Datadog threads ([PHO-11469](https://linear.app/phoebe/issue/PHO-11469))
-- admin-agent: re-triage core-accounts read-access ticket, likely superseded by PHO-12921 ([PHO-12640](https://linear.app/phoebe/issue/PHO-12640))
 - admin-agent: file ticket — `inspect_codebase_wiki` failing 58/59 calls with no error_category, silently down
 - phoebe: file ticket — worker Fargate CPU saturation from per-task startup pinning × deploy churn; continuous profiler is next step
 - tools: consolidate PR-lifecycle skills (6 → ~2) and review trio (3 → 1); see [[agent-skills-and-plugins]]

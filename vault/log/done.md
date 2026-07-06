@@ -17,3 +17,4 @@ Done:
 - 2026-07-03: phoebe: PHO-12949 + PHO-12962 expected-failure alerting (monitors 288625692 / 302175306 live)
 - 2026-07-06: tools: vault system stood up — conventions, map, families, templates, todo, git+remote backup
 - 2026-07-06: tools: codex skills cleanse — 14 stock samples + orphans removed; wiki-vault/handoff/codex-goal-loop ported to Codex
+- 2026-07-05: admin-agent: PHO-12640 core-accounts read access closed as superseded by PHO-12921 (archived in Linear)
