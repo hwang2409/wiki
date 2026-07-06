@@ -24,7 +24,6 @@ Backlog:
 - admin-agent: core accounts API query capability — owner filter, pagination, projection ([PHO-12980](https://linear.app/phoebework/issue/PHO-12980))
 - admin-agent: re-triage Slack-thread alert investigation — close or narrow to mention-gated Datadog threads ([PHO-11469](https://linear.app/phoebework/issue/PHO-11469))
 - admin-agent: root-cause `inspect_codebase_wiki` silent failures, make uncategorized errors impossible ([PHO-13074](https://linear.app/phoebework/issue/PHO-13074))
-- phoebe: worker Fargate startup CPU saturation — profile, pick mitigation ([PHO-13075](https://linear.app/phoebework/issue/PHO-13075))
 - tools: consolidate PR-lifecycle skills (6 → ~2) and review trio (3 → 1); see [[agent-skills-and-plugins]]
 - tools: posthog plugin keep/kill decision
 - tools: fix make-interfaces-feel-better symlink (broken outside phoebe)
