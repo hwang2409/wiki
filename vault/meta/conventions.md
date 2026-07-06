@@ -67,6 +67,9 @@ Reuse existing tags. Bump `updated` on every meaningful edit.
 - Wikilink liberally; an unresolved link marks a note worth writing.
 - No secrets/PII — reference where credentials live, never values.
 - Every fact traces to something observed or something Henry said.
+- Provenance for derived notes: synthesis/summary notes cite what they
+  derive from — wikilink the source notes, or name the external source
+  (PR/ticket/URL/session). A claim with no citable source does not go in.
 
 ## Templates
 
