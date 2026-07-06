@@ -103,7 +103,7 @@ Decision 2026-07-06 rev2 (see [[admin-agent-split|phoebe/decisions/admin-agent-s
 - PHO-13073 sandbox tools — PR #10608, review findings fixed, Bugbot flake + human approval pending
 - PHO-12937 output renderers — PR #10614, CI babysit
 - PHO-12306 leg B webhook ingestion — PR #10622 open; CI/review babysit
-- PHO-12634 API-client port — paused (13073 area collision)
+- PHO-12634 API-client port — PR #10652 merge-ready: removes stale `ADMIN_AGENT_MCP_*` production fallbacks/readiness/docs; CI green + review handled, awaiting human approval
 - PHO-12930 exe.dev pilot — blocked on 13073 tools + plan-upgrade decision
 - #10552 (woodbridge) — reviewed 07-06: blocking on missing `actions: read` App permission
 - #10475 recommendation-subagent fixes — separate session; full bank rerun owed on cleaned fixtures
