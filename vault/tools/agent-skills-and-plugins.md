@@ -7,7 +7,7 @@ updated: 2026-07-06
 
 # Agent Skills & Plugins — Current State
 
-Living inventory of Henry's Claude Code and Codex skills/plugins. **Agents: update this note in place whenever skills or plugins are added, removed, or restructured.** No changelog trail — current state only, `updated` bumped.
+Living inventory. **Update in place on any skill/plugin change.** Current state only, no changelog trail.
 
 ## Global Claude skills (`~/.claude/skills/`)
 
@@ -52,15 +52,9 @@ Clusters: PR lifecycle (ship-pr, babysit-pr, own-pr, commit-push-pr, pushing-cod
 
 ## Cleanse log (2026-07-06)
 
-- Nuked from `~/.codex/skills/`: 14 stock OpenAI samples (brand-guidelines, canvas-design, theme-factory, vercel-design-×2, spreadsheet-formula-helper, email-draft-polish, meeting-notes-and-actions, internal-comms, notion-* ×4, support-ticket-triage).
-- Nuked phoebe `.agents/skills/` orphans: source-command-own-pr/-start-dev/-stop-dev (not git-tracked).
-- **Incident:** tmux-ticket-pr-window-naming wrongly deleted as "orphan" — actually invoked by 7 skills. Reconstructed from call sites. Rule since: grep for references before deleting any skill.
+- Removed: 14 stock OpenAI samples from `~/.codex/skills/`; source-command-* orphans from phoebe `.agents/skills/`.
+- **Incident:** tmux-ticket-pr-window-naming deleted as "orphan" — actually invoked by 7 skills; reconstructed. Rule: grep for references before deleting any skill.
 
 ## Open items
 
-- PR-lifecycle six-pack → consolidate to ~2 (ship-pr + linear-ticket-to-pr) — not done.
-- Review trio (henry-review / thermo-nuclear / builtin code-review) → pick one — not done.
-- Builtin-dups in phoebe (code-simplifier vs /simplify, code-debug-skill vs superpowers:systematic-debugging) — not done.
-- posthog plugin keep/kill decision — pending Henry.
-- make-interfaces-feel-better symlink broken outside phoebe — fix or move.
-- Claude↔Codex skill sync is manual copy — symlink option offered, undecided.
+See [[todo]] (tools entries). Also pending: phoebe builtin-dups (code-simplifier vs /simplify, code-debug-skill vs superpowers:systematic-debugging).
