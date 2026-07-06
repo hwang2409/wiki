@@ -9,6 +9,7 @@ updated: 2026-07-06
 
 ## 2026-07-06
 
+- **admin-agent** — PHO-13104 code-sandbox hardening: compound-word secret guard, symlink-escape check, denylist dedup ([#10640](https://github.com/phoebe-health/phoebe/pull/10640) merged 3edd8a0fe6)
 - [PHO-13095](https://linear.app/phoebework/issue/PHO-13095): skill-load card display-title casing — cdx:PHO-13095 worker (queue overridden; aim to merge before tonight’s 13093 extraction)
 - **admin-agent** — PHO-13073 code-sandbox tool surface PR #10608 merge-ready after rebase/review fixes; CI/Bugbot green and approved ([#10608](https://github.com/phoebe-health/phoebe/pull/10608))
 - **cleanup** — cancelled 11 implemented/stale Internal Admin Agent tickets with evidence comments (PHO-11231, 11268, 11273, 11461, 11462, 11464, 11465, 11466, 11540, 11727, 12424)

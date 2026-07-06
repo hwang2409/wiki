@@ -11,7 +11,6 @@ Todo:
 
 In Progress:
 
-- [P2] [PHO-13104](https://linear.app/phoebework/issue/PHO-13104): code-sandbox hardening — cdx:PHO-13104 worker (queue overridden; aim to merge before tonight extraction)
 - [P2] [PHO-13096](https://linear.app/phoebework/issue/PHO-13096): rewrite /admin/agent frontend + associated components — cc:PHO-13096 worker (opus)
 - [P0] [PHO-13093](https://linear.app/phoebework/issue/PHO-13093): Phase 1 extraction to phoebe_admin_agent — henry, tonight (worker killed mid-day 07-06; partial uncommitted diff parked in .codex/worktrees/pho-13093)
 - [P1] [PHO-12306](https://linear.app/phoebework/issue/PHO-12306): legs C–F (review write-back, PR creation, gates, UX); B merged — henry to set webhook secret + activate App webhook
