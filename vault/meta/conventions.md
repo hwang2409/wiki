@@ -65,7 +65,12 @@ updated: 2026-07-06
 
 ## Writing rules
 
-- Dense over polished. Tables over prose. No fluff, no restating what code/git already says.
+- **Payload first.** First line after the title is the answer/state/decision. Context after, only if needed.
+- **Length budgets:** til ≤ 10 lines, decision ≤ 15, daily log ≤ 20, reference sections one screen each. Campaign is the only long form, and even it leads with a table + one through-line paragraph, not narrative.
+- **Delete, don't compress.** Over budget → cut content, not squeeze wording. Hurts to cut → it's a second note.
+- **No throat-clearing.** No "this note describes…", no restating the title, no unrequested background.
+- Bullets/tables by default; a prose paragraph must earn its place.
+- Dense over polished. No fluff, no restating what code/git already says.
 - Capture the *why* and the rejected approaches — that's the least recoverable information.
 - Exact strings for anything an agent might grep: error messages, command flags, file paths, ticket/PR numbers.
 - Wikilink liberally (`[[note-slug]]`) — links are the retrieval graph. An unresolved link marks a note worth writing.

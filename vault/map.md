@@ -6,10 +6,13 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 
 - [[conventions]] — vault rules: hierarchy, families, frontmatter, templates, git, gardening. Read before writing any note.
 - [[todo]] — general cross-project scrap todo. Read when Henry asks "what's next"; update when items land.
+- [[wiki-app-ui-direction]] — decision: wiki app is an Obsidian clone, monochrome theme, light default; rejected paths + key files. Read before wiki-app UI work.
+- [[obsidian-feature-test]] — renderer test fixture exercising every wiki-app markdown feature. Keep when pruning; used to verify rendering.
 
 ## Tools & agent setup
 
 - [[agent-skills-and-plugins]] — living inventory of Claude/Codex skills + plugins, cleanse log, open items. Read/update on any skills or plugins question or change.
+- [[exe-dev]] — external SSH-first cloud for persistent VMs, agent sandboxes, devboxes, pricing/security notes, and Phoebe fit.
 
 ## Phoebe
 
