@@ -13,6 +13,7 @@ Todo:
 - [P1] tools: review reconstructed tmux-ticket-pr-window-naming skill for divergence from original
 - [P2] admin-agent: run exe.dev week trial — clone speed go/no-go, scoped-token /exec lifecycle; Modal is likely production pivot ([PHO-12930](https://linear.app/phoebework/issue/PHO-12930))
 - [P2] phoebe: treat anthropic 429 as infra in `_is_infrastructure_exception` (evals/main.py)
+- [P1] deployment: bundle and prune settings + feature flags ([DEP-25](https://linear.app/phoebework/issue/DEP-25))
 
 Backlog:
 
@@ -26,3 +27,14 @@ Backlog:
 - tools: posthog plugin keep/kill decision
 - tools: fix make-interfaces-feel-better symlink (broken outside phoebe)
 - tools: decide Claude↔Codex skill sync (manual copy vs symlinks)
+- phoebe: set up native Slack integration for Platinum Care Group — High, ops ([PHO-10748](https://linear.app/phoebework/issue/PHO-10748))
+- admin-agent: execute independent read-only tool calls concurrently — High ([PHO-11305](https://linear.app/phoebework/issue/PHO-11305))
+- admin-agent: fail bootstrap instead of weak admin_agent_readonly default password ([PHO-11344](https://linear.app/phoebework/issue/PHO-11344))
+- admin-agent: re-triage PHO-10498 Slack admin mode — In Progress since May, likely zombie ([PHO-10498](https://linear.app/phoebework/issue/PHO-10498))
+- admin-agent: texQL series — design/parser/engine/UI/saved queries ([PHO-11256](https://linear.app/phoebework/issue/PHO-11256)–11260)
+- admin-agent: canonical data products series — types/adapters/metadata/dashboards ([PHO-11269](https://linear.app/phoebework/issue/PHO-11269)–11272)
+- admin-agent: trace UX series — explorer, run comparison, prompt/context diffing ([PHO-11273](https://linear.app/phoebework/issue/PHO-11273)–11275)
+- admin-agent: artifact/playbook features — saved-investigation actions, handoffs, known-issue memory, playbook authoring ([PHO-11251](https://linear.app/phoebework/issue/PHO-11251), 11264, 11267, 11268)
+- phoebe: phone-first outreach instead of default SMS ([PHO-11052](https://linear.app/phoebework/issue/PHO-11052))
+- phoebe: Slack V2 leftovers — coordinator preference memory, reaction-based triggers ([PHO-10497](https://linear.app/phoebework/issue/PHO-10497), [PHO-10493](https://linear.app/phoebework/issue/PHO-10493))
+- tools: mine ~/me/dox/workflow.md, internal-admin.md, posthog-slack-v2-dashboard-readability.md into vault/todo
