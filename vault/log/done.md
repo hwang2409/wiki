@@ -21,3 +21,4 @@ Done:
 - 2026-07-01: admin-agent: PHO-12826 codebase tools no longer starve run lease heartbeats (Linear: Merged)
 - 2026-07-01: admin-agent: PHO-12830 Linear default project-scope resolution fix (Linear: Merged)
 - 2026-07-06: cleanup: PHO-12658, PHO-10748, PHO-11305, PHO-11344, PHO-10498 closed by Henry (completed in Linear, pruned from todo)
+- 2026-07-06: admin-agent: PHO-12980 core accounts API — owner filter, pagination, projection, evidence opt-in ([#10611](https://github.com/phoebe-health/phoebe/pull/10611) merged f9f1587f24)
