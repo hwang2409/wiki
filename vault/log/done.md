@@ -38,3 +38,4 @@ updated: 2026-07-06
 
 - **admin-agent** — PHO-12830 Linear default project-scope resolution fix (Linear: Merged)
 - **admin-agent** — PHO-12826 codebase tools no longer starve run lease heartbeats (Linear: Merged)
+- 2026-07-06: cli-probe item

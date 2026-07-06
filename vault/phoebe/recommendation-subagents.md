@@ -1,3 +1,10 @@
+---
+type: campaign
+tags: [phoebe, evals]
+created: 2026-07-06
+updated: 2026-07-06
+---
+
 # Phoebe Recommendation Subagents — What Changed and What It Did
 
 Campaign (June 30 – July 2, 2026): make General Agent recommendation

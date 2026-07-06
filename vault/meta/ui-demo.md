@@ -1,3 +1,10 @@
+---
+type: reference
+tags: [meta, wiki-app]
+created: 2026-07-06
+updated: 2026-07-06
+---
+
 ## Text styling
 
 Some **bold**, *italic*, ~~strikethrough~~, ==highlighted text==, `inline code`, and a #tag plus #nested/tag.
