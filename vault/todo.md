@@ -1,5 +1,6 @@
 ---
 type: reference
+view: kanban
 tags: [todo]
 created: 2026-07-06
 updated: 2026-07-06
@@ -28,6 +29,7 @@ Backlog:
 - tools: posthog plugin keep/kill decision
 - tools: fix make-interfaces-feel-better symlink (broken outside phoebe)
 - tools: decide Claude↔Codex skill sync (manual copy vs symlinks)
+- phoebe: migration runner — set lock_timeout + retry for ALTERs on hot tables; 07-06 prod blip was an ADD COLUMN lock queue on app.organizations (see phoebe/til/migration-lock-queue-outage)
 - phoebe: set up native Slack integration for Platinum Care Group — High, ops ([PHO-10748](https://linear.app/phoebework/issue/PHO-10748))
 - admin-agent: execute independent read-only tool calls concurrently — High ([PHO-11305](https://linear.app/phoebework/issue/PHO-11305))
 - admin-agent: fail bootstrap instead of weak admin_agent_readonly default password ([PHO-11344](https://linear.app/phoebework/issue/PHO-11344))
