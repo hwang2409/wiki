@@ -21,6 +21,7 @@ before operational decisions.
   public TLS hostnames, copy-on-write `cp` clones, expiring
   command-scoped SSH-signed API tokens, and HTTP integrations that keep
   secrets in exe.dev's proxy rather than on the VM.
+- **API shapes (captured live 2026-07-06):** `ssh exe.dev billing plan --json` → `{"plan":"Basic","plan_id":"basic:monthly:20260106","pooled_disk_gb":25,"default_disk_gb":25,"bandwidth_gb":100,"max_vms":0,"paid":false,"shelley_credits_max":20,...}`. `ssh exe.dev ls --json` → `{"vms":[]}`. Henry's free Basic tier: 25 GB pooled disk — likely too small for a phoebe-base box with warm Bazel caches; PHO-12930 clone test probably needs the $20 Personal tier (100 GB) first.
 - **Pricing snapshot:** Personal $20/mo for 2 vCPU / 8 GB RAM pool,
   50 VMs, 100 GB pooled disk, 200 GB transfer. Team $25/user/mo. Usage
   pricing advertised at $0.05/core-hour CPU, $0.016/GiB-hour active
