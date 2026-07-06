@@ -24,3 +24,4 @@ Done:
 - 2026-07-06: admin-agent: PHO-12980 core accounts API — owner filter, pagination, projection, evidence opt-in ([#10611](https://github.com/phoebe-health/phoebe/pull/10611) merged f9f1587f24)
 - 2026-07-06: admin-agent: PHO-13042 read-only GitHub repo primitives + deploy doctrine skill; fixed missing actions:read App permission in review→fix loop ([#10552](https://github.com/phoebe-health/phoebe/pull/10552) merged 0aad4a0378)
 - 2026-07-06: admin-agent: PHO-12306 leg B GitHub webhook ingestion — endpoint, HMAC fail-closed, event persistence + dedupe ([#10622](https://github.com/phoebe-health/phoebe/pull/10622) merged dc5d04d5c0)
+- 2026-07-06: admin-agent: PHO-12937 type-aware tool-output renderers — diff/table/code/JSON + markdown fallback, bounded ([#10614](https://github.com/phoebe-health/phoebe/pull/10614) merged 1049b2646f)

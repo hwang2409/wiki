@@ -14,7 +14,6 @@ In Progress:
 
 - [P1] [PHO-12306](https://linear.app/phoebework/issue/PHO-12306): legs C–F (review write-back, PR creation, gates, UX); B merged — henry to set webhook secret + activate App webhook
 - [P0] [PHO-13073](https://linear.app/phoebework/issue/PHO-13073): code-sandbox tool surface (exe.dev backend) — cdx:PHO-13073 worker
-- [P1] [PHO-12937](https://linear.app/phoebework/issue/PHO-12937): type-aware tool-output formatting — cdx:PHO-12937 worker
 - [P1] [PHO-12930](https://linear.app/phoebework/issue/PHO-12930): exe.dev pilot; blocked on 13073 tools + plan upgrade — henry
 - [P1] [PHO-12634](https://linear.app/phoebework/issue/PHO-12634): port MCP integrations to first-party API clients — henry, paused (13073 collision)
 
