@@ -136,6 +136,21 @@ Newest date section at the TOP. Keep summaries one line — the links carry deta
 
 When Henry says something is done: append the done.md line, prune todo.md, AND mark the Linear ticket Done (keep Linear and the vault in sync). If no merged PR/evidence is visible, confirm which ticket before writing.
 
+## Structured ops — `wiki` CLI
+
+Hot-path writes go through `~/me/fun/wiki/wiki` (stdlib Python, no server). It validates format, keeps map.md/todo/done in sync, and fails loudly on ambiguity — prefer it over hand-editing these files:
+
+```bash
+wiki todo add "[PHO-1234](url): one-liner" --priority P1   # --section Todo|Backlog|"In Progress"
+wiki todo move "<unique substring>" --to "In Progress"
+wiki todo complete "<unique substring>"   # removes line + logs under today's done.md header
+wiki log-done "project: summary (links)"  # → "- **project** — summary" under today's header
+wiki note new <topic>/<slug> --type til --hook "one-line map hook" [--title ...] [--tags a,b]
+wiki lint                                  # full conventions sweep; exit 1 on errors
+```
+
+Raw markdown editing stays sanctioned for note prose. Malformed writes are *detected*, not blocked — `wiki lint` catches frontmatter/map/todo/done drift; fix what it reports.
+
 ## Git
 
 Repo is git-backed, private remote. After a vault writing session (no permission needed):
@@ -146,7 +161,7 @@ git -C ~/me/fun/wiki add vault && git -C ~/me/fun/wiki commit -m "vault: <what c
 
 ## Gardening
 
-On ask or ~weekly: (1) map completeness both directions, (2) dead wikilinks, (3) frontmatter validity, (4) family-path violations, (5) stale living notes vs reality. Fix, commit `vault: gardening sweep`.
+On ask or ~weekly: run `wiki lint` (covers map completeness both directions, dead wikilinks, frontmatter validity, todo/done shape), then check stale living notes vs reality by hand. Fix, commit `vault: gardening sweep`.
 
 ## Not vault material
 

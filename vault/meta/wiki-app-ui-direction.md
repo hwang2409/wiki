@@ -35,4 +35,4 @@ Decision (2026-07-06): the wiki frontend is an **Obsidian clone in structure/beh
 
 `![[embeds]]` render as links not transclusions; reading-view checkboxes not clickable; no math/mermaid/graph/backlinks.
 
-Locked 2026-07-06: plain-textarea editor is deliberate and permanent — the wiki is read-first for Henry; agents write the notes. No CodeMirror/live-preview investment. Next interest: link index (backlinks/graph), possibly structured write API for agents (under discussion).
+Locked 2026-07-06: plain-textarea editor is deliberate and permanent — the wiki is read-first for Henry; agents write the notes. No CodeMirror/live-preview investment. Shipped same day: link index (`GET /api/links` — outgoing/incoming/unresolved per note; Linked-mentions section in reading view) and the `wiki` CLI (repo root — todo add/move/complete, log-done, note new with map update, lint sweep). Option 3 locked: CLI for hot paths + lint detection; raw markdown stays sanctioned for prose. Graph view still open.
