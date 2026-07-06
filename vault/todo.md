@@ -8,7 +8,7 @@ updated: 2026-07-06
 
 Todo:
 
-- [P1] [PHO-12306](https://linear.app/phoebework/issue/PHO-12306): GitHub App-backed PR review/creation pipeline
+- [P1] [PHO-12306](https://linear.app/phoebework/issue/PHO-12306): GitHub PR pipeline legs B–F (webhooks, review write-back, PR creation, gates, UX) — App + read lane already done
 
 In Progress:
 

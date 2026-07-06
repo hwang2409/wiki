@@ -17,6 +17,7 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 
 ## Phoebe
 
+- [[admin-agent]] — Internal Admin Agent current state: GitHub App done-vs-remaining, integrations, sandboxes, shipped foundations. Read before admin-agent planning.
 - [[recommendation-subagents]] — recommendation-subagents campaign (June–July 2026): changes, eval numbers, overfit arc.
 
 ## Families (path patterns, not enumerated)
