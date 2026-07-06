@@ -19,14 +19,13 @@ In Progress:
 
 Backlog:
 
-- [PHO-11461](https://linear.app/phoebework/issue/PHO-11461), 11462, 11464–11466: generalized debug workflow family
 - [PHO-11469](https://linear.app/phoebework/issue/PHO-11469): re-triage Slack-thread alert investigation
 - [PHO-13074](https://linear.app/phoebework/issue/PHO-13074): fix inspect_codebase_wiki silent failures + uncategorized errors
-- [PHO-12424](https://linear.app/phoebework/issue/PHO-12424)–12426: multi-shift outreach execution follow-ups
+- [PHO-12425](https://linear.app/phoebework/issue/PHO-12425), 12426: sandboxed outreach start + e2e dogfood
 - [PHO-11256](https://linear.app/phoebework/issue/PHO-11256)–11260: texQL series
 - [PHO-11269](https://linear.app/phoebework/issue/PHO-11269)–11272: canonical data products series
-- [PHO-11273](https://linear.app/phoebework/issue/PHO-11273)–11275: trace UX series
-- [PHO-11251](https://linear.app/phoebework/issue/PHO-11251), 11264, 11267, 11268: artifact/playbook features
+- [PHO-11274](https://linear.app/phoebework/issue/PHO-11274), 11275: trace comparison + prompt/context diffing
+- [PHO-11251](https://linear.app/phoebework/issue/PHO-11251), 11264, 11267: artifact actions, playbook authoring, known-issue memory
 - [PHO-12211](https://linear.app/phoebework/issue/PHO-12211): vendor record-and-inject primitive for sandbox probes
 - [PHO-11598](https://linear.app/phoebework/issue/PHO-11598): Snowflake QA/feedback + trends tool
 - [PHO-12134](https://linear.app/phoebework/issue/PHO-12134): Voice QA inspection support
