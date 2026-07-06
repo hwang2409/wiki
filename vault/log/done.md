@@ -20,3 +20,4 @@ Done:
 - 2026-07-05: admin-agent: PHO-12640 core-accounts read access closed as superseded by PHO-12921 (archived in Linear)
 - 2026-07-01: admin-agent: PHO-12826 codebase tools no longer starve run lease heartbeats (Linear: Merged)
 - 2026-07-01: admin-agent: PHO-12830 Linear default project-scope resolution fix (Linear: Merged)
+- 2026-07-06: cleanup: PHO-12658, PHO-10748, PHO-11305, PHO-11344, PHO-10498 closed by Henry (completed in Linear, pruned from todo)

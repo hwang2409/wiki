@@ -20,7 +20,6 @@ In Progress:
 
 Backlog:
 
-- admin-agent: re-smoke integration credentials after GitHub App lands ([PHO-12658](https://linear.app/phoebework/issue/PHO-12658))
 - admin-agent: type-aware tool-output formatting — diff view, tables, syntax highlighting, collapsible JSON ([PHO-12937](https://linear.app/phoebework/issue/PHO-12937))
 - admin-agent: core accounts API query capability — owner filter, pagination, projection ([PHO-12980](https://linear.app/phoebework/issue/PHO-12980))
 - admin-agent: re-triage Slack-thread alert investigation — close or narrow to mention-gated Datadog threads ([PHO-11469](https://linear.app/phoebework/issue/PHO-11469))
@@ -30,10 +29,6 @@ Backlog:
 - tools: fix make-interfaces-feel-better symlink (broken outside phoebe)
 - tools: decide Claude↔Codex skill sync (manual copy vs symlinks)
 - phoebe: migration runner — set lock_timeout + retry for ALTERs on hot tables; 07-06 prod blip was an ADD COLUMN lock queue on app.organizations (see phoebe/til/migration-lock-queue-outage)
-- phoebe: set up native Slack integration for Platinum Care Group — High, ops ([PHO-10748](https://linear.app/phoebework/issue/PHO-10748))
-- admin-agent: execute independent read-only tool calls concurrently — High ([PHO-11305](https://linear.app/phoebework/issue/PHO-11305))
-- admin-agent: fail bootstrap instead of weak admin_agent_readonly default password ([PHO-11344](https://linear.app/phoebework/issue/PHO-11344))
-- admin-agent: re-triage PHO-10498 Slack admin mode — In Progress since May, likely zombie ([PHO-10498](https://linear.app/phoebework/issue/PHO-10498))
 - admin-agent: texQL series — design/parser/engine/UI/saved queries ([PHO-11256](https://linear.app/phoebework/issue/PHO-11256)–11260)
 - admin-agent: canonical data products series — types/adapters/metadata/dashboards ([PHO-11269](https://linear.app/phoebework/issue/PHO-11269)–11272)
 - admin-agent: trace UX series — explorer, run comparison, prompt/context diffing ([PHO-11273](https://linear.app/phoebework/issue/PHO-11273)–11275)
