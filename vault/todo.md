@@ -8,10 +8,10 @@ updated: 2026-07-06
 
 Todo:
 
-- [P0] [PHO-13093](https://linear.app/phoebework/issue/PHO-13093): split admin agent into own package + database — blocked on current PR wave merging
 
 In Progress:
 
+- [P0] [PHO-13093](https://linear.app/phoebework/issue/PHO-13093): Phase 1 extraction to phoebe_admin_agent — cdx:PHO-13093 worker (carve-outs first, mass move after #10608)
 - [P1] [PHO-12306](https://linear.app/phoebework/issue/PHO-12306): legs C–F (review write-back, PR creation, gates, UX); B merged — henry to set webhook secret + activate App webhook
 - [P0] [PHO-13073](https://linear.app/phoebework/issue/PHO-13073): code-sandbox tool surface (exe.dev backend) — cdx:PHO-13073 worker
 - [P1] [PHO-12930](https://linear.app/phoebework/issue/PHO-12930): exe.dev pilot; blocked on 13073 tools + plan upgrade — henry
