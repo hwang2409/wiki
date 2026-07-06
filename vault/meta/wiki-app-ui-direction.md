@@ -17,7 +17,7 @@ Decision (2026-07-06): the wiki frontend is an **Obsidian clone in structure/beh
 - Backend full-text search: `GET /api/notes?q=`.
 - Custom views, frontmatter-gated: `view: kanban` renders sections as read-only board lanes, list items as cards (used by `todo.md`). First deliberate departure from pure markdown parity.
 - Kanban target look: obsidian-community/obsidian-kanban plugin — multi-column lanes (width proportional to card count, internal card grid; single-column tried and reverted same day), panel lanes on flat pane, rich markdown cards. Shipped 2026-07-06: drag-drop between/within lanes + per-lane add-card, both write todo.md via line surgery (exact-line ops on latest content, last-write-wins). Drop-to-done shipped: drag card onto floating zone → line appended to log/done.md (`- YYYY-MM-DD: <text>`, priority tag stripped) + removed from todo.md; done-append happens first so failures can't lose the card. Remaining: card edit-in-place, lane menus.
-- Split panes (2026-07-06): recursive binary split tree, unlimited panes. Every pane shows a 5-zone overlay while dragging a file from the tree — edge drop splits that pane, center drop replaces its note; closing a pane lifts its sibling. Secondary panes are read-view + full kanban interactivity, ephemeral (not in URL). Cmd+B toggles sidebar; Cmd+K quick switcher.
+- Split panes (2026-07-06): recursive binary split tree, unlimited panes. Every pane shows a 5-zone overlay while dragging a file from the tree — edge drop splits that pane, center drop replaces its note; closing a pane lifts its sibling; dividers drag-resize each split (15–85% clamp). Secondary panes are read-view + full kanban interactivity, ephemeral (not in URL). Cmd+B toggles sidebar; Cmd+K quick switcher.
 
 ## Rejected
 

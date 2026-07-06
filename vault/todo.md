@@ -11,7 +11,7 @@ Todo:
 
 In Progress:
 
-- [P0] [PHO-13093](https://linear.app/phoebework/issue/PHO-13093): Phase 1 extraction to phoebe_admin_agent — cdx:PHO-13093 worker (carve-outs first, mass move after #10608)
+- [P0] [PHO-13093](https://linear.app/phoebework/issue/PHO-13093): Phase 1 extraction to phoebe_admin_agent — henry, tonight (worker killed mid-day 07-06; partial uncommitted diff parked in .codex/worktrees/pho-13093)
 - [P1] [PHO-12306](https://linear.app/phoebework/issue/PHO-12306): legs C–F (review write-back, PR creation, gates, UX); B merged — henry to set webhook secret + activate App webhook
 - [P0] [PHO-13073](https://linear.app/phoebework/issue/PHO-13073): code-sandbox tool surface PR #10608 merge-ready; human approval gate remains — henry
 - [P1] [PHO-12930](https://linear.app/phoebework/issue/PHO-12930): exe.dev pilot; blocked on 13073 tools + plan upgrade — henry
@@ -36,4 +36,4 @@ Backlog:
 - [PHO-11535](https://linear.app/phoebework/issue/PHO-11535): fact/inference evidence tiers for RCA answers
 - [PHO-11231](https://linear.app/phoebework/issue/PHO-11231): Phoebe Home Care seed data for visual testing
 - [PHO-12982](https://linear.app/phoebework/issue/PHO-12982), 12757: reference tickets (harness doctrine, tool brainstorm)
-- [PHO-13095](https://linear.app/phoebework/issue/PHO-13095): skill-load card display-title casing — QUEUED to auto-spawn worker when PHO-13093 extraction merges (same file)
+- [PHO-13095](https://linear.app/phoebework/issue/PHO-13095): skill-load card display-title casing — queued behind PHO-13093 extraction (same file; henry doing 13093 tonight)
