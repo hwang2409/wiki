@@ -124,6 +124,8 @@ Backlog:
 
 Append-only, newest last. This is the first place to check for todo staleness.
 
+When Henry says something is done: append the done.md line, prune todo.md, AND mark the Linear ticket Done (keep Linear and the vault in sync). If no merged PR/evidence is visible, confirm which ticket before writing.
+
 ## Git
 
 Repo is git-backed, private remote. After a vault writing session (no permission needed):
