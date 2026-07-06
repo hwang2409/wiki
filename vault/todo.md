@@ -14,8 +14,6 @@ Todo:
 - [P1] admin-agent: port MCP integrations to first-party typed API clients; MCP stays smoke-only ([PHO-12634](https://linear.app/phoebework/issue/PHO-12634))
 - [P1] phoebe: rerun full 10475 bank evals on cleaned fixtures once fix branch lands ([#10475](https://github.com/phoebe-health/phoebe/pull/10475))
 - [P1] tools: review reconstructed tmux-ticket-pr-window-naming skill for divergence from original
-- [P2] phoebe: treat anthropic 429 as infra in `_is_infrastructure_exception` (evals/main.py)
-- [P1] deployment: bundle and prune settings + feature flags ([DEP-25](https://linear.app/phoebework/issue/DEP-25))
 
 Backlog:
 
