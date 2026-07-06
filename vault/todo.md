@@ -14,6 +14,7 @@ Todo:
 
 In Progress:
 
+- [P1] admin-agent: core accounts API — owner filter, pagination, projection ([PHO-12980](https://linear.app/phoebework/issue/PHO-12980)) — cdx:PHO-12980 worker
 - [P1] admin-agent: type-aware tool-output formatting ([PHO-12937](https://linear.app/phoebework/issue/PHO-12937)) — cdx:PHO-12937 worker
 - [P0] admin-agent: build code-sandbox tool surface, exe.dev first backend ([PHO-13073](https://linear.app/phoebework/issue/PHO-13073)) — cdx:PHO-13073 worker
 - [P1] admin-agent: exe.dev pilot — shapes captured, experiments blocked on PHO-13073 tools + plan-upgrade decision ([PHO-12930](https://linear.app/phoebework/issue/PHO-12930)) — henry
@@ -21,7 +22,6 @@ In Progress:
 
 Backlog:
 
-- admin-agent: core accounts API query capability — owner filter, pagination, projection ([PHO-12980](https://linear.app/phoebework/issue/PHO-12980))
 - admin-agent: re-triage Slack-thread alert investigation — close or narrow to mention-gated Datadog threads ([PHO-11469](https://linear.app/phoebework/issue/PHO-11469))
 - admin-agent: root-cause `inspect_codebase_wiki` silent failures, make uncategorized errors impossible ([PHO-13074](https://linear.app/phoebework/issue/PHO-13074))
 - tools: consolidate PR-lifecycle skills (6 → ~2) and review trio (3 → 1); see [[agent-skills-and-plugins]]
