@@ -119,6 +119,7 @@ Backlog:
 - `In Progress` = actively being worked RIGHT NOW; every line names its owner (Henry or the worker session/window). When work starts on an item — Henry picks it up, a worker is spawned, a Linear ticket moves to In Progress — move the line here in the same action. Stalled/abandoned → move back to Todo or Backlog.
 - `Backlog` = future/unscheduled/blocked; no priority tag — assign one on promotion to Todo.
 - Promote/demote instead of letting Todo rot. Completed = deleted (and logged in `log/done.md`). No Done section, no prose.
+- **Sweep additions:** when backfilling todo.md from Linear/GitHub, do not re-add items Henry deliberately removed — check todo.md git history (`git -C ~/me/fun/wiki log -p vault/todo.md`) for prior removals before adding a ticket line back.
 - **Staleness check before writing todo.md:** Henry sometimes finishes work without telling agents. Cross-check every item against `log/done.md`; for items with ticket/PR links, verify status (gh / Linear) when in doubt. Remove finished items — don't re-list them.
 
 **done** (`log/done.md`) — worldwide completion tally. Append a line whenever a PR merges or a ticket/task completes:
