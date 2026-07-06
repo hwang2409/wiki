@@ -2,7 +2,7 @@
 
 Some **bold**, *italic*, ~~strikethrough~~, ==highlighted text==, `inline code`, and a #tag plus #nested/tag.
 
-Here is a [[ssbu-yoshi-0-to-1]] wikilink, an aliased [[ssbu-yoshi-0-to-1|Yoshi scrapbook]] link, an unresolved [[does-not-exist]] link, and an [external link](https://obsidian.md).
+Here is a [[conventions]] wikilink, an aliased [[conventions|vault rules]] link, an unresolved [[does-not-exist]] link, and an [external link](https://obsidian.md).
 
 %%This comment should be invisible in reading view.%%
 

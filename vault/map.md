@@ -4,7 +4,8 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 
 ## Meta
 
-- [[conventions]] — vault rules: hierarchy, families, frontmatter, note types, writing rules. Read before writing any note.
+- [[conventions]] — vault rules: hierarchy, families, frontmatter, templates, git, gardening. Read before writing any note.
+- [[todo]] — general cross-project scrap todo. Read when Henry asks "what's next"; update when items land.
 
 ## Tools & agent setup
 
@@ -13,10 +14,6 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 ## Phoebe
 
 - [[recommendation-subagents]] — recommendation-subagents campaign (June–July 2026): changes, eval numbers, overfit arc.
-
-## Games
-
-- [[ssbu-yoshi-0-to-1]] — Yoshi scrapbook.
 
 ## Families (path patterns, not enumerated)
 

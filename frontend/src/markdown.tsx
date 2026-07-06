@@ -64,10 +64,39 @@ const calloutTypes: Record<string, typeof Pencil> = {
 
 const calloutMarkerPattern = /^\[!([a-z-]+)\]([+-])?[ \t]*/i;
 const wikiStylesPattern = /\n*```wiki-styles\n[\s\S]*?\n```\s*$/i;
-const commentPattern = /%%[\s\S]*?%%/g;
+
+function stripBlockComments(content: string) {
+  const lines = content.split("\n");
+  const kept: string[] = [];
+  let inFence = false;
+  let inComment = false;
+
+  for (const line of lines) {
+    if (!inComment && /^\s*(```|~~~)/.test(line)) {
+      inFence = !inFence;
+      kept.push(line);
+      continue;
+    }
+    if (inFence) {
+      kept.push(line);
+      continue;
+    }
+    if (!inComment) {
+      if (/^\s*%%\s*$/.test(line)) {
+        inComment = true;
+        continue;
+      }
+      kept.push(line);
+    } else if (/^\s*%%\s*$/.test(line)) {
+      inComment = false;
+    }
+  }
+
+  return kept.join("\n");
+}
 
 export function prepareMarkdown(content: string) {
-  return content.replace(wikiStylesPattern, "").replace(commentPattern, "");
+  return stripBlockComments(content.replace(wikiStylesPattern, ""));
 }
 
 export type NoteProperties = Array<[string, string | string[]]>;
@@ -124,15 +153,17 @@ export function stripLeadingTitle(content: string, title: string) {
 }
 
 const inlinePattern =
-  /==([^=\n]+)==|(!?)\[\[([^\][\n|]+?)(?:\|([^\][\n]+?))?\]\]|(^|[\s(])#([A-Za-z][\w/-]*)/g;
+  /%%[\s\S]*?%%|==([^=\n]+)==|(!?)\[\[([^\][\n|]+?)(?:\|([^\][\n]+?))?\]\]|(^|[\s(])#([A-Za-z][\w/-]*)/g;
 
 function splitInline(value: string): MdNode[] {
   const nodes: MdNode[] = [];
   let last = 0;
+  let matched = false;
   inlinePattern.lastIndex = 0;
   let match: RegExpExecArray | null;
 
   while ((match = inlinePattern.exec(value)) !== null) {
+    matched = true;
     if (match.index > last) {
       nodes.push({ type: "text", value: value.slice(last, match.index) });
     }
@@ -167,7 +198,7 @@ function splitInline(value: string): MdNode[] {
     last = match.index + match[0].length;
   }
 
-  if (nodes.length === 0) return [{ type: "text", value }];
+  if (!matched) return [{ type: "text", value }];
   if (last < value.length) nodes.push({ type: "text", value: value.slice(last) });
   return nodes;
 }
