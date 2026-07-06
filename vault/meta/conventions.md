@@ -104,9 +104,15 @@ Reuse existing tags. Bump `updated` on every meaningful edit.
 Todo:
 
 - [P0|P1|P2] project: task sentence (ticket/PR links only if they exist)
+
+Backlog:
+
+- project: task sentence (links only if they exist)
 ```
 
-No Done section (completed = deleted), no prose, sorted by priority.
+- `Todo` = active working set, priority-sorted, keep ≤ ~10 items.
+- `Backlog` = future/unscheduled/blocked; no priority tag — assign one on promotion to Todo.
+- Promote/demote instead of letting Todo rot. Completed = deleted. No Done section, no prose.
 
 ## Git
 
