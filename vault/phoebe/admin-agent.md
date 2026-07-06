@@ -96,7 +96,7 @@ Internal AI agent at `/admin/agent` (web) and Slack admin mode: investigates pro
 
 ## Planned: package + database split (PHO-13093, P0)
 
-Decision 2026-07-06 (see [[admin-agent-split|phoebe/decisions/admin-agent-split]]): three-way split — `agent_runtime` (mechanics, no capability semantics), `phoebe_general_agent` (scoped), `phoebe_admin_agent` (max) — capability policy duplicated by design, mechanics single-sourced. Phase 2: dedicated admin RDS for INTERNAL/SUBAGENT runs + all `admin_*` tables; probe runs stay in app DB ("a run lives where its runtime lives"); cross-DB linkage by ID + forwarding, no FKs; dedicated admin worker service. Hard sequencing: land in a freeze window after the current PR wave (#10475, #10608, #10614, #10552, 12634 slices). The code map above describes PRE-split layout — update it when PHO-13093 lands.
+Decision 2026-07-06 rev2 (see [[admin-agent-split|phoebe/decisions/admin-agent-split]]): **Phase 1 = pure extraction** — all admin code moves to `libraries/python/phoebe_admin_agent/`; General Agent plumbing + shared mechanics stay in `phoebe_event_agent`, imported via barrel. Phase 2 = dedicated admin RDS (INTERNAL/SUBAGENT runs + `admin_*` tables; probe runs stay in app DB; ID+forwarding links, no cross-DB FKs; dedicated admin worker service). Deferred: `agent_runtime` mechanics extraction, per-agent policy forks. Sequencing: after #10608 merges (#10475 overlaps one probe file, rebase-manageable). Code map above is PRE-split — update when PHO-13093 lands.
 
 ## Active right now (2026-07-06)
 
