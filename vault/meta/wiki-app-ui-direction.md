@@ -26,7 +26,7 @@ Decision (2026-07-06): the wiki frontend is an **Obsidian clone in structure/beh
 - `frontend/src/markdown.tsx` — renderer + callout/wikilink/tag/highlight plugins
 - `frontend/src/App.tsx` — shell, theme toggle
 - `frontend/src/styles.css` — both theme palettes
-- `vault/meta/obsidian-feature-test.md` — exercises every renderer feature
+- `vault/meta/ui-demo.md` — exercises every renderer feature
 
 ## Known gaps (deliberate, "expand later")
 
