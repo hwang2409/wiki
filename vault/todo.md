@@ -7,7 +7,8 @@ updated: 2026-07-06
 
 Todo:
 
-- [P0] admin-agent: run exe.dev week trial — clone-speed go/no-go, scoped-token /exec lifecycle; precedes PHO-12306 build-out; pilot plan in ticket comment ([PHO-12930](https://linear.app/phoebework/issue/PHO-12930))
+- [P0] admin-agent: build code-sandbox tool surface, exe.dev first backend — after 1h manual API-shape capture ([PHO-13073](https://linear.app/phoebework/issue/PHO-13073))
+- [P1] admin-agent: run exe.dev pilot experiments through the new tools — clone-speed go/no-go, lifecycle, cost ([PHO-12930](https://linear.app/phoebework/issue/PHO-12930))
 - [P1] admin-agent: finish native GitHub App/API setup for PR workflows — credentials, installation tokens, bounded PR create/comment/review; no merge authority ([PHO-12306](https://linear.app/phoebework/issue/PHO-12306))
 - [P1] admin-agent: port MCP integrations to first-party typed API clients; MCP stays smoke-only ([PHO-12634](https://linear.app/phoebework/issue/PHO-12634))
 - [P1] phoebe: rerun full 10475 bank evals on cleaned fixtures once fix branch lands ([#10475](https://github.com/phoebe-health/phoebe/pull/10475))
