@@ -20,7 +20,7 @@ In Progress:
 
 Backlog:
 
-- [PHO-13096](https://linear.app/phoebework/issue/PHO-13096): /admin/agent UI polish sweep (clipped tool card, broken artifact panel)
+- [PHO-13096](https://linear.app/phoebework/issue/PHO-13096): rewrite /admin/agent frontend + associated components (rescoped from polish sweep)
 - [PHO-11469](https://linear.app/phoebework/issue/PHO-11469): re-triage Slack-thread alert investigation
 - [PHO-13074](https://linear.app/phoebework/issue/PHO-13074): fix inspect_codebase_wiki silent failures + uncategorized errors
 - [PHO-12425](https://linear.app/phoebework/issue/PHO-12425), 12426: sandboxed outreach start + e2e dogfood
