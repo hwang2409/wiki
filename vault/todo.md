@@ -34,5 +34,4 @@ Backlog:
 - admin-agent: trace UX series — explorer, run comparison, prompt/context diffing ([PHO-11273](https://linear.app/phoebework/issue/PHO-11273)–11275)
 - admin-agent: artifact/playbook features — saved-investigation actions, handoffs, known-issue memory, playbook authoring ([PHO-11251](https://linear.app/phoebework/issue/PHO-11251), 11264, 11267, 11268)
 - phoebe: phone-first outreach instead of default SMS ([PHO-11052](https://linear.app/phoebework/issue/PHO-11052))
-- phoebe: Slack V2 leftovers — coordinator preference memory, reaction-based triggers ([PHO-10497](https://linear.app/phoebework/issue/PHO-10497), [PHO-10493](https://linear.app/phoebework/issue/PHO-10493))
 - tools: mine ~/me/dox/workflow.md, internal-admin.md, posthog-slack-v2-dashboard-readability.md into vault/todo
