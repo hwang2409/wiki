@@ -128,6 +128,16 @@ updated: YYYY-MM-DD
 - <carry-forward items — also mirror into [[todo]]>
 ```
 
+**todo** (`todo.md`, Henry reads constantly — strictest format)
+
+```markdown
+Todo:
+
+- [P0|P1|P2] project: sentence describing task (ticket link, PR link — only if they exist)
+```
+
+Nothing else in the file: no Done section (completed items are deleted), no agent instructions, no prose. Sorted by priority.
+
 ## Git
 
 The wiki repo is git-backed (private remote `origin`). After any vault writing session, commit and push:
