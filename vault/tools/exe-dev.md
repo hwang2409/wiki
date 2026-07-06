@@ -7,6 +7,8 @@ updated: 2026-07-06
 
 # exe.dev
 
+**Status: pilot canceled 2026-07-06** — Henry declined the paid-tier cost ([PHO-12930](https://linear.app/phoebework/issue/PHO-12930) Canceled). The substrate-agnostic sandbox tool surface (PHO-13073/#10608) survives; resuming exe.dev — or a Modal backend, the evaluation's recommended production pivot — is a client swap, not a redesign.
+
 External cloud/tool. Current as of 2026-07-06; verify pricing/security
 before operational decisions.
 
