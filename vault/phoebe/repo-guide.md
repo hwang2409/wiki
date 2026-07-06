@@ -32,6 +32,8 @@ Fastest orientation for an agent touching the phoebe monorepo (`~/me/fun/phoebe`
 
 Never work directly on the primary checkout at `~/me/fun/phoebe` — Henry runs multiple concurrent agent sessions against it, and branch switches/dirty state collide. For ANY code work: reuse the ticket's existing worktree if one exists (`git worktree list | grep -i <ticket>`; conventional homes `.claude/worktrees/<name>` and `.codex/worktrees/<name>`), otherwise create a new one. The primary checkout is for reads, greps, and orchestration only. (Henry, 2026-07-06.)
 
+**Local dev DB is always disposable.** Henry never cares about local DB state — when local data is stale/missing (e.g. missing "Phoebe Home Care" pinned admin org), re-seed without asking: `bazel run //scripts:seed_local_db -- --email henry@phoebe.work --password password` (wipes + recreates), then re-create the agent login via /setup-agent-account. (Henry, 2026-07-06.)
+
 ## The mistakes cold agents actually make
 
 (Each rule's canonical home cited; this list exists because these cause real damage when unknown.)
