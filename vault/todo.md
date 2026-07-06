@@ -19,10 +19,10 @@ In Progress:
 
 Backlog:
 
-- [PHO-13074](https://linear.app/phoebework/issue/PHO-13074): fix inspect_codebase_wiki silent failures + uncategorized errors
-- [PHO-11469](https://linear.app/phoebework/issue/PHO-11469): re-triage Slack-thread alert investigation
-- [PHO-12424](https://linear.app/phoebework/issue/PHO-12424)–12426: multi-shift outreach execution follow-ups
 - [PHO-11461](https://linear.app/phoebework/issue/PHO-11461), 11462, 11464–11466: generalized debug workflow family
+- [PHO-11469](https://linear.app/phoebework/issue/PHO-11469): re-triage Slack-thread alert investigation
+- [PHO-13074](https://linear.app/phoebework/issue/PHO-13074): fix inspect_codebase_wiki silent failures + uncategorized errors
+- [PHO-12424](https://linear.app/phoebework/issue/PHO-12424)–12426: multi-shift outreach execution follow-ups
 - [PHO-11256](https://linear.app/phoebework/issue/PHO-11256)–11260: texQL series
 - [PHO-11269](https://linear.app/phoebework/issue/PHO-11269)–11272: canonical data products series
 - [PHO-11273](https://linear.app/phoebework/issue/PHO-11273)–11275: trace UX series

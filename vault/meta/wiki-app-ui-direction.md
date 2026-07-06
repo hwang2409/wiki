@@ -16,7 +16,7 @@ Decision (2026-07-06): the wiki frontend is an **Obsidian clone in structure/beh
 - Monochrome palette via CSS vars on `:root` (light) + `[data-theme="dark"]` overrides in `frontend/src/styles.css`. Callouts differ by icon only, not color.
 - Backend full-text search: `GET /api/notes?q=`.
 - Custom views, frontmatter-gated: `view: kanban` renders sections as read-only board lanes, list items as cards (used by `todo.md`). First deliberate departure from pure markdown parity.
-- Kanban target look: obsidian-community/obsidian-kanban plugin — single-column 272px lanes (multi-column lanes rejected 2026-07-06), panel lanes on flat pane, rich markdown cards. Next milestones: per-lane add-card write-back, drag-drop.
+- Kanban target look: obsidian-community/obsidian-kanban plugin — single-column 272px lanes (multi-column lanes rejected 2026-07-06), panel lanes on flat pane, rich markdown cards. Shipped 2026-07-06: drag-drop between/within lanes + per-lane add-card, both write todo.md via line surgery (exact-line ops on latest content, last-write-wins). Remaining: card edit-in-place, drop-to-done (done.md), lane menus.
 
 ## Rejected
 
