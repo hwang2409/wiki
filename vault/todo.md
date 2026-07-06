@@ -36,4 +36,4 @@ Backlog:
 - [PHO-11535](https://linear.app/phoebework/issue/PHO-11535): fact/inference evidence tiers for RCA answers
 - [PHO-11231](https://linear.app/phoebework/issue/PHO-11231): Phoebe Home Care seed data for visual testing
 - [PHO-12982](https://linear.app/phoebework/issue/PHO-12982), 12757: reference tickets (harness doctrine, tool brainstorm)
-- [PHO-13095](https://linear.app/phoebework/issue/PHO-13095): skill-load card display-title casing (git hub → GitHub)
+- [PHO-13095](https://linear.app/phoebework/issue/PHO-13095): skill-load card display-title casing — QUEUED to auto-spawn worker when PHO-13093 extraction merges (same file)
