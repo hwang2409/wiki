@@ -130,7 +130,7 @@ Line format: Linear ticket FIRST (linked), then a short one-liner. Clusters: lea
 - YYYY-MM-DD: project: one-line summary (ticket/PR links)
 ```
 
-Append-only, newest last. This is the first place to check for todo staleness.
+Newest entries at the TOP (prepend, don't append). This is the first place to check for todo staleness.
 
 When Henry says something is done: append the done.md line, prune todo.md, AND mark the Linear ticket Done (keep Linear and the vault in sync). If no merged PR/evidence is visible, confirm which ticket before writing.
 
