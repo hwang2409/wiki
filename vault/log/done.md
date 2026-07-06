@@ -20,3 +20,4 @@ Done:
 - 2026-07-05: admin-agent: PHO-12640 core-accounts read access closed as superseded by PHO-12921 (archived in Linear)
 - 2026-07-01: admin-agent: PHO-12826 codebase tools no longer starve run lease heartbeats (Linear: Merged)
 - 2026-07-01: admin-agent: PHO-12830 Linear default project-scope resolution fix (Linear: Merged)
+- 2026-07-06: admin-agent: PHO-12306 native GitHub App/API setup for PR workflows finished ([PHO-12306](https://linear.app/phoebework/issue/PHO-12306))
