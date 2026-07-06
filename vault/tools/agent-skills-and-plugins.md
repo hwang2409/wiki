@@ -50,6 +50,10 @@ Clusters: PR lifecycle (ship-pr, babysit-pr, own-pr, commit-push-pr, pushing-cod
 | Codex | rename-pane@personal | tmux helper |
 | Codex | frontend-design | same as Claude side |
 
+## Cross-machine sync (2026-07-06)
+
+Canonical portable copy lives in the private repo **github.com/hwang2409/agent-config** (local checkout `~/me/fun/config`). Contains `claude/skills/` (13), `codex/skills/` (29), global `CLAUDE.md`/`AGENTS.md`, `install.sh` (idempotent, copy-mode, conflict-safe on instruction files) and `sync.sh` (live → repo, commit+push). Flow: edit live skills → `./sync.sh` → other laptop `git pull && ./install.sh`. Plugins/MCP/settings.json deliberately NOT synced (machine-specific); plugin list documented in the repo README. After any skill edit session, run sync.sh or the repo drifts.
+
 ## Cleanse log (2026-07-06)
 
 - Removed: 14 stock OpenAI samples from `~/.codex/skills/`; source-command-* orphans from phoebe `.agents/skills/`.
