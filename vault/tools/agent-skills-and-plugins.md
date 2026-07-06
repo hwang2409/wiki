@@ -34,7 +34,7 @@ Synced ports (copies, NOT symlinks — edits on Claude side need manual re-copy)
 
 Codex-native keepers: gh-fix-ci, gh-address-comments, pr-review-ci-fix, review, create-plan, issue-triage, sentry-triage, datadog-logs, langsmith-fetch, webapp-testing, codebase-migrate, changelog-generator, linear, mcp-builder, agent-deep-links, ponytail-review.
 
-## Phoebe project skills (`.claude/skills/` — ~54)
+## Phoebe project skills (`.claude/skills/`) — ~54
 
 Clusters: PR lifecycle (ship-pr, babysit-pr, own-pr, commit-push-pr, pushing-code, codex-pr-babysitter-automation), Codex (codex-cli, codex-tmux, cloud-agent-starter), review/quality, worktrees/tmux, testing ×7, observability (dd-*, sentry-cli, cloudwatch-logs, vlogs, braintrust, buildbuddy), voice/preview, DB, planning, misc. Repo-committed; changes go through phoebe PRs.
 

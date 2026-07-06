@@ -112,7 +112,16 @@ Backlog:
 
 - `Todo` = active working set, priority-sorted, keep ≤ ~10 items.
 - `Backlog` = future/unscheduled/blocked; no priority tag — assign one on promotion to Todo.
-- Promote/demote instead of letting Todo rot. Completed = deleted. No Done section, no prose.
+- Promote/demote instead of letting Todo rot. Completed = deleted (and logged in `log/done.md`). No Done section, no prose.
+- **Staleness check before writing todo.md:** Henry sometimes finishes work without telling agents. Cross-check every item against `log/done.md`; for items with ticket/PR links, verify status (gh / Linear) when in doubt. Remove finished items — don't re-list them.
+
+**done** (`log/done.md`) — worldwide completion tally. Append a line whenever a PR merges or a ticket/task completes:
+
+```markdown
+- YYYY-MM-DD: project: one-line summary (ticket/PR links)
+```
+
+Append-only, newest last. This is the first place to check for todo staleness.
 
 ## Git
 

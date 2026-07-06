@@ -6,6 +6,7 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 
 - [[conventions]] — vault rules: hierarchy, families, frontmatter, templates, git, gardening. Read before writing any note.
 - [[todo]] — general cross-project scrap todo. Read when Henry asks "what's next"; update when items land.
+- [[done]] — worldwide completion tally (`log/done.md`). Append on every merge/completion; check before writing todo.
 - [[wiki-app-ui-direction]] — decision: wiki app is an Obsidian clone, monochrome theme, light default; rejected paths + key files. Read before wiki-app UI work.
 - [[ui-demo]] — renderer demo fixture exercising every wiki-app markdown feature. Keep when pruning; used to verify rendering.
 
