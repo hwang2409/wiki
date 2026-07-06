@@ -104,16 +104,18 @@ Reuse existing tags. Bump `updated` on every meaningful edit.
 ```markdown
 Todo:
 
-- [P0|P1|P2] project: task sentence (ticket/PR links only if they exist)
+- [P0|P1|P2] [PHO-1234](url): brief one-liner
 
 In Progress:
 
-- [P0|P1|P2] project: task sentence (links) — owner (e.g. henry, cdx:PHO-1234, codex session)
+- [P0|P1|P2] [PHO-1234](url): brief one-liner — owner (henry / cdx:PHO-1234 / session)
 
 Backlog:
 
-- project: task sentence (links only if they exist)
+- [PHO-1234](url): brief one-liner
 ```
+
+Line format: Linear ticket FIRST (linked), then a short one-liner. Clusters: lead ticket linked, siblings as bare IDs (`[PHO-1256](url)–1260: series name`). No-ticket tasks: plain one-liner.
 
 - `Todo` = ready-to-start working set, priority-sorted, keep ≤ ~10 items.
 - `In Progress` = actively being worked RIGHT NOW; every line names its owner (Henry or the worker session/window). When work starts on an item — Henry picks it up, a worker is spawned, a Linear ticket moves to In Progress — move the line here in the same action. Stalled/abandoned → move back to Todo or Backlog.
