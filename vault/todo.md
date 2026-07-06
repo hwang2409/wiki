@@ -8,12 +8,15 @@ updated: 2026-07-06
 
 Todo:
 
-- [P0] admin-agent: build code-sandbox tool surface, exe.dev first backend — after 1h manual API-shape capture ([PHO-13073](https://linear.app/phoebework/issue/PHO-13073))
-- [P1] admin-agent: run exe.dev pilot experiments through the new tools — clone-speed go/no-go, lifecycle, cost ([PHO-12930](https://linear.app/phoebework/issue/PHO-12930))
 - [P1] admin-agent: finish native GitHub App/API setup for PR workflows — credentials, installation tokens, bounded PR create/comment/review; no merge authority ([PHO-12306](https://linear.app/phoebework/issue/PHO-12306))
-- [P1] admin-agent: port MCP integrations to first-party typed API clients; MCP stays smoke-only ([PHO-12634](https://linear.app/phoebework/issue/PHO-12634))
 - [P1] phoebe: rerun full 10475 bank evals on cleaned fixtures once fix branch lands ([#10475](https://github.com/phoebe-health/phoebe/pull/10475))
 - [P1] tools: review reconstructed tmux-ticket-pr-window-naming skill for divergence from original
+
+In Progress:
+
+- [P0] admin-agent: build code-sandbox tool surface, exe.dev first backend ([PHO-13073](https://linear.app/phoebework/issue/PHO-13073)) — cdx:PHO-13073 worker
+- [P1] admin-agent: exe.dev pilot — shapes captured, experiments blocked on PHO-13073 tools + plan-upgrade decision ([PHO-12930](https://linear.app/phoebework/issue/PHO-12930)) — henry
+- [P1] admin-agent: port MCP integrations to first-party typed API clients ([PHO-12634](https://linear.app/phoebework/issue/PHO-12634)) — henry, paused (collides with 13073 worktree area)
 
 Backlog:
 

@@ -106,12 +106,17 @@ Todo:
 
 - [P0|P1|P2] project: task sentence (ticket/PR links only if they exist)
 
+In Progress:
+
+- [P0|P1|P2] project: task sentence (links) — owner (e.g. henry, cdx:PHO-1234, codex session)
+
 Backlog:
 
 - project: task sentence (links only if they exist)
 ```
 
-- `Todo` = active working set, priority-sorted, keep ≤ ~10 items.
+- `Todo` = ready-to-start working set, priority-sorted, keep ≤ ~10 items.
+- `In Progress` = actively being worked RIGHT NOW; every line names its owner (Henry or the worker session/window). When work starts on an item — Henry picks it up, a worker is spawned, a Linear ticket moves to In Progress — move the line here in the same action. Stalled/abandoned → move back to Todo or Backlog.
 - `Backlog` = future/unscheduled/blocked; no priority tag — assign one on promotion to Todo.
 - Promote/demote instead of letting Todo rot. Completed = deleted (and logged in `log/done.md`). No Done section, no prose.
 - **Staleness check before writing todo.md:** Henry sometimes finishes work without telling agents. Cross-check every item against `log/done.md`; for items with ticket/PR links, verify status (gh / Linear) when in doubt. Remove finished items — don't re-list them.
