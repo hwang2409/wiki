@@ -30,7 +30,6 @@ Backlog:
 - [PHO-12211](https://linear.app/phoebework/issue/PHO-12211): vendor record-and-inject primitive for sandbox probes
 - [PHO-11598](https://linear.app/phoebework/issue/PHO-11598): Snowflake QA/feedback + trends tool
 - [PHO-12134](https://linear.app/phoebework/issue/PHO-12134): Voice QA inspection support
-- [PHO-12294](https://linear.app/phoebework/issue/PHO-12294): prod VPC → staging RDS network path
 - [PHO-11727](https://linear.app/phoebework/issue/PHO-11727): subagents as nested tasks in /admin/agent
 - [PHO-11539](https://linear.app/phoebework/issue/PHO-11539): admin agent as read-only MCP server
 - [PHO-11540](https://linear.app/phoebework/issue/PHO-11540): daily run review summary for tool quality
