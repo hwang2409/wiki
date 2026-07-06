@@ -124,13 +124,15 @@ Line format: Linear ticket FIRST (linked), then a short one-liner. Clusters: lea
 - **Sweep additions:** when backfilling todo.md from Linear/GitHub, do not re-add items Henry deliberately removed — check todo.md git history (`git -C ~/me/fun/wiki log -p vault/todo.md`) for prior removals before adding a ticket line back.
 - **Staleness check before writing todo.md:** Henry sometimes finishes work without telling agents. Cross-check every item against `log/done.md`; for items with ticket/PR links, verify status (gh / Linear) when in doubt. Remove finished items — don't re-list them.
 
-**done** (`log/done.md`) — worldwide completion tally. Append a line whenever a PR merges or a ticket/task completes:
+**done** (`log/done.md`) — worldwide completion tally. On every merge/completion, add a line under the day's header (create the header if today's is missing):
 
 ```markdown
-- YYYY-MM-DD: project: one-line summary (ticket/PR links)
+## YYYY-MM-DD
+
+- **project** — brief summary ([#PR](url) merged <sha> / ticket link)
 ```
 
-Newest entries at the TOP (prepend, don't append). This is the first place to check for todo staleness.
+Newest date section at the TOP. Keep summaries one line — the links carry detail. First place to check for todo staleness.
 
 When Henry says something is done: append the done.md line, prune todo.md, AND mark the Linear ticket Done (keep Linear and the vault in sync). If no merged PR/evidence is visible, confirm which ticket before writing.
 
