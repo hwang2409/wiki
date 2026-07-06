@@ -94,6 +94,10 @@ Internal AI agent at `/admin/agent` (web) and Slack admin mode: investigates pro
 
 06-09/12 foundations (shell/registry/read-only/audit/sources) → 06-11/12 idea wave (texQL/data-products/trace-UX, mostly parked) → 06-15/19 doctrine buildout (subagents, DeepWiki, probes, skills) → 06-19/25 surfaces + MCP integration wave + approval simplification → 06-26/30 event-driven fan-in, no-ceiling runtime, live recommendation promotion, API-client migration start → 07-01/03 hardening + quality loop → 07-05/06 fixture-leak cleanup + overfit exposure, sandbox tool surface, accounts API, webhook ingestion.
 
+## Planned: package + database split (PHO-13093, P0)
+
+Decision 2026-07-06 (see [[admin-agent-split|phoebe/decisions/admin-agent-split]]): three-way split — `agent_runtime` (mechanics, no capability semantics), `phoebe_general_agent` (scoped), `phoebe_admin_agent` (max) — capability policy duplicated by design, mechanics single-sourced. Phase 2: dedicated admin RDS for INTERNAL/SUBAGENT runs + all `admin_*` tables; probe runs stay in app DB ("a run lives where its runtime lives"); cross-DB linkage by ID + forwarding, no FKs; dedicated admin worker service. Hard sequencing: land in a freeze window after the current PR wave (#10475, #10608, #10614, #10552, 12634 slices). The code map above describes PRE-split layout — update it when PHO-13093 lands.
+
 ## Active right now (2026-07-06)
 
 - PHO-13073 sandbox tools — PR #10608, review findings fixed, Bugbot flake + human approval pending

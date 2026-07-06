@@ -8,7 +8,7 @@ updated: 2026-07-06
 
 Todo:
 
-- [P2] test: drop-to-done probe
+- [P0] [PHO-13093](https://linear.app/phoebework/issue/PHO-13093): split admin agent into own package + database — blocked on current PR wave merging
 
 In Progress:
 
