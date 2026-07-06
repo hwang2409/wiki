@@ -14,7 +14,6 @@ In Progress:
 - [P2] [PHO-13096](https://linear.app/phoebework/issue/PHO-13096): rewrite /admin/agent frontend + associated components — cc:PHO-13096 worker (opus)
 - [P0] [PHO-13093](https://linear.app/phoebework/issue/PHO-13093): Phase 1 extraction to phoebe_admin_agent — henry, tonight (worker killed mid-day 07-06; partial uncommitted diff parked in .codex/worktrees/pho-13093)
 - [P1] [PHO-12306](https://linear.app/phoebework/issue/PHO-12306): legs C–F (review write-back, PR creation, gates, UX); B merged — henry to set webhook secret + activate App webhook
-- [P0] [PHO-13073](https://linear.app/phoebework/issue/PHO-13073): code-sandbox tool surface PR #10608 merge-ready; human approval gate remains — henry
 - [P1] [PHO-12930](https://linear.app/phoebework/issue/PHO-12930): exe.dev pilot; blocked on 13073 tools + plan upgrade — henry
 - [P1] [PHO-12634](https://linear.app/phoebework/issue/PHO-12634): port MCP integrations to first-party API clients — henry, paused (13073 collision)
 

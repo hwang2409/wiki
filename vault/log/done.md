@@ -10,7 +10,7 @@ updated: 2026-07-06
 ## 2026-07-06
 
 - [PHO-13095](https://linear.app/phoebework/issue/PHO-13095): skill-load card display-title casing — cdx:PHO-13095 worker (queue overridden; aim to merge before tonight’s 13093 extraction)
-- **admin-agent** — PHO-13073 code-sandbox tool surface PR #10608 merge-ready after rebase/review fixes; CI/Bugbot green, awaiting Henry approval
+- **admin-agent** — PHO-13073 code-sandbox tool surface PR #10608 merge-ready after rebase/review fixes; CI/Bugbot green and approved ([#10608](https://github.com/phoebe-health/phoebe/pull/10608))
 - **cleanup** — cancelled 11 implemented/stale Internal Admin Agent tickets with evidence comments (PHO-11231, 11268, 11273, 11461, 11462, 11464, 11465, 11466, 11540, 11727, 12424)
 - **admin-agent** — PHO-12937 type-aware tool-output renderers — diff/table/code/JSON + markdown fallback, bounded ([#10614](https://github.com/phoebe-health/phoebe/pull/10614) merged 1049b2646f)
 - **admin-agent** — PHO-12306 leg B GitHub webhook ingestion — endpoint, HMAC fail-closed, event persistence + dedupe ([#10622](https://github.com/phoebe-health/phoebe/pull/10622) merged dc5d04d5c0)
