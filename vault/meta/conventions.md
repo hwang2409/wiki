@@ -63,6 +63,7 @@ Reuse existing tags. Bump `updated` on every meaningful edit.
 - Bullets/tables by default; prose must earn its place.
 - Capture the *why* and rejected approaches — least recoverable information.
 - Exact strings for anything greppable: errors, flags, paths, ticket/PR numbers.
+- Linear ticket URLs: `linear.app/phoebework/issue/<ID>` (workspace slug is `phoebework`, not `phoebe`).
 - Wikilink liberally; an unresolved link marks a note worth writing.
 - No secrets/PII — reference where credentials live, never values.
 - Every fact traces to something observed or something Henry said.
