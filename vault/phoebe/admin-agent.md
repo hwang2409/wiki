@@ -69,7 +69,7 @@ Internal AI agent at `/admin/agent` (web) and Slack admin mode: investigates pro
 ## Slack & UI surfaces
 
 - Slack admin mode v2: triple-layer gating (platform-admin AND internal-email AND workspace allowlist) (PHO-12114/12136); thread context auto-load w/ URL resolution (PHO-12235); web↔thread reflection (PHO-12594); `:eyes:` on trace alerts → one idempotent diagnosis run in-thread (PHO-12955); safe auth-failure acks (PHO-12133). Parked: Orchard-report migration to owned threads (PHO-12773).
-- `/admin/agent`: chat + execution graph (PHO-12415/12542), quieter redesign (PHO-12678), run-events inspector + bounded JSON payload viewer (PHO-12429/#10319 — reuse this for renderers), queue/steer, Agent Lab (PHO-12416), tier picker, saved investigations. In flight: type-aware output renderers (PHO-12937, PR #10614).
+- `/admin/agent`: chat + execution graph (PHO-12415/12542), quieter redesign (PHO-12678), run-events inspector + bounded JSON payload viewer (PHO-12429/#10319 — reuse this for renderers), queue/steer, Agent Lab (PHO-12416), tier picker, saved investigations. `load_skill` transcript cards now preserve human-readable skill `display_name` values instead of lowercasing/humanizing them, and admin workflow skill names are Title Case (PHO-13095/#10632). In flight: type-aware output renderers (PHO-12937, PR #10614).
 - `/admin/agent-traces`: raw-first tabs, judge/justice rail (PHO-12299), human review workflow (PHO-12848), Linear-style filters (PHO-12931), embedded sidebar via `page_context_init`.
 
 ## Probe system & eval loop
