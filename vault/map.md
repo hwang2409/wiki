@@ -9,11 +9,15 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[done]] — worldwide completion tally (`log/done.md`). Append on every merge/completion; check before writing todo.
 - [[wiki-app-ui-direction]] — decision: wiki app is an Obsidian clone, monochrome theme, light default; rejected paths + key files. Read before wiki-app UI work.
 - [[ui-demo]] — renderer demo fixture exercising every wiki-app markdown feature. Keep when pruning; used to verify rendering.
+- [[agent-vault-patterns]] — verified survey of how others structure markdown vaults for agent memory; gap analysis vs this vault
+- [[source-credibility]] — structural source-verification method for research tasks; read when a query needs reputable sourcing (acted-on findings), skip for casual surveys.
 
 ## Tools & agent setup
 
 - [[agent-skills-and-plugins]] — living inventory of Claude/Codex skills + plugins, cleanse log, open items. Read/update on any skills or plugins question or change.
 - [[exe-dev]] — external SSH-first cloud for persistent VMs, agent sandboxes, devboxes, pricing/security notes, and Phoebe fit.
+- [[cliproxyapi]] — OAuth-subscription→API proxy evaluation: mechanics, use cases, ToS/account-risk flags. Read before routing any agent traffic through subscriptions.
+- [[model-task-benchmarks]] — which model for which coding task — verified benchmark numbers + caveats; read before assigning models to workers
 
 ## Phoebe
 
