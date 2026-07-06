@@ -28,6 +28,10 @@ Fastest orientation for an agent touching the phoebe monorepo (`~/me/fun/phoebe`
 | Voice | `docs/development_guides/voice_agents.md`, `voice_architecture.md`, `services/voice/AGENTS.md` |
 | Slack V2 | `docs/development_guides/slack/` (9 docs: architecture → rollout checklists) |
 
+## Working rule: always use a worktree
+
+Never work directly on the primary checkout at `~/me/fun/phoebe` — Henry runs multiple concurrent agent sessions against it, and branch switches/dirty state collide. For ANY code work: reuse the ticket's existing worktree if one exists (`git worktree list | grep -i <ticket>`; conventional homes `.claude/worktrees/<name>` and `.codex/worktrees/<name>`), otherwise create a new one. The primary checkout is for reads, greps, and orchestration only. (Henry, 2026-07-06.)
+
 ## The mistakes cold agents actually make
 
 (Each rule's canonical home cited; this list exists because these cause real damage when unknown.)
