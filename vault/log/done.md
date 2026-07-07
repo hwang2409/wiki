@@ -9,6 +9,8 @@ updated: 2026-07-06
 
 ## 2026-07-07
 
+- **admin-agent** — PHO-13093 Phase 1: admin agent extracted into phoebe_admin_agent package (202 files, one-way dependency seam, zero behavior change) ([#10690](https://github.com/phoebe-health/phoebe/pull/10690) merged 12fa6c0c77)
+- **admin-agent** — PHO-13133 /admin/agent polish: tool outputs collapse by default, composer outline removed ([#10689](https://github.com/phoebe-health/phoebe/pull/10689) merged 96bad98a6a)
 - **admin-agent** — PHO-13133 /admin/agent polish: tool-output payload cards collapse by default, inner composer outline removed, screenshots committed, CI green + approved ([#10689](https://github.com/phoebe-health/phoebe/pull/10689))
 
 ## 2026-07-06
