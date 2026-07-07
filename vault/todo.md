@@ -11,10 +11,8 @@ Todo:
 
 In Progress:
 
-- [P0] [PHO-13111](https://linear.app/phoebework/issue/PHO-13111): PR review pipeline — bounded review + GitHub write-back (12306 leg C) — cdx:PHO-13111 worker
 - [P2] [PHO-13096](https://linear.app/phoebework/issue/PHO-13096): rewrite /admin/agent frontend + associated components — cc:PHO-13096 worker (opus)
 - [P0] [PHO-13093](https://linear.app/phoebework/issue/PHO-13093): Phase 1 extraction to phoebe_admin_agent — henry, tonight (worker killed mid-day 07-06; partial uncommitted diff parked in .codex/worktrees/pho-13093)
-- [P1] PHO-12306 legs D–F (PR creation, gates, UX) — parent Done; split into tickets as picked up. Leg C = PHO-13111 (running). Webhook live after next prod deploy
 
 Backlog:
 
