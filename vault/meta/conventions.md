@@ -12,7 +12,7 @@ Shared memory for Henry's agents (Claude Code, Codex, others); sometimes read by
 ## Structure
 
 - One folder per topic (`phoebe/`, `tools/`, `meta/`, …). New folders as topics emerge.
-- Filenames: stable kebab-case slugs; they are wikilink targets. Renaming breaks links.
+- Filenames: stable kebab-case slugs; they are wikilink targets. Rename ONLY via `wiki note rename` (or the app) — it rewrites wikilinks vault-wide + map.md; raw `mv` breaks links.
 - One note per topic — update, don't near-duplicate. Grep before writing.
 - `map.md` (vault root) = topic → note index. Every note create/delete/rename updates its map line in the same action. Family notes are covered by their pattern line, not enumerated.
 
@@ -139,6 +139,8 @@ Newest date section at the TOP. Keep summaries one line — the links carry deta
 
 When Henry says something is done: append the done.md line, prune todo.md, AND mark the Linear ticket Done (keep Linear and the vault in sync). If no merged PR/evidence is visible, confirm which ticket before writing.
 
+**hot** (`hot.md`, vault root) — rolling ≤500-word cross-session cache, auto-injected into every Claude session at start (global SessionStart hook). REWRITE at work-arc boundaries — never append. Sections: Active threads / Recent facts / Watchouts. Wikilink into real notes; hot.md carries pointers and one-liners, not payloads. Stale hot.md poisons every new session — keeping it current outranks keeping it complete.
+
 ## Structured ops — `wiki` CLI
 
 Hot-path writes go through `~/me/fun/wiki/wiki` (stdlib Python, no server). It validates format, keeps map.md/todo/done in sync, and fails loudly on ambiguity — prefer it over hand-editing these files:
@@ -149,6 +151,8 @@ wiki todo move "<unique substring>" --to "In Progress"
 wiki todo complete "<unique substring>"   # removes line + logs under today's done.md header
 wiki log-done "project: summary (links)"  # → "- **project** — summary" under today's header
 wiki note new <topic>/<slug> --type til --hook "one-line map hook" [--title ...] [--tags a,b]
+wiki note rename <old> <new>            # moves file, rewrites [[wikilinks]] vault-wide + map.md
+wiki note delete <path>                 # hard delete + prunes map line (git = undo)
 wiki lint                                  # full conventions sweep; exit 1 on errors
 ```
 
