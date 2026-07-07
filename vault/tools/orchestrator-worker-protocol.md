@@ -1,0 +1,71 @@
+---
+type: reference
+tags: [tools, agents, tmux]
+created: 2026-07-07
+updated: 2026-07-07
+---
+
+# Orchestrator ↔ Worker Protocol (file/tmux schema)
+
+Machine-readable contract between the mastermind orchestrator session and tmux worker sessions. Canonical behavior lives in the `tmux-ticket-codex` / `tmux-ticket-claude` skills (synced via github.com/hwang2409/agent-config); this note is the SCHEMA — what exists on disk/tmux and who reads/writes it. Written for a future "agents" page in the wiki app to render live state from these files.
+
+## Identity
+
+| Thing | Convention | Writer |
+|---|---|---|
+| Worker tmux window | name `cdx:<TICKET>` (codex) / `cc:<TICKET>` (claude); TARGET BY `#{window_id}` (e.g. `@327`) — names contain `:` which breaks tmux target parsing | orchestrator (spawn) |
+| Worker CLI | `codex --yolo -m <model> -c model_reasoning_effort=<effort> "$(cat <prompt-file>)"` / `claude --model <m> --dangerously-skip-permissions "$(cat <prompt-file>)"` | orchestrator |
+| Orchestrator window | `thinker` (never renamed) | — |
+
+## Files (all under /tmp, per ticket)
+
+| Path | Purpose | Writer → Reader | Lifecycle |
+|---|---|---|---|
+| `/tmp/cdx-<TICKET>-prompt.md` (or `cc-`) | Kickoff prompt. ALWAYS a file — inline `"$PROMPT"` quoting breaks on embedded double quotes (codex parses prompt words as CLI args, instant death) | orchestrator → worker CLI at spawn | deleted at wrap-up |
+| `/tmp/agent-status/<TICKET>.json` | PRIMARY status channel. Worker rewrites on EVERY state transition | worker → orchestrator monitors | orchestrator deletes before spawn (stale-state guard) and at wrap-up |
+| `/tmp/cdx-<TICKET>.log` (`-2`, `-3` suffixes per session/respawn) | Full pane log via `tmux pipe-pane -o 'cat >> <log>'`. Scrollback truncates; log doesn't. CAUTION: contains the PROMPT ECHO — sentinel greps against it false-positive on prompt text | tmux → orchestrator (fallback signal only) | deleted at wrap-up |
+
+## Status-file schema (the load-bearing contract)
+
+```json
+{
+  "state": "working | merge-ready | blocked",
+  "pr": "<url or null>",
+  "step": "<one-line current step>",
+  "blocker": "<reason or null>"
+}
+```
+
+- Worker updates BEFORE long operations, not just after.
+- `merge-ready` → orchestrator runs the review gate (never trusts the claim).
+- `blocked` + `blocker: "handoff-needed"` → multi-session handoff (kill window, respawn same worktree, prompt points at newest PR handoff comment).
+- Planning workers reuse the same file with `pr: null`; `merge-ready` means "plan posted".
+
+## Signal priority (orchestrator monitors)
+
+1. **Status file** — structured, no regex guessing; emit event on state/step change.
+2. **GitHub ground truth** — when status file stale (mtime > ~5min) AND pane has no spinner: `gh pr checks`, `mergeStateStatus`, unresolved-thread count. Checks green + threads clear ⇒ merge-ready regardless of worker text; MERGED ⇒ wrap up.
+3. **Pane text** — hints only (workers paraphrase, TUI lies): stall detection (`esc to interrupt` spinner absent across 2 polls) and error-line scraping.
+
+Monitors = persistent background shell loops (Claude Code Monitor tool), one per worker, ~180s poll; each stdout line becomes an orchestrator notification. Dedupe per event type or they spam.
+
+## Input channel (orchestrator → worker)
+
+`tmux send-keys -t <window_id> -l "<msg>"` then `sleep 0.5` then `send-keys Enter`, then VERIFY submitted (~2s later, capture pane; text still in composer ⇒ bare Enter again). The 0.5s is load-bearing: composers paste-detect rapid bursts and treat same-cycle Enter as a newline. Steer shape: observed → why wrong → do instead → constraint.
+
+## Sentinels (worker stdout, backup to status file)
+
+- `MERGE-READY: <pr-url>` — PR open, CI green, review handled
+- `BLOCKED: <one-line reason>` — includes `handoff-needed`, `plan-dispute`, `<hook> baseline`
+- `PLAN-READY: <ticket>` (planning workers)
+- Grep pitfall: the pane log contains the kickoff prompt, which quotes these strings — match against status file or live pane, not raw log, or exclude the echo region.
+
+## Other state the orchestrator tracks (not files)
+
+- **Worktrees**: `~/me/fun/phoebe/.codex/worktrees/<slug>` / `.claude/worktrees/<slug>` — worker-owned; survive handoffs (same worktree across sessions); removed after merge.
+- **PR handoff comments**: durable cross-session memory for multi-session tickets (done / remaining / file map) — better than compaction.
+- **Vault todo.md**: `In Progress` line names the owning window (`cdx:PHO-1234`); other sessions' ownership preflights grep tmux window names + worktrees + branches + open PRs.
+
+## Wrap-up (on merge/close)
+
+Kill window → stop monitor → delete prompt file, log(s), status file → prune vault todo → done.md line → Linear state. No dead-window clutter.
