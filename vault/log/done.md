@@ -7,6 +7,10 @@ updated: 2026-07-06
 
 # Done
 
+## 2026-07-07
+
+- **admin-agent** — PHO-13133 /admin/agent polish: tool-output payload cards collapse by default, inner composer outline removed, screenshots committed, CI green + approved ([#10689](https://github.com/phoebe-health/phoebe/pull/10689))
+
 ## 2026-07-06
 
 - **admin-agent** — PHO-13096 full /admin/agent frontend rewrite: Ramp-style retheme, artifact registry decomposition (6.9k-line monolith dissolved), transcript/inspection rebuild, real-E2E-verified, 6 worker sessions via handoff protocol ([#10634](https://github.com/phoebe-health/phoebe/pull/10634) merged 5bdf0c4b76)
