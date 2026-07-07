@@ -66,6 +66,24 @@ Monitors = persistent background shell loops (Claude Code Monitor tool), one per
 - **PR handoff comments**: durable cross-session memory for multi-session tickets (done / remaining / file map) — better than compaction.
 - **Vault todo.md**: `In Progress` line names the owning window (`cdx:PHO-1234`); other sessions' ownership preflights grep tmux window names + worktrees + branches + open PRs.
 
+## Registry (`/tmp/agent-registry.json`)
+
+Push channel for the wiki `/agents` page — orchestrator announces workers instead of the app scraping tmux names:
+
+```bash
+wiki agent register <TICKET> --window @327 --kind cdx --role plan|implement|review [--model --worktree --log]
+wiki agent done <TICKET> --outcome merged|closed|plan-ready|abandoned   # at wrap-up
+wiki agent list
+```
+
+- Re-registering a ticket = handoff: prior session auto-archived into `history` with `outcome: handoff` (plan→implement chains, multi-session respawns). Do NOT `done` between sessions.
+- Atomic writes (tmp+rename). `/tmp` lifecycle intentional — reboot kills tmux and registry together.
+- Division of truth: registry = identity/metadata (window_id, kind, role, model, worktree, log path, session chain); status file = state (worker-written, unchanged); tmux liveness = health. The app renders: registry entry w/ dead window ⇒ "worker died?"; status file w/o registry entry ⇒ "unregistered" (skill drift flag).
+
+## Archive (`~/me/fun/agent-archive/<TICKET>/<timestamp>/`)
+
+Long-term record of every worker session, written at wrap-up AND at each multi-session handoff BEFORE the /tmp artifacts are deleted: kickoff prompt, pane log(s), final status JSON. Local-only and never pushed to a shared repo — pane logs can contain fetched prod data. Native CLI transcripts (richer: structured turns/tool calls) also persist independently in `~/.codex/sessions/` and `~/.claude/projects/`; the archive dir is the per-ticket index into a session's artifacts.
+
 ## Wrap-up (on merge/close)
 
-Kill window → stop monitor → delete prompt file, log(s), status file → prune vault todo → done.md line → Linear state. No dead-window clutter.
+Kill window → stop monitor → `wiki agent done <TICKET>` → ARCHIVE prompt/logs/status to agent-archive → delete the /tmp copies → prune vault todo → done.md line → Linear state. No dead-window clutter.
