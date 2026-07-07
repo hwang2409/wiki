@@ -9,6 +9,7 @@ updated: 2026-07-06
 
 ## 2026-07-06
 
+- **admin-agent** — PHO-13096 full /admin/agent frontend rewrite: Ramp-style retheme, artifact registry decomposition (6.9k-line monolith dissolved), transcript/inspection rebuild, real-E2E-verified, 6 worker sessions via handoff protocol ([#10634](https://github.com/phoebe-health/phoebe/pull/10634) merged 5bdf0c4b76)
 - **admin-agent** — PHO-13111 PR review pipeline: bounded review + scoped GitHub write-back lane, head-SHA discipline, audit rows, allowlist ([#10651](https://github.com/phoebe-health/phoebe/pull/10651) merged 273dc70a44) — 12306 leg C done
 - **admin-agent** — PHO-12634 MCP-to-native cleanup: MCP fallbacks removed from native clients, 30 stale env keys dropped, prototype MCP prod-impossible ([#10652](https://github.com/phoebe-health/phoebe/pull/10652) merged ab4c2b4177)
 - **admin-agent** — PHO-13104 code-sandbox hardening: compound-word secret guard, symlink-escape check, denylist dedup ([#10640](https://github.com/phoebe-health/phoebe/pull/10640) merged 3edd8a0fe6)
