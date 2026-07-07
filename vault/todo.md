@@ -16,6 +16,7 @@ In Progress:
 
 Backlog:
 
+- [PHO-13142](https://linear.app/phoebework/issue/PHO-13142): chart artifact type (admin.chart@1, client-side declarative rendering)
 - [PHO-11469](https://linear.app/phoebework/issue/PHO-11469): re-triage Slack-thread alert investigation
 - [PHO-13074](https://linear.app/phoebework/issue/PHO-13074): fix inspect_codebase_wiki silent failures + uncategorized errors
 - [PHO-12425](https://linear.app/phoebework/issue/PHO-12425), 12426: sandboxed outreach start + e2e dogfood
