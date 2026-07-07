@@ -11,7 +11,7 @@ Todo:
 
 In Progress:
 
-- [P0] [PHO-13093](https://linear.app/phoebework/issue/PHO-13093): Phase 1 extraction to phoebe_admin_agent — henry, tonight (worker killed mid-day 07-06; partial uncommitted diff parked in .codex/worktrees/pho-13093)
+- [P0] [PHO-13093](https://linear.app/phoebework/issue/PHO-13093): Phase 1 extraction to phoebe_admin_agent — cdx:PHO-13093 worker (gpt-5.4 xhigh; fresh from post-merge main; stale parked diff superseded)
 
 Backlog:
 
