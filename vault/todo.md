@@ -8,6 +8,7 @@ updated: 2026-07-06
 
 Todo:
 
+- [P1] [PHO-13141](https://linear.app/phoebework/issue/PHO-13141): make simple admin-agent ops fast — cohort fast-paths, tool atomization audit, turn-count eval budgets
 
 In Progress:
 
