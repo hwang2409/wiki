@@ -20,7 +20,7 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[exe-dev]] — external SSH-first cloud for persistent VMs, agent sandboxes, devboxes, pricing/security notes, and Phoebe fit.
 - [[cliproxyapi]] — OAuth-subscription→API proxy evaluation: mechanics, use cases, ToS/account-risk flags. Read before routing any agent traffic through subscriptions.
 - [[model-task-benchmarks]] — which model for which coding task — verified benchmark numbers + caveats; read before assigning models to workers
-- [[openhands]] — open-source Devin-style coding agent (ex-OpenDevin) — readable harness reference
+- [[harness]] — what makes agent harnesses great: verified cross-cutting principles + Claude Code/OpenHands/Codex CLI/Devin/SWE-agent design breakdowns
 
 ## Phoebe
 

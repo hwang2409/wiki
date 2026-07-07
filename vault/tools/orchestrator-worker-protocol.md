@@ -72,7 +72,8 @@ Push channel for the wiki `/agents` page — orchestrator announces workers inst
 
 ```bash
 wiki agent register <TICKET> --window @327 --kind cdx --role plan|implement|review [--model --worktree --log]
-wiki agent done <TICKET> --outcome merged|closed|plan-ready|abandoned   # at wrap-up
+wiki agent done <TICKET> --outcome merged|closed|plan-ready|abandoned   # at wrap-up, AFTER archiving
+wiki agent outcome <TICKET> merged|closed|...                           # fix/mark outcome after the fact
 wiki agent list
 ```
 
@@ -86,4 +87,6 @@ Long-term record of every worker session, written at wrap-up AND at each multi-s
 
 ## Wrap-up (on merge/close)
 
-Kill window → stop monitor → `wiki agent done <TICKET>` → ARCHIVE prompt/logs/status to agent-archive → delete the /tmp copies → prune vault todo → done.md line → Linear state. No dead-window clutter.
+Kill window → stop monitor → ARCHIVE prompt/logs/status to agent-archive → `wiki agent done <TICKET> --outcome …` → delete the /tmp copies → prune vault todo → done.md line → Linear state. No dead-window clutter.
+
+ORDER MATTERS: archive BEFORE `agent done` — done persists `{outcome, ended_at, worker-registry snapshot}` into the newest archive dir's `meta.json` (the wiki `/agents` archived section reads it). Done without an archive dir = outcome lost (CLI warns). `wiki agent outcome <TICKET> merged` retro-fixes a missed one.
