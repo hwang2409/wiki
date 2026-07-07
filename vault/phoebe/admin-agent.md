@@ -2,7 +2,7 @@
 type: reference
 tags: [phoebe, admin-agent, architecture]
 created: 2026-07-06
-updated: 2026-07-06
+updated: 2026-07-07
 ---
 
 # Internal Admin Agent — Architecture & Complete State
@@ -55,6 +55,7 @@ Internal AI agent at `/admin/agent` (web) and Slack admin mode: investigates pro
 - **Slack tools**: allowlisted reads + guarded writes, bot-membership boundary (PHO-12471/12533).
 - **Core accounts**: read-only Core API source (PHO-12921/#10400) + owner filter/pagination/projection/evidence-opt-in (PHO-12980/#10611, merged 07-06).
 - **DeepWiki/codebase**: `inspect_codebase_wiki` → hosted bundles → `investigate_codebase` macro, `find_codebase_references`, `localize_codebase_issue`, sharded lazy artifacts (PHO-11737→12775 arc). **KNOWN BROKEN: `inspect_codebase_wiki` 58/59 prod calls fail with no error_category (PHO-13074).**
+- **Run-data verbs**: PHO-13146 introduced shared input-ref/materialization plumbing plus `search_run_data` and `run_admin_python_snippet`. Stacked PR #10740 for PHO-13153 adds the remaining native verbs on that same path: `read_run_data` (paged lines/bytes), `slice_json` (dotted keys + array indices + `[*]` only, with nearest-valid-prefix errors), and `diff_run_data` (unified line diff or structural JSON diff). All five verbs now partition cleanly in workflow text; native verbs cap model-visible output and spill full results to artifacts with audit metadata.
 - **Ops controls**: source health, flag drift, previewed batch changes (PHO-12373), approval-gated org flag tools (PHO-12340), flag catalog (PHO-12699), `find_admin_settings_location` (PHO-12129).
 - **Workflow skills**: typed skill layer over `view_skills`/`load_skill`, tool-name validation (PHO-12785/#10254). Playbooks: schema/runner/library (PHO-11261-11263).
 - **Automations**: `AgentAutomation` substrate, deploy-summary archetype, no self-triggered loops (PHO-12479/#10039).
@@ -105,6 +106,7 @@ Decision 2026-07-06 rev2 (see [[admin-agent-split|phoebe/decisions/admin-agent-s
 - PHO-13073 sandbox tools — PR #10608, review findings fixed, Bugbot flake + human approval pending
 - PHO-12937 output renderers — PR #10614, CI babysit
 - PHO-12306 leg B webhook ingestion — PR #10622 open; CI/review babysit
+- PHO-13153 run-data verb set — stacked PR #10740 on top of PHO-13146 branch; adds `read_run_data`, `slice_json`, `diff_run_data`; retarget to `main` after PHO-13146 merges
 - PHO-12634 API-client port — PR #10652 merge-ready: removes stale `ADMIN_AGENT_MCP_*` production fallbacks/readiness/docs; CI green + review handled, awaiting human approval
 - PHO-12930 exe.dev pilot — blocked on 13073 tools + plan-upgrade decision
 - #10552 (woodbridge) — reviewed 07-06: blocking on missing `actions: read` App permission
