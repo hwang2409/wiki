@@ -8,10 +8,10 @@ updated: 2026-07-06
 
 Todo:
 
-- [P1] [PHO-13138](https://linear.app/phoebework/issue/PHO-13138): Phase 2 — admin-owned run tables (same DB), DB-level user-facing lockout, kill pinned-org hack
 
 In Progress:
 
+- [P1] [PHO-13138](https://linear.app/phoebework/issue/PHO-13138): Phase 2 admin-owned tables — cdx:PHO-13138 PLANNING worker (gpt-5.5 xhigh; plan→implement split, plan gate next)
 
 Backlog:
 
