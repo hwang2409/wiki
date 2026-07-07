@@ -3,7 +3,7 @@ type: reference
 view: kanban
 tags: [todo]
 created: 2026-07-06
-updated: 2026-07-06
+updated: 2026-07-07
 ---
 
 Todo:
@@ -11,12 +11,13 @@ Todo:
 
 In Progress:
 
+- [P1] [PHO-13146](https://linear.app/phoebework/issue/PHO-13146): python snippets v0 (run_admin_python_snippet) — cdx:PHO-13146 worker (gpt-5.5 xhigh)
 - [P1] [PHO-13141](https://linear.app/phoebework/issue/PHO-13141): admin-agent speed — cdx:PHO-13141 worker (gpt-5.5 xhigh; diagnosis-gated)
 - [P1] [PHO-13138](https://linear.app/phoebework/issue/PHO-13138): Phase 2 admin-owned tables — plan approved (ticket comment = contract, 8-PR series); cdx:PHO-13138 worker on PR1 (schema/roles/deny-tests)
+- [P1] [PHO-13142](https://linear.app/phoebework/issue/PHO-13142): chart artifact type (admin.chart@1, client-side declarative rendering) — cdx:PHO-13142
 
 Backlog:
 
-- [PHO-13142](https://linear.app/phoebework/issue/PHO-13142): chart artifact type (admin.chart@1, client-side declarative rendering)
 - [PHO-11469](https://linear.app/phoebework/issue/PHO-11469): re-triage Slack-thread alert investigation
 - [PHO-13074](https://linear.app/phoebework/issue/PHO-13074): fix inspect_codebase_wiki silent failures + uncategorized errors
 - [PHO-12425](https://linear.app/phoebework/issue/PHO-12425), 12426: sandboxed outreach start + e2e dogfood
