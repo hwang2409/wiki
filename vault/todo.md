@@ -8,10 +8,10 @@ updated: 2026-07-06
 
 Todo:
 
-- [P1] [PHO-13141](https://linear.app/phoebework/issue/PHO-13141): make simple admin-agent ops fast — cohort fast-paths, tool atomization audit, turn-count eval budgets
 
 In Progress:
 
+- [P1] [PHO-13141](https://linear.app/phoebework/issue/PHO-13141): admin-agent speed — cdx:PHO-13141 worker (gpt-5.5 xhigh; diagnosis-gated)
 - [P1] [PHO-13138](https://linear.app/phoebework/issue/PHO-13138): Phase 2 admin-owned tables — cdx:PHO-13138 PLANNING worker (gpt-5.5 xhigh; plan→implement split, plan gate next)
 
 Backlog:
