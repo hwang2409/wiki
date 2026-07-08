@@ -22,9 +22,16 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
+
+# Single-flight guard: a full first scan takes minutes of disk-wait, and every
+# concurrent /api/tokens request that also scanned would stack another
+# IO-bound thread until the threadpool starved ALL sync endpoints (live
+# incident 2026-07-08). Losers of the race serve the last persisted snapshot.
+_REFRESH_LOCK = threading.Lock()
 
 CACHE_VERSION = 2  # v1 caches had a byte-offset desync on non-ASCII tail reads
                     # + per-file (not global) msg-id dedupe; both wipe on load.
@@ -403,7 +410,13 @@ def query(
     KEYED by ts and carry a per-series {"<cli>/<model>": {...}} map so a
     single response can drive stacked charts without a second request."""
     if state is None:
-        state = refresh()
+        if _REFRESH_LOCK.acquire(blocking=False):
+            try:
+                state = refresh()
+            finally:
+                _REFRESH_LOCK.release()
+        else:
+            state = _load_state()
     frm = _parse_iso(from_ts)
     to = _parse_iso(to_ts)
     if bucket not in (BUCKET_HOUR, BUCKET_DAY):
