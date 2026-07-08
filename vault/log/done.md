@@ -2,10 +2,14 @@
 type: log
 tags: [log, done]
 created: 2026-07-06
-updated: 2026-07-07
+updated: 2026-07-08
 ---
 
 # Done
+
+## 2026-07-08
+
+- **wiki** — native macOS app (Tauri 2 + PyInstaller sidecar) merged, PR #1: plan→implement→review via codex workers WIKI-1/WIKI-2, 1:1 parity vs web app, web flow unregressed
 
 ## 2026-07-07
 

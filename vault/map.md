@@ -34,6 +34,10 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 
 - [[codebuild-secrets-json-key-drift]] — CodeBuild migrate failure: Secrets Manager JSON key missing during environment processing
 
+## Tools/til
+
+- [[wiki-native-bundle-hardened-runtime-parent-watchdog]] — Tauri Wiki.app with a PyInstaller onefile sidecar needs hardenedRuntime false and a parent-pid watchdog on macOS.
+
 ## Families (path patterns, not enumerated)
 
 - `log/YYYY-MM-DD.md` — daily end-of-day changelogs, cross-project.

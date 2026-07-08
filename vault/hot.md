@@ -2,7 +2,7 @@
 type: reference
 tags: [hot]
 created: 2026-07-06
-updated: 2026-07-07
+updated: 2026-07-08
 ---
 
 # Hot Context
@@ -11,22 +11,19 @@ Rolling ≤500-word session cache. Rewrite (don't append) at work-arc boundaries
 
 ## Active threads
 
-- **phoebe admin-agent tools arc SHIPPED 2026-07-07**: five merges in one day — PHO-13142 charts (#10722), PHO-13160 Slack-link fixes (#10749), PHO-13165 email hardening (#10754), PHO-13146 python snippets + search (#10734), PHO-13153 read/slice/diff (#10740). Run-data verb family complete: read/search/slice/diff/snippet. All live in staging — dogfood candidate. Details [[admin-agent]].
-- **PHO-13157 survey capture (#10751)**: merge-ready, all gates passed, HELD for Henry's team-lead review (PR comment marks the hold; worker in watch mode, window @373).
-- **PHO-13138 Phase 2 admin tables (#10716)**: PR1 terraform-parked (needs staging+prod apply of admin_agent_service secret wiring; staging drift on admin.phoebe-staging.dev accepted, do-not-touch). 8-PR series continues after. Worker @369.
-- **wiki app**: transcript resolver hardened — codex resume writes NEW rollouts invisible to kickoff scan; resolver now falls back to worktree-cwd slug + newest mtime (self-heals resumes). `--worktree` at register is MANDATORY (resolution key). Resurrection flow codified in both tmux-ticket skills (synced 180e00d). Protocol [[orchestrator-worker-protocol]].
+- **wiki NATIVE APP MERGED 2026-07-08** (PR #1, `b658a30`): Tauri 2 shell + PyInstaller onefile sidecar (`wiki-backend`) serving /api + built frontend on dynamic loopback port; lifecycle = spawn→health-wait→one-restart→kill-on-quit + parent-pid watchdog; `make native-build` → `src-tauri/target/release/bundle/macos/Wiki.app`. Web flow (:8011/:5173) unregressed. Manual QA checklist for WKWebView-only deltas in PR #1 body — Henry to click through. Research [[wiki-native-app-research]], plan+parity ledger in agent-archive/WIKI-2.
+- **wiki app (web)**: agent-first monitor — /agents fleet, sidebar agents mode, #/agent/<id> full transcripts (codex+claude), composer (vim, images inline [Image #N], skill autocomplete, on-idle queue), subagent inspect, split agent panes, settings (13 mono fonts + size sliders). [[wiki-app-ui-direction]], protocol [[orchestrator-worker-protocol]].
+- **phoebe admin-agent**: run-data verb family shipped 2026-07-07 (5 merges); PHO-13157 held for team-lead review; PHO-13138 terraform-parked. See [[admin-agent]].
 
 ## Recent facts
 
-- Next admin-agent picks per Henry discussion: PHO-13074 (inspect_codebase_wiki silent failures), PHO-11274/75 (trace/prompt diffing — pairs with new diff verb), PHO-12425/26 (sandboxed outreach dogfood), PHO-11727 (nested subagents). Auth gap still needs a deliberate ticket.
-- Archive dir names MUST be `YYYYMMDD-HHMMSS` (wiki CLI regex) — `T` separator silently breaks outcome persistence.
-- Wrap-up order proven: archive → `wiki agent done --outcome` → delete /tmp → todo complete → log-done.
-- Snippet sandbox design ratified by Henry: v0 subprocess right for threat model; evolution seams = network isolation + third-party packages → both route to admin_code_sandbox VM.
+- Orchestration pattern proven end-to-end on WIKI-2: plan worker (gpt-5.5 xhigh) → gate → implement worker (gpt-5.4 xhigh) → plan-dispute steer (push local main first!) → parity steers → independent review subagent → fix round → merge. Internal tickets use fake IDs with digits (WIKI-1/WIKI-2) so transcript resolver maps them.
+- `wiki agent orch/register --orch/update/done --outcome` full protocol in daily use; wrap-up order archive→done→delete.
+- Native gotchas learned: reqwest::blocking panics inside tauri async runtime (use std::thread); PyInstaller onefile needs parent-pid watchdog + force_exit fallback; hardenedRuntime must be false for ad-hoc-signed frozen sidecars; WKWebView AX tree degrades after repeated relaunches (drives skips → verify prod build via browser against sidecar port instead).
 
 ## Watchouts
 
-- NEVER `pkill -f` on substrings that appear in worker prompt text (e.g. 'bazel') — argv matching killed the whole codex fleet once (2026-07-07); match server binary paths instead.
-- Two-dot `git diff main..HEAD` on a behind-main branch shows main's commits as "reverts" — false blocker in reviews; squash-merge uses merge-base, untouched files are safe. Verify with `gh pr diff --name-only`.
-- Bazel cache was fully purged 2026-07-07 — first builds cold everywhere.
+- Local main must be PUSHED before spawning workers (worktrees come from origin/main) — caused WIKI-2 plan-dispute.
 - Agents rewrite todo.md/map.md concurrently — refetch before line surgery.
-- Codex/Claude JSONL formats are unversioned internals — wiki parsers drift with CLI updates.
+- Codex/Claude transcript JSONL formats are unversioned internals — wiki parsers drift with CLI updates.
+- NEVER `pkill -f` on substrings appearing in worker prompt text — match binary paths.
