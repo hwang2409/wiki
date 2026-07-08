@@ -3228,6 +3228,191 @@ body.is-resizing-panes {
   overflow-wrap: anywhere;
 }
 
+/* WIKI-14: task list, interrupt, pr, marker rows — rectangular corners */
+
+.session-state-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  background-color: var(--background-secondary);
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+}
+
+.session-state-tasks,
+.session-state-pr {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 2px;
+  background-color: var(--background-primary);
+  color: var(--text-muted);
+  text-decoration: none;
+}
+
+.session-state-pr {
+  color: var(--accent-primary);
+  border-color: color-mix(in srgb, var(--accent-primary) 40%, var(--background-modifier-border));
+}
+
+.session-state-pr:hover {
+  background-color: color-mix(in srgb, var(--accent-primary) 10%, var(--background-primary));
+}
+
+.session-tasks {
+  display: flex;
+  flex-direction: column;
+  align-self: stretch;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 2px;
+  background-color: var(--background-secondary);
+  overflow: hidden;
+}
+
+.session-tasks-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  text-align: left;
+}
+
+.session-tasks-head:hover {
+  background-color: color-mix(in srgb, var(--accent-primary) 6%, transparent);
+}
+
+.session-tasks-summary {
+  flex: 1;
+  color: var(--text-normal);
+}
+
+.session-tasks-collapsible {
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+.session-tasks-list {
+  list-style: none;
+  margin: 0;
+  padding: 4px 0;
+}
+
+.session-task {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 12px;
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.5;
+}
+
+.session-task .task-icon {
+  flex-shrink: 0;
+}
+
+.session-task .task-icon.is-done {
+  color: var(--accent-success);
+}
+
+.session-task .task-icon.is-progress {
+  color: var(--accent-warning);
+  animation: session-task-spin 1.6s linear infinite;
+}
+
+.session-task .task-icon.is-open {
+  color: var(--text-faint);
+}
+
+@keyframes session-task-spin {
+  to { transform: rotate(360deg); }
+}
+
+.session-task.is-completed .session-task-subject {
+  color: var(--text-faint);
+  text-decoration: line-through;
+}
+
+.session-task.is-in_progress .session-task-subject {
+  color: var(--text-normal);
+}
+
+.session-task-id {
+  color: var(--text-faint);
+  min-width: 24px;
+}
+
+.session-task-subject {
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.session-interrupt {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  align-self: flex-start;
+  padding: 3px 10px;
+  border: 1px solid color-mix(in srgb, var(--accent-danger) 40%, var(--background-modifier-border));
+  border-radius: 2px;
+  background-color: color-mix(in srgb, var(--accent-danger) 8%, transparent);
+  color: var(--accent-danger);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+}
+
+.session-pr-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  align-self: flex-start;
+  padding: 3px 10px;
+  border: 1px solid color-mix(in srgb, var(--accent-primary) 40%, var(--background-modifier-border));
+  border-radius: 2px;
+  background-color: color-mix(in srgb, var(--accent-primary) 8%, transparent);
+  color: var(--accent-primary);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  text-decoration: none;
+}
+
+.session-pr-chip:hover {
+  background-color: color-mix(in srgb, var(--accent-primary) 16%, transparent);
+}
+
+.session-marker {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  align-self: flex-start;
+  padding: 2px 8px;
+  border: 1px dashed var(--background-modifier-border);
+  border-radius: 2px;
+  background-color: transparent;
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  overflow-wrap: anywhere;
+}
+
+.session-marker.is-api_error {
+  color: var(--accent-danger);
+  border-color: color-mix(in srgb, var(--accent-danger) 40%, var(--background-modifier-border));
+  border-style: solid;
+}
+
 /* Session sidebar */
 
 .agents-layout {

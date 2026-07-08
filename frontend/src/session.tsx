@@ -1,9 +1,13 @@
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
+  AlertTriangle,
   Bell,
   Bot,
   ChevronRight,
+  Circle,
   CircleCheck,
+  CircleDashed,
+  CircleSlash,
   Eye,
   FileText,
   GitCommit,
@@ -35,7 +39,15 @@ import {
   sendAgentMessage,
   uploadImage,
 } from "./api";
-import type { AgentSessionData, QueuedMessage, SessionEvent, SkillInfo, SubagentInfo } from "./api";
+import type {
+  AgentSessionData,
+  QueuedMessage,
+  SessionEvent,
+  SessionPr,
+  SessionTask,
+  SkillInfo,
+  SubagentInfo,
+} from "./api";
 import { LoadingPlaceholder } from "./loading";
 
 const POLL_MS = 2500;
@@ -339,6 +351,70 @@ function BashBlock({ event }: { event: SessionEvent }) {
   );
 }
 
+function TaskStatusIcon({ status }: { status: string }) {
+  if (status === "completed") return <CircleCheck className="task-icon is-done" size={13} />;
+  if (status === "in_progress") return <CircleDashed className="task-icon is-progress" size={13} />;
+  return <Circle className="task-icon is-open" size={13} />;
+}
+
+function TaskListRow({ event }: { event: SessionEvent }) {
+  const tasks = event.tasks ?? [];
+  const [open, setOpen] = useState(true);
+  return (
+    <div className={`session-tasks${open ? " is-open" : ""}`}>
+      <button className="session-tasks-head" type="button" onClick={() => setOpen((v) => !v)}>
+        <ChevronRight className={`collapse-icon${open ? "" : " is-collapsed"}`} size={12} />
+        <ListTodo size={12} />
+        <span className="session-tasks-summary">{event.text}</span>
+      </button>
+      <div className={`session-collapsible session-tasks-collapsible${open ? " is-open" : ""}`}>
+        <div className="session-collapsible-inner">
+          <ul className="session-tasks-list">
+            {tasks.map((task) => (
+              <li className={`session-task is-${task.status}`} key={task.id}>
+                <TaskStatusIcon status={task.status} />
+                <span className="session-task-id">#{task.id}</span>
+                <span className="session-task-subject">
+                  {task.status === "in_progress" && task.activeForm ? task.activeForm : task.subject}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function InterruptRow({ text }: { text: string }) {
+  return (
+    <div className="session-interrupt">
+      <CircleSlash size={12} />
+      <span>{text}</span>
+    </div>
+  );
+}
+
+function PrRow({ pr, text }: { pr: SessionPr | undefined; text: string }) {
+  if (!pr) return null;
+  return (
+    <a className="session-pr-chip" href={pr.url} rel="noopener noreferrer" target="_blank">
+      <GitPullRequest size={12} />
+      <span>{text}</span>
+    </a>
+  );
+}
+
+function MarkerRow({ text, marker }: { text: string; marker?: string }) {
+  const Icon = marker === "api_error" ? AlertTriangle : Radio;
+  return (
+    <div className={`session-marker is-${marker ?? "info"}`}>
+      <Icon size={12} />
+      <span>{text}</span>
+    </div>
+  );
+}
+
 const MessageBlock = memo(function MessageBlock({
   event,
   imageNums,
@@ -381,6 +457,18 @@ const MessageBlock = memo(function MessageBlock({
   }
   if (event.kind === "bash") {
     return <BashBlock event={event} />;
+  }
+  if (event.kind === "tasks") {
+    return <TaskListRow event={event} />;
+  }
+  if (event.kind === "interrupt") {
+    return <InterruptRow text={event.text} />;
+  }
+  if (event.kind === "pr") {
+    return <PrRow pr={event.pr} text={event.text} />;
+  }
+  if (event.kind === "marker") {
+    return <MarkerRow marker={event.marker} text={event.text} />;
   }
   return (
     <div className="session-assistant markdown-preview-view">
@@ -434,6 +522,8 @@ type SessionAcc = {
   format: string;
   path: string;
   tokens: number | null;
+  tasks: SessionTask[];
+  pr: SessionPr | null;
   base: number;
   events: SessionEvent[];
   subagents: SubagentInfo[];
@@ -447,6 +537,8 @@ function spliceSession(acc: SessionAcc | null, result: AgentSessionData): Sessio
       format: result.format,
       path: result.path,
       tokens: result.tokens,
+      tasks: result.tasks ?? [],
+      pr: result.pr ?? null,
       base: result.from,
       events: result.events,
       subagents: result.subagents ?? [],
@@ -457,6 +549,8 @@ function spliceSession(acc: SessionAcc | null, result: AgentSessionData): Sessio
   return {
     ...acc,
     tokens: result.tokens,
+    tasks: result.tasks ?? acc.tasks,
+    pr: result.pr ?? acc.pr,
     subagents: result.subagents ?? acc.subagents,
     working: result.working ?? acc.working,
     events: acc.events.slice(0, result.from - acc.base).concat(result.events),
@@ -544,6 +638,17 @@ export function SessionTab({
     [session]
   );
 
+  const taskCounts = useMemo(() => {
+    const c = { total: 0, done: 0, progress: 0, open: 0 };
+    for (const task of session?.tasks ?? []) {
+      c.total += 1;
+      if (task.status === "completed") c.done += 1;
+      else if (task.status === "in_progress") c.progress += 1;
+      else c.open += 1;
+    }
+    return c;
+  }, [session]);
+
   if (error && !session) return <div className="session-empty">{error}</div>;
   if (!session) {
     return (
@@ -554,8 +659,34 @@ export function SessionTab({
   }
 
   const tokens = formatTokens(session.tokens);
+
   return (
     <>
+      {(session.tasks.length > 0 || session.pr) ? (
+        <div className="session-state-strip">
+          {session.tasks.length > 0 ? (
+            <span className="session-state-tasks">
+              <ListTodo size={12} />
+              <span>
+                {taskCounts.total} task{taskCounts.total === 1 ? "" : "s"} · {taskCounts.done} done
+                {taskCounts.progress ? ` · ${taskCounts.progress} in progress` : ""}
+                {taskCounts.open ? ` · ${taskCounts.open} open` : ""}
+              </span>
+            </span>
+          ) : null}
+          {session.pr ? (
+            <a
+              className="session-state-pr"
+              href={session.pr.url}
+              rel="noopener noreferrer"
+              target="_blank"
+            >
+              <GitPullRequest size={12} />
+              PR #{session.pr.number}
+            </a>
+          ) : null}
+        </div>
+      ) : null}
       <div className="session-scroll" ref={ref} onScroll={onScroll}>
         <div className="session-scroll-inner" ref={innerRef}>
         {groups.map((group) =>
