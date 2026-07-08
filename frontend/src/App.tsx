@@ -109,6 +109,13 @@ type PaneInfo = {
   ticket: string | null;
 };
 
+type PaneGeometry = {
+  key: string;
+  order: number;
+  x: number;
+  y: number;
+};
+
 type WindowChooserKind = "agent" | "note";
 
 type AgentsSnapshot = {
@@ -250,6 +257,82 @@ function collectPaneInfos(node: Layout, panes: PaneInfo[] = []): PaneInfo[] {
   collectPaneInfos(node.first, panes);
   collectPaneInfos(node.second, panes);
   return panes;
+}
+
+function collectPaneGeometry(
+  node: Layout,
+  bounds: { height: number; width: number; x: number; y: number } = {
+    height: 1,
+    width: 1,
+    x: 0,
+    y: 0,
+  },
+  panes: PaneGeometry[] = []
+): PaneGeometry[] {
+  if (node.kind === "pane") {
+    panes.push({
+      key: node.id,
+      order: panes.length,
+      x: bounds.x,
+      y: bounds.y,
+    });
+    return panes;
+  }
+
+  if (node.direction === "row") {
+    const firstWidth = bounds.width * node.ratio;
+    collectPaneGeometry(
+      node.first,
+      {
+        ...bounds,
+        width: firstWidth,
+      },
+      panes
+    );
+    collectPaneGeometry(
+      node.second,
+      {
+        height: bounds.height,
+        width: bounds.width - firstWidth,
+        x: bounds.x + firstWidth,
+        y: bounds.y,
+      },
+      panes
+    );
+    return panes;
+  }
+
+  const firstHeight = bounds.height * node.ratio;
+  collectPaneGeometry(
+    node.first,
+    {
+      ...bounds,
+      height: firstHeight,
+    },
+    panes
+  );
+  collectPaneGeometry(
+    node.second,
+    {
+      height: bounds.height - firstHeight,
+      width: bounds.width,
+      x: bounds.x,
+      y: bounds.y + firstHeight,
+    },
+    panes
+  );
+  return panes;
+}
+
+function orderPaneKeysByVisualPosition(node: Layout): string[] {
+  const epsilon = 0.000001;
+  return collectPaneGeometry(node)
+    .sort((left, right) => {
+      if (Math.abs(left.y - right.y) > epsilon) return left.y - right.y;
+      if (Math.abs(left.x - right.x) > epsilon) return left.x - right.x;
+      return left.order - right.order;
+    })
+    .map((pane) => pane.key);
 }
 
 function firstPaneKey(node: Layout): string {
@@ -1157,6 +1240,13 @@ export default function App() {
     [activeWindow]
   );
   const paneMap = useMemo(() => new Map(paneInfos.map((pane) => [pane.key, pane])), [paneInfos]);
+  const orderedPaneInfos = useMemo(() => {
+    if (!activeWindow) return [];
+    const panesByKey = new Map(paneInfos.map((pane) => [pane.key, pane]));
+    return orderPaneKeysByVisualPosition(activeWindow.layout)
+      .map((key) => panesByKey.get(key))
+      .filter((pane): pane is PaneInfo => pane !== undefined);
+  }, [activeWindow, paneInfos]);
   const focusedPaneId = activeWindow?.focusedPaneId ?? null;
   const focusedPane = focusedPaneId ? paneMap.get(focusedPaneId) ?? null : null;
   const focusedPanePath = focusedPane?.path ?? null;
@@ -1549,9 +1639,15 @@ export default function App() {
   }
 
   function cyclePaneFocus(delta: 1 | -1) {
-    if (!activeWindow || !focusedPaneId || paneInfos.length === 0) return;
-    const currentIndex = Math.max(0, paneInfos.findIndex((pane) => pane.key === focusedPaneId));
-    const nextPane = paneInfos[(currentIndex + delta + paneInfos.length) % paneInfos.length];
+    if (!activeWindow || !focusedPaneId || orderedPaneInfos.length === 0) return;
+    const currentIndex = Math.max(
+      0,
+      orderedPaneInfos.findIndex((pane) => pane.key === focusedPaneId)
+    );
+    const nextPane =
+      orderedPaneInfos[
+        (currentIndex + delta + orderedPaneInfos.length) % orderedPaneInfos.length
+      ];
     activatePane(nextPane.key);
   }
 
@@ -1971,11 +2067,11 @@ export default function App() {
         if (key === "Escape") return;
 
         if (lowerKey === "j") {
-          cyclePaneFocus(-1);
+          cyclePaneFocus(1);
           return;
         }
         if (lowerKey === "k") {
-          cyclePaneFocus(1);
+          cyclePaneFocus(-1);
           return;
         }
         if (windowState.windows.length > 0 && lowerKey === "h") {
