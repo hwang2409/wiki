@@ -10,6 +10,7 @@ Todo:
 
 - [P1] WIKI-24: window-switch state preservation — composer draft, open subagent/review panel, scroll survive N->J->N window switches (inactive windows unmount today; keep mounted-hidden or externalize per-pane state). Repeated pain: in-progress prompts lost when cross-referencing another session
 - [P1] WIKI-32: polling/delta overhaul — central transcript cache, pause hidden panes, patch-by-id deltas (subsumes WIKI-18) — spawn AFTER WIKI-31 merges
+- [P2] WIKI-35: agent session view surfaces status-file state — state badge + blocker banner in agent-session-surface header (blocked/merge-ready visible without going back to /agents); data already in /api/agents
 
 In Progress:
 
