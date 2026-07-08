@@ -9,6 +9,7 @@ updated: 2026-07-08
 
 ## 2026-07-08
 
+- **phoebe** — PHO-13226 authz design delivered — tiers/approvals/revocation/subagent design; decision: T2-only now (PHO-13227), T1/T3/T4 parked with triggers
 - **WIKI-19** — watchdog revival v1.1 — (a) resume by EXPLICIT session id only, id resolved from richest-lineage rollout (kickoff-or-cwd match, largest/newest), launch cwd = worktree + auto-answer codex cwd-mismatch dialog (choose current dir); (b) preserve original tmux session (capture #{session_name} before kill); (c) detect 'access token could not be refreshed' pane signature as auth-dead -> kill+resume; (d) registry tracks current session id per worker (wiki agent update --session) and transcript resolver prefers it over discovery; (e) re-poke includes ticket id + status-file path
 - **phoebe** — PHO-13215 Core data products T1 merged (#10830) — resolve_core_account_owner + get_core_account_book + Core endpoints w/ sanitized errors; Jake golden case at ≤3 calls
 - [PHO-13215](https://linear.app/phoebework/issue/PHO-13215): Core data products T1 (resolver+book+endpoints) — cdx:PHO-13215 worker; T2=PHO-13216 queued; PR #10830 review/CI babysitting
