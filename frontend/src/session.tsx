@@ -663,7 +663,7 @@ function MessageComposer({
 
   useLayoutEffect(() => {
     const el = inputRef.current;
-    if (!el || vimMode === "insert") {
+    if (!el || vimMode === "insert" || document.activeElement !== el) {
       setOverlayPos(null);
       return;
     }
@@ -768,6 +768,11 @@ function MessageComposer({
     setInsertCaret(at);
   }
 
+  function focusPaneScope() {
+    pendingKeyRef.current = null;
+    inputRef.current?.closest<HTMLDivElement>(".pane-frame")?.focus();
+  }
+
   function motionTarget(key: string, at: number): number | null {
     switch (key) {
       case "h": return Math.max(0, at - 1);
@@ -844,6 +849,9 @@ function MessageComposer({
       return;
     }
     switch (key) {
+      case "Escape":
+        focusPaneScope();
+        break;
       case "G": setBlock(text.length - 1); break;
       case "g": pendingKeyRef.current = "g"; break;
       case "x":
@@ -1144,6 +1152,9 @@ function MessageComposer({
           ref={inputRef}
           rows={2}
           value={text}
+          onFocus={(event) => {
+            if (vimMode !== "insert") enterInsert(event.currentTarget.selectionEnd ?? text.length);
+          }}
           onChange={(event) => {
             setText(event.target.value);
             setMenuDismissed(false);
@@ -1179,17 +1190,17 @@ function MessageComposer({
               return;
             }
             if (menuItems.length > 0) {
-              if (event.key === "ArrowDown" || (event.key === "Tab" && !event.shiftKey)) {
+              if (event.key === "ArrowDown" || (event.ctrlKey && event.key === "j")) {
                 event.preventDefault();
                 setMenuIndex((i) => (i + 1) % menuItems.length);
                 return;
               }
-              if (event.key === "ArrowUp" || (event.key === "Tab" && event.shiftKey)) {
+              if (event.key === "ArrowUp" || (event.ctrlKey && event.key === "k")) {
                 event.preventDefault();
                 setMenuIndex((i) => (i - 1 + menuItems.length) % menuItems.length);
                 return;
               }
-              if (event.key === "Enter") {
+              if (event.key === "Enter" || event.key === "Tab") {
                 event.preventDefault();
                 acceptSkill(menuItems[Math.min(menuIndex, menuItems.length - 1)].name);
                 return;

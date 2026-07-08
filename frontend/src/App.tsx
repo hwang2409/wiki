@@ -1113,6 +1113,62 @@ export default function App() {
     requestAnimationFrame(() => paneRefs.current.get(key)?.focus());
   }
 
+  function activePaneFrame(): HTMLDivElement | null {
+    const active = document.activeElement;
+    return active instanceof HTMLDivElement && active.classList.contains("pane-frame")
+      ? active
+      : null;
+  }
+
+  function paneScopeScroll(delta: number): boolean {
+    const frame = activePaneFrame();
+    if (!frame) return false;
+    const scroller = frame.querySelector<HTMLDivElement>(".session-scroll");
+    if (!scroller) return false;
+    scroller.scrollBy({ top: delta });
+    return true;
+  }
+
+  function paneScopeBottom(): boolean {
+    const frame = activePaneFrame();
+    if (!frame) return false;
+    const scroller = frame.querySelector<HTMLDivElement>(".session-scroll");
+    if (!scroller) return false;
+    scroller.scrollTo({ top: scroller.scrollHeight });
+    return true;
+  }
+
+  function paneScopeHalfPage(direction: 1 | -1): boolean {
+    const frame = activePaneFrame();
+    if (!frame) return false;
+    const scroller = frame.querySelector<HTMLDivElement>(".session-scroll");
+    if (!scroller) return false;
+    scroller.scrollBy({ top: Math.round((scroller.clientHeight / 2) * direction) });
+    return true;
+  }
+
+  function focusPaneComposer(): boolean {
+    const frame = activePaneFrame();
+    if (!frame) return false;
+    const composer = frame.querySelector<HTMLTextAreaElement>(".session-composer textarea");
+    if (!composer) return false;
+    composer.focus();
+    return true;
+  }
+
+  function handlePaneScopeKey(event: globalThis.KeyboardEvent): boolean {
+    if (event.ctrlKey || event.metaKey || event.altKey) return false;
+    const key = event.key;
+    const lowerKey = key.toLowerCase();
+    if (lowerKey === "j") return paneScopeScroll(60);
+    if (lowerKey === "k") return paneScopeScroll(-60);
+    if (lowerKey === "d") return paneScopeHalfPage(1);
+    if (lowerKey === "u") return paneScopeHalfPage(-1);
+    if (lowerKey === "i") return focusPaneComposer();
+    if (key === "G") return paneScopeBottom();
+    return false;
+  }
+
   function disarmLeader() {
     if (leaderTimerRef.current) {
       window.clearTimeout(leaderTimerRef.current);
@@ -1534,6 +1590,8 @@ export default function App() {
       } else if ((event.metaKey || event.ctrlKey) && lowerKey === "b") {
         event.preventDefault();
         setSidebarVisible((visible) => !visible);
+      } else if (handlePaneScopeKey(event)) {
+        event.preventDefault();
       }
     }
 
@@ -1550,6 +1608,7 @@ export default function App() {
     leaderArmed,
     modalOpen,
     movePaneFocus,
+    handlePaneScopeKey,
     openAgentInContext,
   ]);
 
@@ -1674,6 +1733,7 @@ export default function App() {
   function renderPaneFrame(key: string, child: ReactNode) {
     return (
       <div
+        data-pane-key={key}
         className={`pane-frame${focusedPaneId === key ? " is-focused" : ""}`}
         ref={(node) => registerPaneRef(key, node)}
         tabIndex={-1}
