@@ -1,6 +1,7 @@
 import { Children, isValidElement, useMemo, useState } from "react";
 import type { MouseEvent, ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
+import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
 import {
@@ -153,7 +154,7 @@ export function stripLeadingTitle(content: string, title: string) {
 }
 
 const inlinePattern =
-  /%%[\s\S]*?%%|==([^=\n]+)==|(!?)\[\[([^\][\n|]+?)(?:\|([^\][\n]+?))?\]\]|(^|[\s(])#([A-Za-z][\w/-]*)/g;
+  /%%[\s\S]*?%%|==([^=\n]+)==|(!?)\[\[([^\][\n|]+?)(?:\|([^\][\n]+?))?\]\]|(^|[\s(])#([A-Za-z][\w/-]*)|\[(P\d)\]/g;
 
 function splitInline(value: string): MdNode[] {
   const nodes: MdNode[] = [];
@@ -192,6 +193,17 @@ function splitInline(value: string): MdNode[] {
         url: "#",
         data: { hProperties: { className: "tag" } },
         children: [{ type: "text", value: `#${match[6]}` }]
+      });
+    } else if (match[7] !== undefined) {
+      nodes.push({
+        type: "strong",
+        data: {
+          hName: "span",
+          hProperties: {
+            className: `priority-badge priority-${match[7].toLowerCase()}`
+          }
+        },
+        children: [{ type: "text", value: match[7] }]
       });
     }
 
@@ -238,26 +250,31 @@ function isParagraphElement(node: ReactNode): node is ReactNode & { props: { chi
   return isValidElement(node) && node.type === "p";
 }
 
-function stripMarkerAndTitle(paragraphChildren: ReactNode): ReactNode[] {
-  const rest: ReactNode[] = [];
-  let pastTitleLine = false;
+function splitTitleLine(paragraphChildren: ReactNode): {
+  titleNodes: ReactNode[];
+  rest: ReactNode[];
+} {
+  const items = Children.toArray(paragraphChildren);
 
-  for (const child of Children.toArray(paragraphChildren)) {
-    if (pastTitleLine) {
-      rest.push(child);
-      continue;
+  for (let index = 0; index < items.length; index += 1) {
+    const child = items[index];
+    if (isValidElement(child) && child.type === "br") {
+      return { titleNodes: items.slice(0, index), rest: items.slice(index + 1) };
     }
-    if (typeof child === "string") {
+    if (typeof child === "string" && child.includes("\n")) {
       const newline = child.indexOf("\n");
-      if (newline !== -1) {
-        pastTitleLine = true;
-        const remainder = child.slice(newline + 1);
-        if (remainder) rest.push(remainder);
-      }
+      const before = child.slice(0, newline);
+      const after = child.slice(newline + 1);
+      return {
+        titleNodes: [...items.slice(0, index), before],
+        rest: [after, ...items.slice(index + 1)].filter(
+          (node) => node !== ""
+        )
+      };
     }
   }
 
-  return rest;
+  return { titleNodes: items, rest: [] };
 }
 
 function Callout({
@@ -316,14 +333,14 @@ function MarkdownBlockquote({ children }: { children?: ReactNode; node?: unknown
 
   const kind = markerMatch[1].toLowerCase();
   const fold = (markerMatch[2] as "+" | "-" | undefined) ?? null;
-  const fullText = textFromReactNode(firstParagraph).replace(calloutMarkerPattern, "");
-  const titleLine = fullText.split("\n", 1)[0].trim();
   const defaultTitle = kind.charAt(0).toUpperCase() + kind.slice(1);
 
-  const restOfFirstParagraph = stripMarkerAndTitle(firstParagraph.props.children);
+  const { titleNodes, rest } = splitTitleLine(firstParagraph.props.children);
+  const titleLine = textFromReactNode(titleNodes).replace(calloutMarkerPattern, "").trim();
+
   const body: ReactNode[] = [];
-  if (restOfFirstParagraph.length > 0) {
-    body.push(<p key="callout-lead">{restOfFirstParagraph}</p>);
+  if (rest.length > 0) {
+    body.push(<p key="callout-lead">{rest}</p>);
   }
   body.push(...items.slice(firstParagraphIndex + 1));
 
@@ -367,7 +384,11 @@ type MarkdownLinkProps = {
   "data-wikilink"?: string;
 };
 
-function createComponents(resolve: WikilinkResolver, onOpenNote: (path: string) => void) {
+function createComponents(
+  resolve: WikilinkResolver,
+  onOpenNote: (path: string) => void,
+  onCreateNote?: (target: string) => void
+) {
   function MarkdownLink({ children, className, href, node: _node, ...props }: MarkdownLinkProps) {
     const wikilink = props["data-wikilink"];
 
@@ -377,9 +398,14 @@ function createComponents(resolve: WikilinkResolver, onOpenNote: (path: string) 
         <a
           className={`internal-link${resolved ? "" : " is-unresolved"}`}
           href="#"
+          title={resolved ? undefined : `Create "${wikilink}"`}
           onClick={(event: MouseEvent<HTMLAnchorElement>) => {
             event.preventDefault();
-            if (resolved) onOpenNote(resolved);
+            if (resolved) {
+              onOpenNote(resolved);
+            } else {
+              onCreateNote?.(wikilink);
+            }
           }}
         >
           {children}
@@ -420,23 +446,26 @@ function createComponents(resolve: WikilinkResolver, onOpenNote: (path: string) 
 export function ObsidianMarkdown({
   content,
   notes,
-  onOpenNote
+  onOpenNote,
+  onCreateNote
 }: {
   content: string;
   notes: NoteSummary[];
   onOpenNote: (path: string) => void;
+  onCreateNote?: (target: string) => void;
 }) {
   const prepared = useMemo(() => prepareMarkdown(content), [content]);
   const components = useMemo(
-    () => createComponents((target) => resolveWikilink(notes, target), onOpenNote),
-    [notes, onOpenNote]
+    () =>
+      createComponents((target) => resolveWikilink(notes, target), onOpenNote, onCreateNote),
+    [notes, onOpenNote, onCreateNote]
   );
 
   return (
     <ReactMarkdown
       components={components}
       rehypePlugins={[[rehypeHighlight, { detect: false }]]}
-      remarkPlugins={[remarkGfm, remarkObsidianInline]}
+      remarkPlugins={[remarkGfm, remarkObsidianInline, remarkBreaks]}
     >
       {prepared}
     </ReactMarkdown>

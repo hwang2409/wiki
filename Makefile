@@ -17,7 +17,7 @@ dev:
 	wait $$backend_pid $$frontend_pid
 
 backend:
-	$(UVICORN) backend.app.main:app --reload --host $(BACKEND_HOST) --port $(BACKEND_PORT)
+	$(UVICORN) backend.app.main:app --reload --reload-dir backend --timeout-graceful-shutdown 3 --host $(BACKEND_HOST) --port $(BACKEND_PORT)
 
 frontend:
 	cd frontend && WIKI_API_TARGET=http://$(BACKEND_HOST):$(BACKEND_PORT) npm run dev -- --host $(FRONTEND_HOST) --port $(FRONTEND_PORT)

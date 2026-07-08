@@ -1,0 +1,733 @@
+#!/usr/bin/env python3
+"""wiki — structured vault ops for agents.
+
+Hot-path writes with validation, so conventions hold mechanically:
+
+  wiki todo add "text" [--priority P1] [--section Todo]
+  wiki todo move "substring" --to "In Progress"
+  wiki todo complete "substring"
+  wiki log-done "project: summary (links)"
+  wiki note new <topic>/<slug> --type til --hook "map hook line" [--title T] [--tags a,b]
+  wiki lint
+
+Raw markdown editing stays allowed for note prose; these commands cover the
+transactional flows (todo/done/map) where drift actually happens.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "backend" / "app"))
+import vaultops  # noqa: E402
+
+VAULT = Path(__file__).resolve().parent / "vault"
+TODO = VAULT / "todo.md"
+DONE = VAULT / "log" / "done.md"
+MAP = VAULT / "map.md"
+AGENT_REGISTRY = Path("/tmp/agent-registry.json")
+AGENT_ARCHIVE = Path.home() / "me" / "fun" / "agent-archive"
+AGENT_ROLES = {"plan", "implement", "review"}
+AGENT_OUTCOMES = {"merged", "closed", "plan-ready", "abandoned", "handoff"}
+
+SECTION_RE = re.compile(r"^([^-*\s#>][^:]*):\s*$")
+ITEM_RE = re.compile(r"^- (.+)$")
+WIKILINK_RE = re.compile(r"\[\[([^\][|\n]+?)(?:\|[^\][\n]*)?\]\]")
+CODE_FENCE_RE = re.compile(r"```[\s\S]*?```|~~~[\s\S]*?~~~")
+INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
+
+
+def strip_code(content: str) -> str:
+    """Remove fenced blocks and inline code so quoted link syntax isn't scanned."""
+    return INLINE_CODE_RE.sub("", CODE_FENCE_RE.sub("", content))
+FRONTMATTER_KEYS = ("type", "tags", "created", "updated")
+NOTE_TYPES = {"campaign", "decision", "til", "reference", "log"}
+
+# Files that legitimately have no frontmatter
+FRONTMATTER_EXEMPT = {"map.md"}
+
+
+def today() -> str:
+    return datetime.date.today().isoformat()
+
+
+def fail(message: str) -> None:
+    print(f"error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def read_lines(path: Path) -> list[str]:
+    if not path.exists():
+        fail(f"{path} does not exist")
+    return path.read_text(encoding="utf-8").split("\n")
+
+
+def write_lines(path: Path, lines: list[str]) -> None:
+    text = "\n".join(lines)
+    if not text.endswith("\n"):
+        text += "\n"
+    path.write_text(text, encoding="utf-8")
+
+
+def bump_updated(lines: list[str]) -> None:
+    if lines and lines[0].strip() == "---":
+        for i in range(1, len(lines)):
+            if lines[i].strip() == "---":
+                break
+            if lines[i].startswith("updated:"):
+                lines[i] = f"updated: {today()}"
+                break
+
+
+def section_bounds(lines: list[str], section: str) -> tuple[int, int] | None:
+    """(header index, exclusive end) for a `Label:` section."""
+    header = None
+    in_frontmatter = False
+    for i, line in enumerate(lines):
+        if i == 0 and line.strip() == "---":
+            in_frontmatter = True
+            continue
+        if in_frontmatter:
+            if line.strip() == "---":
+                in_frontmatter = False
+            continue
+        if line.strip() == f"{section}:":
+            header = i
+            break
+    if header is None:
+        return None
+    end = len(lines)
+    for j in range(header + 1, len(lines)):
+        if SECTION_RE.match(lines[j]):
+            end = j
+            break
+    return header, end
+
+
+def insert_todo_line(lines: list[str], section: str, text: str) -> list[str]:
+    bounds = section_bounds(lines, section)
+    if bounds is None:
+        fail(f'section "{section}:" not found in todo.md')
+    header, end = bounds
+    last_item = None
+    for i in range(header + 1, end):
+        if ITEM_RE.match(lines[i]):
+            last_item = i
+    if last_item is not None:
+        insert_at = last_item + 1
+    else:
+        insert_at = header + 1
+        if insert_at < len(lines) and lines[insert_at].strip() == "":
+            insert_at += 1
+    lines.insert(insert_at, f"- {text}")
+    return lines
+
+
+def find_todo_item(lines: list[str], needle: str) -> int:
+    matches = [
+        i
+        for i, line in enumerate(lines)
+        if ITEM_RE.match(line) and needle.lower() in line.lower()
+    ]
+    if not matches:
+        fail(f'no todo item matches "{needle}"')
+    if len(matches) > 1:
+        listing = "\n".join(f"  {lines[i]}" for i in matches)
+        fail(f'"{needle}" matches {len(matches)} items — be more specific:\n{listing}')
+    return matches[0]
+
+
+def cmd_todo_add(args: argparse.Namespace) -> None:
+    text = args.text.strip()
+    if args.priority:
+        priority = args.priority.upper()
+        if not re.fullmatch(r"P\d", priority):
+            fail("--priority must look like P0/P1/P2")
+        text = f"[{priority}] {text}"
+    lines = read_lines(TODO)
+    lines = insert_todo_line(lines, args.section, text)
+    bump_updated(lines)
+    write_lines(TODO, lines)
+    print(f'added to {args.section}: - {text}')
+
+
+def cmd_todo_move(args: argparse.Namespace) -> None:
+    lines = read_lines(TODO)
+    index = find_todo_item(lines, args.match)
+    item = lines.pop(index)
+    lines = insert_todo_line(lines, args.to, ITEM_RE.match(item).group(1))
+    bump_updated(lines)
+    write_lines(TODO, lines)
+    print(f"moved to {args.to}: {item}")
+
+
+def append_done_line(text: str) -> str:
+    """Insert under today's `## YYYY-MM-DD` header (newest section at top)."""
+    project_match = re.match(r"^([\w-]+):\s*(.+)$", text)
+    entry = (
+        f"- **{project_match.group(1)}** — {project_match.group(2)}"
+        if project_match
+        else f"- {text}"
+    )
+
+    lines = read_lines(DONE)
+    header = f"## {today()}"
+
+    start = 0
+    if lines and lines[0].strip() == "---":
+        for i in range(1, len(lines)):
+            if lines[i].strip() == "---":
+                start = i + 1
+                break
+
+    first_h2 = None
+    for i in range(start, len(lines)):
+        if lines[i].startswith("## "):
+            first_h2 = i
+            break
+
+    if first_h2 is not None and lines[first_h2].strip() == header:
+        at = first_h2 + 1
+        if at < len(lines) and lines[at].strip() == "":
+            at += 1
+        lines.insert(at, entry)
+    else:
+        at = first_h2 if first_h2 is not None else len(lines)
+        lines[at:at] = [header, "", entry, ""]
+
+    bump_updated(lines)
+    write_lines(DONE, lines)
+    return entry
+
+
+def cmd_todo_complete(args: argparse.Namespace) -> None:
+    lines = read_lines(TODO)
+    index = find_todo_item(lines, args.match)
+    item = lines.pop(index)
+    bump_updated(lines)
+    write_lines(TODO, lines)
+    summary = re.sub(r"^\[P\d\]\s*", "", ITEM_RE.match(item).group(1))
+    entry = append_done_line(summary)
+    print(f"completed: {item}\nlogged: {entry}")
+
+
+def cmd_log_done(args: argparse.Namespace) -> None:
+    entry = append_done_line(args.text.strip())
+    print(f"logged: {entry}")
+
+
+def map_insert(slug: str, topic: str, hook: str) -> None:
+    lines = read_lines(MAP)
+    entry = f"- [[{slug}]] — {hook}"
+
+    # Prefer inserting after the last map line that links to a note in the
+    # same topic folder.
+    topic_slugs = {
+        p.stem
+        for p in (VAULT / topic).glob("*.md")
+        if p.stem != slug
+    } if (VAULT / topic).is_dir() else set()
+
+    last_topic_line = None
+    for i, line in enumerate(lines):
+        for m in WIKILINK_RE.finditer(line):
+            if m.group(1).strip() in topic_slugs:
+                last_topic_line = i
+    if last_topic_line is not None:
+        lines.insert(last_topic_line + 1, entry)
+        write_lines(MAP, lines)
+        return
+
+    # Otherwise create a topic section before "## Families" (or at EOF).
+    insert_at = len(lines)
+    for i, line in enumerate(lines):
+        if line.startswith("## Families"):
+            insert_at = i
+            break
+    block = [f"## {topic.capitalize()}", "", entry, ""]
+    lines[insert_at:insert_at] = block
+    write_lines(MAP, lines)
+
+
+def cmd_note_new(args: argparse.Namespace) -> None:
+    rel = args.path.strip().removesuffix(".md")
+    if "/" not in rel:
+        fail("path must look like <topic>/<slug>")
+    topic, slug = rel.rsplit("/", 1)
+    if not re.fullmatch(r"[a-z0-9-]+", slug):
+        fail("slug must be kebab-case")
+    if args.type not in NOTE_TYPES:
+        fail(f"--type must be one of {sorted(NOTE_TYPES)}")
+
+    target = VAULT / f"{rel}.md"
+    if target.exists():
+        fail(f"{target} already exists")
+
+    title = args.title or slug.replace("-", " ").title()
+    tags = [t.strip() for t in (args.tags or topic).split(",") if t.strip()]
+    body = (
+        "---\n"
+        f"type: {args.type}\n"
+        f"tags: [{', '.join(tags)}]\n"
+        f"created: {today()}\n"
+        f"updated: {today()}\n"
+        "---\n"
+        "\n"
+        f"# {title}\n"
+        "\n"
+    )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(body, encoding="utf-8")
+    map_insert(slug, topic, args.hook)
+    print(f"created {target.relative_to(VAULT.parent)}\nmap updated: [[{slug}]]")
+
+
+def read_registry() -> dict:
+    import json
+
+    if not AGENT_REGISTRY.exists():
+        return {}
+    try:
+        return json.loads(AGENT_REGISTRY.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def write_registry(registry: dict) -> None:
+    import json
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(
+        "w", dir="/tmp", suffix=".agent-registry", delete=False, encoding="utf-8"
+    ) as handle:
+        json.dump(registry, handle, indent=1)
+        temp_name = handle.name
+    Path(temp_name).rename(AGENT_REGISTRY)
+
+
+def now_iso() -> str:
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def cmd_agent_register(args: argparse.Namespace) -> None:
+    ticket = args.ticket.strip().upper()
+    if args.role not in AGENT_ROLES:
+        fail(f"--role must be one of {sorted(AGENT_ROLES)}")
+    if args.kind not in {"cdx", "cc"}:
+        fail("--kind must be cdx or cc")
+
+    registry = read_registry()
+    entry = registry.get(ticket, {"history": []})
+
+    current = entry.get("current")
+    if current:
+        current["ended_at"] = now_iso()
+        current["outcome"] = "handoff"
+        entry.setdefault("history", []).append(current)
+
+    entry["current"] = {
+        "window": args.window,
+        "kind": args.kind,
+        "role": args.role,
+        "model": args.model,
+        "worktree": args.worktree,
+        "log": args.log,
+        "orch": args.orch,
+        "session": len(entry.get("history", [])) + 1,
+        "spawned_at": now_iso(),
+    }
+    registry[ticket] = entry
+    write_registry(registry)
+    print(f"registered {ticket}: {args.kind} {args.role} session {entry['current']['session']} ({args.window})")
+
+
+def newest_archive_dir(ticket: str) -> Path | None:
+    ticket_dir = AGENT_ARCHIVE / ticket
+    if not ticket_dir.is_dir():
+        return None
+    sessions = sorted(
+        (d for d in ticket_dir.iterdir() if d.is_dir() and re.fullmatch(r"\d{8}-\d{6}", d.name)),
+        reverse=True,
+    )
+    return sessions[0] if sessions else None
+
+
+def persist_outcome(ticket: str, outcome: str | None, entry: dict | None = None) -> Path | None:
+    import json
+
+    session_dir = newest_archive_dir(ticket)
+    if session_dir is None:
+        return None
+    meta_path = session_dir / "meta.json"
+    meta = {}
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        pass
+    if outcome:
+        meta["outcome"] = outcome
+    meta["ended_at"] = now_iso()
+    if entry:
+        meta["worker"] = entry.get("current")
+        meta["history"] = entry.get("history", [])
+    meta_path.write_text(json.dumps(meta, indent=1) + "\n", encoding="utf-8")
+    return meta_path
+
+
+def cmd_agent_done(args: argparse.Namespace) -> None:
+    ticket = args.ticket.strip().upper()
+    if args.outcome and args.outcome not in AGENT_OUTCOMES:
+        fail(f"--outcome must be one of {sorted(AGENT_OUTCOMES)}")
+    registry = read_registry()
+    if ticket not in registry:
+        fail(f"{ticket} not in registry")
+    entry = registry[ticket]
+    del registry[ticket]
+    write_registry(registry)
+    meta_path = persist_outcome(ticket, args.outcome, entry)
+    line = f"deregistered {ticket}" + (f" (outcome: {args.outcome})" if args.outcome else "")
+    if meta_path:
+        line += f"; persisted {meta_path}"
+    else:
+        line += "; WARNING: no archive dir found — archive BEFORE `wiki agent done` so outcome persists"
+    print(line)
+
+
+def cmd_agent_update(args: argparse.Namespace) -> None:
+    ticket = args.ticket.strip().upper()
+    registry = read_registry()
+    entry = registry.get(ticket)
+    if not entry or not entry.get("current"):
+        fail(f"{ticket} not in registry")
+    current = entry["current"]
+    fields = ("window", "kind", "role", "model", "worktree", "log", "orch")
+    changed = []
+    for field in fields:
+        value = getattr(args, field)
+        if value is not None:
+            current[field] = value
+            changed.append(field)
+    if not changed:
+        fail("nothing to update — pass at least one of " + ", ".join(f"--{f}" for f in fields))
+    if current.get("role") is not None and current["role"] not in AGENT_ROLES:
+        fail(f"--role must be one of {sorted(AGENT_ROLES)}")
+    write_registry(registry)
+    print(f"updated {ticket}: " + ", ".join(f"{f}={current[f]}" for f in changed))
+
+
+def cmd_agent_orch(args: argparse.Namespace) -> None:
+    import json
+    import os
+
+    orch_id = args.id.strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", orch_id):
+        fail("orch id must be alphanumeric/dash/underscore")
+    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    cwd = Path.cwd()
+    transcript = None
+    if session_id:
+        escaped = str(cwd).replace("/", "-").replace(".", "-")
+        candidate = Path.home() / ".claude" / "projects" / escaped / f"{session_id}.jsonl"
+        transcript = str(candidate)
+    registry = read_registry()
+    orchs = registry.setdefault("_orchestrators", {})
+    orchs[orch_id] = {
+        "window": args.window,
+        "cwd": str(cwd),
+        "session_id": session_id,
+        "transcript": transcript,
+        "spawned_at": now_iso(),
+    }
+    write_registry(registry)
+    note = transcript if transcript else "WARNING: CLAUDE_CODE_SESSION_ID not set — no transcript mapping"
+    print(f"orchestrator {orch_id} registered ({note})")
+
+
+def cmd_agent_orch_done(args: argparse.Namespace) -> None:
+    orch_id = args.id.strip()
+    registry = read_registry()
+    orchs = registry.get("_orchestrators", {})
+    if orch_id not in orchs:
+        fail(f"{orch_id} not registered")
+    del orchs[orch_id]
+    write_registry(registry)
+    print(f"orchestrator {orch_id} deregistered")
+
+
+def cmd_agent_outcome(args: argparse.Namespace) -> None:
+    ticket = args.ticket.strip().upper()
+    if args.outcome not in AGENT_OUTCOMES:
+        fail(f"outcome must be one of {sorted(AGENT_OUTCOMES)}")
+    meta_path = persist_outcome(ticket, args.outcome)
+    if meta_path is None:
+        fail(f"no archive dir for {ticket} under {AGENT_ARCHIVE}")
+    print(f"marked {ticket} {args.outcome} ({meta_path})")
+
+
+def cmd_agent_list(_args: argparse.Namespace) -> None:
+    registry = read_registry()
+    if not registry:
+        print("no registered agents")
+        return
+    for orch_id, orch in sorted(registry.get("_orchestrators", {}).items()):
+        print(f"[orch] {orch_id}: {orch.get('window', '?')} {orch.get('cwd', '?')}")
+    for ticket, entry in sorted(registry.items()):
+        if ticket.startswith("_"):
+            continue
+        current = entry.get("current") or {}
+        sessions = len(entry.get("history", [])) + (1 if current else 0)
+        print(
+            f"{ticket}: {current.get('kind', '?')} {current.get('role', '?')} "
+            f"{current.get('window', '?')} (session {current.get('session', '?')}/{sessions})"
+        )
+
+
+def cmd_note_rename(args: argparse.Namespace) -> None:
+    old = args.old.removesuffix(".md") + ".md"
+    new = args.new.removesuffix(".md") + ".md"
+    try:
+        changed = vaultops.rename_note(VAULT, old, new)
+    except vaultops.VaultOpError as exc:
+        fail(str(exc))
+    print(f"renamed {old} -> {new}")
+    if len(changed) > 1:
+        print("wikilinks rewritten in: " + ", ".join(changed[1:]))
+
+
+def cmd_note_delete(args: argparse.Namespace) -> None:
+    rel = args.path.removesuffix(".md") + ".md"
+    try:
+        changed = vaultops.delete_note(VAULT, rel)
+    except vaultops.VaultOpError as exc:
+        fail(str(exc))
+    print(f"deleted {rel}" + (" (map line pruned)" if "map.md" in changed else ""))
+
+
+def parse_frontmatter(lines: list[str]) -> dict[str, str] | None:
+    if not lines or lines[0].strip() != "---":
+        return None
+    fields: dict[str, str] = {}
+    for line in lines[1:]:
+        if line.strip() == "---":
+            return fields
+        if ":" in line and not line.startswith((" ", "\t")):
+            key, _, value = line.partition(":")
+            fields[key.strip()] = value.strip()
+    return None
+
+
+def cmd_lint(_args: argparse.Namespace) -> None:
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    notes = {
+        p.relative_to(VAULT).as_posix(): p.read_text(encoding="utf-8")
+        for p in sorted(VAULT.rglob("*.md"))
+        if ".obsidian" not in p.parts
+    }
+
+    # Frontmatter
+    for rel, content in notes.items():
+        name = Path(rel).name
+        if name in FRONTMATTER_EXEMPT or rel.startswith("log/") and re.fullmatch(
+            r"log/\d{4}-\d{2}-\d{2}\.md", rel
+        ):
+            continue
+        fm = parse_frontmatter(content.split("\n"))
+        if fm is None:
+            errors.append(f"{rel}: missing frontmatter")
+            continue
+        for key in FRONTMATTER_KEYS:
+            if key not in fm:
+                errors.append(f"{rel}: frontmatter missing `{key}`")
+        if fm.get("type") and fm["type"] not in NOTE_TYPES:
+            errors.append(f"{rel}: unknown type `{fm['type']}`")
+        for key in ("created", "updated"):
+            value = fm.get(key, "")
+            if value and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+                errors.append(f"{rel}: `{key}` not YYYY-MM-DD")
+
+    # Map completeness (both directions). Families (log/, <topic>/til|decisions|
+    # features|specs/) are covered by pattern lines, not per-file entries.
+    family_re = re.compile(r"^(log/|[^/]+/(til|decisions|features|specs)/)")
+    map_content = notes.get("map.md", "")
+    map_slugs = {m.group(1).strip() for m in WIKILINK_RE.finditer(map_content)}
+    all_slugs = {Path(rel).stem: rel for rel in notes}
+    for rel in notes:
+        if rel == "map.md" or family_re.match(rel):
+            continue
+        if Path(rel).stem not in map_slugs:
+            errors.append(f"map.md: missing entry for {rel}")
+    for slug in map_slugs:
+        if slug not in all_slugs:
+            errors.append(f"map.md: [[{slug}]] points at no note")
+
+    # todo.md shape
+    todo_rel = "todo.md"
+    if todo_rel in notes:
+        in_fm = False
+        for i, line in enumerate(notes[todo_rel].split("\n"), start=1):
+            stripped = line.strip()
+            if i == 1 and stripped == "---":
+                in_fm = True
+                continue
+            if in_fm:
+                if stripped == "---":
+                    in_fm = False
+                continue
+            if not stripped or SECTION_RE.match(line) or ITEM_RE.match(line):
+                continue
+            errors.append(f"todo.md:{i}: unexpected line: {line!r}")
+
+    # done.md shape
+    done_rel = "log/done.md"
+    if done_rel in notes:
+        body_started = False
+        in_fm = False
+        for i, line in enumerate(notes[done_rel].split("\n"), start=1):
+            stripped = line.strip()
+            if i == 1 and stripped == "---":
+                in_fm = True
+                continue
+            if in_fm:
+                if stripped == "---":
+                    in_fm = False
+                continue
+            if not stripped or stripped.startswith("#"):
+                continue
+            body_started = True
+            # Two sanctioned shapes: flat dated lines, or `- entry` under a
+            # `## YYYY-MM-DD` heading.
+            if not stripped.startswith("- "):
+                errors.append(f"log/done.md:{i}: bad entry format: {line!r}")
+        if not body_started:
+            warnings.append("log/done.md: no entries")
+
+    # Unresolved wikilinks (warning — an unresolved link marks a future note)
+    for rel, content in notes.items():
+        for m in WIKILINK_RE.finditer(strip_code(content)):
+            slug = m.group(1).strip()
+            if slug not in all_slugs:
+                warnings.append(f"{rel}: unresolved [[{slug}]]")
+
+    for warning in sorted(set(warnings)):
+        print(f"warn: {warning}")
+    for error in errors:
+        print(f"ERROR: {error}")
+    if errors:
+        print(f"\n{len(errors)} error(s), {len(set(warnings))} warning(s)")
+        sys.exit(1)
+    print(f"vault clean — 0 errors, {len(set(warnings))} warning(s)")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(prog="wiki", description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    todo = sub.add_parser("todo", help="todo.md operations")
+    todo_sub = todo.add_subparsers(dest="todo_command", required=True)
+
+    add = todo_sub.add_parser("add", help="add an item")
+    add.add_argument("text")
+    add.add_argument("--priority", help="P0/P1/P2 — prepended as [Pn]")
+    add.add_argument("--section", default="Todo", help='default "Todo"')
+    add.set_defaults(func=cmd_todo_add)
+
+    move = todo_sub.add_parser("move", help="move an item between sections")
+    move.add_argument("match", help="unique substring of the item")
+    move.add_argument("--to", required=True, help="target section")
+    move.set_defaults(func=cmd_todo_move)
+
+    complete = todo_sub.add_parser("complete", help="remove item + log to done.md")
+    complete.add_argument("match", help="unique substring of the item")
+    complete.set_defaults(func=cmd_todo_complete)
+
+    log_done = sub.add_parser("log-done", help="append a dated line to log/done.md")
+    log_done.add_argument("text")
+    log_done.set_defaults(func=cmd_log_done)
+
+    note = sub.add_parser("note", help="note operations")
+    note_sub = note.add_subparsers(dest="note_command", required=True)
+    new = note_sub.add_parser("new", help="create note with frontmatter + map entry")
+    new.add_argument("path", help="<topic>/<slug> (no .md)")
+    new.add_argument("--type", required=True, help="|".join(sorted(NOTE_TYPES)))
+    new.add_argument("--hook", required=True, help="one-line map.md hook")
+    new.add_argument("--title")
+    new.add_argument("--tags", help="comma-separated; defaults to topic")
+    new.set_defaults(func=cmd_note_new)
+
+    rename = note_sub.add_parser(
+        "rename", help="move/rename note; rewrites [[wikilinks]] + map.md if slug changes"
+    )
+    rename.add_argument("old", help="current <topic>/<slug>")
+    rename.add_argument("new", help="new <topic>/<slug>")
+    rename.set_defaults(func=cmd_note_rename)
+
+    delete = note_sub.add_parser("delete", help="hard-delete note + prune map line (git = undo)")
+    delete.add_argument("path", help="<topic>/<slug>")
+    delete.set_defaults(func=cmd_note_delete)
+
+    agent = sub.add_parser("agent", help="worker registry ops (/tmp/agent-registry.json)")
+    agent_sub = agent.add_subparsers(dest="agent_command", required=True)
+
+    register = agent_sub.add_parser(
+        "register", help="register a worker at spawn; re-register = handoff (archives prior session)"
+    )
+    register.add_argument("ticket")
+    register.add_argument("--window", required=True, help="tmux window_id, e.g. @327")
+    register.add_argument("--kind", required=True, help="cdx | cc")
+    register.add_argument("--role", default="implement", help="plan | implement | review")
+    register.add_argument("--model")
+    register.add_argument("--worktree")
+    register.add_argument("--log", help="/tmp pane log path")
+    register.add_argument("--orch", help="owning orchestrator id (see `agent orch`)")
+    register.set_defaults(func=cmd_agent_register)
+
+    update = agent_sub.add_parser(
+        "update", help="mutate a live worker's fields in place (no handoff/session bump — use for orch retrofits etc.)"
+    )
+    update.add_argument("ticket")
+    update.add_argument("--window")
+    update.add_argument("--kind")
+    update.add_argument("--role")
+    update.add_argument("--model")
+    update.add_argument("--worktree")
+    update.add_argument("--log")
+    update.add_argument("--orch")
+    update.set_defaults(func=cmd_agent_update)
+
+    orch = agent_sub.add_parser("orch", help="register THIS Claude session as an orchestrator (reads CLAUDE_CODE_SESSION_ID)")
+    orch.add_argument("id", help="short label, e.g. phoebe")
+    orch.add_argument("--window", help="tmux window_id of the orchestrator, e.g. @120")
+    orch.set_defaults(func=cmd_agent_orch)
+
+    orch_done = agent_sub.add_parser("orch-done", help="deregister an orchestrator at session end")
+    orch_done.add_argument("id")
+    orch_done.set_defaults(func=cmd_agent_orch_done)
+
+    done = agent_sub.add_parser("done", help="deregister at wrap-up (run AFTER archiving so outcome persists)")
+    done.add_argument("ticket")
+    done.add_argument("--outcome", help="merged | closed | plan-ready | abandoned")
+    done.set_defaults(func=cmd_agent_done)
+
+    outcome = agent_sub.add_parser("outcome", help="mark an archived ticket's outcome after the fact")
+    outcome.add_argument("ticket")
+    outcome.add_argument("outcome", help="merged | closed | plan-ready | abandoned")
+    outcome.set_defaults(func=cmd_agent_outcome)
+
+    agent_list = agent_sub.add_parser("list", help="print registered workers")
+    agent_list.set_defaults(func=cmd_agent_list)
+
+    lint = sub.add_parser("lint", help="validate vault conventions")
+    lint.set_defaults(func=cmd_lint)
+
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

@@ -30,6 +30,194 @@ export function searchNotes(query: string) {
   return request<NoteSummary[]>(`/api/notes?q=${encodeURIComponent(query)}`);
 }
 
+export function renameNote(path: string, newPath: string) {
+  return request<{ path: string; changed: string[] }>("/api/rename", {
+    method: "POST",
+    body: JSON.stringify({ path, new_path: newPath })
+  });
+}
+
+export function deleteNote(path: string) {
+  return request<{ deleted: string; changed: string[] }>(
+    `/api/notes/${encodeNotePath(path)}`,
+    { method: "DELETE" }
+  );
+}
+
+export type NoteLinks = {
+  outgoing: string[];
+  incoming: string[];
+  unresolved: string[];
+};
+
+export function getLinks() {
+  return request<Record<string, NoteLinks>>("/api/links");
+}
+
+export type AgentSession = {
+  window: string | null;
+  kind: string | null;
+  role: string | null;
+  model: string | null;
+  session: number | null;
+  spawned_at: string | null;
+  ended_at?: string;
+  outcome?: string;
+};
+
+export type AgentWorker = AgentSession & {
+  ticket: string;
+  registered: boolean;
+  window_alive: boolean;
+  worktree: string | null;
+  log: string | null;
+  orch: string | null;
+  history: AgentSession[];
+  state: string | null;
+  pr: string | null;
+  step: string | null;
+  blocker: string | null;
+  status_age_seconds: number | null;
+};
+
+export type ArchivedWorker = {
+  ticket: string;
+  archived_at: string;
+  kind: string | null;
+  role: string | null;
+  model: string | null;
+  outcome: string | null;
+  state: string | null;
+  pr: string | null;
+  step: string | null;
+};
+
+export type Orchestrator = {
+  id: string;
+  window: string | null;
+  window_alive: boolean;
+  cwd: string | null;
+  spawned_at: string | null;
+  transcript_exists: boolean;
+};
+
+export function getAgents() {
+  return request<{
+    workers: AgentWorker[];
+    orchestrators: Orchestrator[];
+    archived: ArchivedWorker[];
+  }>("/api/agents");
+}
+
+export type SessionTool = {
+  name: string;
+  input: string;
+  output: string | null;
+  ok: boolean | null;
+  archetype: string;
+  summary: string;
+  agent_id?: string;
+};
+
+export type SessionEvent = {
+  kind:
+    | "user"
+    | "assistant"
+    | "thinking"
+    | "tool"
+    | "terminal"
+    | "notification"
+    | "command"
+    | "image";
+  ts: string | null;
+  text: string;
+  tool?: SessionTool;
+};
+
+export type SubagentInfo = {
+  id: string;
+  active: boolean;
+  head: string;
+};
+
+export type AgentSessionData = {
+  format: "codex" | "claude";
+  path: string;
+  tokens: number | null;
+  from: number;
+  total: number;
+  events: SessionEvent[];
+  subagents?: SubagentInfo[];
+  working?: boolean;
+};
+
+export type QueuedMessage = { text: string; queued_at: string };
+
+export function sendAgentMessage(ticket: string, text: string, mode: "now" | "on-idle") {
+  return request<{ status: string }>(`/api/agents/${encodeURIComponent(ticket)}/message`, {
+    method: "POST",
+    body: JSON.stringify({ text, mode }),
+  });
+}
+
+export function getAgentQueue(ticket: string) {
+  return request<{ messages: QueuedMessage[] }>(
+    `/api/agents/${encodeURIComponent(ticket)}/queue`
+  );
+}
+
+export function cancelQueuedMessage(ticket: string, index: number) {
+  return request<{ messages: QueuedMessage[] }>(
+    `/api/agents/${encodeURIComponent(ticket)}/queue/${index}`,
+    { method: "DELETE" }
+  );
+}
+
+export function getAgentSession(ticket: string, after = 0) {
+  return request<AgentSessionData>(
+    `/api/agents/${encodeURIComponent(ticket)}/session?after=${after}`
+  );
+}
+
+export type SkillInfo = { name: string; description: string };
+
+export function getSkills() {
+  return request<{ skills: SkillInfo[] }>("/api/skills");
+}
+
+export function uploadImage(mediaType: string, base64: string) {
+  return request<{ path: string; url: string }>("/api/upload", {
+    method: "POST",
+    body: JSON.stringify({ media_type: mediaType, data: base64 }),
+  });
+}
+
+export function getSubagentSession(ticket: string, agentId: string, after = 0) {
+  return request<AgentSessionData>(
+    `/api/agents/${encodeURIComponent(ticket)}/subagents/${encodeURIComponent(agentId)}/session?after=${after}`
+  );
+}
+
+export type ActivityFile = {
+  path: string;
+  status: string;
+};
+
+export type ActivityCommit = {
+  sha: string;
+  date: string;
+  message: string;
+  files: ActivityFile[];
+};
+
+export function getActivity(limit = 50) {
+  return request<ActivityCommit[]>(`/api/activity?limit=${limit}`);
+}
+
+export function getActivityDiff(sha: string) {
+  return request<{ patch: string }>(`/api/activity/${sha}`);
+}
+
 export function getNote(path: string) {
   return request<Note>(`/api/notes/${encodeNotePath(path)}`);
 }
