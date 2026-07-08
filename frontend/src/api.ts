@@ -109,6 +109,34 @@ export function getAgents() {
   }>("/api/agents");
 }
 
+export type SpawnWorkerKind = "cdx" | "cc";
+export type SpawnWorkerRole = "plan" | "implement" | "review";
+export type SpawnWorkerEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
+
+export type SpawnWorkerInput = {
+  ticket: string;
+  kind: SpawnWorkerKind;
+  role: SpawnWorkerRole;
+  model: string;
+  effort: SpawnWorkerEffort | null;
+  workdir: string;
+  orch: string | null;
+  prompt: string;
+};
+
+export type SpawnWorkerResult = {
+  window: string;
+  log: string;
+  prompt_path: string;
+};
+
+export function spawnAgentWorker(body: SpawnWorkerInput) {
+  return request<SpawnWorkerResult>("/api/agents/spawn", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
 export type SessionTool = {
   name: string;
   input: string;
