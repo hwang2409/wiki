@@ -1,5 +1,6 @@
 import {
   useEffect,
+  useCallback,
   useRef,
   useState,
   type PointerEvent as ReactPointerEvent,
@@ -157,10 +158,14 @@ export function AgentSessionSurface({
   const [panel, setPanel] = useState<SidePanelState>(
     initialPanel === "review" && canReview ? { kind: "review" } : null
   );
+  const inspectSubagent = useCallback(
+    (subagent: string) => setPanel({ kind: "subagent", subagent }),
+    []
+  );
 
   useEffect(() => {
     setPanel(initialPanel === "review" && canReview ? { kind: "review" } : null);
-  }, [canReview, initialPanel, worker.ticket]);
+  }, [initialPanel, worker.ticket]);
 
   useEffect(() => {
     if (!canReview && panel?.kind === "review") setPanel(null);
@@ -230,11 +235,7 @@ export function AgentSessionSurface({
           ) : null}
         </header>
         <div className="agent-session-surface-main">
-          <SessionTab
-            ticket={worker.ticket}
-            tick={tick}
-            onInspect={(subagent) => setPanel({ kind: "subagent", subagent })}
-          />
+          <SessionTab ticket={worker.ticket} tick={tick} onInspect={inspectSubagent} />
         </div>
       </section>
       {panel?.kind === "review" ? (

@@ -2012,7 +2012,7 @@ export default function App() {
           ) : mode === "agent" && agentTicket ? (
             <AgentSessionView
               initialPanel={agentPanel}
-              key={`${agentTicket}:${agentPanel ?? "session"}`}
+              key={agentTicket}
               refreshTick={refreshTick}
               worker={activeAgentWorker ?? { ticket: agentTicket }}
             />
