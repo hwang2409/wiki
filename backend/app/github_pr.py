@@ -14,6 +14,7 @@ AGENT_REGISTRY_PATH = Path("/tmp/agent-registry.json")
 AGENT_STATUS_DIR = Path("/tmp/agent-status")
 PR_CACHE_TTL_SECONDS = 20
 PR_URL_HOSTS = {"github.com", "www.github.com"}
+DEFAULT_GITHUB_REPO = "hwang2409/wiki"
 REVIEW_THREADS_QUERY = """
 query ReviewThreads($url: URI!, $endCursor: String) {
   resource(url: $url) {
@@ -69,19 +70,77 @@ def _normalize_pr_url(value: Any) -> str | None:
     return f"https://github.com/{parts[0]}/{parts[1]}/pull/{parts[3]}"
 
 
-def resolve_pr_url(ticket: str) -> str | None:
-    registry = _read_json(AGENT_REGISTRY_PATH) or {}
+def _github_repo_from_url(value: str) -> str | None:
+    parsed = urlparse(value)
+    if parsed.netloc.lower() not in PR_URL_HOSTS:
+        return None
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) < 2:
+        return None
+    return f"{parts[0]}/{parts[1]}"
+
+
+def _github_repo_from_remote(value: str) -> str | None:
+    raw = value.strip()
+    if not raw:
+        return None
+    if raw.startswith("git@github.com:"):
+        path = raw.split(":", 1)[1]
+    elif raw.startswith("ssh://git@github.com/") or raw.startswith("https://github.com/"):
+        path = urlparse(raw).path.lstrip("/")
+    else:
+        return None
+    parts = [part for part in path.removesuffix(".git").split("/") if part]
+    if len(parts) < 2:
+        return None
+    return f"{parts[0]}/{parts[1]}"
+
+
+def _expected_repo(ticket: str, registry: dict[str, Any]) -> str:
     current = (registry.get(ticket) or {}).get("current") or {}
+    worktree = current.get("worktree")
+    if isinstance(worktree, str) and worktree.strip():
+        try:
+            result = subprocess.run(
+                ["git", "-C", worktree, "remote", "get-url", "origin"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            result = None
+        if result and result.returncode == 0:
+            repo = _github_repo_from_remote(result.stdout.strip())
+            if repo:
+                return repo
+    return DEFAULT_GITHUB_REPO
+
+
+def resolve_pr(ticket: str) -> tuple[str, str] | None:
+    registry = _read_json(AGENT_REGISTRY_PATH) or {}
     status = _read_json(AGENT_STATUS_DIR / f"{ticket}.json") or {}
+    expected_repo = _expected_repo(ticket, registry)
     candidates = [
         status.get("pr"),
-        current.get("pr"),
+        ((registry.get(ticket) or {}).get("current") or {}).get("pr"),
         (registry.get(ticket) or {}).get("pr"),
     ]
+    mismatched_repos: set[str] = set()
     for candidate in candidates:
         url = _normalize_pr_url(candidate)
-        if url:
-            return url
+        if not url:
+            continue
+        repo = _github_repo_from_url(url)
+        if repo == expected_repo:
+            return (url, expected_repo)
+        if repo:
+            mismatched_repos.add(repo)
+    if mismatched_repos:
+        found = ", ".join(sorted(mismatched_repos))
+        raise HTTPException(
+            status_code=400,
+            detail=f"PR repo mismatch: expected {expected_repo}, got {found}",
+        )
     return None
 
 
@@ -152,9 +211,9 @@ def _fetch_unresolved_threads(pr_url: str) -> list[dict[str, Any]]:
     threads: list[dict[str, Any]] = []
     cursor: str | None = None
     while True:
-        args = ["api", "graphql", "-f", f"query={REVIEW_THREADS_QUERY}", "-F", f"url={pr_url}"]
+        args = ["api", "graphql", "-f", f"query={REVIEW_THREADS_QUERY}", "-f", f"url={pr_url}"]
         if cursor:
-            args.extend(["-F", f"endCursor={cursor}"])
+            args.extend(["-f", f"endCursor={cursor}"])
         payload = _run_gh_json(args, timeout=30)
         resource = ((payload or {}).get("data") or {}).get("resource") or {}
         connection = resource.get("reviewThreads") or {}
@@ -181,7 +240,7 @@ def _fetch_unresolved_threads(pr_url: str) -> list[dict[str, Any]]:
     return threads
 
 
-def _fetch_pr_payload(pr_url: str) -> dict[str, Any]:
+def _fetch_pr_payload(pr_url: str, repo: str) -> dict[str, Any]:
     view = _run_gh_json(
         [
             "pr",
@@ -210,6 +269,7 @@ def _fetch_pr_payload(pr_url: str) -> dict[str, Any]:
     threads = _fetch_unresolved_threads(pr_url)
     return {
         "url": view.get("url") or pr_url,
+        "repo": repo,
         "title": view.get("title") or pr_url,
         "state": view.get("state"),
         "mergeable": view.get("mergeable"),
@@ -234,20 +294,21 @@ def get_pr_payload(ticket: str) -> dict[str, Any]:
             raise HTTPException(status_code=404, detail="No PR found for this agent")
         return payload
 
-    pr_url = resolve_pr_url(ticket)
-    if not pr_url:
+    resolved = resolve_pr(ticket)
+    if not resolved:
         _pr_cache[ticket] = (now, {"missing": True})
         raise HTTPException(status_code=404, detail="No PR found for this agent")
-
-    payload = _fetch_pr_payload(pr_url)
+    pr_url, repo = resolved
+    payload = _fetch_pr_payload(pr_url, repo)
     _pr_cache[ticket] = (now, payload)
     return payload
 
 
 def approve_pr(ticket: str) -> dict[str, str]:
-    pr_url = resolve_pr_url(ticket)
-    if not pr_url:
+    resolved = resolve_pr(ticket)
+    if not resolved:
         raise HTTPException(status_code=404, detail="No PR found for this agent")
+    pr_url, _repo = resolved
     _run_gh(["pr", "review", pr_url, "--approve"], timeout=30)
     _pr_cache.pop(ticket, None)
     return {"status": "approved"}

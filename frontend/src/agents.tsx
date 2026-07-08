@@ -221,7 +221,7 @@ export function AgentsView({
                   type="button"
                   onClick={() => {
                     setOpenPanel("session");
-                    onOpenTicket(isOpen ? null : worker.ticket);
+                    onOpenTicket(isOpen && openPanel === "session" ? null : worker.ticket);
                   }}
                 >
                   <ScrollText size={13} />

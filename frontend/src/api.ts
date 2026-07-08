@@ -179,6 +179,7 @@ export type AgentPrThread = {
 
 export type AgentPrData = {
   url: string;
+  repo: string;
   title: string;
   state: string | null;
   mergeable: string | null;

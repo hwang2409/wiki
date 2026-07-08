@@ -132,6 +132,7 @@ export function AgentPrReviewPanel({
             </span>
           ) : confirming ? (
             <>
+              <span className="pr-review-pill">{data.repo}</span>
               <button
                 className="pr-review-action is-strong"
                 disabled={submitting}
@@ -139,7 +140,7 @@ export function AgentPrReviewPanel({
                 onClick={() => void approve()}
               >
                 <ShieldCheck size={12} />
-                {submitting ? "approving…" : "confirm approve"}
+                {submitting ? "approving…" : `confirm approve ${data.repo}`}
               </button>
               <button
                 className="pr-review-action"
