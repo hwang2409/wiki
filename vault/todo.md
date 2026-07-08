@@ -20,7 +20,6 @@ In Progress:
 - [PR #10475](https://github.com/phoebe-health/phoebe/pull/10475): subagent recommendation parity iteration (harness #10692) — cdx:PR-10475 worker; overfitting watch
 - [PHO-13251](https://linear.app/phoebework/issue/PHO-13251): cross-org feature-adoption read tool (3x demand-validated) — cdx:PHO-13251 worker
 - [P1] WIKI-31: transcript virtualization — <6k DOM nodes, WebKit scroll p95 <16ms (owner: cdx:WIKI-31)
-- [P1] WIKI-33: cold paths — async tokens cache, sidecar onedir eval, graph RAF pause (owner: cdx:WIKI-33)
 
 Backlog:
 

@@ -42,6 +42,7 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 ## Tools/til
 
 - [[wiki-native-bundle-hardened-runtime-parent-watchdog]] — Tauri Wiki.app with a PyInstaller onefile sidecar needs hardenedRuntime false and a parent-pid watchdog on macOS.
+- [[wiki-native-onedir-sidecar-startup]] — PyInstaller onedir sidecar with a bundled resource folder + exec wrapper drops steady-state Wiki backend startup to ~0.32-0.36s vs ~4.6-5.5s onefile; first post-build launch can still pay ~5.3s.
 - [[wiki-native-tauri-dragdrop-html5]] — Tauri webview drag-drop handler kills HTML5 DnD — check before debugging dead drags in any Tauri app
 
 ## Families (path patterns, not enumerated)

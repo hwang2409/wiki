@@ -9,6 +9,7 @@ updated: 2026-07-08
 
 ## 2026-07-08
 
+- **WIKI-33** — cold paths — async tokens cache, sidecar onedir eval, graph RAF pause (owner: cdx:WIKI-33)
 - **WIKI-28** — external links open in default browser (web target=_blank audit + tauri opener/on_navigation) (owner: cdx:WIKI-28)
 - **WIKI-30** — performance audit — why is the app sluggish; measured bottlenecks + ranked fix plan (owner: cdx:WIKI-30, investigation)
 - **WIKI-29** — C-a leader must override composer insert mode — prefix chords (C-a 9 etc.) intercept at capture phase regardless of vim/chatbox state, like native tmux
