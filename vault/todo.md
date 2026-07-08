@@ -9,6 +9,7 @@ updated: 2026-07-08
 Todo:
 
 - [P1] WIKI-24: window-switch state preservation — composer draft, open subagent/review panel, scroll survive N->J->N window switches (inactive windows unmount today; keep mounted-hidden or externalize per-pane state). Repeated pain: in-progress prompts lost when cross-referencing another session
+- [P1] WIKI-29: C-a leader must override composer insert mode — prefix chords (C-a 9 etc.) intercept at capture phase regardless of vim/chatbox state, like native tmux
 
 In Progress:
 
