@@ -17,7 +17,6 @@ In Progress:
 - [PHO-11274](https://linear.app/phoebework/issue/PHO-11274): compare_agent_runs trace comparison (audit-validated P1) — cdx:PHO-11274 worker
 - [PHO-13216](https://linear.app/phoebework/issue/PHO-13216): Core data products T2 (dossier+funnel+MCP mirrors) — cdx:PHO-13216 worker
 - [PHO-13227](https://linear.app/phoebework/issue/PHO-13227): subagent approval inheritance (13226 T2) — cdx:PHO-13227 worker
-- [PHO-13231](https://linear.app/phoebework/issue/PHO-13231): search_run_data flood regression test (polish) — cdx:PHO-13231 worker (mini)
 - [P2] WIKI-21: /tokens page — usage over time, cli/model filters, cached-split, incremental scan cache (owner: cc:WIKI-21)
 - [P1] WIKI-22: pane focus remount bug — stable pane identity, focus as prop (owner: cdx:WIKI-22)
 
