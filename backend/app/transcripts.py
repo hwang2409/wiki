@@ -2,8 +2,12 @@
 
 Formats are unversioned internals — parsers are defensive, unknown rows are skipped.
 Normalized event:
-  {"kind": "user"|"assistant"|"thinking"|"tool", "ts": str|None, "text": str,
-   "tool": {"name", "input", "output", "ok"} (kind=tool only)}
+  {"kind": "user"|"assistant"|"thinking"|"tool"|"tasks"|"interrupt"|"pr"|"marker",
+   "ts": str|None, "text": str,
+   "tool": {"name", "input", "output", "ok"} (kind=tool only),
+   "tasks": [{id, subject, status, blockedBy}] (kind=tasks only),
+   "pr":   {number, url}                     (kind=pr only),
+   "marker": str                             (kind=marker only)}
 """
 
 from __future__ import annotations
@@ -340,6 +344,47 @@ def _codex_tool_input(name: str, arguments: object) -> str:
     return _clip(str(arguments), MAX_TOOL_IO)
 
 
+def _codex_tool_end_output(ptype: str, payload: dict) -> tuple[str, bool | None]:
+    """patch_apply_end / mcp_tool_call_end carry the authoritative tool output
+    the corresponding function_call/custom_tool_call left `output: null`."""
+    if ptype == "patch_apply_end":
+        parts = [payload.get("stdout") or "", payload.get("stderr") or ""]
+        return "\n".join(p for p in parts if p), bool(payload.get("success"))
+    if ptype == "mcp_tool_call_end":
+        result = payload.get("result") or {}
+        if not isinstance(result, dict):
+            return str(result), None
+        ok_side, err_side = result.get("Ok"), result.get("Err")
+        target = ok_side if ok_side is not None else err_side
+        ok = ok_side is not None and err_side is None
+        if isinstance(target, dict):
+            content = target.get("content")
+            if isinstance(content, list):
+                text = "\n".join(
+                    c.get("text", "")
+                    for c in content
+                    if isinstance(c, dict) and c.get("type") == "text"
+                )
+                return text or json.dumps(target), ok
+            return json.dumps(target), ok
+        return str(target if target is not None else result), ok
+    return json.dumps(payload), None
+
+
+def _seen_msg(state: dict, role: str, text: str) -> bool:
+    """Codex live sessions emit BOTH event_msg user_message/agent_message AND
+    response_item/message with identical text — dedupe by (role, text-head)."""
+    key = (role, text[:400])
+    seen: dict = state.setdefault("seen_msgs", {})
+    if key in seen:
+        return True
+    seen[key] = True
+    if len(seen) > 500:
+        for old in list(seen.keys())[:250]:
+            del seen[old]
+    return False
+
+
 def _codex_apply(state: dict, row: dict) -> None:
     events: list = state["events"]
     pending: dict = state["pending"]  # call_id → event (awaiting output)
@@ -350,9 +395,13 @@ def _codex_apply(state: dict, row: dict) -> None:
 
     if rtype == "event_msg":
         if ptype == "user_message":
-            events.append({"kind": "user", "ts": ts, "text": _clip(payload.get("message") or "", MAX_TEXT)})
+            text = _clip(payload.get("message") or "", MAX_TEXT)
+            if text and not _seen_msg(state, "user", text):
+                events.append({"kind": "user", "ts": ts, "text": text})
         elif ptype == "agent_message":
-            events.append({"kind": "assistant", "ts": ts, "text": _clip(payload.get("message") or "", MAX_TEXT)})
+            text = _clip(payload.get("message") or "", MAX_TEXT)
+            if text and not _seen_msg(state, "assistant", text):
+                events.append({"kind": "assistant", "ts": ts, "text": text})
         elif ptype == "token_count":
             info = payload.get("info") or {}
             total = (info.get("total_token_usage") or {}).get("total_tokens")
@@ -360,8 +409,35 @@ def _codex_apply(state: dict, row: dict) -> None:
                 state["tokens"] = total
         elif ptype == "context_compacted":
             events.append({"kind": "thinking", "ts": ts, "text": "context compacted"})
+        elif ptype == "turn_aborted":
+            reason = payload.get("reason") or "aborted"
+            duration_ms = payload.get("duration_ms")
+            text = f"turn aborted ({reason})"
+            if isinstance(duration_ms, (int, float)) and duration_ms:
+                text += f" · {int(duration_ms // 1000)}s"
+            events.append({"kind": "interrupt", "ts": ts, "text": text})
+        elif ptype in ("patch_apply_end", "mcp_tool_call_end", "web_search_end"):
+            event = pending.pop(payload.get("call_id"), None)
+            if event:
+                out, ok = _codex_tool_end_output(ptype, payload)
+                event["tool"]["output"] = _clip(str(out), MAX_TOOL_IO)
+                event["tool"]["ok"] = ok
     elif rtype == "response_item":
-        if ptype == "reasoning":
+        if ptype == "message":
+            role = payload.get("role")
+            if role not in ("user", "assistant"):
+                return  # developer role = injected instructions, skip
+            parts: list[str] = []
+            for block in payload.get("content") or []:
+                if isinstance(block, dict):
+                    text_field = block.get("text")
+                    if isinstance(text_field, str) and text_field:
+                        parts.append(text_field)
+            text = "\n".join(parts).strip()
+            if not text or _seen_msg(state, role, text):
+                return
+            events.append({"kind": role, "ts": ts, "text": _clip(text, MAX_TEXT)})
+        elif ptype == "reasoning":
             summary = payload.get("summary") or []
             text = " ".join(
                 s.get("text", "") for s in summary if isinstance(s, dict)
@@ -402,6 +478,70 @@ def _codex_apply(state: dict, row: dict) -> None:
 # ---------------------------------------------------------------- claude parser
 
 
+_SYSTEM_MARKERS = {
+    "api_error": "API error",
+    "compact_boundary": "context compacted",
+    "scheduled_task_fire": "scheduled task",
+}
+
+
+def _emit_tasks(state: dict, ts: str | None) -> None:
+    """Append a `kind:"tasks"` event when the status vector changes. The event
+    embeds a deep copy of the task list so later deltas can't retroactively
+    mutate it (delta protocol relies on event objects being immutable once emitted)."""
+    tasks = state.get("tasks") or []
+    key = tuple((t["id"], t.get("status", "pending")) for t in tasks)
+    if key == state.get("tasks_key"):
+        return
+    state["tasks_key"] = key
+    snap = [dict(t) for t in tasks]
+    counts = {"completed": 0, "in_progress": 0, "pending": 0}
+    for task in snap:
+        counts[task.get("status", "pending")] = counts.get(task.get("status", "pending"), 0) + 1
+    total = len(snap)
+    summary = (
+        f"{total} task{'s' if total != 1 else ''} "
+        f"({counts['completed']} done, {counts['in_progress']} in progress, {counts['pending']} open)"
+    )
+    state["events"].append({"kind": "tasks", "ts": ts, "text": summary, "tasks": snap})
+
+
+def _apply_task_delta(state: dict, row: dict, task_meta: dict, ts: str | None) -> None:
+    """Apply a TaskCreate or TaskUpdate result between task_reminder snapshots."""
+    tasks: list = state.setdefault("tasks", [])
+    tur = row.get("toolUseResult") or {}
+    if task_meta.get("kind") == "create":
+        info = tur.get("task") or {}
+        tid = info.get("id")
+        subject = info.get("subject") or task_meta.get("subject") or ""
+        if tid is None:
+            return
+        active_form = task_meta.get("activeForm")
+        if active_form:
+            state.setdefault("task_activeform", {})[subject] = active_form
+        for task in tasks:
+            if task["id"] == str(tid):
+                task["subject"] = subject
+                _emit_tasks(state, ts)
+                return
+        new_task = {"id": str(tid), "subject": subject, "status": "pending", "blockedBy": []}
+        if active_form:
+            new_task["activeForm"] = active_form
+        tasks.append(new_task)
+        _emit_tasks(state, ts)
+        return
+    # update
+    tid = tur.get("taskId") or task_meta.get("taskId")
+    status = (tur.get("statusChange") or {}).get("to") or task_meta.get("status")
+    if tid is None or not status:
+        return
+    for task in tasks:
+        if task["id"] == str(tid):
+            task["status"] = status
+            _emit_tasks(state, ts)
+            return
+
+
 def _xml_tag(text: str, tag: str) -> str | None:
     match = re.search(rf"<{tag}>([\s\S]*?)</{tag}>", text)
     return match.group(1).strip() if match else None
@@ -422,6 +562,8 @@ def _bash_event(ts: str | None, parts: dict[str, str]) -> dict:
 
 def _claude_user_event(text: str, ts: str | None) -> dict | None:
     stripped = text.strip()
+    if stripped.startswith("[Request interrupted"):
+        return {"kind": "interrupt", "ts": ts, "text": _clip(stripped, 400)}
     if stripped.startswith("<task-notification>"):
         summary = _xml_tag(stripped, "summary")
         event = _xml_tag(stripped, "event")
@@ -562,11 +704,64 @@ def _claude_apply(state: dict, row: dict) -> None:
     events: list = state["events"]
     pending: dict = state["pending"]  # tool_use id → event
     rtype = row.get("type")
+    ts = row.get("timestamp")
+
+    if rtype == "pr-link":
+        number = row.get("prNumber")
+        url = row.get("prUrl")
+        if number and url:
+            info = {"number": number, "url": url}
+            if state.get("pr") != info:
+                state["pr"] = info
+                events.append({"kind": "pr", "ts": ts, "text": f"PR #{number}", "pr": info})
+        return
+
+    if rtype == "system":
+        label = _SYSTEM_MARKERS.get(row.get("subtype"))
+        if label:
+            error = row.get("error") or {}
+            detail = row.get("content") or error.get("formatted") or error.get("message")
+            text = f"{label}: {detail}" if detail else label
+            events.append({
+                "kind": "marker",
+                "ts": ts,
+                "text": _clip(str(text), 400),
+                "marker": row.get("subtype"),
+            })
+        return
+
+    if rtype == "attachment":
+        attachment = row.get("attachment") or {}
+        if attachment.get("type") != "task_reminder":
+            return
+        content = attachment.get("content")
+        if not isinstance(content, list):
+            return
+        new_tasks: list = []
+        for entry in content:
+            if not isinstance(entry, dict) or entry.get("id") is None:
+                continue
+            new_tasks.append({
+                "id": str(entry["id"]),
+                "subject": entry.get("subject") or "",
+                "status": entry.get("status") or "pending",
+                "blockedBy": entry.get("blockedBy") or [],
+            })
+        active_form_map = state.get("task_activeform") or {}
+        for task in new_tasks:
+            active_form = active_form_map.get(task["subject"])
+            if active_form:
+                task["activeForm"] = active_form
+        state["tasks"] = new_tasks
+        _emit_tasks(state, ts)
+        return
+
     if rtype not in ("user", "assistant"):
         return
+    if rtype == "user" and row.get("isMeta"):
+        return  # injected context wrapping — not a real user message
     if row.get("isSidechain") and not state.get("sidechain_ok"):
         return
-    ts = row.get("timestamp")
     message = row.get("message") or {}
     content = message.get("content")
     if isinstance(content, str):
@@ -622,8 +817,21 @@ def _claude_apply(state: dict, row: dict) -> None:
             events.append(event)
             if block.get("id"):
                 pending[block["id"]] = event
+                if name == "TaskCreate" and isinstance(raw_input, dict):
+                    state.setdefault("task_inputs", {})[block["id"]] = {
+                        "kind": "create",
+                        "subject": raw_input.get("subject") or "",
+                        "activeForm": raw_input.get("activeForm"),
+                    }
+                elif name == "TaskUpdate" and isinstance(raw_input, dict):
+                    state.setdefault("task_inputs", {})[block["id"]] = {
+                        "kind": "update",
+                        "taskId": raw_input.get("taskId"),
+                        "status": raw_input.get("status"),
+                    }
         elif btype == "tool_result":
-            event = pending.pop(block.get("tool_use_id"), None)
+            tool_use_id = block.get("tool_use_id")
+            event = pending.pop(tool_use_id, None)
             if event:
                 result = block.get("content")
                 if isinstance(result, list):
@@ -632,6 +840,9 @@ def _claude_apply(state: dict, row: dict) -> None:
                     )
                 event["tool"]["output"] = _clip(str(result or ""), MAX_TOOL_IO)
                 event["tool"]["ok"] = not block.get("is_error")
+            task_meta = state.get("task_inputs", {}).pop(tool_use_id, None) if tool_use_id else None
+            if task_meta:
+                _apply_task_delta(state, row, task_meta, ts)
 
 
 # ---------------------------------------------------------------- incremental cache
@@ -663,6 +874,12 @@ def read_session_events(fmt: str, path: Path) -> dict:
             "last_bash": None,
             "tail_replaced": False,
             "sidechain_ok": fmt == "claude-sub",
+            "tasks": [],
+            "tasks_key": (),
+            "pr": None,
+            "task_inputs": {},
+            "task_activeform": {},
+            "seen_msgs": {},
         }
         _cache[key] = state
     if stat.st_size > state["offset"]:
@@ -707,6 +924,8 @@ def read_session_events(fmt: str, path: Path) -> dict:
         "events": state["events"],
         "base": state["base"],
         "tokens": state["tokens"],
+        "tasks": state.get("tasks") or [],
+        "pr": state.get("pr"),
         "dirty_from": dirty_from,
     }
 

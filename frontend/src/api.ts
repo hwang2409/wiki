@@ -176,6 +176,16 @@ export type SessionBash = {
   stderr: string;
 };
 
+export type SessionTask = {
+  id: string;
+  subject: string;
+  status: "pending" | "in_progress" | "completed" | string;
+  blockedBy?: string[];
+  activeForm?: string;
+};
+
+export type SessionPr = { number: number; url: string };
+
 export type SessionEvent = {
   kind:
     | "user"
@@ -186,11 +196,18 @@ export type SessionEvent = {
     | "notification"
     | "command"
     | "bash"
-    | "image";
+    | "image"
+    | "tasks"
+    | "interrupt"
+    | "pr"
+    | "marker";
   ts: string | null;
   text: string;
   tool?: SessionTool;
   bash?: SessionBash;
+  tasks?: SessionTask[];
+  pr?: SessionPr;
+  marker?: string;
 };
 
 export type SubagentInfo = {
@@ -203,6 +220,8 @@ export type AgentSessionData = {
   format: "codex" | "claude";
   path: string;
   tokens: number | null;
+  tasks?: SessionTask[];
+  pr?: SessionPr | null;
   from: number;
   total: number;
   events: SessionEvent[];
