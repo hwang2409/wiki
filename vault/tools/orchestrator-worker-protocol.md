@@ -82,6 +82,7 @@ wiki agent orch-done <ID>                    # at orchestrator session end
 wiki agent list
 ```
 
+- Worker kickoff prompts MUST contain `ticket <ID>` (resolver regex `(?:Linear )?ticket ([A-Z]+-\d+)` scans the first user message; prompts that dropped the phrase broke claude transcript mapping 07-08 — claude workers spawned from repo root have no worktree-slug project dir, so kickoff scan is their ONLY mapping path).
 - `orch` reads `$CLAUDE_CODE_SESSION_ID` + cwd → stores the EXACT transcript path (`~/.claude/projects/<escaped-cwd>/<session-id>.jsonl`); the wiki renders the orchestrator's own session from it. Must run from inside the orchestrator's Claude session (env var scope).
 - In a detached tmux-launched Claude session, resolve the orchestrator window with `tmux display-message -p -t "$TMUX_PANE" '#{window_id}'` — plain `display-message -p '#{window_id}'` can bind to the last attached client window instead of the orchestrator pane.
 - Brand-new project directories can stop on Claude's `Quick safety check` / `Yes, I trust this folder` prompt before the kickoff prompt runs; spawners need to detect that screen and press Enter once or self-registration never happens.
