@@ -96,29 +96,31 @@ class RegistryIdBeatsDiscoveryTests(unittest.TestCase):
 
 
 class SameCwdChainRuleTests(unittest.TestCase):
-    """After `codex resume`, a NEW rollout is written with a NEW id in the
-    SAME cwd. The resolver, once anchored by the (older) registry id, must
-    prefer the newer sibling in the same cwd."""
+    """`codex resume <id>` REUSES the anchor rollout file (verified live
+    2026-07-08 via open file handles), so the exact-id file IS the live
+    session. The same-cwd chain caused cross-ticket bleed for sessions
+    sharing a cwd and now applies ONLY when the anchor file vanished."""
 
-    def test_newer_same_cwd_rollout_wins_over_anchor(self) -> None:
+    def test_exact_anchor_wins_over_newer_same_cwd_sibling(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp) / "sessions"
             now = datetime.now(tz=timezone.utc)
             day_dir = root / f"{now.year:04d}" / f"{now.month:02d}" / f"{now.day:02d}"
-            worktree = Path(tmp) / "wiki-15"
+            shared_cwd = Path(tmp) / "repo-root"
             older = time.time() - 3600
             newer = time.time()
-            _write_rollout(day_dir, "anchor", cwd=str(worktree),
+            _write_rollout(day_dir, "anchor", cwd=str(shared_cwd),
                            session_id="sess-anchor",
                            kickoff_ticket="WIKI-15", mtime=older)
-            _write_rollout(day_dir, "post-resume", cwd=str(worktree),
-                           session_id="sess-post-resume", mtime=newer)
+            # A DIFFERENT ticket's newer session in the same cwd must not win.
+            _write_rollout(day_dir, "other-ticket", cwd=str(shared_cwd),
+                           session_id="sess-other", mtime=newer)
             with mock.patch.object(transcripts, "CODEX_SESSIONS_DIR", root):
                 found = transcripts.find_codex_session(
                     "WIKI-15", now.isoformat(), session_id="sess-anchor"
                 )
             self.assertIsNotNone(found)
-            self.assertEqual(found.name, "rollout-post-resume.jsonl")
+            self.assertEqual(found.name, "rollout-anchor.jsonl")
 
 
 if __name__ == "__main__":

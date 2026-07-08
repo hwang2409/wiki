@@ -109,6 +109,7 @@ def find_codex_session(
     ticket: str,
     spawned_at: str | None,
     session_id: str | None = None,
+    worktree: str | None = None,
 ) -> Path | None:
     """Newest session whose kickoff prompt names the ticket, started at/after spawn.
 
@@ -148,40 +149,42 @@ def find_codex_session(
                 anchor = p
                 break
         if anchor is not None:
-            anchor_cwd = _codex_session_cwd(anchor)
+            # `codex resume <id>` REUSES the anchor rollout file (verified live
+            # 2026-07-08 via open file handles) — the exact-id file IS the live
+            # session. Chaining to "newer rollout, same cwd" here cross-bled
+            # tickets whose sessions share a cwd (workers spawned at repo
+            # root): 13227's view streamed 13251's session. Exact match wins;
+            # the same-cwd chain remains ONLY as the fallback below for
+            # anchors that vanished (old resume---last lineages).
             try:
-                anchor_mtime = anchor.stat().st_mtime
+                anchor.stat()
+                return anchor
             except OSError:
-                anchor_mtime = 0.0
-            chain: list[Path] = [anchor]
+                pass
+            anchor_cwd = _codex_session_cwd(anchor)
+            ranked: list[tuple[float, Path]] = []
             if anchor_cwd:
                 for p in candidates:
                     if p == anchor or _codex_session_cwd(p) != anchor_cwd:
                         continue
                     try:
-                        if p.stat().st_mtime >= anchor_mtime:
-                            chain.append(p)
+                        ranked.append((p.stat().st_mtime, p))
                     except OSError:
                         continue
-            # Rollouts can be deleted mid-scan (cleanup, session archive). max()
-            # over stat() would leak OSError up to the endpoint — collect
-            # (mtime, path) tuples defensively, skipping the vanished files.
-            ranked: list[tuple[float, Path]] = []
-            for p in chain:
-                try:
-                    ranked.append((p.stat().st_mtime, p))
-                except OSError:
-                    continue
-            if not ranked:
-                return None
-            return max(ranked, key=lambda pair: pair[0])[1]
+            if ranked:
+                return max(ranked, key=lambda pair: pair[0])[1]
+            return None
 
     slug = ticket.lower()
+    # worktree = exact registry-recorded path; needed when the worktree dir
+    # name does not embed the ticket slug (e.g. PR-keyed workers running in
+    # branch-named worktrees) AND the kickoff prompt lacks "Linear ticket X".
     matches = [
         p
         for p in candidates
         if _codex_kickoff_ticket(p) == ticket
         or PurePosixPath(_codex_session_cwd(p) or "").name == slug
+        or (worktree and _codex_session_cwd(p) == worktree)
     ]
     if not matches:
         return None
@@ -251,14 +254,15 @@ def find_session(
     ticket: str,
     spawned_at: str | None,
     session_id: str | None = None,
+    worktree: str | None = None,
 ) -> tuple[str, Path] | None:
     if kind == "cc":
         path = find_claude_session(ticket, spawned_at)
         return ("claude", path) if path else None
     if kind == "cdx":
-        path = find_codex_session(ticket, spawned_at, session_id)
+        path = find_codex_session(ticket, spawned_at, session_id, worktree)
         return ("codex", path) if path else None
-    path = find_codex_session(ticket, spawned_at, session_id)
+    path = find_codex_session(ticket, spawned_at, session_id, worktree)
     if path:
         return ("codex", path)
     path = find_claude_session(ticket, spawned_at)
