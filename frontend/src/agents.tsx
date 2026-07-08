@@ -1,5 +1,13 @@
 import { useEffect, useState } from "react";
-import { AlertTriangle, Archive, Bot, ExternalLink, GitBranch, ScrollText } from "lucide-react";
+import {
+  AlertTriangle,
+  Archive,
+  Bot,
+  ExternalLink,
+  GitBranch,
+  GitPullRequest,
+  ScrollText,
+} from "lucide-react";
 import { getAgents } from "./api";
 import type { AgentWorker, ArchivedWorker, Orchestrator } from "./api";
 import { LoadingPlaceholder } from "./loading";
@@ -50,6 +58,7 @@ export function AgentsView({
   const [orchestrators, setOrchestrators] = useState<Orchestrator[]>([]);
   const [archived, setArchived] = useState<ArchivedWorker[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [openPanel, setOpenPanel] = useState<"session" | "review">("session");
 
   useEffect(() => {
     let ignore = false;
@@ -88,11 +97,36 @@ export function AgentsView({
   }
 
   const openOrch = orchestrators.find((orch) => orch.id === openTicket);
-  const openWorker: SidebarTarget | null =
-    workers.find((worker) => worker.ticket === openTicket) ??
-    (openOrch ? { ticket: openOrch.id, kind: "cc", role: "orchestrator", model: null } : null) ??
-    archived.find((entry) => entry.ticket === openTicket) ??
-    null;
+  const liveWorker = workers.find((worker) => worker.ticket === openTicket) ?? null;
+  const archivedWorker = archived.find((entry) => entry.ticket === openTicket) ?? null;
+  const openWorker: SidebarTarget | null = liveWorker
+    ? {
+        ticket: liveWorker.ticket,
+        kind: liveWorker.kind,
+        role: liveWorker.role,
+        model: liveWorker.model,
+        pr: liveWorker.pr,
+        canReview: Boolean(liveWorker.pr),
+      }
+    : openOrch
+      ? {
+          ticket: openOrch.id,
+          kind: "cc",
+          role: "orchestrator",
+          model: null,
+          pr: null,
+          canReview: false,
+        }
+      : archivedWorker
+        ? {
+            ticket: archivedWorker.ticket,
+            kind: archivedWorker.kind,
+            role: archivedWorker.role,
+            model: archivedWorker.model,
+            pr: archivedWorker.pr,
+            canReview: false,
+          }
+        : null;
 
   const grouped = orchestrators.map((orch) => ({
     orch,
@@ -169,10 +203,26 @@ export function AgentsView({
                     PR
                   </a>
                 ) : null}
+                {worker.pr ? (
+                  <button
+                    className="agent-pr"
+                    type="button"
+                    onClick={() => {
+                      setOpenPanel("review");
+                      onOpenTicket(worker.ticket);
+                    }}
+                  >
+                    <GitPullRequest size={11} />
+                    Review
+                  </button>
+                ) : null}
                 <button
                   className={`agent-log-toggle${isOpen ? " is-active" : ""}`}
                   type="button"
-                  onClick={() => onOpenTicket(isOpen ? null : worker.ticket)}
+                  onClick={() => {
+                    setOpenPanel("session");
+                    onOpenTicket(isOpen && openPanel === "session" ? null : worker.ticket);
+                  }}
                 >
                   <ScrollText size={13} />
                   log
@@ -199,7 +249,10 @@ export function AgentsView({
               <button
                 className={`agent-log-toggle${openTicket === orch.id ? " is-active" : ""}`}
                 type="button"
-                onClick={() => onOpenTicket(openTicket === orch.id ? null : orch.id)}
+                onClick={() => {
+                  setOpenPanel("session");
+                  onOpenTicket(openTicket === orch.id ? null : orch.id);
+                }}
               >
                 <ScrollText size={13} />
                 log
@@ -270,7 +323,10 @@ export function AgentsView({
                     <button
                       className={`agent-log-toggle${isOpen ? " is-active" : ""}`}
                       type="button"
-                      onClick={() => onOpenTicket(isOpen ? null : entry.ticket)}
+                      onClick={() => {
+                        setOpenPanel("session");
+                        onOpenTicket(isOpen ? null : entry.ticket);
+                      }}
                     >
                       <ScrollText size={13} />
                       log
@@ -284,6 +340,7 @@ export function AgentsView({
       </div>
       {openWorker ? (
         <SessionSidebar
+          initialTab={openPanel}
           worker={openWorker}
           refreshTick={refreshTick}
           onClose={() => onOpenTicket(null)}

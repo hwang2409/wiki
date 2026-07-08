@@ -161,6 +161,39 @@ export type AgentSessionData = {
 
 export type QueuedMessage = { text: string; queued_at: string };
 
+export type AgentPrCheck = {
+  name: string;
+  state: "pass" | "fail" | "pending";
+  rawState: string;
+  workflow: string | null;
+  detailsUrl: string | null;
+};
+
+export type AgentPrThread = {
+  path: string;
+  latestComment: string;
+  author: string | null;
+  updatedAt: string | null;
+  url: string | null;
+};
+
+export type AgentPrData = {
+  url: string;
+  repo: string;
+  title: string;
+  state: string | null;
+  mergeable: string | null;
+  mergeStateStatus: string | null;
+  reviewDecision: string | null;
+  headRefName: string | null;
+  additions: number;
+  deletions: number;
+  changedFiles: number;
+  statusChecks: AgentPrCheck[];
+  unresolvedThreads: AgentPrThread[];
+  diff: string;
+};
+
 export function sendAgentMessage(ticket: string, text: string, mode: "now" | "on-idle") {
   return request<{ status: string }>(`/api/agents/${encodeURIComponent(ticket)}/message`, {
     method: "POST",
@@ -204,6 +237,16 @@ export function getSubagentSession(ticket: string, agentId: string, after = 0) {
   return request<AgentSessionData>(
     `/api/agents/${encodeURIComponent(ticket)}/subagents/${encodeURIComponent(agentId)}/session?after=${after}`
   );
+}
+
+export function getAgentPr(ticket: string) {
+  return request<AgentPrData>(`/api/agents/${encodeURIComponent(ticket)}/pr`);
+}
+
+export function approveAgentPr(ticket: string) {
+  return request<{ status: string }>(`/api/agents/${encodeURIComponent(ticket)}/pr/approve`, {
+    method: "POST",
+  });
 }
 
 export type ActivityFile = {
