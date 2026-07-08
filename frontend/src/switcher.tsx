@@ -13,6 +13,11 @@ export type FleetSwitcherItem = {
   meta: string;
   indent?: number;
   active?: boolean;
+  disabled?: boolean;
+  chooserKind?: "agent" | "note";
+  path?: string;
+  windowId?: string | null;
+  paneId?: string | null;
 };
 
 type SwitcherItem =
@@ -201,30 +206,45 @@ export function FleetSwitcher({
   const [selected, setSelected] = useState(0);
   const rootRef = useRef<HTMLDivElement | null>(null);
 
+  function nextSelectableIndex(start: number, delta: 1 | -1) {
+    if (items.length === 0) return 0;
+    let index = start;
+    for (let step = 0; step < items.length; step += 1) {
+      index = (index + delta + items.length) % items.length;
+      if (!items[index]?.disabled) return index;
+    }
+    return start;
+  }
+
   useEffect(() => {
     rootRef.current?.focus();
   }, []);
 
   useEffect(() => {
-    const activeIndex = items.findIndex((item) => item.active);
-    setSelected(activeIndex >= 0 ? activeIndex : 0);
+    const activeIndex = items.findIndex((item) => item.active && !item.disabled);
+    if (activeIndex >= 0) {
+      setSelected(activeIndex);
+      return;
+    }
+    const firstSelectable = items.findIndex((item) => !item.disabled);
+    setSelected(firstSelectable >= 0 ? firstSelectable : 0);
   }, [items]);
 
   function handleKeyDown(event: KeyboardEvent<HTMLDivElement>) {
     if (event.key === "ArrowDown" || event.key === "j") {
       event.preventDefault();
-      setSelected((index) => (items.length === 0 ? 0 : (index + 1) % items.length));
+      setSelected((index) => nextSelectableIndex(index, 1));
       return;
     }
     if (event.key === "ArrowUp" || event.key === "k") {
       event.preventDefault();
-      setSelected((index) => (items.length === 0 ? 0 : (index - 1 + items.length) % items.length));
+      setSelected((index) => nextSelectableIndex(index, -1));
       return;
     }
     if (event.key === "Enter") {
       event.preventDefault();
       const item = items[selected];
-      if (item) onPick(item);
+      if (item && !item.disabled) onPick(item);
       return;
     }
     if (event.key === "Escape") {
@@ -254,12 +274,17 @@ export function FleetSwitcher({
               <button
                 className={`quick-switcher-result fleet-switcher-result${
                   index === selected ? " is-selected" : ""
-                }${item.active ? " is-current" : ""}`}
+                }${item.active ? " is-current" : ""}${item.disabled ? " is-disabled" : ""}`}
+                disabled={item.disabled}
                 key={item.key}
                 style={{ paddingInlineStart: `${10 + (item.indent ?? 0) * 18}px` }}
                 type="button"
-                onClick={() => onPick(item)}
-                onMouseEnter={() => setSelected(index)}
+                onClick={() => {
+                  if (!item.disabled) onPick(item);
+                }}
+                onMouseEnter={() => {
+                  if (!item.disabled) setSelected(index);
+                }}
               >
                 <span className="fleet-switcher-icon">{item.icon ?? <span />}</span>
                 <span className="quick-switcher-name">{item.label}</span>
