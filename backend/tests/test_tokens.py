@@ -4,9 +4,13 @@ Every path here is a temp dir. No real session files, no real cache."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -26,6 +30,7 @@ class _EnvOverride:
             "codex": root / "codex-sessions",
             "claude": root / "claude-projects",
             "cache": root / "token-cache.json",
+            "ui_state": root / "ui-state.json",
         }
         paths["codex"].mkdir(parents=True, exist_ok=True)
         paths["claude"].mkdir(parents=True, exist_ok=True)
@@ -33,6 +38,7 @@ class _EnvOverride:
             "WIKI_CODEX_SESSIONS_DIR": str(paths["codex"]),
             "WIKI_CLAUDE_PROJECTS_DIR": str(paths["claude"]),
             "WIKI_TOKEN_CACHE_PATH": str(paths["cache"]),
+            "WIKI_UI_STATE_PATH": str(paths["ui_state"]),
         }
         self._patch = mock.patch.dict(os.environ, env)
         self._patch.start()
@@ -435,6 +441,126 @@ class IncrementalScanTests(unittest.TestCase):
             # If the offset had desynced, row2/row3 would be re-parsed and the
             # drop-clamp path would re-anchor, silently doubling the total.
             self.assertEqual(tokens.query()["totals"]["input"], 500)
+
+
+class NonBlockingQueryTests(unittest.TestCase):
+    def test_cold_cache_returns_empty_snapshot_and_refreshing(self) -> None:
+        with _EnvOverride():
+            from backend.app import tokens
+
+            with mock.patch.object(tokens, "try_start_refresh", return_value=True) as start_refresh:
+                response = tokens.query_nonblocking()
+
+            self.assertTrue(response["refreshing"])
+            self.assertEqual(response["buckets"], [])
+            self.assertEqual(response["totals"]["input"], 0)
+            start_refresh.assert_called_once()
+
+    def test_stale_cache_serves_snapshot_while_refresh_runs(self) -> None:
+        with _EnvOverride():
+            from backend.app import tokens
+
+            state = tokens._empty_state()  # noqa: SLF001 - explicit stale fixture
+            state["updated_at"] = "2026-07-08T00:00:00Z"
+            state["files"] = {"a": {"offset": 1}}
+            state["buckets"] = [
+                {
+                    "ts": "2026-07-08T18:00:00Z",
+                    "cli": "codex",
+                    "model": "gpt-5.4",
+                    "input": 123,
+                    "cached": 0,
+                    "output": 0,
+                    "reasoning": 0,
+                }
+            ]
+            tokens._save_state(state)  # noqa: SLF001
+
+            with mock.patch.object(tokens, "try_start_refresh", return_value=True) as start_refresh:
+                response = tokens.query_nonblocking()
+
+            self.assertTrue(response["refreshing"])
+            self.assertEqual(response["totals"]["input"], 123)
+            start_refresh.assert_called_once()
+
+    def test_refreshing_flag_clears_after_inflight_refresh(self) -> None:
+        with _EnvOverride():
+            from backend.app import tokens
+
+            state = tokens._empty_state()  # noqa: SLF001 - explicit cache fixture
+            state["updated_at"] = datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z")
+            tokens._save_state(state)  # noqa: SLF001
+
+            tokens._REFRESH_LOCK.acquire()  # noqa: SLF001
+            try:
+                inflight = tokens.query_nonblocking()
+            finally:
+                tokens._REFRESH_LOCK.release()  # noqa: SLF001
+
+            settled = tokens.query_nonblocking()
+            self.assertTrue(inflight["refreshing"])
+            self.assertFalse(settled["refreshing"])
+
+    def test_ten_concurrent_cold_requests_do_not_block_on_full_scan(self) -> None:
+        with _EnvOverride():
+            from backend.app import tokens
+
+            started = threading.Event()
+            release = threading.Event()
+            refresh_calls = 0
+
+            def slow_refresh(state: dict | None = None) -> dict:
+                nonlocal refresh_calls
+                refresh_calls += 1
+                started.set()
+                release.wait(timeout=2)
+                state = state or tokens._empty_state()  # noqa: SLF001
+                state["updated_at"] = datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z")
+                tokens._save_state(state)  # noqa: SLF001
+                return state
+
+            with mock.patch.object(tokens, "refresh", side_effect=slow_refresh):
+                began = time.perf_counter()
+                with ThreadPoolExecutor(max_workers=10) as pool:
+                    futures = [pool.submit(tokens.query_nonblocking) for _ in range(10)]
+                    responses = [future.result(timeout=0.5) for future in futures]
+                elapsed = time.perf_counter() - began
+
+                self.assertTrue(started.wait(timeout=0.2))
+                release.set()
+                for _ in range(100):
+                    if not tokens._REFRESH_LOCK.locked():  # noqa: SLF001
+                        break
+                    time.sleep(0.01)
+
+            self.assertLess(elapsed, 0.2)
+            self.assertEqual(refresh_calls, 1)
+            self.assertTrue(all(response["refreshing"] for response in responses))
+
+
+class StartupRefreshTests(unittest.IsolatedAsyncioTestCase):
+    async def test_startup_schedules_background_token_refresh(self) -> None:
+        with _EnvOverride():
+            from backend.app import main
+
+            created: list[object] = []
+            refresh_mock = mock.AsyncMock()
+
+            def fake_create_task(coro):
+                created.append(coro)
+                coro.close()
+                return mock.Mock()
+
+            with (
+                mock.patch.object(main, "message_dispatcher", new=mock.AsyncMock()),
+                mock.patch.object(main.accounts, "watchdog_loop", new=mock.AsyncMock()),
+                mock.patch.object(main.tokens, "refresh_in_background", new=refresh_mock),
+                mock.patch.object(asyncio, "create_task", side_effect=fake_create_task),
+            ):
+                await main._start_dispatcher()
+
+            self.assertEqual(len(created), 3)
+            refresh_mock.assert_called_once()
 
 
 if __name__ == "__main__":
