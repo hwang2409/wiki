@@ -360,3 +360,43 @@ export function updateNote(path: string, content: string) {
     body: JSON.stringify({ content })
   });
 }
+
+export type TokenSeries = {
+  input: number;
+  cached: number;
+  output: number;
+  reasoning: number;
+};
+
+export type TokenBucket = {
+  ts: string;
+  series: Record<string, TokenSeries>;
+};
+
+export type TokensResponse = {
+  buckets: TokenBucket[];
+  totals: TokenSeries;
+  models: string[];
+  clis: string[];
+  sessions_scanned: number;
+  bucket: "hour" | "day";
+};
+
+export type TokensQuery = {
+  from?: string;
+  to?: string;
+  bucket?: "hour" | "day";
+  cli?: string;
+  model?: string;
+};
+
+export function getTokens(params: TokensQuery = {}) {
+  const search = new URLSearchParams();
+  if (params.from) search.set("from", params.from);
+  if (params.to) search.set("to", params.to);
+  if (params.bucket) search.set("bucket", params.bucket);
+  if (params.cli) search.set("cli", params.cli);
+  if (params.model) search.set("model", params.model);
+  const qs = search.toString();
+  return request<TokensResponse>(`/api/tokens${qs ? `?${qs}` : ""}`);
+}
