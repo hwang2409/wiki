@@ -13,7 +13,6 @@ Todo:
 
 In Progress:
 
-- [PHO-13225](https://linear.app/phoebework/issue/PHO-13225): call-recordings tool split (audit P0 #1) — cdx:PHO-13225 worker
 - [PHO-11274](https://linear.app/phoebework/issue/PHO-11274): compare_agent_runs trace comparison (audit-validated P1) — cdx:PHO-11274 worker
 - [PHO-13216](https://linear.app/phoebework/issue/PHO-13216): Core data products T2 (dossier+funnel+MCP mirrors) — cdx:PHO-13216 worker
 - [PHO-13227](https://linear.app/phoebework/issue/PHO-13227): subagent approval inheritance (13226 T2) — cdx:PHO-13227 worker

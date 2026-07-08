@@ -82,6 +82,7 @@ wiki agent orch-done <ID>                    # at orchestrator session end
 wiki agent list
 ```
 
+- LIVE SHARED STATE IS READ-ONLY to workers (registry, ~/.wiki, ~/.codex*, ~/.claude, vault/, live dev stack, others' tmux windows) — isolation via env-overridden paths UP FRONT, never fixture-then-cleanup in live paths (4 leak incidents 2026-07; codified in both tmux-ticket skills). Gate reviewers check shared surfaces for pollution.
 - Worker kickoff prompts MUST contain `ticket <ID>` (resolver regex `(?:Linear )?ticket ([A-Z]+-\d+)` scans the first user message; prompts that dropped the phrase broke claude transcript mapping 07-08 — claude workers spawned from repo root have no worktree-slug project dir, so kickoff scan is their ONLY mapping path).
 - `orch` reads `$CLAUDE_CODE_SESSION_ID` + cwd → stores the EXACT transcript path (`~/.claude/projects/<escaped-cwd>/<session-id>.jsonl`); the wiki renders the orchestrator's own session from it. Must run from inside the orchestrator's Claude session (env var scope).
 - In a detached tmux-launched Claude session, resolve the orchestrator window with `tmux display-message -p -t "$TMUX_PANE" '#{window_id}'` — plain `display-message -p '#{window_id}'` can bind to the last attached client window instead of the orchestrator pane.

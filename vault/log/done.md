@@ -9,6 +9,8 @@ updated: 2026-07-08
 
 ## 2026-07-08
 
+- **phoebe** — PHO-13225 call-recordings tool split merged (#10855) — index/read/search verbs replace 48%-success mega-tool; tag-write honestly approval-gated
+- [PHO-13225](https://linear.app/phoebework/issue/PHO-13225): call-recordings tool split (audit P0 #1) — cdx:PHO-13225 worker
 - **phoebe** — PHO-13218 tiered tool mounting merged (#10845) — 35-tool hot set + domain packs via load_skill + routing evals; ~20k tokens/run saved
 - [PHO-13218](https://linear.app/phoebework/issue/PHO-13218): tiered tool mounting (hot set + domain packs + routing evals) — cdx:PHO-13218 worker
 - **WIKI-25** — unify focused/unfocused pane styling — minimal frame indicator only (owner: cc:WIKI-25)
