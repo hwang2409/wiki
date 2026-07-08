@@ -9,6 +9,7 @@ updated: 2026-07-08
 
 ## 2026-07-08
 
+- **wiki** — WIKI-10 Conductor-inspired restyle merged (PR #10) — transcript/composer/spawn-modal modernization, styling-only, 12-theme safe
 - **wiki** — PR #9 unified session surface (pane parity, review side panel, compact checks) + PR #8 keyboard focus model (pane scope, vim layering, skill-picker keys) merged
 - **wiki** — WIKI-9 merge-ready ([#9](https://github.com/hwang2409/wiki/pull/9)) — unified split/full agent session surface, review side panel, compact checks rows
 - **phoebe** — PHO-13144 WellSky clock-in writeback fix merged (#10812) — QA action executor now honors live-call allowed_action_families for shift_clock_writeback; prod investigation via orchestrator tunnel; follow-up PHO-13207
