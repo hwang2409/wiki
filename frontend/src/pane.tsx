@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
-import { Bot, X } from "lucide-react";
+import { X } from "lucide-react";
 import { getNote, updateNote } from "./api";
+import type { AgentSessionSurfaceWorker } from "./agent-session-surface";
+import { AgentSessionSurface } from "./agent-session-surface";
 import { LoadingPlaceholder } from "./loading";
-import { SessionTab, SubagentSessionPanel, usePollTick } from "./session";
 import { KanbanBoard, appendDoneEntry } from "./kanban";
 import type { KanbanCard } from "./kanban";
 import { ObsidianMarkdown, splitFrontmatter, stripLeadingTitle } from "./markdown";
@@ -13,12 +14,14 @@ function basename(path: string) {
 }
 
 export function SecondaryPane({
+  agentWorkers,
   notes,
   onClose,
   onOpenNote,
   path,
   refreshTick
 }: {
+  agentWorkers?: Map<string, AgentSessionSurfaceWorker>;
   notes: NoteSummary[];
   onClose: () => void;
   onOpenNote: (path: string) => void;
@@ -27,7 +30,12 @@ export function SecondaryPane({
 }) {
   if (path.startsWith("agent://")) {
     return (
-      <AgentPane path={path} refreshTick={refreshTick} onClose={onClose} />
+      <AgentPane
+        agentWorkers={agentWorkers}
+        path={path}
+        refreshTick={refreshTick}
+        onClose={onClose}
+      />
     );
   }
   return (
@@ -42,47 +50,22 @@ export function SecondaryPane({
 }
 
 function AgentPane({
+  agentWorkers,
   path,
   refreshTick,
   onClose,
 }: {
+  agentWorkers?: Map<string, AgentSessionSurfaceWorker>;
   path: string;
   refreshTick: number;
   onClose: () => void;
 }) {
   const ticket = path.slice("agent://".length);
-  const tick = usePollTick(refreshTick);
-  const [subagent, setSubagent] = useState<string | null>(null);
-
-  useEffect(() => {
-    setSubagent(null);
-  }, [ticket]);
+  const worker = agentWorkers?.get(ticket) ?? { ticket };
 
   return (
     <section className="secondary-pane agent-pane">
-      <header className="secondary-pane-header">
-        <span className="secondary-pane-title">
-          <Bot size={13} /> {ticket}
-        </span>
-        <button aria-label="Close pane" className="secondary-pane-close" type="button" onClick={onClose}>
-          <X size={14} />
-        </button>
-      </header>
-      <div className="agent-pane-body">
-        <div className="agent-pane-session">
-          <SessionTab ticket={ticket} tick={tick} onInspect={setSubagent} />
-        </div>
-        {subagent ? (
-          <SubagentSessionPanel
-            className="subagent-panel-inline"
-            onClose={() => setSubagent(null)}
-            subagent={subagent}
-            ticket={ticket}
-            tick={tick}
-            width="42%"
-          />
-        ) : null}
-      </div>
+      <AgentSessionSurface context="pane" onClose={onClose} refreshTick={refreshTick} worker={worker} />
     </section>
   );
 }
