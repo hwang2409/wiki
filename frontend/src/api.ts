@@ -380,6 +380,7 @@ export type TokensResponse = {
   clis: string[];
   sessions_scanned: number;
   bucket: "hour" | "day";
+  refreshing: boolean;
 };
 
 export type TokensQuery = {

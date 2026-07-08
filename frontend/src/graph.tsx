@@ -25,6 +25,8 @@ export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
   useEffect(() => {
+    const metricsWindow = window as typeof window & { __wikiGraphRafCount?: number };
+    metricsWindow.__wikiGraphRafCount = 0;
     const canvas = canvasRef.current;
     if (!canvas) return;
     const context = canvas.getContext("2d");
@@ -33,15 +35,18 @@ export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }
     let nodes: GraphNode[] = [];
     let edges: GraphEdge[] = [];
     let raf = 0;
+    let running = false;
     let alpha = 1;
     let hovered: GraphNode | null = null;
     let dragged: GraphNode | null = null;
     let dragOrigin = { x: 0, y: 0 };
     let dragTravel = 0;
     let disposed = false;
+    let hidden = document.visibilityState === "hidden";
     let width = 0;
     let height = 0;
     const view = { scale: 1, ox: 0, oy: 0 };
+    const settleAlpha = 0.003;
 
     function toScreenX(x: number) {
       return x * view.scale + view.ox;
@@ -56,7 +61,7 @@ export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }
     }
 
     function fitView() {
-      if (nodes.length === 0) return;
+      if (nodes.length === 0) return false;
       let minX = Infinity;
       let maxX = -Infinity;
       let minY = Infinity;
@@ -77,9 +82,23 @@ export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }
       );
       const targetOx = (width - (minX + maxX) * target) / 2;
       const targetOy = (height - (minY + maxY) * target) / 2;
-      view.scale += (target - view.scale) * 0.08;
-      view.ox += (targetOx - view.ox) * 0.08;
-      view.oy += (targetOy - view.oy) * 0.08;
+      const scaleDelta = target - view.scale;
+      const oxDelta = targetOx - view.ox;
+      const oyDelta = targetOy - view.oy;
+      const settled =
+        Math.abs(scaleDelta) <= 0.002 &&
+        Math.abs(oxDelta) <= 0.75 &&
+        Math.abs(oyDelta) <= 0.75;
+      if (settled) {
+        view.scale = target;
+        view.ox = targetOx;
+        view.oy = targetOy;
+        return false;
+      }
+      view.scale += scaleDelta * 0.08;
+      view.ox += oxDelta * 0.08;
+      view.oy += oyDelta * 0.08;
+      return true;
     }
 
     function resize() {
@@ -95,6 +114,7 @@ export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }
       canvas.style.height = `${height}px`;
       context!.setTransform(dpr, 0, 0, dpr, 0, 0);
       alpha = Math.max(alpha, 0.3);
+      requestRender();
     }
 
     function step() {
@@ -173,7 +193,7 @@ export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }
       const textFaint = cssVar("--text-faint") || "#9b9b9b";
       const border = cssVar("--background-modifier-border") || "#dcdcdc";
 
-      fitView();
+      const viewAnimating = fitView();
       context!.clearRect(0, 0, width, height);
 
       const neighborhood = new Set<number>();
@@ -224,13 +244,36 @@ export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }
         context!.fillText(node.label, sx, sy + r + 12);
         context!.globalAlpha = 1;
       });
+
+      return viewAnimating;
+    }
+
+    function stopLoop() {
+      if (raf) cancelAnimationFrame(raf);
+      raf = 0;
+      running = false;
+    }
+
+    function scheduleFrame() {
+      if (disposed || hidden || running) return;
+      running = true;
+      raf = requestAnimationFrame(loop);
+    }
+
+    function requestRender() {
+      scheduleFrame();
     }
 
     function loop() {
-      if (disposed) return;
-      if (alpha > 0.003 || dragged) step();
-      draw();
-      raf = requestAnimationFrame(loop);
+      running = false;
+      raf = 0;
+      if (disposed || hidden) return;
+      metricsWindow.__wikiGraphRafCount = (metricsWindow.__wikiGraphRafCount ?? 0) + 1;
+      if (alpha > settleAlpha || dragged) step();
+      const viewAnimating = draw();
+      if (dragged || alpha > settleAlpha || viewAnimating) {
+        scheduleFrame();
+      }
     }
 
     function nodeAt(px: number, py: number): GraphNode | null {
@@ -258,6 +301,7 @@ export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }
         dragged.x = world.x;
         dragged.y = world.y;
         alpha = Math.max(alpha, 0.25);
+        requestRender();
         return;
       }
       const next = nodeAt(x, y);
@@ -265,6 +309,7 @@ export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }
         hovered = next;
         canvas!.style.cursor = next ? "pointer" : "default";
       }
+      requestRender();
     }
 
     function onPointerDown(event: PointerEvent) {
@@ -275,6 +320,8 @@ export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }
         dragOrigin = { x, y };
         dragTravel = 0;
         canvas!.setPointerCapture(event.pointerId);
+        alpha = Math.max(alpha, 0.25);
+        requestRender();
       }
     }
 
@@ -287,6 +334,24 @@ export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }
           onOpenNote(node.id);
         }
       }
+      requestRender();
+    }
+
+    function onPointerLeave() {
+      if (hovered) {
+        hovered = null;
+        canvas!.style.cursor = "default";
+        requestRender();
+      }
+    }
+
+    function onVisibilityChange() {
+      hidden = document.visibilityState === "hidden";
+      if (hidden) {
+        stopLoop();
+        return;
+      }
+      requestRender();
     }
 
     resize();
@@ -342,23 +407,30 @@ export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }
         }
 
         alpha = 1;
+        requestRender();
       })
-      .catch(() => {});
+      .catch(() => {
+        requestRender();
+      });
 
-    loop();
     const observer = new ResizeObserver(resize);
     if (canvas.parentElement) observer.observe(canvas.parentElement);
     canvas.addEventListener("pointermove", onPointerMove);
     canvas.addEventListener("pointerdown", onPointerDown);
     canvas.addEventListener("pointerup", onPointerUp);
+    canvas.addEventListener("pointerleave", onPointerLeave);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    requestRender();
 
     return () => {
       disposed = true;
-      cancelAnimationFrame(raf);
+      stopLoop();
       observer.disconnect();
       canvas.removeEventListener("pointermove", onPointerMove);
       canvas.removeEventListener("pointerdown", onPointerDown);
       canvas.removeEventListener("pointerup", onPointerUp);
+      canvas.removeEventListener("pointerleave", onPointerLeave);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
     };
   }, [onOpenNote]);
 

@@ -5034,6 +5034,18 @@ body.is-resizing-panes .pane-cell {
   cursor: pointer;
 }
 
+.tokens-refreshing {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 2px;
+  background: var(--background-primary-alt);
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.2;
+}
+
 .tokens-totals {
   display: flex;
   flex-wrap: wrap;

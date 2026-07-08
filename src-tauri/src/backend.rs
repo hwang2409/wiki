@@ -29,6 +29,68 @@ const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
 const MAIN_WINDOW_LABEL: &str = "main";
 const WINDOW_TITLE: &str = "Wiki";
+const LOADING_PAGE: &str = r#"document.open();
+document.write(`<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Wiki</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      body {
+        margin: 0;
+        background: #f6f5f1;
+        color: #1f2328;
+      }
+      .shell {
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: 24px;
+      }
+      .card {
+        width: min(320px, 100%);
+        border: 1px solid rgba(15, 23, 42, 0.12);
+        background: rgba(255, 255, 255, 0.92);
+        padding: 18px 20px;
+      }
+      .label {
+        display: inline-block;
+        margin-bottom: 10px;
+        padding: 3px 8px;
+        border: 1px solid rgba(15, 23, 42, 0.12);
+        color: #5b6470;
+        font-size: 11px;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+      h1 {
+        margin: 0 0 6px;
+        font-size: 16px;
+        font-weight: 600;
+      }
+      p {
+        margin: 0;
+        color: #5b6470;
+        font-size: 13px;
+        line-height: 1.5;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <section class="card">
+        <span class="label">Starting</span>
+        <h1>Launching backend</h1>
+        <p>Waiting for the local API to become healthy.</p>
+      </section>
+    </main>
+  </body>
+</html>`);
+document.close();"#;
 // Stable default keeps the webview origin constant across launches so
 // localStorage (origin-scoped) survives. Falls back to a random port only if
 // the bind fails (e.g. another wiki instance is running).
@@ -63,20 +125,11 @@ enum SidecarAction {
 pub fn setup(app: &mut App) -> Result<(), Box<dyn Error>> {
     app.manage(NativeAppState::default());
 
-    let launch_url = if let Ok(url) = env::var("WIKI_NATIVE_BACKEND_URL") {
-        let launch_url = normalize_launch_url(&url);
-        set_app_origin(app.handle(), &launch_url);
-        wait_for_health(app.handle(), &launch_url, None)?;
-        launch_url
-    } else {
-        start_sidecar(app.handle(), 0)?
-    };
-
     let app_handle = app.handle().clone();
-    WebviewWindowBuilder::new(
+    let window = WebviewWindowBuilder::new(
         &app_handle,
         MAIN_WINDOW_LABEL,
-        WebviewUrl::External(launch_url.parse()?),
+        WebviewUrl::External("about:blank".parse()?),
     )
     .title(WINDOW_TITLE)
     .inner_size(1400.0, 950.0)
@@ -93,6 +146,11 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn Error>> {
     // HTML5 DnD (kanban, pane splits) inside the webview — disable it.
     .disable_drag_drop_handler()
     .build()?;
+
+    let _ = window.eval(LOADING_PAGE);
+
+    let launch_handle = app_handle.clone();
+    thread::spawn(move || launch_backend_and_navigate(&launch_handle));
 
     Ok(())
 }
@@ -193,6 +251,31 @@ fn start_sidecar(app: &AppHandle, restart_count: u8) -> Result<String, Box<dyn E
     set_app_origin(app, &launch_url);
 
     Ok(launch_url)
+}
+
+fn launch_backend_and_navigate(app: &AppHandle) {
+    let launch_result = if let Ok(url) = env::var("WIKI_NATIVE_BACKEND_URL") {
+        let launch_url = normalize_launch_url(&url);
+        wait_for_health(app, &launch_url, None).map(|_| launch_url)
+    } else {
+        start_sidecar(app, 0)
+    };
+
+    match launch_result {
+        Ok(launch_url) => {
+            set_app_origin(app, &launch_url);
+            if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+                if let Ok(url) = launch_url.parse() {
+                    let _ = window.navigate(url);
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
+        }
+        Err(err) => {
+            show_error_dialog(app, "Wiki backend failed to start", &format!("{err}"));
+        }
+    }
 }
 
 fn spawn_sidecar_logger(
@@ -445,7 +528,7 @@ fn app_origin(app: &AppHandle) -> Option<String> {
 
 fn allow_in_webview(app: &AppHandle, url: &Url) -> bool {
     match url.scheme() {
-        "tauri" | "asset" => true,
+        "tauri" | "asset" | "about" => true,
         "http" | "https" => app_origin(app)
             .is_some_and(|origin| origin == url.origin().ascii_serialization()),
         _ => false,

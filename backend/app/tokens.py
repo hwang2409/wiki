@@ -20,6 +20,7 @@ tail-append only. All parsing is defensive — CLI formats are unversioned.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import threading
@@ -35,6 +36,7 @@ _REFRESH_LOCK = threading.Lock()
 
 CACHE_VERSION = 2  # v1 caches had a byte-offset desync on non-ASCII tail reads
                     # + per-file (not global) msg-id dedupe; both wipe on load.
+SYNC_REFRESH_MAX_AGE_SECONDS = int(os.environ.get("WIKI_TOKEN_SYNC_MAX_AGE_SECONDS", "15"))
 
 BUCKET_HOUR = "hour"
 BUCKET_DAY = "day"
@@ -64,6 +66,7 @@ def token_cache_path() -> Path:
 def _empty_state() -> dict:
     return {
         "version": CACHE_VERSION,
+        "updated_at": None,
         # path -> {offset, mtime, size, cli, model, cum (dict|None), sess_id}
         "files": {},
         # list of {ts (iso hour), cli, model, input, cached, output, reasoning}
@@ -83,6 +86,7 @@ def _load_state() -> dict:
         return _empty_state()
     if not isinstance(raw, dict) or raw.get("version") != CACHE_VERSION:
         return _empty_state()
+    raw.setdefault("updated_at", None)
     raw.setdefault("files", {})
     raw.setdefault("buckets", [])
     raw.setdefault("seen_msg_ids", [])
@@ -109,6 +113,10 @@ def _save_state(state: dict) -> None:
         tmp.replace(token_cache_path())
     except OSError:
         return
+
+
+def _now_iso() -> str:
+    return datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 # --------------------------------------------------------------------- helpers
@@ -370,8 +378,38 @@ def refresh(state: dict | None = None) -> dict:
         _scan_file(state, path, "codex", index)
     for path in _iter_claude_files():
         _scan_file(state, path, "claude", index)
+    state["updated_at"] = _now_iso()
     _save_state(state)
     return state
+
+
+def _refresh_in_thread(state: dict | None = None) -> None:
+    try:
+        refresh(state)
+    finally:
+        _REFRESH_LOCK.release()
+
+
+def try_start_refresh(state: dict | None = None) -> bool:
+    if not _REFRESH_LOCK.acquire(blocking=False):
+        return False
+    threading.Thread(
+        target=_refresh_in_thread,
+        args=(state,),
+        name="wiki-token-refresh",
+        daemon=True,
+    ).start()
+    return True
+
+
+async def refresh_in_background() -> bool:
+    if not _REFRESH_LOCK.acquire(blocking=False):
+        return False
+    try:
+        await asyncio.to_thread(refresh)
+    finally:
+        _REFRESH_LOCK.release()
+    return True
 
 
 # --------------------------------------------------------------------- query
@@ -398,25 +436,31 @@ def _floor_day(dt: datetime) -> datetime:
     return dt.replace(hour=0, minute=0, second=0, microsecond=0)
 
 
-def query(
+def _state_has_snapshot(state: dict) -> bool:
+    return bool(state.get("updated_at"))
+
+
+def _state_is_stale(state: dict) -> bool:
+    if not _state_has_snapshot(state):
+        return True
+    updated = _parse_iso(state.get("updated_at"))
+    if updated is None:
+        return True
+    age = (datetime.now(tz=timezone.utc) - updated).total_seconds()
+    return age > SYNC_REFRESH_MAX_AGE_SECONDS
+
+
+def _query_from_state(
+    state: dict,
     from_ts: str | None = None,
     to_ts: str | None = None,
     bucket: str = BUCKET_HOUR,
     cli: str | None = None,
     model: str | None = None,
-    state: dict | None = None,
 ) -> dict:
     """Filter + roll up the persistent buckets. Buckets in the response are
     KEYED by ts and carry a per-series {"<cli>/<model>": {...}} map so a
     single response can drive stacked charts without a second request."""
-    if state is None:
-        if _REFRESH_LOCK.acquire(blocking=False):
-            try:
-                state = refresh()
-            finally:
-                _REFRESH_LOCK.release()
-        else:
-            state = _load_state()
     frm = _parse_iso(from_ts)
     to = _parse_iso(to_ts)
     if bucket not in (BUCKET_HOUR, BUCKET_DAY):
@@ -475,3 +519,89 @@ def query(
     }
 
 
+def query(
+    from_ts: str | None = None,
+    to_ts: str | None = None,
+    bucket: str = BUCKET_HOUR,
+    cli: str | None = None,
+    model: str | None = None,
+    state: dict | None = None,
+) -> dict:
+    if state is None:
+        if _REFRESH_LOCK.acquire(blocking=False):
+            try:
+                state = refresh()
+            finally:
+                _REFRESH_LOCK.release()
+        else:
+            state = _load_state()
+    return _query_from_state(
+        state,
+        from_ts=from_ts,
+        to_ts=to_ts,
+        bucket=bucket,
+        cli=cli,
+        model=model,
+    )
+
+
+def query_nonblocking(
+    from_ts: str | None = None,
+    to_ts: str | None = None,
+    bucket: str = BUCKET_HOUR,
+    cli: str | None = None,
+    model: str | None = None,
+) -> dict:
+    state = _load_state()
+
+    if _REFRESH_LOCK.locked():
+        response = _query_from_state(
+            state,
+            from_ts=from_ts,
+            to_ts=to_ts,
+            bucket=bucket,
+            cli=cli,
+            model=model,
+        )
+        response["refreshing"] = True
+        return response
+
+    if _state_is_stale(state):
+        try_start_refresh(state)
+        response = _query_from_state(
+            state,
+            from_ts=from_ts,
+            to_ts=to_ts,
+            bucket=bucket,
+            cli=cli,
+            model=model,
+        )
+        response["refreshing"] = True
+        return response
+
+    if _REFRESH_LOCK.acquire(blocking=False):
+        try:
+            state = refresh(state)
+        finally:
+            _REFRESH_LOCK.release()
+        response = _query_from_state(
+            state,
+            from_ts=from_ts,
+            to_ts=to_ts,
+            bucket=bucket,
+            cli=cli,
+            model=model,
+        )
+        response["refreshing"] = False
+        return response
+
+    response = _query_from_state(
+        _load_state(),
+        from_ts=from_ts,
+        to_ts=to_ts,
+        bucket=bucket,
+        cli=cli,
+        model=model,
+    )
+    response["refreshing"] = True
+    return response

@@ -115,21 +115,31 @@ export function TokensView() {
 
   useEffect(() => {
     let cancelled = false;
-    setLoading(true);
-    getTokens({ from: range.from, to: range.to, bucket: bucketMode })
-      .then((next) => {
-        if (cancelled) return;
-        setData(next);
-        setError(null);
-      })
-      .catch((err: unknown) => {
-        if (!cancelled) setError(err instanceof Error ? err.message : "Failed");
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
+    let retry = 0;
+
+    const load = (showSpinner: boolean) => {
+      if (showSpinner) setLoading(true);
+      getTokens({ from: range.from, to: range.to, bucket: bucketMode })
+        .then((next) => {
+          if (cancelled) return;
+          setData(next);
+          setError(null);
+          if (next.refreshing) {
+            retry = window.setTimeout(() => load(false), 1000);
+          }
+        })
+        .catch((err: unknown) => {
+          if (!cancelled) setError(err instanceof Error ? err.message : "Failed");
+        })
+        .finally(() => {
+          if (!cancelled && showSpinner) setLoading(false);
+        });
+    };
+
+    load(true);
     return () => {
       cancelled = true;
+      if (retry) window.clearTimeout(retry);
     };
   }, [range.from, range.to, bucketMode]);
 
@@ -220,6 +230,7 @@ export function TokensView() {
           />
           <span>include cached</span>
         </label>
+        {data?.refreshing ? <span className="tokens-refreshing">refreshing...</span> : null}
       </div>
 
       {data ? (

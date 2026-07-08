@@ -920,8 +920,7 @@ async def get_tokens(
     cli=codex|claude, model=<exact>. `from` is a Python keyword so we bind it
     via alias.
     """
-    return await asyncio.to_thread(
-        tokens.query,
+    return tokens.query_nonblocking(
         from_ts=from_ts,
         to_ts=to_ts,
         bucket=bucket,
@@ -1371,6 +1370,7 @@ def _subscribe_agent_events() -> asyncio.Queue[dict]:
 async def _start_dispatcher() -> None:
     asyncio.create_task(message_dispatcher())
     asyncio.create_task(accounts.watchdog_loop(publish_agent_event))
+    asyncio.create_task(tokens.refresh_in_background())
 
 
 def vault_snapshot() -> dict[str, float]:
