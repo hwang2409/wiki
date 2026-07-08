@@ -667,8 +667,16 @@ class AuthDeadDetectionTests(unittest.TestCase):
     def test_matches_the_real_auth_dead_string(self) -> None:
         self.assertTrue(accounts.detect_codex_auth_dead(REAL_AUTH_DEAD_STRING))
 
-    def test_matches_short_sign_in_again_tail(self) -> None:
-        self.assertTrue(accounts.detect_codex_auth_dead("something failed. Please sign in again."))
+    def test_ignores_bare_sign_in_again_phrase(self) -> None:
+        """Product copy, docs, and test output frequently contain "please sign
+        in again"; matching it as an independent alternative would kill+resume
+        any worker merely displaying the phrase every poll. Only the full
+        "your access token could not be refreshed" sentence classifies."""
+        self.assertFalse(accounts.detect_codex_auth_dead("Please sign in again to continue."))
+        self.assertFalse(accounts.detect_codex_auth_dead(
+            "docs say: If prompted, please sign in again with your credentials."
+        ))
+        self.assertFalse(accounts.detect_codex_auth_dead("something failed. Please sign in again."))
 
     def test_ignores_unrelated_pane(self) -> None:
         self.assertFalse(accounts.detect_codex_auth_dead("everything is fine"))
@@ -954,6 +962,128 @@ class AuthDeadRevivalTests(unittest.IsolatedAsyncioTestCase):
 
             # auth.json untouched (still alpha's live creds).
             self.assertEqual(json.loads(paths["auth"].read_text())["tokens"], "alpha-live")
+
+
+class AuthDeadAttemptCapTests(unittest.IsolatedAsyncioTestCase):
+    """A genuinely-dead auth token re-shows the pane signature after every
+    revive. Without a cap, the watchdog kill+resume-loops the same worker
+    every poll cycle forever."""
+
+    async def _drive_cycles(
+        self,
+        paths: dict[str, Path],
+        cycles: int,
+    ) -> tuple[list[dict], list[str]]:
+        (paths["accounts"] / "alpha").mkdir()
+        (paths["accounts"] / "alpha" / "auth.json").write_text("{}")
+        paths["auth"].write_text("{}")
+        paths["registry"].write_text(json.dumps({
+            "WIKI-15": {
+                "current": {
+                    "ticket": "WIKI-15",
+                    "window": "@42",
+                    "kind": "cdx",
+                    "role": "implement",
+                    "worktree": str(paths["root"] / "wt-15"),
+                    "log": "/tmp/cdx-WIKI-15.log",
+                    "session_id": "sess-wiki-15",
+                }
+            }
+        }))
+        accounts.ensure_state_initialized(accounts.AccountState())
+
+        emitted: list[dict] = []
+        revive_calls: list[str] = []
+
+        async def emit(evt: dict) -> None:
+            emitted.append(evt)
+
+        with mock.patch.object(accounts, "tmux_live_windows", lambda: {"@42"}), \
+             mock.patch.object(accounts, "tmux_capture", lambda w, lines=60: REAL_AUTH_DEAD_STRING), \
+             mock.patch.object(accounts, "tmux_window_session", lambda w: "phoebe"), \
+             mock.patch.object(accounts, "tmux_kill_window", lambda w: revive_calls.append(f"kill:{w}")), \
+             mock.patch.object(accounts, "tmux_new_window", lambda n, c, cmd, target_session=None: (revive_calls.append(f"new:{cmd}"), "@200")[1]), \
+             mock.patch.object(accounts, "tmux_pipe_pane", lambda w, l: None), \
+             mock.patch.object(accounts, "tmux_send_literal_and_enter", lambda w, t: None), \
+             mock.patch.object(accounts, "wait_for_codex_ready", lambda w, t: True), \
+             mock.patch.object(accounts, "wait_for_cwd_dialog_and_answer", lambda w, timeout_seconds=8.0: False), \
+             mock.patch.object(accounts, "wiki_agent_update", lambda t, w, l, sid=None: None):
+            watch = accounts.WatchdogInternalState()
+            for _ in range(cycles):
+                # Bypass the cooldown between cycles by rewinding the last
+                # attempt timestamp past the cooldown boundary.
+                for ticket in list(watch.auth_dead_attempts.keys()):
+                    history = watch.auth_dead_attempts[ticket]
+                    if history:
+                        history[-1] -= accounts.AUTH_DEAD_COOLDOWN_SECONDS + 1
+                await accounts._check_once(watch, emit)
+        return emitted, revive_calls
+
+    async def test_stops_reviving_after_max_attempts(self) -> None:
+        with _EnvOverride() as paths:
+            emitted, calls = await self._drive_cycles(paths, cycles=5)
+        revive_events = [e for e in emitted if e["type"] == "codex_auth_dead_revival"]
+        exhausted_events = [e for e in emitted if e["type"] == "codex_auth_dead_exhausted"]
+        self.assertEqual(
+            len(revive_events),
+            accounts.AUTH_DEAD_MAX_ATTEMPTS,
+            "revive at most AUTH_DEAD_MAX_ATTEMPTS times",
+        )
+        self.assertGreaterEqual(
+            len(exhausted_events),
+            1,
+            "manual-attention alert emitted after cap hit",
+        )
+        # Once exhausted, no further new-window calls.
+        new_window_calls = [c for c in calls if c.startswith("new:")]
+        self.assertEqual(len(new_window_calls), accounts.AUTH_DEAD_MAX_ATTEMPTS)
+
+    async def test_cooldown_blocks_back_to_back_revives(self) -> None:
+        """Two consecutive polls (no timestamp rewind) → only ONE revive."""
+        with _EnvOverride() as paths:
+            (paths["accounts"] / "alpha").mkdir()
+            (paths["accounts"] / "alpha" / "auth.json").write_text("{}")
+            paths["auth"].write_text("{}")
+            paths["registry"].write_text(json.dumps({
+                "WIKI-15": {
+                    "current": {
+                        "ticket": "WIKI-15",
+                        "window": "@42",
+                        "kind": "cdx",
+                        "role": "implement",
+                        "worktree": str(paths["root"] / "wt-15"),
+                        "log": "/tmp/cdx-WIKI-15.log",
+                        "session_id": "sess-wiki-15",
+                    }
+                }
+            }))
+            accounts.ensure_state_initialized(accounts.AccountState())
+
+            emitted: list[dict] = []
+            new_calls: list[str] = []
+
+            async def emit(evt: dict) -> None:
+                emitted.append(evt)
+
+            with mock.patch.object(accounts, "tmux_live_windows", lambda: {"@42"}), \
+                 mock.patch.object(accounts, "tmux_capture", lambda w, lines=60: REAL_AUTH_DEAD_STRING), \
+                 mock.patch.object(accounts, "tmux_window_session", lambda w: "phoebe"), \
+                 mock.patch.object(accounts, "tmux_kill_window", lambda w: None), \
+                 mock.patch.object(accounts, "tmux_new_window", lambda n, c, cmd, target_session=None: (new_calls.append(cmd), "@200")[1]), \
+                 mock.patch.object(accounts, "tmux_pipe_pane", lambda w, l: None), \
+                 mock.patch.object(accounts, "tmux_send_literal_and_enter", lambda w, t: None), \
+                 mock.patch.object(accounts, "wait_for_codex_ready", lambda w, t: True), \
+                 mock.patch.object(accounts, "wait_for_cwd_dialog_and_answer", lambda w, timeout_seconds=8.0: False), \
+                 mock.patch.object(accounts, "wiki_agent_update", lambda t, w, l, sid=None: None):
+                watch = accounts.WatchdogInternalState()
+                await accounts._check_once(watch, emit)
+                await accounts._check_once(watch, emit)
+
+            self.assertEqual(
+                len(new_calls),
+                1,
+                "cooldown must block a second revive inside the window",
+            )
 
 
 class RevivalMessageTests(unittest.TestCase):

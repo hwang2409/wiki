@@ -163,7 +163,18 @@ def find_codex_session(
                             chain.append(p)
                     except OSError:
                         continue
-            return max(chain, key=lambda p: p.stat().st_mtime)
+            # Rollouts can be deleted mid-scan (cleanup, session archive). max()
+            # over stat() would leak OSError up to the endpoint — collect
+            # (mtime, path) tuples defensively, skipping the vanished files.
+            ranked: list[tuple[float, Path]] = []
+            for p in chain:
+                try:
+                    ranked.append((p.stat().st_mtime, p))
+                except OSError:
+                    continue
+            if not ranked:
+                return None
+            return max(ranked, key=lambda pair: pair[0])[1]
 
     slug = ticket.lower()
     matches = [

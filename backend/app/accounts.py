@@ -114,11 +114,12 @@ CLAUDE_LIMIT_PATTERN = re.compile(
 # Codex prints this when its cached refresh token is stale (workstation slept,
 # auth swapped externally, another install signed in). The pane is dead —
 # process keeps running but every generation fails with a token-refresh error.
-# Two shapes seen: the long "your access token could not be refreshed" body,
-# and the terser "Please sign in again" tail (both included defensively).
+# Match the full "your access token could not be refreshed" phrase only —
+# a bare "please sign in again" tail is too broad (product copy, docs, tests,
+# and any pane displaying sign-in-related text would false-positive and
+# trigger a kill+resume every poll cycle).
 AUTH_DEAD_PATTERN = re.compile(
-    r"your\s+access\s+token\s+could\s+not\s+be\s+refreshed"
-    r"|please\s+sign\s+in\s+again",
+    r"your\s+access\s+token\s+could\s+not\s+be\s+refreshed",
     re.IGNORECASE,
 )
 # Codex's cwd-mismatch chooser when a rollout is resumed from a directory
@@ -838,7 +839,7 @@ def _revive_worker(
 
     Explicit-id-only: if no lineage is resolvable, we do NOT spawn a fresh
     session (which would replay no history and orphan the transcript). Return
-    ("", reason) so the caller can surface an SSE alert.
+    (None, reason) so the caller can surface an SSE alert.
     """
     session_id = _resolve_revival_session_id(worker)
     if not session_id:
@@ -1007,6 +1008,19 @@ class WatchdogInternalState:
     last_rotation_attempt: float = 0.0
     last_alert_at: dict[str, float] = field(default_factory=dict)
     last_no_eligible_alert: float = 0.0
+    # Per-ticket auth-dead revival timestamps (monotonic). Bounded loop:
+    # after AUTH_DEAD_MAX_ATTEMPTS attempts inside AUTH_DEAD_WINDOW_SECONDS,
+    # or if the last attempt was under AUTH_DEAD_COOLDOWN_SECONDS ago, skip
+    # the revive and emit a manual-attention alert — otherwise a genuinely
+    # broken token loops kill+resume every poll cycle forever.
+    auth_dead_attempts: dict[str, list[float]] = field(default_factory=dict)
+    auth_dead_alert_at: dict[str, float] = field(default_factory=dict)
+
+
+AUTH_DEAD_MAX_ATTEMPTS = 3
+AUTH_DEAD_WINDOW_SECONDS = 3600.0
+AUTH_DEAD_COOLDOWN_SECONDS = 300.0
+AUTH_DEAD_ALERT_INTERVAL_SECONDS = 3600.0
 
 
 def _seconds_since(ts: float) -> float:
@@ -1034,15 +1048,47 @@ async def _check_once(
 
     # Auth-dead workers get killed + resumed on the CURRENT auth.json — no
     # account swap, so no debounce interaction with the rotation loop below.
+    # Bounded per-ticket: cooldown + windowed max-attempts. Genuinely-dead
+    # tokens keep re-showing the signature after revive; without the cap the
+    # watchdog would kill+resume the same worker every poll forever.
     if auth_dead:
-        result = await asyncio.to_thread(revive_auth_dead, auth_dead)
-        await emit({
-            "type": "codex_auth_dead_revival",
-            "revived": result.revived,
-            "failed": result.failed,
-            "failed_reasons": result.failed_reasons,
-            "ts": datetime.now(timezone.utc).isoformat(),
-        })
+        now_mono = time.monotonic()
+        eligible: list[WorkerEntry] = []
+        exhausted: list[str] = []
+        for worker in auth_dead:
+            history = watch.auth_dead_attempts.setdefault(worker.ticket, [])
+            history[:] = [t for t in history if now_mono - t < AUTH_DEAD_WINDOW_SECONDS]
+            if history and now_mono - history[-1] < AUTH_DEAD_COOLDOWN_SECONDS:
+                exhausted.append(worker.ticket)
+                continue
+            if len(history) >= AUTH_DEAD_MAX_ATTEMPTS:
+                exhausted.append(worker.ticket)
+                continue
+            history.append(now_mono)
+            eligible.append(worker)
+        if exhausted:
+            need_alert = [
+                ticket for ticket in exhausted
+                if now_mono - watch.auth_dead_alert_at.get(ticket, 0.0)
+                >= AUTH_DEAD_ALERT_INTERVAL_SECONDS
+            ]
+            if need_alert:
+                for ticket in need_alert:
+                    watch.auth_dead_alert_at[ticket] = now_mono
+                await emit({
+                    "type": "codex_auth_dead_exhausted",
+                    "tickets": need_alert,
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                })
+        if eligible:
+            result = await asyncio.to_thread(revive_auth_dead, eligible)
+            await emit({
+                "type": "codex_auth_dead_revival",
+                "revived": result.revived,
+                "failed": result.failed,
+                "failed_reasons": result.failed_reasons,
+                "ts": datetime.now(timezone.utc).isoformat(),
+            })
 
     for worker in claude_workers:
         if worker.window not in live:
