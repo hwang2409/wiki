@@ -69,7 +69,12 @@ def start_parent_watchdog(server: uvicorn.Server, parent_pid: int | None) -> Non
             sys.stderr.write(f"parent {parent_pid} exited; stopping wiki-backend\n")
             sys.stderr.flush()
             server.should_exit = True
-            return
+            time.sleep(3)
+            server.force_exit = True
+            sys.stderr.write("parent watchdog forcing wiki-backend exit\n")
+            sys.stderr.flush()
+            time.sleep(1)
+            os._exit(1)
 
     threading.Thread(target=watch, name="wiki-parent-watchdog", daemon=True).start()
 

@@ -70,6 +70,13 @@ def _prune_empty_dirs(vault: Path, start: Path) -> None:
         current = current.parent
 
 
+def _split_wikilink_target(target: str) -> tuple[str, str]:
+    base, sep, suffix = target.partition("#")
+    if not sep:
+        return target, ""
+    return base, f"{sep}{suffix}"
+
+
 def rename_note(vault: Path, old_rel: str, new_rel: str) -> list[str]:
     """Move a note; if the slug changed, rewrite [[wikilinks]] vault-wide.
 
@@ -100,11 +107,12 @@ def rename_note(vault: Path, old_rel: str, new_rel: str) -> list[str]:
     def transform(segment: str) -> str:
         def replace(match: re.Match[str]) -> str:
             target = match.group(1).strip()
+            target_base, target_suffix = _split_wikilink_target(target)
             alias = match.group(2) or ""
-            if target == old_target:
-                return f"[[{new_target}{alias}]]"
-            if rewrite_slug and target == old_slug:
-                return f"[[{new_slug}{alias}]]"
+            if target_base == old_target:
+                return f"[[{new_target}{target_suffix}{alias}]]"
+            if rewrite_slug and target_base == old_slug:
+                return f"[[{new_slug}{target_suffix}{alias}]]"
             return match.group(0)
 
         return WIKILINK_RE.sub(replace, segment)

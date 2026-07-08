@@ -193,7 +193,8 @@ fn spawn_sidecar_logger(
                 CommandEvent::Terminated(payload) => {
                     let summary = termination_summary(&payload);
                     let _ = append_log(&log_path, &format!("terminated {summary}"));
-                    handle_sidecar_termination(&app, pid, summary);
+                    let app = app.clone();
+                    thread::spawn(move || handle_sidecar_termination(&app, pid, summary));
                     break;
                 }
                 _ => {}
@@ -483,7 +484,7 @@ fn show_error_dialog(app: &AppHandle, title: &str, message: &str) {
         .message(message.to_string())
         .title(title)
         .kind(MessageDialogKind::Error)
-        .show(|_| {});
+        .blocking_show();
 }
 
 #[cfg(unix)]
