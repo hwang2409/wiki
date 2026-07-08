@@ -11,9 +11,13 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use reqwest::blocking::Client;
-use tauri::{App, AppHandle, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use reqwest::{blocking::Client, Url};
+use tauri::{
+    webview::NewWindowResponse, App, AppHandle, Manager, RunEvent, WebviewUrl,
+    WebviewWindowBuilder, WindowEvent,
+};
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_shell::{
     process::{CommandChild, CommandEvent, TerminatedPayload},
     ShellExt,
@@ -37,6 +41,7 @@ pub struct NativeAppState {
 
 #[derive(Default)]
 struct LifecycleState {
+    app_origin: Option<String>,
     sidecar: Option<SidecarState>,
 }
 
@@ -60,20 +65,30 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn Error>> {
 
     let launch_url = if let Ok(url) = env::var("WIKI_NATIVE_BACKEND_URL") {
         let launch_url = normalize_launch_url(&url);
+        set_app_origin(app.handle(), &launch_url);
         wait_for_health(app.handle(), &launch_url, None)?;
         launch_url
     } else {
         start_sidecar(app.handle(), 0)?
     };
 
+    let app_handle = app.handle().clone();
     WebviewWindowBuilder::new(
-        app.handle(),
+        &app_handle,
         MAIN_WINDOW_LABEL,
         WebviewUrl::External(launch_url.parse()?),
     )
     .title(WINDOW_TITLE)
     .inner_size(1400.0, 950.0)
     .resizable(true)
+    .on_navigation({
+        let app_handle = app_handle.clone();
+        move |url| handle_navigation_request(&app_handle, url)
+    })
+    .on_new_window({
+        let app_handle = app_handle.clone();
+        move |url, _features| handle_new_window_request(&app_handle, &url)
+    })
     // Tauri's native drag-drop handler intercepts drag events and breaks
     // HTML5 DnD (kanban, pane splits) inside the webview — disable it.
     .disable_drag_drop_handler()
@@ -175,6 +190,7 @@ fn start_sidecar(app: &AppHandle, restart_count: u8) -> Result<String, Box<dyn E
         }
     }
     append_log(&log_path, &format!("backend healthy on {launch_url}"))?;
+    set_app_origin(app, &launch_url);
 
     Ok(launch_url)
 }
@@ -410,6 +426,53 @@ fn append_log(log_path: &Path, line: &str) -> io::Result<()> {
         .open(log_path)?;
     writeln!(file, "{line}")?;
     Ok(())
+}
+
+fn set_app_origin(app: &AppHandle, launch_url: &str) {
+    let origin = Url::parse(launch_url)
+        .ok()
+        .map(|url| url.origin().ascii_serialization());
+    let app_state = app.state::<NativeAppState>();
+    let mut state = app_state.inner.lock().unwrap();
+    state.app_origin = origin;
+}
+
+fn app_origin(app: &AppHandle) -> Option<String> {
+    let app_state = app.state::<NativeAppState>();
+    let state = app_state.inner.lock().unwrap();
+    state.app_origin.clone()
+}
+
+fn allow_in_webview(app: &AppHandle, url: &Url) -> bool {
+    match url.scheme() {
+        "tauri" | "asset" => true,
+        "http" | "https" => app_origin(app)
+            .is_some_and(|origin| origin == url.origin().ascii_serialization()),
+        _ => false,
+    }
+}
+
+fn should_open_externally(app: &AppHandle, url: &Url) -> bool {
+    matches!(url.scheme(), "http" | "https") && !allow_in_webview(app, url)
+}
+
+fn handle_navigation_request(app: &AppHandle, url: &Url) -> bool {
+    if should_open_externally(app, url) {
+        let _ = app.opener().open_url(url.as_str(), None::<&str>);
+        return false;
+    }
+    allow_in_webview(app, url)
+}
+
+fn handle_new_window_request(app: &AppHandle, url: &Url) -> NewWindowResponse<tauri::Wry> {
+    if should_open_externally(app, url) {
+        let _ = app.opener().open_url(url.as_str(), None::<&str>);
+        return NewWindowResponse::Deny;
+    }
+    if allow_in_webview(app, url) {
+        return NewWindowResponse::Allow;
+    }
+    NewWindowResponse::Deny
 }
 
 fn normalize_launch_url(raw: &str) -> String {

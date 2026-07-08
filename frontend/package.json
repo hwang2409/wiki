@@ -22,6 +22,7 @@
     "@fontsource/source-serif-4": "^5.2.9",
     "@fontsource/space-mono": "^5.2.9",
     "@fontsource/victor-mono": "^5.2.8",
+    "@tauri-apps/plugin-opener": "^2.5.4",
     "@vitejs/plugin-react": "^5.1.1",
     "lucide-react": "^0.561.0",
     "react": "^19.2.1",

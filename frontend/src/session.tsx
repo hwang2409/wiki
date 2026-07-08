@@ -1,4 +1,5 @@
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import type { ComponentProps } from "react";
 import {
   AlertTriangle,
   Bell,
@@ -48,6 +49,7 @@ import type {
   SkillInfo,
   SubagentInfo,
 } from "./api";
+import { externalLinkProps } from "./external-links";
 import { LoadingPlaceholder } from "./loading";
 
 const POLL_MS = 2500;
@@ -297,8 +299,7 @@ function ImageChip({ url, num }: { url: string; num: number }) {
       <a
         className="session-image-chip"
         href={url}
-        rel="noopener noreferrer"
-        target="_blank"
+        {...externalLinkProps(url)}
       >
         [Image #{num}]
       </a>
@@ -310,6 +311,14 @@ function ImageChip({ url, num }: { url: string; num: number }) {
     </span>
   );
 }
+
+function SessionMarkdownLink({ href, ...props }: ComponentProps<"a">) {
+  return <a href={href} {...props} {...externalLinkProps(href)} />;
+}
+
+const sessionMarkdownComponents = {
+  a: SessionMarkdownLink,
+};
 
 const sameEvents = (
   prev: { events: SessionEvent[]; onInspect?: (agentId: string) => void },
@@ -398,7 +407,7 @@ function InterruptRow({ text }: { text: string }) {
 function PrRow({ pr, text }: { pr: SessionPr | undefined; text: string }) {
   if (!pr) return null;
   return (
-    <a className="session-pr-chip" href={pr.url} rel="noopener noreferrer" target="_blank">
+    <a className="session-pr-chip" href={pr.url} {...externalLinkProps(pr.url)}>
       <GitPullRequest size={12} />
       <span>{text}</span>
     </a>
@@ -472,7 +481,9 @@ const MessageBlock = memo(function MessageBlock({
   }
   return (
     <div className="session-assistant markdown-preview-view">
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>{event.text}</ReactMarkdown>
+      <ReactMarkdown components={sessionMarkdownComponents} remarkPlugins={[remarkGfm]}>
+        {event.text}
+      </ReactMarkdown>
     </div>
   );
 });
@@ -678,8 +689,7 @@ export function SessionTab({
             <a
               className="session-state-pr"
               href={session.pr.url}
-              rel="noopener noreferrer"
-              target="_blank"
+              {...externalLinkProps(session.pr.url)}
             >
               <GitPullRequest size={12} />
               PR #{session.pr.number}

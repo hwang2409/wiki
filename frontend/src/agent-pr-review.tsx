@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import { approveAgentPr, getAgentPr } from "./api";
 import type { AgentPrCheck, AgentPrData } from "./api";
+import { externalLinkProps } from "./external-links";
 import { SplitDiffView } from "./split-diff";
 
 function humanizeEnum(value: string | null | undefined, fallback = "unknown"): string {
@@ -124,8 +125,7 @@ export function AgentPrReviewPanel({
           <a
             className="pr-review-link"
             href={data.url}
-            rel="noopener noreferrer"
-            target="_blank"
+            {...externalLinkProps(data.url)}
           >
             <ExternalLink size={12} />
             github
@@ -230,8 +230,7 @@ export function AgentPrReviewPanel({
                   className="pr-review-check"
                   href={check.detailsUrl}
                   key={`${check.name}-${index}`}
-                  rel="noopener noreferrer"
-                  target="_blank"
+                  {...externalLinkProps(check.detailsUrl)}
                 >
                   {content}
                 </a>
@@ -268,8 +267,7 @@ export function AgentPrReviewPanel({
                     <a
                       className="pr-review-thread-link"
                       href={thread.url}
-                      rel="noopener noreferrer"
-                      target="_blank"
+                      {...externalLinkProps(thread.url)}
                     >
                       <ExternalLink size={11} />
                       comment
