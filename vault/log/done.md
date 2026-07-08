@@ -9,6 +9,9 @@ updated: 2026-07-08
 
 ## 2026-07-08
 
+- **WIKI-17** — native app persistence — stable port + server-side ui-state mirror (owner: cc:WIKI-17)
+- **WIKI-14** — render Claude task lists in transcript (counts header + per-task status glyphs like TUI); prereq = JSONL event-coverage audit (unhandled codex/claude event types)
+- **WIKI-12** — tmux window model redesign — cdx:WIKI-12
 - **WIKI-15** — backend usage-limit watchdog — autonomous codex account rotation + fleet revival (owner: cc:WIKI-15)
 - **WIKI-13** — agent-UI nits — composer growth must push transcript up (always readable above chatbox); font dropdown renders each option in its own font (preview); add Monaco, Consolas + all installed coding fonts to font list
 - **wiki** — WIKI-10 Conductor-inspired restyle merged (PR #10) — transcript/composer/spawn-modal modernization, styling-only, 12-theme safe
