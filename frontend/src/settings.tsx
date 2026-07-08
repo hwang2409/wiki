@@ -98,9 +98,6 @@ const SANS_TAIL =
 const SERIF_TAIL =
   'Georgia, Charter, "Iowan Old Style", "Times New Roman", serif';
 
-const SYSTEM_UI_STACK =
-  '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Helvetica, Arial, sans-serif';
-
 export const MONO_FONTS: FontChoice[] = [
   {
     label: "JetBrains Mono",
@@ -190,7 +187,7 @@ export const UI_FONTS: FontChoice[] = [
   {
     label: "System",
     family: "-apple-system",
-    stack: SYSTEM_UI_STACK,
+    stack: SANS_TAIL,
   },
   {
     label: "Inter",
@@ -215,7 +212,7 @@ export const TEXT_FONTS: FontChoice[] = [
   {
     label: "System",
     family: "-apple-system",
-    stack: SYSTEM_UI_STACK,
+    stack: SANS_TAIL,
   },
   {
     label: "Inter",
@@ -240,9 +237,6 @@ export const TEXT_FONTS: FontChoice[] = [
   { label: "Optima", family: "Optima", stack: `Optima, ${SANS_TAIL}` },
 ];
 
-const MONO_FONT_KEY = "wiki-mono-font";
-const UI_FONT_KEY = "wiki-ui-font";
-const TEXT_FONT_KEY = "wiki-text-font";
 const BODY_SIZE_KEY = "wiki-font-size-body";
 const UI_SIZE_KEY = "wiki-font-size-ui";
 const BODY_SIZE_DEFAULT = 16.5;
@@ -250,6 +244,43 @@ const UI_SIZE_DEFAULT = 13.5;
 
 const MONO_SAMPLE = "→ const x = 0O1lIi";
 const PROP_SAMPLE = "The quick brown fox";
+
+type FontRoleId = "ui" | "text" | "mono";
+type FontRole = {
+  name: string;
+  desc: string;
+  fonts: FontChoice[];
+  key: string;
+  cssVar: string;
+  sample: string;
+};
+
+const FONT_ROLES: Record<FontRoleId, FontRole> = {
+  ui: {
+    name: "Interface font",
+    desc: "App chrome: sidebar, tabs, buttons, status bar, dialogs.",
+    fonts: UI_FONTS,
+    key: "wiki-ui-font",
+    cssVar: "--font-interface",
+    sample: PROP_SAMPLE,
+  },
+  text: {
+    name: "Note font",
+    desc: "Body text of rendered notes and the source editor.",
+    fonts: TEXT_FONTS,
+    key: "wiki-text-font",
+    cssVar: "--font-text",
+    sample: PROP_SAMPLE,
+  },
+  mono: {
+    name: "Monospace font",
+    desc: "Code blocks, agent transcripts, and mono UI chrome.",
+    fonts: MONO_FONTS,
+    key: "wiki-mono-font",
+    cssVar: "--font-monospace",
+    sample: MONO_SAMPLE,
+  },
+};
 
 const loadedFonts = new Set<string>();
 function loadFont(choice: FontChoice): Promise<void> {
@@ -320,23 +351,23 @@ function applyFontVar(cssVar: string, choice: FontChoice) {
 }
 
 export function applyStoredFonts() {
-  applyFontVar("--font-monospace", pickChoice(MONO_FONTS, localStorage.getItem(MONO_FONT_KEY)));
-  applyFontVar("--font-interface", pickChoice(UI_FONTS, localStorage.getItem(UI_FONT_KEY)));
-  applyFontVar("--font-text", pickChoice(TEXT_FONTS, localStorage.getItem(TEXT_FONT_KEY)));
+  for (const role of Object.values(FONT_ROLES)) {
+    applyFontVar(role.cssVar, pickChoice(role.fonts, localStorage.getItem(role.key)));
+  }
   applySizes(
     storedSize(BODY_SIZE_KEY, BODY_SIZE_DEFAULT),
     storedSize(UI_SIZE_KEY, UI_SIZE_DEFAULT)
   );
 }
 
-function currentLabel(key: string, fonts: FontChoice[]): string {
-  return localStorage.getItem(key) ?? fonts[0].label;
+function currentLabel(role: FontRole): string {
+  return localStorage.getItem(role.key) ?? role.fonts[0].label;
 }
 
-function setFont(fonts: FontChoice[], key: string, cssVar: string, label: string) {
-  const choice = pickChoice(fonts, label);
-  localStorage.setItem(key, choice.label);
-  applyFontVar(cssVar, choice);
+function setFont(role: FontRole, label: string) {
+  const choice = pickChoice(role.fonts, label);
+  localStorage.setItem(role.key, choice.label);
+  applyFontVar(role.cssVar, choice);
 }
 
 function FontPicker({
@@ -436,6 +467,27 @@ function FontPicker({
   );
 }
 
+function FontRoleRow({ role }: { role: FontRole }) {
+  const [label, setLabel] = useState(() => currentLabel(role));
+  return (
+    <div className="settings-row">
+      <div className="settings-row-info">
+        <div className="settings-row-name">{role.name}</div>
+        <div className="settings-row-desc">{role.desc}</div>
+      </div>
+      <FontPicker
+        current={label}
+        fonts={role.fonts}
+        sample={role.sample}
+        onChange={(next) => {
+          setFont(role, next);
+          setLabel(next);
+        }}
+      />
+    </div>
+  );
+}
+
 export function SettingsModal({
   onClose,
   onThemeChange,
@@ -445,9 +497,6 @@ export function SettingsModal({
   onThemeChange: (theme: ThemeId) => void;
   theme: ThemeId;
 }) {
-  const [monoFont, setMonoFontLabel] = useState(() => currentLabel(MONO_FONT_KEY, MONO_FONTS));
-  const [uiFont, setUiFontLabel] = useState(() => currentLabel(UI_FONT_KEY, UI_FONTS));
-  const [textFont, setTextFontLabel] = useState(() => currentLabel(TEXT_FONT_KEY, TEXT_FONTS));
   const [bodySize, setBodySize] = useState(() => storedSize(BODY_SIZE_KEY, BODY_SIZE_DEFAULT));
   const [uiSize, setUiSize] = useState(() => storedSize(UI_SIZE_KEY, UI_SIZE_DEFAULT));
 
@@ -509,60 +558,12 @@ export function SettingsModal({
               ))}
             </div>
           </div>
-          <div className="settings-row">
-            <div className="settings-row-info">
-              <div className="settings-row-name">Interface font</div>
-              <div className="settings-row-desc">
-                App chrome: sidebar, tabs, buttons, status bar, dialogs.
-              </div>
-            </div>
-            <FontPicker
-              current={uiFont}
-              fonts={UI_FONTS}
-              sample={PROP_SAMPLE}
-              onChange={(label) => {
-                setFont(UI_FONTS, UI_FONT_KEY, "--font-interface", label);
-                setUiFontLabel(label);
-              }}
-            />
-          </div>
-          <div className="settings-row">
-            <div className="settings-row-info">
-              <div className="settings-row-name">Note font</div>
-              <div className="settings-row-desc">
-                Body text of rendered notes and the source editor.
-              </div>
-            </div>
-            <FontPicker
-              current={textFont}
-              fonts={TEXT_FONTS}
-              sample={PROP_SAMPLE}
-              onChange={(label) => {
-                setFont(TEXT_FONTS, TEXT_FONT_KEY, "--font-text", label);
-                setTextFontLabel(label);
-              }}
-            />
-          </div>
+          <FontRoleRow role={FONT_ROLES.ui} />
+          <FontRoleRow role={FONT_ROLES.text} />
           <div className="settings-preview" style={{ fontFamily: "var(--font-text)" }}>
             The quick brown fox jumps over the lazy dog — 0123456789
           </div>
-          <div className="settings-row">
-            <div className="settings-row-info">
-              <div className="settings-row-name">Monospace font</div>
-              <div className="settings-row-desc">
-                Code blocks, agent transcripts, and mono UI chrome.
-              </div>
-            </div>
-            <FontPicker
-              current={monoFont}
-              fonts={MONO_FONTS}
-              sample={MONO_SAMPLE}
-              onChange={(label) => {
-                setFont(MONO_FONTS, MONO_FONT_KEY, "--font-monospace", label);
-                setMonoFontLabel(label);
-              }}
-            />
-          </div>
+          <FontRoleRow role={FONT_ROLES.mono} />
           <div className="settings-preview" style={{ fontFamily: "var(--font-monospace)" }}>
             wiki agent register PHO-1234 --orch phoebe {"->"} 0O1lI| fi ff
           </div>
