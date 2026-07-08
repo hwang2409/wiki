@@ -33,6 +33,7 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 ## Phoebe/til
 
 - [[codebuild-secrets-json-key-drift]] — CodeBuild migrate failure: Secrets Manager JSON key missing during environment processing
+- [[voice-qa-clock-writeback-action-family]] — Voice QA clock writeback can be blocked by QA_VOICE_AGENT_ENABLED_ACTION_FAMILIES vs call audit_context mismatch
 
 ## Tools/til
 

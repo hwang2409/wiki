@@ -9,6 +9,7 @@ updated: 2026-07-08
 
 ## 2026-07-08
 
+- **phoebe** — PHO-13144 RCA/fix for voice QA clock writeback action-family gate ([#10812](https://github.com/phoebe-health/phoebe/pull/10812) merge-ready)
 - **wiki** — native macOS app (Tauri 2 + PyInstaller sidecar) merged, PR #1: plan→implement→review via codex workers WIKI-1/WIKI-2, 1:1 parity vs web app, web flow unregressed
 
 ## 2026-07-07
