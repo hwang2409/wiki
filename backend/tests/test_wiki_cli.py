@@ -1,8 +1,4 @@
-"""Wiki CLI regression tests.
-
-Only covers the WIKI-19 addition (--session round-trip on `agent update`).
-The rest of the CLI has manual QA coverage.
-"""
+"""Wiki CLI regression tests."""
 
 from __future__ import annotations
 
@@ -10,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import textwrap
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -80,6 +77,175 @@ class AgentUpdateSessionTests(unittest.TestCase):
             reloaded = json.loads(registry_path.read_text())
             self.assertEqual(reloaded["WIKI-15"]["current"]["window"], "@99")
             self.assertNotIn("session_id", reloaded["WIKI-15"]["current"])
+
+
+class AgentDoneWindowCleanupTests(unittest.TestCase):
+    def _run(self, args: list[str], env: dict) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(WIKI_CLI), *args],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=15,
+        )
+
+    def _write_registry(self, path: Path, ticket: str, window: str = "@12") -> None:
+        path.write_text(
+            json.dumps(
+                {
+                    ticket: {
+                        "current": {
+                            "window": window,
+                            "kind": "cdx",
+                            "role": "implement",
+                            "log": f"/tmp/cdx-{ticket}.log",
+                        },
+                        "history": [],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def _write_archive(self, home: Path, ticket: str) -> Path:
+        session_dir = home / "me" / "fun" / "agent-archive" / ticket / "20260708-183300"
+        session_dir.mkdir(parents=True)
+        meta_path = session_dir / "meta.json"
+        meta_path.write_text("{}\n", encoding="utf-8")
+        return meta_path
+
+    def _install_tmux_stub(self, bin_dir: Path) -> Path:
+        script = bin_dir / "tmux"
+        script.write_text(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env python3
+                import os
+                import sys
+                from pathlib import Path
+
+                args = sys.argv[1:]
+                if args == ["list-windows", "-a", "-F", "#{window_id}"]:
+                    sys.stdout.write(os.environ.get("TMUX_WINDOWS", ""))
+                    sys.exit(int(os.environ.get("TMUX_LIST_EXIT", "0")))
+                if len(args) == 3 and args[:2] == ["kill-window", "-t"]:
+                    log_path = os.environ.get("TMUX_KILL_LOG")
+                    if log_path:
+                        with Path(log_path).open("a", encoding="utf-8") as handle:
+                            handle.write(args[2] + "\\n")
+                    sys.exit(int(os.environ.get("TMUX_KILL_EXIT", "0")))
+                sys.exit(97)
+                """
+            ),
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+        return script
+
+    def test_done_kills_exact_recorded_window(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            registry_path = tmp_path / "agent-registry.json"
+            kill_log = tmp_path / "killed.log"
+            self._write_registry(registry_path, "WIKI-26", window="@12")
+            meta_path = self._write_archive(tmp_path, "WIKI-26")
+            bin_dir = tmp_path / "bin"
+            bin_dir.mkdir()
+            self._install_tmux_stub(bin_dir)
+            env = {
+                **os.environ,
+                "HOME": str(tmp_path),
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+                "TMUX_WINDOWS": "@12\n@999\n",
+                "TMUX_KILL_LOG": str(kill_log),
+                "WIKI_AGENT_REGISTRY_PATH": str(registry_path),
+            }
+
+            proc = self._run(["agent", "done", "WIKI-26", "--outcome", "merged"], env=env)
+
+            self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+            self.assertIn("deregistered WIKI-26 (outcome: merged)", proc.stdout)
+            self.assertIn("killed window @12", proc.stdout)
+            self.assertEqual(kill_log.read_text(encoding="utf-8"), "@12\n")
+            self.assertEqual(json.loads(registry_path.read_text(encoding="utf-8")), {})
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            self.assertEqual(meta["outcome"], "merged")
+            self.assertEqual(meta["worker"]["window"], "@12")
+            self.assertIn("ended_at", meta)
+
+    def test_done_keep_window_skips_tmux_calls(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            registry_path = tmp_path / "agent-registry.json"
+            kill_log = tmp_path / "killed.log"
+            self._write_registry(registry_path, "WIKI-26", window="@12")
+            self._write_archive(tmp_path, "WIKI-26")
+            bin_dir = tmp_path / "bin"
+            bin_dir.mkdir()
+            self._install_tmux_stub(bin_dir)
+            env = {
+                **os.environ,
+                "HOME": str(tmp_path),
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+                "TMUX_WINDOWS": "@12\n",
+                "TMUX_KILL_LOG": str(kill_log),
+                "WIKI_AGENT_REGISTRY_PATH": str(registry_path),
+            }
+
+            proc = self._run(
+                ["agent", "done", "WIKI-26", "--outcome", "merged", "--keep-window"],
+                env=env,
+            )
+
+            self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+            self.assertIn("kept window @12", proc.stdout)
+            self.assertFalse(kill_log.exists())
+
+    def test_done_reports_window_already_gone(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            registry_path = tmp_path / "agent-registry.json"
+            kill_log = tmp_path / "killed.log"
+            self._write_registry(registry_path, "WIKI-26", window="@12")
+            self._write_archive(tmp_path, "WIKI-26")
+            bin_dir = tmp_path / "bin"
+            bin_dir.mkdir()
+            self._install_tmux_stub(bin_dir)
+            env = {
+                **os.environ,
+                "HOME": str(tmp_path),
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+                "TMUX_WINDOWS": "@999\n",
+                "TMUX_KILL_LOG": str(kill_log),
+                "WIKI_AGENT_REGISTRY_PATH": str(registry_path),
+            }
+
+            proc = self._run(["agent", "done", "WIKI-26", "--outcome", "closed"], env=env)
+
+            self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+            self.assertIn("window already gone: @12", proc.stdout)
+            self.assertFalse(kill_log.exists())
+
+    def test_done_tolerates_tmux_absent(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            registry_path = tmp_path / "agent-registry.json"
+            self._write_registry(registry_path, "WIKI-26", window="@12")
+            self._write_archive(tmp_path, "WIKI-26")
+            bin_dir = tmp_path / "bin"
+            bin_dir.mkdir()
+            env = {
+                **os.environ,
+                "HOME": str(tmp_path),
+                "PATH": str(bin_dir),
+                "WIKI_AGENT_REGISTRY_PATH": str(registry_path),
+            }
+
+            proc = self._run(["agent", "done", "WIKI-26", "--outcome", "abandoned"], env=env)
+
+            self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+            self.assertIn("window already gone: @12", proc.stdout)
+            self.assertEqual(json.loads(registry_path.read_text(encoding="utf-8")), {})
 
 
 if __name__ == "__main__":
