@@ -9,6 +9,7 @@ updated: 2026-07-08
 
 ## 2026-07-08
 
+- **WIKI-15** — backend usage-limit watchdog — autonomous codex account rotation + fleet revival (owner: cc:WIKI-15)
 - **WIKI-13** — agent-UI nits — composer growth must push transcript up (always readable above chatbox); font dropdown renders each option in its own font (preview); add Monaco, Consolas + all installed coding fonts to font list
 - **wiki** — WIKI-10 Conductor-inspired restyle merged (PR #10) — transcript/composer/spawn-modal modernization, styling-only, 12-theme safe
 - **wiki** — PR #9 unified session surface (pane parity, review side panel, compact checks) + PR #8 keyboard focus model (pane scope, vim layering, skill-picker keys) merged

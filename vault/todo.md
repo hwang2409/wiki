@@ -17,7 +17,6 @@ In Progress:
 - WIKI-12: tmux window model redesign — cdx:WIKI-12
 - [PHO-13218](https://linear.app/phoebework/issue/PHO-13218): tiered tool mounting (hot set + domain packs + routing evals) — cdx:PHO-13218 worker
 - [P2] WIKI-14: render Claude task lists in transcript (counts header + per-task status glyphs like TUI); prereq = JSONL event-coverage audit (unhandled codex/claude event types)
-- [P1] WIKI-15: backend usage-limit watchdog — autonomous codex account rotation + fleet revival (owner: cc:WIKI-15)
 - [P2] WIKI-16: pane-resize perf — transient CSS-var drag, commit on pointerup (owner: cc:WIKI-16)
 - [P2] WIKI-17: native app persistence — stable port + server-side ui-state mirror (owner: cc:WIKI-17)
 
