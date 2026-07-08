@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from . import transcripts, vaultops
+from . import github_pr, transcripts, vaultops
 from .frontend_static import mount_frontend_static
 
 
@@ -526,6 +526,20 @@ def agents() -> dict[str, object]:
         )
 
     return {"workers": workers, "orchestrators": orchestrators, "archived": list_archived()}
+
+
+@app.get("/api/agents/{ticket}/pr")
+def agent_pr(ticket: str) -> dict[str, object]:
+    if not TICKET_PATTERN.fullmatch(ticket):
+        raise HTTPException(status_code=400, detail="Bad ticket")
+    return github_pr.get_pr_payload(ticket)
+
+
+@app.post("/api/agents/{ticket}/pr/approve")
+def agent_pr_approve(ticket: str) -> dict[str, str]:
+    if not TICKET_PATTERN.fullmatch(ticket):
+        raise HTTPException(status_code=400, detail="Bad ticket")
+    return github_pr.approve_pr(ticket)
 
 
 def capture_pane_tail(window: str, lines: int) -> str | None:
