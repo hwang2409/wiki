@@ -367,6 +367,21 @@ def tmux_live_windows() -> set[str]:
         return set()
 
 
+def tmux_has_window_named(name: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["tmux", "list-windows", "-a", "-F", "#{window_name}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return False
+        return any(line.strip() == name for line in result.stdout.splitlines())
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def read_agent_status(ticket: str) -> dict | None:
     path = AGENT_STATUS_DIR / f"{ticket}.json"
     try:
@@ -990,6 +1005,10 @@ def accept_claude_trust_prompt(window: str, *, timeout_seconds: float = 8.0) -> 
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
         pane = capture_pane_tail(window, 40) or ""
+        if "Quick safety check" not in pane and (
+            "? for shortcuts" in pane or "-- INSERT --" in pane or "bypass permissions on" in pane
+        ):
+            return
         if "Quick safety check" in pane and "Yes, I trust this folder" in pane:
             subprocess.run(["tmux", "send-keys", "-t", window, "Enter"], timeout=5, check=False)
             time.sleep(0.5)
@@ -1124,7 +1143,7 @@ def spawn_agent(body: SpawnWorkerIn) -> dict[str, str]:
 
 
 @app.post("/api/agents/spawn-orchestrator")
-def spawn_orchestrator(body: SpawnOrchestratorIn) -> dict[str, str]:
+def spawn_orchestrator(body: SpawnOrchestratorIn, background: BackgroundTasks) -> dict[str, str]:
     orch_id = body.id.strip()
     if not ORCH_ID_PATTERN.fullmatch(orch_id):
         raise HTTPException(
@@ -1144,6 +1163,8 @@ def spawn_orchestrator(body: SpawnOrchestratorIn) -> dict[str, str]:
 
     registry = _read_agent_registry()
     live_windows = tmux_live_windows()
+    if tmux_has_window_named(f"orch:{orch_id}"):
+        raise HTTPException(status_code=409, detail=f"orch:{orch_id} already exists as a live tmux window")
     existing = (registry.get("_orchestrators") or {}).get(orch_id)
     if existing:
         existing_window = existing.get("window")
@@ -1201,7 +1222,7 @@ def spawn_orchestrator(body: SpawnOrchestratorIn) -> dict[str, str]:
             timeout=5,
             label="tmux pipe-pane failed",
         )
-        accept_claude_trust_prompt(window)
+        background.add_task(accept_claude_trust_prompt, window)
     except RuntimeError as exc:
         if window:
             subprocess.run(["tmux", "kill-window", "-t", window], timeout=5, check=False)
