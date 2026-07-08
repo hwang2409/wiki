@@ -593,18 +593,6 @@ function agentStateGlyph(state: string | null, live: boolean): string {
   return "·";
 }
 
-function isEditableTarget(target: EventTarget | null): boolean {
-  if (!(target instanceof HTMLElement)) return false;
-  if (
-    target instanceof HTMLInputElement ||
-    target instanceof HTMLTextAreaElement ||
-    target instanceof HTMLSelectElement
-  ) {
-    return true;
-  }
-  return target.isContentEditable || target.closest("[contenteditable='true']") !== null;
-}
-
 type TreeFolder = {
   name: string;
   path: string;
@@ -1029,6 +1017,7 @@ export default function App() {
   const windowIdRef = useRef(0);
   const paneRefs = useRef(new Map<string, HTMLDivElement>());
   const leaderTimerRef = useRef<number | null>(null);
+  const leaderArmedRef = useRef(false);
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -1626,16 +1615,68 @@ export default function App() {
       window.clearTimeout(leaderTimerRef.current);
       leaderTimerRef.current = null;
     }
+    leaderArmedRef.current = false;
     setLeaderArmed(false);
   }
 
   function armLeader() {
     if (leaderTimerRef.current) window.clearTimeout(leaderTimerRef.current);
+    leaderArmedRef.current = true;
     setLeaderArmed(true);
     leaderTimerRef.current = window.setTimeout(() => {
       leaderTimerRef.current = null;
+      leaderArmedRef.current = false;
       setLeaderArmed(false);
     }, 1500);
+  }
+
+  function executeLeaderChord(key: string, lowerKey: string) {
+    if (key === "Escape") return;
+    if (lowerKey === "j") {
+      cyclePaneFocus(1);
+      return;
+    }
+    if (lowerKey === "k") {
+      cyclePaneFocus(-1);
+      return;
+    }
+    if (windowState.windows.length > 0 && lowerKey === "h") {
+      activateWindowByIndex(
+        activeWindowIndex >= 0
+          ? (activeWindowIndex - 1 + windowState.windows.length) % windowState.windows.length
+          : 0
+      );
+      return;
+    }
+    if (windowState.windows.length > 0 && lowerKey === "l") {
+      activateWindowByIndex(
+        activeWindowIndex >= 0
+          ? (activeWindowIndex + 1) % windowState.windows.length
+          : 0
+      );
+      return;
+    }
+    if (/^\d$/.test(key)) {
+      const targetIndex = Number(key);
+      if (targetIndex < windowState.windows.length) activateWindowByIndex(targetIndex);
+      return;
+    }
+    if (lowerKey === "w") {
+      setWindowChooserOpen(true);
+      return;
+    }
+    if (lowerKey === "x") {
+      closeFocusedPane();
+      return;
+    }
+    if (lowerKey === "z") {
+      setZoomedPaneId((current) => (current === focusedPaneId ? null : focusedPaneId));
+      if (focusedPaneId) focusPane(focusedPaneId);
+      return;
+    }
+    if (key === ",") {
+      setSettingsOpen(true);
+    }
   }
 
   function cyclePaneFocus(delta: 1 | -1) {
@@ -2049,80 +2090,51 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    function onLeaderKeyCapture(event: globalThis.KeyboardEvent) {
+      const key = event.key;
+      const lowerKey = key.toLowerCase();
+      const modifierOnly = ["Shift", "Control", "Alt", "Meta"].includes(key);
+
+      if (leaderArmedRef.current) {
+        if (modifierOnly) return;
+        event.preventDefault();
+        event.stopPropagation();
+        disarmLeader();
+        executeLeaderChord(key, lowerKey);
+        return;
+      }
+
+      if (event.ctrlKey && !event.metaKey && !event.altKey && lowerKey === "a") {
+        event.preventDefault();
+        event.stopPropagation();
+        armLeader();
+      }
+    }
+
+    document.addEventListener("keydown", onLeaderKeyCapture, true);
+    return () => document.removeEventListener("keydown", onLeaderKeyCapture, true);
+  }, [
+    activeWindowIndex,
+    activateWindowByIndex,
+    armLeader,
+    closeFocusedPane,
+    cyclePaneFocus,
+    disarmLeader,
+    executeLeaderChord,
+    focusedPaneId,
+    windowState.windows.length,
+  ]);
+
+  useEffect(() => {
     function onKeyDown(event: globalThis.KeyboardEvent) {
       if (event.defaultPrevented) return;
 
       const key = event.key;
       const lowerKey = key.toLowerCase();
 
-      if (leaderArmed) {
-        if (isEditableTarget(event.target)) {
-          disarmLeader();
-          return;
-        }
-        if (["Shift", "Control", "Alt", "Meta"].includes(key)) return;
-        event.preventDefault();
-        disarmLeader();
-
-        if (key === "Escape") return;
-
-        if (lowerKey === "j") {
-          cyclePaneFocus(1);
-          return;
-        }
-        if (lowerKey === "k") {
-          cyclePaneFocus(-1);
-          return;
-        }
-        if (windowState.windows.length > 0 && lowerKey === "h") {
-          activateWindowByIndex(
-            activeWindowIndex >= 0
-              ? (activeWindowIndex - 1 + windowState.windows.length) % windowState.windows.length
-              : 0
-          );
-          return;
-        }
-        if (windowState.windows.length > 0 && lowerKey === "l") {
-          activateWindowByIndex(
-            activeWindowIndex >= 0
-              ? (activeWindowIndex + 1) % windowState.windows.length
-              : 0
-          );
-          return;
-        }
-        if (/^\d$/.test(key)) {
-          const targetIndex = Number(key);
-          if (targetIndex < windowState.windows.length) activateWindowByIndex(targetIndex);
-          return;
-        }
-        if (lowerKey === "w") {
-          setWindowChooserOpen(true);
-          return;
-        }
-
-        if (lowerKey === "x") {
-          closeFocusedPane();
-          return;
-        }
-
-        if (lowerKey === "z") {
-          setZoomedPaneId((current) => (current === focusedPaneId ? null : focusedPaneId));
-          if (focusedPaneId) focusPane(focusedPaneId);
-          return;
-        }
-
-        if (key === ",") {
-          setSettingsOpen(true);
-        }
-        return;
-      }
-
       if (modalOpen) return;
 
-      if (event.ctrlKey && !event.metaKey && lowerKey === "a" && !isEditableTarget(event.target)) {
-        event.preventDefault();
-        armLeader();
-      } else if ((event.metaKey || event.ctrlKey) && lowerKey === "k") {
+      if ((event.metaKey || event.ctrlKey) && lowerKey === "k") {
         event.preventDefault();
         setSwitcherOpen((open) => !open);
       } else if ((event.metaKey || event.ctrlKey) && lowerKey === "b") {
@@ -2136,16 +2148,8 @@ export default function App() {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [
-    activeWindowIndex,
-    activateWindowByIndex,
-    closeFocusedPane,
-    cyclePaneFocus,
-    disarmLeader,
-    focusedPaneId,
-    leaderArmed,
     modalOpen,
     handlePaneScopeKey,
-    windowState.windows.length,
   ]);
 
   const isEditorMode = mode === "edit" || mode === "new";

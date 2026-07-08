@@ -47,7 +47,7 @@ WIKI_API_TARGET=http://127.0.0.1:8011 npm run dev
 
 ## Agent Fleet Leader Keys
 
-The agent monitor supports a tmux-style leader on `Ctrl+A`. The prefix only arms when focus is not inside an `input`, `textarea`, or `contenteditable` surface, times out after about 1.5 seconds, and shows a temporary `C-a` chip while armed.
+The agent monitor supports a tmux-style leader on `Ctrl+A`. The prefix is intercepted in the capture phase before composer / textarea handlers, wins even when focus is inside agent inputs, times out after about 1.5 seconds, and shows a temporary `C-a` chip while armed.
 
 | Chord | Action |
 | --- | --- |
