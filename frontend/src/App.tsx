@@ -47,12 +47,19 @@ import {
   splitFrontmatter,
   stripLeadingTitle
 } from "./markdown";
+import {
+  applyTheme,
+  getStoredTheme,
+  getTheme,
+  isDarkTheme,
+  toggleThemePolarity,
+  type ThemeId
+} from "./themes";
 import type { Note, NoteDraft, NoteSummary } from "./types";
 
 type Mode = "empty" | "view" | "edit" | "new" | "activity" | "graph" | "health" | "agents" | "agent";
 type UtilityMode = "activity" | "graph" | "health" | "agents";
 type SidebarTab = "files" | "search" | "agents";
-type Theme = "dark" | "light";
 type SplitPosition = "left" | "right" | "top" | "bottom";
 type DropZone = SplitPosition | "center";
 
@@ -539,9 +546,7 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [theme, setTheme] = useState<Theme>(() =>
-    localStorage.getItem("wiki-theme") === "dark" ? "dark" : "light"
-  );
+  const [theme, setTheme] = useState<ThemeId>(() => getStoredTheme());
   // Lifted out of AgentsView: pane splits remount the view, sidebar must survive.
   const [agentsOpenTicket, setAgentsOpenTicket] = useState<string | null>(null);
   const viewContentRef = useRef<HTMLDivElement | null>(null);
@@ -549,8 +554,7 @@ export default function App() {
   const appliedHashRef = useRef<string | null>(null);
 
   useEffect(() => {
-    document.documentElement.dataset.theme = theme;
-    localStorage.setItem("wiki-theme", theme);
+    applyTheme(theme);
   }, [theme]);
 
   useEffect(() => {
@@ -1013,6 +1017,9 @@ export default function App() {
     health: "Health",
     agents: "Agents"
   };
+  const themeToggleTarget = toggleThemePolarity(theme);
+  const themeToggleTargetLabel = getTheme(themeToggleTarget).label;
+  const currentThemeIsDark = isDarkTheme(theme);
   const tabTitle =
     mode === "new"
       ? "Untitled"
@@ -1196,15 +1203,15 @@ export default function App() {
           <Settings size={18} />
         </button>
         <button
-          aria-label="Toggle light/dark mode"
+          aria-label={currentThemeIsDark ? "Switch to light theme" : "Switch to dark theme"}
           className="ribbon-action"
-          title={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+          title={`Switch to ${themeToggleTargetLabel}`}
           type="button"
-          onClick={() => setTheme((current) => (current === "dark" ? "light" : "dark"))}
+          onClick={() => setTheme((current) => toggleThemePolarity(current))}
         >
           <span className="theme-icon-stack">
-            <Sun className={`theme-icon${theme === "dark" ? " is-active" : ""}`} size={18} />
-            <Moon className={`theme-icon${theme === "light" ? " is-active" : ""}`} size={18} />
+            <Sun className={`theme-icon${currentThemeIsDark ? " is-active" : ""}`} size={18} />
+            <Moon className={`theme-icon${currentThemeIsDark ? "" : " is-active"}`} size={18} />
           </span>
         </button>
       </div>
@@ -1559,7 +1566,9 @@ export default function App() {
 
       {dialog ? <Dialog dialog={dialog} onClose={() => setDialog(null)} /> : null}
 
-      {settingsOpen ? <SettingsModal onClose={() => setSettingsOpen(false)} /> : null}
+      {settingsOpen ? (
+        <SettingsModal theme={theme} onClose={() => setSettingsOpen(false)} onThemeChange={setTheme} />
+      ) : null}
       {switcherOpen ? (
         <QuickSwitcher
           notes={notes}

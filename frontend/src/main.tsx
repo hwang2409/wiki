@@ -34,6 +34,10 @@ import "@fontsource/martian-mono/latin-500.css";
 import "@fontsource/martian-mono/latin-600.css";
 import App from "./App";
 import "./styles.css";
+import "./themes.css";
+import { applyStoredTheme } from "./themes";
+
+applyStoredTheme();
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>

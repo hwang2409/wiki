@@ -1,0 +1,810 @@
+:root,
+[data-theme="mono-light"] {
+  color-scheme: light;
+
+  --background-primary: #ffffff;
+  --background-primary-alt: #fafafa;
+  --background-secondary: #f6f6f6;
+  --background-modifier-border: #dcdcdc;
+  --background-modifier-hover: rgba(0, 0, 0, 0.05);
+  --background-modifier-active: rgba(0, 0, 0, 0.09);
+
+  --text-normal: #1c1c1c;
+  --text-muted: #6b6b6b;
+  --text-faint: #9b9b9b;
+  --text-on-accent: #ffffff;
+  --text-selection: rgba(0, 0, 0, 0.12);
+
+  --link-color: var(--text-normal);
+  --link-color-hover: #000000;
+  --link-unresolved-opacity: 0.6;
+
+  --code-background: #f2f2f2;
+  --image-outline: rgba(0, 0, 0, 0.1);
+  --kanban-backdrop: #ececec;
+  --kanban-lane: #f7f7f7;
+  --kanban-card: #ffffff;
+  --kanban-card-shadow: 0 1px 2px rgba(0, 0, 0, 0.07);
+  --hr-color: var(--background-modifier-border);
+  --blockquote-border-color: #c4c4c4;
+  --table-border-color: var(--background-modifier-border);
+  --checkbox-color: var(--text-normal);
+  --scrollbar-thumb: #d6d6d6;
+  --scrollbar-thumb-hover: #a8a8a8;
+
+  --accent-primary: #1c1c1c;
+  --accent-success: #1c1c1c;
+  --accent-warning: #1c1c1c;
+  --accent-danger: #1c1c1c;
+
+  --background-overlay-soft: rgba(0, 0, 0, 0.35);
+  --background-overlay-strong: rgba(0, 0, 0, 0.45);
+  --shadow-floating: 0 2px 8px rgba(0, 0, 0, 0.12), 0 8px 28px rgba(0, 0, 0, 0.22);
+  --shadow-modal: 0 2px 8px rgba(0, 0, 0, 0.12), 0 12px 40px rgba(0, 0, 0, 0.3);
+  --shadow-lifted: 0 2px 6px rgba(0, 0, 0, 0.1), 0 6px 24px rgba(0, 0, 0, 0.16);
+  --shadow-top: 0 -4px 16px rgba(0, 0, 0, 0.12);
+
+  --status-working-background: transparent;
+  --status-working-border: var(--text-normal);
+  --status-working-color: var(--text-normal);
+  --status-merge-ready-background: var(--text-normal);
+  --status-merge-ready-border: var(--text-normal);
+  --status-merge-ready-color: var(--background-primary);
+  --status-blocked-background: transparent;
+  --status-blocked-border: var(--text-normal);
+  --status-blocked-color: var(--text-normal);
+
+  --diff-add-background: var(--background-modifier-active);
+  --diff-add-foreground: var(--text-normal);
+  --diff-remove-background: var(--background-modifier-hover);
+  --diff-remove-foreground: var(--text-faint);
+  --diff-hatch-color: var(--background-modifier-hover);
+
+  --selection-inverse-background: var(--text-faint);
+  --selection-inverse-color: var(--background-primary);
+
+  --syntax-text: var(--text-normal);
+  --syntax-comment: var(--text-faint);
+  --syntax-keyword: var(--text-normal);
+  --syntax-function: var(--text-normal);
+  --syntax-string: var(--text-muted);
+  --syntax-number: var(--text-muted);
+  --syntax-type: var(--text-muted);
+  --syntax-variable: var(--text-normal);
+}
+
+[data-theme="mono-dark"] {
+  color-scheme: dark;
+
+  --background-primary: #111111;
+  --background-primary-alt: #171717;
+  --background-secondary: #181818;
+  --background-modifier-border: #2e2e2e;
+  --background-modifier-hover: rgba(255, 255, 255, 0.06);
+  --background-modifier-active: rgba(255, 255, 255, 0.11);
+
+  --text-normal: #e8e8e8;
+  --text-muted: #9e9e9e;
+  --text-faint: #6a6a6a;
+  --text-on-accent: #111111;
+  --text-selection: rgba(255, 255, 255, 0.16);
+
+  --link-color: var(--text-normal);
+  --link-color-hover: #ffffff;
+
+  --code-background: #191919;
+  --image-outline: rgba(255, 255, 255, 0.1);
+  --kanban-backdrop: #0d0d0d;
+  --kanban-lane: #1a1a1a;
+  --kanban-card: #222222;
+  --kanban-card-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --blockquote-border-color: #454545;
+  --scrollbar-thumb: #333333;
+  --scrollbar-thumb-hover: #525252;
+
+  --accent-primary: #e8e8e8;
+  --accent-success: #e8e8e8;
+  --accent-warning: #e8e8e8;
+  --accent-danger: #e8e8e8;
+
+  --shadow-floating: 0 2px 8px rgba(0, 0, 0, 0.24), 0 8px 28px rgba(0, 0, 0, 0.36);
+  --shadow-modal: 0 2px 8px rgba(0, 0, 0, 0.24), 0 12px 40px rgba(0, 0, 0, 0.44);
+  --shadow-lifted: 0 2px 6px rgba(0, 0, 0, 0.2), 0 6px 24px rgba(0, 0, 0, 0.3);
+  --shadow-top: 0 -4px 16px rgba(0, 0, 0, 0.2);
+
+  --status-working-border: var(--text-normal);
+  --status-working-color: var(--text-normal);
+  --status-merge-ready-background: var(--text-normal);
+  --status-merge-ready-border: var(--text-normal);
+  --status-merge-ready-color: var(--background-primary);
+  --status-blocked-border: var(--text-normal);
+  --status-blocked-color: var(--text-normal);
+
+  --diff-add-background: var(--background-modifier-active);
+  --diff-add-foreground: var(--text-normal);
+  --diff-remove-background: var(--background-modifier-hover);
+  --diff-remove-foreground: var(--text-faint);
+  --diff-hatch-color: var(--background-modifier-hover);
+
+  --selection-inverse-background: var(--text-faint);
+  --selection-inverse-color: var(--background-primary);
+
+  --syntax-text: var(--text-normal);
+  --syntax-comment: var(--text-faint);
+  --syntax-keyword: var(--text-normal);
+  --syntax-function: var(--text-normal);
+  --syntax-string: var(--text-muted);
+  --syntax-number: var(--text-muted);
+  --syntax-type: var(--text-muted);
+  --syntax-variable: var(--text-normal);
+}
+
+[data-theme="gruvbox-dark"] {
+  color-scheme: dark;
+
+  --background-primary: #282828;
+  --background-primary-alt: #32302f;
+  --background-secondary: #3c3836;
+  --background-modifier-border: #504945;
+  --background-modifier-hover: rgba(251, 241, 199, 0.06);
+  --background-modifier-active: rgba(251, 241, 199, 0.12);
+
+  --text-normal: #ebdbb2;
+  --text-muted: #bdae93;
+  --text-faint: #928374;
+  --text-on-accent: #1d2021;
+  --text-selection: rgba(80, 73, 69, 0.55);
+
+  --link-color: #83a598;
+  --link-color-hover: #8ec07c;
+
+  --code-background: #32302f;
+  --image-outline: rgba(251, 241, 199, 0.12);
+  --kanban-backdrop: #1d2021;
+  --kanban-lane: #32302f;
+  --kanban-card: #3c3836;
+  --kanban-card-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --blockquote-border-color: #665c54;
+  --scrollbar-thumb: #665c54;
+  --scrollbar-thumb-hover: #7c6f64;
+
+  --accent-primary: #83a598;
+  --accent-success: #b8bb26;
+  --accent-warning: #fabd2f;
+  --accent-danger: #fb4934;
+
+  --shadow-floating: 0 2px 8px rgba(0, 0, 0, 0.28), 0 8px 28px rgba(0, 0, 0, 0.38);
+  --shadow-modal: 0 2px 8px rgba(0, 0, 0, 0.28), 0 12px 40px rgba(0, 0, 0, 0.46);
+  --shadow-lifted: 0 2px 6px rgba(0, 0, 0, 0.24), 0 6px 24px rgba(0, 0, 0, 0.34);
+  --shadow-top: 0 -4px 16px rgba(0, 0, 0, 0.2);
+
+  --status-working-background: color-mix(in srgb, var(--accent-primary) 14%, transparent);
+  --status-working-border: var(--accent-primary);
+  --status-working-color: var(--accent-primary);
+  --status-merge-ready-background: var(--accent-success);
+  --status-merge-ready-border: var(--accent-success);
+  --status-merge-ready-color: var(--text-on-accent);
+  --status-blocked-background: transparent;
+  --status-blocked-border: var(--accent-danger);
+  --status-blocked-color: var(--accent-danger);
+
+  --diff-add-background: color-mix(in srgb, var(--accent-success) 18%, transparent);
+  --diff-add-foreground: #ebdbb2;
+  --diff-remove-background: color-mix(in srgb, var(--accent-danger) 16%, transparent);
+  --diff-remove-foreground: #fb4934;
+  --diff-hatch-color: color-mix(in srgb, var(--accent-danger) 20%, var(--background-primary));
+
+  --selection-inverse-background: #928374;
+  --selection-inverse-color: var(--background-primary);
+
+  --syntax-text: #ebdbb2;
+  --syntax-comment: #928374;
+  --syntax-keyword: #d3869b;
+  --syntax-function: #b8bb26;
+  --syntax-string: #8ec07c;
+  --syntax-number: #fe8019;
+  --syntax-type: #83a598;
+  --syntax-variable: #fabd2f;
+}
+
+[data-theme="gruvbox-light"] {
+  color-scheme: light;
+
+  --background-primary: #fbf1c7;
+  --background-primary-alt: #f2e5bc;
+  --background-secondary: #ebdbb2;
+  --background-modifier-border: #d5c4a1;
+  --background-modifier-hover: rgba(60, 56, 54, 0.06);
+  --background-modifier-active: rgba(60, 56, 54, 0.12);
+
+  --text-normal: #3c3836;
+  --text-muted: #665c54;
+  --text-faint: #928374;
+  --text-on-accent: #fbf1c7;
+  --text-selection: rgba(168, 153, 132, 0.42);
+
+  --link-color: #458588;
+  --link-color-hover: #076678;
+
+  --code-background: #f2e5bc;
+  --image-outline: rgba(60, 56, 54, 0.12);
+  --kanban-backdrop: #f2e5bc;
+  --kanban-lane: #ebdbb2;
+  --kanban-card: #fbf1c7;
+  --kanban-card-shadow: 0 1px 2px rgba(60, 56, 54, 0.12);
+  --blockquote-border-color: #bdae93;
+  --scrollbar-thumb: #bdae93;
+  --scrollbar-thumb-hover: #a89984;
+
+  --accent-primary: #458588;
+  --accent-success: #98971a;
+  --accent-warning: #d79921;
+  --accent-danger: #cc241d;
+
+  --status-working-background: color-mix(in srgb, var(--accent-primary) 10%, transparent);
+  --status-working-border: var(--accent-primary);
+  --status-working-color: var(--accent-primary);
+  --status-merge-ready-background: var(--accent-success);
+  --status-merge-ready-border: var(--accent-success);
+  --status-merge-ready-color: var(--text-on-accent);
+  --status-blocked-background: transparent;
+  --status-blocked-border: var(--accent-danger);
+  --status-blocked-color: var(--accent-danger);
+
+  --diff-add-background: color-mix(in srgb, var(--accent-success) 14%, transparent);
+  --diff-add-foreground: #3c3836;
+  --diff-remove-background: color-mix(in srgb, var(--accent-danger) 12%, transparent);
+  --diff-remove-foreground: #9d0006;
+  --diff-hatch-color: color-mix(in srgb, var(--accent-danger) 18%, var(--background-primary));
+
+  --selection-inverse-background: #928374;
+  --selection-inverse-color: var(--background-primary);
+
+  --syntax-text: #3c3836;
+  --syntax-comment: #928374;
+  --syntax-keyword: #8f3f71;
+  --syntax-function: #79740e;
+  --syntax-string: #427b58;
+  --syntax-number: #af3a03;
+  --syntax-type: #076678;
+  --syntax-variable: #b57614;
+}
+
+[data-theme="vscode-dark-plus"] {
+  color-scheme: dark;
+
+  --background-primary: #1f1f1f;
+  --background-primary-alt: #181818;
+  --background-secondary: #181818;
+  --background-modifier-border: #2b2b2b;
+  --background-modifier-hover: rgba(241, 241, 241, 0.12);
+  --background-modifier-active: rgba(0, 120, 212, 0.16);
+
+  --text-normal: #cccccc;
+  --text-muted: #9d9d9d;
+  --text-faint: #6e7681;
+  --text-on-accent: #ffffff;
+  --text-selection: rgba(38, 79, 120, 0.78);
+
+  --link-color: #4daafc;
+  --link-color-hover: #85b6ff;
+
+  --code-background: #2b2b2b;
+  --image-outline: rgba(255, 255, 255, 0.1);
+  --kanban-backdrop: #181818;
+  --kanban-lane: #1f1f1f;
+  --kanban-card: #252526;
+  --kanban-card-shadow: 0 1px 2px rgba(0, 0, 0, 0.38);
+  --blockquote-border-color: #616161;
+  --scrollbar-thumb: #616161;
+  --scrollbar-thumb-hover: #868686;
+
+  --accent-primary: #0078d4;
+  --accent-success: #2ea043;
+  --accent-warning: #e2c08d;
+  --accent-danger: #f85149;
+
+  --shadow-floating: 0 2px 8px rgba(0, 0, 0, 0.28), 0 8px 28px rgba(0, 0, 0, 0.4);
+  --shadow-modal: 0 2px 8px rgba(0, 0, 0, 0.28), 0 12px 40px rgba(0, 0, 0, 0.48);
+  --shadow-lifted: 0 2px 6px rgba(0, 0, 0, 0.24), 0 6px 24px rgba(0, 0, 0, 0.34);
+  --shadow-top: 0 -4px 16px rgba(0, 0, 0, 0.2);
+
+  --status-working-background: color-mix(in srgb, var(--accent-primary) 16%, transparent);
+  --status-working-border: var(--accent-primary);
+  --status-working-color: #85b6ff;
+  --status-merge-ready-background: var(--accent-success);
+  --status-merge-ready-border: var(--accent-success);
+  --status-merge-ready-color: var(--text-on-accent);
+  --status-blocked-background: transparent;
+  --status-blocked-border: var(--accent-danger);
+  --status-blocked-color: var(--accent-danger);
+
+  --diff-add-background: color-mix(in srgb, var(--accent-success) 18%, transparent);
+  --diff-add-foreground: #cccccc;
+  --diff-remove-background: color-mix(in srgb, var(--accent-danger) 18%, transparent);
+  --diff-remove-foreground: #f85149;
+  --diff-hatch-color: color-mix(in srgb, var(--accent-danger) 20%, var(--background-primary));
+
+  --selection-inverse-background: #0078d4;
+  --selection-inverse-color: #ffffff;
+
+  --syntax-text: #d4d4d4;
+  --syntax-comment: #6a9955;
+  --syntax-keyword: #c586c0;
+  --syntax-function: #dcdcaa;
+  --syntax-string: #ce9178;
+  --syntax-number: #b5cea8;
+  --syntax-type: #4ec9b0;
+  --syntax-variable: #9cdcfe;
+}
+
+[data-theme="solarized-dark"] {
+  color-scheme: dark;
+
+  --background-primary: #002b36;
+  --background-primary-alt: #073642;
+  --background-secondary: #073642;
+  --background-modifier-border: #586e75;
+  --background-modifier-hover: rgba(238, 232, 213, 0.06);
+  --background-modifier-active: rgba(38, 139, 210, 0.14);
+
+  --text-normal: #93a1a1;
+  --text-muted: #839496;
+  --text-faint: #657b83;
+  --text-on-accent: #fdf6e3;
+  --text-selection: rgba(88, 110, 117, 0.55);
+
+  --link-color: #268bd2;
+  --link-color-hover: #2aa198;
+
+  --code-background: #073642;
+  --image-outline: rgba(238, 232, 213, 0.12);
+  --kanban-backdrop: #00212b;
+  --kanban-lane: #073642;
+  --kanban-card: #0b3a46;
+  --kanban-card-shadow: 0 1px 2px rgba(0, 0, 0, 0.38);
+  --blockquote-border-color: #586e75;
+  --scrollbar-thumb: #586e75;
+  --scrollbar-thumb-hover: #657b83;
+
+  --accent-primary: #268bd2;
+  --accent-success: #859900;
+  --accent-warning: #b58900;
+  --accent-danger: #dc322f;
+
+  --shadow-floating: 0 2px 8px rgba(0, 0, 0, 0.28), 0 8px 28px rgba(0, 0, 0, 0.4);
+  --shadow-modal: 0 2px 8px rgba(0, 0, 0, 0.28), 0 12px 40px rgba(0, 0, 0, 0.48);
+  --shadow-lifted: 0 2px 6px rgba(0, 0, 0, 0.24), 0 6px 24px rgba(0, 0, 0, 0.34);
+  --shadow-top: 0 -4px 16px rgba(0, 0, 0, 0.2);
+
+  --status-working-background: color-mix(in srgb, var(--accent-primary) 14%, transparent);
+  --status-working-border: var(--accent-primary);
+  --status-working-color: #2aa198;
+  --status-merge-ready-background: var(--accent-success);
+  --status-merge-ready-border: var(--accent-success);
+  --status-merge-ready-color: var(--text-on-accent);
+  --status-blocked-background: transparent;
+  --status-blocked-border: var(--accent-danger);
+  --status-blocked-color: var(--accent-danger);
+
+  --diff-add-background: color-mix(in srgb, var(--accent-success) 18%, transparent);
+  --diff-add-foreground: #93a1a1;
+  --diff-remove-background: color-mix(in srgb, var(--accent-danger) 16%, transparent);
+  --diff-remove-foreground: #dc322f;
+  --diff-hatch-color: color-mix(in srgb, var(--accent-danger) 20%, var(--background-primary));
+
+  --selection-inverse-background: #586e75;
+  --selection-inverse-color: #fdf6e3;
+
+  --syntax-text: #93a1a1;
+  --syntax-comment: #586e75;
+  --syntax-keyword: #6c71c4;
+  --syntax-function: #268bd2;
+  --syntax-string: #2aa198;
+  --syntax-number: #cb4b16;
+  --syntax-type: #b58900;
+  --syntax-variable: #839496;
+}
+
+[data-theme="solarized-light"] {
+  color-scheme: light;
+
+  --background-primary: #fdf6e3;
+  --background-primary-alt: #eee8d5;
+  --background-secondary: #eee8d5;
+  --background-modifier-border: #93a1a1;
+  --background-modifier-hover: rgba(88, 110, 117, 0.07);
+  --background-modifier-active: rgba(38, 139, 210, 0.13);
+
+  --text-normal: #586e75;
+  --text-muted: #657b83;
+  --text-faint: #839496;
+  --text-on-accent: #fdf6e3;
+  --text-selection: rgba(147, 161, 161, 0.38);
+
+  --link-color: #268bd2;
+  --link-color-hover: #2aa198;
+
+  --code-background: #eee8d5;
+  --image-outline: rgba(88, 110, 117, 0.12);
+  --kanban-backdrop: #f4efe0;
+  --kanban-lane: #eee8d5;
+  --kanban-card: #fdf6e3;
+  --kanban-card-shadow: 0 1px 2px rgba(88, 110, 117, 0.12);
+  --blockquote-border-color: #93a1a1;
+  --scrollbar-thumb: #93a1a1;
+  --scrollbar-thumb-hover: #839496;
+
+  --accent-primary: #268bd2;
+  --accent-success: #859900;
+  --accent-warning: #b58900;
+  --accent-danger: #dc322f;
+
+  --status-working-background: color-mix(in srgb, var(--accent-primary) 10%, transparent);
+  --status-working-border: var(--accent-primary);
+  --status-working-color: var(--accent-primary);
+  --status-merge-ready-background: var(--accent-success);
+  --status-merge-ready-border: var(--accent-success);
+  --status-merge-ready-color: var(--text-on-accent);
+  --status-blocked-background: transparent;
+  --status-blocked-border: var(--accent-danger);
+  --status-blocked-color: var(--accent-danger);
+
+  --diff-add-background: color-mix(in srgb, var(--accent-success) 14%, transparent);
+  --diff-add-foreground: #586e75;
+  --diff-remove-background: color-mix(in srgb, var(--accent-danger) 12%, transparent);
+  --diff-remove-foreground: #dc322f;
+  --diff-hatch-color: color-mix(in srgb, var(--accent-danger) 18%, var(--background-primary));
+
+  --selection-inverse-background: #657b83;
+  --selection-inverse-color: #fdf6e3;
+
+  --syntax-text: #586e75;
+  --syntax-comment: #93a1a1;
+  --syntax-keyword: #6c71c4;
+  --syntax-function: #268bd2;
+  --syntax-string: #2aa198;
+  --syntax-number: #cb4b16;
+  --syntax-type: #b58900;
+  --syntax-variable: #657b83;
+}
+
+[data-theme="dracula"] {
+  color-scheme: dark;
+
+  --background-primary: #282a36;
+  --background-primary-alt: #21222c;
+  --background-secondary: #353747;
+  --background-modifier-border: #44475a;
+  --background-modifier-hover: rgba(248, 248, 242, 0.06);
+  --background-modifier-active: rgba(189, 147, 249, 0.14);
+
+  --text-normal: #f8f8f2;
+  --text-muted: color-mix(in srgb, #f8f8f2 72%, #282a36);
+  --text-faint: #6272a4;
+  --text-on-accent: #282a36;
+  --text-selection: rgba(68, 71, 90, 0.84);
+
+  --link-color: #8be9fd;
+  --link-color-hover: #bd93f9;
+
+  --code-background: #21222c;
+  --image-outline: rgba(248, 248, 242, 0.1);
+  --kanban-backdrop: #21222c;
+  --kanban-lane: #303241;
+  --kanban-card: #353747;
+  --kanban-card-shadow: 0 1px 2px rgba(0, 0, 0, 0.42);
+  --blockquote-border-color: #6272a4;
+  --scrollbar-thumb: #44475a;
+  --scrollbar-thumb-hover: #6272a4;
+
+  --accent-primary: #bd93f9;
+  --accent-success: #50fa7b;
+  --accent-warning: #ffb86c;
+  --accent-danger: #ff5555;
+
+  --shadow-floating: 0 2px 8px rgba(0, 0, 0, 0.28), 0 8px 28px rgba(0, 0, 0, 0.42);
+  --shadow-modal: 0 2px 8px rgba(0, 0, 0, 0.28), 0 12px 40px rgba(0, 0, 0, 0.5);
+  --shadow-lifted: 0 2px 6px rgba(0, 0, 0, 0.24), 0 6px 24px rgba(0, 0, 0, 0.34);
+  --shadow-top: 0 -4px 16px rgba(0, 0, 0, 0.22);
+
+  --status-working-background: color-mix(in srgb, var(--accent-primary) 16%, transparent);
+  --status-working-border: var(--accent-primary);
+  --status-working-color: var(--accent-primary);
+  --status-merge-ready-background: var(--accent-success);
+  --status-merge-ready-border: var(--accent-success);
+  --status-merge-ready-color: var(--text-on-accent);
+  --status-blocked-background: transparent;
+  --status-blocked-border: var(--accent-danger);
+  --status-blocked-color: var(--accent-danger);
+
+  --diff-add-background: color-mix(in srgb, var(--accent-success) 18%, transparent);
+  --diff-add-foreground: #f8f8f2;
+  --diff-remove-background: color-mix(in srgb, var(--accent-danger) 16%, transparent);
+  --diff-remove-foreground: #ff5555;
+  --diff-hatch-color: color-mix(in srgb, var(--accent-danger) 22%, var(--background-primary));
+
+  --selection-inverse-background: #bd93f9;
+  --selection-inverse-color: #282a36;
+
+  --syntax-text: #f8f8f2;
+  --syntax-comment: #6272a4;
+  --syntax-keyword: #ff79c6;
+  --syntax-function: #50fa7b;
+  --syntax-string: #f1fa8c;
+  --syntax-number: #ffb86c;
+  --syntax-type: #8be9fd;
+  --syntax-variable: #bd93f9;
+}
+
+[data-theme="nord"] {
+  color-scheme: dark;
+
+  --background-primary: #2e3440;
+  --background-primary-alt: #3b4252;
+  --background-secondary: #434c5e;
+  --background-modifier-border: #4c566a;
+  --background-modifier-hover: rgba(236, 239, 244, 0.06);
+  --background-modifier-active: rgba(136, 192, 208, 0.14);
+
+  --text-normal: #eceff4;
+  --text-muted: color-mix(in srgb, #eceff4 78%, #2e3440);
+  --text-faint: color-mix(in srgb, #eceff4 56%, #2e3440);
+  --text-on-accent: #2e3440;
+  --text-selection: rgba(94, 129, 172, 0.32);
+
+  --link-color: #88c0d0;
+  --link-color-hover: #81a1c1;
+
+  --code-background: #3b4252;
+  --image-outline: rgba(236, 239, 244, 0.1);
+  --kanban-backdrop: #242933;
+  --kanban-lane: #3b4252;
+  --kanban-card: #434c5e;
+  --kanban-card-shadow: 0 1px 2px rgba(0, 0, 0, 0.38);
+  --blockquote-border-color: #81a1c1;
+  --scrollbar-thumb: #4c566a;
+  --scrollbar-thumb-hover: #81a1c1;
+
+  --accent-primary: #88c0d0;
+  --accent-success: #a3be8c;
+  --accent-warning: #ebcb8b;
+  --accent-danger: #bf616a;
+
+  --shadow-floating: 0 2px 8px rgba(0, 0, 0, 0.28), 0 8px 28px rgba(0, 0, 0, 0.4);
+  --shadow-modal: 0 2px 8px rgba(0, 0, 0, 0.28), 0 12px 40px rgba(0, 0, 0, 0.48);
+  --shadow-lifted: 0 2px 6px rgba(0, 0, 0, 0.24), 0 6px 24px rgba(0, 0, 0, 0.34);
+  --shadow-top: 0 -4px 16px rgba(0, 0, 0, 0.2);
+
+  --status-working-background: color-mix(in srgb, var(--accent-primary) 16%, transparent);
+  --status-working-border: var(--accent-primary);
+  --status-working-color: var(--accent-primary);
+  --status-merge-ready-background: var(--accent-success);
+  --status-merge-ready-border: var(--accent-success);
+  --status-merge-ready-color: var(--text-on-accent);
+  --status-blocked-background: transparent;
+  --status-blocked-border: var(--accent-danger);
+  --status-blocked-color: var(--accent-danger);
+
+  --diff-add-background: color-mix(in srgb, var(--accent-success) 18%, transparent);
+  --diff-add-foreground: #eceff4;
+  --diff-remove-background: color-mix(in srgb, var(--accent-danger) 16%, transparent);
+  --diff-remove-foreground: #bf616a;
+  --diff-hatch-color: color-mix(in srgb, var(--accent-danger) 20%, var(--background-primary));
+
+  --selection-inverse-background: #81a1c1;
+  --selection-inverse-color: #2e3440;
+
+  --syntax-text: #eceff4;
+  --syntax-comment: #81a1c1;
+  --syntax-keyword: #b48ead;
+  --syntax-function: #88c0d0;
+  --syntax-string: #a3be8c;
+  --syntax-number: #d08770;
+  --syntax-type: #8fbcbb;
+  --syntax-variable: #e5e9f0;
+}
+
+[data-theme="one-dark"] {
+  color-scheme: dark;
+
+  --background-primary: #282c34;
+  --background-primary-alt: #21252b;
+  --background-secondary: #2c313a;
+  --background-modifier-border: #3e4451;
+  --background-modifier-hover: rgba(171, 178, 191, 0.07);
+  --background-modifier-active: rgba(82, 139, 255, 0.16);
+
+  --text-normal: #abb2bf;
+  --text-muted: #828997;
+  --text-faint: #828997;
+  --text-on-accent: #282c34;
+  --text-selection: rgba(62, 68, 81, 0.8);
+
+  --link-color: #61afef;
+  --link-color-hover: #56b6c2;
+
+  --code-background: #21252b;
+  --image-outline: rgba(171, 178, 191, 0.1);
+  --kanban-backdrop: #1d2127;
+  --kanban-lane: #2c313a;
+  --kanban-card: #313640;
+  --kanban-card-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --blockquote-border-color: #4b5263;
+  --scrollbar-thumb: #4b5263;
+  --scrollbar-thumb-hover: #5c6370;
+
+  --accent-primary: #61afef;
+  --accent-success: #98c379;
+  --accent-warning: #e5c07b;
+  --accent-danger: #e06c75;
+
+  --shadow-floating: 0 2px 8px rgba(0, 0, 0, 0.28), 0 8px 28px rgba(0, 0, 0, 0.4);
+  --shadow-modal: 0 2px 8px rgba(0, 0, 0, 0.28), 0 12px 40px rgba(0, 0, 0, 0.48);
+  --shadow-lifted: 0 2px 6px rgba(0, 0, 0, 0.24), 0 6px 24px rgba(0, 0, 0, 0.34);
+  --shadow-top: 0 -4px 16px rgba(0, 0, 0, 0.2);
+
+  --status-working-background: color-mix(in srgb, var(--accent-primary) 16%, transparent);
+  --status-working-border: var(--accent-primary);
+  --status-working-color: var(--accent-primary);
+  --status-merge-ready-background: var(--accent-success);
+  --status-merge-ready-border: var(--accent-success);
+  --status-merge-ready-color: var(--text-on-accent);
+  --status-blocked-background: transparent;
+  --status-blocked-border: var(--accent-danger);
+  --status-blocked-color: var(--accent-danger);
+
+  --diff-add-background: color-mix(in srgb, var(--accent-success) 18%, transparent);
+  --diff-add-foreground: #abb2bf;
+  --diff-remove-background: color-mix(in srgb, var(--accent-danger) 16%, transparent);
+  --diff-remove-foreground: #e06c75;
+  --diff-hatch-color: color-mix(in srgb, var(--accent-danger) 20%, var(--background-primary));
+
+  --selection-inverse-background: #528bff;
+  --selection-inverse-color: #282c34;
+
+  --syntax-text: #abb2bf;
+  --syntax-comment: #5c6370;
+  --syntax-keyword: #c678dd;
+  --syntax-function: #61afef;
+  --syntax-string: #98c379;
+  --syntax-number: #d19a66;
+  --syntax-type: #e5c07b;
+  --syntax-variable: #e06c75;
+}
+
+[data-theme="tokyo-night"] {
+  color-scheme: dark;
+
+  --background-primary: #1a1b26;
+  --background-primary-alt: #16161e;
+  --background-secondary: #1f2335;
+  --background-modifier-border: #292e42;
+  --background-modifier-hover: rgba(192, 202, 245, 0.06);
+  --background-modifier-active: rgba(122, 162, 247, 0.16);
+
+  --text-normal: #a9b1d6;
+  --text-muted: #787c99;
+  --text-faint: #737aa2;
+  --text-on-accent: #1a1b26;
+  --text-selection: rgba(81, 92, 126, 0.48);
+
+  --link-color: #7aa2f7;
+  --link-color-hover: #7dcfff;
+
+  --code-background: #16161e;
+  --image-outline: rgba(192, 202, 245, 0.1);
+  --kanban-backdrop: #14141b;
+  --kanban-lane: #1f2335;
+  --kanban-card: #24283b;
+  --kanban-card-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --blockquote-border-color: #414868;
+  --scrollbar-thumb: #414868;
+  --scrollbar-thumb-hover: #565f89;
+
+  --accent-primary: #7aa2f7;
+  --accent-success: #9ece6a;
+  --accent-warning: #e0af68;
+  --accent-danger: #f7768e;
+
+  --shadow-floating: 0 2px 8px rgba(0, 0, 0, 0.28), 0 8px 28px rgba(0, 0, 0, 0.42);
+  --shadow-modal: 0 2px 8px rgba(0, 0, 0, 0.28), 0 12px 40px rgba(0, 0, 0, 0.5);
+  --shadow-lifted: 0 2px 6px rgba(0, 0, 0, 0.24), 0 6px 24px rgba(0, 0, 0, 0.34);
+  --shadow-top: 0 -4px 16px rgba(0, 0, 0, 0.22);
+
+  --status-working-background: color-mix(in srgb, var(--accent-primary) 16%, transparent);
+  --status-working-border: var(--accent-primary);
+  --status-working-color: var(--accent-primary);
+  --status-merge-ready-background: var(--accent-success);
+  --status-merge-ready-border: var(--accent-success);
+  --status-merge-ready-color: var(--text-on-accent);
+  --status-blocked-background: transparent;
+  --status-blocked-border: var(--accent-danger);
+  --status-blocked-color: var(--accent-danger);
+
+  --diff-add-background: color-mix(in srgb, var(--accent-success) 18%, transparent);
+  --diff-add-foreground: #c0caf5;
+  --diff-remove-background: color-mix(in srgb, var(--accent-danger) 16%, transparent);
+  --diff-remove-foreground: #f7768e;
+  --diff-hatch-color: color-mix(in srgb, var(--accent-danger) 22%, var(--background-primary));
+
+  --selection-inverse-background: #7aa2f7;
+  --selection-inverse-color: #1a1b26;
+
+  --syntax-text: #c0caf5;
+  --syntax-comment: #565f89;
+  --syntax-keyword: #bb9af7;
+  --syntax-function: #7aa2f7;
+  --syntax-string: #9ece6a;
+  --syntax-number: #ff9e64;
+  --syntax-type: #7dcfff;
+  --syntax-variable: #c0caf5;
+}
+
+[data-theme="catppuccin-mocha"] {
+  color-scheme: dark;
+
+  --background-primary: #1e1e2e;
+  --background-primary-alt: #181825;
+  --background-secondary: #313244;
+  --background-modifier-border: #45475a;
+  --background-modifier-hover: rgba(205, 214, 244, 0.07);
+  --background-modifier-active: rgba(203, 166, 247, 0.16);
+
+  --text-normal: #cdd6f4;
+  --text-muted: #bac2de;
+  --text-faint: #a6adc8;
+  --text-on-accent: #11111b;
+  --text-selection: rgba(108, 112, 134, 0.42);
+
+  --link-color: #89b4fa;
+  --link-color-hover: #74c7ec;
+
+  --code-background: #181825;
+  --image-outline: rgba(205, 214, 244, 0.1);
+  --kanban-backdrop: #11111b;
+  --kanban-lane: #313244;
+  --kanban-card: #45475a;
+  --kanban-card-shadow: 0 1px 2px rgba(0, 0, 0, 0.42);
+  --blockquote-border-color: #6c7086;
+  --scrollbar-thumb: #585b70;
+  --scrollbar-thumb-hover: #6c7086;
+
+  --accent-primary: #cba6f7;
+  --accent-success: #a6e3a1;
+  --accent-warning: #f9e2af;
+  --accent-danger: #f38ba8;
+
+  --shadow-floating: 0 2px 8px rgba(0, 0, 0, 0.28), 0 8px 28px rgba(0, 0, 0, 0.42);
+  --shadow-modal: 0 2px 8px rgba(0, 0, 0, 0.28), 0 12px 40px rgba(0, 0, 0, 0.5);
+  --shadow-lifted: 0 2px 6px rgba(0, 0, 0, 0.24), 0 6px 24px rgba(0, 0, 0, 0.34);
+  --shadow-top: 0 -4px 16px rgba(0, 0, 0, 0.22);
+
+  --status-working-background: color-mix(in srgb, var(--accent-primary) 16%, transparent);
+  --status-working-border: var(--accent-primary);
+  --status-working-color: var(--accent-primary);
+  --status-merge-ready-background: var(--accent-success);
+  --status-merge-ready-border: var(--accent-success);
+  --status-merge-ready-color: var(--text-on-accent);
+  --status-blocked-background: transparent;
+  --status-blocked-border: var(--accent-danger);
+  --status-blocked-color: var(--accent-danger);
+
+  --diff-add-background: color-mix(in srgb, var(--accent-success) 18%, transparent);
+  --diff-add-foreground: #cdd6f4;
+  --diff-remove-background: color-mix(in srgb, var(--accent-danger) 16%, transparent);
+  --diff-remove-foreground: #f38ba8;
+  --diff-hatch-color: color-mix(in srgb, var(--accent-danger) 22%, var(--background-primary));
+
+  --selection-inverse-background: #cba6f7;
+  --selection-inverse-color: #11111b;
+
+  --syntax-text: #cdd6f4;
+  --syntax-comment: #6c7086;
+  --syntax-keyword: #cba6f7;
+  --syntax-function: #89b4fa;
+  --syntax-string: #a6e3a1;
+  --syntax-number: #fab387;
+  --syntax-type: #74c7ec;
+  --syntax-variable: #f5c2e7;
+}

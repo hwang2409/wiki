@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { X } from "lucide-react";
+import { ChevronDown, X } from "lucide-react";
+import { THEMES, type ThemeId } from "./themes";
 
 export type MonoFontChoice = { label: string; stack: string };
 
@@ -98,7 +99,15 @@ function setMonoFont(label: string) {
   document.documentElement.style.setProperty("--font-monospace", choice.stack);
 }
 
-export function SettingsModal({ onClose }: { onClose: () => void }) {
+export function SettingsModal({
+  onClose,
+  onThemeChange,
+  theme,
+}: {
+  onClose: () => void;
+  onThemeChange: (theme: ThemeId) => void;
+  theme: ThemeId;
+}) {
   const [monoFont, setMonoFontState] = useState(currentMonoFont);
   const [bodySize, setBodySize] = useState(() => storedSize(BODY_SIZE_KEY, BODY_SIZE_DEFAULT));
   const [uiSize, setUiSize] = useState(() => storedSize(UI_SIZE_KEY, UI_SIZE_DEFAULT));
@@ -130,6 +139,37 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
           </button>
         </div>
         <div className="settings-section">
+          <div className="settings-row settings-row-stack">
+            <div className="settings-row-info">
+              <div className="settings-row-name">Theme</div>
+              <div className="settings-row-desc">
+                UI chrome, diff accents, and syntax highlighting follow the selected palette.
+              </div>
+            </div>
+            <div aria-label="Theme" className="theme-grid" role="radiogroup">
+              {THEMES.map((option) => (
+                <button
+                  key={option.id}
+                  aria-checked={theme === option.id}
+                  className={`theme-choice${theme === option.id ? " is-active" : ""}`}
+                  role="radio"
+                  type="button"
+                  onClick={() => onThemeChange(option.id)}
+                >
+                  <span aria-hidden className="theme-choice-swatches">
+                    {option.preview.map((color, index) => (
+                      <span
+                        key={`${option.id}-${index}`}
+                        className="theme-choice-swatch"
+                        style={{ backgroundColor: color }}
+                      />
+                    ))}
+                  </span>
+                  <span className="theme-choice-name">{option.label}</span>
+                </button>
+              ))}
+            </div>
+          </div>
           <div className="settings-row">
             <div className="settings-row-info">
               <div className="settings-row-name">Monospace font</div>
@@ -137,19 +177,24 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                 Used for headings, code, agent transcripts, and UI chrome.
               </div>
             </div>
-            <select
-              value={monoFont}
-              onChange={(event) => {
-                setMonoFont(event.target.value);
-                setMonoFontState(event.target.value);
-              }}
-            >
-              {MONO_FONTS.map((font) => (
-                <option key={font.label} style={{ fontFamily: font.stack }} value={font.label}>
-                  {font.label}
-                </option>
-              ))}
-            </select>
+            <div className="settings-select">
+              <select
+                value={monoFont}
+                onChange={(event) => {
+                  setMonoFont(event.target.value);
+                  setMonoFontState(event.target.value);
+                }}
+              >
+                {MONO_FONTS.map((font) => (
+                  <option key={font.label} style={{ fontFamily: font.stack }} value={font.label}>
+                    {font.label}
+                  </option>
+                ))}
+              </select>
+              <span aria-hidden className="settings-select-chevron">
+                <ChevronDown size={14} />
+              </span>
+            </div>
           </div>
           <div className="settings-preview" style={{ fontFamily: "var(--font-monospace)" }}>
             wiki agent register PHO-1234 --orch phoebe {"->"} 0O1lI| fi ff

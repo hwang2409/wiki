@@ -8,7 +8,7 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[hot]] — rolling ≤500-word session cache injected at Claude session start; rewrite at work-arc boundaries.
 - [[todo]] — general cross-project scrap todo. Read when Henry asks "what's next"; update when items land.
 - [[done]] — worldwide completion tally (`log/done.md`). Append on every merge/completion; check before writing todo.
-- [[wiki-app-ui-direction]] — decision: wiki app is an Obsidian clone, monochrome theme, light default; rejected paths + key files. Read before wiki-app UI work.
+- [[wiki-app-ui-direction]] — decision: wiki app is an Obsidian clone with restrained chrome and a standard editor-theme set; family toggle behavior + key files. Read before wiki-app UI work.
 - [[ui-demo]] — renderer demo fixture exercising every wiki-app markdown feature. Keep when pruning; used to verify rendering.
 - [[agent-vault-patterns]] — verified survey of how others structure markdown vaults for agent memory; gap analysis vs this vault
 - [[source-credibility]] — structural source-verification method for research tasks; read when a query needs reputable sourcing (acted-on findings), skip for casual surveys.
