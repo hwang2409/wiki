@@ -26,21 +26,30 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
-CODEX_SESSIONS_DIR = Path(
-    os.environ.get("WIKI_CODEX_SESSIONS_DIR", str(Path.home() / ".codex" / "sessions"))
-)
-CLAUDE_PROJECTS_DIR = Path(
-    os.environ.get("WIKI_CLAUDE_PROJECTS_DIR", str(Path.home() / ".claude" / "projects"))
-)
-TOKEN_CACHE_PATH = Path(
-    os.environ.get("WIKI_TOKEN_CACHE_PATH", str(Path.home() / ".wiki" / "token-cache.json"))
-)
-
 CACHE_VERSION = 1
 MAX_MSG_IDS_PER_FILE = 5000  # streaming dedupe window; assistant rows / session
 
 BUCKET_HOUR = "hour"
 BUCKET_DAY = "day"
+
+
+def codex_sessions_dir() -> Path:
+    return Path(
+        os.environ.get("WIKI_CODEX_SESSIONS_DIR", str(Path.home() / ".codex" / "sessions"))
+    )
+
+
+def claude_projects_dir() -> Path:
+    return Path(
+        os.environ.get("WIKI_CLAUDE_PROJECTS_DIR", str(Path.home() / ".claude" / "projects"))
+    )
+
+
+def token_cache_path() -> Path:
+    return Path(
+        os.environ.get("WIKI_TOKEN_CACHE_PATH", str(Path.home() / ".wiki" / "token-cache.json"))
+    )
+
 
 # --------------------------------------------------------------------- state
 
@@ -57,7 +66,7 @@ def _empty_state() -> dict:
 
 def _load_state() -> dict:
     try:
-        raw = json.loads(TOKEN_CACHE_PATH.read_text(encoding="utf-8"))
+        raw = json.loads(token_cache_path().read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return _empty_state()
     if not isinstance(raw, dict) or raw.get("version") != CACHE_VERSION:
@@ -69,13 +78,13 @@ def _load_state() -> dict:
 
 def _save_state(state: dict) -> None:
     try:
-        TOKEN_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        token_cache_path().parent.mkdir(parents=True, exist_ok=True)
     except OSError:
         return
-    tmp = TOKEN_CACHE_PATH.with_suffix(".tmp")
+    tmp = token_cache_path().with_suffix(".tmp")
     try:
         tmp.write_text(json.dumps(state), encoding="utf-8")
-        tmp.replace(TOKEN_CACHE_PATH)
+        tmp.replace(token_cache_path())
     except OSError:
         return
 
@@ -312,18 +321,20 @@ def _scan_file(state: dict, path: Path, cli: str, index: dict) -> None:
 
 
 def _iter_codex_files() -> Iterable[Path]:
-    if not CODEX_SESSIONS_DIR.is_dir():
+    root = codex_sessions_dir()
+    if not root.is_dir():
         return
     # Glob is cheap enough; there are typically hundreds of files, not millions.
-    for path in CODEX_SESSIONS_DIR.rglob("rollout-*.jsonl"):
+    for path in root.rglob("rollout-*.jsonl"):
         if path.is_file():
             yield path
 
 
 def _iter_claude_files() -> Iterable[Path]:
-    if not CLAUDE_PROJECTS_DIR.is_dir():
+    root = claude_projects_dir()
+    if not root.is_dir():
         return
-    for path in CLAUDE_PROJECTS_DIR.rglob("*.jsonl"):
+    for path in root.rglob("*.jsonl"):
         if path.is_file():
             yield path
 
@@ -436,27 +447,3 @@ def query(
     }
 
 
-# --------------------------------------------------------------------- helpers for tests
-
-
-def reset_cache() -> None:
-    """Wipe the on-disk cache (test-only)."""
-    try:
-        TOKEN_CACHE_PATH.unlink()
-    except FileNotFoundError:
-        pass
-
-
-# For tests that swap the env after import, expose a live-resolved dir getter
-# so pytest fixtures can monkeypatch os.environ then call refresh().
-def refresh_paths() -> None:
-    global CODEX_SESSIONS_DIR, CLAUDE_PROJECTS_DIR, TOKEN_CACHE_PATH
-    CODEX_SESSIONS_DIR = Path(
-        os.environ.get("WIKI_CODEX_SESSIONS_DIR", str(Path.home() / ".codex" / "sessions"))
-    )
-    CLAUDE_PROJECTS_DIR = Path(
-        os.environ.get("WIKI_CLAUDE_PROJECTS_DIR", str(Path.home() / ".claude" / "projects"))
-    )
-    TOKEN_CACHE_PATH = Path(
-        os.environ.get("WIKI_TOKEN_CACHE_PATH", str(Path.home() / ".wiki" / "token-cache.json"))
-    )

@@ -36,10 +36,6 @@ class _EnvOverride:
         }
         self._patch = mock.patch.dict(os.environ, env)
         self._patch.start()
-        # tokens module reads env at import time; re-resolve after patching.
-        from backend.app import tokens
-
-        tokens.refresh_paths()
         return paths
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -47,10 +43,6 @@ class _EnvOverride:
             self._patch.stop()
         if self._tmp is not None:
             self._tmp.cleanup()
-        # Reset back to real defaults so other tests aren't affected.
-        from backend.app import tokens
-
-        tokens.refresh_paths()
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:

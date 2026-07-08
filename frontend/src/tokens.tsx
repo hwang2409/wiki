@@ -86,15 +86,11 @@ export function TokensView() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
-  // Applying a preset also picks its natural bucket, but the user can still
-  // override afterwards. We track the last preset the user PICKED so switching
-  // presets re-derives the bucket, without stomping a subsequent manual toggle.
-  const [presetChangeToken, setPresetChangeToken] = useState(0);
-
-  useEffect(() => {
-    const chosen = PRESETS.find((p) => p.key === preset);
+  function pickPreset(next: Preset) {
+    const chosen = PRESETS.find((p) => p.key === next);
+    setPreset(next);
     if (chosen) setBucketMode(chosen.bucket);
-  }, [preset, presetChangeToken]);
+  }
 
   const range = useMemo(() => {
     const chosen = PRESETS.find((p) => p.key === preset) ?? PRESETS[1];
@@ -180,10 +176,7 @@ export function TokensView() {
               key={p.key}
               className={`tokens-chip${preset === p.key ? " is-active" : ""}`}
               type="button"
-              onClick={() => {
-                setPreset(p.key);
-                setPresetChangeToken((n) => n + 1);
-              }}
+              onClick={() => pickPreset(p.key)}
             >
               {p.label}
             </button>
