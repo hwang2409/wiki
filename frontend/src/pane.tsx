@@ -6,8 +6,7 @@ import {
   type RefObject,
   type SetStateAction,
 } from "react";
-import { X } from "lucide-react";
-import { getNote, updateNote, type NoteLinks } from "./api";
+import { getLinks, getNote, updateNote, type NoteLinks } from "./api";
 import {
   AgentSessionSurface,
   type AgentRoutePanel,
@@ -75,17 +74,14 @@ export function WorkspacePane({
     <AgentPane
       agentPanel={agentPanel}
       agentWorkers={agentWorkers}
-      focused={focused}
       onClose={onClose}
       path={path}
       refreshTick={refreshTick}
     />
   ) : (
     <NotePane
-      focused={focused}
       focusState={noteFocusState}
       notes={notes}
-      onClose={onClose}
       onOpenNote={onOpenNote}
       path={path}
       refreshTick={refreshTick}
@@ -110,14 +106,12 @@ export function WorkspacePane({
 function AgentPane({
   agentPanel,
   agentWorkers,
-  focused,
   path,
   refreshTick,
   onClose,
 }: {
   agentPanel: AgentRoutePanel;
   agentWorkers?: Map<string, AgentSessionSurfaceWorker>;
-  focused: boolean;
   path: string;
   refreshTick: number;
   onClose: () => void;
@@ -128,9 +122,9 @@ function AgentPane({
   return (
     <section className="secondary-pane agent-pane">
       <AgentSessionSurface
-        context={focused ? "full" : "pane"}
-        initialPanel={focused ? agentPanel : null}
-        onClose={focused ? undefined : onClose}
+        context="pane"
+        initialPanel={agentPanel}
+        onClose={onClose}
         refreshTick={refreshTick}
         worker={worker}
       />
@@ -139,31 +133,44 @@ function AgentPane({
 }
 
 function NotePane({
-  focused,
   focusState,
   notes,
-  onClose,
   onOpenNote,
   path,
   refreshTick,
   scrollRef,
 }: {
-  focused: boolean;
   focusState: PaneNoteFocusState;
   notes: NoteSummary[];
-  onClose: () => void;
   onOpenNote: (path: string) => void;
   path: string;
   refreshTick: number;
   scrollRef?: RefObject<HTMLDivElement | null>;
 }) {
   const [note, setNote] = useState<Note | null>(null);
+  const [localLinks, setLocalLinks] = useState<NoteLinks | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     setNote(null);
+    setLocalLinks(null);
     setError(null);
   }, [path]);
+
+  useEffect(() => {
+    if (focusState?.kind === "view") return;
+    let ignore = false;
+    getLinks()
+      .then((all) => {
+        if (!ignore) setLocalLinks(all[path] ?? null);
+      })
+      .catch(() => {
+        if (!ignore) setLocalLinks(null);
+      });
+    return () => {
+      ignore = true;
+    };
+  }, [path, refreshTick, focusState?.kind]);
 
   useEffect(() => {
     if (focusState?.kind !== "view") return;
@@ -194,7 +201,10 @@ function NotePane({
   const parsed = currentNote ? splitFrontmatter(currentNote.content) : null;
   const isKanban =
     parsed?.properties?.some(([key, value]) => key === "view" && value === "kanban") ?? false;
-  const backlinks = focusState?.kind === "view" ? focusState.links?.incoming ?? [] : [];
+  const backlinks =
+    focusState?.kind === "view"
+      ? focusState.links?.incoming ?? []
+      : localLinks?.incoming ?? [];
 
   async function handleBoardChange(next: string) {
     setError(null);
@@ -233,21 +243,7 @@ function NotePane({
 
   return (
     <section className="secondary-pane" aria-label={`Pane: ${basename(path)}`}>
-      {!focused ? (
-        <header className="secondary-pane-header">
-          <span className="secondary-pane-title">{basename(path)}</span>
-          <button
-            aria-label="Close pane"
-            className="view-action"
-            title="Close pane"
-            type="button"
-            onClick={onClose}
-          >
-            <X size={14} />
-          </button>
-        </header>
-      ) : null}
-      <div className={`secondary-pane-content${focused ? " view-content" : ""}`} ref={scrollRef}>
+      <div className="secondary-pane-content view-content" ref={scrollRef}>
         {error ? (
           <div className="notice" role="alert">
             <span>{error}</span>
