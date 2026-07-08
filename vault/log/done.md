@@ -9,6 +9,7 @@ updated: 2026-07-08
 
 ## 2026-07-08
 
+- **WIKI-30** — performance audit — why is the app sluggish; measured bottlenecks + ranked fix plan (owner: cdx:WIKI-30, investigation)
 - **WIKI-29** — C-a leader must override composer insert mode — prefix chords (C-a 9 etc.) intercept at capture phase regardless of vim/chatbox state, like native tmux
 - **WIKI-26** — auto-kill tmux window when an agent run is archived (wiki agent done / archive path kills window_id)
 - **phoebe** — PHO-11274 compare_agent_runs merged (#10850) — facts-only run comparison w/ caveats, cold-tier trace pack; audit-validated P1

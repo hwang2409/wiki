@@ -17,7 +17,6 @@ In Progress:
 - [PHO-13227](https://linear.app/phoebework/issue/PHO-13227): subagent approval inheritance (13226 T2) — cdx:PHO-13227 worker
 - [PR #10475](https://github.com/phoebe-health/phoebe/pull/10475): subagent recommendation parity iteration (harness #10692) — cdx:PR-10475 worker; overfitting watch
 - [P1] WIKI-28: external links open in default browser (web target=_blank audit + tauri opener/on_navigation) (owner: cdx:WIKI-28)
-- [P1] WIKI-30: performance audit — why is the app sluggish; measured bottlenecks + ranked fix plan (owner: cdx:WIKI-30, investigation)
 
 Backlog:
 
@@ -41,3 +40,4 @@ Backlog:
 - [P1] [PHO-13138](https://linear.app/phoebework/issue/PHO-13138): Phase 2 admin-owned tables — plan approved (ticket comment = contract, 8-PR series); cdx:PHO-13138 worker on PR1 (schema/roles/deny-tests)
 - [P1] [PHO-13157](https://linear.app/phoebework/issue/PHO-13157): survey delayed-reply capture + chat-history link (folds 13106+13155, 2 customer reports) — cdx:PHO-13157 worker (gpt-5.4 xhigh)
 - [P2] WIKI-27: stabilize view-header height on note<->agent focus flips (40px pane jump, pre-existing — header collapses per focused-pane kind; fix per-window) + drop focusState.kind from pane.tsx getLinks deps (4 redundant /api/links per flip)
+- [P1] WIKI-34: watchdog limit parser misses same-day reset format ('try again at 8:01 PM' — no date) -> account stays eligible:true and rotation thrashes into dead accounts; parse bare time as today (tz-aware), pin outgoing account reset on every rotation
