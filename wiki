@@ -20,6 +20,7 @@ import argparse
 import datetime
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -386,6 +387,45 @@ def persist_outcome(ticket: str, outcome: str | None, entry: dict | None = None)
     return meta_path
 
 
+def maybe_kill_agent_window(entry: dict, keep_window: bool = False) -> str | None:
+    current = entry.get("current")
+    if not isinstance(current, dict):
+        return None
+    window_id = current.get("window")
+    if not isinstance(window_id, str) or not re.fullmatch(r"@\d+", window_id):
+        return None
+    if keep_window:
+        return f"kept window {window_id}"
+    try:
+        result = subprocess.run(
+            ["tmux", "list-windows", "-a", "-F", "#{window_id}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return f"window already gone: {window_id}"
+    if result.returncode != 0:
+        return f"window already gone: {window_id}"
+    live_windows = {line.strip() for line in result.stdout.splitlines() if line.strip()}
+    if window_id not in live_windows:
+        return f"window already gone: {window_id}"
+    try:
+        killed = subprocess.run(
+            ["tmux", "kill-window", "-t", window_id],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return f"window already gone: {window_id}"
+    if killed.returncode != 0:
+        return f"window already gone: {window_id}"
+    return f"killed window {window_id}"
+
+
 def cmd_agent_done(args: argparse.Namespace) -> None:
     ticket = args.ticket.strip().upper()
     if args.outcome and args.outcome not in AGENT_OUTCOMES:
@@ -403,6 +443,9 @@ def cmd_agent_done(args: argparse.Namespace) -> None:
     else:
         line += "; WARNING: no archive dir found — archive BEFORE `wiki agent done` so outcome persists"
     print(line)
+    window_line = maybe_kill_agent_window(entry, keep_window=args.keep_window)
+    if window_line:
+        print(window_line)
 
 
 def cmd_agent_update(args: argparse.Namespace) -> None:
@@ -738,6 +781,11 @@ def main() -> None:
     done = agent_sub.add_parser("done", help="deregister at wrap-up (run AFTER archiving so outcome persists)")
     done.add_argument("ticket")
     done.add_argument("--outcome", help="merged | closed | plan-ready | abandoned")
+    done.add_argument(
+        "--keep-window",
+        action="store_true",
+        help="leave the recorded tmux window alive after archiving",
+    )
     done.set_defaults(func=cmd_agent_done)
 
     outcome = agent_sub.add_parser("outcome", help="mark an archived ticket's outcome after the fact")
