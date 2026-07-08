@@ -1,5 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import {
+  CircleAlert,
+  CircleCheck,
+  LoaderCircle,
   ExternalLink,
   GitBranch,
   GitPullRequest,
@@ -30,6 +33,16 @@ function checkSummary(checks: AgentPrCheck[]) {
     },
     { pass: 0, fail: 0, pending: 0 }
   );
+}
+
+function CheckStateGlyph({ state }: { state: AgentPrCheck["state"] }) {
+  if (state === "pass") {
+    return <CircleCheck size={12} />;
+  }
+  if (state === "fail") {
+    return <CircleAlert size={12} />;
+  }
+  return <LoaderCircle size={12} />;
 }
 
 export function AgentPrReviewPanel({
@@ -199,14 +212,17 @@ export function AgentPrReviewPanel({
         ) : (
           <div className="pr-review-checks">
             {checks.map((check, index) => {
+              const context = check.workflow ?? "status check";
               const content = (
                 <>
-                  <span className={`pr-review-check-state is-${check.state}`}>{check.state}</span>
-                  <span className="pr-review-check-name">{check.name}</span>
-                  {check.workflow ? (
-                    <span className="pr-review-check-detail">{check.workflow}</span>
-                  ) : null}
-                  <span className="pr-review-check-detail">{humanizeEnum(check.rawState)}</span>
+                  <span className={`pr-review-check-status is-${check.state}`} aria-label={check.state}>
+                    <CheckStateGlyph state={check.state} />
+                  </span>
+                  <span className="pr-review-check-copy">
+                    <span className="pr-review-check-name">{check.name}</span>
+                    <span className="pr-review-check-context">{context}</span>
+                  </span>
+                  <span className="pr-review-check-result">{humanizeEnum(check.rawState)}</span>
                 </>
               );
               return check.detailsUrl ? (

@@ -36,8 +36,12 @@ import { FleetSwitcher, QuickSwitcher } from "./switcher";
 import { SettingsModal, applyStoredMonoFont } from "./settings";
 import { ActivityFeed } from "./activity";
 import { AgentsSidebar, AgentsView } from "./agents";
+import {
+  AgentSessionView,
+  type AgentRoutePanel,
+  type AgentSessionSurfaceWorker,
+} from "./agent-session-surface";
 import { LoadingPlaceholder } from "./loading";
-import { AgentSessionView } from "./session";
 import { GraphView } from "./graph";
 import { HealthView } from "./health";
 import { KanbanBoard, appendDoneEntry } from "./kanban";
@@ -196,6 +200,19 @@ function ticketFromPanePath(path: string | null): string | null {
 
 function cwdBasename(path: string | null): string {
   return path ? path.split("/").slice(-1)[0] : "no cwd";
+}
+
+function buildAgentSessionWorker(
+  worker: Pick<AgentWorker, "ticket" | "kind" | "role" | "model" | "pr">
+): AgentSessionSurfaceWorker {
+  return {
+    ticket: worker.ticket,
+    kind: worker.kind,
+    role: worker.role,
+    model: worker.model,
+    pr: worker.pr,
+    canReview: Boolean(worker.pr),
+  };
 }
 
 function buildFleetGroups(workers: AgentWorker[], orchestrators: Orchestrator[]): FleetGroup[] {
@@ -379,7 +396,7 @@ type Route =
   | { kind: "empty" }
   | { kind: "new" }
   | { kind: UtilityMode }
-  | { kind: "agent"; ticket: string }
+  | { kind: "agent"; ticket: string; panel: AgentRoutePanel }
   | { kind: "note" | "edit"; path: string };
 
 const UTILITY_ROUTES: readonly UtilityMode[] = ["activity", "graph", "health", "agents"];
@@ -387,7 +404,10 @@ const UTILITY_ROUTES: readonly UtilityMode[] = ["activity", "graph", "health", "
 function routeHash(route: Route): string {
   if (route.kind === "empty") return "#/";
   if (route.kind === "new") return "#/new";
-  if (route.kind === "agent") return `#/agent/${encodeURIComponent(route.ticket)}`;
+  if (route.kind === "agent") {
+    const base = `#/agent/${encodeURIComponent(route.ticket)}`;
+    return route.panel === "review" ? `${base}/review` : base;
+  }
   if ((UTILITY_ROUTES as readonly string[]).includes(route.kind)) return `#/${route.kind}`;
   const encoded = (route as { path: string }).path
     .split("/")
@@ -398,8 +418,8 @@ function routeHash(route: Route): string {
 
 function parseRoute(hash: string): Route {
   if (hash === "#/new") return { kind: "new" };
-  const agent = hash.match(/^#\/agent\/([A-Za-z0-9-]+)$/);
-  if (agent) return { kind: "agent", ticket: agent[1] };
+  const agent = hash.match(/^#\/agent\/([A-Za-z0-9-]+)(?:\/(review))?$/);
+  if (agent) return { kind: "agent", ticket: agent[1], panel: agent[2] === "review" ? "review" : null };
   const utility = UTILITY_ROUTES.find((kind) => hash === `#/${kind}`);
   if (utility) return { kind: utility };
   const match = hash.match(/^#\/(note|edit)\/(.+)$/);
@@ -739,6 +759,7 @@ export default function App() {
     return stored === "search" || stored === "agents" ? stored : "files";
   });
   const [agentTicket, setAgentTicket] = useState<string | null>(null);
+  const [agentPanel, setAgentPanel] = useState<AgentRoutePanel>(null);
   const [leaderArmed, setLeaderArmed] = useState(false);
   const [fleetChooser, setFleetChooser] = useState<FleetChooserMode | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -902,10 +923,21 @@ export default function App() {
   const tree = useMemo(() => buildTree(notes), [notes]);
   const paneInfos = useMemo(() => collectPaneInfos(layout), [layout]);
   const paneMap = useMemo(() => new Map(paneInfos.map((pane) => [pane.key, pane])), [paneInfos]);
+  const agentWorkers = useMemo(() => {
+    const map = new Map<string, AgentSessionSurfaceWorker>();
+    for (const worker of agentsState.workers ?? []) {
+      map.set(worker.ticket, buildAgentSessionWorker(worker));
+    }
+    for (const worker of agentsState.archived ?? []) {
+      if (!map.has(worker.ticket)) map.set(worker.ticket, buildAgentSessionWorker(worker));
+    }
+    return map;
+  }, [agentsState.archived, agentsState.workers]);
   const fleetGroups = useMemo(
     () => buildFleetGroups(agentsState.workers ?? [], agentsState.orchestrators),
     [agentsState.orchestrators, agentsState.workers]
   );
+  const activeAgentWorker = agentTicket ? agentWorkers.get(agentTicket) ?? { ticket: agentTicket } : null;
   const primaryViewedAgentTicket = mode === "agent" ? agentTicket : mode === "agents" ? agentsOpenTicket : null;
   const focusedPaneTicket =
     focusedPaneId === "primary"
@@ -1044,6 +1076,7 @@ export default function App() {
   async function openNote(path: string) {
     navigate({ kind: "note", path });
     setError(null);
+    setAgentPanel(null);
     setMode("view");
     try {
       const note = await getNote(path);
@@ -1057,13 +1090,15 @@ export default function App() {
     navigate({ kind });
     setError(null);
     setActiveNote(null);
+    setAgentPanel(null);
     setMode(kind);
   }
 
-  function openAgent(ticket: string) {
-    navigate({ kind: "agent", ticket });
+  function openAgent(ticket: string, panel: AgentRoutePanel = null) {
+    navigate({ kind: "agent", panel, ticket });
     setError(null);
     setActiveNote(null);
+    setAgentPanel(panel);
     setAgentTicket(ticket);
     setMode("agent");
   }
@@ -1349,23 +1384,27 @@ export default function App() {
       setError(null);
       if (route.kind === "empty") {
         setActiveNote(null);
+        setAgentPanel(null);
         setMode("empty");
         return;
       }
       if (route.kind === "new") {
         setActiveNote(null);
+        setAgentPanel(null);
         setDraft(emptyDraft);
         setMode("new");
         return;
       }
       if (route.kind === "agent") {
         setActiveNote(null);
+        setAgentPanel(route.panel);
         setAgentTicket(route.ticket);
         setMode("agent");
         return;
       }
       if (route.kind !== "note" && route.kind !== "edit") {
         setActiveNote(null);
+        setAgentPanel(null);
         setMode(route.kind);
         return;
       }
@@ -1677,6 +1716,7 @@ export default function App() {
           {renderPaneFrame(
             node.id,
             <SecondaryPane
+              agentWorkers={agentWorkers}
               notes={notes}
               path={node.path}
               refreshTick={refreshTick}
@@ -1970,10 +2010,16 @@ export default function App() {
           ) : mode === "health" ? (
             <HealthView notes={notes} onOpenNote={openNote} />
           ) : mode === "agent" && agentTicket ? (
-            <AgentSessionView key={agentTicket} refreshTick={refreshTick} ticket={agentTicket} />
+            <AgentSessionView
+              initialPanel={agentPanel}
+              key={agentTicket}
+              refreshTick={refreshTick}
+              worker={activeAgentWorker ?? { ticket: agentTicket }}
+            />
           ) : mode === "agents" ? (
             <AgentsView
               data={agentsState}
+              onOpenAgent={openAgent}
               refreshTick={refreshTick}
               openTicket={agentsOpenTicket}
               onOpenTicket={setAgentsOpenTicket}

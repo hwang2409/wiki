@@ -555,6 +555,7 @@ function SpawnOrchestratorModal({
 
 export function AgentsView({
   data,
+  onOpenAgent,
   refreshTick,
   openTicket,
   onOpenTicket,
@@ -565,6 +566,7 @@ export function AgentsView({
     archived: ArchivedWorker[];
     error: string | null;
   };
+  onOpenAgent: (ticket: string, panel?: "review") => void;
   refreshTick: number;
   openTicket: string | null;
   onOpenTicket: (ticket: string | null) => void;
@@ -573,7 +575,6 @@ export function AgentsView({
   const [fetchedOrchestrators, setFetchedOrchestrators] = useState<Orchestrator[]>([]);
   const [fetchedArchived, setFetchedArchived] = useState<ArchivedWorker[]>([]);
   const [fetchedError, setFetchedError] = useState<string | null>(null);
-  const [openPanel, setOpenPanel] = useState<"session" | "review">("session");
   const [spawnWorkerOpen, setSpawnWorkerOpen] = useState(false);
   const [spawnOrchestratorOpen, setSpawnOrchestratorOpen] = useState(false);
   const [spawnNotice, setSpawnNotice] = useState<SpawnNotice | null>(null);
@@ -634,7 +635,7 @@ export function AgentsView({
             role: archivedWorker.role,
             model: archivedWorker.model,
             pr: archivedWorker.pr,
-            canReview: false,
+            canReview: Boolean(archivedWorker.pr),
           }
         : null;
 
@@ -713,8 +714,7 @@ export function AgentsView({
               className="agent-pr"
               type="button"
               onClick={() => {
-                setOpenPanel("review");
-                onOpenTicket(worker.ticket);
+                onOpenAgent(worker.ticket, "review");
               }}
             >
               <GitPullRequest size={11} />
@@ -724,10 +724,7 @@ export function AgentsView({
           <button
             className={`agent-log-toggle${isOpen ? " is-active" : ""}`}
             type="button"
-            onClick={() => {
-              setOpenPanel("session");
-              onOpenTicket(isOpen && openPanel === "session" ? null : worker.ticket);
-            }}
+            onClick={() => onOpenTicket(isOpen ? null : worker.ticket)}
           >
             <ScrollText size={13} />
             log
@@ -770,10 +767,7 @@ export function AgentsView({
               <button
                 className={`agent-log-toggle${openTicket === orch.id ? " is-active" : ""}`}
                 type="button"
-                onClick={() => {
-                  setOpenPanel("session");
-                  onOpenTicket(openTicket === orch.id ? null : orch.id);
-                }}
+                onClick={() => onOpenTicket(openTicket === orch.id ? null : orch.id)}
               >
                 <ScrollText size={13} />
                 log
@@ -842,10 +836,7 @@ export function AgentsView({
                     <button
                       className={`agent-log-toggle${isOpen ? " is-active" : ""}`}
                       type="button"
-                      onClick={() => {
-                        setOpenPanel("session");
-                        onOpenTicket(isOpen ? null : entry.ticket);
-                      }}
+                      onClick={() => onOpenTicket(isOpen ? null : entry.ticket)}
                     >
                       <ScrollText size={13} />
                       log
@@ -914,7 +905,7 @@ export function AgentsView({
       </div>
       {openWorker ? (
         <SessionSidebar
-          initialTab={openPanel}
+          onOpenAgent={onOpenAgent}
           worker={openWorker}
           refreshTick={refreshTick}
           onClose={() => onOpenTicket(null)}
@@ -925,7 +916,6 @@ export function AgentsView({
           orchestrators={orchestrators}
           onClose={() => setSpawnWorkerOpen(false)}
           onSpawn={(notice) => {
-            setOpenPanel("session");
             setSpawnNotice(notice);
             setSpawnWorkerOpen(false);
             onOpenTicket(notice.ticket);

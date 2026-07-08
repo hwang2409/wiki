@@ -6,18 +6,18 @@ import {
   CircleCheck,
   Eye,
   FileText,
-  MessageCircleQuestion,
-  SendHorizontal,
-  SlashSquare,
   GitCommit,
   GitPullRequest,
   Hourglass,
   ListTodo,
+  MessageCircleQuestion,
   Pencil,
   Radio,
-  Search,
   ScrollText,
+  Search,
+  SendHorizontal,
   Server,
+  SlashSquare,
   Tag,
   Terminal,
   Wrench,
@@ -36,7 +36,6 @@ import {
   uploadImage,
 } from "./api";
 import type { AgentSessionData, QueuedMessage, SessionEvent, SkillInfo, SubagentInfo } from "./api";
-import { AgentPrReviewPanel } from "./agent-pr-review";
 import { LoadingPlaceholder } from "./loading";
 
 const POLL_MS = 2500;
@@ -468,11 +467,13 @@ export function SessionTab({
   ticket,
   tick,
   subagent,
+  showComposer = true,
   onInspect,
 }: {
   ticket: string;
   tick: number;
   subagent?: string;
+  showComposer?: boolean;
   onInspect?: (agentId: string) => void;
 }) {
   const [session, setSession] = useState<SessionAcc | null>(null);
@@ -570,7 +571,7 @@ export function SessionTab({
         )}
       </div>
       </div>
-      {subagent ? null : (
+      {subagent || !showComposer ? null : (
         <MessageComposer
           history={userHistory}
           runningSubagents={runningSubagents}
@@ -1275,24 +1276,19 @@ export type SidebarTarget = {
 
 export function SessionSidebar({
   worker,
-  initialTab = "session",
   refreshTick,
   onClose,
+  onOpenAgent,
 }: {
   worker: SidebarTarget;
-  initialTab?: "session" | "review";
   refreshTick: number;
   onClose: () => void;
+  onOpenAgent: (ticket: string, panel?: "review") => void;
 }) {
   const tick = usePollTick(refreshTick);
-  const [tab, setTab] = useState<"session" | "review">(initialTab);
   const [width, setWidth] = useState(() =>
     clampWidth(Number(localStorage.getItem(WIDTH_KEY)) || 480)
   );
-
-  useEffect(() => {
-    setTab(initialTab);
-  }, [initialTab, worker.ticket]);
 
   const startResize = (event: React.PointerEvent<HTMLDivElement>) => {
     event.preventDefault();
@@ -1326,160 +1322,32 @@ export function SessionSidebar({
           {worker.kind ? <span className="agent-chip">{worker.kind}</span> : null}
           {worker.role ? <span className="agent-chip">{worker.role}</span> : null}
           {worker.model ? <span className="agent-chip is-faint">{worker.model}</span> : null}
+          <div className="agent-surface-actions">
+            <button
+              className="agent-surface-action"
+              type="button"
+              onClick={() => onOpenAgent(worker.ticket)}
+            >
+              <ScrollText size={13} />
+              Open
+            </button>
+            {worker.canReview ? (
+              <button
+                className="agent-surface-action"
+                type="button"
+                onClick={() => onOpenAgent(worker.ticket, "review")}
+              >
+                <GitPullRequest size={13} />
+                Review
+              </button>
+            ) : null}
+          </div>
           <button className="session-close" type="button" onClick={onClose} aria-label="Close">
             <X size={14} />
           </button>
         </header>
-        {worker.canReview ? (
-          <div className="agent-surface-tabs">
-            <button
-              className={`agent-surface-tab${tab === "session" ? " is-active" : ""}`}
-              type="button"
-              onClick={() => setTab("session")}
-            >
-              <ScrollText size={13} />
-              Session
-            </button>
-            <button
-              className={`agent-surface-tab${tab === "review" ? " is-active" : ""}`}
-              type="button"
-              onClick={() => setTab("review")}
-            >
-              <GitPullRequest size={13} />
-              Review
-            </button>
-          </div>
-        ) : null}
-        {tab === "review" && worker.canReview ? (
-          <AgentPrReviewPanel canApprove={worker.canReview} ticket={worker.ticket} tick={tick} />
-        ) : (
-          <SessionTab ticket={worker.ticket} tick={tick} />
-        )}
+        <SessionTab showComposer={false} ticket={worker.ticket} tick={tick} />
       </div>
     </aside>
-  );
-}
-
-const SUBAGENT_WIDTH_KEY = "wiki-subagent-panel-width";
-
-export function SubagentSessionPanel({
-  className,
-  onClose,
-  onResizeStart,
-  subagent,
-  ticket,
-  tick,
-  width,
-}: {
-  className?: string;
-  onClose: () => void;
-  onResizeStart?: (event: React.PointerEvent<HTMLDivElement>) => void;
-  subagent: string;
-  ticket: string;
-  tick: number;
-  width?: number | string;
-}) {
-  return (
-    <aside className={`subagent-panel${className ? ` ${className}` : ""}`} style={{ width }}>
-      {onResizeStart ? <div className="session-resize" onPointerDown={onResizeStart} /> : null}
-      <header className="session-header">
-        <Bot size={13} />
-        <span className="session-ticket">subagent {subagent.slice(0, 8)}</span>
-        <span className="agent-chip is-faint">read-only</span>
-        <button
-          aria-label="Close"
-          className="session-close"
-          type="button"
-          onClick={onClose}
-        >
-          <X size={14} />
-        </button>
-      </header>
-      <SessionTab subagent={subagent} ticket={ticket} tick={tick} />
-    </aside>
-  );
-}
-
-export function AgentSessionView({ ticket, refreshTick }: { ticket: string; refreshTick: number }) {
-  const tick = usePollTick(refreshTick);
-  const [tab, setTab] = useState<"session" | "review">("session");
-  const [subagent, setSubagent] = useState<string | null>(null);
-  const [subagentWidth, setSubagentWidth] = useState(() =>
-    clampWidth(Number(localStorage.getItem(SUBAGENT_WIDTH_KEY)) || 480)
-  );
-
-  useEffect(() => {
-    setSubagent(null);
-    setTab("session");
-  }, [ticket]);
-
-  useEffect(() => {
-    if (tab === "review") setSubagent(null);
-  }, [tab]);
-
-  const startSubagentResize = (event: React.PointerEvent<HTMLDivElement>) => {
-    event.preventDefault();
-    const handle = event.currentTarget;
-    try {
-      handle.setPointerCapture(event.pointerId);
-    } catch {
-      /* synthetic events lack a real pointer — move/up listeners still work */
-    }
-    const onMove = (move: PointerEvent) => {
-      setSubagentWidth(clampWidth(window.innerWidth - move.clientX));
-    };
-    const onUp = () => {
-      handle.removeEventListener("pointermove", onMove);
-      handle.removeEventListener("pointerup", onUp);
-      setSubagentWidth((current) => {
-        localStorage.setItem(SUBAGENT_WIDTH_KEY, String(current));
-        return current;
-      });
-    };
-    handle.addEventListener("pointermove", onMove);
-    handle.addEventListener("pointerup", onUp);
-  };
-
-  return (
-    <div className="agent-fullview-row">
-      <div className="agent-fullview">
-        <header className="session-header agent-fullview-head">
-          <span className="session-ticket">{ticket}</span>
-          <div className="agent-surface-tabs">
-            <button
-              className={`agent-surface-tab${tab === "session" ? " is-active" : ""}`}
-              type="button"
-              onClick={() => setTab("session")}
-            >
-              <ScrollText size={13} />
-              Session
-            </button>
-            <button
-              className={`agent-surface-tab${tab === "review" ? " is-active" : ""}`}
-              type="button"
-              onClick={() => setTab("review")}
-            >
-              <GitPullRequest size={13} />
-              Review
-            </button>
-          </div>
-        </header>
-        {tab === "review" ? (
-          <AgentPrReviewPanel ticket={ticket} tick={tick} />
-        ) : (
-          <SessionTab ticket={ticket} tick={tick} onInspect={setSubagent} />
-        )}
-      </div>
-      {subagent && tab === "session" ? (
-        <SubagentSessionPanel
-          onClose={() => setSubagent(null)}
-          onResizeStart={startSubagentResize}
-          subagent={subagent}
-          ticket={ticket}
-          tick={tick}
-          width={subagentWidth}
-        />
-      ) : null}
-    </div>
   );
 }
