@@ -45,6 +45,22 @@ If you run the backend on another port, start the frontend with:
 WIKI_API_TARGET=http://127.0.0.1:8011 npm run dev
 ```
 
+## Agent Fleet Leader Keys
+
+The agent monitor supports a tmux-style leader on `Ctrl+A`. The prefix only arms when focus is not inside an `input`, `textarea`, or `contenteditable` surface, times out after about 1.5 seconds, and shows a temporary `C-a` chip while armed.
+
+| Chord | Action |
+| --- | --- |
+| `C-a n` / `C-a p` | Next / previous agent run inside the active orchestrator group |
+| `C-a 0-9` | Jump by group-local slot: `0` = orchestrator, `1-9` = workers in registration order |
+| `C-a (` / `C-a )` | Previous / next orchestrator group |
+| `C-a s` | Open orchestrator chooser |
+| `C-a w` | Open global orchestrator + worker tree chooser |
+| `C-a h` / `j` / `k` / `l` | Move focus between split panes |
+| `C-a x` | Close the focused secondary pane |
+| `C-a z` | Zoom/unzoom the focused pane |
+| `C-a ,` | Open settings |
+
 ## Native macOS App
 
 The native app is a Tauri 2 shell around the existing built frontend plus a frozen Python sidecar. The web app remains the source of truth: `make dev`, `frontend/src/api.ts`, and the Vite proxy flow stay unchanged.

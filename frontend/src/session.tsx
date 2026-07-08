@@ -1362,6 +1362,44 @@ export function SessionSidebar({
 
 const SUBAGENT_WIDTH_KEY = "wiki-subagent-panel-width";
 
+export function SubagentSessionPanel({
+  className,
+  onClose,
+  onResizeStart,
+  subagent,
+  ticket,
+  tick,
+  width,
+}: {
+  className?: string;
+  onClose: () => void;
+  onResizeStart?: (event: React.PointerEvent<HTMLDivElement>) => void;
+  subagent: string;
+  ticket: string;
+  tick: number;
+  width?: number | string;
+}) {
+  return (
+    <aside className={`subagent-panel${className ? ` ${className}` : ""}`} style={{ width }}>
+      {onResizeStart ? <div className="session-resize" onPointerDown={onResizeStart} /> : null}
+      <header className="session-header">
+        <Bot size={13} />
+        <span className="session-ticket">subagent {subagent.slice(0, 8)}</span>
+        <span className="agent-chip is-faint">read-only</span>
+        <button
+          aria-label="Close"
+          className="session-close"
+          type="button"
+          onClick={onClose}
+        >
+          <X size={14} />
+        </button>
+      </header>
+      <SessionTab subagent={subagent} ticket={ticket} tick={tick} />
+    </aside>
+  );
+}
+
 export function AgentSessionView({ ticket, refreshTick }: { ticket: string; refreshTick: number }) {
   const tick = usePollTick(refreshTick);
   const [tab, setTab] = useState<"session" | "review">("session");
@@ -1433,23 +1471,14 @@ export function AgentSessionView({ ticket, refreshTick }: { ticket: string; refr
         )}
       </div>
       {subagent && tab === "session" ? (
-        <aside className="subagent-panel" style={{ width: subagentWidth }}>
-          <div className="session-resize" onPointerDown={startSubagentResize} />
-          <header className="session-header">
-            <Bot size={13} />
-            <span className="session-ticket">subagent {subagent.slice(0, 8)}</span>
-            <span className="agent-chip is-faint">read-only</span>
-            <button
-              aria-label="Close"
-              className="session-close"
-              type="button"
-              onClick={() => setSubagent(null)}
-            >
-              <X size={14} />
-            </button>
-          </header>
-          <SessionTab subagent={subagent} ticket={ticket} tick={tick} />
-        </aside>
+        <SubagentSessionPanel
+          onClose={() => setSubagent(null)}
+          onResizeStart={startSubagentResize}
+          subagent={subagent}
+          ticket={ticket}
+          tick={tick}
+          width={subagentWidth}
+        />
       ) : null}
     </div>
   );

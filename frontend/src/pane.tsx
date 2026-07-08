@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { Bot, X } from "lucide-react";
 import { getNote, updateNote } from "./api";
 import { LoadingPlaceholder } from "./loading";
-import { SessionTab, usePollTick } from "./session";
+import { SessionTab, SubagentSessionPanel, usePollTick } from "./session";
 import { KanbanBoard, appendDoneEntry } from "./kanban";
 import type { KanbanCard } from "./kanban";
 import { ObsidianMarkdown, splitFrontmatter, stripLeadingTitle } from "./markdown";
@@ -52,6 +52,12 @@ function AgentPane({
 }) {
   const ticket = path.slice("agent://".length);
   const tick = usePollTick(refreshTick);
+  const [subagent, setSubagent] = useState<string | null>(null);
+
+  useEffect(() => {
+    setSubagent(null);
+  }, [ticket]);
+
   return (
     <section className="secondary-pane agent-pane">
       <header className="secondary-pane-header">
@@ -63,7 +69,19 @@ function AgentPane({
         </button>
       </header>
       <div className="agent-pane-body">
-        <SessionTab ticket={ticket} tick={tick} />
+        <div className="agent-pane-session">
+          <SessionTab ticket={ticket} tick={tick} onInspect={setSubagent} />
+        </div>
+        {subagent ? (
+          <SubagentSessionPanel
+            className="subagent-panel-inline"
+            onClose={() => setSubagent(null)}
+            subagent={subagent}
+            ticket={ticket}
+            tick={tick}
+            width="42%"
+          />
+        ) : null}
       </div>
     </section>
   );

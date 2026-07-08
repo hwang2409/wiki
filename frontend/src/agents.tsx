@@ -554,41 +554,56 @@ function SpawnOrchestratorModal({
 }
 
 export function AgentsView({
+  data,
   refreshTick,
   openTicket,
   onOpenTicket,
 }: {
+  data?: {
+    workers: AgentWorker[] | null;
+    orchestrators: Orchestrator[];
+    archived: ArchivedWorker[];
+    error: string | null;
+  };
   refreshTick: number;
   openTicket: string | null;
   onOpenTicket: (ticket: string | null) => void;
 }) {
-  const [workers, setWorkers] = useState<AgentWorker[] | null>(null);
-  const [orchestrators, setOrchestrators] = useState<Orchestrator[]>([]);
-  const [archived, setArchived] = useState<ArchivedWorker[]>([]);
-  const [error, setError] = useState<string | null>(null);
+  const [fetchedWorkers, setFetchedWorkers] = useState<AgentWorker[] | null>(null);
+  const [fetchedOrchestrators, setFetchedOrchestrators] = useState<Orchestrator[]>([]);
+  const [fetchedArchived, setFetchedArchived] = useState<ArchivedWorker[]>([]);
+  const [fetchedError, setFetchedError] = useState<string | null>(null);
   const [openPanel, setOpenPanel] = useState<"session" | "review">("session");
   const [spawnWorkerOpen, setSpawnWorkerOpen] = useState(false);
   const [spawnOrchestratorOpen, setSpawnOrchestratorOpen] = useState(false);
   const [spawnNotice, setSpawnNotice] = useState<SpawnNotice | null>(null);
 
   useEffect(() => {
+    if (data) return;
     let ignore = false;
     getAgents()
       .then((result) => {
         if (!ignore) {
-          setWorkers(result.workers);
-          setOrchestrators(result.orchestrators ?? []);
-          setArchived(result.archived ?? []);
-          setError(null);
+          setFetchedWorkers(result.workers);
+          setFetchedOrchestrators(result.orchestrators ?? []);
+          setFetchedArchived(result.archived ?? []);
+          setFetchedError(null);
         }
       })
       .catch((err) => {
-        if (!ignore) setError(err instanceof Error ? err.message : "Could not load agents");
+        if (!ignore) {
+          setFetchedError(err instanceof Error ? err.message : "Could not load agents");
+        }
       });
     return () => {
       ignore = true;
     };
-  }, [refreshTick]);
+  }, [data, refreshTick]);
+
+  const workers = data?.workers ?? fetchedWorkers;
+  const orchestrators = data?.orchestrators ?? fetchedOrchestrators;
+  const archived = data?.archived ?? fetchedArchived;
+  const error = data?.error ?? fetchedError;
 
   const openOrch = orchestrators.find((orch) => orch.id === openTicket);
   const liveWorkers = workers ?? [];
@@ -931,39 +946,51 @@ export function AgentsView({
 }
 
 export function AgentsSidebar({
+  data,
   refreshTick,
   activeTicket,
   onOpen,
   onDragStart,
   onDragEnd,
 }: {
+  data?: {
+    workers: AgentWorker[] | null;
+    orchestrators: Orchestrator[];
+    archived: ArchivedWorker[];
+    error: string | null;
+  };
   refreshTick: number;
   activeTicket: string | null;
   onOpen: (ticket: string) => void;
   onDragStart?: (ticket: string) => void;
   onDragEnd?: () => void;
 }) {
-  const [workers, setWorkers] = useState<AgentWorker[] | null>(null);
-  const [orchestrators, setOrchestrators] = useState<Orchestrator[]>([]);
-  const [archived, setArchived] = useState<ArchivedWorker[]>([]);
+  const [fetchedWorkers, setFetchedWorkers] = useState<AgentWorker[] | null>(null);
+  const [fetchedOrchestrators, setFetchedOrchestrators] = useState<Orchestrator[]>([]);
+  const [fetchedArchived, setFetchedArchived] = useState<ArchivedWorker[]>([]);
 
   useEffect(() => {
+    if (data) return;
     let ignore = false;
     getAgents()
       .then((result) => {
         if (!ignore) {
-          setWorkers(result.workers);
-          setOrchestrators(result.orchestrators ?? []);
-          setArchived(result.archived ?? []);
+          setFetchedWorkers(result.workers);
+          setFetchedOrchestrators(result.orchestrators ?? []);
+          setFetchedArchived(result.archived ?? []);
         }
       })
       .catch(() => {
-        if (!ignore) setWorkers([]);
+        if (!ignore) setFetchedWorkers([]);
       });
     return () => {
       ignore = true;
     };
-  }, [refreshTick]);
+  }, [data, refreshTick]);
+
+  const workers = data?.workers ?? fetchedWorkers;
+  const orchestrators = data?.orchestrators ?? fetchedOrchestrators;
+  const archived = data?.archived ?? fetchedArchived;
 
   if (workers === null) {
     return (

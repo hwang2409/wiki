@@ -1,9 +1,11 @@
 :root {
   --titlebar-height: 40px;
   --header-height: 40px;
+  --status-bar-height: 30px;
   --file-line-width: 760px;
   --radius-s: 4px;
   --radius-m: 8px;
+  --pane-focus-ring: color-mix(in srgb, var(--text-normal) 40%, transparent);
 
   --font-interface: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue",
     Helvetica, Arial, sans-serif;
@@ -557,6 +559,20 @@ button:disabled {
   flex-direction: column;
   min-height: 0;
   min-width: 0;
+}
+
+.pane-frame {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  outline: none;
+  box-shadow: inset 0 0 0 1px transparent;
+  transition: box-shadow 120ms ease-out;
+}
+
+.pane-frame.is-focused {
+  box-shadow: inset 0 0 0 1px var(--pane-focus-ring);
 }
 
 .pane-split {
@@ -1311,24 +1327,162 @@ body.is-resizing-panes {
   font-size: var(--font-ui-small);
 }
 
+.fleet-switcher {
+  max-height: 68vh;
+}
+
+.fleet-switcher-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  color: var(--text-normal);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-small);
+  font-weight: 600;
+}
+
+.fleet-switcher-count {
+  color: var(--text-faint);
+  font-size: var(--font-ui-smaller);
+  font-weight: 400;
+}
+
+.fleet-switcher-result {
+  align-items: center;
+}
+
+.fleet-switcher-result.is-current:not(.is-selected) {
+  background-color: var(--background-secondary);
+}
+
+.fleet-switcher-icon,
+.fleet-switcher-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  min-width: 14px;
+  color: var(--text-faint);
+}
+
+.fleet-switcher-current {
+  margin-left: auto;
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+}
+
 /* Status bar */
 
 .status-bar {
-  position: fixed;
-  right: 0;
-  bottom: 0;
-  z-index: 10;
   display: flex;
-  gap: 12px;
-  padding: 4px 12px;
-  border: 1px solid var(--background-modifier-border);
-  border-right: none;
-  border-bottom: none;
-  border-top-left-radius: var(--radius-s);
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  min-height: var(--status-bar-height);
+  padding: 0 12px;
+  border-top: 1px solid var(--background-modifier-border);
   background-color: var(--background-secondary);
   color: var(--text-muted);
   font-size: var(--font-ui-smaller);
   font-variant-numeric: tabular-nums;
+}
+
+.tmux-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  flex: 1;
+}
+
+.tmux-group-list,
+.tmux-group-items,
+.status-bar-metrics {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.tmux-group-list,
+.tmux-group-items {
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.tmux-group-list::-webkit-scrollbar,
+.tmux-group-items::-webkit-scrollbar {
+  display: none;
+}
+
+.tmux-group-button,
+.tmux-status-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  white-space: nowrap;
+  transition: background-color 100ms ease-out, color 100ms ease-out;
+}
+
+.tmux-group-button:hover,
+.tmux-status-item:hover {
+  background-color: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.tmux-group-button.is-active,
+.tmux-status-item.is-active {
+  background-color: var(--background-modifier-active);
+  color: var(--text-normal);
+}
+
+.tmux-status-index,
+.tmux-status-sep {
+  color: var(--text-faint);
+}
+
+.tmux-status-label {
+  max-width: 20ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tmux-status-glyph {
+  margin-left: 5px;
+  color: var(--text-muted);
+}
+
+.tmux-group-empty {
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+}
+
+.status-bar-metrics {
+  flex-shrink: 0;
+}
+
+.leader-indicator {
+  position: fixed;
+  right: 14px;
+  bottom: calc(var(--status-bar-height) + 12px);
+  z-index: 80;
+  padding: 3px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 999px;
+  background-color: var(--background-primary);
+  color: var(--text-normal);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  box-shadow: 0 3px 14px rgba(0, 0, 0, 0.14);
 }
 
 /* ------------------------------------------------------------------ */
@@ -4221,8 +4375,16 @@ body.is-resizing-panes {
 .agent-pane-body {
   display: flex;
   flex: 1;
+  min-height: 0;
+  min-width: 0;
+}
+
+.agent-pane-session {
+  display: flex;
+  flex: 1;
   flex-direction: column;
   min-height: 0;
+  min-width: 0;
 }
 
 .agent-pane .session-scroll-inner,
@@ -4230,6 +4392,12 @@ body.is-resizing-panes {
 .agent-pane .session-composer {
   max-width: none;
   margin: 0;
+}
+
+.subagent-panel-inline {
+  min-width: 260px;
+  max-width: 48%;
+  height: auto;
 }
 
 .session-subagents {
