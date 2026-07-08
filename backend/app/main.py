@@ -10,12 +10,12 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, status
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from . import accounts, github_pr, transcripts, uistate, vaultops
+from . import accounts, github_pr, tokens, transcripts, uistate, vaultops
 from .frontend_static import mount_frontend_static
 
 
@@ -904,6 +904,30 @@ def list_skills() -> dict[str, object]:
             skills.append({"name": command.stem, "description": ""})
     _skills_cache = (now, skills)
     return {"skills": skills}
+
+
+@app.get("/api/tokens")
+async def get_tokens(
+    from_ts: str | None = Query(default=None, alias="from"),
+    to_ts: str | None = Query(default=None, alias="to"),
+    bucket: str = "hour",
+    cli: str | None = None,
+    model: str | None = None,
+) -> dict[str, object]:
+    """Token-usage series over local codex/claude session files.
+
+    Query params: from (ISO, inclusive), to (ISO, exclusive), bucket=hour|day,
+    cli=codex|claude, model=<exact>. `from` is a Python keyword so we bind it
+    via alias.
+    """
+    return await asyncio.to_thread(
+        tokens.query,
+        from_ts=from_ts,
+        to_ts=to_ts,
+        bucket=bucket,
+        cli=cli,
+        model=model,
+    )
 
 
 MSG_QUEUE_PATH = Path("/tmp/wiki-msg-queue.json")

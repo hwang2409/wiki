@@ -17,6 +17,7 @@ import {
   SquarePen,
   SquareTerminal,
   Sun,
+  TrendingUp,
   Waypoints,
   X
 } from "lucide-react";
@@ -44,6 +45,7 @@ import {
 import { LoadingPlaceholder } from "./loading";
 import { GraphView } from "./graph";
 import { HealthView } from "./health";
+import { TokensView } from "./tokens";
 import { KanbanBoard, appendDoneEntry } from "./kanban";
 import { SecondaryPane } from "./pane";
 import {
@@ -62,8 +64,8 @@ import {
 } from "./themes";
 import type { Note, NoteDraft, NoteSummary } from "./types";
 
-type Mode = "empty" | "view" | "edit" | "new" | "activity" | "graph" | "health" | "agents" | "agent";
-type UtilityMode = "activity" | "graph" | "health" | "agents";
+type Mode = "empty" | "view" | "edit" | "new" | "activity" | "graph" | "health" | "agents" | "tokens" | "agent";
+type UtilityMode = "activity" | "graph" | "health" | "agents" | "tokens";
 type SidebarTab = "files" | "search" | "agents";
 type SplitPosition = "left" | "right" | "top" | "bottom";
 type DropZone = SplitPosition | "center";
@@ -545,7 +547,7 @@ type Route =
   | { kind: "agent"; ticket: string; panel: AgentRoutePanel }
   | { kind: "note" | "edit"; path: string };
 
-const UTILITY_ROUTES: readonly UtilityMode[] = ["activity", "graph", "health", "agents"];
+const UTILITY_ROUTES: readonly UtilityMode[] = ["activity", "graph", "health", "agents", "tokens"];
 
 function routeHash(route: Route): string {
   if (route.kind === "empty") return "#/";
@@ -2138,7 +2140,8 @@ export default function App() {
     activity: "Activity",
     graph: "Graph",
     health: "Health",
-    agents: "Agents"
+    agents: "Agents",
+    tokens: "Tokens"
   };
   const themeToggleTarget = toggleThemePolarity(theme);
   const themeToggleTargetLabel = getTheme(themeToggleTarget).label;
@@ -2424,6 +2427,15 @@ export default function App() {
         >
           <Bot size={18} />
         </button>
+        <button
+          aria-label="Token usage"
+          className={`ribbon-action${mode === "tokens" ? " is-active" : ""}`}
+          title="Token usage"
+          type="button"
+          onClick={() => openUtilityView("tokens")}
+        >
+          <TrendingUp size={18} />
+        </button>
         <div className="ribbon-spacer" />
         <button
           aria-label="Settings"
@@ -2630,6 +2642,8 @@ export default function App() {
               onOpenTicket={setAgentsOpenTicket}
               accountEvents={accountEvents}
             />
+          ) : mode === "tokens" ? (
+            <TokensView />
           ) : mode === "empty" ? (
             <div className="empty-state">
               <div className="empty-state-title">No file is open</div>
@@ -2775,6 +2789,8 @@ export default function App() {
                   openTicket={agentsOpenTicket}
                   onOpenTicket={setAgentsOpenTicket}
                 />
+              ) : mode === "tokens" ? (
+                <TokensView />
               ) : mode === "empty" ? (
                 <div className="empty-state">
                   <div className="empty-state-title">No file is open</div>
