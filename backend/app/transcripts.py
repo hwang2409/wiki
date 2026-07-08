@@ -496,6 +496,8 @@ def _append_claude_user(state: dict, event: dict, row: dict) -> None:
                 if next_shell.get(key):
                     shell[key] = next_shell[key]
             current["text"] = shell.get("input") or shell.get("stdout") or shell.get("stderr") or ""
+            state["last_bash"] = {"row_uuid": row.get("uuid"), "index": len(events) - 1}
+            state["tail_replaced"] = True
             return
         events.append(event)
         state["last_bash"] = {"row_uuid": row.get("uuid"), "index": len(events) - 1}

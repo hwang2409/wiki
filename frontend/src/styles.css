@@ -145,6 +145,8 @@ button:disabled {
   flex-direction: column;
   gap: 8px;
   width: min(100%, 420px);
+  opacity: 0;
+  animation: loading-reveal 120ms ease-out 150ms forwards;
 }
 
 .loading-line {
@@ -170,6 +172,16 @@ button:disabled {
 
   50% {
     background-position: 100% 50%;
+    opacity: 1;
+  }
+}
+
+@keyframes loading-reveal {
+  from {
+    opacity: 0;
+  }
+
+  to {
     opacity: 1;
   }
 }
@@ -1968,14 +1980,18 @@ body.is-resizing-panes {
   display: grid;
   grid-template-rows: 0fr;
   opacity: 0;
-  transition-property: grid-template-rows, opacity, margin-top;
+  visibility: hidden;
+  transition-property: grid-template-rows, opacity, margin-top, visibility;
   transition-duration: 160ms;
   transition-timing-function: ease-out;
+  transition-delay: 0ms, 0ms, 0ms, 160ms;
 }
 
 .callout-content-wrap.is-open {
   grid-template-rows: 1fr;
   opacity: 1;
+  visibility: visible;
+  transition-delay: 0ms;
 }
 
 .callout-content {
@@ -2913,14 +2929,18 @@ body.is-resizing-panes {
   display: grid;
   grid-template-rows: 0fr;
   opacity: 0;
-  transition-property: grid-template-rows, opacity, margin-top;
+  visibility: hidden;
+  transition-property: grid-template-rows, opacity, margin-top, visibility;
   transition-duration: 160ms;
   transition-timing-function: ease-out;
+  transition-delay: 0ms, 0ms, 0ms, 160ms;
 }
 
 .session-collapsible.is-open {
   grid-template-rows: 1fr;
   opacity: 1;
+  visibility: visible;
+  transition-delay: 0ms;
 }
 
 .session-collapsible-inner {

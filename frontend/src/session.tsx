@@ -307,7 +307,7 @@ const sameEvents = (
   prev.events.every((event, i) => event === next.events[i]);
 
 function BashBlock({ event }: { event: SessionEvent }) {
-  const bash = event.bash!;
+  const bash = event.bash ?? { input: "", stdout: "", stderr: "" };
   const output = [bash.stdout, bash.stderr].filter(Boolean).join("\n");
   const canCollapse = output.length > 700 || output.split("\n").length > 14;
   const [open, setOpen] = useState(!canCollapse);
