@@ -3,7 +3,7 @@ type: reference
 view: kanban
 tags: [todo]
 created: 2026-07-06
-updated: 2026-07-07
+updated: 2026-07-08
 ---
 
 Todo:
@@ -17,7 +17,6 @@ In Progress:
 Backlog:
 
 - [PHO-11469](https://linear.app/phoebework/issue/PHO-11469): re-triage Slack-thread alert investigation
-- [PHO-13074](https://linear.app/phoebework/issue/PHO-13074): fix inspect_codebase_wiki silent failures + uncategorized errors
 - [PHO-12425](https://linear.app/phoebework/issue/PHO-12425), 12426: sandboxed outreach start + e2e dogfood
 - [PHO-11256](https://linear.app/phoebework/issue/PHO-11256)–11260: texQL series
 - [PHO-11269](https://linear.app/phoebework/issue/PHO-11269)–11272: canonical data products series

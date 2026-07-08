@@ -9,6 +9,13 @@ updated: 2026-07-08
 
 ## 2026-07-08
 
+- **wiki** — polish fleet complete: PR #5 twelve themes, PR #6 orchestrator spawn-from-UI, PR #7 tmux C-a leader keys + status bar + split-pane subagent fix — six PRs merged in one day via codex fleet
+- **wiki** — WIKI-7 merge-ready ([#7](https://github.com/hwang2409/wiki/pull/7)) — tmux-style `Ctrl+A` fleet leader, bottom status strip, pane focus/zoom/close chords, split-pane inline subagent inspect
+- **phoebe** — PHO-13206 admin tool audit delivered — 112 tools, 44 used/7d, 73.1% success; P0s: call-recordings split + Core account owner filtering; backlog re-verdicts on ticket
+- [PHO-13206](https://linear.app/phoebework/issue/PHO-13206): admin agent full tool audit (usage/failure/scoping/gaps) — cdx:PHO-13206 worker (audit-only)
+- **wiki** — polish fleet day 1: PR #2 review surface (gate worker PRs in-app), PR #3 transcript/CSS polish, PR #4 spawn-from-UI — all reviewed+merged
+- **phoebe** — PHO-13074 tool error-taxonomy hardening merged (#10810) — uncategorized_internal structural fallback + silent-down Datadog alerting; inspect_codebase_wiki failure was pre-fixed by #10288, observability gap closed
+- [PHO-13074](https://linear.app/phoebework/issue/PHO-13074): inspect_codebase_wiki silently down (58/59 prod failures, no error_category) — cdx:PHO-13074 worker
 - **phoebe** — PHO-13144 RCA/fix for voice QA clock writeback action-family gate ([#10812](https://github.com/phoebe-health/phoebe/pull/10812) merge-ready)
 - **wiki** — native macOS app (Tauri 2 + PyInstaller sidecar) merged, PR #1: plan→implement→review via codex workers WIKI-1/WIKI-2, 1:1 parity vs web app, web flow unregressed
 

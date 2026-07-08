@@ -12,7 +12,7 @@ Rolling ≤500-word session cache. Rewrite (don't append) at work-arc boundaries
 ## Active threads
 
 - **wiki NATIVE APP MERGED 2026-07-08** (PR #1, `b658a30`): Tauri 2 shell + PyInstaller onefile sidecar (`wiki-backend`) serving /api + built frontend on dynamic loopback port; lifecycle = spawn→health-wait→one-restart→kill-on-quit + parent-pid watchdog; `make native-build` → `src-tauri/target/release/bundle/macos/Wiki.app`. Web flow (:8011/:5173) unregressed. Manual QA checklist for WKWebView-only deltas in PR #1 body — Henry to click through. Research [[wiki-native-app-research]], plan+parity ledger in agent-archive/WIKI-2.
-- **wiki app (web)**: agent-first monitor — /agents fleet, sidebar agents mode, #/agent/<id> full transcripts (codex+claude), composer (vim, images inline [Image #N], skill autocomplete, on-idle queue), subagent inspect, split agent panes, settings (13 mono fonts + size sliders). [[wiki-app-ui-direction]], protocol [[orchestrator-worker-protocol]].
+- **wiki app (web)**: agent-first monitor — /agents fleet, sidebar agents mode, #/agent/<id> full transcripts (codex+claude), tmux-style `Ctrl+A` leader/status bar for orchestrator groups, composer (vim, images inline [Image #N], skill autocomplete, on-idle queue), subagent inspect, split agent panes, settings (13 mono fonts + size sliders). [[wiki-app-ui-direction]], protocol [[orchestrator-worker-protocol]].
 - **phoebe admin-agent**: run-data verb family shipped 2026-07-07 (5 merges); PHO-13157 held for team-lead review; PHO-13138 terraform-parked. See [[admin-agent]].
 
 ## Recent facts
