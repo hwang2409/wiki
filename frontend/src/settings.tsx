@@ -168,7 +168,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                 value={bodySize}
                 onChange={(event) => updateSizes(Number(event.target.value), uiSize)}
               />
-              <span className="settings-slider-value">{bodySize}px</span>
+              <span className="settings-slider-value tabular-nums">{bodySize}px</span>
             </div>
           </div>
           <div className="settings-row">
@@ -187,7 +187,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                 value={uiSize}
                 onChange={(event) => updateSizes(bodySize, Number(event.target.value))}
               />
-              <span className="settings-slider-value">{uiSize}px</span>
+              <span className="settings-slider-value tabular-nums">{uiSize}px</span>
             </div>
           </div>
           <button

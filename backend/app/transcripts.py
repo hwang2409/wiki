@@ -407,6 +407,19 @@ def _xml_tag(text: str, tag: str) -> str | None:
     return match.group(1).strip() if match else None
 
 
+_BASH_TAG_PATTERN = re.compile(r"<(bash-input|bash-stdout|bash-stderr)>([\s\S]*?)</\1>")
+
+
+def _bash_event(ts: str | None, parts: dict[str, str]) -> dict:
+    shell = {
+        "input": _clip(parts.get("input", ""), MAX_TEXT),
+        "stdout": _clip(parts.get("stdout", ""), MAX_TEXT),
+        "stderr": _clip(parts.get("stderr", ""), MAX_TEXT),
+    }
+    text = shell["input"] or shell["stdout"] or shell["stderr"]
+    return {"kind": "bash", "ts": ts, "text": text, "bash": shell}
+
+
 def _claude_user_event(text: str, ts: str | None) -> dict | None:
     stripped = text.strip()
     if stripped.startswith("<task-notification>"):
@@ -426,6 +439,17 @@ def _claude_user_event(text: str, ts: str | None) -> dict | None:
         return {"kind": "command", "ts": ts, "text": f"{name} {args}".strip()}
     # Injected reminders wrap real prompts — drop the wrapper, keep the human text.
     cleaned = re.sub(r"<system-reminder>[\s\S]*?</system-reminder>", "", stripped).strip()
+    bash_matches = list(_BASH_TAG_PATTERN.finditer(cleaned))
+    if bash_matches and not _BASH_TAG_PATTERN.sub("", cleaned).strip():
+        parts: dict[str, str] = {}
+        for match in bash_matches:
+            key = match.group(1).removeprefix("bash-")
+            value = match.group(2).strip()
+            if key in parts and value:
+                parts[key] = f"{parts[key]}\n{value}".strip()
+            else:
+                parts[key] = value
+        return _bash_event(ts, parts)
     if not cleaned:
         return None
     return {"kind": "user", "ts": ts, "text": _clip(cleaned, MAX_TEXT)}
@@ -461,6 +485,23 @@ def _append_claude_user(state: dict, event: dict, row: dict) -> None:
     """Edited/resent prompts fork the tree: sibling user rows share parentUuid.
     Claude Code shows only the newest branch — replace the stale draft in place."""
     events: list = state["events"]
+    if event["kind"] == "bash":
+        prev = state.get("last_bash")
+        parent = row.get("parentUuid")
+        if prev and parent and prev["row_uuid"] == parent and prev["index"] == len(events) - 1:
+            current = events[-1]
+            shell = current.setdefault("bash", {})
+            next_shell = event.get("bash") or {}
+            for key in ("input", "stdout", "stderr"):
+                if next_shell.get(key):
+                    shell[key] = next_shell[key]
+            current["text"] = shell.get("input") or shell.get("stdout") or shell.get("stderr") or ""
+            state["last_bash"] = {"row_uuid": row.get("uuid"), "index": len(events) - 1}
+            state["tail_replaced"] = True
+            return
+        events.append(event)
+        state["last_bash"] = {"row_uuid": row.get("uuid"), "index": len(events) - 1}
+        return
     parent = row.get("parentUuid")
     prev = state.get("last_user")
     if (
@@ -619,6 +660,7 @@ def read_session_events(fmt: str, path: Path) -> dict:
             "tokens": None,
             "base": 0,
             "last_user": None,
+            "last_bash": None,
             "tail_replaced": False,
             "sidechain_ok": fmt == "claude-sub",
         }
@@ -649,6 +691,7 @@ def read_session_events(fmt: str, path: Path) -> dict:
             state["pending"] = {
                 call_id: event for call_id, event in state["pending"].items() if id(event) in kept
             }
+            state["last_bash"] = None
     total = state["base"] + len(state["events"])
     dirty_from = total
     pending_events = set(map(id, state["pending"].values()))

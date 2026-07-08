@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Bot, X } from "lucide-react";
 import { getNote, updateNote } from "./api";
+import { LoadingPlaceholder } from "./loading";
 import { SessionTab, usePollTick } from "./session";
 import { KanbanBoard, appendDoneEntry } from "./kanban";
 import type { KanbanCard } from "./kanban";
@@ -204,7 +205,9 @@ function NotePane({
             </div>
           </div>
         ) : (
-          <div className="nav-empty">Loading...</div>
+          <div className="nav-empty">
+            <LoadingPlaceholder className="note-loading" lines={[88, 96, 74, 84, 91]} />
+          </div>
         )}
       </div>
     </section>

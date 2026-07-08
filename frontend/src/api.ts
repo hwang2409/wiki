@@ -119,6 +119,12 @@ export type SessionTool = {
   agent_id?: string;
 };
 
+export type SessionBash = {
+  input: string;
+  stdout: string;
+  stderr: string;
+};
+
 export type SessionEvent = {
   kind:
     | "user"
@@ -128,10 +134,12 @@ export type SessionEvent = {
     | "terminal"
     | "notification"
     | "command"
+    | "bash"
     | "image";
   ts: string | null;
   text: string;
   tool?: SessionTool;
+  bash?: SessionBash;
 };
 
 export type SubagentInfo = {
@@ -239,4 +247,3 @@ export function updateNote(path: string, content: string) {
     body: JSON.stringify({ content })
   });
 }
-

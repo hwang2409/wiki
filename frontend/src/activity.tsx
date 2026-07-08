@@ -2,6 +2,7 @@ import { Fragment, useEffect, useState } from "react";
 import { ChevronRight, FileText } from "lucide-react";
 import { getActivity, getActivityDiff } from "./api";
 import type { ActivityCommit } from "./api";
+import { LoadingPlaceholder } from "./loading";
 
 function basename(path: string) {
   return path.split("/").pop()?.replace(/\.md$/, "") ?? path;
@@ -100,7 +101,13 @@ function DiffView({ sha }: { sha: string }) {
   }, [sha]);
 
   if (error) return <div className="activity-diff-empty">Could not load diff.</div>;
-  if (patch === null) return <div className="activity-diff-empty">Loading…</div>;
+  if (patch === null) {
+    return (
+      <div className="activity-diff-empty">
+        <LoadingPlaceholder className="activity-loading" lines={[96, 84, 90]} />
+      </div>
+    );
+  }
 
   const files = parseSplitDiff(patch);
   if (files.length === 0) {
@@ -184,7 +191,13 @@ export function ActivityFeed({
   }, [refreshTick]);
 
   if (error) return <div className="activity-empty">{error}</div>;
-  if (commits === null) return <div className="activity-empty">Loading…</div>;
+  if (commits === null) {
+    return (
+      <div className="activity-empty">
+        <LoadingPlaceholder className="activity-loading" lines={[95, 86, 92, 78]} />
+      </div>
+    );
+  }
   if (commits.length === 0) return <div className="activity-empty">No vault commits yet.</div>;
 
   const byDay: Array<{ day: string; commits: ActivityCommit[] }> = [];
@@ -228,7 +241,7 @@ export function ActivityFeed({
                     className={`collapse-icon${isOpen ? "" : " is-collapsed"}`}
                     size={14}
                   />
-                  <span className="activity-time">{timeOf(commit.date)}</span>
+                  <span className="activity-time tabular-nums">{timeOf(commit.date)}</span>
                   <span className="activity-message">{commit.message}</span>
                 </button>
                 <div className="activity-files">

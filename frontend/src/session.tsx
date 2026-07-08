@@ -35,6 +35,7 @@ import {
   uploadImage,
 } from "./api";
 import type { AgentSessionData, QueuedMessage, SessionEvent, SkillInfo, SubagentInfo } from "./api";
+import { LoadingPlaceholder } from "./loading";
 
 const POLL_MS = 2500;
 
@@ -237,12 +238,14 @@ function ToolRow({
           </span>
         ) : null}
       </button>
-      {open ? (
-        <div className="session-tool-body">
-          <pre>{tool.input}</pre>
-          {tool.output ? <pre className="session-tool-output">{tool.output}</pre> : null}
+      <div className={`session-collapsible session-tool-collapsible${open ? " is-open" : ""}`}>
+        <div className="session-collapsible-inner">
+          <div className="session-tool-body">
+            <pre>{tool.input}</pre>
+            {tool.output ? <pre className="session-tool-output">{tool.output}</pre> : null}
+          </div>
         </div>
-      ) : null}
+      </div>
     </div>
   );
 }
@@ -303,6 +306,38 @@ const sameEvents = (
   prev.events.length === next.events.length &&
   prev.events.every((event, i) => event === next.events[i]);
 
+function BashBlock({ event }: { event: SessionEvent }) {
+  const bash = event.bash ?? { input: "", stdout: "", stderr: "" };
+  const output = [bash.stdout, bash.stderr].filter(Boolean).join("\n");
+  const canCollapse = output.length > 700 || output.split("\n").length > 14;
+  const [open, setOpen] = useState(!canCollapse);
+  return (
+    <div className={`session-bash${open ? " is-open" : ""}${canCollapse ? " is-collapsible" : ""}`}>
+      {bash.input ? (
+        <div className="session-bash-command">
+          <span className="session-bash-prompt">❯</span>
+          <pre>{bash.input}</pre>
+        </div>
+      ) : null}
+      {output ? (
+        <div className={`session-collapsible session-bash-collapsible${open ? " is-open" : ""}`}>
+          <div className="session-collapsible-inner">
+            <div className="session-bash-body">
+              {bash.stdout ? <pre className="session-bash-stdout">{bash.stdout}</pre> : null}
+              {bash.stderr ? <pre className="session-bash-stderr">{bash.stderr}</pre> : null}
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {canCollapse ? (
+        <button className="session-expand" type="button" onClick={() => setOpen((value) => !value)}>
+          {open ? "collapse output" : "expand output"}
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
 const MessageBlock = memo(function MessageBlock({
   event,
   imageNums,
@@ -343,6 +378,9 @@ const MessageBlock = memo(function MessageBlock({
       </div>
     );
   }
+  if (event.kind === "bash") {
+    return <BashBlock event={event} />;
+  }
   return (
     <div className="session-assistant markdown-preview-view">
       <ReactMarkdown remarkPlugins={[remarkGfm]}>{event.text}</ReactMarkdown>
@@ -370,8 +408,9 @@ function ActivityGroupBase({
         <ChevronRight className={`collapse-icon${open ? "" : " is-collapsed"}`} size={12} />
         {parts.join(" · ") || "activity"}
       </button>
-      {open ? (
-        <div className="session-activity-body">
+      <div className={`session-collapsible session-activity-collapsible${open ? " is-open" : ""}`}>
+        <div className="session-collapsible-inner">
+          <div className="session-activity-body">
           {visible.map((event, i) =>
             event.kind === "tool" ? (
               <ToolRow event={event} key={i} onInspect={onInspect} />
@@ -381,8 +420,9 @@ function ActivityGroupBase({
               </div>
             )
           )}
+          </div>
         </div>
-      ) : null}
+      </div>
     </div>
   );
 }
@@ -502,7 +542,13 @@ export function SessionTab({
   );
 
   if (error && !session) return <div className="session-empty">{error}</div>;
-  if (!session) return <div className="session-empty">Loading…</div>;
+  if (!session) {
+    return (
+      <div className="session-empty">
+        <LoadingPlaceholder className="session-loading" lines={[82, 96, 74, 88]} />
+      </div>
+    );
+  }
 
   const tokens = formatTokens(session.tokens);
   return (
@@ -532,7 +578,7 @@ export function SessionTab({
           onInspect={onInspect}
         />
       )}
-      <div className="session-footer">
+      <div className="session-footer tabular-nums">
         {session.format} · {session.path.split("/").slice(-1)[0]}
         {tokens ? ` · ${tokens}` : ""}
       </div>

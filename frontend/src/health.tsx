@@ -57,7 +57,7 @@ export function HealthView({
       <div className="health-summary">
         {(Object.keys(counts) as Bucket[]).map((bucket) => (
           <div className={`health-stat health-${bucket}`} key={bucket}>
-            <span className="health-stat-count">{counts[bucket]}</span>
+            <span className="health-stat-count tabular-nums">{counts[bucket]}</span>
             <span className="health-stat-label">{BUCKET_LABEL[bucket]}</span>
           </div>
         ))}
@@ -88,7 +88,7 @@ export function HealthView({
             <span className="health-name">{basename(note.path)}</span>
             <span className="health-type">{note.note_type ?? "—"}</span>
             <span className="health-path">{note.path}</span>
-            <span className="health-age">
+            <span className="health-age tabular-nums">
               {days === 0 ? "today" : `${days}d`}
             </span>
           </button>

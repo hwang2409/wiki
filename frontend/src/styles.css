@@ -120,6 +120,114 @@ button:disabled {
 }
 
 /* ------------------------------------------------------------------ */
+/* Shared polish                                                       */
+/* ------------------------------------------------------------------ */
+
+:where(button, input, textarea, select, a, [role="button"]) {
+  -webkit-tap-highlight-color: transparent;
+}
+
+:where(button, input, textarea, select, a, [role="button"]):focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--background-primary), 0 0 0 4px var(--text-normal);
+}
+
+:where(h1, h2, h3, .inline-title, .activity-day-heading, .dialog-title) {
+  text-wrap: balance;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+.loading-placeholder {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: min(100%, 420px);
+  opacity: 0;
+  animation: loading-reveal 120ms ease-out 150ms forwards;
+}
+
+.loading-line {
+  display: block;
+  height: 10px;
+  border-radius: 999px;
+  background: linear-gradient(
+    90deg,
+    var(--background-secondary) 0%,
+    var(--code-background) 45%,
+    var(--background-secondary) 100%
+  );
+  background-size: 200% 100%;
+  animation: loading-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes loading-pulse {
+  0%,
+  100% {
+    background-position: 0% 50%;
+    opacity: 0.72;
+  }
+
+  50% {
+    background-position: 100% 50%;
+    opacity: 1;
+  }
+}
+
+@keyframes loading-reveal {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
+:where(
+  .search-result,
+  .activity-commit-row,
+  .activity-file,
+  .health-row,
+  .nav-agent,
+  .agent-log-toggle,
+  .view-action,
+  .settings-reset,
+  .session-close,
+  .session-activity-head,
+  .session-tool-head,
+  .session-send,
+  .session-subagent-chip,
+  .session-skill-item,
+  .session-queued button,
+  .session-attachment button,
+  .session-expand
+) {
+  transition-property: background-color, border-color, color, transform, opacity, box-shadow;
+  transition-duration: 120ms;
+  transition-timing-function: ease-out;
+}
+
+:where(
+  .search-result,
+  .activity-file,
+  .agent-log-toggle,
+  .view-action,
+  .settings-reset,
+  .session-close,
+  .session-send,
+  .session-subagent-chip,
+  .session-skill-item,
+  .session-queued button,
+  .session-attachment button,
+  .session-expand
+):active:not(:disabled) {
+  transform: scale(0.96);
+}
+
+/* ------------------------------------------------------------------ */
 /* App layout                                                          */
 /* ------------------------------------------------------------------ */
 
@@ -1825,14 +1933,23 @@ body.is-resizing-panes {
   display: flex;
   align-items: flex-start;
   gap: 8px;
+  padding: 2px 0;
+  border-radius: var(--radius-s);
   color: var(--text-normal);
   font-weight: 600;
   font-size: inherit;
   line-height: 1.3;
+  transition-property: color, transform;
+  transition-duration: 120ms;
+  transition-timing-function: ease-out;
 }
 
 .callout.is-collapsible .callout-title {
   cursor: pointer;
+}
+
+.callout.is-collapsible .callout-title:active {
+  transform: scale(0.99);
 }
 
 .callout-icon {
@@ -1859,7 +1976,27 @@ body.is-resizing-panes {
   transform: rotate(-90deg);
 }
 
+.callout-content-wrap {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  visibility: hidden;
+  transition-property: grid-template-rows, opacity, margin-top, visibility;
+  transition-duration: 160ms;
+  transition-timing-function: ease-out;
+  transition-delay: 0ms, 0ms, 0ms, 160ms;
+}
+
+.callout-content-wrap.is-open {
+  grid-template-rows: 1fr;
+  opacity: 1;
+  visibility: visible;
+  transition-delay: 0ms;
+}
+
 .callout-content {
+  min-height: 0;
+  overflow: hidden;
   margin-top: 8px;
 }
 
@@ -2687,6 +2824,14 @@ body.is-resizing-panes {
   font-size: var(--font-ui-small);
 }
 
+.session-loading,
+.agents-loading,
+.activity-loading,
+.note-loading,
+.nav-loading {
+  width: min(100%, 480px);
+}
+
 .session-scroll {
   flex: 1;
   min-height: 0;
@@ -2728,6 +2873,8 @@ body.is-resizing-panes {
 .session-expand {
   display: block;
   margin-top: 6px;
+  padding: 0 2px;
+  border-radius: var(--radius-s);
   color: var(--text-faint);
   font-family: var(--font-monospace);
   font-size: var(--font-ui-smaller);
@@ -2764,6 +2911,8 @@ body.is-resizing-panes {
   align-items: center;
   gap: 5px;
   min-width: 0;
+  padding: 4px 6px;
+  border-radius: var(--radius-s);
   color: var(--text-faint);
   font-family: var(--font-monospace);
   font-size: var(--font-ui-smaller);
@@ -2772,7 +2921,31 @@ body.is-resizing-panes {
 
 .session-activity-head:hover,
 .session-tool-head:hover {
+  background-color: var(--background-modifier-hover);
   color: var(--text-normal);
+}
+
+.session-collapsible {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  visibility: hidden;
+  transition-property: grid-template-rows, opacity, margin-top, visibility;
+  transition-duration: 160ms;
+  transition-timing-function: ease-out;
+  transition-delay: 0ms, 0ms, 0ms, 160ms;
+}
+
+.session-collapsible.is-open {
+  grid-template-rows: 1fr;
+  opacity: 1;
+  visibility: visible;
+  transition-delay: 0ms;
+}
+
+.session-collapsible-inner {
+  min-height: 0;
+  overflow: hidden;
 }
 
 .session-activity-body {
@@ -2846,6 +3019,66 @@ body.is-resizing-panes {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   overflow-y: auto;
+}
+
+.session-bash {
+  padding: 8px 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  background-color: var(--background-secondary);
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+}
+
+.session-bash-command {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  background-color: var(--code-background);
+}
+
+.session-bash-prompt {
+  flex-shrink: 0;
+  color: var(--text-normal);
+}
+
+.session-bash-command pre,
+.session-bash-body pre {
+  min-width: 0;
+  margin: 0;
+  color: inherit;
+  font-family: inherit;
+  font-size: inherit;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.session-bash-collapsible {
+  margin-top: 4px;
+}
+
+.session-bash-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.session-bash-stdout,
+.session-bash-stderr {
+  padding: 8px 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  background-color: var(--code-background);
+}
+
+.session-bash-stderr {
+  color: var(--text-faint);
+  font-style: italic;
 }
 
 
@@ -3222,13 +3455,16 @@ body.is-resizing-panes {
   min-height: 60px;
   padding: 8px 10px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 3px;
+  border-radius: var(--radius-s);
   background-color: var(--background-primary);
   color: var(--text-normal);
   font-family: var(--font-monospace);
   font-size: var(--font-ui-small);
   line-height: 1.4;
   resize: none;
+  transition-property: border-color, background-color, box-shadow;
+  transition-duration: 120ms;
+  transition-timing-function: ease-out;
 }
 
 .session-composer textarea:focus {
@@ -3281,7 +3517,7 @@ body.is-resizing-panes {
   width: 36px;
   height: 36px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 3px;
+  border-radius: var(--radius-s);
   color: var(--text-muted);
 }
 
@@ -3300,7 +3536,7 @@ body.is-resizing-panes {
   gap: 7px;
   padding: 5px 10px;
   border: 1px dashed var(--background-modifier-border);
-  border-radius: 3px;
+  border-radius: var(--radius-s);
   color: var(--text-faint);
   font-family: var(--font-monospace);
   font-size: var(--font-ui-smaller);
@@ -3590,8 +3826,18 @@ body.is-resizing-panes {
 }
 
 .session-subagent-chip:hover {
+  background-color: var(--background-modifier-hover);
   border-color: var(--text-muted);
   color: var(--text-normal);
+}
+
+.view-content,
+.secondary-pane-content,
+.activity-feed,
+.health-view,
+.agent-fullview,
+.agents-layout .agents-view {
+  overflow-x: hidden;
 }
 
 /* Full-screen agent session view */
