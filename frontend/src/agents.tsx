@@ -553,6 +553,105 @@ function SpawnOrchestratorModal({
   );
 }
 
+type AccountEvent =
+  | {
+      type: "codex_rotation";
+      from: string | null;
+      to: string;
+      revived: string[];
+      failed: string[];
+      ts: string;
+    }
+  | {
+      type: "codex_limit_no_eligible";
+      tickets: string[];
+      reset_at: string | null;
+      ts: string;
+    }
+  | {
+      type: "codex_rotation_failed";
+      error: string;
+      ts: string;
+    }
+  | {
+      type: "claude_limit_hit";
+      ticket: string;
+      window: string;
+      ts: string;
+    };
+
+const MAX_ACCOUNT_EVENTS = 4;
+
+function useAccountEvents(): AccountEvent[] {
+  const [events, setEvents] = useState<AccountEvent[]>([]);
+  useEffect(() => {
+    const source = new EventSource("/api/events");
+    const handler = (raw: MessageEvent<string>) => {
+      try {
+        const payload = JSON.parse(raw.data) as { type?: string };
+        if (
+          payload &&
+          typeof payload.type === "string" &&
+          (payload.type === "codex_rotation" ||
+            payload.type === "codex_limit_no_eligible" ||
+            payload.type === "codex_rotation_failed" ||
+            payload.type === "claude_limit_hit")
+        ) {
+          setEvents((prior) => [payload as AccountEvent, ...prior].slice(0, MAX_ACCOUNT_EVENTS));
+        }
+      } catch {
+        /* ignore malformed frames */
+      }
+    };
+    source.addEventListener("message", handler);
+    return () => {
+      source.removeEventListener("message", handler);
+      source.close();
+    };
+  }, []);
+  return events;
+}
+
+function accountBannerLine(event: AccountEvent): string {
+  switch (event.type) {
+    case "codex_rotation": {
+      const from = event.from ? event.from : "(unset)";
+      const revived = event.revived.length;
+      const failed = event.failed.length;
+      const tail = failed > 0 ? `, ${failed} failed to revive` : "";
+      return `rotated codex account ${from} → ${event.to}, revived ${revived} worker${revived === 1 ? "" : "s"}${tail}`;
+    }
+    case "codex_limit_no_eligible":
+      return event.reset_at
+        ? `codex usage limit hit, no eligible account until ${event.reset_at}`
+        : "codex usage limit hit, no eligible account";
+    case "codex_rotation_failed":
+      return `codex rotation failed: ${event.error}`;
+    case "claude_limit_hit":
+      return `claude usage limit hit on ${event.ticket}`;
+  }
+}
+
+function bannerTone(event: AccountEvent): "info" | "warn" | "danger" {
+  if (event.type === "codex_rotation") return "info";
+  if (event.type === "claude_limit_hit") return "warn";
+  return "danger";
+}
+
+function AccountEventsBanner({ events }: { events: AccountEvent[] }) {
+  if (events.length === 0) return null;
+  return (
+    <div aria-live="polite" className="agents-account-banner">
+      {events.map((event, index) => (
+        <div className={`agents-account-banner-row is-${bannerTone(event)}`} key={`${event.ts}-${index}`}>
+          <AlertTriangle size={13} />
+          <span>{accountBannerLine(event)}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export function AgentsView({
   data,
   onOpenAgent,
@@ -571,6 +670,7 @@ export function AgentsView({
   openTicket: string | null;
   onOpenTicket: (ticket: string | null) => void;
 }) {
+  const accountEvents = useAccountEvents();
   const [fetchedWorkers, setFetchedWorkers] = useState<AgentWorker[] | null>(null);
   const [fetchedOrchestrators, setFetchedOrchestrators] = useState<Orchestrator[]>([]);
   const [fetchedArchived, setFetchedArchived] = useState<ArchivedWorker[]>([]);
@@ -889,6 +989,7 @@ export function AgentsView({
             </button>
           </div>
         </div>
+        <AccountEventsBanner events={accountEvents} />
         {spawnNotice ? (
           spawnNotice.kind === "worker" ? (
             <div className="agents-notice">

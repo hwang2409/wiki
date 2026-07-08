@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from . import github_pr, transcripts, vaultops
+from . import accounts, github_pr, transcripts, vaultops
 from .frontend_static import mount_frontend_static
 
 
@@ -1313,9 +1313,33 @@ async def message_dispatcher() -> None:
             continue  # dispatcher must never die
 
 
+# ---------------------------------------------------------------------------
+# Agent event broker: watchdog + manual endpoints push, /api/events streams.
+# ---------------------------------------------------------------------------
+_event_subscribers: set[asyncio.Queue[dict]] = set()
+
+
+async def publish_agent_event(event: dict) -> None:
+    dead: list[asyncio.Queue[dict]] = []
+    for queue_ in list(_event_subscribers):
+        try:
+            queue_.put_nowait(event)
+        except asyncio.QueueFull:
+            dead.append(queue_)
+    for queue_ in dead:
+        _event_subscribers.discard(queue_)
+
+
+def _subscribe_agent_events() -> asyncio.Queue[dict]:
+    subscriber: asyncio.Queue[dict] = asyncio.Queue(maxsize=64)
+    _event_subscribers.add(subscriber)
+    return subscriber
+
+
 @app.on_event("startup")
 async def _start_dispatcher() -> None:
     asyncio.create_task(message_dispatcher())
+    asyncio.create_task(accounts.watchdog_loop(publish_agent_event))
 
 
 def vault_snapshot() -> dict[str, float]:
@@ -1343,32 +1367,42 @@ def vault_snapshot() -> dict[str, float]:
 @app.get("/api/events")
 async def events() -> StreamingResponse:
     async def stream():
+        subscriber = _subscribe_agent_events()
         snapshot = vault_snapshot()
         idle_ticks = 0
         yield "retry: 2000\n\n"
-        while True:
-            await asyncio.sleep(1)
-            current = vault_snapshot()
-            if current != snapshot:
-                changed = [
-                    path
-                    for path in current
-                    if snapshot.get(path) != current[path]
-                ] + [path for path in snapshot if path not in current]
-                snapshot = current
-                paths = []
-                for path in changed:
+        try:
+            while True:
+                await asyncio.sleep(1)
+                while True:
                     try:
-                        paths.append(Path(path).relative_to(VAULT_DIR).as_posix())
-                    except ValueError:
-                        paths.append("git")
-                yield f"data: {json.dumps({'type': 'vault', 'paths': sorted(set(paths))[:20]})}\n\n"
-                idle_ticks = 0
-            else:
-                idle_ticks += 1
-                if idle_ticks >= 15:
+                        evt = subscriber.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    yield f"data: {json.dumps(evt)}\n\n"
+                current = vault_snapshot()
+                if current != snapshot:
+                    changed = [
+                        path
+                        for path in current
+                        if snapshot.get(path) != current[path]
+                    ] + [path for path in snapshot if path not in current]
+                    snapshot = current
+                    paths = []
+                    for path in changed:
+                        try:
+                            paths.append(Path(path).relative_to(VAULT_DIR).as_posix())
+                        except ValueError:
+                            paths.append("git")
+                    yield f"data: {json.dumps({'type': 'vault', 'paths': sorted(set(paths))[:20]})}\n\n"
                     idle_ticks = 0
-                    yield ": ping\n\n"
+                else:
+                    idle_ticks += 1
+                    if idle_ticks >= 15:
+                        idle_ticks = 0
+                        yield ": ping\n\n"
+        finally:
+            _event_subscribers.discard(subscriber)
 
     return StreamingResponse(
         stream(),
@@ -1483,6 +1517,62 @@ def update_note(note_path: str, payload: NoteUpdate) -> Note:
 
     target.write_text(f"{content}\n", encoding="utf-8")
     return to_note(target)
+
+
+class AccountRotateIn(BaseModel):
+    account: str | None = Field(default=None, max_length=120)
+
+
+@app.get("/api/accounts")
+def get_accounts() -> dict[str, object]:
+    return accounts.snapshot()
+
+
+@app.post("/api/accounts/rotate")
+async def rotate_account(body: AccountRotateIn) -> dict[str, object]:
+    state = accounts.read_state()
+    state = accounts.ensure_state_initialized(state)
+
+    if state.last_rotated_at:
+        try:
+            last = datetime.fromisoformat(state.last_rotated_at)
+        except ValueError:
+            last = None
+        if last is not None:
+            elapsed = (datetime.now(timezone.utc) - last).total_seconds()
+            if elapsed < accounts.debounce_seconds():
+                raise HTTPException(status_code=409, detail="rotation debounced")
+
+    force_target = (body.account or "").strip() or None
+    if force_target and force_target not in accounts.list_available_accounts():
+        raise HTTPException(status_code=400, detail="unknown account")
+
+    try:
+        result = await asyncio.to_thread(
+            accounts.rotate,
+            state=state,
+            force_target=force_target,
+        )
+    except accounts.NoEligibleAccountError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except accounts.RotationError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    event = {
+        "type": "codex_rotation",
+        "from": result.outgoing,
+        "to": result.incoming,
+        "revived": result.revived,
+        "failed": result.failed,
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+    await publish_agent_event(event)
+    return {
+        "from": result.outgoing,
+        "to": result.incoming,
+        "revived": result.revived,
+        "failed": result.failed,
+    }
 
 
 mount_frontend_static(app)
