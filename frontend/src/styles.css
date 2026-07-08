@@ -4674,7 +4674,9 @@ body.is-resizing-panes .pane-cell {
 
 .agent-session-surface-row {
   display: flex;
+  flex: 1;
   height: 100%;
+  min-height: 0;
   min-width: 0;
   overflow: hidden;
 }
@@ -4887,6 +4889,7 @@ body.is-resizing-panes .pane-cell {
 
 .agent-pane > .agent-session-surface-row {
   flex: 1;
+  width: 100%;
 }
 
 .agent-pane .session-scroll-inner,
