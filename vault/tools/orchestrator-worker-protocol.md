@@ -53,6 +53,8 @@ Monitors = persistent background shell loops (Claude Code Monitor tool), one per
 
 `tmux send-keys -t <window_id> -l "<msg>"` then `sleep 0.5` then `send-keys Enter`, then VERIFY submitted (~2s later, capture pane; text still in composer ⇒ bare Enter again). The 0.5s is load-bearing: composers paste-detect rapid bursts and treat same-cycle Enter as a newline. Steer shape: observed → why wrong → do instead → constraint.
 
+The wiki app exposes the same channel: session-view composer → `POST /api/agents/<id>/message` (`mode: now` = immediate send-keys; `mode: on-idle` = queued in `/tmp/wiki-msg-queue.json`, backend dispatcher delivers when the pane shows no `esc to interrupt` spinner two polls running). Henry can steer orchestrators/workers from the browser.
+
 ## Sentinels (worker stdout, backup to status file)
 
 - `MERGE-READY: <pr-url>` — PR open, CI green, review handled
@@ -71,13 +73,20 @@ Monitors = persistent background shell loops (Claude Code Monitor tool), one per
 Push channel for the wiki `/agents` page — orchestrator announces workers instead of the app scraping tmux names:
 
 ```bash
-wiki agent register <TICKET> --window @327 --kind cdx --role plan|implement|review [--model --worktree --log]
+wiki agent orch <ID> --window @120          # at ORCHESTRATOR session start; ID = short label ("phoebe")
+wiki agent register <TICKET> --window @327 --kind cdx --role plan|implement|review --orch <ID> [--model --worktree --log]
+wiki agent update <TICKET> [--orch --model --window ...]                # mutate live worker in place — NO handoff/session bump (re-register = handoff!)
 wiki agent done <TICKET> --outcome merged|closed|plan-ready|abandoned   # at wrap-up, AFTER archiving
 wiki agent outcome <TICKET> merged|closed|...                           # fix/mark outcome after the fact
+wiki agent orch-done <ID>                    # at orchestrator session end
 wiki agent list
 ```
 
+- `orch` reads `$CLAUDE_CODE_SESSION_ID` + cwd → stores the EXACT transcript path (`~/.claude/projects/<escaped-cwd>/<session-id>.jsonl`); the wiki renders the orchestrator's own session from it. Must run from inside the orchestrator's Claude session (env var scope).
+- Workers registered with `--orch <ID>` group under their orchestrator in the wiki; without it they land in "workers" (ungrouped). Multiple concurrent orchestrators = distinct IDs ("phoebe", "phoebe-2", "wiki").
+
 - Re-registering a ticket = handoff: prior session auto-archived into `history` with `outcome: handoff` (plan→implement chains, multi-session respawns). Do NOT `done` between sessions.
+- `codex resume` gotcha: resume writes a NEW rollout file (no `resumed_from` lineage) with prior history replayed as `response_item` rows — the kickoff prompt is invisible to the app's first-user_message ticket scan. The resolver falls back to matching `session_meta.cwd` worktree slug (`pho-<num>`) + newest mtime, which self-heals future resumes. After a resume: `wiki agent update` window/log, and keep `worktree` set — it is the resolution key.
 - Atomic writes (tmp+rename). `/tmp` lifecycle intentional — reboot kills tmux and registry together.
 - Division of truth: registry = identity/metadata (window_id, kind, role, model, worktree, log path, session chain); status file = state (worker-written, unchanged); tmux liveness = health. The app renders: registry entry w/ dead window ⇒ "worker died?"; status file w/o registry entry ⇒ "unregistered" (skill drift flag).
 

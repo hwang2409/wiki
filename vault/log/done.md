@@ -2,13 +2,23 @@
 type: log
 tags: [log, done]
 created: 2026-07-06
-updated: 2026-07-06
+updated: 2026-07-07
 ---
 
 # Done
 
 ## 2026-07-07
 
+- **phoebe** — PHO-13172 Twilio delivery error visibility merged (#10769) — provider error codes now logged + persisted on contact attempts; investigation confirmed original incident was RingCentral 1000-char (fixed by #10466, no recurrence)
+- **phoebe** — PHO-13153 admin run-data read/slice/diff tools merged (#10740) — completes read/search/slice/diff/snippet verb family
+- [PHO-13153](https://linear.app/phoebework/issue/PHO-13153): run-data verb set (read/slice/diff) — cdx:PHO-13153 worker (stacked on 13146 branch)
+- **phoebe** — PHO-13146 admin agent python snippets v0 merged (#10734) — run_admin_python_snippet subprocess sandbox + search_run_data with ReDoS hardening
+- [PHO-13146](https://linear.app/phoebework/issue/PHO-13146): python snippets v0 (run_admin_python_snippet) — cdx:PHO-13146 worker (gpt-5.5 xhigh)
+- **phoebe** — PHO-13165 Slack email-resolution hardening merged (#10754) — lower(email) functional index + case-duplicate ambiguity guard
+- **phoebe** — PHO-13160 Slack account-linking fixes merged (#10749) — NULL-mapping 10min retry TTL, case-insensitive email match, /phoebe link copy; prod investigation documented on ticket
+- [PHO-13160](https://linear.app/phoebework/issue/PHO-13160): Slack link failure Debbie Goble / phoebe-whole-life — cdx:PHO-13160 worker (investigation-first)
+- **phoebe** — PHO-13142 admin chart artifacts merged (#10722) — admin.chart@1 artifact type, client-side declarative rendering, date-only temporal support
+- [PHO-13142](https://linear.app/phoebework/issue/PHO-13142): chart artifact type (admin.chart@1, client-side declarative rendering) — cdx:PHO-13142
 - **admin-agent** — PHO-13141 simple-ops speed: non-churned cohort one-call (SQL predicate + org-id bridge), pinned outreach recipe, <=3-call golden eval, account-lane descriptions de-collided ([#10720](https://github.com/phoebe-health/phoebe/pull/10720) merged 4b6e513d6f)
 - **admin-agent** — PHO-13093 Phase 1: admin agent extracted into phoebe_admin_agent package (202 files, one-way dependency seam, zero behavior change) ([#10690](https://github.com/phoebe-health/phoebe/pull/10690) merged 12fa6c0c77)
 - **admin-agent** — PHO-13133 /admin/agent polish: tool outputs collapse by default, composer outline removed ([#10689](https://github.com/phoebe-health/phoebe/pull/10689) merged 96bad98a6a)
