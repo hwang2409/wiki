@@ -9,16 +9,16 @@ updated: 2026-07-08
 Todo:
 
 - [P1] WIKI-24: window-switch state preservation — composer draft, open subagent/review panel, scroll survive N->J->N window switches (inactive windows unmount today; keep mounted-hidden or externalize per-pane state). Repeated pain: in-progress prompts lost when cross-referencing another session
-- [P1] WIKI-29: C-a leader must override composer insert mode — prefix chords (C-a 9 etc.) intercept at capture phase regardless of vim/chatbox state, like native tmux
 
 In Progress:
 
 - [PHO-11274](https://linear.app/phoebework/issue/PHO-11274): compare_agent_runs trace comparison (audit-validated P1) — cdx:PHO-11274 worker
 - [PHO-13216](https://linear.app/phoebework/issue/PHO-13216): Core data products T2 (dossier+funnel+MCP mirrors) — cdx:PHO-13216 worker
 - [PHO-13227](https://linear.app/phoebework/issue/PHO-13227): subagent approval inheritance (13226 T2) — cdx:PHO-13227 worker
-- [P1] WIKI-23: pane/window open semantics — (1) subagent inspect panel splits the OWNING PANE not the window; (2) clicking notes/docs/activity/graph opens a NEW tmux window by default (drag-in still embeds), never replaces focused pane
 - [PR #10475](https://github.com/phoebe-health/phoebe/pull/10475): subagent recommendation parity iteration (harness #10692) — cdx:PR-10475 worker; overfitting watch
 - [P1] WIKI-28: external links open in default browser (web target=_blank audit + tauri opener/on_navigation) (owner: cdx:WIKI-28)
+- [P1] WIKI-29: C-a leader must override composer insert mode — prefix chords (C-a 9 etc.) intercept at capture phase regardless of vim/chatbox state, like native tmux
+- [P2] WIKI-26: auto-kill tmux window when an agent run is archived (wiki agent done / archive path kills window_id)
 
 Backlog:
 
@@ -41,5 +41,4 @@ Backlog:
 - [P2] WIKI-18: delta protocol misses pending-tool output on the landing poll (client keeps output:null) — reproduced on main e4528c8 by PR #14 reviewer; check dirty_from rewind math
 - [P1] [PHO-13138](https://linear.app/phoebework/issue/PHO-13138): Phase 2 admin-owned tables — plan approved (ticket comment = contract, 8-PR series); cdx:PHO-13138 worker on PR1 (schema/roles/deny-tests)
 - [P1] [PHO-13157](https://linear.app/phoebework/issue/PHO-13157): survey delayed-reply capture + chat-history link (folds 13106+13155, 2 customer reports) — cdx:PHO-13157 worker (gpt-5.4 xhigh)
-- [P2] WIKI-26: auto-kill tmux window when an agent run is archived (wiki agent done / archive path kills window_id)
 - [P2] WIKI-27: stabilize view-header height on note<->agent focus flips (40px pane jump, pre-existing — header collapses per focused-pane kind; fix per-window) + drop focusState.kind from pane.tsx getLinks deps (4 redundant /api/links per flip)

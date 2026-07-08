@@ -9,6 +9,7 @@ updated: 2026-07-08
 
 ## 2026-07-08
 
+- **WIKI-23** — pane/window open semantics — (1) subagent inspect panel splits the OWNING PANE not the window; (2) clicking notes/docs/activity/graph opens a NEW tmux window by default (drag-in still embeds), never replaces focused pane
 - **phoebe** — PHO-13225 call-recordings tool split merged (#10855) — index/read/search verbs replace 48%-success mega-tool; tag-write honestly approval-gated
 - [PHO-13225](https://linear.app/phoebework/issue/PHO-13225): call-recordings tool split (audit P0 #1) — cdx:PHO-13225 worker
 - **phoebe** — PHO-13218 tiered tool mounting merged (#10845) — 35-tool hot set + domain packs via load_skill + routing evals; ~20k tokens/run saved
