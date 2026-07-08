@@ -9,6 +9,7 @@ updated: 2026-07-08
 
 ## 2026-07-08
 
+- **WIKI-21** — /tokens page — usage over time, cli/model filters, cached-split, incremental scan cache (owner: cc:WIKI-21)
 - **phoebe** — PHO-13231 search_run_data flood regression test merge-ready ([#10848](https://github.com/phoebe-health/phoebe/pull/10848))
 - **WIKI-20** — settings pickers for interface + note fonts (probe-gated previews, ui-state synced) (owner: cc:WIKI-20)
 - **phoebe** — PHO-13226 authz design delivered — tiers/approvals/revocation/subagent design; decision: T2-only now (PHO-13227), T1/T3/T4 parked with triggers
