@@ -1530,29 +1530,20 @@ def get_accounts() -> dict[str, object]:
 
 @app.post("/api/accounts/rotate")
 async def rotate_account(body: AccountRotateIn) -> dict[str, object]:
-    state = accounts.read_state()
-    state = accounts.ensure_state_initialized(state)
-
-    if state.last_rotated_at:
-        try:
-            last = datetime.fromisoformat(state.last_rotated_at)
-        except ValueError:
-            last = None
-        if last is not None:
-            elapsed = (datetime.now(timezone.utc) - last).total_seconds()
-            if elapsed < accounts.debounce_seconds():
-                raise HTTPException(status_code=409, detail="rotation debounced")
+    state = await asyncio.to_thread(accounts.read_state)
+    state = await asyncio.to_thread(accounts.ensure_state_initialized, state)
 
     force_target = (body.account or "").strip() or None
-    if force_target and force_target not in accounts.list_available_accounts():
+    if force_target and force_target not in await asyncio.to_thread(accounts.list_available_accounts):
         raise HTTPException(status_code=400, detail="unknown account")
 
     try:
-        result = await asyncio.to_thread(
-            accounts.rotate,
+        result = await accounts.rotate_locked(
             state=state,
             force_target=force_target,
         )
+    except accounts.RotationDebouncedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except accounts.NoEligibleAccountError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except accounts.RotationError as exc:

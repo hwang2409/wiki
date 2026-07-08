@@ -457,11 +457,15 @@ def tmux_send_literal_and_enter(window: str, text: str) -> None:
 
 
 def wait_for_codex_ready(window: str, timeout_seconds: float) -> bool:
-    """Poll pane until the codex composer is drawn (the '> ' prompt or `esc to interrupt` gone)."""
+    """Ready = composer prompt drawn AND no `esc to interrupt` spinner.
+
+    `esc to interrupt` is the BUSY signature — the composer is not accepting
+    input while it's showing. Wait for it to disappear before we send-keys.
+    """
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         pane = tmux_capture(window, lines=40)
-        if pane and ("▌" in pane or "esc to " in pane or ">_" in pane or "> " in pane):
+        if pane and "esc to " not in pane and ("▌" in pane or ">_" in pane or "> " in pane):
             return True
         time.sleep(0.5)
     return False
@@ -583,6 +587,14 @@ def rotate(
     if not install_incoming_auth(target):
         raise RotationError(f"incoming auth.json missing for account {target!r}")
 
+    # Never revive workers onto an unverified auth.json. If `codex login status`
+    # fails, we've already killed the workers — restore the outgoing snapshot
+    # so the next rotation attempt starts from a known-good state.
+    if not codex_login_status():
+        if outgoing:
+            install_incoming_auth(outgoing)
+        raise RotationError(f"codex login status failed after swap to {target!r}")
+
     state.active = target
     state.last_rotated_at = datetime.now(timezone.utc).isoformat()
     state.accounts.setdefault(target, {})["limit_reset_at"] = None
@@ -654,6 +666,75 @@ class NoEligibleAccountError(RotationError):
     pass
 
 
+class RotationDebouncedError(RotationError):
+    pass
+
+
+# One rotation at a time across manual endpoint + watchdog. asyncio.Lock is
+# safe here — every rotate() call runs under a single event loop (endpoint is
+# async; watchdog awaits inside the loop). Sync callers guard via
+# run_coroutine_threadsafe if that ever changes.
+_rotation_lock: asyncio.Lock | None = None
+
+
+def _get_rotation_lock() -> asyncio.Lock:
+    global _rotation_lock
+    if _rotation_lock is None:
+        _rotation_lock = asyncio.Lock()
+    return _rotation_lock
+
+
+def seconds_since_last_rotation(state: AccountState) -> float:
+    """Distance from now to the persisted last_rotated_at, inf if never rotated."""
+    if not state.last_rotated_at:
+        return float("inf")
+    try:
+        last = datetime.fromisoformat(state.last_rotated_at)
+    except ValueError:
+        return float("inf")
+    now = datetime.now(last.tzinfo) if last.tzinfo else datetime.now()
+    return (now - last).total_seconds()
+
+
+async def rotate_locked(
+    *,
+    state: AccountState,
+    force_target: str | None = None,
+    outgoing_reset_at: str | None = None,
+    respect_debounce: bool = True,
+) -> "RotationResult":
+    """Serialize rotations and re-read persisted state under the lock.
+
+    Debounce check runs BOTH against the persisted state (survives restart /
+    cross-request) and against `respect_debounce` = False for a forced call
+    from the endpoint (which does its own 409 handling upstream).
+    """
+    async with _get_rotation_lock():
+        # Re-read under the lock — the in-memory state we were handed may be
+        # stale (parallel rotate wrote the file after we snapshotted).
+        fresh = await asyncio.to_thread(read_state)
+        fresh = await asyncio.to_thread(ensure_state_initialized, fresh)
+        if respect_debounce:
+            elapsed = seconds_since_last_rotation(fresh)
+            if elapsed < debounce_seconds():
+                raise RotationDebouncedError(
+                    f"rotation debounced ({elapsed:.0f}s since last)"
+                )
+        # Merge caller-provided overrides onto the fresh view.
+        if state.accounts:
+            for name, row in state.accounts.items():
+                if isinstance(row, dict):
+                    reset = row.get("limit_reset_at")
+                    if reset is not None:
+                        fresh.accounts.setdefault(name, {})["limit_reset_at"] = reset
+        return await asyncio.to_thread(
+            rotate,
+            state=fresh,
+            force_target=force_target,
+            outgoing_reset_at=outgoing_reset_at,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Watchdog loop.
 # ---------------------------------------------------------------------------
@@ -710,9 +791,13 @@ async def _check_once(
     if _seconds_since(watch.last_rotation_attempt) < debounce_seconds():
         return
 
+    state = await asyncio.to_thread(read_state)
+    state = await asyncio.to_thread(ensure_state_initialized, state)
+    # Persisted debounce survives backend restart AND cross-request races.
+    if seconds_since_last_rotation(state) < debounce_seconds():
+        return
+
     watch.last_rotation_attempt = time.monotonic()
-    state = read_state()
-    state = ensure_state_initialized(state)
 
     # Aggregate the outgoing account's reset window from any hit that carried one.
     outgoing_reset: str | None = None
@@ -722,12 +807,16 @@ async def _check_once(
             outgoing_reset = parsed
             break
 
+    if outgoing_reset and state.active:
+        state.accounts.setdefault(state.active, {})["limit_reset_at"] = outgoing_reset
+
     try:
-        result = await asyncio.to_thread(
-            rotate,
+        result = await rotate_locked(
             state=state,
             outgoing_reset_at=outgoing_reset,
         )
+    except RotationDebouncedError:
+        return
     except NoEligibleAccountError:
         if _seconds_since(watch.last_no_eligible_alert) >= 3600:
             watch.last_no_eligible_alert = time.monotonic()

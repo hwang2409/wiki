@@ -9,6 +9,7 @@ import asyncio
 import json
 import os
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
@@ -357,10 +358,53 @@ class RotationIntegrationTests(unittest.TestCase):
                  mock.patch.object(accounts, "tmux_pipe_pane", lambda w, l: None), \
                  mock.patch.object(accounts, "tmux_send_literal_and_enter", lambda w, t: None), \
                  mock.patch.object(accounts, "wait_for_codex_ready", lambda w, t: True), \
+                 mock.patch.object(accounts, "codex_login_status", lambda: True), \
                  mock.patch.object(accounts, "wiki_agent_update", lambda t, w, l: None):
                 accounts.rotate(state=state)
 
             self.assertEqual(commands, ["codex resume sess-xyz-123"])
+
+    def test_login_status_failure_aborts_before_revive(self) -> None:
+        with _EnvOverride() as paths:
+            (paths["accounts"] / "alpha").mkdir()
+            (paths["accounts"] / "alpha" / "auth.json").write_text('{"tokens":"alpha-v1"}')
+            (paths["accounts"] / "beta").mkdir()
+            (paths["accounts"] / "beta" / "auth.json").write_text('{"tokens":"beta-v1"}')
+            paths["auth"].write_text('{"tokens":"alpha-refreshed"}')
+
+            self._write_registry(
+                paths["registry"],
+                [
+                    {
+                        "ticket": "WIKI-15",
+                        "window": "@42",
+                        "kind": "cdx",
+                        "role": "implement",
+                        "worktree": str(paths["root"] / "wt-15"),
+                        "log": "/tmp/cdx-WIKI-15.log",
+                    }
+                ],
+            )
+            state = accounts.ensure_state_initialized(accounts.AccountState())
+
+            new_windows: list[str] = []
+            with mock.patch.object(accounts, "tmux_live_windows", lambda: {"@42"}), \
+                 mock.patch.object(accounts, "tmux_kill_window", lambda w: None), \
+                 mock.patch.object(accounts, "tmux_new_window", lambda n, c, cmd: new_windows.append(cmd) or "@200"), \
+                 mock.patch.object(accounts, "tmux_pipe_pane", lambda w, l: None), \
+                 mock.patch.object(accounts, "tmux_send_literal_and_enter", lambda w, t: None), \
+                 mock.patch.object(accounts, "wait_for_codex_ready", lambda w, t: True), \
+                 mock.patch.object(accounts, "wiki_agent_update", lambda t, w, l: None), \
+                 mock.patch.object(accounts, "codex_login_status", lambda: False):
+                with self.assertRaises(accounts.RotationError):
+                    accounts.rotate(state=state)
+
+            self.assertEqual(new_windows, [], "no worker may be revived onto unverified creds")
+            # Outgoing snapshot preserved AND ~/.codex/auth.json restored to it.
+            active_auth = json.loads(paths["auth"].read_text())
+            self.assertEqual(active_auth["tokens"], "alpha-refreshed")
+            reloaded = accounts.read_state()
+            self.assertEqual(reloaded.active, "alpha")
 
     def test_no_eligible_raises(self) -> None:
         with _EnvOverride() as paths:
@@ -371,6 +415,87 @@ class RotationIntegrationTests(unittest.TestCase):
             state = accounts.ensure_state_initialized(accounts.AccountState())
             with self.assertRaises(accounts.NoEligibleAccountError):
                 accounts.rotate(state=state)
+
+
+class ConcurrentRotationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_second_rotate_locked_debounces(self) -> None:
+        """Two concurrent rotate_locked calls must not double-swap: the second
+        one, arriving after the first commits, sees a fresh last_rotated_at
+        and raises RotationDebouncedError."""
+        with _EnvOverride() as paths:
+            (paths["accounts"] / "alpha").mkdir()
+            (paths["accounts"] / "alpha" / "auth.json").write_text('{"tokens":"alpha"}')
+            (paths["accounts"] / "beta").mkdir()
+            (paths["accounts"] / "beta" / "auth.json").write_text('{"tokens":"beta"}')
+            paths["auth"].write_text('{"tokens":"alpha"}')
+            paths["registry"].write_text("{}")
+
+            state = accounts.ensure_state_initialized(accounts.AccountState())
+
+            kills: list[str] = []
+            with mock.patch.object(accounts, "tmux_live_windows", set), \
+                 mock.patch.object(accounts, "tmux_kill_window", lambda w: kills.append(w)), \
+                 mock.patch.object(accounts, "codex_login_status", lambda: True):
+                first, second = await asyncio.gather(
+                    accounts.rotate_locked(state=state, respect_debounce=False),
+                    accounts.rotate_locked(state=state, respect_debounce=True),
+                    return_exceptions=True,
+                )
+
+            successes = [r for r in (first, second) if isinstance(r, accounts.RotationResult)]
+            debounced = [r for r in (first, second) if isinstance(r, accounts.RotationDebouncedError)]
+            self.assertEqual(len(successes), 1)
+            self.assertEqual(len(debounced), 1)
+
+    async def test_watchdog_debounces_against_persisted_state(self) -> None:
+        """A restart-fresh watchdog (in-memory counter at 0) must still honor
+        the persisted last_rotated_at and skip if it's inside the window."""
+        with _EnvOverride() as paths:
+            (paths["accounts"] / "alpha").mkdir()
+            (paths["accounts"] / "alpha" / "auth.json").write_text("{}")
+            (paths["accounts"] / "beta").mkdir()
+            (paths["accounts"] / "beta" / "auth.json").write_text("{}")
+            paths["auth"].write_text("{}")
+
+            paths["registry"].write_text(json.dumps({
+                "WIKI-15": {
+                    "current": {
+                        "ticket": "WIKI-15",
+                        "window": "@42",
+                        "kind": "cdx",
+                        "role": "implement",
+                        "worktree": str(paths["root"] / "wt-15"),
+                        "log": "/tmp/cdx-WIKI-15.log",
+                    }
+                }
+            }))
+
+            # Pretend the previous backend rotated 60s ago — well within the
+            # 600s default debounce.
+            recent = datetime.now(timezone.utc).isoformat()
+            accounts.write_state(accounts.AccountState(
+                active="alpha",
+                last_rotated_at=recent,
+                accounts={"alpha": {"limit_reset_at": None}, "beta": {"limit_reset_at": None}},
+            ))
+
+            emitted: list[dict] = []
+
+            async def emit(evt: dict) -> None:
+                emitted.append(evt)
+
+            with mock.patch.object(accounts, "tmux_live_windows", lambda: {"@42"}), \
+                 mock.patch.object(accounts, "tmux_capture", lambda w, lines=60: REAL_LIMIT_STRING):
+                watch = accounts.WatchdogInternalState()  # in-memory counter fresh
+                await accounts._check_once(watch, emit)
+
+            self.assertEqual(emitted, [], "persisted debounce must block the rotation")
+            self.assertEqual(accounts.read_state().active, "alpha", "no swap should have happened")
+
+
+def _needs_timezone_import() -> None:
+    """Guard: the test above uses datetime.now(timezone.utc)."""
+    from datetime import timezone  # noqa: F401
 
 
 class WatchdogLoopTests(unittest.IsolatedAsyncioTestCase):
@@ -410,6 +535,7 @@ class WatchdogLoopTests(unittest.IsolatedAsyncioTestCase):
                  mock.patch.object(accounts, "tmux_send_literal_and_enter", lambda w, t: None), \
                  mock.patch.object(accounts, "wait_for_codex_ready", lambda w, t: True), \
                  mock.patch.object(accounts, "wiki_agent_update", lambda t, w, l: None), \
+                 mock.patch.object(accounts, "codex_login_status", lambda: True), \
                  mock.patch.object(accounts, "find_session_id_for_worktree", lambda w: None):
                 watch = accounts.WatchdogInternalState()
                 await accounts._check_once(watch, emit)

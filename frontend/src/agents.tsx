@@ -553,7 +553,7 @@ function SpawnOrchestratorModal({
   );
 }
 
-type AccountEvent =
+export type AccountEvent =
   | {
       type: "codex_rotation";
       from: string | null;
@@ -579,38 +579,6 @@ type AccountEvent =
       window: string;
       ts: string;
     };
-
-const MAX_ACCOUNT_EVENTS = 4;
-
-function useAccountEvents(): AccountEvent[] {
-  const [events, setEvents] = useState<AccountEvent[]>([]);
-  useEffect(() => {
-    const source = new EventSource("/api/events");
-    const handler = (raw: MessageEvent<string>) => {
-      try {
-        const payload = JSON.parse(raw.data) as { type?: string };
-        if (
-          payload &&
-          typeof payload.type === "string" &&
-          (payload.type === "codex_rotation" ||
-            payload.type === "codex_limit_no_eligible" ||
-            payload.type === "codex_rotation_failed" ||
-            payload.type === "claude_limit_hit")
-        ) {
-          setEvents((prior) => [payload as AccountEvent, ...prior].slice(0, MAX_ACCOUNT_EVENTS));
-        }
-      } catch {
-        /* ignore malformed frames */
-      }
-    };
-    source.addEventListener("message", handler);
-    return () => {
-      source.removeEventListener("message", handler);
-      source.close();
-    };
-  }, []);
-  return events;
-}
 
 function accountBannerLine(event: AccountEvent): string {
   switch (event.type) {
@@ -658,6 +626,7 @@ export function AgentsView({
   refreshTick,
   openTicket,
   onOpenTicket,
+  accountEvents = [],
 }: {
   data?: {
     workers: AgentWorker[] | null;
@@ -669,8 +638,8 @@ export function AgentsView({
   refreshTick: number;
   openTicket: string | null;
   onOpenTicket: (ticket: string | null) => void;
+  accountEvents?: AccountEvent[];
 }) {
-  const accountEvents = useAccountEvents();
   const [fetchedWorkers, setFetchedWorkers] = useState<AgentWorker[] | null>(null);
   const [fetchedOrchestrators, setFetchedOrchestrators] = useState<Orchestrator[]>([]);
   const [fetchedArchived, setFetchedArchived] = useState<ArchivedWorker[]>([]);

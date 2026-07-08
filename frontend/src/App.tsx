@@ -35,7 +35,7 @@ import type { AgentWorker, ArchivedWorker, NoteLinks, Orchestrator } from "./api
 import { FleetSwitcher, QuickSwitcher } from "./switcher";
 import { SettingsModal, applyStoredMonoFont } from "./settings";
 import { ActivityFeed } from "./activity";
-import { AgentsSidebar, AgentsView } from "./agents";
+import { AgentsSidebar, AgentsView, type AccountEvent } from "./agents";
 import {
   AgentSessionView,
   type AgentRoutePanel,
@@ -808,9 +808,27 @@ export default function App() {
     };
   }, [contextMenu]);
 
+  const [accountEvents, setAccountEvents] = useState<AccountEvent[]>([]);
   useEffect(() => {
     const source = new EventSource("/api/events");
-    source.onmessage = () => setRefreshTick((tick) => tick + 1);
+    source.onmessage = (raw) => {
+      setRefreshTick((tick) => tick + 1);
+      try {
+        const payload = JSON.parse(raw.data) as { type?: string };
+        if (
+          payload &&
+          typeof payload.type === "string" &&
+          (payload.type === "codex_rotation" ||
+            payload.type === "codex_limit_no_eligible" ||
+            payload.type === "codex_rotation_failed" ||
+            payload.type === "claude_limit_hit")
+        ) {
+          setAccountEvents((prior) => [payload as AccountEvent, ...prior].slice(0, 4));
+        }
+      } catch {
+        /* ignore malformed frames */
+      }
+    };
     return () => source.close();
   }, []);
   const [isLoading, setIsLoading] = useState(true);
@@ -2083,6 +2101,7 @@ export default function App() {
               refreshTick={refreshTick}
               openTicket={agentsOpenTicket}
               onOpenTicket={setAgentsOpenTicket}
+              accountEvents={accountEvents}
             />
           ) : mode === "empty" ? (
             <div className="empty-state">
