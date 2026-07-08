@@ -37,6 +37,7 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 ## Tools/til
 
 - [[wiki-native-bundle-hardened-runtime-parent-watchdog]] — Tauri Wiki.app with a PyInstaller onefile sidecar needs hardenedRuntime false and a parent-pid watchdog on macOS.
+- [[wiki-native-tauri-dragdrop-html5]] — Tauri webview drag-drop handler kills HTML5 DnD — check before debugging dead drags in any Tauri app
 
 ## Families (path patterns, not enumerated)
 
