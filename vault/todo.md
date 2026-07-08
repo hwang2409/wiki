@@ -17,6 +17,7 @@ In Progress:
 - WIKI-12: tmux window model redesign — cdx:WIKI-12
 - [PHO-13218](https://linear.app/phoebework/issue/PHO-13218): tiered tool mounting (hot set + domain packs + routing evals) — cdx:PHO-13218 worker
 - [P2] WIKI-13: agent-UI nits — composer growth must push transcript up (always readable above chatbox); font dropdown renders each option in its own font (preview); add Monaco, Consolas + all installed coding fonts to font list
+- [P2] WIKI-14: render Claude task lists in transcript (counts header + per-task status glyphs like TUI); prereq = JSONL event-coverage audit (unhandled codex/claude event types)
 
 Backlog:
 
@@ -36,4 +37,3 @@ Backlog:
 - [PHO-11535](https://linear.app/phoebework/issue/PHO-11535): fact/inference evidence tiers for RCA answers
 - [PHO-11231](https://linear.app/phoebework/issue/PHO-11231): Phoebe Home Care seed data for visual testing
 - [PHO-12982](https://linear.app/phoebework/issue/PHO-12982), 12757: reference tickets (harness doctrine, tool brainstorm)
-- [P2] WIKI-14: render Claude task lists in transcript (counts header + per-task status glyphs like TUI); prereq = JSONL event-coverage audit (unhandled codex/claude event types)
