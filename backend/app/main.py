@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from . import accounts, github_pr, transcripts, vaultops
+from . import accounts, github_pr, transcripts, uistate, vaultops
 from .frontend_static import mount_frontend_static
 
 
@@ -1571,5 +1571,7 @@ async def rotate_account(body: AccountRotateIn) -> dict[str, object]:
         "failed": result.failed,
     }
 
+
+app.include_router(uistate.router)
 
 mount_frontend_static(app)
