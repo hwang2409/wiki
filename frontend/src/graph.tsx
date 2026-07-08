@@ -25,8 +25,9 @@ export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
   useEffect(() => {
+    const trackRaf = import.meta.env.DEV;
     const metricsWindow = window as typeof window & { __wikiGraphRafCount?: number };
-    metricsWindow.__wikiGraphRafCount = 0;
+    if (trackRaf) metricsWindow.__wikiGraphRafCount = 0;
     const canvas = canvasRef.current;
     if (!canvas) return;
     const context = canvas.getContext("2d");
@@ -268,7 +269,9 @@ export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }
       running = false;
       raf = 0;
       if (disposed || hidden) return;
-      metricsWindow.__wikiGraphRafCount = (metricsWindow.__wikiGraphRafCount ?? 0) + 1;
+      if (trackRaf) {
+        metricsWindow.__wikiGraphRafCount = (metricsWindow.__wikiGraphRafCount ?? 0) + 1;
+      }
       if (alpha > settleAlpha || dragged) step();
       const viewAnimating = draw();
       if (dragged || alpha > settleAlpha || viewAnimating) {

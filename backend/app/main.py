@@ -920,7 +920,8 @@ async def get_tokens(
     cli=codex|claude, model=<exact>. `from` is a Python keyword so we bind it
     via alias.
     """
-    return tokens.query_nonblocking(
+    return await asyncio.to_thread(
+        tokens.query_nonblocking,
         from_ts=from_ts,
         to_ts=to_ts,
         bucket=bucket,

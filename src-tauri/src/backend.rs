@@ -78,6 +78,21 @@ document.write(`<!doctype html>
         font-size: 13px;
         line-height: 1.5;
       }
+      @media (prefers-color-scheme: dark) {
+        body {
+          background: #12161c;
+          color: #e6edf3;
+        }
+        .card {
+          border-color: rgba(230, 237, 243, 0.12);
+          background: rgba(25, 30, 38, 0.94);
+        }
+        .label,
+        p {
+          color: #9da7b3;
+          border-color: rgba(230, 237, 243, 0.12);
+        }
+      }
     </style>
   </head>
   <body>
