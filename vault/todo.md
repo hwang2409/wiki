@@ -13,8 +13,9 @@ In Progress:
 
 - [P1] [PHO-13157](https://linear.app/phoebework/issue/PHO-13157): survey delayed-reply capture + chat-history link (folds 13106+13155, 2 customer reports) — cdx:PHO-13157 worker (gpt-5.4 xhigh)
 - [P1] [PHO-13138](https://linear.app/phoebework/issue/PHO-13138): Phase 2 admin-owned tables — plan approved (ticket comment = contract, 8-PR series); cdx:PHO-13138 worker on PR1 (schema/roles/deny-tests)
-- [PHO-13215](https://linear.app/phoebework/issue/PHO-13215): Core data products T1 (resolver+book+endpoints) — cdx:PHO-13215 worker; T2=PHO-13216 queued; blocked on repeated remote-only BuildBuddy failure of `//services/worker/handlers/phoebe_event_agent:phoebe_event_agent_test__shard_2__bundle` while the exact target passes locally
+- [PHO-13215](https://linear.app/phoebework/issue/PHO-13215): Core data products T1 (resolver+book+endpoints) — cdx:PHO-13215 worker; T2=PHO-13216 queued; PR #10830 review/CI babysitting
 - [PHO-13218](https://linear.app/phoebework/issue/PHO-13218): tiered tool mounting (hot set + domain packs + routing evals) — cdx:PHO-13218 worker
+- [P1] WIKI-19: watchdog revival v1.1 — (a) resume by EXPLICIT session id only, id resolved from richest-lineage rollout (kickoff-or-cwd match, largest/newest), launch cwd = worktree + auto-answer codex cwd-mismatch dialog (choose current dir); (b) preserve original tmux session (capture #{session_name} before kill); (c) detect 'access token could not be refreshed' pane signature as auth-dead -> kill+resume; (d) registry tracks current session id per worker (wiki agent update --session) and transcript resolver prefers it over discovery; (e) re-poke includes ticket id + status-file path
 
 Backlog:
 
@@ -35,4 +36,3 @@ Backlog:
 - [PHO-11231](https://linear.app/phoebework/issue/PHO-11231): Phoebe Home Care seed data for visual testing
 - [PHO-12982](https://linear.app/phoebework/issue/PHO-12982), 12757: reference tickets (harness doctrine, tool brainstorm)
 - [P2] WIKI-18: delta protocol misses pending-tool output on the landing poll (client keeps output:null) — reproduced on main e4528c8 by PR #14 reviewer; check dirty_from rewind math
-- [P1] WIKI-19: watchdog revival v1.1 — (a) resume by EXPLICIT session id only, id resolved from richest-lineage rollout (kickoff-or-cwd match, largest/newest), launch cwd = worktree + auto-answer codex cwd-mismatch dialog (choose current dir); (b) preserve original tmux session (capture #{session_name} before kill); (c) detect 'access token could not be refreshed' pane signature as auth-dead -> kill+resume; (d) registry tracks current session id per worker (wiki agent update --session) and transcript resolver prefers it over discovery; (e) re-poke includes ticket id + status-file path
