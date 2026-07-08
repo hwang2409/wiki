@@ -47,6 +47,7 @@ export type PaneNoteFocusState =
 
 export function WorkspacePane({
   agentPanel,
+  agentContext,
   agentWorkers,
   focused,
   noteFocusState,
@@ -59,6 +60,7 @@ export function WorkspacePane({
   scrollRef,
 }: {
   agentPanel: AgentRoutePanel;
+  agentContext?: "full" | "pane";
   agentWorkers?: Map<string, AgentSessionSurfaceWorker>;
   focused: boolean;
   noteFocusState: PaneNoteFocusState;
@@ -73,6 +75,7 @@ export function WorkspacePane({
   const content = path.startsWith("agent://") ? (
     <AgentPane
       agentPanel={agentPanel}
+      agentContext={agentContext ?? "pane"}
       agentWorkers={agentWorkers}
       onClose={onClose}
       path={path}
@@ -105,12 +108,14 @@ export function WorkspacePane({
 
 function AgentPane({
   agentPanel,
+  agentContext,
   agentWorkers,
   path,
   refreshTick,
   onClose,
 }: {
   agentPanel: AgentRoutePanel;
+  agentContext: "full" | "pane";
   agentWorkers?: Map<string, AgentSessionSurfaceWorker>;
   path: string;
   refreshTick: number;
@@ -122,7 +127,7 @@ function AgentPane({
   return (
     <section className="secondary-pane agent-pane">
       <AgentSessionSurface
-        context="pane"
+        context={agentContext}
         initialPanel={agentPanel}
         onClose={onClose}
         refreshTick={refreshTick}

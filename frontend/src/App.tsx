@@ -1369,44 +1369,17 @@ export default function App() {
     void showNoteRoute(path, { syncHash });
   }
 
-  function replaceFocusedPanePath(nextPath: string) {
-    if (activeWindow && focusedPaneId) {
-      const focused = findPaneInfo(activeWindow.layout, focusedPaneId);
-      if (focused && focused.path === nextPath) {
-        return { nextState: windowState, targetWindowId: activeWindow.id, targetPaneId: focusedPaneId };
-      }
-    }
-
-    if (!activeWindow || !focusedPaneId) {
-      const windowId = nextWindowId();
-      const paneId = nextPaneId();
-      const nextState = normalizeWindowWorkspaceState({
+  function openPathInSoloWindow(path: string) {
+    const windowId = nextWindowId();
+    const paneId = nextPaneId();
+    if (zoomedPaneId) setZoomedPaneId(null);
+    setWindowState((current) =>
+      normalizeWindowWorkspaceState({
         activeWindowId: windowId,
-        windows: [...windowState.windows, createSoloWindow(windowId, paneId, nextPath)],
-      });
-      return { nextState, targetWindowId: windowId, targetPaneId: paneId };
-    }
-
-    const focused = findPaneInfo(activeWindow.layout, focusedPaneId);
-    if (!focused) {
-      return { nextState: windowState, targetWindowId: activeWindow.id, targetPaneId: activeWindow.focusedPaneId };
-    }
-
-    const nextWindows = windowState.windows.map((window) => ({ ...window }));
-    const targetWindow = nextWindows.find((window) => window.id === activeWindow.id);
-    if (!targetWindow) {
-      return { nextState: windowState, targetWindowId: activeWindow.id, targetPaneId: focusedPaneId };
-    }
-    targetWindow.layout = replacePanePath(targetWindow.layout, focusedPaneId, nextPath);
-    if (focusedPaneId !== targetWindow.focusedPaneId) targetWindow.focusedPaneId = focusedPaneId;
-    if (focused.path !== nextPath && focused.ticket) {
-      nextWindows.push(createSoloWindow(nextWindowId(), nextPaneId(), focused.path));
-    }
-    const nextState = normalizeWindowWorkspaceState({
-      activeWindowId: targetWindow.id,
-      windows: nextWindows,
-    });
-    return { nextState, targetWindowId: targetWindow.id, targetPaneId: focusedPaneId };
+        windows: [...current.windows, createSoloWindow(windowId, paneId, path)],
+      })
+    );
+    requestAnimationFrame(() => paneRefs.current.get(paneId)?.focus());
   }
 
   async function showNoteRoute(
@@ -1442,10 +1415,7 @@ export default function App() {
       if (zoomedPaneId && zoomedPaneId !== existing.pane.key) setZoomedPaneId(null);
       focusWindowPane(existing.window.id, existing.pane.key);
     } else {
-      const replacement = replaceFocusedPanePath(path);
-      if (zoomedPaneId && zoomedPaneId !== replacement.targetPaneId) setZoomedPaneId(null);
-      setWindowState(replacement.nextState);
-      requestAnimationFrame(() => paneRefs.current.get(replacement.targetPaneId)?.focus());
+      openPathInSoloWindow(path);
     }
     await showNoteRoute(path, { edit, syncHash });
   }
@@ -2001,11 +1971,11 @@ export default function App() {
         if (key === "Escape") return;
 
         if (lowerKey === "j") {
-          cyclePaneFocus(1);
+          cyclePaneFocus(-1);
           return;
         }
         if (lowerKey === "k") {
-          cyclePaneFocus(-1);
+          cyclePaneFocus(1);
           return;
         }
         if (windowState.windows.length > 0 && lowerKey === "h") {
@@ -2377,6 +2347,8 @@ export default function App() {
     if (node.kind === "pane") {
       const focused = focusedPaneId === node.id;
       const overlayContent = focused ? renderFocusedPaneOverlayContent() : null;
+      const agentContext =
+        paneInfos.length === 1 || zoomedPaneId === node.id ? "full" : "pane";
       const noteFocusState: PaneNoteFocusState =
         focused && mode === "view" && activeNote?.path === node.path
           ? {
@@ -2409,6 +2381,7 @@ export default function App() {
             node.id,
             <WorkspacePane
               agentPanel={agentPanelForPane}
+              agentContext={agentContext}
               agentWorkers={agentWorkers}
               focused={focused}
               noteFocusState={noteFocusState}
