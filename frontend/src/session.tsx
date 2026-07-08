@@ -737,8 +737,20 @@ function MessageComposer({
   useEffect(() => {
     const el = inputRef.current;
     if (!el) return;
-    el.style.height = "auto";
-    el.style.height = `${Math.min(el.scrollHeight, Math.round(window.innerHeight * 0.4))}px`;
+    const surface = el.closest(".agent-session-surface, .session-side-panel") as HTMLElement | null;
+    const resize = () => {
+      const avail = surface?.clientHeight ?? window.innerHeight;
+      const cap = Math.max(80, Math.round(avail * 0.4));
+      el.style.height = "auto";
+      const desired = Math.min(el.scrollHeight, cap);
+      el.style.height = `${desired}px`;
+      el.style.overflowY = el.scrollHeight > cap ? "auto" : "hidden";
+    };
+    resize();
+    if (!surface) return;
+    const observer = new ResizeObserver(resize);
+    observer.observe(surface);
+    return () => observer.disconnect();
   }, [text]);
 
   function caret(): number {
