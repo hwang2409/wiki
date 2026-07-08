@@ -7,13 +7,14 @@ updated: 2026-07-08
 
 # Wiki App UI Direction
 
-Decision (2026-07-06): the wiki frontend is an **Obsidian clone in structure/behavior, monochrome black-and-white in appearance**. Light mode default, light/dark switcher in ribbon (persisted to `localStorage["wiki-theme"]`).
+Decision (2026-07-08): the wiki frontend stays an **Obsidian clone in structure/behavior with flat, restrained chrome**, but it no longer stays monochrome-only. Light mode default persists; the theme system now ships a curated editor-theme set with family-aware light/dark switching via `localStorage["wiki-theme"]`.
 
 ## Chosen
 
 - Obsidian layout: ribbon, file-explorer sidebar, tab header, breadcrumbs, reading/source mode toggle, status bar with word/char count.
-- Markdown parity with Obsidian core: callouts (all 13 families, foldable `+`/`-`), `[[wikilinks]]` + aliases, `==highlights==` (rendered inverted fg/bg), `#tags` (gray pills), `%%comments%%` hidden, footnotes, task lists, tables, syntax highlighting (grayscale weights/italics, not colors).
-- Monochrome palette via CSS vars on `:root` (light) + `[data-theme="dark"]` overrides in `frontend/src/styles.css`. Callouts differ by icon only, not color.
+- Markdown parity with Obsidian core: callouts (all 13 families, foldable `+`/`-`), `[[wikilinks]]` + aliases, `==highlights==` (rendered inverted fg/bg), `#tags` (gray pills), `%%comments%%` hidden, footnotes, task lists, tables, syntax highlighting themed to match the selected chrome palette.
+- Theme architecture (2026-07-08): same semantic CSS-variable surface for every theme, now centralized in `frontend/src/themes.css` + `frontend/src/themes.ts`. Mono Light/Dark remain unchanged for existing users, plus Gruvbox Dark/Light, VS Code Dark+, Solarized Dark/Light, Dracula, Nord, One Dark, Tokyo Night, and Catppuccin Mocha. Accents stay limited to links, chips, diffs, and syntax tokens; no gradients.
+- Ribbon toggle behavior (2026-07-08): if the active family has both polarities, the sun/moon toggle switches within that family (`mono`, `gruvbox`, `solarized`). Single-variant dark themes fall back to `mono-light` on toggle; the inverse fallback would be `mono-dark`.
 - Backend full-text search: `GET /api/notes?q=`.
 - Custom views, frontmatter-gated: `view: kanban` renders sections as read-only board lanes, list items as cards (used by `todo.md`). First deliberate departure from pure markdown parity.
 - Kanban target look: obsidian-community/obsidian-kanban plugin — multi-column lanes (width proportional to card count, internal card grid; single-column tried and reverted same day), panel lanes on flat pane, rich markdown cards. Shipped 2026-07-06: drag-drop between/within lanes + per-lane add-card, both write todo.md via line surgery (exact-line ops on latest content, last-write-wins). Drop-to-done shipped: drag card onto floating zone → line appended to log/done.md (`- YYYY-MM-DD: <text>`, priority tag stripped) + removed from todo.md; done-append happens first so failures can't lose the card. Remaining: card edit-in-place, lane menus.
@@ -23,12 +24,16 @@ Decision (2026-07-06): the wiki frontend is an **Obsidian clone in structure/beh
 
 - **Per-element CSS customizer prototype** (`wiki-styles` fenced blocks, style inspector, media placement controls) — removed entirely; legacy blocks stripped at render. Do not reintroduce.
 - **Obsidian default color theme** (purple accent `hsl(254,80%,68%)`, per-type callout colors) — replaced same day by monochrome at Henry's request.
+- **Monochrome-only forever** — superseded 2026-07-08. Henry wanted the standard editor theme set, but still mapped onto restrained UI-semantic vars rather than loud per-component accents.
 
 ## Key files
 
 - `frontend/src/markdown.tsx` — renderer + callout/wikilink/tag/highlight plugins
-- `frontend/src/App.tsx` — shell, theme toggle
-- `frontend/src/styles.css` — both theme palettes
+- `frontend/src/App.tsx` — shell, route state, ribbon theme toggle
+- `frontend/src/settings.tsx` — settings modal theme picker + font controls
+- `frontend/src/themes.ts` — theme registry, storage migration, family toggle logic
+- `frontend/src/themes.css` — full theme variable definitions + syntax palettes
+- `frontend/src/styles.css` — shared component rules consuming semantic theme vars
 - `vault/meta/ui-demo.md` — exercises every renderer feature
 
 ## Known gaps (deliberate, "expand later")
