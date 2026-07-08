@@ -580,6 +580,7 @@ button:disabled {
   flex: 1;
   min-height: 0;
   min-width: 0;
+  --split-ratio: 0.5;
 }
 
 .pane-split.column {
@@ -594,10 +595,19 @@ button:disabled {
   min-width: 0;
 }
 
+.pane-split > .pane-cell:first-child {
+  flex-grow: var(--split-ratio);
+}
+
+.pane-split > .pane-cell:last-child {
+  flex-grow: calc(1 - var(--split-ratio));
+}
+
 .pane-divider {
   position: relative;
   z-index: 30;
-  flex: 0 0 7px;
+  flex: 0 0 8px;
+  touch-action: none;
 }
 
 .pane-divider.row {
@@ -651,6 +661,10 @@ button:disabled {
 body.is-resizing-panes {
   cursor: col-resize;
   user-select: none;
+}
+
+body.is-resizing-panes .pane-cell {
+  pointer-events: none;
 }
 
 .view-content {

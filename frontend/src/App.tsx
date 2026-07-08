@@ -720,25 +720,38 @@ function PaneDivider({
       onPointerDown={(event) => {
         event.preventDefault();
         const divider = event.currentTarget;
-        const parent = divider.parentElement;
+        const parent = divider.parentElement as HTMLElement | null;
         if (!parent) return;
         const rect = parent.getBoundingClientRect();
         divider.setPointerCapture(event.pointerId);
         divider.classList.add("is-dragging");
         document.body.classList.add("is-resizing-panes");
 
+        let latest: number | null = null;
+        let frame = 0;
+        const apply = () => {
+          frame = 0;
+          if (latest !== null) parent.style.setProperty("--split-ratio", String(latest));
+        };
+
         const move = (moveEvent: PointerEvent) => {
           const raw =
             direction === "row"
               ? (moveEvent.clientX - rect.left) / rect.width
               : (moveEvent.clientY - rect.top) / rect.height;
-          onRatio(Math.min(0.85, Math.max(0.15, raw)));
+          latest = Math.min(0.85, Math.max(0.15, raw));
+          if (!frame) frame = requestAnimationFrame(apply);
         };
         const up = () => {
+          if (frame) {
+            cancelAnimationFrame(frame);
+            frame = 0;
+          }
           divider.classList.remove("is-dragging");
           document.body.classList.remove("is-resizing-panes");
           window.removeEventListener("pointermove", move);
           window.removeEventListener("pointerup", up);
+          if (latest !== null) onRatio(latest);
         };
         window.addEventListener("pointermove", move);
         window.addEventListener("pointerup", up);
@@ -2303,8 +2316,12 @@ export default function App() {
       );
     }
     return (
-      <div className={`pane-split ${node.direction}`} key={path.join(".")}>
-        <div className="pane-cell" style={{ flexGrow: node.ratio }}>
+      <div
+        className={`pane-split ${node.direction}`}
+        key={path.join(".")}
+        style={{ ["--split-ratio" as string]: node.ratio }}
+      >
+        <div className="pane-cell">
           {renderLayout(node.first, primaryContent, [...path, 1])}
         </div>
         <PaneDivider
@@ -2323,7 +2340,7 @@ export default function App() {
             )
           }
         />
-        <div className="pane-cell" style={{ flexGrow: 1 - node.ratio }}>
+        <div className="pane-cell">
           {renderLayout(node.second, primaryContent, [...path, 2])}
         </div>
       </div>
