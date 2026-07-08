@@ -14,9 +14,10 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from . import transcripts, vaultops
+from .frontend_static import mount_frontend_static
 
 
-ROOT_DIR = Path(__file__).resolve().parents[2]
+ROOT_DIR = Path(os.environ.get("WIKI_REPO_DIR", Path(__file__).resolve().parents[2])).resolve()
 VAULT_DIR = Path(os.environ.get("WIKI_VAULT_DIR", ROOT_DIR / "vault")).resolve()
 MAX_NOTE_BYTES = 2_000_000
 
@@ -1145,3 +1146,6 @@ def update_note(note_path: str, payload: NoteUpdate) -> Note:
 
     target.write_text(f"{content}\n", encoding="utf-8")
     return to_note(target)
+
+
+mount_frontend_static(app)
