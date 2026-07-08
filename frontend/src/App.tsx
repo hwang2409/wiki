@@ -23,6 +23,7 @@ import {
 import {
   createNote,
   deleteNote,
+  getAgents,
   getLinks,
   getNote,
   listNotes,
@@ -30,8 +31,8 @@ import {
   searchNotes,
   updateNote
 } from "./api";
-import type { NoteLinks } from "./api";
-import { QuickSwitcher } from "./switcher";
+import type { AgentWorker, ArchivedWorker, NoteLinks, Orchestrator } from "./api";
+import { FleetSwitcher, QuickSwitcher } from "./switcher";
 import { SettingsModal, applyStoredMonoFont } from "./settings";
 import { ActivityFeed } from "./activity";
 import { AgentsSidebar, AgentsView } from "./agents";
@@ -67,6 +68,37 @@ type Layout =
   | { kind: "primary" }
   | { kind: "note"; id: string; path: string }
   | { kind: "split"; direction: "row" | "column"; ratio: number; first: Layout; second: Layout };
+
+type PaneInfo = {
+  key: string;
+  kind: "primary" | "note";
+  path: string | null;
+};
+
+type Direction = "left" | "right" | "up" | "down";
+type FleetChooserMode = "orchestrators" | "tree";
+
+type AgentsSnapshot = {
+  workers: AgentWorker[] | null;
+  orchestrators: Orchestrator[];
+  archived: ArchivedWorker[];
+  error: string | null;
+};
+
+type FleetItem = {
+  kind: "orchestrator" | "worker";
+  ticket: string;
+  label: string;
+  groupId: string;
+  state: string | null;
+  live: boolean;
+  detail: string | null;
+};
+
+type FleetGroup = {
+  orch: Orchestrator;
+  items: FleetItem[];
+};
 
 function splitLayout(
   node: Layout,
@@ -127,6 +159,169 @@ function closeNotePane(node: Layout, id: string): Layout | null {
     return { ...node, first, second };
   }
   return node;
+}
+
+function layoutContains(node: Layout, key: string): boolean {
+  if (node.kind === "primary") return key === "primary";
+  if (node.kind === "note") return node.id === key;
+  return layoutContains(node.first, key) || layoutContains(node.second, key);
+}
+
+function collectPaneInfos(node: Layout, panes: PaneInfo[] = []): PaneInfo[] {
+  if (node.kind === "primary") {
+    panes.push({ key: "primary", kind: "primary", path: null });
+    return panes;
+  }
+  if (node.kind === "note") {
+    panes.push({ key: node.id, kind: "note", path: node.path });
+    return panes;
+  }
+  collectPaneInfos(node.first, panes);
+  collectPaneInfos(node.second, panes);
+  return panes;
+}
+
+function firstPaneKey(node: Layout): string {
+  if (node.kind === "primary") return "primary";
+  if (node.kind === "note") return node.id;
+  return firstPaneKey(node.first);
+}
+
+function ticketFromPanePath(path: string | null): string | null {
+  return path?.startsWith("agent://") ? path.slice("agent://".length) : null;
+}
+
+function cwdBasename(path: string | null): string {
+  return path ? path.split("/").slice(-1)[0] : "no cwd";
+}
+
+function buildFleetGroups(workers: AgentWorker[], orchestrators: Orchestrator[]): FleetGroup[] {
+  return orchestrators.map((orch) => {
+    const owned = workers.filter((worker) => worker.orch === orch.id);
+    return {
+      orch,
+      items: [
+        {
+          kind: "orchestrator",
+          ticket: orch.id,
+          label: orch.id,
+          groupId: orch.id,
+          state: orch.window_alive ? "working" : "blocked",
+          live: orch.window_alive,
+          detail: cwdBasename(orch.cwd),
+        },
+        ...owned.map((worker) => ({
+          kind: "worker" as const,
+          ticket: worker.ticket,
+          label: worker.ticket,
+          groupId: orch.id,
+          state: worker.state,
+          live: worker.window_alive,
+          detail: worker.step ?? worker.role ?? worker.kind,
+        })),
+      ],
+    };
+  });
+}
+
+function findFleetGroup(groups: FleetGroup[], ticket: string | null): FleetGroup | null {
+  if (!ticket) return null;
+  return groups.find((group) => group.items.some((item) => item.ticket === ticket)) ?? null;
+}
+
+function findFleetItem(groups: FleetGroup[], ticket: string | null): FleetItem | null {
+  if (!ticket) return null;
+  for (const group of groups) {
+    const match = group.items.find((item) => item.ticket === ticket);
+    if (match) return match;
+  }
+  return null;
+}
+
+function agentStateGlyph(state: string | null, live: boolean): string {
+  if (!live) return "○";
+  if (state === "merge-ready") return "◎";
+  if (state === "blocked") return "○";
+  if (state === "working") return "●";
+  return "·";
+}
+
+function isEditableTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  if (
+    target instanceof HTMLInputElement ||
+    target instanceof HTMLTextAreaElement ||
+    target instanceof HTMLSelectElement
+  ) {
+    return true;
+  }
+  return target.isContentEditable || target.closest("[contenteditable='true']") !== null;
+}
+
+function rectCrossDistance(current: DOMRect, candidate: DOMRect, direction: Direction): number {
+  if (direction === "left" || direction === "right") {
+    const overlap = Math.min(current.bottom, candidate.bottom) - Math.max(current.top, candidate.top);
+    if (overlap > 0) return 0;
+    const currentMid = current.top + current.height / 2;
+    const candidateMid = candidate.top + candidate.height / 2;
+    return Math.abs(currentMid - candidateMid);
+  }
+  const overlap = Math.min(current.right, candidate.right) - Math.max(current.left, candidate.left);
+  if (overlap > 0) return 0;
+  const currentMid = current.left + current.width / 2;
+  const candidateMid = candidate.left + candidate.width / 2;
+  return Math.abs(currentMid - candidateMid);
+}
+
+function pickNeighborPane(
+  panes: Map<string, DOMRect>,
+  fromKey: string,
+  direction: Direction
+): string | null {
+  const current = panes.get(fromKey);
+  if (!current) return null;
+
+  let bestKey: string | null = null;
+  let bestRank: [number, number, number] | null = null;
+
+  for (const [key, rect] of panes) {
+    if (key === fromKey || rect.width === 0 || rect.height === 0) continue;
+
+    let valid = false;
+    let primaryGap = 0;
+    if (direction === "left") {
+      valid = rect.left < current.left - 4;
+      primaryGap = Math.max(0, current.left - rect.right);
+    } else if (direction === "right") {
+      valid = rect.right > current.right + 4;
+      primaryGap = Math.max(0, rect.left - current.right);
+    } else if (direction === "up") {
+      valid = rect.top < current.top - 4;
+      primaryGap = Math.max(0, current.top - rect.bottom);
+    } else {
+      valid = rect.bottom > current.bottom + 4;
+      primaryGap = Math.max(0, rect.top - current.bottom);
+    }
+    if (!valid) continue;
+
+    const crossDistance = rectCrossDistance(current, rect, direction);
+    const rank: [number, number, number] = [
+      crossDistance === 0 ? 0 : 1,
+      primaryGap,
+      crossDistance,
+    ];
+    if (
+      !bestRank ||
+      rank[0] < bestRank[0] ||
+      (rank[0] === bestRank[0] && rank[1] < bestRank[1]) ||
+      (rank[0] === bestRank[0] && rank[1] === bestRank[1] && rank[2] < bestRank[2])
+    ) {
+      bestRank = rank;
+      bestKey = key;
+    }
+  }
+
+  return bestKey;
 }
 
 type TreeFolder = {
@@ -506,6 +701,8 @@ export default function App() {
     return stored === "search" || stored === "agents" ? stored : "files";
   });
   const [agentTicket, setAgentTicket] = useState<string | null>(null);
+  const [leaderArmed, setLeaderArmed] = useState(false);
+  const [fleetChooser, setFleetChooser] = useState<FleetChooserMode | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   useEffect(() => {
@@ -519,11 +716,25 @@ export default function App() {
   );
   const [draggingNotePath, setDraggingNotePath] = useState<string | null>(null);
   const [layout, setLayout] = useState<Layout>({ kind: "primary" });
+  const [focusedPaneId, setFocusedPaneId] = useState("primary");
+  const [zoomedPaneId, setZoomedPaneId] = useState<string | null>(null);
+  const [activeGroupId, setActiveGroupId] = useState<string | null>(
+    () => localStorage.getItem("wiki-active-orch-group")
+  );
   const [links, setLinks] = useState<Record<string, NoteLinks>>({});
+  const [agentsState, setAgentsState] = useState<AgentsSnapshot>({
+    workers: null,
+    orchestrators: [],
+    archived: [],
+    error: null,
+  });
   const [refreshTick, setRefreshTick] = useState(0);
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [dialog, setDialog] = useState<DialogState | null>(null);
   const paneIdRef = useRef(0);
+  const paneRefs = useRef(new Map<string, HTMLDivElement>());
+  const leaderTimerRef = useRef<number | null>(null);
+  const lastSelectedAgentRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (!contextMenu) return;
@@ -566,8 +777,49 @@ export default function App() {
   }, [sidebarVisible]);
 
   useEffect(() => {
+    if (activeGroupId) {
+      localStorage.setItem("wiki-active-orch-group", activeGroupId);
+    } else {
+      localStorage.removeItem("wiki-active-orch-group");
+    }
+  }, [activeGroupId]);
+
+  useEffect(() => {
     localStorage.setItem("wiki-collapsed-folders", JSON.stringify([...collapsedFolders]));
   }, [collapsedFolders]);
+
+  useEffect(() => {
+    let ignore = false;
+    getAgents()
+      .then((result) => {
+        if (ignore) return;
+        setAgentsState({
+          workers: result.workers,
+          orchestrators: result.orchestrators ?? [],
+          archived: result.archived ?? [],
+          error: null,
+        });
+      })
+      .catch((err) => {
+        if (ignore) return;
+        const message = err instanceof Error ? err.message : "Could not load agents";
+        setAgentsState((current) =>
+          current.workers === null
+            ? { workers: [], orchestrators: [], archived: [], error: message }
+            : { ...current, error: message }
+        );
+      });
+    return () => {
+      ignore = true;
+    };
+  }, [refreshTick]);
+
+  useEffect(
+    () => () => {
+      if (leaderTimerRef.current) window.clearTimeout(leaderTimerRef.current);
+    },
+    []
+  );
 
   useEffect(() => {
     viewContentRef.current?.scrollTo(0, 0);
@@ -610,6 +862,112 @@ export default function App() {
   }, []);
 
   const tree = useMemo(() => buildTree(notes), [notes]);
+  const paneInfos = useMemo(() => collectPaneInfos(layout), [layout]);
+  const paneMap = useMemo(() => new Map(paneInfos.map((pane) => [pane.key, pane])), [paneInfos]);
+  const fleetGroups = useMemo(
+    () => buildFleetGroups(agentsState.workers ?? [], agentsState.orchestrators),
+    [agentsState.orchestrators, agentsState.workers]
+  );
+  const primaryViewedAgentTicket = mode === "agent" ? agentTicket : mode === "agents" ? agentsOpenTicket : null;
+  const focusedPaneTicket =
+    focusedPaneId === "primary"
+      ? primaryViewedAgentTicket
+      : ticketFromPanePath(paneMap.get(focusedPaneId)?.path ?? null);
+  const currentViewedAgentTicket = focusedPaneTicket ?? primaryViewedAgentTicket ?? null;
+  const activeGroup =
+    fleetGroups.find((group) => group.orch.id === activeGroupId) ?? fleetGroups[0] ?? null;
+  const activeGroupTicket = useMemo(() => {
+    if (!activeGroup) return null;
+    const preferredTickets = [
+      currentViewedAgentTicket,
+      lastSelectedAgentRef.current,
+      activeGroup.orch.id,
+    ];
+    return (
+      preferredTickets.find((ticket) =>
+        activeGroup.items.some((item) => item.ticket === ticket)
+      ) ?? activeGroup.orch.id
+    );
+  }, [activeGroup, currentViewedAgentTicket]);
+  const activeGroupIndex = activeGroup
+    ? fleetGroups.findIndex((group) => group.orch.id === activeGroup.orch.id)
+    : -1;
+  const activeItemIndex =
+    activeGroup && activeGroupTicket
+      ? Math.max(0, activeGroup.items.findIndex((item) => item.ticket === activeGroupTicket))
+      : 0;
+  const modalOpen =
+    switcherOpen || settingsOpen || fleetChooser !== null || dialog !== null || contextMenu !== null;
+  const orchestratorChooserItems = useMemo(
+    () =>
+      fleetGroups.map((group) => ({
+        key: `orch:${group.orch.id}`,
+        value: group.orch.id,
+        icon: <Bot size={14} />,
+        label: group.orch.id,
+        meta: `${cwdBasename(group.orch.cwd)} · ${
+          group.orch.window_alive ? "live" : "dead"
+        } · ${group.items.length - 1} worker${group.items.length === 2 ? "" : "s"}`,
+        active: activeGroup?.orch.id === group.orch.id,
+      })),
+    [activeGroup, fleetGroups]
+  );
+  const fleetTreeItems = useMemo(
+    () =>
+      fleetGroups.flatMap((group) => [
+        {
+          key: `tree-orch:${group.orch.id}`,
+          value: group.orch.id,
+          icon: <Bot size={14} />,
+          label: group.orch.id,
+          meta: `${cwdBasename(group.orch.cwd)} · ${
+            group.orch.window_alive ? "live" : "dead"
+          } · ${group.items.length - 1} worker${group.items.length === 2 ? "" : "s"}`,
+          active: activeGroupTicket === group.orch.id,
+        },
+        ...group.items.slice(1).map((item) => ({
+          key: `tree-worker:${item.ticket}`,
+          value: item.ticket,
+          icon: <span className="fleet-switcher-glyph">{agentStateGlyph(item.state, item.live)}</span>,
+          label: item.ticket,
+          meta: `${item.state ?? "unknown"}${item.detail ? ` · ${item.detail}` : ""}`,
+          indent: 1,
+          active: activeGroupTicket === item.ticket,
+        })),
+      ]),
+    [activeGroupTicket, fleetGroups]
+  );
+
+  useEffect(() => {
+    if (!paneInfos.some((pane) => pane.key === focusedPaneId)) {
+      const fallback = paneInfos[0]?.key ?? "primary";
+      setFocusedPaneId(fallback);
+      requestAnimationFrame(() => paneRefs.current.get(fallback)?.focus());
+    }
+  }, [focusedPaneId, paneInfos]);
+
+  useEffect(() => {
+    if (zoomedPaneId && !paneInfos.some((pane) => pane.key === zoomedPaneId)) {
+      setZoomedPaneId(null);
+    }
+  }, [paneInfos, zoomedPaneId]);
+
+  useEffect(() => {
+    if (!fleetGroups.length) {
+      setActiveGroupId(null);
+      return;
+    }
+    if (!activeGroupId || !fleetGroups.some((group) => group.orch.id === activeGroupId)) {
+      setActiveGroupId(fleetGroups[0].orch.id);
+    }
+  }, [activeGroupId, fleetGroups]);
+
+  useEffect(() => {
+    if (!currentViewedAgentTicket) return;
+    lastSelectedAgentRef.current = currentViewedAgentTicket;
+    const group = findFleetGroup(fleetGroups, currentViewedAgentTicket);
+    if (group && group.orch.id !== activeGroupId) setActiveGroupId(group.orch.id);
+  }, [activeGroupId, currentViewedAgentTicket, fleetGroups]);
 
   const [searchResults, setSearchResults] = useState<NoteSummary[]>([]);
 
@@ -674,6 +1032,71 @@ export default function App() {
     setActiveNote(null);
     setAgentTicket(ticket);
     setMode("agent");
+  }
+
+  function registerPaneRef(key: string, node: HTMLDivElement | null) {
+    if (node) paneRefs.current.set(key, node);
+    else paneRefs.current.delete(key);
+  }
+
+  function focusPane(key: string) {
+    setFocusedPaneId(key);
+    requestAnimationFrame(() => paneRefs.current.get(key)?.focus());
+  }
+
+  function disarmLeader() {
+    if (leaderTimerRef.current) {
+      window.clearTimeout(leaderTimerRef.current);
+      leaderTimerRef.current = null;
+    }
+    setLeaderArmed(false);
+  }
+
+  function armLeader() {
+    if (leaderTimerRef.current) window.clearTimeout(leaderTimerRef.current);
+    setLeaderArmed(true);
+    leaderTimerRef.current = window.setTimeout(() => {
+      leaderTimerRef.current = null;
+      setLeaderArmed(false);
+    }, 1500);
+  }
+
+  function openAgentInContext(ticket: string) {
+    lastSelectedAgentRef.current = ticket;
+    const group = findFleetGroup(fleetGroups, ticket);
+    if (group && group.orch.id !== activeGroupId) setActiveGroupId(group.orch.id);
+
+    const pane = paneMap.get(focusedPaneId);
+    const targetPaneId =
+      focusedPaneId !== "primary" && ticketFromPanePath(pane?.path ?? null)
+        ? focusedPaneId
+        : "primary";
+
+    if (zoomedPaneId && zoomedPaneId !== targetPaneId) setZoomedPaneId(null);
+
+    if (targetPaneId === "primary") {
+      openAgent(ticket);
+      focusPane("primary");
+      return;
+    }
+
+    setLayout((current) => replaceNotePane(current, targetPaneId, `agent://${ticket}`));
+    focusPane(targetPaneId);
+  }
+
+  function movePaneFocus(direction: Direction) {
+    const rects = new Map(
+      [...paneRefs.current.entries()].map(([key, element]) => [key, element.getBoundingClientRect()])
+    );
+    const nextPane = pickNeighborPane(rects, focusedPaneId, direction);
+    if (nextPane) focusPane(nextPane);
+  }
+
+  function closeFocusedPane() {
+    if (focusedPaneId === "primary") return;
+    const target = focusedPaneId;
+    if (zoomedPaneId === target) setZoomedPaneId(null);
+    setLayout((current) => closeNotePane(current, target) ?? { kind: "primary" });
   }
 
   function startNewNote() {
@@ -943,10 +1366,95 @@ export default function App() {
 
   useEffect(() => {
     function onKeyDown(event: globalThis.KeyboardEvent) {
-      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+      if (event.defaultPrevented) return;
+
+      const key = event.key;
+      const lowerKey = key.toLowerCase();
+
+      if (leaderArmed) {
+        if (["Shift", "Control", "Alt", "Meta"].includes(key)) return;
+        event.preventDefault();
+        disarmLeader();
+
+        if (key === "Escape") return;
+
+        if (activeGroup && (lowerKey === "n" || lowerKey === "p")) {
+          const delta = lowerKey === "n" ? 1 : -1;
+          const nextIndex =
+            (activeItemIndex + delta + activeGroup.items.length) % activeGroup.items.length;
+          openAgentInContext(activeGroup.items[nextIndex].ticket);
+          return;
+        }
+
+        if (activeGroup && /^\d$/.test(key)) {
+          const target = activeGroup.items[Number(key)];
+          if (target) openAgentInContext(target.ticket);
+          return;
+        }
+
+        if (fleetGroups.length > 0 && (key === "(" || key === ")")) {
+          const delta = key === ")" ? 1 : -1;
+          const nextIndex =
+            activeGroupIndex >= 0
+              ? (activeGroupIndex + delta + fleetGroups.length) % fleetGroups.length
+              : 0;
+          openAgentInContext(fleetGroups[nextIndex].orch.id);
+          return;
+        }
+
+        if (lowerKey === "s") {
+          setFleetChooser("orchestrators");
+          return;
+        }
+
+        if (lowerKey === "w") {
+          setFleetChooser("tree");
+          return;
+        }
+
+        if (lowerKey === "h") {
+          movePaneFocus("left");
+          return;
+        }
+        if (lowerKey === "j") {
+          movePaneFocus("down");
+          return;
+        }
+        if (lowerKey === "k") {
+          movePaneFocus("up");
+          return;
+        }
+        if (lowerKey === "l") {
+          movePaneFocus("right");
+          return;
+        }
+
+        if (lowerKey === "x") {
+          closeFocusedPane();
+          return;
+        }
+
+        if (lowerKey === "z") {
+          setZoomedPaneId((current) => (current === focusedPaneId ? null : focusedPaneId));
+          focusPane(focusedPaneId);
+          return;
+        }
+
+        if (key === ",") {
+          setSettingsOpen(true);
+        }
+        return;
+      }
+
+      if (modalOpen) return;
+
+      if (event.ctrlKey && !event.metaKey && lowerKey === "a" && !isEditableTarget(event.target)) {
+        event.preventDefault();
+        armLeader();
+      } else if ((event.metaKey || event.ctrlKey) && lowerKey === "k") {
         event.preventDefault();
         setSwitcherOpen((open) => !open);
-      } else if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "b") {
+      } else if ((event.metaKey || event.ctrlKey) && lowerKey === "b") {
         event.preventDefault();
         setSidebarVisible((visible) => !visible);
       }
@@ -954,7 +1462,19 @@ export default function App() {
 
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, []);
+  }, [
+    activeGroup,
+    activeGroupIndex,
+    activeItemIndex,
+    closeFocusedPane,
+    disarmLeader,
+    fleetGroups,
+    focusedPaneId,
+    leaderArmed,
+    modalOpen,
+    movePaneFocus,
+    openAgentInContext,
+  ]);
 
   const isEditorMode = mode === "edit" || mode === "new";
 
@@ -1059,8 +1579,10 @@ export default function App() {
         } else {
           openNote(path);
         }
+        focusPane("primary");
       } else {
         setLayout((current) => replaceNotePane(current, targetKey, path));
+        focusPane(targetKey);
       }
       return;
     }
@@ -1068,9 +1590,33 @@ export default function App() {
     paneIdRef.current += 1;
     const newPane: Layout = { kind: "note", id: `pane-${paneIdRef.current}`, path };
     setLayout((current) => splitLayout(current, targetKey, zone, newPane));
+    focusPane(newPane.id);
+  }
+
+  function renderPaneFrame(key: string, child: ReactNode) {
+    return (
+      <div
+        className={`pane-frame${focusedPaneId === key ? " is-focused" : ""}`}
+        ref={(node) => registerPaneRef(key, node)}
+        tabIndex={-1}
+        onFocusCapture={() => setFocusedPaneId(key)}
+        onMouseDownCapture={() => setFocusedPaneId(key)}
+      >
+        {child}
+      </div>
+    );
   }
 
   function renderLayout(node: Layout, primaryContent: ReactNode, path: number[]): ReactNode {
+    if (zoomedPaneId && node.kind === "split") {
+      if (layoutContains(node.first, zoomedPaneId)) {
+        return renderLayout(node.first, primaryContent, [...path, 1]);
+      }
+      if (layoutContains(node.second, zoomedPaneId)) {
+        return renderLayout(node.second, primaryContent, [...path, 2]);
+      }
+    }
+
     if (node.kind === "primary") {
       return (
         <PaneDropTarget
@@ -1078,7 +1624,7 @@ export default function App() {
           key="primary"
           onDropZone={(zone) => handlePaneDrop("primary", zone)}
         >
-          {primaryContent}
+          {renderPaneFrame("primary", primaryContent)}
         </PaneDropTarget>
       );
     }
@@ -1089,15 +1635,18 @@ export default function App() {
           key={node.id}
           onDropZone={(zone) => handlePaneDrop(node.id, zone)}
         >
-          <SecondaryPane
-            notes={notes}
-            path={node.path}
-            refreshTick={refreshTick}
-            onClose={() =>
-              setLayout((current) => closeNotePane(current, node.id) ?? { kind: "primary" })
-            }
-            onOpenNote={openNote}
-          />
+          {renderPaneFrame(
+            node.id,
+            <SecondaryPane
+              notes={notes}
+              path={node.path}
+              refreshTick={refreshTick}
+              onClose={() =>
+                setLayout((current) => closeNotePane(current, node.id) ?? { kind: "primary" })
+              }
+              onOpenNote={openNote}
+            />
+          )}
         </PaneDropTarget>
       );
     }
@@ -1301,6 +1850,7 @@ export default function App() {
         ) : (
           <AgentsSidebar
             activeTicket={mode === "agent" ? agentTicket : null}
+            data={agentsState}
             refreshTick={refreshTick}
             onDragEnd={() => setDraggingNotePath(null)}
             onDragStart={(ticket) => setDraggingNotePath(`agent://${ticket}`)}
@@ -1384,6 +1934,7 @@ export default function App() {
             <AgentSessionView key={agentTicket} refreshTick={refreshTick} ticket={agentTicket} />
           ) : mode === "agents" ? (
             <AgentsView
+              data={agentsState}
               refreshTick={refreshTick}
               openTicket={agentsOpenTicket}
               onOpenTicket={setAgentsOpenTicket}
@@ -1512,12 +2063,56 @@ export default function App() {
           )}
         </div>
 
-        {mode === "view" || mode === "edit" || mode === "new" ? (
-          <div className="status-bar">
-            <span>{status.words} words</span>
-            <span>{status.characters} characters</span>
+        <div className="status-bar">
+          <div className="tmux-status">
+            <div className="tmux-group-list">
+              {fleetGroups.map((group) => (
+                <button
+                  className={`tmux-group-button${
+                    activeGroup?.orch.id === group.orch.id ? " is-active" : ""
+                  }`}
+                  key={group.orch.id}
+                  type="button"
+                  onClick={() => {
+                    setActiveGroupId(group.orch.id);
+                    openAgentInContext(group.orch.id);
+                  }}
+                >
+                  {group.orch.id}
+                </button>
+              ))}
+            </div>
+            {activeGroup ? (
+              <div className="tmux-group-items">
+                {activeGroup.items.map((item, index) => (
+                  <button
+                    className={`tmux-status-item${
+                      activeGroupTicket === item.ticket ? " is-active" : ""
+                    }`}
+                    key={item.ticket}
+                    type="button"
+                    onClick={() => openAgentInContext(item.ticket)}
+                  >
+                    <span className="tmux-status-index">{index}</span>
+                    <span className="tmux-status-sep">:</span>
+                    <span className="tmux-status-label">{item.label}</span>
+                    <span className="tmux-status-glyph">
+                      {agentStateGlyph(item.state, item.live)}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <div className="tmux-group-empty">{agentsState.error ?? "No orchestrators"}</div>
+            )}
           </div>
-        ) : null}
+          {mode === "view" || mode === "edit" || mode === "new" ? (
+            <div className="status-bar-metrics">
+              <span>{status.words} words</span>
+              <span>{status.characters} characters</span>
+            </div>
+          ) : null}
+        </div>
       </main>
 
       {contextMenu ? (
@@ -1583,6 +2178,18 @@ export default function App() {
           }}
         />
       ) : null}
+      {fleetChooser ? (
+        <FleetSwitcher
+          items={fleetChooser === "orchestrators" ? orchestratorChooserItems : fleetTreeItems}
+          title={fleetChooser === "orchestrators" ? "Choose orchestrator" : "Choose agent run"}
+          onClose={() => setFleetChooser(null)}
+          onPick={(item) => {
+            setFleetChooser(null);
+            openAgentInContext(item.value);
+          }}
+        />
+      ) : null}
+      {leaderArmed ? <div className="leader-indicator">C-a</div> : null}
     </div>
   );
 }

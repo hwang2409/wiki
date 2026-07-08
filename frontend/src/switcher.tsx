@@ -1,9 +1,19 @@
-import { useEffect, useMemo, useState } from "react";
-import type { KeyboardEvent } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { KeyboardEvent, ReactNode } from "react";
 import { Bot, FileText, HeartPulse, History, Waypoints } from "lucide-react";
 import type { NoteSummary } from "./types";
 
 export type SwitcherPage = "graph" | "activity" | "health" | "agents";
+
+export type FleetSwitcherItem = {
+  key: string;
+  value: string;
+  icon?: ReactNode;
+  label: string;
+  meta: string;
+  indent?: number;
+  active?: boolean;
+};
 
 type SwitcherItem =
   | { kind: "note"; note: NoteSummary }
@@ -170,6 +180,95 @@ export function QuickSwitcher({
             })
           ) : (
             <div className="quick-switcher-empty">No matches</div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function FleetSwitcher({
+  title,
+  items,
+  onClose,
+  onPick,
+}: {
+  title: string;
+  items: FleetSwitcherItem[];
+  onClose: () => void;
+  onPick: (item: FleetSwitcherItem) => void;
+}) {
+  const [selected, setSelected] = useState(0);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    rootRef.current?.focus();
+  }, []);
+
+  useEffect(() => {
+    const activeIndex = items.findIndex((item) => item.active);
+    setSelected(activeIndex >= 0 ? activeIndex : 0);
+  }, [items]);
+
+  function handleKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+    if (event.key === "ArrowDown" || event.key === "j") {
+      event.preventDefault();
+      setSelected((index) => (items.length === 0 ? 0 : (index + 1) % items.length));
+      return;
+    }
+    if (event.key === "ArrowUp" || event.key === "k") {
+      event.preventDefault();
+      setSelected((index) => (items.length === 0 ? 0 : (index - 1 + items.length) % items.length));
+      return;
+    }
+    if (event.key === "Enter") {
+      event.preventDefault();
+      const item = items[selected];
+      if (item) onPick(item);
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      onClose();
+    }
+  }
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div
+        aria-label={title}
+        className="quick-switcher fleet-switcher"
+        ref={rootRef}
+        role="dialog"
+        tabIndex={-1}
+        onClick={(event) => event.stopPropagation()}
+        onKeyDown={handleKeyDown}
+      >
+        <div className="fleet-switcher-head">
+          <span>{title}</span>
+          <span className="fleet-switcher-count">{items.length} items</span>
+        </div>
+        <div className="quick-switcher-results">
+          {items.length > 0 ? (
+            items.map((item, index) => (
+              <button
+                className={`quick-switcher-result fleet-switcher-result${
+                  index === selected ? " is-selected" : ""
+                }${item.active ? " is-current" : ""}`}
+                key={item.key}
+                style={{ paddingInlineStart: `${10 + (item.indent ?? 0) * 18}px` }}
+                type="button"
+                onClick={() => onPick(item)}
+                onMouseEnter={() => setSelected(index)}
+              >
+                <span className="fleet-switcher-icon">{item.icon ?? <span />}</span>
+                <span className="quick-switcher-name">{item.label}</span>
+                <span className="quick-switcher-path">{item.meta}</span>
+                {item.active ? <span className="fleet-switcher-current">active</span> : null}
+              </button>
+            ))
+          ) : (
+            <div className="quick-switcher-empty">No agents</div>
           )}
         </div>
       </div>
