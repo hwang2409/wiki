@@ -51,13 +51,11 @@ The agent monitor supports a tmux-style leader on `Ctrl+A`. The prefix only arms
 
 | Chord | Action |
 | --- | --- |
-| `C-a n` / `C-a p` | Next / previous agent run inside the active orchestrator group |
-| `C-a 0-9` | Jump by group-local slot: `0` = orchestrator, `1-9` = workers in registration order |
-| `C-a (` / `C-a )` | Previous / next orchestrator group |
-| `C-a s` | Open orchestrator chooser |
-| `C-a w` | Open global orchestrator + worker tree chooser |
-| `C-a h` / `j` / `k` / `l` | Move focus between split panes |
-| `C-a x` | Close the focused secondary pane |
+| `C-a j` / `C-a k` | Cycle pane focus inside the current tmux window |
+| `C-a h` / `C-a l` | Previous / next tmux window |
+| `C-a 0-9` | Jump to tmux window slot `0-9` |
+| `C-a w` | Open the run / open-note chooser and move the focused pane slot |
+| `C-a x` | Close the focused pane (`agent` panes solo out unless already solo) |
 | `C-a z` | Zoom/unzoom the focused pane |
 | `C-a ,` | Open settings |
 

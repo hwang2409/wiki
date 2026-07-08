@@ -1516,6 +1516,7 @@ body.is-resizing-panes {
 }
 
 .tmux-group-list,
+.tmux-window-list,
 .tmux-group-items,
 .status-bar-metrics {
   display: flex;
@@ -1525,12 +1526,14 @@ body.is-resizing-panes {
 }
 
 .tmux-group-list,
+.tmux-window-list,
 .tmux-group-items {
   overflow-x: auto;
   scrollbar-width: none;
 }
 
 .tmux-group-list::-webkit-scrollbar,
+.tmux-window-list::-webkit-scrollbar,
 .tmux-group-items::-webkit-scrollbar {
   display: none;
 }
@@ -1581,6 +1584,16 @@ body.is-resizing-panes {
 .tmux-group-empty {
   color: var(--text-faint);
   font-family: var(--font-monospace);
+}
+
+.fleet-switcher-result.is-disabled {
+  cursor: default;
+  opacity: 0.72;
+}
+
+.fleet-switcher-result.is-disabled:hover {
+  background-color: transparent;
+  color: inherit;
 }
 
 .status-bar-metrics {

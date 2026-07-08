@@ -32,7 +32,7 @@ import {
   updateNote
 } from "./api";
 import type { AgentWorker, ArchivedWorker, NoteLinks, Orchestrator } from "./api";
-import { FleetSwitcher, QuickSwitcher } from "./switcher";
+import { FleetSwitcher, QuickSwitcher, type FleetSwitcherItem } from "./switcher";
 import { SettingsModal, applyStoredMonoFont } from "./settings";
 import { ActivityFeed } from "./activity";
 import { AgentsSidebar, AgentsView, type AccountEvent } from "./agents";
@@ -69,18 +69,50 @@ type SplitPosition = "left" | "right" | "top" | "bottom";
 type DropZone = SplitPosition | "center";
 
 type Layout =
+  | { kind: "pane"; id: string; path: string }
+  | { kind: "split"; direction: "row" | "column"; ratio: number; first: Layout; second: Layout };
+
+type WorkspaceWindow = {
+  id: string;
+  layout: Layout;
+  focusedPaneId: string;
+};
+
+type WindowWorkspaceState = {
+  activeWindowId: string | null;
+  windows: WorkspaceWindow[];
+};
+
+type StoredWindowWorkspaceState = WindowWorkspaceState & {
+  version: 2;
+};
+
+type LegacyLayout =
   | { kind: "primary" }
   | { kind: "note"; id: string; path: string }
-  | { kind: "split"; direction: "row" | "column"; ratio: number; first: Layout; second: Layout };
+  | {
+      kind: "split";
+      direction: "row" | "column";
+      ratio: number;
+      first: LegacyLayout;
+      second: LegacyLayout;
+    };
+
+type LegacyStoredLayoutState = {
+  focusedPaneId?: string;
+  layout: LegacyLayout;
+  primaryPath?: string | null;
+  version?: 1;
+};
 
 type PaneInfo = {
   key: string;
-  kind: "primary" | "note";
-  path: string | null;
+  kind: "agent" | "note";
+  path: string;
+  ticket: string | null;
 };
 
-type Direction = "left" | "right" | "up" | "down";
-type FleetChooserMode = "orchestrators" | "tree";
+type WindowChooserKind = "agent" | "note";
 
 type AgentsSnapshot = {
   workers: AgentWorker[] | null;
@@ -107,14 +139,24 @@ type FleetGroup = {
   meta: string;
 };
 
+const WINDOWS_STORAGE_KEY = "wiki-window-layout-v2";
+const LEGACY_WINDOWS_STORAGE_KEY = "wiki-window-layout-v1";
+
+function isPanePath(path: unknown): path is string {
+  return typeof path === "string" && path.length > 0;
+}
+
+function isAgentPath(path: string): boolean {
+  return path.startsWith("agent://");
+}
+
 function splitLayout(
   node: Layout,
   targetKey: string,
   position: SplitPosition,
   newPane: Layout
 ): Layout {
-  const key = node.kind === "primary" ? "primary" : node.kind === "note" ? node.id : null;
-  if (key === targetKey) {
+  if (node.kind === "pane" && node.id === targetKey) {
     const direction = position === "left" || position === "right" ? "row" : "column";
     const newFirst = position === "left" || position === "top";
     return {
@@ -135,16 +177,27 @@ function splitLayout(
   return node;
 }
 
-function replaceNotePane(node: Layout, id: string, path: string): Layout {
-  if (node.kind === "note" && node.id === id) return { ...node, path };
+function replacePanePath(node: Layout, id: string, path: string): Layout {
+  if (node.kind === "pane" && node.id === id) return { ...node, path };
   if (node.kind === "split") {
     return {
       ...node,
-      first: replaceNotePane(node.first, id, path),
-      second: replaceNotePane(node.second, id, path)
+      first: replacePanePath(node.first, id, path),
+      second: replacePanePath(node.second, id, path)
     };
   }
   return node;
+}
+
+function replaceMatchingPanePaths(node: Layout, currentPath: string, nextPath: string): Layout {
+  if (node.kind === "pane") {
+    return node.path === currentPath ? { ...node, path: nextPath } : node;
+  }
+  return {
+    ...node,
+    first: replaceMatchingPanePaths(node.first, currentPath, nextPath),
+    second: replaceMatchingPanePaths(node.second, currentPath, nextPath),
+  };
 }
 
 function setSplitRatio(node: Layout, path: number[], ratio: number): Layout {
@@ -156,31 +209,45 @@ function setSplitRatio(node: Layout, path: number[], ratio: number): Layout {
     : { ...node, second: setSplitRatio(node.second, rest, ratio) };
 }
 
-function closeNotePane(node: Layout, id: string): Layout | null {
-  if (node.kind === "note" && node.id === id) return null;
-  if (node.kind === "split") {
-    const first = closeNotePane(node.first, id);
-    const second = closeNotePane(node.second, id);
-    if (first === null) return second;
-    if (second === null) return first;
-    return { ...node, first, second };
+function removePane(node: Layout, id: string): { layout: Layout | null; removedPath: string | null } {
+  if (node.kind === "pane" && node.id === id) {
+    return { layout: null, removedPath: node.path };
   }
-  return node;
+  if (node.kind === "split") {
+    const first = removePane(node.first, id);
+    const second = removePane(node.second, id);
+    if (first.layout === null) return { layout: second.layout, removedPath: first.removedPath };
+    if (second.layout === null) return { layout: first.layout, removedPath: second.removedPath };
+    return {
+      layout: { ...node, first: first.layout, second: second.layout },
+      removedPath: first.removedPath ?? second.removedPath
+    };
+  }
+  return { layout: node, removedPath: null };
+}
+
+function removePanePaths(node: Layout, predicate: (path: string) => boolean): Layout | null {
+  if (node.kind === "pane") return predicate(node.path) ? null : node;
+  const first = removePanePaths(node.first, predicate);
+  const second = removePanePaths(node.second, predicate);
+  if (first === null) return second;
+  if (second === null) return first;
+  return { ...node, first, second };
 }
 
 function layoutContains(node: Layout, key: string): boolean {
-  if (node.kind === "primary") return key === "primary";
-  if (node.kind === "note") return node.id === key;
+  if (node.kind === "pane") return node.id === key;
   return layoutContains(node.first, key) || layoutContains(node.second, key);
 }
 
 function collectPaneInfos(node: Layout, panes: PaneInfo[] = []): PaneInfo[] {
-  if (node.kind === "primary") {
-    panes.push({ key: "primary", kind: "primary", path: null });
-    return panes;
-  }
-  if (node.kind === "note") {
-    panes.push({ key: node.id, kind: "note", path: node.path });
+  if (node.kind === "pane") {
+    panes.push({
+      key: node.id,
+      kind: isAgentPath(node.path) ? "agent" : "note",
+      path: node.path,
+      ticket: ticketFromPanePath(node.path),
+    });
     return panes;
   }
   collectPaneInfos(node.first, panes);
@@ -189,9 +256,22 @@ function collectPaneInfos(node: Layout, panes: PaneInfo[] = []): PaneInfo[] {
 }
 
 function firstPaneKey(node: Layout): string {
-  if (node.kind === "primary") return "primary";
-  if (node.kind === "note") return node.id;
+  if (node.kind === "pane") return node.id;
   return firstPaneKey(node.first);
+}
+
+function findPaneInfo(node: Layout, key: string): PaneInfo | null {
+  if (node.kind === "pane") {
+    return node.id === key
+      ? {
+          key: node.id,
+          kind: isAgentPath(node.path) ? "agent" : "note",
+          path: node.path,
+          ticket: ticketFromPanePath(node.path),
+        }
+      : null;
+  }
+  return findPaneInfo(node.first, key) ?? findPaneInfo(node.second, key);
 }
 
 function ticketFromPanePath(path: string | null): string | null {
@@ -200,6 +280,138 @@ function ticketFromPanePath(path: string | null): string | null {
 
 function cwdBasename(path: string | null): string {
   return path ? path.split("/").slice(-1)[0] : "no cwd";
+}
+
+function paneLabel(path: string): string {
+  return ticketFromPanePath(path) ?? basename(path);
+}
+
+function windowLabel(window: WorkspaceWindow): string {
+  const panes = collectPaneInfos(window.layout);
+  if (panes.length === 0) return "empty";
+  const [first, ...rest] = panes;
+  return rest.length > 0 ? `${paneLabel(first.path)}+${rest.length}` : paneLabel(first.path);
+}
+
+function normalizeWindow(window: WorkspaceWindow, seenTickets: Set<string>): WorkspaceWindow | null {
+  function prune(node: Layout): Layout | null {
+    if (node.kind === "pane") {
+      if (!isPanePath(node.path)) return null;
+      const ticket = ticketFromPanePath(node.path);
+      if (ticket) {
+        if (seenTickets.has(ticket)) return null;
+        seenTickets.add(ticket);
+      }
+      return node;
+    }
+    const first = prune(node.first);
+    const second = prune(node.second);
+    if (first === null) return second;
+    if (second === null) return first;
+    return { ...node, first, second };
+  }
+
+  const layout = prune(window.layout);
+  if (!layout) return null;
+  const panes = collectPaneInfos(layout);
+  if (panes.length === 0) return null;
+  return {
+    id: window.id,
+    layout,
+    focusedPaneId: panes.some((pane) => pane.key === window.focusedPaneId)
+      ? window.focusedPaneId
+      : panes[0].key,
+  };
+}
+
+function normalizeWindowWorkspaceState(state: WindowWorkspaceState): WindowWorkspaceState {
+  const seenWindowIds = new Set<string>();
+  const seenTickets = new Set<string>();
+  const windows = state.windows
+    .filter((window): window is WorkspaceWindow => typeof window.id === "string" && window.id.length > 0)
+    .filter((window) => {
+      if (seenWindowIds.has(window.id)) return false;
+      seenWindowIds.add(window.id);
+      return true;
+    })
+    .map((window) => normalizeWindow(window, seenTickets))
+    .filter((window): window is WorkspaceWindow => window !== null);
+  const activeWindowId =
+    state.activeWindowId && windows.some((window) => window.id === state.activeWindowId)
+      ? state.activeWindowId
+      : windows[0]?.id ?? null;
+  return { activeWindowId, windows };
+}
+
+function createSoloWindow(windowId: string, paneId: string, path: string): WorkspaceWindow {
+  return {
+    id: windowId,
+    layout: { kind: "pane", id: paneId, path },
+    focusedPaneId: paneId,
+  };
+}
+
+function convertLegacyLayout(node: LegacyLayout, primaryPath: string | null): Layout | null {
+  if (node.kind === "primary") {
+    return primaryPath ? { kind: "pane", id: "primary", path: primaryPath } : null;
+  }
+  if (node.kind === "note") {
+    return isPanePath(node.path) ? { kind: "pane", id: node.id, path: node.path } : null;
+  }
+  const first = convertLegacyLayout(node.first, primaryPath);
+  const second = convertLegacyLayout(node.second, primaryPath);
+  if (first === null) return second;
+  if (second === null) return first;
+  return { ...node, first, second };
+}
+
+function readStoredWindowWorkspaceState(): WindowWorkspaceState {
+  try {
+    const raw = localStorage.getItem(WINDOWS_STORAGE_KEY);
+    if (raw) {
+      const parsed: unknown = JSON.parse(raw);
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        (parsed as { version?: number }).version === 2 &&
+        Array.isArray((parsed as StoredWindowWorkspaceState).windows)
+      ) {
+        return normalizeWindowWorkspaceState(parsed as StoredWindowWorkspaceState);
+      }
+    }
+  } catch {
+    // Corrupt state falls through to legacy or default boot.
+  }
+
+  try {
+    const raw = localStorage.getItem(LEGACY_WINDOWS_STORAGE_KEY);
+    if (raw) {
+      const parsed: unknown = JSON.parse(raw);
+      if (parsed && typeof parsed === "object" && "layout" in parsed) {
+        const legacy = parsed as LegacyStoredLayoutState;
+        const primaryPath = isPanePath(legacy.primaryPath) ? legacy.primaryPath : null;
+        const layout = convertLegacyLayout(legacy.layout, primaryPath);
+        if (layout) {
+          localStorage.removeItem(LEGACY_WINDOWS_STORAGE_KEY);
+          return normalizeWindowWorkspaceState({
+            activeWindowId: "window-0",
+            windows: [
+              {
+                id: "window-0",
+                layout,
+                focusedPaneId:
+                  typeof legacy.focusedPaneId === "string" ? legacy.focusedPaneId : firstPaneKey(layout),
+              },
+            ],
+          });
+        }
+      }
+    }
+  } catch {
+    // Legacy migration failures fall back to boot derivation.
+  }
+
+  return { activeWindowId: null, windows: [] };
 }
 
 function buildAgentSessionWorker(
@@ -311,72 +523,6 @@ function isEditableTarget(target: EventTarget | null): boolean {
     return true;
   }
   return target.isContentEditable || target.closest("[contenteditable='true']") !== null;
-}
-
-function rectCrossDistance(current: DOMRect, candidate: DOMRect, direction: Direction): number {
-  if (direction === "left" || direction === "right") {
-    const overlap = Math.min(current.bottom, candidate.bottom) - Math.max(current.top, candidate.top);
-    if (overlap > 0) return 0;
-    const currentMid = current.top + current.height / 2;
-    const candidateMid = candidate.top + candidate.height / 2;
-    return Math.abs(currentMid - candidateMid);
-  }
-  const overlap = Math.min(current.right, candidate.right) - Math.max(current.left, candidate.left);
-  if (overlap > 0) return 0;
-  const currentMid = current.left + current.width / 2;
-  const candidateMid = candidate.left + candidate.width / 2;
-  return Math.abs(currentMid - candidateMid);
-}
-
-function pickNeighborPane(
-  panes: Map<string, DOMRect>,
-  fromKey: string,
-  direction: Direction
-): string | null {
-  const current = panes.get(fromKey);
-  if (!current) return null;
-
-  let bestKey: string | null = null;
-  let bestRank: [number, number, number] | null = null;
-
-  for (const [key, rect] of panes) {
-    if (key === fromKey || rect.width === 0 || rect.height === 0) continue;
-
-    let valid = false;
-    let primaryGap = 0;
-    if (direction === "left") {
-      valid = rect.left < current.left - 4;
-      primaryGap = Math.max(0, current.left - rect.right);
-    } else if (direction === "right") {
-      valid = rect.right > current.right + 4;
-      primaryGap = Math.max(0, rect.left - current.right);
-    } else if (direction === "up") {
-      valid = rect.top < current.top - 4;
-      primaryGap = Math.max(0, current.top - rect.bottom);
-    } else {
-      valid = rect.bottom > current.bottom + 4;
-      primaryGap = Math.max(0, rect.top - current.bottom);
-    }
-    if (!valid) continue;
-
-    const crossDistance = rectCrossDistance(current, rect, direction);
-    const rank: [number, number, number] = [
-      crossDistance === 0 ? 0 : 1,
-      primaryGap,
-      crossDistance,
-    ];
-    if (
-      !bestRank ||
-      rank[0] < bestRank[0] ||
-      (rank[0] === bestRank[0] && rank[1] < bestRank[1]) ||
-      (rank[0] === bestRank[0] && rank[1] === bestRank[1] && rank[2] < bestRank[2])
-    ) {
-      bestRank = rank;
-      bestKey = key;
-    }
-  }
-
-  return bestKey;
 }
 
 type TreeFolder = {
@@ -761,7 +907,7 @@ export default function App() {
   const [agentTicket, setAgentTicket] = useState<string | null>(null);
   const [agentPanel, setAgentPanel] = useState<AgentRoutePanel>(null);
   const [leaderArmed, setLeaderArmed] = useState(false);
-  const [fleetChooser, setFleetChooser] = useState<FleetChooserMode | null>(null);
+  const [windowChooserOpen, setWindowChooserOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   useEffect(() => {
@@ -774,12 +920,8 @@ export default function App() {
     () => localStorage.getItem("wiki-sidebar-visible") !== "false"
   );
   const [draggingNotePath, setDraggingNotePath] = useState<string | null>(null);
-  const [layout, setLayout] = useState<Layout>({ kind: "primary" });
-  const [focusedPaneId, setFocusedPaneId] = useState("primary");
+  const [windowState, setWindowState] = useState<WindowWorkspaceState>(readStoredWindowWorkspaceState);
   const [zoomedPaneId, setZoomedPaneId] = useState<string | null>(null);
-  const [activeGroupId, setActiveGroupId] = useState<string | null>(
-    () => localStorage.getItem("wiki-active-orch-group")
-  );
   const [links, setLinks] = useState<Record<string, NoteLinks>>({});
   const [agentsState, setAgentsState] = useState<AgentsSnapshot>({
     workers: null,
@@ -791,9 +933,26 @@ export default function App() {
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [dialog, setDialog] = useState<DialogState | null>(null);
   const paneIdRef = useRef(0);
+  const windowIdRef = useRef(0);
   const paneRefs = useRef(new Map<string, HTMLDivElement>());
   const leaderTimerRef = useRef<number | null>(null);
-  const lastSelectedAgentRef = useRef<string | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSaving, setIsSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [theme, setTheme] = useState<ThemeId>(() => getStoredTheme());
+  const [agentsOpenTicket, setAgentsOpenTicket] = useState<string | null>(null);
+  const viewContentRef = useRef<HTMLDivElement | null>(null);
+  const appliedHashRef = useRef<string | null>(null);
+
+  function nextPaneId() {
+    paneIdRef.current += 1;
+    return `pane-${paneIdRef.current}`;
+  }
+
+  function nextWindowId() {
+    windowIdRef.current += 1;
+    return `window-${windowIdRef.current}`;
+  }
 
   useEffect(() => {
     if (!contextMenu) return;
@@ -831,15 +990,6 @@ export default function App() {
     };
     return () => source.close();
   }, []);
-  const [isLoading, setIsLoading] = useState(true);
-  const [isSaving, setIsSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [theme, setTheme] = useState<ThemeId>(() => getStoredTheme());
-  // Lifted out of AgentsView: pane splits remount the view, sidebar must survive.
-  const [agentsOpenTicket, setAgentsOpenTicket] = useState<string | null>(null);
-  const viewContentRef = useRef<HTMLDivElement | null>(null);
-
-  const appliedHashRef = useRef<string | null>(null);
 
   useEffect(() => {
     applyTheme(theme);
@@ -854,16 +1004,15 @@ export default function App() {
   }, [sidebarVisible]);
 
   useEffect(() => {
-    if (activeGroupId) {
-      localStorage.setItem("wiki-active-orch-group", activeGroupId);
-    } else {
-      localStorage.removeItem("wiki-active-orch-group");
-    }
-  }, [activeGroupId]);
-
-  useEffect(() => {
     localStorage.setItem("wiki-collapsed-folders", JSON.stringify([...collapsedFolders]));
   }, [collapsedFolders]);
+
+  useEffect(() => {
+    localStorage.setItem(
+      WINDOWS_STORAGE_KEY,
+      JSON.stringify({ version: 2, ...windowState } satisfies StoredWindowWorkspaceState)
+    );
+  }, [windowState]);
 
   useEffect(() => {
     let ignore = false;
@@ -938,9 +1087,59 @@ export default function App() {
     };
   }, []);
 
+  useEffect(() => {
+    for (const window of windowState.windows) {
+      const windowMatch = window.id.match(/^window-(\d+)$/);
+      if (windowMatch) windowIdRef.current = Math.max(windowIdRef.current, Number(windowMatch[1]));
+      for (const pane of collectPaneInfos(window.layout)) {
+        const paneMatch = pane.key.match(/^pane-(\d+)$/);
+        if (paneMatch) paneIdRef.current = Math.max(paneIdRef.current, Number(paneMatch[1]));
+      }
+    }
+  }, [windowState]);
+
+  useEffect(() => {
+    const liveWorkers = agentsState.workers;
+    if (liveWorkers === null) return;
+    setWindowState((current) => {
+      const openTickets = new Set(
+        current.windows.flatMap((window) =>
+          collectPaneInfos(window.layout)
+            .map((pane) => pane.ticket)
+            .filter((ticket): ticket is string => ticket !== null)
+        )
+      );
+      const missing = liveWorkers.filter((worker) => !openTickets.has(worker.ticket));
+      if (missing.length === 0) return current;
+      const next = { ...current, windows: [...current.windows] };
+      for (const worker of missing) {
+        next.windows.push(createSoloWindow(nextWindowId(), nextPaneId(), `agent://${worker.ticket}`));
+      }
+      if (!next.activeWindowId) next.activeWindowId = next.windows[0]?.id ?? null;
+      return normalizeWindowWorkspaceState(next);
+    });
+  }, [agentsState.workers]);
+
   const tree = useMemo(() => buildTree(notes), [notes]);
-  const paneInfos = useMemo(() => collectPaneInfos(layout), [layout]);
+  const activeWindow = useMemo(
+    () =>
+      windowState.windows.find((window) => window.id === windowState.activeWindowId) ??
+      windowState.windows[0] ??
+      null,
+    [windowState]
+  );
+  const activeWindowIndex = activeWindow
+    ? windowState.windows.findIndex((window) => window.id === activeWindow.id)
+    : -1;
+  const paneInfos = useMemo(
+    () => (activeWindow ? collectPaneInfos(activeWindow.layout) : []),
+    [activeWindow]
+  );
   const paneMap = useMemo(() => new Map(paneInfos.map((pane) => [pane.key, pane])), [paneInfos]);
+  const focusedPaneId = activeWindow?.focusedPaneId ?? null;
+  const focusedPane = focusedPaneId ? paneMap.get(focusedPaneId) ?? null : null;
+  const focusedPanePath = focusedPane?.path ?? null;
+  const focusedPaneTicket = focusedPane?.ticket ?? null;
   const agentWorkers = useMemo(() => {
     const map = new Map<string, AgentSessionSurfaceWorker>();
     for (const worker of agentsState.workers ?? []) {
@@ -956,77 +1155,87 @@ export default function App() {
     [agentsState.orchestrators, agentsState.workers]
   );
   const activeAgentWorker = agentTicket ? agentWorkers.get(agentTicket) ?? { ticket: agentTicket } : null;
-  const primaryViewedAgentTicket = mode === "agent" ? agentTicket : mode === "agents" ? agentsOpenTicket : null;
-  const focusedPaneTicket =
-    focusedPaneId === "primary"
-      ? primaryViewedAgentTicket
-      : ticketFromPanePath(paneMap.get(focusedPaneId)?.path ?? null);
-  const currentViewedAgentTicket = focusedPaneTicket ?? primaryViewedAgentTicket ?? null;
-  const activeGroup =
-    fleetGroups.find((group) => group.orch.id === activeGroupId) ?? fleetGroups[0] ?? null;
-  const activeGroupTicket = useMemo(() => {
-    if (!activeGroup) return null;
-    const preferredTickets = [
-      currentViewedAgentTicket,
-      lastSelectedAgentRef.current,
-      activeGroup.entryTicket,
-    ];
-    return (
-      preferredTickets.find((ticket) =>
-        activeGroup.items.some((item) => item.ticket === ticket)
-      ) ?? activeGroup.entryTicket
-    );
-  }, [activeGroup, currentViewedAgentTicket]);
-  const activeGroupIndex = activeGroup
-    ? fleetGroups.findIndex((group) => group.orch.id === activeGroup.orch.id)
-    : -1;
-  const activeItemIndex =
-    activeGroup && activeGroupTicket
-      ? Math.max(0, activeGroup.items.findIndex((item) => item.ticket === activeGroupTicket))
-      : 0;
   const modalOpen =
-    switcherOpen || settingsOpen || fleetChooser !== null || dialog !== null || contextMenu !== null;
-  const orchestratorChooserItems = useMemo(
-    () =>
-      fleetGroups.filter((group) => group.chooserEligible).map((group) => ({
-        key: `orch:${group.orch.id}`,
+    switcherOpen || settingsOpen || windowChooserOpen || dialog !== null || contextMenu !== null;
+  const windowChooserItems = useMemo(() => {
+    const agentLocations = new Map<string, { windowId: string; paneId: string }>();
+    for (const window of windowState.windows) {
+      for (const pane of collectPaneInfos(window.layout)) {
+        if (pane.ticket) agentLocations.set(pane.ticket, { windowId: window.id, paneId: pane.key });
+      }
+    }
+
+    const items: FleetSwitcherItem[] = [];
+    for (const group of fleetGroups) {
+      const workers = group.items.filter((item) => item.kind === "worker");
+      if (workers.length === 0) continue;
+      items.push({
+        key: `heading:${group.orch.id}`,
         value: group.orch.id,
         icon: <Bot size={14} />,
         label: group.orch.id,
         meta: group.meta,
-        active: activeGroup?.orch.id === group.orch.id,
-      })),
-    [activeGroup, fleetGroups]
-  );
-  const fleetTreeItems = useMemo(
-    () =>
-      fleetGroups.flatMap((group) => [
-        {
-          key: `tree-orch:${group.orch.id}`,
-          value: group.entryTicket,
-          icon: <Bot size={14} />,
-          label: group.orch.id,
-          meta: group.meta,
-          active: activeGroupTicket === group.entryTicket,
-        },
-        ...group.items.slice(group.chooserEligible ? 1 : 0).map((item) => ({
-          key: `tree-worker:${item.ticket}`,
-          value: item.ticket,
-          icon: <span className="fleet-switcher-glyph">{agentStateGlyph(item.state, item.live)}</span>,
-          label: item.ticket,
-          meta: `${item.state ?? "unknown"}${item.detail ? ` · ${item.detail}` : ""}`,
+        disabled: true,
+      });
+      for (const worker of workers) {
+        const location = agentLocations.get(worker.ticket);
+        const sourceWindow =
+          location ? windowState.windows.find((window) => window.id === location.windowId) ?? null : null;
+        items.push({
+          key: `agent:${worker.ticket}`,
+          value: worker.ticket,
+          icon: <span className="fleet-switcher-glyph">{agentStateGlyph(worker.state, worker.live)}</span>,
+          label: worker.ticket,
+          meta: `${sourceWindow ? windowLabel(sourceWindow) : "not open"}${
+            worker.detail ? ` · ${worker.detail}` : ""
+          }`,
           indent: 1,
-          active: activeGroupTicket === item.ticket,
-        })),
-      ]),
-    [activeGroupTicket, fleetGroups]
-  );
+          active: focusedPaneTicket === worker.ticket,
+          chooserKind: "agent",
+          path: `agent://${worker.ticket}`,
+          windowId: location?.windowId ?? null,
+          paneId: location?.paneId ?? null,
+        });
+      }
+    }
+
+    const openNotes = windowState.windows.flatMap((window, index) =>
+      collectPaneInfos(window.layout)
+        .filter((pane) => pane.kind === "note")
+        .map((pane) => ({ index, pane, window }))
+    );
+    if (openNotes.length > 0) {
+      items.push({
+        key: "heading:notes",
+        value: "notes",
+        icon: <BookOpen size={14} />,
+        label: "open notes",
+        meta: `${openNotes.length} panes`,
+        disabled: true,
+      });
+      for (const { index, pane, window } of openNotes) {
+        items.push({
+          key: `note:${window.id}:${pane.key}`,
+          value: pane.path,
+          icon: <BookOpen size={14} />,
+          label: basename(pane.path),
+          meta: `${index}:${windowLabel(window)} · ${pane.path}`,
+          indent: 1,
+          active: activeWindow?.id === window.id && focusedPaneId === pane.key,
+          chooserKind: "note",
+          path: pane.path,
+          windowId: window.id,
+          paneId: pane.key,
+        });
+      }
+    }
+    return items;
+  }, [activeWindow, fleetGroups, focusedPaneId, focusedPaneTicket, windowState.windows]);
 
   useEffect(() => {
-    if (!paneInfos.some((pane) => pane.key === focusedPaneId)) {
-      const fallback = paneInfos[0]?.key ?? "primary";
-      setFocusedPaneId(fallback);
-      requestAnimationFrame(() => paneRefs.current.get(fallback)?.focus());
+    if (!focusedPaneId || !paneInfos.some((pane) => pane.key === focusedPaneId)) {
+      const fallback = paneInfos[0]?.key ?? null;
+      if (fallback) requestAnimationFrame(() => paneRefs.current.get(fallback)?.focus());
     }
   }, [focusedPaneId, paneInfos]);
 
@@ -1035,23 +1244,6 @@ export default function App() {
       setZoomedPaneId(null);
     }
   }, [paneInfos, zoomedPaneId]);
-
-  useEffect(() => {
-    if (!fleetGroups.length) {
-      setActiveGroupId(null);
-      return;
-    }
-    if (!activeGroupId || !fleetGroups.some((group) => group.orch.id === activeGroupId)) {
-      setActiveGroupId(fleetGroups[0].orch.id);
-    }
-  }, [activeGroupId, fleetGroups]);
-
-  useEffect(() => {
-    if (!currentViewedAgentTicket) return;
-    lastSelectedAgentRef.current = currentViewedAgentTicket;
-    const group = findFleetGroup(fleetGroups, currentViewedAgentTicket);
-    if (group && group.orch.id !== activeGroupId) setActiveGroupId(group.orch.id);
-  }, [activeGroupId, currentViewedAgentTicket, fleetGroups]);
 
   const [searchResults, setSearchResults] = useState<NoteSummary[]>([]);
 
@@ -1091,29 +1283,175 @@ export default function App() {
     if (window.location.hash !== hash) window.location.hash = hash;
   }
 
-  async function openNote(path: string) {
-    navigate({ kind: "note", path });
+  function findPaneLocationByTicket(ticket: string) {
+    for (const window of windowState.windows) {
+      const pane = collectPaneInfos(window.layout).find((candidate) => candidate.ticket === ticket);
+      if (pane) return { pane, window };
+    }
+    return null;
+  }
+
+  function findPaneLocationByPath(path: string, preferredWindowId?: string | null) {
+    const windows =
+      preferredWindowId && windowState.windows.some((window) => window.id === preferredWindowId)
+        ? [
+            ...windowState.windows.filter((window) => window.id === preferredWindowId),
+            ...windowState.windows.filter((window) => window.id !== preferredWindowId),
+          ]
+        : windowState.windows;
+    for (const window of windows) {
+      const pane = collectPaneInfos(window.layout).find((candidate) => candidate.path === path);
+      if (pane) return { pane, window };
+    }
+    return null;
+  }
+
+  function focusWindowPane(windowId: string, paneId: string) {
+    setWindowState((current) =>
+      normalizeWindowWorkspaceState({
+        ...current,
+        activeWindowId: windowId,
+        windows: current.windows.map((window) =>
+          window.id === windowId ? { ...window, focusedPaneId: paneId } : window
+        ),
+      })
+    );
+    requestAnimationFrame(() => paneRefs.current.get(paneId)?.focus());
+  }
+
+  function syncRouteToPath(path: string | null, options?: { panel?: AgentRoutePanel; syncHash?: boolean }) {
+    const syncHash = options?.syncHash ?? true;
+    if (!path) {
+      if (syncHash) navigate({ kind: "empty" });
+      setError(null);
+      setActiveNote(null);
+      setAgentPanel(null);
+      setAgentTicket(null);
+      setMode("empty");
+      return;
+    }
+    const ticket = ticketFromPanePath(path);
+    if (ticket) {
+      if (syncHash) navigate({ kind: "agent", panel: options?.panel ?? null, ticket });
+      setError(null);
+      setActiveNote(null);
+      setAgentPanel(options?.panel ?? null);
+      setAgentTicket(ticket);
+      setMode("agent");
+      return;
+    }
+    void showNoteRoute(path, { syncHash });
+  }
+
+  function replaceFocusedPanePath(nextPath: string) {
+    if (activeWindow && focusedPaneId) {
+      const focused = findPaneInfo(activeWindow.layout, focusedPaneId);
+      if (focused && focused.path === nextPath) {
+        return { nextState: windowState, targetWindowId: activeWindow.id, targetPaneId: focusedPaneId };
+      }
+    }
+
+    if (!activeWindow || !focusedPaneId) {
+      const windowId = nextWindowId();
+      const paneId = nextPaneId();
+      const nextState = normalizeWindowWorkspaceState({
+        activeWindowId: windowId,
+        windows: [...windowState.windows, createSoloWindow(windowId, paneId, nextPath)],
+      });
+      return { nextState, targetWindowId: windowId, targetPaneId: paneId };
+    }
+
+    const focused = findPaneInfo(activeWindow.layout, focusedPaneId);
+    if (!focused) {
+      return { nextState: windowState, targetWindowId: activeWindow.id, targetPaneId: activeWindow.focusedPaneId };
+    }
+
+    const nextWindows = windowState.windows.map((window) => ({ ...window }));
+    const targetWindow = nextWindows.find((window) => window.id === activeWindow.id);
+    if (!targetWindow) {
+      return { nextState: windowState, targetWindowId: activeWindow.id, targetPaneId: focusedPaneId };
+    }
+    targetWindow.layout = replacePanePath(targetWindow.layout, focusedPaneId, nextPath);
+    if (focusedPaneId !== targetWindow.focusedPaneId) targetWindow.focusedPaneId = focusedPaneId;
+    if (focused.path !== nextPath && focused.ticket) {
+      nextWindows.push(createSoloWindow(nextWindowId(), nextPaneId(), focused.path));
+    }
+    const nextState = normalizeWindowWorkspaceState({
+      activeWindowId: targetWindow.id,
+      windows: nextWindows,
+    });
+    return { nextState, targetWindowId: targetWindow.id, targetPaneId: focusedPaneId };
+  }
+
+  async function showNoteRoute(
+    path: string,
+    options: { syncHash?: boolean; edit?: boolean } = {}
+  ) {
+    const { edit = false, syncHash = true } = options;
+    if (syncHash) navigate({ kind: edit ? "edit" : "note", path });
     setError(null);
+    setAgentTicket(null);
     setAgentPanel(null);
-    setMode("view");
     try {
       const note = await getNote(path);
       setActiveNote(note);
+      if (edit) {
+        setDraft({ title: note.title, path: note.path, content: note.content });
+        setMode("edit");
+      } else {
+        setMode("view");
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not open note");
     }
+  }
+
+  async function openNote(
+    path: string,
+    options: { focusExisting?: boolean; syncHash?: boolean; edit?: boolean } = {}
+  ) {
+    const { edit = false, focusExisting = true, syncHash = true } = options;
+    const existing = focusExisting ? findPaneLocationByPath(path, activeWindow?.id ?? null) : null;
+    if (existing) {
+      if (zoomedPaneId && zoomedPaneId !== existing.pane.key) setZoomedPaneId(null);
+      focusWindowPane(existing.window.id, existing.pane.key);
+    } else {
+      const replacement = replaceFocusedPanePath(path);
+      if (zoomedPaneId && zoomedPaneId !== replacement.targetPaneId) setZoomedPaneId(null);
+      setWindowState(replacement.nextState);
+      requestAnimationFrame(() => paneRefs.current.get(replacement.targetPaneId)?.focus());
+    }
+    await showNoteRoute(path, { edit, syncHash });
   }
 
   function openUtilityView(kind: UtilityMode) {
     navigate({ kind });
     setError(null);
     setActiveNote(null);
+    setAgentTicket(null);
     setAgentPanel(null);
     setMode(kind);
   }
 
-  function openAgent(ticket: string, panel: AgentRoutePanel = null) {
-    navigate({ kind: "agent", panel, ticket });
+  function openAgent(ticket: string, panel: AgentRoutePanel = null, syncHash = true) {
+    const existing = findPaneLocationByTicket(ticket);
+    if (existing) {
+      if (zoomedPaneId && zoomedPaneId !== existing.pane.key) setZoomedPaneId(null);
+      focusWindowPane(existing.window.id, existing.pane.key);
+    } else {
+      const windowId = nextWindowId();
+      const paneId = nextPaneId();
+      if (zoomedPaneId) setZoomedPaneId(null);
+      setWindowState((current) =>
+        normalizeWindowWorkspaceState({
+          activeWindowId: windowId,
+          windows: [...current.windows, createSoloWindow(windowId, paneId, `agent://${ticket}`)],
+        })
+      );
+      requestAnimationFrame(() => paneRefs.current.get(paneId)?.focus());
+    }
+
+    if (syncHash) navigate({ kind: "agent", panel, ticket });
     setError(null);
     setActiveNote(null);
     setAgentPanel(panel);
@@ -1127,8 +1465,17 @@ export default function App() {
   }
 
   function focusPane(key: string) {
-    setFocusedPaneId(key);
-    requestAnimationFrame(() => paneRefs.current.get(key)?.focus());
+    if (!activeWindow) return;
+    focusWindowPane(activeWindow.id, key);
+  }
+
+  function activatePane(key: string) {
+    if (!activeWindow) return;
+    const pane = findPaneInfo(activeWindow.layout, key);
+    if (!pane) return;
+    if (zoomedPaneId && zoomedPaneId !== key) setZoomedPaneId(null);
+    focusWindowPane(activeWindow.id, key);
+    syncRouteToPath(pane.path);
   }
 
   function activePaneFrame(): HTMLDivElement | null {
@@ -1204,42 +1551,120 @@ export default function App() {
     }, 1500);
   }
 
-  function openAgentInContext(ticket: string) {
-    lastSelectedAgentRef.current = ticket;
-    const group = findFleetGroup(fleetGroups, ticket);
-    if (group && group.orch.id !== activeGroupId) setActiveGroupId(group.orch.id);
+  function cyclePaneFocus(delta: 1 | -1) {
+    if (!activeWindow || !focusedPaneId || paneInfos.length === 0) return;
+    const currentIndex = Math.max(0, paneInfos.findIndex((pane) => pane.key === focusedPaneId));
+    const nextPane = paneInfos[(currentIndex + delta + paneInfos.length) % paneInfos.length];
+    activatePane(nextPane.key);
+  }
 
-    const pane = paneMap.get(focusedPaneId);
-    const targetPaneId =
-      focusedPaneId !== "primary" && ticketFromPanePath(pane?.path ?? null)
-        ? focusedPaneId
-        : "primary";
+  function closeFocusedPane(targetPaneId: string | null = focusedPaneId) {
+    if (!activeWindow || !targetPaneId) return;
+    const focused = findPaneInfo(activeWindow.layout, targetPaneId);
+    if (!focused) return;
 
-    if (zoomedPaneId && zoomedPaneId !== targetPaneId) setZoomedPaneId(null);
+    const nextWindows = windowState.windows.map((window) => ({ ...window }));
+    const activeIndex = nextWindows.findIndex((window) => window.id === activeWindow.id);
+    if (activeIndex < 0) return;
 
-    if (targetPaneId === "primary") {
-      openAgent(ticket);
-      focusPane("primary");
+    const targetWindow = nextWindows[activeIndex];
+    const panesInWindow = collectPaneInfos(targetWindow.layout);
+    if (panesInWindow.length === 1) {
+      nextWindows.splice(activeIndex, 1);
+    } else {
+      const removal = removePane(targetWindow.layout, targetPaneId);
+      if (!removal.layout) return;
+      targetWindow.layout = removal.layout;
+      if (focused.ticket) {
+        nextWindows.push(createSoloWindow(nextWindowId(), nextPaneId(), focused.path));
+      }
+    }
+
+    const nextState = normalizeWindowWorkspaceState({
+      activeWindowId:
+        nextWindows[activeIndex]?.id ??
+        nextWindows[Math.max(0, activeIndex - 1)]?.id ??
+        null,
+      windows: nextWindows,
+    });
+    if (zoomedPaneId === targetPaneId) setZoomedPaneId(null);
+    setWindowState(nextState);
+    const nextActiveWindow =
+      nextState.windows.find((window) => window.id === nextState.activeWindowId) ?? null;
+    const nextPane = nextActiveWindow
+      ? findPaneInfo(nextActiveWindow.layout, nextActiveWindow.focusedPaneId)
+      : null;
+    if (nextPane) {
+      requestAnimationFrame(() => paneRefs.current.get(nextPane.key)?.focus());
+    }
+    syncRouteToPath(nextPane?.path ?? null);
+  }
+
+  function activateWindowByIndex(index: number) {
+    const target = windowState.windows[index];
+    if (!target) return;
+    if (zoomedPaneId && zoomedPaneId !== target.focusedPaneId) setZoomedPaneId(null);
+    focusWindowPane(target.id, target.focusedPaneId);
+    const pane = findPaneInfo(target.layout, target.focusedPaneId);
+    syncRouteToPath(pane?.path ?? null);
+  }
+
+  function moveChooserItemToFocusedPane(item: FleetSwitcherItem) {
+    if (!item.path) return;
+    if (item.windowId && item.paneId && activeWindow?.id === item.windowId) {
+      if (zoomedPaneId && zoomedPaneId !== item.paneId) setZoomedPaneId(null);
+      focusWindowPane(item.windowId, item.paneId);
+      syncRouteToPath(item.path);
       return;
     }
 
-    setLayout((current) => replaceNotePane(current, targetPaneId, `agent://${ticket}`));
-    focusPane(targetPaneId);
-  }
+    if (!activeWindow || !focusedPaneId) {
+      if (item.windowId && item.paneId) {
+        if (zoomedPaneId && zoomedPaneId !== item.paneId) setZoomedPaneId(null);
+        focusWindowPane(item.windowId, item.paneId);
+        syncRouteToPath(item.path);
+        return;
+      }
+      if (item.chooserKind === "agent") {
+        openAgent(item.value, null, true);
+      } else {
+        void openNote(item.path);
+      }
+      return;
+    }
 
-  function movePaneFocus(direction: Direction) {
-    const rects = new Map(
-      [...paneRefs.current.entries()].map(([key, element]) => [key, element.getBoundingClientRect()])
-    );
-    const nextPane = pickNeighborPane(rects, focusedPaneId, direction);
-    if (nextPane) focusPane(nextPane);
-  }
+    const focused = findPaneInfo(activeWindow.layout, focusedPaneId);
+    if (!focused) return;
 
-  function closeFocusedPane() {
-    if (focusedPaneId === "primary") return;
-    const target = focusedPaneId;
-    if (zoomedPaneId === target) setZoomedPaneId(null);
-    setLayout((current) => closeNotePane(current, target) ?? { kind: "primary" });
+    const nextWindows = windowState.windows.map((window) => ({ ...window }));
+    if (item.windowId && item.paneId) {
+      const sourceIndex = nextWindows.findIndex((window) => window.id === item.windowId);
+      if (sourceIndex >= 0) {
+        const removal = removePane(nextWindows[sourceIndex].layout, item.paneId);
+        if (removal.layout) {
+          nextWindows[sourceIndex].layout = removal.layout;
+        } else {
+          nextWindows.splice(sourceIndex, 1);
+        }
+      }
+    }
+
+    const targetWindow = nextWindows.find((window) => window.id === activeWindow.id);
+    if (!targetWindow) return;
+    targetWindow.layout = replacePanePath(targetWindow.layout, focusedPaneId, item.path);
+    targetWindow.focusedPaneId = focusedPaneId;
+    if (focused.path !== item.path && focused.ticket) {
+      nextWindows.push(createSoloWindow(nextWindowId(), nextPaneId(), focused.path));
+    }
+
+    const nextState = normalizeWindowWorkspaceState({
+      activeWindowId: targetWindow.id,
+      windows: nextWindows,
+    });
+    if (zoomedPaneId && zoomedPaneId !== focusedPaneId) setZoomedPaneId(null);
+    setWindowState(nextState);
+    requestAnimationFrame(() => paneRefs.current.get(focusedPaneId)?.focus());
+    syncRouteToPath(item.path);
   }
 
   function startNewNote() {
@@ -1284,8 +1709,17 @@ export default function App() {
     setError(null);
     try {
       const result = await renameNote(oldPath, newPath);
+      setWindowState((current) =>
+        normalizeWindowWorkspaceState({
+          ...current,
+          windows: current.windows.map((window) => ({
+            ...window,
+            layout: replaceMatchingPanePaths(window.layout, oldPath, result.path),
+          })),
+        })
+      );
       setNotes(await listNotes());
-      if (activeNote?.path === oldPath) openNote(result.path);
+      if (activeNote?.path === oldPath) void openNote(result.path);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not rename note");
     }
@@ -1311,10 +1745,30 @@ export default function App() {
         setError(null);
         try {
           await deleteNote(path);
+          setWindowState((current) =>
+            normalizeWindowWorkspaceState({
+              ...current,
+              windows: current.windows
+                .map((window) => {
+                  const layout = removePanePaths(window.layout, (candidate) => candidate === path);
+                  if (!layout) return null;
+                  const panes = collectPaneInfos(layout);
+                  return {
+                    ...window,
+                    layout,
+                    focusedPaneId: panes.some((pane) => pane.key === window.focusedPaneId)
+                      ? window.focusedPaneId
+                      : panes[0].key,
+                  };
+                })
+                .filter((window): window is WorkspaceWindow => window !== null),
+            })
+          );
           setNotes(await listNotes());
           if (activeNote?.path === path) {
             navigate({ kind: "empty" });
             setActiveNote(null);
+            setAgentTicket(null);
             setMode("empty");
           }
         } catch (err) {
@@ -1415,15 +1869,13 @@ export default function App() {
       if (mode === "new") {
         const created = await createNote(draft);
         await refreshNotes(created.path);
-        navigate({ kind: "note", path: created.path });
-        setMode("view");
+        await openNote(created.path, { focusExisting: false });
         return;
       }
       if (activeNote) {
         const updated = await updateNote(activeNote.path, draft.content);
         await refreshNotes(updated.path);
-        navigate({ kind: "note", path: updated.path });
-        setMode("view");
+        await openNote(updated.path, { focusExisting: true });
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not save note");
@@ -1435,20 +1887,6 @@ export default function App() {
   useEffect(() => {
     let disposed = false;
 
-    async function fetchNoteWithRetry(path: string) {
-      let lastError: unknown;
-      for (let attempt = 0; attempt < 3; attempt += 1) {
-        try {
-          return await getNote(path);
-        } catch (err) {
-          lastError = err;
-          if (disposed) throw err;
-          await new Promise((resolve) => setTimeout(resolve, 400 * (attempt + 1)));
-        }
-      }
-      throw lastError;
-    }
-
     async function applyRoute() {
       const hash = window.location.hash || "#/";
       if (appliedHashRef.current === hash) return;
@@ -1457,49 +1895,40 @@ export default function App() {
 
       setError(null);
       if (route.kind === "empty") {
+        const activePane =
+          activeWindow ? findPaneInfo(activeWindow.layout, activeWindow.focusedPaneId) : null;
+        if (activePane) {
+          syncRouteToPath(activePane.path, { syncHash: false });
+          return;
+        }
         setActiveNote(null);
         setAgentPanel(null);
+        setAgentTicket(null);
         setMode("empty");
         return;
       }
       if (route.kind === "new") {
         setActiveNote(null);
         setAgentPanel(null);
+        setAgentTicket(null);
         setDraft(emptyDraft);
         setMode("new");
         return;
       }
       if (route.kind === "agent") {
-        setActiveNote(null);
-        setAgentPanel(route.panel);
-        setAgentTicket(route.ticket);
-        setMode("agent");
+        openAgent(route.ticket, route.panel, false);
         return;
       }
       if (route.kind !== "note" && route.kind !== "edit") {
         setActiveNote(null);
         setAgentPanel(null);
+        setAgentTicket(null);
         setMode(route.kind);
         return;
       }
 
-      try {
-        const note = await fetchNoteWithRetry(route.path);
-        if (disposed) return;
-        setActiveNote(note);
-        if (route.kind === "edit") {
-          setDraft({ title: note.title, path: note.path, content: note.content });
-          setMode("edit");
-        } else {
-          setMode("view");
-        }
-      } catch (err) {
-        if (disposed) return;
-        appliedHashRef.current = null;
-        setError(err instanceof Error ? err.message : "Could not open note");
-        setActiveNote(null);
-        setMode("empty");
-      }
+      await openNote(route.path, { edit: route.kind === "edit", focusExisting: true, syncHash: false });
+      if (disposed) return;
     }
 
     applyRoute();
@@ -1509,7 +1938,7 @@ export default function App() {
       appliedHashRef.current = null;
       window.removeEventListener("hashchange", applyRoute);
     };
-  }, []);
+  }, [activeWindow, openAgent, openNote]);
 
   useEffect(() => {
     function onKeyDown(event: globalThis.KeyboardEvent) {
@@ -1529,54 +1958,37 @@ export default function App() {
 
         if (key === "Escape") return;
 
-        if (activeGroup && (lowerKey === "n" || lowerKey === "p")) {
-          const delta = lowerKey === "n" ? 1 : -1;
-          const nextIndex =
-            (activeItemIndex + delta + activeGroup.items.length) % activeGroup.items.length;
-          openAgentInContext(activeGroup.items[nextIndex].ticket);
-          return;
-        }
-
-        if (activeGroup && /^\d$/.test(key)) {
-          const target = activeGroup.items[Number(key)];
-          if (target) openAgentInContext(target.ticket);
-          return;
-        }
-
-        if (fleetGroups.length > 0 && (key === "(" || key === ")")) {
-          const delta = key === ")" ? 1 : -1;
-          const nextIndex =
-            activeGroupIndex >= 0
-              ? (activeGroupIndex + delta + fleetGroups.length) % fleetGroups.length
-              : 0;
-          openAgentInContext(fleetGroups[nextIndex].entryTicket);
-          return;
-        }
-
-        if (lowerKey === "s") {
-          setFleetChooser("orchestrators");
-          return;
-        }
-
-        if (lowerKey === "w") {
-          setFleetChooser("tree");
-          return;
-        }
-
-        if (lowerKey === "h") {
-          movePaneFocus("left");
-          return;
-        }
         if (lowerKey === "j") {
-          movePaneFocus("down");
+          cyclePaneFocus(1);
           return;
         }
         if (lowerKey === "k") {
-          movePaneFocus("up");
+          cyclePaneFocus(-1);
           return;
         }
-        if (lowerKey === "l") {
-          movePaneFocus("right");
+        if (windowState.windows.length > 0 && lowerKey === "h") {
+          activateWindowByIndex(
+            activeWindowIndex >= 0
+              ? (activeWindowIndex - 1 + windowState.windows.length) % windowState.windows.length
+              : 0
+          );
+          return;
+        }
+        if (windowState.windows.length > 0 && lowerKey === "l") {
+          activateWindowByIndex(
+            activeWindowIndex >= 0
+              ? (activeWindowIndex + 1) % windowState.windows.length
+              : 0
+          );
+          return;
+        }
+        if (/^\d$/.test(key)) {
+          const targetIndex = Number(key);
+          if (targetIndex < windowState.windows.length) activateWindowByIndex(targetIndex);
+          return;
+        }
+        if (lowerKey === "w") {
+          setWindowChooserOpen(true);
           return;
         }
 
@@ -1587,7 +1999,7 @@ export default function App() {
 
         if (lowerKey === "z") {
           setZoomedPaneId((current) => (current === focusedPaneId ? null : focusedPaneId));
-          focusPane(focusedPaneId);
+          if (focusedPaneId) focusPane(focusedPaneId);
           return;
         }
 
@@ -1616,18 +2028,16 @@ export default function App() {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [
-    activeGroup,
-    activeGroupIndex,
-    activeItemIndex,
+    activeWindowIndex,
+    activateWindowByIndex,
     closeFocusedPane,
+    cyclePaneFocus,
     disarmLeader,
-    fleetGroups,
     focusedPaneId,
     leaderArmed,
     modalOpen,
-    movePaneFocus,
     handlePaneScopeKey,
-    openAgentInContext,
+    windowState.windows.length,
   ]);
 
   const isEditorMode = mode === "edit" || mode === "new";
@@ -1727,25 +2137,91 @@ export default function App() {
     setDraggingNotePath(null);
     if (!path) return;
 
-    if (zone === "center") {
-      if (targetKey === "primary") {
-        if (path.startsWith("agent://")) {
-          openAgent(path.slice("agent://".length));
-        } else {
-          openNote(path);
-        }
-        focusPane("primary");
+    if (!activeWindow) {
+      if (isAgentPath(path)) {
+        openAgent(path.slice("agent://".length));
       } else {
-        setLayout((current) => replaceNotePane(current, targetKey, path));
-        focusPane(targetKey);
+        void openNote(path);
       }
       return;
     }
 
-    paneIdRef.current += 1;
-    const newPane: Layout = { kind: "note", id: `pane-${paneIdRef.current}`, path };
-    setLayout((current) => splitLayout(current, targetKey, zone, newPane));
-    focusPane(newPane.id);
+    if (zone === "center") {
+      const existingAgent = isAgentPath(path)
+        ? findPaneLocationByTicket(path.slice("agent://".length))
+        : null;
+      if (existingAgent?.window.id === activeWindow.id) {
+        activatePane(existingAgent.pane.key);
+        return;
+      }
+
+      const nextWindows = windowState.windows.map((window) => ({ ...window }));
+      if (existingAgent) {
+        const sourceIndex = nextWindows.findIndex((window) => window.id === existingAgent.window.id);
+        if (sourceIndex >= 0) {
+          const removal = removePane(nextWindows[sourceIndex].layout, existingAgent.pane.key);
+          if (removal.layout) {
+            nextWindows[sourceIndex].layout = removal.layout;
+          } else {
+            nextWindows.splice(sourceIndex, 1);
+          }
+        }
+      }
+
+      const targetWindow = nextWindows.find((window) => window.id === activeWindow.id);
+      const targetPane = targetWindow ? findPaneInfo(targetWindow.layout, targetKey) : null;
+      if (!targetWindow || !targetPane) return;
+      targetWindow.layout = replacePanePath(targetWindow.layout, targetKey, path);
+      targetWindow.focusedPaneId = targetKey;
+      if (targetPane.path !== path && targetPane.ticket) {
+        nextWindows.push(createSoloWindow(nextWindowId(), nextPaneId(), targetPane.path));
+      }
+      setWindowState(
+        normalizeWindowWorkspaceState({
+          activeWindowId: targetWindow.id,
+          windows: nextWindows,
+        })
+      );
+      requestAnimationFrame(() => paneRefs.current.get(targetKey)?.focus());
+      syncRouteToPath(path);
+      return;
+    }
+
+    const existingAgent = isAgentPath(path)
+      ? findPaneLocationByTicket(path.slice("agent://".length))
+      : null;
+    if (existingAgent?.window.id === activeWindow.id) {
+      activatePane(existingAgent.pane.key);
+      return;
+    }
+
+    const nextWindows = windowState.windows.map((window) => ({ ...window }));
+    if (existingAgent) {
+      const sourceIndex = nextWindows.findIndex((window) => window.id === existingAgent.window.id);
+      if (sourceIndex >= 0) {
+        const removal = removePane(nextWindows[sourceIndex].layout, existingAgent.pane.key);
+        if (removal.layout) {
+          nextWindows[sourceIndex].layout = removal.layout;
+        } else {
+          nextWindows.splice(sourceIndex, 1);
+        }
+      }
+    }
+
+    const targetWindow = nextWindows.find((window) => window.id === activeWindow.id);
+    if (!targetWindow) return;
+    const newPaneId = nextPaneId();
+    const newPane: Layout = { kind: "pane", id: newPaneId, path };
+    targetWindow.layout = splitLayout(targetWindow.layout, targetKey, zone, newPane);
+    targetWindow.focusedPaneId = newPaneId;
+    setWindowState(
+      normalizeWindowWorkspaceState({
+        activeWindowId: targetWindow.id,
+        windows: nextWindows,
+      })
+    );
+    requestAnimationFrame(() => paneRefs.current.get(newPaneId)?.focus());
+    syncRouteToPath(path);
   }
 
   function renderPaneFrame(key: string, child: ReactNode) {
@@ -1755,8 +2231,12 @@ export default function App() {
         className={`pane-frame${focusedPaneId === key ? " is-focused" : ""}`}
         ref={(node) => registerPaneRef(key, node)}
         tabIndex={-1}
-        onFocusCapture={() => setFocusedPaneId(key)}
-        onMouseDownCapture={() => setFocusedPaneId(key)}
+        onFocusCapture={() => {
+          if (focusedPaneId !== key) activatePane(key);
+        }}
+        onMouseDownCapture={() => {
+          if (focusedPaneId !== key) activatePane(key);
+        }}
       >
         {child}
       </div>
@@ -1773,18 +2253,7 @@ export default function App() {
       }
     }
 
-    if (node.kind === "primary") {
-      return (
-        <PaneDropTarget
-          active={draggingNotePath !== null}
-          key="primary"
-          onDropZone={(zone) => handlePaneDrop("primary", zone)}
-        >
-          {renderPaneFrame("primary", primaryContent)}
-        </PaneDropTarget>
-      );
-    }
-    if (node.kind === "note") {
+    if (node.kind === "pane") {
       return (
         <PaneDropTarget
           active={draggingNotePath !== null}
@@ -1793,16 +2262,18 @@ export default function App() {
         >
           {renderPaneFrame(
             node.id,
-            <SecondaryPane
-              agentWorkers={agentWorkers}
-              notes={notes}
-              path={node.path}
-              refreshTick={refreshTick}
-              onClose={() =>
-                setLayout((current) => closeNotePane(current, node.id) ?? { kind: "primary" })
-              }
-              onOpenNote={openNote}
-            />
+            focusedPaneId === node.id ? (
+              primaryContent
+            ) : (
+              <SecondaryPane
+                agentWorkers={agentWorkers}
+                notes={notes}
+                path={node.path}
+                refreshTick={refreshTick}
+                onClose={() => closeFocusedPane(node.id)}
+                onOpenNote={openNote}
+              />
+            )
           )}
         </PaneDropTarget>
       );
@@ -1814,7 +2285,19 @@ export default function App() {
         </div>
         <PaneDivider
           direction={node.direction}
-          onRatio={(ratio) => setLayout((current) => setSplitRatio(current, path, ratio))}
+          onRatio={(ratio) =>
+            activeWindow &&
+            setWindowState((current) =>
+              normalizeWindowWorkspaceState({
+                ...current,
+                windows: current.windows.map((window) =>
+                  window.id === activeWindow.id
+                    ? { ...window, layout: setSplitRatio(window.layout, path, ratio) }
+                    : window
+                ),
+              })
+            )
+          }
         />
         <div className="pane-cell" style={{ flexGrow: 1 - node.ratio }}>
           {renderLayout(node.second, primaryContent, [...path, 2])}
@@ -2078,9 +2561,10 @@ export default function App() {
         ) : null}
 
         <div className="workspace-panes">
-          {renderLayout(
-            layout,
-            <div className="view-content" ref={viewContentRef}>
+          {activeWindow ? (
+            renderLayout(
+              activeWindow.layout,
+              <div className="view-content" ref={viewContentRef}>
           {mode === "activity" ? (
             <ActivityFeed onOpenNote={openNote} refreshTick={refreshTick} />
           ) : mode === "graph" ? (
@@ -2222,52 +2706,70 @@ export default function App() {
               </div>
             </div>
           ) : null}
-            </div>,
-            []
+              </div>,
+              []
+            )
+          ) : (
+            <div className="view-content" ref={viewContentRef}>
+              {mode === "activity" ? (
+                <ActivityFeed onOpenNote={openNote} refreshTick={refreshTick} />
+              ) : mode === "graph" ? (
+                <GraphView onOpenNote={openNote} />
+              ) : mode === "health" ? (
+                <HealthView notes={notes} onOpenNote={openNote} />
+              ) : mode === "agent" && agentTicket ? (
+                <AgentSessionView
+                  initialPanel={agentPanel}
+                  key={agentTicket}
+                  refreshTick={refreshTick}
+                  worker={activeAgentWorker ?? { ticket: agentTicket }}
+                />
+              ) : mode === "agents" ? (
+                <AgentsView
+                  data={agentsState}
+                  onOpenAgent={openAgent}
+                  refreshTick={refreshTick}
+                  openTicket={agentsOpenTicket}
+                  onOpenTicket={setAgentsOpenTicket}
+                />
+              ) : mode === "empty" ? (
+                <div className="empty-state">
+                  <div className="empty-state-title">No file is open</div>
+                  <div className="empty-state-actions">
+                    <button type="button" onClick={startNewNote}>
+                      Create new note
+                    </button>
+                    {notes.length > 0 ? (
+                      <button type="button" onClick={() => openNote(notes[0].path)}>
+                        Open most recent note
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
+              ) : null}
+            </div>
           )}
         </div>
 
         <div className="status-bar">
           <div className="tmux-status">
-            <div className="tmux-group-list">
-              {fleetGroups.map((group) => (
-                <button
-                  className={`tmux-group-button${
-                    activeGroup?.orch.id === group.orch.id ? " is-active" : ""
-                  }`}
-                  key={group.orch.id}
-                  type="button"
-                  onClick={() => {
-                    setActiveGroupId(group.orch.id);
-                    openAgentInContext(group.entryTicket);
-                  }}
-                >
-                  {group.orch.id}
-                </button>
-              ))}
-            </div>
-            {activeGroup ? (
-              <div className="tmux-group-items">
-                {activeGroup.items.map((item, index) => (
+            {windowState.windows.length > 0 ? (
+              <div className="tmux-window-list">
+                {windowState.windows.map((window, index) => (
                   <button
-                    className={`tmux-status-item${
-                      activeGroupTicket === item.ticket ? " is-active" : ""
-                    }`}
-                    key={item.ticket}
+                    className={`tmux-status-item${index === activeWindowIndex ? " is-active" : ""}`}
+                    key={window.id}
                     type="button"
-                    onClick={() => openAgentInContext(item.ticket)}
+                    onClick={() => activateWindowByIndex(index)}
                   >
                     <span className="tmux-status-index">{index}</span>
                     <span className="tmux-status-sep">:</span>
-                    <span className="tmux-status-label">{item.label}</span>
-                    <span className="tmux-status-glyph">
-                      {agentStateGlyph(item.state, item.live)}
-                    </span>
+                    <span className="tmux-status-label">{windowLabel(window)}</span>
                   </button>
                 ))}
               </div>
             ) : (
-              <div className="tmux-group-empty">{agentsState.error ?? "No orchestrators"}</div>
+              <div className="tmux-group-empty">{agentsState.error ?? "No windows"}</div>
             )}
           </div>
           {mode === "view" || mode === "edit" || mode === "new" ? (
@@ -2286,27 +2788,27 @@ export default function App() {
         >
           {contextMenu.kind === "file" ? (
             <>
-              <button
-                type="button"
-                onClick={() => {
-                  const { path } = contextMenu;
-                  setContextMenu(null);
-                  promptRename(path);
-                }}
-              >
-                Rename / move…
-              </button>
-              <button
-                className="is-danger"
-                type="button"
-                onClick={() => {
-                  const { path } = contextMenu;
-                  setContextMenu(null);
-                  promptDelete(path);
-                }}
-              >
-                Delete
-              </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const { path } = contextMenu;
+                    setContextMenu(null);
+                    promptRename(path);
+                  }}
+                >
+                  Rename / move…
+                </button>
+                <button
+                  className="is-danger"
+                  type="button"
+                  onClick={() => {
+                    const { path } = contextMenu;
+                    setContextMenu(null);
+                    promptDelete(path);
+                  }}
+                >
+                  Delete
+                </button>
             </>
           ) : (
             <button
@@ -2342,14 +2844,14 @@ export default function App() {
           }}
         />
       ) : null}
-      {fleetChooser ? (
+      {windowChooserOpen ? (
         <FleetSwitcher
-          items={fleetChooser === "orchestrators" ? orchestratorChooserItems : fleetTreeItems}
-          title={fleetChooser === "orchestrators" ? "Choose orchestrator" : "Choose agent run"}
-          onClose={() => setFleetChooser(null)}
+          items={windowChooserItems}
+          title="Choose run or note pane"
+          onClose={() => setWindowChooserOpen(false)}
           onPick={(item) => {
-            setFleetChooser(null);
-            openAgentInContext(item.value);
+            setWindowChooserOpen(false);
+            moveChooserItemToFocusedPane(item);
           }}
         />
       ) : null}
