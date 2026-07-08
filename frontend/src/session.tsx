@@ -645,7 +645,7 @@ function MessageComposer({
   const [queued, setQueued] = useState<QueuedMessage[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [vimMode, setVimMode] = useState<"insert" | "normal" | "visual">("insert");
+  const [vimMode, setVimMode] = useState<"insert" | "normal" | "visual" | "pane">("insert");
   const pendingKeyRef = useRef<string | null>(null);
   const registerRef = useRef<string>("");
   const historyPosRef = useRef<number | null>(null);
@@ -770,6 +770,7 @@ function MessageComposer({
 
   function focusPaneScope() {
     pendingKeyRef.current = null;
+    setVimMode("pane");
     inputRef.current?.closest<HTMLDivElement>(".pane-frame")?.focus();
   }
 
@@ -1146,7 +1147,7 @@ function MessageComposer({
         <textarea
           autoCapitalize="off"
           autoCorrect="off"
-          className={vimMode === "insert" ? undefined : "is-vim-normal"}
+          className={vimMode === "normal" || vimMode === "visual" ? "is-vim-normal" : undefined}
           spellCheck={false}
           placeholder={vimMode === "insert" ? "Enter sends now · Shift+Enter queues until idle · Esc = vim normal" : undefined}
           ref={inputRef}
@@ -1195,12 +1196,16 @@ function MessageComposer({
                 setMenuIndex((i) => (i + 1) % menuItems.length);
                 return;
               }
-              if (event.key === "ArrowUp" || (event.ctrlKey && event.key === "k")) {
+              if (
+                event.key === "ArrowUp" ||
+                (event.ctrlKey && event.key === "k") ||
+                (event.key === "Tab" && event.shiftKey)
+              ) {
                 event.preventDefault();
                 setMenuIndex((i) => (i - 1 + menuItems.length) % menuItems.length);
                 return;
               }
-              if (event.key === "Enter" || event.key === "Tab") {
+              if (event.key === "Enter" || (event.key === "Tab" && !event.shiftKey)) {
                 event.preventDefault();
                 acceptSkill(menuItems[Math.min(menuIndex, menuItems.length - 1)].name);
                 return;
@@ -1262,7 +1267,13 @@ function MessageComposer({
           ))}
         </div>
         <span className={`session-vim-mode is-${vimMode}`}>
-          {vimMode === "insert" ? "-- INSERT --" : vimMode === "visual" ? "-- VISUAL --" : "-- NORMAL --"}
+          {vimMode === "insert"
+            ? "-- INSERT --"
+            : vimMode === "visual"
+              ? "-- VISUAL --"
+              : vimMode === "pane"
+                ? "-- PANE --"
+                : "-- NORMAL --"}
         </span>
       </div>
     </div>
