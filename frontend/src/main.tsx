@@ -4,14 +4,14 @@ import App from "./App";
 import "./styles.css";
 import "./themes.css";
 import { applyStoredTheme } from "./themes";
-import { applyStoredMonoFont } from "./settings";
+import { applyStoredFonts } from "./settings";
 import { hydrateFromServer, installUiStateWriteBack } from "./ui-state-sync";
 
 async function bootstrap() {
   await hydrateFromServer();
   installUiStateWriteBack();
   applyStoredTheme();
-  applyStoredMonoFont();
+  applyStoredFonts();
 
   createRoot(document.getElementById("root")!).render(
     <StrictMode>

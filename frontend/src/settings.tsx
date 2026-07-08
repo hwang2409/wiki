@@ -2,14 +2,14 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, X } from "lucide-react";
 import { THEMES, type ThemeId } from "./themes";
 
-export type MonoFontChoice = {
+export type FontChoice = {
   label: string;
   family: string;
   stack: string;
   load?: () => Promise<unknown>;
 };
 
-const fontsourceLoaders = {
+const monoLoaders = {
   jetbrainsMono: () =>
     Promise.all([
       import("@fontsource/jetbrains-mono/latin-400.css"),
@@ -77,88 +77,105 @@ const fontsourceLoaders = {
     ]),
 };
 
-const SYSTEM_STACK_TAIL =
-  'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace';
+const proportionalLoaders = {
+  inter: () =>
+    Promise.all([
+      import("@fontsource/inter/latin-400.css"),
+      import("@fontsource/inter/latin-500.css"),
+      import("@fontsource/inter/latin-600.css"),
+    ]),
+  sourceSerif4: () =>
+    Promise.all([
+      import("@fontsource/source-serif-4/latin-400.css"),
+      import("@fontsource/source-serif-4/latin-600.css"),
+    ]),
+};
 
-// Full candidate list. System entries are gated via document.fonts.check().
-export const MONO_FONTS: MonoFontChoice[] = [
+const MONO_TAIL =
+  'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace';
+const SANS_TAIL =
+  '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Helvetica, Arial, sans-serif';
+const SERIF_TAIL =
+  'Georgia, Charter, "Iowan Old Style", "Times New Roman", serif';
+
+export const MONO_FONTS: FontChoice[] = [
   {
     label: "JetBrains Mono",
     family: "JetBrains Mono",
-    stack: `"JetBrains Mono", ${SYSTEM_STACK_TAIL}`,
-    load: fontsourceLoaders.jetbrainsMono,
+    stack: `"JetBrains Mono", ${MONO_TAIL}`,
+    load: monoLoaders.jetbrainsMono,
   },
   {
     label: "Geist Mono",
     family: "Geist Mono",
-    stack: `"Geist Mono", ${SYSTEM_STACK_TAIL}`,
-    load: fontsourceLoaders.geistMono,
+    stack: `"Geist Mono", ${MONO_TAIL}`,
+    load: monoLoaders.geistMono,
   },
   {
     label: "Fira Code",
     family: "Fira Code",
-    stack: `"Fira Code", ${SYSTEM_STACK_TAIL}`,
-    load: fontsourceLoaders.firaCode,
+    stack: `"Fira Code", ${MONO_TAIL}`,
+    load: monoLoaders.firaCode,
   },
   {
     label: "IBM Plex Mono",
     family: "IBM Plex Mono",
-    stack: `"IBM Plex Mono", ${SYSTEM_STACK_TAIL}`,
-    load: fontsourceLoaders.ibmPlexMono,
+    stack: `"IBM Plex Mono", ${MONO_TAIL}`,
+    load: monoLoaders.ibmPlexMono,
   },
   {
     label: "Source Code Pro",
     family: "Source Code Pro",
-    stack: `"Source Code Pro", ${SYSTEM_STACK_TAIL}`,
-    load: fontsourceLoaders.sourceCodePro,
+    stack: `"Source Code Pro", ${MONO_TAIL}`,
+    load: monoLoaders.sourceCodePro,
   },
   {
     label: "Roboto Mono",
     family: "Roboto Mono",
-    stack: `"Roboto Mono", ${SYSTEM_STACK_TAIL}`,
-    load: fontsourceLoaders.robotoMono,
+    stack: `"Roboto Mono", ${MONO_TAIL}`,
+    load: monoLoaders.robotoMono,
   },
   {
     label: "Inconsolata",
     family: "Inconsolata",
-    stack: `"Inconsolata", ${SYSTEM_STACK_TAIL}`,
-    load: fontsourceLoaders.inconsolata,
+    stack: `"Inconsolata", ${MONO_TAIL}`,
+    load: monoLoaders.inconsolata,
   },
   {
     label: "Space Mono",
     family: "Space Mono",
-    stack: `"Space Mono", ${SYSTEM_STACK_TAIL}`,
-    load: fontsourceLoaders.spaceMono,
+    stack: `"Space Mono", ${MONO_TAIL}`,
+    load: monoLoaders.spaceMono,
   },
   {
     label: "Victor Mono",
     family: "Victor Mono",
-    stack: `"Victor Mono", ${SYSTEM_STACK_TAIL}`,
-    load: fontsourceLoaders.victorMono,
+    stack: `"Victor Mono", ${MONO_TAIL}`,
+    load: monoLoaders.victorMono,
   },
   {
     label: "Red Hat Mono",
     family: "Red Hat Mono",
-    stack: `"Red Hat Mono", ${SYSTEM_STACK_TAIL}`,
-    load: fontsourceLoaders.redHatMono,
+    stack: `"Red Hat Mono", ${MONO_TAIL}`,
+    load: monoLoaders.redHatMono,
   },
   {
     label: "Martian Mono",
     family: "Martian Mono",
-    stack: `"Martian Mono", ${SYSTEM_STACK_TAIL}`,
-    load: fontsourceLoaders.martianMono,
+    stack: `"Martian Mono", ${MONO_TAIL}`,
+    load: monoLoaders.martianMono,
   },
-  { label: "Monaco", family: "Monaco", stack: `Monaco, ${SYSTEM_STACK_TAIL}` },
-  { label: "Menlo", family: "Menlo", stack: `Menlo, ${SYSTEM_STACK_TAIL}` },
-  { label: "Consolas", family: "Consolas", stack: `Consolas, ${SYSTEM_STACK_TAIL}` },
-  { label: "Courier New", family: "Courier New", stack: `"Courier New", ${SYSTEM_STACK_TAIL}` },
-  { label: "Andale Mono", family: "Andale Mono", stack: `"Andale Mono", ${SYSTEM_STACK_TAIL}` },
-  { label: "PT Mono", family: "PT Mono", stack: `"PT Mono", ${SYSTEM_STACK_TAIL}` },
-  { label: "Cascadia Code", family: "Cascadia Code", stack: `"Cascadia Code", ${SYSTEM_STACK_TAIL}` },
-  { label: "Cascadia Mono", family: "Cascadia Mono", stack: `"Cascadia Mono", ${SYSTEM_STACK_TAIL}` },
-  { label: "Hack", family: "Hack", stack: `Hack, ${SYSTEM_STACK_TAIL}` },
-  { label: "Iosevka", family: "Iosevka", stack: `Iosevka, ${SYSTEM_STACK_TAIL}` },
-  { label: "Anonymous Pro", family: "Anonymous Pro", stack: `"Anonymous Pro", ${SYSTEM_STACK_TAIL}` },
+  { label: "Monaco", family: "Monaco", stack: `Monaco, ${MONO_TAIL}` },
+  { label: "Menlo", family: "Menlo", stack: `Menlo, ${MONO_TAIL}` },
+  { label: "Consolas", family: "Consolas", stack: `Consolas, ${MONO_TAIL}` },
+  { label: "Courier New", family: "Courier New", stack: `"Courier New", ${MONO_TAIL}` },
+  { label: "Andale Mono", family: "Andale Mono", stack: `"Andale Mono", ${MONO_TAIL}` },
+  { label: "PT Mono", family: "PT Mono", stack: `"PT Mono", ${MONO_TAIL}` },
+  { label: "Cascadia Code", family: "Cascadia Code", stack: `"Cascadia Code", ${MONO_TAIL}` },
+  { label: "Cascadia Mono", family: "Cascadia Mono", stack: `"Cascadia Mono", ${MONO_TAIL}` },
+  { label: "Hack", family: "Hack", stack: `Hack, ${MONO_TAIL}` },
+  { label: "Iosevka", family: "Iosevka", stack: `Iosevka, ${MONO_TAIL}` },
+  { label: "Anonymous Pro", family: "Anonymous Pro", stack: `"Anonymous Pro", ${MONO_TAIL}` },
   {
     label: "System (SF Mono)",
     family: "ui-monospace",
@@ -166,15 +183,107 @@ export const MONO_FONTS: MonoFontChoice[] = [
   },
 ];
 
-const MONO_FONT_KEY = "wiki-mono-font";
+export const UI_FONTS: FontChoice[] = [
+  {
+    label: "System",
+    family: "-apple-system",
+    stack: SANS_TAIL,
+  },
+  {
+    label: "Inter",
+    family: "Inter",
+    stack: `"Inter", ${SANS_TAIL}`,
+    load: proportionalLoaders.inter,
+  },
+  { label: "Helvetica Neue", family: "Helvetica Neue", stack: `"Helvetica Neue", ${SANS_TAIL}` },
+  { label: "Helvetica", family: "Helvetica", stack: `Helvetica, ${SANS_TAIL}` },
+  { label: "Arial", family: "Arial", stack: `Arial, ${SANS_TAIL}` },
+  { label: "Avenir", family: "Avenir", stack: `Avenir, ${SANS_TAIL}` },
+  { label: "Avenir Next", family: "Avenir Next", stack: `"Avenir Next", ${SANS_TAIL}` },
+  { label: "Optima", family: "Optima", stack: `Optima, ${SANS_TAIL}` },
+  { label: "Lucida Grande", family: "Lucida Grande", stack: `"Lucida Grande", ${SANS_TAIL}` },
+  { label: "Verdana", family: "Verdana", stack: `Verdana, ${SANS_TAIL}` },
+  { label: "Tahoma", family: "Tahoma", stack: `Tahoma, ${SANS_TAIL}` },
+  { label: "Segoe UI", family: "Segoe UI", stack: `"Segoe UI", ${SANS_TAIL}` },
+  { label: "Roboto", family: "Roboto", stack: `Roboto, ${SANS_TAIL}` },
+];
+
+export const TEXT_FONTS: FontChoice[] = [
+  {
+    label: "System",
+    family: "-apple-system",
+    stack: SANS_TAIL,
+  },
+  {
+    label: "Inter",
+    family: "Inter",
+    stack: `"Inter", ${SANS_TAIL}`,
+    load: proportionalLoaders.inter,
+  },
+  {
+    label: "Source Serif",
+    family: "Source Serif 4",
+    stack: `"Source Serif 4", ${SERIF_TAIL}`,
+    load: proportionalLoaders.sourceSerif4,
+  },
+  { label: "Georgia", family: "Georgia", stack: `Georgia, ${SERIF_TAIL}` },
+  { label: "Charter", family: "Charter", stack: `Charter, ${SERIF_TAIL}` },
+  { label: "Iowan Old Style", family: "Iowan Old Style", stack: `"Iowan Old Style", ${SERIF_TAIL}` },
+  { label: "Palatino", family: "Palatino", stack: `Palatino, ${SERIF_TAIL}` },
+  { label: "Baskerville", family: "Baskerville", stack: `Baskerville, ${SERIF_TAIL}` },
+  { label: "Times New Roman", family: "Times New Roman", stack: `"Times New Roman", ${SERIF_TAIL}` },
+  { label: "Times", family: "Times", stack: `Times, ${SERIF_TAIL}` },
+  { label: "Helvetica Neue", family: "Helvetica Neue", stack: `"Helvetica Neue", ${SANS_TAIL}` },
+  { label: "Optima", family: "Optima", stack: `Optima, ${SANS_TAIL}` },
+];
+
 const BODY_SIZE_KEY = "wiki-font-size-body";
 const UI_SIZE_KEY = "wiki-font-size-ui";
 const BODY_SIZE_DEFAULT = 16.5;
 const UI_SIZE_DEFAULT = 13.5;
-const PREVIEW_SAMPLE = "→ const x = 0O1lIi";
+
+const MONO_SAMPLE = "→ const x = 0O1lIi";
+const PROP_SAMPLE = "The quick brown fox";
+
+type FontRoleId = "ui" | "text" | "mono";
+type FontRole = {
+  name: string;
+  desc: string;
+  fonts: FontChoice[];
+  key: string;
+  cssVar: string;
+  sample: string;
+};
+
+const FONT_ROLES: Record<FontRoleId, FontRole> = {
+  ui: {
+    name: "Interface font",
+    desc: "App chrome: sidebar, tabs, buttons, status bar, dialogs.",
+    fonts: UI_FONTS,
+    key: "wiki-ui-font",
+    cssVar: "--font-interface",
+    sample: PROP_SAMPLE,
+  },
+  text: {
+    name: "Note font",
+    desc: "Body text of rendered notes and the source editor.",
+    fonts: TEXT_FONTS,
+    key: "wiki-text-font",
+    cssVar: "--font-text",
+    sample: PROP_SAMPLE,
+  },
+  mono: {
+    name: "Monospace font",
+    desc: "Code blocks, agent transcripts, and mono UI chrome.",
+    fonts: MONO_FONTS,
+    key: "wiki-mono-font",
+    cssVar: "--font-monospace",
+    sample: MONO_SAMPLE,
+  },
+};
 
 const loadedFonts = new Set<string>();
-function loadFont(choice: MonoFontChoice): Promise<void> {
+function loadFont(choice: FontChoice): Promise<void> {
   if (!choice.load) return Promise.resolve();
   if (loadedFonts.has(choice.label)) return Promise.resolve();
   loadedFonts.add(choice.label);
@@ -212,10 +321,11 @@ function isFontInstalled(family: string): boolean {
   }
 }
 
-function isAvailable(choice: MonoFontChoice): boolean {
-  // Bundled fontsource fonts are always available once loaded; keep them.
+const ALWAYS_AVAILABLE_FAMILIES = new Set(["ui-monospace", "-apple-system"]);
+
+function isAvailable(choice: FontChoice): boolean {
   if (choice.load) return true;
-  if (choice.family === "ui-monospace") return true;
+  if (ALWAYS_AVAILABLE_FAMILIES.has(choice.family)) return true;
   return isFontInstalled(choice.family);
 }
 
@@ -231,48 +341,56 @@ function storedSize(key: string, fallback: number): number {
   return Number.isFinite(raw) && raw >= 10 && raw <= 24 ? raw : fallback;
 }
 
-export function applyStoredMonoFont() {
-  const stored = localStorage.getItem(MONO_FONT_KEY);
-  const choice = MONO_FONTS.find((font) => font.label === stored) ?? MONO_FONTS[0];
-  document.documentElement.style.setProperty("--font-monospace", choice.stack);
+function pickChoice(fonts: FontChoice[], stored: string | null): FontChoice {
+  return fonts.find((font) => font.label === stored) ?? fonts[0];
+}
+
+function applyFontVar(cssVar: string, choice: FontChoice) {
+  document.documentElement.style.setProperty(cssVar, choice.stack);
   void loadFont(choice);
+}
+
+export function applyStoredFonts() {
+  for (const role of Object.values(FONT_ROLES)) {
+    applyFontVar(role.cssVar, pickChoice(role.fonts, localStorage.getItem(role.key)));
+  }
   applySizes(
     storedSize(BODY_SIZE_KEY, BODY_SIZE_DEFAULT),
     storedSize(UI_SIZE_KEY, UI_SIZE_DEFAULT)
   );
 }
 
-export function currentMonoFont(): string {
-  return localStorage.getItem(MONO_FONT_KEY) ?? MONO_FONTS[0].label;
+function currentLabel(role: FontRole): string {
+  return localStorage.getItem(role.key) ?? role.fonts[0].label;
 }
 
-function setMonoFont(label: string) {
-  const choice = MONO_FONTS.find((font) => font.label === label) ?? MONO_FONTS[0];
-  localStorage.setItem(MONO_FONT_KEY, choice.label);
-  document.documentElement.style.setProperty("--font-monospace", choice.stack);
-  void loadFont(choice);
+function setFont(role: FontRole, label: string) {
+  const choice = pickChoice(role.fonts, label);
+  localStorage.setItem(role.key, choice.label);
+  applyFontVar(role.cssVar, choice);
 }
 
-function MonoFontPicker({
+function FontPicker({
+  fonts,
   current,
+  sample,
   onChange,
 }: {
+  fonts: FontChoice[];
   current: string;
+  sample: string;
   onChange: (label: string) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [availTick, setAvailTick] = useState(0);
   const rootRef = useRef<HTMLDivElement | null>(null);
 
-  const currentChoice = useMemo(
-    () => MONO_FONTS.find((font) => font.label === current) ?? MONO_FONTS[0],
-    [current]
-  );
+  const currentChoice = useMemo(() => pickChoice(fonts, current), [fonts, current]);
 
   useEffect(() => {
     if (!open) return;
-    void Promise.all(MONO_FONTS.map(loadFont)).then(() => setAvailTick((t) => t + 1));
-  }, [open]);
+    void Promise.all(fonts.map(loadFont)).then(() => setAvailTick((t) => t + 1));
+  }, [open, fonts]);
 
   useEffect(() => {
     if (!open) return;
@@ -295,33 +413,33 @@ function MonoFontPicker({
   }, [open]);
 
   const visible = useMemo(
-    () => MONO_FONTS.filter((font) => font.label === current || isAvailable(font)),
+    () => fonts.filter((font) => font.label === current || isAvailable(font)),
     // availTick invalidates the memo after loads land
-    [current, availTick]
+    [fonts, current, availTick]
   );
 
   return (
-    <div className={`mono-font-picker${open ? " is-open" : ""}`} ref={rootRef}>
+    <div className={`font-picker${open ? " is-open" : ""}`} ref={rootRef}>
       <button
         aria-expanded={open}
         aria-haspopup="listbox"
-        className="mono-font-trigger"
+        className="font-picker-trigger"
         type="button"
         onClick={() => setOpen((o) => !o)}
       >
-        <span className="mono-font-trigger-label" style={{ fontFamily: currentChoice.stack }}>
+        <span className="font-picker-trigger-label" style={{ fontFamily: currentChoice.stack }}>
           {currentChoice.label}
         </span>
-        <ChevronDown aria-hidden className="mono-font-trigger-chevron" size={14} />
+        <ChevronDown aria-hidden className="font-picker-trigger-chevron" size={14} />
       </button>
       {open ? (
-        <div className="mono-font-menu" role="listbox">
+        <div className="font-picker-menu" role="listbox">
           {visible.map((font) => {
             const active = font.label === current;
             return (
               <button
                 aria-selected={active}
-                className={`mono-font-option${active ? " is-active" : ""}`}
+                className={`font-picker-option${active ? " is-active" : ""}`}
                 key={font.label}
                 role="option"
                 type="button"
@@ -330,21 +448,42 @@ function MonoFontPicker({
                   setOpen(false);
                 }}
               >
-                <span className="mono-font-option-label" style={{ fontFamily: font.stack }}>
+                <span className="font-picker-option-label" style={{ fontFamily: font.stack }}>
                   {font.label}
                 </span>
                 <span
                   aria-hidden
-                  className="mono-font-option-sample"
+                  className="font-picker-option-sample"
                   style={{ fontFamily: font.stack }}
                 >
-                  {PREVIEW_SAMPLE}
+                  {sample}
                 </span>
               </button>
             );
           })}
         </div>
       ) : null}
+    </div>
+  );
+}
+
+function FontRoleRow({ role }: { role: FontRole }) {
+  const [label, setLabel] = useState(() => currentLabel(role));
+  return (
+    <div className="settings-row">
+      <div className="settings-row-info">
+        <div className="settings-row-name">{role.name}</div>
+        <div className="settings-row-desc">{role.desc}</div>
+      </div>
+      <FontPicker
+        current={label}
+        fonts={role.fonts}
+        sample={role.sample}
+        onChange={(next) => {
+          setFont(role, next);
+          setLabel(next);
+        }}
+      />
     </div>
   );
 }
@@ -358,7 +497,6 @@ export function SettingsModal({
   onThemeChange: (theme: ThemeId) => void;
   theme: ThemeId;
 }) {
-  const [monoFont, setMonoFontState] = useState(currentMonoFont);
   const [bodySize, setBodySize] = useState(() => storedSize(BODY_SIZE_KEY, BODY_SIZE_DEFAULT));
   const [uiSize, setUiSize] = useState(() => storedSize(UI_SIZE_KEY, UI_SIZE_DEFAULT));
 
@@ -420,21 +558,12 @@ export function SettingsModal({
               ))}
             </div>
           </div>
-          <div className="settings-row">
-            <div className="settings-row-info">
-              <div className="settings-row-name">Monospace font</div>
-              <div className="settings-row-desc">
-                Used for headings, code, agent transcripts, and UI chrome.
-              </div>
-            </div>
-            <MonoFontPicker
-              current={monoFont}
-              onChange={(label) => {
-                setMonoFont(label);
-                setMonoFontState(label);
-              }}
-            />
+          <FontRoleRow role={FONT_ROLES.ui} />
+          <FontRoleRow role={FONT_ROLES.text} />
+          <div className="settings-preview" style={{ fontFamily: "var(--font-text)" }}>
+            The quick brown fox jumps over the lazy dog — 0123456789
           </div>
+          <FontRoleRow role={FONT_ROLES.mono} />
           <div className="settings-preview" style={{ fontFamily: "var(--font-monospace)" }}>
             wiki agent register PHO-1234 --orch phoebe {"->"} 0O1lI| fi ff
           </div>

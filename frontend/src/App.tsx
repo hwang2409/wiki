@@ -33,7 +33,7 @@ import {
 } from "./api";
 import type { AgentWorker, ArchivedWorker, NoteLinks, Orchestrator } from "./api";
 import { FleetSwitcher, QuickSwitcher, type FleetSwitcherItem } from "./switcher";
-import { SettingsModal, applyStoredMonoFont } from "./settings";
+import { SettingsModal, applyStoredFonts } from "./settings";
 import { ActivityFeed } from "./activity";
 import { AgentsSidebar, AgentsView, type AccountEvent } from "./agents";
 import {
@@ -924,7 +924,7 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   useEffect(() => {
-    applyStoredMonoFont();
+    applyStoredFonts();
   }, []);
 
   const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(readStoredCollapsed);
