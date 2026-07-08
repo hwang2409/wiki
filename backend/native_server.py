@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import threading
+import time
 from pathlib import Path
 
 import uvicorn
@@ -15,6 +17,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repo-dir")
     parser.add_argument("--vault-dir")
     parser.add_argument("--frontend-dist")
+    parser.add_argument("--parent-pid", type=int)
     return parser.parse_args()
 
 
@@ -42,13 +45,42 @@ def configure_environment(args: argparse.Namespace) -> None:
         os.environ["WIKI_FRONTEND_DIST"] = str(bundled)
 
 
+def parent_is_alive(parent_pid: int) -> bool:
+    if parent_pid <= 1:
+        return False
+    try:
+        os.kill(parent_pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def start_parent_watchdog(server: uvicorn.Server, parent_pid: int | None) -> None:
+    if not parent_pid:
+        return
+
+    def watch() -> None:
+        while not server.should_exit:
+            time.sleep(0.5)
+            if parent_is_alive(parent_pid):
+                continue
+            sys.stderr.write(f"parent {parent_pid} exited; stopping wiki-backend\n")
+            sys.stderr.flush()
+            server.should_exit = True
+            return
+
+    threading.Thread(target=watch, name="wiki-parent-watchdog", daemon=True).start()
+
+
 def main() -> None:
     args = parse_args()
     configure_environment(args)
 
     from backend.app.main import app
 
-    uvicorn.run(
+    config = uvicorn.Config(
         app,
         host=args.host,
         port=args.port,
@@ -56,6 +88,9 @@ def main() -> None:
         workers=1,
         log_level="info",
     )
+    server = uvicorn.Server(config)
+    start_parent_watchdog(server, args.parent_pid)
+    server.run()
 
 
 if __name__ == "__main__":

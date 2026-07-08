@@ -87,8 +87,9 @@ pub fn handle_window_event(window: &tauri::Window, event: &WindowEvent) {
 }
 
 pub fn handle_run_event(app: &AppHandle, event: RunEvent) {
-    if let RunEvent::ExitRequested { .. } = event {
-        shutdown_sidecar(app);
+    match event {
+        RunEvent::ExitRequested { .. } | RunEvent::Exit => shutdown_sidecar(app),
+        _ => {}
     }
 }
 
@@ -98,6 +99,10 @@ fn start_sidecar(app: &AppHandle, restart_count: u8) -> Result<String, Box<dyn E
     let repo_dir = resolve_repo_dir();
     let vault_dir = resolve_vault_dir(&repo_dir);
     let log_path = current_log_path(app)?;
+    let parent_pid = std::process::id().to_string();
+    let port_string = port.to_string();
+    let repo_dir_string = repo_dir.display().to_string();
+    let vault_dir_string = vault_dir.display().to_string();
 
     append_log(
         &log_path,
@@ -118,11 +123,13 @@ fn start_sidecar(app: &AppHandle, restart_count: u8) -> Result<String, Box<dyn E
             "--host",
             "127.0.0.1",
             "--port",
-            &port.to_string(),
+            &port_string,
             "--repo-dir",
-            &repo_dir.display().to_string(),
+            &repo_dir_string,
             "--vault-dir",
-            &vault_dir.display().to_string(),
+            &vault_dir_string,
+            "--parent-pid",
+            &parent_pid,
         ])
         .spawn()?;
 
@@ -323,7 +330,7 @@ fn wait_for_health(
     expected_pid: Option<u32>,
 ) -> Result<(), Box<dyn Error>> {
     let client = Client::builder().timeout(Duration::from_secs(2)).build()?;
-    let health_url = format!("{launch_url}health");
+    let health_url = health_url_for(launch_url);
     let deadline = Instant::now() + HEALTH_WAIT_TIMEOUT;
     let mut last_error: Option<String> = None;
 
@@ -398,8 +405,33 @@ fn append_log(log_path: &Path, line: &str) -> io::Result<()> {
 }
 
 fn normalize_launch_url(raw: &str) -> String {
-    let trimmed = raw.trim().trim_end_matches('/');
-    format!("{trimmed}/")
+    let trimmed = raw.trim();
+    if let Ok(mut url) = reqwest::Url::parse(trimmed) {
+        if url.path().is_empty() {
+            url.set_path("/");
+        }
+        return url.to_string();
+    }
+
+    if trimmed.ends_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/")
+    }
+}
+
+fn health_url_for(launch_url: &str) -> String {
+    if let Ok(mut url) = reqwest::Url::parse(launch_url) {
+        url.set_fragment(None);
+        url.set_query(None);
+        url.set_path("/");
+        if let Ok(health) = url.join("health") {
+            return health.to_string();
+        }
+    }
+
+    let trimmed = launch_url.trim().trim_end_matches('/');
+    format!("{trimmed}/health")
 }
 
 fn pick_loopback_port() -> io::Result<u16> {

@@ -23,6 +23,7 @@
       "icons/icon.ico"
     ],
     "macOS": {
+      "hardenedRuntime": false,
       "signingIdentity": "-"
     }
   }

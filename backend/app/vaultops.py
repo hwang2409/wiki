@@ -12,6 +12,7 @@ from pathlib import Path
 FENCE_RE = re.compile(r"^\s*(```|~~~)")
 INLINE_CODE_SPLIT_RE = re.compile(r"(`[^`\n]*`)")
 SAFE_SEGMENT_RE = re.compile(r"^[^.\s/][^/]*$")
+WIKILINK_RE = re.compile(r"\[\[([^\]|]+)(\|[^\]]*)?\]\]")
 
 
 class VaultOpError(ValueError):
@@ -89,13 +90,24 @@ def rename_note(vault: Path, old_rel: str, new_rel: str) -> list[str]:
 
     old_slug = old_path.stem
     new_slug = new_path.stem
-    if old_slug == new_slug:
+    old_target = Path(old_rel).with_suffix("").as_posix()
+    new_target = Path(new_rel).with_suffix("").as_posix()
+    if old_slug == new_slug and old_target == new_target:
         return changed
 
-    link_re = re.compile(r"\[\[" + re.escape(old_slug) + r"(\]\]|\|)")
+    rewrite_slug = old_slug != new_slug
 
     def transform(segment: str) -> str:
-        return link_re.sub(lambda m: f"[[{new_slug}{m.group(1)}", segment)
+        def replace(match: re.Match[str]) -> str:
+            target = match.group(1).strip()
+            alias = match.group(2) or ""
+            if target == old_target:
+                return f"[[{new_target}{alias}]]"
+            if rewrite_slug and target == old_slug:
+                return f"[[{new_slug}{alias}]]"
+            return match.group(0)
+
+        return WIKILINK_RE.sub(replace, segment)
 
     for note in _iter_notes(vault):
         text = note.read_text(encoding="utf-8")
