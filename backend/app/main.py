@@ -714,7 +714,7 @@ def agent_session(ticket: str, after: int = 0) -> dict[str, object]:
 
     found = _session_paths.get(ticket)
     if found is None or not found[1].is_file():
-        found = transcripts.find_session(kind, ticket, spawned_at, registry_session_id)
+        found = transcripts.find_session(kind, ticket, spawned_at, registry_session_id, current.get("worktree"))
         if found:
             _session_paths[ticket] = found
     if found is None:
