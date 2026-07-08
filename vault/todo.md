@@ -18,6 +18,7 @@ In Progress:
 - [PHO-13218](https://linear.app/phoebework/issue/PHO-13218): tiered tool mounting (hot set + domain packs + routing evals) — cdx:PHO-13218 worker
 - [P2] WIKI-13: agent-UI nits — composer growth must push transcript up (always readable above chatbox); font dropdown renders each option in its own font (preview); add Monaco, Consolas + all installed coding fonts to font list
 - [P2] WIKI-14: render Claude task lists in transcript (counts header + per-task status glyphs like TUI); prereq = JSONL event-coverage audit (unhandled codex/claude event types)
+- [P1] WIKI-15: backend usage-limit watchdog — autonomous codex account rotation + fleet revival (owner: cc:WIKI-15)
 
 Backlog:
 
