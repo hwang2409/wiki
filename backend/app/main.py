@@ -707,13 +707,14 @@ def agent_session(ticket: str, after: int = 0) -> dict[str, object]:
     current = (registry.get(ticket) or {}).get("current") or {}
     kind = current.get("kind")
     spawned_at = current.get("spawned_at")
+    registry_session_id = current.get("session_id") if isinstance(current.get("session_id"), str) else None
     archive_dir: Path | None = None
     if not current:
         kind, spawned_at, archive_dir = _archive_hint(ticket)
 
     found = _session_paths.get(ticket)
     if found is None or not found[1].is_file():
-        found = transcripts.find_session(kind, ticket, spawned_at)
+        found = transcripts.find_session(kind, ticket, spawned_at, registry_session_id)
         if found:
             _session_paths[ticket] = found
     if found is None:

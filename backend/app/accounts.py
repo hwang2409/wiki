@@ -19,7 +19,7 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Awaitable, Callable, Iterable
 
@@ -111,6 +111,24 @@ CLAUDE_LIMIT_PATTERN = re.compile(
     r"claude\s+usage\s+limit\s+reached|approaching\s+usage\s+limit",
     re.IGNORECASE,
 )
+# Codex prints this when its cached refresh token is stale (workstation slept,
+# auth swapped externally, another install signed in). The pane is dead —
+# process keeps running but every generation fails with a token-refresh error.
+# Match the full "your access token could not be refreshed" phrase only —
+# a bare "please sign in again" tail is too broad (product copy, docs, tests,
+# and any pane displaying sign-in-related text would false-positive and
+# trigger a kill+resume every poll cycle).
+AUTH_DEAD_PATTERN = re.compile(
+    r"your\s+access\s+token\s+could\s+not\s+be\s+refreshed",
+    re.IGNORECASE,
+)
+# Codex's cwd-mismatch chooser when a rollout is resumed from a directory
+# different from the one it was recorded in.
+CWD_DIALOG_PATTERN = re.compile(
+    r"use\s+current\s+directory",
+    re.IGNORECASE,
+)
+KICKOFF_TICKET_PATTERN = re.compile(r"(?:Linear )?ticket ([A-Z]+-\d+)\b")
 # "try again at Jul 9th, 2026 8:36 PM" — optional ordinal, optional comma.
 RESET_TIME_PATTERN = re.compile(
     r"try\s+again\s+at\s+"
@@ -142,6 +160,17 @@ def detect_codex_limit(pane: str) -> bool:
 
 def detect_claude_limit(pane: str) -> bool:
     return bool(pane and CLAUDE_LIMIT_PATTERN.search(pane))
+
+
+def detect_codex_auth_dead(pane: str) -> bool:
+    """True when codex's stale-refresh-token error is on-screen. Auth-dead is
+    NOT a limit hit — the process just needs to be revived onto the current
+    (already-fresh) auth.json; no account swap."""
+    return bool(pane and AUTH_DEAD_PATTERN.search(pane))
+
+
+def detect_cwd_dialog(pane: str) -> bool:
+    return bool(pane and CWD_DIALOG_PATTERN.search(pane))
 
 
 def parse_reset_time(pane: str) -> str | None:
@@ -291,47 +320,119 @@ def pick_next_account(state: AccountState) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Codex rollout resolution (best-effort).
+# Codex rollout resolution (richest-lineage discovery for revival).
 # ---------------------------------------------------------------------------
 
-def find_session_id_for_worktree(worktree: str) -> str | None:
-    """Newest rollout whose session_meta.cwd == worktree wins."""
+def _rollout_meta(path: Path) -> dict | None:
+    """Parse the session_meta header (first row) of a rollout, defensively."""
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            first = fh.readline()
+    except OSError:
+        return None
+    if not first:
+        return None
+    try:
+        record = json.loads(first)
+    except ValueError:
+        return None
+    payload = record.get("payload") if isinstance(record.get("payload"), dict) else record
+    return payload if isinstance(payload, dict) else None
+
+
+def _rollout_kickoff_ticket(path: Path) -> str | None:
+    """Ticket named in the first user_message ("... worker for Linear ticket X-N")."""
+    try:
+        with path.open(encoding="utf-8", errors="replace") as fh:
+            for _ in range(200):
+                line = fh.readline()
+                if not line:
+                    break
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                payload = row.get("payload") or {}
+                if row.get("type") == "event_msg" and payload.get("type") == "user_message":
+                    match = KICKOFF_TICKET_PATTERN.search(payload.get("message") or "")
+                    return match.group(1) if match else None
+    except OSError:
+        return None
+    return None
+
+
+def _candidate_rollouts(spawned_at: str | None) -> list[Path]:
+    """Scan spawn day ± neighbors and today's day directory for rollouts."""
     root = codex_sessions_dir()
     if not root.is_dir():
+        return []
+    try:
+        spawn = datetime.fromisoformat(spawned_at) if spawned_at else None
+    except ValueError:
+        spawn = None
+    base = spawn or datetime.now(tz=timezone.utc)
+    day_keys: list[str] = []
+    seen: set[str] = set()
+    for delta in (0, 1, -1):
+        d = base + timedelta(days=delta)
+        key = f"{d.year:04d}/{d.month:02d}/{d.day:02d}"
+        if key not in seen:
+            seen.add(key)
+            day_keys.append(key)
+    now = datetime.now(tz=timezone.utc)
+    today_key = f"{now.year:04d}/{now.month:02d}/{now.day:02d}"
+    if today_key not in seen:
+        seen.add(today_key)
+        day_keys.append(today_key)
+    candidates: list[Path] = []
+    for key in day_keys:
+        day_dir = root / key
+        if day_dir.is_dir():
+            candidates.extend(day_dir.glob("rollout-*.jsonl"))
+    return candidates
+
+
+def find_session_id_for_worker(
+    ticket: str,
+    worktree: str,
+    spawned_at: str | None,
+) -> str | None:
+    """Richest-lineage rollout id for this worker, or None.
+
+    Matches by kickoff-ticket regex in first user_message OR by
+    session_meta.cwd basename == worktree slug (works for post-resume rollouts
+    whose kickoff was replayed as a response_item and is invisible to the
+    kickoff scan). Rank: newest mtime, then largest size.
+    """
+    if not worktree or not ticket:
         return None
-    best: tuple[float, str] | None = None
-    for path in root.rglob("rollout-*.jsonl"):
-        try:
-            with path.open("r", encoding="utf-8") as fh:
-                first = fh.readline()
-        except OSError:
+    slug = None
+    try:
+        slug = Path(worktree).name.lower() or None
+    except OSError:
+        slug = None
+    best: tuple[float, int, str] | None = None
+    for path in _candidate_rollouts(spawned_at):
+        meta = _rollout_meta(path)
+        if not meta:
             continue
-        if not first:
-            continue
-        try:
-            record = json.loads(first)
-        except ValueError:
-            continue
-        meta = record.get("payload") if isinstance(record.get("payload"), dict) else record
-        if not isinstance(meta, dict):
+        session_id = meta.get("id") if isinstance(meta.get("id"), str) else None
+        if not session_id:
             continue
         cwd = meta.get("cwd") if isinstance(meta.get("cwd"), str) else None
-        session_id = meta.get("id") if isinstance(meta.get("id"), str) else None
-        if not cwd or not session_id:
+        cwd_slug = Path(cwd).name.lower() if cwd else None
+        cwd_match = bool(cwd_slug and slug and cwd_slug == slug)
+        kickoff_match = _rollout_kickoff_ticket(path) == ticket
+        if not (cwd_match or kickoff_match):
             continue
         try:
-            if Path(cwd).resolve() != Path(worktree).resolve():
-                continue
-        except OSError:
-            if cwd != worktree:
-                continue
-        try:
-            mtime = path.stat().st_mtime
+            stat = path.stat()
         except OSError:
             continue
-        if best is None or mtime > best[0]:
-            best = (mtime, session_id)
-    return best[1] if best else None
+        rank = (stat.st_mtime, stat.st_size, session_id)
+        if best is None or rank > best:
+            best = rank
+    return best[2] if best else None
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +448,8 @@ class WorkerEntry:
     kind: str
     role: str | None
     orch: str | None
+    spawned_at: str | None = None
+    session_id: str | None = None  # codex rollout session id (registry-tracked)
 
 
 def read_registry() -> dict:
@@ -382,6 +485,8 @@ def iter_workers(kind: str) -> list[WorkerEntry]:
                 kind=kind,
                 role=current.get("role") if isinstance(current.get("role"), str) else None,
                 orch=current.get("orch") if isinstance(current.get("orch"), str) else None,
+                spawned_at=current.get("spawned_at") if isinstance(current.get("spawned_at"), str) else None,
+                session_id=current.get("session_id") if isinstance(current.get("session_id"), str) else None,
             )
         )
     return workers
@@ -417,18 +522,49 @@ def tmux_live_windows() -> set[str]:
     return {line.strip() for line in result.stdout.splitlines() if line.strip()}
 
 
+def tmux_window_session(window: str) -> str | None:
+    """The tmux session name owning `window`, or None if the window is gone.
+
+    Load-bearing at revival: workers must respawn into the SAME session their
+    dying window lived in — otherwise a rotation from the wiki orchestrator
+    session pulls every phoebe worker's revival window into the wiki session.
+    """
+    try:
+        result = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", window, "-F", "#{session_name}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    name = result.stdout.strip()
+    return name or None
+
+
 def tmux_kill_window(window: str) -> None:
     subprocess.run(["tmux", "kill-window", "-t", window], timeout=5, check=False)
 
 
-def tmux_new_window(name: str, cwd: str, command: str) -> str | None:
+def tmux_new_window(
+    name: str,
+    cwd: str,
+    command: str,
+    target_session: str | None = None,
+) -> str | None:
+    """Spawn a detached tmux window. When `target_session` is provided, spawn
+    into that session (uses `-t <session>:`); otherwise attaches to the current
+    tmux session (whichever session tmux picks — historically a source of
+    revival windows piling into the wrong session).
+    """
+    args = ["tmux", "new-window", "-dP", "-F", "#{window_id}", "-n", name, "-c", cwd]
+    if target_session:
+        args.extend(["-t", f"{target_session}:"])
+    args.append(command)
     try:
-        result = subprocess.run(
-            ["tmux", "new-window", "-dP", "-F", "#{window_id}", "-n", name, "-c", cwd, command],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
+        result = subprocess.run(args, capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         return None
     if result.returncode != 0:
@@ -456,6 +592,31 @@ def tmux_send_literal_and_enter(window: str, text: str) -> None:
         subprocess.run(["tmux", "send-keys", "-t", window, "Enter"], timeout=5, check=False)
 
 
+def wait_for_cwd_dialog_and_answer(
+    window: str,
+    timeout_seconds: float = 8.0,
+) -> bool:
+    """Watch for codex's "1. Use original / 2. Use current directory" chooser.
+
+    Answer "2" (current dir = worktree — keeps the new rollout mappable by the
+    cwd resolver). No-op if the dialog never shows (e.g. resume launched from
+    the original cwd already).
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        pane = tmux_capture(window, lines=40)
+        if detect_cwd_dialog(pane):
+            subprocess.run(
+                ["tmux", "send-keys", "-t", window, "2", "Enter"],
+                timeout=5,
+                check=False,
+            )
+            time.sleep(0.5)
+            return True
+        time.sleep(0.4)
+    return False
+
+
 def wait_for_codex_ready(window: str, timeout_seconds: float) -> bool:
     """Ready = composer prompt drawn AND no `esc to interrupt` spinner.
 
@@ -471,12 +632,25 @@ def wait_for_codex_ready(window: str, timeout_seconds: float) -> bool:
     return False
 
 
-def wiki_agent_update(ticket: str, window: str, log: str) -> None:
-    subprocess.run(
-        [str(wiki_cli_path()), "agent", "update", ticket, "--window", window, "--log", log],
-        timeout=10,
-        check=False,
-    )
+def wiki_agent_update(
+    ticket: str,
+    window: str,
+    log: str,
+    session_id: str | None = None,
+) -> None:
+    args = [
+        str(wiki_cli_path()),
+        "agent",
+        "update",
+        ticket,
+        "--window",
+        window,
+        "--log",
+        log,
+    ]
+    if session_id:
+        args.extend(["--session", session_id])
+    subprocess.run(args, timeout=10, check=False)
 
 
 def codex_login_status() -> bool:
@@ -537,6 +711,18 @@ def install_incoming_auth(account_name: str) -> bool:
     return True
 
 
+def revival_message(ticket: str) -> str:
+    """Re-poke sent to a revived worker. Names the ticket + status file so a
+    fresh codex resume (which sometimes replays little context) reliably picks
+    up its identity and current step."""
+    return (
+        f"You are worker for ticket {ticket}. Your session was interrupted "
+        f"(usage-limit account rotation or stale auth). Re-read "
+        f"/tmp/agent-status/{ticket}.json and resume from your current step."
+    )
+
+
+# Kept for tests / import compatibility. Watchdog itself uses revival_message().
 REVIVAL_MESSAGE = (
     "continue — interrupted by usage-limit account rotation; "
     "re-read your status file and resume from your current step"
@@ -550,6 +736,14 @@ class RotationResult:
     revived: list[str]  # ticket ids
     failed: list[str]  # ticket ids that couldn't be revived
     reset_at: str | None  # reset time recorded for outgoing account
+    failed_reasons: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class RevivalResult:
+    revived: list[str]
+    failed: list[str]
+    failed_reasons: dict[str, str] = field(default_factory=dict)
 
 
 def rotate(
@@ -575,6 +769,13 @@ def rotate(
     workers = iter_workers("cdx")
     live = tmux_live_windows()
     to_revive = [w for w in workers if w.window in live]
+
+    # Snapshot each worker's tmux session BEFORE killing — revival must land
+    # in the same session it left. Captured up-front because the display-message
+    # lookup fails on a killed window.
+    session_by_window: dict[str, str | None] = {
+        w.window: tmux_window_session(w.window) for w in to_revive
+    }
 
     for worker in to_revive:
         tmux_kill_window(worker.window)
@@ -602,12 +803,15 @@ def rotate(
 
     revived: list[str] = []
     failed: list[str] = []
+    reasons: dict[str, str] = {}
     for worker in to_revive:
-        new_window = _revive_worker(worker)
+        new_window, reason = _revive_worker(worker, session_by_window.get(worker.window))
         if new_window:
             revived.append(worker.ticket)
         else:
             failed.append(worker.ticket)
+            if reason:
+                reasons[worker.ticket] = reason
 
     _append_rotation_log(outgoing, target, revived, failed)
     return RotationResult(
@@ -616,24 +820,81 @@ def rotate(
         revived=revived,
         failed=failed,
         reset_at=outgoing_reset_at,
+        failed_reasons=reasons,
     )
 
 
-def _revive_worker(worker: WorkerEntry) -> str | None:
-    session_id = find_session_id_for_worktree(worker.worktree)
-    if session_id:
-        command = f"codex resume {shlex.quote(session_id)}"
-    else:
-        command = "codex resume --last"
-    new_window = tmux_new_window(f"{worker.kind}:{worker.ticket}", worker.worktree, command)
+def _resolve_revival_session_id(worker: WorkerEntry) -> str | None:
+    """Registry-tracked id beats discovery. Otherwise scan rollouts."""
+    if worker.session_id:
+        return worker.session_id
+    return find_session_id_for_worker(worker.ticket, worker.worktree, worker.spawned_at)
+
+
+def _revive_worker(
+    worker: WorkerEntry,
+    target_session: str | None,
+) -> tuple[str | None, str | None]:
+    """Kick a fresh window off `codex resume <session_id>` for one worker.
+
+    Explicit-id-only: if no lineage is resolvable, we do NOT spawn a fresh
+    session (which would replay no history and orphan the transcript). Return
+    (None, reason) so the caller can surface an SSE alert.
+    """
+    session_id = _resolve_revival_session_id(worker)
+    if not session_id:
+        return None, "no session lineage for revival — manual attention needed"
+    command = f"codex resume {shlex.quote(session_id)}"
+    new_window = tmux_new_window(
+        f"{worker.kind}:{worker.ticket}",
+        worker.worktree,
+        command,
+        target_session=target_session,
+    )
     if not new_window:
-        return None
+        return None, "tmux new-window failed"
     new_log = _next_log_path(worker.log)
     tmux_pipe_pane(new_window, new_log)
-    wiki_agent_update(worker.ticket, new_window, new_log)
+    # Codex's cwd-mismatch chooser shows up when the rollout's recorded cwd
+    # differs from launch cwd. Answer "2" (use current dir = worktree) so the
+    # NEW rollout stays cwd-mappable by the resolver.
+    wait_for_cwd_dialog_and_answer(new_window)
     wait_for_codex_ready(new_window, revival_wait_seconds())
-    tmux_send_literal_and_enter(new_window, REVIVAL_MESSAGE)
-    return new_window
+    # Post-resume: rollout id may change (resume writes a fresh rollout with a
+    # new id). Re-scan and record whichever id is now newest for this worker.
+    post_resume_id = find_session_id_for_worker(
+        worker.ticket, worker.worktree, worker.spawned_at
+    ) or session_id
+    wiki_agent_update(worker.ticket, new_window, new_log, post_resume_id)
+    tmux_send_literal_and_enter(new_window, revival_message(worker.ticket))
+    return new_window, None
+
+
+def revive_auth_dead(workers: list[WorkerEntry]) -> RevivalResult:
+    """Kill + resume workers that hit the stale-refresh-token pane signature.
+
+    Auth-dead != limit-dead: the current auth.json is already fresh; the codex
+    process just needs to reload it. No account swap; no debounce interaction.
+    """
+    live = tmux_live_windows()
+    to_revive = [w for w in workers if w.window in live]
+    session_by_window: dict[str, str | None] = {
+        w.window: tmux_window_session(w.window) for w in to_revive
+    }
+    for worker in to_revive:
+        tmux_kill_window(worker.window)
+    revived: list[str] = []
+    failed: list[str] = []
+    reasons: dict[str, str] = {}
+    for worker in to_revive:
+        new_window, reason = _revive_worker(worker, session_by_window.get(worker.window))
+        if new_window:
+            revived.append(worker.ticket)
+        else:
+            failed.append(worker.ticket)
+            if reason:
+                reasons[worker.ticket] = reason
+    return RevivalResult(revived=revived, failed=failed, failed_reasons=reasons)
 
 
 def _append_rotation_log(outgoing: str | None, incoming: str, revived: list[str], failed: list[str]) -> None:
@@ -747,6 +1008,19 @@ class WatchdogInternalState:
     last_rotation_attempt: float = 0.0
     last_alert_at: dict[str, float] = field(default_factory=dict)
     last_no_eligible_alert: float = 0.0
+    # Per-ticket auth-dead revival timestamps (monotonic). Bounded loop:
+    # after AUTH_DEAD_MAX_ATTEMPTS attempts inside AUTH_DEAD_WINDOW_SECONDS,
+    # or if the last attempt was under AUTH_DEAD_COOLDOWN_SECONDS ago, skip
+    # the revive and emit a manual-attention alert — otherwise a genuinely
+    # broken token loops kill+resume every poll cycle forever.
+    auth_dead_attempts: dict[str, list[float]] = field(default_factory=dict)
+    auth_dead_alert_at: dict[str, float] = field(default_factory=dict)
+
+
+AUTH_DEAD_MAX_ATTEMPTS = 3
+AUTH_DEAD_WINDOW_SECONDS = 3600.0
+AUTH_DEAD_COOLDOWN_SECONDS = 300.0
+AUTH_DEAD_ALERT_INTERVAL_SECONDS = 3600.0
 
 
 def _seconds_since(ts: float) -> float:
@@ -762,12 +1036,59 @@ async def _check_once(
     claude_workers = await asyncio.to_thread(iter_workers, "cc")
 
     codex_hits: list[tuple[WorkerEntry, str]] = []
+    auth_dead: list[WorkerEntry] = []
     for worker in codex_workers:
         if worker.window not in live:
             continue
         pane = await asyncio.to_thread(tmux_capture, worker.window, 80)
         if detect_codex_limit(pane):
             codex_hits.append((worker, pane))
+        elif detect_codex_auth_dead(pane):
+            auth_dead.append(worker)
+
+    # Auth-dead workers get killed + resumed on the CURRENT auth.json — no
+    # account swap, so no debounce interaction with the rotation loop below.
+    # Bounded per-ticket: cooldown + windowed max-attempts. Genuinely-dead
+    # tokens keep re-showing the signature after revive; without the cap the
+    # watchdog would kill+resume the same worker every poll forever.
+    if auth_dead:
+        now_mono = time.monotonic()
+        eligible: list[WorkerEntry] = []
+        exhausted: list[str] = []
+        for worker in auth_dead:
+            history = watch.auth_dead_attempts.setdefault(worker.ticket, [])
+            history[:] = [t for t in history if now_mono - t < AUTH_DEAD_WINDOW_SECONDS]
+            if history and now_mono - history[-1] < AUTH_DEAD_COOLDOWN_SECONDS:
+                exhausted.append(worker.ticket)
+                continue
+            if len(history) >= AUTH_DEAD_MAX_ATTEMPTS:
+                exhausted.append(worker.ticket)
+                continue
+            history.append(now_mono)
+            eligible.append(worker)
+        if exhausted:
+            need_alert = [
+                ticket for ticket in exhausted
+                if now_mono - watch.auth_dead_alert_at.get(ticket, 0.0)
+                >= AUTH_DEAD_ALERT_INTERVAL_SECONDS
+            ]
+            if need_alert:
+                for ticket in need_alert:
+                    watch.auth_dead_alert_at[ticket] = now_mono
+                await emit({
+                    "type": "codex_auth_dead_exhausted",
+                    "tickets": need_alert,
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                })
+        if eligible:
+            result = await asyncio.to_thread(revive_auth_dead, eligible)
+            await emit({
+                "type": "codex_auth_dead_revival",
+                "revived": result.revived,
+                "failed": result.failed,
+                "failed_reasons": result.failed_reasons,
+                "ts": datetime.now(timezone.utc).isoformat(),
+            })
 
     for worker in claude_workers:
         if worker.window not in live:
@@ -842,6 +1163,7 @@ async def _check_once(
         "to": result.incoming,
         "revived": result.revived,
         "failed": result.failed,
+        "failed_reasons": result.failed_reasons,
         "ts": datetime.now(timezone.utc).isoformat(),
     })
 

@@ -78,18 +78,38 @@ def _codex_kickoff_ticket(path: Path) -> str | None:
     return None
 
 
-def _codex_session_cwd(path: Path) -> str | None:
-    """cwd from the session_meta line (first row of every rollout)."""
+def _codex_session_meta(path: Path) -> dict | None:
+    """session_meta payload (first row of every rollout), defensively parsed."""
     try:
         with path.open(encoding="utf-8", errors="replace") as f:
             row = json.loads(f.readline())
     except (OSError, ValueError):
         return None
     payload = row.get("payload") or {}
-    return payload.get("cwd")
+    return payload if isinstance(payload, dict) else None
 
 
-def find_codex_session(ticket: str, spawned_at: str | None) -> Path | None:
+def _codex_session_cwd(path: Path) -> str | None:
+    meta = _codex_session_meta(path)
+    if not meta:
+        return None
+    cwd = meta.get("cwd")
+    return cwd if isinstance(cwd, str) else None
+
+
+def _codex_session_id(path: Path) -> str | None:
+    meta = _codex_session_meta(path)
+    if not meta:
+        return None
+    sid = meta.get("id")
+    return sid if isinstance(sid, str) else None
+
+
+def find_codex_session(
+    ticket: str,
+    spawned_at: str | None,
+    session_id: str | None = None,
+) -> Path | None:
     """Newest session whose kickoff prompt names the ticket, started at/after spawn.
 
     Fallback: match by worktree cwd (dir name embeds the ticket slug). `codex
@@ -117,6 +137,45 @@ def find_codex_session(ticket: str, spawned_at: str | None) -> Path | None:
         day_dir = CODEX_SESSIONS_DIR / key
         if day_dir.is_dir():
             candidates.extend(day_dir.glob("rollout-*.jsonl"))
+    # Registry-tracked id beats discovery. Locate the anchor rollout by id;
+    # then prefer any newer rollout in the same cwd (`codex resume` writes a
+    # NEW rollout with a NEW id, so a chain of resumes appears as a sequence
+    # of rollouts in one cwd — the app should render the newest of that chain).
+    if session_id:
+        anchor: Path | None = None
+        for p in candidates:
+            if _codex_session_id(p) == session_id:
+                anchor = p
+                break
+        if anchor is not None:
+            anchor_cwd = _codex_session_cwd(anchor)
+            try:
+                anchor_mtime = anchor.stat().st_mtime
+            except OSError:
+                anchor_mtime = 0.0
+            chain: list[Path] = [anchor]
+            if anchor_cwd:
+                for p in candidates:
+                    if p == anchor or _codex_session_cwd(p) != anchor_cwd:
+                        continue
+                    try:
+                        if p.stat().st_mtime >= anchor_mtime:
+                            chain.append(p)
+                    except OSError:
+                        continue
+            # Rollouts can be deleted mid-scan (cleanup, session archive). max()
+            # over stat() would leak OSError up to the endpoint — collect
+            # (mtime, path) tuples defensively, skipping the vanished files.
+            ranked: list[tuple[float, Path]] = []
+            for p in chain:
+                try:
+                    ranked.append((p.stat().st_mtime, p))
+                except OSError:
+                    continue
+            if not ranked:
+                return None
+            return max(ranked, key=lambda pair: pair[0])[1]
+
     slug = ticket.lower()
     matches = [
         p
@@ -187,17 +246,24 @@ def find_claude_session(ticket: str, spawned_at: str | None) -> Path | None:
     return max(matches, key=lambda p: p.stat().st_mtime) if matches else None
 
 
-def find_session(kind: str | None, ticket: str, spawned_at: str | None) -> tuple[str, Path] | None:
+def find_session(
+    kind: str | None,
+    ticket: str,
+    spawned_at: str | None,
+    session_id: str | None = None,
+) -> tuple[str, Path] | None:
     if kind == "cc":
         path = find_claude_session(ticket, spawned_at)
         return ("claude", path) if path else None
     if kind == "cdx":
-        path = find_codex_session(ticket, spawned_at)
+        path = find_codex_session(ticket, spawned_at, session_id)
         return ("codex", path) if path else None
-    for fmt, finder in (("codex", find_codex_session), ("claude", find_claude_session)):
-        path = finder(ticket, spawned_at)
-        if path:
-            return (fmt, path)
+    path = find_codex_session(ticket, spawned_at, session_id)
+    if path:
+        return ("codex", path)
+    path = find_claude_session(ticket, spawned_at)
+    if path:
+        return ("claude", path)
     return None
 
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import os
 import re
 import sys
 from pathlib import Path
@@ -29,7 +30,11 @@ VAULT = Path(__file__).resolve().parent / "vault"
 TODO = VAULT / "todo.md"
 DONE = VAULT / "log" / "done.md"
 MAP = VAULT / "map.md"
-AGENT_REGISTRY = Path("/tmp/agent-registry.json")
+# Env override parity with backend/app/accounts.py — lets tests point the CLI
+# at a temp registry without editing this file.
+AGENT_REGISTRY = Path(
+    os.environ.get("WIKI_AGENT_REGISTRY_PATH") or "/tmp/agent-registry.json"
+)
 AGENT_ARCHIVE = Path.home() / "me" / "fun" / "agent-archive"
 AGENT_ROLES = {"plan", "implement", "review"}
 AGENT_OUTCOMES = {"merged", "closed", "plan-ready", "abandoned", "handoff"}
@@ -301,8 +306,11 @@ def write_registry(registry: dict) -> None:
     import json
     import tempfile
 
+    # tempfile dir = registry parent so os.rename stays atomic on the same fs.
+    target_dir = AGENT_REGISTRY.parent
+    target_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
-        "w", dir="/tmp", suffix=".agent-registry", delete=False, encoding="utf-8"
+        "w", dir=str(target_dir), suffix=".agent-registry", delete=False, encoding="utf-8"
     ) as handle:
         json.dump(registry, handle, indent=1)
         temp_name = handle.name
@@ -404,19 +412,33 @@ def cmd_agent_update(args: argparse.Namespace) -> None:
     if not entry or not entry.get("current"):
         fail(f"{ticket} not in registry")
     current = entry["current"]
-    fields = ("window", "kind", "role", "model", "worktree", "log", "orch")
+    # (arg-name, registry-key) — `--session` writes `session_id` to avoid the
+    # collision with the integer session-count field written by `register`.
+    fields = (
+        ("window", "window"),
+        ("kind", "kind"),
+        ("role", "role"),
+        ("model", "model"),
+        ("worktree", "worktree"),
+        ("log", "log"),
+        ("orch", "orch"),
+        ("session", "session_id"),
+    )
     changed = []
-    for field in fields:
-        value = getattr(args, field)
+    for arg_name, reg_key in fields:
+        value = getattr(args, arg_name)
         if value is not None:
-            current[field] = value
-            changed.append(field)
+            current[reg_key] = value
+            changed.append(reg_key)
     if not changed:
-        fail("nothing to update — pass at least one of " + ", ".join(f"--{f}" for f in fields))
+        fail(
+            "nothing to update — pass at least one of "
+            + ", ".join(f"--{arg}" for arg, _ in fields)
+        )
     if current.get("role") is not None and current["role"] not in AGENT_ROLES:
         fail(f"--role must be one of {sorted(AGENT_ROLES)}")
     write_registry(registry)
-    print(f"updated {ticket}: " + ", ".join(f"{f}={current[f]}" for f in changed))
+    print(f"updated {ticket}: " + ", ".join(f"{k}={current[k]}" for k in changed))
 
 
 def cmd_agent_orch(args: argparse.Namespace) -> None:
@@ -698,6 +720,10 @@ def main() -> None:
     update.add_argument("--worktree")
     update.add_argument("--log")
     update.add_argument("--orch")
+    update.add_argument(
+        "--session",
+        help="codex rollout session id (stored as current.session_id — watchdog writes after revival)",
+    )
     update.set_defaults(func=cmd_agent_update)
 
     orch = agent_sub.add_parser("orch", help="register THIS Claude session as an orchestrator (reads CLAUDE_CODE_SESSION_ID)")

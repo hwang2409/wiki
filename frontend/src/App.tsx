@@ -994,6 +994,8 @@ export default function App() {
           (payload.type === "codex_rotation" ||
             payload.type === "codex_limit_no_eligible" ||
             payload.type === "codex_rotation_failed" ||
+            payload.type === "codex_auth_dead_revival" ||
+            payload.type === "codex_auth_dead_exhausted" ||
             payload.type === "claude_limit_hit")
         ) {
           setAccountEvents((prior) => [payload as AccountEvent, ...prior].slice(0, 4));

@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -208,6 +209,7 @@ class RotationIntegrationTests(unittest.TestCase):
                         "role": "implement",
                         "worktree": str(paths["root"] / "wt-15"),
                         "log": "/tmp/cdx-WIKI-15.log",
+                        "session_id": "sess-wiki-15",
                     },
                     {
                         "ticket": "WIKI-99",
@@ -216,6 +218,7 @@ class RotationIntegrationTests(unittest.TestCase):
                         "role": "implement",
                         "worktree": str(paths["root"] / "wt-99"),
                         "log": "/tmp/cdx-WIKI-99.log",
+                        "session_id": "sess-wiki-99",
                     },
                     {
                         "ticket": "WIKI-14",
@@ -233,7 +236,7 @@ class RotationIntegrationTests(unittest.TestCase):
 
             killed: list[str] = []
             revived: list[tuple[str, str, str]] = []
-            wiki_updates: list[tuple[str, str, str]] = []
+            wiki_updates: list[tuple[str, str, str, str | None]] = []
 
             def fake_live() -> set[str]:
                 return {"@42", "@43", "@44"}
@@ -243,7 +246,7 @@ class RotationIntegrationTests(unittest.TestCase):
 
             counter = {"n": 100}
 
-            def fake_new(name: str, cwd: str, command: str) -> str:
+            def fake_new(name: str, cwd: str, command: str, target_session: str | None = None) -> str:
                 counter["n"] += 1
                 revived.append((name, cwd, command))
                 return f"@{counter['n']}"
@@ -257,8 +260,8 @@ class RotationIntegrationTests(unittest.TestCase):
             def fake_ready(window: str, timeout: float) -> bool:
                 return True
 
-            def fake_wiki_update(ticket: str, window: str, log: str) -> None:
-                wiki_updates.append((ticket, window, log))
+            def fake_wiki_update(ticket: str, window: str, log: str, session_id: str | None = None) -> None:
+                wiki_updates.append((ticket, window, log, session_id))
 
             with mock.patch.object(accounts, "tmux_live_windows", fake_live), \
                  mock.patch.object(accounts, "tmux_kill_window", fake_kill), \
@@ -266,8 +269,10 @@ class RotationIntegrationTests(unittest.TestCase):
                  mock.patch.object(accounts, "tmux_pipe_pane", fake_pipe), \
                  mock.patch.object(accounts, "tmux_send_literal_and_enter", fake_send), \
                  mock.patch.object(accounts, "wait_for_codex_ready", fake_ready), \
+                 mock.patch.object(accounts, "wait_for_cwd_dialog_and_answer", lambda w, timeout_seconds=8.0: False), \
                  mock.patch.object(accounts, "wiki_agent_update", fake_wiki_update), \
-                 mock.patch.object(accounts, "find_session_id_for_worktree", lambda w: None):
+                 mock.patch.object(accounts, "tmux_window_session", lambda w: "phoebe"), \
+                 mock.patch.object(accounts, "find_session_id_for_worker", lambda t, wt, sa: None):
                 result = accounts.rotate(
                     state=state,
                     outgoing_reset_at="2099-01-01T00:00:00+00:00",
@@ -295,17 +300,19 @@ class RotationIntegrationTests(unittest.TestCase):
             self.assertIsNone(reloaded.accounts["beta"]["limit_reset_at"])
             self.assertIsNotNone(reloaded.last_rotated_at)
 
-            # Revival: cwd = worktree, command = codex resume --last, wiki update called.
+            # Revival: cwd = worktree, command = codex resume <session_id>, wiki update called.
             self.assertEqual(len(revived), 2)
             for name, cwd, command in revived:
                 self.assertTrue(name.startswith("cdx:WIKI-"))
-                self.assertTrue(command.startswith("codex resume"))
+                self.assertTrue(command.startswith("codex resume "))
+                self.assertNotIn("--last", command, "explicit-id-only: no --last fallback")
                 self.assertTrue(cwd.startswith(str(paths["root"])))
             self.assertEqual(len(wiki_updates), 2)
-            for ticket, window, log in wiki_updates:
+            for ticket, window, log, session_id in wiki_updates:
                 self.assertTrue(ticket.startswith("WIKI-"))
                 self.assertTrue(window.startswith("@"))
                 self.assertIn("-r1.log", log)
+                self.assertTrue(session_id and session_id.startswith("sess-"))
 
             # Rotation log has one JSON line, no credential contents.
             log_content = paths["rotation_log"].read_text().strip().splitlines()
@@ -323,11 +330,14 @@ class RotationIntegrationTests(unittest.TestCase):
             (paths["accounts"] / "beta" / "auth.json").write_text("{}")
             paths["auth"].write_text("{}")
 
-            worktree = paths["root"] / "wt-15"
+            # cwd basename must equal the ticket slug ("wiki-15") for the cwd
+            # match branch of find_session_id_for_worker.
+            worktree = paths["root"] / "wiki-15"
             worktree.mkdir()
-            rollout_dir = paths["sessions"] / "2026" / "07"
-            rollout_dir.mkdir(parents=True)
-            rollout = rollout_dir / "rollout-abc.jsonl"
+            now = datetime.now(tz=timezone.utc)
+            day_dir = paths["sessions"] / f"{now.year:04d}" / f"{now.month:02d}" / f"{now.day:02d}"
+            day_dir.mkdir(parents=True)
+            rollout = day_dir / "rollout-abc.jsonl"
             rollout.write_text(
                 json.dumps({
                     "payload": {"cwd": str(worktree), "id": "sess-xyz-123"}
@@ -344,6 +354,7 @@ class RotationIntegrationTests(unittest.TestCase):
                         "role": "implement",
                         "worktree": str(worktree),
                         "log": "/tmp/cdx-WIKI-15.log",
+                        "spawned_at": now.isoformat(),
                     }
                 ],
             )
@@ -354,12 +365,14 @@ class RotationIntegrationTests(unittest.TestCase):
 
             with mock.patch.object(accounts, "tmux_live_windows", lambda: {"@42"}), \
                  mock.patch.object(accounts, "tmux_kill_window", lambda w: None), \
-                 mock.patch.object(accounts, "tmux_new_window", lambda n, c, cmd: (commands.append(cmd), "@200")[1]), \
+                 mock.patch.object(accounts, "tmux_new_window", lambda n, c, cmd, target_session=None: (commands.append(cmd), "@200")[1]), \
                  mock.patch.object(accounts, "tmux_pipe_pane", lambda w, l: None), \
                  mock.patch.object(accounts, "tmux_send_literal_and_enter", lambda w, t: None), \
                  mock.patch.object(accounts, "wait_for_codex_ready", lambda w, t: True), \
+                 mock.patch.object(accounts, "wait_for_cwd_dialog_and_answer", lambda w, timeout_seconds=8.0: False), \
+                 mock.patch.object(accounts, "tmux_window_session", lambda w: "phoebe"), \
                  mock.patch.object(accounts, "codex_login_status", lambda: True), \
-                 mock.patch.object(accounts, "wiki_agent_update", lambda t, w, l: None):
+                 mock.patch.object(accounts, "wiki_agent_update", lambda t, w, l, sid=None: None):
                 accounts.rotate(state=state)
 
             self.assertEqual(commands, ["codex resume sess-xyz-123"])
@@ -390,11 +403,13 @@ class RotationIntegrationTests(unittest.TestCase):
             new_windows: list[str] = []
             with mock.patch.object(accounts, "tmux_live_windows", lambda: {"@42"}), \
                  mock.patch.object(accounts, "tmux_kill_window", lambda w: None), \
-                 mock.patch.object(accounts, "tmux_new_window", lambda n, c, cmd: new_windows.append(cmd) or "@200"), \
+                 mock.patch.object(accounts, "tmux_new_window", lambda n, c, cmd, target_session=None: new_windows.append(cmd) or "@200"), \
                  mock.patch.object(accounts, "tmux_pipe_pane", lambda w, l: None), \
                  mock.patch.object(accounts, "tmux_send_literal_and_enter", lambda w, t: None), \
                  mock.patch.object(accounts, "wait_for_codex_ready", lambda w, t: True), \
-                 mock.patch.object(accounts, "wiki_agent_update", lambda t, w, l: None), \
+                 mock.patch.object(accounts, "wait_for_cwd_dialog_and_answer", lambda w, timeout_seconds=8.0: False), \
+                 mock.patch.object(accounts, "tmux_window_session", lambda w: "phoebe"), \
+                 mock.patch.object(accounts, "wiki_agent_update", lambda t, w, l, sid=None: None), \
                  mock.patch.object(accounts, "codex_login_status", lambda: False):
                 with self.assertRaises(accounts.RotationError):
                     accounts.rotate(state=state)
@@ -518,6 +533,7 @@ class WatchdogLoopTests(unittest.IsolatedAsyncioTestCase):
                         "role": "implement",
                         "worktree": str(paths["root"] / "wt-15"),
                         "log": "/tmp/cdx-WIKI-15.log",
+                        "session_id": "sess-wiki-15",
                     }
                 }
             }))
@@ -530,13 +546,15 @@ class WatchdogLoopTests(unittest.IsolatedAsyncioTestCase):
             with mock.patch.object(accounts, "tmux_live_windows", lambda: {"@42"}), \
                  mock.patch.object(accounts, "tmux_capture", lambda w, lines=60: REAL_LIMIT_STRING), \
                  mock.patch.object(accounts, "tmux_kill_window", lambda w: None), \
-                 mock.patch.object(accounts, "tmux_new_window", lambda n, c, cmd: "@200"), \
+                 mock.patch.object(accounts, "tmux_new_window", lambda n, c, cmd, target_session=None: "@200"), \
                  mock.patch.object(accounts, "tmux_pipe_pane", lambda w, l: None), \
                  mock.patch.object(accounts, "tmux_send_literal_and_enter", lambda w, t: None), \
                  mock.patch.object(accounts, "wait_for_codex_ready", lambda w, t: True), \
-                 mock.patch.object(accounts, "wiki_agent_update", lambda t, w, l: None), \
+                 mock.patch.object(accounts, "wait_for_cwd_dialog_and_answer", lambda w, timeout_seconds=8.0: False), \
+                 mock.patch.object(accounts, "tmux_window_session", lambda w: "phoebe"), \
+                 mock.patch.object(accounts, "wiki_agent_update", lambda t, w, l, sid=None: None), \
                  mock.patch.object(accounts, "codex_login_status", lambda: True), \
-                 mock.patch.object(accounts, "find_session_id_for_worktree", lambda w: None):
+                 mock.patch.object(accounts, "find_session_id_for_worker", lambda t, wt, sa: None):
                 watch = accounts.WatchdogInternalState()
                 await accounts._check_once(watch, emit)
                 await accounts._check_once(watch, emit)
@@ -610,6 +628,470 @@ class WatchdogLoopTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(len(emitted), 1)
             self.assertEqual(emitted[0]["type"], "claude_limit_hit")
+
+
+REAL_AUTH_DEAD_STRING = (
+    "Your access token could not be refreshed because you have since logged "
+    "out or signed in to another account. Please sign in again."
+)
+CWD_DIALOG_STRING = (
+    "1. Use original directory\n"
+    "2. Use current directory (/Users/henry/me/fun/wiki/.claude/worktrees/wiki-19)\n"
+    "Press enter to continue"
+)
+
+
+def _write_rollout(day_dir: Path, name: str, cwd: str | None, session_id: str,
+                   kickoff_ticket: str | None = None, mtime: float | None = None,
+                   pad_bytes: int = 0) -> Path:
+    day_dir.mkdir(parents=True, exist_ok=True)
+    path = day_dir / f"rollout-{name}.jsonl"
+    lines = [json.dumps({"payload": {"cwd": cwd, "id": session_id}})]
+    if kickoff_ticket:
+        lines.append(json.dumps({
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "message": f"You are worker for ticket {kickoff_ticket}. Do the work.",
+            },
+        }))
+    if pad_bytes:
+        lines.append(json.dumps({"pad": "x" * pad_bytes}))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    if mtime is not None:
+        os.utime(path, (mtime, mtime))
+    return path
+
+
+class AuthDeadDetectionTests(unittest.TestCase):
+    def test_matches_the_real_auth_dead_string(self) -> None:
+        self.assertTrue(accounts.detect_codex_auth_dead(REAL_AUTH_DEAD_STRING))
+
+    def test_ignores_bare_sign_in_again_phrase(self) -> None:
+        """Product copy, docs, and test output frequently contain "please sign
+        in again"; matching it as an independent alternative would kill+resume
+        any worker merely displaying the phrase every poll. Only the full
+        "your access token could not be refreshed" sentence classifies."""
+        self.assertFalse(accounts.detect_codex_auth_dead("Please sign in again to continue."))
+        self.assertFalse(accounts.detect_codex_auth_dead(
+            "docs say: If prompted, please sign in again with your credentials."
+        ))
+        self.assertFalse(accounts.detect_codex_auth_dead("something failed. Please sign in again."))
+
+    def test_ignores_unrelated_pane(self) -> None:
+        self.assertFalse(accounts.detect_codex_auth_dead("everything is fine"))
+        self.assertFalse(accounts.detect_codex_auth_dead(""))
+
+    def test_auth_dead_is_not_a_limit_hit(self) -> None:
+        self.assertFalse(accounts.detect_codex_limit(REAL_AUTH_DEAD_STRING))
+
+    def test_cwd_dialog_signature(self) -> None:
+        self.assertTrue(accounts.detect_cwd_dialog(CWD_DIALOG_STRING))
+        self.assertFalse(accounts.detect_cwd_dialog("no dialog here"))
+
+
+class SessionIdResolutionTests(unittest.TestCase):
+    def _prepare(self, paths: dict[str, Path]) -> tuple[Path, Path]:
+        now = datetime.now(tz=timezone.utc)
+        day_dir = paths["sessions"] / f"{now.year:04d}" / f"{now.month:02d}" / f"{now.day:02d}"
+        worktree = paths["root"] / "wiki-15"
+        worktree.mkdir(parents=True, exist_ok=True)
+        return worktree, day_dir
+
+    def test_kickoff_ticket_match_returns_id(self) -> None:
+        with _EnvOverride() as paths:
+            worktree, day_dir = self._prepare(paths)
+            _write_rollout(day_dir, "kick", cwd="/somewhere/else", session_id="sess-K",
+                           kickoff_ticket="WIKI-15", mtime=time.time())
+            sid = accounts.find_session_id_for_worker(
+                "WIKI-15", str(worktree), datetime.now(tz=timezone.utc).isoformat()
+            )
+            self.assertEqual(sid, "sess-K")
+
+    def test_cwd_slug_match_returns_id(self) -> None:
+        with _EnvOverride() as paths:
+            worktree, day_dir = self._prepare(paths)
+            _write_rollout(day_dir, "cwd", cwd=str(worktree), session_id="sess-C",
+                           mtime=time.time())
+            sid = accounts.find_session_id_for_worker(
+                "WIKI-15", str(worktree), datetime.now(tz=timezone.utc).isoformat()
+            )
+            self.assertEqual(sid, "sess-C")
+
+    def test_newest_mtime_wins_on_tie(self) -> None:
+        with _EnvOverride() as paths:
+            worktree, day_dir = self._prepare(paths)
+            now = time.time()
+            _write_rollout(day_dir, "old", cwd=str(worktree), session_id="sess-old",
+                           kickoff_ticket="WIKI-15", mtime=now - 3600)
+            _write_rollout(day_dir, "new", cwd=str(worktree), session_id="sess-new",
+                           kickoff_ticket="WIKI-15", mtime=now)
+            sid = accounts.find_session_id_for_worker(
+                "WIKI-15", str(worktree), datetime.now(tz=timezone.utc).isoformat()
+            )
+            self.assertEqual(sid, "sess-new")
+
+    def test_size_breaks_mtime_tie(self) -> None:
+        with _EnvOverride() as paths:
+            worktree, day_dir = self._prepare(paths)
+            same_time = time.time()
+            _write_rollout(day_dir, "small", cwd=str(worktree), session_id="sess-small",
+                           kickoff_ticket="WIKI-15", mtime=same_time)
+            _write_rollout(day_dir, "large", cwd=str(worktree), session_id="sess-large",
+                           kickoff_ticket="WIKI-15", mtime=same_time, pad_bytes=4096)
+            sid = accounts.find_session_id_for_worker(
+                "WIKI-15", str(worktree), datetime.now(tz=timezone.utc).isoformat()
+            )
+            self.assertEqual(sid, "sess-large")
+
+    def test_no_match_returns_none(self) -> None:
+        with _EnvOverride() as paths:
+            worktree, day_dir = self._prepare(paths)
+            _write_rollout(day_dir, "other", cwd="/nope", session_id="sess-nope",
+                           kickoff_ticket="WIKI-999", mtime=time.time())
+            sid = accounts.find_session_id_for_worker(
+                "WIKI-15", str(worktree), datetime.now(tz=timezone.utc).isoformat()
+            )
+            self.assertIsNone(sid)
+
+
+class NoLineageNoFreshSpawnTests(unittest.TestCase):
+    """When a worker has no resolvable rollout AND no registry session_id, we
+    must NOT spawn a fresh session (which would replay no history and orphan
+    the transcript). The rotation succeeds; the worker is failed with a reason."""
+
+    def test_worker_without_lineage_is_skipped_and_reason_recorded(self) -> None:
+        with _EnvOverride() as paths:
+            (paths["accounts"] / "alpha").mkdir()
+            (paths["accounts"] / "alpha" / "auth.json").write_text("{}")
+            (paths["accounts"] / "beta").mkdir()
+            (paths["accounts"] / "beta" / "auth.json").write_text("{}")
+            paths["auth"].write_text("{}")
+
+            registry = paths["registry"]
+            registry.write_text(json.dumps({
+                "WIKI-15": {
+                    "current": {
+                        "ticket": "WIKI-15",
+                        "window": "@42",
+                        "kind": "cdx",
+                        "role": "implement",
+                        "worktree": str(paths["root"] / "wt-15"),
+                        "log": "/tmp/cdx-WIKI-15.log",
+                    }
+                }
+            }))
+            state = accounts.ensure_state_initialized(accounts.AccountState())
+
+            new_windows: list[str] = []
+            with mock.patch.object(accounts, "tmux_live_windows", lambda: {"@42"}), \
+                 mock.patch.object(accounts, "tmux_kill_window", lambda w: None), \
+                 mock.patch.object(accounts, "tmux_new_window", lambda n, c, cmd, target_session=None: new_windows.append(cmd) or "@200"), \
+                 mock.patch.object(accounts, "tmux_pipe_pane", lambda w, l: None), \
+                 mock.patch.object(accounts, "tmux_send_literal_and_enter", lambda w, t: None), \
+                 mock.patch.object(accounts, "wait_for_codex_ready", lambda w, t: True), \
+                 mock.patch.object(accounts, "wait_for_cwd_dialog_and_answer", lambda w, timeout_seconds=8.0: False), \
+                 mock.patch.object(accounts, "tmux_window_session", lambda w: "phoebe"), \
+                 mock.patch.object(accounts, "codex_login_status", lambda: True), \
+                 mock.patch.object(accounts, "wiki_agent_update", lambda t, w, l, sid=None: None), \
+                 mock.patch.object(accounts, "find_session_id_for_worker", lambda t, wt, sa: None):
+                result = accounts.rotate(state=state)
+
+            self.assertEqual(new_windows, [], "no fresh spawn without lineage")
+            self.assertEqual(result.revived, [])
+            self.assertEqual(result.failed, ["WIKI-15"])
+            self.assertIn("WIKI-15", result.failed_reasons)
+            self.assertIn("manual attention", result.failed_reasons["WIKI-15"])
+
+
+class CwdDialogAutoAnswerTests(unittest.TestCase):
+    def test_answers_2_and_enter_when_dialog_visible(self) -> None:
+        captured_panes = iter([CWD_DIALOG_STRING])
+        send_calls: list[list[str]] = []
+
+        def fake_capture(window: str, lines: int = 40) -> str:
+            try:
+                return next(captured_panes)
+            except StopIteration:
+                return ""
+
+        def fake_run(args, **kwargs):
+            send_calls.append(list(args))
+            class Result:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+            return Result()
+
+        with mock.patch.object(accounts, "tmux_capture", fake_capture), \
+             mock.patch("backend.app.accounts.subprocess.run", fake_run):
+            answered = accounts.wait_for_cwd_dialog_and_answer("@42", timeout_seconds=1.0)
+
+        self.assertTrue(answered)
+        self.assertTrue(any(
+            "send-keys" in " ".join(call) and call[-2:] == ["2", "Enter"]
+            for call in send_calls
+        ))
+
+    def test_no_dialog_returns_false(self) -> None:
+        with mock.patch.object(accounts, "tmux_capture", lambda w, lines=40: "nothing here"):
+            answered = accounts.wait_for_cwd_dialog_and_answer("@42", timeout_seconds=0.5)
+        self.assertFalse(answered)
+
+
+class SessionPreservationTests(unittest.TestCase):
+    """Revival window must spawn into the ORIGINAL tmux session, captured
+    before the dying window is killed."""
+
+    def test_new_window_receives_target_session_from_dying_window(self) -> None:
+        with _EnvOverride() as paths:
+            (paths["accounts"] / "alpha").mkdir()
+            (paths["accounts"] / "alpha" / "auth.json").write_text("{}")
+            (paths["accounts"] / "beta").mkdir()
+            (paths["accounts"] / "beta" / "auth.json").write_text("{}")
+            paths["auth"].write_text("{}")
+
+            registry = paths["registry"]
+            registry.write_text(json.dumps({
+                "WIKI-15": {
+                    "current": {
+                        "ticket": "WIKI-15",
+                        "window": "@42",
+                        "kind": "cdx",
+                        "role": "implement",
+                        "worktree": str(paths["root"] / "wt-15"),
+                        "log": "/tmp/cdx-WIKI-15.log",
+                        "session_id": "sess-wiki-15",
+                    }
+                }
+            }))
+            state = accounts.ensure_state_initialized(accounts.AccountState())
+
+            session_calls: list[str] = []
+            new_window_calls: list[dict] = []
+            kill_calls: list[str] = []
+
+            def fake_session(window: str) -> str:
+                session_calls.append(window)
+                return "phoebe" if window == "@42" else "wiki"
+
+            def fake_kill(window: str) -> None:
+                kill_calls.append(window)
+
+            def fake_new(name: str, cwd: str, command: str,
+                         target_session: str | None = None) -> str:
+                new_window_calls.append({"name": name, "target_session": target_session})
+                return "@200"
+
+            with mock.patch.object(accounts, "tmux_live_windows", lambda: {"@42"}), \
+                 mock.patch.object(accounts, "tmux_window_session", fake_session), \
+                 mock.patch.object(accounts, "tmux_kill_window", fake_kill), \
+                 mock.patch.object(accounts, "tmux_new_window", fake_new), \
+                 mock.patch.object(accounts, "tmux_pipe_pane", lambda w, l: None), \
+                 mock.patch.object(accounts, "tmux_send_literal_and_enter", lambda w, t: None), \
+                 mock.patch.object(accounts, "wait_for_codex_ready", lambda w, t: True), \
+                 mock.patch.object(accounts, "wait_for_cwd_dialog_and_answer", lambda w, timeout_seconds=8.0: False), \
+                 mock.patch.object(accounts, "codex_login_status", lambda: True), \
+                 mock.patch.object(accounts, "wiki_agent_update", lambda t, w, l, sid=None: None):
+                accounts.rotate(state=state)
+
+            # Session was captured BEFORE kill.
+            self.assertEqual(session_calls, ["@42"], "session lookup once per worker, before kill")
+            self.assertEqual(kill_calls, ["@42"])
+            self.assertEqual(len(new_window_calls), 1)
+            self.assertEqual(new_window_calls[0]["target_session"], "phoebe")
+
+
+class AuthDeadRevivalTests(unittest.IsolatedAsyncioTestCase):
+    async def test_auth_dead_worker_is_revived_without_rotation(self) -> None:
+        """Auth-dead workers get killed + resumed on CURRENT auth.json — no
+        account swap. The rotation loop must not treat them as limit hits."""
+        with _EnvOverride() as paths:
+            (paths["accounts"] / "alpha").mkdir()
+            (paths["accounts"] / "alpha" / "auth.json").write_text('{"tokens":"alpha"}')
+            (paths["accounts"] / "beta").mkdir()
+            (paths["accounts"] / "beta" / "auth.json").write_text('{"tokens":"beta"}')
+            paths["auth"].write_text('{"tokens":"alpha-live"}')
+
+            paths["registry"].write_text(json.dumps({
+                "WIKI-15": {
+                    "current": {
+                        "ticket": "WIKI-15",
+                        "window": "@42",
+                        "kind": "cdx",
+                        "role": "implement",
+                        "worktree": str(paths["root"] / "wt-15"),
+                        "log": "/tmp/cdx-WIKI-15.log",
+                        "session_id": "sess-wiki-15",
+                    }
+                }
+            }))
+            state = accounts.ensure_state_initialized(accounts.AccountState())
+            self.assertEqual(state.active, "alpha")
+
+            emitted: list[dict] = []
+            revive_commands: list[str] = []
+
+            async def emit(evt: dict) -> None:
+                emitted.append(evt)
+
+            with mock.patch.object(accounts, "tmux_live_windows", lambda: {"@42"}), \
+                 mock.patch.object(accounts, "tmux_capture", lambda w, lines=60: REAL_AUTH_DEAD_STRING), \
+                 mock.patch.object(accounts, "tmux_window_session", lambda w: "phoebe"), \
+                 mock.patch.object(accounts, "tmux_kill_window", lambda w: None), \
+                 mock.patch.object(accounts, "tmux_new_window", lambda n, c, cmd, target_session=None: revive_commands.append(cmd) or "@200"), \
+                 mock.patch.object(accounts, "tmux_pipe_pane", lambda w, l: None), \
+                 mock.patch.object(accounts, "tmux_send_literal_and_enter", lambda w, t: None), \
+                 mock.patch.object(accounts, "wait_for_codex_ready", lambda w, t: True), \
+                 mock.patch.object(accounts, "wait_for_cwd_dialog_and_answer", lambda w, timeout_seconds=8.0: False), \
+                 mock.patch.object(accounts, "wiki_agent_update", lambda t, w, l, sid=None: None):
+                watch = accounts.WatchdogInternalState()
+                await accounts._check_once(watch, emit)
+
+            # Revival happened.
+            self.assertEqual(len(revive_commands), 1)
+            self.assertIn("codex resume sess-wiki-15", revive_commands[0])
+
+            # Auth-dead SSE event emitted; NO rotation event.
+            types = [e["type"] for e in emitted]
+            self.assertIn("codex_auth_dead_revival", types)
+            self.assertNotIn("codex_rotation", types)
+
+            # Active account unchanged (still alpha) — no swap.
+            self.assertEqual(accounts.read_state().active, "alpha")
+
+            # auth.json untouched (still alpha's live creds).
+            self.assertEqual(json.loads(paths["auth"].read_text())["tokens"], "alpha-live")
+
+
+class AuthDeadAttemptCapTests(unittest.IsolatedAsyncioTestCase):
+    """A genuinely-dead auth token re-shows the pane signature after every
+    revive. Without a cap, the watchdog kill+resume-loops the same worker
+    every poll cycle forever."""
+
+    async def _drive_cycles(
+        self,
+        paths: dict[str, Path],
+        cycles: int,
+    ) -> tuple[list[dict], list[str]]:
+        (paths["accounts"] / "alpha").mkdir()
+        (paths["accounts"] / "alpha" / "auth.json").write_text("{}")
+        paths["auth"].write_text("{}")
+        paths["registry"].write_text(json.dumps({
+            "WIKI-15": {
+                "current": {
+                    "ticket": "WIKI-15",
+                    "window": "@42",
+                    "kind": "cdx",
+                    "role": "implement",
+                    "worktree": str(paths["root"] / "wt-15"),
+                    "log": "/tmp/cdx-WIKI-15.log",
+                    "session_id": "sess-wiki-15",
+                }
+            }
+        }))
+        accounts.ensure_state_initialized(accounts.AccountState())
+
+        emitted: list[dict] = []
+        revive_calls: list[str] = []
+
+        async def emit(evt: dict) -> None:
+            emitted.append(evt)
+
+        with mock.patch.object(accounts, "tmux_live_windows", lambda: {"@42"}), \
+             mock.patch.object(accounts, "tmux_capture", lambda w, lines=60: REAL_AUTH_DEAD_STRING), \
+             mock.patch.object(accounts, "tmux_window_session", lambda w: "phoebe"), \
+             mock.patch.object(accounts, "tmux_kill_window", lambda w: revive_calls.append(f"kill:{w}")), \
+             mock.patch.object(accounts, "tmux_new_window", lambda n, c, cmd, target_session=None: (revive_calls.append(f"new:{cmd}"), "@200")[1]), \
+             mock.patch.object(accounts, "tmux_pipe_pane", lambda w, l: None), \
+             mock.patch.object(accounts, "tmux_send_literal_and_enter", lambda w, t: None), \
+             mock.patch.object(accounts, "wait_for_codex_ready", lambda w, t: True), \
+             mock.patch.object(accounts, "wait_for_cwd_dialog_and_answer", lambda w, timeout_seconds=8.0: False), \
+             mock.patch.object(accounts, "wiki_agent_update", lambda t, w, l, sid=None: None):
+            watch = accounts.WatchdogInternalState()
+            for _ in range(cycles):
+                # Bypass the cooldown between cycles by rewinding the last
+                # attempt timestamp past the cooldown boundary.
+                for ticket in list(watch.auth_dead_attempts.keys()):
+                    history = watch.auth_dead_attempts[ticket]
+                    if history:
+                        history[-1] -= accounts.AUTH_DEAD_COOLDOWN_SECONDS + 1
+                await accounts._check_once(watch, emit)
+        return emitted, revive_calls
+
+    async def test_stops_reviving_after_max_attempts(self) -> None:
+        with _EnvOverride() as paths:
+            emitted, calls = await self._drive_cycles(paths, cycles=5)
+        revive_events = [e for e in emitted if e["type"] == "codex_auth_dead_revival"]
+        exhausted_events = [e for e in emitted if e["type"] == "codex_auth_dead_exhausted"]
+        self.assertEqual(
+            len(revive_events),
+            accounts.AUTH_DEAD_MAX_ATTEMPTS,
+            "revive at most AUTH_DEAD_MAX_ATTEMPTS times",
+        )
+        self.assertGreaterEqual(
+            len(exhausted_events),
+            1,
+            "manual-attention alert emitted after cap hit",
+        )
+        # Once exhausted, no further new-window calls.
+        new_window_calls = [c for c in calls if c.startswith("new:")]
+        self.assertEqual(len(new_window_calls), accounts.AUTH_DEAD_MAX_ATTEMPTS)
+
+    async def test_cooldown_blocks_back_to_back_revives(self) -> None:
+        """Two consecutive polls (no timestamp rewind) → only ONE revive."""
+        with _EnvOverride() as paths:
+            (paths["accounts"] / "alpha").mkdir()
+            (paths["accounts"] / "alpha" / "auth.json").write_text("{}")
+            paths["auth"].write_text("{}")
+            paths["registry"].write_text(json.dumps({
+                "WIKI-15": {
+                    "current": {
+                        "ticket": "WIKI-15",
+                        "window": "@42",
+                        "kind": "cdx",
+                        "role": "implement",
+                        "worktree": str(paths["root"] / "wt-15"),
+                        "log": "/tmp/cdx-WIKI-15.log",
+                        "session_id": "sess-wiki-15",
+                    }
+                }
+            }))
+            accounts.ensure_state_initialized(accounts.AccountState())
+
+            emitted: list[dict] = []
+            new_calls: list[str] = []
+
+            async def emit(evt: dict) -> None:
+                emitted.append(evt)
+
+            with mock.patch.object(accounts, "tmux_live_windows", lambda: {"@42"}), \
+                 mock.patch.object(accounts, "tmux_capture", lambda w, lines=60: REAL_AUTH_DEAD_STRING), \
+                 mock.patch.object(accounts, "tmux_window_session", lambda w: "phoebe"), \
+                 mock.patch.object(accounts, "tmux_kill_window", lambda w: None), \
+                 mock.patch.object(accounts, "tmux_new_window", lambda n, c, cmd, target_session=None: (new_calls.append(cmd), "@200")[1]), \
+                 mock.patch.object(accounts, "tmux_pipe_pane", lambda w, l: None), \
+                 mock.patch.object(accounts, "tmux_send_literal_and_enter", lambda w, t: None), \
+                 mock.patch.object(accounts, "wait_for_codex_ready", lambda w, t: True), \
+                 mock.patch.object(accounts, "wait_for_cwd_dialog_and_answer", lambda w, timeout_seconds=8.0: False), \
+                 mock.patch.object(accounts, "wiki_agent_update", lambda t, w, l, sid=None: None):
+                watch = accounts.WatchdogInternalState()
+                await accounts._check_once(watch, emit)
+                await accounts._check_once(watch, emit)
+
+            self.assertEqual(
+                len(new_calls),
+                1,
+                "cooldown must block a second revive inside the window",
+            )
+
+
+class RevivalMessageTests(unittest.TestCase):
+    def test_message_includes_ticket_and_status_file(self) -> None:
+        msg = accounts.revival_message("WIKI-42")
+        self.assertIn("WIKI-42", msg)
+        self.assertIn("/tmp/agent-status/WIKI-42.json", msg)
+        self.assertIn("worker for ticket", msg.lower())
 
 
 if __name__ == "__main__":

@@ -560,6 +560,7 @@ export type AccountEvent =
       to: string;
       revived: string[];
       failed: string[];
+      failed_reasons?: Record<string, string>;
       ts: string;
     }
   | {
@@ -574,11 +575,30 @@ export type AccountEvent =
       ts: string;
     }
   | {
+      type: "codex_auth_dead_revival";
+      revived: string[];
+      failed: string[];
+      failed_reasons?: Record<string, string>;
+      ts: string;
+    }
+  | {
+      type: "codex_auth_dead_exhausted";
+      tickets: string[];
+      ts: string;
+    }
+  | {
       type: "claude_limit_hit";
       ticket: string;
       window: string;
       ts: string;
     };
+
+function failedReasonsSuffix(reasons?: Record<string, string>): string {
+  if (!reasons) return "";
+  const entries = Object.entries(reasons);
+  if (entries.length === 0) return "";
+  return ` — ${entries.map(([ticket, reason]) => `${ticket}: ${reason}`).join("; ")}`;
+}
 
 function accountBannerLine(event: AccountEvent): string {
   switch (event.type) {
@@ -587,7 +607,7 @@ function accountBannerLine(event: AccountEvent): string {
       const revived = event.revived.length;
       const failed = event.failed.length;
       const tail = failed > 0 ? `, ${failed} failed to revive` : "";
-      return `rotated codex account ${from} → ${event.to}, revived ${revived} worker${revived === 1 ? "" : "s"}${tail}`;
+      return `rotated codex account ${from} → ${event.to}, revived ${revived} worker${revived === 1 ? "" : "s"}${tail}${failedReasonsSuffix(event.failed_reasons)}`;
     }
     case "codex_limit_no_eligible":
       return event.reset_at
@@ -595,6 +615,14 @@ function accountBannerLine(event: AccountEvent): string {
         : "codex usage limit hit, no eligible account";
     case "codex_rotation_failed":
       return `codex rotation failed: ${event.error}`;
+    case "codex_auth_dead_revival": {
+      const revived = event.revived.length;
+      const failed = event.failed.length;
+      const tail = failed > 0 ? `, ${failed} failed` : "";
+      return `codex auth-dead: revived ${revived} worker${revived === 1 ? "" : "s"}${tail}${failedReasonsSuffix(event.failed_reasons)}`;
+    }
+    case "codex_auth_dead_exhausted":
+      return `codex auth-dead: revival cap hit on ${event.tickets.join(", ")} — manual attention needed`;
     case "claude_limit_hit":
       return `claude usage limit hit on ${event.ticket}`;
   }
@@ -602,6 +630,9 @@ function accountBannerLine(event: AccountEvent): string {
 
 function bannerTone(event: AccountEvent): "info" | "warn" | "danger" {
   if (event.type === "codex_rotation") return "info";
+  if (event.type === "codex_auth_dead_revival") {
+    return event.failed.length > 0 ? "warn" : "info";
+  }
   if (event.type === "claude_limit_hit") return "warn";
   return "danger";
 }
