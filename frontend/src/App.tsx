@@ -46,14 +46,9 @@ import { LoadingPlaceholder } from "./loading";
 import { GraphView } from "./graph";
 import { HealthView } from "./health";
 import { TokensView } from "./tokens";
-import { KanbanBoard, appendDoneEntry } from "./kanban";
-import { SecondaryPane } from "./pane";
-import {
-  ObsidianMarkdown,
-  prepareMarkdown,
-  splitFrontmatter,
-  stripLeadingTitle
-} from "./markdown";
+import { appendDoneEntry } from "./kanban";
+import { WorkspacePane, type PaneNoteFocusState } from "./pane";
+import { prepareMarkdown, splitFrontmatter } from "./markdown";
 import {
   applyTheme,
   getStoredTheme,
@@ -957,6 +952,7 @@ export default function App() {
   const [theme, setTheme] = useState<ThemeId>(() => getStoredTheme());
   const [agentsOpenTicket, setAgentsOpenTicket] = useState<string | null>(null);
   const viewContentRef = useRef<HTMLDivElement | null>(null);
+  const preserveViewScrollRef = useRef(false);
   const appliedHashRef = useRef<string | null>(null);
   const closedTicketsRef = useRef<Set<string>>(new Set());
 
@@ -1066,6 +1062,10 @@ export default function App() {
   );
 
   useEffect(() => {
+    if (preserveViewScrollRef.current) {
+      preserveViewScrollRef.current = false;
+      return;
+    }
     viewContentRef.current?.scrollTo(0, 0);
   }, [activeNote?.path, mode]);
 
@@ -1328,6 +1328,7 @@ export default function App() {
   }
 
   function focusWindowPane(windowId: string, paneId: string) {
+    preserveViewScrollRef.current = true;
     setWindowState((current) => {
       const target = current.windows.find((window) => window.id === windowId);
       if (current.activeWindowId === windowId && target?.focusedPaneId === paneId) {
@@ -2169,9 +2170,6 @@ export default function App() {
   const status = countWords(
     isEditor ? draft.content : prepareMarkdown(activeParsed.body)
   );
-  const isKanban =
-    activeParsed.properties?.some(([key, value]) => key === "view" && value === "kanban") ??
-    false;
 
   function handlePaneDrop(targetKey: string, zone: DropZone) {
     setZoomedPaneId(null);
@@ -2285,17 +2283,122 @@ export default function App() {
     );
   }
 
-  function renderLayout(node: Layout, primaryContent: ReactNode, path: number[]): ReactNode {
+  function renderFocusedPaneOverlayContent(): ReactNode {
+    if (mode === "activity") {
+      return <ActivityFeed onOpenNote={openNote} refreshTick={refreshTick} />;
+    }
+    if (mode === "graph") {
+      return <GraphView onOpenNote={openNote} />;
+    }
+    if (mode === "health") {
+      return <HealthView notes={notes} onOpenNote={openNote} />;
+    }
+    if (mode === "tokens") {
+      return <TokensView />;
+    }
+    if (mode === "agents") {
+      return (
+        <AgentsView
+          accountEvents={accountEvents}
+          data={agentsState}
+          onOpenAgent={openAgent}
+          onOpenTicket={setAgentsOpenTicket}
+          openTicket={agentsOpenTicket}
+          refreshTick={refreshTick}
+        />
+      );
+    }
+    if (mode === "empty") {
+      return (
+        <div className="empty-state">
+          <div className="empty-state-title">No file is open</div>
+          <div className="empty-state-actions">
+            <button type="button" onClick={startNewNote}>
+              Create new note
+            </button>
+            {notes.length > 0 ? (
+              <button type="button" onClick={() => openNote(notes[0].path)}>
+                Open most recent note
+              </button>
+            ) : null}
+          </div>
+        </div>
+      );
+    }
+    if (mode === "new") {
+      return (
+        <div className="markdown-source-view">
+          <div className="markdown-sizer">
+            <div className="new-note-meta">
+              <input
+                className="inline-title-input"
+                placeholder="Untitled"
+                type="text"
+                value={draft.title}
+                onChange={(event) =>
+                  setDraft((current) => ({ ...current, title: event.target.value }))
+                }
+              />
+              <input
+                className="note-path-input"
+                placeholder="folder/note.md (optional)"
+                type="text"
+                value={draft.path}
+                onChange={(event) =>
+                  setDraft((current) => ({ ...current, path: event.target.value }))
+                }
+              />
+            </div>
+            <textarea
+              className="source-editor"
+              spellCheck="true"
+              value={draft.content}
+              onChange={(event) =>
+                setDraft((current) => ({ ...current, content: event.target.value }))
+              }
+            />
+          </div>
+        </div>
+      );
+    }
+    return null;
+  }
+
+  function renderLayout(node: Layout, path: number[]): ReactNode {
     if (zoomedPaneId && node.kind === "split") {
       if (layoutContains(node.first, zoomedPaneId)) {
-        return renderLayout(node.first, primaryContent, [...path, 1]);
+        return renderLayout(node.first, [...path, 1]);
       }
       if (layoutContains(node.second, zoomedPaneId)) {
-        return renderLayout(node.second, primaryContent, [...path, 2]);
+        return renderLayout(node.second, [...path, 2]);
       }
     }
 
     if (node.kind === "pane") {
+      const focused = focusedPaneId === node.id;
+      const overlayContent = focused ? renderFocusedPaneOverlayContent() : null;
+      const noteFocusState: PaneNoteFocusState =
+        focused && mode === "view" && activeNote?.path === node.path
+          ? {
+              kind: "view",
+              links: links[activeNote.path] ?? null,
+              note: activeNote,
+              onChangeKanban: saveKanbanContent,
+              onCompleteKanban: completeKanbanCard,
+              onCreateNote: promptCreateUnresolved,
+            }
+          : focused && mode === "edit" && activeNote?.path === node.path
+            ? {
+                kind: "edit",
+                draft,
+                setDraft,
+              }
+            : null;
+      const agentPanelForPane =
+        focused && mode === "agent" && agentTicket && node.path === `agent://${agentTicket}`
+          ? agentPanel
+          : null;
+      const scrollRef = focused && !overlayContent ? viewContentRef : undefined;
       return (
         <PaneDropTarget
           active={draggingNotePath !== null}
@@ -2304,18 +2407,19 @@ export default function App() {
         >
           {renderPaneFrame(
             node.id,
-            focusedPaneId === node.id ? (
-              primaryContent
-            ) : (
-              <SecondaryPane
-                agentWorkers={agentWorkers}
-                notes={notes}
-                path={node.path}
-                refreshTick={refreshTick}
-                onClose={() => closeFocusedPane(node.id)}
-                onOpenNote={openNote}
-              />
-            )
+            <WorkspacePane
+              agentPanel={agentPanelForPane}
+              agentWorkers={agentWorkers}
+              focused={focused}
+              noteFocusState={noteFocusState}
+              notes={notes}
+              onClose={() => closeFocusedPane(node.id)}
+              onOpenNote={openNote}
+              overlayContent={overlayContent}
+              path={node.path}
+              refreshTick={refreshTick}
+              scrollRef={scrollRef}
+            />
           )}
         </PaneDropTarget>
       );
@@ -2327,7 +2431,7 @@ export default function App() {
         style={{ ["--split-ratio" as string]: node.ratio }}
       >
         <div className="pane-cell">
-          {renderLayout(node.first, primaryContent, [...path, 1])}
+          {renderLayout(node.first, [...path, 1])}
         </div>
         <PaneDivider
           direction={node.direction}
@@ -2346,7 +2450,7 @@ export default function App() {
           }
         />
         <div className="pane-cell">
-          {renderLayout(node.second, primaryContent, [...path, 2])}
+          {renderLayout(node.second, [...path, 2])}
         </div>
       </div>
     );
@@ -2617,155 +2721,7 @@ export default function App() {
 
         <div className="workspace-panes">
           {activeWindow ? (
-            renderLayout(
-              activeWindow.layout,
-              <div className="view-content" ref={viewContentRef}>
-          {mode === "activity" ? (
-            <ActivityFeed onOpenNote={openNote} refreshTick={refreshTick} />
-          ) : mode === "graph" ? (
-            <GraphView onOpenNote={openNote} />
-          ) : mode === "health" ? (
-            <HealthView notes={notes} onOpenNote={openNote} />
-          ) : mode === "agent" && agentTicket ? (
-            <AgentSessionView
-              initialPanel={agentPanel}
-              key={agentTicket}
-              refreshTick={refreshTick}
-              worker={activeAgentWorker ?? { ticket: agentTicket }}
-            />
-          ) : mode === "agents" ? (
-            <AgentsView
-              data={agentsState}
-              onOpenAgent={openAgent}
-              refreshTick={refreshTick}
-              openTicket={agentsOpenTicket}
-              onOpenTicket={setAgentsOpenTicket}
-              accountEvents={accountEvents}
-            />
-          ) : mode === "tokens" ? (
-            <TokensView />
-          ) : mode === "empty" ? (
-            <div className="empty-state">
-              <div className="empty-state-title">No file is open</div>
-              <div className="empty-state-actions">
-                <button type="button" onClick={startNewNote}>
-                  Create new note
-                </button>
-                {notes.length > 0 ? (
-                  <button type="button" onClick={() => openNote(notes[0].path)}>
-                    Open most recent note
-                  </button>
-                ) : null}
-              </div>
-            </div>
-          ) : mode === "view" && activeNote ? (
-            <div className="markdown-reading-view" key={activeNote.path}>
-              <div className={`markdown-sizer${isKanban ? " kanban-sizer" : ""}`}>
-                <h1 className="inline-title">{activeNote.title}</h1>
-                {!isKanban && activeParsed.properties && activeParsed.properties.length > 0 ? (
-                  <div className="metadata-container" aria-label="Properties">
-                    {activeParsed.properties.map(([key, value]) => (
-                      <div className="metadata-property" key={key}>
-                        <span className="metadata-property-key">{key}</span>
-                        <span className="metadata-property-value">
-                          {Array.isArray(value) ? (
-                            value.map((item) => (
-                              <span className="metadata-pill" key={item}>
-                                {item}
-                              </span>
-                            ))
-                          ) : (
-                            value
-                          )}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                ) : null}
-                {isKanban ? (
-                  <KanbanBoard
-                    content={activeNote.content}
-                    notes={notes}
-                    onChange={saveKanbanContent}
-                    onComplete={completeKanbanCard}
-                    onOpenNote={openNote}
-                  />
-                ) : (
-                  <div className="markdown-preview-view">
-                    <ObsidianMarkdown
-                      content={stripLeadingTitle(activeParsed.body, activeNote.title)}
-                      notes={notes}
-                      onCreateNote={promptCreateUnresolved}
-                      onOpenNote={openNote}
-                    />
-                  </div>
-                )}
-                {(links[activeNote.path]?.incoming.length ?? 0) > 0 ? (
-                  <div className="backlinks">
-                    <div className="backlinks-heading">
-                      Linked mentions
-                      <span className="backlinks-count">
-                        {links[activeNote.path].incoming.length}
-                      </span>
-                    </div>
-                    <div className="backlinks-list">
-                      {links[activeNote.path].incoming.map((linkPath) => (
-                        <button
-                          className="backlink"
-                          key={linkPath}
-                          type="button"
-                          onClick={() => openNote(linkPath)}
-                        >
-                          <span className="backlink-name">{basename(linkPath)}</span>
-                          <span className="backlink-path">{linkPath}</span>
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                ) : null}
-              </div>
-            </div>
-          ) : isEditor ? (
-            <div className="markdown-source-view">
-              <div className="markdown-sizer">
-                {mode === "new" ? (
-                  <div className="new-note-meta">
-                    <input
-                      className="inline-title-input"
-                      placeholder="Untitled"
-                      type="text"
-                      value={draft.title}
-                      onChange={(event) =>
-                        setDraft((current) => ({ ...current, title: event.target.value }))
-                      }
-                    />
-                    <input
-                      className="note-path-input"
-                      placeholder="folder/note.md (optional)"
-                      type="text"
-                      value={draft.path}
-                      onChange={(event) =>
-                        setDraft((current) => ({ ...current, path: event.target.value }))
-                      }
-                    />
-                  </div>
-                ) : (
-                  <h1 className="inline-title">{draft.title}</h1>
-                )}
-                <textarea
-                  className="source-editor"
-                  spellCheck="true"
-                  value={draft.content}
-                  onChange={(event) =>
-                    setDraft((current) => ({ ...current, content: event.target.value }))
-                  }
-                />
-              </div>
-            </div>
-          ) : null}
-              </div>,
-              []
-            )
+            renderLayout(activeWindow.layout, [])
           ) : (
             <div className="view-content" ref={viewContentRef}>
               {mode === "activity" ? (
