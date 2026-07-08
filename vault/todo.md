@@ -8,6 +8,7 @@ updated: 2026-07-08
 
 Todo:
 
+- [P1] WIKI-23: pane/window open semantics — (1) subagent inspect panel splits the OWNING PANE not the window; (2) clicking notes/docs/activity/graph opens a NEW tmux window by default (drag-in still embeds), never replaces focused pane
 
 In Progress:
 
