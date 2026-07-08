@@ -4270,6 +4270,7 @@ body.is-resizing-panes {
 .agent-session-surface-main {
   display: flex;
   flex: 1;
+  flex-direction: column;
   min-height: 0;
   min-width: 0;
 }
