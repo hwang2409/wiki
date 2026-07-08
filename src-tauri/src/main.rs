@@ -5,6 +5,7 @@ mod backend;
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .setup(backend::setup)
         .on_window_event(backend::handle_window_event)

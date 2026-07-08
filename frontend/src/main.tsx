@@ -1,6 +1,7 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App";
+import { installExternalLinkInterceptors } from "./external-links";
 import "./styles.css";
 import "./themes.css";
 import { applyStoredTheme } from "./themes";
@@ -10,6 +11,7 @@ import { hydrateFromServer, installUiStateWriteBack } from "./ui-state-sync";
 async function bootstrap() {
   await hydrateFromServer();
   installUiStateWriteBack();
+  installExternalLinkInterceptors();
   applyStoredTheme();
   applyStoredFonts();
 

@@ -20,6 +20,7 @@ import type {
   SpawnWorkerKind,
   SpawnWorkerRole,
 } from "./api";
+import { externalLinkProps } from "./external-links";
 import { LoadingPlaceholder } from "./loading";
 import { SessionSidebar } from "./session";
 import type { SidebarTarget } from "./session";
@@ -757,8 +758,7 @@ export function AgentsView({
           <a
             className="agent-ticket"
             href={`https://linear.app/phoebework/issue/${worker.ticket}`}
-            rel="noopener noreferrer"
-            target="_blank"
+            {...externalLinkProps(`https://linear.app/phoebework/issue/${worker.ticket}`)}
           >
             {worker.ticket}
           </a>
@@ -804,7 +804,7 @@ export function AgentsView({
             </span>
           ) : null}
           {worker.pr ? (
-            <a className="agent-pr" href={worker.pr} rel="noopener noreferrer" target="_blank">
+            <a className="agent-pr" href={worker.pr} {...externalLinkProps(worker.pr)}>
               <ExternalLink size={11} />
               PR
             </a>
@@ -903,8 +903,7 @@ export function AgentsView({
                     <a
                       className="agent-ticket"
                       href={`https://linear.app/phoebework/issue/${entry.ticket}`}
-                      rel="noopener noreferrer"
-                      target="_blank"
+                      {...externalLinkProps(`https://linear.app/phoebework/issue/${entry.ticket}`)}
                     >
                       {entry.ticket}
                     </a>
@@ -926,8 +925,7 @@ export function AgentsView({
                       <a
                         className="agent-pr"
                         href={entry.pr}
-                        rel="noopener noreferrer"
-                        target="_blank"
+                        {...externalLinkProps(entry.pr)}
                       >
                         <ExternalLink size={11} />
                         PR

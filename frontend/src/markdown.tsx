@@ -20,6 +20,7 @@ import {
   X,
   Zap
 } from "lucide-react";
+import { externalLinkProps, isExternalHttpUrl } from "./external-links";
 import type { NoteSummary } from "./types";
 
 type MdNode = {
@@ -425,10 +426,10 @@ function createComponents(
       );
     }
 
-    const isExternal = /^[a-z][\w+.-]*:\/\//i.test(href ?? "");
+    const isExternal = isExternalHttpUrl(href);
     if (isExternal) {
       return (
-        <a className="external-link" href={href} rel="noopener noreferrer" target="_blank">
+        <a className="external-link" href={href} {...externalLinkProps(href)}>
           {children}
         </a>
       );
