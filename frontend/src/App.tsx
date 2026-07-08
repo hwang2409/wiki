@@ -943,6 +943,7 @@ export default function App() {
   const [agentsOpenTicket, setAgentsOpenTicket] = useState<string | null>(null);
   const viewContentRef = useRef<HTMLDivElement | null>(null);
   const appliedHashRef = useRef<string | null>(null);
+  const closedTicketsRef = useRef<Set<string>>(new Set());
 
   function nextPaneId() {
     paneIdRef.current += 1;
@@ -1109,7 +1110,10 @@ export default function App() {
             .filter((ticket): ticket is string => ticket !== null)
         )
       );
-      const missing = liveWorkers.filter((worker) => !openTickets.has(worker.ticket));
+      const closedTickets = closedTicketsRef.current;
+      const missing = liveWorkers.filter(
+        (worker) => !openTickets.has(worker.ticket) && !closedTickets.has(worker.ticket)
+      );
       if (missing.length === 0) return current;
       const next = { ...current, windows: [...current.windows] };
       for (const worker of missing) {
@@ -1307,15 +1311,19 @@ export default function App() {
   }
 
   function focusWindowPane(windowId: string, paneId: string) {
-    setWindowState((current) =>
-      normalizeWindowWorkspaceState({
+    setWindowState((current) => {
+      const target = current.windows.find((window) => window.id === windowId);
+      if (current.activeWindowId === windowId && target?.focusedPaneId === paneId) {
+        return current;
+      }
+      return normalizeWindowWorkspaceState({
         ...current,
         activeWindowId: windowId,
         windows: current.windows.map((window) =>
           window.id === windowId ? { ...window, focusedPaneId: paneId } : window
         ),
-      })
-    );
+      });
+    });
     requestAnimationFrame(() => paneRefs.current.get(paneId)?.focus());
   }
 
@@ -1434,6 +1442,7 @@ export default function App() {
   }
 
   function openAgent(ticket: string, panel: AgentRoutePanel = null, syncHash = true) {
+    closedTicketsRef.current.delete(ticket);
     const existing = findPaneLocationByTicket(ticket);
     if (existing) {
       if (zoomedPaneId && zoomedPaneId !== existing.pane.key) setZoomedPaneId(null);
@@ -1571,6 +1580,7 @@ export default function App() {
     const panesInWindow = collectPaneInfos(targetWindow.layout);
     if (panesInWindow.length === 1) {
       nextWindows.splice(activeIndex, 1);
+      if (focused.ticket) closedTicketsRef.current.add(focused.ticket);
     } else {
       const removal = removePane(targetWindow.layout, targetPaneId);
       if (!removal.layout) return;
@@ -1884,6 +1894,15 @@ export default function App() {
     }
   }
 
+  const openAgentRef = useRef(openAgent);
+  const openNoteRef = useRef(openNote);
+  const syncRouteToPathRef = useRef(syncRouteToPath);
+  const activeWindowRef = useRef(activeWindow);
+  openAgentRef.current = openAgent;
+  openNoteRef.current = openNote;
+  syncRouteToPathRef.current = syncRouteToPath;
+  activeWindowRef.current = activeWindow;
+
   useEffect(() => {
     let disposed = false;
 
@@ -1895,10 +1914,12 @@ export default function App() {
 
       setError(null);
       if (route.kind === "empty") {
-        const activePane =
-          activeWindow ? findPaneInfo(activeWindow.layout, activeWindow.focusedPaneId) : null;
+        const currentActive = activeWindowRef.current;
+        const activePane = currentActive
+          ? findPaneInfo(currentActive.layout, currentActive.focusedPaneId)
+          : null;
         if (activePane) {
-          syncRouteToPath(activePane.path, { syncHash: false });
+          syncRouteToPathRef.current(activePane.path, { syncHash: false });
           return;
         }
         setActiveNote(null);
@@ -1916,7 +1937,7 @@ export default function App() {
         return;
       }
       if (route.kind === "agent") {
-        openAgent(route.ticket, route.panel, false);
+        openAgentRef.current(route.ticket, route.panel, false);
         return;
       }
       if (route.kind !== "note" && route.kind !== "edit") {
@@ -1927,7 +1948,11 @@ export default function App() {
         return;
       }
 
-      await openNote(route.path, { edit: route.kind === "edit", focusExisting: true, syncHash: false });
+      await openNoteRef.current(route.path, {
+        edit: route.kind === "edit",
+        focusExisting: true,
+        syncHash: false,
+      });
       if (disposed) return;
     }
 
@@ -1935,10 +1960,9 @@ export default function App() {
     window.addEventListener("hashchange", applyRoute);
     return () => {
       disposed = true;
-      appliedHashRef.current = null;
       window.removeEventListener("hashchange", applyRoute);
     };
-  }, [activeWindow, openAgent, openNote]);
+  }, []);
 
   useEffect(() => {
     function onKeyDown(event: globalThis.KeyboardEvent) {

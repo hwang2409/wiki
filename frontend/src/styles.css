@@ -1515,9 +1515,7 @@ body.is-resizing-panes {
   flex: 1;
 }
 
-.tmux-group-list,
 .tmux-window-list,
-.tmux-group-items,
 .status-bar-metrics {
   display: flex;
   align-items: center;
@@ -1525,20 +1523,15 @@ body.is-resizing-panes {
   min-width: 0;
 }
 
-.tmux-group-list,
-.tmux-window-list,
-.tmux-group-items {
+.tmux-window-list {
   overflow-x: auto;
   scrollbar-width: none;
 }
 
-.tmux-group-list::-webkit-scrollbar,
-.tmux-window-list::-webkit-scrollbar,
-.tmux-group-items::-webkit-scrollbar {
+.tmux-window-list::-webkit-scrollbar {
   display: none;
 }
 
-.tmux-group-button,
 .tmux-status-item {
   display: inline-flex;
   align-items: center;
@@ -1553,13 +1546,11 @@ body.is-resizing-panes {
   transition: background-color 100ms ease-out, color 100ms ease-out;
 }
 
-.tmux-group-button:hover,
 .tmux-status-item:hover {
   background-color: var(--background-modifier-hover);
   color: var(--text-normal);
 }
 
-.tmux-group-button.is-active,
 .tmux-status-item.is-active {
   background-color: var(--background-modifier-active);
   color: var(--text-normal);
@@ -1574,11 +1565,6 @@ body.is-resizing-panes {
   max-width: 20ch;
   overflow: hidden;
   text-overflow: ellipsis;
-}
-
-.tmux-status-glyph {
-  margin-left: 5px;
-  color: var(--text-muted);
 }
 
 .tmux-group-empty {
