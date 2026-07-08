@@ -222,6 +222,26 @@ class ClaudeUsageTests(unittest.TestCase):
             self.assertEqual(b["input"], 10)
             self.assertEqual(b["output"], 20)
 
+    def test_dedupes_cross_file(self) -> None:
+        """Resume/fork replays put identical msg ids in different files."""
+        with _EnvOverride() as paths:
+            from backend.app import tokens
+
+            usage = {"input_tokens": 10, "output_tokens": 20}
+            _write_jsonl(
+                paths["claude"] / "proj-a" / "orig.jsonl",
+                [_claude_assistant_row("2026-07-08T18:00:00Z", "msg_shared", "sonnet", usage)],
+            )
+            _write_jsonl(
+                paths["claude"] / "proj-b" / "fork.jsonl",
+                [_claude_assistant_row("2026-07-08T18:00:00Z", "msg_shared", "sonnet", usage)],
+            )
+            state = tokens.refresh()
+            # Both files replayed the same message id — must NOT double-count.
+            totals = tokens.query()["totals"]
+            self.assertEqual(totals["input"], 10)
+            self.assertEqual(totals["output"], 20)
+
 
 class BucketAggregationTests(unittest.TestCase):
     def test_hourly_and_daily_rollups(self) -> None:
@@ -361,6 +381,60 @@ class IncrementalScanTests(unittest.TestCase):
             hour_bucket = next((b for b in hourly["buckets"] if b["ts"] == hour_ts), None)
             self.assertIsNotNone(hour_bucket)
             self.assertEqual(hour_bucket["series"]["codex/gpt-5.4"]["input"], 42)
+
+
+    def test_multibyte_tail_append_preserves_offset(self) -> None:
+        """Regression: byte-vs-character offset desync on non-ASCII tail read.
+
+        If the mid-line split uses decoded-string indices, a chunk containing
+        multi-byte UTF-8 leaves the file offset short of the actual bytes
+        consumed. The next scan re-parses complete token_count rows and the
+        cumulative-delta anchor re-anchors to a stale value, permanently
+        double-counting.
+        """
+        with _EnvOverride() as paths:
+            from backend.app import tokens
+
+            rollout = paths["codex"] / "2026/07/08/rollout-m.jsonl"
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            # First row: session_meta. Second row: token_count with a fat
+            # multi-byte user_message payload (emoji + CJK). Third row: partial
+            # (no newline) — mid-line tail. Written by hand to control bytes.
+            row1 = json.dumps(_codex_session_meta("2026-07-08T18:00:00Z", "gpt-5.4"))
+            row2 = json.dumps(_codex_token_row("2026-07-08T18:00:10Z", {"input": 100}))
+            row3_partial_bytes = (
+                b'{"timestamp":"2026-07-08T18:15:00Z","type":"event_msg","payload":'
+                b'{"type":"user_message","message":"'
+                + "🚀🚀🚀 中文测试 🚀🚀🚀".encode("utf-8")
+            )  # no closing quote, no newline — genuinely partial
+            rollout.write_bytes(
+                row1.encode("utf-8") + b"\n" + row2.encode("utf-8") + b"\n" + row3_partial_bytes
+            )
+            tokens.refresh()
+            state = tokens._load_state()  # noqa: SLF001
+            offset = state["files"][str(rollout)]["offset"]
+            # Offset must equal exactly the bytes of the two complete lines
+            # (including their trailing newlines).
+            expected = len(row1.encode("utf-8")) + 1 + len(row2.encode("utf-8")) + 1
+            self.assertEqual(offset, expected)
+
+            # Now finish row3 with a valid token_count and append row4.
+            row3_full = json.dumps(
+                _codex_token_row("2026-07-08T18:15:00Z", {"input": 300})
+            )
+            row4 = json.dumps(
+                _codex_token_row("2026-07-08T18:30:00Z", {"input": 500})
+            )
+            with rollout.open("wb") as f:
+                f.write(row1.encode("utf-8") + b"\n")
+                f.write(row2.encode("utf-8") + b"\n")
+                f.write(row3_full.encode("utf-8") + b"\n")
+                f.write(row4.encode("utf-8") + b"\n")
+            tokens.refresh()
+            # Total input = 100 (r2) + (300-100) (r3) + (500-300) (r4) = 500.
+            # If the offset had desynced, row2/row3 would be re-parsed and the
+            # drop-clamp path would re-anchor, silently doubling the total.
+            self.assertEqual(tokens.query()["totals"]["input"], 500)
 
 
 if __name__ == "__main__":

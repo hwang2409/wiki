@@ -47,12 +47,26 @@ function formatCompact(n: number): string {
 function formatBucketLabel(iso: string, mode: BucketMode): string {
   const d = new Date(iso);
   if (mode === "day") {
-    return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+    // Backend buckets are UTC-floored; formatting locally would shift the
+    // label by a day for anyone in a negative UTC offset.
+    return d.toLocaleDateString(undefined, {
+      month: "short",
+      day: "numeric",
+      timeZone: "UTC",
+    });
   }
   return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
 }
 
-function bucketFull(iso: string): string {
+function bucketFull(iso: string, mode: BucketMode): string {
+  if (mode === "day") {
+    return new Date(iso).toLocaleDateString(undefined, {
+      month: "short",
+      day: "numeric",
+      year: "numeric",
+      timeZone: "UTC",
+    });
+  }
   return new Date(iso).toLocaleString(undefined, {
     month: "short",
     day: "numeric",
@@ -128,7 +142,11 @@ export function TokensView() {
     const bucketsFiltered = data.buckets.map((bucket) => {
       const series: TokenBucket["series"] = {};
       for (const [key, values] of Object.entries(bucket.series)) {
-        const [cli, model] = key.split("/");
+        // Only the first "/" separates cli from model — models like
+        // "openai/gpt-5.4" would otherwise be truncated by split("/").
+        const slash = key.indexOf("/");
+        const cli = slash === -1 ? key : key.slice(0, slash);
+        const model = slash === -1 ? "" : key.slice(slash + 1);
         if (cliFilter.size > 0 && !cliFilter.has(cli)) continue;
         if (modelFilter.size > 0 && !modelFilter.has(model)) continue;
         series[key] = values;
@@ -463,7 +481,7 @@ function TokensChart({
             top: Math.max(0, hover!.y - 12),
           }}
         >
-          <div className="tokens-tooltip-title">{bucketFull(hoveredBucket.ts)}</div>
+          <div className="tokens-tooltip-title">{bucketFull(hoveredBucket.ts, bucketMode)}</div>
           {seriesKeys.map((key) => {
             const value = seriesTotal(hoveredBucket, key, activeMetrics);
             if (value <= 0) return null;

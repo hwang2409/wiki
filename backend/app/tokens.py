@@ -26,8 +26,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
-CACHE_VERSION = 1
-MAX_MSG_IDS_PER_FILE = 5000  # streaming dedupe window; assistant rows / session
+CACHE_VERSION = 2  # v1 caches had a byte-offset desync on non-ASCII tail reads
+                    # + per-file (not global) msg-id dedupe; both wipe on load.
 
 BUCKET_HOUR = "hour"
 BUCKET_DAY = "day"
@@ -57,10 +57,15 @@ def token_cache_path() -> Path:
 def _empty_state() -> dict:
     return {
         "version": CACHE_VERSION,
-        # path -> {offset, mtime, size, cli, model, cum (dict|None), sess_id, msg_ids (list, LRU)}
+        # path -> {offset, mtime, size, cli, model, cum (dict|None), sess_id}
         "files": {},
         # list of {ts (iso hour), cli, model, input, cached, output, reasoning}
         "buckets": [],
+        # Global msg-id dedupe across all claude project/subagent files —
+        # 277/21,521 real ids appear in >=2 files (resume/fork replays);
+        # per-file dedupe double-counts ~1.3%. Persisted as a list; loaded
+        # into a set for O(1) membership.
+        "seen_msg_ids": [],
     }
 
 
@@ -73,6 +78,10 @@ def _load_state() -> dict:
         return _empty_state()
     raw.setdefault("files", {})
     raw.setdefault("buckets", [])
+    raw.setdefault("seen_msg_ids", [])
+    # Rehydrate the on-disk id list into an in-memory set for O(1) lookup;
+    # _save_state serialises it back to a sorted list on the way out.
+    raw["_seen_msg_ids_set"] = set(raw["seen_msg_ids"])
     return raw
 
 
@@ -82,8 +91,14 @@ def _save_state(state: dict) -> None:
     except OSError:
         return
     tmp = token_cache_path().with_suffix(".tmp")
+    # Freeze the in-memory set back to a stable on-disk list. Keep the set
+    # off-disk (private "_"-prefixed key) so JSON doesn't choke on it.
+    seen = state.get("_seen_msg_ids_set")
+    if isinstance(seen, set):
+        state["seen_msg_ids"] = sorted(seen)
+    serialisable = {k: v for k, v in state.items() if not k.startswith("_")}
     try:
-        tmp.write_text(json.dumps(state), encoding="utf-8")
+        tmp.write_text(json.dumps(serialisable), encoding="utf-8")
         tmp.replace(token_cache_path())
     except OSError:
         return
@@ -194,9 +209,11 @@ def _codex_apply(state: dict, file_state: dict, row: dict, index: dict) -> None:
         delta = cum
     else:
         # A resumed session's counters restart from 0. If ANY counter went
-        # down, treat as a re-anchor: emit zero delta this event, adopt the
-        # new baseline. Individual counters can move independently, so clamp
-        # per-field at 0 rather than dropping the whole event.
+        # down, treat as a re-anchor: emit zero delta this event across all
+        # fields, adopt the new cumulative as the baseline. (Counters that
+        # didn't move backwards are still zeroed for the reset event — codex
+        # ships them as a group and mixing pre/post-resume deltas
+        # over-attributes.)
         drops = any(cum[k] < prev.get(k, 0) for k in cum)
         if drops:
             delta = {k: 0 for k in cum}
@@ -228,13 +245,10 @@ def _claude_apply(state: dict, file_state: dict, row: dict, index: dict) -> None
         return
     msg_id = message.get("id")
     if isinstance(msg_id, str):
-        ids = file_state.setdefault("msg_ids", [])
-        if msg_id in ids:
-            return
-        ids.append(msg_id)
-        # LRU cap — drop oldest half when we hit the ceiling.
-        if len(ids) > MAX_MSG_IDS_PER_FILE:
-            del ids[: MAX_MSG_IDS_PER_FILE // 2]
+        seen = state.setdefault("_seen_msg_ids_set", set())
+        if msg_id in seen:
+            return  # global dedupe: resume/fork replays copy the same id
+        seen.add(msg_id)
 
     model = message.get("model") if isinstance(message.get("model"), str) else None
     delta = {
@@ -276,7 +290,6 @@ def _scan_file(state: dict, path: Path, cli: str, index: dict) -> None:
             "model": None,
             "cum": None,
             "sess_id": None,
-            "msg_ids": [],
             "mtime": stat.st_mtime,
             "size": stat.st_size,
         }
@@ -292,18 +305,20 @@ def _scan_file(state: dict, path: Path, cli: str, index: dict) -> None:
             chunk = f.read()
     except OSError:
         return
-    text = chunk.decode("utf-8", errors="replace")
     # Trailing partial line stays in the file until it's fully written; back
-    # the offset off so we re-read it next scan.
-    if not text.endswith("\n"):
-        last_nl = text.rfind("\n")
+    # the offset off so we re-read it next scan. Do the newline split on the
+    # RAW BYTES — decoded-character indices don't map to file byte offsets
+    # once multi-byte UTF-8 shows up (a mismatch here silently desyncs the
+    # per-file offset and re-parses complete token_count rows on every scan).
+    if not chunk.endswith(b"\n"):
+        last_nl = chunk.rfind(b"\n")
         if last_nl == -1:
-            # No newline at all — nothing complete to parse this pass.
-            return
+            return  # No newline at all — nothing complete to parse this pass.
         consumed = last_nl + 1
-        text = text[:consumed]
+        chunk = chunk[:consumed]
     else:
         consumed = len(chunk)
+    text = chunk.decode("utf-8", errors="replace")
     for line in text.split("\n"):
         if not line.strip():
             continue
