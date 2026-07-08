@@ -9,6 +9,8 @@ updated: 2026-07-08
 
 ## 2026-07-08
 
+- **phoebe** — PHO-13215 Core data products T1 merged (#10830) — resolve_core_account_owner + get_core_account_book + Core endpoints w/ sanitized errors; Jake golden case at ≤3 calls
+- [PHO-13215](https://linear.app/phoebework/issue/PHO-13215): Core data products T1 (resolver+book+endpoints) — cdx:PHO-13215 worker; T2=PHO-13216 queued; PR #10830 review/CI babysitting
 - **WIKI-16** — pane-resize perf — transient CSS-var drag, commit on pointerup (owner: cc:WIKI-16)
 - **WIKI-17** — native app persistence — stable port + server-side ui-state mirror (owner: cc:WIKI-17)
 - **WIKI-14** — render Claude task lists in transcript (counts header + per-task status glyphs like TUI); prereq = JSONL event-coverage audit (unhandled codex/claude event types)
