@@ -24,6 +24,7 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[harness]] — what makes agent harnesses great: verified cross-cutting principles + Claude Code/OpenHands/Codex CLI/Devin/SWE-agent design breakdowns
 - [[conductor]] — Conductor desktop app stack: Tauri/Rust/WebKit + mostly TypeScript; local bundle evidence and public founder statements.
 - [[mcp-vs-native-agent-tooling]] — Henry's position: MCP is generally a bad way to build agent tooling — prefer native, code-aware tools; Core MCP serves external clients only
+- [[multi-account-auth-rotation]] — codex/claude multi-account auth mechanics + rotation design (WIKI-15 watchdog)
 
 ## Phoebe
 
