@@ -26,6 +26,7 @@ Rolling ≤500-word session cache. Rewrite (don't append) at work-arc boundaries
 - Workers must never commit vault/ files into ticket branches (orchestrator strips; vault = orchestrator's at wrap-up).
 
 ## Watchouts
+- Wiki NATIVE app = FROZEN PyInstaller backend (build-time snapshot). Backend patches reach :8011 (hot-reload) but NOT Wiki.app until `make native-build` + relaunch. Symptom: fix verified via curl on 8011, user still sees stale behavior (sidecar port ~8213). Bit us 2026-07-08 (PR-10475 transcript).
 
 - Rotation kills ALL registry cdx workers cross-orchestrator (correct — shared account) — expect phoebe workers to bounce when wiki's watchdog rotates.
 - Local main PUSHED before spawning workers; refetch todo/map/hot before writing (concurrent agents).

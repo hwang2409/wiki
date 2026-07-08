@@ -9,6 +9,8 @@ updated: 2026-07-08
 
 ## 2026-07-08
 
+- **phoebe** — PHO-13218 tiered tool mounting merged (#10845) — 35-tool hot set + domain packs via load_skill + routing evals; ~20k tokens/run saved
+- [PHO-13218](https://linear.app/phoebework/issue/PHO-13218): tiered tool mounting (hot set + domain packs + routing evals) — cdx:PHO-13218 worker
 - **WIKI-25** — unify focused/unfocused pane styling — minimal frame indicator only (owner: cc:WIKI-25)
 - **phoebe** — PHO-13231 search_run_data flood regression test merged (#10848)
 - **WIKI-22** — pane focus remount bug — stable pane identity, focus as prop (owner: cdx:WIKI-22)

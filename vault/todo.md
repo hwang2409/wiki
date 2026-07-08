@@ -12,12 +12,13 @@ Todo:
 
 In Progress:
 
-- [PHO-13218](https://linear.app/phoebework/issue/PHO-13218): tiered tool mounting (hot set + domain packs + routing evals) — cdx:PHO-13218 worker
 - [PHO-13225](https://linear.app/phoebework/issue/PHO-13225): call-recordings tool split (audit P0 #1) — cdx:PHO-13225 worker
 - [PHO-11274](https://linear.app/phoebework/issue/PHO-11274): compare_agent_runs trace comparison (audit-validated P1) — cdx:PHO-11274 worker
 - [PHO-13216](https://linear.app/phoebework/issue/PHO-13216): Core data products T2 (dossier+funnel+MCP mirrors) — cdx:PHO-13216 worker
 - [PHO-13227](https://linear.app/phoebework/issue/PHO-13227): subagent approval inheritance (13226 T2) — cdx:PHO-13227 worker
 - [P1] WIKI-23: pane/window open semantics — (1) subagent inspect panel splits the OWNING PANE not the window; (2) clicking notes/docs/activity/graph opens a NEW tmux window by default (drag-in still embeds), never replaces focused pane
+- [PR #10475](https://github.com/phoebe-health/phoebe/pull/10475): subagent recommendation parity iteration (harness #10692) — cdx:PR-10475 worker; overfitting watch
+- [P1] WIKI-28: external links open in default browser (web target=_blank audit + tauri opener/on_navigation) (owner: cdx:WIKI-28)
 
 Backlog:
 
