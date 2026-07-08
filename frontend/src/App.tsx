@@ -98,6 +98,9 @@ type FleetItem = {
 type FleetGroup = {
   orch: Orchestrator;
   items: FleetItem[];
+  entryTicket: string;
+  chooserEligible: boolean;
+  meta: string;
 };
 
 function splitLayout(
@@ -196,13 +199,13 @@ function cwdBasename(path: string | null): string {
 }
 
 function buildFleetGroups(workers: AgentWorker[], orchestrators: Orchestrator[]): FleetGroup[] {
-  return orchestrators.map((orch) => {
+  const groups = orchestrators.map((orch): FleetGroup => {
     const owned = workers.filter((worker) => worker.orch === orch.id);
     return {
       orch,
       items: [
         {
-          kind: "orchestrator",
+          kind: "orchestrator" as const,
           ticket: orch.id,
           label: orch.id,
           groupId: orch.id,
@@ -220,8 +223,43 @@ function buildFleetGroups(workers: AgentWorker[], orchestrators: Orchestrator[])
           detail: worker.step ?? worker.role ?? worker.kind,
         })),
       ],
+      entryTicket: orch.id,
+      chooserEligible: true,
+      meta: `${cwdBasename(orch.cwd)} · ${orch.window_alive ? "live" : "dead"} · ${
+        owned.length
+      } worker${owned.length === 1 ? "" : "s"}`,
     };
   });
+
+  const unattached = workers.filter(
+    (worker) => !worker.orch || !orchestrators.some((orch) => orch.id === worker.orch)
+  );
+  if (unattached.length > 0) {
+    groups.push({
+      orch: {
+        id: "unattached",
+        window: null,
+        window_alive: false,
+        cwd: null,
+        spawned_at: null,
+        transcript_exists: false,
+      },
+      items: unattached.map((worker) => ({
+        kind: "worker" as const,
+        ticket: worker.ticket,
+        label: worker.ticket,
+        groupId: "unattached",
+        state: worker.state,
+        live: worker.window_alive,
+        detail: worker.step ?? worker.role ?? worker.kind,
+      })),
+      entryTicket: unattached[0].ticket,
+      chooserEligible: false,
+      meta: `${unattached.length} unattached worker${unattached.length === 1 ? "" : "s"}`,
+    });
+  }
+
+  return groups;
 }
 
 function findFleetGroup(groups: FleetGroup[], ticket: string | null): FleetGroup | null {
@@ -881,12 +919,12 @@ export default function App() {
     const preferredTickets = [
       currentViewedAgentTicket,
       lastSelectedAgentRef.current,
-      activeGroup.orch.id,
+      activeGroup.entryTicket,
     ];
     return (
       preferredTickets.find((ticket) =>
         activeGroup.items.some((item) => item.ticket === ticket)
-      ) ?? activeGroup.orch.id
+      ) ?? activeGroup.entryTicket
     );
   }, [activeGroup, currentViewedAgentTicket]);
   const activeGroupIndex = activeGroup
@@ -900,14 +938,12 @@ export default function App() {
     switcherOpen || settingsOpen || fleetChooser !== null || dialog !== null || contextMenu !== null;
   const orchestratorChooserItems = useMemo(
     () =>
-      fleetGroups.map((group) => ({
+      fleetGroups.filter((group) => group.chooserEligible).map((group) => ({
         key: `orch:${group.orch.id}`,
         value: group.orch.id,
         icon: <Bot size={14} />,
         label: group.orch.id,
-        meta: `${cwdBasename(group.orch.cwd)} · ${
-          group.orch.window_alive ? "live" : "dead"
-        } · ${group.items.length - 1} worker${group.items.length === 2 ? "" : "s"}`,
+        meta: group.meta,
         active: activeGroup?.orch.id === group.orch.id,
       })),
     [activeGroup, fleetGroups]
@@ -917,15 +953,13 @@ export default function App() {
       fleetGroups.flatMap((group) => [
         {
           key: `tree-orch:${group.orch.id}`,
-          value: group.orch.id,
+          value: group.entryTicket,
           icon: <Bot size={14} />,
           label: group.orch.id,
-          meta: `${cwdBasename(group.orch.cwd)} · ${
-            group.orch.window_alive ? "live" : "dead"
-          } · ${group.items.length - 1} worker${group.items.length === 2 ? "" : "s"}`,
-          active: activeGroupTicket === group.orch.id,
+          meta: group.meta,
+          active: activeGroupTicket === group.entryTicket,
         },
-        ...group.items.slice(1).map((item) => ({
+        ...group.items.slice(group.chooserEligible ? 1 : 0).map((item) => ({
           key: `tree-worker:${item.ticket}`,
           value: item.ticket,
           icon: <span className="fleet-switcher-glyph">{agentStateGlyph(item.state, item.live)}</span>,
@@ -1372,6 +1406,10 @@ export default function App() {
       const lowerKey = key.toLowerCase();
 
       if (leaderArmed) {
+        if (isEditableTarget(event.target)) {
+          disarmLeader();
+          return;
+        }
         if (["Shift", "Control", "Alt", "Meta"].includes(key)) return;
         event.preventDefault();
         disarmLeader();
@@ -1398,7 +1436,7 @@ export default function App() {
             activeGroupIndex >= 0
               ? (activeGroupIndex + delta + fleetGroups.length) % fleetGroups.length
               : 0;
-          openAgentInContext(fleetGroups[nextIndex].orch.id);
+          openAgentInContext(fleetGroups[nextIndex].entryTicket);
           return;
         }
 
@@ -1568,6 +1606,7 @@ export default function App() {
     false;
 
   function handlePaneDrop(targetKey: string, zone: DropZone) {
+    setZoomedPaneId(null);
     const path = draggingNotePath;
     setDraggingNotePath(null);
     if (!path) return;
@@ -2075,7 +2114,7 @@ export default function App() {
                   type="button"
                   onClick={() => {
                     setActiveGroupId(group.orch.id);
-                    openAgentInContext(group.orch.id);
+                    openAgentInContext(group.entryTicket);
                   }}
                 >
                   {group.orch.id}
