@@ -36,3 +36,4 @@ Backlog:
 - [PHO-11231](https://linear.app/phoebework/issue/PHO-11231): Phoebe Home Care seed data for visual testing
 - [PHO-12982](https://linear.app/phoebework/issue/PHO-12982), 12757: reference tickets (harness doctrine, tool brainstorm)
 - [P2] WIKI-18: delta protocol misses pending-tool output on the landing poll (client keeps output:null) — reproduced on main e4528c8 by PR #14 reviewer; check dirty_from rewind math
+- [P1] WIKI-19: watchdog revival v1.1 — preserve original tmux session (capture #{session_name} before kill, new-window -t <session>:), resume by explicit session id verified (13215 got fresh session via --last), re-poke message must include ticket id + status-file path for fresh-session context recovery

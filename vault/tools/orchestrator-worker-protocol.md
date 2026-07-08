@@ -90,6 +90,7 @@ wiki agent list
 
 - Re-registering a ticket = handoff: prior session auto-archived into `history` with `outcome: handoff` (plan→implement chains, multi-session respawns). Do NOT `done` between sessions.
 - `codex resume` gotcha: resume writes a NEW rollout file (no `resumed_from` lineage) with prior history replayed as `response_item` rows — the kickoff prompt is invisible to the app's first-user_message ticket scan. The resolver falls back to matching `session_meta.cwd` worktree slug (`pho-<num>`) + newest mtime, which self-heals future resumes. After a resume: `wiki agent update` window/log, and keep `worktree` set — it is the resolution key.
+- Revival/respawn must target the worker's ORIGINAL tmux session: `tmux new-window -t <session>:` (capture `#{session_name}` from the old window BEFORE killing it), else windows pile into whatever session the reviver runs in (happened 07-08: watchdog + manual revivals dumped phoebe workers into the wiki session; `tmux move-window -s <wid> -t <session>:` repairs, window ids survive moves).
 - Atomic writes (tmp+rename). `/tmp` lifecycle intentional — reboot kills tmux and registry together.
 - Division of truth: registry = identity/metadata (window_id, kind, role, model, worktree, log path, session chain); status file = state (worker-written, unchanged); tmux liveness = health. The app renders: registry entry w/ dead window ⇒ "worker died?"; status file w/o registry entry ⇒ "unregistered" (skill drift flag).
 
