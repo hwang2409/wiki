@@ -9,7 +9,6 @@ updated: 2026-07-08
 
 ## 2026-07-08
 
-- **WIKI-19** — watchdog revival v1.1 — preserve original tmux session (capture #{session_name} before kill, new-window -t <session>:), resume by explicit session id verified (13215 got fresh session via --last), re-poke message must include ticket id + status-file path for fresh-session context recovery
 - **WIKI-16** — pane-resize perf — transient CSS-var drag, commit on pointerup (owner: cc:WIKI-16)
 - **WIKI-17** — native app persistence — stable port + server-side ui-state mirror (owner: cc:WIKI-17)
 - **WIKI-14** — render Claude task lists in transcript (counts header + per-task status glyphs like TUI); prereq = JSONL event-coverage audit (unhandled codex/claude event types)
