@@ -371,17 +371,31 @@ def _codex_tool_end_output(ptype: str, payload: dict) -> tuple[str, bool | None]
     return json.dumps(payload), None
 
 
-def _seen_msg(state: dict, role: str, text: str) -> bool:
-    """Codex live sessions emit BOTH event_msg user_message/agent_message AND
-    response_item/message with identical text — dedupe by (role, text-head)."""
-    key = (role, text[:400])
-    seen: dict = state.setdefault("seen_msgs", {})
-    if key in seen:
+def _dedupe_pair(state: dict, source: str, role: str, text: str) -> bool:
+    """Pair-consumption dedupe. Codex live sessions emit the SAME turn as
+    both `event_msg` user_message/agent_message AND `response_item`/message.
+    Naive set-based dedup drops legitimate repeats ("Continue" x89 in one
+    audited rollout).
+
+    Model: each rendered message grants one suppress-credit for its twin
+    (opposite source). The next twin arrival consumes the credit and is
+    skipped. Bidirectional — either source can arrive first (audit measured
+    41 event_msg-first vs 2 response_item-first orderings). No credit ⇒
+    render normally (a true repeat from the same source, or an unpaired one).
+    """
+    key = (source, role, text.strip()[:400])
+    credits: dict = state.setdefault("dedupe_credits", {})
+    if credits.get(key, 0) > 0:
+        credits[key] -= 1
+        if credits[key] == 0:
+            del credits[key]
         return True
-    seen[key] = True
-    if len(seen) > 500:
-        for old in list(seen.keys())[:250]:
-            del seen[old]
+    twin_source = "response_item" if source == "event_msg" else "event_msg"
+    twin_key = (twin_source, role, text.strip()[:400])
+    credits[twin_key] = credits.get(twin_key, 0) + 1
+    if len(credits) > 2000:
+        for old in list(credits.keys())[:1000]:
+            del credits[old]
     return False
 
 
@@ -396,11 +410,11 @@ def _codex_apply(state: dict, row: dict) -> None:
     if rtype == "event_msg":
         if ptype == "user_message":
             text = _clip(payload.get("message") or "", MAX_TEXT)
-            if text and not _seen_msg(state, "user", text):
+            if text and not _dedupe_pair(state, "event_msg", "user", text):
                 events.append({"kind": "user", "ts": ts, "text": text})
         elif ptype == "agent_message":
             text = _clip(payload.get("message") or "", MAX_TEXT)
-            if text and not _seen_msg(state, "assistant", text):
+            if text and not _dedupe_pair(state, "event_msg", "assistant", text):
                 events.append({"kind": "assistant", "ts": ts, "text": text})
         elif ptype == "token_count":
             info = payload.get("info") or {}
@@ -434,7 +448,7 @@ def _codex_apply(state: dict, row: dict) -> None:
                     if isinstance(text_field, str) and text_field:
                         parts.append(text_field)
             text = "\n".join(parts).strip()
-            if not text or _seen_msg(state, role, text):
+            if not text or _dedupe_pair(state, "response_item", role, text):
                 return
             events.append({"kind": role, "ts": ts, "text": _clip(text, MAX_TEXT)})
         elif ptype == "reasoning":
@@ -719,7 +733,8 @@ def _claude_apply(state: dict, row: dict) -> None:
     if rtype == "system":
         label = _SYSTEM_MARKERS.get(row.get("subtype"))
         if label:
-            error = row.get("error") or {}
+            error_raw = row.get("error")
+            error = error_raw if isinstance(error_raw, dict) else {}
             detail = row.get("content") or error.get("formatted") or error.get("message")
             text = f"{label}: {detail}" if detail else label
             events.append({
@@ -879,7 +894,7 @@ def read_session_events(fmt: str, path: Path) -> dict:
             "pr": None,
             "task_inputs": {},
             "task_activeform": {},
-            "seen_msgs": {},
+            "dedupe_credits": {},
         }
         _cache[key] = state
     if stat.st_size > state["offset"]:
