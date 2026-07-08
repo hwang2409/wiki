@@ -313,7 +313,11 @@ function Callout({
           </div>
         ) : null}
       </div>
-      {hasBody && open ? <div className="callout-content">{body}</div> : null}
+      {hasBody ? (
+        <div className={`callout-content-wrap${open ? " is-open" : ""}`}>
+          <div className="callout-content">{body}</div>
+        </div>
+      ) : null}
     </div>
   );
 }

@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { AlertTriangle, Archive, Bot, ExternalLink, GitBranch, ScrollText } from "lucide-react";
 import { getAgents } from "./api";
 import type { AgentWorker, ArchivedWorker, Orchestrator } from "./api";
+import { LoadingPlaceholder } from "./loading";
 import { SessionSidebar } from "./session";
 import type { SidebarTarget } from "./session";
 
@@ -70,7 +71,13 @@ export function AgentsView({
   }, [refreshTick]);
 
   if (error) return <div className="agents-empty">{error}</div>;
-  if (workers === null) return <div className="agents-empty">Loading…</div>;
+  if (workers === null) {
+    return (
+      <div className="agents-empty">
+        <LoadingPlaceholder className="agents-loading" lines={[94, 88, 91, 76]} />
+      </div>
+    );
+  }
   if (workers.length === 0 && archived.length === 0 && orchestrators.length === 0) {
     return (
       <div className="agents-empty">
@@ -114,7 +121,7 @@ export function AgentsView({
                 {worker.role ? <span className="agent-chip">{worker.role}</span> : null}
                 {worker.model ? <span className="agent-chip is-faint">{worker.model}</span> : null}
                 <span className={`agent-state is-${worker.state ?? "unknown"}`}>{state}</span>
-                <span className="agent-age">{ageLabel(worker.status_age_seconds)}</span>
+                <span className="agent-age tabular-nums">{ageLabel(worker.status_age_seconds)}</span>
               </header>
 
               {worker.step ? <div className="agent-step">{worker.step}</div> : null}
@@ -245,7 +252,7 @@ export function AgentsView({
                     ) : entry.state ? (
                       <span className={`agent-state is-${entry.state}`}>{entry.state}</span>
                     ) : null}
-                    <span className="agent-age">{archivedAge(entry.archived_at)}</span>
+                    <span className="agent-age tabular-nums">{archivedAge(entry.archived_at)}</span>
                   </header>
                   <div className="agent-meta">
                     {entry.step ? <span className="agent-chain">{entry.step}</span> : null}
@@ -321,7 +328,13 @@ export function AgentsSidebar({
     };
   }, [refreshTick]);
 
-  if (workers === null) return <div className="nav-empty">Loading...</div>;
+  if (workers === null) {
+    return (
+      <div className="nav-empty">
+        <LoadingPlaceholder className="nav-loading" lines={[92, 84, 88, 73]} />
+      </div>
+    );
+  }
   if (workers.length === 0 && archived.length === 0 && orchestrators.length === 0) {
     return <div className="nav-empty">No workers</div>;
   }
@@ -350,7 +363,7 @@ export function AgentsSidebar({
       <span className={`nav-agent-dot is-${worker.state ?? "unknown"}`} />
       <span className="nav-agent-ticket">{worker.ticket}</span>
       <span className="nav-agent-meta">{stateLabel(worker)}</span>
-      <span className="nav-agent-age">{ageLabel(worker.status_age_seconds)}</span>
+      <span className="nav-agent-age tabular-nums">{ageLabel(worker.status_age_seconds)}</span>
     </button>
   );
 
@@ -387,7 +400,7 @@ export function AgentsSidebar({
           <span className="nav-agent-dot is-done" />
           <span className="nav-agent-ticket">{entry.ticket}</span>
           <span className="nav-agent-meta">{entry.outcome ?? entry.state ?? ""}</span>
-          <span className="nav-agent-age">{archivedAge(entry.archived_at)}</span>
+          <span className="nav-agent-age tabular-nums">{archivedAge(entry.archived_at)}</span>
         </button>
       ))}
     </div>

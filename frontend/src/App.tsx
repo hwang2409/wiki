@@ -35,6 +35,7 @@ import { QuickSwitcher } from "./switcher";
 import { SettingsModal, applyStoredMonoFont } from "./settings";
 import { ActivityFeed } from "./activity";
 import { AgentsSidebar, AgentsView } from "./agents";
+import { LoadingPlaceholder } from "./loading";
 import { AgentSessionView } from "./session";
 import { GraphView } from "./graph";
 import { HealthView } from "./health";
@@ -1235,7 +1236,9 @@ export default function App() {
             </div>
             <div className="nav-files-container">
               {isLoading ? (
-                <div className="nav-empty">Loading...</div>
+                <div className="nav-empty">
+                  <LoadingPlaceholder className="nav-loading" lines={[92, 86, 88, 74, 81]} />
+                </div>
               ) : notes.length > 0 ? (
                 <FolderTree
                   activePath={mode === "view" || mode === "edit" ? activeNote?.path ?? null : null}
