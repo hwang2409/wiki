@@ -281,7 +281,10 @@ function MonoFontPicker({
       if (!rootRef.current.contains(event.target as Node)) setOpen(false);
     };
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setOpen(false);
+      if (event.key !== "Escape") return;
+      // stop the settings modal's window keydown from closing the whole modal
+      event.stopPropagation();
+      setOpen(false);
     };
     document.addEventListener("mousedown", onDocDown);
     document.addEventListener("keydown", onKey);
