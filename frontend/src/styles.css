@@ -9,7 +9,8 @@
 
   --font-interface: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue",
     Helvetica, Arial, sans-serif;
-  --font-text: var(--font-interface);
+  --font-text: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue",
+    Helvetica, Arial, sans-serif;
   --font-monospace: "JetBrains Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
     "Roboto Mono", monospace;
 
@@ -993,13 +994,13 @@ body.is-resizing-panes .pane-cell {
   font-size: var(--font-ui-small);
 }
 
-.mono-font-picker {
+.font-picker {
   position: relative;
   flex-shrink: 0;
   min-width: 260px;
 }
 
-.mono-font-trigger {
+.font-picker-trigger {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -1010,31 +1011,30 @@ body.is-resizing-panes .pane-cell {
   border-radius: 3px;
   background-color: var(--background-secondary);
   color: var(--text-normal);
-  font-family: var(--font-monospace);
   font-size: var(--font-ui-smaller);
   cursor: pointer;
 }
 
-.mono-font-trigger:hover {
+.font-picker-trigger:hover {
   border-color: var(--text-muted);
 }
 
-.mono-font-picker.is-open .mono-font-trigger {
+.font-picker.is-open .font-picker-trigger {
   border-color: var(--text-muted);
 }
 
-.mono-font-trigger-label {
+.font-picker-trigger-label {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.mono-font-trigger-chevron {
+.font-picker-trigger-chevron {
   flex-shrink: 0;
   color: var(--text-faint);
 }
 
-.mono-font-menu {
+.font-picker-menu {
   position: absolute;
   top: calc(100% + 4px);
   right: 0;
@@ -1051,7 +1051,7 @@ body.is-resizing-panes .pane-cell {
   overflow-y: auto;
 }
 
-.mono-font-option {
+.font-picker-option {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
@@ -1064,20 +1064,20 @@ body.is-resizing-panes .pane-cell {
   cursor: pointer;
 }
 
-.mono-font-option:hover,
-.mono-font-option.is-active {
+.font-picker-option:hover,
+.font-picker-option.is-active {
   background-color: var(--background-modifier-hover);
   color: var(--text-normal);
 }
 
-.mono-font-option-label {
+.font-picker-option-label {
   flex-shrink: 0;
   color: var(--text-normal);
   font-size: var(--font-ui-smaller);
   font-weight: 600;
 }
 
-.mono-font-option-sample {
+.font-picker-option-sample {
   overflow: hidden;
   color: var(--text-faint);
   font-size: var(--font-ui-smaller);
