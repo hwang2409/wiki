@@ -1,9 +1,9 @@
+const EXTERNAL_LINK_REL = "noopener noreferrer";
+
 type WindowWithTauri = Window & {
   __TAURI_INTERNALS__?: unknown;
   __wikiExternalLinksInstalled__?: boolean;
 };
-
-const EXTERNAL_LINK_REL = "noopener noreferrer";
 
 function currentHref() {
   return typeof window === "undefined" ? "http://localhost/" : window.location.href;
@@ -35,12 +35,8 @@ export function externalLinkProps(href?: string) {
 }
 
 async function openExternalUrl(url: string) {
-  if (isTauriRuntime()) {
-    const { openUrl } = await import("@tauri-apps/plugin-opener");
-    await openUrl(url);
-    return;
-  }
-  window.open(url, "_blank", "noopener,noreferrer");
+  const { openUrl } = await import("@tauri-apps/plugin-opener");
+  await openUrl(url);
 }
 
 function findAnchor(target: EventTarget | null) {
@@ -58,8 +54,15 @@ function isPlainLeftClick(event: MouseEvent) {
   );
 }
 
+function fallbackToRustNavigation(url: string) {
+  // If the JS opener is denied or unavailable, force a normal navigation.
+  // The native Tauri on_navigation/on_new_window handlers then open the URL
+  // in the system browser instead of leaving the click dead.
+  window.location.assign(url);
+}
+
 export function installExternalLinkInterceptors() {
-  if (typeof window === "undefined" || typeof document === "undefined") return;
+  if (typeof window === "undefined" || typeof document === "undefined" || !isTauriRuntime()) return;
   const tauriWindow = window as WindowWithTauri;
   if (tauriWindow.__wikiExternalLinksInstalled__) return;
   tauriWindow.__wikiExternalLinksInstalled__ = true;
@@ -71,7 +74,10 @@ export function installExternalLinkInterceptors() {
       const anchor = findAnchor(event.target);
       if (!anchor || !isExternalHttpUrl(anchor.href)) return;
       event.preventDefault();
-      void openExternalUrl(anchor.href);
+      void openExternalUrl(anchor.href).catch((error) => {
+        console.error("native external link opener failed", error);
+        fallbackToRustNavigation(anchor.href);
+      });
     },
     true
   );
@@ -79,8 +85,11 @@ export function installExternalLinkInterceptors() {
   const originalOpen = window.open.bind(window);
   window.open = ((url?: string | URL, target?: string, features?: string) => {
     const href = typeof url === "string" || url instanceof URL ? String(url) : "";
-    if (isTauriRuntime() && isExternalHttpUrl(href)) {
-      void openExternalUrl(href);
+    if (isExternalHttpUrl(href)) {
+      void openExternalUrl(href).catch((error) => {
+        console.error("native window.open external opener failed", error);
+        fallbackToRustNavigation(href);
+      });
       return null;
     }
     return originalOpen(url, target, features);
