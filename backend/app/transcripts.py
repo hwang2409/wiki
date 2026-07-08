@@ -15,7 +15,7 @@ from pathlib import Path, PurePosixPath
 
 CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
-KICKOFF_TICKET_PATTERN = re.compile(r"Linear ticket ([A-Z]+-\d+)\b")
+KICKOFF_TICKET_PATTERN = re.compile(r"(?:Linear )?ticket ([A-Z]+-\d+)\b")
 
 MAX_TEXT = 80_000
 MAX_TOOL_IO = 3_000
