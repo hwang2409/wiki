@@ -645,7 +645,7 @@ function MessageComposer({
   const [queued, setQueued] = useState<QueuedMessage[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [vimMode, setVimMode] = useState<"insert" | "normal" | "visual">("insert");
+  const [vimMode, setVimMode] = useState<"insert" | "normal" | "visual" | "pane">("insert");
   const pendingKeyRef = useRef<string | null>(null);
   const registerRef = useRef<string>("");
   const historyPosRef = useRef<number | null>(null);
@@ -663,7 +663,7 @@ function MessageComposer({
 
   useLayoutEffect(() => {
     const el = inputRef.current;
-    if (!el || vimMode === "insert") {
+    if (!el || vimMode === "insert" || document.activeElement !== el) {
       setOverlayPos(null);
       return;
     }
@@ -768,6 +768,12 @@ function MessageComposer({
     setInsertCaret(at);
   }
 
+  function focusPaneScope() {
+    pendingKeyRef.current = null;
+    setVimMode("pane");
+    inputRef.current?.closest<HTMLDivElement>(".pane-frame")?.focus();
+  }
+
   function motionTarget(key: string, at: number): number | null {
     switch (key) {
       case "h": return Math.max(0, at - 1);
@@ -844,6 +850,9 @@ function MessageComposer({
       return;
     }
     switch (key) {
+      case "Escape":
+        focusPaneScope();
+        break;
       case "G": setBlock(text.length - 1); break;
       case "g": pendingKeyRef.current = "g"; break;
       case "x":
@@ -1138,12 +1147,15 @@ function MessageComposer({
         <textarea
           autoCapitalize="off"
           autoCorrect="off"
-          className={vimMode === "insert" ? undefined : "is-vim-normal"}
+          className={vimMode === "normal" || vimMode === "visual" ? "is-vim-normal" : undefined}
           spellCheck={false}
           placeholder={vimMode === "insert" ? "Enter sends now · Shift+Enter queues until idle · Esc = vim normal" : undefined}
           ref={inputRef}
           rows={2}
           value={text}
+          onFocus={(event) => {
+            if (vimMode !== "insert") enterInsert(event.currentTarget.selectionEnd ?? text.length);
+          }}
           onChange={(event) => {
             setText(event.target.value);
             setMenuDismissed(false);
@@ -1179,17 +1191,21 @@ function MessageComposer({
               return;
             }
             if (menuItems.length > 0) {
-              if (event.key === "ArrowDown" || (event.key === "Tab" && !event.shiftKey)) {
+              if (event.key === "ArrowDown" || (event.ctrlKey && event.key === "j")) {
                 event.preventDefault();
                 setMenuIndex((i) => (i + 1) % menuItems.length);
                 return;
               }
-              if (event.key === "ArrowUp" || (event.key === "Tab" && event.shiftKey)) {
+              if (
+                event.key === "ArrowUp" ||
+                (event.ctrlKey && event.key === "k") ||
+                (event.key === "Tab" && event.shiftKey)
+              ) {
                 event.preventDefault();
                 setMenuIndex((i) => (i - 1 + menuItems.length) % menuItems.length);
                 return;
               }
-              if (event.key === "Enter") {
+              if (event.key === "Enter" || (event.key === "Tab" && !event.shiftKey)) {
                 event.preventDefault();
                 acceptSkill(menuItems[Math.min(menuIndex, menuItems.length - 1)].name);
                 return;
@@ -1251,7 +1267,13 @@ function MessageComposer({
           ))}
         </div>
         <span className={`session-vim-mode is-${vimMode}`}>
-          {vimMode === "insert" ? "-- INSERT --" : vimMode === "visual" ? "-- VISUAL --" : "-- NORMAL --"}
+          {vimMode === "insert"
+            ? "-- INSERT --"
+            : vimMode === "visual"
+              ? "-- VISUAL --"
+              : vimMode === "pane"
+                ? "-- PANE --"
+                : "-- NORMAL --"}
         </span>
       </div>
     </div>
