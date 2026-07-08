@@ -530,6 +530,9 @@ type SessionAcc = {
   working: boolean;
 };
 
+const sessionCache = new Map<string, SessionAcc>();
+const composerDraftCache = new Map<string, string>();
+
 function spliceSession(acc: SessionAcc | null, result: AgentSessionData): SessionAcc {
   const clientEnd = acc ? acc.base + acc.events.length : 0;
   if (!acc || result.path !== acc.path || result.from > clientEnd || result.from < acc.base) {
@@ -570,18 +573,24 @@ export function SessionTab({
   showComposer?: boolean;
   onInspect?: (agentId: string) => void;
 }) {
-  const [session, setSession] = useState<SessionAcc | null>(null);
+  const resetKey = `${ticket}:${subagent ?? ""}`;
+  const [session, setSession] = useState<SessionAcc | null>(() => sessionCache.get(resetKey) ?? null);
   const [error, setError] = useState<string | null>(null);
   const sessionRef = useRef<SessionAcc | null>(null);
   sessionRef.current = session;
-  const resetKey = `${ticket}:${subagent ?? ""}`;
   const { ref, innerRef, onScroll } = usePinnedScroll<HTMLDivElement>(session, resetKey);
 
   useEffect(() => {
-    setSession(null);
+    const cached = sessionCache.get(resetKey) ?? null;
+    setSession(cached);
     setError(null);
-    sessionRef.current = null;
+    sessionRef.current = cached;
   }, [resetKey]);
+
+  useEffect(() => {
+    if (session) sessionCache.set(resetKey, session);
+    else sessionCache.delete(resetKey);
+  }, [resetKey, session]);
 
   useEffect(() => {
     let ignore = false;
@@ -772,7 +781,7 @@ function MessageComposer({
   thinking?: boolean;
   onInspect?: (agentId: string) => void;
 }) {
-  const [text, setText] = useState("");
+  const [text, setText] = useState(() => composerDraftCache.get(ticket) ?? "");
   const [queued, setQueued] = useState<QueuedMessage[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -791,6 +800,15 @@ function MessageComposer({
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const [caretPos, setCaretPos] = useState(0);
   const [overlayPos, setOverlayPos] = useState<{ top: number; left: number } | null>(null);
+
+  useEffect(() => {
+    setText(composerDraftCache.get(ticket) ?? "");
+  }, [ticket]);
+
+  useEffect(() => {
+    if (text) composerDraftCache.set(ticket, text);
+    else composerDraftCache.delete(ticket);
+  }, [ticket, text]);
 
   useLayoutEffect(() => {
     const el = inputRef.current;
