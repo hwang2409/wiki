@@ -70,6 +70,9 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn Error>> {
     .title(WINDOW_TITLE)
     .inner_size(1400.0, 950.0)
     .resizable(true)
+    // Tauri's native drag-drop handler intercepts drag events and breaks
+    // HTML5 DnD (kanban, pane splits) inside the webview — disable it.
+    .disable_drag_drop_handler()
     .build()?;
 
     Ok(())
