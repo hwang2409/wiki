@@ -25,6 +25,10 @@ const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
 const MAIN_WINDOW_LABEL: &str = "main";
 const WINDOW_TITLE: &str = "Wiki";
+// Stable default keeps the webview origin constant across launches so
+// localStorage (origin-scoped) survives. Falls back to a random port only if
+// the bind fails (e.g. another wiki instance is running).
+const DEFAULT_LOOPBACK_PORT: u16 = 8213;
 
 #[derive(Default)]
 pub struct NativeAppState {
@@ -439,8 +443,28 @@ fn health_url_for(launch_url: &str) -> String {
 }
 
 fn pick_loopback_port() -> io::Result<u16> {
+    for candidate in preferred_ports() {
+        if TcpListener::bind(("127.0.0.1", candidate)).is_ok() {
+            return Ok(candidate);
+        }
+    }
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     Ok(listener.local_addr()?.port())
+}
+
+fn preferred_ports() -> Vec<u16> {
+    let mut ports = Vec::new();
+    if let Ok(raw) = env::var("WIKI_NATIVE_PORT") {
+        if let Ok(parsed) = raw.trim().parse::<u16>() {
+            if parsed != 0 {
+                ports.push(parsed);
+            }
+        }
+    }
+    if !ports.contains(&DEFAULT_LOOPBACK_PORT) {
+        ports.push(DEFAULT_LOOPBACK_PORT);
+    }
+    ports
 }
 
 fn resolve_repo_dir() -> PathBuf {
