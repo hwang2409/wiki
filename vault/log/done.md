@@ -9,6 +9,8 @@ updated: 2026-07-08
 
 ## 2026-07-08
 
+- **WIKI-25** — unify focused/unfocused pane styling — minimal frame indicator only (owner: cc:WIKI-25)
+- **phoebe** — PHO-13231 search_run_data flood regression test merged (#10848)
 - **WIKI-22** — pane focus remount bug — stable pane identity, focus as prop (owner: cdx:WIKI-22)
 - **WIKI-21** — /tokens page — usage over time, cli/model filters, cached-split, incremental scan cache (owner: cc:WIKI-21)
 - **phoebe** — PHO-13231 search_run_data flood regression test merge-ready ([#10848](https://github.com/phoebe-health/phoebe/pull/10848))
