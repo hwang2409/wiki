@@ -137,6 +137,29 @@ export function spawnAgentWorker(body: SpawnWorkerInput) {
   });
 }
 
+export type SpawnOrchestratorModel = "opus" | "sonnet";
+
+export type SpawnOrchestratorInput = {
+  id: string;
+  workdir: string;
+  model: SpawnOrchestratorModel;
+  goal: string;
+};
+
+export type SpawnOrchestratorResult = {
+  window: string;
+  log: string;
+  prompt_path: string;
+  note: string;
+};
+
+export function spawnAgentOrchestrator(body: SpawnOrchestratorInput) {
+  return request<SpawnOrchestratorResult>("/api/agents/spawn-orchestrator", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
 export type SessionTool = {
   name: string;
   input: string;

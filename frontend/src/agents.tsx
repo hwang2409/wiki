@@ -10,11 +10,12 @@ import {
   ScrollText,
   X,
 } from "lucide-react";
-import { getAgents, spawnAgentWorker } from "./api";
+import { getAgents, spawnAgentOrchestrator, spawnAgentWorker } from "./api";
 import type {
   AgentWorker,
   ArchivedWorker,
   Orchestrator,
+  SpawnOrchestratorModel,
   SpawnWorkerEffort,
   SpawnWorkerKind,
   SpawnWorkerRole,
@@ -25,17 +26,31 @@ import type { SidebarTarget } from "./session";
 
 const STALE_SECONDS = 5 * 60;
 const SPAWN_TICKET_PATTERN = /^[A-Z0-9-]+$/;
+const ORCH_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 const DEFAULT_WORKDIR = "/Users/henry/me/fun/wiki";
 const CDX_MODELS = ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"] as const;
 const CC_MODELS = ["opus", "sonnet"] as const;
+const ORCHESTRATOR_MODELS: SpawnOrchestratorModel[] = ["opus", "sonnet"];
 const REASONING_EFFORTS: SpawnWorkerEffort[] = ["minimal", "low", "medium", "high", "xhigh"];
 
-type SpawnNotice = {
+type WorkerSpawnNotice = {
+  kind: "worker";
   ticket: string;
   window: string;
   log: string;
   promptPath: string;
 };
+
+type OrchestratorSpawnNotice = {
+  kind: "orchestrator";
+  id: string;
+  window: string;
+  log: string;
+  promptPath: string;
+  note: string;
+};
+
+type SpawnNotice = WorkerSpawnNotice | OrchestratorSpawnNotice;
 
 function modelsFor(kind: SpawnWorkerKind): readonly string[] {
   return kind === "cdx" ? CDX_MODELS : CC_MODELS;
@@ -81,7 +96,7 @@ function SpawnWorkerModal({
 }: {
   orchestrators: Orchestrator[];
   onClose: () => void;
-  onSpawn: (notice: SpawnNotice) => void;
+  onSpawn: (notice: WorkerSpawnNotice) => void;
 }) {
   const [ticket, setTicket] = useState("");
   const [kind, setKind] = useState<SpawnWorkerKind>("cdx");
@@ -161,6 +176,7 @@ function SpawnWorkerModal({
         prompt,
       });
       onSpawn({
+        kind: "worker",
         ticket: normalizedTicket,
         window: result.window,
         log: result.log,
@@ -356,6 +372,187 @@ function SpawnWorkerModal({
   );
 }
 
+function SpawnOrchestratorModal({
+  onClose,
+  onSpawn,
+}: {
+  onClose: () => void;
+  onSpawn: (notice: OrchestratorSpawnNotice) => void;
+}) {
+  const [id, setId] = useState("");
+  const [projectDir, setProjectDir] = useState("");
+  const [model, setModel] = useState<SpawnOrchestratorModel>("opus");
+  const [goal, setGoal] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  function requestClose() {
+    if (submitting) return;
+    onClose();
+  }
+
+  function resetConfirmation() {
+    setConfirming(false);
+    setError(null);
+  }
+
+  useEffect(() => {
+    function onKeyDown(event: globalThis.KeyboardEvent) {
+      if (event.key === "Escape") requestClose();
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose, submitting]);
+
+  const normalizedId = id.trim();
+  const goalBytes = new TextEncoder().encode(goal).length;
+  const goalTooLarge = goalBytes >= 20_000;
+  const idValid = ORCH_ID_PATTERN.test(normalizedId);
+  const projectDirValid = projectDir.trim().length > 0;
+  const confirmLabel = `launch ${normalizedId} · ${model} in ${projectDir.trim()}?`;
+  const canSubmit = idValid && projectDirValid && !goalTooLarge && !submitting;
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!canSubmit) return;
+    if (!confirming) {
+      setConfirming(true);
+      return;
+    }
+
+    setSubmitting(true);
+    setError(null);
+    try {
+      const result = await spawnAgentOrchestrator({
+        id: normalizedId,
+        workdir: projectDir.trim(),
+        model,
+        goal,
+      });
+      onSpawn({
+        kind: "orchestrator",
+        id: normalizedId,
+        window: result.window,
+        log: result.log,
+        promptPath: result.prompt_path,
+        note: result.note,
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not spawn orchestrator");
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <>
+      <div className="settings-backdrop" onClick={requestClose} />
+      <form
+        aria-modal
+        className="dialog agent-spawn-modal"
+        role="dialog"
+        onSubmit={submit}
+      >
+        <div className="settings-header">
+          <div className="dialog-title">Spawn orchestrator</div>
+          <button
+            aria-label="Close orchestrator dialog"
+            className="session-close"
+            type="button"
+            onClick={requestClose}
+          >
+            <X size={14} />
+          </button>
+        </div>
+
+        <div className="agent-spawn-fields">
+          <label className="agent-spawn-field">
+            <span className="agent-spawn-label">Orchestrator id</span>
+            <input
+              required
+              className="dialog-input"
+              placeholder="wiki-dev"
+              value={id}
+              onChange={(event) => {
+                resetConfirmation();
+                setId(event.target.value);
+              }}
+            />
+            <span className="agent-spawn-hint">
+              Letters, numbers, dashes, and underscores. Must start with a letter or number.
+            </span>
+          </label>
+
+          <label className="agent-spawn-field">
+            <span className="agent-spawn-label">Project directory</span>
+            <input
+              required
+              className="dialog-input"
+              placeholder="/tmp/project"
+              value={projectDir}
+              onChange={(event) => {
+                resetConfirmation();
+                setProjectDir(event.target.value);
+              }}
+            />
+          </label>
+
+          <label className="agent-spawn-field">
+            <span className="agent-spawn-label">Model</span>
+            <select
+              className="agent-spawn-select"
+              value={model}
+              onChange={(event) => {
+                resetConfirmation();
+                setModel(event.target.value as SpawnOrchestratorModel);
+              }}
+            >
+              {ORCHESTRATOR_MODELS.map((option) => (
+                <option key={option} value={option}>
+                  {option}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label className="agent-spawn-field">
+            <span className="agent-spawn-label">Initial goal</span>
+            <textarea
+              className="dialog-input agent-spawn-textarea"
+              placeholder="Optional. Leave empty to have the orchestrator report ready and wait."
+              value={goal}
+              onChange={(event) => {
+                resetConfirmation();
+                setGoal(event.target.value);
+              }}
+            />
+            <span className="agent-spawn-hint">
+              {goalTooLarge ? "Goal must stay under 20KB." : `${goalBytes} bytes`}
+            </span>
+          </label>
+        </div>
+
+        {!idValid && normalizedId ? (
+          <div className="agent-spawn-error">
+            Orchestrator ids must start with a letter or number and only use letters, numbers, dashes, or underscores.
+          </div>
+        ) : null}
+        {!projectDirValid ? <div className="agent-spawn-error">Project directory is required.</div> : null}
+        {error ? <div className="agent-spawn-error">{error}</div> : null}
+
+        <div className="dialog-actions">
+          <button className="dialog-button" type="button" onClick={requestClose}>
+            Cancel
+          </button>
+          <button className="dialog-button dialog-confirm" disabled={!canSubmit} type="submit">
+            {submitting ? "Launching…" : confirming ? confirmLabel : "Launch"}
+          </button>
+        </div>
+      </form>
+    </>
+  );
+}
+
 export function AgentsView({
   refreshTick,
   openTicket,
@@ -370,7 +567,8 @@ export function AgentsView({
   const [archived, setArchived] = useState<ArchivedWorker[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [openPanel, setOpenPanel] = useState<"session" | "review">("session");
-  const [spawnOpen, setSpawnOpen] = useState(false);
+  const [spawnWorkerOpen, setSpawnWorkerOpen] = useState(false);
+  const [spawnOrchestratorOpen, setSpawnOrchestratorOpen] = useState(false);
   const [spawnNotice, setSpawnNotice] = useState<SpawnNotice | null>(null);
 
   useEffect(() => {
@@ -658,24 +856,44 @@ export function AgentsView({
               {liveWorkers.length} live worker{liveWorkers.length === 1 ? "" : "s"}
             </div>
           </div>
-          <button
-            className="agents-spawn-button"
-            disabled={workers === null}
-            type="button"
-            onClick={() => {
-              setSpawnNotice(null);
-              setSpawnOpen(true);
-            }}
-          >
-            <Plus size={14} />
-            Spawn worker
-          </button>
+          <div className="dialog-actions">
+            <button
+              className="agents-spawn-button"
+              disabled={workers === null}
+              type="button"
+              onClick={() => {
+                setSpawnNotice(null);
+                setSpawnOrchestratorOpen(true);
+              }}
+            >
+              <Bot size={14} />
+              Spawn orchestrator
+            </button>
+            <button
+              className="agents-spawn-button"
+              disabled={workers === null}
+              type="button"
+              onClick={() => {
+                setSpawnNotice(null);
+                setSpawnWorkerOpen(true);
+              }}
+            >
+              <Plus size={14} />
+              Spawn worker
+            </button>
+          </div>
         </div>
         {spawnNotice ? (
-          <div className="agents-notice">
-            spawned <code>{spawnNotice.ticket}</code> in <code>{spawnNotice.window}</code> · log{" "}
-            <code>{spawnNotice.log}</code>
-          </div>
+          spawnNotice.kind === "worker" ? (
+            <div className="agents-notice">
+              spawned <code>{spawnNotice.ticket}</code> in <code>{spawnNotice.window}</code> · log{" "}
+              <code>{spawnNotice.log}</code>
+            </div>
+          ) : (
+            <div className="agents-notice">
+              {spawnNotice.note} · tmux <code>{spawnNotice.window}</code> · log <code>{spawnNotice.log}</code>
+            </div>
+          )
         ) : null}
         {body}
       </div>
@@ -687,15 +905,24 @@ export function AgentsView({
           onClose={() => onOpenTicket(null)}
         />
       ) : null}
-      {spawnOpen ? (
+      {spawnWorkerOpen ? (
         <SpawnWorkerModal
           orchestrators={orchestrators}
-          onClose={() => setSpawnOpen(false)}
+          onClose={() => setSpawnWorkerOpen(false)}
           onSpawn={(notice) => {
             setOpenPanel("session");
             setSpawnNotice(notice);
-            setSpawnOpen(false);
+            setSpawnWorkerOpen(false);
             onOpenTicket(notice.ticket);
+          }}
+        />
+      ) : null}
+      {spawnOrchestratorOpen ? (
+        <SpawnOrchestratorModal
+          onClose={() => setSpawnOrchestratorOpen(false)}
+          onSpawn={(notice) => {
+            setSpawnNotice(notice);
+            setSpawnOrchestratorOpen(false);
           }}
         />
       ) : null}

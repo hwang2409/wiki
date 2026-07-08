@@ -6,6 +6,7 @@ import os
 import re
 import shlex
 import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
@@ -335,6 +336,20 @@ CC_MODELS = {"opus", "sonnet"}
 WORKER_ROLES = {"plan", "implement", "review"}
 REASONING_EFFORTS = {"minimal", "low", "medium", "high", "xhigh"}
 MAX_SPAWN_PROMPT_BYTES = 100_000
+MAX_ORCH_GOAL_BYTES = 20_000
+ORCH_KICKOFF_TEMPLATE = """FIRST, self-register this Claude Code session before anything else:
+`~/me/fun/wiki/wiki agent orch {orch_id} --window "$(tmux display-message -p -t "$TMUX_PANE" '#{{window_id}}')"`
+
+You are the MASTERMIND ORCHESTRATOR for this project per the `tmux-ticket-codex` / `tmux-ticket-claude` skills.
+Your job is to spawn tmux workers for bounded tickets/tasks, monitor their status files and pane logs, steer them back on track, and independently gate PRs before merge.
+Every worker you spawn must register with `--orch {orch_id}` so the wiki can map them back to you.
+
+Before spawning anything, read this protocol note in full:
+`~/me/fun/wiki/vault/tools/orchestrator-worker-protocol.md`
+
+After you self-register and read the protocol:
+{goal_instruction}
+"""
 
 
 def tmux_live_windows() -> set[str]:
@@ -894,6 +909,13 @@ class SpawnWorkerIn(BaseModel):
     prompt: str = Field(..., min_length=1, max_length=100_000)
 
 
+class SpawnOrchestratorIn(BaseModel):
+    id: str = Field(..., min_length=1, max_length=100)
+    workdir: str = Field(..., min_length=1, max_length=4096)
+    model: str = Field(..., min_length=2, max_length=32)
+    goal: str = Field(default="", max_length=20_000)
+
+
 def _read_queue() -> dict[str, list[dict]]:
     try:
         data = json.loads(MSG_QUEUE_PATH.read_text(encoding="utf-8"))
@@ -917,6 +939,29 @@ def _read_agent_registry() -> dict:
         return {}
 
 
+def resolve_existing_dir(raw_path: str, *, field_name: str) -> Path:
+    try:
+        resolved = Path(raw_path).expanduser().resolve(strict=True)
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"{field_name} does not exist") from exc
+    if not resolved.is_dir():
+        raise HTTPException(status_code=400, detail=f"{field_name} must be a directory")
+    return resolved
+
+
+def run_checked(args: list[str], *, timeout: int, label: str) -> subprocess.CompletedProcess[str]:
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
+    except OSError as exc:
+        raise RuntimeError(f"{label}: {exc}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"{label}: timed out") from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "command failed"
+        raise RuntimeError(f"{label}: {detail[:240]}")
+    return result
+
+
 def resolve_window(ticket: str) -> str | None:
     """Live tmux window for a worker ticket or orchestrator id."""
     registry = _read_agent_registry()
@@ -931,8 +976,6 @@ def resolve_window(ticket: str) -> str | None:
 def deliver_message(window: str, text: str) -> None:
     """Protocol input channel: literal text, pause (composer paste-detection), Enter,
     then verify submitted — text still sitting in the composer gets a bare Enter."""
-    import time
-
     subprocess.run(["tmux", "send-keys", "-t", window, "-l", text], timeout=5, check=False)
     time.sleep(0.5)
     subprocess.run(["tmux", "send-keys", "-t", window, "Enter"], timeout=5, check=False)
@@ -940,6 +983,18 @@ def deliver_message(window: str, text: str) -> None:
     pane = capture_pane_tail(window, 30) or ""
     if text[:60] in pane.replace("\n", " "):
         subprocess.run(["tmux", "send-keys", "-t", window, "Enter"], timeout=5, check=False)
+
+
+def accept_claude_trust_prompt(window: str, *, timeout_seconds: float = 8.0) -> None:
+    """New project directories can trigger Claude's trust prompt before the kickoff prompt runs."""
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        pane = capture_pane_tail(window, 40) or ""
+        if "Quick safety check" in pane and "Yes, I trust this folder" in pane:
+            subprocess.run(["tmux", "send-keys", "-t", window, "Enter"], timeout=5, check=False)
+            time.sleep(0.5)
+            return
+        time.sleep(0.25)
 
 
 @app.post("/api/agents/spawn")
@@ -974,12 +1029,7 @@ def spawn_agent(body: SpawnWorkerIn) -> dict[str, str]:
     if len(prompt.encode("utf-8")) >= MAX_SPAWN_PROMPT_BYTES:
         raise HTTPException(status_code=400, detail="Kickoff prompt must be smaller than 100KB")
 
-    try:
-        workdir_path = Path(body.workdir).expanduser().resolve(strict=True)
-    except OSError as exc:
-        raise HTTPException(status_code=400, detail="Working directory does not exist") from exc
-    if not workdir_path.is_dir():
-        raise HTTPException(status_code=400, detail="Working directory must be a directory")
+    workdir_path = resolve_existing_dir(body.workdir, field_name="Working directory")
 
     registry = _read_agent_registry()
     orch = (body.orch or "").strip()
@@ -1005,18 +1055,6 @@ def spawn_agent(body: SpawnWorkerIn) -> dict[str, str]:
     except OSError as exc:
         raise HTTPException(status_code=500, detail="Could not prepare worker files") from exc
 
-    def run_spawn(args: list[str], *, timeout: int, label: str) -> subprocess.CompletedProcess[str]:
-        try:
-            result = subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
-        except OSError as exc:
-            raise RuntimeError(f"{label}: {exc}") from exc
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(f"{label}: timed out") from exc
-        if result.returncode != 0:
-            detail = result.stderr.strip() or result.stdout.strip() or "command failed"
-            raise RuntimeError(f"{label}: {detail[:240]}")
-        return result
-
     prompt_shell = shlex.quote(str(prompt_path))
     model_shell = shlex.quote(model)
     if kind == "cdx":
@@ -1030,7 +1068,7 @@ def spawn_agent(body: SpawnWorkerIn) -> dict[str, str]:
 
     window: str | None = None
     try:
-        created = run_spawn(
+        created = run_checked(
             [
                 "tmux",
                 "new-window",
@@ -1050,7 +1088,7 @@ def spawn_agent(body: SpawnWorkerIn) -> dict[str, str]:
         if not re.fullmatch(r"@\d+", window):
             raise RuntimeError(f"tmux new-window failed: unexpected window id {window!r}")
 
-        run_spawn(
+        run_checked(
             ["tmux", "pipe-pane", "-t", window, "-o", f"cat >> {shlex.quote(str(log_path))}"],
             timeout=5,
             label="tmux pipe-pane failed",
@@ -1076,13 +1114,110 @@ def spawn_agent(body: SpawnWorkerIn) -> dict[str, str]:
         ]
         if orch:
             register_args.extend(["--orch", orch])
-        run_spawn(register_args, timeout=10, label="wiki agent register failed")
+        run_checked(register_args, timeout=10, label="wiki agent register failed")
     except RuntimeError as exc:
         if window:
             subprocess.run(["tmux", "kill-window", "-t", window], timeout=5, check=False)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     return {"window": window, "log": str(log_path), "prompt_path": str(prompt_path)}
+
+
+@app.post("/api/agents/spawn-orchestrator")
+def spawn_orchestrator(body: SpawnOrchestratorIn) -> dict[str, str]:
+    orch_id = body.id.strip()
+    if not ORCH_ID_PATTERN.fullmatch(orch_id):
+        raise HTTPException(
+            status_code=400,
+            detail="Orchestrator id must start with a letter or number and only use letters, numbers, dashes, or underscores",
+        )
+
+    model = body.model.strip()
+    if model not in CC_MODELS:
+        raise HTTPException(status_code=400, detail="Model must be opus or sonnet")
+
+    goal = body.goal.strip()
+    if len(goal.encode("utf-8")) >= MAX_ORCH_GOAL_BYTES:
+        raise HTTPException(status_code=400, detail="Initial goal must stay under 20KB")
+
+    workdir_path = resolve_existing_dir(body.workdir, field_name="Project directory")
+
+    registry = _read_agent_registry()
+    live_windows = tmux_live_windows()
+    existing = (registry.get("_orchestrators") or {}).get(orch_id)
+    if existing:
+        existing_window = existing.get("window")
+        if isinstance(existing_window, str) and existing_window in live_windows:
+            raise HTTPException(status_code=409, detail=f"{orch_id} already has a live orchestrator window")
+        raise HTTPException(
+            status_code=409,
+            detail=f"{orch_id} is already registered as an orchestrator; run `wiki agent orch-done {orch_id}` first",
+        )
+
+    goal_instruction = (
+        f"Pursue this initial goal immediately:\n\n{goal}\n"
+        if goal
+        else "Print exactly one line: READY: orchestrator registered and awaiting instructions.\nThen wait for Henry to steer you via the wiki composer."
+    )
+    prompt = ORCH_KICKOFF_TEMPLATE.format(orch_id=orch_id, goal_instruction=goal_instruction)
+
+    prompt_path = Path("/tmp") / f"cc-orch-{orch_id}-prompt.md"
+    log_path = Path("/tmp") / f"cc-orch-{orch_id}.log"
+    try:
+        log_path.unlink(missing_ok=True)
+        prompt_path.unlink(missing_ok=True)
+        prompt_path.write_text(prompt if prompt.endswith("\n") else f"{prompt}\n", encoding="utf-8")
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail="Could not prepare orchestrator files") from exc
+
+    prompt_shell = shlex.quote(str(prompt_path))
+    model_shell = shlex.quote(model)
+    command = f'claude --model {model_shell} --dangerously-skip-permissions "$(cat {prompt_shell})"'
+
+    window: str | None = None
+    try:
+        created = run_checked(
+            [
+                "tmux",
+                "new-window",
+                "-dP",
+                "-F",
+                "#{window_id}",
+                "-n",
+                f"orch:{orch_id}",
+                "-c",
+                str(workdir_path),
+                command,
+            ],
+            timeout=10,
+            label="tmux new-window failed",
+        )
+        window = created.stdout.strip()
+        if not re.fullmatch(r"@\d+", window):
+            raise RuntimeError(f"tmux new-window failed: unexpected window id {window!r}")
+
+        run_checked(
+            ["tmux", "pipe-pane", "-t", window, "-o", f"cat >> {shlex.quote(str(log_path))}"],
+            timeout=5,
+            label="tmux pipe-pane failed",
+        )
+        accept_claude_trust_prompt(window)
+    except RuntimeError as exc:
+        if window:
+            subprocess.run(["tmux", "kill-window", "-t", window], timeout=5, check=False)
+        try:
+            prompt_path.unlink(missing_ok=True)
+            log_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return {
+        "window": window,
+        "log": str(log_path),
+        "prompt_path": str(prompt_path),
+        "note": "orchestrator launching — will appear when it self-registers",
+    }
 
 
 @app.post("/api/agents/{ticket}/message")
