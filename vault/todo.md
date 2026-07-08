@@ -15,7 +15,6 @@ In Progress:
 - [PHO-13225](https://linear.app/phoebework/issue/PHO-13225): call-recordings tool split (audit P0 #1) — cdx:PHO-13225 worker
 - [PHO-11274](https://linear.app/phoebework/issue/PHO-11274): compare_agent_runs trace comparison (audit-validated P1) — cdx:PHO-11274 worker
 - [PHO-13216](https://linear.app/phoebework/issue/PHO-13216): Core data products T2 (dossier+funnel+MCP mirrors) — cdx:PHO-13216 worker
-- [P2] WIKI-20: settings pickers for interface + note fonts (probe-gated previews, ui-state synced) (owner: cc:WIKI-20)
 - [PHO-13227](https://linear.app/phoebework/issue/PHO-13227): subagent approval inheritance (13226 T2) — cdx:PHO-13227 worker
 - [PHO-13231](https://linear.app/phoebework/issue/PHO-13231): search_run_data flood regression test (polish) — cdx:PHO-13231 worker (mini)
 - [P2] WIKI-21: /tokens page — usage over time, cli/model filters, cached-split, incremental scan cache (owner: cc:WIKI-21)
