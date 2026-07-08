@@ -12,7 +12,6 @@ Todo:
 In Progress:
 
 - [PHO-13218](https://linear.app/phoebework/issue/PHO-13218): tiered tool mounting (hot set + domain packs + routing evals) — cdx:PHO-13218 worker
-- [P1] WIKI-19: watchdog revival v1.1 — (a) resume by EXPLICIT session id only, id resolved from richest-lineage rollout (kickoff-or-cwd match, largest/newest), launch cwd = worktree + auto-answer codex cwd-mismatch dialog (choose current dir); (b) preserve original tmux session (capture #{session_name} before kill); (c) detect 'access token could not be refreshed' pane signature as auth-dead -> kill+resume; (d) registry tracks current session id per worker (wiki agent update --session) and transcript resolver prefers it over discovery; (e) re-poke includes ticket id + status-file path
 - [PHO-13225](https://linear.app/phoebework/issue/PHO-13225): call-recordings tool split (audit P0 #1) — cdx:PHO-13225 worker
 - [PHO-11274](https://linear.app/phoebework/issue/PHO-11274): compare_agent_runs trace comparison (audit-validated P1) — cdx:PHO-11274 worker
 - [PHO-13216](https://linear.app/phoebework/issue/PHO-13216): Core data products T2 (dossier+funnel+MCP mirrors) — cdx:PHO-13216 worker
