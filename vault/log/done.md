@@ -9,6 +9,9 @@ updated: 2026-07-08
 
 ## 2026-07-08
 
+- **wiki** — PR #9 unified session surface (pane parity, review side panel, compact checks) + PR #8 keyboard focus model (pane scope, vim layering, skill-picker keys) merged
+- **wiki** — WIKI-9 merge-ready ([#9](https://github.com/hwang2409/wiki/pull/9)) — unified split/full agent session surface, review side panel, compact checks rows
+- **phoebe** — PHO-13144 WellSky clock-in writeback fix merged (#10812) — QA action executor now honors live-call allowed_action_families for shift_clock_writeback; prod investigation via orchestrator tunnel; follow-up PHO-13207
 - **wiki** — polish fleet complete: PR #5 twelve themes, PR #6 orchestrator spawn-from-UI, PR #7 tmux C-a leader keys + status bar + split-pane subagent fix — six PRs merged in one day via codex fleet
 - **wiki** — WIKI-7 merge-ready ([#7](https://github.com/hwang2409/wiki/pull/7)) — tmux-style `Ctrl+A` fleet leader, bottom status strip, pane focus/zoom/close chords, split-pane inline subagent inspect
 - **phoebe** — PHO-13206 admin tool audit delivered — 112 tools, 44 used/7d, 73.1% success; P0s: call-recordings split + Core account owner filtering; backlog re-verdicts on ticket

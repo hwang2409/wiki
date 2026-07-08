@@ -23,6 +23,7 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[model-task-benchmarks]] — which model for which coding task — verified benchmark numbers + caveats; read before assigning models to workers
 - [[harness]] — what makes agent harnesses great: verified cross-cutting principles + Claude Code/OpenHands/Codex CLI/Devin/SWE-agent design breakdowns
 - [[conductor]] — Conductor desktop app stack: Tauri/Rust/WebKit + mostly TypeScript; local bundle evidence and public founder statements.
+- [[mcp-vs-native-agent-tooling]] — Henry's position: MCP is generally a bad way to build agent tooling — prefer native, code-aware tools; Core MCP serves external clients only
 
 ## Phoebe
 
