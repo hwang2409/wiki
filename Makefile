@@ -6,8 +6,9 @@ FRONTEND_HOST ?= 127.0.0.1
 FRONTEND_PORT ?= 5173
 VENV_BIN := .venv/bin
 UVICORN := $(if $(wildcard $(VENV_BIN)/uvicorn),$(VENV_BIN)/uvicorn,uvicorn)
+TAURI := cargo tauri
 
-.PHONY: dev backend frontend build
+.PHONY: dev backend frontend build native-backend native-dev native-build native-smoke
 
 dev:
 	@set -e; \
@@ -25,3 +26,15 @@ frontend:
 build:
 	cd frontend && npm run build
 	python -m compileall backend
+
+native-backend:
+	./scripts/build-native-backend.sh
+
+native-dev: native-backend
+	$(TAURI) dev --no-watch
+
+native-build: native-backend
+	$(TAURI) build --bundles app
+
+native-smoke: native-backend
+	./scripts/native-smoke.sh
