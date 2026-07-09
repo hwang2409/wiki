@@ -1492,6 +1492,11 @@ def _changed_registry_tickets(previous: dict, current: dict) -> set[str]:
     return changed
 
 
+def _invalidate_session_paths(changed: set[str]) -> None:
+    for ticket in changed:
+        _session_paths.pop(ticket, None)
+
+
 @app.get("/api/events")
 async def events() -> StreamingResponse:
     async def stream():
@@ -1538,6 +1543,7 @@ async def events() -> StreamingResponse:
                             vault_paths.append(candidate.relative_to(VAULT_DIR).as_posix())
                         except ValueError:
                             git_changed = True
+                    _invalidate_session_paths(changed_tickets)
                     if vault_paths or git_changed:
                         paths = sorted(set(vault_paths + (["git"] if git_changed else [])))[:20]
                         yield f"data: {json.dumps({'type': 'vault', 'paths': paths})}\n\n"

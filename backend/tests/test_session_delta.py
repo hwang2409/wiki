@@ -487,6 +487,97 @@ class SessionDeltaTests(unittest.TestCase):
             self.assertEqual(body["cursor"], 2)
             self.assertEqual([event["text"] for event in body["events"]], ["hello", "world"])
 
+    def test_session_path_invalidation_drops_only_changed_tickets(self) -> None:
+        with mock.patch.dict(
+            main._session_paths,
+            {
+                "WIKI-46": ("claude", Path("/tmp/old.jsonl")),
+                "WIKI-99": ("codex", Path("/tmp/keep.jsonl")),
+            },
+            clear=True,
+        ):
+            main._invalidate_session_paths({"WIKI-46"})
+            self.assertNotIn("WIKI-46", main._session_paths)
+            self.assertIn("WIKI-99", main._session_paths)
+
+    def test_registry_handoff_re_resolves_after_cache_invalidation(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_path = root / "old.jsonl"
+            new_path = root / "new.jsonl"
+            registry = root / "agent-registry.json"
+            queue = root / "queue.json"
+            status_dir = root / "status"
+            status_dir.mkdir()
+            queue.write_text("{}", encoding="utf-8")
+            _write_rows(
+                old_path,
+                [
+                    {
+                        "type": "user",
+                        "timestamp": "2026-07-09T01:00:00Z",
+                        "message": {"content": "old transcript"},
+                    }
+                ],
+                mode="w",
+            )
+            _write_rows(
+                new_path,
+                [
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-07-09T01:00:01Z",
+                        "payload": {"type": "user_message", "message": "new transcript"},
+                    }
+                ],
+                mode="w",
+            )
+            previous = {
+                "WIKI-46": {
+                    "current": {
+                        "kind": "cc",
+                        "spawned_at": "2026-07-09T01:00:00Z",
+                        "session_id": "old-session",
+                    }
+                }
+            }
+            current = {
+                "WIKI-46": {
+                    "current": {
+                        "kind": "cdx",
+                        "spawned_at": "2026-07-09T01:00:00Z",
+                        "session_id": "new-session",
+                    }
+                }
+            }
+            registry.write_text(json.dumps(previous), encoding="utf-8")
+
+            def fake_find_session(kind: str | None, ticket: str, spawned_at: str | None, session_id: str | None = None, worktree: str | None = None):
+                if kind == "cc":
+                    return ("claude", old_path)
+                if kind == "cdx":
+                    return ("codex", new_path)
+                return None
+
+            with (
+                mock.patch.object(main, "AGENT_REGISTRY_PATH", registry),
+                mock.patch.object(main, "AGENT_STATUS_DIR", status_dir),
+                mock.patch.object(main, "MSG_QUEUE_PATH", queue),
+                mock.patch.object(main, "resolve_window", return_value=None),
+                mock.patch.object(main.transcripts, "find_session", side_effect=fake_find_session) as find_session,
+                mock.patch.dict(main._session_paths, {"WIKI-46": ("claude", old_path)}, clear=True),
+            ):
+                first = main.agent_session("WIKI-46", cursor=0)
+                registry.write_text(json.dumps(current), encoding="utf-8")
+                main._invalidate_session_paths(main._changed_registry_tickets(previous, current))
+                second = main.agent_session("WIKI-46", cursor=0)
+
+            self.assertEqual(first["path"], str(old_path))
+            self.assertEqual(second["path"], str(new_path))
+            self.assertEqual([event["text"] for event in first["events"]], ["old transcript"])
+            self.assertEqual([event["text"] for event in second["events"]], ["new transcript"])
+            self.assertEqual(find_session.call_args_list[-1].args[0], "cdx")
+
 
 if __name__ == "__main__":
     unittest.main()
