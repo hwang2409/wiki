@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -10,8 +11,8 @@ from urllib.parse import urlparse
 from fastapi import HTTPException
 
 
-AGENT_REGISTRY_PATH = Path("/tmp/agent-registry.json")
-AGENT_STATUS_DIR = Path("/tmp/agent-status")
+AGENT_REGISTRY_PATH = Path(os.environ.get("WIKI_AGENT_REGISTRY_PATH") or "/tmp/agent-registry.json")
+AGENT_STATUS_DIR = Path(os.environ.get("WIKI_AGENT_STATUS_DIR") or "/tmp/agent-status")
 PR_CACHE_TTL_SECONDS = 20
 PR_URL_HOSTS = {"github.com", "www.github.com"}
 DEFAULT_GITHUB_REPO = "hwang2409/wiki"

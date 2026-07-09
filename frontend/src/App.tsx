@@ -589,6 +589,7 @@ function buildFleetGroups(workers: AgentWorker[], orchestrators: Orchestrator[])
         window: null,
         window_alive: false,
         cwd: null,
+        model: null,
         spawned_at: null,
         transcript_exists: false,
       },

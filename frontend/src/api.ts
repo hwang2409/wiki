@@ -97,6 +97,7 @@ export type Orchestrator = {
   window: string | null;
   window_alive: boolean;
   cwd: string | null;
+  model: string | null;
   spawned_at: string | null;
   transcript_exists: boolean;
 };
@@ -157,6 +158,22 @@ export function spawnAgentOrchestrator(body: SpawnOrchestratorInput) {
   return request<SpawnOrchestratorResult>("/api/agents/spawn-orchestrator", {
     method: "POST",
     body: JSON.stringify(body),
+  });
+}
+
+export type ReplaceAgentResult = {
+  id: string;
+  type: "worker" | "orchestrator";
+  window: string;
+  log: string;
+  prompt_path: string;
+  model?: string;
+  registration?: unknown;
+};
+
+export function replaceAgent(id: string) {
+  return request<ReplaceAgentResult>(`/api/agents/${encodeURIComponent(id)}/replace`, {
+    method: "POST",
   });
 }
 
