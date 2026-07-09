@@ -9,6 +9,7 @@ updated: 2026-07-09
 Todo:
 
 - [P2] WIKI-35: agent session view surfaces status-file state — state badge + blocker banner in agent-session-surface header (blocked/merge-ready visible without going back to /agents); data already in /api/agents
+- [P1] WIKI-40: resolver hardening — for LIVE workers resolve transcripts from ground truth: registry window -> pane PID -> lsof open rollout/transcript handle (exact by construction, immune to stale session ids + resume --last rollout forks); registry session id becomes fallback for dead/idle sessions only. Evidence 07-09: three phoebe workers revived via resume --last forked fresh rollouts, app mis-rendered JSONL until hand-pinned via lsof. Sequenced AFTER WIKI-39 (Henry directive)
 
 In Progress:
 
