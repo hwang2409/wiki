@@ -3565,13 +3565,30 @@ body.is-resizing-panes .pane-cell {
   min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
+  overflow-anchor: none;
 }
 
 .session-scroll-inner {
+  position: relative;
+  min-height: 100%;
+  padding: 16px 16px 12px;
+}
+
+.session-virtual-list {
+  position: relative;
+  min-height: 100%;
+}
+
+.session-virtual-row {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
   display: flex;
   flex-direction: column;
-  gap: 14px;
-  padding: 16px 16px 12px;
+  min-width: 0;
+  contain: content;
+  will-change: transform;
 }
 
 .session-footer {
@@ -3870,7 +3887,7 @@ body.is-resizing-panes .pane-cell {
 
 .session-text {
   white-space: pre-wrap;
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
 }
 
 .session-expand {
@@ -3894,7 +3911,7 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-normal);
   font-size: var(--font-ui-small);
   line-height: 1.6;
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
 }
 
 .session-assistant > *:first-child {
@@ -4031,7 +4048,7 @@ body.is-resizing-panes .pane-cell {
   font-size: var(--font-ui-smaller);
   line-height: 1.5;
   white-space: pre-wrap;
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
   overflow-y: auto;
 }
 
@@ -4048,7 +4065,7 @@ body.is-resizing-panes .pane-cell {
   font-style: italic;
   line-height: 1.55;
   white-space: pre-wrap;
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
   overflow-y: auto;
 }
 
@@ -4087,7 +4104,7 @@ body.is-resizing-panes .pane-cell {
   font-size: inherit;
   line-height: 1.5;
   white-space: pre-wrap;
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
 }
 
 .session-bash-collapsible {

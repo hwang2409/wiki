@@ -1,5 +1,5 @@
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { ComponentProps } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import type { ComponentProps, CSSProperties } from "react";
 import {
   AlertTriangle,
   Bell,
@@ -53,6 +53,12 @@ import { externalLinkProps } from "./external-links";
 import { LoadingPlaceholder } from "./loading";
 
 const POLL_MS = 2500;
+const VIRTUAL_ROW_GAP = 14;
+const VIRTUAL_MIN_OVERSCAN = 3600;
+const VIRTUAL_OVERSCAN_MULTIPLIER = 5;
+const VIRTUAL_DEFAULT_VIEWPORT = 720;
+const MIN_ROW_HEIGHT = 24;
+const COMPOSER_MIN_HEIGHT = 44;
 
 let skillsCache: SkillInfo[] | null = null;
 function useSkills(): SkillInfo[] {
@@ -101,6 +107,59 @@ function measureCaret(el: HTMLTextAreaElement, at: number): { top: number; left:
   return { top, left };
 }
 
+function createTextareaMeasure(): HTMLTextAreaElement {
+  const mirror = document.createElement("textarea");
+  mirror.setAttribute("aria-hidden", "true");
+  mirror.tabIndex = -1;
+  mirror.style.position = "absolute";
+  mirror.style.visibility = "hidden";
+  mirror.style.pointerEvents = "none";
+  mirror.style.top = "0";
+  mirror.style.left = "-9999px";
+  mirror.style.height = "0";
+  mirror.style.minHeight = "0";
+  mirror.style.maxHeight = "none";
+  mirror.style.overflow = "hidden";
+  mirror.style.contain = "strict";
+  document.body.appendChild(mirror);
+  return mirror;
+}
+
+function measureTextareaHeight(source: HTMLTextAreaElement, mirror: HTMLTextAreaElement): number {
+  const style = getComputedStyle(source);
+  for (const prop of [
+    "boxSizing",
+    "fontFamily",
+    "fontSize",
+    "fontStyle",
+    "fontWeight",
+    "letterSpacing",
+    "lineHeight",
+    "paddingTop",
+    "paddingRight",
+    "paddingBottom",
+    "paddingLeft",
+    "borderTopWidth",
+    "borderRightWidth",
+    "borderBottomWidth",
+    "borderLeftWidth",
+    "textIndent",
+    "textTransform",
+    "whiteSpace",
+    "wordBreak",
+    "overflowWrap",
+  ] as const) {
+    mirror.style[prop] = style[prop];
+  }
+  mirror.style.width = `${Math.max(source.clientWidth, Math.ceil(source.getBoundingClientRect().width))}px`;
+  mirror.value = source.value
+    ? source.value.endsWith("\n")
+      ? `${source.value} `
+      : source.value
+    : " ";
+  return Math.max(mirror.scrollHeight, COMPOSER_MIN_HEIGHT);
+}
+
 // "/par" or "$par" at the caret, at start-of-word → autocomplete trigger
 const SKILL_TRIGGER = /(?:^|\s)([/$])([\w-]*)$/;
 
@@ -113,21 +172,62 @@ export function usePollTick(refreshTick: number): number {
   return pollTick + refreshTick;
 }
 
-function usePinnedScroll<T extends HTMLElement>(dep: unknown, resetKey: unknown) {
+function usePinnedScroll<T extends HTMLElement>(
+  dep: unknown,
+  resetKey: unknown,
+  onViewportChange?: (viewport: { top: number; height: number }, force?: boolean) => void
+) {
   const ref = useRef<T | null>(null);
   const innerRef = useRef<HTMLDivElement | null>(null);
   const pinnedRef = useRef(true);
+  const rafRef = useRef<number | null>(null);
+  const pendingForceRef = useRef(false);
+  const viewportRef = useRef<{ top: number; height: number } | null>(null);
+
+  const syncViewport = useCallback((force = false) => {
+    const el = ref.current;
+    if (!el || !onViewportChange) return;
+    const height = el.clientHeight || VIRTUAL_DEFAULT_VIEWPORT;
+    const top = el.scrollTop;
+    const previousViewport = viewportRef.current;
+    const nextPinned = el.scrollHeight - top - height < 24;
+    if (!(pinnedRef.current && previousViewport && previousViewport.top === top && height < previousViewport.height)) {
+      pinnedRef.current = nextPinned;
+    }
+    const viewport = { top, height };
+    viewportRef.current = viewport;
+    onViewportChange(viewport, force);
+  }, [onViewportChange]);
+
+  const scheduleViewportSync = useCallback((force = false) => {
+    pendingForceRef.current = pendingForceRef.current || force;
+    if (rafRef.current !== null) return;
+    rafRef.current = window.requestAnimationFrame(() => {
+      rafRef.current = null;
+      const shouldForce = pendingForceRef.current;
+      pendingForceRef.current = false;
+      syncViewport(shouldForce);
+    });
+  }, [syncViewport]);
+
+  const scrollToBottom = useCallback(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+    syncViewport();
+  }, [syncViewport]);
 
   // New target (ticket switch) always starts pinned at the bottom.
   useLayoutEffect(() => {
     pinnedRef.current = true;
+    viewportRef.current = null;
   }, [resetKey]);
 
   // Pin before paint so an opened log never flashes at the top.
   useLayoutEffect(() => {
-    const el = ref.current;
-    if (el && pinnedRef.current) el.scrollTop = el.scrollHeight;
-  }, [dep]);
+    if (pinnedRef.current) scrollToBottom();
+    else syncViewport();
+  }, [dep, scrollToBottom, syncViewport]);
 
   // Content can grow after the effect (font swap, wrapping, expands) — re-pin on resize.
   useEffect(() => {
@@ -135,17 +235,41 @@ function usePinnedScroll<T extends HTMLElement>(dep: unknown, resetKey: unknown)
     const inner = innerRef.current;
     if (!el || !inner) return;
     const observer = new ResizeObserver(() => {
-      if (pinnedRef.current) el.scrollTop = el.scrollHeight;
+      if (pinnedRef.current) scrollToBottom();
+      else scheduleViewportSync(true);
     });
+    observer.observe(el);
     observer.observe(inner);
-    return () => observer.disconnect();
-  }, [dep]);
+    return () => {
+      observer.disconnect();
+      if (rafRef.current !== null) {
+        window.cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+    };
+  }, [dep, scheduleViewportSync, scrollToBottom]);
 
-  const onScroll = (event: React.UIEvent<T>) => {
-    const el = event.currentTarget;
-    pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+  useLayoutEffect(() => {
+    syncViewport(true);
+  }, [resetKey, syncViewport]);
+
+  const handleNativeScroll = useCallback(() => {
+    scheduleViewportSync();
+  }, [scheduleViewportSync]);
+ 
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.addEventListener("scroll", handleNativeScroll, { passive: true });
+    return () => el.removeEventListener("scroll", handleNativeScroll);
+  }, [handleNativeScroll]);
+  return {
+    ref,
+    innerRef,
+    pinnedRef,
+    scrollToBottom,
+    syncViewport,
   };
-  return { ref, innerRef, onScroll };
 }
 
 function formatTokens(tokens: number | null): string | null {
@@ -185,7 +309,13 @@ function UserText({
       {parts.map((part, i) => {
         if (typeof part === "string") return <span key={i}>{part}</span>;
         imgIndex += 1;
-        return <ImageChip key={i} num={imageNums[imgIndex] ?? 0} url={part.url} />;
+        return (
+          <ImageChip
+            key={i}
+            num={imageNums[imgIndex] ?? 0}
+            url={part.url}
+          />
+        );
       })}
     </div>
   );
@@ -214,11 +344,15 @@ const ARCHETYPE_ICONS: Record<string, LucideIcon> = {
 function ToolRow({
   event,
   onInspect,
+  stateKey,
+  uiState,
 }: {
   event: SessionEvent;
   onInspect?: (agentId: string) => void;
+  stateKey: string;
+  uiState: SessionUiState;
 }) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useStoredBooleanState(uiState, stateKey, false);
   const tool = event.tool!;
   const Icon = ARCHETYPE_ICONS[tool.archetype] ?? Terminal;
   const summary = tool.summary || tool.input.split("\n")[0].slice(0, 120);
@@ -269,6 +403,181 @@ type EventGroup =
   | { kind: "message"; event: SessionEvent; key: number }
   | { kind: "activity"; events: SessionEvent[]; key: number };
 
+type RowMeasurement = {
+  refs: readonly SessionEvent[];
+  height: number;
+};
+
+type VirtualLayout = {
+  keys: number[];
+  keyToIndex: Map<number, number>;
+  tops: number[];
+  sizes: number[];
+  totalHeight: number;
+};
+
+type SessionUiState = {
+  booleans: Map<string, boolean>;
+};
+
+function createSessionUiState(): SessionUiState {
+  return { booleans: new Map() };
+}
+
+function useStoredBooleanState(
+  store: SessionUiState,
+  key: string,
+  initial: boolean
+): [boolean, (next: boolean | ((current: boolean) => boolean)) => void] {
+  const [, forceRender] = useState(0);
+  const value = store.booleans.get(key) ?? initial;
+  const setValue = useCallback((next: boolean | ((current: boolean) => boolean)) => {
+    const current = store.booleans.get(key) ?? initial;
+    const resolved = typeof next === "function" ? next(current) : next;
+    if (resolved === initial) store.booleans.delete(key);
+    else store.booleans.set(key, resolved);
+    forceRender((version) => version + 1);
+  }, [initial, key, store]);
+  return [value, setValue];
+}
+
+function groupEventRefs(group: EventGroup): readonly SessionEvent[] {
+  return group.kind === "activity" ? group.events : [group.event];
+}
+
+function sameEventRefs(prev: readonly SessionEvent[], next: readonly SessionEvent[]): boolean {
+  return prev.length === next.length && prev.every((event, index) => event === next[index]);
+}
+
+function estimateWrappedLines(text: string, charsPerLine: number): number {
+  let total = 0;
+  for (const line of text.split("\n")) total += Math.max(1, Math.ceil(line.length / charsPerLine));
+  return total;
+}
+
+function getEstimatedGroupHeight(group: EventGroup): number {
+  if (group.kind === "activity") return 34;
+  switch (group.event.kind) {
+    case "assistant":
+      return Math.max(96, 28 + estimateWrappedLines(group.event.text, 92) * 22);
+    case "bash":
+      return Math.max(
+        76,
+        28 +
+          estimateWrappedLines(group.event.bash?.input ?? "", 92) * 20 +
+          estimateWrappedLines(
+            [group.event.bash?.stdout, group.event.bash?.stderr].filter(Boolean).join("\n"),
+            104
+          ) *
+            18
+      );
+    case "tasks":
+      return Math.max(72, 40 + (group.event.tasks?.length ?? 0) * 28);
+    case "terminal":
+      return Math.max(60, 24 + estimateWrappedLines(group.event.text, 112) * 18);
+    case "user":
+      return Math.max(52, 20 + estimateWrappedLines(group.event.text, 96) * 20);
+    case "image":
+      return 44;
+    case "notification":
+    case "command":
+    case "interrupt":
+    case "pr":
+    case "marker":
+      return Math.max(40, 18 + estimateWrappedLines(group.event.text, 92) * 18);
+    default:
+      return 56;
+  }
+}
+
+function getMeasuredGroupHeight(group: EventGroup, heights: Map<number, RowMeasurement>): number | null {
+  const measurement = heights.get(group.key);
+  if (!measurement) return null;
+  return measurement.height;
+}
+
+function buildVirtualLayout(groups: EventGroup[], heights: Map<number, RowMeasurement>): VirtualLayout {
+  const keys = new Array<number>(groups.length);
+  const keyToIndex = new Map<number, number>();
+  const tops = new Array<number>(groups.length);
+  const sizes = new Array<number>(groups.length);
+  let offset = 0;
+  for (let index = 0; index < groups.length; index += 1) {
+    const group = groups[index];
+    keys[index] = group.key;
+    keyToIndex.set(group.key, index);
+    tops[index] = offset;
+    const height = getMeasuredGroupHeight(group, heights) ?? getEstimatedGroupHeight(group);
+    const size = height + (index === groups.length - 1 ? 0 : VIRTUAL_ROW_GAP);
+    sizes[index] = size;
+    offset += size;
+  }
+  return { keys, keyToIndex, tops, sizes, totalHeight: offset };
+}
+
+function findFirstVisibleIndex(layout: VirtualLayout, offset: number): number {
+  let lo = 0;
+  let hi = layout.tops.length - 1;
+  let answer = layout.tops.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (layout.tops[mid] + layout.sizes[mid] > offset) {
+      answer = mid;
+      hi = mid - 1;
+    } else {
+      lo = mid + 1;
+    }
+  }
+  return answer;
+}
+
+function findLastVisibleIndex(layout: VirtualLayout, offset: number): number {
+  let lo = 0;
+  let hi = layout.tops.length - 1;
+  let answer = 0;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (layout.tops[mid] < offset) {
+      answer = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return answer;
+}
+
+function computeVisibleRange(layout: VirtualLayout, top: number, height: number): { start: number; end: number } {
+  if (layout.tops.length === 0) return { start: 0, end: -1 };
+  const overscan = Math.max(VIRTUAL_MIN_OVERSCAN, height * VIRTUAL_OVERSCAN_MULTIPLIER);
+  const start = findFirstVisibleIndex(layout, Math.max(0, top - overscan));
+  const end = findLastVisibleIndex(layout, top + height + overscan);
+  return { start, end: Math.max(start, end) };
+}
+
+function sameVisibleRange(
+  prev: { start: number; end: number },
+  next: { start: number; end: number }
+): boolean {
+  return prev.start === next.start && prev.end === next.end;
+}
+
+function findScrollAnchor(layout: VirtualLayout, top: number): { index: number; key: number; offset: number } | null {
+  if (layout.tops.length === 0) return null;
+  const index = findFirstVisibleIndex(layout, top);
+  return {
+    index,
+    key: layout.keys[index] ?? 0,
+    offset: top - layout.tops[index],
+  };
+}
+
+function sameImageNums(prev?: number[], next?: number[]): boolean {
+  if (prev === next) return true;
+  if (!prev || !next) return !prev && !next;
+  return prev.length === next.length && prev.every((num, index) => num === next[index]);
+}
+
 function groupEvents(events: SessionEvent[], offset: number): EventGroup[] {
   const groups: EventGroup[] = [];
   for (let i = 0; i < events.length; i += 1) {
@@ -288,8 +597,15 @@ function groupEvents(events: SessionEvent[], offset: number): EventGroup[] {
   return groups;
 }
 
-function ImageChip({ url, num }: { url: string; num: number }) {
+function ImageChip({
+  num,
+  url,
+}: {
+  num: number;
+  url: string;
+}) {
   const [hover, setHover] = useState(false);
+
   return (
     <span
       className="session-image-wrap"
@@ -320,19 +636,19 @@ const sessionMarkdownComponents = {
   a: SessionMarkdownLink,
 };
 
-const sameEvents = (
-  prev: { events: SessionEvent[]; onInspect?: (agentId: string) => void },
-  next: { events: SessionEvent[]; onInspect?: (agentId: string) => void }
-) =>
-  prev.onInspect === next.onInspect &&
-  prev.events.length === next.events.length &&
-  prev.events.every((event, i) => event === next.events[i]);
-
-function BashBlock({ event }: { event: SessionEvent }) {
+function BashBlock({
+  event,
+  stateKey,
+  uiState,
+}: {
+  event: SessionEvent;
+  stateKey: string;
+  uiState: SessionUiState;
+}) {
   const bash = event.bash ?? { input: "", stdout: "", stderr: "" };
   const output = [bash.stdout, bash.stderr].filter(Boolean).join("\n");
   const canCollapse = output.length > 700 || output.split("\n").length > 14;
-  const [open, setOpen] = useState(!canCollapse);
+  const [open, setOpen] = useStoredBooleanState(uiState, stateKey, !canCollapse);
   return (
     <div className={`session-bash${open ? " is-open" : ""}${canCollapse ? " is-collapsible" : ""}`}>
       {bash.input ? (
@@ -366,9 +682,17 @@ function TaskStatusIcon({ status }: { status: string }) {
   return <Circle className="task-icon is-open" size={13} />;
 }
 
-function TaskListRow({ event }: { event: SessionEvent }) {
+function TaskListRow({
+  event,
+  stateKey,
+  uiState,
+}: {
+  event: SessionEvent;
+  stateKey: string;
+  uiState: SessionUiState;
+}) {
   const tasks = event.tasks ?? [];
-  const [open, setOpen] = useState(true);
+  const [open, setOpen] = useStoredBooleanState(uiState, stateKey, true);
   return (
     <div className={`session-tasks${open ? " is-open" : ""}`}>
       <button className="session-tasks-head" type="button" onClick={() => setOpen((v) => !v)}>
@@ -427,9 +751,13 @@ function MarkerRow({ text, marker }: { text: string; marker?: string }) {
 const MessageBlock = memo(function MessageBlock({
   event,
   imageNums,
+  rowKey,
+  uiState,
 }: {
   event: SessionEvent;
   imageNums?: number[];
+  rowKey: number;
+  uiState: SessionUiState;
 }) {
   if (event.kind === "user") {
     return (
@@ -465,10 +793,10 @@ const MessageBlock = memo(function MessageBlock({
     );
   }
   if (event.kind === "bash") {
-    return <BashBlock event={event} />;
+    return <BashBlock event={event} stateKey={`bash:${rowKey}`} uiState={uiState} />;
   }
   if (event.kind === "tasks") {
-    return <TaskListRow event={event} />;
+    return <TaskListRow event={event} stateKey={`tasks:${rowKey}`} uiState={uiState} />;
   }
   if (event.kind === "interrupt") {
     return <InterruptRow text={event.text} />;
@@ -486,22 +814,30 @@ const MessageBlock = memo(function MessageBlock({
       </ReactMarkdown>
     </div>
   );
-});
+}, (prev, next) =>
+  prev.event === next.event &&
+  prev.rowKey === next.rowKey &&
+  prev.uiState === next.uiState &&
+  sameImageNums(prev.imageNums, next.imageNums)
+);
 
 function ActivityGroupBase({
   events,
+  groupKey,
   onInspect,
+  uiState,
 }: {
   events: SessionEvent[];
+  groupKey: number;
   onInspect?: (agentId: string) => void;
+  uiState: SessionUiState;
 }) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useStoredBooleanState(uiState, `activity:${groupKey}`, false);
   const tools = events.filter((e) => e.kind === "tool");
   const thinking = events.filter((e) => e.kind === "thinking");
   const parts: string[] = [];
   if (tools.length) parts.push(`${tools.length} tool call${tools.length > 1 ? "s" : ""}`);
   if (thinking.length) parts.push(`${thinking.length} thinking`);
-  const visible = events.filter((e) => e.kind === "tool" || e.text);
   return (
     <div className="session-activity">
       <button className="session-activity-head" type="button" onClick={() => setOpen(!open)}>
@@ -511,15 +847,25 @@ function ActivityGroupBase({
       <div className={`session-collapsible session-activity-collapsible${open ? " is-open" : ""}`}>
         <div className="session-collapsible-inner">
           <div className="session-activity-body">
-          {visible.map((event, i) =>
-            event.kind === "tool" ? (
-              <ToolRow event={event} key={i} onInspect={onInspect} />
-            ) : (
-              <div className="session-thinking" key={i}>
-                {event.text}
-              </div>
-            )
-          )}
+            {events.map((event, index) => {
+              if (event.kind === "tool") {
+                return (
+                  <ToolRow
+                    event={event}
+                    key={groupKey + index}
+                    onInspect={onInspect}
+                    stateKey={`tool:${groupKey + index}`}
+                    uiState={uiState}
+                  />
+                );
+              }
+              if (!event.text) return null;
+              return (
+                <div className="session-thinking" key={groupKey + index}>
+                  {event.text}
+                </div>
+              );
+            })}
           </div>
         </div>
       </div>
@@ -527,7 +873,83 @@ function ActivityGroupBase({
   );
 }
 
-const ActivityGroup = memo(ActivityGroupBase, sameEvents);
+const ActivityGroup = memo(ActivityGroupBase, (prev, next) =>
+  prev.groupKey === next.groupKey &&
+  prev.onInspect === next.onInspect &&
+  prev.uiState === next.uiState &&
+  prev.events.length === next.events.length &&
+  prev.events.every((event, index) => event === next.events[index])
+);
+
+function useMeasuredRow(group: EventGroup, onHeightChange: (group: EventGroup, height: number) => void) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const report = (height: number) => onHeightChange(group, Math.max(MIN_ROW_HEIGHT, Math.round(height)));
+    report(el.getBoundingClientRect().height);
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (entry) report(entry.contentRect.height);
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [group, onHeightChange]);
+  return ref;
+}
+
+const VirtualSessionRow = memo(function VirtualSessionRow({
+  group,
+  imageNums,
+  onHeightChange,
+  onInspect,
+  top,
+  uiState,
+}: {
+  group: EventGroup;
+  imageNums?: number[];
+  onHeightChange: (group: EventGroup, height: number) => void;
+  onInspect?: (agentId: string) => void;
+  top: number;
+  uiState: SessionUiState;
+}) {
+  const rowRef = useMeasuredRow(group, onHeightChange);
+  const style: CSSProperties = { transform: `translateY(${top}px)` };
+  return (
+    <div className="session-virtual-row" ref={rowRef} style={style}>
+      {group.kind === "activity" ? (
+        <ActivityGroup events={group.events} groupKey={group.key} onInspect={onInspect} uiState={uiState} />
+      ) : (
+        <MessageBlock
+          event={group.event}
+          imageNums={imageNums}
+          rowKey={group.key}
+          uiState={uiState}
+        />
+      )}
+    </div>
+  );
+}, (prev, next) => {
+  if (
+    prev.top !== next.top ||
+    prev.onHeightChange !== next.onHeightChange ||
+    prev.onInspect !== next.onInspect ||
+    prev.uiState !== next.uiState
+  ) {
+    return false;
+  }
+  const prevGroup = prev.group;
+  const nextGroup = next.group;
+  if (prevGroup.kind !== nextGroup.kind || prevGroup.key !== nextGroup.key) return false;
+  if (prevGroup.kind === "activity" && nextGroup.kind === "activity") {
+    return (
+      prevGroup.events.length === nextGroup.events.length &&
+      prevGroup.events.every((event, index) => event === nextGroup.events[index])
+    );
+  }
+  if (prevGroup.kind !== "message" || nextGroup.kind !== "message") return false;
+  return prevGroup.event === nextGroup.event && sameImageNums(prev.imageNums, next.imageNums);
+});
 
 type SessionAcc = {
   format: string;
@@ -588,8 +1010,19 @@ export function SessionTab({
   const [session, setSession] = useState<SessionAcc | null>(() => sessionCache.get(resetKey) ?? null);
   const [error, setError] = useState<string | null>(null);
   const sessionRef = useRef<SessionAcc | null>(null);
+  const rowHeightsKeyRef = useRef(resetKey);
+  const rowHeightsRef = useRef<Map<number, RowMeasurement>>(new Map());
+  const layoutRef = useRef<VirtualLayout | null>(null);
+  const layoutResetKeyRef = useRef(resetKey);
+  const [rowHeightVersion, setRowHeightVersion] = useState(0);
+  const uiState = useMemo(() => createSessionUiState(), [resetKey]);
+
+  if (rowHeightsKeyRef.current !== resetKey) {
+    rowHeightsKeyRef.current = resetKey;
+    rowHeightsRef.current = new Map();
+  }
+
   sessionRef.current = session;
-  const { ref, innerRef, onScroll } = usePinnedScroll<HTMLDivElement>(session, resetKey);
 
   useEffect(() => {
     const cached = sessionCache.get(resetKey) ?? null;
@@ -627,6 +1060,84 @@ export function SessionTab({
     () => groupEvents(session?.events ?? [], session?.base ?? 0),
     [session]
   );
+  const layout = useMemo(
+    () => buildVirtualLayout(groups, rowHeightsRef.current),
+    [groups, resetKey, rowHeightVersion]
+  );
+  const [visibleRange, setVisibleRange] = useState<{ start: number; end: number }>({ start: 0, end: -1 });
+  const visibleRangeViewportRef = useRef<{ top: number; height: number } | null>(null);
+  const syncVisibleRange = useCallback((viewport: { top: number; height: number }, force = false) => {
+    const height = viewport.height || VIRTUAL_DEFAULT_VIEWPORT;
+    const overscan = Math.max(VIRTUAL_MIN_OVERSCAN, height * VIRTUAL_OVERSCAN_MULTIPLIER);
+    const previousViewport = visibleRangeViewportRef.current;
+    if (!force && previousViewport && previousViewport.height === height) {
+      const hysteresis = overscan * 0.5;
+      if (Math.abs(viewport.top - previousViewport.top) < hysteresis) return;
+    }
+    visibleRangeViewportRef.current = { top: viewport.top, height };
+    const next = computeVisibleRange(layout, viewport.top, height);
+    setVisibleRange((current) => (sameVisibleRange(current, next) ? current : next));
+  }, [layout]);
+  const {
+    ref,
+    innerRef,
+    pinnedRef,
+    scrollToBottom,
+    syncViewport,
+  } = usePinnedScroll<HTMLDivElement>(layout.totalHeight, resetKey, syncVisibleRange);
+
+  const reportRowHeight = useCallback((group: EventGroup, height: number) => {
+    const measurement: RowMeasurement = {
+      height,
+      refs: group.kind === "activity" ? group.events.slice() : [group.event],
+    };
+    const current = rowHeightsRef.current.get(group.key);
+    if (current && current.height === measurement.height && sameEventRefs(current.refs, measurement.refs)) {
+      return;
+    }
+    rowHeightsRef.current.set(group.key, measurement);
+    setRowHeightVersion((version) => version + 1);
+  }, []);
+
+  useLayoutEffect(() => {
+    const el = ref.current;
+    const previousLayout = layoutRef.current;
+    const previousResetKey = layoutResetKeyRef.current;
+    layoutRef.current = layout;
+    layoutResetKeyRef.current = resetKey;
+    if (!el) return;
+    if (!previousLayout || previousResetKey !== resetKey) {
+      if (pinnedRef.current) scrollToBottom();
+      else syncViewport(true);
+      return;
+    }
+    if (pinnedRef.current) {
+      scrollToBottom();
+      return;
+    }
+    const anchor = findScrollAnchor(previousLayout, el.scrollTop);
+    if (!anchor) {
+      syncViewport(true);
+      return;
+    }
+    const nextIndex = layout.keyToIndex.get(anchor.key) ?? Math.min(anchor.index, Math.max(0, layout.tops.length - 1));
+    const nextTop = layout.tops[nextIndex] ?? 0;
+    const maxScrollTop = Math.max(0, layout.totalHeight - el.clientHeight);
+    const target = Math.max(0, Math.min(nextTop + anchor.offset, maxScrollTop));
+    if (Math.abs(el.scrollTop - target) > 1) el.scrollTop = target;
+    syncViewport(true);
+  }, [layout, pinnedRef, ref, resetKey, scrollToBottom, syncViewport]);
+  const visibleGroups = useMemo(() => {
+    const end = Math.min(visibleRange.end, groups.length - 1);
+    if (end < visibleRange.start) return [];
+    const rows: { group: EventGroup; top: number }[] = [];
+    for (let index = visibleRange.start; index <= end; index += 1) {
+      const group = groups[index];
+      if (!group) continue;
+      rows.push({ group, top: layout.tops[index] ?? 0 });
+    }
+    return rows;
+  }, [groups, layout.tops, visibleRange.end, visibleRange.start]);
 
   const imageNumbers = useMemo(() => {
     const map = new Map<SessionEvent, number[]>();
@@ -706,20 +1217,22 @@ export function SessionTab({
           ) : null}
         </div>
       ) : null}
-      <div className="session-scroll" ref={ref} onScroll={onScroll}>
+      <div className="session-scroll" ref={ref}>
         <div className="session-scroll-inner" ref={innerRef}>
-        {groups.map((group) =>
-          group.kind === "activity" ? (
-            <ActivityGroup events={group.events} key={group.key} onInspect={onInspect} />
-          ) : (
-            <MessageBlock
-              event={group.event}
-              imageNums={imageNumbers.get(group.event)}
-              key={group.key}
-            />
-          )
-        )}
-      </div>
+          <div className="session-virtual-list" style={{ height: layout.totalHeight }}>
+            {visibleGroups.map(({ group, top }) => (
+              <VirtualSessionRow
+                group={group}
+                imageNums={group.kind === "message" ? imageNumbers.get(group.event) : undefined}
+                key={group.key}
+                onHeightChange={reportRowHeight}
+                onInspect={onInspect}
+                top={top}
+                uiState={uiState}
+              />
+            ))}
+          </div>
+        </div>
       </div>
       {subagent || !showComposer ? null : (
         <MessageComposer
@@ -808,6 +1321,7 @@ function MessageComposer({
   const visualAnchorRef = useRef(0);
   const visualHeadRef = useRef(0);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const measureRef = useRef<HTMLTextAreaElement | null>(null);
   const [caretPos, setCaretPos] = useState(0);
   const [overlayPos, setOverlayPos] = useState<{ top: number; left: number } | null>(null);
 
@@ -893,24 +1407,42 @@ function MessageComposer({
       }
     }
   }
+
+  const resizeComposer = useCallback(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    if (!measureRef.current) measureRef.current = createTextareaMeasure();
+    const surface = el.closest(".agent-session-surface, .session-side-panel") as HTMLElement | null;
+    const avail = surface?.clientHeight ?? window.innerHeight;
+    const cap = Math.max(80, Math.round(avail * 0.4));
+    const contentHeight = measureTextareaHeight(el, measureRef.current);
+    const desired = Math.min(contentHeight, cap);
+    el.style.height = `${desired}px`;
+    el.style.overflowY = contentHeight > cap ? "auto" : "hidden";
+  }, []);
+
+  useLayoutEffect(() => {
+    resizeComposer();
+  }, [resizeComposer, text]);
+
   useEffect(() => {
     const el = inputRef.current;
     if (!el) return;
     const surface = el.closest(".agent-session-surface, .session-side-panel") as HTMLElement | null;
-    const resize = () => {
-      const avail = surface?.clientHeight ?? window.innerHeight;
-      const cap = Math.max(80, Math.round(avail * 0.4));
-      el.style.height = "auto";
-      const desired = Math.min(el.scrollHeight, cap);
-      el.style.height = `${desired}px`;
-      el.style.overflowY = el.scrollHeight > cap ? "auto" : "hidden";
+    const handleWindowResize = () => resizeComposer();
+    window.addEventListener("resize", handleWindowResize);
+    const observer = surface ? new ResizeObserver(() => resizeComposer()) : null;
+    if (observer && surface) observer.observe(surface);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("resize", handleWindowResize);
     };
-    resize();
-    if (!surface) return;
-    const observer = new ResizeObserver(resize);
-    observer.observe(surface);
-    return () => observer.disconnect();
-  }, [text]);
+  }, [resizeComposer]);
+
+  useEffect(() => () => {
+    measureRef.current?.remove();
+    measureRef.current = null;
+  }, []);
 
   function caret(): number {
     return inputRef.current?.selectionStart ?? 0;
