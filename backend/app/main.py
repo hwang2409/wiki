@@ -1667,6 +1667,7 @@ async def rotate_account(body: AccountRotateIn) -> dict[str, object]:
         "to": result.incoming,
         "revived": result.revived,
         "failed": result.failed,
+        "failed_reasons": result.failed_reasons,
         "ts": datetime.now(timezone.utc).isoformat(),
     }
     await publish_agent_event(event)
@@ -1675,6 +1676,7 @@ async def rotate_account(body: AccountRotateIn) -> dict[str, object]:
         "to": result.incoming,
         "revived": result.revived,
         "failed": result.failed,
+        "failed_reasons": result.failed_reasons,
     }
 
 

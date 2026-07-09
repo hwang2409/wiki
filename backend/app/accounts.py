@@ -128,6 +128,9 @@ CWD_DIALOG_PATTERN = re.compile(
     r"use\s+current\s+directory",
     re.IGNORECASE,
 )
+# Codex renders completed TUI errors with a solid-square prefix. Requiring it
+# avoids treating source code, quoted fixtures, or transcript prose as a hit.
+CODEX_LIMIT_BANNER_PATTERN = re.compile(r"^\s*■\s+")
 KICKOFF_TICKET_PATTERN = re.compile(r"(?:Linear )?ticket ([A-Z]+-\d+)\b")
 # "try again at Jul 9th, 2026 8:36 PM" — optional ordinal, optional comma.
 RESET_TIME_PATTERN = re.compile(
@@ -158,12 +161,14 @@ def detect_codex_limit(pane: str) -> bool:
     """True when the pane shows the usage-limit signature (excludes benign form)."""
     if not pane:
         return False
-    if BENIGN_USAGE_PATTERN.search(pane):
-        # Both may co-occur if the operator ran /usage before the hit — reject
-        # only when the benign form matches AND the hit form doesn't.
-        if not LIMIT_HIT_PATTERN.search(pane):
-            return False
-    return bool(LIMIT_HIT_PATTERN.search(pane))
+    for line in pane.splitlines():
+        if not CODEX_LIMIT_BANNER_PATTERN.match(line):
+            continue
+        if BENIGN_USAGE_PATTERN.search(line) and not LIMIT_HIT_PATTERN.search(line):
+            continue
+        if LIMIT_HIT_PATTERN.search(line):
+            return True
+    return False
 
 
 def detect_claude_limit(pane: str) -> bool:
@@ -523,7 +528,11 @@ def read_registry() -> dict:
         return {}
 
 
-def _safe_revival_cwd(current: dict) -> tuple[str | None, str | None]:
+def _safe_revival_cwd(
+    current: dict,
+    *,
+    require_existing: bool = False,
+) -> tuple[str | None, str | None]:
     raw = current.get("worktree")
     source = "worktree"
     if not isinstance(raw, str) or not raw.strip():
@@ -539,6 +548,8 @@ def _safe_revival_cwd(current: dict) -> tuple[str | None, str | None]:
     home = os.path.abspath(os.path.expanduser("~"))
     if expanded == home:
         return None, "registry revival cwd resolves to $HOME; refusing zombie spawn"
+    if require_existing and not os.path.isdir(expanded):
+        return None, f"registry revival cwd does not exist: {expanded}"
     return expanded, None
 
 
@@ -559,6 +570,8 @@ def _worker_from_registry_entry(
     ticket: str,
     entry: object,
     kind: str,
+    *,
+    require_existing_cwd: bool = False,
 ) -> tuple[WorkerEntry | None, str | None]:
     if not isinstance(entry, dict):
         return None, "ticket is no longer in the registry"
@@ -575,7 +588,7 @@ def _worker_from_registry_entry(
         return None, "registry entry has no window for revival"
     if not isinstance(log, str) or not log:
         return None, "registry entry has no log path for revival"
-    cwd, reason = _safe_revival_cwd(current)
+    cwd, reason = _safe_revival_cwd(current, require_existing=require_existing_cwd)
     if not cwd:
         return None, reason
     return WorkerEntry(
@@ -625,6 +638,7 @@ def current_worker_for_revival(
         snapshot.ticket,
         registry.get(snapshot.ticket),
         snapshot.kind,
+        require_existing_cwd=True,
     )
     if not worker:
         return None, reason
@@ -781,7 +795,7 @@ def wiki_agent_update(
     window: str,
     log: str,
     session_id: str | None = None,
-) -> None:
+) -> tuple[bool, str | None]:
     args = [
         str(wiki_cli_path()),
         "agent",
@@ -794,7 +808,20 @@ def wiki_agent_update(
     ]
     if session_id:
         args.extend(["--session", session_id])
-    subprocess.run(args, timeout=10, check=False)
+    try:
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        return False, detail or f"exit {result.returncode}"
+    return True, None
 
 
 def codex_login_status() -> bool:
@@ -926,9 +953,8 @@ def rotate(
 
     if outgoing:
         snapshot_active_auth(outgoing)
-        if outgoing_reset_at is None:
-            outgoing_reset_at = _fallback_reset_time()
-        state.accounts.setdefault(outgoing, {})["limit_reset_at"] = outgoing_reset_at
+        if outgoing_reset_at is not None:
+            state.accounts.setdefault(outgoing, {})["limit_reset_at"] = outgoing_reset_at
 
     if not install_incoming_auth(target):
         raise RotationError(f"incoming auth.json missing for account {target!r}")
@@ -1017,8 +1043,19 @@ def _revive_worker(
     # new id). Re-scan and record whichever id is now newest for this worker.
     post_resume_id = find_session_id_for_worker(
         worker.ticket, worker.worktree, worker.spawned_at
-    ) or session_id
-    wiki_agent_update(worker.ticket, new_window, new_log, post_resume_id)
+    )
+    if not post_resume_id:
+        tmux_kill_window(new_window)
+        return None, "post-resume session id unresolved; registry not updated"
+    updated, update_error = wiki_agent_update(
+        worker.ticket,
+        new_window,
+        new_log,
+        post_resume_id,
+    )
+    if not updated:
+        tmux_kill_window(new_window)
+        return None, f"wiki agent update failed: {update_error or 'unknown error'}"
     tmux_send_literal_and_enter(new_window, revival_message(worker.ticket))
     return new_window, None
 
