@@ -9,6 +9,8 @@ updated: 2026-07-09
 
 ## 2026-07-09
 
+- **phoebe** — PHO-13279 admin trace UI quality — real tool names, purpose titles, python highlighting merged (#10929)
+- **phoebe** — PHO-13281 admin trace env-attributed DSN errors + tool constraint context merged (#10925)
 - **WIKI-24** — window-switch state preservation merged (PR #29) — drafts/panels/scroll survive window switches
 - **WIKI-32** — polling/delta overhaul — central transcript cache, pause hidden panes, patch-by-id deltas (subsumes WIKI-18) — spawn AFTER WIKI-31 merges
 - **phoebe** — PHO-13216 Core dossier + funnel snapshot data products (#10856 — account limit cap, stripeErroredCount, typed tags, spill markers)

@@ -17,9 +17,7 @@ In Progress:
 - [P1] WIKI-37: terminal panes — xterm.js WebGL + pty WS + token auth (owner: cdx:WIKI-37)
 - [P1] [PHO-13277](https://linear.app/phoebework/issue/PHO-13277): admin agent charts as messages + no point limits
 - [P1] [PHO-13278](https://linear.app/phoebework/issue/PHO-13278): truncation policy + artifact UI — cdx:PHO-13278 worker
-- [P1] [PHO-13279](https://linear.app/phoebework/issue/PHO-13279): trace UI quality (tool names, code render, titles)
 - [P1] [PHO-13280](https://linear.app/phoebework/issue/PHO-13280): tool semantics + discoverability (recordings/models/pack routing)
-- [P1] [PHO-13281](https://linear.app/phoebework/issue/PHO-13281): prod DSN readonly + tool constraint context
 
 Backlog:
 
