@@ -18,4 +18,6 @@ Henry + orchestrator brainstorm, 2026-07-09. Ticket: PHO-13273.
 
 **Rejected:** raw SQL surface (unbounded query shapes, composes badly with structured spill machinery); runtime information_schema introspection (semantics like mode/org-anchor/sensitivity not in catalog — allow-list problem reappears as annotation side-table); sensitivity tag+caveat machinery (Henry: internal tool, admins have prod access; only true secrets matter).
 
+**Operational notes:** `50k` is a Postgres planner-cost threshold, not a portable latency budget; `ALTER ROLE ... SET statement_timeout` only affects new sessions; `EXPLAIN (FORMAT JSON)` shares the same 10s budget as the query.
+
 **Beyond-DB gap map** (future, discussed same session): known-issue memory (PHO-11267), cross-run learning (PHO-11275), approval-gated writes (T3, trigger parked per PHO-13226), Temporal/queue ops visibility (no ticket yet).
