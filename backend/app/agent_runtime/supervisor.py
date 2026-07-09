@@ -1023,10 +1023,34 @@ class Supervisor:
             )
         if method == "events/read":
             run_id = self._resolve_run_id(params)
+            after_seq = params.get("after_seq", 0)
+            limit = params.get("limit", 200)
+            if not isinstance(after_seq, int) or isinstance(after_seq, bool) or after_seq < 0:
+                raise ValueError("event cursor must be a non-negative integer")
+            if (
+                not isinstance(limit, int)
+                or isinstance(limit, bool)
+                or not 1 <= limit <= 1000
+            ):
+                raise ValueError("event limit must be between 1 and 1000")
+            record = self.store.get(run_id)
             return {
                 "run_id": run_id,
-                "events": self.store.read_normalized_events(run_id),
-                "raw": self.store.read_raw_events(run_id)
+                "provider": record.provider.value,
+                "state": record.state.value,
+                "raw_count": record.raw_event_count,
+                "normalized_count": record.normalized_event_count,
+                "dispositions": dict(record.disposition_counts),
+                "events": self.store.read_normalized_events(
+                    run_id,
+                    after_seq=after_seq,
+                    limit=limit,
+                ),
+                "raw": self.store.read_raw_events(
+                    run_id,
+                    after_seq=after_seq,
+                    limit=limit,
+                )
                 if params.get("include_raw")
                 else None,
             }

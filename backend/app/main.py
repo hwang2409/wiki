@@ -780,6 +780,56 @@ def _direct_transcript_session(path: Path) -> tuple[str, Path] | None:
     return (fmt, path)
 
 
+def _provider_events(
+    agent_id: str,
+    *,
+    after_seq: int = 0,
+    limit: int = 200,
+    include_raw: bool = False,
+) -> dict[str, object] | None:
+    resolved = _registry_agent(_read_agent_registry(), agent_id)
+    if resolved is None or not _is_headless(resolved[2]):
+        return None
+    result = _supervisor_request(
+        "events/read",
+        {
+            "agent_id": resolved[0],
+            "after_seq": after_seq,
+            "limit": limit,
+            "include_raw": include_raw,
+        },
+    )
+    if not isinstance(result, dict) or not isinstance(result.get("events"), list):
+        raise HTTPException(
+            status_code=502,
+            detail="Agent supervisor returned a bad event inspector response",
+        )
+    return dict(result)
+
+
+@app.get("/api/agents/{agent_id}/events")
+def agent_provider_events(
+    agent_id: str,
+    after_seq: int = Query(0, ge=0),
+    limit: int = Query(200, ge=1, le=1000),
+    include_raw: bool = Query(False),
+) -> dict[str, object]:
+    if not valid_agent_id(agent_id):
+        raise HTTPException(status_code=400, detail="Bad agent id")
+    result = _provider_events(
+        agent_id,
+        after_seq=after_seq,
+        limit=limit,
+        include_raw=include_raw,
+    )
+    if result is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Provider event inspection is available after headless migration",
+        )
+    return result
+
+
 def _session_delta_payload(
     fmt: str,
     path: Path,
@@ -815,6 +865,10 @@ def _session_delta_payload(
         payload["subagents"] = _active_subagents(path)
     if include_queue and ticket and valid_agent_id(ticket):
         payload["queue"] = _queue_messages(ticket)
+    if ticket:
+        provider_inspector = _provider_events(ticket, limit=50)
+        if provider_inspector is not None:
+            payload["provider_inspector"] = provider_inspector
     return payload
 
 
@@ -870,6 +924,37 @@ def agent_session(
         if found:
             _session_paths[ticket] = found
     if found is None:
+        if isinstance(current, dict) and _is_headless(current):
+            provider_inspector = _provider_events(ticket, limit=50)
+            if provider_inspector is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Supervisor event inspector is unavailable",
+                )
+            return {
+                "version": 2,
+                "format": "provider-events",
+                "path": f"provider://{current['run_id']}",
+                "tokens": None,
+                "tasks": [],
+                "pr": None,
+                "session_meta": {},
+                "dispositions": {
+                    "rendered": 0,
+                    "summarized": 0,
+                    "ignored": 0,
+                    "unknown": 0,
+                },
+                "base": 0,
+                "cursor": 0,
+                "tail_from": 0,
+                "events": [],
+                "patches": [],
+                "subagents": [],
+                "queue": _queue_messages(ticket),
+                "working": _transcript_working(Path(current.get("log") or "."), ticket),
+                "provider_inspector": provider_inspector,
+            }
         # Native transcript gone (cleanup) — fall back to the archived pane log.
         if archive_dir is not None:
             logs = sorted(archive_dir.glob("*.log"), key=lambda p: p.stat().st_size, reverse=True)
@@ -1246,6 +1331,51 @@ Recover context from:
 
 Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and status-file contract. Re-read the current ticket/PR state, update the status file before long operations, then continue from the last durable step.
 """
+
+
+def _control_headless_agent(agent_id: str, action: str) -> dict[str, object]:
+    raw_id = agent_id.strip()
+    if not raw_id or not valid_agent_id(raw_id):
+        raise HTTPException(status_code=400, detail="Bad agent id")
+    resolved = _registry_agent(_read_agent_registry(), raw_id)
+    if resolved is None:
+        raise HTTPException(status_code=404, detail="No registered agent")
+    resolved_id, _, current = resolved
+    if not _is_headless(current):
+        raise HTTPException(
+            status_code=409,
+            detail="Legacy tmux agents must be migrated before lifecycle control",
+        )
+    result = _supervisor_request(
+        f"run/{action}",
+        {"agent_id": resolved_id},
+    )
+    if not isinstance(result, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="Agent supervisor returned a bad lifecycle response",
+        )
+    return dict(result)
+
+
+@app.post("/api/agents/{agent_id}/interrupt")
+def interrupt_agent(agent_id: str) -> dict[str, object]:
+    return _control_headless_agent(agent_id, "interrupt")
+
+
+@app.post("/api/agents/{agent_id}/resume")
+def resume_agent(agent_id: str) -> dict[str, object]:
+    return _control_headless_agent(agent_id, "resume")
+
+
+@app.post("/api/agents/{agent_id}/stop")
+def stop_agent(agent_id: str) -> dict[str, object]:
+    return _control_headless_agent(agent_id, "stop")
+
+
+@app.post("/api/agents/{agent_id}/archive")
+def archive_agent(agent_id: str) -> dict[str, object]:
+    return _control_headless_agent(agent_id, "archive")
 
 
 @app.post("/api/agents/{agent_id}/replace")

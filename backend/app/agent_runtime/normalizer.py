@@ -25,6 +25,8 @@ _CODEX_RENDERED_METHODS = {
     "error",
     "account/rateLimits/updated",
     "context/compacted",
+    "account/chatgptAuthTokens/refresh",
+    "serverRequest/resolved",
     "thread/archived",
     "thread/closed",
 }
@@ -39,6 +41,7 @@ _CODEX_IGNORED_METHODS = {
     "mcpServer/startupStatus/updated",
     "remoteControl/status/changed",
     "thread/settings/updated",
+    "thread/goal/cleared",
 }
 _CODEX_APPROVAL_METHODS = {
     "item/commandExecution/requestApproval",
@@ -115,6 +118,31 @@ _CLAUDE_RENDERED_TYPES = {
     "result",
     "task_notification",
     "stream_event",
+    "permission-mode",
+    "progress",
+    "pr-link",
+}
+_CLAUDE_SUMMARIZED_TYPES = {
+    "custom-title",
+    "agent-name",
+}
+_CLAUDE_IGNORED_TYPES = {
+    "ai-title",
+    "file-history-snapshot",
+    "last-prompt",
+    "mode",
+    "queue-operation",
+    "started",
+}
+_CLAUDE_RENDERED_SYSTEM_SUBTYPES = {
+    "api_error",
+    "compact_boundary",
+    "scheduled_task_fire",
+    "stop_hook_summary",
+    "turn_duration",
+    "informational",
+    "local_command",
+    "away_summary",
 }
 _CLAUDE_SUMMARIZED_SYSTEM_SUBTYPES = {
     "status",
@@ -176,6 +204,41 @@ def _normalize_claude(payload: dict[str, Any]) -> NormalizedProviderEvent:
             EventDisposition.SUMMARIZED,
             "provider_stderr",
             payload,
+        )
+    if event_type in _CLAUDE_IGNORED_TYPES:
+        return NormalizedProviderEvent(
+            EventDisposition.IGNORED,
+            f"claude_{event_type}",
+            payload,
+            state,
+        )
+    if event_type in _CLAUDE_SUMMARIZED_TYPES:
+        return NormalizedProviderEvent(
+            EventDisposition.SUMMARIZED,
+            f"claude_{event_type}",
+            payload,
+            state,
+        )
+    if event_type == "system" and subtype in _CLAUDE_RENDERED_SYSTEM_SUBTYPES:
+        return NormalizedProviderEvent(
+            EventDisposition.RENDERED,
+            f"claude_{subtype}",
+            payload,
+            state,
+        )
+    if event_type == "attachment":
+        attachment = payload.get("attachment") or {}
+        disposition = (
+            EventDisposition.RENDERED
+            if isinstance(attachment, dict)
+            and attachment.get("type") == "task_reminder"
+            else EventDisposition.UNKNOWN
+        )
+        return NormalizedProviderEvent(
+            disposition,
+            "claude_attachment",
+            payload,
+            state,
         )
     if event_type in _CLAUDE_RENDERED_TYPES:
         return NormalizedProviderEvent(

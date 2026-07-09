@@ -859,11 +859,51 @@ class RunStore:
             self._write_registry(registry)
             return old, new_record
 
-    def read_raw_events(self, run_id: str) -> list[dict[str, Any]]:
-        return self._read_json_lines(self.raw_events_path(run_id))
+    def read_raw_events(
+        self,
+        run_id: str,
+        *,
+        after_seq: int = 0,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        path = self.raw_events_path(run_id)
+        return self._event_page(
+            self._read_json_lines_tail(path, limit)
+            if after_seq == 0 and limit is not None
+            else self._read_json_lines(path),
+            after_seq=after_seq,
+            limit=limit,
+        )
 
-    def read_normalized_events(self, run_id: str) -> list[dict[str, Any]]:
-        return self._read_json_lines(self.normalized_events_path(run_id))
+    def read_normalized_events(
+        self,
+        run_id: str,
+        *,
+        after_seq: int = 0,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        path = self.normalized_events_path(run_id)
+        return self._event_page(
+            self._read_json_lines_tail(path, limit)
+            if after_seq == 0 and limit is not None
+            else self._read_json_lines(path),
+            after_seq=after_seq,
+            limit=limit,
+        )
+
+    @staticmethod
+    def _event_page(
+        events: list[dict[str, Any]],
+        *,
+        after_seq: int,
+        limit: int | None,
+    ) -> list[dict[str, Any]]:
+        filtered = [event for event in events if int(event.get("seq", 0)) > after_seq]
+        if limit is None:
+            return filtered
+        if after_seq == 0:
+            return filtered[-limit:]
+        return filtered[:limit]
 
     def _read_json_lines(self, path: Path) -> list[dict[str, Any]]:
         try:
@@ -876,6 +916,43 @@ class RunStore:
                 continue
             try:
                 value = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(value, dict):
+                events.append(value)
+        return events
+
+    def _read_json_lines_tail(
+        self,
+        path: Path,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Read complete JSONL records from the tail without scanning large logs."""
+
+        try:
+            with path.open("rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                remaining = handle.tell()
+                chunks: list[bytes] = []
+                newline_count = 0
+                while remaining > 0 and newline_count <= limit:
+                    size = min(64 * 1024, remaining)
+                    remaining -= size
+                    handle.seek(remaining)
+                    chunk = handle.read(size)
+                    chunks.append(chunk)
+                    newline_count += chunk.count(b"\n")
+        except FileNotFoundError as exc:
+            raise RunNotFound(str(path)) from exc
+        raw_lines = b"".join(reversed(chunks)).splitlines()
+        if remaining > 0 and raw_lines:
+            raw_lines.pop(0)  # the first chunk began in the middle of a record
+        events: list[dict[str, Any]] = []
+        for raw_line in raw_lines[-limit:]:
+            if not raw_line:
+                continue
+            try:
+                value = json.loads(raw_line)
             except ValueError:
                 continue
             if isinstance(value, dict):

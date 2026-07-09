@@ -11,8 +11,16 @@ import {
   ScrollText,
   X,
 } from "lucide-react";
-import { getAgents, replaceAgent, spawnAgentOrchestrator, spawnAgentWorker } from "./api";
+import {
+  controlAgent,
+  getAgents,
+  replaceAgent,
+  spawnAgentOrchestrator,
+  spawnAgentWorker,
+} from "./api";
 import type {
+  AgentControlAction,
+  AgentControlResult,
   AgentWorker,
   ArchivedWorker,
   Orchestrator,
@@ -690,6 +698,13 @@ export function AgentsView({
   const [replacePending, setReplacePending] = useState<string | null>(null);
   const [replaceNotice, setReplaceNotice] = useState<ReplaceAgentResult | null>(null);
   const [replaceError, setReplaceError] = useState<string | null>(null);
+  const [controlConfirm, setControlConfirm] = useState<string | null>(null);
+  const [controlPending, setControlPending] = useState<string | null>(null);
+  const [controlNotice, setControlNotice] = useState<{
+    action: AgentControlAction;
+    result: AgentControlResult;
+  } | null>(null);
+  const [controlError, setControlError] = useState<string | null>(null);
 
   useEffect(() => {
     if (data) return;
@@ -782,6 +797,33 @@ export function AgentsView({
     }
   }
 
+  async function requestControl(
+    id: string,
+    action: AgentControlAction,
+    confirm: boolean,
+  ) {
+    if (controlPending) return;
+    const key = `${id}:${action}`;
+    if (confirm && controlConfirm !== key) {
+      setControlConfirm(key);
+      setControlNotice(null);
+      setControlError(null);
+      return;
+    }
+    setControlPending(key);
+    setControlError(null);
+    try {
+      const result = await controlAgent(id, action);
+      setControlNotice({ action, result });
+      setReplaceNotice(null);
+      setControlConfirm(null);
+    } catch (err) {
+      setControlError(err instanceof Error ? err.message : `Could not ${action} agent`);
+    } finally {
+      setControlPending(null);
+    }
+  }
+
   function ReplaceButton({ id, disabled = false }: { id: string; disabled?: boolean }) {
     const confirming = replaceConfirm === id;
     const pending = replacePending === id;
@@ -798,6 +840,52 @@ export function AgentsView({
         <RefreshCw size={12} />
         {pending ? "Replacing" : confirming ? "Confirm replace" : "Replace"}
       </button>
+    );
+  }
+
+  function LifecycleControls({
+    id,
+    state,
+    controlAttached,
+  }: {
+    id: string;
+    state: string | null | undefined;
+    controlAttached: boolean;
+  }) {
+    const terminal = state === "dead" || state === "completed";
+    const canInterrupt =
+      controlAttached &&
+      (state === "starting" || state === "working" || state === "waiting-approval");
+    const canResume = !controlAttached && state === "blocked";
+    const canArchive =
+      controlAttached && (state === "idle" || state === "interrupted");
+
+    function button(action: AgentControlAction, label: string, confirm = false) {
+      const key = `${id}:${action}`;
+      const confirming = confirm && controlConfirm === key;
+      const pending = controlPending === key;
+      return (
+        <button
+          className={`agent-replace-button${confirming ? " is-confirming" : ""}`}
+          disabled={Boolean(controlPending)}
+          key={action}
+          type="button"
+          onClick={() => {
+            void requestControl(id, action, confirm);
+          }}
+        >
+          {pending ? `${label}…` : confirming ? `Confirm ${label.toLowerCase()}` : label}
+        </button>
+      );
+    }
+
+    return (
+      <>
+        {canInterrupt ? button("interrupt", "Interrupt") : null}
+        {canResume ? button("resume", "Revive") : null}
+        {canArchive ? button("archive", "Complete", true) : null}
+        {!terminal ? button("stop", "Stop", true) : null}
+      </>
     );
   }
 
@@ -880,6 +968,13 @@ export function AgentsView({
             </button>
           ) : null}
           <span className="agent-actions">
+            {worker.run_id ? (
+              <LifecycleControls
+                id={worker.ticket}
+                state={worker.runtime_state ?? worker.state}
+                controlAttached={Boolean(worker.control_attached)}
+              />
+            ) : null}
             <ReplaceButton
               id={worker.ticket}
               disabled={!worker.run_id && (!worker.window || !worker.window_alive)}
@@ -935,6 +1030,13 @@ export function AgentsView({
                   <span className="agents-orch-dead">window gone</span>
                 ) : null}
                 <span className="agents-orch-actions">
+                  {orch.run_id ? (
+                    <LifecycleControls
+                      id={orch.id}
+                      state={orch.runtime_state}
+                      controlAttached={Boolean(orch.control_attached)}
+                    />
+                  ) : null}
                   <ReplaceButton
                     id={orch.id}
                     disabled={!orch.run_id && (!orch.window || !orch.window_alive)}
@@ -1107,6 +1209,13 @@ export function AgentsView({
           </div>
         ) : null}
         {replaceError ? <div className="agents-notice is-error">{replaceError}</div> : null}
+        {controlNotice ? (
+          <div className="agents-notice">
+            {controlNotice.action} <code>{controlNotice.result.agent_id}</code> · state{" "}
+            <code>{controlNotice.result.state}</code>
+          </div>
+        ) : null}
+        {controlError ? <div className="agents-notice is-error">{controlError}</div> : null}
         {body}
       </div>
       {openWorker ? (

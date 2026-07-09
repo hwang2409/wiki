@@ -30,6 +30,8 @@ class FakeSupervisorClient:
         self.raw_path = raw_path
         self.calls: list[tuple[str, dict]] = []
         self.messages: list[dict[str, str]] = []
+        self.normalized_events: list[dict[str, Any]] = []
+        self.raw_events: list[dict[str, Any]] = []
         self.fail_unavailable = False
         self.event = {
             "type": "session",
@@ -122,6 +124,17 @@ class FakeSupervisorClient:
                 },
             )
             return {**row, "agent_id": agent_id}
+        if method in {"run/interrupt", "run/resume", "run/stop", "run/archive"}:
+            agent_id = values["agent_id"]
+            current = registry[agent_id]["current"]
+            current["state"] = {
+                "run/interrupt": "interrupted",
+                "run/resume": "working",
+                "run/stop": "dead",
+                "run/archive": "completed",
+            }[method]
+            self.registry_path.write_text(json.dumps(registry), encoding="utf-8")
+            return {**current, "agent_id": agent_id}
         if method == "run/send_now":
             return {"status": "sent"}
         if method == "run/send_on_idle":
@@ -140,6 +153,40 @@ class FakeSupervisorClient:
         if method == "run/queue/delete":
             self.messages.pop(values["index"])
             return {"messages": list(self.messages)}
+        if method == "events/read":
+            agent_id = values["agent_id"]
+            current = registry[agent_id]["current"]
+            limit = values.get("limit", 200)
+            after_seq = values.get("after_seq", 0)
+            normalized = [
+                event
+                for event in self.normalized_events
+                if event.get("seq", 0) > after_seq
+            ][-limit:]
+            raw = [
+                event for event in self.raw_events if event.get("seq", 0) > after_seq
+            ][-limit:]
+            return {
+                "run_id": current["run_id"],
+                "provider": current["provider"],
+                "state": current["state"],
+                "raw_count": len(self.raw_events),
+                "normalized_count": len(self.normalized_events),
+                "dispositions": {
+                    "rendered": len(
+                        [
+                            event
+                            for event in self.normalized_events
+                            if event.get("disposition") == "rendered"
+                        ]
+                    ),
+                    "summarized": 0,
+                    "ignored": 0,
+                    "unknown": 0,
+                },
+                "events": normalized,
+                "raw": raw if values.get("include_raw") else None,
+            }
         raise AssertionError(f"unexpected supervisor method: {method}")
 
     async def subscribe_events(self):
@@ -171,6 +218,7 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(main, "AGENT_TMP_DIR", self.tmp_dir),
             mock.patch.object(main, "MSG_QUEUE_PATH", self.queue_path),
             mock.patch.object(main, "SUPERVISOR_CLIENT", self.client),
+            mock.patch.object(main.transcripts, "find_session", return_value=None),
         ]
         for patcher in self.patchers:
             patcher.start()
@@ -260,6 +308,32 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(failed.exception.status_code, 503)
 
+    async def test_lifecycle_controls_are_closed_supervisor_routes(self) -> None:
+        self._seed_headless()
+        interrupted = main.interrupt_agent("WIKI-42")
+        resumed = main.resume_agent("WIKI-42")
+        stopped = main.stop_agent("WIKI-42")
+        archived = main.archive_agent("WIKI-42")
+        self.assertEqual(interrupted["state"], "interrupted")
+        self.assertEqual(resumed["state"], "working")
+        self.assertEqual(stopped["state"], "dead")
+        self.assertEqual(archived["state"], "completed")
+        self.assertEqual(
+            [method for method, _ in self.client.calls],
+            ["run/interrupt", "run/resume", "run/stop", "run/archive"],
+        )
+
+        registry = json.loads(self.registry.read_text(encoding="utf-8"))
+        registry["WIKI-LEGACY"] = {
+            "history": [],
+            "current": {"window": "@9999", "kind": "cc"},
+        }
+        self.registry.write_text(json.dumps(registry), encoding="utf-8")
+        with self.assertRaises(HTTPException) as legacy:
+            main.stop_agent("WIKI-LEGACY")
+        self.assertEqual(legacy.exception.status_code, 409)
+        self.assertIn("must be migrated", str(legacy.exception.detail))
+
     async def test_mixed_fleet_keeps_legacy_control_isolated(self) -> None:
         self._seed_headless()
         registry = json.loads(self.registry.read_text(encoding="utf-8"))
@@ -341,6 +415,41 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["format"], "codex")
         self.assertTrue(payload["working"])
         self.assertEqual(payload["queue"], [])
+
+    async def test_session_extends_wiki41_inspector_with_provider_stream(self) -> None:
+        self._seed_headless()
+        normalized_event = {
+            "seq": 1,
+            "raw_seq": 1,
+            "normalized_at": "2026-07-09T12:00:00+00:00",
+            "disposition": "rendered",
+            "kind": "approval",
+            "payload": {"method": "item/tool/requestUserInput"},
+            "lifecycle_state": "waiting-approval",
+        }
+        self.client.normalized_events = [normalized_event]
+        self.client.raw_events = [
+            {
+                "seq": 1,
+                "payload": {"method": "item/tool/requestUserInput"},
+            }
+        ]
+
+        payload = main.agent_session("WIKI-42")
+        inspector = cast(dict[str, Any], payload["provider_inspector"])
+        self.assertEqual(payload["format"], "provider-events")
+        self.assertEqual(inspector["raw_count"], 1)
+        self.assertEqual(inspector["normalized_count"], 1)
+        self.assertEqual(inspector["dispositions"]["rendered"], 1)
+        self.assertEqual(inspector["events"][0]["kind"], "approval")
+
+        raw = main.agent_provider_events(
+            "WIKI-42",
+            after_seq=0,
+            limit=200,
+            include_raw=True,
+        )
+        self.assertEqual(cast(list[dict[str, Any]], raw["raw"])[0]["seq"], 1)
 
     async def test_spawn_and_replace_are_supervisor_owned(self) -> None:
         with mock.patch.object(

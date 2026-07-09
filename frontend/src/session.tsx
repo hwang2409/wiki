@@ -39,6 +39,7 @@ import {
   uploadImage,
 } from "./api";
 import type {
+  ProviderEventInspector,
   QueuedMessage,
   SessionEvent,
   SessionPr,
@@ -324,6 +325,54 @@ function formatTokens(tokens: number | null): string | null {
 
 function formatDispositionCounts({ unknown }: { unknown: number }): string {
   return `Unknown ${unknown}`;
+}
+
+function ProviderStreamInspector({ inspector }: { inspector: ProviderEventInspector }) {
+  const [open, setOpen] = useState(false);
+  const counts = formatDispositionCounts(inspector.dispositions);
+  return (
+    <div className={`session-provider-inspector${open ? " is-open" : ""}`}>
+      <button
+        aria-expanded={open}
+        className="session-provider-inspector-head"
+        type="button"
+        onClick={() => setOpen((current) => !current)}
+      >
+        <ChevronRight size={12} />
+        <span className="session-dispositions-label">Provider stream</span>
+        <span className="session-provider-inspector-route">
+          raw {inspector.raw_count} → normalized {inspector.normalized_count}
+        </span>
+        <span className="session-dispositions-value">{counts}</span>
+        <span className={`session-provider-state is-${inspector.state}`}>
+          {inspector.provider} · {inspector.state}
+        </span>
+      </button>
+      {open ? (
+        <div className="session-provider-events">
+          {inspector.events.length > 0 ? (
+            inspector.events
+              .slice()
+              .reverse()
+              .map((event) => (
+                <details className="session-provider-event" key={event.seq}>
+                  <summary>
+                    <span className={`is-${event.disposition}`}>{event.disposition}</span>
+                    <span>#{event.seq}</span>
+                    <span>{event.kind}</span>
+                    {event.lifecycle_state ? <span>→ {event.lifecycle_state}</span> : null}
+                    <span>raw #{event.raw_seq}</span>
+                  </summary>
+                  <pre>{JSON.stringify(event.payload, null, 2)}</pre>
+                </details>
+              ))
+          ) : (
+            <div className="session-provider-empty">No normalized provider events yet.</div>
+          )}
+        </div>
+      ) : null}
+    </div>
+  );
 }
 
 const IMG_TOKEN_PATTERN = /\u27e6img:([^\u27e7]+)\u27e7/g;
@@ -1491,6 +1540,9 @@ export function SessionTab({
         </div>
       ) : null}
       <div className="session-dispositions">{dispositionCounts}</div>
+      {session.providerInspector ? (
+        <ProviderStreamInspector inspector={session.providerInspector} />
+      ) : null}
       <div className="session-scroll" ref={ref}>
         <div className="session-scroll-inner" ref={innerRef}>
           <div className="session-virtual-list" style={{ height: layout.totalHeight }}>

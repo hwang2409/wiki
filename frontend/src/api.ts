@@ -191,6 +191,22 @@ export function replaceAgent(id: string) {
   });
 }
 
+export type AgentControlAction = "interrupt" | "resume" | "stop" | "archive";
+
+export type AgentControlResult = {
+  run_id: string;
+  agent_id: string;
+  state: string;
+  state_reason?: string | null;
+};
+
+export function controlAgent(id: string, action: AgentControlAction) {
+  return request<AgentControlResult>(
+    `/api/agents/${encodeURIComponent(id)}/${action}`,
+    { method: "POST" },
+  );
+}
+
 export type SessionTool = {
   name: string;
   input: string;
@@ -239,6 +255,36 @@ export type SessionMeta = {
   agent_name?: string;
 };
 
+export type ProviderStreamEvent = {
+  seq: number;
+  raw_seq: number;
+  normalized_at: string;
+  disposition: "rendered" | "summarized" | "ignored" | "unknown";
+  kind: string;
+  lifecycle_state: string | null;
+  payload: Record<string, unknown>;
+};
+
+export type ProviderRawEvent = {
+  seq: number;
+  received_at?: string;
+  provider?: string;
+  direction?: string;
+  generation?: number;
+  payload: Record<string, unknown>;
+};
+
+export type ProviderEventInspector = {
+  run_id: string;
+  provider: string;
+  state: string;
+  raw_count: number;
+  normalized_count: number;
+  dispositions: SessionDispositionCounts;
+  events: ProviderStreamEvent[];
+  raw?: ProviderRawEvent[] | null;
+};
+
 export type SessionEvent = {
   id: number;
   kind:
@@ -282,7 +328,7 @@ export type SessionPatch = {
 
 export type AgentSessionData = {
   version: 2;
-  format: "codex" | "claude" | "pane-log";
+  format: "codex" | "claude" | "pane-log" | "provider-events";
   path: string;
   tokens: number | null;
   tasks?: SessionTask[];
@@ -297,6 +343,7 @@ export type AgentSessionData = {
   subagents?: SubagentInfo[];
   queue?: QueuedMessage[];
   working?: boolean;
+  provider_inspector?: ProviderEventInspector;
 };
 
 export type QueuedMessage = { text: string; queued_at: string };
@@ -362,6 +409,13 @@ export function getAgentSession(ticket: string, after = 0, path?: string) {
   if (path) params.set("path", path);
   return request<AgentSessionData>(
     `/api/agents/${encodeURIComponent(ticket)}/session?${params.toString()}`
+  );
+}
+
+export function getAgentProviderEvents(ticket: string, includeRaw = false) {
+  const params = new URLSearchParams({ include_raw: String(includeRaw) });
+  return request<ProviderEventInspector>(
+    `/api/agents/${encodeURIComponent(ticket)}/events?${params.toString()}`,
   );
 }
 

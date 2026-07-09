@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest import mock
 
 from backend.app.agent_runtime.fake import WireFixture
+from backend.app.agent_runtime.normalizer import normalize_provider_event
 from backend.app.agent_runtime.provider import AdapterStatus
 from backend.app.agent_runtime.store import (
     RunStore,
@@ -121,6 +122,44 @@ class ProtocolFixtureTests(unittest.TestCase):
             text = path.read_text(encoding="utf-8")
             for marker in forbidden:
                 self.assertNotIn(marker, text, f"{marker!r} leaked in {path.name}")
+
+    def test_provider_normalizer_covers_wiki41_native_surface_dispositions(self) -> None:
+        claude_cases = [
+            ({"type": "progress", "data": {"type": "planning"}}, EventDisposition.RENDERED),
+            (
+                {"type": "permission-mode", "permissionMode": "bypassPermissions"},
+                EventDisposition.RENDERED,
+            ),
+            (
+                {"type": "system", "subtype": "api_error", "error": {"formatted": "529"}},
+                EventDisposition.RENDERED,
+            ),
+            (
+                {"type": "attachment", "attachment": {"type": "task_reminder"}},
+                EventDisposition.RENDERED,
+            ),
+            ({"type": "custom-title", "customTitle": "Fixture"}, EventDisposition.SUMMARIZED),
+            ({"type": "agent-name", "agentName": "worker"}, EventDisposition.SUMMARIZED),
+            ({"type": "file-history-snapshot", "snapshot": {}}, EventDisposition.IGNORED),
+            ({"type": "unknown-fixture"}, EventDisposition.UNKNOWN),
+        ]
+        for payload, disposition in claude_cases:
+            with self.subTest(payload=payload):
+                normalized = normalize_provider_event(ProviderKind.CLAUDE, payload)
+                self.assertEqual(normalized.disposition, disposition)
+
+        auth = normalize_provider_event(
+            ProviderKind.CODEX,
+            {"method": "account/chatgptAuthTokens/refresh", "params": {}},
+        )
+        approval = normalize_provider_event(
+            ProviderKind.CODEX,
+            {"method": "item/tool/requestUserInput", "params": {}},
+        )
+        self.assertEqual(auth.disposition, EventDisposition.RENDERED)
+        self.assertEqual(auth.lifecycle_state, LifecycleState.BLOCKED)
+        self.assertEqual(approval.kind, "approval")
+        self.assertEqual(approval.lifecycle_state, LifecycleState.WAITING_APPROVAL)
 
 
 class LifecycleTests(unittest.TestCase):
@@ -240,6 +279,54 @@ class RunStoreTests(unittest.TestCase):
             self.assertEqual(normalized["raw_seq"], 1)
             reloaded = store.get(record.run_id)
             self.assertEqual(reloaded.disposition_counts["rendered"], 1)
+
+    def test_event_inspector_pages_from_cursor_or_bounded_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(_paths(root))
+            record = store.create(_record(root))
+            for index in range(1, 4):
+                raw = store.append_raw(
+                    record.run_id,
+                    provider="codex",
+                    direction="server",
+                    payload={"method": f"fixture/{index}"},
+                )
+                store.append_normalized(
+                    record.run_id,
+                    raw_seq=raw["seq"],
+                    disposition=EventDisposition.RENDERED,
+                    kind=f"fixture_{index}",
+                    payload=raw["payload"],
+                )
+
+            self.assertEqual(
+                [event["seq"] for event in store.read_raw_events(record.run_id, limit=2)],
+                [2, 3],
+            )
+            self.assertEqual(
+                [
+                    event["seq"]
+                    for event in store.read_normalized_events(
+                        record.run_id,
+                        after_seq=1,
+                        limit=1,
+                    )
+                ],
+                [2],
+            )
+            large_rows = [
+                {"seq": index, "payload": {"text": "x" * 2048}}
+                for index in range(1, 81)
+            ]
+            store.raw_events_path(record.run_id).write_text(
+                "\n".join(json.dumps(row) for row in large_rows) + "\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                [event["seq"] for event in store.read_raw_events(record.run_id, limit=2)],
+                [79, 80],
+            )
 
     def test_store_files_are_private_and_registry_keeps_legacy_shape(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
