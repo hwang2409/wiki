@@ -9,6 +9,7 @@ updated: 2026-07-09
 
 ## 2026-07-09
 
+- **phoebe** — PHO-13280 admin tool semantics + discoverability merged (#10926 — recordings partition, compare models, source-health routing, collision validator)
 - **WIKI-37** — terminal panes — xterm.js WebGL + pty WS + token auth (owner: cdx:WIKI-37)
 - **phoebe** — PHO-13279 admin trace UI quality — real tool names, purpose titles, python highlighting merged (#10929)
 - **phoebe** — PHO-13281 admin trace env-attributed DSN errors + tool constraint context merged (#10925)
