@@ -189,10 +189,10 @@ function mergeSession(current: TranscriptSession | null, result: AgentSessionDat
   };
 }
 
-async function loadTarget(target: TranscriptTarget, cursor: number): Promise<AgentSessionData> {
+async function loadTarget(target: TranscriptTarget, cursor: number, path?: string): Promise<AgentSessionData> {
   return target.subagent
-    ? getSubagentSession(target.ticket, target.subagent, cursor)
-    : getAgentSession(target.ticket, cursor);
+    ? getSubagentSession(target.ticket, target.subagent, cursor, path)
+    : getAgentSession(target.ticket, cursor, path);
 }
 
 function fetchEntry(entry: Entry): Promise<void> {
@@ -204,7 +204,11 @@ function fetchEntry(entry: Entry): Promise<void> {
   }
   entry.inFlight = (async () => {
     try {
-      const result = await loadTarget(entry.target, entry.snapshot.session?.cursor ?? 0);
+      const result = await loadTarget(
+        entry.target,
+        entry.snapshot.session?.cursor ?? 0,
+        entry.snapshot.session?.path
+      );
       entry.snapshot = {
         session: mergeSession(entry.snapshot.session, result),
         error: null,

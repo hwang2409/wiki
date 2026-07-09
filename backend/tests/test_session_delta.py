@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -262,6 +264,132 @@ class SessionDeltaTests(unittest.TestCase):
             self.assertEqual(body["cursor"], 1)
             self.assertEqual(body["queue"][0]["text"], "queued")
             self.assertEqual(body["events"][0]["text"], "hello")
+
+    def test_path_mismatch_forces_full_reset(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "first.jsonl"
+            second = root / "second.jsonl"
+            registry = root / "agent-registry.json"
+            queue = root / "queue.json"
+            status_dir = root / "status"
+            status_dir.mkdir()
+            registry.write_text("{}", encoding="utf-8")
+            queue.write_text("{}", encoding="utf-8")
+            _write_rows(
+                first,
+                [
+                    {
+                        "type": "event_msg",
+                        "timestamp": f"2026-07-09T01:00:0{index}Z",
+                        "payload": {"type": "user_message", "message": f"old-{index}"},
+                    }
+                    for index in range(3)
+                ],
+                mode="w",
+            )
+            _write_rows(
+                second,
+                [
+                    {
+                        "type": "event_msg",
+                        "timestamp": f"2026-07-09T01:01:0{index}Z",
+                        "payload": {"type": "user_message", "message": f"new-{index}"},
+                    }
+                    for index in range(8)
+                ],
+                mode="w",
+            )
+
+            with (
+                mock.patch.object(main, "AGENT_REGISTRY_PATH", registry),
+                mock.patch.object(main, "AGENT_STATUS_DIR", status_dir),
+                mock.patch.object(main, "MSG_QUEUE_PATH", queue),
+                mock.patch.object(main, "resolve_window", return_value=None),
+                mock.patch.dict(main._session_paths, {"WIKI-32": ("codex", second)}, clear=True),
+            ):
+                body = main.agent_session("WIKI-32", cursor=3, client_path=str(first))
+
+            self.assertEqual(body["path"], str(second))
+            self.assertEqual(body["tail_from"], 0)
+            self.assertEqual(body["cursor"], 8)
+            self.assertEqual(len(body["events"]), 8)
+            self.assertEqual(body["events"][0]["text"], "new-0")
+
+    def test_concurrent_readers_do_not_double_apply_rows(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout.jsonl"
+            path.write_text("", encoding="utf-8")
+            transcripts.read_session_delta("codex", path, 0)
+            _write_rows(
+                path,
+                [
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-07-09T01:00:00Z",
+                        "payload": {"type": "user_message", "message": "one"},
+                    }
+                ],
+                mode="w",
+            )
+
+            original_open = Path.open
+            first_read_started = threading.Event()
+            slowed = {"done": False}
+
+            class SlowHandle:
+                def __init__(self, inner):
+                    self._inner = inner
+
+                def read(self, *args, **kwargs):
+                    if not slowed["done"]:
+                        slowed["done"] = True
+                        first_read_started.set()
+                        time.sleep(0.1)
+                    return self._inner.read(*args, **kwargs)
+
+                def __getattr__(self, name):
+                    return getattr(self._inner, name)
+
+                def __enter__(self):
+                    self._inner.__enter__()
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    return self._inner.__exit__(exc_type, exc, tb)
+
+            def patched_open(self, *args, **kwargs):
+                handle = original_open(self, *args, **kwargs)
+                if self == path:
+                    return SlowHandle(handle)
+                return handle
+
+            results: list[dict] = []
+            errors: list[Exception] = []
+
+            def worker() -> None:
+                try:
+                    results.append(transcripts.read_session_delta("codex", path, 0))
+                except Exception as exc:  # pragma: no cover - test should stay green
+                    errors.append(exc)
+
+            with mock.patch.object(Path, "open", patched_open):
+                first = threading.Thread(target=worker)
+                second = threading.Thread(target=worker)
+                first.start()
+                self.assertTrue(first_read_started.wait(timeout=1))
+                second.start()
+                first.join(timeout=1)
+                second.join(timeout=1)
+
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            self.assertFalse(errors)
+            self.assertEqual(len(results), 2)
+            self.assertEqual(len(transcripts._cache[str(path)]["events"]), 1)
+            self.assertEqual(transcripts._cache[str(path)]["cursor"], 1)
+            self.assertTrue(all(len(result["events"]) == 1 for result in results))
+            self.assertTrue(all(result["events"][0]["text"] == "one" for result in results))
 
     def test_orchestrator_direct_codex_transcript_is_detected(self) -> None:
         with TemporaryDirectory() as tmp:

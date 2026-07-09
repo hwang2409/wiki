@@ -680,11 +680,13 @@ def _session_delta_payload(
     path: Path,
     *,
     cursor: int,
+    client_path: str | None = None,
     ticket: str | None = None,
     include_subagents: bool = False,
     include_queue: bool = False,
 ) -> dict[str, object]:
-    result = transcripts.read_session_delta(fmt, path, cursor)
+    effective_cursor = 0 if client_path is not None and client_path != str(path) else cursor
+    result = transcripts.read_session_delta(fmt, path, effective_cursor)
     events = result["events"]
     if fmt == "claude":
         transcripts.annotate_agent_events(path, events)
@@ -710,7 +712,11 @@ def _session_delta_payload(
 
 
 @app.get("/api/agents/{ticket}/session")
-def agent_session(ticket: str, cursor: int = Query(0, ge=0)) -> dict[str, object]:
+def agent_session(
+    ticket: str,
+    cursor: int = Query(0, ge=0),
+    client_path: str | None = Query(None, alias="path"),
+) -> dict[str, object]:
     if not TICKET_PATTERN.fullmatch(ticket):
         raise HTTPException(status_code=400, detail="Bad ticket")
 
@@ -728,6 +734,7 @@ def agent_session(ticket: str, cursor: int = Query(0, ge=0)) -> dict[str, object
                 fmt,
                 path,
                 cursor=cursor,
+                client_path=client_path,
                 ticket=ticket,
                 include_subagents=fmt == "claude",
                 include_queue=True,
@@ -776,6 +783,7 @@ def agent_session(ticket: str, cursor: int = Query(0, ge=0)) -> dict[str, object
         fmt,
         path,
         cursor=cursor,
+        client_path=client_path,
         ticket=ticket,
         include_subagents=fmt == "claude",
         include_queue=True,
@@ -830,7 +838,12 @@ def _resolve_main_transcript(ticket: str) -> Path | None:
 
 
 @app.get("/api/agents/{ticket}/subagents/{agent_id}/session")
-def subagent_session(ticket: str, agent_id: str, cursor: int = Query(0, ge=0)) -> dict[str, object]:
+def subagent_session(
+    ticket: str,
+    agent_id: str,
+    cursor: int = Query(0, ge=0),
+    client_path: str | None = Query(None, alias="path"),
+) -> dict[str, object]:
     if not TICKET_PATTERN.fullmatch(ticket) or not SUBAGENT_ID_PATTERN.fullmatch(agent_id):
         raise HTTPException(status_code=400, detail="Bad id")
     main_path = _resolve_main_transcript(ticket)
@@ -839,7 +852,7 @@ def subagent_session(ticket: str, agent_id: str, cursor: int = Query(0, ge=0)) -
     path = transcripts.subagents_dir(main_path) / f"agent-{agent_id}.jsonl"
     if not path.is_file():
         raise HTTPException(status_code=404, detail="No such subagent")
-    return _session_delta_payload("claude", path, cursor=cursor)
+    return _session_delta_payload("claude", path, cursor=cursor, client_path=client_path)
 
 
 UPLOAD_DIR = Path("/tmp/wiki-uploads")

@@ -298,9 +298,11 @@ export function cancelQueuedMessage(ticket: string, index: number) {
   );
 }
 
-export function getAgentSession(ticket: string, after = 0) {
+export function getAgentSession(ticket: string, after = 0, path?: string) {
+  const params = new URLSearchParams({ cursor: String(after) });
+  if (path) params.set("path", path);
   return request<AgentSessionData>(
-    `/api/agents/${encodeURIComponent(ticket)}/session?cursor=${after}`
+    `/api/agents/${encodeURIComponent(ticket)}/session?${params.toString()}`
   );
 }
 
@@ -317,9 +319,11 @@ export function uploadImage(mediaType: string, base64: string) {
   });
 }
 
-export function getSubagentSession(ticket: string, agentId: string, after = 0) {
+export function getSubagentSession(ticket: string, agentId: string, after = 0, path?: string) {
+  const params = new URLSearchParams({ cursor: String(after) });
+  if (path) params.set("path", path);
   return request<AgentSessionData>(
-    `/api/agents/${encodeURIComponent(ticket)}/subagents/${encodeURIComponent(agentId)}/session?cursor=${after}`
+    `/api/agents/${encodeURIComponent(ticket)}/subagents/${encodeURIComponent(agentId)}/session?${params.toString()}`
   );
 }
 

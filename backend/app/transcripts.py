@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import json
 import re
+import threading
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 
@@ -1012,6 +1014,17 @@ def _claude_apply(state: dict, row: dict) -> None:
 
 _APPLY = {"codex": _codex_apply, "claude": _claude_apply, "claude-sub": _claude_apply}
 _cache: dict[str, dict] = {}  # path → parse state; wiped on reload, rebuilt lazily
+_cache_locks: dict[str, threading.Lock] = {}
+_cache_locks_guard = threading.Lock()
+
+
+def _cache_lock_for(key: str) -> threading.Lock:
+    with _cache_locks_guard:
+        lock = _cache_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _cache_locks[key] = lock
+        return lock
 
 
 def _new_parse_state(fmt: str) -> dict:
@@ -1053,15 +1066,7 @@ def _prune_change_log(state: dict) -> None:
     ]
 
 
-def read_session_events(fmt: str, path: Path) -> dict:
-    """Returns {events, base, tokens, dirty_from}.
-
-    base = absolute index of events[0] (grows when the buffer trims).
-    dirty_from = absolute index of the oldest tool event still awaiting its
-    output — everything at/after it can mutate on a later read, so delta
-    consumers must re-fetch from min(cursor, dirty_from).
-    """
-    key = str(path)
+def _read_cached_state(fmt: str, path: Path, key: str) -> dict:
     stat = path.stat()
     state = _cache.get(key)
     if state is None or stat.st_size < state["offset"]:
@@ -1096,102 +1101,119 @@ def read_session_events(fmt: str, path: Path) -> dict:
             }
             _prune_change_log(state)
             state["last_bash"] = None
-    total = state["base"] + len(state["events"])
-    dirty_from = total
-    pending_events = set(map(id, state["pending"].values()))
-    if pending_events:
-        for i, event in enumerate(state["events"]):
-            if id(event) in pending_events:
-                dirty_from = state["base"] + i
-                break
-    return {
-        "events": state["events"],
-        "base": state["base"],
-        "tokens": state["tokens"],
-        "tasks": state.get("tasks") or [],
-        "pr": state.get("pr"),
-        "dirty_from": dirty_from,
-        "cursor": state.get("cursor", 0),
-    }
+    return state
+
+
+def read_session_events(fmt: str, path: Path) -> dict:
+    """Returns {events, base, tokens, dirty_from}.
+
+    base = absolute index of events[0] (grows when the buffer trims).
+    dirty_from = absolute index of the oldest tool event still awaiting its
+    output — everything at/after it can mutate on a later read, so delta
+    consumers must re-fetch from min(cursor, dirty_from).
+    """
+    key = str(path)
+    with _cache_lock_for(key):
+        state = _read_cached_state(fmt, path, key)
+        total = state["base"] + len(state["events"])
+        dirty_from = total
+        pending_events = set(map(id, state["pending"].values()))
+        if pending_events:
+            for i, event in enumerate(state["events"]):
+                if id(event) in pending_events:
+                    dirty_from = state["base"] + i
+                    break
+        return {
+            "events": deepcopy(state["events"]),
+            "base": state["base"],
+            "tokens": state["tokens"],
+            "tasks": deepcopy(state.get("tasks") or []),
+            "pr": deepcopy(state.get("pr")),
+            "dirty_from": dirty_from,
+            "cursor": state.get("cursor", 0),
+        }
 
 
 def read_session_delta(fmt: str, path: Path, cursor: int = 0) -> dict:
-    state = read_session_events(fmt, path)
-    current = _cache[str(path)]
-    base = int(state["base"])
-    events = state["events"]
-    current_cursor = int(state.get("cursor", 0))
-    total = base + len(events)
-    changes: list[dict] = list(current.get("changes", []))
+    key = str(path)
+    with _cache_lock_for(key):
+        state = _read_cached_state(fmt, path, key)
+        base = int(state["base"])
+        events = state["events"]
+        current_cursor = int(state.get("cursor", 0))
+        total = base + len(events)
+        changes: list[dict] = list(state.get("changes", []))
+        tasks = deepcopy(state.get("tasks") or [])
+        pr = deepcopy(state.get("pr"))
 
-    full_reset = cursor <= 0 or cursor > current_cursor
-    if not full_reset:
-        if not changes:
-            full_reset = cursor != current_cursor
+        full_reset = cursor <= 0 or cursor > current_cursor
+        if not full_reset:
+            if not changes:
+                full_reset = cursor != current_cursor
+            else:
+                first_cursor = int(changes[0]["cursor"])
+                if cursor < first_cursor - 1:
+                    full_reset = True
+
+        if full_reset:
+            return {
+                "events": deepcopy(events),
+                "base": base,
+                "tokens": state["tokens"],
+                "tasks": tasks,
+                "pr": pr,
+                "cursor": current_cursor,
+                "tail_from": base,
+                "patches": [],
+            }
+
+        changed = [entry for entry in changes if int(entry["cursor"]) > cursor]
+        tail_from = total
+        patch_map: dict[int, dict] = {}
+        for entry in changed:
+            if entry.get("kind") == "tail":
+                tail_from = min(tail_from, int(entry.get("from", total)))
+            elif entry.get("kind") == "patch":
+                patch_map[int(entry["id"])] = entry
+
+        if tail_from < base:
+            return {
+                "events": deepcopy(events),
+                "base": base,
+                "tokens": state["tokens"],
+                "tasks": tasks,
+                "pr": pr,
+                "cursor": current_cursor,
+                "tail_from": base,
+                "patches": [],
+            }
+
+        if tail_from < total:
+            tail_events = deepcopy(events[tail_from - base :])
+            patch_map = {
+                event_id: entry for event_id, entry in patch_map.items() if int(entry.get("index", total)) < tail_from
+            }
         else:
-            first_cursor = int(changes[0]["cursor"])
-            if cursor < first_cursor - 1:
-                full_reset = True
+            tail_events = []
 
-    if full_reset:
+        patches = [
+            {
+                "id": int(entry["id"]),
+                "output": entry.get("output"),
+                "ok": entry.get("ok"),
+            }
+            for entry in sorted(patch_map.values(), key=lambda item: int(item["cursor"]))
+        ]
         return {
-            "events": events,
+            "events": tail_events,
             "base": base,
             "tokens": state["tokens"],
-            "tasks": state.get("tasks") or [],
-            "pr": state.get("pr"),
+            "tasks": tasks,
+            "pr": pr,
             "cursor": current_cursor,
-            "tail_from": base,
-            "patches": [],
+            "tail_from": tail_from,
+            "patches": patches,
         }
-
-    changed = [entry for entry in changes if int(entry["cursor"]) > cursor]
-    tail_from = total
-    patch_map: dict[int, dict] = {}
-    for entry in changed:
-        if entry.get("kind") == "tail":
-            tail_from = min(tail_from, int(entry.get("from", total)))
-        elif entry.get("kind") == "patch":
-            patch_map[int(entry["id"])] = entry
-
-    if tail_from < base:
-        return {
-            "events": events,
-            "base": base,
-            "tokens": state["tokens"],
-            "tasks": state.get("tasks") or [],
-            "pr": state.get("pr"),
-            "cursor": current_cursor,
-            "tail_from": base,
-            "patches": [],
-        }
-
-    if tail_from < total:
-        tail_events = events[tail_from - base :]
-        patch_map = {
-            event_id: entry for event_id, entry in patch_map.items() if int(entry.get("index", total)) < tail_from
-        }
-    else:
-        tail_events = []
-
-    patches = [
-        {
-            "id": int(entry["id"]),
-            "output": entry.get("output"),
-            "ok": entry.get("ok"),
-        }
-        for entry in sorted(patch_map.values(), key=lambda item: int(item["cursor"]))
-    ]
-    return {
-        "events": tail_events,
-        "base": base,
-        "tokens": state["tokens"],
-        "tasks": state.get("tasks") or [],
-        "pr": state.get("pr"),
-        "cursor": current_cursor,
-        "tail_from": tail_from,
-        "patches": patches,
-    }
 
 
 # ---------------------------------------------------------------- claude subagents
