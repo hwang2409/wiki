@@ -293,6 +293,92 @@ class RunStoreTests(unittest.TestCase):
             self.assertEqual(legacy["outcome"], "handoff")
             self.assertEqual(legacy["migration"], "headless-supervisor")
 
+    def test_create_archives_stale_legacy_orchestrator_only_when_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            paths.registry_path.parent.mkdir(parents=True)
+            paths.registry_path.write_text(
+                json.dumps(
+                    {
+                        "_orchestrators": {
+                            "wiki_dev": {
+                                "window": "@9999",
+                                "cwd": str(root / "legacy-worktree"),
+                                "model": "opus",
+                                "spawned_at": "2026-07-08T12:00:00+00:00",
+                            },
+                            "keep-me": {"window": "@9998", "model": "sonnet"},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            store = RunStore(paths)
+            record = _record(root, "wiki_dev")
+            record.provider = ProviderKind.CLAUDE
+            record.role = "orchestrator"
+            record.model = "opus"
+            record.orchestrator_id = None
+            with self.assertRaisesRegex(StoreConflict, "explicit migration"):
+                store.create(record)
+            created = store.create(record, migrate_legacy=True)
+            registry = json.loads(paths.registry_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(registry["wiki_dev"]["current"]["run_id"], created.run_id)
+            legacy = registry["wiki_dev"]["history"][0]
+            self.assertEqual(legacy["window"], "@9999")
+            self.assertEqual(legacy["role"], "orchestrator")
+            self.assertEqual(legacy["kind"], "cc")
+            self.assertEqual(legacy["migration"], "headless-supervisor")
+            self.assertNotIn("wiki_dev", registry["_orchestrators"])
+            self.assertIn("keep-me", registry["_orchestrators"])
+
+    def test_restart_finishes_legacy_orchestrator_migration_after_registry_crash(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            paths.registry_path.parent.mkdir(parents=True)
+            paths.registry_path.write_text(
+                json.dumps(
+                    {
+                        "_orchestrators": {
+                            "wiki-dev": {
+                                "window": "@9999",
+                                "cwd": str(root / "legacy-worktree"),
+                                "model": "opus",
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            store = RunStore(paths)
+            record = _record(root, "wiki-dev")
+            record.provider = ProviderKind.CLAUDE
+            record.role = "orchestrator"
+            record.orchestrator_id = None
+            with mock.patch.object(
+                store,
+                "_write_registry",
+                side_effect=OSError("simulated registry crash"),
+            ):
+                with self.assertRaisesRegex(OSError, "simulated registry crash"):
+                    store.create(record, migrate_legacy=True)
+
+            restarted = RunStore(paths)
+            registry = json.loads(paths.registry_path.read_text(encoding="utf-8"))
+            self.assertEqual(restarted.current_run_id("wiki-dev"), record.run_id)
+            self.assertNotIn("_orchestrators", registry)
+            self.assertEqual(registry["wiki-dev"]["history"][0]["window"], "@9999")
+            self.assertEqual(
+                registry["wiki-dev"]["history"][0]["migration"],
+                "headless-supervisor",
+            )
+
     def test_restart_repairs_crash_stale_counts_and_truncated_tail(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -435,9 +435,43 @@ class RunStore:
                 )
                 history.append(row)
 
+            legacy_orchestrators = registry.get("_orchestrators")
+            legacy_orchestrator = (
+                legacy_orchestrators.get(agent_id)
+                if isinstance(legacy_orchestrators, dict)
+                else None
+            )
+            if isinstance(legacy_orchestrator, dict) and not any(
+                isinstance(item, dict)
+                and item.get("migration") == "headless-supervisor"
+                and item.get("role") == "orchestrator"
+                for item in history
+            ):
+                history.append(
+                    {
+                        **legacy_orchestrator,
+                        "ticket": agent_id,
+                        "kind": legacy_orchestrator.get("kind") or "cc",
+                        "role": legacy_orchestrator.get("role") or "orchestrator",
+                        "worktree": legacy_orchestrator.get("worktree")
+                        or legacy_orchestrator.get("cwd"),
+                        "outcome": legacy_orchestrator.get("outcome") or "handoff",
+                        "ended_at": legacy_orchestrator.get("ended_at") or current.created_at,
+                        "migration": "headless-supervisor",
+                    }
+                )
             projected = {"history": history, "current": self._registry_current(current)}
             if registry.get(agent_id) != projected:
                 registry[agent_id] = projected
+                changed = True
+            if isinstance(legacy_orchestrators, dict) and agent_id in legacy_orchestrators:
+                # A run file may have reached disk immediately before a crash
+                # stopped the legacy orchestrator projection from being removed.
+                # Durable run metadata wins on restart; never expose two live
+                # identities for the same agent id.
+                legacy_orchestrators.pop(agent_id)
+                if not legacy_orchestrators:
+                    registry.pop("_orchestrators", None)
                 changed = True
         if changed:
             self._write_registry(registry)
@@ -447,13 +481,28 @@ class RunStore:
             registry = self._read_registry()
             entry = registry.get(record.agent_id)
             current = entry.get("current") if isinstance(entry, dict) else None
+            legacy_orchestrators = registry.get("_orchestrators")
+            legacy_orchestrator = (
+                legacy_orchestrators.get(record.agent_id)
+                if isinstance(legacy_orchestrators, dict)
+                else None
+            )
             if isinstance(current, dict) and current.get("run_id"):
                 raise StoreConflict(
                     f"agent already has a current run: {record.agent_id}"
                 )
+            if isinstance(current, dict) and isinstance(legacy_orchestrator, dict):
+                raise StoreConflict(
+                    f"agent id has ambiguous legacy registrations: {record.agent_id}"
+                )
             if isinstance(current, dict) and not migrate_legacy:
                 raise StoreConflict(
                     f"agent has a legacy current run requiring explicit migration: {record.agent_id}"
+                )
+            if isinstance(legacy_orchestrator, dict) and not migrate_legacy:
+                raise StoreConflict(
+                    "agent has a legacy orchestrator registration requiring "
+                    f"explicit migration: {record.agent_id}"
                 )
             self._create_run_files(record)
             history = (
@@ -474,6 +523,24 @@ class RunStore:
                         "migration": "headless-supervisor",
                     }
                 )
+            if isinstance(legacy_orchestrator, dict):
+                history.append(
+                    {
+                        **legacy_orchestrator,
+                        "ticket": record.agent_id,
+                        "kind": legacy_orchestrator.get("kind") or "cc",
+                        "role": legacy_orchestrator.get("role") or "orchestrator",
+                        "worktree": legacy_orchestrator.get("worktree")
+                        or legacy_orchestrator.get("cwd"),
+                        "outcome": legacy_orchestrator.get("outcome") or "handoff",
+                        "ended_at": legacy_orchestrator.get("ended_at") or utc_now(),
+                        "migration": "headless-supervisor",
+                    }
+                )
+                assert isinstance(legacy_orchestrators, dict)
+                legacy_orchestrators.pop(record.agent_id)
+                if not legacy_orchestrators:
+                    registry.pop("_orchestrators", None)
             registry[record.agent_id] = {
                 "history": history,
                 "current": self._registry_current(record),

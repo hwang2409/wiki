@@ -101,10 +101,16 @@ export type Orchestrator = {
   id: string;
   window: string | null;
   window_alive: boolean;
+  run_id?: string | null;
+  runtime_state?: string | null;
+  control_attached?: boolean;
+  provider_session_id?: string | null;
+  provider_pid?: number | null;
   cwd: string | null;
   model: string | null;
   spawned_at: string | null;
   transcript_exists: boolean;
+  log?: string | null;
 };
 
 export function getAgents() {
@@ -154,9 +160,10 @@ export type SpawnOrchestratorInput = {
 };
 
 export type SpawnOrchestratorResult = {
-  window: string;
-  log: string;
-  prompt_path: string;
+  window: string | null;
+  run_id: string;
+  log: string | null;
+  prompt_path: string | null;
   note: string;
 };
 

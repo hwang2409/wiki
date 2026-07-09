@@ -378,6 +378,55 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn(str(self.status_dir / "WIKI-42.json"), replace_call["prompt"])
 
+    async def test_orchestrator_spawn_grouping_and_controls_are_supervisor_owned(
+        self,
+    ) -> None:
+        with mock.patch.object(
+            main,
+            "tmux_live_windows",
+            side_effect=AssertionError("headless orchestrator spawn touched tmux"),
+        ):
+            spawned = main.spawn_orchestrator(
+                main.SpawnOrchestratorIn(
+                    id="wiki_dev",
+                    workdir=str(self.worktree),
+                    model="opus",
+                    goal="Coordinate the isolated fixture fleet.",
+                )
+            )
+            payload = main.agents()
+
+        self.assertIsNone(spawned["window"])
+        self.assertEqual(spawned["run_id"], RUN_ID)
+        self.assertEqual(spawned["log"], str(self.raw))
+        start = next(params for method, params in self.client.calls if method == "run/start")
+        self.assertEqual(start["provider"], "claude")
+        self.assertEqual(start["role"], "orchestrator")
+        self.assertFalse(start["migrate_legacy"])
+        self.assertIn("do not use tmux", start["prompt"])
+
+        workers = cast(list[dict[str, Any]], payload["workers"])
+        orchestrators = cast(list[dict[str, Any]], payload["orchestrators"])
+        self.assertEqual(workers, [])
+        self.assertEqual(orchestrators[0]["id"], "wiki_dev")
+        self.assertEqual(orchestrators[0]["run_id"], RUN_ID)
+        self.assertTrue(orchestrators[0]["control_attached"])
+
+        sent = main.agent_message(
+            "wiki_dev",
+            main.MessageIn(text="steer orchestrator", mode="now"),
+            BackgroundTasks(),
+        )
+        with mock.patch.object(
+            main.agent_replace,
+            "replace_agent",
+            side_effect=AssertionError("headless orchestrator used legacy replace"),
+        ):
+            replaced = main.replace_agent("wiki_dev")
+        self.assertEqual(sent, {"status": "sent"})
+        self.assertEqual(replaced["type"], "orchestrator")
+        self.assertEqual(replaced["run_id"], REPLACEMENT_RUN_ID)
+
     async def test_supervisor_event_bridge_preserves_sse_dictionary(self) -> None:
         subscriber = main._subscribe_agent_events()  # noqa: SLF001 - contract test
         task = asyncio.create_task(main.supervisor_event_bridge())

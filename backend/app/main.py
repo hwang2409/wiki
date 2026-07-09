@@ -4,7 +4,6 @@ import asyncio
 import json
 import os
 import re
-import shlex
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -350,19 +349,23 @@ WORKER_ROLES = {"plan", "implement", "review"}
 REASONING_EFFORTS = {"minimal", "low", "medium", "high", "xhigh"}
 MAX_SPAWN_PROMPT_BYTES = 100_000
 MAX_ORCH_GOAL_BYTES = 20_000
-ORCH_KICKOFF_TEMPLATE = """FIRST, self-register this Claude Code session before anything else:
-`~/me/fun/wiki/wiki agent orch {orch_id} --model {model} --window "$(tmux display-message -p -t "$TMUX_PANE" '#{{window_id}}')"`
+HEADLESS_ORCH_KICKOFF_TEMPLATE = """You are the MASTERMIND ORCHESTRATOR `{orch_id}` for this project.
+Wiki's durable supervisor has already registered this provider session. Do not self-register and do not use tmux as an agent runtime or control plane.
 
-You are the MASTERMIND ORCHESTRATOR for this project per the `tmux-ticket-codex` / `tmux-ticket-claude` skills.
-Your job is to spawn tmux workers for bounded tickets/tasks, monitor their status files and pane logs, steer them back on track, and independently gate PRs before merge.
-Every worker you spawn must register with `--orch {orch_id}` so the wiki can map them back to you.
+Delegate bounded tickets/tasks through Wiki's supervisor-backed controls, monitor durable lifecycle/status/event data, steer runs through Wiki, and independently gate PRs before merge. Every worker you create must use orchestrator id `{orch_id}` so Wiki preserves the group.
 
 Before spawning anything, read this protocol note in full:
 `~/me/fun/wiki/vault/tools/orchestrator-worker-protocol.md`
 
-After you self-register and read the protocol:
+Where that note still describes tmux mechanics, preserve the workflow invariant but use Wiki's headless supervisor controls instead.
+
+After reading the protocol:
 {goal_instruction}
 """
+
+
+def valid_agent_id(value: str) -> bool:
+    return bool(TICKET_PATTERN.fullmatch(value) or ORCH_ID_PATTERN.fullmatch(value))
 
 
 def tmux_live_windows() -> set[str]:
@@ -378,21 +381,6 @@ def tmux_live_windows() -> set[str]:
         return {line.strip() for line in result.stdout.split("\n") if line.strip()}
     except (OSError, subprocess.TimeoutExpired):
         return set()
-
-
-def tmux_has_window_named(name: str) -> bool:
-    try:
-        result = subprocess.run(
-            ["tmux", "list-windows", "-a", "-F", "#{window_name}"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode != 0:
-            return False
-        return any(line.strip() == name for line in result.stdout.splitlines())
-    except (OSError, subprocess.TimeoutExpired):
-        return False
 
 
 def read_agent_status(ticket: str) -> dict | None:
@@ -538,6 +526,7 @@ def agents() -> dict[str, object]:
             supervisor_health["detail"] = str(exc.detail if isinstance(exc, HTTPException) else exc)
     now = datetime.now(tz=timezone.utc).timestamp()
     workers = []
+    orchestrators = []
     seen_tickets = set()
 
     for ticket, entry in sorted(registry.items()):
@@ -552,16 +541,37 @@ def agents() -> dict[str, object]:
         control_attached = bool(runtime.get("control_attached")) if headless else False
         status = read_agent_status(ticket)
         seen_tickets.add(ticket)
+        window_alive = (
+            control_attached if headless else current.get("window") in live_windows
+        )
+        if current.get("role") == "orchestrator":
+            transcript = current.get("transcript")
+            orchestrators.append(
+                {
+                    "id": ticket,
+                    "window": current.get("window"),
+                    "window_alive": window_alive,
+                    "run_id": current.get("run_id"),
+                    "runtime_state": runtime_state,
+                    "control_attached": control_attached,
+                    "provider_session_id": current.get("provider_session_id"),
+                    "provider_pid": runtime.get("provider_pid") if headless else None,
+                    "cwd": current.get("worktree") or current.get("cwd"),
+                    "model": current.get("model"),
+                    "spawned_at": current.get("spawned_at"),
+                    "transcript_exists": bool(
+                        isinstance(transcript, str) and Path(transcript).is_file()
+                    ),
+                    "log": current.get("log"),
+                }
+            )
+            continue
         workers.append(
             {
                 "ticket": ticket,
                 "registered": True,
                 "window": current.get("window"),
-                "window_alive": (
-                    control_attached
-                    if headless
-                    else current.get("window") in live_windows
-                ),
+                "window_alive": window_alive,
                 "run_id": current.get("run_id"),
                 "runtime_state": runtime_state,
                 "control_attached": control_attached,
@@ -618,18 +628,25 @@ def agents() -> dict[str, object]:
                 }
             )
 
-    orchestrators = []
     for orch_id, orch in sorted((registry.get("_orchestrators") or {}).items()):
+        if not isinstance(orch, dict):
+            continue
         transcript = orch.get("transcript")
         orchestrators.append(
             {
                 "id": orch_id,
                 "window": orch.get("window"),
                 "window_alive": orch.get("window") in live_windows,
+                "run_id": None,
+                "runtime_state": None,
+                "control_attached": False,
+                "provider_session_id": orch.get("session_id"),
+                "provider_pid": None,
                 "cwd": orch.get("cwd"),
                 "model": orch.get("model"),
                 "spawned_at": orch.get("spawned_at"),
                 "transcript_exists": bool(transcript and Path(transcript).is_file()),
+                "log": orch.get("log"),
             }
         )
 
@@ -691,7 +708,7 @@ def _tail_text_file(path: Path, lines: int) -> str:
 
 @app.get("/api/agents/{ticket}/log")
 def agent_log(ticket: str, lines: int = 200) -> dict[str, str]:
-    if not TICKET_PATTERN.fullmatch(ticket):
+    if not valid_agent_id(ticket):
         raise HTTPException(status_code=400, detail="Bad ticket")
     lines = max(10, min(lines, 1000))
 
@@ -796,7 +813,7 @@ def _session_delta_payload(
     }
     if include_subagents:
         payload["subagents"] = _active_subagents(path)
-    if include_queue and ticket and TICKET_PATTERN.fullmatch(ticket):
+    if include_queue and ticket and valid_agent_id(ticket):
         payload["queue"] = _queue_messages(ticket)
     return payload
 
@@ -807,7 +824,7 @@ def agent_session(
     cursor: int = Query(0, ge=0),
     client_path: str | None = Query(None, alias="path"),
 ) -> dict[str, object]:
-    if not TICKET_PATTERN.fullmatch(ticket):
+    if not valid_agent_id(ticket):
         raise HTTPException(status_code=400, detail="Bad ticket")
 
     registry: dict = {}
@@ -958,7 +975,7 @@ def subagent_session(
     cursor: int = Query(0, ge=0),
     client_path: str | None = Query(None, alias="path"),
 ) -> dict[str, object]:
-    if not TICKET_PATTERN.fullmatch(ticket) or not SUBAGENT_ID_PATTERN.fullmatch(agent_id):
+    if not valid_agent_id(ticket) or not SUBAGENT_ID_PATTERN.fullmatch(agent_id):
         raise HTTPException(status_code=400, detail="Bad id")
     main_path = _resolve_main_transcript(ticket)
     if main_path is None:
@@ -1193,32 +1210,6 @@ def resolve_existing_dir(raw_path: str, *, field_name: str) -> Path:
     return resolved
 
 
-def run_checked(
-    args: list[str],
-    *,
-    timeout: int,
-    label: str,
-    env: dict[str, str] | None = None,
-) -> subprocess.CompletedProcess[str]:
-    try:
-        result = subprocess.run(
-            args,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-            env=env,
-        )
-    except OSError as exc:
-        raise RuntimeError(f"{label}: {exc}") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"{label}: timed out") from exc
-    if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip() or "command failed"
-        raise RuntimeError(f"{label}: {detail[:240]}")
-    return result
-
-
 def resolve_window(ticket: str) -> str | None:
     """Live tmux window for a worker ticket or orchestrator id."""
     registry = _read_agent_registry()
@@ -1240,22 +1231,6 @@ def deliver_message(window: str, text: str) -> None:
     pane = capture_pane_tail(window, 30) or ""
     if text[:60] in pane.replace("\n", " "):
         subprocess.run(["tmux", "send-keys", "-t", window, "Enter"], timeout=5, check=False)
-
-
-def accept_claude_trust_prompt(window: str, *, timeout_seconds: float = 8.0) -> None:
-    """New project directories can trigger Claude's trust prompt before the kickoff prompt runs."""
-    deadline = time.time() + timeout_seconds
-    while time.time() < deadline:
-        pane = capture_pane_tail(window, 40) or ""
-        if "Quick safety check" not in pane and (
-            "? for shortcuts" in pane or "-- INSERT --" in pane or "bypass permissions on" in pane
-        ):
-            return
-        if "Quick safety check" in pane and "Yes, I trust this folder" in pane:
-            subprocess.run(["tmux", "send-keys", "-t", window, "Enter"], timeout=5, check=False)
-            time.sleep(0.5)
-            return
-        time.sleep(0.25)
 
 
 def _headless_replacement_prompt(agent_id: str, current: dict) -> str:
@@ -1400,7 +1375,7 @@ def spawn_agent(body: SpawnWorkerIn) -> dict[str, object]:
 
 
 @app.post("/api/agents/spawn-orchestrator")
-def spawn_orchestrator(body: SpawnOrchestratorIn, background: BackgroundTasks) -> dict[str, str]:
+def spawn_orchestrator(body: SpawnOrchestratorIn) -> dict[str, object]:
     orch_id = body.id.strip()
     if not ORCH_ID_PATTERN.fullmatch(orch_id):
         raise HTTPException(
@@ -1419,93 +1394,79 @@ def spawn_orchestrator(body: SpawnOrchestratorIn, background: BackgroundTasks) -
     workdir_path = resolve_existing_dir(body.workdir, field_name="Project directory")
 
     registry = _read_agent_registry()
-    live_windows = tmux_live_windows()
-    if tmux_has_window_named(f"orch:{orch_id}"):
-        raise HTTPException(status_code=409, detail=f"orch:{orch_id} already exists as a live tmux window")
-    existing = (registry.get("_orchestrators") or {}).get(orch_id)
-    if existing:
-        existing_window = existing.get("window")
-        if isinstance(existing_window, str) and existing_window in live_windows:
-            raise HTTPException(status_code=409, detail=f"{orch_id} already has a live orchestrator window")
-        raise HTTPException(
-            status_code=409,
-            detail=f"{orch_id} is already registered as an orchestrator; run `wiki agent orch-done {orch_id}` first",
+    normal_entry = registry.get(orch_id)
+    normal_current = (
+        normal_entry.get("current") if isinstance(normal_entry, dict) else None
+    )
+    if isinstance(normal_current, dict):
+        detail = (
+            f"{orch_id} already has a supervisor-owned run; use Replace"
+            if _is_headless(normal_current)
+            else f"{orch_id} is already registered as a legacy worker"
         )
+        raise HTTPException(status_code=409, detail=detail)
+
+    legacy_orchestrators = registry.get("_orchestrators")
+    legacy_orchestrator = (
+        legacy_orchestrators.get(orch_id)
+        if isinstance(legacy_orchestrators, dict)
+        else None
+    )
+    if legacy_orchestrator is not None and not isinstance(legacy_orchestrator, dict):
+        raise HTTPException(status_code=409, detail=f"{orch_id} has an invalid legacy registration")
+    migrate_legacy = isinstance(legacy_orchestrator, dict)
+    if isinstance(legacy_orchestrator, dict):
+        legacy_window = legacy_orchestrator.get("window")
+        if (
+            isinstance(legacy_window, str)
+            and re.fullmatch(r"@\d+", legacy_window)
+            and legacy_window in tmux_live_windows()
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=f"{orch_id} already has a live legacy orchestrator window",
+            )
 
     goal_instruction = (
         f"Pursue this initial goal immediately:\n\n{goal}\n"
         if goal
         else "Print exactly one line: READY: orchestrator registered and awaiting instructions.\nThen wait for Henry to steer you via the wiki composer."
     )
-    prompt = ORCH_KICKOFF_TEMPLATE.format(
+    prompt = HEADLESS_ORCH_KICKOFF_TEMPLATE.format(
         orch_id=orch_id,
-        model=model,
         goal_instruction=goal_instruction,
     )
-
-    prompt_path = AGENT_TMP_DIR / f"cc-orch-{orch_id}-prompt.md"
-    log_path = AGENT_TMP_DIR / f"cc-orch-{orch_id}.log"
-    try:
-        AGENT_TMP_DIR.mkdir(parents=True, exist_ok=True)
-        log_path.unlink(missing_ok=True)
-        prompt_path.unlink(missing_ok=True)
-        prompt_path.write_text(prompt if prompt.endswith("\n") else f"{prompt}\n", encoding="utf-8")
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail="Could not prepare orchestrator files") from exc
-
-    prompt_shell = shlex.quote(str(prompt_path))
-    model_shell = shlex.quote(model)
-    command = f'claude --model {model_shell} --dangerously-skip-permissions "$(cat {prompt_shell})"'
-
-    window: str | None = None
-    try:
-        created = run_checked(
-            [
-                "tmux",
-                "new-window",
-                "-dP",
-                "-F",
-                "#{window_id}",
-                "-n",
-                f"orch:{orch_id}",
-                "-c",
-                str(workdir_path),
-                command,
-            ],
-            timeout=10,
-            label="tmux new-window failed",
-        )
-        window = created.stdout.strip()
-        if not re.fullmatch(r"@\d+", window):
-            raise RuntimeError(f"tmux new-window failed: unexpected window id {window!r}")
-
-        run_checked(
-            ["tmux", "pipe-pane", "-t", window, "-o", f"cat >> {shlex.quote(str(log_path))}"],
-            timeout=5,
-            label="tmux pipe-pane failed",
-        )
-        background.add_task(accept_claude_trust_prompt, window)
-    except RuntimeError as exc:
-        if window:
-            subprocess.run(["tmux", "kill-window", "-t", window], timeout=5, check=False)
-        try:
-            prompt_path.unlink(missing_ok=True)
-            log_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    result = _supervisor_request(
+        "run/start",
+        {
+            "agent_id": orch_id,
+            "provider": "claude",
+            "role": "orchestrator",
+            "model": model,
+            "effort": None,
+            "worktree": str(workdir_path),
+            "prompt": prompt,
+            "orchestrator_id": None,
+            "migrate_legacy": migrate_legacy,
+        },
+    )
+    if not isinstance(result, dict):
+        raise HTTPException(status_code=502, detail="Agent supervisor returned a bad run")
+    refreshed = _registry_agent(_read_agent_registry(), orch_id)
+    registration = refreshed[2] if refreshed is not None else {}
 
     return {
-        "window": window,
-        "log": str(log_path),
-        "prompt_path": str(prompt_path),
-        "note": "orchestrator launching — will appear when it self-registers",
+        "window": None,
+        "run_id": result.get("run_id"),
+        "log": registration.get("log"),
+        "prompt_path": None,
+        "note": "orchestrator registered under the durable supervisor",
     }
 
 
 @app.post("/api/agents/{ticket}/message")
 def agent_message(ticket: str, body: MessageIn, background: BackgroundTasks) -> dict[str, object]:
-    if not TICKET_PATTERN.fullmatch(ticket):
+    if not valid_agent_id(ticket):
         raise HTTPException(status_code=400, detail="Bad ticket")
     resolved = _registry_agent(_read_agent_registry(), ticket)
     if resolved is not None and _is_headless(resolved[2]):
@@ -1541,7 +1502,7 @@ def agent_message(ticket: str, body: MessageIn, background: BackgroundTasks) -> 
 
 @app.get("/api/agents/{ticket}/queue")
 def agent_queue(ticket: str) -> dict[str, object]:
-    if not TICKET_PATTERN.fullmatch(ticket):
+    if not valid_agent_id(ticket):
         raise HTTPException(status_code=400, detail="Bad ticket")
     resolved = _registry_agent(_read_agent_registry(), ticket)
     if resolved is not None and _is_headless(resolved[2]):
@@ -1551,7 +1512,7 @@ def agent_queue(ticket: str) -> dict[str, object]:
 
 @app.delete("/api/agents/{ticket}/queue/{index}")
 def agent_queue_delete(ticket: str, index: int) -> dict[str, object]:
-    if not TICKET_PATTERN.fullmatch(ticket):
+    if not valid_agent_id(ticket):
         raise HTTPException(status_code=400, detail="Bad ticket")
     resolved = _registry_agent(_read_agent_registry(), ticket)
     if resolved is not None and _is_headless(resolved[2]):

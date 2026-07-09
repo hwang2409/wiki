@@ -48,9 +48,10 @@ type WorkerSpawnNotice = {
 type OrchestratorSpawnNotice = {
   kind: "orchestrator";
   id: string;
-  window: string;
-  log: string;
-  promptPath: string;
+  window: string | null;
+  runId: string;
+  log: string | null;
+  promptPath: string | null;
   note: string;
 };
 
@@ -440,6 +441,7 @@ function SpawnOrchestratorModal({
         kind: "orchestrator",
         id: normalizedId,
         window: result.window,
+        runId: result.run_id,
         log: result.log,
         promptPath: result.prompt_path,
         note: result.note,
@@ -924,11 +926,19 @@ export function AgentsView({
                 {orch.cwd ? (
                   <span className="agents-orch-cwd">{orch.cwd.split("/").slice(-1)[0]}</span>
                 ) : null}
+                {orch.run_id ? (
+                  <span className={`agent-window${orch.control_attached ? "" : " is-dead"}`}>
+                    run {orch.run_id.slice(0, 8)} · {orch.runtime_state ?? "unknown"}
+                  </span>
+                ) : null}
                 {orch.window && !orch.window_alive ? (
                   <span className="agents-orch-dead">window gone</span>
                 ) : null}
                 <span className="agents-orch-actions">
-                  <ReplaceButton id={orch.id} disabled={!orch.window || !orch.window_alive} />
+                  <ReplaceButton
+                    id={orch.id}
+                    disabled={!orch.run_id && (!orch.window || !orch.window_alive)}
+                  />
                   <button
                     className={`agent-log-toggle${openTicket === orch.id ? " is-active" : ""}`}
                     type="button"
@@ -1067,7 +1077,12 @@ export function AgentsView({
             </div>
           ) : (
             <div className="agents-notice">
-              {spawnNotice.note} · tmux <code>{spawnNotice.window}</code> · log <code>{spawnNotice.log}</code>
+              {spawnNotice.note} · run <code>{spawnNotice.runId.slice(0, 8)}</code>
+              {spawnNotice.log ? (
+                <>
+                  {" "}· log <code>{spawnNotice.log}</code>
+                </>
+              ) : null}
             </div>
           )
         ) : null}
@@ -1224,7 +1239,11 @@ export function AgentsSidebar({
             <Bot size={12} />
             <span className="nav-agent-ticket">{orch.id}</span>
             <span className="nav-agent-meta">
-              {orch.window && !orch.window_alive ? "window gone" : "orchestrator"}
+              {orch.run_id
+                ? orch.runtime_state ?? "unknown"
+                : orch.window && !orch.window_alive
+                  ? "window gone"
+                  : "orchestrator"}
             </span>
           </button>
           {workers
