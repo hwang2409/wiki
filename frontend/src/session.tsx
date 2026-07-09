@@ -46,6 +46,7 @@ import type {
 } from "./api";
 import { externalLinkProps } from "./external-links";
 import { LoadingPlaceholder } from "./loading";
+import { createStateKeyWriteBarrier, deletePaneStateEntries } from "./pane-state-cache";
 import {
   replaceTranscriptQueue,
   useTranscriptSession,
@@ -213,7 +214,9 @@ function useElementVisible(ref: RefObject<HTMLElement | null>): boolean {
 function usePinnedScroll<T extends HTMLElement>(
   dep: unknown,
   resetKey: unknown,
-  onViewportChange?: (viewport: { top: number; height: number }, force?: boolean) => void
+  onViewportChange?: (viewport: { top: number; height: number }, force?: boolean) => void,
+  initialPinned = true,
+  onScrollStateChange?: (state: { pinned: boolean; scrollTop: number }) => void,
 ) {
   const ref = useRef<T | null>(null);
   const innerRef = useRef<HTMLDivElement | null>(null);
@@ -235,7 +238,8 @@ function usePinnedScroll<T extends HTMLElement>(
     const viewport = { top, height };
     viewportRef.current = viewport;
     onViewportChange(viewport, force);
-  }, [onViewportChange]);
+    onScrollStateChange?.({ pinned: pinnedRef.current, scrollTop: top });
+  }, [onScrollStateChange, onViewportChange]);
 
   const scheduleViewportSync = useCallback((force = false) => {
     pendingForceRef.current = pendingForceRef.current || force;
@@ -257,9 +261,9 @@ function usePinnedScroll<T extends HTMLElement>(
 
   // New target (ticket switch) always starts pinned at the bottom.
   useLayoutEffect(() => {
-    pinnedRef.current = true;
+    pinnedRef.current = initialPinned;
     viewportRef.current = null;
-  }, [resetKey]);
+  }, [initialPinned, resetKey]);
 
   // Pin before paint so an opened log never flashes at the top.
   useLayoutEffect(() => {
@@ -954,7 +958,13 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
   const rowRef = useMeasuredRow(group, onHeightChange);
   const style: CSSProperties = { transform: `translateY(${top}px)` };
   return (
-    <div className="session-virtual-row" ref={rowRef} style={style}>
+    <div
+      className="session-virtual-row"
+      data-group-key={group.key}
+      data-row-top={top}
+      ref={rowRef}
+      style={style}
+    >
       {group.kind === "activity" ? (
         <ActivityGroup events={group.events} groupKey={group.key} onInspect={onInspect} uiState={uiState} />
       ) : (
@@ -991,27 +1001,120 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
 
 type SessionAcc = TranscriptSession;
 
-const composerDraftCache = new Map<string, string>();
+type ComposerMode = "insert" | "normal" | "visual" | "pane";
+
+type ComposerState = {
+  text: string;
+  vimMode: ComposerMode;
+  selectionStart: number;
+  selectionEnd: number;
+};
+
+type ScrollAnchor = {
+  index: number;
+  key: number;
+  offset: number;
+};
+
+type ScrollState = {
+  pinned: boolean;
+  scrollTop: number;
+  anchor: ScrollAnchor | null;
+};
+
+const composerStateCache = new Map<string, ComposerState>();
+const sessionUiStateCache = new Map<string, SessionUiState>();
+const sessionScrollCache = new Map<string, ScrollState>();
+const sessionScrollWriteBarrier = createStateKeyWriteBarrier();
+
+function composerStateKeyForSession(ticket: string, subagent?: string): string {
+  return subagent
+    ? `${ticket}:subagent:${subagent}:composer`
+    : `${ticket}:main:composer`;
+}
+
+export function clearSessionPaneState(paneStateKey: string) {
+  deletePaneStateEntries(sessionUiStateCache, paneStateKey);
+  sessionScrollWriteBarrier.block(deletePaneStateEntries(sessionScrollCache, paneStateKey));
+}
+
+function getComposerState(key: string): ComposerState | null {
+  return composerStateCache.get(key) ?? null;
+}
+
+function setComposerState(key: string, state: ComposerState) {
+  const isDefault =
+    state.text.length === 0 &&
+    state.vimMode === "insert" &&
+    state.selectionStart === 0 &&
+    state.selectionEnd === 0;
+  if (isDefault) composerStateCache.delete(key);
+  else composerStateCache.set(key, state);
+}
+
+function getSessionUiState(key: string): SessionUiState {
+  const existing = sessionUiStateCache.get(key);
+  if (existing) return existing;
+  const created = createSessionUiState();
+  sessionUiStateCache.set(key, created);
+  return created;
+}
+
+function decrementRestoreAttempts(ref: { current: number }, pendingRef: { current: boolean }) {
+  ref.current -= 1;
+  if (ref.current <= 0) pendingRef.current = false;
+}
+
+function setSessionScrollState(key: string, state: ScrollState) {
+  if (!sessionScrollWriteBarrier.allows(key)) return;
+  sessionScrollCache.set(key, state);
+}
+
+function resolveScrollAnchorTarget(
+  layout: VirtualLayout,
+  anchor: ScrollAnchor,
+  viewportHeight: number
+): { index: number; key: number; target: number } | null {
+  if (layout.tops.length === 0) return null;
+  const index = layout.keyToIndex.get(anchor.key) ?? Math.min(anchor.index, Math.max(0, layout.tops.length - 1));
+  const key = layout.keys[index];
+  if (key === undefined) return null;
+  const maxScrollTop = Math.max(0, layout.totalHeight - viewportHeight);
+  const target = Math.max(0, Math.min((layout.tops[index] ?? 0) + anchor.offset, maxScrollTop));
+  return { index, key, target };
+}
 
 export function SessionTab({
   ticket,
   subagent,
   showComposer = true,
   onInspect,
+  stateKey,
 }: {
   ticket: string;
   subagent?: string;
   showComposer?: boolean;
   onInspect?: (agentId: string) => void;
+  stateKey?: string;
 }) {
   const resetKey = `${ticket}:${subagent ?? ""}`;
+  const sessionStateKey = `${stateKey ?? resetKey}:${resetKey}`;
   const rowHeightsKeyRef = useRef(resetKey);
   const rowHeightsRef = useRef<Map<number, RowMeasurement>>(new Map());
   const layoutRef = useRef<VirtualLayout | null>(null);
   const layoutResetKeyRef = useRef(resetKey);
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const restoreAttemptsRef = useRef(3);
+  const scrollRestoreStateRef = useRef<ScrollState | null>(sessionScrollCache.get(sessionStateKey) ?? null);
+  const scrollRestorePendingRef = useRef(Boolean(scrollRestoreStateRef.current));
+  const latestScrollStateRef = useRef<ScrollState | null>(scrollRestoreStateRef.current);
+  const rowHeightVersionRef = useRef(0);
+  const restoreFinalizeRafRef = useRef<number | null>(null);
   const [rowHeightVersion, setRowHeightVersion] = useState(0);
-  const uiState = useMemo(() => createSessionUiState(), [resetKey]);
+  const uiState = useMemo(() => getSessionUiState(sessionStateKey), [sessionStateKey]);
+  const cachedScroll = scrollRestoreStateRef.current;
+
+  rowHeightVersionRef.current = rowHeightVersion;
 
   if (rowHeightsKeyRef.current !== resetKey) {
     rowHeightsKeyRef.current = resetKey;
@@ -1053,7 +1156,34 @@ export function SessionTab({
     pinnedRef,
     scrollToBottom,
     syncViewport,
-  } = usePinnedScroll<HTMLDivElement>(layout.totalHeight, resetKey, syncVisibleRange);
+  } = usePinnedScroll<HTMLDivElement>(
+    layout.totalHeight,
+    resetKey,
+    syncVisibleRange,
+    cachedScroll?.pinned ?? true,
+    useCallback((state: { pinned: boolean; scrollTop: number }) => {
+      const viewportLayout = layoutRef.current ?? layout;
+      const anchor = state.pinned ? null : findScrollAnchor(viewportLayout, state.scrollTop);
+      const nextState = {
+        ...state,
+        anchor,
+      };
+      latestScrollStateRef.current = nextState;
+      if (scrollRestorePendingRef.current) return;
+      setSessionScrollState(sessionStateKey, nextState);
+    }, [layout, sessionStateKey])
+  );
+
+  useEffect(() => {
+    restoreAttemptsRef.current = 3;
+    scrollRestoreStateRef.current = sessionScrollCache.get(sessionStateKey) ?? null;
+    scrollRestorePendingRef.current = Boolean(scrollRestoreStateRef.current);
+    latestScrollStateRef.current = scrollRestoreStateRef.current;
+    if (restoreFinalizeRafRef.current !== null) {
+      window.cancelAnimationFrame(restoreFinalizeRafRef.current);
+      restoreFinalizeRafRef.current = null;
+    }
+  }, [sessionStateKey]);
 
   const reportRowHeight = useCallback((group: EventGroup, height: number) => {
     const measurement: RowMeasurement = {
@@ -1096,6 +1226,104 @@ export function SessionTab({
     if (Math.abs(el.scrollTop - target) > 1) el.scrollTop = target;
     syncViewport(true);
   }, [layout, pinnedRef, ref, resetKey, scrollToBottom, syncViewport]);
+
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!cachedScroll || !el || !session || restoreAttemptsRef.current <= 0) return;
+    const frame = window.requestAnimationFrame(() => {
+      const node = ref.current;
+      if (!node || restoreAttemptsRef.current <= 0) return;
+      if (cachedScroll.pinned) {
+        pinnedRef.current = true;
+        node.scrollTop = node.scrollHeight;
+        syncViewport(true);
+        const distance = Math.abs(node.scrollHeight - node.scrollTop - node.clientHeight);
+        latestScrollStateRef.current = {
+          pinned: true,
+          scrollTop: node.scrollTop,
+          anchor: null,
+        };
+        if (distance <= 24) {
+          restoreAttemptsRef.current = 0;
+          scrollRestorePendingRef.current = false;
+        } else decrementRestoreAttempts(restoreAttemptsRef, scrollRestorePendingRef);
+        return;
+      }
+      pinnedRef.current = false;
+      const resolvedAnchor = cachedScroll.anchor
+        ? resolveScrollAnchorTarget(layout, cachedScroll.anchor, node.clientHeight)
+        : null;
+      const maxScrollTop = Math.max(0, layout.totalHeight - node.clientHeight);
+      const target = resolvedAnchor
+        ? resolvedAnchor.target
+        : Math.max(0, Math.min(cachedScroll.scrollTop, maxScrollTop));
+      if (Math.abs(node.scrollTop - target) > 1) node.scrollTop = target;
+      syncViewport(true);
+      const restoredAnchor = findScrollAnchor(layout, node.scrollTop);
+      latestScrollStateRef.current = {
+        pinned: false,
+        scrollTop: node.scrollTop,
+        anchor: restoredAnchor,
+      };
+      const anchorRestored = Boolean(
+        resolvedAnchor &&
+          restoredAnchor &&
+          restoredAnchor.key === resolvedAnchor.key &&
+          Math.abs(restoredAnchor.offset - (cachedScroll.anchor?.offset ?? 0)) <= 24
+      );
+      if (anchorRestored || Math.abs(node.scrollTop - target) <= 24) {
+        if (restoreFinalizeRafRef.current !== null) {
+          window.cancelAnimationFrame(restoreFinalizeRafRef.current);
+          restoreFinalizeRafRef.current = null;
+        }
+        const settledVersion = rowHeightVersion;
+        restoreFinalizeRafRef.current = window.requestAnimationFrame(() => {
+          restoreFinalizeRafRef.current = window.requestAnimationFrame(() => {
+            restoreFinalizeRafRef.current = null;
+            if (rowHeightVersionRef.current !== settledVersion) return;
+            restoreAttemptsRef.current = 0;
+            scrollRestorePendingRef.current = false;
+            const finalized = latestScrollStateRef.current ?? {
+              pinned: false,
+              scrollTop: node.scrollTop,
+              anchor: findScrollAnchor(layout, node.scrollTop),
+            };
+            latestScrollStateRef.current = finalized;
+            setSessionScrollState(sessionStateKey, finalized);
+          });
+        });
+      } else decrementRestoreAttempts(restoreAttemptsRef, scrollRestorePendingRef);
+    });
+    return () => {
+      window.cancelAnimationFrame(frame);
+      if (restoreFinalizeRafRef.current !== null) {
+        window.cancelAnimationFrame(restoreFinalizeRafRef.current);
+        restoreFinalizeRafRef.current = null;
+      }
+    };
+  }, [cachedScroll, layout, pinnedRef, ref, rowHeightVersion, session, sessionStateKey, syncViewport]);
+
+  useEffect(() => {
+    return () => {
+      scrollRestorePendingRef.current = false;
+      const node = ref.current;
+      const latest = latestScrollStateRef.current;
+      const scrollTop = node?.scrollTop ?? latest?.scrollTop ?? 0;
+      const pinned = latest?.pinned ?? pinnedRef.current;
+      const anchor = pinned
+        ? null
+        : node
+          ? findScrollAnchor(layoutRef.current ?? layout, scrollTop)
+          : latest?.anchor ?? null;
+      const saved = {
+        pinned,
+        scrollTop,
+        anchor,
+      };
+      if (sessionScrollWriteBarrier.consume(sessionStateKey)) return;
+      sessionScrollCache.set(sessionStateKey, saved);
+    };
+  }, [pinnedRef, ref, sessionStateKey]);
   const visibleGroups = useMemo(() => {
     const end = Math.min(visibleRange.end, groups.length - 1);
     if (end < visibleRange.start) return [];
@@ -1216,6 +1444,7 @@ export function SessionTab({
           history={userHistory}
           queued={session.queue}
           runningSubagents={runningSubagents}
+          stateKey={composerStateKeyForSession(ticket, subagent)}
           thinking={session.working}
           ticket={ticket}
           onInspect={onInspect}
@@ -1267,6 +1496,7 @@ function lineMove(text: string, at: number, dir: 1 | -1): number {
 }
 
 function MessageComposer({
+  stateKey,
   ticket,
   history = [],
   queued = [],
@@ -1274,6 +1504,7 @@ function MessageComposer({
   thinking = false,
   onInspect,
 }: {
+  stateKey: string;
   ticket: string;
   history?: string[];
   queued?: QueuedMessage[];
@@ -1281,10 +1512,16 @@ function MessageComposer({
   thinking?: boolean;
   onInspect?: (agentId: string) => void;
 }) {
-  const [text, setText] = useState(() => composerDraftCache.get(ticket) ?? "");
+  const cachedComposer = getComposerState(stateKey);
+  const selectionRef = useRef({
+    start: cachedComposer?.selectionStart ?? cachedComposer?.text.length ?? 0,
+    end: cachedComposer?.selectionEnd ?? cachedComposer?.text.length ?? 0,
+  });
+  const restoreSelectionRef = useRef(true);
+  const [text, setText] = useState(() => cachedComposer?.text ?? "");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [vimMode, setVimMode] = useState<"insert" | "normal" | "visual" | "pane">("insert");
+  const [vimMode, setVimMode] = useState<ComposerMode>(() => cachedComposer?.vimMode ?? "insert");
   const pendingKeyRef = useRef<string | null>(null);
   const registerRef = useRef<string>("");
   const historyPosRef = useRef<number | null>(null);
@@ -1298,17 +1535,48 @@ function MessageComposer({
   const visualHeadRef = useRef(0);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const measureRef = useRef<HTMLTextAreaElement | null>(null);
-  const [caretPos, setCaretPos] = useState(0);
+  const [caretPos, setCaretPos] = useState(selectionRef.current.start);
   const [overlayPos, setOverlayPos] = useState<{ top: number; left: number } | null>(null);
 
   useEffect(() => {
-    setText(composerDraftCache.get(ticket) ?? "");
-  }, [ticket]);
+    const cached = getComposerState(stateKey);
+    const nextText = cached?.text ?? "";
+    setText(nextText);
+    setVimMode(cached?.vimMode ?? "insert");
+    selectionRef.current = {
+      start: cached?.selectionStart ?? nextText.length,
+      end: cached?.selectionEnd ?? nextText.length,
+    };
+    pendingKeyRef.current = null;
+    historyPosRef.current = null;
+    draftRef.current = nextText;
+    visualAnchorRef.current = selectionRef.current.start;
+    visualHeadRef.current = selectionRef.current.start;
+    restoreSelectionRef.current = true;
+    setCaretPos(selectionRef.current.start);
+  }, [stateKey]);
 
   useEffect(() => {
-    if (text) composerDraftCache.set(ticket, text);
-    else composerDraftCache.delete(ticket);
-  }, [ticket, text]);
+    const start = Math.max(0, Math.min(selectionRef.current.start, text.length));
+    const end = Math.max(0, Math.min(selectionRef.current.end, text.length));
+    setComposerState(stateKey, {
+      text,
+      vimMode,
+      selectionStart: start,
+      selectionEnd: end,
+    });
+  }, [caretPos, stateKey, text, vimMode]);
+
+  useLayoutEffect(() => {
+    if (!restoreSelectionRef.current) return;
+    const el = inputRef.current;
+    if (!el) return;
+    const start = Math.max(0, Math.min(selectionRef.current.start, text.length));
+    const end = Math.max(start, Math.min(selectionRef.current.end, text.length));
+    el.setSelectionRange(start, end);
+    setCaretPos(start);
+    restoreSelectionRef.current = false;
+  }, [stateKey, text]);
 
   useLayoutEffect(() => {
     const el = inputRef.current;
@@ -1336,11 +1604,25 @@ function MessageComposer({
       ? skills.filter((s) => s.name.startsWith(trigger.partial)).slice(0, 8)
       : [];
 
+  function rememberSelection(start: number, end = start, caret = start) {
+    selectionRef.current = { start, end };
+    setCaretPos(caret);
+  }
+
+  function captureSelection(el: HTMLTextAreaElement) {
+    const start = el.selectionStart ?? 0;
+    const end = el.selectionEnd ?? start;
+    rememberSelection(start, end, start);
+  }
+
   function insertNewline() {
     const el = inputRef.current;
     const at = el ? el.selectionStart : text.length;
     setText((current) => current.slice(0, at) + "\n" + current.slice(at));
-    requestAnimationFrame(() => inputRef.current?.setSelectionRange(at + 1, at + 1));
+    requestAnimationFrame(() => {
+      inputRef.current?.setSelectionRange(at + 1, at + 1);
+      rememberSelection(at + 1);
+    });
   }
 
   function acceptSkill(name: string) {
@@ -1352,7 +1634,10 @@ function MessageComposer({
     setText(next);
     setMenuIndex(0);
     const pos = before.length + insert.length + 1;
-    requestAnimationFrame(() => inputRef.current?.setSelectionRange(pos, pos));
+    requestAnimationFrame(() => {
+      inputRef.current?.setSelectionRange(pos, pos);
+      rememberSelection(pos);
+    });
   }
 
   async function attachFiles(files: FileList | File[]) {
@@ -1430,15 +1715,16 @@ function MessageComposer({
       const el = inputRef.current;
       if (!el) return;
       const start = Math.max(0, Math.min(at, Math.max(0, el.value.length - 1)));
-      el.setSelectionRange(start, Math.min(start + 1, el.value.length));
-      setCaretPos(start);
+      const end = Math.min(start + 1, el.value.length);
+      el.setSelectionRange(start, end);
+      rememberSelection(start, end, start);
     });
   }
 
   function setInsertCaret(at: number) {
     requestAnimationFrame(() => {
       inputRef.current?.setSelectionRange(at, at);
-      setCaretPos(at);
+      rememberSelection(at);
     });
   }
 
@@ -1653,7 +1939,7 @@ function MessageComposer({
       const lo = Math.min(anchor, head);
       const hi = Math.min(el.value.length, Math.max(anchor, head) + 1);
       el.setSelectionRange(lo, hi);
-      setCaretPos(head);
+      rememberSelection(lo, hi, head);
     });
   }
 
@@ -1819,15 +2105,17 @@ function MessageComposer({
           value={text}
           onFocus={(event) => {
             if (vimMode !== "insert") enterInsert(event.currentTarget.selectionEnd ?? text.length);
+            else captureSelection(event.currentTarget);
           }}
           onChange={(event) => {
             setText(event.target.value);
             setMenuDismissed(false);
             setMenuIndex(0);
+            captureSelection(event.currentTarget);
           }}
-          onClick={(event) => setCaretPos(event.currentTarget.selectionStart)}
-          onKeyUp={(event) => setCaretPos(event.currentTarget.selectionStart)}
-          onSelect={(event) => setCaretPos(event.currentTarget.selectionStart)}
+          onClick={(event) => captureSelection(event.currentTarget)}
+          onKeyUp={(event) => captureSelection(event.currentTarget)}
+          onSelect={(event) => captureSelection(event.currentTarget)}
           onDragOver={(event) => event.preventDefault()}
           onDrop={(event) => {
             if (event.dataTransfer.files.length > 0) {

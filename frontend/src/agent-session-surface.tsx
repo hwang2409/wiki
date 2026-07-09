@@ -8,6 +8,7 @@ import {
 } from "react";
 import { Bot, GitPullRequest, X } from "lucide-react";
 import { AgentPrReviewPanel } from "./agent-pr-review";
+import { deletePaneStateEntries } from "./pane-state-cache";
 import { SessionTab, usePollTick } from "./session";
 
 const SIDE_PANEL_WIDTH_KEY = "wiki-session-side-panel-width";
@@ -22,6 +23,11 @@ type SidePanelState =
   | { kind: "subagent"; subagent: string }
   | null;
 
+type SurfaceState = {
+  panel: SidePanelState;
+  panelWidth: number;
+};
+
 export type AgentRoutePanel = "review" | null;
 
 export type AgentSessionSurfaceWorker = {
@@ -32,6 +38,33 @@ export type AgentSessionSurfaceWorker = {
   pr?: string | null;
   canReview?: boolean;
 };
+
+const surfaceStateCache = new Map<string, SurfaceState>();
+
+export function clearSurfacePaneState(paneStateKey: string) {
+  deletePaneStateEntries(surfaceStateCache, paneStateKey);
+}
+
+function readSurfaceState(
+  key: string,
+  canReview: boolean,
+  initialPanel: AgentRoutePanel,
+): SurfaceState {
+  const cached = surfaceStateCache.get(key) ?? null;
+  const fallbackWidth = clampPanelWidth(
+    Number(localStorage.getItem(SIDE_PANEL_WIDTH_KEY)) || 480,
+    window.innerWidth
+  );
+  const cachedPanel =
+    cached?.panel?.kind === "review" && !canReview ? null : cached?.panel ?? null;
+  return {
+    panel:
+      initialPanel === "review" && canReview
+        ? { kind: "review" }
+        : cachedPanel,
+    panelWidth: cached?.panelWidth ?? fallbackWidth,
+  };
+}
 
 function SessionSidePanel({
   badge,
@@ -109,12 +142,14 @@ function ReviewSidePanel({
 function SubagentSidePanel({
   onClose,
   onResizeStart,
+  stateKey,
   subagent,
   ticket,
   width,
 }: {
   onClose: () => void;
   onResizeStart: (event: ReactPointerEvent<HTMLDivElement>) => void;
+  stateKey: string;
   subagent: string;
   ticket: string;
   width: number;
@@ -129,7 +164,7 @@ function SubagentSidePanel({
       title={`subagent ${subagent.slice(0, 8)}`}
       width={width}
     >
-      <SessionTab showComposer={false} subagent={subagent} ticket={ticket} />
+      <SessionTab showComposer={false} stateKey={stateKey} subagent={subagent} ticket={ticket} />
     </SessionSidePanel>
   );
 }
@@ -139,22 +174,25 @@ export function AgentSessionSurface({
   initialPanel = null,
   onClose,
   refreshTick,
+  stateKey,
   worker,
 }: {
   context: "full" | "pane";
   initialPanel?: AgentRoutePanel;
   onClose?: () => void;
   refreshTick: number;
+  stateKey?: string;
   worker: AgentSessionSurfaceWorker;
 }) {
   const tick = usePollTick(refreshTick);
   const canReview = worker.canReview ?? Boolean(worker.pr);
   const rowRef = useRef<HTMLDivElement | null>(null);
+  const surfaceStateKey = `${stateKey ?? worker.ticket}:${worker.ticket}`;
   const [panelWidth, setPanelWidth] = useState(() =>
-    clampPanelWidth(Number(localStorage.getItem(SIDE_PANEL_WIDTH_KEY)) || 480, window.innerWidth)
+    readSurfaceState(surfaceStateKey, canReview, initialPanel).panelWidth
   );
   const [panel, setPanel] = useState<SidePanelState>(
-    initialPanel === "review" && canReview ? { kind: "review" } : null
+    () => readSurfaceState(surfaceStateKey, canReview, initialPanel).panel
   );
   const inspectSubagent = useCallback(
     (subagent: string) => setPanel({ kind: "subagent", subagent }),
@@ -162,12 +200,25 @@ export function AgentSessionSurface({
   );
 
   useEffect(() => {
-    setPanel(initialPanel === "review" && canReview ? { kind: "review" } : null);
-  }, [initialPanel, worker.ticket]);
+    const stored = readSurfaceState(surfaceStateKey, canReview, initialPanel);
+    setPanelWidth(stored.panelWidth);
+    setPanel(stored.panel);
+  }, [canReview, initialPanel, surfaceStateKey]);
+
+  useEffect(() => {
+    if (initialPanel === "review" && canReview) setPanel({ kind: "review" });
+  }, [canReview, initialPanel]);
 
   useEffect(() => {
     if (!canReview && panel?.kind === "review") setPanel(null);
   }, [canReview, panel]);
+
+  useEffect(() => {
+    surfaceStateCache.set(surfaceStateKey, {
+      panel: !canReview && panel?.kind === "review" ? null : panel,
+      panelWidth,
+    });
+  }, [canReview, panel, panelWidth, surfaceStateKey]);
 
   const resizePanel = (event: ReactPointerEvent<HTMLDivElement>) => {
     event.preventDefault();
@@ -233,7 +284,7 @@ export function AgentSessionSurface({
           ) : null}
         </header>
         <div className="agent-session-surface-main">
-          <SessionTab ticket={worker.ticket} onInspect={inspectSubagent} />
+          <SessionTab stateKey={`${surfaceStateKey}:main`} ticket={worker.ticket} onInspect={inspectSubagent} />
         </div>
       </section>
       {panel?.kind === "review" ? (
@@ -249,6 +300,7 @@ export function AgentSessionSurface({
         <SubagentSidePanel
           onClose={() => setPanel(null)}
           onResizeStart={resizePanel}
+          stateKey={`${surfaceStateKey}:subagent:${panel.subagent}`}
           subagent={panel.subagent}
           ticket={worker.ticket}
           width={panelWidth}
@@ -261,10 +313,12 @@ export function AgentSessionSurface({
 export function AgentSessionView({
   initialPanel = null,
   refreshTick,
+  stateKey,
   worker,
 }: {
   initialPanel?: AgentRoutePanel;
   refreshTick: number;
+  stateKey?: string;
   worker: AgentSessionSurfaceWorker;
 }) {
   return (
@@ -272,6 +326,7 @@ export function AgentSessionView({
       context="full"
       initialPanel={initialPanel}
       refreshTick={refreshTick}
+      stateKey={stateKey}
       worker={worker}
     />
   );

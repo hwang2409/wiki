@@ -55,6 +55,7 @@ export function WorkspacePane({
   onClose,
   onOpenNote,
   overlayContent,
+  paneStateKey,
   path,
   refreshTick,
   scrollRef,
@@ -68,6 +69,7 @@ export function WorkspacePane({
   onClose: () => void;
   onOpenNote: (path: string) => void;
   overlayContent?: ReactNode;
+  paneStateKey: string;
   path: string;
   refreshTick: number;
   scrollRef?: RefObject<HTMLDivElement | null>;
@@ -78,6 +80,7 @@ export function WorkspacePane({
       agentContext={agentContext ?? "pane"}
       agentWorkers={agentWorkers}
       onClose={onClose}
+      paneStateKey={paneStateKey}
       path={path}
       refreshTick={refreshTick}
     />
@@ -111,6 +114,7 @@ function AgentPane({
   agentContext,
   agentWorkers,
   path,
+  paneStateKey,
   refreshTick,
   onClose,
 }: {
@@ -118,6 +122,7 @@ function AgentPane({
   agentContext: "full" | "pane";
   agentWorkers?: Map<string, AgentSessionSurfaceWorker>;
   path: string;
+  paneStateKey: string;
   refreshTick: number;
   onClose: () => void;
 }) {
@@ -127,10 +132,12 @@ function AgentPane({
   return (
     <section className="secondary-pane agent-pane">
       <AgentSessionSurface
+        key={path}
         context={agentContext}
         initialPanel={agentPanel}
         onClose={onClose}
         refreshTick={refreshTick}
+        stateKey={paneStateKey}
         worker={worker}
       />
     </section>
