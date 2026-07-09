@@ -9,6 +9,7 @@ updated: 2026-07-09
 
 ## 2026-07-09
 
+- **WIKI-32** — polling/delta overhaul — central transcript cache, pause hidden panes, patch-by-id deltas (subsumes WIKI-18) — spawn AFTER WIKI-31 merges
 - **phoebe** — PHO-13216 Core dossier + funnel snapshot data products (#10856 — account limit cap, stripeErroredCount, typed tags, spill markers)
 - **phoebe** — PHO-13227 subagent approval inheritance hole closed (#10861 — parent snapshot inherit + intersection + structural unmount, fail-closed hardening)
 - **WIKI-31** — transcript virtualization — <6k DOM nodes, WebKit scroll p95 <16ms (owner: cdx:WIKI-31)
