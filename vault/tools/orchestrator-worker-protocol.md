@@ -103,4 +103,6 @@ Long-term record of every worker session, written at wrap-up AND at each multi-s
 
 Kill window → stop monitor → ARCHIVE prompt/logs/status to agent-archive → `wiki agent done <TICKET> --outcome …` → delete the /tmp copies → prune vault todo → done.md line → Linear state. No dead-window clutter.
 
+GOTCHA: `agent done` AUTO-KILLS the window (`--keep-window` opt-out) — an explicit `tmux kill-window` after it fails with "can't find window", and if that sits in a `&&` chain the later cleanup steps (rm status file / logs, worktree remove) silently never run, leaving a ghost "active" worker in the app (bit the wiki orchestrator 2026-07-09). Skip the manual kill after `agent done`, or join cleanup with `;` not `&&`.
+
 ORDER MATTERS: archive BEFORE `agent done` — done persists `{outcome, ended_at, worker-registry snapshot}` into the newest archive dir's `meta.json` (the wiki `/agents` archived section reads it). Done without an archive dir = outcome lost (CLI warns). `wiki agent outcome <TICKET> merged` retro-fixes a missed one.
