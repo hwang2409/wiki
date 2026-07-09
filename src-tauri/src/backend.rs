@@ -29,7 +29,12 @@ const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
 const MAIN_WINDOW_LABEL: &str = "main";
 const WINDOW_TITLE: &str = "Wiki";
-const LOADING_PAGE: &str = r#"document.open();
+// Guard: WKWebView can defer this eval past the post-health navigate() when
+// the backend boots fast (onedir sidecar ~0.4s) — unguarded, the deferred
+// write CLOBBERS the already-loaded app with the static loading card.
+// Only paint the card while still on the initial about:blank document.
+const LOADING_PAGE: &str = r#"if (location.protocol === "about:") {
+document.open();
 document.write(`<!doctype html>
 <html lang="en">
   <head>
@@ -105,7 +110,8 @@ document.write(`<!doctype html>
     </main>
   </body>
 </html>`);
-document.close();"#;
+document.close();
+}"#;
 // Stable default keeps the webview origin constant across launches so
 // localStorage (origin-scoped) survives. Falls back to a random port only if
 // the bind fails (e.g. another wiki instance is running).
