@@ -2504,6 +2504,7 @@ export default function App() {
               onClose={() => closeFocusedPane(node.id)}
               onOpenNote={openNote}
               overlayContent={overlayContent}
+              paneStateKey={node.id}
               path={node.path}
               refreshTick={refreshTick}
               scrollRef={scrollRef}
