@@ -264,6 +264,8 @@ class SessionDeltaTests(unittest.TestCase):
             self.assertEqual(body["cursor"], 1)
             self.assertEqual(body["queue"][0]["text"], "queued")
             self.assertEqual(body["events"][0]["text"], "hello")
+            self.assertEqual(body["session_meta"], {})
+            self.assertEqual(body["dispositions"], {"rendered": 1, "summarized": 0, "ignored": 0, "unknown": 0})
 
     def test_subagent_session_renders_sidechain_events(self) -> None:
         with TemporaryDirectory() as tmp:
