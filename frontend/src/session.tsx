@@ -126,17 +126,23 @@ function usePinnedScroll<T extends HTMLElement>(
   const ref = useRef<T | null>(null);
   const innerRef = useRef<HTMLDivElement | null>(null);
   const pinnedRef = useRef(true);
-  const initialBottomRenderRef = useRef(true);
   const rafRef = useRef<number | null>(null);
   const pendingForceRef = useRef(false);
+  const viewportRef = useRef<{ top: number; height: number } | null>(null);
 
   const syncViewport = useCallback((force = false) => {
     const el = ref.current;
     if (!el || !onViewportChange) return;
     const height = el.clientHeight || VIRTUAL_DEFAULT_VIEWPORT;
     const top = el.scrollTop;
-    pinnedRef.current = el.scrollHeight - top - height < 24;
-    onViewportChange({ top, height }, force);
+    const previousViewport = viewportRef.current;
+    const nextPinned = el.scrollHeight - top - height < 24;
+    if (!(pinnedRef.current && previousViewport && previousViewport.top === top && height < previousViewport.height)) {
+      pinnedRef.current = nextPinned;
+    }
+    const viewport = { top, height };
+    viewportRef.current = viewport;
+    onViewportChange(viewport, force);
   }, [onViewportChange]);
 
   const scheduleViewportSync = useCallback((force = false) => {
@@ -154,14 +160,13 @@ function usePinnedScroll<T extends HTMLElement>(
     const el = ref.current;
     if (!el) return;
     el.scrollTop = el.scrollHeight;
-    initialBottomRenderRef.current = false;
     syncViewport();
   }, [syncViewport]);
 
   // New target (ticket switch) always starts pinned at the bottom.
   useLayoutEffect(() => {
     pinnedRef.current = true;
-    initialBottomRenderRef.current = true;
+    viewportRef.current = null;
   }, [resetKey]);
 
   // Pin before paint so an opened log never flashes at the top.
@@ -195,7 +200,6 @@ function usePinnedScroll<T extends HTMLElement>(
   }, [resetKey, syncViewport]);
 
   const handleNativeScroll = useCallback(() => {
-    initialBottomRenderRef.current = false;
     scheduleViewportSync();
   }, [scheduleViewportSync]);
  
@@ -1070,10 +1074,13 @@ export function SessionTab({
     syncViewport(true);
   }, [layout, pinnedRef, ref, resetKey, scrollToBottom, syncViewport]);
   const visibleGroups = useMemo(() => {
-    if (visibleRange.end < visibleRange.start) return [];
+    const end = Math.min(visibleRange.end, groups.length - 1);
+    if (end < visibleRange.start) return [];
     const rows: { group: EventGroup; top: number }[] = [];
-    for (let index = visibleRange.start; index <= visibleRange.end; index += 1) {
-      rows.push({ group: groups[index], top: layout.tops[index] });
+    for (let index = visibleRange.start; index <= end; index += 1) {
+      const group = groups[index];
+      if (!group) continue;
+      rows.push({ group, top: layout.tops[index] ?? 0 });
     }
     return rows;
   }, [groups, layout.tops, visibleRange.end, visibleRange.start]);
