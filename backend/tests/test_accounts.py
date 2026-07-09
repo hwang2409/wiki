@@ -10,7 +10,7 @@ import json
 import os
 import time
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
@@ -96,6 +96,27 @@ class DetectionTests(unittest.TestCase):
         parsed = accounts.parse_reset_time(REAL_LIMIT_STRING)
         self.assertIsNotNone(parsed)
         self.assertIn("2026-07-09T20:36", parsed)
+
+    def test_parses_bare_reset_time_as_today_when_future(self) -> None:
+        now = datetime(2026, 7, 9, 19, 30, tzinfo=timezone(timedelta(hours=-4)))
+        parsed = accounts.parse_reset_time(
+            "You've hit your usage limit; try again at 8:01 PM.",
+            now=now,
+        )
+        self.assertEqual(parsed, "2026-07-09T20:01:00-04:00")
+
+    def test_parses_bare_reset_time_as_tomorrow_when_passed(self) -> None:
+        now = datetime(2026, 7, 9, 21, 0, tzinfo=timezone(timedelta(hours=-4)))
+        parsed = accounts.parse_reset_time(
+            "You've hit your usage limit; try again at 8:01 PM.",
+            now=now,
+        )
+        self.assertEqual(parsed, "2026-07-10T20:01:00-04:00")
+
+    def test_parses_bare_midnight_reset_with_rollover(self) -> None:
+        now = datetime(2026, 7, 9, 23, 59, tzinfo=timezone(timedelta(hours=-4)))
+        parsed = accounts.parse_reset_time("try again at 12:05 AM", now=now)
+        self.assertEqual(parsed, "2026-07-10T00:05:00-04:00")
 
     def test_reset_time_none_when_missing(self) -> None:
         self.assertIsNone(accounts.parse_reset_time("no reset time here"))
@@ -377,6 +398,232 @@ class RotationIntegrationTests(unittest.TestCase):
 
             self.assertEqual(commands, ["codex resume sess-xyz-123"])
 
+    def test_revival_rechecks_registry_and_skips_deregistered_ticket(self) -> None:
+        with _EnvOverride() as paths:
+            (paths["accounts"] / "alpha").mkdir()
+            (paths["accounts"] / "alpha" / "auth.json").write_text("{}")
+            (paths["accounts"] / "beta").mkdir()
+            (paths["accounts"] / "beta" / "auth.json").write_text("{}")
+            paths["auth"].write_text("{}")
+            self._write_registry(
+                paths["registry"],
+                [
+                    {
+                        "ticket": "WIKI-15",
+                        "window": "@42",
+                        "kind": "cdx",
+                        "role": "implement",
+                        "worktree": str(paths["root"] / "wt-15"),
+                        "log": "/tmp/cdx-WIKI-15.log",
+                        "session_id": "sess-wiki-15",
+                    }
+                ],
+            )
+            state = accounts.ensure_state_initialized(accounts.AccountState())
+
+            new_windows: list[str] = []
+
+            def fake_kill(window: str) -> None:
+                self.assertEqual(window, "@42")
+                paths["registry"].write_text("{}")
+
+            with mock.patch.object(accounts, "tmux_live_windows", lambda: {"@42"}), \
+                 mock.patch.object(accounts, "tmux_window_session", lambda w: "phoebe"), \
+                 mock.patch.object(accounts, "tmux_kill_window", fake_kill), \
+                 mock.patch.object(
+                     accounts,
+                     "tmux_new_window",
+                     lambda n, c, cmd, target_session=None: new_windows.append(cmd) or "@200",
+                 ), \
+                 mock.patch.object(accounts, "codex_login_status", lambda: True):
+                result = accounts.rotate(state=state)
+
+            self.assertEqual(new_windows, [], "deregistered tickets must not be revived")
+            self.assertEqual(result.revived, [])
+            self.assertEqual(result.failed, ["WIKI-15"])
+            self.assertIn("no longer in the registry", result.failed_reasons["WIKI-15"])
+
+    def test_revival_skips_terminal_history_entry(self) -> None:
+        with _EnvOverride() as paths:
+            (paths["accounts"] / "alpha").mkdir()
+            (paths["accounts"] / "alpha" / "auth.json").write_text("{}")
+            (paths["accounts"] / "beta").mkdir()
+            (paths["accounts"] / "beta" / "auth.json").write_text("{}")
+            paths["auth"].write_text("{}")
+            worker = {
+                "ticket": "WIKI-15",
+                "window": "@42",
+                "kind": "cdx",
+                "role": "implement",
+                "worktree": str(paths["root"] / "wt-15"),
+                "log": "/tmp/cdx-WIKI-15.log",
+                "session_id": "sess-wiki-15",
+            }
+            self._write_registry(paths["registry"], [worker])
+            state = accounts.ensure_state_initialized(accounts.AccountState())
+
+            def fake_kill(window: str) -> None:
+                archived = dict(worker)
+                archived["outcome"] = "merged"
+                paths["registry"].write_text(json.dumps({
+                    "WIKI-15": {"history": [archived]},
+                }))
+
+            new_windows: list[str] = []
+            with mock.patch.object(accounts, "tmux_live_windows", lambda: {"@42"}), \
+                 mock.patch.object(accounts, "tmux_window_session", lambda w: "phoebe"), \
+                 mock.patch.object(accounts, "tmux_kill_window", fake_kill), \
+                 mock.patch.object(
+                     accounts,
+                     "tmux_new_window",
+                     lambda n, c, cmd, target_session=None: new_windows.append(cmd) or "@200",
+                 ), \
+                 mock.patch.object(accounts, "codex_login_status", lambda: True):
+                result = accounts.rotate(state=state)
+
+            self.assertEqual(new_windows, [])
+            self.assertEqual(result.failed, ["WIKI-15"])
+            self.assertIn("terminal registry outcome", result.failed_reasons["WIKI-15"])
+
+    def test_revival_uses_registry_worktree_reloaded_after_kill(self) -> None:
+        with _EnvOverride() as paths:
+            (paths["accounts"] / "alpha").mkdir()
+            (paths["accounts"] / "alpha" / "auth.json").write_text("{}")
+            (paths["accounts"] / "beta").mkdir()
+            (paths["accounts"] / "beta" / "auth.json").write_text("{}")
+            paths["auth"].write_text("{}")
+            old_worktree = paths["root"] / "old-wt"
+            new_worktree = paths["root"] / "new-wt"
+            self._write_registry(
+                paths["registry"],
+                [
+                    {
+                        "ticket": "WIKI-15",
+                        "window": "@42",
+                        "kind": "cdx",
+                        "role": "implement",
+                        "worktree": str(old_worktree),
+                        "log": "/tmp/cdx-WIKI-15.log",
+                        "session_id": "sess-wiki-15",
+                    }
+                ],
+            )
+            state = accounts.ensure_state_initialized(accounts.AccountState())
+
+            cwd_used: list[str] = []
+
+            def fake_kill(window: str) -> None:
+                self._write_registry(
+                    paths["registry"],
+                    [
+                        {
+                            "ticket": "WIKI-15",
+                            "window": "@42",
+                            "kind": "cdx",
+                            "role": "implement",
+                            "worktree": str(new_worktree),
+                            "log": "/tmp/cdx-WIKI-15.log",
+                            "session_id": "sess-wiki-15",
+                        }
+                    ],
+                )
+
+            with mock.patch.object(accounts, "tmux_live_windows", lambda: {"@42"}), \
+                 mock.patch.object(accounts, "tmux_window_session", lambda w: "phoebe"), \
+                 mock.patch.object(accounts, "tmux_kill_window", fake_kill), \
+                 mock.patch.object(
+                     accounts,
+                     "tmux_new_window",
+                     lambda n, c, cmd, target_session=None: cwd_used.append(c) or "@200",
+                 ), \
+                 mock.patch.object(accounts, "tmux_pipe_pane", lambda w, l: None), \
+                 mock.patch.object(accounts, "tmux_send_literal_and_enter", lambda w, t: None), \
+                 mock.patch.object(accounts, "wait_for_codex_ready", lambda w, t: True), \
+                 mock.patch.object(accounts, "wait_for_cwd_dialog_and_answer", lambda w, timeout_seconds=8.0: False), \
+                 mock.patch.object(accounts, "wiki_agent_update", lambda t, w, l, sid=None: None), \
+                 mock.patch.object(accounts, "codex_login_status", lambda: True):
+                result = accounts.rotate(state=state)
+
+            self.assertEqual(result.revived, ["WIKI-15"])
+            self.assertEqual(cwd_used, [str(new_worktree)])
+
+    def test_revival_falls_back_to_registry_cwd_and_refuses_home(self) -> None:
+        with _EnvOverride() as paths:
+            fallback_cwd = paths["root"] / "cwd-only"
+            worker = {
+                "ticket": "WIKI-15",
+                "window": "@42",
+                "kind": "cdx",
+                "role": "implement",
+                "cwd": str(fallback_cwd),
+                "log": "/tmp/cdx-WIKI-15.log",
+                "session_id": "sess-wiki-15",
+            }
+            revived_worker, reason = accounts._worker_from_registry_entry(
+                "WIKI-15", {"current": worker}, "cdx"
+            )
+            self.assertIsNone(reason)
+            self.assertIsNotNone(revived_worker)
+            self.assertEqual(revived_worker.worktree, str(fallback_cwd))
+
+            home_worker = dict(worker)
+            home_worker["cwd"] = str(Path.home())
+            revived_worker, reason = accounts._worker_from_registry_entry(
+                "WIKI-15", {"current": home_worker}, "cdx"
+            )
+            self.assertIsNone(revived_worker)
+            self.assertIn("$HOME", reason or "")
+
+    def test_wiki_agent_update_receives_post_resume_session_id(self) -> None:
+        with _EnvOverride() as paths:
+            (paths["accounts"] / "alpha").mkdir()
+            (paths["accounts"] / "alpha" / "auth.json").write_text("{}")
+            (paths["accounts"] / "beta").mkdir()
+            (paths["accounts"] / "beta" / "auth.json").write_text("{}")
+            paths["auth"].write_text("{}")
+            self._write_registry(
+                paths["registry"],
+                [
+                    {
+                        "ticket": "WIKI-15",
+                        "window": "@42",
+                        "kind": "cdx",
+                        "role": "implement",
+                        "worktree": str(paths["root"] / "wt-15"),
+                        "log": "/tmp/cdx-WIKI-15.log",
+                        "session_id": "sess-before",
+                    }
+                ],
+            )
+            state = accounts.ensure_state_initialized(accounts.AccountState())
+
+            commands: list[str] = []
+            updates: list[tuple[str, str | None]] = []
+
+            with mock.patch.object(accounts, "tmux_live_windows", lambda: {"@42"}), \
+                 mock.patch.object(accounts, "tmux_window_session", lambda w: "phoebe"), \
+                 mock.patch.object(accounts, "tmux_kill_window", lambda w: None), \
+                 mock.patch.object(
+                     accounts,
+                     "tmux_new_window",
+                     lambda n, c, cmd, target_session=None: commands.append(cmd) or "@200",
+                 ), \
+                 mock.patch.object(accounts, "tmux_pipe_pane", lambda w, l: None), \
+                 mock.patch.object(accounts, "tmux_send_literal_and_enter", lambda w, t: None), \
+                 mock.patch.object(accounts, "wait_for_codex_ready", lambda w, t: True), \
+                 mock.patch.object(accounts, "wait_for_cwd_dialog_and_answer", lambda w, timeout_seconds=8.0: False), \
+                 mock.patch.object(
+                     accounts,
+                     "wiki_agent_update",
+                     lambda t, w, l, sid=None: updates.append((t, sid)),
+                 ), \
+                 mock.patch.object(accounts, "find_session_id_for_worker", lambda t, wt, sa: "sess-after"), \
+                 mock.patch.object(accounts, "codex_login_status", lambda: True):
+                accounts.rotate(state=state)
+
+            self.assertEqual(commands, ["codex resume sess-before"])
+            self.assertEqual(updates, [("WIKI-15", "sess-after")])
+
     def test_login_status_failure_aborts_before_revive(self) -> None:
         with _EnvOverride() as paths:
             (paths["accounts"] / "alpha").mkdir()
@@ -430,6 +677,28 @@ class RotationIntegrationTests(unittest.TestCase):
             state = accounts.ensure_state_initialized(accounts.AccountState())
             with self.assertRaises(accounts.NoEligibleAccountError):
                 accounts.rotate(state=state)
+
+    def test_rotation_pins_outgoing_reset_even_without_parsed_time(self) -> None:
+        with _EnvOverride() as paths:
+            (paths["accounts"] / "alpha").mkdir()
+            (paths["accounts"] / "alpha" / "auth.json").write_text("{}")
+            (paths["accounts"] / "beta").mkdir()
+            (paths["accounts"] / "beta" / "auth.json").write_text("{}")
+            paths["auth"].write_text("{}")
+            paths["registry"].write_text("{}")
+
+            state = accounts.ensure_state_initialized(accounts.AccountState())
+
+            with mock.patch.object(accounts, "tmux_live_windows", set), \
+                 mock.patch.object(accounts, "codex_login_status", lambda: True), \
+                 mock.patch.object(accounts, "_fallback_reset_time", lambda: "2099-01-01T00:00:00+00:00"):
+                result = accounts.rotate(state=state)
+
+            self.assertEqual(result.reset_at, "2099-01-01T00:00:00+00:00")
+            reloaded = accounts.read_state()
+            self.assertEqual(
+                reloaded.accounts["alpha"]["limit_reset_at"], "2099-01-01T00:00:00+00:00"
+            )
 
 
 class ConcurrentRotationTests(unittest.IsolatedAsyncioTestCase):

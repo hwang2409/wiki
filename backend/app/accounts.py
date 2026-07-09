@@ -139,11 +139,19 @@ RESET_TIME_PATTERN = re.compile(
     r"(?P<meridiem>AM|PM)",
     re.IGNORECASE,
 )
+BARE_RESET_TIME_PATTERN = re.compile(
+    r"try\s+again\s+at\s+"
+    r"(?P<hour>\d{1,2}):(?P<minute>\d{2})\s*"
+    r"(?P<meridiem>AM|PM)\b",
+    re.IGNORECASE,
+)
 
 _MONTHS = {
     "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
     "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
 }
+TERMINAL_OUTCOMES = {"merged", "closed", "plan-ready", "abandoned"}
+UNKNOWN_RESET_HOURS = 24
 
 
 def detect_codex_limit(pane: str) -> bool:
@@ -173,29 +181,84 @@ def detect_cwd_dialog(pane: str) -> bool:
     return bool(pane and CWD_DIALOG_PATTERN.search(pane))
 
 
-def parse_reset_time(pane: str) -> str | None:
-    """Return an ISO-8601 UTC-ish timestamp for the reset window, or None.
+def _local_now(now: datetime | None = None) -> datetime:
+    if now is None:
+        return datetime.now().astimezone()
+    if now.tzinfo is None:
+        return now.astimezone()
+    return now
 
-    Interpreted as local time (codex prints it in the operator's tz) and
-    upcast to a naive-but-annotated ISO string via astimezone().
+
+def _local_datetime(
+    year: int,
+    month: int,
+    day: int,
+    hour: int,
+    minute: int,
+    *,
+    now: datetime | None = None,
+) -> datetime:
+    dt = datetime(year, month, day, hour, minute)
+    if now is None:
+        return dt.astimezone()
+    local_now = _local_now(now)
+    return dt.replace(tzinfo=local_now.tzinfo)
+
+
+def _meridiem_hour(hour_text: str, meridiem: str) -> int:
+    hour = int(hour_text) % 12
+    if meridiem.upper() == "PM":
+        hour += 12
+    return hour
+
+
+def parse_reset_time(pane: str, *, now: datetime | None = None) -> str | None:
+    """Return a tz-aware ISO-8601 timestamp for the reset window, or None.
+
+    Codex prints reset times in the operator's local timezone. Full date
+    strings carry the date; bare times are interpreted as today unless that
+    local instant has already passed, in which case they roll to tomorrow.
     """
     if not pane:
         return None
+    local_now = _local_now(now)
+    tz = local_now.tzinfo
     match = RESET_TIME_PATTERN.search(pane)
+    if match:
+        try:
+            month = _MONTHS[match.group("month").lower()[:3]]
+            day = int(match.group("day"))
+            year = int(match.group("year"))
+            hour = _meridiem_hour(match.group("hour"), match.group("meridiem"))
+            minute = int(match.group("minute"))
+            return _local_datetime(year, month, day, hour, minute, now=now).isoformat()
+        except (KeyError, ValueError):
+            return None
+
+    match = BARE_RESET_TIME_PATTERN.search(pane)
     if not match:
         return None
     try:
-        month = _MONTHS[match.group("month").lower()[:3]]
-        day = int(match.group("day"))
-        year = int(match.group("year"))
-        hour = int(match.group("hour")) % 12
-        if match.group("meridiem").upper() == "PM":
-            hour += 12
+        hour = _meridiem_hour(match.group("hour"), match.group("meridiem"))
         minute = int(match.group("minute"))
-        dt = datetime(year, month, day, hour, minute)
-    except (KeyError, ValueError):
+        dt = datetime(
+            local_now.year,
+            local_now.month,
+            local_now.day,
+            hour,
+            minute,
+            tzinfo=tz,
+        )
+    except ValueError:
         return None
-    return dt.astimezone().isoformat()
+    if dt < local_now:
+        dt += timedelta(days=1)
+    return dt.isoformat()
+
+
+def _fallback_reset_time(now: datetime | None = None) -> str:
+    """Conservative reset pin when the pane omitted an unparseable reset time."""
+    return (_local_now(now) + timedelta(hours=UNKNOWN_RESET_HOURS)).isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -460,36 +523,117 @@ def read_registry() -> dict:
         return {}
 
 
+def _safe_revival_cwd(current: dict) -> tuple[str | None, str | None]:
+    raw = current.get("worktree")
+    source = "worktree"
+    if not isinstance(raw, str) or not raw.strip():
+        raw = current.get("cwd")
+        source = "cwd"
+    if not isinstance(raw, str) or not raw.strip():
+        return None, "registry entry has no worktree/cwd for revival"
+
+    expanded = os.path.expandvars(os.path.expanduser(raw.strip()))
+    if not os.path.isabs(expanded):
+        return None, f"registry {source} is not absolute: {raw!r}"
+    expanded = os.path.abspath(expanded)
+    home = os.path.abspath(os.path.expanduser("~"))
+    if expanded == home:
+        return None, "registry revival cwd resolves to $HOME; refusing zombie spawn"
+    return expanded, None
+
+
+def _entry_has_terminal_outcome(entry: dict) -> bool:
+    current = entry.get("current")
+    if isinstance(current, dict) and current.get("outcome") in TERMINAL_OUTCOMES:
+        return True
+    history = entry.get("history")
+    if not isinstance(history, list):
+        return False
+    return any(
+        isinstance(row, dict) and row.get("outcome") in TERMINAL_OUTCOMES
+        for row in history
+    )
+
+
+def _worker_from_registry_entry(
+    ticket: str,
+    entry: object,
+    kind: str,
+) -> tuple[WorkerEntry | None, str | None]:
+    if not isinstance(entry, dict):
+        return None, "ticket is no longer in the registry"
+    if _entry_has_terminal_outcome(entry):
+        return None, "ticket has terminal registry outcome; skipping revival"
+    current = entry.get("current")
+    if not isinstance(current, dict):
+        return None, "ticket has no current registry worker"
+    if current.get("kind") != kind:
+        return None, "registry worker kind changed; skipping stale revival"
+    window = current.get("window")
+    log = current.get("log")
+    if not isinstance(window, str) or not window:
+        return None, "registry entry has no window for revival"
+    if not isinstance(log, str) or not log:
+        return None, "registry entry has no log path for revival"
+    cwd, reason = _safe_revival_cwd(current)
+    if not cwd:
+        return None, reason
+    return WorkerEntry(
+        ticket=ticket,
+        window=window,
+        worktree=cwd,
+        log=log,
+        kind=kind,
+        role=current.get("role") if isinstance(current.get("role"), str) else None,
+        orch=current.get("orch") if isinstance(current.get("orch"), str) else None,
+        spawned_at=(
+            current.get("spawned_at")
+            if isinstance(current.get("spawned_at"), str)
+            else None
+        ),
+        session_id=(
+            current.get("session_id")
+            if isinstance(current.get("session_id"), str)
+            else None
+        ),
+    ), None
+
+
 def iter_workers(kind: str) -> list[WorkerEntry]:
     workers: list[WorkerEntry] = []
     registry = read_registry()
     for ticket, entry in registry.items():
         if ticket.startswith("_") or not isinstance(entry, dict):
             continue
-        current = entry.get("current")
-        if not isinstance(current, dict):
-            continue
-        if current.get("kind") != kind:
-            continue
-        window = current.get("window")
-        worktree = current.get("worktree")
-        log = current.get("log")
-        if not isinstance(window, str) or not isinstance(worktree, str) or not isinstance(log, str):
-            continue
-        workers.append(
-            WorkerEntry(
-                ticket=ticket,
-                window=window,
-                worktree=worktree,
-                log=log,
-                kind=kind,
-                role=current.get("role") if isinstance(current.get("role"), str) else None,
-                orch=current.get("orch") if isinstance(current.get("orch"), str) else None,
-                spawned_at=current.get("spawned_at") if isinstance(current.get("spawned_at"), str) else None,
-                session_id=current.get("session_id") if isinstance(current.get("session_id"), str) else None,
-            )
-        )
+        worker, _ = _worker_from_registry_entry(ticket, entry, kind)
+        if worker:
+            workers.append(worker)
     return workers
+
+
+def current_worker_for_revival(
+    snapshot: WorkerEntry,
+) -> tuple[WorkerEntry | None, str | None]:
+    """Re-read registry immediately before reviving a killed worker.
+
+    If the ticket was deregistered, archived with a terminal outcome, or
+    re-registered/updated to a different window while rotation was in flight,
+    skip instead of spawning a zombie from the stale pre-kill snapshot.
+    """
+    registry = read_registry()
+    worker, reason = _worker_from_registry_entry(
+        snapshot.ticket,
+        registry.get(snapshot.ticket),
+        snapshot.kind,
+    )
+    if not worker:
+        return None, reason
+    if worker.window != snapshot.window:
+        return None, (
+            f"registry window changed from {snapshot.window} to {worker.window}; "
+            "skipping stale revival"
+        )
+    return worker, None
 
 
 def tmux_capture(window: str, lines: int = 60) -> str:
@@ -782,8 +926,9 @@ def rotate(
 
     if outgoing:
         snapshot_active_auth(outgoing)
-        if outgoing_reset_at is not None:
-            state.accounts.setdefault(outgoing, {})["limit_reset_at"] = outgoing_reset_at
+        if outgoing_reset_at is None:
+            outgoing_reset_at = _fallback_reset_time()
+        state.accounts.setdefault(outgoing, {})["limit_reset_at"] = outgoing_reset_at
 
     if not install_incoming_auth(target):
         raise RotationError(f"incoming auth.json missing for account {target!r}")
@@ -804,8 +949,14 @@ def rotate(
     revived: list[str] = []
     failed: list[str] = []
     reasons: dict[str, str] = {}
-    for worker in to_revive:
-        new_window, reason = _revive_worker(worker, session_by_window.get(worker.window))
+    for snapshot in to_revive:
+        worker, reason = current_worker_for_revival(snapshot)
+        if not worker:
+            failed.append(snapshot.ticket)
+            if reason:
+                reasons[snapshot.ticket] = reason
+            continue
+        new_window, reason = _revive_worker(worker, session_by_window.get(snapshot.window))
         if new_window:
             revived.append(worker.ticket)
         else:
@@ -841,6 +992,8 @@ def _revive_worker(
     session (which would replay no history and orphan the transcript). Return
     (None, reason) so the caller can surface an SSE alert.
     """
+    if not target_session:
+        return None, "original tmux session unavailable for revival"
     session_id = _resolve_revival_session_id(worker)
     if not session_id:
         return None, "no session lineage for revival — manual attention needed"
@@ -886,8 +1039,14 @@ def revive_auth_dead(workers: list[WorkerEntry]) -> RevivalResult:
     revived: list[str] = []
     failed: list[str] = []
     reasons: dict[str, str] = {}
-    for worker in to_revive:
-        new_window, reason = _revive_worker(worker, session_by_window.get(worker.window))
+    for snapshot in to_revive:
+        worker, reason = current_worker_for_revival(snapshot)
+        if not worker:
+            failed.append(snapshot.ticket)
+            if reason:
+                reasons[snapshot.ticket] = reason
+            continue
+        new_window, reason = _revive_worker(worker, session_by_window.get(snapshot.window))
         if new_window:
             revived.append(worker.ticket)
         else:
@@ -1127,8 +1286,10 @@ async def _check_once(
         if parsed:
             outgoing_reset = parsed
             break
+    if outgoing_reset is None:
+        outgoing_reset = _fallback_reset_time()
 
-    if outgoing_reset and state.active:
+    if state.active:
         state.accounts.setdefault(state.active, {})["limit_reset_at"] = outgoing_reset
 
     try:
