@@ -58,6 +58,7 @@ const VIRTUAL_MIN_OVERSCAN = 3600;
 const VIRTUAL_OVERSCAN_MULTIPLIER = 5;
 const VIRTUAL_DEFAULT_VIEWPORT = 720;
 const MIN_ROW_HEIGHT = 24;
+const COMPOSER_MIN_HEIGHT = 44;
 
 let skillsCache: SkillInfo[] | null = null;
 function useSkills(): SkillInfo[] {
@@ -104,6 +105,59 @@ function measureCaret(el: HTMLTextAreaElement, at: number): { top: number; left:
   const left = marker.offsetLeft;
   document.body.removeChild(mirror);
   return { top, left };
+}
+
+function createTextareaMeasure(): HTMLTextAreaElement {
+  const mirror = document.createElement("textarea");
+  mirror.setAttribute("aria-hidden", "true");
+  mirror.tabIndex = -1;
+  mirror.style.position = "absolute";
+  mirror.style.visibility = "hidden";
+  mirror.style.pointerEvents = "none";
+  mirror.style.top = "0";
+  mirror.style.left = "-9999px";
+  mirror.style.height = "0";
+  mirror.style.minHeight = "0";
+  mirror.style.maxHeight = "none";
+  mirror.style.overflow = "hidden";
+  mirror.style.contain = "strict";
+  document.body.appendChild(mirror);
+  return mirror;
+}
+
+function measureTextareaHeight(source: HTMLTextAreaElement, mirror: HTMLTextAreaElement): number {
+  const style = getComputedStyle(source);
+  for (const prop of [
+    "boxSizing",
+    "fontFamily",
+    "fontSize",
+    "fontStyle",
+    "fontWeight",
+    "letterSpacing",
+    "lineHeight",
+    "paddingTop",
+    "paddingRight",
+    "paddingBottom",
+    "paddingLeft",
+    "borderTopWidth",
+    "borderRightWidth",
+    "borderBottomWidth",
+    "borderLeftWidth",
+    "textIndent",
+    "textTransform",
+    "whiteSpace",
+    "wordBreak",
+    "overflowWrap",
+  ] as const) {
+    mirror.style[prop] = style[prop];
+  }
+  mirror.style.width = `${Math.max(source.clientWidth, Math.ceil(source.getBoundingClientRect().width))}px`;
+  mirror.value = source.value
+    ? source.value.endsWith("\n")
+      ? `${source.value} `
+      : source.value
+    : " ";
+  return Math.max(mirror.scrollHeight, COMPOSER_MIN_HEIGHT);
 }
 
 // "/par" or "$par" at the caret, at start-of-word → autocomplete trigger
@@ -1267,6 +1321,7 @@ function MessageComposer({
   const visualAnchorRef = useRef(0);
   const visualHeadRef = useRef(0);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const measureRef = useRef<HTMLTextAreaElement | null>(null);
   const [caretPos, setCaretPos] = useState(0);
   const [overlayPos, setOverlayPos] = useState<{ top: number; left: number } | null>(null);
 
@@ -1352,24 +1407,42 @@ function MessageComposer({
       }
     }
   }
+
+  const resizeComposer = useCallback(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    if (!measureRef.current) measureRef.current = createTextareaMeasure();
+    const surface = el.closest(".agent-session-surface, .session-side-panel") as HTMLElement | null;
+    const avail = surface?.clientHeight ?? window.innerHeight;
+    const cap = Math.max(80, Math.round(avail * 0.4));
+    const contentHeight = measureTextareaHeight(el, measureRef.current);
+    const desired = Math.min(contentHeight, cap);
+    el.style.height = `${desired}px`;
+    el.style.overflowY = contentHeight > cap ? "auto" : "hidden";
+  }, []);
+
+  useLayoutEffect(() => {
+    resizeComposer();
+  }, [resizeComposer, text]);
+
   useEffect(() => {
     const el = inputRef.current;
     if (!el) return;
     const surface = el.closest(".agent-session-surface, .session-side-panel") as HTMLElement | null;
-    const resize = () => {
-      const avail = surface?.clientHeight ?? window.innerHeight;
-      const cap = Math.max(80, Math.round(avail * 0.4));
-      el.style.height = "auto";
-      const desired = Math.min(el.scrollHeight, cap);
-      el.style.height = `${desired}px`;
-      el.style.overflowY = el.scrollHeight > cap ? "auto" : "hidden";
+    const handleWindowResize = () => resizeComposer();
+    window.addEventListener("resize", handleWindowResize);
+    const observer = surface ? new ResizeObserver(() => resizeComposer()) : null;
+    if (observer && surface) observer.observe(surface);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("resize", handleWindowResize);
     };
-    resize();
-    if (!surface) return;
-    const observer = new ResizeObserver(resize);
-    observer.observe(surface);
-    return () => observer.disconnect();
-  }, [text]);
+  }, [resizeComposer]);
+
+  useEffect(() => () => {
+    measureRef.current?.remove();
+    measureRef.current = null;
+  }, []);
 
   function caret(): number {
     return inputRef.current?.selectionStart ?? 0;
