@@ -2,10 +2,14 @@
 type: log
 tags: [log, done]
 created: 2026-07-06
-updated: 2026-07-08
+updated: 2026-07-09
 ---
 
 # Done
+
+## 2026-07-09
+
+- **phoebe** — PHO-13251 cross-org feature-adoption survey tool merged (#10887, admin agent; count/list modes, jsonb-typeof guard, missing-row default coalescing)
 
 ## 2026-07-08
 
