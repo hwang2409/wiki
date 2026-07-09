@@ -18,6 +18,7 @@ In Progress:
 - [P1] [PHO-13277](https://linear.app/phoebework/issue/PHO-13277): admin agent charts as messages + no point limits
 - [P1] [PHO-13278](https://linear.app/phoebework/issue/PHO-13278): truncation policy + artifact UI — cdx:PHO-13278 worker
 - [P1] [PHO-13280](https://linear.app/phoebework/issue/PHO-13280): tool semantics + discoverability (recordings/models/pack routing)
+- [P1] WIKI-38: agents-page Replace protocol — kill + respawn orchestrator/worker with same model, kickoff prompt carries role + replaced session id/transcript for context recovery (owner: cdx:WIKI-38)
 
 Backlog:
 
