@@ -43,7 +43,11 @@ _CODEX_IGNORED_METHODS = {
 _CODEX_APPROVAL_METHODS = {
     "item/commandExecution/requestApproval",
     "item/fileChange/requestApproval",
+    "item/permissions/requestApproval",
     "item/tool/requestUserInput",
+    "mcpServer/elicitation/request",
+    "execCommandApproval",
+    "applyPatchApproval",
 }
 
 
@@ -55,10 +59,15 @@ def _codex_state(payload: dict[str, Any]) -> LifecycleState | None:
     if method == "turn/started":
         return LifecycleState.WORKING
     if method == "thread/status/changed":
-        status = (params.get("status") or {}).get("type")
+        status_value = params.get("status") or {}
+        active_flags = set(status_value.get("activeFlags") or [])
+        if active_flags & {"waitingOnApproval", "waitingOnUserInput"}:
+            return LifecycleState.WAITING_APPROVAL
+        status = status_value.get("type")
         return {
             "active": LifecycleState.WORKING,
             "idle": LifecycleState.IDLE,
+            "systemError": LifecycleState.BLOCKED,
         }.get(status)
     if method == "turn/completed":
         status = (params.get("turn") or {}).get("status")
@@ -70,6 +79,8 @@ def _codex_state(payload: dict[str, Any]) -> LifecycleState | None:
     if method in {"thread/archived", "thread/closed"}:
         return LifecycleState.COMPLETED
     if method == "error" and not params.get("willRetry"):
+        return LifecycleState.BLOCKED
+    if method == "account/chatgptAuthTokens/refresh":
         return LifecycleState.BLOCKED
     return None
 
@@ -121,12 +132,25 @@ def _normalize_claude(payload: dict[str, Any]) -> NormalizedProviderEvent:
     state = None
     if event_type == "control_request":
         state = LifecycleState.WAITING_APPROVAL
-        return NormalizedProviderEvent(EventDisposition.RENDERED, "approval", payload, state)
+        return NormalizedProviderEvent(
+            EventDisposition.RENDERED, "approval", payload, state
+        )
+    if event_type == "control_cancel_request":
+        return NormalizedProviderEvent(
+            EventDisposition.RENDERED,
+            "approval_cancelled",
+            payload,
+            LifecycleState.WORKING,
+        )
     if event_type == "result":
         if subtype in {"interrupted", "interrupt"}:
             state = LifecycleState.INTERRUPTED
         else:
-            state = LifecycleState.BLOCKED if payload.get("is_error") else LifecycleState.IDLE
+            state = (
+                LifecycleState.BLOCKED
+                if payload.get("is_error")
+                else LifecycleState.IDLE
+            )
     elif event_type == "system" and subtype == "status":
         status = payload.get("status")
         state = {
@@ -134,6 +158,25 @@ def _normalize_claude(payload: dict[str, Any]) -> NormalizedProviderEvent:
             "running": LifecycleState.WORKING,
             "idle": LifecycleState.IDLE,
         }.get(status)
+    elif event_type == "system" and subtype == "session_state_changed":
+        status = payload.get("state") or payload.get("session_state")
+        state = {
+            "running": LifecycleState.WORKING,
+            "idle": LifecycleState.IDLE,
+            "requires_action": LifecycleState.WAITING_APPROVAL,
+        }.get(status)
+    elif event_type == "provider_process_exit":
+        return NormalizedProviderEvent(
+            EventDisposition.RENDERED,
+            "provider_process_exit",
+            payload,
+        )
+    elif event_type == "provider_stderr":
+        return NormalizedProviderEvent(
+            EventDisposition.SUMMARIZED,
+            "provider_stderr",
+            payload,
+        )
     if event_type in _CLAUDE_RENDERED_TYPES:
         return NormalizedProviderEvent(
             EventDisposition.RENDERED,
@@ -149,7 +192,9 @@ def _normalize_claude(payload: dict[str, Any]) -> NormalizedProviderEvent:
             state,
         )
     if event_type in {"control_response", "keep_alive"}:
-        return NormalizedProviderEvent(EventDisposition.IGNORED, f"claude_{event_type}", payload, state)
+        return NormalizedProviderEvent(
+            EventDisposition.IGNORED, f"claude_{event_type}", payload, state
+        )
     return NormalizedProviderEvent(
         EventDisposition.UNKNOWN,
         f"claude_{event_type or 'unknown'}",
@@ -161,7 +206,31 @@ def _normalize_claude(payload: dict[str, Any]) -> NormalizedProviderEvent:
 def normalize_provider_event(
     provider: ProviderKind,
     payload: dict[str, Any],
+    *,
+    direction: str = "provider",
 ) -> NormalizedProviderEvent:
+    if direction in {"client", "stdin"}:
+        return NormalizedProviderEvent(
+            EventDisposition.IGNORED,
+            f"{provider.value}_client_message",
+            payload,
+        )
+    if direction == "stderr":
+        return NormalizedProviderEvent(
+            EventDisposition.SUMMARIZED,
+            f"{provider.value}_stderr",
+            payload,
+        )
+    if direction == "process":
+        is_exit = (
+            payload.get("method") == "provider/processExited"
+            or payload.get("type") == "provider_process_exit"
+        )
+        return NormalizedProviderEvent(
+            EventDisposition.RENDERED,
+            "provider_process_exit" if is_exit else "provider_protocol_error",
+            payload,
+        )
     if provider is ProviderKind.CODEX:
         return _normalize_codex(payload)
     return _normalize_claude(payload)

@@ -4,10 +4,16 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from backend.app.agent_runtime.fake import WireFixture
 from backend.app.agent_runtime.provider import AdapterStatus
-from backend.app.agent_runtime.store import RunStore, RuntimePaths, StoreConflict, StoreError
+from backend.app.agent_runtime.store import (
+    RunStore,
+    RuntimePaths,
+    StoreConflict,
+    StoreError,
+)
 from backend.app.agent_runtime.types import (
     EventDisposition,
     LifecycleState,
@@ -47,10 +53,13 @@ def _record(root: Path, agent_id: str = "WIKI-42") -> RunRecord:
 
 
 class ProtocolFixtureTests(unittest.TestCase):
-    def test_codex_wire_fixtures_cover_success_failure_resume_steer_interrupt(self) -> None:
+    def test_codex_wire_fixtures_cover_success_failure_resume_steer_interrupt(
+        self,
+    ) -> None:
         success = WireFixture(FIXTURES / "codex_app_server_success.jsonl")
         failure = WireFixture(FIXTURES / "codex_app_server_failure.jsonl")
         control = WireFixture(FIXTURES / "codex_app_server_control.jsonl")
+        approval = WireFixture(FIXTURES / "codex_app_server_approval.jsonl")
 
         thread_start = success.response_result("thread/start")
         assert thread_start is not None
@@ -62,8 +71,36 @@ class ProtocolFixtureTests(unittest.TestCase):
                 for message in success.server_messages("turn/start")
             )
         )
+        request = next(
+            message
+            for message in approval.server_messages("turn/start")
+            if message.get("method") == "item/tool/requestUserInput"
+        )
+        self.assertEqual(request["id"], 0)
+        self.assertEqual(request["params"]["questions"][0]["id"], "wiki_surface")
+        self.assertEqual(request["params"]["autoResolutionMs"], None)
+        approval_rows = [
+            json.loads(line)
+            for line in (FIXTURES / "codex_app_server_approval.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        response = next(
+            row["message"]
+            for row in approval_rows
+            if row["direction"] == "client"
+            and row["message"].get("id") == request["id"]
+            and "result" in row["message"]
+        )
+        self.assertEqual(
+            response["result"],
+            {"answers": {"wiki_surface": {"answers": ["Agents page"]}}},
+        )
         self.assertTrue(
-            any(message.get("method") == "error" for message in failure.server_messages("turn/start"))
+            any(
+                message.get("method") == "error"
+                for message in failure.server_messages("turn/start")
+            )
         )
         self.assertIsNotNone(control.response_result("thread/resume"))
         steer = control.response_result("turn/steer")
@@ -87,7 +124,9 @@ class ProtocolFixtureTests(unittest.TestCase):
 
 
 class LifecycleTests(unittest.TestCase):
-    def test_restart_recovery_table_is_closed_and_only_working_idle_resume(self) -> None:
+    def test_restart_recovery_table_is_closed_and_only_working_idle_resume(
+        self,
+    ) -> None:
         expected = {
             LifecycleState.STARTING: RecoveryAction.BLOCK,
             LifecycleState.WORKING: RecoveryAction.RESUME,
@@ -112,7 +151,9 @@ class LifecycleTests(unittest.TestCase):
                 )
                 self.assertEqual(decision.action, action, state.value)
 
-    def test_replaced_terminal_live_pid_and_missing_session_never_duplicate(self) -> None:
+    def test_replaced_terminal_live_pid_and_missing_session_never_duplicate(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             record = _record(Path(tmp))
             record.state = LifecycleState.WORKING
@@ -206,7 +247,10 @@ class RunStoreTests(unittest.TestCase):
             paths = _paths(root)
             store = RunStore(paths)
             record = store.create(_record(root))
-            self.assertEqual(store.file_modes(record.run_id), {"run": 0o600, "raw": 0o600, "events": 0o600})
+            self.assertEqual(
+                store.file_modes(record.run_id),
+                {"run": 0o600, "raw": 0o600, "events": 0o600},
+            )
             self.assertEqual(store.run_dir(record.run_id).stat().st_mode & 0o777, 0o700)
             registry = json.loads(paths.registry_path.read_text(encoding="utf-8"))
             current = registry["WIKI-42"]["current"]
@@ -277,14 +321,31 @@ class RunStoreTests(unittest.TestCase):
             store = RunStore(paths)
             old = store.create(_record(root))
             replacement = _record(root)
-            replacement.replaces_run_id = old.run_id
-            store._create_run_files(replacement)  # noqa: SLF001 - crash-point fixture
+            replacement.state = LifecycleState.WORKING
+            replacement.provider_session_id = "replacement-session"
+            replacement.provider_pid = 4242
+            replacement.provider_generation = 2
+            replacement.transcript_path = "/isolated/replacement-rollout.jsonl"
+            with mock.patch.object(
+                store,
+                "_write_registry",
+                side_effect=OSError("simulated crash before registry rename"),
+            ):
+                with self.assertRaisesRegex(OSError, "simulated crash"):
+                    store.replace(old.run_id, replacement)
 
             restarted = RunStore(paths)
             repaired_old = restarted.get(old.run_id)
+            repaired_replacement = restarted.get(replacement.run_id)
             self.assertEqual(restarted.current_run_id("WIKI-42"), replacement.run_id)
             self.assertEqual(repaired_old.replaced_by_run_id, replacement.run_id)
             self.assertEqual(repaired_old.state, LifecycleState.COMPLETED)
+            self.assertEqual(repaired_replacement.state, LifecycleState.WORKING)
+            self.assertEqual(
+                repaired_replacement.provider_session_id,
+                "replacement-session",
+            )
+            self.assertEqual(repaired_replacement.provider_generation, 2)
             registry = json.loads(paths.registry_path.read_text(encoding="utf-8"))
             self.assertEqual(registry["WIKI-42"]["history"][0]["run_id"], old.run_id)
 
@@ -306,7 +367,9 @@ class RunStoreTests(unittest.TestCase):
                 ),
             )
             self.assertEqual(updated.provider_session_id, "session-1")
-            current = json.loads(paths.registry_path.read_text(encoding="utf-8"))["WIKI-42"]["current"]
+            current = json.loads(paths.registry_path.read_text(encoding="utf-8"))[
+                "WIKI-42"
+            ]["current"]
             self.assertEqual(current["provider_pid"], 4242)
             self.assertEqual(current["provider_generation"], 2)
             self.assertEqual(current["active_turn_id"], "turn-1")

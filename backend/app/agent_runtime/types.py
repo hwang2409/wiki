@@ -155,6 +155,8 @@ class RunRecord:
     updated_at: str = field(default_factory=utc_now)
     state_reason: str | None = None
     recovery_from_state: LifecycleState | None = None
+    automatic_resume_suppressed: bool = False
+    automatic_resume_guarded_at: str | None = None
     replaces_run_id: str | None = None
     replaced_by_run_id: str | None = None
     outcome: str | None = None
@@ -210,6 +212,8 @@ class RunRecord:
             "recovery_from_state": (
                 self.recovery_from_state.value if self.recovery_from_state else None
             ),
+            "automatic_resume_suppressed": self.automatic_resume_suppressed,
+            "automatic_resume_guarded_at": self.automatic_resume_guarded_at,
             "provider_session_id": self.provider_session_id,
             "provider_pid": self.provider_pid,
             "provider_generation": self.provider_generation,
@@ -247,6 +251,10 @@ class RunRecord:
                 if value.get("recovery_from_state")
                 else None
             ),
+            automatic_resume_suppressed=bool(
+                value.get("automatic_resume_suppressed", False)
+            ),
+            automatic_resume_guarded_at=value.get("automatic_resume_guarded_at"),
             provider_session_id=value.get("provider_session_id"),
             provider_pid=value.get("provider_pid"),
             provider_generation=int(value.get("provider_generation", 0)),
@@ -262,7 +270,9 @@ class RunRecord:
             normalized_event_count=int(value.get("normalized_event_count", 0)),
             last_lifecycle_event_seq=int(value.get("last_lifecycle_event_seq", 0)),
             disposition_counts={
-                item.value: int((value.get("disposition_counts") or {}).get(item.value, 0))
+                item.value: int(
+                    (value.get("disposition_counts") or {}).get(item.value, 0)
+                )
                 for item in EventDisposition
             },
             queued_messages=[dict(item) for item in value.get("queued_messages") or []],
@@ -273,7 +283,9 @@ def validate_transition(current: LifecycleState, target: LifecycleState) -> None
     if current is target:
         return
     if target not in ALLOWED_STATE_TRANSITIONS[current]:
-        raise ValueError(f"invalid lifecycle transition: {current.value} -> {target.value}")
+        raise ValueError(
+            f"invalid lifecycle transition: {current.value} -> {target.value}"
+        )
 
 
 def restart_recovery_decision(
@@ -307,10 +319,17 @@ def restart_recovery_decision(
     than duplicated until an adapter can verify process identity. For a
     working/idle run, that block preserves `recovery_from_state`; the daemon
     rechecks the PID and resumes the exact session once it exits.
+
+    The supervisor guards an automatic resume until its replacement control
+    stream remains attached for the configured stability window. A failed or
+    immediately dying resume is not retried every polling tick; its original
+    working/idle intent remains available for an explicit operator resume.
     """
 
     if not is_current:
-        return RecoveryDecision(RecoveryAction.SKIP, "run is not the registry current run")
+        return RecoveryDecision(
+            RecoveryAction.SKIP, "run is not the registry current run"
+        )
     if record.replaced_by_run_id:
         return RecoveryDecision(RecoveryAction.SKIP, "run was replaced")
     if record.state in TERMINAL_STATES:
@@ -330,11 +349,14 @@ def restart_recovery_decision(
 
     action = RESTART_RECOVERY_TABLE[recovery_state]
     if action is RecoveryAction.RESUME and not record.provider_session_id:
-        return RecoveryDecision(RecoveryAction.BLOCK, "eligible state has no provider session id")
+        return RecoveryDecision(
+            RecoveryAction.BLOCK, "eligible state has no provider session id"
+        )
     reasons = {
         RecoveryAction.RESUME: "current working/idle run has a dead provider PID",
         RecoveryAction.BLOCK: (
-            "provider start did not finish" if recovery_state is LifecycleState.STARTING
+            "provider start did not finish"
+            if recovery_state is LifecycleState.STARTING
             else "pending approval cannot be reconstructed safely"
         ),
         RecoveryAction.SKIP: f"state {recovery_state.value} is not auto-resumable",

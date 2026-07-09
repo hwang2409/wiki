@@ -1,0 +1,688 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+from uuid import uuid4
+
+from .process import (
+    ProviderProcessIdentity,
+    command_tuple,
+    resolve_provider_identity,
+    terminate_process_group,
+)
+from .provider import (
+    AdapterStatus,
+    ProviderAdapter,
+    ProviderBusy,
+    ProviderEvent,
+    ProviderProcessError,
+    ProviderProtocolError,
+    StartRequest,
+)
+from .types import LifecycleState, ProviderKind, RunRecord
+
+
+IdentityResolver = Callable[..., Awaitable[ProviderProcessIdentity | None]]
+
+
+@dataclass
+class _PendingControl:
+    future: asyncio.Future[dict[str, Any]]
+    generation: int
+    subtype: str
+
+
+@dataclass(frozen=True)
+class _ServerControl:
+    raw_id: str
+    generation: int
+    subtype: str
+
+
+@dataclass(frozen=True)
+class _StreamEnd:
+    generation: int
+
+
+class ClaudeStreamAdapter(ProviderAdapter):
+    """Persistent bidirectional Claude stream-json subprocess adapter."""
+
+    provider = ProviderKind.CLAUDE
+
+    def __init__(
+        self,
+        record: RunRecord,
+        *,
+        command: Sequence[str] = ("claude",),
+        env: Mapping[str, str] | None = None,
+        request_timeout: float = 30.0,
+        identity_resolver: IdentityResolver = resolve_provider_identity,
+    ):
+        self.command = command_tuple(command)
+        child_env = dict(os.environ if env is None else env)
+        child_env.pop("TMUX", None)
+        child_env.pop("TMUX_PANE", None)
+        self.env = child_env
+        self.request_timeout = request_timeout
+        self.identity_resolver = identity_resolver
+        self.worktree = record.worktree
+        self.model = record.model
+        self.effort = record.effort
+        self.run_id = record.run_id
+        self.agent_id = record.agent_id
+        self._resume_state = record.recovery_from_state or record.state
+
+        self._process: asyncio.subprocess.Process | None = None
+        self._reader_task: asyncio.Task[None] | None = None
+        self._stderr_task: asyncio.Task[None] | None = None
+        self._events: asyncio.Queue[ProviderEvent | _StreamEnd] = asyncio.Queue()
+        self._pending: dict[str, _PendingControl] = {}
+        self._server_request_ids: dict[str, _ServerControl] = {}
+        self._session_generations: dict[str, int] = {}
+        self._suppress_stream_end: set[int] = set()
+        self._request_id = 0
+        self._generation = record.provider_generation
+        self._state = record.state
+        self._session_id = record.provider_session_id
+        self._provider_pid: int | None = None
+        self._transcript_path = record.transcript_path
+        self._detail: str | None = None
+        self._request: StartRequest | None = None
+        self._write_lock = asyncio.Lock()
+        self._operation_lock = asyncio.Lock()
+
+    def _status(self) -> AdapterStatus:
+        return AdapterStatus(
+            state=self._state,
+            session_id=self._session_id,
+            pid=self._provider_pid,
+            generation=self._generation,
+            transcript_path=self._transcript_path,
+            detail=self._detail,
+        )
+
+    def _process_is_alive(self) -> bool:
+        return self._process is not None and self._process.returncode is None
+
+    def _command_for(self, session_id: str, *, resume: bool) -> tuple[str, ...]:
+        args = [
+            *self.command,
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+            "--verbose",
+            "--replay-user-messages",
+            "--permission-prompt-tool",
+            "stdio",
+            "--include-partial-messages",
+            "--include-hook-events",
+            "--permission-mode",
+            "default",
+            "--model",
+            self.model,
+        ]
+        if self.effort:
+            args.extend(("--effort", self.effort))
+        args.extend(("--resume" if resume else "--session-id", session_id))
+        return tuple(args)
+
+    async def _emit(
+        self, payload: dict[str, Any], *, direction: str, generation: int
+    ) -> None:
+        await self._events.put(
+            ProviderEvent(
+                provider=self.provider,
+                payload=payload,
+                direction=direction,
+                generation=generation,
+            )
+        )
+
+    async def _spawn(self, session_id: str, *, resume: bool, generation: int) -> None:
+        if self._process_is_alive():
+            raise ProviderProcessError("Claude stream process is already running")
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *self._command_for(session_id, resume=resume),
+                cwd=self.worktree,
+                env=self.env,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                limit=4 * 1024 * 1024,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            raise ProviderProcessError(
+                f"could not start Claude stream process: {exc}"
+            ) from exc
+        self._process = process
+        self._generation = generation
+        self._session_id = session_id
+        self._session_generations[session_id] = generation
+        self._provider_pid = process.pid
+        self._state = LifecycleState.STARTING
+        self._detail = None
+        self._reader_task = asyncio.create_task(
+            self._reader_loop(process, generation),
+            name=f"claude-reader-{self.run_id}-{generation}",
+        )
+        self._stderr_task = asyncio.create_task(
+            self._stderr_loop(process, generation),
+            name=f"claude-stderr-{self.run_id}-{generation}",
+        )
+        try:
+            await self._control("initialize", {}, generation=generation)
+        except Exception:
+            await terminate_process_group(process)
+            await asyncio.gather(
+                *(
+                    task
+                    for task in (self._reader_task, self._stderr_task)
+                    if task is not None
+                ),
+                return_exceptions=True,
+            )
+            raise
+
+    async def _send_json(self, message: dict[str, Any], *, generation: int) -> None:
+        process = self._process
+        if process is None or process.returncode is not None or process.stdin is None:
+            raise ProviderProcessError("Claude stream stdin is unavailable")
+        await self._emit(message, direction="stdin", generation=generation)
+        encoded = json.dumps(message, separators=(",", ":")).encode("utf-8") + b"\n"
+        async with self._write_lock:
+            process.stdin.write(encoded)
+            try:
+                await process.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError) as exc:
+                raise ProviderProcessError(
+                    "Claude stream process closed stdin"
+                ) from exc
+
+    async def _control(
+        self,
+        subtype: str,
+        request: dict[str, Any],
+        *,
+        generation: int | None = None,
+    ) -> dict[str, Any]:
+        event_generation = generation or self._generation
+        self._request_id += 1
+        request_id = f"wiki-{self._request_id}"
+        future: asyncio.Future[dict[str, Any]] = (
+            asyncio.get_running_loop().create_future()
+        )
+        self._pending[request_id] = _PendingControl(future, event_generation, subtype)
+        try:
+            await self._send_json(
+                {
+                    "type": "control_request",
+                    "request_id": request_id,
+                    "request": {"subtype": subtype, **request},
+                },
+                generation=event_generation,
+            )
+            return await asyncio.wait_for(future, timeout=self.request_timeout)
+        except TimeoutError as exc:
+            raise ProviderProtocolError(
+                f"Claude control request timed out: {subtype}"
+            ) from exc
+        finally:
+            self._pending.pop(request_id, None)
+
+    async def _send_user(self, text: str) -> None:
+        await self._send_json(
+            {
+                "type": "user",
+                "session_id": "",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": text}],
+                },
+                "parent_tool_use_id": None,
+            },
+            generation=self._generation,
+        )
+        self._state = LifecycleState.WORKING
+        self._detail = None
+
+    def _message_generation(self, value: dict[str, Any], fallback: int) -> int:
+        session_id = value.get("session_id")
+        if isinstance(session_id, str) and session_id in self._session_generations:
+            return self._session_generations[session_id]
+        if value.get("type") == "control_response":
+            response = value.get("response") or {}
+            request_id = (
+                response.get("request_id") if isinstance(response, dict) else None
+            )
+            pending = self._pending.get(str(request_id))
+            if pending is not None:
+                return pending.generation
+        return fallback
+
+    def _has_pending_approval(self, generation: int) -> bool:
+        return any(
+            request.generation == generation and request.subtype == "can_use_tool"
+            for request in self._server_request_ids.values()
+        )
+
+    def _apply_message_state(self, value: dict[str, Any], generation: int) -> None:
+        event_type = value.get("type")
+        subtype = value.get("subtype")
+        session_id = value.get("session_id")
+        if isinstance(session_id, str) and session_id:
+            self._session_id = session_id
+            self._session_generations[session_id] = self._generation
+        if event_type == "control_request":
+            request_id = value.get("request_id")
+            request = value.get("request") or {}
+            if isinstance(request_id, str):
+                request_subtype = (
+                    str(request.get("subtype")) if isinstance(request, dict) else ""
+                )
+                self._server_request_ids[request_id] = _ServerControl(
+                    request_id,
+                    generation,
+                    request_subtype,
+                )
+            if isinstance(request, dict) and request.get("subtype") == "can_use_tool":
+                self._state = LifecycleState.WAITING_APPROVAL
+        elif event_type == "control_cancel_request":
+            request_id = value.get("request_id")
+            cancelled: _ServerControl | None = None
+            if isinstance(request_id, str):
+                cancelled = self._server_request_ids.pop(request_id, None)
+            if (
+                cancelled is not None
+                and cancelled.subtype == "can_use_tool"
+                and self._state is LifecycleState.WAITING_APPROVAL
+                and not self._has_pending_approval(generation)
+            ):
+                self._state = LifecycleState.WORKING
+        elif event_type in {
+            "assistant",
+            "stream_event",
+        } and not self._has_pending_approval(generation):
+            self._state = LifecycleState.WORKING
+        elif event_type == "system" and subtype == "session_state_changed":
+            state = value.get("state") or value.get("session_state")
+            mapped = {
+                "running": LifecycleState.WORKING,
+                "idle": LifecycleState.IDLE,
+                "requires_action": LifecycleState.WAITING_APPROVAL,
+            }.get(state)
+            if mapped is not None:
+                if not (
+                    self._has_pending_approval(generation)
+                    and mapped in {LifecycleState.WORKING, LifecycleState.IDLE}
+                ):
+                    self._state = mapped
+        elif event_type == "system" and subtype == "status":
+            mapped = {
+                "requesting": LifecycleState.WORKING,
+                "running": LifecycleState.WORKING,
+                "idle": LifecycleState.IDLE,
+            }.get(value.get("status"))
+            if mapped is not None:
+                if not (
+                    self._has_pending_approval(generation)
+                    and mapped in {LifecycleState.WORKING, LifecycleState.IDLE}
+                ):
+                    self._state = mapped
+        elif event_type == "result":
+            self._server_request_ids.clear()
+            if subtype in {"interrupted", "interrupt"}:
+                self._state = LifecycleState.INTERRUPTED
+            elif value.get("is_error"):
+                self._state = LifecycleState.BLOCKED
+                self._detail = str(value.get("result") or "Claude provider error")
+            else:
+                self._state = LifecycleState.IDLE
+
+    async def _reader_loop(
+        self,
+        process: asyncio.subprocess.Process,
+        generation: int,
+    ) -> None:
+        assert process.stdout is not None
+        reader_error: Exception | None = None
+        try:
+            while line := await process.stdout.readline():
+                try:
+                    value = json.loads(line)
+                except ValueError:
+                    value = {
+                        "type": "provider_protocol_error",
+                        "line": line.decode("utf-8", errors="replace").rstrip("\n"),
+                    }
+                if not isinstance(value, dict):
+                    value = {"type": "provider_protocol_error", "value": value}
+                event_generation = self._message_generation(value, generation)
+                self._apply_message_state(value, event_generation)
+                await self._emit(value, direction="stdout", generation=event_generation)
+                if value.get("type") != "control_response":
+                    continue
+                response = value.get("response")
+                if not isinstance(response, dict):
+                    continue
+                request_id = response.get("request_id")
+                pending = self._pending.get(str(request_id))
+                if pending is None or pending.future.done():
+                    continue
+                if response.get("subtype") == "success":
+                    result = response.get("response")
+                    pending.future.set_result(
+                        result if isinstance(result, dict) else {}
+                    )
+                else:
+                    pending.future.set_exception(
+                        ProviderProtocolError(
+                            f"Claude {pending.subtype} failed: "
+                            f"{json.dumps(response, sort_keys=True)}"
+                        )
+                    )
+        except asyncio.CancelledError:
+            await terminate_process_group(process)
+            raise
+        except Exception as exc:
+            reader_error = exc
+            await self._emit(
+                {
+                    "type": "provider_protocol_error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+                direction="process",
+                generation=generation,
+            )
+            await terminate_process_group(process)
+        finally:
+            # EOF is also a transport failure if the child stays alive. Never
+            # await a provider that has closed its only control/output stream.
+            if process.returncode is None:
+                await terminate_process_group(process)
+            returncode = await process.wait()
+            exit_payload: dict[str, Any] = {
+                "type": "provider_process_exit",
+                "returncode": returncode,
+            }
+            if reader_error is not None:
+                exit_payload["reader_error"] = (
+                    f"{type(reader_error).__name__}: {reader_error}"
+                )
+            await self._emit(
+                exit_payload,
+                direction="process",
+                generation=generation,
+            )
+            detail = f"Claude process exited with status {returncode}"
+            if reader_error is not None:
+                detail += f" after reader failure: {reader_error}"
+            error = ProviderProcessError(detail)
+            for pending in self._pending.values():
+                if pending.generation == generation and not pending.future.done():
+                    pending.future.set_exception(error)
+            await self._events.put(_StreamEnd(generation))
+
+    async def _stderr_loop(
+        self,
+        process: asyncio.subprocess.Process,
+        generation: int,
+    ) -> None:
+        assert process.stderr is not None
+        try:
+            while line := await process.stderr.readline():
+                await self._emit(
+                    {
+                        "type": "provider_stderr",
+                        "text": line.decode("utf-8", errors="replace").rstrip("\n"),
+                    },
+                    direction="stderr",
+                    generation=generation,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._emit(
+                {
+                    "type": "provider_protocol_error",
+                    "stream": "stderr",
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+                direction="process",
+                generation=generation,
+            )
+            await terminate_process_group(process)
+
+    async def _refresh_transcript(self, *, wait_for_file: bool = False) -> None:
+        process_pid = (
+            self._process.pid if self._process_is_alive() and self._process else None
+        )
+        identity = await self.identity_resolver(
+            process_pid,
+            self.provider,
+            self._session_id,
+            reported_path=self._transcript_path,
+        )
+        if identity is not None:
+            self._provider_pid = identity.pid
+            self._transcript_path = identity.transcript_path
+            return
+        self._provider_pid = process_pid
+        if not self._session_id:
+            return
+        config_dir = Path(
+            self.env.get("CLAUDE_CONFIG_DIR")
+            or Path(self.env.get("HOME") or Path.home()) / ".claude"
+        )
+        attempts = 20 if wait_for_file else 1
+        for attempt in range(attempts):
+            candidates = list(config_dir.glob(f"projects/**/{self._session_id}.jsonl"))
+            if candidates:
+                self._transcript_path = str(
+                    max(candidates, key=lambda path: path.stat().st_mtime)
+                )
+                return
+            if attempt + 1 < attempts:
+                await asyncio.sleep(0.1)
+
+    async def start(self, request: StartRequest) -> AdapterStatus:
+        async with self._operation_lock:
+            self._request = request
+            self.worktree = request.worktree
+            self.model = request.model
+            self.effort = request.effort
+            generation = self._generation + 1
+            session_id = str(uuid4())
+            await self._spawn(session_id, resume=False, generation=generation)
+            try:
+                await self._send_user(request.prompt)
+                await self._refresh_transcript(wait_for_file=True)
+            except Exception:
+                await terminate_process_group(self._process)
+                raise
+            return self._status()
+
+    async def resume(self, session_id: str) -> AdapterStatus:
+        async with self._operation_lock:
+            generation = self._generation + 1
+            try:
+                await self._spawn(session_id, resume=True, generation=generation)
+                self._state = LifecycleState.IDLE
+                if self._resume_state is LifecycleState.WORKING:
+                    status_dir = Path(
+                        self.env.get("WIKI_AGENT_STATUS_DIR") or "/tmp/agent-status"
+                    )
+                    await self._send_user(
+                        f"You are worker for ticket {self.agent_id}. Your provider session was "
+                        f"interrupted. Re-read {status_dir / f'{self.agent_id}.json'} and resume "
+                        "from your current step."
+                    )
+                await self._refresh_transcript()
+            except Exception:
+                await terminate_process_group(self._process)
+                raise
+            return self._status()
+
+    async def send_now(self, message: str) -> AdapterStatus:
+        async with self._operation_lock:
+            if not self._process_is_alive():
+                raise ProviderProcessError("Claude provider is not attached")
+            await self._send_user(message)
+            return self._status()
+
+    async def send_on_idle(self, message: str) -> AdapterStatus:
+        if self._state is not LifecycleState.IDLE:
+            raise ProviderBusy(f"Claude run is {self._state.value}, not idle")
+        return await self.send_now(message)
+
+    async def interrupt(self) -> AdapterStatus:
+        async with self._operation_lock:
+            if not self._process_is_alive():
+                raise ProviderProcessError("Claude provider is not attached")
+            await self._control("interrupt", {})
+            self._state = LifecycleState.INTERRUPTED
+            return self._status()
+
+    async def _wait_for_exit(self, process: asyncio.subprocess.Process) -> None:
+        try:
+            await asyncio.wait_for(process.wait(), timeout=3.0)
+        except TimeoutError:
+            await terminate_process_group(process)
+
+    async def _end_session(
+        self,
+        reason: str,
+        *,
+        suppress_stream_end: bool,
+    ) -> None:
+        process = self._process
+        if process is None:
+            self._server_request_ids.clear()
+            return
+        generation = self._generation
+        if suppress_stream_end:
+            self._suppress_stream_end.add(generation)
+        if process.returncode is None:
+            try:
+                await self._control("end_session", {"reason": reason})
+            except (ProviderProcessError, ProviderProtocolError):
+                pass
+            if process.stdin is not None:
+                process.stdin.close()
+            await self._wait_for_exit(process)
+        if self._stderr_task is not None:
+            await asyncio.gather(self._stderr_task, return_exceptions=True)
+        if self._reader_task is not None:
+            await asyncio.gather(self._reader_task, return_exceptions=True)
+        self._server_request_ids.clear()
+
+    async def stop(self) -> AdapterStatus:
+        async with self._operation_lock:
+            self._state = LifecycleState.DEAD
+            await self._end_session("wiki-stop", suppress_stream_end=False)
+            self._provider_pid = None
+            return self._status()
+
+    async def replace(self, new_prompt: str, model: str | None = None) -> AdapterStatus:
+        async with self._operation_lock:
+            if not self._process_is_alive():
+                raise ProviderProcessError(
+                    "Claude replacement requires an attached provider"
+                )
+            await self._end_session("wiki-replace", suppress_stream_end=True)
+            self.model = model or self.model
+            generation = self._generation + 1
+            session_id = str(uuid4())
+            try:
+                await self._spawn(session_id, resume=False, generation=generation)
+                await self._send_user(new_prompt)
+                await self._refresh_transcript(wait_for_file=True)
+            except Exception:
+                await terminate_process_group(self._process)
+                raise
+            return self._status()
+
+    async def status(self) -> AdapterStatus:
+        async with self._operation_lock:
+            if not self._process_is_alive():
+                if self._state is not LifecycleState.COMPLETED:
+                    self._state = LifecycleState.DEAD
+                self._provider_pid = None
+                return self._status()
+            await self._refresh_transcript()
+            return self._status()
+
+    def snapshot(self) -> AdapterStatus:
+        return self._status()
+
+    def events(self) -> AsyncIterator[ProviderEvent]:
+        return self._event_stream()
+
+    async def _event_stream(self) -> AsyncIterator[ProviderEvent]:
+        while True:
+            event = await self._events.get()
+            if isinstance(event, _StreamEnd):
+                if (
+                    event.generation in self._suppress_stream_end
+                    or event.generation < self._generation
+                ):
+                    self._suppress_stream_end.discard(event.generation)
+                    continue
+                return
+            yield event
+
+    async def archive(self) -> AdapterStatus:
+        async with self._operation_lock:
+            self._state = LifecycleState.COMPLETED
+            await self._end_session("wiki-archive", suppress_stream_end=False)
+            self._provider_pid = None
+            return self._status()
+
+    async def respond(
+        self,
+        request_id: str | int,
+        response: dict[str, Any],
+    ) -> AdapterStatus:
+        if not isinstance(request_id, str):
+            raise ProviderProtocolError(
+                f"unknown, canceled, or stale Claude server request id: {request_id!r}"
+            )
+        pending = self._server_request_ids.pop(request_id, None)
+        if pending is None or pending.generation != self._generation:
+            raise ProviderProtocolError(
+                f"unknown, canceled, or stale Claude server request id: {request_id!r}"
+            )
+        await self._send_json(
+            {
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": pending.raw_id,
+                    "response": response,
+                },
+            },
+            generation=self._generation,
+        )
+        if (
+            pending.subtype == "can_use_tool"
+            and self._state is LifecycleState.WAITING_APPROVAL
+            and not self._has_pending_approval(pending.generation)
+        ):
+            self._state = LifecycleState.WORKING
+        return self._status()
+
+    async def close(self) -> None:
+        await terminate_process_group(self._process)
+        if self._stderr_task is not None:
+            await asyncio.gather(self._stderr_task, return_exceptions=True)
+        if self._reader_task is not None:
+            await asyncio.gather(self._reader_task, return_exceptions=True)
+        self._server_request_ids.clear()

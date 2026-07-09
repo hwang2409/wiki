@@ -8,6 +8,22 @@ from typing import Any
 from .types import LifecycleState, ProviderKind, utc_now
 
 
+class ProviderError(RuntimeError):
+    pass
+
+
+class ProviderBusy(ProviderError):
+    pass
+
+
+class ProviderProcessError(ProviderError):
+    pass
+
+
+class ProviderProtocolError(ProviderError):
+    pass
+
+
 @dataclass(frozen=True)
 class StartRequest:
     prompt: str
@@ -83,6 +99,12 @@ class ProviderAdapter(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def snapshot(self) -> AdapterStatus:
+        """Return lock-free in-memory status for the event persistence path."""
+
+        raise NotImplementedError
+
+    @abstractmethod
     def events(self) -> AsyncIterator[ProviderEvent]:
         raise NotImplementedError
 
@@ -90,7 +112,16 @@ class ProviderAdapter(ABC):
     async def archive(self) -> AdapterStatus:
         raise NotImplementedError
 
-    async def respond(self, request_id: str, response: dict[str, Any]) -> AdapterStatus:
+    async def respond(
+        self, request_id: str | int, response: dict[str, Any]
+    ) -> AdapterStatus:
         """Answer a provider approval/question request when the protocol supports it."""
 
-        raise NotImplementedError(f"{self.provider.value} adapter does not support responses")
+        raise NotImplementedError(
+            f"{self.provider.value} adapter does not support responses"
+        )
+
+    async def close(self) -> None:
+        """Release local transport resources without changing durable run intent."""
+
+        await self.stop()

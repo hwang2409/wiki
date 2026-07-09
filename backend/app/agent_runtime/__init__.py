@@ -6,6 +6,7 @@ next migration phase.
 """
 
 from .client import SupervisorClient
+from .factory import RealAdapterFactory
 from .provider import AdapterStatus, ProviderAdapter, ProviderEvent, StartRequest
 from .store import RunStore, RuntimePaths
 from .types import (
@@ -25,6 +26,7 @@ __all__ = [
     "ProviderEvent",
     "ProviderKind",
     "RecoveryAction",
+    "RealAdapterFactory",
     "RunRecord",
     "RunStore",
     "RuntimePaths",

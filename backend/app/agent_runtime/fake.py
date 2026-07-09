@@ -9,7 +9,7 @@ from typing import Any
 from uuid import uuid5, NAMESPACE_URL
 
 from .provider import AdapterStatus, ProviderAdapter, ProviderEvent, StartRequest
-from .types import LifecycleState, ProviderKind
+from .types import LifecycleState, ProviderKind, RunRecord
 
 
 class WireFixture:
@@ -47,15 +47,28 @@ class CodexFixtureAdapter(ProviderAdapter):
 
     provider = ProviderKind.CODEX
 
-    def __init__(self, success_fixture: Path, control_fixture: Path, *, pid: int | None = None):
+    def __init__(
+        self,
+        success_fixture: Path,
+        control_fixture: Path,
+        *,
+        pid: int | None = None,
+        generation: int = 0,
+    ):
         self.success = WireFixture(success_fixture)
         self.control = WireFixture(control_fixture)
         self.pid = os.getpid() if pid is None else pid
         self._events: asyncio.Queue[ProviderEvent | None] = asyncio.Queue()
-        self._status = AdapterStatus(LifecycleState.STARTING, None, self.pid, generation=0)
+        self._status = AdapterStatus(
+            LifecycleState.STARTING,
+            None,
+            self.pid,
+            generation=generation,
+        )
         self._request: StartRequest | None = None
         self._queued: list[str] = []
         self.replayed_methods: list[str] = []
+        self.closed = False
 
     async def _emit(
         self,
@@ -178,6 +191,9 @@ class CodexFixtureAdapter(ProviderAdapter):
     async def status(self) -> AdapterStatus:
         return self._status
 
+    def snapshot(self) -> AdapterStatus:
+        return self._status
+
     async def _event_stream(self) -> AsyncIterator[ProviderEvent]:
         while True:
             event = await self._events.get()
@@ -198,7 +214,9 @@ class CodexFixtureAdapter(ProviderAdapter):
         )
         return self._status
 
-    async def respond(self, request_id: str, response: dict[str, Any]) -> AdapterStatus:
+    async def respond(
+        self, request_id: str | int, response: dict[str, Any]
+    ) -> AdapterStatus:
         await self._events.put(
             ProviderEvent(
                 self.provider,
@@ -210,6 +228,7 @@ class CodexFixtureAdapter(ProviderAdapter):
         return self._status
 
     async def close(self) -> None:
+        self.closed = True
         await self._events.put(None)
 
 
@@ -218,7 +237,7 @@ class ClaudeFixtureAdapter(ProviderAdapter):
 
     provider = ProviderKind.CLAUDE
 
-    def __init__(self, fixture: Path, *, pid: int | None = None):
+    def __init__(self, fixture: Path, *, pid: int | None = None, generation: int = 0):
         self.fixture = fixture
         self.pid = os.getpid() if pid is None else pid
         self._rows = [
@@ -227,9 +246,15 @@ class ClaudeFixtureAdapter(ProviderAdapter):
             if line
         ]
         self._events: asyncio.Queue[ProviderEvent | None] = asyncio.Queue()
-        self._status = AdapterStatus(LifecycleState.STARTING, None, self.pid, generation=0)
+        self._status = AdapterStatus(
+            LifecycleState.STARTING,
+            None,
+            self.pid,
+            generation=generation,
+        )
         self._request: StartRequest | None = None
         self._queued: list[str] = []
+        self.closed = False
 
     async def _replay(self, *, generation: int | None = None) -> None:
         event_generation = generation or max(1, self._status.generation)
@@ -332,6 +357,9 @@ class ClaudeFixtureAdapter(ProviderAdapter):
     async def status(self) -> AdapterStatus:
         return self._status
 
+    def snapshot(self) -> AdapterStatus:
+        return self._status
+
     async def _event_stream(self) -> AsyncIterator[ProviderEvent]:
         while True:
             event = await self._events.get()
@@ -351,7 +379,9 @@ class ClaudeFixtureAdapter(ProviderAdapter):
         )
         return self._status
 
-    async def respond(self, request_id: str, response: dict[str, Any]) -> AdapterStatus:
+    async def respond(
+        self, request_id: str | int, response: dict[str, Any]
+    ) -> AdapterStatus:
         await self._events.put(
             ProviderEvent(
                 self.provider,
@@ -370,6 +400,7 @@ class ClaudeFixtureAdapter(ProviderAdapter):
         return self._status
 
     async def close(self) -> None:
+        self.closed = True
         await self._events.put(None)
 
 
@@ -378,14 +409,17 @@ class FixtureAdapterFactory:
         self.fixture_dir = fixture_dir
         self.pid = pid
 
-    def __call__(self, provider: ProviderKind) -> ProviderAdapter:
+    def __call__(self, record: RunRecord) -> ProviderAdapter:
+        provider = record.provider
         if provider is ProviderKind.CODEX:
             return CodexFixtureAdapter(
                 self.fixture_dir / "codex_app_server_success.jsonl",
                 self.fixture_dir / "codex_app_server_control.jsonl",
                 pid=self.pid,
+                generation=record.provider_generation,
             )
         return ClaudeFixtureAdapter(
             self.fixture_dir / "claude_stream_native_surfaces.jsonl",
             pid=self.pid,
+            generation=record.provider_generation,
         )

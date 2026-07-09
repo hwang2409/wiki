@@ -59,8 +59,7 @@ class RuntimePaths:
             or Path.home() / ".wiki" / "agent-runtime"
         ).expanduser()
         socket_path = Path(
-            values.get("WIKI_SUPERVISOR_SOCKET_PATH")
-            or runtime_dir / "supervisor.sock"
+            values.get("WIKI_SUPERVISOR_SOCKET_PATH") or runtime_dir / "supervisor.sock"
         ).expanduser()
         registry_path = Path(
             values.get("WIKI_AGENT_REGISTRY_PATH") or "/tmp/agent-registry.json"
@@ -229,7 +228,9 @@ class RunStore:
         except FileNotFoundError:
             return {}
         except (OSError, ValueError) as exc:
-            raise StoreError(f"could not read registry {self.paths.registry_path}: {exc}") from exc
+            raise StoreError(
+                f"could not read registry {self.paths.registry_path}: {exc}"
+            ) from exc
         if not isinstance(value, dict):
             raise StoreError("agent registry must contain an object")
         return value
@@ -254,6 +255,8 @@ class RunStore:
             "recovery_from_state": (
                 record.recovery_from_state.value if record.recovery_from_state else None
             ),
+            "automatic_resume_suppressed": record.automatic_resume_suppressed,
+            "automatic_resume_guarded_at": record.automatic_resume_guarded_at,
             "session_id": record.provider_session_id,
             "provider_session_id": record.provider_session_id,
             "provider_pid": record.provider_pid,
@@ -277,7 +280,10 @@ class RunStore:
             raise StoreConflict(f"run already exists: {record.run_id}")
         directory.mkdir(mode=0o700, parents=False)
         directory.chmod(0o700)
-        for path in (self.raw_events_path(record.run_id), self.normalized_events_path(record.run_id)):
+        for path in (
+            self.raw_events_path(record.run_id),
+            self.normalized_events_path(record.run_id),
+        ):
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             os.close(fd)
         self._write_record(record)
@@ -368,7 +374,9 @@ class RunStore:
                 for record in records
                 if record.replaces_run_id in by_id
             }
-            heads = [record for record in records if record.run_id not in child_by_parent]
+            heads = [
+                record for record in records if record.run_id not in child_by_parent
+            ]
             raw_entry = registry.get(agent_id)
             entry = raw_entry if isinstance(raw_entry, dict) else {}
             raw_current = entry.get("current")
@@ -413,7 +421,9 @@ class RunStore:
                 if record.run_id == current.run_id:
                     continue
                 child = child_by_parent.get(record.run_id)
-                row = dict(history_by_id.get(record.run_id) or self._registry_current(record))
+                row = dict(
+                    history_by_id.get(record.run_id) or self._registry_current(record)
+                )
                 row.update(
                     {
                         "outcome": record.outcome or ("handoff" if child else None),
@@ -437,9 +447,15 @@ class RunStore:
             registry = self._read_registry()
             entry = registry.get(record.agent_id)
             if isinstance(entry, dict) and isinstance(entry.get("current"), dict):
-                raise StoreConflict(f"agent already has a current run: {record.agent_id}")
+                raise StoreConflict(
+                    f"agent already has a current run: {record.agent_id}"
+                )
             self._create_run_files(record)
-            history = list((entry or {}).get("history") or []) if isinstance(entry, dict) else []
+            history = (
+                list((entry or {}).get("history") or [])
+                if isinstance(entry, dict)
+                else []
+            )
             registry[record.agent_id] = {
                 "history": history,
                 "current": self._registry_current(record),
@@ -468,7 +484,7 @@ class RunStore:
 
     def current_run_id(self, agent_id: str) -> str | None:
         with self._lock:
-            current = ((self._read_registry().get(agent_id) or {}).get("current") or {})
+            current = (self._read_registry().get(agent_id) or {}).get("current") or {}
             run_id = current.get("run_id")
             return run_id if isinstance(run_id, str) else None
 
@@ -482,6 +498,7 @@ class RunStore:
         *,
         reason: str | None = None,
         adapter_status: AdapterStatus | None = None,
+        guard_automatic_resume: bool = False,
     ) -> RunRecord:
         with self._lock:
             record = self.get(run_id)
@@ -497,16 +514,21 @@ class RunStore:
             if target is not LifecycleState.BLOCKED:
                 record.recovery_from_state = None
             if adapter_status is not None:
-                record.provider_session_id = adapter_status.session_id
+                if adapter_status.session_id is not None:
+                    record.provider_session_id = adapter_status.session_id
                 record.provider_pid = adapter_status.pid
                 record.provider_generation = adapter_status.generation
                 record.active_turn_id = adapter_status.active_turn_id
-                record.transcript_path = adapter_status.transcript_path
+                if adapter_status.transcript_path is not None:
+                    record.transcript_path = adapter_status.transcript_path
                 if adapter_status.detail and reason is None:
                     record.state_reason = adapter_status.detail
+            if guard_automatic_resume:
+                record.automatic_resume_suppressed = True
+                record.automatic_resume_guarded_at = utc_now()
             self._write_record(record)
             registry = self._read_registry()
-            current = ((registry.get(record.agent_id) or {}).get("current") or {})
+            current = (registry.get(record.agent_id) or {}).get("current") or {}
             if current.get("run_id") == record.run_id:
                 registry[record.agent_id]["current"] = self._registry_current(record)
                 self._write_registry(registry)
@@ -532,20 +554,73 @@ class RunStore:
             record.state = LifecycleState.BLOCKED
             record.state_reason = reason
             record.recovery_from_state = recovery_state
+            record.automatic_resume_suppressed = False
+            record.automatic_resume_guarded_at = None
             self._write_record(record)
             registry = self._read_registry()
-            current = ((registry.get(record.agent_id) or {}).get("current") or {})
+            current = (registry.get(record.agent_id) or {}).get("current") or {}
             if current.get("run_id") == record.run_id:
                 registry[record.agent_id]["current"] = self._registry_current(record)
                 self._write_registry(registry)
             return record
 
-    def update_adapter_status(self, run_id: str, status: AdapterStatus) -> RunRecord:
+    def mark_automatic_resume_failed(
+        self,
+        run_id: str,
+        *,
+        reason: str,
+        recovery_state: LifecycleState,
+    ) -> RunRecord:
+        """Suppress crash-loop retries while preserving explicit resume intent."""
+
+        with self._lock:
+            record = self.get(run_id)
+            if recovery_state not in {LifecycleState.WORKING, LifecycleState.IDLE}:
+                raise StoreConflict(
+                    f"state {recovery_state.value} has no resumable recovery intent"
+                )
+            validate_transition(record.state, LifecycleState.BLOCKED)
+            record.state = LifecycleState.BLOCKED
+            record.state_reason = reason
+            record.recovery_from_state = recovery_state
+            record.automatic_resume_suppressed = True
+            record.automatic_resume_guarded_at = None
+            self._write_record(record)
+            registry = self._read_registry()
+            current = (registry.get(record.agent_id) or {}).get("current") or {}
+            if current.get("run_id") == record.run_id:
+                registry[record.agent_id]["current"] = self._registry_current(record)
+                self._write_registry(registry)
+            return record
+
+    def clear_automatic_resume_suppression(self, run_id: str) -> RunRecord:
+        with self._lock:
+            record = self.get(run_id)
+            if not record.automatic_resume_suppressed:
+                return record
+            record.automatic_resume_suppressed = False
+            record.automatic_resume_guarded_at = None
+            self._write_record(record)
+            registry = self._read_registry()
+            current = (registry.get(record.agent_id) or {}).get("current") or {}
+            if current.get("run_id") == record.run_id:
+                registry[record.agent_id]["current"] = self._registry_current(record)
+                self._write_registry(registry)
+            return record
+
+    def update_adapter_status(
+        self,
+        run_id: str,
+        status: AdapterStatus,
+        *,
+        guard_automatic_resume: bool = False,
+    ) -> RunRecord:
         return self.transition(
             run_id,
             status.state,
             reason=status.detail,
             adapter_status=status,
+            guard_automatic_resume=guard_automatic_resume,
         )
 
     def append_raw(
@@ -555,6 +630,7 @@ class RunStore:
         provider: str,
         direction: str,
         payload: dict[str, Any],
+        generation: int = 1,
         received_at: str | None = None,
     ) -> dict[str, Any]:
         """Durably append raw provider input before normalization is attempted."""
@@ -566,6 +642,7 @@ class RunStore:
                 "received_at": received_at or utc_now(),
                 "provider": provider,
                 "direction": direction,
+                "generation": generation,
                 "payload": payload,
             }
             _append_json_line(self.raw_events_path(run_id), envelope)
@@ -588,7 +665,9 @@ class RunStore:
         with self._lock:
             record = self.get(run_id)
             if raw_seq < 1 or raw_seq > record.raw_event_count:
-                raise StoreError(f"normalized event references missing raw sequence {raw_seq}")
+                raise StoreError(
+                    f"normalized event references missing raw sequence {raw_seq}"
+                )
             envelope = {
                 "seq": record.normalized_event_count + 1,
                 "raw_seq": raw_seq,
@@ -642,7 +721,9 @@ class RunStore:
                 return None
             return dict(record.queued_messages[0])
 
-    def replace(self, old_run_id: str, new_record: RunRecord) -> tuple[RunRecord, RunRecord]:
+    def replace(
+        self, old_run_id: str, new_record: RunRecord
+    ) -> tuple[RunRecord, RunRecord]:
         with self._lock:
             old = self.get(old_run_id)
             if new_record.agent_id != old.agent_id:

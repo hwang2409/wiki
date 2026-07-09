@@ -9,12 +9,11 @@ import traceback
 from pathlib import Path
 from typing import BinaryIO
 
+from .factory import RealAdapterFactory
 from .fake import FixtureAdapterFactory
 from .protocol import UnixSupervisorServer
-from .provider import ProviderAdapter
 from .store import RunStore, RuntimePaths
 from .supervisor import Supervisor
-from .types import ProviderKind
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,10 +34,6 @@ def _paths_from_args(args: argparse.Namespace) -> RuntimePaths:
     if args.registry:
         env["WIKI_AGENT_REGISTRY_PATH"] = args.registry
     return RuntimePaths.from_env(env)
-
-
-def _unavailable_adapter(_provider: ProviderKind) -> ProviderAdapter:
-    raise RuntimeError("real provider adapters are not enabled in the additive migration phase")
 
 
 def _acquire_single_instance(paths: RuntimePaths) -> BinaryIO:
@@ -74,8 +69,14 @@ async def _recovery_loop(supervisor: Supervisor, stop: asyncio.Event) -> None:
 async def run_daemon(args: argparse.Namespace) -> None:
     paths = _paths_from_args(args)
     lock = _acquire_single_instance(paths)
-    fixture_dir = args.fake_fixture_dir or os.environ.get("WIKI_SUPERVISOR_FAKE_FIXTURE_DIR")
-    factory = FixtureAdapterFactory(Path(fixture_dir)) if fixture_dir else _unavailable_adapter
+    fixture_dir = args.fake_fixture_dir or os.environ.get(
+        "WIKI_SUPERVISOR_FAKE_FIXTURE_DIR"
+    )
+    factory = (
+        FixtureAdapterFactory(Path(fixture_dir))
+        if fixture_dir
+        else RealAdapterFactory()
+    )
     supervisor = Supervisor(RunStore(paths), factory)
     server = UnixSupervisorServer(supervisor, paths.socket_path)
     stop = asyncio.Event()
