@@ -854,7 +854,7 @@ def subagent_session(
     path = transcripts.subagents_dir(main_path) / f"agent-{agent_id}.jsonl"
     if not path.is_file():
         raise HTTPException(status_code=404, detail="No such subagent")
-    return _session_delta_payload("claude", path, cursor=cursor, client_path=client_path)
+    return _session_delta_payload("claude-sub", path, cursor=cursor, client_path=client_path)
 
 
 UPLOAD_DIR = Path("/tmp/wiki-uploads")

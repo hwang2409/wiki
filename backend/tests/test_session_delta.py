@@ -265,6 +265,49 @@ class SessionDeltaTests(unittest.TestCase):
             self.assertEqual(body["queue"][0]["text"], "queued")
             self.assertEqual(body["events"][0]["text"], "hello")
 
+    def test_subagent_session_renders_sidechain_events(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            main_transcript = root / "session.jsonl"
+            subagents_dir = root / "session" / "subagents"
+            subagents_dir.mkdir(parents=True)
+            agent_path = subagents_dir / "agent-abc123def456.jsonl"
+            _write_rows(main_transcript, [{"type": "user", "message": {"content": "seed"}}], mode="w")
+            _write_rows(
+                agent_path,
+                [
+                    {
+                        "type": "user",
+                        "isSidechain": True,
+                        "message": {"content": "subagent prompt"},
+                    },
+                    {
+                        "type": "assistant",
+                        "isSidechain": True,
+                        "message": {
+                            "content": [{"type": "text", "text": "subagent reply"}]
+                        },
+                    },
+                ],
+                mode="w",
+            )
+            registry = root / "agent-registry.json"
+            registry.write_text("{}", encoding="utf-8")
+            with (
+                mock.patch.object(main, "AGENT_REGISTRY_PATH", registry),
+                mock.patch.dict(
+                    main._session_paths,
+                    {"WIKI-44": ("claude", main_transcript)},
+                    clear=True,
+                ),
+            ):
+                body = main.subagent_session("WIKI-44", "abc123def456", cursor=0)
+            self.assertGreater(
+                len(body["events"]),
+                0,
+                "sidechain rows must render (regression: fmt='claude' filters them out)",
+            )
+
     def test_path_mismatch_forces_full_reset(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
