@@ -3582,12 +3582,14 @@ body.is-resizing-panes .pane-cell {
 
 .session-virtual-row {
   position: absolute;
+  top: 0;
   right: 0;
   left: 0;
   display: flex;
   flex-direction: column;
   min-width: 0;
   contain: content;
+  will-change: transform;
 }
 
 .session-footer {

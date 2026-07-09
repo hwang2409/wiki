@@ -121,25 +121,32 @@ export function usePollTick(refreshTick: number): number {
 function usePinnedScroll<T extends HTMLElement>(
   dep: unknown,
   resetKey: unknown,
-  onViewportChange?: (viewport: { top: number; height: number }) => void
+  onViewportChange?: (viewport: { top: number; height: number }, force?: boolean) => void
 ) {
   const ref = useRef<T | null>(null);
   const innerRef = useRef<HTMLDivElement | null>(null);
   const pinnedRef = useRef(true);
   const initialBottomRenderRef = useRef(true);
   const rafRef = useRef<number | null>(null);
+  const pendingForceRef = useRef(false);
 
-  const syncViewport = useCallback(() => {
+  const syncViewport = useCallback((force = false) => {
     const el = ref.current;
     if (!el || !onViewportChange) return;
-    onViewportChange({ top: el.scrollTop, height: el.clientHeight || VIRTUAL_DEFAULT_VIEWPORT });
+    const height = el.clientHeight || VIRTUAL_DEFAULT_VIEWPORT;
+    const top = el.scrollTop;
+    pinnedRef.current = el.scrollHeight - top - height < 24;
+    onViewportChange({ top, height }, force);
   }, [onViewportChange]);
 
-  const scheduleViewportSync = useCallback(() => {
+  const scheduleViewportSync = useCallback((force = false) => {
+    pendingForceRef.current = pendingForceRef.current || force;
     if (rafRef.current !== null) return;
     rafRef.current = window.requestAnimationFrame(() => {
       rafRef.current = null;
-      syncViewport();
+      const shouldForce = pendingForceRef.current;
+      pendingForceRef.current = false;
+      syncViewport(shouldForce);
     });
   }, [syncViewport]);
 
@@ -170,7 +177,7 @@ function usePinnedScroll<T extends HTMLElement>(
     if (!el || !inner) return;
     const observer = new ResizeObserver(() => {
       if (pinnedRef.current) scrollToBottom();
-      else scheduleViewportSync();
+      else scheduleViewportSync(true);
     });
     observer.observe(el);
     observer.observe(inner);
@@ -184,30 +191,23 @@ function usePinnedScroll<T extends HTMLElement>(
   }, [dep, scheduleViewportSync, scrollToBottom]);
 
   useLayoutEffect(() => {
-    syncViewport();
+    syncViewport(true);
   }, [resetKey, syncViewport]);
 
-  const handleScrollTarget = useCallback((el: T) => {
-    pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+  const handleNativeScroll = useCallback(() => {
     initialBottomRenderRef.current = false;
-    syncViewport();
-  }, [syncViewport]);
+    scheduleViewportSync();
+  }, [scheduleViewportSync]);
  
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
-    const onNativeScroll = () => handleScrollTarget(el);
-    el.addEventListener("scroll", onNativeScroll, { passive: true });
-    return () => el.removeEventListener("scroll", onNativeScroll);
-  }, [handleScrollTarget]);
-
-  const onScroll = useCallback((event: React.UIEvent<T>) => {
-    handleScrollTarget(event.currentTarget);
-  }, [handleScrollTarget]);
+    el.addEventListener("scroll", handleNativeScroll, { passive: true });
+    return () => el.removeEventListener("scroll", handleNativeScroll);
+  }, [handleNativeScroll]);
   return {
     ref,
     innerRef,
-    onScroll,
     pinnedRef,
     scrollToBottom,
     syncViewport,
@@ -856,7 +856,7 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
   uiState: SessionUiState;
 }) {
   const rowRef = useMeasuredRow(group, onHeightChange);
-  const style: CSSProperties = { top };
+  const style: CSSProperties = { transform: `translateY(${top}px)` };
   return (
     <div className="session-virtual-row" ref={rowRef} style={style}>
       {group.kind === "activity" ? (
@@ -1007,14 +1007,22 @@ export function SessionTab({
     [groups, resetKey, rowHeightVersion]
   );
   const [visibleRange, setVisibleRange] = useState<{ start: number; end: number }>({ start: 0, end: -1 });
-  const syncVisibleRange = useCallback((viewport: { top: number; height: number }) => {
-    const next = computeVisibleRange(layout, viewport.top, viewport.height || VIRTUAL_DEFAULT_VIEWPORT);
+  const visibleRangeViewportRef = useRef<{ top: number; height: number } | null>(null);
+  const syncVisibleRange = useCallback((viewport: { top: number; height: number }, force = false) => {
+    const height = viewport.height || VIRTUAL_DEFAULT_VIEWPORT;
+    const overscan = Math.max(VIRTUAL_MIN_OVERSCAN, height * VIRTUAL_OVERSCAN_MULTIPLIER);
+    const previousViewport = visibleRangeViewportRef.current;
+    if (!force && previousViewport && previousViewport.height === height) {
+      const hysteresis = overscan * 0.5;
+      if (Math.abs(viewport.top - previousViewport.top) < hysteresis) return;
+    }
+    visibleRangeViewportRef.current = { top: viewport.top, height };
+    const next = computeVisibleRange(layout, viewport.top, height);
     setVisibleRange((current) => (sameVisibleRange(current, next) ? current : next));
   }, [layout]);
   const {
     ref,
     innerRef,
-    onScroll,
     pinnedRef,
     scrollToBottom,
     syncViewport,
@@ -1042,7 +1050,7 @@ export function SessionTab({
     if (!el) return;
     if (!previousLayout || previousResetKey !== resetKey) {
       if (pinnedRef.current) scrollToBottom();
-      else syncViewport();
+      else syncViewport(true);
       return;
     }
     if (pinnedRef.current) {
@@ -1051,7 +1059,7 @@ export function SessionTab({
     }
     const anchor = findScrollAnchor(previousLayout, el.scrollTop);
     if (!anchor) {
-      syncViewport();
+      syncViewport(true);
       return;
     }
     const nextIndex = layout.keyToIndex.get(anchor.key) ?? Math.min(anchor.index, Math.max(0, layout.tops.length - 1));
@@ -1059,7 +1067,7 @@ export function SessionTab({
     const maxScrollTop = Math.max(0, layout.totalHeight - el.clientHeight);
     const target = Math.max(0, Math.min(nextTop + anchor.offset, maxScrollTop));
     if (Math.abs(el.scrollTop - target) > 1) el.scrollTop = target;
-    syncViewport();
+    syncViewport(true);
   }, [layout, pinnedRef, ref, resetKey, scrollToBottom, syncViewport]);
   const visibleGroups = useMemo(() => {
     if (visibleRange.end < visibleRange.start) return [];
@@ -1148,7 +1156,7 @@ export function SessionTab({
           ) : null}
         </div>
       ) : null}
-      <div className="session-scroll" ref={ref} onScroll={onScroll}>
+      <div className="session-scroll" ref={ref}>
         <div className="session-scroll-inner" ref={innerRef}>
           <div className="session-virtual-list" style={{ height: layout.totalHeight }}>
             {visibleGroups.map(({ group, top }) => (
