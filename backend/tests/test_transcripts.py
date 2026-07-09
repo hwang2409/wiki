@@ -19,6 +19,9 @@ from unittest import mock
 from backend.app import transcripts
 
 
+FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
+
+
 def _write_rollout(day_dir: Path, name: str, cwd: str, session_id: str,
                    kickoff_ticket: str | None = None, mtime: float | None = None) -> Path:
     day_dir.mkdir(parents=True, exist_ok=True)
@@ -204,6 +207,56 @@ class SameCwdChainRuleTests(unittest.TestCase):
                 )
             self.assertIsNotNone(found)
             self.assertEqual(found.name, "rollout-anchor.jsonl")
+
+
+class TranscriptSurfaceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        transcripts._cache.clear()
+
+    def test_claude_native_surfaces_fixture(self) -> None:
+        path = FIXTURES_DIR / "claude_native_surfaces.jsonl"
+        result = transcripts.read_session_events("claude", path)
+
+        self.assertEqual(
+            result["dispositions"],
+            {"rendered": 10, "summarized": 2, "ignored": 3, "unknown": 0},
+        )
+        self.assertEqual(
+            result["session_meta"],
+            {"custom_title": "Fixture transcript", "agent_name": "wiki worker"},
+        )
+
+        questions = [event for event in result["events"] if event["kind"] == "question"]
+        self.assertEqual(len(questions), 2)
+        self.assertEqual(questions[0]["question"]["answered_option"], 1)
+        self.assertIsNone(questions[0]["question"]["custom_reply"])
+        self.assertIsNone(questions[1]["question"]["answered_option"])
+        self.assertEqual(questions[1]["question"]["custom_reply"], "Go with the fresh branch")
+
+        markers = {(event.get("marker"), event["text"]) for event in result["events"] if event["kind"] == "marker"}
+        self.assertIn(("permission-mode", "permissions · bypass permissions"), markers)
+        self.assertIn(("progress", "Sampling fixtures and wiring renderers."), markers)
+        self.assertTrue(any(event.get("marker") == "tool_reference" for event in result["events"]))
+        self.assertTrue(any(event["kind"] == "image" and event["text"].startswith("/api/transcript-images/") for event in result["events"]))
+        self.assertEqual(result["tasks"][0]["status"], "in_progress")
+
+    def test_codex_native_surfaces_fixture(self) -> None:
+        path = FIXTURES_DIR / "codex_native_surfaces.jsonl"
+        result = transcripts.read_session_events("codex", path)
+
+        self.assertEqual(
+            result["dispositions"],
+            {"rendered": 6, "summarized": 1, "ignored": 3, "unknown": 1},
+        )
+        thinking = next(event for event in result["events"] if event["kind"] == "thinking")
+        self.assertTrue(thinking["encrypted"])
+        self.assertEqual(result["tokens"], 3210)
+        self.assertTrue(any(event.get("marker") == "task_started" for event in result["events"]))
+        self.assertTrue(any(event.get("marker") == "subagent" for event in result["events"]))
+        self.assertTrue(any(event.get("marker") == "task_complete" for event in result["events"]))
+        tool = next(event for event in result["events"] if event["kind"] == "tool")
+        self.assertEqual(tool["tool"]["output"], "done\nexited with code 0")
+        self.assertTrue(tool["tool"]["ok"])
 
 
 if __name__ == "__main__":

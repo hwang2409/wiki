@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,8 +8,22 @@ import net from "node:net";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, "..", "..");
 const WRAPPER = resolve(ROOT, "scripts", "wiki32_isolated_backend.py");
-const PYTHON = resolve(ROOT, ".venv", "bin", "python");
 const FRONTEND_DIST = resolve(ROOT, "frontend", "dist");
+
+function resolvePython() {
+  const candidates = [
+    process.env.WIKI_PYTHON,
+    resolve(ROOT, ".venv", "bin", "python"),
+    resolve(ROOT, "..", "..", "..", ".venv", "bin", "python"),
+  ].filter(Boolean);
+  const found = candidates.find((candidate) => existsSync(candidate));
+  if (!found) {
+    throw new Error(`No Python runtime found for isolated backend: ${candidates.join(", ")}`);
+  }
+  return found;
+}
+
+const PYTHON = resolvePython();
 
 export function makeFixtureRoot(prefix) {
   const root = mkdtempSync(join(tmpdir(), prefix));

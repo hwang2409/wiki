@@ -1,13 +1,21 @@
 """Native CLI session transcripts (codex/claude JSONL) → normalized event stream.
 
-Formats are unversioned internals — parsers are defensive, unknown rows are skipped.
+Formats are unversioned internals — parsers are defensive, and each source row
+is bucketed as rendered, summarized, intentionally ignored, or unknown.
 Normalized event:
-  {"kind": "user"|"assistant"|"thinking"|"tool"|"tasks"|"interrupt"|"pr"|"marker",
-   "ts": str|None, "text": str,
+  {"kind": "user"|"assistant"|"thinking"|"tool"|"tasks"|"interrupt"|"pr"|
+            "marker"|"image"|"question",
+   "ts": str|None, "text": str, "disposition": "rendered"|"summarized"|
+                                                "intentionally_ignored"|"unknown",
    "tool": {"name", "input", "output", "ok"} (kind=tool only),
    "tasks": [{id, subject, status, blockedBy}] (kind=tasks only),
-   "pr":   {number, url}                     (kind=pr only),
-   "marker": str                             (kind=marker only)}
+   "pr":   {number, url}                      (kind=pr only),
+   "marker": str                              (kind=marker only),
+   "encrypted": bool                          (thinking only),
+   "question": {
+       "prompt": str, "header": str|None, "options": [str, ...],
+       "answered_option": int|None, "custom_reply": str|None
+   }                                          (question only)}
 """
 
 from __future__ import annotations
@@ -30,6 +38,11 @@ MAX_CHANGE_LOG = 4_096
 TRANSCRIPT_IMAGE_DIR = Path("/tmp/wiki-transcript-images")
 
 _IMAGE_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp"}
+
+EVENT_DISPOSITION_RENDERED = "rendered"
+EVENT_DISPOSITION_SUMMARIZED = "summarized"
+EVENT_DISPOSITION_IGNORED = "intentionally_ignored"
+EVENT_DISPOSITION_UNKNOWN = "unknown"
 
 
 def cache_image(media_type: str, b64_data: str) -> str | None:
@@ -55,6 +68,48 @@ def _clip(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + f"\n… [{len(text) - limit} chars truncated]"
+
+
+def _disposition_counts_key(disposition: str) -> str:
+    return "ignored" if disposition == EVENT_DISPOSITION_IGNORED else disposition
+
+
+def _record_row_disposition(state: dict, disposition: str) -> None:
+    counts = state.setdefault(
+        "dispositions",
+        {"rendered": 0, "summarized": 0, "ignored": 0, "unknown": 0},
+    )
+    key = _disposition_counts_key(disposition)
+    counts[key] = int(counts.get(key, 0)) + 1
+
+
+def _format_duration_ms(value: object) -> str | None:
+    if not isinstance(value, (int, float)):
+        return None
+    total_seconds = max(0, int(round(float(value) / 1000)))
+    minutes, seconds = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {seconds}s" if seconds else f"{minutes}m"
+    return f"{seconds}s"
+
+
+def _marker_event(
+    ts: str | None,
+    text: str,
+    marker: str,
+    *,
+    disposition: str = EVENT_DISPOSITION_RENDERED,
+) -> dict:
+    return {
+        "kind": "marker",
+        "ts": ts,
+        "text": text,
+        "marker": marker,
+        "disposition": disposition,
+    }
 
 
 # ---------------------------------------------------------------- discovery
@@ -424,6 +479,29 @@ def _classify_tool(name: str, tool_input: str) -> tuple[str, str]:
     return ("run", _clip(cmd, 80))
 
 
+# ---------------------------------------------------------------- disposition policy
+
+
+_CLAUDE_IGNORED_TYPES = {
+    "ai-title": "Claude auto-titles duplicate visible transcript context.",
+    "file-history-snapshot": "Backup manifests are large implementation metadata, not session content.",
+    "last-prompt": "Truncated prompt storage is bookkeeping, not a transcript event.",
+    "mode": "Repeated mode rows are ambient metadata without user-visible state.",
+    "queue-operation": "Queue bookkeeping is internal plumbing noise.",
+    "result": "Completion sentinels carry no additional session detail.",
+    "started": "Bootstrap sentinels only record session start.",
+}
+
+_CODEX_IGNORED_TYPES = {
+    "compacted": "Compaction bookkeeping is redundant with the rendered compacted marker.",
+    "inter_agent_communication_metadata": "Cross-thread transport metadata is internal-only plumbing.",
+    "session_meta": "Session headers duplicate stable metadata already shown elsewhere.",
+    "thread_settings_applied": "Thread settings are verbose startup metadata with no incremental transcript value.",
+    "turn_context": "Turn context rows are parser bookkeeping, not user-visible activity.",
+    "world_state": "World-state snapshots are large internal state dumps.",
+}
+
+
 # ---------------------------------------------------------------- codex parser
 
 
@@ -510,6 +588,7 @@ def _record_change(state: dict, change: dict) -> None:
 
 
 def _append_event(state: dict, event: dict) -> dict:
+    event.setdefault("disposition", EVENT_DISPOSITION_RENDERED)
     event_id = int(state.get("next_event_id", state.get("base", 0) + len(state.get("events", []))))
     event["id"] = event_id
     state["next_event_id"] = event_id + 1
@@ -545,30 +624,68 @@ def _record_tool_patch(state: dict, event: dict) -> None:
     )
 
 
+def _codex_background_event(payload: dict, ts: str | None) -> dict | None:
+    ptype = payload.get("type")
+    if ptype == "task_started":
+        mode = payload.get("collaboration_mode_kind")
+        text = "task started"
+        if isinstance(mode, str) and mode:
+            text += f" · {mode}"
+        return _marker_event(ts, text, "task_started")
+    if ptype == "task_complete":
+        text = "task complete"
+        duration = _format_duration_ms(payload.get("duration_ms"))
+        if duration:
+            text += f" · {duration}"
+        last = payload.get("last_agent_message")
+        if isinstance(last, str) and last.strip():
+            first = last.strip().splitlines()[0]
+            text += f": {_clip(first, 220)}"
+        return _marker_event(ts, _clip(text, 400), "task_complete")
+    if ptype == "sub_agent_activity":
+        kind = payload.get("kind") or "activity"
+        path = PurePosixPath(payload.get("agent_path") or "").name
+        label = f"subagent {kind}"
+        if path:
+            label += f" · {path}"
+        return _marker_event(ts, label, "subagent")
+    return None
+
+
 def _codex_apply(state: dict, row: dict) -> None:
-    events: list = state["events"]
     pending: dict = state["pending"]  # call_id → event (awaiting output)
     ts = row.get("timestamp")
     rtype = row.get("type")
     payload = row.get("payload") or {}
     ptype = payload.get("type")
 
+    if rtype in _CODEX_IGNORED_TYPES:
+        _record_row_disposition(state, EVENT_DISPOSITION_IGNORED)
+        return
+
     if rtype == "event_msg":
+        if ptype == "thread_settings_applied":
+            _record_row_disposition(state, EVENT_DISPOSITION_IGNORED)
+            return
         if ptype == "user_message":
             text = _clip(payload.get("message") or "", MAX_TEXT)
             if text and not _dedupe_pair(state, "event_msg", "user", text):
                 _append_event(state, {"kind": "user", "ts": ts, "text": text})
+            _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
         elif ptype == "agent_message":
             text = _clip(payload.get("message") or "", MAX_TEXT)
             if text and not _dedupe_pair(state, "event_msg", "assistant", text):
                 _append_event(state, {"kind": "assistant", "ts": ts, "text": text})
+            _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
         elif ptype == "token_count":
             info = payload.get("info") or {}
             total = (info.get("total_token_usage") or {}).get("total_tokens")
             if total:
                 state["tokens"] = total
+            _record_row_disposition(state, EVENT_DISPOSITION_SUMMARIZED)
         elif ptype == "context_compacted":
             _append_event(state, {"kind": "thinking", "ts": ts, "text": "context compacted"})
+            _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
         elif ptype == "turn_aborted":
             reason = payload.get("reason") or "aborted"
             duration_ms = payload.get("duration_ms")
@@ -576,6 +693,12 @@ def _codex_apply(state: dict, row: dict) -> None:
             if isinstance(duration_ms, (int, float)) and duration_ms:
                 text += f" · {int(duration_ms // 1000)}s"
             _append_event(state, {"kind": "interrupt", "ts": ts, "text": text})
+            _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
+        elif ptype in ("task_started", "task_complete", "sub_agent_activity"):
+            marker = _codex_background_event(payload, ts)
+            if marker:
+                _append_event(state, marker)
+            _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
         elif ptype in ("patch_apply_end", "mcp_tool_call_end", "web_search_end"):
             event = pending.pop(payload.get("call_id"), None)
             if event:
@@ -583,10 +706,14 @@ def _codex_apply(state: dict, row: dict) -> None:
                 event["tool"]["output"] = _clip(str(out), MAX_TOOL_IO)
                 event["tool"]["ok"] = ok
                 _record_tool_patch(state, event)
+            _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
+        else:
+            _record_row_disposition(state, EVENT_DISPOSITION_UNKNOWN)
     elif rtype == "response_item":
         if ptype == "message":
             role = payload.get("role")
             if role not in ("user", "assistant"):
+                _record_row_disposition(state, EVENT_DISPOSITION_IGNORED)
                 return  # developer role = injected instructions, skip
             parts: list[str] = []
             for block in payload.get("content") or []:
@@ -595,15 +722,24 @@ def _codex_apply(state: dict, row: dict) -> None:
                     if isinstance(text_field, str) and text_field:
                         parts.append(text_field)
             text = "\n".join(parts).strip()
-            if not text or _dedupe_pair(state, "response_item", role, text):
-                return
-            _append_event(state, {"kind": role, "ts": ts, "text": _clip(text, MAX_TEXT)})
+            if text and not _dedupe_pair(state, "response_item", role, text):
+                _append_event(state, {"kind": role, "ts": ts, "text": _clip(text, MAX_TEXT)})
+            _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
         elif ptype == "reasoning":
             summary = payload.get("summary") or []
             text = " ".join(
                 s.get("text", "") for s in summary if isinstance(s, dict)
             ).strip()
-            _append_event(state, {"kind": "thinking", "ts": ts, "text": _clip(text, MAX_TEXT)})
+            _append_event(
+                state,
+                {
+                    "kind": "thinking",
+                    "ts": ts,
+                    "text": _clip(text, MAX_TEXT),
+                    "encrypted": isinstance(payload.get("encrypted_content"), str),
+                },
+            )
+            _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
         elif ptype in ("function_call", "custom_tool_call", "web_search_call", "tool_search_call"):
             name = payload.get("name") or ptype.replace("_call", "")
             raw_input = payload.get("arguments", payload.get("input", payload.get("action", "")))
@@ -626,6 +762,7 @@ def _codex_apply(state: dict, row: dict) -> None:
             call_id = payload.get("call_id")
             if call_id:
                 pending[call_id] = event
+            _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
         elif ptype in ("function_call_output", "custom_tool_call_output", "tool_search_output"):
             event = pending.pop(payload.get("call_id"), None)
             if event:
@@ -635,16 +772,183 @@ def _codex_apply(state: dict, row: dict) -> None:
                 event["tool"]["output"] = _clip(str(output or ""), MAX_TOOL_IO)
                 event["tool"]["ok"] = "exited with code 0" in str(output or "") or None
                 _record_tool_patch(state, event)
+            _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
+        else:
+            _record_row_disposition(state, EVENT_DISPOSITION_UNKNOWN)
+    else:
+        _record_row_disposition(state, EVENT_DISPOSITION_UNKNOWN)
 
 
 # ---------------------------------------------------------------- claude parser
 
 
-_SYSTEM_MARKERS = {
-    "api_error": "API error",
-    "compact_boundary": "context compacted",
-    "scheduled_task_fire": "scheduled task",
-}
+def _claude_progress_text(row: dict) -> str:
+    data = row.get("data")
+    if isinstance(data, dict):
+        nested = data.get("message")
+        if isinstance(nested, dict):
+            content = nested.get("content")
+            if isinstance(content, str) and content.strip():
+                return _clip(content.strip(), MAX_TEXT)
+            if isinstance(content, list):
+                parts: list[str] = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text = block.get("text")
+                        if isinstance(text, str) and text.strip():
+                            parts.append(text.strip())
+                if parts:
+                    return _clip("\n".join(parts), MAX_TEXT)
+        prompt = data.get("prompt")
+        if isinstance(prompt, str) and prompt.strip():
+            return _clip(prompt.strip(), MAX_TEXT)
+        kind = data.get("type")
+        if isinstance(kind, str) and kind:
+            return f"progress · {kind}"
+    return "progress"
+
+
+def _claude_system_text(row: dict) -> tuple[str, str] | None:
+    subtype = row.get("subtype")
+    if subtype == "api_error":
+        error_raw = row.get("error")
+        error = error_raw if isinstance(error_raw, dict) else {}
+        detail = row.get("content") or error.get("formatted") or error.get("message")
+        retry = _format_duration_ms(row.get("retryInMs"))
+        text = f"API error: {detail}" if detail else "API error"
+        if retry:
+            text += f" · retry in {retry}"
+        return ("api_error", _clip(str(text), 400))
+    if subtype == "compact_boundary":
+        return ("compact_boundary", _clip(str(row.get("content") or "conversation compacted"), 400))
+    if subtype == "scheduled_task_fire":
+        return ("scheduled_task_fire", _clip(str(row.get("content") or "scheduled task fired"), 400))
+    if subtype == "stop_hook_summary":
+        parts = [f"stop hook · {int(row.get('hookCount') or 0)} hook{'s' if int(row.get('hookCount') or 0) != 1 else ''}"]
+        level = row.get("level")
+        if isinstance(level, str) and level:
+            parts.append(level)
+        if row.get("preventedContinuation"):
+            parts.append("blocked continuation")
+        return ("stop_hook_summary", " · ".join(parts))
+    if subtype == "turn_duration":
+        duration = _format_duration_ms(row.get("durationMs")) or "0s"
+        count = row.get("messageCount")
+        text = f"turn duration · {duration}"
+        if isinstance(count, int):
+            text += f" · {count} messages"
+        return ("turn_duration", text)
+    if subtype == "informational":
+        return ("informational", _clip(str(row.get("content") or "informational"), 400))
+    if subtype == "local_command":
+        name = _xml_tag(str(row.get("content") or ""), "command-name") or "local command"
+        args = _xml_tag(str(row.get("content") or ""), "command-args") or ""
+        return ("local_command", f"{name} {args}".strip())
+    if subtype == "away_summary":
+        return ("away_summary", _clip(str(row.get("content") or "away summary"), 400))
+    return None
+
+
+def _claude_permission_text(row: dict) -> str:
+    mode = row.get("permissionMode") or "unknown"
+    label = str(mode)
+    if label == "bypassPermissions":
+        label = "bypass permissions"
+    return f"permissions · {label}"
+
+
+def _emit_question_events(state: dict, ts: str | None, questions: list[dict], tool_use_id: str) -> None:
+    pending_questions: dict = state.setdefault("pending_questions", {})
+    refs: list[dict] = []
+    for entry in questions:
+        if not isinstance(entry, dict):
+            continue
+        options = [
+            str(option.get("label") or "")
+            for option in (entry.get("options") or [])
+            if isinstance(option, dict) and str(option.get("label") or "")
+        ]
+        event = {
+            "kind": "question",
+            "ts": ts,
+            "text": str(entry.get("question") or "").strip(),
+            "question": {
+                "prompt": str(entry.get("question") or "").strip(),
+                "header": str(entry.get("header") or "").strip() or None,
+                "options": options,
+                "answered_option": None,
+                "custom_reply": None,
+            },
+        }
+        refs.append(_append_event(state, event))
+    if refs:
+        pending_questions[tool_use_id] = refs
+
+
+def _apply_question_answers(state: dict, tool_use_id: str, result: str) -> None:
+    refs = state.get("pending_questions", {}).pop(tool_use_id, None)
+    if not refs:
+        return
+    prefix = "Your questions have been answered: "
+    suffix = ". You can now continue with these answers in mind."
+    body = result.strip()
+    if body.startswith(prefix):
+        body = body[len(prefix):]
+    if body.endswith(suffix):
+        body = body[: -len(suffix)]
+    changed_indices: list[int] = []
+    cursor = 0
+    for idx, event in enumerate(refs):
+        question = (event.get("question") or {}).get("prompt") or ""
+        marker = f'"{question}"='
+        start = body.find(marker, cursor)
+        if start < 0:
+            continue
+        value_start = start + len(marker)
+        next_start = len(body)
+        for next_event in refs[idx + 1 :]:
+            next_question = (next_event.get("question") or {}).get("prompt") or ""
+            candidate = body.find(f', "{next_question}"=', value_start)
+            if candidate >= 0:
+                next_start = candidate
+                break
+        raw_value = body[value_start:next_start].strip().rstrip(",")
+        if raw_value.startswith('"') and raw_value.endswith('"') and len(raw_value) >= 2:
+            raw_value = raw_value[1:-1]
+        raw_value = raw_value.strip()
+        question_meta = event.get("question") or {}
+        options = question_meta.get("options") or []
+        answered_option = next((i for i, label in enumerate(options) if label == raw_value), None)
+        question_meta["answered_option"] = answered_option
+        question_meta["custom_reply"] = None if answered_option is not None else (raw_value or None)
+        changed_indices.append(int(event["id"]) - int(state.get("base", 0)))
+        cursor = next_start
+    for changed_index in changed_indices:
+        if 0 <= changed_index < len(state["events"]):
+            _mark_tail_changed(state, changed_index)
+
+
+def _tool_reference_event(ts: str | None, tool_name: str) -> dict:
+    return _marker_event(ts, f"tool reference · {tool_name}", "tool_reference")
+
+
+def _render_claude_result_text(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                text = block.get("text")
+                if isinstance(text, str) and text:
+                    parts.append(text)
+            elif block.get("type") == "tool_reference":
+                name = block.get("tool_name") or "unknown tool"
+                parts.append(f"Tool reference: {name}")
+        return "\n".join(parts)
+    return json.dumps(content) if content is not None else ""
 
 
 def _emit_tasks(state: dict, ts: str | None) -> None:
@@ -862,7 +1166,6 @@ def _assemble_user_content(content: list) -> str:
 
 
 def _claude_apply(state: dict, row: dict) -> None:
-    events: list = state["events"]
     pending: dict = state["pending"]  # tool_use id → event
     rtype = row.get("type")
     ts = row.get("timestamp")
@@ -875,32 +1178,55 @@ def _claude_apply(state: dict, row: dict) -> None:
             if state.get("pr") != info:
                 state["pr"] = info
                 _append_event(state, {"kind": "pr", "ts": ts, "text": f"PR #{number}", "pr": info})
+        _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
+        return
+
+    if rtype in _CLAUDE_IGNORED_TYPES:
+        _record_row_disposition(state, EVENT_DISPOSITION_IGNORED)
+        return
+
+    if rtype == "custom-title":
+        title = row.get("customTitle")
+        if isinstance(title, str) and title.strip():
+            state.setdefault("session_meta", {})["custom_title"] = title.strip()
+        _record_row_disposition(state, EVENT_DISPOSITION_SUMMARIZED)
+        return
+
+    if rtype == "agent-name":
+        agent_name = row.get("agentName")
+        if isinstance(agent_name, str) and agent_name.strip():
+            state.setdefault("session_meta", {})["agent_name"] = agent_name.strip()
+        _record_row_disposition(state, EVENT_DISPOSITION_SUMMARIZED)
+        return
+
+    if rtype == "permission-mode":
+        _append_event(state, _marker_event(ts, _claude_permission_text(row), "permission-mode"))
+        _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
+        return
+
+    if rtype == "progress":
+        _append_event(state, _marker_event(ts, _claude_progress_text(row), "progress"))
+        _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
         return
 
     if rtype == "system":
-        label = _SYSTEM_MARKERS.get(row.get("subtype"))
-        if label:
-            error_raw = row.get("error")
-            error = error_raw if isinstance(error_raw, dict) else {}
-            detail = row.get("content") or error.get("formatted") or error.get("message")
-            text = f"{label}: {detail}" if detail else label
-            _append_event(
-                state,
-                {
-                    "kind": "marker",
-                    "ts": ts,
-                    "text": _clip(str(text), 400),
-                    "marker": row.get("subtype"),
-                },
-            )
+        rendered = _claude_system_text(row)
+        if rendered:
+            subtype, text = rendered
+            _append_event(state, _marker_event(ts, text, subtype))
+            _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
+        else:
+            _record_row_disposition(state, EVENT_DISPOSITION_UNKNOWN)
         return
 
     if rtype == "attachment":
         attachment = row.get("attachment") or {}
         if attachment.get("type") != "task_reminder":
+            _record_row_disposition(state, EVENT_DISPOSITION_UNKNOWN)
             return
         content = attachment.get("content")
         if not isinstance(content, list):
+            _record_row_disposition(state, EVENT_DISPOSITION_UNKNOWN)
             return
         new_tasks: list = []
         for entry in content:
@@ -919,13 +1245,17 @@ def _claude_apply(state: dict, row: dict) -> None:
                 task["activeForm"] = active_form
         state["tasks"] = new_tasks
         _emit_tasks(state, ts)
+        _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
         return
 
     if rtype not in ("user", "assistant"):
+        _record_row_disposition(state, EVENT_DISPOSITION_UNKNOWN)
         return
     if rtype == "user" and row.get("isMeta"):
+        _record_row_disposition(state, EVENT_DISPOSITION_IGNORED)
         return  # injected context wrapping — not a real user message
     if row.get("isSidechain") and not state.get("sidechain_ok"):
+        _record_row_disposition(state, EVENT_DISPOSITION_IGNORED)
         return
     message = row.get("message") or {}
     content = message.get("content")
@@ -933,8 +1263,12 @@ def _claude_apply(state: dict, row: dict) -> None:
         if rtype == "user" and content.strip():
             for event in _claude_user_events(content, ts):
                 _append_claude_user(state, event, row)
+            _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
+        else:
+            _record_row_disposition(state, EVENT_DISPOSITION_UNKNOWN)
         return
     if not isinstance(content, list):
+        _record_row_disposition(state, EVENT_DISPOSITION_UNKNOWN)
         return
     if rtype == "user" and any(
         isinstance(b, dict) and b.get("type") in ("text", "image") for b in content
@@ -943,6 +1277,7 @@ def _claude_apply(state: dict, row: dict) -> None:
         if assembled.strip():
             for event in _claude_user_events(assembled, ts):
                 _append_claude_user(state, event, row)
+    rendered = False
     for block in content:
         if not isinstance(block, dict):
             continue
@@ -954,64 +1289,95 @@ def _claude_apply(state: dict, row: dict) -> None:
                     pass  # handled by _assemble_user_content above
                 else:
                     _append_event(state, {"kind": "assistant", "ts": ts, "text": _clip(text, MAX_TEXT)})
+                    rendered = True
         elif btype == "thinking":
             _append_event(
                 state,
                 {"kind": "thinking", "ts": ts, "text": _clip(block.get("thinking") or "", MAX_TEXT)},
             )
+            rendered = True
 
         elif btype == "tool_use":
             name = block.get("name") or "tool"
             raw_input = block.get("input")
-            tool_input = _codex_tool_input(name, raw_input)
-            archetype, summary = classify_tool(name, tool_input)
-            event = {
-                "kind": "tool",
-                "ts": ts,
-                "text": "",
-                "tool": {
-                    "name": name,
-                    "input": tool_input,
-                    "output": None,
-                    "ok": None,
-                    "archetype": archetype,
-                    "summary": summary,
-                },
-            }
-            if name in ("Agent", "Task") and isinstance(raw_input, dict):
-                prompt = raw_input.get("prompt")
-                if isinstance(prompt, str):
-                    event["tool"]["prompt_head"] = prompt[:120]
-            _append_event(state, event)
-            if block.get("id"):
-                pending[block["id"]] = event
-                if name == "TaskCreate" and isinstance(raw_input, dict):
-                    state.setdefault("task_inputs", {})[block["id"]] = {
-                        "kind": "create",
-                        "subject": raw_input.get("subject") or "",
-                        "activeForm": raw_input.get("activeForm"),
-                    }
-                elif name == "TaskUpdate" and isinstance(raw_input, dict):
-                    state.setdefault("task_inputs", {})[block["id"]] = {
-                        "kind": "update",
-                        "taskId": raw_input.get("taskId"),
-                        "status": raw_input.get("status"),
-                    }
+            block_id = block.get("id")
+            if name == "AskUserQuestion" and isinstance(raw_input, dict) and block_id:
+                _emit_question_events(state, ts, raw_input.get("questions") or [], block_id)
+                rendered = True
+            else:
+                tool_input = _codex_tool_input(name, raw_input)
+                archetype, summary = classify_tool(name, tool_input)
+                event = {
+                    "kind": "tool",
+                    "ts": ts,
+                    "text": "",
+                    "tool": {
+                        "name": name,
+                        "input": tool_input,
+                        "output": None,
+                        "ok": None,
+                        "archetype": archetype,
+                        "summary": summary,
+                    },
+                }
+                if name in ("Agent", "Task") and isinstance(raw_input, dict):
+                    prompt = raw_input.get("prompt")
+                    if isinstance(prompt, str):
+                        event["tool"]["prompt_head"] = prompt[:120]
+                _append_event(state, event)
+                rendered = True
+                if block_id:
+                    pending[block_id] = event
+                    if name == "TaskCreate" and isinstance(raw_input, dict):
+                        state.setdefault("task_inputs", {})[block_id] = {
+                            "kind": "create",
+                            "subject": raw_input.get("subject") or "",
+                            "activeForm": raw_input.get("activeForm"),
+                        }
+                    elif name == "TaskUpdate" and isinstance(raw_input, dict):
+                        state.setdefault("task_inputs", {})[block_id] = {
+                            "kind": "update",
+                            "taskId": raw_input.get("taskId"),
+                            "status": raw_input.get("status"),
+                        }
         elif btype == "tool_result":
             tool_use_id = block.get("tool_use_id")
+            if tool_use_id and isinstance(block.get("content"), str):
+                _apply_question_answers(state, tool_use_id, block.get("content") or "")
+                rendered = True
             event = pending.pop(tool_use_id, None)
             if event:
                 result = block.get("content")
-                if isinstance(result, list):
-                    result = "\n".join(
-                        b.get("text", "") for b in result if isinstance(b, dict) and b.get("type") == "text"
-                    )
-                event["tool"]["output"] = _clip(str(result or ""), MAX_TOOL_IO)
+                event["tool"]["output"] = _clip(_render_claude_result_text(result), MAX_TOOL_IO)
                 event["tool"]["ok"] = not block.get("is_error")
                 _record_tool_patch(state, event)
+                rendered = True
             task_meta = state.get("task_inputs", {}).pop(tool_use_id, None) if tool_use_id else None
             if task_meta:
                 _apply_task_delta(state, row, task_meta, ts)
+                rendered = True
+            for result_block in block.get("content") or [] if isinstance(block.get("content"), list) else []:
+                if isinstance(result_block, dict) and result_block.get("type") == "tool_reference":
+                    name = str(result_block.get("tool_name") or "unknown tool")
+                    _append_event(state, _tool_reference_event(ts, name))
+                    rendered = True
+        elif btype == "tool_reference":
+            name = str(block.get("tool_name") or "unknown tool")
+            _append_event(state, _tool_reference_event(ts, name))
+            rendered = True
+        elif btype == "image":
+            source = block.get("source") or {}
+            if source.get("type") == "base64":
+                name = cache_image(source.get("media_type") or "", source.get("data") or "")
+                if name:
+                    _append_event(state, {"kind": "image", "ts": ts, "text": f"/api/transcript-images/{name}"})
+                    rendered = True
+    _record_row_disposition(
+        state,
+        EVENT_DISPOSITION_RENDERED if rendered or (rtype == "user" and any(
+            isinstance(b, dict) and b.get("type") in ("text", "image") for b in content
+        )) else EVENT_DISPOSITION_UNKNOWN,
+    )
 
 
 # ---------------------------------------------------------------- incremental cache
@@ -1037,6 +1403,7 @@ def _new_parse_state(fmt: str) -> dict:
         "buffer": "",
         "events": [],
         "pending": {},
+        "pending_questions": {},
         "tokens": None,
         "base": 0,
         "next_event_id": 0,
@@ -1048,9 +1415,11 @@ def _new_parse_state(fmt: str) -> dict:
         "tasks": [],
         "tasks_key": (),
         "pr": None,
+        "session_meta": {},
         "task_inputs": {},
         "task_activeform": {},
         "dedupe_credits": {},
+        "dispositions": {"rendered": 0, "summarized": 0, "ignored": 0, "unknown": 0},
     }
 
 
@@ -1133,6 +1502,8 @@ def read_session_events(fmt: str, path: Path) -> dict:
             "tokens": state["tokens"],
             "tasks": deepcopy(state.get("tasks") or []),
             "pr": deepcopy(state.get("pr")),
+            "session_meta": deepcopy(state.get("session_meta") or {}),
+            "dispositions": dict(state.get("dispositions") or {}),
             "dirty_from": dirty_from,
             "cursor": state.get("cursor", 0),
         }
@@ -1166,6 +1537,8 @@ def read_session_delta(fmt: str, path: Path, cursor: int = 0) -> dict:
                 "tokens": state["tokens"],
                 "tasks": tasks,
                 "pr": pr,
+                "session_meta": deepcopy(state.get("session_meta") or {}),
+                "dispositions": dict(state.get("dispositions") or {}),
                 "cursor": current_cursor,
                 "tail_from": base,
                 "patches": [],
@@ -1187,6 +1560,8 @@ def read_session_delta(fmt: str, path: Path, cursor: int = 0) -> dict:
                 "tokens": state["tokens"],
                 "tasks": tasks,
                 "pr": pr,
+                "session_meta": deepcopy(state.get("session_meta") or {}),
+                "dispositions": dict(state.get("dispositions") or {}),
                 "cursor": current_cursor,
                 "tail_from": base,
                 "patches": [],
@@ -1214,6 +1589,8 @@ def read_session_delta(fmt: str, path: Path, cursor: int = 0) -> dict:
             "tokens": state["tokens"],
             "tasks": tasks,
             "pr": pr,
+            "session_meta": deepcopy(state.get("session_meta") or {}),
+            "dispositions": dict(state.get("dispositions") or {}),
             "cursor": current_cursor,
             "tail_from": tail_from,
             "patches": patches,
