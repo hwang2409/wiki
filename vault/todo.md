@@ -9,6 +9,7 @@ updated: 2026-07-09
 Todo:
 
 - [P2] WIKI-35: agent session view surfaces status-file state — state badge + blocker banner in agent-session-surface header (blocked/merge-ready visible without going back to /agents); data already in /api/agents
+- [P1] [WIKI] worker mapping fixes from 07-09 phoebe churn: watchdog revived DEREGISTERED tickets (PHO-13279/13281 zombies at $HOME, no worktree); revivals skipped 'wiki agent update' so registry window ids went stale; revived-without-session-id workers fall back to worktree discovery — mapping wrong in app UI. Fix: watchdog must (1) skip tickets absent from registry, (2) spawn at registry worktree cwd, (3) run agent update --window --session after every revival, (4) WIKI-34 reset parse
 
 In Progress:
 
