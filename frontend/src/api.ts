@@ -56,6 +56,11 @@ export function getLinks() {
 
 export type AgentSession = {
   window: string | null;
+  run_id?: string | null;
+  runtime_state?: string | null;
+  control_attached?: boolean;
+  provider_session_id?: string | null;
+  provider_pid?: number | null;
   kind: string | null;
   role: string | null;
   model: string | null;
@@ -126,9 +131,10 @@ export type SpawnWorkerInput = {
 };
 
 export type SpawnWorkerResult = {
-  window: string;
-  log: string;
-  prompt_path: string;
+  window: string | null;
+  run_id: string;
+  log: string | null;
+  prompt_path: string | null;
 };
 
 export function spawnAgentWorker(body: SpawnWorkerInput) {
@@ -164,9 +170,10 @@ export function spawnAgentOrchestrator(body: SpawnOrchestratorInput) {
 export type ReplaceAgentResult = {
   id: string;
   type: "worker" | "orchestrator";
-  window: string;
-  log: string;
-  prompt_path: string;
+  window: string | null;
+  run_id?: string;
+  log: string | null;
+  prompt_path: string | null;
   model?: string;
   registration?: unknown;
 };

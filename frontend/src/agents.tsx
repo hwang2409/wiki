@@ -39,9 +39,10 @@ const REASONING_EFFORTS: SpawnWorkerEffort[] = ["minimal", "low", "medium", "hig
 type WorkerSpawnNotice = {
   kind: "worker";
   ticket: string;
-  window: string;
-  log: string;
-  promptPath: string;
+  window: string | null;
+  runId: string;
+  log: string | null;
+  promptPath: string | null;
 };
 
 type OrchestratorSpawnNotice = {
@@ -78,6 +79,7 @@ function stateLabel(worker: AgentWorker): string {
 
 function healthFlag(worker: AgentWorker): string | null {
   if (!worker.registered) return "unregistered — status file without registry entry";
+  if (worker.run_id && !worker.control_attached) return "supervisor control is not attached";
   if (worker.window && !worker.window_alive) return "window gone — worker died or wrapped up?";
   if ((worker.status_age_seconds ?? 0) > STALE_SECONDS && worker.state === "working")
     return "status stale >5m";
@@ -182,6 +184,7 @@ function SpawnWorkerModal({
         kind: "worker",
         ticket: normalizedTicket,
         window: result.window,
+        runId: result.run_id,
         log: result.log,
         promptPath: result.prompt_path,
       });
@@ -784,7 +787,7 @@ export function AgentsView({
       <button
         className={`agent-replace-button${confirming ? " is-confirming" : ""}`}
         disabled={disabled || Boolean(replacePending)}
-        title={disabled ? "Registered window is not live" : "Kill this run and spawn a replacement"}
+        title={disabled ? "Registered runtime is not live" : "Stop this run and spawn a replacement"}
         type="button"
         onClick={() => {
           void requestReplace(id);
@@ -837,6 +840,11 @@ export function AgentsView({
               tmux {worker.window}
             </span>
           ) : null}
+          {worker.run_id ? (
+            <span className={`agent-window${worker.control_attached ? "" : " is-dead"}`}>
+              run {worker.run_id.slice(0, 8)} · {worker.runtime_state ?? "unknown"}
+            </span>
+          ) : null}
           {worker.session && worker.history.length > 0 ? (
             <span className="agent-chain">
               session {worker.session} · prev:{" "}
@@ -870,7 +878,10 @@ export function AgentsView({
             </button>
           ) : null}
           <span className="agent-actions">
-            <ReplaceButton id={worker.ticket} disabled={!worker.window || !worker.window_alive} />
+            <ReplaceButton
+              id={worker.ticket}
+              disabled={!worker.run_id && (!worker.window || !worker.window_alive)}
+            />
             <button
               className={`agent-log-toggle${isOpen ? " is-active" : ""}`}
               type="button"
@@ -1046,8 +1057,13 @@ export function AgentsView({
         {spawnNotice ? (
           spawnNotice.kind === "worker" ? (
             <div className="agents-notice">
-              spawned <code>{spawnNotice.ticket}</code> in <code>{spawnNotice.window}</code> · log{" "}
-              <code>{spawnNotice.log}</code>
+              spawned <code>{spawnNotice.ticket}</code> as run{" "}
+              <code>{spawnNotice.runId.slice(0, 8)}</code>
+              {spawnNotice.log ? (
+                <>
+                  {" "}· log <code>{spawnNotice.log}</code>
+                </>
+              ) : null}
             </div>
           ) : (
             <div className="agents-notice">
@@ -1057,8 +1073,22 @@ export function AgentsView({
         ) : null}
         {replaceNotice ? (
           <div className="agents-notice">
-            replaced <code>{replaceNotice.id}</code> · new tmux <code>{replaceNotice.window}</code> · log{" "}
-            <code>{replaceNotice.log}</code>
+            replaced <code>{replaceNotice.id}</code>
+            {replaceNotice.run_id ? (
+              <>
+                {" "}· run <code>{replaceNotice.run_id.slice(0, 8)}</code>
+              </>
+            ) : null}
+            {replaceNotice.window ? (
+              <>
+                {" "}· tmux <code>{replaceNotice.window}</code>
+              </>
+            ) : null}
+            {replaceNotice.log ? (
+              <>
+                {" "}· log <code>{replaceNotice.log}</code>
+              </>
+            ) : null}
           </div>
         ) : null}
         {replaceError ? <div className="agents-notice is-error">{replaceError}</div> : null}

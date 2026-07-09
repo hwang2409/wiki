@@ -11,7 +11,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from backend.app.agent_runtime.client import SupervisorClient, SupervisorUnavailable
+from backend.app.agent_runtime.client import (
+    SupervisorClient,
+    SupervisorRemoteError,
+    SupervisorUnavailable,
+)
 from backend.app.agent_runtime.codex import CodexAppServerAdapter
 from backend.app.agent_runtime.fake import CodexFixtureAdapter, FixtureAdapterFactory
 from backend.app.agent_runtime.process import ProviderProcessIdentity
@@ -1236,6 +1240,24 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(queued["status"], "queued")
         self.assertEqual(queued["messages"][0]["text"], "later")
+        listed_queue = await asyncio.to_thread(self.client.queue, "WIKI-42")
+        self.assertEqual(listed_queue, {"messages": queued["messages"]})
+        emptied = await asyncio.to_thread(
+            self.client.delete_queued,
+            "WIKI-42",
+            0,
+        )
+        self.assertEqual(emptied, {"messages": []})
+        with self.assertRaises(SupervisorRemoteError) as missing:
+            await asyncio.to_thread(self.client.delete_queued, "WIKI-42", 0)
+        self.assertEqual(missing.exception.error_type, "RunNotFound")
+
+        runs = await asyncio.to_thread(self.client.request, "run/list")
+        current = next(
+            run for run in runs["runs"] if run["run_id"] == started["run_id"]
+        )
+        self.assertTrue(current["control_attached"])
+        self.assertTrue(current["provider_alive"])
         await stream.aclose()
 
     async def test_server_accepts_existing_prompt_contract_above_default_reader_limit(

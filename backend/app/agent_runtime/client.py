@@ -21,7 +21,9 @@ class SupervisorUnavailable(RuntimeError):
 
 
 class SupervisorRemoteError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, error_type: str | None = None):
+        super().__init__(message)
+        self.error_type = error_type
 
 
 class SupervisorClient:
@@ -50,7 +52,10 @@ class SupervisorClient:
             raise SupervisorRemoteError("supervisor response id mismatch")
         if "error" in response:
             error = response["error"]
-            raise SupervisorRemoteError(str(error.get("message") or error))
+            raise SupervisorRemoteError(
+                str(error.get("message") or error),
+                error_type=error.get("type") if isinstance(error, dict) else None,
+            )
         return response.get("result")
 
     def ping(self) -> dict[str, Any]:
@@ -63,6 +68,17 @@ class SupervisorClient:
             raise ValueError("mode must be now or on-idle")
         method = "run/send_now" if mode == "now" else "run/send_on_idle"
         return dict(self.request(method, {"agent_id": agent_id, "text": text}))
+
+    def queue(self, agent_id: str) -> dict[str, Any]:
+        return dict(self.request("run/queue", {"agent_id": agent_id}))
+
+    def delete_queued(self, agent_id: str, index: int) -> dict[str, Any]:
+        return dict(
+            self.request(
+                "run/queue/delete",
+                {"agent_id": agent_id, "index": index},
+            )
+        )
 
     async def subscribe_events(self) -> AsyncGenerator[dict[str, Any], None]:
         reader, writer = await asyncio.open_unix_connection(

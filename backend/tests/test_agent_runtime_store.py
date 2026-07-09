@@ -259,6 +259,40 @@ class RunStoreTests(unittest.TestCase):
             self.assertIsNone(current["window"])
             self.assertEqual(current["log"], str(store.raw_events_path(record.run_id)))
 
+    def test_create_archives_stale_legacy_current_during_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            paths.registry_path.parent.mkdir(parents=True)
+            paths.registry_path.write_text(
+                json.dumps(
+                    {
+                        "WIKI-42": {
+                            "history": [],
+                            "current": {
+                                "window": "@9999",
+                                "kind": "cdx",
+                                "role": "implement",
+                                "model": "legacy",
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            store = RunStore(paths)
+            with self.assertRaisesRegex(StoreConflict, "explicit migration"):
+                store.create(_record(root))
+            record = store.create(_record(root), migrate_legacy=True)
+            registry = json.loads(paths.registry_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(registry["WIKI-42"]["current"]["run_id"], record.run_id)
+            legacy = registry["WIKI-42"]["history"][0]
+            self.assertEqual(legacy["window"], "@9999")
+            self.assertEqual(legacy["outcome"], "handoff")
+            self.assertEqual(legacy["migration"], "headless-supervisor")
+
     def test_restart_repairs_crash_stale_counts_and_truncated_tail(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

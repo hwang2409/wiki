@@ -9,6 +9,7 @@ import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,6 +18,12 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from . import accounts, agent_replace, github_pr, terminal, tokens, transcripts, uistate, vaultops
+from .agent_runtime.client import (
+    SupervisorClient,
+    SupervisorRemoteError,
+    SupervisorUnavailable,
+)
+from .agent_runtime.store import RuntimePaths
 from .frontend_static import mount_frontend_static
 
 
@@ -325,6 +332,7 @@ AGENT_ARCHIVE_DIR = Path(
     os.environ.get("WIKI_AGENT_ARCHIVE_DIR") or Path.home() / "me" / "fun" / "agent-archive"
 )
 AGENT_TMP_DIR = Path(os.environ.get("WIKI_AGENT_TMP_DIR") or "/tmp")
+SUPERVISOR_CLIENT = SupervisorClient(RuntimePaths.from_env())
 ARCHIVE_TS_PATTERN = re.compile(r"^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})$")
 ANSI_PATTERN = re.compile(
     r"\x1b\[[0-9;?]*[ -/]*[@-~]"  # CSI incl. space-intermediate forms (e.g. ESC[0 q)
@@ -486,15 +494,62 @@ def agents() -> dict[str, object]:
     except (OSError, ValueError):
         pass
 
-    live_windows = tmux_live_windows()
+    legacy_windows: set[str] = set()
+    headless_ids: set[str] = set()
+    for ticket, entry in registry.items():
+        if ticket.startswith("_") or not isinstance(entry, dict):
+            continue
+        current = entry.get("current")
+        if not isinstance(current, dict):
+            continue
+        if _is_headless(current):
+            headless_ids.add(current["run_id"])
+        elif isinstance(current.get("window"), str):
+            legacy_windows.add(current["window"])
+    legacy_windows.update(
+        orch.get("window")
+        for orch in (registry.get("_orchestrators") or {}).values()
+        if isinstance(orch, dict) and isinstance(orch.get("window"), str)
+    )
+    live_windows = tmux_live_windows() if legacy_windows else set()
+    runtime_by_id: dict[str, dict] = {}
+    supervisor_health: dict[str, object] = {
+        "status": "not-needed" if not headless_ids else "unavailable",
+        "runs": len(headless_ids),
+    }
+    if headless_ids:
+        try:
+            runtime_result = _supervisor_request("run/list")
+            runtime_rows = (
+                runtime_result.get("runs", [])
+                if isinstance(runtime_result, dict)
+                else []
+            )
+            runtime_by_id = {
+                row["run_id"]: row
+                for row in runtime_rows
+                if isinstance(row, dict)
+                and isinstance(row.get("run_id"), str)
+                and row["run_id"] in headless_ids
+            }
+            supervisor_health["status"] = "ready"
+            supervisor_health["pid"] = runtime_result.get("pid")
+        except (HTTPException, SupervisorUnavailable, SupervisorRemoteError) as exc:
+            supervisor_health["detail"] = str(exc.detail if isinstance(exc, HTTPException) else exc)
     now = datetime.now(tz=timezone.utc).timestamp()
     workers = []
     seen_tickets = set()
 
     for ticket, entry in sorted(registry.items()):
-        if ticket.startswith("_"):
+        if ticket.startswith("_") or not isinstance(entry, dict):
             continue
         current = entry.get("current") or {}
+        if not isinstance(current, dict):
+            continue
+        headless = _is_headless(current)
+        runtime = runtime_by_id.get(current.get("run_id"), current) if headless else {}
+        runtime_state = runtime.get("state") if headless else None
+        control_attached = bool(runtime.get("control_attached")) if headless else False
         status = read_agent_status(ticket)
         seen_tickets.add(ticket)
         workers.append(
@@ -502,7 +557,16 @@ def agents() -> dict[str, object]:
                 "ticket": ticket,
                 "registered": True,
                 "window": current.get("window"),
-                "window_alive": current.get("window") in live_windows,
+                "window_alive": (
+                    control_attached
+                    if headless
+                    else current.get("window") in live_windows
+                ),
+                "run_id": current.get("run_id"),
+                "runtime_state": runtime_state,
+                "control_attached": control_attached,
+                "provider_session_id": current.get("provider_session_id"),
+                "provider_pid": runtime.get("provider_pid") if headless else None,
                 "kind": current.get("kind"),
                 "role": current.get("role"),
                 "model": current.get("model"),
@@ -512,7 +576,7 @@ def agents() -> dict[str, object]:
                 "session": current.get("session"),
                 "spawned_at": current.get("spawned_at"),
                 "history": entry.get("history", []),
-                "state": (status or {}).get("state"),
+                "state": (status or {}).get("state") or runtime_state,
                 "pr": (status or {}).get("pr"),
                 "step": (status or {}).get("step"),
                 "blocker": (status or {}).get("blocker"),
@@ -569,7 +633,12 @@ def agents() -> dict[str, object]:
             }
         )
 
-    return {"workers": workers, "orchestrators": orchestrators, "archived": list_archived()}
+    return {
+        "workers": workers,
+        "orchestrators": orchestrators,
+        "archived": list_archived(),
+        "supervisor": supervisor_health,
+    }
 
 
 @app.get("/api/agents/{ticket}/pr")
@@ -613,6 +682,13 @@ def capture_pane_tail(window: str, lines: int) -> str | None:
     return "\n".join(cleaned).strip("\n")
 
 
+def _tail_text_file(path: Path, lines: int) -> str:
+    with path.open("rb") as handle:
+        handle.seek(max(0, path.stat().st_size - 400_000))
+        raw = handle.read().decode("utf-8", errors="replace")
+    return "\n".join(raw.splitlines()[-lines:])
+
+
 @app.get("/api/agents/{ticket}/log")
 def agent_log(ticket: str, lines: int = 200) -> dict[str, str]:
     if not TICKET_PATTERN.fullmatch(ticket):
@@ -626,6 +702,12 @@ def agent_log(ticket: str, lines: int = 200) -> dict[str, str]:
         pass
 
     current = (registry.get(ticket) or {}).get("current") or {}
+    if isinstance(current, dict) and _is_headless(current):
+        log_hint = current.get("log")
+        if not isinstance(log_hint, str) or not Path(log_hint).is_file():
+            raise HTTPException(status_code=404, detail="No supervisor event log found")
+        path = Path(log_hint)
+        return {"path": str(path), "tail": _tail_text_file(path, lines)}
     window = current.get("window")
     if window and re.fullmatch(r"@\d+", window) and window in tmux_live_windows():
         tail = capture_pane_tail(window, lines)
@@ -715,7 +797,7 @@ def _session_delta_payload(
     if include_subagents:
         payload["subagents"] = _active_subagents(path)
     if include_queue and ticket and TICKET_PATTERN.fullmatch(ticket):
-        payload["queue"] = _read_queue().get(ticket, [])
+        payload["queue"] = _queue_messages(ticket)
     return payload
 
 
@@ -757,7 +839,15 @@ def agent_session(
     if not current:
         kind, spawned_at, archive_dir = _archive_hint(ticket)
 
-    found = _session_paths.get(ticket)
+    found = None
+    if isinstance(current, dict) and _is_headless(current):
+        transcript_hint = current.get("transcript")
+        if isinstance(transcript_hint, str):
+            found = _direct_transcript_session(Path(transcript_hint))
+            if found is not None:
+                _session_paths[ticket] = found
+    if found is None:
+        found = _session_paths.get(ticket)
     if found is None or not found[1].is_file():
         found = transcripts.find_session(kind, ticket, spawned_at, registry_session_id, current.get("worktree"))
         if found:
@@ -801,9 +891,15 @@ def agent_session(
 
 
 def _transcript_working(path: Path, ticket: str | None = None) -> bool:
-    """Pane spinner is authoritative (transcript writes gap during long tool calls);
-    mtime is the fallback when there's no live window."""
+    """Use supervisor lifecycle, then legacy pane spinner, then transcript mtime."""
     if ticket:
+        resolved = _registry_agent(_read_agent_registry(), ticket)
+        if resolved is not None and _is_headless(resolved[2]):
+            return resolved[2].get("state") in {
+                "starting",
+                "working",
+                "waiting-approval",
+            }
         window = resolve_window(ticket)
         if window:
             pane = capture_pane_tail(window, 20)
@@ -833,6 +929,7 @@ SUBAGENT_ID_PATTERN = re.compile(r"^[a-f0-9]{8,24}$")
 
 
 def _resolve_main_transcript(ticket: str) -> Path | None:
+    registry: dict = {}
     try:
         registry = json.loads(AGENT_REGISTRY_PATH.read_text(encoding="utf-8"))
         orch = (registry.get("_orchestrators") or {}).get(ticket)
@@ -843,6 +940,13 @@ def _resolve_main_transcript(ticket: str) -> Path | None:
         if found and found[0] == "claude":
             return found[1]
         return None
+    resolved = _registry_agent(registry if isinstance(registry, dict) else {}, ticket)
+    if resolved is not None and _is_headless(resolved[2]):
+        transcript_hint = resolved[2].get("transcript")
+        if isinstance(transcript_hint, str):
+            found = _direct_transcript_session(Path(transcript_hint))
+            if found and found[0] == "claude":
+                return found[1]
     found = _session_paths.get(ticket)
     return found[1] if found and found[0] == "claude" and found[1].is_file() else None
 
@@ -1023,6 +1127,62 @@ def _read_agent_registry() -> dict:
         return {}
 
 
+def _registry_agent(
+    registry: dict,
+    agent_id: str,
+) -> tuple[str, dict, dict] | None:
+    """Resolve one worker/headless orchestrator without guessing across entries."""
+
+    for candidate in (agent_id, agent_id.upper()):
+        entry = registry.get(candidate)
+        if not isinstance(entry, dict):
+            continue
+        current = entry.get("current")
+        if isinstance(current, dict):
+            return candidate, entry, current
+    return None
+
+
+def _is_headless(current: dict) -> bool:
+    return isinstance(current.get("run_id"), str) and bool(current["run_id"])
+
+
+def _supervisor_request(method: str, params: dict | None = None) -> Any:
+    """Call the durable supervisor and preserve useful HTTP error classes."""
+
+    try:
+        SUPERVISOR_CLIENT.ensure_running()
+        return SUPERVISOR_CLIENT.request(method, params)
+    except SupervisorUnavailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Agent supervisor is unavailable: {exc}",
+        ) from exc
+    except SupervisorRemoteError as exc:
+        status_code = {
+            "RunNotFound": 404,
+            "ValueError": 400,
+            "StoreConflict": 409,
+            "ProviderBusy": 409,
+            "ProviderProcessError": 409,
+        }.get(exc.error_type, 502)
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+
+
+def _headless_queue(ticket: str) -> list[dict[str, Any]]:
+    result = _supervisor_request("run/queue", {"agent_id": ticket})
+    if not isinstance(result, dict) or not isinstance(result.get("messages"), list):
+        raise HTTPException(status_code=502, detail="Agent supervisor returned a bad queue")
+    return [dict(message) for message in result["messages"] if isinstance(message, dict)]
+
+
+def _queue_messages(ticket: str) -> list[dict]:
+    resolved = _registry_agent(_read_agent_registry(), ticket)
+    if resolved is not None and _is_headless(resolved[2]):
+        return _headless_queue(resolved[0])
+    return list(_read_queue().get(ticket, []))
+
+
 def resolve_existing_dir(raw_path: str, *, field_name: str) -> Path:
     try:
         resolved = Path(raw_path).expanduser().resolve(strict=True)
@@ -1098,13 +1258,59 @@ def accept_claude_trust_prompt(window: str, *, timeout_seconds: float = 8.0) -> 
         time.sleep(0.25)
 
 
+def _headless_replacement_prompt(agent_id: str, current: dict) -> str:
+    status_path = AGENT_STATUS_DIR / f"{agent_id}.json"
+    role = current.get("role") or "worker"
+    return f"""You are the replacement {role} for {agent_id}.
+Your prior provider session was {current.get("provider_session_id") or "not recorded"}.
+
+Recover context from:
+- prior transcript: {current.get("transcript") or "not resolved"}
+- raw provider events: {current.get("log") or "not recorded"}
+- status file: {status_path}
+
+Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and status-file contract. Re-read the current ticket/PR state, update the status file before long operations, then continue from the last durable step.
+"""
+
+
 @app.post("/api/agents/{agent_id}/replace")
 def replace_agent(agent_id: str) -> dict[str, object]:
-    return agent_replace.replace_agent(agent_id)
+    raw_id = agent_id.strip()
+    if not raw_id or not (
+        TICKET_PATTERN.fullmatch(raw_id) or ORCH_ID_PATTERN.fullmatch(raw_id)
+    ):
+        raise HTTPException(status_code=400, detail="Bad agent id")
+    registry = _read_agent_registry()
+    resolved = _registry_agent(registry, raw_id)
+    if resolved is None or not _is_headless(resolved[2]):
+        return agent_replace.replace_agent(agent_id)
+
+    resolved_id, _, current = resolved
+    result = _supervisor_request(
+        "run/replace",
+        {
+            "run_id": current["run_id"],
+            "prompt": _headless_replacement_prompt(resolved_id, current),
+        },
+    )
+    if not isinstance(result, dict):
+        raise HTTPException(status_code=502, detail="Agent supervisor returned a bad run")
+    refreshed = _registry_agent(_read_agent_registry(), resolved_id)
+    registration = refreshed[2] if refreshed is not None else result
+    return {
+        "id": resolved_id,
+        "type": "orchestrator" if current.get("role") == "orchestrator" else "worker",
+        "window": None,
+        "run_id": result.get("run_id"),
+        "log": registration.get("log"),
+        "prompt_path": None,
+        "model": result.get("model"),
+        "registration": registration,
+    }
 
 
 @app.post("/api/agents/spawn")
-def spawn_agent(body: SpawnWorkerIn) -> dict[str, str]:
+def spawn_agent(body: SpawnWorkerIn) -> dict[str, object]:
     ticket = body.ticket.strip()
     if not ticket or not SPAWN_TICKET_PATTERN.fullmatch(ticket):
         raise HTTPException(status_code=400, detail="Ticket must be uppercase letters, numbers, or dashes")
@@ -1142,92 +1348,55 @@ def spawn_agent(body: SpawnWorkerIn) -> dict[str, str]:
     if orch:
         if not ORCH_ID_PATTERN.fullmatch(orch):
             raise HTTPException(status_code=400, detail="Orchestrator id is invalid")
-        if orch not in (registry.get("_orchestrators") or {}):
+        headless_orch = _registry_agent(registry, orch)
+        if orch not in (registry.get("_orchestrators") or {}) and not (
+            headless_orch is not None
+            and headless_orch[2].get("role") == "orchestrator"
+            and _is_headless(headless_orch[2])
+        ):
             raise HTTPException(status_code=400, detail="Orchestrator id is not registered")
 
     current = (registry.get(ticket) or {}).get("current") or {}
+    if isinstance(current, dict) and _is_headless(current):
+        raise HTTPException(
+            status_code=409,
+            detail=f"{ticket} already has a supervisor-owned run; use Replace",
+        )
     live_window = current.get("window")
     if isinstance(live_window, str) and live_window in tmux_live_windows():
         raise HTTPException(status_code=409, detail=f"{ticket} already has a live worker window")
 
-    prompt_path = AGENT_TMP_DIR / f"{kind}-{ticket}-prompt.md"
-    log_path = AGENT_TMP_DIR / f"{kind}-{ticket}.log"
     status_path = AGENT_STATUS_DIR / f"{ticket}.json"
     AGENT_STATUS_DIR.mkdir(parents=True, exist_ok=True)
-    AGENT_TMP_DIR.mkdir(parents=True, exist_ok=True)
     try:
         status_path.unlink(missing_ok=True)
-        log_path.unlink(missing_ok=True)
-        prompt_path.write_text(prompt if prompt.endswith("\n") else f"{prompt}\n", encoding="utf-8")
     except OSError as exc:
-        raise HTTPException(status_code=500, detail="Could not prepare worker files") from exc
+        raise HTTPException(status_code=500, detail="Could not reset worker status") from exc
 
-    prompt_shell = shlex.quote(str(prompt_path))
-    model_shell = shlex.quote(model)
-    if kind == "cdx":
-        effort_shell = shlex.quote(effort or "")
-        command = (
-            f'codex --yolo -m {model_shell} -c model_reasoning_effort={effort_shell} '
-            f'"$(cat {prompt_shell})"'
-        )
-    else:
-        command = f'claude --model {model_shell} --dangerously-skip-permissions "$(cat {prompt_shell})"'
-
-    window: str | None = None
-    try:
-        created = run_checked(
-            [
-                "tmux",
-                "new-window",
-                "-dP",
-                "-F",
-                "#{window_id}",
-                "-n",
-                f"{kind}:{ticket}",
-                "-c",
-                str(workdir_path),
-                command,
-            ],
-            timeout=10,
-            label="tmux new-window failed",
-        )
-        window = created.stdout.strip()
-        if not re.fullmatch(r"@\d+", window):
-            raise RuntimeError(f"tmux new-window failed: unexpected window id {window!r}")
-
-        run_checked(
-            ["tmux", "pipe-pane", "-t", window, "-o", f"cat >> {shlex.quote(str(log_path))}"],
-            timeout=5,
-            label="tmux pipe-pane failed",
-        )
-
-        register_args = [
-            str(ROOT_DIR / "wiki"),
-            "agent",
-            "register",
-            ticket,
-            "--window",
-            window,
-            "--kind",
-            kind,
-            "--role",
-            role,
-            "--model",
-            model,
-            "--worktree",
-            str(workdir_path),
-            "--log",
-            str(log_path),
-        ]
-        if orch:
-            register_args.extend(["--orch", orch])
-        run_checked(register_args, timeout=10, label="wiki agent register failed")
-    except RuntimeError as exc:
-        if window:
-            subprocess.run(["tmux", "kill-window", "-t", window], timeout=5, check=False)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    return {"window": window, "log": str(log_path), "prompt_path": str(prompt_path)}
+    result = _supervisor_request(
+        "run/start",
+        {
+            "agent_id": ticket,
+            "provider": "codex" if kind == "cdx" else "claude",
+            "role": role,
+            "model": model,
+            "effort": effort,
+            "worktree": str(workdir_path),
+            "prompt": prompt,
+            "orchestrator_id": orch or None,
+            "migrate_legacy": bool(current),
+        },
+    )
+    if not isinstance(result, dict):
+        raise HTTPException(status_code=502, detail="Agent supervisor returned a bad run")
+    refreshed = _registry_agent(_read_agent_registry(), ticket)
+    registration = refreshed[2] if refreshed is not None else {}
+    return {
+        "window": None,
+        "run_id": result.get("run_id"),
+        "log": registration.get("log"),
+        "prompt_path": None,
+    }
 
 
 @app.post("/api/agents/spawn-orchestrator")
@@ -1338,6 +1507,19 @@ def spawn_orchestrator(body: SpawnOrchestratorIn, background: BackgroundTasks) -
 def agent_message(ticket: str, body: MessageIn, background: BackgroundTasks) -> dict[str, object]:
     if not TICKET_PATTERN.fullmatch(ticket):
         raise HTTPException(status_code=400, detail="Bad ticket")
+    resolved = _registry_agent(_read_agent_registry(), ticket)
+    if resolved is not None and _is_headless(resolved[2]):
+        method = "run/send_now" if body.mode == "now" else "run/send_on_idle"
+        result = _supervisor_request(
+            method,
+            {"agent_id": resolved[0], "text": body.text},
+        )
+        if not isinstance(result, dict):
+            raise HTTPException(
+                status_code=502,
+                detail="Agent supervisor returned a bad message response",
+            )
+        return dict(result)
     window = resolve_window(ticket)
     if window is None:
         raise HTTPException(status_code=409, detail="No live tmux window for this agent")
@@ -1361,6 +1543,9 @@ def agent_message(ticket: str, body: MessageIn, background: BackgroundTasks) -> 
 def agent_queue(ticket: str) -> dict[str, object]:
     if not TICKET_PATTERN.fullmatch(ticket):
         raise HTTPException(status_code=400, detail="Bad ticket")
+    resolved = _registry_agent(_read_agent_registry(), ticket)
+    if resolved is not None and _is_headless(resolved[2]):
+        return {"messages": _headless_queue(resolved[0])}
     return {"messages": _read_queue().get(ticket, [])}
 
 
@@ -1368,6 +1553,18 @@ def agent_queue(ticket: str) -> dict[str, object]:
 def agent_queue_delete(ticket: str, index: int) -> dict[str, object]:
     if not TICKET_PATTERN.fullmatch(ticket):
         raise HTTPException(status_code=400, detail="Bad ticket")
+    resolved = _registry_agent(_read_agent_registry(), ticket)
+    if resolved is not None and _is_headless(resolved[2]):
+        result = _supervisor_request(
+            "run/queue/delete",
+            {"agent_id": resolved[0], "index": index},
+        )
+        if not isinstance(result, dict) or not isinstance(result.get("messages"), list):
+            raise HTTPException(
+                status_code=502,
+                detail="Agent supervisor returned a bad queue response",
+            )
+        return {"messages": list(result["messages"])}
     queue = _read_queue()
     messages = queue.get(ticket, [])
     if not 0 <= index < len(messages):
@@ -1439,10 +1636,41 @@ def _subscribe_agent_events() -> asyncio.Queue[dict]:
     return subscriber
 
 
+async def supervisor_event_bridge() -> None:
+    """Forward supervisor events without wrapping the established SSE dictionaries."""
+
+    while True:
+        try:
+            async for event in SUPERVISOR_CLIENT.subscribe_events():
+                ticket = event.get("ticket")
+                tickets = event.get("tickets")
+                changed = {
+                    value
+                    for value in (
+                        [ticket] if isinstance(ticket, str) else []
+                    )
+                    + (tickets if isinstance(tickets, list) else [])
+                    if isinstance(value, str)
+                }
+                _invalidate_session_paths(changed)
+                await publish_agent_event(event)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # The backend may start before the detached daemon. Spawn/control
+            # requests autostart it; this bridge reconnects without owning it.
+            pass
+        await asyncio.sleep(1)
+
+
+async def agent_runtime_dispatchers() -> None:
+    await asyncio.gather(message_dispatcher(), supervisor_event_bridge())
+
+
 @app.on_event("startup")
 async def _start_dispatcher() -> None:
     terminal.refresh_boot_token()
-    asyncio.create_task(message_dispatcher())
+    asyncio.create_task(agent_runtime_dispatchers())
     asyncio.create_task(accounts.watchdog_loop(publish_agent_event))
     asyncio.create_task(tokens.refresh_in_background())
 

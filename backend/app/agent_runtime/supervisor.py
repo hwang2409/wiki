@@ -79,6 +79,21 @@ class Supervisor:
         self.expected_stream_ends: set[int] = set()
         self.subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
 
+    def _runtime_status(self, record: RunRecord) -> dict[str, Any]:
+        value = _public_run(record)
+        adapter = self.adapters.get(record.run_id)
+        snapshot = adapter.snapshot() if adapter is not None else None
+        value["control_attached"] = adapter is not None
+        value["provider_alive"] = bool(
+            snapshot is not None
+            and snapshot.state not in {LifecycleState.DEAD, LifecycleState.COMPLETED}
+        )
+        if snapshot is not None:
+            value["state"] = snapshot.state.value
+            value["provider_pid"] = snapshot.pid
+            value["active_turn_id"] = snapshot.active_turn_id
+        return value
+
     def subscribe(self) -> asyncio.Queue[dict[str, Any]]:
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=256)
         self.subscribers.add(queue)
@@ -411,6 +426,7 @@ class Supervisor:
         prompt: str,
         effort: str | None = None,
         orchestrator_id: str | None = None,
+        migrate_legacy: bool = False,
     ) -> RunRecord:
         resolved = resolve_safe_worktree(worktree)
         record = RunRecord.new(
@@ -427,6 +443,7 @@ class Supervisor:
             return await self._start_run(
                 record=record,
                 prompt=prompt,
+                migrate_legacy=migrate_legacy,
             )
 
     async def _start_run(
@@ -434,8 +451,9 @@ class Supervisor:
         *,
         record: RunRecord,
         prompt: str,
+        migrate_legacy: bool = False,
     ) -> RunRecord:
-        self.store.create(record)
+        self.store.create(record, migrate_legacy=migrate_legacy)
         return await self._launch_record(record, prompt)
 
     async def _launch_record(self, record: RunRecord, prompt: str) -> RunRecord:
@@ -658,6 +676,18 @@ class Supervisor:
         if status.state is LifecycleState.IDLE:
             await self._deliver_next_queued_locked(run_id, adapter)
         return response
+
+    async def delete_queued(self, run_id: str, index: int) -> dict[str, Any]:
+        async with self._run_lock(run_id):
+            record = self.store.delete_queued_message(run_id, index)
+            await self._publish(
+                {
+                    "type": "session",
+                    "ticket": record.agent_id,
+                    "surface": "queue",
+                }
+            )
+            return {"messages": list(record.queued_messages)}
 
     async def interrupt(self, run_id: str) -> RunRecord:
         async with self._run_lock(run_id):
@@ -923,6 +953,9 @@ class Supervisor:
         if method == "ping":
             return {"status": "ok", "pid": os.getpid()}
         if method == "run/start":
+            migrate_legacy = params.get("migrate_legacy", False)
+            if not isinstance(migrate_legacy, bool):
+                raise ValueError("migrate_legacy must be a boolean")
             record = await self.start_run(
                 agent_id=str(params["agent_id"]),
                 provider=ProviderKind(params["provider"]),
@@ -932,12 +965,19 @@ class Supervisor:
                 prompt=str(params["prompt"]),
                 effort=params.get("effort"),
                 orchestrator_id=params.get("orchestrator_id"),
+                migrate_legacy=migrate_legacy,
             )
             return _public_run(record)
         if method == "run/list":
-            return {"runs": [_public_run(record) for record in self.store.list_runs()]}
+            return {
+                "status": "ok",
+                "pid": os.getpid(),
+                "runs": [
+                    self._runtime_status(record) for record in self.store.list_runs()
+                ],
+            }
         if method == "run/status":
-            return _public_run(self.store.get(self._resolve_run_id(params)))
+            return self._runtime_status(self.store.get(self._resolve_run_id(params)))
         if method == "run/resume":
             return _public_run(await self.resume_run(self._resolve_run_id(params)))
         if method == "run/send_now":
@@ -948,6 +988,14 @@ class Supervisor:
             return await self.send_on_idle(
                 self._resolve_run_id(params), str(params["text"])
             )
+        if method == "run/queue":
+            run_id = self._resolve_run_id(params)
+            return {"messages": self.store.queued_messages(run_id)}
+        if method == "run/queue/delete":
+            index = params.get("index")
+            if not isinstance(index, int) or isinstance(index, bool):
+                raise ValueError("queue index must be an integer")
+            return await self.delete_queued(self._resolve_run_id(params), index)
         if method == "run/interrupt":
             return _public_run(await self.interrupt(self._resolve_run_id(params)))
         if method == "run/stop":

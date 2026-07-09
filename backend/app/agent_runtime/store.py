@@ -442,13 +442,18 @@ class RunStore:
         if changed:
             self._write_registry(registry)
 
-    def create(self, record: RunRecord) -> RunRecord:
+    def create(self, record: RunRecord, *, migrate_legacy: bool = False) -> RunRecord:
         with self._lock:
             registry = self._read_registry()
             entry = registry.get(record.agent_id)
-            if isinstance(entry, dict) and isinstance(entry.get("current"), dict):
+            current = entry.get("current") if isinstance(entry, dict) else None
+            if isinstance(current, dict) and current.get("run_id"):
                 raise StoreConflict(
                     f"agent already has a current run: {record.agent_id}"
+                )
+            if isinstance(current, dict) and not migrate_legacy:
+                raise StoreConflict(
+                    f"agent has a legacy current run requiring explicit migration: {record.agent_id}"
                 )
             self._create_run_files(record)
             history = (
@@ -456,6 +461,19 @@ class RunStore:
                 if isinstance(entry, dict)
                 else []
             )
+            if isinstance(current, dict) and current:
+                # Mixed-fleet migration: the backend refuses a still-live
+                # legacy window before calling create(). A stale tmux-era
+                # current row is archived once, then the supervisor becomes
+                # the sole registry writer for this agent.
+                history.append(
+                    {
+                        **current,
+                        "outcome": current.get("outcome") or "handoff",
+                        "ended_at": current.get("ended_at") or utc_now(),
+                        "migration": "headless-supervisor",
+                    }
+                )
             registry[record.agent_id] = {
                 "history": history,
                 "current": self._registry_current(record),
@@ -720,6 +738,19 @@ class RunStore:
             if not record.queued_messages:
                 return None
             return dict(record.queued_messages[0])
+
+    def queued_messages(self, run_id: str) -> list[dict[str, str]]:
+        with self._lock:
+            return [dict(message) for message in self.get(run_id).queued_messages]
+
+    def delete_queued_message(self, run_id: str, index: int) -> RunRecord:
+        with self._lock:
+            record = self.get(run_id)
+            if not 0 <= index < len(record.queued_messages):
+                raise RunNotFound("no such queued message")
+            record.queued_messages.pop(index)
+            self._write_record(record)
+            return record
 
     def replace(
         self, old_run_id: str, new_record: RunRecord
