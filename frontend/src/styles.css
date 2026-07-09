@@ -720,6 +720,120 @@ body.is-resizing-panes .pane-cell {
   overflow-y: auto;
 }
 
+.terminal-pane {
+  background-color: var(--terminal-surface);
+}
+
+.terminal-pane-header {
+  align-items: center;
+  padding: 5px 10px;
+  border-bottom-color: var(--terminal-border);
+  background-color: var(--terminal-surface-alt);
+  color: var(--terminal-text);
+}
+
+.terminal-pane-title {
+  color: var(--terminal-text);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+}
+
+.terminal-pane-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.terminal-pane-chip,
+.terminal-pane-action,
+.terminal-pane-restart {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 24px;
+  padding: 0 8px;
+  border: 1px solid var(--terminal-border);
+  border-radius: 2px;
+  background-color: var(--terminal-surface);
+  color: var(--terminal-muted);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  text-transform: lowercase;
+}
+
+.terminal-pane-chip.is-live,
+.terminal-pane-chip.is-connecting {
+  color: var(--terminal-accent);
+}
+
+.terminal-pane-chip.is-ended {
+  color: var(--terminal-warning);
+}
+
+.terminal-pane-chip.is-error {
+  color: var(--terminal-danger);
+}
+
+.terminal-pane-action:hover,
+.terminal-pane-restart:hover {
+  border-color: var(--terminal-accent);
+  color: var(--terminal-text);
+}
+
+.terminal-pane-content {
+  position: relative;
+  overflow: hidden;
+  background-color: var(--terminal-surface);
+}
+
+.terminal-pane-host {
+  position: relative;
+  z-index: 0;
+  height: 100%;
+  padding: 8px 10px 10px;
+  background-color: var(--terminal-surface);
+}
+
+.terminal-pane-host,
+.terminal-pane-host .xterm {
+  min-height: 0;
+}
+
+.terminal-pane-host .xterm {
+  height: 100%;
+}
+
+.terminal-pane-host .xterm-viewport {
+  scrollbar-color: var(--terminal-border) transparent;
+}
+
+.terminal-pane-host .xterm-screen {
+  inset: 0;
+}
+
+.terminal-pane-overlay {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  left: 10px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--terminal-border);
+  border-radius: 2px;
+  background-color: var(--terminal-overlay);
+  backdrop-filter: blur(6px);
+}
+
+.terminal-pane-notice {
+  color: var(--terminal-text);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+}
+
 /* Drop zones (visible while dragging a file) */
 
 .pane-drop-overlay {
