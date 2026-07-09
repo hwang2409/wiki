@@ -9,6 +9,7 @@ updated: 2026-07-09
 
 ## 2026-07-09
 
+- **WIKI-31** — transcript virtualization — <6k DOM nodes, WebKit scroll p95 <16ms (owner: cdx:WIKI-31)
 - **phoebe** — PHO-13251 cross-org feature-adoption survey tool merged (#10887, admin agent; count/list modes, jsonb-typeof guard, missing-row default coalescing)
 
 ## 2026-07-08
