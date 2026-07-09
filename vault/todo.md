@@ -18,7 +18,6 @@ In Progress:
 - [PHO-13216](https://linear.app/phoebework/issue/PHO-13216): Core data products T2 (dossier+funnel+MCP mirrors) — cdx:PHO-13216 worker
 - [PHO-13227](https://linear.app/phoebework/issue/PHO-13227): subagent approval inheritance (13226 T2) — cdx:PHO-13227 worker
 - [PR #10475](https://github.com/phoebe-health/phoebe/pull/10475): subagent recommendation parity iteration (harness #10692) — cdx:PR-10475 worker; overfitting watch
-- [PHO-13251](https://linear.app/phoebework/issue/PHO-13251): cross-org feature-adoption read tool (3x demand-validated) — cdx:PHO-13251 worker
 - [P1] WIKI-31: transcript virtualization — <6k DOM nodes, WebKit scroll p95 <16ms (owner: cdx:WIKI-31)
 
 Backlog:
