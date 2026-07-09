@@ -38,6 +38,24 @@ def _write_rollout(day_dir: Path, name: str, cwd: str, session_id: str,
     return path
 
 
+def _write_claude_rollout(project_dir: Path, session_id: str, *,
+                          cwd: str, kickoff_ticket: str | None = None,
+                          mtime: float | None = None) -> Path:
+    project_dir.mkdir(parents=True, exist_ok=True)
+    path = project_dir / f"{session_id}.jsonl"
+    lines = [json.dumps({"payload": {"cwd": cwd, "id": session_id}})]
+    if kickoff_ticket:
+        lines.append(json.dumps({
+            "type": "user",
+            "timestamp": "2026-07-09T01:00:00Z",
+            "message": {"content": f"You are a worker for Linear ticket {kickoff_ticket}. Go."},
+        }))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    if mtime is not None:
+        os.utime(path, (mtime, mtime))
+    return path
+
+
 class RegistryIdBeatsDiscoveryTests(unittest.TestCase):
     def test_registry_id_confines_result_to_anchor_cwd(self) -> None:
         """Discovery mode has a stale-worker foot-gun: a NEWER rollout in a
@@ -93,6 +111,71 @@ class RegistryIdBeatsDiscoveryTests(unittest.TestCase):
                 )
             self.assertIsNotNone(found)
             self.assertEqual(found.name, "rollout-pinned.jsonl")
+
+
+class ClaudeSessionIdResolverTests(unittest.TestCase):
+    def test_session_id_primary_path_wins_without_slug_match(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / ".claude" / "projects"
+            session_id = "599b561a-7d40-4492-ab82-35a3ae91f733"
+            now = datetime.now(tz=timezone.utc)
+            project_dir = root / "-Users-henry-me-fun-phoebe--claude-worktrees-pr10475-eval-rerun"
+            expected = _write_claude_rollout(
+                project_dir,
+                session_id,
+                cwd="/Users/henry/me/fun/phoebe/claude-worktrees/pr10475-eval-rerun",
+                mtime=time.time(),
+            )
+            with mock.patch.object(transcripts, "CLAUDE_PROJECTS_DIR", root):
+                found = transcripts.find_session(
+                    "cc", "PR-10475", now.isoformat(), session_id=session_id
+                )
+            self.assertIsNotNone(found)
+            self.assertEqual(found, ("claude", expected))
+
+    def test_slug_glob_fallback_remains_when_session_id_missing(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / ".claude" / "projects"
+            now = datetime.now(tz=timezone.utc)
+            project_dir = root / "-Users-henry-me-fun-phoebe--claude-worktrees-pr10475-eval-rerun"
+            expected = _write_claude_rollout(
+                project_dir,
+                "fallback-session",
+                cwd="/Users/henry/me/fun/phoebe/claude-worktrees/pr10475-eval-rerun",
+                kickoff_ticket="PR-10475",
+                mtime=time.time(),
+            )
+            with mock.patch.object(transcripts, "CLAUDE_PROJECTS_DIR", root):
+                found = transcripts.find_session("cc", "PR-10475", now.isoformat())
+            self.assertIsNotNone(found)
+            self.assertEqual(found, ("claude", expected))
+
+    def test_session_id_beats_newer_slug_match(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / ".claude" / "projects"
+            now = datetime.now(tz=timezone.utc)
+            pinned_dir = root / "eval-rerun"
+            slug_dir = root / "-Users-henry-me-fun-phoebe--claude-worktrees-pr10475"
+            pinned = _write_claude_rollout(
+                pinned_dir,
+                "599b561a-7d40-4492-ab82-35a3ae91f733",
+                cwd="/Users/henry/me/fun/phoebe/claude-worktrees/pr10475-eval-rerun",
+                mtime=time.time() - 3600,
+            )
+            slug = _write_claude_rollout(
+                slug_dir,
+                "slug-session",
+                cwd="/Users/henry/me/fun/phoebe/claude-worktrees/pr10475",
+                kickoff_ticket="PR-10475",
+                mtime=time.time(),
+            )
+            with mock.patch.object(transcripts, "CLAUDE_PROJECTS_DIR", root):
+                pinned_found = transcripts.find_session(
+                    "cc", "PR-10475", now.isoformat(), session_id="599b561a-7d40-4492-ab82-35a3ae91f733"
+                )
+                slug_found = transcripts.find_session("cc", "PR-10475", now.isoformat())
+            self.assertEqual(pinned_found, ("claude", pinned))
+            self.assertEqual(slug_found, ("claude", slug))
 
 
 class SameCwdChainRuleTests(unittest.TestCase):

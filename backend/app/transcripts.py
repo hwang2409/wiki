@@ -250,8 +250,12 @@ def _claude_kickoff_ticket(path: Path) -> str | None:
     return None
 
 
-def find_claude_session(ticket: str, spawned_at: str | None) -> Path | None:
+def find_claude_session(ticket: str, spawned_at: str | None, session_id: str | None = None) -> Path | None:
     """Worktree project dirs embed the ticket slug; kickoff prompt disambiguates the rest."""
+    if session_id:
+        matches = list(CLAUDE_PROJECTS_DIR.glob(f"**/{session_id}.jsonl"))
+        if matches:
+            return max(matches, key=lambda p: p.stat().st_mtime)
     slug = ticket.lower()
     dirs = [d for d in CLAUDE_PROJECTS_DIR.glob(f"*{slug}*") if d.is_dir()]
     candidates: list[Path] = []
@@ -283,7 +287,7 @@ def find_session(
     worktree: str | None = None,
 ) -> tuple[str, Path] | None:
     if kind == "cc":
-        path = find_claude_session(ticket, spawned_at)
+        path = find_claude_session(ticket, spawned_at, session_id)
         return ("claude", path) if path else None
     if kind == "cdx":
         path = find_codex_session(ticket, spawned_at, session_id, worktree)
@@ -291,7 +295,7 @@ def find_session(
     path = find_codex_session(ticket, spawned_at, session_id, worktree)
     if path:
         return ("codex", path)
-    path = find_claude_session(ticket, spawned_at)
+    path = find_claude_session(ticket, spawned_at, session_id)
     if path:
         return ("claude", path)
     return None
