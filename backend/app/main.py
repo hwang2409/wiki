@@ -12,10 +12,11 @@ from pathlib import Path, PurePosixPath
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from . import accounts, github_pr, tokens, transcripts, uistate, vaultops
+from . import accounts, github_pr, terminal, tokens, transcripts, uistate, vaultops
 from .frontend_static import mount_frontend_static
 
 
@@ -26,6 +27,7 @@ MAX_NOTE_BYTES = 2_000_000
 VAULT_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="Wiki API")
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=terminal.TRUSTED_HOSTS)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -1407,9 +1409,15 @@ def _subscribe_agent_events() -> asyncio.Queue[dict]:
 
 @app.on_event("startup")
 async def _start_dispatcher() -> None:
+    terminal.refresh_boot_token()
     asyncio.create_task(message_dispatcher())
     asyncio.create_task(accounts.watchdog_loop(publish_agent_event))
     asyncio.create_task(tokens.refresh_in_background())
+
+
+@app.on_event("shutdown")
+async def _stop_terminals() -> None:
+    await asyncio.to_thread(terminal.TERMINAL_MANAGER.close_all)
 
 
 def vault_snapshot() -> dict[str, float]:
@@ -1678,6 +1686,7 @@ async def rotate_account(body: AccountRotateIn) -> dict[str, object]:
     }
 
 
+app.include_router(terminal.router)
 app.include_router(uistate.router)
 
 mount_frontend_static(app)

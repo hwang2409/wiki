@@ -15,6 +15,7 @@ import {
 import { LoadingPlaceholder } from "./loading";
 import { KanbanBoard, appendDoneEntry, type KanbanCard } from "./kanban";
 import { ObsidianMarkdown, splitFrontmatter, stripLeadingTitle } from "./markdown";
+import { TerminalPane, type TerminalPaneController } from "./terminal-pane";
 import type { Note, NoteDraft, NoteSummary } from "./types";
 
 function basename(path: string) {
@@ -54,11 +55,14 @@ export function WorkspacePane({
   notes,
   onClose,
   onOpenNote,
+  onRegisterTerminalController,
+  onRestartTerminal,
   overlayContent,
   paneStateKey,
   path,
   refreshTick,
   scrollRef,
+  terminalLaunchNonce,
 }: {
   agentPanel: AgentRoutePanel;
   agentContext?: "full" | "pane";
@@ -68,32 +72,51 @@ export function WorkspacePane({
   notes: NoteSummary[];
   onClose: () => void;
   onOpenNote: (path: string) => void;
+  onRegisterTerminalController?: (terminalId: string, controller: TerminalPaneController | null) => void;
+  onRestartTerminal?: (terminalId: string) => void;
   overlayContent?: ReactNode;
   paneStateKey: string;
   path: string;
   refreshTick: number;
   scrollRef?: RefObject<HTMLDivElement | null>;
+  terminalLaunchNonce?: number;
 }) {
-  const content = path.startsWith("agent://") ? (
-    <AgentPane
-      agentPanel={agentPanel}
-      agentContext={agentContext ?? "pane"}
-      agentWorkers={agentWorkers}
-      onClose={onClose}
-      paneStateKey={paneStateKey}
-      path={path}
-      refreshTick={refreshTick}
-    />
-  ) : (
-    <NotePane
-      focusState={noteFocusState}
-      notes={notes}
-      onOpenNote={onOpenNote}
-      path={path}
-      refreshTick={refreshTick}
-      scrollRef={scrollRef}
-    />
-  );
+  let content: ReactNode;
+  if (path.startsWith("agent://")) {
+    content = (
+      <AgentPane
+        agentPanel={agentPanel}
+        agentContext={agentContext ?? "pane"}
+        agentWorkers={agentWorkers}
+        onClose={onClose}
+        paneStateKey={paneStateKey}
+        path={path}
+        refreshTick={refreshTick}
+      />
+    );
+  } else if (path.startsWith("terminal://")) {
+    const terminalId = path.slice("terminal://".length);
+    content = (
+      <TerminalPane
+        focused={focused}
+        launchNonce={terminalLaunchNonce ?? 0}
+        onRegisterController={onRegisterTerminalController}
+        onRestart={() => onRestartTerminal?.(terminalId)}
+        terminalId={terminalId}
+      />
+    );
+  } else {
+    content = (
+      <NotePane
+        focusState={noteFocusState}
+        notes={notes}
+        onOpenNote={onOpenNote}
+        path={path}
+        refreshTick={refreshTick}
+        scrollRef={scrollRef}
+      />
+    );
+  }
 
   return (
     <div className="pane-wrap">

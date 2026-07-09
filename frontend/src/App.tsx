@@ -16,6 +16,7 @@ import {
   Settings,
   SquarePen,
   SquareTerminal,
+  Terminal as TerminalIcon,
   Sun,
   TrendingUp,
   Waypoints,
@@ -51,6 +52,8 @@ import { appendDoneEntry } from "./kanban";
 import { WorkspacePane, type PaneNoteFocusState } from "./pane";
 import { prepareMarkdown, splitFrontmatter } from "./markdown";
 import { clearSessionPaneState } from "./session";
+import type { TerminalPaneController } from "./terminal-pane";
+import { disposeTerminalRuntime } from "./terminal-runtime";
 import { invalidateTranscript } from "./transcript-store";
 import {
   applyTheme,
@@ -62,7 +65,18 @@ import {
 } from "./themes";
 import type { Note, NoteDraft, NoteSummary } from "./types";
 
-type Mode = "empty" | "view" | "edit" | "new" | "activity" | "graph" | "health" | "agents" | "tokens" | "agent";
+type Mode =
+  | "empty"
+  | "view"
+  | "edit"
+  | "new"
+  | "activity"
+  | "graph"
+  | "health"
+  | "agents"
+  | "tokens"
+  | "agent"
+  | "terminal";
 type UtilityMode = "activity" | "graph" | "health" | "agents" | "tokens";
 type SidebarTab = "files" | "search" | "agents";
 type SplitPosition = "left" | "right" | "top" | "bottom";
@@ -107,7 +121,7 @@ type LegacyStoredLayoutState = {
 
 type PaneInfo = {
   key: string;
-  kind: "agent" | "note";
+  kind: "agent" | "note" | "terminal";
   path: string;
   ticket: string | null;
 };
@@ -155,6 +169,10 @@ function isPanePath(path: unknown): path is string {
 
 function isAgentPath(path: string): boolean {
   return path.startsWith("agent://");
+}
+
+function isTerminalPath(path: string): boolean {
+  return path.startsWith("terminal://");
 }
 
 function splitLayout(
@@ -251,7 +269,7 @@ function collectPaneInfos(node: Layout, panes: PaneInfo[] = []): PaneInfo[] {
   if (node.kind === "pane") {
     panes.push({
       key: node.id,
-      kind: isAgentPath(node.path) ? "agent" : "note",
+      kind: isAgentPath(node.path) ? "agent" : isTerminalPath(node.path) ? "terminal" : "note",
       path: node.path,
       ticket: ticketFromPanePath(node.path),
     });
@@ -348,7 +366,7 @@ function findPaneInfo(node: Layout, key: string): PaneInfo | null {
     return node.id === key
       ? {
           key: node.id,
-          kind: isAgentPath(node.path) ? "agent" : "note",
+          kind: isAgentPath(node.path) ? "agent" : isTerminalPath(node.path) ? "terminal" : "note",
           path: node.path,
           ticket: ticketFromPanePath(node.path),
         }
@@ -361,12 +379,20 @@ function ticketFromPanePath(path: string | null): string | null {
   return path?.startsWith("agent://") ? path.slice("agent://".length) : null;
 }
 
+function terminalIdFromPanePath(path: string | null): string | null {
+  return path?.startsWith("terminal://") ? path.slice("terminal://".length) : null;
+}
+
 function cwdBasename(path: string | null): string {
   return path ? path.split("/").slice(-1)[0] : "no cwd";
 }
 
 function paneLabel(path: string): string {
-  return ticketFromPanePath(path) ?? basename(path);
+  const ticket = ticketFromPanePath(path);
+  if (ticket) return ticket;
+  const terminalId = terminalIdFromPanePath(path);
+  if (terminalId) return `term:${terminalId.slice(0, 8)}`;
+  return basename(path);
 }
 
 function windowLabel(window: WorkspaceWindow): string {
@@ -376,7 +402,11 @@ function windowLabel(window: WorkspaceWindow): string {
   return rest.length > 0 ? `${paneLabel(first.path)}+${rest.length}` : paneLabel(first.path);
 }
 
-function normalizeWindow(window: WorkspaceWindow, seenTickets: Set<string>): WorkspaceWindow | null {
+function normalizeWindow(
+  window: WorkspaceWindow,
+  seenTickets: Set<string>,
+  seenTerminalIds: Set<string>
+): WorkspaceWindow | null {
   function prune(node: Layout): Layout | null {
     if (node.kind === "pane") {
       if (!isPanePath(node.path)) return null;
@@ -384,6 +414,11 @@ function normalizeWindow(window: WorkspaceWindow, seenTickets: Set<string>): Wor
       if (ticket) {
         if (seenTickets.has(ticket)) return null;
         seenTickets.add(ticket);
+      }
+      const terminalId = terminalIdFromPanePath(node.path);
+      if (terminalId) {
+        if (seenTerminalIds.has(terminalId)) return null;
+        seenTerminalIds.add(terminalId);
       }
       return node;
     }
@@ -410,6 +445,7 @@ function normalizeWindow(window: WorkspaceWindow, seenTickets: Set<string>): Wor
 function normalizeWindowWorkspaceState(state: WindowWorkspaceState): WindowWorkspaceState {
   const seenWindowIds = new Set<string>();
   const seenTickets = new Set<string>();
+  const seenTerminalIds = new Set<string>();
   const windows = state.windows
     .filter((window): window is WorkspaceWindow => typeof window.id === "string" && window.id.length > 0)
     .filter((window) => {
@@ -417,7 +453,7 @@ function normalizeWindowWorkspaceState(state: WindowWorkspaceState): WindowWorks
       seenWindowIds.add(window.id);
       return true;
     })
-    .map((window) => normalizeWindow(window, seenTickets))
+    .map((window) => normalizeWindow(window, seenTickets, seenTerminalIds))
     .filter((window): window is WorkspaceWindow => window !== null);
   const activeWindowId =
     state.activeWindowId && windows.some((window) => window.id === state.activeWindowId)
@@ -614,6 +650,7 @@ type Route =
   | { kind: "new" }
   | { kind: UtilityMode }
   | { kind: "agent"; ticket: string; panel: AgentRoutePanel }
+  | { kind: "terminal"; id: string }
   | { kind: "note" | "edit"; path: string };
 
 const UTILITY_ROUTES: readonly UtilityMode[] = ["activity", "graph", "health", "agents", "tokens"];
@@ -625,6 +662,7 @@ function routeHash(route: Route): string {
     const base = `#/agent/${encodeURIComponent(route.ticket)}`;
     return route.panel === "review" ? `${base}/review` : base;
   }
+  if (route.kind === "terminal") return `#/terminal/${encodeURIComponent(route.id)}`;
   if ((UTILITY_ROUTES as readonly string[]).includes(route.kind)) return `#/${route.kind}`;
   const encoded = (route as { path: string }).path
     .split("/")
@@ -637,6 +675,8 @@ function parseRoute(hash: string): Route {
   if (hash === "#/new") return { kind: "new" };
   const agent = hash.match(/^#\/agent\/([A-Za-z0-9-]+)(?:\/(review))?$/);
   if (agent) return { kind: "agent", ticket: agent[1], panel: agent[2] === "review" ? "review" : null };
+  const terminal = hash.match(/^#\/terminal\/([A-Za-z0-9._-]+)$/);
+  if (terminal) return { kind: "terminal", id: terminal[1] };
   const utility = UTILITY_ROUTES.find((kind) => hash === `#/${kind}`);
   if (utility) return { kind: utility };
   const match = hash.match(/^#\/(note|edit)\/(.+)$/);
@@ -989,6 +1029,7 @@ export default function App() {
     return stored === "search" || stored === "agents" ? stored : "files";
   });
   const [agentTicket, setAgentTicket] = useState<string | null>(null);
+  const [terminalRouteId, setTerminalRouteId] = useState<string | null>(null);
   const [agentPanel, setAgentPanel] = useState<AgentRoutePanel>(null);
   const [leaderArmed, setLeaderArmed] = useState(false);
   const [windowChooserOpen, setWindowChooserOpen] = useState(false);
@@ -1006,6 +1047,7 @@ export default function App() {
   const [draggingNotePath, setDraggingNotePath] = useState<string | null>(null);
   const [windowState, setWindowState] = useState<WindowWorkspaceState>(readStoredWindowWorkspaceState);
   const [zoomedPaneId, setZoomedPaneId] = useState<string | null>(null);
+  const [terminalLaunchNonceById, setTerminalLaunchNonceById] = useState<Record<string, number>>({});
   const [links, setLinks] = useState<Record<string, NoteLinks>>({});
   const [agentsState, setAgentsState] = useState<AgentsSnapshot>({
     workers: null,
@@ -1027,6 +1069,8 @@ export default function App() {
   const [theme, setTheme] = useState<ThemeId>(() => getStoredTheme());
   const [agentsOpenTicket, setAgentsOpenTicket] = useState<string | null>(null);
   const viewContentRef = useRef<HTMLDivElement | null>(null);
+  const terminalControllersRef = useRef(new Map<string, TerminalPaneController>());
+  const openTerminalIdsRef = useRef<Set<string>>(new Set());
   const preserveViewScrollRef = useRef(false);
   const appliedHashRef = useRef<string | null>(null);
   const closedTicketsRef = useRef<Set<string>>(new Set());
@@ -1206,6 +1250,23 @@ export default function App() {
   }, [windowState]);
 
   useEffect(() => {
+    const nextOpenTerminalIds = new Set<string>();
+    for (const window of windowState.windows) {
+      for (const pane of collectPaneInfos(window.layout)) {
+        const terminalId = terminalIdFromPanePath(pane.path);
+        if (terminalId) nextOpenTerminalIds.add(terminalId);
+      }
+    }
+    for (const terminalId of openTerminalIdsRef.current) {
+      if (!nextOpenTerminalIds.has(terminalId)) {
+        terminalControllersRef.current.delete(terminalId);
+        disposeTerminalRuntime(terminalId);
+      }
+    }
+    openTerminalIdsRef.current = nextOpenTerminalIds;
+  }, [windowState]);
+
+  useEffect(() => {
     const liveWorkers = agentsState.workers;
     if (liveWorkers === null) return;
     setWindowState((current) => {
@@ -1257,6 +1318,7 @@ export default function App() {
   const focusedPane = focusedPaneId ? paneMap.get(focusedPaneId) ?? null : null;
   const focusedPanePath = focusedPane?.path ?? null;
   const focusedPaneTicket = focusedPane?.ticket ?? null;
+  const focusedTerminalId = terminalIdFromPanePath(focusedPanePath);
   const agentWorkers = useMemo(() => {
     const map = new Map<string, AgentSessionSurfaceWorker>();
     for (const worker of agentsState.workers ?? []) {
@@ -1449,6 +1511,7 @@ export default function App() {
       setActiveNote(null);
       setAgentPanel(null);
       setAgentTicket(null);
+      setTerminalRouteId(null);
       setMode("empty");
       return;
     }
@@ -1459,7 +1522,19 @@ export default function App() {
       setActiveNote(null);
       setAgentPanel(options?.panel ?? null);
       setAgentTicket(ticket);
+      setTerminalRouteId(null);
       setMode("agent");
+      return;
+    }
+    const terminalId = terminalIdFromPanePath(path);
+    if (terminalId) {
+      if (syncHash) navigate({ kind: "terminal", id: terminalId });
+      setError(null);
+      setActiveNote(null);
+      setAgentPanel(null);
+      setAgentTicket(null);
+      setTerminalRouteId(terminalId);
+      setMode("terminal");
       return;
     }
     void showNoteRoute(path, { syncHash });
@@ -1487,6 +1562,7 @@ export default function App() {
     setError(null);
     setAgentTicket(null);
     setAgentPanel(null);
+    setTerminalRouteId(null);
     try {
       const note = await getNote(path);
       setActiveNote(note);
@@ -1522,6 +1598,7 @@ export default function App() {
     setActiveNote(null);
     setAgentTicket(null);
     setAgentPanel(null);
+    setTerminalRouteId(null);
     setMode(kind);
   }
 
@@ -1549,7 +1626,83 @@ export default function App() {
     setActiveNote(null);
     setAgentPanel(panel);
     setAgentTicket(ticket);
+    setTerminalRouteId(null);
     setMode("agent");
+  }
+
+  function bumpTerminalLaunchNonce(terminalId: string) {
+    setTerminalLaunchNonceById((current) => ({
+      ...current,
+      [terminalId]: (current[terminalId] ?? 0) + 1,
+    }));
+  }
+
+  function openPathAsSplit(path: string, position: SplitPosition = "right") {
+    if (!activeWindow || !focusedPaneId) {
+      openPathInSoloWindow(path);
+      return;
+    }
+    const newPaneId = nextPaneId();
+    setWindowState((current) =>
+      normalizeWindowWorkspaceState({
+        activeWindowId: activeWindow.id,
+        windows: current.windows.map((window) =>
+          window.id === activeWindow.id
+            ? {
+                ...window,
+                focusedPaneId: newPaneId,
+                layout: splitLayout(window.layout, focusedPaneId, position, {
+                  kind: "pane",
+                  id: newPaneId,
+                  path,
+                }),
+              }
+            : window
+        ),
+      })
+    );
+    requestAnimationFrame(() => paneRefs.current.get(newPaneId)?.focus());
+  }
+
+  function showTerminalRoute(
+    terminalId: string,
+    options: { launch?: boolean; splitIfNew?: boolean; syncHash?: boolean } = {}
+  ) {
+    const { launch = false, splitIfNew = false, syncHash = true } = options;
+    const path = `terminal://${terminalId}`;
+    const existing = findPaneLocationByPath(path, activeWindow?.id ?? null);
+    if (existing) {
+      if (zoomedPaneId && zoomedPaneId !== existing.pane.key) setZoomedPaneId(null);
+      focusWindowPane(existing.window.id, existing.pane.key);
+    } else if (splitIfNew) {
+      openPathAsSplit(path, "right");
+    } else {
+      openPathInSoloWindow(path);
+    }
+    if (launch) bumpTerminalLaunchNonce(terminalId);
+    if (syncHash) navigate({ kind: "terminal", id: terminalId });
+    setError(null);
+    setActiveNote(null);
+    setAgentPanel(null);
+    setAgentTicket(null);
+    setTerminalRouteId(terminalId);
+    setMode("terminal");
+  }
+
+  function createTerminalPane() {
+    showTerminalRoute(crypto.randomUUID(), { launch: true, splitIfNew: true, syncHash: true });
+  }
+
+  function restartTerminalPane(terminalId: string) {
+    showTerminalRoute(terminalId, { launch: true, splitIfNew: false, syncHash: true });
+  }
+
+  function registerTerminalController(
+    terminalId: string,
+    controller: TerminalPaneController | null
+  ) {
+    if (controller) terminalControllersRef.current.set(terminalId, controller);
+    else terminalControllersRef.current.delete(terminalId);
   }
 
   function registerPaneRef(key: string, node: HTMLDivElement | null) {
@@ -1649,6 +1802,10 @@ export default function App() {
 
   function executeLeaderChord(key: string, lowerKey: string) {
     if (key === "Escape") return;
+    if (lowerKey === "a" && focusedTerminalId) {
+      terminalControllersRef.current.get(focusedTerminalId)?.sendInput("\u0001");
+      return;
+    }
     if (lowerKey === "j") {
       cyclePaneFocus(1);
       return;
@@ -1680,6 +1837,10 @@ export default function App() {
     }
     if (lowerKey === "w") {
       setWindowChooserOpen(true);
+      return;
+    }
+    if (lowerKey === "t") {
+      createTerminalPane();
       return;
     }
     if (lowerKey === "x") {
@@ -2073,6 +2234,7 @@ export default function App() {
         setActiveNote(null);
         setAgentPanel(null);
         setAgentTicket(null);
+        setTerminalRouteId(null);
         setMode("empty");
         return;
       }
@@ -2080,6 +2242,7 @@ export default function App() {
         setActiveNote(null);
         setAgentPanel(null);
         setAgentTicket(null);
+        setTerminalRouteId(null);
         setDraft(emptyDraft);
         setMode("new");
         return;
@@ -2088,10 +2251,15 @@ export default function App() {
         openAgentRef.current(route.ticket, route.panel, false);
         return;
       }
+      if (route.kind === "terminal") {
+        showTerminalRoute(route.id, { launch: false, splitIfNew: false, syncHash: false });
+        return;
+      }
       if (route.kind !== "note" && route.kind !== "edit") {
         setActiveNote(null);
         setAgentPanel(null);
         setAgentTicket(null);
+        setTerminalRouteId(null);
         setMode(route.kind);
         return;
       }
@@ -2156,6 +2324,12 @@ export default function App() {
       const lowerKey = key.toLowerCase();
 
       if (modalOpen) return;
+      if (
+        document.activeElement instanceof HTMLTextAreaElement &&
+        document.activeElement.dataset.terminalInput === "true"
+      ) {
+        return;
+      }
 
       if ((event.metaKey || event.ctrlKey) && lowerKey === "k") {
         event.preventDefault();
@@ -2245,12 +2419,16 @@ export default function App() {
       ? "Untitled"
       : mode === "agent"
         ? agentTicket ?? "Agent"
+        : mode === "terminal"
+          ? terminalRouteId ? `terminal:${terminalRouteId.slice(0, 8)}` : "Terminal"
         : utilityTitles[mode] ?? (activeNote ? basename(activeNote.path) : "New tab");
   const breadcrumbs =
     mode === "new"
       ? ["Untitled"]
       : mode === "agent"
         ? ["Agents", agentTicket ?? ""]
+        : mode === "terminal"
+          ? ["Terminal", terminalRouteId ?? ""]
         : utilityTitles[mode]
           ? [utilityTitles[mode]!]
           : activeNote
@@ -2517,11 +2695,18 @@ export default function App() {
               notes={notes}
               onClose={() => closeFocusedPane(node.id)}
               onOpenNote={openNote}
+              onRegisterTerminalController={registerTerminalController}
+              onRestartTerminal={restartTerminalPane}
               overlayContent={overlayContent}
               paneStateKey={node.id}
               path={node.path}
               refreshTick={refreshTick}
               scrollRef={scrollRef}
+              terminalLaunchNonce={
+                terminalIdFromPanePath(node.path)
+                  ? terminalLaunchNonceById[terminalIdFromPanePath(node.path) ?? ""] ?? 0
+                  : 0
+              }
             />
           )}
         </PaneDropTarget>
@@ -2597,6 +2782,15 @@ export default function App() {
           onClick={() => setSidebarTab("agents")}
         >
           <SquareTerminal size={18} />
+        </button>
+        <button
+          aria-label="New terminal"
+          className="ribbon-action"
+          title="New terminal (C-a t)"
+          type="button"
+          onClick={createTerminalPane}
+        >
+          <TerminalIcon size={18} />
         </button>
         <button
           aria-label="Activity feed"
@@ -2768,7 +2962,7 @@ export default function App() {
           </div>
         </div>
 
-        <div className={`view-header${mode === "agent" ? " is-hidden" : ""}`}>
+        <div className={`view-header${mode === "agent" || mode === "terminal" ? " is-hidden" : ""}`}>
           <div className="view-header-title-container">
             {breadcrumbs.map((crumb, index) => (
               <span className="view-header-breadcrumb" key={`${crumb}-${index}`}>
