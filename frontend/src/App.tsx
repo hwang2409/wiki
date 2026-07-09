@@ -49,6 +49,7 @@ import { TokensView } from "./tokens";
 import { appendDoneEntry } from "./kanban";
 import { WorkspacePane, type PaneNoteFocusState } from "./pane";
 import { prepareMarkdown, splitFrontmatter } from "./markdown";
+import { invalidateTranscript } from "./transcript-store";
 import {
   applyTheme,
   getStoredTheme,
@@ -1055,18 +1056,32 @@ export default function App() {
   useEffect(() => {
     const source = new EventSource("/api/events");
     source.onmessage = (raw) => {
-      setRefreshTick((tick) => tick + 1);
       try {
-        const payload = JSON.parse(raw.data) as { type?: string };
+        const payload = JSON.parse(raw.data) as { type?: string; ticket?: string; surface?: string | null };
+        if (!payload || typeof payload.type !== "string") return;
+        if (payload.type === "session" && typeof payload.ticket === "string") {
+          invalidateTranscript(payload.ticket, payload.surface ?? null);
+          return;
+        }
         if (
-          payload &&
-          typeof payload.type === "string" &&
-          (payload.type === "codex_rotation" ||
-            payload.type === "codex_limit_no_eligible" ||
-            payload.type === "codex_rotation_failed" ||
-            payload.type === "codex_auth_dead_revival" ||
-            payload.type === "codex_auth_dead_exhausted" ||
-            payload.type === "claude_limit_hit")
+          payload.type === "vault" ||
+          payload.type === "agents" ||
+          payload.type === "codex_rotation" ||
+          payload.type === "codex_limit_no_eligible" ||
+          payload.type === "codex_rotation_failed" ||
+          payload.type === "codex_auth_dead_revival" ||
+          payload.type === "codex_auth_dead_exhausted" ||
+          payload.type === "claude_limit_hit"
+        ) {
+          setRefreshTick((tick) => tick + 1);
+        }
+        if (
+          payload.type === "codex_rotation" ||
+          payload.type === "codex_limit_no_eligible" ||
+          payload.type === "codex_rotation_failed" ||
+          payload.type === "codex_auth_dead_revival" ||
+          payload.type === "codex_auth_dead_exhausted" ||
+          payload.type === "claude_limit_hit"
         ) {
           setAccountEvents((prior) => [payload as AccountEvent, ...prior].slice(0, 4));
         }

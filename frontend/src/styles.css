@@ -3552,6 +3552,13 @@ body.is-resizing-panes .pane-cell {
   font-size: var(--font-ui-small);
 }
 
+.session-tab {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+}
+
 .session-loading,
 .agents-loading,
 .activity-loading,

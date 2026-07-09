@@ -668,10 +668,55 @@ def clean_pane_log(path: Path, lines: int = 500) -> str:
 _session_paths: dict[str, tuple[str, Path]] = {}  # ticket → (fmt, path), successes only
 
 
+def _direct_transcript_session(path: Path) -> tuple[str, Path] | None:
+    if not path.is_file():
+        return None
+    fmt = transcripts.detect_session_format(path) or "codex"
+    return (fmt, path)
+
+
+def _session_delta_payload(
+    fmt: str,
+    path: Path,
+    *,
+    cursor: int,
+    client_path: str | None = None,
+    ticket: str | None = None,
+    include_subagents: bool = False,
+    include_queue: bool = False,
+) -> dict[str, object]:
+    effective_cursor = 0 if client_path is not None and client_path != str(path) else cursor
+    result = transcripts.read_session_delta(fmt, path, effective_cursor)
+    events = result["events"]
+    if fmt == "claude":
+        transcripts.annotate_agent_events(path, events)
+    payload: dict[str, object] = {
+        "version": 2,
+        "format": fmt,
+        "path": str(path),
+        "tokens": result["tokens"],
+        "tasks": result.get("tasks") or [],
+        "pr": result.get("pr"),
+        "base": result["base"],
+        "cursor": result["cursor"],
+        "tail_from": result["tail_from"],
+        "events": events,
+        "patches": result.get("patches") or [],
+        "working": _transcript_working(path, ticket),
+    }
+    if include_subagents:
+        payload["subagents"] = _active_subagents(path)
+    if include_queue and ticket and TICKET_PATTERN.fullmatch(ticket):
+        payload["queue"] = _read_queue().get(ticket, [])
+    return payload
+
+
 @app.get("/api/agents/{ticket}/session")
-def agent_session(ticket: str, after: int = 0) -> dict[str, object]:
-    """Delta protocol: `after` = client's absolute event cursor. Response events
-    start at `from` = min(after, oldest-still-mutating event); client splices."""
+def agent_session(
+    ticket: str,
+    cursor: int = Query(0, ge=0),
+    client_path: str | None = Query(None, alias="path"),
+) -> dict[str, object]:
     if not TICKET_PATTERN.fullmatch(ticket):
         raise HTTPException(status_code=400, detail="Bad ticket")
 
@@ -682,26 +727,18 @@ def agent_session(ticket: str, after: int = 0) -> dict[str, object]:
         pass
     orch = (registry.get("_orchestrators") or {}).get(ticket)
     if orch and orch.get("transcript"):
-        path = Path(orch["transcript"])
-        if path.is_file():
-            result = transcripts.read_session_events("claude", path)
-            base = result["base"]
-            events = result["events"]
-            transcripts.annotate_agent_events(path, events)
-            total = base + len(events)
-            start = max(base, min(max(after, 0), result["dirty_from"], total))
-            return {
-                "format": "claude",
-                "path": str(path),
-                "tokens": result["tokens"],
-                "tasks": result.get("tasks") or [],
-                "pr": result.get("pr"),
-                "from": start,
-                "total": total,
-                "events": events[start - base :],
-                "subagents": _active_subagents(path),
-                "working": _transcript_working(path, ticket),
-            }
+        found = _direct_transcript_session(Path(orch["transcript"]))
+        if found is not None:
+            fmt, path = found
+            return _session_delta_payload(
+                fmt,
+                path,
+                cursor=cursor,
+                client_path=client_path,
+                ticket=ticket,
+                include_subagents=fmt == "claude",
+                include_queue=True,
+            )
         raise HTTPException(status_code=404, detail="Orchestrator transcript missing")
 
     current = (registry.get(ticket) or {}).get("current") or {}
@@ -724,35 +761,33 @@ def agent_session(ticket: str, after: int = 0) -> dict[str, object]:
             if logs:
                 tail = clean_pane_log(logs[0])
                 return {
+                    "version": 2,
                     "format": "pane-log",
                     "path": str(logs[0]),
                     "tokens": None,
-                    "from": 0,
-                    "total": 1,
-                    "events": [{"kind": "terminal", "ts": None, "text": tail}],
+                    "tasks": [],
+                    "pr": None,
+                    "base": 0,
+                    "cursor": 1,
+                    "tail_from": 0,
+                    "events": [{"id": 0, "kind": "terminal", "ts": None, "text": tail}],
+                    "patches": [],
+                    "subagents": [],
+                    "queue": [],
+                    "working": False,
                 }
         raise HTTPException(status_code=404, detail="No session transcript found")
 
     fmt, path = found
-    result = transcripts.read_session_events(fmt, path)
-    base = result["base"]
-    events = result["events"]
-    if fmt == "claude":
-        transcripts.annotate_agent_events(path, events)
-    total = base + len(events)
-    start = max(base, min(max(after, 0), result["dirty_from"], total))
-    return {
-        "format": fmt,
-        "path": str(path),
-        "tokens": result["tokens"],
-        "tasks": result.get("tasks") or [],
-        "pr": result.get("pr"),
-        "from": start,
-        "total": total,
-        "events": events[start - base :],
-        "subagents": _active_subagents(path) if fmt == "claude" else [],
-        "working": _transcript_working(path, ticket),
-    }
+    return _session_delta_payload(
+        fmt,
+        path,
+        cursor=cursor,
+        client_path=client_path,
+        ticket=ticket,
+        include_subagents=fmt == "claude",
+        include_queue=True,
+    )
 
 
 def _transcript_working(path: Path, ticket: str | None = None) -> bool:
@@ -794,14 +829,21 @@ def _resolve_main_transcript(ticket: str) -> Path | None:
     except (OSError, ValueError):
         orch = None
     if orch and orch.get("transcript"):
-        path = Path(orch["transcript"])
-        return path if path.is_file() else None
+        found = _direct_transcript_session(Path(orch["transcript"]))
+        if found and found[0] == "claude":
+            return found[1]
+        return None
     found = _session_paths.get(ticket)
     return found[1] if found and found[0] == "claude" and found[1].is_file() else None
 
 
 @app.get("/api/agents/{ticket}/subagents/{agent_id}/session")
-def subagent_session(ticket: str, agent_id: str, after: int = 0) -> dict[str, object]:
+def subagent_session(
+    ticket: str,
+    agent_id: str,
+    cursor: int = Query(0, ge=0),
+    client_path: str | None = Query(None, alias="path"),
+) -> dict[str, object]:
     if not TICKET_PATTERN.fullmatch(ticket) or not SUBAGENT_ID_PATTERN.fullmatch(agent_id):
         raise HTTPException(status_code=400, detail="Bad id")
     main_path = _resolve_main_transcript(ticket)
@@ -810,21 +852,7 @@ def subagent_session(ticket: str, agent_id: str, after: int = 0) -> dict[str, ob
     path = transcripts.subagents_dir(main_path) / f"agent-{agent_id}.jsonl"
     if not path.is_file():
         raise HTTPException(status_code=404, detail="No such subagent")
-    result = transcripts.read_session_events("claude-sub", path)
-    base = result["base"]
-    events = result["events"]
-    total = base + len(events)
-    start = max(base, min(max(after, 0), result["dirty_from"], total))
-    return {
-        "format": "claude",
-        "path": str(path),
-        "tokens": result["tokens"],
-        "tasks": result.get("tasks") or [],
-        "pr": result.get("pr"),
-        "from": start,
-        "total": total,
-        "events": events[start - base :],
-    }
+    return _session_delta_payload("claude", path, cursor=cursor, client_path=client_path)
 
 
 UPLOAD_DIR = Path("/tmp/wiki-uploads")
@@ -1285,7 +1313,11 @@ def agent_message(ticket: str, body: MessageIn, background: BackgroundTasks) -> 
             {"text": body.text, "queued_at": datetime.now(tz=timezone.utc).isoformat()}
         )
         _write_queue(queue)
-        return {"status": "queued", "position": len(queue[ticket])}
+        background.add_task(
+            publish_agent_event,
+            {"type": "session", "ticket": ticket, "surface": "queue"},
+        )
+        return {"status": "queued", "position": len(queue[ticket]), "messages": queue[ticket]}
     # Delivery has load-bearing sleeps (paste-pause + submit-verify) — don't block the response.
     background.add_task(deliver_message, window, body.text)
     return {"status": "sent"}
@@ -1308,6 +1340,11 @@ def agent_queue_delete(ticket: str, index: int) -> dict[str, object]:
         raise HTTPException(status_code=404, detail="No such queued message")
     messages.pop(index)
     _write_queue(queue)
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(publish_agent_event({"type": "session", "ticket": ticket, "surface": "queue"}))
+    except RuntimeError:
+        pass
     return {"messages": messages}
 
 
@@ -1339,6 +1376,7 @@ async def message_dispatcher() -> None:
                 message = messages.pop(0)
                 _write_queue(queue)
                 _idle_counts[ticket] = 0
+                await publish_agent_event({"type": "session", "ticket": ticket, "surface": "queue"})
                 await asyncio.to_thread(deliver_message, window, message["text"])
         except Exception:
             continue  # dispatcher must never die
@@ -1385,7 +1423,6 @@ def vault_snapshot() -> dict[str, float]:
     extras = [git_dir / "HEAD", git_dir / "packed-refs", *(git_dir / "refs" / "heads").glob("*")]
     # Agent state: registry + per-ticket status files.
     extras.append(AGENT_REGISTRY_PATH)
-    extras.append(MSG_QUEUE_PATH)
     if AGENT_STATUS_DIR.is_dir():
         extras.extend(AGENT_STATUS_DIR.glob("*.json"))
     for candidate in extras:
@@ -1396,11 +1433,35 @@ def vault_snapshot() -> dict[str, float]:
     return snapshot
 
 
+def _read_registry_snapshot() -> dict:
+    try:
+        data = json.loads(AGENT_REGISTRY_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _changed_registry_tickets(previous: dict, current: dict) -> set[str]:
+    changed: set[str] = set()
+    previous_workers = {k: v for k, v in previous.items() if k != "_orchestrators"}
+    current_workers = {k: v for k, v in current.items() if k != "_orchestrators"}
+    for ticket in set(previous_workers) | set(current_workers):
+        if previous_workers.get(ticket) != current_workers.get(ticket):
+            changed.add(ticket)
+    previous_orchs = previous.get("_orchestrators") or {}
+    current_orchs = current.get("_orchestrators") or {}
+    for ticket in set(previous_orchs) | set(current_orchs):
+        if previous_orchs.get(ticket) != current_orchs.get(ticket):
+            changed.add(ticket)
+    return changed
+
+
 @app.get("/api/events")
 async def events() -> StreamingResponse:
     async def stream():
         subscriber = _subscribe_agent_events()
         snapshot = vault_snapshot()
+        registry_snapshot = _read_registry_snapshot()
         idle_ticks = 0
         yield "retry: 2000\n\n"
         try:
@@ -1420,13 +1481,32 @@ async def events() -> StreamingResponse:
                         if snapshot.get(path) != current[path]
                     ] + [path for path in snapshot if path not in current]
                     snapshot = current
-                    paths = []
+                    vault_paths: list[str] = []
+                    git_changed = False
+                    agents_dirty = False
+                    changed_tickets: set[str] = set()
                     for path in changed:
+                        candidate = Path(path)
+                        if candidate == AGENT_REGISTRY_PATH:
+                            agents_dirty = True
+                            current_registry = _read_registry_snapshot()
+                            changed_tickets.update(_changed_registry_tickets(registry_snapshot, current_registry))
+                            registry_snapshot = current_registry
+                            continue
+                        if candidate.parent == AGENT_STATUS_DIR:
+                            agents_dirty = True
+                            if TICKET_PATTERN.fullmatch(candidate.stem):
+                                changed_tickets.add(candidate.stem)
+                            continue
                         try:
-                            paths.append(Path(path).relative_to(VAULT_DIR).as_posix())
+                            vault_paths.append(candidate.relative_to(VAULT_DIR).as_posix())
                         except ValueError:
-                            paths.append("git")
-                    yield f"data: {json.dumps({'type': 'vault', 'paths': sorted(set(paths))[:20]})}\n\n"
+                            git_changed = True
+                    if vault_paths or git_changed:
+                        paths = sorted(set(vault_paths + (["git"] if git_changed else [])))[:20]
+                        yield f"data: {json.dumps({'type': 'vault', 'paths': paths})}\n\n"
+                    if agents_dirty:
+                        yield f"data: {json.dumps({'type': 'agents', 'tickets': sorted(changed_tickets)[:20], 'surface': 'agents'})}\n\n"
                     idle_ticks = 0
                 else:
                     idle_ticks += 1

@@ -1006,7 +1006,6 @@ export function AgentsView({
         <SessionSidebar
           onOpenAgent={onOpenAgent}
           worker={openWorker}
-          refreshTick={refreshTick}
           onClose={() => onOpenTicket(null)}
         />
       ) : null}

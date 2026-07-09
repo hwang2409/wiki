@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { ComponentProps, CSSProperties } from "react";
+import type { ComponentProps, CSSProperties, RefObject } from "react";
 import {
   AlertTriangle,
   Bell,
@@ -33,24 +33,24 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   cancelQueuedMessage,
-  getAgentQueue,
-  getAgentSession,
   getSkills,
-  getSubagentSession,
   sendAgentMessage,
   uploadImage,
 } from "./api";
 import type {
-  AgentSessionData,
   QueuedMessage,
   SessionEvent,
   SessionPr,
-  SessionTask,
   SkillInfo,
   SubagentInfo,
 } from "./api";
 import { externalLinkProps } from "./external-links";
 import { LoadingPlaceholder } from "./loading";
+import {
+  replaceTranscriptQueue,
+  useTranscriptSession,
+  type TranscriptSession,
+} from "./transcript-store";
 
 const POLL_MS = 2500;
 const VIRTUAL_ROW_GAP = 14;
@@ -170,6 +170,44 @@ export function usePollTick(refreshTick: number): number {
     return () => window.clearInterval(id);
   }, []);
   return pollTick + refreshTick;
+}
+
+function useElementVisible(ref: RefObject<HTMLElement | null>): boolean {
+  const [visible, setVisible] = useState(false);
+
+  useEffect(() => {
+    const node = ref.current;
+    if (!node) return;
+
+    const compute = () => {
+      const rect = node.getBoundingClientRect();
+      const inViewport =
+        rect.width > 0 &&
+        rect.height > 0 &&
+        rect.bottom > 0 &&
+        rect.right > 0 &&
+        rect.top < window.innerHeight &&
+        rect.left < window.innerWidth;
+      setVisible(document.visibilityState === "visible" && inViewport);
+    };
+
+    const observer = new IntersectionObserver(() => compute());
+    observer.observe(node);
+    document.addEventListener("visibilitychange", compute);
+    window.addEventListener("focus", compute);
+    window.addEventListener("resize", compute);
+    window.addEventListener("scroll", compute, true);
+    compute();
+    return () => {
+      observer.disconnect();
+      document.removeEventListener("visibilitychange", compute);
+      window.removeEventListener("focus", compute);
+      window.removeEventListener("resize", compute);
+      window.removeEventListener("scroll", compute, true);
+    };
+  }, [ref]);
+
+  return visible;
 }
 
 function usePinnedScroll<T extends HTMLElement>(
@@ -951,69 +989,27 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
   return prevGroup.event === nextGroup.event && sameImageNums(prev.imageNums, next.imageNums);
 });
 
-type SessionAcc = {
-  format: string;
-  path: string;
-  tokens: number | null;
-  tasks: SessionTask[];
-  pr: SessionPr | null;
-  base: number;
-  events: SessionEvent[];
-  subagents: SubagentInfo[];
-  working: boolean;
-};
+type SessionAcc = TranscriptSession;
 
-const sessionCache = new Map<string, SessionAcc>();
 const composerDraftCache = new Map<string, string>();
-
-function spliceSession(acc: SessionAcc | null, result: AgentSessionData): SessionAcc {
-  const clientEnd = acc ? acc.base + acc.events.length : 0;
-  if (!acc || result.path !== acc.path || result.from > clientEnd || result.from < acc.base) {
-    return {
-      format: result.format,
-      path: result.path,
-      tokens: result.tokens,
-      tasks: result.tasks ?? [],
-      pr: result.pr ?? null,
-      base: result.from,
-      events: result.events,
-      subagents: result.subagents ?? [],
-      working: result.working ?? false,
-    };
-  }
-  // Delta: keep old event objects (memo identity), replace from the dirty point on.
-  return {
-    ...acc,
-    tokens: result.tokens,
-    tasks: result.tasks ?? acc.tasks,
-    pr: result.pr ?? acc.pr,
-    subagents: result.subagents ?? acc.subagents,
-    working: result.working ?? acc.working,
-    events: acc.events.slice(0, result.from - acc.base).concat(result.events),
-  };
-}
 
 export function SessionTab({
   ticket,
-  tick,
   subagent,
   showComposer = true,
   onInspect,
 }: {
   ticket: string;
-  tick: number;
   subagent?: string;
   showComposer?: boolean;
   onInspect?: (agentId: string) => void;
 }) {
   const resetKey = `${ticket}:${subagent ?? ""}`;
-  const [session, setSession] = useState<SessionAcc | null>(() => sessionCache.get(resetKey) ?? null);
-  const [error, setError] = useState<string | null>(null);
-  const sessionRef = useRef<SessionAcc | null>(null);
   const rowHeightsKeyRef = useRef(resetKey);
   const rowHeightsRef = useRef<Map<number, RowMeasurement>>(new Map());
   const layoutRef = useRef<VirtualLayout | null>(null);
   const layoutResetKeyRef = useRef(resetKey);
+  const containerRef = useRef<HTMLDivElement | null>(null);
   const [rowHeightVersion, setRowHeightVersion] = useState(0);
   const uiState = useMemo(() => createSessionUiState(), [resetKey]);
 
@@ -1022,39 +1018,12 @@ export function SessionTab({
     rowHeightsRef.current = new Map();
   }
 
-  sessionRef.current = session;
-
-  useEffect(() => {
-    const cached = sessionCache.get(resetKey) ?? null;
-    setSession(cached);
-    setError(null);
-    sessionRef.current = cached;
-  }, [resetKey]);
-
-  useEffect(() => {
-    if (session) sessionCache.set(resetKey, session);
-    else sessionCache.delete(resetKey);
-  }, [resetKey, session]);
-
-  useEffect(() => {
-    let ignore = false;
-    const acc = sessionRef.current;
-    const after = acc ? acc.base + acc.events.length : 0;
-    (subagent
-      ? getSubagentSession(ticket, subagent, after)
-      : getAgentSession(ticket, after))
-      .then((result) => {
-        if (ignore) return;
-        setSession((prev) => spliceSession(prev, result));
-        setError(null);
-      })
-      .catch(() => {
-        if (!ignore) setError("No session transcript found.");
-      });
-    return () => {
-      ignore = true;
-    };
-  }, [resetKey, ticket, subagent, tick]);
+  const target = useMemo(
+    () => (subagent ? { ticket, subagent } : { ticket }),
+    [subagent, ticket]
+  );
+  const visible = useElementVisible(containerRef);
+  const { session, error, loading } = useTranscriptSession(target, visible);
 
   const groups = useMemo(
     () => groupEvents(session?.events ?? [], session?.base ?? 0),
@@ -1180,11 +1149,19 @@ export function SessionTab({
     return c;
   }, [session]);
 
-  if (error && !session) return <div className="session-empty">{error}</div>;
   if (!session) {
+    if (error && !loading) {
+      return (
+        <div className="session-tab" ref={containerRef}>
+          <div className="session-empty">{error}</div>
+        </div>
+      );
+    }
     return (
-      <div className="session-empty">
-        <LoadingPlaceholder className="session-loading" lines={[82, 96, 74, 88]} />
+      <div className="session-tab" ref={containerRef}>
+        <div className="session-empty">
+          <LoadingPlaceholder className="session-loading" lines={[82, 96, 74, 88]} />
+        </div>
       </div>
     );
   }
@@ -1192,7 +1169,7 @@ export function SessionTab({
   const tokens = formatTokens(session.tokens);
 
   return (
-    <>
+    <div className="session-tab" ref={containerRef}>
       {(session.tasks.length > 0 || session.pr) ? (
         <div className="session-state-strip">
           {session.tasks.length > 0 ? (
@@ -1237,10 +1214,10 @@ export function SessionTab({
       {subagent || !showComposer ? null : (
         <MessageComposer
           history={userHistory}
+          queued={session.queue}
           runningSubagents={runningSubagents}
           thinking={session.working}
           ticket={ticket}
-          tick={tick}
           onInspect={onInspect}
         />
       )}
@@ -1248,7 +1225,7 @@ export function SessionTab({
         {session.format} · {session.path.split("/").slice(-1)[0]}
         {tokens ? ` · ${tokens}` : ""}
       </div>
-    </>
+    </div>
   );
 }
 
@@ -1291,21 +1268,20 @@ function lineMove(text: string, at: number, dir: 1 | -1): number {
 
 function MessageComposer({
   ticket,
-  tick,
   history = [],
+  queued = [],
   runningSubagents = [],
   thinking = false,
   onInspect,
 }: {
   ticket: string;
-  tick: number;
   history?: string[];
+  queued?: QueuedMessage[];
   runningSubagents?: SubagentInfo[];
   thinking?: boolean;
   onInspect?: (agentId: string) => void;
 }) {
   const [text, setText] = useState(() => composerDraftCache.get(ticket) ?? "");
-  const [queued, setQueued] = useState<QueuedMessage[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [vimMode, setVimMode] = useState<"insert" | "normal" | "visual" | "pane">("insert");
@@ -1670,18 +1646,6 @@ function MessageComposer({
     historyPosRef.current = null;
   }, [ticket]);
 
-  useEffect(() => {
-    let ignore = false;
-    getAgentQueue(ticket)
-      .then((result) => {
-        if (!ignore) setQueued(result.messages);
-      })
-      .catch(() => {});
-    return () => {
-      ignore = true;
-    };
-  }, [ticket, tick]);
-
   function setVisualSelection(anchor: number, head: number) {
     requestAnimationFrame(() => {
       const el = inputRef.current;
@@ -1759,14 +1723,11 @@ function MessageComposer({
     setBusy(true);
     setError(null);
     try {
-      await sendAgentMessage(ticket, value, mode);
+      const result = await sendAgentMessage(ticket, value, mode);
       historyPosRef.current = null;
       setText("");
       setAttachments([]);
-      if (mode === "on-idle") {
-        const result = await getAgentQueue(ticket);
-        setQueued(result.messages);
-      }
+      if (mode === "on-idle" && result.messages) replaceTranscriptQueue(ticket, result.messages);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Send failed");
     } finally {
@@ -1777,9 +1738,9 @@ function MessageComposer({
   async function cancel(index: number) {
     try {
       const result = await cancelQueuedMessage(ticket, index);
-      setQueued(result.messages);
+      replaceTranscriptQueue(ticket, result.messages);
     } catch {
-      /* queue changed under us — next tick refreshes */
+      /* queue changed under us — the next session refresh will reconcile it */
     }
   }
 
@@ -2001,16 +1962,13 @@ export type SidebarTarget = {
 
 export function SessionSidebar({
   worker,
-  refreshTick,
   onClose,
   onOpenAgent,
 }: {
   worker: SidebarTarget;
-  refreshTick: number;
   onClose: () => void;
   onOpenAgent: (ticket: string, panel?: "review") => void;
 }) {
-  const tick = usePollTick(refreshTick);
   const [width, setWidth] = useState(() =>
     clampWidth(Number(localStorage.getItem(WIDTH_KEY)) || 480)
   );
@@ -2071,7 +2029,7 @@ export function SessionSidebar({
             <X size={14} />
           </button>
         </header>
-        <SessionTab showComposer={false} ticket={worker.ticket} tick={tick} />
+        <SessionTab showComposer={false} ticket={worker.ticket} />
       </div>
     </aside>
   );
