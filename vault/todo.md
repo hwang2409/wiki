@@ -9,7 +9,6 @@ updated: 2026-07-09
 Todo:
 
 - [P2] WIKI-35: agent session view surfaces status-file state — state badge + blocker banner in agent-session-surface header (blocked/merge-ready visible without going back to /agents); data already in /api/agents
-- [P1] WIKI-37: terminal panes — xterm.js (WebGL renderer) terminal:// pane type; backend pty over WS on the sidecar w/ per-boot auth token (native injects token); window-model participation (splits, C-a intercepts above, raw keys to pty); theme-matched palette; flow control + bounded scrollback. Spawn after WIKI-24 merges (App.tsx pane-type touch)
 
 In Progress:
 

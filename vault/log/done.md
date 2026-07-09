@@ -9,6 +9,7 @@ updated: 2026-07-09
 
 ## 2026-07-09
 
+- **WIKI-24** — window-switch state preservation merged (PR #29) — drafts/panels/scroll survive window switches
 - **WIKI-24** — window-switch state preservation — composer draft, open subagent/review panel, scroll survive N->J->N window switches (inactive windows unmount today; keep mounted-hidden or externalize per-pane state). Repeated pain: in-progress prompts lost when cross-referencing another session
 - **WIKI-32** — polling/delta overhaul — central transcript cache, pause hidden panes, patch-by-id deltas (subsumes WIKI-18) — spawn AFTER WIKI-31 merges
 - **phoebe** — PHO-13216 Core dossier + funnel snapshot data products (#10856 — account limit cap, stripeErroredCount, typed tags, spill markers)
