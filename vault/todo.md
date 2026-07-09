@@ -3,7 +3,7 @@ type: reference
 view: kanban
 tags: [todo]
 created: 2026-07-06
-updated: 2026-07-08
+updated: 2026-07-09
 ---
 
 Todo:
@@ -43,3 +43,4 @@ Backlog:
 - [P1] [PHO-13157](https://linear.app/phoebework/issue/PHO-13157): survey delayed-reply capture + chat-history link (folds 13106+13155, 2 customer reports) — cdx:PHO-13157 worker (gpt-5.4 xhigh)
 - [P2] WIKI-27: stabilize view-header height on note<->agent focus flips (40px pane jump, pre-existing — header collapses per focused-pane kind; fix per-window) + drop focusState.kind from pane.tsx getLinks deps (4 redundant /api/links per flip)
 - [P1] WIKI-34: watchdog limit parser misses same-day reset format ('try again at 8:01 PM' — no date) -> account stays eligible:true and rotation thrashes into dead accounts; parse bare time as today (tz-aware), pin outgoing account reset on every rotation
+- [P1] WIKI-36: backend env overrides for agent-registry/status-dir/msg-queue paths (main.py hardcodes /tmp/agent-registry.json — isolated test backends can't detach from live registry without monkey-patching; root cause of the 07-09 composer-probe breach)
