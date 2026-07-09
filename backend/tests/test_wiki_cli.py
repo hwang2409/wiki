@@ -78,6 +78,22 @@ class AgentUpdateSessionTests(unittest.TestCase):
             self.assertEqual(reloaded["WIKI-15"]["current"]["window"], "@99")
             self.assertNotIn("session_id", reloaded["WIKI-15"]["current"])
 
+    def test_orchestrator_registration_persists_model(self) -> None:
+        with TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / "agent-registry.json"
+            env = {
+                **os.environ,
+                "WIKI_AGENT_REGISTRY_PATH": str(registry_path),
+                "CLAUDE_CODE_SESSION_ID": "claude-session-1",
+            }
+            proc = self._run(["agent", "orch", "wiki", "--window", "@9", "--model", "sonnet"], env=env)
+            self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+            reloaded = json.loads(registry_path.read_text())
+            orch = reloaded["_orchestrators"]["wiki"]
+            self.assertEqual(orch["window"], "@9")
+            self.assertEqual(orch["model"], "sonnet")
+            self.assertEqual(orch["session_id"], "claude-session-1")
+
 
 class AgentDoneWindowCleanupTests(unittest.TestCase):
     def _run(self, args: list[str], env: dict) -> subprocess.CompletedProcess:

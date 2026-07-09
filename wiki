@@ -36,7 +36,9 @@ MAP = VAULT / "map.md"
 AGENT_REGISTRY = Path(
     os.environ.get("WIKI_AGENT_REGISTRY_PATH") or "/tmp/agent-registry.json"
 )
-AGENT_ARCHIVE = Path.home() / "me" / "fun" / "agent-archive"
+AGENT_ARCHIVE = Path(
+    os.environ.get("WIKI_AGENT_ARCHIVE_DIR") or Path.home() / "me" / "fun" / "agent-archive"
+)
 AGENT_ROLES = {"plan", "implement", "review"}
 AGENT_OUTCOMES = {"merged", "closed", "plan-ready", "abandoned", "handoff"}
 
@@ -502,6 +504,7 @@ def cmd_agent_orch(args: argparse.Namespace) -> None:
     orchs = registry.setdefault("_orchestrators", {})
     orchs[orch_id] = {
         "window": args.window,
+        "model": args.model,
         "cwd": str(cwd),
         "session_id": session_id,
         "transcript": transcript,
@@ -772,6 +775,7 @@ def main() -> None:
     orch = agent_sub.add_parser("orch", help="register THIS Claude session as an orchestrator (reads CLAUDE_CODE_SESSION_ID)")
     orch.add_argument("id", help="short label, e.g. phoebe")
     orch.add_argument("--window", help="tmux window_id of the orchestrator, e.g. @120")
+    orch.add_argument("--model", default="opus", help="Claude model for this orchestrator; default opus")
     orch.set_defaults(func=cmd_agent_orch)
 
     orch_done = agent_sub.add_parser("orch-done", help="deregister an orchestrator at session end")

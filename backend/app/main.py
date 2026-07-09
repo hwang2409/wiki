@@ -16,7 +16,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from . import accounts, github_pr, terminal, tokens, transcripts, uistate, vaultops
+from . import accounts, agent_replace, github_pr, terminal, tokens, transcripts, uistate, vaultops
 from .frontend_static import mount_frontend_static
 
 
@@ -319,9 +319,12 @@ class NoteLinks(BaseModel):
     unresolved: list[str]
 
 
-AGENT_REGISTRY_PATH = Path("/tmp/agent-registry.json")
-AGENT_STATUS_DIR = Path("/tmp/agent-status")
-AGENT_ARCHIVE_DIR = Path.home() / "me" / "fun" / "agent-archive"
+AGENT_REGISTRY_PATH = Path(os.environ.get("WIKI_AGENT_REGISTRY_PATH") or "/tmp/agent-registry.json")
+AGENT_STATUS_DIR = Path(os.environ.get("WIKI_AGENT_STATUS_DIR") or "/tmp/agent-status")
+AGENT_ARCHIVE_DIR = Path(
+    os.environ.get("WIKI_AGENT_ARCHIVE_DIR") or Path.home() / "me" / "fun" / "agent-archive"
+)
+AGENT_TMP_DIR = Path(os.environ.get("WIKI_AGENT_TMP_DIR") or "/tmp")
 ARCHIVE_TS_PATTERN = re.compile(r"^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})$")
 ANSI_PATTERN = re.compile(
     r"\x1b\[[0-9;?]*[ -/]*[@-~]"  # CSI incl. space-intermediate forms (e.g. ESC[0 q)
@@ -340,7 +343,7 @@ REASONING_EFFORTS = {"minimal", "low", "medium", "high", "xhigh"}
 MAX_SPAWN_PROMPT_BYTES = 100_000
 MAX_ORCH_GOAL_BYTES = 20_000
 ORCH_KICKOFF_TEMPLATE = """FIRST, self-register this Claude Code session before anything else:
-`~/me/fun/wiki/wiki agent orch {orch_id} --window "$(tmux display-message -p -t "$TMUX_PANE" '#{{window_id}}')"`
+`~/me/fun/wiki/wiki agent orch {orch_id} --model {model} --window "$(tmux display-message -p -t "$TMUX_PANE" '#{{window_id}}')"`
 
 You are the MASTERMIND ORCHESTRATOR for this project per the `tmux-ticket-codex` / `tmux-ticket-claude` skills.
 Your job is to spawn tmux workers for bounded tickets/tasks, monitor their status files and pane logs, steer them back on track, and independently gate PRs before merge.
@@ -560,6 +563,7 @@ def agents() -> dict[str, object]:
                 "window": orch.get("window"),
                 "window_alive": orch.get("window") in live_windows,
                 "cwd": orch.get("cwd"),
+                "model": orch.get("model"),
                 "spawned_at": orch.get("spawned_at"),
                 "transcript_exists": bool(transcript and Path(transcript).is_file()),
             }
@@ -960,7 +964,7 @@ async def get_tokens(
     )
 
 
-MSG_QUEUE_PATH = Path("/tmp/wiki-msg-queue.json")
+MSG_QUEUE_PATH = Path(os.environ.get("WIKI_MSG_QUEUE_PATH") or "/tmp/wiki-msg-queue.json")
 # codex: "• Working (26m 28s • esc to interrupt)" · claude: "✽ Leavening… (4m 26s · ↓ 6.0k tokens)"
 SPINNER_PATTERN = re.compile(r"esc to interrupt|\(\d+m\s\d+s\b|\(\d+s\b")
 
@@ -1025,9 +1029,22 @@ def resolve_existing_dir(raw_path: str, *, field_name: str) -> Path:
     return resolved
 
 
-def run_checked(args: list[str], *, timeout: int, label: str) -> subprocess.CompletedProcess[str]:
+def run_checked(
+    args: list[str],
+    *,
+    timeout: int,
+    label: str,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     try:
-        result = subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            env=env,
+        )
     except OSError as exc:
         raise RuntimeError(f"{label}: {exc}") from exc
     except subprocess.TimeoutExpired as exc:
@@ -1077,6 +1094,11 @@ def accept_claude_trust_prompt(window: str, *, timeout_seconds: float = 8.0) -> 
         time.sleep(0.25)
 
 
+@app.post("/api/agents/{agent_id}/replace")
+def replace_agent(agent_id: str) -> dict[str, object]:
+    return agent_replace.replace_agent(agent_id)
+
+
 @app.post("/api/agents/spawn")
 def spawn_agent(body: SpawnWorkerIn) -> dict[str, str]:
     ticket = body.ticket.strip()
@@ -1124,10 +1146,11 @@ def spawn_agent(body: SpawnWorkerIn) -> dict[str, str]:
     if isinstance(live_window, str) and live_window in tmux_live_windows():
         raise HTTPException(status_code=409, detail=f"{ticket} already has a live worker window")
 
-    prompt_path = Path("/tmp") / f"{kind}-{ticket}-prompt.md"
-    log_path = Path("/tmp") / f"{kind}-{ticket}.log"
+    prompt_path = AGENT_TMP_DIR / f"{kind}-{ticket}-prompt.md"
+    log_path = AGENT_TMP_DIR / f"{kind}-{ticket}.log"
     status_path = AGENT_STATUS_DIR / f"{ticket}.json"
     AGENT_STATUS_DIR.mkdir(parents=True, exist_ok=True)
+    AGENT_TMP_DIR.mkdir(parents=True, exist_ok=True)
     try:
         status_path.unlink(missing_ok=True)
         log_path.unlink(missing_ok=True)
@@ -1241,11 +1264,16 @@ def spawn_orchestrator(body: SpawnOrchestratorIn, background: BackgroundTasks) -
         if goal
         else "Print exactly one line: READY: orchestrator registered and awaiting instructions.\nThen wait for Henry to steer you via the wiki composer."
     )
-    prompt = ORCH_KICKOFF_TEMPLATE.format(orch_id=orch_id, goal_instruction=goal_instruction)
+    prompt = ORCH_KICKOFF_TEMPLATE.format(
+        orch_id=orch_id,
+        model=model,
+        goal_instruction=goal_instruction,
+    )
 
-    prompt_path = Path("/tmp") / f"cc-orch-{orch_id}-prompt.md"
-    log_path = Path("/tmp") / f"cc-orch-{orch_id}.log"
+    prompt_path = AGENT_TMP_DIR / f"cc-orch-{orch_id}-prompt.md"
+    log_path = AGENT_TMP_DIR / f"cc-orch-{orch_id}.log"
     try:
+        AGENT_TMP_DIR.mkdir(parents=True, exist_ok=True)
         log_path.unlink(missing_ok=True)
         prompt_path.unlink(missing_ok=True)
         prompt_path.write_text(prompt if prompt.endswith("\n") else f"{prompt}\n", encoding="utf-8")

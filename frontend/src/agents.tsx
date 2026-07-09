@@ -7,14 +7,16 @@ import {
   GitBranch,
   GitPullRequest,
   Plus,
+  RefreshCw,
   ScrollText,
   X,
 } from "lucide-react";
-import { getAgents, spawnAgentOrchestrator, spawnAgentWorker } from "./api";
+import { getAgents, replaceAgent, spawnAgentOrchestrator, spawnAgentWorker } from "./api";
 import type {
   AgentWorker,
   ArchivedWorker,
   Orchestrator,
+  ReplaceAgentResult,
   SpawnOrchestratorModel,
   SpawnWorkerEffort,
   SpawnWorkerKind,
@@ -679,6 +681,10 @@ export function AgentsView({
   const [spawnWorkerOpen, setSpawnWorkerOpen] = useState(false);
   const [spawnOrchestratorOpen, setSpawnOrchestratorOpen] = useState(false);
   const [spawnNotice, setSpawnNotice] = useState<SpawnNotice | null>(null);
+  const [replaceConfirm, setReplaceConfirm] = useState<string | null>(null);
+  const [replacePending, setReplacePending] = useState<string | null>(null);
+  const [replaceNotice, setReplaceNotice] = useState<ReplaceAgentResult | null>(null);
+  const [replaceError, setReplaceError] = useState<string | null>(null);
 
   useEffect(() => {
     if (data) return;
@@ -725,7 +731,7 @@ export function AgentsView({
           ticket: openOrch.id,
           kind: "cc",
           role: "orchestrator",
-          model: null,
+          model: openOrch.model,
           pr: null,
           canReview: false,
         }
@@ -747,6 +753,48 @@ export function AgentsView({
   const ungrouped = liveWorkers.filter(
     (worker) => !worker.orch || !orchestrators.some((orch) => orch.id === worker.orch)
   );
+
+  async function requestReplace(id: string) {
+    if (replacePending) return;
+    if (replaceConfirm !== id) {
+      setReplaceConfirm(id);
+      setReplaceNotice(null);
+      setReplaceError(null);
+      return;
+    }
+    setReplacePending(id);
+    setReplaceError(null);
+    try {
+      const result = await replaceAgent(id);
+      setReplaceNotice(result);
+      setSpawnNotice(null);
+      setReplaceConfirm(null);
+      onOpenTicket(result.id);
+    } catch (err) {
+      setReplaceError(err instanceof Error ? err.message : "Could not replace agent");
+    } finally {
+      setReplacePending(null);
+    }
+  }
+
+  function ReplaceButton({ id, disabled = false }: { id: string; disabled?: boolean }) {
+    const confirming = replaceConfirm === id;
+    const pending = replacePending === id;
+    return (
+      <button
+        className={`agent-replace-button${confirming ? " is-confirming" : ""}`}
+        disabled={disabled || Boolean(replacePending)}
+        title={disabled ? "Registered window is not live" : "Kill this run and spawn a replacement"}
+        type="button"
+        onClick={() => {
+          void requestReplace(id);
+        }}
+      >
+        <RefreshCw size={12} />
+        {pending ? "Replacing" : confirming ? "Confirm replace" : "Replace"}
+      </button>
+    );
+  }
 
   function renderWorker(worker: AgentWorker) {
     const flag = healthFlag(worker);
@@ -821,14 +869,17 @@ export function AgentsView({
               Review
             </button>
           ) : null}
-          <button
-            className={`agent-log-toggle${isOpen ? " is-active" : ""}`}
-            type="button"
-            onClick={() => onOpenTicket(isOpen ? null : worker.ticket)}
-          >
-            <ScrollText size={13} />
-            log
-          </button>
+          <span className="agent-actions">
+            <ReplaceButton id={worker.ticket} disabled={!worker.window || !worker.window_alive} />
+            <button
+              className={`agent-log-toggle${isOpen ? " is-active" : ""}`}
+              type="button"
+              onClick={() => onOpenTicket(isOpen ? null : worker.ticket)}
+            >
+              <ScrollText size={13} />
+              log
+            </button>
+          </span>
         </div>
       </article>
     );
@@ -855,24 +906,28 @@ export function AgentsView({
       <>
         {grouped.map(({ orch, owned }) => (
           <div className="agents-orch-group" key={orch.id}>
-            <div className="agents-orch-head">
-              <Bot size={13} />
-              <span className="agents-orch-id">{orch.id}</span>
-              {orch.cwd ? (
-                <span className="agents-orch-cwd">{orch.cwd.split("/").slice(-1)[0]}</span>
-              ) : null}
-              {orch.window && !orch.window_alive ? (
-                <span className="agents-orch-dead">window gone</span>
-              ) : null}
-              <button
-                className={`agent-log-toggle${openTicket === orch.id ? " is-active" : ""}`}
-                type="button"
-                onClick={() => onOpenTicket(openTicket === orch.id ? null : orch.id)}
-              >
-                <ScrollText size={13} />
-                log
-              </button>
-            </div>
+              <div className="agents-orch-head">
+                <Bot size={13} />
+                <span className="agents-orch-id">{orch.id}</span>
+                {orch.model ? <span className="agent-chip is-faint">{orch.model}</span> : null}
+                {orch.cwd ? (
+                  <span className="agents-orch-cwd">{orch.cwd.split("/").slice(-1)[0]}</span>
+                ) : null}
+                {orch.window && !orch.window_alive ? (
+                  <span className="agents-orch-dead">window gone</span>
+                ) : null}
+                <span className="agents-orch-actions">
+                  <ReplaceButton id={orch.id} disabled={!orch.window || !orch.window_alive} />
+                  <button
+                    className={`agent-log-toggle${openTicket === orch.id ? " is-active" : ""}`}
+                    type="button"
+                    onClick={() => onOpenTicket(openTicket === orch.id ? null : orch.id)}
+                  >
+                    <ScrollText size={13} />
+                    log
+                  </button>
+                </span>
+              </div>
             {owned.map(renderWorker)}
             {owned.length === 0 ? (
               <div className="agents-orch-empty">no registered workers</div>
@@ -1000,6 +1055,13 @@ export function AgentsView({
             </div>
           )
         ) : null}
+        {replaceNotice ? (
+          <div className="agents-notice">
+            replaced <code>{replaceNotice.id}</code> · new tmux <code>{replaceNotice.window}</code> · log{" "}
+            <code>{replaceNotice.log}</code>
+          </div>
+        ) : null}
+        {replaceError ? <div className="agents-notice is-error">{replaceError}</div> : null}
         {body}
       </div>
       {openWorker ? (

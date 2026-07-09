@@ -3069,6 +3069,11 @@ body.is-resizing-panes .pane-cell {
   font-size: inherit;
 }
 
+.agents-notice.is-error {
+  border-color: var(--accent-danger);
+  color: var(--accent-danger);
+}
+
 .agents-account-banner {
   display: flex;
   flex-direction: column;
@@ -3267,6 +3272,14 @@ body.is-resizing-panes .pane-cell {
   text-decoration: underline;
 }
 
+.agent-actions,
+.agents-orch-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
 .agent-log-toggle {
   display: inline-flex;
   align-items: center;
@@ -3280,12 +3293,42 @@ body.is-resizing-panes .pane-cell {
   transition-timing-function: ease-out;
 }
 
+.agent-actions .agent-log-toggle,
+.agents-orch-actions .agent-log-toggle {
+  margin-left: 0;
+}
+
 .agent-log-toggle:hover {
   color: var(--text-normal);
 }
 
 .agent-log-toggle.is-active {
   color: var(--text-normal);
+}
+
+.agent-replace-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  transition-property: color;
+  transition-duration: 100ms;
+  transition-timing-function: ease-out;
+}
+
+.agent-replace-button:hover {
+  color: var(--text-normal);
+}
+
+.agent-replace-button.is-confirming {
+  color: var(--accent-danger);
+}
+
+.agent-replace-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
 }
 
 .agent-card.is-selected {
@@ -4600,7 +4643,7 @@ body.is-resizing-panes .pane-cell {
   font-style: italic;
 }
 
-.agents-orch-head .agent-log-toggle {
+.agents-orch-head > .agent-log-toggle {
   margin-left: auto;
 }
 
