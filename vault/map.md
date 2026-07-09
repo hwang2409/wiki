@@ -47,6 +47,10 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[wiki-native-tauri-dragdrop-html5]] — Tauri webview drag-drop handler kills HTML5 DnD — check before debugging dead drags in any Tauri app
 - [[wkwebview-eval-defer-clobber]] — WKWebView defers window.eval past navigate() — injected loading page clobbers loaded app when backend boots fast
 
+## Phoebe/decisions
+
+- [[admin-db-reads-generated-catalog]] — Admin agent DB access: schema-wide reads via migrate-apply generated catalog + secret deny-tier + cost guardrails; allow-list curation retired (PHO-13273)
+
 ## Families (path patterns, not enumerated)
 
 - `log/YYYY-MM-DD.md` — daily end-of-day changelogs, cross-project.
