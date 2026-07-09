@@ -39,6 +39,7 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[codebuild-secrets-json-key-drift]] — CodeBuild migrate failure: Secrets Manager JSON key missing during environment processing
 - [[voice-qa-clock-writeback-action-family]] — Voice QA clock writeback can be blocked by QA_VOICE_AGENT_ENABLED_ACTION_FAMILIES vs call audit_context mismatch
 - [[admin-call-search-hydrates-transcripts]] — Core semantic call search hydrates full transcript rows before list serialization; root cause for PHO-13225 ReadTimeouts
+- [[buildbuddy-executeworkflow-pr-context]] — BuildBuddy ExecuteWorkflow on a PR branch runs branch-push workflow steps unless GitHub PR context is present
 
 ## Tools/til
 
