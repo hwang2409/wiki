@@ -203,6 +203,28 @@ export type SessionTask = {
 
 export type SessionPr = { number: number; url: string };
 
+export type SessionQuestion = {
+  prompt: string;
+  header?: string | null;
+  options: string[];
+  answered_option: number | null;
+  custom_reply: string | null;
+};
+
+export type SessionDisposition = "rendered" | "summarized" | "intentionally_ignored" | "unknown";
+
+export type SessionDispositionCounts = {
+  rendered: number;
+  summarized: number;
+  ignored: number;
+  unknown: number;
+};
+
+export type SessionMeta = {
+  custom_title?: string;
+  agent_name?: string;
+};
+
 export type SessionEvent = {
   id: number;
   kind:
@@ -218,14 +240,18 @@ export type SessionEvent = {
     | "tasks"
     | "interrupt"
     | "pr"
-    | "marker";
+    | "marker"
+    | "question";
   ts: string | null;
   text: string;
+  disposition: SessionDisposition;
   tool?: SessionTool;
   bash?: SessionBash;
   tasks?: SessionTask[];
   pr?: SessionPr;
   marker?: string;
+  encrypted?: boolean;
+  question?: SessionQuestion;
 };
 
 export type SubagentInfo = {
@@ -247,6 +273,8 @@ export type AgentSessionData = {
   tokens: number | null;
   tasks?: SessionTask[];
   pr?: SessionPr | null;
+  session_meta?: SessionMeta;
+  dispositions?: SessionDispositionCounts;
   base: number;
   cursor: number;
   tail_from: number;

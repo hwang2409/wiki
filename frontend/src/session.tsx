@@ -15,6 +15,7 @@ import {
   GitPullRequest,
   Hourglass,
   ListTodo,
+  Lock,
   MessageCircleQuestion,
   Pencil,
   Radio,
@@ -321,6 +322,20 @@ function formatTokens(tokens: number | null): string | null {
   return `${tokens} tok`;
 }
 
+function formatDispositionCounts({
+  rendered,
+  summarized,
+  ignored,
+  unknown,
+}: {
+  rendered: number;
+  summarized: number;
+  ignored: number;
+  unknown: number;
+}): string {
+  return `R ${rendered} · S ${summarized} · I ${ignored} · U ${unknown}`;
+}
+
 const IMG_TOKEN_PATTERN = /\u27e6img:([^\u27e7]+)\u27e7/g;
 
 function splitImgTokens(text: string): (string | { url: string })[] {
@@ -515,6 +530,8 @@ function getEstimatedGroupHeight(group: EventGroup): number {
       );
     case "tasks":
       return Math.max(72, 40 + (group.event.tasks?.length ?? 0) * 28);
+    case "question":
+      return Math.max(132, 56 + ((group.event.question?.options.length ?? 0) * 28));
     case "terminal":
       return Math.max(60, 24 + estimateWrappedLines(group.event.text, 112) * 18);
     case "user":
@@ -781,11 +798,61 @@ function PrRow({ pr, text }: { pr: SessionPr | undefined; text: string }) {
 }
 
 function MarkerRow({ text, marker }: { text: string; marker?: string }) {
-  const Icon = marker === "api_error" ? AlertTriangle : Radio;
+  const Icon =
+    marker === "api_error"
+      ? AlertTriangle
+      : marker === "permission-mode"
+        ? Lock
+        : marker === "progress" || marker === "subagent"
+          ? Bot
+          : marker === "tool_reference"
+            ? Wrench
+            : Radio;
   return (
     <div className={`session-marker is-${marker ?? "info"}`}>
       <Icon size={12} />
       <span>{text}</span>
+    </div>
+  );
+}
+
+function QuestionRow({ event }: { event: SessionEvent }) {
+  const question = event.question;
+  if (!question) return null;
+  const answered =
+    question.answered_option !== null
+      ? question.options[question.answered_option] ?? null
+      : null;
+  return (
+    <div className="session-question">
+      <div className="session-question-head">
+        <MessageCircleQuestion size={13} />
+        <span>{question.header || "Question"}</span>
+      </div>
+      <div className="session-question-prompt">{question.prompt}</div>
+      <div className="session-question-options">
+        {question.options.map((option, index) => (
+          <div
+            className={`session-question-option${question.answered_option === index ? " is-picked" : ""}`}
+            key={`${question.prompt}:${option}:${index}`}
+          >
+            <span className="session-question-index">{index + 1}</span>
+            <span>{option}</span>
+          </div>
+        ))}
+      </div>
+      {answered ? (
+        <div className="session-question-answer">
+          <span className="session-question-answer-label">Picked</span>
+          <span>{answered}</span>
+        </div>
+      ) : null}
+      {question.custom_reply ? (
+        <div className="session-question-custom">
+          <span className="session-question-answer-label">Custom reply</span>
+          <span>{question.custom_reply}</span>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -839,6 +906,9 @@ const MessageBlock = memo(function MessageBlock({
   }
   if (event.kind === "tasks") {
     return <TaskListRow event={event} stateKey={`tasks:${rowKey}`} uiState={uiState} />;
+  }
+  if (event.kind === "question") {
+    return <QuestionRow event={event} />;
   }
   if (event.kind === "interrupt") {
     return <InterruptRow text={event.text} />;
@@ -904,6 +974,7 @@ function ActivityGroupBase({
               if (!event.text) return null;
               return (
                 <div className="session-thinking" key={groupKey + index}>
+                  {event.encrypted ? <span className="session-thinking-chip">encrypted</span> : null}
                   {event.text}
                 </div>
               );
@@ -1395,11 +1466,18 @@ export function SessionTab({
   }
 
   const tokens = formatTokens(session.tokens);
+  const dispositionCounts = formatDispositionCounts(session.dispositions);
 
   return (
     <div className="session-tab" ref={containerRef}>
-      {(session.tasks.length > 0 || session.pr) ? (
+      {(session.tasks.length > 0 || session.pr || session.sessionMeta.custom_title || session.sessionMeta.agent_name) ? (
         <div className="session-state-strip">
+          {session.sessionMeta.custom_title ? (
+            <span className="session-state-meta">{session.sessionMeta.custom_title}</span>
+          ) : null}
+          {session.sessionMeta.agent_name ? (
+            <span className="session-state-meta is-faint">{session.sessionMeta.agent_name}</span>
+          ) : null}
           {session.tasks.length > 0 ? (
             <span className="session-state-tasks">
               <ListTodo size={12} />
@@ -1422,6 +1500,10 @@ export function SessionTab({
           ) : null}
         </div>
       ) : null}
+      <div className="session-dispositions">
+        <span className="session-dispositions-label">Inspector</span>
+        <span className="session-dispositions-value">{dispositionCounts}</span>
+      </div>
       <div className="session-scroll" ref={ref}>
         <div className="session-scroll-inner" ref={innerRef}>
           <div className="session-virtual-list" style={{ height: layout.totalHeight }}>
@@ -1453,6 +1535,7 @@ export function SessionTab({
       <div className="session-footer tabular-nums">
         {session.format} · {session.path.split("/").slice(-1)[0]}
         {tokens ? ` · ${tokens}` : ""}
+        {` · ${dispositionCounts}`}
       </div>
     </div>
   );

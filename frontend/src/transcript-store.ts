@@ -3,6 +3,8 @@ import {
   getAgentSession,
   getSubagentSession,
   type AgentSessionData,
+  type SessionDispositionCounts,
+  type SessionMeta,
   type QueuedMessage,
   type SessionEvent,
   type SessionPatch,
@@ -24,6 +26,8 @@ export type TranscriptSession = {
   tokens: number | null;
   tasks: SessionTask[];
   pr: SessionPr | null;
+  sessionMeta: SessionMeta;
+  dispositions: SessionDispositionCounts;
   base: number;
   cursor: number;
   events: SessionEvent[];
@@ -107,6 +111,8 @@ function buildSession(result: AgentSessionData): TranscriptSession {
     tokens: result.tokens,
     tasks: result.tasks ?? [],
     pr: result.pr ?? null,
+    sessionMeta: result.session_meta ?? {},
+    dispositions: result.dispositions ?? { rendered: 0, summarized: 0, ignored: 0, unknown: 0 },
     base: result.base,
     cursor: result.cursor,
     events: result.events,
@@ -180,6 +186,8 @@ function mergeSession(current: TranscriptSession | null, result: AgentSessionDat
     tokens: result.tokens,
     tasks: result.tasks ?? current.tasks,
     pr: result.pr ?? current.pr,
+    sessionMeta: result.session_meta ?? current.sessionMeta,
+    dispositions: result.dispositions ?? current.dispositions,
     base,
     cursor: result.cursor,
     events,
