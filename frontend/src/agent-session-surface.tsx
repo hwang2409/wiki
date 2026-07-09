@@ -111,14 +111,12 @@ function SubagentSidePanel({
   onResizeStart,
   subagent,
   ticket,
-  tick,
   width,
 }: {
   onClose: () => void;
   onResizeStart: (event: ReactPointerEvent<HTMLDivElement>) => void;
   subagent: string;
   ticket: string;
-  tick: number;
   width: number;
 }) {
   return (
@@ -131,7 +129,7 @@ function SubagentSidePanel({
       title={`subagent ${subagent.slice(0, 8)}`}
       width={width}
     >
-      <SessionTab showComposer={false} subagent={subagent} ticket={ticket} tick={tick} />
+      <SessionTab showComposer={false} subagent={subagent} ticket={ticket} />
     </SessionSidePanel>
   );
 }
@@ -235,7 +233,7 @@ export function AgentSessionSurface({
           ) : null}
         </header>
         <div className="agent-session-surface-main">
-          <SessionTab ticket={worker.ticket} tick={tick} onInspect={inspectSubagent} />
+          <SessionTab ticket={worker.ticket} onInspect={inspectSubagent} />
         </div>
       </section>
       {panel?.kind === "review" ? (
@@ -253,7 +251,6 @@ export function AgentSessionSurface({
           onResizeStart={resizePanel}
           subagent={panel.subagent}
           ticket={worker.ticket}
-          tick={tick}
           width={panelWidth}
         />
       ) : null}

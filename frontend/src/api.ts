@@ -187,6 +187,7 @@ export type SessionTask = {
 export type SessionPr = { number: number; url: string };
 
 export type SessionEvent = {
+  id: number;
   kind:
     | "user"
     | "assistant"
@@ -216,16 +217,26 @@ export type SubagentInfo = {
   head: string;
 };
 
+export type SessionPatch = {
+  id: number;
+  output: string | null;
+  ok: boolean | null;
+};
+
 export type AgentSessionData = {
-  format: "codex" | "claude";
+  version: 2;
+  format: "codex" | "claude" | "pane-log";
   path: string;
   tokens: number | null;
   tasks?: SessionTask[];
   pr?: SessionPr | null;
-  from: number;
-  total: number;
+  base: number;
+  cursor: number;
+  tail_from: number;
   events: SessionEvent[];
+  patches: SessionPatch[];
   subagents?: SubagentInfo[];
+  queue?: QueuedMessage[];
   working?: boolean;
 };
 
@@ -265,10 +276,13 @@ export type AgentPrData = {
 };
 
 export function sendAgentMessage(ticket: string, text: string, mode: "now" | "on-idle") {
-  return request<{ status: string }>(`/api/agents/${encodeURIComponent(ticket)}/message`, {
-    method: "POST",
-    body: JSON.stringify({ text, mode }),
-  });
+  return request<{ status: string; position?: number; messages?: QueuedMessage[] }>(
+    `/api/agents/${encodeURIComponent(ticket)}/message`,
+    {
+      method: "POST",
+      body: JSON.stringify({ text, mode }),
+    }
+  );
 }
 
 export function getAgentQueue(ticket: string) {
@@ -286,7 +300,7 @@ export function cancelQueuedMessage(ticket: string, index: number) {
 
 export function getAgentSession(ticket: string, after = 0) {
   return request<AgentSessionData>(
-    `/api/agents/${encodeURIComponent(ticket)}/session?after=${after}`
+    `/api/agents/${encodeURIComponent(ticket)}/session?cursor=${after}`
   );
 }
 
@@ -305,7 +319,7 @@ export function uploadImage(mediaType: string, base64: string) {
 
 export function getSubagentSession(ticket: string, agentId: string, after = 0) {
   return request<AgentSessionData>(
-    `/api/agents/${encodeURIComponent(ticket)}/subagents/${encodeURIComponent(agentId)}/session?after=${after}`
+    `/api/agents/${encodeURIComponent(ticket)}/subagents/${encodeURIComponent(agentId)}/session?cursor=${after}`
   );
 }
 

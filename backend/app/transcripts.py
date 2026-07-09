@@ -23,6 +23,7 @@ KICKOFF_TICKET_PATTERN = re.compile(r"(?:Linear )?ticket ([A-Z]+-\d+)\b")
 
 MAX_TEXT = 80_000
 MAX_TOOL_IO = 3_000
+MAX_CHANGE_LOG = 4_096
 
 TRANSCRIPT_IMAGE_DIR = Path("/tmp/wiki-transcript-images")
 
@@ -73,6 +74,29 @@ def _codex_kickoff_ticket(path: Path) -> str | None:
                 if row.get("type") == "event_msg" and payload.get("type") == "user_message":
                     match = KICKOFF_TICKET_PATTERN.search(payload.get("message") or "")
                     return match.group(1) if match else None
+    except OSError:
+        return None
+    return None
+
+
+def detect_session_format(path: Path) -> str | None:
+    try:
+        with path.open(encoding="utf-8", errors="replace") as f:
+            for _ in range(200):
+                line = f.readline()
+                if not line:
+                    break
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                rtype = row.get("type")
+                if rtype in {"event_msg", "response_item", "turn_context"}:
+                    return "codex"
+                if rtype in {"user", "assistant", "system", "attachment", "pr-link"}:
+                    return "claude"
     except OSError:
         return None
     return None
@@ -469,6 +493,52 @@ def _dedupe_pair(state: dict, source: str, role: str, text: str) -> bool:
     return False
 
 
+def _record_change(state: dict, change: dict) -> None:
+    cursor = int(state.get("cursor", 0)) + 1
+    state["cursor"] = cursor
+    entry = {"cursor": cursor, **change}
+    changes: list[dict] = state.setdefault("changes", [])
+    changes.append(entry)
+    if len(changes) > MAX_CHANGE_LOG:
+        del changes[: len(changes) - MAX_CHANGE_LOG]
+
+
+def _append_event(state: dict, event: dict) -> dict:
+    event_id = int(state.get("next_event_id", state.get("base", 0) + len(state.get("events", []))))
+    event["id"] = event_id
+    state["next_event_id"] = event_id + 1
+    state["events"].append(event)
+    _record_change(state, {"kind": "tail", "from": event_id})
+    return event
+
+
+def _replace_event_at(state: dict, index: int, event: dict) -> dict:
+    current = state["events"][index]
+    event["id"] = current["id"]
+    state["events"][index] = event
+    _record_change(state, {"kind": "tail", "from": int(event["id"])})
+    return event
+
+
+def _mark_tail_changed(state: dict, index: int) -> None:
+    event = state["events"][index]
+    _record_change(state, {"kind": "tail", "from": int(event["id"])})
+
+
+def _record_tool_patch(state: dict, event: dict) -> None:
+    tool = event.get("tool") or {}
+    _record_change(
+        state,
+        {
+            "kind": "patch",
+            "id": int(event["id"]),
+            "index": int(event["id"]),
+            "output": tool.get("output"),
+            "ok": tool.get("ok"),
+        },
+    )
+
+
 def _codex_apply(state: dict, row: dict) -> None:
     events: list = state["events"]
     pending: dict = state["pending"]  # call_id → event (awaiting output)
@@ -481,31 +551,32 @@ def _codex_apply(state: dict, row: dict) -> None:
         if ptype == "user_message":
             text = _clip(payload.get("message") or "", MAX_TEXT)
             if text and not _dedupe_pair(state, "event_msg", "user", text):
-                events.append({"kind": "user", "ts": ts, "text": text})
+                _append_event(state, {"kind": "user", "ts": ts, "text": text})
         elif ptype == "agent_message":
             text = _clip(payload.get("message") or "", MAX_TEXT)
             if text and not _dedupe_pair(state, "event_msg", "assistant", text):
-                events.append({"kind": "assistant", "ts": ts, "text": text})
+                _append_event(state, {"kind": "assistant", "ts": ts, "text": text})
         elif ptype == "token_count":
             info = payload.get("info") or {}
             total = (info.get("total_token_usage") or {}).get("total_tokens")
             if total:
                 state["tokens"] = total
         elif ptype == "context_compacted":
-            events.append({"kind": "thinking", "ts": ts, "text": "context compacted"})
+            _append_event(state, {"kind": "thinking", "ts": ts, "text": "context compacted"})
         elif ptype == "turn_aborted":
             reason = payload.get("reason") or "aborted"
             duration_ms = payload.get("duration_ms")
             text = f"turn aborted ({reason})"
             if isinstance(duration_ms, (int, float)) and duration_ms:
                 text += f" · {int(duration_ms // 1000)}s"
-            events.append({"kind": "interrupt", "ts": ts, "text": text})
+            _append_event(state, {"kind": "interrupt", "ts": ts, "text": text})
         elif ptype in ("patch_apply_end", "mcp_tool_call_end", "web_search_end"):
             event = pending.pop(payload.get("call_id"), None)
             if event:
                 out, ok = _codex_tool_end_output(ptype, payload)
                 event["tool"]["output"] = _clip(str(out), MAX_TOOL_IO)
                 event["tool"]["ok"] = ok
+                _record_tool_patch(state, event)
     elif rtype == "response_item":
         if ptype == "message":
             role = payload.get("role")
@@ -520,13 +591,13 @@ def _codex_apply(state: dict, row: dict) -> None:
             text = "\n".join(parts).strip()
             if not text or _dedupe_pair(state, "response_item", role, text):
                 return
-            events.append({"kind": role, "ts": ts, "text": _clip(text, MAX_TEXT)})
+            _append_event(state, {"kind": role, "ts": ts, "text": _clip(text, MAX_TEXT)})
         elif ptype == "reasoning":
             summary = payload.get("summary") or []
             text = " ".join(
                 s.get("text", "") for s in summary if isinstance(s, dict)
             ).strip()
-            events.append({"kind": "thinking", "ts": ts, "text": _clip(text, MAX_TEXT)})
+            _append_event(state, {"kind": "thinking", "ts": ts, "text": _clip(text, MAX_TEXT)})
         elif ptype in ("function_call", "custom_tool_call", "web_search_call", "tool_search_call"):
             name = payload.get("name") or ptype.replace("_call", "")
             raw_input = payload.get("arguments", payload.get("input", payload.get("action", "")))
@@ -545,7 +616,7 @@ def _codex_apply(state: dict, row: dict) -> None:
                     "summary": summary,
                 },
             }
-            events.append(event)
+            _append_event(state, event)
             call_id = payload.get("call_id")
             if call_id:
                 pending[call_id] = event
@@ -557,6 +628,7 @@ def _codex_apply(state: dict, row: dict) -> None:
                     output = output.get("content") or json.dumps(output)
                 event["tool"]["output"] = _clip(str(output or ""), MAX_TOOL_IO)
                 event["tool"]["ok"] = "exited with code 0" in str(output or "") or None
+                _record_tool_patch(state, event)
 
 
 # ---------------------------------------------------------------- claude parser
@@ -587,7 +659,7 @@ def _emit_tasks(state: dict, ts: str | None) -> None:
         f"{total} task{'s' if total != 1 else ''} "
         f"({counts['completed']} done, {counts['in_progress']} in progress, {counts['pending']} open)"
     )
-    state["events"].append({"kind": "tasks", "ts": ts, "text": summary, "tasks": snap})
+    _append_event(state, {"kind": "tasks", "ts": ts, "text": summary, "tasks": snap})
 
 
 def _apply_task_delta(state: dict, row: dict, task_meta: dict, ts: str | None) -> None:
@@ -723,9 +795,9 @@ def _append_claude_user(state: dict, event: dict, row: dict) -> None:
                     shell[key] = next_shell[key]
             current["text"] = shell.get("input") or shell.get("stdout") or shell.get("stderr") or ""
             state["last_bash"] = {"row_uuid": row.get("uuid"), "index": len(events) - 1}
-            state["tail_replaced"] = True
+            _mark_tail_changed(state, len(events) - 1)
             return
-        events.append(event)
+        _append_event(state, event)
         state["last_bash"] = {"row_uuid": row.get("uuid"), "index": len(events) - 1}
         return
     parent = row.get("parentUuid")
@@ -737,10 +809,9 @@ def _append_claude_user(state: dict, event: dict, row: dict) -> None:
         and prev["parent"] == parent
         and prev["index"] == len(events) - 1
     ):
-        events[-1] = event
-        state["tail_replaced"] = True
+        _replace_event_at(state, len(events) - 1, event)
     else:
-        events.append(event)
+        _append_event(state, event)
     if event["kind"] == "user":
         state["last_user"] = {"parent": parent, "index": len(events) - 1}
 
@@ -797,7 +868,7 @@ def _claude_apply(state: dict, row: dict) -> None:
             info = {"number": number, "url": url}
             if state.get("pr") != info:
                 state["pr"] = info
-                events.append({"kind": "pr", "ts": ts, "text": f"PR #{number}", "pr": info})
+                _append_event(state, {"kind": "pr", "ts": ts, "text": f"PR #{number}", "pr": info})
         return
 
     if rtype == "system":
@@ -807,12 +878,15 @@ def _claude_apply(state: dict, row: dict) -> None:
             error = error_raw if isinstance(error_raw, dict) else {}
             detail = row.get("content") or error.get("formatted") or error.get("message")
             text = f"{label}: {detail}" if detail else label
-            events.append({
-                "kind": "marker",
-                "ts": ts,
-                "text": _clip(str(text), 400),
-                "marker": row.get("subtype"),
-            })
+            _append_event(
+                state,
+                {
+                    "kind": "marker",
+                    "ts": ts,
+                    "text": _clip(str(text), 400),
+                    "marker": row.get("subtype"),
+                },
+            )
         return
 
     if rtype == "attachment":
@@ -873,9 +947,12 @@ def _claude_apply(state: dict, row: dict) -> None:
                 if rtype == "user":
                     pass  # handled by _assemble_user_content above
                 else:
-                    events.append({"kind": "assistant", "ts": ts, "text": _clip(text, MAX_TEXT)})
+                    _append_event(state, {"kind": "assistant", "ts": ts, "text": _clip(text, MAX_TEXT)})
         elif btype == "thinking":
-            events.append({"kind": "thinking", "ts": ts, "text": _clip(block.get("thinking") or "", MAX_TEXT)})
+            _append_event(
+                state,
+                {"kind": "thinking", "ts": ts, "text": _clip(block.get("thinking") or "", MAX_TEXT)},
+            )
 
         elif btype == "tool_use":
             name = block.get("name") or "tool"
@@ -899,7 +976,7 @@ def _claude_apply(state: dict, row: dict) -> None:
                 prompt = raw_input.get("prompt")
                 if isinstance(prompt, str):
                     event["tool"]["prompt_head"] = prompt[:120]
-            events.append(event)
+            _append_event(state, event)
             if block.get("id"):
                 pending[block["id"]] = event
                 if name == "TaskCreate" and isinstance(raw_input, dict):
@@ -925,6 +1002,7 @@ def _claude_apply(state: dict, row: dict) -> None:
                     )
                 event["tool"]["output"] = _clip(str(result or ""), MAX_TOOL_IO)
                 event["tool"]["ok"] = not block.get("is_error")
+                _record_tool_patch(state, event)
             task_meta = state.get("task_inputs", {}).pop(tool_use_id, None) if tool_use_id else None
             if task_meta:
                 _apply_task_delta(state, row, task_meta, ts)
@@ -934,6 +1012,45 @@ def _claude_apply(state: dict, row: dict) -> None:
 
 _APPLY = {"codex": _codex_apply, "claude": _claude_apply, "claude-sub": _claude_apply}
 _cache: dict[str, dict] = {}  # path → parse state; wiped on reload, rebuilt lazily
+
+
+def _new_parse_state(fmt: str) -> dict:
+    return {
+        "offset": 0,
+        "buffer": "",
+        "events": [],
+        "pending": {},
+        "tokens": None,
+        "base": 0,
+        "next_event_id": 0,
+        "cursor": 0,
+        "changes": [],
+        "last_user": None,
+        "last_bash": None,
+        "sidechain_ok": fmt == "claude-sub",
+        "tasks": [],
+        "tasks_key": (),
+        "pr": None,
+        "task_inputs": {},
+        "task_activeform": {},
+        "dedupe_credits": {},
+    }
+
+
+def _prune_change_log(state: dict) -> None:
+    base = int(state["base"])
+    state["changes"] = [
+        change
+        for change in state.get("changes", [])
+        if (
+            change.get("kind") == "tail"
+            and int(change.get("from", base)) >= base
+        )
+        or (
+            change.get("kind") == "patch"
+            and int(change.get("index", base)) >= base
+        )
+    ]
 
 
 def read_session_events(fmt: str, path: Path) -> dict:
@@ -948,24 +1065,7 @@ def read_session_events(fmt: str, path: Path) -> dict:
     stat = path.stat()
     state = _cache.get(key)
     if state is None or stat.st_size < state["offset"]:
-        state = {
-            "offset": 0,
-            "buffer": "",
-            "events": [],
-            "pending": {},
-            "tokens": None,
-            "base": 0,
-            "last_user": None,
-            "last_bash": None,
-            "tail_replaced": False,
-            "sidechain_ok": fmt == "claude-sub",
-            "tasks": [],
-            "tasks_key": (),
-            "pr": None,
-            "task_inputs": {},
-            "task_activeform": {},
-            "dedupe_credits": {},
-        }
+        state = _new_parse_state(fmt)
         _cache[key] = state
     if stat.st_size > state["offset"]:
         apply = _APPLY[fmt]
@@ -987,12 +1087,14 @@ def read_session_events(fmt: str, path: Path) -> dict:
             except (KeyError, TypeError, AttributeError):
                 continue
         if len(state["events"]) > 2000:
-            state["base"] += len(state["events"]) - 2000
+            trim = len(state["events"]) - 2000
+            state["base"] += trim
             state["events"] = state["events"][-2000:]
             kept = set(map(id, state["events"]))
             state["pending"] = {
                 call_id: event for call_id, event in state["pending"].items() if id(event) in kept
             }
+            _prune_change_log(state)
             state["last_bash"] = None
     total = state["base"] + len(state["events"])
     dirty_from = total
@@ -1002,9 +1104,6 @@ def read_session_events(fmt: str, path: Path) -> dict:
             if id(event) in pending_events:
                 dirty_from = state["base"] + i
                 break
-    if state.get("tail_replaced") and state["events"]:
-        dirty_from = min(dirty_from, total - 1)
-        state["tail_replaced"] = False
     return {
         "events": state["events"],
         "base": state["base"],
@@ -1012,6 +1111,86 @@ def read_session_events(fmt: str, path: Path) -> dict:
         "tasks": state.get("tasks") or [],
         "pr": state.get("pr"),
         "dirty_from": dirty_from,
+        "cursor": state.get("cursor", 0),
+    }
+
+
+def read_session_delta(fmt: str, path: Path, cursor: int = 0) -> dict:
+    state = read_session_events(fmt, path)
+    current = _cache[str(path)]
+    base = int(state["base"])
+    events = state["events"]
+    current_cursor = int(state.get("cursor", 0))
+    total = base + len(events)
+    changes: list[dict] = list(current.get("changes", []))
+
+    full_reset = cursor <= 0 or cursor > current_cursor
+    if not full_reset:
+        if not changes:
+            full_reset = cursor != current_cursor
+        else:
+            first_cursor = int(changes[0]["cursor"])
+            if cursor < first_cursor - 1:
+                full_reset = True
+
+    if full_reset:
+        return {
+            "events": events,
+            "base": base,
+            "tokens": state["tokens"],
+            "tasks": state.get("tasks") or [],
+            "pr": state.get("pr"),
+            "cursor": current_cursor,
+            "tail_from": base,
+            "patches": [],
+        }
+
+    changed = [entry for entry in changes if int(entry["cursor"]) > cursor]
+    tail_from = total
+    patch_map: dict[int, dict] = {}
+    for entry in changed:
+        if entry.get("kind") == "tail":
+            tail_from = min(tail_from, int(entry.get("from", total)))
+        elif entry.get("kind") == "patch":
+            patch_map[int(entry["id"])] = entry
+
+    if tail_from < base:
+        return {
+            "events": events,
+            "base": base,
+            "tokens": state["tokens"],
+            "tasks": state.get("tasks") or [],
+            "pr": state.get("pr"),
+            "cursor": current_cursor,
+            "tail_from": base,
+            "patches": [],
+        }
+
+    if tail_from < total:
+        tail_events = events[tail_from - base :]
+        patch_map = {
+            event_id: entry for event_id, entry in patch_map.items() if int(entry.get("index", total)) < tail_from
+        }
+    else:
+        tail_events = []
+
+    patches = [
+        {
+            "id": int(entry["id"]),
+            "output": entry.get("output"),
+            "ok": entry.get("ok"),
+        }
+        for entry in sorted(patch_map.values(), key=lambda item: int(item["cursor"]))
+    ]
+    return {
+        "events": tail_events,
+        "base": base,
+        "tokens": state["tokens"],
+        "tasks": state.get("tasks") or [],
+        "pr": state.get("pr"),
+        "cursor": current_cursor,
+        "tail_from": tail_from,
+        "patches": patches,
     }
 
 
