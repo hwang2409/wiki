@@ -8,6 +8,7 @@ import {
 } from "react";
 import { Bot, GitPullRequest, X } from "lucide-react";
 import { AgentPrReviewPanel } from "./agent-pr-review";
+import { deletePaneStateEntries } from "./pane-state-cache";
 import { SessionTab, usePollTick } from "./session";
 
 const SIDE_PANEL_WIDTH_KEY = "wiki-session-side-panel-width";
@@ -41,10 +42,7 @@ export type AgentSessionSurfaceWorker = {
 const surfaceStateCache = new Map<string, SurfaceState>();
 
 export function clearSurfacePaneState(paneStateKey: string) {
-  const prefix = `${paneStateKey}:`;
-  for (const key of [...surfaceStateCache.keys()]) {
-    if (key.startsWith(prefix)) surfaceStateCache.delete(key);
-  }
+  deletePaneStateEntries(surfaceStateCache, paneStateKey);
 }
 
 function readSurfaceState(

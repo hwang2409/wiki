@@ -46,6 +46,7 @@ import type {
 } from "./api";
 import { externalLinkProps } from "./external-links";
 import { LoadingPlaceholder } from "./loading";
+import { createStateKeyWriteBarrier, deletePaneStateEntries } from "./pane-state-cache";
 import {
   replaceTranscriptQueue,
   useTranscriptSession,
@@ -1024,6 +1025,7 @@ type ScrollState = {
 const composerStateCache = new Map<string, ComposerState>();
 const sessionUiStateCache = new Map<string, SessionUiState>();
 const sessionScrollCache = new Map<string, ScrollState>();
+const sessionScrollWriteBarrier = createStateKeyWriteBarrier();
 
 function composerStateKeyForSession(ticket: string, subagent?: string): string {
   return subagent
@@ -1032,13 +1034,8 @@ function composerStateKeyForSession(ticket: string, subagent?: string): string {
 }
 
 export function clearSessionPaneState(paneStateKey: string) {
-  const prefix = `${paneStateKey}:`;
-  for (const key of [...sessionUiStateCache.keys()]) {
-    if (key.startsWith(prefix)) sessionUiStateCache.delete(key);
-  }
-  for (const key of [...sessionScrollCache.keys()]) {
-    if (key.startsWith(prefix)) sessionScrollCache.delete(key);
-  }
+  deletePaneStateEntries(sessionUiStateCache, paneStateKey);
+  sessionScrollWriteBarrier.block(deletePaneStateEntries(sessionScrollCache, paneStateKey));
 }
 
 function getComposerState(key: string): ComposerState | null {
@@ -1066,6 +1063,11 @@ function getSessionUiState(key: string): SessionUiState {
 function decrementRestoreAttempts(ref: { current: number }, pendingRef: { current: boolean }) {
   ref.current -= 1;
   if (ref.current <= 0) pendingRef.current = false;
+}
+
+function setSessionScrollState(key: string, state: ScrollState) {
+  if (!sessionScrollWriteBarrier.allows(key)) return;
+  sessionScrollCache.set(key, state);
 }
 
 function resolveScrollAnchorTarget(
@@ -1168,7 +1170,7 @@ export function SessionTab({
       };
       latestScrollStateRef.current = nextState;
       if (scrollRestorePendingRef.current) return;
-      sessionScrollCache.set(sessionStateKey, nextState);
+      setSessionScrollState(sessionStateKey, nextState);
     }, [layout, sessionStateKey])
   );
 
@@ -1287,7 +1289,7 @@ export function SessionTab({
               anchor: findScrollAnchor(layout, node.scrollTop),
             };
             latestScrollStateRef.current = finalized;
-            sessionScrollCache.set(sessionStateKey, finalized);
+            setSessionScrollState(sessionStateKey, finalized);
           });
         });
       } else decrementRestoreAttempts(restoreAttemptsRef, scrollRestorePendingRef);
@@ -1318,6 +1320,7 @@ export function SessionTab({
         scrollTop,
         anchor,
       };
+      if (sessionScrollWriteBarrier.consume(sessionStateKey)) return;
       sessionScrollCache.set(sessionStateKey, saved);
     };
   }, [pinnedRef, ref, sessionStateKey]);

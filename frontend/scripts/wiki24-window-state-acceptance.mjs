@@ -254,6 +254,39 @@ async function pickWindowChooserTicket(page, ticket) {
   }, ticket);
 }
 
+async function runChooserDraftCheck(page, draftText) {
+  const composer = page.locator(".session-composer textarea");
+  await page.waitForFunction(
+    (expected) => document.querySelector(".session-composer textarea")?.value === expected,
+    draftText,
+  );
+  await pickWindowChooserTicket(page, WINDOW_1);
+  await page.waitForFunction(
+    (current) => {
+      const ticket = document.querySelector(".agent-session-surface > .session-header .session-ticket")?.textContent;
+      return Boolean(ticket) && ticket !== current;
+    },
+    WINDOW_0,
+  );
+  const chooserTicketDuringMove = await activeMainTicket(page);
+  const chooserDraftDuringMove = await composer.inputValue();
+  await pickWindowChooserTicket(page, WINDOW_0);
+  await page.waitForFunction(
+    (expected) => document.querySelector(".agent-session-surface > .session-header .session-ticket")?.textContent === expected,
+    WINDOW_0,
+  );
+  await page.waitForFunction(
+    (expected) => document.querySelector(".session-composer textarea")?.value === expected,
+    draftText,
+  );
+  return {
+    intermediateTicket: chooserTicketDuringMove,
+    intermediateDraft: chooserDraftDuringMove,
+    restoredTicket: await activeMainTicket(page),
+    restoredDraftExact: (await composer.inputValue()) === draftText,
+  };
+}
+
 async function settleVirtualizer(page) {
   await page.evaluate(
     () =>
@@ -420,35 +453,8 @@ async function main() {
 
     await page.screenshot({ path: ROUNDTRIP_SCREENSHOT, fullPage: true });
 
-    await pickWindowChooserTicket(page, WINDOW_1);
-    await page.waitForFunction(
-      (current) => {
-        const ticket = document.querySelector(".agent-session-surface > .session-header .session-ticket")?.textContent;
-        return Boolean(ticket) && ticket !== current;
-      },
-      WINDOW_0,
-    );
-    const chooserTicketDuringMove = await activeMainTicket(page);
-    const chooserDraftDuringMove = await composer.inputValue();
-    await pickWindowChooserTicket(page, WINDOW_0);
-    await page.waitForFunction(
-      (expected) => document.querySelector(".agent-session-surface > .session-header .session-ticket")?.textContent === expected,
-      WINDOW_0,
-    );
-    await page.waitForFunction(
-      (expected) => document.querySelector(".session-composer textarea")?.value === expected,
-      draftText,
-    );
-    const chooserDraftExact = (await composer.inputValue()) === draftText;
-    const chooserTicketAfter = await activeMainTicket(page);
-    const chooserDraft = {
-      intermediateTicket: chooserTicketDuringMove,
-      intermediateDraft: chooserDraftDuringMove,
-      restoredTicket: chooserTicketAfter,
-      restoredDraftExact: chooserDraftExact,
-    };
-
     if (TARGETED) {
+      const chooserDraft = await runChooserDraftCheck(page, draftText);
       const targetedResult = {
         fixtureRoot: fixtures.root,
         fixtures: {
@@ -498,6 +504,8 @@ async function main() {
       return;
     }
 
+    await openAgentPage(page, backend.baseUrl, layout, WINDOW_0);
+    await page.waitForSelector(".session-subagent-chip");
     await page.locator(".agent-session-surface-main .session-scroll").evaluate((node) => {
       node.scrollTop = node.scrollHeight;
       node.dispatchEvent(new Event("scroll"));
@@ -583,6 +591,11 @@ async function main() {
       windowCountBeforeClose + 1,
     );
     smoke.x = (await page.locator(".tmux-status-item").count()) === windowCountBeforeClose + 1;
+
+    await openAgentPage(page, backend.baseUrl, layout, WINDOW_0);
+    const chooserComposer = page.locator(".session-composer textarea");
+    await chooserComposer.fill(draftText);
+    const chooserDraft = await runChooserDraftCheck(page, draftText);
 
     const pinnedDistance = Math.abs(
       pinnedScroll.scrollHeight - pinnedScroll.scrollTop - pinnedScroll.clientHeight,

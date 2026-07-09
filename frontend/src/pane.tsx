@@ -132,6 +132,7 @@ function AgentPane({
   return (
     <section className="secondary-pane agent-pane">
       <AgentSessionSurface
+        key={path}
         context={agentContext}
         initialPanel={agentPanel}
         onClose={onClose}
