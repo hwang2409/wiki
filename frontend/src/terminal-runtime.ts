@@ -335,10 +335,19 @@ class TerminalRuntime {
       socket.onmessage = (event) => {
         if (!this.isCurrentSocket(socket, generation)) return;
         if (typeof event.data === "string") {
-          const payload = JSON.parse(event.data) as {
+          let payload: {
             message?: string;
             type?: string;
           };
+          try {
+            payload = JSON.parse(event.data) as {
+              message?: string;
+              type?: string;
+            };
+          } catch {
+            this.setSnapshot({ message: "Terminal sent an invalid control message.", status: "error" });
+            return;
+          }
           if (payload.type === "missing" || payload.type === "exit") {
             this.setSnapshot({
               message: payload.message ?? "Session ended.",

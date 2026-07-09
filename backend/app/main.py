@@ -12,6 +12,7 @@ from pathlib import Path, PurePosixPath
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -26,6 +27,7 @@ MAX_NOTE_BYTES = 2_000_000
 VAULT_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="Wiki API")
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=terminal.TRUSTED_HOSTS)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -1415,7 +1417,7 @@ async def _start_dispatcher() -> None:
 
 @app.on_event("shutdown")
 async def _stop_terminals() -> None:
-    terminal.TERMINAL_MANAGER.close_all()
+    await asyncio.to_thread(terminal.TERMINAL_MANAGER.close_all)
 
 
 def vault_snapshot() -> dict[str, float]:

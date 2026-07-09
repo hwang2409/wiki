@@ -10,9 +10,12 @@ import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from urllib.error import HTTPError
+from urllib.request import Request as UrlRequest
 from urllib.request import urlopen
 
 from fastapi import FastAPI
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 import uvicorn
 from websockets.exceptions import InvalidStatus
 from websockets.sync.client import connect as ws_connect
@@ -22,6 +25,7 @@ from backend.app import terminal
 
 def _make_app() -> FastAPI:
     app = FastAPI()
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=terminal.TRUSTED_HOSTS)
     app.include_router(terminal.router)
     app.add_event_handler("startup", terminal.refresh_boot_token)
     app.add_event_handler("shutdown", terminal.TERMINAL_MANAGER.close_all)
@@ -191,6 +195,36 @@ class TerminalWebSocketTests(unittest.TestCase):
                 ws.send(json.dumps({"type": "input", "data": "printf '%s\\n' \"$PWD\"\r"}))
                 output = _read_websocket_text(ws, str(self.root))
                 self.assertIn(str(self.root), output)
+
+    def test_terminal_endpoints_reject_untrusted_host_and_origin(self) -> None:
+        with _LiveServer(_make_app()) as server:
+            with self.assertRaises(HTTPError) as bad_host:
+                urlopen(
+                    UrlRequest(
+                        f"{server.http_base}/api/terminal-token",
+                        headers={"Host": "evil.test"},
+                    ),
+                    timeout=2,
+                )
+            self.assertEqual(bad_host.exception.code, 400)
+
+            with self.assertRaises(HTTPError) as bad_origin:
+                urlopen(
+                    UrlRequest(
+                        f"{server.http_base}/api/terminal-token",
+                        headers={"Origin": "http://evil.test"},
+                    ),
+                    timeout=2,
+                )
+            self.assertEqual(bad_origin.exception.code, 403)
+
+            token = _http_get_json(f"{server.http_base}/api/terminal-token")["token"]
+            with self.assertRaises(InvalidStatus):
+                with ws_connect(
+                    f"{server.ws_base}/ws/terminal/bad-origin?token={token}&create=1",
+                    origin="http://evil.test",
+                ):
+                    pass
 
     def test_terminal_limit_returns_clear_error(self) -> None:
         terminal.TERMINAL_MANAGER = terminal.TerminalManager(

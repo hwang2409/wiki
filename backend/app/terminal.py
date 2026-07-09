@@ -18,8 +18,9 @@ import termios
 import threading
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
-from fastapi import APIRouter, WebSocket, WebSocketException, status
+from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketException, status
 from starlette.websockets import WebSocketState
 
 
@@ -30,6 +31,8 @@ DEFAULT_ROWS = 24
 DEFAULT_MAX_SESSIONS = int(os.environ.get("WIKI_TERMINAL_MAX_SESSIONS", "8"))
 FLOW_HIGH_WATERMARK = 512 * 1024
 FLOW_LOW_WATERMARK = 128 * 1024
+TRUSTED_HOSTS = ["localhost", "127.0.0.1", "[::1]"]
+TRUSTED_HOST_NAMES = {"localhost", "127.0.0.1", "::1"}
 
 router = APIRouter()
 _boot_token: str | None = None
@@ -48,6 +51,48 @@ def current_boot_token() -> str:
 
 def valid_terminal_id(terminal_id: str) -> bool:
     return bool(TERMINAL_ID_PATTERN.fullmatch(terminal_id))
+
+
+def _hostname_from_host_header(value: str | None) -> str:
+    host = (value or "").strip().lower()
+    if not host:
+        return ""
+    if host.startswith("["):
+        end = host.find("]")
+        return host[1:end] if end != -1 else host
+    if host.count(":") == 1:
+        return host.rsplit(":", 1)[0]
+    return host
+
+
+def trusted_host(value: str | None) -> bool:
+    return _hostname_from_host_header(value) in TRUSTED_HOST_NAMES
+
+
+def trusted_origin(value: str | None) -> bool:
+    if not value:
+        return True
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    if parsed.scheme not in {"http", "https", "ws", "wss"}:
+        return False
+    return (parsed.hostname or "").lower() in TRUSTED_HOST_NAMES
+
+
+def validate_trusted_headers(host: str | None, origin: str | None) -> bool:
+    return trusted_host(host) and trusted_origin(origin)
+
+
+def require_trusted_request(request: Request) -> None:
+    if not validate_trusted_headers(request.headers.get("host"), request.headers.get("origin")):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Untrusted terminal origin")
+
+
+def require_trusted_websocket(websocket: WebSocket) -> None:
+    if not validate_trusted_headers(websocket.headers.get("host"), websocket.headers.get("origin")):
+        raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION)
 
 
 def resolve_shell_path() -> str:
@@ -276,7 +321,7 @@ class TerminalSession:
                     task.result()
         finally:
             self.detach()
-            self.close()
+            await asyncio.to_thread(self.close)
             if websocket.application_state != WebSocketState.DISCONNECTED:
                 with contextlib.suppress(Exception):
                     await websocket.close()
@@ -312,7 +357,7 @@ class TerminalSession:
             except json.JSONDecodeError:
                 continue
             if body.get("type") == "input":
-                self.write_input(str(body.get("data", "")))
+                await asyncio.to_thread(self.write_input, str(body.get("data", "")))
             elif body.get("type") == "resize":
                 try:
                     rows = int(body.get("rows", DEFAULT_ROWS))
@@ -335,6 +380,7 @@ class TerminalManager:
         self.shell_path = shell_path
         self._lock = threading.Lock()
         self._sessions: dict[str, TerminalSession] = {}
+        self._creating: set[str] = set()
 
     @property
     def sessions(self) -> dict[str, TerminalSession]:
@@ -351,17 +397,33 @@ class TerminalManager:
             session = self._sessions.get(terminal_id)
             if session is not None:
                 return session
+            if terminal_id in self._creating:
+                raise TerminalAlreadyAttachedError("terminal is already starting")
             if not create:
                 raise MissingTerminalSessionError("session-missing")
-            if len(self._sessions) >= self.max_sessions:
+            if len(self._sessions) + len(self._creating) >= self.max_sessions:
                 raise TerminalLimitError(
                     f"Terminal limit reached ({self.max_sessions}). Close another terminal and try again."
                 )
+            self._creating.add(terminal_id)
+
+        try:
             session = TerminalSession(
                 terminal_id,
                 cwd=self.cwd,
                 shell_path=self.shell_path,
             )
+        except Exception:
+            with self._lock:
+                self._creating.discard(terminal_id)
+            raise
+
+        with self._lock:
+            self._creating.discard(terminal_id)
+            current = self._sessions.get(terminal_id)
+            if current is not None:
+                session.close()
+                return current
             self._sessions[terminal_id] = session
         return session
 
@@ -383,7 +445,8 @@ TERMINAL_MANAGER = TerminalManager()
 
 
 @router.get("/api/terminal-token")
-def terminal_token() -> dict[str, object]:
+def terminal_token(request: Request) -> dict[str, object]:
+    require_trusted_request(request)
     return {
         "token": current_boot_token(),
         "limit": TERMINAL_MANAGER.max_sessions,
@@ -392,17 +455,18 @@ def terminal_token() -> dict[str, object]:
 
 @router.websocket("/ws/terminal/{terminal_id}")
 async def terminal_socket(websocket: WebSocket, terminal_id: str) -> None:
+    require_trusted_websocket(websocket)
     if not valid_terminal_id(terminal_id):
         raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION)
     token = websocket.query_params.get("token")
-    if not token or token != current_boot_token():
+    if not token or not secrets.compare_digest(token, current_boot_token()):
         raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION)
     create = websocket.query_params.get("create") in {"1", "true", "yes"}
+    await websocket.accept()
     try:
-        session = TERMINAL_MANAGER.get_or_create(terminal_id, create=create)
+        session = await asyncio.to_thread(TERMINAL_MANAGER.get_or_create, terminal_id, create=create)
         session.attach()
     except MissingTerminalSessionError:
-        await websocket.accept()
         await websocket.send_json(
             {
                 "type": "missing",
@@ -412,7 +476,6 @@ async def terminal_socket(websocket: WebSocket, terminal_id: str) -> None:
         await websocket.close(code=1000)
         return
     except TerminalLimitError as exc:
-        await websocket.accept()
         await websocket.send_json(
             {
                 "type": "error",
@@ -423,7 +486,6 @@ async def terminal_socket(websocket: WebSocket, terminal_id: str) -> None:
         await websocket.close(code=1013)
         return
     except TerminalAlreadyAttachedError:
-        await websocket.accept()
         await websocket.send_json(
             {
                 "type": "error",
@@ -434,7 +496,6 @@ async def terminal_socket(websocket: WebSocket, terminal_id: str) -> None:
         await websocket.close(code=1000)
         return
 
-    await websocket.accept()
     try:
         await session.serve(websocket)
     finally:
