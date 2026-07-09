@@ -6,15 +6,17 @@ import {
   makeFixtureRoot,
   startBackend,
   writeQueue,
-  writeRegistry,
 } from "./wiki32-harness.mjs";
 
 const ROUNDTRIP_SCREENSHOT = "/tmp/wiki-24-window-state-roundtrip.png";
 const COLLAPSE_SCREENSHOT = "/tmp/wiki-24-window-state-collapsed.png";
-const OUT_PATH = "/tmp/wiki-24-window-state-acceptance.json";
 const WINDOW_0 = "WIKI-320";
 const WINDOW_1 = "WIKI-321";
 const SUBAGENT_ID = "abcdef12";
+const TARGETED = process.argv.includes("--targeted");
+const OUT_PATH = TARGETED
+  ? "/tmp/wiki-24-window-state-targeted.json"
+  : "/tmp/wiki-24-window-state-acceptance.json";
 
 function claudeUser(text, timestamp) {
   return {
@@ -59,6 +61,45 @@ function writeJsonl(path, rows) {
 
 function appendJsonl(path, rows) {
   for (const row of rows) appendFileSync(path, `${JSON.stringify(row)}\n`);
+}
+
+function writeAgentRegistry(registryPath, tickets) {
+  const spawnedAt = "2026-07-09T00:00:00Z";
+  const workers = Object.fromEntries(
+    tickets.map(([ticket, transcript]) => [
+      ticket,
+      {
+        current: {
+          window: "@9999",
+          spawned_at: spawnedAt,
+          transcript,
+          kind: "cc",
+          role: "worker",
+        },
+      },
+    ]),
+  );
+  const orchestrators = Object.fromEntries(
+    tickets.map(([ticket, transcript]) => [
+      ticket,
+      {
+        window: "@9999",
+        spawned_at: spawnedAt,
+        transcript,
+      },
+    ]),
+  );
+  writeFileSync(
+    registryPath,
+    JSON.stringify(
+      {
+        ...workers,
+        _orchestrators: orchestrators,
+      },
+      null,
+      2,
+    ),
+  );
 }
 
 function transcriptTimestamp(index) {
@@ -160,6 +201,10 @@ async function focusedPaneKey(page) {
   return page.locator(".pane-frame.is-focused").evaluate((node) => node.getAttribute("data-pane-key"));
 }
 
+async function activeMainTicket(page) {
+  return page.locator(".agent-session-surface > .session-header .session-ticket").first().textContent();
+}
+
 async function scrollState(page) {
   return page.locator(".agent-session-surface-main .session-scroll").evaluate((node) => ({
     scrollTop: node.scrollTop,
@@ -191,6 +236,22 @@ async function mainScrollAnchor(page) {
 async function debugScrollState(page) {
   const [scroll, anchor] = await Promise.all([scrollState(page), mainScrollAnchor(page)]);
   return { ...scroll, anchor };
+}
+
+async function pickWindowChooserTicket(page, ticket) {
+  await leaderChord(page, "w");
+  await page.waitForSelector(".fleet-switcher");
+  await page.evaluate((targetTicket) => {
+    const button = [...document.querySelectorAll(".fleet-switcher-result")].find((node) => {
+      if (!(node instanceof HTMLButtonElement) || node.disabled) return false;
+      const label = node.querySelector(".quick-switcher-name")?.textContent?.trim();
+      return label === targetTicket;
+    });
+    if (!(button instanceof HTMLButtonElement)) {
+      throw new Error(`Missing chooser target for ${targetTicket}`);
+    }
+    button.click();
+  }, ticket);
 }
 
 async function settleVirtualizer(page) {
@@ -240,7 +301,7 @@ async function main() {
   mkdirSync(subagentsDir, { recursive: true });
   writeJsonl(join(subagentsDir, `agent-${SUBAGENT_ID}.jsonl`), buildSubagentTranscript());
 
-  writeRegistry(
+  writeAgentRegistry(
     fixtures.registryPath,
     [...transcriptPaths.entries()].map(([ticket, transcript]) => [ticket, transcript]),
   );
@@ -358,6 +419,84 @@ async function main() {
     ).length;
 
     await page.screenshot({ path: ROUNDTRIP_SCREENSHOT, fullPage: true });
+
+    await pickWindowChooserTicket(page, WINDOW_1);
+    await page.waitForFunction(
+      (current) => {
+        const ticket = document.querySelector(".agent-session-surface > .session-header .session-ticket")?.textContent;
+        return Boolean(ticket) && ticket !== current;
+      },
+      WINDOW_0,
+    );
+    const chooserTicketDuringMove = await activeMainTicket(page);
+    const chooserDraftDuringMove = await composer.inputValue();
+    await pickWindowChooserTicket(page, WINDOW_0);
+    await page.waitForFunction(
+      (expected) => document.querySelector(".agent-session-surface > .session-header .session-ticket")?.textContent === expected,
+      WINDOW_0,
+    );
+    await page.waitForFunction(
+      (expected) => document.querySelector(".session-composer textarea")?.value === expected,
+      draftText,
+    );
+    const chooserDraftExact = (await composer.inputValue()) === draftText;
+    const chooserTicketAfter = await activeMainTicket(page);
+    const chooserDraft = {
+      intermediateTicket: chooserTicketDuringMove,
+      intermediateDraft: chooserDraftDuringMove,
+      restoredTicket: chooserTicketAfter,
+      restoredDraftExact: chooserDraftExact,
+    };
+
+    if (TARGETED) {
+      const targetedResult = {
+        fixtureRoot: fixtures.root,
+        fixtures: {
+          registry: fixtures.registryPath,
+          queue: fixtures.queuePath,
+          statusDir: fixtures.statusDir,
+          transcripts: Object.fromEntries(transcriptPaths),
+          subagentTranscript: join(subagentsDir, `agent-${SUBAGENT_ID}.jsonl`),
+        },
+        screenshots: {
+          roundTrip: ROUNDTRIP_SCREENSHOT,
+        },
+        consoleErrors,
+        pageErrors,
+        roundTrip: {
+          draftExact: roundTripDraftExact,
+          hiddenWindowRequests,
+          returnRequests,
+          panelWidthBefore,
+          panelWidthAfter,
+          panelWidthDelta: Math.abs(panelWidthAfter - panelWidthBefore),
+          scrollTopBefore,
+          scrollTopAfter: roundTripScroll.scrollTop,
+          scrollDelta: Math.abs(roundTripScroll.scrollTop - scrollTopBefore),
+          anchorBefore,
+          anchorAfter,
+          anchorOffsetDelta: anchorBefore && anchorAfter ? Math.abs(anchorAfter.offset - anchorBefore.offset) : null,
+        },
+        chooserDraft,
+        pass: {
+          noConsoleErrors: consoleErrors.length === 0 && pageErrors.length === 0,
+          roundTrip:
+            hiddenWindowRequests === 0 &&
+            returnRequests === 1 &&
+            Math.abs(panelWidthAfter - panelWidthBefore) <= 8 &&
+            Boolean(anchorMatches) &&
+            roundTripDraftExact,
+          chooserDraft:
+            chooserDraft.intermediateTicket !== WINDOW_0 &&
+            chooserDraft.intermediateDraft !== draftText &&
+            chooserDraft.restoredTicket === WINDOW_0 &&
+            chooserDraft.restoredDraftExact,
+        },
+      };
+      writeFileSync(OUT_PATH, JSON.stringify(targetedResult, null, 2));
+      console.log(JSON.stringify(targetedResult, null, 2));
+      return;
+    }
 
     await page.locator(".agent-session-surface-main .session-scroll").evaluate((node) => {
       node.scrollTop = node.scrollHeight;
@@ -477,6 +616,7 @@ async function main() {
         anchorAfter,
         anchorOffsetDelta: anchorBefore && anchorAfter ? Math.abs(anchorAfter.offset - anchorBefore.offset) : null,
       },
+      chooserDraft,
       pinnedRoundTrip: {
         hiddenWindowRequests: sessionRequests.filter(
           (entry) => entry.ts >= pinnedAwayStart && entry.ts < pinnedReturnStart,
@@ -498,6 +638,11 @@ async function main() {
           Math.abs(panelWidthAfter - panelWidthBefore) <= 8 &&
           Boolean(anchorMatches) &&
           roundTripDraftExact,
+        chooserDraft:
+          chooserDraft.intermediateTicket !== WINDOW_0 &&
+          chooserDraft.intermediateDraft !== draftText &&
+          chooserDraft.restoredTicket === WINDOW_0 &&
+          chooserDraft.restoredDraftExact,
         pinned: pinnedDistance <= 24,
         collapsed: collapsedAfterReturn,
         smoke: Object.values(smoke).every(Boolean),

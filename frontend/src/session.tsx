@@ -1025,6 +1025,22 @@ const composerStateCache = new Map<string, ComposerState>();
 const sessionUiStateCache = new Map<string, SessionUiState>();
 const sessionScrollCache = new Map<string, ScrollState>();
 
+function composerStateKeyForSession(ticket: string, subagent?: string): string {
+  return subagent
+    ? `${ticket}:subagent:${subagent}:composer`
+    : `${ticket}:main:composer`;
+}
+
+export function clearSessionPaneState(paneStateKey: string) {
+  const prefix = `${paneStateKey}:`;
+  for (const key of [...sessionUiStateCache.keys()]) {
+    if (key.startsWith(prefix)) sessionUiStateCache.delete(key);
+  }
+  for (const key of [...sessionScrollCache.keys()]) {
+    if (key.startsWith(prefix)) sessionScrollCache.delete(key);
+  }
+}
+
 function getComposerState(key: string): ComposerState | null {
   return composerStateCache.get(key) ?? null;
 }
@@ -1425,7 +1441,7 @@ export function SessionTab({
           history={userHistory}
           queued={session.queue}
           runningSubagents={runningSubagents}
-          stateKey={`${sessionStateKey}:composer`}
+          stateKey={composerStateKeyForSession(ticket, subagent)}
           thinking={session.working}
           ticket={ticket}
           onInspect={onInspect}

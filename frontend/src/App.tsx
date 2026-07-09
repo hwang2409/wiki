@@ -39,6 +39,7 @@ import { ActivityFeed } from "./activity";
 import { AgentsSidebar, AgentsView, type AccountEvent } from "./agents";
 import {
   AgentSessionView,
+  clearSurfacePaneState,
   type AgentRoutePanel,
   type AgentSessionSurfaceWorker,
 } from "./agent-session-surface";
@@ -49,6 +50,7 @@ import { TokensView } from "./tokens";
 import { appendDoneEntry } from "./kanban";
 import { WorkspacePane, type PaneNoteFocusState } from "./pane";
 import { prepareMarkdown, splitFrontmatter } from "./markdown";
+import { clearSessionPaneState } from "./session";
 import { invalidateTranscript } from "./transcript-store";
 import {
   applyTheme,
@@ -1738,6 +1740,8 @@ export default function App() {
       windows: nextWindows,
     });
     if (zoomedPaneId === targetPaneId) setZoomedPaneId(null);
+    clearSessionPaneState(targetPaneId);
+    clearSurfacePaneState(targetPaneId);
     setWindowState(nextState);
     const nextActiveWindow =
       nextState.windows.find((window) => window.id === nextState.activeWindowId) ?? null;
@@ -1796,6 +1800,8 @@ export default function App() {
         } else {
           nextWindows.splice(sourceIndex, 1);
         }
+        clearSessionPaneState(item.paneId);
+        clearSurfacePaneState(item.paneId);
       }
     }
 
@@ -1805,6 +1811,8 @@ export default function App() {
     targetWindow.focusedPaneId = focusedPaneId;
     if (focused.path !== item.path && focused.ticket) {
       nextWindows.push(createSoloWindow(nextWindowId(), nextPaneId(), focused.path));
+      clearSessionPaneState(focusedPaneId);
+      clearSurfacePaneState(focusedPaneId);
     }
 
     const nextState = normalizeWindowWorkspaceState({
@@ -2290,6 +2298,8 @@ export default function App() {
           } else {
             nextWindows.splice(sourceIndex, 1);
           }
+          clearSessionPaneState(existingAgent.pane.key);
+          clearSurfacePaneState(existingAgent.pane.key);
         }
       }
 
@@ -2300,6 +2310,8 @@ export default function App() {
       targetWindow.focusedPaneId = targetKey;
       if (targetPane.path !== path && targetPane.ticket) {
         nextWindows.push(createSoloWindow(nextWindowId(), nextPaneId(), targetPane.path));
+        clearSessionPaneState(targetKey);
+        clearSurfacePaneState(targetKey);
       }
       setWindowState(
         normalizeWindowWorkspaceState({
@@ -2330,6 +2342,8 @@ export default function App() {
         } else {
           nextWindows.splice(sourceIndex, 1);
         }
+        clearSessionPaneState(existingAgent.pane.key);
+        clearSurfacePaneState(existingAgent.pane.key);
       }
     }
 

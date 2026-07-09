@@ -40,6 +40,13 @@ export type AgentSessionSurfaceWorker = {
 
 const surfaceStateCache = new Map<string, SurfaceState>();
 
+export function clearSurfacePaneState(paneStateKey: string) {
+  const prefix = `${paneStateKey}:`;
+  for (const key of [...surfaceStateCache.keys()]) {
+    if (key.startsWith(prefix)) surfaceStateCache.delete(key);
+  }
+}
+
 function readSurfaceState(
   key: string,
   canReview: boolean,
