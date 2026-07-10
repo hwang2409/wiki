@@ -534,15 +534,19 @@ function readStoredWindowWorkspaceState(): WindowWorkspaceState {
 }
 
 function buildAgentSessionWorker(
-  worker: Pick<AgentWorker, "ticket" | "kind" | "role" | "model" | "pr">
+  worker: Pick<AgentWorker, "ticket" | "kind" | "role" | "model" | "effort" | "pr"> & {
+    run_id?: string | null;
+  }
 ): AgentSessionSurfaceWorker {
   return {
     ticket: worker.ticket,
     kind: worker.kind,
     role: worker.role,
     model: worker.model,
+    effort: worker.effort,
     pr: worker.pr,
     canReview: Boolean(worker.pr),
+    canReplace: Boolean(worker.run_id),
   };
 }
 
@@ -589,7 +593,9 @@ function buildFleetGroups(workers: AgentWorker[], orchestrators: Orchestrator[])
         window: null,
         window_alive: false,
         cwd: null,
+        kind: null,
         model: null,
+        effort: null,
         spawned_at: null,
         transcript_exists: false,
       },
@@ -1326,10 +1332,22 @@ export default function App() {
       map.set(worker.ticket, buildAgentSessionWorker(worker));
     }
     for (const worker of agentsState.archived ?? []) {
-      if (!map.has(worker.ticket)) map.set(worker.ticket, buildAgentSessionWorker(worker));
+      if (!map.has(worker.ticket)) {
+        map.set(worker.ticket, { ...buildAgentSessionWorker(worker), canReplace: false });
+      }
+    }
+    for (const orch of agentsState.orchestrators) {
+      map.set(orch.id, {
+        ticket: orch.id,
+        kind: orch.kind,
+        role: "orchestrator",
+        model: orch.model,
+        effort: orch.effort,
+        canReplace: Boolean(orch.run_id),
+      });
     }
     return map;
-  }, [agentsState.archived, agentsState.workers]);
+  }, [agentsState.archived, agentsState.orchestrators, agentsState.workers]);
   const fleetGroups = useMemo(
     () => buildFleetGroups(agentsState.workers ?? [], agentsState.orchestrators),
     [agentsState.orchestrators, agentsState.workers]

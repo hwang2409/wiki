@@ -6,9 +6,11 @@ import {
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
 } from "react";
-import { Bot, GitPullRequest, X } from "lucide-react";
+import { Bot, GitPullRequest, RefreshCw, X } from "lucide-react";
 import { AgentPrReviewPanel } from "./agent-pr-review";
 import { deletePaneStateEntries } from "./pane-state-cache";
+import { ReplaceAgentModal } from "./replace-agent-modal";
+import type { SpawnWorkerEffort, SpawnWorkerKind } from "./api";
 import { SessionTab, usePollTick } from "./session";
 
 const SIDE_PANEL_WIDTH_KEY = "wiki-session-side-panel-width";
@@ -35,8 +37,10 @@ export type AgentSessionSurfaceWorker = {
   kind?: string | null;
   role?: string | null;
   model?: string | null;
+  effort?: SpawnWorkerEffort | null;
   pr?: string | null;
   canReview?: boolean;
+  canReplace?: boolean;
 };
 
 const surfaceStateCache = new Map<string, SurfaceState>();
@@ -194,6 +198,7 @@ export function AgentSessionSurface({
   const [panel, setPanel] = useState<SidePanelState>(
     () => readSurfaceState(surfaceStateKey, canReview, initialPanel).panel
   );
+  const [replaceOpen, setReplaceOpen] = useState(false);
   const inspectSubagent = useCallback(
     (subagent: string) => setPanel({ kind: "subagent", subagent }),
     []
@@ -254,8 +259,18 @@ export function AgentSessionSurface({
           {worker.kind ? <span className="agent-chip">{worker.kind}</span> : null}
           {worker.role ? <span className="agent-chip">{worker.role}</span> : null}
           {worker.model ? <span className="agent-chip is-faint">{worker.model}</span> : null}
-          {canReview || onClose ? (
+          {canReview || worker.canReplace || onClose ? (
             <div className="agent-surface-actions">
+              {worker.canReplace && worker.kind && worker.model ? (
+                <button
+                  className="agent-surface-action"
+                  type="button"
+                  onClick={() => setReplaceOpen(true)}
+                >
+                  <RefreshCw size={13} />
+                  Replace
+                </button>
+              ) : null}
               {canReview ? (
                 <button
                   className={`agent-surface-action${panel?.kind === "review" ? " is-active" : ""}`}
@@ -304,6 +319,18 @@ export function AgentSessionSurface({
           subagent={panel.subagent}
           ticket={worker.ticket}
           width={panelWidth}
+        />
+      ) : null}
+      {replaceOpen && worker.kind && worker.model ? (
+        <ReplaceAgentModal
+          target={{
+            id: worker.ticket,
+            kind: worker.kind as SpawnWorkerKind,
+            model: worker.model,
+            effort: worker.effort,
+            role: worker.role,
+          }}
+          onClose={() => setReplaceOpen(false)}
         />
       ) : null}
     </div>

@@ -64,6 +64,7 @@ export type AgentSession = {
   kind: string | null;
   role: string | null;
   model: string | null;
+  effort?: SpawnWorkerEffort | null;
   desired_model?: string | null;
   session: number | null;
   spawned_at: string | null;
@@ -108,7 +109,9 @@ export type Orchestrator = {
   provider_session_id?: string | null;
   provider_pid?: number | null;
   cwd: string | null;
+  kind: SpawnWorkerKind | null;
   model: string | null;
+  effort: SpawnWorkerEffort | null;
   spawned_at: string | null;
   transcript_exists: boolean;
   log?: string | null;
@@ -200,9 +203,16 @@ export type ReplaceAgentResult = {
   registration?: unknown;
 };
 
-export function replaceAgent(id: string) {
+export type ReplaceAgentInput = {
+  kind?: SpawnWorkerKind;
+  model?: string;
+  effort?: SpawnWorkerEffort;
+};
+
+export function replaceAgent(id: string, input: ReplaceAgentInput = {}) {
   return request<ReplaceAgentResult>(`/api/agents/${encodeURIComponent(id)}/replace`, {
     method: "POST",
+    body: JSON.stringify(input),
   });
 }
 

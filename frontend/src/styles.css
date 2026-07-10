@@ -1365,6 +1365,73 @@ body.is-resizing-panes .pane-cell {
   width: min(620px, calc(100vw - 32px));
 }
 
+.agent-replace-modal {
+  top: 16vh;
+  width: min(500px, calc(100vw - 32px));
+}
+
+.agent-replace-summary,
+.agent-replace-warning {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.45;
+}
+
+.agent-replace-summary {
+  margin-top: 3px;
+}
+
+.agent-replace-warning {
+  padding-left: 10px;
+  border-left: 2px solid var(--text-faint);
+}
+
+.agent-kind-toggle {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  overflow: hidden;
+}
+
+.agent-kind-toggle button {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 38px;
+  padding: 8px 10px;
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-small);
+}
+
+.agent-kind-toggle button + button {
+  border-left: 1px solid var(--background-modifier-border);
+}
+
+.agent-kind-toggle button:hover {
+  background-color: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.agent-kind-toggle button.is-active {
+  background-color: var(--text-normal);
+  color: var(--background-primary);
+}
+
+.agent-kind-toggle small {
+  color: inherit;
+  font-size: var(--font-ui-smaller);
+  opacity: 0.7;
+}
+
+.agent-replace-modal .dialog-confirm {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
 .agent-spawn-fields {
   display: flex;
   flex-direction: column;
