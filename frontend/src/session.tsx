@@ -66,6 +66,12 @@ import type {
 } from "./api";
 import { renderAnsi } from "./ansi";
 import { externalLinkProps } from "./external-links";
+import {
+  GhPreviewCard,
+  containsGitHubPreviewUrl,
+  isGitHubPreviewUrl,
+  splitGitHubPreviewSegments,
+} from "./github-preview";
 import { LoadingPlaceholder } from "./loading";
 import { createStateKeyWriteBarrier, deletePaneStateEntries } from "./pane-state-cache";
 import { Timestamp } from "./timestamp";
@@ -839,6 +845,10 @@ function ToolRow({
   const Icon = ARCHETYPE_ICONS[tool.archetype] ?? Terminal;
   const summary = tool.summary || tool.input.split("\n")[0].slice(0, 120);
   const running = tool.output === null && tool.ok === null;
+  const outputSegments =
+    tool.output && containsGitHubPreviewUrl(tool.output)
+      ? splitGitHubPreviewSegments(tool.output)
+      : null;
   return (
     <div className={`session-tool${open ? " is-open" : ""}`}>
       <button className="session-tool-head" type="button" onClick={() => setOpen(!open)}>
@@ -877,7 +887,19 @@ function ToolRow({
             ) : (
               <pre>{tool.input}</pre>
             )}
-            {tool.output ? <pre className="session-tool-output">{renderAnsi(tool.output)}</pre> : null}
+            {outputSegments ? (
+              <div className="session-tool-output-blocks">
+                {outputSegments.map((segment, index) =>
+                  segment.type === "url" ? (
+                    <GhPreviewCard key={`${segment.value}:${index}`} url={segment.value} />
+                  ) : segment.value ? (
+                    <pre className="session-tool-output" key={`text:${index}`}>
+                      {renderAnsi(segment.value)}
+                    </pre>
+                  ) : null
+                )}
+              </div>
+            ) : tool.output ? <pre className="session-tool-output">{renderAnsi(tool.output)}</pre> : null}
           </div>
         </div>
       </div>
@@ -1117,6 +1139,9 @@ function ImageChip({
 }
 
 function SessionMarkdownLink({ href, ...props }: ComponentProps<"a">) {
+  if (typeof href === "string" && isGitHubPreviewUrl(href)) {
+    return <GhPreviewCard url={href} />;
+  }
   return <a href={href} {...props} {...externalLinkProps(href)} />;
 }
 

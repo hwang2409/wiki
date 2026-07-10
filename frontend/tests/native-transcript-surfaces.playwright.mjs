@@ -3,7 +3,16 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
 
-import { makeFixtureRoot, openSessionPage, startBackend, writeQueue, writeRegistry } from "../scripts/wiki32-harness.mjs";
+import {
+  codexAssistant,
+  codexToolCall,
+  codexToolOutput,
+  makeFixtureRoot,
+  openSessionPage,
+  startBackend,
+  writeQueue,
+  writeRegistry,
+} from "../scripts/wiki32-harness.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const FIXTURES_DIR = path.resolve(ROOT, "backend", "tests", "fixtures");
@@ -31,15 +40,38 @@ async function openTicket(page, baseUrl, ticket) {
   await page.waitForSelector(".session-scroll");
 }
 
+async function writeJsonl(target, rows) {
+  await fs.writeFile(target, rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+}
+
 async function main() {
   logStep("preparing isolated fixtures");
   await fs.mkdir(OUT_DIR, { recursive: true });
   const fixtures = makeFixtureRoot("wiki-41-native-surfaces-");
   const claudeTranscript = await copyFixture("claude_native_surfaces.jsonl", fixtures.root);
   const codexTranscript = await copyFixture("codex_native_surfaces.jsonl", fixtures.root);
+  const ghPreviewTranscript = path.join(fixtures.root, "codex_github_preview.jsonl");
+  await writeJsonl(ghPreviewTranscript, [
+    codexAssistant(
+      "Please review https://github.com/hwang2409/wiki/pull/45 before merging.",
+      "2026-07-10T18:10:00Z"
+    ),
+    codexToolCall("call-gh-preview", "Read", '{"path":"notes.md"}', "2026-07-10T18:10:01Z"),
+    codexToolOutput(
+      "call-gh-preview",
+      [
+        "Rendered commit preview target:",
+        "https://github.com/hwang2409/wiki/commit/467c1a2fc52a9d8072282894b92a954ccb17727e",
+        "Fallback should stay bare:",
+        "https://github.com/hwang2409/wiki/issues/64",
+      ].join("\n"),
+      "2026-07-10T18:10:02Z"
+    ),
+  ]);
   writeRegistry(fixtures.registryPath, [
     ["WIKI-32", claudeTranscript],
     ["WIKI-33", codexTranscript],
+    ["WIKI-64", ghPreviewTranscript],
   ]);
   writeQueue(fixtures.queuePath, "WIKI-32", []);
 
@@ -50,6 +82,54 @@ async function main() {
   const page = await browser.newPage({ viewport: { width: 1440, height: 1600 } });
 
   try {
+    await page.route("**/api/gh/preview**", async (route) => {
+      const requested = new URL(route.request().url()).searchParams.get("url");
+      if (requested === "https://github.com/hwang2409/wiki/pull/45") {
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          headers: { ETag: '"pr-preview"' },
+          body: JSON.stringify({
+            ok: true,
+            kind: "pr",
+            title: "WIKI-58 inline thinking rows and font picker",
+            state: "MERGED",
+            extra: {
+              mergeStateStatus: "CLEAN",
+              checks: { pass: 0, fail: 0, pending: 0 },
+              changedFiles: 3,
+              updatedAt: "2026-07-10T18:00:00Z",
+            },
+          }),
+        });
+        return;
+      }
+      if (requested === "https://github.com/hwang2409/wiki/commit/467c1a2fc52a9d8072282894b92a954ccb17727e") {
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          headers: { ETag: '"commit-preview"' },
+          body: JSON.stringify({
+            ok: true,
+            kind: "commit",
+            title: "Add GitHub URL previews",
+            state: null,
+            extra: {
+              sha: "467c1a2fc52a9d8072282894b92a954ccb17727e",
+              author: "hwang2409",
+              date: "2026-07-10T17:45:00Z",
+            },
+          }),
+        });
+        return;
+      }
+      await route.fulfill({
+        status: 502,
+        contentType: "application/json",
+        body: JSON.stringify({ ok: false, error: "fixture failure" }),
+      });
+    });
+
     logStep("opening Claude fixture session");
     await openSessionPage(page, backend.baseUrl, {
       version: 2,
@@ -103,6 +183,28 @@ async function main() {
     logStep("capturing Codex screenshot");
     await page.screenshot({ path: path.join(OUT_DIR, "codex-native-surfaces.png"), fullPage: true });
 
+    logStep("opening GitHub preview fixture session");
+    await openTicket(page, backend.baseUrl, "WIKI-64");
+    await expectVisibleText(page, ".gh-preview-title", "WIKI-58 inline thinking rows and font picker");
+    await expectVisibleText(page, ".gh-preview-badge", "merged");
+    await expectVisibleText(page, ".gh-preview-badge.is-muted", "3 files");
+    const ghActivityToggle = page.locator(".session-activity-head").first();
+    await ghActivityToggle.waitFor({ state: "visible" });
+    await ghActivityToggle.click();
+    await page.locator(".session-activity-collapsible.is-open .session-tool").first().waitFor({ state: "visible" });
+    const previewTool = page.locator(".session-activity-collapsible.is-open .session-tool").first();
+    await previewTool.locator(".session-tool-head").click();
+    await page.locator(".session-tool-collapsible.is-open").first().waitFor({ state: "visible" });
+    await previewTool.locator(".gh-preview-title", { hasText: "Add GitHub URL previews" }).waitFor();
+    await previewTool
+      .locator(".session-tool-output-blocks > a.external-link", {
+        hasText: "https://github.com/hwang2409/wiki/issues/64",
+      })
+      .waitFor({ state: "visible" });
+    await page.waitForTimeout(250);
+    logStep("capturing GitHub preview screenshot");
+    await page.locator(".session-scroll").screenshot({ path: path.join(OUT_DIR, "github-preview-cards.png") });
+
     logStep("writing Playwright summary");
     await fs.writeFile(
       path.join(OUT_DIR, "summary.json"),
@@ -115,6 +217,9 @@ async function main() {
           codex: {
             dispositions: "Unknown 1",
             screenshot: path.join(OUT_DIR, "codex-native-surfaces.png"),
+          },
+          github_preview: {
+            screenshot: path.join(OUT_DIR, "github-preview-cards.png"),
           },
         },
         null,

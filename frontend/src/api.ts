@@ -486,6 +486,54 @@ export function getSkills() {
   return request<{ skills: SkillInfo[] }>("/api/skills");
 }
 
+export type GhPreviewKind = "pr" | "issue" | "commit";
+
+export type GhPreviewData = {
+  ok: true;
+  kind: GhPreviewKind;
+  title: string;
+  state: string | null;
+  extra: {
+    mergeStateStatus?: string | null;
+    checks?: {
+      pass: number;
+      fail: number;
+      pending: number;
+    };
+    changedFiles?: number | null;
+    updatedAt?: string | null;
+    sha?: string | null;
+    author?: string | null;
+    date?: string | null;
+  };
+};
+
+export type GhPreviewFetchResult =
+  | { status: 200; etag: string | null; data: GhPreviewData }
+  | { status: 304; etag: string | null };
+
+export async function getGhPreview(url: string, etag?: string): Promise<GhPreviewFetchResult> {
+  const response = await fetch(`/api/gh/preview?url=${encodeURIComponent(url)}`, {
+    headers: etag ? { "If-None-Match": etag } : undefined,
+  });
+
+  if (response.status === 304) {
+    return { status: 304, etag: response.headers.get("ETag") };
+  }
+
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    const message = body?.error ?? body?.detail ?? `Request failed with ${response.status}`;
+    throw new Error(message);
+  }
+
+  return {
+    status: 200,
+    etag: response.headers.get("ETag"),
+    data: (await response.json()) as GhPreviewData,
+  };
+}
+
 export function uploadImage(mediaType: string, base64: string) {
   return request<{ path: string; url: string }>("/api/upload", {
     method: "POST",

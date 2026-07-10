@@ -21,6 +21,7 @@ import {
   Zap
 } from "lucide-react";
 import { externalLinkProps, isExternalHttpUrl } from "./external-links";
+import { GhPreviewCard, isGitHubPreviewUrl } from "./github-preview";
 import type { NoteSummary } from "./types";
 
 type MdNode = {
@@ -447,6 +448,9 @@ function createComponents(
 
     const isExternal = isExternalHttpUrl(href);
     if (isExternal) {
+      if (typeof href === "string" && isGitHubPreviewUrl(href)) {
+        return <GhPreviewCard url={href} />;
+      }
       return (
         <a className="external-link" href={href} {...externalLinkProps(href)}>
           {children}

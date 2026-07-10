@@ -3624,6 +3624,104 @@ body.is-resizing-panes .pane-cell {
   background-color: color-mix(in srgb, var(--accent-primary) 16%, transparent);
 }
 
+.gh-preview-card {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 220px;
+  max-width: min(100%, 460px);
+  margin: 2px 0;
+  padding: 7px 10px;
+  border: 1px solid color-mix(in srgb, var(--accent-primary) 24%, var(--background-modifier-border));
+  border-radius: 4px;
+  background:
+    linear-gradient(
+      135deg,
+      color-mix(in srgb, var(--accent-primary) 7%, var(--background-secondary)) 0%,
+      var(--background-secondary) 100%
+    );
+  color: var(--text-normal);
+  text-decoration: none;
+  vertical-align: top;
+}
+
+.gh-preview-card:hover {
+  border-color: color-mix(in srgb, var(--accent-primary) 42%, var(--background-modifier-border));
+  background:
+    linear-gradient(
+      135deg,
+      color-mix(in srgb, var(--accent-primary) 11%, var(--background-secondary)) 0%,
+      var(--background-secondary) 100%
+    );
+}
+
+.gh-preview-title {
+  overflow: hidden;
+  color: var(--text-normal);
+  font-size: var(--font-ui-small);
+  font-weight: 600;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gh-preview-meta {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.gh-preview-badges {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.gh-preview-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-size: 11px;
+  line-height: 1;
+  text-transform: lowercase;
+  white-space: nowrap;
+}
+
+.gh-preview-badge.is-muted {
+  color: var(--text-faint);
+}
+
+.gh-preview-card.is-pr .gh-preview-badge:first-child {
+  color: var(--accent-primary);
+}
+
+.gh-preview-card.is-commit .gh-preview-badge:first-child {
+  color: var(--accent-success);
+}
+
+.gh-preview-updated {
+  margin-left: auto;
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.gh-preview-loading {
+  margin-left: 6px;
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-size: 11px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
 .session-marker {
   display: inline-flex;
   align-items: center;
@@ -4640,6 +4738,16 @@ body.is-resizing-panes .pane-cell {
 
 .session-tool-body pre.session-tool-output {
   color: var(--text-faint);
+}
+
+.session-tool-output-blocks {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.session-tool-output-blocks .gh-preview-card {
+  align-self: flex-start;
 }
 
 .session-thinking {
