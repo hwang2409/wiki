@@ -373,7 +373,7 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(legacy.exception.status_code, 409)
         self.assertIn("must be migrated", str(legacy.exception.detail))
 
-    async def test_mixed_fleet_keeps_legacy_control_isolated(self) -> None:
+    async def test_mixed_fleet_surfaces_legacy_liveness_but_refuses_control(self) -> None:
         self._seed_headless()
         registry = json.loads(self.registry.read_text(encoding="utf-8"))
         registry["WIKI-LEGACY"] = {
@@ -390,23 +390,22 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         calls_before = list(self.client.calls)
         background = BackgroundTasks()
 
-        with (
-            mock.patch.object(main, "tmux_live_windows", return_value={"@9999"}),
-            mock.patch.object(main, "resolve_window", return_value="@9999"),
-        ):
+        with mock.patch.object(main, "tmux_live_windows", return_value={"@9999"}):
             payload = main.agents()
-            sent = main.agent_message(
-                "WIKI-LEGACY",
-                main.MessageIn(text="legacy steer", mode="now"),
-                background,
-            )
+            with self.assertRaises(HTTPException) as blocked:
+                main.agent_message(
+                    "WIKI-LEGACY",
+                    main.MessageIn(text="legacy steer", mode="now"),
+                    background,
+                )
 
         workers = cast(list[dict[str, Any]], payload["workers"])
         by_ticket = {worker["ticket"]: worker for worker in workers}
         self.assertTrue(by_ticket["WIKI-42"]["control_attached"])
         self.assertTrue(by_ticket["WIKI-LEGACY"]["window_alive"])
-        self.assertEqual(sent, {"status": "sent"})
-        self.assertEqual(len(background.tasks), 1)
+        self.assertEqual(blocked.exception.status_code, 409)
+        self.assertIn("must be migrated", str(blocked.exception.detail))
+        self.assertEqual(len(background.tasks), 0)
         self.assertEqual(
             [call for call in self.client.calls if call not in calls_before],
             [("run/list", {})],
@@ -533,18 +532,33 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(spawned["log"], str(self.raw))
         self.assertFalse((self.status_dir / "WIKI-42.json").exists())
 
-        with mock.patch.object(
-            main.agent_replace,
-            "replace_agent",
-            side_effect=AssertionError("headless replace used legacy protocol"),
-        ):
-            replaced = main.replace_agent("WIKI-42")
+        replaced = main.replace_agent("WIKI-42")
         self.assertEqual(replaced["run_id"], REPLACEMENT_RUN_ID)
         self.assertEqual(replaced["window"], None)
         replace_call = next(
             params for method, params in self.client.calls if method == "run/replace"
         )
         self.assertIn(str(self.status_dir / "WIKI-42.json"), replace_call["prompt"])
+
+    async def test_legacy_replace_is_rejected(self) -> None:
+        registry = {}
+        registry["WIKI-LEGACY"] = {
+            "history": [],
+            "current": {
+                "window": "@9999",
+                "kind": "cc",
+                "role": "review",
+                "model": "sonnet",
+                "worktree": str(self.worktree),
+            },
+        }
+        self.registry.write_text(json.dumps(registry), encoding="utf-8")
+
+        with self.assertRaises(HTTPException) as blocked:
+            main.replace_agent("WIKI-LEGACY")
+
+        self.assertEqual(blocked.exception.status_code, 409)
+        self.assertIn("must be migrated", str(blocked.exception.detail))
 
     async def test_orchestrator_spawn_grouping_and_controls_are_supervisor_owned(
         self,
@@ -585,12 +599,7 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
             main.MessageIn(text="steer orchestrator", mode="now"),
             BackgroundTasks(),
         )
-        with mock.patch.object(
-            main.agent_replace,
-            "replace_agent",
-            side_effect=AssertionError("headless orchestrator used legacy replace"),
-        ):
-            replaced = main.replace_agent("wiki_dev")
+        replaced = main.replace_agent("wiki_dev")
         self.assertEqual(sent, {"status": "sent"})
         self.assertEqual(replaced["type"], "orchestrator")
         self.assertEqual(replaced["run_id"], REPLACEMENT_RUN_ID)

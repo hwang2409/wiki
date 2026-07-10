@@ -18,7 +18,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from . import accounts, agent_replace, github_pr, terminal, tokens, transcripts, uistate, vaultops
+from . import accounts, github_pr, terminal, tokens, transcripts, uistate, vaultops
 from .agent_runtime.client import (
     SupervisorClient,
     SupervisorRemoteError,
@@ -1271,6 +1271,21 @@ def _is_headless(current: dict) -> bool:
     return isinstance(current.get("run_id"), str) and bool(current["run_id"])
 
 
+def _has_legacy_control_target(registry: dict, agent_id: str) -> bool:
+    for candidate in (agent_id, agent_id.upper()):
+        entry = registry.get(candidate)
+        if not isinstance(entry, dict):
+            continue
+        current = entry.get("current")
+        if isinstance(current, dict) and not _is_headless(current):
+            return True
+    orchestrators = registry.get("_orchestrators")
+    return bool(
+        isinstance(orchestrators, dict)
+        and isinstance(orchestrators.get(agent_id), dict)
+    )
+
+
 def _supervisor_request(method: str, params: dict | None = None) -> Any:
     """Call the durable supervisor and preserve useful HTTP error classes."""
 
@@ -1308,7 +1323,7 @@ def _queue_messages(ticket: str) -> list[dict]:
     resolved = _registry_agent(_read_agent_registry(), ticket)
     if resolved is not None and _is_headless(resolved[2]):
         return _headless_queue(resolved[0])
-    return list(_read_queue().get(ticket, []))
+    return []
 
 
 def resolve_existing_dir(raw_path: str, *, field_name: str) -> Path:
@@ -1450,8 +1465,21 @@ def replace_agent(agent_id: str) -> dict[str, object]:
         raise HTTPException(status_code=400, detail="Bad agent id")
     registry = _read_agent_registry()
     resolved = _registry_agent(registry, raw_id)
-    if resolved is None or not _is_headless(resolved[2]):
-        return agent_replace.replace_agent(agent_id)
+    if resolved is None:
+        if _has_legacy_control_target(registry, raw_id):
+            raise HTTPException(
+                status_code=409,
+                detail="Legacy tmux agents must be migrated before Replace",
+            )
+        raise HTTPException(
+            status_code=404,
+            detail=f"No registered worker or orchestrator named {raw_id}",
+        )
+    if not _is_headless(resolved[2]):
+        raise HTTPException(
+            status_code=409,
+            detail="Legacy tmux agents must be migrated before Replace",
+        )
 
     resolved_id, _, current = resolved
     result = _supervisor_request(
@@ -1661,7 +1689,8 @@ def spawn_orchestrator(body: SpawnOrchestratorIn) -> dict[str, object]:
 def agent_message(ticket: str, body: MessageIn, background: BackgroundTasks) -> dict[str, object]:
     if not valid_agent_id(ticket):
         raise HTTPException(status_code=400, detail="Bad ticket")
-    resolved = _registry_agent(_read_agent_registry(), ticket)
+    registry = _read_agent_registry()
+    resolved = _registry_agent(registry, ticket)
     if resolved is not None and _is_headless(resolved[2]):
         method = "run/send_now" if body.mode == "now" else "run/send_on_idle"
         result = _supervisor_request(
@@ -1674,40 +1703,37 @@ def agent_message(ticket: str, body: MessageIn, background: BackgroundTasks) -> 
                 detail="Agent supervisor returned a bad message response",
             )
         return dict(result)
-    window = resolve_window(ticket)
-    if window is None:
-        raise HTTPException(status_code=409, detail="No live tmux window for this agent")
-    if body.mode == "on-idle":
-        queue = _read_queue()
-        queue.setdefault(ticket, []).append(
-            {"text": body.text, "queued_at": datetime.now(tz=timezone.utc).isoformat()}
+    del background
+    if _has_legacy_control_target(registry, ticket):
+        raise HTTPException(
+            status_code=409,
+            detail="Legacy tmux agents must be migrated before composer control",
         )
-        _write_queue(queue)
-        background.add_task(
-            publish_agent_event,
-            {"type": "session", "ticket": ticket, "surface": "queue"},
-        )
-        return {"status": "queued", "position": len(queue[ticket]), "messages": queue[ticket]}
-    # Delivery has load-bearing sleeps (paste-pause + submit-verify) — don't block the response.
-    background.add_task(deliver_message, window, body.text)
-    return {"status": "sent"}
+    raise HTTPException(status_code=404, detail="No registered agent")
 
 
 @app.get("/api/agents/{ticket}/queue")
 def agent_queue(ticket: str) -> dict[str, object]:
     if not valid_agent_id(ticket):
         raise HTTPException(status_code=400, detail="Bad ticket")
-    resolved = _registry_agent(_read_agent_registry(), ticket)
+    registry = _read_agent_registry()
+    resolved = _registry_agent(registry, ticket)
     if resolved is not None and _is_headless(resolved[2]):
         return {"messages": _headless_queue(resolved[0])}
-    return {"messages": _read_queue().get(ticket, [])}
+    if _has_legacy_control_target(registry, ticket):
+        raise HTTPException(
+            status_code=409,
+            detail="Legacy tmux agents must be migrated before queue inspection",
+        )
+    return {"messages": []}
 
 
 @app.delete("/api/agents/{ticket}/queue/{index}")
 def agent_queue_delete(ticket: str, index: int) -> dict[str, object]:
     if not valid_agent_id(ticket):
         raise HTTPException(status_code=400, detail="Bad ticket")
-    resolved = _registry_agent(_read_agent_registry(), ticket)
+    registry = _read_agent_registry()
+    resolved = _registry_agent(registry, ticket)
     if resolved is not None and _is_headless(resolved[2]):
         result = _supervisor_request(
             "run/queue/delete",
@@ -1719,52 +1745,12 @@ def agent_queue_delete(ticket: str, index: int) -> dict[str, object]:
                 detail="Agent supervisor returned a bad queue response",
             )
         return {"messages": list(result["messages"])}
-    queue = _read_queue()
-    messages = queue.get(ticket, [])
-    if not 0 <= index < len(messages):
-        raise HTTPException(status_code=404, detail="No such queued message")
-    messages.pop(index)
-    _write_queue(queue)
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(publish_agent_event({"type": "session", "ticket": ticket, "surface": "queue"}))
-    except RuntimeError:
-        pass
-    return {"messages": messages}
-
-
-_idle_counts: dict[str, int] = {}
-
-
-async def message_dispatcher() -> None:
-    """Deliver on-idle messages once the target pane shows no spinner twice in a row."""
-    while True:
-        await asyncio.sleep(2.5)
-        try:
-            queue = _read_queue()
-            if not any(queue.values()):
-                _idle_counts.clear()
-                continue
-            for ticket, messages in list(queue.items()):
-                if not messages:
-                    continue
-                window = resolve_window(ticket)
-                if window is None:
-                    continue  # window gone — hold until it returns or user cancels
-                pane = await asyncio.to_thread(capture_pane_tail, window, 40)
-                if pane is None or pane_is_working(pane):
-                    _idle_counts[ticket] = 0
-                    continue
-                _idle_counts[ticket] = _idle_counts.get(ticket, 0) + 1
-                if _idle_counts[ticket] < 2:
-                    continue
-                message = messages.pop(0)
-                _write_queue(queue)
-                _idle_counts[ticket] = 0
-                await publish_agent_event({"type": "session", "ticket": ticket, "surface": "queue"})
-                await asyncio.to_thread(deliver_message, window, message["text"])
-        except Exception:
-            continue  # dispatcher must never die
+    if _has_legacy_control_target(registry, ticket):
+        raise HTTPException(
+            status_code=409,
+            detail="Legacy tmux agents must be migrated before queue mutation",
+        )
+    raise HTTPException(status_code=404, detail="No registered agent")
 
 
 # ---------------------------------------------------------------------------
@@ -1818,7 +1804,7 @@ async def supervisor_event_bridge() -> None:
 
 
 async def agent_runtime_dispatchers() -> None:
-    await asyncio.gather(message_dispatcher(), supervisor_event_bridge())
+    await supervisor_event_bridge()
 
 
 def vault_snapshot() -> dict[str, float]:
