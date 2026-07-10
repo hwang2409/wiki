@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import time
 from collections.abc import Callable
@@ -25,6 +26,25 @@ from .types import (
 
 
 AdapterFactory = Callable[[RunRecord], ProviderAdapter]
+DEFAULT_REAPER_INTERVAL_SECONDS = 30.0
+DEFAULT_REAPER_GRACE_SECONDS = 60.0
+
+
+def _validated_seconds(name: str, value: float) -> float:
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{name} must be a finite, non-negative number")
+    return value
+
+
+def _env_seconds(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number") from exc
+    return _validated_seconds(name, value)
 
 
 def provider_pid_is_alive(pid: int | None) -> bool:
@@ -68,11 +88,37 @@ class Supervisor:
         *,
         pid_alive: Callable[[int | None], bool] = provider_pid_is_alive,
         recovery_stability_seconds: float = 30.0,
+        reaper_interval_seconds: float | None = None,
+        reaper_grace_seconds: float | None = None,
     ):
         self.store = store
         self.adapter_factory = adapter_factory
         self.pid_alive = pid_alive
         self.recovery_stability_seconds = recovery_stability_seconds
+        self.reaper_interval_seconds = _validated_seconds(
+            "WIKI_REAPER_INTERVAL_SECONDS",
+            (
+                reaper_interval_seconds
+                if reaper_interval_seconds is not None
+                else _env_seconds(
+                    "WIKI_REAPER_INTERVAL_SECONDS",
+                    DEFAULT_REAPER_INTERVAL_SECONDS,
+                )
+            ),
+        )
+        self.reaper_grace_seconds = _validated_seconds(
+            "WIKI_REAPER_GRACE_SECONDS",
+            (
+                reaper_grace_seconds
+                if reaper_grace_seconds is not None
+                else _env_seconds(
+                    "WIKI_REAPER_GRACE_SECONDS",
+                    DEFAULT_REAPER_GRACE_SECONDS,
+                )
+            ),
+        )
+        self.last_reaper_at = 0.0
+        self.detached_at_monotonic: dict[str, float] = {}
         self.adapters: dict[str, ProviderAdapter] = {}
         self.event_tasks: dict[str, asyncio.Task[None]] = {}
         self.event_routes: dict[tuple[int, int], str] = {}
@@ -185,6 +231,38 @@ class Supervisor:
             datetime.now(timezone.utc) - guarded_at
         ).total_seconds() >= self.recovery_stability_seconds
 
+    def _reaper_due(self) -> bool:
+        return self._seconds_since(self.last_reaper_at) >= self.reaper_interval_seconds
+
+    def _mark_adapter_loss(self, run_id: str) -> None:
+        self.detached_at_monotonic.setdefault(run_id, time.monotonic())
+
+    def _clear_adapter_loss(self, run_id: str) -> None:
+        self.detached_at_monotonic.pop(run_id, None)
+
+    def _reapable_adapter_loss(self, record: RunRecord) -> bool:
+        if record.state in TERMINAL_STATES:
+            self._clear_adapter_loss(record.run_id)
+            return False
+        if record.run_id in self.adapters:
+            self._clear_adapter_loss(record.run_id)
+            return False
+        if record.provider_pid is not None:
+            self._clear_adapter_loss(record.run_id)
+            return False
+        if record.quiesce_operation_id is not None:
+            self._clear_adapter_loss(record.run_id)
+            return False
+        detached_at = self.detached_at_monotonic.get(record.run_id)
+        if detached_at is None:
+            # Monotonic timestamps do not survive process restart. If the
+            # daemon boots with a persisted adapterless no-PID run, start a
+            # fresh grace window rather than reaping immediately from wall
+            # clock metadata unrelated to detach time.
+            self._mark_adapter_loss(record.run_id)
+            return False
+        return self._seconds_since(detached_at) >= self.reaper_grace_seconds
+
     async def _pump_events(self, run_id: str, adapter: ProviderAdapter) -> None:
         stream_key = id(adapter)
         try:
@@ -242,6 +320,8 @@ class Supervisor:
             except Exception:
                 record = None
             self._remove_adapter_mapping(run_id, adapter)
+            if record is not None and record.provider_pid is None:
+                self._mark_adapter_loss(run_id)
             if record is not None:
                 await self._publish_agent_change(record.agent_id)
 
@@ -267,6 +347,8 @@ class Supervisor:
             except (RunNotFound, ValueError):
                 record = None
             self._remove_adapter_mapping(run_id, adapter)
+            if record is not None and record.provider_pid is None:
+                self._mark_adapter_loss(run_id)
             if record is not None:
                 await self._publish_agent_change(record.agent_id)
 
@@ -628,6 +710,7 @@ class Supervisor:
             raise StoreConflict(
                 f"run already has an attached provider adapter: {run_id}"
             )
+        self._clear_adapter_loss(run_id)
         old_task = self.event_tasks.pop(run_id, None)
         if old_task is not None:
             old_task.cancel()
@@ -640,6 +723,7 @@ class Supervisor:
     async def _detach_adapter(
         self, run_id: str, *, preserve_event_routes: bool = False
     ) -> None:
+        self._clear_adapter_loss(run_id)
         adapter = self.adapters.pop(run_id, None)
         task = self.event_tasks.pop(run_id, None)
         if task is not None:
@@ -845,7 +929,45 @@ class Supervisor:
 
     async def recover_on_start(self) -> list[dict[str, str]]:
         async with self.recovery_scan_lock:
-            return await self._recover_once()
+            results = await self._recover_once()
+            if self._reaper_due():
+                by_run_id = {
+                    item["run_id"]: index for index, item in enumerate(results)
+                }
+                for reaped in await self._reap_lost_runs():
+                    index = by_run_id.get(reaped["run_id"])
+                    if index is None:
+                        results.append(reaped)
+                    else:
+                        results[index] = reaped
+            return results
+
+    async def _reap_lost_runs(self) -> list[dict[str, str]]:
+        self.last_reaper_at = time.monotonic()
+        results: list[dict[str, str]] = []
+        for snapshot in self.store.list_runs():
+            async with self._run_lock(snapshot.run_id):
+                try:
+                    record = self.store.get(snapshot.run_id)
+                except RunNotFound:
+                    continue
+                if not self._reapable_adapter_loss(record):
+                    continue
+                record = self.store.transition(
+                    record.run_id,
+                    LifecycleState.COMPLETED,
+                    reason="adapter_lost",
+                )
+                self._clear_adapter_loss(record.run_id)
+                await self._publish_agent_change(record.agent_id)
+                results.append(
+                    {
+                        "run_id": record.run_id,
+                        "action": "reap",
+                        "reason": "adapter_lost",
+                    }
+                )
+        return results
 
     async def request_codex_rotation(
         self,
@@ -1594,6 +1716,7 @@ class Supervisor:
                     reason="archived",
                 )
             archived, _ = self.store.archive_current(run_id, outcome=outcome)
+            self._clear_adapter_loss(run_id)
             await self._publish_agent_change(archived.agent_id)
             return archived
         try:
@@ -1614,6 +1737,7 @@ class Supervisor:
             raise StoreConflict("provider archive returned no status")
         record = self.store.update_adapter_status(run_id, status)
         archived, _ = self.store.archive_current(run_id, outcome=outcome)
+        self._clear_adapter_loss(run_id)
         await self._publish_agent_change(archived.agent_id)
         return archived
 
@@ -1983,4 +2107,5 @@ class Supervisor:
         self.auth_dead_recoveries.clear()
         self.last_limit_alert_at.clear()
         self.last_no_eligible_alert = 0.0
+        self.detached_at_monotonic.clear()
         self.adapters.clear()
