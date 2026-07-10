@@ -305,6 +305,20 @@ def read_registry() -> dict:
         return {}
 
 
+def is_headless_current(entry: object) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    current = entry.get("current")
+    return isinstance(current, dict) and isinstance(current.get("run_id"), str)
+
+
+def fail_headless_ownership(command: str, agent_id: str) -> None:
+    fail(
+        f"{command} cannot mutate supervisor-owned headless run {agent_id}; "
+        "use the wiki app/backend lifecycle controls instead"
+    )
+
+
 def write_registry(registry: dict) -> None:
     import json
     import tempfile
@@ -333,6 +347,8 @@ def cmd_agent_register(args: argparse.Namespace) -> None:
 
     registry = read_registry()
     entry = registry.get(ticket, {"history": []})
+    if is_headless_current(entry):
+        fail_headless_ownership("wiki agent register", ticket)
 
     current = entry.get("current")
     if current:
@@ -436,6 +452,8 @@ def cmd_agent_done(args: argparse.Namespace) -> None:
     if ticket not in registry:
         fail(f"{ticket} not in registry")
     entry = registry[ticket]
+    if is_headless_current(entry):
+        fail_headless_ownership("wiki agent done", ticket)
     del registry[ticket]
     write_registry(registry)
     meta_path = persist_outcome(ticket, args.outcome, entry)
@@ -456,6 +474,8 @@ def cmd_agent_update(args: argparse.Namespace) -> None:
     entry = registry.get(ticket)
     if not entry or not entry.get("current"):
         fail(f"{ticket} not in registry")
+    if is_headless_current(entry):
+        fail_headless_ownership("wiki agent update", ticket)
     current = entry["current"]
     # (arg-name, registry-key) — `--session` writes `session_id` to avoid the
     # collision with the integer session-count field written by `register`.
@@ -487,7 +507,6 @@ def cmd_agent_update(args: argparse.Namespace) -> None:
 
 
 def cmd_agent_orch(args: argparse.Namespace) -> None:
-    import json
     import os
 
     orch_id = args.id.strip()
@@ -501,6 +520,8 @@ def cmd_agent_orch(args: argparse.Namespace) -> None:
         candidate = Path.home() / ".claude" / "projects" / escaped / f"{session_id}.jsonl"
         transcript = str(candidate)
     registry = read_registry()
+    if is_headless_current(registry.get(orch_id)):
+        fail_headless_ownership("wiki agent orch", orch_id)
     orchs = registry.setdefault("_orchestrators", {})
     orchs[orch_id] = {
         "window": args.window,

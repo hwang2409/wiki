@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
 import tempfile
 import threading
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -126,6 +128,19 @@ class RuntimePaths:
     runtime_dir: Path
     socket_path: Path
     registry_path: Path
+    archive_dir: Path = (
+        Path(
+            os.environ.get("WIKI_AGENT_ARCHIVE_DIR")
+            or Path.home() / "me" / "fun" / "agent-archive"
+        )
+        .expanduser()
+        .absolute()
+    )
+    status_dir: Path = (
+        Path(os.environ.get("WIKI_AGENT_STATUS_DIR") or "/tmp/agent-status")
+        .expanduser()
+        .absolute()
+    )
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> RuntimePaths:
@@ -140,12 +155,21 @@ class RuntimePaths:
         registry_path = Path(
             values.get("WIKI_AGENT_REGISTRY_PATH") or "/tmp/agent-registry.json"
         ).expanduser()
+        archive_dir = Path(
+            values.get("WIKI_AGENT_ARCHIVE_DIR")
+            or Path.home() / "me" / "fun" / "agent-archive"
+        ).expanduser()
+        status_dir = Path(
+            values.get("WIKI_AGENT_STATUS_DIR") or "/tmp/agent-status"
+        ).expanduser()
         # absolute() preserves the final path component instead of following a
         # pre-existing symlink. Writers can then reject symlinks explicitly.
         return cls(
             runtime_dir=runtime_dir.absolute(),
             socket_path=socket_path.absolute(),
             registry_path=registry_path.absolute(),
+            archive_dir=archive_dir.absolute(),
+            status_dir=status_dir.absolute(),
         )
 
     @property
@@ -301,6 +325,12 @@ class RunStore:
 
     def provider_log_path(self, run_id: str) -> Path:
         return self.run_dir(run_id) / "provider.log"
+
+    def archive_ticket_dir(self, agent_id: str) -> Path:
+        return self.paths.archive_dir / agent_id
+
+    def status_path(self, agent_id: str) -> Path:
+        return self.paths.status_dir / f"{agent_id}.json"
 
     def read_codex_rotation_journal(self) -> dict[str, Any] | None:
         """Read the secret-free account-rotation checkpoint, if present."""
@@ -516,14 +546,33 @@ class RunStore:
         and history rows not owned by this runtime are preserved verbatim.
         """
 
+        registry = self._read_registry()
+        changed = False
+        for agent_id, entry in list(registry.items()):
+            if agent_id.startswith("_") or not isinstance(entry, dict):
+                continue
+            current = entry.get("current")
+            if not isinstance(current, dict):
+                continue
+            run_id = current.get("run_id")
+            if not isinstance(run_id, str):
+                continue
+            if self.run_path(run_id).is_file():
+                continue
+            # Archive finalization deletes the runtime run dir first, then
+            # drops the registry row. If the daemon stops between those steps,
+            # the missing run file is the durable signal that the current row
+            # must not survive restart.
+            registry.pop(agent_id, None)
+            changed = True
+
         records_by_agent: dict[str, list[RunRecord]] = {}
         for record in self.list_runs():
             records_by_agent.setdefault(record.agent_id, []).append(record)
         if not records_by_agent:
+            if changed:
+                self._write_registry(registry)
             return
-
-        registry = self._read_registry()
-        changed = False
         for agent_id, records in records_by_agent.items():
             records.sort(key=lambda item: (item.created_at, item.run_id))
             by_id = {record.run_id: record for record in records}
@@ -633,6 +682,103 @@ class RunStore:
                 changed = True
         if changed:
             self._write_registry(registry)
+
+    def _next_archive_session_dir(self, agent_id: str) -> Path:
+        ticket_dir = self.archive_ticket_dir(agent_id)
+        _ensure_parent_dir(ticket_dir)
+        stamp = datetime.now().astimezone().replace(microsecond=0)
+        while True:
+            session_dir = ticket_dir / stamp.strftime("%Y%m%d-%H%M%S")
+            if not session_dir.exists():
+                session_dir.mkdir(mode=0o700, parents=True)
+                session_dir.chmod(0o700)
+                return session_dir
+            stamp += timedelta(seconds=1)
+
+    def _copy_archive_file(self, source: Path, destination: Path) -> None:
+        if not source.is_file():
+            return
+        _ensure_parent_dir(destination.parent)
+        shutil.copy2(source, destination)
+        destination.chmod(0o600)
+
+    def archive_current(
+        self,
+        run_id: str,
+        *,
+        outcome: str | None = None,
+    ) -> tuple[RunRecord, Path]:
+        with self._lock:
+            record = self.get(run_id)
+            registry = self._read_registry()
+            entry = registry.get(record.agent_id)
+            current = entry.get("current") if isinstance(entry, dict) else None
+            if not isinstance(current, dict) or current.get("run_id") != run_id:
+                raise StoreConflict("archive target is no longer current")
+            if record.state not in TERMINAL_STATES:
+                raise StoreConflict("archive target must be terminal before finalization")
+
+            ended_at = utc_now()
+            if outcome is not None:
+                record.outcome = outcome
+            record.updated_at = ended_at
+            entry_dict = entry if isinstance(entry, dict) else {}
+            history = [
+                dict(item)
+                for item in (entry_dict.get("history") or [])
+                if isinstance(item, dict)
+            ]
+            session_dir = self._next_archive_session_dir(record.agent_id)
+            log_name = f"{record.provider.legacy_kind}-{record.agent_id}.log"
+            prompt_name = f"{record.provider.legacy_kind}-{record.agent_id}-prompt.md"
+            archive_worker = {**current, "ended_at": ended_at}
+            if record.outcome is not None:
+                archive_worker["outcome"] = record.outcome
+            _atomic_write_json(session_dir / "run.json", record.to_dict())
+            _atomic_write_json(
+                session_dir / "meta.json",
+                {
+                    "outcome": record.outcome,
+                    "ended_at": ended_at,
+                    "worker": archive_worker,
+                    "history": history,
+                    "source": "headless-supervisor",
+                },
+            )
+            self._copy_archive_file(
+                self.raw_events_path(run_id),
+                session_dir / log_name,
+            )
+            self._copy_archive_file(
+                self.raw_events_path(run_id),
+                session_dir / "raw.jsonl",
+            )
+            self._copy_archive_file(
+                self.normalized_events_path(run_id),
+                session_dir / "events.jsonl",
+            )
+            self._copy_archive_file(
+                self.provider_log_path(run_id),
+                session_dir / "provider.log",
+            )
+            if record.initial_prompt:
+                prompt_path = session_dir / prompt_name
+                prompt_path.write_text(record.initial_prompt, encoding="utf-8")
+                prompt_path.chmod(0o600)
+            status_path = self.status_path(record.agent_id)
+            if status_path.is_file():
+                try:
+                    status = json.loads(status_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    status = None
+                if isinstance(status, dict):
+                    _atomic_write_json(session_dir / "final-status.json", status)
+                status_path.unlink(missing_ok=True)
+
+            shutil.rmtree(self.run_dir(run_id))
+            registry.pop(record.agent_id, None)
+            self._write_registry(registry)
+            return record, session_dir
 
     def create(self, record: RunRecord, *, migrate_legacy: bool = False) -> RunRecord:
         with self._lock:

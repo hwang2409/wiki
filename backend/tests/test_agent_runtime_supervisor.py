@@ -74,6 +74,8 @@ def _paths(root: Path) -> RuntimePaths:
         runtime_dir=root / "runtime",
         socket_path=root / "runtime" / "supervisor.sock",
         registry_path=root / "isolated-registry.json",
+        archive_dir=root / "archive",
+        status_dir=root / "status",
     )
 
 
@@ -1401,6 +1403,69 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             "provider archive failed: fixture archive rejection",
         )
         self.assertNotIn(original.run_id, self.supervisor.adapters)
+
+    async def test_archive_finalizes_current_run_into_archive_dir(self) -> None:
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-ARCHIVE",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="fixture prompt",
+        )
+        self.paths.status_dir.mkdir(parents=True, exist_ok=True)
+        (self.paths.status_dir / "WIKI-ARCHIVE.json").write_text(
+            json.dumps({"state": "merge-ready", "step": "waiting for merge"}),
+            encoding="utf-8",
+        )
+
+        archived = await self.supervisor.archive(record.run_id)
+
+        self.assertEqual(archived.state, LifecycleState.COMPLETED)
+        self.assertFalse(self.store.run_dir(record.run_id).exists())
+        self.assertNotIn("WIKI-ARCHIVE", json.loads(self.paths.registry_path.read_text()))
+        session_dirs = sorted((self.paths.archive_dir / "WIKI-ARCHIVE").iterdir())
+        self.assertEqual(len(session_dirs), 1)
+        session_dir = session_dirs[0]
+        self.assertTrue((session_dir / "run.json").is_file())
+        self.assertTrue((session_dir / "raw.jsonl").is_file())
+        self.assertTrue((session_dir / "events.jsonl").is_file())
+        self.assertTrue((session_dir / "cdx-WIKI-ARCHIVE.log").is_file())
+        self.assertEqual(
+            (session_dir / "cdx-WIKI-ARCHIVE-prompt.md").read_text(
+                encoding="utf-8"
+            ),
+            "fixture prompt",
+        )
+        meta = json.loads((session_dir / "meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["worker"]["run_id"], record.run_id)
+        final_status = json.loads(
+            (session_dir / "final-status.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(final_status["state"], "merge-ready")
+        self.assertNotIn(record.run_id, self.supervisor.adapters)
+
+    async def test_archive_allows_detached_dead_run(self) -> None:
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-ARCHIVE-DEAD",
+            provider=ProviderKind.CLAUDE,
+            role="implement",
+            model="fixture-claude",
+            effort=None,
+            worktree=str(self.worktree),
+            prompt="fixture",
+        )
+        await self.supervisor.stop(record.run_id)
+
+        archived = await self.supervisor.archive(record.run_id)
+
+        self.assertEqual(archived.state, LifecycleState.DEAD)
+        self.assertFalse(self.store.run_dir(record.run_id).exists())
+        self.assertFalse(
+            (self.paths.registry_path.exists())
+            and json.loads(self.paths.registry_path.read_text()).get("WIKI-ARCHIVE-DEAD")
+        )
 
     async def test_codex_fake_exercises_start_steer_and_targeted_interrupt(
         self,

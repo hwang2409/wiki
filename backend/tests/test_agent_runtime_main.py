@@ -671,6 +671,8 @@ class BackendSupervisorEndToEndTests(unittest.IsolatedAsyncioTestCase):
             runtime_dir=self.root / "runtime",
             socket_path=self.root / "runtime" / "supervisor.sock",
             registry_path=self.root / "agent-registry.json",
+            archive_dir=self.root / "archive",
+            status_dir=self.root / "status",
         )
         self.store = RunStore(self.paths)
         self.supervisor = Supervisor(

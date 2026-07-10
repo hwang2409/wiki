@@ -18,6 +18,7 @@ from .types import (
     ProviderKind,
     RecoveryAction,
     RunRecord,
+    TERMINAL_STATES,
     restart_recovery_decision,
 )
 
@@ -1288,14 +1289,37 @@ class Supervisor:
         await self._publish_agent_change(record.agent_id)
         return record
 
-    async def archive(self, run_id: str) -> RunRecord:
+    async def archive(
+        self,
+        run_id: str,
+        *,
+        outcome: str | None = None,
+    ) -> RunRecord:
         async with self._run_lock(run_id):
-            return await self._archive(run_id)
+            return await self._archive(run_id, outcome=outcome)
 
-    async def _archive(self, run_id: str) -> RunRecord:
+    async def _archive(
+        self,
+        run_id: str,
+        *,
+        outcome: str | None = None,
+    ) -> RunRecord:
         adapter = self.adapters.get(run_id)
         if adapter is None:
-            raise StoreConflict("run has no attached provider adapter")
+            record = self.store.get(run_id)
+            if self.pid_alive(record.provider_pid):
+                raise StoreConflict(
+                    "provider PID is live without attached control; refusing false archive"
+                )
+            if record.state not in TERMINAL_STATES:
+                record = self.store.transition(
+                    run_id,
+                    LifecycleState.COMPLETED,
+                    reason="archived",
+                )
+            archived, _ = self.store.archive_current(run_id, outcome=outcome)
+            await self._publish_agent_change(archived.agent_id)
+            return archived
         try:
             status = await self._close_and_drain_adapter(
                 run_id,
@@ -1313,8 +1337,9 @@ class Supervisor:
         if status is None:
             raise StoreConflict("provider archive returned no status")
         record = self.store.update_adapter_status(run_id, status)
-        await self._publish_agent_change(record.agent_id)
-        return record
+        archived, _ = self.store.archive_current(run_id, outcome=outcome)
+        await self._publish_agent_change(archived.agent_id)
+        return archived
 
     async def _record_failed_terminal_control(
         self,
@@ -1569,7 +1594,15 @@ class Supervisor:
         if method == "run/stop":
             return _public_run(await self.stop(self._resolve_run_id(params)))
         if method == "run/archive":
-            return _public_run(await self.archive(self._resolve_run_id(params)))
+            outcome = params.get("outcome")
+            if outcome is not None and not isinstance(outcome, str):
+                raise ValueError("outcome must be a string or null")
+            return _public_run(
+                await self.archive(
+                    self._resolve_run_id(params),
+                    outcome=outcome,
+                )
+            )
         if method == "run/replace":
             return _public_run(
                 await self.replace(

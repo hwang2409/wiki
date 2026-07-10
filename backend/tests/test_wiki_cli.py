@@ -94,6 +94,91 @@ class AgentUpdateSessionTests(unittest.TestCase):
             self.assertEqual(orch["model"], "sonnet")
             self.assertEqual(orch["session_id"], "claude-session-1")
 
+    def test_update_rejects_supervisor_owned_run(self) -> None:
+        with TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / "agent-registry.json"
+            registry_path.write_text(
+                json.dumps(
+                    {
+                        "WIKI-15": {
+                            "current": {
+                                "run_id": "00000000-0000-4000-8000-000000000015",
+                                "window": None,
+                                "kind": "cdx",
+                                "role": "implement",
+                            }
+                        }
+                    }
+                )
+            )
+            env = {**os.environ, "WIKI_AGENT_REGISTRY_PATH": str(registry_path)}
+            proc = self._run(["agent", "update", "WIKI-15", "--window", "@99"], env=env)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("supervisor-owned headless run WIKI-15", proc.stderr)
+            reloaded = json.loads(registry_path.read_text())
+            self.assertIsNone(reloaded["WIKI-15"]["current"]["window"])
+
+    def test_register_rejects_supervisor_owned_run(self) -> None:
+        with TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / "agent-registry.json"
+            registry_path.write_text(
+                json.dumps(
+                    {
+                        "WIKI-15": {
+                            "current": {
+                                "run_id": "00000000-0000-4000-8000-000000000015",
+                                "window": None,
+                                "kind": "cdx",
+                                "role": "implement",
+                            }
+                        }
+                    }
+                )
+            )
+            env = {**os.environ, "WIKI_AGENT_REGISTRY_PATH": str(registry_path)}
+            proc = self._run(
+                [
+                    "agent",
+                    "register",
+                    "WIKI-15",
+                    "--window",
+                    "@42",
+                    "--kind",
+                    "cdx",
+                    "--role",
+                    "implement",
+                ],
+                env=env,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("supervisor-owned headless run WIKI-15", proc.stderr)
+
+    def test_orchestrator_registration_rejects_supervisor_owned_id(self) -> None:
+        with TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / "agent-registry.json"
+            registry_path.write_text(
+                json.dumps(
+                    {
+                        "wiki": {
+                            "current": {
+                                "run_id": "00000000-0000-4000-8000-000000000099",
+                                "window": None,
+                                "kind": "cc",
+                                "role": "orchestrator",
+                            }
+                        }
+                    }
+                )
+            )
+            env = {
+                **os.environ,
+                "WIKI_AGENT_REGISTRY_PATH": str(registry_path),
+                "CLAUDE_CODE_SESSION_ID": "claude-session-1",
+            }
+            proc = self._run(["agent", "orch", "wiki", "--window", "@9"], env=env)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("supervisor-owned headless run wiki", proc.stderr)
+
 
 class AgentDoneWindowCleanupTests(unittest.TestCase):
     def _run(self, args: list[str], env: dict) -> subprocess.CompletedProcess:
@@ -262,6 +347,33 @@ class AgentDoneWindowCleanupTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, msg=proc.stderr)
             self.assertIn("window already gone: @12", proc.stdout)
             self.assertEqual(json.loads(registry_path.read_text(encoding="utf-8")), {})
+
+    def test_done_rejects_supervisor_owned_run(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            registry_path = tmp_path / "agent-registry.json"
+            registry_path.write_text(
+                json.dumps(
+                    {
+                        "WIKI-26": {
+                            "current": {
+                                "run_id": "00000000-0000-4000-8000-000000000026",
+                                "window": None,
+                                "kind": "cdx",
+                                "role": "implement",
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            env = {**os.environ, "WIKI_AGENT_REGISTRY_PATH": str(registry_path)}
+
+            proc = self._run(["agent", "done", "WIKI-26", "--outcome", "merged"], env=env)
+
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("supervisor-owned headless run WIKI-26", proc.stderr)
+            self.assertIn("WIKI-26", json.loads(registry_path.read_text(encoding="utf-8")))
 
 
 if __name__ == "__main__":

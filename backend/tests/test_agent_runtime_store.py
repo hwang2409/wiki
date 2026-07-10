@@ -36,6 +36,8 @@ def _paths(root: Path) -> RuntimePaths:
         runtime_dir=root / "runtime",
         socket_path=root / "runtime" / "supervisor.sock",
         registry_path=root / "registry" / "agents.json",
+        archive_dir=root / "archive",
+        status_dir=root / "status",
     )
 
 
@@ -960,6 +962,75 @@ class RunStoreTests(unittest.TestCase):
             with self.assertRaisesRegex(StoreConflict, "no longer current"):
                 store.replace(old.run_id, _record(root))
 
+    def test_archive_current_writes_snapshot_and_removes_runtime_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            record = store.create(_record(root))
+            record = store.transition(record.run_id, LifecycleState.COMPLETED)
+            paths.status_dir.mkdir(parents=True, exist_ok=True)
+            status_path = paths.status_dir / "WIKI-42.json"
+            status_path.write_text(
+                json.dumps({"state": "merge-ready", "step": "done", "pr": "https://example/pr/42"}),
+                encoding="utf-8",
+            )
+
+            archived, session_dir = store.archive_current(
+                record.run_id,
+                outcome="merged",
+            )
+
+            self.assertEqual(archived.outcome, "merged")
+            self.assertFalse(store.run_dir(record.run_id).exists())
+            self.assertEqual(store.current_run_id("WIKI-42"), None)
+            self.assertFalse(status_path.exists())
+            self.assertTrue((session_dir / "run.json").is_file())
+            self.assertTrue((session_dir / "raw.jsonl").is_file())
+            self.assertTrue((session_dir / "events.jsonl").is_file())
+            self.assertTrue((session_dir / "cdx-WIKI-42.log").is_file())
+            self.assertEqual(
+                (session_dir / "cdx-WIKI-42-prompt.md").read_text(encoding="utf-8"),
+                "Work on ticket WIKI-42",
+            )
+            meta = json.loads((session_dir / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["outcome"], "merged")
+            self.assertEqual(meta["worker"]["run_id"], record.run_id)
+            final_status = json.loads(
+                (session_dir / "final-status.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(final_status["state"], "merge-ready")
+
+    def test_reconcile_prunes_headless_registry_rows_missing_run_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            paths.registry_path.parent.mkdir(parents=True, exist_ok=True)
+            missing_run_id = str(uuid4())
+            paths.registry_path.write_text(
+                json.dumps(
+                    {
+                        "WIKI-42": {
+                            "history": [],
+                            "current": {
+                                "run_id": missing_run_id,
+                                "kind": "cdx",
+                                "role": "implement",
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            store = RunStore(paths)
+
+            self.assertEqual(store.current_run_id("WIKI-42"), None)
+            self.assertEqual(
+                json.loads(paths.registry_path.read_text(encoding="utf-8")),
+                {},
+            )
+
     def test_env_paths_keep_every_live_surface_redirectable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -967,11 +1038,15 @@ class RunStoreTests(unittest.TestCase):
                 "WIKI_AGENT_RUNTIME_DIR": str(root / "runtime"),
                 "WIKI_SUPERVISOR_SOCKET_PATH": str(root / "control.sock"),
                 "WIKI_AGENT_REGISTRY_PATH": str(root / "registry.json"),
+                "WIKI_AGENT_ARCHIVE_DIR": str(root / "archive"),
+                "WIKI_AGENT_STATUS_DIR": str(root / "status"),
             }
             paths = RuntimePaths.from_env(env)
             self.assertEqual(paths.runtime_dir, (root / "runtime").absolute())
             self.assertEqual(paths.socket_path, (root / "control.sock").absolute())
             self.assertEqual(paths.registry_path, (root / "registry.json").absolute())
+            self.assertEqual(paths.archive_dir, (root / "archive").absolute())
+            self.assertEqual(paths.status_dir, (root / "status").absolute())
 
 
 if __name__ == "__main__":
