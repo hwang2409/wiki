@@ -1,4 +1,14 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  createContext,
+  memo,
+  useCallback,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import type { ComponentProps, CSSProperties, RefObject } from "react";
 import {
   AlertTriangle,
@@ -495,6 +505,19 @@ function ProviderPendingRequestCard({
     </div>
   );
 }
+
+type QuestionDraft = {
+  answers: Record<string, number>;
+  sending: boolean;
+  error: string | null;
+};
+
+type QuestionUiContextValue = {
+  drafts: Record<string, QuestionDraft>;
+  answerQuestion: (event: SessionEvent, optionIndex: number) => void;
+};
+
+const QuestionUiContext = createContext<QuestionUiContextValue | null>(null);
 
 function ProviderStreamInspector({
   inspector,
@@ -1049,12 +1072,18 @@ function MarkerRow({ text, marker }: { text: string; marker?: string }) {
 }
 
 function QuestionRow({ event }: { event: SessionEvent }) {
+  const questionUi = useContext(QuestionUiContext);
   const question = event.question;
   if (!question) return null;
-  const answered =
-    question.answered_option !== null
-      ? question.options[question.answered_option] ?? null
-      : null;
+  const draft = questionUi?.drafts[question.tool_use_id];
+  const optimisticIndex = draft?.answers[question.prompt];
+  const pickedIndex =
+    question.answered_option !== null ? question.answered_option : optimisticIndex ?? null;
+  const answered = pickedIndex !== null ? question.options[pickedIndex] ?? null : null;
+  const disabled =
+    question.answered_option !== null ||
+    Boolean(question.custom_reply) ||
+    Boolean(draft?.sending);
   return (
     <div className="session-question">
       <div className="session-question-head">
@@ -1064,13 +1093,23 @@ function QuestionRow({ event }: { event: SessionEvent }) {
       <div className="session-question-prompt">{question.prompt}</div>
       <div className="session-question-options">
         {question.options.map((option, index) => (
-          <div
-            className={`session-question-option${question.answered_option === index ? " is-picked" : ""}`}
+          <button
+            className={[
+              "session-question-option",
+              pickedIndex === index ? "is-picked" : "",
+              !disabled ? "is-clickable" : "",
+            ].filter(Boolean).join(" ")}
+            disabled={disabled}
             key={`${question.prompt}:${option}:${index}`}
+            type="button"
+            onClick={() => {
+              if (disabled) return;
+              questionUi?.answerQuestion(event, index);
+            }}
           >
             <span className="session-question-index">{index + 1}</span>
             <span>{option}</span>
-          </div>
+          </button>
         ))}
       </div>
       {answered ? (
@@ -1085,6 +1124,7 @@ function QuestionRow({ event }: { event: SessionEvent }) {
           <span>{question.custom_reply}</span>
         </div>
       ) : null}
+      {draft?.error ? <div className="session-question-error">{draft.error}</div> : null}
     </div>
   );
 }
@@ -1430,6 +1470,112 @@ export function SessionTab({
   );
   const visible = useElementVisible(containerRef);
   const { session, error, loading } = useTranscriptSession(target, visible);
+  const [questionDrafts, setQuestionDrafts] = useState<Record<string, QuestionDraft>>({});
+
+  const questionGroups = useMemo(() => {
+    const groups = new Map<string, SessionEvent[]>();
+    for (const event of session?.events ?? []) {
+      if (event.kind !== "question" || !event.question?.tool_use_id) continue;
+      const existing = groups.get(event.question.tool_use_id);
+      if (existing) existing.push(event);
+      else groups.set(event.question.tool_use_id, [event]);
+    }
+    return groups;
+  }, [session?.events]);
+
+  useEffect(() => {
+    setQuestionDrafts((current) => {
+      let changed = false;
+      const next: Record<string, QuestionDraft> = {};
+      for (const [toolUseId, draft] of Object.entries(current)) {
+        const events = questionGroups.get(toolUseId);
+        if (!events || events.every((event) => {
+          const question = event.question;
+          return Boolean(
+            question &&
+            (question.answered_option !== null || question.custom_reply)
+          );
+        })) {
+          changed = true;
+          continue;
+        }
+        next[toolUseId] = draft;
+      }
+      return changed ? next : current;
+    });
+  }, [questionGroups]);
+
+  const answerQuestion = useCallback(async (event: SessionEvent, optionIndex: number) => {
+    const question = event.question;
+    const toolUseId = question?.tool_use_id;
+    if (
+      !question ||
+      !toolUseId ||
+      question.answered_option !== null ||
+      question.custom_reply
+    ) {
+      return;
+    }
+    const group = questionGroups.get(toolUseId) ?? [event];
+    const previous = questionDrafts[toolUseId] ?? { answers: {}, sending: false, error: null };
+    if (previous.sending) return;
+    const nextAnswers = { ...previous.answers, [question.prompt]: optionIndex };
+    const payloadAnswers = group.map((candidate) => {
+      const candidateQuestion = candidate.question;
+      if (!candidateQuestion) return null;
+      const selectedIndex =
+        candidateQuestion.answered_option !== null
+          ? candidateQuestion.answered_option
+          : nextAnswers[candidateQuestion.prompt];
+      if (selectedIndex === undefined || selectedIndex === null) return null;
+      const answer = candidateQuestion.options[selectedIndex];
+      if (!answer) return null;
+      return [candidateQuestion.prompt, answer] as const;
+    });
+    const ready = payloadAnswers.every((candidate) => candidate !== null);
+    setQuestionDrafts((current) => ({
+      ...current,
+      [toolUseId]: {
+        answers: nextAnswers,
+        sending: ready,
+        error: null,
+      },
+    }));
+    if (!ready) return;
+    const readyAnswers = payloadAnswers.filter(
+      (candidate): candidate is readonly [string, string] => candidate !== null,
+    );
+    try {
+      await respondToAgentRequest(ticket, toolUseId, {
+        answers: Object.fromEntries(readyAnswers),
+      });
+      setQuestionDrafts((current) => ({
+        ...current,
+        [toolUseId]: {
+          answers: nextAnswers,
+          sending: false,
+          error: null,
+        },
+      }));
+    } catch (submitError) {
+      setQuestionDrafts((current) => ({
+        ...current,
+        [toolUseId]: {
+          answers: previous.answers,
+          sending: false,
+          error:
+            submitError instanceof Error
+              ? submitError.message
+              : "Could not answer question.",
+        },
+      }));
+    }
+  }, [questionDrafts, questionGroups, ticket]);
+
+  const questionUi = useMemo<QuestionUiContextValue>(() => ({
+    drafts: questionDrafts,
+    answerQuestion,
+  }), [answerQuestion, questionDrafts]);
 
   const groups = useMemo(
     () => groupEvents(session?.events ?? [], session?.base ?? 0),
@@ -1701,7 +1847,8 @@ export function SessionTab({
   const dispositionCounts = formatDispositionCounts(session.dispositions);
 
   return (
-    <div className="session-tab" ref={containerRef}>
+    <QuestionUiContext.Provider value={questionUi}>
+      <div className="session-tab" ref={containerRef}>
       {(session.tasks.length > 0 || session.pr || session.sessionMeta.custom_title || session.sessionMeta.agent_name) ? (
         <div className="session-state-strip">
           {session.sessionMeta.custom_title ? (
@@ -1769,7 +1916,8 @@ export function SessionTab({
         {tokens ? ` · ${tokens}` : ""}
         {` · ${dispositionCounts}`}
       </div>
-    </div>
+      </div>
+    </QuestionUiContext.Provider>
   );
 }
 

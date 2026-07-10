@@ -375,6 +375,24 @@ class RunStoreTests(unittest.TestCase):
             self.assertIsInstance(pending["int:0"]["request_id"], int)
             store.clear_pending_request(record.run_id, 0)
             self.assertEqual(set(store.get(record.run_id).pending_requests), {"str:0"})
+            store.get(record.run_id).pending_requests["str:ask"] = {
+                "request_id": "ask",
+                "request_kind": "can_use_tool",
+                "received_at": "2026-07-10T12:00:00+00:00",
+                "raw_seq": 3,
+                "payload": {
+                    "request": {
+                        "subtype": "can_use_tool",
+                        "tool_use_id": "toolu_fixture",
+                    }
+                },
+            }
+            store._write_record(store.get(record.run_id))  # noqa: SLF001 - persist fixture mutation
+            store.clear_pending_request_by_tool_use_id(
+                record.run_id,
+                "toolu_fixture",
+            )
+            self.assertEqual(set(store.get(record.run_id).pending_requests), {"str:0"})
 
             resolved_payload = {
                 "method": "serverRequest/resolved",

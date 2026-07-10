@@ -620,6 +620,76 @@ class ClaudeAdapterTests(unittest.IsolatedAsyncioTestCase):
         archived = await adapter.archive()
         self.assertEqual(archived.state, LifecycleState.COMPLETED)
 
+    async def test_pending_question_response_updates_control_input(self) -> None:
+        record = _record(self.root, ProviderKind.CLAUDE, state=LifecycleState.STARTING)
+        adapter = self._adapter(record)
+        started = await adapter.start(_start_request(record))
+        self.assertEqual(started.state, LifecycleState.WORKING)
+        await _wait_event(
+            adapter,
+            lambda event: (
+                event.payload.get("type") == "result"
+                and event.payload.get("subtype") == "success"
+            ),
+        )
+        self.assertEqual((await adapter.status()).state, LifecycleState.IDLE)
+
+        generation = adapter.snapshot().generation
+        adapter._apply_message_state(  # noqa: SLF001 - pair question answer with control request approval
+            {
+                "type": "control_request",
+                "request_id": "permission-ask-user",
+                "request": {
+                    "subtype": "can_use_tool",
+                    "tool_name": "AskUserQuestion",
+                    "tool_use_id": "toolu_pending_fixture",
+                    "input": {"questions": [{"question": "Which path should I take?"}]},
+                },
+            },
+            generation,
+        )
+        adapter._pending_question_ids.add("toolu_pending_fixture")  # noqa: SLF001 - question response path
+        responded = await adapter.respond(
+            "toolu_pending_fixture",
+            {
+                "answers": {
+                    "Which path should I take?": "Ship it",
+                }
+            },
+        )
+        self.assertEqual(responded.state, LifecycleState.WORKING)
+        self.assertNotIn("toolu_pending_fixture", adapter._pending_question_ids)  # noqa: SLF001
+
+        approval_row = next(
+            row
+            for row in reversed(_protocol_rows(self.log))
+            if row.get("type") == "control_response"
+            and row.get("response", {}).get("request_id") == "permission-ask-user"
+        )
+        self.assertEqual(
+            approval_row["response"]["response"]["updatedInput"],
+            {
+                "questions": [{"question": "Which path should I take?"}],
+                "answers": {"Which path should I take?": "Ship it"},
+            },
+        )
+        self.assertEqual(
+            approval_row["response"]["response"]["behavior"],
+            "allow",
+        )
+        self.assertFalse(
+            any(
+                row.get("type") == "user"
+                and any(
+                    isinstance(block, dict)
+                    and block.get("type") == "tool_result"
+                    and block.get("tool_use_id") == "toolu_pending_fixture"
+                    for block in row.get("message", {}).get("content") or []
+                )
+                for row in _protocol_rows(self.log)
+            )
+        )
+
     async def test_working_resume_reissues_continuation_but_idle_does_not(self) -> None:
         self.env["WIKI_AGENT_STATUS_DIR"] = str(self.root / "status")
         working = _record(self.root, ProviderKind.CLAUDE, state=LifecycleState.WORKING)

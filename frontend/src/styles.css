@@ -4514,9 +4514,27 @@ body.is-resizing-panes .pane-cell {
   padding: 6px 8px;
   border: 1px solid var(--background-modifier-border);
   border-radius: 2px;
+  background: transparent;
   color: var(--text-muted);
   font-family: var(--font-monospace);
   font-size: var(--font-ui-smaller);
+  text-align: left;
+}
+
+.session-question-option.is-clickable {
+  cursor: pointer;
+  transition: border-color 120ms ease, background-color 120ms ease, color 120ms ease;
+}
+
+.session-question-option.is-clickable:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent-primary) 35%, var(--background-modifier-border));
+  background-color: color-mix(in srgb, var(--accent-primary) 6%, var(--background-primary));
+  color: var(--text-normal);
+}
+
+.session-question-option:disabled {
+  opacity: 0.8;
+  cursor: default;
 }
 
 .session-question-option.is-picked {
@@ -4534,6 +4552,12 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-faint);
   text-transform: uppercase;
   letter-spacing: 0.04em;
+}
+
+.session-question-error {
+  color: var(--text-error);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.45;
 }
 
 .session-bash {

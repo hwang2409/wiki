@@ -857,9 +857,12 @@ def _claude_permission_text(row: dict) -> str:
     return f"permissions · {label}"
 
 
-def _emit_question_events(state: dict, ts: str | None, questions: list[dict], tool_use_id: str) -> None:
-    pending_questions: dict = state.setdefault("pending_questions", {})
-    refs: list[dict] = []
+def build_question_events(
+    ts: str | None,
+    questions: list[dict],
+    tool_use_id: str,
+) -> list[dict]:
+    events: list[dict] = []
     for entry in questions:
         if not isinstance(entry, dict):
             continue
@@ -868,27 +871,80 @@ def _emit_question_events(state: dict, ts: str | None, questions: list[dict], to
             for option in (entry.get("options") or [])
             if isinstance(option, dict) and str(option.get("label") or "")
         ]
-        event = {
-            "kind": "question",
-            "ts": ts,
-            "text": str(entry.get("question") or "").strip(),
-            "question": {
-                "prompt": str(entry.get("question") or "").strip(),
-                "header": str(entry.get("header") or "").strip() or None,
-                "options": options,
-                "answered_option": None,
-                "custom_reply": None,
-            },
-        }
+        events.append(
+            {
+                "kind": "question",
+                "ts": ts,
+                "text": str(entry.get("question") or "").strip(),
+                "tool_use_id": tool_use_id,
+                "question": {
+                    "tool_use_id": tool_use_id,
+                    "prompt": str(entry.get("question") or "").strip(),
+                    "header": str(entry.get("header") or "").strip() or None,
+                    "options": options,
+                    "answered_option": None,
+                    "custom_reply": None,
+                },
+            }
+        )
+    return events
+
+
+def _emit_question_events(state: dict, ts: str | None, questions: list[dict], tool_use_id: str) -> None:
+    pending_questions: dict = state.setdefault("pending_questions", {})
+    refs: list[dict] = []
+    for event in build_question_events(ts, questions, tool_use_id):
         refs.append(_append_event(state, event))
     if refs:
         pending_questions[tool_use_id] = refs
 
 
-def _apply_question_answers(state: dict, tool_use_id: str, result: str) -> None:
-    refs = state.get("pending_questions", {}).pop(tool_use_id, None)
-    if not refs:
-        return
+def _coerce_question_answer_value(value: object) -> str | None:
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    if isinstance(value, list):
+        parts = [
+            item.strip()
+            for item in value
+            if isinstance(item, str) and item.strip()
+        ]
+        return ", ".join(parts) or None
+    if isinstance(value, dict):
+        direct = value.get("answer")
+        if isinstance(direct, str) and direct.strip():
+            return direct.strip()
+        nested = value.get("answers")
+        return _coerce_question_answer_value(nested)
+    return None
+
+
+def _question_answer_map(
+    refs: list[dict],
+    result: str,
+    structured_answers: object,
+) -> dict[str, str]:
+    prompts = [
+        str((event.get("question") or {}).get("prompt") or "").strip()
+        for event in refs
+    ]
+    answers_by_prompt: dict[str, str] = {}
+    if isinstance(structured_answers, dict):
+        for key, raw_value in structured_answers.items():
+            answer = _coerce_question_answer_value(raw_value)
+            if answer is None:
+                continue
+            prompt: str | None = None
+            if isinstance(key, str) and key in prompts:
+                prompt = key
+            elif isinstance(key, str) and key.isdigit():
+                index = int(key)
+                if 0 <= index < len(prompts):
+                    prompt = prompts[index]
+            if prompt:
+                answers_by_prompt[prompt] = answer
+    if answers_by_prompt:
+        return answers_by_prompt
     prefix = "Your questions have been answered: "
     suffix = ". You can now continue with these answers in mind."
     body = result.strip()
@@ -896,19 +952,16 @@ def _apply_question_answers(state: dict, tool_use_id: str, result: str) -> None:
         body = body[len(prefix):]
     if body.endswith(suffix):
         body = body[: -len(suffix)]
-    changed_indices: list[int] = []
     cursor = 0
-    for idx, event in enumerate(refs):
-        question = (event.get("question") or {}).get("prompt") or ""
-        marker = f'"{question}"='
+    for idx, prompt in enumerate(prompts):
+        marker = f'"{prompt}"='
         start = body.find(marker, cursor)
         if start < 0:
             continue
         value_start = start + len(marker)
         next_start = len(body)
-        for next_event in refs[idx + 1 :]:
-            next_question = (next_event.get("question") or {}).get("prompt") or ""
-            candidate = body.find(f', "{next_question}"=', value_start)
+        for next_prompt in prompts[idx + 1 :]:
+            candidate = body.find(f', "{next_prompt}"=', value_start)
             if candidate >= 0:
                 next_start = candidate
                 break
@@ -916,13 +969,33 @@ def _apply_question_answers(state: dict, tool_use_id: str, result: str) -> None:
         if raw_value.startswith('"') and raw_value.endswith('"') and len(raw_value) >= 2:
             raw_value = raw_value[1:-1]
         raw_value = raw_value.strip()
+        if raw_value:
+            answers_by_prompt[prompt] = raw_value
+        cursor = next_start
+    return answers_by_prompt
+
+
+def _apply_question_answers(
+    state: dict,
+    tool_use_id: str,
+    result: str,
+    structured_answers: object = None,
+) -> None:
+    refs = state.get("pending_questions", {}).pop(tool_use_id, None)
+    if not refs:
+        return
+    answers_by_prompt = _question_answer_map(refs, result, structured_answers)
+    changed_indices: list[int] = []
+    for event in refs:
         question_meta = event.get("question") or {}
+        raw_value = answers_by_prompt.get(str(question_meta.get("prompt") or ""))
+        if raw_value is None:
+            continue
         options = question_meta.get("options") or []
         answered_option = next((i for i, label in enumerate(options) if label == raw_value), None)
         question_meta["answered_option"] = answered_option
         question_meta["custom_reply"] = None if answered_option is not None else (raw_value or None)
         changed_indices.append(int(event["id"]) - int(state.get("base", 0)))
-        cursor = next_start
     for changed_index in changed_indices:
         if 0 <= changed_index < len(state["events"]):
             _mark_tail_changed(state, changed_index)
@@ -1343,7 +1416,20 @@ def _claude_apply(state: dict, row: dict) -> None:
         elif btype == "tool_result":
             tool_use_id = block.get("tool_use_id")
             if tool_use_id and isinstance(block.get("content"), str):
-                _apply_question_answers(state, tool_use_id, block.get("content") or "")
+                tool_use_result = row.get("toolUseResult")
+                if not isinstance(tool_use_result, dict):
+                    tool_use_result = row.get("tool_use_result")
+                structured_answers = (
+                    tool_use_result.get("answers")
+                    if isinstance(tool_use_result, dict)
+                    else None
+                )
+                _apply_question_answers(
+                    state,
+                    tool_use_id,
+                    block.get("content") or "",
+                    structured_answers,
+                )
                 rendered = True
             event = pending.pop(tool_use_id, None)
             if event:

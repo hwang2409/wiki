@@ -1128,6 +1128,28 @@ class RunStore:
             self._write_record(record)
             return record
 
+    def clear_pending_request_by_tool_use_id(
+        self,
+        run_id: str,
+        tool_use_id: str,
+    ) -> RunRecord:
+        with self._lock:
+            record = self.get(run_id)
+            to_remove = [
+                key
+                for key, request in record.pending_requests.items()
+                for payload in [request.get("payload") if isinstance(request, dict) else None]
+                for nested_request in [payload.get("request") if isinstance(payload, dict) else None]
+                if isinstance(nested_request, dict)
+                and nested_request.get("tool_use_id") == tool_use_id
+            ]
+            if not to_remove:
+                return record
+            for key in to_remove:
+                record.pending_requests.pop(key, None)
+            self._write_record(record)
+            return record
+
     def clear_pending_requests(self, run_id: str) -> RunRecord:
         with self._lock:
             record = self.get(run_id)

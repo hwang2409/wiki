@@ -29,6 +29,8 @@ from backend.app.agent_runtime.supervisor import Supervisor
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "agent_runtime"
+RAW_PENDING_ASK_FIXTURE = Path(__file__).parent / "fixtures" / "headless_pending_ask_raw.jsonl"
+RAW_RESOLVED_ASK_FIXTURE = Path(__file__).parent / "fixtures" / "headless_resolved_ask_raw.jsonl"
 RUN_ID = "00000000-0000-4000-8000-000000000042"
 REPLACEMENT_RUN_ID = "00000000-0000-4000-8000-000000000043"
 
@@ -270,22 +272,98 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         main._event_subscribers.clear()  # noqa: SLF001 - isolate broker state
         main._session_paths.clear()  # noqa: SLF001 - isolate transcript cache
+        main._session_question_overlays.clear()  # noqa: SLF001 - isolate overlay cache
+        main.transcripts._cache.clear()  # noqa: SLF001 - isolate transcript cache
         for patcher in reversed(self.patchers):
             patcher.stop()
         self.tmp.cleanup()
 
-    def _seed_headless(self) -> None:
+    def _seed_headless(
+        self,
+        *,
+        provider: str = "codex",
+        transcript: Path | None = None,
+    ) -> None:
         self.client._write_current(  # noqa: SLF001 - fixture setup
             RUN_ID,
             {
                 "agent_id": "WIKI-42",
-                "provider": "codex",
+                "provider": provider,
                 "role": "implement",
-                "model": "gpt-5.4",
-                "effort": "high",
+                "model": "sonnet" if provider == "claude" else "gpt-5.4",
+                "effort": None if provider == "claude" else "high",
                 "worktree": str(self.worktree),
                 "orchestrator_id": None,
             },
+        )
+        if transcript is not None:
+            registry = json.loads(self.registry.read_text(encoding="utf-8"))
+            registry["WIKI-42"]["current"]["transcript"] = str(transcript)
+            self.registry.write_text(json.dumps(registry), encoding="utf-8")
+
+    def _write_claude_transcript(
+        self,
+        path: Path,
+        *,
+        answered: bool = False,
+    ) -> None:
+        rows: list[dict[str, Any]] = [
+            {
+                "type": "assistant",
+                "timestamp": "2026-07-10T16:00:00Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "Waiting on the user."}],
+                },
+            }
+        ]
+        if answered:
+            rows = [
+                {
+                    "type": "assistant",
+                    "timestamp": "2026-07-10T16:00:01Z",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_pending_fixture",
+                                "name": "AskUserQuestion",
+                                "input": {
+                                    "questions": [
+                                        {
+                                            "question": "Which path should I take?",
+                                            "header": "Path",
+                                            "options": [
+                                                {"label": "Ship it"},
+                                                {"label": "Wait"},
+                                            ],
+                                        }
+                                    ]
+                                },
+                            }
+                        ],
+                    },
+                },
+                {
+                    "type": "user",
+                    "timestamp": "2026-07-10T16:00:02Z",
+                    "message": {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_pending_fixture",
+                                "content": 'Your questions have been answered: "Which path should I take?"="Ship it". You can now continue with these answers in mind.',
+                                "is_error": False,
+                            }
+                        ],
+                    },
+                },
+            ]
+        path.write_text(
+            "\n".join(json.dumps(row) for row in rows) + "\n",
+            encoding="utf-8",
         )
 
     async def test_composer_and_queue_shapes_route_only_to_supervisor(self) -> None:
@@ -458,6 +536,92 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["format"], "codex")
         self.assertTrue(payload["working"])
         self.assertEqual(payload["queue"], [])
+
+    async def test_session_overlays_pending_headless_question_from_raw_log(self) -> None:
+        transcript = self.root / "claude-session.jsonl"
+        self._write_claude_transcript(transcript)
+        self.raw.write_bytes(RAW_PENDING_ASK_FIXTURE.read_bytes())
+        self._seed_headless(provider="claude", transcript=transcript)
+
+        payload = main.agent_session("WIKI-42")
+        questions = [
+            event for event in cast(list[dict[str, Any]], payload["events"])
+            if event.get("kind") == "question"
+        ]
+        self.assertEqual(len(questions), 1)
+        self.assertEqual(questions[0]["question"]["tool_use_id"], "toolu_pending_fixture")
+        self.assertIsNone(questions[0]["question"]["answered_option"])
+        self.assertGreater(
+            int(payload["cursor"]),
+            int(main.transcripts.read_session_events("claude", transcript)["cursor"]),
+        )
+
+        unchanged = main.agent_session(
+            "WIKI-42",
+            cursor=cast(int, payload["cursor"]),
+            client_path=cast(str, payload["path"]),
+        )
+        self.assertEqual(unchanged["events"], [])
+
+    async def test_session_drops_overlay_after_raw_tool_result_arrives(self) -> None:
+        transcript = self.root / "claude-session.jsonl"
+        self._write_claude_transcript(transcript)
+        self.raw.write_bytes(RAW_RESOLVED_ASK_FIXTURE.read_bytes())
+        self._seed_headless(provider="claude", transcript=transcript)
+
+        payload = main.agent_session("WIKI-42")
+        questions = [
+            event for event in cast(list[dict[str, Any]], payload["events"])
+            if event.get("kind") == "question"
+        ]
+        self.assertEqual(questions, [])
+
+    async def test_session_replaces_overlay_with_answered_transcript_without_duplicate(
+        self,
+    ) -> None:
+        transcript = self.root / "claude-session.jsonl"
+        self._write_claude_transcript(transcript)
+        self.raw.write_bytes(RAW_PENDING_ASK_FIXTURE.read_bytes())
+        self._seed_headless(provider="claude", transcript=transcript)
+
+        first = main.agent_session("WIKI-42")
+        first_questions = [
+            event for event in cast(list[dict[str, Any]], first["events"])
+            if event.get("kind") == "question"
+        ]
+        self.assertEqual(len(first_questions), 1)
+        self.assertIsNone(first_questions[0]["question"]["answered_option"])
+
+        self._write_claude_transcript(transcript, answered=True)
+        self.raw.write_bytes(RAW_RESOLVED_ASK_FIXTURE.read_bytes())
+        main.transcripts._cache.clear()  # noqa: SLF001 - simulate transcript refresh
+
+        second = main.agent_session(
+            "WIKI-42",
+            cursor=cast(int, first["cursor"]),
+            client_path=cast(str, first["path"]),
+        )
+        second_questions = [
+            event for event in cast(list[dict[str, Any]], second["events"])
+            if event.get("kind") == "question"
+        ]
+        self.assertEqual(len(second_questions), 1)
+        self.assertEqual(second_questions[0]["question"]["tool_use_id"], "toolu_pending_fixture")
+        self.assertEqual(second_questions[0]["question"]["answered_option"], 0)
+        self.assertEqual(second["tail_from"], second["base"])
+        self.assertGreater(cast(int, second["cursor"]), cast(int, first["cursor"]))
+
+    async def test_session_skips_overlay_for_non_headless_claude_transcript(self) -> None:
+        transcript = self.root / "claude-session.jsonl"
+        self._write_claude_transcript(transcript)
+        self.raw.write_bytes(RAW_PENDING_ASK_FIXTURE.read_bytes())
+
+        payload = main._session_delta_payload("claude", transcript, cursor=0)
+        questions = [
+            event for event in cast(list[dict[str, Any]], payload["events"])
+            if event.get("kind") == "question"
+        ]
+        self.assertEqual(questions, [])
 
     async def test_session_extends_wiki41_inspector_with_provider_stream(self) -> None:
         self._seed_headless()
