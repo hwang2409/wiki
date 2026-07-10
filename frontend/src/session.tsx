@@ -1309,11 +1309,39 @@ function groupAlign(group: EventGroup): "end" | "start" {
   return group.kind === "message" && group.event.kind === "user" ? "end" : "start";
 }
 
+function computeTimestampKeys(groups: EventGroup[]): Set<number> {
+  const keys = new Set<number>();
+  for (let i = 0; i < groups.length; i += 1) {
+    const g = groups[i];
+    if (g.kind !== "message") continue;
+    const kind = g.event.kind;
+    if (kind === "user") {
+      keys.add(g.key);
+      continue;
+    }
+    if (kind !== "assistant") continue;
+    let isLast = true;
+    for (let j = i + 1; j < groups.length; j += 1) {
+      const later = groups[j];
+      if (later.kind !== "message") continue;
+      const laterKind = later.event.kind;
+      if (laterKind === "assistant") {
+        isLast = false;
+        break;
+      }
+      if (laterKind === "user") break;
+    }
+    if (isLast) keys.add(g.key);
+  }
+  return keys;
+}
+
 const VirtualSessionRow = memo(function VirtualSessionRow({
   group,
   imageNums,
   onHeightChange,
   onInspect,
+  showTimestamp,
   top,
   uiState,
 }: {
@@ -1321,12 +1349,13 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
   imageNums?: number[];
   onHeightChange: (group: EventGroup, height: number) => void;
   onInspect?: (agentId: string) => void;
+  showTimestamp: boolean;
   top: number;
   uiState: SessionUiState;
 }) {
   const rowRef = useMeasuredRow(group, onHeightChange);
   const style: CSSProperties = { transform: `translateY(${top}px)` };
-  const ts = groupTimestamp(group);
+  const ts = showTimestamp ? groupTimestamp(group) : null;
   return (
     <div
       className="session-virtual-row"
@@ -1354,6 +1383,7 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
     prev.top !== next.top ||
     prev.onHeightChange !== next.onHeightChange ||
     prev.onInspect !== next.onInspect ||
+    prev.showTimestamp !== next.showTimestamp ||
     prev.uiState !== next.uiState
   ) {
     return false;
@@ -1813,6 +1843,7 @@ export function SessionTab({
     }
     return rows;
   }, [groups, layout.tops, visibleRange.end, visibleRange.start]);
+  const timestampKeys = useMemo(() => computeTimestampKeys(groups), [groups]);
 
   const imageNumbers = useMemo(() => {
     const map = new Map<SessionEvent, number[]>();
@@ -1925,6 +1956,7 @@ export function SessionTab({
                 key={group.key}
                 onHeightChange={reportRowHeight}
                 onInspect={onInspect}
+                showTimestamp={timestampKeys.has(group.key)}
                 top={top}
                 uiState={uiState}
               />
