@@ -26,6 +26,7 @@ export type TranscriptSession = {
   path: string;
   tokens: number | null;
   model: string | null;
+  desiredModel: string | null;
   kind: string | null;
   provider: string | null;
   tasks: SessionTask[];
@@ -115,6 +116,7 @@ function buildSession(result: AgentSessionData): TranscriptSession {
     path: result.path,
     tokens: result.tokens,
     model: result.model ?? null,
+    desiredModel: result.desired_model ?? null,
     kind: result.kind ?? null,
     provider: result.provider ?? null,
     tasks: result.tasks ?? [],
@@ -194,6 +196,9 @@ function mergeSession(current: TranscriptSession | null, result: AgentSessionDat
     path: result.path,
     tokens: result.tokens,
     model: result.model ?? current.model,
+    desiredModel: Object.prototype.hasOwnProperty.call(result, "desired_model")
+      ? result.desired_model ?? null
+      : current.desiredModel,
     kind: result.kind ?? current.kind,
     provider: result.provider ?? current.provider,
     tasks: result.tasks ?? current.tasks,
@@ -322,6 +327,20 @@ export function replaceTranscriptQueue(ticket: string, messages: QueuedMessage[]
       session: {
         ...entry.snapshot.session,
         queue: messages,
+      },
+    };
+    emit(entry);
+  });
+}
+
+export function replaceTranscriptDesiredModel(ticket: string, desiredModel: string | null) {
+  entries.forEach((entry) => {
+    if (entry.target.ticket !== ticket || entry.target.subagent || !entry.snapshot.session) return;
+    entry.snapshot = {
+      ...entry.snapshot,
+      session: {
+        ...entry.snapshot.session,
+        desiredModel,
       },
     };
     emit(entry);

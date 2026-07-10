@@ -434,7 +434,11 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                     },
                 ),
             )
-        persisted = self.store.get(record.run_id)
+            for _ in range(200):
+                persisted = self.store.get(record.run_id)
+                if persisted.state_reason == "queued message delivery failed: fixture delivery failed":
+                    break
+                await asyncio.sleep(0.01)
         queued = persisted.queued_messages
         self.assertEqual([item["text"] for item in queued], ["do not lose this"])
         self.assertEqual(
@@ -566,6 +570,95 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         recovery = await self.supervisor.recover_on_start()
         old_result = next(item for item in recovery if item["run_id"] == old.run_id)
         self.assertEqual(old_result["action"], "skip")
+
+    async def test_queue_model_change_persists_then_applies_at_idle_boundary(
+        self,
+    ) -> None:
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-56",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="Original ticket WIKI-56 prompt",
+        )
+        await self.supervisor.send_now(record.run_id, "start a turn")
+        queued = await self.supervisor.queue_model_change(record.run_id, "fixture-codex-next")
+        self.assertEqual(queued, {"status": "queued", "desired_model": "fixture-codex-next"})
+        self.assertEqual(self.store.get(record.run_id).desired_model, "fixture-codex-next")
+
+        published = self.supervisor.subscribe()
+        adapter = self.supervisor.adapters[record.run_id]
+        status = adapter.snapshot()
+        adapter._status = AdapterStatus(  # noqa: SLF001 - fixture state sync
+            LifecycleState.IDLE,
+            status.session_id,
+            status.pid,
+            generation=status.generation,
+        )
+        await adapter._events.put(  # noqa: SLF001 - fixture event injection
+            ProviderEvent(
+                ProviderKind.CODEX,
+                {
+                    "method": "turn/completed",
+                    "params": {"turn": {"status": "completed"}},
+                },
+                generation=status.generation,
+            )
+        )
+
+        model_event = await _wait_for_published(published, "model_changed")
+        self.assertEqual(model_event["from_model"], "fixture-codex")
+        self.assertEqual(model_event["to_model"], "fixture-codex-next")
+        replacement = self.store.get(str(model_event["run_id"]))
+        self.assertEqual(replacement.model, "fixture-codex-next")
+        self.assertIsNone(replacement.desired_model)
+        normalized = self.store.read_normalized_events(replacement.run_id)
+        self.assertTrue(
+            any(event["kind"] == "model_changed" for event in normalized),
+            normalized,
+        )
+        self.supervisor.unsubscribe(published)
+
+    async def test_cancel_model_change_before_idle_prevents_apply(self) -> None:
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-56-CANCEL",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="Original ticket WIKI-56 prompt",
+        )
+        await self.supervisor.send_now(record.run_id, "start a turn")
+        await self.supervisor.queue_model_change(record.run_id, "fixture-codex-next")
+        canceled = await self.supervisor.cancel_model_change(record.run_id)
+        self.assertEqual(canceled, {"status": "canceled", "desired_model": None})
+
+        adapter = self.supervisor.adapters[record.run_id]
+        status = adapter.snapshot()
+        adapter._status = AdapterStatus(  # noqa: SLF001 - fixture state sync
+            LifecycleState.IDLE,
+            status.session_id,
+            status.pid,
+            generation=status.generation,
+        )
+        await adapter._events.put(  # noqa: SLF001 - fixture event injection
+            ProviderEvent(
+                ProviderKind.CODEX,
+                {
+                    "method": "turn/completed",
+                    "params": {"turn": {"status": "completed"}},
+                },
+                generation=status.generation,
+            )
+        )
+        await asyncio.sleep(0.05)
+        current = self.store.get(record.run_id)
+        self.assertEqual(current.model, "fixture-codex")
+        self.assertIsNone(current.desired_model)
+        self.assertIn(record.run_id, self.supervisor.adapters)
 
     async def test_recovery_resumes_only_current_working_and_idle_with_dead_pid(
         self,

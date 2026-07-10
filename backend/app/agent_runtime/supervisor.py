@@ -244,6 +244,56 @@ class Supervisor:
             detail=detail,
         )
 
+    def _model_change_prompt(
+        self,
+        record: RunRecord,
+        *,
+        old_model: str,
+        new_model: str,
+    ) -> str:
+        status_path = self.store.status_path(record.agent_id)
+        return f"""You are the same {record.role} for {record.agent_id}.
+Your model changed from {old_model} to {new_model} at a natural idle boundary.
+
+Recover context from:
+- prior transcript: {record.transcript_path or "not resolved"}
+- raw provider events: {self.store.raw_events_path(record.run_id)}
+- status file: {status_path}
+
+Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and status-file contract. Re-read the current ticket/PR state, update the status file before long operations, then continue from the last durable step.
+"""
+
+    def _append_model_changed_event(
+        self,
+        record: RunRecord,
+        *,
+        old_model: str,
+        new_model: str,
+        trigger: str,
+    ) -> None:
+        payload = {
+            "type": "model_changed",
+            "from_model": old_model,
+            "to_model": new_model,
+            "trigger": trigger,
+            "message": f"model changed to {new_model}",
+        }
+        raw = self.store.append_raw(
+            record.run_id,
+            provider="supervisor",
+            direction="supervisor",
+            payload=payload,
+            generation=record.provider_generation,
+        )
+        self.store.append_normalized(
+            record.run_id,
+            raw_seq=int(raw["seq"]),
+            disposition=EventDisposition.RENDERED,
+            kind="model_changed",
+            payload=payload,
+            lifecycle_state=record.state,
+        )
+
     def _codex_rotation_active(self) -> bool:
         task = self.codex_rotation_task
         if task is not None and not task.done():
@@ -453,7 +503,10 @@ class Supervisor:
             record.state is LifecycleState.IDLE
             and id(adapter) not in self.expected_stream_ends
         ):
-            await self._deliver_next_queued(run_id, adapter)
+            self._spawn_monitor_task(
+                self._deliver_next_queued(run_id, adapter),
+                name=f"agent-idle-boundary-{run_id}",
+            )
 
     def _schedule_monitor_actions(
         self,
@@ -686,6 +739,62 @@ class Supervisor:
         async with self._run_lock(run_id):
             await self._deliver_next_queued_locked(run_id, adapter)
 
+    async def _apply_desired_model_locked(
+        self,
+        run_id: str,
+        adapter: ProviderAdapter | None,
+        *,
+        trigger: str,
+    ) -> tuple[str, ProviderAdapter | None, RunRecord]:
+        record = self.store.get(run_id)
+        desired_model = record.desired_model
+        if not desired_model:
+            return run_id, adapter, record
+        if desired_model == record.model:
+            record = self.store.set_desired_model(run_id, None)
+            return run_id, adapter, record
+        if not self.store.is_current(record) or record.replaced_by_run_id:
+            raise StoreConflict("model-change target is no longer current")
+        if adapter is None:
+            adapter = self.adapters.get(run_id)
+        queued_messages = self.store.queued_messages(run_id)
+        old_model = record.model
+        prompt = self._model_change_prompt(
+            record,
+            old_model=old_model,
+            new_model=desired_model,
+        )
+        replacement = await self._replace(run_id, prompt, desired_model)
+        if queued_messages:
+            replacement = self.store.replace_queued_messages(
+                replacement.run_id,
+                queued_messages,
+            )
+        self._append_model_changed_event(
+            replacement,
+            old_model=old_model,
+            new_model=desired_model,
+            trigger=trigger,
+        )
+        await self._publish(
+            {
+                "type": "model_changed",
+                "ticket": replacement.agent_id,
+                "from_model": old_model,
+                "to_model": desired_model,
+                "run_id": replacement.run_id,
+                "ts": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        await self._publish(
+            {
+                "type": "session",
+                "ticket": replacement.agent_id,
+                "surface": "session",
+            }
+        )
+        return replacement.run_id, self.adapters.get(replacement.run_id), replacement
+
     async def _deliver_next_queued_locked(
         self,
         run_id: str,
@@ -697,6 +806,20 @@ class Supervisor:
             return
         lock = self.queue_locks.setdefault(run_id, asyncio.Lock())
         async with lock:
+            original_run_id = run_id
+            run_id, adapter, _ = await self._apply_desired_model_locked(
+                run_id,
+                adapter,
+                trigger="queued-message",
+            )
+            if adapter is None or self.adapters.get(run_id) is not adapter:
+                return
+            if run_id != original_run_id:
+                self._spawn_monitor_task(
+                    self._deliver_next_queued(run_id, adapter),
+                    name=f"agent-idle-boundary-{run_id}",
+                )
+                return
             queued = self.store.peek_queued_message(run_id)
             if queued is None:
                 return
@@ -722,6 +845,57 @@ class Supervisor:
             await self._publish(
                 {"type": "session", "ticket": record.agent_id, "surface": "queue"}
             )
+
+    async def queue_model_change(self, run_id: str, model: str) -> dict[str, Any]:
+        if self.store.get(run_id).provider is ProviderKind.CODEX:
+            self._assert_codex_fleet_available()
+            async with self.codex_fleet_lock:
+                self._assert_codex_fleet_available()
+                async with self._run_lock(run_id):
+                    return await self._queue_model_change_locked(run_id, model)
+        async with self._run_lock(run_id):
+            return await self._queue_model_change_locked(run_id, model)
+
+    async def _queue_model_change_locked(
+        self,
+        run_id: str,
+        model: str,
+    ) -> dict[str, Any]:
+        record = self.store.get(run_id)
+        if not self.store.is_current(record) or record.replaced_by_run_id:
+            raise StoreConflict("model-change target is no longer current")
+        if record.state in TERMINAL_STATES:
+            raise StoreConflict(f"{record.state.value} runs cannot change model")
+        if model == record.model:
+            raise ValueError("desired model matches current model")
+        record = self.store.set_desired_model(run_id, model)
+        await self._publish_agent_change(record.agent_id)
+        await self._publish(
+            {"type": "session", "ticket": record.agent_id, "surface": "session"}
+        )
+        if record.state in {LifecycleState.IDLE, LifecycleState.BLOCKED}:
+            adapter = self.adapters.get(run_id)
+            next_run_id, _, applied = await self._apply_desired_model_locked(
+                run_id,
+                adapter,
+                trigger=record.state.value,
+            )
+            return {
+                "status": "applied",
+                "run_id": next_run_id,
+                "desired_model": applied.desired_model,
+                "model": applied.model,
+            }
+        return {"status": "queued", "desired_model": model}
+
+    async def cancel_model_change(self, run_id: str) -> dict[str, Any]:
+        async with self._run_lock(run_id):
+            record = self.store.set_desired_model(run_id, None)
+            await self._publish_agent_change(record.agent_id)
+            await self._publish(
+                {"type": "session", "ticket": record.agent_id, "surface": "session"}
+            )
+            return {"status": "canceled", "desired_model": None}
 
     def _route_adapter_generation(
         self,
@@ -1633,6 +1807,15 @@ class Supervisor:
         adapter = self.adapters.get(run_id)
         if adapter is None:
             raise StoreConflict("run has no attached provider adapter")
+        status = await adapter.status()
+        if status.state is LifecycleState.IDLE:
+            run_id, adapter, _ = await self._apply_desired_model_locked(
+                run_id,
+                adapter,
+                trigger="send-now",
+            )
+            if adapter is None:
+                raise StoreConflict("run has no attached provider adapter")
         status = await adapter.send_now(message)
         record = self.store.update_adapter_status(run_id, status)
         record = self.store.clear_automatic_resume_suppression(run_id)
@@ -2062,6 +2245,16 @@ class Supervisor:
             if not isinstance(index, int) or isinstance(index, bool):
                 raise ValueError("queue index must be an integer")
             return await self.delete_queued(self._resolve_run_id(params), index)
+        if method == "run/queue_model_change":
+            model = params.get("model")
+            if not isinstance(model, str) or not model.strip():
+                raise ValueError("model must be a non-empty string")
+            return await self.queue_model_change(
+                self._resolve_run_id(params),
+                model.strip(),
+            )
+        if method == "run/cancel_model_change":
+            return await self.cancel_model_change(self._resolve_run_id(params))
         if method == "run/interrupt":
             return _public_run(await self.interrupt(self._resolve_run_id(params)))
         if method == "run/stop":

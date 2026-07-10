@@ -142,6 +142,7 @@ class RunRecord:
     role: str
     model: str
     worktree: str
+    desired_model: str | None = None
     state: LifecycleState = LifecycleState.STARTING
     effort: str | None = None
     orchestrator_id: str | None = None
@@ -207,6 +208,7 @@ class RunRecord:
             "provider": self.provider.value,
             "role": self.role,
             "model": self.model,
+            "desired_model": self.desired_model,
             "effort": self.effort,
             "worktree": self.worktree,
             "orchestrator_id": self.orchestrator_id,
@@ -254,6 +256,7 @@ class RunRecord:
             provider=ProviderKind(value["provider"]),
             role=str(value["role"]),
             model=str(value["model"]),
+            desired_model=value.get("desired_model"),
             effort=value.get("effort"),
             worktree=str(value["worktree"]),
             orchestrator_id=value.get("orchestrator_id"),

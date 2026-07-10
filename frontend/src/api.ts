@@ -64,6 +64,7 @@ export type AgentSession = {
   kind: string | null;
   role: string | null;
   model: string | null;
+  desired_model?: string | null;
   session: number | null;
   spawned_at: string | null;
   ended_at?: string;
@@ -202,6 +203,24 @@ export type ReplaceAgentResult = {
 export function replaceAgent(id: string) {
   return request<ReplaceAgentResult>(`/api/agents/${encodeURIComponent(id)}/replace`, {
     method: "POST",
+  });
+}
+
+export type SetAgentModelResult = {
+  status: "queued" | "applied" | "canceled" | string;
+  desired_model: string | null;
+};
+
+export function setAgentModel(id: string, model: string) {
+  return request<SetAgentModelResult>(`/api/agents/${encodeURIComponent(id)}/set-model`, {
+    method: "POST",
+    body: JSON.stringify({ model }),
+  });
+}
+
+export function cancelAgentModelChange(id: string) {
+  return request<SetAgentModelResult>(`/api/agents/${encodeURIComponent(id)}/set-model`, {
+    method: "DELETE",
   });
 }
 
@@ -356,6 +375,7 @@ export type AgentSessionData = {
   path: string;
   tokens: number | null;
   model?: string | null;
+  desired_model?: string | null;
   kind?: string | null;
   provider?: string | null;
   tasks?: SessionTask[];

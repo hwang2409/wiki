@@ -80,6 +80,22 @@ class SupervisorClient:
             )
         )
 
+    def queue_model_change(self, agent_id: str, model: str) -> dict[str, Any]:
+        return dict(
+            self.request(
+                "run/queue_model_change",
+                {"agent_id": agent_id, "model": model},
+            )
+        )
+
+    def cancel_model_change(self, agent_id: str) -> dict[str, Any]:
+        return dict(
+            self.request(
+                "run/cancel_model_change",
+                {"agent_id": agent_id},
+            )
+        )
+
     async def subscribe_events(self) -> AsyncGenerator[dict[str, Any], None]:
         reader, writer = await asyncio.open_unix_connection(
             str(self.paths.socket_path),

@@ -81,6 +81,7 @@ class FakeSupervisorClient:
             "kind": "cdx" if params.get("provider", "codex") == "codex" else "cc",
             "role": params.get("role", "implement"),
             "model": params.get("model", "gpt-5.4"),
+            "desired_model": params.get("desired_model"),
             "effort": params.get("effort"),
             "worktree": params.get("worktree"),
             "cwd": params.get("worktree"),
@@ -198,6 +199,26 @@ class FakeSupervisorClient:
         if method == "run/queue/delete":
             self.messages.pop(values["index"])
             return {"messages": list(self.messages)}
+        if method == "run/queue_model_change":
+            agent_id = next(
+                key
+                for key, entry in registry.items()
+                if isinstance(entry, dict)
+                and (entry.get("current") or {}).get("run_id") == values["run_id"]
+            )
+            registry[agent_id]["current"]["desired_model"] = values["model"]
+            self.registry_path.write_text(json.dumps(registry), encoding="utf-8")
+            return {"status": "queued", "desired_model": values["model"]}
+        if method == "run/cancel_model_change":
+            agent_id = next(
+                key
+                for key, entry in registry.items()
+                if isinstance(entry, dict)
+                and (entry.get("current") or {}).get("run_id") == values["run_id"]
+            )
+            registry[agent_id]["current"]["desired_model"] = None
+            self.registry_path.write_text(json.dumps(registry), encoding="utf-8")
+            return {"status": "canceled", "desired_model": None}
         if method == "events/read":
             agent_id = values["agent_id"]
             current = registry[agent_id]["current"]
@@ -411,6 +432,40 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
                 "run/queue/delete",
             ],
         )
+
+    async def test_set_model_routes_to_supervisor_and_cancel_clears_pending(self) -> None:
+        self._seed_headless()
+
+        queued = main.set_agent_model("WIKI-42", main.SetModelIn(model="gpt-5.5"))
+        session = main.agent_session("WIKI-42")
+        canceled = main.cancel_agent_model("WIKI-42")
+
+        self.assertEqual(queued, {"status": "queued", "desired_model": "gpt-5.5"})
+        self.assertEqual(session["desired_model"], "gpt-5.5")
+        self.assertEqual(canceled, {"status": "canceled", "desired_model": None})
+        self.assertEqual(
+            [method for method, _ in self.client.calls],
+            [
+                "run/queue_model_change",
+                "events/read",
+                "run/queue",
+                "run/cancel_model_change",
+            ],
+        )
+
+    async def test_set_model_rejects_invalid_cross_kind_and_noop_models(self) -> None:
+        self._seed_headless(provider="claude")
+
+        with self.assertRaises(HTTPException) as invalid:
+            main.set_agent_model("WIKI-42", main.SetModelIn(model="gpt-5.5"))
+        with self.assertRaises(HTTPException) as noop:
+            main.set_agent_model("WIKI-42", main.SetModelIn(model="sonnet"))
+
+        self.assertEqual(invalid.exception.status_code, 400)
+        self.assertIn("not allowed for Claude", str(invalid.exception.detail))
+        self.assertEqual(noop.exception.status_code, 400)
+        self.assertIn("matches current", str(noop.exception.detail))
+        self.assertEqual(self.client.calls, [])
 
     async def test_headless_control_failure_never_falls_back_to_tmux(self) -> None:
         self._seed_headless()

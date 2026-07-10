@@ -45,13 +45,17 @@ import remarkGfm from "remark-gfm";
 import { MarkdownPre } from "./markdown";
 import { ShikiCode } from "./shiki";
 import {
+  cancelAgentModelChange,
   cancelQueuedMessage,
+  getAgentModels,
   getSkills,
   respondToAgentRequest,
   sendAgentMessage,
+  setAgentModel,
   uploadImage,
 } from "./api";
 import type {
+  AgentModelOption,
   ProviderEventInspector,
   ProviderPendingRequest,
   QueuedMessage,
@@ -66,6 +70,8 @@ import { LoadingPlaceholder } from "./loading";
 import { createStateKeyWriteBarrier, deletePaneStateEntries } from "./pane-state-cache";
 import { Timestamp } from "./timestamp";
 import {
+  invalidateTranscript,
+  replaceTranscriptDesiredModel,
   replaceTranscriptQueue,
   useTranscriptSession,
   type TranscriptSession,
@@ -522,6 +528,166 @@ type QuestionUiContextValue = {
 };
 
 const QuestionUiContext = createContext<QuestionUiContextValue | null>(null);
+
+function modelChangedMarkers(session: TranscriptSession | null): SessionEvent[] {
+  if (!session?.providerInspector?.events.length) return [];
+  return session.providerInspector.events
+    .filter((event) => event.kind === "model_changed")
+    .map((event) => {
+      const toModel = typeof event.payload.to_model === "string" ? event.payload.to_model : "";
+      const text =
+        typeof event.payload.message === "string"
+          ? event.payload.message
+          : `model changed to ${toModel || "new model"}`;
+      return {
+        id: 1_000_000 + event.seq,
+        kind: "marker" as const,
+        ts: event.normalized_at,
+        text,
+        disposition: "rendered" as const,
+        marker: "model_changed",
+      };
+    });
+}
+
+function SessionModelFooter({
+  session,
+  ticket,
+}: {
+  session: TranscriptSession;
+  ticket: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [models, setModels] = useState<AgentModelOption[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [confirmModel, setConfirmModel] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const currentModel = session.model ?? "";
+  const desiredModel = session.desiredModel;
+  const kind = session.kind;
+  const allowedModels = useMemo(
+    () =>
+      models.filter(
+        (option) => option.kind === kind && option.id !== currentModel,
+      ),
+    [currentModel, kind, models],
+  );
+
+  useEffect(() => {
+    if (!open || models.length > 0 || loading) return;
+    setLoading(true);
+    getAgentModels()
+      .then((result) => setModels(result.models ?? []))
+      .catch((err) => setError(err instanceof Error ? err.message : "Could not load models"))
+      .finally(() => setLoading(false));
+  }, [loading, models.length, open]);
+
+  async function confirmSwitch() {
+    if (!confirmModel) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await setAgentModel(ticket, confirmModel);
+      replaceTranscriptDesiredModel(
+        ticket,
+        result.desired_model === undefined ? confirmModel : result.desired_model,
+      );
+      setConfirmModel(null);
+      setOpen(false);
+      invalidateTranscript(ticket, "session");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not queue model change");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function cancelQueued(event: React.MouseEvent<HTMLButtonElement>) {
+    event.stopPropagation();
+    setBusy(true);
+    setError(null);
+    try {
+      await cancelAgentModelChange(ticket);
+      replaceTranscriptDesiredModel(ticket, null);
+      invalidateTranscript(ticket, "session");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not cancel model change");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!currentModel || !kind) {
+    return <span>{currentModel}</span>;
+  }
+
+  return (
+    <span className="session-model-control">
+      <span className={`session-model-badge${desiredModel ? " has-queued" : ""}`}>
+        <button
+          aria-expanded={open}
+          aria-label="Change model"
+          className="session-model-current"
+          disabled={busy}
+          type="button"
+          onClick={() => setOpen((value) => !value)}
+        >
+          <span>{currentModel}</span>
+          {desiredModel ? (
+            <span className="session-model-queued">· queued: {desiredModel}</span>
+          ) : null}
+        </button>
+        {desiredModel ? (
+          <button
+            aria-label="Cancel queued model change"
+            className="session-model-cancel"
+            disabled={busy}
+            type="button"
+            onClick={(event) => void cancelQueued(event)}
+          >
+            <X size={10} />
+          </button>
+        ) : null}
+      </span>
+      {open ? (
+        <div className="session-model-menu">
+          {loading ? <div className="session-model-empty">Loading models</div> : null}
+          {!loading && allowedModels.length === 0 ? (
+            <div className="session-model-empty">No alternate models</div>
+          ) : null}
+          {allowedModels.map((option) => (
+            <button
+              className="session-model-option"
+              key={option.id}
+              type="button"
+              onClick={() => setConfirmModel(option.id)}
+            >
+              <span>{option.label}</span>
+              <code>{option.id}</code>
+            </button>
+          ))}
+        </div>
+      ) : null}
+      {confirmModel ? (
+        <div className="session-model-confirm" role="dialog" aria-modal="true">
+          <div className="session-model-confirm-text">
+            Switch to {confirmModel} after current turn finishes? Currently on {currentModel}.
+          </div>
+          <div className="session-model-confirm-actions">
+            <button type="button" onClick={() => setConfirmModel(null)}>
+              Cancel
+            </button>
+            <button disabled={busy} type="button" onClick={() => void confirmSwitch()}>
+              Switch model
+            </button>
+          </div>
+        </div>
+      ) : null}
+      {error ? <span className="session-model-error">{error}</span> : null}
+    </span>
+  );
+}
 
 function ProviderStreamInspector({
   inspector,
@@ -1636,9 +1802,17 @@ export function SessionTab({
     answerQuestion,
   }), [answerQuestion, questionDrafts]);
 
+  const displayEvents = useMemo(
+    () => {
+      if (!session) return [];
+      return [...session.events, ...modelChangedMarkers(session)];
+    },
+    [session],
+  );
+
   const groups = useMemo(
-    () => groupEvents(session?.events ?? [], session?.base ?? 0),
-    [session]
+    () => groupEvents(displayEvents, session?.base ?? 0),
+    [displayEvents, session?.base]
   );
   const layout = useMemo(
     () => buildVirtualLayout(groups, rowHeightsRef.current),
@@ -1905,7 +2079,7 @@ export function SessionTab({
 
   const tokens = formatTokens(session.tokens);
   const dispositionCounts = formatDispositionCounts(session.dispositions);
-  const footerSegments = [session.format, session.model ?? "", tokens ?? "", dispositionCounts].filter(Boolean);
+  const footerSegments = [session.format, tokens ?? "", dispositionCounts].filter(Boolean);
 
   return (
     <QuestionUiContext.Provider value={questionUi}>
@@ -1976,7 +2150,15 @@ export function SessionTab({
         />
       )}
       <div className="session-footer tabular-nums">
-        {footerSegments.join(" · ")}
+        {footerSegments[0] ? <span>{footerSegments[0]}</span> : null}
+        <span className="session-footer-separator">·</span>
+        <SessionModelFooter session={session} ticket={ticket} />
+        {footerSegments.slice(1).map((segment) => (
+          <span className="session-footer-segment" key={segment}>
+            <span className="session-footer-separator">·</span>
+            {segment}
+          </span>
+        ))}
       </div>
       </div>
     </QuestionUiContext.Provider>

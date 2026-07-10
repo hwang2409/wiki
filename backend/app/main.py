@@ -682,6 +682,7 @@ def agents() -> dict[str, object]:
                 "kind": current.get("kind"),
                 "role": current.get("role"),
                 "model": current.get("model"),
+                "desired_model": current.get("desired_model"),
                 "worktree": current.get("worktree"),
                 "log": current.get("log"),
                 "orch": current.get("orch"),
@@ -1193,6 +1194,7 @@ def _session_delta_payload(
     include_queue: bool = False,
     headless_current: dict[str, Any] | None = None,
     model: str | None = None,
+    desired_model: str | None = None,
     kind: str | None = None,
     provider: str | None = None,
 ) -> dict[str, object]:
@@ -1231,6 +1233,7 @@ def _session_delta_payload(
         "patches": result.get("patches") or [],
         "working": _transcript_working(path, ticket),
         "model": model,
+        "desired_model": desired_model,
         "kind": kind,
         "provider": provider,
     }
@@ -1278,6 +1281,9 @@ def agent_session(
                 include_queue=True,
                 headless_current=orch if isinstance(orch, dict) else None,
                 model=model,
+                desired_model=(
+                    orch.get("desired_model") if isinstance(orch, dict) else None
+                ),
                 kind=kind,
                 provider=provider,
             )
@@ -1348,6 +1354,7 @@ def agent_session(
                 "queue": _queue_messages(ticket),
                 "working": _transcript_working(Path(current.get("log") or "."), ticket),
                 "model": model,
+                "desired_model": current.get("desired_model"),
                 "kind": kind,
                 "provider": provider,
                 "provider_inspector": provider_inspector,
@@ -1403,6 +1410,7 @@ def agent_session(
         include_queue=True,
         headless_current=current if isinstance(current, dict) and _is_headless(current) else None,
         model=model,
+        desired_model=current.get("desired_model") if isinstance(current, dict) else None,
         kind=kind,
         provider=provider,
     )
@@ -1612,6 +1620,10 @@ class MessageIn(BaseModel):
 class AgentRespondIn(BaseModel):
     request_id: str | int
     response: dict[str, Any]
+
+
+class SetModelIn(BaseModel):
+    model: str = Field(..., min_length=2, max_length=64)
 
 
 class SpawnWorkerIn(BaseModel):
@@ -1949,6 +1961,87 @@ def replace_agent(agent_id: str) -> dict[str, object]:
         "model": result.get("model"),
         "registration": registration,
     }
+
+
+@app.post("/api/agents/{ticket}/set-model")
+def set_agent_model(ticket: str, body: SetModelIn) -> dict[str, object]:
+    raw_id = ticket.strip()
+    if not raw_id or not valid_agent_id(raw_id):
+        raise HTTPException(status_code=400, detail="Bad ticket")
+    registry = _read_agent_registry()
+    resolved = _registry_agent(registry, raw_id)
+    if resolved is None:
+        if _has_legacy_control_target(registry, raw_id):
+            raise HTTPException(
+                status_code=409,
+                detail="Legacy tmux agents must be migrated before model changes",
+            )
+        raise HTTPException(status_code=404, detail="No registered worker")
+    _, _, current = resolved
+    if not _is_headless(current):
+        raise HTTPException(
+            status_code=409,
+            detail="Legacy tmux agents must be migrated before model changes",
+        )
+    if current.get("role") == "orchestrator":
+        raise HTTPException(status_code=400, detail="Only workers can change model")
+    kind = current.get("kind")
+    if kind not in {"cc", "cdx"}:
+        raise HTTPException(status_code=400, detail="Worker kind is unknown")
+    model = body.model.strip()
+    _require_allowed_model(kind, model, target="Worker")
+    if model == current.get("model"):
+        raise HTTPException(status_code=400, detail="Desired model matches current model")
+    result = _supervisor_request(
+        "run/queue_model_change",
+        {
+            "run_id": current["run_id"],
+            "model": model,
+        },
+    )
+    if not isinstance(result, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="Agent supervisor returned a bad model-change response",
+        )
+    return {
+        "status": result.get("status", "queued"),
+        "desired_model": result.get("desired_model", model),
+    }
+
+
+@app.delete("/api/agents/{ticket}/set-model")
+def cancel_agent_model(ticket: str) -> dict[str, object]:
+    raw_id = ticket.strip()
+    if not raw_id or not valid_agent_id(raw_id):
+        raise HTTPException(status_code=400, detail="Bad ticket")
+    registry = _read_agent_registry()
+    resolved = _registry_agent(registry, raw_id)
+    if resolved is None:
+        if _has_legacy_control_target(registry, raw_id):
+            raise HTTPException(
+                status_code=409,
+                detail="Legacy tmux agents must be migrated before model changes",
+            )
+        raise HTTPException(status_code=404, detail="No registered worker")
+    _, _, current = resolved
+    if not _is_headless(current):
+        raise HTTPException(
+            status_code=409,
+            detail="Legacy tmux agents must be migrated before model changes",
+        )
+    if current.get("role") == "orchestrator":
+        raise HTTPException(status_code=400, detail="Only workers can change model")
+    result = _supervisor_request(
+        "run/cancel_model_change",
+        {"run_id": current["run_id"]},
+    )
+    if not isinstance(result, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="Agent supervisor returned a bad model-change response",
+        )
+    return {"status": result.get("status", "canceled"), "desired_model": None}
 
 
 @app.post("/api/agents/spawn")
