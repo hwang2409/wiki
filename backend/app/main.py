@@ -9,16 +9,17 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from . import accounts, github_pr, terminal, tokens, transcripts, uistate, vaultops
+from .agent_models import is_model_allowed, list_model_options
 from .agent_runtime.client import (
     SupervisorClient,
     SupervisorRemoteError,
@@ -38,14 +39,14 @@ VAULT_DIR.mkdir(parents=True, exist_ok=True)
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     terminal.refresh_boot_token()
-    dispatcher_task = asyncio.create_task(agent_runtime_dispatchers())
-    token_task = asyncio.create_task(tokens.refresh_in_background())
+    dispatcher_task, watchdog_task, token_task = await _start_dispatcher()
     try:
         yield
     finally:
         dispatcher_task.cancel()
+        watchdog_task.cancel()
         token_task.cancel()
-        await asyncio.gather(dispatcher_task, token_task, return_exceptions=True)
+        await asyncio.gather(dispatcher_task, watchdog_task, token_task, return_exceptions=True)
         await asyncio.to_thread(terminal.TERMINAL_MANAGER.close_all)
 
 
@@ -360,8 +361,6 @@ CURSOR_JUMP_PATTERN = re.compile(r"\x1b\[\d*[GD]")
 TICKET_PATTERN = re.compile(r"^[A-Za-z0-9-]+$")
 SPAWN_TICKET_PATTERN = re.compile(r"^[A-Z0-9-]+$")
 ORCH_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
-CDX_MODELS = {"gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"}
-CC_MODELS = {"opus", "sonnet"}
 WORKER_ROLES = {"plan", "implement", "review"}
 REASONING_EFFORTS = {"minimal", "low", "medium", "high", "xhigh"}
 MAX_SPAWN_PROMPT_BYTES = 100_000
@@ -383,6 +382,92 @@ After reading the protocol:
 
 def valid_agent_id(value: str) -> bool:
     return bool(TICKET_PATTERN.fullmatch(value) or ORCH_ID_PATTERN.fullmatch(value))
+
+
+def _normalize_kind(value: object) -> str | None:
+    if value == "cc" or value == "claude":
+        return "cc"
+    if value == "cdx" or value == "codex":
+        return "cdx"
+    return None
+
+
+def _normalize_provider(value: object) -> str | None:
+    if value == "claude" or value == "cc":
+        return "claude"
+    if value == "codex" or value == "cdx":
+        return "codex"
+    return None
+
+
+def _provider_for_kind(kind: str | None) -> str | None:
+    if kind == "cc":
+        return "claude"
+    if kind == "cdx":
+        return "codex"
+    return None
+
+
+def _kind_for_format(fmt: str | None) -> str | None:
+    if fmt and fmt.startswith("claude"):
+        return "cc"
+    if fmt == "codex":
+        return "cdx"
+    return None
+
+
+def _session_identity(
+    entry: dict[str, Any] | None,
+    *,
+    fmt: str | None = None,
+) -> tuple[str | None, str | None, str | None]:
+    model = None
+    kind = _kind_for_format(fmt)
+    provider = _provider_for_kind(kind)
+    if isinstance(entry, dict):
+        raw_model = entry.get("model")
+        if isinstance(raw_model, str) and raw_model.strip():
+            model = raw_model.strip()
+        kind = _normalize_kind(entry.get("kind")) or kind or _normalize_kind(entry.get("provider"))
+        provider = _normalize_provider(entry.get("provider")) or _provider_for_kind(kind)
+    return (model, kind, provider)
+
+
+def _session_identity_from_provider_inspector(
+    provider_inspector: dict[str, object] | None,
+    fallback: tuple[str | None, str | None, str | None],
+) -> tuple[str | None, str | None, str | None]:
+    model, kind, provider = fallback
+    if not isinstance(provider_inspector, dict):
+        return fallback
+    raw_model = provider_inspector.get("model")
+    if model is None and isinstance(raw_model, str) and raw_model.strip():
+        model = raw_model.strip()
+    kind = kind or _normalize_kind(provider_inspector.get("kind")) or _normalize_kind(
+        provider_inspector.get("provider")
+    )
+    provider = provider or _normalize_provider(provider_inspector.get("provider")) or _provider_for_kind(kind)
+    return (model, kind, provider)
+
+
+def _validation_detail(exc: ValidationError) -> str:
+    messages = []
+    for error in exc.errors():
+        message = error.get("msg")
+        if isinstance(message, str):
+            messages.append(message)
+    return "; ".join(messages) or "Bad request body"
+
+
+def _coerce_request_model(body: object, model_type: type[BaseModel]) -> BaseModel:
+    if isinstance(body, model_type):
+        return body
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Request body must be an object")
+    try:
+        return model_type.model_validate(body)
+    except ValidationError as exc:
+        raise HTTPException(status_code=400, detail=_validation_detail(exc)) from exc
 
 
 def tmux_live_windows() -> set[str]:
@@ -1066,7 +1151,12 @@ def _provider_events(
             status_code=502,
             detail="Agent supervisor returned a bad event inspector response",
         )
-    return dict(result)
+    payload = dict(result)
+    model, kind, provider = _session_identity(resolved[2])
+    payload["model"] = payload.get("model") or model
+    payload["kind"] = payload.get("kind") or kind
+    payload["provider"] = payload.get("provider") or provider
+    return payload
 
 
 @app.get("/api/agents/{agent_id}/events")
@@ -1102,6 +1192,9 @@ def _session_delta_payload(
     include_subagents: bool = False,
     include_queue: bool = False,
     headless_current: dict[str, Any] | None = None,
+    model: str | None = None,
+    kind: str | None = None,
+    provider: str | None = None,
 ) -> dict[str, object]:
     effective_cursor = 0 if client_path is not None and client_path != str(path) else cursor
     result = transcripts.read_session_delta(fmt, path, effective_cursor)
@@ -1137,6 +1230,9 @@ def _session_delta_payload(
         "events": events,
         "patches": result.get("patches") or [],
         "working": _transcript_working(path, ticket),
+        "model": model,
+        "kind": kind,
+        "provider": provider,
     }
     if include_subagents:
         payload["subagents"] = _active_subagents(path)
@@ -1168,6 +1264,10 @@ def agent_session(
         found = _direct_transcript_session(Path(orch["transcript"]))
         if found is not None:
             fmt, path = found
+            model, kind, provider = _session_identity(
+                orch if isinstance(orch, dict) else None,
+                fmt=fmt,
+            )
             return _session_delta_payload(
                 fmt,
                 path,
@@ -1177,16 +1277,22 @@ def agent_session(
                 include_subagents=fmt == "claude",
                 include_queue=True,
                 headless_current=orch if isinstance(orch, dict) else None,
+                model=model,
+                kind=kind,
+                provider=provider,
             )
         raise HTTPException(status_code=404, detail="Orchestrator transcript missing")
 
     current = (registry.get(ticket) or {}).get("current") or {}
-    kind = current.get("kind")
+    current_model, current_kind, current_provider = _session_identity(
+        current if isinstance(current, dict) else None
+    )
     spawned_at = current.get("spawned_at")
     registry_session_id = current.get("session_id") if isinstance(current.get("session_id"), str) else None
     archive_dir: Path | None = None
     if not current:
-        kind, spawned_at, archive_dir = _archive_hint(ticket)
+        archive_kind, spawned_at, archive_dir = _archive_hint(ticket)
+        current_kind = current_kind or archive_kind
 
     found = None
     if isinstance(current, dict) and _is_headless(current):
@@ -1198,7 +1304,13 @@ def agent_session(
     if found is None:
         found = _session_paths.get(ticket)
     if found is None or not found[1].is_file():
-        found = transcripts.find_session(kind, ticket, spawned_at, registry_session_id, current.get("worktree"))
+        found = transcripts.find_session(
+            current_kind,
+            ticket,
+            spawned_at,
+            registry_session_id,
+            current.get("worktree"),
+        )
         if found:
             _session_paths[ticket] = found
     if found is None:
@@ -1209,6 +1321,10 @@ def agent_session(
                     status_code=503,
                     detail="Supervisor event inspector is unavailable",
                 )
+            model, kind, provider = _session_identity_from_provider_inspector(
+                provider_inspector,
+                (current_model, current_kind, current_provider),
+            )
             return {
                 "version": 2,
                 "format": "provider-events",
@@ -1231,6 +1347,9 @@ def agent_session(
                 "subagents": [],
                 "queue": _queue_messages(ticket),
                 "working": _transcript_working(Path(current.get("log") or "."), ticket),
+                "model": model,
+                "kind": kind,
+                "provider": provider,
                 "provider_inspector": provider_inspector,
             }
         # Native transcript gone (cleanup) — fall back to the archived pane log.
@@ -1238,6 +1357,15 @@ def agent_session(
             logs = sorted(archive_dir.glob("*.log"), key=lambda p: p.stat().st_size, reverse=True)
             if logs:
                 tail = clean_pane_log(logs[0])
+                meta = {}
+                try:
+                    meta = json.loads((archive_dir / "meta.json").read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    pass
+                worker = meta.get("worker") if isinstance(meta.get("worker"), dict) else None
+                model, kind, provider = _session_identity(worker, fmt="pane-log")
+                kind = kind or current_kind
+                provider = provider or _provider_for_kind(kind)
                 return {
                     "version": 2,
                     "format": "pane-log",
@@ -1255,10 +1383,16 @@ def agent_session(
                     "subagents": [],
                     "queue": [],
                     "working": False,
+                    "model": model,
+                    "kind": kind,
+                    "provider": provider,
                 }
         raise HTTPException(status_code=404, detail="No session transcript found")
 
     fmt, path = found
+    model = current_model
+    kind = current_kind or _kind_for_format(fmt)
+    provider = current_provider or _provider_for_kind(kind)
     return _session_delta_payload(
         fmt,
         path,
@@ -1268,6 +1402,9 @@ def agent_session(
         include_subagents=fmt == "claude",
         include_queue=True,
         headless_current=current if isinstance(current, dict) and _is_headless(current) else None,
+        model=model,
+        kind=kind,
+        provider=provider,
     )
 
 
@@ -1429,6 +1566,11 @@ def list_skills() -> dict[str, object]:
     return {"skills": skills}
 
 
+@app.get("/api/models")
+def list_models() -> dict[str, object]:
+    return {"models": list_model_options()}
+
+
 @app.get("/api/tokens")
 async def get_tokens(
     from_ts: str | None = Query(default=None, alias="from"),
@@ -1482,12 +1624,32 @@ class SpawnWorkerIn(BaseModel):
     orch: str | None = Field(default=None, max_length=100)
     prompt: str = Field(..., min_length=1, max_length=100_000)
 
+    @model_validator(mode="after")
+    def validate_model_and_effort(self) -> SpawnWorkerIn:
+        kind = self.kind.strip()
+        model = self.model.strip()
+        effort = (self.effort or "").strip() or None
+        if kind in {"cc", "cdx"} and not is_model_allowed(kind, model):
+            raise ValueError(f"Model {model!r} is not allowed for worker kind {kind}")
+        if kind == "cdx" and effort not in REASONING_EFFORTS:
+            raise ValueError("Reasoning effort is required for Codex workers")
+        if kind == "cc" and effort is not None:
+            raise ValueError("Claude workers do not accept reasoning effort")
+        return self
+
 
 class SpawnOrchestratorIn(BaseModel):
     id: str = Field(..., min_length=1, max_length=100)
     workdir: str = Field(..., min_length=1, max_length=4096)
     model: str = Field(..., min_length=2, max_length=32)
     goal: str = Field(default="", max_length=20_000)
+
+    @model_validator(mode="after")
+    def validate_model(self) -> SpawnOrchestratorIn:
+        model = self.model.strip()
+        if not is_model_allowed("cc", model):
+            raise ValueError(f"Model {model!r} is not allowed for orchestrators")
+        return self
 
 
 def _read_queue() -> dict[str, list[dict]]:
@@ -1585,7 +1747,7 @@ def _queue_messages(ticket: str) -> list[dict]:
     resolved = _registry_agent(_read_agent_registry(), ticket)
     if resolved is not None and _is_headless(resolved[2]):
         return _headless_queue(resolved[0])
-    return []
+    return [dict(message) for message in (_read_queue().get(ticket) or []) if isinstance(message, dict)]
 
 
 def resolve_existing_dir(raw_path: str, *, field_name: str) -> Path:
@@ -1768,7 +1930,8 @@ def replace_agent(agent_id: str) -> dict[str, object]:
 
 
 @app.post("/api/agents/spawn")
-def spawn_agent(body: SpawnWorkerIn) -> dict[str, object]:
+def spawn_agent(body: dict[str, Any] | SpawnWorkerIn) -> dict[str, object]:
+    body = cast(SpawnWorkerIn, _coerce_request_model(body, SpawnWorkerIn))
     ticket = body.ticket.strip()
     if not ticket or not SPAWN_TICKET_PATTERN.fullmatch(ticket):
         raise HTTPException(status_code=400, detail="Ticket must be uppercase letters, numbers, or dashes")
@@ -1782,16 +1945,7 @@ def spawn_agent(body: SpawnWorkerIn) -> dict[str, object]:
         raise HTTPException(status_code=400, detail="Role must be plan, implement, or review")
 
     model = body.model.strip()
-    allowed_models = CDX_MODELS if kind == "cdx" else CC_MODELS
-    if model not in allowed_models:
-        raise HTTPException(status_code=400, detail="Model is not allowed for this worker kind")
-
     effort = (body.effort or "").strip() or None
-    if kind == "cdx":
-        if effort not in REASONING_EFFORTS:
-            raise HTTPException(status_code=400, detail="Reasoning effort is required for Codex workers")
-    elif effort is not None:
-        raise HTTPException(status_code=400, detail="Claude workers do not accept reasoning effort")
 
     prompt = body.prompt
     if not prompt.strip():
@@ -1858,7 +2012,8 @@ def spawn_agent(body: SpawnWorkerIn) -> dict[str, object]:
 
 
 @app.post("/api/agents/spawn-orchestrator")
-def spawn_orchestrator(body: SpawnOrchestratorIn) -> dict[str, object]:
+def spawn_orchestrator(body: dict[str, Any] | SpawnOrchestratorIn) -> dict[str, object]:
+    body = cast(SpawnOrchestratorIn, _coerce_request_model(body, SpawnOrchestratorIn))
     orch_id = body.id.strip()
     if not ORCH_ID_PATTERN.fullmatch(orch_id):
         raise HTTPException(
@@ -1867,9 +2022,6 @@ def spawn_orchestrator(body: SpawnOrchestratorIn) -> dict[str, object]:
         )
 
     model = body.model.strip()
-    if model not in CC_MODELS:
-        raise HTTPException(status_code=400, detail="Model must be opus or sonnet")
-
     goal = body.goal.strip()
     if len(goal.encode("utf-8")) >= MAX_ORCH_GOAL_BYTES:
         raise HTTPException(status_code=400, detail="Initial goal must stay under 20KB")
@@ -2067,6 +2219,17 @@ async def supervisor_event_bridge() -> None:
 
 async def agent_runtime_dispatchers() -> None:
     await supervisor_event_bridge()
+
+
+async def message_dispatcher() -> None:
+    await agent_runtime_dispatchers()
+
+
+async def _start_dispatcher() -> tuple[asyncio.Task, asyncio.Task, asyncio.Task]:
+    dispatcher_task = asyncio.create_task(message_dispatcher())
+    watchdog_task = asyncio.create_task(accounts.watchdog_loop(publish_agent_event))
+    token_task = asyncio.create_task(tokens.refresh_in_background())
+    return (dispatcher_task, watchdog_task, token_task)
 
 
 def vault_snapshot() -> dict[str, float]:

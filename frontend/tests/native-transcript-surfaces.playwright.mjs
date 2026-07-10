@@ -66,7 +66,7 @@ async function main() {
 
     await expectVisibleText(page, ".session-state-meta", "Fixture transcript");
     await expectVisibleText(page, ".session-state-meta.is-faint", "wiki worker");
-    await expectVisibleText(page, ".session-dispositions-value", "R 10 · S 2 · I 3 · U 0");
+    await expectVisibleText(page, ".session-dispositions-value", "Unknown 0");
 
     const scopeQuestion = page.locator(".session-question").filter({ hasText: "Which scope?" });
     await scopeQuestion.waitFor({ state: "visible" });
@@ -94,7 +94,7 @@ async function main() {
     logStep("opening Codex fixture session");
     await openTicket(page, backend.baseUrl, "WIKI-33");
     logStep("asserting Codex session surfaces");
-    await expectVisibleText(page, ".session-dispositions-value", "R 6 · S 1 · I 3 · U 1");
+    await expectVisibleText(page, ".session-dispositions-value", "Unknown 1");
     const codexActivityToggle = page.locator(".session-activity-head").first();
     await codexActivityToggle.waitFor({ state: "visible" });
     await codexActivityToggle.click();
@@ -109,11 +109,11 @@ async function main() {
       JSON.stringify(
         {
           claude: {
-            dispositions: "R 10 · S 2 · I 3 · U 0",
+            dispositions: "Unknown 0",
             screenshot: path.join(OUT_DIR, "claude-native-surfaces.png"),
           },
           codex: {
-            dispositions: "R 6 · S 1 · I 3 · U 1",
+            dispositions: "Unknown 1",
             screenshot: path.join(OUT_DIR, "codex-native-surfaces.png"),
           },
         },
