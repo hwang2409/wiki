@@ -3599,22 +3599,18 @@ body.is-resizing-panes .pane-cell {
 }
 
 .session-dispositions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 12px 0;
+  position: absolute;
+  right: 12px;
+  bottom: 8px;
+  z-index: 2;
+  padding: 3px 8px;
   color: var(--text-faint);
   font-family: var(--font-monospace);
   font-size: var(--font-ui-smaller);
-}
-
-.session-dispositions-label {
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-
-.session-dispositions-value {
-  color: var(--text-muted);
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  pointer-events: none;
 }
 
 /* Session sidebar */
@@ -3747,6 +3743,7 @@ body.is-resizing-panes .pane-cell {
   flex: 1;
   flex-direction: column;
   min-height: 0;
+  position: relative;
 }
 
 .session-loading,

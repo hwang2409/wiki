@@ -322,18 +322,8 @@ function formatTokens(tokens: number | null): string | null {
   return `${tokens} tok`;
 }
 
-function formatDispositionCounts({
-  rendered,
-  summarized,
-  ignored,
-  unknown,
-}: {
-  rendered: number;
-  summarized: number;
-  ignored: number;
-  unknown: number;
-}): string {
-  return `R ${rendered} · S ${summarized} · I ${ignored} · U ${unknown}`;
+function formatDispositionCounts({ unknown }: { unknown: number }): string {
+  return `Unknown ${unknown}`;
 }
 
 const IMG_TOKEN_PATTERN = /\u27e6img:([^\u27e7]+)\u27e7/g;
@@ -1500,10 +1490,7 @@ export function SessionTab({
           ) : null}
         </div>
       ) : null}
-      <div className="session-dispositions">
-        <span className="session-dispositions-label">Inspector</span>
-        <span className="session-dispositions-value">{dispositionCounts}</span>
-      </div>
+      <div className="session-dispositions">{dispositionCounts}</div>
       <div className="session-scroll" ref={ref}>
         <div className="session-scroll-inner" ref={innerRef}>
           <div className="session-virtual-list" style={{ height: layout.totalHeight }}>
