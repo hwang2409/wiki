@@ -72,6 +72,22 @@ async def _wait_event(
     return await asyncio.wait_for(find(), timeout=timeout)
 
 
+async def _wait_protocol_row(
+    path: Path,
+    predicate: Callable[[dict], bool],
+    *,
+    timeout: float = 3.0,
+) -> dict:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        for row in _protocol_rows(path):
+            if predicate(row):
+                return row
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError("protocol log never contained the expected row")
+        await asyncio.sleep(0.01)
+
+
 def _protocol_rows(path: Path) -> list[dict]:
     return [
         json.loads(line)
@@ -492,6 +508,16 @@ class ClaudeAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.adapters.append(adapter)
         return adapter
 
+    async def _apply_message(
+        self,
+        adapter: ClaudeStreamAdapter,
+        value: dict[str, object],
+        generation: int,
+    ) -> None:
+        deferred = adapter._apply_message_state(value, generation)  # noqa: SLF001
+        if deferred is not None:
+            await adapter._flush_deferred_question_answer(*deferred)  # noqa: SLF001
+
     async def test_persistent_turns_permission_interrupt_and_no_tmux(self) -> None:
         record = _record(self.root, ProviderKind.CLAUDE, state=LifecycleState.STARTING)
         adapter = self._adapter(record)
@@ -620,6 +646,88 @@ class ClaudeAdapterTests(unittest.IsolatedAsyncioTestCase):
         archived = await adapter.archive()
         self.assertEqual(archived.state, LifecycleState.COMPLETED)
 
+    async def test_pending_question_response_waits_for_control_request(self) -> None:
+        record = _record(self.root, ProviderKind.CLAUDE, state=LifecycleState.STARTING)
+        adapter = self._adapter(record)
+        started = await adapter.start(_start_request(record))
+        self.assertEqual(started.state, LifecycleState.WORKING)
+        await _wait_event(
+            adapter,
+            lambda event: (
+                event.payload.get("type") == "result"
+                and event.payload.get("subtype") == "success"
+            ),
+        )
+        self.assertEqual((await adapter.status()).state, LifecycleState.IDLE)
+
+        generation = adapter.snapshot().generation
+        await self._apply_message(
+            adapter,
+            {
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_start",
+                    "content_block": {
+                        "type": "tool_use",
+                        "name": "AskUserQuestion",
+                        "id": "toolu_pending_fixture",
+                    },
+                },
+            },
+            generation,
+        )
+        response = {
+            "answers": {
+                "Which path should I take?": "Ship it",
+            }
+        }
+        responded = await adapter.respond("toolu_pending_fixture", response)
+        self.assertEqual(responded.state, LifecycleState.WORKING)
+        self.assertEqual(  # noqa: SLF001 - deferred race path regression
+            adapter._deferred_question_answers["toolu_pending_fixture"],
+            response,
+        )
+        self.assertIn("toolu_pending_fixture", adapter._pending_question_ids)  # noqa: SLF001
+        self.assertFalse(
+            any(
+                row.get("type") == "control_response"
+                and row.get("response", {}).get("request_id") == "permission-ask-user"
+                for row in _protocol_rows(self.log)
+            )
+        )
+
+        await self._apply_message(
+            adapter,
+            {
+                "type": "control_request",
+                "request_id": "permission-ask-user",
+                "request": {
+                    "subtype": "can_use_tool",
+                    "tool_name": "AskUserQuestion",
+                    "tool_use_id": "toolu_pending_fixture",
+                    "input": {"questions": [{"question": "Which path should I take?"}]},
+                },
+            },
+            generation,
+        )
+
+        approval_row = await _wait_protocol_row(
+            self.log,
+            lambda row: (
+                row.get("type") == "control_response"
+                and row.get("response", {}).get("request_id") == "permission-ask-user"
+            ),
+        )
+        self.assertEqual(
+            approval_row["response"]["response"]["updatedInput"],
+            {
+                "questions": [{"question": "Which path should I take?"}],
+                "answers": {"Which path should I take?": "Ship it"},
+            },
+        )
+        self.assertNotIn("toolu_pending_fixture", adapter._pending_question_ids)  # noqa: SLF001
+        self.assertNotIn("toolu_pending_fixture", adapter._deferred_question_answers)  # noqa: SLF001
+
     async def test_pending_question_response_updates_control_input(self) -> None:
         record = _record(self.root, ProviderKind.CLAUDE, state=LifecycleState.STARTING)
         adapter = self._adapter(record)
@@ -659,12 +767,14 @@ class ClaudeAdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(responded.state, LifecycleState.WORKING)
         self.assertNotIn("toolu_pending_fixture", adapter._pending_question_ids)  # noqa: SLF001
+        self.assertEqual(adapter._deferred_question_answers, {})  # noqa: SLF001
 
-        approval_row = next(
-            row
-            for row in reversed(_protocol_rows(self.log))
-            if row.get("type") == "control_response"
-            and row.get("response", {}).get("request_id") == "permission-ask-user"
+        approval_row = await _wait_protocol_row(
+            self.log,
+            lambda row: (
+                row.get("type") == "control_response"
+                and row.get("response", {}).get("request_id") == "permission-ask-user"
+            ),
         )
         self.assertEqual(
             approval_row["response"]["response"]["updatedInput"],
@@ -688,6 +798,168 @@ class ClaudeAdapterTests(unittest.IsolatedAsyncioTestCase):
                 )
                 for row in _protocol_rows(self.log)
             )
+        )
+
+    async def test_pending_question_response_cleanup_drops_deferred_answer(self) -> None:
+        record = _record(self.root, ProviderKind.CLAUDE, state=LifecycleState.STARTING)
+        adapter = self._adapter(record)
+        started = await adapter.start(_start_request(record))
+        self.assertEqual(started.state, LifecycleState.WORKING)
+        await _wait_event(
+            adapter,
+            lambda event: (
+                event.payload.get("type") == "result"
+                and event.payload.get("subtype") == "success"
+            ),
+        )
+        self.assertEqual((await adapter.status()).state, LifecycleState.IDLE)
+
+        generation = adapter.snapshot().generation
+        await self._apply_message(
+            adapter,
+            {
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_start",
+                    "content_block": {
+                        "type": "tool_use",
+                        "name": "AskUserQuestion",
+                        "id": "toolu_pending_fixture",
+                    },
+                },
+            },
+            generation,
+        )
+        await adapter.respond(
+            "toolu_pending_fixture",
+            {
+                "answers": {
+                    "Which path should I take?": "Ship it",
+                }
+            },
+        )
+        self.assertIn("toolu_pending_fixture", adapter._deferred_question_answers)  # noqa: SLF001
+
+        await self._apply_message(
+            adapter,
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_pending_fixture",
+                        }
+                    ]
+                },
+            },
+            generation,
+        )
+        self.assertNotIn("toolu_pending_fixture", adapter._pending_question_ids)  # noqa: SLF001
+        self.assertNotIn("toolu_pending_fixture", adapter._deferred_question_answers)  # noqa: SLF001
+
+        await self._apply_message(
+            adapter,
+            {
+                "type": "control_request",
+                "request_id": "permission-ask-user",
+                "request": {
+                    "subtype": "can_use_tool",
+                    "tool_name": "AskUserQuestion",
+                    "tool_use_id": "toolu_pending_fixture",
+                    "input": {"questions": [{"question": "Which path should I take?"}]},
+                },
+            },
+            generation,
+        )
+        self.assertFalse(
+            any(
+                row.get("type") == "control_response"
+                and row.get("response", {}).get("request_id") == "permission-ask-user"
+                for row in _protocol_rows(self.log)
+            )
+        )
+
+    async def test_pending_question_response_keeps_latest_queued_answer(self) -> None:
+        record = _record(self.root, ProviderKind.CLAUDE, state=LifecycleState.STARTING)
+        adapter = self._adapter(record)
+        started = await adapter.start(_start_request(record))
+        self.assertEqual(started.state, LifecycleState.WORKING)
+        await _wait_event(
+            adapter,
+            lambda event: (
+                event.payload.get("type") == "result"
+                and event.payload.get("subtype") == "success"
+            ),
+        )
+        self.assertEqual((await adapter.status()).state, LifecycleState.IDLE)
+
+        generation = adapter.snapshot().generation
+        await self._apply_message(
+            adapter,
+            {
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_start",
+                    "content_block": {
+                        "type": "tool_use",
+                        "name": "AskUserQuestion",
+                        "id": "toolu_pending_fixture",
+                    },
+                },
+            },
+            generation,
+        )
+        await adapter.respond(
+            "toolu_pending_fixture",
+            {
+                "answers": {
+                    "Which path should I take?": "Take path A",
+                }
+            },
+        )
+        await adapter.respond(
+            "toolu_pending_fixture",
+            {
+                "answers": {
+                    "Which path should I take?": "Take path B",
+                }
+            },
+        )
+        self.assertEqual(  # noqa: SLF001 - deferred overwrite regression
+            adapter._deferred_question_answers["toolu_pending_fixture"],
+            {
+                "answers": {
+                    "Which path should I take?": "Take path B",
+                }
+            },
+        )
+
+        await self._apply_message(
+            adapter,
+            {
+                "type": "control_request",
+                "request_id": "permission-ask-user",
+                "request": {
+                    "subtype": "can_use_tool",
+                    "tool_name": "AskUserQuestion",
+                    "tool_use_id": "toolu_pending_fixture",
+                    "input": {"questions": [{"question": "Which path should I take?"}]},
+                },
+            },
+            generation,
+        )
+
+        control_row = await _wait_protocol_row(
+            self.log,
+            lambda row: (
+                row.get("type") == "control_response"
+                and row.get("response", {}).get("request_id") == "permission-ask-user"
+            ),
+        )
+        self.assertEqual(
+            control_row["response"]["response"]["updatedInput"]["answers"],
+            {"Which path should I take?": "Take path B"},
         )
 
     async def test_working_resume_reissues_continuation_but_idle_does_not(self) -> None:

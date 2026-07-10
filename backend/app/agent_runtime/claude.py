@@ -139,6 +139,7 @@ class ClaudeStreamAdapter(ProviderAdapter):
         self._pending: dict[str, _PendingControl] = {}
         self._server_request_ids: dict[str, _ServerControl] = {}
         self._pending_question_ids: set[str] = set()
+        self._deferred_question_answers: dict[str, dict[str, Any]] = {}
         self._session_generations: dict[str, int] = {}
         self._suppress_stream_end: set[int] = set()
         self._request_id = 0
@@ -339,14 +340,93 @@ class ClaudeStreamAdapter(ProviderAdapter):
             for request in self._server_request_ids.values()
         )
 
-    def _apply_message_state(self, value: dict[str, Any], generation: int) -> None:
+    def _drop_pending_questions(self, tool_use_ids: set[str]) -> None:
+        if not tool_use_ids:
+            return
+        self._pending_question_ids.difference_update(tool_use_ids)
+        for tool_use_id in tool_use_ids:
+            self._deferred_question_answers.pop(tool_use_id, None)
+
+    def _drop_pending_question(self, tool_use_id: str | None) -> None:
+        if not isinstance(tool_use_id, str) or not tool_use_id:
+            return
+        self._pending_question_ids.discard(tool_use_id)
+        self._deferred_question_answers.pop(tool_use_id, None)
+
+    def _matching_question_control(
+        self, tool_use_id: str
+    ) -> tuple[str, _ServerControl] | None:
+        for control_id, control in self._server_request_ids.items():
+            if (
+                control.tool_use_id == tool_use_id
+                and control.subtype == "can_use_tool"
+                and control.generation == self._generation
+            ):
+                return control_id, control
+        return None
+
+    async def _send_question_answer(
+        self,
+        control_id: str,
+        control: _ServerControl,
+        response: dict[str, Any],
+    ) -> None:
+        answers = _ask_user_question_answers(response)
+        if answers is None:
+            self._server_request_ids[control_id] = control
+            raise ProviderProtocolError(
+                "Claude AskUserQuestion responses require a non-empty answers map"
+            )
+        try:
+            await self._send_json(
+                {
+                    "type": "control_response",
+                    "response": {
+                        "subtype": "success",
+                        "request_id": control.raw_id,
+                        "response": _ask_user_question_allow_response(
+                            control.input_payload,
+                            answers,
+                        ),
+                    },
+                },
+                generation=self._generation,
+            )
+            await asyncio.sleep(0)
+        except Exception:
+            self._server_request_ids[control_id] = control
+            raise
+        self._drop_pending_question(control.tool_use_id)
+        self._state = LifecycleState.WORKING
+        self._detail = None
+
+    async def _flush_deferred_question_answer(
+        self,
+        control_id: str,
+        control: _ServerControl,
+    ) -> None:
+        tool_use_id = control.tool_use_id
+        if not isinstance(tool_use_id, str) or not tool_use_id:
+            return
+        response = self._deferred_question_answers.get(tool_use_id)
+        if response is None:
+            return
+        pending = self._server_request_ids.pop(control_id, None)
+        if pending is None:
+            return
+        await self._send_question_answer(control_id, pending, response)
+
+    def _apply_message_state(
+        self, value: dict[str, Any], generation: int
+    ) -> tuple[str, _ServerControl] | None:
         event_type = value.get("type")
         subtype = value.get("subtype")
         session_id = value.get("session_id")
+        deferred_question_control: tuple[str, _ServerControl] | None = None
         if isinstance(session_id, str) and session_id:
             self._session_id = session_id
             self._session_generations[session_id] = self._generation
-        self._pending_question_ids.difference_update(_message_tool_result_ids(value))
+        self._drop_pending_questions(_message_tool_result_ids(value))
         if event_type == "stream_event":
             event = value.get("event")
             if isinstance(event, dict) and event.get("type") == "content_block_start":
@@ -376,6 +456,10 @@ class ClaudeStreamAdapter(ProviderAdapter):
                     request_subtype,
                     tool_use_id if isinstance(tool_use_id, str) else None,
                     dict(input_payload) if isinstance(input_payload, dict) else None,
+                )
+                deferred_question_control = (
+                    request_id,
+                    self._server_request_ids[request_id],
                 )
             if isinstance(request, dict) and request.get("subtype") == "can_use_tool":
                 self._state = LifecycleState.WAITING_APPROVAL
@@ -430,6 +514,7 @@ class ClaudeStreamAdapter(ProviderAdapter):
                 self._detail = str(value.get("result") or "Claude provider error")
             else:
                 self._state = LifecycleState.IDLE
+        return deferred_question_control
 
     async def _reader_loop(
         self,
@@ -450,7 +535,13 @@ class ClaudeStreamAdapter(ProviderAdapter):
                 if not isinstance(value, dict):
                     value = {"type": "provider_protocol_error", "value": value}
                 event_generation = self._message_generation(value, generation)
-                self._apply_message_state(value, event_generation)
+                deferred_question_control = self._apply_message_state(
+                    value, event_generation
+                )
+                if deferred_question_control is not None:
+                    await self._flush_deferred_question_answer(
+                        *deferred_question_control
+                    )
                 await self._emit(value, direction="stdout", generation=event_generation)
                 if value.get("type") != "control_response":
                     continue
@@ -650,6 +741,8 @@ class ClaudeStreamAdapter(ProviderAdapter):
         process = self._process
         if process is None:
             self._server_request_ids.clear()
+            self._pending_question_ids.clear()
+            self._deferred_question_answers.clear()
             return
         generation = self._generation
         if suppress_stream_end:
@@ -667,6 +760,8 @@ class ClaudeStreamAdapter(ProviderAdapter):
         if self._reader_task is not None:
             await asyncio.gather(self._reader_task, return_exceptions=True)
         self._server_request_ids.clear()
+        self._pending_question_ids.clear()
+        self._deferred_question_answers.clear()
 
     async def stop(self) -> AdapterStatus:
         async with self._operation_lock:
@@ -745,58 +840,24 @@ class ClaudeStreamAdapter(ProviderAdapter):
                 raise ProviderProtocolError(
                     f"unknown, canceled, or stale Claude server request id: {request_id!r}"
                 )
-            matching_control_id = next(
-                (
-                    control_id
-                    for control_id, control in self._server_request_ids.items()
-                    if control.tool_use_id == request_id
-                    and control.subtype == "can_use_tool"
-                    and control.generation == self._generation
-                ),
-                None,
-            )
-            matching_control = (
-                self._server_request_ids.pop(matching_control_id, None)
-                if matching_control_id is not None
-                else None
-            )
-            answers = _ask_user_question_answers(response)
-            if answers is None:
-                if matching_control is not None and matching_control_id is not None:
-                    self._server_request_ids[matching_control_id] = matching_control
+            if _ask_user_question_answers(response) is None:
                 raise ProviderProtocolError(
                     "Claude AskUserQuestion responses require a non-empty answers map"
                 )
-            if matching_control is None or matching_control_id is None:
-                raise ProviderProtocolError(
-                    f"unknown, canceled, or stale Claude server request id: {request_id!r}"
-                )
-            try:
-                await self._send_json(
-                    {
-                        "type": "control_response",
-                        "response": {
-                            "subtype": "success",
-                            "request_id": matching_control.raw_id,
-                            "response": _ask_user_question_allow_response(
-                                matching_control.input_payload,
-                                answers,
-                            ),
-                        },
-                    },
-                    generation=self._generation,
-                )
-                # The fake provider test harness inspects the protocol log
-                # immediately after respond() returns; yield once so the child
-                # process can consume the line we just wrote.
-                await asyncio.sleep(0)
-            except Exception:
-                if matching_control is not None and matching_control_id is not None:
-                    self._server_request_ids[matching_control_id] = matching_control
-                raise
-            self._pending_question_ids.discard(request_id)
-            self._state = LifecycleState.WORKING
-            self._detail = None
+            matching_question_control = self._matching_question_control(request_id)
+            if matching_question_control is None:
+                self._deferred_question_answers[request_id] = dict(response)
+                return self._status()
+            matching_control_id, _matching_control = matching_question_control
+            matching_control = self._server_request_ids.pop(matching_control_id, None)
+            if matching_control is None:
+                self._deferred_question_answers[request_id] = dict(response)
+                return self._status()
+            await self._send_question_answer(
+                matching_control_id,
+                matching_control,
+                response,
+            )
             return self._status()
         if pending.generation != self._generation:
             self._server_request_ids[request_id] = pending
@@ -835,3 +896,4 @@ class ClaudeStreamAdapter(ProviderAdapter):
             await asyncio.gather(self._reader_task, return_exceptions=True)
         self._server_request_ids.clear()
         self._pending_question_ids.clear()
+        self._deferred_question_answers.clear()
