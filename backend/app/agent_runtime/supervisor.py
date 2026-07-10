@@ -1716,6 +1716,7 @@ class Supervisor:
                     reason="archived",
                 )
             archived, _ = self.store.archive_current(run_id, outcome=outcome)
+            self._clear_adapter_loss(run_id)
             await self._publish_agent_change(archived.agent_id)
             return archived
         try:
@@ -1736,6 +1737,7 @@ class Supervisor:
             raise StoreConflict("provider archive returned no status")
         record = self.store.update_adapter_status(run_id, status)
         archived, _ = self.store.archive_current(run_id, outcome=outcome)
+        self._clear_adapter_loss(run_id)
         await self._publish_agent_change(archived.agent_id)
         return archived
 

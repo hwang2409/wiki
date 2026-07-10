@@ -1828,6 +1828,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             json.dumps({"state": "merge-ready", "step": "waiting for merge"}),
             encoding="utf-8",
         )
+        self.supervisor.detached_at_monotonic[record.run_id] = time.monotonic()
 
         archived = await self.supervisor.archive(record.run_id)
 
@@ -1854,6 +1855,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(final_status["state"], "merge-ready")
         self.assertNotIn(record.run_id, self.supervisor.adapters)
+        self.assertNotIn(record.run_id, self.supervisor.detached_at_monotonic)
 
     async def test_archive_allows_detached_dead_run(self) -> None:
         record = await self.supervisor.start_run(
@@ -1866,11 +1868,13 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             prompt="fixture",
         )
         await self.supervisor.stop(record.run_id)
+        self.supervisor.detached_at_monotonic[record.run_id] = time.monotonic()
 
         archived = await self.supervisor.archive(record.run_id)
 
         self.assertEqual(archived.state, LifecycleState.DEAD)
         self.assertFalse(self.store.run_dir(record.run_id).exists())
+        self.assertNotIn(record.run_id, self.supervisor.detached_at_monotonic)
         self.assertFalse(
             (self.paths.registry_path.exists())
             and json.loads(self.paths.registry_path.read_text()).get("WIKI-ARCHIVE-DEAD")
