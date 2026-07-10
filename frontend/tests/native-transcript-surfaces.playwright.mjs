@@ -196,7 +196,11 @@ async function main() {
     await previewTool.locator(".session-tool-head").click();
     await page.locator(".session-tool-collapsible.is-open").first().waitFor({ state: "visible" });
     await previewTool.locator(".gh-preview-title", { hasText: "Add GitHub URL previews" }).waitFor();
-    await expectVisibleText(page, ".session-tool-output a.external-link", "https://github.com/hwang2409/wiki/issues/64");
+    await previewTool
+      .locator(".session-tool-output-blocks > a.external-link", {
+        hasText: "https://github.com/hwang2409/wiki/issues/64",
+      })
+      .waitFor({ state: "visible" });
     await page.waitForTimeout(250);
     logStep("capturing GitHub preview screenshot");
     await page.locator(".session-scroll").screenshot({ path: path.join(OUT_DIR, "github-preview-cards.png") });
