@@ -417,6 +417,7 @@ class RunStore:
             "kind": record.provider.legacy_kind,
             "role": record.role,
             "model": record.model,
+            "desired_model": record.desired_model,
             "effort": record.effort,
             "worktree": record.worktree,
             "cwd": record.worktree,
@@ -1030,6 +1031,18 @@ class RunStore:
             guard_automatic_resume=guard_automatic_resume,
         )
 
+    def set_desired_model(self, run_id: str, model: str | None) -> RunRecord:
+        with self._lock:
+            record = self.get(run_id)
+            record.desired_model = model
+            self._write_record(record)
+            registry = self._read_registry()
+            current = (registry.get(record.agent_id) or {}).get("current") or {}
+            if current.get("run_id") == record.run_id:
+                registry[record.agent_id]["current"] = self._registry_current(record)
+                self._write_registry(registry)
+            return record
+
     def append_raw(
         self,
         run_id: str,
@@ -1304,6 +1317,17 @@ class RunStore:
         with self._lock:
             record = self.get(run_id)
             record.queued_messages.append({"text": text, "queued_at": utc_now()})
+            self._write_record(record)
+            return record
+
+    def replace_queued_messages(
+        self,
+        run_id: str,
+        messages: list[dict[str, str]],
+    ) -> RunRecord:
+        with self._lock:
+            record = self.get(run_id)
+            record.queued_messages = [dict(message) for message in messages]
             self._write_record(record)
             return record
 
