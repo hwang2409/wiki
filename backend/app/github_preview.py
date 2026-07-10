@@ -5,11 +5,13 @@ import json
 import re
 import subprocess
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
 
 
 PREVIEW_CACHE_TTL_SECONDS = 300
+PREVIEW_CACHE_MAX_SIZE = 128
 GITHUB_PREVIEW_URL_PATTERN = re.compile(
     r"^https://(?:www\.)?github\.com/"
     r"(?P<owner>[A-Za-z0-9_.-]+)/"
@@ -17,7 +19,7 @@ GITHUB_PREVIEW_URL_PATTERN = re.compile(
     r"(?:(?P<kind>pull|issues)/(?P<number>\d+)|commit/(?P<sha>[0-9a-fA-F]{7,40}))/?$"
 )
 
-_preview_cache: dict[str, tuple[float, str, dict[str, Any]]] = {}
+_preview_cache: OrderedDict[str, tuple[float, str, dict[str, Any]]] = OrderedDict()
 
 
 class GitHubPreviewFetchError(RuntimeError):
@@ -191,15 +193,23 @@ def _etag_for_payload(payload: dict[str, Any]) -> str:
     return f'"{hashlib.sha1(encoded).hexdigest()}"'
 
 
+def _store_cached_preview(url: str, expires_at: float, etag: str, payload: dict[str, Any]) -> None:
+    _preview_cache[url] = (expires_at, etag, payload)
+    _preview_cache.move_to_end(url)
+    while len(_preview_cache) > PREVIEW_CACHE_MAX_SIZE:
+        _preview_cache.popitem(last=False)
+
+
 def get_github_preview(url: str) -> tuple[dict[str, Any], str]:
     parsed = parse_github_preview_url(url)
     cached = _preview_cache.get(parsed.normalized_url)
     now = time.time()
     if cached and cached[0] > now:
+        _preview_cache.move_to_end(parsed.normalized_url)
         return (cached[2], cached[1])
     payload = _build_preview(parsed)
     etag = _etag_for_payload(payload)
-    _preview_cache[parsed.normalized_url] = (now + PREVIEW_CACHE_TTL_SECONDS, etag, payload)
+    _store_cached_preview(parsed.normalized_url, now + PREVIEW_CACHE_TTL_SECONDS, etag, payload)
     return (payload, etag)
 
 

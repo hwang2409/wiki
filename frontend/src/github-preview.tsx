@@ -9,6 +9,10 @@ const GITHUB_PREVIEW_TEXT_PATTERN =
   /(https:\/\/(?:www\.)?github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/(?:pull\/\d+|issues\/\d+|commit\/[0-9a-fA-F]{7,40})\/?)/g;
 const FRONTEND_CACHE_TTL_MS = 60_000;
 
+export type GitHubPreviewSegment =
+  | { type: "text"; value: string }
+  | { type: "url"; value: string };
+
 type CacheEntry = {
   data?: GhPreviewData;
   etag?: string | null;
@@ -30,6 +34,17 @@ export function isGitHubPreviewUrl(url?: string) {
 export function containsGitHubPreviewUrl(text: string) {
   GITHUB_PREVIEW_TEXT_PATTERN.lastIndex = 0;
   return GITHUB_PREVIEW_TEXT_PATTERN.test(text);
+}
+
+export function splitGitHubPreviewSegments(text: string): GitHubPreviewSegment[] {
+  GITHUB_PREVIEW_TEXT_PATTERN.lastIndex = 0;
+  return text
+    .split(GITHUB_PREVIEW_TEXT_PATTERN)
+    .filter(Boolean)
+    .map((part) => ({
+      type: isGitHubPreviewUrl(part) ? "url" : "text",
+      value: part,
+    }));
 }
 
 function humanizeState(value: string | null | undefined) {
@@ -212,16 +227,14 @@ export function GhPreviewCard({ url }: { url: string }) {
 }
 
 export function GitHubPreviewText({ text }: { text: string }) {
-  GITHUB_PREVIEW_TEXT_PATTERN.lastIndex = 0;
-  const parts: string[] = text.split(GITHUB_PREVIEW_TEXT_PATTERN);
+  const parts = splitGitHubPreviewSegments(text);
   return (
     <>
       {parts.map((part, index) => {
-        if (!part) return null;
-        if (isGitHubPreviewUrl(part)) {
-          return <GhPreviewCard key={`${part}:${index}`} url={part} />;
+        if (part.type === "url") {
+          return <GhPreviewCard key={`${part.value}:${index}`} url={part.value} />;
         }
-        return <Fragment key={`${index}:${part.slice(0, 12)}`}>{part}</Fragment>;
+        return <Fragment key={`${index}:${part.value.slice(0, 12)}`}>{part.value}</Fragment>;
       })}
     </>
   );

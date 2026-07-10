@@ -160,3 +160,32 @@ class GitHubPreviewRouteTests(unittest.TestCase):
 
         self.assertEqual(error.status_code, 502)
         self.assertEqual(json.loads(error.body), {"ok": False, "error": "boom"})
+
+    def test_cache_is_lru_bounded(self) -> None:
+        payload = {
+            "title": "Bounded cache test",
+            "state": "OPEN",
+            "mergeStateStatus": "CLEAN",
+            "updatedAt": "2026-07-10T16:20:00Z",
+            "changedFiles": 1,
+            "statusCheckRollup": [],
+        }
+
+        with mock.patch("backend.app.github_preview.subprocess.run", return_value=_gh_ok(payload)):
+            original_limit = github_preview.PREVIEW_CACHE_MAX_SIZE
+            github_preview.PREVIEW_CACHE_MAX_SIZE = 2
+            try:
+                main.gh_preview_card(_request(), url="https://github.com/hwang2409/wiki/pull/45")
+                main.gh_preview_card(_request(), url="https://github.com/hwang2409/wiki/pull/46")
+                main.gh_preview_card(_request(), url="https://github.com/hwang2409/wiki/pull/45")
+                main.gh_preview_card(_request(), url="https://github.com/hwang2409/wiki/pull/47")
+            finally:
+                github_preview.PREVIEW_CACHE_MAX_SIZE = original_limit
+
+        self.assertEqual(
+            list(github_preview._preview_cache.keys()),  # noqa: SLF001 - cache contract test
+            [
+                "https://github.com/hwang2409/wiki/pull/45",
+                "https://github.com/hwang2409/wiki/pull/47",
+            ],
+        )

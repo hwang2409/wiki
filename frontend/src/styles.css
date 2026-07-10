@@ -4740,6 +4740,16 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-faint);
 }
 
+.session-tool-output-blocks {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.session-tool-output-blocks .gh-preview-card {
+  align-self: flex-start;
+}
+
 .session-thinking {
   max-height: 160px;
   padding: 4px 0 4px 10px;
