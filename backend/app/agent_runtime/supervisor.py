@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import time
 from collections.abc import Callable
@@ -25,6 +26,25 @@ from .types import (
 
 
 AdapterFactory = Callable[[RunRecord], ProviderAdapter]
+DEFAULT_REAPER_INTERVAL_SECONDS = 30.0
+DEFAULT_REAPER_GRACE_SECONDS = 60.0
+
+
+def _validated_seconds(name: str, value: float) -> float:
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{name} must be a finite, non-negative number")
+    return value
+
+
+def _env_seconds(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number") from exc
+    return _validated_seconds(name, value)
 
 
 def provider_pid_is_alive(pid: int | None) -> bool:
@@ -68,11 +88,36 @@ class Supervisor:
         *,
         pid_alive: Callable[[int | None], bool] = provider_pid_is_alive,
         recovery_stability_seconds: float = 30.0,
+        reaper_interval_seconds: float | None = None,
+        reaper_grace_seconds: float | None = None,
     ):
         self.store = store
         self.adapter_factory = adapter_factory
         self.pid_alive = pid_alive
         self.recovery_stability_seconds = recovery_stability_seconds
+        self.reaper_interval_seconds = _validated_seconds(
+            "WIKI_REAPER_INTERVAL_SECONDS",
+            (
+                reaper_interval_seconds
+                if reaper_interval_seconds is not None
+                else _env_seconds(
+                    "WIKI_REAPER_INTERVAL_SECONDS",
+                    DEFAULT_REAPER_INTERVAL_SECONDS,
+                )
+            ),
+        )
+        self.reaper_grace_seconds = _validated_seconds(
+            "WIKI_REAPER_GRACE_SECONDS",
+            (
+                reaper_grace_seconds
+                if reaper_grace_seconds is not None
+                else _env_seconds(
+                    "WIKI_REAPER_GRACE_SECONDS",
+                    DEFAULT_REAPER_GRACE_SECONDS,
+                )
+            ),
+        )
+        self.last_reaper_at = 0.0
         self.adapters: dict[str, ProviderAdapter] = {}
         self.event_tasks: dict[str, asyncio.Task[None]] = {}
         self.event_routes: dict[tuple[int, int], str] = {}
@@ -184,6 +229,32 @@ class Supervisor:
         return (
             datetime.now(timezone.utc) - guarded_at
         ).total_seconds() >= self.recovery_stability_seconds
+
+    def _reaper_due(self) -> bool:
+        return self._seconds_since(self.last_reaper_at) >= self.reaper_interval_seconds
+
+    @staticmethod
+    def _record_age_seconds(timestamp: str | None) -> float:
+        if not timestamp:
+            return 0.0
+        try:
+            parsed = datetime.fromisoformat(timestamp)
+        except ValueError:
+            return 0.0
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return max((datetime.now(timezone.utc) - parsed).total_seconds(), 0.0)
+
+    def _reapable_adapter_loss(self, record: RunRecord) -> bool:
+        if record.state in TERMINAL_STATES:
+            return False
+        if record.run_id in self.adapters:
+            return False
+        if record.provider_pid is not None:
+            return False
+        if record.quiesce_operation_id is not None:
+            return False
+        return self._record_age_seconds(record.updated_at) >= self.reaper_grace_seconds
 
     async def _pump_events(self, run_id: str, adapter: ProviderAdapter) -> None:
         stream_key = id(adapter)
@@ -845,7 +916,44 @@ class Supervisor:
 
     async def recover_on_start(self) -> list[dict[str, str]]:
         async with self.recovery_scan_lock:
-            return await self._recover_once()
+            results = await self._recover_once()
+            if self._reaper_due():
+                by_run_id = {
+                    item["run_id"]: index for index, item in enumerate(results)
+                }
+                for reaped in await self._reap_lost_runs():
+                    index = by_run_id.get(reaped["run_id"])
+                    if index is None:
+                        results.append(reaped)
+                    else:
+                        results[index] = reaped
+            return results
+
+    async def _reap_lost_runs(self) -> list[dict[str, str]]:
+        self.last_reaper_at = time.monotonic()
+        results: list[dict[str, str]] = []
+        for snapshot in self.store.list_runs():
+            async with self._agent_lock(snapshot.agent_id):
+                try:
+                    record = self.store.get(snapshot.run_id)
+                except RunNotFound:
+                    continue
+                if not self._reapable_adapter_loss(record):
+                    continue
+                record = self.store.transition(
+                    record.run_id,
+                    LifecycleState.COMPLETED,
+                    reason="adapter_lost",
+                )
+                await self._publish_agent_change(record.agent_id)
+                results.append(
+                    {
+                        "run_id": record.run_id,
+                        "action": "reap",
+                        "reason": "adapter_lost",
+                    }
+                )
+        return results
 
     async def request_codex_rotation(
         self,

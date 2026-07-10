@@ -717,6 +717,82 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(stable.automatic_resume_suppressed)
         self.assertIsNone(stable.automatic_resume_guarded_at)
 
+    async def test_reaper_completes_stale_adapterless_run(self) -> None:
+        await self.supervisor.close()
+        record = RunRecord.new(
+            agent_id="WIKI-REAPER",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            worktree=str(self.worktree),
+            prompt="fixture",
+        )
+        record.state = LifecycleState.WORKING
+        self.store.create(record)
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "WIKI_REAPER_INTERVAL_SECONDS": "0",
+                "WIKI_REAPER_GRACE_SECONDS": "0.01",
+            },
+        ):
+            self.supervisor = Supervisor(
+                self.store,
+                FixtureAdapterFactory(FIXTURES, pid=os.getpid()),
+                pid_alive=lambda _pid: False,
+            )
+            first = await self.supervisor.recover_on_start()
+            self.assertEqual(first[0]["action"], "block")
+            self.assertEqual(
+                self.store.get(record.run_id).state,
+                LifecycleState.BLOCKED,
+            )
+
+            await asyncio.sleep(0.02)
+
+            second = await self.supervisor.recover_on_start()
+            self.assertEqual(second[0]["action"], "reap")
+
+        reaped = self.store.get(record.run_id)
+        self.assertEqual(reaped.state, LifecycleState.COMPLETED)
+        self.assertEqual(reaped.state_reason, "adapter_lost")
+
+    async def test_reaper_skips_active_quiesce_runs(self) -> None:
+        await self.supervisor.close()
+        record = RunRecord.new(
+            agent_id="WIKI-REAPER-QUIESCE",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            worktree=str(self.worktree),
+            prompt="fixture",
+        )
+        record.state = LifecycleState.BLOCKED
+        record.provider_session_id = "session-quiesce"
+        record.quiesce_operation_id = "00000000-0000-4000-8000-000000000088"
+        record.quiesce_resume_state = LifecycleState.WORKING
+        record.automatic_resume_suppressed = True
+        self.store.create(record)
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "WIKI_REAPER_INTERVAL_SECONDS": "0",
+                "WIKI_REAPER_GRACE_SECONDS": "0",
+            },
+        ):
+            self.supervisor = Supervisor(
+                self.store,
+                FixtureAdapterFactory(FIXTURES, pid=os.getpid()),
+                pid_alive=lambda _pid: False,
+            )
+            await self.supervisor.recover_on_start()
+
+        guarded = self.store.get(record.run_id)
+        self.assertEqual(guarded.state, LifecycleState.BLOCKED)
+        self.assertEqual(guarded.quiesce_operation_id, record.quiesce_operation_id)
+
     async def test_recovery_retains_healthy_attachment_despite_stale_pid(self) -> None:
         await self.supervisor.close()
         self.supervisor = Supervisor(
