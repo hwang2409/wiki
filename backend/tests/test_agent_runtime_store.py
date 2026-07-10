@@ -15,6 +15,7 @@ from backend.app.agent_runtime.store import (
     RuntimePaths,
     StoreConflict,
     StoreError,
+    _atomic_write_json,
 )
 from backend.app.agent_runtime.types import (
     EventDisposition,
@@ -1069,11 +1070,48 @@ class RunStoreTests(unittest.TestCase):
                 "WIKI_AGENT_STATUS_DIR": str(root / "status"),
             }
             paths = RuntimePaths.from_env(env)
-            self.assertEqual(paths.runtime_dir, (root / "runtime").absolute())
-            self.assertEqual(paths.socket_path, (root / "control.sock").absolute())
-            self.assertEqual(paths.registry_path, (root / "registry.json").absolute())
-            self.assertEqual(paths.archive_dir, (root / "archive").absolute())
-            self.assertEqual(paths.status_dir, (root / "status").absolute())
+            resolved = root.resolve()
+            self.assertEqual(paths.runtime_dir, resolved / "runtime")
+            self.assertEqual(paths.socket_path, resolved / "control.sock")
+            self.assertEqual(paths.registry_path, resolved / "registry.json")
+            self.assertEqual(paths.archive_dir, resolved / "archive")
+            self.assertEqual(paths.status_dir, resolved / "status")
+
+    def test_registry_under_symlinked_parent_dir_writes_fine(self) -> None:
+        """macOS /tmp is a symlink to /private/tmp; parents must resolve so the
+        symlink-dir guard only rejects the final component."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            real = root / "real"
+            real.mkdir()
+            link = root / "link"
+            link.symlink_to(real, target_is_directory=True)
+            env = {
+                "WIKI_AGENT_RUNTIME_DIR": str(root / "runtime"),
+                "WIKI_SUPERVISOR_SOCKET_PATH": str(root / "control.sock"),
+                "WIKI_AGENT_REGISTRY_PATH": str(link / "registry.json"),
+                "WIKI_AGENT_ARCHIVE_DIR": str(root / "archive"),
+                "WIKI_AGENT_STATUS_DIR": str(link / "status"),
+            }
+            paths = RuntimePaths.from_env(env)
+            self.assertEqual(paths.registry_path.parent, real.resolve())
+            _atomic_write_json(paths.registry_path, {"ok": True})
+            self.assertTrue((real / "registry.json").is_file())
+
+    def test_symlinked_final_component_still_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "target.json"
+            target.write_text("{}", encoding="utf-8")
+            planted = root / "registry.json"
+            planted.symlink_to(target)
+            env = {
+                "WIKI_AGENT_RUNTIME_DIR": str(root / "runtime"),
+                "WIKI_AGENT_REGISTRY_PATH": str(planted),
+            }
+            paths = RuntimePaths.from_env(env)
+            with self.assertRaises(StoreError):
+                _atomic_write_json(paths.registry_path, {"ok": True})
 
 
 if __name__ == "__main__":
