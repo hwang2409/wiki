@@ -12,13 +12,13 @@ from pathlib import Path, PurePosixPath
 from typing import Any, cast
 from uuid import uuid4
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, status
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
-from . import accounts, github_pr, terminal, tokens, transcripts, uistate, vaultops
+from . import accounts, github_pr, github_preview, terminal, tokens, transcripts, uistate, vaultops
 from .agent_models import is_model_allowed, list_model_options, model_ids_for_kind
 from .agent_runtime.client import (
     SupervisorClient,
@@ -335,6 +335,27 @@ def activity_diff(sha: str) -> dict[str, str]:
         raise HTTPException(status_code=400, detail="Bad commit sha")
     patch = run_git("show", sha, "--format=%s", "--patch", "--", "vault")
     return {"patch": patch}
+
+
+@app.get("/api/gh/preview")
+def gh_preview_card(
+    request: Request,
+    url: str = Query(..., min_length=1, max_length=300),
+) -> Response:
+    try:
+        payload, etag = github_preview.get_github_preview(url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except github_preview.GitHubPreviewFetchError as exc:
+        return JSONResponse(status_code=502, content={"ok": False, "error": str(exc)})
+
+    headers = {
+        "Cache-Control": f"private, max-age={github_preview.PREVIEW_CACHE_TTL_SECONDS}",
+        "ETag": etag,
+    }
+    if github_preview.etag_matches(request.headers.get("if-none-match"), etag):
+        return Response(status_code=304, headers=headers)
+    return JSONResponse(content=payload, headers=headers)
 
 
 class NoteLinks(BaseModel):
