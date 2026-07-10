@@ -58,6 +58,7 @@ import type {
   SkillInfo,
   SubagentInfo,
 } from "./api";
+import { renderAnsi } from "./ansi";
 import { externalLinkProps } from "./external-links";
 import { LoadingPlaceholder } from "./loading";
 import { createStateKeyWriteBarrier, deletePaneStateEntries } from "./pane-state-cache";
@@ -703,7 +704,7 @@ function ToolRow({
         <div className="session-collapsible-inner">
           <div className="session-tool-body">
             <pre>{tool.input}</pre>
-            {tool.output ? <pre className="session-tool-output">{tool.output}</pre> : null}
+            {tool.output ? <pre className="session-tool-output">{renderAnsi(tool.output)}</pre> : null}
           </div>
         </div>
       </div>
@@ -986,8 +987,8 @@ function BashBlock({
         <div className={`session-collapsible session-bash-collapsible${open ? " is-open" : ""}`}>
           <div className="session-collapsible-inner">
             <div className="session-bash-body">
-              {bash.stdout ? <pre className="session-bash-stdout">{bash.stdout}</pre> : null}
-              {bash.stderr ? <pre className="session-bash-stderr">{bash.stderr}</pre> : null}
+              {bash.stdout ? <pre className="session-bash-stdout">{renderAnsi(bash.stdout)}</pre> : null}
+              {bash.stderr ? <pre className="session-bash-stderr">{renderAnsi(bash.stderr)}</pre> : null}
             </div>
           </div>
         </div>
@@ -1162,7 +1163,7 @@ const MessageBlock = memo(function MessageBlock({
     return <ThinkingBlock event={event} />;
   }
   if (event.kind === "terminal") {
-    return <pre className="session-pane-log">{event.text}</pre>;
+    return <pre className="session-pane-log">{renderAnsi(event.text)}</pre>;
   }
   if (event.kind === "image") {
     return (
