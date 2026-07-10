@@ -180,6 +180,7 @@ export function GhPreviewCard({ url }: { url: string }) {
   const state = humanizeState(preview.state);
   const meta = secondaryMeta(preview);
   const timestamp = previewTimestamp(preview);
+  const showState = preview.kind !== "commit";
 
   return (
     <a
@@ -191,13 +192,15 @@ export function GhPreviewCard({ url }: { url: string }) {
       <span className="gh-preview-title">{preview.title}</span>
       <span className="gh-preview-meta">
         <span className="gh-preview-badges">
-          <span className="gh-preview-badge">
-            {previewIcon(preview.kind)}
-            <span>{state}</span>
-          </span>
+          {showState ? (
+            <span className="gh-preview-badge">
+              {previewIcon(preview.kind)}
+              <span>{state}</span>
+            </span>
+          ) : null}
           {meta ? (
-            <span className="gh-preview-badge is-muted">
-              <span>•</span>
+            <span className={`gh-preview-badge${showState ? " is-muted" : ""}`}>
+              <span>{showState ? "•" : previewIcon(preview.kind)}</span>
               <span>{meta}</span>
             </span>
           ) : null}
