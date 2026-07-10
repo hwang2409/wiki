@@ -21,8 +21,22 @@ class AgentModelOption:
 
 MODEL_OPTIONS: tuple[AgentModelOption, ...] = (
     AgentModelOption(
-        id="gpt-5.6",
-        label="GPT 5.6",
+        id="gpt-5.6-sol",
+        label="GPT 5.6 Sol",
+        kind="cdx",
+        provider="codex",
+        supports_reasoning_effort=True,
+    ),
+    AgentModelOption(
+        id="gpt-5.6-terra",
+        label="GPT 5.6 Terra",
+        kind="cdx",
+        provider="codex",
+        supports_reasoning_effort=True,
+    ),
+    AgentModelOption(
+        id="gpt-5.6-luna",
+        label="GPT 5.6 Luna",
         kind="cdx",
         provider="codex",
         supports_reasoning_effort=True,
