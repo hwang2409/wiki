@@ -1803,6 +1803,8 @@ class Supervisor:
             raise StoreConflict("provider adapter changed while sending response")
         record = self.store.update_adapter_status(run_id, status)
         record = self.store.clear_pending_request(run_id, request_id)
+        if isinstance(request_id, str):
+            record = self.store.clear_pending_request_by_tool_use_id(run_id, request_id)
         record = self.store.clear_automatic_resume_suppression(run_id)
         await self._publish_agent_change(record.agent_id)
         await self._publish(

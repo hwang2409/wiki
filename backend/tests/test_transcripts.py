@@ -228,6 +228,7 @@ class TranscriptSurfaceTests(unittest.TestCase):
 
         questions = [event for event in result["events"] if event["kind"] == "question"]
         self.assertEqual(len(questions), 2)
+        self.assertEqual(questions[0]["question"]["tool_use_id"], "toolu_question")
         self.assertEqual(questions[0]["question"]["answered_option"], 1)
         self.assertIsNone(questions[0]["question"]["custom_reply"])
         self.assertIsNone(questions[1]["question"]["answered_option"])
@@ -257,6 +258,86 @@ class TranscriptSurfaceTests(unittest.TestCase):
         tool = next(event for event in result["events"] if event["kind"] == "tool")
         self.assertEqual(tool["tool"]["output"], "done\nexited with code 0")
         self.assertTrue(tool["tool"]["ok"])
+
+    def test_structured_question_answers_use_tool_use_result_map(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "structured-answers.jsonl"
+            path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "assistant",
+                                "timestamp": "2026-07-10T17:31:04.506Z",
+                                "message": {
+                                    "role": "assistant",
+                                    "content": [
+                                        {
+                                            "type": "tool_use",
+                                            "id": "toolu_question",
+                                            "name": "AskUserQuestion",
+                                            "input": {
+                                                "questions": [
+                                                    {
+                                                        "question": "Which path should I take?",
+                                                        "header": "Path choice",
+                                                        "multiSelect": False,
+                                                        "options": [
+                                                            {"label": "Path A"},
+                                                            {"label": "Path B"},
+                                                            {"label": "Path C"},
+                                                        ],
+                                                    }
+                                                ]
+                                            },
+                                        }
+                                    ],
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "user",
+                                "timestamp": "2026-07-10T17:31:16.659Z",
+                                "message": {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "tool_result",
+                                            "tool_use_id": "toolu_question",
+                                            "content": "Your questions have been answered: . You can now continue with these answers in mind.",
+                                        }
+                                    ],
+                                },
+                                "toolUseResult": {
+                                    "questions": [
+                                        {
+                                            "question": "Which path should I take?",
+                                            "header": "Path choice",
+                                            "multiSelect": False,
+                                            "options": [
+                                                {"label": "Path A"},
+                                                {"label": "Path B"},
+                                                {"label": "Path C"},
+                                            ],
+                                        }
+                                    ],
+                                    "answers": {
+                                        "Which path should I take?": "Path B",
+                                    },
+                                },
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            result = transcripts.read_session_events("claude", path)
+
+        question = next(event for event in result["events"] if event["kind"] == "question")
+        self.assertEqual(question["question"]["answered_option"], 1)
+        self.assertIsNone(question["question"]["custom_reply"])
 
 
 if __name__ == "__main__":

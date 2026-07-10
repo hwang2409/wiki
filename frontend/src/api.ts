@@ -234,6 +234,7 @@ export type SessionTask = {
 export type SessionPr = { number: number; url: string };
 
 export type SessionQuestion = {
+  tool_use_id: string;
   prompt: string;
   header?: string | null;
   options: string[];

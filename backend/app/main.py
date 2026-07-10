@@ -788,6 +788,8 @@ def clean_pane_log(path: Path, lines: int = 500) -> str:
 
 
 _session_paths: dict[str, tuple[str, Path]] = {}  # ticket → (fmt, path), successes only
+_session_question_overlays: dict[str, dict[str, Any]] = {}
+_RAW_OVERLAY_TAIL_BYTES = 256 * 1024
 
 
 def _direct_transcript_session(path: Path) -> tuple[str, Path] | None:
@@ -795,6 +797,249 @@ def _direct_transcript_session(path: Path) -> tuple[str, Path] | None:
         return None
     fmt = transcripts.detect_session_format(path) or "codex"
     return (fmt, path)
+
+
+def _tail_json_lines(path: Path, *, limit_bytes: int = _RAW_OVERLAY_TAIL_BYTES) -> list[dict[str, Any]]:
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            offset = max(0, size - limit_bytes)
+            handle.seek(offset)
+            chunk = handle.read()
+    except OSError:
+        return []
+    if offset > 0:
+        first_newline = chunk.find(b"\n")
+        if first_newline < 0:
+            return []
+        chunk = chunk[first_newline + 1 :]
+    rows: list[dict[str, Any]] = []
+    for line in chunk.splitlines():
+        if not line.strip():
+            continue
+        try:
+            parsed = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(parsed, dict):
+            rows.append(parsed)
+    return rows
+
+
+def _payload_tool_result_ids(payload: dict[str, Any]) -> set[str]:
+    ids: set[str] = set()
+    message = payload.get("message")
+    if not isinstance(message, dict):
+        return ids
+    for block in message.get("content") or []:
+        if not isinstance(block, dict) or block.get("type") != "tool_result":
+            continue
+        tool_use_id = block.get("tool_use_id")
+        if isinstance(tool_use_id, str) and tool_use_id:
+            ids.add(tool_use_id)
+    return ids
+
+
+def _parse_pending_question_overlay(
+    raw_path: Path,
+    *,
+    seen_tool_use_ids: set[str],
+) -> list[dict[str, Any]]:
+    rows = _tail_json_lines(raw_path)
+    if not rows:
+        return []
+    open_indices: dict[int, str] = {}
+    pending: dict[str, dict[str, Any]] = {}
+    resolved_ids: set[str] = set()
+    for row in rows:
+        payload = row.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        resolved_ids.update(_payload_tool_result_ids(payload))
+        stream_event = payload.get("event") if payload.get("type") == "stream_event" else None
+        if not isinstance(stream_event, dict):
+            continue
+        event_type = stream_event.get("type")
+        if event_type == "content_block_start":
+            block = stream_event.get("content_block")
+            index = stream_event.get("index")
+            if not isinstance(block, dict) or not isinstance(index, int):
+                continue
+            if block.get("type") != "tool_use" or block.get("name") != "AskUserQuestion":
+                continue
+            tool_use_id = block.get("id") or block.get("tool_use_id")
+            if not isinstance(tool_use_id, str) or not tool_use_id:
+                continue
+            open_indices[index] = tool_use_id
+            entry: dict[str, Any] = {
+                "tool_use_id": tool_use_id,
+                "seq": int(row.get("seq") or 0),
+                "ts": payload.get("timestamp") or row.get("received_at"),
+                "partial_json": "",
+                "questions": [],
+            }
+            raw_input = block.get("input")
+            if isinstance(raw_input, dict) and isinstance(raw_input.get("questions"), list):
+                entry["questions"] = raw_input["questions"]
+            pending[tool_use_id] = entry
+            continue
+        if event_type == "content_block_delta":
+            index = stream_event.get("index")
+            tool_use_id = open_indices.get(index) if isinstance(index, int) else None
+            if tool_use_id is None:
+                continue
+            delta = stream_event.get("delta")
+            if not isinstance(delta, dict) or delta.get("type") != "input_json_delta":
+                continue
+            entry = pending.get(tool_use_id)
+            if entry is None:
+                continue
+            entry["partial_json"] += str(delta.get("partial_json") or "")
+            try:
+                parsed = json.loads(entry["partial_json"])
+            except ValueError:
+                continue
+            questions = parsed.get("questions") if isinstance(parsed, dict) else None
+            if isinstance(questions, list):
+                entry["questions"] = questions
+            continue
+        if event_type == "content_block_stop":
+            index = stream_event.get("index")
+            if isinstance(index, int):
+                open_indices.pop(index, None)
+    events: list[dict[str, Any]] = []
+    for entry in sorted(pending.values(), key=lambda item: (int(item["seq"]), str(item["tool_use_id"]))):
+        tool_use_id = entry["tool_use_id"]
+        if tool_use_id in seen_tool_use_ids or tool_use_id in resolved_ids:
+            continue
+        questions = entry.get("questions")
+        if not isinstance(questions, list) or not questions:
+            continue
+        events.extend(transcripts.build_question_events(entry.get("ts"), questions, tool_use_id))
+    return events
+
+
+def _overlay_signature(events: list[dict[str, Any]]) -> tuple[Any, ...]:
+    return tuple(
+        (
+            event.get("tool_use_id"),
+            event.get("ts"),
+            event.get("text"),
+            (event.get("question") or {}).get("header"),
+            tuple((event.get("question") or {}).get("options") or []),
+        )
+        for event in events
+    )
+
+
+def _assign_overlay_ids(events: list[dict[str, Any]], start_id: int) -> list[dict[str, Any]]:
+    assigned: list[dict[str, Any]] = []
+    next_id = start_id
+    for event in events:
+        assigned_event = dict(event)
+        assigned_event["question"] = dict(event.get("question") or {})
+        assigned_event["id"] = next_id
+        next_id += 1
+        assigned.append(assigned_event)
+    return assigned
+
+
+def _copy_overlay_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    copied: list[dict[str, Any]] = []
+    for event in events:
+        copied_event = dict(event)
+        copied_event["question"] = dict(event.get("question") or {})
+        copied.append(copied_event)
+    return copied
+
+
+def _overlay_pending_questions(
+    delta: dict[str, Any],
+    *,
+    fmt: str,
+    transcript_path: Path,
+    raw_path: Path | None,
+    client_cursor: int,
+) -> dict[str, Any]:
+    if fmt != "claude" or raw_path is None or not raw_path.is_file():
+        return delta
+    current = transcripts.read_session_events(fmt, transcript_path)
+    existing_tool_use_ids = {
+        question_tool_use_id
+        for event in current["events"]
+        if event.get("kind") == "question"
+        for question_tool_use_id in [
+            (event.get("question") or {}).get("tool_use_id") or event.get("tool_use_id")
+        ]
+        if isinstance(question_tool_use_id, str)
+    }
+    overlay_events = _parse_pending_question_overlay(
+        raw_path,
+        seen_tool_use_ids=existing_tool_use_ids,
+    )
+    cache_key = f"{transcript_path}::{raw_path}"
+    cached = _session_question_overlays.get(cache_key)
+    transcript_cursor = int(current.get("cursor", delta.get("cursor", 0)))
+    signature = _overlay_signature(overlay_events)
+
+    if not overlay_events and cached is None:
+        return delta
+
+    if (
+        cached is not None
+        and signature == cached.get("signature")
+        and transcript_cursor == int(cached.get("transcript_cursor", -1))
+    ):
+        combined_cursor = int(cached["cursor"])
+        assigned_overlay = _copy_overlay_events(cached.get("events") or [])
+    else:
+        prior_cursor = int(cached.get("cursor", transcript_cursor)) if cached is not None else transcript_cursor
+        combined_cursor = max(transcript_cursor, prior_cursor) + 1
+        max_existing_id = max(
+            (int(event.get("id", -1)) for event in current["events"]),
+            default=-1,
+        )
+        assigned_overlay = _assign_overlay_ids(overlay_events, max_existing_id + 1)
+        _session_question_overlays[cache_key] = {
+            "signature": signature,
+            "events": _copy_overlay_events(assigned_overlay),
+            "transcript_cursor": transcript_cursor,
+            "cursor": combined_cursor,
+        }
+
+    if (
+        cached is not None
+        and not assigned_overlay
+        and client_cursor >= combined_cursor
+        and transcript_cursor >= combined_cursor
+    ):
+        _session_question_overlays.pop(cache_key, None)
+        return delta
+
+    total = int(current["base"]) + len(current["events"]) + len(assigned_overlay)
+    if client_cursor == combined_cursor:
+        return {
+            **delta,
+            "base": int(current["base"]),
+            "cursor": combined_cursor,
+            "tail_from": total,
+            "events": [],
+            "patches": [],
+        }
+
+    return {
+        "events": [*current["events"], *assigned_overlay],
+        "base": int(current["base"]),
+        "tokens": current.get("tokens"),
+        "tasks": current.get("tasks") or [],
+        "pr": current.get("pr"),
+        "session_meta": current.get("session_meta") or {},
+        "dispositions": current.get("dispositions") or {"rendered": 0, "summarized": 0, "ignored": 0, "unknown": 0},
+        "cursor": combined_cursor,
+        "tail_from": int(current["base"]),
+        "patches": [],
+    }
 
 
 def _provider_events(
@@ -856,9 +1101,24 @@ def _session_delta_payload(
     ticket: str | None = None,
     include_subagents: bool = False,
     include_queue: bool = False,
+    headless_current: dict[str, Any] | None = None,
 ) -> dict[str, object]:
     effective_cursor = 0 if client_path is not None and client_path != str(path) else cursor
     result = transcripts.read_session_delta(fmt, path, effective_cursor)
+    raw_path: Path | None = None
+    if (
+        isinstance(headless_current, dict)
+        and _is_headless(headless_current)
+        and isinstance(headless_current.get("log"), str)
+    ):
+        raw_path = Path(headless_current["log"])
+        result = _overlay_pending_questions(
+            result,
+            fmt=fmt,
+            transcript_path=path,
+            raw_path=raw_path,
+            client_cursor=effective_cursor,
+        )
     events = result["events"]
     if fmt == "claude":
         transcripts.annotate_agent_events(path, events)
@@ -916,6 +1176,7 @@ def agent_session(
                 ticket=ticket,
                 include_subagents=fmt == "claude",
                 include_queue=True,
+                headless_current=orch if isinstance(orch, dict) else None,
             )
         raise HTTPException(status_code=404, detail="Orchestrator transcript missing")
 
@@ -1006,6 +1267,7 @@ def agent_session(
         ticket=ticket,
         include_subagents=fmt == "claude",
         include_queue=True,
+        headless_current=current if isinstance(current, dict) and _is_headless(current) else None,
     )
 
 

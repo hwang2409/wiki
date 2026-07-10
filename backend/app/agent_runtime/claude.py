@@ -42,11 +42,66 @@ class _ServerControl:
     raw_id: str
     generation: int
     subtype: str
+    tool_use_id: str | None = None
+    input_payload: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
 class _StreamEnd:
     generation: int
+
+
+def _message_tool_result_ids(value: dict[str, Any]) -> set[str]:
+    ids: set[str] = set()
+    message = value.get("message")
+    if not isinstance(message, dict):
+        return ids
+    for block in message.get("content") or []:
+        if not isinstance(block, dict) or block.get("type") != "tool_result":
+            continue
+        tool_use_id = block.get("tool_use_id")
+        if isinstance(tool_use_id, str) and tool_use_id:
+            ids.add(tool_use_id)
+    return ids
+
+
+def _ask_user_question_answers(response: dict[str, Any]) -> dict[str, str] | None:
+    answers = response.get("answers")
+    if isinstance(answers, dict) and answers:
+        normalized: dict[str, str] = {}
+        for prompt, answer in answers.items():
+            if not isinstance(prompt, str) or not prompt.strip():
+                return None
+            if not isinstance(answer, str) or not answer.strip():
+                return None
+            normalized[prompt.strip()] = answer.strip()
+        return normalized or None
+    if not isinstance(answers, list) or not answers:
+        return None
+    normalized = {}
+    for item in answers:
+        if not isinstance(item, dict):
+            return None
+        prompt = item.get("prompt") or item.get("question")
+        answer = item.get("answer")
+        if not isinstance(prompt, str) or not prompt.strip():
+            return None
+        if not isinstance(answer, str) or not answer.strip():
+            return None
+        normalized[prompt.strip()] = answer.strip()
+    return normalized or None
+
+
+def _ask_user_question_allow_response(
+    input_payload: dict[str, Any] | None,
+    answers: dict[str, str],
+) -> dict[str, Any]:
+    updated_input = dict(input_payload or {})
+    updated_input["answers"] = dict(answers)
+    return {
+        "behavior": "allow",
+        "updatedInput": updated_input,
+    }
 
 
 class ClaudeStreamAdapter(ProviderAdapter):
@@ -83,6 +138,7 @@ class ClaudeStreamAdapter(ProviderAdapter):
         self._events: asyncio.Queue[ProviderEvent | _StreamEnd] = asyncio.Queue()
         self._pending: dict[str, _PendingControl] = {}
         self._server_request_ids: dict[str, _ServerControl] = {}
+        self._pending_question_ids: set[str] = set()
         self._session_generations: dict[str, int] = {}
         self._suppress_stream_end: set[int] = set()
         self._request_id = 0
@@ -245,20 +301,23 @@ class ClaudeStreamAdapter(ProviderAdapter):
             self._pending.pop(request_id, None)
 
     async def _send_user(self, text: str) -> None:
+        await self._send_user_message([{"type": "text", "text": text}])
+        self._state = LifecycleState.WORKING
+        self._detail = None
+
+    async def _send_user_message(self, content: list[dict[str, Any]]) -> None:
         await self._send_json(
             {
                 "type": "user",
                 "session_id": "",
                 "message": {
                     "role": "user",
-                    "content": [{"type": "text", "text": text}],
+                    "content": content,
                 },
                 "parent_tool_use_id": None,
             },
             generation=self._generation,
         )
-        self._state = LifecycleState.WORKING
-        self._detail = None
 
     def _message_generation(self, value: dict[str, Any], fallback: int) -> int:
         session_id = value.get("session_id")
@@ -287,6 +346,19 @@ class ClaudeStreamAdapter(ProviderAdapter):
         if isinstance(session_id, str) and session_id:
             self._session_id = session_id
             self._session_generations[session_id] = self._generation
+        self._pending_question_ids.difference_update(_message_tool_result_ids(value))
+        if event_type == "stream_event":
+            event = value.get("event")
+            if isinstance(event, dict) and event.get("type") == "content_block_start":
+                block = event.get("content_block")
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "tool_use"
+                    and block.get("name") == "AskUserQuestion"
+                ):
+                    tool_use_id = block.get("id") or block.get("tool_use_id")
+                    if isinstance(tool_use_id, str) and tool_use_id:
+                        self._pending_question_ids.add(tool_use_id)
         if event_type == "control_request":
             request_id = value.get("request_id")
             request = value.get("request") or {}
@@ -294,10 +366,16 @@ class ClaudeStreamAdapter(ProviderAdapter):
                 request_subtype = (
                     str(request.get("subtype")) if isinstance(request, dict) else ""
                 )
+                tool_use_id = (
+                    request.get("tool_use_id") if isinstance(request, dict) else None
+                )
+                input_payload = request.get("input") if isinstance(request, dict) else None
                 self._server_request_ids[request_id] = _ServerControl(
                     request_id,
                     generation,
                     request_subtype,
+                    tool_use_id if isinstance(tool_use_id, str) else None,
+                    dict(input_payload) if isinstance(input_payload, dict) else None,
                 )
             if isinstance(request, dict) and request.get("subtype") == "can_use_tool":
                 self._state = LifecycleState.WAITING_APPROVAL
@@ -662,7 +740,62 @@ class ClaudeStreamAdapter(ProviderAdapter):
                 f"unknown, canceled, or stale Claude server request id: {request_id!r}"
             )
         pending = self._server_request_ids.pop(request_id, None)
-        if pending is None or pending.generation != self._generation:
+        if pending is None:
+            if request_id not in self._pending_question_ids:
+                raise ProviderProtocolError(
+                    f"unknown, canceled, or stale Claude server request id: {request_id!r}"
+                )
+            matching_control_id = next(
+                (
+                    control_id
+                    for control_id, control in self._server_request_ids.items()
+                    if control.tool_use_id == request_id
+                    and control.subtype == "can_use_tool"
+                    and control.generation == self._generation
+                ),
+                None,
+            )
+            matching_control = (
+                self._server_request_ids.pop(matching_control_id, None)
+                if matching_control_id is not None
+                else None
+            )
+            answers = _ask_user_question_answers(response)
+            if answers is None:
+                if matching_control is not None and matching_control_id is not None:
+                    self._server_request_ids[matching_control_id] = matching_control
+                raise ProviderProtocolError(
+                    "Claude AskUserQuestion responses require a non-empty answers map"
+                )
+            if matching_control is None or matching_control_id is None:
+                raise ProviderProtocolError(
+                    f"unknown, canceled, or stale Claude server request id: {request_id!r}"
+                )
+            try:
+                await self._send_json(
+                    {
+                        "type": "control_response",
+                        "response": {
+                            "subtype": "success",
+                            "request_id": matching_control.raw_id,
+                            "response": _ask_user_question_allow_response(
+                                matching_control.input_payload,
+                                answers,
+                            ),
+                        },
+                    },
+                    generation=self._generation,
+                )
+            except Exception:
+                if matching_control is not None and matching_control_id is not None:
+                    self._server_request_ids[matching_control_id] = matching_control
+                raise
+            self._pending_question_ids.discard(request_id)
+            self._state = LifecycleState.WORKING
+            self._detail = None
+            return self._status()
+        if pending.generation != self._generation:
+            self._server_request_ids[request_id] = pending
             raise ProviderProtocolError(
                 f"unknown, canceled, or stale Claude server request id: {request_id!r}"
             )
@@ -696,3 +829,4 @@ class ClaudeStreamAdapter(ProviderAdapter):
         if self._reader_task is not None:
             await asyncio.gather(self._reader_task, return_exceptions=True)
         self._server_request_ids.clear()
+        self._pending_question_ids.clear()
