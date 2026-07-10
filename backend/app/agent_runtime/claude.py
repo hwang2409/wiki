@@ -123,8 +123,14 @@ class ClaudeStreamAdapter(ProviderAdapter):
             "stdio",
             "--include-partial-messages",
             "--include-hook-events",
+            # Parity with the codex adapter's approvalPolicy "never" +
+            # danger-full-access: unattended workers, same trust model as the
+            # legacy tmux flow's --dangerously-skip-permissions. The stdio
+            # permission-prompt-tool stays wired so anything that still asks
+            # (e.g. a policy-forced prompt) surfaces in the app instead of
+            # killing the run.
             "--permission-mode",
-            "default",
+            "bypassPermissions",
             "--model",
             self.model,
         ]
