@@ -3,7 +3,7 @@ import type { MouseEvent, ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
-import rehypeHighlight from "rehype-highlight";
+import { MarkdownPre } from "./shiki";
 import {
   AlertTriangle,
   Bug,
@@ -444,7 +444,8 @@ function createComponents(
 
   return {
     a: MarkdownLink,
-    blockquote: MarkdownBlockquote
+    blockquote: MarkdownBlockquote,
+    pre: MarkdownPre
   };
 }
 
@@ -469,7 +470,6 @@ export function ObsidianMarkdown({
   return (
     <ReactMarkdown
       components={components}
-      rehypePlugins={[[rehypeHighlight, { detect: false }]]}
       remarkPlugins={[remarkGfm, remarkObsidianInline, remarkBreaks]}
     >
       {prepared}

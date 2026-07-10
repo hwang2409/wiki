@@ -2417,6 +2417,57 @@ body.is-resizing-panes .pane-cell {
   overflow-wrap: normal;
 }
 
+.shiki-block {
+  margin: 0 0 1em;
+}
+
+.shiki-block:last-child {
+  margin-bottom: 0;
+}
+
+.shiki-block > pre.shiki,
+.shiki-block > pre {
+  overflow-x: auto;
+  margin: 0;
+  padding: 12px 16px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  font-size: 0.875em;
+  line-height: 1.5;
+}
+
+.shiki-block > pre > code {
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  font-size: inherit;
+  white-space: pre;
+  overflow-wrap: normal;
+}
+
+.shiki-block.is-transparent {
+  margin: 0;
+}
+
+.shiki-block.is-transparent > pre,
+.shiki-block.is-transparent > pre.shiki {
+  margin: 0;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent !important;
+  font-size: inherit;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+}
+
+.shiki-block.is-transparent > pre > code {
+  font-size: inherit;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+}
+
 /* Blockquote */
 
 .markdown-preview-view blockquote {
@@ -4598,6 +4649,17 @@ body.is-resizing-panes .pane-cell {
   overflow-wrap: break-word;
 }
 
+.session-bash-command-code {
+  flex: 1;
+  min-width: 0;
+}
+
+.session-bash-command-code > pre,
+.session-bash-command-code > pre.shiki {
+  font-family: inherit;
+  font-size: inherit;
+}
+
 .session-bash-collapsible {
   margin-top: 4px;
 }
@@ -4731,73 +4793,13 @@ body.is-resizing-panes .pane-cell {
   white-space: nowrap;
 }
 
-/* Syntax highlighting (highlight.js, Obsidian-ish dark palette)       */
+/* Syntax highlighting: Shiki inline styles color the tokens.         */
+/* Fallback color for plain (unhighlighted) code fences below.        */
 /* ------------------------------------------------------------------ */
 
-.markdown-preview-view pre code {
+.markdown-preview-view pre code,
+.shiki-block > pre > code {
   color: var(--syntax-text);
-}
-
-.hljs-comment,
-.hljs-quote {
-  color: var(--syntax-comment);
-  font-style: italic;
-}
-
-.hljs-keyword,
-.hljs-selector-tag,
-.hljs-tag,
-.hljs-deletion,
-.hljs-section {
-  color: var(--syntax-keyword);
-  font-weight: 600;
-}
-
-.hljs-title,
-.hljs-title.function_ {
-  color: var(--syntax-function);
-  font-weight: 600;
-}
-
-.hljs-string,
-.hljs-regexp,
-.hljs-addition,
-.hljs-link,
-.hljs-symbol,
-.hljs-bullet,
-.hljs-meta .hljs-string {
-  color: var(--syntax-string);
-}
-
-.hljs-attribute,
-.hljs-number,
-.hljs-literal,
-.hljs-selector-id,
-.hljs-selector-class,
-.hljs-selector-attr,
-.hljs-selector-pseudo,
-.hljs-meta {
-  color: var(--syntax-number);
-}
-
-.hljs-variable,
-.hljs-template-variable {
-  color: var(--syntax-variable);
-}
-
-.hljs-title.class_,
-.hljs-type,
-.hljs-built_in {
-  color: var(--syntax-type);
-  font-style: italic;
-}
-
-.hljs-emphasis {
-  font-style: italic;
-}
-
-.hljs-strong {
-  font-weight: 600;
 }
 
 /* ------------------------------------------------------------------ */
