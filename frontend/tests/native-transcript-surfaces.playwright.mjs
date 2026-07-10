@@ -95,10 +95,11 @@ async function main() {
     await openTicket(page, backend.baseUrl, "WIKI-33");
     logStep("asserting Codex session surfaces");
     await expectVisibleText(page, ".session-dispositions-value", "Unknown 1");
+    await expectVisibleText(page, ".session-thinking-chip", "encrypted");
+    await expectVisibleText(page, ".session-thinking", "working through the rendering gap checklist");
     const codexActivityToggle = page.locator(".session-activity-head").first();
     await codexActivityToggle.waitFor({ state: "visible" });
     await codexActivityToggle.click();
-    await expectVisibleText(page, ".session-thinking-chip", "encrypted");
     await expectVisibleText(page, ".session-marker", "subagent started");
     logStep("capturing Codex screenshot");
     await page.screenshot({ path: path.join(OUT_DIR, "codex-native-surfaces.png"), fullPage: true });
