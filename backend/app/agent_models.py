@@ -57,8 +57,8 @@ MODEL_OPTIONS: tuple[AgentModelOption, ...] = (
         supports_reasoning_effort=True,
     ),
     AgentModelOption(
-        id="opus-4.8",
-        label="Opus 4.8",
+        id="opus-4.7",
+        label="Opus 4.7",
         kind="cc",
         provider="claude",
         supports_reasoning_effort=False,
@@ -79,6 +79,27 @@ MODEL_OPTIONS: tuple[AgentModelOption, ...] = (
         supports_reasoning_effort=False,
         default_worker=True,
     ),
+    AgentModelOption(
+        id="sonnet-4.6",
+        label="Sonnet 4.6",
+        kind="cc",
+        provider="claude",
+        supports_reasoning_effort=False,
+    ),
+    AgentModelOption(
+        id="haiku",
+        label="Haiku",
+        kind="cc",
+        provider="claude",
+        supports_reasoning_effort=False,
+    ),
+    AgentModelOption(
+        id="haiku-4.5",
+        label="Haiku 4.5",
+        kind="cc",
+        provider="claude",
+        supports_reasoning_effort=False,
+    ),
 )
 
 
@@ -86,8 +107,8 @@ def list_model_options() -> list[dict[str, object]]:
     return [asdict(option) for option in MODEL_OPTIONS]
 
 
-def model_ids_for_kind(kind: str) -> set[str]:
-    return {option.id for option in MODEL_OPTIONS if option.kind == kind}
+def model_ids_for_kind(kind: str) -> tuple[str, ...]:
+    return tuple(option.id for option in MODEL_OPTIONS if option.kind == kind)
 
 
 def is_model_allowed(kind: str, model: str) -> bool:

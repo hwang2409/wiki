@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from . import accounts, github_pr, terminal, tokens, transcripts, uistate, vaultops
-from .agent_models import is_model_allowed, list_model_options
+from .agent_models import is_model_allowed, list_model_options, model_ids_for_kind
 from .agent_runtime.client import (
     SupervisorClient,
     SupervisorRemoteError,
@@ -1627,10 +1627,7 @@ class SpawnWorkerIn(BaseModel):
     @model_validator(mode="after")
     def validate_model_and_effort(self) -> SpawnWorkerIn:
         kind = self.kind.strip()
-        model = self.model.strip()
         effort = (self.effort or "").strip() or None
-        if kind in {"cc", "cdx"} and not is_model_allowed(kind, model):
-            raise ValueError(f"Model {model!r} is not allowed for worker kind {kind}")
         if kind == "cdx" and effort not in REASONING_EFFORTS:
             raise ValueError("Reasoning effort is required for Codex workers")
         if kind == "cc" and effort is not None:
@@ -1644,12 +1641,23 @@ class SpawnOrchestratorIn(BaseModel):
     model: str = Field(..., min_length=2, max_length=32)
     goal: str = Field(default="", max_length=20_000)
 
-    @model_validator(mode="after")
-    def validate_model(self) -> SpawnOrchestratorIn:
-        model = self.model.strip()
-        if not is_model_allowed("cc", model):
-            raise ValueError(f"Model {model!r} is not allowed for orchestrators")
-        return self
+
+def _allowed_model_message(kind: str, model: str, *, target: str) -> str:
+    provider = {"cdx": "Codex", "cc": "Claude"}.get(kind, kind)
+    allowed = ", ".join(model_ids_for_kind(kind))
+    return (
+        f"{target} model {model!r} is not allowed for {provider}. "
+        f"Allowed values: {allowed}"
+    )
+
+
+def _require_allowed_model(kind: str, model: str, *, target: str) -> None:
+    if is_model_allowed(kind, model):
+        return
+    raise HTTPException(
+        status_code=400,
+        detail=_allowed_model_message(kind, model, target=target),
+    )
 
 
 def _read_queue() -> dict[str, list[dict]]:
@@ -1945,6 +1953,7 @@ def spawn_agent(body: dict[str, Any] | SpawnWorkerIn) -> dict[str, object]:
         raise HTTPException(status_code=400, detail="Role must be plan, implement, or review")
 
     model = body.model.strip()
+    _require_allowed_model(kind, model, target="Worker")
     effort = (body.effort or "").strip() or None
 
     prompt = body.prompt
@@ -2022,6 +2031,7 @@ def spawn_orchestrator(body: dict[str, Any] | SpawnOrchestratorIn) -> dict[str, 
         )
 
     model = body.model.strip()
+    _require_allowed_model("cc", model, target="Orchestrator")
     goal = body.goal.strip()
     if len(goal.encode("utf-8")) >= MAX_ORCH_GOAL_BYTES:
         raise HTTPException(status_code=400, detail="Initial goal must stay under 20KB")
