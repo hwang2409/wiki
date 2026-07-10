@@ -118,6 +118,7 @@ class Supervisor:
             ),
         )
         self.last_reaper_at = 0.0
+        self.detached_at_monotonic: dict[str, float] = {}
         self.adapters: dict[str, ProviderAdapter] = {}
         self.event_tasks: dict[str, asyncio.Task[None]] = {}
         self.event_routes: dict[tuple[int, int], str] = {}
@@ -233,28 +234,34 @@ class Supervisor:
     def _reaper_due(self) -> bool:
         return self._seconds_since(self.last_reaper_at) >= self.reaper_interval_seconds
 
-    @staticmethod
-    def _record_age_seconds(timestamp: str | None) -> float:
-        if not timestamp:
-            return 0.0
-        try:
-            parsed = datetime.fromisoformat(timestamp)
-        except ValueError:
-            return 0.0
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return max((datetime.now(timezone.utc) - parsed).total_seconds(), 0.0)
+    def _mark_adapter_loss(self, run_id: str) -> None:
+        self.detached_at_monotonic.setdefault(run_id, time.monotonic())
+
+    def _clear_adapter_loss(self, run_id: str) -> None:
+        self.detached_at_monotonic.pop(run_id, None)
 
     def _reapable_adapter_loss(self, record: RunRecord) -> bool:
         if record.state in TERMINAL_STATES:
+            self._clear_adapter_loss(record.run_id)
             return False
         if record.run_id in self.adapters:
+            self._clear_adapter_loss(record.run_id)
             return False
         if record.provider_pid is not None:
+            self._clear_adapter_loss(record.run_id)
             return False
         if record.quiesce_operation_id is not None:
+            self._clear_adapter_loss(record.run_id)
             return False
-        return self._record_age_seconds(record.updated_at) >= self.reaper_grace_seconds
+        detached_at = self.detached_at_monotonic.get(record.run_id)
+        if detached_at is None:
+            # Monotonic timestamps do not survive process restart. If the
+            # daemon boots with a persisted adapterless no-PID run, start a
+            # fresh grace window rather than reaping immediately from wall
+            # clock metadata unrelated to detach time.
+            self._mark_adapter_loss(record.run_id)
+            return False
+        return self._seconds_since(detached_at) >= self.reaper_grace_seconds
 
     async def _pump_events(self, run_id: str, adapter: ProviderAdapter) -> None:
         stream_key = id(adapter)
@@ -313,6 +320,8 @@ class Supervisor:
             except Exception:
                 record = None
             self._remove_adapter_mapping(run_id, adapter)
+            if record is not None and record.provider_pid is None:
+                self._mark_adapter_loss(run_id)
             if record is not None:
                 await self._publish_agent_change(record.agent_id)
 
@@ -338,6 +347,8 @@ class Supervisor:
             except (RunNotFound, ValueError):
                 record = None
             self._remove_adapter_mapping(run_id, adapter)
+            if record is not None and record.provider_pid is None:
+                self._mark_adapter_loss(run_id)
             if record is not None:
                 await self._publish_agent_change(record.agent_id)
 
@@ -699,6 +710,7 @@ class Supervisor:
             raise StoreConflict(
                 f"run already has an attached provider adapter: {run_id}"
             )
+        self._clear_adapter_loss(run_id)
         old_task = self.event_tasks.pop(run_id, None)
         if old_task is not None:
             old_task.cancel()
@@ -711,6 +723,7 @@ class Supervisor:
     async def _detach_adapter(
         self, run_id: str, *, preserve_event_routes: bool = False
     ) -> None:
+        self._clear_adapter_loss(run_id)
         adapter = self.adapters.pop(run_id, None)
         task = self.event_tasks.pop(run_id, None)
         if task is not None:
@@ -933,7 +946,7 @@ class Supervisor:
         self.last_reaper_at = time.monotonic()
         results: list[dict[str, str]] = []
         for snapshot in self.store.list_runs():
-            async with self._agent_lock(snapshot.agent_id):
+            async with self._run_lock(snapshot.run_id):
                 try:
                     record = self.store.get(snapshot.run_id)
                 except RunNotFound:
@@ -945,6 +958,7 @@ class Supervisor:
                     LifecycleState.COMPLETED,
                     reason="adapter_lost",
                 )
+                self._clear_adapter_loss(record.run_id)
                 await self._publish_agent_change(record.agent_id)
                 results.append(
                     {
@@ -2091,4 +2105,5 @@ class Supervisor:
         self.auth_dead_recoveries.clear()
         self.last_limit_alert_at.clear()
         self.last_no_eligible_alert = 0.0
+        self.detached_at_monotonic.clear()
         self.adapters.clear()

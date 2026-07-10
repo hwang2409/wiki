@@ -758,6 +758,46 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reaped.state, LifecycleState.COMPLETED)
         self.assertEqual(reaped.state_reason, "adapter_lost")
 
+    async def test_archive_succeeds_after_reaper_completes_run(self) -> None:
+        await self.supervisor.close()
+        record = RunRecord.new(
+            agent_id="WIKI-REAPER-ARCHIVE",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            worktree=str(self.worktree),
+            prompt="fixture",
+        )
+        record.state = LifecycleState.WORKING
+        self.store.create(record)
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "WIKI_REAPER_INTERVAL_SECONDS": "0",
+                "WIKI_REAPER_GRACE_SECONDS": "0.01",
+            },
+        ):
+            self.supervisor = Supervisor(
+                self.store,
+                FixtureAdapterFactory(FIXTURES, pid=os.getpid()),
+                pid_alive=lambda _pid: False,
+            )
+            await self.supervisor.recover_on_start()
+            await asyncio.sleep(0.02)
+            await self.supervisor.recover_on_start()
+
+        archived = await self.supervisor.archive(record.run_id)
+
+        self.assertEqual(archived.state, LifecycleState.COMPLETED)
+        self.assertFalse(self.store.run_dir(record.run_id).exists())
+        self.assertFalse(
+            (self.paths.registry_path.exists())
+            and json.loads(self.paths.registry_path.read_text()).get(
+                "WIKI-REAPER-ARCHIVE"
+            )
+        )
+
     async def test_reaper_skips_active_quiesce_runs(self) -> None:
         await self.supervisor.close()
         record = RunRecord.new(
