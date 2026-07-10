@@ -42,7 +42,8 @@ import {
 import type { LucideIcon } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { MarkdownPre, ShikiCode } from "./shiki";
+import { MarkdownPre } from "./markdown";
+import { ShikiCode } from "./shiki";
 import {
   cancelQueuedMessage,
   getSkills,

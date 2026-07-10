@@ -1,5 +1,4 @@
-import { Children, isValidElement, useEffect, useState } from "react";
-import type { ReactNode } from "react";
+import { useEffect, useState } from "react";
 import type { BundledLanguage, BundledTheme, Highlighter } from "shiki";
 import { createHighlighter } from "shiki";
 import { DEFAULT_THEME, normalizeTheme, type ThemeId } from "./themes";
@@ -177,45 +176,11 @@ export function ShikiCode({
     );
   }
   return (
-    <pre className={wrapperClass} data-lang={normalized ?? undefined}>
-      <code>{code}</code>
-    </pre>
-  );
-}
-
-function textFromReactNode(node: ReactNode): string {
-  if (typeof node === "string" || typeof node === "number") return String(node);
-  if (Array.isArray(node)) return node.map(textFromReactNode).join("");
-  if (isValidElement<{ children?: ReactNode }>(node)) {
-    return textFromReactNode(node.props.children);
-  }
-  return "";
-}
-
-export function MarkdownPre({
-  children,
-  className: preClassName,
-  ...rest
-}: {
-  children?: ReactNode;
-  className?: string;
-} & React.HTMLAttributes<HTMLPreElement>) {
-  const items = Children.toArray(children);
-  const child = items.length === 1 ? items[0] : null;
-  if (
-    child &&
-    isValidElement<{ className?: string; children?: ReactNode }>(child) &&
-    child.type === "code"
-  ) {
-    const langMatch = /language-([\w-]+)/.exec(child.props.className ?? "");
-    const lang = langMatch?.[1] ?? null;
-    const code = textFromReactNode(child.props.children).replace(/\n$/, "");
-    return <ShikiCode className="markdown-code-block" code={code} lang={lang} />;
-  }
-  return (
-    <pre className={preClassName} {...rest}>
-      {children}
-    </pre>
+    <div className={wrapperClass} data-lang={normalized ?? undefined}>
+      <pre>
+        <code>{code}</code>
+      </pre>
+    </div>
   );
 }
 
