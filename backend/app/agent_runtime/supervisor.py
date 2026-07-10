@@ -505,18 +505,23 @@ class Supervisor:
             raise StoreConflict(
                 f"state {recovery_state.value} is not eligible for exact-session resume"
             )
-        if not record.provider_session_id:
+        session_id = record.provider_session_id
+        if not session_id:
             raise StoreConflict("run has no provider session id")
         if self.pid_alive(record.provider_pid):
             raise StoreConflict(
                 "provider PID is live without attached control; refusing duplicate resume"
             )
         resolve_safe_worktree(record.worktree)
+        # Request ids belong to the old transport generation. A resumed
+        # provider must re-emit any still-actionable request before the UI can
+        # answer it through the new adapter.
+        record = self.store.clear_pending_requests(run_id)
 
         adapter = self.adapter_factory(record)
         self._attach_adapter(record.run_id, adapter)
         try:
-            status = await adapter.resume(record.provider_session_id)
+            status = await adapter.resume(session_id)
         except Exception:
             await self._close_and_drain_adapter(record.run_id, adapter)
             raise
@@ -946,8 +951,14 @@ class Supervisor:
         status = await adapter.respond(request_id, response)
         if self.adapters.get(run_id) is not adapter:
             raise StoreConflict("provider adapter changed while sending response")
-        self.store.update_adapter_status(run_id, status)
-        return self.store.clear_automatic_resume_suppression(run_id)
+        record = self.store.update_adapter_status(run_id, status)
+        record = self.store.clear_pending_request(run_id, request_id)
+        record = self.store.clear_automatic_resume_suppression(run_id)
+        await self._publish_agent_change(record.agent_id)
+        await self._publish(
+            {"type": "session", "ticket": record.agent_id, "surface": "session"}
+        )
+        return record
 
     async def dispatch(self, method: str, params: dict[str, Any]) -> Any:
         if method == "ping":
@@ -1041,6 +1052,9 @@ class Supervisor:
                 "raw_count": record.raw_event_count,
                 "normalized_count": record.normalized_event_count,
                 "dispositions": dict(record.disposition_counts),
+                "pending_requests": [
+                    dict(request) for request in record.pending_requests.values()
+                ],
                 "events": self.store.read_normalized_events(
                     run_id,
                     after_seq=after_seq,

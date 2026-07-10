@@ -887,16 +887,22 @@ class CodexAppServerAdapter(ProviderAdapter):
         request_id: str | int,
         response: dict[str, Any],
     ) -> AdapterStatus:
-        pending = self._server_request_ids.pop(_request_key(request_id), None)
+        key = _request_key(request_id)
+        pending = self._server_request_ids.pop(key, None)
         if pending is None or pending.generation != self._generation:
             raise ProviderProtocolError(
                 f"unknown, resolved, or stale Codex server request id: {request_id!r}"
             )
         self._server_request_revision += 1
-        await self._send_json(
-            {"id": pending.raw_id, "result": response},
-            generation=pending.generation,
-        )
+        try:
+            await self._send_json(
+                {"id": pending.raw_id, "result": response},
+                generation=pending.generation,
+            )
+        except Exception:
+            self._server_request_ids[key] = pending
+            self._server_request_revision += 1
+            raise
         if (
             pending.method in _APPROVAL_METHODS
             and self._state is LifecycleState.WAITING_APPROVAL

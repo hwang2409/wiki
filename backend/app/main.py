@@ -1188,6 +1188,11 @@ class MessageIn(BaseModel):
     mode: str = Field(default="now", pattern="^(now|on-idle)$")
 
 
+class AgentRespondIn(BaseModel):
+    request_id: str | int
+    response: dict[str, Any]
+
+
 class SpawnWorkerIn(BaseModel):
     ticket: str = Field(..., min_length=1, max_length=80)
     kind: str = Field(..., min_length=2, max_length=8)
@@ -1267,6 +1272,7 @@ def _supervisor_request(method: str, params: dict | None = None) -> Any:
             "StoreConflict": 409,
             "ProviderBusy": 409,
             "ProviderProcessError": 409,
+            "ProviderProtocolError": 409,
         }.get(exc.error_type, 502)
         raise HTTPException(status_code=status_code, detail=str(exc)) from exc
 
@@ -1376,6 +1382,43 @@ def stop_agent(agent_id: str) -> dict[str, object]:
 @app.post("/api/agents/{agent_id}/archive")
 def archive_agent(agent_id: str) -> dict[str, object]:
     return _control_headless_agent(agent_id, "archive")
+
+
+@app.post("/api/agents/{agent_id}/respond")
+def respond_to_agent(agent_id: str, body: AgentRespondIn) -> dict[str, object]:
+    raw_id = agent_id.strip()
+    if not raw_id or not valid_agent_id(raw_id):
+        raise HTTPException(status_code=400, detail="Bad agent id")
+    if isinstance(body.request_id, bool):
+        raise HTTPException(status_code=400, detail="Bad provider request id")
+    if len(json.dumps(body.response).encode("utf-8")) > MAX_SPAWN_PROMPT_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail="Provider response must be smaller than 100KB",
+        )
+    resolved = _registry_agent(_read_agent_registry(), raw_id)
+    if resolved is None:
+        raise HTTPException(status_code=404, detail="No registered agent")
+    resolved_id, _, current = resolved
+    if not _is_headless(current):
+        raise HTTPException(
+            status_code=409,
+            detail="Legacy tmux agents cannot accept provider responses",
+        )
+    result = _supervisor_request(
+        "run/respond",
+        {
+            "agent_id": resolved_id,
+            "request_id": body.request_id,
+            "response": body.response,
+        },
+    )
+    if not isinstance(result, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="Agent supervisor returned a bad provider response",
+        )
+    return dict(result)
 
 
 @app.post("/api/agents/{agent_id}/replace")

@@ -160,6 +160,13 @@ class ProtocolFixtureTests(unittest.TestCase):
         self.assertEqual(auth.lifecycle_state, LifecycleState.BLOCKED)
         self.assertEqual(approval.kind, "approval")
         self.assertEqual(approval.lifecycle_state, LifecycleState.WAITING_APPROVAL)
+        response = normalize_provider_event(
+            ProviderKind.CODEX,
+            {"id": 0, "result": {"answers": {}}},
+            direction="client",
+        )
+        self.assertEqual(response.kind, "approval_response")
+        self.assertEqual(response.disposition, EventDisposition.IGNORED)
 
 
 class LifecycleTests(unittest.TestCase):
@@ -327,6 +334,112 @@ class RunStoreTests(unittest.TestCase):
                 [event["seq"] for event in store.read_raw_events(record.run_id, limit=2)],
                 [79, 80],
             )
+
+    def test_pending_provider_requests_are_durable_and_id_type_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(_paths(root))
+            record = store.create(_record(root))
+            numeric_payload = {
+                "id": 0,
+                "method": "item/tool/requestUserInput",
+                "params": {"questions": [{"id": "scope"}]},
+            }
+            string_payload = {
+                "id": "0",
+                "method": "item/commandExecution/requestApproval",
+                "params": {},
+            }
+            for payload in (numeric_payload, string_payload):
+                raw = store.append_raw(
+                    record.run_id,
+                    provider="codex",
+                    direction="server",
+                    payload=payload,
+                )
+                store.append_normalized(
+                    record.run_id,
+                    raw_seq=raw["seq"],
+                    disposition=EventDisposition.RENDERED,
+                    kind="approval",
+                    payload=payload,
+                    lifecycle_state=LifecycleState.WAITING_APPROVAL,
+                )
+
+            pending = store.get(record.run_id).pending_requests
+            self.assertEqual(set(pending), {"int:0", "str:0"})
+            self.assertIsInstance(pending["int:0"]["request_id"], int)
+            store.clear_pending_request(record.run_id, 0)
+            self.assertEqual(set(store.get(record.run_id).pending_requests), {"str:0"})
+
+            resolved_payload = {
+                "method": "serverRequest/resolved",
+                "params": {"requestId": "0"},
+            }
+            raw = store.append_raw(
+                record.run_id,
+                provider="codex",
+                direction="server",
+                payload=resolved_payload,
+            )
+            store.append_normalized(
+                record.run_id,
+                raw_seq=raw["seq"],
+                disposition=EventDisposition.RENDERED,
+                kind="approval_resolved",
+                payload=resolved_payload,
+            )
+            self.assertEqual(store.get(record.run_id).pending_requests, {})
+
+    def test_restart_rebuilds_pending_request_index_from_event_log(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            record = store.create(_record(root))
+            approval = {
+                "id": 0,
+                "method": "item/tool/requestUserInput",
+                "params": {"questions": []},
+            }
+            raw = store.append_raw(
+                record.run_id,
+                provider="codex",
+                direction="server",
+                payload=approval,
+            )
+            store.append_normalized(
+                record.run_id,
+                raw_seq=raw["seq"],
+                disposition=EventDisposition.RENDERED,
+                kind="approval",
+                payload=approval,
+                lifecycle_state=LifecycleState.WAITING_APPROVAL,
+            )
+            metadata = json.loads(store.run_path(record.run_id).read_text(encoding="utf-8"))
+            metadata["pending_requests"] = {}
+            store.run_path(record.run_id).write_text(
+                json.dumps(metadata),
+                encoding="utf-8",
+            )
+
+            restarted = RunStore(paths)
+            self.assertIn("int:0", restarted.get(record.run_id).pending_requests)
+            response = {"id": 0, "result": {"answers": {}}}
+            raw = restarted.append_raw(
+                record.run_id,
+                provider="codex",
+                direction="client",
+                payload=response,
+            )
+            restarted.append_normalized(
+                record.run_id,
+                raw_seq=raw["seq"],
+                disposition=EventDisposition.IGNORED,
+                kind="approval_response",
+                payload=response,
+            )
+            self.assertEqual(restarted.get(record.run_id).pending_requests, {})
 
     def test_store_files_are_private_and_registry_keeps_legacy_shape(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

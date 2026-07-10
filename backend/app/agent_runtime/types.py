@@ -166,6 +166,7 @@ class RunRecord:
     disposition_counts: dict[str, int] = field(
         default_factory=lambda: {item.value: 0 for item in EventDisposition}
     )
+    pending_requests: dict[str, dict[str, Any]] = field(default_factory=dict)
     queued_messages: list[dict[str, str]] = field(default_factory=list)
     schema_version: int = 1
 
@@ -229,11 +230,17 @@ class RunRecord:
             "normalized_event_count": self.normalized_event_count,
             "last_lifecycle_event_seq": self.last_lifecycle_event_seq,
             "disposition_counts": dict(self.disposition_counts),
+            "pending_requests": {
+                key: dict(request) for key, request in self.pending_requests.items()
+            },
             "queued_messages": list(self.queued_messages),
         }
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> RunRecord:
+        pending_requests = value.get("pending_requests")
+        if not isinstance(pending_requests, dict):
+            pending_requests = {}
         return cls(
             schema_version=int(value.get("schema_version", 1)),
             run_id=str(value["run_id"]),
@@ -274,6 +281,11 @@ class RunRecord:
                     (value.get("disposition_counts") or {}).get(item.value, 0)
                 )
                 for item in EventDisposition
+            },
+            pending_requests={
+                str(key): dict(request)
+                for key, request in pending_requests.items()
+                if isinstance(request, dict)
             },
             queued_messages=[dict(item) for item in value.get("queued_messages") or []],
         )

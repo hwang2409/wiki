@@ -233,22 +233,26 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         run_id: str | None = None
         for _ in range(200):
             run_id = self.store.current_run_id("WIKI-QUESTION")
-            if run_id and any(
-                row["payload"].get("method") == "item/tool/requestUserInput"
-                for row in self.store.read_raw_events(run_id)
-            ):
+            if run_id and self.store.get(run_id).pending_requests:
                 break
             await asyncio.sleep(0.01)
         self.assertIsNotNone(run_id)
         assert run_id is not None
         started = await asyncio.wait_for(start_task, timeout=2)
         self.assertEqual(started.provider_session_id, "thread-1")
+        pending = self.store.get(run_id).pending_requests
+        self.assertEqual(pending["int:0"]["request_id"], 0)
+        self.assertEqual(
+            pending["int:0"]["request_kind"],
+            "item/tool/requestUserInput",
+        )
 
         await self.supervisor.respond(
             run_id,
             0,
             {"answers": {"wiki_surface": {"answers": ["Agents page"]}}},
         )
+        self.assertEqual(self.store.get(run_id).pending_requests, {})
         self.assertGreater(started.raw_event_count, 0)
         surfaces: set[str] = set()
         for _ in range(8):

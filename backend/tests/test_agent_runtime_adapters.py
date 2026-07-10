@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from collections.abc import Callable
 from pathlib import Path
+from unittest import mock
 
 from backend.app.agent_runtime.claude import ClaudeStreamAdapter
 from backend.app.agent_runtime.codex import CodexAppServerAdapter
@@ -292,6 +293,19 @@ class CodexAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(adapter.snapshot().state, LifecycleState.WAITING_APPROVAL)
         await asyncio.sleep(0.12)
         self.assertTrue(adapter._turn_start_pending)  # noqa: SLF001
+        with (
+            mock.patch.object(
+                adapter,
+                "_send_json",
+                new=mock.AsyncMock(side_effect=ProviderProcessError("fixture write failed")),
+            ),
+            self.assertRaisesRegex(ProviderProcessError, "fixture write failed"),
+        ):
+            await adapter.respond(
+                0,
+                {"answers": {"wiki_surface": {"answers": ["Agents page"]}}},
+            )
+        self.assertIn(("int", 0), adapter._server_request_ids)  # noqa: SLF001
         await adapter.respond(
             0,
             {"answers": {"wiki_surface": {"answers": ["Agents page"]}}},
@@ -509,6 +523,24 @@ class ClaudeAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             (await adapter.status()).state, LifecycleState.WAITING_APPROVAL
         )
+        with (
+            mock.patch.object(
+                adapter,
+                "_send_json",
+                new=mock.AsyncMock(side_effect=ProviderProcessError("fixture write failed")),
+            ),
+            self.assertRaisesRegex(ProviderProcessError, "fixture write failed"),
+        ):
+            await adapter.respond(
+                "permission-1",
+                {
+                    "behavior": "deny",
+                    "message": "Denied by test",
+                    "interrupt": False,
+                    "toolUseID": "toolu_fixture",
+                },
+            )
+        self.assertIn("permission-1", adapter._server_request_ids)  # noqa: SLF001
         await adapter.respond(
             "permission-1",
             {

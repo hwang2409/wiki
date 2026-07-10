@@ -45,6 +45,68 @@ def _validated_run_id(run_id: str) -> str:
     return run_id
 
 
+def _provider_request_key(request_id: str | int) -> str:
+    if isinstance(request_id, bool) or not isinstance(request_id, (str, int)):
+        raise StoreError("provider request id must be a string or integer")
+    prefix = "int" if isinstance(request_id, int) else "str"
+    return f"{prefix}:{request_id}"
+
+
+def _provider_request_id(kind: str, payload: dict[str, Any]) -> str | int | None:
+    if kind == "approval":
+        value = payload.get("id", payload.get("request_id"))
+    elif kind == "approval_resolved":
+        params = payload.get("params") or {}
+        value = params.get("requestId") if isinstance(params, dict) else None
+    elif kind == "approval_cancelled":
+        value = payload.get("request_id")
+    elif kind == "approval_response":
+        response = payload.get("response") or {}
+        value = (
+            response.get("request_id")
+            if isinstance(response, dict) and payload.get("type") == "control_response"
+            else payload.get("id")
+        )
+    else:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return None
+    return value
+
+
+def _apply_pending_request_event(
+    record: RunRecord,
+    *,
+    kind: str,
+    payload: dict[str, Any],
+    raw_seq: int,
+    normalized_at: str,
+) -> None:
+    request_id = _provider_request_id(kind, payload)
+    if (
+        kind == "approval"
+        and request_id is not None
+        and record.state not in TERMINAL_STATES
+    ):
+        request = payload.get("request") or {}
+        request_kind = payload.get("method")
+        if not isinstance(request_kind, str) and isinstance(request, dict):
+            request_kind = request.get("subtype")
+        record.pending_requests[_provider_request_key(request_id)] = {
+            "request_id": request_id,
+            "request_kind": str(request_kind or "approval"),
+            "received_at": normalized_at,
+            "raw_seq": raw_seq,
+            "payload": dict(payload),
+        }
+    elif kind in {
+        "approval_resolved",
+        "approval_cancelled",
+        "approval_response",
+    } and request_id is not None:
+        record.pending_requests.pop(_provider_request_key(request_id), None)
+
+
 @dataclass(frozen=True)
 class RuntimePaths:
     runtime_dir: Path
@@ -304,11 +366,25 @@ class RunStore:
                 raw_events = self._read_json_lines(raw_path)
                 normalized_events = self._read_json_lines(normalized_path)
                 counts = {item.value: 0 for item in EventDisposition}
+                previous_pending_requests = {
+                    key: dict(request)
+                    for key, request in record.pending_requests.items()
+                }
+                record.pending_requests = {}
                 lifecycle_checkpoint = record.last_lifecycle_event_seq
                 for event in normalized_events:
                     disposition = event.get("disposition")
                     if disposition in counts:
                         counts[disposition] += 1
+                    payload = event.get("payload")
+                    if isinstance(payload, dict):
+                        _apply_pending_request_event(
+                            record,
+                            kind=str(event.get("kind") or "unknown"),
+                            payload=payload,
+                            raw_seq=int(event.get("raw_seq", 0)),
+                            normalized_at=str(event.get("normalized_at") or utc_now()),
+                        )
                     seq = int(event.get("seq", 0))
                     if seq <= lifecycle_checkpoint:
                         continue
@@ -324,6 +400,8 @@ class RunStore:
                             record.state_reason = None
                             if target is not LifecycleState.BLOCKED:
                                 record.recovery_from_state = None
+                            if target in TERMINAL_STATES:
+                                record.pending_requests.clear()
                     lifecycle_checkpoint = seq
                 raw_count = max(
                     (int(event.get("seq", 0)) for event in raw_events),
@@ -337,6 +415,7 @@ class RunStore:
                     record.raw_event_count != raw_count
                     or record.normalized_event_count != normalized_count
                     or record.disposition_counts != counts
+                    or previous_pending_requests != record.pending_requests
                     or record.last_lifecycle_event_seq != lifecycle_checkpoint
                 ):
                     record.raw_event_count = raw_count
@@ -598,6 +677,8 @@ class RunStore:
             record.state_reason = reason
             if target is not LifecycleState.BLOCKED:
                 record.recovery_from_state = None
+            if target in TERMINAL_STATES:
+                record.pending_requests.clear()
             if adapter_status is not None:
                 if adapter_status.session_id is not None:
                     record.provider_session_id = adapter_status.session_id
@@ -767,6 +848,13 @@ class RunStore:
             record.disposition_counts[disposition.value] = (
                 record.disposition_counts.get(disposition.value, 0) + 1
             )
+            _apply_pending_request_event(
+                record,
+                kind=kind,
+                payload=payload,
+                raw_seq=raw_seq,
+                normalized_at=str(envelope["normalized_at"]),
+            )
             if lifecycle_state is not None:
                 try:
                     validate_transition(record.state, lifecycle_state)
@@ -779,9 +867,31 @@ class RunStore:
                     record.state_reason = None
                     if lifecycle_state is not LifecycleState.BLOCKED:
                         record.recovery_from_state = None
+            if record.state in TERMINAL_STATES:
+                record.pending_requests.clear()
             record.last_lifecycle_event_seq = int(envelope["seq"])
             self._write_record(record)
             return envelope
+
+    def clear_pending_request(
+        self,
+        run_id: str,
+        request_id: str | int,
+    ) -> RunRecord:
+        with self._lock:
+            record = self.get(run_id)
+            record.pending_requests.pop(_provider_request_key(request_id), None)
+            self._write_record(record)
+            return record
+
+    def clear_pending_requests(self, run_id: str) -> RunRecord:
+        with self._lock:
+            record = self.get(run_id)
+            if not record.pending_requests:
+                return record
+            record.pending_requests.clear()
+            self._write_record(record)
+            return record
 
     def queue_message(self, run_id: str, text: str) -> RunRecord:
         with self._lock:

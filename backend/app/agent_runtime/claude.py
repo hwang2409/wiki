@@ -660,17 +660,21 @@ class ClaudeStreamAdapter(ProviderAdapter):
             raise ProviderProtocolError(
                 f"unknown, canceled, or stale Claude server request id: {request_id!r}"
             )
-        await self._send_json(
-            {
-                "type": "control_response",
-                "response": {
-                    "subtype": "success",
-                    "request_id": pending.raw_id,
-                    "response": response,
+        try:
+            await self._send_json(
+                {
+                    "type": "control_response",
+                    "response": {
+                        "subtype": "success",
+                        "request_id": pending.raw_id,
+                        "response": response,
+                    },
                 },
-            },
-            generation=self._generation,
-        )
+                generation=self._generation,
+            )
+        except Exception:
+            self._server_request_ids[request_id] = pending
+            raise
         if (
             pending.subtype == "can_use_tool"
             and self._state is LifecycleState.WAITING_APPROVAL

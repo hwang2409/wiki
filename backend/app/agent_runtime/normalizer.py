@@ -94,6 +94,9 @@ def _normalize_codex(payload: dict[str, Any]) -> NormalizedProviderEvent:
     if method in _CODEX_APPROVAL_METHODS:
         disposition = EventDisposition.RENDERED
         kind = "approval"
+    elif method == "serverRequest/resolved":
+        disposition = EventDisposition.RENDERED
+        kind = "approval_resolved"
     elif method in _CODEX_RENDERED_METHODS:
         disposition = EventDisposition.RENDERED
         kind = str(method).replace("/", "_")
@@ -273,9 +276,19 @@ def normalize_provider_event(
     direction: str = "provider",
 ) -> NormalizedProviderEvent:
     if direction in {"client", "stdin"}:
+        is_approval_response = (
+            provider is ProviderKind.CODEX
+            and payload.get("id") is not None
+            and "result" in payload
+        ) or (
+            provider is ProviderKind.CLAUDE
+            and payload.get("type") == "control_response"
+        )
         return NormalizedProviderEvent(
             EventDisposition.IGNORED,
-            f"{provider.value}_client_message",
+            "approval_response"
+            if is_approval_response
+            else f"{provider.value}_client_message",
             payload,
         )
     if direction == "stderr":

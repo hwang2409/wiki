@@ -3659,6 +3659,112 @@ body.is-resizing-panes .pane-cell {
   color: var(--accent-warning);
 }
 
+.session-provider-pending {
+  padding: 1px 5px;
+  border: 1px solid color-mix(in srgb, var(--accent-warning) 45%, var(--background-modifier-border));
+  border-radius: 999px;
+  color: var(--accent-warning);
+}
+
+.session-provider-request {
+  padding: 9px;
+  border-top: 1px solid color-mix(in srgb, var(--accent-warning) 45%, var(--background-modifier-border));
+  background-color: color-mix(in srgb, var(--accent-warning) 5%, transparent);
+}
+
+.session-provider-request-head,
+.session-provider-request-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.session-provider-request-head span:first-child {
+  color: var(--accent-warning);
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.session-provider-request-head span:last-child {
+  margin-left: auto;
+}
+
+.session-provider-questions {
+  display: grid;
+  gap: 8px;
+  margin-top: 9px;
+}
+
+.session-provider-question,
+.session-provider-json-response {
+  display: grid;
+  gap: 5px;
+  color: var(--text-muted);
+}
+
+.session-provider-question select,
+.session-provider-question input,
+.session-provider-json-response textarea {
+  width: 100%;
+  padding: 6px 7px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 2px;
+  background-color: var(--background-primary);
+  color: var(--text-normal);
+  font: inherit;
+}
+
+.session-provider-json-response {
+  margin-top: 9px;
+}
+
+.session-provider-json-response textarea {
+  min-height: 72px;
+  resize: vertical;
+}
+
+.session-provider-request-actions {
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+
+.session-provider-request-actions details {
+  margin-right: auto;
+}
+
+.session-provider-request-actions summary,
+.session-provider-request-actions button {
+  cursor: pointer;
+  color: var(--text-muted);
+}
+
+.session-provider-request-actions button {
+  padding: 3px 7px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 2px;
+}
+
+.session-provider-request-actions button:hover {
+  color: var(--text-normal);
+}
+
+.session-provider-request-actions button:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.session-provider-request-actions pre {
+  max-height: 220px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.session-provider-request-error {
+  margin-top: 6px;
+  color: var(--accent-danger);
+}
+
 .session-provider-events {
   max-height: 260px;
   overflow: auto;

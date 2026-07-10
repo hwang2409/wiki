@@ -45,7 +45,20 @@ async function startFakeSupervisor(fixtures, current, registry) {
       kind: "approval",
       payload: {
         method: "item/tool/requestUserInput",
-        params: { questions: [{ id: "scope", question: "Which scope?" }] },
+        id: 0,
+        params: {
+          questions: [
+            {
+              id: "scope",
+              header: "Scope",
+              question: "Which scope?",
+              options: [
+                { label: "Full brief", description: "Complete the ticket." },
+                { label: "First slice", description: "Stop after the first boundary." },
+              ],
+            },
+          ],
+        },
       },
       lifecycle_state: "waiting-approval",
     },
@@ -68,6 +81,16 @@ async function startFakeSupervisor(fixtures, current, registry) {
       lifecycle_state: "waiting-approval",
     },
   ];
+  let pendingRequests = [
+    {
+      request_id: 0,
+      request_kind: "item/tool/requestUserInput",
+      received_at: "2026-07-09T20:00:01Z",
+      raw_seq: 2,
+      payload: events[1].payload,
+    },
+  ];
+  let capturedResponse = null;
 
   async function persistState() {
     registry[TICKET].current = { ...current };
@@ -117,6 +140,7 @@ async function startFakeSupervisor(fixtures, current, registry) {
           raw_count: raw.length,
           normalized_count: events.length,
           dispositions: { rendered: 3, summarized: 1, ignored: 0, unknown: 0 },
+          pending_requests: pendingRequests,
           events,
           raw: params.include_raw ? raw : null,
         };
@@ -124,6 +148,15 @@ async function startFakeSupervisor(fixtures, current, registry) {
         result = { messages: [] };
       } else if (method === "run/send_now") {
         result = { status: "sent" };
+      } else if (method === "run/respond") {
+        capturedResponse = params;
+        pendingRequests = pendingRequests.filter(
+          (request) => request.request_id !== params.request_id,
+        );
+        current.state = "working";
+        await persistState();
+        result = runtimeRow();
+        publish({ type: "session", ticket: TICKET, surface: "session" });
       } else if (["run/interrupt", "run/resume", "run/stop", "run/archive"].includes(method)) {
         current.state = {
           "run/interrupt": "interrupted",
@@ -152,6 +185,9 @@ async function startFakeSupervisor(fixtures, current, registry) {
     server.listen(fixtures.supervisorSocketPath, resolve);
   });
   return {
+    response() {
+      return capturedResponse;
+    },
     async stop() {
       for (const socket of subscribers) socket.destroy();
       await new Promise((resolve) => server.close(resolve));
@@ -222,20 +258,28 @@ async function main() {
       throw new Error(`composer response changed: ${JSON.stringify(composerResult)}`);
     }
 
-    logStep("interrupting through the agents controller");
-    await page.getByRole("button", { name: "Interrupt", exact: true }).click();
-    await page.getByText("interrupt", { exact: false }).first().waitFor();
-    await page.getByText("run 00000000 · interrupted", { exact: true }).waitFor();
-    await page.screenshot({ path: path.join(OUT_DIR, "agents-headless-after.png"), fullPage: true });
-
     logStep("opening provider stream inspector");
     await page.goto(`${backend.baseUrl}/#/agent/${TICKET}`, { waitUntil: "domcontentloaded" });
     await page.getByText("Provider stream", { exact: true }).waitFor();
     await page.getByText("raw 4 → normalized 4", { exact: true }).waitFor();
-    await page.getByRole("button", { name: /Provider stream/ }).click();
+    await page.getByText("Action required", { exact: true }).waitFor();
     await page.getByText("approval", { exact: true }).waitFor();
     await page.getByText("context_compacted", { exact: true }).waitFor();
     await page.screenshot({ path: path.join(OUT_DIR, "session-provider-inspector.png"), fullPage: true });
+
+    logStep("answering captured Codex requestUserInput through the adapter route");
+    await page.locator(".session-provider-question select").selectOption("Full brief");
+    await page.getByRole("button", { name: "Send answers", exact: true }).click();
+    await page.waitForFunction(() => !document.body.textContent?.includes("Action required"));
+    const response = supervisor.response();
+    const expectedResponse = {
+      agent_id: TICKET,
+      request_id: 0,
+      response: { answers: { scope: { answers: ["Full brief"] } } },
+    };
+    if (JSON.stringify(response) !== JSON.stringify(expectedResponse)) {
+      throw new Error(`provider response changed: ${JSON.stringify(response)}`);
+    }
 
     const rawInspector = await page.evaluate(async (ticket) => {
       const response = await fetch(`/api/agents/${ticket}/events?include_raw=true`);
@@ -245,12 +289,21 @@ async function main() {
       throw new Error(`raw inspector mismatch: ${JSON.stringify(rawInspector)}`);
     }
 
+    logStep("interrupting through the agents controller after approval resolution");
+    await page.goto(`${backend.baseUrl}/#/agents`, { waitUntil: "domcontentloaded" });
+    await page.getByText("run 00000000 · working", { exact: true }).waitFor();
+    await page.getByRole("button", { name: "Interrupt", exact: true }).click();
+    await page.getByText("interrupt", { exact: false }).first().waitFor();
+    await page.getByText("run 00000000 · interrupted", { exact: true }).waitFor();
+    await page.screenshot({ path: path.join(OUT_DIR, "agents-headless-after.png"), fullPage: true });
+
     await fs.writeFile(
       path.join(OUT_DIR, "summary.json"),
       JSON.stringify(
         {
           tmux: "empty",
           composer: composerResult,
+          provider_response: response,
           raw_count: rawInspector.raw_count,
           normalized_count: rawInspector.normalized_count,
           screenshots: [

@@ -274,6 +274,14 @@ export type ProviderRawEvent = {
   payload: Record<string, unknown>;
 };
 
+export type ProviderPendingRequest = {
+  request_id: string | number;
+  request_kind: string;
+  received_at: string;
+  raw_seq: number;
+  payload: Record<string, unknown>;
+};
+
 export type ProviderEventInspector = {
   run_id: string;
   provider: string;
@@ -281,6 +289,7 @@ export type ProviderEventInspector = {
   raw_count: number;
   normalized_count: number;
   dispositions: SessionDispositionCounts;
+  pending_requests: ProviderPendingRequest[];
   events: ProviderStreamEvent[];
   raw?: ProviderRawEvent[] | null;
 };
@@ -416,6 +425,20 @@ export function getAgentProviderEvents(ticket: string, includeRaw = false) {
   const params = new URLSearchParams({ include_raw: String(includeRaw) });
   return request<ProviderEventInspector>(
     `/api/agents/${encodeURIComponent(ticket)}/events?${params.toString()}`,
+  );
+}
+
+export function respondToAgentRequest(
+  ticket: string,
+  requestId: string | number,
+  response: Record<string, unknown>,
+) {
+  return request<AgentControlResult>(
+    `/api/agents/${encodeURIComponent(ticket)}/respond`,
+    {
+      method: "POST",
+      body: JSON.stringify({ request_id: requestId, response }),
+    },
   );
 }
 

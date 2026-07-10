@@ -32,6 +32,7 @@ class FakeSupervisorClient:
         self.messages: list[dict[str, str]] = []
         self.normalized_events: list[dict[str, Any]] = []
         self.raw_events: list[dict[str, Any]] = []
+        self.pending_requests: list[dict[str, Any]] = []
         self.fail_unavailable = False
         self.event = {
             "type": "session",
@@ -135,6 +136,17 @@ class FakeSupervisorClient:
             }[method]
             self.registry_path.write_text(json.dumps(registry), encoding="utf-8")
             return {**current, "agent_id": agent_id}
+        if method == "run/respond":
+            agent_id = values["agent_id"]
+            current = registry[agent_id]["current"]
+            current["state"] = "working"
+            self.pending_requests = [
+                request
+                for request in self.pending_requests
+                if request.get("request_id") != values["request_id"]
+            ]
+            self.registry_path.write_text(json.dumps(registry), encoding="utf-8")
+            return {**current, "agent_id": agent_id}
         if method == "run/send_now":
             return {"status": "sent"}
         if method == "run/send_on_idle":
@@ -184,6 +196,7 @@ class FakeSupervisorClient:
                     "ignored": 0,
                     "unknown": 0,
                 },
+                "pending_requests": list(self.pending_requests),
                 "events": normalized,
                 "raw": raw if values.get("include_raw") else None,
             }
@@ -434,6 +447,15 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
                 "payload": {"method": "item/tool/requestUserInput"},
             }
         ]
+        self.client.pending_requests = [
+            {
+                "request_id": 0,
+                "request_kind": "item/tool/requestUserInput",
+                "received_at": "2026-07-09T12:00:00+00:00",
+                "raw_seq": 1,
+                "payload": normalized_event["payload"],
+            }
+        ]
 
         payload = main.agent_session("WIKI-42")
         inspector = cast(dict[str, Any], payload["provider_inspector"])
@@ -442,6 +464,7 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(inspector["normalized_count"], 1)
         self.assertEqual(inspector["dispositions"]["rendered"], 1)
         self.assertEqual(inspector["events"][0]["kind"], "approval")
+        self.assertEqual(inspector["pending_requests"][0]["request_id"], 0)
 
         raw = main.agent_provider_events(
             "WIKI-42",
@@ -450,6 +473,16 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
             include_raw=True,
         )
         self.assertEqual(cast(list[dict[str, Any]], raw["raw"])[0]["seq"], 1)
+
+        responded = main.respond_to_agent(
+            "WIKI-42",
+            main.AgentRespondIn(
+                request_id=0,
+                response={"answers": {"scope": {"answers": ["Full"]}}},
+            ),
+        )
+        self.assertEqual(responded["state"], "working")
+        self.assertEqual(self.client.pending_requests, [])
 
     async def test_spawn_and_replace_are_supervisor_owned(self) -> None:
         with mock.patch.object(
