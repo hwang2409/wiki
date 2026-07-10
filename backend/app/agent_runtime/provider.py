@@ -84,7 +84,12 @@ class ProviderAdapter(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def replace(self, new_prompt: str, model: str | None = None) -> AdapterStatus:
+    async def replace(
+        self,
+        new_prompt: str,
+        model: str | None = None,
+        effort: str | None = None,
+    ) -> AdapterStatus:
         """End the current provider session and return the replacement status.
 
         Replacement-session events must not be exposed through `events()`

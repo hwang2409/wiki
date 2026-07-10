@@ -2021,27 +2021,77 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             pass
 
     async def replace(
-        self, run_id: str, prompt: str, model: str | None = None
+        self,
+        run_id: str,
+        prompt: str,
+        model: str | None = None,
+        provider: ProviderKind | None = None,
+        effort: str | None = None,
     ) -> RunRecord:
-        if self.store.get(run_id).provider is ProviderKind.CODEX:
+        old = self.store.get(run_id)
+        target_provider = provider or old.provider
+        if ProviderKind.CODEX in {old.provider, target_provider}:
             self._assert_codex_fleet_available()
             async with self.codex_fleet_lock:
                 self._assert_codex_fleet_available()
                 async with self._run_lock(run_id):
-                    return await self._replace(run_id, prompt, model)
-        async with self._run_lock(run_id):
-            return await self._replace(run_id, prompt, model)
+                    replacement = await self._replace(
+                        run_id,
+                        prompt,
+                        model,
+                        target_provider,
+                        effort if provider is not None else old.effort,
+                    )
+        else:
+            async with self._run_lock(run_id):
+                replacement = await self._replace(
+                    run_id,
+                    prompt,
+                    model,
+                    target_provider,
+                    effort if provider is not None else old.effort,
+                )
+        if old.model != replacement.model:
+            self._append_model_changed_event(
+                replacement,
+                old_model=old.model,
+                new_model=replacement.model,
+                trigger="replace",
+            )
+            await self._publish(
+                {
+                    "type": "model_changed",
+                    "ticket": replacement.agent_id,
+                    "from_model": old.model,
+                    "to_model": replacement.model,
+                    "run_id": replacement.run_id,
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            await self._publish(
+                {
+                    "type": "session",
+                    "ticket": replacement.agent_id,
+                    "surface": "session",
+                }
+            )
+        return replacement
 
     async def _replace(
         self,
         run_id: str,
         prompt: str,
         model: str | None = None,
+        provider: ProviderKind | None = None,
+        effort: str | None = None,
     ) -> RunRecord:
         old = self.store.get(run_id)
         if not self.store.is_current(old):
             raise StoreConflict("replacement target is no longer current")
         resolve_safe_worktree(old.worktree)
+        target_provider = provider or old.provider
+        target_model = model or old.model
+        target_effort = effort if target_provider is ProviderKind.CODEX else None
         old_adapter = self.adapters.get(run_id)
         if old_adapter is None:
             if self.pid_alive(old.provider_pid):
@@ -2050,12 +2100,33 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 )
             replacement = RunRecord.new(
                 agent_id=old.agent_id,
-                provider=old.provider,
+                provider=target_provider,
                 role=old.role,
-                model=model or old.model,
+                model=target_model,
                 worktree=old.worktree,
                 prompt=prompt,
-                effort=old.effort,
+                effort=target_effort,
+                orchestrator_id=old.orchestrator_id,
+                replaces_run_id=old.run_id,
+            )
+            self.store.replace(old.run_id, replacement)
+            return await self._launch_record(replacement, prompt)
+
+        if target_provider is not old.provider:
+            await self._close_and_drain_adapter(
+                run_id,
+                old_adapter,
+                finalize="stop",
+                suppress_operation_errors=False,
+            )
+            replacement = RunRecord.new(
+                agent_id=old.agent_id,
+                provider=target_provider,
+                role=old.role,
+                model=target_model,
+                worktree=old.worktree,
+                prompt=prompt,
+                effort=target_effort,
                 orchestrator_id=old.orchestrator_id,
                 replaces_run_id=old.run_id,
             )
@@ -2064,7 +2135,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         await self._detach_adapter(run_id, preserve_event_routes=True)
 
         try:
-            status = await old_adapter.replace(prompt, model)
+            status = await old_adapter.replace(prompt, model, target_effort)
         except Exception as exc:
             await self._close_and_drain_adapter(run_id, old_adapter)
             try:
@@ -2088,12 +2159,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
 
         replacement = RunRecord.new(
             agent_id=old.agent_id,
-            provider=old.provider,
+            provider=target_provider,
             role=old.role,
-            model=model or old.model,
+            model=target_model,
             worktree=old.worktree,
             prompt=prompt,
-            effort=old.effort,
+            effort=target_effort,
             orchestrator_id=old.orchestrator_id,
             replaces_run_id=old.run_id,
         )
@@ -2270,11 +2341,14 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 )
             )
         if method == "run/replace":
+            provider = params.get("provider")
             return _public_run(
                 await self.replace(
                     self._resolve_run_id(params),
                     str(params["prompt"]),
                     params.get("model"),
+                    ProviderKind(provider) if provider is not None else None,
+                    params.get("effort"),
                 )
             )
         if method == "run/respond":

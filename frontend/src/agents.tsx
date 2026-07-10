@@ -15,7 +15,6 @@ import {
   controlAgent,
   getAgents,
   getAgentModels,
-  replaceAgent,
   spawnAgentOrchestrator,
   spawnAgentWorker,
 } from "./api";
@@ -33,6 +32,7 @@ import type {
 } from "./api";
 import { externalLinkProps } from "./external-links";
 import { LoadingPlaceholder } from "./loading";
+import { ReplaceAgentModal, type ReplaceAgentTarget } from "./replace-agent-modal";
 import { SessionSidebar } from "./session";
 import type { SidebarTarget } from "./session";
 
@@ -779,10 +779,8 @@ export function AgentsView({
   const [spawnWorkerOpen, setSpawnWorkerOpen] = useState(false);
   const [spawnOrchestratorOpen, setSpawnOrchestratorOpen] = useState(false);
   const [spawnNotice, setSpawnNotice] = useState<SpawnNotice | null>(null);
-  const [replaceConfirm, setReplaceConfirm] = useState<string | null>(null);
-  const [replacePending, setReplacePending] = useState<string | null>(null);
+  const [replaceTarget, setReplaceTarget] = useState<ReplaceAgentTarget | null>(null);
   const [replaceNotice, setReplaceNotice] = useState<ReplaceAgentResult | null>(null);
-  const [replaceError, setReplaceError] = useState<string | null>(null);
   const [controlConfirm, setControlConfirm] = useState<string | null>(null);
   const [controlPending, setControlPending] = useState<string | null>(null);
   const [controlNotice, setControlNotice] = useState<{
@@ -853,7 +851,7 @@ export function AgentsView({
     : openOrch
       ? {
           ticket: openOrch.id,
-          kind: "cc",
+          kind: openOrch.kind,
           role: "orchestrator",
           model: openOrch.model,
           pr: null,
@@ -877,29 +875,6 @@ export function AgentsView({
   const ungrouped = liveWorkers.filter(
     (worker) => !worker.orch || !orchestrators.some((orch) => orch.id === worker.orch)
   );
-
-  async function requestReplace(id: string) {
-    if (replacePending) return;
-    if (replaceConfirm !== id) {
-      setReplaceConfirm(id);
-      setReplaceNotice(null);
-      setReplaceError(null);
-      return;
-    }
-    setReplacePending(id);
-    setReplaceError(null);
-    try {
-      const result = await replaceAgent(id);
-      setReplaceNotice(result);
-      setSpawnNotice(null);
-      setReplaceConfirm(null);
-      onOpenTicket(result.id);
-    } catch (err) {
-      setReplaceError(err instanceof Error ? err.message : "Could not replace agent");
-    } finally {
-      setReplacePending(null);
-    }
-  }
 
   async function requestControl(
     id: string,
@@ -928,21 +903,26 @@ export function AgentsView({
     }
   }
 
-  function ReplaceButton({ id, disabled = false }: { id: string; disabled?: boolean }) {
-    const confirming = replaceConfirm === id;
-    const pending = replacePending === id;
+  function ReplaceButton({
+    disabled = false,
+    target,
+  }: {
+    disabled?: boolean;
+    target: ReplaceAgentTarget;
+  }) {
     return (
       <button
-        className={`agent-replace-button${confirming ? " is-confirming" : ""}`}
-        disabled={disabled || Boolean(replacePending)}
+        className="agent-replace-button"
+        disabled={disabled}
         title={disabled ? "Registered runtime is not live" : "Stop this run and spawn a replacement"}
         type="button"
         onClick={() => {
-          void requestReplace(id);
+          setReplaceNotice(null);
+          setReplaceTarget(target);
         }}
       >
         <RefreshCw size={12} />
-        {pending ? "Replacing" : confirming ? "Confirm replace" : "Replace"}
+        Replace
       </button>
     );
   }
@@ -1082,7 +1062,13 @@ export function AgentsView({
               />
             ) : null}
             <ReplaceButton
-              id={worker.ticket}
+              target={{
+                id: worker.ticket,
+                kind: worker.kind === "cdx" ? "cdx" : "cc",
+                model: worker.model ?? "",
+                effort: worker.effort,
+                role: worker.role,
+              }}
               disabled={!worker.run_id && (!worker.window || !worker.window_alive)}
             />
             <button
@@ -1144,7 +1130,13 @@ export function AgentsView({
                     />
                   ) : null}
                   <ReplaceButton
-                    id={orch.id}
+                    target={{
+                      id: orch.id,
+                      kind: orch.kind ?? "cc",
+                      model: orch.model ?? "",
+                      effort: orch.effort,
+                      role: "orchestrator",
+                    }}
                     disabled={!orch.run_id && (!orch.window || !orch.window_alive)}
                   />
                   <button
@@ -1314,7 +1306,6 @@ export function AgentsView({
             ) : null}
           </div>
         ) : null}
-        {replaceError ? <div className="agents-notice is-error">{replaceError}</div> : null}
         {controlNotice ? (
           <div className="agents-notice">
             {controlNotice.action} <code>{controlNotice.result.agent_id}</code> · state{" "}
@@ -1351,6 +1342,18 @@ export function AgentsView({
           onSpawn={(notice) => {
             setSpawnNotice(notice);
             setSpawnOrchestratorOpen(false);
+          }}
+        />
+      ) : null}
+      {replaceTarget ? (
+        <ReplaceAgentModal
+          models={availableModels}
+          target={replaceTarget}
+          onClose={() => setReplaceTarget(null)}
+          onReplaced={(result) => {
+            setReplaceNotice(result);
+            setSpawnNotice(null);
+            onOpenTicket(result.id);
           }}
         />
       ) : null}

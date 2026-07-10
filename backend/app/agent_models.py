@@ -26,6 +26,7 @@ MODEL_OPTIONS: tuple[AgentModelOption, ...] = (
         kind="cdx",
         provider="codex",
         supports_reasoning_effort=True,
+        default_orchestrator=True,
     ),
     AgentModelOption(
         id="gpt-5.6-terra",
@@ -134,3 +135,11 @@ def model_ids_for_kind(kind: str) -> tuple[str, ...]:
 
 def is_model_allowed(kind: str, model: str) -> bool:
     return model in model_ids_for_kind(kind)
+
+
+def default_model_for_kind(kind: str, *, target: str) -> str:
+    field = "default_orchestrator" if target == "Orchestrator" else "default_worker"
+    for option in MODEL_OPTIONS:
+        if option.kind == kind and getattr(option, field):
+            return option.id
+    raise ValueError(f"No default {target.lower()} model for {kind}")

@@ -150,10 +150,10 @@ class FakeSupervisorClient:
                 REPLACEMENT_RUN_ID,
                 {
                     "agent_id": agent_id,
-                    "provider": old["provider"],
+                    "provider": values.get("provider", old["provider"]),
                     "role": old["role"],
-                    "model": old["model"],
-                    "effort": old.get("effort"),
+                    "model": values.get("model", old["model"]),
+                    "effort": values.get("effort", old.get("effort")),
                     "worktree": old["worktree"],
                     "orchestrator_id": old.get("orch"),
                 },
@@ -769,6 +769,75 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
             params for method, params in self.client.calls if method == "run/replace"
         )
         self.assertIn(str(self.status_dir / "WIKI-42.json"), replace_call["prompt"])
+        self.assertEqual(replace_call["provider"], "codex")
+        self.assertEqual(replace_call["model"], "gpt-5.4")
+        self.assertEqual(replace_call["effort"], "high")
+
+    async def test_replace_accepts_model_kind_and_effort_overrides(self) -> None:
+        self._seed_headless(provider="claude")
+
+        replaced = main.replace_agent(
+            "WIKI-42",
+            main.SpawnReplaceIn(kind="cdx", model="gpt-5.4"),
+        )
+
+        self.assertEqual(replaced["model"], "gpt-5.4")
+        replace_call = self.client.calls[-1][1]
+        self.assertEqual(replace_call["provider"], "codex")
+        self.assertEqual(replace_call["model"], "gpt-5.4")
+        self.assertEqual(replace_call["effort"], "high")
+
+    async def test_replace_kind_only_uses_role_default_model(self) -> None:
+        self.client._write_current(  # noqa: SLF001 - fixture setup
+            RUN_ID,
+            {
+                "agent_id": "wiki_dev",
+                "provider": "claude",
+                "role": "orchestrator",
+                "model": "opus",
+                "effort": None,
+                "worktree": str(self.worktree),
+                "orchestrator_id": None,
+            },
+        )
+
+        main.replace_agent("wiki_dev", main.SpawnReplaceIn(kind="cdx"))
+
+        replace_call = self.client.calls[-1][1]
+        self.assertEqual(replace_call["provider"], "codex")
+        self.assertEqual(replace_call["model"], "gpt-5.6-sol")
+        self.assertEqual(replace_call["effort"], "high")
+
+    async def test_replace_cc_model_override_stays_on_claude(self) -> None:
+        self._seed_headless(provider="claude")
+
+        main.replace_agent(
+            "WIKI-42",
+            main.SpawnReplaceIn(model="sonnet-4.6"),
+        )
+
+        replace_call = self.client.calls[-1][1]
+        self.assertEqual(replace_call["provider"], "claude")
+        self.assertEqual(replace_call["model"], "sonnet-4.6")
+        self.assertIsNone(replace_call["effort"])
+
+    async def test_replace_rejects_invalid_model_and_kind_before_supervisor(self) -> None:
+        self._seed_headless(provider="claude")
+
+        with self.assertRaises(HTTPException) as bad_model:
+            main.replace_agent(
+                "WIKI-42",
+                main.SpawnReplaceIn(model="gpt-5.4"),
+            )
+        with self.assertRaises(HTTPException) as bad_kind:
+            main.replace_agent(
+                "WIKI-42",
+                main.SpawnReplaceIn(kind="other"),
+            )
+
+        self.assertEqual(bad_model.exception.status_code, 400)
+        self.assertEqual(bad_kind.exception.status_code, 400)
+        self.assertEqual(self.client.calls, [])
 
     async def test_spawn_rejects_unknown_model_with_clear_400_before_supervisor(self) -> None:
         with self.assertRaises(HTTPException) as blocked:
@@ -1284,7 +1353,10 @@ for raw in sys.stdin:
                 include_raw=True,
             )
         elif method == "POST" and path.endswith("/replace"):
-            result = main.replace_agent(_ticket_from(path, "/replace"))
+            result = main.replace_agent(
+                _ticket_from(path, "/replace"),
+                main.SpawnReplaceIn(**body),
+            )
         elif method == "POST" and path.endswith("/resume"):
             result = main.resume_agent(_ticket_from(path, "/resume"))
         elif method == "POST" and path.endswith("/message"):
@@ -1480,6 +1552,14 @@ for raw in sys.stdin:
             self.assertIn(row.get("tmux"), (None, ""))
             self.assertIn(row.get("tmux_pane"), (None, ""))
 
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+
     def _write_evidence(self, payload: dict[str, Any]) -> None:
         out_dir = os.environ.get("WIKI_HEADLESS_EVIDENCE_DIR")
         if not out_dir:
@@ -1645,6 +1725,63 @@ for raw in sys.stdin:
                 },
             }
         )
+
+    def test_cross_provider_orchestrator_replace_terminates_old_provider_pids(
+        self,
+    ) -> None:
+        self._start_daemon()
+        self._start_backend()
+        started = cast(
+            dict[str, Any],
+            self.client.request(
+                "run/start",
+                {
+                    "agent_id": "wiki",
+                    "provider": "claude",
+                    "role": "orchestrator",
+                    "model": "opus",
+                    "effort": None,
+                    "worktree": str(self.worktree),
+                    "prompt": "Coordinate the isolated WIKI-81 fixture fleet.",
+                    "orchestrator_id": None,
+                },
+            ),
+        )
+        claude_pid = cast(int, started["provider_pid"])
+        self.assertTrue(self._pid_alive(claude_pid))
+
+        codex = self._read_json(
+            "POST",
+            "/api/agents/wiki/replace",
+            {"kind": "cdx", "model": "gpt-5.4", "effort": "high"},
+        )
+        codex_current = self._wait_for(
+            lambda: self._current("wiki"),
+            lambda current: current["run_id"] == codex["run_id"]
+            and current["provider"] == "codex",
+        )
+        codex_pid = cast(int, codex_current["provider_pid"])
+        self.assertNotEqual(codex_pid, claude_pid)
+        self.assertTrue(self._pid_alive(codex_pid))
+        self._wait_for(lambda: self._pid_alive(claude_pid), lambda alive: not alive)
+
+        claude = self._read_json(
+            "POST",
+            "/api/agents/wiki/replace",
+            {"kind": "cc", "model": "opus"},
+        )
+        claude_current = self._wait_for(
+            lambda: self._current("wiki"),
+            lambda current: current["run_id"] == claude["run_id"]
+            and current["provider"] == "claude",
+        )
+        replacement_claude_pid = cast(int, claude_current["provider_pid"])
+        self.assertNotIn(replacement_claude_pid, {claude_pid, codex_pid})
+        self.assertTrue(self._pid_alive(replacement_claude_pid))
+        self._wait_for(lambda: self._pid_alive(codex_pid), lambda alive: not alive)
+        self.assertEqual(claude_current["kind"], "cc")
+        self.assertEqual(claude_current["model"], "opus")
+        self.assertIsNone(claude_current["effort"])
 
 
 if __name__ == "__main__":

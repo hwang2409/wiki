@@ -806,7 +806,12 @@ class CodexAppServerAdapter(ProviderAdapter):
                     pass
             return await self._shutdown(LifecycleState.DEAD)
 
-    async def replace(self, new_prompt: str, model: str | None = None) -> AdapterStatus:
+    async def replace(
+        self,
+        new_prompt: str,
+        model: str | None = None,
+        effort: str | None = None,
+    ) -> AdapterStatus:
         async with self._operation_lock:
             if not self._process_is_alive() or not self._session_id:
                 raise ProviderProcessError(
@@ -824,6 +829,7 @@ class CodexAppServerAdapter(ProviderAdapter):
             self._server_request_ids.clear()
             await self._rpc("thread/archive", {"threadId": self._session_id})
             self.model = model or self.model
+            self.effort = effort or self.effort
             generation = self._generation + 1
             self._generation = generation
             self._session_id = None

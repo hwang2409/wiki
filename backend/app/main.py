@@ -19,7 +19,12 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from . import accounts, github_pr, github_preview, terminal, tokens, transcripts, uistate, vaultops
-from .agent_models import is_model_allowed, list_model_options, model_ids_for_kind
+from .agent_models import (
+    default_model_for_kind,
+    is_model_allowed,
+    list_model_options,
+    model_ids_for_kind,
+)
 from .agent_runtime.client import (
     SupervisorClient,
     SupervisorRemoteError,
@@ -680,7 +685,9 @@ def agents() -> dict[str, object]:
                     "provider_session_id": current.get("provider_session_id"),
                     "provider_pid": runtime.get("provider_pid") if headless else None,
                     "cwd": current.get("worktree") or current.get("cwd"),
+                    "kind": current.get("kind"),
                     "model": current.get("model"),
+                    "effort": current.get("effort"),
                     "spawned_at": current.get("spawned_at"),
                     "transcript_exists": bool(
                         isinstance(transcript, str) and Path(transcript).is_file()
@@ -704,6 +711,7 @@ def agents() -> dict[str, object]:
                 "role": current.get("role"),
                 "model": current.get("model"),
                 "desired_model": current.get("desired_model"),
+                "effort": current.get("effort"),
                 "worktree": current.get("worktree"),
                 "log": current.get("log"),
                 "orch": current.get("orch"),
@@ -767,7 +775,9 @@ def agents() -> dict[str, object]:
                 "provider_session_id": orch.get("session_id"),
                 "provider_pid": None,
                 "cwd": orch.get("cwd"),
+                "kind": orch.get("kind") or "cc",
                 "model": orch.get("model"),
+                "effort": orch.get("effort"),
                 "spawned_at": orch.get("spawned_at"),
                 "transcript_exists": bool(transcript and Path(transcript).is_file()),
                 "log": orch.get("log"),
@@ -1647,6 +1657,12 @@ class SetModelIn(BaseModel):
     model: str = Field(..., min_length=2, max_length=64)
 
 
+class SpawnReplaceIn(BaseModel):
+    model: str | None = Field(default=None, max_length=64)
+    kind: str | None = Field(default=None, max_length=8)
+    effort: str | None = Field(default=None, max_length=16)
+
+
 class SpawnWorkerIn(BaseModel):
     ticket: str = Field(..., min_length=1, max_length=80)
     kind: str = Field(..., min_length=2, max_length=8)
@@ -1936,7 +1952,10 @@ def respond_to_agent(agent_id: str, body: AgentRespondIn) -> dict[str, object]:
 
 
 @app.post("/api/agents/{agent_id}/replace")
-def replace_agent(agent_id: str) -> dict[str, object]:
+def replace_agent(
+    agent_id: str,
+    body: SpawnReplaceIn | None = None,
+) -> dict[str, object]:
     raw_id = agent_id.strip()
     if not raw_id or not (
         TICKET_PATTERN.fullmatch(raw_id) or ORCH_ID_PATTERN.fullmatch(raw_id)
@@ -1961,11 +1980,51 @@ def replace_agent(agent_id: str) -> dict[str, object]:
         )
 
     resolved_id, _, current = resolved
+    current_kind = current.get("kind")
+    if current_kind not in {"cc", "cdx"}:
+        raise HTTPException(status_code=400, detail="Agent kind is unknown")
+    target = "Orchestrator" if current.get("role") == "orchestrator" else "Worker"
+    requested_kind = (body.kind or "").strip() if body is not None else ""
+    if requested_kind and requested_kind not in {"cc", "cdx"}:
+        raise HTTPException(status_code=400, detail="Kind must be cdx or cc")
+    kind = requested_kind or current_kind
+
+    requested_model = (body.model or "").strip() if body is not None else ""
+    if requested_model:
+        model = requested_model
+    elif requested_kind:
+        model = default_model_for_kind(kind, target=target)
+    else:
+        model = str(current.get("model") or "").strip()
+    if not model:
+        raise HTTPException(status_code=400, detail="Agent model is unknown")
+    if requested_model or requested_kind:
+        _require_allowed_model(kind, model, target=target)
+
+    requested_effort = (body.effort or "").strip() if body is not None else ""
+    has_override = bool(requested_kind or requested_model or requested_effort)
+    if kind == "cc":
+        if requested_effort:
+            raise HTTPException(
+                status_code=400,
+                detail="Claude replacements do not accept reasoning effort",
+            )
+        effort = None
+    else:
+        effort = requested_effort or (
+            "high" if has_override else (current.get("effort") or "high")
+        )
+        if effort not in REASONING_EFFORTS:
+            raise HTTPException(status_code=400, detail="Invalid Codex reasoning effort")
+
     result = _supervisor_request(
         "run/replace",
         {
             "run_id": current["run_id"],
             "prompt": _headless_replacement_prompt(resolved_id, current),
+            "provider": "codex" if kind == "cdx" else "claude",
+            "model": model,
+            "effort": effort,
         },
     )
     if not isinstance(result, dict):

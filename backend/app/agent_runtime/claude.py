@@ -770,7 +770,12 @@ class ClaudeStreamAdapter(ProviderAdapter):
             self._provider_pid = None
             return self._status()
 
-    async def replace(self, new_prompt: str, model: str | None = None) -> AdapterStatus:
+    async def replace(
+        self,
+        new_prompt: str,
+        model: str | None = None,
+        effort: str | None = None,
+    ) -> AdapterStatus:
         async with self._operation_lock:
             if not self._process_is_alive():
                 raise ProviderProcessError(
@@ -778,6 +783,7 @@ class ClaudeStreamAdapter(ProviderAdapter):
                 )
             await self._end_session("wiki-replace", suppress_stream_end=True)
             self.model = model or self.model
+            self.effort = effort
             generation = self._generation + 1
             session_id = str(uuid4())
             try:
