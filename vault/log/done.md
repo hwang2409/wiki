@@ -9,6 +9,24 @@ updated: 2026-07-09
 
 ## 2026-07-09
 
+- **phoebe** — HOTFIX-CATALOG-2 regenerate admin schema catalog after PHO-13242 `shifts.pay_rate` merge ([#10978](https://github.com/phoebe-health/phoebe/pull/10978) merged c7ec74e7c9)
+- [URGENT] HOTFIX-CATALOG: main red — regenerate admin schema catalog post PHO-13273 merge — cdx:HOTFIX-CATALOG worker
+- WIKI-41 (#37) native transcript surfaces — normalization for AskUserQuestion / Monitor / progress / system-subtype / tool_reference / image / custom-title / permission-mode / Codex encrypted_content; disposition inspector (rendered/summarized/ignored/unknown counts); Playwright coverage; closes WIKI-42 step-5 rendering acceptance
+- [P?] [PHO-13273](https://linear.app/phoebework/issue/PHO-13273): rebase-onto-main (schema-wide admin DB reads via generated catalog) — cdx:PHO-13273 worker
+- phoebe-mastermind cross-orch bug#3 (cwd-not-worktree case, non-numeric-suffix ticket VA-WHEATRIDGE) — already covered by WIKI-45 (#34, c8c1da4) since session_id-first glob is independent of both slug shape and kickoff-ticket regex. No new work; symlink workaround unnecessary once phoebe wiki rebuilds.
+- [TASK] VA Wheatridge availability report v2 (customer-friendly, includes 117 with unavailability blocks) — cc:VA-WHEATRIDGE worker
+- [TASK] VA Wheatridge caregiver availability report — cc:VA-WHEATRIDGE worker
+- [PHO-13278](https://linear.app/phoebework/issue/PHO-13278): truncation policy + artifact UI — cdx:PHO-13278 worker
+- WIKI-46 (#36) _session_paths cache invalidation on handoff — pop entries for tickets in _changed_registry_tickets diff; unblocks every future cc↔cdx handoff
+- [PHO-13307](https://linear.app/phoebework/issue/PHO-13307): harden Slack projection + MessageBubble artifact-only rendering (follow-up findings from PHO-13277) — cdx:PHO-13307 worker
+- [PHO-13304](https://linear.app/phoebework/issue/PHO-13304): tighten delayed-reply survey attribution (follow-up findings from PHO-13157) — cdx:PHO-13304 worker
+- [PHO-13277](https://linear.app/phoebework/issue/PHO-13277): admin agent charts as messages + no point limits
+- WIKI-45 (#34) cc-path resolver session_id-first — mirror cdx pattern; unblocks phoebe UI mapping for PR-10475 and any cc worker whose ticket slug does not match worktree dir
+- [PHO-13157](https://linear.app/phoebework/issue/PHO-13157): survey delayed-reply capture + chat-history link (folds 13106+13155, 2 customer reports) — cdx:PHO-13157 worker (gpt-5.4 xhigh)
+- WIKI-38 (#32) agent Replace protocol: POST /api/agents/{id}/replace for worker+orch, env overrides for registry/status/tmp/archive/msg-queue, /agents Replace controls
+- WIKI-39 (#31) watchdog revival mapping: live-registry recheck skips deregistered/terminal/re-windowed, refuse $HOME cwd, agent update --window --session after revive, bare same-day reset parse
+- WIKI-44 (#33) subagent session events hotfix — 1-word revert to "claude-sub" fmt on backend/app/main.py:857, regression from #28; new regression test test_subagent_session_renders_sidechain_events
+- [PHO-11274](https://linear.app/phoebework/issue/PHO-11274): compare_agent_runs trace comparison (audit-validated P1) — cdx:PHO-11274 worker
 - **phoebe** — PHO-13280 admin tool semantics + discoverability merged (#10926 — recordings partition, compare models, source-health routing, collision validator)
 - **WIKI-37** — terminal panes — xterm.js WebGL + pty WS + token auth (owner: cdx:WIKI-37)
 - **phoebe** — PHO-13279 admin trace UI quality — real tool names, purpose titles, python highlighting merged (#10929)
