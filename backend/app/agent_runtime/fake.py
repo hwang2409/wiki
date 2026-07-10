@@ -174,13 +174,18 @@ class CodexFixtureAdapter(ProviderAdapter):
         )
         return self._status
 
-    async def replace(self, new_prompt: str, model: str | None = None) -> AdapterStatus:
+    async def replace(
+        self,
+        new_prompt: str,
+        model: str | None = None,
+        effort: str | None = None,
+    ) -> AdapterStatus:
         if self._request is None:
             raise RuntimeError("adapter has not started")
         request = StartRequest(
             prompt=new_prompt,
             model=model or self._request.model,
-            effort=self._request.effort,
+            effort=effort or self._request.effort,
             worktree=self._request.worktree,
             run_id=self._request.run_id,
             agent_id=self._request.agent_id,
@@ -340,13 +345,18 @@ class ClaudeFixtureAdapter(ProviderAdapter):
         )
         return self._status
 
-    async def replace(self, new_prompt: str, model: str | None = None) -> AdapterStatus:
+    async def replace(
+        self,
+        new_prompt: str,
+        model: str | None = None,
+        effort: str | None = None,
+    ) -> AdapterStatus:
         if self._request is None:
             raise RuntimeError("adapter has not started")
         request = StartRequest(
             prompt=new_prompt,
             model=model or self._request.model,
-            effort=self._request.effort,
+            effort=effort,
             worktree=self._request.worktree,
             run_id=self._request.run_id,
             agent_id=self._request.agent_id,

@@ -534,7 +534,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 "Replacement ticket WIKI-42 prompt",
             )
         provider_replace.assert_awaited_once_with(
-            "Replacement ticket WIKI-42 prompt", None
+            "Replacement ticket WIKI-42 prompt", None, "high"
         )
         self.assertNotEqual(replacement.run_id, old.run_id)
         old = self.store.get(old.run_id)
@@ -570,6 +570,67 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         recovery = await self.supervisor.recover_on_start()
         old_result = next(item for item in recovery if item["run_id"] == old.run_id)
         self.assertEqual(old_result["action"], "skip")
+
+    async def test_cross_provider_orchestrator_replace_stops_old_pid_both_directions(
+        self,
+    ) -> None:
+        claude = await self.supervisor.start_run(
+            agent_id="wiki",
+            provider=ProviderKind.CLAUDE,
+            role="orchestrator",
+            model="fixture-claude",
+            effort=None,
+            worktree=str(self.worktree),
+            prompt="Coordinate the fixture fleet",
+        )
+        claude_adapter = self.supervisor.adapters[claude.run_id]
+        published = self.supervisor.subscribe()
+
+        codex = await self.supervisor.replace(
+            claude.run_id,
+            "Continue as Codex",
+            model="fixture-codex",
+            provider=ProviderKind.CODEX,
+            effort="high",
+        )
+
+        self.assertEqual(codex.provider, ProviderKind.CODEX)
+        self.assertEqual(codex.model, "fixture-codex")
+        self.assertEqual(codex.effort, "high")
+        self.assertTrue(claude_adapter.closed)
+        self.assertIsNone(claude_adapter.snapshot().pid)
+        self.assertNotIn(claude.run_id, self.supervisor.adapters)
+        self.assertIs(
+            self.supervisor.adapters[codex.run_id].provider,
+            ProviderKind.CODEX,
+        )
+        model_event = await _wait_for_published(published, "model_changed")
+        self.assertEqual(model_event["from_model"], "fixture-claude")
+        self.assertEqual(model_event["to_model"], "fixture-codex")
+        normalized = self.store.read_normalized_events(codex.run_id)
+        self.assertEqual(normalized[-1]["kind"], "model_changed")
+        self.assertEqual(normalized[-1]["payload"]["trigger"], "replace")
+
+        codex_adapter = self.supervisor.adapters[codex.run_id]
+        claude_again = await self.supervisor.replace(
+            codex.run_id,
+            "Continue as Claude",
+            model="fixture-claude-next",
+            provider=ProviderKind.CLAUDE,
+            effort=None,
+        )
+
+        self.assertEqual(claude_again.provider, ProviderKind.CLAUDE)
+        self.assertEqual(claude_again.model, "fixture-claude-next")
+        self.assertIsNone(claude_again.effort)
+        self.assertTrue(codex_adapter.closed)
+        self.assertIsNone(codex_adapter.snapshot().pid)
+        self.assertNotIn(codex.run_id, self.supervisor.adapters)
+        self.assertIs(
+            self.supervisor.adapters[claude_again.run_id].provider,
+            ProviderKind.CLAUDE,
+        )
+        self.supervisor.unsubscribe(published)
 
     async def test_queue_model_change_persists_then_applies_at_idle_boundary(
         self,
@@ -1630,10 +1691,14 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         allow_replace = asyncio.Event()
         original_replace = adapter.replace
 
-        async def delayed_replace(prompt: str, model: str | None = None):
+        async def delayed_replace(
+            prompt: str,
+            model: str | None = None,
+            effort: str | None = None,
+        ):
             replace_started.set()
             await allow_replace.wait()
-            return await original_replace(prompt, model)
+            return await original_replace(prompt, model, effort)
 
         with (
             mock.patch.object(adapter, "replace", side_effect=delayed_replace),
@@ -1803,7 +1868,11 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(adapter, CodexFixtureAdapter)
         assert isinstance(adapter, CodexFixtureAdapter)
 
-        async def fail_replace(_prompt: str, _model: str | None = None):
+        async def fail_replace(
+            _prompt: str,
+            _model: str | None = None,
+            _effort: str | None = None,
+        ):
             await adapter._events.put(  # noqa: SLF001 - failure-drain fixture
                 ProviderEvent(
                     ProviderKind.CODEX,
