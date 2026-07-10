@@ -72,27 +72,31 @@ async function getHighlighter(): Promise<Highlighter> {
 
 async function ensureTheme(h: Highlighter, theme: BundledTheme): Promise<void> {
   if (loadedThemes.has(theme)) return;
-  let pending = loadingThemes.get(theme);
-  if (!pending) {
-    pending = h.loadTheme(theme).then(() => {
-      loadedThemes.add(theme);
-      loadingThemes.delete(theme);
-    });
-    loadingThemes.set(theme, pending);
+  const existing = loadingThemes.get(theme);
+  if (existing) {
+    await existing;
+    return;
   }
+  const pending: Promise<void> = h.loadTheme(theme).then(() => {
+    loadedThemes.add(theme);
+    loadingThemes.delete(theme);
+  });
+  loadingThemes.set(theme, pending);
   await pending;
 }
 
 async function ensureLang(h: Highlighter, lang: BundledLanguage): Promise<void> {
   if (loadedLangs.has(lang)) return;
-  let pending = loadingLangs.get(lang);
-  if (!pending) {
-    pending = h.loadLanguage(lang).then(() => {
-      loadedLangs.add(lang);
-      loadingLangs.delete(lang);
-    });
-    loadingLangs.set(lang, pending);
+  const existing = loadingLangs.get(lang);
+  if (existing) {
+    await existing;
+    return;
   }
+  const pending: Promise<void> = h.loadLanguage(lang).then(() => {
+    loadedLangs.add(lang);
+    loadingLangs.delete(lang);
+  });
+  loadingLangs.set(lang, pending);
   await pending;
 }
 
