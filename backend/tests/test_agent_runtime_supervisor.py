@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -21,7 +22,13 @@ from backend.app.agent_runtime.client import (
 )
 from backend.app.agent_runtime.codex import CodexAppServerAdapter
 from backend.app.agent_runtime.fake import CodexFixtureAdapter, FixtureAdapterFactory
-from backend.app.agent_runtime.process import ProviderProcessIdentity
+from backend.app.agent_runtime.process import (
+    ProviderProcessIdentity,
+    ProviderProcessStatus,
+    provider_parent_pid,
+    provider_pid_is_orphan,
+    provider_process_status,
+)
 from backend.app.agent_runtime.protocol import UnixSupervisorServer
 from backend.app.agent_runtime.provider import (
     AdapterStatus,
@@ -122,6 +129,47 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         await self.supervisor.close()
         self.tmp.cleanup()
+
+    async def _spawn_orphan_process(self, *, ignore_sigterm: bool = False) -> int:
+        child_code = (
+            "import os, signal, sys, time\n"
+            "pid = os.fork()\n"
+            "if pid == 0:\n"
+            "    os.setsid()\n"
+            f"    {'signal.signal(signal.SIGTERM, signal.SIG_IGN)' if ignore_sigterm else 'pass'}\n"
+            "    os.close(sys.stdout.fileno())\n"
+            "    time.sleep(30)\n"
+            "    os._exit(0)\n"
+            "print(pid, flush=True)\n"
+            "os._exit(0)\n"
+        )
+        helper = subprocess.Popen(
+            [sys.executable, "-c", child_code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            start_new_session=True,
+        )
+        stdout, _ = helper.communicate(timeout=2)
+        child_pid = int(stdout.strip())
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if await provider_parent_pid(child_pid) == 1:
+                return child_pid
+            await asyncio.sleep(0.05)
+        self.fail(f"child {child_pid} was not reparented to init")
+
+    async def _cleanup_process(self, pid: int) -> None:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if await provider_process_status(pid) is None:
+                return
+            await asyncio.sleep(0.05)
+        self.fail(f"child {pid} did not exit during cleanup")
 
     def _codex_process_factory(self, env: dict[str, str]):
         async def identity(
@@ -1880,13 +1928,21 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             and json.loads(self.paths.registry_path.read_text()).get("WIKI-ARCHIVE-DEAD")
         )
 
+    async def test_provider_parent_pid_reports_real_orphan(self) -> None:
+        child_pid = await self._spawn_orphan_process()
+        try:
+            self.assertEqual(await provider_parent_pid(child_pid), 1)
+            self.assertTrue(await provider_pid_is_orphan(child_pid))
+        finally:
+            await self._cleanup_process(child_pid)
+
     async def test_archive_allows_detached_live_orphan_run(self) -> None:
         await self.supervisor.close()
         self.supervisor = Supervisor(
             self.store,
             FixtureAdapterFactory(FIXTURES),
-            pid_alive=lambda _pid: True,
         )
+        child_pid = await self._spawn_orphan_process(ignore_sigterm=True)
         record = RunRecord.new(
             agent_id="WIKI-ARCHIVE-ORPHAN",
             provider=ProviderKind.CODEX,
@@ -1898,27 +1954,16 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         record.state = LifecycleState.BLOCKED
         record.state_reason = "provider PID is live but its control channel is not attached"
         record.provider_session_id = "session-orphan"
-        record.provider_pid = 424_242
+        record.provider_pid = child_pid
         self.store.create(record)
-
-        with (
-            mock.patch.object(
-                self.supervisor,
-                "_provider_pid_is_orphan",
-                new=mock.AsyncMock(return_value=True),
-            ) as orphan,
-            mock.patch.object(
-                self.supervisor,
-                "_terminate_orphan_provider_pid",
-                new=mock.AsyncMock(return_value=True),
-            ) as terminate,
-        ):
+        try:
             archived = await self.supervisor.archive(record.run_id)
+        finally:
+            if await provider_process_status(child_pid) is not None:
+                await self._cleanup_process(child_pid)
 
         self.assertEqual(archived.state, LifecycleState.COMPLETED)
         self.assertIsNone(archived.provider_pid)
-        orphan.assert_awaited_once_with(424_242)
-        terminate.assert_awaited_once_with(424_242)
         self.assertFalse(self.store.run_dir(record.run_id).exists())
         self.assertFalse(
             (self.paths.registry_path.exists())
@@ -1926,13 +1971,19 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 "WIKI-ARCHIVE-ORPHAN"
             )
         )
+        self.assertIsNone(await provider_process_status(child_pid))
 
     async def test_archive_refuses_detached_live_non_orphan_run(self) -> None:
         await self.supervisor.close()
         self.supervisor = Supervisor(
             self.store,
             FixtureAdapterFactory(FIXTURES),
-            pid_alive=lambda _pid: True,
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
         )
         record = RunRecord.new(
             agent_id="WIKI-ARCHIVE-LIVE",
@@ -1945,26 +1996,75 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         record.state = LifecycleState.BLOCKED
         record.state_reason = "provider PID is live but its control channel is not attached"
         record.provider_session_id = "session-live"
-        record.provider_pid = 313_337
+        record.provider_pid = process.pid
         self.store.create(record)
 
+        try:
+            with self.assertRaisesRegex(
+                StoreConflict,
+                "provider PID is live without attached control; refusing false archive",
+            ):
+                await self.supervisor.archive(record.run_id)
+        finally:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=2)
+
+        blocked = self.store.get(record.run_id)
+        self.assertEqual(blocked.state, LifecycleState.BLOCKED)
+        self.assertEqual(blocked.provider_pid, process.pid)
+
+    async def test_archive_marks_orphan_kill_failed_and_clears_pid(self) -> None:
+        await self.supervisor.close()
+        self.supervisor = Supervisor(
+            self.store,
+            FixtureAdapterFactory(FIXTURES),
+            pid_alive=lambda _pid: True,
+        )
+        record = RunRecord.new(
+            agent_id="WIKI-ARCHIVE-KILL-FAIL",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            worktree=str(self.worktree),
+            prompt="fixture",
+        )
+        record.state = LifecycleState.BLOCKED
+        record.state_reason = "provider PID is live but its control channel is not attached"
+        record.provider_session_id = "session-kill-fail"
+        record.provider_pid = 424_244
+        self.store.create(record)
+
+        orphan = ProviderProcessStatus(
+            pid=424_244,
+            parent_pid=1,
+            started_at="Fri Jul 10 16:00:00 2026",
+            process_group_id=424_244,
+        )
         with (
             mock.patch.object(
                 self.supervisor,
-                "_provider_pid_is_orphan",
+                "_orphaned_provider_process",
+                new=mock.AsyncMock(return_value=orphan),
+            ),
+            mock.patch.object(
+                self.supervisor,
+                "_terminate_orphan_provider_pid",
                 new=mock.AsyncMock(return_value=False),
-            ) as orphan,
+            ),
             self.assertRaisesRegex(
                 StoreConflict,
-                "provider PID is live without attached control; refusing false archive",
+                "orphan provider PID remained live after forced archive cleanup",
             ),
         ):
             await self.supervisor.archive(record.run_id)
 
-        orphan.assert_awaited_once_with(313_337)
         blocked = self.store.get(record.run_id)
         self.assertEqual(blocked.state, LifecycleState.BLOCKED)
-        self.assertEqual(blocked.provider_pid, 313_337)
+        self.assertEqual(blocked.state_reason, "orphan_kill_failed")
+        self.assertIsNone(blocked.provider_pid)
 
     async def test_codex_fake_exercises_start_steer_and_targeted_interrupt(
         self,

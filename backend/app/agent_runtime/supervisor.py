@@ -12,7 +12,11 @@ from uuid import UUID, uuid4
 
 from .. import accounts
 from .normalizer import NormalizedProviderEvent, normalize_provider_event
-from .process import provider_pid_is_orphan, terminate_detached_provider_pid
+from .process import (
+    ProviderProcessStatus,
+    orphaned_provider_process,
+    terminate_detached_provider_pid,
+)
 from .provider import AdapterStatus, ProviderAdapter, ProviderEvent, StartRequest
 from .store import RunNotFound, RunStore, StoreConflict
 from .types import (
@@ -210,12 +214,16 @@ class Supervisor:
     def _run_lock(self, run_id: str) -> asyncio.Lock:
         return self._agent_lock(self.store.get(run_id).agent_id)
 
-    async def _provider_pid_is_orphan(self, pid: int | None) -> bool:
-        return await provider_pid_is_orphan(pid)
+    async def _orphaned_provider_process(
+        self, pid: int | None
+    ) -> ProviderProcessStatus | None:
+        return await orphaned_provider_process(pid)
 
-    async def _terminate_orphan_provider_pid(self, pid: int | None) -> bool:
+    async def _terminate_orphan_provider_pid(
+        self, process: ProviderProcessStatus | None
+    ) -> bool:
         return await terminate_detached_provider_pid(
-            pid,
+            process,
             grace=self.orphan_archive_grace_seconds,
         )
 
@@ -1735,11 +1743,23 @@ class Supervisor:
         if adapter is None:
             record = self.store.get(run_id)
             if self.pid_alive(record.provider_pid):
-                if not await self._provider_pid_is_orphan(record.provider_pid):
+                orphan = await self._orphaned_provider_process(record.provider_pid)
+                if orphan is None:
                     raise StoreConflict(
                         "provider PID is live without attached control; refusing false archive"
                     )
-                if not await self._terminate_orphan_provider_pid(record.provider_pid):
+                if not await self._terminate_orphan_provider_pid(orphan):
+                    record = self.store.transition(
+                        run_id,
+                        record.state,
+                        reason="orphan_kill_failed",
+                        adapter_status=self._detached_terminal_status(
+                            record,
+                            record.state,
+                            detail="orphan_kill_failed",
+                        ),
+                    )
+                    await self._publish_agent_change(record.agent_id)
                     raise StoreConflict(
                         "orphan provider PID remained live after forced archive cleanup"
                     )
