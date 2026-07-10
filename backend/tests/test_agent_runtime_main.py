@@ -3,7 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
+import signal
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from typing import Any, cast
@@ -755,6 +760,517 @@ class BackendSupervisorEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(workers[0]["control_attached"])
         supervisor = cast(dict[str, Any], agents["supervisor"])
         self.assertEqual(supervisor["status"], "ready")
+
+
+class DetachedHeadlessAcceptanceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.repo_root = Path(__file__).resolve().parents[2]
+        self.python = Path(sys.executable)
+        self.worktree = self.root / "worktree"
+        self.bin_dir = self.root / "bin"
+        self.status_dir = self.root / "status"
+        self.archive_dir = self.root / "archive"
+        self.tmp_dir = self.root / "tmp"
+        self.sessions_dir = self.root / "sessions"
+        self.vault_dir = self.root / "vault"
+        self.account_home = self.root / "account-home"
+        self.claude_config_dir = self.account_home / "claude"
+        self.paths = RuntimePaths(
+            runtime_dir=self.root / "runtime",
+            socket_path=self.root / "runtime" / "supervisor.sock",
+            registry_path=self.root / "agent-registry.json",
+            archive_dir=self.archive_dir,
+            status_dir=self.status_dir,
+        )
+        for directory in (
+            self.worktree,
+            self.bin_dir,
+            self.status_dir,
+            self.archive_dir,
+            self.tmp_dir,
+            self.sessions_dir,
+            self.vault_dir,
+            self.claude_config_dir,
+            self.root / "queue-parent",
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+        self.queue_path = self.root / "queue-parent" / "wiki-msg-queue.json"
+        self.queue_path.write_text("{}\n", encoding="utf-8")
+        self.backend_driver = self.root / "backend-driver.py"
+        self.codex_log = self.root / "codex-protocol.log"
+        self.claude_log = self.root / "claude-protocol.log"
+        self._write_cli_wrapper(
+            "codex",
+            self.codex_log,
+            FIXTURES / "fake_codex_app_server.py",
+            extra_exports={
+                "FAKE_CODEX_TRANSCRIPT_DIR": str(self.sessions_dir),
+            },
+        )
+        self._write_cli_wrapper(
+            "claude",
+            self.claude_log,
+            FIXTURES / "fake_claude_stream.py",
+        )
+        self.env = {
+            **os.environ,
+            "PATH": f"{self.bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+            "PYTHONPATH": f"{self.repo_root}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+            "PYTHONUNBUFFERED": "1",
+            "TMUX": "",
+            "TMUX_PANE": "",
+            "WIKI_AGENT_REGISTRY_PATH": str(self.paths.registry_path),
+            "WIKI_AGENT_STATUS_DIR": str(self.status_dir),
+            "WIKI_AGENT_ARCHIVE_DIR": str(self.archive_dir),
+            "WIKI_AGENT_TMP_DIR": str(self.tmp_dir),
+            "WIKI_MSG_QUEUE_PATH": str(self.queue_path),
+            "WIKI_AGENT_RUNTIME_DIR": str(self.paths.runtime_dir),
+            "WIKI_SUPERVISOR_SOCKET_PATH": str(self.paths.socket_path),
+            "WIKI_SUPERVISOR_AUTOSTART": "off",
+            "WIKI_VAULT_DIR": str(self.vault_dir),
+            "WIKI_CODEX_SESSIONS_DIR": str(self.sessions_dir),
+            "WIKI_CLAUDE_PROJECTS_DIR": str(self.claude_config_dir / "projects"),
+            "WIKI_ACCOUNT_HOME_OVERRIDE": str(self.account_home),
+            "WIKI_CODEX_AUTH_PATH": str(self.account_home / "codex" / "auth.json"),
+            "WIKI_CODEX_ACCOUNTS_DIR": str(self.account_home / "codex-accounts"),
+            "WIKI_ROTATION_LOG_PATH": str(self.account_home / "rotation.log"),
+            "WIKI_ACCOUNT_WATCHDOG": "off",
+            "CODEX_HOME": str(self.account_home / "codex"),
+            "CLAUDE_CONFIG_DIR": str(self.claude_config_dir),
+            "WIKI_TEST_REPO_ROOT": str(self.repo_root),
+        }
+        self._write_backend_driver()
+        self.daemon: subprocess.Popen[str] | None = None
+        self.client = SupervisorClient(self.paths, timeout=1.0)
+
+    def tearDown(self) -> None:
+        self._stop_daemon()
+        self.tmp.cleanup()
+
+    def _write_cli_wrapper(
+        self,
+        name: str,
+        log_path: Path,
+        script_path: Path,
+        *,
+        extra_exports: dict[str, str] | None = None,
+    ) -> None:
+        extra = extra_exports or {}
+        exports = "\n".join(
+            f'export {key}="{value}"' for key, value in {"FAKE_PROTOCOL_LOG": str(log_path), **extra}.items()
+        )
+        wrapper = self.bin_dir / name
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            f'{exports}\n'
+            f'exec "{self.python}" "{script_path}" "$@"\n',
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+
+    def _write_backend_driver(self) -> None:
+        self.backend_driver.write_text(
+            """
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+ROOT = Path(os.environ["WIKI_TEST_REPO_ROOT"])
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from fastapi import BackgroundTasks, HTTPException
+from backend.app import main
+
+
+def _ticket_from(path: str, suffix: str) -> str:
+    prefix = "/api/agents/"
+    if not path.startswith(prefix) or not path.endswith(suffix):
+        raise RuntimeError(f"unsupported path: {path}")
+    return path[len(prefix) : -len(suffix)]
+
+
+for raw in sys.stdin:
+    if not raw:
+        break
+    request = json.loads(raw)
+    method = request["method"]
+    path = request["path"]
+    body = request.get("body") or {}
+    try:
+        if method == "GET" and path == "/health":
+            result = main.health()
+        elif method == "GET" and path == "/api/agents":
+            result = main.agents()
+        elif method == "POST" and path == "/api/agents/spawn":
+            result = main.spawn_agent(main.SpawnWorkerIn(**body))
+        elif method == "GET" and path.endswith("/events?include_raw=true"):
+            result = main.agent_provider_events(
+                _ticket_from(path, "/events?include_raw=true"),
+                after_seq=0,
+                limit=200,
+                include_raw=True,
+            )
+        elif method == "POST" and path.endswith("/replace"):
+            result = main.replace_agent(_ticket_from(path, "/replace"))
+        elif method == "POST" and path.endswith("/resume"):
+            result = main.resume_agent(_ticket_from(path, "/resume"))
+        elif method == "POST" and path.endswith("/message"):
+            result = main.agent_message(
+                _ticket_from(path, "/message"),
+                main.MessageIn(**body),
+                BackgroundTasks(),
+            )
+        else:
+            raise RuntimeError(f"unsupported request: {method} {path}")
+        sys.stdout.write(json.dumps({"result": result}, separators=(",", ":")) + "\\n")
+        sys.stdout.flush()
+    except HTTPException as exc:
+        sys.stdout.write(
+            json.dumps(
+                {
+                    "error": {
+                        "type": "HTTPException",
+                        "status": exc.status_code,
+                        "detail": exc.detail,
+                    }
+                },
+                separators=(",", ":"),
+            )
+            + "\\n"
+        )
+        sys.stdout.flush()
+    except Exception as exc:
+        sys.stdout.write(
+            json.dumps(
+                {
+                    "error": {
+                        "type": type(exc).__name__,
+                        "detail": str(exc),
+                    }
+                },
+                separators=(",", ":"),
+            )
+            + "\\n"
+        )
+        sys.stdout.flush()
+""".strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        self.backend_driver.chmod(0o755)
+
+    def _wait_for(
+        self,
+        loader,
+        predicate,
+        *,
+        timeout: float = 15.0,
+        interval: float = 0.05,
+    ):
+        deadline = time.monotonic() + timeout
+        last = None
+        while time.monotonic() < deadline:
+            try:
+                last = loader()
+            except Exception as exc:  # noqa: BLE001 - polling helper
+                last = exc
+            else:
+                if predicate(last):
+                    return last
+            time.sleep(interval)
+        self.fail(f"timed out waiting for condition; last value: {last!r}")
+
+    def _start_daemon(self) -> None:
+        if self.daemon is not None and self.daemon.poll() is None:
+            return
+        self.daemon = subprocess.Popen(
+            [
+                str(self.python),
+                "-m",
+                "backend.app.agent_runtime.daemon",
+                "--runtime-dir",
+                str(self.paths.runtime_dir),
+                "--socket",
+                str(self.paths.socket_path),
+                "--registry",
+                str(self.paths.registry_path),
+            ],
+            cwd=self.repo_root,
+            env=self.env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            self._wait_for(
+                self.client.ping,
+                lambda payload: payload.get("status") == "ok",
+            )
+        except AssertionError as exc:
+            stderr = self.daemon.stderr.read() if self.daemon and self.daemon.stderr else ""
+            raise AssertionError(f"{exc}\ndaemon stderr:\n{stderr}") from exc
+        if self.daemon.poll() is not None:
+            stderr = self.daemon.stderr.read() if self.daemon.stderr else ""
+            self.fail(f"daemon exited during startup: {stderr}")
+
+    def _stop_daemon(self) -> None:
+        process = self.daemon
+        if process is None:
+            return
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        if process.stderr:
+            process.stderr.close()
+        self.daemon = None
+
+    def _start_backend(self) -> None:
+        try:
+            self._wait_for(
+                lambda: self._read_json("GET", "/health"),
+                lambda payload: payload.get("status") == "ok",
+            )
+        except AssertionError as exc:
+            raise AssertionError(f"{exc}\nbackend request bootstrap failed") from exc
+
+    def _stop_backend(self) -> None:
+        """Each request uses a fresh backend process; no persistent child to stop."""
+
+        return None
+
+    def _read_json(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        request = json.dumps(
+            {"method": method, "path": path, "body": body},
+            separators=(",", ":"),
+        )
+        process = subprocess.run(
+            [str(self.python), str(self.backend_driver)],
+            cwd=self.repo_root,
+            env=self.env,
+            input=f"{request}\n",
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        if process.returncode != 0:
+            raise AssertionError(
+                f"backend request process failed ({process.returncode}): {process.stderr or process.stdout}"
+            )
+        lines = [line for line in process.stdout.splitlines() if line]
+        if not lines:
+            raise AssertionError(f"backend request produced no output: {process.stderr}")
+        response = cast(dict[str, Any], json.loads(lines[-1]))
+        error = response.get("error")
+        if isinstance(error, dict):
+            raise AssertionError(f"{method} {path} failed: {error}")
+        return cast(dict[str, Any], response["result"])
+
+    def _registry(self) -> dict[str, Any]:
+        return cast(
+            dict[str, Any],
+            json.loads(self.paths.registry_path.read_text(encoding="utf-8")),
+        )
+
+    def _current(self, agent_id: str) -> dict[str, Any]:
+        return cast(dict[str, Any], self._registry()[agent_id]["current"])
+
+    def _agents_payload(self) -> dict[str, Any]:
+        return self._read_json("GET", "/api/agents")
+
+    def _worker_row(self, payload: dict[str, Any], ticket: str) -> dict[str, Any]:
+        workers = cast(list[dict[str, Any]], payload["workers"])
+        return next(row for row in workers if row["ticket"] == ticket)
+
+    def _events(self, ticket: str) -> dict[str, Any]:
+        return self._read_json("GET", f"/api/agents/{ticket}/events?include_raw=true")
+
+    def _assert_tmux_stripped(self, log_path: Path) -> None:
+        rows = [
+            json.loads(line)
+            for line in log_path.read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+        env_rows = [row for row in rows if "tmux" in row]
+        self.assertTrue(env_rows)
+        for row in env_rows:
+            self.assertIn(row.get("tmux"), (None, ""))
+            self.assertIn(row.get("tmux_pane"), (None, ""))
+
+    def _write_evidence(self, payload: dict[str, Any]) -> None:
+        out_dir = os.environ.get("WIKI_HEADLESS_EVIDENCE_DIR")
+        if not out_dir:
+            return
+        target = Path(out_dir)
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "summary.json").write_text(
+            json.dumps(payload, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        shutil.copy2(self.codex_log, target / "codex-protocol.log")
+        shutil.copy2(self.claude_log, target / "claude-protocol.log")
+        shutil.copy2(self.paths.registry_path, target / "agent-registry.json")
+
+    def test_real_daemon_backend_restart_and_mixed_fleet_cycle_without_tmux(
+        self,
+    ) -> None:
+        self._start_daemon()
+        self._start_backend()
+
+        codex = self._read_json(
+            "POST",
+            "/api/agents/spawn",
+            {
+                "ticket": "WIKI-CODEX",
+                "kind": "cdx",
+                "role": "implement",
+                "model": "gpt-5.4",
+                "effort": "high",
+                "workdir": str(self.worktree),
+                "orch": None,
+                "prompt": "Implement the Codex side of WIKI-42.",
+            },
+        )
+        claude = self._read_json(
+            "POST",
+            "/api/agents/spawn",
+            {
+                "ticket": "WIKI-CLAUDE",
+                "kind": "cc",
+                "role": "review",
+                "model": "sonnet",
+                "effort": None,
+                "workdir": str(self.worktree),
+                "orch": None,
+                "prompt": "Review the Claude side of WIKI-42.",
+            },
+        )
+        self.assertIsNone(codex["window"])
+        self.assertIsNone(claude["window"])
+
+        initial_agents = self._wait_for(
+            self._agents_payload,
+            lambda payload: {
+                row["ticket"] for row in cast(list[dict[str, Any]], payload["workers"])
+            }
+            >= {"WIKI-CODEX", "WIKI-CLAUDE"}
+            and cast(dict[str, Any], payload["supervisor"]).get("status") == "ready",
+        )
+        codex_row = self._worker_row(initial_agents, "WIKI-CODEX")
+        claude_row = self._worker_row(initial_agents, "WIKI-CLAUDE")
+        self.assertTrue(codex_row["control_attached"])
+        self.assertTrue(claude_row["control_attached"])
+        self.assertIsNone(codex_row["window"])
+        self.assertIsNone(claude_row["window"])
+
+        codex_events_before = self._wait_for(
+            lambda: self._events("WIKI-CODEX"),
+            lambda payload: cast(int, payload["raw_count"]) > 0,
+        )
+        claude_events_before = self._wait_for(
+            lambda: self._events("WIKI-CLAUDE"),
+            lambda payload: cast(int, payload["raw_count"]) > 0,
+        )
+        codex_session_before = cast(str, self._current("WIKI-CODEX")["provider_session_id"])
+        claude_session_before = cast(
+            str, self._current("WIKI-CLAUDE")["provider_session_id"]
+        )
+        self._assert_tmux_stripped(self.codex_log)
+        self._assert_tmux_stripped(self.claude_log)
+
+        self._stop_backend()
+        self.assertEqual(
+            self.client.send_message("WIKI-CODEX", "keep going while backend is down", "now"),
+            {"status": "sent"},
+        )
+        self.assertEqual(
+            self.client.send_message("WIKI-CLAUDE", "keep going while backend is down", "now"),
+            {"status": "sent"},
+        )
+
+        self._start_backend()
+        codex_events_after_restart = self._wait_for(
+            lambda: self._events("WIKI-CODEX"),
+            lambda payload: cast(int, payload["raw_count"])
+            > cast(int, codex_events_before["raw_count"]),
+        )
+        claude_events_after_restart = self._wait_for(
+            lambda: self._events("WIKI-CLAUDE"),
+            lambda payload: cast(int, payload["raw_count"])
+            > cast(int, claude_events_before["raw_count"]),
+        )
+        self.assertEqual(
+            self._current("WIKI-CODEX")["provider_session_id"], codex_session_before
+        )
+        self.assertEqual(
+            self._current("WIKI-CLAUDE")["provider_session_id"], claude_session_before
+        )
+
+        replaced = self._read_json("POST", "/api/agents/WIKI-CODEX/replace")
+        replaced_run_id = cast(str, replaced["run_id"])
+        self.assertNotEqual(replaced_run_id, codex["run_id"])
+        replaced_current = self._wait_for(
+            lambda: self._current("WIKI-CODEX"),
+            lambda current: current["run_id"] == replaced_run_id,
+        )
+
+        claude_before_kill = self._current("WIKI-CLAUDE")
+        claude_pid_before = cast(int, claude_before_kill["provider_pid"])
+        os.kill(claude_pid_before, signal.SIGTERM)
+        detached = self._wait_for(
+            self._agents_payload,
+            lambda payload: not self._worker_row(payload, "WIKI-CLAUDE")["control_attached"],
+        )
+        self.assertIsNotNone(self._worker_row(detached, "WIKI-CLAUDE")["provider_pid"])
+
+        resumed = self._read_json("POST", "/api/agents/WIKI-CLAUDE/resume")
+        self.assertEqual(resumed["provider_session_id"], claude_session_before)
+        revived = self._wait_for(
+            lambda: self._current("WIKI-CLAUDE"),
+            lambda current: current["provider_session_id"] == claude_session_before
+            and current["provider_pid"] not in (None, claude_pid_before),
+        )
+        final_agents = self._agents_payload()
+        self.assertTrue(self._worker_row(final_agents, "WIKI-CLAUDE")["control_attached"])
+        self.assertTrue(self._worker_row(final_agents, "WIKI-CODEX")["control_attached"])
+        self._assert_tmux_stripped(self.codex_log)
+        self._assert_tmux_stripped(self.claude_log)
+        self._write_evidence(
+            {
+                "backend_restart": {
+                    "codex_raw_before": codex_events_before["raw_count"],
+                    "codex_raw_after": codex_events_after_restart["raw_count"],
+                    "claude_raw_before": claude_events_before["raw_count"],
+                    "claude_raw_after": claude_events_after_restart["raw_count"],
+                },
+                "replace": {
+                    "old_run_id": codex["run_id"],
+                    "new_run_id": replaced_run_id,
+                    "session_id": replaced_current["provider_session_id"],
+                },
+                "revive": {
+                    "session_id": claude_session_before,
+                    "old_pid": claude_pid_before,
+                    "new_pid": revived["provider_pid"],
+                },
+            }
+        )
 
 
 if __name__ == "__main__":
