@@ -123,6 +123,12 @@ def _apply_pending_request_event(
         record.pending_requests.pop(_provider_request_key(request_id), None)
 
 
+def _resolved_parent(path: Path) -> Path:
+    """Resolve the parent chain, keep the final component unresolved."""
+    absolute = path.absolute()
+    return absolute.parent.resolve() / absolute.name
+
+
 @dataclass(frozen=True)
 class RuntimePaths:
     runtime_dir: Path
@@ -162,14 +168,17 @@ class RuntimePaths:
         status_dir = Path(
             values.get("WIKI_AGENT_STATUS_DIR") or "/tmp/agent-status"
         ).expanduser()
-        # absolute() preserves the final path component instead of following a
-        # pre-existing symlink. Writers can then reject symlinks explicitly.
+        # Resolve the PARENT chain but keep the final component unresolved:
+        # macOS's /tmp is itself a symlink (-> /private/tmp), which the
+        # symlink-dir guards would otherwise refuse, while the final component
+        # must stay unresolved so writers still reject symlinked files/dirs
+        # planted at the exact target path.
         return cls(
-            runtime_dir=runtime_dir.absolute(),
-            socket_path=socket_path.absolute(),
-            registry_path=registry_path.absolute(),
-            archive_dir=archive_dir.absolute(),
-            status_dir=status_dir.absolute(),
+            runtime_dir=_resolved_parent(runtime_dir),
+            socket_path=_resolved_parent(socket_path),
+            registry_path=_resolved_parent(registry_path),
+            archive_dir=_resolved_parent(archive_dir),
+            status_dir=_resolved_parent(status_dir),
         )
 
     @property
