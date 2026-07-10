@@ -735,6 +735,47 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("opus-4.8", str(blocked.exception.detail))
         self.assertIn("Allowed values: opus-4.7, opus, sonnet, sonnet-4.6, haiku, haiku-4.5", str(blocked.exception.detail))
 
+    async def test_spawn_accepts_gpt_56_sol_variant(self) -> None:
+        spawned = main.spawn_agent(
+            main.SpawnWorkerIn(
+                ticket="WIKI-42",
+                kind="cdx",
+                role="implement",
+                model="gpt-5.6-sol",
+                effort="high",
+                workdir=str(self.worktree),
+                orch=None,
+                prompt="Implement WIKI-42",
+            )
+        )
+
+        self.assertEqual(spawned["run_id"], RUN_ID)
+        start = next(params for method, params in self.client.calls if method == "run/start")
+        self.assertEqual(start["model"], "gpt-5.6-sol")
+
+    async def test_spawn_rejects_legacy_bare_gpt_56_before_supervisor(self) -> None:
+        with self.assertRaises(HTTPException) as blocked:
+            main.spawn_agent(
+                main.SpawnWorkerIn(
+                    ticket="WIKI-42",
+                    kind="cdx",
+                    role="implement",
+                    model="gpt-5.6",
+                    effort="high",
+                    workdir=str(self.worktree),
+                    orch=None,
+                    prompt="Implement WIKI-42",
+                )
+            )
+
+        self.assertEqual(blocked.exception.status_code, 400)
+        self.assertEqual(self.client.calls, [])
+        self.assertIn("gpt-5.6", str(blocked.exception.detail))
+        self.assertIn(
+            "Allowed values: gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna, gpt-5.5, gpt-5.4, gpt-5.4-mini, gpt-5.3-codex-spark",
+            str(blocked.exception.detail),
+        )
+
     async def test_orchestrator_spawn_rejects_unknown_model_before_supervisor(self) -> None:
         with self.assertRaises(HTTPException) as blocked:
             main.spawn_orchestrator(

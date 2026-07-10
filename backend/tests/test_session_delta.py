@@ -34,8 +34,12 @@ class SessionDeltaTests(unittest.TestCase):
         payload = main.list_models()
         models = {model["id"]: model for model in payload["models"]}
 
-        self.assertIn("gpt-5.6", models)
-        self.assertEqual(models["gpt-5.6"]["kind"], "cdx")
+        self.assertNotIn("gpt-5.6", models)
+        self.assertEqual(
+            ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+            [payload["models"][index]["id"] for index in range(3)],
+        )
+        self.assertEqual(models["gpt-5.6-sol"]["kind"], "cdx")
         self.assertIn("opus-4.7", models)
         self.assertEqual(models["opus-4.7"]["kind"], "cc")
 
@@ -462,7 +466,7 @@ class SessionDeltaTests(unittest.TestCase):
                         "_orchestrators": {
                             "WIKI-32": {
                                 "window": "@9999",
-                                "model": "gpt-5.6",
+                                "model": "gpt-5.6-sol",
                                 "spawned_at": "2026-07-09T01:00:00Z",
                                 "transcript": str(transcript),
                             }
@@ -501,7 +505,7 @@ class SessionDeltaTests(unittest.TestCase):
             self.assertEqual(body["format"], "codex")
             self.assertEqual(body["cursor"], 2)
             self.assertEqual([event["text"] for event in body["events"]], ["hello", "world"])
-            self.assertEqual(body["model"], "gpt-5.6")
+            self.assertEqual(body["model"], "gpt-5.6-sol")
             self.assertEqual(body["kind"], "cdx")
             self.assertEqual(body["provider"], "codex")
 
