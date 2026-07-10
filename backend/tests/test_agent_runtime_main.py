@@ -856,6 +856,71 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(replaced["type"], "orchestrator")
         self.assertEqual(replaced["run_id"], REPLACEMENT_RUN_ID)
 
+    async def test_orchestrator_spawn_accepts_cdx_kind_with_valid_model_and_effort(self) -> None:
+        spawned = main.spawn_orchestrator(
+            main.SpawnOrchestratorIn(
+                id="wiki_cdx",
+                workdir=str(self.worktree),
+                kind="cdx",
+                model="gpt-5.4",
+                effort="high",
+                goal="Orchestrate the cdx fleet.",
+            )
+        )
+        self.assertIsNone(spawned["window"])
+        self.assertEqual(spawned["run_id"], RUN_ID)
+        start = next(params for method, params in self.client.calls if method == "run/start")
+        self.assertEqual(start["provider"], "codex")
+        self.assertEqual(start["role"], "orchestrator")
+        self.assertEqual(start["model"], "gpt-5.4")
+        self.assertEqual(start["effort"], "high")
+
+    async def test_orchestrator_spawn_rejects_cdx_with_invalid_model_before_supervisor(self) -> None:
+        with self.assertRaises(HTTPException) as blocked:
+            main.spawn_orchestrator(
+                {
+                    "id": "wiki_cdx",
+                    "workdir": str(self.worktree),
+                    "kind": "cdx",
+                    "model": "gpt-99",
+                    "effort": "high",
+                    "goal": "Coordinate.",
+                }
+            )
+        self.assertEqual(blocked.exception.status_code, 400)
+        self.assertEqual(self.client.calls, [])
+        self.assertIn("gpt-99", str(blocked.exception.detail))
+
+    async def test_orchestrator_spawn_rejects_invalid_kind(self) -> None:
+        with self.assertRaises(HTTPException) as blocked:
+            main.spawn_orchestrator(
+                {
+                    "id": "wiki_bad",
+                    "workdir": str(self.worktree),
+                    "kind": "bad",
+                    "model": "opus",
+                    "effort": None,
+                    "goal": "",
+                }
+            )
+        self.assertEqual(blocked.exception.status_code, 400)
+        self.assertEqual(self.client.calls, [])
+
+    async def test_orchestrator_spawn_cc_still_works_without_kind(self) -> None:
+        spawned = main.spawn_orchestrator(
+            {
+                "id": "wiki_cc_compat",
+                "workdir": str(self.worktree),
+                "model": "opus",
+                "goal": "Coordinate the cc fleet.",
+            }
+        )
+        self.assertIsNone(spawned["window"])
+        self.assertEqual(spawned["run_id"], RUN_ID)
+        start = next(params for method, params in self.client.calls if method == "run/start")
+        self.assertEqual(start["provider"], "claude")
+        self.assertEqual(start["effort"], None)
+
     async def test_supervisor_event_bridge_preserves_sse_dictionary(self) -> None:
         subscriber = main._subscribe_agent_events()  # noqa: SLF001 - contract test
         task = asyncio.create_task(main.supervisor_event_bridge())

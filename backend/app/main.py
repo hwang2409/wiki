@@ -1638,8 +1638,22 @@ class SpawnWorkerIn(BaseModel):
 class SpawnOrchestratorIn(BaseModel):
     id: str = Field(..., min_length=1, max_length=100)
     workdir: str = Field(..., min_length=1, max_length=4096)
-    model: str = Field(..., min_length=2, max_length=32)
+    kind: str = Field(default="cc", min_length=2, max_length=8)
+    model: str = Field(..., min_length=2, max_length=64)
+    effort: str | None = Field(default=None, max_length=16)
     goal: str = Field(default="", max_length=20_000)
+
+    @model_validator(mode="after")
+    def validate_kind_and_effort(self) -> SpawnOrchestratorIn:
+        kind = self.kind.strip()
+        effort = (self.effort or "").strip() or None
+        if kind not in {"cc", "cdx"}:
+            raise ValueError("kind must be cc or cdx")
+        if kind == "cdx" and effort not in REASONING_EFFORTS:
+            raise ValueError("Reasoning effort is required for Codex orchestrators")
+        if kind == "cc" and effort is not None:
+            raise ValueError("Claude orchestrators do not accept reasoning effort")
+        return self
 
 
 def _allowed_model_message(kind: str, model: str, *, target: str) -> str:
@@ -2030,8 +2044,9 @@ def spawn_orchestrator(body: dict[str, Any] | SpawnOrchestratorIn) -> dict[str, 
             detail="Orchestrator id must start with a letter or number and only use letters, numbers, dashes, or underscores",
         )
 
+    kind = body.kind.strip()
     model = body.model.strip()
-    _require_allowed_model("cc", model, target="Orchestrator")
+    _require_allowed_model(kind, model, target="Orchestrator")
     goal = body.goal.strip()
     if len(goal.encode("utf-8")) >= MAX_ORCH_GOAL_BYTES:
         raise HTTPException(status_code=400, detail="Initial goal must stay under 20KB")
@@ -2085,10 +2100,10 @@ def spawn_orchestrator(body: dict[str, Any] | SpawnOrchestratorIn) -> dict[str, 
         "run/start",
         {
             "agent_id": orch_id,
-            "provider": "claude",
+            "provider": "codex" if kind == "cdx" else "claude",
             "role": "orchestrator",
             "model": model,
-            "effort": None,
+            "effort": body.effort,
             "worktree": str(workdir_path),
             "prompt": prompt,
             "orchestrator_id": None,

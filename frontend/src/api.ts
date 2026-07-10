@@ -153,7 +153,9 @@ export function spawnAgentWorker(body: SpawnWorkerInput) {
 export type SpawnOrchestratorInput = {
   id: string;
   workdir: string;
+  kind: SpawnWorkerKind;
   model: string;
+  effort: SpawnWorkerEffort | null;
   goal: string;
 };
 
