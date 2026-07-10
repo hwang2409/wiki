@@ -774,8 +774,6 @@ function getEstimatedGroupHeight(group: EventGroup): number {
   switch (group.event.kind) {
     case "assistant":
       return Math.max(96, 28 + estimateWrappedLines(group.event.text, 92) * 22);
-    case "thinking":
-      return Math.max(64, 24 + estimateWrappedLines(group.event.text, 104) * 18);
     case "bash":
       return Math.max(
         76,
@@ -901,7 +899,7 @@ function groupEvents(events: SessionEvent[], offset: number): EventGroup[] {
   for (let i = 0; i < events.length; i += 1) {
     const event = events[i];
     // Keys are absolute event indices so open/closed state survives window slides.
-    if (event.kind !== "tool") {
+    if (event.kind !== "tool" && event.kind !== "thinking") {
       groups.push({ kind: "message", event, key: offset + i });
     } else {
       const last = groups[groups.length - 1];
@@ -953,15 +951,6 @@ function SessionMarkdownLink({ href, ...props }: ComponentProps<"a">) {
 const sessionMarkdownComponents = {
   a: SessionMarkdownLink,
 };
-
-function ThinkingBlock({ event }: { event: SessionEvent }) {
-  return (
-    <div className="session-thinking">
-      {event.encrypted ? <span className="session-thinking-chip">encrypted</span> : null}
-      {event.text}
-    </div>
-  );
-}
 
 function BashBlock({
   event,
@@ -1160,9 +1149,6 @@ const MessageBlock = memo(function MessageBlock({
       </div>
     );
   }
-  if (event.kind === "thinking") {
-    return <ThinkingBlock event={event} />;
-  }
   if (event.kind === "terminal") {
     return <pre className="session-pane-log">{renderAnsi(event.text)}</pre>;
   }
@@ -1234,24 +1220,39 @@ function ActivityGroupBase({
 }) {
   const [open, setOpen] = useStoredBooleanState(uiState, `activity:${groupKey}`, false);
   const tools = events.filter((e) => e.kind === "tool");
+  const thinking = events.filter((e) => e.kind === "thinking");
+  const parts: string[] = [];
+  if (tools.length) parts.push(`${tools.length} tool call${tools.length > 1 ? "s" : ""}`);
+  if (thinking.length) parts.push(`${thinking.length} thinking`);
   return (
     <div className="session-activity">
       <button className="session-activity-head" type="button" onClick={() => setOpen(!open)}>
         <ChevronRight className={`collapse-icon${open ? "" : " is-collapsed"}`} size={12} />
-        {tools.length ? `${tools.length} tool call${tools.length > 1 ? "s" : ""}` : "activity"}
+        {parts.join(" · ") || "activity"}
       </button>
       <div className={`session-collapsible session-activity-collapsible${open ? " is-open" : ""}`}>
         <div className="session-collapsible-inner">
           <div className="session-activity-body">
-            {tools.map((event, index) => (
-              <ToolRow
-                event={event}
-                key={groupKey + index}
-                onInspect={onInspect}
-                stateKey={`tool:${groupKey + index}`}
-                uiState={uiState}
-              />
-            ))}
+            {events.map((event, index) => {
+              if (event.kind === "tool") {
+                return (
+                  <ToolRow
+                    event={event}
+                    key={groupKey + index}
+                    onInspect={onInspect}
+                    stateKey={`tool:${groupKey + index}`}
+                    uiState={uiState}
+                  />
+                );
+              }
+              if (!event.text) return null;
+              return (
+                <div className="session-thinking" key={groupKey + index}>
+                  {event.encrypted ? <span className="session-thinking-chip">encrypted</span> : null}
+                  {event.text}
+                </div>
+              );
+            })}
           </div>
         </div>
       </div>
