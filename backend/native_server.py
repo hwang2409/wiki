@@ -80,6 +80,15 @@ def start_parent_watchdog(server: uvicorn.Server, parent_pid: int | None) -> Non
 
 
 def main() -> None:
+    # The frozen supervisor autostart (agent_runtime/client.py) re-execs this
+    # binary with --supervisor; route to the daemon before backend argparse.
+    if "--supervisor" in sys.argv[1:]:
+        sys.argv.remove("--supervisor")
+        from backend.app.agent_runtime.daemon import main as supervisor_main
+
+        supervisor_main()
+        return
+
     args = parse_args()
     configure_environment(args)
 

@@ -41,6 +41,7 @@ hiddenimports = (
     + collect_submodules("starlette")
     + collect_submodules("uvicorn")
     + [
+        "backend.app.agent_runtime.daemon",
         "backend.app.frontend_static",
         "backend.app.main",
         "backend.app.transcripts",
