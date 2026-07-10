@@ -35,10 +35,13 @@ import remarkGfm from "remark-gfm";
 import {
   cancelQueuedMessage,
   getSkills,
+  respondToAgentRequest,
   sendAgentMessage,
   uploadImage,
 } from "./api";
 import type {
+  ProviderEventInspector,
+  ProviderPendingRequest,
   QueuedMessage,
   SessionEvent,
   SessionPr,
@@ -324,6 +327,245 @@ function formatTokens(tokens: number | null): string | null {
 
 function formatDispositionCounts({ unknown }: { unknown: number }): string {
   return `Unknown ${unknown}`;
+}
+
+type ProviderQuestion = {
+  id: string;
+  header?: string;
+  question: string;
+  isOther?: boolean;
+  isSecret?: boolean;
+  options?: { label: string; description?: string }[];
+};
+
+function providerQuestions(request: ProviderPendingRequest): ProviderQuestion[] {
+  if (request.request_kind !== "item/tool/requestUserInput") return [];
+  const params = request.payload.params;
+  if (!params || typeof params !== "object") return [];
+  const questions = (params as { questions?: unknown }).questions;
+  return Array.isArray(questions)
+    ? questions.filter(
+        (question): question is ProviderQuestion =>
+          Boolean(
+            question &&
+              typeof question === "object" &&
+              typeof (question as { id?: unknown }).id === "string" &&
+              typeof (question as { question?: unknown }).question === "string",
+          ),
+      )
+    : [];
+}
+
+function ProviderPendingRequestCard({
+  request,
+  ticket,
+}: {
+  request: ProviderPendingRequest;
+  ticket: string;
+}) {
+  const questions = providerQuestions(request);
+  const [answers, setAnswers] = useState<Record<string, string>>({});
+  const [responseText, setResponseText] = useState("{}");
+  const [sending, setSending] = useState(false);
+  const [sent, setSent] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function submit() {
+    if (sending || sent) return;
+    let response: Record<string, unknown>;
+    if (questions.length > 0) {
+      const missing = questions.find((question) => !answers[question.id]?.trim());
+      if (missing) {
+        setError(`Answer required: ${missing.question}`);
+        return;
+      }
+      response = {
+        answers: Object.fromEntries(
+          questions.map((question) => [
+            question.id,
+            { answers: [answers[question.id].trim()] },
+          ]),
+        ),
+      };
+    } else {
+      try {
+        const parsed: unknown = JSON.parse(responseText);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          throw new Error("Response must be a JSON object.");
+        }
+        response = parsed as Record<string, unknown>;
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Response is not valid JSON.");
+        return;
+      }
+    }
+
+    setSending(true);
+    setError(null);
+    try {
+      await respondToAgentRequest(ticket, request.request_id, response);
+      setSent(true);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not send provider response.");
+    } finally {
+      setSending(false);
+    }
+  }
+
+  return (
+    <div className="session-provider-request">
+      <div className="session-provider-request-head">
+        <span>Action required</span>
+        <span>{request.request_kind}</span>
+        <span>request {String(request.request_id)}</span>
+      </div>
+      {questions.length > 0 ? (
+        <div className="session-provider-questions">
+          {questions.map((question) => (
+            <label className="session-provider-question" key={question.id}>
+              <span>
+                {question.header ? `${question.header} · ` : ""}
+                {question.question}
+              </span>
+              {question.options?.length ? (
+                <select
+                  value={answers[question.id] ?? ""}
+                  onChange={(event) => {
+                    setAnswers((current) => ({
+                      ...current,
+                      [question.id]: event.target.value,
+                    }));
+                    setError(null);
+                  }}
+                >
+                  <option value="">Choose…</option>
+                  {question.options.map((option) => (
+                    <option key={option.label} value={option.label}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              ) : null}
+              {question.isOther || !question.options?.length ? (
+                <input
+                  placeholder={question.options?.length ? "Or type another answer" : "Answer"}
+                  type={question.isSecret ? "password" : "text"}
+                  value={answers[question.id] ?? ""}
+                  onChange={(event) => {
+                    setAnswers((current) => ({
+                      ...current,
+                      [question.id]: event.target.value,
+                    }));
+                    setError(null);
+                  }}
+                />
+              ) : null}
+            </label>
+          ))}
+        </div>
+      ) : (
+        <label className="session-provider-json-response">
+          <span>Provider response JSON</span>
+          <textarea
+            spellCheck={false}
+            value={responseText}
+            onChange={(event) => {
+              setResponseText(event.target.value);
+              setError(null);
+            }}
+          />
+        </label>
+      )}
+      <div className="session-provider-request-actions">
+        <details>
+          <summary>Raw request</summary>
+          <pre>{JSON.stringify(request.payload, null, 2)}</pre>
+        </details>
+        <button disabled={sending || sent} type="button" onClick={() => void submit()}>
+          {sent
+            ? "Response sent"
+            : sending
+              ? "Sending…"
+              : questions.length
+                ? "Send answers"
+                : "Send JSON"}
+        </button>
+      </div>
+      {error ? <div className="session-provider-request-error">{error}</div> : null}
+    </div>
+  );
+}
+
+function ProviderStreamInspector({
+  inspector,
+  ticket,
+}: {
+  inspector: ProviderEventInspector;
+  ticket: string;
+}) {
+  const pendingRequests = inspector.pending_requests ?? [];
+  const [open, setOpen] = useState(pendingRequests.length > 0);
+  useEffect(() => {
+    if (pendingRequests.length > 0) setOpen(true);
+  }, [pendingRequests.length]);
+  const counts = formatDispositionCounts(inspector.dispositions);
+  return (
+    <div className={`session-provider-inspector${open ? " is-open" : ""}`}>
+      <button
+        aria-expanded={open}
+        className="session-provider-inspector-head"
+        type="button"
+        onClick={() => setOpen((current) => !current)}
+      >
+        <ChevronRight size={12} />
+        <span className="session-dispositions-label">Provider stream</span>
+        <span className="session-provider-inspector-route">
+          raw {inspector.raw_count} → normalized {inspector.normalized_count}
+        </span>
+        <span className="session-dispositions-value">{counts}</span>
+        {pendingRequests.length > 0 ? (
+          <span className="session-provider-pending">
+            {pendingRequests.length} pending
+          </span>
+        ) : null}
+        <span className={`session-provider-state is-${inspector.state}`}>
+          {inspector.provider} · {inspector.state}
+        </span>
+      </button>
+      {open ? (
+        <div className="session-provider-inspector-body">
+          {pendingRequests.map((request) => (
+            <ProviderPendingRequestCard
+              key={`${typeof request.request_id}:${request.request_id}`}
+              request={request}
+              ticket={ticket}
+            />
+          ))}
+          <div className="session-provider-events">
+            {inspector.events.length > 0 ? (
+              inspector.events
+                .slice()
+                .reverse()
+                .map((event) => (
+                  <details className="session-provider-event" key={event.seq}>
+                    <summary>
+                      <span className={`is-${event.disposition}`}>{event.disposition}</span>
+                      <span>#{event.seq}</span>
+                      <span>{event.kind}</span>
+                      {event.lifecycle_state ? <span>→ {event.lifecycle_state}</span> : null}
+                      <span>raw #{event.raw_seq}</span>
+                    </summary>
+                    <pre>{JSON.stringify(event.payload, null, 2)}</pre>
+                  </details>
+                ))
+            ) : (
+              <div className="session-provider-empty">No normalized provider events yet.</div>
+            )}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
 }
 
 const IMG_TOKEN_PATTERN = /\u27e6img:([^\u27e7]+)\u27e7/g;
@@ -1491,6 +1733,9 @@ export function SessionTab({
         </div>
       ) : null}
       <div className="session-dispositions">{dispositionCounts}</div>
+      {session.providerInspector ? (
+        <ProviderStreamInspector inspector={session.providerInspector} ticket={ticket} />
+      ) : null}
       <div className="session-scroll" ref={ref}>
         <div className="session-scroll-inner" ref={innerRef}>
           <div className="session-virtual-list" style={{ height: layout.totalHeight }}>

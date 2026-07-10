@@ -1,0 +1,312 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+from .types import EventDisposition, LifecycleState, ProviderKind
+
+
+@dataclass(frozen=True)
+class NormalizedProviderEvent:
+    disposition: EventDisposition
+    kind: str
+    payload: dict[str, Any]
+    lifecycle_state: LifecycleState | None = None
+
+
+_CODEX_RENDERED_METHODS = {
+    "thread/started",
+    "turn/started",
+    "turn/completed",
+    "item/started",
+    "item/completed",
+    "item/fileChange/outputDelta",
+    "item/commandExecution/outputDelta",
+    "error",
+    "account/rateLimits/updated",
+    "context/compacted",
+    "account/chatgptAuthTokens/refresh",
+    "serverRequest/resolved",
+    "thread/archived",
+    "thread/closed",
+}
+_CODEX_SUMMARIZED_METHODS = {
+    "item/agentMessage/delta",
+    "item/reasoning/summaryTextDelta",
+    "thread/tokenUsage/updated",
+    "thread/status/changed",
+}
+_CODEX_IGNORED_METHODS = {
+    "rawResponseItem/completed",
+    "mcpServer/startupStatus/updated",
+    "remoteControl/status/changed",
+    "thread/settings/updated",
+    "thread/goal/cleared",
+}
+_CODEX_APPROVAL_METHODS = {
+    "item/commandExecution/requestApproval",
+    "item/fileChange/requestApproval",
+    "item/permissions/requestApproval",
+    "item/tool/requestUserInput",
+    "mcpServer/elicitation/request",
+    "execCommandApproval",
+    "applyPatchApproval",
+}
+
+
+def _codex_state(payload: dict[str, Any]) -> LifecycleState | None:
+    method = payload.get("method")
+    params = payload.get("params") or {}
+    if method in _CODEX_APPROVAL_METHODS:
+        return LifecycleState.WAITING_APPROVAL
+    if method == "turn/started":
+        return LifecycleState.WORKING
+    if method == "thread/status/changed":
+        status_value = params.get("status") or {}
+        active_flags = set(status_value.get("activeFlags") or [])
+        if active_flags & {"waitingOnApproval", "waitingOnUserInput"}:
+            return LifecycleState.WAITING_APPROVAL
+        status = status_value.get("type")
+        return {
+            "active": LifecycleState.WORKING,
+            "idle": LifecycleState.IDLE,
+            "systemError": LifecycleState.BLOCKED,
+        }.get(status)
+    if method == "turn/completed":
+        status = (params.get("turn") or {}).get("status")
+        return {
+            "completed": LifecycleState.IDLE,
+            "interrupted": LifecycleState.INTERRUPTED,
+            "failed": LifecycleState.BLOCKED,
+        }.get(status)
+    if method in {"thread/archived", "thread/closed"}:
+        return LifecycleState.COMPLETED
+    if method == "error" and not params.get("willRetry"):
+        return LifecycleState.BLOCKED
+    if method == "account/chatgptAuthTokens/refresh":
+        return LifecycleState.BLOCKED
+    return None
+
+
+def _normalize_codex(payload: dict[str, Any]) -> NormalizedProviderEvent:
+    method = payload.get("method")
+    lifecycle = _codex_state(payload)
+    if method in _CODEX_APPROVAL_METHODS:
+        disposition = EventDisposition.RENDERED
+        kind = "approval"
+    elif method == "serverRequest/resolved":
+        disposition = EventDisposition.RENDERED
+        kind = "approval_resolved"
+    elif method in _CODEX_RENDERED_METHODS:
+        disposition = EventDisposition.RENDERED
+        kind = str(method).replace("/", "_")
+    elif method in _CODEX_SUMMARIZED_METHODS:
+        disposition = EventDisposition.SUMMARIZED
+        kind = str(method).replace("/", "_")
+    elif method in _CODEX_IGNORED_METHODS:
+        disposition = EventDisposition.IGNORED
+        kind = str(method).replace("/", "_")
+    elif method is None and "id" in payload:
+        disposition = EventDisposition.IGNORED
+        kind = "rpc_response"
+    else:
+        disposition = EventDisposition.UNKNOWN
+        kind = str(method or "unknown")
+    return NormalizedProviderEvent(disposition, kind, payload, lifecycle)
+
+
+_CLAUDE_RENDERED_TYPES = {
+    "assistant",
+    "user",
+    "result",
+    "task_notification",
+    "stream_event",
+    "permission-mode",
+    "progress",
+    "pr-link",
+}
+_CLAUDE_SUMMARIZED_TYPES = {
+    "custom-title",
+    "agent-name",
+}
+_CLAUDE_IGNORED_TYPES = {
+    "ai-title",
+    "file-history-snapshot",
+    "last-prompt",
+    "mode",
+    "queue-operation",
+    "started",
+}
+_CLAUDE_RENDERED_SYSTEM_SUBTYPES = {
+    "api_error",
+    "compact_boundary",
+    "scheduled_task_fire",
+    "stop_hook_summary",
+    "turn_duration",
+    "informational",
+    "local_command",
+    "away_summary",
+}
+_CLAUDE_SUMMARIZED_SYSTEM_SUBTYPES = {
+    "status",
+    "hook_started",
+    "hook_progress",
+    "hook_response",
+    "task_started",
+    "task_progress",
+}
+
+
+def _normalize_claude(payload: dict[str, Any]) -> NormalizedProviderEvent:
+    event_type = payload.get("type")
+    subtype = payload.get("subtype")
+    state = None
+    if event_type == "control_request":
+        state = LifecycleState.WAITING_APPROVAL
+        return NormalizedProviderEvent(
+            EventDisposition.RENDERED, "approval", payload, state
+        )
+    if event_type == "control_cancel_request":
+        return NormalizedProviderEvent(
+            EventDisposition.RENDERED,
+            "approval_cancelled",
+            payload,
+            LifecycleState.WORKING,
+        )
+    if event_type == "result":
+        if subtype in {"interrupted", "interrupt"}:
+            state = LifecycleState.INTERRUPTED
+        else:
+            state = (
+                LifecycleState.BLOCKED
+                if payload.get("is_error")
+                else LifecycleState.IDLE
+            )
+    elif event_type == "system" and subtype == "status":
+        status = payload.get("status")
+        state = {
+            "requesting": LifecycleState.WORKING,
+            "running": LifecycleState.WORKING,
+            "idle": LifecycleState.IDLE,
+        }.get(status)
+    elif event_type == "system" and subtype == "session_state_changed":
+        status = payload.get("state") or payload.get("session_state")
+        state = {
+            "running": LifecycleState.WORKING,
+            "idle": LifecycleState.IDLE,
+            "requires_action": LifecycleState.WAITING_APPROVAL,
+        }.get(status)
+    elif event_type == "provider_process_exit":
+        return NormalizedProviderEvent(
+            EventDisposition.RENDERED,
+            "provider_process_exit",
+            payload,
+        )
+    elif event_type == "provider_stderr":
+        return NormalizedProviderEvent(
+            EventDisposition.SUMMARIZED,
+            "provider_stderr",
+            payload,
+        )
+    if event_type in _CLAUDE_IGNORED_TYPES:
+        return NormalizedProviderEvent(
+            EventDisposition.IGNORED,
+            f"claude_{event_type}",
+            payload,
+            state,
+        )
+    if event_type in _CLAUDE_SUMMARIZED_TYPES:
+        return NormalizedProviderEvent(
+            EventDisposition.SUMMARIZED,
+            f"claude_{event_type}",
+            payload,
+            state,
+        )
+    if event_type == "system" and subtype in _CLAUDE_RENDERED_SYSTEM_SUBTYPES:
+        return NormalizedProviderEvent(
+            EventDisposition.RENDERED,
+            f"claude_{subtype}",
+            payload,
+            state,
+        )
+    if event_type == "attachment":
+        attachment = payload.get("attachment") or {}
+        disposition = (
+            EventDisposition.RENDERED
+            if isinstance(attachment, dict)
+            and attachment.get("type") == "task_reminder"
+            else EventDisposition.UNKNOWN
+        )
+        return NormalizedProviderEvent(
+            disposition,
+            "claude_attachment",
+            payload,
+            state,
+        )
+    if event_type in _CLAUDE_RENDERED_TYPES:
+        return NormalizedProviderEvent(
+            EventDisposition.RENDERED,
+            f"claude_{event_type}",
+            payload,
+            state,
+        )
+    if event_type == "system" and subtype in _CLAUDE_SUMMARIZED_SYSTEM_SUBTYPES:
+        return NormalizedProviderEvent(
+            EventDisposition.SUMMARIZED,
+            f"claude_{subtype}",
+            payload,
+            state,
+        )
+    if event_type in {"control_response", "keep_alive"}:
+        return NormalizedProviderEvent(
+            EventDisposition.IGNORED, f"claude_{event_type}", payload, state
+        )
+    return NormalizedProviderEvent(
+        EventDisposition.UNKNOWN,
+        f"claude_{event_type or 'unknown'}",
+        payload,
+        state,
+    )
+
+
+def normalize_provider_event(
+    provider: ProviderKind,
+    payload: dict[str, Any],
+    *,
+    direction: str = "provider",
+) -> NormalizedProviderEvent:
+    if direction in {"client", "stdin"}:
+        is_approval_response = (
+            provider is ProviderKind.CODEX
+            and payload.get("id") is not None
+            and "result" in payload
+        ) or (
+            provider is ProviderKind.CLAUDE
+            and payload.get("type") == "control_response"
+        )
+        return NormalizedProviderEvent(
+            EventDisposition.IGNORED,
+            "approval_response"
+            if is_approval_response
+            else f"{provider.value}_client_message",
+            payload,
+        )
+    if direction == "stderr":
+        return NormalizedProviderEvent(
+            EventDisposition.SUMMARIZED,
+            f"{provider.value}_stderr",
+            payload,
+        )
+    if direction == "process":
+        is_exit = (
+            payload.get("method") == "provider/processExited"
+            or payload.get("type") == "provider_process_exit"
+        )
+        return NormalizedProviderEvent(
+            EventDisposition.RENDERED,
+            "provider_process_exit" if is_exit else "provider_protocol_error",
+            payload,
+        )
+    if provider is ProviderKind.CODEX:
+        return _normalize_codex(payload)
+    return _normalize_claude(payload)

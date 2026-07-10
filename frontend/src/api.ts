@@ -56,6 +56,11 @@ export function getLinks() {
 
 export type AgentSession = {
   window: string | null;
+  run_id?: string | null;
+  runtime_state?: string | null;
+  control_attached?: boolean;
+  provider_session_id?: string | null;
+  provider_pid?: number | null;
   kind: string | null;
   role: string | null;
   model: string | null;
@@ -96,10 +101,16 @@ export type Orchestrator = {
   id: string;
   window: string | null;
   window_alive: boolean;
+  run_id?: string | null;
+  runtime_state?: string | null;
+  control_attached?: boolean;
+  provider_session_id?: string | null;
+  provider_pid?: number | null;
   cwd: string | null;
   model: string | null;
   spawned_at: string | null;
   transcript_exists: boolean;
+  log?: string | null;
 };
 
 export function getAgents() {
@@ -126,9 +137,10 @@ export type SpawnWorkerInput = {
 };
 
 export type SpawnWorkerResult = {
-  window: string;
-  log: string;
-  prompt_path: string;
+  window: string | null;
+  run_id: string;
+  log: string | null;
+  prompt_path: string | null;
 };
 
 export function spawnAgentWorker(body: SpawnWorkerInput) {
@@ -148,9 +160,10 @@ export type SpawnOrchestratorInput = {
 };
 
 export type SpawnOrchestratorResult = {
-  window: string;
-  log: string;
-  prompt_path: string;
+  window: string | null;
+  run_id: string;
+  log: string | null;
+  prompt_path: string | null;
   note: string;
 };
 
@@ -164,9 +177,10 @@ export function spawnAgentOrchestrator(body: SpawnOrchestratorInput) {
 export type ReplaceAgentResult = {
   id: string;
   type: "worker" | "orchestrator";
-  window: string;
-  log: string;
-  prompt_path: string;
+  window: string | null;
+  run_id?: string;
+  log: string | null;
+  prompt_path: string | null;
   model?: string;
   registration?: unknown;
 };
@@ -175,6 +189,22 @@ export function replaceAgent(id: string) {
   return request<ReplaceAgentResult>(`/api/agents/${encodeURIComponent(id)}/replace`, {
     method: "POST",
   });
+}
+
+export type AgentControlAction = "interrupt" | "resume" | "stop" | "archive";
+
+export type AgentControlResult = {
+  run_id: string;
+  agent_id: string;
+  state: string;
+  state_reason?: string | null;
+};
+
+export function controlAgent(id: string, action: AgentControlAction) {
+  return request<AgentControlResult>(
+    `/api/agents/${encodeURIComponent(id)}/${action}`,
+    { method: "POST" },
+  );
 }
 
 export type SessionTool = {
@@ -225,6 +255,45 @@ export type SessionMeta = {
   agent_name?: string;
 };
 
+export type ProviderStreamEvent = {
+  seq: number;
+  raw_seq: number;
+  normalized_at: string;
+  disposition: "rendered" | "summarized" | "ignored" | "unknown";
+  kind: string;
+  lifecycle_state: string | null;
+  payload: Record<string, unknown>;
+};
+
+export type ProviderRawEvent = {
+  seq: number;
+  received_at?: string;
+  provider?: string;
+  direction?: string;
+  generation?: number;
+  payload: Record<string, unknown>;
+};
+
+export type ProviderPendingRequest = {
+  request_id: string | number;
+  request_kind: string;
+  received_at: string;
+  raw_seq: number;
+  payload: Record<string, unknown>;
+};
+
+export type ProviderEventInspector = {
+  run_id: string;
+  provider: string;
+  state: string;
+  raw_count: number;
+  normalized_count: number;
+  dispositions: SessionDispositionCounts;
+  pending_requests: ProviderPendingRequest[];
+  events: ProviderStreamEvent[];
+  raw?: ProviderRawEvent[] | null;
+};
+
 export type SessionEvent = {
   id: number;
   kind:
@@ -268,7 +337,7 @@ export type SessionPatch = {
 
 export type AgentSessionData = {
   version: 2;
-  format: "codex" | "claude" | "pane-log";
+  format: "codex" | "claude" | "pane-log" | "provider-events";
   path: string;
   tokens: number | null;
   tasks?: SessionTask[];
@@ -283,6 +352,7 @@ export type AgentSessionData = {
   subagents?: SubagentInfo[];
   queue?: QueuedMessage[];
   working?: boolean;
+  provider_inspector?: ProviderEventInspector;
 };
 
 export type QueuedMessage = { text: string; queued_at: string };
@@ -348,6 +418,27 @@ export function getAgentSession(ticket: string, after = 0, path?: string) {
   if (path) params.set("path", path);
   return request<AgentSessionData>(
     `/api/agents/${encodeURIComponent(ticket)}/session?${params.toString()}`
+  );
+}
+
+export function getAgentProviderEvents(ticket: string, includeRaw = false) {
+  const params = new URLSearchParams({ include_raw: String(includeRaw) });
+  return request<ProviderEventInspector>(
+    `/api/agents/${encodeURIComponent(ticket)}/events?${params.toString()}`,
+  );
+}
+
+export function respondToAgentRequest(
+  ticket: string,
+  requestId: string | number,
+  response: Record<string, unknown>,
+) {
+  return request<AgentControlResult>(
+    `/api/agents/${encodeURIComponent(ticket)}/respond`,
+    {
+      method: "POST",
+      body: JSON.stringify({ request_id: requestId, response }),
+    },
   );
 }
 

@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import net from "node:net";
 
@@ -27,14 +27,20 @@ const PYTHON = resolvePython();
 
 export function makeFixtureRoot(prefix) {
   const root = mkdtempSync(join(tmpdir(), prefix));
+  const socketSuffix = basename(root).slice(-12);
   const statusDir = join(root, "status");
   const sessionsDir = join(root, "sessions");
+  const runtimeDir = join(root, "runtime");
   mkdirSync(statusDir, { recursive: true });
   mkdirSync(sessionsDir, { recursive: true });
+  mkdirSync(runtimeDir, { recursive: true });
   return {
     root,
     statusDir,
     sessionsDir,
+    runtimeDir,
+    // AF_UNIX paths are short on macOS; keep the isolated socket under /tmp.
+    supervisorSocketPath: join("/tmp", `wiki-${socketSuffix}.sock`),
     registryPath: join(root, "agent-registry.json"),
     queuePath: join(root, "wiki-msg-queue.json"),
   };
@@ -182,7 +188,13 @@ export async function startBackend(fixtures) {
     ],
     {
       cwd: ROOT,
-      env: { ...process.env, WIKI_FRONTEND_DIST: FRONTEND_DIST },
+      env: {
+        ...process.env,
+        TMUX: "",
+        TMUX_PANE: "",
+        WIKI_FRONTEND_DIST: FRONTEND_DIST,
+        WIKI_SUPERVISOR_SOCKET_PATH: fixtures.supervisorSocketPath,
+      },
       stdio: ["ignore", "pipe", "pipe"],
     }
   );

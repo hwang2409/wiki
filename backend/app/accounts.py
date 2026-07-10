@@ -11,6 +11,7 @@ Every filesystem path is env-overridable so tests never touch real credentials.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 import re
@@ -21,7 +22,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Awaitable, Callable, Iterable
+from typing import Awaitable, Callable, Iterator
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +187,95 @@ def detect_cwd_dialog(pane: str) -> bool:
     return bool(pane and CWD_DIALOG_PATTERN.search(pane))
 
 
+def _iter_payload_strings(value: object) -> Iterator[str]:
+    if isinstance(value, str):
+        yield value
+        return
+    if isinstance(value, dict):
+        for nested in value.values():
+            yield from _iter_payload_strings(nested)
+        return
+    if isinstance(value, list | tuple | set):
+        for nested in value:
+            yield from _iter_payload_strings(nested)
+
+
+def _payload_matches(pattern: re.Pattern[str], payload: object) -> bool:
+    return any(pattern.search(text) for text in _iter_payload_strings(payload))
+
+
+def detect_claude_limit_payload(payload: object) -> bool:
+    """Event-level Claude limit detector that ignores echoed user content."""
+
+    if not isinstance(payload, dict):
+        return False
+    event_type = payload.get("type")
+    if event_type not in {
+        "result",
+        "system",
+        "provider_stderr",
+        "provider_protocol_error",
+    }:
+        return False
+    return _payload_matches(CLAUDE_LIMIT_PATTERN, payload)
+
+
+def detect_codex_auth_dead_payload(payload: object) -> bool:
+    """Event-level Codex auth-dead detector that ignores echoed prompts."""
+
+    if not isinstance(payload, dict):
+        return False
+    method = payload.get("method")
+    if method not in {
+        "error",
+        "turn/completed",
+        "provider/stderr",
+        "provider/protocolError",
+    }:
+        return False
+    return _payload_matches(AUTH_DEAD_PATTERN, payload)
+
+
+def codex_rate_limit_reached_type(payload: object) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("method") != "account/rateLimits/updated":
+        return None
+    params = payload.get("params")
+    if not isinstance(params, dict):
+        return None
+    rate_limits = params.get("rateLimits")
+    if not isinstance(rate_limits, dict):
+        return None
+    value = rate_limits.get("rateLimitReachedType")
+    return value if isinstance(value, str) and value else None
+
+
+def rate_limit_reset_from_snapshot(payload: object) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    params = payload.get("params")
+    if not isinstance(params, dict):
+        return None
+    rate_limits = params.get("rateLimits")
+    if not isinstance(rate_limits, dict):
+        return None
+
+    resets_at: list[float] = []
+    for value in rate_limits.values():
+        if not isinstance(value, dict):
+            continue
+        raw = value.get("resetsAt")
+        if isinstance(raw, bool) or not isinstance(raw, int | float):
+            continue
+        if raw <= 0:
+            continue
+        resets_at.append(float(raw))
+    if not resets_at:
+        return None
+    return datetime.fromtimestamp(min(resets_at), tz=timezone.utc).isoformat()
+
+
 def _local_now(now: datetime | None = None) -> datetime:
     if now is None:
         return datetime.now().astimezone()
@@ -266,6 +356,10 @@ def _fallback_reset_time(now: datetime | None = None) -> str:
     return (_local_now(now) + timedelta(hours=UNKNOWN_RESET_HOURS)).isoformat()
 
 
+def fallback_reset_time(now: datetime | None = None) -> str:
+    return _fallback_reset_time(now)
+
+
 # ---------------------------------------------------------------------------
 # State file.
 # ---------------------------------------------------------------------------
@@ -286,13 +380,30 @@ class AccountState:
     @classmethod
     def from_dict(cls, data: dict[str, object] | None) -> "AccountState":
         data = data or {}
-        accounts = data.get("accounts") or {}
-        if not isinstance(accounts, dict):
-            accounts = {}
+        active_value = data.get("active")
+        active = active_value if isinstance(active_value, str) else None
+        last_rotated_value = data.get("last_rotated_at")
+        last_rotated_at = (
+            last_rotated_value if isinstance(last_rotated_value, str) else None
+        )
+        raw_accounts = data.get("accounts")
+        accounts: dict[str, dict[str, object]] = {}
+        if isinstance(raw_accounts, dict):
+            for key, value in raw_accounts.items():
+                if not isinstance(key, str):
+                    continue
+                if not isinstance(value, dict):
+                    accounts[key] = {}
+                    continue
+                normalized: dict[str, object] = {}
+                for entry_key, entry_value in value.items():
+                    if isinstance(entry_key, str):
+                        normalized[entry_key] = entry_value
+                accounts[key] = normalized
         return cls(
-            active=data.get("active") if isinstance(data.get("active"), str) else None,
-            last_rotated_at=data.get("last_rotated_at") if isinstance(data.get("last_rotated_at"), str) else None,
-            accounts={k: dict(v) if isinstance(v, dict) else {} for k, v in accounts.items()},
+            active=active,
+            last_rotated_at=last_rotated_at,
+            accounts=accounts,
         )
 
 
@@ -577,9 +688,13 @@ def _worker_from_registry_entry(
         return None, "ticket is no longer in the registry"
     if _entry_has_terminal_outcome(entry):
         return None, "ticket has terminal registry outcome; skipping revival"
-    current = entry.get("current")
-    if not isinstance(current, dict):
+    current_obj = entry.get("current")
+    if not isinstance(current_obj, dict):
         return None, "ticket has no current registry worker"
+    current: dict[str, object] = {}
+    for key, value in current_obj.items():
+        if isinstance(key, str):
+            current[key] = value
     if current.get("kind") != kind:
         return None, "registry worker kind changed; skipping stale revival"
     window = current.get("window")
@@ -591,24 +706,20 @@ def _worker_from_registry_entry(
     cwd, reason = _safe_revival_cwd(current, require_existing=require_existing_cwd)
     if not cwd:
         return None, reason
+    role_value = current.get("role")
+    orch_value = current.get("orch")
+    spawned_at_value = current.get("spawned_at")
+    session_id_value = current.get("session_id")
     return WorkerEntry(
         ticket=ticket,
         window=window,
         worktree=cwd,
         log=log,
         kind=kind,
-        role=current.get("role") if isinstance(current.get("role"), str) else None,
-        orch=current.get("orch") if isinstance(current.get("orch"), str) else None,
-        spawned_at=(
-            current.get("spawned_at")
-            if isinstance(current.get("spawned_at"), str)
-            else None
-        ),
-        session_id=(
-            current.get("session_id")
-            if isinstance(current.get("session_id"), str)
-            else None
-        ),
+        role=role_value if isinstance(role_value, str) else None,
+        orch=orch_value if isinstance(orch_value, str) else None,
+        spawned_at=spawned_at_value if isinstance(spawned_at_value, str) else None,
+        session_id=session_id_value if isinstance(session_id_value, str) else None,
     ), None
 
 
@@ -1001,6 +1112,118 @@ def rotate(
     )
 
 
+@dataclass(frozen=True)
+class _FileSnapshot:
+    exists: bool
+    contents: bytes = b""
+    mode: int | None = None
+
+
+def _capture_file(path: Path) -> _FileSnapshot:
+    try:
+        contents = path.read_bytes()
+        mode = path.stat().st_mode & 0o777
+    except FileNotFoundError:
+        return _FileSnapshot(exists=False)
+    return _FileSnapshot(exists=True, contents=contents, mode=mode)
+
+
+def _restore_file(path: Path, snapshot: _FileSnapshot) -> None:
+    if not snapshot.exists:
+        path.unlink(missing_ok=True)
+        return
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(
+        f".{path.name}.wiki-rollback-{os.getpid()}-{time.time_ns()}"
+    )
+    try:
+        tmp.write_bytes(snapshot.contents)
+        if snapshot.mode is not None:
+            os.chmod(tmp, snapshot.mode)
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _replace_state(target: AccountState, source: AccountState) -> None:
+    accounts = copy.deepcopy(source.accounts)
+    target.active = source.active
+    target.last_rotated_at = source.last_rotated_at
+    target.accounts = accounts
+
+
+def rotate_credentials(
+    *,
+    state: AccountState,
+    force_target: str | None = None,
+    outgoing_reset_at: str | None = None,
+    snapshot_outgoing: bool = True,
+) -> RotationResult:
+    """Atomically swap auth after the supervisor has quiesced Codex runs.
+
+    The caller may snapshot the outgoing account before quiescing the fleet and
+    pass ``snapshot_outgoing=False``. On every failure, the active auth file,
+    persisted account state, and caller-owned ``AccountState`` are restored to
+    their exact pre-call values. This credential-only path never inspects or
+    controls tmux.
+    """
+
+    target = force_target or pick_next_account(state)
+    if target is None:
+        raise NoEligibleAccountError("no eligible account for rotation")
+    if target == state.active:
+        raise NoEligibleAccountError("target account is already active")
+    outgoing = state.active
+
+    auth_before = _capture_file(codex_auth_path())
+    state_file_before = _capture_file(_state_path())
+    state_before = copy.deepcopy(state)
+    candidate = copy.deepcopy(state)
+
+    try:
+        if outgoing and snapshot_outgoing:
+            snapshot_active_auth(outgoing)
+        if outgoing and outgoing_reset_at is not None:
+            candidate.accounts.setdefault(outgoing, {})[
+                "limit_reset_at"
+            ] = outgoing_reset_at
+        if not install_incoming_auth(target):
+            raise RotationError(f"incoming auth.json missing for account {target!r}")
+        if not codex_login_status():
+            raise RotationError(f"codex login status failed after swap to {target!r}")
+        candidate.active = target
+        candidate.last_rotated_at = datetime.now(timezone.utc).isoformat()
+        candidate.accounts.setdefault(target, {})["limit_reset_at"] = None
+        write_state(candidate)
+        _replace_state(state, candidate)
+    except Exception as error:
+        rollback_errors: list[str] = []
+        for label, path, snapshot in (
+            ("active auth", codex_auth_path(), auth_before),
+            ("account state", _state_path(), state_file_before),
+        ):
+            try:
+                _restore_file(path, snapshot)
+            except OSError as rollback_error:
+                rollback_errors.append(f"{label}: {rollback_error}")
+        _replace_state(state, state_before)
+        if rollback_errors:
+            detail = "; ".join(rollback_errors)
+            raise RotationError(
+                f"credential rotation failed and rollback was incomplete ({detail})"
+            ) from error
+        raise
+
+    return RotationResult(
+        outgoing=outgoing,
+        incoming=target,
+        revived=[],
+        failed=[],
+        reset_at=outgoing_reset_at,
+    )
+
+
 def _resolve_revival_session_id(worker: WorkerEntry) -> str | None:
     """Registry-tracked id beats discovery. Otherwise scan rollouts."""
     if worker.session_id:
@@ -1115,6 +1338,15 @@ def _append_rotation_log(outgoing: str | None, incoming: str, revived: list[str]
         pass
 
 
+def record_rotation_log(result: RotationResult) -> None:
+    _append_rotation_log(
+        result.outgoing,
+        result.incoming,
+        result.revived,
+        result.failed,
+    )
+
+
 class RotationError(Exception):
     pass
 
@@ -1189,6 +1421,40 @@ async def rotate_locked(
             state=fresh,
             force_target=force_target,
             outgoing_reset_at=outgoing_reset_at,
+        )
+
+
+async def rotate_credentials_locked(
+    *,
+    state: AccountState,
+    force_target: str | None = None,
+    outgoing_reset_at: str | None = None,
+    respect_debounce: bool = True,
+    snapshot_outgoing: bool = True,
+) -> RotationResult:
+    """Serialize a supervisor-coordinated credential-only rotation."""
+
+    async with _get_rotation_lock():
+        fresh = await asyncio.to_thread(read_state)
+        fresh = await asyncio.to_thread(ensure_state_initialized, fresh)
+        if respect_debounce:
+            elapsed = seconds_since_last_rotation(fresh)
+            if elapsed < debounce_seconds():
+                raise RotationDebouncedError(
+                    f"rotation debounced ({elapsed:.0f}s since last)"
+                )
+        if state.accounts:
+            for name, row in state.accounts.items():
+                if isinstance(row, dict):
+                    reset = row.get("limit_reset_at")
+                    if reset is not None:
+                        fresh.accounts.setdefault(name, {})["limit_reset_at"] = reset
+        return await asyncio.to_thread(
+            rotate_credentials,
+            state=fresh,
+            force_target=force_target,
+            outgoing_reset_at=outgoing_reset_at,
+            snapshot_outgoing=snapshot_outgoing,
         )
 
 

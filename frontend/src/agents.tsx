@@ -11,8 +11,16 @@ import {
   ScrollText,
   X,
 } from "lucide-react";
-import { getAgents, replaceAgent, spawnAgentOrchestrator, spawnAgentWorker } from "./api";
+import {
+  controlAgent,
+  getAgents,
+  replaceAgent,
+  spawnAgentOrchestrator,
+  spawnAgentWorker,
+} from "./api";
 import type {
+  AgentControlAction,
+  AgentControlResult,
   AgentWorker,
   ArchivedWorker,
   Orchestrator,
@@ -39,17 +47,19 @@ const REASONING_EFFORTS: SpawnWorkerEffort[] = ["minimal", "low", "medium", "hig
 type WorkerSpawnNotice = {
   kind: "worker";
   ticket: string;
-  window: string;
-  log: string;
-  promptPath: string;
+  window: string | null;
+  runId: string;
+  log: string | null;
+  promptPath: string | null;
 };
 
 type OrchestratorSpawnNotice = {
   kind: "orchestrator";
   id: string;
-  window: string;
-  log: string;
-  promptPath: string;
+  window: string | null;
+  runId: string;
+  log: string | null;
+  promptPath: string | null;
   note: string;
 };
 
@@ -78,6 +88,7 @@ function stateLabel(worker: AgentWorker): string {
 
 function healthFlag(worker: AgentWorker): string | null {
   if (!worker.registered) return "unregistered — status file without registry entry";
+  if (worker.run_id && !worker.control_attached) return "supervisor control is not attached";
   if (worker.window && !worker.window_alive) return "window gone — worker died or wrapped up?";
   if ((worker.status_age_seconds ?? 0) > STALE_SECONDS && worker.state === "working")
     return "status stale >5m";
@@ -182,6 +193,7 @@ function SpawnWorkerModal({
         kind: "worker",
         ticket: normalizedTicket,
         window: result.window,
+        runId: result.run_id,
         log: result.log,
         promptPath: result.prompt_path,
       });
@@ -437,6 +449,7 @@ function SpawnOrchestratorModal({
         kind: "orchestrator",
         id: normalizedId,
         window: result.window,
+        runId: result.run_id,
         log: result.log,
         promptPath: result.prompt_path,
         note: result.note,
@@ -685,6 +698,13 @@ export function AgentsView({
   const [replacePending, setReplacePending] = useState<string | null>(null);
   const [replaceNotice, setReplaceNotice] = useState<ReplaceAgentResult | null>(null);
   const [replaceError, setReplaceError] = useState<string | null>(null);
+  const [controlConfirm, setControlConfirm] = useState<string | null>(null);
+  const [controlPending, setControlPending] = useState<string | null>(null);
+  const [controlNotice, setControlNotice] = useState<{
+    action: AgentControlAction;
+    result: AgentControlResult;
+  } | null>(null);
+  const [controlError, setControlError] = useState<string | null>(null);
 
   useEffect(() => {
     if (data) return;
@@ -777,6 +797,33 @@ export function AgentsView({
     }
   }
 
+  async function requestControl(
+    id: string,
+    action: AgentControlAction,
+    confirm: boolean,
+  ) {
+    if (controlPending) return;
+    const key = `${id}:${action}`;
+    if (confirm && controlConfirm !== key) {
+      setControlConfirm(key);
+      setControlNotice(null);
+      setControlError(null);
+      return;
+    }
+    setControlPending(key);
+    setControlError(null);
+    try {
+      const result = await controlAgent(id, action);
+      setControlNotice({ action, result });
+      setReplaceNotice(null);
+      setControlConfirm(null);
+    } catch (err) {
+      setControlError(err instanceof Error ? err.message : `Could not ${action} agent`);
+    } finally {
+      setControlPending(null);
+    }
+  }
+
   function ReplaceButton({ id, disabled = false }: { id: string; disabled?: boolean }) {
     const confirming = replaceConfirm === id;
     const pending = replacePending === id;
@@ -784,7 +831,7 @@ export function AgentsView({
       <button
         className={`agent-replace-button${confirming ? " is-confirming" : ""}`}
         disabled={disabled || Boolean(replacePending)}
-        title={disabled ? "Registered window is not live" : "Kill this run and spawn a replacement"}
+        title={disabled ? "Registered runtime is not live" : "Stop this run and spawn a replacement"}
         type="button"
         onClick={() => {
           void requestReplace(id);
@@ -793,6 +840,54 @@ export function AgentsView({
         <RefreshCw size={12} />
         {pending ? "Replacing" : confirming ? "Confirm replace" : "Replace"}
       </button>
+    );
+  }
+
+  function LifecycleControls({
+    id,
+    state,
+    controlAttached,
+  }: {
+    id: string;
+    state: string | null | undefined;
+    controlAttached: boolean;
+  }) {
+    const terminal = state === "dead" || state === "completed";
+    const canInterrupt =
+      controlAttached &&
+      (state === "starting" || state === "working" || state === "waiting-approval");
+    const canResume =
+      !controlAttached &&
+      (state === "working" || state === "idle" || state === "blocked");
+    const canArchive =
+      controlAttached && (state === "idle" || state === "interrupted");
+
+    function button(action: AgentControlAction, label: string, confirm = false) {
+      const key = `${id}:${action}`;
+      const confirming = confirm && controlConfirm === key;
+      const pending = controlPending === key;
+      return (
+        <button
+          className={`agent-replace-button${confirming ? " is-confirming" : ""}`}
+          disabled={Boolean(controlPending)}
+          key={action}
+          type="button"
+          onClick={() => {
+            void requestControl(id, action, confirm);
+          }}
+        >
+          {pending ? `${label}…` : confirming ? `Confirm ${label.toLowerCase()}` : label}
+        </button>
+      );
+    }
+
+    return (
+      <>
+        {canInterrupt ? button("interrupt", "Interrupt") : null}
+        {canResume ? button("resume", "Revive") : null}
+        {canArchive ? button("archive", "Complete", true) : null}
+        {!terminal ? button("stop", "Stop", true) : null}
+      </>
     );
   }
 
@@ -837,6 +932,11 @@ export function AgentsView({
               tmux {worker.window}
             </span>
           ) : null}
+          {worker.run_id ? (
+            <span className={`agent-window${worker.control_attached ? "" : " is-dead"}`}>
+              run {worker.run_id.slice(0, 8)} · {worker.runtime_state ?? "unknown"}
+            </span>
+          ) : null}
           {worker.session && worker.history.length > 0 ? (
             <span className="agent-chain">
               session {worker.session} · prev:{" "}
@@ -870,7 +970,17 @@ export function AgentsView({
             </button>
           ) : null}
           <span className="agent-actions">
-            <ReplaceButton id={worker.ticket} disabled={!worker.window || !worker.window_alive} />
+            {worker.run_id ? (
+              <LifecycleControls
+                id={worker.ticket}
+                state={worker.runtime_state ?? worker.state}
+                controlAttached={Boolean(worker.control_attached)}
+              />
+            ) : null}
+            <ReplaceButton
+              id={worker.ticket}
+              disabled={!worker.run_id && (!worker.window || !worker.window_alive)}
+            />
             <button
               className={`agent-log-toggle${isOpen ? " is-active" : ""}`}
               type="button"
@@ -913,11 +1023,26 @@ export function AgentsView({
                 {orch.cwd ? (
                   <span className="agents-orch-cwd">{orch.cwd.split("/").slice(-1)[0]}</span>
                 ) : null}
+                {orch.run_id ? (
+                  <span className={`agent-window${orch.control_attached ? "" : " is-dead"}`}>
+                    run {orch.run_id.slice(0, 8)} · {orch.runtime_state ?? "unknown"}
+                  </span>
+                ) : null}
                 {orch.window && !orch.window_alive ? (
                   <span className="agents-orch-dead">window gone</span>
                 ) : null}
                 <span className="agents-orch-actions">
-                  <ReplaceButton id={orch.id} disabled={!orch.window || !orch.window_alive} />
+                  {orch.run_id ? (
+                    <LifecycleControls
+                      id={orch.id}
+                      state={orch.runtime_state}
+                      controlAttached={Boolean(orch.control_attached)}
+                    />
+                  ) : null}
+                  <ReplaceButton
+                    id={orch.id}
+                    disabled={!orch.run_id && (!orch.window || !orch.window_alive)}
+                  />
                   <button
                     className={`agent-log-toggle${openTicket === orch.id ? " is-active" : ""}`}
                     type="button"
@@ -1046,22 +1171,53 @@ export function AgentsView({
         {spawnNotice ? (
           spawnNotice.kind === "worker" ? (
             <div className="agents-notice">
-              spawned <code>{spawnNotice.ticket}</code> in <code>{spawnNotice.window}</code> · log{" "}
-              <code>{spawnNotice.log}</code>
+              spawned <code>{spawnNotice.ticket}</code> as run{" "}
+              <code>{spawnNotice.runId.slice(0, 8)}</code>
+              {spawnNotice.log ? (
+                <>
+                  {" "}· log <code>{spawnNotice.log}</code>
+                </>
+              ) : null}
             </div>
           ) : (
             <div className="agents-notice">
-              {spawnNotice.note} · tmux <code>{spawnNotice.window}</code> · log <code>{spawnNotice.log}</code>
+              {spawnNotice.note} · run <code>{spawnNotice.runId.slice(0, 8)}</code>
+              {spawnNotice.log ? (
+                <>
+                  {" "}· log <code>{spawnNotice.log}</code>
+                </>
+              ) : null}
             </div>
           )
         ) : null}
         {replaceNotice ? (
           <div className="agents-notice">
-            replaced <code>{replaceNotice.id}</code> · new tmux <code>{replaceNotice.window}</code> · log{" "}
-            <code>{replaceNotice.log}</code>
+            replaced <code>{replaceNotice.id}</code>
+            {replaceNotice.run_id ? (
+              <>
+                {" "}· run <code>{replaceNotice.run_id.slice(0, 8)}</code>
+              </>
+            ) : null}
+            {replaceNotice.window ? (
+              <>
+                {" "}· tmux <code>{replaceNotice.window}</code>
+              </>
+            ) : null}
+            {replaceNotice.log ? (
+              <>
+                {" "}· log <code>{replaceNotice.log}</code>
+              </>
+            ) : null}
           </div>
         ) : null}
         {replaceError ? <div className="agents-notice is-error">{replaceError}</div> : null}
+        {controlNotice ? (
+          <div className="agents-notice">
+            {controlNotice.action} <code>{controlNotice.result.agent_id}</code> · state{" "}
+            <code>{controlNotice.result.state}</code>
+          </div>
+        ) : null}
+        {controlError ? <div className="agents-notice is-error">{controlError}</div> : null}
         {body}
       </div>
       {openWorker ? (
@@ -1194,7 +1350,11 @@ export function AgentsSidebar({
             <Bot size={12} />
             <span className="nav-agent-ticket">{orch.id}</span>
             <span className="nav-agent-meta">
-              {orch.window && !orch.window_alive ? "window gone" : "orchestrator"}
+              {orch.run_id
+                ? orch.runtime_state ?? "unknown"
+                : orch.window && !orch.window_alive
+                  ? "window gone"
+                  : "orchestrator"}
             </span>
           </button>
           {workers
