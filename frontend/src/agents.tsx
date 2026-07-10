@@ -72,9 +72,12 @@ function defaultWorkerModel(models: AgentModelOption[], kind: SpawnWorkerKind): 
   return byKind.find((option) => option.default_worker)?.id ?? byKind[0]?.id ?? "";
 }
 
-function defaultOrchestratorModel(models: AgentModelOption[]): string {
-  const claudeModels = modelsForKind(models, "cc");
-  return claudeModels.find((option) => option.default_orchestrator)?.id ?? claudeModels[0]?.id ?? "";
+function defaultOrchestratorModel(models: AgentModelOption[], kind: SpawnWorkerKind): string {
+  const byKind = modelsForKind(models, kind);
+  if (kind === "cc") {
+    return byKind.find((option) => option.default_orchestrator)?.id ?? byKind[0]?.id ?? "";
+  }
+  return byKind[0]?.id ?? "";
 }
 
 function ageLabel(seconds: number | null): string {
@@ -417,7 +420,9 @@ function SpawnOrchestratorModal({
 }) {
   const [id, setId] = useState("");
   const [projectDir, setProjectDir] = useState("");
+  const [kind, setKind] = useState<SpawnWorkerKind>("cc");
   const [model, setModel] = useState("");
+  const [effort, setEffort] = useState<SpawnWorkerEffort>("high");
   const [goal, setGoal] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [confirming, setConfirming] = useState(false);
@@ -442,19 +447,19 @@ function SpawnOrchestratorModal({
   }, [onClose, submitting]);
 
   useEffect(() => {
-    const nextDefault = defaultOrchestratorModel(models);
+    const nextDefault = defaultOrchestratorModel(models, kind);
     setModel((current) =>
-      modelsForKind(models, "cc").some((option) => option.id === current) ? current : nextDefault
+      modelsForKind(models, kind).some((option) => option.id === current) ? current : nextDefault
     );
-  }, [models]);
+  }, [kind, models]);
 
   const normalizedId = id.trim();
-  const claudeModels = modelsForKind(models, "cc");
+  const allowedModels = modelsForKind(models, kind);
   const goalBytes = new TextEncoder().encode(goal).length;
   const goalTooLarge = goalBytes >= 20_000;
   const idValid = ORCH_ID_PATTERN.test(normalizedId);
   const projectDirValid = projectDir.trim().length > 0;
-  const confirmLabel = `launch ${normalizedId} · ${model} in ${projectDir.trim()}?`;
+  const confirmLabel = `launch ${kind} · ${normalizedId} · ${model} in ${projectDir.trim()}?`;
   const canSubmit = idValid && projectDirValid && model.length > 0 && !goalTooLarge && !submitting;
 
   async function submit(event: FormEvent<HTMLFormElement>) {
@@ -471,7 +476,9 @@ function SpawnOrchestratorModal({
       const result = await spawnAgentOrchestrator({
         id: normalizedId,
         workdir: projectDir.trim(),
+        kind,
         model,
+        effort: kind === "cdx" ? effort : null,
         goal,
       });
       onSpawn({
@@ -543,27 +550,69 @@ function SpawnOrchestratorModal({
           </label>
 
           <label className="agent-spawn-field">
-            <span className="agent-spawn-label">Model</span>
+            <span className="agent-spawn-label">Kind</span>
             <select
               className="agent-spawn-select"
-              disabled={claudeModels.length === 0}
-              value={model}
+              value={kind}
               onChange={(event) => {
                 resetConfirmation();
-                setModel(event.target.value);
+                setKind(event.target.value as SpawnWorkerKind);
               }}
             >
-              {claudeModels.length === 0 ? (
-                <option value="">No models available</option>
-              ) : (
-                claudeModels.map((option) => (
-                  <option key={option.id} value={option.id}>
-                    {option.label}
-                  </option>
-                ))
-              )}
+              <option value="cc">cc</option>
+              <option value="cdx">cdx</option>
             </select>
           </label>
+
+          <div className="agent-spawn-row">
+            <label className="agent-spawn-field">
+              <span className="agent-spawn-label">Model</span>
+              <select
+                className="agent-spawn-select"
+                disabled={allowedModels.length === 0}
+                value={model}
+                onChange={(event) => {
+                  resetConfirmation();
+                  setModel(event.target.value);
+                }}
+              >
+                {allowedModels.length === 0 ? (
+                  <option value="">No models available</option>
+                ) : (
+                  allowedModels.map((option) => (
+                    <option key={option.id} value={option.id}>
+                      {option.label}
+                    </option>
+                  ))
+                )}
+              </select>
+            </label>
+
+            {kind === "cdx" ? (
+              <label className="agent-spawn-field">
+                <span className="agent-spawn-label">Reasoning effort</span>
+                <select
+                  className="agent-spawn-select"
+                  value={effort}
+                  onChange={(event) => {
+                    resetConfirmation();
+                    setEffort(event.target.value as SpawnWorkerEffort);
+                  }}
+                >
+                  {REASONING_EFFORTS.map((option) => (
+                    <option key={option} value={option}>
+                      {option}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            ) : (
+              <div className="agent-spawn-field">
+                <span className="agent-spawn-label">Reasoning effort</span>
+                <div className="agent-spawn-static">Not used for Claude orchestrators.</div>
+              </div>
+            )}
+          </div>
 
           <label className="agent-spawn-field">
             <span className="agent-spawn-label">Initial goal</span>
