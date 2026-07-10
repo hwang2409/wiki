@@ -3,7 +3,7 @@ type: reference
 view: kanban
 tags: [todo]
 created: 2026-07-06
-updated: 2026-07-09
+updated: 2026-07-10
 ---
 
 Todo:
@@ -14,7 +14,6 @@ Todo:
 
 In Progress:
 
-- [PHO-11274](https://linear.app/phoebework/issue/PHO-11274): compare_agent_runs trace comparison (audit-validated P1) — cdx:PHO-11274 worker
 - [PR #10475](https://github.com/phoebe-health/phoebe/pull/10475): subagent recommendation parity iteration (harness #10692) — cdx:PR-10475 worker; overfitting watch
 - [P1] WIKI-38: agents-page Replace protocol — kill + respawn orchestrator/worker with same model, kickoff prompt carries role + replaced session id/transcript for context recovery (owner: cdx:WIKI-38)
 - [P1] WIKI-39: worker mapping fixes from 07-09 phoebe churn: watchdog revived DEREGISTERED tickets (PHO-13279/13281 zombies at $HOME, no worktree); revivals skipped 'wiki agent update' so registry window ids went stale; revived-without-session-id workers fall back to worktree discovery — mapping wrong in app UI. Fix: watchdog must (1) skip tickets absent from registry, (2) spawn at registry worktree cwd, (3) run agent update --window --session after every revival, (4) WIKI-34 reset parse

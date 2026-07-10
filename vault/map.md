@@ -49,6 +49,7 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[wiki-native-tauri-dragdrop-html5]] — Tauri webview drag-drop handler kills HTML5 DnD — check before debugging dead drags in any Tauri app
 - [[wkwebview-eval-defer-clobber]] — WKWebView defers window.eval past navigate() — injected loading page clobbers loaded app when backend boots fast
 - [[vite-dist-root-owned]] — Vite ENOTEMPTY: root-owned frontend/dist artifacts block make native-build
+- [[wiki-native-codesign-running]] — Wiki native build codesign can fail when wiki-native is still running from the target bundle
 
 ## Phoebe/decisions
 

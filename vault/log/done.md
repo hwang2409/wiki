@@ -9,6 +9,8 @@ updated: 2026-07-10
 
 ## 2026-07-10
 
+- [PHO-11274](https://linear.app/phoebework/issue/PHO-11274): compare_agent_runs trace comparison (audit-validated P1) — cdx:PHO-11274 worker
+- WIKI-47 (#38) disposition footer polish — collapse R/S/I/U to just Unknown N in bottom-right chip
 - [TASK] REVIEW-10983: adversarial review of PR #10983 (call analysis approval + failure alerts) — cdx:REVIEW-10983 worker
 
 ## 2026-07-09
