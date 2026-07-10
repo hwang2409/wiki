@@ -1880,6 +1880,92 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             and json.loads(self.paths.registry_path.read_text()).get("WIKI-ARCHIVE-DEAD")
         )
 
+    async def test_archive_allows_detached_live_orphan_run(self) -> None:
+        await self.supervisor.close()
+        self.supervisor = Supervisor(
+            self.store,
+            FixtureAdapterFactory(FIXTURES),
+            pid_alive=lambda _pid: True,
+        )
+        record = RunRecord.new(
+            agent_id="WIKI-ARCHIVE-ORPHAN",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            worktree=str(self.worktree),
+            prompt="fixture",
+        )
+        record.state = LifecycleState.BLOCKED
+        record.state_reason = "provider PID is live but its control channel is not attached"
+        record.provider_session_id = "session-orphan"
+        record.provider_pid = 424_242
+        self.store.create(record)
+
+        with (
+            mock.patch.object(
+                self.supervisor,
+                "_provider_pid_is_orphan",
+                new=mock.AsyncMock(return_value=True),
+            ) as orphan,
+            mock.patch.object(
+                self.supervisor,
+                "_terminate_orphan_provider_pid",
+                new=mock.AsyncMock(return_value=True),
+            ) as terminate,
+        ):
+            archived = await self.supervisor.archive(record.run_id)
+
+        self.assertEqual(archived.state, LifecycleState.COMPLETED)
+        self.assertIsNone(archived.provider_pid)
+        orphan.assert_awaited_once_with(424_242)
+        terminate.assert_awaited_once_with(424_242)
+        self.assertFalse(self.store.run_dir(record.run_id).exists())
+        self.assertFalse(
+            (self.paths.registry_path.exists())
+            and json.loads(self.paths.registry_path.read_text()).get(
+                "WIKI-ARCHIVE-ORPHAN"
+            )
+        )
+
+    async def test_archive_refuses_detached_live_non_orphan_run(self) -> None:
+        await self.supervisor.close()
+        self.supervisor = Supervisor(
+            self.store,
+            FixtureAdapterFactory(FIXTURES),
+            pid_alive=lambda _pid: True,
+        )
+        record = RunRecord.new(
+            agent_id="WIKI-ARCHIVE-LIVE",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            worktree=str(self.worktree),
+            prompt="fixture",
+        )
+        record.state = LifecycleState.BLOCKED
+        record.state_reason = "provider PID is live but its control channel is not attached"
+        record.provider_session_id = "session-live"
+        record.provider_pid = 313_337
+        self.store.create(record)
+
+        with (
+            mock.patch.object(
+                self.supervisor,
+                "_provider_pid_is_orphan",
+                new=mock.AsyncMock(return_value=False),
+            ) as orphan,
+            self.assertRaisesRegex(
+                StoreConflict,
+                "provider PID is live without attached control; refusing false archive",
+            ),
+        ):
+            await self.supervisor.archive(record.run_id)
+
+        orphan.assert_awaited_once_with(313_337)
+        blocked = self.store.get(record.run_id)
+        self.assertEqual(blocked.state, LifecycleState.BLOCKED)
+        self.assertEqual(blocked.provider_pid, 313_337)
+
     async def test_codex_fake_exercises_start_steer_and_targeted_interrupt(
         self,
     ) -> None:

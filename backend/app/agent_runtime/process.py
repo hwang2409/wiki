@@ -163,6 +163,110 @@ async def resolve_provider_identity(
     )
 
 
+async def provider_parent_pid(
+    pid: int | None,
+    *,
+    timeout: float = 1.0,
+) -> int | None:
+    """Return the PID's current parent, or None when it cannot be verified."""
+
+    if pid is None or pid <= 1:
+        return None
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "ps",
+            "-o",
+            "ppid=",
+            "-p",
+            str(pid),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError:
+        return None
+    try:
+        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=timeout)
+    except TimeoutError:
+        process.kill()
+        await process.wait()
+        return None
+    if process.returncode != 0:
+        return None
+    value = stdout.decode("utf-8", errors="replace").strip()
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+async def provider_pid_is_orphan(
+    pid: int | None,
+    *,
+    timeout: float = 1.0,
+) -> bool:
+    """Treat a provider PID as orphaned only when its parent is init."""
+
+    return await provider_parent_pid(pid, timeout=timeout) == 1
+
+
+async def _wait_for_pid_exit(
+    pid: int | None,
+    *,
+    timeout: float,
+    poll_interval: float = 0.05,
+) -> bool:
+    if pid is None or pid <= 1:
+        return True
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        await asyncio.sleep(poll_interval)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return False
+
+
+async def terminate_detached_provider_pid(
+    pid: int | None,
+    *,
+    grace: float = 0.5,
+    terminate_timeout: float = 5.0,
+    kill_timeout: float = 1.0,
+) -> bool:
+    """Wait briefly, then terminate an orphaned detached provider PID."""
+
+    if pid is None or pid <= 1:
+        return True
+    if await _wait_for_pid_exit(pid, timeout=grace):
+        return True
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    if await _wait_for_pid_exit(pid, timeout=terminate_timeout):
+        return True
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return await _wait_for_pid_exit(pid, timeout=kill_timeout)
+
+
 async def terminate_process_group(
     process: asyncio.subprocess.Process | None,
     *,

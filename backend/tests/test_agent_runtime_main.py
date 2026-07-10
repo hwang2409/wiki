@@ -1445,7 +1445,14 @@ for raw in sys.stdin:
         )
         self.assertIsNotNone(self._worker_row(detached, "WIKI-CLAUDE")["provider_pid"])
 
-        resumed = self._read_json("POST", "/api/agents/WIKI-CLAUDE/resume")
+        try:
+            resumed = self._read_json("POST", "/api/agents/WIKI-CLAUDE/resume")
+        except AssertionError as exc:
+            if "run already has an attached provider adapter" not in str(exc):
+                raise
+            # The daemon's recovery loop may win the race and reattach before
+            # the explicit API resume lands; either path is a valid revival.
+            resumed = self._current("WIKI-CLAUDE")
         self.assertEqual(resumed["provider_session_id"], claude_session_before)
         revived = self._wait_for(
             lambda: self._current("WIKI-CLAUDE"),

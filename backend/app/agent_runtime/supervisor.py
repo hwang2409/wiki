@@ -12,6 +12,7 @@ from uuid import UUID, uuid4
 
 from .. import accounts
 from .normalizer import NormalizedProviderEvent, normalize_provider_event
+from .process import provider_pid_is_orphan, terminate_detached_provider_pid
 from .provider import AdapterStatus, ProviderAdapter, ProviderEvent, StartRequest
 from .store import RunNotFound, RunStore, StoreConflict
 from .types import (
@@ -90,6 +91,7 @@ class Supervisor:
         recovery_stability_seconds: float = 30.0,
         reaper_interval_seconds: float | None = None,
         reaper_grace_seconds: float | None = None,
+        orphan_archive_grace_seconds: float = 0.5,
     ):
         self.store = store
         self.adapter_factory = adapter_factory
@@ -119,6 +121,7 @@ class Supervisor:
         )
         self.last_reaper_at = 0.0
         self.detached_at_monotonic: dict[str, float] = {}
+        self.orphan_archive_grace_seconds = orphan_archive_grace_seconds
         self.adapters: dict[str, ProviderAdapter] = {}
         self.event_tasks: dict[str, asyncio.Task[None]] = {}
         self.event_routes: dict[tuple[int, int], str] = {}
@@ -206,6 +209,32 @@ class Supervisor:
 
     def _run_lock(self, run_id: str) -> asyncio.Lock:
         return self._agent_lock(self.store.get(run_id).agent_id)
+
+    async def _provider_pid_is_orphan(self, pid: int | None) -> bool:
+        return await provider_pid_is_orphan(pid)
+
+    async def _terminate_orphan_provider_pid(self, pid: int | None) -> bool:
+        return await terminate_detached_provider_pid(
+            pid,
+            grace=self.orphan_archive_grace_seconds,
+        )
+
+    @staticmethod
+    def _detached_terminal_status(
+        record: RunRecord,
+        target: LifecycleState,
+        *,
+        detail: str | None,
+    ) -> AdapterStatus:
+        return AdapterStatus(
+            state=target,
+            session_id=record.provider_session_id,
+            pid=None,
+            generation=record.provider_generation,
+            active_turn_id=None,
+            transcript_path=record.transcript_path,
+            detail=detail,
+        )
 
     def _codex_rotation_active(self) -> bool:
         task = self.codex_rotation_task
@@ -1706,10 +1735,32 @@ class Supervisor:
         if adapter is None:
             record = self.store.get(run_id)
             if self.pid_alive(record.provider_pid):
-                raise StoreConflict(
-                    "provider PID is live without attached control; refusing false archive"
+                if not await self._provider_pid_is_orphan(record.provider_pid):
+                    raise StoreConflict(
+                        "provider PID is live without attached control; refusing false archive"
+                    )
+                if not await self._terminate_orphan_provider_pid(record.provider_pid):
+                    raise StoreConflict(
+                        "orphan provider PID remained live after forced archive cleanup"
+                    )
+                target = (
+                    record.state
+                    if record.state in TERMINAL_STATES
+                    else LifecycleState.COMPLETED
                 )
-            if record.state not in TERMINAL_STATES:
+                record = self.store.transition(
+                    run_id,
+                    target,
+                    reason=record.state_reason if target in TERMINAL_STATES else "archived",
+                    adapter_status=self._detached_terminal_status(
+                        record,
+                        target,
+                        detail=record.state_reason
+                        if target in TERMINAL_STATES
+                        else "archived",
+                    ),
+                )
+            elif record.state not in TERMINAL_STATES:
                 record = self.store.transition(
                     run_id,
                     LifecycleState.COMPLETED,
