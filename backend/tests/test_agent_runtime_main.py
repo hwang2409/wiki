@@ -715,15 +715,15 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn(str(self.status_dir / "WIKI-42.json"), replace_call["prompt"])
 
-    async def test_spawn_rejects_unknown_model_with_clear_400(self) -> None:
+    async def test_spawn_rejects_unknown_model_with_clear_400_before_supervisor(self) -> None:
         with self.assertRaises(HTTPException) as blocked:
             main.spawn_agent(
                 {
                     "ticket": "WIKI-42",
-                    "kind": "cdx",
+                    "kind": "cc",
                     "role": "implement",
-                    "model": "totally-fake",
-                    "effort": "high",
+                    "model": "opus-4.8",
+                    "effort": None,
                     "workdir": str(self.worktree),
                     "orch": None,
                     "prompt": "Implement WIKI-42",
@@ -731,7 +731,25 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(blocked.exception.status_code, 400)
-        self.assertIn("totally-fake", str(blocked.exception.detail))
+        self.assertEqual(self.client.calls, [])
+        self.assertIn("opus-4.8", str(blocked.exception.detail))
+        self.assertIn("Allowed values: opus-4.7, opus, sonnet, sonnet-4.6, haiku, haiku-4.5", str(blocked.exception.detail))
+
+    async def test_orchestrator_spawn_rejects_unknown_model_before_supervisor(self) -> None:
+        with self.assertRaises(HTTPException) as blocked:
+            main.spawn_orchestrator(
+                {
+                    "id": "wiki_dev",
+                    "workdir": str(self.worktree),
+                    "model": "opus-4.8",
+                    "goal": "Coordinate the isolated fixture fleet.",
+                }
+            )
+
+        self.assertEqual(blocked.exception.status_code, 400)
+        self.assertEqual(self.client.calls, [])
+        self.assertIn("opus-4.8", str(blocked.exception.detail))
+        self.assertIn("Allowed values: opus-4.7, opus, sonnet, sonnet-4.6, haiku, haiku-4.5", str(blocked.exception.detail))
 
     async def test_legacy_replace_is_rejected(self) -> None:
         registry = {}

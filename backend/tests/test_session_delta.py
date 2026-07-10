@@ -36,8 +36,8 @@ class SessionDeltaTests(unittest.TestCase):
 
         self.assertIn("gpt-5.6", models)
         self.assertEqual(models["gpt-5.6"]["kind"], "cdx")
-        self.assertIn("opus-4.8", models)
-        self.assertEqual(models["opus-4.8"]["kind"], "cc")
+        self.assertIn("opus-4.7", models)
+        self.assertEqual(models["opus-4.7"]["kind"], "cc")
 
     def test_landing_poll_patch_fixes_legacy_miss(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -518,7 +518,7 @@ class SessionDeltaTests(unittest.TestCase):
                         "worker": {
                             "kind": "cc",
                             "provider": "claude",
-                            "model": "opus-4.8",
+                            "model": "opus-4.7",
                         }
                     }
                 ),
@@ -543,7 +543,7 @@ class SessionDeltaTests(unittest.TestCase):
                 body = main.agent_session("WIKI-55", cursor=0)
 
             self.assertEqual(body["format"], "pane-log")
-            self.assertEqual(body["model"], "opus-4.8")
+            self.assertEqual(body["model"], "opus-4.7")
             self.assertEqual(body["kind"], "cc")
             self.assertEqual(body["provider"], "claude")
 
