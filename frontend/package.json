@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
-    "test": "node tests/native-transcript-surfaces.playwright.mjs",
+    "test": "node tests/native-transcript-surfaces.playwright.mjs && node tests/wiki59-shiki.playwright.mjs",
     "build": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.node.json --noEmit && vite build",
     "preview": "vite preview"
   },
@@ -32,9 +32,9 @@
     "react": "^19.2.1",
     "react-dom": "^19.2.1",
     "react-markdown": "^10.1.0",
-    "rehype-highlight": "^7.0.2",
     "remark-breaks": "^4.0.0",
     "remark-gfm": "^4.0.1",
+    "shiki": "^4.3.1",
     "vite": "^7.3.0"
   },
   "devDependencies": {

@@ -3,7 +3,7 @@ import type { MouseEvent, ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
-import rehypeHighlight from "rehype-highlight";
+import { ShikiCode } from "./shiki";
 import {
   AlertTriangle,
   Bug,
@@ -389,6 +389,25 @@ type MarkdownLinkProps = {
   "data-wikilink"?: string;
 };
 
+export function MarkdownPre({
+  children,
+  ...rest
+}: React.HTMLAttributes<HTMLPreElement>) {
+  const items = Children.toArray(children);
+  const child = items.length === 1 ? items[0] : null;
+  if (
+    child &&
+    isValidElement<{ className?: string; children?: ReactNode }>(child) &&
+    child.type === "code"
+  ) {
+    const langMatch = /language-([\w-]+)/.exec(child.props.className ?? "");
+    const lang = langMatch?.[1] ?? null;
+    const code = textFromReactNode(child.props.children).replace(/\n$/, "");
+    return <ShikiCode className="markdown-code-block" code={code} lang={lang} />;
+  }
+  return <pre {...rest}>{children}</pre>;
+}
+
 function createComponents(
   resolve: WikilinkResolver,
   onOpenNote: (path: string) => void,
@@ -444,7 +463,8 @@ function createComponents(
 
   return {
     a: MarkdownLink,
-    blockquote: MarkdownBlockquote
+    blockquote: MarkdownBlockquote,
+    pre: MarkdownPre
   };
 }
 
@@ -469,7 +489,6 @@ export function ObsidianMarkdown({
   return (
     <ReactMarkdown
       components={components}
-      rehypePlugins={[[rehypeHighlight, { detect: false }]]}
       remarkPlugins={[remarkGfm, remarkObsidianInline, remarkBreaks]}
     >
       {prepared}

@@ -42,6 +42,8 @@ import {
 import type { LucideIcon } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { MarkdownPre } from "./markdown";
+import { ShikiCode } from "./shiki";
 import {
   cancelQueuedMessage,
   getSkills,
@@ -704,7 +706,11 @@ function ToolRow({
       <div className={`session-collapsible session-tool-collapsible${open ? " is-open" : ""}`}>
         <div className="session-collapsible-inner">
           <div className="session-tool-body">
-            <pre>{tool.input}</pre>
+            {tool.name === "Bash" ? (
+              <ShikiCode className="session-tool-input" code={tool.input} lang="bash" />
+            ) : (
+              <pre>{tool.input}</pre>
+            )}
             {tool.output ? <pre className="session-tool-output">{renderAnsi(tool.output)}</pre> : null}
           </div>
         </div>
@@ -950,6 +956,7 @@ function SessionMarkdownLink({ href, ...props }: ComponentProps<"a">) {
 
 const sessionMarkdownComponents = {
   a: SessionMarkdownLink,
+  pre: MarkdownPre,
 };
 
 function BashBlock({
@@ -970,7 +977,12 @@ function BashBlock({
       {bash.input ? (
         <div className="session-bash-command">
           <span className="session-bash-prompt">❯</span>
-          <pre>{bash.input}</pre>
+          <ShikiCode
+            className="session-bash-command-code"
+            code={bash.input}
+            lang="bash"
+            transparent
+          />
         </div>
       ) : null}
       {output ? (
