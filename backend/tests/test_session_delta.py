@@ -42,6 +42,8 @@ class SessionDeltaTests(unittest.TestCase):
         self.assertEqual(models["gpt-5.6-sol"]["kind"], "cdx")
         self.assertIn("opus-4.7", models)
         self.assertEqual(models["opus-4.7"]["kind"], "cc")
+        self.assertIn("claude-fable-5", models)
+        self.assertEqual(models["claude-fable-5"]["kind"], "cc")
 
     def test_landing_poll_patch_fixes_legacy_miss(self) -> None:
         with TemporaryDirectory() as tmp:

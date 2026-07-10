@@ -71,6 +71,13 @@ MODEL_OPTIONS: tuple[AgentModelOption, ...] = (
         supports_reasoning_effort=True,
     ),
     AgentModelOption(
+        id="claude-fable-5",
+        label="Claude Fable 5",
+        kind="cc",
+        provider="claude",
+        supports_reasoning_effort=False,
+    ),
+    AgentModelOption(
         id="opus-4.7",
         label="Opus 4.7",
         kind="cc",

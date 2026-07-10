@@ -733,7 +733,7 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(blocked.exception.status_code, 400)
         self.assertEqual(self.client.calls, [])
         self.assertIn("opus-4.8", str(blocked.exception.detail))
-        self.assertIn("Allowed values: opus-4.7, opus, sonnet, sonnet-4.6, haiku, haiku-4.5", str(blocked.exception.detail))
+        self.assertIn("Allowed values: claude-fable-5, opus-4.7, opus, sonnet, sonnet-4.6, haiku, haiku-4.5", str(blocked.exception.detail))
 
     async def test_spawn_accepts_gpt_56_sol_variant(self) -> None:
         spawned = main.spawn_agent(
@@ -790,7 +790,7 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(blocked.exception.status_code, 400)
         self.assertEqual(self.client.calls, [])
         self.assertIn("opus-4.8", str(blocked.exception.detail))
-        self.assertIn("Allowed values: opus-4.7, opus, sonnet, sonnet-4.6, haiku, haiku-4.5", str(blocked.exception.detail))
+        self.assertIn("Allowed values: claude-fable-5, opus-4.7, opus, sonnet, sonnet-4.6, haiku, haiku-4.5", str(blocked.exception.detail))
 
     async def test_legacy_replace_is_rejected(self) -> None:
         registry = {}
