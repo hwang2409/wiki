@@ -8,6 +8,7 @@ updated: 2026-07-10
 # Done
 
 ## 2026-07-10
+- **tools** — removed destructive_command_guard Codex hook and /Users/henry/.local/bin/dcg
 
 - [PHO-11274](https://linear.app/phoebework/issue/PHO-11274): compare_agent_runs trace comparison (audit-validated P1) — cdx:PHO-11274 worker
 - WIKI-47 (#38) disposition footer polish — collapse R/S/I/U to just Unknown N in bottom-right chip
