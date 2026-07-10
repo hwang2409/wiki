@@ -786,6 +786,33 @@ class RunStoreTests(unittest.TestCase):
                 )
             self.assertEqual(store.current_run_id("WIKI-42"), replacement.run_id)
 
+    def test_quiesce_intent_can_capture_prior_working_state_from_blocked_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(_paths(root))
+            record = store.create(_record(root))
+            record = store.update_adapter_status(
+                record.run_id,
+                AdapterStatus(
+                    LifecycleState.WORKING,
+                    "session-1",
+                    4242,
+                ),
+            )
+            store.transition(
+                record.run_id,
+                LifecycleState.BLOCKED,
+                reason="fixture auth-dead",
+            )
+
+            marked = store.mark_quiesce_intent(
+                record.run_id,
+                str(uuid4()),
+                "session-1",
+                resume_state=LifecycleState.WORKING,
+            )
+            self.assertEqual(marked.quiesce_resume_state, LifecycleState.WORKING)
+
     def test_quiesce_detach_converges_after_late_lifecycle_and_clears_on_resume(
         self,
     ) -> None:

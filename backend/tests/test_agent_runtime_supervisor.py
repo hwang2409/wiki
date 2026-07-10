@@ -8,7 +8,9 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, cast
 from unittest import mock
 
 from backend.app import accounts
@@ -86,6 +88,22 @@ async def _wait_for_events(store: RunStore, run_id: str, minimum: int) -> RunRec
             return record
         await asyncio.sleep(0.01)
     raise AssertionError(f"run {run_id} did not reach {minimum} raw events")
+
+
+async def _wait_for_published(
+    queue: asyncio.Queue[dict[str, Any]],
+    event_type: str,
+    *,
+    timeout: float = 2,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AssertionError(f"did not publish {event_type}")
+        event = await asyncio.wait_for(queue.get(), timeout=remaining)
+        if event.get("type") == event_type:
+            return event
 
 
 class SupervisorTests(unittest.IsolatedAsyncioTestCase):
@@ -802,6 +820,281 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(journal["phase"], "complete")
         self.assertEqual(journal["status"], "succeeded")
         self.assertNotIn("tokens", json.dumps(journal))
+
+    async def test_rate_limit_event_rotates_codex_fleet_and_pins_reset(
+        self,
+    ) -> None:
+        await self.supervisor.close()
+        self.supervisor = Supervisor(
+            self.store,
+            FixtureAdapterFactory(FIXTURES, pid=987_654),
+            pid_alive=lambda _pid: False,
+        )
+        env = self._seed_accounts()
+        queue = self.supervisor.subscribe()
+        codex = await self.supervisor.start_run(
+            agent_id="WIKI-RATE-LIMIT",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="fixture",
+        )
+        claude = await self.supervisor.start_run(
+            agent_id="WIKI-CLAUDE-STABLE",
+            provider=ProviderKind.CLAUDE,
+            role="review",
+            model="fixture-claude",
+            effort=None,
+            worktree=str(self.worktree),
+            prompt="fixture",
+        )
+        old_adapter = self.supervisor.adapters[codex.run_id]
+        payload = {
+            "method": "account/rateLimits/updated",
+            "params": {
+                "rateLimits": {
+                    "primary": {"resetsAt": 1_750_001_234},
+                    "secondary": {"resetsAt": 1_760_000_000},
+                    "rateLimitReachedType": "rate_limit_reached",
+                }
+            },
+        }
+
+        with (
+            mock.patch.dict(os.environ, env),
+            mock.patch.object(accounts, "codex_login_status", return_value=True),
+        ):
+            await self.supervisor._handle_provider_event(  # noqa: SLF001
+                codex.run_id,
+                old_adapter,
+                ProviderEvent(ProviderKind.CODEX, payload),
+            )
+            published = await _wait_for_published(queue, "codex_rotation")
+            for _ in range(200):
+                current = self.store.get(codex.run_id)
+                new_adapter = self.supervisor.adapters.get(codex.run_id)
+                if (
+                    current.state is LifecycleState.IDLE
+                    and new_adapter is not None
+                    and new_adapter is not old_adapter
+                ):
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(accounts.read_state().active, "beta")
+            self.assertEqual(
+                accounts.read_state().accounts["alpha"]["limit_reset_at"],
+                datetime.fromtimestamp(1_750_001_234, tz=timezone.utc).isoformat(),
+            )
+
+        self.assertEqual(
+            published,
+            {
+                "type": "codex_rotation",
+                "from": "alpha",
+                "to": "beta",
+                "revived": ["WIKI-RATE-LIMIT"],
+                "failed": [],
+                "failed_reasons": {},
+                "ts": published["ts"],
+            },
+        )
+        self.assertIsNot(self.supervisor.adapters[codex.run_id], old_adapter)
+        self.assertIn(claude.run_id, self.supervisor.adapters)
+        self.supervisor.unsubscribe(queue)
+
+    async def test_rate_limit_event_without_eligible_account_emits_banner(
+        self,
+    ) -> None:
+        await self.supervisor.close()
+        self.supervisor = Supervisor(
+            self.store,
+            FixtureAdapterFactory(FIXTURES, pid=987_654),
+            pid_alive=lambda _pid: False,
+        )
+        env = self._seed_accounts()
+        queue = self.supervisor.subscribe()
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-NO-ELIGIBLE",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="fixture",
+        )
+        adapter = self.supervisor.adapters[record.run_id]
+        payload = {
+            "method": "account/rateLimits/updated",
+            "params": {
+                "rateLimits": {
+                    "primary": {"resetsAt": 1_750_009_999},
+                    "rateLimitReachedType": "rate_limit_reached",
+                }
+            },
+        }
+
+        with mock.patch.dict(os.environ, env):
+            state = accounts.read_state()
+            state.accounts.setdefault("beta", {})["limit_reset_at"] = (
+                "2099-01-02T00:00:00+00:00"
+            )
+            accounts.write_state(state)
+            await self.supervisor._handle_provider_event(  # noqa: SLF001
+                record.run_id,
+                adapter,
+                ProviderEvent(ProviderKind.CODEX, payload),
+            )
+            published = await _wait_for_published(queue, "codex_limit_no_eligible")
+            self.assertEqual(accounts.read_state().active, "alpha")
+
+        self.assertEqual(published["tickets"], ["WIKI-NO-ELIGIBLE"])
+        self.assertEqual(
+            published["reset_at"],
+            datetime.fromtimestamp(1_750_009_999, tz=timezone.utc).isoformat(),
+        )
+        self.supervisor.unsubscribe(queue)
+
+    async def test_auth_dead_event_resumes_exact_session_without_rotation(
+        self,
+    ) -> None:
+        queue = self.supervisor.subscribe()
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-AUTH-DEAD",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="fixture",
+        )
+        old_adapter = self.supervisor.adapters[record.run_id]
+
+        await self.supervisor._handle_provider_event(  # noqa: SLF001
+            record.run_id,
+            old_adapter,
+            ProviderEvent(
+                ProviderKind.CODEX,
+                {
+                    "method": "error",
+                    "params": {
+                        "message": (
+                            "Your access token could not be refreshed because you have "
+                            "since logged out or signed in to another account. "
+                            "Please sign in again."
+                        ),
+                        "willRetry": False,
+                    },
+                },
+            ),
+        )
+        published = await _wait_for_published(queue, "codex_auth_dead_revival")
+        for _ in range(200):
+            current = self.store.get(record.run_id)
+            new_adapter = self.supervisor.adapters.get(record.run_id)
+            if (
+                current.state is LifecycleState.IDLE
+                and new_adapter is not None
+                and new_adapter is not old_adapter
+            ):
+                break
+            await asyncio.sleep(0.01)
+
+        current = self.store.get(record.run_id)
+        self.assertEqual(current.provider_session_id, record.provider_session_id)
+        self.assertEqual(current.state, LifecycleState.IDLE)
+        self.assertIsNot(self.supervisor.adapters[record.run_id], old_adapter)
+        self.assertIsInstance(old_adapter, CodexFixtureAdapter)
+        old_codex_adapter = cast(CodexFixtureAdapter, old_adapter)
+        self.assertTrue(old_codex_adapter.closed)
+        self.assertEqual(published["revived"], ["WIKI-AUTH-DEAD"])
+        self.assertEqual(published["failed"], [])
+        self.supervisor.unsubscribe(queue)
+
+    async def test_auth_dead_exhaustion_alerts_without_restarting_run(self) -> None:
+        queue = self.supervisor.subscribe()
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-AUTH-CAP",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="fixture",
+        )
+        adapter = self.supervisor.adapters[record.run_id]
+        now = time.monotonic()
+        self.supervisor.auth_dead_attempts[record.agent_id] = [
+            now - 400,
+            now - 500,
+            now - 600,
+        ]
+
+        await self.supervisor._handle_provider_event(  # noqa: SLF001
+            record.run_id,
+            adapter,
+            ProviderEvent(
+                ProviderKind.CODEX,
+                {
+                    "method": "error",
+                    "params": {
+                        "message": (
+                            "Your access token could not be refreshed because you have "
+                            "since logged out or signed in to another account. "
+                            "Please sign in again."
+                        ),
+                        "willRetry": False,
+                    },
+                },
+            ),
+        )
+        published = await _wait_for_published(queue, "codex_auth_dead_exhausted")
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(published["tickets"], ["WIKI-AUTH-CAP"])
+        self.assertIsInstance(adapter, CodexFixtureAdapter)
+        codex_adapter = cast(CodexFixtureAdapter, adapter)
+        self.assertIs(self.supervisor.adapters[record.run_id], adapter)
+        self.assertFalse(codex_adapter.closed)
+        self.supervisor.unsubscribe(queue)
+
+    async def test_claude_limit_event_alerts_once_per_hour(self) -> None:
+        queue = self.supervisor.subscribe()
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-CLAUDE-LIMIT",
+            provider=ProviderKind.CLAUDE,
+            role="review",
+            model="fixture-claude",
+            effort=None,
+            worktree=str(self.worktree),
+            prompt="fixture",
+        )
+        adapter = self.supervisor.adapters[record.run_id]
+        payload = {
+            "type": "result",
+            "subtype": "error",
+            "is_error": True,
+            "result": "Claude usage limit reached. Try again at 4pm.",
+        }
+
+        await self.supervisor._handle_provider_event(  # noqa: SLF001
+            record.run_id,
+            adapter,
+            ProviderEvent(ProviderKind.CLAUDE, payload),
+        )
+        first = await _wait_for_published(queue, "claude_limit_hit")
+        await self.supervisor._handle_provider_event(  # noqa: SLF001
+            record.run_id,
+            adapter,
+            ProviderEvent(ProviderKind.CLAUDE, payload),
+        )
+
+        self.assertEqual(first["ticket"], "WIKI-CLAUDE-LIMIT")
+        self.assertEqual(first["window"], "")
+        with self.assertRaises(TimeoutError):
+            await _wait_for_published(queue, "claude_limit_hit", timeout=0.1)
+        self.supervisor.unsubscribe(queue)
 
     async def test_rotation_failure_restores_auth_and_resumes_quiesced_run(
         self,

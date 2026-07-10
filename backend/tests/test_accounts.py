@@ -1289,6 +1289,63 @@ class AuthDeadDetectionTests(unittest.TestCase):
         self.assertTrue(accounts.detect_cwd_dialog(CWD_DIALOG_STRING))
         self.assertFalse(accounts.detect_cwd_dialog("no dialog here"))
 
+    def test_event_level_auth_dead_detection_ignores_user_echo(self) -> None:
+        self.assertTrue(
+            accounts.detect_codex_auth_dead_payload(
+                {"method": "error", "params": {"message": REAL_AUTH_DEAD_STRING}}
+            )
+        )
+        self.assertFalse(
+            accounts.detect_codex_auth_dead_payload(
+                {
+                    "method": "item/started",
+                    "params": {
+                        "item": {
+                            "type": "userMessage",
+                            "content": [{"type": "text", "text": REAL_AUTH_DEAD_STRING}],
+                        }
+                    },
+                }
+            )
+        )
+
+    def test_event_level_claude_limit_detection_ignores_user_echo(self) -> None:
+        self.assertTrue(
+            accounts.detect_claude_limit_payload(
+                {"type": "result", "is_error": True, "result": CLAUDE_LIMIT_STRING}
+            )
+        )
+        self.assertFalse(
+            accounts.detect_claude_limit_payload(
+                {
+                    "type": "user",
+                    "message": {
+                        "content": [{"type": "text", "text": CLAUDE_LIMIT_STRING}]
+                    },
+                }
+            )
+        )
+
+    def test_codex_rate_limit_snapshot_extracts_type_and_reset(self) -> None:
+        payload = {
+            "method": "account/rateLimits/updated",
+            "params": {
+                "rateLimits": {
+                    "primary": {"resetsAt": 1_750_000_000},
+                    "secondary": {"resetsAt": 1_760_000_000},
+                    "rateLimitReachedType": "rate_limit_reached",
+                }
+            },
+        }
+        self.assertEqual(
+            accounts.codex_rate_limit_reached_type(payload),
+            "rate_limit_reached",
+        )
+        self.assertEqual(
+            accounts.rate_limit_reset_from_snapshot(payload),
+            datetime.fromtimestamp(1_750_000_000, tz=timezone.utc).isoformat(),
+        )
+
 
 class SessionIdResolutionTests(unittest.TestCase):
     def _prepare(self, paths: dict[str, Path]) -> tuple[Path, Path]:

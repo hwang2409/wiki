@@ -1133,6 +1133,8 @@ class RunStore:
         run_id: str,
         operation_id: str,
         expected_session_id: str,
+        *,
+        resume_state: LifecycleState | None = None,
     ) -> RunRecord:
         """Capture the exact current session and resumable state before stopping it."""
 
@@ -1151,12 +1153,20 @@ class RunStore:
                 if record.quiesce_operation_id == operation_id:
                     return record
                 raise StoreConflict("run belongs to another quiesce operation")
-            if record.state not in {LifecycleState.WORKING, LifecycleState.IDLE}:
+            captured_state = resume_state or record.state
+            if captured_state not in {LifecycleState.WORKING, LifecycleState.IDLE}:
+                raise StoreConflict(
+                    f"state {captured_state.value} cannot be quiesced for exact-session resume"
+                )
+            if resume_state is None and record.state not in {
+                LifecycleState.WORKING,
+                LifecycleState.IDLE,
+            }:
                 raise StoreConflict(
                     f"state {record.state.value} cannot be quiesced for exact-session resume"
                 )
             record.quiesce_operation_id = operation_id
-            record.quiesce_resume_state = record.state
+            record.quiesce_resume_state = captured_state
             self._write_record(record)
             registry = self._read_registry()
             current = (registry.get(record.agent_id) or {}).get("current") or {}

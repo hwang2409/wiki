@@ -22,7 +22,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Iterator
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +187,95 @@ def detect_cwd_dialog(pane: str) -> bool:
     return bool(pane and CWD_DIALOG_PATTERN.search(pane))
 
 
+def _iter_payload_strings(value: object) -> Iterator[str]:
+    if isinstance(value, str):
+        yield value
+        return
+    if isinstance(value, dict):
+        for nested in value.values():
+            yield from _iter_payload_strings(nested)
+        return
+    if isinstance(value, list | tuple | set):
+        for nested in value:
+            yield from _iter_payload_strings(nested)
+
+
+def _payload_matches(pattern: re.Pattern[str], payload: object) -> bool:
+    return any(pattern.search(text) for text in _iter_payload_strings(payload))
+
+
+def detect_claude_limit_payload(payload: object) -> bool:
+    """Event-level Claude limit detector that ignores echoed user content."""
+
+    if not isinstance(payload, dict):
+        return False
+    event_type = payload.get("type")
+    if event_type not in {
+        "result",
+        "system",
+        "provider_stderr",
+        "provider_protocol_error",
+    }:
+        return False
+    return _payload_matches(CLAUDE_LIMIT_PATTERN, payload)
+
+
+def detect_codex_auth_dead_payload(payload: object) -> bool:
+    """Event-level Codex auth-dead detector that ignores echoed prompts."""
+
+    if not isinstance(payload, dict):
+        return False
+    method = payload.get("method")
+    if method not in {
+        "error",
+        "turn/completed",
+        "provider/stderr",
+        "provider/protocolError",
+    }:
+        return False
+    return _payload_matches(AUTH_DEAD_PATTERN, payload)
+
+
+def codex_rate_limit_reached_type(payload: object) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("method") != "account/rateLimits/updated":
+        return None
+    params = payload.get("params")
+    if not isinstance(params, dict):
+        return None
+    rate_limits = params.get("rateLimits")
+    if not isinstance(rate_limits, dict):
+        return None
+    value = rate_limits.get("rateLimitReachedType")
+    return value if isinstance(value, str) and value else None
+
+
+def rate_limit_reset_from_snapshot(payload: object) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    params = payload.get("params")
+    if not isinstance(params, dict):
+        return None
+    rate_limits = params.get("rateLimits")
+    if not isinstance(rate_limits, dict):
+        return None
+
+    resets_at: list[float] = []
+    for value in rate_limits.values():
+        if not isinstance(value, dict):
+            continue
+        raw = value.get("resetsAt")
+        if isinstance(raw, bool) or not isinstance(raw, int | float):
+            continue
+        if raw <= 0:
+            continue
+        resets_at.append(float(raw))
+    if not resets_at:
+        return None
+    return datetime.fromtimestamp(min(resets_at), tz=timezone.utc).isoformat()
+
+
 def _local_now(now: datetime | None = None) -> datetime:
     if now is None:
         return datetime.now().astimezone()
@@ -265,6 +354,10 @@ def parse_reset_time(pane: str, *, now: datetime | None = None) -> str | None:
 def _fallback_reset_time(now: datetime | None = None) -> str:
     """Conservative reset pin when the pane omitted an unparseable reset time."""
     return (_local_now(now) + timedelta(hours=UNKNOWN_RESET_HOURS)).isoformat()
+
+
+def fallback_reset_time(now: datetime | None = None) -> str:
+    return _fallback_reset_time(now)
 
 
 # ---------------------------------------------------------------------------

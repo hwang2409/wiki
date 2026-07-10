@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from .. import accounts
 from .normalizer import NormalizedProviderEvent, normalize_provider_event
@@ -84,6 +85,12 @@ class Supervisor:
         self.pipeline_failures: dict[str, str] = {}
         self.expected_stream_ends: set[int] = set()
         self.subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
+        self.monitor_tasks: set[asyncio.Task[Any]] = set()
+        self.auth_dead_attempts: dict[str, list[float]] = {}
+        self.auth_dead_alert_at: dict[str, float] = {}
+        self.auth_dead_recoveries: dict[str, asyncio.Task[None]] = {}
+        self.last_limit_alert_at: dict[str, float] = {}
+        self.last_no_eligible_alert: float = 0.0
 
     def _runtime_status(self, record: RunRecord) -> dict[str, Any]:
         value = _public_run(record)
@@ -121,6 +128,32 @@ class Supervisor:
         await self._publish(
             {"type": "agents", "tickets": [agent_id], "surface": "agents"}
         )
+
+    def _spawn_monitor_task(
+        self,
+        coro: Any,
+        *,
+        name: str,
+    ) -> asyncio.Task[Any]:
+        task = asyncio.create_task(coro, name=name)
+        self.monitor_tasks.add(task)
+        task.add_done_callback(self.monitor_tasks.discard)
+        return task
+
+    @staticmethod
+    def _seconds_since(ts: float) -> float:
+        return time.monotonic() - ts if ts else float("inf")
+
+    def _current_codex_tickets(self) -> list[str]:
+        tickets = {
+            record.agent_id
+            for record in self.store.list_runs()
+            if record.provider is ProviderKind.CODEX
+            and self.store.is_current(record)
+            and not record.replaced_by_run_id
+            and record.state not in TERMINAL_STATES
+        }
+        return sorted(tickets)
 
     def _agent_lock(self, agent_id: str) -> asyncio.Lock:
         return self.agent_locks.setdefault(agent_id, asyncio.Lock())
@@ -243,6 +276,7 @@ class Supervisor:
         adapter: ProviderAdapter,
         event: ProviderEvent,
     ) -> None:
+        prior = self.store.get(run_id)
         raw = self.store.append_raw(
             run_id,
             provider=event.provider.value,
@@ -288,12 +322,246 @@ class Supervisor:
         await self._publish(
             {"type": "session", "ticket": record.agent_id, "surface": "session"}
         )
+        self._schedule_monitor_actions(
+            run_id,
+            adapter,
+            event,
+            prior_state=prior.state,
+            record=record,
+        )
 
         if (
             record.state is LifecycleState.IDLE
             and id(adapter) not in self.expected_stream_ends
         ):
             await self._deliver_next_queued(run_id, adapter)
+
+    def _schedule_monitor_actions(
+        self,
+        run_id: str,
+        adapter: ProviderAdapter,
+        event: ProviderEvent,
+        *,
+        prior_state: LifecycleState,
+        record: RunRecord,
+    ) -> None:
+        if not self.store.is_current(record) or record.replaced_by_run_id:
+            return
+        if event.provider is ProviderKind.CODEX:
+            reached = accounts.codex_rate_limit_reached_type(event.payload)
+            if reached is not None:
+                outgoing_reset_at = (
+                    accounts.rate_limit_reset_from_snapshot(event.payload)
+                    or accounts.fallback_reset_time()
+                )
+                self._spawn_monitor_task(
+                    self._handle_codex_rate_limit_event(
+                        run_id,
+                        outgoing_reset_at=outgoing_reset_at,
+                    ),
+                    name=f"codex-rate-limit-{run_id}",
+                )
+            if (
+                event.direction != "client"
+                and accounts.detect_codex_auth_dead_payload(event.payload)
+            ):
+                existing = self.auth_dead_recoveries.get(run_id)
+                if existing is None or existing.done():
+                    task = self._spawn_monitor_task(
+                        self._recover_codex_auth_dead(
+                            run_id,
+                            adapter,
+                            prior_state=prior_state,
+                        ),
+                        name=f"codex-auth-dead-{run_id}",
+                    )
+                    self.auth_dead_recoveries[run_id] = task
+
+                    def clear_finished(done: asyncio.Task[None]) -> None:
+                        if self.auth_dead_recoveries.get(run_id) is done:
+                            self.auth_dead_recoveries.pop(run_id, None)
+
+                    task.add_done_callback(clear_finished)
+            return
+        if (
+            event.provider is ProviderKind.CLAUDE
+            and event.direction != "stdin"
+            and accounts.detect_claude_limit_payload(event.payload)
+        ):
+            if self._seconds_since(self.last_limit_alert_at.get(record.agent_id, 0.0)) < 3600:
+                return
+            self.last_limit_alert_at[record.agent_id] = time.monotonic()
+            self._spawn_monitor_task(
+                self._publish(
+                    {
+                        "type": "claude_limit_hit",
+                        "ticket": record.agent_id,
+                        "window": "",
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                    }
+                ),
+                name=f"claude-limit-{run_id}",
+            )
+
+    async def _handle_codex_rate_limit_event(
+        self,
+        run_id: str,
+        *,
+        outgoing_reset_at: str,
+    ) -> None:
+        try:
+            await self.request_codex_rotation(
+                operation_id=str(uuid4()),
+                force_target=None,
+                outgoing_reset_at=outgoing_reset_at,
+            )
+        except accounts.RotationDebouncedError:
+            return
+        except StoreConflict as exc:
+            if "another Codex account rotation is active" in str(exc):
+                return
+            await self._publish(
+                {
+                    "type": "codex_rotation_failed",
+                    "error": str(exc),
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+        except accounts.NoEligibleAccountError:
+            if self._seconds_since(self.last_no_eligible_alert) < 3600:
+                return
+            self.last_no_eligible_alert = time.monotonic()
+            tickets = self._current_codex_tickets()
+            if not tickets:
+                try:
+                    tickets = [self.store.get(run_id).agent_id]
+                except RunNotFound:
+                    tickets = []
+            await self._publish(
+                {
+                    "type": "codex_limit_no_eligible",
+                    "tickets": tickets,
+                    "reset_at": outgoing_reset_at,
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+        except accounts.RotationError as exc:
+            await self._publish(
+                {
+                    "type": "codex_rotation_failed",
+                    "error": str(exc),
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+
+    async def _recover_codex_auth_dead(
+        self,
+        run_id: str,
+        adapter: ProviderAdapter,
+        *,
+        prior_state: LifecycleState,
+    ) -> None:
+        if prior_state not in {LifecycleState.WORKING, LifecycleState.IDLE}:
+            return
+        try:
+            initial = self.store.get(run_id)
+        except RunNotFound:
+            return
+        now_mono = time.monotonic()
+        history = self.auth_dead_attempts.setdefault(initial.agent_id, [])
+        history[:] = [
+            ts
+            for ts in history
+            if now_mono - ts < accounts.AUTH_DEAD_WINDOW_SECONDS
+        ]
+        if history and now_mono - history[-1] < accounts.AUTH_DEAD_COOLDOWN_SECONDS:
+            await self._publish_auth_dead_exhausted(initial.agent_id, now_mono)
+            return
+        if len(history) >= accounts.AUTH_DEAD_MAX_ATTEMPTS:
+            await self._publish_auth_dead_exhausted(initial.agent_id, now_mono)
+            return
+        history.append(now_mono)
+
+        operation_id = str(uuid4())
+        revived: list[str] = []
+        failed: list[str] = []
+        failed_reasons: dict[str, str] = {}
+
+        async with self._run_lock(run_id):
+            try:
+                record = self.store.get(run_id)
+                if (
+                    not self.store.is_current(record)
+                    or record.replaced_by_run_id
+                    or record.state in TERMINAL_STATES
+                ):
+                    return
+                if self.adapters.get(run_id) is not adapter:
+                    return
+                session_id = record.provider_session_id
+                if not session_id:
+                    raise StoreConflict("run has no provider session id")
+                self.store.mark_quiesce_intent(
+                    run_id,
+                    operation_id,
+                    session_id,
+                    resume_state=prior_state,
+                )
+                await self._close_and_drain_adapter(run_id, adapter)
+                detached = self.store.finish_provider_detached(
+                    run_id,
+                    operation_id,
+                    reason="quiesced for auth-dead recovery",
+                )
+                await self._publish_agent_change(detached.agent_id)
+                await self._resume_run(run_id, automatic=False)
+                revived.append(record.agent_id)
+            except Exception as exc:
+                try:
+                    current = self.store.transition(
+                        run_id,
+                        LifecycleState.BLOCKED,
+                        reason=f"auth-dead exact-session resume failed: {exc}",
+                    )
+                except Exception:
+                    current = None
+                if current is not None:
+                    await self._publish_agent_change(current.agent_id)
+                    failed.append(current.agent_id)
+                    failed_reasons[current.agent_id] = str(exc)
+                else:
+                    failed.append(initial.agent_id)
+                    failed_reasons[initial.agent_id] = str(exc)
+
+        if revived or failed:
+            await self._publish(
+                {
+                    "type": "codex_auth_dead_revival",
+                    "revived": revived,
+                    "failed": failed,
+                    "failed_reasons": failed_reasons,
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+
+    async def _publish_auth_dead_exhausted(
+        self,
+        agent_id: str,
+        now_mono: float,
+    ) -> None:
+        if (
+            now_mono - self.auth_dead_alert_at.get(agent_id, 0.0)
+            < accounts.AUTH_DEAD_ALERT_INTERVAL_SECONDS
+        ):
+            return
+        self.auth_dead_alert_at[agent_id] = now_mono
+        await self._publish(
+            {
+                "type": "codex_auth_dead_exhausted",
+                "tickets": [agent_id],
+                "ts": datetime.now(timezone.utc).isoformat(),
+            }
+        )
 
     async def _deliver_next_queued(self, run_id: str, adapter: ProviderAdapter) -> None:
         async with self._run_lock(run_id):
@@ -584,6 +852,7 @@ class Supervisor:
         *,
         operation_id: str,
         force_target: str | None,
+        outgoing_reset_at: str | None = None,
     ) -> dict[str, Any]:
         """Run or join one shielded, daemon-owned account rotation."""
 
@@ -611,7 +880,11 @@ class Supervisor:
                 )
 
         task = asyncio.create_task(
-            self._rotate_codex_fleet(operation_id, force_target),
+            self._rotate_codex_fleet(
+                operation_id,
+                force_target,
+                outgoing_reset_at=outgoing_reset_at,
+            ),
             name=f"codex-account-rotation-{operation_id}",
         )
         self.codex_rotation_task = task
@@ -629,6 +902,8 @@ class Supervisor:
         self,
         operation_id: str,
         force_target: str | None,
+        *,
+        outgoing_reset_at: str | None,
     ) -> dict[str, Any]:
         async with self.codex_fleet_lock:
             recovered = await self._recover_codex_rotation_locked()
@@ -702,6 +977,7 @@ class Supervisor:
                     accounts.rotate_credentials,
                     state=state,
                     force_target=target,
+                    outgoing_reset_at=outgoing_reset_at,
                     snapshot_outgoing=False,
                 )
                 committed = await asyncio.to_thread(accounts.read_state)
@@ -1692,9 +1968,17 @@ class Supervisor:
         if self.event_tasks:
             await asyncio.gather(*self.event_tasks.values(), return_exceptions=True)
         self.event_tasks.clear()
+        if self.monitor_tasks:
+            await asyncio.gather(*self.monitor_tasks, return_exceptions=True)
+        self.monitor_tasks.clear()
         self.event_routes.clear()
         self.queue_locks.clear()
         self.agent_locks.clear()
         self.pipeline_failures.clear()
         self.expected_stream_ends.clear()
+        self.auth_dead_attempts.clear()
+        self.auth_dead_alert_at.clear()
+        self.auth_dead_recoveries.clear()
+        self.last_limit_alert_at.clear()
+        self.last_no_eligible_alert = 0.0
         self.adapters.clear()
