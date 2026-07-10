@@ -150,12 +150,10 @@ export function spawnAgentWorker(body: SpawnWorkerInput) {
   });
 }
 
-export type SpawnOrchestratorModel = "opus" | "sonnet";
-
 export type SpawnOrchestratorInput = {
   id: string;
   workdir: string;
-  model: SpawnOrchestratorModel;
+  model: string;
   goal: string;
 };
 
@@ -172,6 +170,20 @@ export function spawnAgentOrchestrator(body: SpawnOrchestratorInput) {
     method: "POST",
     body: JSON.stringify(body),
   });
+}
+
+export type AgentModelOption = {
+  id: string;
+  label: string;
+  kind: SpawnWorkerKind;
+  provider: "claude" | "codex";
+  supports_reasoning_effort: boolean;
+  default_worker: boolean;
+  default_orchestrator: boolean;
+};
+
+export function getAgentModels() {
+  return request<{ models: AgentModelOption[] }>("/api/models");
 }
 
 export type ReplaceAgentResult = {
@@ -341,6 +353,9 @@ export type AgentSessionData = {
   format: "codex" | "claude" | "pane-log" | "provider-events";
   path: string;
   tokens: number | null;
+  model?: string | null;
+  kind?: string | null;
+  provider?: string | null;
   tasks?: SessionTask[];
   pr?: SessionPr | null;
   session_meta?: SessionMeta;

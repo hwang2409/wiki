@@ -786,6 +786,10 @@ class ClaudeStreamAdapter(ProviderAdapter):
                     },
                     generation=self._generation,
                 )
+                # The fake provider test harness inspects the protocol log
+                # immediately after respond() returns; yield once so the child
+                # process can consume the line we just wrote.
+                await asyncio.sleep(0)
             except Exception:
                 if matching_control is not None and matching_control_id is not None:
                     self._server_request_ids[matching_control_id] = matching_control
@@ -811,6 +815,7 @@ class ClaudeStreamAdapter(ProviderAdapter):
                 },
                 generation=self._generation,
             )
+            await asyncio.sleep(0)
         except Exception:
             self._server_request_ids[request_id] = pending
             raise

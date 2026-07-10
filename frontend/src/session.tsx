@@ -1845,6 +1845,7 @@ export function SessionTab({
 
   const tokens = formatTokens(session.tokens);
   const dispositionCounts = formatDispositionCounts(session.dispositions);
+  const footerSegments = [session.format, session.model ?? "", tokens ?? "", dispositionCounts].filter(Boolean);
 
   return (
     <QuestionUiContext.Provider value={questionUi}>
@@ -1879,7 +1880,9 @@ export function SessionTab({
           ) : null}
         </div>
       ) : null}
-      <div className="session-dispositions">{dispositionCounts}</div>
+      <div className="session-dispositions">
+        <span className="session-dispositions-value">{dispositionCounts}</span>
+      </div>
       {session.providerInspector ? (
         <ProviderStreamInspector inspector={session.providerInspector} ticket={ticket} />
       ) : null}
@@ -1912,9 +1915,7 @@ export function SessionTab({
         />
       )}
       <div className="session-footer tabular-nums">
-        {session.format} · {session.path.split("/").slice(-1)[0]}
-        {tokens ? ` · ${tokens}` : ""}
-        {` · ${dispositionCounts}`}
+        {footerSegments.join(" · ")}
       </div>
       </div>
     </QuestionUiContext.Provider>

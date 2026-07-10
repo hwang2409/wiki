@@ -536,6 +536,9 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["format"], "codex")
         self.assertTrue(payload["working"])
         self.assertEqual(payload["queue"], [])
+        self.assertEqual(payload["model"], "gpt-5.4")
+        self.assertEqual(payload["kind"], "cdx")
+        self.assertEqual(payload["provider"], "codex")
 
     async def test_session_overlays_pending_headless_question_from_raw_log(self) -> None:
         transcript = self.root / "claude-session.jsonl"
@@ -654,6 +657,9 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         payload = main.agent_session("WIKI-42")
         inspector = cast(dict[str, Any], payload["provider_inspector"])
         self.assertEqual(payload["format"], "provider-events")
+        self.assertEqual(payload["model"], "gpt-5.4")
+        self.assertEqual(payload["kind"], "cdx")
+        self.assertEqual(payload["provider"], "codex")
         self.assertEqual(inspector["raw_count"], 1)
         self.assertEqual(inspector["normalized_count"], 1)
         self.assertEqual(inspector["dispositions"]["rendered"], 1)
@@ -708,6 +714,24 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
             params for method, params in self.client.calls if method == "run/replace"
         )
         self.assertIn(str(self.status_dir / "WIKI-42.json"), replace_call["prompt"])
+
+    async def test_spawn_rejects_unknown_model_with_clear_400(self) -> None:
+        with self.assertRaises(HTTPException) as blocked:
+            main.spawn_agent(
+                {
+                    "ticket": "WIKI-42",
+                    "kind": "cdx",
+                    "role": "implement",
+                    "model": "totally-fake",
+                    "effort": "high",
+                    "workdir": str(self.worktree),
+                    "orch": None,
+                    "prompt": "Implement WIKI-42",
+                }
+            )
+
+        self.assertEqual(blocked.exception.status_code, 400)
+        self.assertIn("totally-fake", str(blocked.exception.detail))
 
     async def test_legacy_replace_is_rejected(self) -> None:
         registry = {}

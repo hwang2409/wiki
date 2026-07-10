@@ -25,6 +25,9 @@ export type TranscriptSession = {
   format: AgentSessionData["format"];
   path: string;
   tokens: number | null;
+  model: string | null;
+  kind: string | null;
+  provider: string | null;
   tasks: SessionTask[];
   pr: SessionPr | null;
   sessionMeta: SessionMeta;
@@ -111,6 +114,9 @@ function buildSession(result: AgentSessionData): TranscriptSession {
     format: result.format,
     path: result.path,
     tokens: result.tokens,
+    model: result.model ?? null,
+    kind: result.kind ?? null,
+    provider: result.provider ?? null,
     tasks: result.tasks ?? [],
     pr: result.pr ?? null,
     sessionMeta: result.session_meta ?? {},
@@ -187,6 +193,9 @@ function mergeSession(current: TranscriptSession | null, result: AgentSessionDat
     format: result.format,
     path: result.path,
     tokens: result.tokens,
+    model: result.model ?? current.model,
+    kind: result.kind ?? current.kind,
+    provider: result.provider ?? current.provider,
     tasks: result.tasks ?? current.tasks,
     pr: result.pr ?? current.pr,
     sessionMeta: result.session_meta ?? current.sessionMeta,

@@ -14,18 +14,19 @@ import {
 import {
   controlAgent,
   getAgents,
+  getAgentModels,
   replaceAgent,
   spawnAgentOrchestrator,
   spawnAgentWorker,
 } from "./api";
 import type {
+  AgentModelOption,
   AgentControlAction,
   AgentControlResult,
   AgentWorker,
   ArchivedWorker,
   Orchestrator,
   ReplaceAgentResult,
-  SpawnOrchestratorModel,
   SpawnWorkerEffort,
   SpawnWorkerKind,
   SpawnWorkerRole,
@@ -39,9 +40,6 @@ const STALE_SECONDS = 5 * 60;
 const SPAWN_TICKET_PATTERN = /^[A-Z0-9-]+$/;
 const ORCH_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 const DEFAULT_WORKDIR = "/Users/henry/me/fun/wiki";
-const CDX_MODELS = ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"] as const;
-const CC_MODELS = ["opus", "sonnet"] as const;
-const ORCHESTRATOR_MODELS: SpawnOrchestratorModel[] = ["opus", "sonnet"];
 const REASONING_EFFORTS: SpawnWorkerEffort[] = ["minimal", "low", "medium", "high", "xhigh"];
 
 type WorkerSpawnNotice = {
@@ -65,12 +63,18 @@ type OrchestratorSpawnNotice = {
 
 type SpawnNotice = WorkerSpawnNotice | OrchestratorSpawnNotice;
 
-function modelsFor(kind: SpawnWorkerKind): readonly string[] {
-  return kind === "cdx" ? CDX_MODELS : CC_MODELS;
+function modelsForKind(models: AgentModelOption[], kind: SpawnWorkerKind): AgentModelOption[] {
+  return models.filter((option) => option.kind === kind);
 }
 
-function defaultModel(kind: SpawnWorkerKind): string {
-  return kind === "cdx" ? "gpt-5.4" : "sonnet";
+function defaultWorkerModel(models: AgentModelOption[], kind: SpawnWorkerKind): string {
+  const byKind = modelsForKind(models, kind);
+  return byKind.find((option) => option.default_worker)?.id ?? byKind[0]?.id ?? "";
+}
+
+function defaultOrchestratorModel(models: AgentModelOption[]): string {
+  const claudeModels = modelsForKind(models, "cc");
+  return claudeModels.find((option) => option.default_orchestrator)?.id ?? claudeModels[0]?.id ?? "";
 }
 
 function ageLabel(seconds: number | null): string {
@@ -104,10 +108,12 @@ function archivedAge(iso: string): string {
 }
 
 function SpawnWorkerModal({
+  models,
   orchestrators,
   onClose,
   onSpawn,
 }: {
+  models: AgentModelOption[];
   orchestrators: Orchestrator[];
   onClose: () => void;
   onSpawn: (notice: WorkerSpawnNotice) => void;
@@ -115,7 +121,7 @@ function SpawnWorkerModal({
   const [ticket, setTicket] = useState("");
   const [kind, setKind] = useState<SpawnWorkerKind>("cdx");
   const [role, setRole] = useState<SpawnWorkerRole>("implement");
-  const [model, setModel] = useState(defaultModel("cdx"));
+  const [model, setModel] = useState("");
   const [effort, setEffort] = useState<SpawnWorkerEffort>("high");
   const [workdir, setWorkdir] = useState(DEFAULT_WORKDIR);
   const [orch, setOrch] = useState(orchestrators[0]?.id ?? "");
@@ -143,9 +149,11 @@ function SpawnWorkerModal({
   }, [onClose, submitting]);
 
   useEffect(() => {
-    const allowed = modelsFor(kind);
-    setModel((current) => (allowed.includes(current) ? current : defaultModel(kind)));
-  }, [kind]);
+    const allowed = modelsForKind(models, kind);
+    setModel((current) =>
+      allowed.some((option) => option.id === current) ? current : defaultWorkerModel(models, kind)
+    );
+  }, [kind, models]);
 
   useEffect(() => {
     if (orchestrators.length === 0) {
@@ -160,13 +168,19 @@ function SpawnWorkerModal({
   }, [orchestrators]);
 
   const normalizedTicket = ticket.trim().toUpperCase();
+  const allowedModels = modelsForKind(models, kind);
   const promptBytes = new TextEncoder().encode(prompt).length;
   const promptTooLarge = promptBytes >= 100_000;
   const ticketValid = SPAWN_TICKET_PATTERN.test(normalizedTicket);
   const workdirValid = workdir.trim().length > 0;
   const confirmLabel = `spawn ${kind} · ${model} · ${role} in ${workdir.trim()}?`;
   const canSubmit =
-    ticketValid && workdirValid && prompt.trim().length > 0 && !promptTooLarge && !submitting;
+    ticketValid &&
+    workdirValid &&
+    model.length > 0 &&
+    prompt.trim().length > 0 &&
+    !promptTooLarge &&
+    !submitting;
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -278,17 +292,22 @@ function SpawnWorkerModal({
               <span className="agent-spawn-label">Model</span>
               <select
                 className="agent-spawn-select"
+                disabled={allowedModels.length === 0}
                 value={model}
                 onChange={(event) => {
                   resetConfirmation();
                   setModel(event.target.value);
                 }}
               >
-                {modelsFor(kind).map((option) => (
-                  <option key={option} value={option}>
-                    {option}
-                  </option>
-                ))}
+                {allowedModels.length === 0 ? (
+                  <option value="">No models available</option>
+                ) : (
+                  allowedModels.map((option) => (
+                    <option key={option.id} value={option.id}>
+                      {option.label}
+                    </option>
+                  ))
+                )}
               </select>
             </label>
 
@@ -388,15 +407,17 @@ function SpawnWorkerModal({
 }
 
 function SpawnOrchestratorModal({
+  models,
   onClose,
   onSpawn,
 }: {
+  models: AgentModelOption[];
   onClose: () => void;
   onSpawn: (notice: OrchestratorSpawnNotice) => void;
 }) {
   const [id, setId] = useState("");
   const [projectDir, setProjectDir] = useState("");
-  const [model, setModel] = useState<SpawnOrchestratorModel>("opus");
+  const [model, setModel] = useState("");
   const [goal, setGoal] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [confirming, setConfirming] = useState(false);
@@ -420,13 +441,21 @@ function SpawnOrchestratorModal({
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [onClose, submitting]);
 
+  useEffect(() => {
+    const nextDefault = defaultOrchestratorModel(models);
+    setModel((current) =>
+      modelsForKind(models, "cc").some((option) => option.id === current) ? current : nextDefault
+    );
+  }, [models]);
+
   const normalizedId = id.trim();
+  const claudeModels = modelsForKind(models, "cc");
   const goalBytes = new TextEncoder().encode(goal).length;
   const goalTooLarge = goalBytes >= 20_000;
   const idValid = ORCH_ID_PATTERN.test(normalizedId);
   const projectDirValid = projectDir.trim().length > 0;
   const confirmLabel = `launch ${normalizedId} · ${model} in ${projectDir.trim()}?`;
-  const canSubmit = idValid && projectDirValid && !goalTooLarge && !submitting;
+  const canSubmit = idValid && projectDirValid && model.length > 0 && !goalTooLarge && !submitting;
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -517,17 +546,22 @@ function SpawnOrchestratorModal({
             <span className="agent-spawn-label">Model</span>
             <select
               className="agent-spawn-select"
+              disabled={claudeModels.length === 0}
               value={model}
               onChange={(event) => {
                 resetConfirmation();
-                setModel(event.target.value as SpawnOrchestratorModel);
+                setModel(event.target.value);
               }}
             >
-              {ORCHESTRATOR_MODELS.map((option) => (
-                <option key={option} value={option}>
-                  {option}
-                </option>
-              ))}
+              {claudeModels.length === 0 ? (
+                <option value="">No models available</option>
+              ) : (
+                claudeModels.map((option) => (
+                  <option key={option.id} value={option.id}>
+                    {option.label}
+                  </option>
+                ))
+              )}
             </select>
           </label>
 
@@ -691,6 +725,8 @@ export function AgentsView({
   const [fetchedOrchestrators, setFetchedOrchestrators] = useState<Orchestrator[]>([]);
   const [fetchedArchived, setFetchedArchived] = useState<ArchivedWorker[]>([]);
   const [fetchedError, setFetchedError] = useState<string | null>(null);
+  const [availableModels, setAvailableModels] = useState<AgentModelOption[]>([]);
+  const [modelsError, setModelsError] = useState<string | null>(null);
   const [spawnWorkerOpen, setSpawnWorkerOpen] = useState(false);
   const [spawnOrchestratorOpen, setSpawnOrchestratorOpen] = useState(false);
   const [spawnNotice, setSpawnNotice] = useState<SpawnNotice | null>(null);
@@ -727,6 +763,25 @@ export function AgentsView({
       ignore = true;
     };
   }, [data, refreshTick]);
+
+  useEffect(() => {
+    let ignore = false;
+    getAgentModels()
+      .then((result) => {
+        if (!ignore) {
+          setAvailableModels(result.models ?? []);
+          setModelsError(null);
+        }
+      })
+      .catch((err) => {
+        if (!ignore) {
+          setModelsError(err instanceof Error ? err.message : "Could not load models");
+        }
+      });
+    return () => {
+      ignore = true;
+    };
+  }, []);
 
   const workers = data?.workers ?? fetchedWorkers;
   const orchestrators = data?.orchestrators ?? fetchedOrchestrators;
@@ -1218,6 +1273,7 @@ export function AgentsView({
           </div>
         ) : null}
         {controlError ? <div className="agents-notice is-error">{controlError}</div> : null}
+        {modelsError ? <div className="agents-notice is-error">{modelsError}</div> : null}
         {body}
       </div>
       {openWorker ? (
@@ -1229,6 +1285,7 @@ export function AgentsView({
       ) : null}
       {spawnWorkerOpen ? (
         <SpawnWorkerModal
+          models={availableModels}
           orchestrators={orchestrators}
           onClose={() => setSpawnWorkerOpen(false)}
           onSpawn={(notice) => {
@@ -1240,6 +1297,7 @@ export function AgentsView({
       ) : null}
       {spawnOrchestratorOpen ? (
         <SpawnOrchestratorModal
+          models={availableModels}
           onClose={() => setSpawnOrchestratorOpen(false)}
           onSpawn={(notice) => {
             setSpawnNotice(notice);

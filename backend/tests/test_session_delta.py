@@ -30,6 +30,15 @@ class SessionDeltaTests(unittest.TestCase):
     def setUp(self) -> None:
         transcripts._cache.clear()
 
+    def test_models_endpoint_includes_new_codex_and_claude_options(self) -> None:
+        payload = main.list_models()
+        models = {model["id"]: model for model in payload["models"]}
+
+        self.assertIn("gpt-5.6", models)
+        self.assertEqual(models["gpt-5.6"]["kind"], "cdx")
+        self.assertIn("opus-4.8", models)
+        self.assertEqual(models["opus-4.8"]["kind"], "cc")
+
     def test_landing_poll_patch_fixes_legacy_miss(self) -> None:
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "rollout.jsonl"
@@ -266,6 +275,9 @@ class SessionDeltaTests(unittest.TestCase):
             self.assertEqual(body["events"][0]["text"], "hello")
             self.assertEqual(body["session_meta"], {})
             self.assertEqual(body["dispositions"], {"rendered": 1, "summarized": 0, "ignored": 0, "unknown": 0})
+            self.assertEqual(body["model"], None)
+            self.assertEqual(body["kind"], "cdx")
+            self.assertEqual(body["provider"], "codex")
 
     def test_subagent_session_renders_sidechain_events(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -450,6 +462,7 @@ class SessionDeltaTests(unittest.TestCase):
                         "_orchestrators": {
                             "WIKI-32": {
                                 "window": "@9999",
+                                "model": "gpt-5.6",
                                 "spawned_at": "2026-07-09T01:00:00Z",
                                 "transcript": str(transcript),
                             }
@@ -488,6 +501,51 @@ class SessionDeltaTests(unittest.TestCase):
             self.assertEqual(body["format"], "codex")
             self.assertEqual(body["cursor"], 2)
             self.assertEqual([event["text"] for event in body["events"]], ["hello", "world"])
+            self.assertEqual(body["model"], "gpt-5.6")
+            self.assertEqual(body["kind"], "cdx")
+            self.assertEqual(body["provider"], "codex")
+
+    def test_archived_pane_log_exposes_model_from_meta(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive_dir = root / "archive"
+            session_dir = archive_dir / "WIKI-55" / "20260710-010203"
+            session_dir.mkdir(parents=True)
+            (session_dir / "worker.log").write_text("worker output\n", encoding="utf-8")
+            (session_dir / "meta.json").write_text(
+                json.dumps(
+                    {
+                        "worker": {
+                            "kind": "cc",
+                            "provider": "claude",
+                            "model": "opus-4.8",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            registry = root / "agent-registry.json"
+            queue = root / "queue.json"
+            status_dir = root / "status"
+            status_dir.mkdir()
+            registry.write_text("{}", encoding="utf-8")
+            queue.write_text("{}", encoding="utf-8")
+
+            with (
+                mock.patch.object(main, "AGENT_REGISTRY_PATH", registry),
+                mock.patch.object(main, "AGENT_ARCHIVE_DIR", archive_dir),
+                mock.patch.object(main, "AGENT_STATUS_DIR", status_dir),
+                mock.patch.object(main, "MSG_QUEUE_PATH", queue),
+                mock.patch.object(main, "resolve_window", return_value=None),
+                mock.patch.object(main.transcripts, "find_session", return_value=None),
+                mock.patch.dict(main._session_paths, {}, clear=True),
+            ):
+                body = main.agent_session("WIKI-55", cursor=0)
+
+            self.assertEqual(body["format"], "pane-log")
+            self.assertEqual(body["model"], "opus-4.8")
+            self.assertEqual(body["kind"], "cc")
+            self.assertEqual(body["provider"], "claude")
 
     def test_session_path_invalidation_drops_only_changed_tickets(self) -> None:
         with mock.patch.dict(
