@@ -8,6 +8,7 @@ updated: 2026-07-10
 # Done
 
 ## 2026-07-10
+- **tools** — cleared destructive_command_guard PreToolUse hook from /Users/henry/.claude/settings.json
 - **tools** — removed destructive_command_guard Codex hook and /Users/henry/.local/bin/dcg
 
 - [PHO-11274](https://linear.app/phoebework/issue/PHO-11274): compare_agent_runs trace comparison (audit-validated P1) — cdx:PHO-11274 worker
