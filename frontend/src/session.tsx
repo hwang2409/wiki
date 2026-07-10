@@ -61,6 +61,7 @@ import type {
 import { externalLinkProps } from "./external-links";
 import { LoadingPlaceholder } from "./loading";
 import { createStateKeyWriteBarrier, deletePaneStateEntries } from "./pane-state-cache";
+import { Timestamp } from "./timestamp";
 import {
   replaceTranscriptQueue,
   useTranscriptSession,
@@ -1282,6 +1283,18 @@ function useMeasuredRow(group: EventGroup, onHeightChange: (group: EventGroup, h
   return ref;
 }
 
+function groupTimestamp(group: EventGroup): string | null {
+  if (group.kind === "message") return group.event.ts;
+  for (const event of group.events) {
+    if (event.ts) return event.ts;
+  }
+  return null;
+}
+
+function groupAlign(group: EventGroup): "end" | "start" {
+  return group.kind === "message" && group.event.kind === "user" ? "end" : "start";
+}
+
 const VirtualSessionRow = memo(function VirtualSessionRow({
   group,
   imageNums,
@@ -1299,9 +1312,11 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
 }) {
   const rowRef = useMeasuredRow(group, onHeightChange);
   const style: CSSProperties = { transform: `translateY(${top}px)` };
+  const ts = groupTimestamp(group);
   return (
     <div
       className="session-virtual-row"
+      data-align={groupAlign(group)}
       data-group-key={group.key}
       data-row-top={top}
       ref={rowRef}
@@ -1317,6 +1332,7 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
           uiState={uiState}
         />
       )}
+      {ts ? <Timestamp value={ts} /> : null}
     </div>
   );
 }, (prev, next) => {
