@@ -9,6 +9,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+import psutil
+
 from .types import ProviderKind
 
 
@@ -22,7 +24,7 @@ class ProviderProcessIdentity:
 class ProviderProcessStatus:
     pid: int
     parent_pid: int
-    started_at: str
+    created_at: float
     process_group_id: int
 
 
@@ -180,51 +182,26 @@ async def provider_process_status(
 
     if pid is None or pid <= 1:
         return None
-    try:
-        process = await asyncio.create_subprocess_exec(
-            "ps",
-            "-o",
-            "ppid=",
-            "-o",
-            "lstart=",
-            "-o",
-            "pgid=",
-            "-p",
-            str(pid),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+
+    def inspect_process() -> ProviderProcessStatus | None:
+        try:
+            process = psutil.Process(pid)
+            parent_pid = process.ppid()
+            created_at = process.create_time()
+            process_group_id = os.getpgid(pid)
+        except (ProcessLookupError, PermissionError, psutil.Error):
+            return None
+        return ProviderProcessStatus(
+            pid=pid,
+            parent_pid=parent_pid,
+            created_at=created_at,
+            process_group_id=process_group_id,
         )
-    except OSError:
-        return None
+
     try:
-        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        return await asyncio.wait_for(asyncio.to_thread(inspect_process), timeout=timeout)
     except TimeoutError:
-        process.kill()
-        await process.wait()
         return None
-    if process.returncode != 0:
-        return None
-    lines = [line.strip() for line in stdout.decode("utf-8", errors="replace").splitlines()]
-    lines = [line for line in lines if line]
-    if len(lines) != 1:
-        return None
-    parts = lines[0].split()
-    if len(parts) < 7:
-        return None
-    try:
-        parent_pid = int(parts[0])
-        process_group_id = int(parts[-1])
-    except ValueError:
-        return None
-    started_at = " ".join(parts[1:-1])
-    if not started_at:
-        return None
-    return ProviderProcessStatus(
-        pid=pid,
-        parent_pid=parent_pid,
-        started_at=started_at,
-        process_group_id=process_group_id,
-    )
 
 
 async def provider_parent_pid(
@@ -270,7 +247,7 @@ async def _current_matching_process(
     if process is None or process.pid <= 1:
         return None
     current = await provider_process_status(process.pid, timeout=timeout)
-    if current is None or current.started_at != process.started_at:
+    if current is None or current.created_at != process.created_at:
         return None
     return current
 

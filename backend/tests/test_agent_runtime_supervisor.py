@@ -2040,7 +2040,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         orphan = ProviderProcessStatus(
             pid=424_244,
             parent_pid=1,
-            started_at="Fri Jul 10 16:00:00 2026",
+            created_at=1_783_718_400.125,
             process_group_id=424_244,
         )
         with (
