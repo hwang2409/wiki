@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from uuid import uuid4
 
 from backend.app.agent_runtime.fake import WireFixture
 from backend.app.agent_runtime.normalizer import normalize_provider_event
@@ -693,6 +694,254 @@ class RunStoreTests(unittest.TestCase):
             self.assertEqual(current["provider_pid"], 4242)
             self.assertEqual(current["provider_generation"], 2)
             self.assertEqual(current["active_turn_id"], "turn-1")
+
+    def test_quiesce_intent_is_exact_current_session_and_durable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            record = store.create(_record(root))
+            record = store.update_adapter_status(
+                record.run_id,
+                AdapterStatus(
+                    LifecycleState.WORKING,
+                    "session-1",
+                    4242,
+                    active_turn_id="turn-1",
+                ),
+            )
+            operation_id = str(uuid4())
+
+            with self.assertRaisesRegex(StoreConflict, "session changed"):
+                store.mark_quiesce_intent(
+                    record.run_id,
+                    operation_id,
+                    "stale-session",
+                )
+            marked = store.mark_quiesce_intent(
+                record.run_id,
+                operation_id,
+                "session-1",
+            )
+            self.assertEqual(marked.quiesce_operation_id, operation_id)
+            self.assertEqual(marked.quiesce_resume_state, LifecycleState.WORKING)
+            self.assertEqual(
+                store.mark_quiesce_intent(
+                    record.run_id,
+                    operation_id,
+                    "session-1",
+                ).quiesce_operation_id,
+                operation_id,
+            )
+            with self.assertRaisesRegex(StoreConflict, "another quiesce"):
+                store.mark_quiesce_intent(
+                    record.run_id,
+                    str(uuid4()),
+                    "session-1",
+                )
+
+            restarted = RunStore(paths)
+            persisted = restarted.get(record.run_id)
+            self.assertEqual(persisted.quiesce_operation_id, operation_id)
+            self.assertEqual(
+                persisted.quiesce_resume_state,
+                LifecycleState.WORKING,
+            )
+            current = json.loads(paths.registry_path.read_text(encoding="utf-8"))[
+                "WIKI-42"
+            ]["current"]
+            self.assertEqual(current["quiesce_operation_id"], operation_id)
+            self.assertEqual(current["quiesce_resume_state"], "working")
+
+    def test_quiesce_intent_rejects_nonresumable_and_noncurrent_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(_paths(root))
+            record = store.create(_record(root))
+            record = store.update_adapter_status(
+                record.run_id,
+                AdapterStatus(
+                    LifecycleState.WAITING_APPROVAL,
+                    "session-1",
+                    4242,
+                ),
+            )
+            with self.assertRaisesRegex(StoreConflict, "waiting-approval"):
+                store.mark_quiesce_intent(
+                    record.run_id,
+                    str(uuid4()),
+                    "session-1",
+                )
+
+            store.transition(record.run_id, LifecycleState.IDLE)
+            replacement = _record(root)
+            _, replacement = store.replace(record.run_id, replacement)
+            with self.assertRaisesRegex(StoreConflict, "no longer current"):
+                store.mark_quiesce_intent(
+                    record.run_id,
+                    str(uuid4()),
+                    "session-1",
+                )
+            self.assertEqual(store.current_run_id("WIKI-42"), replacement.run_id)
+
+    def test_quiesce_detach_converges_after_late_lifecycle_and_clears_on_resume(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            record = store.create(_record(root))
+            record = store.update_adapter_status(
+                record.run_id,
+                AdapterStatus(
+                    LifecycleState.WORKING,
+                    "session-1",
+                    4242,
+                    active_turn_id="turn-1",
+                ),
+            )
+            operation_id = str(uuid4())
+            store.mark_quiesce_intent(
+                record.run_id,
+                operation_id,
+                "session-1",
+            )
+
+            approval = {"id": 7, "method": "item/commandExecution/requestApproval"}
+            raw = store.append_raw(
+                record.run_id,
+                provider="codex",
+                direction="server",
+                payload=approval,
+            )
+            store.append_normalized(
+                record.run_id,
+                raw_seq=raw["seq"],
+                disposition=EventDisposition.RENDERED,
+                kind="approval",
+                payload=approval,
+                lifecycle_state=LifecycleState.WAITING_APPROVAL,
+            )
+            with self.assertRaisesRegex(StoreConflict, "missing or stale"):
+                store.finish_provider_detached(
+                    record.run_id,
+                    str(uuid4()),
+                    reason="quiesced for account rotation",
+                )
+
+            detached = store.finish_provider_detached(
+                record.run_id,
+                operation_id,
+                reason="quiesced for account rotation",
+            )
+            self.assertEqual(detached.state, LifecycleState.BLOCKED)
+            self.assertEqual(detached.recovery_from_state, LifecycleState.WORKING)
+            self.assertIsNone(detached.provider_pid)
+            self.assertIsNone(detached.active_turn_id)
+            self.assertEqual(detached.pending_requests, {})
+            self.assertTrue(detached.automatic_resume_suppressed)
+            self.assertEqual(detached.quiesce_operation_id, operation_id)
+
+            with self.assertRaisesRegex(StoreConflict, "not completed"):
+                store.clear_quiesce_marker(record.run_id, operation_id)
+            resumed = store.update_adapter_status(
+                record.run_id,
+                AdapterStatus(LifecycleState.IDLE, "session-1", 5252),
+            )
+            self.assertEqual(resumed.recovery_from_state, LifecycleState.WORKING)
+            self.assertTrue(resumed.automatic_resume_suppressed)
+            with self.assertRaisesRegex(StoreConflict, "quiesce marker"):
+                store.clear_automatic_resume_suppression(record.run_id)
+            with self.assertRaisesRegex(StoreConflict, "missing or stale"):
+                store.clear_quiesce_marker(record.run_id, str(uuid4()))
+
+            cleared = store.clear_quiesce_marker(record.run_id, operation_id)
+            self.assertIsNone(cleared.quiesce_operation_id)
+            self.assertIsNone(cleared.quiesce_resume_state)
+            self.assertIsNone(cleared.recovery_from_state)
+            self.assertFalse(cleared.automatic_resume_suppressed)
+            current = json.loads(paths.registry_path.read_text(encoding="utf-8"))[
+                "WIKI-42"
+            ]["current"]
+            self.assertIsNone(current["quiesce_operation_id"])
+            self.assertIsNone(current["quiesce_resume_state"])
+
+    def test_terminal_run_can_abandon_but_current_resumable_cannot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(_paths(root))
+            record = store.create(_record(root))
+            record = store.update_adapter_status(
+                record.run_id,
+                AdapterStatus(LifecycleState.IDLE, "session-1", 4242),
+            )
+            operation_id = str(uuid4())
+            store.mark_quiesce_intent(record.run_id, operation_id, "session-1")
+            with self.assertRaisesRegex(StoreConflict, "cannot abandon"):
+                store.abandon_quiesce_marker(record.run_id, operation_id)
+
+            store.transition(record.run_id, LifecycleState.COMPLETED)
+            abandoned = store.abandon_quiesce_marker(record.run_id, operation_id)
+            self.assertEqual(abandoned.state, LifecycleState.COMPLETED)
+            self.assertIsNone(abandoned.quiesce_operation_id)
+            self.assertIsNone(abandoned.quiesce_resume_state)
+
+    def test_rotation_journal_is_atomic_private_and_restart_durable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            self.assertIsNone(store.read_codex_rotation_journal())
+            operation_id = str(uuid4())
+            journal = {
+                "operation_id": operation_id,
+                "phase": "providers-detached",
+                "runs": [{"run_id": str(uuid4()), "agent_id": "WIKI-42"}],
+            }
+            store.write_codex_rotation_journal(journal)
+            self.assertEqual(
+                paths.codex_rotation_journal_path.stat().st_mode & 0o777,
+                0o600,
+            )
+            self.assertEqual(
+                RunStore(paths).read_codex_rotation_journal(),
+                journal,
+            )
+            store.clear_codex_rotation_journal()
+            self.assertIsNone(RunStore(paths).read_codex_rotation_journal())
+
+            paths.codex_rotation_journal_path.write_text("[]", encoding="utf-8")
+            with self.assertRaisesRegex(StoreError, "must contain an object"):
+                store.read_codex_rotation_journal()
+
+    def test_legacy_codex_detection_is_strict_and_ignores_headless_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            paths.registry_path.parent.mkdir(parents=True)
+            paths.registry_path.write_text(
+                json.dumps(
+                    {
+                        "WIKI-LEGACY": {"current": {"kind": "cdx", "window": "@9999"}},
+                        "WIKI-HEADLESS": {
+                            "current": {"kind": "cdx", "run_id": str(uuid4())}
+                        },
+                        "WIKI-CLAUDE": {"current": {"kind": "cc"}},
+                        "_orchestrators": {"wiki-dev": {"kind": "cdx"}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            store = RunStore(paths)
+            self.assertEqual(store.legacy_codex_agent_ids(), ["WIKI-LEGACY"])
+
+            paths.registry_path.write_text(
+                json.dumps({"WIKI-BROKEN": {"current": []}}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(StoreError, "current entry"):
+                store.legacy_codex_agent_ids()
 
     def test_replace_archives_handoff_and_prevents_stale_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

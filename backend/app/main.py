@@ -6,9 +6,11 @@ import os
 import re
 import subprocess
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
+from uuid import uuid4
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,7 +34,22 @@ MAX_NOTE_BYTES = 2_000_000
 
 VAULT_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="Wiki API")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    terminal.refresh_boot_token()
+    dispatcher_task = asyncio.create_task(agent_runtime_dispatchers())
+    token_task = asyncio.create_task(tokens.refresh_in_background())
+    try:
+        yield
+    finally:
+        dispatcher_task.cancel()
+        token_task.cancel()
+        await asyncio.gather(dispatcher_task, token_task, return_exceptions=True)
+        await asyncio.to_thread(terminal.TERMINAL_MANAGER.close_all)
+
+
+app = FastAPI(title="Wiki API", lifespan=lifespan)
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=terminal.TRUSTED_HOSTS)
 app.add_middleware(
     CORSMiddleware,
@@ -1270,6 +1287,9 @@ def _supervisor_request(method: str, params: dict | None = None) -> Any:
             "RunNotFound": 404,
             "ValueError": 400,
             "StoreConflict": 409,
+            "NoEligibleAccountError": 409,
+            "RotationDebouncedError": 409,
+            "RotationError": 500,
             "ProviderBusy": 409,
             "ProviderProcessError": 409,
             "ProviderProtocolError": 409,
@@ -1801,19 +1821,6 @@ async def agent_runtime_dispatchers() -> None:
     await asyncio.gather(message_dispatcher(), supervisor_event_bridge())
 
 
-@app.on_event("startup")
-async def _start_dispatcher() -> None:
-    terminal.refresh_boot_token()
-    asyncio.create_task(agent_runtime_dispatchers())
-    asyncio.create_task(accounts.watchdog_loop(publish_agent_event))
-    asyncio.create_task(tokens.refresh_in_background())
-
-
-@app.on_event("shutdown")
-async def _stop_terminals() -> None:
-    await asyncio.to_thread(terminal.TERMINAL_MANAGER.close_all)
-
-
 def vault_snapshot() -> dict[str, float]:
     snapshot = {
         str(path): path.stat().st_mtime
@@ -2050,42 +2057,21 @@ def get_accounts() -> dict[str, object]:
 
 @app.post("/api/accounts/rotate")
 async def rotate_account(body: AccountRotateIn) -> dict[str, object]:
-    state = await asyncio.to_thread(accounts.read_state)
-    state = await asyncio.to_thread(accounts.ensure_state_initialized, state)
-
     force_target = (body.account or "").strip() or None
-    if force_target and force_target not in await asyncio.to_thread(accounts.list_available_accounts):
-        raise HTTPException(status_code=400, detail="unknown account")
-
-    try:
-        result = await accounts.rotate_locked(
-            state=state,
-            force_target=force_target,
+    result = await asyncio.to_thread(
+        _supervisor_request,
+        "fleet/rotate_codex",
+        {
+            "account": force_target,
+            "operation_id": str(uuid4()),
+        },
+    )
+    if not isinstance(result, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="Agent supervisor returned a bad rotation response",
         )
-    except accounts.RotationDebouncedError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except accounts.NoEligibleAccountError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except accounts.RotationError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    event = {
-        "type": "codex_rotation",
-        "from": result.outgoing,
-        "to": result.incoming,
-        "revived": result.revived,
-        "failed": result.failed,
-        "failed_reasons": result.failed_reasons,
-        "ts": datetime.now(timezone.utc).isoformat(),
-    }
-    await publish_agent_event(event)
-    return {
-        "from": result.outgoing,
-        "to": result.incoming,
-        "revived": result.revived,
-        "failed": result.failed,
-        "failed_reasons": result.failed_reasons,
-    }
+    return result
 
 
 app.include_router(terminal.router)

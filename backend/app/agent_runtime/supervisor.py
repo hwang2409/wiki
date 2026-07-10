@@ -6,7 +6,9 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
+from .. import accounts
 from .normalizer import NormalizedProviderEvent, normalize_provider_event
 from .provider import AdapterStatus, ProviderAdapter, ProviderEvent, StartRequest
 from .store import RunNotFound, RunStore, StoreConflict
@@ -74,6 +76,9 @@ class Supervisor:
         self.event_routes: dict[tuple[int, int], str] = {}
         self.queue_locks: dict[str, asyncio.Lock] = {}
         self.agent_locks: dict[str, asyncio.Lock] = {}
+        self.codex_fleet_lock = asyncio.Lock()
+        self.codex_rotation_task: asyncio.Task[dict[str, Any]] | None = None
+        self.codex_rotation_operation_id: str | None = None
         self.recovery_scan_lock = asyncio.Lock()
         self.pipeline_failures: dict[str, str] = {}
         self.expected_stream_ends: set[int] = set()
@@ -121,6 +126,17 @@ class Supervisor:
 
     def _run_lock(self, run_id: str) -> asyncio.Lock:
         return self._agent_lock(self.store.get(run_id).agent_id)
+
+    def _codex_rotation_active(self) -> bool:
+        task = self.codex_rotation_task
+        if task is not None and not task.done():
+            return True
+        journal = self.store.read_codex_rotation_journal()
+        return bool(journal and journal.get("phase") != "complete")
+
+    def _assert_codex_fleet_available(self) -> None:
+        if self._codex_rotation_active():
+            raise StoreConflict("Codex fleet is quiesced for account rotation")
 
     def _automatic_resume_is_stable(self, record: RunRecord) -> bool:
         if not record.automatic_resume_guarded_at:
@@ -439,6 +455,16 @@ class Supervisor:
             effort=effort,
             orchestrator_id=orchestrator_id,
         )
+        if provider is ProviderKind.CODEX:
+            self._assert_codex_fleet_available()
+            async with self.codex_fleet_lock:
+                self._assert_codex_fleet_available()
+                async with self._agent_lock(record.agent_id):
+                    return await self._start_run(
+                        record=record,
+                        prompt=prompt,
+                        migrate_legacy=migrate_legacy,
+                    )
         async with self._agent_lock(record.agent_id):
             return await self._start_run(
                 record=record,
@@ -484,6 +510,12 @@ class Supervisor:
         return record
 
     async def resume_run(self, run_id: str) -> RunRecord:
+        if self.store.get(run_id).provider is ProviderKind.CODEX:
+            self._assert_codex_fleet_available()
+            async with self.codex_fleet_lock:
+                self._assert_codex_fleet_available()
+                async with self._run_lock(run_id):
+                    return await self._resume_run(run_id, automatic=False)
         async with self._run_lock(run_id):
             return await self._resume_run(run_id, automatic=False)
 
@@ -506,6 +538,7 @@ class Supervisor:
                 f"state {recovery_state.value} is not eligible for exact-session resume"
             )
         session_id = record.provider_session_id
+        quiesce_operation_id = record.quiesce_operation_id
         if not session_id:
             raise StoreConflict("run has no provider session id")
         if self.pid_alive(record.provider_pid):
@@ -530,7 +563,12 @@ class Supervisor:
             status,
             guard_automatic_resume=automatic,
         )
-        if not automatic:
+        if quiesce_operation_id is not None:
+            record = self.store.clear_quiesce_marker(
+                run_id,
+                quiesce_operation_id,
+            )
+        elif not automatic:
             record = self.store.clear_automatic_resume_suppression(run_id)
         self._route_adapter_generation(run_id, adapter, status.generation)
         await self._publish_agent_change(record.agent_id)
@@ -540,9 +578,514 @@ class Supervisor:
         async with self.recovery_scan_lock:
             return await self._recover_once()
 
+    async def request_codex_rotation(
+        self,
+        *,
+        operation_id: str,
+        force_target: str | None,
+    ) -> dict[str, Any]:
+        """Run or join one shielded, daemon-owned account rotation."""
+
+        try:
+            parsed = UUID(operation_id)
+        except (ValueError, AttributeError) as exc:
+            raise ValueError("operation_id must be a canonical UUID") from exc
+        if str(parsed) != operation_id:
+            raise ValueError("operation_id must be a canonical UUID")
+
+        task = self.codex_rotation_task
+        if task is not None and not task.done():
+            if operation_id != self.codex_rotation_operation_id:
+                raise StoreConflict("another Codex account rotation is active")
+            return await asyncio.shield(task)
+
+        journal = self.store.read_codex_rotation_journal()
+        if journal and journal.get("phase") == "complete":
+            if journal.get("operation_id") == operation_id:
+                result = journal.get("result")
+                if isinstance(result, dict) and journal.get("status") == "succeeded":
+                    return dict(result)
+                raise accounts.RotationError(
+                    str(journal.get("error") or "Codex account rotation failed")
+                )
+
+        task = asyncio.create_task(
+            self._rotate_codex_fleet(operation_id, force_target),
+            name=f"codex-account-rotation-{operation_id}",
+        )
+        self.codex_rotation_task = task
+        self.codex_rotation_operation_id = operation_id
+
+        def clear_finished(done: asyncio.Task[dict[str, Any]]) -> None:
+            if self.codex_rotation_task is done:
+                self.codex_rotation_task = None
+                self.codex_rotation_operation_id = None
+
+        task.add_done_callback(clear_finished)
+        return await asyncio.shield(task)
+
+    async def _rotate_codex_fleet(
+        self,
+        operation_id: str,
+        force_target: str | None,
+    ) -> dict[str, Any]:
+        async with self.codex_fleet_lock:
+            recovered = await self._recover_codex_rotation_locked()
+            if not recovered:
+                raise StoreConflict(
+                    "a previous Codex rotation is waiting for provider PIDs to exit"
+                )
+
+            state = await asyncio.to_thread(accounts.read_state)
+            state = await asyncio.to_thread(accounts.ensure_state_initialized, state)
+            elapsed = accounts.seconds_since_last_rotation(state)
+            if elapsed < accounts.debounce_seconds():
+                raise accounts.RotationDebouncedError(
+                    f"rotation debounced ({elapsed:.0f}s since last)"
+                )
+            available = await asyncio.to_thread(accounts.list_available_accounts)
+            if force_target and force_target not in available:
+                raise ValueError("unknown account")
+            target = force_target or await asyncio.to_thread(
+                accounts.pick_next_account, state
+            )
+            if target is None:
+                raise accounts.NoEligibleAccountError(
+                    "no eligible account for rotation"
+                )
+            if target == state.active:
+                raise accounts.NoEligibleAccountError(
+                    "target account is already active"
+                )
+
+            legacy = self.store.legacy_codex_agent_ids()
+            if legacy:
+                raise StoreConflict(
+                    "Codex account rotation requires headless migration for: "
+                    + ", ".join(legacy)
+                )
+
+            runs, close_only = await self._rotation_preflight_locked()
+            now = datetime.now(timezone.utc).isoformat()
+            journal: dict[str, Any] = {
+                "schema_version": 1,
+                "operation_id": operation_id,
+                "phase": "prepared",
+                "status": "working",
+                "started_at": now,
+                "updated_at": now,
+                "outgoing": state.active,
+                "incoming": target,
+                "previous_state": state.to_dict(),
+                "committed_state": None,
+                "rollback_requires_auth_restore": False,
+                "runs": runs,
+                "close_only_run_ids": close_only,
+                "result": None,
+                "error": None,
+            }
+            self.store.write_codex_rotation_journal(journal)
+
+            try:
+                await self._quiesce_rotation_runs_locked(journal)
+                journal["phase"] = "quiesced"
+                self._write_rotation_journal(journal)
+
+                outgoing = journal.get("outgoing")
+                if isinstance(outgoing, str) and outgoing:
+                    await asyncio.to_thread(accounts.snapshot_active_auth, outgoing)
+                journal["phase"] = "installing"
+                journal["rollback_requires_auth_restore"] = True
+                self._write_rotation_journal(journal)
+                account_result = await asyncio.to_thread(
+                    accounts.rotate_credentials,
+                    state=state,
+                    force_target=target,
+                    snapshot_outgoing=False,
+                )
+                committed = await asyncio.to_thread(accounts.read_state)
+                journal["committed_state"] = committed.to_dict()
+                journal["phase"] = "committed"
+                self._write_rotation_journal(journal)
+            except Exception as exc:
+                await self._rollback_rotation_locked(journal, exc)
+                if isinstance(exc, (accounts.RotationError, StoreConflict)):
+                    raise
+                raise accounts.RotationError(
+                    f"Codex credential rotation failed: {exc}"
+                ) from exc
+
+            journal["phase"] = "resuming"
+            self._write_rotation_journal(journal)
+            revival = await self._resume_rotation_runs_locked(journal)
+            result = {
+                "from": account_result.outgoing,
+                "to": account_result.incoming,
+                "revived": revival["revived"],
+                "failed": revival["failed"],
+                "failed_reasons": revival["failed_reasons"],
+            }
+            journal.update(
+                {
+                    "phase": "complete",
+                    "status": "succeeded",
+                    "result": result,
+                    "error": None,
+                }
+            )
+            self._write_rotation_journal(journal)
+            account_result.revived = list(result["revived"])
+            account_result.failed = list(result["failed"])
+            account_result.failed_reasons = dict(result["failed_reasons"])
+            await asyncio.to_thread(accounts.record_rotation_log, account_result)
+            await self._publish(
+                {
+                    "type": "codex_rotation",
+                    **result,
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            return result
+
+    async def _rotation_preflight_locked(
+        self,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """Fail closed on every Wiki-owned Codex transport, including stale runs."""
+
+        runs: list[dict[str, Any]] = []
+        close_only: list[str] = []
+        blockers: dict[str, str] = {}
+        for snapshot in self.store.list_runs():
+            if snapshot.provider is not ProviderKind.CODEX:
+                continue
+            adapter = self.adapters.get(snapshot.run_id)
+            if adapter is None and self.pid_alive(snapshot.provider_pid):
+                blockers[snapshot.agent_id] = (
+                    "provider PID is live without supervisor control"
+                )
+                continue
+            current = self.store.is_current(snapshot) and not snapshot.replaced_by_run_id
+            resumable = snapshot.state in {
+                LifecycleState.WORKING,
+                LifecycleState.IDLE,
+            }
+            if not current or snapshot.state in {
+                LifecycleState.DEAD,
+                LifecycleState.COMPLETED,
+            }:
+                if adapter is not None:
+                    close_only.append(snapshot.run_id)
+                continue
+            if not resumable:
+                blockers[snapshot.agent_id] = (
+                    f"state {snapshot.state.value} is not safe for auth rotation"
+                )
+                continue
+            if not snapshot.provider_session_id:
+                blockers[snapshot.agent_id] = "provider session id is missing"
+                continue
+            if snapshot.pending_requests:
+                blockers[snapshot.agent_id] = "provider approval is pending"
+                continue
+            if adapter is not None:
+                try:
+                    status = await adapter.status()
+                except Exception as exc:
+                    blockers[snapshot.agent_id] = f"provider status failed: {exc}"
+                    continue
+                if status.state not in {
+                    LifecycleState.WORKING,
+                    LifecycleState.IDLE,
+                }:
+                    blockers[snapshot.agent_id] = (
+                        f"provider reports {status.state.value}"
+                    )
+                    continue
+                if status.session_id != snapshot.provider_session_id:
+                    blockers[snapshot.agent_id] = (
+                        "provider session identity does not match durable metadata"
+                    )
+                    continue
+            runs.append(
+                {
+                    "run_id": snapshot.run_id,
+                    "agent_id": snapshot.agent_id,
+                    "session_id": snapshot.provider_session_id,
+                    "resume_state": snapshot.state.value,
+                    "detached": False,
+                    "resumed": False,
+                    "skipped": False,
+                    "failed_reason": None,
+                }
+            )
+        if blockers:
+            details = "; ".join(
+                f"{agent_id}: {reason}" for agent_id, reason in sorted(blockers.items())
+            )
+            raise StoreConflict(f"Codex fleet is not safe to rotate: {details}")
+        return runs, close_only
+
+    async def _quiesce_rotation_runs_locked(self, journal: dict[str, Any]) -> None:
+        operation_id = str(journal["operation_id"])
+        rows = journal["runs"]
+        for row in rows:
+            self.store.mark_quiesce_intent(
+                row["run_id"],
+                operation_id,
+                row["session_id"],
+            )
+        journal["phase"] = "quiescing"
+        self._write_rotation_journal(journal)
+
+        for run_id in journal["close_only_run_ids"]:
+            async with self._run_lock(run_id):
+                record = self.store.get(run_id)
+                adapter = self.adapters.get(run_id)
+                if adapter is not None:
+                    await self._close_and_drain_adapter(run_id, adapter)
+                if self.pid_alive(record.provider_pid):
+                    raise StoreConflict(
+                        f"stale Codex provider PID remained live for {record.agent_id}"
+                    )
+                record = self.store.get(run_id)
+                if record.state not in {
+                    LifecycleState.DEAD,
+                    LifecycleState.COMPLETED,
+                }:
+                    self.store.transition(
+                        run_id,
+                        LifecycleState.DEAD,
+                        reason="stale provider closed for account rotation",
+                    )
+
+        for row in rows:
+            run_id = row["run_id"]
+            async with self._run_lock(run_id):
+                adapter = self.adapters.get(run_id)
+                if adapter is not None:
+                    status = await adapter.status()
+                    if status.state is LifecycleState.WORKING or status.active_turn_id:
+                        status = await adapter.interrupt()
+                        self.store.update_adapter_status(run_id, status)
+                    if status.active_turn_id:
+                        raise StoreConflict(
+                            f"provider turn did not interrupt for {row['agent_id']}"
+                        )
+                    await self._close_and_drain_adapter(run_id, adapter)
+                record = self.store.get(run_id)
+                if self.pid_alive(record.provider_pid):
+                    raise StoreConflict(
+                        f"provider PID remained live for {row['agent_id']}"
+                    )
+                record = self.store.finish_provider_detached(
+                    run_id,
+                    operation_id,
+                    reason="quiesced for account rotation",
+                )
+                row["detached"] = True
+                self._write_rotation_journal(journal)
+                await self._publish_agent_change(record.agent_id)
+
+    def _write_rotation_journal(self, journal: dict[str, Any]) -> None:
+        journal["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self.store.write_codex_rotation_journal(journal)
+
+    async def _rollback_rotation_locked(
+        self,
+        journal: dict[str, Any],
+        cause: Exception,
+    ) -> None:
+        restore_error: str | None = None
+        restore_credentials = bool(journal.get("rollback_requires_auth_restore"))
+        journal["phase"] = "rolling-back"
+        self._write_rotation_journal(journal)
+        if restore_credentials:
+            try:
+                await asyncio.to_thread(self._restore_previous_account, journal)
+            except Exception as exc:
+                restore_error = str(exc)
+        revival = await self._resume_rotation_runs_locked(journal)
+        reasons = dict(revival["failed_reasons"])
+        if restore_error:
+            reasons["credentials"] = restore_error
+        detail = str(cause)
+        if reasons:
+            detail += f"; rollback failures: {reasons}"
+        if restore_error or revival["pending"]:
+            journal.update(
+                {
+                    "phase": "rolling-back",
+                    "status": "working",
+                    "result": None,
+                    "error": detail,
+                }
+            )
+            self._write_rotation_journal(journal)
+            return
+        journal.update(
+            {
+                "phase": "complete",
+                "status": "failed",
+                "result": {
+                    "from": journal.get("outgoing"),
+                    "to": journal.get("incoming"),
+                    "revived": revival["revived"],
+                    "failed": revival["failed"],
+                    "failed_reasons": reasons,
+                },
+                "error": detail,
+            }
+        )
+        self._write_rotation_journal(journal)
+
+    @staticmethod
+    def _restore_previous_account(journal: dict[str, Any]) -> None:
+        outgoing = journal.get("outgoing")
+        if isinstance(outgoing, str) and outgoing:
+            if not accounts.install_incoming_auth(outgoing):
+                raise accounts.RotationError(
+                    f"outgoing auth.json missing for account {outgoing!r}"
+                )
+        previous = journal.get("previous_state")
+        if not isinstance(previous, dict):
+            raise accounts.RotationError("rotation journal lost previous account state")
+        accounts.write_state(accounts.AccountState.from_dict(previous))
+
+    @staticmethod
+    def _ensure_committed_account(journal: dict[str, Any]) -> None:
+        incoming = journal.get("incoming")
+        if not isinstance(incoming, str) or not accounts.install_incoming_auth(incoming):
+            raise accounts.RotationError("committed incoming auth.json is missing")
+        if not accounts.codex_login_status():
+            raise accounts.RotationError("committed Codex login verification failed")
+        committed = journal.get("committed_state")
+        if not isinstance(committed, dict):
+            raise accounts.RotationError("rotation journal lost committed account state")
+        accounts.write_state(accounts.AccountState.from_dict(committed))
+
+    async def _resume_rotation_runs_locked(
+        self,
+        journal: dict[str, Any],
+    ) -> dict[str, Any]:
+        revived: list[str] = []
+        failed: list[str] = []
+        failed_reasons: dict[str, str] = {}
+        pending = False
+        operation_id = str(journal["operation_id"])
+        for row in journal["runs"]:
+            if row.get("resumed") or row.get("skipped"):
+                if row.get("resumed"):
+                    revived.append(row["agent_id"])
+                continue
+            run_id = row["run_id"]
+            agent_id = row["agent_id"]
+            async with self._run_lock(run_id):
+                try:
+                    record = self.store.get(run_id)
+                    if not self.store.is_current(record) or record.replaced_by_run_id:
+                        if record.quiesce_operation_id == operation_id:
+                            self.store.abandon_quiesce_marker(run_id, operation_id)
+                        row["skipped"] = True
+                        continue
+                    if record.state in {
+                        LifecycleState.DEAD,
+                        LifecycleState.COMPLETED,
+                    }:
+                        if record.quiesce_operation_id == operation_id:
+                            self.store.abandon_quiesce_marker(run_id, operation_id)
+                        row["skipped"] = True
+                        continue
+                    if self.adapters.get(run_id) is not None:
+                        if record.quiesce_operation_id == operation_id:
+                            self.store.clear_quiesce_marker(run_id, operation_id)
+                        elif record.quiesce_operation_id is not None:
+                            raise StoreConflict(
+                                "run belongs to another quiesce operation"
+                            )
+                        row["resumed"] = True
+                        revived.append(agent_id)
+                        continue
+                    if self.pid_alive(record.provider_pid):
+                        pending = True
+                        continue
+                    await self._resume_run(run_id, automatic=False)
+                    row["resumed"] = True
+                    row["failed_reason"] = None
+                    revived.append(agent_id)
+                except Exception as exc:
+                    reason = str(exc)
+                    row["failed_reason"] = reason
+                    failed.append(agent_id)
+                    failed_reasons[agent_id] = reason
+                finally:
+                    self._write_rotation_journal(journal)
+        return {
+            "revived": revived,
+            "failed": failed,
+            "failed_reasons": failed_reasons,
+            "pending": pending,
+        }
+
+    async def _recover_codex_rotation_locked(self) -> bool:
+        journal = self.store.read_codex_rotation_journal()
+        if not journal or journal.get("phase") == "complete":
+            return True
+        phase = str(journal.get("phase") or "")
+        try:
+            if phase in {
+                "prepared",
+                "quiescing",
+                "quiesced",
+            }:
+                journal["phase"] = "rolling-back"
+            elif phase in {"installing", "rolling-back"}:
+                if journal.get("rollback_requires_auth_restore"):
+                    await asyncio.to_thread(self._restore_previous_account, journal)
+                journal["phase"] = "rolling-back"
+            elif phase in {"committed", "resuming"}:
+                await asyncio.to_thread(self._ensure_committed_account, journal)
+                journal["phase"] = "resuming"
+            else:
+                raise accounts.RotationError(
+                    f"unknown Codex rotation journal phase: {phase!r}"
+                )
+            self._write_rotation_journal(journal)
+            revival = await self._resume_rotation_runs_locked(journal)
+            if revival["pending"]:
+                return False
+            succeeded = phase in {"committed", "resuming"}
+            result = {
+                "from": journal.get("outgoing"),
+                "to": journal.get("incoming"),
+                "revived": revival["revived"],
+                "failed": revival["failed"],
+                "failed_reasons": revival["failed_reasons"],
+            }
+            journal.update(
+                {
+                    "phase": "complete",
+                    "status": "succeeded" if succeeded else "failed",
+                    "result": result,
+                    "error": None if succeeded else "recovered by rolling back auth",
+                }
+            )
+            self._write_rotation_journal(journal)
+            return True
+        except Exception as exc:
+            journal["error"] = f"rotation recovery failed: {exc}"
+            self._write_rotation_journal(journal)
+            return False
+
     async def _recover_once(self) -> list[dict[str, str]]:
+        async with self.codex_fleet_lock:
+            await self._recover_codex_rotation_locked()
         results: list[dict[str, str]] = []
         for snapshot in self.store.list_runs():
+            if snapshot.provider is ProviderKind.CODEX:
+                async with self.codex_fleet_lock:
+                    async with self._agent_lock(snapshot.agent_id):
+                        results.append(await self._recover_run(snapshot.run_id))
+                continue
             async with self._agent_lock(snapshot.agent_id):
                 results.append(await self._recover_run(snapshot.run_id))
         return results
@@ -801,6 +1344,12 @@ class Supervisor:
     async def replace(
         self, run_id: str, prompt: str, model: str | None = None
     ) -> RunRecord:
+        if self.store.get(run_id).provider is ProviderKind.CODEX:
+            self._assert_codex_fleet_available()
+            async with self.codex_fleet_lock:
+                self._assert_codex_fleet_available()
+                async with self._run_lock(run_id):
+                    return await self._replace(run_id, prompt, model)
         async with self._run_lock(run_id):
             return await self._replace(run_id, prompt, model)
 
@@ -987,6 +1536,14 @@ class Supervisor:
                     self._runtime_status(record) for record in self.store.list_runs()
                 ],
             }
+        if method == "fleet/rotate_codex":
+            account = params.get("account")
+            if account is not None and not isinstance(account, str):
+                raise ValueError("account must be a string or null")
+            return await self.request_codex_rotation(
+                operation_id=str(params.get("operation_id") or ""),
+                force_target=account,
+            )
         if method == "run/status":
             return self._runtime_status(self.store.get(self._resolve_run_id(params)))
         if method == "run/resume":
@@ -1073,6 +1630,14 @@ class Supervisor:
         raise ValueError(f"unknown supervisor method: {method}")
 
     async def close(self) -> None:
+        rotation = self.codex_rotation_task
+        if rotation is not None and not rotation.done():
+            try:
+                await asyncio.shield(rotation)
+            except Exception:
+                # The durable journal records the failed phase; shutdown still
+                # has to release provider transports for restart recovery.
+                pass
         owned: list[tuple[str, ProviderAdapter]] = []
         seen: set[int] = set()
         for run_id, adapter in list(self.adapters.items()):

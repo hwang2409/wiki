@@ -856,7 +856,9 @@ export function AgentsView({
     const canInterrupt =
       controlAttached &&
       (state === "starting" || state === "working" || state === "waiting-approval");
-    const canResume = !controlAttached && state === "blocked";
+    const canResume =
+      !controlAttached &&
+      (state === "working" || state === "idle" || state === "blocked");
     const canArchive =
       controlAttached && (state === "idle" || state === "interrupted");
 

@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from backend.app import accounts
 from backend.app.agent_runtime.client import (
     SupervisorClient,
     SupervisorRemoteError,
@@ -128,6 +129,39 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             )
 
         return factory
+
+    def _seed_accounts(self) -> dict[str, str]:
+        auth = self.root / "codex" / "auth.json"
+        account_dir = self.root / "codex-accounts"
+        for name, token in (("alpha", "alpha-stored"), ("beta", "beta")):
+            path = account_dir / name
+            path.mkdir(parents=True)
+            (path / "auth.json").write_text(
+                json.dumps({"tokens": token}), encoding="utf-8"
+            )
+        auth.parent.mkdir(parents=True)
+        auth.write_text('{"tokens":"alpha-refreshed"}', encoding="utf-8")
+        env = {
+            "WIKI_CODEX_AUTH_PATH": str(auth),
+            "WIKI_CODEX_ACCOUNTS_DIR": str(account_dir),
+            "WIKI_ROTATION_LOG_PATH": str(account_dir / "rotation.log"),
+            "WIKI_CODEX_SESSIONS_DIR": str(self.root / "codex" / "sessions"),
+            "WIKI_ACCOUNT_HOME_OVERRIDE": str(self.root / "account-home"),
+            "WIKI_CLI_PATH": str(self.root / "missing-wiki"),
+            "TMUX": "",
+            "TMUX_PANE": "",
+        }
+        with mock.patch.dict(os.environ, env):
+            accounts.write_state(
+                accounts.AccountState(
+                    active="alpha",
+                    accounts={
+                        "alpha": {"limit_reset_at": None},
+                        "beta": {"limit_reset_at": None},
+                    },
+                )
+            )
+        return env
 
     async def test_mixed_fake_fleet_persists_raw_before_normalized(self) -> None:
         codex = await self.supervisor.start_run(
@@ -688,6 +722,300 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(self.supervisor.adapters[record.run_id], adapter)
         with self.assertRaisesRegex(StoreConflict, "already has an attached"):
             await self.supervisor.resume_run(record.run_id)
+
+    async def test_daemon_owned_rotation_quiesces_only_codex_and_resumes_exact_session(
+        self,
+    ) -> None:
+        await self.supervisor.close()
+        self.supervisor = Supervisor(
+            self.store,
+            FixtureAdapterFactory(FIXTURES, pid=987_654),
+            pid_alive=lambda _pid: False,
+        )
+        env = self._seed_accounts()
+        codex = await self.supervisor.start_run(
+            agent_id="WIKI-CODEX-ROTATE",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="fixture",
+        )
+        claude = await self.supervisor.start_run(
+            agent_id="WIKI-CLAUDE-ROTATE",
+            provider=ProviderKind.CLAUDE,
+            role="review",
+            model="fixture-claude",
+            effort=None,
+            worktree=str(self.worktree),
+            prompt="fixture",
+        )
+        codex_adapter = self.supervisor.adapters[codex.run_id]
+        claude_adapter = self.supervisor.adapters[claude.run_id]
+        operation_id = "00000000-0000-4000-8000-000000000099"
+        tmux_called = AssertionError("headless account rotation touched tmux")
+
+        with (
+            mock.patch.dict(os.environ, env),
+            mock.patch.object(accounts, "codex_login_status", return_value=True),
+            mock.patch.object(accounts, "tmux_live_windows", side_effect=tmux_called),
+            mock.patch.object(accounts, "tmux_kill_window", side_effect=tmux_called),
+        ):
+            result = await self.supervisor.request_codex_rotation(
+                operation_id=operation_id,
+                force_target="beta",
+            )
+
+        self.assertEqual(
+            result,
+            {
+                "from": "alpha",
+                "to": "beta",
+                "revived": ["WIKI-CODEX-ROTATE"],
+                "failed": [],
+                "failed_reasons": {},
+            },
+        )
+        resumed = self.store.get(codex.run_id)
+        self.assertEqual(resumed.provider_session_id, codex.provider_session_id)
+        self.assertEqual(resumed.state, LifecycleState.IDLE)
+        self.assertIsNone(resumed.quiesce_operation_id)
+        self.assertIsNot(self.supervisor.adapters[codex.run_id], codex_adapter)
+        assert isinstance(codex_adapter, CodexFixtureAdapter)
+        self.assertTrue(codex_adapter.closed)
+        self.assertIs(self.supervisor.adapters[claude.run_id], claude_adapter)
+        self.assertEqual(
+            self.store.get(claude.run_id).provider_session_id,
+            claude.provider_session_id,
+        )
+        with mock.patch.dict(os.environ, env):
+            self.assertEqual(accounts.read_state().active, "beta")
+            self.assertEqual(
+                json.loads(Path(env["WIKI_CODEX_AUTH_PATH"]).read_text())["tokens"],
+                "beta",
+            )
+        journal = self.store.read_codex_rotation_journal()
+        assert journal is not None
+        self.assertEqual(journal["phase"], "complete")
+        self.assertEqual(journal["status"], "succeeded")
+        self.assertNotIn("tokens", json.dumps(journal))
+
+    async def test_rotation_failure_restores_auth_and_resumes_quiesced_run(
+        self,
+    ) -> None:
+        await self.supervisor.close()
+        self.supervisor = Supervisor(
+            self.store,
+            FixtureAdapterFactory(FIXTURES, pid=987_654),
+            pid_alive=lambda _pid: False,
+        )
+        env = self._seed_accounts()
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-ROTATE-ROLLBACK",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="fixture",
+        )
+        old_adapter = self.supervisor.adapters[record.run_id]
+        with (
+            mock.patch.dict(os.environ, env),
+            mock.patch.object(accounts, "codex_login_status", return_value=False),
+            self.assertRaisesRegex(
+                accounts.RotationError,
+                "codex login status failed",
+            ),
+        ):
+            await self.supervisor.request_codex_rotation(
+                operation_id="00000000-0000-4000-8000-000000000098",
+                force_target="beta",
+            )
+
+        recovered = self.store.get(record.run_id)
+        self.assertEqual(recovered.provider_session_id, record.provider_session_id)
+        self.assertEqual(recovered.state, LifecycleState.IDLE)
+        self.assertIsNone(recovered.quiesce_operation_id)
+        assert isinstance(old_adapter, CodexFixtureAdapter)
+        self.assertTrue(old_adapter.closed)
+        self.assertIn(record.run_id, self.supervisor.adapters)
+        with mock.patch.dict(os.environ, env):
+            self.assertEqual(accounts.read_state().active, "alpha")
+            self.assertEqual(
+                json.loads(Path(env["WIKI_CODEX_AUTH_PATH"]).read_text())["tokens"],
+                "alpha-refreshed",
+            )
+        journal = self.store.read_codex_rotation_journal()
+        assert journal is not None
+        self.assertEqual(journal["phase"], "complete")
+        self.assertEqual(journal["status"], "failed")
+
+    async def test_rotation_journal_rolls_back_and_resumes_after_daemon_restart(
+        self,
+    ) -> None:
+        await self.supervisor.close()
+        self.supervisor = Supervisor(
+            self.store,
+            FixtureAdapterFactory(FIXTURES, pid=987_654),
+            pid_alive=lambda _pid: False,
+        )
+        env = self._seed_accounts()
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-ROTATE-RESTART",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="fixture",
+        )
+        operation_id = "00000000-0000-4000-8000-000000000096"
+        with mock.patch.dict(os.environ, env):
+            previous = accounts.read_state()
+            accounts.snapshot_active_auth("alpha")
+        journal = {
+            "schema_version": 1,
+            "operation_id": operation_id,
+            "phase": "installing",
+            "status": "working",
+            "started_at": "2026-07-09T12:00:00+00:00",
+            "updated_at": "2026-07-09T12:00:00+00:00",
+            "outgoing": "alpha",
+            "incoming": "beta",
+            "previous_state": previous.to_dict(),
+            "committed_state": None,
+            "rollback_requires_auth_restore": True,
+            "runs": [
+                {
+                    "run_id": record.run_id,
+                    "agent_id": record.agent_id,
+                    "session_id": record.provider_session_id,
+                    "resume_state": record.state.value,
+                    "detached": True,
+                    "resumed": False,
+                    "skipped": False,
+                    "failed_reason": None,
+                }
+            ],
+            "close_only_run_ids": [],
+            "result": None,
+            "error": None,
+        }
+        self.store.write_codex_rotation_journal(journal)
+        self.store.mark_quiesce_intent(
+            record.run_id,
+            operation_id,
+            record.provider_session_id or "",
+        )
+        adapter = self.supervisor.adapters[record.run_id]
+        async with self.supervisor._run_lock(record.run_id):  # noqa: SLF001
+            await self.supervisor._close_and_drain_adapter(  # noqa: SLF001
+                record.run_id,
+                adapter,
+            )
+            self.store.finish_provider_detached(
+                record.run_id,
+                operation_id,
+                reason="fixture daemon crash during auth install",
+            )
+        with mock.patch.dict(os.environ, env):
+            self.assertTrue(accounts.install_incoming_auth("beta"))
+            accounts.write_state(
+                accounts.AccountState(
+                    active="beta",
+                    accounts={
+                        "alpha": {"limit_reset_at": None},
+                        "beta": {"limit_reset_at": None},
+                    },
+                )
+            )
+
+        await self.supervisor.close()
+        self.supervisor = Supervisor(
+            self.store,
+            FixtureAdapterFactory(FIXTURES, pid=987_655),
+            pid_alive=lambda _pid: False,
+        )
+        with mock.patch.dict(os.environ, env):
+            await self.supervisor.recover_on_start()
+
+        recovered = self.store.get(record.run_id)
+        self.assertEqual(recovered.provider_session_id, record.provider_session_id)
+        self.assertEqual(recovered.state, LifecycleState.IDLE)
+        self.assertIsNone(recovered.quiesce_operation_id)
+        self.assertIn(record.run_id, self.supervisor.adapters)
+        with mock.patch.dict(os.environ, env):
+            self.assertEqual(accounts.read_state().active, "alpha")
+            self.assertEqual(
+                json.loads(Path(env["WIKI_CODEX_AUTH_PATH"]).read_text())["tokens"],
+                "alpha-refreshed",
+            )
+        recovered_journal = self.store.read_codex_rotation_journal()
+        assert recovered_journal is not None
+        self.assertEqual(recovered_journal["phase"], "complete")
+        self.assertEqual(recovered_journal["status"], "failed")
+
+    async def test_rotation_preflight_blocks_before_mutation_on_approval_or_stale_pid(
+        self,
+    ) -> None:
+        await self.supervisor.close()
+        self.supervisor = Supervisor(
+            self.store,
+            FixtureAdapterFactory(FIXTURES, pid=987_654),
+            pid_alive=lambda pid: pid == 777_777,
+        )
+        env = self._seed_accounts()
+        healthy = await self.supervisor.start_run(
+            agent_id="WIKI-ROTATE-HEALTHY",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="fixture",
+        )
+        approval = await self.supervisor.start_run(
+            agent_id="WIKI-ROTATE-APPROVAL",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="fixture",
+        )
+        self.store.transition(approval.run_id, LifecycleState.WAITING_APPROVAL)
+        stale = RunRecord.new(
+            agent_id="WIKI-ROTATE-STALE",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            worktree=str(self.worktree),
+            prompt="fixture",
+        )
+        stale.state = LifecycleState.DEAD
+        stale.provider_session_id = "stale-session"
+        stale.provider_pid = 777_777
+        self.store.create(stale)
+        healthy_adapter = self.supervisor.adapters[healthy.run_id]
+
+        with (
+            mock.patch.dict(os.environ, env),
+            self.assertRaisesRegex(StoreConflict, "not safe to rotate"),
+        ):
+            await self.supervisor.request_codex_rotation(
+                operation_id="00000000-0000-4000-8000-000000000097",
+                force_target="beta",
+            )
+
+        self.assertIs(self.supervisor.adapters[healthy.run_id], healthy_adapter)
+        assert isinstance(healthy_adapter, CodexFixtureAdapter)
+        self.assertFalse(healthy_adapter.closed)
+        self.assertIsNone(self.store.get(healthy.run_id).quiesce_operation_id)
+        self.assertIsNone(self.store.read_codex_rotation_journal())
+        with mock.patch.dict(os.environ, env):
+            self.assertEqual(accounts.read_state().active, "alpha")
 
     async def test_raw_persistence_failure_closes_and_blocks_without_recovery(
         self,

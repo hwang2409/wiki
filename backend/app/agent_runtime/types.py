@@ -155,6 +155,8 @@ class RunRecord:
     updated_at: str = field(default_factory=utc_now)
     state_reason: str | None = None
     recovery_from_state: LifecycleState | None = None
+    quiesce_operation_id: str | None = None
+    quiesce_resume_state: LifecycleState | None = None
     automatic_resume_suppressed: bool = False
     automatic_resume_guarded_at: str | None = None
     replaces_run_id: str | None = None
@@ -213,6 +215,10 @@ class RunRecord:
             "recovery_from_state": (
                 self.recovery_from_state.value if self.recovery_from_state else None
             ),
+            "quiesce_operation_id": self.quiesce_operation_id,
+            "quiesce_resume_state": (
+                self.quiesce_resume_state.value if self.quiesce_resume_state else None
+            ),
             "automatic_resume_suppressed": self.automatic_resume_suppressed,
             "automatic_resume_guarded_at": self.automatic_resume_guarded_at,
             "provider_session_id": self.provider_session_id,
@@ -256,6 +262,12 @@ class RunRecord:
             recovery_from_state=(
                 LifecycleState(value["recovery_from_state"])
                 if value.get("recovery_from_state")
+                else None
+            ),
+            quiesce_operation_id=value.get("quiesce_operation_id"),
+            quiesce_resume_state=(
+                LifecycleState(value["quiesce_resume_state"])
+                if value.get("quiesce_resume_state")
                 else None
             ),
             automatic_resume_suppressed=bool(

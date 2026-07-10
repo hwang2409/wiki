@@ -12,7 +12,11 @@ from unittest import mock
 from fastapi import BackgroundTasks, HTTPException
 
 from backend.app import main
-from backend.app.agent_runtime.client import SupervisorClient, SupervisorUnavailable
+from backend.app.agent_runtime.client import (
+    SupervisorClient,
+    SupervisorRemoteError,
+    SupervisorUnavailable,
+)
 from backend.app.agent_runtime.fake import FixtureAdapterFactory
 from backend.app.agent_runtime.protocol import UnixSupervisorServer
 from backend.app.agent_runtime.store import RunStore, RuntimePaths
@@ -34,6 +38,7 @@ class FakeSupervisorClient:
         self.raw_events: list[dict[str, Any]] = []
         self.pending_requests: list[dict[str, Any]] = []
         self.fail_unavailable = False
+        self.rotation_error: SupervisorRemoteError | None = None
         self.event = {
             "type": "session",
             "ticket": "WIKI-42",
@@ -91,6 +96,27 @@ class FakeSupervisorClient:
         values = dict(params or {})
         self.calls.append((method, values))
         registry = self._registry()
+        if method == "fleet/rotate_codex":
+            if self.rotation_error is not None:
+                raise self.rotation_error
+            revived = sorted(
+                agent_id
+                for agent_id, entry in registry.items()
+                if not agent_id.startswith("_")
+                and isinstance(entry, dict)
+                and isinstance(entry.get("current"), dict)
+                and entry["current"].get("run_id")
+                and entry["current"].get("kind") == "cdx"
+                and entry["current"].get("state")
+                not in {"dead", "completed"}
+            )
+            return {
+                "from": "alpha",
+                "to": values.get("account") or "beta",
+                "revived": revived,
+                "failed": [],
+                "failed_reasons": {},
+            }
         if method == "run/list":
             rows = []
             for agent_id, entry in registry.items():
@@ -578,6 +604,61 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+
+    async def test_account_rotation_is_one_supervisor_owned_rpc(self) -> None:
+        self._seed_headless()
+        registry = json.loads(self.registry.read_text(encoding="utf-8"))
+        registry["WIKI-CLAUDE"] = {
+            "history": [],
+            "current": {
+                "ticket": "WIKI-CLAUDE",
+                "run_id": "00000000-0000-4000-8000-000000000044",
+                "provider": "claude",
+                "kind": "cc",
+                "role": "review",
+                "model": "sonnet",
+                "worktree": str(self.worktree),
+                "state": "idle",
+            },
+        }
+        self.registry.write_text(json.dumps(registry), encoding="utf-8")
+        tmux_called = AssertionError("account route touched tmux")
+
+        with (
+            mock.patch.object(accounts := main.accounts, "rotate", side_effect=tmux_called),
+            mock.patch.object(accounts, "rotate_credentials", side_effect=tmux_called),
+            mock.patch.object(accounts, "tmux_live_windows", side_effect=tmux_called),
+        ):
+            result = await main.rotate_account(main.AccountRotateIn(account="beta"))
+
+        self.assertEqual(
+            result,
+            {
+                "from": "alpha",
+                "to": "beta",
+                "revived": ["WIKI-42"],
+                "failed": [],
+                "failed_reasons": {},
+            },
+        )
+        method, params = self.client.calls[-1]
+        self.assertEqual(method, "fleet/rotate_codex")
+        self.assertEqual(params["account"], "beta")
+        self.assertRegex(
+            params["operation_id"],
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+        )
+
+    async def test_account_rotation_preserves_supervisor_conflict_status(self) -> None:
+        self._seed_headless()
+        self.client.rotation_error = SupervisorRemoteError(
+            "Codex fleet is not safe to rotate: approval pending",
+            error_type="StoreConflict",
+        )
+        with self.assertRaises(HTTPException) as blocked:
+            await main.rotate_account(main.AccountRotateIn(account="beta"))
+        self.assertEqual(blocked.exception.status_code, 409)
+        self.assertIn("approval pending", str(blocked.exception.detail))
 
 
 class BackendSupervisorEndToEndTests(unittest.IsolatedAsyncioTestCase):

@@ -45,6 +45,20 @@ def _validated_run_id(run_id: str) -> str:
     return run_id
 
 
+def _validated_operation_id(operation_id: str) -> str:
+    """Accept only canonical UUIDs for stale-operation comparisons."""
+
+    try:
+        parsed = UUID(operation_id)
+    except (ValueError, AttributeError) as exc:
+        raise StoreError(f"invalid quiesce operation id: {operation_id!r}") from exc
+    if str(parsed) != operation_id:
+        raise StoreError(
+            f"quiesce operation id is not a canonical UUID: {operation_id!r}"
+        )
+    return operation_id
+
+
 def _provider_request_key(request_id: str | int) -> str:
     if isinstance(request_id, bool) or not isinstance(request_id, (str, int)):
         raise StoreError("provider request id must be a string or integer")
@@ -149,6 +163,10 @@ class RuntimePaths:
     @property
     def log_path(self) -> Path:
         return self.runtime_dir / "supervisor.log"
+
+    @property
+    def codex_rotation_journal_path(self) -> Path:
+        return self.runtime_dir / "codex-rotation-journal.json"
 
     def run_dir(self, run_id: str) -> Path:
         return self.runs_dir / _validated_run_id(run_id)
@@ -284,6 +302,30 @@ class RunStore:
     def provider_log_path(self, run_id: str) -> Path:
         return self.run_dir(run_id) / "provider.log"
 
+    def read_codex_rotation_journal(self) -> dict[str, Any] | None:
+        """Read the secret-free account-rotation checkpoint, if present."""
+
+        with self._lock:
+            try:
+                value = _read_json(self.paths.codex_rotation_journal_path)
+            except RunNotFound:
+                return None
+            if value == {}:
+                return None
+            if not isinstance(value, dict):
+                raise StoreError("Codex rotation journal must contain an object")
+            return dict(value)
+
+    def write_codex_rotation_journal(self, value: dict[str, Any]) -> None:
+        """Atomically persist caller-sanitized rotation coordination metadata."""
+
+        with self._lock:
+            _atomic_write_json(self.paths.codex_rotation_journal_path, dict(value))
+
+    def clear_codex_rotation_journal(self) -> None:
+        with self._lock:
+            _atomic_write_json(self.paths.codex_rotation_journal_path, {})
+
     def _read_registry(self) -> dict[str, Any]:
         try:
             value = json.loads(self.paths.registry_path.read_text(encoding="utf-8"))
@@ -299,6 +341,34 @@ class RunStore:
 
     def _write_registry(self, registry: dict[str, Any]) -> None:
         _atomic_write_json(self.paths.registry_path, registry)
+
+    def legacy_codex_agent_ids(self) -> list[str]:
+        """Return tmux-era Codex currents, failing closed on corrupt entries."""
+
+        with self._lock:
+            registry = self._read_registry()
+            legacy: list[str] = []
+            for agent_id, entry in registry.items():
+                if agent_id.startswith("_"):
+                    continue
+                if not isinstance(entry, dict):
+                    raise StoreError(f"registry entry for {agent_id} must be an object")
+                current = entry.get("current")
+                if current is None:
+                    continue
+                if not isinstance(current, dict):
+                    raise StoreError(
+                        f"registry current entry for {agent_id} must be an object"
+                    )
+                kind = current.get("kind")
+                run_id = current.get("run_id")
+                if kind is not None and not isinstance(kind, str):
+                    raise StoreError(f"registry kind for {agent_id} must be a string")
+                if run_id is not None and not isinstance(run_id, str):
+                    raise StoreError(f"registry run id for {agent_id} must be a string")
+                if kind == "cdx" and not run_id:
+                    legacy.append(agent_id)
+            return sorted(legacy)
 
     def _registry_current(self, record: RunRecord) -> dict[str, Any]:
         return {
@@ -316,6 +386,12 @@ class RunStore:
             "state_reason": record.state_reason,
             "recovery_from_state": (
                 record.recovery_from_state.value if record.recovery_from_state else None
+            ),
+            "quiesce_operation_id": record.quiesce_operation_id,
+            "quiesce_resume_state": (
+                record.quiesce_resume_state.value
+                if record.quiesce_resume_state
+                else None
             ),
             "automatic_resume_suppressed": record.automatic_resume_suppressed,
             "automatic_resume_guarded_at": record.automatic_resume_guarded_at,
@@ -398,7 +474,10 @@ class RunStore:
                         else:
                             record.state = target
                             record.state_reason = None
-                            if target is not LifecycleState.BLOCKED:
+                            if (
+                                target is not LifecycleState.BLOCKED
+                                and record.quiesce_operation_id is None
+                            ):
                                 record.recovery_from_state = None
                             if target in TERMINAL_STATES:
                                 record.pending_requests.clear()
@@ -675,7 +754,10 @@ class RunStore:
             validate_transition(record.state, target)
             record.state = target
             record.state_reason = reason
-            if target is not LifecycleState.BLOCKED:
+            if (
+                target is not LifecycleState.BLOCKED
+                and record.quiesce_operation_id is None
+            ):
                 record.recovery_from_state = None
             if target in TERMINAL_STATES:
                 record.pending_requests.clear()
@@ -762,6 +844,10 @@ class RunStore:
     def clear_automatic_resume_suppression(self, run_id: str) -> RunRecord:
         with self._lock:
             record = self.get(run_id)
+            if record.quiesce_operation_id is not None:
+                raise StoreConflict(
+                    "quiesce marker must be cleared after controlled resume"
+                )
             if not record.automatic_resume_suppressed:
                 return record
             record.automatic_resume_suppressed = False
@@ -865,7 +951,10 @@ class RunStore:
                 else:
                     record.state = lifecycle_state
                     record.state_reason = None
-                    if lifecycle_state is not LifecycleState.BLOCKED:
+                    if (
+                        lifecycle_state is not LifecycleState.BLOCKED
+                        and record.quiesce_operation_id is None
+                    ):
                         record.recovery_from_state = None
             if record.state in TERMINAL_STATES:
                 record.pending_requests.clear()
@@ -891,6 +980,137 @@ class RunStore:
                 return record
             record.pending_requests.clear()
             self._write_record(record)
+            return record
+
+    def mark_quiesce_intent(
+        self,
+        run_id: str,
+        operation_id: str,
+        expected_session_id: str,
+    ) -> RunRecord:
+        """Capture the exact current session and resumable state before stopping it."""
+
+        _validated_operation_id(operation_id)
+        if not expected_session_id:
+            raise StoreError("expected provider session id must not be empty")
+        with self._lock:
+            record = self.get(run_id)
+            if not self.is_current(record):
+                raise StoreConflict("quiesce target is no longer current")
+            if record.replaced_by_run_id:
+                raise StoreConflict("quiesce target was replaced")
+            if record.provider_session_id != expected_session_id:
+                raise StoreConflict("provider session changed during quiesce preflight")
+            if record.quiesce_operation_id is not None:
+                if record.quiesce_operation_id == operation_id:
+                    return record
+                raise StoreConflict("run belongs to another quiesce operation")
+            if record.state not in {LifecycleState.WORKING, LifecycleState.IDLE}:
+                raise StoreConflict(
+                    f"state {record.state.value} cannot be quiesced for exact-session resume"
+                )
+            record.quiesce_operation_id = operation_id
+            record.quiesce_resume_state = record.state
+            self._write_record(record)
+            registry = self._read_registry()
+            current = (registry.get(record.agent_id) or {}).get("current") or {}
+            if current.get("run_id") == record.run_id:
+                registry[record.agent_id]["current"] = self._registry_current(record)
+                self._write_registry(registry)
+            return record
+
+    def finish_provider_detached(
+        self,
+        run_id: str,
+        operation_id: str,
+        *,
+        reason: str,
+    ) -> RunRecord:
+        """Converge a matching quiesce after transport shutdown and late events."""
+
+        _validated_operation_id(operation_id)
+        with self._lock:
+            record = self.get(run_id)
+            if record.quiesce_operation_id != operation_id:
+                raise StoreConflict("quiesce operation is missing or stale")
+            resume_state = record.quiesce_resume_state
+            if resume_state not in {LifecycleState.WORKING, LifecycleState.IDLE}:
+                raise StoreError("quiesce operation has no resumable captured state")
+            record.provider_pid = None
+            record.active_turn_id = None
+            record.pending_requests.clear()
+            record.automatic_resume_suppressed = True
+            record.automatic_resume_guarded_at = None
+            record.recovery_from_state = resume_state
+            record.state = LifecycleState.BLOCKED
+            record.state_reason = reason
+            self._write_record(record)
+            registry = self._read_registry()
+            current = (registry.get(record.agent_id) or {}).get("current") or {}
+            if current.get("run_id") == record.run_id:
+                registry[record.agent_id]["current"] = self._registry_current(record)
+                self._write_registry(registry)
+            return record
+
+    def clear_quiesce_marker(
+        self,
+        run_id: str,
+        operation_id: str,
+    ) -> RunRecord:
+        """Clear the matching marker only after its provider is attached again."""
+
+        _validated_operation_id(operation_id)
+        with self._lock:
+            record = self.get(run_id)
+            if record.quiesce_operation_id != operation_id:
+                raise StoreConflict("quiesce operation is missing or stale")
+            if (
+                record.state not in {LifecycleState.WORKING, LifecycleState.IDLE}
+                or record.provider_pid is None
+            ):
+                raise StoreConflict("provider has not completed controlled resume")
+            record.quiesce_operation_id = None
+            record.quiesce_resume_state = None
+            record.recovery_from_state = None
+            record.automatic_resume_suppressed = False
+            record.automatic_resume_guarded_at = None
+            self._write_record(record)
+            registry = self._read_registry()
+            current = (registry.get(record.agent_id) or {}).get("current") or {}
+            if current.get("run_id") == record.run_id:
+                registry[record.agent_id]["current"] = self._registry_current(record)
+                self._write_registry(registry)
+            return record
+
+    def abandon_quiesce_marker(
+        self,
+        run_id: str,
+        operation_id: str,
+    ) -> RunRecord:
+        """Forget a marker only when the captured run can never be revived."""
+
+        _validated_operation_id(operation_id)
+        with self._lock:
+            record = self.get(run_id)
+            if record.quiesce_operation_id != operation_id:
+                raise StoreConflict("quiesce operation is missing or stale")
+            if (
+                self.is_current(record)
+                and not record.replaced_by_run_id
+                and record.state not in TERMINAL_STATES
+            ):
+                raise StoreConflict("current resumable run cannot abandon quiesce")
+            record.quiesce_operation_id = None
+            record.quiesce_resume_state = None
+            record.recovery_from_state = None
+            record.automatic_resume_suppressed = False
+            record.automatic_resume_guarded_at = None
+            self._write_record(record)
+            registry = self._read_registry()
+            current = (registry.get(record.agent_id) or {}).get("current") or {}
+            if current.get("run_id") == record.run_id:
+                registry[record.agent_id]["current"] = self._registry_current(record)
+                self._write_registry(registry)
             return record
 
     def queue_message(self, run_id: str, text: str) -> RunRecord:
