@@ -9,6 +9,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+import psutil
+
 from .types import ProviderKind
 
 
@@ -16,6 +18,14 @@ from .types import ProviderKind
 class ProviderProcessIdentity:
     pid: int
     transcript_path: str
+
+
+@dataclass(frozen=True)
+class ProviderProcessStatus:
+    pid: int
+    parent_pid: int
+    created_at: float
+    process_group_id: int
 
 
 def select_transcript_identity(
@@ -161,6 +171,156 @@ async def resolve_provider_identity(
         session_id,
         reported_path=reported_path,
     )
+
+
+async def provider_process_status(
+    pid: int | None,
+    *,
+    timeout: float = 1.0,
+) -> ProviderProcessStatus | None:
+    """Return a stable PID snapshot including parent/start time/process group."""
+
+    if pid is None or pid <= 1:
+        return None
+
+    def inspect_process() -> ProviderProcessStatus | None:
+        try:
+            process = psutil.Process(pid)
+            parent_pid = process.ppid()
+            created_at = process.create_time()
+            process_group_id = os.getpgid(pid)
+        except (ProcessLookupError, PermissionError, psutil.Error):
+            return None
+        return ProviderProcessStatus(
+            pid=pid,
+            parent_pid=parent_pid,
+            created_at=created_at,
+            process_group_id=process_group_id,
+        )
+
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(inspect_process), timeout=timeout)
+    except TimeoutError:
+        return None
+
+
+async def provider_parent_pid(
+    pid: int | None,
+    *,
+    timeout: float = 1.0,
+) -> int | None:
+    """Return the PID's current parent, or None when it cannot be verified."""
+
+    status = await provider_process_status(pid, timeout=timeout)
+    return status.parent_pid if status is not None else None
+
+
+async def provider_pid_is_orphan(
+    pid: int | None,
+    *,
+    timeout: float = 1.0,
+) -> bool:
+    """Treat a provider PID as orphaned only when its parent is init."""
+
+    status = await provider_process_status(pid, timeout=timeout)
+    return status is not None and status.parent_pid == 1
+
+
+async def orphaned_provider_process(
+    pid: int | None,
+    *,
+    timeout: float = 1.0,
+) -> ProviderProcessStatus | None:
+    """Return the verified orphan snapshot, or None when the PID is not orphaned."""
+
+    status = await provider_process_status(pid, timeout=timeout)
+    if status is None or status.parent_pid != 1:
+        return None
+    return status
+
+
+async def _current_matching_process(
+    process: ProviderProcessStatus | None,
+    *,
+    timeout: float = 1.0,
+) -> ProviderProcessStatus | None:
+    if process is None or process.pid <= 1:
+        return None
+    current = await provider_process_status(process.pid, timeout=timeout)
+    if current is None or current.created_at != process.created_at:
+        return None
+    return current
+
+
+async def _wait_for_process_exit(
+    process: ProviderProcessStatus | None,
+    *,
+    timeout: float,
+    poll_interval: float = 0.05,
+) -> bool:
+    if process is None or process.pid <= 1:
+        return True
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if await _current_matching_process(process, timeout=poll_interval) is None:
+            return True
+        await asyncio.sleep(poll_interval)
+    return await _current_matching_process(process, timeout=poll_interval) is None
+
+
+def _signal_process(process: ProviderProcessStatus, sig: signal.Signals) -> bool | None:
+    try:
+        if process.process_group_id > 1:
+            os.killpg(process.process_group_id, sig)
+        else:
+            os.kill(process.pid, sig)
+    except ProcessLookupError:
+        return None
+    except PermissionError:
+        return False
+    return True
+
+
+async def terminate_detached_provider_pid(
+    process: ProviderProcessStatus | None,
+    *,
+    grace: float = 0.5,
+    terminate_timeout: float = 5.0,
+    kill_timeout: float = 1.0,
+) -> bool:
+    """Wait briefly, then terminate a verified orphaned detached provider PID."""
+
+    if process is None or process.pid <= 1:
+        return True
+    if await _wait_for_process_exit(process, timeout=grace):
+        return True
+
+    current = await _current_matching_process(process)
+    if current is None:
+        return True
+    if current.parent_pid != 1:
+        return False
+
+    result = _signal_process(current, signal.SIGTERM)
+    if result is None:
+        return True
+    if result is False:
+        return False
+    if await _wait_for_process_exit(process, timeout=terminate_timeout):
+        return True
+
+    current = await _current_matching_process(process)
+    if current is None:
+        return True
+    if current.parent_pid != 1:
+        return False
+
+    result = _signal_process(current, signal.SIGKILL)
+    if result is None:
+        return True
+    if result is False:
+        return False
+    return await _wait_for_process_exit(process, timeout=kill_timeout)
 
 
 async def terminate_process_group(
