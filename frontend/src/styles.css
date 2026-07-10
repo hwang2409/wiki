@@ -3983,6 +3983,22 @@ body.is-resizing-panes .pane-cell {
   will-change: transform;
 }
 
+.session-ts {
+  margin-top: 2px;
+  padding: 0 2px;
+  align-self: flex-start;
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.4;
+  cursor: default;
+  white-space: nowrap;
+}
+
+.session-virtual-row[data-align="end"] .session-ts {
+  align-self: flex-end;
+}
+
 .session-footer {
   flex-shrink: 0;
   padding: 2px 14px 10px;
