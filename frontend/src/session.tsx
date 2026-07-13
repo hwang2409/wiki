@@ -79,6 +79,7 @@ import { Timestamp } from "./timestamp";
 import {
   addPendingUserMessage,
   invalidateTranscript,
+  loadOlderEvents,
   removePendingUserMessage,
   refreshTranscript,
   replaceTranscriptDesiredModel,
@@ -89,9 +90,18 @@ import {
   type PendingUserMessage,
   type TranscriptSession,
 } from "./transcript-store";
+import {
+  buildVirtualLayoutIncremental,
+  groupEventsIncremental,
+  sameEventRefs,
+  type EventGroup,
+  type GroupEventsCache,
+  type RowMeasurement,
+  type VirtualLayout,
+  type VirtualLayoutCache,
+} from "./session-layout";
 
 const POLL_MS = 2500;
-const VIRTUAL_ROW_GAP = 14;
 const VIRTUAL_MIN_OVERSCAN = 3600;
 const VIRTUAL_OVERSCAN_MULTIPLIER = 5;
 const VIRTUAL_DEFAULT_VIEWPORT = 720;
@@ -987,23 +997,6 @@ function ToolRow({
   );
 }
 
-type EventGroup =
-  | { kind: "message"; event: SessionEvent; key: number }
-  | { kind: "activity"; events: SessionEvent[]; key: number };
-
-type RowMeasurement = {
-  refs: readonly SessionEvent[];
-  height: number;
-};
-
-type VirtualLayout = {
-  keys: number[];
-  keyToIndex: Map<number, number>;
-  tops: number[];
-  sizes: number[];
-  totalHeight: number;
-};
-
 type SessionUiState = {
   booleans: Map<string, boolean>;
 };
@@ -1027,84 +1020,6 @@ function useStoredBooleanState(
     forceRender((version) => version + 1);
   }, [initial, key, store]);
   return [value, setValue];
-}
-
-function groupEventRefs(group: EventGroup): readonly SessionEvent[] {
-  return group.kind === "activity" ? group.events : [group.event];
-}
-
-function sameEventRefs(prev: readonly SessionEvent[], next: readonly SessionEvent[]): boolean {
-  return prev.length === next.length && prev.every((event, index) => event === next[index]);
-}
-
-function estimateWrappedLines(text: string, charsPerLine: number): number {
-  let total = 0;
-  for (const line of text.split("\n")) total += Math.max(1, Math.ceil(line.length / charsPerLine));
-  return total;
-}
-
-function getEstimatedGroupHeight(group: EventGroup): number {
-  if (group.kind === "activity") return 34;
-  switch (group.event.kind) {
-    case "assistant":
-      return Math.max(96, 28 + estimateWrappedLines(group.event.text, 92) * 22);
-    case "bash":
-      return Math.max(
-        76,
-        28 +
-          estimateWrappedLines(group.event.bash?.input ?? "", 92) * 20 +
-          estimateWrappedLines(
-            [group.event.bash?.stdout, group.event.bash?.stderr].filter(Boolean).join("\n"),
-            104
-          ) *
-            18
-      );
-    case "tasks":
-      return Math.max(72, 40 + (group.event.tasks?.length ?? 0) * 28);
-    case "question":
-      return Math.max(132, 56 + ((group.event.question?.options.length ?? 0) * 28));
-    case "terminal":
-      return Math.max(60, 24 + estimateWrappedLines(group.event.text, 112) * 18);
-    case "user":
-      return Math.max(52, 20 + estimateWrappedLines(group.event.text, 96) * 20);
-    case "image":
-      return 44;
-    case "artifact":
-      return 420;
-    case "notification":
-    case "command":
-    case "interrupt":
-    case "pr":
-    case "marker":
-      return Math.max(40, 18 + estimateWrappedLines(group.event.text, 92) * 18);
-    default:
-      return 56;
-  }
-}
-
-function getMeasuredGroupHeight(group: EventGroup, heights: Map<number, RowMeasurement>): number | null {
-  const measurement = heights.get(group.key);
-  if (!measurement) return null;
-  return measurement.height;
-}
-
-function buildVirtualLayout(groups: EventGroup[], heights: Map<number, RowMeasurement>): VirtualLayout {
-  const keys = new Array<number>(groups.length);
-  const keyToIndex = new Map<number, number>();
-  const tops = new Array<number>(groups.length);
-  const sizes = new Array<number>(groups.length);
-  let offset = 0;
-  for (let index = 0; index < groups.length; index += 1) {
-    const group = groups[index];
-    keys[index] = group.key;
-    keyToIndex.set(group.key, index);
-    tops[index] = offset;
-    const height = getMeasuredGroupHeight(group, heights) ?? getEstimatedGroupHeight(group);
-    const size = height + (index === groups.length - 1 ? 0 : VIRTUAL_ROW_GAP);
-    sizes[index] = size;
-    offset += size;
-  }
-  return { keys, keyToIndex, tops, sizes, totalHeight: offset };
 }
 
 function findFirstVisibleIndex(layout: VirtualLayout, offset: number): number {
@@ -1168,25 +1083,6 @@ function sameImageNums(prev?: number[], next?: number[]): boolean {
   if (prev === next) return true;
   if (!prev || !next) return !prev && !next;
   return prev.length === next.length && prev.every((num, index) => num === next[index]);
-}
-
-function groupEvents(events: SessionEvent[], offset: number): EventGroup[] {
-  const groups: EventGroup[] = [];
-  for (let i = 0; i < events.length; i += 1) {
-    const event = events[i];
-    // Keys are absolute event indices so open/closed state survives window slides.
-    if (event.kind !== "tool" && event.kind !== "thinking") {
-      groups.push({ kind: "message", event, key: offset + i });
-    } else {
-      const last = groups[groups.length - 1];
-      if (last && last.kind === "activity") {
-        last.events.push(event);
-      } else {
-        groups.push({ kind: "activity", events: [event], key: offset + i });
-      }
-    }
-  }
-  return groups;
 }
 
 function ImageChip({
@@ -1871,6 +1767,9 @@ export function SessionTab({
   const sessionStateKey = `${stateKey ?? resetKey}:${resetKey}`;
   const rowHeightsKeyRef = useRef(resetKey);
   const rowHeightsRef = useRef<Map<number, RowMeasurement>>(new Map());
+  const groupCacheRef = useRef<GroupEventsCache | null>(null);
+  const layoutCacheRef = useRef<VirtualLayoutCache | null>(null);
+  const layoutDirtyFromRef = useRef(Number.POSITIVE_INFINITY);
   const layoutRef = useRef<VirtualLayout | null>(null);
   const layoutResetKeyRef = useRef(resetKey);
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -1889,6 +1788,9 @@ export function SessionTab({
   if (rowHeightsKeyRef.current !== resetKey) {
     rowHeightsKeyRef.current = resetKey;
     rowHeightsRef.current = new Map();
+    groupCacheRef.current = null;
+    layoutCacheRef.current = null;
+    layoutDirtyFromRef.current = 0;
   }
 
   const target = useMemo(
@@ -1898,6 +1800,8 @@ export function SessionTab({
   const visible = useElementVisible(containerRef);
   const { session, pendingUserMessages, error, loading } = useTranscriptSession(target, visible);
   const [questionDrafts, setQuestionDrafts] = useState<Record<string, QuestionDraft>>({});
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const [olderError, setOlderError] = useState<string | null>(null);
 
   useEffect(() => {
     onArtifactsChange?.((session?.events ?? []).filter((event) => event.kind === "artifact" && Boolean(event.artifact_id)));
@@ -2115,14 +2019,30 @@ export function SessionTab({
     [session],
   );
 
-  const groups = useMemo(
-    () => groupEvents(displayEvents, session?.base ?? 0),
-    [displayEvents, session?.base]
-  );
-  const layout = useMemo(
-    () => buildVirtualLayout(groups, rowHeightsRef.current),
-    [groups, resetKey, rowHeightVersion]
-  );
+  const grouped = useMemo(() => {
+    const result = groupEventsIncremental(
+      displayEvents,
+      session?.base ?? 0,
+      groupCacheRef.current,
+      session?.eventsChangedFrom,
+    );
+    groupCacheRef.current = result.cache;
+    return result;
+  }, [displayEvents, session?.base, session?.eventsChangedFrom]);
+  const groups = grouped.groups;
+  const layout = useMemo(() => {
+    const changedFrom = Math.min(grouped.changedFrom, layoutDirtyFromRef.current);
+    const result = buildVirtualLayoutIncremental(
+      groups,
+      rowHeightsRef.current,
+      rowHeightVersion,
+      layoutCacheRef.current,
+      Number.isFinite(changedFrom) ? changedFrom : undefined,
+    );
+    layoutCacheRef.current = result.cache;
+    layoutDirtyFromRef.current = Number.POSITIVE_INFINITY;
+    return result.layout;
+  }, [grouped.changedFrom, groups, resetKey, rowHeightVersion]);
   const [visibleRange, setVisibleRange] = useState<{ start: number; end: number }>({ start: 0, end: -1 });
   const visibleRangeViewportRef = useRef<{ top: number; height: number } | null>(null);
   const syncVisibleRange = useCallback((viewport: { top: number; height: number }, force = false) => {
@@ -2182,8 +2102,25 @@ export function SessionTab({
       return;
     }
     rowHeightsRef.current.set(group.key, measurement);
+    const index = layoutCacheRef.current?.layout.keyToIndex.get(group.key);
+    if (index !== undefined) {
+      layoutDirtyFromRef.current = Math.min(layoutDirtyFromRef.current, index);
+    }
     setRowHeightVersion((version) => version + 1);
   }, []);
+
+  const loadOlder = useCallback(async () => {
+    if (!session || loadingOlder) return;
+    setLoadingOlder(true);
+    setOlderError(null);
+    try {
+      await loadOlderEvents(ticket, session.base, 500);
+    } catch (loadError) {
+      setOlderError(loadError instanceof Error ? loadError.message : "Could not load older events");
+    } finally {
+      setLoadingOlder(false);
+    }
+  }, [loadingOlder, session, ticket]);
 
   useLayoutEffect(() => {
     const el = ref.current;
@@ -2427,6 +2364,14 @@ export function SessionTab({
       ) : null}
       <div className="session-scroll" ref={ref}>
         <div className="session-scroll-inner" ref={innerRef}>
+          {session.hasOlder && !subagent ? (
+            <div className="session-load-older">
+              <button disabled={loadingOlder} onClick={() => void loadOlder()} type="button">
+                {loadingOlder ? "Loading older events…" : "Load older events"}
+              </button>
+              {olderError ? <span role="alert">{olderError}</span> : null}
+            </div>
+          ) : null}
           <div className="session-virtual-list" style={{ height: layout.totalHeight }}>
             {visibleGroups.map(({ group, top }) => (
               <VirtualSessionRow

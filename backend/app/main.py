@@ -1251,7 +1251,7 @@ def _session_delta_payload(
         )
     events = result["events"]
     if fmt == "claude":
-        transcripts.annotate_agent_events(path, events)
+        events = transcripts.annotate_agent_events(path, events)
     payload: dict[str, object] = {
         "version": 2,
         "format": fmt,
@@ -1272,6 +1272,8 @@ def _session_delta_payload(
         "kind": kind,
         "provider": provider,
     }
+    if "has_older" in result:
+        payload["has_older"] = bool(result["has_older"])
     if include_subagents:
         payload["subagents"] = _active_subagents(path)
     if include_queue and ticket and valid_agent_id(ticket):
@@ -1449,6 +1451,32 @@ def agent_session(
         kind=kind,
         provider=provider,
     )
+
+
+@app.get("/api/agents/{ticket}/session/older")
+def agent_session_older(
+    ticket: str,
+    before: int = Query(..., ge=0),
+    count: int = Query(500, ge=1, le=2_000),
+) -> dict[str, object]:
+    session = agent_session(ticket, cursor=0, client_path=None)
+    fmt = session.get("format")
+    raw_path = session.get("path")
+    if fmt not in {"codex", "claude"} or not isinstance(raw_path, str):
+        raise HTTPException(status_code=409, detail="Older transcript events are unavailable")
+    path = Path(raw_path)
+    result = transcripts.read_older_session(fmt, path, before, count)
+    events = result["events"]
+    if fmt == "claude":
+        events = transcripts.annotate_agent_events(path, events)
+    return {
+        "version": 2,
+        "format": fmt,
+        "path": raw_path,
+        "base": result["base"],
+        "events": events,
+        "has_older": result["has_older"],
+    }
 
 
 def _transcript_working(path: Path, ticket: str | None = None) -> bool:

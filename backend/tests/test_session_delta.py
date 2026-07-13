@@ -30,6 +30,78 @@ class SessionDeltaTests(unittest.TestCase):
     def setUp(self) -> None:
         transcripts._cache.clear()
 
+    def _cached_events(self, root: Path, count: int) -> tuple[Path, dict]:
+        path = root / "large.jsonl"
+        path.touch()
+        state = transcripts._new_parse_state("codex")
+        state["events"] = [
+            {
+                "id": index,
+                "kind": "assistant",
+                "ts": None,
+                "text": f"event-{index}",
+                "disposition": "rendered",
+            }
+            for index in range(count)
+        ]
+        state["cursor"] = count
+        state["next_event_id"] = count
+        transcripts._cache[str(path)] = state
+        return path, state
+
+    def test_full_reset_returns_tail_window_with_older_flag(self) -> None:
+        with TemporaryDirectory() as tmp, mock.patch.object(transcripts, "TAIL_WINDOW_EVENTS", 3):
+            path, state = self._cached_events(Path(tmp), 5)
+
+            result = transcripts.read_session_delta("codex", path, 0)
+
+            self.assertEqual(result["base"], 2)
+            self.assertEqual(result["tail_from"], 2)
+            self.assertEqual([event["id"] for event in result["events"]], [2, 3, 4])
+            self.assertTrue(result["has_older"])
+            self.assertIs(result["events"][0], state["events"][2])
+
+    def test_full_reset_returns_all_events_without_older_flag(self) -> None:
+        with TemporaryDirectory() as tmp, mock.patch.object(transcripts, "TAIL_WINDOW_EVENTS", 5):
+            path, _state = self._cached_events(Path(tmp), 3)
+
+            result = transcripts.read_session_delta("codex", path, 0)
+
+            self.assertEqual(result["base"], 0)
+            self.assertEqual([event["id"] for event in result["events"]], [0, 1, 2])
+            self.assertFalse(result["has_older"])
+
+    def test_read_older_session_returns_slice_and_retention_boundary(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path, _state = self._cached_events(Path(tmp), 6)
+
+            page = transcripts.read_older_session("codex", path, before=5, count=2)
+            first_page = transcripts.read_older_session("codex", path, before=2, count=2)
+
+            self.assertEqual(page["base"], 3)
+            self.assertEqual([event["id"] for event in page["events"]], [3, 4])
+            self.assertTrue(page["has_older"])
+            self.assertEqual(first_page["base"], 0)
+            self.assertEqual([event["id"] for event in first_page["events"]], [0, 1])
+            self.assertFalse(first_page["has_older"])
+
+    def test_claude_annotation_does_not_mutate_cached_events(self) -> None:
+        event = {
+            "id": 1,
+            "kind": "tool",
+            "tool": {"name": "Agent", "prompt_head": "delegate this"},
+        }
+        with mock.patch.object(
+            transcripts,
+            "list_subagents",
+            return_value=[{"id": "abc12345", "prompt_head": "delegate this"}],
+        ):
+            annotated = transcripts.annotate_agent_events(Path("session.jsonl"), [event])
+
+        self.assertNotIn("agent_id", event["tool"])
+        self.assertEqual(annotated[0]["tool"]["agent_id"], "abc12345")
+        self.assertIsNot(annotated[0], event)
+
     def test_models_endpoint_includes_new_codex_and_claude_options(self) -> None:
         payload = main.list_models()
         models = {model["id"]: model for model in payload["models"]}
@@ -284,6 +356,59 @@ class SessionDeltaTests(unittest.TestCase):
             self.assertEqual(body["model"], None)
             self.assertEqual(body["kind"], "cdx")
             self.assertEqual(body["provider"], "codex")
+
+    def test_agent_session_older_endpoint_returns_requested_page(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            transcript = root / "rollout.jsonl"
+            registry = root / "agent-registry.json"
+            queue = root / "queue.json"
+            status_dir = root / "status"
+            status_dir.mkdir()
+            registry.write_text(
+                json.dumps(
+                    {
+                        "_orchestrators": {
+                            "WIKI-94": {
+                                "window": "@9999",
+                                "spawned_at": "2026-07-13T00:00:00Z",
+                                "transcript": str(transcript),
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            queue.write_text("{}", encoding="utf-8")
+            _write_rows(
+                transcript,
+                [
+                    {
+                        "type": "event_msg",
+                        "timestamp": f"2026-07-13T00:00:0{index}Z",
+                        "payload": {"type": "user_message", "message": f"event-{index}"},
+                    }
+                    for index in range(5)
+                ],
+                mode="w",
+            )
+
+            with (
+                mock.patch.object(main, "AGENT_REGISTRY_PATH", registry),
+                mock.patch.object(main, "AGENT_STATUS_DIR", status_dir),
+                mock.patch.object(main, "MSG_QUEUE_PATH", queue),
+                mock.patch.object(main, "resolve_window", return_value=None),
+                mock.patch.object(transcripts, "TAIL_WINDOW_EVENTS", 2),
+                mock.patch.dict(main._session_paths, {}, clear=True),
+            ):
+                initial = main.agent_session("WIKI-94", cursor=0)
+                older = main.agent_session_older("WIKI-94", before=initial["base"], count=2)
+
+            self.assertEqual(initial["base"], 3)
+            self.assertTrue(initial["has_older"])
+            self.assertEqual(older["base"], 1)
+            self.assertEqual([event["text"] for event in older["events"]], ["event-1", "event-2"])
+            self.assertTrue(older["has_older"])
 
     def test_subagent_session_renders_sidechain_events(self) -> None:
         with TemporaryDirectory() as tmp:
