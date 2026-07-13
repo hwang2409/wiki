@@ -10,6 +10,7 @@ from collections.abc import Callable
 from pathlib import Path
 from unittest import mock
 
+from backend.app.agent_models import MODEL_OPTIONS
 from backend.app.agent_runtime.claude import ClaudeStreamAdapter
 from backend.app.agent_runtime.codex import CodexAppServerAdapter
 from backend.app.agent_runtime.process import (
@@ -514,6 +515,39 @@ class ClaudeAdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         self.adapters.append(adapter)
         return adapter
+
+    def test_catalog_models_use_cli_compatible_model_names(self) -> None:
+        expected_cli_models = {
+            "claude-fable-5": "claude-fable-5",
+            "opus-4.7": "claude-opus-4-7",
+            "opus": "opus",
+            "sonnet": "sonnet",
+            "sonnet-4.6": "claude-sonnet-4-6",
+            "haiku": "haiku",
+            "haiku-4.5": "claude-haiku-4-5",
+        }
+        catalog_models = [
+            option.id for option in MODEL_OPTIONS if option.provider == "claude"
+        ]
+        self.assertEqual(catalog_models, list(expected_cli_models))
+
+        for model, expected_cli_model in expected_cli_models.items():
+            with self.subTest(model=model):
+                record = _record(
+                    self.root,
+                    ProviderKind.CLAUDE,
+                    state=LifecycleState.STARTING,
+                )
+                record.model = model
+                adapter = self._adapter(record)
+                command = adapter._command_for(  # noqa: SLF001 - argv contract
+                    "00000000-0000-4000-8000-000000000040",
+                    resume=False,
+                )
+                self.assertEqual(
+                    command[command.index("--model") + 1],
+                    expected_cli_model,
+                )
 
     async def _apply_message(
         self,

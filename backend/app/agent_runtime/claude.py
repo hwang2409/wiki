@@ -31,6 +31,14 @@ from .types import LifecycleState, ProviderKind, RunRecord
 IdentityResolver = Callable[..., Awaitable[ProviderProcessIdentity | None]]
 
 
+# Claude Code accepts aliases or full API IDs, not versioned catalog shortnames.
+_CLAUDE_CLI_MODEL_OVERRIDES = {
+    "opus-4.7": "claude-opus-4-7",
+    "sonnet-4.6": "claude-sonnet-4-6",
+    "haiku-4.5": "claude-haiku-4-5",
+}
+
+
 @dataclass
 class _PendingControl:
     future: asyncio.Future[dict[str, Any]]
@@ -233,7 +241,7 @@ class ClaudeStreamAdapter(ProviderAdapter):
             "--permission-mode",
             "bypassPermissions",
             "--model",
-            self.model,
+            _CLAUDE_CLI_MODEL_OVERRIDES.get(self.model, self.model),
         ]
         if self.effort:
             args.extend(("--effort", self.effort))
