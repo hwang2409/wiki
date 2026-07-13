@@ -46,10 +46,28 @@
   --font-ui-smaller: 12.5px;
   --font-ui-small: 13.5px;
   --font-text-size: 16.5px;
+  --font-monospace-size: 13.5px;
 }
 
 * {
   box-sizing: border-box;
+}
+
+:where(
+  .session-scroll pre,
+  .session-scroll code,
+  .session-pane-log,
+  .session-tool-output,
+  .session-bash-command-code,
+  .shiki-block,
+  .shiki-block pre,
+  .shiki-block code,
+  .markdown-body pre,
+  .markdown-body code,
+  .note-editor pre,
+  .note-editor code
+) {
+  font-size: var(--font-monospace-size);
 }
 
 html,

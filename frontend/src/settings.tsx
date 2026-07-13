@@ -244,8 +244,25 @@ export const TEXT_FONTS: FontChoice[] = [
 
 const BODY_SIZE_KEY = "wiki-font-size-body";
 const UI_SIZE_KEY = "wiki-font-size-ui";
+const MONO_SIZE_KEY = "wiki-font-size-mono";
 const BODY_SIZE_DEFAULT = 16.5;
 const UI_SIZE_DEFAULT = 13.5;
+const MONO_SIZE_DEFAULT = 13.5;
+
+function dedupeByLabel(...pools: FontChoice[][]): FontChoice[] {
+  const seen = new Set<string>();
+  const merged: FontChoice[] = [];
+  for (const pool of pools) {
+    for (const choice of pool) {
+      if (seen.has(choice.label)) continue;
+      seen.add(choice.label);
+      merged.push(choice);
+    }
+  }
+  return merged;
+}
+
+export const ALL_FONTS: FontChoice[] = dedupeByLabel(MONO_FONTS, UI_FONTS, TEXT_FONTS);
 
 const MONO_SAMPLE = "→ const x = 0O1lIi";
 const PROP_SAMPLE = "The quick brown fox";
@@ -264,7 +281,7 @@ const FONT_ROLES: Record<FontRoleId, FontRole> = {
   ui: {
     name: "Interface font",
     desc: "App chrome: sidebar, tabs, buttons, status bar, dialogs.",
-    fonts: UI_FONTS,
+    fonts: ALL_FONTS,
     key: "wiki-ui-font",
     cssVar: "--font-interface",
     sample: PROP_SAMPLE,
@@ -272,7 +289,7 @@ const FONT_ROLES: Record<FontRoleId, FontRole> = {
   text: {
     name: "Note font",
     desc: "Body text of rendered notes and the source editor.",
-    fonts: TEXT_FONTS,
+    fonts: ALL_FONTS,
     key: "wiki-text-font",
     cssVar: "--font-text",
     sample: PROP_SAMPLE,
@@ -280,7 +297,7 @@ const FONT_ROLES: Record<FontRoleId, FontRole> = {
   mono: {
     name: "Monospace font",
     desc: "Code blocks, agent transcripts, and mono UI chrome.",
-    fonts: MONO_FONTS,
+    fonts: ALL_FONTS,
     key: "wiki-mono-font",
     cssVar: "--font-monospace",
     sample: MONO_SAMPLE,
@@ -338,11 +355,12 @@ function isAvailable(choice: FontChoice): boolean {
   return isFontInstalled(choice.family);
 }
 
-function applySizes(body: number, ui: number) {
+function applySizes(body: number, ui: number, mono: number) {
   const root = document.documentElement.style;
   root.setProperty("--font-text-size", `${body}px`);
   root.setProperty("--font-ui-small", `${ui}px`);
   root.setProperty("--font-ui-smaller", `${ui - 1}px`);
+  root.setProperty("--font-monospace-size", `${mono}px`);
 }
 
 function storedSize(key: string, fallback: number): number {
@@ -365,7 +383,8 @@ export function applyStoredFonts() {
   }
   applySizes(
     storedSize(BODY_SIZE_KEY, BODY_SIZE_DEFAULT),
-    storedSize(UI_SIZE_KEY, UI_SIZE_DEFAULT)
+    storedSize(UI_SIZE_KEY, UI_SIZE_DEFAULT),
+    storedSize(MONO_SIZE_KEY, MONO_SIZE_DEFAULT)
   );
 }
 
@@ -508,13 +527,16 @@ export function SettingsModal({
 }) {
   const [bodySize, setBodySize] = useState(() => storedSize(BODY_SIZE_KEY, BODY_SIZE_DEFAULT));
   const [uiSize, setUiSize] = useState(() => storedSize(UI_SIZE_KEY, UI_SIZE_DEFAULT));
+  const [monoSize, setMonoSize] = useState(() => storedSize(MONO_SIZE_KEY, MONO_SIZE_DEFAULT));
 
-  function updateSizes(body: number, ui: number) {
+  function updateSizes(body: number, ui: number, mono: number) {
     setBodySize(body);
     setUiSize(ui);
+    setMonoSize(mono);
     localStorage.setItem(BODY_SIZE_KEY, String(body));
     localStorage.setItem(UI_SIZE_KEY, String(ui));
-    applySizes(body, ui);
+    localStorage.setItem(MONO_SIZE_KEY, String(mono));
+    applySizes(body, ui, mono);
   }
 
   useEffect(() => {
@@ -588,7 +610,7 @@ export function SettingsModal({
                 step={0.5}
                 type="range"
                 value={bodySize}
-                onChange={(event) => updateSizes(Number(event.target.value), uiSize)}
+                onChange={(event) => updateSizes(Number(event.target.value), uiSize, monoSize)}
               />
               <span className="settings-slider-value tabular-nums">{bodySize}px</span>
             </div>
@@ -607,15 +629,34 @@ export function SettingsModal({
                 step={0.5}
                 type="range"
                 value={uiSize}
-                onChange={(event) => updateSizes(bodySize, Number(event.target.value))}
+                onChange={(event) => updateSizes(bodySize, Number(event.target.value), monoSize)}
               />
               <span className="settings-slider-value tabular-nums">{uiSize}px</span>
+            </div>
+          </div>
+          <div className="settings-row">
+            <div className="settings-row-info">
+              <div className="settings-row-name">Monospace font size</div>
+              <div className="settings-row-desc">
+                Code blocks, agent transcripts, tool output, bash rows.
+              </div>
+            </div>
+            <div className="settings-slider">
+              <input
+                max={20}
+                min={11}
+                step={0.5}
+                type="range"
+                value={monoSize}
+                onChange={(event) => updateSizes(bodySize, uiSize, Number(event.target.value))}
+              />
+              <span className="settings-slider-value tabular-nums">{monoSize}px</span>
             </div>
           </div>
           <button
             className="settings-reset"
             type="button"
-            onClick={() => updateSizes(BODY_SIZE_DEFAULT, UI_SIZE_DEFAULT)}
+            onClick={() => updateSizes(BODY_SIZE_DEFAULT, UI_SIZE_DEFAULT, MONO_SIZE_DEFAULT)}
           >
             Reset sizes to default
           </button>
