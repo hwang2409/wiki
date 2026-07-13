@@ -739,6 +739,19 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(responded["state"], "working")
         self.assertEqual(self.client.pending_requests, [])
 
+        mixed_answers = {
+            "answers": {
+                "Which features?": ["Search", "Vim mode"],
+                "Which rollout?": "Ship now",
+            }
+        }
+        main.respond_to_agent(
+            "WIKI-42",
+            main.AgentRespondIn(request_id="toolu-mixed", response=mixed_answers),
+        )
+        self.assertEqual(self.client.calls[-1][0], "run/respond")
+        self.assertEqual(self.client.calls[-1][1]["response"], mixed_answers)
+
     async def test_spawn_and_replace_are_supervisor_owned(self) -> None:
         with mock.patch.object(
             main,

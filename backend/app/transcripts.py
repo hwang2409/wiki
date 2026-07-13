@@ -14,7 +14,8 @@ Normalized event:
    "encrypted": bool                          (thinking only),
    "question": {
        "prompt": str, "header": str|None, "options": [str, ...],
-       "answered_option": int|None, "custom_reply": str|None
+       "multi_select": bool, "answered_option": int|None,
+       "answered_options": [int, ...], "custom_reply": str|None
    }                                          (question only)}
 """
 
@@ -882,7 +883,9 @@ def build_question_events(
                     "prompt": str(entry.get("question") or "").strip(),
                     "header": str(entry.get("header") or "").strip() or None,
                     "options": options,
+                    "multi_select": entry.get("multiSelect") is True,
                     "answered_option": None,
+                    "answered_options": [],
                     "custom_reply": None,
                 },
             }
@@ -899,7 +902,7 @@ def _emit_question_events(state: dict, ts: str | None, questions: list[dict], to
         pending_questions[tool_use_id] = refs
 
 
-def _coerce_question_answer_value(value: object) -> str | None:
+def _coerce_question_answer_value(value: object) -> str | list[str] | None:
     if isinstance(value, str):
         stripped = value.strip()
         return stripped or None
@@ -909,11 +912,12 @@ def _coerce_question_answer_value(value: object) -> str | None:
             for item in value
             if isinstance(item, str) and item.strip()
         ]
-        return ", ".join(parts) or None
+        return parts or None
     if isinstance(value, dict):
         direct = value.get("answer")
-        if isinstance(direct, str) and direct.strip():
-            return direct.strip()
+        coerced = _coerce_question_answer_value(direct)
+        if coerced is not None:
+            return coerced
         nested = value.get("answers")
         return _coerce_question_answer_value(nested)
     return None
@@ -923,12 +927,12 @@ def _question_answer_map(
     refs: list[dict],
     result: str,
     structured_answers: object,
-) -> dict[str, str]:
+) -> dict[str, str | list[str]]:
     prompts = [
         str((event.get("question") or {}).get("prompt") or "").strip()
         for event in refs
     ]
-    answers_by_prompt: dict[str, str] = {}
+    answers_by_prompt: dict[str, str | list[str]] = {}
     if isinstance(structured_answers, dict):
         for key, raw_value in structured_answers.items():
             answer = _coerce_question_answer_value(raw_value)
@@ -975,6 +979,21 @@ def _question_answer_map(
     return answers_by_prompt
 
 
+def _question_answer_values(
+    raw_value: str | list[str],
+    options: list[str],
+    multi_select: bool,
+) -> list[str]:
+    if isinstance(raw_value, list):
+        return raw_value
+    if not multi_select or raw_value in options:
+        return [raw_value]
+    # Claude Code records multi-select answers as a comma-space separated
+    # string. Prefer an exact option match above so labels containing commas
+    # remain intact when only that option was selected.
+    return [part.strip() for part in raw_value.split(", ") if part.strip()]
+
+
 def _apply_question_answers(
     state: dict,
     tool_use_id: str,
@@ -992,9 +1011,19 @@ def _apply_question_answers(
         if raw_value is None:
             continue
         options = question_meta.get("options") or []
-        answered_option = next((i for i, label in enumerate(options) if label == raw_value), None)
-        question_meta["answered_option"] = answered_option
-        question_meta["custom_reply"] = None if answered_option is not None else (raw_value or None)
+        multi_select = question_meta.get("multi_select") is True
+        values = _question_answer_values(raw_value, options, multi_select)
+        answered_options = [
+            index for index, label in enumerate(options) if label in values
+        ]
+        custom_values = [value for value in values if value not in options]
+        question_meta["answered_options"] = answered_options
+        question_meta["answered_option"] = (
+            answered_options[0]
+            if not multi_select and len(answered_options) == 1
+            else None
+        )
+        question_meta["custom_reply"] = ", ".join(custom_values) or None
         changed_indices.append(int(event["id"]) - int(state.get("base", 0)))
     for changed_index in changed_indices:
         if 0 <= changed_index < len(state["events"]):
