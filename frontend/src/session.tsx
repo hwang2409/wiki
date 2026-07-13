@@ -42,7 +42,7 @@ import {
 import type { LucideIcon } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { MarkdownPre, rehypeEscapeRawHtml } from "./markdown";
+import { MarkdownPre, prepareTranscriptMarkdown, rehypeEscapeRawHtml } from "./markdown";
 import { ShikiCode } from "./shiki";
 import {
   cancelAgentModelChange,
@@ -1510,7 +1510,7 @@ const MessageBlock = memo(function MessageBlock({
         rehypePlugins={[rehypeEscapeRawHtml]}
         remarkPlugins={[remarkGfm]}
       >
-        {event.text}
+        {prepareTranscriptMarkdown(event.text)}
       </ReactMarkdown>
     </div>
   );
