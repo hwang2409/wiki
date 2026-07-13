@@ -7,7 +7,7 @@ import { chromium } from "playwright";
 
 import { makeFixtureRoot, startBackend, writeQueue, writeRegistry } from "../scripts/wiki32-harness.mjs";
 
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "..", "..");
 const PYTHON = path.join(ROOT, ".venv", "bin", "python");
 const RUN_ID = "00000000-0000-4000-8000-000000000092";
 const TICKET = "WIKI-92";

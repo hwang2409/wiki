@@ -11,7 +11,7 @@ import {
   writeQueue,
 } from "../scripts/wiki32-harness.mjs";
 
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "..", "..");
 const PYTHON = path.join(ROOT, ".venv", "bin", "python");
 const FIXTURES = path.join(ROOT, "backend", "tests", "fixtures", "agent_runtime");
 const PROMPT =

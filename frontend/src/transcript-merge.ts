@@ -208,14 +208,14 @@ export function mergeSession(
   ) {
     return mergeSessionState(current, result, current.base, current.events, current.events.length);
   }
-  // The server may retain events older than the client's initial tail window.
-  // That lower retention base is compatible with an unchanged loaded suffix.
   if (
-    result.tail_from === clientEnd &&
     result.events.length === 0 &&
     result.patches.length === 0 &&
     result.base < current.base
   ) {
+    // The server may retain events older than the client's initial tail window,
+    // and any empty poll that moves the base backward is compatible with the
+    // already-loaded suffix because the cursor guard above rejects regressions.
     return mergeSessionState(
       current,
       { ...result, has_older: current.hasOlder || Boolean(result.has_older) },
