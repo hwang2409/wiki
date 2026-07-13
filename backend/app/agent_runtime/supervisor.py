@@ -526,7 +526,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     "composer_text": pending_message["text"],
                     "composer_sent_at": pending_message["sent_at"],
                 }
-        normalized_event = self.store.append_normalized(
+        self.store.append_normalized(
             run_id,
             raw_seq=int(raw["seq"]),
             disposition=normalized.disposition,
@@ -534,13 +534,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             payload=normalized_payload,
             lifecycle_state=normalized.lifecycle_state,
         )
-        if pending_message is not None:
-            self.store.acknowledge_pending_user_message(
-                run_id,
-                pending_message["pending_id"],
-                echoed_at=str(normalized_event["normalized_at"]),
-                seq=int(normalized_event["seq"]),
-            )
 
         record = self.store.get(run_id)
         if normalized.lifecycle_state is not None:

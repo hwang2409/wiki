@@ -308,11 +308,27 @@ class RunStoreTests(unittest.TestCase):
             self.assertIsNotNone(matched)
             assert matched is not None
             self.assertEqual(matched["pending_id"], first)
-            store.acknowledge_pending_user_message(
+            stale_record = store.get(record.run_id).to_dict()
+            raw = store.append_raw(
                 record.run_id,
-                first,
-                echoed_at="2026-07-13T19:09:03Z",
-                seq=1,
+                provider="claude",
+                direction="inbound",
+                payload={"type": "user"},
+            )
+            store.append_normalized(
+                record.run_id,
+                raw_seq=raw["seq"],
+                disposition=EventDisposition.RENDERED,
+                kind="claude_user",
+                payload={
+                    "pending_id": first,
+                    "composer_text": "same text",
+                    "composer_sent_at": matched["sent_at"],
+                },
+            )
+            store.run_path(record.run_id).write_text(
+                json.dumps(stale_record),
+                encoding="utf-8",
             )
 
             reloaded = RunStore(_paths(root))
