@@ -2096,8 +2096,27 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         old_adapter = self.adapters.get(run_id)
         if old_adapter is None:
             if self.pid_alive(old.provider_pid):
-                raise StoreConflict(
-                    "replacement target has a live PID without attached control"
+                orphan = await self._orphaned_provider_process(old.provider_pid)
+                if orphan is None:
+                    raise StoreConflict(
+                        "replacement target has a live PID without attached control"
+                    )
+                if not await self._terminate_orphan_provider_pid(orphan):
+                    raise StoreConflict(
+                        "replacement target's orphan provider PID remained live"
+                    )
+                terminal_state = (
+                    old.state if old.state in TERMINAL_STATES else LifecycleState.DEAD
+                )
+                old = self.store.transition(
+                    run_id,
+                    terminal_state,
+                    reason="orphan stopped for replacement",
+                    adapter_status=self._detached_terminal_status(
+                        old,
+                        terminal_state,
+                        detail="orphan stopped for replacement",
+                    ),
                 )
             replacement = RunRecord.new(
                 agent_id=old.agent_id,

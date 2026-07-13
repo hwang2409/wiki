@@ -29,6 +29,7 @@ from .agent_runtime.client import (
     SupervisorClient,
     SupervisorRemoteError,
     SupervisorUnavailable,
+    replacement_prompt,
 )
 from .agent_runtime.store import RuntimePaths
 from .frontend_static import mount_frontend_static
@@ -1927,18 +1928,7 @@ def deliver_message(window: str, text: str) -> None:
 
 
 def _headless_replacement_prompt(agent_id: str, current: dict) -> str:
-    status_path = AGENT_STATUS_DIR / f"{agent_id}.json"
-    role = current.get("role") or "worker"
-    return f"""You are the replacement {role} for {agent_id}.
-Your prior provider session was {current.get("provider_session_id") or "not recorded"}.
-
-Recover context from:
-- prior transcript: {current.get("transcript") or "not resolved"}
-- raw provider events: {current.get("log") or "not recorded"}
-- status file: {status_path}
-
-Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and status-file contract. Re-read the current ticket/PR state, update the status file before long operations, then continue from the last durable step.
-"""
+    return replacement_prompt(agent_id, current, status_dir=AGENT_STATUS_DIR)
 
 
 def _control_headless_agent(agent_id: str, action: str) -> dict[str, object]:
