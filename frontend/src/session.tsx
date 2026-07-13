@@ -2067,7 +2067,7 @@ export function SessionTab({
         ...modelChangedMarkers(session),
       ];
     },
-    [session?.events, session?.providerInspector],
+    [session?.events, session?.providerInspector, session?.composerMessages],
   );
 
   const grouped = useMemo(() => {

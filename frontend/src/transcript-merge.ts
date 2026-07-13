@@ -48,14 +48,20 @@ export function mergeQueueSources(current: QueuedMessage[], next: QueuedMessage[
     previous.set(queueKey(message), message);
     previous.set(legacyQueueKey(message), message);
   });
-  return next.map((message) => {
+  let changed = false;
+  const merged = next.map((message) => {
     const match = previous.get(queueKey(message)) ?? previous.get(legacyQueueKey(message));
+    const pendingId = message.pending_id ?? match?.pending_id;
+    const source = message.source ?? match?.source;
+    if (pendingId === message.pending_id && source === message.source) return message;
+    changed = true;
     return {
       ...message,
-      pending_id: message.pending_id ?? match?.pending_id,
-      source: message.source ?? match?.source,
+      ...(pendingId ? { pending_id: pendingId } : {}),
+      ...(source ? { source } : {}),
     };
   });
+  return changed ? merged : next;
 }
 
 function sameJsonValue(left: unknown, right: unknown): boolean {

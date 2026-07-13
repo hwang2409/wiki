@@ -149,6 +149,23 @@ test("mergeQueueSources preserves a pending id across queue snapshots", () => {
   assert.deepEqual(mergeQueueSources(current, next), current);
 });
 
+test("mergeQueueSources preserves an unmatched legacy snapshot by reference", () => {
+  const current = [{
+    text: "old queued message",
+    queued_at: "2026-07-13T12:00:00Z",
+    pending_id: "73f65e1c-ad09-4ce5-9ca8-31bb44db431b",
+  }];
+  const next = [{
+    text: "new queued message",
+    queued_at: "2026-07-13T12:01:00Z",
+  }];
+
+  const merged = mergeQueueSources(current, next);
+  assert.strictEqual(merged, next);
+  assert.strictEqual(merged[0], next[0]);
+  assert.deepEqual(Object.keys(merged[0]), ["text", "queued_at"]);
+});
+
 test("mergeSession preserves loaded older prefix across a full reset", () => {
   const current = buildSession(sessionData(Array.from({ length: 6 }, (_, index) => event(index))));
   const resetEvents = [event(3, "assistant", "reset-3"), event(4), event(5), event(6)];
