@@ -39,10 +39,11 @@ Give agents one MCP tool that emits typed artifacts (mermaid, SVG, raster image,
    │ 4. emit sentinel to stdout: <<wiki-artifact:v1>>{normalized-json}<<end>>
    │ 5. return tool_result: {artifact_id: "<uuid>", ok: true}
    ▼
-[supervisor normalizer]  ← new event kind "artifact"
-   │ 1. matches sentinel in MCP tool_use result stream
-   │ 2. emits normalized event with full payload (text kinds) or ref (image kind)
-   │ 3. persisted in raw NDJSON — WIKI-42 restart-safety
+[provider-native transcript]  ← existing Codex + Claude transcript parsers
+   │ 1. specializes render_artifact tool_use/tool_result pairs
+   │ 2. emits session event kind "artifact" with full payload for text kinds
+   │    or {ref, mime, byte_size} for image
+   │ 3. remains restart-safe because the provider transcript is durable
    ▼
 [frontend session view]  ← existing VirtualSessionRow dispatch
    │ event.kind === "artifact" → <ArtifactBlock event={event} />
@@ -56,7 +57,7 @@ Give agents one MCP tool that emits typed artifacts (mermaid, SVG, raster image,
    │ code    → <CodeRenderer /> (Shiki, +diff view when diff_from present)
 ```
 
-Four new surfaces: MCP server (~150 LOC Python), one supervisor normalizer branch, one backend artifact-serve route, one React component tree. No vault write, no cleanup daemon.
+Four new surfaces: MCP server (~150 LOC Python), transcript specializations for both providers, one backend artifact-serve route, one React component tree. The supervisor only wires the MCP server into provider startup. No vault write, no cleanup daemon.
 
 ## Protocol
 
@@ -161,7 +162,7 @@ Tool description explicitly steers agents: *"Use this ONLY for tabular data with
 GET /api/agents/{ticket}/artifact/{uuid}
 ```
 
-Resolves `WIKI_AGENT_RUNTIME_DIR/runs/<run-id>/artifacts/<uuid>.<ext>`, sends with correct `Content-Type`, `Cache-Control: private, max-age=3600`. Returns 404 if artifact doesn't exist. No auth beyond backend's existing localhost-bind (same posture as other agent routes).
+Resolves the ticket's live run first at `WIKI_AGENT_RUNTIME_DIR/runs/<run-id>/artifacts/<uuid>.<ext>`. If the ticket is archived, falls back to `WIKI_AGENT_ARCHIVE_DIR/<ticket>/<newest-session-dir>/artifacts/<uuid>.<ext>` using the existing ticket/archive lookup semantics. Sends with correct `Content-Type`, `Cache-Control: private, max-age=3600`. Returns 404 if the ticket or artifact doesn't exist. Resolution is ticket-scoped: a caller cannot use one ticket ID to retrieve another ticket's artifact. No auth beyond backend's existing localhost-bind (same posture as other agent routes).
 
 ## Renderers
 
@@ -198,7 +199,7 @@ Per-kind renderer notes:
 - **Text kinds** (mermaid, svg, table, plot, code) — payload inlined in raw NDJSON event. Cap 100KB per artifact enforced at the MCP server, reject with clear error over 100KB.
 - **`image`** — bytes decoded from base64 written to `WIKI_AGENT_RUNTIME_DIR/runs/<run-id>/artifacts/<uuid>.<ext>` (extension inferred from `mime`). Cap 5MB. Event carries only `{ref, mime, byte_size}`. Backend serves via the route above.
 
-Everything archives with the run: WIKI-42 supervisor archive already sweeps `runs/<run-id>/*` including the new `artifacts/` subdir. Reading an archived session → artifact route still resolves. No separate cleanup, no orphan risk.
+Everything archives with the run. Before deleting the live run directory, the supervisor archive path copies `runs/<run-id>/artifacts/` (when present) to the selected `<archive-session>/artifacts/` directory. Reading the newest archived session for a ticket resolves image refs through the artifact route's archived fallback. No separate cleanup, no orphan risk.
 
 ## Discovery
 
@@ -213,7 +214,7 @@ The MCP server binary ships inside the wiki-backend sidecar (same bundle strateg
 
 Backend:
 - `test_wiki_artifacts_server.py` — one test per kind: valid payload accepted + returns tool_result, oversized payload rejected with clear error, malformed shape rejected.
-- `test_supervisor_normalizer_artifact.py` — raw MCP tool_use sentinel → normalized `artifact` event, one case per kind.
+- transcript parser tests — Codex and Claude `render_artifact` tool_use/tool_result pairs → session `artifact` event, one case per kind across the two formats.
 - `test_artifact_serve.py` — `GET /api/agents/{ticket}/artifact/{uuid}` returns bytes with correct Content-Type; 404 for unknown UUID; scope check that a bad ticket ID can't grab another ticket's artifact.
 
 Frontend (Playwright):
