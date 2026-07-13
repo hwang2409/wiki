@@ -601,12 +601,16 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         self.raw.write_bytes(RAW_PENDING_ASK_FIXTURE.read_bytes())
         self._seed_headless(provider="claude", transcript=transcript)
 
-        payload = main.agent_session("WIKI-42")
+        with mock.patch.object(main.transcripts, "TAIL_WINDOW_EVENTS", 1):
+            payload = main.agent_session("WIKI-42")
         questions = [
             event for event in cast(list[dict[str, Any]], payload["events"])
             if event.get("kind") == "question"
         ]
         self.assertEqual(len(questions), 1)
+        self.assertEqual(len(payload["events"]), 1)
+        self.assertTrue(payload["has_older"])
+        self.assertEqual(payload["tail_from"], payload["base"])
         self.assertEqual(questions[0]["question"]["tool_use_id"], "toolu_pending_fixture")
         self.assertIsNone(questions[0]["question"]["answered_option"])
         self.assertGreater(

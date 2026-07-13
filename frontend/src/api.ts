@@ -435,10 +435,20 @@ export type AgentSessionData = {
   tail_from: number;
   events: SessionEvent[];
   patches: SessionPatch[];
+  has_older?: boolean;
   subagents?: SubagentInfo[];
   queue?: QueuedMessage[];
   working?: boolean;
   provider_inspector?: ProviderEventInspector;
+};
+
+export type AgentOlderSessionData = {
+  version: 2;
+  format: "codex" | "claude";
+  path: string;
+  base: number;
+  events: SessionEvent[];
+  has_older: boolean;
 };
 
 export type QueuedMessage = {
@@ -508,6 +518,13 @@ export function getAgentSession(ticket: string, after = 0, path?: string) {
   if (path) params.set("path", path);
   return request<AgentSessionData>(
     `/api/agents/${encodeURIComponent(ticket)}/session?${params.toString()}`
+  );
+}
+
+export function getAgentOlderSession(ticket: string, before: number, count = 500) {
+  const params = new URLSearchParams({ before: String(before), count: String(count) });
+  return request<AgentOlderSessionData>(
+    `/api/agents/${encodeURIComponent(ticket)}/session/older?${params.toString()}`
   );
 }
 

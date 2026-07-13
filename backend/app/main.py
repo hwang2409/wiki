@@ -1149,17 +1149,21 @@ def _overlay_pending_questions(
             "patches": [],
         }
 
+    combined_base = int(current["base"])
+    combined_events = [*current["events"], *assigned_overlay]
+    window_base = max(combined_base, total - transcripts.TAIL_WINDOW_EVENTS)
     return {
-        "events": [*current["events"], *assigned_overlay],
-        "base": int(current["base"]),
+        "events": combined_events[window_base - combined_base :],
+        "base": window_base,
         "tokens": current.get("tokens"),
         "tasks": current.get("tasks") or [],
         "pr": current.get("pr"),
         "session_meta": current.get("session_meta") or {},
         "dispositions": current.get("dispositions") or {"rendered": 0, "summarized": 0, "ignored": 0, "unknown": 0},
         "cursor": combined_cursor,
-        "tail_from": int(current["base"]),
+        "tail_from": window_base,
         "patches": [],
+        "has_older": window_base > combined_base,
     }
 
 
@@ -1232,9 +1236,15 @@ def _session_delta_payload(
     desired_model: str | None = None,
     kind: str | None = None,
     provider: str | None = None,
+    tail_window: bool = True,
 ) -> dict[str, object]:
     effective_cursor = 0 if client_path is not None and client_path != str(path) else cursor
-    result = transcripts.read_session_delta(fmt, path, effective_cursor)
+    result = transcripts.read_session_delta(
+        fmt,
+        path,
+        effective_cursor,
+        tail_window=tail_window,
+    )
     raw_path: Path | None = None
     if (
         isinstance(headless_current, dict)
@@ -1251,7 +1261,7 @@ def _session_delta_payload(
         )
     events = result["events"]
     if fmt == "claude":
-        transcripts.annotate_agent_events(path, events)
+        events = transcripts.annotate_agent_events(path, events)
     payload: dict[str, object] = {
         "version": 2,
         "format": fmt,
@@ -1272,6 +1282,8 @@ def _session_delta_payload(
         "kind": kind,
         "provider": provider,
     }
+    if "has_older" in result:
+        payload["has_older"] = bool(result["has_older"])
     if include_subagents:
         payload["subagents"] = _active_subagents(path)
     if include_queue and ticket and valid_agent_id(ticket):
@@ -1451,6 +1463,32 @@ def agent_session(
     )
 
 
+@app.get("/api/agents/{ticket}/session/older")
+def agent_session_older(
+    ticket: str,
+    before: int = Query(..., ge=0),
+    count: int = Query(500, ge=1, le=2_000),
+) -> dict[str, object]:
+    session = agent_session(ticket, cursor=0, client_path=None)
+    fmt = session.get("format")
+    raw_path = session.get("path")
+    if fmt not in {"codex", "claude"} or not isinstance(raw_path, str):
+        raise HTTPException(status_code=409, detail="Older transcript events are unavailable")
+    path = Path(raw_path)
+    result = transcripts.read_older_session(fmt, path, before, count)
+    events = result["events"]
+    if fmt == "claude":
+        events = transcripts.annotate_agent_events(path, events)
+    return {
+        "version": 2,
+        "format": fmt,
+        "path": raw_path,
+        "base": result["base"],
+        "events": events,
+        "has_older": result["has_older"],
+    }
+
+
 def _transcript_working(path: Path, ticket: str | None = None) -> bool:
     """Use supervisor lifecycle, then legacy pane spinner, then transcript mtime."""
     if ticket:
@@ -1527,7 +1565,15 @@ def subagent_session(
     path = transcripts.subagents_dir(main_path) / f"agent-{agent_id}.jsonl"
     if not path.is_file():
         raise HTTPException(status_code=404, detail="No such subagent")
-    return _session_delta_payload("claude-sub", path, cursor=cursor, client_path=client_path)
+    # Subagent transcripts have no older-page route in the UI. Keep their
+    # initial response complete so tail-windowed events never become unreachable.
+    return _session_delta_payload(
+        "claude-sub",
+        path,
+        cursor=cursor,
+        client_path=client_path,
+        tail_window=False,
+    )
 
 
 UPLOAD_DIR = Path("/tmp/wiki-uploads")

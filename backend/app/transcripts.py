@@ -22,6 +22,7 @@ Normalized event:
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 from copy import deepcopy
@@ -37,6 +38,11 @@ KICKOFF_TICKET_PATTERN = re.compile(r"(?:Linear )?ticket ([A-Z]+-\d+)\b")
 MAX_TEXT = 80_000
 MAX_TOOL_IO = 3_000
 MAX_CHANGE_LOG = 4_096
+
+try:
+    TAIL_WINDOW_EVENTS = max(1, int(os.environ.get("WIKI_TRANSCRIPT_TAIL_WINDOW", "500")))
+except ValueError:
+    TAIL_WINDOW_EVENTS = 500
 
 TRANSCRIPT_IMAGE_DIR = Path("/tmp/wiki-transcript-images")
 
@@ -1718,7 +1724,26 @@ def read_session_events(fmt: str, path: Path) -> dict:
         }
 
 
-def read_session_delta(fmt: str, path: Path, cursor: int = 0) -> dict:
+def _snapshot_events(events: list[dict]) -> list[dict]:
+    """Copy event objects and the nested leaves parsers mutate in place."""
+    snapshot: list[dict] = []
+    for event in events:
+        copied = dict(event)
+        for key in ("tool", "question"):
+            value = event.get(key)
+            if isinstance(value, dict):
+                copied[key] = dict(value)
+        snapshot.append(copied)
+    return snapshot
+
+
+def read_session_delta(
+    fmt: str,
+    path: Path,
+    cursor: int = 0,
+    *,
+    tail_window: bool = True,
+) -> dict:
     key = str(path)
     with _cache_lock_for(key):
         state = _read_cached_state(fmt, path, key)
@@ -1740,17 +1765,21 @@ def read_session_delta(fmt: str, path: Path, cursor: int = 0) -> dict:
                     full_reset = True
 
         if full_reset:
+            window_base = max(base, total - TAIL_WINDOW_EVENTS) if tail_window else base
             return {
-                "events": deepcopy(events),
-                "base": base,
+                # Snapshot only the event objects and mutable nested leaves;
+                # avoid a recursive clone of large immutable payloads.
+                "events": _snapshot_events(events[window_base - base :]),
+                "base": window_base,
                 "tokens": state["tokens"],
                 "tasks": tasks,
                 "pr": pr,
                 "session_meta": deepcopy(state.get("session_meta") or {}),
                 "dispositions": dict(state.get("dispositions") or {}),
                 "cursor": current_cursor,
-                "tail_from": base,
+                "tail_from": window_base,
                 "patches": [],
+                "has_older": window_base > base,
             }
 
         changed = [entry for entry in changes if int(entry["cursor"]) > cursor]
@@ -1764,7 +1793,7 @@ def read_session_delta(fmt: str, path: Path, cursor: int = 0) -> dict:
 
         if tail_from < base:
             return {
-                "events": deepcopy(events),
+                "events": _snapshot_events(events),
                 "base": base,
                 "tokens": state["tokens"],
                 "tasks": tasks,
@@ -1774,6 +1803,7 @@ def read_session_delta(fmt: str, path: Path, cursor: int = 0) -> dict:
                 "cursor": current_cursor,
                 "tail_from": base,
                 "patches": [],
+                "has_older": False,
             }
 
         if tail_from < total:
@@ -1803,6 +1833,28 @@ def read_session_delta(fmt: str, path: Path, cursor: int = 0) -> dict:
             "cursor": current_cursor,
             "tail_from": tail_from,
             "patches": patches,
+        }
+
+
+def read_older_session(
+    fmt: str,
+    path: Path,
+    before: int,
+    count: int,
+) -> dict:
+    """Return the retained events immediately before an absolute event index."""
+    key = str(path)
+    with _cache_lock_for(key):
+        state = _read_cached_state(fmt, path, key)
+        base = int(state["base"])
+        events = state["events"]
+        total = base + len(events)
+        end = min(max(before, base), total)
+        start = max(base, end - max(1, count))
+        return {
+            "events": _snapshot_events(events[start - base : end - base]),
+            "base": start,
+            "has_older": start > base,
         }
 
 
@@ -1864,10 +1916,11 @@ def list_subagents(main_path: Path) -> list[dict]:
     return entries
 
 
-def annotate_agent_events(main_path: Path, events: list) -> None:
-    """Attach subagent ids to Agent tool events by prompt-head match."""
+def annotate_agent_events(main_path: Path, events: list) -> list:
+    """Attach subagent ids without mutating parser-owned cached events."""
     heads: dict[str, str] | None = None
-    for event in events:
+    annotated = events
+    for index, event in enumerate(events):
         tool = event.get("tool")
         if not tool or tool.get("name") not in ("Agent", "Task") or tool.get("agent_id"):
             continue
@@ -1878,4 +1931,10 @@ def annotate_agent_events(main_path: Path, events: list) -> None:
             heads = {e["prompt_head"]: e["id"] for e in list_subagents(main_path) if e["prompt_head"]}
         agent_id = heads.get(prompt_head)
         if agent_id:
-            tool["agent_id"] = agent_id
+            if annotated is events:
+                annotated = list(events)
+            annotated[index] = {
+                **event,
+                "tool": {**tool, "agent_id": agent_id},
+            }
+    return annotated

@@ -1,5 +1,6 @@
 import { useEffect, useId, useState } from "react";
 import {
+  getAgentOlderSession,
   getAgentSession,
   getSubagentSession,
   type AgentSessionData,
@@ -8,11 +9,11 @@ import {
   type SessionMeta,
   type QueuedMessage,
   type SessionEvent,
-  type SessionPatch,
   type SessionPr,
   type SessionTask,
   type SubagentInfo,
 } from "./api";
+import { mergeQueueSources, mergeSession, prependOlderEvents } from "./transcript-merge";
 
 const POLL_MS = 2500;
 const PENDING_RECONCILE_WINDOW_MS = 30_000;
@@ -38,6 +39,8 @@ export type TranscriptSession = {
   base: number;
   cursor: number;
   events: SessionEvent[];
+  eventsChangedFrom: number;
+  hasOlder: boolean;
   subagents: SubagentInfo[];
   queue: QueuedMessage[];
   working: boolean;
@@ -177,20 +180,6 @@ function reconcilePendingUserMessages(
   return remaining.length === pending.length ? pending : remaining;
 }
 
-function mergeQueueSources(current: QueuedMessage[], next: QueuedMessage[]): QueuedMessage[] {
-  if (current.length === 0 || next.length === 0) return next;
-  const sources = new Map(
-    current
-      .filter((message) => message.source)
-      .map((message) => [`${message.queued_at}\u0000${message.text}`, message.source] as const),
-  );
-  if (sources.size === 0) return next;
-  return next.map((message) => ({
-    ...message,
-    source: message.source ?? sources.get(`${message.queued_at}\u0000${message.text}`),
-  }));
-}
-
 function getEntry(target: TranscriptTarget): Entry {
   const key = targetKey(target);
   const existing = entries.get(key);
@@ -220,115 +209,36 @@ function setPollerState() {
   }
 }
 
-function buildSession(result: AgentSessionData): TranscriptSession {
-  return {
-    format: result.format,
-    path: result.path,
-    tokens: result.tokens,
-    model: result.model ?? null,
-    desiredModel: result.desired_model ?? null,
-    kind: result.kind ?? null,
-    provider: result.provider ?? null,
-    tasks: result.tasks ?? [],
-    pr: result.pr ?? null,
-    sessionMeta: result.session_meta ?? {},
-    dispositions: result.dispositions ?? { rendered: 0, summarized: 0, ignored: 0, unknown: 0 },
-    providerInspector: result.provider_inspector ?? null,
-    base: result.base,
-    cursor: result.cursor,
-    events: result.events,
-    subagents: result.subagents ?? [],
-    queue: result.queue ?? [],
-    working: result.working ?? false,
-  };
-}
-
-function applyPatches(events: SessionEvent[], patches: SessionPatch[]): SessionEvent[] {
-  if (patches.length === 0) return events;
-  const indexById = new Map<number, number>();
-  events.forEach((event, index) => indexById.set(event.id, index));
-  let next = events;
-  let changed = false;
-  for (const patch of patches) {
-    const index = indexById.get(patch.id);
-    if (index === undefined) continue;
-    const event = next[index];
-    if (!event?.tool) continue;
-    if (event.tool.output === patch.output && event.tool.ok === patch.ok) continue;
-    if (!changed) {
-      next = next.slice();
-      changed = true;
-    }
-    next[index] = {
-      ...event,
-      tool: {
-        ...event.tool,
-        output: patch.output,
-        ok: patch.ok,
-      },
-    };
-  }
-  return next;
-}
-
-function mergeSession(current: TranscriptSession | null, result: AgentSessionData): TranscriptSession {
-  if (
-    !current ||
-    current.path !== result.path ||
-    result.cursor < current.cursor
-  ) {
-    return buildSession(result);
-  }
-
-  let base = current.base;
-  let events = current.events;
-
-  if (result.base > base) {
-    const trim = result.base - base;
-    if (trim >= events.length) {
-      return buildSession(result);
-    }
-    events = events.slice(trim);
-    base = result.base;
-  }
-
-  const clientEnd = base + events.length;
-  if (result.tail_from < base || result.tail_from > clientEnd) {
-    return buildSession(result);
-  }
-
-  events = events.slice(0, result.tail_from - base).concat(result.events);
-  events = applyPatches(events, result.patches);
-
-  return {
-    ...current,
-    format: result.format,
-    path: result.path,
-    tokens: result.tokens,
-    model: result.model ?? current.model,
-    desiredModel: Object.prototype.hasOwnProperty.call(result, "desired_model")
-      ? result.desired_model ?? null
-      : current.desiredModel,
-    kind: result.kind ?? current.kind,
-    provider: result.provider ?? current.provider,
-    tasks: result.tasks ?? current.tasks,
-    pr: result.pr ?? current.pr,
-    sessionMeta: result.session_meta ?? current.sessionMeta,
-    dispositions: result.dispositions ?? current.dispositions,
-    providerInspector: result.provider_inspector ?? current.providerInspector,
-    base,
-    cursor: result.cursor,
-    events,
-    subagents: result.subagents ?? current.subagents,
-    queue: result.queue ? mergeQueueSources(current.queue, result.queue) : current.queue,
-    working: result.working ?? current.working,
-  };
-}
-
 async function loadTarget(target: TranscriptTarget, cursor: number, path?: string): Promise<AgentSessionData> {
   return target.subagent
     ? getSubagentSession(target.ticket, target.subagent, cursor, path)
     : getAgentSession(target.ticket, cursor, path);
+}
+
+export async function loadOlderEvents(ticket: string, before: number, count = 500): Promise<void> {
+  const entry = getEntry({ ticket });
+  const result = await getAgentOlderSession(ticket, before, count);
+  const current = entry.snapshot.session;
+  if (!current || current.path !== result.path || current.base !== before) return;
+  const merged = prependOlderEvents(current, result, before);
+  if (!merged) {
+    const reset = await getAgentSession(ticket, 0);
+    const latest = entry.snapshot.session;
+    if (!latest || latest.path !== current.path || latest.base !== before) return;
+    entry.snapshot = {
+      ...entry.snapshot,
+      session: mergeSession(null, reset),
+      error: null,
+      loading: false,
+    };
+    emit(entry);
+    return;
+  }
+  entry.snapshot = {
+    ...entry.snapshot,
+    session: merged,
+  };
+  emit(entry);
 }
 
 function fetchEntry(entry: Entry): Promise<void> {
