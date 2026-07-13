@@ -1862,7 +1862,7 @@ body.is-resizing-panes .pane-cell {
 /* Wide code blocks take their natural width (up to the pane's content
    width) and stay centered on the text column — symmetric breakout, no
    inner scrolling until the pane itself runs out. */
-.markdown-preview-view pre {
+.markdown-reading-view .markdown-preview-view pre {
   position: relative;
   left: 50%;
   width: max-content;
@@ -4888,6 +4888,8 @@ body.is-resizing-panes .pane-cell {
 
 .session-tool-body pre.session-tool-output {
   color: var(--text-faint);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .session-tool-output-blocks {
