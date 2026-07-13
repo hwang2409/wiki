@@ -28,6 +28,7 @@ from .types import (
     TERMINAL_STATES,
     restart_recovery_decision,
 )
+from .version import RUNTIME_FINGERPRINT
 
 
 AdapterFactory = Callable[[RunRecord], ProviderAdapter]
@@ -2263,7 +2264,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
 
     async def dispatch(self, method: str, params: dict[str, Any]) -> Any:
         if method == "ping":
-            return {"status": "ok", "pid": os.getpid()}
+            return {
+                "status": "ok",
+                "pid": os.getpid(),
+                "runtime_fingerprint": RUNTIME_FINGERPRINT,
+            }
         if method == "run/start":
             migrate_legacy = params.get("migrate_legacy", False)
             if not isinstance(migrate_legacy, bool):

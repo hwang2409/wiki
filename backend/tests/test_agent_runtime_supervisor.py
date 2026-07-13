@@ -2358,6 +2358,7 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         ping = await asyncio.to_thread(self.client.ping)
         self.assertEqual(ping["status"], "ok")
+        self.assertIsInstance(ping["runtime_fingerprint"], str)
         self.assertEqual(self.paths.socket_path.stat().st_mode & 0o777, 0o600)
 
         stream = self.client.subscribe_events()
@@ -2447,6 +2448,70 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "already active"):
             await second.start()
         self.assertTrue(self.paths.socket_path.exists())
+
+    def test_client_replaces_a_supervisor_from_an_older_runtime(self) -> None:
+        client = SupervisorClient(
+            self.paths,
+            timeout=0.1,
+            runtime_fingerprint="current-runtime",
+        )
+        stale = {"status": "ok", "pid": 424_242}
+        current = {
+            "status": "ok",
+            "pid": 424_243,
+            "runtime_fingerprint": "current-runtime",
+        }
+        with (
+            mock.patch.object(
+                client,
+                "ping",
+                side_effect=[stale, SupervisorUnavailable("stopped"), current],
+            ),
+            mock.patch.object(client, "_spawn_detached") as spawn,
+            mock.patch("backend.app.agent_runtime.client.os.kill") as kill,
+        ):
+            self.assertEqual(client.ensure_running(timeout=0.1), current)
+        kill.assert_called_once_with(424_242, signal.SIGTERM)
+        spawn.assert_called_once_with()
+
+    def test_client_does_not_replace_an_old_runtime_when_autostart_is_off(
+        self,
+    ) -> None:
+        client = SupervisorClient(
+            self.paths,
+            timeout=0.1,
+            runtime_fingerprint="current-runtime",
+        )
+        with (
+            mock.patch.object(
+                client,
+                "ping",
+                return_value={
+                    "pid": 424_242,
+                    "runtime_fingerprint": "old-runtime",
+                },
+            ),
+            mock.patch.object(client, "_spawn_detached") as spawn,
+            mock.patch("backend.app.agent_runtime.client.os.kill") as kill,
+            mock.patch.dict(os.environ, {"WIKI_SUPERVISOR_AUTOSTART": "off"}),
+            self.assertRaisesRegex(SupervisorUnavailable, "does not match"),
+        ):
+            client.ensure_running(timeout=0.1)
+        kill.assert_not_called()
+        spawn.assert_not_called()
+
+    def test_client_accepts_an_unversioned_external_supervisor(self) -> None:
+        client = SupervisorClient(
+            self.paths,
+            timeout=0.1,
+            runtime_fingerprint="current-runtime",
+        )
+        health = {"status": "ok", "pid": 424_242}
+        with (
+            mock.patch.object(client, "ping", return_value=health),
+            mock.patch.dict(os.environ, {"WIKI_SUPERVISOR_AUTOSTART": "off"}),
+        ):
+            self.assertEqual(client.ensure_running(timeout=0.1), health)
 
 
 class DaemonProcessTests(unittest.TestCase):
