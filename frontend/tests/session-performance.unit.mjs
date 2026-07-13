@@ -184,6 +184,28 @@ test("mergeSession preserves loaded older prefix across a full reset", () => {
   assert.equal(merged.eventsChangedFrom, 3);
 });
 
+test("mergeSession keeps the current tail when an empty poll moves base backward", () => {
+  const current = buildSession({
+    ...sessionData(Array.from({ length: 500 }, (_, index) => event(49_500 + index))),
+    base: 49_500,
+    tail_from: 49_500,
+    has_older: true,
+  });
+  const result = {
+    ...sessionData([]),
+    base: 48_000,
+    cursor: current.cursor,
+    tail_from: 48_000,
+    patches: [],
+  };
+
+  const merged = mergeSession(current, result);
+  assert.strictEqual(merged, current);
+  assert.equal(merged.hasOlder, true);
+  assert.equal(merged.base, 49_500);
+  assert.equal(merged.events.length, 500);
+});
+
 test("prependOlderEvents rejects a non-contiguous page", () => {
   const current = buildSession({
     ...sessionData([event(3), event(4)]),

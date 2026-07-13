@@ -26,6 +26,17 @@ async function writeTranscript(target) {
         "11. Time-travel forks — scrub session like video.",
         "12. Session diffing — compare two workers.",
         "",
+        "**Table section**",
+        "Label | Value",
+        "--- | ---",
+        "Alpha | Beta",
+        "",
+        "**Nested list section**",
+        "1. Parent item",
+        "  - Child one",
+        "  - Child two",
+        "2. Next item",
+        "",
         "**Another section**",
         "1. Already working.",
         "2. Still a list.",
@@ -85,12 +96,21 @@ async function main() {
     await orderedLists.first().waitFor({ state: "visible" });
     await orderedLists.nth(1).waitFor({ state: "visible" });
     await orderedLists.first().getByText("Time-travel forks").waitFor({ state: "visible" });
+    await assistant.locator("table").waitFor({ state: "visible" });
+    await assistant.locator("table").getByText("Label").waitFor({ state: "visible" });
+    await assistant.locator("table").getByText("Alpha").waitFor({ state: "visible" });
+    await assistant.locator("ol").nth(1).locator("ul").waitFor({ state: "visible" });
+    await assistant.locator("ol").nth(1).locator("ul > li").first().getByText("Child one").waitFor({ state: "visible" });
     await assistant.getByText("Still a list.", { exact: true }).waitFor({ state: "visible" });
     await assistant.locator("pre code", { hasText: "11. something inside a fence" }).waitFor({ state: "visible" });
     await assistant.locator("code", { hasText: "11. x" }).waitFor({ state: "visible" });
     const firstListStart = await orderedLists.first().evaluate((element) => element.getAttribute("start"));
     if (firstListStart !== "11") {
       throw new Error(`Expected the repaired ordered list to preserve start=11, saw ${firstListStart}`);
+    }
+    const secondListStart = await orderedLists.nth(1).evaluate((element) => element.getAttribute("start"));
+    if (secondListStart !== null) {
+      throw new Error(`Expected the plain ordered list to omit a start attribute for item 1, saw ${secondListStart}`);
     }
 
     const screenshotPath = path.join(OUT_DIR, "wiki-97-transcript-markdown.png");
@@ -103,6 +123,8 @@ async function main() {
         {
           screenshot: screenshotPath,
           listRoot: "ordered list starts at 11 after a bold lead-in",
+          table: "table renders after prose without literal pipes",
+          nestedList: "two-space child bullets nest under ordered items",
         },
         null,
         2

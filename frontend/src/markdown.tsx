@@ -149,12 +149,12 @@ function isOrderedListLine(line: string) {
   return matchOrderedListLine(line) !== null;
 }
 
-function needsOrderedListSeparator(line: string) {
-  return Number(matchOrderedListLine(line)?.[1] ?? 0) > 1;
-}
-
 function isBulletListLine(line: string) {
   return /^\s*[-+*]\s+/.test(line);
+}
+
+function needsOrderedListSeparator(line: string) {
+  return Number(matchOrderedListLine(line)?.[1] ?? 0) > 1;
 }
 
 function isNestedListLine(line: string) {

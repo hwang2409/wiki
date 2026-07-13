@@ -216,7 +216,26 @@ export function mergeSession(
     result.patches.length === 0 &&
     result.base < current.base
   ) {
-    return mergeSessionState(current, result, current.base, current.events, current.events.length);
+    return mergeSessionState(
+      current,
+      { ...result, has_older: current.hasOlder || Boolean(result.has_older) },
+      current.base,
+      current.events,
+      current.events.length,
+    );
+  }
+  if (
+    result.events.length === 0 &&
+    result.patches.length === 0 &&
+    result.base < current.base
+  ) {
+    return mergeSessionState(
+      current,
+      { ...result, has_older: current.hasOlder || Boolean(result.has_older) },
+      current.base,
+      current.events,
+      current.events.length,
+    );
   }
 
   let base = current.base;
