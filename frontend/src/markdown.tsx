@@ -132,6 +132,131 @@ export function rehypeEscapeRawHtml() {
   };
 }
 
+function isFenceLine(line: string, fence: "`" | "~" | null) {
+  const match = /^(\s*)([`~]{3,})(.*)$/.exec(line);
+  if (!match) return null;
+
+  const marker = match[2][0] as "`" | "~";
+  if (fence && marker !== fence) return null;
+  return { marker, length: match[2].length };
+}
+
+function matchOrderedListLine(line: string) {
+  return /^(\d+)\.\s+/.exec(line);
+}
+
+function isOrderedListLine(line: string) {
+  return matchOrderedListLine(line) !== null;
+}
+
+function isBulletListLine(line: string) {
+  return /^\s*[-+*]\s+/.test(line);
+}
+
+function needsOrderedListSeparator(line: string) {
+  return Number(matchOrderedListLine(line)?.[1] ?? 0) > 1;
+}
+
+function isNestedListLine(line: string) {
+  return /^ {2}(?:[-+*]|\d+\.)\s+/.test(line);
+}
+
+function isTableDelimiterLine(line: string) {
+  return /^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$/.test(line);
+}
+
+function isTableStartLine(line: string, nextLine?: string) {
+  return Boolean(nextLine && line.includes("|") && isTableDelimiterLine(nextLine));
+}
+
+function isTranscriptTextLine(line: string) {
+  return !isOrderedListLine(line) && !isBulletListLine(line) && !isTableDelimiterLine(line) && !line.includes("|");
+}
+
+export function prepareTranscriptMarkdown(content: string) {
+  const lines = content.split(/\r?\n/);
+  const output: string[] = [];
+  let fence: "`" | "~" | null = null;
+  let fenceLength = 0;
+  let previousWasText = false;
+  let tableBlock = false;
+  let orderedContext = false;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const originalLine = lines[index];
+    const nextLine = lines[index + 1];
+    let line = originalLine;
+
+    const fenceMatch = fence ? isFenceLine(line, fence) : null;
+    if (fenceMatch && fenceMatch.length >= fenceLength) {
+      output.push(line);
+      fence = null;
+      fenceLength = 0;
+      previousWasText = false;
+      continue;
+    }
+
+    if (fence) {
+      output.push(line);
+      continue;
+    }
+
+    const openingFence = isFenceLine(line, null);
+    if (openingFence) {
+      output.push(line);
+      fence = openingFence.marker;
+      fenceLength = openingFence.length;
+      previousWasText = false;
+      continue;
+    }
+
+    if (tableBlock) {
+      output.push(line);
+      previousWasText = false;
+      if (line.trim() === "") {
+        tableBlock = false;
+      }
+      continue;
+    }
+
+    if (line.trim() === "") {
+      output.push(line);
+      previousWasText = false;
+      continue;
+    }
+
+    if (previousWasText && isTableStartLine(line, nextLine)) {
+      output.push("");
+    }
+
+    if (orderedContext && isNestedListLine(line)) {
+      line = `  ${line}`;
+    }
+
+    if (isTableStartLine(line, nextLine)) {
+      output.push(line);
+      tableBlock = true;
+      previousWasText = false;
+      continue;
+    }
+
+    if (previousWasText && needsOrderedListSeparator(line)) {
+      output.push("");
+    }
+
+    output.push(line);
+    previousWasText = isTranscriptTextLine(line);
+
+    if (isOrderedListLine(line)) {
+      orderedContext = true;
+    } else if (!line.startsWith(" ") && !line.includes("|") && !isBulletListLine(line) && !isTableDelimiterLine(line)) {
+      orderedContext = false;
+    }
+  }
+
+  return output.join("\n");
+}
+
 export type NoteProperties = Array<[string, string | string[]]>;
 
 const frontmatterPattern = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/;
