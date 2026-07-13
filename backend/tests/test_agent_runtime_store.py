@@ -1021,6 +1021,15 @@ class RunStoreTests(unittest.TestCase):
                 json.dumps({"state": "merge-ready", "step": "done", "pr": "https://example/pr/42"}),
                 encoding="utf-8",
             )
+            artifact_dir = store.run_dir(record.run_id) / "artifacts"
+            artifact_dir.mkdir(mode=0o700)
+            artifact_path = artifact_dir / "00000000-0000-4000-8000-000000000085.png"
+            artifact_path.write_bytes(b"artifact-png")
+            artifact_path.chmod(0o600)
+            outside = root / "outside.jpg"
+            outside.write_bytes(b"must-not-be-copied")
+            linked_artifact = artifact_dir / "00000000-0000-4000-8000-000000000086.jpg"
+            linked_artifact.symlink_to(outside)
 
             archived, session_dir = store.archive_current(
                 record.run_id,
@@ -1035,6 +1044,10 @@ class RunStoreTests(unittest.TestCase):
             self.assertTrue((session_dir / "raw.jsonl").is_file())
             self.assertTrue((session_dir / "events.jsonl").is_file())
             self.assertTrue((session_dir / "cdx-WIKI-42.log").is_file())
+            archived_artifact = session_dir / "artifacts" / artifact_path.name
+            self.assertEqual(archived_artifact.read_bytes(), b"artifact-png")
+            self.assertEqual(archived_artifact.stat().st_mode & 0o777, 0o600)
+            self.assertTrue((session_dir / "artifacts" / linked_artifact.name).is_symlink())
             self.assertEqual(
                 (session_dir / "cdx-WIKI-42-prompt.md").read_text(encoding="utf-8"),
                 "Work on ticket WIKI-42",

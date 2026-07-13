@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -1563,6 +1563,75 @@ def _serve_image(directory: Path, name: str) -> FileResponse:
     if not target.is_file():
         raise HTTPException(status_code=404, detail="Not found")
     return FileResponse(target)
+
+
+ARTIFACT_MEDIA_TYPES = {
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "webp": "image/webp",
+}
+
+
+def _canonical_artifact_id(value: str) -> str | None:
+    try:
+        parsed = UUID(value)
+    except (ValueError, AttributeError):
+        return None
+    return value if str(parsed) == value else None
+
+
+def _artifact_file(directory: Path, artifact_id: str) -> tuple[Path, str] | None:
+    if directory.is_symlink() or not directory.is_dir():
+        return None
+    for extension, media_type in ARTIFACT_MEDIA_TYPES.items():
+        candidate = directory / f"{artifact_id}.{extension}"
+        if candidate.is_file() and not candidate.is_symlink():
+            return candidate, media_type
+    return None
+
+
+@app.get("/api/agents/{ticket}/artifact/{artifact_id}")
+def get_agent_artifact(ticket: str, artifact_id: str) -> FileResponse:
+    if not valid_agent_id(ticket) or _canonical_artifact_id(artifact_id) is None:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+
+    registry_match = _registry_agent(_read_agent_registry(), ticket)
+    if registry_match is not None:
+        canonical_ticket, _, current = registry_match
+        run_id = current.get("run_id")
+        try:
+            canonical_run_id = str(UUID(str(run_id)))
+        except (ValueError, AttributeError):
+            canonical_run_id = ""
+        if canonical_run_id and canonical_run_id == run_id:
+            live = _artifact_file(
+                SUPERVISOR_CLIENT.paths.runtime_dir
+                / "runs"
+                / canonical_run_id
+                / "artifacts",
+                artifact_id,
+            )
+            if live is not None:
+                target, media_type = live
+                return FileResponse(
+                    target,
+                    media_type=media_type,
+                    headers={"Cache-Control": "private, max-age=3600"},
+                )
+    else:
+        canonical_ticket = ticket.upper()
+
+    _, _, archive_dir = _archive_hint(canonical_ticket)
+    if archive_dir is not None:
+        archived = _artifact_file(archive_dir / "artifacts", artifact_id)
+        if archived is not None:
+            target, media_type = archived
+            return FileResponse(
+                target,
+                media_type=media_type,
+                headers={"Cache-Control": "private, max-age=3600"},
+            )
+    raise HTTPException(status_code=404, detail="Artifact not found")
 
 
 @app.get("/api/uploads/{name}")

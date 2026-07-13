@@ -348,6 +348,29 @@ export type ProviderEventInspector = {
   raw?: ProviderRawEvent[] | null;
 };
 
+export type ArtifactKind = "mermaid" | "svg" | "image" | "table" | "plot" | "code";
+
+export type ArtifactColumn = {
+  key: string;
+  label: string;
+  type: "string" | "number" | "date" | "link";
+};
+
+export type SessionArtifact = {
+  kind: ArtifactKind;
+  source?: string;
+  ref?: string;
+  mime?: "image/png" | "image/jpeg" | "image/webp";
+  byte_size?: number;
+  data_base64?: string;
+  columns?: ArtifactColumn[];
+  rows?: (string | number | boolean | null)[][];
+  spec_vega_lite?: Record<string, unknown>;
+  language?: string;
+  filename?: string;
+  diff_from?: string;
+};
+
 export type SessionEvent = {
   id: number;
   kind:
@@ -364,7 +387,8 @@ export type SessionEvent = {
     | "interrupt"
     | "pr"
     | "marker"
-    | "question";
+    | "question"
+    | "artifact";
   ts: string | null;
   text: string;
   disposition: SessionDisposition;
@@ -375,6 +399,10 @@ export type SessionEvent = {
   marker?: string;
   encrypted?: boolean;
   question?: SessionQuestion;
+  artifact_id?: string;
+  title?: string | null;
+  caption?: string | null;
+  artifact?: SessionArtifact;
 };
 
 export type SubagentInfo = {

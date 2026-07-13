@@ -80,6 +80,11 @@ def start_parent_watchdog(server: uvicorn.Server, parent_pid: int | None) -> Non
 
 
 def main() -> None:
+    if "--wiki-artifacts-mcp" in sys.argv[1:]:
+        from backend.app.wiki_artifacts import main as artifacts_main
+
+        artifacts_main()
+        return
     # The frozen supervisor autostart (agent_runtime/client.py) re-execs this
     # binary with --supervisor; route to the daemon before backend argparse.
     if "--supervisor" in sys.argv[1:]:

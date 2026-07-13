@@ -1,0 +1,542 @@
+import { useEffect, useId, useMemo, useRef, useState } from "react";
+import type { ReactNode } from "react";
+import {
+  BarChart3,
+  ChevronDown,
+  Code2,
+  Copy,
+  Download,
+  FileJson,
+  GitBranch,
+  Image as ImageIcon,
+  Info,
+  Shapes,
+  Table2,
+  X,
+} from "lucide-react";
+import type { LucideIcon } from "lucide-react";
+import type { ArtifactColumn, ArtifactKind, SessionArtifact, SessionEvent } from "./api";
+import { ShikiCode, useCurrentTheme } from "./shiki";
+
+const TABLE_ROW_HEIGHT = 32;
+const TABLE_VIEWPORT_HEIGHT = 320;
+const TABLE_OVERSCAN = 8;
+const SVG_TAGS = [
+  "svg",
+  "g",
+  "path",
+  "rect",
+  "circle",
+  "ellipse",
+  "line",
+  "polyline",
+  "polygon",
+  "text",
+  "tspan",
+  "defs",
+  "use",
+  "symbol",
+  "title",
+  "desc",
+  "style",
+  "lineargradient",
+  "radialgradient",
+  "stop",
+  "pattern",
+  "clippath",
+  "mask",
+  "image",
+  "marker",
+];
+
+const KIND_ICONS: Record<ArtifactKind, LucideIcon> = {
+  mermaid: GitBranch,
+  svg: Shapes,
+  image: ImageIcon,
+  table: Table2,
+  plot: BarChart3,
+  code: Code2,
+};
+
+function artifactUrl(ticket: string, event: SessionEvent): string {
+  return `/api/agents/${encodeURIComponent(ticket)}/artifact/${encodeURIComponent(event.artifact_id ?? "")}`;
+}
+
+function csvCell(value: unknown): string {
+  const text = value == null ? "" : String(value);
+  return /[",\n\r]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+}
+
+function tableText(
+  artifact: SessionArtifact,
+  format: "tsv" | "csv" | "json"
+): string {
+  const columns = artifact.columns ?? [];
+  const rows = artifact.rows ?? [];
+  if (format === "json") {
+    return JSON.stringify(
+      rows.map((row) => Object.fromEntries(columns.map((column, index) => [column.key, row[index] ?? null]))),
+      null,
+      2
+    );
+  }
+  const separator = format === "tsv" ? "\t" : ",";
+  const encode = format === "tsv" ? (value: unknown) => String(value ?? "") : csvCell;
+  return [
+    columns.map((column) => encode(column.label)).join(separator),
+    ...rows.map((row) => row.map(encode).join(separator)),
+  ].join("\n");
+}
+
+function textPayload(artifact: SessionArtifact): string {
+  switch (artifact.kind) {
+    case "mermaid":
+    case "svg":
+    case "code":
+      return artifact.source ?? "";
+    case "table":
+      return tableText(artifact, "tsv");
+    case "plot":
+      return JSON.stringify(artifact.spec_vega_lite ?? {}, null, 2);
+    case "image":
+      return artifact.data_base64 ?? artifact.ref ?? "";
+  }
+}
+
+async function imageBase64(url: string): Promise<string> {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`Image download failed (${response.status})`);
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+  }
+  return btoa(binary);
+}
+
+function downloadName(event: SessionEvent): string {
+  const artifact = event.artifact!;
+  const base = (event.title || `artifact-${event.artifact_id?.slice(0, 8) || artifact.kind}`)
+    .replace(/[^a-zA-Z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "artifact";
+  if (artifact.kind === "code" && artifact.filename) {
+    return artifact.filename.split(/[\\/]/).pop() || `${base}.txt`;
+  }
+  const extension = {
+    mermaid: "mmd",
+    svg: "svg",
+    image: artifact.mime === "image/jpeg" ? "jpg" : artifact.mime?.split("/")[1] || "png",
+    table: "csv",
+    plot: "json",
+    code: artifact.language?.replace(/[^a-zA-Z0-9]/g, "") || "txt",
+  }[artifact.kind];
+  return `${base}.${extension}`;
+}
+
+function MermaidRenderer({ source }: { source: string }) {
+  const theme = useCurrentTheme();
+  const reactId = useId();
+  const [html, setHtml] = useState("");
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const id = `wiki-artifact-${reactId.replace(/[^a-zA-Z0-9_-]/g, "")}`;
+    void import("mermaid").then(async ({ default: mermaid }) => {
+      try {
+        mermaid.initialize({
+          startOnLoad: false,
+          securityLevel: "strict",
+          theme: theme.includes("light") ? "default" : "dark",
+          fontFamily: getComputedStyle(document.documentElement).getPropertyValue("--font-monospace"),
+        });
+        const rendered = await mermaid.render(id, source);
+        if (!cancelled) {
+          setHtml(rendered.svg);
+          setError(null);
+        }
+      } catch (reason) {
+        if (!cancelled) {
+          setHtml("");
+          setError(reason instanceof Error ? reason.message : "Mermaid could not render this source.");
+        }
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [reactId, source, theme]);
+
+  if (error) return <div className="artifact-error">{error}</div>;
+  if (!html) return <div className="artifact-loading">Rendering diagram…</div>;
+  return <div className="artifact-mermaid" dangerouslySetInnerHTML={{ __html: html }} />;
+}
+
+function SvgRenderer({ source }: { source: string }) {
+  const [html, setHtml] = useState("");
+  useEffect(() => {
+    let cancelled = false;
+    void import("dompurify").then(({ default: DOMPurify }) => {
+      const sanitized = DOMPurify.sanitize(source, {
+        ALLOWED_TAGS: SVG_TAGS,
+        FORBID_TAGS: ["script", "foreignObject", "iframe"],
+      });
+      if (!cancelled) setHtml(sanitized);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [source]);
+  if (!html) return <div className="artifact-loading">Sanitizing SVG…</div>;
+  return <div className="artifact-svg" dangerouslySetInnerHTML={{ __html: html }} />;
+}
+
+function ImageRenderer({ artifact, event, ticket }: ArtifactRendererProps) {
+  const source = artifact.data_base64
+    ? `data:${artifact.mime ?? "image/png"};base64,${artifact.data_base64}`
+    : artifactUrl(ticket, event);
+  return <img alt={event.title || event.caption || "Agent artifact"} className="artifact-image" loading="lazy" src={source} />;
+}
+
+function compareCells(left: unknown, right: unknown, column: ArtifactColumn): number {
+  if (column.type === "number") return Number(left ?? 0) - Number(right ?? 0);
+  if (column.type === "date") {
+    return new Date(String(left ?? "")).getTime() - new Date(String(right ?? "")).getTime();
+  }
+  return String(left ?? "").localeCompare(String(right ?? ""), undefined, {
+    numeric: true,
+    sensitivity: "base",
+  });
+}
+
+function safeTableLink(value: string): string | null {
+  try {
+    const url = new URL(value, window.location.origin);
+    return ["http:", "https:", "mailto:"].includes(url.protocol) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function TableRenderer({ artifact }: { artifact: SessionArtifact }) {
+  const columns = artifact.columns ?? [];
+  const rows = artifact.rows ?? [];
+  const [sort, setSort] = useState<{ index: number; direction: 1 | -1 } | null>(null);
+  const [scrollTop, setScrollTop] = useState(0);
+  const sortedRows = useMemo(() => {
+    if (!sort) return rows;
+    const column = columns[sort.index];
+    if (!column) return rows;
+    return rows
+      .map((row, index) => ({ row, index }))
+      .sort((left, right) => {
+        const compared = compareCells(left.row[sort.index], right.row[sort.index], column);
+        return compared === 0 ? left.index - right.index : compared * sort.direction;
+      })
+      .map(({ row }) => row);
+  }, [columns, rows, sort]);
+  const start = Math.max(0, Math.floor(scrollTop / TABLE_ROW_HEIGHT) - TABLE_OVERSCAN);
+  const visibleCount = Math.ceil(TABLE_VIEWPORT_HEIGHT / TABLE_ROW_HEIGHT) + TABLE_OVERSCAN * 2;
+  const end = Math.min(sortedRows.length, start + visibleCount);
+  const visible = sortedRows.slice(start, end);
+
+  return (
+    <div
+      className="artifact-table-scroll"
+      onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
+      style={{ maxHeight: TABLE_VIEWPORT_HEIGHT }}
+    >
+      <table className="artifact-table tabular-nums">
+        <thead>
+          <tr>
+            {columns.map((column, index) => {
+              const active = sort?.index === index;
+              return (
+                <th className={`is-${column.type}`} key={column.key}>
+                  <button
+                    aria-label={`Sort by ${column.label}`}
+                    type="button"
+                    onClick={() =>
+                      setSort((current) => ({
+                        index,
+                        direction: current?.index === index && current.direction === 1 ? -1 : 1,
+                      }))
+                    }
+                  >
+                    {column.label}
+                    {active ? <span aria-hidden="true">{sort.direction === 1 ? "↑" : "↓"}</span> : null}
+                  </button>
+                </th>
+              );
+            })}
+          </tr>
+        </thead>
+        <tbody>
+          {start > 0 ? (
+            <tr aria-hidden="true" className="artifact-table-spacer">
+              <td colSpan={columns.length} style={{ height: start * TABLE_ROW_HEIGHT }} />
+            </tr>
+          ) : null}
+          {visible.map((row, rowOffset) => (
+            <tr key={start + rowOffset}>
+              {columns.map((column, columnIndex) => {
+                const value = row[columnIndex];
+                const link = column.type === "link" && typeof value === "string" ? safeTableLink(value) : null;
+                return (
+                  <td className={`is-${column.type}`} key={column.key}>
+                    {link ? (
+                      <a href={link} rel="noreferrer" target="_blank">{value}</a>
+                    ) : column.type === "date" && value ? (
+                      <time dateTime={String(value)}>{new Date(String(value)).toLocaleString()}</time>
+                    ) : (
+                      String(value ?? "")
+                    )}
+                  </td>
+                );
+              })}
+            </tr>
+          ))}
+          {end < sortedRows.length ? (
+            <tr aria-hidden="true" className="artifact-table-spacer">
+              <td colSpan={columns.length} style={{ height: (sortedRows.length - end) * TABLE_ROW_HEIGHT }} />
+            </tr>
+          ) : null}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function PlotRenderer({ spec }: { spec: Record<string, unknown> }) {
+  const theme = useCurrentTheme();
+  const container = useRef<HTMLDivElement>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    const target = container.current;
+    if (!target) return;
+    let finalized = false;
+    let finalize: (() => void) | undefined;
+    const styles = getComputedStyle(document.documentElement);
+    const text = styles.getPropertyValue("--text-normal").trim();
+    const muted = styles.getPropertyValue("--text-muted").trim();
+    const border = styles.getPropertyValue("--background-modifier-border").trim();
+    const background = styles.getPropertyValue("--background-primary").trim();
+    const accent = styles.getPropertyValue("--accent-primary").trim();
+    const font = styles.getPropertyValue("--font-monospace").trim();
+    const sourceConfig: Record<string, unknown> =
+      typeof spec.config === "object" && spec.config ? spec.config as Record<string, unknown> : {};
+    const sourceAxis = typeof sourceConfig.axis === "object" && sourceConfig.axis ? sourceConfig.axis : {};
+    const sourceLegend = typeof sourceConfig.legend === "object" && sourceConfig.legend ? sourceConfig.legend : {};
+    const sourceTitle = typeof sourceConfig.title === "object" && sourceConfig.title ? sourceConfig.title : {};
+    const sourceRange = typeof sourceConfig.range === "object" && sourceConfig.range ? sourceConfig.range : {};
+    const themedSpec = {
+      ...spec,
+      background,
+      config: {
+        ...sourceConfig,
+        font,
+        background,
+        axis: { ...sourceAxis, domainColor: border, gridColor: border, labelColor: muted, titleColor: text },
+        legend: { ...sourceLegend, labelColor: muted, titleColor: text },
+        title: { ...sourceTitle, color: text, font },
+        range: { ...sourceRange, category: [accent, text, muted, border] },
+      },
+    };
+    void import("vega-embed").then(async ({ default: embed }) => {
+      try {
+        const result = await embed(target, themedSpec, { actions: false, renderer: "svg" });
+        finalize = result.finalize;
+        if (!finalized) setError(null);
+      } catch (reason) {
+        if (!finalized) setError(reason instanceof Error ? reason.message : "Plot could not render this spec.");
+      }
+    });
+    return () => {
+      finalized = true;
+      finalize?.();
+      target.replaceChildren();
+    };
+  }, [spec, theme]);
+  return error ? <div className="artifact-error">{error}</div> : <div className="artifact-plot" ref={container} />;
+}
+
+function CodeRenderer({ artifact }: { artifact: SessionArtifact }) {
+  const [code, setCode] = useState(artifact.source ?? "");
+  const isDiff = artifact.diff_from !== undefined;
+  useEffect(() => {
+    if (!isDiff) {
+      setCode(artifact.source ?? "");
+      return;
+    }
+    let cancelled = false;
+    void import("diff").then(({ createTwoFilesPatch }) => {
+      const filename = artifact.filename || "artifact";
+      const patch = createTwoFilesPatch(
+        filename,
+        filename,
+        artifact.diff_from ?? "",
+        artifact.source ?? "",
+        "before",
+        "after",
+        { context: 3 }
+      );
+      if (!cancelled) setCode(patch);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [artifact.diff_from, artifact.filename, artifact.source, isDiff]);
+  return (
+    <div className="artifact-code" data-diff={isDiff || undefined}>
+      {artifact.filename ? <div className="artifact-code-filename">{artifact.filename}</div> : null}
+      <ShikiCode code={code} lang={isDiff ? "diff" : artifact.language} />
+    </div>
+  );
+}
+
+type ArtifactRendererProps = {
+  artifact: SessionArtifact;
+  event: SessionEvent;
+  ticket: string;
+};
+
+function ArtifactRenderer(props: ArtifactRendererProps): ReactNode {
+  const { artifact } = props;
+  switch (artifact.kind) {
+    case "mermaid":
+      return <MermaidRenderer source={artifact.source ?? ""} />;
+    case "svg":
+      return <SvgRenderer source={artifact.source ?? ""} />;
+    case "image":
+      return <ImageRenderer {...props} />;
+    case "table":
+      return <TableRenderer artifact={artifact} />;
+    case "plot":
+      return <PlotRenderer spec={artifact.spec_vega_lite ?? {}} />;
+    case "code":
+      return <CodeRenderer artifact={artifact} />;
+  }
+}
+
+function TableCopyMenu({ artifact, onCopied }: { artifact: SessionArtifact; onCopied: () => void }) {
+  const [open, setOpen] = useState(false);
+  async function copy(format: "tsv" | "csv" | "json") {
+    await navigator.clipboard.writeText(tableText(artifact, format));
+    setOpen(false);
+    onCopied();
+  }
+  return (
+    <div className="artifact-copy-menu">
+      <button aria-expanded={open} className="artifact-action" type="button" onClick={() => setOpen((value) => !value)}>
+        <Copy size={12} /> Copy <ChevronDown size={11} />
+      </button>
+      {open ? (
+        <div className="artifact-copy-options" role="menu">
+          <button type="button" role="menuitem" onClick={() => void copy("tsv")}>Copy as TSV</button>
+          <button type="button" role="menuitem" onClick={() => void copy("csv")}>Copy as CSV</button>
+          <button type="button" role="menuitem" onClick={() => void copy("json")}>Copy as JSON</button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+export function ArtifactBlock({ event, ticket }: { event: SessionEvent; ticket: string }) {
+  const artifact = event.artifact;
+  const [inspect, setInspect] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const copiedTimer = useRef<number | null>(null);
+  useEffect(() => () => {
+    if (copiedTimer.current !== null) window.clearTimeout(copiedTimer.current);
+  }, []);
+  if (!artifact) return <div className="artifact-error">Artifact payload missing.</div>;
+  const resolvedArtifact = artifact;
+  const Icon = KIND_ICONS[resolvedArtifact.kind] ?? FileJson;
+  const rowCount = resolvedArtifact.kind === "table" ? resolvedArtifact.rows?.length ?? 0 : null;
+
+  function showCopied() {
+    setCopied(true);
+    if (copiedTimer.current !== null) window.clearTimeout(copiedTimer.current);
+    copiedTimer.current = window.setTimeout(() => setCopied(false), 1400);
+  }
+
+  async function copy() {
+    const value =
+      resolvedArtifact.kind === "image" && !resolvedArtifact.data_base64
+        ? await imageBase64(artifactUrl(ticket, event))
+        : textPayload(resolvedArtifact);
+    await navigator.clipboard.writeText(value);
+    showCopied();
+  }
+
+  async function download() {
+    let blob: Blob;
+    if (resolvedArtifact.kind === "image" && !resolvedArtifact.data_base64) {
+      const response = await fetch(artifactUrl(ticket, event));
+      if (!response.ok) throw new Error(`Image download failed (${response.status})`);
+      blob = await response.blob();
+    } else if (resolvedArtifact.kind === "image" && resolvedArtifact.data_base64) {
+      const response = await fetch(`data:${resolvedArtifact.mime};base64,${resolvedArtifact.data_base64}`);
+      blob = await response.blob();
+    } else {
+      const text = resolvedArtifact.kind === "table" ? tableText(resolvedArtifact, "csv") : textPayload(resolvedArtifact);
+      blob = new Blob([text], { type: resolvedArtifact.kind === "svg" ? "image/svg+xml" : "text/plain;charset=utf-8" });
+    }
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = downloadName(event);
+    anchor.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+  }
+
+  return (
+    <div className={`artifact-block-shell${inspect ? " has-inspect" : ""}`}>
+      <section className="artifact-block" data-artifact-kind={resolvedArtifact.kind}>
+        <header className="artifact-header">
+          <div className="artifact-heading">
+            <Icon size={14} />
+            <div>
+              <div className="artifact-title">{event.title || resolvedArtifact.kind}</div>
+              {event.caption ? <div className="artifact-caption">{event.caption}</div> : null}
+            </div>
+            {rowCount !== null ? <span className="artifact-count tabular-nums">{rowCount} rows</span> : null}
+          </div>
+          <div className="artifact-actions">
+            {resolvedArtifact.kind === "table" ? (
+              <TableCopyMenu artifact={resolvedArtifact} onCopied={showCopied} />
+            ) : (
+              <button className="artifact-action" type="button" onClick={() => void copy()}>
+                <Copy size={12} /> {copied ? "Copied" : "Copy"}
+              </button>
+            )}
+            <button className="artifact-action" type="button" onClick={() => void download()}>
+              <Download size={12} /> Download
+            </button>
+            <button
+              aria-expanded={inspect}
+              className={`artifact-action${inspect ? " is-active" : ""}`}
+              type="button"
+              onClick={() => setInspect((value) => !value)}
+            >
+              <Info size={12} /> Inspect
+            </button>
+          </div>
+        </header>
+        <div className="artifact-body">
+          <ArtifactRenderer artifact={resolvedArtifact} event={event} ticket={ticket} />
+        </div>
+      </section>
+      {inspect ? (
+        <aside aria-label="Artifact inspector" className="artifact-inspect-panel">
+          <header>
+            <span>Artifact event</span>
+            <button aria-label="Close artifact inspector" type="button" onClick={() => setInspect(false)}><X size={13} /></button>
+          </header>
+          <pre>{JSON.stringify(event, null, 2)}</pre>
+        </aside>
+      ) : null}
+    </div>
+  );
+}
