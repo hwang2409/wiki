@@ -13,7 +13,7 @@ import {
   type SessionTask,
   type SubagentInfo,
 } from "./api";
-import { mergeQueueSources, mergeSession } from "./transcript-merge";
+import { mergeQueueSources, mergeSession, prependOlderEvents } from "./transcript-merge";
 
 const POLL_MS = 2500;
 const PENDING_RECONCILE_WINDOW_MS = 30_000;
@@ -220,15 +220,23 @@ export async function loadOlderEvents(ticket: string, before: number, count = 50
   const result = await getAgentOlderSession(ticket, before, count);
   const current = entry.snapshot.session;
   if (!current || current.path !== result.path || current.base !== before) return;
+  const merged = prependOlderEvents(current, result, before);
+  if (!merged) {
+    const reset = await getAgentSession(ticket, 0);
+    const latest = entry.snapshot.session;
+    if (!latest || latest.path !== current.path || latest.base !== before) return;
+    entry.snapshot = {
+      ...entry.snapshot,
+      session: mergeSession(null, reset),
+      error: null,
+      loading: false,
+    };
+    emit(entry);
+    return;
+  }
   entry.snapshot = {
     ...entry.snapshot,
-    session: {
-      ...current,
-      base: result.base,
-      events: [...result.events, ...current.events],
-      eventsChangedFrom: 0,
-      hasOlder: result.has_older,
-    },
+    session: merged,
   };
   emit(entry);
 }

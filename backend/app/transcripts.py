@@ -1724,7 +1724,26 @@ def read_session_events(fmt: str, path: Path) -> dict:
         }
 
 
-def read_session_delta(fmt: str, path: Path, cursor: int = 0) -> dict:
+def _snapshot_events(events: list[dict]) -> list[dict]:
+    """Copy event objects and the nested leaves parsers mutate in place."""
+    snapshot: list[dict] = []
+    for event in events:
+        copied = dict(event)
+        for key in ("tool", "question"):
+            value = event.get(key)
+            if isinstance(value, dict):
+                copied[key] = dict(value)
+        snapshot.append(copied)
+    return snapshot
+
+
+def read_session_delta(
+    fmt: str,
+    path: Path,
+    cursor: int = 0,
+    *,
+    tail_window: bool = True,
+) -> dict:
     key = str(path)
     with _cache_lock_for(key):
         state = _read_cached_state(fmt, path, key)
@@ -1746,11 +1765,11 @@ def read_session_delta(fmt: str, path: Path, cursor: int = 0) -> dict:
                     full_reset = True
 
         if full_reset:
-            window_base = max(base, total - TAIL_WINDOW_EVENTS)
+            window_base = max(base, total - TAIL_WINDOW_EVENTS) if tail_window else base
             return {
-                # Callers treat this parser-owned view as read-only. Keep the
-                # slice shallow so initial reads do not clone nested payloads.
-                "events": events[window_base - base :],
+                # Snapshot only the event objects and mutable nested leaves;
+                # avoid a recursive clone of large immutable payloads.
+                "events": _snapshot_events(events[window_base - base :]),
                 "base": window_base,
                 "tokens": state["tokens"],
                 "tasks": tasks,
@@ -1774,7 +1793,7 @@ def read_session_delta(fmt: str, path: Path, cursor: int = 0) -> dict:
 
         if tail_from < base:
             return {
-                "events": list(events),
+                "events": _snapshot_events(events),
                 "base": base,
                 "tokens": state["tokens"],
                 "tasks": tasks,
@@ -1833,7 +1852,7 @@ def read_older_session(
         end = min(max(before, base), total)
         start = max(base, end - max(1, count))
         return {
-            "events": events[start - base : end - base],
+            "events": _snapshot_events(events[start - base : end - base]),
             "base": start,
             "has_older": start > base,
         }

@@ -1,4 +1,10 @@
-import type { AgentSessionData, QueuedMessage, SessionEvent, SessionPatch } from "./api";
+import type {
+  AgentOlderSessionData,
+  AgentSessionData,
+  QueuedMessage,
+  SessionEvent,
+  SessionPatch,
+} from "./api";
 import type { TranscriptSession } from "./transcript-store";
 
 export function buildSession(result: AgentSessionData): TranscriptSession {
@@ -38,6 +44,101 @@ export function mergeQueueSources(current: QueuedMessage[], next: QueuedMessage[
     ...message,
     source: message.source ?? sources.get(`${message.queued_at}\u0000${message.text}`),
   }));
+}
+
+function sameJsonValue(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return Array.isArray(left)
+      && Array.isArray(right)
+      && left.length === right.length
+      && left.every((value, index) => sameJsonValue(value, right[index]));
+  }
+  if (!left || !right || typeof left !== "object" || typeof right !== "object") return false;
+  const leftRecord = left as Record<string, unknown>;
+  const rightRecord = right as Record<string, unknown>;
+  const leftKeys = Object.keys(leftRecord);
+  const rightKeys = Object.keys(rightRecord);
+  return leftKeys.length === rightKeys.length
+    && leftKeys.every((key) => Object.prototype.hasOwnProperty.call(rightRecord, key)
+      && sameJsonValue(leftRecord[key], rightRecord[key]));
+}
+
+function mergeSessionState(
+  current: TranscriptSession,
+  result: AgentSessionData,
+  base: number,
+  events: SessionEvent[],
+  eventsChangedFrom: number,
+): TranscriptSession {
+  const next: TranscriptSession = {
+    ...current,
+    format: result.format,
+    path: result.path,
+    tokens: result.tokens,
+    model: result.model ?? current.model,
+    desiredModel: Object.prototype.hasOwnProperty.call(result, "desired_model")
+      ? result.desired_model ?? null
+      : current.desiredModel,
+    kind: result.kind ?? current.kind,
+    provider: result.provider ?? current.provider,
+    tasks: result.tasks ?? current.tasks,
+    pr: Object.prototype.hasOwnProperty.call(result, "pr")
+      ? result.pr ?? null
+      : current.pr,
+    sessionMeta: result.session_meta ?? current.sessionMeta,
+    dispositions: result.dispositions ?? current.dispositions,
+    providerInspector: result.provider_inspector ?? current.providerInspector,
+    base,
+    cursor: result.cursor,
+    events,
+    eventsChangedFrom,
+    hasOlder: result.has_older ?? current.hasOlder,
+    subagents: result.subagents ?? current.subagents,
+    queue: result.queue ? mergeQueueSources(current.queue, result.queue) : current.queue,
+    working: result.working ?? current.working,
+  };
+  const unchanged = next.format === current.format
+    && next.path === current.path
+    && next.tokens === current.tokens
+    && next.model === current.model
+    && next.desiredModel === current.desiredModel
+    && next.kind === current.kind
+    && next.provider === current.provider
+    && next.base === current.base
+    && next.cursor === current.cursor
+    && next.events === current.events
+    && next.hasOlder === current.hasOlder
+    && next.working === current.working
+    && sameJsonValue(next.tasks, current.tasks)
+    && sameJsonValue(next.pr, current.pr)
+    && sameJsonValue(next.sessionMeta, current.sessionMeta)
+    && sameJsonValue(next.dispositions, current.dispositions)
+    && sameJsonValue(next.providerInspector, current.providerInspector)
+    && sameJsonValue(next.subagents, current.subagents)
+    && sameJsonValue(next.queue, current.queue);
+  return unchanged ? current : next;
+}
+
+export function prependOlderEvents(
+  current: TranscriptSession,
+  result: AgentOlderSessionData,
+  before: number,
+): TranscriptSession | null {
+  if (
+    current.path !== result.path
+    || current.base !== before
+    || result.base + result.events.length !== before
+  ) {
+    return null;
+  }
+  return {
+    ...current,
+    base: result.base,
+    events: [...result.events, ...current.events],
+    eventsChangedFrom: 0,
+    hasOlder: result.has_older,
+  };
 }
 
 function applyPatches(
@@ -85,7 +186,7 @@ export function mergeSession(
     result.base === current.base &&
     result.path === current.path
   ) {
-    return current;
+    return mergeSessionState(current, result, current.base, current.events, current.events.length);
   }
   // The server may retain events older than the client's initial tail window.
   // That lower retention base is compatible with an unchanged loaded suffix.
@@ -95,12 +196,33 @@ export function mergeSession(
     result.patches.length === 0 &&
     result.base < current.base
   ) {
-    return current;
+    return mergeSessionState(current, result, current.base, current.events, current.events.length);
   }
 
   let base = current.base;
   let events = current.events;
   let changedFrom = events.length;
+
+  // A full reset after change-log overflow can start inside a client prefix
+  // loaded through older-page pagination. Preserve that still-contiguous
+  // prefix and replace only the suffix covered by the reset.
+  if (
+    result.tail_from === result.base
+    && result.base > base
+    && result.base <= clientEnd
+  ) {
+    const prefixLength = result.base - base;
+    events = events.slice(0, prefixLength).concat(result.events);
+    changedFrom = prefixLength;
+    const patched = applyPatches(events, result.patches);
+    return mergeSessionState(
+      current,
+      result,
+      base,
+      patched.events,
+      Math.min(changedFrom, patched.changedFrom),
+    );
+  }
 
   if (result.base > base) {
     const trim = result.base - base;
@@ -124,29 +246,5 @@ export function mergeSession(
   events = patched.events;
   changedFrom = Math.min(changedFrom, patched.changedFrom);
 
-  return {
-    ...current,
-    format: result.format,
-    path: result.path,
-    tokens: result.tokens,
-    model: result.model ?? current.model,
-    desiredModel: Object.prototype.hasOwnProperty.call(result, "desired_model")
-      ? result.desired_model ?? null
-      : current.desiredModel,
-    kind: result.kind ?? current.kind,
-    provider: result.provider ?? current.provider,
-    tasks: result.tasks ?? current.tasks,
-    pr: result.pr ?? current.pr,
-    sessionMeta: result.session_meta ?? current.sessionMeta,
-    dispositions: result.dispositions ?? current.dispositions,
-    providerInspector: result.provider_inspector ?? current.providerInspector,
-    base,
-    cursor: result.cursor,
-    events,
-    eventsChangedFrom: changedFrom,
-    hasOlder: result.has_older ?? current.hasOlder,
-    subagents: result.subagents ?? current.subagents,
-    queue: result.queue ? mergeQueueSources(current.queue, result.queue) : current.queue,
-    working: result.working ?? current.working,
-  };
+  return mergeSessionState(current, result, base, events, changedFrom);
 }

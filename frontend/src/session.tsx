@@ -2016,7 +2016,7 @@ export function SessionTab({
       if (!session) return [];
       return [...session.events, ...modelChangedMarkers(session)];
     },
-    [session],
+    [session?.events, session?.providerInspector],
   );
 
   const grouped = useMemo(() => {

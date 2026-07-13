@@ -220,6 +220,9 @@ export function buildVirtualLayoutIncremental(
   const keys = previous?.layout.keys.slice(0, changedFrom) ?? [];
   const tops = previous?.layout.tops.slice(0, changedFrom) ?? [];
   const sizes = previous?.layout.sizes.slice(0, changedFrom) ?? [];
+  // Rebuild this index for correctness after trims/reorders. This remains
+  // O(N), but it only stores numeric key/index pairs; height estimation and
+  // cumulative-top work below stay O(delta), which is the expensive path.
   const keyToIndex = new Map<number, number>();
   for (let index = 0; index < changedFrom; index += 1) keyToIndex.set(keys[index], index);
   let offset = changedFrom > 0 ? tops[changedFrom - 1] + sizes[changedFrom - 1] : 0;

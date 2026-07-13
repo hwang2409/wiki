@@ -1149,17 +1149,21 @@ def _overlay_pending_questions(
             "patches": [],
         }
 
+    combined_base = int(current["base"])
+    combined_events = [*current["events"], *assigned_overlay]
+    window_base = max(combined_base, total - transcripts.TAIL_WINDOW_EVENTS)
     return {
-        "events": [*current["events"], *assigned_overlay],
-        "base": int(current["base"]),
+        "events": combined_events[window_base - combined_base :],
+        "base": window_base,
         "tokens": current.get("tokens"),
         "tasks": current.get("tasks") or [],
         "pr": current.get("pr"),
         "session_meta": current.get("session_meta") or {},
         "dispositions": current.get("dispositions") or {"rendered": 0, "summarized": 0, "ignored": 0, "unknown": 0},
         "cursor": combined_cursor,
-        "tail_from": int(current["base"]),
+        "tail_from": window_base,
         "patches": [],
+        "has_older": window_base > combined_base,
     }
 
 
@@ -1232,9 +1236,15 @@ def _session_delta_payload(
     desired_model: str | None = None,
     kind: str | None = None,
     provider: str | None = None,
+    tail_window: bool = True,
 ) -> dict[str, object]:
     effective_cursor = 0 if client_path is not None and client_path != str(path) else cursor
-    result = transcripts.read_session_delta(fmt, path, effective_cursor)
+    result = transcripts.read_session_delta(
+        fmt,
+        path,
+        effective_cursor,
+        tail_window=tail_window,
+    )
     raw_path: Path | None = None
     if (
         isinstance(headless_current, dict)
@@ -1555,7 +1565,15 @@ def subagent_session(
     path = transcripts.subagents_dir(main_path) / f"agent-{agent_id}.jsonl"
     if not path.is_file():
         raise HTTPException(status_code=404, detail="No such subagent")
-    return _session_delta_payload("claude-sub", path, cursor=cursor, client_path=client_path)
+    # Subagent transcripts have no older-page route in the UI. Keep their
+    # initial response complete so tail-windowed events never become unreachable.
+    return _session_delta_payload(
+        "claude-sub",
+        path,
+        cursor=cursor,
+        client_path=client_path,
+        tail_window=False,
+    )
 
 
 UPLOAD_DIR = Path("/tmp/wiki-uploads")

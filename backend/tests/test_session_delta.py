@@ -55,11 +55,18 @@ class SessionDeltaTests(unittest.TestCase):
 
             result = transcripts.read_session_delta("codex", path, 0)
 
+            state["events"][2]["tool"] = {"output": None, "ok": None}
+            isolated = transcripts.read_session_delta("codex", path, 0)
+            state["events"][2]["text"] = "mutated after read"
+            state["events"][2]["tool"]["output"] = "late output"
+
             self.assertEqual(result["base"], 2)
             self.assertEqual(result["tail_from"], 2)
             self.assertEqual([event["id"] for event in result["events"]], [2, 3, 4])
             self.assertTrue(result["has_older"])
-            self.assertIs(result["events"][0], state["events"][2])
+            self.assertIsNot(result["events"][0], state["events"][2])
+            self.assertEqual(isolated["events"][0]["text"], "event-2")
+            self.assertIsNone(isolated["events"][0]["tool"]["output"])
 
     def test_full_reset_returns_all_events_without_older_flag(self) -> None:
         with TemporaryDirectory() as tmp, mock.patch.object(transcripts, "TAIL_WINDOW_EVENTS", 5):
@@ -446,12 +453,14 @@ class SessionDeltaTests(unittest.TestCase):
                     clear=True,
                 ),
             ):
-                body = main.subagent_session("WIKI-44", "abc123def456", cursor=0)
-            self.assertGreater(
+                with mock.patch.object(transcripts, "TAIL_WINDOW_EVENTS", 1):
+                    body = main.subagent_session("WIKI-44", "abc123def456", cursor=0)
+            self.assertEqual(
                 len(body["events"]),
-                0,
-                "sidechain rows must render (regression: fmt='claude' filters them out)",
+                2,
+                "subagent sessions must stay complete because they have no older-page UI",
             )
+            self.assertFalse(body["has_older"])
 
     def test_path_mismatch_forces_full_reset(self) -> None:
         with TemporaryDirectory() as tmp:
