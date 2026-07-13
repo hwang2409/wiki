@@ -18,6 +18,46 @@ from .store import RuntimePaths
 from .version import RUNTIME_FINGERPRINT
 
 
+DEFAULT_SWAP_DRAIN_SECONDS = 10.0
+
+
+def replacement_prompt(
+    agent_id: str,
+    current: dict[str, Any],
+    *,
+    status_dir: Path,
+    runs_dir: Path | None = None,
+) -> str:
+    """Build the WIKI-38 recovery kickoff for manual and upgrade replacements."""
+
+    run_id = current.get("run_id")
+    raw_events = current.get("log")
+    if not raw_events and isinstance(run_id, str) and runs_dir is not None:
+        raw_events = runs_dir / run_id / "raw.jsonl"
+    return f"""You are the replacement {current.get("role") or "worker"} for {agent_id}.
+Your prior provider session was {current.get("provider_session_id") or current.get("session_id") or "not recorded"}.
+
+Recover context from:
+- prior transcript: {current.get("transcript_path") or current.get("transcript") or "not resolved"}
+- raw provider events: {raw_events or "not recorded"}
+- status file: {status_dir / f"{agent_id}.json"}
+
+Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and status-file contract. Re-read the current ticket/PR state, update the status file before long operations, then continue from the last durable step.
+"""
+
+
+def _pid_alive(pid: object) -> bool:
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 class SupervisorUnavailable(RuntimeError):
     pass
 
@@ -35,10 +75,14 @@ class SupervisorClient:
         *,
         timeout: float = 10.0,
         runtime_fingerprint: str = RUNTIME_FINGERPRINT,
+        swap_drain_seconds: float = DEFAULT_SWAP_DRAIN_SECONDS,
     ):
+        if swap_drain_seconds < 0:
+            raise ValueError("swap_drain_seconds must be non-negative")
         self.paths = paths
         self.timeout = timeout
         self.runtime_fingerprint = runtime_fingerprint
+        self.swap_drain_seconds = swap_drain_seconds
 
     def request(self, method: str, params: dict[str, Any] | None = None) -> Any:
         request_id = str(uuid4())
@@ -135,6 +179,7 @@ class SupervisorClient:
             await writer.wait_closed()
 
     def ensure_running(self, *, timeout: float = 5.0) -> dict[str, Any]:
+        active_runs: list[dict[str, Any]] = []
         autostart_enabled = os.environ.get(
             "WIKI_SUPERVISOR_AUTOSTART", "on"
         ).lower() not in {"0", "off", "false"}
@@ -154,8 +199,11 @@ class SupervisorClient:
                 raise SupervisorUnavailable(
                     "supervisor runtime does not match this backend and autostart is disabled"
                 )
+            active_runs = self._active_runs_for_swap()
+            self._prepare_runs_for_swap(active_runs)
             replacement = self._stop_stale_supervisor(health, timeout=timeout)
             if replacement is not None:
+                self._replace_runs_after_swap(active_runs)
                 return replacement
         if not autostart_enabled:
             raise SupervisorUnavailable("supervisor is not running and autostart is disabled")
@@ -164,11 +212,121 @@ class SupervisorClient:
         last_error: Exception | None = None
         while time.monotonic() < deadline:
             try:
-                return self.ping()
+                health = self.ping()
+                if health.get("runtime_fingerprint") != self.runtime_fingerprint:
+                    time.sleep(0.05)
+                    continue
+                self._replace_runs_after_swap(active_runs)
+                return health
             except SupervisorUnavailable as exc:
                 last_error = exc
                 time.sleep(0.05)
         raise SupervisorUnavailable(f"supervisor did not become ready: {last_error}")
+
+    def _active_runs_for_swap(self) -> list[dict[str, Any]]:
+        """Snapshot current runs whose provider transport must cross the swap."""
+
+        try:
+            result = self.request("run/list")
+        except (SupervisorRemoteError, SupervisorUnavailable) as exc:
+            raise SupervisorUnavailable(
+                f"cannot enumerate runs before supervisor replacement: {exc}"
+            ) from exc
+        runs = result.get("runs") if isinstance(result, dict) else None
+        if not isinstance(runs, list):
+            raise SupervisorUnavailable(
+                "cannot enumerate runs before supervisor replacement: bad run list"
+            )
+
+        active: list[dict[str, Any]] = []
+        for candidate in runs:
+            if not isinstance(candidate, dict):
+                continue
+            agent_id = candidate.get("agent_id")
+            run_id = candidate.get("run_id")
+            if not isinstance(agent_id, str) or not isinstance(run_id, str):
+                continue
+            try:
+                current = self.request("run/status", {"agent_id": agent_id})
+            except SupervisorRemoteError:
+                continue
+            except SupervisorUnavailable as exc:
+                raise SupervisorUnavailable(
+                    f"cannot inspect {agent_id} before supervisor replacement: {exc}"
+                ) from exc
+            if not isinstance(current, dict) or current.get("run_id") != run_id:
+                continue
+            if current.get("control_attached") or _pid_alive(
+                current.get("provider_pid")
+            ):
+                active.append(dict(current))
+        return active
+
+    def _prepare_runs_for_swap(self, runs: list[dict[str, Any]]) -> None:
+        """Quiesce providers while the old daemon still owns their control pipes."""
+
+        for run in runs:
+            run_id = str(run["run_id"])
+            if run.get("state") == "working":
+                try:
+                    self.request("run/interrupt", {"run_id": run_id})
+                    self._drain_interrupted_run(run_id)
+                except (SupervisorRemoteError, SupervisorUnavailable):
+                    # v1 permits losing an in-flight turn. The new supervisor's
+                    # verified orphan cleanup is the fallback if graceful
+                    # interruption cannot complete before the daemon exits.
+                    pass
+            try:
+                self.request("run/stop", {"run_id": run_id})
+            except (SupervisorRemoteError, SupervisorUnavailable):
+                # Continue the swap: run/replace on the new daemon verifies and
+                # terminates any provider process left behind by the old one.
+                pass
+
+    def _drain_interrupted_run(self, run_id: str) -> None:
+        deadline = time.monotonic() + self.swap_drain_seconds
+        while time.monotonic() < deadline:
+            status = self.request("run/status", {"run_id": run_id})
+            if not isinstance(status, dict):
+                return
+            if status.get("state") != "working" or not status.get("active_turn_id"):
+                return
+            time.sleep(0.05)
+
+    def _replace_runs_after_swap(self, runs: list[dict[str, Any]]) -> None:
+        failures: list[str] = []
+        for run in runs:
+            agent_id = str(run["agent_id"])
+            run_id = str(run["run_id"])
+            try:
+                self.request(
+                    "run/replace",
+                    {
+                        "run_id": run_id,
+                        "prompt": replacement_prompt(
+                            agent_id,
+                            run,
+                            status_dir=self.paths.status_dir,
+                            runs_dir=self.paths.runs_dir,
+                        ),
+                    },
+                )
+            except (SupervisorRemoteError, SupervisorUnavailable) as exc:
+                try:
+                    current = self.request("run/status", {"agent_id": agent_id})
+                except (SupervisorRemoteError, SupervisorUnavailable):
+                    current = None
+                if (
+                    isinstance(current, dict)
+                    and current.get("run_id") != run_id
+                    and current.get("control_attached")
+                ):
+                    continue
+                failures.append(f"{agent_id}: {exc}")
+        if failures:
+            raise SupervisorUnavailable(
+                "supervisor upgraded but run replacement failed: " + "; ".join(failures)
+            )
 
     def _stop_stale_supervisor(
         self,

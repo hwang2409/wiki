@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
@@ -38,6 +40,7 @@ from backend.app.agent_runtime.provider import (
 from backend.app.agent_runtime.store import RunStore, RuntimePaths, StoreConflict
 from backend.app.agent_runtime.supervisor import Supervisor, resolve_safe_worktree
 from backend.app.agent_runtime.types import LifecycleState, ProviderKind, RunRecord
+from backend.app.agent_runtime.version import RUNTIME_FINGERPRINT
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "agent_runtime"
@@ -570,6 +573,53 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         recovery = await self.supervisor.recover_on_start()
         old_result = next(item for item in recovery if item["run_id"] == old.run_id)
         self.assertEqual(old_result["action"], "skip")
+
+    async def test_replace_terminates_verified_orphan_before_fresh_launch(self) -> None:
+        old = RunRecord.new(
+            agent_id="WIKI-SWAP",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="Original swap prompt",
+        )
+        old.state = LifecycleState.IDLE
+        old.provider_session_id = "old-swap-session"
+        old.provider_pid = 424_242
+        self.store.create(old)
+        orphan = ProviderProcessStatus(
+            pid=424_242,
+            parent_pid=1,
+            created_at=1_783_718_400.125,
+            process_group_id=424_242,
+        )
+
+        with (
+            mock.patch.object(self.supervisor, "pid_alive", return_value=True),
+            mock.patch.object(
+                self.supervisor,
+                "_orphaned_provider_process",
+                new=mock.AsyncMock(return_value=orphan),
+            ) as inspect_orphan,
+            mock.patch.object(
+                self.supervisor,
+                "_terminate_orphan_provider_pid",
+                new=mock.AsyncMock(return_value=True),
+            ) as terminate_orphan,
+        ):
+            replacement = await self.supervisor.replace(
+                old.run_id,
+                "Recover after supervisor swap",
+            )
+
+        inspect_orphan.assert_awaited_once_with(424_242)
+        terminate_orphan.assert_awaited_once_with(orphan)
+        archived_old = self.store.get(old.run_id)
+        self.assertIsNone(archived_old.provider_pid)
+        self.assertEqual(archived_old.replaced_by_run_id, replacement.run_id)
+        self.assertIn(replacement.run_id, self.supervisor.adapters)
+        self.assertEqual(replacement.state, LifecycleState.IDLE)
 
     async def test_cross_provider_orchestrator_replace_stops_old_pid_both_directions(
         self,
@@ -2467,12 +2517,122 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
                 "ping",
                 side_effect=[stale, SupervisorUnavailable("stopped"), current],
             ),
+            mock.patch.object(
+                client,
+                "request",
+                return_value={"status": "ok", "runs": []},
+            ) as request,
             mock.patch.object(client, "_spawn_detached") as spawn,
             mock.patch("backend.app.agent_runtime.client.os.kill") as kill,
         ):
             self.assertEqual(client.ensure_running(timeout=0.1), current)
+        request.assert_called_once_with("run/list")
         kill.assert_called_once_with(424_242, signal.SIGTERM)
         spawn.assert_called_once_with()
+
+    def test_client_migrates_idle_and_working_runs_across_runtime_swap(self) -> None:
+        client = SupervisorClient(
+            self.paths,
+            timeout=0.1,
+            runtime_fingerprint="current-runtime",
+            swap_drain_seconds=0,
+        )
+        idle = {
+            "agent_id": "WIKI-IDLE",
+            "run_id": "idle-run",
+            "role": "implement",
+            "state": "idle",
+            "provider_session_id": "idle-session",
+            "provider_pid": 424_250,
+            "control_attached": True,
+            "transcript_path": "/isolated/idle.jsonl",
+        }
+        working = {
+            "agent_id": "wiki",
+            "run_id": "working-run",
+            "role": "orchestrator",
+            "state": "working",
+            "provider_session_id": "working-session",
+            "provider_pid": 424_251,
+            "active_turn_id": "turn-1",
+            "control_attached": True,
+            "transcript_path": "/isolated/working.jsonl",
+        }
+        calls: list[tuple[str, dict[str, Any]]] = []
+
+        def request(method: str, params: dict[str, Any] | None = None) -> Any:
+            values = dict(params or {})
+            calls.append((method, values))
+            if method == "run/list":
+                return {"runs": [idle, working]}
+            if method == "run/status":
+                if values.get("agent_id") == "WIKI-IDLE":
+                    return idle
+                if values.get("agent_id") == "wiki":
+                    return working
+                return {**working, "state": "interrupted", "active_turn_id": None}
+            if method in {"run/interrupt", "run/stop", "run/replace"}:
+                return {"status": "ok"}
+            raise AssertionError(method)
+
+        stale = {
+            "status": "ok",
+            "pid": 424_242,
+            "runtime_fingerprint": "old-runtime",
+        }
+        current = {
+            "status": "ok",
+            "pid": 424_243,
+            "runtime_fingerprint": "current-runtime",
+        }
+        with (
+            mock.patch.object(
+                client,
+                "ping",
+                side_effect=[stale, SupervisorUnavailable("stopped"), current],
+            ),
+            mock.patch.object(client, "request", side_effect=request),
+            mock.patch.object(client, "_spawn_detached") as spawn,
+            mock.patch("backend.app.agent_runtime.client.os.kill"),
+        ):
+            self.assertEqual(client.ensure_running(timeout=0.1), current)
+
+        spawn.assert_called_once_with()
+        self.assertEqual(
+            [values["run_id"] for method, values in calls if method == "run/stop"],
+            ["idle-run", "working-run"],
+        )
+        self.assertEqual(
+            [values["run_id"] for method, values in calls if method == "run/interrupt"],
+            ["working-run"],
+        )
+        replacements = [values for method, values in calls if method == "run/replace"]
+        self.assertEqual(
+            [values["run_id"] for values in replacements],
+            ["idle-run", "working-run"],
+        )
+        self.assertIn("idle-session", replacements[0]["prompt"])
+        self.assertIn("working-session", replacements[1]["prompt"])
+        self.assertIn(str(self.paths.status_dir), replacements[0]["prompt"])
+
+    def test_client_matching_fingerprint_does_not_inspect_or_replace_runs(self) -> None:
+        client = SupervisorClient(
+            self.paths,
+            runtime_fingerprint="current-runtime",
+        )
+        current = {
+            "status": "ok",
+            "pid": 424_243,
+            "runtime_fingerprint": "current-runtime",
+        }
+        with (
+            mock.patch.object(client, "ping", return_value=current),
+            mock.patch.object(client, "request") as request,
+            mock.patch.object(client, "_spawn_detached") as spawn,
+        ):
+            self.assertEqual(client.ensure_running(), current)
+        request.assert_not_called()
+        spawn.assert_not_called()
 
     def test_client_does_not_replace_an_old_runtime_when_autostart_is_off(
         self,
@@ -2585,6 +2745,157 @@ class DaemonProcessTests(unittest.TestCase):
                     process.stderr.close()
             self.assertFalse(paths.socket_path.exists())
             self.assertFalse(paths.pid_path.exists())
+
+    def test_fingerprint_swap_replaces_live_runs_under_fresh_daemon(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            worktree = root / "worktree"
+            worktree.mkdir()
+            old_checkout = root / "old-checkout"
+            shutil.copytree(
+                Path(__file__).resolve().parents[1],
+                old_checkout / "backend",
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+            old_version = old_checkout / "backend/app/agent_runtime/version.py"
+            old_version.write_text(
+                old_version.read_text(encoding="utf-8") + "\n# old-runtime-fixture\n",
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env.pop("PYTHONPATH", None)
+            env.update(
+                {
+                    "TMUX": "",
+                    "WIKI_AGENT_ARCHIVE_DIR": str(paths.archive_dir),
+                    "WIKI_AGENT_STATUS_DIR": str(paths.status_dir),
+                    "WIKI_SUPERVISOR_FAKE_FIXTURE_DIR": str(FIXTURES),
+                }
+            )
+            old_process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "backend.app.agent_runtime.daemon",
+                    "--runtime-dir",
+                    str(paths.runtime_dir),
+                    "--socket",
+                    str(paths.socket_path),
+                    "--registry",
+                    str(paths.registry_path),
+                    "--fake-fixture-dir",
+                    str(FIXTURES),
+                ],
+                cwd=old_checkout,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            client = SupervisorClient(
+                paths,
+                timeout=1,
+                runtime_fingerprint=RUNTIME_FINGERPRINT,
+                swap_drain_seconds=0.1,
+            )
+            new_pid: int | None = None
+            try:
+                deadline = time.monotonic() + 5
+                while True:
+                    try:
+                        old_health = client.ping()
+                        break
+                    except SupervisorUnavailable:
+                        if time.monotonic() >= deadline:
+                            stderr = (
+                                old_process.stderr.read()
+                                if old_process.poll() is not None and old_process.stderr
+                                else "old daemon still starting"
+                            )
+                            self.fail(f"old daemon did not start: {stderr}")
+                        time.sleep(0.05)
+                self.assertNotEqual(
+                    old_health["runtime_fingerprint"],
+                    RUNTIME_FINGERPRINT,
+                )
+                old_runs = []
+                for agent_id in ("WIKI-IDLE", "WIKI-WORKING"):
+                    old_runs.append(
+                        client.request(
+                            "run/start",
+                            {
+                                "agent_id": agent_id,
+                                "provider": "codex",
+                                "role": "implement",
+                                "model": "fixture-codex",
+                                "effort": "high",
+                                "worktree": str(worktree),
+                                "prompt": f"Work on {agent_id}",
+                            },
+                        )
+                    )
+                client.request(
+                    "run/send_now",
+                    {"agent_id": "WIKI-WORKING", "text": "keep working"},
+                )
+                self.assertEqual(
+                    client.request("run/status", {"agent_id": "WIKI-WORKING"})[
+                        "state"
+                    ],
+                    "working",
+                )
+
+                with (
+                    mock.patch.dict(os.environ, env, clear=False),
+                    warnings.catch_warnings(),
+                ):
+                    warnings.simplefilter("ignore", ResourceWarning)
+                    current = client.ensure_running(timeout=5)
+                new_pid = cast(int, current["pid"])
+                self.assertNotEqual(new_pid, old_process.pid)
+                old_process.wait(timeout=5)
+
+                listed = client.request("run/list")["runs"]
+                replacements = {
+                    run["replaces_run_id"]: run
+                    for run in listed
+                    if run.get("replaces_run_id")
+                }
+                self.assertEqual(
+                    set(replacements),
+                    {run["run_id"] for run in old_runs},
+                )
+                for replacement in replacements.values():
+                    self.assertTrue(replacement["control_attached"])
+                    self.assertEqual(replacement["provider_pid"], new_pid)
+                    client.request(
+                        "run/send_now",
+                        {
+                            "agent_id": replacement["agent_id"],
+                            "text": "post-swap steering",
+                        },
+                    )
+                    post_swap = client.request(
+                        "run/status", {"agent_id": replacement["agent_id"]}
+                    )
+                    self.assertTrue(post_swap["control_attached"])
+                    self.assertIn(post_swap["state"], {"idle", "working"})
+            finally:
+                if new_pid is not None:
+                    try:
+                        os.kill(new_pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    deadline = time.monotonic() + 5
+                    while paths.socket_path.exists() and time.monotonic() < deadline:
+                        time.sleep(0.05)
+                if old_process.poll() is None:
+                    old_process.terminate()
+                    old_process.wait(timeout=5)
+                if old_process.stderr:
+                    old_process.stderr.close()
 
 
 if __name__ == "__main__":
