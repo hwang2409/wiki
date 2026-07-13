@@ -77,10 +77,16 @@ import { LoadingPlaceholder } from "./loading";
 import { createStateKeyWriteBarrier, deletePaneStateEntries } from "./pane-state-cache";
 import { Timestamp } from "./timestamp";
 import {
+  addPendingUserMessage,
   invalidateTranscript,
+  removePendingUserMessage,
+  refreshTranscript,
   replaceTranscriptDesiredModel,
   replaceTranscriptQueue,
+  retryPendingUserMessage,
+  updatePendingUserMessage,
   useTranscriptSession,
+  type PendingUserMessage,
   type TranscriptSession,
 } from "./transcript-store";
 
@@ -1890,7 +1896,7 @@ export function SessionTab({
     [subagent, ticket]
   );
   const visible = useElementVisible(containerRef);
-  const { session, error, loading } = useTranscriptSession(target, visible);
+  const { session, pendingUserMessages, error, loading } = useTranscriptSession(target, visible);
   const [questionDrafts, setQuestionDrafts] = useState<Record<string, QuestionDraft>>({});
 
   useEffect(() => {
@@ -2442,6 +2448,7 @@ export function SessionTab({
       {subagent || !showComposer ? null : (
         <MessageComposer
           history={userHistory}
+          pending={pendingUserMessages}
           queued={session.queue}
           runningSubagents={runningSubagents}
           stateKey={composerStateKeyForSession(ticket, subagent)}
@@ -2507,6 +2514,7 @@ function MessageComposer({
   stateKey,
   ticket,
   history = [],
+  pending = [],
   queued = [],
   runningSubagents = [],
   thinking = false,
@@ -2515,6 +2523,7 @@ function MessageComposer({
   stateKey: string;
   ticket: string;
   history?: string[];
+  pending?: PendingUserMessage[];
   queued?: QueuedMessage[];
   runningSubagents?: SubagentInfo[];
   thinking?: boolean;
@@ -3011,22 +3020,67 @@ function MessageComposer({
     }
   }
 
+  async function deliverPending(
+    message: Pick<PendingUserMessage, "id" | "text" | "mode">,
+  ) {
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await sendAgentMessage(ticket, message.text, message.mode);
+      historyPosRef.current = null;
+      if (result.messages) {
+        replaceTranscriptQueue(ticket, result.messages, {
+          source: message.mode === "now" ? "auto" : "explicit",
+          text: message.text,
+          position: result.position,
+        });
+      }
+      if (result.status === "queued") {
+        removePendingUserMessage(ticket, message.id);
+      } else {
+        updatePendingUserMessage(ticket, message.id, { status: "sent", error: undefined });
+        refreshTranscript(ticket);
+      }
+    } catch (err) {
+      updatePendingUserMessage(ticket, message.id, {
+        status: "failed",
+        error: err instanceof Error ? err.message : "Send failed",
+      });
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function send(mode: "now" | "on-idle") {
     const value = text.trim();
     if (!value || busy) return;
     setBusy(true);
     setError(null);
-    try {
-      const result = await sendAgentMessage(ticket, value, mode);
-      historyPosRef.current = null;
-      setText("");
-      setAttachments([]);
-      if (mode === "on-idle" && result.messages) replaceTranscriptQueue(ticket, result.messages);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Send failed");
-    } finally {
-      setBusy(false);
-    }
+    setText("");
+    setAttachments([]);
+    rememberSelection(0);
+    const message = {
+      id: crypto.randomUUID(),
+      text: value,
+      mode,
+    };
+    addPendingUserMessage(ticket, message);
+    await deliverPending(message);
+  }
+
+  async function retry(message: PendingUserMessage) {
+    if (busy) return;
+    retryPendingUserMessage(ticket, message.id);
+    await deliverPending(message);
+  }
+
+  function edit(message: PendingUserMessage) {
+    if (busy) return;
+    removePendingUserMessage(ticket, message.id);
+    setText(message.text);
+    setVimMode("insert");
+    setInsertCaret(message.text.length);
+    inputRef.current?.focus();
   }
 
   async function cancel(index: number) {
@@ -3040,13 +3094,54 @@ function MessageComposer({
 
   return (
     <div className="session-composer">
+      {pending.map((message) => (
+        <div
+          className={`session-user session-pending-user is-${message.status}`}
+          data-status={message.status}
+          key={message.id}
+        >
+          <UserText text={message.text} />
+          <div className="session-pending-status">
+            {message.status === "sending" ? (
+              <>
+                <CircleDashed className="session-pending-spinner" size={11} />
+                <span>sending…</span>
+              </>
+            ) : message.status === "sent" ? (
+              <>
+                <CircleCheck size={11} />
+                <span>sent · waiting for transcript</span>
+              </>
+            ) : (
+              <>
+                <AlertTriangle size={11} />
+                <span title={message.error}>send failed</span>
+                <button type="button" onClick={() => void retry(message)}>Retry send</button>
+                <button type="button" onClick={() => edit(message)}>Edit message</button>
+              </>
+            )}
+          </div>
+        </div>
+      ))}
       {queued.map((message, i) => (
-        <div className="session-queued" key={`${message.queued_at}-${i}`}>
+        <div
+          className={`session-queued is-${message.source ?? "explicit"}`}
+          key={`${message.queued_at}-${i}`}
+          tabIndex={0}
+          title={message.source === "auto"
+            ? "Waiting for current turn to finish"
+            : "Queued for next idle boundary"}
+        >
           <Hourglass size={11} />
           <span className="session-queued-text">{message.text}</span>
           <button aria-label="Cancel queued message" type="button" onClick={() => cancel(i)}>
             <X size={12} />
           </button>
+          <span className="session-queued-tooltip" role="tooltip">
+            {message.source === "auto"
+              ? "Waiting for current turn to finish"
+              : "Queued for next idle boundary"}
+          </span>
         </div>
       ))}
       {menuItems.length > 0 ? (

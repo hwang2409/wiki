@@ -5633,6 +5633,7 @@ body.is-resizing-panes .pane-cell {
 }
 
 .session-queued {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -5643,6 +5644,35 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-muted);
   font-family: var(--font-monospace);
   font-size: var(--font-ui-smaller);
+}
+
+.session-queued.is-auto > svg {
+  color: var(--text-normal);
+}
+
+.session-queued-tooltip {
+  position: absolute;
+  z-index: 4;
+  right: 8px;
+  bottom: calc(100% + 6px);
+  width: max-content;
+  max-width: min(360px, 80vw);
+  padding: 5px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 2px;
+  background-color: var(--background-primary);
+  color: var(--text-normal);
+  box-shadow: 0 4px 14px rgb(0 0 0 / 18%);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 100ms ease-out;
+  white-space: normal;
+}
+
+.session-queued:hover .session-queued-tooltip,
+.session-queued:focus .session-queued-tooltip,
+.session-queued:focus-within .session-queued-tooltip {
+  opacity: 1;
 }
 
 .session-queued-text {
@@ -5665,6 +5695,56 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-muted);
   font-size: var(--font-ui-smaller);
   font-style: italic;
+}
+
+.session-pending-user {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  border-style: dashed;
+}
+
+.session-pending-user.is-sent {
+  border-style: solid;
+}
+
+.session-pending-user.is-failed {
+  border-color: var(--accent-danger);
+}
+
+.session-pending-status {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 5px;
+  color: var(--text-faint);
+  font-family: var(--font-interface);
+  font-size: var(--font-ui-smaller);
+}
+
+.session-pending-user.is-failed .session-pending-status {
+  color: var(--accent-danger);
+}
+
+.session-pending-status button {
+  padding: 1px 4px;
+  border: 1px solid currentColor;
+  border-radius: 2px;
+  color: inherit;
+  font-size: inherit;
+}
+
+.session-pending-status button:hover {
+  background-color: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.session-pending-spinner {
+  animation: session-pending-spin 1s linear infinite;
+}
+
+@keyframes session-pending-spin {
+  to { transform: rotate(360deg); }
 }
 
 .session-tool-running {
