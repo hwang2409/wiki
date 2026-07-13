@@ -7,7 +7,12 @@ import {
   groupEvents,
   groupEventsIncremental,
 } from "../src/session-layout.ts";
-import { buildSession, mergeSession, prependOlderEvents } from "../src/transcript-merge.ts";
+import {
+  buildSession,
+  mergeQueueSources,
+  mergeSession,
+  prependOlderEvents,
+} from "../src/transcript-merge.ts";
 
 function event(id, kind = "assistant", text = `event-${id}`) {
   return {
@@ -104,6 +109,44 @@ test("mergeSession applies metadata-only changes without replacing events", () =
   assert.equal(merged.subagents[0].active, false);
   assert.equal(merged.working, false);
   assert.deepEqual(merged.queue, result.queue);
+});
+
+test("mergeSession applies composer acknowledgements without replacing events", () => {
+  const current = buildSession(sessionData([event(0), event(1)]));
+  const composerMessage = {
+    pending_id: "73f65e1c-ad09-4ce5-9ca8-31bb44db431b",
+    text: "mid-turn message",
+    sent_at: "2026-07-13T12:00:00Z",
+    echoed_at: "2026-07-13T12:01:00Z",
+    seq: 42,
+  };
+  const result = {
+    ...sessionData([]),
+    cursor: current.cursor,
+    tail_from: current.base + current.events.length,
+    base: current.base,
+    composer_messages: [composerMessage],
+  };
+
+  const merged = mergeSession(current, result);
+  assert.notStrictEqual(merged, current);
+  assert.strictEqual(merged.events, current.events);
+  assert.deepEqual(merged.composerMessages, [composerMessage]);
+});
+
+test("mergeQueueSources preserves a pending id across queue snapshots", () => {
+  const current = [{
+    text: "queued once",
+    queued_at: "2026-07-13T12:00:00Z",
+    pending_id: "73f65e1c-ad09-4ce5-9ca8-31bb44db431b",
+    source: "explicit",
+  }];
+  const next = [{
+    text: "queued once",
+    queued_at: "2026-07-13T12:00:00Z",
+  }];
+
+  assert.deepEqual(mergeQueueSources(current, next), current);
 });
 
 test("mergeSession preserves loaded older prefix across a full reset", () => {

@@ -4,6 +4,7 @@ import {
   getAgentSession,
   getSubagentSession,
   type AgentSessionData,
+  type ComposerMessage,
   type ProviderEventInspector,
   type SessionDispositionCounts,
   type SessionMeta,
@@ -16,7 +17,6 @@ import {
 import { mergeQueueSources, mergeSession, prependOlderEvents } from "./transcript-merge";
 
 const POLL_MS = 2500;
-const PENDING_RECONCILE_WINDOW_MS = 30_000;
 
 export type TranscriptTarget = {
   ticket: string;
@@ -41,6 +41,7 @@ export type TranscriptSession = {
   events: SessionEvent[];
   eventsChangedFrom: number;
   hasOlder: boolean;
+  composerMessages: ComposerMessage[];
   subagents: SubagentInfo[];
   queue: QueuedMessage[];
   working: boolean;
@@ -76,7 +77,6 @@ export type PanelState = {
 export type PendingUserMessage = {
   id: string;
   text: string;
-  textHash: string;
   status: "sending" | "sent" | "failed";
   mode: "now" | "on-idle";
   firstSeenTs: number;
@@ -85,6 +85,7 @@ export type PendingUserMessage = {
 };
 
 export type QueueSourceAnnotation = {
+  pendingId: string;
   source: "auto" | "explicit";
   text: string;
   position?: number;
@@ -142,41 +143,49 @@ function createEntry(target: TranscriptTarget): Entry {
   };
 }
 
-function hashPendingText(text: string): string {
-  const normalized = text
+function normalizePendingText(text: string): string {
+  return text
     .replace(/\[image:\s*\/tmp\/wiki-uploads\/([^\]\s]+)\s*\]/g, "[image:$1]")
-    .replace(/\u27e6img:\/api\/uploads\/([^\u27e7]+)\u27e7/g, "[image:$1]");
-  let hash = 0x811c9dc5;
-  for (let index = 0; index < normalized.length; index += 1) {
-    hash ^= normalized.charCodeAt(index);
-    hash = Math.imul(hash, 0x01000193);
-  }
-  return (hash >>> 0).toString(16).padStart(8, "0");
+    .replace(/\u27e6img:\/api\/uploads\/([^\u27e7]+)\u27e7/g, "[image:$1]")
+    .trim();
+}
+
+export function composerTextMatches(eventText: string, composerText: string): boolean {
+  const normalizedEvent = normalizePendingText(eventText);
+  const normalizedComposer = normalizePendingText(composerText);
+  if (normalizedEvent === normalizedComposer) return true;
+  const suffix = normalizedEvent.slice(normalizedComposer.length).trimStart();
+  const prefix = normalizedEvent.slice(0, -normalizedComposer.length).trimEnd();
+  return (
+    normalizedEvent.startsWith(normalizedComposer) && suffix.startsWith("<")
+  ) || (
+    normalizedEvent.endsWith(normalizedComposer) && prefix.endsWith(">")
+  );
+}
+
+function pendingTextMatches(eventText: string, message: PendingUserMessage): boolean {
+  return composerTextMatches(eventText, message.text);
 }
 
 function reconcilePendingUserMessages(
   pending: PendingUserMessage[],
   events: SessionEvent[],
+  composerMessages: ComposerMessage[],
 ): PendingUserMessage[] {
   if (pending.length === 0) return pending;
-  const remaining = pending.slice();
+  const acknowledged = new Set(composerMessages.map((message) => message.pending_id));
+  const remaining = pending.filter((message) => !acknowledged.has(message.id));
   for (const event of events) {
     if (event.kind !== "user") continue;
-    const eventHash = hashPendingText(event.text.trim());
     const eventTs = event.ts ? Date.parse(event.ts) : Number.NaN;
     const match = remaining.findIndex((message) => {
-      if (event.id <= message.eventIdFloor || eventHash !== message.textHash) return false;
-      if (Number.isFinite(eventTs)) {
-        return eventTs >= message.firstSeenTs - 2_000
-          && eventTs <= message.firstSeenTs + PENDING_RECONCILE_WINDOW_MS;
-      }
-      return Date.now() <= message.firstSeenTs + PENDING_RECONCILE_WINDOW_MS;
+      if (event.id <= message.eventIdFloor || !pendingTextMatches(event.text, message)) return false;
+      return !Number.isFinite(eventTs) || eventTs >= message.firstSeenTs - 2_000;
     });
     if (match >= 0) remaining.splice(match, 1);
   }
-  // Text/time matching is intentionally a fallback: identical messages sent
-  // inside 30s can pair with the wrong echo, though one event only consumes
-  // one optimistic row so duplicate messages are never both discarded.
+  // Text matching is only a fallback for providers without durable ids. One
+  // event consumes one optimistic row, so identical sends remain FIFO-safe.
   return remaining.length === pending.length ? pending : remaining;
 }
 
@@ -261,6 +270,7 @@ function fetchEntry(entry: Entry): Promise<void> {
         pendingUserMessages: reconcilePendingUserMessages(
           entry.snapshot.pendingUserMessages,
           result.events,
+          result.composer_messages ?? [],
         ),
         error: null,
         loading: false,
@@ -370,13 +380,32 @@ export function replaceTranscriptQueue(
           break;
         }
       }
-      const index = requestedIndex >= 0 && requestedIndex < annotated.length
-        ? requestedIndex
-        : fallbackIndex;
-      if (index >= 0) annotated[index].source = annotation.source;
+      const exactIndex = annotated.findIndex(
+        (message) => message.pending_id === annotation.pendingId,
+      );
+      const legacyIndex = annotated.every((message) => !message.pending_id)
+        ? (
+          requestedIndex >= 0 && requestedIndex < annotated.length
+            ? requestedIndex
+            : fallbackIndex
+        )
+        : -1;
+      const index = exactIndex >= 0
+        ? exactIndex
+        : legacyIndex;
+      if (index >= 0) {
+        annotated[index].source = annotation.source;
+        annotated[index].pending_id ??= annotation.pendingId;
+      }
     }
+    const queuedPendingIds = new Set(
+      annotated.flatMap((message) => message.pending_id ? [message.pending_id] : []),
+    );
     entry.snapshot = {
       ...entry.snapshot,
+      pendingUserMessages: entry.snapshot.pendingUserMessages.filter(
+        (message) => !queuedPendingIds.has(message.id),
+      ),
       session: {
         ...entry.snapshot.session,
         queue: mergeQueueSources(entry.snapshot.session.queue, annotated),
@@ -395,7 +424,6 @@ export function addPendingUserMessage(
   const eventIdFloor = events.length > 0 ? events[events.length - 1].id : -1;
   const pending: PendingUserMessage = {
     ...message,
-    textHash: hashPendingText(message.text.trim()),
     status: "sending",
     firstSeenTs: Date.now(),
     eventIdFloor,
