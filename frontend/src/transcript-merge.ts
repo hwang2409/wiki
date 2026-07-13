@@ -26,24 +26,42 @@ export function buildSession(result: AgentSessionData): TranscriptSession {
     events: result.events,
     eventsChangedFrom: 0,
     hasOlder: result.has_older ?? false,
+    composerMessages: result.composer_messages ?? [],
     subagents: result.subagents ?? [],
     queue: result.queue ?? [],
     working: result.working ?? false,
   };
 }
 
+function queueKey(message: QueuedMessage): string {
+  return message.pending_id ?? legacyQueueKey(message);
+}
+
+function legacyQueueKey(message: QueuedMessage): string {
+  return `${message.queued_at}\u0000${message.text}`;
+}
+
 export function mergeQueueSources(current: QueuedMessage[], next: QueuedMessage[]): QueuedMessage[] {
   if (current.length === 0 || next.length === 0) return next;
-  const sources = new Map(
-    current
-      .filter((message) => message.source)
-      .map((message) => [`${message.queued_at}\u0000${message.text}`, message.source] as const),
-  );
-  if (sources.size === 0) return next;
-  return next.map((message) => ({
-    ...message,
-    source: message.source ?? sources.get(`${message.queued_at}\u0000${message.text}`),
-  }));
+  const previous = new Map<string, QueuedMessage>();
+  current.forEach((message) => {
+    previous.set(queueKey(message), message);
+    previous.set(legacyQueueKey(message), message);
+  });
+  let changed = false;
+  const merged = next.map((message) => {
+    const match = previous.get(queueKey(message)) ?? previous.get(legacyQueueKey(message));
+    const pendingId = message.pending_id ?? match?.pending_id;
+    const source = message.source ?? match?.source;
+    if (pendingId === message.pending_id && source === message.source) return message;
+    changed = true;
+    return {
+      ...message,
+      ...(pendingId ? { pending_id: pendingId } : {}),
+      ...(source ? { source } : {}),
+    };
+  });
+  return changed ? merged : next;
 }
 
 function sameJsonValue(left: unknown, right: unknown): boolean {
@@ -94,6 +112,7 @@ function mergeSessionState(
     events,
     eventsChangedFrom,
     hasOlder: result.has_older ?? current.hasOlder,
+    composerMessages: result.composer_messages ?? current.composerMessages,
     subagents: result.subagents ?? current.subagents,
     queue: result.queue ? mergeQueueSources(current.queue, result.queue) : current.queue,
     working: result.working ?? current.working,
@@ -115,6 +134,7 @@ function mergeSessionState(
     && sameJsonValue(next.sessionMeta, current.sessionMeta)
     && sameJsonValue(next.dispositions, current.dispositions)
     && sameJsonValue(next.providerInspector, current.providerInspector)
+    && sameJsonValue(next.composerMessages, current.composerMessages)
     && sameJsonValue(next.subagents, current.subagents)
     && sameJsonValue(next.queue, current.queue);
   return unchanged ? current : next;

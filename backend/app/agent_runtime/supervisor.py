@@ -36,6 +36,46 @@ DEFAULT_REAPER_INTERVAL_SECONDS = 30.0
 DEFAULT_REAPER_GRACE_SECONDS = 60.0
 
 
+def _validated_pending_id(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("pending_id must be a canonical UUID")
+    try:
+        parsed = UUID(value)
+    except ValueError as exc:
+        raise ValueError("pending_id must be a canonical UUID") from exc
+    if str(parsed) != value:
+        raise ValueError("pending_id must be a canonical UUID")
+    return value
+
+
+def _provider_user_text(
+    provider: ProviderKind,
+    kind: str,
+    payload: dict[str, Any],
+) -> str | None:
+    if provider is ProviderKind.CLAUDE and kind == "claude_user":
+        content = (payload.get("message") or {}).get("content")
+    elif provider is ProviderKind.CODEX and kind in {"item_started", "item_completed"}:
+        item = (payload.get("params") or {}).get("item") or {}
+        if item.get("type") != "userMessage":
+            return None
+        content = item.get("content")
+    else:
+        return None
+    if isinstance(content, str):
+        return content.strip() or None
+    if not isinstance(content, list):
+        return None
+    text = "\n".join(
+        str(block.get("text") or "")
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "text"
+    ).strip()
+    return text or None
+
+
 def _validated_seconds(name: str, value: float) -> float:
     if not math.isfinite(value) or value < 0:
         raise ValueError(f"{name} must be a finite, non-negative number")
@@ -467,12 +507,31 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 "normalization_error",
                 {"error": str(exc), "raw_payload": event.payload},
             )
+        pending_message = None
+        echoed_text = _provider_user_text(
+            event.provider,
+            normalized.kind,
+            normalized.payload,
+        )
+        normalized_payload = normalized.payload
+        if echoed_text is not None:
+            pending_message = self.store.match_pending_user_message(
+                run_id,
+                echoed_text,
+            )
+            if pending_message is not None:
+                normalized_payload = {
+                    **normalized.payload,
+                    "pending_id": pending_message["pending_id"],
+                    "composer_text": pending_message["text"],
+                    "composer_sent_at": pending_message["sent_at"],
+                }
         self.store.append_normalized(
             run_id,
             raw_seq=int(raw["seq"]),
             disposition=normalized.disposition,
             kind=normalized.kind,
-            payload=normalized.payload,
+            payload=normalized_payload,
             lifecycle_state=normalized.lifecycle_state,
         )
 
@@ -824,9 +883,18 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             queued = self.store.peek_queued_message(run_id)
             if queued is None:
                 return
+            pending_id = queued.get("pending_id")
+            if pending_id is not None:
+                self.store.track_pending_user_message(
+                    run_id,
+                    pending_id,
+                    queued["text"],
+                )
             try:
                 status = await adapter.send_on_idle(queued["text"])
             except Exception as exc:
+                if pending_id is not None:
+                    self.store.discard_pending_user_message(run_id, pending_id)
                 # Provider refusal/races are delivery failures, not event
                 # persistence failures. Retain the durable message for the
                 # next idle edge and keep the provider control stream alive.
@@ -1800,11 +1868,21 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 return current
         raise RunNotFound("no current run")
 
-    async def send_now(self, run_id: str, message: str) -> dict[str, Any]:
+    async def send_now(
+        self,
+        run_id: str,
+        message: str,
+        pending_id: str | None = None,
+    ) -> dict[str, Any]:
         async with self._run_lock(run_id):
-            return await self._send_now(run_id, message)
+            return await self._send_now(run_id, message, pending_id)
 
-    async def _send_now(self, run_id: str, message: str) -> dict[str, Any]:
+    async def _send_now(
+        self,
+        run_id: str,
+        message: str,
+        pending_id: str | None = None,
+    ) -> dict[str, Any]:
         adapter = self.adapters.get(run_id)
         if adapter is None:
             raise StoreConflict("run has no attached provider adapter")
@@ -1817,21 +1895,41 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             )
             if adapter is None:
                 raise StoreConflict("run has no attached provider adapter")
-        status = await adapter.send_now(message)
+        if pending_id is not None:
+            self.store.track_pending_user_message(run_id, pending_id, message)
+        try:
+            status = await adapter.send_now(message)
+        except Exception:
+            if pending_id is not None:
+                self.store.discard_pending_user_message(run_id, pending_id)
+            raise
         record = self.store.update_adapter_status(run_id, status)
         record = self.store.clear_automatic_resume_suppression(run_id)
         await self._publish_agent_change(record.agent_id)
-        return {"status": "sent"}
+        response: dict[str, Any] = {"status": "sent"}
+        if pending_id is not None:
+            response["pending_id"] = pending_id
+        return response
 
-    async def send_on_idle(self, run_id: str, message: str) -> dict[str, Any]:
+    async def send_on_idle(
+        self,
+        run_id: str,
+        message: str,
+        pending_id: str | None = None,
+    ) -> dict[str, Any]:
         async with self._run_lock(run_id):
-            return await self._send_on_idle(run_id, message)
+            return await self._send_on_idle(run_id, message, pending_id)
 
-    async def _send_on_idle(self, run_id: str, message: str) -> dict[str, Any]:
+    async def _send_on_idle(
+        self,
+        run_id: str,
+        message: str,
+        pending_id: str | None = None,
+    ) -> dict[str, Any]:
         adapter = self.adapters.get(run_id)
         if adapter is None:
             raise StoreConflict("run has no attached provider adapter")
-        record = self.store.queue_message(run_id, message)
+        record = self.store.queue_message(run_id, message, pending_id)
         response = {
             "status": "queued",
             "position": len(record.queued_messages),
@@ -1843,6 +1941,14 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         status = await adapter.status()
         if status.state is LifecycleState.IDLE:
             await self._deliver_next_queued_locked(run_id, adapter)
+            remaining = self.store.queued_messages(run_id)
+            if pending_id is not None and not any(
+                item.get("pending_id") == pending_id for item in remaining
+            ):
+                return {
+                    "status": "sent",
+                    "pending_id": pending_id,
+                }
         return response
 
     async def delete_queued(self, run_id: str, index: int) -> dict[str, Any]:
@@ -2326,11 +2432,15 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             return _public_run(await self.resume_run(self._resolve_run_id(params)))
         if method == "run/send_now":
             return await self.send_now(
-                self._resolve_run_id(params), str(params["text"])
+                self._resolve_run_id(params),
+                str(params["text"]),
+                _validated_pending_id(params.get("pending_id")),
             )
         if method == "run/send_on_idle":
             return await self.send_on_idle(
-                self._resolve_run_id(params), str(params["text"])
+                self._resolve_run_id(params),
+                str(params["text"]),
+                _validated_pending_id(params.get("pending_id")),
             )
         if method == "run/queue":
             run_id = self._resolve_run_id(params)
@@ -2408,6 +2518,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 "dispositions": dict(record.disposition_counts),
                 "pending_requests": [
                     dict(request) for request in record.pending_requests.values()
+                ],
+                "composer_messages": [
+                    dict(message) for message in record.composer_messages
                 ],
                 "events": self.store.read_normalized_events(
                     run_id,

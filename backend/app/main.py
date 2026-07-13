@@ -1292,6 +1292,9 @@ def _session_delta_payload(
         provider_inspector = _provider_events(ticket, limit=50)
         if provider_inspector is not None:
             payload["provider_inspector"] = provider_inspector
+            composer_messages = provider_inspector.get("composer_messages")
+            if isinstance(composer_messages, list):
+                payload["composer_messages"] = composer_messages
     return payload
 
 
@@ -1405,6 +1408,7 @@ def agent_session(
                 "kind": kind,
                 "provider": provider,
                 "provider_inspector": provider_inspector,
+                "composer_messages": provider_inspector.get("composer_messages") or [],
             }
         # Native transcript gone (cleanup) — fall back to the archived pane log.
         if archive_dir is not None:
@@ -1765,6 +1769,7 @@ def pane_is_working(pane: str) -> bool:
 class MessageIn(BaseModel):
     text: str = Field(..., min_length=1, max_length=4000)
     mode: str = Field(default="now", pattern="^(now|on-idle)$")
+    pending_id: UUID | None = None
 
 
 class AgentRespondIn(BaseModel):
@@ -2415,7 +2420,11 @@ def agent_message(ticket: str, body: MessageIn, background: BackgroundTasks) -> 
         method = "run/send_now" if body.mode == "now" else "run/send_on_idle"
         result = _supervisor_request(
             method,
-            {"agent_id": resolved[0], "text": body.text},
+            {
+                "agent_id": resolved[0],
+                "text": body.text,
+                "pending_id": str(body.pending_id) if body.pending_id else None,
+            },
         )
         if not isinstance(result, dict):
             raise HTTPException(

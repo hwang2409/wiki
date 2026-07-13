@@ -440,6 +440,15 @@ export type AgentSessionData = {
   queue?: QueuedMessage[];
   working?: boolean;
   provider_inspector?: ProviderEventInspector;
+  composer_messages?: ComposerMessage[];
+};
+
+export type ComposerMessage = {
+  pending_id: string;
+  text: string;
+  sent_at: string | null;
+  echoed_at: string | null;
+  seq: number;
 };
 
 export type AgentOlderSessionData = {
@@ -454,6 +463,7 @@ export type AgentOlderSessionData = {
 export type QueuedMessage = {
   text: string;
   queued_at: string;
+  pending_id?: string;
   source?: "auto" | "explicit";
 };
 
@@ -490,12 +500,22 @@ export type AgentPrData = {
   diff: string;
 };
 
-export function sendAgentMessage(ticket: string, text: string, mode: "now" | "on-idle") {
-  return request<{ status: string; position?: number; messages?: QueuedMessage[] }>(
+export function sendAgentMessage(
+  ticket: string,
+  text: string,
+  mode: "now" | "on-idle",
+  pendingId: string,
+) {
+  return request<{
+    status: string;
+    pending_id?: string;
+    position?: number;
+    messages?: QueuedMessage[];
+  }>(
     `/api/agents/${encodeURIComponent(ticket)}/message`,
     {
       method: "POST",
-      body: JSON.stringify({ text, mode }),
+      body: JSON.stringify({ text, mode, pending_id: pendingId }),
     }
   );
 }

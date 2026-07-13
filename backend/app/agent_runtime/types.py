@@ -170,6 +170,8 @@ class RunRecord:
         default_factory=lambda: {item.value: 0 for item in EventDisposition}
     )
     pending_requests: dict[str, dict[str, Any]] = field(default_factory=dict)
+    pending_user_messages: list[dict[str, str]] = field(default_factory=list)
+    composer_messages: list[dict[str, Any]] = field(default_factory=list)
     queued_messages: list[dict[str, str]] = field(default_factory=list)
     schema_version: int = 1
 
@@ -241,6 +243,8 @@ class RunRecord:
             "pending_requests": {
                 key: dict(request) for key, request in self.pending_requests.items()
             },
+            "pending_user_messages": list(self.pending_user_messages),
+            "composer_messages": list(self.composer_messages),
             "queued_messages": list(self.queued_messages),
         }
 
@@ -302,6 +306,12 @@ class RunRecord:
                 for key, request in pending_requests.items()
                 if isinstance(request, dict)
             },
+            pending_user_messages=[
+                dict(item) for item in value.get("pending_user_messages") or []
+            ],
+            composer_messages=[
+                dict(item) for item in value.get("composer_messages") or []
+            ],
             queued_messages=[dict(item) for item in value.get("queued_messages") or []],
         )
 

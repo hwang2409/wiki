@@ -123,6 +123,39 @@ def _apply_pending_request_event(
         record.pending_requests.pop(_provider_request_key(request_id), None)
 
 
+def _apply_composer_message_event(
+    record: RunRecord,
+    *,
+    payload: dict[str, Any],
+    seq: int,
+    normalized_at: str,
+) -> None:
+    pending_id = payload.get("pending_id")
+    text = payload.get("composer_text")
+    sent_at = payload.get("composer_sent_at")
+    if not all(isinstance(value, str) for value in (pending_id, text, sent_at)):
+        return
+    record.pending_user_messages = [
+        message
+        for message in record.pending_user_messages
+        if message.get("pending_id") != pending_id
+    ]
+    if any(
+        message.get("pending_id") == pending_id
+        for message in record.composer_messages
+    ):
+        return
+    record.composer_messages.append(
+        {
+            "pending_id": pending_id,
+            "text": text,
+            "sent_at": sent_at,
+            "echoed_at": normalized_at,
+            "seq": seq,
+        }
+    )
+
+
 def _resolved_parent(path: Path) -> Path:
     """Resolve the parent chain, keep the final component unresolved."""
     absolute = path.absolute()
@@ -486,6 +519,8 @@ class RunStore:
                     key: dict(request)
                     for key, request in record.pending_requests.items()
                 }
+                previous_pending_user_messages = list(record.pending_user_messages)
+                previous_composer_messages = list(record.composer_messages)
                 record.pending_requests = {}
                 lifecycle_checkpoint = record.last_lifecycle_event_seq
                 for event in normalized_events:
@@ -502,6 +537,13 @@ class RunStore:
                             normalized_at=str(event.get("normalized_at") or utc_now()),
                         )
                     seq = int(event.get("seq", 0))
+                    if isinstance(payload, dict):
+                        _apply_composer_message_event(
+                            record,
+                            payload=payload,
+                            seq=seq,
+                            normalized_at=str(event.get("normalized_at") or utc_now()),
+                        )
                     if seq <= lifecycle_checkpoint:
                         continue
                     lifecycle_value = event.get("lifecycle_state")
@@ -535,6 +577,8 @@ class RunStore:
                     or record.normalized_event_count != normalized_count
                     or record.disposition_counts != counts
                     or previous_pending_requests != record.pending_requests
+                    or previous_pending_user_messages != record.pending_user_messages
+                    or previous_composer_messages != record.composer_messages
                     or record.last_lifecycle_event_seq != lifecycle_checkpoint
                 ):
                     record.raw_event_count = raw_count
@@ -1119,6 +1163,12 @@ class RunStore:
                 raw_seq=raw_seq,
                 normalized_at=str(envelope["normalized_at"]),
             )
+            _apply_composer_message_event(
+                record,
+                payload=payload,
+                seq=int(envelope["seq"]),
+                normalized_at=str(envelope["normalized_at"]),
+            )
             if lifecycle_state is not None:
                 try:
                     validate_transition(record.state, lifecycle_state)
@@ -1323,10 +1373,81 @@ class RunStore:
                 self._write_registry(registry)
             return record
 
-    def queue_message(self, run_id: str, text: str) -> RunRecord:
+    def track_pending_user_message(
+        self,
+        run_id: str,
+        pending_id: str,
+        text: str,
+    ) -> RunRecord:
         with self._lock:
             record = self.get(run_id)
-            record.queued_messages.append({"text": text, "queued_at": utc_now()})
+            record.pending_user_messages.append(
+                {"pending_id": pending_id, "text": text, "sent_at": utc_now()}
+            )
+            self._write_record(record)
+            return record
+
+    def match_pending_user_message(
+        self,
+        run_id: str,
+        echoed_text: str,
+    ) -> dict[str, str] | None:
+        normalized_echo = echoed_text.strip()
+        if not normalized_echo:
+            return None
+        with self._lock:
+            record = self.get(run_id)
+            # This list is append-ordered. Always scan from the front so one
+            # provider echo acknowledges the oldest identical send (FIFO),
+            # including the hook-wrapped fallback below.
+            exact = next(
+                (
+                    message
+                    for message in record.pending_user_messages
+                    if message.get("text", "").strip() == normalized_echo
+                ),
+                None,
+            )
+            if exact is not None:
+                return dict(exact)
+            for message in record.pending_user_messages:
+                text = message.get("text", "").strip()
+                suffix = normalized_echo[len(text) :].lstrip() if text else ""
+                prefix = normalized_echo[: -len(text)].rstrip() if text else ""
+                if text and (
+                    (normalized_echo.startswith(text) and suffix.startswith("<"))
+                    or (normalized_echo.endswith(text) and prefix.endswith(">"))
+                ):
+                    return dict(message)
+            return None
+
+    def discard_pending_user_message(
+        self,
+        run_id: str,
+        pending_id: str,
+    ) -> RunRecord:
+        with self._lock:
+            record = self.get(run_id)
+            record.pending_user_messages = [
+                message
+                for message in record.pending_user_messages
+                if message.get("pending_id") != pending_id
+            ]
+            self._write_record(record)
+            return record
+
+    def queue_message(
+        self,
+        run_id: str,
+        text: str,
+        pending_id: str | None = None,
+    ) -> RunRecord:
+        with self._lock:
+            record = self.get(run_id)
+            message = {"text": text, "queued_at": utc_now()}
+            if pending_id is not None:
+                message["pending_id"] = pending_id
+            record.queued_messages.append(message)
             self._write_record(record)
             return record
 
@@ -1385,6 +1506,16 @@ class RunStore:
             if current.get("run_id") != old.run_id:
                 raise StoreConflict("replacement target is no longer current")
 
+            # Replacements are a continuation of the same logical composer
+            # session. Provider echoes can arrive after the run-id swap, and
+            # the frontend may not have polled an acknowledgement journaled
+            # just before it, so both sides of reconciliation must carry over.
+            new_record.pending_user_messages = [
+                dict(message) for message in old.pending_user_messages
+            ]
+            new_record.composer_messages = [
+                dict(message) for message in old.composer_messages
+            ]
             old.replaced_by_run_id = new_record.run_id
             old.outcome = "handoff"
             old.state_reason = "replaced"

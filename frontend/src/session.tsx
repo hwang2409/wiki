@@ -78,6 +78,7 @@ import { createStateKeyWriteBarrier, deletePaneStateEntries } from "./pane-state
 import { Timestamp } from "./timestamp";
 import {
   addPendingUserMessage,
+  composerTextMatches,
   invalidateTranscript,
   loadOlderEvents,
   removePendingUserMessage,
@@ -644,6 +645,53 @@ function modelChangedMarkers(session: TranscriptSession | null): SessionEvent[] 
         marker: "model_changed",
       };
     });
+}
+
+function composerMessageEvents(session: TranscriptSession): SessionEvent[] {
+  const unmatchedUsers = session.events
+    .filter((event) => event.kind === "user")
+    .map((event) => ({ event, matched: false }));
+  const synthetic: SessionEvent[] = [];
+  for (const message of session.composerMessages) {
+    const sentAt = message.sent_at ? Date.parse(message.sent_at) : Number.NaN;
+    const match = unmatchedUsers.find((candidate) => {
+      if (candidate.matched) return false;
+      const eventAt = candidate.event.ts ? Date.parse(candidate.event.ts) : Number.NaN;
+      if (Number.isFinite(sentAt) && Number.isFinite(eventAt) && eventAt < sentAt - 2_000) {
+        return false;
+      }
+      return composerTextMatches(candidate.event.text, message.text);
+    });
+    if (match) {
+      match.matched = true;
+      continue;
+    }
+    synthetic.push({
+      id: 2_000_000 + message.seq,
+      kind: "user",
+      ts: message.echoed_at,
+      text: message.text,
+      disposition: "rendered",
+    });
+  }
+  return synthetic;
+}
+
+function mergeComposerEvents(events: SessionEvent[], composerEvents: SessionEvent[]): SessionEvent[] {
+  if (composerEvents.length === 0) return events;
+  const merged = events.slice();
+  for (const event of composerEvents) {
+    const eventTs = event.ts ? Date.parse(event.ts) : Number.NaN;
+    const index = Number.isFinite(eventTs)
+      ? merged.findIndex((candidate) => {
+        const candidateTs = candidate.ts ? Date.parse(candidate.ts) : Number.NaN;
+        return Number.isFinite(candidateTs) && candidateTs > eventTs;
+      })
+      : -1;
+    if (index >= 0) merged.splice(index, 0, event);
+    else merged.push(event);
+  }
+  return merged;
 }
 
 function SessionModelFooter({
@@ -2014,9 +2062,12 @@ export function SessionTab({
   const displayEvents = useMemo(
     () => {
       if (!session) return [];
-      return [...session.events, ...modelChangedMarkers(session)];
+      return [
+        ...mergeComposerEvents(session.events, composerMessageEvents(session)),
+        ...modelChangedMarkers(session),
+      ];
     },
-    [session?.events, session?.providerInspector],
+    [session?.events, session?.providerInspector, session?.composerMessages],
   );
 
   const grouped = useMemo(() => {
@@ -2971,18 +3022,17 @@ function MessageComposer({
     setBusy(true);
     setError(null);
     try {
-      const result = await sendAgentMessage(ticket, message.text, message.mode);
+      const result = await sendAgentMessage(ticket, message.text, message.mode, message.id);
       historyPosRef.current = null;
       if (result.messages) {
         replaceTranscriptQueue(ticket, result.messages, {
+          pendingId: message.id,
           source: message.mode === "now" ? "auto" : "explicit",
           text: message.text,
           position: result.position,
         });
       }
-      if (result.status === "queued") {
-        removePendingUserMessage(ticket, message.id);
-      } else {
+      if (result.status !== "queued") {
         updatePendingUserMessage(ticket, message.id, { status: "sent", error: undefined });
         refreshTranscript(ticket);
       }
@@ -3071,7 +3121,7 @@ function MessageComposer({
       {queued.map((message, i) => (
         <div
           className={`session-queued is-${message.source ?? "explicit"}`}
-          key={`${message.queued_at}-${i}`}
+          key={message.pending_id ?? `${message.queued_at}-${i}`}
           tabIndex={0}
           title={message.source === "auto"
             ? "Waiting for current turn to finish"
