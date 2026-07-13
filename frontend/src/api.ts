@@ -289,7 +289,9 @@ export type SessionQuestion = {
   prompt: string;
   header?: string | null;
   options: string[];
+  multi_select: boolean;
   answered_option: number | null;
+  answered_options: number[];
   custom_reply: string | null;
 };
 
@@ -487,7 +489,7 @@ export function getAgentProviderEvents(ticket: string, includeRaw = false) {
 export function respondToAgentRequest(
   ticket: string,
   requestId: string | number,
-  response: Record<string, unknown>,
+  response: { answers: Record<string, string | string[]> } | Record<string, unknown>,
 ) {
   return request<AgentControlResult>(
     `/api/agents/${encodeURIComponent(ticket)}/respond`,

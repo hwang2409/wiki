@@ -229,9 +229,12 @@ class TranscriptSurfaceTests(unittest.TestCase):
         questions = [event for event in result["events"] if event["kind"] == "question"]
         self.assertEqual(len(questions), 2)
         self.assertEqual(questions[0]["question"]["tool_use_id"], "toolu_question")
+        self.assertFalse(questions[0]["question"]["multi_select"])
         self.assertEqual(questions[0]["question"]["answered_option"], 1)
+        self.assertEqual(questions[0]["question"]["answered_options"], [1])
         self.assertIsNone(questions[0]["question"]["custom_reply"])
         self.assertIsNone(questions[1]["question"]["answered_option"])
+        self.assertEqual(questions[1]["question"]["answered_options"], [])
         self.assertEqual(questions[1]["question"]["custom_reply"], "Go with the fresh branch")
 
         markers = {(event.get("marker"), event["text"]) for event in result["events"] if event["kind"] == "marker"}
@@ -258,6 +261,23 @@ class TranscriptSurfaceTests(unittest.TestCase):
         tool = next(event for event in result["events"] if event["kind"] == "tool")
         self.assertEqual(tool["tool"]["output"], "done\nexited with code 0")
         self.assertTrue(tool["tool"]["ok"])
+
+    def test_multi_select_question_preserves_all_answers_and_custom_reply(self) -> None:
+        path = FIXTURES_DIR / "agent_runtime" / "claude_stream_native_surfaces.jsonl"
+        result = transcripts.read_session_events("claude", path)
+
+        questions = [
+            event["question"]
+            for event in result["events"]
+            if event.get("question", {}).get("tool_use_id") == "toolu_ask"
+        ]
+        self.assertEqual(len(questions), 2)
+        self.assertFalse(questions[0]["multi_select"])
+        self.assertEqual(questions[0]["answered_option"], 0)
+        self.assertTrue(questions[1]["multi_select"])
+        self.assertIsNone(questions[1]["answered_option"])
+        self.assertEqual(questions[1]["answered_options"], [0, 1])
+        self.assertEqual(questions[1]["custom_reply"], "Include typed Other text")
 
     def test_structured_question_answers_use_tool_use_result_map(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -336,7 +356,9 @@ class TranscriptSurfaceTests(unittest.TestCase):
             result = transcripts.read_session_events("claude", path)
 
         question = next(event for event in result["events"] if event["kind"] == "question")
+        self.assertFalse(question["question"]["multi_select"])
         self.assertEqual(question["question"]["answered_option"], 1)
+        self.assertEqual(question["question"]["answered_options"], [1])
         self.assertIsNone(question["question"]["custom_reply"])
 
 

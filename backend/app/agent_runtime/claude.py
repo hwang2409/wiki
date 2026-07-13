@@ -65,6 +65,22 @@ def _message_tool_result_ids(value: dict[str, Any]) -> set[str]:
     return ids
 
 
+def _ask_user_question_answer(value: object) -> str | None:
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    if not isinstance(value, list) or not value:
+        return None
+    selected: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            return None
+        selected.append(item.strip())
+    # Claude Code's AskUserQuestion input contract stores multi-select answers
+    # as comma-separated strings in updatedInput.answers.
+    return ", ".join(selected)
+
+
 def _ask_user_question_answers(response: dict[str, Any]) -> dict[str, str] | None:
     answers = response.get("answers")
     if isinstance(answers, dict) and answers:
@@ -72,9 +88,10 @@ def _ask_user_question_answers(response: dict[str, Any]) -> dict[str, str] | Non
         for prompt, answer in answers.items():
             if not isinstance(prompt, str) or not prompt.strip():
                 return None
-            if not isinstance(answer, str) or not answer.strip():
+            normalized_answer = _ask_user_question_answer(answer)
+            if normalized_answer is None:
                 return None
-            normalized[prompt.strip()] = answer.strip()
+            normalized[prompt.strip()] = normalized_answer
         return normalized or None
     if not isinstance(answers, list) or not answers:
         return None
@@ -86,9 +103,10 @@ def _ask_user_question_answers(response: dict[str, Any]) -> dict[str, str] | Non
         answer = item.get("answer")
         if not isinstance(prompt, str) or not prompt.strip():
             return None
-        if not isinstance(answer, str) or not answer.strip():
+        normalized_answer = _ask_user_question_answer(answer)
+        if normalized_answer is None:
             return None
-        normalized[prompt.strip()] = answer.strip()
+        normalized[prompt.strip()] = normalized_answer
     return normalized or None
 
 

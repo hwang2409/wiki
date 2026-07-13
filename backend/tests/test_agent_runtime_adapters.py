@@ -800,6 +800,62 @@ class ClaudeAdapterTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
+    async def test_multi_select_response_uses_claude_comma_separated_answer(self) -> None:
+        record = _record(self.root, ProviderKind.CLAUDE, state=LifecycleState.STARTING)
+        adapter = self._adapter(record)
+        await adapter.start(_start_request(record))
+        await _wait_event(
+            adapter,
+            lambda event: (
+                event.payload.get("type") == "result"
+                and event.payload.get("subtype") == "success"
+            ),
+        )
+
+        generation = adapter.snapshot().generation
+        input_payload = {
+            "questions": [
+                {
+                    "question": "Which features?",
+                    "multiSelect": True,
+                }
+            ]
+        }
+        adapter._apply_message_state(  # noqa: SLF001 - pair answer with Claude control request
+            {
+                "type": "control_request",
+                "request_id": "permission-multi-select",
+                "request": {
+                    "subtype": "can_use_tool",
+                    "tool_name": "AskUserQuestion",
+                    "tool_use_id": "toolu_multi_select",
+                    "input": input_payload,
+                },
+            },
+            generation,
+        )
+        adapter._pending_question_ids.add("toolu_multi_select")  # noqa: SLF001 - fixture setup
+
+        await adapter.respond(
+            "toolu_multi_select",
+            {"answers": {"Which features?": ["Search", "Vim mode"]}},
+        )
+
+        approval_row = await _wait_protocol_row(
+            self.log,
+            lambda row: (
+                row.get("type") == "control_response"
+                and row.get("response", {}).get("request_id") == "permission-multi-select"
+            ),
+        )
+        self.assertEqual(
+            approval_row["response"]["response"]["updatedInput"],
+            {
+                **input_payload,
+                "answers": {"Which features?": "Search, Vim mode"},
+            },
+        )
+
     async def test_pending_question_response_cleanup_drops_deferred_answer(self) -> None:
         record = _record(self.root, ProviderKind.CLAUDE, state=LifecycleState.STARTING)
         adapter = self._adapter(record)

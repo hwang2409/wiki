@@ -4980,13 +4980,13 @@ body.is-resizing-panes .pane-cell {
   transition: border-color 120ms ease, background-color 120ms ease, color 120ms ease;
 }
 
-.session-question-option.is-clickable:hover:not(:disabled) {
+.session-question-option.is-clickable:hover {
   border-color: color-mix(in srgb, var(--accent-primary) 35%, var(--background-modifier-border));
   background-color: color-mix(in srgb, var(--accent-primary) 6%, var(--background-primary));
   color: var(--text-normal);
 }
 
-.session-question-option:disabled {
+.session-question-option.is-disabled {
   opacity: 0.8;
   cursor: default;
 }
@@ -5000,6 +5000,64 @@ body.is-resizing-panes .pane-cell {
 .session-question-index {
   color: var(--text-faint);
   min-width: 16px;
+}
+
+.session-question-option > input[type="checkbox"],
+.session-question-option > input[type="radio"] {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--accent-primary);
+  flex: 0 0 auto;
+}
+
+.session-question-other .session-question-index {
+  min-width: auto;
+}
+
+.session-question-other-input {
+  min-width: 0;
+  flex: 1 1 auto;
+  padding: 3px 6px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 2px;
+  background: var(--background-primary);
+  color: var(--text-normal);
+  font: inherit;
+}
+
+.session-question-other-input:focus {
+  border-color: color-mix(in srgb, var(--accent-primary) 50%, var(--background-modifier-border));
+  outline: none;
+}
+
+.session-question-requirement {
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+}
+
+.session-question-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.session-question-actions button {
+  padding: 5px 10px;
+  border: 1px solid color-mix(in srgb, var(--accent-primary) 45%, var(--background-modifier-border));
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--accent-primary) 10%, var(--background-primary));
+  color: var(--text-normal);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+}
+
+.session-question-actions button:not(:disabled) {
+  cursor: pointer;
+}
+
+.session-question-actions button:disabled {
+  opacity: 0.55;
 }
 
 .session-question-answer-label {

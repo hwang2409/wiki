@@ -522,18 +522,91 @@ function ProviderPendingRequestCard({
   );
 }
 
+type QuestionAnswerDraft = {
+  optionIndexes: number[];
+  otherSelected: boolean;
+  customReply: string;
+};
+
 type QuestionDraft = {
-  answers: Record<string, number>;
+  answers: Record<string, QuestionAnswerDraft>;
   sending: boolean;
+  submitted: boolean;
   error: string | null;
 };
 
 type QuestionUiContextValue = {
   drafts: Record<string, QuestionDraft>;
-  answerQuestion: (event: SessionEvent, optionIndex: number) => void;
+  groups: Map<string, SessionEvent[]>;
+  selectOption: (event: SessionEvent, optionIndex: number) => void;
+  selectOther: (event: SessionEvent, selected: boolean) => void;
+  setCustomReply: (event: SessionEvent, value: string) => void;
+  submitQuestions: (event: SessionEvent) => void;
 };
 
 const QuestionUiContext = createContext<QuestionUiContextValue | null>(null);
+
+function emptyQuestionAnswer(): QuestionAnswerDraft {
+  return { optionIndexes: [], otherSelected: false, customReply: "" };
+}
+
+function questionIsResolved(question: NonNullable<SessionEvent["question"]>): boolean {
+  return (
+    question.answered_option !== null ||
+    (question.answered_options ?? []).length > 0 ||
+    Boolean(question.custom_reply)
+  );
+}
+
+function resolvedQuestionAnswer(
+  question: NonNullable<SessionEvent["question"]>,
+): string | string[] | null {
+  const optionIndexes = question.multi_select
+    ? question.answered_options ?? []
+    : question.answered_option !== null
+      ? [question.answered_option]
+      : question.answered_options ?? [];
+  const values = optionIndexes
+    .map((index) => question.options[index])
+    .filter((value): value is string => Boolean(value));
+  if (question.custom_reply) values.push(question.custom_reply);
+  if (question.multi_select) return values.length ? values : null;
+  return values[0] ?? null;
+}
+
+function draftQuestionAnswer(
+  question: NonNullable<SessionEvent["question"]>,
+  answer: QuestionAnswerDraft | undefined,
+): string | string[] | null {
+  if (!answer) return null;
+  const values = answer.optionIndexes
+    .map((index) => question.options[index])
+    .filter((value): value is string => Boolean(value));
+  const customReply = answer.customReply.trim();
+  if (answer.otherSelected) {
+    if (!customReply) return null;
+    values.push(customReply);
+  }
+  if (question.multi_select) return values.length ? values : null;
+  return values.length === 1 ? values[0] : null;
+}
+
+function questionGroupPayload(
+  group: SessionEvent[],
+  answers: Record<string, QuestionAnswerDraft>,
+): Record<string, string | string[]> | null {
+  const payload: Record<string, string | string[]> = {};
+  for (const event of group) {
+    const question = event.question;
+    if (!question) continue;
+    const answer = questionIsResolved(question)
+      ? resolvedQuestionAnswer(question)
+      : draftQuestionAnswer(question, answers[question.prompt]);
+    if (answer === null) return null;
+    payload[question.prompt] = answer;
+  }
+  return Object.keys(payload).length ? payload : null;
+}
 
 function modelChangedMarkers(session: TranscriptSession | null): SessionEvent[] {
   if (!session?.providerInspector?.events.length) return [];
@@ -1281,14 +1354,43 @@ function QuestionRow({ event }: { event: SessionEvent }) {
   const question = event.question;
   if (!question) return null;
   const draft = questionUi?.drafts[question.tool_use_id];
-  const optimisticIndex = draft?.answers[question.prompt];
-  const pickedIndex =
-    question.answered_option !== null ? question.answered_option : optimisticIndex ?? null;
-  const answered = pickedIndex !== null ? question.options[pickedIndex] ?? null : null;
+  const answerDraft = draft?.answers[question.prompt];
+  const resolved = questionIsResolved(question);
+  const pickedIndexes = resolved
+    ? question.multi_select
+      ? question.answered_options ?? []
+      : question.answered_option !== null
+        ? [question.answered_option]
+        : question.answered_options ?? []
+    : answerDraft?.optionIndexes ?? [];
+  const customReply = resolved
+    ? question.custom_reply ?? ""
+    : answerDraft?.customReply ?? "";
+  const otherSelected = resolved
+    ? Boolean(question.custom_reply)
+    : Boolean(answerDraft?.otherSelected);
   const disabled =
-    question.answered_option !== null ||
-    Boolean(question.custom_reply) ||
-    Boolean(draft?.sending);
+    resolved || Boolean(draft?.sending) || Boolean(draft?.submitted);
+  const group = questionUi?.groups.get(question.tool_use_id) ?? [event];
+  const isLastQuestion = group.at(-1)?.question?.prompt === question.prompt;
+  const hasMultiSelect = group.some((candidate) => candidate.question?.multi_select);
+  const hasCustomSelection = group.some((candidate) => {
+    const candidateQuestion = candidate.question;
+    return Boolean(
+      candidateQuestion &&
+      (candidateQuestion.custom_reply || draft?.answers[candidateQuestion.prompt]?.otherSelected)
+    );
+  });
+  const groupResolved = group.every(
+    (candidate) => candidate.question && questionIsResolved(candidate.question),
+  );
+  const payload = questionGroupPayload(group, draft?.answers ?? {});
+  const showSubmit = isLastQuestion && !groupResolved && (hasMultiSelect || hasCustomSelection);
+  const displayedAnswers = [
+    ...pickedIndexes
+      .map((index) => question.options[index])
+      .filter((value): value is string => Boolean(value)),
+  ];
   return (
     <div className="session-question">
       <div className="session-question-head">
@@ -1298,35 +1400,80 @@ function QuestionRow({ event }: { event: SessionEvent }) {
       <div className="session-question-prompt">{question.prompt}</div>
       <div className="session-question-options">
         {question.options.map((option, index) => (
-          <button
+          <label
             className={[
               "session-question-option",
-              pickedIndex === index ? "is-picked" : "",
+              pickedIndexes.includes(index) ? "is-picked" : "",
               !disabled ? "is-clickable" : "",
+              disabled ? "is-disabled" : "",
             ].filter(Boolean).join(" ")}
-            disabled={disabled}
             key={`${question.prompt}:${option}:${index}`}
-            type="button"
-            onClick={() => {
-              if (disabled) return;
-              questionUi?.answerQuestion(event, index);
-            }}
           >
+            <input
+              checked={pickedIndexes.includes(index)}
+              disabled={disabled}
+              name={`question:${question.tool_use_id}:${question.prompt}`}
+              type={question.multi_select ? "checkbox" : "radio"}
+              onChange={() => questionUi?.selectOption(event, index)}
+            />
             <span className="session-question-index">{index + 1}</span>
             <span>{option}</span>
-          </button>
+          </label>
         ))}
+        <div
+          className={[
+            "session-question-option",
+            "session-question-other",
+            otherSelected ? "is-picked" : "",
+            !disabled ? "is-clickable" : "",
+            disabled ? "is-disabled" : "",
+          ].filter(Boolean).join(" ")}
+        >
+          <input
+            aria-label={`Other answer for ${question.prompt}`}
+            checked={otherSelected}
+            disabled={disabled}
+            name={`question:${question.tool_use_id}:${question.prompt}`}
+            type={question.multi_select ? "checkbox" : "radio"}
+            onChange={(changeEvent) => questionUi?.selectOther(event, changeEvent.target.checked)}
+          />
+          <span className="session-question-index">Other</span>
+          <input
+            aria-label={`Custom answer for ${question.prompt}`}
+            className="session-question-other-input"
+            disabled={disabled}
+            placeholder="Type another answer"
+            type="text"
+            value={customReply}
+            onFocus={() => questionUi?.selectOther(event, true)}
+            onChange={(changeEvent) => questionUi?.setCustomReply(event, changeEvent.target.value)}
+          />
+        </div>
       </div>
-      {answered ? (
+      {question.multi_select ? (
+        <div className="session-question-requirement">Select at least one option (required).</div>
+      ) : null}
+      {(resolved || draft?.submitted) && displayedAnswers.length ? (
         <div className="session-question-answer">
           <span className="session-question-answer-label">Picked</span>
-          <span>{answered}</span>
+          <span>{displayedAnswers.join(", ")}</span>
         </div>
       ) : null}
-      {question.custom_reply ? (
+      {(resolved || draft?.submitted) && customReply.trim() ? (
         <div className="session-question-custom">
           <span className="session-question-answer-label">Custom reply</span>
-          <span>{question.custom_reply}</span>
+          <span>{customReply.trim()}</span>
+        </div>
+      ) : null}
+      {showSubmit ? (
+        <div className="session-question-actions">
+          <button
+            disabled={payload === null || Boolean(draft?.sending) || Boolean(draft?.submitted)}
+            type="button"
+            onClick={() => questionUi?.submitQuestions(event)}
+          >
+            {draft?.sending ? "Sending…" : draft?.submitted ? "Answers sent" : "Send answers"}
+          </button>
         </div>
       ) : null}
       {draft?.error ? <div className="session-question-error">{draft.error}</div> : null}
@@ -1741,10 +1888,7 @@ export function SessionTab({
         const events = questionGroups.get(toolUseId);
         if (!events || events.every((event) => {
           const question = event.question;
-          return Boolean(
-            question &&
-            (question.answered_option !== null || question.custom_reply)
-          );
+          return Boolean(question && questionIsResolved(question));
         })) {
           changed = true;
           continue;
@@ -1755,55 +1899,28 @@ export function SessionTab({
     });
   }, [questionGroups]);
 
-  const answerQuestion = useCallback(async (event: SessionEvent, optionIndex: number) => {
-    const question = event.question;
-    const toolUseId = question?.tool_use_id;
-    if (
-      !question ||
-      !toolUseId ||
-      question.answered_option !== null ||
-      question.custom_reply
-    ) {
-      return;
-    }
-    const group = questionGroups.get(toolUseId) ?? [event];
-    const previous = questionDrafts[toolUseId] ?? { answers: {}, sending: false, error: null };
-    if (previous.sending) return;
-    const nextAnswers = { ...previous.answers, [question.prompt]: optionIndex };
-    const payloadAnswers = group.map((candidate) => {
-      const candidateQuestion = candidate.question;
-      if (!candidateQuestion) return null;
-      const selectedIndex =
-        candidateQuestion.answered_option !== null
-          ? candidateQuestion.answered_option
-          : nextAnswers[candidateQuestion.prompt];
-      if (selectedIndex === undefined || selectedIndex === null) return null;
-      const answer = candidateQuestion.options[selectedIndex];
-      if (!answer) return null;
-      return [candidateQuestion.prompt, answer] as const;
-    });
-    const ready = payloadAnswers.every((candidate) => candidate !== null);
+  const sendQuestionAnswers = useCallback(async (
+    toolUseId: string,
+    answers: Record<string, QuestionAnswerDraft>,
+    payload: Record<string, string | string[]>,
+  ) => {
     setQuestionDrafts((current) => ({
       ...current,
       [toolUseId]: {
-        answers: nextAnswers,
-        sending: ready,
+        answers,
+        sending: true,
+        submitted: false,
         error: null,
       },
     }));
-    if (!ready) return;
-    const readyAnswers = payloadAnswers.filter(
-      (candidate): candidate is readonly [string, string] => candidate !== null,
-    );
     try {
-      await respondToAgentRequest(ticket, toolUseId, {
-        answers: Object.fromEntries(readyAnswers),
-      });
+      await respondToAgentRequest(ticket, toolUseId, { answers: payload });
       setQuestionDrafts((current) => ({
         ...current,
         [toolUseId]: {
-          answers: nextAnswers,
+          answers,
           sending: false,
+          submitted: true,
           error: null,
         },
       }));
@@ -1811,8 +1928,9 @@ export function SessionTab({
       setQuestionDrafts((current) => ({
         ...current,
         [toolUseId]: {
-          answers: previous.answers,
+          answers,
           sending: false,
+          submitted: false,
           error:
             submitError instanceof Error
               ? submitError.message
@@ -1820,12 +1938,140 @@ export function SessionTab({
         },
       }));
     }
-  }, [questionDrafts, questionGroups, ticket]);
+  }, [ticket]);
+
+  const selectOption = useCallback((event: SessionEvent, optionIndex: number) => {
+    const question = event.question;
+    const toolUseId = question?.tool_use_id;
+    if (
+      !question ||
+      !toolUseId ||
+      questionIsResolved(question)
+    ) {
+      return;
+    }
+    const group = questionGroups.get(toolUseId) ?? [event];
+    const previous = questionDrafts[toolUseId] ?? {
+      answers: {},
+      sending: false,
+      submitted: false,
+      error: null,
+    };
+    if (previous.sending || previous.submitted) return;
+    const currentAnswer = previous.answers[question.prompt] ?? emptyQuestionAnswer();
+    const optionIndexes = question.multi_select
+      ? currentAnswer.optionIndexes.includes(optionIndex)
+        ? currentAnswer.optionIndexes.filter((index) => index !== optionIndex)
+        : [...currentAnswer.optionIndexes, optionIndex].sort((a, b) => a - b)
+      : [optionIndex];
+    const nextAnswer = {
+      ...currentAnswer,
+      optionIndexes,
+      ...(question.multi_select
+        ? {}
+        : { otherSelected: false, customReply: "" }),
+    };
+    const nextAnswers = { ...previous.answers, [question.prompt]: nextAnswer };
+    const payload = questionGroupPayload(group, nextAnswers);
+    const shouldAutoSubmit = !group.some((candidate) => candidate.question?.multi_select);
+    if (shouldAutoSubmit && payload) {
+      void sendQuestionAnswers(toolUseId, nextAnswers, payload);
+      return;
+    }
+    setQuestionDrafts((current) => ({
+      ...current,
+      [toolUseId]: {
+        answers: nextAnswers,
+        sending: false,
+        submitted: false,
+        error: null,
+      },
+    }));
+  }, [questionDrafts, questionGroups, sendQuestionAnswers]);
+
+  const selectOther = useCallback((event: SessionEvent, selected: boolean) => {
+    const question = event.question;
+    const toolUseId = question?.tool_use_id;
+    if (!question || !toolUseId || questionIsResolved(question)) return;
+    const previous = questionDrafts[toolUseId] ?? {
+      answers: {},
+      sending: false,
+      submitted: false,
+      error: null,
+    };
+    if (previous.sending || previous.submitted) return;
+    const currentAnswer = previous.answers[question.prompt] ?? emptyQuestionAnswer();
+    const nextAnswers = {
+      ...previous.answers,
+      [question.prompt]: {
+        ...currentAnswer,
+        optionIndexes: question.multi_select ? currentAnswer.optionIndexes : [],
+        otherSelected: selected,
+        customReply: selected ? currentAnswer.customReply : "",
+      },
+    };
+    setQuestionDrafts((current) => ({
+      ...current,
+      [toolUseId]: {
+        answers: nextAnswers,
+        sending: false,
+        submitted: false,
+        error: null,
+      },
+    }));
+  }, [questionDrafts]);
+
+  const setCustomReply = useCallback((event: SessionEvent, value: string) => {
+    const question = event.question;
+    const toolUseId = question?.tool_use_id;
+    if (!question || !toolUseId || questionIsResolved(question)) return;
+    const previous = questionDrafts[toolUseId] ?? {
+      answers: {},
+      sending: false,
+      submitted: false,
+      error: null,
+    };
+    if (previous.sending || previous.submitted) return;
+    const currentAnswer = previous.answers[question.prompt] ?? emptyQuestionAnswer();
+    const nextAnswers = {
+      ...previous.answers,
+      [question.prompt]: {
+        ...currentAnswer,
+        optionIndexes: question.multi_select ? currentAnswer.optionIndexes : [],
+        otherSelected: true,
+        customReply: value,
+      },
+    };
+    setQuestionDrafts((current) => ({
+      ...current,
+      [toolUseId]: {
+        answers: nextAnswers,
+        sending: false,
+        submitted: false,
+        error: null,
+      },
+    }));
+  }, [questionDrafts]);
+
+  const submitQuestions = useCallback((event: SessionEvent) => {
+    const toolUseId = event.question?.tool_use_id;
+    if (!toolUseId) return;
+    const group = questionGroups.get(toolUseId) ?? [event];
+    const draft = questionDrafts[toolUseId];
+    if (!draft || draft.sending || draft.submitted) return;
+    const payload = questionGroupPayload(group, draft.answers);
+    if (!payload) return;
+    void sendQuestionAnswers(toolUseId, draft.answers, payload);
+  }, [questionDrafts, questionGroups, sendQuestionAnswers]);
 
   const questionUi = useMemo<QuestionUiContextValue>(() => ({
     drafts: questionDrafts,
-    answerQuestion,
-  }), [answerQuestion, questionDrafts]);
+    groups: questionGroups,
+    selectOption,
+    selectOther,
+    setCustomReply,
+    submitQuestions,
+  }), [questionDrafts, questionGroups, selectOption, selectOther, setCustomReply, submitQuestions]);
 
   const displayEvents = useMemo(
     () => {
