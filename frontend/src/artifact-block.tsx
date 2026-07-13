@@ -10,6 +10,7 @@ import {
   GitBranch,
   Image as ImageIcon,
   Info,
+  PanelRightOpen,
   Shapes,
   Table2,
   X,
@@ -58,7 +59,7 @@ const KIND_ICONS: Record<ArtifactKind, LucideIcon> = {
   code: Code2,
 };
 
-function artifactUrl(ticket: string, event: SessionEvent): string {
+export function artifactUrl(ticket: string, event: SessionEvent): string {
   return `/api/agents/${encodeURIComponent(ticket)}/artifact/${encodeURIComponent(event.artifact_id ?? "")}`;
 }
 
@@ -134,7 +135,7 @@ function downloadName(event: SessionEvent): string {
   return `${base}.${extension}`;
 }
 
-function MermaidRenderer({ source }: { source: string }) {
+export function MermaidRenderer({ source }: { source: string }) {
   const theme = useCurrentTheme();
   const reactId = useId();
   const [html, setHtml] = useState("");
@@ -173,7 +174,7 @@ function MermaidRenderer({ source }: { source: string }) {
   return <div className="artifact-mermaid" dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
-function SvgRenderer({ source }: { source: string }) {
+export function SvgRenderer({ source }: { source: string }) {
   const [html, setHtml] = useState("");
   useEffect(() => {
     let cancelled = false;
@@ -192,11 +193,19 @@ function SvgRenderer({ source }: { source: string }) {
   return <div className="artifact-svg" dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
-function ImageRenderer({ artifact, event, ticket }: ArtifactRendererProps) {
+export function ImageRenderer({ artifact, event, onImageLoad, ticket }: ArtifactRendererProps) {
   const source = artifact.data_base64
     ? `data:${artifact.mime ?? "image/png"};base64,${artifact.data_base64}`
     : artifactUrl(ticket, event);
-  return <img alt={event.title || event.caption || "Agent artifact"} className="artifact-image" loading="lazy" src={source} />;
+  return (
+    <img
+      alt={event.title || event.caption || "Agent artifact"}
+      className="artifact-image"
+      loading="lazy"
+      src={source}
+      onLoad={(loadEvent) => onImageLoad?.(loadEvent.currentTarget)}
+    />
+  );
 }
 
 function compareCells(left: unknown, right: unknown, column: ArtifactColumn): number {
@@ -308,7 +317,7 @@ function TableRenderer({ artifact }: { artifact: SessionArtifact }) {
   );
 }
 
-function PlotRenderer({ spec }: { spec: Record<string, unknown> }) {
+export function PlotRenderer({ actions = false, spec }: { actions?: boolean; spec: Record<string, unknown> }) {
   const theme = useCurrentTheme();
   const container = useRef<HTMLDivElement>(null);
   const [error, setError] = useState<string | null>(null);
@@ -345,7 +354,7 @@ function PlotRenderer({ spec }: { spec: Record<string, unknown> }) {
     };
     void import("vega-embed").then(async ({ default: embed }) => {
       try {
-        const result = await embed(target, themedSpec, { actions: false, renderer: "svg" });
+        const result = await embed(target, themedSpec, { actions, renderer: "svg" });
         finalize = result.finalize;
         if (!finalized) setError(null);
       } catch (reason) {
@@ -357,7 +366,7 @@ function PlotRenderer({ spec }: { spec: Record<string, unknown> }) {
       finalize?.();
       target.replaceChildren();
     };
-  }, [spec, theme]);
+  }, [actions, spec, theme]);
   return error ? <div className="artifact-error">{error}</div> : <div className="artifact-plot" ref={container} />;
 }
 
@@ -395,13 +404,14 @@ function CodeRenderer({ artifact }: { artifact: SessionArtifact }) {
   );
 }
 
-type ArtifactRendererProps = {
+export type ArtifactRendererProps = {
   artifact: SessionArtifact;
   event: SessionEvent;
+  onImageLoad?: (image: HTMLImageElement) => void;
   ticket: string;
 };
 
-function ArtifactRenderer(props: ArtifactRendererProps): ReactNode {
+export function ArtifactRenderer(props: ArtifactRendererProps): ReactNode {
   const { artifact } = props;
   switch (artifact.kind) {
     case "mermaid":
@@ -442,11 +452,108 @@ function TableCopyMenu({ artifact, onCopied }: { artifact: SessionArtifact; onCo
   );
 }
 
-export function ArtifactBlock({ event, ticket }: { event: SessionEvent; ticket: string }) {
+function numericSvgAttribute(source: string, name: string): number | null {
+  const match = source.match(new RegExp(`\\b${name}=["']([0-9.]+)(?:px)?["']`, "i"));
+  if (!match) return null;
+  const value = Number(match[1]);
+  return Number.isFinite(value) ? value : null;
+}
+
+function svgBounds(source: string): { width: number; height: number } | null {
+  const width = numericSvgAttribute(source, "width");
+  const height = numericSvgAttribute(source, "height");
+  if (width !== null && height !== null) return { width, height };
+  const viewBox = source.match(/\bviewBox=["']\s*[-0-9.]+\s+[-0-9.]+\s+([0-9.]+)\s+([0-9.]+)\s*["']/i);
+  if (!viewBox) return null;
+  return { width: Number(viewBox[1]), height: Number(viewBox[2]) };
+}
+
+function mermaidNodeCount(source: string): number {
+  const nodes = new Set<string>();
+  const add = (value: string | undefined) => {
+    if (value && !["flowchart", "graph", "subgraph", "end", "direction", "participant"].includes(value)) nodes.add(value);
+  };
+  for (const line of source.split("\n")) {
+    const clean = line.replace(/%%.*$/, "");
+    for (const match of clean.matchAll(/(?:^|[\s;&])([A-Za-z_][\w-]*)\s*(?=(?:\[|\(|\{|>|-->|---|-.->|==>|->>|-->>))/g)) add(match[1]);
+    for (const match of clean.matchAll(/(?:-->|---|-.->|==>|->>|-->>)\s*([A-Za-z_][\w-]*)/g)) add(match[1]);
+    for (const match of clean.matchAll(/\bparticipant\s+([A-Za-z_][\w-]*)/g)) add(match[1]);
+  }
+  return nodes.size;
+}
+
+function plotExceedsInlineBounds(spec: Record<string, unknown>) {
+  const bytes = new TextEncoder().encode(JSON.stringify(spec)).byteLength;
+  const width = typeof spec.width === "number" ? spec.width : 0;
+  const height = typeof spec.height === "number" ? spec.height : 0;
+  return bytes > 100 * 1024 || width > 640 || height > 400;
+}
+
+export function artifactExceedsInlineThreshold(
+  artifact: SessionArtifact,
+  imageBounds?: { width: number; height: number } | null,
+): boolean {
+  switch (artifact.kind) {
+    case "table": return (artifact.rows?.length ?? 0) > 30;
+    case "code": return (artifact.source ?? "").split("\n").length > 100;
+    case "image": return Boolean(imageBounds && (imageBounds.width > 400 || imageBounds.height > 400));
+    case "mermaid": return mermaidNodeCount(artifact.source ?? "") > 20;
+    case "svg": {
+      const bounds = svgBounds(artifact.source ?? "");
+      return Boolean(bounds && (bounds.width > 400 || bounds.height > 400));
+    }
+    case "plot": return plotExceedsInlineBounds(artifact.spec_vega_lite ?? {});
+  }
+}
+
+function CompactPreview({ artifact, event, ticket }: ArtifactRendererProps) {
+  if (artifact.kind === "table") {
+    const columns = artifact.columns ?? [];
+    const rows = artifact.rows ?? [];
+    return (
+      <div className="artifact-compact-table">
+        <table className="artifact-table tabular-nums">
+          <thead><tr>{columns.map((column) => <th className={`is-${column.type}`} key={column.key}><span>{column.label}</span></th>)}</tr></thead>
+          <tbody>{rows.slice(0, 5).map((row, rowIndex) => <tr key={rowIndex}>{columns.map((column, columnIndex) => <td className={`is-${column.type}`} key={column.key}>{String(row[columnIndex] ?? "")}</td>)}</tr>)}</tbody>
+        </table>
+        <span className="artifact-compact-summary">+ {Math.max(0, rows.length - 5)} rows (click to open)</span>
+      </div>
+    );
+  }
+  if (artifact.kind === "code") {
+    const lines = (artifact.source ?? "").split("\n");
+    return (
+      <div className="artifact-compact-code">
+        {artifact.filename ? <div className="artifact-code-filename">{artifact.filename}</div> : null}
+        <pre><code>{lines.slice(0, 10).join("\n")}</code></pre>
+        <span className="artifact-compact-summary">… {lines.length - 10} lines folded · Open in panel</span>
+      </div>
+    );
+  }
+  if (artifact.kind === "image") {
+    const source = artifact.data_base64
+      ? `data:${artifact.mime ?? "image/png"};base64,${artifact.data_base64}`
+      : artifactUrl(ticket, event);
+    return <img alt={event.title || event.caption || "Agent artifact"} className="artifact-image artifact-compact-image" loading="lazy" src={source} />;
+  }
+  return <ArtifactRenderer artifact={artifact} event={event} ticket={ticket} />;
+}
+
+export function ArtifactBlock({
+  event,
+  onOpen,
+  ticket,
+}: {
+  event: SessionEvent;
+  onOpen?: (event: SessionEvent) => void;
+  ticket: string;
+}) {
   const artifact = event.artifact;
   const [inspect, setInspect] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [imageBounds, setImageBounds] = useState<{ width: number; height: number } | null>(null);
   const copiedTimer = useRef<number | null>(null);
+  useEffect(() => setImageBounds(null), [event.artifact_id]);
   useEffect(() => () => {
     if (copiedTimer.current !== null) window.clearTimeout(copiedTimer.current);
   }, []);
@@ -454,6 +561,7 @@ export function ArtifactBlock({ event, ticket }: { event: SessionEvent; ticket: 
   const resolvedArtifact = artifact;
   const Icon = KIND_ICONS[resolvedArtifact.kind] ?? FileJson;
   const rowCount = resolvedArtifact.kind === "table" ? resolvedArtifact.rows?.length ?? 0 : null;
+  const oversized = artifactExceedsInlineThreshold(resolvedArtifact, imageBounds);
 
   function showCopied() {
     setCopied(true);
@@ -493,7 +601,12 @@ export function ArtifactBlock({ event, ticket }: { event: SessionEvent; ticket: 
 
   return (
     <div className={`artifact-block-shell${inspect ? " has-inspect" : ""}`}>
-      <section className="artifact-block" data-artifact-kind={resolvedArtifact.kind}>
+      <section
+        className={`artifact-block${oversized ? " is-compact" : ""}`}
+        data-artifact-compact={oversized || undefined}
+        data-artifact-id={event.artifact_id}
+        data-artifact-kind={resolvedArtifact.kind}
+      >
         <header className="artifact-header">
           <div className="artifact-heading">
             <Icon size={14} />
@@ -504,6 +617,11 @@ export function ArtifactBlock({ event, ticket }: { event: SessionEvent; ticket: 
             {rowCount !== null ? <span className="artifact-count tabular-nums">{rowCount} rows</span> : null}
           </div>
           <div className="artifact-actions">
+            {oversized && onOpen ? (
+              <button className="artifact-action artifact-open-panel" type="button" onClick={() => onOpen?.(event)}>
+                <PanelRightOpen size={12} /> Open in panel
+              </button>
+            ) : null}
             {resolvedArtifact.kind === "table" ? (
               <TableCopyMenu artifact={resolvedArtifact} onCopied={showCopied} />
             ) : (
@@ -524,8 +642,17 @@ export function ArtifactBlock({ event, ticket }: { event: SessionEvent; ticket: 
             </button>
           </div>
         </header>
-        <div className="artifact-body">
-          <ArtifactRenderer artifact={resolvedArtifact} event={event} ticket={ticket} />
+        <div className="artifact-body" onClick={oversized && onOpen ? () => onOpen(event) : undefined}>
+          {oversized ? (
+            <CompactPreview artifact={resolvedArtifact} event={event} ticket={ticket} />
+          ) : (
+            <ArtifactRenderer
+              artifact={resolvedArtifact}
+              event={event}
+              ticket={ticket}
+              onImageLoad={(image) => setImageBounds({ width: image.naturalWidth, height: image.naturalHeight })}
+            />
+          )}
         </div>
       </section>
       {inspect ? (

@@ -6357,6 +6357,65 @@ body.is-resizing-panes .pane-cell {
   overflow: hidden;
 }
 
+.artifact-block.is-compact .artifact-body {
+  min-height: 0;
+  cursor: pointer;
+}
+
+.artifact-compact-table {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid var(--table-border-color);
+}
+
+.artifact-compact-table .artifact-table th > span {
+  display: block;
+  height: 31px;
+  padding: 7px 9px;
+}
+
+.artifact-compact-summary {
+  display: inline-flex;
+  align-items: center;
+  margin: 9px;
+  padding: 3px 7px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 999px;
+  background: var(--background-secondary);
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-size: 10px;
+}
+
+.artifact-compact-code {
+  overflow: hidden;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--code-background);
+}
+
+.artifact-compact-code pre {
+  max-height: 15em;
+  margin: 0;
+  padding: 10px;
+  overflow: hidden;
+  color: var(--text-normal);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.5;
+}
+
+.artifact-compact-image,
+.artifact-block.is-compact .artifact-svg > svg,
+.artifact-block.is-compact .artifact-mermaid svg {
+  max-width: 400px;
+  max-height: 400px;
+}
+
+.artifact-block.is-compact .artifact-plot {
+  max-height: 400px;
+  overflow: hidden;
+}
+
 .artifact-loading,
 .artifact-error {
   display: grid;
@@ -6555,6 +6614,459 @@ body.is-resizing-panes .pane-cell {
   line-height: 1.5;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+/* Artifact split-pane */
+
+.artifact-panel {
+  z-index: 20;
+  min-width: 320px;
+  max-width: 70%;
+  overflow: visible;
+}
+
+.artifact-panel-tabs {
+  position: relative;
+  display: flex;
+  flex: 0 0 auto;
+  min-height: 40px;
+  padding-right: 35px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+  overflow: visible;
+}
+
+.artifact-panel-tab {
+  position: relative;
+  display: flex;
+  flex: 1 1 132px;
+  min-width: 0;
+  max-width: 220px;
+  border-right: 1px solid var(--background-modifier-border);
+  color: var(--text-muted);
+}
+
+.artifact-panel-tab.is-active {
+  background: var(--background-primary);
+  color: var(--text-normal);
+  box-shadow: inset 0 -2px 0 var(--accent-primary);
+}
+
+.artifact-panel-tab-main {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  padding: 6px 5px 5px 9px;
+  text-align: left;
+}
+
+.artifact-panel-tab-main span {
+  overflow: hidden;
+  font-family: var(--font-monospace);
+  font-size: 10px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.artifact-panel-tab-main small {
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-size: 9px;
+}
+
+.artifact-panel-tab-action,
+.artifact-panel-close {
+  display: grid;
+  flex: 0 0 22px;
+  width: 22px;
+  place-items: center;
+  color: var(--text-faint);
+}
+
+.artifact-panel-tab-action:hover,
+.artifact-panel-close:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.artifact-panel-close {
+  position: absolute;
+  top: 7px;
+  right: 6px;
+  z-index: 2;
+  height: 26px;
+}
+
+.artifact-panel-tab-menu {
+  position: absolute;
+  top: 35px;
+  right: 18px;
+  z-index: 40;
+  min-width: 170px;
+  padding: 4px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 2px;
+  background: var(--background-primary);
+  box-shadow: var(--shadow-floating);
+}
+
+.artifact-panel-tab-menu button {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 6px 7px;
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-size: 10px;
+  text-align: left;
+}
+
+.artifact-panel-tab-menu button span {
+  margin-left: auto;
+}
+
+.artifact-panel-recent {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 5px;
+  min-height: 30px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-size: 9px;
+  overflow-x: auto;
+}
+
+.artifact-panel-recent > span {
+  flex: 0 0 auto;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.artifact-panel-recent button {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 999px;
+  color: var(--text-muted);
+}
+
+.artifact-panel-recent button:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.artifact-panel-detail {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.artifact-panel-missing {
+  display: grid;
+  flex: 1;
+  place-items: center;
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+}
+
+.artifact-detail-toolbar {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 5px;
+  min-height: 38px;
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+  overflow-x: auto;
+}
+
+.artifact-detail-toolbar button,
+.artifact-detail-toolbar select {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 25px;
+  padding: 4px 7px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 2px;
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.artifact-detail-toolbar button:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.artifact-panzoom-detail,
+.artifact-plot-detail,
+.artifact-table-detail,
+.artifact-code-detail {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.artifact-zoom-value {
+  margin-left: auto;
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-size: 10px;
+}
+
+.artifact-panzoom-viewport {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  background-color: var(--background-primary);
+  background-image: radial-gradient(var(--background-modifier-border) 0.7px, transparent 0.7px);
+  background-size: 16px 16px;
+  overflow: hidden;
+  cursor: grab;
+  touch-action: none;
+}
+
+.artifact-panzoom-viewport:active {
+  cursor: grabbing;
+}
+
+.artifact-panzoom-content {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  transform-origin: center;
+  will-change: transform;
+}
+
+.artifact-panzoom-content .artifact-mermaid,
+.artifact-panzoom-content .artifact-svg {
+  width: max-content;
+  min-width: 0;
+  min-height: 0;
+  overflow: visible;
+}
+
+.artifact-detail-image {
+  display: block;
+  max-width: none;
+  max-height: none;
+  border: 1px solid var(--image-outline);
+}
+
+.artifact-plot-detail-canvas {
+  flex: 1;
+  min-height: 0;
+  padding: 16px;
+  overflow: auto;
+}
+
+.artifact-plot-detail-canvas .artifact-plot {
+  min-height: 100%;
+}
+
+.artifact-table-toolbar {
+  flex-wrap: wrap;
+}
+
+.artifact-filter,
+.artifact-code-find {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 180px;
+  padding: 3px 7px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 2px;
+  color: var(--text-faint);
+  background: var(--background-primary);
+}
+
+.artifact-filter input,
+.artifact-code-find input {
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text-normal);
+  font-family: var(--font-monospace);
+  font-size: 10px;
+}
+
+.artifact-table-result-count {
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-size: 10px;
+}
+
+.artifact-table-detail-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+.artifact-table-detail .artifact-table {
+  width: max-content;
+  min-width: 100%;
+}
+
+.artifact-table-detail-heading {
+  display: flex;
+  min-width: 120px;
+}
+
+.artifact-table-detail-heading > button:first-child {
+  flex: 1;
+}
+
+.artifact-table-detail-heading .artifact-table-copy-column {
+  flex: 0 0 28px;
+  width: 28px;
+  padding: 0;
+  justify-content: center;
+  border-left: 1px solid var(--table-border-color);
+}
+
+.artifact-table-row-action {
+  width: 30px;
+  padding: 0 !important;
+  text-align: center !important;
+}
+
+.artifact-table-row-action button {
+  display: grid;
+  width: 30px;
+  height: 31px;
+  place-items: center;
+  color: var(--text-faint);
+}
+
+.artifact-table-row-action button:hover {
+  color: var(--text-normal);
+}
+
+.artifact-code-detail-filename {
+  flex: 0 0 auto;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-size: 10px;
+}
+
+.artifact-code-detail-source {
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  padding: 8px 0 24px;
+  overflow: auto;
+  background: var(--code-background);
+  color: var(--text-normal);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.55;
+}
+
+.artifact-code-line {
+  display: flex;
+  min-width: max-content;
+}
+
+.artifact-code-gutter {
+  position: sticky;
+  left: 0;
+  display: inline-flex;
+  flex: 0 0 66px;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 5px;
+  padding-right: 8px;
+  background: var(--code-background);
+  color: var(--text-faint);
+  user-select: none;
+}
+
+.artifact-code-gutter button {
+  display: grid;
+  width: 16px;
+  height: 16px;
+  place-items: center;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 2px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.artifact-code-line code {
+  padding-right: 24px;
+  white-space: pre;
+}
+
+.artifact-code-line mark {
+  border-radius: 1px;
+  background: color-mix(in srgb, var(--accent-primary) 36%, transparent);
+  color: inherit;
+}
+
+.artifact-code-fold-marker {
+  padding: 2px 10px 2px 72px;
+  color: var(--text-faint);
+  font-style: italic;
+}
+
+.artifact-code-find {
+  margin-left: auto;
+}
+
+.artifact-code-find > span {
+  flex: 0 0 auto;
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-size: 9px;
+}
+
+.artifact-code-find button {
+  min-height: 18px;
+  padding: 1px;
+  border: 0;
+}
+
+@keyframes artifact-slideover-in {
+  from { transform: translateX(24px); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+
+@media (max-width: 899px) {
+  .artifact-panel.session-side-panel,
+  .agent-pane .artifact-panel.session-side-panel {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    width: 100vw !important;
+    max-width: none;
+    min-width: 0;
+    height: 100vh;
+    border: 0;
+    animation: artifact-slideover-in 150ms ease-out;
+  }
+
+  .artifact-panel > .session-resize {
+    display: none;
+  }
 }
 
 @media (max-width: 760px) {
