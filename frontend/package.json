@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
-    "test": "node tests/native-transcript-surfaces.playwright.mjs && node tests/ask-user-question-multi-select.playwright.mjs && node tests/wiki59-shiki.playwright.mjs && node tests/wiki87-code-overflow.playwright.mjs && node tests/session-model-footer.playwright.mjs && node tests/replace-agent-modal.playwright.mjs && node tests/dead-archive.playwright.mjs",
+    "test": "node tests/native-transcript-surfaces.playwright.mjs && node tests/ask-user-question-multi-select.playwright.mjs && node tests/wiki59-shiki.playwright.mjs && node tests/wiki87-code-overflow.playwright.mjs && node tests/session-model-footer.playwright.mjs && node tests/replace-agent-modal.playwright.mjs && node tests/dead-archive.playwright.mjs && node tests/wiki-85-artifacts.playwright.mjs",
     "build": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.node.json --noEmit && vite build",
     "preview": "vite preview"
   },
@@ -28,13 +28,17 @@
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/addon-webgl": "^0.19.0",
     "@xterm/xterm": "^6.0.0",
+    "diff": "^9.0.0",
+    "dompurify": "^3.4.12",
     "lucide-react": "^0.561.0",
+    "mermaid": "^11.16.0",
     "react": "^19.2.1",
     "react-dom": "^19.2.1",
     "react-markdown": "^10.1.0",
     "remark-breaks": "^4.0.0",
     "remark-gfm": "^4.0.1",
     "shiki": "^4.3.1",
+    "vega-embed": "^7.1.0",
     "vite": "^7.3.0"
   },
   "devDependencies": {

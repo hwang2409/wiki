@@ -65,6 +65,7 @@ import type {
   SubagentInfo,
 } from "./api";
 import { renderAnsi } from "./ansi";
+import { ArtifactBlock } from "./artifact-block";
 import { externalLinkProps } from "./external-links";
 import {
   GhPreviewCard,
@@ -1062,6 +1063,8 @@ function getEstimatedGroupHeight(group: EventGroup): number {
       return Math.max(52, 20 + estimateWrappedLines(group.event.text, 96) * 20);
     case "image":
       return 44;
+    case "artifact":
+      return 420;
     case "notification":
     case "command":
     case "interrupt":
@@ -1485,13 +1488,18 @@ const MessageBlock = memo(function MessageBlock({
   event,
   imageNums,
   rowKey,
+  ticket,
   uiState,
 }: {
   event: SessionEvent;
   imageNums?: number[];
   rowKey: number;
+  ticket: string;
   uiState: SessionUiState;
 }) {
+  if (event.kind === "artifact") {
+    return <ArtifactBlock event={event} ticket={ticket} />;
+  }
   if (event.kind === "user") {
     return (
       <div className="session-user">
@@ -1553,6 +1561,7 @@ const MessageBlock = memo(function MessageBlock({
 }, (prev, next) =>
   prev.event === next.event &&
   prev.rowKey === next.rowKey &&
+  prev.ticket === next.ticket &&
   prev.uiState === next.uiState &&
   sameImageNums(prev.imageNums, next.imageNums)
 );
@@ -1681,6 +1690,7 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
   onInspect,
   showTimestamp,
   top,
+  ticket,
   uiState,
 }: {
   group: EventGroup;
@@ -1689,6 +1699,7 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
   onInspect?: (agentId: string) => void;
   showTimestamp: boolean;
   top: number;
+  ticket: string;
   uiState: SessionUiState;
 }) {
   const rowRef = useMeasuredRow(group, onHeightChange);
@@ -1710,6 +1721,7 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
           event={group.event}
           imageNums={imageNums}
           rowKey={group.key}
+          ticket={ticket}
           uiState={uiState}
         />
       )}
@@ -1722,6 +1734,7 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
     prev.onHeightChange !== next.onHeightChange ||
     prev.onInspect !== next.onInspect ||
     prev.showTimestamp !== next.showTimestamp ||
+    prev.ticket !== next.ticket ||
     prev.uiState !== next.uiState
   ) {
     return false;
@@ -2402,6 +2415,7 @@ export function SessionTab({
                 onHeightChange={reportRowHeight}
                 onInspect={onInspect}
                 showTimestamp={timestampKeys.has(group.key)}
+                ticket={ticket}
                 top={top}
                 uiState={uiState}
               />
