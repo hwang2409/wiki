@@ -1557,6 +1557,11 @@ def agent_session_older(
         raise HTTPException(status_code=409, detail="Older transcript events are unavailable")
     path = Path(raw_path)
     if fmt == "provider-events":
+        if raw_path.startswith("provider://") or not path.is_file():
+            raise HTTPException(
+                status_code=409,
+                detail="Older transcript events are unavailable",
+            )
         provider = session.get("provider")
         if provider not in {"codex", "claude"}:
             raise HTTPException(
