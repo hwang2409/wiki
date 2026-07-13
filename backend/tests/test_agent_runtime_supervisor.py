@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
 from unittest import mock
+from uuid import uuid4
 
 from backend.app import accounts
 from backend.app.agent_runtime.client import (
@@ -304,6 +305,87 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             session_events,
         )
         self.supervisor.unsubscribe(queue)
+
+    async def test_pending_id_round_trips_through_claude_provider_echo(self) -> None:
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-96",
+            provider=ProviderKind.CLAUDE,
+            role="implement",
+            model="fixture-claude",
+            effort=None,
+            worktree=str(self.worktree),
+            prompt="Work on ticket WIKI-96",
+        )
+        await _wait_for_events(self.store, record.run_id, 5)
+        pending_id = str(uuid4())
+
+        sent = await self.supervisor.send_now(
+            record.run_id,
+            "Test test test",
+            pending_id,
+        )
+        self.assertEqual(sent["status"], "sent")
+        self.assertEqual(sent["pending_id"], pending_id)
+        self.assertNotIn("messages", sent)
+
+        adapter = self.supervisor.adapters[record.run_id]
+        await self.supervisor._handle_provider_event(  # noqa: SLF001
+            record.run_id,
+            adapter,
+            ProviderEvent(
+                ProviderKind.CLAUDE,
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Test test test\n<system-reminder>hook</system-reminder>",
+                            }
+                        ],
+                    },
+                },
+            ),
+        )
+
+        for _ in range(100):
+            composer_messages = self.store.get(record.run_id).composer_messages
+            if composer_messages:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            self.fail("Claude provider echo never acknowledged pending_id")
+
+        self.assertEqual(composer_messages[0]["pending_id"], pending_id)
+        self.assertEqual(composer_messages[0]["text"], "Test test test")
+        self.assertEqual(self.store.get(record.run_id).pending_user_messages, [])
+
+    async def test_queued_message_keeps_pending_id_until_delivery(self) -> None:
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-96-QUEUE",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="Work on ticket WIKI-96-QUEUE",
+        )
+        await self.supervisor.send_now(record.run_id, "begin a long turn")
+        pending_id = str(uuid4())
+
+        queued = await self.supervisor.send_on_idle(
+            record.run_id,
+            "deliver later",
+            pending_id,
+        )
+
+        self.assertEqual(queued["status"], "queued")
+        self.assertEqual(queued["messages"][0]["pending_id"], pending_id)
+        self.assertEqual(
+            self.store.get(record.run_id).queued_messages[0]["pending_id"],
+            pending_id,
+        )
 
     async def test_codex_question_before_turn_response_can_be_answered(self) -> None:
         await self.supervisor.close()

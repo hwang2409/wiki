@@ -13,6 +13,7 @@ import unittest
 from pathlib import Path
 from typing import Any, cast
 from unittest import mock
+from uuid import uuid4
 
 from fastapi import BackgroundTasks, HTTPException
 
@@ -182,12 +183,20 @@ class FakeSupervisorClient:
             self.registry_path.write_text(json.dumps(registry), encoding="utf-8")
             return {**current, "agent_id": agent_id}
         if method == "run/send_now":
-            return {"status": "sent"}
+            response: dict[str, Any] = {"status": "sent"}
+            if values.get("pending_id"):
+                response.update(
+                    pending_id=values["pending_id"],
+                    messages=list(self.messages),
+                )
+            return response
         if method == "run/send_on_idle":
             message = {
                 "text": values["text"],
                 "queued_at": "2026-07-09T12:00:00+00:00",
             }
+            if values.get("pending_id"):
+                message["pending_id"] = values["pending_id"]
             self.messages.append(message)
             return {
                 "status": "queued",
@@ -389,6 +398,8 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_composer_and_queue_shapes_route_only_to_supervisor(self) -> None:
         self._seed_headless()
+        sent_pending_id = uuid4()
+        queued_pending_id = uuid4()
         with mock.patch.object(
             main,
             "resolve_window",
@@ -396,18 +407,33 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         ):
             sent = main.agent_message(
                 "WIKI-42",
-                main.MessageIn(text="steer now", mode="now"),
+                main.MessageIn(
+                    text="steer now",
+                    mode="now",
+                    pending_id=sent_pending_id,
+                ),
                 BackgroundTasks(),
             )
             queued = main.agent_message(
                 "WIKI-42",
-                main.MessageIn(text="after idle", mode="on-idle"),
+                main.MessageIn(
+                    text="after idle",
+                    mode="on-idle",
+                    pending_id=queued_pending_id,
+                ),
                 BackgroundTasks(),
             )
             listed = main.agent_queue("WIKI-42")
             deleted = main.agent_queue_delete("WIKI-42", 0)
 
-        self.assertEqual(sent, {"status": "sent"})
+        self.assertEqual(
+            sent,
+            {
+                "status": "sent",
+                "pending_id": str(sent_pending_id),
+                "messages": [],
+            },
+        )
         self.assertEqual(
             queued,
             {
@@ -417,6 +443,7 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
                     {
                         "text": "after idle",
                         "queued_at": "2026-07-09T12:00:00+00:00",
+                        "pending_id": str(queued_pending_id),
                     }
                 ],
             },
@@ -432,6 +459,8 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
                 "run/queue/delete",
             ],
         )
+        self.assertEqual(self.client.calls[0][1]["pending_id"], str(sent_pending_id))
+        self.assertEqual(self.client.calls[1][1]["pending_id"], str(queued_pending_id))
 
     async def test_set_model_routes_to_supervisor_and_cancel_clears_pending(self) -> None:
         self._seed_headless()

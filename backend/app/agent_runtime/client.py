@@ -114,13 +114,22 @@ class SupervisorClient:
     def ping(self) -> dict[str, Any]:
         return dict(self.request("ping"))
 
-    def send_message(self, agent_id: str, text: str, mode: str) -> dict[str, Any]:
+    def send_message(
+        self,
+        agent_id: str,
+        text: str,
+        mode: str,
+        pending_id: str | None = None,
+    ) -> dict[str, Any]:
         """Preserve POST /api/agents/<id>/message's now/on-idle contract."""
 
         if mode not in {"now", "on-idle"}:
             raise ValueError("mode must be now or on-idle")
         method = "run/send_now" if mode == "now" else "run/send_on_idle"
-        return dict(self.request(method, {"agent_id": agent_id, "text": text}))
+        params = {"agent_id": agent_id, "text": text}
+        if pending_id is not None:
+            params["pending_id"] = pending_id
+        return dict(self.request(method, params))
 
     def queue(self, agent_id: str) -> dict[str, Any]:
         return dict(self.request("run/queue", {"agent_id": agent_id}))

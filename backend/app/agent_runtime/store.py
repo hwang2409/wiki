@@ -1323,10 +1323,117 @@ class RunStore:
                 self._write_registry(registry)
             return record
 
-    def queue_message(self, run_id: str, text: str) -> RunRecord:
+    def track_pending_user_message(
+        self,
+        run_id: str,
+        pending_id: str,
+        text: str,
+    ) -> RunRecord:
         with self._lock:
             record = self.get(run_id)
-            record.queued_messages.append({"text": text, "queued_at": utc_now()})
+            record.pending_user_messages.append(
+                {"pending_id": pending_id, "text": text, "sent_at": utc_now()}
+            )
+            self._write_record(record)
+            return record
+
+    def match_pending_user_message(
+        self,
+        run_id: str,
+        echoed_text: str,
+    ) -> dict[str, str] | None:
+        normalized_echo = echoed_text.strip()
+        if not normalized_echo:
+            return None
+        with self._lock:
+            record = self.get(run_id)
+            exact = next(
+                (
+                    message
+                    for message in record.pending_user_messages
+                    if message.get("text", "").strip() == normalized_echo
+                ),
+                None,
+            )
+            if exact is not None:
+                return dict(exact)
+            for message in record.pending_user_messages:
+                text = message.get("text", "").strip()
+                suffix = normalized_echo[len(text) :].lstrip() if text else ""
+                prefix = normalized_echo[: -len(text)].rstrip() if text else ""
+                if text and (
+                    (normalized_echo.startswith(text) and suffix.startswith("<"))
+                    or (normalized_echo.endswith(text) and prefix.endswith(">"))
+                ):
+                    return dict(message)
+            return None
+
+    def acknowledge_pending_user_message(
+        self,
+        run_id: str,
+        pending_id: str,
+        *,
+        echoed_at: str,
+        seq: int,
+    ) -> RunRecord:
+        with self._lock:
+            record = self.get(run_id)
+            matched = next(
+                (
+                    message
+                    for message in record.pending_user_messages
+                    if message.get("pending_id") == pending_id
+                ),
+                None,
+            )
+            record.pending_user_messages = [
+                message
+                for message in record.pending_user_messages
+                if message.get("pending_id") != pending_id
+            ]
+            if matched is not None and not any(
+                message.get("pending_id") == pending_id
+                for message in record.composer_messages
+            ):
+                record.composer_messages.append(
+                    {
+                        "pending_id": pending_id,
+                        "text": matched["text"],
+                        "sent_at": matched["sent_at"],
+                        "echoed_at": echoed_at,
+                        "seq": seq,
+                    }
+                )
+            self._write_record(record)
+            return record
+
+    def discard_pending_user_message(
+        self,
+        run_id: str,
+        pending_id: str,
+    ) -> RunRecord:
+        with self._lock:
+            record = self.get(run_id)
+            record.pending_user_messages = [
+                message
+                for message in record.pending_user_messages
+                if message.get("pending_id") != pending_id
+            ]
+            self._write_record(record)
+            return record
+
+    def queue_message(
+        self,
+        run_id: str,
+        text: str,
+        pending_id: str | None = None,
+    ) -> RunRecord:
+        with self._lock:
+            record = self.get(run_id)
+            message = {"text": text, "queued_at": utc_now()}
+            if pending_id is not None:
+                message["pending_id"] = pending_id
+            record.queued_messages.append(message)
             self._write_record(record)
             return record
 

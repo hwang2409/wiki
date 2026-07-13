@@ -291,6 +291,39 @@ class RunStoreTests(unittest.TestCase):
             reloaded = store.get(record.run_id)
             self.assertEqual(reloaded.disposition_counts["rendered"], 1)
 
+    def test_pending_user_message_matching_is_durable_and_fifo_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(_paths(root))
+            record = store.create(_record(root))
+            first = str(uuid4())
+            second = str(uuid4())
+            store.track_pending_user_message(record.run_id, first, "same text")
+            store.track_pending_user_message(record.run_id, second, "same text")
+
+            matched = store.match_pending_user_message(
+                record.run_id,
+                "same text\n<system-reminder>hook context</system-reminder>",
+            )
+            self.assertIsNotNone(matched)
+            assert matched is not None
+            self.assertEqual(matched["pending_id"], first)
+            store.acknowledge_pending_user_message(
+                record.run_id,
+                first,
+                echoed_at="2026-07-13T19:09:03Z",
+                seq=1,
+            )
+
+            reloaded = RunStore(_paths(root))
+            self.assertEqual(
+                reloaded.match_pending_user_message(record.run_id, "same text")[
+                    "pending_id"
+                ],
+                second,
+            )
+            self.assertEqual(reloaded.get(record.run_id).composer_messages[0]["seq"], 1)
+
     def test_event_inspector_pages_from_cursor_or_bounded_tail(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
