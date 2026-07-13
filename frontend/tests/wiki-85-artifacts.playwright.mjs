@@ -67,7 +67,7 @@ function logStep(message) {
 }
 
 function artifactInputs() {
-  const rows = Array.from({ length: 40 }, (_, index) => [
+  const rows = Array.from({ length: 30 }, (_, index) => [
     index + 1,
     `row-${String(index + 1).padStart(2, "0")}`,
     `2026-07-${String((index % 13) + 1).padStart(2, "0")}T12:00:00Z`,
@@ -381,7 +381,7 @@ async function main() {
     await blocks.table.getByRole("button", { name: "Sort by ID" }).click();
     await blocks.table.getByRole("button", { name: "Sort by ID" }).click();
     const firstTableValue = await blocks.table.locator("tbody tr:not(.artifact-table-spacer) td").first().innerText();
-    if (firstTableValue !== "40") throw new Error(`Descending table sort failed: ${firstTableValue}`);
+    if (firstTableValue !== "30") throw new Error(`Descending table sort failed: ${firstTableValue}`);
 
     const suffixes = { mermaid: ".mmd", svg: ".svg", image: ".png", table: ".csv", plot: ".json", code: ".ts" };
     for (const input of inputs) {

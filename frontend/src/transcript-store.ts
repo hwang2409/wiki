@@ -48,6 +48,26 @@ export type TranscriptSnapshot = {
   loading: boolean;
 };
 
+export type ArtifactViewState = {
+  filter?: string;
+  find?: string;
+  findOpen?: boolean;
+  foldedBlocks?: number[];
+  panX?: number;
+  panY?: number;
+  sortColumn?: string | null;
+  sortDirection?: "asc" | "desc" | null;
+  zoom?: number;
+};
+
+export type PanelState = {
+  focusedTab: string | null;
+  open: boolean;
+  recentlyClosed: string[];
+  tabs: string[];
+  viewState: Record<string, ArtifactViewState>;
+};
+
 type Listener = () => void;
 
 type Entry = {
@@ -62,7 +82,26 @@ type Entry = {
 };
 
 const entries = new Map<string, Entry>();
+const panelStates = new Map<string, PanelState>();
 let pollHandle: number | null = null;
+
+export function emptyPanelState(): PanelState {
+  return {
+    focusedTab: null,
+    open: false,
+    recentlyClosed: [],
+    tabs: [],
+    viewState: {},
+  };
+}
+
+export function readPanelState(sessionKey: string): PanelState {
+  return panelStates.get(sessionKey) ?? emptyPanelState();
+}
+
+export function writePanelState(sessionKey: string, state: PanelState) {
+  panelStates.set(sessionKey, state);
+}
 
 function targetKey(target: TranscriptTarget): string {
   return `${target.ticket}::${target.subagent ?? ""}`;

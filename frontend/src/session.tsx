@@ -1487,18 +1487,20 @@ function QuestionRow({ event }: { event: SessionEvent }) {
 const MessageBlock = memo(function MessageBlock({
   event,
   imageNums,
+  onOpenArtifact,
   rowKey,
   ticket,
   uiState,
 }: {
   event: SessionEvent;
   imageNums?: number[];
+  onOpenArtifact?: (event: SessionEvent) => void;
   rowKey: number;
   ticket: string;
   uiState: SessionUiState;
 }) {
   if (event.kind === "artifact") {
-    return <ArtifactBlock event={event} ticket={ticket} />;
+    return <ArtifactBlock event={event} onOpen={onOpenArtifact} ticket={ticket} />;
   }
   if (event.kind === "user") {
     return (
@@ -1561,6 +1563,7 @@ const MessageBlock = memo(function MessageBlock({
 }, (prev, next) =>
   prev.event === next.event &&
   prev.rowKey === next.rowKey &&
+  prev.onOpenArtifact === next.onOpenArtifact &&
   prev.ticket === next.ticket &&
   prev.uiState === next.uiState &&
   sameImageNums(prev.imageNums, next.imageNums)
@@ -1688,6 +1691,7 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
   imageNums,
   onHeightChange,
   onInspect,
+  onOpenArtifact,
   showTimestamp,
   top,
   ticket,
@@ -1697,6 +1701,7 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
   imageNums?: number[];
   onHeightChange: (group: EventGroup, height: number) => void;
   onInspect?: (agentId: string) => void;
+  onOpenArtifact?: (event: SessionEvent) => void;
   showTimestamp: boolean;
   top: number;
   ticket: string;
@@ -1720,6 +1725,7 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
         <MessageBlock
           event={group.event}
           imageNums={imageNums}
+          onOpenArtifact={onOpenArtifact}
           rowKey={group.key}
           ticket={ticket}
           uiState={uiState}
@@ -1733,6 +1739,7 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
     prev.top !== next.top ||
     prev.onHeightChange !== next.onHeightChange ||
     prev.onInspect !== next.onInspect ||
+    prev.onOpenArtifact !== next.onOpenArtifact ||
     prev.showTimestamp !== next.showTimestamp ||
     prev.ticket !== next.ticket ||
     prev.uiState !== next.uiState
@@ -1842,12 +1849,16 @@ export function SessionTab({
   subagent,
   showComposer = true,
   onInspect,
+  onArtifactsChange,
+  onOpenArtifact,
   stateKey,
 }: {
   ticket: string;
   subagent?: string;
   showComposer?: boolean;
   onInspect?: (agentId: string) => void;
+  onArtifactsChange?: (events: SessionEvent[]) => void;
+  onOpenArtifact?: (event: SessionEvent) => void;
   stateKey?: string;
 }) {
   const resetKey = `${ticket}:${subagent ?? ""}`;
@@ -1881,6 +1892,10 @@ export function SessionTab({
   const visible = useElementVisible(containerRef);
   const { session, error, loading } = useTranscriptSession(target, visible);
   const [questionDrafts, setQuestionDrafts] = useState<Record<string, QuestionDraft>>({});
+
+  useEffect(() => {
+    onArtifactsChange?.((session?.events ?? []).filter((event) => event.kind === "artifact" && Boolean(event.artifact_id)));
+  }, [onArtifactsChange, session?.events]);
 
   const questionGroups = useMemo(() => {
     const groups = new Map<string, SessionEvent[]>();
@@ -2414,6 +2429,7 @@ export function SessionTab({
                 key={group.key}
                 onHeightChange={reportRowHeight}
                 onInspect={onInspect}
+                onOpenArtifact={onOpenArtifact}
                 showTimestamp={timestampKeys.has(group.key)}
                 ticket={ticket}
                 top={top}
