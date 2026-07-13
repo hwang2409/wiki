@@ -13,7 +13,9 @@ def send(value: dict[str, Any]) -> None:
 
 
 log_path = Path(os.environ["FAKE_PROTOCOL_LOG"])
+args = sys.argv[1:]
 approval = os.environ.get("FAKE_CODEX_APPROVAL") == "1"
+artifact_tool = os.environ.get("FAKE_ARTIFACT_TOOL") == "1"
 turn_start_error = os.environ.get("FAKE_TURN_START_ERROR") == "1"
 thread_counter = 0
 thread_id: str | None = None
@@ -184,6 +186,96 @@ for raw_line in sys.stdin:
                 }
             )
             turn_start_error = False
+        elif artifact_tool and "render_artifact" in json.dumps(params):
+            from datetime import datetime, timezone
+            from uuid import uuid4
+
+            registered = any(
+                argument.startswith("mcp_servers.wiki_artifacts.command=")
+                for argument in args
+            )
+            if not registered:
+                raise RuntimeError("wiki_artifacts MCP config missing from Codex argv")
+            artifact_id = str(uuid4())
+            call_id = "call_render_artifact"
+            event = {
+                "kind": "artifact",
+                "id": artifact_id,
+                "artifact": {"kind": "mermaid", "source": "graph TD; A-->B"},
+                "ts": datetime.now(timezone.utc).isoformat(),
+            }
+            output = f"<<wiki-artifact:v1>>{json.dumps(event, separators=(',', ':'))}<<end>>"
+            tool_item = {
+                "type": "mcpToolCall",
+                "id": call_id,
+                "server": "wiki_artifacts",
+                "tool": "render_artifact",
+                "arguments": {
+                    "kind": "mermaid",
+                    "payload": {"source": "graph TD; A-->B"},
+                },
+                "status": "completed",
+                "result": {"content": [{"type": "text", "text": output}]},
+            }
+            send(
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": thread_id,
+                        "turnId": active_turn,
+                        "item": tool_item,
+                    },
+                }
+            )
+            if open_files:
+                open_files[-1].write(
+                    json.dumps(
+                        {
+                            "type": "response_item",
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "payload": {
+                                "type": "function_call",
+                                "name": "wiki_artifacts__render_artifact",
+                                "call_id": call_id,
+                                "arguments": tool_item["arguments"],
+                            },
+                        },
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                )
+                open_files[-1].write(
+                    json.dumps(
+                        {
+                            "type": "response_item",
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "payload": {
+                                "type": "function_call_output",
+                                "call_id": call_id,
+                                "output": output,
+                            },
+                        },
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                )
+                open_files[-1].flush()
+            send(
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": thread_id,
+                        "turn": {"id": active_turn, "status": "completed"},
+                    },
+                }
+            )
+            send(
+                {
+                    "method": "thread/status/changed",
+                    "params": {"threadId": thread_id, "status": {"type": "idle"}},
+                }
+            )
+            active_turn = None
     elif method == "turn/steer":
         send({"id": request_id, "result": {"turnId": active_turn}})
     elif method == "turn/interrupt":

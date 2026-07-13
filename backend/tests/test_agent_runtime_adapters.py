@@ -26,6 +26,7 @@ from backend.app.agent_runtime.provider import (
     StartRequest,
 )
 from backend.app.agent_runtime.types import LifecycleState, ProviderKind, RunRecord
+from backend.app.wiki_artifacts import artifact_server_command
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "agent_runtime"
@@ -186,6 +187,7 @@ class CodexAdapterTests(unittest.IsolatedAsyncioTestCase):
                 "FAKE_PROTOCOL_LOG": str(self.log),
                 "FAKE_CODEX_TRANSCRIPT_DIR": str(self.transcripts),
                 "WIKI_AGENT_STATUS_DIR": str(self.root / "status"),
+                "WIKI_AGENT_RUNTIME_DIR": str(self.root / "runtime"),
                 "TMUX": "must-not-leak",
                 "TMUX_PANE": "%9999",
             }
@@ -244,6 +246,25 @@ class CodexAdapterTests(unittest.IsolatedAsyncioTestCase):
                 str(argument).startswith("mcp_servers.wiki_artifacts.command=")
                 for argument in adapter.command
             )
+        )
+        server_command = artifact_server_command()
+        self.assertIn(
+            f"mcp_servers.wiki_artifacts.command={json.dumps(server_command[0])}",
+            adapter.command,
+        )
+        self.assertIn(
+            f"mcp_servers.wiki_artifacts.args={json.dumps(list(server_command[1:]))}",
+            adapter.command,
+        )
+        server_env = next(
+            argument.removeprefix("mcp_servers.wiki_artifacts.env=")
+            for argument in adapter.command
+            if argument.startswith("mcp_servers.wiki_artifacts.env=")
+        )
+        self.assertIn(f'WIKI_RUN_ID = "{record.run_id}"', server_env)
+        self.assertIn(
+            f'WIKI_AGENT_RUNTIME_DIR = "{self.root / "runtime"}"',
+            server_env,
         )
         self.assertEqual(adapter.env["WIKI_RUN_ID"], record.run_id)
         await _wait_event(
@@ -485,6 +506,7 @@ class ClaudeAdapterTests(unittest.IsolatedAsyncioTestCase):
                 "HOME": str(self.root / "home"),
                 "CLAUDE_CONFIG_DIR": str(self.config),
                 "FAKE_PROTOCOL_LOG": str(self.log),
+                "WIKI_AGENT_RUNTIME_DIR": str(self.root / "runtime"),
                 "TMUX": "must-not-leak",
                 "TMUX_PANE": "%9999",
             }
@@ -652,7 +674,14 @@ class ClaudeAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("--mcp-config", argv)
         mcp_config = json.loads(argv[argv.index("--mcp-config") + 1])
         artifact_config = mcp_config["mcpServers"]["wiki-artifacts"]
+        server_command = artifact_server_command()
+        self.assertEqual(artifact_config["command"], server_command[0])
+        self.assertEqual(artifact_config["args"], list(server_command[1:]))
         self.assertEqual(artifact_config["env"]["WIKI_RUN_ID"], record.run_id)
+        self.assertEqual(
+            artifact_config["env"]["WIKI_AGENT_RUNTIME_DIR"],
+            str(self.root / "runtime"),
+        )
         self.assertNotIn("--dangerously-skip-permissions", argv)
         self.assertNotIn("--tmux", argv)
         self.assertIsNone(first["tmux"])

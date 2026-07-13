@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -14,6 +15,7 @@ from uuid import uuid4
 
 from .protocol import MAX_PROTOCOL_LINE_BYTES
 from .store import RuntimePaths
+from .version import RUNTIME_FINGERPRINT
 
 
 class SupervisorUnavailable(RuntimeError):
@@ -27,9 +29,16 @@ class SupervisorRemoteError(RuntimeError):
 
 
 class SupervisorClient:
-    def __init__(self, paths: RuntimePaths, *, timeout: float = 10.0):
+    def __init__(
+        self,
+        paths: RuntimePaths,
+        *,
+        timeout: float = 10.0,
+        runtime_fingerprint: str = RUNTIME_FINGERPRINT,
+    ):
         self.paths = paths
         self.timeout = timeout
+        self.runtime_fingerprint = runtime_fingerprint
 
     def request(self, method: str, params: dict[str, Any] | None = None) -> Any:
         request_id = str(uuid4())
@@ -126,11 +135,29 @@ class SupervisorClient:
             await writer.wait_closed()
 
     def ensure_running(self, *, timeout: float = 5.0) -> dict[str, Any]:
+        autostart_enabled = os.environ.get(
+            "WIKI_SUPERVISOR_AUTOSTART", "on"
+        ).lower() not in {"0", "off", "false"}
         try:
-            return self.ping()
+            health = self.ping()
         except SupervisorUnavailable:
             pass
-        if os.environ.get("WIKI_SUPERVISOR_AUTOSTART", "on").lower() in {"0", "off", "false"}:
+        else:
+            if health.get("runtime_fingerprint") == self.runtime_fingerprint:
+                return health
+            if health.get("runtime_fingerprint") is None and not autostart_enabled:
+                # Isolated test and externally managed supervisors predate the
+                # fingerprint field. With autostart disabled, use the server
+                # the caller deliberately supplied instead of replacing it.
+                return health
+            if not autostart_enabled:
+                raise SupervisorUnavailable(
+                    "supervisor runtime does not match this backend and autostart is disabled"
+                )
+            replacement = self._stop_stale_supervisor(health, timeout=timeout)
+            if replacement is not None:
+                return replacement
+        if not autostart_enabled:
             raise SupervisorUnavailable("supervisor is not running and autostart is disabled")
         self._spawn_detached()
         deadline = time.monotonic() + timeout
@@ -142,6 +169,41 @@ class SupervisorClient:
                 last_error = exc
                 time.sleep(0.05)
         raise SupervisorUnavailable(f"supervisor did not become ready: {last_error}")
+
+    def _stop_stale_supervisor(
+        self,
+        health: dict[str, Any],
+        *,
+        timeout: float,
+    ) -> dict[str, Any] | None:
+        pid = health.get("pid")
+        if not isinstance(pid, int) or pid <= 1 or pid == os.getpid():
+            raise SupervisorUnavailable(
+                "supervisor runtime does not match this backend and its PID is invalid"
+            )
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return None
+        except PermissionError as exc:
+            raise SupervisorUnavailable(
+                f"cannot replace stale supervisor process {pid}: {exc}"
+            ) from exc
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                current = self.ping()
+            except SupervisorUnavailable:
+                return None
+            if current.get("runtime_fingerprint") == self.runtime_fingerprint:
+                return current
+            if current.get("pid") != pid:
+                return None
+            time.sleep(0.05)
+        raise SupervisorUnavailable(
+            f"stale supervisor process {pid} did not stop within {timeout:g}s"
+        )
 
     def _spawn_detached(self) -> None:
         self.paths.runtime_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
