@@ -237,7 +237,6 @@ export function mergeSession(
       current.events.length,
     );
   }
-
   let base = current.base;
   let events = current.events;
   let changedFrom = events.length;
