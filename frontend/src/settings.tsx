@@ -326,7 +326,11 @@ function isFontInstalled(family: string): boolean {
   }
 }
 
-const ALWAYS_AVAILABLE_FAMILIES = new Set(["ui-monospace", "-apple-system"]);
+const ALWAYS_AVAILABLE_FAMILIES = new Set([
+  "ui-monospace",
+  "-apple-system",
+  "Consolas for Powerline",
+]);
 
 function isAvailable(choice: FontChoice): boolean {
   if (choice.load) return true;
