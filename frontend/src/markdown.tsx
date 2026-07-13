@@ -35,6 +35,14 @@ type MdNode = {
   };
 };
 
+type HtmlNode = {
+  type: string;
+  value?: string;
+  children?: HtmlNode[];
+  tagName?: string;
+  properties?: Record<string, unknown>;
+};
+
 const calloutTypes: Record<string, typeof Pencil> = {
   note: Pencil,
   info: Info,
@@ -100,6 +108,28 @@ function stripBlockComments(content: string) {
 
 export function prepareMarkdown(content: string) {
   return stripBlockComments(content.replace(wikiStylesPattern, ""));
+}
+
+export function rehypeEscapeRawHtml() {
+  return (tree: HtmlNode) => {
+    function escapeNode(node: HtmlNode): HtmlNode {
+      if (node.type === "raw") {
+        return {
+          type: "element",
+          tagName: "code",
+          properties: { className: ["transcript-raw-html"] },
+          children: [{ type: "text", value: node.value ?? "" }]
+        };
+      }
+
+      if (node.children) {
+        node.children = node.children.map(escapeNode);
+      }
+      return node;
+    }
+
+    escapeNode(tree);
+  };
 }
 
 export type NoteProperties = Array<[string, string | string[]]>;

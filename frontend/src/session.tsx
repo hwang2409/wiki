@@ -42,7 +42,7 @@ import {
 import type { LucideIcon } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { MarkdownPre } from "./markdown";
+import { MarkdownPre, rehypeEscapeRawHtml } from "./markdown";
 import { ShikiCode } from "./shiki";
 import {
   cancelAgentModelChange,
@@ -1505,7 +1505,11 @@ const MessageBlock = memo(function MessageBlock({
   }
   return (
     <div className="session-assistant markdown-preview-view">
-      <ReactMarkdown components={sessionMarkdownComponents} remarkPlugins={[remarkGfm]}>
+      <ReactMarkdown
+        components={sessionMarkdownComponents}
+        rehypePlugins={[rehypeEscapeRawHtml]}
+        remarkPlugins={[remarkGfm]}
+      >
         {event.text}
       </ReactMarkdown>
     </div>
