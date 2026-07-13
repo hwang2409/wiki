@@ -25,6 +25,7 @@ import json
 import os
 import re
 import threading
+from collections.abc import Callable
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
@@ -870,6 +871,119 @@ def _codex_apply(state: dict, row: dict) -> None:
         _record_row_disposition(state, EVENT_DISPOSITION_UNKNOWN)
 
 
+def _normalized_disposition(row: dict) -> str:
+    disposition = row.get("disposition")
+    if disposition == "ignored":
+        return EVENT_DISPOSITION_IGNORED
+    if disposition in {
+        EVENT_DISPOSITION_RENDERED,
+        EVENT_DISPOSITION_SUMMARIZED,
+        EVENT_DISPOSITION_UNKNOWN,
+    }:
+        return disposition
+    return EVENT_DISPOSITION_UNKNOWN
+
+
+def _apply_normalized_payload(
+    state: dict,
+    row: dict,
+    apply: Callable[[dict, dict], None],
+    payload_row: dict | None,
+) -> None:
+    """Apply a provider payload while keeping archive normalization counts.
+
+    Native transcript parsers also classify their input rows. Archived
+    events.jsonl already contains the authoritative classification, so keep
+    parser side effects (events, patches, tokens) but count each envelope once.
+    """
+    counts = dict(state.get("dispositions") or {})
+    if payload_row is not None:
+        apply(state, payload_row)
+    state["dispositions"] = counts
+    _record_row_disposition(state, _normalized_disposition(row))
+
+
+def _codex_normalized_apply(state: dict, row: dict) -> None:
+    payload = row.get("payload")
+    if not isinstance(payload, dict):
+        _apply_normalized_payload(state, row, _codex_apply, None)
+        return
+    method = payload.get("method")
+    params = payload.get("params")
+    params = params if isinstance(params, dict) else {}
+    ts = row.get("normalized_at")
+    native_row: dict | None = None
+
+    if method == "rawResponseItem/completed":
+        item = params.get("item")
+        if isinstance(item, dict):
+            native_row = {"type": "response_item", "timestamp": ts, "payload": item}
+    elif method == "item/completed":
+        # App-server also emits rawResponseItem/completed for rich content.
+        # These two message forms are retained as a defensive fallback and the
+        # native parser's pair-credit dedupe removes the app-server twin.
+        item = params.get("item")
+        if isinstance(item, dict) and item.get("type") == "userMessage":
+            text = "\n".join(
+                str(block.get("text"))
+                for block in item.get("content") or []
+                if isinstance(block, dict) and isinstance(block.get("text"), str)
+            ).strip()
+            native_row = {
+                "type": "event_msg",
+                "timestamp": ts,
+                "payload": {"type": "user_message", "message": text},
+            }
+        elif isinstance(item, dict) and item.get("type") == "agentMessage":
+            native_row = {
+                "type": "event_msg",
+                "timestamp": ts,
+                "payload": {
+                    "type": "agent_message",
+                    "message": str(item.get("text") or ""),
+                },
+            }
+    elif method == "thread/tokenUsage/updated":
+        usage = params.get("tokenUsage")
+        if isinstance(usage, dict):
+            native_row = {
+                "type": "event_msg",
+                "timestamp": ts,
+                "payload": {
+                    "type": "token_count",
+                    "info": {"total_token_usage": usage.get("total") or {}},
+                },
+            }
+    elif method == "context/compacted":
+        native_row = {
+            "type": "event_msg",
+            "timestamp": ts,
+            "payload": {"type": "context_compacted"},
+        }
+    elif method == "turn/completed":
+        turn = params.get("turn")
+        if isinstance(turn, dict) and turn.get("status") == "interrupted":
+            native_row = {
+                "type": "event_msg",
+                "timestamp": ts,
+                "payload": {
+                    "type": "turn_aborted",
+                    "reason": "interrupted",
+                    "duration_ms": turn.get("durationMs"),
+                },
+            }
+
+    _apply_normalized_payload(state, row, _codex_apply, native_row)
+
+
+def _claude_normalized_apply(state: dict, row: dict) -> None:
+    payload = row.get("payload")
+    native_row = dict(payload) if isinstance(payload, dict) else None
+    if native_row is not None and not native_row.get("timestamp"):
+        native_row["timestamp"] = row.get("normalized_at")
+    _apply_normalized_payload(state, row, _claude_apply, native_row)
+
+
 # ---------------------------------------------------------------- claude parser
 
 
@@ -1596,7 +1710,13 @@ def _claude_apply(state: dict, row: dict) -> None:
 
 # ---------------------------------------------------------------- incremental cache
 
-_APPLY = {"codex": _codex_apply, "claude": _claude_apply, "claude-sub": _claude_apply}
+_APPLY = {
+    "codex": _codex_apply,
+    "claude": _claude_apply,
+    "claude-sub": _claude_apply,
+    "codex-normalized": _codex_normalized_apply,
+    "claude-normalized": _claude_normalized_apply,
+}
 _cache: dict[str, dict] = {}  # path → parse state; wiped on reload, rebuilt lazily
 _cache_locks: dict[str, threading.Lock] = {}
 _cache_locks_guard = threading.Lock()
