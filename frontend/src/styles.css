@@ -4787,6 +4787,10 @@ body.is-resizing-panes .pane-cell {
   margin-bottom: 0;
 }
 
+.session-assistant code.transcript-raw-html {
+  white-space: pre-wrap;
+}
+
 /* anywhere-wrapping lets table min-content sizing break words mid-word */
 .session-assistant th,
 .session-assistant td {
