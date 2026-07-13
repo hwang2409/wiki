@@ -441,7 +441,11 @@ export type AgentSessionData = {
   provider_inspector?: ProviderEventInspector;
 };
 
-export type QueuedMessage = { text: string; queued_at: string };
+export type QueuedMessage = {
+  text: string;
+  queued_at: string;
+  source?: "auto" | "explicit";
+};
 
 export type AgentPrCheck = {
   name: string;

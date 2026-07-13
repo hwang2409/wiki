@@ -15,6 +15,7 @@ import {
 } from "./api";
 
 const POLL_MS = 2500;
+const PENDING_RECONCILE_WINDOW_MS = 30_000;
 
 export type TranscriptTarget = {
   ticket: string;
@@ -44,6 +45,7 @@ export type TranscriptSession = {
 
 export type TranscriptSnapshot = {
   session: TranscriptSession | null;
+  pendingUserMessages: PendingUserMessage[];
   error: string | null;
   loading: boolean;
 };
@@ -66,6 +68,23 @@ export type PanelState = {
   recentlyClosed: string[];
   tabs: string[];
   viewState: Record<string, ArtifactViewState>;
+};
+
+export type PendingUserMessage = {
+  id: string;
+  text: string;
+  textHash: string;
+  status: "sending" | "sent" | "failed";
+  mode: "now" | "on-idle";
+  firstSeenTs: number;
+  eventIdFloor: number;
+  error?: string;
+};
+
+export type QueueSourceAnnotation = {
+  source: "auto" | "explicit";
+  text: string;
+  position?: number;
 };
 
 type Listener = () => void;
@@ -111,13 +130,65 @@ function createEntry(target: TranscriptTarget): Entry {
   return {
     key: targetKey(target),
     target,
-    snapshot: { session: null, error: null, loading: true },
+    snapshot: { session: null, pendingUserMessages: [], error: null, loading: true },
     listeners: new Set(),
     pollers: new Set(),
     inFlight: null,
     dirty: false,
     lastLoadedAt: 0,
   };
+}
+
+function hashPendingText(text: string): string {
+  const normalized = text
+    .replace(/\[image:\s*\/tmp\/wiki-uploads\/([^\]\s]+)\s*\]/g, "[image:$1]")
+    .replace(/\u27e6img:\/api\/uploads\/([^\u27e7]+)\u27e7/g, "[image:$1]");
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < normalized.length; index += 1) {
+    hash ^= normalized.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+function reconcilePendingUserMessages(
+  pending: PendingUserMessage[],
+  events: SessionEvent[],
+): PendingUserMessage[] {
+  if (pending.length === 0) return pending;
+  const remaining = pending.slice();
+  for (const event of events) {
+    if (event.kind !== "user") continue;
+    const eventHash = hashPendingText(event.text.trim());
+    const eventTs = event.ts ? Date.parse(event.ts) : Number.NaN;
+    const match = remaining.findIndex((message) => {
+      if (event.id <= message.eventIdFloor || eventHash !== message.textHash) return false;
+      if (Number.isFinite(eventTs)) {
+        return eventTs >= message.firstSeenTs - 2_000
+          && eventTs <= message.firstSeenTs + PENDING_RECONCILE_WINDOW_MS;
+      }
+      return Date.now() <= message.firstSeenTs + PENDING_RECONCILE_WINDOW_MS;
+    });
+    if (match >= 0) remaining.splice(match, 1);
+  }
+  // Text/time matching is intentionally a fallback: identical messages sent
+  // inside 30s can pair with the wrong echo, though one event only consumes
+  // one optimistic row so duplicate messages are never both discarded.
+  return remaining.length === pending.length ? pending : remaining;
+}
+
+function mergeQueueSources(current: QueuedMessage[], next: QueuedMessage[]): QueuedMessage[] {
+  if (current.length === 0 || next.length === 0) return next;
+  const sources = new Map(
+    current
+      .filter((message) => message.source)
+      .map((message) => [`${message.queued_at}\u0000${message.text}`, message.source] as const),
+  );
+  if (sources.size === 0) return next;
+  return next.map((message) => ({
+    ...message,
+    source: message.source ?? sources.get(`${message.queued_at}\u0000${message.text}`),
+  }));
 }
 
 function getEntry(target: TranscriptTarget): Entry {
@@ -249,7 +320,7 @@ function mergeSession(current: TranscriptSession | null, result: AgentSessionDat
     cursor: result.cursor,
     events,
     subagents: result.subagents ?? current.subagents,
-    queue: result.queue ?? current.queue,
+    queue: result.queue ? mergeQueueSources(current.queue, result.queue) : current.queue,
     working: result.working ?? current.working,
   };
 }
@@ -262,6 +333,7 @@ async function loadTarget(target: TranscriptTarget, cursor: number, path?: strin
 
 function fetchEntry(entry: Entry): Promise<void> {
   if (entry.inFlight) return entry.inFlight;
+  entry.dirty = false;
   const current = entry.snapshot;
   if (!current.session && !current.loading) {
     entry.snapshot = { ...current, loading: true, error: null };
@@ -276,15 +348,19 @@ function fetchEntry(entry: Entry): Promise<void> {
       );
       entry.snapshot = {
         session: mergeSession(entry.snapshot.session, result),
+        pendingUserMessages: reconcilePendingUserMessages(
+          entry.snapshot.pendingUserMessages,
+          result.events,
+        ),
         error: null,
         loading: false,
       };
-      entry.dirty = false;
       entry.lastLoadedAt = Date.now();
     } catch (error) {
       if (!entry.snapshot.session) {
         entry.snapshot = {
           session: null,
+          pendingUserMessages: entry.snapshot.pendingUserMessages,
           error: error instanceof Error ? error.message : "No session transcript found.",
           loading: false,
         };
@@ -294,6 +370,7 @@ function fetchEntry(entry: Entry): Promise<void> {
     } finally {
       entry.inFlight = null;
       emit(entry);
+      if (entry.dirty && entry.listeners.size > 0) void fetchEntry(entry);
     }
   })();
   return entry.inFlight;
@@ -358,18 +435,112 @@ export function invalidateTranscript(ticket: string, surface: string | null = nu
   });
 }
 
-export function replaceTranscriptQueue(ticket: string, messages: QueuedMessage[]) {
+export function refreshTranscript(ticket: string) {
+  entries.forEach((entry) => {
+    if (entry.target.ticket !== ticket || entry.target.subagent) return;
+    entry.dirty = true;
+    if (entry.listeners.size > 0) void fetchEntry(entry);
+  });
+}
+
+export function replaceTranscriptQueue(
+  ticket: string,
+  messages: QueuedMessage[],
+  annotation?: QueueSourceAnnotation,
+) {
   entries.forEach((entry) => {
     if (entry.target.ticket !== ticket || entry.target.subagent || !entry.snapshot.session) return;
+    const annotated = messages.map((message) => ({ ...message }));
+    if (annotation) {
+      const requestedIndex = annotation.position === undefined ? -1 : annotation.position - 1;
+      let fallbackIndex = -1;
+      for (let index = annotated.length - 1; index >= 0; index -= 1) {
+        if (annotated[index].text === annotation.text) {
+          fallbackIndex = index;
+          break;
+        }
+      }
+      const index = requestedIndex >= 0 && requestedIndex < annotated.length
+        ? requestedIndex
+        : fallbackIndex;
+      if (index >= 0) annotated[index].source = annotation.source;
+    }
     entry.snapshot = {
       ...entry.snapshot,
       session: {
         ...entry.snapshot.session,
-        queue: messages,
+        queue: mergeQueueSources(entry.snapshot.session.queue, annotated),
       },
     };
     emit(entry);
   });
+}
+
+export function addPendingUserMessage(
+  ticket: string,
+  message: Pick<PendingUserMessage, "id" | "text" | "mode">,
+) {
+  const entry = getEntry({ ticket });
+  const events = entry.snapshot.session?.events ?? [];
+  const eventIdFloor = events.length > 0 ? events[events.length - 1].id : -1;
+  const pending: PendingUserMessage = {
+    ...message,
+    textHash: hashPendingText(message.text.trim()),
+    status: "sending",
+    firstSeenTs: Date.now(),
+    eventIdFloor,
+  };
+  entry.snapshot = {
+    ...entry.snapshot,
+    pendingUserMessages: [...entry.snapshot.pendingUserMessages, pending],
+  };
+  emit(entry);
+}
+
+export function updatePendingUserMessage(
+  ticket: string,
+  id: string,
+  update: Partial<Pick<PendingUserMessage, "status" | "error">>,
+) {
+  const entry = getEntry({ ticket });
+  let changed = false;
+  const pendingUserMessages = entry.snapshot.pendingUserMessages.map((message) => {
+    if (message.id !== id) return message;
+    changed = true;
+    return { ...message, ...update };
+  });
+  if (!changed) return;
+  entry.snapshot = { ...entry.snapshot, pendingUserMessages };
+  emit(entry);
+}
+
+export function retryPendingUserMessage(ticket: string, id: string) {
+  const entry = getEntry({ ticket });
+  const events = entry.snapshot.session?.events ?? [];
+  const eventIdFloor = events.length > 0 ? events[events.length - 1].id : -1;
+  let changed = false;
+  const pendingUserMessages = entry.snapshot.pendingUserMessages.map((message) => {
+    if (message.id !== id) return message;
+    changed = true;
+    return {
+      ...message,
+      status: "sending" as const,
+      error: undefined,
+      firstSeenTs: Date.now(),
+      eventIdFloor,
+    };
+  });
+  if (!changed) return;
+  entry.snapshot = { ...entry.snapshot, pendingUserMessages };
+  emit(entry);
+}
+
+export function removePendingUserMessage(ticket: string, id: string) {
+  const entry = getEntry({ ticket });
+  const pendingUserMessages = entry.snapshot.pendingUserMessages.filter((message) => message.id !== id);
+  if (pendingUserMessages.length === entry.snapshot.pendingUserMessages.length) return;
+  entry.snapshot = { ...entry.snapshot, pendingUserMessages };
+  emit(entry);
 }
 
 export function replaceTranscriptDesiredModel(ticket: string, desiredModel: string | null) {
