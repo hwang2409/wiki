@@ -1397,6 +1397,9 @@ class RunStore:
             return None
         with self._lock:
             record = self.get(run_id)
+            # This list is append-ordered. Always scan from the front so one
+            # provider echo acknowledges the oldest identical send (FIFO),
+            # including the hook-wrapped fallback below.
             exact = next(
                 (
                     message
@@ -1503,6 +1506,16 @@ class RunStore:
             if current.get("run_id") != old.run_id:
                 raise StoreConflict("replacement target is no longer current")
 
+            # Replacements are a continuation of the same logical composer
+            # session. Provider echoes can arrive after the run-id swap, and
+            # the frontend may not have polled an acknowledgement journaled
+            # just before it, so both sides of reconciliation must carry over.
+            new_record.pending_user_messages = [
+                dict(message) for message in old.pending_user_messages
+            ]
+            new_record.composer_messages = [
+                dict(message) for message in old.composer_messages
+            ]
             old.replaced_by_run_id = new_record.run_id
             old.outcome = "handoff"
             old.state_reason = "replaced"

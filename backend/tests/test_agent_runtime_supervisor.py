@@ -387,6 +387,78 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             pending_id,
         )
 
+    async def test_delivered_pending_id_survives_replace_until_late_echo(self) -> None:
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-96-REPLACE",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="Work on ticket WIKI-96-REPLACE",
+        )
+        await self.supervisor.send_now(record.run_id, "begin a long turn")
+        pending_id = str(uuid4())
+        await self.supervisor.send_on_idle(
+            record.run_id,
+            "survive replacement",
+            pending_id,
+        )
+        adapter = self.supervisor.adapters[record.run_id]
+
+        # The provider has accepted the queued message, but its user echo has
+        # not arrived yet: it has moved from queued to pending reconciliation.
+        await self.supervisor._deliver_next_queued_locked(  # noqa: SLF001
+            record.run_id,
+            adapter,
+        )
+        delivered = self.store.get(record.run_id)
+        self.assertEqual(delivered.queued_messages, [])
+        self.assertEqual(
+            [message["pending_id"] for message in delivered.pending_user_messages],
+            [pending_id],
+        )
+
+        replacement = await self.supervisor.replace(
+            record.run_id,
+            "Continue ticket WIKI-96-REPLACE after revival",
+        )
+        self.assertEqual(
+            [
+                message["pending_id"]
+                for message in self.store.get(replacement.run_id).pending_user_messages
+            ],
+            [pending_id],
+        )
+
+        replacement_adapter = self.supervisor.adapters[replacement.run_id]
+        await self.supervisor._handle_provider_event(  # noqa: SLF001
+            replacement.run_id,
+            replacement_adapter,
+            ProviderEvent(
+                ProviderKind.CODEX,
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "item": {
+                            "type": "userMessage",
+                            "content": [
+                                {"type": "text", "text": "survive replacement"}
+                            ],
+                        }
+                    },
+                },
+                generation=replacement.provider_generation,
+            ),
+        )
+
+        reconciled = self.store.get(replacement.run_id)
+        self.assertEqual(reconciled.pending_user_messages, [])
+        self.assertEqual(
+            [message["pending_id"] for message in reconciled.composer_messages],
+            [pending_id],
+        )
+
     async def test_codex_question_before_turn_response_can_be_answered(self) -> None:
         await self.supervisor.close()
         protocol_log = self.root / "live-order-protocol.jsonl"

@@ -3032,9 +3032,7 @@ function MessageComposer({
           position: result.position,
         });
       }
-      if (result.status === "queued") {
-        removePendingUserMessage(ticket, message.id);
-      } else {
+      if (result.status !== "queued") {
         updatePendingUserMessage(ticket, message.id, { status: "sent", error: undefined });
         refreshTranscript(ticket);
       }

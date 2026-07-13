@@ -178,9 +178,13 @@ function reconcilePendingUserMessages(
   for (const event of events) {
     if (event.kind !== "user") continue;
     const eventTs = event.ts ? Date.parse(event.ts) : Number.NaN;
+    // Without a provider timestamp, text alone cannot prove this event came
+    // after an older optimistic row. Durable pending_id acknowledgements above
+    // remain the canonical path for timestamp-less provider events.
+    if (!Number.isFinite(eventTs)) continue;
     const match = remaining.findIndex((message) => {
       if (event.id <= message.eventIdFloor || !pendingTextMatches(event.text, message)) return false;
-      return !Number.isFinite(eventTs) || eventTs >= message.firstSeenTs - 2_000;
+      return eventTs >= message.firstSeenTs - 2_000;
     });
     if (match >= 0) remaining.splice(match, 1);
   }
