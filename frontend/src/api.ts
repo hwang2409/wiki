@@ -58,6 +58,7 @@ export type AgentSession = {
   window: string | null;
   run_id?: string | null;
   runtime_state?: string | null;
+  state_reason?: string | null;
   control_attached?: boolean;
   provider_session_id?: string | null;
   provider_pid?: number | null;
@@ -105,6 +106,7 @@ export type Orchestrator = {
   window_alive: boolean;
   run_id?: string | null;
   runtime_state?: string | null;
+  state_reason?: string | null;
   control_attached?: boolean;
   provider_session_id?: string | null;
   provider_pid?: number | null;
@@ -248,6 +250,12 @@ export function controlAgent(id: string, action: AgentControlAction) {
     `/api/agents/${encodeURIComponent(id)}/${action}`,
     { method: "POST" },
   );
+}
+
+export function archiveAgent(id: string) {
+  return request<AgentControlResult>(`/api/agents/${encodeURIComponent(id)}/archive`, {
+    method: "POST",
+  });
 }
 
 export type SessionTool = {

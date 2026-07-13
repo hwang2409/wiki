@@ -12,6 +12,7 @@ import {
   X,
 } from "lucide-react";
 import {
+  archiveAgent,
   controlAgent,
   getAgents,
   getAgentModels,
@@ -41,6 +42,16 @@ const SPAWN_TICKET_PATTERN = /^[A-Z0-9-]+$/;
 const ORCH_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 const DEFAULT_WORKDIR = "/Users/henry/me/fun/wiki";
 const REASONING_EFFORTS: SpawnWorkerEffort[] = ["minimal", "low", "medium", "high", "xhigh"];
+const DEAD_RUN_COPY = "adapter detached — archive to reset";
+
+type HeadlessAgentState = {
+  run_id?: string | null;
+  control_attached?: boolean;
+  provider_pid?: number | null;
+  runtime_state?: string | null;
+  state?: string | null;
+  state_reason?: string | null;
+};
 
 type WorkerSpawnNotice = {
   kind: "worker";
@@ -93,7 +104,22 @@ function stateLabel(worker: AgentWorker): string {
   return worker.state;
 }
 
+function stateValueLabel(state: string | null | undefined): string {
+  return state || "unknown";
+}
+
+function isDeadRun(agent: HeadlessAgentState): boolean {
+  if (!agent.run_id) return false;
+  const state = agent.state ?? agent.runtime_state;
+  return (
+    state === "completed" ||
+    (!agent.control_attached && agent.provider_pid == null) ||
+    agent.state_reason === "adapter_lost"
+  );
+}
+
 function healthFlag(worker: AgentWorker): string | null {
+  if (isDeadRun(worker)) return null;
   if (!worker.registered) return "unregistered — status file without registry entry";
   if (worker.run_id && !worker.control_attached) return "supervisor control is not attached";
   if (worker.window && !worker.window_alive) return "window gone — worker died or wrapped up?";
@@ -788,6 +814,14 @@ export function AgentsView({
     result: AgentControlResult;
   } | null>(null);
   const [controlError, setControlError] = useState<string | null>(null);
+  const [archivePending, setArchivePending] = useState<string | null>(null);
+  const [archiveErrors, setArchiveErrors] = useState<Record<string, string>>({});
+  const [overrideData, setOverrideData] = useState<{
+    workers: AgentWorker[] | null;
+    orchestrators: Orchestrator[];
+    archived: ArchivedWorker[];
+    error: string | null;
+  } | null>(null);
 
   useEffect(() => {
     if (data) return;
@@ -830,10 +864,29 @@ export function AgentsView({
     };
   }, []);
 
-  const workers = data?.workers ?? fetchedWorkers;
-  const orchestrators = data?.orchestrators ?? fetchedOrchestrators;
-  const archived = data?.archived ?? fetchedArchived;
-  const error = data?.error ?? fetchedError;
+  useEffect(() => {
+    setOverrideData(null);
+  }, [data, refreshTick]);
+
+  const workers = overrideData?.workers ?? data?.workers ?? fetchedWorkers;
+  const orchestrators = overrideData?.orchestrators ?? data?.orchestrators ?? fetchedOrchestrators;
+  const archived = overrideData?.archived ?? data?.archived ?? fetchedArchived;
+  const error = overrideData?.error ?? data?.error ?? fetchedError;
+
+  useEffect(() => {
+    const currentIds = new Set([
+      ...(workers ?? []).map((worker) => worker.ticket),
+      ...orchestrators.map((orch) => orch.id),
+    ]);
+    setArchiveErrors((previous) =>
+      Object.fromEntries(
+        Object.entries(previous).filter(([id]) => currentIds.has(id))
+      )
+    );
+    if (archivePending && !currentIds.has(archivePending)) {
+      setArchivePending(null);
+    }
+  }, [archivePending, orchestrators, workers]);
 
   const openOrch = orchestrators.find((orch) => orch.id === openTicket);
   const liveWorkers = workers ?? [];
@@ -900,6 +953,36 @@ export function AgentsView({
       setControlError(err instanceof Error ? err.message : `Could not ${action} agent`);
     } finally {
       setControlPending(null);
+    }
+  }
+
+  async function requestArchive(id: string) {
+    if (archivePending) return;
+    setArchivePending(id);
+    setArchiveErrors((previous) => {
+      const next = { ...previous };
+      delete next[id];
+      return next;
+    });
+    setControlConfirm(null);
+    setControlNotice(null);
+    setControlError(null);
+    try {
+      await archiveAgent(id);
+      const result = await getAgents();
+      setOverrideData({
+        workers: result.workers,
+        orchestrators: result.orchestrators ?? [],
+        archived: result.archived ?? [],
+        error: null,
+      });
+    } catch (err) {
+      setArchiveErrors((previous) => ({
+        ...previous,
+        [id]: err instanceof Error ? err.message : "Could not archive agent",
+      }));
+    } finally {
+      setArchivePending((current) => (current === id ? null : current));
     }
   }
 
@@ -975,7 +1058,28 @@ export function AgentsView({
     );
   }
 
+  function DeadRunAffordance({ id }: { id: string }) {
+    const pending = archivePending === id;
+    return (
+      <>
+        <span className="agent-state is-detached">{DEAD_RUN_COPY}</span>
+        <button
+          className="agent-archive-button"
+          disabled={Boolean(archivePending)}
+          type="button"
+          onClick={() => {
+            void requestArchive(id);
+          }}
+        >
+          <Archive size={12} />
+          {pending ? "Archiving…" : "Archive"}
+        </button>
+      </>
+    );
+  }
+
   function renderWorker(worker: AgentWorker) {
+    const deadRun = isDeadRun(worker);
     const flag = healthFlag(worker);
     const state = stateLabel(worker);
     const isOpen = openTicket === worker.ticket;
@@ -992,7 +1096,11 @@ export function AgentsView({
           {worker.kind ? <span className="agent-chip">{worker.kind}</span> : null}
           {worker.role ? <span className="agent-chip">{worker.role}</span> : null}
           {worker.model ? <span className="agent-chip is-faint">{worker.model}</span> : null}
-          <span className={`agent-state is-${worker.state ?? "unknown"}`}>{state}</span>
+          {deadRun ? (
+            <DeadRunAffordance id={worker.ticket} />
+          ) : (
+            <span className={`agent-state is-${worker.state ?? "unknown"}`}>{state}</span>
+          )}
           <span className="agent-age tabular-nums">{ageLabel(worker.status_age_seconds)}</span>
         </header>
 
@@ -1008,6 +1116,9 @@ export function AgentsView({
             <AlertTriangle size={13} />
             <span>{flag}</span>
           </div>
+        ) : null}
+        {archiveErrors[worker.ticket] ? (
+          <div className="agent-inline-error">{archiveErrors[worker.ticket]}</div>
         ) : null}
 
         <div className="agent-meta">
@@ -1054,7 +1165,7 @@ export function AgentsView({
             </button>
           ) : null}
           <span className="agent-actions">
-            {worker.run_id ? (
+            {worker.run_id && !deadRun ? (
               <LifecycleControls
                 id={worker.ticket}
                 state={worker.runtime_state ?? worker.state}
@@ -1104,14 +1215,26 @@ export function AgentsView({
   } else {
     body = (
       <>
-        {grouped.map(({ orch, owned }) => (
-          <div className="agents-orch-group" key={orch.id}>
+        {grouped.map(({ orch, owned }) => {
+          const deadRun = isDeadRun(orch);
+          return (
+            <div className="agents-orch-group" key={orch.id}>
               <div className="agents-orch-head">
                 <Bot size={13} />
                 <span className="agents-orch-id">{orch.id}</span>
+                {orch.kind ? <span className="agent-chip">{orch.kind}</span> : null}
                 {orch.model ? <span className="agent-chip is-faint">{orch.model}</span> : null}
                 {orch.cwd ? (
                   <span className="agents-orch-cwd">{orch.cwd.split("/").slice(-1)[0]}</span>
+                ) : null}
+                {orch.run_id ? (
+                  deadRun ? (
+                    <DeadRunAffordance id={orch.id} />
+                  ) : (
+                    <span className={`agent-state is-${orch.runtime_state ?? "unknown"}`}>
+                      {stateValueLabel(orch.runtime_state)}
+                    </span>
+                  )
                 ) : null}
                 {orch.run_id ? (
                   <span className={`agent-window${orch.control_attached ? "" : " is-dead"}`}>
@@ -1122,7 +1245,7 @@ export function AgentsView({
                   <span className="agents-orch-dead">window gone</span>
                 ) : null}
                 <span className="agents-orch-actions">
-                  {orch.run_id ? (
+                  {orch.run_id && !deadRun ? (
                     <LifecycleControls
                       id={orch.id}
                       state={orch.runtime_state}
@@ -1149,12 +1272,16 @@ export function AgentsView({
                   </button>
                 </span>
               </div>
+              {archiveErrors[orch.id] ? (
+                <div className="agent-inline-error">{archiveErrors[orch.id]}</div>
+              ) : null}
             {owned.map(renderWorker)}
             {owned.length === 0 ? (
               <div className="agents-orch-empty">no registered workers</div>
             ) : null}
-          </div>
-        ))}
+            </div>
+          );
+        })}
 
         {ungrouped.length > 0 && grouped.length > 0 ? (
           <div className="agents-section-head">workers</div>
