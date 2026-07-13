@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from ..wiki_artifacts import artifact_server_command
 from .process import (
     ProviderProcessIdentity,
     command_tuple,
@@ -136,11 +137,34 @@ class ClaudeStreamAdapter(ProviderAdapter):
         request_timeout: float = 30.0,
         identity_resolver: IdentityResolver = resolve_provider_identity,
     ):
-        self.command = command_tuple(command)
         child_env = dict(os.environ if env is None else env)
         child_env.pop("TMUX", None)
         child_env.pop("TMUX_PANE", None)
+        child_env["WIKI_RUN_ID"] = record.run_id
+        child_env.setdefault(
+            "WIKI_AGENT_RUNTIME_DIR",
+            str(Path(child_env.get("HOME") or Path.home()) / ".wiki" / "agent-runtime"),
+        )
         self.env = child_env
+        self.command = command_tuple(command)
+        server_command = artifact_server_command()
+        self.artifact_mcp_config = json.dumps(
+            {
+                "mcpServers": {
+                    "wiki-artifacts": {
+                        "command": server_command[0],
+                        "args": list(server_command[1:]),
+                        "env": {
+                            "WIKI_AGENT_RUNTIME_DIR": child_env[
+                                "WIKI_AGENT_RUNTIME_DIR"
+                            ],
+                            "WIKI_RUN_ID": record.run_id,
+                        },
+                    }
+                }
+            },
+            separators=(",", ":"),
+        )
         self.request_timeout = request_timeout
         self.identity_resolver = identity_resolver
         self.worktree = record.worktree
@@ -198,6 +222,8 @@ class ClaudeStreamAdapter(ProviderAdapter):
             "stdio",
             "--include-partial-messages",
             "--include-hook-events",
+            "--mcp-config",
+            self.artifact_mcp_config,
             # Parity with the codex adapter's approvalPolicy "never" +
             # danger-full-access: unattended workers, same trust model as the
             # legacy tmux flow's --dangerously-skip-permissions. The stdio

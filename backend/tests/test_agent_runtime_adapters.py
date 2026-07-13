@@ -238,6 +238,13 @@ class CodexAdapterTests(unittest.IsolatedAsyncioTestCase):
         assert process is not None
         self.assertEqual(started.pid, process.pid)
         self.assertTrue(str(started.transcript_path).endswith("rollout-thread-1.jsonl"))
+        self.assertTrue(
+            any(
+                str(argument).startswith("mcp_servers.wiki_artifacts.command=")
+                for argument in adapter.command
+            )
+        )
+        self.assertEqual(adapter.env["WIKI_RUN_ID"], record.run_id)
         await _wait_event(
             adapter,
             lambda event: (
@@ -608,6 +615,10 @@ class ClaudeAdapterTests(unittest.IsolatedAsyncioTestCase):
         first = _protocol_rows(self.log)[0]
         argv = first["argv"]
         self.assertIn("--permission-prompt-tool", argv)
+        self.assertIn("--mcp-config", argv)
+        mcp_config = json.loads(argv[argv.index("--mcp-config") + 1])
+        artifact_config = mcp_config["mcpServers"]["wiki-artifacts"]
+        self.assertEqual(artifact_config["env"]["WIKI_RUN_ID"], record.run_id)
         self.assertNotIn("--dangerously-skip-permissions", argv)
         self.assertNotIn("--tmux", argv)
         self.assertIsNone(first["tmux"])

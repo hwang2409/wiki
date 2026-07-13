@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ..wiki_artifacts import artifact_server_command
 from .process import (
     ProviderProcessIdentity,
     command_tuple,
@@ -73,11 +74,34 @@ class CodexAppServerAdapter(ProviderAdapter):
         request_timeout: float = 30.0,
         identity_resolver: IdentityResolver = resolve_provider_identity,
     ):
-        self.command = command_tuple(command)
         child_env = dict(os.environ if env is None else env)
         child_env.pop("TMUX", None)
         child_env.pop("TMUX_PANE", None)
+        child_env["WIKI_RUN_ID"] = record.run_id
+        child_env.setdefault(
+            "WIKI_AGENT_RUNTIME_DIR",
+            str(Path(child_env.get("HOME") or Path.home()) / ".wiki" / "agent-runtime"),
+        )
         self.env = child_env
+        server_command = artifact_server_command()
+        server_env = {
+            "WIKI_AGENT_RUNTIME_DIR": child_env["WIKI_AGENT_RUNTIME_DIR"],
+            "WIKI_RUN_ID": record.run_id,
+        }
+        toml_env = "{ " + ", ".join(
+            f"{key} = {json.dumps(value)}" for key, value in server_env.items()
+        ) + " }"
+        self.command = command_tuple(
+            (
+                *command,
+                "-c",
+                f"mcp_servers.wiki_artifacts.command={json.dumps(server_command[0])}",
+                "-c",
+                f"mcp_servers.wiki_artifacts.args={json.dumps(list(server_command[1:]))}",
+                "-c",
+                f"mcp_servers.wiki_artifacts.env={toml_env}",
+            )
+        )
         self.request_timeout = request_timeout
         self.identity_resolver = identity_resolver
         self.worktree = record.worktree

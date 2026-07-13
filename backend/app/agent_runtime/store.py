@@ -785,6 +785,12 @@ class RunStore:
                     _atomic_write_json(session_dir / "final-status.json", status)
                 status_path.unlink(missing_ok=True)
 
+            artifact_dir = self.run_dir(run_id) / "artifacts"
+            if artifact_dir.is_symlink():
+                raise StoreError(f"refusing symlink artifact directory: {artifact_dir}")
+            if artifact_dir.is_dir():
+                shutil.copytree(artifact_dir, session_dir / "artifacts")
+
             shutil.rmtree(self.run_dir(run_id))
             registry.pop(record.agent_id, None)
             self._write_registry(registry)

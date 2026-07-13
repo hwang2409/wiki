@@ -17,9 +17,118 @@ from tempfile import TemporaryDirectory
 from unittest import mock
 
 from backend.app import transcripts
+from backend.app.wiki_artifacts import sentinel_text
 
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
+
+
+def _artifact_protocol_event(kind: str, index: int) -> dict:
+    artifact_id = f"00000000-0000-4000-8000-{index:012d}"
+    payloads = {
+        "mermaid": {"source": "graph TD; A-->B"},
+        "svg": {"source": "<svg><rect width='1' height='1'/></svg>"},
+        "image": {"ref": f"artifact://{artifact_id}", "mime": "image/png", "byte_size": 12},
+        "table": {
+            "columns": [{"key": "id", "label": "ID", "type": "number"}],
+            "rows": [[1]],
+        },
+        "plot": {"spec_vega_lite": {"mark": "point"}},
+        "code": {"language": "python", "source": "print(1)"},
+    }
+    return {
+        "kind": "artifact",
+        "id": artifact_id,
+        "title": f"Fixture {kind}",
+        "caption": "Fixture caption",
+        "artifact": {"kind": kind, **payloads[kind]},
+        "ts": "2026-07-13T12:00:00+00:00",
+    }
+
+
+class ArtifactTranscriptTests(unittest.TestCase):
+    def setUp(self) -> None:
+        transcripts._cache.clear()
+
+    def test_codex_and_claude_artifact_tools_emit_specialized_events(self) -> None:
+        kinds = ["mermaid", "svg", "image", "table", "plot", "code"]
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for index, kind in enumerate(kinds, start=1):
+                protocol_event = _artifact_protocol_event(kind, index)
+                call_id = f"artifact-{index}"
+                tool_input = {
+                    "kind": kind,
+                    "title": protocol_event["title"],
+                    "caption": protocol_event["caption"],
+                    "payload": {"source": "fixture"},
+                }
+                if index % 2:
+                    path = root / f"codex-{kind}.jsonl"
+                    rows = [
+                        {
+                            "type": "response_item",
+                            "timestamp": "2026-07-13T12:00:00Z",
+                            "payload": {
+                                "type": "function_call",
+                                "call_id": call_id,
+                                "name": "mcp__wiki_artifacts__render_artifact",
+                                "arguments": json.dumps(tool_input),
+                            },
+                        },
+                        {
+                            "type": "response_item",
+                            "timestamp": "2026-07-13T12:00:01Z",
+                            "payload": {
+                                "type": "function_call_output",
+                                "call_id": call_id,
+                                "output": sentinel_text(protocol_event),
+                            },
+                        },
+                    ]
+                    fmt = "codex"
+                else:
+                    path = root / f"claude-{kind}.jsonl"
+                    rows = [
+                        {
+                            "type": "assistant",
+                            "timestamp": "2026-07-13T12:00:00Z",
+                            "message": {
+                                "content": [
+                                    {
+                                        "type": "tool_use",
+                                        "id": call_id,
+                                        "name": "mcp__wiki-artifacts__render_artifact",
+                                        "input": tool_input,
+                                    }
+                                ]
+                            },
+                        },
+                        {
+                            "type": "user",
+                            "timestamp": "2026-07-13T12:00:01Z",
+                            "message": {
+                                "content": [
+                                    {
+                                        "type": "tool_result",
+                                        "tool_use_id": call_id,
+                                        "content": sentinel_text(protocol_event),
+                                    }
+                                ]
+                            },
+                        },
+                    ]
+                    fmt = "claude"
+                path.write_text(
+                    "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+                )
+                parsed = transcripts.read_session_events(fmt, path)
+                self.assertEqual(len(parsed["events"]), 1, kind)
+                event = parsed["events"][0]
+                self.assertEqual(event["kind"], "artifact")
+                self.assertEqual(event["artifact_id"], protocol_event["id"])
+                self.assertEqual(event["artifact"], protocol_event["artifact"])
+                self.assertEqual(event["title"], f"Fixture {kind}")
 
 
 def _write_rollout(day_dir: Path, name: str, cwd: str, session_id: str,

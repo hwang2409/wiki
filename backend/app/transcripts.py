@@ -4,7 +4,7 @@ Formats are unversioned internals — parsers are defensive, and each source row
 is bucketed as rendered, summarized, intentionally ignored, or unknown.
 Normalized event:
   {"kind": "user"|"assistant"|"thinking"|"tool"|"tasks"|"interrupt"|"pr"|
-            "marker"|"image"|"question",
+            "marker"|"image"|"question"|"artifact",
    "ts": str|None, "text": str, "disposition": "rendered"|"summarized"|
                                                 "intentionally_ignored"|"unknown",
    "tool": {"name", "input", "output", "ok"} (kind=tool only),
@@ -27,6 +27,8 @@ import threading
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
+
+from .wiki_artifacts import artifact_from_text
 
 CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
@@ -523,6 +525,72 @@ def _codex_tool_input(name: str, arguments: object) -> str:
     return _clip(str(arguments), MAX_TOOL_IO)
 
 
+def _is_artifact_tool(name: object) -> bool:
+    return isinstance(name, str) and (
+        name == "render_artifact" or name.endswith("__render_artifact")
+    )
+
+
+def _tool_arguments(arguments: object) -> dict | None:
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except ValueError:
+            return None
+    return dict(arguments) if isinstance(arguments, dict) else None
+
+
+def _artifact_event(protocol_event: dict, ts: str | None) -> dict:
+    artifact = protocol_event.get("artifact") or {}
+    title = protocol_event.get("title")
+    kind = artifact.get("kind") or "artifact"
+    return {
+        "kind": "artifact",
+        "ts": protocol_event.get("ts") or ts,
+        "text": title or kind,
+        "artifact_id": protocol_event.get("id"),
+        "title": title,
+        "caption": protocol_event.get("caption"),
+        "artifact": artifact,
+    }
+
+
+def _failed_artifact_tool(meta: dict, output: str, ts: str | None) -> dict:
+    raw_input = meta.get("input") or {}
+    return {
+        "kind": "tool",
+        "ts": ts,
+        "text": "",
+        "tool": {
+            "name": meta.get("name") or "render_artifact",
+            "input": _clip(json.dumps(raw_input), MAX_TOOL_IO),
+            "output": _clip(output, MAX_TOOL_IO),
+            "ok": False,
+            "archetype": "tool",
+            "summary": "render_artifact rejected",
+        },
+    }
+
+
+def _complete_artifact(
+    state: dict,
+    call_id: object,
+    output: str,
+    ts: str | None,
+) -> bool:
+    meta = state.get("pending_artifacts", {}).pop(call_id, None)
+    if meta is None:
+        return False
+    protocol_event = artifact_from_text(output)
+    event = (
+        _artifact_event(protocol_event, ts)
+        if protocol_event is not None
+        else _failed_artifact_tool(meta, output, ts)
+    )
+    _append_event(state, event)
+    return True
+
+
 def _codex_tool_end_output(ptype: str, payload: dict) -> tuple[str, bool | None]:
     """patch_apply_end / mcp_tool_call_end carry the authoritative tool output
     the corresponding function_call/custom_tool_call left `output: null`."""
@@ -701,9 +769,13 @@ def _codex_apply(state: dict, row: dict) -> None:
                 _append_event(state, marker)
             _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
         elif ptype in ("patch_apply_end", "mcp_tool_call_end", "web_search_end"):
-            event = pending.pop(payload.get("call_id"), None)
+            call_id = payload.get("call_id")
+            out, ok = _codex_tool_end_output(ptype, payload)
+            if _complete_artifact(state, call_id, str(out), ts):
+                _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
+                return
+            event = pending.pop(call_id, None)
             if event:
-                out, ok = _codex_tool_end_output(ptype, payload)
                 event["tool"]["output"] = _clip(str(out), MAX_TOOL_IO)
                 event["tool"]["ok"] = ok
                 _record_tool_patch(state, event)
@@ -744,6 +816,14 @@ def _codex_apply(state: dict, row: dict) -> None:
         elif ptype in ("function_call", "custom_tool_call", "web_search_call", "tool_search_call"):
             name = payload.get("name") or ptype.replace("_call", "")
             raw_input = payload.get("arguments", payload.get("input", payload.get("action", "")))
+            call_id = payload.get("call_id")
+            if _is_artifact_tool(name) and call_id:
+                state.setdefault("pending_artifacts", {})[call_id] = {
+                    "name": name,
+                    "input": _tool_arguments(raw_input) or {},
+                }
+                _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
+                return
             tool_input = _codex_tool_input(name, raw_input)
             archetype, summary = classify_tool(name, tool_input)
             event = {
@@ -760,18 +840,22 @@ def _codex_apply(state: dict, row: dict) -> None:
                 },
             }
             _append_event(state, event)
-            call_id = payload.get("call_id")
             if call_id:
                 pending[call_id] = event
             _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
         elif ptype in ("function_call_output", "custom_tool_call_output", "tool_search_output"):
-            event = pending.pop(payload.get("call_id"), None)
+            call_id = payload.get("call_id")
+            output = payload.get("output")
+            if isinstance(output, dict):
+                output = output.get("content") or json.dumps(output)
+            output_text = str(output or "")
+            if _complete_artifact(state, call_id, output_text, ts):
+                _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
+                return
+            event = pending.pop(call_id, None)
             if event:
-                output = payload.get("output")
-                if isinstance(output, dict):
-                    output = output.get("content") or json.dumps(output)
-                event["tool"]["output"] = _clip(str(output or ""), MAX_TOOL_IO)
-                event["tool"]["ok"] = "exited with code 0" in str(output or "") or None
+                event["tool"]["output"] = _clip(output_text, MAX_TOOL_IO)
+                event["tool"]["ok"] = "exited with code 0" in output_text or None
                 _record_tool_patch(state, event)
             _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
         else:
@@ -1406,6 +1490,12 @@ def _claude_apply(state: dict, row: dict) -> None:
             if name == "AskUserQuestion" and isinstance(raw_input, dict) and block_id:
                 _emit_question_events(state, ts, raw_input.get("questions") or [], block_id)
                 rendered = True
+            elif _is_artifact_tool(name) and block_id:
+                state.setdefault("pending_artifacts", {})[block_id] = {
+                    "name": name,
+                    "input": _tool_arguments(raw_input) or {},
+                }
+                rendered = True
             else:
                 tool_input = _codex_tool_input(name, raw_input)
                 archetype, summary = classify_tool(name, tool_input)
@@ -1444,6 +1534,7 @@ def _claude_apply(state: dict, row: dict) -> None:
                         }
         elif btype == "tool_result":
             tool_use_id = block.get("tool_use_id")
+            result_text = _render_claude_result_text(block.get("content"))
             if tool_use_id and isinstance(block.get("content"), str):
                 tool_use_result = row.get("toolUseResult")
                 if not isinstance(tool_use_result, dict):
@@ -1460,10 +1551,12 @@ def _claude_apply(state: dict, row: dict) -> None:
                     structured_answers,
                 )
                 rendered = True
+            if _complete_artifact(state, tool_use_id, result_text, ts):
+                rendered = True
+                continue
             event = pending.pop(tool_use_id, None)
             if event:
-                result = block.get("content")
-                event["tool"]["output"] = _clip(_render_claude_result_text(result), MAX_TOOL_IO)
+                event["tool"]["output"] = _clip(result_text, MAX_TOOL_IO)
                 event["tool"]["ok"] = not block.get("is_error")
                 _record_tool_patch(state, event)
                 rendered = True
@@ -1518,6 +1611,7 @@ def _new_parse_state(fmt: str) -> dict:
         "buffer": "",
         "events": [],
         "pending": {},
+        "pending_artifacts": {},
         "pending_questions": {},
         "tokens": None,
         "base": 0,
