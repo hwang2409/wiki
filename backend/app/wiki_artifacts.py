@@ -34,7 +34,8 @@ TOOL_DESCRIPTION = (
     "Render a typed artifact inline in the Wiki.app session view. Prefer this over "
     "dumping /tmp file paths: the artifact is inspectable, downloadable, and lives "
     "with the transcript. Use table artifacts only for 20+ rows or data the user will "
-    "want to sort, export, or inspect; use a plain markdown table for small comparisons."
+    "want to sort, export, or inspect. For prose comparisons with at most 6 rows and "
+    "3 columns, use a plain markdown table instead."
 )
 
 TOOL_SCHEMA: dict[str, Any] = {
@@ -272,7 +273,7 @@ def artifact_server_command() -> tuple[str, ...]:
 def _tool_result(request_id: Any, arguments: Any) -> dict[str, Any]:
     try:
         event = render_artifact(arguments)
-    except ArtifactValidationError as exc:
+    except (ArtifactValidationError, OSError) as exc:
         result = {
             "content": [{"type": "text", "text": f"artifact rejected: {exc}"}],
             "isError": True,

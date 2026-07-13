@@ -1026,6 +1026,10 @@ class RunStoreTests(unittest.TestCase):
             artifact_path = artifact_dir / "00000000-0000-4000-8000-000000000085.png"
             artifact_path.write_bytes(b"artifact-png")
             artifact_path.chmod(0o600)
+            outside = root / "outside.jpg"
+            outside.write_bytes(b"must-not-be-copied")
+            linked_artifact = artifact_dir / "00000000-0000-4000-8000-000000000086.jpg"
+            linked_artifact.symlink_to(outside)
 
             archived, session_dir = store.archive_current(
                 record.run_id,
@@ -1043,6 +1047,7 @@ class RunStoreTests(unittest.TestCase):
             archived_artifact = session_dir / "artifacts" / artifact_path.name
             self.assertEqual(archived_artifact.read_bytes(), b"artifact-png")
             self.assertEqual(archived_artifact.stat().st_mode & 0o777, 0o600)
+            self.assertTrue((session_dir / "artifacts" / linked_artifact.name).is_symlink())
             self.assertEqual(
                 (session_dir / "cdx-WIKI-42-prompt.md").read_text(encoding="utf-8"),
                 "Work on ticket WIKI-42",

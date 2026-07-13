@@ -181,6 +181,12 @@ class WikiArtifactsTests(unittest.TestCase):
         event = wiki_artifacts.artifact_from_text(result["content"][0]["text"])
         self.assertEqual(event["id"], result["structuredContent"]["artifact_id"])
 
+    def test_storage_failure_returns_a_tool_error_without_crashing_server(self) -> None:
+        with mock.patch.object(wiki_artifacts, "render_artifact", side_effect=OSError("disk full")):
+            response = wiki_artifacts._tool_result(7, {"kind": "image", "payload": {}})
+        self.assertTrue(response["result"]["isError"])
+        self.assertIn("disk full", response["result"]["content"][0]["text"])
+
 
 if __name__ == "__main__":
     unittest.main()

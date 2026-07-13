@@ -789,7 +789,11 @@ class RunStore:
             if artifact_dir.is_symlink():
                 raise StoreError(f"refusing symlink artifact directory: {artifact_dir}")
             if artifact_dir.is_dir():
-                shutil.copytree(artifact_dir, session_dir / "artifacts")
+                shutil.copytree(
+                    artifact_dir,
+                    session_dir / "artifacts",
+                    symlinks=True,
+                )
 
             shutil.rmtree(self.run_dir(run_id))
             registry.pop(record.agent_id, None)
