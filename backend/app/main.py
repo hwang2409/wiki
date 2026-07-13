@@ -603,6 +603,29 @@ def _archive_hint(ticket: str) -> tuple[str | None, str | None, Path | None]:
     return (kind, archived_at.isoformat(), session_dir)
 
 
+def _read_json_object(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _archive_runtime_identity(
+    archive_dir: Path,
+    *,
+    fallback_kind: str | None,
+) -> tuple[dict[str, Any], str | None, str | None, str | None]:
+    run = _read_json_object(archive_dir / "run.json")
+    meta = _read_json_object(archive_dir / "meta.json")
+    worker = meta.get("worker")
+    entry = {**run, **(worker if isinstance(worker, dict) else {})}
+    model, kind, provider = _session_identity(entry)
+    kind = kind or fallback_kind
+    provider = provider or _provider_for_kind(kind)
+    return entry, model, kind, provider
+
+
 @app.get("/api/agents")
 def agents() -> dict[str, object]:
     registry: dict = {}
@@ -1298,6 +1321,53 @@ def _session_delta_payload(
     return payload
 
 
+def _archived_events_payload(
+    archive_dir: Path,
+    *,
+    cursor: int,
+    client_path: str | None,
+    fallback_kind: str | None,
+) -> dict[str, object] | None:
+    path = archive_dir / "events.jsonl"
+    if not path.is_file():
+        return None
+    entry, model, kind, provider = _archive_runtime_identity(
+        archive_dir,
+        fallback_kind=fallback_kind,
+    )
+    if provider not in {"codex", "claude"}:
+        return None
+    source_format = f"{provider}-normalized"
+    effective_cursor = 0 if client_path is not None and client_path != str(path) else cursor
+    result = transcripts.read_session_delta(source_format, path, effective_cursor)
+    payload: dict[str, object] = {
+        "version": 2,
+        "format": "provider-events",
+        "path": str(path),
+        "tokens": result["tokens"],
+        "tasks": result.get("tasks") or [],
+        "pr": result.get("pr"),
+        "session_meta": result.get("session_meta") or {},
+        "dispositions": result.get("dispositions")
+        or {"rendered": 0, "summarized": 0, "ignored": 0, "unknown": 0},
+        "base": result["base"],
+        "cursor": result["cursor"],
+        "tail_from": result["tail_from"],
+        "events": result["events"],
+        "patches": result.get("patches") or [],
+        "subagents": [],
+        "queue": [],
+        "working": False,
+        "model": model,
+        "desired_model": entry.get("desired_model"),
+        "kind": kind,
+        "provider": provider,
+    }
+    if "has_older" in result:
+        payload["has_older"] = bool(result["has_older"])
+    return payload
+
+
 @app.get("/api/agents/{ticket}/session")
 def agent_session(
     ticket: str,
@@ -1410,18 +1480,25 @@ def agent_session(
                 "provider_inspector": provider_inspector,
                 "composer_messages": provider_inspector.get("composer_messages") or [],
             }
-        # Native transcript gone (cleanup) — fall back to the archived pane log.
+        # Native transcript gone (cleanup) — the archive owns a durable,
+        # normalized provider stream for headless runs.
         if archive_dir is not None:
+            archived = _archived_events_payload(
+                archive_dir,
+                cursor=cursor,
+                client_path=client_path,
+                fallback_kind=current_kind,
+            )
+            if archived is not None:
+                return archived
+            # Pre-headless tmux archives have no normalized event stream.
             logs = sorted(archive_dir.glob("*.log"), key=lambda p: p.stat().st_size, reverse=True)
             if logs:
                 tail = clean_pane_log(logs[0])
-                meta = {}
-                try:
-                    meta = json.loads((archive_dir / "meta.json").read_text(encoding="utf-8"))
-                except (OSError, ValueError):
-                    pass
-                worker = meta.get("worker") if isinstance(meta.get("worker"), dict) else None
-                model, kind, provider = _session_identity(worker, fmt="pane-log")
+                _, model, kind, provider = _archive_runtime_identity(
+                    archive_dir,
+                    fallback_kind=current_kind,
+                )
                 kind = kind or current_kind
                 provider = provider or _provider_for_kind(kind)
                 return {
@@ -1476,10 +1553,31 @@ def agent_session_older(
     session = agent_session(ticket, cursor=0, client_path=None)
     fmt = session.get("format")
     raw_path = session.get("path")
-    if fmt not in {"codex", "claude"} or not isinstance(raw_path, str):
+    if not isinstance(raw_path, str):
         raise HTTPException(status_code=409, detail="Older transcript events are unavailable")
     path = Path(raw_path)
-    result = transcripts.read_older_session(fmt, path, before, count)
+    if fmt == "provider-events":
+        if raw_path.startswith("provider://") or not path.is_file():
+            raise HTTPException(
+                status_code=409,
+                detail="Older transcript events are unavailable",
+            )
+        provider = session.get("provider")
+        if provider not in {"codex", "claude"}:
+            raise HTTPException(
+                status_code=409,
+                detail="Older transcript events are unavailable",
+            )
+        result = transcripts.read_older_session(
+            f"{provider}-normalized",
+            path,
+            before,
+            count,
+        )
+    elif fmt in {"codex", "claude"}:
+        result = transcripts.read_older_session(fmt, path, before, count)
+    else:
+        raise HTTPException(status_code=409, detail="Older transcript events are unavailable")
     events = result["events"]
     if fmt == "claude":
         events = transcripts.annotate_agent_events(path, events)

@@ -8,6 +8,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
+from fastapi import HTTPException
+
 from backend.app import main, transcripts
 
 
@@ -416,6 +418,178 @@ class SessionDeltaTests(unittest.TestCase):
             self.assertEqual(older["base"], 1)
             self.assertEqual([event["text"] for event in older["events"]], ["event-1", "event-2"])
             self.assertTrue(older["has_older"])
+
+    def test_archived_session_prefers_provider_native_transcript(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            transcript = root / "rollout.jsonl"
+            registry = root / "agent-registry.json"
+            queue = root / "queue.json"
+            archive_root = root / "archive"
+            session_dir = archive_root / "WIKI-99" / "20260713-010203"
+            session_dir.mkdir(parents=True)
+            registry.write_text("{}", encoding="utf-8")
+            queue.write_text("{}", encoding="utf-8")
+            _write_rows(
+                transcript,
+                [
+                    {
+                        "type": "event_msg",
+                        "timestamp": "2026-07-13T00:00:00Z",
+                        "payload": {
+                            "type": "agent_message",
+                            "message": "provider-native",
+                        },
+                    }
+                ],
+                mode="w",
+            )
+            _write_rows(
+                session_dir / "events.jsonl",
+                [
+                    {
+                        "seq": 1,
+                        "raw_seq": 1,
+                        "normalized_at": "2026-07-13T00:00:00Z",
+                        "disposition": "rendered",
+                        "kind": "item_completed",
+                        "payload": {
+                            "method": "item/completed",
+                            "params": {
+                                "item": {
+                                    "type": "agentMessage",
+                                    "text": "archived-normalized",
+                                }
+                            },
+                        },
+                    }
+                ],
+                mode="w",
+            )
+            (session_dir / "run.json").write_text(
+                json.dumps({"provider": "codex", "model": "gpt-5.6-sol"}),
+                encoding="utf-8",
+            )
+
+            with (
+                mock.patch.object(main, "AGENT_REGISTRY_PATH", registry),
+                mock.patch.object(main, "AGENT_ARCHIVE_DIR", archive_root),
+                mock.patch.object(main, "MSG_QUEUE_PATH", queue),
+                mock.patch.object(main, "resolve_window", return_value=None),
+                mock.patch.object(
+                    transcripts,
+                    "find_session",
+                    return_value=("codex", transcript),
+                ),
+                mock.patch.dict(main._session_paths, {}, clear=True),
+            ):
+                body = main.agent_session("WIKI-99", cursor=0)
+
+            self.assertEqual(body["format"], "codex")
+            self.assertEqual(body["path"], str(transcript))
+            self.assertEqual([event["text"] for event in body["events"]], ["provider-native"])
+
+    def test_archived_normalized_session_is_structured_and_pages_older_events(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            registry = root / "agent-registry.json"
+            archive_root = root / "archive"
+            session_dir = archive_root / "WIKI-99" / "20260713-010203"
+            session_dir.mkdir(parents=True)
+            registry.write_text("{}", encoding="utf-8")
+            rows = []
+            for index in range(5):
+                item_type = "userMessage" if index % 2 == 0 else "agentMessage"
+                item = {"type": item_type}
+                if item_type == "userMessage":
+                    item["content"] = [{"type": "text", "text": f"event-{index}"}]
+                else:
+                    item["text"] = f"event-{index}"
+                rows.append(
+                    {
+                        "seq": index + 1,
+                        "raw_seq": index + 1,
+                        "normalized_at": f"2026-07-13T00:00:0{index}Z",
+                        "disposition": "rendered",
+                        "kind": "item_completed",
+                        "payload": {
+                            "method": "item/completed",
+                            "params": {"item": item},
+                        },
+                    }
+                )
+            _write_rows(session_dir / "events.jsonl", rows, mode="w")
+            (session_dir / "run.json").write_text(
+                json.dumps(
+                    {
+                        "provider": "codex",
+                        "model": "gpt-5.6-sol",
+                        "desired_model": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (session_dir / "meta.json").write_text(
+                json.dumps({"worker": {"kind": "cdx"}}),
+                encoding="utf-8",
+            )
+
+            with (
+                mock.patch.object(main, "AGENT_REGISTRY_PATH", registry),
+                mock.patch.object(main, "AGENT_ARCHIVE_DIR", archive_root),
+                mock.patch.object(main.transcripts, "TAIL_WINDOW_EVENTS", 2),
+                mock.patch.object(transcripts, "find_session", return_value=None),
+                mock.patch.dict(main._session_paths, {}, clear=True),
+            ):
+                initial = main.agent_session("WIKI-99", cursor=0)
+                older = main.agent_session_older(
+                    "WIKI-99",
+                    before=initial["base"],
+                    count=2,
+                )
+
+            self.assertEqual(initial["format"], "provider-events")
+            self.assertEqual(initial["base"], 3)
+            self.assertEqual(initial["tail_from"], 3)
+            self.assertEqual(initial["cursor"], 5)
+            self.assertTrue(initial["has_older"])
+            self.assertFalse(initial["working"])
+            self.assertEqual(initial["queue"], [])
+            self.assertEqual(initial["model"], "gpt-5.6-sol")
+            self.assertEqual(initial["kind"], "cdx")
+            self.assertEqual(initial["provider"], "codex")
+            self.assertEqual(
+                [(event["kind"], event["text"]) for event in initial["events"]],
+                [("assistant", "event-3"), ("user", "event-4")],
+            )
+            self.assertEqual(older["format"], "provider-events")
+            self.assertEqual(older["base"], 1)
+            self.assertEqual(
+                [(event["kind"], event["text"]) for event in older["events"]],
+                [("assistant", "event-1"), ("user", "event-2")],
+            )
+            self.assertTrue(older["has_older"])
+
+    def test_archived_session_without_transcript_events_or_log_is_404(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            registry = root / "agent-registry.json"
+            archive_root = root / "archive"
+            (archive_root / "WIKI-99" / "20260713-010203").mkdir(parents=True)
+            registry.write_text("{}", encoding="utf-8")
+
+            with (
+                mock.patch.object(main, "AGENT_REGISTRY_PATH", registry),
+                mock.patch.object(main, "AGENT_ARCHIVE_DIR", archive_root),
+                mock.patch.object(transcripts, "find_session", return_value=None),
+                mock.patch.dict(main._session_paths, {}, clear=True),
+                self.assertRaises(HTTPException) as missing,
+            ):
+                main.agent_session("WIKI-99", cursor=0)
+
+            self.assertEqual(missing.exception.status_code, 404)
 
     def test_subagent_session_renders_sidechain_events(self) -> None:
         with TemporaryDirectory() as tmp:

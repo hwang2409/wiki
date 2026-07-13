@@ -785,6 +785,18 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.client.calls[-1][0], "run/respond")
         self.assertEqual(self.client.calls[-1][1]["response"], mixed_answers)
 
+    async def test_live_provider_events_session_rejects_older_pagination(self) -> None:
+        self._seed_headless()
+
+        with self.assertRaises(HTTPException) as unavailable:
+            main.agent_session_older("WIKI-42", before=0)
+
+        self.assertEqual(unavailable.exception.status_code, 409)
+        self.assertEqual(
+            unavailable.exception.detail,
+            "Older transcript events are unavailable",
+        )
+
     async def test_spawn_and_replace_are_supervisor_owned(self) -> None:
         with mock.patch.object(
             main,
