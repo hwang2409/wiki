@@ -57,6 +57,10 @@ ITEM_RE = re.compile(r"^- (.+)$")
 WIKILINK_RE = re.compile(r"\[\[([^\][|\n]+?)(?:\|[^\][\n]*)?\]\]")
 CODE_FENCE_RE = re.compile(r"```[\s\S]*?```|~~~[\s\S]*?~~~")
 INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
+CLI_TICKET_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+PR_REFERENCE_RE = re.compile(
+    r"^(?:\d+|https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/\d+)$"
+)
 
 
 def strip_code(content: str) -> str:
@@ -613,6 +617,22 @@ def nonnegative_seconds(value: str) -> float:
     return seconds
 
 
+def normalized_cli_ticket(value: str) -> str:
+    ticket = value.strip().upper()
+    if CLI_TICKET_RE.fullmatch(ticket):
+        return ticket
+    print("error: ticket must match [A-Za-z0-9_-]+", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def normalized_pr_reference(value: str) -> str:
+    reference = value.strip()
+    if PR_REFERENCE_RE.fullmatch(reference):
+        return reference
+    print("error: PR must be a number or a github.com pull-request URL", file=sys.stderr)
+    raise SystemExit(2)
+
+
 def _backend_json(path: str) -> dict:
     url = f"{_backend_url()}{path}"
     try:
@@ -759,10 +779,7 @@ def _watch_exit(args: argparse.Namespace, *, status: dict | None, terminal: str 
 
 
 def cmd_agent_watch(args: argparse.Namespace) -> None:
-    ticket = args.ticket.strip().upper()
-    if not ticket:
-        print("error: ticket must not be empty", file=sys.stderr)
-        raise SystemExit(2)
+    ticket = normalized_cli_ticket(args.ticket)
 
     unseen = object()
     previous_runtime: object = unseen
@@ -770,7 +787,8 @@ def cmd_agent_watch(args: argparse.Namespace) -> None:
     previous_pr: object = unseen
     previous_stall: object = unseen
     previous_terminal: object = unseen
-    seen_merge_ready: set[str] = set()
+    last_merge_ready_signature: str | None = None
+    last_pr_url: str | None = None
     found_worker = False
     backend_down = False
 
@@ -799,7 +817,15 @@ def cmd_agent_watch(args: argparse.Namespace) -> None:
             if previous_terminal != terminal:
                 _watch_event(args, ticket, "terminal", terminal=terminal)
                 previous_terminal = terminal
-            if _watch_exit(args, status=None, terminal=terminal, pr=None):
+            pr_truth = _watch_pr_truth(last_pr_url) if last_pr_url else None
+            pr_signature = json.dumps(pr_truth, sort_keys=True, default=str) if pr_truth is not None else None
+            if previous_pr != pr_signature and pr_truth is not None:
+                if pr_truth.get("available"):
+                    _watch_event(args, ticket, "pr", pr=last_pr_url, **pr_truth)
+                else:
+                    _watch_event(args, ticket, "warning", pr=last_pr_url, **pr_truth)
+            previous_pr = pr_signature
+            if _watch_exit(args, status=None, terminal=terminal, pr=pr_truth):
                 return
             time.sleep(args.interval)
             continue
@@ -822,7 +848,7 @@ def cmd_agent_watch(args: argparse.Namespace) -> None:
             previous_runtime = runtime
 
         status = _watch_status(ticket)
-        if status is None:
+        if status is None and previous_status is unseen:
             # Keep compatibility with remote backends that expose their own
             # status directory while still treating the local file as source
             # of truth when it is present.
@@ -831,10 +857,11 @@ def cmd_agent_watch(args: argparse.Namespace) -> None:
         status_signature = json.dumps(status, sort_keys=True, default=str) if status is not None else None
         if previous_status != status_signature and status is not None:
             merge_ready = status.get("state") == "merge-ready"
-            merge_ready_key = status_signature if merge_ready else None
-            emit_merge_ready = bool(merge_ready_key and merge_ready_key not in seen_merge_ready)
-            if merge_ready_key:
-                seen_merge_ready.add(merge_ready_key)
+            emit_merge_ready = bool(
+                merge_ready and status_signature != last_merge_ready_signature
+            )
+            if merge_ready:
+                last_merge_ready_signature = status_signature
             _watch_event(
                 args,
                 ticket,
@@ -842,16 +869,19 @@ def cmd_agent_watch(args: argparse.Namespace) -> None:
                 **status,
                 merge_ready=emit_merge_ready,
             )
-        previous_status = status_signature
+        if status_signature is not None:
+            previous_status = status_signature
 
         pr_url = status.get("pr") if status else None
-        pr_truth = _watch_pr_truth(pr_url) if isinstance(pr_url, str) and pr_url else None
+        if isinstance(pr_url, str) and pr_url:
+            last_pr_url = pr_url
+        pr_truth = _watch_pr_truth(last_pr_url) if last_pr_url else None
         pr_signature = json.dumps(pr_truth, sort_keys=True, default=str) if pr_truth is not None else None
         if previous_pr != pr_signature and pr_truth is not None:
             if pr_truth.get("available"):
-                _watch_event(args, ticket, "pr", pr=pr_url, **pr_truth)
+                _watch_event(args, ticket, "pr", pr=last_pr_url, **pr_truth)
             else:
-                _watch_event(args, ticket, "warning", pr=pr_url, **pr_truth)
+                _watch_event(args, ticket, "warning", pr=last_pr_url, **pr_truth)
         previous_pr = pr_signature
 
         last_event_at = _watch_last_event_at(ticket, worker)
@@ -1048,6 +1078,7 @@ def _gate_result(args: argparse.Namespace) -> dict:
 
 
 def cmd_gate(args: argparse.Namespace) -> None:
+    args.pr = normalized_pr_reference(args.pr)
     try:
         result = _gate_result(args)
     except GateError as exc:
@@ -1399,7 +1430,7 @@ def main() -> None:
     watch.add_argument("--no-retry", action="store_true", help="exit 3 when the backend is unavailable")
     watch.set_defaults(func=cmd_agent_watch)
 
-    gate = sub.add_parser("gate", help="report merge-gate plumbing for one GitHub PR; never merges or reviews")
+    gate = sub.add_parser("gate", help="report merge-gate plumbing for one GitHub PR; never merges or reviews (gh 2.37+)")
     gate.add_argument("pr", help="PR number or URL")
     gate.add_argument("--repo", help="GitHub OWNER/REPO (defaults to origin remote)")
     gate.add_argument("--expect-sha", help="required prefix of the PR head SHA")
