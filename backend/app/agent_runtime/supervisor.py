@@ -4,7 +4,10 @@ import asyncio
 import math
 import os
 import time
+import warnings
+from collections import OrderedDict
 from collections.abc import Callable
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -34,6 +37,10 @@ from .version import RUNTIME_FINGERPRINT
 AdapterFactory = Callable[[RunRecord], ProviderAdapter]
 DEFAULT_REAPER_INTERVAL_SECONDS = 30.0
 DEFAULT_REAPER_GRACE_SECONDS = 60.0
+DEFAULT_ADAPTER_DETACH_GRACE_SECONDS = 1.0
+DEFAULT_IDEMPOTENCY_CACHE_SIZE = 256
+DEFAULT_WORKER_SOFT_CAP = 5
+_IDEMPOTENT_METHODS = frozenset({"run/start", "run/send_now", "run/send_on_idle"})
 
 
 def _validated_pending_id(value: object) -> str | None:
@@ -47,6 +54,37 @@ def _validated_pending_id(value: object) -> str | None:
         raise ValueError("pending_id must be a canonical UUID") from exc
     if str(parsed) != value:
         raise ValueError("pending_id must be a canonical UUID")
+    return value
+
+
+def _validated_idempotency_request_id(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip() or len(value) > 200:
+        raise ValueError("request_id must be a non-empty string up to 200 characters")
+    return value
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        warnings.warn(
+            f"{name} must be a positive integer; using default {default}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return default
+    if value < 1:
+        warnings.warn(
+            f"{name} must be a positive integer; using default {default}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return default
     return value
 
 
@@ -136,8 +174,13 @@ class Supervisor:
         recovery_stability_seconds: float = 30.0,
         reaper_interval_seconds: float | None = None,
         reaper_grace_seconds: float | None = None,
+        adapter_detach_grace_seconds: float = DEFAULT_ADAPTER_DETACH_GRACE_SECONDS,
         orphan_archive_grace_seconds: float = 0.5,
+        idempotency_cache_size: int = DEFAULT_IDEMPOTENCY_CACHE_SIZE,
+        worker_soft_cap: int | None = None,
     ):
+        if idempotency_cache_size < 1:
+            raise ValueError("idempotency_cache_size must be positive")
         self.store = store
         self.adapter_factory = adapter_factory
         self.pid_alive = pid_alive
@@ -164,6 +207,9 @@ class Supervisor:
                 )
             ),
         )
+        self.adapter_detach_grace_seconds = _validated_seconds(
+            "adapter_detach_grace_seconds", adapter_detach_grace_seconds
+        )
         self.last_reaper_at = 0.0
         self.detached_at_monotonic: dict[str, float] = {}
         self.orphan_archive_grace_seconds = orphan_archive_grace_seconds
@@ -185,6 +231,19 @@ class Supervisor:
         self.auth_dead_recoveries: dict[str, asyncio.Task[None]] = {}
         self.last_limit_alert_at: dict[str, float] = {}
         self.last_no_eligible_alert: float = 0.0
+        self.idempotency_cache_size = idempotency_cache_size
+        self.idempotency_results: OrderedDict[
+            tuple[str, str], tuple[str, Any]
+        ] = OrderedDict()
+        self.idempotency_tasks: dict[tuple[str, str], asyncio.Task[Any]] = {}
+        self.idempotency_lock = asyncio.Lock()
+        self.worker_soft_cap = (
+            worker_soft_cap
+            if worker_soft_cap is not None
+            else _env_positive_int("WIKI_WORKER_SOFT_CAP", DEFAULT_WORKER_SOFT_CAP)
+        )
+        if self.worker_soft_cap < 1:
+            raise ValueError("worker_soft_cap must be positive")
 
     def _runtime_status(self, record: RunRecord) -> dict[str, Any]:
         value = _public_run(record)
@@ -248,6 +307,16 @@ class Supervisor:
             and record.state not in TERMINAL_STATES
         }
         return sorted(tickets)
+
+    def _active_worker_count(self) -> int:
+        return sum(
+            1
+            for record in self.store.list_runs()
+            if record.role != "orchestrator"
+            and record.state not in TERMINAL_STATES
+            and not record.replaced_by_run_id
+            and self.store.is_current(record)
+        )
 
     def _agent_lock(self, agent_id: str) -> asyncio.Lock:
         return self.agent_locks.setdefault(agent_id, asyncio.Lock())
@@ -368,6 +437,13 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
     def _clear_adapter_loss(self, run_id: str) -> None:
         self.detached_at_monotonic.pop(run_id, None)
 
+    def _adapter_recently_detached(self, run_id: str) -> bool:
+        detached_at = self.detached_at_monotonic.get(run_id)
+        return (
+            detached_at is not None
+            and self._seconds_since(detached_at) < self.adapter_detach_grace_seconds
+        )
+
     def _reapable_adapter_loss(self, record: RunRecord) -> bool:
         if record.state in TERMINAL_STATES:
             self._clear_adapter_loss(record.run_id)
@@ -475,7 +551,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             except (RunNotFound, ValueError):
                 record = None
             self._remove_adapter_mapping(run_id, adapter)
-            if record is not None and record.provider_pid is None:
+            if record is not None:
                 self._mark_adapter_loss(run_id)
             if record is not None:
                 await self._publish_agent_change(record.agent_id)
@@ -977,6 +1053,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
     def _remove_adapter_mapping(self, run_id: str, adapter: ProviderAdapter) -> None:
         if self.adapters.get(run_id) is adapter:
             self.adapters.pop(run_id, None)
+            try:
+                self.store.set_control_attached(run_id, False)
+            except RunNotFound:
+                pass
         adapter_key = id(adapter)
         self.event_routes = {
             key: target
@@ -995,6 +1075,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         if old_task is not None:
             old_task.cancel()
         self.adapters[run_id] = adapter
+        self.store.set_control_attached(run_id, True)
         self.event_tasks[run_id] = asyncio.create_task(
             self._pump_events(run_id, adapter),
             name=f"agent-events-{run_id}",
@@ -1005,6 +1086,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
     ) -> None:
         self._clear_adapter_loss(run_id)
         adapter = self.adapters.pop(run_id, None)
+        if adapter is not None:
+            try:
+                self.store.set_control_attached(run_id, False)
+            except RunNotFound:
+                pass
         task = self.event_tasks.pop(run_id, None)
         if task is not None:
             task.cancel()
@@ -1808,6 +1894,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 "action": RecoveryAction.RETAIN.value,
                 "reason": "provider control channel is attached",
             }
+        if self._adapter_recently_detached(record.run_id):
+            return {
+                "run_id": record.run_id,
+                "action": RecoveryAction.BLOCK.value,
+                "reason": "provider control channel recently detached",
+            }
         if record.automatic_resume_suppressed:
             return {
                 "run_id": record.run_id,
@@ -2388,11 +2480,82 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         return record
 
     async def dispatch(self, method: str, params: dict[str, Any]) -> Any:
+        if method not in _IDEMPOTENT_METHODS:
+            return await self._dispatch(method, params)
+        request_id = _validated_idempotency_request_id(params.get("request_id"))
+        if request_id is None:
+            return await self._dispatch(method, params)
+        return await self._dispatch_idempotently(method, request_id, params)
+
+    def _complete_idempotency_task(
+        self,
+        key: tuple[str, str],
+        task: asyncio.Task[Any],
+    ) -> None:
+        """Cache a completed operation even when every waiter was cancelled."""
+
+        if self.idempotency_tasks.get(key) is not task:
+            return
+        self.idempotency_tasks.pop(key, None)
+        if task.cancelled():
+            return
+        try:
+            outcome: tuple[str, Any] = ("result", deepcopy(task.result()))
+        except Exception as exc:
+            outcome = ("error", (type(exc), exc.args))
+        self.idempotency_results[key] = outcome
+        self.idempotency_results.move_to_end(key)
+        while len(self.idempotency_results) > self.idempotency_cache_size:
+            self.idempotency_results.popitem(last=False)
+
+    @staticmethod
+    def _replay_idempotency_result(outcome: tuple[str, Any]) -> Any:
+        kind, value = outcome
+        if kind == "error":
+            error_type, args = value
+            raise error_type(*args)
+        return deepcopy(value)
+
+    async def _dispatch_idempotently(
+        self,
+        method: str,
+        request_id: str,
+        params: dict[str, Any],
+    ) -> Any:
+        key = (method, request_id)
+        async with self.idempotency_lock:
+            if key in self.idempotency_results:
+                self.idempotency_results.move_to_end(key)
+                return self._replay_idempotency_result(self.idempotency_results[key])
+            task = self.idempotency_tasks.get(key)
+            if task is None:
+                task = asyncio.create_task(
+                    self._dispatch(method, params),
+                    name=f"agent-idempotency-{method}-{request_id}",
+                )
+                self.idempotency_tasks[key] = task
+                task.add_done_callback(
+                    lambda completed: self._complete_idempotency_task(key, completed)
+                )
+        return deepcopy(await asyncio.shield(task))
+
+    async def _dispatch(self, method: str, params: dict[str, Any]) -> Any:
         if method == "ping":
             return {
                 "status": "ok",
                 "pid": os.getpid(),
                 "runtime_fingerprint": RUNTIME_FINGERPRINT,
+            }
+        if method == "idempotency/status":
+            target_method = params.get("method")
+            if target_method not in _IDEMPOTENT_METHODS:
+                raise ValueError("method must be an idempotent supervisor operation")
+            request_id = _validated_idempotency_request_id(params.get("request_id"))
+            if request_id is None:
+                raise ValueError("request_id is required")
+            key = (target_method, request_id)
+            return {
+                "known": key in self.idempotency_results or key in self.idempotency_tasks,
             }
         if method == "run/start":
             migrate_legacy = params.get("migrate_legacy", False)
@@ -2409,7 +2572,14 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 orchestrator_id=params.get("orchestrator_id"),
                 migrate_legacy=migrate_legacy,
             )
-            return _public_run(record)
+            result = _public_run(record)
+            active_worker_count = self._active_worker_count()
+            if record.role != "orchestrator" and active_worker_count >= self.worker_soft_cap:
+                result["warning"] = (
+                    f"{active_worker_count} active workers; soft cap {self.worker_soft_cap} "
+                    "— expect provider timeouts under load"
+                )
+            return result
         if method == "run/list":
             return {
                 "status": "ok",
@@ -2582,5 +2752,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         self.auth_dead_recoveries.clear()
         self.last_limit_alert_at.clear()
         self.last_no_eligible_alert = 0.0
+        self.idempotency_results.clear()
+        self.idempotency_tasks.clear()
         self.detached_at_monotonic.clear()
         self.adapters.clear()

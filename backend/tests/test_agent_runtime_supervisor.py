@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -305,6 +306,153 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             session_events,
         )
         self.supervisor.unsubscribe(queue)
+
+    async def test_dispatch_idempotently_replays_start_and_message_once(self) -> None:
+        start_params = {
+            "agent_id": "WIKI-IDEMPOTENT",
+            "provider": "codex",
+            "role": "implement",
+            "model": "fixture-codex",
+            "effort": "high",
+            "worktree": str(self.worktree),
+            "prompt": "Work on ticket WIKI-IDEMPOTENT",
+            "request_id": "spawn-retry-1",
+        }
+        first_start, replayed_start = await asyncio.gather(
+            self.supervisor.dispatch("run/start", start_params),
+            self.supervisor.dispatch("run/start", dict(start_params)),
+        )
+        self.assertEqual(first_start, replayed_start)
+        matching_runs = [
+            record
+            for record in self.store.list_runs()
+            if record.agent_id == "WIKI-IDEMPOTENT"
+        ]
+        self.assertEqual(len(matching_runs), 1)
+
+        adapter = self.supervisor.adapters[matching_runs[0].run_id]
+        starts_before_message = adapter.replayed_methods.count("turn/start")
+        message_params = {
+            "agent_id": "WIKI-IDEMPOTENT",
+            "text": "Retry-safe steer",
+            "request_id": "message-retry-1",
+        }
+        first_message, replayed_message = await asyncio.gather(
+            self.supervisor.dispatch("run/send_now", message_params),
+            self.supervisor.dispatch("run/send_now", dict(message_params)),
+        )
+        self.assertEqual(first_message, {"status": "sent"})
+        self.assertEqual(replayed_message, first_message)
+        self.assertEqual(
+            adapter.replayed_methods.count("turn/start"),
+            starts_before_message + 1,
+        )
+        await asyncio.sleep(0)
+        self.assertEqual(self.supervisor.idempotency_tasks, {})
+
+    async def test_dispatch_allows_integer_codex_approval_request_id(self) -> None:
+        started = await self.supervisor.dispatch(
+            "run/start",
+            {
+                "agent_id": "WIKI-APPROVAL",
+                "provider": "codex",
+                "role": "implement",
+                "model": "fixture-codex",
+                "effort": "high",
+                "worktree": str(self.worktree),
+                "prompt": "Handle a Codex approval.",
+            },
+        )
+
+        responded = await self.supervisor.dispatch(
+            "run/respond",
+            {
+                "run_id": started["run_id"],
+                "request_id": 3,
+                "response": {"approved": True},
+            },
+        )
+
+        self.assertEqual(responded["run_id"], started["run_id"])
+
+    async def test_idempotency_cache_evicts_oldest_result(self) -> None:
+        self.supervisor.idempotency_cache_size = 2
+        started = await self.supervisor.dispatch(
+            "run/start",
+            {
+                "agent_id": "WIKI-IDEMPOTENCY-LRU",
+                "provider": "codex",
+                "role": "implement",
+                "model": "fixture-codex",
+                "effort": "high",
+                "worktree": str(self.worktree),
+                "prompt": "Work on ticket WIKI-IDEMPOTENCY-LRU",
+                "request_id": "spawn-retry-1",
+            },
+        )
+        for request_id in ("message-retry-1", "message-retry-2"):
+            await self.supervisor.dispatch(
+                "run/send_now",
+                {
+                    "run_id": started["run_id"],
+                    "text": request_id,
+                    "request_id": request_id,
+                },
+            )
+
+        self.assertEqual(len(self.supervisor.idempotency_results), 2)
+        self.assertNotIn(("run/start", "spawn-retry-1"), self.supervisor.idempotency_results)
+
+    async def test_start_warns_when_active_workers_reach_soft_cap(self) -> None:
+        self.supervisor.worker_soft_cap = 1
+        warned_at_cap = await self.supervisor.dispatch(
+            "run/start",
+            {
+                "agent_id": "WIKI-SOFT-CAP-ONE",
+                "provider": "codex",
+                "role": "implement",
+                "model": "fixture-codex",
+                "effort": "high",
+                "worktree": str(self.worktree),
+                "prompt": "Work on ticket WIKI-SOFT-CAP-ONE",
+            },
+        )
+        warned = await self.supervisor.dispatch(
+            "run/start",
+            {
+                "agent_id": "WIKI-SOFT-CAP-TWO",
+                "provider": "codex",
+                "role": "review",
+                "model": "fixture-codex",
+                "effort": "high",
+                "worktree": str(self.worktree),
+                "prompt": "Work on ticket WIKI-SOFT-CAP-TWO",
+            },
+        )
+
+        self.assertEqual(
+            warned_at_cap["warning"],
+            "1 active workers; soft cap 1 — expect provider timeouts under load",
+        )
+        self.assertEqual(
+            warned["warning"],
+            "2 active workers; soft cap 1 — expect provider timeouts under load",
+        )
+
+    async def test_malformed_worker_soft_cap_uses_default_with_warning(self) -> None:
+        with (
+            mock.patch.dict(os.environ, {"WIKI_WORKER_SOFT_CAP": "not-a-number"}),
+            warnings.catch_warnings(record=True) as caught,
+        ):
+            warnings.simplefilter("always")
+            supervisor = Supervisor(self.store, FixtureAdapterFactory(FIXTURES))
+        try:
+            self.assertEqual(supervisor.worker_soft_cap, 5)
+            self.assertTrue(
+                any("WIKI_WORKER_SOFT_CAP" in str(item.message) for item in caught)
+            )
+        finally:
+            await supervisor.close()
 
     async def test_pending_id_round_trips_through_claude_provider_echo(self) -> None:
         record = await self.supervisor.start_run(
@@ -651,16 +799,27 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.supervisor = Supervisor(self.store, factory, pid_alive=lambda _pid: False)
+        params = {
+            "agent_id": "WIKI-START-FAIL",
+            "provider": "codex",
+            "role": "implement",
+            "model": "fixture-codex",
+            "effort": "high",
+            "worktree": str(self.worktree),
+            "prompt": "Fail after emitting a provider event",
+            "request_id": "failed-spawn-retry",
+        }
         with self.assertRaisesRegex(RuntimeError, "fixture start failure"):
-            await self.supervisor.start_run(
-                agent_id="WIKI-START-FAIL",
-                provider=ProviderKind.CODEX,
-                role="implement",
-                model="fixture-codex",
-                effort="high",
-                worktree=str(self.worktree),
-                prompt="Fail after emitting a provider event",
-            )
+            await self.supervisor.dispatch("run/start", params)
+        with self.assertRaisesRegex(RuntimeError, "fixture start failure"):
+            await self.supervisor.dispatch("run/start", dict(params))
+        await asyncio.sleep(0)
+        self.assertNotIn(
+            ("run/start", "failed-spawn-retry"), self.supervisor.idempotency_tasks
+        )
+        self.assertIn(
+            ("run/start", "failed-spawn-retry"), self.supervisor.idempotency_results
+        )
         run_id = self.store.current_run_id("WIKI-START-FAIL")
         assert run_id is not None
         failed = self.store.get(run_id)
@@ -2484,6 +2643,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             self.store,
             FixtureAdapterFactory(FIXTURES, pid=987_654),
             pid_alive=lambda _pid: False,
+            adapter_detach_grace_seconds=0.1,
         )
         record = await self.supervisor.start_run(
             agent_id="WIKI-STREAM",
@@ -2495,6 +2655,8 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             prompt="Work on ticket WIKI-STREAM",
         )
         await _wait_for_events(self.store, record.run_id, 10)
+        registry = json.loads(self.paths.registry_path.read_text(encoding="utf-8"))
+        self.assertTrue(registry["WIKI-STREAM"]["current"]["control_attached"])
         adapter = self.supervisor.adapters[record.run_id]
         await adapter.close()
         for _ in range(200):
@@ -2502,10 +2664,20 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 break
             await asyncio.sleep(0.01)
         self.assertNotIn(record.run_id, self.supervisor.adapters)
+        self.assertIn(record.run_id, self.supervisor.detached_at_monotonic)
+        registry = json.loads(self.paths.registry_path.read_text(encoding="utf-8"))
+        self.assertFalse(registry["WIKI-STREAM"]["current"]["control_attached"])
         interrupted = self.store.get(record.run_id)
         self.assertEqual(interrupted.state, LifecycleState.IDLE)
         self.assertEqual(interrupted.state_reason, "provider event stream ended")
 
+        delayed_recovery = await self.supervisor.recover_on_start()
+        delayed = next(
+            item for item in delayed_recovery if item["run_id"] == record.run_id
+        )
+        self.assertEqual(delayed["action"], "block")
+        self.assertEqual(delayed["reason"], "provider control channel recently detached")
+        await asyncio.sleep(0.11)
         recovery = await self.supervisor.recover_on_start()
         result = next(item for item in recovery if item["run_id"] == record.run_id)
         self.assertEqual(result["action"], "resume")
@@ -2622,6 +2794,43 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(current["control_attached"])
         self.assertTrue(current["provider_alive"])
         await stream.aclose()
+
+    def test_default_client_timeout_is_lane_aware_and_retry_safe(self) -> None:
+        client = SupervisorClient(self.paths)
+        for method in {
+            "run/start",
+            "run/replace",
+            "run/stop",
+            "run/resume",
+            "run/interrupt",
+            "run/archive",
+            "run/respond",
+        }:
+            self.assertEqual(client._timeout_for(method), 30.0)  # noqa: SLF001
+        for method in {"ping", "run/list", "run/status", "run/queue", "events/read"}:
+            self.assertEqual(client._timeout_for(method), 1.0)  # noqa: SLF001
+        connection = mock.Mock()
+        connection.connect.side_effect = socket.timeout()
+        with mock.patch(
+            "backend.app.agent_runtime.client.socket.socket",
+            return_value=connection,
+        ):
+            with self.assertRaises(SupervisorUnavailable) as timed_out:
+                client.request("run/start", {"agent_id": "WIKI-TIMEOUT"})
+
+        self.assertEqual(connection.settimeout.call_args.args, (30.0,))
+        self.assertIn("may have succeeded", str(timed_out.exception))
+        self.assertIn("Check GET /api/agents", str(timed_out.exception))
+
+        read_connection = mock.Mock()
+        read_connection.connect.side_effect = socket.timeout()
+        with mock.patch(
+            "backend.app.agent_runtime.client.socket.socket",
+            return_value=read_connection,
+        ):
+            with self.assertRaises(SupervisorUnavailable):
+                client.request("run/status", {"agent_id": "WIKI-TIMEOUT"})
+        self.assertEqual(read_connection.settimeout.call_args.args, (1.0,))
 
     async def test_server_accepts_existing_prompt_contract_above_default_reader_limit(
         self,

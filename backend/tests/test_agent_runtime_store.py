@@ -529,6 +529,30 @@ class RunStoreTests(unittest.TestCase):
             self.assertEqual(current["kind"], "cdx")
             self.assertIsNone(current["window"])
             self.assertEqual(current["log"], str(store.raw_events_path(record.run_id)))
+            self.assertFalse(current["control_attached"])
+
+    def test_control_attachment_is_projected_and_resets_on_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            record = store.create(_record(root))
+
+            store.set_control_attached(record.run_id, True)
+            registry = json.loads(paths.registry_path.read_text(encoding="utf-8"))
+            self.assertTrue(registry["WIKI-42"]["current"]["control_attached"])
+
+            store.update_adapter_status(
+                record.run_id,
+                AdapterStatus(LifecycleState.WORKING, "session-1", 4242),
+            )
+            registry = json.loads(paths.registry_path.read_text(encoding="utf-8"))
+            self.assertTrue(registry["WIKI-42"]["current"]["control_attached"])
+
+            restarted = RunStore(paths)
+            registry = json.loads(paths.registry_path.read_text(encoding="utf-8"))
+            self.assertFalse(registry["WIKI-42"]["current"]["control_attached"])
+            self.assertEqual(restarted.get(record.run_id).provider_pid, 4242)
 
     def test_create_archives_stale_legacy_current_during_migration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

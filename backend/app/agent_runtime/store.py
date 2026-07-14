@@ -349,6 +349,9 @@ class RunStore:
     def __init__(self, paths: RuntimePaths):
         self.paths = paths
         self._lock = threading.RLock()
+        # Adapter ownership is process-local. A restarted supervisor must
+        # project every retained PID as detached until it reattaches control.
+        self._control_attached_run_ids: set[str] = set()
         _ensure_private_dir(paths.runtime_dir)
         _ensure_private_dir(paths.runs_dir)
         self._reconcile_existing_runs()
@@ -472,6 +475,7 @@ class RunStore:
             "session_id": record.provider_session_id,
             "provider_session_id": record.provider_session_id,
             "provider_pid": record.provider_pid,
+            "control_attached": record.run_id in self._control_attached_run_ids,
             "provider_generation": record.provider_generation,
             "active_turn_id": record.active_turn_id,
             "transcript": record.transcript_path,
@@ -948,6 +952,22 @@ class RunStore:
 
     def is_current(self, record: RunRecord) -> bool:
         return self.current_run_id(record.agent_id) == record.run_id
+
+    def set_control_attached(self, run_id: str, attached: bool) -> RunRecord:
+        """Project this supervisor's adapter ownership without persisting it in a run."""
+
+        with self._lock:
+            record = self.get(run_id)
+            if attached:
+                self._control_attached_run_ids.add(run_id)
+            else:
+                self._control_attached_run_ids.discard(run_id)
+            registry = self._read_registry()
+            current = (registry.get(record.agent_id) or {}).get("current") or {}
+            if current.get("run_id") == run_id:
+                registry[record.agent_id]["current"] = self._registry_current(record)
+                self._write_registry(registry)
+            return record
 
     def transition(
         self,
