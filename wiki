@@ -25,9 +25,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "backend" / "app"))
-import vaultops  # noqa: E402
-import knowledge  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from backend.app import knowledge, vaultops  # noqa: E402
 
 VAULT = Path(
     os.environ.get("WIKI_VAULT_DIR") or Path(__file__).resolve().parent / "vault"

@@ -9,7 +9,7 @@ import stat
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from uuid import UUID, uuid4
 
 from . import knowledge
@@ -288,6 +288,24 @@ def artifact_server_command() -> tuple[str, ...]:
     if getattr(sys, "frozen", False):
         return (sys.executable, "--wiki-artifacts-mcp")
     return (sys.executable, "-m", "backend.app.wiki_artifacts")
+
+
+def artifact_server_environment(
+    child_env: Mapping[str, str],
+    run_id: str,
+) -> dict[str, str]:
+    server_env = {
+        "WIKI_AGENT_RUNTIME_DIR": child_env["WIKI_AGENT_RUNTIME_DIR"],
+        "WIKI_RUN_ID": run_id,
+    }
+    for key in (
+        "WIKI_KNOWLEDGE_DB_PATH",
+        "WIKI_VAULT_DIR",
+        "WIKI_AGENT_ARCHIVE_DIR",
+    ):
+        if child_env.get(key):
+            server_env[key] = child_env[key]
+    return server_env
 
 
 def _tool_result(request_id: Any, arguments: Any) -> dict[str, Any]:

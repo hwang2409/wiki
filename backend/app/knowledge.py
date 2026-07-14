@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import logging
 import os
 import re
@@ -14,17 +13,28 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping
+from typing import Any, Mapping
+
+from .knowledge_content import (
+    NoteChunk,
+    chunk_markdown,
+    extract_title,
+    extract_wikilinks,
+    frontmatter_body,
+    normalize_link_target,
+    resolve_wikilink_target,
+    ticket_for_note,
+)
+from .knowledge_runs import last_event_seq, load_run_metadata, read_run_events
+from .knowledge_schema import (
+    SCHEMA_VERSION,
+    is_corruption_error as _corruption_error,
+    reset_schema,
+)
 
 
 LOGGER = logging.getLogger(__name__)
-SCHEMA_VERSION = 1
-DEFAULT_CHUNK_CHARS = 4_000
 MAX_SEARCH_LIMIT = 100
-WIKILINK_RE = re.compile(r"\[\[([^\]|\n]+)(?:\|[^\]\n]*)?\]\]")
-FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
-HEADING_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$")
-TICKET_RE = re.compile(r"\b[A-Z][A-Z0-9]+-\d+\b")
 FTS_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 _PATH_LOCKS: dict[str, threading.RLock] = {}
 _PATH_LOCKS_GUARD = threading.Lock()
@@ -40,13 +50,6 @@ class KnowledgeUnavailable(KnowledgeError):
 
 class KnowledgeQueryError(KnowledgeError):
     """The caller supplied an invalid knowledge query."""
-
-
-@dataclass(frozen=True)
-class NoteChunk:
-    heading: str | None
-    text: str
-    pos: int
 
 
 @dataclass
@@ -152,251 +155,6 @@ def _path_lock(path: Path) -> threading.RLock:
         return _PATH_LOCKS.setdefault(key, threading.RLock())
 
 
-def _fence_marker(line: str) -> str | None:
-    match = FENCE_RE.match(line)
-    return match.group(1) if match else None
-
-
-def _frontmatter_body(content: str) -> tuple[dict[str, str], str]:
-    lines = content.splitlines()
-    if not lines or lines[0].strip() != "---":
-        return {}, content
-    fields: dict[str, str] = {}
-    for index, line in enumerate(lines[1:], start=1):
-        if line.strip() == "---":
-            return fields, "\n".join(lines[index + 1 :])
-        if ":" in line and not line.startswith((" ", "\t")):
-            key, _, value = line.partition(":")
-            fields[key.strip()] = value.strip()
-    return {}, content
-
-
-def _split_plain_text(text: str, max_chars: int) -> list[str]:
-    if len(text) <= max_chars:
-        return [text]
-    pieces: list[str] = []
-    remaining = text
-    while len(remaining) > max_chars:
-        cut = remaining.rfind("\n", 0, max_chars + 1)
-        if cut < max_chars // 2:
-            cut = remaining.rfind(" ", 0, max_chars + 1)
-        if cut < max_chars // 2:
-            cut = max_chars
-        pieces.append(remaining[:cut].strip())
-        remaining = remaining[cut:].strip()
-    if remaining:
-        pieces.append(remaining)
-    return [piece for piece in pieces if piece]
-
-
-def _section_units(lines: list[str], max_chars: int) -> list[str]:
-    """Return paragraph/fence-safe units, splitting only plain oversized text."""
-
-    units: list[tuple[str, bool]] = []
-    plain: list[str] = []
-    fenced: list[str] = []
-    fence: str | None = None
-
-    def flush_plain() -> None:
-        if not plain:
-            return
-        value = "\n".join(plain).strip()
-        plain.clear()
-        if value:
-            units.extend((piece, False) for piece in _split_plain_text(value, max_chars))
-
-    for line in lines:
-        marker = _fence_marker(line)
-        if fence is not None:
-            fenced.append(line)
-            if marker and marker[0] == fence[0] and len(marker) >= len(fence):
-                units.append(("\n".join(fenced).strip(), True))
-                fenced = []
-                fence = None
-            continue
-        if marker:
-            flush_plain()
-            fence = marker
-            fenced = [line]
-            continue
-        if not line.strip():
-            flush_plain()
-            continue
-        plain.append(line)
-    flush_plain()
-    if fenced:
-        # An unterminated fence is still one indivisible source block.
-        units.append(("\n".join(fenced).strip(), True))
-
-    chunks: list[str] = []
-    current = ""
-    for unit, is_fence in units:
-        if not unit:
-            continue
-        candidate = unit if not current else f"{current}\n\n{unit}"
-        if current and len(candidate) > max_chars:
-            chunks.append(current)
-            current = unit
-        elif is_fence and len(unit) > max_chars:
-            if current:
-                chunks.append(current)
-            chunks.append(unit)
-            current = ""
-        else:
-            current = candidate
-    if current:
-        chunks.append(current)
-    return chunks
-
-
-def chunk_markdown(
-    content: str,
-    *,
-    max_chars: int = DEFAULT_CHUNK_CHARS,
-) -> list[NoteChunk]:
-    """Chunk Markdown without crossing headings or splitting fenced blocks."""
-
-    if max_chars < 32:
-        raise ValueError("max_chars must be at least 32")
-    _, body = _frontmatter_body(content)
-    sections: list[tuple[str | None, list[str]]] = []
-    heading: str | None = None
-    lines: list[str] = []
-    fence: str | None = None
-    for line in body.splitlines():
-        marker = _fence_marker(line)
-        if fence is not None:
-            lines.append(line)
-            if marker and marker[0] == fence[0] and len(marker) >= len(fence):
-                fence = None
-            continue
-        if marker:
-            fence = marker
-            lines.append(line)
-            continue
-        match = HEADING_RE.match(line)
-        if match:
-            if lines or heading is not None:
-                sections.append((heading, lines))
-            heading = match.group(2).strip()
-            lines = []
-            continue
-        lines.append(line)
-    if lines or heading is not None or not sections:
-        sections.append((heading, lines))
-
-    chunks: list[NoteChunk] = []
-    for section_heading, section_lines in sections:
-        values = _section_units(section_lines, max_chars)
-        if not values and section_heading:
-            values = [""]
-        for value in values:
-            chunks.append(NoteChunk(section_heading, value, len(chunks)))
-    return chunks
-
-
-def strip_code(content: str) -> str:
-    """Remove fenced and inline code before extracting wikilinks."""
-
-    output: list[str] = []
-    fence: str | None = None
-    for line in content.splitlines():
-        marker = _fence_marker(line)
-        if fence is not None:
-            if marker and marker[0] == fence[0] and len(marker) >= len(fence):
-                fence = None
-            continue
-        if marker:
-            fence = marker
-            continue
-        output.append(re.sub(r"`[^`\n]*`", "", line))
-    return "\n".join(output)
-
-
-def _normalize_link_target(target: str) -> str:
-    base = target.strip().partition("#")[0].strip().replace("\\", "/")
-    if base.lower().endswith(".md"):
-        base = base[:-3]
-    return base.strip("/")
-
-
-def resolve_wikilink_target(target: str, note_paths: Iterable[str]) -> str | None:
-    """Resolve one Obsidian wikilink target; ambiguous basenames stay unresolved."""
-
-    normalized = _normalize_link_target(target)
-    if not normalized:
-        return None
-    paths = sorted({Path(path).as_posix() for path in note_paths})
-    by_no_suffix = {
-        Path(path).with_suffix("").as_posix().casefold(): path for path in paths
-    }
-    exact = by_no_suffix.get(normalized.casefold())
-    if exact:
-        return exact
-    matches = [path for path in paths if Path(path).stem.casefold() == normalized.casefold()]
-    return matches[0] if len(matches) == 1 else None
-
-
-def extract_wikilinks(content: str) -> list[str]:
-    return [match.group(1).strip() for match in WIKILINK_RE.finditer(strip_code(content))]
-
-
-def _extract_title(content: str, rel_path: str) -> str:
-    _, body = _frontmatter_body(content)
-    for line in body.splitlines():
-        match = HEADING_RE.match(line)
-        if match and len(match.group(1)) == 1:
-            return match.group(2).strip()
-    return Path(rel_path).stem.replace("-", " ").replace("_", " ").title()
-
-
-def _ticket_for_note(rel_path: str, content: str) -> str | None:
-    match = TICKET_RE.search(f"{rel_path}\n{content}")
-    return match.group(0) if match else None
-
-
-def _json_strings(value: Any) -> Iterator[str]:
-    if isinstance(value, str):
-        stripped = value.strip()
-        if stripped:
-            yield stripped
-    elif isinstance(value, list):
-        for item in value:
-            yield from _json_strings(item)
-    elif isinstance(value, dict):
-        for key, item in value.items():
-            if key in {"encrypted_content", "data_base64"}:
-                continue
-            yield from _json_strings(item)
-
-
-def event_text(event: Mapping[str, Any]) -> str:
-    """Flatten normalized event payload strings into searchable transcript text."""
-
-    kind = str(event.get("kind") or "unknown")
-    strings = [kind]
-    seen = {kind}
-    for value in _json_strings(event.get("payload") or {}):
-        if value in seen:
-            continue
-        seen.add(value)
-        strings.append(value)
-    return "\n".join(strings)
-
-
-def _corruption_error(exc: BaseException) -> bool:
-    message = str(exc).lower()
-    return any(
-        marker in message
-        for marker in (
-            "database disk image is malformed",
-            "file is not a database",
-            "database corrupt",
-            "malformed database schema",
-        )
-    )
-
-
 class KnowledgeIndex:
     def __init__(self, paths: KnowledgePaths):
         self.paths = paths
@@ -483,105 +241,9 @@ class KnowledgeIndex:
             self._remove_database()
             replacement = self._connect_raw()
             try:
-                self._reset_schema(replacement)
+                reset_schema(replacement)
             finally:
                 replacement.close()
-
-    def _reset_schema(self, connection: sqlite3.Connection) -> None:
-        connection.executescript(
-            """
-            DROP TRIGGER IF EXISTS chunks_ai;
-            DROP TRIGGER IF EXISTS chunks_ad;
-            DROP TRIGGER IF EXISTS chunks_au;
-            DROP TABLE IF EXISTS chunks_fts;
-            DROP TABLE IF EXISTS links;
-            DROP TABLE IF EXISTS chunks;
-            DROP TABLE IF EXISTS events;
-            DROP TABLE IF EXISTS runs;
-            DROP TABLE IF EXISTS notes;
-            DROP TABLE IF EXISTS meta;
-
-            CREATE TABLE meta (
-                schema_version INTEGER NOT NULL,
-                built_at TEXT
-            );
-            CREATE TABLE notes (
-                path TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                type TEXT,
-                tags TEXT,
-                created TEXT,
-                updated TEXT,
-                mtime INTEGER NOT NULL,
-                content_hash TEXT NOT NULL
-            );
-            CREATE TABLE chunks (
-                id INTEGER PRIMARY KEY,
-                source_kind TEXT NOT NULL CHECK(source_kind IN ('note', 'event')),
-                source_id TEXT NOT NULL,
-                ticket TEXT,
-                title TEXT NOT NULL DEFAULT '',
-                heading TEXT,
-                text TEXT NOT NULL,
-                pos INTEGER NOT NULL,
-                UNIQUE(source_kind, source_id, pos)
-            );
-            CREATE VIRTUAL TABLE chunks_fts USING fts5(
-                text,
-                title,
-                heading,
-                content='chunks',
-                content_rowid='id',
-                tokenize='porter unicode61'
-            );
-            CREATE TRIGGER chunks_ai AFTER INSERT ON chunks BEGIN
-                INSERT INTO chunks_fts(rowid, text, title, heading)
-                VALUES (new.id, new.text, new.title, new.heading);
-            END;
-            CREATE TRIGGER chunks_ad AFTER DELETE ON chunks BEGIN
-                INSERT INTO chunks_fts(chunks_fts, rowid, text, title, heading)
-                VALUES ('delete', old.id, old.text, old.title, old.heading);
-            END;
-            CREATE TRIGGER chunks_au AFTER UPDATE ON chunks BEGIN
-                INSERT INTO chunks_fts(chunks_fts, rowid, text, title, heading)
-                VALUES ('delete', old.id, old.text, old.title, old.heading);
-                INSERT INTO chunks_fts(rowid, text, title, heading)
-                VALUES (new.id, new.text, new.title, new.heading);
-            END;
-            CREATE TABLE links (
-                src_note TEXT NOT NULL REFERENCES notes(path) ON DELETE CASCADE,
-                dst_name TEXT NOT NULL,
-                resolved_path TEXT REFERENCES notes(path) ON DELETE SET NULL
-            );
-            CREATE TABLE runs (
-                run_id TEXT PRIMARY KEY,
-                ticket TEXT,
-                provider TEXT,
-                model TEXT,
-                role TEXT,
-                spawned_at TEXT,
-                ended_at TEXT,
-                outcome TEXT
-            );
-            CREATE TABLE events (
-                run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
-                seq INTEGER NOT NULL,
-                type TEXT NOT NULL,
-                ts TEXT,
-                text_excerpt TEXT NOT NULL,
-                PRIMARY KEY(run_id, seq)
-            );
-            CREATE INDEX chunks_source_idx ON chunks(source_kind, source_id, pos);
-            CREATE INDEX chunks_ticket_idx ON chunks(ticket);
-            CREATE INDEX links_dst_idx ON links(resolved_path);
-            CREATE INDEX events_type_ts_idx ON events(type, ts);
-            INSERT INTO meta(schema_version, built_at) VALUES (1, NULL);
-            """
-        )
-        connection.execute(
-            "UPDATE meta SET schema_version = ?", (SCHEMA_VERSION,)
-        )
-        connection.commit()
 
     def _prepare(self) -> tuple[sqlite3.Connection, bool]:
         """Return a usable connection and whether a full rebuild is required."""
@@ -605,7 +267,7 @@ class KnowledgeIndex:
                     self.paths.db_path,
                 )
                 self._mark_rebuilding()
-                self._reset_schema(connection)
+                reset_schema(connection)
                 return connection, True
             except sqlite3.DatabaseError as exc:
                 if connection is not None:
@@ -736,8 +398,8 @@ class KnowledgeIndex:
                             stats.notes_metadata_updated += 1
                         continue
 
-                    fields, _ = _frontmatter_body(content)
-                    title = _extract_title(content, rel)
+                    fields, _ = frontmatter_body(content)
+                    title = extract_title(content, rel)
                     connection.execute(
                         """
                         INSERT INTO notes(path, title, type, tags, created, updated, mtime, content_hash)
@@ -766,7 +428,7 @@ class KnowledgeIndex:
                         "DELETE FROM chunks WHERE source_kind = 'note' AND source_id = ?",
                         (rel,),
                     )
-                    ticket = _ticket_for_note(rel, content)
+                    ticket = ticket_for_note(rel, content)
                     chunks = chunk_markdown(content)
                     if not chunks:
                         chunks = [NoteChunk(None, "", 0)]
@@ -802,7 +464,7 @@ class KnowledgeIndex:
                                 rel,
                                 target,
                                 rel
-                                if not _normalize_link_target(target)
+                                if not normalize_link_target(target)
                                 else resolve_wikilink_target(target, note_paths),
                             ),
                         )
@@ -817,74 +479,13 @@ class KnowledgeIndex:
             connection.close()
             stats.elapsed_seconds = time.perf_counter() - started
 
-    @staticmethod
-    def _read_json(path: Path) -> dict[str, Any]:
-        try:
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return {}
-        return value if isinstance(value, dict) else {}
-
-    @staticmethod
-    def _last_event_seq(path: Path) -> int:
-        try:
-            with path.open("rb") as handle:
-                handle.seek(0, os.SEEK_END)
-                end = handle.tell()
-                offset = max(0, end - 256 * 1024)
-                handle.seek(offset)
-                data = handle.read()
-        except OSError:
-            return 0
-        lines = data.splitlines()
-        if offset and lines:
-            lines = lines[1:]
-        for raw in reversed(lines):
-            try:
-                value = json.loads(raw)
-                seq = int(value.get("seq", 0)) if isinstance(value, dict) else 0
-            except (ValueError, TypeError):
-                continue
-            if seq > 0:
-                return seq
-        return 0
-
-    @staticmethod
-    def _run_metadata(run_dir: Path) -> dict[str, Any]:
-        run = KnowledgeIndex._read_json(run_dir / "run.json")
-        meta = KnowledgeIndex._read_json(run_dir / "meta.json")
-        worker = meta.get("worker") if isinstance(meta.get("worker"), dict) else {}
-        ticket = (
-            run.get("agent_id")
-            or worker.get("ticket")
-            or worker.get("agent_id")
-            or (run_dir.parent.name if run_dir.parent.name else None)
-        )
-        run_id = run.get("run_id") or worker.get("run_id")
-        if not isinstance(run_id, str) or not run_id:
-            digest = hashlib.sha256(str(run_dir.absolute()).encode()).hexdigest()[:24]
-            run_id = f"archive-{digest}"
-        provider = run.get("provider") or worker.get("provider")
-        if provider is None:
-            provider = {"cdx": "codex", "cc": "claude"}.get(worker.get("kind"))
-        return {
-            "run_id": run_id,
-            "ticket": str(ticket) if ticket else None,
-            "provider": str(provider) if provider else None,
-            "model": run.get("model") or worker.get("model"),
-            "role": run.get("role") or worker.get("role"),
-            "spawned_at": run.get("created_at") or worker.get("spawned_at"),
-            "ended_at": meta.get("ended_at") or worker.get("ended_at"),
-            "outcome": meta.get("outcome") or run.get("outcome") or worker.get("outcome"),
-        }
-
     def index_run_directory(self, run_dir: Path) -> IngestStats:
         """Delta-index one live or archived run directory."""
 
         started = time.perf_counter()
         events_path = run_dir / "events.jsonl"
-        metadata = self._run_metadata(run_dir)
-        run_id = str(metadata["run_id"])
+        metadata = load_run_metadata(run_dir)
+        run_id = metadata.run_id
         connection, _ = self._prepare()
         stats = IngestStats(runs_indexed=1)
         try:
@@ -893,7 +494,12 @@ class KnowledgeIndex:
                 (run_id,),
             ).fetchone()
             after_seq = int(current_row["seq"] if current_row else 0)
-            last_seq = self._last_event_seq(events_path)
+            last_seq = last_event_seq(events_path)
+            batch = (
+                read_run_events(events_path, after_seq=after_seq)
+                if events_path.is_file() and not (last_seq > 0 and last_seq <= after_seq)
+                else None
+            )
             with connection:
                 connection.execute(
                     """
@@ -910,50 +516,16 @@ class KnowledgeIndex:
                     """,
                     (
                         run_id,
-                        metadata["ticket"],
-                        metadata["provider"],
-                        metadata["model"],
-                        metadata["role"],
-                        metadata["spawned_at"],
-                        metadata["ended_at"],
-                        metadata["outcome"],
+                        metadata.ticket,
+                        metadata.provider,
+                        metadata.model,
+                        metadata.role,
+                        metadata.spawned_at,
+                        metadata.ended_at,
+                        metadata.outcome,
                     ),
                 )
-                if not events_path.is_file() or (last_seq > 0 and last_seq <= after_seq):
-                    return stats
-                try:
-                    lines = events_path.read_text(encoding="utf-8").splitlines()
-                except FileNotFoundError:
-                    lines = []
-                for line in lines:
-                    if not line.strip():
-                        continue
-                    try:
-                        event = json.loads(line)
-                        if not isinstance(event, dict):
-                            raise ValueError("event is not an object")
-                        seq = int(event.get("seq", 0))
-                        if seq < 1:
-                            raise ValueError("event sequence is missing")
-                    except (TypeError, ValueError):
-                        stats.malformed_event_lines += 1
-                        continue
-                    if seq <= after_seq:
-                        continue
-                    payload = event.get("payload")
-                    if not isinstance(payload, dict):
-                        payload = {}
-                    kind = str(
-                        event.get("kind")
-                        or payload.get("type")
-                        or payload.get("method")
-                        or "unknown"
-                    )
-                    text = event_text(event)
-                    excerpt = re.sub(r"\s+", " ", text).strip()[:500]
-                    ts = event.get("normalized_at") or event.get("ts")
-                    if not ts:
-                        ts = payload.get("timestamp") or payload.get("ts")
+                for event in batch.events if batch else ():
                     connection.execute(
                         """
                         INSERT INTO events(run_id, seq, type, ts, text_excerpt)
@@ -963,11 +535,17 @@ class KnowledgeIndex:
                             ts=excluded.ts,
                             text_excerpt=excluded.text_excerpt
                         """,
-                        (run_id, seq, kind, ts, excerpt),
+                        (
+                            run_id,
+                            event.seq,
+                            event.event_type,
+                            event.ts,
+                            event.excerpt,
+                        ),
                     )
                     connection.execute(
                         "DELETE FROM chunks WHERE source_kind = 'event' AND source_id = ? AND pos = ?",
-                        (run_id, seq),
+                        (run_id, event.seq),
                     )
                     connection.execute(
                         """
@@ -977,15 +555,16 @@ class KnowledgeIndex:
                         """,
                         (
                             run_id,
-                            metadata["ticket"],
-                            metadata["ticket"] or run_id,
-                            kind,
-                            text,
-                            seq,
+                            metadata.ticket,
+                            metadata.ticket or run_id,
+                            event.event_type,
+                            event.text,
+                            event.seq,
                         ),
                     )
                     stats.events_indexed += 1
                     stats.chunks_indexed += 1
+            stats.malformed_event_lines = batch.malformed_lines if batch else 0
             if stats.malformed_event_lines:
                 LOGGER.warning(
                     "skipped %d malformed event lines in %s",
@@ -1032,7 +611,7 @@ class KnowledgeIndex:
             self._mark_rebuilding()
             connection = self._connect_raw()
             try:
-                self._reset_schema(connection)
+                reset_schema(connection)
             finally:
                 connection.close()
         stats = IngestStats()

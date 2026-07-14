@@ -19,7 +19,7 @@ def _runtime_fingerprint() -> str:
         runtime_dir = Path(__file__).resolve().parent
         sources = [
             *runtime_dir.glob("*.py"),
-            runtime_dir.parent / "knowledge.py",
+            *runtime_dir.parent.glob("knowledge*.py"),
             runtime_dir.parent / "wiki_artifacts.py",
         ]
         for path in sorted(sources):

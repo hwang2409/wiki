@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ..wiki_artifacts import artifact_server_command
+from ..wiki_artifacts import artifact_server_command, artifact_server_environment
 from .process import (
     ProviderProcessIdentity,
     command_tuple,
@@ -84,17 +84,7 @@ class CodexAppServerAdapter(ProviderAdapter):
         )
         self.env = child_env
         server_command = artifact_server_command()
-        server_env = {
-            "WIKI_AGENT_RUNTIME_DIR": child_env["WIKI_AGENT_RUNTIME_DIR"],
-            "WIKI_RUN_ID": record.run_id,
-        }
-        for key in (
-            "WIKI_KNOWLEDGE_DB_PATH",
-            "WIKI_VAULT_DIR",
-            "WIKI_AGENT_ARCHIVE_DIR",
-        ):
-            if child_env.get(key):
-                server_env[key] = child_env[key]
+        server_env = artifact_server_environment(child_env, record.run_id)
         toml_env = "{ " + ", ".join(
             f"{key} = {json.dumps(value)}" for key, value in server_env.items()
         ) + " }"
