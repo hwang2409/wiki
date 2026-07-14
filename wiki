@@ -33,7 +33,6 @@ import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
-from urllib.request import Request as UrlRequest
 from urllib.request import urlopen
 from uuid import uuid4
 
@@ -670,28 +669,15 @@ def _backend_request(
     path: str,
     payload: dict | None = None,
 ) -> dict:
-    url = f"{_backend_url()}{path}"
-    data = None
-    headers = {"Accept": "application/json"}
-    if payload is not None:
-        data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    request = UrlRequest(url, data=data, headers=headers, method=method)
     try:
-        with urlopen(request, timeout=10) as response:  # noqa: S310 - validated loopback URL
-            payload = json.loads(response.read().decode("utf-8"))
-    except HTTPError as exc:
-        try:
-            error = json.loads(exc.read().decode("utf-8"))
-            detail = error.get("detail") if isinstance(error, dict) else None
-        except (OSError, ValueError):
-            detail = None
-        raise WatchBackendError(str(detail or exc)) from exc
-    except (URLError, OSError, ValueError) as exc:
+        return backend_runtime.request_json(
+            _backend_url(),
+            method,
+            path,
+            payload,
+        )
+    except (backend_runtime.BackendRequestError, ValueError) as exc:
         raise WatchBackendError(str(exc)) from exc
-    if not isinstance(payload, dict):
-        raise WatchBackendError("backend returned a non-object JSON response")
-    return payload
 
 
 def _backend_json(path: str) -> dict:

@@ -1,13 +1,22 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
+from urllib.request import Request as UrlRequest
+from urllib.request import urlopen
 
 
 BACKEND_DISCOVERY_ENV = "WIKI_BACKEND_DISCOVERY_FILE"
+
+
+class BackendRequestError(RuntimeError):
+    pass
 
 
 def normalize_loopback_url(value: str) -> str:
@@ -68,3 +77,40 @@ def read_backend_url(env: Mapping[str, str] | None = None) -> str | None:
         return normalize_loopback_url(value)
     except (OSError, ValueError):
         return None
+
+
+def request_json(
+    base_url: str,
+    method: str,
+    path: str,
+    payload: dict[str, Any] | None = None,
+    *,
+    timeout: float = 10,
+) -> dict[str, Any]:
+    base = normalize_loopback_url(base_url)
+    data = None
+    headers = {"Accept": "application/json"}
+    if payload is not None:
+        data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = UrlRequest(
+        f"{base}{path}",
+        data=data,
+        headers=headers,
+        method=method,
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:  # noqa: S310 - loopback validated
+            result = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        try:
+            error = json.loads(exc.read().decode("utf-8"))
+            detail = error.get("detail") if isinstance(error, dict) else None
+        except (OSError, ValueError):
+            detail = None
+        raise BackendRequestError(str(detail or exc)) from exc
+    except (URLError, OSError, ValueError) as exc:
+        raise BackendRequestError(str(exc)) from exc
+    if not isinstance(result, dict):
+        raise BackendRequestError("backend returned non-object JSON")
+    return result

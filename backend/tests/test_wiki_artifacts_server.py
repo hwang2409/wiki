@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from backend.app import wiki_artifacts
+from backend.app import wiki_agent_tools, wiki_artifacts
 
 
 RUN_ID = "00000000-0000-4000-8000-000000000085"
@@ -218,9 +218,9 @@ class WikiArtifactsTests(unittest.TestCase):
 
         with (
             mock.patch.dict(os.environ, {"WIKI_AGENT_ROLE": "orchestrator"}),
-            mock.patch.object(wiki_artifacts, "_backend_api", side_effect=backend),
+            mock.patch.object(wiki_agent_tools, "_backend_api", side_effect=backend),
         ):
-            spawned = wiki_artifacts.spawn_agent(
+            spawned = wiki_agent_tools.spawn_agent(
                 {
                     "ticket": "WIKI-200",
                     "kind": "cdx",
@@ -233,7 +233,7 @@ class WikiArtifactsTests(unittest.TestCase):
                     "request_id": "mcp-spawn-1",
                 }
             )
-            wiki_artifacts.steer_agent(
+            wiki_agent_tools.steer_agent(
                 {
                     "id": "WIKI-200",
                     "message": "Run tests",
@@ -241,7 +241,7 @@ class WikiArtifactsTests(unittest.TestCase):
                     "request_id": "mcp-steer-1",
                 }
             )
-            wiki_artifacts.archive_agent(
+            wiki_agent_tools.archive_agent(
                 {"id": "WIKI-200", "outcome": "merged"}
             )
         self.assertTrue(spawned["ok"])

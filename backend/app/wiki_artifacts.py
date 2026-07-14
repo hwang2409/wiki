@@ -10,14 +10,10 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
-from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode
-from urllib.request import Request as UrlRequest
-from urllib.request import urlopen
 from uuid import UUID, uuid4
 
 from . import knowledge
-from .backend_runtime import normalize_loopback_url
+from . import wiki_agent_tools
 
 
 TEXT_LIMIT = 100_000
@@ -74,138 +70,6 @@ SEARCH_TOOL_SCHEMA: dict[str, Any] = {
         "limit": {"type": "integer", "minimum": 1, "maximum": 100},
     },
 }
-
-ORCHESTRATOR_TOOL_DEFINITIONS: list[dict[str, Any]] = [
-    {
-        "name": "list_agents",
-        "description": (
-            "List Wiki supervisor workers and orchestrators with durable runtime/status "
-            "state. Use this instead of inspecting tmux, process tables, or registry files."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {},
-        },
-    },
-    {
-        "name": "read_agent",
-        "description": (
-            "Read one agent snapshot, including run id, lifecycle state, status-file "
-            "state, PR, current step, blocker, provider identity, and worktree."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["id"],
-            "properties": {"id": {"type": "string", "minLength": 1}},
-        },
-    },
-    {
-        "name": "read_agent_events",
-        "description": (
-            "Read durable normalized supervisor/provider events for gate diagnosis and "
-            "progress inspection. Cursors are normalized event sequence numbers."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["id"],
-            "properties": {
-                "id": {"type": "string", "minLength": 1},
-                "after_seq": {"type": "integer", "minimum": 0, "default": 0},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 200},
-                "include_raw": {"type": "boolean", "default": False},
-            },
-        },
-    },
-    {
-        "name": "read_agent_pr",
-        "description": (
-            "Read the Wiki GitHub PR snapshot for a ticket. Use `wiki gate` for the "
-            "authoritative merge-ready check including checks and review threads."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["id"],
-            "properties": {"id": {"type": "string", "minLength": 1}},
-        },
-    },
-    {
-        "name": "spawn_agent",
-        "description": (
-            "Spawn one supervisor-owned worker. Always pass this orchestrator's id in "
-            "orch. request_id is generated when omitted; reuse an explicit value on retry."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["ticket", "kind", "role", "model", "workdir", "prompt", "orch"],
-            "properties": {
-                "ticket": {"type": "string", "minLength": 1},
-                "kind": {"enum": ["cc", "cdx"]},
-                "role": {"enum": ["plan", "implement", "review"]},
-                "model": {"type": "string", "minLength": 1},
-                "effort": {"enum": ["minimal", "low", "medium", "high", "xhigh"]},
-                "workdir": {"type": "string", "minLength": 1},
-                "prompt": {"type": "string", "minLength": 1},
-                "orch": {"type": "string", "minLength": 1},
-                "request_id": {"type": "string", "minLength": 1, "maxLength": 200},
-            },
-        },
-    },
-    {
-        "name": "steer_agent",
-        "description": (
-            "Send a supervisor-native message now or once the run is idle. request_id "
-            "is generated when omitted; reuse an explicit value on retry."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["id", "message"],
-            "properties": {
-                "id": {"type": "string", "minLength": 1},
-                "message": {"type": "string", "minLength": 1, "maxLength": 4000},
-                "mode": {"enum": ["now", "on-idle"], "default": "now"},
-                "request_id": {"type": "string", "minLength": 1, "maxLength": 200},
-            },
-        },
-    },
-    {
-        "name": "replace_agent",
-        "description": "Replace a supervisor-owned worker or orchestrator without using tmux.",
-        "inputSchema": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["id"],
-            "properties": {
-                "id": {"type": "string", "minLength": 1},
-                "kind": {"enum": ["cc", "cdx"]},
-                "model": {"type": "string", "minLength": 1},
-                "effort": {"enum": ["minimal", "low", "medium", "high", "xhigh"]},
-            },
-        },
-    },
-    {
-        "name": "archive_agent",
-        "description": (
-            "Archive a terminal run with its outcome and release its provider process. "
-            "Call only after the protocol's gate/wrap-up conditions are satisfied."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["id", "outcome"],
-            "properties": {
-                "id": {"type": "string", "minLength": 1},
-                "outcome": {"enum": ["merged", "closed", "abandoned"]},
-            },
-        },
-    },
-]
-
 
 def _require_keys(
     value: dict[str, Any],
@@ -506,211 +370,6 @@ def _knowledge_tool_result(request_id: Any, arguments: Any) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
 
-class RuntimeToolError(RuntimeError):
-    pass
-
-
-def _orchestrator_arguments(
-    arguments: Any,
-    *,
-    required: set[str],
-    optional: set[str] = frozenset(),
-) -> dict[str, Any]:
-    if os.environ.get("WIKI_AGENT_ROLE") != "orchestrator":
-        raise RuntimeToolError("agent operations require an orchestrator runtime")
-    if not isinstance(arguments, dict):
-        raise RuntimeToolError("tool input must be an object")
-    try:
-        _require_keys(arguments, required=required, optional=optional)
-    except ArtifactValidationError as exc:
-        raise RuntimeToolError(str(exc)) from exc
-    return dict(arguments)
-
-
-def _backend_api(
-    method: str,
-    path: str,
-    payload: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    configured = os.environ.get("WIKI_BACKEND_URL")
-    if not configured:
-        raise RuntimeToolError("WIKI_BACKEND_URL is missing from the runtime")
-    try:
-        base_url = normalize_loopback_url(configured)
-    except ValueError as exc:
-        raise RuntimeToolError(str(exc)) from exc
-    data = None
-    headers = {"Accept": "application/json"}
-    if payload is not None:
-        data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    request = UrlRequest(
-        f"{base_url}{path}",
-        data=data,
-        headers=headers,
-        method=method,
-    )
-    try:
-        with urlopen(request, timeout=15) as response:  # noqa: S310 - validated loopback URL
-            result = json.loads(response.read().decode("utf-8"))
-    except HTTPError as exc:
-        try:
-            error = json.loads(exc.read().decode("utf-8"))
-            detail = error.get("detail") if isinstance(error, dict) else None
-        except (OSError, ValueError):
-            detail = None
-        raise RuntimeToolError(str(detail or exc)) from exc
-    except (URLError, OSError, ValueError) as exc:
-        raise RuntimeToolError(f"Wiki backend request failed: {exc}") from exc
-    if not isinstance(result, dict):
-        raise RuntimeToolError("Wiki backend returned non-object JSON")
-    return result
-
-
-def list_agents(arguments: Any) -> dict[str, Any]:
-    _orchestrator_arguments(arguments, required=set())
-    return _backend_api("GET", "/api/agents")
-
-
-def read_agent(arguments: Any) -> dict[str, Any]:
-    values = _orchestrator_arguments(arguments, required={"id"})
-    agent_id = _require_string(values["id"], "id")
-    payload = _backend_api("GET", "/api/agents")
-    wanted = agent_id.upper()
-    for kind, key, rows in (
-        ("worker", "ticket", payload.get("workers")),
-        ("orchestrator", "id", payload.get("orchestrators")),
-    ):
-        for row in rows if isinstance(rows, list) else []:
-            if not isinstance(row, dict):
-                continue
-            found = row.get(key)
-            if isinstance(found, str) and found.upper() == wanted:
-                return {"type": kind, **row}
-    raise RuntimeToolError(f"agent {agent_id} was not found")
-
-
-def read_agent_events(arguments: Any) -> dict[str, Any]:
-    values = _orchestrator_arguments(
-        arguments,
-        required={"id"},
-        optional={"after_seq", "limit", "include_raw"},
-    )
-    agent_id = _require_string(values.pop("id"), "id")
-    query = urlencode(
-        {
-            "after_seq": values.get("after_seq", 0),
-            "limit": values.get("limit", 200),
-            "include_raw": str(values.get("include_raw", False)).lower(),
-        }
-    )
-    return _backend_api(
-        "GET",
-        f"/api/agents/{quote(agent_id, safe='')}/events?{query}",
-    )
-
-
-def read_agent_pr(arguments: Any) -> dict[str, Any]:
-    values = _orchestrator_arguments(arguments, required={"id"})
-    agent_id = _require_string(values["id"], "id")
-    return _backend_api("GET", f"/api/agents/{quote(agent_id, safe='')}/pr")
-
-
-def spawn_agent(arguments: Any) -> dict[str, Any]:
-    values = _orchestrator_arguments(
-        arguments,
-        required={"ticket", "kind", "role", "model", "workdir", "prompt", "orch"},
-        optional={"effort", "request_id"},
-    )
-    values.setdefault("effort", None)
-    values.setdefault("request_id", str(uuid4()))
-    return _backend_api("POST", "/api/agents/spawn", values)
-
-
-def steer_agent(arguments: Any) -> dict[str, Any]:
-    values = _orchestrator_arguments(
-        arguments,
-        required={"id", "message"},
-        optional={"mode", "request_id"},
-    )
-    agent_id = _require_string(values.pop("id"), "id")
-    message = _require_string(values.pop("message"), "message")
-    payload = {
-        "text": message,
-        "mode": values.get("mode", "now"),
-        "request_id": values.get("request_id") or str(uuid4()),
-    }
-    return _backend_api(
-        "POST",
-        f"/api/agents/{quote(agent_id, safe='')}/message",
-        payload,
-    )
-
-
-def replace_agent(arguments: Any) -> dict[str, Any]:
-    values = _orchestrator_arguments(
-        arguments,
-        required={"id"},
-        optional={"kind", "model", "effort"},
-    )
-    agent_id = _require_string(values.pop("id"), "id")
-    return _backend_api(
-        "POST",
-        f"/api/agents/{quote(agent_id, safe='')}/replace",
-        values,
-    )
-
-
-def archive_agent(arguments: Any) -> dict[str, Any]:
-    values = _orchestrator_arguments(
-        arguments,
-        required={"id", "outcome"},
-    )
-    agent_id = _require_string(values.pop("id"), "id")
-    return _backend_api(
-        "POST",
-        f"/api/agents/{quote(agent_id, safe='')}/archive",
-        values,
-    )
-
-
-ORCHESTRATOR_TOOL_HANDLERS = {
-    "list_agents": list_agents,
-    "read_agent": read_agent,
-    "read_agent_events": read_agent_events,
-    "read_agent_pr": read_agent_pr,
-    "spawn_agent": spawn_agent,
-    "steer_agent": steer_agent,
-    "replace_agent": replace_agent,
-    "archive_agent": archive_agent,
-}
-
-
-def _runtime_tool_result(
-    request_id: Any,
-    name: str,
-    arguments: Any,
-) -> dict[str, Any]:
-    try:
-        payload = ORCHESTRATOR_TOOL_HANDLERS[name](arguments)
-    except (RuntimeToolError, ArtifactValidationError, TypeError, ValueError) as exc:
-        result = {
-            "content": [{"type": "text", "text": f"Wiki runtime operation failed: {exc}"}],
-            "isError": True,
-        }
-    else:
-        result = {
-            "content": [
-                {
-                    "type": "text",
-                    "text": json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-                }
-            ],
-            "structuredContent": payload,
-        }
-    return {"jsonrpc": "2.0", "id": request_id, "result": result}
-
-
 def _response(message: dict[str, Any]) -> dict[str, Any] | None:
     method = message.get("method")
     request_id = message.get("id")
@@ -741,7 +400,7 @@ def _response(message: dict[str, Any]) -> dict[str, Any] | None:
             },
         ]
         if os.environ.get("WIKI_AGENT_ROLE") == "orchestrator":
-            tools.extend(ORCHESTRATOR_TOOL_DEFINITIONS)
+            tools.extend(wiki_agent_tools.TOOL_DEFINITIONS)
         return {
             "jsonrpc": "2.0",
             "id": request_id,
@@ -753,8 +412,8 @@ def _response(message: dict[str, Any]) -> dict[str, Any] | None:
             return _tool_result(request_id, params.get("arguments"))
         if params.get("name") == "search_knowledge":
             return _knowledge_tool_result(request_id, params.get("arguments"))
-        if params.get("name") in ORCHESTRATOR_TOOL_HANDLERS:
-            return _runtime_tool_result(
+        if params.get("name") in wiki_agent_tools.TOOL_HANDLERS:
+            return wiki_agent_tools.tool_result(
                 request_id,
                 params["name"],
                 params.get("arguments"),
