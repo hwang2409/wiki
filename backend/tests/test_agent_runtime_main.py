@@ -89,7 +89,7 @@ class FakeSupervisorClient:
             "orch": params.get("orchestrator_id"),
             "state": "working",
             "provider_session_id": f"session-{run_id[-2:]}",
-            "provider_pid": 4242,
+            "provider_pid": os.getpid(),
             "transcript": None,
             "log": str(self.raw_path),
             "window": None,
@@ -640,6 +640,21 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         worker = cast(list[dict[str, Any]], payload["workers"])[0]
         self.assertEqual(supervisor["status"], "degraded")
         self.assertEqual(supervisor["liveness"], "unavailable")
+        self.assertFalse(worker["control_attached"])
+        self.assertFalse(worker["window_alive"])
+        self.assertEqual(self.client.calls, [])
+
+    async def test_agents_marks_dead_provider_detached_without_supervisor_rpc(self) -> None:
+        self._seed_headless()
+        registry = json.loads(self.registry.read_text(encoding="utf-8"))
+        registry["WIKI-42"]["current"]["provider_pid"] = 999999
+        self.registry.write_text(json.dumps(registry), encoding="utf-8")
+
+        payload = main.agents()
+
+        supervisor = cast(dict[str, Any], payload["supervisor"])
+        worker = cast(list[dict[str, Any]], payload["workers"])[0]
+        self.assertEqual(supervisor["status"], "snapshot")
         self.assertFalse(worker["control_attached"])
         self.assertFalse(worker["window_alive"])
         self.assertEqual(self.client.calls, [])

@@ -654,15 +654,8 @@ def _archive_runtime_identity(
     return entry, model, kind, provider
 
 
-def _supervisor_pid_is_alive() -> bool:
-    """Avoid a queued supervisor RPC when annotating a registry snapshot."""
-
-    try:
-        raw_pid = SUPERVISOR_CLIENT.paths.pid_path.read_text(encoding="utf-8").strip()
-        pid = int(raw_pid)
-    except (AttributeError, OSError, ValueError):
-        return False
-    if pid <= 1:
+def _pid_is_alive(pid: object) -> bool:
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
         return False
     try:
         os.kill(pid, 0)
@@ -671,6 +664,17 @@ def _supervisor_pid_is_alive() -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _supervisor_pid_is_alive() -> bool:
+    """Avoid a queued supervisor RPC when annotating a registry snapshot."""
+
+    try:
+        raw_pid = SUPERVISOR_CLIENT.paths.pid_path.read_text(encoding="utf-8").strip()
+        pid = int(raw_pid)
+    except (AttributeError, OSError, ValueError):
+        return False
+    return _pid_is_alive(pid)
 
 
 @app.get("/api/agents")
@@ -738,7 +742,9 @@ def agents() -> dict[str, object]:
         runtime = current if headless else {}
         runtime_state = runtime.get("state") if headless else None
         control_attached = (
-            supervisor_alive and bool(runtime.get("provider_pid")) if headless else False
+            supervisor_alive and _pid_is_alive(runtime.get("provider_pid"))
+            if headless
+            else False
         )
         status = read_agent_status(ticket)
         seen_tickets.add(ticket)
