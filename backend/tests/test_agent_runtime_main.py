@@ -411,6 +411,7 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
                     text="steer now",
                     mode="now",
                     pending_id=sent_pending_id,
+                    request_id="message-retry-1",
                 ),
                 BackgroundTasks(),
             )
@@ -460,6 +461,7 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         self.assertEqual(self.client.calls[0][1]["pending_id"], str(sent_pending_id))
+        self.assertEqual(self.client.calls[0][1]["request_id"], "message-retry-1")
         self.assertEqual(self.client.calls[1][1]["pending_id"], str(queued_pending_id))
 
     async def test_set_model_routes_to_supervisor_and_cancel_clears_pending(self) -> None:
@@ -573,12 +575,9 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(blocked.exception.status_code, 409)
         self.assertIn("must be migrated", str(blocked.exception.detail))
         self.assertEqual(len(background.tasks), 0)
-        self.assertEqual(
-            [call for call in self.client.calls if call not in calls_before],
-            [("run/list", {})],
-        )
+        self.assertEqual([call for call in self.client.calls if call not in calls_before], [])
 
-    async def test_agents_and_log_use_supervisor_liveness_without_tmux(self) -> None:
+    async def test_agents_and_log_use_registry_snapshot_without_tmux(self) -> None:
         self._seed_headless()
         with mock.patch.object(
             main,
@@ -595,9 +594,29 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(worker["runtime_state"], "working")
         self.assertTrue(worker["window_alive"])
         self.assertTrue(worker["control_attached"])
-        self.assertEqual(supervisor["status"], "ready")
+        self.assertEqual(supervisor["status"], "snapshot")
+        self.assertEqual(supervisor["liveness"], "snapshot")
+        self.assertIsNotNone(supervisor["snapshot_refreshed_at"])
+        self.assertEqual(self.client.calls, [])
         self.assertEqual(log["path"], str(self.raw))
         self.assertIn("turn/started", log["tail"])
+
+    async def test_agents_fast_lane_never_waits_for_a_slow_supervisor(self) -> None:
+        self._seed_headless()
+
+        def slow_request(*_args: object, **_kwargs: object) -> None:
+            time.sleep(2)
+            raise AssertionError("agent listing must not call the supervisor")
+
+        with mock.patch.object(self.client, "request", side_effect=slow_request) as request:
+            started = time.monotonic()
+            payload = main.agents()
+            elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 1)
+        self.assertEqual(payload["supervisor"]["status"], "snapshot")
+        self.assertEqual(payload["workers"][0]["runtime_state"], "working")
+        request.assert_not_called()
 
     async def test_session_prefers_supervisor_transcript_and_runtime_state(
         self,
@@ -813,12 +832,15 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
                     workdir=str(self.worktree),
                     orch=None,
                     prompt="Implement WIKI-42",
+                    request_id="spawn-retry-1",
                 )
             )
         self.assertEqual(spawned["window"], None)
         self.assertEqual(spawned["run_id"], RUN_ID)
         self.assertEqual(spawned["log"], str(self.raw))
         self.assertFalse((self.status_dir / "WIKI-42.json").exists())
+        start = next(params for method, params in self.client.calls if method == "run/start")
+        self.assertEqual(start["request_id"], "spawn-retry-1")
 
         replaced = main.replace_agent("WIKI-42")
         self.assertEqual(replaced["run_id"], REPLACEMENT_RUN_ID)
@@ -1253,7 +1275,8 @@ class BackendSupervisorEndToEndTests(unittest.IsolatedAsyncioTestCase):
         workers = cast(list[dict[str, Any]], agents["workers"])
         self.assertTrue(workers[0]["control_attached"])
         supervisor = cast(dict[str, Any], agents["supervisor"])
-        self.assertEqual(supervisor["status"], "ready")
+        self.assertEqual(supervisor["status"], "snapshot")
+        self.assertEqual(supervisor["liveness"], "snapshot")
 
 
 class DetachedHeadlessAcceptanceTests(unittest.TestCase):

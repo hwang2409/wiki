@@ -19,6 +19,16 @@ from .version import RUNTIME_FINGERPRINT
 
 
 DEFAULT_SWAP_DRAIN_SECONDS = 10.0
+DEFAULT_FAST_READ_TIMEOUT = 1.0
+DEFAULT_SLOW_OPERATION_TIMEOUT = 30.0
+
+_SLOW_OPERATION_METHODS = frozenset(
+    {
+        "run/start",
+        "run/send_now",
+        "run/send_on_idle",
+    }
+)
 
 
 def replacement_prompt(
@@ -73,7 +83,7 @@ class SupervisorClient:
         self,
         paths: RuntimePaths,
         *,
-        timeout: float = 10.0,
+        timeout: float | None = None,
         runtime_fingerprint: str = RUNTIME_FINGERPRINT,
         swap_drain_seconds: float = DEFAULT_SWAP_DRAIN_SECONDS,
     ):
@@ -84,17 +94,37 @@ class SupervisorClient:
         self.runtime_fingerprint = runtime_fingerprint
         self.swap_drain_seconds = swap_drain_seconds
 
+    def _timeout_for(self, method: str) -> float:
+        """Keep legacy explicit timeouts while giving default RPCs a lane."""
+
+        if self.timeout is not None:
+            return self.timeout
+        if method in _SLOW_OPERATION_METHODS:
+            return DEFAULT_SLOW_OPERATION_TIMEOUT
+        return DEFAULT_FAST_READ_TIMEOUT
+
+    @staticmethod
+    def _timeout_message(method: str, timeout: float) -> str:
+        return (
+            f"supervisor request {method} timed out after {timeout:g}s; "
+            "the operation may have succeeded. Check GET /api/agents or run/status "
+            "before retrying, and reuse the same request_id for spawn or message retries."
+        )
+
     def request(self, method: str, params: dict[str, Any] | None = None) -> Any:
         request_id = str(uuid4())
         request = {"id": request_id, "method": method, "params": params or {}}
         connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        connection.settimeout(self.timeout)
+        timeout = self._timeout_for(method)
+        connection.settimeout(timeout)
         try:
             connection.connect(str(self.paths.socket_path))
             connection.sendall(json.dumps(request, separators=(",", ":")).encode("utf-8") + b"\n")
             with connection.makefile("rb") as reader:
                 line = reader.readline()
-        except (FileNotFoundError, ConnectionRefusedError, socket.timeout, OSError) as exc:
+        except socket.timeout as exc:
+            raise SupervisorUnavailable(self._timeout_message(method, timeout)) from exc
+        except (FileNotFoundError, ConnectionRefusedError, OSError) as exc:
             raise SupervisorUnavailable(str(exc)) from exc
         finally:
             connection.close()
@@ -120,6 +150,7 @@ class SupervisorClient:
         text: str,
         mode: str,
         pending_id: str | None = None,
+        request_id: str | None = None,
     ) -> dict[str, Any]:
         """Preserve POST /api/agents/<id>/message's now/on-idle contract."""
 
@@ -129,6 +160,8 @@ class SupervisorClient:
         params = {"agent_id": agent_id, "text": text}
         if pending_id is not None:
             params["pending_id"] = pending_id
+        if request_id is not None:
+            params["request_id"] = request_id
         return dict(self.request(method, params))
 
     def queue(self, agent_id: str) -> dict[str, Any]:

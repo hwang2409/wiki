@@ -657,8 +657,13 @@ def _archive_runtime_identity(
 @app.get("/api/agents")
 def agents() -> dict[str, object]:
     registry: dict = {}
+    registry_refreshed_at: str | None = None
     try:
         registry = json.loads(AGENT_REGISTRY_PATH.read_text(encoding="utf-8"))
+        registry_refreshed_at = datetime.fromtimestamp(
+            AGENT_REGISTRY_PATH.stat().st_mtime,
+            tz=timezone.utc,
+        ).isoformat()
     except (OSError, ValueError):
         pass
 
@@ -680,30 +685,16 @@ def agents() -> dict[str, object]:
         if isinstance(orch, dict) and isinstance(orch.get("window"), str)
     )
     live_windows = tmux_live_windows() if legacy_windows else set()
-    runtime_by_id: dict[str, dict] = {}
     supervisor_health: dict[str, object] = {
-        "status": "not-needed" if not headless_ids else "unavailable",
+        "status": "not-needed" if not headless_ids else "snapshot",
         "runs": len(headless_ids),
     }
     if headless_ids:
-        try:
-            runtime_result = _supervisor_request("run/list")
-            runtime_rows = (
-                runtime_result.get("runs", [])
-                if isinstance(runtime_result, dict)
-                else []
-            )
-            runtime_by_id = {
-                row["run_id"]: row
-                for row in runtime_rows
-                if isinstance(row, dict)
-                and isinstance(row.get("run_id"), str)
-                and row["run_id"] in headless_ids
-            }
-            supervisor_health["status"] = "ready"
-            supervisor_health["pid"] = runtime_result.get("pid")
-        except (HTTPException, SupervisorUnavailable, SupervisorRemoteError) as exc:
-            supervisor_health["detail"] = str(exc.detail if isinstance(exc, HTTPException) else exc)
+        # This route must remain responsive while run/start awaits a provider.
+        # The runtime atomically projects its durable state into this registry,
+        # so listing intentionally never waits on the supervisor socket.
+        supervisor_health["liveness"] = "snapshot"
+        supervisor_health["snapshot_refreshed_at"] = registry_refreshed_at
     now = datetime.now(tz=timezone.utc).timestamp()
     workers = []
     orchestrators = []
@@ -716,9 +707,9 @@ def agents() -> dict[str, object]:
         if not isinstance(current, dict):
             continue
         headless = _is_headless(current)
-        runtime = runtime_by_id.get(current.get("run_id"), current) if headless else {}
+        runtime = current if headless else {}
         runtime_state = runtime.get("state") if headless else None
-        control_attached = bool(runtime.get("control_attached")) if headless else False
+        control_attached = bool(runtime.get("provider_pid")) if headless else False
         status = read_agent_status(ticket)
         seen_tickets.add(ticket)
         window_alive = (
@@ -1896,6 +1887,7 @@ class MessageIn(BaseModel):
     text: str = Field(..., min_length=1, max_length=4000)
     mode: str = Field(default="now", pattern="^(now|on-idle)$")
     pending_id: UUID | None = None
+    request_id: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 class AgentRespondIn(BaseModel):
@@ -1922,6 +1914,7 @@ class SpawnWorkerIn(BaseModel):
     workdir: str = Field(..., min_length=1, max_length=4096)
     orch: str | None = Field(default=None, max_length=100)
     prompt: str = Field(..., min_length=1, max_length=100_000)
+    request_id: str | None = Field(default=None, min_length=1, max_length=200)
 
     @model_validator(mode="after")
     def validate_model_and_effort(self) -> SpawnWorkerIn:
@@ -2404,7 +2397,11 @@ def spawn_agent(body: dict[str, Any] | SpawnWorkerIn) -> dict[str, object]:
             raise HTTPException(status_code=400, detail="Orchestrator id is not registered")
 
     current = (registry.get(ticket) or {}).get("current") or {}
-    if isinstance(current, dict) and _is_headless(current):
+    if (
+        isinstance(current, dict)
+        and _is_headless(current)
+        and body.request_id is None
+    ):
         raise HTTPException(
             status_code=409,
             detail=f"{ticket} already has a supervisor-owned run; use Replace",
@@ -2413,12 +2410,13 @@ def spawn_agent(body: dict[str, Any] | SpawnWorkerIn) -> dict[str, object]:
     if isinstance(live_window, str) and live_window in tmux_live_windows():
         raise HTTPException(status_code=409, detail=f"{ticket} already has a live worker window")
 
-    status_path = AGENT_STATUS_DIR / f"{ticket}.json"
-    AGENT_STATUS_DIR.mkdir(parents=True, exist_ok=True)
-    try:
-        status_path.unlink(missing_ok=True)
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail="Could not reset worker status") from exc
+    if not (body.request_id is not None and isinstance(current, dict) and _is_headless(current)):
+        status_path = AGENT_STATUS_DIR / f"{ticket}.json"
+        AGENT_STATUS_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            status_path.unlink(missing_ok=True)
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail="Could not reset worker status") from exc
 
     result = _supervisor_request(
         "run/start",
@@ -2432,18 +2430,22 @@ def spawn_agent(body: dict[str, Any] | SpawnWorkerIn) -> dict[str, object]:
             "prompt": prompt,
             "orchestrator_id": orch or None,
             "migrate_legacy": bool(current),
+            "request_id": body.request_id,
         },
     )
     if not isinstance(result, dict):
         raise HTTPException(status_code=502, detail="Agent supervisor returned a bad run")
     refreshed = _registry_agent(_read_agent_registry(), ticket)
     registration = refreshed[2] if refreshed is not None else {}
-    return {
+    response: dict[str, object] = {
         "window": None,
         "run_id": result.get("run_id"),
         "log": registration.get("log"),
         "prompt_path": None,
     }
+    if isinstance(result.get("warning"), str):
+        response["warning"] = result["warning"]
+    return response
 
 
 @app.post("/api/agents/spawn-orchestrator")
@@ -2550,6 +2552,7 @@ def agent_message(ticket: str, body: MessageIn, background: BackgroundTasks) -> 
                 "agent_id": resolved[0],
                 "text": body.text,
                 "pending_id": str(body.pending_id) if body.pending_id else None,
+                "request_id": body.request_id,
             },
         )
         if not isinstance(result, dict):

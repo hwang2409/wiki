@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -305,6 +306,107 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             session_events,
         )
         self.supervisor.unsubscribe(queue)
+
+    async def test_dispatch_idempotently_replays_start_and_message_once(self) -> None:
+        start_params = {
+            "agent_id": "WIKI-IDEMPOTENT",
+            "provider": "codex",
+            "role": "implement",
+            "model": "fixture-codex",
+            "effort": "high",
+            "worktree": str(self.worktree),
+            "prompt": "Work on ticket WIKI-IDEMPOTENT",
+            "request_id": "spawn-retry-1",
+        }
+        first_start, replayed_start = await asyncio.gather(
+            self.supervisor.dispatch("run/start", start_params),
+            self.supervisor.dispatch("run/start", dict(start_params)),
+        )
+        self.assertEqual(first_start, replayed_start)
+        matching_runs = [
+            record
+            for record in self.store.list_runs()
+            if record.agent_id == "WIKI-IDEMPOTENT"
+        ]
+        self.assertEqual(len(matching_runs), 1)
+
+        adapter = self.supervisor.adapters[matching_runs[0].run_id]
+        starts_before_message = adapter.replayed_methods.count("turn/start")
+        message_params = {
+            "agent_id": "WIKI-IDEMPOTENT",
+            "text": "Retry-safe steer",
+            "request_id": "message-retry-1",
+        }
+        first_message, replayed_message = await asyncio.gather(
+            self.supervisor.dispatch("run/send_now", message_params),
+            self.supervisor.dispatch("run/send_now", dict(message_params)),
+        )
+        self.assertEqual(first_message, {"status": "sent"})
+        self.assertEqual(replayed_message, first_message)
+        self.assertEqual(
+            adapter.replayed_methods.count("turn/start"),
+            starts_before_message + 1,
+        )
+
+    async def test_idempotency_cache_evicts_oldest_result(self) -> None:
+        self.supervisor.idempotency_cache_size = 2
+        started = await self.supervisor.dispatch(
+            "run/start",
+            {
+                "agent_id": "WIKI-IDEMPOTENCY-LRU",
+                "provider": "codex",
+                "role": "implement",
+                "model": "fixture-codex",
+                "effort": "high",
+                "worktree": str(self.worktree),
+                "prompt": "Work on ticket WIKI-IDEMPOTENCY-LRU",
+                "request_id": "spawn-retry-1",
+            },
+        )
+        for request_id in ("message-retry-1", "message-retry-2"):
+            await self.supervisor.dispatch(
+                "run/send_now",
+                {
+                    "run_id": started["run_id"],
+                    "text": request_id,
+                    "request_id": request_id,
+                },
+            )
+
+        self.assertEqual(len(self.supervisor.idempotency_results), 2)
+        self.assertNotIn(("run/start", "spawn-retry-1"), self.supervisor.idempotency_results)
+
+    async def test_start_warns_when_active_workers_reach_soft_cap(self) -> None:
+        self.supervisor.worker_soft_cap = 1
+        await self.supervisor.dispatch(
+            "run/start",
+            {
+                "agent_id": "WIKI-SOFT-CAP-ONE",
+                "provider": "codex",
+                "role": "implement",
+                "model": "fixture-codex",
+                "effort": "high",
+                "worktree": str(self.worktree),
+                "prompt": "Work on ticket WIKI-SOFT-CAP-ONE",
+            },
+        )
+        warned = await self.supervisor.dispatch(
+            "run/start",
+            {
+                "agent_id": "WIKI-SOFT-CAP-TWO",
+                "provider": "codex",
+                "role": "review",
+                "model": "fixture-codex",
+                "effort": "high",
+                "worktree": str(self.worktree),
+                "prompt": "Work on ticket WIKI-SOFT-CAP-TWO",
+            },
+        )
+
+        self.assertEqual(
+            warned["warning"],
+            "1 active workers; soft cap 1 — expect provider timeouts under load",
+        )
 
     async def test_pending_id_round_trips_through_claude_provider_echo(self) -> None:
         record = await self.supervisor.start_run(
@@ -2622,6 +2724,31 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(current["control_attached"])
         self.assertTrue(current["provider_alive"])
         await stream.aclose()
+
+    def test_default_client_timeout_is_lane_aware_and_retry_safe(self) -> None:
+        client = SupervisorClient(self.paths)
+        connection = mock.Mock()
+        connection.connect.side_effect = socket.timeout()
+        with mock.patch(
+            "backend.app.agent_runtime.client.socket.socket",
+            return_value=connection,
+        ):
+            with self.assertRaises(SupervisorUnavailable) as timed_out:
+                client.request("run/start", {"agent_id": "WIKI-TIMEOUT"})
+
+        self.assertEqual(connection.settimeout.call_args.args, (30.0,))
+        self.assertIn("may have succeeded", str(timed_out.exception))
+        self.assertIn("Check GET /api/agents", str(timed_out.exception))
+
+        read_connection = mock.Mock()
+        read_connection.connect.side_effect = socket.timeout()
+        with mock.patch(
+            "backend.app.agent_runtime.client.socket.socket",
+            return_value=read_connection,
+        ):
+            with self.assertRaises(SupervisorUnavailable):
+                client.request("run/status", {"agent_id": "WIKI-TIMEOUT"})
+        self.assertEqual(read_connection.settimeout.call_args.args, (1.0,))
 
     async def test_server_accepts_existing_prompt_contract_above_default_reader_limit(
         self,

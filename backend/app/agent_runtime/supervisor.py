@@ -4,7 +4,9 @@ import asyncio
 import math
 import os
 import time
+from collections import OrderedDict
 from collections.abc import Callable
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -34,6 +36,9 @@ from .version import RUNTIME_FINGERPRINT
 AdapterFactory = Callable[[RunRecord], ProviderAdapter]
 DEFAULT_REAPER_INTERVAL_SECONDS = 30.0
 DEFAULT_REAPER_GRACE_SECONDS = 60.0
+DEFAULT_IDEMPOTENCY_CACHE_SIZE = 256
+DEFAULT_WORKER_SOFT_CAP = 5
+_IDEMPOTENT_METHODS = frozenset({"run/start", "run/send_now", "run/send_on_idle"})
 
 
 def _validated_pending_id(value: object) -> str | None:
@@ -47,6 +52,27 @@ def _validated_pending_id(value: object) -> str | None:
         raise ValueError("pending_id must be a canonical UUID") from exc
     if str(parsed) != value:
         raise ValueError("pending_id must be a canonical UUID")
+    return value
+
+
+def _validated_idempotency_request_id(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip() or len(value) > 200:
+        raise ValueError("request_id must be a non-empty string up to 200 characters")
+    return value
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if value < 1:
+        raise ValueError(f"{name} must be a positive integer")
     return value
 
 
@@ -137,7 +163,11 @@ class Supervisor:
         reaper_interval_seconds: float | None = None,
         reaper_grace_seconds: float | None = None,
         orphan_archive_grace_seconds: float = 0.5,
+        idempotency_cache_size: int = DEFAULT_IDEMPOTENCY_CACHE_SIZE,
+        worker_soft_cap: int | None = None,
     ):
+        if idempotency_cache_size < 1:
+            raise ValueError("idempotency_cache_size must be positive")
         self.store = store
         self.adapter_factory = adapter_factory
         self.pid_alive = pid_alive
@@ -185,6 +215,17 @@ class Supervisor:
         self.auth_dead_recoveries: dict[str, asyncio.Task[None]] = {}
         self.last_limit_alert_at: dict[str, float] = {}
         self.last_no_eligible_alert: float = 0.0
+        self.idempotency_cache_size = idempotency_cache_size
+        self.idempotency_results: OrderedDict[tuple[str, str], Any] = OrderedDict()
+        self.idempotency_tasks: dict[tuple[str, str], asyncio.Task[Any]] = {}
+        self.idempotency_lock = asyncio.Lock()
+        self.worker_soft_cap = (
+            worker_soft_cap
+            if worker_soft_cap is not None
+            else _env_positive_int("WIKI_WORKER_SOFT_CAP", DEFAULT_WORKER_SOFT_CAP)
+        )
+        if self.worker_soft_cap < 1:
+            raise ValueError("worker_soft_cap must be positive")
 
     def _runtime_status(self, record: RunRecord) -> dict[str, Any]:
         value = _public_run(record)
@@ -248,6 +289,16 @@ class Supervisor:
             and record.state not in TERMINAL_STATES
         }
         return sorted(tickets)
+
+    def _active_worker_count(self) -> int:
+        return sum(
+            1
+            for record in self.store.list_runs()
+            if record.role != "orchestrator"
+            and record.state not in TERMINAL_STATES
+            and not record.replaced_by_run_id
+            and self.store.is_current(record)
+        )
 
     def _agent_lock(self, agent_id: str) -> asyncio.Lock:
         return self.agent_locks.setdefault(agent_id, asyncio.Lock())
@@ -2388,6 +2439,46 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         return record
 
     async def dispatch(self, method: str, params: dict[str, Any]) -> Any:
+        request_id = _validated_idempotency_request_id(params.get("request_id"))
+        if request_id is None or method not in _IDEMPOTENT_METHODS:
+            return await self._dispatch(method, params)
+        return await self._dispatch_idempotently(method, request_id, params)
+
+    async def _dispatch_idempotently(
+        self,
+        method: str,
+        request_id: str,
+        params: dict[str, Any],
+    ) -> Any:
+        key = (method, request_id)
+        async with self.idempotency_lock:
+            if key in self.idempotency_results:
+                self.idempotency_results.move_to_end(key)
+                return deepcopy(self.idempotency_results[key])
+            task = self.idempotency_tasks.get(key)
+            if task is None:
+                task = asyncio.create_task(
+                    self._dispatch(method, params),
+                    name=f"agent-idempotency-{method}-{request_id}",
+                )
+                self.idempotency_tasks[key] = task
+        try:
+            result = await asyncio.shield(task)
+        except BaseException:
+            async with self.idempotency_lock:
+                if self.idempotency_tasks.get(key) is task and task.done():
+                    self.idempotency_tasks.pop(key, None)
+            raise
+        async with self.idempotency_lock:
+            if self.idempotency_tasks.get(key) is task:
+                self.idempotency_tasks.pop(key, None)
+                self.idempotency_results[key] = deepcopy(result)
+                self.idempotency_results.move_to_end(key)
+                while len(self.idempotency_results) > self.idempotency_cache_size:
+                    self.idempotency_results.popitem(last=False)
+            return deepcopy(result)
+
+    async def _dispatch(self, method: str, params: dict[str, Any]) -> Any:
         if method == "ping":
             return {
                 "status": "ok",
@@ -2398,6 +2489,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             migrate_legacy = params.get("migrate_legacy", False)
             if not isinstance(migrate_legacy, bool):
                 raise ValueError("migrate_legacy must be a boolean")
+            active_worker_count = self._active_worker_count()
             record = await self.start_run(
                 agent_id=str(params["agent_id"]),
                 provider=ProviderKind(params["provider"]),
@@ -2409,7 +2501,13 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 orchestrator_id=params.get("orchestrator_id"),
                 migrate_legacy=migrate_legacy,
             )
-            return _public_run(record)
+            result = _public_run(record)
+            if record.role != "orchestrator" and active_worker_count >= self.worker_soft_cap:
+                result["warning"] = (
+                    f"{active_worker_count} active workers; soft cap {self.worker_soft_cap} "
+                    "— expect provider timeouts under load"
+                )
+            return result
         if method == "run/list":
             return {
                 "status": "ok",
@@ -2582,5 +2680,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         self.auth_dead_recoveries.clear()
         self.last_limit_alert_at.clear()
         self.last_no_eligible_alert = 0.0
+        self.idempotency_results.clear()
+        self.idempotency_tasks.clear()
         self.detached_at_monotonic.clear()
         self.adapters.clear()
