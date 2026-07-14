@@ -145,6 +145,21 @@ class WikiArtifactsCallabilityTests(unittest.IsolatedAsyncioTestCase):
                     )
                 )
 
+                normalized_session = transcripts.read_session_delta(
+                    f"{provider.value}-normalized",
+                    self.store.normalized_events_path(record.run_id),
+                )
+                normalized_artifacts = [
+                    event
+                    for event in normalized_session["events"]
+                    if event.get("kind") == "artifact"
+                ]
+                self.assertEqual(len(normalized_artifacts), 1)
+                self.assertEqual(
+                    normalized_artifacts[0]["artifact"],
+                    {"kind": "mermaid", "source": "graph TD; A-->B"},
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -284,6 +284,32 @@ def artifact_from_text(value: Any) -> dict[str, Any] | None:
     return event
 
 
+def artifact_from_codex_mcp_tool_result(item: Any) -> dict[str, Any] | None:
+    """Return a validated artifact event from a completed Codex MCP tool item."""
+    if not isinstance(item, dict):
+        return None
+    if (
+        item.get("type") != "mcpToolCall"
+        or item.get("server") != "wiki_artifacts"
+        or item.get("tool") != "render_artifact"
+        or item.get("status") != "completed"
+        or item.get("error") is not None
+    ):
+        return None
+    result = item.get("result")
+    if not isinstance(result, dict) or result.get("isError") is True:
+        return None
+    content = result.get("content")
+    if not isinstance(content, list):
+        return None
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            event = artifact_from_text(block.get("text"))
+            if event is not None:
+                return event
+    return None
+
+
 def artifact_server_command() -> tuple[str, ...]:
     if getattr(sys, "frozen", False):
         return (sys.executable, "--wiki-artifacts-mcp")

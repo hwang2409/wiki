@@ -11,6 +11,7 @@ import json
 import os
 import time
 import unittest
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -145,6 +146,61 @@ class ArtifactTranscriptTests(unittest.TestCase):
         )
         self.assertEqual(event["title"], "Fixture diagram")
         self.assertEqual(event["caption"], "Structured result fallback")
+
+    def test_codex_normalized_render_artifact_events_heal_archived_runs(self) -> None:
+        fixture = json.loads(
+            (
+                FIXTURES_DIR
+                / "agent_runtime"
+                / "codex_render_artifact_completed.jsonl"
+            ).read_text(encoding="utf-8")
+        )
+        payload = fixture["message"]
+        envelope = {
+            "seq": 200,
+            "raw_seq": 200,
+            "normalized_at": "2026-07-14T22:09:40.568821+00:00",
+            "disposition": "rendered",
+            "kind": "item_completed",
+            "payload": payload,
+        }
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "events.jsonl"
+            path.write_text(json.dumps(envelope) + "\n", encoding="utf-8")
+
+            parsed = transcripts.read_session_events("codex-normalized", path)
+
+        self.assertEqual(len(parsed["events"]), 1)
+        event = parsed["events"][0]
+        self.assertEqual(event["kind"], "artifact")
+        self.assertEqual(event["artifact_id"], "6d0e7d00-2edf-4054-b0dc-fe17cd382c2a")
+        self.assertEqual(event["title"], "Wiki.app architecture")
+        self.assertEqual(
+            event["caption"],
+            "Native shell, frontend, FastAPI, headless supervisor, MCP, CLI, and local storage/data-control flows.",
+        )
+        self.assertEqual(
+            event["artifact"],
+            {"kind": "mermaid", "source": "flowchart TB\n  worker --> artifact"},
+        )
+
+        failed = deepcopy(envelope)
+        failed["payload"] = deepcopy(payload)
+        item = failed["payload"]["params"]["item"]
+        item["status"] = "failed"
+        item["error"] = "artifact server rejected the request"
+        item["result"] = {"content": [{"type": "text", "text": "render rejected"}]}
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "events.jsonl"
+            path.write_text(json.dumps(failed) + "\n", encoding="utf-8")
+
+            failed_parsed = transcripts.read_session_events("codex-normalized", path)
+
+        self.assertEqual(len(failed_parsed["events"]), 1)
+        failed_event = failed_parsed["events"][0]
+        self.assertEqual(failed_event["kind"], "tool")
+        self.assertFalse(failed_event["tool"]["ok"])
+        self.assertEqual(failed_event["tool"]["summary"], "render_artifact rejected")
 
     def test_structured_image_result_reconstructs_artifact_reference(self) -> None:
         artifact_id = "33b1c159-9d1e-4804-9b14-3d880ac2e3c7"
