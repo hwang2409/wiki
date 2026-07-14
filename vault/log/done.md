@@ -9,6 +9,7 @@ updated: 2026-07-14
 
 ## 2026-07-14
 
+- [WIKI-101](https://github.com/hwang2409/wiki/pull/81) cc render_artifact rejected-badge fix — dropped structuredContent from MCP success results (sentinel now reaches cc transcripts); parser fallback reconstructs artifact event from tool input on bare {artifact_id,ok:true} results with full server-parity validation (kind allowlist, UUID, TEXT_LIMIT, title/caption limits, image ref-shape not data_base64); e2e now asserts the RESULT parses into a kind:"artifact" session event for BOTH providers (closes WIKI-89 assertion gap). Gate: 1 steer iteration (2 MEDIUMs fixed, red-before-fix verified). Merged 34eb99a9.
 - PHO-13646 merged (#11271, 00eac05ab1): admin agent batch account-health rollup tool (get_admin_account_health_rollups, ≤50 orgs/call, ~14k→~7 calls for 151-org cohort), Slack one-call posting up to 250 accounts, 90-min turn budget both admin paths, 25-min lease fence on daily run; whale-safe day-slicing + 50k gate preserved; PostHog users descoped to PHO-13647
 
 ## 2026-07-13
