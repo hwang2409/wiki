@@ -25,7 +25,12 @@ from .knowledge_content import (
     resolve_wikilink_target,
     ticket_for_note,
 )
-from .knowledge_runs import last_event_seq, load_run_metadata, read_run_events
+from .knowledge_runs import (
+    is_supervisor_archive,
+    last_event_seq,
+    load_run_metadata,
+    read_run_events,
+)
 from .knowledge_schema import (
     SCHEMA_VERSION,
     is_corruption_error as _corruption_error,
@@ -68,6 +73,11 @@ class IngestStats:
     runs_skipped: int = 0
     events_indexed: int = 0
     malformed_event_lines: int = 0
+    event_chunks_excerpted: int = 0
+    tool_outputs_truncated: int = 0
+    base64_blobs_skipped: int = 0
+    ansi_heavy_lines_skipped: int = 0
+    legacy_runs_skipped: int = 0
     elapsed_seconds: float = 0.0
 
     def merge(self, other: IngestStats) -> None:
@@ -82,6 +92,11 @@ class IngestStats:
             "runs_skipped",
             "events_indexed",
             "malformed_event_lines",
+            "event_chunks_excerpted",
+            "tool_outputs_truncated",
+            "base64_blobs_skipped",
+            "ansi_heavy_lines_skipped",
+            "legacy_runs_skipped",
         ):
             setattr(self, field, getattr(self, field) + getattr(other, field))
 
@@ -95,6 +110,7 @@ class KnowledgePaths:
     vault_dir: Path
     archive_dir: Path
     runtime_dir: Path
+    include_legacy_archives: bool = False
 
     @classmethod
     def from_env(
@@ -128,6 +144,8 @@ class KnowledgePaths:
             vault_dir=vault.absolute(),
             archive_dir=archive.absolute(),
             runtime_dir=runtime.absolute(),
+            include_legacy_archives=values.get("WIKI_KNOWLEDGE_INCLUDE_LEGACY", "").lower()
+            in {"1", "true", "yes", "on"},
         )
 
 
@@ -564,24 +582,29 @@ class KnowledgeIndex:
                         "DELETE FROM chunks WHERE source_kind = 'event' AND source_id = ? AND pos = ?",
                         (run_id, event.seq),
                     )
-                    connection.execute(
-                        """
-                        INSERT INTO chunks(
-                            source_kind, source_id, ticket, title, heading, text, pos
-                        ) VALUES ('event', ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            run_id,
-                            metadata.ticket,
-                            metadata.ticket or run_id,
-                            event.event_type,
-                            event.text,
-                            event.seq,
-                        ),
-                    )
+                    if event.text is not None:
+                        connection.execute(
+                            """
+                            INSERT INTO chunks(
+                                source_kind, source_id, ticket, title, heading, text, pos
+                            ) VALUES ('event', ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                run_id,
+                                metadata.ticket,
+                                metadata.ticket or run_id,
+                                event.event_type,
+                                event.text,
+                                event.seq,
+                            ),
+                        )
+                        stats.chunks_indexed += 1
                     stats.events_indexed += 1
-                    stats.chunks_indexed += 1
             stats.malformed_event_lines = batch.malformed_lines if batch else 0
+            stats.event_chunks_excerpted = batch.event_chunks_excerpted if batch else 0
+            stats.tool_outputs_truncated = batch.tool_outputs_truncated if batch else 0
+            stats.base64_blobs_skipped = batch.base64_blobs_skipped if batch else 0
+            stats.ansi_heavy_lines_skipped = batch.ansi_heavy_lines_skipped if batch else 0
             if stats.malformed_event_lines:
                 LOGGER.warning(
                     "skipped %d malformed event lines in %s",
@@ -602,12 +625,20 @@ class KnowledgeIndex:
             connection.close()
             stats.elapsed_seconds = time.perf_counter() - started
 
-    def scan_archives(self) -> IngestStats:
+    def scan_archives(self, *, include_legacy_archives: bool | None = None) -> IngestStats:
         stats = IngestStats()
         started = time.perf_counter()
+        include_legacy = (
+            self.paths.include_legacy_archives
+            if include_legacy_archives is None
+            else include_legacy_archives
+        )
         if self.paths.archive_dir.is_dir():
             for events_path in sorted(self.paths.archive_dir.rglob("events.jsonl")):
                 if events_path.is_file():
+                    if not include_legacy and not is_supervisor_archive(events_path.parent):
+                        stats.legacy_runs_skipped += 1
+                        continue
                     try:
                         stats.merge(self.index_run_directory(events_path.parent))
                     except KnowledgeSourceError as exc:
@@ -627,7 +658,7 @@ class KnowledgeIndex:
         stats.elapsed_seconds = time.perf_counter() - started
         return stats
 
-    def rebuild(self) -> IngestStats:
+    def rebuild(self, *, include_legacy_archives: bool | None = None) -> IngestStats:
         """Drop derived data and deterministically restore it from source files."""
 
         started = time.perf_counter()
@@ -642,7 +673,7 @@ class KnowledgeIndex:
         stats = IngestStats()
         try:
             stats.merge(self.scan_vault())
-            stats.merge(self.scan_archives())
+            stats.merge(self.scan_archives(include_legacy_archives=include_legacy_archives))
             connection, _ = self._prepare()
             try:
                 self._finish_build(connection, clear_rebuild_marker=True)

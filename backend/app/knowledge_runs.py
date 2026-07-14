@@ -13,12 +13,21 @@ from typing import Any
 from .knowledge_content import event_text
 
 
+EVENT_CHUNK_EXCERPT_MAX_CHARS = 2_048
+TOOL_OUTPUT_MAX_CHARS = 8_192
+BASE64_BLOB_MIN_CHARS = 1_024
+ANSI_ESCAPE_RE = re.compile(
+    r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]"
+)
+BASE64_LINE_RE = re.compile(r"[A-Za-z0-9+/]+={0,2}\Z")
+
+
 @dataclass(frozen=True)
 class ParsedRunEvent:
     seq: int
     event_type: str
     ts: str | None
-    text: str
+    text: str | None
     excerpt: str
 
 
@@ -26,6 +35,10 @@ class ParsedRunEvent:
 class RunEventBatch:
     events: tuple[ParsedRunEvent, ...]
     malformed_lines: int
+    event_chunks_excerpted: int
+    tool_outputs_truncated: int
+    base64_blobs_skipped: int
+    ansi_heavy_lines_skipped: int
 
 
 @dataclass(frozen=True)
@@ -107,6 +120,45 @@ def load_run_metadata(run_dir: Path) -> RunMetadata:
     )
 
 
+def is_supervisor_archive(run_dir: Path) -> bool:
+    """Whether an archive was produced by the durable headless supervisor."""
+
+    return _read_json(run_dir / "meta.json").get("source") == "headless-supervisor"
+
+
+def _is_tool_output(event_type: str) -> bool:
+    normalized = event_type.lower()
+    return (
+        "commandexecution" in normalized and "output" in normalized
+    ) or ("tool" in normalized and ("output" in normalized or "result" in normalized))
+
+
+def _has_base64_blob(text: str) -> bool:
+    for line in text.splitlines():
+        candidate = "".join(line.split())
+        alphabet = set(candidate.rstrip("="))
+        if (
+            len(candidate) >= BASE64_BLOB_MIN_CHARS
+            and len(candidate) % 4 == 0
+            and len(alphabet) >= 4
+            and BASE64_LINE_RE.fullmatch(candidate)
+        ):
+            return True
+    return False
+
+
+def _has_ansi_heavy_line(text: str) -> bool:
+    for line in text.splitlines():
+        escapes = list(ANSI_ESCAPE_RE.finditer(line))
+        if not escapes:
+            continue
+        ansi_chars = sum(len(match.group(0)) for match in escapes)
+        visible_chars = len(ANSI_ESCAPE_RE.sub("", line).strip())
+        if ansi_chars >= max(16, visible_chars):
+            return True
+    return False
+
+
 def read_run_events(path: Path, *, after_seq: int) -> RunEventBatch:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -114,6 +166,10 @@ def read_run_events(path: Path, *, after_seq: int) -> RunEventBatch:
         lines = []
     events: list[ParsedRunEvent] = []
     malformed = 0
+    event_chunks_excerpted = 0
+    tool_outputs_truncated = 0
+    base64_blobs_skipped = 0
+    ansi_heavy_lines_skipped = 0
     for line in lines:
         if not line.strip():
             continue
@@ -139,6 +195,19 @@ def read_run_events(path: Path, *, after_seq: int) -> RunEventBatch:
             or "unknown"
         )
         text = event_text(event)
+        indexed_text: str | None = text
+        if _has_base64_blob(text):
+            indexed_text = None
+            base64_blobs_skipped += 1
+        elif _has_ansi_heavy_line(text):
+            indexed_text = None
+            ansi_heavy_lines_skipped += 1
+        elif _is_tool_output(event_type) and len(text) > TOOL_OUTPUT_MAX_CHARS:
+            indexed_text = text[:TOOL_OUTPUT_MAX_CHARS]
+            tool_outputs_truncated += 1
+        if indexed_text is not None and len(indexed_text) > EVENT_CHUNK_EXCERPT_MAX_CHARS:
+            indexed_text = indexed_text[:EVENT_CHUNK_EXCERPT_MAX_CHARS]
+            event_chunks_excerpted += 1
         ts = event.get("normalized_at") or event.get("ts")
         if not ts:
             ts = payload.get("timestamp") or payload.get("ts")
@@ -147,8 +216,19 @@ def read_run_events(path: Path, *, after_seq: int) -> RunEventBatch:
                 seq=seq,
                 event_type=event_type,
                 ts=str(ts) if ts is not None else None,
-                text=text,
-                excerpt=re.sub(r"\s+", " ", text).strip()[:500],
+                text=indexed_text,
+                excerpt=(
+                    re.sub(r"\s+", " ", indexed_text).strip()[:500]
+                    if indexed_text is not None
+                    else ""
+                ),
             )
         )
-    return RunEventBatch(tuple(events), malformed)
+    return RunEventBatch(
+        tuple(events),
+        malformed,
+        event_chunks_excerpted,
+        tool_outputs_truncated,
+        base64_blobs_skipped,
+        ansi_heavy_lines_skipped,
+    )
