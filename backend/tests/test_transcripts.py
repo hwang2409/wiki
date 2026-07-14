@@ -17,7 +17,7 @@ from tempfile import TemporaryDirectory
 from unittest import mock
 
 from backend.app import transcripts
-from backend.app.wiki_artifacts import sentinel_text
+from backend.app.wiki_artifacts import TEXT_LIMIT, sentinel_text
 
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
@@ -146,6 +146,30 @@ class ArtifactTranscriptTests(unittest.TestCase):
         self.assertEqual(event["title"], "Fixture diagram")
         self.assertEqual(event["caption"], "Structured result fallback")
 
+    def test_structured_image_result_reconstructs_artifact_reference(self) -> None:
+        artifact_id = "33b1c159-9d1e-4804-9b14-3d880ac2e3c7"
+
+        event = transcripts._artifact_from_structured_result(
+            {
+                "input": {
+                    "kind": "image",
+                    "payload": {"data_base64": "fixture-png", "mime": "image/png"},
+                }
+            },
+            json.dumps({"artifact_id": artifact_id, "ok": True}),
+        )
+
+        self.assertIsNotNone(event)
+        self.assertEqual(
+            event["artifact"],
+            {
+                "kind": "image",
+                "ref": f"artifact://{artifact_id}",
+                "mime": "image/png",
+            },
+        )
+        self.assertNotIn("data_base64", event["artifact"])
+
     def test_structured_artifact_fallback_rejects_errors_and_invalid_metadata(self) -> None:
         valid_input = {
             "kind": "mermaid",
@@ -153,9 +177,16 @@ class ArtifactTranscriptTests(unittest.TestCase):
         }
         valid_id = "33b1c159-9d1e-4804-9b14-3d880ac2e3c7"
         cases = [
+            (valid_input, {"ok": True}, None),
             (valid_input, {"artifact_id": valid_id, "ok": False}, None),
             (valid_input, {"artifact_id": "not-a-uuid", "ok": True}, None),
             ({**valid_input, "kind": "unknown"}, {"artifact_id": valid_id, "ok": True}, None),
+            (
+                {**valid_input, "payload": {"source": "x" * (TEXT_LIMIT + 1)}},
+                {"artifact_id": valid_id, "ok": True},
+                None,
+            ),
+            ({**valid_input, "title": 42}, {"artifact_id": valid_id, "ok": True}, None),
             (valid_input, {"artifact_id": valid_id, "ok": True}, "is_error"),
             (valid_input, {"artifact_id": valid_id, "ok": True}, "isError"),
         ]

@@ -30,7 +30,12 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 
-from .wiki_artifacts import artifact_from_text, sentinel_text
+from .wiki_artifacts import (
+    ArtifactValidationError,
+    _validate_text_payload,
+    artifact_from_text,
+    sentinel_text,
+)
 
 CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
@@ -586,6 +591,9 @@ def _artifact_from_structured_result(meta: dict, output: str) -> dict | None:
         return None
     if not isinstance(result, dict) or result.get("ok") is not True:
         return None
+    artifact_id = result.get("artifact_id")
+    if not isinstance(artifact_id, str) or not artifact_id:
+        return None
     raw_input = meta.get("input")
     if not isinstance(raw_input, dict):
         return None
@@ -593,14 +601,25 @@ def _artifact_from_structured_result(meta: dict, output: str) -> dict | None:
     payload = raw_input.get("payload")
     if not isinstance(kind, str) or not isinstance(payload, dict):
         return None
-    protocol_event = {
-        "kind": "artifact",
-        "id": result.get("artifact_id"),
-        "artifact": {**payload, "kind": kind},
-    }
-    for field in ("title", "caption"):
+    if kind == "image":
+        artifact = {
+            "kind": "image",
+            "ref": f"artifact://{artifact_id}",
+            "mime": payload.get("mime"),
+        }
+    else:
+        try:
+            validated_payload = _validate_text_payload(kind, payload)
+        except ArtifactValidationError:
+            return None
+        artifact = {**validated_payload, "kind": kind}
+    protocol_event = {"kind": "artifact", "id": artifact_id, "artifact": artifact}
+    for field, limit in (("title", 200), ("caption", 500)):
         if field in raw_input:
-            protocol_event[field] = raw_input[field]
+            value = raw_input[field]
+            if not isinstance(value, str) or len(value) > limit:
+                return None
+            protocol_event[field] = value
     return artifact_from_text(sentinel_text(protocol_event))
 
 
