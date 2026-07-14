@@ -2495,6 +2495,10 @@ export default function App() {
       const key = event.key;
       const lowerKey = key.toLowerCase();
       const modifierOnly = ["Shift", "Control", "Alt", "Meta"].includes(key);
+      const terminalPane =
+        event.target instanceof Element && event.target.closest("[data-terminal-pane='true']");
+
+      if (terminalPane && (event.metaKey || event.ctrlKey) && lowerKey === "f") return;
 
       if (leaderArmedRef.current) {
         if (modifierOnly) return;

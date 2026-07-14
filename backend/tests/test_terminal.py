@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import queue
 import re
 import shlex
 import socket
@@ -136,7 +138,7 @@ class TerminalSessionTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_spawn_resize_and_cleanup_leave_no_orphans(self) -> None:
-        session = terminal.TerminalSession("term-1", cwd=self.root, shell_path="/bin/sh")
+        session = terminal.TerminalSession("term-1", cwd=self.root, shell_path="/bin/bash")
         self.addCleanup(session.close)
 
         session.write_input("printf '%s\\n' \"$PWD\"\r")
@@ -171,13 +173,27 @@ class TerminalSessionTests(unittest.TestCase):
         self.assertTrue(_wait_for(lambda: not _pid_is_alive(shell_pid), timeout=5))
         self.assertTrue(_wait_for(lambda: not _pid_is_alive(child_pid), timeout=5))
 
+    def test_ctrl_c_interrupts_foreground_sleep(self) -> None:
+        session = terminal.TerminalSession("term-ctrl-c", cwd=self.root, shell_path="/bin/bash")
+        self.addCleanup(session.close)
+
+        session.write_input("sleep 30\r")
+        time.sleep(0.2)
+        session.write_input(b"\x03")
+        time.sleep(0.5)
+        session.write_input("echo __AFTER_CTRL_C__\r")
+
+        output = _read_session_text(session, "__AFTER_CTRL_C__")
+        self.assertIn("__AFTER_CTRL_C__", output)
+        self.assertTrue(session.alive)
+
 
 class TerminalWebSocketTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.original_manager = terminal.TERMINAL_MANAGER
-        terminal.TERMINAL_MANAGER = terminal.TerminalManager(cwd=self.root, shell_path="/bin/sh")
+        terminal.TERMINAL_MANAGER = terminal.TerminalManager(cwd=self.root, shell_path="/bin/bash")
 
     def tearDown(self) -> None:
         terminal.TERMINAL_MANAGER.close_all()
@@ -192,7 +208,7 @@ class TerminalWebSocketTests(unittest.TestCase):
 
             token = _http_get_json(f"{server.http_base}/api/terminal-token")["token"]
             with ws_connect(f"{server.ws_base}/ws/terminal/test-term?token={token}&create=1") as ws:
-                ws.send(json.dumps({"type": "input", "data": "printf '%s\\n' \"$PWD\"\r"}))
+                ws.send(b"printf '%s\\n' \"$PWD\"\r")
                 output = _read_websocket_text(ws, str(self.root))
                 self.assertIn(str(self.root), output)
 
@@ -235,7 +251,7 @@ class TerminalWebSocketTests(unittest.TestCase):
         with _LiveServer(_make_app()) as server:
             token = _http_get_json(f"{server.http_base}/api/terminal-token")["token"]
             with ws_connect(f"{server.ws_base}/ws/terminal/one?token={token}&create=1") as first:
-                first.send(json.dumps({"type": "input", "data": "printf '%s\\n' \"$PWD\"\r"}))
+                first.send(b"printf '%s\\n' \"$PWD\"\r")
                 _read_websocket_text(first, str(self.root))
                 with ws_connect(f"{server.ws_base}/ws/terminal/two?token={token}&create=1") as second:
                     payload = json.loads(second.recv())
@@ -251,22 +267,129 @@ class TerminalWebSocketTests(unittest.TestCase):
             with ws_connect(f"{server.ws_base}/ws/terminal/ctrl-probe?token={token}&create=1") as ws:
                 time.sleep(0.5)
 
-                ws.send(json.dumps({"type": "input", "data": f"cat > {ctrl_a_path}\r"}))
+                ws.send(f"cat > {ctrl_a_path}\r".encode("utf-8"))
                 time.sleep(0.2)
-                ws.send(json.dumps({"type": "input", "data": "\x01Z\x04"}))
+                ws.send(b"\x01Z\x04")
                 self.assertTrue(
                     _wait_for(lambda: ctrl_a_path.exists() and ctrl_a_path.read_bytes() == b"\x01Z", timeout=5),
                     "ctrl-a probe bytes never settled",
                 )
                 self.assertEqual(ctrl_a_path.read_bytes(), b"\x01Z")
 
-                ws.send(json.dumps({"type": "input", "data": "sleep 100\r"}))
+                ws.send(b"sleep 100\r")
                 time.sleep(0.2)
-                ws.send(json.dumps({"type": "input", "data": "\x03"}))
+                ws.send(b"\x03")
                 time.sleep(1.0)
-                ws.send(json.dumps({"type": "input", "data": f"echo done > {ctrl_c_path}\r"}))
+                ws.send(f"echo done > {ctrl_c_path}\r".encode("utf-8"))
                 self.assertTrue(_wait_for(ctrl_c_path.exists, timeout=5), "ctrl-c probe file never appeared")
                 self.assertEqual(ctrl_c_path.read_text(encoding="utf-8").strip(), "done")
+
+    def test_resize_delivers_sigwinch_to_child(self) -> None:
+        ready_path = self.root / "winch-ready.txt"
+        winch_path = self.root / "winch-hit.txt"
+        with _LiveServer(_make_app()) as server:
+            token = _http_get_json(f"{server.http_base}/api/terminal-token")["token"]
+            with ws_connect(f"{server.ws_base}/ws/terminal/winch-probe?token={token}&create=1") as ws:
+                time.sleep(0.5)
+                ws.send(
+                    (
+                        "python3 -c "
+                        + shlex.quote(
+                            "import pathlib, signal, time; "
+                            f"ready = pathlib.Path({str(ready_path)!r}); "
+                            f"winch = pathlib.Path({str(winch_path)!r}); "
+                            "signal.signal(signal.SIGWINCH, lambda *_: winch.write_text('hit', encoding='utf-8')); "
+                            "ready.write_text('ready', encoding='utf-8'); "
+                            "time.sleep(30)"
+                        )
+                        + "\r"
+                    ).encode("utf-8")
+                )
+                self.assertTrue(_wait_for(ready_path.exists, timeout=5), "WINCH probe never became ready")
+                ws.send(json.dumps({"type": "resize", "rows": 41, "cols": 119}))
+                self.assertTrue(_wait_for(winch_path.exists, timeout=5), "WINCH probe never observed a resize")
+                self.assertEqual(winch_path.read_text(encoding="utf-8").strip(), "hit")
+
+    def test_send_loop_batches_output_frames(self) -> None:
+        class FakeWebSocket:
+            def __init__(self) -> None:
+                self.binary_frames: list[bytes] = []
+                self.control_frames: list[dict[str, object]] = []
+
+            async def send_bytes(self, data: bytes) -> None:
+                self.binary_frames.append(data)
+
+            async def send_json(self, payload: dict[str, object]) -> None:
+                self.control_frames.append(payload)
+
+        session = terminal.TerminalSession.__new__(terminal.TerminalSession)
+        session._flow_gate = threading.Condition()
+        session._pending_bytes = 0
+        session._output_queue = queue.Queue()
+        for _ in range(20):
+            chunk = b"x" * 4096
+            session._pending_bytes += len(chunk)
+            session._output_queue.put(chunk)
+        session._output_queue.put(terminal.TerminalExit(exit_code=0))
+
+        websocket = FakeWebSocket()
+        asyncio.run(session._send_loop(websocket))
+
+        self.assertEqual(len(websocket.control_frames), 1)
+        self.assertEqual(websocket.control_frames[0]["type"], "exit")
+        self.assertLess(len(websocket.binary_frames), 20)
+        self.assertEqual(sum(len(frame) for frame in websocket.binary_frames), 20 * 4096)
+
+    def test_send_loop_preserves_output_boundaries_without_input_loopback(self) -> None:
+        class FakeWebSocket:
+            def __init__(self) -> None:
+                self.binary_frames: list[bytes] = []
+                self.control_frames: list[dict[str, object]] = []
+
+            async def send_bytes(self, data: bytes) -> None:
+                self.binary_frames.append(data)
+
+            async def send_json(self, payload: dict[str, object]) -> None:
+                self.control_frames.append(payload)
+
+        session = terminal.TerminalSession.__new__(terminal.TerminalSession)
+        session._flow_gate = threading.Condition()
+        session._pending_bytes = 0
+        session._output_queue = queue.Queue()
+        expected_chunks = [
+            b"ls\x1b[?2004l\r\r\n",
+            b"backend\r\nfrontend\r\n",
+        ]
+        for chunk in expected_chunks:
+            session._pending_bytes += len(chunk)
+            session._output_queue.put(chunk)
+        session._output_queue.put(terminal.TerminalExit(exit_code=0))
+
+        websocket = FakeWebSocket()
+        asyncio.run(session._send_loop(websocket))
+
+        self.assertEqual(websocket.control_frames[0]["type"], "exit")
+        self.assertEqual(b"".join(websocket.binary_frames), b"".join(expected_chunks))
+        self.assertNotIn(b"lsbackend", b"".join(websocket.binary_frames))
+
+    def test_receive_loop_routes_binary_input_only_to_pty(self) -> None:
+        class FakeWebSocket:
+            def __init__(self) -> None:
+                self.messages = [
+                    {"type": "websocket.receive", "bytes": b"ls\r"},
+                    {"type": "websocket.disconnect"},
+                ]
+
+            async def receive(self) -> dict[str, object]:
+                return self.messages.pop(0)
+
+        session = terminal.TerminalSession.__new__(terminal.TerminalSession)
+        writes: list[bytes] = []
+        session.write_input = writes.append  # type: ignore[method-assign]
+
+        asyncio.run(session._receive_loop(FakeWebSocket()))
+
+        self.assertEqual(writes, [b"ls\r"])
 
 
 if __name__ == "__main__":

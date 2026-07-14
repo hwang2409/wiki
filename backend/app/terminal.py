@@ -16,6 +16,7 @@ import struct
 import subprocess
 import termios
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -31,6 +32,11 @@ DEFAULT_ROWS = 24
 DEFAULT_MAX_SESSIONS = int(os.environ.get("WIKI_TERMINAL_MAX_SESSIONS", "8"))
 FLOW_HIGH_WATERMARK = 512 * 1024
 FLOW_LOW_WATERMARK = 128 * 1024
+OUTPUT_BATCH_WINDOW_SECONDS = max(
+    0.0,
+    float(os.environ.get("WIKI_TERMINAL_OUTPUT_BATCH_WINDOW_MS", "5")) / 1000.0,
+)
+OUTPUT_BATCH_MAX_BYTES = max(1024, int(os.environ.get("WIKI_TERMINAL_OUTPUT_BATCH_MAX_BYTES", str(64 * 1024))))
 TRUSTED_HOSTS = ["localhost", "127.0.0.1", "[::1]"]
 TRUSTED_HOST_NAMES = {"localhost", "127.0.0.1", "::1"}
 
@@ -116,6 +122,12 @@ class TerminalExit:
     exit_code: int | None
 
 
+@dataclass(frozen=True)
+class TerminalOutputBatch:
+    data: bytes
+    exit_frame: TerminalExit | None = None
+
+
 class TerminalSessionError(RuntimeError):
     pass
 
@@ -132,6 +144,33 @@ class TerminalAlreadyAttachedError(TerminalSessionError):
     pass
 
 
+class TerminalChildProcess:
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+        self._exit_code: int | None = None
+        self._lock = threading.Lock()
+
+    def poll(self) -> int | None:
+        with self._lock:
+            if self._exit_code is not None:
+                return self._exit_code
+            waited_pid, status = os.waitpid(self.pid, os.WNOHANG)
+            if waited_pid == 0:
+                return None
+            self._exit_code = os.waitstatus_to_exitcode(status)
+            return self._exit_code
+
+    def wait(self, timeout: float | None = None) -> int:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            exit_code = self.poll()
+            if exit_code is not None:
+                return exit_code
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired("terminal-child", timeout)
+            time.sleep(0.01)
+
+
 class TerminalSession:
     def __init__(
         self,
@@ -143,7 +182,7 @@ class TerminalSession:
         self.terminal_id = terminal_id
         self.cwd = (cwd or ROOT_DIR).resolve()
         self.shell_path = shell_path or resolve_shell_path()
-        self.process: subprocess.Popen[bytes] | None = None
+        self.process: TerminalChildProcess | None = None
         self.exit_code: int | None = None
         self._master_fd: int | None = None
         self._attached = False
@@ -166,16 +205,17 @@ class TerminalSession:
             "COLORTERM": os.environ.get("COLORTERM", "truecolor"),
         }
         try:
-            self.process = subprocess.Popen(
-                [self.shell_path, "-il"],
-                stdin=slave_fd,
-                stdout=slave_fd,
-                stderr=slave_fd,
-                cwd=str(self.cwd),
-                env=env,
-                start_new_session=True,
-                close_fds=True,
-            )
+            pid = os.fork()
+            if pid == 0:
+                with contextlib.suppress(OSError):
+                    os.close(master_fd)
+                try:
+                    os.login_tty(slave_fd)
+                    os.chdir(self.cwd)
+                    os.execve(self.shell_path, [self.shell_path, "-il"], env)
+                except BaseException:
+                    os._exit(1)
+            self.process = TerminalChildProcess(pid)
         finally:
             with contextlib.suppress(OSError):
                 os.close(slave_fd)
@@ -205,14 +245,15 @@ class TerminalSession:
         with self._state_lock:
             self._attached = False
 
-    def write_input(self, data: str) -> None:
+    def write_input(self, data: str | bytes) -> None:
         if not data:
             return
         master_fd = self._master_fd
         if master_fd is None or self._closed:
             return
+        payload = data.encode("utf-8", errors="ignore") if isinstance(data, str) else data
         with contextlib.suppress(OSError):
-            os.write(master_fd, data.encode("utf-8", errors="ignore"))
+            os.write(master_fd, payload)
 
     def resize(self, rows: int, cols: int) -> None:
         master_fd = self._master_fd
@@ -223,6 +264,31 @@ class TerminalSession:
 
     def read_output(self, timeout: float | None = None) -> bytes | TerminalExit:
         return self._output_queue.get(timeout=timeout)
+
+    def read_output_batch(self, timeout: float | None = None) -> TerminalOutputBatch | TerminalExit:
+        first = self._output_queue.get(timeout=timeout)
+        if isinstance(first, TerminalExit):
+            return first
+        chunks = [first]
+        total = len(first)
+        exit_frame: TerminalExit | None = None
+        if OUTPUT_BATCH_WINDOW_SECONDS <= 0:
+            return TerminalOutputBatch(data=first)
+        deadline = time.monotonic() + OUTPUT_BATCH_WINDOW_SECONDS
+        while total < OUTPUT_BATCH_MAX_BYTES:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                item = self._output_queue.get(timeout=remaining)
+            except queue.Empty:
+                break
+            if isinstance(item, TerminalExit):
+                exit_frame = item
+                break
+            chunks.append(item)
+            total += len(item)
+        return TerminalOutputBatch(data=b"".join(chunks), exit_frame=exit_frame)
 
     def _enqueue_exit_once(self, exit_code: int | None) -> None:
         with self._state_lock:
@@ -328,13 +394,15 @@ class TerminalSession:
 
     async def _send_loop(self, websocket: WebSocket) -> None:
         while True:
-            frame = await asyncio.to_thread(self.read_output)
-            if isinstance(frame, bytes):
+            frame = await asyncio.to_thread(self.read_output_batch)
+            if isinstance(frame, TerminalOutputBatch):
                 try:
-                    await websocket.send_bytes(frame)
+                    await websocket.send_bytes(frame.data)
                 finally:
-                    self.mark_output_delivered(len(frame))
-                continue
+                    self.mark_output_delivered(len(frame.data))
+                if frame.exit_frame is None:
+                    continue
+                frame = frame.exit_frame
             await websocket.send_json(
                 {
                     "type": "exit",
@@ -349,6 +417,10 @@ class TerminalSession:
             message = await websocket.receive()
             if message["type"] == "websocket.disconnect":
                 return
+            payload = message.get("bytes")
+            if payload is not None:
+                self.write_input(payload)
+                continue
             payload = message.get("text")
             if not payload:
                 continue
