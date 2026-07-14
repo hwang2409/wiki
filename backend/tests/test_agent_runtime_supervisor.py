@@ -347,6 +347,33 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             adapter.replayed_methods.count("turn/start"),
             starts_before_message + 1,
         )
+        await asyncio.sleep(0)
+        self.assertEqual(self.supervisor.idempotency_tasks, {})
+
+    async def test_dispatch_allows_integer_codex_approval_request_id(self) -> None:
+        started = await self.supervisor.dispatch(
+            "run/start",
+            {
+                "agent_id": "WIKI-APPROVAL",
+                "provider": "codex",
+                "role": "implement",
+                "model": "fixture-codex",
+                "effort": "high",
+                "worktree": str(self.worktree),
+                "prompt": "Handle a Codex approval.",
+            },
+        )
+
+        responded = await self.supervisor.dispatch(
+            "run/respond",
+            {
+                "run_id": started["run_id"],
+                "request_id": 3,
+                "response": {"approved": True},
+            },
+        )
+
+        self.assertEqual(responded["run_id"], started["run_id"])
 
     async def test_idempotency_cache_evicts_oldest_result(self) -> None:
         self.supervisor.idempotency_cache_size = 2
@@ -378,7 +405,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_start_warns_when_active_workers_reach_soft_cap(self) -> None:
         self.supervisor.worker_soft_cap = 1
-        await self.supervisor.dispatch(
+        warned_at_cap = await self.supervisor.dispatch(
             "run/start",
             {
                 "agent_id": "WIKI-SOFT-CAP-ONE",
@@ -404,9 +431,28 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(
-            warned["warning"],
+            warned_at_cap["warning"],
             "1 active workers; soft cap 1 — expect provider timeouts under load",
         )
+        self.assertEqual(
+            warned["warning"],
+            "2 active workers; soft cap 1 — expect provider timeouts under load",
+        )
+
+    async def test_malformed_worker_soft_cap_uses_default_with_warning(self) -> None:
+        with (
+            mock.patch.dict(os.environ, {"WIKI_WORKER_SOFT_CAP": "not-a-number"}),
+            warnings.catch_warnings(record=True) as caught,
+        ):
+            warnings.simplefilter("always")
+            supervisor = Supervisor(self.store, FixtureAdapterFactory(FIXTURES))
+        try:
+            self.assertEqual(supervisor.worker_soft_cap, 5)
+            self.assertTrue(
+                any("WIKI_WORKER_SOFT_CAP" in str(item.message) for item in caught)
+            )
+        finally:
+            await supervisor.close()
 
     async def test_pending_id_round_trips_through_claude_provider_echo(self) -> None:
         record = await self.supervisor.start_run(
@@ -753,16 +799,27 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.supervisor = Supervisor(self.store, factory, pid_alive=lambda _pid: False)
+        params = {
+            "agent_id": "WIKI-START-FAIL",
+            "provider": "codex",
+            "role": "implement",
+            "model": "fixture-codex",
+            "effort": "high",
+            "worktree": str(self.worktree),
+            "prompt": "Fail after emitting a provider event",
+            "request_id": "failed-spawn-retry",
+        }
         with self.assertRaisesRegex(RuntimeError, "fixture start failure"):
-            await self.supervisor.start_run(
-                agent_id="WIKI-START-FAIL",
-                provider=ProviderKind.CODEX,
-                role="implement",
-                model="fixture-codex",
-                effort="high",
-                worktree=str(self.worktree),
-                prompt="Fail after emitting a provider event",
-            )
+            await self.supervisor.dispatch("run/start", params)
+        with self.assertRaisesRegex(RuntimeError, "fixture start failure"):
+            await self.supervisor.dispatch("run/start", dict(params))
+        await asyncio.sleep(0)
+        self.assertNotIn(
+            ("run/start", "failed-spawn-retry"), self.supervisor.idempotency_tasks
+        )
+        self.assertIn(
+            ("run/start", "failed-spawn-retry"), self.supervisor.idempotency_results
+        )
         run_id = self.store.current_run_id("WIKI-START-FAIL")
         assert run_id is not None
         failed = self.store.get(run_id)
@@ -2727,6 +2784,18 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
 
     def test_default_client_timeout_is_lane_aware_and_retry_safe(self) -> None:
         client = SupervisorClient(self.paths)
+        for method in {
+            "run/start",
+            "run/replace",
+            "run/stop",
+            "run/resume",
+            "run/interrupt",
+            "run/archive",
+            "run/respond",
+        }:
+            self.assertEqual(client._timeout_for(method), 30.0)  # noqa: SLF001
+        for method in {"ping", "run/list", "run/status", "run/queue", "events/read"}:
+            self.assertEqual(client._timeout_for(method), 1.0)  # noqa: SLF001
         connection = mock.Mock()
         connection.connect.side_effect = socket.timeout()
         with mock.patch(

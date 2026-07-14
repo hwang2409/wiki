@@ -654,6 +654,25 @@ def _archive_runtime_identity(
     return entry, model, kind, provider
 
 
+def _supervisor_pid_is_alive() -> bool:
+    """Avoid a queued supervisor RPC when annotating a registry snapshot."""
+
+    try:
+        raw_pid = SUPERVISOR_CLIENT.paths.pid_path.read_text(encoding="utf-8").strip()
+        pid = int(raw_pid)
+    except (AttributeError, OSError, ValueError):
+        return False
+    if pid <= 1:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 @app.get("/api/agents")
 def agents() -> dict[str, object]:
     registry: dict = {}
@@ -685,16 +704,25 @@ def agents() -> dict[str, object]:
         if isinstance(orch, dict) and isinstance(orch.get("window"), str)
     )
     live_windows = tmux_live_windows() if legacy_windows else set()
+    supervisor_alive = _supervisor_pid_is_alive() if headless_ids else False
     supervisor_health: dict[str, object] = {
-        "status": "not-needed" if not headless_ids else "snapshot",
+        "status": (
+            "not-needed"
+            if not headless_ids
+            else "snapshot"
+            if supervisor_alive
+            else "degraded"
+        ),
         "runs": len(headless_ids),
     }
     if headless_ids:
         # This route must remain responsive while run/start awaits a provider.
         # The runtime atomically projects its durable state into this registry,
         # so listing intentionally never waits on the supervisor socket.
-        supervisor_health["liveness"] = "snapshot"
+        supervisor_health["liveness"] = "snapshot" if supervisor_alive else "unavailable"
         supervisor_health["snapshot_refreshed_at"] = registry_refreshed_at
+        if not supervisor_alive:
+            supervisor_health["detail"] = "supervisor PID is absent or not running"
     now = datetime.now(tz=timezone.utc).timestamp()
     workers = []
     orchestrators = []
@@ -709,7 +737,9 @@ def agents() -> dict[str, object]:
         headless = _is_headless(current)
         runtime = current if headless else {}
         runtime_state = runtime.get("state") if headless else None
-        control_attached = bool(runtime.get("provider_pid")) if headless else False
+        control_attached = (
+            supervisor_alive and bool(runtime.get("provider_pid")) if headless else False
+        )
         status = read_agent_status(ticket)
         seen_tickets.add(ticket)
         window_alive = (
@@ -2397,11 +2427,20 @@ def spawn_agent(body: dict[str, Any] | SpawnWorkerIn) -> dict[str, object]:
             raise HTTPException(status_code=400, detail="Orchestrator id is not registered")
 
     current = (registry.get(ticket) or {}).get("current") or {}
-    if (
-        isinstance(current, dict)
-        and _is_headless(current)
-        and body.request_id is None
-    ):
+    current_is_headless = isinstance(current, dict) and _is_headless(current)
+    replaying = False
+    if current_is_headless and body.request_id is not None:
+        idempotency = _supervisor_request(
+            "idempotency/status",
+            {"method": "run/start", "request_id": body.request_id},
+        )
+        if not isinstance(idempotency, dict) or not isinstance(idempotency.get("known"), bool):
+            raise HTTPException(
+                status_code=502,
+                detail="Agent supervisor returned a bad idempotency response",
+            )
+        replaying = idempotency["known"]
+    if current_is_headless and not replaying:
         raise HTTPException(
             status_code=409,
             detail=f"{ticket} already has a supervisor-owned run; use Replace",
@@ -2410,7 +2449,7 @@ def spawn_agent(body: dict[str, Any] | SpawnWorkerIn) -> dict[str, object]:
     if isinstance(live_window, str) and live_window in tmux_live_windows():
         raise HTTPException(status_code=409, detail=f"{ticket} already has a live worker window")
 
-    if not (body.request_id is not None and isinstance(current, dict) and _is_headless(current)):
+    if not replaying:
         status_path = AGENT_STATUS_DIR / f"{ticket}.json"
         AGENT_STATUS_DIR.mkdir(parents=True, exist_ok=True)
         try:
@@ -2429,7 +2468,7 @@ def spawn_agent(body: dict[str, Any] | SpawnWorkerIn) -> dict[str, object]:
             "worktree": str(workdir_path),
             "prompt": prompt,
             "orchestrator_id": orch or None,
-            "migrate_legacy": bool(current),
+            "migrate_legacy": bool(current) and not current_is_headless,
             "request_id": body.request_id,
         },
     )

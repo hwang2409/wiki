@@ -22,11 +22,13 @@ DEFAULT_SWAP_DRAIN_SECONDS = 10.0
 DEFAULT_FAST_READ_TIMEOUT = 1.0
 DEFAULT_SLOW_OPERATION_TIMEOUT = 30.0
 
-_SLOW_OPERATION_METHODS = frozenset(
+_FAST_READ_METHODS = frozenset(
     {
-        "run/start",
-        "run/send_now",
-        "run/send_on_idle",
+        "ping",
+        "run/list",
+        "run/status",
+        "run/queue",
+        "events/read",
     }
 )
 
@@ -99,9 +101,9 @@ class SupervisorClient:
 
         if self.timeout is not None:
             return self.timeout
-        if method in _SLOW_OPERATION_METHODS:
-            return DEFAULT_SLOW_OPERATION_TIMEOUT
-        return DEFAULT_FAST_READ_TIMEOUT
+        if method in _FAST_READ_METHODS:
+            return DEFAULT_FAST_READ_TIMEOUT
+        return DEFAULT_SLOW_OPERATION_TIMEOUT
 
     @staticmethod
     def _timeout_message(method: str, timeout: float) -> str:

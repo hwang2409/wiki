@@ -4,6 +4,7 @@ import asyncio
 import math
 import os
 import time
+import warnings
 from collections import OrderedDict
 from collections.abc import Callable
 from copy import deepcopy
@@ -69,10 +70,20 @@ def _env_positive_int(name: str, default: int) -> int:
         return default
     try:
         value = int(raw)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be a positive integer") from exc
+    except ValueError:
+        warnings.warn(
+            f"{name} must be a positive integer; using default {default}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return default
     if value < 1:
-        raise ValueError(f"{name} must be a positive integer")
+        warnings.warn(
+            f"{name} must be a positive integer; using default {default}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return default
     return value
 
 
@@ -216,7 +227,9 @@ class Supervisor:
         self.last_limit_alert_at: dict[str, float] = {}
         self.last_no_eligible_alert: float = 0.0
         self.idempotency_cache_size = idempotency_cache_size
-        self.idempotency_results: OrderedDict[tuple[str, str], Any] = OrderedDict()
+        self.idempotency_results: OrderedDict[
+            tuple[str, str], tuple[str, Any]
+        ] = OrderedDict()
         self.idempotency_tasks: dict[tuple[str, str], asyncio.Task[Any]] = {}
         self.idempotency_lock = asyncio.Lock()
         self.worker_soft_cap = (
@@ -2439,10 +2452,41 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         return record
 
     async def dispatch(self, method: str, params: dict[str, Any]) -> Any:
+        if method not in _IDEMPOTENT_METHODS:
+            return await self._dispatch(method, params)
         request_id = _validated_idempotency_request_id(params.get("request_id"))
-        if request_id is None or method not in _IDEMPOTENT_METHODS:
+        if request_id is None:
             return await self._dispatch(method, params)
         return await self._dispatch_idempotently(method, request_id, params)
+
+    def _complete_idempotency_task(
+        self,
+        key: tuple[str, str],
+        task: asyncio.Task[Any],
+    ) -> None:
+        """Cache a completed operation even when every waiter was cancelled."""
+
+        if self.idempotency_tasks.get(key) is not task:
+            return
+        self.idempotency_tasks.pop(key, None)
+        if task.cancelled():
+            return
+        try:
+            outcome: tuple[str, Any] = ("result", deepcopy(task.result()))
+        except Exception as exc:
+            outcome = ("error", (type(exc), exc.args))
+        self.idempotency_results[key] = outcome
+        self.idempotency_results.move_to_end(key)
+        while len(self.idempotency_results) > self.idempotency_cache_size:
+            self.idempotency_results.popitem(last=False)
+
+    @staticmethod
+    def _replay_idempotency_result(outcome: tuple[str, Any]) -> Any:
+        kind, value = outcome
+        if kind == "error":
+            error_type, args = value
+            raise error_type(*args)
+        return deepcopy(value)
 
     async def _dispatch_idempotently(
         self,
@@ -2454,7 +2498,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         async with self.idempotency_lock:
             if key in self.idempotency_results:
                 self.idempotency_results.move_to_end(key)
-                return deepcopy(self.idempotency_results[key])
+                return self._replay_idempotency_result(self.idempotency_results[key])
             task = self.idempotency_tasks.get(key)
             if task is None:
                 task = asyncio.create_task(
@@ -2462,21 +2506,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     name=f"agent-idempotency-{method}-{request_id}",
                 )
                 self.idempotency_tasks[key] = task
-        try:
-            result = await asyncio.shield(task)
-        except BaseException:
-            async with self.idempotency_lock:
-                if self.idempotency_tasks.get(key) is task and task.done():
-                    self.idempotency_tasks.pop(key, None)
-            raise
-        async with self.idempotency_lock:
-            if self.idempotency_tasks.get(key) is task:
-                self.idempotency_tasks.pop(key, None)
-                self.idempotency_results[key] = deepcopy(result)
-                self.idempotency_results.move_to_end(key)
-                while len(self.idempotency_results) > self.idempotency_cache_size:
-                    self.idempotency_results.popitem(last=False)
-            return deepcopy(result)
+                task.add_done_callback(
+                    lambda completed: self._complete_idempotency_task(key, completed)
+                )
+        return deepcopy(await asyncio.shield(task))
 
     async def _dispatch(self, method: str, params: dict[str, Any]) -> Any:
         if method == "ping":
@@ -2485,11 +2518,21 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 "pid": os.getpid(),
                 "runtime_fingerprint": RUNTIME_FINGERPRINT,
             }
+        if method == "idempotency/status":
+            target_method = params.get("method")
+            if target_method not in _IDEMPOTENT_METHODS:
+                raise ValueError("method must be an idempotent supervisor operation")
+            request_id = _validated_idempotency_request_id(params.get("request_id"))
+            if request_id is None:
+                raise ValueError("request_id is required")
+            key = (target_method, request_id)
+            return {
+                "known": key in self.idempotency_results or key in self.idempotency_tasks,
+            }
         if method == "run/start":
             migrate_legacy = params.get("migrate_legacy", False)
             if not isinstance(migrate_legacy, bool):
                 raise ValueError("migrate_legacy must be a boolean")
-            active_worker_count = self._active_worker_count()
             record = await self.start_run(
                 agent_id=str(params["agent_id"]),
                 provider=ProviderKind(params["provider"]),
@@ -2502,6 +2545,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 migrate_legacy=migrate_legacy,
             )
             result = _public_run(record)
+            active_worker_count = self._active_worker_count()
             if record.role != "orchestrator" and active_worker_count >= self.worker_soft_cap:
                 result["warning"] = (
                     f"{active_worker_count} active workers; soft cap {self.worker_soft_cap} "

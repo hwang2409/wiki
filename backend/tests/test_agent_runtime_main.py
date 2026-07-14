@@ -105,6 +105,8 @@ class FakeSupervisorClient:
         values = dict(params or {})
         self.calls.append((method, values))
         registry = self._registry()
+        if method == "idempotency/status":
+            return {"known": False}
         if method == "fleet/rotate_codex":
             if self.rotation_error is not None:
                 raise self.rotation_error
@@ -287,6 +289,16 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
             '{"seq":1,"payload":{"method":"turn/started"}}\n', encoding="utf-8"
         )
         self.client = FakeSupervisorClient(self.registry, self.raw)
+        self.paths = RuntimePaths(
+            runtime_dir=self.root / "runtime",
+            socket_path=self.root / "runtime" / "supervisor.sock",
+            registry_path=self.registry,
+            archive_dir=self.archive_dir,
+            status_dir=self.status_dir,
+        )
+        self.paths.runtime_dir.mkdir()
+        self.paths.pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
+        self.client.paths = self.paths
         self.patchers = [
             mock.patch.object(main, "AGENT_REGISTRY_PATH", self.registry),
             mock.patch.object(main, "AGENT_STATUS_DIR", self.status_dir),
@@ -618,6 +630,20 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["workers"][0]["runtime_state"], "working")
         request.assert_not_called()
 
+    async def test_agents_marks_dead_supervisor_snapshot_degraded(self) -> None:
+        self._seed_headless()
+        self.paths.pid_path.write_text("999999\n", encoding="utf-8")
+
+        payload = main.agents()
+
+        supervisor = cast(dict[str, Any], payload["supervisor"])
+        worker = cast(list[dict[str, Any]], payload["workers"])[0]
+        self.assertEqual(supervisor["status"], "degraded")
+        self.assertEqual(supervisor["liveness"], "unavailable")
+        self.assertFalse(worker["control_attached"])
+        self.assertFalse(worker["window_alive"])
+        self.assertEqual(self.client.calls, [])
+
     async def test_session_prefers_supervisor_transcript_and_runtime_state(
         self,
     ) -> None:
@@ -852,6 +878,32 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(replace_call["provider"], "codex")
         self.assertEqual(replace_call["model"], "gpt-5.4")
         self.assertEqual(replace_call["effort"], "high")
+
+    async def test_spawn_with_new_request_id_keeps_duplicate_guard(self) -> None:
+        self._seed_headless()
+        status_path = self.status_dir / "WIKI-42.json"
+        status_path.write_text('{"state":"working"}\n', encoding="utf-8")
+
+        with self.assertRaises(HTTPException) as blocked:
+            main.spawn_agent(
+                main.SpawnWorkerIn(
+                    ticket="WIKI-42",
+                    kind="cdx",
+                    role="implement",
+                    model="gpt-5.4",
+                    effort="high",
+                    workdir=str(self.worktree),
+                    orch=None,
+                    prompt="Duplicate WIKI-42",
+                    request_id="new-retry-id",
+                )
+            )
+
+        self.assertEqual(blocked.exception.status_code, 409)
+        self.assertTrue(status_path.exists())
+        self.assertEqual(
+            [method for method, _ in self.client.calls], ["idempotency/status"]
+        )
 
     async def test_replace_accepts_model_kind_and_effort_overrides(self) -> None:
         self._seed_headless(provider="claude")
@@ -1211,6 +1263,7 @@ class BackendSupervisorEndToEndTests(unittest.IsolatedAsyncioTestCase):
         )
         self.server = UnixSupervisorServer(self.supervisor, self.paths.socket_path)
         await self.server.start()
+        self.paths.pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
         self.client = SupervisorClient(self.paths, timeout=2)
         self.patchers = [
             mock.patch.object(main, "AGENT_REGISTRY_PATH", self.paths.registry_path),
@@ -1277,6 +1330,38 @@ class BackendSupervisorEndToEndTests(unittest.IsolatedAsyncioTestCase):
         supervisor = cast(dict[str, Any], agents["supervisor"])
         self.assertEqual(supervisor["status"], "snapshot")
         self.assertEqual(supervisor["liveness"], "snapshot")
+
+    async def test_spawn_replay_preserves_status_and_returns_original_run(self) -> None:
+        request = main.SpawnWorkerIn(
+            ticket="WIKI-RETRY",
+            kind="cdx",
+            role="implement",
+            model="gpt-5.4",
+            effort="high",
+            workdir=str(self.worktree),
+            orch=None,
+            prompt="Retry-safe WIKI-RETRY spawn.",
+            request_id="spawn-replay-1",
+        )
+
+        first = await asyncio.to_thread(main.spawn_agent, request)
+        status_path = self.paths.status_dir / "WIKI-RETRY.json"
+        status_path.write_text('{"state":"working"}\n', encoding="utf-8")
+        await asyncio.sleep(0)
+        replayed = await asyncio.to_thread(main.spawn_agent, request)
+
+        self.assertEqual(replayed, first)
+        self.assertEqual(status_path.read_text(encoding="utf-8"), '{"state":"working"}\n')
+        self.assertEqual(
+            len(
+                [
+                    record
+                    for record in self.store.list_runs()
+                    if record.agent_id == "WIKI-RETRY"
+                ]
+            ),
+            1,
+        )
 
 
 class DetachedHeadlessAcceptanceTests(unittest.TestCase):
@@ -1698,7 +1783,7 @@ for raw in sys.stdin:
                 row["ticket"] for row in cast(list[dict[str, Any]], payload["workers"])
             }
             >= {"WIKI-CODEX", "WIKI-CLAUDE"}
-            and cast(dict[str, Any], payload["supervisor"]).get("status") == "ready",
+            and cast(dict[str, Any], payload["supervisor"]).get("status") == "snapshot",
         )
         codex_row = self._worker_row(initial_agents, "WIKI-CODEX")
         claude_row = self._worker_row(initial_agents, "WIKI-CLAUDE")
