@@ -414,7 +414,7 @@ class CodexAdapterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_numeric_approval_response_keeps_original_id_type(self) -> None:
         record = _record(self.root, ProviderKind.CODEX, state=LifecycleState.STARTING)
-        adapter = self._adapter(record, approval=True, request_timeout=0.05)
+        adapter = self._adapter(record, approval=True, request_timeout=0.5)
         start_task = asyncio.create_task(adapter.start(_start_request(record)))
         request = await _wait_event(
             adapter,
