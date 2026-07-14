@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from .. import knowledge
 from .provider import AdapterStatus
 from .types import (
     EventDisposition,
@@ -811,6 +812,10 @@ class RunStore:
                 self.normalized_events_path(run_id),
                 session_dir / "events.jsonl",
             )
+            # The normalized transcript is durable before the background index
+            # hook is enqueued. A cache failure can never block archive
+            # finalization or provider cleanup.
+            knowledge.enqueue_refresh(runtime_dir=self.paths.runtime_dir)
             self._copy_archive_file(
                 self.provider_log_path(run_id),
                 session_dir / "provider.log",

@@ -63,6 +63,7 @@ def main_cli() -> None:
             "WIKI_AGENT_TMP_DIR": str(agent_tmp_dir),
             "WIKI_MSG_QUEUE_PATH": str(args.queue),
             "WIKI_AGENT_RUNTIME_DIR": str(runtime_dir),
+            "WIKI_KNOWLEDGE_DB_PATH": str(fixture_root / "knowledge.db"),
             "WIKI_SUPERVISOR_SOCKET_PATH": str(supervisor_socket),
             "WIKI_SUPERVISOR_AUTOSTART": "off",
             "WIKI_VAULT_DIR": str(vault_dir),

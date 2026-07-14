@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from ..wiki_artifacts import artifact_server_command
+from ..wiki_artifacts import artifact_server_command, artifact_server_environment
 from .process import (
     ProviderProcessIdentity,
     command_tuple,
@@ -156,18 +156,14 @@ class ClaudeStreamAdapter(ProviderAdapter):
         self.env = child_env
         self.command = command_tuple(command)
         server_command = artifact_server_command()
+        server_env = artifact_server_environment(child_env, record.run_id)
         self.artifact_mcp_config = json.dumps(
             {
                 "mcpServers": {
                     "wiki-artifacts": {
                         "command": server_command[0],
                         "args": list(server_command[1:]),
-                        "env": {
-                            "WIKI_AGENT_RUNTIME_DIR": child_env[
-                                "WIKI_AGENT_RUNTIME_DIR"
-                            ],
-                            "WIKI_RUN_ID": record.run_id,
-                        },
+                        "env": server_env,
                     }
                 }
             },

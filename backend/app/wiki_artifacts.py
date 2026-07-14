@@ -9,8 +9,10 @@ import stat
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from uuid import UUID, uuid4
+
+from . import knowledge
 
 
 TEXT_LIMIT = 100_000
@@ -47,6 +49,24 @@ TOOL_SCHEMA: dict[str, Any] = {
         "title": {"type": "string", "maxLength": 200},
         "caption": {"type": "string", "maxLength": 500},
         "payload": {"type": "object"},
+    },
+}
+
+SEARCH_TOOL_DESCRIPTION = (
+    "Search durable Wiki knowledge across vault notes and Wiki-managed fleet run "
+    "history. Returns ranked snippets with note-path or run-id/event-sequence citations."
+)
+SEARCH_TOOL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["query"],
+    "properties": {
+        "query": {"type": "string", "minLength": 1},
+        "ticket": {"type": "string"},
+        "kind": {"enum": ["note", "run"]},
+        "type": {"type": "string"},
+        "since": {"type": "string", "format": "date"},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 100},
     },
 }
 
@@ -270,6 +290,24 @@ def artifact_server_command() -> tuple[str, ...]:
     return (sys.executable, "-m", "backend.app.wiki_artifacts")
 
 
+def artifact_server_environment(
+    child_env: Mapping[str, str],
+    run_id: str,
+) -> dict[str, str]:
+    server_env = {
+        "WIKI_AGENT_RUNTIME_DIR": child_env["WIKI_AGENT_RUNTIME_DIR"],
+        "WIKI_RUN_ID": run_id,
+    }
+    for key in (
+        "WIKI_KNOWLEDGE_DB_PATH",
+        "WIKI_VAULT_DIR",
+        "WIKI_AGENT_ARCHIVE_DIR",
+    ):
+        if child_env.get(key):
+            server_env[key] = child_env[key]
+    return server_env
+
+
 def _tool_result(request_id: Any, arguments: Any) -> dict[str, Any]:
     try:
         event = render_artifact(arguments)
@@ -280,6 +318,52 @@ def _tool_result(request_id: Any, arguments: Any) -> dict[str, Any]:
         }
     else:
         result = {"content": [{"type": "text", "text": sentinel_text(event)}]}
+    return {"jsonrpc": "2.0", "id": request_id, "result": result}
+
+
+def search_knowledge(arguments: Any) -> dict[str, Any]:
+    if not isinstance(arguments, dict):
+        raise knowledge.KnowledgeQueryError("tool input must be an object")
+    extra = set(arguments) - {"query", "ticket", "kind", "type", "since", "limit"}
+    if extra:
+        raise knowledge.KnowledgeQueryError(f"unknown field: {sorted(extra)[0]}")
+    query = arguments.get("query")
+    if not isinstance(query, str) or not query.strip():
+        raise knowledge.KnowledgeQueryError("query must be a non-empty string")
+    limit = arguments.get("limit", 20)
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise knowledge.KnowledgeQueryError("limit must be an integer")
+    for field in ("ticket", "kind", "type", "since"):
+        if field in arguments and not isinstance(arguments[field], str):
+            raise knowledge.KnowledgeQueryError(f"{field} must be a string")
+    return knowledge.KnowledgeIndex.from_env().search(
+        query,
+        ticket=arguments.get("ticket"),
+        kind=arguments.get("kind"),
+        event_type=arguments.get("type"),
+        since=arguments.get("since"),
+        limit=limit,
+    )
+
+
+def _knowledge_tool_result(request_id: Any, arguments: Any) -> dict[str, Any]:
+    try:
+        payload = search_knowledge(arguments)
+    except (knowledge.KnowledgeError, OSError) as exc:
+        result = {
+            "content": [{"type": "text", "text": f"knowledge search failed: {exc}"}],
+            "isError": True,
+        }
+    else:
+        result = {
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                }
+            ],
+            "structuredContent": payload,
+        }
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
 
@@ -309,7 +393,12 @@ def _response(message: dict[str, Any]) -> dict[str, Any] | None:
                         "name": "render_artifact",
                         "description": TOOL_DESCRIPTION,
                         "inputSchema": TOOL_SCHEMA,
-                    }
+                    },
+                    {
+                        "name": "search_knowledge",
+                        "description": SEARCH_TOOL_DESCRIPTION,
+                        "inputSchema": SEARCH_TOOL_SCHEMA,
+                    },
                 ]
             },
         }
@@ -317,6 +406,8 @@ def _response(message: dict[str, Any]) -> dict[str, Any] | None:
         params = message.get("params") or {}
         if params.get("name") == "render_artifact":
             return _tool_result(request_id, params.get("arguments"))
+        if params.get("name") == "search_knowledge":
+            return _knowledge_tool_result(request_id, params.get("arguments"))
         return {
             "jsonrpc": "2.0",
             "id": request_id,

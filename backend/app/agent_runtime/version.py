@@ -17,7 +17,11 @@ def _runtime_fingerprint() -> str:
         )
     else:
         runtime_dir = Path(__file__).resolve().parent
-        sources = [*runtime_dir.glob("*.py"), runtime_dir.parent / "wiki_artifacts.py"]
+        sources = [
+            *runtime_dir.glob("*.py"),
+            *runtime_dir.parent.glob("knowledge*.py"),
+            runtime_dir.parent / "wiki_artifacts.py",
+        ]
         for path in sorted(sources):
             digest.update(path.name.encode())
             digest.update(path.read_bytes())
