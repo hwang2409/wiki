@@ -105,6 +105,10 @@ export function WorkspacePane({
         terminalId={terminalId}
       />
     );
+  } else if (path.startsWith("utility://")) {
+    // Utility pages are provided by App's focused-pane overlay. Do not mount a
+    // hidden note pane for their internal workspace identity.
+    content = null;
   } else {
     content = (
       <NotePane

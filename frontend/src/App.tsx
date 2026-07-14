@@ -121,7 +121,7 @@ type LegacyStoredLayoutState = {
 
 type PaneInfo = {
   key: string;
-  kind: "agent" | "note" | "terminal";
+  kind: "agent" | "note" | "terminal" | "utility";
   path: string;
   ticket: string | null;
 };
@@ -173,6 +173,19 @@ function isAgentPath(path: string): boolean {
 
 function isTerminalPath(path: string): boolean {
   return path.startsWith("terminal://");
+}
+
+function utilityKindFromPanePath(path: string | null): UtilityMode | null {
+  const kind = path?.startsWith("utility://") ? path.slice("utility://".length) : null;
+  return kind && (UTILITY_ROUTES as readonly string[]).includes(kind) ? (kind as UtilityMode) : null;
+}
+
+function utilityPanePath(kind: UtilityMode): string {
+  return `utility://${kind}`;
+}
+
+function utilityLabel(kind: UtilityMode): string {
+  return `${kind.slice(0, 1).toUpperCase()}${kind.slice(1)}`;
 }
 
 function splitLayout(
@@ -269,7 +282,13 @@ function collectPaneInfos(node: Layout, panes: PaneInfo[] = []): PaneInfo[] {
   if (node.kind === "pane") {
     panes.push({
       key: node.id,
-      kind: isAgentPath(node.path) ? "agent" : isTerminalPath(node.path) ? "terminal" : "note",
+      kind: isAgentPath(node.path)
+        ? "agent"
+        : isTerminalPath(node.path)
+          ? "terminal"
+          : utilityKindFromPanePath(node.path)
+            ? "utility"
+            : "note",
       path: node.path,
       ticket: ticketFromPanePath(node.path),
     });
@@ -366,7 +385,13 @@ function findPaneInfo(node: Layout, key: string): PaneInfo | null {
     return node.id === key
       ? {
           key: node.id,
-          kind: isAgentPath(node.path) ? "agent" : isTerminalPath(node.path) ? "terminal" : "note",
+          kind: isAgentPath(node.path)
+            ? "agent"
+            : isTerminalPath(node.path)
+              ? "terminal"
+              : utilityKindFromPanePath(node.path)
+                ? "utility"
+                : "note",
           path: node.path,
           ticket: ticketFromPanePath(node.path),
         }
@@ -392,6 +417,8 @@ function paneLabel(path: string): string {
   if (ticket) return ticket;
   const terminalId = terminalIdFromPanePath(path);
   if (terminalId) return `term:${terminalId.slice(0, 8)}`;
+  const utility = utilityKindFromPanePath(path);
+  if (utility) return utilityLabel(utility);
   return basename(path);
 }
 
@@ -405,7 +432,8 @@ function windowLabel(window: WorkspaceWindow): string {
 function normalizeWindow(
   window: WorkspaceWindow,
   seenTickets: Set<string>,
-  seenTerminalIds: Set<string>
+  seenTerminalIds: Set<string>,
+  seenUtilities: Set<UtilityMode>
 ): WorkspaceWindow | null {
   function prune(node: Layout): Layout | null {
     if (node.kind === "pane") {
@@ -419,6 +447,11 @@ function normalizeWindow(
       if (terminalId) {
         if (seenTerminalIds.has(terminalId)) return null;
         seenTerminalIds.add(terminalId);
+      }
+      const utility = utilityKindFromPanePath(node.path);
+      if (utility) {
+        if (seenUtilities.has(utility)) return null;
+        seenUtilities.add(utility);
       }
       return node;
     }
@@ -446,6 +479,7 @@ function normalizeWindowWorkspaceState(state: WindowWorkspaceState): WindowWorks
   const seenWindowIds = new Set<string>();
   const seenTickets = new Set<string>();
   const seenTerminalIds = new Set<string>();
+  const seenUtilities = new Set<UtilityMode>();
   const windows = state.windows
     .filter((window): window is WorkspaceWindow => typeof window.id === "string" && window.id.length > 0)
     .filter((window) => {
@@ -453,7 +487,7 @@ function normalizeWindowWorkspaceState(state: WindowWorkspaceState): WindowWorks
       seenWindowIds.add(window.id);
       return true;
     })
-    .map((window) => normalizeWindow(window, seenTickets, seenTerminalIds))
+    .map((window) => normalizeWindow(window, seenTickets, seenTerminalIds, seenUtilities))
     .filter((window): window is WorkspaceWindow => window !== null);
   const activeWindowId =
     state.activeWindowId && windows.some((window) => window.id === state.activeWindowId)
@@ -1556,6 +1590,11 @@ export default function App() {
       setMode("terminal");
       return;
     }
+    const utility = utilityKindFromPanePath(path);
+    if (utility) {
+      showUtilityRoute(utility, { syncHash });
+      return;
+    }
     void showNoteRoute(path, { syncHash });
   }
 
@@ -1611,14 +1650,26 @@ export default function App() {
     await showNoteRoute(path, { edit, syncHash });
   }
 
-  function openUtilityView(kind: UtilityMode) {
-    navigate({ kind });
+  function showUtilityRoute(kind: UtilityMode, options: { syncHash?: boolean } = {}) {
+    if (options.syncHash ?? true) navigate({ kind });
     setError(null);
     setActiveNote(null);
     setAgentTicket(null);
     setAgentPanel(null);
     setTerminalRouteId(null);
     setMode(kind);
+  }
+
+  function openUtilityView(kind: UtilityMode, options: { syncHash?: boolean } = {}) {
+    const path = utilityPanePath(kind);
+    const existing = findPaneLocationByPath(path, activeWindow?.id ?? null);
+    if (existing) {
+      if (zoomedPaneId && zoomedPaneId !== existing.pane.key) setZoomedPaneId(null);
+      focusWindowPane(existing.window.id, existing.pane.key);
+    } else {
+      openPathInSoloWindow(path);
+    }
+    showUtilityRoute(kind, options);
   }
 
   function openAgent(ticket: string, panel: AgentRoutePanel = null, syncHash = true) {
@@ -2224,10 +2275,12 @@ export default function App() {
 
   const openAgentRef = useRef(openAgent);
   const openNoteRef = useRef(openNote);
+  const openUtilityViewRef = useRef(openUtilityView);
   const syncRouteToPathRef = useRef(syncRouteToPath);
   const activeWindowRef = useRef(activeWindow);
   openAgentRef.current = openAgent;
   openNoteRef.current = openNote;
+  openUtilityViewRef.current = openUtilityView;
   syncRouteToPathRef.current = syncRouteToPath;
   activeWindowRef.current = activeWindow;
 
@@ -2275,11 +2328,7 @@ export default function App() {
         return;
       }
       if (route.kind !== "note" && route.kind !== "edit") {
-        setActiveNote(null);
-        setAgentPanel(null);
-        setAgentTicket(null);
-        setTerminalRouteId(null);
-        setMode(route.kind);
+        openUtilityViewRef.current(route.kind, { syncHash: false });
         return;
       }
 
