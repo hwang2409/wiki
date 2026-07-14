@@ -10,8 +10,10 @@ import socket
 import threading
 import time
 import unittest
+import warnings
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request as UrlRequest
 from urllib.request import urlopen
@@ -187,6 +189,59 @@ class TerminalSessionTests(unittest.TestCase):
         self.assertIn("__AFTER_CTRL_C__", output)
         self.assertTrue(session.alive)
 
+    def test_spawn_under_thread_load_has_no_python_fork_warning(self) -> None:
+        errors: list[BaseException] = []
+
+        def spawn_and_close(index: int) -> None:
+            try:
+                session = terminal.TerminalSession(f"thread-load-{index}", cwd=self.root, shell_path="/bin/sh")
+                session.close()
+            except BaseException as error:
+                errors.append(error)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            workers = [threading.Thread(target=spawn_and_close, args=(index,)) for index in range(8)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=5)
+
+        self.assertEqual(errors, [])
+        self.assertFalse(any("fork()" in str(item.message) for item in caught))
+
+    def test_immediate_close_during_spawn_never_signals_parent_group(self) -> None:
+        parent_pgid = os.getpgrp()
+        original_killpg = terminal.os.killpg
+        killpg_calls: list[int] = []
+
+        def guarded_killpg(pgid: int, signum: int) -> None:
+            killpg_calls.append(pgid)
+            self.assertNotEqual(pgid, parent_pgid)
+            original_killpg(pgid, signum)
+
+        with patch.object(terminal.os, "killpg", side_effect=guarded_killpg):
+            session = terminal.TerminalSession("immediate-close", cwd=self.root, shell_path="/bin/sh")
+            session.close()
+
+        self.assertTrue(session.closed)
+        self.assertNotIn(parent_pgid, killpg_calls)
+
+    def test_write_input_retries_short_writes(self) -> None:
+        session = terminal.TerminalSession.__new__(terminal.TerminalSession)
+        session._master_fd = 42
+        session._closed = False
+        writes: list[bytes] = []
+
+        def short_write(_fd: int, payload: bytes) -> int:
+            writes.append(payload)
+            return min(2, len(payload))
+
+        with patch.object(terminal.os, "write", side_effect=short_write):
+            session.write_input(b"abcdef")
+
+        self.assertEqual(writes, [b"abcdef", b"cdef", b"ef"])
+
 
 class TerminalWebSocketTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -335,8 +390,8 @@ class TerminalWebSocketTests(unittest.TestCase):
         websocket = FakeWebSocket()
         asyncio.run(session._send_loop(websocket))
 
-        self.assertEqual(len(websocket.control_frames), 1)
-        self.assertEqual(websocket.control_frames[0]["type"], "exit")
+        self.assertEqual([frame["type"] for frame in websocket.control_frames], ["hello", "exit"])
+        self.assertEqual(websocket.control_frames[0]["capabilities"], {"binaryInput": True})
         self.assertLess(len(websocket.binary_frames), 20)
         self.assertEqual(sum(len(frame) for frame in websocket.binary_frames), 20 * 4096)
 
@@ -368,7 +423,7 @@ class TerminalWebSocketTests(unittest.TestCase):
         websocket = FakeWebSocket()
         asyncio.run(session._send_loop(websocket))
 
-        self.assertEqual(websocket.control_frames[0]["type"], "exit")
+        self.assertEqual([frame["type"] for frame in websocket.control_frames], ["hello", "exit"])
         self.assertEqual(b"".join(websocket.binary_frames), b"".join(expected_chunks))
         self.assertNotIn(b"lsbackend", b"".join(websocket.binary_frames))
 
@@ -377,6 +432,7 @@ class TerminalWebSocketTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.messages = [
                     {"type": "websocket.receive", "bytes": b"ls\r"},
+                    {"type": "websocket.receive", "text": json.dumps({"type": "input", "data": "pwd\r"})},
                     {"type": "websocket.disconnect"},
                 ]
 
@@ -384,12 +440,12 @@ class TerminalWebSocketTests(unittest.TestCase):
                 return self.messages.pop(0)
 
         session = terminal.TerminalSession.__new__(terminal.TerminalSession)
-        writes: list[bytes] = []
+        writes: list[object] = []
         session.write_input = writes.append  # type: ignore[method-assign]
 
         asyncio.run(session._receive_loop(FakeWebSocket()))
 
-        self.assertEqual(writes, [b"ls\r"])
+        self.assertEqual(writes, [b"ls\r", "pwd\r"])
 
 
 if __name__ == "__main__":

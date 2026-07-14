@@ -14,6 +14,7 @@ import secrets
 import signal
 import struct
 import subprocess
+import sys
 import termios
 import threading
 import time
@@ -144,34 +145,9 @@ class TerminalAlreadyAttachedError(TerminalSessionError):
     pass
 
 
-class TerminalChildProcess:
-    def __init__(self, pid: int) -> None:
-        self.pid = pid
-        self._exit_code: int | None = None
-        self._lock = threading.Lock()
-
-    def poll(self) -> int | None:
-        with self._lock:
-            if self._exit_code is not None:
-                return self._exit_code
-            waited_pid, status = os.waitpid(self.pid, os.WNOHANG)
-            if waited_pid == 0:
-                return None
-            self._exit_code = os.waitstatus_to_exitcode(status)
-            return self._exit_code
-
-    def wait(self, timeout: float | None = None) -> int:
-        deadline = None if timeout is None else time.monotonic() + timeout
-        while True:
-            exit_code = self.poll()
-            if exit_code is not None:
-                return exit_code
-            if deadline is not None and time.monotonic() >= deadline:
-                raise subprocess.TimeoutExpired("terminal-child", timeout)
-            time.sleep(0.01)
-
-
 class TerminalSession:
+    _spawn_lock = threading.Lock()
+
     def __init__(
         self,
         terminal_id: str,
@@ -182,7 +158,7 @@ class TerminalSession:
         self.terminal_id = terminal_id
         self.cwd = (cwd or ROOT_DIR).resolve()
         self.shell_path = shell_path or resolve_shell_path()
-        self.process: TerminalChildProcess | None = None
+        self.process: subprocess.Popen[bytes] | None = None
         self.exit_code: int | None = None
         self._master_fd: int | None = None
         self._attached = False
@@ -196,29 +172,34 @@ class TerminalSession:
         self._spawn()
 
     def _spawn(self) -> None:
-        master_fd, slave_fd = pty.openpty()
-        set_winsize(master_fd, DEFAULT_ROWS, DEFAULT_COLS)
-        set_winsize(slave_fd, DEFAULT_ROWS, DEFAULT_COLS)
-        env = {
-            **os.environ,
-            "TERM": os.environ.get("TERM", "xterm-256color"),
-            "COLORTERM": os.environ.get("COLORTERM", "truecolor"),
-        }
-        try:
-            pid = os.fork()
-            if pid == 0:
+        with self._spawn_lock:
+            master_fd, slave_fd = pty.openpty()
+            set_winsize(master_fd, DEFAULT_ROWS, DEFAULT_COLS)
+            set_winsize(slave_fd, DEFAULT_ROWS, DEFAULT_COLS)
+            env = {
+                **os.environ,
+                "TERM": os.environ.get("TERM", "xterm-256color"),
+                "COLORTERM": os.environ.get("COLORTERM", "truecolor"),
+            }
+            try:
+                self.process = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(Path(__file__).with_name("terminal_child.py")),
+                        self.shell_path,
+                        str(self.cwd),
+                    ],
+                    stdin=slave_fd,
+                    stdout=slave_fd,
+                    stderr=slave_fd,
+                    cwd=str(self.cwd),
+                    env=env,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+            finally:
                 with contextlib.suppress(OSError):
-                    os.close(master_fd)
-                try:
-                    os.login_tty(slave_fd)
-                    os.chdir(self.cwd)
-                    os.execve(self.shell_path, [self.shell_path, "-il"], env)
-                except BaseException:
-                    os._exit(1)
-            self.process = TerminalChildProcess(pid)
-        finally:
-            with contextlib.suppress(OSError):
-                os.close(slave_fd)
+                    os.close(slave_fd)
         self._master_fd = master_fd
         self._reader_thread = threading.Thread(
             target=self._reader_loop,
@@ -252,8 +233,17 @@ class TerminalSession:
         if master_fd is None or self._closed:
             return
         payload = data.encode("utf-8", errors="ignore") if isinstance(data, str) else data
-        with contextlib.suppress(OSError):
-            os.write(master_fd, payload)
+        offset = 0
+        while offset < len(payload):
+            try:
+                written = os.write(master_fd, payload[offset:])
+            except InterruptedError:
+                continue
+            except OSError:
+                return
+            if written <= 0:
+                return
+            offset += written
 
     def resize(self, rows: int, cols: int) -> None:
         master_fd = self._master_fd
@@ -328,8 +318,13 @@ class TerminalSession:
                     exit_code = process.wait(timeout=0.5)
             self._enqueue_exit_once(exit_code)
             if master_fd is not None:
-                with contextlib.suppress(OSError):
-                    os.close(master_fd)
+                self._close_master_fd(master_fd)
+
+    @classmethod
+    def _close_master_fd(cls, master_fd: int) -> None:
+        with cls._spawn_lock:
+            with contextlib.suppress(OSError):
+                os.close(master_fd)
 
     def mark_output_delivered(self, size: int) -> None:
         with self._flow_gate:
@@ -346,30 +341,39 @@ class TerminalSession:
             self._flow_gate.notify_all()
         process = self.process
         if process is not None and process.poll() is None:
-            with contextlib.suppress(ProcessLookupError):
-                pgid = os.getpgid(process.pid)
-                os.killpg(pgid, signal.SIGHUP)
+            self._signal_child(process, signal.SIGHUP)
             with contextlib.suppress(subprocess.TimeoutExpired):
                 process.wait(timeout=0.5)
             if process.poll() is None:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                self._signal_child(process, signal.SIGTERM)
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     process.wait(timeout=0.5)
             if process.poll() is None:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                self._signal_child(process, signal.SIGKILL)
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     process.wait(timeout=0.5)
         master_fd = self._master_fd
         self._master_fd = None
         if master_fd is not None:
-            with contextlib.suppress(OSError):
-                os.close(master_fd)
+            self._close_master_fd(master_fd)
         if self._reader_thread is not None:
             self._reader_thread.join(timeout=1)
         if process is not None:
             self._enqueue_exit_once(process.poll())
+
+    @staticmethod
+    def _signal_child(process: subprocess.Popen[bytes], signum: int) -> None:
+        try:
+            pgid = os.getpgid(process.pid)
+        except ProcessLookupError:
+            return
+        try:
+            if pgid == process.pid:
+                os.killpg(pgid, signum)
+            else:
+                os.kill(process.pid, signum)
+        except ProcessLookupError:
+            return
 
     async def serve(self, websocket: WebSocket) -> None:
         sender = asyncio.create_task(self._send_loop(websocket))
@@ -393,6 +397,12 @@ class TerminalSession:
                     await websocket.close()
 
     async def _send_loop(self, websocket: WebSocket) -> None:
+        await websocket.send_json(
+            {
+                "type": "hello",
+                "capabilities": {"binaryInput": True},
+            }
+        )
         while True:
             frame = await asyncio.to_thread(self.read_output_batch)
             if isinstance(frame, TerminalOutputBatch):
@@ -419,7 +429,7 @@ class TerminalSession:
                 return
             payload = message.get("bytes")
             if payload is not None:
-                self.write_input(payload)
+                await asyncio.to_thread(self.write_input, payload)
                 continue
             payload = message.get("text")
             if not payload:

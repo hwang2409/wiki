@@ -119,7 +119,7 @@ export function TerminalPane({
     }
   }
 
-  function handleFindKeyDown(event: ReactKeyboardEvent<HTMLInputElement>) {
+  function handleFindKeyDown(event: ReactKeyboardEvent<HTMLElement>) {
     if (event.key === "Escape") {
       event.preventDefault();
       event.stopPropagation();
@@ -165,7 +165,11 @@ export function TerminalPane({
           <span className="terminal-pane-chip">{snapshot.renderer}</span>
           <span className={`terminal-pane-chip is-${snapshot.status}`}>{snapshot.status}</span>
           {findOpen ? (
-            <div className="terminal-pane-find" role="search">
+            <div
+              className="terminal-pane-find"
+              role="search"
+              onKeyDownCapture={handleFindKeyDown}
+            >
               <input
                 ref={findInputRef}
                 aria-label="Find in terminal"
@@ -174,7 +178,6 @@ export function TerminalPane({
                 placeholder="Find"
                 value={findTerm}
                 onChange={(event) => updateFindTerm(event.target.value)}
-                onKeyDown={handleFindKeyDown}
               />
               <span className="terminal-pane-find-count" aria-live="polite">
                 {resultLabel}

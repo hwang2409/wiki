@@ -486,6 +486,7 @@ const result = {
   pageErrors: [],
   paintProbe: null,
   renderer: null,
+  binaryInputNegotiated: false,
   searchWorked: false,
   shellPid: null,
   shellPidGoneAfterClose: null,
@@ -604,6 +605,8 @@ try {
   }
 
   await focusTerminal(page, terminalId);
+  await page.waitForFunction((id) => window.__wikiTerminals?.[id]?.binaryInputSupported?.() === true, terminalId);
+  result.binaryInputNegotiated = true;
   await page.keyboard.press("Control+f");
   const findInput = page.getByLabel("Find in terminal");
   await findInput.fill("README");
@@ -612,6 +615,7 @@ try {
     return /\d+ of \d+/.test(count);
   });
   result.searchWorked = (await page.locator(".terminal-pane-find").count()) === 1;
+  await page.getByRole("button", { name: "Next match" }).click();
   await page.keyboard.press("Escape");
   await page.waitForFunction(() => document.querySelector("[aria-label='Find in terminal']") === null);
 
@@ -791,6 +795,9 @@ try {
   }
   if (!result.searchWorked) {
     throw new Error("Terminal scrollback search did not open");
+  }
+  if (!result.binaryInputNegotiated) {
+    throw new Error("Terminal binary-input capability was not negotiated");
   }
   if (!result.latency || result.latency.p95 >= 30) {
     throw new Error(`Expected p95 latency under 30ms, saw ${result.latency?.p95}`);

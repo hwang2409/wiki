@@ -4,6 +4,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
 import type { IDisposable } from "@xterm/xterm";
 import { deriveTerminalTheme, type DerivedTerminalTheme } from "./terminal-theme";
+import { terminalInputFrame } from "./terminal-transport";
 
 export type TerminalStatus = "connecting" | "live" | "ended" | "error";
 export type TerminalRenderer = "webgl" | "dom";
@@ -21,6 +22,7 @@ declare global {
     __wikiTerminals?: Record<
       string,
       {
+        binaryInputSupported: () => boolean;
         renderer: () => TerminalRenderer;
         sendInput: (data: string) => void;
         socketReadyState: () => number;
@@ -93,6 +95,7 @@ class TerminalRuntime {
   private rendererDisposable: IDisposable | null = null;
   private webglAddon: WebglAddon | null = null;
   private socket: WebSocket | null = null;
+  private binaryInputSupported = false;
   private resizeObserver: ResizeObserver | null = null;
   private attachedHost: HTMLDivElement | null = null;
   private resizeTimer: number | null = null;
@@ -154,6 +157,7 @@ class TerminalRuntime {
     getParkingLot().appendChild(this.shellRoot);
     window.__wikiTerminals = window.__wikiTerminals ?? {};
     window.__wikiTerminals[terminalId] = {
+      binaryInputSupported: () => this.binaryInputSupported,
       renderer: () => this.snapshot.renderer,
       sendInput: (data: string) => this.sendInput(data),
       socketReadyState: () => this.socket?.readyState ?? -1,
@@ -252,7 +256,11 @@ class TerminalRuntime {
     if (!data) return;
     const socket = this.socket;
     if (socket?.readyState !== WebSocket.OPEN) return;
-    socket.send(this.encoder.encode(data));
+    if (this.binaryInputSupported) {
+      socket.send(terminalInputFrame(data, true, this.encoder));
+    } else {
+      socket.send(terminalInputFrame(data, false, this.encoder));
+    }
   }
 
   dispose() {
@@ -339,6 +347,7 @@ class TerminalRuntime {
     const generation = ++this.connectGeneration;
     const previousSocket = this.socket;
     this.socket = null;
+    this.binaryInputSupported = false;
     previousSocket?.close();
     this.setSnapshot({ message: "Connecting…", status: "connecting" });
 
@@ -372,11 +381,17 @@ class TerminalRuntime {
         if (!this.isCurrentSocket(socket, generation)) return;
         if (typeof event.data === "string") {
           let payload: {
+            capabilities?: {
+              binaryInput?: boolean;
+            };
             message?: string;
             type?: string;
           };
           try {
             payload = JSON.parse(event.data) as {
+              capabilities?: {
+                binaryInput?: boolean;
+              };
               message?: string;
               type?: string;
             };
@@ -384,7 +399,9 @@ class TerminalRuntime {
             this.setSnapshot({ message: "Terminal sent an invalid control message.", status: "error" });
             return;
           }
-          if (payload.type === "missing" || payload.type === "exit") {
+          if (payload.type === "hello") {
+            this.binaryInputSupported = payload.capabilities?.binaryInput === true;
+          } else if (payload.type === "missing" || payload.type === "exit") {
             this.setSnapshot({
               message: payload.message ?? "Session ended.",
               status: "ended",
