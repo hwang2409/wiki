@@ -9,6 +9,7 @@ updated: 2026-07-14
 
 ## 2026-07-14
 
+- WIKI-115 merged (#91): cdx render_artifact mcpToolCall results now normalize to kind=artifact events (write-time + read-time heal for archived runs); gate found WIKI-117 (test env-sensitivity) + WIKI-118 (hardening bundle); needs native-build+relaunch
 - [WIKI-114](https://github.com/hwang2409/wiki/pull/90) legible compact preview for large mermaid/SVG artifacts — explicit px dims from viewBox (kills Chromium 300px fallback), 400px crop + bottom/right fades + click-to-inspect via existing pan/zoom. Gate: 2 iterations (2 BLOCKING: wide diagrams still 2-6px text via width:max-content fallback, viewBox-only SVGs collapsed 0x0; 1 HIGH: test passed by 276px-fixture coincidence — wide fixture + width assertions added). Merged e792f49 via #90.
 - **phoebe** — admin account note -> org-Slack admin-agent thread automation merged (#11339, no ticket yet — backfill after Linear re-auth)
 - **phoebe** — PHO-13685 point-in-time lifecycle state-series primitives for churn cohort/survival merged (#11336)

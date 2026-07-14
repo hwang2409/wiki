@@ -9,6 +9,18 @@ updated: 2026-07-14
 
 Machine-readable contract between the mastermind orchestrator session and tmux worker sessions. Canonical behavior lives in the `tmux-ticket-codex` / `tmux-ticket-claude` skills (synced via github.com/hwang2409/agent-config); this note is the SCHEMA — what exists on disk/tmux and who reads/writes it. Written for a future "agents" page in the wiki app to render live state from these files.
 
+## Default role→model pipeline (Henry 2026-07-14)
+
+Unless a ticket or Henry specifies otherwise:
+
+| Role | Runtime | Model |
+|---|---|---|
+| Orchestrator | cc | claude-fable-5 ("Fable") |
+| Implement worker | cdx | gpt-5.6-luna |
+| Review worker | cdx | gpt-5.6-sol |
+
+Flow: Fable spawns luna implementer → worker signals merge-ready → Fable spawns (or steers existing) sol reviewer as the gate's deep-review step → sol's severity-tagged findings return to Fable → Fable structures them into a steer to the luna implementer (observed → why wrong → do instead → constraint, one item per finding) → loop until sol returns MERGE-READY clean → merge per repo authority. Sol never steers luna directly; all routing goes through the orchestrator. Iteration cap and Henry-interrupt rules follow the gate-loop section below. Explicit `--model`/`--effort` overrides remain allowed per ticket.
+
 ## Identity
 
 | Thing | Convention | Writer |
@@ -107,7 +119,7 @@ Loop:
 
 1. **Verification gate** — `gh pr view` + `gh pr checks` + reviewThreads GraphQL. Verify: PR open + not draft, `mergeable=MERGEABLE`, all non-skipped checks pass, `reviewThreads` with `isResolved==false` count is 0, head SHA matches worker's claimed SHA.
 2a. **Bazel repos — gate suite reruns bypass the shared test cache**: `bazel test --cache_test_results=no <targets>`. The user-level `~/.bazelrc` shares a content-addressed disk cache (`~/.cache/bazel-disk`) across all worktrees/workers — an explicit, accepted exception to worker shared-state isolation (content-addressing prevents accidental cross-pollution). Workers iterate WITH the cache; the gate forces real execution because cached `PASSED` masks timing flakes and defeats the 2x back-to-back reproducibility check.
-2. **Deep code review (MANDATORY, no shortcuts)** — spawn the `code-review` subagent with adversarial framing and the project's domain context (for Phoebe: admin-agent RLS role, schema catalog, `admin_tool_result_caps` pipeline, sandbox mode, styleguide, banned APIs). Ask for verdict + severity-tagged findings with file:line. CI-green + threads-clear is a gate, NOT a review. Grep scans, checklist walks, and any "we already reviewed once this PR" skip = violation. Every new head SHA earns a fresh review.
+2. **Deep code review (MANDATORY, no shortcuts)** — default reviewer is a cdx gpt-5.6-sol review worker (see Default pipeline section); spawn it (or an in-session `code-review` subagent as fallback when the fleet is constrained) with adversarial framing and the project's domain context (for Phoebe: admin-agent RLS role, schema catalog, `admin_tool_result_caps` pipeline, sandbox mode, styleguide, banned APIs). Ask for verdict + severity-tagged findings with file:line. CI-green + threads-clear is a gate, NOT a review. Grep scans, checklist walks, and any "we already reviewed once this PR" skip = violation. Every new head SHA earns a fresh review.
 3. **Steer on findings** — if verdict != MERGE-READY (has BLOCKING/HIGH/actionable MEDIUM), the orchestrator itself composes the steer and sends it via the wiki composer (`send_now`) to the worker. Do NOT ask Henry "should I steer?" — just steer. Steer shape: observed → why wrong → do instead → constraint (per Input Channel section). Include severity, file:line, concrete fix per finding. Tell the worker not to re-declare merge-ready until every BLOCKING+HIGH is resolved and MEDIUMs are either fixed or explicitly deferred with a follow-up ticket link.
 4. **Re-enter the loop** — wait for the worker's next `merge-ready`, then GOTO 1. Cap at 3 review iterations; on iteration 4 still-not-clean, surface to Henry as a "true blocker" with a summary of what the worker is failing to converge on.
 5. **Clean pass** — only after deep review returns MERGE-READY. Merge authority is PER-REPO (Henry 2026-07-13): **wiki** (hwang2409/wiki) — orchestrator squash-merges itself after the clean pass, then auto wrap-up. **Phoebe** (phoebe-health/phoebe) — NEVER auto-merge; surface to Henry: "PR #N merge-ready; reviewer approval required" and wait.

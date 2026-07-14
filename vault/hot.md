@@ -19,6 +19,8 @@ Rolling ≤500-word session cache. Rewrite (don't append) at work-arc boundaries
 - **Phoebe Linear sweep DONE (re-auth completed 22:00)**: 13676/13690 auto-closed; 13685 hand-bumped Merged→Done. New tickets from run-019f628f audit ($5.45 churn-CSV run, CSV verified correct vs prod): **PHO-13733** (High: document entire admin tool surface — filter semantics/caveats/cross-refs; run burned ~$2.50 on eligible-filter trap + discovery), **PHO-13735** (High: lifecycle_state_series churn-blind — customer_signed_kickoff_date NULL on 22/29 churned orgs, backfill via revenue_accounts.close_date or anchor fallback), **PHO-13736** (regex word-boundary "demolition"), **PHO-13737** (Low, shaping: exe.dev sandbox workspace, data-governance gate explicit).
 - **Phoebe carry-overs**: PHO-13646 rollup flag enabled — watch first nightly pulse; revoke 6 `ADMIN_AGENT_SNOWFLAKE_*` prod secrets; parked race fix `b4d5e7f9` — PR or drop.
 
+- **Default pipeline locked (Henry 2026-07-14)**: Fable (cc claude-fable-5) orchestrates → gpt-5.6-luna (cdx) implements → gpt-5.6-sol (cdx) reviews → sol findings route back through Fable, who structures steers to luna until sol passes clean → merge per repo authority. Codified in [[orchestrator-worker-protocol]] (Default role→model pipeline section + gate loop step 2). Per-ticket overrides allowed.
+
 ## Recent facts
 
 - Steer/message endpoint body field is `text` not `message` (MessageIn, main.py:1918) — 422 otherwise. Post-#89 use `wiki agent steer` instead.

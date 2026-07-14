@@ -9,7 +9,9 @@ updated: 2026-07-14
 Todo:
 
 - [P2] wiki: compact mermaid artifact preview illegible for large diagrams — styles.css:6684 caps svg at 400px, scale-to-fit squeezes text to ~3px; fix = crop + click-to-inspect or min-scale floor (pan/zoom detail exists). File as WIKI ticket when Linear reauthed
-- [P1] WIKI-115: cdx workers' render_artifact invisible in session view — codex normalizer (agent_runtime/normalizer.py:91-115) maps item/completed uniformly, never emits kind=artifact for mcpToolCall server=wiki_artifacts; frontend session.tsx:1452 only renders kind=artifact. cc path fine (transcripts.py _complete_artifact). Repro: archived TEST-1 run a2a4ff74 seq 200 (~/me/fun/agent-archive/TEST-1/20260714-181129/events.jsonl)
+- [P2] WIKI-116: render_artifact accepts syntactically-invalid mermaid silently — worker got success, Henry got 'lexical error on line 79'. Validate mermaid at render time (mermaid.parse in frontend-side check is too late; consider bundled mmdc/headless parse in MCP server) OR feed render errors back into session so agents self-correct. Found via TEST-1 artifact (unquoted [/tmp/... label = trapezoid syntax)
+- [P2] WIKI-117: test_wiki_artifacts_server role tests inherit WIKI_AGENT_ROLE from environment — fails on untouched main when run from an orchestrator session (worker tools/list shows fleet ops). Tests must clear/pin WIKI_AGENT_ROLE + WIKI_AGENT_ID. Found during #91 gate
+- [P3] WIKI-118: #91 hardening follow-ups from gate review — (M) dedupe artifact events by artifact_id in transcripts parse state (raw function_call pair could double-render); (L) completed-but-unparseable sentinel mislabeled 'rejected'; (L) assert in prod path stripped under -O; (L) artifact_from_text skips _validate_text_payload on write path (worker-forged oversized bodies); (L) missing write-time failed-render normalizer test
 
 In Progress:
 
@@ -19,6 +21,8 @@ In Progress:
 - [P3] [PHO-13367](https://linear.app/phoebework/issue/PHO-13367): fix Slack admin agent shifts-filled-through-Phoebe miscount (scope to callout, dedupe unique shift) — cdx:PHO-13367 worker
 - [P4] [PHO-13368](https://linear.app/phoebework/issue/PHO-13368): admin agent run events monospace font — cc:PHO-13368 worker
 - [P2] [PHO-13669](https://linear.app/phoebework/issue/PHO-13669): Core email/account-book gaps — cdx:PHO-13669 (gpt-5.6-terra)
+- PHO-13735 lifecycle_state_series anchor fallback (worker cc:PHO-13735, run e09cf8ec)
+- PHO-13736 customer-predicate regex word-boundary (worker cc:PHO-13736, run 464aa533)
 
 Backlog:
 
