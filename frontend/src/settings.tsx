@@ -456,11 +456,12 @@ export function detectFontWeights(family: string): number[] {
     const detected = [...bySignature.values()]
       // When CSS has declared faces (bundled and dynamically loaded fonts),
       // reject a canvas-only signature: it is browser synthesis, not a face.
-      .filter((weights) => declared.size === 0 || weights.some((weight) => declared.has(weight)))
+      .filter((weights) => weights.some((weight) => declared.has(weight)))
       .map((weights) => groupWeight(weights, declared))
       .sort((left, right) => left - right);
-    WEIGHT_CACHE.set(family, detected);
-    return detected;
+    const result = detected.length > 0 ? detected : [400];
+    WEIGHT_CACHE.set(family, result);
+    return result;
   } catch {
     return [400];
   }
@@ -651,7 +652,9 @@ function FontRoleRow({ role }: { role: FontRole }) {
       const nextWeight = nextWeights.includes(savedWeight ?? 400)
         ? savedWeight ?? 400
         : preferredWeight(nextWeights);
-      if (savedWeight !== null && savedWeight !== nextWeight) setFontWeight(role, null);
+      if (savedWeight !== nextWeight && (savedWeight !== null || nextWeight !== 400)) {
+        setFontWeight(role, nextWeight);
+      }
       setWeights(nextWeights);
       setWeight(nextWeight);
     });

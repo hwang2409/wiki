@@ -29,6 +29,32 @@ try {
   await page.goto(`${backend.baseUrl}/`, { waitUntil: "domcontentloaded" });
   await page.getByLabel("Settings").waitFor();
   await page.getByLabel("Settings").click();
+  const defaults = await page.evaluate(() => {
+    const modal = document.querySelector(".settings-modal");
+    const preview = document.createElement("div");
+    preview.className = "markdown-preview-view";
+    preview.innerHTML = "<strong><code>inline code</code></strong>";
+    document.body.append(preview);
+    const codeWeight = getComputedStyle(preview.querySelector("code")).fontWeight;
+    preview.remove();
+    return {
+      codeWeight,
+      interface: document.documentElement.style.getPropertyValue("--font-interface-weight"),
+      text: document.documentElement.style.getPropertyValue("--font-text-weight"),
+      mono: document.documentElement.style.getPropertyValue("--font-monospace-weight"),
+      width: modal?.clientWidth,
+      scrollWidth: modal?.scrollWidth,
+    };
+  });
+  if (defaults.codeWeight !== "600") {
+    throw new Error(`Default bold inline code changed to ${defaults.codeWeight}`);
+  }
+  if (defaults.interface || defaults.text || defaults.mono) {
+    throw new Error(`Default font weights should be unset: ${JSON.stringify(defaults)}`);
+  }
+  if (defaults.width !== defaults.scrollWidth) {
+    throw new Error(`Settings modal overflowed: ${defaults.width} clientWidth vs ${defaults.scrollWidth} scrollWidth`);
+  }
 
   const monoPicker = page.locator(".font-picker").nth(2);
   await monoPicker.getByRole("button").click();
@@ -41,6 +67,15 @@ try {
   const weights = await monoWeight.locator("option").evaluateAll((options) => options.map((option) => option.value));
   if (!weights.includes("400") || !weights.includes("700")) {
     throw new Error(`Expected bundled Consolas faces to expose Regular and Bold, saw ${weights.join(", ")}`);
+  }
+  const selectedLayout = await page.locator(".settings-modal").evaluate((modal) => ({
+    width: modal.clientWidth,
+    scrollWidth: modal.scrollWidth,
+  }));
+  if (selectedLayout.width !== selectedLayout.scrollWidth) {
+    throw new Error(
+      `Weight selector overflowed settings: ${selectedLayout.width} clientWidth vs ${selectedLayout.scrollWidth} scrollWidth`
+    );
   }
 
   await monoPicker.getByRole("button").click();
@@ -106,6 +141,23 @@ try {
     .evaluateAll((options) => options.map((option) => option.value));
   if (!availableAfterChange.includes(selectedAfterChange)) {
     throw new Error("Family change left an invalid selected weight");
+  }
+  const appliedAfterChange = await page.evaluate(() =>
+    document.documentElement.style.getPropertyValue("--font-monospace-weight")
+  );
+  if (appliedAfterChange !== selectedAfterChange) {
+    throw new Error(`Family reset displayed ${selectedAfterChange} but applied ${appliedAfterChange || "nothing"}`);
+  }
+
+  await page.evaluate(() => {
+    localStorage.setItem("wiki-mono-font", "Andale Mono");
+    localStorage.removeItem("wiki-mono-font-weight");
+  });
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.getByLabel("Settings").waitFor();
+  await page.getByLabel("Settings").click();
+  if (await page.getByLabel("Monospace font weight").count()) {
+    throw new Error("Single detected weight should hide the selector");
   }
   if (errors.length) throw new Error(errors.join("\n"));
 
