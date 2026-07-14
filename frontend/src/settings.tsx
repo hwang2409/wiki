@@ -274,6 +274,8 @@ type FontRole = {
   fonts: FontChoice[];
   key: string;
   cssVar: string;
+  weightKey: string;
+  weightCssVar: string;
   sample: string;
 };
 
@@ -284,6 +286,8 @@ const FONT_ROLES: Record<FontRoleId, FontRole> = {
     fonts: ALL_FONTS,
     key: "wiki-ui-font",
     cssVar: "--font-interface",
+    weightKey: "wiki-ui-font-weight",
+    weightCssVar: "--font-interface-weight",
     sample: PROP_SAMPLE,
   },
   text: {
@@ -292,6 +296,8 @@ const FONT_ROLES: Record<FontRoleId, FontRole> = {
     fonts: ALL_FONTS,
     key: "wiki-text-font",
     cssVar: "--font-text",
+    weightKey: "wiki-text-font-weight",
+    weightCssVar: "--font-text-weight",
     sample: PROP_SAMPLE,
   },
   mono: {
@@ -300,6 +306,8 @@ const FONT_ROLES: Record<FontRoleId, FontRole> = {
     fonts: ALL_FONTS,
     key: "wiki-mono-font",
     cssVar: "--font-monospace",
+    weightKey: "wiki-mono-font-weight",
+    weightCssVar: "--font-monospace-weight",
     sample: MONO_SAMPLE,
   },
 };
@@ -314,12 +322,35 @@ function loadFont(choice: FontChoice): Promise<void> {
   }) as Promise<void>;
 }
 
+async function loadFontFaces(choice: FontChoice): Promise<void> {
+  await loadFont(choice);
+  if (!document.fonts) return;
+  await Promise.all(
+    WEIGHT_STOPS.map((weight) =>
+      document.fonts.load(`${weight} 72px ${quotedFamily(choice.family)}`, AVAIL_SAMPLE).catch(() => [])
+    )
+  );
+}
+
 // document.fonts.check() is optimistic — returns true for anything, so it can't
 // tell an installed system font from a missing one. Fall back to canvas metrics:
 // if "family" renders identically under monospace and serif fallbacks, the font
 // is actually installed; otherwise the fallbacks kicked in.
 const AVAIL_SAMPLE = "mmmmmmmmwwwwwwwlliOoZ01";
 const AVAIL_CACHE = new Map<string, boolean>();
+const WEIGHT_CACHE = new Map<string, number[]>();
+const WEIGHT_STOPS = [100, 200, 300, 400, 500, 600, 700, 800, 900];
+const WEIGHT_LABELS: Record<number, string> = {
+  100: "Thin",
+  200: "Extra Light",
+  300: "Light",
+  400: "Regular",
+  500: "Medium",
+  600: "Semibold",
+  700: "Bold",
+  800: "Extra Bold",
+  900: "Black",
+};
 
 function isFontInstalled(family: string): boolean {
   const cached = AVAIL_CACHE.get(family);
@@ -355,6 +386,90 @@ function isAvailable(choice: FontChoice): boolean {
   return isFontInstalled(choice.family);
 }
 
+function quotedFamily(family: string): string {
+  return `"${family.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
+}
+
+function measureWeightSignature(ctx: CanvasRenderingContext2D, family: string, weight: number): string {
+  ctx.font = `${weight} 72px ${quotedFamily(family)}`;
+  const metrics = ctx.measureText(AVAIL_SAMPLE);
+  // Advance width catches most faces. The ink bounds matter for fixed-width
+  // faces, whose advance stays constant while their real weights differ.
+  return [
+    metrics.width,
+    metrics.actualBoundingBoxLeft,
+    metrics.actualBoundingBoxRight,
+    metrics.actualBoundingBoxAscent,
+    metrics.actualBoundingBoxDescent,
+  ]
+    .map((value) => (Number.isFinite(value) ? value.toFixed(3) : ""))
+    .join("|");
+}
+
+function preferredWeight(weights: number[]): number {
+  return weights.reduce((best, weight) =>
+    Math.abs(weight - 400) < Math.abs(best - 400) ? weight : best
+  );
+}
+
+function declaredWeightStops(family: string): Set<number> {
+  const familyName = family.replaceAll('"', "");
+  const declared = new Set<number>();
+  for (const face of document.fonts) {
+    if (face.family.replaceAll('"', "") !== familyName) continue;
+    const values = [...face.weight.matchAll(/\d+/g)].map((match) => Number(match[0]));
+    if (values.length === 1 && WEIGHT_STOPS.includes(values[0])) declared.add(values[0]);
+    if (values.length >= 2) {
+      for (const stop of WEIGHT_STOPS) {
+        if (stop >= values[0] && stop <= values[1]) declared.add(stop);
+      }
+    }
+  }
+  return declared;
+}
+
+function groupWeight(weights: number[], declared: Set<number>): number {
+  const realWeights = weights.filter((weight) => declared.has(weight));
+  return preferredWeight(realWeights.length > 0 ? realWeights : weights);
+}
+
+// Canvas uses the browser's actual font selection path, unlike
+// document.fonts.check(), which says any requested family/weight is present.
+// Identical metrics map to one face, so browser fallback and repeated aliases
+// do not become fake choices. Keeping the stop nearest Regular makes a 400
+// face report as Regular rather than the first equivalent probe (100).
+export function detectFontWeights(family: string): number[] {
+  const cached = WEIGHT_CACHE.get(family);
+  if (cached) return cached;
+  try {
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return [400];
+    const bySignature = new Map<string, number[]>();
+    for (const weight of WEIGHT_STOPS) {
+      const signature = measureWeightSignature(ctx, family, weight);
+      const weights = bySignature.get(signature) ?? [];
+      weights.push(weight);
+      bySignature.set(signature, weights);
+    }
+    const declared = declaredWeightStops(family);
+    const detected = [...bySignature.values()]
+      // When CSS has declared faces (bundled and dynamically loaded fonts),
+      // reject a canvas-only signature: it is browser synthesis, not a face.
+      .filter((weights) => declared.size === 0 || weights.some((weight) => declared.has(weight)))
+      .map((weights) => groupWeight(weights, declared))
+      .sort((left, right) => left - right);
+    WEIGHT_CACHE.set(family, detected);
+    return detected;
+  } catch {
+    return [400];
+  }
+}
+
+function weightLabel(weight: number): string {
+  return WEIGHT_LABELS[weight] ?? String(weight);
+}
+
 function applySizes(body: number, ui: number, mono: number) {
   const root = document.documentElement.style;
   root.setProperty("--font-text-size", `${body}px`);
@@ -377,9 +492,21 @@ function applyFontVar(cssVar: string, choice: FontChoice) {
   void loadFont(choice);
 }
 
+function storedWeight(role: FontRole): number | null {
+  const weight = Number(localStorage.getItem(role.weightKey));
+  return WEIGHT_STOPS.includes(weight) ? weight : null;
+}
+
+function applyFontWeightVar(cssVar: string, weight: number | null) {
+  const root = document.documentElement.style;
+  if (weight === null) root.removeProperty(cssVar);
+  else root.setProperty(cssVar, String(weight));
+}
+
 export function applyStoredFonts() {
   for (const role of Object.values(FONT_ROLES)) {
     applyFontVar(role.cssVar, pickChoice(role.fonts, localStorage.getItem(role.key)));
+    applyFontWeightVar(role.weightCssVar, storedWeight(role));
   }
   applySizes(
     storedSize(BODY_SIZE_KEY, BODY_SIZE_DEFAULT),
@@ -398,15 +525,23 @@ function setFont(role: FontRole, label: string) {
   applyFontVar(role.cssVar, choice);
 }
 
+function setFontWeight(role: FontRole, weight: number | null) {
+  if (weight === null) localStorage.removeItem(role.weightKey);
+  else localStorage.setItem(role.weightKey, String(weight));
+  applyFontWeightVar(role.weightCssVar, weight);
+}
+
 function FontPicker({
   fonts,
   current,
   sample,
+  weight,
   onChange,
 }: {
   fonts: FontChoice[];
   current: string;
   sample: string;
+  weight: number;
   onChange: (label: string) => void;
 }) {
   const [open, setOpen] = useState(false);
@@ -455,7 +590,10 @@ function FontPicker({
         type="button"
         onClick={() => setOpen((o) => !o)}
       >
-        <span className="font-picker-trigger-label" style={{ fontFamily: currentChoice.stack }}>
+        <span
+          className="font-picker-trigger-label"
+          style={{ fontFamily: currentChoice.stack, fontWeight: weight }}
+        >
           {currentChoice.label}
         </span>
         <ChevronDown aria-hidden className="font-picker-trigger-chevron" size={14} />
@@ -476,13 +614,16 @@ function FontPicker({
                   setOpen(false);
                 }}
               >
-                <span className="font-picker-option-label" style={{ fontFamily: font.stack }}>
+                <span
+                  className="font-picker-option-label"
+                  style={{ fontFamily: font.stack, fontWeight: weight }}
+                >
                   {font.label}
                 </span>
                 <span
                   aria-hidden
                   className="font-picker-option-sample"
-                  style={{ fontFamily: font.stack }}
+                  style={{ fontFamily: font.stack, fontWeight: weight }}
                 >
                   {sample}
                 </span>
@@ -497,21 +638,65 @@ function FontPicker({
 
 function FontRoleRow({ role }: { role: FontRole }) {
   const [label, setLabel] = useState(() => currentLabel(role));
+  const [weights, setWeights] = useState<number[]>([]);
+  const [weight, setWeight] = useState(() => storedWeight(role) ?? 400);
+  const choice = useMemo(() => pickChoice(role.fonts, label), [role.fonts, label]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void loadFontFaces(choice).then(() => {
+      if (cancelled) return;
+      const nextWeights = detectFontWeights(choice.family);
+      const savedWeight = storedWeight(role);
+      const nextWeight = nextWeights.includes(savedWeight ?? 400)
+        ? savedWeight ?? 400
+        : preferredWeight(nextWeights);
+      if (savedWeight !== null && savedWeight !== nextWeight) setFontWeight(role, null);
+      setWeights(nextWeights);
+      setWeight(nextWeight);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [choice, role]);
+
   return (
     <div className="settings-row">
       <div className="settings-row-info">
         <div className="settings-row-name">{role.name}</div>
         <div className="settings-row-desc">{role.desc}</div>
       </div>
-      <FontPicker
-        current={label}
-        fonts={role.fonts}
-        sample={role.sample}
-        onChange={(next) => {
-          setFont(role, next);
-          setLabel(next);
-        }}
-      />
+      <div className="font-setting-controls">
+        <FontPicker
+          current={label}
+          fonts={role.fonts}
+          sample={role.sample}
+          weight={weight}
+          onChange={(next) => {
+            setFont(role, next);
+            setLabel(next);
+            setWeights([]);
+          }}
+        />
+        {weights.length > 1 ? (
+          <select
+            aria-label={`${role.name} weight`}
+            className="font-weight-picker"
+            value={weight}
+            onChange={(event) => {
+              const next = Number(event.target.value);
+              setFontWeight(role, next);
+              setWeight(next);
+            }}
+          >
+            {weights.map((option) => (
+              <option key={option} value={option}>
+                {weightLabel(option)}
+              </option>
+            ))}
+          </select>
+        ) : null}
+      </div>
     </div>
   );
 }
@@ -591,11 +776,17 @@ export function SettingsModal({
           </div>
           <FontRoleRow role={FONT_ROLES.ui} />
           <FontRoleRow role={FONT_ROLES.text} />
-          <div className="settings-preview" style={{ fontFamily: "var(--font-text)" }}>
+          <div
+            className="settings-preview"
+            style={{ fontFamily: "var(--font-text)", fontWeight: "var(--font-text-weight)" }}
+          >
             The quick brown fox jumps over the lazy dog — 0123456789
           </div>
           <FontRoleRow role={FONT_ROLES.mono} />
-          <div className="settings-preview" style={{ fontFamily: "var(--font-monospace)" }}>
+          <div
+            className="settings-preview"
+            style={{ fontFamily: "var(--font-monospace)", fontWeight: "var(--font-monospace-weight)" }}
+          >
             wiki agent register PHO-1234 --orch phoebe {"->"} 0O1lI| fi ff
           </div>
           <div className="settings-row">

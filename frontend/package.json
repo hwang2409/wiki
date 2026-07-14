@@ -10,6 +10,7 @@
     "dev": "vite --host 0.0.0.0",
     "test": "node --test tests/session-performance.unit.mjs && node tests/wiki-94-session-performance.playwright.mjs && node tests/native-transcript-surfaces.playwright.mjs && node tests/ask-user-question-multi-select.playwright.mjs && node tests/wiki59-shiki.playwright.mjs && node tests/wiki87-code-overflow.playwright.mjs && node tests/session-model-footer.playwright.mjs && node tests/replace-agent-modal.playwright.mjs && node tests/dead-archive.playwright.mjs && node tests/wiki-85-artifacts.playwright.mjs && node tests/wiki-92-artifact-panel.playwright.mjs && node tests/wiki-89-artifact-callability.playwright.mjs && node tests/wiki-93-optimistic-send.playwright.mjs && node tests/wiki-96-composer-reconcile.playwright.mjs && node tests/wiki-97-transcript-markdown.playwright.mjs && node tests/wiki-98-raw-html.playwright.mjs",
     "test:unit": "node --test tests/session-performance.unit.mjs",
+    "test:wiki-105": "node tests/wiki-105-font-weights.playwright.mjs",
     "build": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.node.json --noEmit && vite build",
     "preview": "vite preview"
   },
