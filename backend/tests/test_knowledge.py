@@ -490,6 +490,8 @@ class KnowledgeCliIsolationTests(unittest.TestCase):
                 "WIKI_AGENT_RUNTIME_DIR": str(runtime),
                 "WIKI_AGENT_ARCHIVE_DIR": str(archive),
                 "WIKI_AGENT_REGISTRY_PATH": str(root / "agent-registry.json"),
+                "WIKI_AGENT_STATUS_DIR": str(root / "status"),
+                "WIKI_AGENT_TMP_DIR": str(root / "agent-tmp"),
             }
 
             rebuild = subprocess.run(
