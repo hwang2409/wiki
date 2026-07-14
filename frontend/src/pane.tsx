@@ -76,13 +76,15 @@ export function WorkspacePane({
   onRestartTerminal?: (terminalId: string) => void;
   overlayContent?: ReactNode;
   paneStateKey: string;
-  path: string;
+  path: string | null;
   refreshTick: number;
   scrollRef?: RefObject<HTMLDivElement | null>;
   terminalLaunchNonce?: number;
 }) {
   let content: ReactNode;
-  if (path.startsWith("agent://")) {
+  if (path === null) {
+    content = <BlankPane />;
+  } else if (path.startsWith("agent://")) {
     content = (
       <AgentPane
         agentPanel={agentPanel}
@@ -133,6 +135,15 @@ export function WorkspacePane({
         </div>
       ) : null}
     </div>
+  );
+}
+
+function BlankPane() {
+  return (
+    <section className="blank-pane" data-new-pane="true">
+      <div className="blank-pane-title">New pane</div>
+      <div className="blank-pane-hint">Cmd+K to move a live session here</div>
+    </section>
   );
 }
 

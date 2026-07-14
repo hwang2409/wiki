@@ -61,6 +61,7 @@ open src-tauri/target/release/bundle/macos/Wiki.app
 | `C-a h` / `l` | Previous / next window |
 | `C-a 0`–`9` | Jump to window slot |
 | `C-a w` | Open the run / open-note chooser |
+| `C-a p` | Split the focused pane with a blank pane |
 | `C-a x` | Close the focused pane |
 | `C-a z` | Zoom / unzoom the focused pane |
 | `C-a ,` | Settings |
