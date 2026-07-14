@@ -483,6 +483,37 @@ class AgentWatchTests(unittest.TestCase):
             self.assertEqual(sum(event["merge_ready"] for event in statuses), 1)
             self.assertEqual(polls, 7)
 
+    def test_watch_uses_remote_status_after_first_poll_when_no_local_file_exists(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            status_dir = tmp_path / "status"
+            status_dir.mkdir()
+            polls = 0
+
+            def responder(path: str) -> tuple[int, dict]:
+                nonlocal polls
+                if path.startswith("/api/agents/WIKI-103/events"):
+                    return 200, {"events": []}
+                polls += 1
+                worker = self._worker()
+                if polls == 1:
+                    worker.update({"state": "working", "step": "first"})
+                else:
+                    worker.update({"state": "merge-ready", "step": "ready"})
+                return 200, {"workers": [worker]}
+
+            with _WatchApi(responder) as api:
+                proc = self._run(
+                    ["agent", "watch", "WIKI-103", "--json", "--interval", "0", "--until", "merge-ready"],
+                    {**os.environ, "WIKI_AGENT_STATUS_DIR": str(status_dir), "WIKI_BACKEND_URL": api.url},
+                )
+
+            self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+            statuses = [json.loads(line) for line in proc.stdout.splitlines() if json.loads(line)["kind"] == "status"]
+            self.assertEqual([event["step"] for event in statuses], ["first", "ready"])
+            self.assertTrue(statuses[-1]["merge_ready"])
+            self.assertEqual(polls, 2)
+
     def test_watch_until_terminal_and_stall(self) -> None:
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

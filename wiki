@@ -789,6 +789,7 @@ def cmd_agent_watch(args: argparse.Namespace) -> None:
     previous_terminal: object = unseen
     last_merge_ready_signature: str | None = None
     last_pr_url: str | None = None
+    local_status_seen = False
     found_worker = False
     backend_down = False
 
@@ -848,7 +849,9 @@ def cmd_agent_watch(args: argparse.Namespace) -> None:
             previous_runtime = runtime
 
         status = _watch_status(ticket)
-        if status is None and previous_status is unseen:
+        if status is not None:
+            local_status_seen = True
+        if status is None and not local_status_seen:
             # Keep compatibility with remote backends that expose their own
             # status directory while still treating the local file as source
             # of truth when it is present.
