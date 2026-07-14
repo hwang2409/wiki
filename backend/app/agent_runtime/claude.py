@@ -156,18 +156,24 @@ class ClaudeStreamAdapter(ProviderAdapter):
         self.env = child_env
         self.command = command_tuple(command)
         server_command = artifact_server_command()
+        server_env = {
+            "WIKI_AGENT_RUNTIME_DIR": child_env["WIKI_AGENT_RUNTIME_DIR"],
+            "WIKI_RUN_ID": record.run_id,
+        }
+        for key in (
+            "WIKI_KNOWLEDGE_DB_PATH",
+            "WIKI_VAULT_DIR",
+            "WIKI_AGENT_ARCHIVE_DIR",
+        ):
+            if child_env.get(key):
+                server_env[key] = child_env[key]
         self.artifact_mcp_config = json.dumps(
             {
                 "mcpServers": {
                     "wiki-artifacts": {
                         "command": server_command[0],
                         "args": list(server_command[1:]),
-                        "env": {
-                            "WIKI_AGENT_RUNTIME_DIR": child_env[
-                                "WIKI_AGENT_RUNTIME_DIR"
-                            ],
-                            "WIKI_RUN_ID": record.run_id,
-                        },
+                        "env": server_env,
                     }
                 }
             },

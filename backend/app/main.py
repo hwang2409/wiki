@@ -18,7 +18,17 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
-from . import accounts, github_pr, github_preview, terminal, tokens, transcripts, uistate, vaultops
+from . import (
+    accounts,
+    github_pr,
+    github_preview,
+    knowledge,
+    terminal,
+    tokens,
+    transcripts,
+    uistate,
+    vaultops,
+)
 from .agent_models import (
     default_model_for_kind,
     is_model_allowed,
@@ -46,13 +56,31 @@ VAULT_DIR.mkdir(parents=True, exist_ok=True)
 async def lifespan(_app: FastAPI):
     terminal.refresh_boot_token()
     dispatcher_task, watchdog_task, token_task = await _start_dispatcher()
+    runtime_paths = RuntimePaths.from_env()
+    knowledge_task = asyncio.create_task(
+        knowledge.background_index_loop(
+            knowledge.KnowledgePaths.from_env(
+                runtime_dir=runtime_paths.runtime_dir,
+                archive_dir=runtime_paths.archive_dir,
+                vault_dir=VAULT_DIR,
+            )
+        ),
+        name="wiki-knowledge-indexer",
+    )
     try:
         yield
     finally:
         dispatcher_task.cancel()
         watchdog_task.cancel()
         token_task.cancel()
-        await asyncio.gather(dispatcher_task, watchdog_task, token_task, return_exceptions=True)
+        knowledge_task.cancel()
+        await asyncio.gather(
+            dispatcher_task,
+            watchdog_task,
+            token_task,
+            knowledge_task,
+            return_exceptions=True,
+        )
         await asyncio.to_thread(terminal.TERMINAL_MANAGER.close_all)
 
 
@@ -2830,7 +2858,9 @@ def create_note(payload: NoteCreate) -> Note:
     target = resolve_note_path(note_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(normalize_content(title, payload.content), encoding="utf-8")
-    return to_note(target)
+    note = to_note(target)
+    knowledge.enqueue_refresh(runtime_dir=RuntimePaths.from_env().runtime_dir)
+    return note
 
 
 class RenameRequest(BaseModel):
@@ -2844,6 +2874,7 @@ def rename(payload: RenameRequest) -> dict[str, object]:
         changed = vaultops.rename_note(VAULT_DIR, payload.path, payload.new_path)
     except vaultops.VaultOpError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    knowledge.enqueue_refresh(runtime_dir=RuntimePaths.from_env().runtime_dir)
     return {"path": changed[0], "changed": changed}
 
 
@@ -2853,6 +2884,7 @@ def delete_note(note_path: str) -> dict[str, object]:
         changed = vaultops.delete_note(VAULT_DIR, note_path)
     except vaultops.VaultOpError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    knowledge.enqueue_refresh(runtime_dir=RuntimePaths.from_env().runtime_dir)
     return {"deleted": changed[0], "changed": changed}
 
 
@@ -2867,7 +2899,9 @@ def update_note(note_path: str, payload: NoteUpdate) -> Note:
         raise HTTPException(status_code=413, detail="Note is too large")
 
     target.write_text(f"{content}\n", encoding="utf-8")
-    return to_note(target)
+    note = to_note(target)
+    knowledge.enqueue_refresh(runtime_dir=RuntimePaths.from_env().runtime_dir)
+    return note
 
 
 class AccountRotateIn(BaseModel):

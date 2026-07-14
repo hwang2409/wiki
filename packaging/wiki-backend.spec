@@ -42,6 +42,7 @@ hiddenimports = (
     + collect_submodules("uvicorn")
     + [
         "backend.app.agent_runtime.daemon",
+        "backend.app.knowledge",
         "backend.app.wiki_artifacts",
         "backend.app.frontend_static",
         "backend.app.main",

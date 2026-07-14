@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+from . import knowledge
+
 
 TEXT_LIMIT = 100_000
 IMAGE_LIMIT = 5 * 1024 * 1024
@@ -47,6 +49,24 @@ TOOL_SCHEMA: dict[str, Any] = {
         "title": {"type": "string", "maxLength": 200},
         "caption": {"type": "string", "maxLength": 500},
         "payload": {"type": "object"},
+    },
+}
+
+SEARCH_TOOL_DESCRIPTION = (
+    "Search durable Wiki knowledge across vault notes and Wiki-managed fleet run "
+    "history. Returns ranked snippets with note-path or run-id/event-sequence citations."
+)
+SEARCH_TOOL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["query"],
+    "properties": {
+        "query": {"type": "string", "minLength": 1},
+        "ticket": {"type": "string"},
+        "kind": {"enum": ["note", "run"]},
+        "type": {"type": "string"},
+        "since": {"type": "string", "format": "date"},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 100},
     },
 }
 
@@ -283,6 +303,52 @@ def _tool_result(request_id: Any, arguments: Any) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
 
+def search_knowledge(arguments: Any) -> dict[str, Any]:
+    if not isinstance(arguments, dict):
+        raise knowledge.KnowledgeQueryError("tool input must be an object")
+    extra = set(arguments) - {"query", "ticket", "kind", "type", "since", "limit"}
+    if extra:
+        raise knowledge.KnowledgeQueryError(f"unknown field: {sorted(extra)[0]}")
+    query = arguments.get("query")
+    if not isinstance(query, str) or not query.strip():
+        raise knowledge.KnowledgeQueryError("query must be a non-empty string")
+    limit = arguments.get("limit", 20)
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise knowledge.KnowledgeQueryError("limit must be an integer")
+    for field in ("ticket", "kind", "type", "since"):
+        if field in arguments and not isinstance(arguments[field], str):
+            raise knowledge.KnowledgeQueryError(f"{field} must be a string")
+    return knowledge.KnowledgeIndex.from_env().search(
+        query,
+        ticket=arguments.get("ticket"),
+        kind=arguments.get("kind"),
+        event_type=arguments.get("type"),
+        since=arguments.get("since"),
+        limit=limit,
+    )
+
+
+def _knowledge_tool_result(request_id: Any, arguments: Any) -> dict[str, Any]:
+    try:
+        payload = search_knowledge(arguments)
+    except (knowledge.KnowledgeError, OSError) as exc:
+        result = {
+            "content": [{"type": "text", "text": f"knowledge search failed: {exc}"}],
+            "isError": True,
+        }
+    else:
+        result = {
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                }
+            ],
+            "structuredContent": payload,
+        }
+    return {"jsonrpc": "2.0", "id": request_id, "result": result}
+
+
 def _response(message: dict[str, Any]) -> dict[str, Any] | None:
     method = message.get("method")
     request_id = message.get("id")
@@ -309,7 +375,12 @@ def _response(message: dict[str, Any]) -> dict[str, Any] | None:
                         "name": "render_artifact",
                         "description": TOOL_DESCRIPTION,
                         "inputSchema": TOOL_SCHEMA,
-                    }
+                    },
+                    {
+                        "name": "search_knowledge",
+                        "description": SEARCH_TOOL_DESCRIPTION,
+                        "inputSchema": SEARCH_TOOL_SCHEMA,
+                    },
                 ]
             },
         }
@@ -317,6 +388,8 @@ def _response(message: dict[str, Any]) -> dict[str, Any] | None:
         params = message.get("params") or {}
         if params.get("name") == "render_artifact":
             return _tool_result(request_id, params.get("arguments"))
+        if params.get("name") == "search_knowledge":
+            return _knowledge_tool_result(request_id, params.get("arguments"))
         return {
             "jsonrpc": "2.0",
             "id": request_id,

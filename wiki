@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import json
 import os
 import re
 import subprocess
@@ -26,8 +27,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "backend" / "app"))
 import vaultops  # noqa: E402
+import knowledge  # noqa: E402
 
-VAULT = Path(__file__).resolve().parent / "vault"
+VAULT = Path(
+    os.environ.get("WIKI_VAULT_DIR") or Path(__file__).resolve().parent / "vault"
+).expanduser().absolute()
 TODO = VAULT / "todo.md"
 DONE = VAULT / "log" / "done.md"
 MAP = VAULT / "map.md"
@@ -713,6 +717,77 @@ def cmd_lint(_args: argparse.Namespace) -> None:
     print(f"vault clean — 0 errors, {len(set(warnings))} warning(s)")
 
 
+def _knowledge_index() -> knowledge.KnowledgeIndex:
+    return knowledge.KnowledgeIndex.from_env(vault_dir=VAULT)
+
+
+def cmd_search(args: argparse.Namespace) -> None:
+    try:
+        result = _knowledge_index().search(
+            args.query,
+            ticket=args.ticket,
+            kind=args.kind,
+            event_type=args.event_type,
+            since=args.since,
+            limit=args.limit,
+        )
+    except knowledge.KnowledgeQueryError as exc:
+        fail(str(exc))
+    except knowledge.KnowledgeUnavailable as exc:
+        fail(f"knowledge database unavailable: {exc}")
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return
+    if result["rebuilding"]:
+        print("knowledge index is rebuilding; results may be partial", file=sys.stderr)
+    for row in result["results"]:
+        print(f"{row['citation']}  score={row['score']:.8f}")
+        snippet = str(row.get("snippet") or "").strip()
+        if snippet:
+            print(f"  {snippet}")
+
+
+def cmd_links_backlinks(args: argparse.Namespace) -> None:
+    try:
+        result = _knowledge_index().backlinks(args.note)
+    except knowledge.KnowledgeQueryError as exc:
+        fail(str(exc))
+    except knowledge.KnowledgeUnavailable as exc:
+        fail(f"knowledge database unavailable: {exc}")
+    for path in result["backlinks"]:
+        print(path)
+
+
+def cmd_links_orphans(_args: argparse.Namespace) -> None:
+    try:
+        result = _knowledge_index().orphans()
+    except knowledge.KnowledgeQueryError as exc:
+        fail(str(exc))
+    except knowledge.KnowledgeUnavailable as exc:
+        fail(f"knowledge database unavailable: {exc}")
+    for path in result["orphans"]:
+        print(path)
+
+
+def cmd_links_unresolved(_args: argparse.Namespace) -> None:
+    try:
+        result = _knowledge_index().unresolved()
+    except knowledge.KnowledgeQueryError as exc:
+        fail(str(exc))
+    except knowledge.KnowledgeUnavailable as exc:
+        fail(f"knowledge database unavailable: {exc}")
+    for row in result["unresolved"]:
+        print(f"{row['src_note']} -> [[{row['dst_name']}]]")
+
+
+def cmd_index_rebuild(_args: argparse.Namespace) -> None:
+    try:
+        stats = _knowledge_index().rebuild()
+    except knowledge.KnowledgeError as exc:
+        fail(f"knowledge database unavailable: {exc}")
+    print(json.dumps(stats.to_dict(), sort_keys=True))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="wiki", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -724,20 +799,20 @@ def main() -> None:
     add.add_argument("text")
     add.add_argument("--priority", help="P0/P1/P2 — prepended as [Pn]")
     add.add_argument("--section", default="Todo", help='default "Todo"')
-    add.set_defaults(func=cmd_todo_add)
+    add.set_defaults(func=cmd_todo_add, refresh_knowledge=True)
 
     move = todo_sub.add_parser("move", help="move an item between sections")
     move.add_argument("match", help="unique substring of the item")
     move.add_argument("--to", required=True, help="target section")
-    move.set_defaults(func=cmd_todo_move)
+    move.set_defaults(func=cmd_todo_move, refresh_knowledge=True)
 
     complete = todo_sub.add_parser("complete", help="remove item + log to done.md")
     complete.add_argument("match", help="unique substring of the item")
-    complete.set_defaults(func=cmd_todo_complete)
+    complete.set_defaults(func=cmd_todo_complete, refresh_knowledge=True)
 
     log_done = sub.add_parser("log-done", help="append a dated line to log/done.md")
     log_done.add_argument("text")
-    log_done.set_defaults(func=cmd_log_done)
+    log_done.set_defaults(func=cmd_log_done, refresh_knowledge=True)
 
     note = sub.add_parser("note", help="note operations")
     note_sub = note.add_subparsers(dest="note_command", required=True)
@@ -747,18 +822,18 @@ def main() -> None:
     new.add_argument("--hook", required=True, help="one-line map.md hook")
     new.add_argument("--title")
     new.add_argument("--tags", help="comma-separated; defaults to topic")
-    new.set_defaults(func=cmd_note_new)
+    new.set_defaults(func=cmd_note_new, refresh_knowledge=True)
 
     rename = note_sub.add_parser(
         "rename", help="move/rename note; rewrites [[wikilinks]] + map.md if slug changes"
     )
     rename.add_argument("old", help="current <topic>/<slug>")
     rename.add_argument("new", help="new <topic>/<slug>")
-    rename.set_defaults(func=cmd_note_rename)
+    rename.set_defaults(func=cmd_note_rename, refresh_knowledge=True)
 
     delete = note_sub.add_parser("delete", help="hard-delete note + prune map line (git = undo)")
     delete.add_argument("path", help="<topic>/<slug>")
-    delete.set_defaults(func=cmd_note_delete)
+    delete.set_defaults(func=cmd_note_delete, refresh_knowledge=True)
 
     agent = sub.add_parser("agent", help="worker registry ops (/tmp/agent-registry.json)")
     agent_sub = agent.add_subparsers(dest="agent_command", required=True)
@@ -824,8 +899,37 @@ def main() -> None:
     lint = sub.add_parser("lint", help="validate vault conventions")
     lint.set_defaults(func=cmd_lint)
 
+    search = sub.add_parser("search", help="search indexed vault notes and fleet runs")
+    search.add_argument("query")
+    search.add_argument("--ticket")
+    search.add_argument("--kind", choices=("note", "run"))
+    search.add_argument("--type", dest="event_type", help="normalized event type")
+    search.add_argument("--since", help="YYYY-MM-DD")
+    search.add_argument("--limit", type=int, default=20)
+    search.add_argument("--json", action="store_true")
+    search.set_defaults(func=cmd_search)
+
+    links = sub.add_parser("links", help="query the indexed wikilink graph")
+    links_sub = links.add_subparsers(dest="links_command", required=True)
+    backlinks = links_sub.add_parser("backlinks", help="list notes linking to a note")
+    backlinks.add_argument("note")
+    backlinks.set_defaults(func=cmd_links_backlinks)
+    orphans = links_sub.add_parser("orphans", help="list notes with no backlinks")
+    orphans.set_defaults(func=cmd_links_orphans)
+    unresolved = links_sub.add_parser("unresolved", help="list unresolved wikilinks")
+    unresolved.set_defaults(func=cmd_links_unresolved)
+
+    index = sub.add_parser("index", help="manage the rebuildable knowledge index")
+    index_sub = index.add_subparsers(dest="index_command", required=True)
+    rebuild = index_sub.add_parser("rebuild", help="drop and rebuild the full index")
+    rebuild.set_defaults(func=cmd_index_rebuild)
+
     args = parser.parse_args()
     args.func(args)
+    if getattr(args, "refresh_knowledge", False):
+        # The transactional operation has already completed and printed its
+        # response. This only enqueues work for the backend indexer.
+        knowledge.enqueue_refresh(runtime_dir=os.environ.get("WIKI_AGENT_RUNTIME_DIR"))
 
 
 if __name__ == "__main__":
