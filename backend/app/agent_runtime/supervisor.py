@@ -20,6 +20,7 @@ from .process import (
     orphaned_provider_process,
     terminate_detached_provider_pid,
 )
+from .runtime_card import inject_runtime_card
 from .provider import AdapterStatus, ProviderAdapter, ProviderEvent, StartRequest
 from .store import RunNotFound, RunStore, StoreConflict
 from .types import (
@@ -1162,6 +1163,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         effort: str | None = None,
         orchestrator_id: str | None = None,
         migrate_legacy: bool = False,
+        backend_base_url: str | None = None,
     ) -> RunRecord:
         resolved = resolve_safe_worktree(worktree)
         record = RunRecord.new(
@@ -1173,7 +1175,14 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             prompt=prompt,
             effort=effort,
             orchestrator_id=orchestrator_id,
+            backend_base_url=backend_base_url,
         )
+        prompt = inject_runtime_card(
+            record,
+            prompt,
+            status_path=self.store.status_path(record.agent_id),
+        )
+        record.initial_prompt = prompt
         if provider is ProviderKind.CODEX:
             self._assert_codex_fleet_available()
             async with self.codex_fleet_lock:
@@ -2226,6 +2235,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         model: str | None = None,
         provider: ProviderKind | None = None,
         effort: str | None = None,
+        backend_base_url: str | None = None,
     ) -> RunRecord:
         old = self.store.get(run_id)
         target_provider = provider or old.provider
@@ -2240,6 +2250,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         model,
                         target_provider,
                         effort if provider is not None else old.effort,
+                        backend_base_url,
                     )
         else:
             async with self._run_lock(run_id):
@@ -2249,6 +2260,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     model,
                     target_provider,
                     effort if provider is not None else old.effort,
+                    backend_base_url,
                 )
         if old.model != replacement.model:
             self._append_model_changed_event(
@@ -2283,6 +2295,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         model: str | None = None,
         provider: ProviderKind | None = None,
         effort: str | None = None,
+        backend_base_url: str | None = None,
     ) -> RunRecord:
         old = self.store.get(run_id)
         if not self.store.is_current(old):
@@ -2291,6 +2304,24 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         target_provider = provider or old.provider
         target_model = model or old.model
         target_effort = effort if target_provider is ProviderKind.CODEX else None
+        replacement = RunRecord.new(
+            agent_id=old.agent_id,
+            provider=target_provider,
+            role=old.role,
+            model=target_model,
+            worktree=old.worktree,
+            prompt=prompt,
+            effort=target_effort,
+            orchestrator_id=old.orchestrator_id,
+            replaces_run_id=old.run_id,
+            backend_base_url=backend_base_url or old.backend_base_url,
+        )
+        prompt = inject_runtime_card(
+            replacement,
+            prompt,
+            status_path=self.store.status_path(replacement.agent_id),
+        )
+        replacement.initial_prompt = prompt
         old_adapter = self.adapters.get(run_id)
         if old_adapter is None:
             if self.pid_alive(old.provider_pid):
@@ -2316,17 +2347,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         detail="orphan stopped for replacement",
                     ),
                 )
-            replacement = RunRecord.new(
-                agent_id=old.agent_id,
-                provider=target_provider,
-                role=old.role,
-                model=target_model,
-                worktree=old.worktree,
-                prompt=prompt,
-                effort=target_effort,
-                orchestrator_id=old.orchestrator_id,
-                replaces_run_id=old.run_id,
-            )
             self.store.replace(old.run_id, replacement)
             return await self._launch_record(replacement, prompt)
 
@@ -2337,22 +2357,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 finalize="stop",
                 suppress_operation_errors=False,
             )
-            replacement = RunRecord.new(
-                agent_id=old.agent_id,
-                provider=target_provider,
-                role=old.role,
-                model=target_model,
-                worktree=old.worktree,
-                prompt=prompt,
-                effort=target_effort,
-                orchestrator_id=old.orchestrator_id,
-                replaces_run_id=old.run_id,
-            )
             self.store.replace(old.run_id, replacement)
             return await self._launch_record(replacement, prompt)
         await self._detach_adapter(run_id, preserve_event_routes=True)
 
         try:
+            old_adapter.prepare_replacement(replacement)
             status = await old_adapter.replace(prompt, model, target_effort)
         except Exception as exc:
             await self._close_and_drain_adapter(run_id, old_adapter)
@@ -2375,17 +2385,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             await self._publish_agent_change(old.agent_id)
             raise
 
-        replacement = RunRecord.new(
-            agent_id=old.agent_id,
-            provider=target_provider,
-            role=old.role,
-            model=target_model,
-            worktree=old.worktree,
-            prompt=prompt,
-            effort=target_effort,
-            orchestrator_id=old.orchestrator_id,
-            replaces_run_id=old.run_id,
-        )
         # The replacement run file is the crash-recovery authority. Seed it
         # with live provider identity before the multi-file registry swap, so
         # reconciliation can exact-session resume after a partial commit.
@@ -2571,6 +2570,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 effort=params.get("effort"),
                 orchestrator_id=params.get("orchestrator_id"),
                 migrate_legacy=migrate_legacy,
+                backend_base_url=params.get("backend_base_url"),
             )
             result = _public_run(record)
             active_worker_count = self._active_worker_count()
@@ -2653,6 +2653,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     params.get("model"),
                     ProviderKind(provider) if provider is not None else None,
                     params.get("effort"),
+                    params.get("backend_base_url"),
                 )
             )
         if method == "run/respond":

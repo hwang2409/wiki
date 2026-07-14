@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -12,6 +13,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from uuid import UUID
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -413,6 +415,274 @@ class _WatchApi:
     @property
     def url(self) -> str:
         return f"http://127.0.0.1:{self.server.server_port}"
+
+
+class _AgentControlApi:
+    def __init__(self):
+        self.requests: list[tuple[str, str, dict | None]] = []
+        self.current: dict[str, dict] = {}
+        self.spawn_results: dict[str, dict] = {}
+        self.provider_starts = 0
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def _reply(self, status: int, payload: dict) -> None:
+                encoded = json.dumps(payload).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler API
+                owner.requests.append(("GET", self.path, None))
+                if self.path == "/health":
+                    self._reply(200, {"status": "ok"})
+                    return
+                if self.path == "/api/agents":
+                    workers = [
+                        {
+                            "ticket": ticket,
+                            "run_id": row["run_id"],
+                            "runtime_state": row["state"],
+                            "state": row["state"],
+                            "role": row["role"],
+                            "kind": row["kind"],
+                        }
+                        for ticket, row in sorted(owner.current.items())
+                    ]
+                    self._reply(200, {"workers": workers, "orchestrators": []})
+                    return
+                self._reply(404, {"detail": "not found"})
+
+            def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler API
+                length = int(self.headers.get("Content-Length") or 0)
+                payload = json.loads(self.rfile.read(length) or b"{}")
+                owner.requests.append(("POST", self.path, payload))
+                if self.path == "/api/agents/spawn":
+                    request_id = payload["request_id"]
+                    result = owner.spawn_results.get(request_id)
+                    if result is None:
+                        owner.provider_starts += 1
+                        result = {
+                            "run_id": f"00000000-0000-4000-8000-{owner.provider_starts:012d}",
+                            "window": None,
+                        }
+                        owner.spawn_results[request_id] = result
+                        owner.current[payload["ticket"]] = {
+                            "run_id": result["run_id"],
+                            "state": "working",
+                            "role": payload["role"],
+                            "kind": payload["kind"],
+                        }
+                    self._reply(200, result)
+                    return
+                if self.path == "/api/agents/spawn-orchestrator":
+                    request_id = payload["request_id"]
+                    result = owner.spawn_results.get(request_id)
+                    if result is None:
+                        owner.provider_starts += 1
+                        result = {
+                            "run_id": f"00000000-0000-4000-8000-{owner.provider_starts:012d}",
+                            "window": None,
+                        }
+                        owner.spawn_results[request_id] = result
+                        owner.current[payload["id"]] = {
+                            "run_id": result["run_id"],
+                            "state": "working",
+                            "role": "orchestrator",
+                            "kind": payload["kind"],
+                        }
+                    self._reply(200, result)
+                    return
+                match = re.fullmatch(r"/api/agents/([^/]+)/(message|replace|archive)", self.path)
+                if match:
+                    agent_id, action = match.groups()
+                    row = owner.current[agent_id]
+                    if action == "message":
+                        self._reply(200, {"status": "sent", "request_id": payload["request_id"]})
+                    elif action == "replace":
+                        row["run_id"] = "00000000-0000-4000-8000-000000000099"
+                        self._reply(200, {"run_id": row["run_id"], "model": payload.get("model")})
+                    else:
+                        row["state"] = "completed"
+                        self._reply(200, {"state": "completed", "outcome": payload["outcome"]})
+                    return
+                self._reply(404, {"detail": "not found"})
+
+            def log_message(self, _format, *_args):
+                return
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_args):
+        self.server.shutdown()
+        self.thread.join(timeout=5)
+        self.server.server_close()
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.server.server_port}"
+
+
+class AgentControlCliTests(unittest.TestCase):
+    def _run(self, args: list[str], env: dict) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(WIKI_CLI), *args],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=20,
+        )
+
+    def test_spawn_status_steer_replace_archive_round_trip_and_idempotency(self) -> None:
+        with TemporaryDirectory() as tmp, _AgentControlApi() as api:
+            root = Path(tmp)
+            prompt = root / "prompt.md"
+            prompt.write_text("Implement ticket WIKI-200", encoding="utf-8")
+            worktree = root / "worktree"
+            worktree.mkdir()
+            env = {**os.environ, "WIKI_BACKEND_URL": api.url}
+            spawn_args = [
+                "agent",
+                "spawn",
+                "WIKI-200",
+                "--kind",
+                "cdx",
+                "--role",
+                "implement",
+                "--model",
+                "gpt-5.4",
+                "--effort",
+                "high",
+                "--prompt-file",
+                str(prompt),
+                "--workdir",
+                str(worktree),
+                "--orch",
+                "wiki",
+                "--request-id",
+                "cli-spawn-1",
+            ]
+            first = self._run(spawn_args, env)
+            replay = self._run(spawn_args, env)
+            status = self._run(["agent", "status", "WIKI-200"], env)
+            steer = self._run(
+                [
+                    "agent",
+                    "steer",
+                    "WIKI-200",
+                    "--message",
+                    "Run the backend suite",
+                    "--mode",
+                    "on-idle",
+                    "--request-id",
+                    "cli-steer-1",
+                ],
+                env,
+            )
+            replace = self._run(
+                ["agent", "replace", "WIKI-200", "--model", "gpt-5.5"],
+                env,
+            )
+            archive = self._run(
+                ["agent", "archive", "WIKI-200", "--outcome", "merged"],
+                env,
+            )
+
+            for process in (first, replay, status, steer, replace, archive):
+                self.assertEqual(process.returncode, 0, msg=process.stderr)
+            self.assertEqual(json.loads(first.stdout), json.loads(replay.stdout))
+            self.assertEqual(api.provider_starts, 1)
+            self.assertEqual(json.loads(status.stdout)["run_id"], json.loads(first.stdout)["run_id"])
+            self.assertEqual(json.loads(steer.stdout)["status"], "sent")
+            self.assertEqual(json.loads(archive.stdout)["outcome"], "merged")
+
+            spawn_requests = [
+                payload
+                for method, path, payload in api.requests
+                if method == "POST" and path == "/api/agents/spawn"
+            ]
+            self.assertEqual(
+                [payload["request_id"] for payload in spawn_requests],
+                ["cli-spawn-1", "cli-spawn-1"],
+            )
+
+    def test_generated_request_id_and_discovery_file_find_live_backend(self) -> None:
+        with TemporaryDirectory() as tmp, _AgentControlApi() as api:
+            root = Path(tmp)
+            prompt = root / "prompt.md"
+            prompt.write_text("Review ticket WIKI-201", encoding="utf-8")
+            worktree = root / "worktree"
+            worktree.mkdir()
+            discovery = root / "backend-url"
+            discovery.write_text(api.url + "\n", encoding="utf-8")
+            env = {
+                key: value
+                for key, value in os.environ.items()
+                if key not in {"WIKI_BACKEND_URL", "WIKI_BACKEND_PORT"}
+            }
+            env["WIKI_BACKEND_DISCOVERY_FILE"] = str(discovery)
+            spawned = self._run(
+                [
+                    "agent",
+                    "spawn",
+                    "WIKI-201",
+                    "--kind",
+                    "cc",
+                    "--role",
+                    "review",
+                    "--model",
+                    "sonnet",
+                    "--prompt-file",
+                    str(prompt),
+                    "--workdir",
+                    str(worktree),
+                ],
+                env,
+            )
+            status = self._run(["agent", "status", "WIKI-201"], env)
+            orchestrator = self._run(
+                [
+                    "agent",
+                    "spawn",
+                    "WIKI-ORCH",
+                    "--kind",
+                    "cc",
+                    "--role",
+                    "orchestrator",
+                    "--model",
+                    "opus",
+                    "--prompt-file",
+                    str(prompt),
+                    "--workdir",
+                    str(worktree),
+                ],
+                env,
+            )
+            self.assertEqual(spawned.returncode, 0, msg=spawned.stderr)
+            self.assertEqual(status.returncode, 0, msg=status.stderr)
+            self.assertEqual(orchestrator.returncode, 0, msg=orchestrator.stderr)
+            request = next(
+                payload
+                for method, path, payload in api.requests
+                if method == "POST" and path == "/api/agents/spawn"
+            )
+            UUID(request["request_id"])
+            self.assertTrue(
+                any(
+                    method == "POST" and path == "/api/agents/spawn-orchestrator"
+                    for method, path, _ in api.requests
+                )
+            )
+            self.assertTrue(
+                any(method == "GET" and path == "/health" for method, path, _ in api.requests)
+            )
 
 
 class AgentWatchTests(unittest.TestCase):

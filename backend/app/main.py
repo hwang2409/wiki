@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from . import (
     accounts,
+    backend_runtime,
     github_pr,
     github_preview,
     knowledge,
@@ -54,6 +55,9 @@ VAULT_DIR.mkdir(parents=True, exist_ok=True)
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    configured_backend = os.environ.get("WIKI_BACKEND_URL")
+    if configured_backend:
+        backend_runtime.publish_backend_url(configured_backend)
     terminal.refresh_boot_token()
     dispatcher_task, watchdog_task, token_task = await _start_dispatcher()
     runtime_paths = RuntimePaths.from_env()
@@ -1966,6 +1970,7 @@ class SpawnOrchestratorIn(BaseModel):
     model: str = Field(..., min_length=2, max_length=64)
     effort: str | None = Field(default=None, max_length=16)
     goal: str = Field(default="", max_length=20_000)
+    request_id: str | None = Field(default=None, min_length=1, max_length=200)
 
     @model_validator(mode="after")
     def validate_kind_and_effort(self) -> SpawnOrchestratorIn:
@@ -1978,6 +1983,10 @@ class SpawnOrchestratorIn(BaseModel):
         if kind == "cc" and effort is not None:
             raise ValueError("Claude orchestrators do not accept reasoning effort")
         return self
+
+
+class AgentArchiveIn(BaseModel):
+    outcome: str = Field(pattern="^(merged|closed|abandoned)$")
 
 
 def _allowed_model_message(kind: str, model: str, *, target: str) -> str:
@@ -2106,6 +2115,16 @@ def resolve_existing_dir(raw_path: str, *, field_name: str) -> Path:
     return resolved
 
 
+def request_backend_base_url(request: Request) -> str:
+    try:
+        configured = os.environ.get("WIKI_BACKEND_URL")
+        return backend_runtime.normalize_loopback_url(
+            configured or str(request.base_url)
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 def resolve_window(ticket: str) -> str | None:
     """Live tmux window for a worker ticket or orchestrator id."""
     registry = _read_agent_registry()
@@ -2133,7 +2152,12 @@ def _headless_replacement_prompt(agent_id: str, current: dict) -> str:
     return replacement_prompt(agent_id, current, status_dir=AGENT_STATUS_DIR)
 
 
-def _control_headless_agent(agent_id: str, action: str) -> dict[str, object]:
+def _control_headless_agent(
+    agent_id: str,
+    action: str,
+    *,
+    outcome: str | None = None,
+) -> dict[str, object]:
     raw_id = agent_id.strip()
     if not raw_id or not valid_agent_id(raw_id):
         raise HTTPException(status_code=400, detail="Bad agent id")
@@ -2146,10 +2170,10 @@ def _control_headless_agent(agent_id: str, action: str) -> dict[str, object]:
             status_code=409,
             detail="Legacy tmux agents must be migrated before lifecycle control",
         )
-    result = _supervisor_request(
-        f"run/{action}",
-        {"agent_id": resolved_id},
-    )
+    params: dict[str, object] = {"agent_id": resolved_id}
+    if action == "archive":
+        params["outcome"] = outcome
+    result = _supervisor_request(f"run/{action}", params)
     if not isinstance(result, dict):
         raise HTTPException(
             status_code=502,
@@ -2174,8 +2198,15 @@ def stop_agent(agent_id: str) -> dict[str, object]:
 
 
 @app.post("/api/agents/{agent_id}/archive")
-def archive_agent(agent_id: str) -> dict[str, object]:
-    return _control_headless_agent(agent_id, "archive")
+def archive_agent(
+    agent_id: str,
+    body: AgentArchiveIn | None = None,
+) -> dict[str, object]:
+    return _control_headless_agent(
+        agent_id,
+        "archive",
+        outcome=body.outcome if body is not None else None,
+    )
 
 
 @app.post("/api/agents/{agent_id}/respond")
@@ -2215,10 +2246,11 @@ def respond_to_agent(agent_id: str, body: AgentRespondIn) -> dict[str, object]:
     return dict(result)
 
 
-@app.post("/api/agents/{agent_id}/replace")
 def replace_agent(
     agent_id: str,
     body: SpawnReplaceIn | None = None,
+    *,
+    backend_base_url: str | None = None,
 ) -> dict[str, object]:
     raw_id = agent_id.strip()
     if not raw_id or not (
@@ -2289,6 +2321,7 @@ def replace_agent(
             "provider": "codex" if kind == "cdx" else "claude",
             "model": model,
             "effort": effort,
+            "backend_base_url": backend_base_url,
         },
     )
     if not isinstance(result, dict):
@@ -2305,6 +2338,19 @@ def replace_agent(
         "model": result.get("model"),
         "registration": registration,
     }
+
+
+@app.post("/api/agents/{agent_id}/replace")
+def replace_agent_route(
+    request: Request,
+    agent_id: str,
+    body: SpawnReplaceIn | None = None,
+) -> dict[str, object]:
+    return replace_agent(
+        agent_id,
+        body,
+        backend_base_url=request_backend_base_url(request),
+    )
 
 
 @app.post("/api/agents/{ticket}/set-model")
@@ -2388,8 +2434,11 @@ def cancel_agent_model(ticket: str) -> dict[str, object]:
     return {"status": result.get("status", "canceled"), "desired_model": None}
 
 
-@app.post("/api/agents/spawn")
-def spawn_agent(body: dict[str, Any] | SpawnWorkerIn) -> dict[str, object]:
+def spawn_agent(
+    body: dict[str, Any] | SpawnWorkerIn,
+    *,
+    backend_base_url: str | None = None,
+) -> dict[str, object]:
     body = cast(SpawnWorkerIn, _coerce_request_model(body, SpawnWorkerIn))
     ticket = body.ticket.strip()
     if not ticket or not SPAWN_TICKET_PATTERN.fullmatch(ticket):
@@ -2472,6 +2521,7 @@ def spawn_agent(body: dict[str, Any] | SpawnWorkerIn) -> dict[str, object]:
             "orchestrator_id": orch or None,
             "migrate_legacy": bool(current) and not current_is_headless,
             "request_id": body.request_id,
+            "backend_base_url": backend_base_url,
         },
     )
     if not isinstance(result, dict):
@@ -2489,8 +2539,22 @@ def spawn_agent(body: dict[str, Any] | SpawnWorkerIn) -> dict[str, object]:
     return response
 
 
-@app.post("/api/agents/spawn-orchestrator")
-def spawn_orchestrator(body: dict[str, Any] | SpawnOrchestratorIn) -> dict[str, object]:
+@app.post("/api/agents/spawn")
+def spawn_agent_route(
+    request: Request,
+    body: dict[str, Any] | SpawnWorkerIn,
+) -> dict[str, object]:
+    return spawn_agent(
+        body,
+        backend_base_url=request_backend_base_url(request),
+    )
+
+
+def spawn_orchestrator(
+    body: dict[str, Any] | SpawnOrchestratorIn,
+    *,
+    backend_base_url: str | None = None,
+) -> dict[str, object]:
     body = cast(SpawnOrchestratorIn, _coerce_request_model(body, SpawnOrchestratorIn))
     orch_id = body.id.strip()
     if not ORCH_ID_PATTERN.fullmatch(orch_id):
@@ -2513,13 +2577,28 @@ def spawn_orchestrator(body: dict[str, Any] | SpawnOrchestratorIn) -> dict[str, 
     normal_current = (
         normal_entry.get("current") if isinstance(normal_entry, dict) else None
     )
+    replaying = False
     if isinstance(normal_current, dict):
-        detail = (
-            f"{orch_id} already has a supervisor-owned run; use Replace"
-            if _is_headless(normal_current)
-            else f"{orch_id} is already registered as a legacy worker"
-        )
-        raise HTTPException(status_code=409, detail=detail)
+        if _is_headless(normal_current) and body.request_id is not None:
+            idempotency = _supervisor_request(
+                "idempotency/status",
+                {"method": "run/start", "request_id": body.request_id},
+            )
+            if not isinstance(idempotency, dict) or not isinstance(
+                idempotency.get("known"), bool
+            ):
+                raise HTTPException(
+                    status_code=502,
+                    detail="Agent supervisor returned a bad idempotency response",
+                )
+            replaying = idempotency["known"]
+        if not replaying:
+            detail = (
+                f"{orch_id} already has a supervisor-owned run; use Replace"
+                if _is_headless(normal_current)
+                else f"{orch_id} is already registered as a legacy worker"
+            )
+            raise HTTPException(status_code=409, detail=detail)
 
     legacy_orchestrators = registry.get("_orchestrators")
     legacy_orchestrator = (
@@ -2563,6 +2642,8 @@ def spawn_orchestrator(body: dict[str, Any] | SpawnOrchestratorIn) -> dict[str, 
             "prompt": prompt,
             "orchestrator_id": None,
             "migrate_legacy": migrate_legacy,
+            "request_id": body.request_id,
+            "backend_base_url": backend_base_url,
         },
     )
     if not isinstance(result, dict):
@@ -2577,6 +2658,17 @@ def spawn_orchestrator(body: dict[str, Any] | SpawnOrchestratorIn) -> dict[str, 
         "prompt_path": None,
         "note": "orchestrator registered under the durable supervisor",
     }
+
+
+@app.post("/api/agents/spawn-orchestrator")
+def spawn_orchestrator_route(
+    request: Request,
+    body: dict[str, Any] | SpawnOrchestratorIn,
+) -> dict[str, object]:
+    return spawn_orchestrator(
+        body,
+        backend_base_url=request_backend_base_url(request),
+    )
 
 
 @app.post("/api/agents/{ticket}/message")

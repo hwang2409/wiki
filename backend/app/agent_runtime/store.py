@@ -458,6 +458,7 @@ class RunStore:
             "effort": record.effort,
             "worktree": record.worktree,
             "cwd": record.worktree,
+            "backend_base_url": record.backend_base_url,
             "orch": record.orchestrator_id,
             "state": record.state.value,
             "state_reason": record.state_reason,

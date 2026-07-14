@@ -45,6 +45,11 @@ class _ServerRequest:
     method: str
 
 
+@dataclass(frozen=True)
+class _StreamEnd:
+    generation: int
+
+
 _APPROVAL_METHODS = {
     "item/commandExecution/requestApproval",
     "item/fileChange/requestApproval",
@@ -77,45 +82,30 @@ class CodexAppServerAdapter(ProviderAdapter):
         child_env = dict(os.environ if env is None else env)
         child_env.pop("TMUX", None)
         child_env.pop("TMUX_PANE", None)
-        child_env["WIKI_RUN_ID"] = record.run_id
         child_env.setdefault(
             "WIKI_AGENT_RUNTIME_DIR",
             str(Path(child_env.get("HOME") or Path.home()) / ".wiki" / "agent-runtime"),
         )
         self.env = child_env
-        server_command = artifact_server_command()
-        server_env = artifact_server_environment(child_env, record.run_id)
-        toml_env = "{ " + ", ".join(
-            f"{key} = {json.dumps(value)}" for key, value in server_env.items()
-        ) + " }"
-        self.command = command_tuple(
-            (
-                *command,
-                "-c",
-                f"mcp_servers.wiki_artifacts.command={json.dumps(server_command[0])}",
-                "-c",
-                f"mcp_servers.wiki_artifacts.args={json.dumps(list(server_command[1:]))}",
-                "-c",
-                f"mcp_servers.wiki_artifacts.env={toml_env}",
-            )
-        )
+        self.base_command = command_tuple(command)
+        self._restart_for_runtime_change = False
+        self._configure_runtime(record)
         self.request_timeout = request_timeout
         self.identity_resolver = identity_resolver
         self.worktree = record.worktree
         self.model = record.model
         self.effort = record.effort
-        self.run_id = record.run_id
-        self.agent_id = record.agent_id
         self._resume_state = record.recovery_from_state or record.state
 
         self._process: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
-        self._events: asyncio.Queue[ProviderEvent | None] = asyncio.Queue()
+        self._events: asyncio.Queue[ProviderEvent | _StreamEnd] = asyncio.Queue()
         self._pending: dict[str, _PendingRequest] = {}
         self._server_request_ids: dict[tuple[str, str | int], _ServerRequest] = {}
         self._server_request_revision = 0
         self._thread_generations: dict[str, int] = {}
+        self._suppress_stream_end: set[int] = set()
         self._request_id = 0
         self._generation = record.provider_generation
         self._state = record.state
@@ -130,6 +120,35 @@ class CodexAppServerAdapter(ProviderAdapter):
         self._operation_lock = asyncio.Lock()
         self._turn_tasks: set[asyncio.Task[None]] = set()
         self._turn_start_pending = False
+
+    def _configure_runtime(self, record: RunRecord) -> None:
+        self.env["WIKI_RUN_ID"] = record.run_id
+        self.env["WIKI_AGENT_ID"] = record.agent_id
+        self.env["WIKI_AGENT_ROLE"] = record.role
+        if record.backend_base_url:
+            self.env["WIKI_BACKEND_URL"] = record.backend_base_url
+        server_command = artifact_server_command()
+        server_env = artifact_server_environment(self.env, record.run_id)
+        toml_env = "{ " + ", ".join(
+            f"{key} = {json.dumps(value)}" for key, value in server_env.items()
+        ) + " }"
+        self.command = command_tuple(
+            (
+                *self.base_command,
+                "-c",
+                f"mcp_servers.wiki_artifacts.command={json.dumps(server_command[0])}",
+                "-c",
+                f"mcp_servers.wiki_artifacts.args={json.dumps(list(server_command[1:]))}",
+                "-c",
+                f"mcp_servers.wiki_artifacts.env={toml_env}",
+            )
+        )
+        self.run_id = record.run_id
+        self.agent_id = record.agent_id
+
+    def prepare_replacement(self, record: RunRecord) -> None:
+        self._configure_runtime(record)
+        self._restart_for_runtime_change = True
 
     def _status(self) -> AdapterStatus:
         return AdapterStatus(
@@ -193,7 +212,7 @@ class CodexAppServerAdapter(ProviderAdapter):
         self._state = LifecycleState.STARTING
         self._detail = None
         self._reader_task = asyncio.create_task(
-            self._reader_loop(process),
+            self._reader_loop(process, generation),
             name=f"codex-reader-{self.run_id}",
         )
         self._stderr_task = asyncio.create_task(
@@ -427,7 +446,11 @@ class CodexAppServerAdapter(ProviderAdapter):
             if isinstance(path, str):
                 self._transcript_path = path
 
-    async def _reader_loop(self, process: asyncio.subprocess.Process) -> None:
+    async def _reader_loop(
+        self,
+        process: asyncio.subprocess.Process,
+        process_generation: int,
+    ) -> None:
         assert process.stdout is not None
         reader_error: Exception | None = None
         try:
@@ -484,7 +507,7 @@ class CodexAppServerAdapter(ProviderAdapter):
                     "params": {"error": f"{type(exc).__name__}: {exc}"},
                 },
                 direction="process",
-                generation=self._generation,
+                generation=process_generation,
             )
             await terminate_process_group(process)
         finally:
@@ -508,13 +531,13 @@ class CodexAppServerAdapter(ProviderAdapter):
                     "params": {"returncode": returncode},
                 },
                 direction="process",
-                generation=self._generation,
+                generation=process_generation,
             )
             error = ProviderProcessError(self._detail or "Codex App Server exited")
             for pending in self._pending.values():
                 if not pending.future.done():
                     pending.future.set_exception(error)
-            await self._events.put(None)
+            await self._events.put(_StreamEnd(process_generation))
 
     async def _stderr_loop(self, process: asyncio.subprocess.Process) -> None:
         assert process.stderr is not None
@@ -852,7 +875,13 @@ class CodexAppServerAdapter(ProviderAdapter):
             self.model = model or self.model
             self.effort = effort or self.effort
             generation = self._generation + 1
-            self._generation = generation
+            if self._restart_for_runtime_change:
+                self._suppress_stream_end.add(self._generation)
+                await self._shutdown(LifecycleState.DEAD)
+                await self._spawn(generation)
+                self._restart_for_runtime_change = False
+            else:
+                self._generation = generation
             self._session_id = None
             self._active_turn_id = None
             self._state = LifecycleState.STARTING
@@ -892,7 +921,13 @@ class CodexAppServerAdapter(ProviderAdapter):
     async def _event_stream(self) -> AsyncIterator[ProviderEvent]:
         while True:
             event = await self._events.get()
-            if event is None:
+            if isinstance(event, _StreamEnd):
+                if (
+                    event.generation in self._suppress_stream_end
+                    or event.generation < self._generation
+                ):
+                    self._suppress_stream_end.discard(event.generation)
+                    continue
                 return
             yield event
 

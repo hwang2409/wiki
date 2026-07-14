@@ -13,6 +13,7 @@ from typing import Any, Mapping
 from uuid import UUID, uuid4
 
 from . import knowledge
+from . import wiki_agent_tools
 
 
 TEXT_LIMIT = 100_000
@@ -69,7 +70,6 @@ SEARCH_TOOL_SCHEMA: dict[str, Any] = {
         "limit": {"type": "integer", "minimum": 1, "maximum": 100},
     },
 }
-
 
 def _require_keys(
     value: dict[str, Any],
@@ -299,6 +299,9 @@ def artifact_server_environment(
         "WIKI_RUN_ID": run_id,
     }
     for key in (
+        "WIKI_AGENT_ID",
+        "WIKI_AGENT_ROLE",
+        "WIKI_BACKEND_URL",
         "WIKI_KNOWLEDGE_DB_PATH",
         "WIKI_VAULT_DIR",
         "WIKI_AGENT_ARCHIVE_DIR",
@@ -384,23 +387,24 @@ def _response(message: dict[str, Any]) -> dict[str, Any] | None:
     if method in {"notifications/initialized", "notifications/cancelled"}:
         return None
     if method == "tools/list":
+        tools = [
+            {
+                "name": "render_artifact",
+                "description": TOOL_DESCRIPTION,
+                "inputSchema": TOOL_SCHEMA,
+            },
+            {
+                "name": "search_knowledge",
+                "description": SEARCH_TOOL_DESCRIPTION,
+                "inputSchema": SEARCH_TOOL_SCHEMA,
+            },
+        ]
+        if os.environ.get("WIKI_AGENT_ROLE") == "orchestrator":
+            tools.extend(wiki_agent_tools.TOOL_DEFINITIONS)
         return {
             "jsonrpc": "2.0",
             "id": request_id,
-            "result": {
-                "tools": [
-                    {
-                        "name": "render_artifact",
-                        "description": TOOL_DESCRIPTION,
-                        "inputSchema": TOOL_SCHEMA,
-                    },
-                    {
-                        "name": "search_knowledge",
-                        "description": SEARCH_TOOL_DESCRIPTION,
-                        "inputSchema": SEARCH_TOOL_SCHEMA,
-                    },
-                ]
-            },
+            "result": {"tools": tools},
         }
     if method == "tools/call":
         params = message.get("params") or {}
@@ -408,6 +412,12 @@ def _response(message: dict[str, Any]) -> dict[str, Any] | None:
             return _tool_result(request_id, params.get("arguments"))
         if params.get("name") == "search_knowledge":
             return _knowledge_tool_result(request_id, params.get("arguments"))
+        if params.get("name") in wiki_agent_tools.TOOL_HANDLERS:
+            return wiki_agent_tools.tool_result(
+                request_id,
+                params["name"],
+                params.get("arguments"),
+            )
         return {
             "jsonrpc": "2.0",
             "id": request_id,
