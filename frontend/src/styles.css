@@ -6679,11 +6679,72 @@ body.is-resizing-panes .pane-cell {
   line-height: 1.5;
 }
 
-.artifact-compact-image,
-.artifact-block.is-compact .artifact-svg > svg,
-.artifact-block.is-compact .artifact-mermaid svg {
+.artifact-compact-image {
   max-width: 400px;
   max-height: 400px;
+}
+
+.artifact-compact-diagram {
+  position: relative;
+  height: 400px;
+  overflow: hidden;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+}
+
+.artifact-compact-diagram .artifact-mermaid,
+.artifact-compact-diagram .artifact-svg {
+  display: block;
+  width: max-content;
+  max-width: none;
+  min-height: 0;
+  overflow: visible;
+}
+
+.artifact-compact-diagram .artifact-mermaid svg,
+.artifact-compact-diagram .artifact-svg > svg {
+  max-width: none;
+  max-height: none;
+}
+
+.artifact-compact-diagram::after {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 1;
+  height: 84px;
+  background: linear-gradient(transparent, var(--background-primary));
+  content: "";
+  pointer-events: none;
+}
+
+.artifact-compact-diagram::before {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 1;
+  width: 84px;
+  background: linear-gradient(to left, var(--background-primary), transparent);
+  content: "";
+  pointer-events: none;
+}
+
+.artifact-compact-diagram-hint {
+  position: absolute;
+  right: 9px;
+  bottom: 9px;
+  z-index: 2;
+  padding: 3px 7px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 999px;
+  background: var(--background-secondary);
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: 10px;
+  pointer-events: none;
 }
 
 .artifact-block.is-compact .artifact-plot {
