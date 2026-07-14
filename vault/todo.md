@@ -32,6 +32,7 @@ In Progress:
 - [P?] [PHO-13274](https://linear.app/phoebework/issue/PHO-13274): post account-health automation as per-owner Phoebe Slack threads with sales-call + product-agent context — cdx:PHO-13274 worker
 - [P3] [PHO-13367](https://linear.app/phoebework/issue/PHO-13367): fix Slack admin agent shifts-filled-through-Phoebe miscount (scope to callout, dedupe unique shift) — cdx:PHO-13367 worker
 - [P4] [PHO-13368](https://linear.app/phoebework/issue/PHO-13368): admin agent run events monospace font — cc:PHO-13368 worker
+- [P1] WIKI-100: knowledge layer — SQLite index (~/.wiki/knowledge.db) over vault + wiki-managed run history. Files stay truth, DB rebuildable. v1: FTS5 + wikilink graph + `wiki search`/`wiki links` CLI + search_knowledge MCP tool; ingest = mtime/hash delta scan (vault) + archive hook (runs), all async off hot path. Budgets: CLI +0ms, archive hook <1s, query p95 <50ms, rebuild <60s. Spec: docs/superpowers/specs/2026-07-14-knowledge-layer-storage-design.md
 
 Backlog:
 
