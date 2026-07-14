@@ -9,6 +9,15 @@ updated: 2026-07-14
 
 ## 2026-07-14
 
+- [WIKI-114](https://github.com/hwang2409/wiki/pull/90) legible compact preview for large mermaid/SVG artifacts — explicit px dims from viewBox (kills Chromium 300px fallback), 400px crop + bottom/right fades + click-to-inspect via existing pan/zoom. Gate: 2 iterations (2 BLOCKING: wide diagrams still 2-6px text via width:max-content fallback, viewBox-only SVGs collapsed 0x0; 1 HIGH: test passed by 276px-fixture coincidence — wide fixture + width assertions added). Merged e792f49 via #90.
+- **phoebe** — admin account note -> org-Slack admin-agent thread automation merged (#11339, no ticket yet — backfill after Linear re-auth)
+- **phoebe** — PHO-13685 point-in-time lifecycle state-series primitives for churn cohort/survival merged (#11336)
+- **phoebe** — PR-11284 callout 2-min timing check + ALL-group grace race + DB-clock cutoff fixes merged (#11284)
+- PHO-13690 merged #11325
+- PHO-13676 merged #11310
+- **phoebe** — PHO-13676 admin-agent in-flight tool-call dedup black hole fix merged (#11310); PHO-13690 atomic lifecycle CSV export tools merged (#11325)
+- [WIKI-88](https://github.com/hwang2409/wiki/pull/89) orchestrator wiki-artifacts MCP registration — subsumed into WIKI-111 (#89): role gate lifted, WIKI_RUN_ID isolation regression-tested
+- [WIKI-111](https://github.com/hwang2409/wiki/pull/89) built-in agent harness — WIKI_RUNTIME_CARD v1 injected into every cc/cdx run (role-flavored, 4KB budget), wiki agent spawn/status/steer/replace/archive CLI verbs + backend URL autodiscovery (fixes watch dead-port), orchestrator MCP fleet ops (role-enforced at list+call), WIKI-88 subsumed (orchestrator MCP + WIKI_RUN_ID artifact isolation). Gate: 1 iteration, 0 BLOCKING/HIGH, 1 MEDIUM deferred to WIKI-113. Merged 14e78d2 via #89.
 - [WIKI-109](https://github.com/hwang2409/wiki/pull/88) Cmd+K session search + blank-pane placement (WIKI-110 folded) — sessions first-class palette results (dead/archived excluded), C-a p blank pane, move-only-from-blank semantics with pane-state key retention. Gate: 1 iteration + rebase over #87 (1 MEDIUM: palette selection reset under SSE churn). Merged 58c6c30 via #88.
 - [WIKI-108](https://github.com/hwang2409/wiki/pull/87) sidebar pages open in separate windows — utility:// pane identities, reuse-and-focus, standalone restore; settings modal untouched. Gate: 1 iteration (1 MEDIUM: npm test chain registration). Merged 47cddb0 via #87.
 - PHO-13669 merged (#11303, 17d7241ae6): account-book name filter (case-insensitive, projection-preserving, 100-row name-ordered scan) + HTML-only email bodies -> bounded redacted text (bs4) + embedded opening-marker neutralization in wrap_untrusted_evidence + account-health prompt diet

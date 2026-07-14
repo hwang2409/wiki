@@ -2,12 +2,12 @@
 type: reference
 tags: [tools, cloud, agents]
 created: 2026-07-06
-updated: 2026-07-06
+updated: 2026-07-14
 ---
 
 # exe.dev
 
-**Status: pilot canceled 2026-07-06** — Henry declined the paid-tier cost ([PHO-12930](https://linear.app/phoebework/issue/PHO-12930) Canceled). The substrate-agnostic sandbox tool surface (PHO-13073/#10608) survives; resuming exe.dev — or a Modal backend, the evaluation's recommended production pivot — is a client swap, not a redesign.
+**Status: BACK IN USE 2026-07-13** — woodbridge's #11104 shipped `scripts/preview.sh`: shareable multi-day branch preview environments on exe.dev VMs (team plan active — the 2026-07-06 pilot-canceled state is obsolete). Stable `https://preview-<slug>.exe.xyz` URLs behind team login, same-origin Caddy proxy (`/api/*`→API, `/kratos/*`→Kratos, rest→Vite), warm quiesced `preview-template` VM disk-cloned in ~3s (118s warm `up` vs ~10min cold), 48h TTL + hourly sweep workflow, nightly template refresh. Small team plan pools 2 vCPU/8GB → ~one running full-stack preview at a time. Docs: `docs/development_guides/branch_previews.md`, execplan `docs/notes/plans/exe_preview_envs_execplan.md`, skill `.claude/skills/exe-preview/`. Complements Modal PR previews (24h cap, random URLs, ~$18/day idle) rather than replacing them. Prior history: PHO-12930 pilot canceled 2026-07-06; substrate-agnostic sandbox tool surface (PHO-13073/#10608) still the seam for any admin-agent sandbox backend.
 
 External cloud/tool. Current as of 2026-07-06; verify pricing/security
 before operational decisions.
