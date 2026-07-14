@@ -172,6 +172,27 @@ class ProtocolFixtureTests(unittest.TestCase):
         self.assertEqual(response.kind, "approval_response")
         self.assertEqual(response.disposition, EventDisposition.IGNORED)
 
+    def test_codex_render_artifact_completion_normalizes_as_artifact(self) -> None:
+        row = json.loads(
+            (FIXTURES / "codex_render_artifact_completed.jsonl").read_text(
+                encoding="utf-8"
+            )
+        )
+        normalized = normalize_provider_event(ProviderKind.CODEX, row["message"])
+
+        self.assertEqual(normalized.disposition, EventDisposition.RENDERED)
+        self.assertEqual(normalized.kind, "artifact")
+        self.assertEqual(normalized.payload["id"], "6d0e7d00-2edf-4054-b0dc-fe17cd382c2a")
+        self.assertEqual(normalized.payload["title"], "Wiki.app architecture")
+        self.assertEqual(
+            normalized.payload["caption"],
+            "Native shell, frontend, FastAPI, headless supervisor, MCP, CLI, and local storage/data-control flows.",
+        )
+        self.assertEqual(
+            normalized.payload["artifact"],
+            {"kind": "mermaid", "source": "flowchart TB\n  worker --> artifact"},
+        )
+
 
 class LifecycleTests(unittest.TestCase):
     def test_restart_recovery_table_is_closed_and_only_working_idle_resume(

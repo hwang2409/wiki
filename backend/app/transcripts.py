@@ -33,6 +33,7 @@ from pathlib import Path, PurePosixPath
 from .wiki_artifacts import (
     ArtifactValidationError,
     _validate_text_payload,
+    artifact_from_codex_mcp_tool_result,
     artifact_from_text,
     sentinel_text,
 )
@@ -584,6 +585,31 @@ def _failed_artifact_tool(meta: dict, output: str, ts: str | None) -> dict:
     }
 
 
+def _codex_mcp_tool_result_text(item: dict) -> str:
+    result = item.get("result")
+    if not isinstance(result, dict):
+        return str(item.get("error") or result or "")
+    content = result.get("content")
+    if isinstance(content, list):
+        parts = [
+            block.get("text")
+            for block in content
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        ]
+        if parts:
+            return "\n".join(parts)
+    return str(item.get("error") or result.get("error") or json.dumps(result))
+
+
+def _is_codex_render_artifact_call(item: object) -> bool:
+    return (
+        isinstance(item, dict)
+        and item.get("type") == "mcpToolCall"
+        and item.get("server") == "wiki_artifacts"
+        and item.get("tool") == "render_artifact"
+    )
+
+
 def _artifact_from_structured_result(meta: dict, output: str) -> dict | None:
     try:
         result = json.loads(output)
@@ -956,6 +982,10 @@ def _codex_normalized_apply(state: dict, row: dict) -> None:
     if not isinstance(payload, dict):
         _apply_normalized_payload(state, row, _codex_apply, None)
         return
+    if row.get("kind") == "artifact" and payload.get("kind") == "artifact":
+        _append_event(state, _artifact_event(payload, row.get("normalized_at")))
+        _record_row_disposition(state, _normalized_disposition(row))
+        return
     method = payload.get("method")
     params = payload.get("params")
     params = params if isinstance(params, dict) else {}
@@ -971,6 +1001,26 @@ def _codex_normalized_apply(state: dict, row: dict) -> None:
         # These two message forms are retained as a defensive fallback and the
         # native parser's pair-credit dedupe removes the app-server twin.
         item = params.get("item")
+        artifact = artifact_from_codex_mcp_tool_result(item)
+        if artifact is not None:
+            _append_event(state, _artifact_event(artifact, ts))
+            _record_row_disposition(state, _normalized_disposition(row))
+            return
+        if _is_codex_render_artifact_call(item):
+            assert isinstance(item, dict)
+            _append_event(
+                state,
+                _failed_artifact_tool(
+                    {
+                        "name": "render_artifact",
+                        "input": _tool_arguments(item.get("arguments")) or {},
+                    },
+                    _codex_mcp_tool_result_text(item),
+                    ts,
+                ),
+            )
+            _record_row_disposition(state, _normalized_disposition(row))
+            return
         if isinstance(item, dict) and item.get("type") == "userMessage":
             text = "\n".join(
                 str(block.get("text"))

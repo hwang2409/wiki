@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from ..wiki_artifacts import artifact_from_codex_mcp_tool_result
 from .types import EventDisposition, LifecycleState, ProviderKind
 
 
@@ -91,6 +92,15 @@ def _codex_state(payload: dict[str, Any]) -> LifecycleState | None:
 def _normalize_codex(payload: dict[str, Any]) -> NormalizedProviderEvent:
     method = payload.get("method")
     lifecycle = _codex_state(payload)
+    params = payload.get("params")
+    item = params.get("item") if isinstance(params, dict) else None
+    artifact = (
+        artifact_from_codex_mcp_tool_result(item)
+        if method == "item/completed"
+        else None
+    )
+    if artifact is not None:
+        return NormalizedProviderEvent(EventDisposition.RENDERED, "artifact", artifact)
     if method in _CODEX_APPROVAL_METHODS:
         disposition = EventDisposition.RENDERED
         kind = "approval"
