@@ -739,6 +739,8 @@ def cmd_search(args: argparse.Namespace) -> None:
         return
     if result["rebuilding"]:
         print("knowledge index is rebuilding; results may be partial", file=sys.stderr)
+    if result["stale"]:
+        print("live run index is stale; returning existing results", file=sys.stderr)
     for row in result["results"]:
         print(f"{row['citation']}  score={row['score']:.8f}")
         snippet = str(row.get("snippet") or "").strip()

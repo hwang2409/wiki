@@ -52,6 +52,10 @@ class KnowledgeQueryError(KnowledgeError):
     """The caller supplied an invalid knowledge query."""
 
 
+class KnowledgeSourceError(KnowledgeError):
+    """One source file could not be ingested while the database remains usable."""
+
+
 @dataclass
 class IngestStats:
     notes_scanned: int = 0
@@ -61,6 +65,7 @@ class IngestStats:
     chunks_indexed: int = 0
     links_indexed: int = 0
     runs_indexed: int = 0
+    runs_skipped: int = 0
     events_indexed: int = 0
     malformed_event_lines: int = 0
     elapsed_seconds: float = 0.0
@@ -74,6 +79,7 @@ class IngestStats:
             "chunks_indexed",
             "links_indexed",
             "runs_indexed",
+            "runs_skipped",
             "events_indexed",
             "malformed_event_lines",
         ):
@@ -195,7 +201,9 @@ class KnowledgeIndex:
             self.paths.db_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             connection = sqlite3.connect(self.paths.db_path, timeout=0.75)
             connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA journal_mode=WAL")
+            journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+            if str(journal_mode).lower() != "wal":
+                connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA foreign_keys=ON")
             connection.execute("PRAGMA busy_timeout=750")
             connection.execute("PRAGMA synchronous=NORMAL")
@@ -219,26 +227,35 @@ class KnowledgeIndex:
                 f"cannot open {self.paths.db_path}: {exc}"
             ) from exc
 
-    def _remove_database(self) -> None:
-        for path in (
-            self.paths.db_path,
-            Path(f"{self.paths.db_path}-wal"),
-            Path(f"{self.paths.db_path}-shm"),
+    def _quarantine_database(self) -> Path:
+        quarantine = Path(
+            f"{self.paths.db_path}.corrupt-{time.time_ns()}-{os.getpid()}"
+        )
+        for source, destination in (
+            (self.paths.db_path, quarantine),
+            (Path(f"{self.paths.db_path}-wal"), Path(f"{quarantine}-wal")),
+            (Path(f"{self.paths.db_path}-shm"), Path(f"{quarantine}-shm")),
         ):
             try:
-                path.unlink(missing_ok=True)
+                source.replace(destination)
+            except FileNotFoundError:
+                continue
             except OSError as exc:
-                raise KnowledgeUnavailable(f"cannot replace corrupt {path}: {exc}") from exc
+                raise KnowledgeUnavailable(
+                    f"cannot quarantine corrupt {source}: {exc}"
+                ) from exc
+        return quarantine
 
     def _recover_corruption(self, exc: BaseException) -> None:
         LOGGER.warning(
-            "knowledge database corrupt at %s; dropping for rebuild: %s",
+            "knowledge database corrupt at %s; quarantining for rebuild: %s",
             self.paths.db_path,
             exc,
         )
         with self._lock:
             self._mark_rebuilding()
-            self._remove_database()
+            quarantine = self._quarantine_database()
+            LOGGER.warning("quarantined corrupt knowledge database at %s", quarantine)
             replacement = self._connect_raw()
             try:
                 reset_schema(replacement)
@@ -572,11 +589,15 @@ class KnowledgeIndex:
                     events_path,
                 )
             return stats
-        except (OSError, sqlite3.Error) as exc:
-            if isinstance(exc, sqlite3.Error) and _corruption_error(exc):
+        except sqlite3.Error as exc:
+            if _corruption_error(exc):
                 connection.close()
                 self._recover_corruption(exc)
             raise KnowledgeUnavailable(f"run indexing failed for {run_dir}: {exc}") from exc
+        except (OSError, UnicodeError) as exc:
+            raise KnowledgeSourceError(
+                f"run source unreadable for {run_dir}: {exc}"
+            ) from exc
         finally:
             connection.close()
             stats.elapsed_seconds = time.perf_counter() - started
@@ -587,7 +608,11 @@ class KnowledgeIndex:
         if self.paths.archive_dir.is_dir():
             for events_path in sorted(self.paths.archive_dir.rglob("events.jsonl")):
                 if events_path.is_file():
-                    stats.merge(self.index_run_directory(events_path.parent))
+                    try:
+                        stats.merge(self.index_run_directory(events_path.parent))
+                    except KnowledgeSourceError as exc:
+                        stats.runs_skipped += 1
+                        LOGGER.warning("skipping unreadable archived run: %s", exc)
         stats.elapsed_seconds = time.perf_counter() - started
         return stats
 
@@ -681,11 +706,14 @@ class KnowledgeIndex:
             raise KnowledgeQueryError(f"limit must be between 1 and {MAX_SEARCH_LIMIT}")
         fts_query = self._fts_query(query)
         since_value = self._since_value(since)
-        connection, _ = self._prepare()
-        connection.close()
+        connection, needs_rebuild = self._prepare()
+        stale = needs_rebuild or self.rebuilding
         # Live runs are append-only and indexed on first query, delta by seq.
-        self.index_live_runs()
-        connection, _ = self._prepare()
+        try:
+            self.index_live_runs()
+        except (KnowledgeError, OSError) as exc:
+            stale = True
+            LOGGER.warning("live run indexing failed; returning stale results: %s", exc)
         try:
             clauses = ["chunks_fts MATCH ?"]
             params: list[Any] = [fts_query]
@@ -769,12 +797,18 @@ class KnowledgeIndex:
                 "query": query,
                 "results": results,
                 "rebuilding": self.rebuilding,
+                "stale": stale,
             }
         except sqlite3.Error as exc:
             if _corruption_error(exc):
                 connection.close()
                 self._recover_corruption(exc)
-                return {"query": query, "results": [], "rebuilding": True}
+                return {
+                    "query": query,
+                    "results": [],
+                    "rebuilding": True,
+                    "stale": True,
+                }
             raise KnowledgeUnavailable(f"knowledge query failed: {exc}") from exc
         finally:
             connection.close()

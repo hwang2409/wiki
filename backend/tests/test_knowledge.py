@@ -43,6 +43,34 @@ def _write_note(path: Path, title: str, body: str, *, note_type: str = "referenc
     )
 
 
+def _write_run(
+    run_dir: Path,
+    *,
+    run_id: str,
+    ticket: str,
+    text: str,
+) -> Path:
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(
+        json.dumps({"run_id": run_id, "agent_id": ticket, "provider": "codex"}),
+        encoding="utf-8",
+    )
+    events_path = run_dir / "events.jsonl"
+    events_path.write_text(
+        json.dumps(
+            {
+                "seq": 1,
+                "kind": "agent_message",
+                "normalized_at": "2026-07-14T12:00:00+00:00",
+                "payload": {"text": text},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return events_path
+
+
 class ChunkerAndResolverTests(unittest.TestCase):
     def test_chunks_stay_heading_bounded(self) -> None:
         chunks = knowledge.chunk_markdown(
@@ -327,7 +355,9 @@ class KnowledgeIndexTests(unittest.TestCase):
         self.db.write_bytes(b"this is not sqlite")
         corrupt_partial = self.index.search("recoveryneedle")
         self.assertTrue(corrupt_partial["rebuilding"])
+        self.assertTrue(corrupt_partial["stale"])
         self.assertEqual(corrupt_partial["results"], [])
+        self.assertTrue(list(self.root.glob("knowledge.db.corrupt-*")))
         self.index.refresh_all()
         self.assertEqual(
             self.index.search("recoveryneedle")["results"][0]["path"],
@@ -347,6 +377,72 @@ class KnowledgeIndexTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(knowledge.KnowledgeUnavailable, "cannot open"):
             broken.search("anything")
+
+    def test_unreadable_live_run_returns_existing_results_as_stale(self) -> None:
+        _write_note(self.vault / "durable.md", "Durable", "resilientsearchneedle")
+        self.index.rebuild()
+        _write_run(
+            self.runtime / "runs" / "unreadable-live-run",
+            run_id="00000000-0000-4000-8000-000000000103",
+            ticket="WIKI-103",
+            text="live source text",
+        )
+        with mock.patch.object(
+            knowledge,
+            "read_run_events",
+            side_effect=PermissionError("fixture is unreadable"),
+        ):
+            result = self.index.search("resilientsearchneedle")
+        self.assertTrue(result["stale"])
+        self.assertEqual(result["results"][0]["citation"], "durable.md")
+
+    def test_locked_live_run_writer_returns_existing_results_as_stale(self) -> None:
+        _write_note(self.vault / "locked.md", "Locked", "lockedsearchneedle")
+        self.index.rebuild()
+        _write_run(
+            self.runtime / "runs" / "locked-live-run",
+            run_id="00000000-0000-4000-8000-000000000104",
+            ticket="WIKI-104",
+            text="new live text",
+        )
+        with closing(sqlite3.connect(self.db)) as blocker:
+            blocker.execute("PRAGMA journal_mode=WAL")
+            blocker.execute("BEGIN IMMEDIATE")
+            result = self.index.search("lockedsearchneedle")
+            blocker.rollback()
+        self.assertTrue(result["stale"])
+        self.assertEqual(result["results"][0]["citation"], "locked.md")
+
+    def test_bad_archive_is_skipped_without_blocking_good_archive(self) -> None:
+        bad_events = _write_run(
+            self.archive / "bad" / "20260714-100000",
+            run_id="00000000-0000-4000-8000-000000000105",
+            ticket="WIKI-105",
+            text="unreadable archive text",
+        )
+        _write_run(
+            self.archive / "good" / "20260714-110000",
+            run_id="00000000-0000-4000-8000-000000000106",
+            ticket="WIKI-106",
+            text="goodarchiveneedle",
+        )
+        read_run_events = knowledge.read_run_events
+
+        def read_fixture(path: Path, *, after_seq: int):
+            if path == bad_events:
+                raise PermissionError("fixture is unreadable")
+            return read_run_events(path, after_seq=after_seq)
+
+        self.index.request_refresh()
+        with mock.patch.object(knowledge, "read_run_events", side_effect=read_fixture):
+            stats = self.index.refresh_all()
+        self.assertEqual(stats.runs_skipped, 1)
+        self.assertEqual(stats.runs_indexed, 1)
+        self.assertFalse(self.index.rebuild_marker.exists())
+        self.assertFalse(self.index.refresh_marker.exists())
+        result = self.index.search("goodarchiveneedle")
+        self.assertFalse(result["stale"])
+        self.assertEqual(result["results"][0]["run_id"], "00000000-0000-4000-8000-000000000106")
 
     def test_archive_hook_enqueues_real_store_path_under_one_second(self) -> None:
         _write_note(
@@ -429,7 +525,7 @@ class KnowledgeIndexTests(unittest.TestCase):
         self.assertEqual(stats.notes_indexed, 120)
         self.index.search("budgetneedle", limit=10)  # warm lazy-run + page caches
         timings = []
-        for _ in range(30):
+        for _ in range(100):
             query_started = time.perf_counter()
             self.index.search("budgetneedle", limit=10)
             timings.append(time.perf_counter() - query_started)
