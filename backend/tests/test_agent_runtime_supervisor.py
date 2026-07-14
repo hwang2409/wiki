@@ -236,6 +236,50 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             )
         return env
 
+    async def test_runtime_card_covers_each_role_and_provider_variant(self) -> None:
+        backend_url = "http://127.0.0.1:43111"
+        for provider in (ProviderKind.CODEX, ProviderKind.CLAUDE):
+            for role in ("implement", "orchestrator"):
+                with self.subTest(provider=provider.value, role=role):
+                    agent_id = f"WIKI-CARD-{provider.value.upper()}-{role.upper()}"
+                    with mock.patch(
+                        "backend.app.agent_runtime.runtime_card.worktree_branch",
+                        return_value="codex/fixture-runtime-card",
+                    ):
+                        record = await self.supervisor.start_run(
+                            agent_id=agent_id,
+                            provider=provider,
+                            role=role,
+                            model=f"fixture-{provider.value}",
+                            effort="high" if provider is ProviderKind.CODEX else None,
+                            worktree=str(self.worktree),
+                            prompt=f"Original prompt for {agent_id}",
+                            orchestrator_id=None if role == "orchestrator" else "wiki",
+                            backend_base_url=backend_url,
+                        )
+                    prompt = self.store.get(record.run_id).initial_prompt or ""
+                    self.assertTrue(prompt.startswith("<WIKI_RUNTIME_CARD v=1>"))
+                    self.assertIn(f"run_id={record.run_id}", prompt)
+                    self.assertIn(f"role={role}", prompt)
+                    self.assertIn(f"kind={provider.legacy_kind}", prompt)
+                    self.assertIn(f"backend: {backend_url}", prompt)
+                    self.assertIn(f"worktree: {self.worktree.resolve()}", prompt)
+                    self.assertIn("branch: codex/fixture-runtime-card", prompt)
+                    self.assertTrue(prompt.endswith(f"Original prompt for {agent_id}"))
+                    self.assertLess(len(prompt.encode("utf-8")), 100_000)
+                    if role == "orchestrator":
+                        self.assertIn("ORCHESTRATOR controls", prompt)
+                        self.assertIn("wiki agent spawn <ticket>", prompt)
+                        self.assertIn("wiki gate <pr> --expect-sha <sha>", prompt)
+                        self.assertIn("wiki agent archive <id>", prompt)
+                    else:
+                        self.assertIn("WORKER contract", prompt)
+                        self.assertIn(
+                            "You do not have fleet spawn/steer/archive authority",
+                            prompt,
+                        )
+                        self.assertNotIn("wiki agent spawn <ticket>", prompt)
+
     async def test_mixed_fake_fleet_persists_raw_before_normalized(self) -> None:
         codex = await self.supervisor.start_run(
             agent_id="WIKI-CODEX",
@@ -849,9 +893,12 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 old.run_id,
                 "Replacement ticket WIKI-42 prompt",
             )
-        provider_replace.assert_awaited_once_with(
-            "Replacement ticket WIKI-42 prompt", None, "high"
-        )
+        provider_replace.assert_awaited_once()
+        replacement_prompt = provider_replace.await_args.args[0]
+        self.assertIn("<WIKI_RUNTIME_CARD v=1>", replacement_prompt)
+        self.assertIn("Replacement ticket WIKI-42 prompt", replacement_prompt)
+        self.assertIn(f"run_id={replacement.run_id}", replacement_prompt)
+        self.assertEqual(provider_replace.await_args.args[1:], (None, "high"))
         self.assertNotEqual(replacement.run_id, old.run_id)
         old = self.store.get(old.run_id)
         self.assertEqual(old.replaced_by_run_id, replacement.run_id)
@@ -2415,12 +2462,11 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((session_dir / "raw.jsonl").is_file())
         self.assertTrue((session_dir / "events.jsonl").is_file())
         self.assertTrue((session_dir / "cdx-WIKI-ARCHIVE.log").is_file())
-        self.assertEqual(
-            (session_dir / "cdx-WIKI-ARCHIVE-prompt.md").read_text(
-                encoding="utf-8"
-            ),
-            "fixture prompt",
+        archived_prompt = (session_dir / "cdx-WIKI-ARCHIVE-prompt.md").read_text(
+            encoding="utf-8"
         )
+        self.assertIn(f"run_id={record.run_id}", archived_prompt)
+        self.assertTrue(archived_prompt.endswith("fixture prompt"))
         meta = json.loads((session_dir / "meta.json").read_text(encoding="utf-8"))
         self.assertEqual(meta["worker"]["run_id"], record.run_id)
         final_status = json.loads(

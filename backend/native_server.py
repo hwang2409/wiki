@@ -30,6 +30,9 @@ def bundled_frontend_dist() -> Path | None:
 
 
 def configure_environment(args: argparse.Namespace) -> None:
+    client_host = "127.0.0.1" if args.host in {"0.0.0.0", "::"} else args.host
+    os.environ["WIKI_BACKEND_PORT"] = str(args.port)
+    os.environ["WIKI_BACKEND_URL"] = f"http://{client_host}:{args.port}"
     if args.repo_dir:
         os.environ["WIKI_REPO_DIR"] = args.repo_dir
     if args.vault_dir:

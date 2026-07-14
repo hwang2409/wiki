@@ -59,6 +59,53 @@ def _start_request(record: RunRecord, prompt: str = "initial prompt") -> StartRe
     )
 
 
+class OrchestratorMcpConfigTests(unittest.TestCase):
+    def test_both_providers_attach_run_isolated_mcp_to_orchestrators(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree = root / "worktree"
+            worktree.mkdir()
+            env = {
+                **os.environ,
+                "WIKI_AGENT_RUNTIME_DIR": str(root / "runtime"),
+            }
+            for provider in (ProviderKind.CODEX, ProviderKind.CLAUDE):
+                with self.subTest(provider=provider.value):
+                    record = RunRecord.new(
+                        agent_id="wiki",
+                        provider=provider,
+                        role="orchestrator",
+                        model="fixture-model",
+                        effort="high" if provider is ProviderKind.CODEX else None,
+                        worktree=str(worktree),
+                        prompt="coordinate",
+                        backend_base_url="http://127.0.0.1:43113",
+                    )
+                    if provider is ProviderKind.CODEX:
+                        adapter = CodexAppServerAdapter(record, env=env)
+                        server_env = next(
+                            argument.removeprefix("mcp_servers.wiki_artifacts.env=")
+                            for argument in adapter.command
+                            if argument.startswith("mcp_servers.wiki_artifacts.env=")
+                        )
+                        self.assertIn(f'WIKI_RUN_ID = "{record.run_id}"', server_env)
+                        self.assertIn('WIKI_AGENT_ROLE = "orchestrator"', server_env)
+                        self.assertIn(
+                            'WIKI_BACKEND_URL = "http://127.0.0.1:43113"',
+                            server_env,
+                        )
+                    else:
+                        adapter = ClaudeStreamAdapter(record, env=env)
+                        config = json.loads(adapter.artifact_mcp_config)
+                        server_env = config["mcpServers"]["wiki-artifacts"]["env"]
+                        self.assertEqual(server_env["WIKI_RUN_ID"], record.run_id)
+                        self.assertEqual(server_env["WIKI_AGENT_ROLE"], "orchestrator")
+                        self.assertEqual(
+                            server_env["WIKI_BACKEND_URL"],
+                            "http://127.0.0.1:43113",
+                        )
+
+
 async def _wait_event(
     adapter: ProviderAdapter,
     predicate: Callable[[ProviderEvent], bool],
@@ -323,6 +370,47 @@ class CodexAdapterTests(unittest.IsolatedAsyncioTestCase):
         first = _protocol_rows(self.log)[0]
         self.assertIsNone(first["tmux"])
         self.assertIsNone(first["tmux_pane"])
+
+    async def test_replacement_restarts_transport_with_new_run_mcp_identity(self) -> None:
+        record = _record(self.root, ProviderKind.CODEX, state=LifecycleState.STARTING)
+        adapter = self._adapter(record)
+        started = await adapter.start(_start_request(record))
+        old_process = adapter._process  # noqa: SLF001 - replacement transport contract
+        assert old_process is not None
+
+        replacement = RunRecord.new(
+            agent_id=record.agent_id,
+            provider=record.provider,
+            role=record.role,
+            model=record.model,
+            effort=record.effort,
+            worktree=record.worktree,
+            prompt="replacement prompt",
+            replaces_run_id=record.run_id,
+            backend_base_url="http://127.0.0.1:43114",
+        )
+        adapter.prepare_replacement(replacement)
+        status = await adapter.replace("replacement prompt")
+
+        new_process = adapter._process  # noqa: SLF001
+        assert new_process is not None
+        self.assertNotEqual(new_process.pid, old_process.pid)
+        self.assertEqual(status.generation, started.generation + 1)
+        server_env = next(
+            argument.removeprefix("mcp_servers.wiki_artifacts.env=")
+            for argument in adapter.command
+            if argument.startswith("mcp_servers.wiki_artifacts.env=")
+        )
+        self.assertIn(f'WIKI_RUN_ID = "{replacement.run_id}"', server_env)
+        self.assertIn('WIKI_BACKEND_URL = "http://127.0.0.1:43114"', server_env)
+        replacement_event = await _wait_event(
+            adapter,
+            lambda event: (
+                event.payload.get("method") == "turn/started"
+                and event.generation == status.generation
+            ),
+        )
+        self.assertEqual(replacement_event.generation, status.generation)
 
     async def test_numeric_approval_response_keeps_original_id_type(self) -> None:
         record = _record(self.root, ProviderKind.CODEX, state=LifecycleState.STARTING)
@@ -699,6 +787,17 @@ class ClaudeAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resumed.generation, 4)
         self.assertEqual(resumed.state, LifecycleState.IDLE)
 
+        replacement_record = RunRecord.new(
+            agent_id=record.agent_id,
+            provider=record.provider,
+            role=record.role,
+            model="fixture-model-2",
+            worktree=record.worktree,
+            prompt="replacement prompt",
+            replaces_run_id=record.run_id,
+            backend_base_url="http://127.0.0.1:43115",
+        )
+        adapter.prepare_replacement(replacement_record)
         replacement = await adapter.replace("replacement prompt", "fixture-model-2")
         self.assertNotEqual(replacement.session_id, resumed.session_id)
         self.assertEqual(replacement.generation, 5)
@@ -714,6 +813,15 @@ class ClaudeAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(invocations), 2)
         self.assertIn("--resume", invocations[0]["argv"])
         self.assertIn("--session-id", invocations[1]["argv"])
+        replacement_config = json.loads(
+            invocations[1]["argv"][invocations[1]["argv"].index("--mcp-config") + 1]
+        )
+        replacement_env = replacement_config["mcpServers"]["wiki-artifacts"]["env"]
+        self.assertEqual(replacement_env["WIKI_RUN_ID"], replacement_record.run_id)
+        self.assertEqual(
+            replacement_env["WIKI_BACKEND_URL"],
+            "http://127.0.0.1:43115",
+        )
         user_rows = [row for row in rows if row.get("type") == "user"]
         self.assertEqual(len(user_rows), 1)
 

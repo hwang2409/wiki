@@ -5,7 +5,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
-from .types import LifecycleState, ProviderKind, utc_now
+from .types import LifecycleState, ProviderKind, RunRecord, utc_now
 
 
 class ProviderError(RuntimeError):
@@ -98,6 +98,16 @@ class ProviderAdapter(ABC):
         """
 
         raise NotImplementedError
+
+    def prepare_replacement(self, record: RunRecord) -> None:
+        """Rebind per-run provider configuration before a replacement starts.
+
+        Fixture and third-party adapters without per-run configuration can keep
+        the default no-op. Built-in adapters use this to rotate Wiki runtime and
+        MCP identity before the replacement prompt can invoke tools.
+        """
+
+        del record
 
     @abstractmethod
     async def status(self) -> AdapterStatus:

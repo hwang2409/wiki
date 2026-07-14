@@ -6,6 +6,10 @@ Hot-path writes with validation, so conventions hold mechanically:
   wiki todo add "text" [--priority P1] [--section Todo]
   wiki todo move "substring" --to "In Progress"
   wiki todo complete "substring" [--done-line "terse completion"]
+  wiki agent spawn <ticket> --kind cdx --role implement --model gpt-5.4 --effort high --prompt-file prompt.md --workdir /path
+  wiki agent steer <id> --message "text" [--mode now|on-idle]
+  wiki agent replace <id> [--kind cc|cdx] [--model model] [--effort effort]
+  wiki agent archive <id> --outcome merged|closed|abandoned
   wiki agent watch <ticket> [--json] [--until merge-ready|terminal|merged]
   wiki gate <pr-number> [--expect-sha SHA] [--json]
   wiki log-done "project: summary (links)"
@@ -29,10 +33,12 @@ import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
+from urllib.request import Request as UrlRequest
 from urllib.request import urlopen
+from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from backend.app import knowledge, vaultops  # noqa: E402
+from backend.app import backend_runtime, knowledge, vaultops  # noqa: E402
 
 VAULT = Path(
     os.environ.get("WIKI_VAULT_DIR") or Path(__file__).resolve().parent / "vault"
@@ -602,9 +608,35 @@ class GateError(RuntimeError):
 def _backend_url() -> str:
     configured = os.environ.get("WIKI_BACKEND_URL")
     if configured:
-        return configured.rstrip("/")
-    port = os.environ.get("WIKI_BACKEND_PORT") or "8011"
-    return f"http://127.0.0.1:{port}"
+        try:
+            return backend_runtime.normalize_loopback_url(configured)
+        except ValueError as exc:
+            raise WatchBackendError(str(exc)) from exc
+    configured_port = os.environ.get("WIKI_BACKEND_PORT")
+    if configured_port:
+        candidates = [f"http://127.0.0.1:{configured_port}"]
+    else:
+        candidates = []
+        discovered = backend_runtime.read_backend_url()
+        if discovered:
+            candidates.append(discovered)
+        candidates.extend(("http://127.0.0.1:8213", "http://127.0.0.1:8011"))
+    tried: list[str] = []
+    for candidate in dict.fromkeys(candidates):
+        try:
+            normalized = backend_runtime.normalize_loopback_url(candidate)
+            with urlopen(  # noqa: S310 - loopback URLs validated above
+                f"{normalized}/health",
+                timeout=0.5,
+            ) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            if isinstance(payload, dict) and payload.get("status") == "ok":
+                return normalized
+        except (HTTPError, URLError, OSError, ValueError):
+            tried.append(candidate)
+    raise WatchBackendError(
+        "no live Wiki backend found; tried " + ", ".join(tried or candidates)
+    )
 
 
 def nonnegative_seconds(value: str) -> float:
@@ -633,16 +665,162 @@ def normalized_pr_reference(value: str) -> str:
     raise SystemExit(2)
 
 
-def _backend_json(path: str) -> dict:
+def _backend_request(
+    method: str,
+    path: str,
+    payload: dict | None = None,
+) -> dict:
     url = f"{_backend_url()}{path}"
+    data = None
+    headers = {"Accept": "application/json"}
+    if payload is not None:
+        data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = UrlRequest(url, data=data, headers=headers, method=method)
     try:
-        with urlopen(url, timeout=5) as response:  # noqa: S310 - local configured backend
+        with urlopen(request, timeout=10) as response:  # noqa: S310 - validated loopback URL
             payload = json.loads(response.read().decode("utf-8"))
-    except (HTTPError, URLError, OSError, ValueError) as exc:
+    except HTTPError as exc:
+        try:
+            error = json.loads(exc.read().decode("utf-8"))
+            detail = error.get("detail") if isinstance(error, dict) else None
+        except (OSError, ValueError):
+            detail = None
+        raise WatchBackendError(str(detail or exc)) from exc
+    except (URLError, OSError, ValueError) as exc:
         raise WatchBackendError(str(exc)) from exc
     if not isinstance(payload, dict):
         raise WatchBackendError("backend returned a non-object JSON response")
     return payload
+
+
+def _backend_json(path: str) -> dict:
+    return _backend_request("GET", path)
+
+
+def _backend_post(path: str, payload: dict | None = None) -> dict:
+    return _backend_request("POST", path, payload)
+
+
+def _read_cli_text(path_value: str, *, label: str) -> str:
+    path = Path(path_value).expanduser()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        fail(f"could not read {label} {path}: {exc}")
+    if not text.strip():
+        fail(f"{label} must not be empty")
+    return text
+
+
+def _request_id(value: str | None) -> str:
+    request_id = (value or "").strip() or str(uuid4())
+    if len(request_id) > 200:
+        fail("--request-id must be at most 200 characters")
+    return request_id
+
+
+def _print_backend_call(path: str, payload: dict | None = None) -> dict:
+    try:
+        result = _backend_post(path, payload)
+    except WatchBackendError as exc:
+        fail(f"Wiki backend request failed: {exc}")
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return result
+
+
+def cmd_agent_spawn(args: argparse.Namespace) -> None:
+    agent_id = normalized_cli_ticket(args.ticket)
+    prompt = _read_cli_text(args.prompt_file, label="--prompt-file")
+    request_id = _request_id(args.request_id)
+    if args.role == "orchestrator":
+        if args.orch:
+            fail("--orch is only valid for worker roles")
+        payload = {
+            "id": agent_id,
+            "kind": args.kind,
+            "model": args.model,
+            "effort": args.effort,
+            "workdir": str(Path(args.workdir).expanduser()),
+            "goal": prompt,
+            "request_id": request_id,
+        }
+        _print_backend_call("/api/agents/spawn-orchestrator", payload)
+        return
+    payload = {
+        "ticket": agent_id,
+        "kind": args.kind,
+        "role": args.role,
+        "model": args.model,
+        "effort": args.effort,
+        "workdir": str(Path(args.workdir).expanduser()),
+        "orch": args.orch,
+        "prompt": prompt,
+        "request_id": request_id,
+    }
+    _print_backend_call("/api/agents/spawn", payload)
+
+
+def cmd_agent_steer(args: argparse.Namespace) -> None:
+    agent_id = normalized_cli_ticket(args.id)
+    text = (
+        args.message
+        if args.message is not None
+        else _read_cli_text(args.file, label="--file")
+    )
+    if not text.strip():
+        fail("steer message must not be empty")
+    _print_backend_call(
+        f"/api/agents/{quote(agent_id)}/message",
+        {
+            "text": text,
+            "mode": args.mode,
+            "request_id": _request_id(args.request_id),
+        },
+    )
+
+
+def cmd_agent_replace_headless(args: argparse.Namespace) -> None:
+    agent_id = normalized_cli_ticket(args.id)
+    payload = {
+        key: value
+        for key, value in {
+            "kind": args.kind,
+            "model": args.model,
+            "effort": args.effort,
+        }.items()
+        if value is not None
+    }
+    _print_backend_call(f"/api/agents/{quote(agent_id)}/replace", payload)
+
+
+def cmd_agent_archive_headless(args: argparse.Namespace) -> None:
+    agent_id = normalized_cli_ticket(args.id)
+    _print_backend_call(
+        f"/api/agents/{quote(agent_id)}/archive",
+        {"outcome": args.outcome},
+    )
+
+
+def cmd_agent_status(args: argparse.Namespace) -> None:
+    agent_id = normalized_cli_ticket(args.id)
+    try:
+        payload = _backend_json("/api/agents")
+    except WatchBackendError as exc:
+        fail(f"Wiki backend request failed: {exc}")
+    wanted = agent_id.upper()
+    for key, rows in (
+        ("worker", payload.get("workers")),
+        ("orchestrator", payload.get("orchestrators")),
+    ):
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict):
+                continue
+            found = row.get("ticket") if key == "worker" else row.get("id")
+            if isinstance(found, str) and found.upper() == wanted:
+                print(json.dumps({"type": key, **row}, ensure_ascii=False, sort_keys=True))
+                return
+    fail(f"agent {agent_id} was not found")
 
 
 def _watch_status(ticket: str) -> dict | None:
@@ -1363,8 +1541,52 @@ def main() -> None:
     delete.add_argument("path", help="<topic>/<slug>")
     delete.set_defaults(func=cmd_note_delete, refresh_knowledge=True)
 
-    agent = sub.add_parser("agent", help="worker registry ops (/tmp/agent-registry.json)")
+    agent = sub.add_parser("agent", help="Wiki supervisor agent operations")
     agent_sub = agent.add_subparsers(dest="agent_command", required=True)
+
+    spawn = agent_sub.add_parser("spawn", help="spawn a supervisor-owned worker or orchestrator")
+    spawn.add_argument("ticket", help="worker ticket or orchestrator id")
+    spawn.add_argument("--kind", required=True, choices=("cc", "cdx"))
+    spawn.add_argument(
+        "--role",
+        required=True,
+        choices=("plan", "implement", "review", "orchestrator"),
+    )
+    spawn.add_argument("--model", required=True)
+    spawn.add_argument("--effort", choices=("minimal", "low", "medium", "high", "xhigh"))
+    spawn.add_argument("--prompt-file", required=True)
+    spawn.add_argument("--workdir", required=True)
+    spawn.add_argument("--orch", help="owning orchestrator id for worker roles")
+    spawn.add_argument(
+        "--request-id",
+        help="idempotency key; defaults to a generated UUID (reuse this value when retrying)",
+    )
+    spawn.set_defaults(func=cmd_agent_spawn)
+
+    steer = agent_sub.add_parser("steer", help="send or queue a message to a supervisor-owned run")
+    steer.add_argument("id")
+    steer_input = steer.add_mutually_exclusive_group(required=True)
+    steer_input.add_argument("--message")
+    steer_input.add_argument("--file")
+    steer.add_argument("--mode", choices=("now", "on-idle"), default="now")
+    steer.add_argument("--request-id", help="idempotency key; defaults to a generated UUID")
+    steer.set_defaults(func=cmd_agent_steer)
+
+    replace = agent_sub.add_parser("replace", help="replace a supervisor-owned worker or orchestrator")
+    replace.add_argument("id")
+    replace.add_argument("--kind", choices=("cc", "cdx"))
+    replace.add_argument("--model")
+    replace.add_argument("--effort", choices=("minimal", "low", "medium", "high", "xhigh"))
+    replace.set_defaults(func=cmd_agent_replace_headless)
+
+    archive = agent_sub.add_parser("archive", help="archive and release a supervisor-owned run")
+    archive.add_argument("id")
+    archive.add_argument("--outcome", required=True, choices=("merged", "closed", "abandoned"))
+    archive.set_defaults(func=cmd_agent_archive_headless)
+
+    agent_status = agent_sub.add_parser("status", help="print one supervisor-backed run snapshot as JSON")
+    agent_status.add_argument("id")
+    agent_status.set_defaults(func=cmd_agent_status)
 
     register = agent_sub.add_parser(
         "register", help="register a worker at spawn; re-register = handoff (archives prior session)"

@@ -182,6 +182,119 @@ class WikiArtifactsTests(unittest.TestCase):
         self.assertIsNotNone(event)
         self.assertEqual(event["artifact"]["kind"], "mermaid")
 
+    def test_orchestrator_lists_native_ops_but_worker_does_not(self) -> None:
+        worker = wiki_artifacts._response(  # noqa: SLF001 - MCP contract test
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+        )
+        assert worker is not None
+        worker_names = {tool["name"] for tool in worker["result"]["tools"]}
+        self.assertEqual(worker_names, {"render_artifact", "search_knowledge"})
+
+        with mock.patch.dict(os.environ, {"WIKI_AGENT_ROLE": "orchestrator"}):
+            orchestrator = wiki_artifacts._response(  # noqa: SLF001
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+            )
+        assert orchestrator is not None
+        names = {tool["name"] for tool in orchestrator["result"]["tools"]}
+        self.assertTrue(
+            {
+                "spawn_agent",
+                "steer_agent",
+                "replace_agent",
+                "archive_agent",
+                "list_agents",
+                "read_agent",
+                "read_agent_events",
+                "read_agent_pr",
+            }.issubset(names)
+        )
+
+    def test_orchestrator_operations_route_through_the_live_backend(self) -> None:
+        calls: list[tuple[str, str, dict | None]] = []
+
+        def backend(method: str, path: str, payload: dict | None = None) -> dict:
+            calls.append((method, path, payload))
+            return {"ok": True, "path": path}
+
+        with (
+            mock.patch.dict(os.environ, {"WIKI_AGENT_ROLE": "orchestrator"}),
+            mock.patch.object(wiki_artifacts, "_backend_api", side_effect=backend),
+        ):
+            spawned = wiki_artifacts.spawn_agent(
+                {
+                    "ticket": "WIKI-200",
+                    "kind": "cdx",
+                    "role": "implement",
+                    "model": "gpt-5.4",
+                    "effort": "high",
+                    "workdir": "/tmp/worktree",
+                    "prompt": "Implement ticket WIKI-200",
+                    "orch": "wiki",
+                    "request_id": "mcp-spawn-1",
+                }
+            )
+            wiki_artifacts.steer_agent(
+                {
+                    "id": "WIKI-200",
+                    "message": "Run tests",
+                    "mode": "on-idle",
+                    "request_id": "mcp-steer-1",
+                }
+            )
+            wiki_artifacts.archive_agent(
+                {"id": "WIKI-200", "outcome": "merged"}
+            )
+        self.assertTrue(spawned["ok"])
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "POST",
+                    "/api/agents/spawn",
+                    {
+                        "ticket": "WIKI-200",
+                        "kind": "cdx",
+                        "role": "implement",
+                        "model": "gpt-5.4",
+                        "effort": "high",
+                        "workdir": "/tmp/worktree",
+                        "prompt": "Implement ticket WIKI-200",
+                        "orch": "wiki",
+                        "request_id": "mcp-spawn-1",
+                    },
+                ),
+                (
+                    "POST",
+                    "/api/agents/WIKI-200/message",
+                    {
+                        "text": "Run tests",
+                        "mode": "on-idle",
+                        "request_id": "mcp-steer-1",
+                    },
+                ),
+                (
+                    "POST",
+                    "/api/agents/WIKI-200/archive",
+                    {"outcome": "merged"},
+                ),
+            ],
+        )
+
+    def test_orchestrator_render_artifact_uses_its_run_directory(self) -> None:
+        with mock.patch.dict(os.environ, {"WIKI_AGENT_ROLE": "orchestrator"}):
+            event = wiki_artifacts.render_artifact(
+                {"kind": "image", "payload": _payload("image")}
+            )
+        target = (
+            self.root
+            / "runtime"
+            / "runs"
+            / RUN_ID
+            / "artifacts"
+            / f"{event['id']}.png"
+        )
+        self.assertEqual(target.read_bytes(), b"fixture-png")
+
     def test_storage_failure_returns_a_tool_error_without_crashing_server(self) -> None:
         with mock.patch.object(wiki_artifacts, "render_artifact", side_effect=OSError("disk full")):
             response = wiki_artifacts._tool_result(7, {"kind": "image", "payload": {}})

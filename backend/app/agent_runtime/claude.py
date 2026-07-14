@@ -148,34 +148,18 @@ class ClaudeStreamAdapter(ProviderAdapter):
         child_env = dict(os.environ if env is None else env)
         child_env.pop("TMUX", None)
         child_env.pop("TMUX_PANE", None)
-        child_env["WIKI_RUN_ID"] = record.run_id
         child_env.setdefault(
             "WIKI_AGENT_RUNTIME_DIR",
             str(Path(child_env.get("HOME") or Path.home()) / ".wiki" / "agent-runtime"),
         )
         self.env = child_env
         self.command = command_tuple(command)
-        server_command = artifact_server_command()
-        server_env = artifact_server_environment(child_env, record.run_id)
-        self.artifact_mcp_config = json.dumps(
-            {
-                "mcpServers": {
-                    "wiki-artifacts": {
-                        "command": server_command[0],
-                        "args": list(server_command[1:]),
-                        "env": server_env,
-                    }
-                }
-            },
-            separators=(",", ":"),
-        )
+        self._configure_runtime(record)
         self.request_timeout = request_timeout
         self.identity_resolver = identity_resolver
         self.worktree = record.worktree
         self.model = record.model
         self.effort = record.effort
-        self.run_id = record.run_id
-        self.agent_id = record.agent_id
         self._resume_state = record.recovery_from_state or record.state
 
         self._process: asyncio.subprocess.Process | None = None
@@ -198,6 +182,32 @@ class ClaudeStreamAdapter(ProviderAdapter):
         self._request: StartRequest | None = None
         self._write_lock = asyncio.Lock()
         self._operation_lock = asyncio.Lock()
+
+    def _configure_runtime(self, record: RunRecord) -> None:
+        self.env["WIKI_RUN_ID"] = record.run_id
+        self.env["WIKI_AGENT_ID"] = record.agent_id
+        self.env["WIKI_AGENT_ROLE"] = record.role
+        if record.backend_base_url:
+            self.env["WIKI_BACKEND_URL"] = record.backend_base_url
+        server_command = artifact_server_command()
+        server_env = artifact_server_environment(self.env, record.run_id)
+        self.artifact_mcp_config = json.dumps(
+            {
+                "mcpServers": {
+                    "wiki-artifacts": {
+                        "command": server_command[0],
+                        "args": list(server_command[1:]),
+                        "env": server_env,
+                    }
+                }
+            },
+            separators=(",", ":"),
+        )
+        self.run_id = record.run_id
+        self.agent_id = record.agent_id
+
+    def prepare_replacement(self, record: RunRecord) -> None:
+        self._configure_runtime(record)
 
     def _status(self) -> AdapterStatus:
         return AdapterStatus(

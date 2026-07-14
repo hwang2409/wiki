@@ -142,6 +142,7 @@ class RunRecord:
     role: str
     model: str
     worktree: str
+    backend_base_url: str | None = None
     desired_model: str | None = None
     state: LifecycleState = LifecycleState.STARTING
     effort: str | None = None
@@ -188,6 +189,7 @@ class RunRecord:
         effort: str | None = None,
         orchestrator_id: str | None = None,
         replaces_run_id: str | None = None,
+        backend_base_url: str | None = None,
     ) -> RunRecord:
         return cls(
             run_id=str(uuid4()),
@@ -196,6 +198,7 @@ class RunRecord:
             role=role,
             model=model,
             worktree=worktree,
+            backend_base_url=backend_base_url,
             initial_prompt=prompt,
             effort=effort,
             orchestrator_id=orchestrator_id,
@@ -213,6 +216,7 @@ class RunRecord:
             "desired_model": self.desired_model,
             "effort": self.effort,
             "worktree": self.worktree,
+            "backend_base_url": self.backend_base_url,
             "orchestrator_id": self.orchestrator_id,
             "state": self.state.value,
             "state_reason": self.state_reason,
@@ -263,6 +267,7 @@ class RunRecord:
             desired_model=value.get("desired_model"),
             effort=value.get("effort"),
             worktree=str(value["worktree"]),
+            backend_base_url=value.get("backend_base_url"),
             orchestrator_id=value.get("orchestrator_id"),
             state=LifecycleState(value.get("state", LifecycleState.STARTING.value)),
             state_reason=value.get("state_reason"),

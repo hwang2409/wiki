@@ -15,7 +15,7 @@ from typing import Any, cast
 from unittest import mock
 from uuid import uuid4
 
-from fastapi import BackgroundTasks, HTTPException
+from fastapi import BackgroundTasks, HTTPException, Request
 
 from backend.app import main
 from backend.app.agent_runtime.client import (
@@ -534,7 +534,10 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         interrupted = main.interrupt_agent("WIKI-42")
         resumed = main.resume_agent("WIKI-42")
         stopped = main.stop_agent("WIKI-42")
-        archived = main.archive_agent("WIKI-42")
+        archived = main.archive_agent(
+            "WIKI-42",
+            main.AgentArchiveIn(outcome="merged"),
+        )
         self.assertEqual(interrupted["state"], "interrupted")
         self.assertEqual(resumed["state"], "working")
         self.assertEqual(stopped["state"], "dead")
@@ -543,6 +546,7 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
             [method for method, _ in self.client.calls],
             ["run/interrupt", "run/resume", "run/stop", "run/archive"],
         )
+        self.assertEqual(self.client.calls[-1][1]["outcome"], "merged")
 
         registry = json.loads(self.registry.read_text(encoding="utf-8"))
         registry["WIKI-LEGACY"] = {
@@ -894,6 +898,37 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(replace_call["provider"], "codex")
         self.assertEqual(replace_call["model"], "gpt-5.4")
         self.assertEqual(replace_call["effort"], "high")
+
+    async def test_http_spawn_route_passes_the_live_backend_port(self) -> None:
+        request = Request(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/api/agents/spawn",
+                "raw_path": b"/api/agents/spawn",
+                "query_string": b"",
+                "headers": [],
+                "client": ("127.0.0.1", 50000),
+                "server": ("127.0.0.1", 43112),
+            }
+        )
+        with mock.patch.dict(os.environ, {"WIKI_BACKEND_URL": ""}):
+            main.spawn_agent_route(
+                request,
+                main.SpawnWorkerIn(
+                    ticket="WIKI-PORT",
+                    kind="cc",
+                    role="review",
+                    model="sonnet",
+                    workdir=str(self.worktree),
+                    prompt="Review ticket WIKI-PORT",
+                    request_id="port-card-1",
+                ),
+            )
+        start = next(params for method, params in self.client.calls if method == "run/start")
+        self.assertEqual(start["backend_base_url"], "http://127.0.0.1:43112")
 
     async def test_spawn_with_new_request_id_keeps_duplicate_guard(self) -> None:
         self._seed_headless()
