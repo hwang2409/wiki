@@ -135,7 +135,28 @@ function downloadName(event: SessionEvent): string {
   return `${base}.${extension}`;
 }
 
-export function MermaidRenderer({ source }: { source: string }) {
+function viewBoxBounds(source: string): { width: number; height: number } | null {
+  const viewBox = source.match(/\bviewBox=["']\s*[-0-9.]+\s+[-0-9.]+\s+([0-9.]+)\s+([0-9.]+)\s*["']/i);
+  if (!viewBox) return null;
+  const width = Number(viewBox[1]);
+  const height = Number(viewBox[2]);
+  return Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0 ? { width, height } : null;
+}
+
+function withExplicitSvgDimensions(source: string): string {
+  const bounds = viewBoxBounds(source) ?? svgBounds(source);
+  const openTag = source.match(/<svg\b[^>]*>/i)?.[0];
+  if (!bounds || !openTag) return source;
+  const dimensions = `width: ${bounds.width}px !important; height: ${bounds.height}px !important; max-width: none !important; max-height: none !important;`;
+  const withoutDimensions = openTag.replace(/\s(?:width|height)\s*=\s*(?:"[^"]*"|'[^']*')/gi, "");
+  const withStyle = /\sstyle=(["'])(.*?)\1/i.test(withoutDimensions)
+    ? withoutDimensions.replace(/\sstyle=(["'])(.*?)\1/i, (_match, quote: string, style: string) => ` style=${quote}${style}; ${dimensions}${quote}`)
+    : `${withoutDimensions.slice(0, -1)} style="${dimensions}">`;
+  const sizedTag = withStyle.replace(/>$/, ` width="${bounds.width}" height="${bounds.height}">`);
+  return source.replace(openTag, sizedTag);
+}
+
+export function MermaidRenderer({ compact = false, source }: { compact?: boolean; source: string }) {
   const theme = useCurrentTheme();
   const reactId = useId();
   const [html, setHtml] = useState("");
@@ -154,7 +175,7 @@ export function MermaidRenderer({ source }: { source: string }) {
         });
         const rendered = await mermaid.render(id, source);
         if (!cancelled) {
-          setHtml(rendered.svg);
+          setHtml(compact ? withExplicitSvgDimensions(rendered.svg) : rendered.svg);
           setError(null);
         }
       } catch (reason) {
@@ -167,14 +188,14 @@ export function MermaidRenderer({ source }: { source: string }) {
     return () => {
       cancelled = true;
     };
-  }, [reactId, source, theme]);
+  }, [compact, reactId, source, theme]);
 
   if (error) return <div className="artifact-error">{error}</div>;
   if (!html) return <div className="artifact-loading">Rendering diagram…</div>;
   return <div className="artifact-mermaid" dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
-export function SvgRenderer({ source }: { source: string }) {
+export function SvgRenderer({ compact = false, source }: { compact?: boolean; source: string }) {
   const [html, setHtml] = useState("");
   useEffect(() => {
     let cancelled = false;
@@ -183,12 +204,12 @@ export function SvgRenderer({ source }: { source: string }) {
         ALLOWED_TAGS: SVG_TAGS,
         FORBID_TAGS: ["script", "foreignObject", "iframe"],
       });
-      if (!cancelled) setHtml(sanitized);
+      if (!cancelled) setHtml(compact ? withExplicitSvgDimensions(sanitized) : sanitized);
     });
     return () => {
       cancelled = true;
     };
-  }, [source]);
+  }, [compact, source]);
   if (!html) return <div className="artifact-loading">Sanitizing SVG…</div>;
   return <div className="artifact-svg" dangerouslySetInnerHTML={{ __html: html }} />;
 }
@@ -406,6 +427,7 @@ function CodeRenderer({ artifact }: { artifact: SessionArtifact }) {
 
 export type ArtifactRendererProps = {
   artifact: SessionArtifact;
+  compact?: boolean;
   event: SessionEvent;
   onImageLoad?: (image: HTMLImageElement) => void;
   ticket: string;
@@ -415,9 +437,9 @@ export function ArtifactRenderer(props: ArtifactRendererProps): ReactNode {
   const { artifact } = props;
   switch (artifact.kind) {
     case "mermaid":
-      return <MermaidRenderer source={artifact.source ?? ""} />;
+      return <MermaidRenderer compact={props.compact} source={artifact.source ?? ""} />;
     case "svg":
-      return <SvgRenderer source={artifact.source ?? ""} />;
+      return <SvgRenderer compact={props.compact} source={artifact.source ?? ""} />;
     case "image":
       return <ImageRenderer {...props} />;
     case "table":
@@ -463,9 +485,7 @@ function svgBounds(source: string): { width: number; height: number } | null {
   const width = numericSvgAttribute(source, "width");
   const height = numericSvgAttribute(source, "height");
   if (width !== null && height !== null) return { width, height };
-  const viewBox = source.match(/\bviewBox=["']\s*[-0-9.]+\s+[-0-9.]+\s+([0-9.]+)\s+([0-9.]+)\s*["']/i);
-  if (!viewBox) return null;
-  return { width: Number(viewBox[1]), height: Number(viewBox[2]) };
+  return viewBoxBounds(source);
 }
 
 function mermaidNodeCount(source: string): number {
@@ -535,6 +555,14 @@ function CompactPreview({ artifact, event, ticket }: ArtifactRendererProps) {
       ? `data:${artifact.mime ?? "image/png"};base64,${artifact.data_base64}`
       : artifactUrl(ticket, event);
     return <img alt={event.title || event.caption || "Agent artifact"} className="artifact-image artifact-compact-image" loading="lazy" src={source} />;
+  }
+  if (artifact.kind === "mermaid" || artifact.kind === "svg") {
+    return (
+      <div className="artifact-compact-diagram">
+        <ArtifactRenderer artifact={artifact} compact event={event} ticket={ticket} />
+        <span className="artifact-compact-diagram-hint">Diagram continues · Click to inspect</span>
+      </div>
+    );
   }
   return <ArtifactRenderer artifact={artifact} event={event} ticket={ticket} />;
 }
