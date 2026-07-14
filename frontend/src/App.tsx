@@ -188,6 +188,13 @@ function utilityLabel(kind: UtilityMode): string {
   return `${kind.slice(0, 1).toUpperCase()}${kind.slice(1)}`;
 }
 
+function paneKind(path: string): PaneInfo["kind"] {
+  if (isAgentPath(path)) return "agent";
+  if (isTerminalPath(path)) return "terminal";
+  if (utilityKindFromPanePath(path)) return "utility";
+  return "note";
+}
+
 function splitLayout(
   node: Layout,
   targetKey: string,
@@ -282,13 +289,7 @@ function collectPaneInfos(node: Layout, panes: PaneInfo[] = []): PaneInfo[] {
   if (node.kind === "pane") {
     panes.push({
       key: node.id,
-      kind: isAgentPath(node.path)
-        ? "agent"
-        : isTerminalPath(node.path)
-          ? "terminal"
-          : utilityKindFromPanePath(node.path)
-            ? "utility"
-            : "note",
+      kind: paneKind(node.path),
       path: node.path,
       ticket: ticketFromPanePath(node.path),
     });
@@ -385,13 +386,7 @@ function findPaneInfo(node: Layout, key: string): PaneInfo | null {
     return node.id === key
       ? {
           key: node.id,
-          kind: isAgentPath(node.path)
-            ? "agent"
-            : isTerminalPath(node.path)
-              ? "terminal"
-              : utilityKindFromPanePath(node.path)
-                ? "utility"
-                : "note",
+          kind: paneKind(node.path),
           path: node.path,
           ticket: ticketFromPanePath(node.path),
         }
