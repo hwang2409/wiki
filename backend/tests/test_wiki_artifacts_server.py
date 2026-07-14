@@ -177,9 +177,10 @@ class WikiArtifactsTests(unittest.TestCase):
         responses = [json.loads(line) for line in process.stdout.splitlines()]
         self.assertEqual(responses[1]["result"]["tools"][0]["name"], "render_artifact")
         result = responses[2]["result"]
-        self.assertTrue(result["structuredContent"]["ok"])
+        self.assertNotIn("structuredContent", result)
         event = wiki_artifacts.artifact_from_text(result["content"][0]["text"])
-        self.assertEqual(event["id"], result["structuredContent"]["artifact_id"])
+        self.assertIsNotNone(event)
+        self.assertEqual(event["artifact"]["kind"], "mermaid")
 
     def test_storage_failure_returns_a_tool_error_without_crashing_server(self) -> None:
         with mock.patch.object(wiki_artifacts, "render_artifact", side_effect=OSError("disk full")):

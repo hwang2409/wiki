@@ -30,7 +30,12 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 
-from .wiki_artifacts import artifact_from_text
+from .wiki_artifacts import (
+    ArtifactValidationError,
+    _validate_text_payload,
+    artifact_from_text,
+    sentinel_text,
+)
 
 CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
@@ -579,16 +584,59 @@ def _failed_artifact_tool(meta: dict, output: str, ts: str | None) -> dict:
     }
 
 
+def _artifact_from_structured_result(meta: dict, output: str) -> dict | None:
+    try:
+        result = json.loads(output)
+    except ValueError:
+        return None
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        return None
+    artifact_id = result.get("artifact_id")
+    if not isinstance(artifact_id, str) or not artifact_id:
+        return None
+    raw_input = meta.get("input")
+    if not isinstance(raw_input, dict):
+        return None
+    kind = raw_input.get("kind")
+    payload = raw_input.get("payload")
+    if not isinstance(kind, str) or not isinstance(payload, dict):
+        return None
+    if kind == "image":
+        artifact = {
+            "kind": "image",
+            "ref": f"artifact://{artifact_id}",
+            "mime": payload.get("mime"),
+        }
+    else:
+        try:
+            validated_payload = _validate_text_payload(kind, payload)
+        except ArtifactValidationError:
+            return None
+        artifact = {**validated_payload, "kind": kind}
+    protocol_event = {"kind": "artifact", "id": artifact_id, "artifact": artifact}
+    for field, limit in (("title", 200), ("caption", 500)):
+        if field in raw_input:
+            value = raw_input[field]
+            if not isinstance(value, str) or len(value) > limit:
+                return None
+            protocol_event[field] = value
+    return artifact_from_text(sentinel_text(protocol_event))
+
+
 def _complete_artifact(
     state: dict,
     call_id: object,
     output: str,
     ts: str | None,
+    *,
+    failed: bool = False,
 ) -> bool:
     meta = state.get("pending_artifacts", {}).pop(call_id, None)
     if meta is None:
         return False
-    protocol_event = artifact_from_text(output)
+    protocol_event = None if failed else artifact_from_text(output)
+    if protocol_event is None and not failed:
+        protocol_event = _artifact_from_structured_result(meta, output)
     event = (
         _artifact_event(protocol_event, ts)
         if protocol_event is not None
@@ -778,7 +826,7 @@ def _codex_apply(state: dict, row: dict) -> None:
         elif ptype in ("patch_apply_end", "mcp_tool_call_end", "web_search_end"):
             call_id = payload.get("call_id")
             out, ok = _codex_tool_end_output(ptype, payload)
-            if _complete_artifact(state, call_id, str(out), ts):
+            if _complete_artifact(state, call_id, str(out), ts, failed=ok is False):
                 _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
                 return
             event = pending.pop(call_id, None)
@@ -1671,7 +1719,13 @@ def _claude_apply(state: dict, row: dict) -> None:
                     structured_answers,
                 )
                 rendered = True
-            if _complete_artifact(state, tool_use_id, result_text, ts):
+            if _complete_artifact(
+                state,
+                tool_use_id,
+                result_text,
+                ts,
+                failed=bool(block.get("isError") or block.get("is_error")),
+            ):
                 rendered = True
                 continue
             event = pending.pop(tool_use_id, None)

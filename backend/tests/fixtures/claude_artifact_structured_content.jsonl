@@ -1,0 +1,2 @@
+{"type":"assistant","timestamp":"2026-07-14T12:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_01Ky6ebQ7SwGxWizmSZEM5Kj","name":"mcp__wiki-artifacts__render_artifact","input":{"kind":"mermaid","title":"Fixture diagram","caption":"Structured result fallback","payload":{"source":"graph TD; A-->B"}}}]}}
+{"type":"user","timestamp":"2026-07-14T12:00:01Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01Ky6ebQ7SwGxWizmSZEM5Kj","content":"{\"artifact_id\":\"33b1c159-9d1e-4804-9b14-3d880ac2e3c7\",\"ok\":true}"}]}}

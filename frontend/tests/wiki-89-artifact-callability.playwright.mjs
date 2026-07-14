@@ -11,7 +11,7 @@ import {
   writeQueue,
 } from "../scripts/wiki32-harness.mjs";
 
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "..", "..");
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const PYTHON = path.join(ROOT, ".venv", "bin", "python");
 const FIXTURES = path.join(ROOT, "backend", "tests", "fixtures", "agent_runtime");
 const PROMPT =
@@ -159,6 +159,24 @@ async function waitForArtifactFrame(fixtures, runId, timeoutMs = 15000) {
   throw new Error(`Run ${runId} never emitted a render_artifact tool frame`);
 }
 
+async function waitForArtifactSessionEvent(request, baseUrl, ticket, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const response = await request.get(`${baseUrl}/api/agents/${ticket}/session?cursor=0`);
+    if (response.ok()) {
+      const session = await response.json();
+      const rejected = session.events?.find(
+        (event) => event.kind === "tool" && event.tool?.summary === "render_artifact rejected",
+      );
+      if (rejected) throw new Error(`${ticket} session payload contains render_artifact rejected`);
+      const artifact = session.events?.find((event) => event.kind === "artifact");
+      if (artifact) return artifact;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`Run ${ticket} session payload never contained an artifact event`);
+}
+
 function sessionLayout(ticket) {
   return {
     version: 2,
@@ -215,6 +233,14 @@ async function main() {
       }
       const spawned = await response.json();
       const rawPath = await waitForArtifactFrame(fixtures, spawned.run_id);
+      const sessionArtifact = await waitForArtifactSessionEvent(
+        page.request,
+        backend.baseUrl,
+        provider.ticket,
+      );
+      if (sessionArtifact.artifact?.kind !== "mermaid") {
+        throw new Error(`${provider.ticket} session payload contained the wrong artifact kind`);
+      }
 
       await page.addInitScript(({ layout }) => {
         localStorage.setItem("wiki-window-layout-v2", JSON.stringify(layout));
