@@ -34,12 +34,9 @@ In Progress:
 - [P4] [PHO-13368](https://linear.app/phoebework/issue/PHO-13368): admin agent run events monospace font — cc:PHO-13368 worker
 - [P2] [PHO-13665](https://linear.app/phoebework/issue/PHO-13665): resolver truncation transparency — cdx:PHO-13665 (gpt-5.6-terra)
 - [P2] [PHO-13666](https://linear.app/phoebework/issue/PHO-13666): sync_logs catalog diagnosability — cdx:PHO-13666 (gpt-5.6-terra)
-- [P2] [PHO-13667](https://linear.app/phoebework/issue/PHO-13667): trailing template window caps — cdx:PHO-13667 (gpt-5.6-terra)
-- [P2] [PHO-13668](https://linear.app/phoebework/issue/PHO-13668): query_admin_database ergonomics — cdx:PHO-13668 (gpt-5.6-terra)
 - [P2] [PHO-13669](https://linear.app/phoebework/issue/PHO-13669): Core email/account-book gaps — cdx:PHO-13669 (gpt-5.6-terra)
-- [P2] [PHO-13675](https://linear.app/phoebework/issue/PHO-13675): rollup input ergonomics (window docs + cohort chunks) — cdx:PHO-13675 (gpt-5.6-terra)
 - [P2] [PHO-13676](https://linear.app/phoebework/issue/PHO-13676): in-flight tool-call dedup black hole — cdx:PHO-13676 (gpt-5.6-terra)
-- [P2] WIKI-104: supervisor RPC responsiveness under machine load — repro 2026-07-14 (load avg 35-39: 8 phoebe terra workers + bazel fan-out + 2 wiki workers): /api/agents took 20s, spawn thread/start timed out (killed WIKI-103 run ebe5f399, replacement needed), POST /message responses timed out client-side while landing server-side (dangerous: encourages duplicate sends — orchestrators must ground-truth-check raw.jsonl before retry). Supervisor unix-socket dispatch appears serialized; read-path RPCs starve behind slow spawn/provider ops. Fix directions: (1) serve /api/agents list/status from cached registry snapshot without supervisor round-trip; (2) separate fast-lane read dispatch from slow ops (spawn/message) in daemon.py; (3) idempotency keys on spawn/message so client retries after timeout are safe; (4) backend surfaces load-shed state instead of raw timeouts. Also consider worker-count admission cap at spawn (soft cap 4-5/box per protocol).
+- [P2] [PHO-13690](https://linear.app/phoebework/issue/PHO-13690): lifecycle-export atomic tools (curated query + CSV artifact + recipe) — cdx:PHO-13690 (gpt-5.6-terra)
 
 Backlog:
 
