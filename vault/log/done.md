@@ -9,6 +9,8 @@ updated: 2026-07-14
 
 ## 2026-07-14
 
+- [WIKI-105](https://github.com/hwang2409/wiki/pull/86) font weight picker — per-surface weight selector (interface/note/mono) with canvas-measure real-weight detection (probes 100-900, dedupes faux-bold, hides single-weight families), CSS vars only set when user selects (default rendering unchanged), ui-state persisted + cross-window mirror. Gate: 2 iterations (2 BLOCKING: modal overflow visible in worker's own screenshots, :root defaults changed unselected rendering; + 1 HIGH modal-width drive-by, 3 MEDIUMs — all fixed, re-screenshotted, live-measured). Merged via #86.
+- PHO-13664 merged (#11299, 7befa37d40): composite context tool budgets 200ms/500ms -> 2s/5s (EHR state) + 2.5s/8s (context index + summary), failure isolation preserved, budget-floor regression tests; tools stop being prod no-ops
 - [WIKI-103](https://github.com/hwang2409/wiki/pull/84) orchestration ergonomics — wiki agent watch (deduped events, stall detection, --until merge-ready|terminal|merged, NDJSON), wiki gate (one-call checks+threads+SHA verdict, exit codes), todo complete no longer dumps full body into done.md (--done-line flag). Gate: 3 iterations (1 BLOCKING --until-merged hang, path-traversal MEDIUM, dedupe gaps, then 1 HIGH remote-fallback regression introduced by fix — all fixed + revert-tested). Merged 38cbc8d4.
 - [PHO-13662](https://linear.app/phoebework/issue/PHO-13662): composable python-snippet pipelines (named outputs, artifact listing, re-run) — cdx:PHO-13662 (gpt-5.6-terra)
 - [PHO-13660](https://linear.app/phoebework/issue/PHO-13660): deterministic multi-signal account-health tiering in rollup + pulse prompt cleanup — cdx:PHO-13660 (gpt-5.6-terra)
