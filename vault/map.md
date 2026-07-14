@@ -50,6 +50,8 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[wkwebview-eval-defer-clobber]] — WKWebView defers window.eval past navigate() — injected loading page clobbers loaded app when backend boots fast
 - [[vite-dist-root-owned]] — Vite ENOTEMPTY: root-owned frontend/dist artifacts block make native-build
 - [[wiki-native-codesign-running]] — Wiki native build codesign can fail when wiki-native is still running from the target bundle
+- [[wiki-headless-auto-resume-race]] — Headless supervisor recovery may reattach before an explicit /resume call; tests and operators must accept either valid path.
+- [[wiki-headless-orphan-pid-identity]] — Detached orphan cleanup must verify PID start time before signaling and kill the provider process group to avoid PID-reuse and grandchild leaks.
 
 ## Phoebe/decisions
 

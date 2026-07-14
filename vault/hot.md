@@ -2,7 +2,7 @@
 type: reference
 tags: [hot]
 created: 2026-07-06
-updated: 2026-07-10
+updated: 2026-07-14
 ---
 
 # Hot Context
@@ -11,23 +11,25 @@ Rolling ≤500-word session cache. Rewrite (don't append) at work-arc boundaries
 
 ## Active threads
 
-- **phoebe admin-agent arc — MAJOR MILESTONE 2026-07-09/10** — 8 PRs merged into main + prod through this orchestrator session, all admin-agent surface: [PHO-13157](https://linear.app/phoebework/issue/PHO-13157) delayed survey capture (#10751), [PHO-13273](https://linear.app/phoebework/issue/PHO-13273) generated schema catalog replaces `_DOMAIN_SPECS` (#10920 — 78k JSON checked in, `search_schema`/`describe_table` discovery tools, EXPLAIN cost gate, deny-tier secret classification, `admin_agent_readonly` role with NOBYPASSRLS + 10s statement_timeout), [PHO-13277](https://linear.app/phoebework/issue/PHO-13277) admin charts as agent messages (#10930), [PHO-13278](https://linear.app/phoebework/issue/PHO-13278) unified truncation policy + artifact registry (#10933), follow-ups [PHO-13304](https://linear.app/phoebework/issue/PHO-13304) (#10961), [PHO-13307](https://linear.app/phoebework/issue/PHO-13307) (#10965), plus HOTFIX-CATALOG (#10976) + HOTFIX-CATALOG-2 (#10978) regens after schema-touching PRs landed stale catalog. woodbridge PR #10983 (call analysis approval + failure alerts) merged 07-10 with our added regression test + doc fixes. Linear all Done.
-- **Active fleet (07-10)**: **cdx:PHO-13274** @23 (account-health as per-org Phoebe Slack threads) mid-refactor to call-feed shape per Henry steer — hardcode channel constant, drop feature flag, traffic-light emoji + org name parent, `slack_markdown` block detail thread reply (mirror `call_analysis_run.py:95-427` pattern). **cdx:PR-10475** @22 (subagent recommendation parity) into iteration 10+ of the Step 3↔4 loop; step-1-postfix showed verdict 0.778→0.889 + forbidden picks 10→1 but overlap regressed slightly and 2 ON-worse cases + 1 forbidden-pick pair remain. Henry directive: keep looping until parity or he says otherwise.
-- **Merge-conflict pain point confirmed 07-09** — 78k `admin_readable_schema_catalog.json` regenerates on every schema change. Two hotfix cycles in 90 minutes proved it. Systemic fix worth a follow-up ticket: pre-merge CI gate that runs `bazel run //database:update_schema --diff` and blocks merge if working tree differs. Ergonomic concern flagged in orchestrator review of PHO-13273 pre-merge.
-- **Wiki resolver bugs handed to wiki-dev** — 3 bugs bundled: [[WIKI-45]] cc-path resolver session_id-first, [[WIKI-46]] `_session_paths` cache invalidation on handoff, and slug-glob-cwd-not-worktree case (subsumed by WIKI-45). All in vault todo. Repro'd during PR-10475 cc→cdx handoff + VA-WHEATRIDGE cwd=main-checkout tasks.
+- **phoebe fleet EMPTY as of 2026-07-14 ~13:15Z** — PHO-13646 MERGED (#11271 `00eac05ab1`): admin agent batch account-health rollups. `get_admin_account_health_rollups` (≤50 orgs/call, two 7-day windows, ~14k calls → ~7 for 151-org cohort), Slack one-call posting up to 250 accounts, 90-min turn budget both admin paths (internal + Slack), 25-min lease fence scoped to daily run. Whale-safe day-slicing preserved (28-day recurring_shift bound, pre-SQL window-width guard, seeded equivalence proof); 50k gate + no-index constraints untouched. Linear Merged; worker archived; worktree/branch cleaned.
+- **Post-#11271 manual ops for Henry**: (1) rollout is safe-by-default behind `ACCOUNT_HEALTH_BATCH_ROLLUP_ENABLED` — enable to activate batch lane; (2) watch first nightly pulse after enabling — first live exercise of batch rollup + one-thread-per-org posting at 151-org scale; (3) PHO-13647 open: PostHog users metric group descoped from #11271, still per-query.
+- **Post-#11222 manual ops still pending**: delete/revoke 6 prod secrets `ADMIN_AGENT_SNOWFLAKE_{DATABASE,PAT,ROLE,SCHEMA,SQL_API_URL,WAREHOUSE}` — PAT worth revoking soonish. Also: "filled within 24h" metric REDEFINED to last-minute proxy (shift created ≤24h before start).
+- **Unpushed race fix parked**: `b4d5e7f9` on `henry/staging-modal-deploy-investigation-2`, worktree `.codex/worktrees/staging-modal-2` kept — staging-deploy workflow_run race (checks out stale head_sha). PR it or drop.
+- **cdx render gap RESOLVED 2026-07-14** — WIKI-99 (#80) archived-events path verified live post-relaunch: archived PHO-13559 session serves 500 structured events, zero terminal blobs. No wiki ticket needed. Wiki fleet EMPTY; bundle rebuilt 09:43 + relaunched 09:44 local, both orchestrators recycled clean. Wiki vault reconciled: 11 merged tickets pruned from todo, 9 stale worktrees removed; kept `wiki-43-terminal-fidelity` (unmerged ~500-line commit, no PR — ship or drop), `wiki-41-native-surfaces` + `wiki-24-hidden-probe` (dirty).
+- **Orchestrator replaced 2026-07-14 ~09:45 local** (prior session cb6cace6 died post-merge mid-vault-logging); recovery clean, all durable steps completed.
 
 ## Recent facts
 
-- Admin agent readonly role: `LOGIN` only, `NOBYPASSRLS`, `default_transaction_read_only=on`, `statement_timeout='10s'`, `SELECT` on `app.*` only. Runtime tripwire `verify_read_only_postgres_connection` re-checks `is_superuser=false`, `bypasses_rls=false`, `has_table_privilege('app.organizations','INSERT')=false` on each pooled connection. 19 columns denied in catalog (all real secrets — OAuth tokens, EHR API keys, encrypted credentials, push tokens). Zero suspicious readable secret-pattern columns.
-- Post-truncation admin agent contract (PHO-13278): every admin tool output goes through central `admin_tool_result_caps` pipeline — trim collections → trim source links → envelope compaction → cap check → raise. Truncation marker = `{"kind","path","dropped","artifact_ref"}` uniform across all tools. Agent uses `admin_python_snippet_workflow` skill's 5 verbs (`read_run_data`/`search_run_data`/`slice_json`/`diff_run_data`/`run_admin_python_snippet`) against artifact_ref instead of re-running expensive query.
-- Call feed shape reference (`services/worker/handlers/system/call_analysis_run.py:95-427`) = the pattern PHO-13274 should mirror: hardcoded channel constant, parent = scannable header (emoji + name + one-line context), thread reply = full detail via `slack_markdown(text, max_chars=11500)` block (12k Slack `mrkdwn` cap), non-fatal try/except failure. Same `post_admin_operational_slack_thread` primitive for binding to a Phoebe run.
-- Adversarial diff review before merge-ready is the standard gate — delegated via code-review agent for large diffs, inline for small. Latent-vs-real MEDIUM triage: if it can trigger with real data or LLM retry (idempotency, char caps), fix inline; if purely defensive, follow-up ticket.
+- PHO-13646 gate history: round 1 found 1 blocker + 3 majors + 4 minors, all steered; round 2 adversarial verify confirmed 7/8 + caught residual Slack-path timeout (180s turn vs 480s tool); final deltas (lease + Slack timeout) reviewed inline, clean.
+- Curated-catalog cost audit method: prod EXPLAIN via readonly tunnel role ≠ tool path (admin_agent_readonly + app.mode) — 5-8x divergence; always validate through worker's real-path harness, worst-case org (e32e0940, 232k contact_attempts/28d), all 226 orgs.
+- `contact_attempts` deliberately has NO (org, created_at) index — heap fetches dominate; templates split/window-capped instead. Gate stays 50k, fail-closed.
+- Provider hang playbook proven: no events N min → nudge → interrupt + resend → `/replace` (same model, in-place, worktree/branch/PR survive).
+- Spawn contract: ALWAYS pass real worktree as `workdir` (not repo root) — fixes Wiki.app transcript mapping.
+- Modal image packaging class-bug OPEN: eagerly-imported lib reading repo files outside mounted dirs breaks voice deploys silently; no CI boots image fs. Candidate ticket: import-smoke + staging-deploy failure alert.
 
 ## Watchouts
 
-- Wiki NATIVE app = FROZEN build: backend/frontend fixes reach Wiki.app only after `make native-build` + relaunch.
-- Every schema-touching PR must run `migrate apply` locally before commit or main goes red on `//database:update_schema_0_test`. Two hotfix cycles already this week.
-- `admin_readable_schema_catalog.json` merge conflicts: deterministic generator (sort_keys=True), rebase regens cleanly. Reviewer fatigue on 78k-line diffs is real.
-- LLM tool retry after partial failure = duplicate Slack posts unless idempotency key persisted (PHO-13274 MEDIUM 2). Prompt-only "don't retry" guardrails are fragile.
-- Slack `mrkdwn` section text cap 3000 chars (blocks: 12,000). Test parent+detail sizing against realistic org sizes.
+- Schema-touching PRs: `migrate apply` locally before commit; catalog (78k) conflicts → regenerate, never hand-merge.
+- Investigation-only ship-shaped findings → file Linear ticket IMMEDIATELY.
+- Slack mrkdwn caps: section 3000, blocks 12000.
 - Local main PUSHED before spawns; refetch todo/map/hot before writing; screenshots = LOCAL /tmp paths.

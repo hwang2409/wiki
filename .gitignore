@@ -11,3 +11,4 @@ vite.config.d.ts
 .env
 .playwright-mcp/
 .obsidian/workspace.json
+build/
