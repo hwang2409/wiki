@@ -31,6 +31,7 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 
 - [[repo-guide]] — phoebe monorepo 0→1 routing: read-first stack per task, cold-start mistake list, documented gaps. Start here for any phoebe repo work.
 - [[admin-agent]] — Internal Admin Agent FULL architecture + state doc: code map, runtime, tool inventory, safety model, incidents, chronology, active work. THE one-read context for any admin-agent session.
+- [[admin-agent-audit-2026-07-14]] — Full 15-domain e2e audit of admin agent @ origin/main af8173bbfb: 134 tools, 63 endpoints, maturity assessment, ranked gaps/risks (5 HIGH), half-finished arcs.
 - [[recommendation-subagents]] — recommendation-subagents campaign (June–July 2026): changes, eval numbers, overfit arc.
 - [[pr10475-parity-loop]] — PR-10475 parity iteration protocol: OFF frozen, no eval overfit, 6-step loop until ON hits OFF-vs-OFF noise floor
 

@@ -27,6 +27,7 @@ Todo:
 - [P2] WIKI-106: knowledge.db rebuild never reclaims disk — no VACUUM/fresh-file swap in KnowledgeIndex.rebuild (knowledge.py:657); post-diet rebuild leaves 2.0G file for ~400M content. Also: CLI rebuild racing sidecar auto-rebuild dies with bare 'database is locked' (busy_timeout 750ms) — should detect concurrent rebuild and say so
 - [P2] WIKI-107: native_server sibling supervisor spawns log full PyInstaller tracebacks on lost single-instance race (daemon.py:48 'wiki supervisor is already running') — catch and exit 0 quietly; supervisor.log filled with benign ERROR noise every relaunch
 - [P2] WIKI-112: dead-archive.playwright.mjs fails on untouched main (4c41ed0) — TimeoutError waiting for WIKI-7801 Archive button; reproduced independently by gate reviewer + two workers 2026-07-14; either test rot or real dead-archive UI regression; unbreaks npm test chain baseline
+- [P2] wiki: compact mermaid artifact preview illegible for large diagrams — styles.css:6684 caps svg at 400px, scale-to-fit squeezes text to ~3px; fix = crop + click-to-inspect or min-scale floor (pan/zoom detail exists). File as WIKI ticket when Linear reauthed
 
 In Progress:
 
@@ -38,8 +39,6 @@ In Progress:
 - [P2] [PHO-13669](https://linear.app/phoebework/issue/PHO-13669): Core email/account-book gaps — cdx:PHO-13669 (gpt-5.6-terra)
 - [P2] [PHO-13676](https://linear.app/phoebework/issue/PHO-13676): in-flight tool-call dedup black hole — cdx:PHO-13676 (gpt-5.6-terra)
 - [P2] [PHO-13690](https://linear.app/phoebework/issue/PHO-13690): lifecycle-export atomic tools (curated query + CSV artifact + recipe) — cdx:PHO-13690 (gpt-5.6-terra)
-- [P2] WIKI-109: Cmd+K searches active worker/orchestrator sessions — e.g. type 'phoebe' -> jump to phoebe window; sessions as first-class palette results alongside notes — cdx:WIKI-109 (gpt-5.6-terra)
-- [P2] WIKI-110: blank-pane + Cmd+K session placement (builds on WIKI-109) — C-a p opens blank new pane; Cmd+K selection from a blank pane MOVES that session's pane there; from any non-blank context Cmd+K only FOCUSES the target (no move) — folded into cdx:WIKI-109 worker
 - [P1] WIKI-111: built-in agent harness — every orchestrator + worker run spawned from Wiki app self-knows its runtime: injected runtime card (spawned-by-wiki, backend port, run_id/ticket/orch identity, protocol + hot.md pointers), first-class wiki agent spawn/steer/replace/archive CLI verbs, orchestrator ops exposed as MCP tools alongside wiki-artifacts, skills/native-tooling discovery — kills per-run steering about how to spawn workers/call artifacts. ONE ticket, no split (Henry)
 
 Backlog:

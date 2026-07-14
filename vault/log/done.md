@@ -9,6 +9,7 @@ updated: 2026-07-14
 
 ## 2026-07-14
 
+- [WIKI-109](https://github.com/hwang2409/wiki/pull/88) Cmd+K session search + blank-pane placement (WIKI-110 folded) — sessions first-class palette results (dead/archived excluded), C-a p blank pane, move-only-from-blank semantics with pane-state key retention. Gate: 1 iteration + rebase over #87 (1 MEDIUM: palette selection reset under SSE churn). Merged 58c6c30 via #88.
 - [WIKI-108](https://github.com/hwang2409/wiki/pull/87) sidebar pages open in separate windows — utility:// pane identities, reuse-and-focus, standalone restore; settings modal untouched. Gate: 1 iteration (1 MEDIUM: npm test chain registration). Merged 47cddb0 via #87.
 - PHO-13669 merged (#11303, 17d7241ae6): account-book name filter (case-insensitive, projection-preserving, 100-row name-ordered scan) + HTML-only email bodies -> bounded redacted text (bs4) + embedded opening-marker neutralization in wrap_untrusted_evidence + account-health prompt diet
 - PHO-13666 merged (#11311, 89c9bdbc47): source_health.org_sync_history curated query (30d-bounded CTEs after 74k->21k cost evidence) + source_health cross-listed under ehr domain
