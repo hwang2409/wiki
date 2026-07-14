@@ -114,13 +114,9 @@ for raw_line in sys.stdin:
                 raise RuntimeError("wiki-artifacts MCP server missing from Claude config")
             artifact_id = str(uuid4())
             tool_use_id = "toolu_render_artifact"
-            event = {
-                "kind": "artifact",
-                "id": artifact_id,
-                "artifact": {"kind": "mermaid", "source": "graph TD; A-->B"},
-                "ts": datetime.now(timezone.utc).isoformat(),
-            }
-            output = f"<<wiki-artifact:v1>>{json.dumps(event, separators=(',', ':'))}<<end>>"
+            output = json.dumps(
+                {"artifact_id": artifact_id, "ok": True}, separators=(",", ":")
+            )
             assistant = {
                 "type": "assistant",
                 "session_id": session_id,

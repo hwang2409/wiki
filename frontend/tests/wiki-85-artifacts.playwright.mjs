@@ -11,7 +11,7 @@ import {
   writeQueue,
 } from "../scripts/wiki32-harness.mjs";
 
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "..", "..");
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const PYTHON = path.join(ROOT, ".venv", "bin", "python");
 const RUN_ID = "00000000-0000-4000-8000-000000000085";
 const TICKET = "WIKI-85";
@@ -184,9 +184,11 @@ function invokeFixtureWorker(fixtures, inputs) {
   const responses = result.stdout.trim().split("\n").map((line) => JSON.parse(line));
   return responses.slice(1).map((response) => {
     if (response.result?.isError) throw new Error(response.result.content?.[0]?.text || "artifact rejected");
+    const sentinel = response.result.content[0].text;
+    const event = JSON.parse(sentinel.slice("<<wiki-artifact:v1>>".length, -"<<end>>".length));
     return {
-      artifactId: response.result.structuredContent.artifact_id,
-      sentinel: response.result.content[0].text,
+      artifactId: event.id,
+      sentinel,
     };
   });
 }

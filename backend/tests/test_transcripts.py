@@ -130,6 +130,79 @@ class ArtifactTranscriptTests(unittest.TestCase):
                 self.assertEqual(event["artifact"], protocol_event["artifact"])
                 self.assertEqual(event["title"], f"Fixture {kind}")
 
+    def test_claude_structured_content_result_reconstructs_artifact_event(self) -> None:
+        path = FIXTURES_DIR / "claude_artifact_structured_content.jsonl"
+
+        parsed = transcripts.read_session_events("claude", path)
+
+        self.assertEqual(len(parsed["events"]), 1)
+        event = parsed["events"][0]
+        self.assertEqual(event["kind"], "artifact")
+        self.assertEqual(event["artifact_id"], "33b1c159-9d1e-4804-9b14-3d880ac2e3c7")
+        self.assertEqual(
+            event["artifact"],
+            {"kind": "mermaid", "source": "graph TD; A-->B"},
+        )
+        self.assertEqual(event["title"], "Fixture diagram")
+        self.assertEqual(event["caption"], "Structured result fallback")
+
+    def test_structured_artifact_fallback_rejects_errors_and_invalid_metadata(self) -> None:
+        valid_input = {
+            "kind": "mermaid",
+            "payload": {"source": "graph TD; A-->B"},
+        }
+        valid_id = "33b1c159-9d1e-4804-9b14-3d880ac2e3c7"
+        cases = [
+            (valid_input, {"artifact_id": valid_id, "ok": False}, None),
+            (valid_input, {"artifact_id": "not-a-uuid", "ok": True}, None),
+            ({**valid_input, "kind": "unknown"}, {"artifact_id": valid_id, "ok": True}, None),
+            (valid_input, {"artifact_id": valid_id, "ok": True}, "is_error"),
+            (valid_input, {"artifact_id": valid_id, "ok": True}, "isError"),
+        ]
+        for index, (tool_input, result, error_field) in enumerate(cases):
+            with self.subTest(index=index), TemporaryDirectory() as tmp:
+                call_id = f"artifact-{index}"
+                path = Path(tmp) / "claude.jsonl"
+                result_block = {
+                    "type": "tool_result",
+                    "tool_use_id": call_id,
+                    "content": json.dumps(result),
+                }
+                if error_field:
+                    result_block[error_field] = True
+                rows = [
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": call_id,
+                                    "name": "mcp__wiki-artifacts__render_artifact",
+                                    "input": tool_input,
+                                }
+                            ]
+                        },
+                    },
+                    {
+                        "type": "user",
+                        "message": {
+                            "content": [result_block]
+                        },
+                    },
+                ]
+                path.write_text(
+                    "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+                )
+
+                parsed = transcripts.read_session_events("claude", path)
+
+                self.assertEqual(len(parsed["events"]), 1)
+                event = parsed["events"][0]
+                self.assertEqual(event["kind"], "tool")
+                self.assertFalse(event["tool"]["ok"])
+                self.assertEqual(event["tool"]["summary"], "render_artifact rejected")
+
 
 def _write_rollout(day_dir: Path, name: str, cwd: str, session_id: str,
                    kickoff_ticket: str | None = None, mtime: float | None = None) -> Path:

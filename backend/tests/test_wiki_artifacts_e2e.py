@@ -128,8 +128,21 @@ class WikiArtifactsCallabilityTests(unittest.IsolatedAsyncioTestCase):
                     provider.value,
                     transcript_path,
                 )
-                self.assertTrue(
-                    any(event.get("kind") == "artifact" for event in session["events"])
+                artifact_events = [
+                    event for event in session["events"] if event.get("kind") == "artifact"
+                ]
+                self.assertEqual(len(artifact_events), 1)
+                self.assertEqual(
+                    artifact_events[0]["artifact"],
+                    {"kind": "mermaid", "source": "graph TD; A-->B"},
+                )
+                self.assertFalse(
+                    any(
+                        event.get("kind") == "tool"
+                        and (event.get("tool") or {}).get("summary")
+                        == "render_artifact rejected"
+                        for event in session["events"]
+                    )
                 )
 
 
