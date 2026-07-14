@@ -781,9 +781,9 @@ def cmd_links_unresolved(_args: argparse.Namespace) -> None:
         print(f"{row['src_note']} -> [[{row['dst_name']}]]")
 
 
-def cmd_index_rebuild(_args: argparse.Namespace) -> None:
+def cmd_index_rebuild(args: argparse.Namespace) -> None:
     try:
-        stats = _knowledge_index().rebuild()
+        stats = _knowledge_index().rebuild(include_legacy_archives=args.include_legacy)
     except knowledge.KnowledgeError as exc:
         fail(f"knowledge database unavailable: {exc}")
     print(json.dumps(stats.to_dict(), sort_keys=True))
@@ -922,7 +922,16 @@ def main() -> None:
 
     index = sub.add_parser("index", help="manage the rebuildable knowledge index")
     index_sub = index.add_subparsers(dest="index_command", required=True)
-    rebuild = index_sub.add_parser("rebuild", help="drop and rebuild the full index")
+    rebuild = index_sub.add_parser(
+        "rebuild",
+        help="drop and rebuild the index (supervisor archives only by default)",
+    )
+    rebuild.add_argument(
+        "--include-legacy",
+        action="store_true",
+        default=None,
+        help="also index pre-headless tmux archives (or set WIKI_KNOWLEDGE_INCLUDE_LEGACY=1)",
+    )
     rebuild.set_defaults(func=cmd_index_rebuild)
 
     args = parser.parse_args()
