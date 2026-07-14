@@ -2,7 +2,7 @@
 type: til
 tags: [agents, verification]
 created: 2026-07-08
-updated: 2026-07-08
+updated: 2026-07-14
 ---
 
 # Instance-pinning verification
@@ -10,9 +10,11 @@ updated: 2026-07-08
 
 ## The shape
 
-Multiple live instances of one system coexist; a fix or test silently validates instance A while the consumer runs instance B. Three bites on 2026-07-08 alone:
+Multiple live instances of one system coexist; a fix or test silently validates instance A while the consumer runs instance B. Four observed failures:
 
 - Bazel MCP runs the MAIN checkout — a worker's "passes locally" validated the wrong branch (PHO-13215 shard failure).
+- `worktree_bazel/run_bazel_test` without `worktree_path` ran its server's
+  `pho-13669` checkout during PHO-13690; pass the exact current worktree path.
 - The primary phoebe checkout sits on a stale branch — explore agents reported wrong repo facts twice; fix: `git fetch` + read via `git show <pinned-sha>:<path>`.
 - Wiki web backend (:8011) hot-reloads; the native Wiki.app sidecar is a FROZEN PyInstaller build — a resolver fix verified by curl was invisible in the app until `make native-build` + relaunch.
 
