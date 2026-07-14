@@ -74,8 +74,7 @@ class IngestStats:
     events_indexed: int = 0
     malformed_event_lines: int = 0
     event_chunks_excerpted: int = 0
-    tool_outputs_truncated: int = 0
-    base64_blobs_skipped: int = 0
+    base64_blob_lines_skipped: int = 0
     ansi_heavy_lines_skipped: int = 0
     legacy_runs_skipped: int = 0
     elapsed_seconds: float = 0.0
@@ -93,8 +92,7 @@ class IngestStats:
             "events_indexed",
             "malformed_event_lines",
             "event_chunks_excerpted",
-            "tool_outputs_truncated",
-            "base64_blobs_skipped",
+            "base64_blob_lines_skipped",
             "ansi_heavy_lines_skipped",
             "legacy_runs_skipped",
         ):
@@ -582,28 +580,26 @@ class KnowledgeIndex:
                         "DELETE FROM chunks WHERE source_kind = 'event' AND source_id = ? AND pos = ?",
                         (run_id, event.seq),
                     )
-                    if event.text is not None:
-                        connection.execute(
-                            """
-                            INSERT INTO chunks(
-                                source_kind, source_id, ticket, title, heading, text, pos
-                            ) VALUES ('event', ?, ?, ?, ?, ?, ?)
-                            """,
-                            (
-                                run_id,
-                                metadata.ticket,
-                                metadata.ticket or run_id,
-                                event.event_type,
-                                event.text,
-                                event.seq,
-                            ),
-                        )
-                        stats.chunks_indexed += 1
+                    connection.execute(
+                        """
+                        INSERT INTO chunks(
+                            source_kind, source_id, ticket, title, heading, text, pos
+                        ) VALUES ('event', ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            run_id,
+                            metadata.ticket,
+                            metadata.ticket or run_id,
+                            event.event_type,
+                            event.text,
+                            event.seq,
+                        ),
+                    )
+                    stats.chunks_indexed += 1
                     stats.events_indexed += 1
             stats.malformed_event_lines = batch.malformed_lines if batch else 0
             stats.event_chunks_excerpted = batch.event_chunks_excerpted if batch else 0
-            stats.tool_outputs_truncated = batch.tool_outputs_truncated if batch else 0
-            stats.base64_blobs_skipped = batch.base64_blobs_skipped if batch else 0
+            stats.base64_blob_lines_skipped = batch.base64_blob_lines_skipped if batch else 0
             stats.ansi_heavy_lines_skipped = batch.ansi_heavy_lines_skipped if batch else 0
             if stats.malformed_event_lines:
                 LOGGER.warning(

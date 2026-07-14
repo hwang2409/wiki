@@ -304,24 +304,34 @@ class KnowledgeIndexTests(unittest.TestCase):
         cases = (
             (
                 "item_commandExecution_outputDelta",
-                "toolneedle " + "x" * knowledge_runs.TOOL_OUTPUT_MAX_CHARS,
-                "tool_outputs_truncated",
+                "toolneedle " + "x" * knowledge_runs.EVENT_CHUNK_EXCERPT_MAX_CHARS,
+                "event_chunks_excerpted",
                 "toolneedle",
+                None,
             ),
             (
-                "agent_message",
-                "QUJD" * (knowledge_runs.BASE64_BLOB_MIN_CHARS // 4 + 1),
-                "base64_blobs_skipped",
-                None,
+                "item_commandExecution_outputDelta",
+                "usefulbase64needle survives\n"
+                + "data:image/png;base64,"
+                + "QUJD" * (knowledge_runs.BASE64_BLOB_MIN_CHARS // 4 + 1),
+                "base64_blob_lines_skipped",
+                "usefulbase64needle",
+                "data:image/png;base64",
             ),
             (
                 "codex_stderr",
-                "\x1b[31m" * 20 + "legacy pane redraw",
+                "usefulansineedle survives\n"
+                + "\x1b[31m" * 20
+                + "legacy pane redraw\n"
+                + "\x1b[31m" * 20
+                + "another redraw",
                 "ansi_heavy_lines_skipped",
-                None,
+                "usefulansineedle",
+                "\x1b[31m",
             ),
         )
-        for index, (event_type, text, counter, searchable) in enumerate(cases, start=1):
+        expected_counts = (1, 1, 2)
+        for index, (event_type, text, counter, searchable, removed) in enumerate(cases, start=1):
             run_dir = self.archive / f"filter-{index}" / "20260714-132000"
             run_dir.mkdir(parents=True)
             (run_dir / "run.json").write_text(
@@ -334,21 +344,18 @@ class KnowledgeIndexTests(unittest.TestCase):
                 encoding="utf-8",
             )
             stats = self.index.index_run_directory(run_dir)
-            self.assertEqual(getattr(stats, counter), 1)
-            if searchable:
-                self.assertEqual(
-                    self.index.search(searchable, kind="run")["results"][0]["run_id"],
-                    f"filter-{index}",
-                )
-            else:
+            self.assertEqual(getattr(stats, counter), expected_counts[index - 1])
+            self.assertEqual(
+                self.index.search(searchable, kind="run")["results"][0]["run_id"],
+                f"filter-{index}",
+            )
+            if removed:
                 with closing(sqlite3.connect(self.db)) as connection:
-                    self.assertEqual(
-                        connection.execute(
-                            "SELECT COUNT(*) FROM chunks WHERE source_kind = 'event' AND source_id = ?",
-                            (f"filter-{index}",),
-                        ).fetchone()[0],
-                        0,
-                    )
+                    stored = connection.execute(
+                        "SELECT text FROM chunks WHERE source_kind = 'event' AND source_id = ?",
+                        (f"filter-{index}",),
+                    ).fetchone()[0]
+                self.assertNotIn(removed, stored)
 
     def test_live_runs_are_indexed_lazily_and_delta_by_sequence(self) -> None:
         self.index.rebuild()
