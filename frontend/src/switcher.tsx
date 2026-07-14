@@ -5,6 +5,15 @@ import type { NoteSummary } from "./types";
 
 export type SwitcherPage = "graph" | "activity" | "health" | "agents";
 
+export type QuickSwitcherSession = {
+  id: string;
+  model: string | null;
+  orchestratorId: string | null;
+  provider: string | null;
+  role: string | null;
+  sessionKind: "orchestrator" | "worker";
+};
+
 export type FleetSwitcherItem = {
   key: string;
   value: string;
@@ -22,7 +31,13 @@ export type FleetSwitcherItem = {
 
 type SwitcherItem =
   | { kind: "note"; note: NoteSummary }
-  | { kind: "page"; page: SwitcherPage; label: string };
+  | { kind: "page"; page: SwitcherPage; label: string }
+  | { kind: "session"; session: QuickSwitcherSession };
+
+type SwitcherGroup = {
+  label: string;
+  items: SwitcherItem[];
+};
 
 const PAGES: Array<{ page: SwitcherPage; label: string }> = [
   { page: "graph", label: "Graph" },
@@ -63,54 +78,103 @@ function scoreNote(note: NoteSummary, query: string): number | null {
   return null;
 }
 
+function scoreSession(session: QuickSwitcherSession, query: string): number | null {
+  const fields = [
+    session.id,
+    session.role ?? "",
+    session.model ?? "",
+    session.orchestratorId ?? "",
+    session.provider ?? "",
+    session.sessionKind,
+  ].map((field) => field.toLowerCase());
+
+  if (fields.some((field) => field.startsWith(query))) return 0;
+  if (fields.some((field) => field.includes(query))) return 1;
+  if (fields.some((field) => isSubsequence(query, field))) return 2;
+  return null;
+}
+
+function itemKey(item: SwitcherItem) {
+  if (item.kind === "note") return `note:${item.note.id}`;
+  if (item.kind === "page") return `page:${item.page}`;
+  return `session:${item.session.id}`;
+}
+
+function sessionMeta(session: QuickSwitcherSession) {
+  return [session.role ?? session.sessionKind, session.model, session.provider]
+    .filter((part): part is string => Boolean(part))
+    .join(" · ");
+}
+
 export function QuickSwitcher({
   notes,
+  sessions,
   onClose,
   onOpen,
+  onOpenSession,
   onOpenPage
 }: {
   notes: NoteSummary[];
+  sessions: QuickSwitcherSession[];
   onClose: () => void;
   onOpen: (path: string) => void;
+  onOpenSession: (id: string) => void;
   onOpenPage: (page: SwitcherPage) => void;
 }) {
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState(0);
 
-  const results = useMemo<SwitcherItem[]>(() => {
+  const groups = useMemo<SwitcherGroup[]>(() => {
     const needle = query.trim().toLowerCase();
     if (!needle) {
       return [
-        ...notes.slice(0, 10).map((note): SwitcherItem => ({ kind: "note", note })),
-        ...PAGES.map((entry): SwitcherItem => ({ kind: "page", ...entry }))
-      ];
+        {
+          label: "Sessions",
+          items: sessions.slice(0, 10).map((session): SwitcherItem => ({ kind: "session", session })),
+        },
+        {
+          label: "Notes",
+          items: notes.slice(0, 10).map((note): SwitcherItem => ({ kind: "note", note })),
+        },
+        {
+          label: "Views",
+          items: PAGES.map((entry): SwitcherItem => ({ kind: "page", ...entry })),
+        },
+      ].filter((group) => group.items.length > 0);
     }
+
+    const sessionItems = sessions
+      .map((session) => ({ session, score: scoreSession(session, needle) }))
+      .filter((entry): entry is { session: QuickSwitcherSession; score: number } => entry.score !== null)
+      .sort((a, b) => a.score - b.score || a.session.id.localeCompare(b.session.id))
+      .slice(0, 10)
+      .map((entry): SwitcherItem => ({ kind: "session", session: entry.session }));
 
     const noteItems = notes
       .map((note) => ({ note, score: scoreNote(note, needle) }))
       .filter((entry): entry is { note: NoteSummary; score: number } => entry.score !== null)
       .sort((a, b) => a.score - b.score || a.note.path.localeCompare(b.note.path))
-      .map((entry): { item: SwitcherItem; score: number } => ({
-        item: { kind: "note", note: entry.note },
-        score: entry.score
-      }));
+      .slice(0, 10)
+      .map((entry): SwitcherItem => ({ kind: "note", note: entry.note }));
 
     const pageItems = PAGES.filter((entry) =>
       entry.label.toLowerCase().includes(needle)
-    ).map((entry): { item: SwitcherItem; score: number } => ({
-      item: { kind: "page", ...entry },
-      score: entry.label.toLowerCase().startsWith(needle) ? 0 : 1
-    }));
+    ).map((entry): SwitcherItem => ({ kind: "page", ...entry }));
 
-    return [...noteItems, ...pageItems]
-      .sort((a, b) => a.score - b.score)
-      .slice(0, 10)
-      .map((entry) => entry.item);
-  }, [notes, query]);
+    return [
+      { label: "Sessions", items: sessionItems },
+      { label: "Notes", items: noteItems },
+      { label: "Views", items: pageItems },
+    ].filter((group) => group.items.length > 0);
+  }, [notes, query, sessions]);
+
+  const results = useMemo(() => groups.flatMap((group) => group.items), [groups]);
 
   function activate(item: SwitcherItem) {
     if (item.kind === "note") {
       onOpen(item.note.path);
+    } else if (item.kind === "session") {
+      onOpenSession(item.session.id);
     } else {
       onOpenPage(item.page);
     }
@@ -149,7 +213,7 @@ export function QuickSwitcher({
       >
         <input
           autoFocus
-          placeholder="Find a note..."
+          placeholder="Find a note or session..."
           type="text"
           value={query}
           onChange={(event) => setQuery(event.target.value)}
@@ -157,32 +221,48 @@ export function QuickSwitcher({
         />
         <div className="quick-switcher-results">
           {results.length > 0 ? (
-            results.map((item, index) => {
-              const key = item.kind === "note" ? item.note.id : `page:${item.page}`;
-              const Icon = item.kind === "note" ? FileText : PAGE_ICONS[item.page];
-              return (
-                <button
-                  className={`quick-switcher-result${index === selected ? " is-selected" : ""}`}
-                  key={key}
-                  type="button"
-                  onClick={() => activate(item)}
-                  onMouseEnter={() => setSelected(index)}
-                >
-                  <Icon size={14} />
-                  {item.kind === "note" ? (
-                    <>
-                      <span className="quick-switcher-name">{basename(item.note.path)}</span>
-                      <span className="quick-switcher-path">{item.note.path}</span>
-                    </>
-                  ) : (
-                    <>
-                      <span className="quick-switcher-name">{item.label}</span>
-                      <span className="quick-switcher-path">page</span>
-                    </>
-                  )}
-                </button>
-              );
-            })
+            groups.map((group) => (
+              <div className="quick-switcher-group" key={group.label}>
+                <div className="quick-switcher-group-label">{group.label}</div>
+                {group.items.map((item) => {
+                  const index = results.indexOf(item);
+                  const Icon =
+                    item.kind === "note"
+                      ? FileText
+                      : item.kind === "session"
+                        ? Bot
+                        : PAGE_ICONS[item.page];
+                  return (
+                    <button
+                      className={`quick-switcher-result${index === selected ? " is-selected" : ""}`}
+                      key={itemKey(item)}
+                      type="button"
+                      onClick={() => activate(item)}
+                      onMouseEnter={() => setSelected(index)}
+                    >
+                      <Icon size={14} />
+                      {item.kind === "note" ? (
+                        <>
+                          <span className="quick-switcher-name">{basename(item.note.path)}</span>
+                          <span className="quick-switcher-path">{item.note.path}</span>
+                        </>
+                      ) : item.kind === "session" ? (
+                        <>
+                          <span className="quick-switcher-name">{item.session.id}</span>
+                          <span className="quick-switcher-session-badge">{item.session.sessionKind}</span>
+                          <span className="quick-switcher-path">{sessionMeta(item.session)}</span>
+                        </>
+                      ) : (
+                        <>
+                          <span className="quick-switcher-name">{item.label}</span>
+                          <span className="quick-switcher-path">page</span>
+                        </>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+            ))
           ) : (
             <div className="quick-switcher-empty">No matches</div>
           )}

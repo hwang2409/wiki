@@ -34,7 +34,12 @@ import {
   updateNote
 } from "./api";
 import type { AgentWorker, ArchivedWorker, NoteLinks, Orchestrator } from "./api";
-import { FleetSwitcher, QuickSwitcher, type FleetSwitcherItem } from "./switcher";
+import {
+  FleetSwitcher,
+  QuickSwitcher,
+  type FleetSwitcherItem,
+  type QuickSwitcherSession,
+} from "./switcher";
 import { SettingsModal, applyStoredFonts } from "./settings";
 import { ActivityFeed } from "./activity";
 import { AgentsSidebar, AgentsView, type AccountEvent } from "./agents";
@@ -83,7 +88,7 @@ type SplitPosition = "left" | "right" | "top" | "bottom";
 type DropZone = SplitPosition | "center";
 
 type Layout =
-  | { kind: "pane"; id: string; path: string }
+  | { kind: "pane"; id: string; path: string | null }
   | { kind: "split"; direction: "row" | "column"; ratio: number; first: Layout; second: Layout };
 
 type WorkspaceWindow = {
@@ -121,8 +126,8 @@ type LegacyStoredLayoutState = {
 
 type PaneInfo = {
   key: string;
-  kind: "agent" | "note" | "terminal" | "utility";
-  path: string;
+  kind: "agent" | "blank" | "note" | "terminal" | "utility";
+  path: string | null;
   ticket: string | null;
 };
 
@@ -167,12 +172,12 @@ function isPanePath(path: unknown): path is string {
   return typeof path === "string" && path.length > 0;
 }
 
-function isAgentPath(path: string): boolean {
-  return path.startsWith("agent://");
+function isAgentPath(path: string | null): path is string {
+  return Boolean(path?.startsWith("agent://"));
 }
 
-function isTerminalPath(path: string): boolean {
-  return path.startsWith("terminal://");
+function isTerminalPath(path: string | null): path is string {
+  return Boolean(path?.startsWith("terminal://"));
 }
 
 function utilityKindFromPanePath(path: string | null): UtilityMode | null {
@@ -188,7 +193,8 @@ function utilityLabel(kind: UtilityMode): string {
   return `${kind.slice(0, 1).toUpperCase()}${kind.slice(1)}`;
 }
 
-function paneKind(path: string): PaneInfo["kind"] {
+function paneKind(path: string | null): PaneInfo["kind"] {
+  if (path === null) return "blank";
   if (isAgentPath(path)) return "agent";
   if (isTerminalPath(path)) return "terminal";
   if (utilityKindFromPanePath(path)) return "utility";
@@ -222,7 +228,19 @@ function splitLayout(
   return node;
 }
 
-function replacePanePath(node: Layout, id: string, path: string): Layout {
+function replacePane(node: Layout, id: string, replacement: Extract<Layout, { kind: "pane" }>): Layout {
+  if (node.kind === "pane" && node.id === id) return replacement;
+  if (node.kind === "split") {
+    return {
+      ...node,
+      first: replacePane(node.first, id, replacement),
+      second: replacePane(node.second, id, replacement)
+    };
+  }
+  return node;
+}
+
+function replacePanePath(node: Layout, id: string, path: string | null): Layout {
   if (node.kind === "pane" && node.id === id) return { ...node, path };
   if (node.kind === "split") {
     return {
@@ -272,7 +290,7 @@ function removePane(node: Layout, id: string): { layout: Layout | null; removedP
 }
 
 function removePanePaths(node: Layout, predicate: (path: string) => boolean): Layout | null {
-  if (node.kind === "pane") return predicate(node.path) ? null : node;
+  if (node.kind === "pane") return node.path !== null && predicate(node.path) ? null : node;
   const first = removePanePaths(node.first, predicate);
   const second = removePanePaths(node.second, predicate);
   if (first === null) return second;
@@ -285,14 +303,18 @@ function layoutContains(node: Layout, key: string): boolean {
   return layoutContains(node.first, key) || layoutContains(node.second, key);
 }
 
+function paneInfo(node: Extract<Layout, { kind: "pane" }>): PaneInfo {
+  return {
+    key: node.id,
+    kind: paneKind(node.path),
+    path: node.path,
+    ticket: ticketFromPanePath(node.path),
+  };
+}
+
 function collectPaneInfos(node: Layout, panes: PaneInfo[] = []): PaneInfo[] {
   if (node.kind === "pane") {
-    panes.push({
-      key: node.id,
-      kind: paneKind(node.path),
-      path: node.path,
-      ticket: ticketFromPanePath(node.path),
-    });
+    panes.push(paneInfo(node));
     return panes;
   }
   collectPaneInfos(node.first, panes);
@@ -383,14 +405,7 @@ function firstPaneKey(node: Layout): string {
 
 function findPaneInfo(node: Layout, key: string): PaneInfo | null {
   if (node.kind === "pane") {
-    return node.id === key
-      ? {
-          key: node.id,
-          kind: paneKind(node.path),
-          path: node.path,
-          ticket: ticketFromPanePath(node.path),
-        }
-      : null;
+    return node.id === key ? paneInfo(node) : null;
   }
   return findPaneInfo(node.first, key) ?? findPaneInfo(node.second, key);
 }
@@ -407,7 +422,8 @@ function cwdBasename(path: string | null): string {
   return path ? path.split("/").slice(-1)[0] : "no cwd";
 }
 
-function paneLabel(path: string): string {
+function paneLabel(path: string | null): string {
+  if (path === null) return "new pane";
   const ticket = ticketFromPanePath(path);
   if (ticket) return ticket;
   const terminalId = terminalIdFromPanePath(path);
@@ -432,6 +448,7 @@ function normalizeWindow(
 ): WorkspaceWindow | null {
   function prune(node: Layout): Layout | null {
     if (node.kind === "pane") {
+      if (node.path === null) return node;
       if (!isPanePath(node.path)) return null;
       const ticket = ticketFromPanePath(node.path);
       if (ticket) {
@@ -491,7 +508,7 @@ function normalizeWindowWorkspaceState(state: WindowWorkspaceState): WindowWorks
   return { activeWindowId, windows };
 }
 
-function createSoloWindow(windowId: string, paneId: string, path: string): WorkspaceWindow {
+function createSoloWindow(windowId: string, paneId: string, path: string | null): WorkspaceWindow {
   return {
     id: windowId,
     layout: { kind: "pane", id: paneId, path },
@@ -1303,8 +1320,8 @@ export default function App() {
   }, [windowState]);
 
   useEffect(() => {
-    const liveWorkers = agentsState.workers;
-    if (liveWorkers === null) return;
+    const liveWorkers = agentsState.workers?.filter((worker) => worker.window_alive);
+    if (!liveWorkers) return;
     setWindowState((current) => {
       const openTickets = new Set(
         current.windows.flatMap((window) =>
@@ -1377,6 +1394,32 @@ export default function App() {
     }
     return map;
   }, [agentsState.archived, agentsState.orchestrators, agentsState.workers]);
+  const quickSwitcherSessions = useMemo<QuickSwitcherSession[]>(() => {
+    const sessions: QuickSwitcherSession[] = [];
+    for (const orch of agentsState.orchestrators) {
+      if (!orch.window_alive) continue;
+      sessions.push({
+        id: orch.id,
+        model: orch.model,
+        orchestratorId: null,
+        provider: orch.kind,
+        role: "orchestrator",
+        sessionKind: "orchestrator",
+      });
+    }
+    for (const worker of agentsState.workers ?? []) {
+      if (!worker.window_alive) continue;
+      sessions.push({
+        id: worker.ticket,
+        model: worker.model,
+        orchestratorId: worker.orch,
+        provider: worker.kind,
+        role: worker.role,
+        sessionKind: "worker",
+      });
+    }
+    return sessions.sort((left, right) => left.id.localeCompare(right.id));
+  }, [agentsState.orchestrators, agentsState.workers]);
   const fleetGroups = useMemo(
     () => buildFleetGroups(agentsState.workers ?? [], agentsState.orchestrators),
     [agentsState.orchestrators, agentsState.workers]
@@ -1428,7 +1471,9 @@ export default function App() {
 
     const openNotes = windowState.windows.flatMap((window, index) =>
       collectPaneInfos(window.layout)
-        .filter((pane) => pane.kind === "note")
+        .filter((pane): pane is PaneInfo & { kind: "note"; path: string } =>
+          pane.kind === "note" && pane.path !== null
+        )
         .map((pane) => ({ index, pane, window }))
     );
     if (openNotes.length > 0) {
@@ -1729,6 +1774,104 @@ export default function App() {
     requestAnimationFrame(() => paneRefs.current.get(newPaneId)?.focus());
   }
 
+  function createBlankPane() {
+    const blankPaneId = nextPaneId();
+    const blankPane: Extract<Layout, { kind: "pane" }> = {
+      kind: "pane",
+      id: blankPaneId,
+      path: null,
+    };
+
+    if (!activeWindow || !focusedPaneId) {
+      const windowId = nextWindowId();
+      setWindowState((current) =>
+        normalizeWindowWorkspaceState({
+          activeWindowId: windowId,
+          windows: [...current.windows, createSoloWindow(windowId, blankPaneId, null)],
+        })
+      );
+    } else {
+      setWindowState((current) =>
+        normalizeWindowWorkspaceState({
+          activeWindowId: activeWindow.id,
+          windows: current.windows.map((window) =>
+            window.id === activeWindow.id
+              ? {
+                  ...window,
+                  focusedPaneId: blankPaneId,
+                  layout: splitLayout(window.layout, focusedPaneId, "right", blankPane),
+                }
+              : window
+          ),
+        })
+      );
+    }
+    if (zoomedPaneId) setZoomedPaneId(null);
+    requestAnimationFrame(() => paneRefs.current.get(blankPaneId)?.focus());
+    syncRouteToPath(null);
+  }
+
+  function moveSessionToFocusedBlankPane(ticket: string): boolean {
+    if (!activeWindow || !focusedPaneId) return false;
+    const target = findPaneInfo(activeWindow.layout, focusedPaneId);
+    if (target?.kind !== "blank") return false;
+
+    closedTicketsRef.current.delete(ticket);
+    const source = findPaneLocationByTicket(ticket);
+    if (!source) {
+      const path = `agent://${ticket}`;
+      setWindowState((current) =>
+        normalizeWindowWorkspaceState({
+          activeWindowId: activeWindow.id,
+          windows: current.windows.map((window) =>
+            window.id === activeWindow.id
+              ? {
+                  ...window,
+                  focusedPaneId,
+                  layout: replacePanePath(window.layout, focusedPaneId, path),
+                }
+              : window
+          ),
+        })
+      );
+      requestAnimationFrame(() => paneRefs.current.get(focusedPaneId)?.focus());
+      syncRouteToPath(path);
+      return true;
+    }
+
+    const nextWindows = windowState.windows.map((window) => ({ ...window }));
+    const sourceIndex = nextWindows.findIndex((window) => window.id === source.window.id);
+    if (sourceIndex < 0) return false;
+    const removal = removePane(nextWindows[sourceIndex].layout, source.pane.key);
+    if (removal.layout) nextWindows[sourceIndex].layout = removal.layout;
+    else nextWindows.splice(sourceIndex, 1);
+
+    const targetWindow = nextWindows.find((window) => window.id === activeWindow.id);
+    if (!targetWindow) return false;
+    targetWindow.layout = replacePane(targetWindow.layout, focusedPaneId, {
+      kind: "pane",
+      // Retain the source key so the session surface keeps its cached state.
+      id: source.pane.key,
+      path: source.pane.path,
+    });
+    targetWindow.focusedPaneId = source.pane.key;
+
+    const nextState = normalizeWindowWorkspaceState({
+      activeWindowId: targetWindow.id,
+      windows: nextWindows,
+    });
+    if (zoomedPaneId === focusedPaneId) setZoomedPaneId(source.pane.key);
+    else if (zoomedPaneId && zoomedPaneId !== source.pane.key) setZoomedPaneId(null);
+    setWindowState(nextState);
+    requestAnimationFrame(() => paneRefs.current.get(source.pane.key)?.focus());
+    syncRouteToPath(source.pane.path);
+    return true;
+  }
+
+  function openSessionFromSwitcher(ticket: string) {
+    if (!moveSessionToFocusedBlankPane(ticket)) openAgent(ticket);
+  }
+
   function showTerminalRoute(
     terminalId: string,
     options: { launch?: boolean; splitIfNew?: boolean; syncHash?: boolean } = {}
@@ -1902,6 +2045,10 @@ export default function App() {
     }
     if (lowerKey === "w") {
       setWindowChooserOpen(true);
+      return;
+    }
+    if (lowerKey === "p") {
+      createBlankPane();
       return;
     }
     if (lowerKey === "t") {
@@ -2716,7 +2863,7 @@ export default function App() {
 
     if (node.kind === "pane") {
       const focused = focusedPaneId === node.id;
-      const overlayContent = focused ? renderFocusedPaneOverlayContent() : null;
+      const overlayContent = focused && node.path !== null ? renderFocusedPaneOverlayContent() : null;
       const agentContext =
         paneInfos.length === 1 || zoomedPaneId === node.id ? "full" : "pane";
       const noteFocusState: PaneNoteFocusState =
@@ -3208,10 +3355,18 @@ export default function App() {
       {switcherOpen ? (
         <QuickSwitcher
           notes={notes}
-          onClose={() => setSwitcherOpen(false)}
+          sessions={quickSwitcherSessions}
+          onClose={() => {
+            setSwitcherOpen(false);
+            requestAnimationFrame(() => focusedPaneId && paneRefs.current.get(focusedPaneId)?.focus());
+          }}
           onOpen={(path) => {
             setSwitcherOpen(false);
             openNote(path);
+          }}
+          onOpenSession={(ticket) => {
+            setSwitcherOpen(false);
+            openSessionFromSwitcher(ticket);
           }}
           onOpenPage={(page) => {
             setSwitcherOpen(false);
