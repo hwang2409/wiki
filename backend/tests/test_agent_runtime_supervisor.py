@@ -2643,6 +2643,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             self.store,
             FixtureAdapterFactory(FIXTURES, pid=987_654),
             pid_alive=lambda _pid: False,
+            adapter_detach_grace_seconds=0.1,
         )
         record = await self.supervisor.start_run(
             agent_id="WIKI-STREAM",
@@ -2654,6 +2655,8 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             prompt="Work on ticket WIKI-STREAM",
         )
         await _wait_for_events(self.store, record.run_id, 10)
+        registry = json.loads(self.paths.registry_path.read_text(encoding="utf-8"))
+        self.assertTrue(registry["WIKI-STREAM"]["current"]["control_attached"])
         adapter = self.supervisor.adapters[record.run_id]
         await adapter.close()
         for _ in range(200):
@@ -2661,10 +2664,20 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 break
             await asyncio.sleep(0.01)
         self.assertNotIn(record.run_id, self.supervisor.adapters)
+        self.assertIn(record.run_id, self.supervisor.detached_at_monotonic)
+        registry = json.loads(self.paths.registry_path.read_text(encoding="utf-8"))
+        self.assertFalse(registry["WIKI-STREAM"]["current"]["control_attached"])
         interrupted = self.store.get(record.run_id)
         self.assertEqual(interrupted.state, LifecycleState.IDLE)
         self.assertEqual(interrupted.state_reason, "provider event stream ended")
 
+        delayed_recovery = await self.supervisor.recover_on_start()
+        delayed = next(
+            item for item in delayed_recovery if item["run_id"] == record.run_id
+        )
+        self.assertEqual(delayed["action"], "block")
+        self.assertEqual(delayed["reason"], "provider control channel recently detached")
+        await asyncio.sleep(0.11)
         recovery = await self.supervisor.recover_on_start()
         result = next(item for item in recovery if item["run_id"] == record.run_id)
         self.assertEqual(result["action"], "resume")

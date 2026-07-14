@@ -89,7 +89,8 @@ class FakeSupervisorClient:
             "orch": params.get("orchestrator_id"),
             "state": "working",
             "provider_session_id": f"session-{run_id[-2:]}",
-            "provider_pid": os.getpid(),
+            "provider_pid": 4242,
+            "control_attached": True,
             "transcript": None,
             "log": str(self.raw_path),
             "window": None,
@@ -644,10 +645,10 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(worker["window_alive"])
         self.assertEqual(self.client.calls, [])
 
-    async def test_agents_marks_dead_provider_detached_without_supervisor_rpc(self) -> None:
+    async def test_agents_uses_projected_control_attachment_without_supervisor_rpc(self) -> None:
         self._seed_headless()
         registry = json.loads(self.registry.read_text(encoding="utf-8"))
-        registry["WIKI-42"]["current"]["provider_pid"] = 999999
+        registry["WIKI-42"]["current"]["control_attached"] = False
         self.registry.write_text(json.dumps(registry), encoding="utf-8")
 
         payload = main.agents()

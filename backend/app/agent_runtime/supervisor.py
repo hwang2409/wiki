@@ -37,6 +37,7 @@ from .version import RUNTIME_FINGERPRINT
 AdapterFactory = Callable[[RunRecord], ProviderAdapter]
 DEFAULT_REAPER_INTERVAL_SECONDS = 30.0
 DEFAULT_REAPER_GRACE_SECONDS = 60.0
+DEFAULT_ADAPTER_DETACH_GRACE_SECONDS = 1.0
 DEFAULT_IDEMPOTENCY_CACHE_SIZE = 256
 DEFAULT_WORKER_SOFT_CAP = 5
 _IDEMPOTENT_METHODS = frozenset({"run/start", "run/send_now", "run/send_on_idle"})
@@ -173,6 +174,7 @@ class Supervisor:
         recovery_stability_seconds: float = 30.0,
         reaper_interval_seconds: float | None = None,
         reaper_grace_seconds: float | None = None,
+        adapter_detach_grace_seconds: float = DEFAULT_ADAPTER_DETACH_GRACE_SECONDS,
         orphan_archive_grace_seconds: float = 0.5,
         idempotency_cache_size: int = DEFAULT_IDEMPOTENCY_CACHE_SIZE,
         worker_soft_cap: int | None = None,
@@ -204,6 +206,9 @@ class Supervisor:
                     DEFAULT_REAPER_GRACE_SECONDS,
                 )
             ),
+        )
+        self.adapter_detach_grace_seconds = _validated_seconds(
+            "adapter_detach_grace_seconds", adapter_detach_grace_seconds
         )
         self.last_reaper_at = 0.0
         self.detached_at_monotonic: dict[str, float] = {}
@@ -432,6 +437,13 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
     def _clear_adapter_loss(self, run_id: str) -> None:
         self.detached_at_monotonic.pop(run_id, None)
 
+    def _adapter_recently_detached(self, run_id: str) -> bool:
+        detached_at = self.detached_at_monotonic.get(run_id)
+        return (
+            detached_at is not None
+            and self._seconds_since(detached_at) < self.adapter_detach_grace_seconds
+        )
+
     def _reapable_adapter_loss(self, record: RunRecord) -> bool:
         if record.state in TERMINAL_STATES:
             self._clear_adapter_loss(record.run_id)
@@ -539,7 +551,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             except (RunNotFound, ValueError):
                 record = None
             self._remove_adapter_mapping(run_id, adapter)
-            if record is not None and record.provider_pid is None:
+            if record is not None:
                 self._mark_adapter_loss(run_id)
             if record is not None:
                 await self._publish_agent_change(record.agent_id)
@@ -1041,6 +1053,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
     def _remove_adapter_mapping(self, run_id: str, adapter: ProviderAdapter) -> None:
         if self.adapters.get(run_id) is adapter:
             self.adapters.pop(run_id, None)
+            try:
+                self.store.set_control_attached(run_id, False)
+            except RunNotFound:
+                pass
         adapter_key = id(adapter)
         self.event_routes = {
             key: target
@@ -1059,6 +1075,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         if old_task is not None:
             old_task.cancel()
         self.adapters[run_id] = adapter
+        self.store.set_control_attached(run_id, True)
         self.event_tasks[run_id] = asyncio.create_task(
             self._pump_events(run_id, adapter),
             name=f"agent-events-{run_id}",
@@ -1069,6 +1086,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
     ) -> None:
         self._clear_adapter_loss(run_id)
         adapter = self.adapters.pop(run_id, None)
+        if adapter is not None:
+            try:
+                self.store.set_control_attached(run_id, False)
+            except RunNotFound:
+                pass
         task = self.event_tasks.pop(run_id, None)
         if task is not None:
             task.cancel()
@@ -1871,6 +1893,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 "run_id": record.run_id,
                 "action": RecoveryAction.RETAIN.value,
                 "reason": "provider control channel is attached",
+            }
+        if self._adapter_recently_detached(record.run_id):
+            return {
+                "run_id": record.run_id,
+                "action": RecoveryAction.BLOCK.value,
+                "reason": "provider control channel recently detached",
             }
         if record.automatic_resume_suppressed:
             return {

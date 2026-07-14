@@ -654,18 +654,6 @@ def _archive_runtime_identity(
     return entry, model, kind, provider
 
 
-def _pid_is_alive(pid: object) -> bool:
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
 def _supervisor_pid_is_alive() -> bool:
     """Avoid a queued supervisor RPC when annotating a registry snapshot."""
 
@@ -674,7 +662,15 @@ def _supervisor_pid_is_alive() -> bool:
         pid = int(raw_pid)
     except (AttributeError, OSError, ValueError):
         return False
-    return _pid_is_alive(pid)
+    if pid <= 1:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 @app.get("/api/agents")
@@ -742,7 +738,7 @@ def agents() -> dict[str, object]:
         runtime = current if headless else {}
         runtime_state = runtime.get("state") if headless else None
         control_attached = (
-            supervisor_alive and _pid_is_alive(runtime.get("provider_pid"))
+            supervisor_alive and runtime.get("control_attached") is True
             if headless
             else False
         )
