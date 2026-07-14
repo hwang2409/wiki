@@ -7,7 +7,9 @@ import os
 import subprocess
 import sys
 import textwrap
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -374,6 +376,382 @@ class AgentDoneWindowCleanupTests(unittest.TestCase):
             self.assertNotEqual(proc.returncode, 0)
             self.assertIn("supervisor-owned headless run WIKI-26", proc.stderr)
             self.assertIn("WIKI-26", json.loads(registry_path.read_text(encoding="utf-8")))
+
+
+class _WatchApi:
+    def __init__(self, responder):
+        self.responder = responder
+        self.requests: list[str] = []
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler API
+                owner.requests.append(self.path)
+                status, payload = owner.responder(self.path)
+                encoded = json.dumps(payload).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, _format, *_args):
+                return
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_args):
+        self.server.shutdown()
+        self.thread.join(timeout=5)
+        self.server.server_close()
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.server.server_port}"
+
+
+class AgentWatchTests(unittest.TestCase):
+    def _run(self, args: list[str], env: dict) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(WIKI_CLI), *args],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=20,
+        )
+
+    @staticmethod
+    def _worker(*, state: str = "working", last_event_at: str | None = None) -> dict:
+        worker = {
+            "ticket": "WIKI-103",
+            "runtime_state": state,
+            "state_reason": None,
+            "provider_pid": 4242,
+        }
+        if last_event_at is not None:
+            worker["lastEventAt"] = last_event_at
+        return worker
+
+    def test_watch_dedupes_status_and_emits_each_changed_content_once(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            status_dir = tmp_path / "status"
+            status_dir.mkdir()
+            status_path = status_dir / "WIKI-103.json"
+            status_path.write_text(json.dumps({
+                "state": "working", "pr": None, "step": "first", "blocker": None,
+            }))
+            polls = 0
+
+            def responder(path: str) -> tuple[int, dict]:
+                nonlocal polls
+                if path.startswith("/api/agents/WIKI-103/events"):
+                    return 200, {"events": []}
+                self.assertEqual(path, "/api/agents")
+                polls += 1
+                if polls == 6:
+                    status_path.write_text(json.dumps({
+                        "state": "working", "pr": None, "step": "second", "blocker": None,
+                    }))
+                elif polls == 7:
+                    status_path.write_text(json.dumps({
+                        "state": "merge-ready", "pr": None, "step": "ready", "blocker": None,
+                    }))
+                return 200, {"workers": [self._worker()]}
+
+            with _WatchApi(responder) as api:
+                env = {
+                    **os.environ,
+                    "WIKI_AGENT_STATUS_DIR": str(status_dir),
+                    "WIKI_BACKEND_URL": api.url,
+                    "WIKI_AGENT_RUNTIME_DIR": str(tmp_path / "runtime"),
+                }
+                proc = self._run(
+                    ["agent", "watch", "WIKI-103", "--json", "--interval", "0", "--until", "merge-ready"],
+                    env,
+                )
+
+            self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+            events = [json.loads(line) for line in proc.stdout.splitlines()]
+            statuses = [event for event in events if event["kind"] == "status"]
+            self.assertEqual([event["step"] for event in statuses], ["first", "second", "ready"])
+            self.assertEqual(sum(event["merge_ready"] for event in statuses), 1)
+            self.assertEqual(polls, 7)
+
+    def test_watch_until_terminal_and_stall(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            status_dir = tmp_path / "status"
+            status_dir.mkdir()
+            (status_dir / "WIKI-103.json").write_text(json.dumps({
+                "state": "working", "pr": None, "step": "waiting", "blocker": None,
+            }))
+
+            def responder(path: str) -> tuple[int, dict]:
+                if path.startswith("/api/agents/WIKI-103/events"):
+                    return 200, {"events": []}
+                return 200, {"workers": [self._worker(state="dead", last_event_at="2000-01-01T00:00:00Z")]}
+
+            with _WatchApi(responder) as api:
+                env = {
+                    **os.environ,
+                    "WIKI_AGENT_STATUS_DIR": str(status_dir),
+                    "WIKI_BACKEND_URL": api.url,
+                }
+                proc = self._run(
+                    ["agent", "watch", "WIKI-103", "--json", "--until", "terminal", "--stall-secs", "1"],
+                    env,
+                )
+
+            self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+            events = [json.loads(line) for line in proc.stdout.splitlines()]
+            self.assertTrue(any(event["kind"] == "terminal" and event["terminal"] == "dead" for event in events))
+            self.assertFalse(any(event["kind"] == "stall" and event.get("active") for event in events))
+
+    def test_watch_emits_stall_from_last_event_at(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            status_dir = tmp_path / "status"
+            status_dir.mkdir()
+            (status_dir / "WIKI-103.json").write_text(json.dumps({
+                "state": "merge-ready", "pr": None, "step": "ready", "blocker": None,
+            }))
+
+            def responder(path: str) -> tuple[int, dict]:
+                if path.startswith("/api/agents/WIKI-103/events"):
+                    return 200, {"events": []}
+                return 200, {"workers": [self._worker(last_event_at="2000-01-01T00:00:00Z")]}
+
+            with _WatchApi(responder) as api:
+                proc = self._run(
+                    ["agent", "watch", "WIKI-103", "--json", "--until", "merge-ready", "--stall-secs", "1"],
+                    {**os.environ, "WIKI_AGENT_STATUS_DIR": str(status_dir), "WIKI_BACKEND_URL": api.url},
+                )
+
+            self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+            events = [json.loads(line) for line in proc.stdout.splitlines()]
+            self.assertTrue(any(event["kind"] == "stall" and event.get("active") for event in events))
+
+    def test_watch_until_merged_and_backend_down_exit_codes(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            status_dir = tmp_path / "status"
+            status_dir.mkdir()
+            (status_dir / "WIKI-103.json").write_text(json.dumps({
+                "state": "working", "pr": "https://github.com/example/wiki/pull/103", "step": "waiting", "blocker": None,
+            }))
+            bin_dir = tmp_path / "bin"
+            bin_dir.mkdir()
+            self._write_fake_gh(bin_dir)
+
+            def responder(path: str) -> tuple[int, dict]:
+                if path.startswith("/api/agents/WIKI-103/events"):
+                    return 200, {"events": []}
+                return 200, {"workers": [self._worker()]}
+
+            with _WatchApi(responder) as api:
+                env = {
+                    **os.environ,
+                    "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+                    "FAKE_GH_SCENARIO": "merged",
+                    "WIKI_AGENT_STATUS_DIR": str(status_dir),
+                    "WIKI_BACKEND_URL": api.url,
+                }
+                merged = self._run(["agent", "watch", "WIKI-103", "--json", "--until", "merged"], env)
+
+            self.assertEqual(merged.returncode, 0, msg=merged.stderr)
+            self.assertTrue(any(json.loads(line)["kind"] == "pr" for line in merged.stdout.splitlines()))
+            down = self._run(
+                ["agent", "watch", "WIKI-103", "--json", "--no-retry"],
+                {**env, "WIKI_BACKEND_URL": "http://127.0.0.1:1"},
+            )
+            self.assertEqual(down.returncode, 3)
+            self.assertTrue(any(json.loads(line)["kind"] == "warning" for line in down.stdout.splitlines()))
+
+    def test_watch_rejects_unknown_worker(self) -> None:
+        with _WatchApi(lambda _path: (200, {"workers": []})) as api:
+            proc = self._run(
+                ["agent", "watch", "WIKI-103", "--no-retry"],
+                {**os.environ, "WIKI_BACKEND_URL": api.url},
+            )
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("WIKI-103 was not found", proc.stderr)
+
+    def _write_fake_gh(self, bin_dir: Path) -> None:
+        script = bin_dir / "gh"
+        script.write_text(textwrap.dedent(
+            """\
+            #!/usr/bin/env python3
+            import json
+            import os
+            import sys
+
+            scenario = os.environ.get("FAKE_GH_SCENARIO", "ready")
+            args = sys.argv[1:]
+            if args[:2] == ["pr", "view"]:
+                if scenario == "not-found":
+                    sys.stderr.write("pull request not found\\n")
+                    raise SystemExit(1)
+                state = "MERGED" if scenario == "merged" else "OPEN"
+                print(json.dumps({
+                    "state": state,
+                    "isDraft": scenario == "draft",
+                    "mergeable": "CONFLICTING" if scenario == "not-mergeable" else "MERGEABLE",
+                    "mergeStateStatus": "CLEAN",
+                    "headRefOid": "abcdef0123456789",
+                    "url": "https://github.com/example/wiki/pull/103",
+                }))
+            elif args[:2] == ["pr", "checks"]:
+                if scenario == "failing-checks":
+                    print(json.dumps([{ "name": "test", "state": "FAILURE" }]))
+                    raise SystemExit(8)
+                if scenario == "no-checks":
+                    print("[]")
+                else:
+                    print(json.dumps([{ "name": "test", "state": "SUCCESS" }]))
+            elif args[:2] == ["api", "graphql"]:
+                unresolved = [] if scenario != "unresolved" else [{ "isResolved": False }, { "isResolved": False }]
+                print(json.dumps({"data": {"resource": {"reviewThreads": {
+                    "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": unresolved
+                }}}}))
+            else:
+                sys.stderr.write("unexpected gh call: " + repr(args) + "\\n")
+                raise SystemExit(97)
+            """
+        ), encoding="utf-8")
+        script.chmod(0o755)
+
+
+class GateTests(unittest.TestCase):
+    _run = AgentWatchTests._run
+    _write_fake_gh = AgentWatchTests._write_fake_gh
+
+    def test_gate_json_verdicts_and_exit_codes(self) -> None:
+        cases = {
+            "ready": (0, []),
+            "draft": (1, ["draft"]),
+            "failing-checks": (1, ["checks-failing"]),
+            "no-checks": (0, []),
+            "unresolved": (1, ["unresolved-threads:2"]),
+            "not-mergeable": (1, ["not-mergeable"]),
+        }
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bin_dir = tmp_path / "bin"
+            bin_dir.mkdir()
+            self._write_fake_gh(bin_dir)
+            for scenario, (code, reasons) in cases.items():
+                with self.subTest(scenario=scenario):
+                    proc = self._run(
+                        ["gate", "103", "--repo", "example/wiki", "--expect-sha", "abcdef", "--json"],
+                        {
+                            **os.environ,
+                            "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+                            "FAKE_GH_SCENARIO": scenario,
+                        },
+                    )
+                    self.assertEqual(proc.returncode, code, msg=proc.stderr)
+                    payload = json.loads(proc.stdout)
+                    self.assertEqual(payload["ready"], code == 0)
+                    self.assertEqual(payload["reasons"], reasons)
+                    if scenario == "no-checks":
+                        self.assertEqual(payload["notes"], ["no-checks-reported"])
+
+    def test_gate_reports_sha_mismatch_and_pr_not_found_as_usage_error(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bin_dir = tmp_path / "bin"
+            bin_dir.mkdir()
+            self._write_fake_gh(bin_dir)
+            mismatch = self._run(
+                ["gate", "103", "--repo", "example/wiki", "--expect-sha", "wrong", "--json"],
+                {**os.environ, "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}"},
+            )
+            self.assertEqual(mismatch.returncode, 1)
+            self.assertEqual(json.loads(mismatch.stdout)["reasons"], ["sha-mismatch"])
+            missing = self._run(
+                ["gate", "103", "--repo", "example/wiki", "--json"],
+                {
+                    **os.environ,
+                    "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+                    "FAKE_GH_SCENARIO": "not-found",
+                },
+            )
+            self.assertEqual(missing.returncode, 2)
+            self.assertIn("pull request not found", missing.stderr)
+
+
+class TodoCompleteTests(unittest.TestCase):
+    def _run(self, args: list[str], env: dict) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(WIKI_CLI), *args],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=20,
+        )
+
+    def _vault(self, root: Path) -> Path:
+        vault = root / "vault"
+        (vault / "log").mkdir(parents=True, exist_ok=True)
+        (vault / "todo.md").write_text(textwrap.dedent("""\
+            ---
+            type: reference
+            tags: [meta]
+            created: 2026-07-14
+            updated: 2026-07-14
+            ---
+
+            Todo:
+
+            - [P1] WIKI-103: concise item
+
+            In Progress:
+
+            Backlog:
+        """), encoding="utf-8")
+        (vault / "log" / "done.md").write_text(textwrap.dedent("""\
+            ---
+            type: log
+            tags: [log, done]
+            created: 2026-07-14
+            updated: 2026-07-14
+            ---
+
+            # Done
+        """), encoding="utf-8")
+        (vault / "map.md").write_text("# Map\n\n- [[todo]] — tasks\n", encoding="utf-8")
+        return vault
+
+    def test_default_removes_only_and_done_line_is_opt_in(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            vault = self._vault(tmp_path)
+            env = {
+                **os.environ,
+                "WIKI_VAULT_DIR": str(vault),
+                "WIKI_AGENT_RUNTIME_DIR": str(tmp_path / "runtime"),
+            }
+            done_path = vault / "log" / "done.md"
+            before = done_path.read_text(encoding="utf-8")
+            default = self._run(["todo", "complete", "WIKI-103"], env)
+            self.assertEqual(default.returncode, 0, msg=default.stderr)
+            self.assertIn("no done.md line written", default.stdout)
+            self.assertNotIn("WIKI-103", (vault / "todo.md").read_text(encoding="utf-8"))
+            self.assertEqual(done_path.read_text(encoding="utf-8"), before)
+
+            self._vault(tmp_path)
+            with_line = self._run(["todo", "complete", "WIKI-103", "--done-line", "wiki: terse completion"], env)
+            self.assertEqual(with_line.returncode, 0, msg=with_line.stderr)
+            done = done_path.read_text(encoding="utf-8")
+            self.assertEqual(done.count("- **wiki** — terse completion"), 1)
+            lint = self._run(["lint"], env)
+            self.assertEqual(lint.returncode, 0, msg=lint.stdout + lint.stderr)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,9 @@ Hot-path writes with validation, so conventions hold mechanically:
 
   wiki todo add "text" [--priority P1] [--section Todo]
   wiki todo move "substring" --to "In Progress"
-  wiki todo complete "substring"
+  wiki todo complete "substring" [--done-line "terse completion"]
+  wiki agent watch <ticket> [--json] [--until merge-ready|terminal|merged]
+  wiki gate <pr-number> [--expect-sha SHA] [--json]
   wiki log-done "project: summary (links)"
   wiki note new <topic>/<slug> --type til --hook "map hook line" [--title T] [--tags a,b]
   wiki lint
@@ -23,7 +25,11 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
+from urllib.request import urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from backend.app import knowledge, vaultops  # noqa: E402
@@ -42,6 +48,7 @@ AGENT_REGISTRY = Path(
 AGENT_ARCHIVE = Path(
     os.environ.get("WIKI_AGENT_ARCHIVE_DIR") or Path.home() / "me" / "fun" / "agent-archive"
 )
+AGENT_STATUS_DIR = Path(os.environ.get("WIKI_AGENT_STATUS_DIR") or "/tmp/agent-status")
 AGENT_ROLES = {"plan", "implement", "review"}
 AGENT_OUTCOMES = {"merged", "closed", "plan-ready", "abandoned", "handoff"}
 
@@ -221,9 +228,11 @@ def cmd_todo_complete(args: argparse.Namespace) -> None:
     item = lines.pop(index)
     bump_updated(lines)
     write_lines(TODO, lines)
-    summary = re.sub(r"^\[P\d\]\s*", "", ITEM_RE.match(item).group(1))
-    entry = append_done_line(summary)
-    print(f"completed: {item}\nlogged: {entry}")
+    if args.done_line:
+        entry = append_done_line(args.done_line.strip())
+        print(f"completed: {item}\nlogged: {entry}")
+        return
+    print(f"completed: {item}\nno done.md line written (use --done-line to add one)")
 
 
 def cmd_log_done(args: argparse.Namespace) -> None:
@@ -578,6 +587,489 @@ def cmd_agent_list(_args: argparse.Namespace) -> None:
         )
 
 
+class WatchBackendError(RuntimeError):
+    """The local Wiki backend could not provide a worker snapshot."""
+
+
+class GateError(RuntimeError):
+    """A merge-gate input could not be collected."""
+
+
+def _backend_url() -> str:
+    configured = os.environ.get("WIKI_BACKEND_URL")
+    if configured:
+        return configured.rstrip("/")
+    port = os.environ.get("WIKI_BACKEND_PORT") or "8011"
+    return f"http://127.0.0.1:{port}"
+
+
+def nonnegative_seconds(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if seconds < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return seconds
+
+
+def _backend_json(path: str) -> dict:
+    url = f"{_backend_url()}{path}"
+    try:
+        with urlopen(url, timeout=5) as response:  # noqa: S310 - local configured backend
+            payload = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, OSError, ValueError) as exc:
+        raise WatchBackendError(str(exc)) from exc
+    if not isinstance(payload, dict):
+        raise WatchBackendError("backend returned a non-object JSON response")
+    return payload
+
+
+def _watch_status(ticket: str) -> dict | None:
+    path = AGENT_STATUS_DIR / f"{ticket}.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        return {"error": f"invalid status file: {exc}"}
+    if not isinstance(payload, dict):
+        return {"error": "invalid status file: expected JSON object"}
+    return {
+        key: payload.get(key)
+        for key in ("state", "pr", "step", "blocker")
+    }
+
+
+def _watch_worker(payload: dict, ticket: str) -> dict | None:
+    workers = payload.get("workers")
+    if not isinstance(workers, list):
+        return None
+    wanted = ticket.upper()
+    for worker in workers:
+        if not isinstance(worker, dict):
+            continue
+        found = worker.get("ticket")
+        if isinstance(found, str) and found.upper() == wanted:
+            return worker
+    return None
+
+
+def _watch_event(args: argparse.Namespace, ticket: str, kind: str, **details: object) -> None:
+    event = {
+        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "ticket": ticket,
+        "kind": kind,
+        **details,
+    }
+    if args.json:
+        print(json.dumps(event, sort_keys=True), flush=True)
+        return
+
+    labels = {
+        "state": "state",
+        "status": "status",
+        "pr": "pr",
+        "stall": "stall",
+        "terminal": "terminal",
+        "warning": "warning",
+    }
+    summary = details.get("message")
+    if not isinstance(summary, str):
+        fields = [
+            f"{key}={value}"
+            for key, value in details.items()
+            if value is not None and key not in {"message", "active"}
+        ]
+        summary = " ".join(fields) or "changed"
+    print(f"[{event['ts']}] {ticket} {labels.get(kind, kind)}: {summary}", flush=True)
+
+
+def _parse_watch_time(value: object) -> datetime.datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.astimezone(datetime.timezone.utc)
+
+
+def _watch_last_event_at(ticket: str, worker: dict) -> str | None:
+    for key in ("lastEventAt", "last_event_at"):
+        value = worker.get(key)
+        if _parse_watch_time(value) is not None:
+            return value
+
+    # The worker list intentionally stays small. The supervisor event endpoint
+    # is the existing durable fallback when it does not include lastEventAt.
+    try:
+        payload = _backend_json(f"/api/agents/{quote(ticket)}/events?limit=1")
+    except WatchBackendError:
+        return None
+    events = payload.get("events")
+    if not isinstance(events, list) or not events:
+        return None
+    latest = events[-1]
+    if not isinstance(latest, dict):
+        return None
+    for key in ("normalized_at", "received_at", "ts"):
+        value = latest.get(key)
+        if _parse_watch_time(value) is not None:
+            return value
+    return None
+
+
+def _watch_pr_truth(pr: str) -> dict:
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "view", pr, "--json", "state,mergeStateStatus"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        return {"available": False, "warning": f"gh unavailable: {exc}"}
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+        return {"available": False, "warning": f"gh pr view failed: {detail[:300]}"}
+    try:
+        payload = json.loads(result.stdout)
+    except ValueError:
+        return {"available": False, "warning": "gh pr view returned invalid JSON"}
+    if not isinstance(payload, dict):
+        return {"available": False, "warning": "gh pr view returned a non-object"}
+    return {
+        "available": True,
+        "state": payload.get("state"),
+        "merge_state_status": payload.get("mergeStateStatus"),
+    }
+
+
+def _watch_exit(args: argparse.Namespace, *, status: dict | None, terminal: str | None, pr: dict | None) -> bool:
+    if args.until == "merge-ready":
+        return bool(status and status.get("state") == "merge-ready")
+    if args.until == "terminal":
+        return terminal is not None
+    if args.until == "merged":
+        return bool(pr and pr.get("state") == "MERGED")
+    return False
+
+
+def cmd_agent_watch(args: argparse.Namespace) -> None:
+    ticket = args.ticket.strip().upper()
+    if not ticket:
+        print("error: ticket must not be empty", file=sys.stderr)
+        raise SystemExit(2)
+
+    unseen = object()
+    previous_runtime: object = unseen
+    previous_status: object = unseen
+    previous_pr: object = unseen
+    previous_stall: object = unseen
+    previous_terminal: object = unseen
+    seen_merge_ready: set[str] = set()
+    found_worker = False
+    backend_down = False
+
+    while True:
+        try:
+            agents = _backend_json("/api/agents")
+        except WatchBackendError as exc:
+            if not backend_down:
+                _watch_event(args, ticket, "warning", message=f"backend unavailable; retrying: {exc}")
+            backend_down = True
+            if args.no_retry:
+                raise SystemExit(3)
+            time.sleep(args.interval)
+            continue
+
+        if backend_down:
+            _watch_event(args, ticket, "warning", message="backend recovered")
+            backend_down = False
+
+        worker = _watch_worker(agents, ticket)
+        if worker is None:
+            if not found_worker:
+                print(f"error: worker {ticket} was not found", file=sys.stderr)
+                raise SystemExit(2)
+            terminal = "gone"
+            if previous_terminal != terminal:
+                _watch_event(args, ticket, "terminal", terminal=terminal)
+                previous_terminal = terminal
+            if _watch_exit(args, status=None, terminal=terminal, pr=None):
+                return
+            time.sleep(args.interval)
+            continue
+
+        found_worker = True
+        runtime = (
+            worker.get("runtime_state"),
+            worker.get("state_reason"),
+            worker.get("provider_pid"),
+        )
+        if previous_runtime != runtime:
+            _watch_event(
+                args,
+                ticket,
+                "state",
+                runtime_state=runtime[0],
+                state_reason=runtime[1],
+                provider_pid=runtime[2],
+            )
+            previous_runtime = runtime
+
+        status = _watch_status(ticket)
+        if status is None:
+            # Keep compatibility with remote backends that expose their own
+            # status directory while still treating the local file as source
+            # of truth when it is present.
+            candidate = {key: worker.get(key) for key in ("state", "pr", "step", "blocker")}
+            status = candidate if any(value is not None for value in candidate.values()) else None
+        status_signature = json.dumps(status, sort_keys=True, default=str) if status is not None else None
+        if previous_status != status_signature and status is not None:
+            merge_ready = status.get("state") == "merge-ready"
+            merge_ready_key = status_signature if merge_ready else None
+            emit_merge_ready = bool(merge_ready_key and merge_ready_key not in seen_merge_ready)
+            if merge_ready_key:
+                seen_merge_ready.add(merge_ready_key)
+            _watch_event(
+                args,
+                ticket,
+                "status",
+                **status,
+                merge_ready=emit_merge_ready,
+            )
+        previous_status = status_signature
+
+        pr_url = status.get("pr") if status else None
+        pr_truth = _watch_pr_truth(pr_url) if isinstance(pr_url, str) and pr_url else None
+        pr_signature = json.dumps(pr_truth, sort_keys=True, default=str) if pr_truth is not None else None
+        if previous_pr != pr_signature and pr_truth is not None:
+            if pr_truth.get("available"):
+                _watch_event(args, ticket, "pr", pr=pr_url, **pr_truth)
+            else:
+                _watch_event(args, ticket, "warning", pr=pr_url, **pr_truth)
+        previous_pr = pr_signature
+
+        last_event_at = _watch_last_event_at(ticket, worker)
+        parsed_last_event = _parse_watch_time(last_event_at)
+        age_seconds = (
+            int((datetime.datetime.now(datetime.timezone.utc) - parsed_last_event).total_seconds())
+            if parsed_last_event is not None
+            else None
+        )
+        stalled = bool(
+            runtime[0] == "working"
+            and age_seconds is not None
+            and age_seconds > args.stall_secs
+        )
+        if previous_stall is not stalled:
+            if stalled:
+                _watch_event(
+                    args,
+                    ticket,
+                    "stall",
+                    active=True,
+                    last_event_at=last_event_at,
+                    age_seconds=age_seconds,
+                    threshold_seconds=args.stall_secs,
+                )
+            elif previous_stall is True:
+                _watch_event(args, ticket, "stall", active=False, message="stall cleared")
+            previous_stall = stalled
+
+        terminal = None
+        if runtime[0] in {"dead", "completed"}:
+            terminal = str(runtime[0])
+        elif status and status.get("state") == "blocked":
+            terminal = "blocked"
+        if previous_terminal != terminal and terminal is not None:
+            _watch_event(args, ticket, "terminal", terminal=terminal)
+        previous_terminal = terminal
+        if _watch_exit(args, status=status, terminal=terminal, pr=pr_truth):
+            return
+        time.sleep(args.interval)
+
+
+def _run_gh(args: list[str], *, allowed_returncodes: set[int] | None = None) -> subprocess.CompletedProcess[str]:
+    try:
+        result = subprocess.run(
+            ["gh", *args],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        raise GateError(f"gh unavailable: {exc}") from exc
+    allowed = allowed_returncodes or {0}
+    if result.returncode not in allowed:
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+        raise GateError(f"gh {' '.join(args[:3])} failed: {detail[:300]}")
+    return result
+
+
+def _gh_json(args: list[str], *, allowed_returncodes: set[int] | None = None) -> dict:
+    result = _run_gh(args, allowed_returncodes=allowed_returncodes)
+    try:
+        payload = json.loads(result.stdout)
+    except ValueError as exc:
+        raise GateError(f"gh {' '.join(args[:3])} returned invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise GateError(f"gh {' '.join(args[:3])} returned a non-object")
+    return payload
+
+
+def _repo_from_origin() -> str:
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        raise GateError(f"could not detect GitHub repo: {exc}") from exc
+    remote = result.stdout.strip()
+    match = re.search(r"github\.com[:/]([^/\s]+)/([^/\s]+?)(?:\.git)?$", remote)
+    if result.returncode != 0 or not match:
+        raise GateError("could not detect GitHub repo; pass --repo OWNER/REPO")
+    return f"{match.group(1)}/{match.group(2)}"
+
+
+REVIEW_THREADS_QUERY = """
+query ReviewThreads($url: URI!, $endCursor: String) {
+  resource(url: $url) {
+    ... on PullRequest {
+      reviewThreads(first: 100, after: $endCursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes { isResolved }
+      }
+    }
+  }
+}
+""".strip()
+
+
+def _unresolved_threads(pr_url: str) -> int:
+    count = 0
+    cursor: str | None = None
+    while True:
+        args = ["api", "graphql", "-f", f"query={REVIEW_THREADS_QUERY}", "-f", f"url={pr_url}"]
+        if cursor:
+            args.extend(["-f", f"endCursor={cursor}"])
+        payload = _gh_json(args)
+        connection = (((payload.get("data") or {}).get("resource") or {}).get("reviewThreads") or {})
+        nodes = connection.get("nodes") or []
+        if not isinstance(nodes, list):
+            raise GateError("gh reviewThreads response had invalid nodes")
+        count += sum(1 for node in nodes if isinstance(node, dict) and not node.get("isResolved"))
+        page_info = connection.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            return count
+        cursor = page_info.get("endCursor")
+        if not isinstance(cursor, str) or not cursor:
+            raise GateError("gh reviewThreads response omitted endCursor")
+
+
+def _check_gate_checks(pr: str, repo: str) -> tuple[list[dict], bool]:
+    result = _run_gh(
+        ["pr", "checks", pr, "--repo", repo, "--json", "name,state"],
+        allowed_returncodes={0, 1, 8},
+    )
+    raw = result.stdout.strip()
+    if not raw or raw.lower().startswith("no checks reported"):
+        return [], True
+    try:
+        checks = json.loads(raw)
+    except ValueError as exc:
+        raise GateError("gh pr checks returned invalid JSON") from exc
+    if not isinstance(checks, list):
+        raise GateError("gh pr checks returned a non-list")
+    normalized = [check for check in checks if isinstance(check, dict)]
+    return normalized, not normalized
+
+
+def _gate_result(args: argparse.Namespace) -> dict:
+    repo = args.repo or _repo_from_origin()
+    view = _gh_json(
+        [
+            "pr",
+            "view",
+            args.pr,
+            "--repo",
+            repo,
+            "--json",
+            "state,isDraft,mergeable,mergeStateStatus,headRefOid,url",
+        ]
+    )
+    pr_url = view.get("url")
+    if not isinstance(pr_url, str) or not pr_url:
+        raise GateError("gh pr view response omitted URL")
+    checks, no_checks = _check_gate_checks(args.pr, repo)
+    unresolved = _unresolved_threads(pr_url)
+
+    check_states = {str(check.get("state") or "").upper() for check in checks}
+    failing = bool(check_states & {"FAILURE", "FAILED", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "ERROR"})
+    pending = bool(check_states - {"SUCCESS", "SKIPPED", "NEUTRAL", "PASS", ""})
+    head_sha = view.get("headRefOid") if isinstance(view.get("headRefOid"), str) else None
+    reasons: list[str] = []
+    if view.get("state") != "OPEN":
+        reasons.append("not-open")
+    if view.get("isDraft"):
+        reasons.append("draft")
+    if view.get("mergeable") != "MERGEABLE":
+        reasons.append("not-mergeable")
+    if failing:
+        reasons.append("checks-failing")
+    elif pending:
+        reasons.append("checks-pending")
+    if unresolved:
+        reasons.append(f"unresolved-threads:{unresolved}")
+    if args.expect_sha and (not head_sha or not head_sha.startswith(args.expect_sha)):
+        reasons.append("sha-mismatch")
+
+    return {
+        "ready": not reasons,
+        "pr": pr_url,
+        "repo": repo,
+        "state": view.get("state"),
+        "is_draft": bool(view.get("isDraft")),
+        "mergeable": view.get("mergeable"),
+        "merge_state_status": view.get("mergeStateStatus"),
+        "head_sha": head_sha,
+        "checks": checks,
+        "unresolved_threads": unresolved,
+        "reasons": reasons,
+        "notes": ["no-checks-reported"] if no_checks else [],
+    }
+
+
+def cmd_gate(args: argparse.Namespace) -> None:
+    try:
+        result = _gate_result(args)
+    except GateError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+    if args.json:
+        print(json.dumps(result, sort_keys=True))
+    else:
+        print(f"PR: {result['pr']}")
+        print(f"State: {result['state']}  draft={result['is_draft']}")
+        print(f"Mergeable: {result['mergeable']}  merge state: {result['merge_state_status']}")
+        print(f"Head SHA: {result['head_sha'] or 'unknown'}")
+        print(f"Checks: {'none reported (pass)' if not result['checks'] else len(result['checks'])}")
+        print(f"Unresolved threads: {result['unresolved_threads']}")
+        print(f"Ready: {'yes' if result['ready'] else 'no'}")
+        if result['notes']:
+            print(f"Notes: {', '.join(result['notes'])}")
+        if result['reasons']:
+            print(f"Reasons: {', '.join(result['reasons'])}")
+    raise SystemExit(0 if result["ready"] else 1)
+
+
 def cmd_note_rename(args: argparse.Namespace) -> None:
     old = args.old.removesuffix(".md") + ".md"
     new = args.new.removesuffix(".md") + ".md"
@@ -807,8 +1299,9 @@ def main() -> None:
     move.add_argument("--to", required=True, help="target section")
     move.set_defaults(func=cmd_todo_move, refresh_knowledge=True)
 
-    complete = todo_sub.add_parser("complete", help="remove item + log to done.md")
+    complete = todo_sub.add_parser("complete", help="remove item; optionally log a terse done.md line")
     complete.add_argument("match", help="unique substring of the item")
+    complete.add_argument("--done-line", help="terse completion text to prepend to done.md")
     complete.set_defaults(func=cmd_todo_complete, refresh_knowledge=True)
 
     log_done = sub.add_parser("log-done", help="append a dated line to log/done.md")
@@ -896,6 +1389,22 @@ def main() -> None:
 
     agent_list = agent_sub.add_parser("list", help="print registered workers")
     agent_list.set_defaults(func=cmd_agent_list)
+
+    watch = agent_sub.add_parser("watch", help="poll one supervisor-backed worker for state, status, PR, and stall changes")
+    watch.add_argument("ticket")
+    watch.add_argument("--json", action="store_true", help="emit NDJSON instead of human-readable lines")
+    watch.add_argument("--until", choices=("merge-ready", "terminal", "merged"))
+    watch.add_argument("--interval", type=nonnegative_seconds, default=30.0, help="poll interval in seconds (default: 30)")
+    watch.add_argument("--stall-secs", type=nonnegative_seconds, default=300.0, help="working event-age alert threshold (default: 300)")
+    watch.add_argument("--no-retry", action="store_true", help="exit 3 when the backend is unavailable")
+    watch.set_defaults(func=cmd_agent_watch)
+
+    gate = sub.add_parser("gate", help="report merge-gate plumbing for one GitHub PR; never merges or reviews")
+    gate.add_argument("pr", help="PR number or URL")
+    gate.add_argument("--repo", help="GitHub OWNER/REPO (defaults to origin remote)")
+    gate.add_argument("--expect-sha", help="required prefix of the PR head SHA")
+    gate.add_argument("--json", action="store_true", help="emit a JSON verdict")
+    gate.set_defaults(func=cmd_gate)
 
     lint = sub.add_parser("lint", help="validate vault conventions")
     lint.set_defaults(func=cmd_lint)
