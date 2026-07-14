@@ -11,25 +11,24 @@ Rolling ≤500-word session cache. Rewrite (don't append) at work-arc boundaries
 
 ## Active threads
 
-- **phoebe fleet EMPTY as of 2026-07-14 ~13:15Z** — PHO-13646 MERGED (#11271 `00eac05ab1`): admin agent batch account-health rollups. `get_admin_account_health_rollups` (≤50 orgs/call, two 7-day windows, ~14k calls → ~7 for 151-org cohort), Slack one-call posting up to 250 accounts, 90-min turn budget both admin paths (internal + Slack), 25-min lease fence scoped to daily run. Whale-safe day-slicing preserved (28-day recurring_shift bound, pre-SQL window-width guard, seeded equivalence proof); 50k gate + no-index constraints untouched. Linear Merged; worker archived; worktree/branch cleaned.
-- **Post-#11271 manual ops for Henry**: (1) rollout is safe-by-default behind `ACCOUNT_HEALTH_BATCH_ROLLUP_ENABLED` — enable to activate batch lane; (2) watch first nightly pulse after enabling — first live exercise of batch rollup + one-thread-per-org posting at 151-org scale; (3) PHO-13647 open: PostHog users metric group descoped from #11271, still per-query.
-- **Post-#11222 manual ops still pending**: delete/revoke 6 prod secrets `ADMIN_AGENT_SNOWFLAKE_{DATABASE,PAT,ROLE,SCHEMA,SQL_API_URL,WAREHOUSE}` — PAT worth revoking soonish. Also: "filled within 24h" metric REDEFINED to last-minute proxy (shift created ≤24h before start).
-- **Unpushed race fix parked**: `b4d5e7f9` on `henry/staging-modal-deploy-investigation-2`, worktree `.codex/worktrees/staging-modal-2` kept — staging-deploy workflow_run race (checks out stale head_sha). PR it or drop.
-- **cdx render gap RESOLVED 2026-07-14** — WIKI-99 (#80) archived-events path verified live post-relaunch: archived PHO-13559 session serves 500 structured events, zero terminal blobs. No wiki ticket needed. Wiki fleet EMPTY; bundle rebuilt 09:43 + relaunched 09:44 local, both orchestrators recycled clean. Wiki vault reconciled: 11 merged tickets pruned from todo, 9 stale worktrees removed; kept `wiki-43-terminal-fidelity` (unmerged ~500-line commit, no PR — ship or drop), `wiki-41-native-surfaces` + `wiki-24-hidden-probe` (dirty).
-- **Orchestrator replaced 2026-07-14 ~09:45 local** (prior session cb6cace6 died post-merge mid-vault-logging); recovery clean, all durable steps completed.
+- **Knowledge layer v1 SHIPPED 2026-07-14** — WIKI-100 (#82 `0818766b`): rebuildable SQLite index over vault + wiki-managed run history. `wiki search "<q>" [--kind note|run] [--json]`, `wiki links backlinks|orphans|unresolved`, `wiki index rebuild`, `search_knowledge` MCP tool. **Agents: prefer `wiki search` over map.md-walk + grep for recall queries.** Goal test passed live: contact_attempts decision → hot.md note; Modal deploy race → run transcript with run_id:seq citation (unfiled knowledge findable). Spec: docs/superpowers/specs/2026-07-14-knowledge-layer-storage-design.md. v1.5 analytics + v2 embeddings deferred.
+- **WIKI-101 SHIPPED 2026-07-14** (#81 `34eb99a9`) — cc render_artifact "rejected" badge fixed: structuredContent dropped from MCP success results (sentinel now reaches cc transcripts) + validated parser fallback. Found when orchestrator's own mermaid artifact showed rejected; root-caused + fixed same day.
+- **Wiki fleet EMPTY**; both workers (gpt-5.6-sol) merged + archived same-day. Gate loop worked: WIKI-100 took 2 iterations (1 BLOCKING + 1 HIGH resilience holes found by adversarial review, fixed + revert-tested), WIKI-101 took 2 (2 MEDIUMs).
+- **First knowledge.db rebuild in progress** (~700MB, one-time — real corpus ≫ fixture; budget <60s applies to fixture only). Concurrent `wiki index rebuild` during a running rebuild → "database is locked" per-run skips + stale-result degradation (by design, verified live).
+- **Wiki.app bundle STALE vs main**: running sidecar predates #81/#82 — transcripts-parser artifact fix + knowledge module reach Wiki.app only after `make native-build` + relaunch. CLI/`wiki search` work from repo checkout regardless.
+- **Phoebe (2026-07-14)**: PHO-13646 merged (#11271) — batch account-health rollups behind `ACCOUNT_HEALTH_BATCH_ROLLUP_ENABLED` (enable + watch first nightly pulse); PHO-13647 open (PostHog users metric descoped). Post-#11222 ops still pending: revoke 6 `ADMIN_AGENT_SNOWFLAKE_*` prod secrets. Unpushed staging-deploy race fix parked at `b4d5e7f9` (`henry/staging-modal-deploy-investigation-2`) — PR or drop.
 
 ## Recent facts
 
-- PHO-13646 gate history: round 1 found 1 blocker + 3 majors + 4 minors, all steered; round 2 adversarial verify confirmed 7/8 + caught residual Slack-path timeout (180s turn vs 480s tool); final deltas (lease + Slack timeout) reviewed inline, clean.
-- Curated-catalog cost audit method: prod EXPLAIN via readonly tunnel role ≠ tool path (admin_agent_readonly + app.mode) — 5-8x divergence; always validate through worker's real-path harness, worst-case org (e32e0940, 232k contact_attempts/28d), all 226 orgs.
-- `contact_attempts` deliberately has NO (org, created_at) index — heap fetches dominate; templates split/window-capped instead. Gate stays 50k, fail-closed.
-- Provider hang playbook proven: no events N min → nudge → interrupt + resend → `/replace` (same model, in-place, worktree/branch/PR survive).
-- Spawn contract: ALWAYS pass real worktree as `workdir` (not repo root) — fixes Wiki.app transcript mapping.
-- Modal image packaging class-bug OPEN: eagerly-imported lib reading repo files outside mounted dirs breaks voice deploys silently; no CI boots image fs. Candidate ticket: import-smoke + staging-deploy failure alert.
+- Vault reconciled + pushed 2026-07-14 morning: 11 merged tickets pruned, 9 stale worktrees removed; kept `wiki-43-terminal-fidelity` (unmerged ~500-line commit, no PR — ship or drop), `wiki-41-native-surfaces` + `wiki-24-hidden-probe` (dirty) pending Henry call.
+- `wiki todo complete` appends the FULL ticket body to done.md — dedupe/replace with terse PR-linked line after (bit us twice 07-14).
+- Monitor scripts: status-file merge-ready greps re-emit every poll — dedupe by (state|step|pr) hash AND verify worker runtime_state + PR head SHA before gating; stale echoes otherwise.
+- Headless spawn contract: `workdir`=real worktree, `orch`=orchestrator id; steer via POST /message mode=now; wrap-up via POST /archive.
+- Provider hang playbook: no events N min → nudge → interrupt + resend → /replace.
 
 ## Watchouts
 
-- Schema-touching PRs: `migrate apply` locally before commit; catalog (78k) conflicts → regenerate, never hand-merge.
-- Investigation-only ship-shaped findings → file Linear ticket IMMEDIATELY.
-- Slack mrkdwn caps: section 3000, blocks 12000.
+- Two+ workers touching same file surface: note overlap in both prompts; whoever merges second rebases (WIKI-100 rebased over #81's wiki_artifacts change cleanly after steer).
+- Schema-touching phoebe PRs: `migrate apply` locally; catalog conflicts → regenerate.
+- Ship-shaped findings → file ticket IMMEDIATELY (WIKI-101 same-day proof).
 - Local main PUSHED before spawns; refetch todo/map/hot before writing; screenshots = LOCAL /tmp paths.
