@@ -2,7 +2,7 @@
 type: reference
 tags: [tools, agents]
 created: 2026-07-07
-updated: 2026-07-07
+updated: 2026-07-14
 ---
 
 # Agent Harness Design
@@ -41,6 +41,15 @@ Harness design is a measurable independent variable, not a wrapper around a stro
 - Closed; philosophy public, harness proprietary. Shell + editor + browser in unspecified "sandboxed compute environment" (mechanism undisclosed — claim, not spec).
 - Long-horizon iteration as differentiator: "72% of passing tests take over 10 minutes," 45-min runtime cap, "capability to run indefinitely" (cognition.com/blog/swe-bench-technical-report; 13.86% unassisted, mid-2024).
 - "Don't Build Multi-Agents" (Walden Yan, 2025): single-threaded agent, share full traces not messages ("Actions carry implicit decisions, and conflicting decisions carry bad results"), dedicated compressor LLM for history compaction ("hard to get right," may need fine-tuning).
+
+### Cursor (added 2026-07-14)
+- Harness = evals-driven product, per-model: tool formats match training distribution (OpenAI = patch-based edits, Anthropic = string replacement); prompts tuned per family (OpenAI literal, Claude intuitive); quirks patched via prompts (one model's "context anxiety" — refused work as context filled).
+- **Keep Rate**: fraction of agent-written code still in codebase after fixed intervals — ground-truth quality metric. Plus LLM-scored user-satisfaction from replies, latency/token/cache-hit ops metrics, Cursor Bench offline + A/B online.
+- Tool-error discipline: unknown error = harness bug, always; expected-error taxonomy (`InvalidArguments`/`Timeout`/…); per-tool per-model anomaly alerts; sprint to "2-3 nines" tool-call reliability. Rationale: failed calls linger in context → context rot.
+- Codex-model rework: shell-forward tool names; dropping Responses-API reasoning traces between tool calls = 30% drop on Cursor Bench (vs OpenAI's claimed 3%) — alerting guarantees trace flow; autonomy-biasing ("implement, don't propose"); token-thrift prompt lines made Codex refuse ambitious tasks.
+- Static → dynamic context shift: dropped upfront dumps (folder layouts, semantic snippets) for on-demand fetch as models improved.
+- "Automated software factory": weekly log-mining agents file Linear tickets on new/spiked issues.
+- Sources: cursor.com/blog/{continually-improving-agent-harness, codex-model-harness} (fetched 2026-07-14, single-pass not adversarially verified).
 
 ### SWE-agent (Princeton)
 - Origin of the ACI axis: purpose-built file-edit/repo-nav/test tools; removing ACI dropped resolve rate 12%→3% at fixed model. mini-swe-agent: ~100-line harness for eval baselines (github.com/SWE-agent/mini-swe-agent).
