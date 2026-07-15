@@ -55,6 +55,14 @@ FILES_ROOT = ROOT_DIR
 MAX_NOTE_BYTES = 2_000_000
 MAX_FILE_BYTES = 2_000_000
 MAX_FILE_TREE_ENTRIES = 10_000
+VAULT_ASSET_MEDIA_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".svg": "image/svg+xml",
+}
 IGNORED_FILE_PARTS = {
     ".git",
     ".obsidian",
@@ -238,6 +246,36 @@ def resolve_file_path(raw_path: str) -> tuple[Path, str]:
     except (OSError, RuntimeError, ValueError, TypeError):
         file_not_found()
     return target, path.as_posix()
+
+
+def resolve_vault_asset_path(raw_path: str) -> tuple[Path, str, str]:
+    candidate = raw_path.strip().replace("\\", "/")
+    if "\x00" in candidate or not candidate:
+        file_not_found()
+    raw_parts = candidate.split("/")
+    if any(part in {"", ".", ".."} for part in raw_parts):
+        file_not_found()
+    try:
+        path = PurePosixPath(candidate)
+        media_type = VAULT_ASSET_MEDIA_TYPES.get(path.suffix.lower())
+        if (
+            path.is_absolute()
+            or media_type is None
+            or any(part in {"", ".", ".."} for part in path.parts)
+            or is_ignored_file_parts(path.parts)
+        ):
+            file_not_found()
+
+        vault_root = VAULT_DIR.resolve()
+        target = (vault_root / Path(*path.parts)).resolve()
+        relative_target = target.relative_to(vault_root)
+        if is_ignored_file_parts(relative_target.parts):
+            file_not_found()
+    except HTTPException:
+        raise
+    except (OSError, RuntimeError, ValueError, TypeError):
+        file_not_found()
+    return target, path.as_posix(), media_type
 
 
 def iter_repo_files() -> tuple[list[Path], bool]:
@@ -3195,6 +3233,44 @@ def get_file_content(path: str = Query(..., min_length=1)) -> FileContent:
     except UnicodeDecodeError:
         return FileContent(path=relative_path, size=size, binary=True, error="binary file")
     return FileContent(path=relative_path, size=size, content=content)
+
+
+@app.get("/api/vault/assets/{asset_path:path}")
+def get_vault_asset(asset_path: str) -> Response:
+    target, _relative_path, media_type = resolve_vault_asset_path(asset_path)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(target, flags)
+    except OSError as exc:
+        raise HTTPException(status_code=404, detail="File not found") from exc
+
+    try:
+        if not opened_file_is_safe(fd, target, VAULT_DIR.resolve()):
+            file_not_found()
+        size = os.fstat(fd).st_size
+        raw = read_open_file(fd, MAX_FILE_BYTES)
+        if size > MAX_FILE_BYTES or len(raw) > MAX_FILE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail={
+                    "code": "file_too_large",
+                    "message": f"File exceeds the {MAX_FILE_BYTES // 1_000_000}MB viewing limit",
+                },
+            )
+    except HTTPException:
+        raise
+    except (OSError, RuntimeError, ValueError):
+        raise HTTPException(status_code=404, detail="File not found")
+    finally:
+        os.close(fd)
+
+    headers = {
+        "Cache-Control": "private, max-age=3600",
+        "X-Content-Type-Options": "nosniff",
+    }
+    if media_type == "image/svg+xml":
+        headers["Content-Security-Policy"] = "default-src 'none'; style-src 'unsafe-inline'"
+    return Response(content=raw, media_type=media_type, headers=headers)
 
 
 @app.get("/api/notes/{note_path:path}", response_model=Note)

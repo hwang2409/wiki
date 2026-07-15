@@ -351,6 +351,7 @@ function NotePane({
                 <div className="markdown-preview-view">
                   <ObsidianMarkdown
                     content={stripLeadingTitle(parsed.body, currentNote.title)}
+                    notePath={currentNote.path}
                     notes={notes}
                     onCreateNote={focusState?.kind === "view" ? focusState.onCreateNote : undefined}
                     onOpenNote={onOpenNote}
