@@ -9,6 +9,9 @@ updated: 2026-07-15
 
 ## 2026-07-15
 
+- WIKI-112 merged (#101, 2 rounds): dead-archive flake root-caused as test rot — fixture never persisted runtime states to durable registry; fix = persist snapshot + deterministic precondition wait; 20/20 greens
+- **pufferclone** — PUF-4 engine+API merged (3 sol rounds incl. 7-major xhigh round); v0 COMPLETE main@3ee62c5
+- pufferclone v0 complete: PUF-1..4 merged, main@3ee62c5, 46 tests, HTTP smoke green
 - WIKI-127 merged (#98, 6 rounds): multi-workspace file browsing — fd-pinned roots + constant-descriptor tree walk, workspace derivation from orchestrator registry, file://<workspace>/<relpath> path space, recents v2 migration
 - orchard@phoebe.work provisioned prod (f5025027) + staging (273fa49a) — account-health tick unblocked
 - WIKI-128 merged (#99): code-viewer density fix — view-content prose leak removed from code scroll container, line-height 1.4 both render paths, h-scroll restored, tighter gutter

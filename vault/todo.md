@@ -14,7 +14,6 @@ Todo:
 - [P2] PHO-13800 customer_churned_date timing unreliable (19/29 in one entry window; zero churns Jan-Apr) — backfill true dates or document entry-date semantic; related PHO-13735
 - [P2] PHO-13763 PARKED by Henry 2026-07-15: PR 11383 drafted at 909ef288ce, gate-passed (CI green, 0 threads, sol REVIEW4 merge-ready), worker archived — resume = un-draft, re-verify freshness vs main, merge
 - [P3] WIKI-126: surface rebrand — rename app-facing identity only (app display name, window title, README header); NAME NOT YET CHOSEN by Henry, blocked until he picks. Internal identifiers stay (repo, wiki CLI, WIKI-* tickets, MCP names, vault paths — codename doctrine, Henry 2026-07-15)
-- [P2] WIKI-129: make native-build while Wiki.app running breaks live supervisor — bundle swap clobbers running sidecar's _internal (ENOENT on supervisor channel, respawn blocked by stale supervisor.lock, worker spawn/replace dead until app relaunch; hit 2026-07-15 eve). Fix: build to staging dir + atomic swap on app quit, or preflight check refusing rebuild while app runs
 - [P2] amd-shadow invalid index: KORGAN owns fix (PR 11416 closed w/ evidence); prod index still INVALID 0-byte — watch deploys
 - [P2] PHO-13826/27/28 exe.dev sandbox arc: enable (SSH key secret + smoke) -> ownership fix -> TTL sweeper; PHO-13829 egress design backlog. Surface merged since PHO-13073/#10608, dormant on missing key
 
@@ -30,8 +29,10 @@ In Progress:
 - [P2] PHO-13830 live EHR record fetch tool (admin agent) — worker live
 - [P2] PHO-13832 shift classification + calendar artifact (admin agent) — worker live
 - [P2] WIKI-124: accepted svg artifact silently not rendered in session view above size threshold — 24KB svg (id 4907cf6e, 14:48Z 2026-07-15) accepted server-side, never displayed; 800B probe (1acaeef1) rendered fine. Silent accept-then-drop masks failure from sender. Fix: render large svg (scroll/scale) OR visible reject like source-validation errors. Bisect threshold; check overlap with mermaid >20-node compact-preview machinery. Related [[WIKI-116]] — cdx:WIKI-116 worker (bundled w/ 116)
-- [P2] WIKI-112: dead-archive.playwright.mjs flake — TimeoutError waiting for WIKI-7801 Archive button on untouched main; bit all 9 review rounds wave 3; root-cause test rot vs real dead-archive UI regression — cdx:WIKI-112 worker
 - [P2] WIKI-116: render_artifact accepts syntactically-invalid mermaid silently — worker got success, Henry got 'lexical error on line 79'. Validate mermaid at render time (mermaid.parse in frontend-side check is too late; consider bundled mmdc/headless parse in MCP server) OR feed render errors back into session so agents self-correct. Found via TEST-1 artifact (unquoted [/tmp/... label = trapezoid syntax) — cdx:WIKI-116 worker (bundled w/ 124)
+- [P2] PHO-13826 ModalSandboxBackend + PHO-13827 sandbox ownership — workers live (Modal replaces exe.dev for v0; 13828 lifecycle + 13829 egress design queued)
+- PUF-5..8: pufferclone v1 — HNSW, compaction, S3 store, non-blocking reads (spec: docs/superpowers/specs/2026-07-15-pufferclone-v1-design.md)
+- [P2] WIKI-129: make native-build while Wiki.app running breaks live supervisor — bundle swap clobbers running sidecar's _internal (ENOENT on supervisor channel, respawn blocked by stale supervisor.lock, worker spawn/replace dead until app relaunch; hit 2026-07-15 eve). Fix: build to staging dir + atomic swap on app quit, or preflight check refusing rebuild while app runs
 
 Backlog:
 
