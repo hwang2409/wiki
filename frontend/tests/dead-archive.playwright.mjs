@@ -114,7 +114,6 @@ async function startFakeSupervisor(fixtures, registry) {
         state: runtime.state,
         state_reason: runtime.state_reason,
         control_attached: runtime.control_attached,
-        provider_alive: runtime.provider_alive,
         provider_pid: runtime.provider_pid,
       });
     }
