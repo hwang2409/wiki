@@ -127,6 +127,27 @@ class FilesApiTests(unittest.TestCase):
         self.assertEqual(len(tree.files), 2)
         self.assertTrue(tree.truncated)
 
+    def test_tree_at_exact_result_limit_is_not_truncated(self) -> None:
+        (self.vault / "file-0.txt").write_text("x", encoding="utf-8")
+        (self.vault / "file-1.txt").write_text("x", encoding="utf-8")
+
+        with mock.patch.object(main, "VAULT_DIR", self.vault), mock.patch.object(
+            main, "MAX_FILE_TREE_ENTRIES", 4
+        ):
+            tree = main.list_files()
+
+        self.assertEqual(len(tree.files), 4)
+        self.assertFalse(tree.truncated)
+
+    def test_descriptor_containment_walks_from_the_vault_root(self) -> None:
+        target = self.vault / "src" / "app.py"
+        outside = self.vault.parent / "outside.py"
+        outside.write_text("outside", encoding="utf-8")
+
+        with target.open("rb") as opened:
+            self.assertTrue(main.opened_file_is_safe(opened.fileno(), target, self.vault))
+            self.assertFalse(main.opened_file_is_safe(opened.fileno(), outside, self.vault))
+
     def test_binary_and_invalid_utf8_return_structured_binary_response(self) -> None:
         (self.vault / "image.bin").write_bytes(b"PNG\x00bytes")
         (self.vault / "invalid.bin").write_bytes(b"\xff\xfe")

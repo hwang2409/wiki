@@ -258,9 +258,6 @@ def iter_vault_files() -> tuple[list[Path], bool]:
                 truncated = True
                 return files, truncated
             files.append(Path(entry.path))
-            if len(files) >= MAX_FILE_TREE_ENTRIES:
-                truncated = True
-                return files, truncated
     files.sort(key=lambda candidate: candidate.relative_to(vault_root).as_posix())
     return files, truncated
 
@@ -269,29 +266,41 @@ def opened_file_is_safe(fd: int, target: Path, vault_root: Path) -> bool:
     descriptor_stat = os.fstat(fd)
     if not stat.S_ISREG(descriptor_stat.st_mode):
         return False
-
-    for descriptor_link in (f"/proc/self/fd/{fd}", f"/dev/fd/{fd}"):
-        try:
-            descriptor_target = os.readlink(descriptor_link)
-        except OSError:
-            continue
-        if descriptor_target.endswith(" (deleted)"):
-            return False
-        try:
-            resolved_descriptor = Path(descriptor_target).resolve()
-            relative_descriptor = resolved_descriptor.relative_to(vault_root)
-        except (OSError, RuntimeError, ValueError):
-            return False
-        return not is_ignored_file_parts(relative_descriptor.parts)
-
     try:
-        path_stat = os.stat(target, follow_symlinks=False)
-    except OSError:
+        relative_target = target.relative_to(vault_root)
+        if is_ignored_file_parts(relative_target.parts):
+            return False
+    except ValueError:
         return False
-    return (path_stat.st_dev, path_stat.st_ino) == (
-        descriptor_stat.st_dev,
-        descriptor_stat.st_ino,
-    )
+
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    root_fd: int | None = None
+    current_fd: int | None = None
+    try:
+        root_fd = os.open(vault_root, os.O_RDONLY | no_follow | directory_flag)
+        current_fd = root_fd
+        for index, component in enumerate(relative_target.parts):
+            is_final = index == len(relative_target.parts) - 1
+            flags = os.O_RDONLY | no_follow | (0 if is_final else directory_flag)
+            next_fd = os.open(component, flags, dir_fd=current_fd)
+            if current_fd != root_fd:
+                os.close(current_fd)
+            current_fd = next_fd
+        if current_fd is None:
+            return False
+        opened_stat = os.fstat(current_fd)
+        return (opened_stat.st_dev, opened_stat.st_ino) == (
+            descriptor_stat.st_dev,
+            descriptor_stat.st_ino,
+        )
+    except (OSError, RuntimeError, ValueError):
+        return False
+    finally:
+        if current_fd is not None and current_fd != root_fd:
+            os.close(current_fd)
+        if root_fd is not None:
+            os.close(root_fd)
 
 
 def read_open_file(fd: int, limit: int) -> bytes:
