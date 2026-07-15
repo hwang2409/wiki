@@ -4,12 +4,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-target_triple="$(rustc --print host-tuple 2>/dev/null || rustc -Vv | awk '/host:/ {print $2}')"
-binary="src-tauri/binaries/wiki-backend-${target_triple}"
-if [[ ! -x "$binary" ]]; then
-  echo "missing $binary; run ./scripts/build-native-backend.sh first" >&2
+bundle_binary="src-tauri/target/release/bundle/macos/Wiki.app/Contents/MacOS/wiki-backend"
+if [[ ! -x "$bundle_binary" ]]; then
+  echo "missing bundled backend $bundle_binary; run make native-build first" >&2
   exit 1
 fi
+binary="$bundle_binary"
 
 repo_dir="$ROOT"
 case "$repo_dir" in

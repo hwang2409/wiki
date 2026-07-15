@@ -34,7 +34,7 @@ native-dev: native-backend
 	$(TAURI) dev --no-watch
 
 native-build:
-	FORCE_STAGE_ONLY="$(FORCE_STAGE_ONLY)" ./scripts/build-native-app.sh
+	FORCE_STAGE_ONLY="$(FORCE_STAGE_ONLY)" ALLOW_MISSING_APP_LOCK="$(ALLOW_MISSING_APP_LOCK)" ./scripts/build-native-app.sh
 
 native-smoke: native-backend
 	./scripts/native-smoke.sh

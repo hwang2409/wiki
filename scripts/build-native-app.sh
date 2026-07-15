@@ -4,16 +4,25 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 runtime_dir="${WIKI_AGENT_RUNTIME_DIR:-${HOME}/.wiki/agent-runtime}"
 force_stage_only="${FORCE_STAGE_ONLY:-0}"
+guard_args=()
+if [[ "${ALLOW_MISSING_APP_LOCK:-${WIKI_NATIVE_ALLOW_MISSING_APP_LOCK:-}}" == 1 ]]; then
+  guard_args+=(--allow-missing-app-lock)
+fi
 
-if ! python3 "$ROOT/scripts/native_build_guard.py" --runtime-dir "$runtime_dir"; then
+if ! python3 "$ROOT/scripts/native_build_guard.py" --runtime-dir "$runtime_dir" "${guard_args[@]}"; then
   if [[ "$force_stage_only" != 1 ]]; then
     exit 1
   fi
   echo "live Wiki supervisor detected; FORCE_STAGE_ONLY=1 will build without swapping" >&2
 fi
 
-stage_parent="${WIKI_NATIVE_STAGE_PARENT:-$ROOT/src-tauri/.native-build-staging}"
+stage_parent="${WIKI_NATIVE_STAGE_PARENT:-$ROOT/.native-build-staging}"
 mkdir -p "$stage_parent"
+shopt -s nullglob
+for completed_stage in "$stage_parent"/*/.swap-complete; do
+  rm -rf "$(dirname "$completed_stage")"
+done
+shopt -u nullglob
 if [[ -n "${WIKI_NATIVE_STAGE_ROOT:-}" ]]; then
   stage_root="$(cd "$(dirname "$WIKI_NATIVE_STAGE_ROOT")" && pwd)/$(basename "$WIKI_NATIVE_STAGE_ROOT")"
 else
@@ -49,11 +58,17 @@ env \
 
 mkdir -p "$stage_root/src-tauri"
 if command -v rsync >/dev/null 2>&1; then
-  rsync -a --exclude '/target' --exclude '/binaries' \
+  rsync -a \
+    --exclude '/target' \
+    --exclude '/binaries' \
+    --exclude '/.native-build-staging' \
     "$ROOT/src-tauri/" "$stage_root/src-tauri/"
 else
   cp -R "$ROOT/src-tauri/." "$stage_root/src-tauri/"
-  rm -rf "$stage_root/src-tauri/target"
+  rm -rf \
+    "$stage_root/src-tauri/target" \
+    "$stage_root/src-tauri/binaries" \
+    "$stage_root/src-tauri/.native-build-staging"
 fi
 mkdir -p "$stage_root/src-tauri/binaries"
 cp "$backend_output_dir"/* "$stage_root/src-tauri/binaries/"
@@ -75,14 +90,18 @@ PY
 
 (
   cd "$stage_root/src-tauri"
-  CARGO_TARGET_DIR="$stage_root/target" cargo tauri build --bundles app
+  CARGO_TARGET_DIR="${WIKI_NATIVE_CARGO_TARGET_DIR:-$ROOT/.native-cargo-target}" \
+    cargo tauri build --bundles app
 )
 
+shared_bundle="${WIKI_NATIVE_CARGO_TARGET_DIR:-$ROOT/.native-cargo-target}/release/bundle/macos/Wiki.app"
 staged_bundle="$stage_root/target/release/bundle/macos/Wiki.app"
-if [[ ! -d "$staged_bundle" ]]; then
-  echo "Tauri build did not produce $staged_bundle" >&2
+if [[ ! -d "$shared_bundle" ]]; then
+  echo "Tauri build did not produce $shared_bundle" >&2
   exit 1
 fi
+mkdir -p "$(dirname "$staged_bundle")"
+cp -R "$shared_bundle" "$staged_bundle"
 
 if [[ "$force_stage_only" == 1 ]]; then
   preserve_stage=1

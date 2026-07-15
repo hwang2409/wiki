@@ -53,7 +53,9 @@ open src-tauri/target/release/bundle/macos/Wiki.app
 
 `make native-dev` runs the Tauri shell with a live sidecar. Ad-hoc signed, no notarization — quarantined copies may need right-click Open once. Sidecar logs live at `~/Library/Logs/Wiki/`.
 
-Native builds refuse to replace a bundle while Wiki.app or its supervisor is running. To prepare a build while Wiki is open, use `make native-build FORCE_STAGE_ONLY=1`; after quitting Wiki, run the printed `./scripts/swap-native-app.sh <stage-root>` command.
+Native builds refuse to replace a bundle while Wiki.app or its supervisor is running. The backend holds an app-lifetime lock at `~/.wiki/agent-runtime/app.lock`; the build holds both that lock and `supervisor.lock` across the final swap. To prepare a build while Wiki is open, use `make native-build FORCE_STAGE_ONLY=1`; after quitting Wiki, run the printed `./scripts/swap-native-app.sh <stage-root>` command. Successful deferred swaps remove the stage tree; interrupted cleanup is retried by the next native build via its `.swap-complete` sentinel.
+
+The first build after upgrading from an older sidecar (before it creates `app.lock`) must be explicit: `make native-build ALLOW_MISSING_APP_LOCK=1`. This is safe only after quitting Wiki and confirming the supervisor lock is free; subsequent builds use the app lock as the authoritative app-liveness signal. PID files are advisory only.
 
 ## Fleet leader (`Ctrl+A`)
 

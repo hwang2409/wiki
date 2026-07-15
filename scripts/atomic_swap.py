@@ -5,7 +5,15 @@ from __future__ import annotations
 import ctypes
 import os
 import shutil
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from backend.app.native_lifecycle import (
+    NativeRuntimeLockError,
+    hold_runtime_locks,
+)
 
 
 def _rename_swap(first: Path, second: Path) -> bool:
@@ -67,5 +75,31 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Atomically replace a native app bundle")
     parser.add_argument("staged", type=Path)
     parser.add_argument("live", type=Path)
+    parser.add_argument(
+        "--runtime-dir",
+        type=Path,
+        default=Path(
+            os.environ.get("WIKI_AGENT_RUNTIME_DIR")
+            or Path.home() / ".wiki" / "agent-runtime"
+        ).expanduser(),
+    )
+    parser.add_argument(
+        "--allow-missing-app-lock",
+        action="store_true",
+        default=os.environ.get("WIKI_NATIVE_ALLOW_MISSING_APP_LOCK", "").lower()
+        in {"1", "true", "yes", "on"},
+    )
     args = parser.parse_args()
-    atomic_replace(args.staged, args.live)
+    try:
+        with hold_runtime_locks(
+            args.runtime_dir,
+            allow_missing_app_lock=args.allow_missing_app_lock,
+        ):
+            atomic_replace(args.staged, args.live)
+    except NativeRuntimeLockError as exc:
+        print(
+            "REFUSING native bundle swap: "
+            f"{exc}. The live bundle was not touched.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from exc

@@ -9,7 +9,10 @@ fi
 
 stage_root="$(cd "$1" && pwd)"
 runtime_dir="${WIKI_AGENT_RUNTIME_DIR:-${HOME}/.wiki/agent-runtime}"
-python3 "$ROOT/scripts/native_build_guard.py" --runtime-dir "$runtime_dir"
+allow_missing_args=()
+if [[ "${ALLOW_MISSING_APP_LOCK:-${WIKI_NATIVE_ALLOW_MISSING_APP_LOCK:-}}" == 1 ]]; then
+  allow_missing_args+=(--allow-missing-app-lock)
+fi
 
 staged_bundle="$stage_root/target/release/bundle/macos/Wiki.app"
 live_bundle="$ROOT/src-tauri/target/release/bundle/macos/Wiki.app"
@@ -18,6 +21,13 @@ if [[ ! -d "$staged_bundle" ]]; then
   exit 1
 fi
 
-python3 "$ROOT/scripts/atomic_swap.py" "$staged_bundle" "$live_bundle"
+python3 "$ROOT/scripts/atomic_swap.py" \
+  "$staged_bundle" \
+  "$live_bundle" \
+  --runtime-dir "$runtime_dir" \
+  "${allow_missing_args[@]}"
+
+touch "$stage_root/.swap-complete"
+rm -rf "$stage_root"
 
 echo "swapped staged Wiki.app into $live_bundle"
