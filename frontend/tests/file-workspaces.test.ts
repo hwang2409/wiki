@@ -1,12 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  buildTree,
   filePanePath,
   fileResourceKey,
   isActiveFilePath,
   normalizeFilePanePath,
   parseFilePanePath,
   parseStoredRecentResources,
+  reconcileWorkspaceState,
   workspaceFileSearchPath,
 } from "../src/file-workspaces.ts";
 import { fileContentRequestPath } from "../src/api.ts";
@@ -56,4 +58,43 @@ test("code pane API requests preserve workspace and relative path separately", (
     fileContentRequestPath("phoebe", "src/shared.ts"),
     "/api/files/content?workspace=phoebe&path=src%2Fshared.ts"
   );
+});
+
+test("built trees preserve workspace identity for shared relative paths", () => {
+  const files = [{ path: "src/shared.ts" }];
+  const wikiTree = buildTree([], files, "wiki");
+  const phoebeTree = buildTree([], files, "phoebe");
+  const wikiFile = wikiTree.folders[0]?.files[0];
+  const phoebeFile = phoebeTree.folders[0]?.files[0];
+
+  assert.equal(wikiFile?.path, "src/shared.ts");
+  assert.equal(wikiFile?.workspace, "wiki");
+  assert.equal(phoebeFile?.path, "src/shared.ts");
+  assert.equal(phoebeFile?.workspace, "phoebe");
+  assert.equal(phoebeFile?.openPath, filePanePath("phoebe", "src/shared.ts"));
+});
+
+test("workspace refresh reconciles stopped and newly live workspaces", () => {
+  const cache = { wiki: "wiki-files", phoebe: "phoebe-files" };
+  const stopped = reconcileWorkspaceState(
+    [
+      { id: "wiki", live: true },
+      { id: "phoebe", live: false },
+    ],
+    "phoebe",
+    cache
+  );
+  assert.equal(stopped.activeWorkspace, "wiki");
+  assert.deepEqual(stopped.cache, { wiki: "wiki-files" });
+
+  const newlyLive = reconcileWorkspaceState(
+    [
+      { id: "wiki", live: true },
+      { id: "phoebe", live: true },
+    ],
+    "phoebe",
+    stopped.cache
+  );
+  assert.equal(newlyLive.activeWorkspace, "phoebe");
+  assert.deepEqual(newlyLive.cache, { wiki: "wiki-files" });
 });

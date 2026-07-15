@@ -331,9 +331,11 @@ def open_relative_file(root_fd: int, relative_parts: tuple[str, ...]) -> int:
 
 
 def iter_repo_files(file_root: Path, root_fd: int | None = None) -> tuple[list[Path], bool]:
+    if root_fd is not None:
+        return iter_repo_files_from_fd(file_root, root_fd)
+
     files: list[Path] = []
-    if root_fd is None:
-        file_root = file_root.resolve()
+    file_root = file_root.resolve()
     directories = [file_root]
     truncated = False
     while directories:
@@ -375,6 +377,58 @@ def iter_repo_files(file_root: Path, root_fd: int | None = None) -> tuple[list[P
                 truncated = True
                 return files, truncated
             files.append(Path(entry.path))
+    files.sort(key=lambda candidate: candidate.relative_to(file_root).as_posix())
+    return files, truncated
+
+
+def iter_repo_files_from_fd(file_root: Path, root_fd: int) -> tuple[list[Path], bool]:
+    files: list[Path] = []
+    directories: list[tuple[int, tuple[str, ...]]] = [(os.dup(root_fd), ())]
+    truncated = False
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+
+    while directories:
+        directory_fd, directory_parts = directories.pop()
+        try:
+            with os.scandir(directory_fd) as scanner:
+                entries = sorted(scanner, key=lambda entry: entry.name)
+            for entry in entries:
+                relative_parts = directory_parts + (entry.name,)
+                if is_ignored_file_parts(relative_parts):
+                    continue
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        child_fd = os.open(
+                            entry.name,
+                            os.O_RDONLY | directory_flag | no_follow,
+                            dir_fd=directory_fd,
+                        )
+                        directories.append((child_fd, relative_parts))
+                        continue
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    file_fd = os.open(
+                        entry.name,
+                        os.O_RDONLY | no_follow,
+                        dir_fd=directory_fd,
+                    )
+                    try:
+                        if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+                            continue
+                    finally:
+                        os.close(file_fd)
+                except OSError:
+                    continue
+                if len(files) >= MAX_FILE_TREE_ENTRIES:
+                    truncated = True
+                    return files, truncated
+                files.append(file_root.joinpath(*relative_parts))
+        except OSError:
+            continue
+        finally:
+            os.close(directory_fd)
+
     files.sort(key=lambda candidate: candidate.relative_to(file_root).as_posix())
     return files, truncated
 
@@ -3390,9 +3444,9 @@ def get_file_content(
     path: str = Query(..., min_length=1),
     workspace: str = "wiki",
 ) -> FileContent:
+    relative = validate_file_path(path)
     resolution = resolve_workspace(workspace)
     file_root = resolution.root
-    relative = validate_file_path(path)
     relative_path = relative.as_posix()
     target = file_root / Path(*relative.parts)
     try:

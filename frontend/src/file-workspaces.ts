@@ -1,3 +1,5 @@
+import type { NoteSummary } from "./types";
+
 export type FileReference = {
   workspace: string;
   path: string;
@@ -7,6 +9,26 @@ export type RecentResource = {
   kind: "note" | "file";
   workspace: string;
   path: string;
+};
+
+export type TreeFile = {
+  path: string;
+  openPath: string;
+  id: string;
+  isNote: boolean;
+  workspace?: string;
+};
+
+export type TreeFolder = {
+  name: string;
+  path: string;
+  folders: TreeFolder[];
+  files: TreeFile[];
+};
+
+type WorkspaceStatus = {
+  id: string;
+  live: boolean;
 };
 
 export const MAX_RECENT_RESOURCES = 15;
@@ -38,6 +60,87 @@ export function fileResourceKey(workspace: string, path: string): string {
 
 export function isActiveFilePath(activePath: string | null, workspace: string, path: string): boolean {
   return activePath === filePanePath(workspace, path);
+}
+
+export function buildTree(
+  notes: NoteSummary[],
+  files?: Array<{ path: string }>,
+  workspace = "wiki"
+): TreeFolder {
+  const repoNotePaths = new Set(notes.map((note) => `vault/${note.path}`));
+  const treeFiles: Array<TreeFile> =
+    files === undefined
+      ? notes.map((note) => ({
+          id: note.id,
+          isNote: true,
+          openPath: note.path,
+          path: note.path,
+        }))
+      : [
+          ...files
+            .filter((file) => workspace !== "wiki" || !repoNotePaths.has(file.path))
+            .map((file) => ({
+              id: `${workspace}:${file.path}`,
+              isNote: false,
+              openPath: filePanePath(workspace, file.path),
+              path: file.path,
+              workspace,
+            })),
+          ...notes.map((note) => ({
+            id: note.id,
+            isNote: true,
+            openPath: note.path,
+            path: `vault/${note.path}`,
+          })),
+        ];
+  const root: TreeFolder = { name: "", path: "", folders: [], files: [] };
+  const folderIndex = new Map<string, TreeFolder>([["", root]]);
+
+  for (const file of treeFiles) {
+    const parts = file.path.split("/");
+    let current = root;
+
+    for (const part of parts.slice(0, -1)) {
+      const folderPath = current.path ? `${current.path}/${part}` : part;
+      let next = folderIndex.get(folderPath);
+      if (!next) {
+        next = { name: part, path: folderPath, folders: [], files: [] };
+        folderIndex.set(folderPath, next);
+        current.folders.push(next);
+      }
+      current = next;
+    }
+
+    current.files.push({
+      id: file.id,
+      isNote: file.isNote,
+      openPath: file.openPath,
+      path: file.path,
+      workspace: file.workspace,
+    });
+  }
+
+  const basename = (path: string) => path.split("/").pop()?.replace(/\.md$/, "") ?? path;
+  const sortFolder = (folder: TreeFolder) => {
+    folder.folders.sort((a, b) => a.name.localeCompare(b.name));
+    folder.files.sort((a, b) => basename(a.path).localeCompare(basename(b.path)));
+    folder.folders.forEach(sortFolder);
+  };
+  sortFolder(root);
+  return root;
+}
+
+export function reconcileWorkspaceState<T>(
+  workspaces: WorkspaceStatus[],
+  activeWorkspace: string,
+  cache: Record<string, T>
+): { activeWorkspace: string; cache: Record<string, T> } {
+  const liveIds = new Set(workspaces.filter((workspace) => workspace.live).map((workspace) => workspace.id));
+  const fallback = liveIds.has("wiki") ? "wiki" : workspaces.find((workspace) => workspace.live)?.id ?? "wiki";
+  return {
+    activeWorkspace: liveIds.has(activeWorkspace) ? activeWorkspace : fallback,
+    cache: Object.fromEntries(Object.entries(cache).filter(([workspace]) => liveIds.has(workspace))),
+  };
 }
 
 export function parseStoredRecentResources(raw: string | null): RecentResource[] {

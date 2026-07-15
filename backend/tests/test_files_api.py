@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -229,6 +230,29 @@ class FilesApiTests(unittest.TestCase):
         listed_paths = {entry.path for entry in tree.files}
         self.assertEqual(listed_paths, {"nested/app.py", "src/other.py"})
 
+    def test_invalid_content_requests_do_not_leak_workspace_root_fds(self) -> None:
+        registry = {
+            "misc": {
+                "current": {
+                    "role": "orchestrator",
+                    "cwd": str(self.other_repo),
+                    "run_id": "misc-run",
+                    "control_attached": True,
+                }
+            }
+        }
+
+        with mock.patch.object(main, "FILES_ROOT", self.repo), mock.patch.object(
+            main, "_read_agent_registry", return_value=registry
+        ), mock.patch.object(main, "_supervisor_pid_is_alive", return_value=True):
+            before = len(os.listdir("/dev/fd"))
+            for _ in range(50):
+                with self.assertRaises(HTTPException):
+                    main.get_file_content("../outside", "misc")
+            after = len(os.listdir("/dev/fd"))
+
+        self.assertLessEqual(after, before + 1)
+
     def test_content_uses_pinned_root_when_path_is_replaced_after_resolution(self) -> None:
         original_root = self.other_repo
         outside = self.repo / "outside-root"
@@ -262,6 +286,43 @@ class FilesApiTests(unittest.TestCase):
 
         self.assertEqual(result.content, "inside")
 
+    def test_tree_uses_pinned_root_when_path_is_replaced_after_resolution(self) -> None:
+        original_root = self.other_repo
+        outside = self.repo / "outside-tree"
+        outside.mkdir()
+        for index in range(25):
+            (outside / f"outside-{index}.txt").write_text("outside", encoding="utf-8")
+        (original_root / "inside.txt").write_text("inside", encoding="utf-8")
+        registry = {
+            "misc": {
+                "current": {
+                    "role": "orchestrator",
+                    "cwd": str(original_root),
+                    "run_id": "misc-run",
+                    "control_attached": True,
+                }
+            }
+        }
+
+        with mock.patch.object(main, "FILES_ROOT", self.repo), mock.patch.object(
+            main, "_read_agent_registry", return_value=registry
+        ), mock.patch.object(main, "_supervisor_pid_is_alive", return_value=True):
+            resolution = main.resolve_workspace("misc")
+            moved_root = original_root.with_name(f"{original_root.name}-moved")
+            original_root.rename(moved_root)
+            original_root.symlink_to(outside, target_is_directory=True)
+            try:
+                with mock.patch.object(main, "resolve_workspace", return_value=resolution), mock.patch.object(
+                    main, "MAX_FILE_TREE_ENTRIES", 1
+                ):
+                    tree = main.list_files("misc")
+            finally:
+                original_root.unlink()
+                moved_root.rename(original_root)
+
+        self.assertEqual([entry.path for entry in tree.files], ["inside.txt"])
+        self.assertTrue(tree.truncated)
+
     def test_tree_prunes_excluded_directories_before_descending(self) -> None:
         (self.repo / ".git").mkdir()
         (self.repo / ".git" / "config").write_text("secret", encoding="utf-8")
@@ -270,9 +331,12 @@ class FilesApiTests(unittest.TestCase):
         real_scandir = main.os.scandir
         scanned: list[Path] = []
 
-        def tracking_scandir(path: str | bytes | Path):
+        def tracking_scandir(path: int | str | bytes | Path):
+            original_path = path
+            if isinstance(path, int):
+                path = os.readlink(f"/dev/fd/{path}")
             scanned.append(Path(path))
-            return real_scandir(path)
+            return real_scandir(original_path)
 
         with mock.patch.object(main, "FILES_ROOT", self.repo), mock.patch.object(
             main.os, "scandir", tracking_scandir

@@ -62,12 +62,16 @@ import {
   type QuickSwitcherSession,
 } from "./switcher";
 import {
+  buildTree,
   filePanePath,
   isActiveFilePath,
   MAX_RECENT_RESOURCES,
   normalizeFilePanePath,
   parseFilePanePath,
   parseStoredRecentResources,
+  reconcileWorkspaceState,
+  type TreeFile,
+  type TreeFolder,
 } from "./file-workspaces";
 import { SettingsModal, applyStoredFonts } from "./settings";
 import { ActivityFeed } from "./activity";
@@ -748,21 +752,6 @@ function agentStateGlyph(state: string | null, live: boolean): string {
   return "·";
 }
 
-type TreeFolder = {
-  name: string;
-  path: string;
-  folders: TreeFolder[];
-  files: TreeFile[];
-};
-
-type TreeFile = {
-  path: string;
-  openPath: string;
-  id: string;
-  isNote: boolean;
-  workspace?: string;
-};
-
 const emptyDraft: NoteDraft = { title: "", path: "", content: "" };
 
 function basename(path: string) {
@@ -907,76 +896,6 @@ function recentResourceKey(item: RecentSwitcherItem) {
 
 function readStoredRecentResources(): RecentSwitcherItem[] {
   return parseStoredRecentResources(localStorage.getItem(RECENT_RESOURCES_STORAGE_KEY));
-}
-
-function buildTree(
-  notes: NoteSummary[],
-  files?: Pick<FileSummary, "path">[],
-  workspace = "wiki"
-): TreeFolder {
-  // The file API uses repo-relative paths; the note API keeps vault-relative IDs.
-  // Represent notes at vault/<path> in the merged tree, but retain their note ID
-  // as openPath so clicking and note actions continue to use the note API.
-  const repoNotePaths = new Set(notes.map((note) => `vault/${note.path}`));
-  const treeFiles =
-    files === undefined
-      ? notes.map((note) => ({
-          id: note.id,
-          isNote: true,
-          openPath: note.path,
-          path: note.path,
-        }))
-      : [
-          ...files
-            .filter((file) => workspace !== "wiki" || !repoNotePaths.has(file.path))
-            .map((file) => ({
-              id: `${workspace}:${file.path}`,
-              isNote: false,
-              openPath: filePanePath(workspace, file.path),
-              path: file.path,
-              workspace,
-            })),
-          ...notes.map((note) => ({
-            id: note.id,
-            isNote: true,
-            openPath: note.path,
-            path: `vault/${note.path}`,
-          })),
-        ];
-  const root: TreeFolder = { name: "", path: "", folders: [], files: [] };
-  const folderIndex = new Map<string, TreeFolder>([["", root]]);
-
-  for (const file of treeFiles) {
-    const parts = file.path.split("/");
-    let current = root;
-
-    for (const part of parts.slice(0, -1)) {
-      const folderPath = current.path ? `${current.path}/${part}` : part;
-      let next = folderIndex.get(folderPath);
-      if (!next) {
-        next = { name: part, path: folderPath, folders: [], files: [] };
-        folderIndex.set(folderPath, next);
-        current.folders.push(next);
-      }
-      current = next;
-    }
-
-    current.files.push({
-      id: file.id,
-      isNote: file.isNote,
-      openPath: file.openPath,
-      path: file.path,
-    });
-  }
-
-  const sortFolder = (folder: TreeFolder) => {
-    folder.folders.sort((a, b) => a.name.localeCompare(b.name));
-    folder.files.sort((a, b) => basename(a.path).localeCompare(basename(b.path)));
-    folder.folders.forEach(sortFolder);
-  };
-  sortFolder(root);
-
-  return root;
 }
 
 function noteFolderFromTreePath(folderPath: string, showAllFiles: boolean): string | null {
@@ -1447,8 +1366,12 @@ export default function App() {
       .then((result) => {
         if (ignore) return;
         setWorkspaces(result.workspaces);
-        const liveIds = new Set(result.workspaces.filter((workspace) => workspace.live).map((workspace) => workspace.id));
-        setActiveWorkspace((current) => (liveIds.has(current) ? current : "wiki"));
+        setActiveWorkspace((current) =>
+          reconcileWorkspaceState(result.workspaces, current, {}).activeWorkspace
+        );
+        setFilesByWorkspace((current) =>
+          reconcileWorkspaceState(result.workspaces, "wiki", current).cache
+        );
       })
       .catch(() => {
         if (!ignore) {
@@ -1459,7 +1382,7 @@ export default function App() {
     return () => {
       ignore = true;
     };
-  }, [sidebarTab]);
+  }, [refreshTick, sidebarTab]);
 
   useEffect(() => {
     localStorage.setItem(
@@ -1587,7 +1510,7 @@ export default function App() {
         filesLoadPromiseRef.current.delete(workspace);
       });
     filesLoadPromiseRef.current.set(workspace, request);
-  }, [activeFileState?.loaded, activeWorkspace, showAllFiles, switcherOpen]);
+  }, [activeFileState?.loaded, activeWorkspace, refreshTick, showAllFiles, switcherOpen, workspaces]);
 
   useEffect(() => {
     for (const window of windowState.windows) {
