@@ -10,7 +10,9 @@ if MODE not in {"onefile", "onedir"}:
     raise SystemExit(f"Unsupported WIKI_PYINSTALLER_MODE={MODE!r}")
 
 ONEDIR_NAME = "wiki-backend-sidecar"
-LAUNCHER_PATH = ROOT / "dist" / "wiki-backend"
+FRONTEND_DIST = Path(os.environ.get("WIKI_FRONTEND_DIST", ROOT / "frontend" / "dist"))
+PYINSTALLER_DIST = Path(os.environ.get("WIKI_PYINSTALLER_DIST", ROOT / "dist"))
+LAUNCHER_PATH = PYINSTALLER_DIST / "wiki-backend"
 
 
 def write_onedir_launcher() -> None:
@@ -64,7 +66,7 @@ hiddenimports = (
 )
 
 datas = [
-    (str(ROOT / "frontend" / "dist"), "frontend_dist"),
+    (str(FRONTEND_DIST), "frontend_dist"),
 ]
 
 

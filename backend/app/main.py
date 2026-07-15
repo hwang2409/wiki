@@ -81,12 +81,12 @@ VAULT_DIR.mkdir(parents=True, exist_ok=True)
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    runtime_paths = RuntimePaths.from_env()
     configured_backend = os.environ.get("WIKI_BACKEND_URL")
     if configured_backend:
         backend_runtime.publish_backend_url(configured_backend)
     terminal.refresh_boot_token()
     dispatcher_task, watchdog_task, token_task = await _start_dispatcher()
-    runtime_paths = RuntimePaths.from_env()
     knowledge_task = asyncio.create_task(
         knowledge.background_index_loop(
             knowledge.KnowledgePaths.from_env(
