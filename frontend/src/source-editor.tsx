@@ -9,6 +9,12 @@ import type { NoteDraft } from "./types";
 
 const externalDocUpdate = Annotation.define<boolean>();
 
+export type SourceEditorHandoff = {
+  anchor: number;
+  focused: boolean;
+  head: number;
+};
+
 const sourceEditorTheme = EditorView.theme({
   "&": {
     backgroundColor: "var(--background-primary)",
@@ -61,9 +67,11 @@ const sourceEditorHighlighting = syntaxHighlighting(
 
 export default function MarkdownSourceEditor({
   content,
+  handoffRef,
   setDraft,
 }: {
   content: string;
+  handoffRef: { current: SourceEditorHandoff | null };
   setDraft: Dispatch<SetStateAction<NoteDraft>>;
 }) {
   const editorParentRef = useRef<HTMLDivElement | null>(null);
@@ -104,6 +112,19 @@ export default function MarkdownSourceEditor({
       }),
     });
     editorViewRef.current = view;
+
+    const handoff = handoffRef.current;
+    if (handoff?.focused) {
+      const clamp = (offset: number) => Math.max(0, Math.min(offset, view.state.doc.length));
+      view.dispatch({
+        selection: {
+          anchor: clamp(handoff.anchor),
+          head: clamp(handoff.head),
+        },
+      });
+      view.focus();
+    }
+    handoffRef.current = null;
 
     return () => {
       editorViewRef.current = null;

@@ -2,6 +2,8 @@ import {
   lazy,
   Suspense,
   useEffect,
+  useLayoutEffect,
+  useRef,
   useState,
   type Dispatch,
   type ReactNode,
@@ -19,6 +21,7 @@ import { LoadingPlaceholder } from "./loading";
 import { KanbanBoard, appendDoneEntry, type KanbanCard } from "./kanban";
 import { ObsidianMarkdown, splitFrontmatter, stripLeadingTitle } from "./markdown";
 import { TerminalPane, type TerminalPaneController } from "./terminal-pane";
+import type { SourceEditorHandoff } from "./source-editor";
 import type { Note, NoteDraft, NoteSummary } from "./types";
 
 const MarkdownSourceEditor = lazy(() => import("./source-editor"));
@@ -37,14 +40,34 @@ function sameNote(left: Note | null, right: Note | null) {
 
 function PlainSourceEditor({
   content,
+  handoffRef,
   setDraft,
 }: {
   content: string;
+  handoffRef: { current: SourceEditorHandoff | null };
   setDraft: Dispatch<SetStateAction<NoteDraft>>;
 }) {
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+
+  useLayoutEffect(() => {
+    return () => {
+      const textarea = textareaRef.current;
+      if (!textarea || document.activeElement !== textarea) {
+        handoffRef.current = null;
+        return;
+      }
+      handoffRef.current = {
+        anchor: textarea.selectionStart,
+        focused: true,
+        head: textarea.selectionEnd,
+      };
+    };
+  }, [handoffRef]);
+
   return (
     <textarea
       className="source-editor"
+      ref={textareaRef}
       spellCheck="true"
       value={content}
       onChange={(event) =>
@@ -61,9 +84,15 @@ function NoteSourceEditor({
   content: string;
   setDraft: Dispatch<SetStateAction<NoteDraft>>;
 }) {
+  const handoffRef = useRef<SourceEditorHandoff | null>(null);
+
   return (
-    <Suspense fallback={<PlainSourceEditor content={content} setDraft={setDraft} />}>
-      <MarkdownSourceEditor content={content} setDraft={setDraft} />
+    <Suspense
+      fallback={
+        <PlainSourceEditor content={content} handoffRef={handoffRef} setDraft={setDraft} />
+      }
+    >
+      <MarkdownSourceEditor content={content} handoffRef={handoffRef} setDraft={setDraft} />
     </Suspense>
   );
 }
