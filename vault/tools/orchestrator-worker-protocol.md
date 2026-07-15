@@ -68,6 +68,7 @@ Monitors = persistent background shell loops (Claude Code Monitor tool), one per
 3. **Arm-time self-verify.** After starting a monitor, confirm the initial-state event arrives AND the printed line contains the `state` value. No state in the first event ⇒ extraction broken ⇒ fix before relying on it.
 4. **Every live worker has exactly one state monitor at all times.** Spawn ⇒ arm; archive/replace ⇒ stop + re-arm. A worker without a monitor is invisible; silence is not "still working".
 5. **Silence backstop:** if a monitor produces no event for a long stretch while a PR is open, do a one-shot direct status read instead of trusting silence — GitHub ground truth (checks green + threads clear) overrides a stale/blind monitor per the signal-priority list above.
+6. **Watch `runtime_state`, not just the status file.** The worker-written status file says `working` while the provider run sits in `waiting-approval` (codex elicitation/approval prompts — e.g. the "install GitHub plugin?" tool suggestion stalled two workers 50-75 min on 2026-07-15). Monitors must print `state / runtime_state`; on `waiting-approval`, read the pending request from the run's raw.jsonl (`grep -i approval`/`elicitation`) and answer it via `POST /api/agents/<id>/respond` with `{"request_id": <id from the request payload>, "response": {"action": "decline"}}` (or accept when genuinely wanted). Plugin/tool-install suggestions: decline — workers use `gh` CLI. Kickoff prompts should pre-empt: workers decline install suggestions themselves.
 
 ## Input channel (orchestrator → worker)
 

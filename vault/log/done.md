@@ -9,6 +9,11 @@ updated: 2026-07-15
 
 ## 2026-07-15
 
+- **wiki** — WIKI-123 repo-scoped file browsing merged (#94, 0b6e9ad) — file API re-rooted at repo, 2-round sol gate
+- PHO-13783 analysis-log note Slack automation merged (#11397, 02f633ea47)
+- PHO-13780 account-health tick cron registered + barrel-registration guard merged (#11398, 0e4974121f)
+- PHO-13762 DRI staleness Slack pings merged (#11385, d308fa37e9)
+- PHO-13760 deployment report pack merged (#11384, 4 gate iterations)
 - **wiki** — WIKI-119 non-markdown file open — scoped file API + code viewer pane merged (#93, 0b6f391); 3 gate iterations, sol caught symlink-alias/TOCTOU class issues round 1, descriptor containment + exact-cap fixes round 3
 
 ## 2026-07-14
