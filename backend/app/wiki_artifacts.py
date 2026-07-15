@@ -277,6 +277,18 @@ def artifact_from_text(value: Any) -> dict[str, Any] | None:
     artifact = event.get("artifact")
     if not isinstance(artifact, dict) or artifact.get("kind") not in ARTIFACT_KINDS:
         return None
+    for field, limit in (("title", 200), ("caption", 500)):
+        if field in event and (
+            not isinstance(event[field], str) or len(event[field]) > limit
+        ):
+            return None
+    kind = artifact["kind"]
+    if kind != "image":
+        payload = {key: item for key, item in artifact.items() if key != "kind"}
+        try:
+            _validate_text_payload(kind, payload)
+        except ArtifactValidationError:
+            return None
     try:
         _validated_run_id(str(event.get("id") or ""))
     except ArtifactValidationError:

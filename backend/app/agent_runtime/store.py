@@ -916,7 +916,10 @@ class RunStore:
                         "migration": "headless-supervisor",
                     }
                 )
-                assert isinstance(legacy_orchestrators, dict)
+                if not isinstance(legacy_orchestrators, dict):
+                    raise StoreError(
+                        "legacy orchestrator registry changed during migration"
+                    )
                 legacy_orchestrators.pop(record.agent_id)
                 if not legacy_orchestrators:
                     registry.pop("_orchestrators", None)
