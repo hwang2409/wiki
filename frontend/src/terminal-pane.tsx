@@ -119,13 +119,15 @@ export function TerminalPane({
     }
   }
 
-  function handleFindKeyDown(event: ReactKeyboardEvent<HTMLElement>) {
+  function handleFindContainerKeyDown(event: ReactKeyboardEvent<HTMLElement>) {
     if (event.key === "Escape") {
       event.preventDefault();
       event.stopPropagation();
       closeFind();
-      return;
     }
+  }
+
+  function handleFindInputKeyDown(event: ReactKeyboardEvent<HTMLInputElement>) {
     if (event.key === "Enter") {
       event.preventDefault();
       event.stopPropagation();
@@ -168,7 +170,7 @@ export function TerminalPane({
             <div
               className="terminal-pane-find"
               role="search"
-              onKeyDownCapture={handleFindKeyDown}
+              onKeyDownCapture={handleFindContainerKeyDown}
             >
               <input
                 ref={findInputRef}
@@ -178,6 +180,7 @@ export function TerminalPane({
                 placeholder="Find"
                 value={findTerm}
                 onChange={(event) => updateFindTerm(event.target.value)}
+                onKeyDown={handleFindInputKeyDown}
               />
               <span className="terminal-pane-find-count" aria-live="polite">
                 {resultLabel}

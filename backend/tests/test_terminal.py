@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import os
 import queue
@@ -230,6 +231,7 @@ class TerminalSessionTests(unittest.TestCase):
     def test_write_input_retries_short_writes(self) -> None:
         session = terminal.TerminalSession.__new__(terminal.TerminalSession)
         session._master_fd = 42
+        session._master_fd_lock = threading.Lock()
         session._closed = False
         writes: list[bytes] = []
 
@@ -237,10 +239,81 @@ class TerminalSessionTests(unittest.TestCase):
             writes.append(payload)
             return min(2, len(payload))
 
-        with patch.object(terminal.os, "write", side_effect=short_write):
+        with patch.object(terminal.os, "dup", return_value=43), patch.object(
+            terminal.os, "write", side_effect=short_write
+        ):
             session.write_input(b"abcdef")
 
         self.assertEqual(writes, [b"abcdef", b"cdef", b"ef"])
+
+    def test_frozen_terminal_child_command_uses_native_dispatch(self) -> None:
+        with patch.object(terminal.sys, "frozen", True, create=True), patch.object(
+            terminal.sys, "executable", "/Applications/Wiki.app/Contents/MacOS/wiki-backend"
+        ):
+            command = terminal.terminal_child_command("/bin/sh", self.root)
+
+        self.assertEqual(
+            command,
+            ["/Applications/Wiki.app/Contents/MacOS/wiki-backend", "--terminal-child", "/bin/sh", str(self.root)],
+        )
+
+    @staticmethod
+    def _bare_session(master_fd: int = 42) -> terminal.TerminalSession:
+        session = terminal.TerminalSession.__new__(terminal.TerminalSession)
+        session._master_fd = master_fd
+        session._master_fd_lock = threading.Lock()
+        session._closed = False
+        return session
+
+    def test_close_during_read_clears_master_fd_once(self) -> None:
+        session = self._bare_session()
+        session._flow_gate = threading.Condition()
+        session._pending_bytes = 0
+        session._output_queue = queue.Queue()
+        session._exit_enqueued = False
+        session._state_lock = threading.Lock()
+        session.process = None
+
+        def read_and_close(_fd: int, _size: int) -> bytes:
+            self.assertEqual(session._take_master_fd(), 42)
+            raise OSError(errno.EBADF, "closed")
+
+        with patch.object(terminal.os, "dup", return_value=43), patch.object(
+            terminal.os, "read", side_effect=read_and_close
+        ):
+            session._reader_loop()
+
+        self.assertIsNone(session._master_fd)
+
+    def test_close_during_write_stops_before_writing_to_reused_fd(self) -> None:
+        session = self._bare_session()
+        writes: list[tuple[int, bytes]] = []
+
+        def write_and_close(fd: int, payload: bytes) -> int:
+            writes.append((fd, payload))
+            self.assertEqual(session._take_master_fd(), 42)
+            return 1
+
+        with patch.object(terminal.os, "dup", return_value=43), patch.object(
+            terminal.os, "write", side_effect=write_and_close
+        ):
+            session.write_input(b"abcdef")
+
+        self.assertEqual(writes, [(43, b"abcdef")])
+
+    def test_fd_reuse_by_new_session_cannot_receive_stale_input(self) -> None:
+        old_session = self._bare_session(42)
+        old_session._take_master_fd()
+        new_session = self._bare_session(42)
+        writes: list[bytes] = []
+
+        with patch.object(terminal.os, "dup", return_value=43), patch.object(
+            terminal.os, "write", side_effect=lambda _fd, payload: writes.append(payload) or len(payload)
+        ):
+            old_session.write_input(b"stale")
+            new_session.write_input(b"current")
+
+        self.assertEqual(writes, [b"current"])
 
 
 class TerminalWebSocketTests(unittest.TestCase):

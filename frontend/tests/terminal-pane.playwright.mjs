@@ -615,8 +615,14 @@ try {
     return /\d+ of \d+/.test(count);
   });
   result.searchWorked = (await page.locator(".terminal-pane-find").count()) === 1;
-  await page.getByRole("button", { name: "Next match" }).click();
-  await page.keyboard.press("Escape");
+  await page.getByRole("button", { name: "Previous match" }).focus();
+  await page.keyboard.press("Enter");
+  await page.waitForSelector(".terminal-pane-find");
+  await page.getByRole("button", { name: "Next match" }).focus();
+  await page.keyboard.press("Enter");
+  await page.waitForSelector(".terminal-pane-find");
+  await page.getByRole("button", { name: "Close find" }).focus();
+  await page.keyboard.press("Enter");
   await page.waitForFunction(() => document.querySelector("[aria-label='Find in terminal']") === null);
 
   const topOutput = await runCommand(page, terminalId, "top -l 1 | head", "Processes:");

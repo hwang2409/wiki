@@ -118,6 +118,13 @@ def set_winsize(fd: int, rows: int, cols: int) -> None:
     fcntl.ioctl(fd, termios.TIOCSWINSZ, winsize)
 
 
+def terminal_child_command(shell_path: str, cwd: Path) -> list[str]:
+    """Build the child command for both source checkouts and frozen binaries."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--terminal-child", shell_path, str(cwd)]
+    return [sys.executable, str(Path(__file__).with_name("terminal_child.py")), shell_path, str(cwd)]
+
+
 @dataclass(frozen=True)
 class TerminalExit:
     exit_code: int | None
@@ -161,6 +168,7 @@ class TerminalSession:
         self.process: subprocess.Popen[bytes] | None = None
         self.exit_code: int | None = None
         self._master_fd: int | None = None
+        self._master_fd_lock = threading.Lock()
         self._attached = False
         self._closed = False
         self._output_queue: queue.Queue[bytes | TerminalExit] = queue.Queue()
@@ -183,12 +191,7 @@ class TerminalSession:
             }
             try:
                 self.process = subprocess.Popen(
-                    [
-                        sys.executable,
-                        str(Path(__file__).with_name("terminal_child.py")),
-                        self.shell_path,
-                        str(self.cwd),
-                    ],
+                    terminal_child_command(self.shell_path, self.cwd),
                     stdin=slave_fd,
                     stdout=slave_fd,
                     stderr=slave_fd,
@@ -200,7 +203,18 @@ class TerminalSession:
             finally:
                 with contextlib.suppress(OSError):
                     os.close(slave_fd)
-        self._master_fd = master_fd
+        with self._master_fd_lock:
+            if self._closed:
+                publish_master = False
+            else:
+                self._master_fd = master_fd
+                publish_master = True
+        if not publish_master:
+            self._close_master_fd(master_fd)
+            if self.process is not None:
+                self._terminate_process(self.process)
+            self._enqueue_exit_once(self.process.poll() if self.process is not None else None)
+            return
         self._reader_thread = threading.Thread(
             target=self._reader_loop,
             name=f"wiki-terminal-{self.terminal_id}",
@@ -210,7 +224,8 @@ class TerminalSession:
 
     @property
     def closed(self) -> bool:
-        return self._closed
+        with self._master_fd_lock:
+            return self._closed
 
     @property
     def alive(self) -> bool:
@@ -229,28 +244,35 @@ class TerminalSession:
     def write_input(self, data: str | bytes) -> None:
         if not data:
             return
-        master_fd = self._master_fd
-        if master_fd is None or self._closed:
-            return
         payload = data.encode("utf-8", errors="ignore") if isinstance(data, str) else data
         offset = 0
         while offset < len(payload):
+            with self._master_fd_lock:
+                if self._master_fd is None or self._closed:
+                    return
+                try:
+                    write_fd = os.dup(self._master_fd)
+                except OSError:
+                    return
             try:
-                written = os.write(master_fd, payload[offset:])
+                written = os.write(write_fd, payload[offset:])
             except InterruptedError:
                 continue
             except OSError:
                 return
+            finally:
+                with contextlib.suppress(OSError):
+                    os.close(write_fd)
             if written <= 0:
                 return
             offset += written
 
     def resize(self, rows: int, cols: int) -> None:
-        master_fd = self._master_fd
-        if master_fd is None or self._closed:
-            return
-        with contextlib.suppress(OSError):
-            set_winsize(master_fd, rows, cols)
+        with self._master_fd_lock:
+            if self._master_fd is None or self._closed:
+                return
+            with contextlib.suppress(OSError):
+                set_winsize(self._master_fd, rows, cols)
 
     def read_output(self, timeout: float | None = None) -> bytes | TerminalExit:
         return self._output_queue.get(timeout=timeout)
@@ -289,22 +311,29 @@ class TerminalSession:
         self._output_queue.put(TerminalExit(exit_code=exit_code))
 
     def _reader_loop(self) -> None:
-        master_fd = self._master_fd
         try:
-            if master_fd is None:
-                return
             while True:
                 with self._flow_gate:
-                    while self._pending_bytes >= FLOW_HIGH_WATERMARK and not self._closed:
+                    while self._pending_bytes >= FLOW_HIGH_WATERMARK and not self.closed:
                         self._flow_gate.wait(timeout=0.1)
-                if self._closed:
+                if self.closed:
                     break
+                with self._master_fd_lock:
+                    if self._master_fd is None or self._closed:
+                        break
+                    try:
+                        reader_fd = os.dup(self._master_fd)
+                    except OSError:
+                        break
                 try:
-                    chunk = os.read(master_fd, 65536)
+                    chunk = os.read(reader_fd, 65536)
                 except OSError as exc:
                     if exc.errno in {errno.EIO, errno.EBADF}:
                         break
                     continue
+                finally:
+                    with contextlib.suppress(OSError):
+                        os.close(reader_fd)
                 if not chunk:
                     break
                 with self._flow_gate:
@@ -317,14 +346,20 @@ class TerminalSession:
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     exit_code = process.wait(timeout=0.5)
             self._enqueue_exit_once(exit_code)
+            master_fd = self._take_master_fd()
             if master_fd is not None:
                 self._close_master_fd(master_fd)
 
-    @classmethod
-    def _close_master_fd(cls, master_fd: int) -> None:
-        with cls._spawn_lock:
-            with contextlib.suppress(OSError):
-                os.close(master_fd)
+    def _take_master_fd(self) -> int | None:
+        with self._master_fd_lock:
+            master_fd = self._master_fd
+            self._master_fd = None
+            return master_fd
+
+    @staticmethod
+    def _close_master_fd(master_fd: int) -> None:
+        with contextlib.suppress(OSError):
+            os.close(master_fd)
 
     def mark_output_delivered(self, size: int) -> None:
         with self._flow_gate:
@@ -333,33 +368,39 @@ class TerminalSession:
                 self._flow_gate.notify_all()
 
     def close(self) -> None:
-        with self._state_lock:
+        with self._master_fd_lock:
             if self._closed:
                 return
             self._closed = True
+            master_fd = self._master_fd
+            self._master_fd = None
         with self._flow_gate:
             self._flow_gate.notify_all()
         process = self.process
         if process is not None and process.poll() is None:
-            self._signal_child(process, signal.SIGHUP)
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                process.wait(timeout=0.5)
-            if process.poll() is None:
-                self._signal_child(process, signal.SIGTERM)
-                with contextlib.suppress(subprocess.TimeoutExpired):
-                    process.wait(timeout=0.5)
-            if process.poll() is None:
-                self._signal_child(process, signal.SIGKILL)
-                with contextlib.suppress(subprocess.TimeoutExpired):
-                    process.wait(timeout=0.5)
-        master_fd = self._master_fd
-        self._master_fd = None
+            self._terminate_process(process)
         if master_fd is not None:
             self._close_master_fd(master_fd)
         if self._reader_thread is not None:
             self._reader_thread.join(timeout=1)
         if process is not None:
             self._enqueue_exit_once(process.poll())
+
+    @classmethod
+    def _terminate_process(cls, process: subprocess.Popen[bytes]) -> None:
+        if process.poll() is not None:
+            return
+        cls._signal_child(process, signal.SIGHUP)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=0.5)
+        if process.poll() is None:
+            cls._signal_child(process, signal.SIGTERM)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=0.5)
+        if process.poll() is None:
+            cls._signal_child(process, signal.SIGKILL)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=0.5)
 
     @staticmethod
     def _signal_child(process: subprocess.Popen[bytes], signum: int) -> None:
