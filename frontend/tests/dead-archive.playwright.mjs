@@ -106,6 +106,21 @@ async function startFakeSupervisor(fixtures, registry) {
     await fs.writeFile(fixtures.registryPath, JSON.stringify(registry, null, 2));
   }
 
+  async function persistRuntimeSnapshot() {
+    for (const runtime of runtimeByAgent.values()) {
+      const current = registry[runtime.ticket]?.current;
+      if (!current) throw new Error(`missing runtime snapshot target ${runtime.ticket}`);
+      Object.assign(current, {
+        state: runtime.state,
+        state_reason: runtime.state_reason,
+        control_attached: runtime.control_attached,
+        provider_pid: runtime.provider_pid,
+      });
+    }
+    await persistRegistry();
+    await fs.writeFile(path.join(fixtures.runtimeDir, "supervisor.pid"), `${process.pid}\n`);
+  }
+
   async function archiveAgent(agentId) {
     const entry = registry[agentId];
     if (!entry?.current) throw new Error(`missing archive target ${agentId}`);
@@ -221,11 +236,13 @@ async function startFakeSupervisor(fixtures, registry) {
     server.once("error", reject);
     server.listen(fixtures.supervisorSocketPath, resolve);
   });
+  await persistRuntimeSnapshot();
 
   return {
     async stop() {
       await new Promise((resolve) => server.close(resolve));
       await fs.rm(fixtures.supervisorSocketPath, { force: true });
+      await fs.rm(path.join(fixtures.runtimeDir, "supervisor.pid"), { force: true });
     },
   };
 }
@@ -285,6 +302,21 @@ async function main() {
 
   try {
     await page.goto(`${backend.baseUrl}/#/agents`, { waitUntil: "domcontentloaded" });
+    await waitForAgents(
+      backend.baseUrl,
+      (payload) => {
+        const dead = payload.workers.find((worker) => worker.ticket === DEAD_WORKER);
+        const healthy = payload.workers.find((worker) => worker.ticket === HEALTHY_WORKER);
+        return (
+          dead?.state === "working" &&
+          dead.control_attached === false &&
+          dead.provider_pid === null &&
+          healthy?.state === "working" &&
+          healthy.control_attached === true &&
+          healthy.provider_pid != null
+        );
+      },
+    );
     await page.getByText(DETACHED_COPY, { exact: true }).first().waitFor();
     await agentCard(page, DEAD_WORKER).getByRole("button", { name: "Archive", exact: true }).waitFor();
     await orchestratorGroup(page, DEAD_ORCH)
