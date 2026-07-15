@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import stat
 import subprocess
 import time
 from contextlib import asynccontextmanager
@@ -49,6 +50,9 @@ from .frontend_static import mount_frontend_static
 ROOT_DIR = Path(os.environ.get("WIKI_REPO_DIR", Path(__file__).resolve().parents[2])).resolve()
 VAULT_DIR = Path(os.environ.get("WIKI_VAULT_DIR", ROOT_DIR / "vault")).resolve()
 MAX_NOTE_BYTES = 2_000_000
+MAX_FILE_BYTES = 2_000_000
+MAX_FILE_TREE_ENTRIES = 10_000
+IGNORED_FILE_PARTS = {".git", ".obsidian", "node_modules"}
 
 VAULT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -126,6 +130,25 @@ class NoteUpdate(BaseModel):
     content: str = Field(..., max_length=MAX_NOTE_BYTES)
 
 
+class FileSummary(BaseModel):
+    path: str
+    size: int
+    updated_at: datetime
+
+
+class FileContent(BaseModel):
+    path: str
+    size: int
+    content: str | None = None
+    binary: bool = False
+    error: str | None = None
+
+
+class FileTree(BaseModel):
+    files: list[FileSummary]
+    truncated: bool = False
+
+
 def slugify(value: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", value.strip().lower()).strip("-")
     return slug or "untitled"
@@ -167,6 +190,129 @@ def resolve_note_path(note_path: str) -> Path:
         raise HTTPException(status_code=400, detail="Note path escapes the vault") from exc
 
     return target
+
+
+def is_ignored_file_parts(parts: tuple[str, ...]) -> bool:
+    return any(part.startswith(".") or part in IGNORED_FILE_PARTS for part in parts)
+
+
+def file_not_found() -> None:
+    raise HTTPException(status_code=404, detail="File not found")
+
+
+def resolve_file_path(raw_path: str) -> tuple[Path, str]:
+    candidate = raw_path.strip().replace("\\", "/")
+    if "\x00" in candidate:
+        file_not_found()
+    try:
+        path = PurePosixPath(candidate)
+        if (
+            not candidate
+            or path.is_absolute()
+            or any(part in {"", ".", ".."} for part in path.parts)
+            or is_ignored_file_parts(path.parts)
+        ):
+            file_not_found()
+
+        vault_root = VAULT_DIR.resolve()
+        target = (vault_root / Path(*path.parts)).resolve()
+        relative_target = target.relative_to(vault_root)
+        if is_ignored_file_parts(relative_target.parts):
+            file_not_found()
+    except HTTPException:
+        raise
+    except (OSError, RuntimeError, ValueError, TypeError):
+        file_not_found()
+    return target, path.as_posix()
+
+
+def iter_vault_files() -> tuple[list[Path], bool]:
+    files: list[Path] = []
+    vault_root = VAULT_DIR.resolve()
+    directories = [vault_root]
+    truncated = False
+    while directories:
+        directory = directories.pop()
+        try:
+            with os.scandir(directory) as scanner:
+                entries = sorted(scanner, key=lambda entry: entry.name)
+        except OSError:
+            continue
+        for entry in entries:
+            relative_parts = Path(entry.path).relative_to(vault_root).parts
+            if is_ignored_file_parts(relative_parts):
+                continue
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    directories.append(Path(entry.path))
+                    continue
+                if not entry.is_file(follow_symlinks=True):
+                    continue
+                resolved = Path(entry.path).resolve()
+                resolved_relative = resolved.relative_to(vault_root)
+                if is_ignored_file_parts(resolved_relative.parts):
+                    continue
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if len(files) >= MAX_FILE_TREE_ENTRIES:
+                truncated = True
+                return files, truncated
+            files.append(Path(entry.path))
+    files.sort(key=lambda candidate: candidate.relative_to(vault_root).as_posix())
+    return files, truncated
+
+
+def opened_file_is_safe(fd: int, target: Path, vault_root: Path) -> bool:
+    descriptor_stat = os.fstat(fd)
+    if not stat.S_ISREG(descriptor_stat.st_mode):
+        return False
+    try:
+        relative_target = target.relative_to(vault_root)
+        if is_ignored_file_parts(relative_target.parts):
+            return False
+    except ValueError:
+        return False
+
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    root_fd: int | None = None
+    current_fd: int | None = None
+    try:
+        root_fd = os.open(vault_root, os.O_RDONLY | no_follow | directory_flag)
+        current_fd = root_fd
+        for index, component in enumerate(relative_target.parts):
+            is_final = index == len(relative_target.parts) - 1
+            flags = os.O_RDONLY | no_follow | (0 if is_final else directory_flag)
+            next_fd = os.open(component, flags, dir_fd=current_fd)
+            if current_fd != root_fd:
+                os.close(current_fd)
+            current_fd = next_fd
+        if current_fd is None:
+            return False
+        opened_stat = os.fstat(current_fd)
+        return (opened_stat.st_dev, opened_stat.st_ino) == (
+            descriptor_stat.st_dev,
+            descriptor_stat.st_ino,
+        )
+    except (OSError, RuntimeError, ValueError):
+        return False
+    finally:
+        if current_fd is not None and current_fd != root_fd:
+            os.close(current_fd)
+        if root_fd is not None:
+            os.close(root_fd)
+
+
+def read_open_file(fd: int, limit: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = limit + 1
+    while remaining > 0:
+        chunk = os.read(fd, remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
 
 
 def unique_note_path(raw_path: str | None, title: str) -> str:
@@ -2974,6 +3120,63 @@ def list_notes(q: str | None = None) -> list[NoteSummary]:
             if needle in note_id_for(path).lower() or needle in read_note(path).lower()
         ]
     return [to_summary(path) for path in files]
+
+
+@app.get("/api/files/tree", response_model=FileTree)
+def list_files() -> FileTree:
+    summaries: list[FileSummary] = []
+    files, truncated = iter_vault_files()
+    for path in files:
+        try:
+            stat_result = path.stat()
+        except OSError:
+            continue
+        summaries.append(
+            FileSummary(
+                path=path.relative_to(VAULT_DIR.resolve()).as_posix(),
+                size=stat_result.st_size,
+                updated_at=datetime.fromtimestamp(stat_result.st_mtime, tz=timezone.utc),
+            )
+        )
+    return FileTree(files=summaries, truncated=truncated)
+
+
+@app.get("/api/files/content", response_model=FileContent)
+def get_file_content(path: str = Query(..., min_length=1)) -> FileContent:
+    target, relative_path = resolve_file_path(path)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(target, flags)
+    except OSError as exc:
+        raise HTTPException(status_code=404, detail="File not found") from exc
+
+    try:
+        vault_root = VAULT_DIR.resolve()
+        if not opened_file_is_safe(fd, target, vault_root):
+            file_not_found()
+        size = os.fstat(fd).st_size
+        raw = read_open_file(fd, MAX_FILE_BYTES)
+        if size > MAX_FILE_BYTES or len(raw) > MAX_FILE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail={
+                    "code": "file_too_large",
+                    "message": f"File exceeds the {MAX_FILE_BYTES // 1_000_000}MB viewing limit",
+                },
+            )
+    except HTTPException:
+        raise
+    except (OSError, RuntimeError, ValueError):
+        raise HTTPException(status_code=404, detail="File not found")
+    finally:
+        os.close(fd)
+    if b"\x00" in raw:
+        return FileContent(path=relative_path, size=size, binary=True, error="binary file")
+    try:
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return FileContent(path=relative_path, size=size, binary=True, error="binary file")
+    return FileContent(path=relative_path, size=size, content=content)
 
 
 @app.get("/api/notes/{note_path:path}", response_model=Note)

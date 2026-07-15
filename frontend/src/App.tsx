@@ -7,6 +7,8 @@ import {
   ChevronRight,
   ChevronsDownUp,
   FilePlus2,
+  Files,
+  FileCode2,
   Folder as FolderIcon,
   HeartPulse,
   History,
@@ -28,12 +30,13 @@ import {
   getAgents,
   getLinks,
   getNote,
+  listFiles,
   listNotes,
   renameNote,
   searchNotes,
   updateNote
 } from "./api";
-import type { AgentWorker, ArchivedWorker, NoteLinks, Orchestrator } from "./api";
+import type { AgentWorker, ArchivedWorker, FileSummary, NoteLinks, Orchestrator } from "./api";
 import {
   FleetSwitcher,
   QuickSwitcher,
@@ -73,6 +76,7 @@ import type { Note, NoteDraft, NoteSummary } from "./types";
 type Mode =
   | "empty"
   | "view"
+  | "file"
   | "edit"
   | "new"
   | "activity"
@@ -689,7 +693,13 @@ type TreeFolder = {
   name: string;
   path: string;
   folders: TreeFolder[];
-  notes: NoteSummary[];
+  files: TreeFile[];
+};
+
+type TreeFile = {
+  path: string;
+  id: string;
+  isNote: boolean;
 };
 
 const emptyDraft: NoteDraft = { title: "", path: "", content: "" };
@@ -698,13 +708,17 @@ function basename(path: string) {
   return path.split("/").pop()?.replace(/\.md$/, "") ?? path;
 }
 
+function isMarkdownPath(path: string) {
+  return path.toLowerCase().endsWith(".md");
+}
+
 type Route =
   | { kind: "empty" }
   | { kind: "new" }
   | { kind: UtilityMode }
   | { kind: "agent"; ticket: string; panel: AgentRoutePanel }
   | { kind: "terminal"; id: string }
-  | { kind: "note" | "edit"; path: string };
+  | { kind: "note" | "edit" | "file"; path: string };
 
 const UTILITY_ROUTES: readonly UtilityMode[] = ["activity", "graph", "health", "agents", "tokens"];
 
@@ -732,10 +746,10 @@ function parseRoute(hash: string): Route {
   if (terminal) return { kind: "terminal", id: terminal[1] };
   const utility = UTILITY_ROUTES.find((kind) => hash === `#/${kind}`);
   if (utility) return { kind: utility };
-  const match = hash.match(/^#\/(note|edit)\/(.+)$/);
+  const match = hash.match(/^#\/(note|edit|file)\/(.+)$/);
   if (match) {
     const path = match[2].split("/").map(decodeURIComponent).join("/");
-    return { kind: match[1] as "note" | "edit", path };
+    return { kind: match[1] as "note" | "edit" | "file", path };
   }
   return { kind: "empty" };
 }
@@ -754,31 +768,39 @@ function readStoredCollapsed(): Set<string> {
   }
 }
 
-function buildTree(notes: NoteSummary[]): TreeFolder {
-  const root: TreeFolder = { name: "", path: "", folders: [], notes: [] };
+function buildTree(
+  notes: NoteSummary[],
+  files: Array<Pick<FileSummary, "path"> | NoteSummary> = notes
+): TreeFolder {
+  const notePaths = new Map(notes.map((note) => [note.path, note]));
+  const root: TreeFolder = { name: "", path: "", folders: [], files: [] };
   const folderIndex = new Map<string, TreeFolder>([["", root]]);
 
-  for (const note of notes) {
-    const parts = note.path.split("/");
+  for (const file of files) {
+    const parts = file.path.split("/");
     let current = root;
 
     for (const part of parts.slice(0, -1)) {
       const folderPath = current.path ? `${current.path}/${part}` : part;
       let next = folderIndex.get(folderPath);
       if (!next) {
-        next = { name: part, path: folderPath, folders: [], notes: [] };
+        next = { name: part, path: folderPath, folders: [], files: [] };
         folderIndex.set(folderPath, next);
         current.folders.push(next);
       }
       current = next;
     }
 
-    current.notes.push(note);
+    current.files.push({
+      id: "id" in file ? file.id : file.path,
+      isNote: notePaths.has(file.path),
+      path: file.path,
+    });
   }
 
   const sortFolder = (folder: TreeFolder) => {
     folder.folders.sort((a, b) => a.name.localeCompare(b.name));
-    folder.notes.sort((a, b) => basename(a.path).localeCompare(basename(b.path)));
+    folder.files.sort((a, b) => basename(a.path).localeCompare(basename(b.path)));
     folder.folders.forEach(sortFolder);
   };
   sortFolder(root);
@@ -976,7 +998,7 @@ function FolderTree({
   collapsed,
   dragActive,
   onToggleFolder,
-  onOpenNote,
+  onOpenFile,
   onNoteDragStart,
   onNoteDragEnd,
   onDropOnFolder,
@@ -988,7 +1010,7 @@ function FolderTree({
   collapsed: Set<string>;
   dragActive: boolean;
   onToggleFolder: (path: string) => void;
-  onOpenNote: (path: string) => void;
+  onOpenFile: (path: string) => void;
   onNoteDragStart: (path: string) => void;
   onNoteDragEnd: () => void;
   onDropOnFolder: (folderPath: string) => void;
@@ -1039,32 +1061,37 @@ function FolderTree({
                 onDropOnFolder={onDropOnFolder}
                 onNoteDragEnd={onNoteDragEnd}
                 onNoteDragStart={onNoteDragStart}
-                onOpenNote={onOpenNote}
+                onOpenFile={onOpenFile}
                 onToggleFolder={onToggleFolder}
               />
             )}
           </div>
         );
       })}
-      {folder.notes.map((note) => (
+      {folder.files.map((file) => (
         <button
-          className={`tree-item-self nav-file-title${
-            activePath === note.path ? " is-active" : ""
+          className={`tree-item-self ${file.isNote ? "nav-file-title" : "nav-code-file-title"}${
+            activePath === file.path ? " is-active" : ""
           }`}
-          draggable
-          key={note.id}
+          draggable={file.isNote}
+          key={file.id}
           style={{ paddingInlineStart: `${depth * 17 + 24}px` }}
           type="button"
-          onClick={() => onOpenNote(note.path)}
-          onContextMenu={(event) => onContextMenu(event, "file", note.path)}
-          onDragEnd={onNoteDragEnd}
-          onDragStart={(event) => {
-            event.dataTransfer.effectAllowed = "copyMove";
-            event.dataTransfer.setData("text/plain", note.path);
-            onNoteDragStart(note.path);
-          }}
+          onClick={() => onOpenFile(file.path)}
+          onContextMenu={file.isNote ? (event) => onContextMenu(event, "file", file.path) : undefined}
+          onDragEnd={file.isNote ? onNoteDragEnd : undefined}
+          onDragStart={
+            file.isNote
+              ? (event) => {
+                  event.dataTransfer.effectAllowed = "copyMove";
+                  event.dataTransfer.setData("text/plain", file.path);
+                  onNoteDragStart(file.path);
+                }
+              : undefined
+          }
         >
-          <span className="tree-item-name">{basename(note.path)}</span>
+          {!file.isNote ? <FileCode2 className="tree-file-icon" size={13} /> : null}
+          <span className="tree-item-name">{basename(file.path)}</span>
         </button>
       ))}
     </>
@@ -1073,6 +1100,11 @@ function FolderTree({
 
 export default function App() {
   const [notes, setNotes] = useState<NoteSummary[]>([]);
+  const [files, setFiles] = useState<FileSummary[]>([]);
+  const [filesTruncated, setFilesTruncated] = useState(false);
+  const [showAllFiles, setShowAllFiles] = useState(
+    () => localStorage.getItem("wiki-show-all-files") === "true"
+  );
   const [activeNote, setActiveNote] = useState<Note | null>(null);
   const [mode, setMode] = useState<Mode>("empty");
   const [draft, setDraft] = useState<NoteDraft>(emptyDraft);
@@ -1208,6 +1240,10 @@ export default function App() {
   }, [collapsedFolders]);
 
   useEffect(() => {
+    localStorage.setItem("wiki-show-all-files", String(showAllFiles));
+  }, [showAllFiles]);
+
+  useEffect(() => {
     localStorage.setItem(
       WINDOWS_STORAGE_KEY,
       JSON.stringify({ version: 2, ...windowState } satisfies StoredWindowWorkspaceState)
@@ -1292,6 +1328,31 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (!showAllFiles) {
+      setFiles([]);
+      setFilesTruncated(false);
+      return;
+    }
+    let ignore = false;
+    listFiles()
+      .then((nextTree) => {
+        if (!ignore) {
+          setFiles(nextTree.files);
+          setFilesTruncated(nextTree.truncated);
+        }
+      })
+      .catch(() => {
+        if (!ignore) {
+          setFiles([]);
+          setFilesTruncated(false);
+        }
+      });
+    return () => {
+      ignore = true;
+    };
+  }, [refreshTick, showAllFiles]);
+
+  useEffect(() => {
     for (const window of windowState.windows) {
       const windowMatch = window.id.match(/^window-(\d+)$/);
       if (windowMatch) windowIdRef.current = Math.max(windowIdRef.current, Number(windowMatch[1]));
@@ -1344,7 +1405,10 @@ export default function App() {
     });
   }, [agentsState.workers]);
 
-  const tree = useMemo(() => buildTree(notes), [notes]);
+  const tree = useMemo(
+    () => buildTree(notes, showAllFiles && files.length > 0 ? files : undefined),
+    [files, notes, showAllFiles]
+  );
   const activeWindow = useMemo(
     () =>
       windowState.windows.find((window) => window.id === windowState.activeWindowId) ??
@@ -1635,6 +1699,16 @@ export default function App() {
       showUtilityRoute(utility, { syncHash });
       return;
     }
+    if (!isMarkdownPath(path)) {
+      if (syncHash) navigate({ kind: "file", path });
+      setError(null);
+      setActiveNote(null);
+      setAgentPanel(null);
+      setAgentTicket(null);
+      setTerminalRouteId(null);
+      setMode("file");
+      return;
+    }
     void showNoteRoute(path, { syncHash });
   }
 
@@ -1656,6 +1730,16 @@ export default function App() {
     options: { syncHash?: boolean; edit?: boolean } = {}
   ) {
     const { edit = false, syncHash = true } = options;
+    if (!isMarkdownPath(path)) {
+      if (syncHash) navigate({ kind: "file", path });
+      setError(null);
+      setActiveNote(null);
+      setAgentTicket(null);
+      setAgentPanel(null);
+      setTerminalRouteId(null);
+      setMode("file");
+      return;
+    }
     if (syncHash) navigate({ kind: edit ? "edit" : "note", path });
     setError(null);
     setAgentTicket(null);
@@ -2469,7 +2553,7 @@ export default function App() {
         showTerminalRoute(route.id, { launch: false, splitIfNew: false, syncHash: false });
         return;
       }
-      if (route.kind !== "note" && route.kind !== "edit") {
+      if (route.kind !== "note" && route.kind !== "edit" && route.kind !== "file") {
         openUtilityViewRef.current(route.kind, { syncHash: false });
         return;
       }
@@ -2631,6 +2715,8 @@ export default function App() {
   const tabTitle =
     mode === "new"
       ? "Untitled"
+      : mode === "file"
+        ? focusedPanePath?.split("/").pop() ?? "File"
       : mode === "agent"
         ? agentTicket ?? "Agent"
         : mode === "terminal"
@@ -2639,6 +2725,8 @@ export default function App() {
   const breadcrumbs =
     mode === "new"
       ? ["Untitled"]
+      : mode === "file"
+        ? focusedPanePath?.split("/") ?? []
       : mode === "agent"
         ? ["Agents", agentTicket ?? ""]
         : mode === "terminal"
@@ -3098,6 +3186,15 @@ export default function App() {
                 >
                   <ChevronsDownUp size={16} />
                 </button>
+                <button
+                  aria-label={showAllFiles ? "Show notes only" : "Show all files"}
+                  className={`nav-action-button${showAllFiles ? " is-active" : ""}`}
+                  title={showAllFiles ? "Show notes only" : "Show all files"}
+                  type="button"
+                  onClick={() => setShowAllFiles((current) => !current)}
+                >
+                  <Files size={16} />
+                </button>
               </div>
             </div>
             <div className="nav-files-container">
@@ -3105,20 +3202,29 @@ export default function App() {
                 <div className="nav-empty">
                   <LoadingPlaceholder className="nav-loading" lines={[92, 86, 88, 74, 81]} />
                 </div>
-              ) : notes.length > 0 ? (
-                <FolderTree
-                  activePath={mode === "view" || mode === "edit" ? activeNote?.path ?? null : null}
-                  collapsed={collapsedFolders}
-                  depth={0}
-                  dragActive={draggingNotePath !== null}
-                  folder={tree}
-                  onContextMenu={handleTreeContextMenu}
-                  onDropOnFolder={handleDropOnFolder}
-                  onNoteDragEnd={() => setDraggingNotePath(null)}
-                  onNoteDragStart={setDraggingNotePath}
-                  onOpenNote={openNote}
-                  onToggleFolder={toggleFolder}
-                />
+              ) : tree.files.length > 0 || tree.folders.length > 0 ? (
+                <>
+                  <FolderTree
+                    activePath={
+                      mode === "file"
+                        ? focusedPanePath
+                        : mode === "view" || mode === "edit"
+                          ? activeNote?.path ?? null
+                          : null
+                    }
+                    collapsed={collapsedFolders}
+                    depth={0}
+                    dragActive={draggingNotePath !== null}
+                    folder={tree}
+                    onContextMenu={handleTreeContextMenu}
+                    onDropOnFolder={handleDropOnFolder}
+                    onNoteDragEnd={() => setDraggingNotePath(null)}
+                    onNoteDragStart={setDraggingNotePath}
+                    onOpenFile={openNote}
+                    onToggleFolder={toggleFolder}
+                  />
+                  {filesTruncated ? <div className="nav-empty">File list truncated at 10,000 items</div> : null}
+                </>
               ) : (
                 <div className="nav-empty">No notes yet</div>
               )}

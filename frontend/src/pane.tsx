@@ -7,6 +7,7 @@ import {
   type SetStateAction,
 } from "react";
 import { getLinks, getNote, updateNote, type NoteLinks } from "./api";
+import { CodeFilePane } from "./code-file-pane";
 import {
   AgentSessionSurface,
   type AgentRoutePanel,
@@ -111,6 +112,8 @@ export function WorkspacePane({
     // Utility pages are provided by App's focused-pane overlay. Do not mount a
     // hidden note pane for their internal workspace identity.
     content = null;
+  } else if (!path.toLowerCase().endsWith(".md")) {
+    content = <CodeFilePane path={path} scrollRef={scrollRef} />;
   } else {
     content = (
       <NotePane

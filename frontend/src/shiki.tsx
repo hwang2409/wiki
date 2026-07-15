@@ -44,13 +44,29 @@ const LANG_ALIAS: Record<string, BundledLanguage> = {
   rs: "rust",
   css: "css",
   html: "html",
+  xml: "xml",
   diff: "diff",
   patch: "diff",
+  c: "c",
+  h: "c",
+  cpp: "cpp",
+  hpp: "cpp",
+  java: "java",
+  ruby: "ruby",
+  rb: "ruby",
+  php: "php",
+  dockerfile: "docker",
 };
 
 function normalizeLang(lang: string | null | undefined): BundledLanguage | null {
   if (!lang) return null;
   return LANG_ALIAS[lang.trim().toLowerCase()] ?? null;
+}
+
+export function languageForPath(path: string): BundledLanguage | null {
+  const filename = path.split("/").pop()?.toLowerCase() ?? "";
+  if (filename === "dockerfile") return "docker";
+  return normalizeLang(filename.split(".").pop() ?? null);
 }
 
 function resolveShikiTheme(appTheme: ThemeId): BundledTheme {
@@ -187,4 +203,3 @@ export function ShikiCode({
     </div>
   );
 }
-
