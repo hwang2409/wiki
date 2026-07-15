@@ -46,6 +46,7 @@ class RecoveryAction(str, Enum):
 
 
 TERMINAL_STATES = frozenset({LifecycleState.DEAD, LifecycleState.COMPLETED})
+MAX_MESSAGE_DEDUPE_KEYS = 256
 
 
 ALLOWED_STATE_TRANSITIONS: dict[LifecycleState, frozenset[LifecycleState]] = {

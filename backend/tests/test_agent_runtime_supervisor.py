@@ -41,7 +41,12 @@ from backend.app.agent_runtime.provider import (
 )
 from backend.app.agent_runtime.store import RunStore, RuntimePaths, StoreConflict
 from backend.app.agent_runtime.supervisor import Supervisor, resolve_safe_worktree
-from backend.app.agent_runtime.types import LifecycleState, ProviderKind, RunRecord
+from backend.app.agent_runtime.types import (
+    MAX_MESSAGE_DEDUPE_KEYS,
+    LifecycleState,
+    ProviderKind,
+    RunRecord,
+)
 from backend.app.agent_runtime.version import RUNTIME_FINGERPRINT
 
 
@@ -384,6 +389,16 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
 
         reloaded = RunStore(self.paths)
         self.assertEqual(reloaded.get(record.run_id).message_dedupe_keys, [dedupe_key])
+
+        for index in range(MAX_MESSAGE_DEDUPE_KEYS + 1):
+            self.store.claim_message_dedupe_key(record.run_id, f"artifact-render:key-{index}:svg-render")
+        keys = self.store.get(record.run_id).message_dedupe_keys
+        self.assertEqual(len(keys), MAX_MESSAGE_DEDUPE_KEYS)
+        self.assertNotIn("artifact-render:key-0:svg-render", keys)
+        self.assertIn(
+            f"artifact-render:key-{MAX_MESSAGE_DEDUPE_KEYS}:svg-render",
+            keys,
+        )
 
     async def test_dispatch_idempotently_replays_start_and_message_once(self) -> None:
         start_params = {

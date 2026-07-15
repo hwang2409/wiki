@@ -94,6 +94,7 @@ async function main() {
     await artifact.locator(".artifact-error").waitFor({ state: "visible" });
     await target.waitForFunction((id) => document.querySelector(`[data-artifact-id="${id}"]`)?.getAttribute("data-artifact-render-status") === "failed", event.id);
     await artifact.getByText(/Render failed;/).waitFor({ state: "visible" });
+    await artifact.getByText("Render failed; diagnostic queued for agent.").waitFor({ state: "visible" });
   }
   try {
     await openSession(page);

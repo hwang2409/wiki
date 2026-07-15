@@ -18,6 +18,7 @@ from .types import (
     EventDisposition,
     LifecycleState,
     RunRecord,
+    MAX_MESSAGE_DEDUPE_KEYS,
     TERMINAL_STATES,
     utc_now,
     validate_transition,
@@ -1487,6 +1488,8 @@ class RunStore:
             if dedupe_key in record.message_dedupe_keys:
                 return record, False
             record.message_dedupe_keys.append(dedupe_key)
+            if len(record.message_dedupe_keys) > MAX_MESSAGE_DEDUPE_KEYS:
+                del record.message_dedupe_keys[:-MAX_MESSAGE_DEDUPE_KEYS]
             self._write_record(record)
             return record, True
 

@@ -162,7 +162,7 @@ function normalizeRenderFailure(
 
 function viewBoxBounds(source: string): { width: number; height: number } | null {
   const openTag = source.match(/<svg\b[^>]*>/i)?.[0] ?? "";
-  const viewBox = openTag.match(/\bviewBox=["']\s*[-0-9.]+\s+[-0-9.]+\s+([0-9.]+)\s+([0-9.]+)\s*["']/i);
+  const viewBox = openTag.match(/(?:^|\s)viewBox\s*=\s*["']\s*[-0-9.]+\s+[-0-9.]+\s+([0-9.]+)\s+([0-9.]+)\s*["']/i);
   if (!viewBox) return null;
   const width = Number(viewBox[1]);
   const height = Number(viewBox[2]);
@@ -542,7 +542,7 @@ function TableCopyMenu({ artifact, onCopied }: { artifact: SessionArtifact; onCo
 
 function numericSvgAttribute(source: string, name: string): number | null {
   const openTag = source.match(/<svg\b[^>]*>/i)?.[0] ?? "";
-  const match = openTag.match(new RegExp(`\\b${name}=["']([0-9.]+)(?:px)?["']`, "i"));
+  const match = openTag.match(new RegExp(`(?:^|\\s)${name}\\s*=\\s*["']([0-9.]+)(?:px)?["']`, "i"));
   if (!match) return null;
   const value = Number(match[1]);
   return Number.isFinite(value) ? value : null;
@@ -648,7 +648,7 @@ export function ArtifactBlock({
   const [copied, setCopied] = useState(false);
   const [imageBounds, setImageBounds] = useState<{ width: number; height: number } | null>(null);
   const [renderFailure, setRenderFailure] = useState<ArtifactRenderFailure | null>(null);
-  const [deliveryStatus, setDeliveryStatus] = useState<"pending" | "sent" | "failed" | null>(null);
+  const [deliveryStatus, setDeliveryStatus] = useState<"pending" | "queued" | "sent" | "failed" | null>(null);
   const copiedTimer = useRef<number | null>(null);
   const reportedRenderFailure = useRef<string | null>(null);
   const renderFailureArtifactId = useRef(event.artifact_id);
@@ -682,10 +682,16 @@ export function ArtifactBlock({
     ].join("\n");
     void sendAgentMessage(ticket, diagnostic, "on-idle", undefined, dedupeKey)
       .then((response) => {
-        if (["queued", "sent", "deduplicated"].includes(response.status)) {
-          setDeliveryStatus("sent");
-        } else {
-          setDeliveryStatus("failed");
+        switch (response.status) {
+          case "queued":
+            setDeliveryStatus("queued");
+            break;
+          case "sent":
+          case "deduplicated":
+            setDeliveryStatus("sent");
+            break;
+          default:
+            setDeliveryStatus("failed");
         }
       })
       .catch(() => {
@@ -797,6 +803,8 @@ export function ArtifactBlock({
               ? "Render failed; agent unavailable."
               : deliveryStatus === "pending"
                 ? "Render failed; reporting to agent…"
+                : deliveryStatus === "queued"
+                  ? "Render failed; diagnostic queued for agent."
                 : "Render failed; diagnostic sent to agent."}
           </div>
         ) : null}
