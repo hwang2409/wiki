@@ -607,12 +607,12 @@ function decodeAssetPath(value: string) {
 
 function normalizeAssetPath(value: string, base: string[] = []) {
   const parts = value.replaceAll("\\", "/").split("/");
-  const resolved = value.startsWith("/") ? [] : [...base];
+  const resolved = [...base];
   for (const part of parts) {
     if (!part || part === ".") continue;
     if (part === "..") {
-      if (resolved.length === 0) return null;
-      resolved.pop();
+      if (resolved.length > 0 && resolved[resolved.length - 1] !== "..") resolved.pop();
+      else resolved.push("..");
     } else {
       resolved.push(part);
     }
@@ -625,17 +625,18 @@ function vaultAssetUrl(path: string) {
 }
 
 function assetCandidates(src: string, notePath?: string) {
-  if (/^[a-z][a-z\d+.-]*:/i.test(src)) return [];
+  if (/^[a-z][a-z\d+.-]*:/i.test(src) || src.startsWith("//")) return [];
   const decoded = decodeAssetPath(src.split(/[?#]/, 1)[0]);
+  if (decoded.includes("\0") || decoded.startsWith("/")) return [];
   if (!isVaultImagePath(decoded)) return [];
   const rootPath = normalizeAssetPath(decoded);
-  if (!rootPath) return [];
-  if (decoded.startsWith("/") || !notePath) return [rootPath];
-  const noteDirectory = notePath.split("/").slice(0, -1);
-  const notePathCandidate = normalizeAssetPath(decoded, noteDirectory);
-  return notePathCandidate && notePathCandidate !== rootPath
-    ? [notePathCandidate, rootPath]
-    : [rootPath];
+  const notePathCandidate = notePath
+    ? normalizeAssetPath(decoded, notePath.split("/").slice(0, -1))
+    : null;
+  return [notePathCandidate, rootPath].filter(
+    (candidate, index, candidates): candidate is string =>
+      Boolean(candidate) && candidates.indexOf(candidate) === index,
+  );
 }
 
 type MarkdownImageProps = {
