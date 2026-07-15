@@ -68,43 +68,119 @@ function basename(path: string) {
   return path.split("/").pop()?.replace(/\.md$/, "") ?? path;
 }
 
+const SEARCH_RESULT_LIMIT = 10;
+
+type SwitcherSearchEntry =
+  | { kind: "note"; note: NoteSummary; path: string }
+  | { kind: "file"; file: QuickSwitcherFile; path: string };
+
+function searchEntryDisplayPath(entry: SwitcherSearchEntry) {
+  return entry.kind === "note" ? entry.note.path : entry.file.path;
+}
+
+function isPathBoundary(character: string | undefined) {
+  return character === "/" || character === "\\" || character === "." || character === "_" || character === "-" || character === " ";
+}
+
+type MatchState = {
+  first: number;
+  last: number;
+  boundaryHits: number;
+  contiguous: number;
+  gaps: number;
+};
+
+function betterMatch(a: MatchState, b: MatchState) {
+  if (a.boundaryHits !== b.boundaryHits) return a.boundaryHits > b.boundaryHits;
+  if (a.contiguous !== b.contiguous) return a.contiguous > b.contiguous;
+  if (a.gaps !== b.gaps) return a.gaps < b.gaps;
+  return a.first < b.first;
+}
+
+function canMatchRemainder(text: string, query: string, queryIndex: number, start: number) {
+  let textIndex = start;
+  for (; queryIndex < query.length; queryIndex += 1) {
+    while (textIndex < text.length && text[textIndex] !== query[queryIndex]) textIndex += 1;
+    if (textIndex === text.length) return false;
+    textIndex += 1;
+  }
+  return true;
+}
+
+function collectSubsequence(text: string, query: string, preferBoundaries: boolean): MatchState | null {
+  let cursor = 0;
+  let first = -1;
+  let last = -1;
+  let boundaryHits = 0;
+  let contiguous = 0;
+  let gaps = 0;
+
+  for (let queryIndex = 0; queryIndex < query.length; queryIndex += 1) {
+    let fallback = -1;
+    let chosen = -1;
+    for (let index = cursor; index < text.length; index += 1) {
+      if (text[index] !== query[queryIndex]) continue;
+      if (fallback < 0) fallback = index;
+      const boundary = index === 0 || isPathBoundary(text[index - 1]);
+      if (!preferBoundaries || (boundary && canMatchRemainder(text, query, queryIndex + 1, index + 1))) {
+        chosen = index;
+        break;
+      }
+    }
+    if (chosen < 0) chosen = fallback;
+    if (chosen < 0) return null;
+
+    if (first < 0) first = chosen;
+    if (last >= 0) {
+      if (chosen === last + 1) contiguous += 1;
+      else gaps += chosen - last - 1;
+    }
+    if (chosen === 0 || isPathBoundary(text[chosen - 1])) boundaryHits += 1;
+    last = chosen;
+    cursor = chosen + 1;
+  }
+
+  return { first, last, boundaryHits, contiguous, gaps };
+}
+
+function subsequenceScore(text: string, query: string): number | null {
+  const normal = collectSubsequence(text, query, false);
+  const boundaryAnchored = collectSubsequence(text, query, true);
+  const best =
+    normal && boundaryAnchored
+      ? betterMatch(boundaryAnchored, normal)
+        ? boundaryAnchored
+        : normal
+      : boundaryAnchored ?? normal;
+  if (!best) return null;
+
+  const missingBoundaryHits = query.length - best.boundaryHits;
+  return 40 + missingBoundaryHits * 12 + best.gaps * 3 - best.contiguous * 2 + best.first / Math.max(text.length, 1);
+}
+
 function matchScore(text: string, query: string): number | null {
   if (text === query) return 0;
   if (text.startsWith(query)) return 4;
 
-  const segmentStart = text
-    .split(/[\\/._\-\s]+/)
-    .some((segment) => segment.startsWith(query));
-  if (segmentStart) return 8;
-  if (text.includes(query)) return 12 + text.indexOf(query) / Math.max(text.length, 1);
-
-  const boundaries = new Set(["/", "\\", ".", "_", "-", " "]);
-  const matchedIndexes: number[] = [];
-  let queryIndex = 0;
-  for (let index = 0; index < text.length; index += 1) {
-    if (text[index] !== query[queryIndex]) continue;
-    matchedIndexes.push(index);
-    queryIndex += 1;
-    if (queryIndex === query.length) break;
+  for (let index = 1; index < text.length; index += 1) {
+    if (isPathBoundary(text[index - 1]) && text.startsWith(query, index)) return 8;
   }
-  if (queryIndex !== query.length) return null;
-
-  const first = matchedIndexes[0] ?? 0;
-  const last = matchedIndexes[matchedIndexes.length - 1] ?? first;
-  const boundaryMatches = matchedIndexes.filter(
-    (index) => index === 0 || boundaries.has(text[index - 1] ?? "")
-  ).length;
-  const gaps = last - first + 1 - query.length;
-  return 40 + (query.length - boundaryMatches) * 4 + gaps + first / Math.max(text.length, 1);
+  if (text.includes(query)) return 12 + text.indexOf(query) / Math.max(text.length, 1);
+  return subsequenceScore(text, query);
 }
 
 function scorePath(path: string, query: string): number | null {
-  const segments = path.split(/[\\/._\-\s]+/).filter(Boolean);
-  const segmentScore = segments
-    .map((segment) => matchScore(segment, query))
-    .filter((score): score is number => score !== null)
-    .sort((a, b) => a - b)[0];
-  if (segmentScore !== undefined) return 10 + segmentScore;
+  let segmentStart = 0;
+  let segmentScore: number | null = null;
+  for (let index = 0; index <= path.length; index += 1) {
+    if (index < path.length && !isPathBoundary(path[index])) continue;
+    if (index > segmentStart) {
+      const score = matchScore(path.slice(segmentStart, index), query);
+      if (score !== null && (segmentScore === null || score < segmentScore)) segmentScore = score;
+    }
+    segmentStart = index + 1;
+  }
+  if (segmentScore !== null) return 10 + segmentScore;
   return matchScore(path, query);
 }
 
@@ -135,6 +211,34 @@ function scoreSession(session: QuickSwitcherSession, query: string): number | nu
   if (fields.some((field) => field.includes(query))) return 1;
   if (fields.some((field) => matchScore(field, query) !== null)) return 2;
   return null;
+}
+
+function topResourceMatches(
+  index: SwitcherSearchEntry[],
+  kind: SwitcherSearchEntry["kind"],
+  query: string
+) {
+  const top: Array<{ entry: SwitcherSearchEntry; score: number }> = [];
+  for (const entry of index) {
+    if (entry.kind !== kind) continue;
+    const score = entry.kind === "note" ? scoreNote(entry.note, query) : scorePath(entry.path, query);
+    if (score === null) continue;
+    const displayPath = searchEntryDisplayPath(entry);
+
+    let insertAt = 0;
+    while (
+      insertAt < top.length &&
+      (top[insertAt].score < score ||
+        (top[insertAt].score === score &&
+          searchEntryDisplayPath(top[insertAt].entry).localeCompare(displayPath) <= 0))
+    ) {
+      insertAt += 1;
+    }
+    if (insertAt >= SEARCH_RESULT_LIMIT) continue;
+    top.splice(insertAt, 0, { entry, score });
+    if (top.length > SEARCH_RESULT_LIMIT) top.pop();
+  }
+  return top;
 }
 
 function itemKey(item: SwitcherItem) {
@@ -177,6 +281,24 @@ export function QuickSwitcher({
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState(0);
 
+  const searchIndex = useMemo<SwitcherSearchEntry[]>(() => {
+    const notePaths = new Set(notes.map((note) => `vault/${note.path}`));
+    return [
+      ...notes.map((note): SwitcherSearchEntry => ({
+        kind: "note",
+        note,
+        path: note.path.toLowerCase(),
+      })),
+      ...files
+        .filter((file) => !notePaths.has(file.path))
+        .map((file): SwitcherSearchEntry => ({
+          kind: "file",
+          file,
+          path: file.path.toLowerCase(),
+        })),
+    ];
+  }, [files, notes]);
+
   const groups = useMemo<SwitcherGroup[]>(() => {
     const needle = query.trim().toLowerCase();
     if (!needle) {
@@ -207,20 +329,14 @@ export function QuickSwitcher({
       .slice(0, 10)
       .map((entry): SwitcherItem => ({ kind: "session", session: entry.session }));
 
-    const noteItems = notes
-      .map((note) => ({ note, score: scoreNote(note, needle) }))
-      .filter((entry): entry is { note: NoteSummary; score: number } => entry.score !== null)
-      .sort((a, b) => a.score - b.score || a.note.path.localeCompare(b.note.path))
-      .slice(0, 10)
+    const noteItems = topResourceMatches(searchIndex, "note", needle)
+      .map((entry) => entry.entry)
+      .filter((entry): entry is Extract<SwitcherSearchEntry, { kind: "note" }> => entry.kind === "note")
       .map((entry): SwitcherItem => ({ kind: "note", note: entry.note }));
 
-    const notePaths = new Set(notes.map((note) => `vault/${note.path}`));
-    const fileItems = files
-      .filter((file) => !notePaths.has(file.path))
-      .map((file) => ({ file, score: scorePath(file.path.toLowerCase(), needle) }))
-      .filter((entry): entry is { file: QuickSwitcherFile; score: number } => entry.score !== null)
-      .sort((a, b) => a.score - b.score || a.file.path.localeCompare(b.file.path))
-      .slice(0, 10)
+    const fileItems = topResourceMatches(searchIndex, "file", needle)
+      .map((entry) => entry.entry)
+      .filter((entry): entry is Extract<SwitcherSearchEntry, { kind: "file" }> => entry.kind === "file")
       .map((entry): SwitcherItem => ({ kind: "file", file: entry.file }));
 
     const pageItems = PAGES.filter((entry) =>
@@ -233,7 +349,7 @@ export function QuickSwitcher({
       { label: "Files", items: fileItems },
       { label: "Views", items: pageItems },
     ].filter((group) => group.items.length > 0);
-  }, [files, notes, query, recent, sessions]);
+  }, [notes, query, recent, searchIndex, sessions]);
 
   const results = useMemo(() => groups.flatMap((group) => group.items), [groups]);
 
