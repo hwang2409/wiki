@@ -42,7 +42,7 @@ def _release_lock(handle: BinaryIO) -> None:
 
 @contextmanager
 def hold_app_lock(runtime_dir: Path | str) -> Iterator[BinaryIO]:
-    """Hold the native backend's app-lifetime lock until the context exits."""
+    """Model the GUI-owned app-lifetime lock in tests and native helpers."""
 
     path = Path(runtime_dir).expanduser() / APP_LOCK_NAME
     handle = _acquire_lock(path, "Wiki app")

@@ -2,9 +2,11 @@ use std::{
     env,
     error::Error,
     ffi::OsStr,
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{self, Write},
     net::TcpListener,
+    os::fd::AsRawFd,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::Mutex,
     thread,
@@ -29,6 +31,7 @@ const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
 const MAIN_WINDOW_LABEL: &str = "main";
 const WINDOW_TITLE: &str = "Wiki";
+const APP_LOCK_NAME: &str = "app.lock";
 // Guard: WKWebView can defer this eval past the post-health navigate() when
 // the backend boots fast (onedir sidecar ~0.4s) — unguarded, the deferred
 // write CLOBBERS the already-loaded app with the static loading card.
@@ -120,6 +123,10 @@ const DEFAULT_LOOPBACK_PORT: u16 = 8213;
 #[derive(Default)]
 pub struct NativeAppState {
     inner: Mutex<LifecycleState>,
+    // The GUI owns this descriptor for its whole lifetime. Keeping the file
+    // handle in managed state makes sidecar restarts unable to release the
+    // app-lifetime exclusion lock.
+    _app_lock: Option<File>,
 }
 
 #[derive(Default)]
@@ -144,7 +151,11 @@ enum SidecarAction {
 }
 
 pub fn setup(app: &mut App) -> Result<(), Box<dyn Error>> {
-    app.manage(NativeAppState::default());
+    let app_lock = acquire_app_lock()?;
+    app.manage(NativeAppState {
+        _app_lock: Some(app_lock),
+        ..NativeAppState::default()
+    });
 
     let app_handle = app.handle().clone();
     let window = WebviewWindowBuilder::new(
@@ -174,6 +185,52 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn Error>> {
     thread::spawn(move || launch_backend_and_navigate(&launch_handle));
 
     Ok(())
+}
+
+fn runtime_dir() -> PathBuf {
+    env::var_os("WIKI_AGENT_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".wiki/agent-runtime")))
+        .unwrap_or_else(|| PathBuf::from(".wiki/agent-runtime"))
+}
+
+fn acquire_app_lock() -> Result<File, Box<dyn Error>> {
+    let runtime_dir = runtime_dir();
+    fs::create_dir_all(&runtime_dir)?;
+    fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700))?;
+    let path = runtime_dir.join(APP_LOCK_NAME);
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(file);
+    }
+
+    let error = io::Error::last_os_error();
+    let code = error.raw_os_error();
+    if code == Some(libc::EWOULDBLOCK) || code == Some(libc::EAGAIN) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "Wiki.app is already running (app lock held at {})",
+                path.display()
+            ),
+        )
+        .into());
+    }
+    Err(io::Error::new(
+        error.kind(),
+        format!(
+            "cannot acquire Wiki.app lock at {}: {error}",
+            path.display()
+        ),
+    )
+    .into())
 }
 
 pub fn handle_window_event(window: &tauri::Window, event: &WindowEvent) {

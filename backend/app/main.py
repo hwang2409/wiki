@@ -47,7 +47,6 @@ from .agent_runtime.client import (
 )
 from .agent_runtime.store import RuntimePaths
 from .frontend_static import mount_frontend_static
-from .native_lifecycle import hold_app_lock
 
 
 ROOT_DIR = Path(os.environ.get("WIKI_REPO_DIR", Path(__file__).resolve().parents[2])).resolve()
@@ -83,37 +82,36 @@ VAULT_DIR.mkdir(parents=True, exist_ok=True)
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     runtime_paths = RuntimePaths.from_env()
-    with hold_app_lock(runtime_paths.runtime_dir):
-        configured_backend = os.environ.get("WIKI_BACKEND_URL")
-        if configured_backend:
-            backend_runtime.publish_backend_url(configured_backend)
-        terminal.refresh_boot_token()
-        dispatcher_task, watchdog_task, token_task = await _start_dispatcher()
-        knowledge_task = asyncio.create_task(
-            knowledge.background_index_loop(
-                knowledge.KnowledgePaths.from_env(
-                    runtime_dir=runtime_paths.runtime_dir,
-                    archive_dir=runtime_paths.archive_dir,
-                    vault_dir=VAULT_DIR,
-                )
-            ),
-            name="wiki-knowledge-indexer",
-        )
-        try:
-            yield
-        finally:
-            dispatcher_task.cancel()
-            watchdog_task.cancel()
-            token_task.cancel()
-            knowledge_task.cancel()
-            await asyncio.gather(
-                dispatcher_task,
-                watchdog_task,
-                token_task,
-                knowledge_task,
-                return_exceptions=True,
+    configured_backend = os.environ.get("WIKI_BACKEND_URL")
+    if configured_backend:
+        backend_runtime.publish_backend_url(configured_backend)
+    terminal.refresh_boot_token()
+    dispatcher_task, watchdog_task, token_task = await _start_dispatcher()
+    knowledge_task = asyncio.create_task(
+        knowledge.background_index_loop(
+            knowledge.KnowledgePaths.from_env(
+                runtime_dir=runtime_paths.runtime_dir,
+                archive_dir=runtime_paths.archive_dir,
+                vault_dir=VAULT_DIR,
             )
-            await asyncio.to_thread(terminal.TERMINAL_MANAGER.close_all)
+        ),
+        name="wiki-knowledge-indexer",
+    )
+    try:
+        yield
+    finally:
+        dispatcher_task.cancel()
+        watchdog_task.cancel()
+        token_task.cancel()
+        knowledge_task.cancel()
+        await asyncio.gather(
+            dispatcher_task,
+            watchdog_task,
+            token_task,
+            knowledge_task,
+            return_exceptions=True,
+        )
+        await asyncio.to_thread(terminal.TERMINAL_MANAGER.close_all)
 
 
 app = FastAPI(title="Wiki API", lifespan=lifespan)

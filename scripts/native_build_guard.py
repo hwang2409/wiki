@@ -1,6 +1,6 @@
 """Preflight checks for native bundle builds.
 
-The backend holds ``app.lock`` for its entire process lifetime. The guard
+The Tauri GUI holds ``app.lock`` for its entire process lifetime. The guard
 acquires that lock and the lazy supervisor's lock together; PID files are only
 diagnostic and never decide liveness.
 """

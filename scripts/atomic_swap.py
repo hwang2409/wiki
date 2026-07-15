@@ -43,7 +43,7 @@ def _rename_swap(first: Path, second: Path) -> bool:
     return True
 
 
-def atomic_replace(staged: Path, live: Path) -> None:
+def atomic_replace(staged: Path, live: Path, success_sentinel: Path | None = None) -> None:
     """Put *staged* at *live*, retaining the old bundle on any failed swap."""
 
     if not staged.is_dir():
@@ -51,9 +51,13 @@ def atomic_replace(staged: Path, live: Path) -> None:
     live.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
     if not live.exists() and not live.is_symlink():
         os.rename(staged, live)
+        if success_sentinel is not None:
+            success_sentinel.touch()
         return
 
     if _rename_swap(staged, live):
+        if success_sentinel is not None:
+            success_sentinel.touch()
         return
 
     # Non-macOS fallback for tests and development environments. The old
@@ -67,6 +71,8 @@ def atomic_replace(staged: Path, live: Path) -> None:
         os.rename(backup, live)
         raise
     shutil.rmtree(backup)
+    if success_sentinel is not None:
+        success_sentinel.touch()
 
 
 if __name__ == "__main__":
@@ -75,6 +81,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Atomically replace a native app bundle")
     parser.add_argument("staged", type=Path)
     parser.add_argument("live", type=Path)
+    parser.add_argument(
+        "--success-sentinel",
+        type=Path,
+        help="write this marker immediately after the exchange succeeds",
+    )
     parser.add_argument(
         "--runtime-dir",
         type=Path,
@@ -95,7 +106,7 @@ if __name__ == "__main__":
             args.runtime_dir,
             allow_missing_app_lock=args.allow_missing_app_lock,
         ):
-            atomic_replace(args.staged, args.live)
+            atomic_replace(args.staged, args.live, args.success_sentinel)
     except NativeRuntimeLockError as exc:
         print(
             "REFUSING native bundle swap: "

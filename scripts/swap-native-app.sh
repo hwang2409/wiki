@@ -25,9 +25,9 @@ python3 "$ROOT/scripts/atomic_swap.py" \
   "$staged_bundle" \
   "$live_bundle" \
   --runtime-dir "$runtime_dir" \
+  --success-sentinel "$stage_root/.swap-complete" \
   "${allow_missing_args[@]}"
 
-touch "$stage_root/.swap-complete"
 rm -rf "$stage_root"
 
 echo "swapped staged Wiki.app into $live_bundle"

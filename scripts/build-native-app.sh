@@ -88,20 +88,11 @@ config["bundle"]["resources"] = {
 config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
 PY
 
-(
-  cd "$stage_root/src-tauri"
-  CARGO_TARGET_DIR="${WIKI_NATIVE_CARGO_TARGET_DIR:-$ROOT/.native-cargo-target}" \
-    cargo tauri build --bundles app
-)
-
-shared_bundle="${WIKI_NATIVE_CARGO_TARGET_DIR:-$ROOT/.native-cargo-target}/release/bundle/macos/Wiki.app"
 staged_bundle="$stage_root/target/release/bundle/macos/Wiki.app"
-if [[ ! -d "$shared_bundle" ]]; then
-  echo "Tauri build did not produce $shared_bundle" >&2
-  exit 1
-fi
-mkdir -p "$(dirname "$staged_bundle")"
-cp -R "$shared_bundle" "$staged_bundle"
+python3 "$ROOT/scripts/build-native-cargo.py" \
+  "$stage_root/src-tauri" \
+  "${WIKI_NATIVE_CARGO_TARGET_DIR:-$ROOT/.native-cargo-target}" \
+  "$staged_bundle"
 
 if [[ "$force_stage_only" == 1 ]]; then
   preserve_stage=1

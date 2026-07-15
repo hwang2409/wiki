@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import os
 import subprocess
 import sys
@@ -51,7 +52,7 @@ class NativeBuildGuardTests(TestCase):
             self.assertTrue(status.running)
             self.assertIn("Wiki app lock is held", status.reason or "")
 
-    def test_backend_app_lock_alone_blocks_build(self) -> None:
+    def test_gui_app_lock_alone_blocks_build(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             runtime = Path(tmp)
             (runtime / "supervisor.lock").touch()
@@ -59,6 +60,21 @@ class NativeBuildGuardTests(TestCase):
                 status = inspect_runtime(runtime)
             self.assertTrue(status.running)
             self.assertIn("Wiki app lock is held", status.reason or "")
+
+    def test_gui_lock_survives_sidecar_restart_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Path(tmp)
+            supervisor_lock = runtime / "supervisor.lock"
+            supervisor_lock.touch()
+            with hold_app_lock(runtime):
+                for _ in range(2):
+                    with supervisor_lock.open("a+b") as handle:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                        self.assertTrue(inspect_runtime(runtime).running)
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    status = inspect_runtime(runtime)
+                    self.assertTrue(status.running)
+                    self.assertIn("Wiki app lock is held", status.reason or "")
 
     def test_locks_remain_held_through_atomic_swap(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -75,7 +91,7 @@ class NativeBuildGuardTests(TestCase):
             (staged / "marker").write_text("new", encoding="utf-8")
 
             with hold_runtime_locks(runtime):
-                atomic_replace(staged, live)
+                atomic_replace(staged, live, root / "stage" / ".swap-complete")
                 probe = subprocess.run(
                     [
                         sys.executable,
@@ -88,4 +104,5 @@ class NativeBuildGuardTests(TestCase):
                     check=False,
                 )
                 self.assertNotEqual(probe.returncode, 0)
+            self.assertTrue((root / "stage" / ".swap-complete").exists())
             self.assertFalse(inspect_runtime(runtime).running)
