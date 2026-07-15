@@ -9,6 +9,9 @@ updated: 2026-07-15
 
 ## 2026-07-15
 
+- WIKI-116+124 merged (#100, 5 rounds): artifact render trust — render-error feedback loop (durable dedupe, injection-safe normalized diagnostics, truthful delivery states) + SVG root-geometry parse fix (descendant width/viewBox no longer shrink previews)
+- **pufferclone** — PUF-5 hand-rolled HNSW merged (incremental insertion, two-heap search, filtered beam, 3 sol rounds incl. full rebuild directive, main@fa274a9)
+- **pufferclone** — PUF-7 S3Store merged (conditional-put write-once, conformance suite, 3 sol rounds, main@21951c8) — MinIO-ready for local-cloud
 - WIKI-112 merged (#101, 2 rounds): dead-archive flake root-caused as test rot — fixture never persisted runtime states to durable registry; fix = persist snapshot + deterministic precondition wait; 20/20 greens
 - **pufferclone** — PUF-4 engine+API merged (3 sol rounds incl. 7-major xhigh round); v0 COMPLETE main@3ee62c5
 - pufferclone v0 complete: PUF-1..4 merged, main@3ee62c5, 46 tests, HTTP smoke green
