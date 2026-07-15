@@ -3,9 +3,11 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import logging
 import os
 import re
 import stat
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,10 +29,77 @@ IMAGE_TYPES = {
     "image/webp": "webp",
 }
 TABLE_COLUMN_TYPES = {"string", "number", "date", "link"}
+MERMAID_VALIDATION_TIMEOUT_SECONDS = 2
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class ArtifactValidationError(ValueError):
     pass
+
+
+def _mermaid_node_directory() -> Path | None:
+    configured = os.environ.get("WIKI_MERMAID_NODE_DIR")
+    candidates = [Path(configured)] if configured else []
+    candidates.append(Path(__file__).resolve().parents[2] / "frontend")
+    frontend_dist = os.environ.get("WIKI_FRONTEND_DIST")
+    if frontend_dist:
+        candidates.append(Path(frontend_dist).resolve().parent)
+    for candidate in candidates:
+        if (candidate / "node_modules" / "mermaid" / "package.json").is_file():
+            return candidate
+    return None
+
+
+def _validate_mermaid_source(source: str) -> None:
+    """Parse Mermaid with the same package used by the session-view renderer.
+
+    The native bundle intentionally does not include Node or frontend/node_modules.
+    In that environment this is a best-effort check: accepting on validator
+    unavailability keeps artifact rendering from taking down the MCP endpoint.
+    """
+    node_directory = _mermaid_node_directory()
+    if node_directory is None:
+        LOGGER.warning("Mermaid validator package is unavailable; accepting source")
+        return
+
+    validator = (
+        "import DOMPurify from 'dompurify';\n"
+        "DOMPurify.addHook = () => {};\n"
+        "DOMPurify.sanitize = (value) => value;\n"
+        "const { default: mermaid } = await import('mermaid/dist/mermaid.core.mjs');\n"
+        "import { readFileSync } from 'node:fs';\n"
+        "const source = readFileSync(0, 'utf8');\n"
+        "try { await mermaid.parse(source); }\n"
+        "catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exit(2); }\n"
+    )
+    try:
+        result = subprocess.run(
+            ["node", "--input-type=module", "-e", validator],
+            cwd=node_directory,
+            input=source,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=MERMAID_VALIDATION_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        LOGGER.warning("Mermaid validator failed open; accepting source: %s", exc)
+        return
+
+    if result.returncode == 0:
+        return
+    if result.returncode == 2:
+        message = (result.stderr or "Mermaid parser rejected the source.").strip()
+        raise ArtifactValidationError(
+            f"payload.source is not valid Mermaid: {message[:1000]}"
+        )
+    LOGGER.warning(
+        "Mermaid validator crashed (exit %s); accepting source: %s",
+        result.returncode,
+        (result.stderr or "no diagnostic").strip()[:1000],
+    )
 
 
 TOOL_DESCRIPTION = (
@@ -98,9 +167,15 @@ def _text_size(payload: dict[str, Any]) -> int:
 
 
 def _validate_text_payload(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+    if _text_size(payload) > TEXT_LIMIT:
+        raise ArtifactValidationError(
+            f"{kind} payload exceeds the {TEXT_LIMIT // 1000}KB text limit"
+        )
     if kind in {"mermaid", "svg"}:
         _require_keys(payload, required={"source"})
         source = _require_string(payload["source"], "payload.source")
+        if kind == "mermaid":
+            _validate_mermaid_source(source)
         if kind == "svg" and not re.search(r"<svg(?:\s|>)", source, re.IGNORECASE):
             raise ArtifactValidationError("payload.source must contain an <svg> root")
     elif kind == "table":
@@ -149,10 +224,6 @@ def _validate_text_payload(kind: str, payload: dict[str, Any]) -> dict[str, Any]
         for field in ("filename", "diff_from"):
             if field in payload and not isinstance(payload[field], str):
                 raise ArtifactValidationError(f"payload.{field} must be a string")
-    if _text_size(payload) > TEXT_LIMIT:
-        raise ArtifactValidationError(
-            f"{kind} payload exceeds the {TEXT_LIMIT // 1000}KB text limit"
-        )
     return dict(payload)
 
 

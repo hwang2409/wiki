@@ -116,6 +116,44 @@ class WikiArtifactsTests(unittest.TestCase):
             ):
                 wiki_artifacts.render_artifact({"kind": kind, "payload": payload})
 
+    def test_mermaid_parser_rejects_invalid_source_before_event_creation(self) -> None:
+        source = "flowchart TD\n  A[/tmp/invalid-label] --> B"
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError,
+            "payload.source is not valid Mermaid",
+        ):
+            wiki_artifacts.render_artifact({"kind": "mermaid", "payload": {"source": source}})
+        response = wiki_artifacts._tool_result(7, {"kind": "mermaid", "payload": {"source": source}})
+        self.assertTrue(response["result"]["isError"])
+        self.assertIn(
+            "artifact rejected: payload.source is not valid Mermaid",
+            response["result"]["content"][0]["text"],
+        )
+
+    def test_mermaid_validator_failure_fails_open(self) -> None:
+        with mock.patch.object(
+            wiki_artifacts.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(
+                args=["node"], returncode=1, stdout="", stderr="validator crashed"
+            ),
+        ), mock.patch.object(wiki_artifacts, "_mermaid_node_directory", return_value=self.root):
+            event = wiki_artifacts.render_artifact(
+                {"kind": "mermaid", "payload": {"source": "not mermaid, but accepted on validator failure"}}
+            )
+        self.assertEqual(event["artifact"]["source"], "not mermaid, but accepted on validator failure")
+
+    def test_mermaid_validator_timeout_fails_open(self) -> None:
+        with mock.patch.object(
+            wiki_artifacts.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired("node", 2),
+        ), mock.patch.object(wiki_artifacts, "_mermaid_node_directory", return_value=self.root):
+            event = wiki_artifacts.render_artifact(
+                {"kind": "mermaid", "payload": {"source": "accepted after validator timeout"}}
+            )
+        self.assertEqual(event["artifact"]["source"], "accepted after validator timeout")
+
     def test_text_and_image_caps_are_enforced(self) -> None:
         oversized_text = "x" * (wiki_artifacts.TEXT_LIMIT + 1)
         text_payloads = {
