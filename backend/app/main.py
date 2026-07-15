@@ -214,13 +214,15 @@ def file_not_found() -> None:
 
 def resolve_file_path(raw_path: str) -> tuple[Path, str]:
     candidate = raw_path.strip().replace("\\", "/")
-    if "\x00" in candidate:
+    if "\x00" in candidate or not candidate:
+        file_not_found()
+    raw_parts = candidate.split("/")
+    if any(part in {"", ".", ".."} for part in raw_parts):
         file_not_found()
     try:
         path = PurePosixPath(candidate)
         if (
-            not candidate
-            or path.is_absolute()
+            path.is_absolute()
             or any(part in {"", ".", ".."} for part in path.parts)
             or is_ignored_file_parts(path.parts)
         ):

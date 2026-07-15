@@ -90,9 +90,10 @@ type UtilityMode = "activity" | "graph" | "health" | "agents" | "tokens";
 type SidebarTab = "files" | "search" | "agents";
 type SplitPosition = "left" | "right" | "top" | "bottom";
 type DropZone = SplitPosition | "center";
+type ResourceKind = "note" | "file";
 
 type Layout =
-  | { kind: "pane"; id: string; path: string | null }
+  | { kind: "pane"; id: string; path: string | null; resourceKind?: ResourceKind }
   | { kind: "split"; direction: "row" | "column"; ratio: number; first: Layout; second: Layout };
 
 type WorkspaceWindow = {
@@ -130,8 +131,9 @@ type LegacyStoredLayoutState = {
 
 type PaneInfo = {
   key: string;
-  kind: "agent" | "blank" | "note" | "terminal" | "utility";
+  kind: "agent" | "blank" | "file" | "note" | "terminal" | "utility";
   path: string | null;
+  resourceKind: ResourceKind | null;
   ticket: string | null;
 };
 
@@ -197,12 +199,12 @@ function utilityLabel(kind: UtilityMode): string {
   return `${kind.slice(0, 1).toUpperCase()}${kind.slice(1)}`;
 }
 
-function paneKind(path: string | null): PaneInfo["kind"] {
+function paneKind(path: string | null, resourceKind?: ResourceKind): PaneInfo["kind"] {
   if (path === null) return "blank";
   if (isAgentPath(path)) return "agent";
   if (isTerminalPath(path)) return "terminal";
   if (utilityKindFromPanePath(path)) return "utility";
-  return "note";
+  return resourceKind === "file" ? "file" : "note";
 }
 
 function splitLayout(
@@ -244,13 +246,18 @@ function replacePane(node: Layout, id: string, replacement: Extract<Layout, { ki
   return node;
 }
 
-function replacePanePath(node: Layout, id: string, path: string | null): Layout {
-  if (node.kind === "pane" && node.id === id) return { ...node, path };
+function replacePanePath(
+  node: Layout,
+  id: string,
+  path: string | null,
+  resourceKind?: ResourceKind
+): Layout {
+  if (node.kind === "pane" && node.id === id) return { ...node, path, resourceKind };
   if (node.kind === "split") {
     return {
       ...node,
-      first: replacePanePath(node.first, id, path),
-      second: replacePanePath(node.second, id, path)
+      first: replacePanePath(node.first, id, path, resourceKind),
+      second: replacePanePath(node.second, id, path, resourceKind)
     };
   }
   return node;
@@ -308,10 +315,12 @@ function layoutContains(node: Layout, key: string): boolean {
 }
 
 function paneInfo(node: Extract<Layout, { kind: "pane" }>): PaneInfo {
+  const kind = paneKind(node.path, node.resourceKind);
   return {
     key: node.id,
-    kind: paneKind(node.path),
+    kind,
     path: node.path,
+    resourceKind: kind === "note" || kind === "file" ? node.resourceKind ?? "note" : null,
     ticket: ticketFromPanePath(node.path),
   };
 }
@@ -454,6 +463,13 @@ function normalizeWindow(
     if (node.kind === "pane") {
       if (node.path === null) return node;
       if (!isPanePath(node.path)) return null;
+      const resourceKind =
+        node.resourceKind ??
+        (isAgentPath(node.path) || isTerminalPath(node.path) || utilityKindFromPanePath(node.path)
+          ? undefined
+          : isMarkdownPath(node.path)
+            ? "note"
+            : "file");
       const ticket = ticketFromPanePath(node.path);
       if (ticket) {
         if (seenTickets.has(ticket)) return null;
@@ -469,7 +485,7 @@ function normalizeWindow(
         if (seenUtilities.has(utility)) return null;
         seenUtilities.add(utility);
       }
-      return node;
+      return { ...node, resourceKind };
     }
     const first = prune(node.first);
     const second = prune(node.second);
@@ -512,20 +528,29 @@ function normalizeWindowWorkspaceState(state: WindowWorkspaceState): WindowWorks
   return { activeWindowId, windows };
 }
 
-function createSoloWindow(windowId: string, paneId: string, path: string | null): WorkspaceWindow {
+function createSoloWindow(
+  windowId: string,
+  paneId: string,
+  path: string | null,
+  resourceKind?: ResourceKind
+): WorkspaceWindow {
   return {
     id: windowId,
-    layout: { kind: "pane", id: paneId, path },
+    layout: { kind: "pane", id: paneId, path, resourceKind },
     focusedPaneId: paneId,
   };
 }
 
 function convertLegacyLayout(node: LegacyLayout, primaryPath: string | null): Layout | null {
   if (node.kind === "primary") {
-    return primaryPath ? { kind: "pane", id: "primary", path: primaryPath } : null;
+    return primaryPath
+      ? { kind: "pane", id: "primary", path: primaryPath, resourceKind: "note" }
+      : null;
   }
   if (node.kind === "note") {
-    return isPanePath(node.path) ? { kind: "pane", id: node.id, path: node.path } : null;
+    return isPanePath(node.path)
+      ? { kind: "pane", id: node.id, path: node.path, resourceKind: "note" }
+      : null;
   }
   const first = convertLegacyLayout(node.first, primaryPath);
   const second = convertLegacyLayout(node.second, primaryPath);
@@ -832,6 +857,13 @@ function buildTree(
   return root;
 }
 
+function noteFolderFromTreePath(folderPath: string, showAllFiles: boolean): string | null {
+  if (!showAllFiles) return folderPath;
+  if (folderPath === "vault") return "";
+  if (folderPath.startsWith("vault/")) return folderPath.slice("vault/".length);
+  return null;
+}
+
 function collectFolderPaths(folder: TreeFolder, paths: string[] = []): string[] {
   for (const child of folder.folders) {
     paths.push(child.path);
@@ -1022,6 +1054,7 @@ function FolderTree({
   collapsed,
   dragActive,
   onToggleFolder,
+  canDropOnFolder,
   onOpenFile,
   onNoteDragStart,
   onNoteDragEnd,
@@ -1034,7 +1067,8 @@ function FolderTree({
   collapsed: Set<string>;
   dragActive: boolean;
   onToggleFolder: (path: string) => void;
-  onOpenFile: (path: string) => void;
+  canDropOnFolder: (path: string) => boolean;
+  onOpenFile: (file: TreeFile) => void;
   onNoteDragStart: (path: string) => void;
   onNoteDragEnd: () => void;
   onDropOnFolder: (folderPath: string) => void;
@@ -1056,13 +1090,13 @@ function FolderTree({
                 if (dragActive) event.currentTarget.classList.remove("is-drop-target");
               }}
               onDragOver={(event) => {
-                if (!dragActive) return;
+                if (!dragActive || !canDropOnFolder(child.path)) return;
                 event.preventDefault();
                 event.dataTransfer.dropEffect = "move";
                 event.currentTarget.classList.add("is-drop-target");
               }}
               onDrop={(event) => {
-                if (!dragActive) return;
+                if (!dragActive || !canDropOnFolder(child.path)) return;
                 event.preventDefault();
                 event.currentTarget.classList.remove("is-drop-target");
                 onDropOnFolder(child.path);
@@ -1082,6 +1116,7 @@ function FolderTree({
                 dragActive={dragActive}
                 folder={child}
                 onContextMenu={onContextMenu}
+                canDropOnFolder={canDropOnFolder}
                 onDropOnFolder={onDropOnFolder}
                 onNoteDragEnd={onNoteDragEnd}
                 onNoteDragStart={onNoteDragStart}
@@ -1101,7 +1136,7 @@ function FolderTree({
           key={file.id}
           style={{ paddingInlineStart: `${depth * 17 + 24}px` }}
           type="button"
-          onClick={() => onOpenFile(file.openPath)}
+          onClick={() => onOpenFile(file)}
           onContextMenu={file.isNote ? (event) => onContextMenu(event, "file", file.openPath) : undefined}
           onDragEnd={file.isNote ? onNoteDragEnd : undefined}
           onDragStart={
@@ -1652,6 +1687,14 @@ export default function App() {
   }
 
   function findPaneLocationByPath(path: string, preferredWindowId?: string | null) {
+    return findPaneLocationByResource(path, undefined, preferredWindowId);
+  }
+
+  function findPaneLocationByResource(
+    path: string,
+    resourceKind?: ResourceKind,
+    preferredWindowId?: string | null
+  ) {
     const windows =
       preferredWindowId && windowState.windows.some((window) => window.id === preferredWindowId)
         ? [
@@ -1660,7 +1703,9 @@ export default function App() {
           ]
         : windowState.windows;
     for (const window of windows) {
-      const pane = collectPaneInfos(window.layout).find((candidate) => candidate.path === path);
+      const pane = collectPaneInfos(window.layout).find(
+        (candidate) => candidate.path === path && (resourceKind === undefined || candidate.resourceKind === resourceKind)
+      );
       if (pane) return { pane, window };
     }
     return null;
@@ -1684,7 +1729,10 @@ export default function App() {
     requestAnimationFrame(() => paneRefs.current.get(paneId)?.focus());
   }
 
-  function syncRouteToPath(path: string | null, options?: { panel?: AgentRoutePanel; syncHash?: boolean }) {
+  function syncRouteToPath(
+    path: string | null,
+    options?: { panel?: AgentRoutePanel; resourceKind?: ResourceKind; syncHash?: boolean }
+  ) {
     const syncHash = options?.syncHash ?? true;
     if (!path) {
       if (syncHash) navigate({ kind: "empty" });
@@ -1723,7 +1771,7 @@ export default function App() {
       showUtilityRoute(utility, { syncHash });
       return;
     }
-    if (!isMarkdownPath(path)) {
+    if (options?.resourceKind === "file") {
       if (syncHash) navigate({ kind: "file", path });
       setError(null);
       setActiveNote(null);
@@ -1733,28 +1781,29 @@ export default function App() {
       setMode("file");
       return;
     }
-    void showNoteRoute(path, { syncHash });
+    void showResourceRoute(path, "note", { syncHash });
   }
 
-  function openPathInSoloWindow(path: string) {
+  function openPathInSoloWindow(path: string, resourceKind?: ResourceKind) {
     const windowId = nextWindowId();
     const paneId = nextPaneId();
     if (zoomedPaneId) setZoomedPaneId(null);
     setWindowState((current) =>
       normalizeWindowWorkspaceState({
         activeWindowId: windowId,
-        windows: [...current.windows, createSoloWindow(windowId, paneId, path)],
+        windows: [...current.windows, createSoloWindow(windowId, paneId, path, resourceKind)],
       })
     );
     requestAnimationFrame(() => paneRefs.current.get(paneId)?.focus());
   }
 
-  async function showNoteRoute(
+  async function showResourceRoute(
     path: string,
+    resourceKind: ResourceKind,
     options: { syncHash?: boolean; edit?: boolean } = {}
   ) {
     const { edit = false, syncHash = true } = options;
-    if (!isMarkdownPath(path)) {
+    if (resourceKind === "file") {
       if (syncHash) navigate({ kind: "file", path });
       setError(null);
       setActiveNote(null);
@@ -1783,19 +1832,44 @@ export default function App() {
     }
   }
 
-  async function openNote(
+  async function openResource(
     path: string,
+    resourceKind: ResourceKind,
     options: { focusExisting?: boolean; syncHash?: boolean; edit?: boolean } = {}
   ) {
     const { edit = false, focusExisting = true, syncHash = true } = options;
-    const existing = focusExisting ? findPaneLocationByPath(path, activeWindow?.id ?? null) : null;
+    const existing = focusExisting
+      ? findPaneLocationByResource(path, resourceKind, activeWindow?.id ?? null)
+      : null;
     if (existing) {
       if (zoomedPaneId && zoomedPaneId !== existing.pane.key) setZoomedPaneId(null);
       focusWindowPane(existing.window.id, existing.pane.key);
     } else {
-      openPathInSoloWindow(path);
+      openPathInSoloWindow(path, resourceKind);
     }
-    await showNoteRoute(path, { edit, syncHash });
+    await showResourceRoute(path, resourceKind, { edit, syncHash });
+  }
+
+  async function openNote(
+    path: string,
+    options: { focusExisting?: boolean; syncHash?: boolean; edit?: boolean } = {}
+  ) {
+    await openResource(path, "note", options);
+  }
+
+  async function openFile(
+    path: string,
+    options: { focusExisting?: boolean; syncHash?: boolean } = {}
+  ) {
+    await openResource(path, "file", options);
+  }
+
+  function openTreeFile(file: TreeFile) {
+    if (file.isNote) {
+      void openNote(file.openPath);
+    } else {
+      void openFile(file.openPath);
+    }
   }
 
   function showUtilityRoute(kind: UtilityMode, options: { syncHash?: boolean } = {}) {
@@ -1961,6 +2035,7 @@ export default function App() {
       // Retain the source key so the session surface keeps its cached state.
       id: source.pane.key,
       path: source.pane.path,
+      resourceKind: source.pane.resourceKind ?? undefined,
     });
     targetWindow.focusedPaneId = source.pane.key;
 
@@ -2037,7 +2112,7 @@ export default function App() {
     if (!pane) return;
     if (zoomedPaneId && zoomedPaneId !== key) setZoomedPaneId(null);
     focusWindowPane(activeWindow.id, key);
-    syncRouteToPath(pane.path);
+    syncRouteToPath(pane.path, { resourceKind: pane.resourceKind ?? undefined });
   }
 
   function activePaneFrame(): HTMLDivElement | null {
@@ -2209,7 +2284,7 @@ export default function App() {
       if (!removal.layout) return;
       targetWindow.layout = removal.layout;
       if (focused.ticket) {
-        nextWindows.push(createSoloWindow(nextWindowId(), nextPaneId(), focused.path));
+        nextWindows.push(createSoloWindow(nextWindowId(), nextPaneId(), focused.path, focused.resourceKind ?? undefined));
       }
     }
 
@@ -2232,7 +2307,7 @@ export default function App() {
     if (nextPane) {
       requestAnimationFrame(() => paneRefs.current.get(nextPane.key)?.focus());
     }
-    syncRouteToPath(nextPane?.path ?? null);
+    syncRouteToPath(nextPane?.path ?? null, { resourceKind: nextPane?.resourceKind ?? undefined });
   }
 
   function activateWindowByIndex(index: number) {
@@ -2241,7 +2316,7 @@ export default function App() {
     if (zoomedPaneId && zoomedPaneId !== target.focusedPaneId) setZoomedPaneId(null);
     focusWindowPane(target.id, target.focusedPaneId);
     const pane = findPaneInfo(target.layout, target.focusedPaneId);
-    syncRouteToPath(pane?.path ?? null);
+    syncRouteToPath(pane?.path ?? null, { resourceKind: pane?.resourceKind ?? undefined });
   }
 
   function moveChooserItemToFocusedPane(item: FleetSwitcherItem) {
@@ -2288,10 +2363,10 @@ export default function App() {
 
     const targetWindow = nextWindows.find((window) => window.id === activeWindow.id);
     if (!targetWindow) return;
-    targetWindow.layout = replacePanePath(targetWindow.layout, focusedPaneId, item.path);
+    targetWindow.layout = replacePanePath(targetWindow.layout, focusedPaneId, item.path, "note");
     targetWindow.focusedPaneId = focusedPaneId;
     if (focused.path !== item.path && focused.ticket) {
-      nextWindows.push(createSoloWindow(nextWindowId(), nextPaneId(), focused.path));
+      nextWindows.push(createSoloWindow(nextWindowId(), nextPaneId(), focused.path, focused.resourceKind ?? undefined));
       clearSessionPaneState(focusedPaneId);
       clearSurfacePaneState(focusedPaneId);
     }
@@ -2303,7 +2378,7 @@ export default function App() {
     if (zoomedPaneId && zoomedPaneId !== focusedPaneId) setZoomedPaneId(null);
     setWindowState(nextState);
     requestAnimationFrame(() => paneRefs.current.get(focusedPaneId)?.focus());
-    syncRouteToPath(item.path);
+    syncRouteToPath(item.path, { resourceKind: "note" });
   }
 
   function startNewNote() {
@@ -2435,13 +2510,8 @@ export default function App() {
   }
 
   function promptNewNoteIn(folderPath: string) {
-    const noteFolder = showAllFiles
-      ? folderPath === "vault"
-        ? ""
-        : folderPath.startsWith("vault/")
-          ? folderPath.slice("vault/".length)
-          : folderPath
-      : folderPath;
+    const noteFolder = noteFolderFromTreePath(folderPath, showAllFiles);
+    if (noteFolder === null) return;
     setDialog({
       title: "New note",
       input: noteFolder ? `${noteFolder}/` : "",
@@ -2474,13 +2544,8 @@ export default function App() {
     const source = draggingNotePath;
     setDraggingNotePath(null);
     if (!source) return;
-    const noteFolder = showAllFiles
-      ? folderPath === "vault"
-        ? ""
-        : folderPath.startsWith("vault/")
-          ? folderPath.slice("vault/".length)
-          : folderPath
-      : folderPath;
+    const noteFolder = noteFolderFromTreePath(folderPath, showAllFiles);
+    if (noteFolder === null) return;
     const dest = noteFolder ? `${noteFolder}/${basename(source)}.md` : `${basename(source)}.md`;
     if (dest !== source) doRename(source, dest);
   }
@@ -2539,11 +2604,13 @@ export default function App() {
 
   const openAgentRef = useRef(openAgent);
   const openNoteRef = useRef(openNote);
+  const openFileRef = useRef(openFile);
   const openUtilityViewRef = useRef(openUtilityView);
   const syncRouteToPathRef = useRef(syncRouteToPath);
   const activeWindowRef = useRef(activeWindow);
   openAgentRef.current = openAgent;
   openNoteRef.current = openNote;
+  openFileRef.current = openFile;
   openUtilityViewRef.current = openUtilityView;
   syncRouteToPathRef.current = syncRouteToPath;
   activeWindowRef.current = activeWindow;
@@ -2564,7 +2631,10 @@ export default function App() {
           ? findPaneInfo(currentActive.layout, currentActive.focusedPaneId)
           : null;
         if (activePane) {
-          syncRouteToPathRef.current(activePane.path, { syncHash: false });
+          syncRouteToPathRef.current(activePane.path, {
+            resourceKind: activePane.resourceKind ?? undefined,
+            syncHash: false,
+          });
           return;
         }
         setActiveNote(null);
@@ -2596,11 +2666,15 @@ export default function App() {
         return;
       }
 
-      await openNoteRef.current(route.path, {
-        edit: route.kind === "edit",
-        focusExisting: true,
-        syncHash: false,
-      });
+      if (route.kind === "file") {
+        await openFileRef.current(route.path, { focusExisting: true, syncHash: false });
+      } else {
+        await openNoteRef.current(route.path, {
+          edit: route.kind === "edit",
+          focusExisting: true,
+          syncHash: false,
+        });
+      }
       if (disposed) return;
     }
 
@@ -2824,7 +2898,12 @@ export default function App() {
       const targetWindow = nextWindows.find((window) => window.id === activeWindow.id);
       const targetPane = targetWindow ? findPaneInfo(targetWindow.layout, targetKey) : null;
       if (!targetWindow || !targetPane) return;
-      targetWindow.layout = replacePanePath(targetWindow.layout, targetKey, path);
+      targetWindow.layout = replacePanePath(
+        targetWindow.layout,
+        targetKey,
+        path,
+        isAgentPath(path) ? undefined : "note"
+      );
       targetWindow.focusedPaneId = targetKey;
       if (targetPane.path !== path && targetPane.ticket) {
         nextWindows.push(createSoloWindow(nextWindowId(), nextPaneId(), targetPane.path));
@@ -2838,7 +2917,7 @@ export default function App() {
         })
       );
       requestAnimationFrame(() => paneRefs.current.get(targetKey)?.focus());
-      syncRouteToPath(path);
+      syncRouteToPath(path, { resourceKind: isAgentPath(path) ? undefined : "note" });
       return;
     }
 
@@ -2868,7 +2947,12 @@ export default function App() {
     const targetWindow = nextWindows.find((window) => window.id === activeWindow.id);
     if (!targetWindow) return;
     const newPaneId = nextPaneId();
-    const newPane: Layout = { kind: "pane", id: newPaneId, path };
+    const newPane: Layout = {
+      kind: "pane",
+      id: newPaneId,
+      path,
+      resourceKind: isAgentPath(path) ? undefined : "note",
+    };
     targetWindow.layout = splitLayout(targetWindow.layout, targetKey, zone, newPane);
     targetWindow.focusedPaneId = newPaneId;
     setWindowState(
@@ -2878,7 +2962,7 @@ export default function App() {
       })
     );
     requestAnimationFrame(() => paneRefs.current.get(newPaneId)?.focus());
-    syncRouteToPath(path);
+    syncRouteToPath(path, { resourceKind: isAgentPath(path) ? undefined : "note" });
   }
 
   function renderPaneFrame(key: string, child: ReactNode) {
@@ -3040,6 +3124,7 @@ export default function App() {
               overlayContent={overlayContent}
               paneStateKey={node.id}
               path={node.path}
+              resourceKind={node.resourceKind}
               refreshTick={refreshTick}
               scrollRef={scrollRef}
               terminalLaunchNonce={
@@ -3255,6 +3340,7 @@ export default function App() {
                           : null
                     }
                     collapsed={collapsedFolders}
+                    canDropOnFolder={(path) => noteFolderFromTreePath(path, showAllFiles) !== null}
                     depth={0}
                     dragActive={draggingNotePath !== null}
                     folder={tree}
@@ -3262,7 +3348,7 @@ export default function App() {
                     onDropOnFolder={handleDropOnFolder}
                     onNoteDragEnd={() => setDraggingNotePath(null)}
                     onNoteDragStart={setDraggingNotePath}
-                    onOpenFile={openNote}
+                    onOpenFile={openTreeFile}
                     onToggleFolder={toggleFolder}
                   />
                   {filesTruncated ? <div className="nav-empty">File list truncated at 10,000 items</div> : null}
@@ -3486,6 +3572,7 @@ export default function App() {
             </>
           ) : (
             <button
+              disabled={noteFolderFromTreePath(contextMenu.path, showAllFiles) === null}
               type="button"
               onClick={() => {
                 const { path } = contextMenu;

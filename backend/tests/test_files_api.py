@@ -75,7 +75,16 @@ class FilesApiTests(unittest.TestCase):
         (self.repo / "escape.py").symlink_to(outside)
 
         with mock.patch.object(main, "FILES_ROOT", self.repo):
-            for path in ("../outside.py", str(outside), "escape.py"):
+            for path in (
+                "",
+                "../outside.py",
+                "./src/app.py",
+                "src/./app.py",
+                "src//app.py",
+                "src/../src/app.py",
+                str(outside),
+                "escape.py",
+            ):
                 with self.subTest(path=path), self.assertRaises(HTTPException) as raised:
                     main.get_file_content(path)
                 self.assertEqual(raised.exception.status_code, 404)
