@@ -2,6 +2,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent, ReactNode } from "react";
 import { Bot, FileCode2, FileText, HeartPulse, History, Waypoints } from "lucide-react";
 import type { NoteSummary } from "./types";
+import { workspaceFileSearchPath } from "./file-workspaces";
+import type { RecentResource } from "./file-workspaces";
+
+export type RecentSwitcherItem = RecentResource;
 
 export type SwitcherPage = "graph" | "activity" | "health" | "agents";
 
@@ -15,11 +19,7 @@ export type QuickSwitcherSession = {
 };
 
 export type QuickSwitcherFile = {
-  path: string;
-};
-
-export type RecentSwitcherItem = {
-  kind: "note" | "file";
+  workspace: string;
   path: string;
 };
 
@@ -75,7 +75,7 @@ type SwitcherSearchEntry =
   | { kind: "file"; file: QuickSwitcherFile; path: string };
 
 function searchEntryDisplayPath(entry: SwitcherSearchEntry) {
-  return entry.kind === "note" ? entry.note.path : entry.file.path;
+  return entry.kind === "note" ? entry.note.path : workspaceFileSearchPath(entry.file.workspace, entry.file.path);
 }
 
 function isPathBoundary(character: string | undefined) {
@@ -246,8 +246,8 @@ function topResourceMatches(
 
 function itemKey(item: SwitcherItem) {
   if (item.kind === "note") return `note:${item.note.id}`;
-  if (item.kind === "file") return `file:${item.file.path}`;
-  if (item.kind === "recent") return `recent:${item.recent.kind}:${item.recent.path}`;
+  if (item.kind === "file") return `file:${item.file.workspace}:${item.file.path}`;
+  if (item.kind === "recent") return `recent:${item.recent.kind}:${item.recent.workspace}:${item.recent.path}`;
   if (item.kind === "page") return `page:${item.page}`;
   return `session:${item.session.id}`;
 }
@@ -278,7 +278,7 @@ export function QuickSwitcher({
   sessions: QuickSwitcherSession[];
   onClose: () => void;
   onOpen: (path: string) => void;
-  onOpenFile: (path: string) => void;
+  onOpenFile: (file: QuickSwitcherFile) => void;
   onOpenRecent: (item: RecentSwitcherItem) => void;
   onOpenSession: (id: string) => void;
   onOpenPage: (page: SwitcherPage) => void;
@@ -295,11 +295,11 @@ export function QuickSwitcher({
         path: note.path.toLowerCase(),
       })),
       ...files
-        .filter((file) => !notePaths.has(file.path))
+        .filter((file) => file.workspace !== "wiki" || !notePaths.has(file.path))
         .map((file): SwitcherSearchEntry => ({
           kind: "file",
           file,
-          path: file.path.toLowerCase(),
+          path: workspaceFileSearchPath(file.workspace, file.path).toLowerCase(),
         })),
     ];
   }, [files, notes]);
@@ -362,7 +362,7 @@ export function QuickSwitcher({
     if (item.kind === "note") {
       onOpen(item.note.path);
     } else if (item.kind === "file") {
-      onOpenFile(item.file.path);
+      onOpenFile(item.file);
     } else if (item.kind === "recent") {
       onOpenRecent(item.recent);
     } else if (item.kind === "session") {
@@ -453,7 +453,11 @@ export function QuickSwitcher({
                               : item.recent.path.split("/").pop() ?? item.recent.path}
                           </span>
                           <span className="quick-switcher-path">
-                            {item.kind === "file" ? item.file.path : item.recent.path}
+                            {item.kind === "file"
+                              ? workspaceFileSearchPath(item.file.workspace, item.file.path)
+                              : item.recent.kind === "file"
+                                ? workspaceFileSearchPath(item.recent.workspace, item.recent.path)
+                                : item.recent.path}
                           </span>
                         </>
                       ) : item.kind === "session" ? (

@@ -55,6 +55,12 @@ export type FileTree = {
   truncated: boolean;
 };
 
+export type Workspace = {
+  id: string;
+  root: string;
+  live: boolean;
+};
+
 export type FileContent = {
   path: string;
   size: number;
@@ -63,12 +69,20 @@ export type FileContent = {
   error: string | null;
 };
 
-export function listFiles() {
-  return request<FileTree>("/api/files/tree");
+export function listWorkspaces() {
+  return request<{ workspaces: Workspace[] }>("/api/workspaces");
 }
 
-export function getFileContent(path: string) {
-  return request<FileContent>(`/api/files/content?path=${encodeURIComponent(path)}`);
+export function listFiles(workspace = "wiki") {
+  return request<FileTree>(`/api/files/tree?workspace=${encodeURIComponent(workspace)}`);
+}
+
+export function fileContentRequestPath(workspace: string, path: string) {
+  return `/api/files/content?workspace=${encodeURIComponent(workspace)}&path=${encodeURIComponent(path)}`;
+}
+
+export function getFileContent(workspace: string, path: string) {
+  return request<FileContent>(fileContentRequestPath(workspace, path));
 }
 
 export function renameNote(path: string, newPath: string) {
