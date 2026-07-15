@@ -40,17 +40,21 @@ function sameNote(left: Note | null, right: Note | null) {
 
 function PlainSourceEditor({
   content,
+  entryContent,
   handoffRef,
   notePath,
   setDraft,
 }: {
   content: string;
+  entryContent: string;
   handoffRef: { current: SourceEditorHandoff | null };
   notePath: string;
   setDraft: Dispatch<SetStateAction<NoteDraft>>;
 }) {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const entryContentRef = useRef(entryContent);
   const notePathRef = useRef(notePath);
+  entryContentRef.current = entryContent;
   notePathRef.current = notePath;
 
   useLayoutEffect(() => {
@@ -62,6 +66,7 @@ function PlainSourceEditor({
       }
       handoffRef.current = {
         anchor: textarea.selectionStart,
+        content: entryContentRef.current,
         focused: true,
         head: textarea.selectionEnd,
         notePath: notePathRef.current,
@@ -98,12 +103,17 @@ function NoteSourceEditor({
   setDraft: Dispatch<SetStateAction<NoteDraft>>;
 }) {
   const handoffRef = useRef<SourceEditorHandoff | null>(null);
+  const entrySnapshotRef = useRef({ content, notePath });
+  if (entrySnapshotRef.current.notePath !== notePath) {
+    entrySnapshotRef.current = { content, notePath };
+  }
 
   return (
     <Suspense
       fallback={
         <PlainSourceEditor
           content={content}
+          entryContent={entrySnapshotRef.current.content}
           handoffRef={handoffRef}
           notePath={notePath}
           setDraft={setDraft}

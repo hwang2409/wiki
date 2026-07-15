@@ -2,7 +2,7 @@ import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import { markdown } from "@codemirror/lang-markdown";
 import { languages } from "@codemirror/language-data";
 import { HighlightStyle, syntaxHighlighting } from "@codemirror/language";
-import { Annotation, EditorState } from "@codemirror/state";
+import { Annotation, EditorState, Transaction } from "@codemirror/state";
 import { tags } from "@lezer/highlight";
 import { EditorView, keymap } from "@codemirror/view";
 import { useEffect, useRef, type Dispatch, type SetStateAction } from "react";
@@ -12,6 +12,7 @@ const externalDocUpdate = Annotation.define<boolean>();
 
 export type SourceEditorHandoff = {
   anchor: number;
+  content: string;
   focused: boolean;
   head: number;
   notePath: string;
@@ -115,11 +116,14 @@ export default function MarkdownSourceEditor({
       editorViewRef.current === view &&
       liveEditorRef.current === liveEditor;
     const isLiveCurrentNote = () => isLiveView() && liveEditor.notePath === currentNotePathRef.current;
+    const handoff = handoffRef.current;
+    const canRestoreHandoff = handoff?.focused === true && handoff.notePath === notePath;
+    const initialContent = canRestoreHandoff ? handoff.content : content;
 
     view = new EditorView({
       parent,
       state: EditorState.create({
-        doc: content,
+        doc: initialContent,
         extensions: [
           markdown({ codeLanguages: languages, pasteURLAsLink: false }),
           EditorView.lineWrapping,
@@ -151,8 +155,17 @@ export default function MarkdownSourceEditor({
     editorViewRef.current = view;
     liveEditorRef.current = liveEditor;
 
-    const handoff = handoffRef.current;
-    if (isLiveView() && handoff?.focused && handoff.notePath === notePath) {
+    if (isLiveCurrentNote() && canRestoreHandoff && initialContent !== content) {
+      view.dispatch({
+        annotations: [
+          Transaction.addToHistory.of(true),
+          Transaction.userEvent.of("input"),
+        ],
+        changes: { from: 0, insert: content, to: view.state.doc.length },
+      });
+    }
+
+    if (isLiveView() && canRestoreHandoff) {
       const clamp = (offset: number) => Math.max(0, Math.min(offset, view.state.doc.length));
       const start = clamp(handoff.anchor);
       const end = clamp(handoff.head);
@@ -190,7 +203,11 @@ export default function MarkdownSourceEditor({
     }
     if (liveEditor.notePath !== notePath || view.state.doc.toString() !== content) {
       view.dispatch({
-        annotations: externalDocUpdate.of(true),
+        annotations: [
+          externalDocUpdate.of(true),
+          Transaction.addToHistory.of(false),
+          Transaction.remote.of(true),
+        ],
         changes: { from: 0, insert: content, to: view.state.doc.length },
       });
       if (!mountedRef.current || !liveEditor.active || liveEditorRef.current !== liveEditor) return;
