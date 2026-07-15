@@ -49,10 +49,22 @@ from .frontend_static import mount_frontend_static
 
 ROOT_DIR = Path(os.environ.get("WIKI_REPO_DIR", Path(__file__).resolve().parents[2])).resolve()
 VAULT_DIR = Path(os.environ.get("WIKI_VAULT_DIR", ROOT_DIR / "vault")).resolve()
+# File API paths are relative to the repository root. Note paths remain
+# vault-relative because the note API is rooted at VAULT_DIR.
+FILES_ROOT = ROOT_DIR
 MAX_NOTE_BYTES = 2_000_000
 MAX_FILE_BYTES = 2_000_000
 MAX_FILE_TREE_ENTRIES = 10_000
-IGNORED_FILE_PARTS = {".git", ".obsidian", "node_modules"}
+IGNORED_FILE_PARTS = {
+    ".git",
+    ".obsidian",
+    ".codex",
+    "__pycache__",
+    ".venv",
+    "dist",
+    "node_modules",
+    "target",
+}
 
 VAULT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -202,21 +214,23 @@ def file_not_found() -> None:
 
 def resolve_file_path(raw_path: str) -> tuple[Path, str]:
     candidate = raw_path.strip().replace("\\", "/")
-    if "\x00" in candidate:
+    if "\x00" in candidate or not candidate:
+        file_not_found()
+    raw_parts = candidate.split("/")
+    if any(part in {"", ".", ".."} for part in raw_parts):
         file_not_found()
     try:
         path = PurePosixPath(candidate)
         if (
-            not candidate
-            or path.is_absolute()
+            path.is_absolute()
             or any(part in {"", ".", ".."} for part in path.parts)
             or is_ignored_file_parts(path.parts)
         ):
             file_not_found()
 
-        vault_root = VAULT_DIR.resolve()
-        target = (vault_root / Path(*path.parts)).resolve()
-        relative_target = target.relative_to(vault_root)
+        file_root = FILES_ROOT.resolve()
+        target = (file_root / Path(*path.parts)).resolve()
+        relative_target = target.relative_to(file_root)
         if is_ignored_file_parts(relative_target.parts):
             file_not_found()
     except HTTPException:
@@ -226,10 +240,10 @@ def resolve_file_path(raw_path: str) -> tuple[Path, str]:
     return target, path.as_posix()
 
 
-def iter_vault_files() -> tuple[list[Path], bool]:
+def iter_repo_files() -> tuple[list[Path], bool]:
     files: list[Path] = []
-    vault_root = VAULT_DIR.resolve()
-    directories = [vault_root]
+    file_root = FILES_ROOT.resolve()
+    directories = [file_root]
     truncated = False
     while directories:
         directory = directories.pop()
@@ -239,7 +253,7 @@ def iter_vault_files() -> tuple[list[Path], bool]:
         except OSError:
             continue
         for entry in entries:
-            relative_parts = Path(entry.path).relative_to(vault_root).parts
+            relative_parts = Path(entry.path).relative_to(file_root).parts
             if is_ignored_file_parts(relative_parts):
                 continue
             try:
@@ -249,7 +263,7 @@ def iter_vault_files() -> tuple[list[Path], bool]:
                 if not entry.is_file(follow_symlinks=True):
                     continue
                 resolved = Path(entry.path).resolve()
-                resolved_relative = resolved.relative_to(vault_root)
+                resolved_relative = resolved.relative_to(file_root)
                 if is_ignored_file_parts(resolved_relative.parts):
                     continue
             except (OSError, RuntimeError, ValueError):
@@ -258,17 +272,20 @@ def iter_vault_files() -> tuple[list[Path], bool]:
                 truncated = True
                 return files, truncated
             files.append(Path(entry.path))
-    files.sort(key=lambda candidate: candidate.relative_to(vault_root).as_posix())
+    files.sort(key=lambda candidate: candidate.relative_to(file_root).as_posix())
     return files, truncated
 
 
-def opened_file_is_safe(fd: int, target: Path, vault_root: Path) -> bool:
+def opened_file_is_safe(fd: int, target: Path, file_root: Path) -> bool:
     descriptor_stat = os.fstat(fd)
     if not stat.S_ISREG(descriptor_stat.st_mode):
         return False
     try:
-        relative_target = target.relative_to(vault_root)
-        if is_ignored_file_parts(relative_target.parts):
+        relative_target = target.relative_to(file_root)
+        if (
+            any(part in {"", ".", ".."} for part in relative_target.parts)
+            or is_ignored_file_parts(relative_target.parts)
+        ):
             return False
     except ValueError:
         return False
@@ -278,7 +295,7 @@ def opened_file_is_safe(fd: int, target: Path, vault_root: Path) -> bool:
     root_fd: int | None = None
     current_fd: int | None = None
     try:
-        root_fd = os.open(vault_root, os.O_RDONLY | no_follow | directory_flag)
+        root_fd = os.open(file_root, os.O_RDONLY | no_follow | directory_flag)
         current_fd = root_fd
         for index, component in enumerate(relative_target.parts):
             is_final = index == len(relative_target.parts) - 1
@@ -3125,7 +3142,8 @@ def list_notes(q: str | None = None) -> list[NoteSummary]:
 @app.get("/api/files/tree", response_model=FileTree)
 def list_files() -> FileTree:
     summaries: list[FileSummary] = []
-    files, truncated = iter_vault_files()
+    files, truncated = iter_repo_files()
+    file_root = FILES_ROOT.resolve()
     for path in files:
         try:
             stat_result = path.stat()
@@ -3133,7 +3151,7 @@ def list_files() -> FileTree:
             continue
         summaries.append(
             FileSummary(
-                path=path.relative_to(VAULT_DIR.resolve()).as_posix(),
+                path=path.relative_to(file_root).as_posix(),
                 size=stat_result.st_size,
                 updated_at=datetime.fromtimestamp(stat_result.st_mtime, tz=timezone.utc),
             )
@@ -3151,8 +3169,8 @@ def get_file_content(path: str = Query(..., min_length=1)) -> FileContent:
         raise HTTPException(status_code=404, detail="File not found") from exc
 
     try:
-        vault_root = VAULT_DIR.resolve()
-        if not opened_file_is_safe(fd, target, vault_root):
+        file_root = FILES_ROOT.resolve()
+        if not opened_file_is_safe(fd, target, file_root):
             file_not_found()
         size = os.fstat(fd).st_size
         raw = read_open_file(fd, MAX_FILE_BYTES)

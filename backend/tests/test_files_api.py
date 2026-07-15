@@ -13,36 +13,39 @@ from backend.app import main
 class FilesApiTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
-        self.vault = Path(self.tmp.name).resolve()
-        (self.vault / "src").mkdir()
-        (self.vault / "src" / "app.py").write_text("print('hello')\n", encoding="utf-8")
+        self.repo = Path(self.tmp.name).resolve()
+        self.vault = self.repo / "vault"
+        (self.repo / "src").mkdir()
+        self.vault.mkdir()
+        (self.repo / "src" / "app.py").write_text("print('hello')\n", encoding="utf-8")
         (self.vault / "note.md").write_text("# Note\n", encoding="utf-8")
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def test_tree_lists_vault_files_and_excludes_hidden_directories(self) -> None:
-        (self.vault / ".git").mkdir()
-        (self.vault / ".git" / "config").write_text("secret", encoding="utf-8")
-        (self.vault / ".obsidian").mkdir()
-        (self.vault / ".obsidian" / "app.json").write_text("{}", encoding="utf-8")
-        (self.vault / "node_modules").mkdir()
-        (self.vault / "node_modules" / "package.js").write_text("ignored", encoding="utf-8")
-        (self.vault / ".secret").write_text("ignored", encoding="utf-8")
-        (self.vault / "secret-alias").symlink_to(self.vault / ".secret")
-        (self.vault / "git-alias").symlink_to(self.vault / ".git" / "config")
+    def test_tree_lists_repo_files_and_excludes_hidden_directories(self) -> None:
+        (self.repo / ".git").mkdir()
+        (self.repo / ".git" / "config").write_text("secret", encoding="utf-8")
+        (self.repo / ".obsidian").mkdir()
+        (self.repo / ".obsidian" / "app.json").write_text("{}", encoding="utf-8")
+        for ignored in ("node_modules", "target", "dist", ".codex", "__pycache__", ".venv"):
+            (self.repo / ignored).mkdir()
+            (self.repo / ignored / "ignored.txt").write_text("ignored", encoding="utf-8")
+        (self.repo / ".secret").write_text("ignored", encoding="utf-8")
+        (self.repo / "secret-alias").symlink_to(self.repo / ".secret")
+        (self.repo / "git-alias").symlink_to(self.repo / ".git" / "config")
 
-        with mock.patch.object(main, "VAULT_DIR", self.vault):
+        with mock.patch.object(main, "FILES_ROOT", self.repo):
             tree = main.list_files()
 
-        self.assertEqual([entry.path for entry in tree.files], ["note.md", "src/app.py"])
+        self.assertEqual([entry.path for entry in tree.files], ["src/app.py", "vault/note.md"])
         self.assertFalse(tree.truncated)
 
     def test_tree_prunes_excluded_directories_before_descending(self) -> None:
-        (self.vault / ".git").mkdir()
-        (self.vault / ".git" / "config").write_text("secret", encoding="utf-8")
-        (self.vault / "node_modules").mkdir()
-        (self.vault / "node_modules" / "package.js").write_text("ignored", encoding="utf-8")
+        (self.repo / ".git").mkdir()
+        (self.repo / ".git" / "config").write_text("secret", encoding="utf-8")
+        (self.repo / "node_modules").mkdir()
+        (self.repo / "node_modules" / "package.js").write_text("ignored", encoding="utf-8")
         real_scandir = main.os.scandir
         scanned: list[Path] = []
 
@@ -50,16 +53,16 @@ class FilesApiTests(unittest.TestCase):
             scanned.append(Path(path))
             return real_scandir(path)
 
-        with mock.patch.object(main, "VAULT_DIR", self.vault), mock.patch.object(
+        with mock.patch.object(main, "FILES_ROOT", self.repo), mock.patch.object(
             main.os, "scandir", tracking_scandir
         ):
             main.list_files()
 
-        self.assertNotIn(self.vault / ".git", scanned)
-        self.assertNotIn(self.vault / "node_modules", scanned)
+        self.assertNotIn(self.repo / ".git", scanned)
+        self.assertNotIn(self.repo / "node_modules", scanned)
 
     def test_content_is_utf8_text(self) -> None:
-        with mock.patch.object(main, "VAULT_DIR", self.vault):
+        with mock.patch.object(main, "FILES_ROOT", self.repo):
             result = main.get_file_content("src/app.py")
 
         self.assertEqual(result.path, "src/app.py")
@@ -67,24 +70,33 @@ class FilesApiTests(unittest.TestCase):
         self.assertFalse(result.binary)
 
     def test_traversal_absolute_and_symlink_escape_are_not_found(self) -> None:
-        outside = self.vault.parent / "outside.py"
+        outside = self.repo.parent / "outside.py"
         outside.write_text("outside", encoding="utf-8")
-        (self.vault / "escape.py").symlink_to(outside)
+        (self.repo / "escape.py").symlink_to(outside)
 
-        with mock.patch.object(main, "VAULT_DIR", self.vault):
-            for path in ("../outside.py", str(outside), "escape.py"):
+        with mock.patch.object(main, "FILES_ROOT", self.repo):
+            for path in (
+                "",
+                "../outside.py",
+                "./src/app.py",
+                "src/./app.py",
+                "src//app.py",
+                "src/../src/app.py",
+                str(outside),
+                "escape.py",
+            ):
                 with self.subTest(path=path), self.assertRaises(HTTPException) as raised:
                     main.get_file_content(path)
                 self.assertEqual(raised.exception.status_code, 404)
 
     def test_symlink_aliases_to_hidden_files_are_not_listed_or_served(self) -> None:
-        (self.vault / ".secret").write_text("secret", encoding="utf-8")
-        (self.vault / ".git").mkdir()
-        (self.vault / ".git" / "config").write_text("git secret", encoding="utf-8")
-        (self.vault / "secret-alias").symlink_to(self.vault / ".secret")
-        (self.vault / "git-alias").symlink_to(self.vault / ".git" / "config")
+        (self.repo / ".secret").write_text("secret", encoding="utf-8")
+        (self.repo / ".git").mkdir()
+        (self.repo / ".git" / "config").write_text("git secret", encoding="utf-8")
+        (self.repo / "secret-alias").symlink_to(self.repo / ".secret")
+        (self.repo / "git-alias").symlink_to(self.repo / ".git" / "config")
 
-        with mock.patch.object(main, "VAULT_DIR", self.vault):
+        with mock.patch.object(main, "FILES_ROOT", self.repo):
             tree = main.list_files()
             for path in ("secret-alias", "git-alias"):
                 with self.subTest(path=path), self.assertRaises(HTTPException) as raised:
@@ -96,17 +108,17 @@ class FilesApiTests(unittest.TestCase):
         self.assertNotIn("git-alias", listed_paths)
 
     def test_nul_in_path_is_not_found(self) -> None:
-        with mock.patch.object(main, "VAULT_DIR", self.vault):
+        with mock.patch.object(main, "FILES_ROOT", self.repo):
             with self.assertRaises(HTTPException) as raised:
                 main.get_file_content("src/app.py\x00")
 
         self.assertEqual(raised.exception.status_code, 404)
 
     def test_size_cap_returns_structured_error(self) -> None:
-        (self.vault / "at-limit.txt").write_bytes(b"x" * main.MAX_FILE_BYTES)
-        (self.vault / "large.txt").write_bytes(b"x" * (main.MAX_FILE_BYTES + 1))
+        (self.repo / "at-limit.txt").write_bytes(b"x" * main.MAX_FILE_BYTES)
+        (self.repo / "large.txt").write_bytes(b"x" * (main.MAX_FILE_BYTES + 1))
 
-        with mock.patch.object(main, "VAULT_DIR", self.vault):
+        with mock.patch.object(main, "FILES_ROOT", self.repo):
             at_limit = main.get_file_content("at-limit.txt")
             with self.assertRaises(HTTPException) as raised:
                 main.get_file_content("large.txt")
@@ -119,7 +131,7 @@ class FilesApiTests(unittest.TestCase):
         for index in range(3):
             (self.vault / f"file-{index}.txt").write_text("x", encoding="utf-8")
 
-        with mock.patch.object(main, "VAULT_DIR", self.vault), mock.patch.object(
+        with mock.patch.object(main, "FILES_ROOT", self.repo), mock.patch.object(
             main, "MAX_FILE_TREE_ENTRIES", 2
         ):
             tree = main.list_files()
@@ -131,7 +143,7 @@ class FilesApiTests(unittest.TestCase):
         (self.vault / "file-0.txt").write_text("x", encoding="utf-8")
         (self.vault / "file-1.txt").write_text("x", encoding="utf-8")
 
-        with mock.patch.object(main, "VAULT_DIR", self.vault), mock.patch.object(
+        with mock.patch.object(main, "FILES_ROOT", self.repo), mock.patch.object(
             main, "MAX_FILE_TREE_ENTRIES", 4
         ):
             tree = main.list_files()
@@ -139,20 +151,20 @@ class FilesApiTests(unittest.TestCase):
         self.assertEqual(len(tree.files), 4)
         self.assertFalse(tree.truncated)
 
-    def test_descriptor_containment_walks_from_the_vault_root(self) -> None:
-        target = self.vault / "src" / "app.py"
-        outside = self.vault.parent / "outside.py"
+    def test_descriptor_containment_walks_from_the_repo_root(self) -> None:
+        target = self.repo / "src" / "app.py"
+        outside = self.repo.parent / "outside.py"
         outside.write_text("outside", encoding="utf-8")
 
         with target.open("rb") as opened:
-            self.assertTrue(main.opened_file_is_safe(opened.fileno(), target, self.vault))
-            self.assertFalse(main.opened_file_is_safe(opened.fileno(), outside, self.vault))
+            self.assertTrue(main.opened_file_is_safe(opened.fileno(), target, self.repo))
+            self.assertFalse(main.opened_file_is_safe(opened.fileno(), outside, self.repo))
 
     def test_binary_and_invalid_utf8_return_structured_binary_response(self) -> None:
-        (self.vault / "image.bin").write_bytes(b"PNG\x00bytes")
-        (self.vault / "invalid.bin").write_bytes(b"\xff\xfe")
+        (self.repo / "image.bin").write_bytes(b"PNG\x00bytes")
+        (self.repo / "invalid.bin").write_bytes(b"\xff\xfe")
 
-        with mock.patch.object(main, "VAULT_DIR", self.vault):
+        with mock.patch.object(main, "FILES_ROOT", self.repo):
             binary = main.get_file_content("image.bin")
             invalid = main.get_file_content("invalid.bin")
 

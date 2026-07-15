@@ -61,6 +61,7 @@ export function WorkspacePane({
   overlayContent,
   paneStateKey,
   path,
+  resourceKind,
   refreshTick,
   scrollRef,
   terminalLaunchNonce,
@@ -78,6 +79,7 @@ export function WorkspacePane({
   overlayContent?: ReactNode;
   paneStateKey: string;
   path: string | null;
+  resourceKind?: "note" | "file";
   refreshTick: number;
   scrollRef?: RefObject<HTMLDivElement | null>;
   terminalLaunchNonce?: number;
@@ -112,7 +114,7 @@ export function WorkspacePane({
     // Utility pages are provided by App's focused-pane overlay. Do not mount a
     // hidden note pane for their internal workspace identity.
     content = null;
-  } else if (!path.toLowerCase().endsWith(".md")) {
+  } else if (resourceKind === "file") {
     content = <CodeFilePane path={path} scrollRef={scrollRef} />;
   } else {
     content = (
