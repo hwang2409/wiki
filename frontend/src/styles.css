@@ -842,7 +842,7 @@ body.is-resizing-panes .pane-cell {
   flex: 1;
   min-width: 0;
   min-height: 0;
-  overflow-x: hidden;
+  overflow-x: auto;
   overflow-y: auto;
   background: var(--code-background);
 }
