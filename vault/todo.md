@@ -15,9 +15,10 @@ Todo:
 - [P2] WIKI-124: accepted svg artifact silently not rendered in session view above size threshold — 24KB svg (id 4907cf6e, 14:48Z 2026-07-15) accepted server-side, never displayed; 800B probe (1acaeef1) rendered fine. Silent accept-then-drop masks failure from sender. Fix: render large svg (scroll/scale) OR visible reject like source-validation errors. Bisect threshold; check overlap with mermaid >20-node compact-preview machinery. Related [[WIKI-116]]
 - [P2] PHO-13800 customer_churned_date timing unreliable (19/29 in one entry window; zero churns Jan-Apr) — backfill true dates or document entry-date semantic; related PHO-13735
 - [P2] PHO-13763 PARKED by Henry 2026-07-15: PR 11383 drafted at 909ef288ce, gate-passed (CI green, 0 threads, sol REVIEW4 merge-ready), worker archived — resume = un-draft, re-verify freshness vs main, merge
-- [P1] amd-shadow migration: KORGAN owns (Henry 2026-07-15). PR 11416 closed w/ handoff evidence comment. Prod: invalid 0-byte index, no schema_migrations row; correct fix = NEW migration w/ SET timeout + DROP CONCURRENTLY first. Watch next prod deploy
 - [P3] WIKI-126: surface rebrand — rename app-facing identity only (app display name, window title, README header); NAME NOT YET CHOSEN by Henry, blocked until he picks. Internal identifiers stay (repo, wiki CLI, WIKI-* tickets, MCP names, vault paths — codename doctrine, Henry 2026-07-15)
 - [P2] WIKI-129: make native-build while Wiki.app running breaks live supervisor — bundle swap clobbers running sidecar's _internal (ENOENT on supervisor channel, respawn blocked by stale supervisor.lock, worker spawn/replace dead until app relaunch; hit 2026-07-15 eve). Fix: build to staging dir + atomic swap on app quit, or preflight check refusing rebuild while app runs
+- [P2] amd-shadow invalid index: KORGAN owns fix (PR 11416 closed w/ evidence); prod index still INVALID 0-byte — watch deploys
+- [P2] PHO-13826/27/28 exe.dev sandbox arc: enable (SSH key secret + smoke) -> ownership fix -> TTL sweeper; PHO-13829 egress design backlog. Surface merged since PHO-13073/#10608, dormant on missing key
 
 In Progress:
 
@@ -28,9 +29,8 @@ In Progress:
 - [P4] [PHO-13368](https://linear.app/phoebework/issue/PHO-13368): admin agent run events monospace font — cc:PHO-13368 worker
 - [P2] [PHO-13669](https://linear.app/phoebework/issue/PHO-13669): Core email/account-book gaps — cdx:PHO-13669 (gpt-5.6-terra)
 - PHO-13763 per-org scratchpad (worker cdx:PHO-13763, run bd90b506)
-- [P2] PHO-13804 admin agent full Intercom messages: Core getConversation(parts) + admin-agent endpoint + audit-scoped tool, live-fetch only (PII), spill-cap output
-- [P1] WIKI-127: multi-workspace file browsing — GET /api/workspaces (orchestrator-derived allowlist + self), workspace param on file APIs w/ per-root containment, sidebar switcher, (workspace,relpath) pane paths + recents v2. Design: vault/tools/wiki-workspaces-design.md
-- [P2] WIKI-128: code-viewer density — root-cause prose-style leak into shiki .line blocks (renders ~2.3x despite declared 1.55), set ~1.4 line-height, tighter gutter/padding on code-file-* surfaces
+- PUF-1..4: pufferclone — v0 turbopuffer clone in Rust (~/me/fun/misc/pufferclone, spec in docs/superpowers/specs/)
+- [P2] PHO-13830 live EHR record fetch tool (admin agent) — worker live
 
 Backlog:
 

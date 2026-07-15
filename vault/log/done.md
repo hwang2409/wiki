@@ -9,6 +9,15 @@ updated: 2026-07-15
 
 ## 2026-07-15
 
+- WIKI-127 merged (#98, 6 rounds): multi-workspace file browsing — fd-pinned roots + constant-descriptor tree walk, workspace derivation from orchestrator registry, file://<workspace>/<relpath> path space, recents v2 migration
+- orchard@phoebe.work provisioned prod (f5025027) + staging (273fa49a) — account-health tick unblocked
+- WIKI-128 merged (#99): code-viewer density fix — view-content prose leak removed from code scroll container, line-height 1.4 both render paths, h-scroll restored, tighter gutter
+- PHO-13815 merged as https://github.com/phoebe-health/phoebe/pull/11433 (review-marker backfill from Core + false-ping cleanup; 2 sol rounds)
+- **pufferclone** — PUF-2 index modules merged (exact-scan vector, BM25 mergeable stats, filters, RRF, 3 sol rounds, main@2068d11)
+- **pufferclone** — PUF-3 segment container merged (crc32, opaque sections, 2 sol rounds, main@a226022)
+- PHO-13804 merged as https://github.com/phoebe-health/phoebe/pull/11420 (admin agent full Intercom messages; 4 sol rounds + 2 Bugbot rounds)
+- **pufferclone** — PUF-1 foundation merged (types/store/WAL/manifest, 4 sol review rounds, local repo main@c2aa070)
+- ORCHARD-EMAIL merged as https://github.com/phoebe-health/phoebe/pull/11431 (account-health service email → orchard@phoebe.work)
 - WIKI-121 CodeMirror 6 editor merged (#95): markdown+lazy langs, CSS-var theme, history/undo, code-split; 6 review rounds incl. fallback design simplification
 - WIKI-125 note rendering merged (#97): mermaid (lazy/strict/theme-synced), vault asset endpoint, image/svg embeds, table styling; 4 review rounds
 - WIKI-122 explorer polish merged (#96): extension icons, repo files + boundary fuzzy in Cmd+K, Recent group; 4 review rounds
