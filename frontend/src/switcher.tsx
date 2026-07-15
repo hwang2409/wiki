@@ -2,6 +2,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent, ReactNode } from "react";
 import { Bot, FileCode2, FileText, HeartPulse, History, Waypoints } from "lucide-react";
 import type { NoteSummary } from "./types";
+import { workspaceFileSearchPath } from "./file-workspaces";
+import type { RecentResource } from "./file-workspaces";
+
+export type RecentSwitcherItem = RecentResource;
 
 export type SwitcherPage = "graph" | "activity" | "health" | "agents";
 
@@ -15,12 +19,6 @@ export type QuickSwitcherSession = {
 };
 
 export type QuickSwitcherFile = {
-  workspace: string;
-  path: string;
-};
-
-export type RecentSwitcherItem = {
-  kind: "note" | "file";
   workspace: string;
   path: string;
 };
@@ -77,7 +75,7 @@ type SwitcherSearchEntry =
   | { kind: "file"; file: QuickSwitcherFile; path: string };
 
 function searchEntryDisplayPath(entry: SwitcherSearchEntry) {
-  return entry.kind === "note" ? entry.note.path : `${entry.file.workspace}/${entry.file.path}`;
+  return entry.kind === "note" ? entry.note.path : workspaceFileSearchPath(entry.file.workspace, entry.file.path);
 }
 
 function isPathBoundary(character: string | undefined) {
@@ -301,7 +299,7 @@ export function QuickSwitcher({
         .map((file): SwitcherSearchEntry => ({
           kind: "file",
           file,
-          path: `${file.workspace}/${file.path}`.toLowerCase(),
+          path: workspaceFileSearchPath(file.workspace, file.path).toLowerCase(),
         })),
     ];
   }, [files, notes]);
@@ -456,9 +454,9 @@ export function QuickSwitcher({
                           </span>
                           <span className="quick-switcher-path">
                             {item.kind === "file"
-                              ? `${item.file.workspace}/${item.file.path}`
+                              ? workspaceFileSearchPath(item.file.workspace, item.file.path)
                               : item.recent.kind === "file"
-                                ? `${item.recent.workspace}/${item.recent.path}`
+                                ? workspaceFileSearchPath(item.recent.workspace, item.recent.path)
                                 : item.recent.path}
                           </span>
                         </>

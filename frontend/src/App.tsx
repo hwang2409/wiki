@@ -61,6 +61,14 @@ import {
   type RecentSwitcherItem,
   type QuickSwitcherSession,
 } from "./switcher";
+import {
+  filePanePath,
+  isActiveFilePath,
+  MAX_RECENT_RESOURCES,
+  normalizeFilePanePath,
+  parseFilePanePath,
+  parseStoredRecentResources,
+} from "./file-workspaces";
 import { SettingsModal, applyStoredFonts } from "./settings";
 import { ActivityFeed } from "./activity";
 import { AgentsSidebar, AgentsView, type AccountEvent } from "./agents";
@@ -155,11 +163,6 @@ type PaneInfo = {
   ticket: string | null;
 };
 
-type FileRef = {
-  workspace: string;
-  path: string;
-};
-
 type FileWorkspaceState = {
   files: FileSummary[];
   truncated: boolean;
@@ -214,23 +217,6 @@ function isAgentPath(path: string | null): path is string {
 
 function isTerminalPath(path: string | null): path is string {
   return Boolean(path?.startsWith("terminal://"));
-}
-
-function filePanePath(workspace: string, path: string) {
-  return `file://${workspace}/${path}`;
-}
-
-function parseFilePanePath(path: string): FileRef | null {
-  const match = path.match(/^file:\/\/([^/]+)\/(.+)$/);
-  return match ? { workspace: match[1], path: match[2] } : null;
-}
-
-function normalizeFilePanePath(path: string) {
-  return parseFilePanePath(path) ? path : filePanePath("wiki", path);
-}
-
-function isWorkspaceToken(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0 && !/[\\/\x00]/.test(value);
 }
 
 function utilityKindFromPanePath(path: string | null): UtilityMode | null {
@@ -914,47 +900,13 @@ function readStoredCollapsed(): Set<string> {
 }
 
 const RECENT_RESOURCES_STORAGE_KEY = "wiki-recent-resources";
-const MAX_RECENT_RESOURCES = 15;
 
 function recentResourceKey(item: RecentSwitcherItem) {
   return `${item.kind}:${item.workspace}:${item.path}`;
 }
 
 function readStoredRecentResources(): RecentSwitcherItem[] {
-  try {
-    const raw = localStorage.getItem(RECENT_RESOURCES_STORAGE_KEY);
-    const parsed: unknown = raw ? JSON.parse(raw) : [];
-    if (!parsed || typeof parsed !== "object") return [];
-    const stored = parsed as { v?: unknown; entries?: unknown };
-    if ((stored.v !== 1 && stored.v !== 2) || !Array.isArray(stored.entries)) return [];
-    const entries = stored.entries.map((item): RecentSwitcherItem | null => {
-      if (!item || typeof item !== "object") return null;
-      const candidate = item as { kind?: unknown; path?: unknown; workspace?: unknown };
-      if (
-        (candidate.kind !== "note" && candidate.kind !== "file") ||
-        typeof candidate.path !== "string" ||
-        candidate.path.length === 0
-      ) {
-        return null;
-      }
-      const workspace = stored.v === 1 ? "wiki" : candidate.workspace;
-      return isWorkspaceToken(workspace)
-        ? { kind: candidate.kind, path: candidate.path, workspace }
-        : null;
-    });
-    if (entries.some((item): item is null => item === null)) return [];
-    const seen = new Set<string>();
-    return (entries as RecentSwitcherItem[])
-      .filter((item) => {
-        const key = recentResourceKey(item);
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      })
-      .slice(0, MAX_RECENT_RESOURCES);
-  } catch {
-    return [];
-  }
+  return parseStoredRecentResources(localStorage.getItem(RECENT_RESOURCES_STORAGE_KEY));
 }
 
 function buildTree(
@@ -1300,7 +1252,11 @@ function FolderTree({
       {folder.files.map((file) => (
         <button
           className={`tree-item-self ${file.isNote ? "nav-file-title" : "nav-code-file-title"}${
-            activePath === (file.isNote ? file.path : file.openPath) ? " is-active" : ""
+            (file.isNote
+              ? activePath === file.path
+              : isActiveFilePath(activePath, file.workspace ?? "wiki", file.path))
+              ? " is-active"
+              : ""
           }`}
           draggable={file.isNote}
           key={file.id}

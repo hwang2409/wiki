@@ -8,6 +8,7 @@ import stat
 import subprocess
 import time
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
@@ -179,6 +180,21 @@ class WorkspaceList(BaseModel):
     workspaces: list[Workspace]
 
 
+@dataclass(frozen=True)
+class WorkspaceCandidate:
+    workspace: Workspace
+    root: Path
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True)
+class WorkspaceResolution:
+    workspace: Workspace
+    root: Path
+    root_fd: int
+
+
 def slugify(value: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", value.strip().lower()).strip("-")
     return slug or "untitled"
@@ -230,7 +246,7 @@ def file_not_found() -> None:
     raise HTTPException(status_code=404, detail="File not found")
 
 
-def resolve_file_path(raw_path: str, file_root: Path) -> tuple[Path, str]:
+def validate_file_path(raw_path: str) -> PurePosixPath:
     candidate = raw_path.strip().replace("\\", "/")
     if "\x00" in candidate or not candidate:
         file_not_found()
@@ -245,7 +261,16 @@ def resolve_file_path(raw_path: str, file_root: Path) -> tuple[Path, str]:
             or is_ignored_file_parts(path.parts)
         ):
             file_not_found()
+    except HTTPException:
+        raise
+    except (OSError, RuntimeError, ValueError, TypeError):
+        file_not_found()
+    return path
 
+
+def resolve_file_path(raw_path: str, file_root: Path) -> tuple[Path, str]:
+    path = validate_file_path(raw_path)
+    try:
         file_root = file_root.resolve()
         target = (file_root / Path(*path.parts)).resolve()
         relative_target = target.relative_to(file_root)
@@ -288,9 +313,27 @@ def resolve_vault_asset_path(raw_path: str) -> tuple[Path, str, str]:
     return target, path.as_posix(), media_type
 
 
-def iter_repo_files(file_root: Path) -> tuple[list[Path], bool]:
+def open_relative_file(root_fd: int, relative_parts: tuple[str, ...]) -> int:
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    current_fd = os.dup(root_fd)
+    try:
+        for index, component in enumerate(relative_parts):
+            is_final = index == len(relative_parts) - 1
+            flags = os.O_RDONLY | no_follow | (0 if is_final else directory_flag)
+            next_fd = os.open(component, flags, dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+        return current_fd
+    except BaseException:
+        os.close(current_fd)
+        raise
+
+
+def iter_repo_files(file_root: Path, root_fd: int | None = None) -> tuple[list[Path], bool]:
     files: list[Path] = []
-    file_root = file_root.resolve()
+    if root_fd is None:
+        file_root = file_root.resolve()
     directories = [file_root]
     truncated = False
     while directories:
@@ -308,12 +351,24 @@ def iter_repo_files(file_root: Path) -> tuple[list[Path], bool]:
                 if entry.is_dir(follow_symlinks=False):
                     directories.append(Path(entry.path))
                     continue
-                if not entry.is_file(follow_symlinks=True):
+                if not entry.is_file(follow_symlinks=root_fd is None):
                     continue
-                resolved = Path(entry.path).resolve()
-                resolved_relative = resolved.relative_to(file_root)
-                if is_ignored_file_parts(resolved_relative.parts):
-                    continue
+                if root_fd is not None:
+                    relative_path = Path(entry.path).relative_to(file_root)
+                    try:
+                        fd = open_relative_file(root_fd, relative_path.parts)
+                        try:
+                            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                                continue
+                        finally:
+                            os.close(fd)
+                    except OSError:
+                        continue
+                else:
+                    resolved = Path(entry.path).resolve()
+                    resolved_relative = resolved.relative_to(file_root)
+                    if is_ignored_file_parts(resolved_relative.parts):
+                        continue
             except (OSError, RuntimeError, ValueError):
                 continue
             if len(files) >= MAX_FILE_TREE_ENTRIES:
@@ -324,7 +379,7 @@ def iter_repo_files(file_root: Path) -> tuple[list[Path], bool]:
     return files, truncated
 
 
-def opened_file_is_safe(fd: int, target: Path, file_root: Path) -> bool:
+def opened_file_is_safe(fd: int, target: Path, file_root: Path, root_fd: int | None = None) -> bool:
     descriptor_stat = os.fstat(fd)
     if not stat.S_ISREG(descriptor_stat.st_mode):
         return False
@@ -340,16 +395,19 @@ def opened_file_is_safe(fd: int, target: Path, file_root: Path) -> bool:
 
     no_follow = getattr(os, "O_NOFOLLOW", 0)
     directory_flag = getattr(os, "O_DIRECTORY", 0)
-    root_fd: int | None = None
+    verification_root_fd: int | None = None
     current_fd: int | None = None
     try:
-        root_fd = os.open(file_root, os.O_RDONLY | no_follow | directory_flag)
-        current_fd = root_fd
+        if root_fd is None:
+            verification_root_fd = os.open(file_root, os.O_RDONLY | no_follow | directory_flag)
+        else:
+            verification_root_fd = os.dup(root_fd)
+        current_fd = verification_root_fd
         for index, component in enumerate(relative_target.parts):
             is_final = index == len(relative_target.parts) - 1
             flags = os.O_RDONLY | no_follow | (0 if is_final else directory_flag)
             next_fd = os.open(component, flags, dir_fd=current_fd)
-            if current_fd != root_fd:
+            if current_fd != verification_root_fd:
                 os.close(current_fd)
             current_fd = next_fd
         if current_fd is None:
@@ -362,10 +420,10 @@ def opened_file_is_safe(fd: int, target: Path, file_root: Path) -> bool:
     except (OSError, RuntimeError, ValueError):
         return False
     finally:
-        if current_fd is not None and current_fd != root_fd:
+        if current_fd is not None and current_fd != verification_root_fd:
             os.close(current_fd)
-        if root_fd is not None:
-            os.close(root_fd)
+        if verification_root_fd is not None:
+            os.close(verification_root_fd)
 
 
 def read_open_file(fd: int, limit: int) -> bytes:
@@ -908,54 +966,89 @@ def _registered_orchestrators(registry: dict) -> list[tuple[str, dict, bool]]:
     return entries
 
 
-def derive_workspaces() -> list[Workspace]:
-    """Derive the server-side workspace allowlist from live runtime state."""
-
-    workspaces: list[Workspace] = []
-    seen_roots: set[Path] = set()
+def _derive_workspace_candidates() -> list[WorkspaceCandidate]:
+    candidates: list[WorkspaceCandidate] = []
     seen_ids: set[str] = set()
 
-    def add_workspace(workspace_id: str, raw_root: object, live: bool) -> None:
+    def add_candidate(workspace_id: str, raw_root: object, live: bool) -> None:
         if not isinstance(raw_root, str) or not workspace_id or workspace_id in seen_ids:
             return
         try:
             root = Path(raw_root).expanduser().resolve()
-            if not root.is_dir() or root in seen_roots:
+            root_stat = root.stat()
+            if not stat.S_ISDIR(root_stat.st_mode):
                 return
         except (OSError, RuntimeError, TypeError, ValueError):
             return
-        seen_roots.add(root)
         seen_ids.add(workspace_id)
-        workspaces.append(Workspace(id=workspace_id, root=str(root), live=live))
+        candidates.append(
+            WorkspaceCandidate(
+                workspace=Workspace(id=workspace_id, root=str(root), live=live),
+                root=root,
+                device=root_stat.st_dev,
+                inode=root_stat.st_ino,
+            )
+        )
 
     own_root = FILES_ROOT.resolve()
-    add_workspace("wiki", str(own_root), True)
+    add_candidate("wiki", str(own_root), True)
     registry = _read_agent_registry()
-    headless_entries = [entry for _id, entry, headless in _registered_orchestrators(registry) if headless]
+    orchestrators = _registered_orchestrators(registry)
+    headless_entries = [entry for _id, entry, headless in orchestrators if headless]
     supervisor_alive = _supervisor_pid_is_alive() if headless_entries else False
     legacy_windows = {
         entry.get("window")
-        for _id, entry, headless in _registered_orchestrators(registry)
+        for _id, entry, headless in orchestrators
         if not headless and isinstance(entry.get("window"), str)
     }
     live_windows = tmux_live_windows() if legacy_windows else set()
-    for workspace_id, entry, headless in _registered_orchestrators(registry):
+    for workspace_id, entry, headless in orchestrators:
         cwd = entry.get("worktree") or entry.get("cwd")
         if headless:
             live = supervisor_alive and entry.get("control_attached") is True
         else:
             live = entry.get("window") in live_windows
-        add_workspace(workspace_id, cwd, live)
-    return workspaces
+        add_candidate(workspace_id, cwd, live)
+
+    candidates_by_root: dict[Path, list[WorkspaceCandidate]] = {}
+    for candidate in candidates:
+        candidates_by_root.setdefault(candidate.root, []).append(candidate)
+    return [
+        min(grouped, key=lambda candidate: (not candidate.workspace.live, candidate.workspace.id))
+        for grouped in candidates_by_root.values()
+    ]
 
 
-def resolve_workspace(workspace_id: str) -> tuple[Workspace, Path]:
+def derive_workspaces() -> list[Workspace]:
+    """Derive the server-side workspace allowlist from live runtime state."""
+
+    return [candidate.workspace for candidate in _derive_workspace_candidates()]
+
+
+def resolve_workspace(workspace_id: str) -> WorkspaceResolution:
     if not workspace_id or "/" in workspace_id or "\\" in workspace_id:
         raise HTTPException(status_code=404, detail="Unknown workspace")
-    workspace = next((item for item in derive_workspaces() if item.id == workspace_id), None)
-    if workspace is None or not workspace.live:
+    candidate = next(
+        (item for item in _derive_workspace_candidates() if item.workspace.id == workspace_id),
+        None,
+    )
+    if candidate is None or not candidate.workspace.live:
         raise HTTPException(status_code=404, detail=f"Workspace not found or inactive: {workspace_id}")
-    return workspace, Path(workspace.root)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        root_fd = os.open(candidate.root, flags)
+        root_stat = os.fstat(root_fd)
+        if not stat.S_ISDIR(root_stat.st_mode) or (root_stat.st_dev, root_stat.st_ino) != (
+            candidate.device,
+            candidate.inode,
+        ):
+            os.close(root_fd)
+            raise HTTPException(status_code=404, detail=f"Workspace changed while resolving: {workspace_id}")
+    except HTTPException:
+        raise
+    except OSError as exc:
+        raise HTTPException(status_code=404, detail=f"Workspace not found or inactive: {workspace_id}") from exc
+    return WorkspaceResolution(workspace=candidate.workspace, root=candidate.root, root_fd=root_fd)
 
 
 @app.get("/api/workspaces", response_model=WorkspaceList)
@@ -3265,21 +3358,30 @@ def list_notes(q: str | None = None) -> list[NoteSummary]:
 @app.get("/api/files/tree", response_model=FileTree)
 def list_files(workspace: str = "wiki") -> FileTree:
     summaries: list[FileSummary] = []
-    _workspace, file_root = resolve_workspace(workspace)
-    files, truncated = iter_repo_files(file_root)
-    file_root = file_root.resolve()
-    for path in files:
-        try:
-            stat_result = path.stat()
-        except OSError:
-            continue
-        summaries.append(
-            FileSummary(
-                path=path.relative_to(file_root).as_posix(),
-                size=stat_result.st_size,
-                updated_at=datetime.fromtimestamp(stat_result.st_mtime, tz=timezone.utc),
+    resolution = resolve_workspace(workspace)
+    try:
+        files, truncated = iter_repo_files(resolution.root, resolution.root_fd)
+        for path in files:
+            relative_path = path.relative_to(resolution.root)
+            try:
+                fd = open_relative_file(resolution.root_fd, relative_path.parts)
+                try:
+                    stat_result = os.fstat(fd)
+                finally:
+                    os.close(fd)
+            except OSError:
+                continue
+            if not stat.S_ISREG(stat_result.st_mode):
+                continue
+            summaries.append(
+                FileSummary(
+                    path=relative_path.as_posix(),
+                    size=stat_result.st_size,
+                    updated_at=datetime.fromtimestamp(stat_result.st_mtime, tz=timezone.utc),
+                )
             )
-        )
+    finally:
+        os.close(resolution.root_fd)
     return FileTree(files=summaries, truncated=truncated)
 
 
@@ -3288,17 +3390,19 @@ def get_file_content(
     path: str = Query(..., min_length=1),
     workspace: str = "wiki",
 ) -> FileContent:
-    _workspace, file_root = resolve_workspace(workspace)
-    target, relative_path = resolve_file_path(path, file_root)
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    resolution = resolve_workspace(workspace)
+    file_root = resolution.root
+    relative = validate_file_path(path)
+    relative_path = relative.as_posix()
+    target = file_root / Path(*relative.parts)
     try:
-        fd = os.open(target, flags)
+        fd = open_relative_file(resolution.root_fd, relative.parts)
     except OSError as exc:
+        os.close(resolution.root_fd)
         raise HTTPException(status_code=404, detail="File not found") from exc
 
     try:
-        file_root = file_root.resolve()
-        if not opened_file_is_safe(fd, target, file_root):
+        if not opened_file_is_safe(fd, target, file_root, resolution.root_fd):
             file_not_found()
         size = os.fstat(fd).st_size
         raw = read_open_file(fd, MAX_FILE_BYTES)
@@ -3316,6 +3420,7 @@ def get_file_content(
         raise HTTPException(status_code=404, detail="File not found")
     finally:
         os.close(fd)
+        os.close(resolution.root_fd)
     if b"\x00" in raw:
         return FileContent(path=relative_path, size=size, binary=True, error="binary file")
     try:

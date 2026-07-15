@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode, RefObject } from "react";
 import { Search, X } from "lucide-react";
 import { getFileContent, type FileContent } from "./api";
+import { normalizeFilePanePath, parseFilePanePath } from "./file-workspaces";
 import { languageForPath, highlightToHtml, useCurrentTheme } from "./shiki";
 
 function HighlightedLine({ line, needle }: { line: string; needle: string }) {
@@ -67,9 +68,9 @@ export function CodeFilePane({ path, scrollRef }: { path: string; scrollRef?: Re
   const [findOpen, setFindOpen] = useState(false);
   const [find, setFind] = useState("");
   const [highlighted, setHighlighted] = useState<string | null>(null);
-  const fileMatch = path.match(/^file:\/\/([^/]+)\/(.+)$/);
-  const workspace = fileMatch?.[1] ?? "wiki";
-  const relativePath = fileMatch?.[2] ?? path;
+  const fileRef = parseFilePanePath(normalizeFilePanePath(path));
+  const workspace = fileRef?.workspace ?? "wiki";
+  const relativePath = fileRef?.path ?? path;
 
   useEffect(() => {
     let ignore = false;

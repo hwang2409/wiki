@@ -77,10 +77,12 @@ export function listFiles(workspace = "wiki") {
   return request<FileTree>(`/api/files/tree?workspace=${encodeURIComponent(workspace)}`);
 }
 
+export function fileContentRequestPath(workspace: string, path: string) {
+  return `/api/files/content?workspace=${encodeURIComponent(workspace)}&path=${encodeURIComponent(path)}`;
+}
+
 export function getFileContent(workspace: string, path: string) {
-  return request<FileContent>(
-    `/api/files/content?workspace=${encodeURIComponent(workspace)}&path=${encodeURIComponent(path)}`
-  );
+  return request<FileContent>(fileContentRequestPath(workspace, path));
 }
 
 export function renameNote(path: string, newPath: string) {

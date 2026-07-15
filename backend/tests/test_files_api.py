@@ -59,6 +59,14 @@ class FilesApiTests(unittest.TestCase):
                     "control_attached": True,
                 }
             },
+            "a-dead": {
+                "current": {
+                    "role": "orchestrator",
+                    "cwd": str(self.other_repo),
+                    "run_id": "dead-run",
+                    "control_attached": False,
+                }
+            },
             "dead": {
                 "current": {
                     "role": "orchestrator",
@@ -98,11 +106,39 @@ class FilesApiTests(unittest.TestCase):
         ), mock.patch.object(main, "_supervisor_pid_is_alive", return_value=True):
             workspaces = main.list_workspaces().workspaces
 
-        self.assertEqual([workspace.id for workspace in workspaces], ["wiki", "dead", "misc"])
+        self.assertEqual([workspace.id for workspace in workspaces], ["wiki", "misc", "dead"])
         self.assertEqual(workspaces[0].root, str(self.repo))
         self.assertTrue(workspaces[0].live)
-        self.assertFalse(workspaces[1].live)
-        self.assertTrue(workspaces[2].live)
+        self.assertTrue(workspaces[1].live)
+        self.assertFalse(workspaces[2].live)
+
+    def test_live_workspace_wins_deduplication_over_inactive_same_root(self) -> None:
+        registry = {
+            "a-dead": {
+                "current": {
+                    "role": "orchestrator",
+                    "cwd": str(self.other_repo),
+                    "run_id": "dead-run",
+                    "control_attached": False,
+                }
+            },
+            "z-live": {
+                "current": {
+                    "role": "orchestrator",
+                    "cwd": str(self.other_repo),
+                    "run_id": "live-run",
+                    "control_attached": True,
+                }
+            },
+        }
+
+        with mock.patch.object(main, "FILES_ROOT", self.repo), mock.patch.object(
+            main, "_read_agent_registry", return_value=registry
+        ), mock.patch.object(main, "_supervisor_pid_is_alive", return_value=True):
+            workspaces = main.list_workspaces().workspaces
+
+        self.assertEqual([workspace.id for workspace in workspaces], ["wiki", "z-live"])
+        self.assertTrue(workspaces[-1].live)
 
     def test_workspace_file_endpoints_use_the_selected_root_and_default_to_wiki(self) -> None:
         registry = {
@@ -192,6 +228,39 @@ class FilesApiTests(unittest.TestCase):
 
         listed_paths = {entry.path for entry in tree.files}
         self.assertEqual(listed_paths, {"nested/app.py", "src/other.py"})
+
+    def test_content_uses_pinned_root_when_path_is_replaced_after_resolution(self) -> None:
+        original_root = self.other_repo
+        outside = self.repo / "outside-root"
+        outside.mkdir()
+        (outside / "secret.txt").write_text("outside", encoding="utf-8")
+        (original_root / "secret.txt").write_text("inside", encoding="utf-8")
+        registry = {
+            "misc": {
+                "current": {
+                    "role": "orchestrator",
+                    "cwd": str(original_root),
+                    "run_id": "misc-run",
+                    "control_attached": True,
+                }
+            }
+        }
+
+        with mock.patch.object(main, "FILES_ROOT", self.repo), mock.patch.object(
+            main, "_read_agent_registry", return_value=registry
+        ), mock.patch.object(main, "_supervisor_pid_is_alive", return_value=True):
+            resolution = main.resolve_workspace("misc")
+            moved_root = original_root.with_name(f"{original_root.name}-moved")
+            original_root.rename(moved_root)
+            original_root.symlink_to(outside, target_is_directory=True)
+            try:
+                with mock.patch.object(main, "resolve_workspace", return_value=resolution):
+                    result = main.get_file_content("secret.txt", "misc")
+            finally:
+                original_root.unlink()
+                moved_root.rename(original_root)
+
+        self.assertEqual(result.content, "inside")
 
     def test_tree_prunes_excluded_directories_before_descending(self) -> None:
         (self.repo / ".git").mkdir()
