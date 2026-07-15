@@ -28,6 +28,8 @@ In Progress:
 - [P2] [PHO-13669](https://linear.app/phoebework/issue/PHO-13669): Core email/account-book gaps — cdx:PHO-13669 (gpt-5.6-terra)
 - PHO-13763 per-org scratchpad (worker cdx:PHO-13763, run bd90b506)
 - [P2] PHO-13804 admin agent full Intercom messages: Core getConversation(parts) + admin-agent endpoint + audit-scoped tool, live-fetch only (PII), spill-cap output
+- [P1] WIKI-127: multi-workspace file browsing — GET /api/workspaces (orchestrator-derived allowlist + self), workspace param on file APIs w/ per-root containment, sidebar switcher, (workspace,relpath) pane paths + recents v2. Design: vault/tools/wiki-workspaces-design.md
+- [P2] WIKI-128: code-viewer density — root-cause prose-style leak into shiki .line blocks (renders ~2.3x despite declared 1.55), set ~1.4 line-height, tighter gutter/padding on code-file-* surfaces
 
 Backlog:
 
