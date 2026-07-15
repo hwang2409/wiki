@@ -190,11 +190,14 @@ function scoreNote(note: NoteSummary, query: string): number | null {
   const title = note.title.toLowerCase();
 
   const titleScore = matchScore(title, query);
-  if (titleScore !== null) return titleScore;
   const nameScore = scorePath(name, query);
-  if (nameScore !== null) return 10 + nameScore;
   const pathScore = scorePath(path, query);
-  return pathScore === null ? null : 20 + pathScore;
+  const scores = [
+    titleScore,
+    nameScore === null ? null : 10 + nameScore,
+    pathScore === null ? null : 20 + pathScore,
+  ].filter((score): score is number => score !== null);
+  return scores.length > 0 ? Math.min(...scores) : null;
 }
 
 function scoreSession(session: QuickSwitcherSession, query: string): number | null {
@@ -258,6 +261,7 @@ function sessionMeta(session: QuickSwitcherSession) {
 export function QuickSwitcher({
   notes,
   files,
+  filesLoading,
   recent,
   sessions,
   onClose,
@@ -269,6 +273,7 @@ export function QuickSwitcher({
 }: {
   notes: NoteSummary[];
   files: QuickSwitcherFile[];
+  filesLoading: boolean;
   recent: RecentSwitcherItem[];
   sessions: QuickSwitcherSession[];
   onClose: () => void;
@@ -407,6 +412,7 @@ export function QuickSwitcher({
           onKeyDown={handleKeyDown}
         />
         <div className="quick-switcher-results">
+          {filesLoading ? <div className="quick-switcher-loading">Loading files…</div> : null}
           {results.length > 0 ? (
             groups.map((group) => (
               <div className="quick-switcher-group" key={group.label}>
@@ -467,7 +473,7 @@ export function QuickSwitcher({
                 })}
               </div>
             ))
-          ) : (
+          ) : filesLoading ? null : (
             <div className="quick-switcher-empty">No matches</div>
           )}
         </div>

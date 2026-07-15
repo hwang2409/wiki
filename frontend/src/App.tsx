@@ -1277,6 +1277,8 @@ export default function App() {
   const [notesLoaded, setNotesLoaded] = useState(false);
   const [files, setFiles] = useState<FileSummary[]>([]);
   const [filesLoaded, setFilesLoaded] = useState(false);
+  const [filesLoading, setFilesLoading] = useState(false);
+  const [filesLoadAttempted, setFilesLoadAttempted] = useState(false);
   const [filesTruncated, setFilesTruncated] = useState(false);
   const [showAllFiles, setShowAllFiles] = useState(
     () => localStorage.getItem("wiki-show-all-files") === "true"
@@ -1518,33 +1520,22 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!showAllFiles) {
-      setFiles([]);
-      setFilesTruncated(false);
-      setFilesLoaded(false);
-      return;
-    }
-    let ignore = false;
-    setFilesLoaded(false);
+    if ((!showAllFiles && !switcherOpen) || filesLoadAttempted || filesLoading) return;
+    setFilesLoadAttempted(true);
+    setFilesLoading(true);
     listFiles()
       .then((nextTree) => {
-        if (!ignore) {
-          setFiles(nextTree.files);
-          setFilesTruncated(nextTree.truncated);
-          setFilesLoaded(true);
-        }
+        setFiles(nextTree.files);
+        setFilesTruncated(nextTree.truncated);
+        setFilesLoaded(true);
       })
       .catch(() => {
-        if (!ignore) {
-          setFiles([]);
-          setFilesTruncated(false);
-          setFilesLoaded(false);
-        }
-      });
-    return () => {
-      ignore = true;
-    };
-  }, [refreshTick, showAllFiles]);
+        setFiles([]);
+        setFilesTruncated(false);
+        setFilesLoaded(false);
+      })
+      .finally(() => setFilesLoading(false));
+  }, [showAllFiles, switcherOpen]);
 
   useEffect(() => {
     for (const window of windowState.windows) {
@@ -1605,7 +1596,7 @@ export default function App() {
   );
   const visibleRecentResources = useMemo(() => {
     const notePaths = notesLoaded ? new Set(notes.map((note) => note.path)) : null;
-    const filePaths = showAllFiles && filesLoaded ? new Set(files.map((file) => file.path)) : null;
+    const filePaths = filesLoaded ? new Set(files.map((file) => file.path)) : null;
     return recentResources.filter((item) => {
       if (item.kind === "note") return notePaths === null || notePaths.has(item.path);
       return filePaths === null || filePaths.has(item.path);
@@ -2047,8 +2038,7 @@ export default function App() {
         return;
       }
       try {
-        const result = await getFileContent(item.path);
-        if (result.error) throw new Error(result.error);
+        await getFileContent(item.path);
       } catch {
         forgetRecentResource("file", item.path);
         return;
@@ -3790,9 +3780,10 @@ export default function App() {
       ) : null}
       {switcherOpen ? (
         <QuickSwitcher
-          files={showAllFiles ? files : []}
+          files={files}
+          filesLoading={filesLoading}
           notes={notes}
-          recent={recentResources}
+          recent={visibleRecentResources}
           sessions={quickSwitcherSessions}
           onClose={() => {
             setSwitcherOpen(false);
