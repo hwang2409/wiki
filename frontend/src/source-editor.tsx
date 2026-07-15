@@ -1,9 +1,10 @@
+import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import { markdown } from "@codemirror/lang-markdown";
 import { languages } from "@codemirror/language-data";
 import { HighlightStyle, syntaxHighlighting } from "@codemirror/language";
 import { Annotation, EditorState } from "@codemirror/state";
 import { tags } from "@lezer/highlight";
-import { EditorView } from "@codemirror/view";
+import { EditorView, keymap } from "@codemirror/view";
 import { useEffect, useRef, type Dispatch, type SetStateAction } from "react";
 import type { NoteDraft } from "./types";
 
@@ -13,6 +14,14 @@ export type SourceEditorHandoff = {
   anchor: number;
   focused: boolean;
   head: number;
+  notePath: string;
+  selectionDirection: "backward" | "forward" | "none";
+};
+
+type LiveEditor = {
+  active: boolean;
+  notePath: string;
+  view: EditorView | null;
 };
 
 const sourceEditorTheme = EditorView.theme({
@@ -68,28 +77,54 @@ const sourceEditorHighlighting = syntaxHighlighting(
 export default function MarkdownSourceEditor({
   content,
   handoffRef,
+  notePath,
   setDraft,
 }: {
   content: string;
   handoffRef: { current: SourceEditorHandoff | null };
+  notePath: string;
   setDraft: Dispatch<SetStateAction<NoteDraft>>;
 }) {
   const editorParentRef = useRef<HTMLDivElement | null>(null);
   const editorViewRef = useRef<EditorView | null>(null);
+  const liveEditorRef = useRef<LiveEditor | null>(null);
+  const mountedRef = useRef(false);
+  const currentContentRef = useRef(content);
+  const currentNotePathRef = useRef(notePath);
+  currentContentRef.current = content;
+  currentNotePathRef.current = notePath;
   const setDraftRef = useRef(setDraft);
   setDraftRef.current = setDraft;
 
   useEffect(() => {
     const parent = editorParentRef.current;
     if (!parent) return;
+    mountedRef.current = true;
 
-    const view = new EditorView({
+    let view: EditorView | null = null;
+    const liveEditor: LiveEditor = {
+      active: true,
+      notePath,
+      view: null as EditorView | null,
+    };
+    const isLiveView = () =>
+      mountedRef.current &&
+      liveEditor.active &&
+      liveEditor.view === view &&
+      view !== null &&
+      editorViewRef.current === view &&
+      liveEditorRef.current === liveEditor;
+    const isLiveCurrentNote = () => isLiveView() && liveEditor.notePath === currentNotePathRef.current;
+
+    view = new EditorView({
       parent,
       state: EditorState.create({
         doc: content,
         extensions: [
           markdown({ codeLanguages: languages, pasteURLAsLink: false }),
           EditorView.lineWrapping,
+          history(),
+          keymap.of([...defaultKeymap, ...historyKeymap]),
           sourceEditorHighlighting,
           sourceEditorTheme,
           EditorView.contentAttributes.of({
@@ -99,6 +134,7 @@ export default function MarkdownSourceEditor({
           EditorView.updateListener.of((update) => {
             if (
               !update.docChanged ||
+              !isLiveCurrentNote() ||
               update.transactions.some((transaction) => transaction.annotation(externalDocUpdate))
             ) {
               return;
@@ -111,35 +147,56 @@ export default function MarkdownSourceEditor({
         ],
       }),
     });
+    liveEditor.view = view;
     editorViewRef.current = view;
+    liveEditorRef.current = liveEditor;
 
     const handoff = handoffRef.current;
-    if (handoff?.focused) {
+    if (isLiveView() && handoff?.focused && handoff.notePath === notePath) {
       const clamp = (offset: number) => Math.max(0, Math.min(offset, view.state.doc.length));
-      view.dispatch({
-        selection: {
-          anchor: clamp(handoff.anchor),
-          head: clamp(handoff.head),
-        },
-      });
-      view.focus();
+      const start = clamp(handoff.anchor);
+      const end = clamp(handoff.head);
+      const selection =
+        handoff.selectionDirection === "backward"
+          ? { anchor: end, head: start }
+          : { anchor: start, head: end };
+      if (isLiveView()) view.dispatch({ selection });
+      if (isLiveView()) view.focus();
     }
     handoffRef.current = null;
 
     return () => {
-      editorViewRef.current = null;
+      mountedRef.current = false;
+      liveEditor.active = false;
+      if (liveEditorRef.current === liveEditor) liveEditorRef.current = null;
+      if (editorViewRef.current === view) editorViewRef.current = null;
       view.destroy();
     };
   }, []);
 
   useEffect(() => {
     const view = editorViewRef.current;
-    if (!view || view.state.doc.toString() === content) return;
-    view.dispatch({
-      annotations: externalDocUpdate.of(true),
-      changes: { from: 0, insert: content, to: view.state.doc.length },
-    });
-  }, [content]);
+    const liveEditor = liveEditorRef.current;
+    if (
+      !view ||
+      !liveEditor ||
+      !mountedRef.current ||
+      !liveEditor.active ||
+      liveEditor.view !== view ||
+      currentNotePathRef.current !== notePath ||
+      currentContentRef.current !== content
+    ) {
+      return;
+    }
+    if (liveEditor.notePath !== notePath || view.state.doc.toString() !== content) {
+      view.dispatch({
+        annotations: externalDocUpdate.of(true),
+        changes: { from: 0, insert: content, to: view.state.doc.length },
+      });
+      if (!mountedRef.current || !liveEditor.active || liveEditorRef.current !== liveEditor) return;
+      liveEditor.notePath = notePath;
+    }
+  }, [content, notePath]);
 
   return <div className="source-editor" ref={editorParentRef} />;
 }

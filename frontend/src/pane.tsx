@@ -41,13 +41,17 @@ function sameNote(left: Note | null, right: Note | null) {
 function PlainSourceEditor({
   content,
   handoffRef,
+  notePath,
   setDraft,
 }: {
   content: string;
   handoffRef: { current: SourceEditorHandoff | null };
+  notePath: string;
   setDraft: Dispatch<SetStateAction<NoteDraft>>;
 }) {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const notePathRef = useRef(notePath);
+  notePathRef.current = notePath;
 
   useLayoutEffect(() => {
     return () => {
@@ -60,6 +64,13 @@ function PlainSourceEditor({
         anchor: textarea.selectionStart,
         focused: true,
         head: textarea.selectionEnd,
+        notePath: notePathRef.current,
+        selectionDirection:
+          textarea.selectionDirection === "backward"
+            ? "backward"
+            : textarea.selectionDirection === "forward"
+              ? "forward"
+              : "none",
       };
     };
   }, [handoffRef]);
@@ -79,9 +90,11 @@ function PlainSourceEditor({
 
 function NoteSourceEditor({
   content,
+  notePath,
   setDraft,
 }: {
   content: string;
+  notePath: string;
   setDraft: Dispatch<SetStateAction<NoteDraft>>;
 }) {
   const handoffRef = useRef<SourceEditorHandoff | null>(null);
@@ -89,10 +102,20 @@ function NoteSourceEditor({
   return (
     <Suspense
       fallback={
-        <PlainSourceEditor content={content} handoffRef={handoffRef} setDraft={setDraft} />
+        <PlainSourceEditor
+          content={content}
+          handoffRef={handoffRef}
+          notePath={notePath}
+          setDraft={setDraft}
+        />
       }
     >
-      <MarkdownSourceEditor content={content} handoffRef={handoffRef} setDraft={setDraft} />
+      <MarkdownSourceEditor
+        content={content}
+        handoffRef={handoffRef}
+        notePath={notePath}
+        setDraft={setDraft}
+      />
     </Suspense>
   );
 }
@@ -375,6 +398,7 @@ function NotePane({
               <h1 className="inline-title">{focusState.draft.title}</h1>
               <NoteSourceEditor
                 content={focusState.draft.content}
+                notePath={path}
                 setDraft={focusState.setDraft}
               />
             </div>
