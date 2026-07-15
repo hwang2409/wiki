@@ -17,6 +17,7 @@ Todo:
 - [P2] PHO-13763 PARKED by Henry 2026-07-15: PR 11383 drafted at 909ef288ce, gate-passed (CI green, 0 threads, sol REVIEW4 merge-ready), worker archived — resume = un-draft, re-verify freshness vs main, merge
 - [P1] amd-shadow migration: KORGAN owns (Henry 2026-07-15). PR 11416 closed w/ handoff evidence comment. Prod: invalid 0-byte index, no schema_migrations row; correct fix = NEW migration w/ SET timeout + DROP CONCURRENTLY first. Watch next prod deploy
 - [P3] WIKI-126: surface rebrand — rename app-facing identity only (app display name, window title, README header); NAME NOT YET CHOSEN by Henry, blocked until he picks. Internal identifiers stay (repo, wiki CLI, WIKI-* tickets, MCP names, vault paths — codename doctrine, Henry 2026-07-15)
+- [P2] WIKI-129: make native-build while Wiki.app running breaks live supervisor — bundle swap clobbers running sidecar's _internal (ENOENT on supervisor channel, respawn blocked by stale supervisor.lock, worker spawn/replace dead until app relaunch; hit 2026-07-15 eve). Fix: build to staging dir + atomic swap on app quit, or preflight check refusing rebuild while app runs
 
 In Progress:
 
