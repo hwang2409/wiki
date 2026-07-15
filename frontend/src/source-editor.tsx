@@ -10,15 +10,6 @@ import type { NoteDraft } from "./types";
 
 const externalDocUpdate = Annotation.define<boolean>();
 
-export type SourceEditorHandoff = {
-  anchor: number;
-  content: string;
-  focused: boolean;
-  head: number;
-  notePath: string;
-  selectionDirection: "backward" | "forward" | "none";
-};
-
 type LiveEditor = {
   active: boolean;
   notePath: string;
@@ -77,12 +68,12 @@ const sourceEditorHighlighting = syntaxHighlighting(
 
 export default function MarkdownSourceEditor({
   content,
-  handoffRef,
+  focused,
   notePath,
   setDraft,
 }: {
   content: string;
-  handoffRef: { current: SourceEditorHandoff | null };
+  focused: boolean;
   notePath: string;
   setDraft: Dispatch<SetStateAction<NoteDraft>>;
 }) {
@@ -96,10 +87,34 @@ export default function MarkdownSourceEditor({
   currentNotePathRef.current = notePath;
   const setDraftRef = useRef(setDraft);
   setDraftRef.current = setDraft;
+  const cleanupTokenRef = useRef<object | null>(null);
 
   useEffect(() => {
     const parent = editorParentRef.current;
     if (!parent) return;
+
+    if (editorViewRef.current && liveEditorRef.current) {
+      cleanupTokenRef.current = null;
+      mountedRef.current = true;
+      liveEditorRef.current.active = true;
+      return () => {
+        const liveEditor = liveEditorRef.current;
+        const view = editorViewRef.current;
+        if (!liveEditor || !view) return;
+        mountedRef.current = false;
+        liveEditor.active = false;
+        const cleanupToken = {};
+        cleanupTokenRef.current = cleanupToken;
+        queueMicrotask(() => {
+          if (cleanupTokenRef.current !== cleanupToken) return;
+          cleanupTokenRef.current = null;
+          if (liveEditorRef.current === liveEditor) liveEditorRef.current = null;
+          if (editorViewRef.current === view) editorViewRef.current = null;
+          view.destroy();
+        });
+      };
+    }
+
     mountedRef.current = true;
 
     let view: EditorView | null = null;
@@ -116,14 +131,10 @@ export default function MarkdownSourceEditor({
       editorViewRef.current === view &&
       liveEditorRef.current === liveEditor;
     const isLiveCurrentNote = () => isLiveView() && liveEditor.notePath === currentNotePathRef.current;
-    const handoff = handoffRef.current;
-    const canRestoreHandoff = handoff?.focused === true && handoff.notePath === notePath;
-    const initialContent = canRestoreHandoff ? handoff.content : content;
-
     view = new EditorView({
       parent,
       state: EditorState.create({
-        doc: initialContent,
+        doc: content,
         extensions: [
           markdown({ codeLanguages: languages, pasteURLAsLink: false }),
           EditorView.lineWrapping,
@@ -155,35 +166,22 @@ export default function MarkdownSourceEditor({
     editorViewRef.current = view;
     liveEditorRef.current = liveEditor;
 
-    if (isLiveCurrentNote() && canRestoreHandoff && initialContent !== content) {
-      view.dispatch({
-        annotations: [
-          Transaction.addToHistory.of(true),
-          Transaction.userEvent.of("input"),
-        ],
-        changes: { from: 0, insert: content, to: view.state.doc.length },
-      });
+    if (focused && isLiveCurrentNote() && isLiveView()) {
+      view.focus();
     }
-
-    if (isLiveView() && canRestoreHandoff) {
-      const clamp = (offset: number) => Math.max(0, Math.min(offset, view.state.doc.length));
-      const start = clamp(handoff.anchor);
-      const end = clamp(handoff.head);
-      const selection =
-        handoff.selectionDirection === "backward"
-          ? { anchor: end, head: start }
-          : { anchor: start, head: end };
-      if (isLiveView()) view.dispatch({ selection });
-      if (isLiveView()) view.focus();
-    }
-    handoffRef.current = null;
 
     return () => {
       mountedRef.current = false;
       liveEditor.active = false;
-      if (liveEditorRef.current === liveEditor) liveEditorRef.current = null;
-      if (editorViewRef.current === view) editorViewRef.current = null;
-      view.destroy();
+      const cleanupToken = {};
+      cleanupTokenRef.current = cleanupToken;
+      queueMicrotask(() => {
+        if (cleanupTokenRef.current !== cleanupToken) return;
+        cleanupTokenRef.current = null;
+        if (liveEditorRef.current === liveEditor) liveEditorRef.current = null;
+        if (editorViewRef.current === view) editorViewRef.current = null;
+        view?.destroy();
+      });
     };
   }, []);
 

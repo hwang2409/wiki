@@ -2588,6 +2588,37 @@ body.is-resizing-panes .pane-cell {
   outline: none;
 }
 
+.source-editor-placeholder {
+  position: relative;
+  flex: 1;
+  width: 100%;
+  min-height: 60vh;
+  overflow: auto;
+  background-color: var(--background-primary);
+  color: var(--text-normal);
+  font-family: var(--font-text);
+  font-weight: var(--font-text-weight);
+  font-size: var(--font-text-size);
+  line-height: 1.6;
+}
+
+.source-editor-placeholder-content {
+  min-height: 60vh;
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: inherit;
+}
+
+.source-editor-placeholder-status {
+  position: absolute;
+  top: 0;
+  right: 0;
+  padding: 0.15rem 0.4rem;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
 /* ------------------------------------------------------------------ */
 /* Markdown preview (Obsidian reading view)                            */
 /* ------------------------------------------------------------------ */

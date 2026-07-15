@@ -2,8 +2,6 @@ import {
   lazy,
   Suspense,
   useEffect,
-  useLayoutEffect,
-  useRef,
   useState,
   type Dispatch,
   type ReactNode,
@@ -21,7 +19,6 @@ import { LoadingPlaceholder } from "./loading";
 import { KanbanBoard, appendDoneEntry, type KanbanCard } from "./kanban";
 import { ObsidianMarkdown, splitFrontmatter, stripLeadingTitle } from "./markdown";
 import { TerminalPane, type TerminalPaneController } from "./terminal-pane";
-import type { SourceEditorHandoff } from "./source-editor";
 import type { Note, NoteDraft, NoteSummary } from "./types";
 
 const MarkdownSourceEditor = lazy(() => import("./source-editor"));
@@ -38,91 +35,31 @@ function sameNote(left: Note | null, right: Note | null) {
   );
 }
 
-function PlainSourceEditor({
-  content,
-  entryContent,
-  handoffRef,
-  notePath,
-  setDraft,
-}: {
-  content: string;
-  entryContent: string;
-  handoffRef: { current: SourceEditorHandoff | null };
-  notePath: string;
-  setDraft: Dispatch<SetStateAction<NoteDraft>>;
-}) {
-  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
-  const entryContentRef = useRef(entryContent);
-  const notePathRef = useRef(notePath);
-  entryContentRef.current = entryContent;
-  notePathRef.current = notePath;
-
-  useLayoutEffect(() => {
-    return () => {
-      const textarea = textareaRef.current;
-      if (!textarea || document.activeElement !== textarea) {
-        handoffRef.current = null;
-        return;
-      }
-      handoffRef.current = {
-        anchor: textarea.selectionStart,
-        content: entryContentRef.current,
-        focused: true,
-        head: textarea.selectionEnd,
-        notePath: notePathRef.current,
-        selectionDirection:
-          textarea.selectionDirection === "backward"
-            ? "backward"
-            : textarea.selectionDirection === "forward"
-              ? "forward"
-              : "none",
-      };
-    };
-  }, [handoffRef]);
-
+function SourceEditorPlaceholder({ content }: { content: string }) {
   return (
-    <textarea
-      className="source-editor"
-      ref={textareaRef}
-      spellCheck="true"
-      value={content}
-      onChange={(event) =>
-        setDraft((current) => ({ ...current, content: event.target.value }))
-      }
-    />
+    <div className="source-editor-placeholder" aria-busy="true" aria-label="Loading source editor">
+      <pre className="source-editor-placeholder-content">{content || "\u00a0"}</pre>
+      <span className="source-editor-placeholder-status">Loading editor</span>
+    </div>
   );
 }
 
 function NoteSourceEditor({
   content,
+  focused,
   notePath,
   setDraft,
 }: {
   content: string;
+  focused: boolean;
   notePath: string;
   setDraft: Dispatch<SetStateAction<NoteDraft>>;
 }) {
-  const handoffRef = useRef<SourceEditorHandoff | null>(null);
-  const entrySnapshotRef = useRef({ content, notePath });
-  if (entrySnapshotRef.current.notePath !== notePath) {
-    entrySnapshotRef.current = { content, notePath };
-  }
-
   return (
-    <Suspense
-      fallback={
-        <PlainSourceEditor
-          content={content}
-          entryContent={entrySnapshotRef.current.content}
-          handoffRef={handoffRef}
-          notePath={notePath}
-          setDraft={setDraft}
-        />
-      }
-    >
+    <Suspense fallback={<SourceEditorPlaceholder content={content} />}>
       <MarkdownSourceEditor
         content={content}
-        handoffRef={handoffRef}
+        focused={focused}
         notePath={notePath}
         setDraft={setDraft}
       />
@@ -218,6 +155,7 @@ export function WorkspacePane({
   } else {
     content = (
       <NotePane
+        focused={focused}
         focusState={noteFocusState}
         notes={notes}
         onOpenNote={onOpenNote}
@@ -287,6 +225,7 @@ function AgentPane({
 }
 
 function NotePane({
+  focused,
   focusState,
   notes,
   onOpenNote,
@@ -294,6 +233,7 @@ function NotePane({
   refreshTick,
   scrollRef,
 }: {
+  focused: boolean;
   focusState: PaneNoteFocusState;
   notes: NoteSummary[];
   onOpenNote: (path: string) => void;
@@ -408,6 +348,7 @@ function NotePane({
               <h1 className="inline-title">{focusState.draft.title}</h1>
               <NoteSourceEditor
                 content={focusState.draft.content}
+                focused={focused}
                 notePath={path}
                 setDraft={focusState.setDraft}
               />
