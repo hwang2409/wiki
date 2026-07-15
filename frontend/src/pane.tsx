@@ -1,4 +1,6 @@
 import {
+  lazy,
+  Suspense,
   useEffect,
   useState,
   type Dispatch,
@@ -19,6 +21,8 @@ import { ObsidianMarkdown, splitFrontmatter, stripLeadingTitle } from "./markdow
 import { TerminalPane, type TerminalPaneController } from "./terminal-pane";
 import type { Note, NoteDraft, NoteSummary } from "./types";
 
+const MarkdownSourceEditor = lazy(() => import("./source-editor"));
+
 function basename(path: string) {
   return path.split("/").pop()?.replace(/\.md$/, "") ?? path;
 }
@@ -28,6 +32,38 @@ function sameNote(left: Note | null, right: Note | null) {
     left?.path === right?.path &&
     left?.updated_at === right?.updated_at &&
     left?.content === right?.content
+  );
+}
+
+function SourceEditorPlaceholder({ content }: { content: string }) {
+  return (
+    <div className="source-editor-placeholder" aria-busy="true" aria-label="Loading source editor">
+      <pre className="source-editor-placeholder-content">{content || "\u00a0"}</pre>
+      <span className="source-editor-placeholder-status">Loading editor</span>
+    </div>
+  );
+}
+
+function NoteSourceEditor({
+  content,
+  focused,
+  notePath,
+  setDraft,
+}: {
+  content: string;
+  focused: boolean;
+  notePath: string;
+  setDraft: Dispatch<SetStateAction<NoteDraft>>;
+}) {
+  return (
+    <Suspense fallback={<SourceEditorPlaceholder content={content} />}>
+      <MarkdownSourceEditor
+        content={content}
+        focused={focused}
+        notePath={notePath}
+        setDraft={setDraft}
+      />
+    </Suspense>
   );
 }
 
@@ -119,6 +155,7 @@ export function WorkspacePane({
   } else {
     content = (
       <NotePane
+        focused={focused}
         focusState={noteFocusState}
         notes={notes}
         onOpenNote={onOpenNote}
@@ -188,6 +225,7 @@ function AgentPane({
 }
 
 function NotePane({
+  focused,
   focusState,
   notes,
   onOpenNote,
@@ -195,6 +233,7 @@ function NotePane({
   refreshTick,
   scrollRef,
 }: {
+  focused: boolean;
   focusState: PaneNoteFocusState;
   notes: NoteSummary[];
   onOpenNote: (path: string) => void;
@@ -307,13 +346,11 @@ function NotePane({
           <div className="markdown-source-view">
             <div className="markdown-sizer">
               <h1 className="inline-title">{focusState.draft.title}</h1>
-              <textarea
-                className="source-editor"
-                spellCheck="true"
-                value={focusState.draft.content}
-                onChange={(event) =>
-                  focusState.setDraft((current) => ({ ...current, content: event.target.value }))
-                }
+              <NoteSourceEditor
+                content={focusState.draft.content}
+                focused={focused}
+                notePath={path}
+                setDraft={focusState.setDraft}
               />
             </div>
           </div>

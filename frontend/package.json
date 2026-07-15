@@ -17,6 +17,12 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@codemirror/commands": "^6.10.4",
+    "@codemirror/lang-markdown": "^6.5.1",
+    "@codemirror/language": "^6.12.4",
+    "@codemirror/language-data": "^6.5.2",
+    "@codemirror/state": "^6.7.1",
+    "@codemirror/view": "^6.43.6",
     "@fontsource/fira-code": "^5.2.7",
     "@fontsource/geist-mono": "^5.2.8",
     "@fontsource/ibm-plex-mono": "^5.2.7",
@@ -30,6 +36,7 @@
     "@fontsource/source-serif-4": "^5.2.9",
     "@fontsource/space-mono": "^5.2.9",
     "@fontsource/victor-mono": "^5.2.8",
+    "@lezer/highlight": "^1.2.3",
     "@tauri-apps/plugin-opener": "^2.5.4",
     "@vitejs/plugin-react": "^5.1.1",
     "@xterm/addon-fit": "^0.11.0",
