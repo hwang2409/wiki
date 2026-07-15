@@ -83,6 +83,15 @@ def start_parent_watchdog(server: uvicorn.Server, parent_pid: int | None) -> Non
 
 
 def main() -> None:
+    # Frozen terminal sessions re-exec this binary with --terminal-child;
+    # dispatch before the backend argument parser sees the child arguments.
+    if "--terminal-child" in sys.argv[1:]:
+        flag_index = sys.argv.index("--terminal-child")
+        sys.argv = [sys.argv[0], *sys.argv[flag_index + 1 :]]
+        from backend.app.terminal_child import main as terminal_child_main
+
+        terminal_child_main()
+        return
     if "--wiki-artifacts-mcp" in sys.argv[1:]:
         from backend.app.wiki_artifacts import main as artifacts_main
 

@@ -1,11 +1,14 @@
 import { FitAddon } from "@xterm/addon-fit";
+import { SearchAddon, type ISearchResultChangeEvent } from "@xterm/addon-search";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
 import type { IDisposable } from "@xterm/xterm";
 import { deriveTerminalTheme, type DerivedTerminalTheme } from "./terminal-theme";
+import { terminalInputFrame } from "./terminal-transport";
 
 export type TerminalStatus = "connecting" | "live" | "ended" | "error";
 export type TerminalRenderer = "webgl" | "dom";
+export type TerminalSearchResults = ISearchResultChangeEvent;
 
 type TerminalSnapshot = {
   message: string;
@@ -19,7 +22,9 @@ declare global {
     __wikiTerminals?: Record<
       string,
       {
+        binaryInputSupported: () => boolean;
         renderer: () => TerminalRenderer;
+        sendInput: (data: string) => void;
         socketReadyState: () => number;
         status: () => TerminalStatus;
         terminal: Terminal;
@@ -79,13 +84,18 @@ class TerminalRuntime {
   private readonly terminalId: string;
   private readonly terminal: Terminal;
   private readonly fitAddon: FitAddon;
+  private readonly searchAddon: SearchAddon;
   private readonly shellRoot: HTMLDivElement;
+  private readonly encoder = new TextEncoder();
   private readonly listeners = new Set<() => void>();
+  private readonly searchListeners = new Set<(results: TerminalSearchResults) => void>();
   private readonly themeObserver: MutationObserver;
   private readonly dataDisposable: IDisposable;
+  private readonly searchResultsDisposable: IDisposable;
   private rendererDisposable: IDisposable | null = null;
   private webglAddon: WebglAddon | null = null;
   private socket: WebSocket | null = null;
+  private binaryInputSupported = false;
   private resizeObserver: ResizeObserver | null = null;
   private attachedHost: HTMLDivElement | null = null;
   private resizeTimer: number | null = null;
@@ -109,6 +119,7 @@ class TerminalRuntime {
     this.shellRoot.style.width = "1px";
 
     this.terminal = new Terminal({
+      allowProposedApi: true,
       allowTransparency: false,
       convertEol: false,
       cursorBlink: false,
@@ -122,13 +133,18 @@ class TerminalRuntime {
       theme: this.snapshot.theme.renderer,
     });
     this.fitAddon = new FitAddon();
+    this.searchAddon = new SearchAddon();
     this.terminal.loadAddon(this.fitAddon);
     this.terminal.open(this.shellRoot);
+    this.terminal.loadAddon(this.searchAddon);
     this.terminal.textarea?.setAttribute("data-terminal-input", "true");
     this.terminal.textarea?.setAttribute("data-terminal-id", terminalId);
     this.installRenderer();
     this.dataDisposable = this.terminal.onData((data) => {
       this.sendInput(data);
+    });
+    this.searchResultsDisposable = this.searchAddon.onDidChangeResults((results) => {
+      this.searchListeners.forEach((listener) => listener(results));
     });
     this.themeObserver = new MutationObserver(() => {
       this.applyTheme();
@@ -141,7 +157,9 @@ class TerminalRuntime {
     getParkingLot().appendChild(this.shellRoot);
     window.__wikiTerminals = window.__wikiTerminals ?? {};
     window.__wikiTerminals[terminalId] = {
+      binaryInputSupported: () => this.binaryInputSupported,
       renderer: () => this.snapshot.renderer,
+      sendInput: (data: string) => this.sendInput(data),
       socketReadyState: () => this.socket?.readyState ?? -1,
       status: () => this.snapshot.status,
       terminal: this.terminal,
@@ -155,6 +173,38 @@ class TerminalRuntime {
   subscribe(listener: () => void) {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  }
+
+  onSearchResults(listener: (results: TerminalSearchResults) => void) {
+    this.searchListeners.add(listener);
+    return () => this.searchListeners.delete(listener);
+  }
+
+  search(term: string, direction: "next" | "previous" = "next") {
+    if (!term) {
+      this.clearSearch();
+      return false;
+    }
+    const options = {
+      incremental: true,
+      decorations: {
+        matchBackground: "#365a78",
+        matchBorder: "#4f8fba",
+        matchOverviewRuler: "#4f8fba",
+        activeMatchBackground: "#9a6b27",
+        activeMatchBorder: "#f0b44d",
+        activeMatchColorOverviewRuler: "#f0b44d",
+      },
+    };
+    return direction === "previous"
+      ? this.searchAddon.findPrevious(term, options)
+      : this.searchAddon.findNext(term, options);
+  }
+
+  clearSearch() {
+    this.searchAddon.clearDecorations();
+    const results = { resultIndex: -1, resultCount: 0 };
+    this.searchListeners.forEach((listener) => listener(results));
   }
 
   attach(host: HTMLDivElement) {
@@ -206,7 +256,11 @@ class TerminalRuntime {
     if (!data) return;
     const socket = this.socket;
     if (socket?.readyState !== WebSocket.OPEN) return;
-    socket.send(JSON.stringify({ type: "input", data }));
+    if (this.binaryInputSupported) {
+      socket.send(terminalInputFrame(data, true, this.encoder));
+    } else {
+      socket.send(terminalInputFrame(data, false, this.encoder));
+    }
   }
 
   dispose() {
@@ -219,6 +273,9 @@ class TerminalRuntime {
       this.resizeTimer = null;
     }
     this.themeObserver.disconnect();
+    this.searchResultsDisposable.dispose();
+    this.searchListeners.clear();
+    this.searchAddon.dispose();
     this.rendererDisposable?.dispose();
     this.rendererDisposable = null;
     this.webglAddon?.dispose();
@@ -277,25 +334,7 @@ class TerminalRuntime {
     }
     this.resizeTimer = window.setTimeout(() => {
       this.resizeTimer = null;
-      if (this.disposed || !this.attachedHost) return;
-      if (this.attachedHost.clientWidth < 8 || this.attachedHost.clientHeight < 8) return;
-      this.terminal.options.theme = this.snapshot.theme.renderer;
-      this.terminal.options.fontFamily = readTerminalFontFamily();
-      this.terminal.options.fontSize = readTerminalFontSize();
-      try {
-        this.fitAddon.fit();
-      } catch {
-        return;
-      }
-      const next = { cols: this.terminal.cols, rows: this.terminal.rows };
-      const last = this.lastSize;
-      if (!last || last.cols !== next.cols || last.rows !== next.rows) {
-        this.lastSize = next;
-        const socket = this.socket;
-        if (socket?.readyState === WebSocket.OPEN) {
-          socket.send(JSON.stringify({ type: "resize", ...next }));
-        }
-      }
+      this.syncTerminalSize(true);
     }, RESIZE_DEBOUNCE_MS);
   }
 
@@ -308,6 +347,7 @@ class TerminalRuntime {
     const generation = ++this.connectGeneration;
     const previousSocket = this.socket;
     this.socket = null;
+    this.binaryInputSupported = false;
     previousSocket?.close();
     this.setSnapshot({ message: "Connecting…", status: "connecting" });
 
@@ -321,13 +361,18 @@ class TerminalRuntime {
         if (!this.isCurrentSocket(socket, generation)) return;
         this.setSnapshot({ message: "Live shell", status: "live" });
         this.focus();
+        this.syncTerminalSize(false);
         this.scheduleResize();
         if (socket.readyState === WebSocket.OPEN) {
+          const size = this.lastSize ?? {
+            cols: this.terminal.cols || DEFAULT_COLS,
+            rows: this.terminal.rows || DEFAULT_ROWS,
+          };
           socket.send(
             JSON.stringify({
               type: "resize",
-              cols: this.terminal.cols || DEFAULT_COLS,
-              rows: this.terminal.rows || DEFAULT_ROWS,
+              cols: size.cols,
+              rows: size.rows,
             })
           );
         }
@@ -336,11 +381,17 @@ class TerminalRuntime {
         if (!this.isCurrentSocket(socket, generation)) return;
         if (typeof event.data === "string") {
           let payload: {
+            capabilities?: {
+              binaryInput?: boolean;
+            };
             message?: string;
             type?: string;
           };
           try {
             payload = JSON.parse(event.data) as {
+              capabilities?: {
+                binaryInput?: boolean;
+              };
               message?: string;
               type?: string;
             };
@@ -348,7 +399,9 @@ class TerminalRuntime {
             this.setSnapshot({ message: "Terminal sent an invalid control message.", status: "error" });
             return;
           }
-          if (payload.type === "missing" || payload.type === "exit") {
+          if (payload.type === "hello") {
+            this.binaryInputSupported = payload.capabilities?.binaryInput === true;
+          } else if (payload.type === "missing" || payload.type === "exit") {
             this.setSnapshot({
               message: payload.message ?? "Session ended.",
               status: "ended",
@@ -361,9 +414,7 @@ class TerminalRuntime {
           }
           return;
         }
-        if (event.data instanceof ArrayBuffer) {
-          this.terminal.write(new Uint8Array(event.data));
-        }
+        void this.handleBinaryMessage(socket, generation, event.data);
       };
       socket.onerror = () => {
         if (!this.isCurrentSocket(socket, generation)) return;
@@ -390,6 +441,37 @@ class TerminalRuntime {
 
   private isCurrentSocket(socket: WebSocket, generation: number) {
     return !this.disposed && generation === this.connectGeneration && this.socket === socket;
+  }
+
+  private async handleBinaryMessage(socket: WebSocket, generation: number, payload: ArrayBuffer | Blob) {
+    const bytes =
+      payload instanceof ArrayBuffer
+        ? new Uint8Array(payload)
+        : new Uint8Array(await payload.arrayBuffer());
+    if (!this.isCurrentSocket(socket, generation)) return;
+    this.terminal.write(bytes);
+  }
+
+  private syncTerminalSize(sendResize: boolean) {
+    if (this.disposed || !this.attachedHost) return;
+    if (this.attachedHost.clientWidth < 8 || this.attachedHost.clientHeight < 8) return;
+    this.terminal.options.theme = this.snapshot.theme.renderer;
+    this.terminal.options.fontFamily = readTerminalFontFamily();
+    this.terminal.options.fontSize = readTerminalFontSize();
+    try {
+      this.fitAddon.fit();
+    } catch {
+      return;
+    }
+    const next = { cols: this.terminal.cols, rows: this.terminal.rows };
+    const last = this.lastSize;
+    const changed = !last || last.cols !== next.cols || last.rows !== next.rows;
+    this.lastSize = next;
+    if (!sendResize || !changed) return;
+    const socket = this.socket;
+    if (socket?.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "resize", ...next }));
+    }
   }
 }
 

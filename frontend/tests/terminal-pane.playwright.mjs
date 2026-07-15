@@ -16,6 +16,10 @@ const OUT_DIR = process.env.WIKI_PLAYWRIGHT_OUT_DIR || "/tmp/wiki-37-terminal-ev
 const OUT_JSON = process.env.WIKI_PLAYWRIGHT_OUT_JSON || path.join(OUT_DIR, "evidence.json");
 const PRIMARY_TICKET = "WIKI-370";
 const SECONDARY_TICKET = "WIKI-371";
+const textEncoder = new TextEncoder();
+
+// Keep browser-side transport tests deterministic; user shell startup is covered elsewhere.
+process.env.SHELL = "/bin/bash";
 
 await fs.mkdir(OUT_DIR, { recursive: true });
 
@@ -150,8 +154,24 @@ async function terminalBufferText(page, terminalId) {
   }, terminalId);
 }
 
+async function terminalBufferLines(page, terminalId) {
+  return page.evaluate((id) => {
+    const term = window.__wikiTerminals?.[id]?.terminal;
+    if (!term) return [];
+    const buffer = term.buffer.active;
+    const start = Math.max(0, buffer.baseY - 250);
+    const end = buffer.baseY + term.rows;
+    const lines = [];
+    for (let index = start; index <= end; index += 1) {
+      const line = buffer.getLine(index);
+      if (line) lines.push(line.translateToString(true));
+    }
+    return lines;
+  }, terminalId);
+}
+
 async function focusTerminal(page, terminalId) {
-  await page.locator(".terminal-pane-host").click();
+  await page.getByLabel(`Terminal: ${terminalId}`).locator(".terminal-pane-host").click();
   await page.evaluate((id) => {
     window.__wikiTerminals?.[id]?.terminal.focus();
   }, terminalId);
@@ -174,10 +194,31 @@ async function waitForBufferText(page, terminalId, text, timeout = 10000) {
   throw new Error(`Timed out waiting for terminal text: ${text}`);
 }
 
+async function sendTerminalInput(page, terminalId, data) {
+  await page.evaluate(
+    ({ id, input }) => {
+      const runtime = window.__wikiTerminals?.[id];
+      if (!runtime) throw new Error(`missing terminal runtime for ${id}`);
+      runtime.sendInput(input);
+    },
+    { id: terminalId, input: data }
+  );
+}
+
+async function sendTerminalCommand(page, terminalId, command) {
+  await page.evaluate(
+    ({ id, input }) => {
+      const runtime = window.__wikiTerminals?.[id];
+      if (!runtime) throw new Error(`missing terminal runtime for ${id}`);
+      runtime.sendInput(input);
+      runtime.sendInput(String.fromCharCode(13));
+    },
+    { id: terminalId, input: command }
+  );
+}
+
 async function runCommand(page, terminalId, command, needle, timeout = 10000) {
-  await focusTerminal(page, terminalId);
-  await page.keyboard.type(command);
-  await page.keyboard.press("Enter");
+  await sendTerminalCommand(page, terminalId, command);
   await waitForBufferText(page, terminalId, needle, timeout);
   return terminalBufferText(page, terminalId);
 }
@@ -268,11 +309,11 @@ async function measureDirectLatency(baseUrl) {
     for (const char of probe) {
       typed += char;
       const started = performance.now();
-      ws.send(JSON.stringify({ type: "input", data: char }));
+      ws.send(textEncoder.encode(char));
       await waitForText((value) => value.includes(typed));
       samples.push(performance.now() - started);
     }
-    ws.send(JSON.stringify({ type: "input", data: "\u0015" }));
+    ws.send(textEncoder.encode("\u0015"));
     await sleep(100);
     return { samples, p95: percentile(samples.slice(2), 95) };
   } finally {
@@ -290,6 +331,13 @@ async function currentLine(page, terminalId) {
   }, terminalId);
 }
 
+async function currentCursorX(page, terminalId) {
+  return page.evaluate((id) => {
+    const term = window.__wikiTerminals?.[id]?.terminal;
+    return term?.buffer.active.cursorX ?? 0;
+  }, terminalId);
+}
+
 async function measureEchoLatency(page, terminalId) {
   await focusTerminal(page, terminalId);
   await page.keyboard.type("zz");
@@ -297,30 +345,54 @@ async function measureEchoLatency(page, terminalId) {
   await page.keyboard.press("Control+U");
   await page.waitForTimeout(100);
 
-  const baseline = await currentLine(page, terminalId);
+  const baselineCursorX = await currentCursorX(page, terminalId);
   const samples = [];
-  let typed = "";
-  for (const char of "latency-check-1234") {
-    typed += char;
+  for (const [index, char] of [..."latency-check-1234"].entries()) {
     const started = performance.now();
     await page.keyboard.type(char);
-    const expected = baseline + typed;
+    const expectedCursorX = baselineCursorX + index + 1;
     const deadline = Date.now() + 1000;
     let matched = false;
     while (Date.now() < deadline) {
-      const line = await currentLine(page, terminalId);
-      if (line.endsWith(expected)) {
+      const cursorX = await currentCursorX(page, terminalId);
+      if (cursorX >= expectedCursorX) {
         matched = true;
         break;
       }
       await page.waitForTimeout(5);
     }
-    if (!matched) throw new Error(`Timed out waiting for echo: ${expected}`);
+    if (!matched) throw new Error(`Timed out waiting for cursor advance to ${expectedCursorX}`);
     samples.push(performance.now() - started);
   }
   await page.keyboard.press("Control+U");
   await page.waitForTimeout(100);
   return { samples, p95: percentile(samples.slice(2), 95) };
+}
+
+async function measurePaintProbe(page, terminalId) {
+  await sendTerminalCommand(page, terminalId, "seq 1 50000; echo __SEQ_DONE__");
+  await waitForBufferText(page, terminalId, "__SEQ_DONE__", 15000);
+  return page.evaluate((id) => {
+    const term = window.__wikiTerminals?.[id]?.terminal;
+    if (!term) return null;
+    const buffer = term.buffer.active;
+    const start = Math.max(0, buffer.baseY - 240);
+    const end = buffer.baseY + term.rows;
+    const lines = [];
+    for (let index = start; index <= end; index += 1) {
+      lines.push(buffer.getLine(index)?.translateToString(true)?.trim() ?? "");
+    }
+    const markerIndex = lines.lastIndexOf("__SEQ_DONE__");
+    const relevant = markerIndex === -1 ? lines : lines.slice(0, markerIndex);
+    const numbers = relevant.filter((line) => /^\d+$/.test(line)).map((line) => Number(line));
+    const tail = numbers.slice(-80);
+    return {
+      contiguous: tail.every((value, index) => index === 0 || value === tail[index - 1] + 1),
+      count: tail.length,
+      end: tail.at(-1) ?? null,
+      start: tail[0] ?? null,
+    };
+  }, terminalId);
 }
 
 async function focusedPaneKind(page) {
@@ -331,6 +403,13 @@ async function focusedPaneKind(page) {
     if (focused.querySelector(".agent-session-surface")) return "agent";
     if (focused.querySelector(".note-view")) return "note";
     return "other";
+  });
+}
+
+async function focusedTerminalId(page) {
+  return page.evaluate(() => {
+    const pane = document.querySelector(".pane-frame.is-focused .terminal-pane");
+    return pane?.getAttribute("aria-label")?.replace(/^Terminal: /, "") ?? null;
   });
 }
 
@@ -388,6 +467,7 @@ const result = {
   colsAfter: null,
   colsBefore: null,
   darkScreenshot,
+  echoLatency: null,
   fixturePaths: {
     codexSessionsDir: fixtures.sessionsDir,
     queue: fixtures.queuePath,
@@ -404,7 +484,10 @@ const result = {
   lightScreenshot,
   lsSawFrontend: false,
   pageErrors: [],
+  paintProbe: null,
   renderer: null,
+  binaryInputNegotiated: false,
+  searchWorked: false,
   shellPid: null,
   shellPidGoneAfterClose: null,
   terminalId: null,
@@ -499,23 +582,118 @@ try {
   logStep("running shell commands and latency checks");
   result.renderer = await page.evaluate((id) => window.__wikiTerminals?.[id]?.renderer(), terminalId);
 
-  const lsOutput = await runCommand(page, terminalId, "ls", "frontend");
+  await sendTerminalCommand(page, terminalId, "echo hi");
+  await waitForBufferText(page, terminalId, "hi");
+  await page.waitForTimeout(150);
+  const echoLines = await terminalBufferLines(page, terminalId);
+  if (!echoLines.includes("hi")) {
+    throw new Error(`Expected echo output line, saw ${JSON.stringify(echoLines.slice(-6))}`);
+  }
+  if (echoLines.some((line) => line.includes("echo hihi") || /\bhihi\b/.test(line))) {
+    throw new Error(`Echo output glued typed input into output: ${JSON.stringify(echoLines.slice(-6))}`);
+  }
+
+  const lsOutput = await runCommand(page, terminalId, "ls -1", "frontend");
   result.lsSawFrontend = lsOutput.includes("frontend");
+  if (/^lsbackend$/m.test(lsOutput) || /^lsfrontend$/m.test(lsOutput)) {
+    throw new Error(`ls output glued typed input into output: ${lsOutput}`);
+  }
+
+  const printfOutput = await runCommand(page, terminalId, "printf %s hello", "hello");
+  if (printfOutput.includes("hellohello") || printfOutput.includes("printf %s hellohello")) {
+    throw new Error(`printf output glued typed input into output: ${printfOutput}`);
+  }
+
+  await focusTerminal(page, terminalId);
+  await page.waitForFunction((id) => window.__wikiTerminals?.[id]?.binaryInputSupported?.() === true, terminalId);
+  result.binaryInputNegotiated = true;
+  await page.keyboard.press("Control+f");
+  const findInput = page.getByLabel("Find in terminal");
+  await findInput.fill("README");
+  await page.waitForFunction(() => {
+    const count = document.querySelector(".terminal-pane-find-count")?.textContent ?? "";
+    return /\d+ of \d+/.test(count);
+  });
+  result.searchWorked = (await page.locator(".terminal-pane-find").count()) === 1;
+  await page.getByRole("button", { name: "Previous match" }).focus();
+  await page.keyboard.press("Enter");
+  await page.waitForSelector(".terminal-pane-find");
+  await page.getByRole("button", { name: "Next match" }).focus();
+  await page.keyboard.press("Enter");
+  await page.waitForSelector(".terminal-pane-find");
+  await page.getByRole("button", { name: "Close find" }).focus();
+  await page.keyboard.press("Enter");
+  await page.waitForFunction(() => document.querySelector("[aria-label='Find in terminal']") === null);
 
   const topOutput = await runCommand(page, terminalId, "top -l 1 | head", "Processes:");
   result.topSawProcesses = topOutput.includes("Processes:");
+  result.echoLatency = await measureEchoLatency(page, terminalId);
 
   result.themeBefore = await page.evaluate((id) => window.__wikiTerminals?.[id]?.terminal.options.theme, terminalId);
 
-  await page.keyboard.type("printf '__''PID''__%s__\\n' \"$$\"");
-  await page.keyboard.press("Enter");
+  await sendTerminalCommand(page, terminalId, "printf '__''PID''__%s__\\n' \"$$\"");
   await waitForBufferText(page, terminalId, "__PID__");
   result.shellPid = await readMarkerNumber(page, terminalId, "__PID__");
 
-  await page.keyboard.type("printf '__''COLS''__%s__\\n' \"$(tput cols)\"");
-  await page.keyboard.press("Enter");
+  await sendTerminalCommand(page, terminalId, "printf '__''COLS''__%s__\\n' \"$(tput cols)\"");
   await waitForBufferText(page, terminalId, "__COLS__");
   result.colsBefore = await readMarkerNumber(page, terminalId, "__COLS__");
+
+  logStep("checking leader navigation across multiple terminal panes");
+  await focusTerminal(page, terminalId);
+  await leader(page, "t");
+  await page.waitForFunction(() => Object.keys(window.__wikiTerminals ?? {}).length >= 2);
+  const terminalIds = await getTerminalIds(page);
+  const secondaryTerminalId = terminalIds.find((id) => id !== terminalId);
+  if (!secondaryTerminalId) {
+    throw new Error(`Expected a second terminal pane, saw ${JSON.stringify(terminalIds)}`);
+  }
+  await focusTerminal(page, secondaryTerminalId);
+  await leader(page, "k");
+  await page.waitForFunction(
+    (id) =>
+      document.querySelector(".pane-frame.is-focused .terminal-pane")?.getAttribute("aria-label") ===
+      `Terminal: ${id}`,
+    terminalId
+  );
+  const paneAfterTerminalK = await focusedTerminalId(page);
+  await leader(page, "k");
+  await page.waitForFunction(() => document.querySelector(".pane-frame.is-focused .agent-session-surface") !== null);
+  const paneAfterAgentK = await focusedPaneKind(page);
+  await leader(page, "j");
+  await page.waitForFunction(
+    (id) =>
+      document.querySelector(".pane-frame.is-focused .terminal-pane")?.getAttribute("aria-label") ===
+      `Terminal: ${id}`,
+    terminalId
+  );
+  const paneAfterTerminalJ = await focusedTerminalId(page);
+  await leader(page, "j");
+  await page.waitForFunction(
+    (id) =>
+      document.querySelector(".pane-frame.is-focused .terminal-pane")?.getAttribute("aria-label") ===
+      `Terminal: ${id}`,
+    secondaryTerminalId
+  );
+  await leader(page, "x");
+  await page.waitForFunction(
+    (id) =>
+      !Object.keys(window.__wikiTerminals ?? {}).includes(id) &&
+      document.querySelectorAll(".terminal-pane").length === 1,
+    secondaryTerminalId
+  );
+  if (paneAfterTerminalK !== terminalId || paneAfterAgentK !== "agent" || paneAfterTerminalJ !== terminalId) {
+    throw new Error(
+      `Leader pane cycling skipped terminals: ${JSON.stringify({
+        paneAfterAgentK,
+        paneAfterTerminalJ,
+        paneAfterTerminalK,
+        primaryTerminalId: terminalId,
+        secondaryTerminalId,
+      })}`
+    );
+  }
+  await focusTerminal(page, terminalId);
 
   await leader(page, "h");
   await page.waitForFunction(() => document.querySelector(".pane-frame.is-focused .agent-session-surface") !== null);
@@ -566,15 +744,13 @@ try {
   });
   await page.waitForTimeout(500);
 
-  await page.keyboard.type("printf '__''COLS''__%s__\\n' \"$(tput cols)\"");
-  await page.keyboard.press("Enter");
+  await sendTerminalCommand(page, terminalId, "printf '__''COLS''__%s__\\n' \"$(tput cols)\"");
   await page.waitForTimeout(250);
   result.colsAfter = await readMarkerNumber(page, terminalId, "__COLS__");
 
   logStep("running flood responsiveness checks");
   await focusTerminal(page, terminalId);
-  await page.keyboard.type("yes | head -c 10000000");
-  await page.keyboard.press("Enter");
+  await sendTerminalCommand(page, terminalId, "yes | head -c 10000000");
   await page.waitForTimeout(150);
   result.floodFrameMs = await frameRoundTrip(page);
   await page.waitForTimeout(1200);
@@ -589,6 +765,8 @@ try {
     };
   }, terminalId);
   await page.waitForTimeout(500);
+  logStep("running paint integrity probe");
+  result.paintProbe = await measurePaintProbe(page, terminalId);
 
   logStep("capturing theme evidence and auth rejection");
   await page.screenshot({ path: lightScreenshot, fullPage: true });
@@ -621,8 +799,17 @@ try {
   if (!result.topSawProcesses) {
     throw new Error("Expected top output to include Processes:");
   }
+  if (!result.searchWorked) {
+    throw new Error("Terminal scrollback search did not open");
+  }
+  if (!result.binaryInputNegotiated) {
+    throw new Error("Terminal binary-input capability was not negotiated");
+  }
   if (!result.latency || result.latency.p95 >= 30) {
     throw new Error(`Expected p95 latency under 30ms, saw ${result.latency?.p95}`);
+  }
+  if (!result.echoLatency || result.echoLatency.p95 >= 60) {
+    throw new Error(`Expected page echo p95 under 60ms, saw ${result.echoLatency?.p95}`);
   }
   if (!result.windowSwitchWorked) {
     throw new Error("Leader pane/window chords did not move focus as expected");
@@ -635,6 +822,9 @@ try {
   }
   if (!result.floodBuffer || result.floodBuffer.baseY < 1000) {
     throw new Error("Flood command did not produce enough terminal output to validate scrollback");
+  }
+  if (!result.paintProbe || !result.paintProbe.contiguous || result.paintProbe.end !== 50000) {
+    throw new Error(`Paint probe dropped terminal lines: ${JSON.stringify(result.paintProbe)}`);
   }
   if (result.floodBuffer.length > (result.floodBuffer.scrollback ?? 5000) + result.floodBuffer.rows + 8) {
     throw new Error(`Scrollback cap exceeded: ${JSON.stringify(result.floodBuffer)}`);
