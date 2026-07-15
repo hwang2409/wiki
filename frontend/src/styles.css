@@ -313,6 +313,36 @@ button:disabled {
   padding: 8px;
 }
 
+.workspace-selector {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px 6px;
+  color: var(--text-faint);
+  font-size: var(--font-ui-smaller);
+}
+
+.workspace-selector span {
+  flex-shrink: 0;
+}
+
+.workspace-selector select {
+  min-width: 0;
+  flex: 1;
+  padding: 4px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  color: var(--text-normal);
+  background-color: var(--background-primary);
+  font: inherit;
+}
+
+.workspace-selector select:focus-visible {
+  border-color: var(--text-faint);
+  outline: 2px solid color-mix(in srgb, var(--text-normal) 12%, transparent);
+  outline-offset: 1px;
+}
+
 .nav-buttons-container {
   display: flex;
   gap: 2px;

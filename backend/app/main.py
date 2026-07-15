@@ -169,6 +169,16 @@ class FileTree(BaseModel):
     truncated: bool = False
 
 
+class Workspace(BaseModel):
+    id: str
+    root: str
+    live: bool
+
+
+class WorkspaceList(BaseModel):
+    workspaces: list[Workspace]
+
+
 def slugify(value: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", value.strip().lower()).strip("-")
     return slug or "untitled"
@@ -220,7 +230,7 @@ def file_not_found() -> None:
     raise HTTPException(status_code=404, detail="File not found")
 
 
-def resolve_file_path(raw_path: str) -> tuple[Path, str]:
+def resolve_file_path(raw_path: str, file_root: Path) -> tuple[Path, str]:
     candidate = raw_path.strip().replace("\\", "/")
     if "\x00" in candidate or not candidate:
         file_not_found()
@@ -236,7 +246,7 @@ def resolve_file_path(raw_path: str) -> tuple[Path, str]:
         ):
             file_not_found()
 
-        file_root = FILES_ROOT.resolve()
+        file_root = file_root.resolve()
         target = (file_root / Path(*path.parts)).resolve()
         relative_target = target.relative_to(file_root)
         if is_ignored_file_parts(relative_target.parts):
@@ -278,9 +288,9 @@ def resolve_vault_asset_path(raw_path: str) -> tuple[Path, str, str]:
     return target, path.as_posix(), media_type
 
 
-def iter_repo_files() -> tuple[list[Path], bool]:
+def iter_repo_files(file_root: Path) -> tuple[list[Path], bool]:
     files: list[Path] = []
-    file_root = FILES_ROOT.resolve()
+    file_root = file_root.resolve()
     directories = [file_root]
     truncated = False
     while directories:
@@ -876,6 +886,81 @@ def _supervisor_pid_is_alive() -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _registered_orchestrators(registry: dict) -> list[tuple[str, dict, bool]]:
+    """Return registered orchestrators as (id, entry, is_headless)."""
+
+    entries: list[tuple[str, dict, bool]] = []
+    seen_ids: set[str] = set()
+    for ticket, entry in sorted(registry.items()):
+        if ticket.startswith("_") or not isinstance(entry, dict):
+            continue
+        current = entry.get("current")
+        if not isinstance(current, dict) or current.get("role") != "orchestrator":
+            continue
+        entries.append((ticket, current, _is_headless(current)))
+        seen_ids.add(ticket)
+    for orch_id, entry in sorted((registry.get("_orchestrators") or {}).items()):
+        if orch_id in seen_ids or not isinstance(entry, dict):
+            continue
+        entries.append((orch_id, entry, False))
+    return entries
+
+
+def derive_workspaces() -> list[Workspace]:
+    """Derive the server-side workspace allowlist from live runtime state."""
+
+    workspaces: list[Workspace] = []
+    seen_roots: set[Path] = set()
+    seen_ids: set[str] = set()
+
+    def add_workspace(workspace_id: str, raw_root: object, live: bool) -> None:
+        if not isinstance(raw_root, str) or not workspace_id or workspace_id in seen_ids:
+            return
+        try:
+            root = Path(raw_root).expanduser().resolve()
+            if not root.is_dir() or root in seen_roots:
+                return
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return
+        seen_roots.add(root)
+        seen_ids.add(workspace_id)
+        workspaces.append(Workspace(id=workspace_id, root=str(root), live=live))
+
+    own_root = FILES_ROOT.resolve()
+    add_workspace("wiki", str(own_root), True)
+    registry = _read_agent_registry()
+    headless_entries = [entry for _id, entry, headless in _registered_orchestrators(registry) if headless]
+    supervisor_alive = _supervisor_pid_is_alive() if headless_entries else False
+    legacy_windows = {
+        entry.get("window")
+        for _id, entry, headless in _registered_orchestrators(registry)
+        if not headless and isinstance(entry.get("window"), str)
+    }
+    live_windows = tmux_live_windows() if legacy_windows else set()
+    for workspace_id, entry, headless in _registered_orchestrators(registry):
+        cwd = entry.get("worktree") or entry.get("cwd")
+        if headless:
+            live = supervisor_alive and entry.get("control_attached") is True
+        else:
+            live = entry.get("window") in live_windows
+        add_workspace(workspace_id, cwd, live)
+    return workspaces
+
+
+def resolve_workspace(workspace_id: str) -> tuple[Workspace, Path]:
+    if not workspace_id or "/" in workspace_id or "\\" in workspace_id:
+        raise HTTPException(status_code=404, detail="Unknown workspace")
+    workspace = next((item for item in derive_workspaces() if item.id == workspace_id), None)
+    if workspace is None or not workspace.live:
+        raise HTTPException(status_code=404, detail=f"Workspace not found or inactive: {workspace_id}")
+    return workspace, Path(workspace.root)
+
+
+@app.get("/api/workspaces", response_model=WorkspaceList)
+def list_workspaces() -> WorkspaceList:
+    return WorkspaceList(workspaces=derive_workspaces())
 
 
 @app.get("/api/agents")
@@ -3178,10 +3263,11 @@ def list_notes(q: str | None = None) -> list[NoteSummary]:
 
 
 @app.get("/api/files/tree", response_model=FileTree)
-def list_files() -> FileTree:
+def list_files(workspace: str = "wiki") -> FileTree:
     summaries: list[FileSummary] = []
-    files, truncated = iter_repo_files()
-    file_root = FILES_ROOT.resolve()
+    _workspace, file_root = resolve_workspace(workspace)
+    files, truncated = iter_repo_files(file_root)
+    file_root = file_root.resolve()
     for path in files:
         try:
             stat_result = path.stat()
@@ -3198,8 +3284,12 @@ def list_files() -> FileTree:
 
 
 @app.get("/api/files/content", response_model=FileContent)
-def get_file_content(path: str = Query(..., min_length=1)) -> FileContent:
-    target, relative_path = resolve_file_path(path)
+def get_file_content(
+    path: str = Query(..., min_length=1),
+    workspace: str = "wiki",
+) -> FileContent:
+    _workspace, file_root = resolve_workspace(workspace)
+    target, relative_path = resolve_file_path(path, file_root)
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(target, flags)
@@ -3207,7 +3297,7 @@ def get_file_content(path: str = Query(..., min_length=1)) -> FileContent:
         raise HTTPException(status_code=404, detail="File not found") from exc
 
     try:
-        file_root = FILES_ROOT.resolve()
+        file_root = file_root.resolve()
         if not opened_file_is_safe(fd, target, file_root):
             file_not_found()
         size = os.fstat(fd).st_size

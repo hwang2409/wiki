@@ -67,13 +67,16 @@ export function CodeFilePane({ path, scrollRef }: { path: string; scrollRef?: Re
   const [findOpen, setFindOpen] = useState(false);
   const [find, setFind] = useState("");
   const [highlighted, setHighlighted] = useState<string | null>(null);
+  const fileMatch = path.match(/^file:\/\/([^/]+)\/(.+)$/);
+  const workspace = fileMatch?.[1] ?? "wiki";
+  const relativePath = fileMatch?.[2] ?? path;
 
   useEffect(() => {
     let ignore = false;
     setFile(null);
     setError(null);
     setHighlighted(null);
-    getFileContent(path)
+    getFileContent(workspace, relativePath)
       .then((result) => {
         if (!ignore) setFile(result);
       })
@@ -83,11 +86,11 @@ export function CodeFilePane({ path, scrollRef }: { path: string; scrollRef?: Re
     return () => {
       ignore = true;
     };
-  }, [path]);
+  }, [relativePath, workspace]);
 
   useEffect(() => {
     if (!file || file.binary || file.content === null) return;
-    const language = languageForPath(path);
+    const language = languageForPath(relativePath);
     if (!language) {
       setHighlighted(null);
       return;
@@ -99,7 +102,7 @@ export function CodeFilePane({ path, scrollRef }: { path: string; scrollRef?: Re
     return () => {
       ignore = true;
     };
-  }, [file, path, theme]);
+  }, [file, relativePath, theme]);
 
   const content = file?.content ?? "";
   const lines = content.split("\n");
@@ -126,7 +129,7 @@ export function CodeFilePane({ path, scrollRef }: { path: string; scrollRef?: Re
       }}
     >
       <div className="code-file-toolbar">
-        <span className="code-file-language">{languageForPath(path) ?? "text"}</span>
+        <span className="code-file-language">{languageForPath(relativePath) ?? "text"}</span>
         <button data-code-file-find="true" type="button" onClick={openFind}>
           <Search size={12} /> Find
         </button>
@@ -153,7 +156,7 @@ export function CodeFilePane({ path, scrollRef }: { path: string; scrollRef?: Re
           </label>
         ) : null}
       </div>
-      <div className="code-file-path">{path}</div>
+      <div className="code-file-path">{workspace}/{relativePath}</div>
       <div className="code-file-scroll" ref={scrollRef}>
         {error ? (
           <div className="notice" role="alert">{error}</div>

@@ -40,11 +40,20 @@ import {
   getNote,
   listFiles,
   listNotes,
+  listWorkspaces,
   renameNote,
   searchNotes,
   updateNote
 } from "./api";
-import { ApiError, type AgentWorker, type ArchivedWorker, type FileSummary, type NoteLinks, type Orchestrator } from "./api";
+import {
+  ApiError,
+  type AgentWorker,
+  type ArchivedWorker,
+  type FileSummary,
+  type NoteLinks,
+  type Orchestrator,
+  type Workspace,
+} from "./api";
 import {
   FleetSwitcher,
   QuickSwitcher,
@@ -146,6 +155,18 @@ type PaneInfo = {
   ticket: string | null;
 };
 
+type FileRef = {
+  workspace: string;
+  path: string;
+};
+
+type FileWorkspaceState = {
+  files: FileSummary[];
+  truncated: boolean;
+  loaded: boolean;
+  loading: boolean;
+};
+
 type PaneGeometry = {
   key: string;
   order: number;
@@ -193,6 +214,23 @@ function isAgentPath(path: string | null): path is string {
 
 function isTerminalPath(path: string | null): path is string {
   return Boolean(path?.startsWith("terminal://"));
+}
+
+function filePanePath(workspace: string, path: string) {
+  return `file://${workspace}/${path}`;
+}
+
+function parseFilePanePath(path: string): FileRef | null {
+  const match = path.match(/^file:\/\/([^/]+)\/(.+)$/);
+  return match ? { workspace: match[1], path: match[2] } : null;
+}
+
+function normalizeFilePanePath(path: string) {
+  return parseFilePanePath(path) ? path : filePanePath("wiki", path);
+}
+
+function isWorkspaceToken(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && !/[\\/\x00]/.test(value);
 }
 
 function utilityKindFromPanePath(path: string | null): UtilityMode | null {
@@ -479,22 +517,23 @@ function normalizeWindow(
           : isMarkdownPath(node.path)
             ? "note"
             : "file");
-      const ticket = ticketFromPanePath(node.path);
+      const normalizedPath = resourceKind === "file" ? normalizeFilePanePath(node.path) : node.path;
+      const ticket = ticketFromPanePath(normalizedPath);
       if (ticket) {
         if (seenTickets.has(ticket)) return null;
         seenTickets.add(ticket);
       }
-      const terminalId = terminalIdFromPanePath(node.path);
+      const terminalId = terminalIdFromPanePath(normalizedPath);
       if (terminalId) {
         if (seenTerminalIds.has(terminalId)) return null;
         seenTerminalIds.add(terminalId);
       }
-      const utility = utilityKindFromPanePath(node.path);
+      const utility = utilityKindFromPanePath(normalizedPath);
       if (utility) {
         if (seenUtilities.has(utility)) return null;
         seenUtilities.add(utility);
       }
-      return { ...node, resourceKind };
+      return { ...node, path: normalizedPath, resourceKind };
     }
     const first = prune(node.first);
     const second = prune(node.second);
@@ -735,6 +774,7 @@ type TreeFile = {
   openPath: string;
   id: string;
   isNote: boolean;
+  workspace?: string;
 };
 
 const emptyDraft: NoteDraft = { title: "", path: "", content: "" };
@@ -877,7 +917,7 @@ const RECENT_RESOURCES_STORAGE_KEY = "wiki-recent-resources";
 const MAX_RECENT_RESOURCES = 15;
 
 function recentResourceKey(item: RecentSwitcherItem) {
-  return `${item.kind}:${item.path}`;
+  return `${item.kind}:${item.workspace}:${item.path}`;
 }
 
 function readStoredRecentResources(): RecentSwitcherItem[] {
@@ -886,17 +926,25 @@ function readStoredRecentResources(): RecentSwitcherItem[] {
     const parsed: unknown = raw ? JSON.parse(raw) : [];
     if (!parsed || typeof parsed !== "object") return [];
     const stored = parsed as { v?: unknown; entries?: unknown };
-    if (stored.v !== 1 || !Array.isArray(stored.entries)) return [];
+    if ((stored.v !== 1 && stored.v !== 2) || !Array.isArray(stored.entries)) return [];
+    const entries = stored.entries.map((item): RecentSwitcherItem | null => {
+      if (!item || typeof item !== "object") return null;
+      const candidate = item as { kind?: unknown; path?: unknown; workspace?: unknown };
+      if (
+        (candidate.kind !== "note" && candidate.kind !== "file") ||
+        typeof candidate.path !== "string" ||
+        candidate.path.length === 0
+      ) {
+        return null;
+      }
+      const workspace = stored.v === 1 ? "wiki" : candidate.workspace;
+      return isWorkspaceToken(workspace)
+        ? { kind: candidate.kind, path: candidate.path, workspace }
+        : null;
+    });
+    if (entries.some((item): item is null => item === null)) return [];
     const seen = new Set<string>();
-    return stored.entries
-      .filter(
-        (item): item is RecentSwitcherItem =>
-          Boolean(item) &&
-          typeof item === "object" &&
-          (item as { kind?: unknown }).kind !== undefined &&
-          ((item as { kind?: unknown }).kind === "note" || (item as { kind?: unknown }).kind === "file") &&
-          typeof (item as { path?: unknown }).path === "string"
-      )
+    return (entries as RecentSwitcherItem[])
       .filter((item) => {
         const key = recentResourceKey(item);
         if (seen.has(key)) return false;
@@ -911,7 +959,8 @@ function readStoredRecentResources(): RecentSwitcherItem[] {
 
 function buildTree(
   notes: NoteSummary[],
-  files?: Pick<FileSummary, "path">[]
+  files?: Pick<FileSummary, "path">[],
+  workspace = "wiki"
 ): TreeFolder {
   // The file API uses repo-relative paths; the note API keeps vault-relative IDs.
   // Represent notes at vault/<path> in the merged tree, but retain their note ID
@@ -927,8 +976,14 @@ function buildTree(
         }))
       : [
           ...files
-            .filter((file) => !repoNotePaths.has(file.path))
-            .map((file) => ({ id: file.path, isNote: false, openPath: file.path, path: file.path })),
+            .filter((file) => workspace !== "wiki" || !repoNotePaths.has(file.path))
+            .map((file) => ({
+              id: `${workspace}:${file.path}`,
+              isNote: false,
+              openPath: filePanePath(workspace, file.path),
+              path: file.path,
+              workspace,
+            })),
           ...notes.map((note) => ({
             id: note.id,
             isNote: true,
@@ -1245,7 +1300,7 @@ function FolderTree({
       {folder.files.map((file) => (
         <button
           className={`tree-item-self ${file.isNote ? "nav-file-title" : "nav-code-file-title"}${
-            activePath === file.path ? " is-active" : ""
+            activePath === (file.isNote ? file.path : file.openPath) ? " is-active" : ""
           }`}
           draggable={file.isNote}
           key={file.id}
@@ -1275,10 +1330,11 @@ function FolderTree({
 export default function App() {
   const [notes, setNotes] = useState<NoteSummary[]>([]);
   const [notesLoaded, setNotesLoaded] = useState(false);
-  const [files, setFiles] = useState<FileSummary[]>([]);
-  const [filesLoaded, setFilesLoaded] = useState(false);
-  const [filesLoading, setFilesLoading] = useState(false);
-  const [filesTruncated, setFilesTruncated] = useState(false);
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  const [activeWorkspace, setActiveWorkspace] = useState(
+    () => localStorage.getItem("wiki-files-workspace") || "wiki"
+  );
+  const [filesByWorkspace, setFilesByWorkspace] = useState<Record<string, FileWorkspaceState>>({});
   const [showAllFiles, setShowAllFiles] = useState(
     () => localStorage.getItem("wiki-show-all-files") === "true"
   );
@@ -1339,7 +1395,7 @@ export default function App() {
   const preserveViewScrollRef = useRef(false);
   const appliedHashRef = useRef<string | null>(null);
   const closedTicketsRef = useRef<Set<string>>(new Set());
-  const filesLoadPromiseRef = useRef<Promise<void> | null>(null);
+  const filesLoadPromiseRef = useRef(new Map<string, Promise<void>>());
 
   function nextPaneId() {
     paneIdRef.current += 1;
@@ -1425,9 +1481,34 @@ export default function App() {
   }, [showAllFiles]);
 
   useEffect(() => {
+    localStorage.setItem("wiki-files-workspace", activeWorkspace);
+  }, [activeWorkspace]);
+
+  useEffect(() => {
+    if (sidebarTab !== "files") return;
+    let ignore = false;
+    listWorkspaces()
+      .then((result) => {
+        if (ignore) return;
+        setWorkspaces(result.workspaces);
+        const liveIds = new Set(result.workspaces.filter((workspace) => workspace.live).map((workspace) => workspace.id));
+        setActiveWorkspace((current) => (liveIds.has(current) ? current : "wiki"));
+      })
+      .catch(() => {
+        if (!ignore) {
+          setWorkspaces([]);
+          setActiveWorkspace("wiki");
+        }
+      });
+    return () => {
+      ignore = true;
+    };
+  }, [sidebarTab]);
+
+  useEffect(() => {
     localStorage.setItem(
       RECENT_RESOURCES_STORAGE_KEY,
-      JSON.stringify({ v: 1, entries: recentResources })
+      JSON.stringify({ v: 2, entries: recentResources })
     );
   }, [recentResources]);
 
@@ -1519,26 +1600,38 @@ export default function App() {
     };
   }, []);
 
+  const activeFileState = filesByWorkspace[activeWorkspace];
+  const files = activeFileState?.files ?? [];
+  const filesLoaded = activeFileState?.loaded ?? false;
+  const filesLoading = activeFileState?.loading ?? false;
+  const filesTruncated = activeFileState?.truncated ?? false;
+
   useEffect(() => {
-    if ((!showAllFiles && !switcherOpen) || filesLoaded || filesLoadPromiseRef.current) return;
-    setFilesLoading(true);
-    const request = listFiles()
+    if ((!showAllFiles && !switcherOpen) || !activeWorkspace || activeFileState?.loaded) return;
+    if (filesLoadPromiseRef.current.has(activeWorkspace)) return;
+    setFilesByWorkspace((current) => ({
+      ...current,
+      [activeWorkspace]: { ...(current[activeWorkspace] ?? { files: [], truncated: false, loaded: false }), loading: true },
+    }));
+    const workspace = activeWorkspace;
+    const request = listFiles(workspace)
       .then((nextTree) => {
-        setFiles(nextTree.files);
-        setFilesTruncated(nextTree.truncated);
-        setFilesLoaded(true);
+        setFilesByWorkspace((current) => ({
+          ...current,
+          [workspace]: { files: nextTree.files, truncated: nextTree.truncated, loaded: true, loading: false },
+        }));
       })
       .catch(() => {
-        setFiles([]);
-        setFilesTruncated(false);
-        setFilesLoaded(false);
+        setFilesByWorkspace((current) => ({
+          ...current,
+          [workspace]: { files: [], truncated: false, loaded: false, loading: false },
+        }));
       })
       .finally(() => {
-        if (filesLoadPromiseRef.current === request) filesLoadPromiseRef.current = null;
-        setFilesLoading(false);
+        filesLoadPromiseRef.current.delete(workspace);
       });
-    filesLoadPromiseRef.current = request;
-  }, [filesLoaded, showAllFiles, switcherOpen]);
+    filesLoadPromiseRef.current.set(workspace, request);
+  }, [activeFileState?.loaded, activeWorkspace, showAllFiles, switcherOpen]);
 
   useEffect(() => {
     for (const window of windowState.windows) {
@@ -1594,17 +1687,18 @@ export default function App() {
   }, [agentsState.workers]);
 
   const tree = useMemo(
-    () => buildTree(notes, showAllFiles ? files : undefined),
-    [files, notes, showAllFiles]
+    () => buildTree(notes, showAllFiles ? files : undefined, activeWorkspace),
+    [activeWorkspace, files, notes, showAllFiles]
   );
+  const liveWorkspaces = workspaces.filter((workspace) => workspace.live);
   const visibleRecentResources = useMemo(() => {
     const notePaths = notesLoaded ? new Set(notes.map((note) => note.path)) : null;
     const filePaths = filesLoaded && !filesTruncated ? new Set(files.map((file) => file.path)) : null;
     return recentResources.filter((item) => {
       if (item.kind === "note") return notePaths === null || notePaths.has(item.path);
-      return filePaths === null || filePaths.has(item.path);
+      return item.workspace !== activeWorkspace || filePaths === null || filePaths.has(item.path);
     });
-  }, [files, filesLoaded, filesTruncated, notes, notesLoaded, recentResources]);
+  }, [activeWorkspace, files, filesLoaded, filesTruncated, notes, notesLoaded, recentResources]);
   useEffect(() => {
     const visibleKeys = new Set(visibleRecentResources.map(recentResourceKey));
     setRecentResources((current) => {
@@ -1979,16 +2073,26 @@ export default function App() {
     }
   }
 
-  function forgetRecentResource(kind: RecentSwitcherItem["kind"], path: string) {
+  function forgetRecentResource(kind: RecentSwitcherItem["kind"], path: string, workspace = "wiki") {
     setRecentResources((current) =>
-      current.filter((item) => !(item.kind === kind && item.path === path))
+      current.filter((item) => !(item.kind === kind && item.workspace === workspace && item.path === path))
     );
   }
 
-  function recentResourcePresence(kind: RecentSwitcherItem["kind"], path: string): boolean | null {
+  function recentResourcePresence(
+    kind: RecentSwitcherItem["kind"],
+    path: string,
+    workspace = "wiki"
+  ): boolean | null {
     if (kind === "note") {
       return notesLoaded ? notes.some((note) => note.path === path) : null;
     }
+    const file = parseFilePanePath(path);
+    if (file) {
+      workspace = file.workspace;
+      path = file.path;
+    }
+    if (workspace !== activeWorkspace) return null;
     if (!showAllFiles || !filesLoaded || filesTruncated) return null;
     return files.some((file) => file.path === path);
   }
@@ -1999,15 +2103,20 @@ export default function App() {
     options: { focusExisting?: boolean; syncHash?: boolean; edit?: boolean; fromRecent?: boolean } = {}
   ) {
     const { edit = false, focusExisting = true, fromRecent = false, syncHash = true } = options;
-    const presence = recentResourcePresence(resourceKind, path);
+    const file = resourceKind === "file" ? parseFilePanePath(path) : null;
+    const recentWorkspace = file?.workspace ?? "wiki";
+    const recentPath = file?.path ?? path;
+    const presence = recentResourcePresence(resourceKind, path, recentWorkspace);
     if (fromRecent && presence === false) {
-      forgetRecentResource(resourceKind, path);
+      forgetRecentResource(resourceKind, recentPath, recentWorkspace);
       return;
     }
     if (resourceKind === "note" || resourceKind === "file") {
       setRecentResources((current) => [
-        { kind: resourceKind, path },
-        ...current.filter((item) => !(item.kind === resourceKind && item.path === path)),
+        { kind: resourceKind, workspace: recentWorkspace, path: recentPath },
+        ...current.filter(
+          (item) => !(item.kind === resourceKind && item.workspace === recentWorkspace && item.path === recentPath)
+        ),
       ].slice(0, MAX_RECENT_RESOURCES));
     }
     const existing = focusExisting
@@ -2033,20 +2142,21 @@ export default function App() {
     path: string,
     options: { focusExisting?: boolean; syncHash?: boolean; fromRecent?: boolean } = {}
   ) {
-    await openResource(path, "file", options);
+    await openResource(normalizeFilePanePath(path), "file", options);
   }
 
   async function openRecentResource(item: RecentSwitcherItem) {
     if (item.kind === "file") {
-      if (recentResourcePresence("file", item.path) === false) {
-        forgetRecentResource("file", item.path);
+      const panePath = filePanePath(item.workspace, item.path);
+      if (recentResourcePresence("file", panePath, item.workspace) === false) {
+        forgetRecentResource("file", item.path, item.workspace);
         return;
       }
       try {
-        await getFileContent(item.path);
+        await getFileContent(item.workspace, item.path);
       } catch (error) {
         if (error instanceof ApiError && (error.status === 404 || error.status === 410)) {
-          forgetRecentResource("file", item.path);
+          forgetRecentResource("file", item.path, item.workspace);
         }
         if (error instanceof Error) setError(error.message);
         else setError("Could not open file");
@@ -2054,7 +2164,7 @@ export default function App() {
       }
     }
     if (item.kind === "file") {
-      await openFile(item.path, { fromRecent: true });
+      await openFile(filePanePath(item.workspace, item.path), { fromRecent: true });
     } else {
       await openNote(item.path, { fromRecent: true });
     }
@@ -3516,8 +3626,24 @@ export default function App() {
                 </button>
               </div>
             </div>
+            <label className="workspace-selector">
+              <span>Workspace</span>
+              <select
+                aria-label="Files workspace"
+                value={activeWorkspace}
+                onChange={(event) => setActiveWorkspace(event.target.value)}
+              >
+                {(liveWorkspaces.length > 0 ? liveWorkspaces : [{ id: "wiki", root: "", live: true }]).map(
+                  (workspace) => (
+                    <option key={workspace.id} value={workspace.id}>
+                      {workspace.id}
+                    </option>
+                  )
+                )}
+              </select>
+            </label>
             <div className="nav-files-container">
-              {isLoading ? (
+              {isLoading || (showAllFiles && filesLoading) ? (
                 <div className="nav-empty">
                   <LoadingPlaceholder className="nav-loading" lines={[92, 86, 88, 74, 81]} />
                 </div>
@@ -3789,7 +3915,7 @@ export default function App() {
       ) : null}
       {switcherOpen ? (
         <QuickSwitcher
-          files={files}
+          files={files.map((file) => ({ workspace: activeWorkspace, path: file.path }))}
           filesLoading={filesLoading}
           notes={notes}
           recent={visibleRecentResources}
@@ -3802,9 +3928,9 @@ export default function App() {
             setSwitcherOpen(false);
             openNote(path);
           }}
-          onOpenFile={(path) => {
+          onOpenFile={(file) => {
             setSwitcherOpen(false);
-            openFile(path);
+            openFile(filePanePath(file.workspace, file.path));
           }}
           onOpenRecent={(item) => {
             setSwitcherOpen(false);

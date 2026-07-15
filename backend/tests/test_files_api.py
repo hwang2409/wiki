@@ -14,14 +14,19 @@ class FilesApiTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.repo = Path(self.tmp.name).resolve()
+        self.other_tmp = tempfile.TemporaryDirectory()
+        self.other_repo = Path(self.other_tmp.name).resolve()
         self.vault = self.repo / "vault"
         (self.repo / "src").mkdir()
+        (self.other_repo / "src").mkdir(parents=True)
         self.vault.mkdir()
         (self.repo / "src" / "app.py").write_text("print('hello')\n", encoding="utf-8")
+        (self.other_repo / "src" / "other.py").write_text("print('other')\n", encoding="utf-8")
         (self.vault / "note.md").write_text("# Note\n", encoding="utf-8")
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
+        self.other_tmp.cleanup()
 
     def test_tree_lists_repo_files_and_excludes_hidden_directories(self) -> None:
         (self.repo / ".git").mkdir()
@@ -40,6 +45,153 @@ class FilesApiTests(unittest.TestCase):
 
         self.assertEqual([entry.path for entry in tree.files], ["src/app.py", "vault/note.md"])
         self.assertFalse(tree.truncated)
+
+    def test_workspaces_are_derived_from_orchestrators_and_deduplicated(self) -> None:
+        dead_root = self.repo / "dead-workspace"
+        dead_root.mkdir()
+        missing = self.repo / "missing-workspace"
+        registry = {
+            "misc": {
+                "current": {
+                    "role": "orchestrator",
+                    "cwd": str(self.other_repo),
+                    "run_id": "misc-run",
+                    "control_attached": True,
+                }
+            },
+            "dead": {
+                "current": {
+                    "role": "orchestrator",
+                    "cwd": str(dead_root),
+                    "run_id": "dead-run",
+                    "control_attached": False,
+                }
+            },
+            "missing": {
+                "current": {
+                    "role": "orchestrator",
+                    "cwd": str(missing),
+                    "run_id": "missing-run",
+                    "control_attached": True,
+                }
+            },
+            "worker": {
+                "current": {
+                    "role": "implement",
+                    "cwd": str(self.other_repo),
+                    "run_id": "worker-run",
+                    "control_attached": True,
+                }
+            },
+            "zz-duplicate": {
+                "current": {
+                    "role": "orchestrator",
+                    "cwd": str(self.other_repo / ".." / "other-workspace"),
+                    "run_id": "duplicate-run",
+                    "control_attached": True,
+                }
+            },
+        }
+
+        with mock.patch.object(main, "FILES_ROOT", self.repo), mock.patch.object(
+            main, "_read_agent_registry", return_value=registry
+        ), mock.patch.object(main, "_supervisor_pid_is_alive", return_value=True):
+            workspaces = main.list_workspaces().workspaces
+
+        self.assertEqual([workspace.id for workspace in workspaces], ["wiki", "dead", "misc"])
+        self.assertEqual(workspaces[0].root, str(self.repo))
+        self.assertTrue(workspaces[0].live)
+        self.assertFalse(workspaces[1].live)
+        self.assertTrue(workspaces[2].live)
+
+    def test_workspace_file_endpoints_use_the_selected_root_and_default_to_wiki(self) -> None:
+        registry = {
+            "misc": {
+                "current": {
+                    "role": "orchestrator",
+                    "cwd": str(self.other_repo),
+                    "run_id": "misc-run",
+                    "control_attached": True,
+                }
+            }
+        }
+
+        with mock.patch.object(main, "FILES_ROOT", self.repo), mock.patch.object(
+            main, "_read_agent_registry", return_value=registry
+        ), mock.patch.object(main, "_supervisor_pid_is_alive", return_value=True):
+            default_tree = main.list_files()
+            other_tree = main.list_files("misc")
+            other_content = main.get_file_content("src/other.py", "misc")
+
+        self.assertEqual([entry.path for entry in default_tree.files], ["src/app.py", "vault/note.md"])
+        self.assertEqual([entry.path for entry in other_tree.files], ["src/other.py"])
+        self.assertEqual(other_content.path, "src/other.py")
+        self.assertEqual(other_content.content, "print('other')\n")
+
+    def test_unknown_and_inactive_workspaces_are_not_file_roots(self) -> None:
+        dead_root = self.repo / "dead-workspace"
+        dead_root.mkdir()
+        registry = {
+            "dead": {
+                "current": {
+                    "role": "orchestrator",
+                    "cwd": str(dead_root),
+                    "run_id": "dead-run",
+                    "control_attached": False,
+                }
+            }
+        }
+
+        with mock.patch.object(main, "FILES_ROOT", self.repo), mock.patch.object(
+            main, "_read_agent_registry", return_value=registry
+        ), mock.patch.object(main, "_supervisor_pid_is_alive", return_value=True):
+            with self.assertRaises(HTTPException) as inactive:
+                main.list_files("dead")
+            with self.assertRaises(HTTPException) as unknown:
+                main.list_files("missing")
+            with self.assertRaises(HTTPException) as separator:
+                main.list_files("../wiki")
+
+        self.assertEqual(inactive.exception.status_code, 404)
+        self.assertIn("inactive", inactive.exception.detail)
+        self.assertEqual(unknown.exception.status_code, 404)
+        self.assertEqual(separator.exception.status_code, 404)
+
+    def test_selected_workspace_retains_file_containment_guarantees(self) -> None:
+        outside = self.repo / "outside.py"
+        outside.write_text("outside", encoding="utf-8")
+        (self.other_repo / "escape.py").symlink_to(outside)
+        (self.other_repo / ".hidden").write_text("hidden", encoding="utf-8")
+        (self.other_repo / "nested").mkdir()
+        (self.other_repo / "nested" / "app.py").write_text("nested", encoding="utf-8")
+        registry = {
+            "misc": {
+                "current": {
+                    "role": "orchestrator",
+                    "cwd": str(self.other_repo),
+                    "run_id": "misc-run",
+                    "control_attached": True,
+                }
+            }
+        }
+
+        with mock.patch.object(main, "FILES_ROOT", self.repo), mock.patch.object(
+            main, "_read_agent_registry", return_value=registry
+        ), mock.patch.object(main, "_supervisor_pid_is_alive", return_value=True):
+            tree = main.list_files("misc")
+            for path in (
+                "../outside.py",
+                "./src/other.py",
+                "nested/../src/other.py",
+                "src/other.py\x00",
+                "escape.py",
+            ):
+                with self.subTest(path=path), self.assertRaises(HTTPException) as raised:
+                    main.get_file_content(path, "misc")
+                self.assertEqual(raised.exception.status_code, 404)
+
+        listed_paths = {entry.path for entry in tree.files}
+        self.assertEqual(listed_paths, {"nested/app.py", "src/other.py"})
 
     def test_tree_prunes_excluded_directories_before_descending(self) -> None:
         (self.repo / ".git").mkdir()
