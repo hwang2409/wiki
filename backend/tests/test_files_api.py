@@ -175,6 +175,73 @@ class FilesApiTests(unittest.TestCase):
         self.assertIsNone(invalid.content)
         self.assertEqual(invalid.error, "binary file")
 
+    def test_vault_asset_content_type_and_svg_security_headers(self) -> None:
+        image = self.vault / "images" / "diagram.SVG"
+        image.parent.mkdir()
+        image.write_text("<svg><style>svg { color: red }</style></svg>", encoding="utf-8")
+
+        with mock.patch.object(main, "VAULT_DIR", self.vault):
+            response = main.get_vault_asset("images/diagram.SVG")
+
+        self.assertEqual(response.media_type, "image/svg+xml")
+        self.assertEqual(response.body, image.read_bytes())
+        self.assertEqual(
+            response.headers["content-security-policy"],
+            "default-src 'none'; style-src 'unsafe-inline'",
+        )
+        self.assertEqual(response.headers["x-content-type-options"], "nosniff")
+
+    def test_vault_asset_maps_raster_content_types(self) -> None:
+        image_types = (
+            ("png", "image/png"),
+            ("jpg", "image/jpeg"),
+            ("jpeg", "image/jpeg"),
+            ("gif", "image/gif"),
+            ("webp", "image/webp"),
+        )
+        for suffix, media_type in image_types:
+            with self.subTest(suffix=suffix):
+                target = self.vault / f"image.{suffix}"
+                target.write_bytes(b"image")
+                with mock.patch.object(main, "VAULT_DIR", self.vault):
+                    response = main.get_vault_asset(target.name)
+                self.assertEqual(response.media_type, media_type)
+                self.assertEqual(response.headers["x-content-type-options"], "nosniff")
+
+    def test_vault_asset_rejects_traversal_absolute_dot_segments_and_symlink_escape(self) -> None:
+        image = self.vault / "image.png"
+        image.write_bytes(b"image")
+        outside = self.repo.parent / "outside.png"
+        outside.write_bytes(b"outside")
+        (self.vault / "escape.png").symlink_to(outside)
+
+        with mock.patch.object(main, "VAULT_DIR", self.vault):
+            for path in (
+                "../outside.png",
+                "./image.png",
+                "nested/../image.png",
+                "nested//image.png",
+                str(outside),
+                "escape.png",
+                "image.txt",
+            ):
+                with self.subTest(path=path), self.assertRaises(HTTPException) as raised:
+                    main.get_vault_asset(path)
+                self.assertEqual(raised.exception.status_code, 404)
+
+    def test_vault_asset_missing_and_oversized_files(self) -> None:
+        (self.vault / "large.webp").write_bytes(b"x" * (main.MAX_FILE_BYTES + 1))
+
+        with mock.patch.object(main, "VAULT_DIR", self.vault):
+            with self.assertRaises(HTTPException) as missing:
+                main.get_vault_asset("missing.png")
+            with self.assertRaises(HTTPException) as oversized:
+                main.get_vault_asset("large.webp")
+
+        self.assertEqual(missing.exception.status_code, 404)
+        self.assertEqual(oversized.exception.status_code, 413)
+        self.assertEqual(oversized.exception.detail["code"], "file_too_large")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,5 +1,5 @@
-import { Children, isValidElement, useMemo, useState } from "react";
-import type { MouseEvent, ReactNode } from "react";
+import { Children, isValidElement, useEffect, useMemo, useState } from "react";
+import type { MouseEvent, ReactElement, ReactNode, TableHTMLAttributes } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
@@ -28,6 +28,7 @@ type MdNode = {
   type: string;
   value?: string;
   url?: string;
+  alt?: string;
   children?: MdNode[];
   data?: {
     hName?: string;
@@ -313,6 +314,12 @@ export function stripLeadingTitle(content: string, title: string) {
 const inlinePattern =
   /%%[\s\S]*?%%|==([^=\n]+)==|(!?)\[\[([^\][\n|]+?)(?:\|([^\][\n]+?))?\]\]|(^|[\s(])#([A-Za-z][\w/-]*)|\[(P\d)\]/g;
 
+const vaultImagePattern = /\.(?:png|jpe?g|gif|webp|svg)$/i;
+
+function isVaultImagePath(value: string) {
+  return vaultImagePattern.test(value.split(/[?#]/, 1)[0]);
+}
+
 function splitInline(value: string): MdNode[] {
   const nodes: MdNode[] = [];
   let last = 0;
@@ -335,14 +342,29 @@ function splitInline(value: string): MdNode[] {
     } else if (match[3] !== undefined) {
       const target = match[3].trim();
       const alias = match[4]?.trim();
-      nodes.push({
-        type: "link",
-        url: "#",
-        data: {
-          hProperties: { className: "internal-link", "data-wikilink": target }
-        },
-        children: [{ type: "text", value: alias || target }]
-      });
+      if (match[2] === "!" && isVaultImagePath(target)) {
+        const width = alias && /^\d+$/.test(alias) ? Number(alias) : undefined;
+        nodes.push({
+          type: "image",
+          url: target,
+          alt: target,
+          data: {
+            hProperties: {
+              ...(width ? { "data-obsidian-width": width } : {}),
+              "data-obsidian-embed": true
+            }
+          }
+        });
+      } else {
+        nodes.push({
+          type: "link",
+          url: "#",
+          data: {
+            hProperties: { className: "internal-link", "data-wikilink": target }
+          },
+          children: [{ type: "text", value: alias || target }]
+        });
+      }
     } else if (match[6] !== undefined) {
       if (match[5]) nodes.push({ type: "text", value: match[5] });
       nodes.push({
@@ -559,15 +581,137 @@ export function MarkdownPre({
     const langMatch = /language-([\w-]+)/.exec(child.props.className ?? "");
     const lang = langMatch?.[1] ?? null;
     const code = textFromReactNode(child.props.children).replace(/\n$/, "");
+    if (lang === "mermaid") return <MermaidBlock source={code} />;
     return <ShikiCode className="markdown-code-block" code={code} lang={lang} />;
   }
   return <pre {...rest}>{children}</pre>;
 }
 
+function MermaidBlock({ source }: { source: string }) {
+  const [renderer, setRenderer] = useState<
+    ((props: { source: string }) => ReactElement) | null
+  >(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void import("./markdown-mermaid").then(({ MermaidBlock: LoadedMermaidBlock }) => {
+      if (!cancelled) setRenderer(() => LoadedMermaidBlock);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  if (!renderer) return <div className="markdown-mermaid-loading">Rendering diagram…</div>;
+  return renderer({ source });
+}
+
+function decodeAssetPath(value: string) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function normalizeAssetPath(value: string, base: string[] = []) {
+  const parts = value.replaceAll("\\", "/").split("/");
+  const resolved = value.startsWith("/") ? [] : [...base];
+  for (const part of parts) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (resolved.length === 0) return null;
+      resolved.pop();
+    } else {
+      resolved.push(part);
+    }
+  }
+  return resolved.length > 0 ? resolved.join("/") : null;
+}
+
+function vaultAssetUrl(path: string) {
+  return `/api/vault/assets/${path.split("/").map(encodeURIComponent).join("/")}`;
+}
+
+function notePathFromRoute() {
+  if (typeof window === "undefined") return undefined;
+  const match = window.location.hash.match(/^#\/(?:note|edit)\/(.+)$/);
+  if (!match) return undefined;
+  try {
+    return match[1].split("/").map(decodeURIComponent).join("/");
+  } catch {
+    return undefined;
+  }
+}
+
+function assetCandidates(src: string, notePath?: string) {
+  if (/^[a-z][a-z\d+.-]*:/i.test(src)) return [];
+  const decoded = decodeAssetPath(src.split(/[?#]/, 1)[0]);
+  if (!isVaultImagePath(decoded)) return [];
+  const rootPath = normalizeAssetPath(decoded);
+  if (!rootPath) return [];
+  if (decoded.startsWith("/") || !notePath) return [rootPath];
+  const noteDirectory = notePath.split("/").slice(0, -1);
+  const notePathCandidate = normalizeAssetPath(decoded, noteDirectory);
+  return notePathCandidate && notePathCandidate !== rootPath
+    ? [notePathCandidate, rootPath]
+    : [rootPath];
+}
+
+type MarkdownImageProps = {
+  alt?: string;
+  className?: string;
+  "data-obsidian-width"?: number | string;
+  node?: unknown;
+  notePath?: string;
+  src?: string;
+};
+
+function nodeProperties(node: unknown): Record<string, unknown> {
+  if (!node || typeof node !== "object") return {};
+  const typedNode = node as {
+    data?: { hProperties?: Record<string, unknown> };
+    properties?: Record<string, unknown>;
+  };
+  return typedNode.data?.hProperties ?? typedNode.properties ?? {};
+}
+
+function MarkdownImage({ alt, className, "data-obsidian-width": dataWidth, node, notePath, src }: MarkdownImageProps) {
+  const candidates = src ? assetCandidates(src, notePath) : [];
+  const [failed, setFailed] = useState(false);
+  useEffect(() => setFailed(false), [src, notePath]);
+  const currentSrc = src && candidates.length > 0
+    ? vaultAssetUrl(candidates[failed && candidates.length > 1 ? 1 : 0])
+    : src;
+  const widthValue = dataWidth ?? nodeProperties(node)["data-obsidian-width"];
+  const width = typeof widthValue === "number" ? widthValue : undefined;
+
+  return (
+    <img
+      alt={alt ?? ""}
+      className={className}
+      src={currentSrc}
+      style={width ? { width: `${width}px` } : undefined}
+      onError={() => {
+        if (candidates.length > 1) setFailed(true);
+      }}
+    />
+  );
+}
+
+function MarkdownTable({ children, ...props }: TableHTMLAttributes<HTMLTableElement>) {
+  return (
+    <div className="markdown-table-scroll">
+      <table {...props}>{children}</table>
+    </div>
+  );
+}
+
 function createComponents(
   resolve: WikilinkResolver,
   onOpenNote: (path: string) => void,
-  onCreateNote?: (target: string) => void
+  onCreateNote?: (target: string) => void,
+  notePath?: string
 ) {
   function MarkdownLink({ children, className, href, node: _node, ...props }: MarkdownLinkProps) {
     const wikilink = props["data-wikilink"];
@@ -622,27 +766,37 @@ function createComponents(
 
   return {
     a: MarkdownLink,
+    img: (props: MarkdownImageProps) => <MarkdownImage {...props} notePath={notePath} />,
     blockquote: MarkdownBlockquote,
-    pre: MarkdownPre
+    pre: MarkdownPre,
+    table: MarkdownTable
   };
 }
 
 export function ObsidianMarkdown({
   content,
   notes,
+  notePath,
   onOpenNote,
   onCreateNote
 }: {
   content: string;
   notes: NoteSummary[];
+  notePath?: string;
   onOpenNote: (path: string) => void;
   onCreateNote?: (target: string) => void;
 }) {
   const prepared = useMemo(() => prepareMarkdown(content), [content]);
+  const resolvedNotePath = notePath ?? notePathFromRoute();
   const components = useMemo(
     () =>
-      createComponents((target) => resolveWikilink(notes, target), onOpenNote, onCreateNote),
-    [notes, onOpenNote, onCreateNote]
+      createComponents(
+        (target) => resolveWikilink(notes, target),
+        onOpenNote,
+        onCreateNote,
+        resolvedNotePath
+      ),
+    [notes, resolvedNotePath, onOpenNote, onCreateNote]
   );
 
   return (

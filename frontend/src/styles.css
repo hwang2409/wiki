@@ -2900,6 +2900,45 @@ body.is-resizing-panes .pane-cell {
   overflow-wrap: break-word;
 }
 
+.markdown-mermaid,
+.markdown-mermaid-loading,
+.markdown-mermaid-error {
+  margin: 0 0 1em;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  background: var(--background-secondary);
+}
+
+.markdown-mermaid {
+  display: flex;
+  justify-content: center;
+  max-width: 100%;
+  padding: 16px;
+  overflow-x: auto;
+}
+
+.markdown-mermaid svg {
+  max-width: 100%;
+  height: auto;
+}
+
+.markdown-mermaid-loading,
+.markdown-mermaid-error {
+  padding: 12px 16px;
+  color: var(--text-muted);
+  font-family: var(--font-interface);
+  font-size: var(--font-ui-small);
+}
+
+.markdown-mermaid-error {
+  color: var(--accent-danger);
+}
+
+.markdown-mermaid-error pre {
+  margin: 8px 0 0;
+  color: var(--text-normal);
+}
+
 /* Blockquote */
 
 .markdown-preview-view blockquote {
@@ -3007,17 +3046,25 @@ body.is-resizing-panes .pane-cell {
 
 /* Tables */
 
-.markdown-preview-view table {
-  width: 100%;
+.markdown-table-scroll {
+  max-width: 100%;
   margin: 0 0 1em;
+  overflow-x: auto;
+  border: 1px solid var(--table-border-color);
+  border-radius: var(--radius-s);
+}
+
+.markdown-preview-view table {
+  width: max-content;
+  min-width: 100%;
   border-collapse: collapse;
   font-size: 0.9375em;
 }
 
 .markdown-preview-view th,
 .markdown-preview-view td {
-  padding: 6px 20px 6px 0;
-  border: none;
+  padding: 8px 12px;
+  border-right: 1px solid var(--table-border-color);
   border-bottom: 1px solid var(--table-border-color);
   text-align: left;
   vertical-align: top;
@@ -3025,7 +3072,7 @@ body.is-resizing-panes .pane-cell {
 
 .markdown-preview-view th:last-child,
 .markdown-preview-view td:last-child {
-  padding-right: 0;
+  border-right: none;
 }
 
 /* Keep slugs/labels unbroken in the first column, but only while the pane
@@ -3039,8 +3086,13 @@ body.is-resizing-panes .pane-cell {
 
 .markdown-preview-view th {
   border-bottom-color: var(--text-faint);
+  background: var(--background-secondary);
   color: var(--text-normal);
   font-weight: 600;
+}
+
+.markdown-preview-view tbody tr:last-child td {
+  border-bottom: none;
 }
 
 .markdown-preview-view tbody tr {
