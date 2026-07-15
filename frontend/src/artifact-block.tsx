@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import {
   BarChart3,
@@ -16,6 +16,7 @@ import {
   X,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
+import { sendAgentMessage } from "./api";
 import type { ArtifactColumn, ArtifactKind, SessionArtifact, SessionEvent } from "./api";
 import { ShikiCode, useCurrentTheme } from "./shiki";
 
@@ -135,8 +136,33 @@ function downloadName(event: SessionEvent): string {
   return `${base}.${extension}`;
 }
 
+type ArtifactRenderFailure = {
+  failureClass: "mermaid-render" | "svg-render";
+  errorCode: string;
+  position?: string;
+};
+
+function normalizeRenderFailure(
+  failureClass: ArtifactRenderFailure["failureClass"],
+  reason: unknown,
+): ArtifactRenderFailure {
+  const message = reason instanceof Error ? reason.message : "";
+  const errorCode = failureClass === "mermaid-render"
+    ? /lexical error/i.test(message)
+      ? "LEXICAL_ERROR"
+      : /parse error/i.test(message)
+        ? "PARSE_ERROR"
+        : "MERMAID_RENDER_ERROR"
+    : "SVG_RENDER_ERROR";
+  const line = message.match(/\bline\s+(\d{1,5})\b/i)?.[1];
+  const column = message.match(/\bcolumn\s+(\d{1,5})\b/i)?.[1];
+  const position = line ? `line ${line}${column ? `, column ${column}` : ""}` : undefined;
+  return { failureClass, errorCode, ...(position ? { position } : {}) };
+}
+
 function viewBoxBounds(source: string): { width: number; height: number } | null {
-  const viewBox = source.match(/\bviewBox=["']\s*[-0-9.]+\s+[-0-9.]+\s+([0-9.]+)\s+([0-9.]+)\s*["']/i);
+  const openTag = source.match(/<svg\b[^>]*>/i)?.[0] ?? "";
+  const viewBox = openTag.match(/(?:^|\s)viewBox\s*=\s*["']\s*[-0-9.]+\s+[-0-9.]+\s+([0-9.]+)\s+([0-9.]+)\s*["']/i);
   if (!viewBox) return null;
   const width = Number(viewBox[1]);
   const height = Number(viewBox[2]);
@@ -144,7 +170,7 @@ function viewBoxBounds(source: string): { width: number; height: number } | null
 }
 
 function withExplicitSvgDimensions(source: string): string {
-  const bounds = viewBoxBounds(source) ?? svgBounds(source);
+  const bounds = svgBounds(source);
   const openTag = source.match(/<svg\b[^>]*>/i)?.[0];
   if (!bounds || !openTag) return source;
   const dimensions = `width: ${bounds.width}px !important; height: ${bounds.height}px !important; max-width: none !important; max-height: none !important;`;
@@ -156,7 +182,15 @@ function withExplicitSvgDimensions(source: string): string {
   return source.replace(openTag, sizedTag);
 }
 
-export function MermaidRenderer({ compact = false, source }: { compact?: boolean; source: string }) {
+export function MermaidRenderer({
+  compact = false,
+  onRenderError,
+  source,
+}: {
+  compact?: boolean;
+  onRenderError?: (failure: ArtifactRenderFailure) => void;
+  source: string;
+}) {
   const theme = useCurrentTheme();
   const reactId = useId();
   const [html, setHtml] = useState("");
@@ -165,6 +199,13 @@ export function MermaidRenderer({ compact = false, source }: { compact?: boolean
   useEffect(() => {
     let cancelled = false;
     const id = `wiki-artifact-${reactId.replace(/[^a-zA-Z0-9_-]/g, "")}`;
+    const reportFailure = (reason: unknown) => {
+      if (cancelled) return;
+      setHtml("");
+      const message = reason instanceof Error ? reason.message : "Mermaid could not render this source.";
+      setError(message);
+      onRenderError?.(normalizeRenderFailure("mermaid-render", reason));
+    };
     void import("mermaid").then(async ({ default: mermaid }) => {
       try {
         mermaid.initialize({
@@ -179,37 +220,61 @@ export function MermaidRenderer({ compact = false, source }: { compact?: boolean
           setError(null);
         }
       } catch (reason) {
-        if (!cancelled) {
-          setHtml("");
-          setError(reason instanceof Error ? reason.message : "Mermaid could not render this source.");
-        }
+        reportFailure(reason);
       }
-    });
+    }).catch(reportFailure);
     return () => {
       cancelled = true;
     };
-  }, [compact, reactId, source, theme]);
+  }, [compact, onRenderError, reactId, source, theme]);
 
   if (error) return <div className="artifact-error">{error}</div>;
   if (!html) return <div className="artifact-loading">Rendering diagram…</div>;
   return <div className="artifact-mermaid" dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
-export function SvgRenderer({ compact = false, source }: { compact?: boolean; source: string }) {
+export function SvgRenderer({
+  compact = false,
+  onRenderError,
+  source,
+}: {
+  compact?: boolean;
+  onRenderError?: (failure: ArtifactRenderFailure) => void;
+  source: string;
+}) {
   const [html, setHtml] = useState("");
+  const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     let cancelled = false;
+    const reportFailure = (reason: unknown) => {
+      if (cancelled) return;
+      setHtml("");
+      const message = reason instanceof Error ? reason.message : "SVG could not render this source.";
+      setError(message);
+      onRenderError?.(normalizeRenderFailure("svg-render", reason));
+    };
     void import("dompurify").then(({ default: DOMPurify }) => {
-      const sanitized = DOMPurify.sanitize(source, {
-        ALLOWED_TAGS: SVG_TAGS,
-        FORBID_TAGS: ["script", "foreignObject", "iframe"],
-      });
-      if (!cancelled) setHtml(compact ? withExplicitSvgDimensions(sanitized) : sanitized);
-    });
+      try {
+        const sanitized = DOMPurify.sanitize(source, {
+          ALLOWED_TAGS: SVG_TAGS,
+          FORBID_TAGS: ["script", "foreignObject", "iframe"],
+        });
+        if (!/<svg(?:\s|>)/i.test(sanitized)) {
+          throw new Error("SVG sanitizer produced no <svg> output.");
+        }
+        if (!cancelled) {
+          setHtml(compact ? withExplicitSvgDimensions(sanitized) : sanitized);
+          setError(null);
+        }
+      } catch (reason) {
+        reportFailure(reason);
+      }
+    }).catch(reportFailure);
     return () => {
       cancelled = true;
     };
-  }, [compact, source]);
+  }, [compact, onRenderError, source]);
+  if (error) return <div className="artifact-error">{error}</div>;
   if (!html) return <div className="artifact-loading">Sanitizing SVG…</div>;
   return <div className="artifact-svg" dangerouslySetInnerHTML={{ __html: html }} />;
 }
@@ -430,6 +495,7 @@ export type ArtifactRendererProps = {
   compact?: boolean;
   event: SessionEvent;
   onImageLoad?: (image: HTMLImageElement) => void;
+  onRenderError?: (failure: ArtifactRenderFailure) => void;
   ticket: string;
 };
 
@@ -437,9 +503,9 @@ export function ArtifactRenderer(props: ArtifactRendererProps): ReactNode {
   const { artifact } = props;
   switch (artifact.kind) {
     case "mermaid":
-      return <MermaidRenderer compact={props.compact} source={artifact.source ?? ""} />;
+      return <MermaidRenderer compact={props.compact} onRenderError={props.onRenderError} source={artifact.source ?? ""} />;
     case "svg":
-      return <SvgRenderer compact={props.compact} source={artifact.source ?? ""} />;
+      return <SvgRenderer compact={props.compact} onRenderError={props.onRenderError} source={artifact.source ?? ""} />;
     case "image":
       return <ImageRenderer {...props} />;
     case "table":
@@ -475,7 +541,8 @@ function TableCopyMenu({ artifact, onCopied }: { artifact: SessionArtifact; onCo
 }
 
 function numericSvgAttribute(source: string, name: string): number | null {
-  const match = source.match(new RegExp(`\\b${name}=["']([0-9.]+)(?:px)?["']`, "i"));
+  const openTag = source.match(/<svg\b[^>]*>/i)?.[0] ?? "";
+  const match = openTag.match(new RegExp(`(?:^|\\s)${name}\\s*=\\s*["']([0-9.]+)(?:px)?["']`, "i"));
   if (!match) return null;
   const value = Number(match[1]);
   return Number.isFinite(value) ? value : null;
@@ -526,7 +593,7 @@ export function artifactExceedsInlineThreshold(
   }
 }
 
-function CompactPreview({ artifact, event, ticket }: ArtifactRendererProps) {
+function CompactPreview({ artifact, event, onRenderError, ticket }: ArtifactRendererProps) {
   if (artifact.kind === "table") {
     const columns = artifact.columns ?? [];
     const rows = artifact.rows ?? [];
@@ -559,7 +626,7 @@ function CompactPreview({ artifact, event, ticket }: ArtifactRendererProps) {
   if (artifact.kind === "mermaid" || artifact.kind === "svg") {
     return (
       <div className="artifact-compact-diagram">
-        <ArtifactRenderer artifact={artifact} compact event={event} ticket={ticket} />
+        <ArtifactRenderer artifact={artifact} compact event={event} onRenderError={onRenderError} ticket={ticket} />
         <span className="artifact-compact-diagram-hint">Diagram continues · Click to inspect</span>
       </div>
     );
@@ -580,11 +647,59 @@ export function ArtifactBlock({
   const [inspect, setInspect] = useState(false);
   const [copied, setCopied] = useState(false);
   const [imageBounds, setImageBounds] = useState<{ width: number; height: number } | null>(null);
+  const [renderFailure, setRenderFailure] = useState<ArtifactRenderFailure | null>(null);
+  const [deliveryStatus, setDeliveryStatus] = useState<"pending" | "queued" | "deduplicated" | "sent" | "failed" | null>(null);
   const copiedTimer = useRef<number | null>(null);
+  const reportedRenderFailure = useRef<string | null>(null);
+  const renderFailureArtifactId = useRef(event.artifact_id);
   useEffect(() => setImageBounds(null), [event.artifact_id]);
+  useEffect(() => {
+    if (renderFailureArtifactId.current === event.artifact_id) return;
+    renderFailureArtifactId.current = event.artifact_id;
+    setRenderFailure(null);
+    setDeliveryStatus(null);
+    reportedRenderFailure.current = null;
+  }, [event.artifact_id]);
   useEffect(() => () => {
     if (copiedTimer.current !== null) window.clearTimeout(copiedTimer.current);
   }, []);
+  const reportRenderFailure = useCallback((failure: ArtifactRenderFailure) => {
+    setRenderFailure(failure);
+    const artifactId = event.artifact_id ?? "unknown";
+    const dedupeKey = `artifact-render:${artifactId}:${failure.failureClass}`;
+    if (reportedRenderFailure.current === dedupeKey) return;
+    reportedRenderFailure.current = dedupeKey;
+    setDeliveryStatus("pending");
+    const diagnostic = [
+      "Wiki.app artifact render failure",
+      "The following fields are normalized, untrusted renderer metadata; artifact source text is omitted.",
+      `artifact_id: ${artifactId}`,
+      `kind: ${artifact?.kind ?? "unknown"}`,
+      `failure_class: ${failure.failureClass}`,
+      `error_code: ${failure.errorCode}`,
+      ...(failure.position ? [`position: ${failure.position}`] : []),
+      "The artifact was accepted by render_artifact but the session view could not render it. Correct the source and render it again.",
+    ].join("\n");
+    void sendAgentMessage(ticket, diagnostic, "on-idle", undefined, dedupeKey)
+      .then((response) => {
+        switch (response.status) {
+          case "queued":
+            setDeliveryStatus("queued");
+            break;
+          case "deduplicated":
+            setDeliveryStatus("deduplicated");
+            break;
+          case "sent":
+            setDeliveryStatus("sent");
+            break;
+          default:
+            setDeliveryStatus("failed");
+        }
+      })
+      .catch(() => {
+        setDeliveryStatus("failed");
+      });
+  }, [artifact?.kind, event.artifact_id, ticket]);
   if (!artifact) return <div className="artifact-error">Artifact payload missing.</div>;
   const resolvedArtifact = artifact;
   const Icon = KIND_ICONS[resolvedArtifact.kind] ?? FileJson;
@@ -634,6 +749,7 @@ export function ArtifactBlock({
         data-artifact-compact={oversized || undefined}
         data-artifact-id={event.artifact_id}
         data-artifact-kind={resolvedArtifact.kind}
+        data-artifact-render-status={renderFailure ? "failed" : undefined}
       >
         <header className="artifact-header">
           <div className="artifact-heading">
@@ -672,16 +788,30 @@ export function ArtifactBlock({
         </header>
         <div className="artifact-body" onClick={oversized && onOpen ? () => onOpen(event) : undefined}>
           {oversized ? (
-            <CompactPreview artifact={resolvedArtifact} event={event} ticket={ticket} />
+            <CompactPreview artifact={resolvedArtifact} event={event} onRenderError={reportRenderFailure} ticket={ticket} />
           ) : (
             <ArtifactRenderer
               artifact={resolvedArtifact}
               event={event}
               ticket={ticket}
+              onRenderError={reportRenderFailure}
               onImageLoad={(image) => setImageBounds({ width: image.naturalWidth, height: image.naturalHeight })}
             />
           )}
         </div>
+        {renderFailure ? (
+          <div className="artifact-render-failure" role="status">
+            {deliveryStatus === "failed"
+              ? "Render failed; agent unavailable."
+              : deliveryStatus === "pending"
+                ? "Render failed; reporting to agent…"
+                : deliveryStatus === "queued"
+                  ? "Render failed; diagnostic queued for agent."
+                  : deliveryStatus === "deduplicated"
+                    ? "Render failed; diagnostic already reported."
+                    : "Render failed; diagnostic sent to agent."}
+          </div>
+        ) : null}
       </section>
       {inspect ? (
         <aside aria-label="Artifact inspector" className="artifact-inspect-panel">

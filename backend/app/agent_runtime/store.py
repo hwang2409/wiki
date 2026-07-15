@@ -18,6 +18,7 @@ from .types import (
     EventDisposition,
     LifecycleState,
     RunRecord,
+    MAX_MESSAGE_DEDUPE_KEYS,
     TERMINAL_STATES,
     utc_now,
     validate_transition,
@@ -1477,6 +1478,34 @@ class RunStore:
             self._write_record(record)
             return record
 
+    def claim_message_dedupe_key(
+        self,
+        run_id: str,
+        dedupe_key: str,
+    ) -> tuple[RunRecord, bool]:
+        with self._lock:
+            record = self.get(run_id)
+            if dedupe_key in record.message_dedupe_keys:
+                return record, False
+            record.message_dedupe_keys.append(dedupe_key)
+            if len(record.message_dedupe_keys) > MAX_MESSAGE_DEDUPE_KEYS:
+                del record.message_dedupe_keys[:-MAX_MESSAGE_DEDUPE_KEYS]
+            self._write_record(record)
+            return record, True
+
+    def release_message_dedupe_key(
+        self,
+        run_id: str,
+        dedupe_key: str,
+    ) -> RunRecord:
+        with self._lock:
+            record = self.get(run_id)
+            record.message_dedupe_keys = [
+                key for key in record.message_dedupe_keys if key != dedupe_key
+            ]
+            self._write_record(record)
+            return record
+
     def replace_queued_messages(
         self,
         run_id: str,
@@ -1542,6 +1571,7 @@ class RunStore:
             new_record.composer_messages = [
                 dict(message) for message in old.composer_messages
             ]
+            new_record.message_dedupe_keys = list(old.message_dedupe_keys)
             old.replaced_by_run_id = new_record.run_id
             old.outcome = "handoff"
             old.state_reason = "replaced"

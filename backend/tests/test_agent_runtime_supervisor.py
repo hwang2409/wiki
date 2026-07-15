@@ -41,7 +41,12 @@ from backend.app.agent_runtime.provider import (
 )
 from backend.app.agent_runtime.store import RunStore, RuntimePaths, StoreConflict
 from backend.app.agent_runtime.supervisor import Supervisor, resolve_safe_worktree
-from backend.app.agent_runtime.types import LifecycleState, ProviderKind, RunRecord
+from backend.app.agent_runtime.types import (
+    MAX_MESSAGE_DEDUPE_KEYS,
+    LifecycleState,
+    ProviderKind,
+    RunRecord,
+)
 from backend.app.agent_runtime.version import RUNTIME_FINGERPRINT
 
 
@@ -350,6 +355,50 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             session_events,
         )
         self.supervisor.unsubscribe(queue)
+
+    async def test_artifact_failure_message_deduplicates_durably(self) -> None:
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-ARTIFACT-DEDUPE",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="Work on artifact feedback.",
+        )
+        await self.supervisor.send_now(record.run_id, "begin work")
+        dedupe_key = "artifact-render:artifact-123:mermaid-render"
+        first = await self.supervisor.send_on_idle(
+            record.run_id,
+            "normalized artifact failure",
+            dedupe_key=dedupe_key,
+        )
+        second = await self.supervisor.send_on_idle(
+            record.run_id,
+            "different duplicate payload",
+            dedupe_key=dedupe_key,
+        )
+
+        self.assertEqual(first["status"], "queued")
+        self.assertEqual(second["status"], "deduplicated")
+        self.assertEqual(len(self.store.queued_messages(record.run_id)), 1)
+        self.assertEqual(
+            self.store.get(record.run_id).message_dedupe_keys,
+            [dedupe_key],
+        )
+
+        reloaded = RunStore(self.paths)
+        self.assertEqual(reloaded.get(record.run_id).message_dedupe_keys, [dedupe_key])
+
+        for index in range(MAX_MESSAGE_DEDUPE_KEYS + 1):
+            self.store.claim_message_dedupe_key(record.run_id, f"artifact-render:key-{index}:svg-render")
+        keys = self.store.get(record.run_id).message_dedupe_keys
+        self.assertEqual(len(keys), MAX_MESSAGE_DEDUPE_KEYS)
+        self.assertNotIn("artifact-render:key-0:svg-render", keys)
+        self.assertIn(
+            f"artifact-render:key-{MAX_MESSAGE_DEDUPE_KEYS}:svg-render",
+            keys,
+        )
 
     async def test_dispatch_idempotently_replays_start_and_message_once(self) -> None:
         start_params = {
