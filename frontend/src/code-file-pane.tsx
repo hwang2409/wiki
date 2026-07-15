@@ -154,7 +154,7 @@ export function CodeFilePane({ path, scrollRef }: { path: string; scrollRef?: Re
         ) : null}
       </div>
       <div className="code-file-path">{path}</div>
-      <div className="code-file-scroll view-content" ref={scrollRef}>
+      <div className="code-file-scroll" ref={scrollRef}>
         {error ? (
           <div className="notice" role="alert">{error}</div>
         ) : !file ? (
