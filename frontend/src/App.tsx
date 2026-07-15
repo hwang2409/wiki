@@ -4,14 +4,20 @@ import {
   AlertCircle,
   BookOpen,
   Bot,
+  Code2,
   ChevronRight,
   ChevronsDownUp,
   FilePlus2,
   Files,
   FileCode2,
+  FileImage,
+  FileJson,
+  FileText,
+  File as FileIcon,
   Folder as FolderIcon,
   HeartPulse,
   History,
+  Lock,
   Moon,
   Pencil,
   Search,
@@ -24,10 +30,12 @@ import {
   Waypoints,
   X
 } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import {
   createNote,
   deleteNote,
   getAgents,
+  getFileContent,
   getLinks,
   getNote,
   listFiles,
@@ -36,11 +44,12 @@ import {
   searchNotes,
   updateNote
 } from "./api";
-import type { AgentWorker, ArchivedWorker, FileSummary, NoteLinks, Orchestrator } from "./api";
+import { ApiError, type AgentWorker, type ArchivedWorker, type FileSummary, type NoteLinks, type Orchestrator } from "./api";
 import {
   FleetSwitcher,
   QuickSwitcher,
   type FleetSwitcherItem,
+  type RecentSwitcherItem,
   type QuickSwitcherSession,
 } from "./switcher";
 import { SettingsModal, applyStoredFonts } from "./settings";
@@ -738,6 +747,76 @@ function isMarkdownPath(path: string) {
   return path.toLowerCase().endsWith(".md");
 }
 
+const FILE_ICON_BY_EXTENSION: Record<string, LucideIcon> = {
+  ts: FileCode2,
+  tsx: FileCode2,
+  js: FileCode2,
+  jsx: FileCode2,
+  mjs: FileCode2,
+  cjs: FileCode2,
+  py: Code2,
+  rb: Code2,
+  go: Code2,
+  rs: Code2,
+  java: Code2,
+  c: Code2,
+  cc: Code2,
+  cpp: Code2,
+  h: Code2,
+  hpp: Code2,
+  json: FileJson,
+  yaml: FileJson,
+  yml: FileJson,
+  toml: FileJson,
+  css: Settings,
+  scss: Settings,
+  sass: Settings,
+  less: Settings,
+  html: Code2,
+  htm: Code2,
+  xml: Code2,
+  svg: Code2,
+  md: FileText,
+  markdown: FileText,
+  txt: FileText,
+  rst: FileText,
+  png: FileImage,
+  jpg: FileImage,
+  jpeg: FileImage,
+  gif: FileImage,
+  webp: FileImage,
+  ico: FileImage,
+  bmp: FileImage,
+  avif: FileImage,
+  env: Lock,
+  sh: TerminalIcon,
+  bash: TerminalIcon,
+  zsh: TerminalIcon,
+  fish: TerminalIcon,
+  ps1: TerminalIcon,
+  bat: TerminalIcon,
+  cmd: TerminalIcon,
+  conf: Settings,
+  config: Settings,
+  ini: Settings,
+};
+
+function fileIconForPath(path: string): LucideIcon {
+  const name = path.slice(path.lastIndexOf("/") + 1).toLowerCase();
+  const extensionStart = name.lastIndexOf(".");
+  const extension = extensionStart >= 0 ? name.slice(extensionStart + 1) : "";
+
+  if (name.endsWith(".lock") || name.includes(".lock.")) return Lock;
+  if (name.endsWith(".config") || name.includes(".config.")) return Settings;
+  if (name === ".env" || name === ".gitignore" || name === ".dockerignore") return Lock;
+  return FILE_ICON_BY_EXTENSION[extension] ?? FileIcon;
+}
+
+function TreeFileIcon({ path }: { path: string }) {
+  const Icon = fileIconForPath(path);
+  return <Icon className="tree-file-icon" size={13} />;
+}
+
 type Route =
   | { kind: "empty" }
   | { kind: "new" }
@@ -791,6 +870,42 @@ function readStoredCollapsed(): Set<string> {
     return new Set(Array.isArray(parsed) ? parsed.filter((p): p is string => typeof p === "string") : []);
   } catch {
     return new Set();
+  }
+}
+
+const RECENT_RESOURCES_STORAGE_KEY = "wiki-recent-resources";
+const MAX_RECENT_RESOURCES = 15;
+
+function recentResourceKey(item: RecentSwitcherItem) {
+  return `${item.kind}:${item.path}`;
+}
+
+function readStoredRecentResources(): RecentSwitcherItem[] {
+  try {
+    const raw = localStorage.getItem(RECENT_RESOURCES_STORAGE_KEY);
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    if (!parsed || typeof parsed !== "object") return [];
+    const stored = parsed as { v?: unknown; entries?: unknown };
+    if (stored.v !== 1 || !Array.isArray(stored.entries)) return [];
+    const seen = new Set<string>();
+    return stored.entries
+      .filter(
+        (item): item is RecentSwitcherItem =>
+          Boolean(item) &&
+          typeof item === "object" &&
+          (item as { kind?: unknown }).kind !== undefined &&
+          ((item as { kind?: unknown }).kind === "note" || (item as { kind?: unknown }).kind === "file") &&
+          typeof (item as { path?: unknown }).path === "string"
+      )
+      .filter((item) => {
+        const key = recentResourceKey(item);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .slice(0, MAX_RECENT_RESOURCES);
+  } catch {
+    return [];
   }
 }
 
@@ -1149,7 +1264,7 @@ function FolderTree({
               : undefined
           }
         >
-          {!file.isNote ? <FileCode2 className="tree-file-icon" size={13} /> : null}
+          {!file.isNote ? <TreeFileIcon path={file.path} /> : null}
           <span className="tree-item-name">{basename(file.path)}</span>
         </button>
       ))}
@@ -1159,7 +1274,10 @@ function FolderTree({
 
 export default function App() {
   const [notes, setNotes] = useState<NoteSummary[]>([]);
+  const [notesLoaded, setNotesLoaded] = useState(false);
   const [files, setFiles] = useState<FileSummary[]>([]);
+  const [filesLoaded, setFilesLoaded] = useState(false);
+  const [filesLoading, setFilesLoading] = useState(false);
   const [filesTruncated, setFilesTruncated] = useState(false);
   const [showAllFiles, setShowAllFiles] = useState(
     () => localStorage.getItem("wiki-show-all-files") === "true"
@@ -1184,6 +1302,9 @@ export default function App() {
   }, []);
 
   const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(readStoredCollapsed);
+  const [recentResources, setRecentResources] = useState<RecentSwitcherItem[]>(
+    readStoredRecentResources
+  );
   const [switcherOpen, setSwitcherOpen] = useState(false);
   const [sidebarVisible, setSidebarVisible] = useState(
     () => localStorage.getItem("wiki-sidebar-visible") !== "false"
@@ -1218,6 +1339,7 @@ export default function App() {
   const preserveViewScrollRef = useRef(false);
   const appliedHashRef = useRef<string | null>(null);
   const closedTicketsRef = useRef<Set<string>>(new Set());
+  const filesLoadPromiseRef = useRef<Promise<void> | null>(null);
 
   function nextPaneId() {
     paneIdRef.current += 1;
@@ -1304,6 +1426,13 @@ export default function App() {
 
   useEffect(() => {
     localStorage.setItem(
+      RECENT_RESOURCES_STORAGE_KEY,
+      JSON.stringify({ v: 1, entries: recentResources })
+    );
+  }, [recentResources]);
+
+  useEffect(() => {
+    localStorage.setItem(
       WINDOWS_STORAGE_KEY,
       JSON.stringify({ version: 2, ...windowState } satisfies StoredWindowWorkspaceState)
     );
@@ -1373,8 +1502,12 @@ export default function App() {
         const nextNotes = await listNotes();
         if (ignore) return;
         setNotes(nextNotes);
+        setNotesLoaded(true);
       } catch (err) {
-        if (!ignore) setError(err instanceof Error ? err.message : "Could not load notes");
+        if (!ignore) {
+          setNotesLoaded(false);
+          setError(err instanceof Error ? err.message : "Could not load notes");
+        }
       } finally {
         if (!ignore) setIsLoading(false);
       }
@@ -1387,29 +1520,25 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!showAllFiles) {
-      setFiles([]);
-      setFilesTruncated(false);
-      return;
-    }
-    let ignore = false;
-    listFiles()
+    if ((!showAllFiles && !switcherOpen) || filesLoaded || filesLoadPromiseRef.current) return;
+    setFilesLoading(true);
+    const request = listFiles()
       .then((nextTree) => {
-        if (!ignore) {
-          setFiles(nextTree.files);
-          setFilesTruncated(nextTree.truncated);
-        }
+        setFiles(nextTree.files);
+        setFilesTruncated(nextTree.truncated);
+        setFilesLoaded(true);
       })
       .catch(() => {
-        if (!ignore) {
-          setFiles([]);
-          setFilesTruncated(false);
-        }
+        setFiles([]);
+        setFilesTruncated(false);
+        setFilesLoaded(false);
+      })
+      .finally(() => {
+        if (filesLoadPromiseRef.current === request) filesLoadPromiseRef.current = null;
+        setFilesLoading(false);
       });
-    return () => {
-      ignore = true;
-    };
-  }, [refreshTick, showAllFiles]);
+    filesLoadPromiseRef.current = request;
+  }, [filesLoaded, showAllFiles, switcherOpen]);
 
   useEffect(() => {
     for (const window of windowState.windows) {
@@ -1468,6 +1597,21 @@ export default function App() {
     () => buildTree(notes, showAllFiles ? files : undefined),
     [files, notes, showAllFiles]
   );
+  const visibleRecentResources = useMemo(() => {
+    const notePaths = notesLoaded ? new Set(notes.map((note) => note.path)) : null;
+    const filePaths = filesLoaded && !filesTruncated ? new Set(files.map((file) => file.path)) : null;
+    return recentResources.filter((item) => {
+      if (item.kind === "note") return notePaths === null || notePaths.has(item.path);
+      return filePaths === null || filePaths.has(item.path);
+    });
+  }, [files, filesLoaded, filesTruncated, notes, notesLoaded, recentResources]);
+  useEffect(() => {
+    const visibleKeys = new Set(visibleRecentResources.map(recentResourceKey));
+    setRecentResources((current) => {
+      const next = current.filter((item) => visibleKeys.has(recentResourceKey(item)));
+      return next.length === current.length ? current : next;
+    });
+  }, [visibleRecentResources]);
   const activeWindow = useMemo(
     () =>
       windowState.windows.find((window) => window.id === windowState.activeWindowId) ??
@@ -1828,16 +1972,44 @@ export default function App() {
         setMode("view");
       }
     } catch (err) {
+      if (err instanceof ApiError && (err.status === 404 || err.status === 410)) {
+        forgetRecentResource("note", path);
+      }
       setError(err instanceof Error ? err.message : "Could not open note");
     }
+  }
+
+  function forgetRecentResource(kind: RecentSwitcherItem["kind"], path: string) {
+    setRecentResources((current) =>
+      current.filter((item) => !(item.kind === kind && item.path === path))
+    );
+  }
+
+  function recentResourcePresence(kind: RecentSwitcherItem["kind"], path: string): boolean | null {
+    if (kind === "note") {
+      return notesLoaded ? notes.some((note) => note.path === path) : null;
+    }
+    if (!showAllFiles || !filesLoaded || filesTruncated) return null;
+    return files.some((file) => file.path === path);
   }
 
   async function openResource(
     path: string,
     resourceKind: ResourceKind,
-    options: { focusExisting?: boolean; syncHash?: boolean; edit?: boolean } = {}
+    options: { focusExisting?: boolean; syncHash?: boolean; edit?: boolean; fromRecent?: boolean } = {}
   ) {
-    const { edit = false, focusExisting = true, syncHash = true } = options;
+    const { edit = false, focusExisting = true, fromRecent = false, syncHash = true } = options;
+    const presence = recentResourcePresence(resourceKind, path);
+    if (fromRecent && presence === false) {
+      forgetRecentResource(resourceKind, path);
+      return;
+    }
+    if (resourceKind === "note" || resourceKind === "file") {
+      setRecentResources((current) => [
+        { kind: resourceKind, path },
+        ...current.filter((item) => !(item.kind === resourceKind && item.path === path)),
+      ].slice(0, MAX_RECENT_RESOURCES));
+    }
     const existing = focusExisting
       ? findPaneLocationByResource(path, resourceKind, activeWindow?.id ?? null)
       : null;
@@ -1852,16 +2024,40 @@ export default function App() {
 
   async function openNote(
     path: string,
-    options: { focusExisting?: boolean; syncHash?: boolean; edit?: boolean } = {}
+    options: { focusExisting?: boolean; syncHash?: boolean; edit?: boolean; fromRecent?: boolean } = {}
   ) {
     await openResource(path, "note", options);
   }
 
   async function openFile(
     path: string,
-    options: { focusExisting?: boolean; syncHash?: boolean } = {}
+    options: { focusExisting?: boolean; syncHash?: boolean; fromRecent?: boolean } = {}
   ) {
     await openResource(path, "file", options);
+  }
+
+  async function openRecentResource(item: RecentSwitcherItem) {
+    if (item.kind === "file") {
+      if (recentResourcePresence("file", item.path) === false) {
+        forgetRecentResource("file", item.path);
+        return;
+      }
+      try {
+        await getFileContent(item.path);
+      } catch (error) {
+        if (error instanceof ApiError && (error.status === 404 || error.status === 410)) {
+          forgetRecentResource("file", item.path);
+        }
+        if (error instanceof Error) setError(error.message);
+        else setError("Could not open file");
+        return;
+      }
+    }
+    if (item.kind === "file") {
+      await openFile(item.path, { fromRecent: true });
+    } else {
+      await openNote(item.path, { fromRecent: true });
+    }
   }
 
   function openTreeFile(file: TreeFile) {
@@ -3593,7 +3789,10 @@ export default function App() {
       ) : null}
       {switcherOpen ? (
         <QuickSwitcher
+          files={files}
+          filesLoading={filesLoading}
           notes={notes}
+          recent={visibleRecentResources}
           sessions={quickSwitcherSessions}
           onClose={() => {
             setSwitcherOpen(false);
@@ -3602,6 +3801,14 @@ export default function App() {
           onOpen={(path) => {
             setSwitcherOpen(false);
             openNote(path);
+          }}
+          onOpenFile={(path) => {
+            setSwitcherOpen(false);
+            openFile(path);
+          }}
+          onOpenRecent={(item) => {
+            setSwitcherOpen(false);
+            void openRecentResource(item);
           }}
           onOpenSession={(ticket) => {
             setSwitcherOpen(false);

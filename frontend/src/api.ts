@@ -1,5 +1,15 @@
 import type { Note, NoteDraft, NoteSummary } from "./types";
 
+export class ApiError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
 function encodeNotePath(path: string) {
   return path.split("/").map(encodeURIComponent).join("/");
 }
@@ -20,7 +30,7 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
       typeof detail === "string"
         ? detail
         : detail?.message ?? `Request failed with ${response.status}`;
-    throw new Error(message);
+    throw new ApiError(message, response.status);
   }
 
   return response.json() as Promise<T>;
