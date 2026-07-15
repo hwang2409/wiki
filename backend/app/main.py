@@ -49,6 +49,8 @@ from .frontend_static import mount_frontend_static
 ROOT_DIR = Path(os.environ.get("WIKI_REPO_DIR", Path(__file__).resolve().parents[2])).resolve()
 VAULT_DIR = Path(os.environ.get("WIKI_VAULT_DIR", ROOT_DIR / "vault")).resolve()
 MAX_NOTE_BYTES = 2_000_000
+MAX_FILE_BYTES = 2_000_000
+IGNORED_FILE_PARTS = {".git", ".obsidian", "node_modules"}
 
 VAULT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -126,6 +128,20 @@ class NoteUpdate(BaseModel):
     content: str = Field(..., max_length=MAX_NOTE_BYTES)
 
 
+class FileSummary(BaseModel):
+    path: str
+    size: int
+    updated_at: datetime
+
+
+class FileContent(BaseModel):
+    path: str
+    size: int
+    content: str | None = None
+    binary: bool = False
+    error: str | None = None
+
+
 def slugify(value: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", value.strip().lower()).strip("-")
     return slug or "untitled"
@@ -167,6 +183,44 @@ def resolve_note_path(note_path: str) -> Path:
         raise HTTPException(status_code=400, detail="Note path escapes the vault") from exc
 
     return target
+
+
+def resolve_file_path(raw_path: str) -> tuple[Path, str]:
+    candidate = raw_path.strip().replace("\\", "/")
+    path = PurePosixPath(candidate)
+    if (
+        not candidate
+        or path.is_absolute()
+        or any(part in {"", ".", ".."} for part in path.parts)
+        or any(part.startswith(".") for part in path.parts)
+    ):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    vault_root = VAULT_DIR.resolve()
+    target = (vault_root / Path(*path.parts)).resolve()
+    try:
+        target.relative_to(vault_root)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="File not found") from exc
+    return target, path.as_posix()
+
+
+def iter_vault_files() -> list[Path]:
+    files: list[Path] = []
+    vault_root = VAULT_DIR.resolve()
+    for path in vault_root.rglob("*"):
+        relative_parts = path.relative_to(vault_root).parts
+        if any(part.startswith(".") or part in IGNORED_FILE_PARTS for part in relative_parts):
+            continue
+        if not path.is_file():
+            continue
+        resolved = path.resolve()
+        try:
+            resolved.relative_to(vault_root)
+        except ValueError:
+            continue
+        files.append(resolved)
+    return sorted(files, key=lambda candidate: candidate.relative_to(vault_root).as_posix())
 
 
 def unique_note_path(raw_path: str | None, title: str) -> str:
@@ -2974,6 +3028,64 @@ def list_notes(q: str | None = None) -> list[NoteSummary]:
             if needle in note_id_for(path).lower() or needle in read_note(path).lower()
         ]
     return [to_summary(path) for path in files]
+
+
+@app.get("/api/files/tree", response_model=list[FileSummary])
+def list_files() -> list[FileSummary]:
+    summaries: list[FileSummary] = []
+    for path in iter_vault_files():
+        try:
+            stat_result = path.stat()
+        except OSError:
+            continue
+        summaries.append(
+            FileSummary(
+                path=path.relative_to(VAULT_DIR.resolve()).as_posix(),
+                size=stat_result.st_size,
+                updated_at=datetime.fromtimestamp(stat_result.st_mtime, tz=timezone.utc),
+            )
+        )
+    return summaries
+
+
+@app.get("/api/files/content", response_model=FileContent)
+def get_file_content(path: str = Query(..., min_length=1)) -> FileContent:
+    target, relative_path = resolve_file_path(path)
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    try:
+        size = target.stat().st_size
+    except OSError as exc:
+        raise HTTPException(status_code=404, detail="File not found") from exc
+
+    if size > MAX_FILE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "code": "file_too_large",
+                "message": f"File exceeds the {MAX_FILE_BYTES // 1_000_000}MB viewing limit",
+            },
+        )
+    try:
+        raw = target.read_bytes()
+    except OSError as exc:
+        raise HTTPException(status_code=404, detail="File not found") from exc
+    if len(raw) > MAX_FILE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "code": "file_too_large",
+                "message": f"File exceeds the {MAX_FILE_BYTES // 1_000_000}MB viewing limit",
+            },
+        )
+    if b"\x00" in raw:
+        return FileContent(path=relative_path, size=size, binary=True, error="binary file")
+    try:
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return FileContent(path=relative_path, size=size, binary=True, error="binary file")
+    return FileContent(path=relative_path, size=size, content=content)
 
 
 @app.get("/api/notes/{note_path:path}", response_model=Note)

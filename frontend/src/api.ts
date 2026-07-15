@@ -15,7 +15,11 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
 
   if (!response.ok) {
     const body = await response.json().catch(() => null);
-    const message = body?.detail ?? `Request failed with ${response.status}`;
+    const detail = body?.detail;
+    const message =
+      typeof detail === "string"
+        ? detail
+        : detail?.message ?? `Request failed with ${response.status}`;
     throw new Error(message);
   }
 
@@ -28,6 +32,28 @@ export function listNotes() {
 
 export function searchNotes(query: string) {
   return request<NoteSummary[]>(`/api/notes?q=${encodeURIComponent(query)}`);
+}
+
+export type FileSummary = {
+  path: string;
+  size: number;
+  updated_at: string;
+};
+
+export type FileContent = {
+  path: string;
+  size: number;
+  content: string | null;
+  binary: boolean;
+  error: string | null;
+};
+
+export function listFiles() {
+  return request<FileSummary[]>("/api/files/tree");
+}
+
+export function getFileContent(path: string) {
+  return request<FileContent>(`/api/files/content?path=${encodeURIComponent(path)}`);
 }
 
 export function renameNote(path: string, newPath: string) {
