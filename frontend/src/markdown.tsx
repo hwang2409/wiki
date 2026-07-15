@@ -1,5 +1,5 @@
-import { Children, isValidElement, useEffect, useMemo, useState } from "react";
-import type { MouseEvent, ReactElement, ReactNode, TableHTMLAttributes } from "react";
+import { Children, isValidElement, lazy, Suspense, useEffect, useMemo, useState } from "react";
+import type { MouseEvent, ReactNode, TableHTMLAttributes } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
@@ -581,30 +581,21 @@ export function MarkdownPre({
     const langMatch = /language-([\w-]+)/.exec(child.props.className ?? "");
     const lang = langMatch?.[1] ?? null;
     const code = textFromReactNode(child.props.children).replace(/\n$/, "");
-    if (lang === "mermaid") return <MermaidBlock source={code} />;
+    if (lang === "mermaid") {
+      return (
+        <Suspense fallback={<div className="markdown-mermaid-loading">Rendering diagram…</div>}>
+          <LazyMermaidBlock source={code} />
+        </Suspense>
+      );
+    }
     return <ShikiCode className="markdown-code-block" code={code} lang={lang} />;
   }
   return <pre {...rest}>{children}</pre>;
 }
 
-function MermaidBlock({ source }: { source: string }) {
-  const [renderer, setRenderer] = useState<
-    ((props: { source: string }) => ReactElement) | null
-  >(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    void import("./markdown-mermaid").then(({ MermaidBlock: LoadedMermaidBlock }) => {
-      if (!cancelled) setRenderer(() => LoadedMermaidBlock);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  if (!renderer) return <div className="markdown-mermaid-loading">Rendering diagram…</div>;
-  return renderer({ source });
-}
+const LazyMermaidBlock = lazy(() =>
+  import("./markdown-mermaid").then(({ MermaidBlock }) => ({ default: MermaidBlock }))
+);
 
 function decodeAssetPath(value: string) {
   try {
@@ -631,17 +622,6 @@ function normalizeAssetPath(value: string, base: string[] = []) {
 
 function vaultAssetUrl(path: string) {
   return `/api/vault/assets/${path.split("/").map(encodeURIComponent).join("/")}`;
-}
-
-function notePathFromRoute() {
-  if (typeof window === "undefined") return undefined;
-  const match = window.location.hash.match(/^#\/(?:note|edit)\/(.+)$/);
-  if (!match) return undefined;
-  try {
-    return match[1].split("/").map(decodeURIComponent).join("/");
-  } catch {
-    return undefined;
-  }
 }
 
 function assetCandidates(src: string, notePath?: string) {
@@ -787,16 +767,15 @@ export function ObsidianMarkdown({
   onCreateNote?: (target: string) => void;
 }) {
   const prepared = useMemo(() => prepareMarkdown(content), [content]);
-  const resolvedNotePath = notePath ?? notePathFromRoute();
   const components = useMemo(
     () =>
       createComponents(
         (target) => resolveWikilink(notes, target),
         onOpenNote,
         onCreateNote,
-        resolvedNotePath
+        notePath
       ),
-    [notes, resolvedNotePath, onOpenNote, onCreateNote]
+    [notes, notePath, onOpenNote, onCreateNote]
   );
 
   return (

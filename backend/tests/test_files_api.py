@@ -218,6 +218,7 @@ class FilesApiTests(unittest.TestCase):
         with mock.patch.object(main, "VAULT_DIR", self.vault):
             for path in (
                 "../outside.png",
+                "image.png\x00",
                 "./image.png",
                 "nested/../image.png",
                 "nested//image.png",
@@ -241,6 +242,20 @@ class FilesApiTests(unittest.TestCase):
         self.assertEqual(missing.exception.status_code, 404)
         self.assertEqual(oversized.exception.status_code, 413)
         self.assertEqual(oversized.exception.detail["code"], "file_too_large")
+
+    def test_vault_asset_route_binds_descriptor_check_to_vault_root(self) -> None:
+        image = self.vault / "bound.png"
+        image.write_bytes(b"image")
+
+        with mock.patch.object(main, "VAULT_DIR", self.vault), mock.patch.object(
+            main, "opened_file_is_safe", wraps=main.opened_file_is_safe
+        ) as opened_file_is_safe:
+            response = main.get_vault_asset("bound.png")
+
+        self.assertEqual(response.body, b"image")
+        opened_file_is_safe.assert_called_once()
+        self.assertIsInstance(opened_file_is_safe.call_args.args[0], int)
+        self.assertEqual(opened_file_is_safe.call_args.args[2], self.vault.resolve())
 
 
 if __name__ == "__main__":
