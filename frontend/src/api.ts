@@ -559,18 +559,20 @@ export function sendAgentMessage(
   ticket: string,
   text: string,
   mode: "now" | "on-idle",
-  pendingId: string,
+  pendingId?: string,
+  dedupeKey?: string,
 ) {
   return request<{
     status: string;
     pending_id?: string;
+    dedupe_key?: string;
     position?: number;
     messages?: QueuedMessage[];
   }>(
     `/api/agents/${encodeURIComponent(ticket)}/message`,
     {
       method: "POST",
-      body: JSON.stringify({ text, mode, pending_id: pendingId }),
+      body: JSON.stringify({ text, mode, pending_id: pendingId, dedupe_key: dedupeKey }),
     }
   );
 }

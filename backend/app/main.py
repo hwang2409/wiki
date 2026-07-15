@@ -2385,6 +2385,7 @@ class MessageIn(BaseModel):
     mode: str = Field(default="now", pattern="^(now|on-idle)$")
     pending_id: UUID | None = None
     request_id: str | None = Field(default=None, min_length=1, max_length=200)
+    dedupe_key: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 class AgentRespondIn(BaseModel):
@@ -3147,6 +3148,7 @@ def agent_message(ticket: str, body: MessageIn, background: BackgroundTasks) -> 
                 "text": body.text,
                 "pending_id": str(body.pending_id) if body.pending_id else None,
                 "request_id": body.request_id,
+                "dedupe_key": body.dedupe_key,
             },
         )
         if not isinstance(result, dict):

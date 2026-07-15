@@ -58,6 +58,14 @@ def _validated_pending_id(value: object) -> str | None:
     return value
 
 
+def _validated_dedupe_key(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip() or len(value) > 200:
+        raise ValueError("dedupe_key must be a non-empty string up to 200 characters")
+    return value
+
+
 def _validated_idempotency_request_id(value: object) -> str | None:
     if value is None:
         return None
@@ -1974,15 +1982,17 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         run_id: str,
         message: str,
         pending_id: str | None = None,
+        dedupe_key: str | None = None,
     ) -> dict[str, Any]:
         async with self._run_lock(run_id):
-            return await self._send_now(run_id, message, pending_id)
+            return await self._send_now(run_id, message, pending_id, dedupe_key)
 
     async def _send_now(
         self,
         run_id: str,
         message: str,
         pending_id: str | None = None,
+        dedupe_key: str | None = None,
     ) -> dict[str, Any]:
         adapter = self.adapters.get(run_id)
         if adapter is None:
@@ -1996,11 +2006,17 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             )
             if adapter is None:
                 raise StoreConflict("run has no attached provider adapter")
+        if dedupe_key is not None:
+            _, claimed = self.store.claim_message_dedupe_key(run_id, dedupe_key)
+            if not claimed:
+                return {"status": "deduplicated", "dedupe_key": dedupe_key}
         if pending_id is not None:
             self.store.track_pending_user_message(run_id, pending_id, message)
         try:
             status = await adapter.send_now(message)
         except Exception:
+            if dedupe_key is not None:
+                self.store.release_message_dedupe_key(run_id, dedupe_key)
             if pending_id is not None:
                 self.store.discard_pending_user_message(run_id, pending_id)
             raise
@@ -2010,6 +2026,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         response: dict[str, Any] = {"status": "sent"}
         if pending_id is not None:
             response["pending_id"] = pending_id
+        if dedupe_key is not None:
+            response["dedupe_key"] = dedupe_key
         return response
 
     async def send_on_idle(
@@ -2017,25 +2035,42 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         run_id: str,
         message: str,
         pending_id: str | None = None,
+        dedupe_key: str | None = None,
     ) -> dict[str, Any]:
         async with self._run_lock(run_id):
-            return await self._send_on_idle(run_id, message, pending_id)
+            return await self._send_on_idle(run_id, message, pending_id, dedupe_key)
 
     async def _send_on_idle(
         self,
         run_id: str,
         message: str,
         pending_id: str | None = None,
+        dedupe_key: str | None = None,
     ) -> dict[str, Any]:
         adapter = self.adapters.get(run_id)
         if adapter is None:
             raise StoreConflict("run has no attached provider adapter")
-        record = self.store.queue_message(run_id, message, pending_id)
+        if dedupe_key is not None:
+            record, claimed = self.store.claim_message_dedupe_key(run_id, dedupe_key)
+            if not claimed:
+                return {
+                    "status": "deduplicated",
+                    "dedupe_key": dedupe_key,
+                    "messages": list(record.queued_messages),
+                }
+        try:
+            record = self.store.queue_message(run_id, message, pending_id)
+        except Exception:
+            if dedupe_key is not None:
+                self.store.release_message_dedupe_key(run_id, dedupe_key)
+            raise
         response = {
             "status": "queued",
             "position": len(record.queued_messages),
             "messages": list(record.queued_messages),
         }
+        if dedupe_key is not None:
+            response["dedupe_key"] = dedupe_key
         await self._publish(
             {"type": "session", "ticket": record.agent_id, "surface": "queue"}
         )
@@ -2049,6 +2084,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 return {
                     "status": "sent",
                     "pending_id": pending_id,
+                    **({"dedupe_key": dedupe_key} if dedupe_key is not None else {}),
                 }
         return response
 
@@ -2605,12 +2641,14 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 self._resolve_run_id(params),
                 str(params["text"]),
                 _validated_pending_id(params.get("pending_id")),
+                _validated_dedupe_key(params.get("dedupe_key")),
             )
         if method == "run/send_on_idle":
             return await self.send_on_idle(
                 self._resolve_run_id(params),
                 str(params["text"]),
                 _validated_pending_id(params.get("pending_id")),
+                _validated_dedupe_key(params.get("dedupe_key")),
             )
         if method == "run/queue":
             run_id = self._resolve_run_id(params)

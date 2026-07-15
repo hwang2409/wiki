@@ -136,8 +136,33 @@ function downloadName(event: SessionEvent): string {
   return `${base}.${extension}`;
 }
 
+type ArtifactRenderFailure = {
+  failureClass: "mermaid-render" | "svg-render";
+  errorCode: string;
+  position?: string;
+};
+
+function normalizeRenderFailure(
+  failureClass: ArtifactRenderFailure["failureClass"],
+  reason: unknown,
+): ArtifactRenderFailure {
+  const message = reason instanceof Error ? reason.message : "";
+  const errorCode = failureClass === "mermaid-render"
+    ? /lexical error/i.test(message)
+      ? "LEXICAL_ERROR"
+      : /parse error/i.test(message)
+        ? "PARSE_ERROR"
+        : "MERMAID_RENDER_ERROR"
+    : "SVG_RENDER_ERROR";
+  const line = message.match(/\bline\s+(\d{1,5})\b/i)?.[1];
+  const column = message.match(/\bcolumn\s+(\d{1,5})\b/i)?.[1];
+  const position = line ? `line ${line}${column ? `, column ${column}` : ""}` : undefined;
+  return { failureClass, errorCode, ...(position ? { position } : {}) };
+}
+
 function viewBoxBounds(source: string): { width: number; height: number } | null {
-  const viewBox = source.match(/\bviewBox=["']\s*[-0-9.]+\s+[-0-9.]+\s+([0-9.]+)\s+([0-9.]+)\s*["']/i);
+  const openTag = source.match(/<svg\b[^>]*>/i)?.[0] ?? "";
+  const viewBox = openTag.match(/\bviewBox=["']\s*[-0-9.]+\s+[-0-9.]+\s+([0-9.]+)\s+([0-9.]+)\s*["']/i);
   if (!viewBox) return null;
   const width = Number(viewBox[1]);
   const height = Number(viewBox[2]);
@@ -145,7 +170,7 @@ function viewBoxBounds(source: string): { width: number; height: number } | null
 }
 
 function withExplicitSvgDimensions(source: string): string {
-  const bounds = viewBoxBounds(source) ?? svgBounds(source);
+  const bounds = svgBounds(source);
   const openTag = source.match(/<svg\b[^>]*>/i)?.[0];
   if (!bounds || !openTag) return source;
   const dimensions = `width: ${bounds.width}px !important; height: ${bounds.height}px !important; max-width: none !important; max-height: none !important;`;
@@ -163,7 +188,7 @@ export function MermaidRenderer({
   source,
 }: {
   compact?: boolean;
-  onRenderError?: (message: string) => void;
+  onRenderError?: (failure: ArtifactRenderFailure) => void;
   source: string;
 }) {
   const theme = useCurrentTheme();
@@ -179,7 +204,7 @@ export function MermaidRenderer({
       setHtml("");
       const message = reason instanceof Error ? reason.message : "Mermaid could not render this source.";
       setError(message);
-      onRenderError?.(message);
+      onRenderError?.(normalizeRenderFailure("mermaid-render", reason));
     };
     void import("mermaid").then(async ({ default: mermaid }) => {
       try {
@@ -214,7 +239,7 @@ export function SvgRenderer({
   source,
 }: {
   compact?: boolean;
-  onRenderError?: (message: string) => void;
+  onRenderError?: (failure: ArtifactRenderFailure) => void;
   source: string;
 }) {
   const [html, setHtml] = useState("");
@@ -226,7 +251,7 @@ export function SvgRenderer({
       setHtml("");
       const message = reason instanceof Error ? reason.message : "SVG could not render this source.";
       setError(message);
-      onRenderError?.(message);
+      onRenderError?.(normalizeRenderFailure("svg-render", reason));
     };
     void import("dompurify").then(({ default: DOMPurify }) => {
       try {
@@ -470,7 +495,7 @@ export type ArtifactRendererProps = {
   compact?: boolean;
   event: SessionEvent;
   onImageLoad?: (image: HTMLImageElement) => void;
-  onRenderError?: (message: string) => void;
+  onRenderError?: (failure: ArtifactRenderFailure) => void;
   ticket: string;
 };
 
@@ -622,7 +647,8 @@ export function ArtifactBlock({
   const [inspect, setInspect] = useState(false);
   const [copied, setCopied] = useState(false);
   const [imageBounds, setImageBounds] = useState<{ width: number; height: number } | null>(null);
-  const [renderFailure, setRenderFailure] = useState<string | null>(null);
+  const [renderFailure, setRenderFailure] = useState<ArtifactRenderFailure | null>(null);
+  const [deliveryStatus, setDeliveryStatus] = useState<"pending" | "sent" | "failed" | null>(null);
   const copiedTimer = useRef<number | null>(null);
   const reportedRenderFailure = useRef<string | null>(null);
   const renderFailureArtifactId = useRef(event.artifact_id);
@@ -631,25 +657,40 @@ export function ArtifactBlock({
     if (renderFailureArtifactId.current === event.artifact_id) return;
     renderFailureArtifactId.current = event.artifact_id;
     setRenderFailure(null);
+    setDeliveryStatus(null);
     reportedRenderFailure.current = null;
   }, [event.artifact_id]);
   useEffect(() => () => {
     if (copiedTimer.current !== null) window.clearTimeout(copiedTimer.current);
   }, []);
-  const reportRenderFailure = useCallback((message: string) => {
-    setRenderFailure(message);
-    if (reportedRenderFailure.current === message) return;
-    reportedRenderFailure.current = message;
+  const reportRenderFailure = useCallback((failure: ArtifactRenderFailure) => {
+    setRenderFailure(failure);
+    const artifactId = event.artifact_id ?? "unknown";
+    const dedupeKey = `artifact-render:${artifactId}:${failure.failureClass}`;
+    if (reportedRenderFailure.current === dedupeKey) return;
+    reportedRenderFailure.current = dedupeKey;
+    setDeliveryStatus("pending");
     const diagnostic = [
       "Wiki.app artifact render failure",
-      `artifact_id: ${event.artifact_id ?? "unknown"}`,
+      "The following fields are normalized, untrusted renderer metadata; artifact source text is omitted.",
+      `artifact_id: ${artifactId}`,
       `kind: ${artifact?.kind ?? "unknown"}`,
-      `error: ${message}`,
+      `failure_class: ${failure.failureClass}`,
+      `error_code: ${failure.errorCode}`,
+      ...(failure.position ? [`position: ${failure.position}`] : []),
       "The artifact was accepted by render_artifact but the session view could not render it. Correct the source and render it again.",
     ].join("\n");
-    void sendAgentMessage(ticket, diagnostic, "on-idle", crypto.randomUUID()).catch(() => {
-      /* The visible failure state remains useful when the agent is unavailable. */
-    });
+    void sendAgentMessage(ticket, diagnostic, "on-idle", undefined, dedupeKey)
+      .then((response) => {
+        if (["queued", "sent", "deduplicated"].includes(response.status)) {
+          setDeliveryStatus("sent");
+        } else {
+          setDeliveryStatus("failed");
+        }
+      })
+      .catch(() => {
+        setDeliveryStatus("failed");
+      });
   }, [artifact?.kind, event.artifact_id, ticket]);
   if (!artifact) return <div className="artifact-error">Artifact payload missing.</div>;
   const resolvedArtifact = artifact;
@@ -752,7 +793,11 @@ export function ArtifactBlock({
         </div>
         {renderFailure ? (
           <div className="artifact-render-failure" role="status">
-            Render failed; diagnostic sent to agent.
+            {deliveryStatus === "failed"
+              ? "Render failed; agent unavailable."
+              : deliveryStatus === "pending"
+                ? "Render failed; reporting to agent…"
+                : "Render failed; diagnostic sent to agent."}
           </div>
         ) : null}
       </section>

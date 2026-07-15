@@ -28,6 +28,14 @@ function incidentSvg(elementCount) {
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 900">${elements}</svg>`;
 }
 
+function nestedSymbolSvg(elementCount) {
+  return incidentSvg(elementCount)
+    .replace(
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 900">',
+      '<svg xmlns="http://www.w3.org/2000/svg" width="640" height="900"><symbol viewBox="0 0 24 24"><path d="M0 0h24v24H0z"/></symbol>',
+    );
+}
+
 function invokeArtifactTool(fixtures, inputs) {
   const requests = [
     {
@@ -84,6 +92,7 @@ async function main() {
     svgProbe(800, 320, 240),
     incidentSvg(134),
     incidentSvg(200),
+    nestedSymbolSvg(134),
   ];
   const inputs = sources.map((source, index) => ({
     kind: "svg",
@@ -122,6 +131,7 @@ async function main() {
         rectCount: element.querySelectorAll("rect").length,
         textCount: element.querySelectorAll("text").length,
         viewBox: element.getAttribute("viewBox"),
+        symbolViewBox: element.querySelector("symbol")?.getAttribute("viewBox"),
         widthAttribute: element.getAttribute("width"),
         width: element.getBoundingClientRect().width,
       }));
@@ -139,7 +149,7 @@ async function main() {
           throw new Error(`SVG incident-shape probe lost elements: ${JSON.stringify(metrics)}`);
         }
         if (
-          metrics.viewBox !== "0 0 640 900"
+          (index === 3 ? metrics.viewBox !== null || metrics.symbolViewBox !== "0 0 24 24" : metrics.viewBox !== "0 0 640 900")
           || metrics.widthAttribute !== "640"
           || metrics.heightAttribute !== "900"
           || Math.abs(metrics.width - 640) > 1

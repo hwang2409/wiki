@@ -174,6 +174,7 @@ class RunRecord:
     pending_user_messages: list[dict[str, str]] = field(default_factory=list)
     composer_messages: list[dict[str, Any]] = field(default_factory=list)
     queued_messages: list[dict[str, str]] = field(default_factory=list)
+    message_dedupe_keys: list[str] = field(default_factory=list)
     schema_version: int = 1
 
     @classmethod
@@ -250,6 +251,7 @@ class RunRecord:
             "pending_user_messages": list(self.pending_user_messages),
             "composer_messages": list(self.composer_messages),
             "queued_messages": list(self.queued_messages),
+            "message_dedupe_keys": list(self.message_dedupe_keys),
         }
 
     @classmethod
@@ -318,6 +320,11 @@ class RunRecord:
                 dict(item) for item in value.get("composer_messages") or []
             ],
             queued_messages=[dict(item) for item in value.get("queued_messages") or []],
+            message_dedupe_keys=[
+                str(item)
+                for item in value.get("message_dedupe_keys") or []
+                if isinstance(item, str) and item
+            ],
         )
 
 
