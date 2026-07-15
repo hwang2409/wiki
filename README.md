@@ -47,11 +47,13 @@ Open http://localhost:5173. Custom backend port: set `WIKI_API_TARGET=http://127
 ## Run (native macOS)
 
 ```bash
-make native-build   # signs Wiki.app under src-tauri/target/release/bundle/macos/
+make native-build   # stages, then atomically swaps Wiki.app when Wiki is closed
 open src-tauri/target/release/bundle/macos/Wiki.app
 ```
 
 `make native-dev` runs the Tauri shell with a live sidecar. Ad-hoc signed, no notarization — quarantined copies may need right-click Open once. Sidecar logs live at `~/Library/Logs/Wiki/`.
+
+Native builds refuse to replace a bundle while Wiki.app or its supervisor is running. To prepare a build while Wiki is open, use `make native-build FORCE_STAGE_ONLY=1`; after quitting Wiki, run the printed `./scripts/swap-native-app.sh <stage-root>` command.
 
 ## Fleet leader (`Ctrl+A`)
 

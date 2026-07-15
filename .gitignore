@@ -12,3 +12,4 @@ vite.config.d.ts
 .playwright-mcp/
 .obsidian/workspace.json
 build/
+src-tauri/.native-build-staging/

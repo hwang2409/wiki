@@ -33,8 +33,8 @@ native-backend:
 native-dev: native-backend
 	$(TAURI) dev --no-watch
 
-native-build: native-backend
-	$(TAURI) build --bundles app
+native-build:
+	FORCE_STAGE_ONLY="$(FORCE_STAGE_ONLY)" ./scripts/build-native-app.sh
 
 native-smoke: native-backend
 	./scripts/native-smoke.sh
