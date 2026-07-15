@@ -1101,6 +1101,7 @@ function FolderTree({
 export default function App() {
   const [notes, setNotes] = useState<NoteSummary[]>([]);
   const [files, setFiles] = useState<FileSummary[]>([]);
+  const [filesTruncated, setFilesTruncated] = useState(false);
   const [showAllFiles, setShowAllFiles] = useState(
     () => localStorage.getItem("wiki-show-all-files") === "true"
   );
@@ -1329,15 +1330,22 @@ export default function App() {
   useEffect(() => {
     if (!showAllFiles) {
       setFiles([]);
+      setFilesTruncated(false);
       return;
     }
     let ignore = false;
     listFiles()
-      .then((nextFiles) => {
-        if (!ignore) setFiles(nextFiles);
+      .then((nextTree) => {
+        if (!ignore) {
+          setFiles(nextTree.files);
+          setFilesTruncated(nextTree.truncated);
+        }
       })
       .catch(() => {
-        if (!ignore) setFiles([]);
+        if (!ignore) {
+          setFiles([]);
+          setFilesTruncated(false);
+        }
       });
     return () => {
       ignore = true;
@@ -3190,26 +3198,29 @@ export default function App() {
                 <div className="nav-empty">
                   <LoadingPlaceholder className="nav-loading" lines={[92, 86, 88, 74, 81]} />
                 </div>
-              ) : tree.files.length > 0 ? (
-                <FolderTree
-                  activePath={
-                    mode === "file"
-                      ? focusedPanePath
-                      : mode === "view" || mode === "edit"
-                        ? activeNote?.path ?? null
-                        : null
-                  }
-                  collapsed={collapsedFolders}
-                  depth={0}
-                  dragActive={draggingNotePath !== null}
-                  folder={tree}
-                  onContextMenu={handleTreeContextMenu}
-                  onDropOnFolder={handleDropOnFolder}
-                  onNoteDragEnd={() => setDraggingNotePath(null)}
-                  onNoteDragStart={setDraggingNotePath}
-                  onOpenFile={openNote}
-                  onToggleFolder={toggleFolder}
-                />
+              ) : tree.files.length > 0 || tree.folders.length > 0 ? (
+                <>
+                  <FolderTree
+                    activePath={
+                      mode === "file"
+                        ? focusedPanePath
+                        : mode === "view" || mode === "edit"
+                          ? activeNote?.path ?? null
+                          : null
+                    }
+                    collapsed={collapsedFolders}
+                    depth={0}
+                    dragActive={draggingNotePath !== null}
+                    folder={tree}
+                    onContextMenu={handleTreeContextMenu}
+                    onDropOnFolder={handleDropOnFolder}
+                    onNoteDragEnd={() => setDraggingNotePath(null)}
+                    onNoteDragStart={setDraggingNotePath}
+                    onOpenFile={openNote}
+                    onToggleFolder={toggleFolder}
+                  />
+                  {filesTruncated ? <div className="nav-empty">File list truncated at 10,000 items</div> : null}
+                </>
               ) : (
                 <div className="nav-empty">No notes yet</div>
               )}

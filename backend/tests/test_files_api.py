@@ -29,11 +29,34 @@ class FilesApiTests(unittest.TestCase):
         (self.vault / "node_modules").mkdir()
         (self.vault / "node_modules" / "package.js").write_text("ignored", encoding="utf-8")
         (self.vault / ".secret").write_text("ignored", encoding="utf-8")
+        (self.vault / "secret-alias").symlink_to(self.vault / ".secret")
+        (self.vault / "git-alias").symlink_to(self.vault / ".git" / "config")
 
         with mock.patch.object(main, "VAULT_DIR", self.vault):
-            paths = [entry.path for entry in main.list_files()]
+            tree = main.list_files()
 
-        self.assertEqual(paths, ["note.md", "src/app.py"])
+        self.assertEqual([entry.path for entry in tree.files], ["note.md", "src/app.py"])
+        self.assertFalse(tree.truncated)
+
+    def test_tree_prunes_excluded_directories_before_descending(self) -> None:
+        (self.vault / ".git").mkdir()
+        (self.vault / ".git" / "config").write_text("secret", encoding="utf-8")
+        (self.vault / "node_modules").mkdir()
+        (self.vault / "node_modules" / "package.js").write_text("ignored", encoding="utf-8")
+        real_scandir = main.os.scandir
+        scanned: list[Path] = []
+
+        def tracking_scandir(path: str | bytes | Path):
+            scanned.append(Path(path))
+            return real_scandir(path)
+
+        with mock.patch.object(main, "VAULT_DIR", self.vault), mock.patch.object(
+            main.os, "scandir", tracking_scandir
+        ):
+            main.list_files()
+
+        self.assertNotIn(self.vault / ".git", scanned)
+        self.assertNotIn(self.vault / "node_modules", scanned)
 
     def test_content_is_utf8_text(self) -> None:
         with mock.patch.object(main, "VAULT_DIR", self.vault):
@@ -54,15 +77,55 @@ class FilesApiTests(unittest.TestCase):
                     main.get_file_content(path)
                 self.assertEqual(raised.exception.status_code, 404)
 
+    def test_symlink_aliases_to_hidden_files_are_not_listed_or_served(self) -> None:
+        (self.vault / ".secret").write_text("secret", encoding="utf-8")
+        (self.vault / ".git").mkdir()
+        (self.vault / ".git" / "config").write_text("git secret", encoding="utf-8")
+        (self.vault / "secret-alias").symlink_to(self.vault / ".secret")
+        (self.vault / "git-alias").symlink_to(self.vault / ".git" / "config")
+
+        with mock.patch.object(main, "VAULT_DIR", self.vault):
+            tree = main.list_files()
+            for path in ("secret-alias", "git-alias"):
+                with self.subTest(path=path), self.assertRaises(HTTPException) as raised:
+                    main.get_file_content(path)
+                self.assertEqual(raised.exception.status_code, 404)
+
+        listed_paths = {entry.path for entry in tree.files}
+        self.assertNotIn("secret-alias", listed_paths)
+        self.assertNotIn("git-alias", listed_paths)
+
+    def test_nul_in_path_is_not_found(self) -> None:
+        with mock.patch.object(main, "VAULT_DIR", self.vault):
+            with self.assertRaises(HTTPException) as raised:
+                main.get_file_content("src/app.py\x00")
+
+        self.assertEqual(raised.exception.status_code, 404)
+
     def test_size_cap_returns_structured_error(self) -> None:
+        (self.vault / "at-limit.txt").write_bytes(b"x" * main.MAX_FILE_BYTES)
         (self.vault / "large.txt").write_bytes(b"x" * (main.MAX_FILE_BYTES + 1))
 
         with mock.patch.object(main, "VAULT_DIR", self.vault):
+            at_limit = main.get_file_content("at-limit.txt")
             with self.assertRaises(HTTPException) as raised:
                 main.get_file_content("large.txt")
 
+        self.assertEqual(len(at_limit.content or ""), main.MAX_FILE_BYTES)
         self.assertEqual(raised.exception.status_code, 413)
         self.assertEqual(raised.exception.detail["code"], "file_too_large")
+
+    def test_tree_reports_truncation_at_the_result_limit(self) -> None:
+        for index in range(3):
+            (self.vault / f"file-{index}.txt").write_text("x", encoding="utf-8")
+
+        with mock.patch.object(main, "VAULT_DIR", self.vault), mock.patch.object(
+            main, "MAX_FILE_TREE_ENTRIES", 2
+        ):
+            tree = main.list_files()
+
+        self.assertEqual(len(tree.files), 2)
+        self.assertTrue(tree.truncated)
 
     def test_binary_and_invalid_utf8_return_structured_binary_response(self) -> None:
         (self.vault / "image.bin").write_bytes(b"PNG\x00bytes")

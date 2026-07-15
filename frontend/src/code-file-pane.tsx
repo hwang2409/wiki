@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode, RefObject } from "react";
 import { Search, X } from "lucide-react";
 import { getFileContent, type FileContent } from "./api";
@@ -24,6 +24,39 @@ function HighlightedLine({ line, needle }: { line: string; needle: string }) {
 function matchCount(content: string, needle: string) {
   if (!needle) return 0;
   return content.toLocaleLowerCase().split(needle.toLocaleLowerCase()).length - 1;
+}
+
+function decorateMatches(html: string | null, needle: string) {
+  if (!html || !needle || typeof document === "undefined") return html;
+  const root = document.createElement("div");
+  root.innerHTML = html;
+  const wanted = needle.toLocaleLowerCase();
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const textNodes: Text[] = [];
+  let node = walker.nextNode();
+  while (node) {
+    if (!node.parentElement?.closest("mark")) textNodes.push(node as Text);
+    node = walker.nextNode();
+  }
+  for (const textNode of textNodes) {
+    const value = textNode.nodeValue ?? "";
+    const lower = value.toLocaleLowerCase();
+    let cursor = 0;
+    let match = lower.indexOf(wanted);
+    if (match < 0) continue;
+    const fragment = document.createDocumentFragment();
+    while (match >= 0) {
+      fragment.append(value.slice(cursor, match));
+      const mark = document.createElement("mark");
+      mark.textContent = value.slice(match, match + needle.length);
+      fragment.append(mark);
+      cursor = match + needle.length;
+      match = lower.indexOf(wanted, cursor);
+    }
+    fragment.append(value.slice(cursor));
+    textNode.replaceWith(fragment);
+  }
+  return root.innerHTML;
 }
 
 export function CodeFilePane({ path, scrollRef }: { path: string; scrollRef?: RefObject<HTMLDivElement | null> }) {
@@ -71,6 +104,10 @@ export function CodeFilePane({ path, scrollRef }: { path: string; scrollRef?: Re
   const content = file?.content ?? "";
   const lines = content.split("\n");
   const matches = matchCount(content, find);
+  const renderedHighlighted = useMemo(
+    () => decorateMatches(highlighted, find),
+    [find, highlighted]
+  );
 
   function openFind() {
     setFindOpen(true);
@@ -127,8 +164,8 @@ export function CodeFilePane({ path, scrollRef }: { path: string; scrollRef?: Re
             <strong>Binary file</strong>
             <span>This file cannot be displayed as text.</span>
           </div>
-        ) : highlighted ? (
-          <div className="code-file-highlighted" dangerouslySetInnerHTML={{ __html: highlighted }} />
+        ) : renderedHighlighted ? (
+          <div className="code-file-highlighted" dangerouslySetInnerHTML={{ __html: renderedHighlighted }} />
         ) : (
           <pre className="code-file-source">
             {lines.map((line, index) => (

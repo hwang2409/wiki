@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import stat
 import subprocess
 import time
 from contextlib import asynccontextmanager
@@ -50,6 +51,7 @@ ROOT_DIR = Path(os.environ.get("WIKI_REPO_DIR", Path(__file__).resolve().parents
 VAULT_DIR = Path(os.environ.get("WIKI_VAULT_DIR", ROOT_DIR / "vault")).resolve()
 MAX_NOTE_BYTES = 2_000_000
 MAX_FILE_BYTES = 2_000_000
+MAX_FILE_TREE_ENTRIES = 10_000
 IGNORED_FILE_PARTS = {".git", ".obsidian", "node_modules"}
 
 VAULT_DIR.mkdir(parents=True, exist_ok=True)
@@ -142,6 +144,11 @@ class FileContent(BaseModel):
     error: str | None = None
 
 
+class FileTree(BaseModel):
+    files: list[FileSummary]
+    truncated: bool = False
+
+
 def slugify(value: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", value.strip().lower()).strip("-")
     return slug or "untitled"
@@ -185,42 +192,118 @@ def resolve_note_path(note_path: str) -> Path:
     return target
 
 
+def is_ignored_file_parts(parts: tuple[str, ...]) -> bool:
+    return any(part.startswith(".") or part in IGNORED_FILE_PARTS for part in parts)
+
+
+def file_not_found() -> None:
+    raise HTTPException(status_code=404, detail="File not found")
+
+
 def resolve_file_path(raw_path: str) -> tuple[Path, str]:
     candidate = raw_path.strip().replace("\\", "/")
-    path = PurePosixPath(candidate)
-    if (
-        not candidate
-        or path.is_absolute()
-        or any(part in {"", ".", ".."} for part in path.parts)
-        or any(part.startswith(".") for part in path.parts)
-    ):
-        raise HTTPException(status_code=404, detail="File not found")
-
-    vault_root = VAULT_DIR.resolve()
-    target = (vault_root / Path(*path.parts)).resolve()
+    if "\x00" in candidate:
+        file_not_found()
     try:
-        target.relative_to(vault_root)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail="File not found") from exc
+        path = PurePosixPath(candidate)
+        if (
+            not candidate
+            or path.is_absolute()
+            or any(part in {"", ".", ".."} for part in path.parts)
+            or is_ignored_file_parts(path.parts)
+        ):
+            file_not_found()
+
+        vault_root = VAULT_DIR.resolve()
+        target = (vault_root / Path(*path.parts)).resolve()
+        relative_target = target.relative_to(vault_root)
+        if is_ignored_file_parts(relative_target.parts):
+            file_not_found()
+    except HTTPException:
+        raise
+    except (OSError, RuntimeError, ValueError, TypeError):
+        file_not_found()
     return target, path.as_posix()
 
 
-def iter_vault_files() -> list[Path]:
+def iter_vault_files() -> tuple[list[Path], bool]:
     files: list[Path] = []
     vault_root = VAULT_DIR.resolve()
-    for path in vault_root.rglob("*"):
-        relative_parts = path.relative_to(vault_root).parts
-        if any(part.startswith(".") or part in IGNORED_FILE_PARTS for part in relative_parts):
-            continue
-        if not path.is_file():
-            continue
-        resolved = path.resolve()
+    directories = [vault_root]
+    truncated = False
+    while directories:
+        directory = directories.pop()
         try:
-            resolved.relative_to(vault_root)
-        except ValueError:
+            with os.scandir(directory) as scanner:
+                entries = sorted(scanner, key=lambda entry: entry.name)
+        except OSError:
             continue
-        files.append(resolved)
-    return sorted(files, key=lambda candidate: candidate.relative_to(vault_root).as_posix())
+        for entry in entries:
+            relative_parts = Path(entry.path).relative_to(vault_root).parts
+            if is_ignored_file_parts(relative_parts):
+                continue
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    directories.append(Path(entry.path))
+                    continue
+                if not entry.is_file(follow_symlinks=True):
+                    continue
+                resolved = Path(entry.path).resolve()
+                resolved_relative = resolved.relative_to(vault_root)
+                if is_ignored_file_parts(resolved_relative.parts):
+                    continue
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if len(files) >= MAX_FILE_TREE_ENTRIES:
+                truncated = True
+                return files, truncated
+            files.append(Path(entry.path))
+            if len(files) >= MAX_FILE_TREE_ENTRIES:
+                truncated = True
+                return files, truncated
+    files.sort(key=lambda candidate: candidate.relative_to(vault_root).as_posix())
+    return files, truncated
+
+
+def opened_file_is_safe(fd: int, target: Path, vault_root: Path) -> bool:
+    descriptor_stat = os.fstat(fd)
+    if not stat.S_ISREG(descriptor_stat.st_mode):
+        return False
+
+    for descriptor_link in (f"/proc/self/fd/{fd}", f"/dev/fd/{fd}"):
+        try:
+            descriptor_target = os.readlink(descriptor_link)
+        except OSError:
+            continue
+        if descriptor_target.endswith(" (deleted)"):
+            return False
+        try:
+            resolved_descriptor = Path(descriptor_target).resolve()
+            relative_descriptor = resolved_descriptor.relative_to(vault_root)
+        except (OSError, RuntimeError, ValueError):
+            return False
+        return not is_ignored_file_parts(relative_descriptor.parts)
+
+    try:
+        path_stat = os.stat(target, follow_symlinks=False)
+    except OSError:
+        return False
+    return (path_stat.st_dev, path_stat.st_ino) == (
+        descriptor_stat.st_dev,
+        descriptor_stat.st_ino,
+    )
+
+
+def read_open_file(fd: int, limit: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = limit + 1
+    while remaining > 0:
+        chunk = os.read(fd, remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
 
 
 def unique_note_path(raw_path: str | None, title: str) -> str:
@@ -3030,10 +3113,11 @@ def list_notes(q: str | None = None) -> list[NoteSummary]:
     return [to_summary(path) for path in files]
 
 
-@app.get("/api/files/tree", response_model=list[FileSummary])
-def list_files() -> list[FileSummary]:
+@app.get("/api/files/tree", response_model=FileTree)
+def list_files() -> FileTree:
     summaries: list[FileSummary] = []
-    for path in iter_vault_files():
+    files, truncated = iter_vault_files()
+    for path in files:
         try:
             stat_result = path.stat()
         except OSError:
@@ -3045,40 +3129,38 @@ def list_files() -> list[FileSummary]:
                 updated_at=datetime.fromtimestamp(stat_result.st_mtime, tz=timezone.utc),
             )
         )
-    return summaries
+    return FileTree(files=summaries, truncated=truncated)
 
 
 @app.get("/api/files/content", response_model=FileContent)
 def get_file_content(path: str = Query(..., min_length=1)) -> FileContent:
     target, relative_path = resolve_file_path(path)
-    if not target.is_file():
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(target, flags)
+    except OSError as exc:
+        raise HTTPException(status_code=404, detail="File not found") from exc
+
+    try:
+        vault_root = VAULT_DIR.resolve()
+        if not opened_file_is_safe(fd, target, vault_root):
+            file_not_found()
+        size = os.fstat(fd).st_size
+        raw = read_open_file(fd, MAX_FILE_BYTES)
+        if size > MAX_FILE_BYTES or len(raw) > MAX_FILE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail={
+                    "code": "file_too_large",
+                    "message": f"File exceeds the {MAX_FILE_BYTES // 1_000_000}MB viewing limit",
+                },
+            )
+    except HTTPException:
+        raise
+    except (OSError, RuntimeError, ValueError):
         raise HTTPException(status_code=404, detail="File not found")
-
-    try:
-        size = target.stat().st_size
-    except OSError as exc:
-        raise HTTPException(status_code=404, detail="File not found") from exc
-
-    if size > MAX_FILE_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail={
-                "code": "file_too_large",
-                "message": f"File exceeds the {MAX_FILE_BYTES // 1_000_000}MB viewing limit",
-            },
-        )
-    try:
-        raw = target.read_bytes()
-    except OSError as exc:
-        raise HTTPException(status_code=404, detail="File not found") from exc
-    if len(raw) > MAX_FILE_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail={
-                "code": "file_too_large",
-                "message": f"File exceeds the {MAX_FILE_BYTES // 1_000_000}MB viewing limit",
-            },
-        )
+    finally:
+        os.close(fd)
     if b"\x00" in raw:
         return FileContent(path=relative_path, size=size, binary=True, error="binary file")
     try:

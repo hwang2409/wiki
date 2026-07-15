@@ -40,6 +40,11 @@ export type FileSummary = {
   updated_at: string;
 };
 
+export type FileTree = {
+  files: FileSummary[];
+  truncated: boolean;
+};
+
 export type FileContent = {
   path: string;
   size: number;
@@ -49,7 +54,7 @@ export type FileContent = {
 };
 
 export function listFiles() {
-  return request<FileSummary[]>("/api/files/tree");
+  return request<FileTree>("/api/files/tree");
 }
 
 export function getFileContent(path: string) {

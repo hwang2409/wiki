@@ -896,7 +896,8 @@ body.is-resizing-panes .pane-cell {
   white-space: pre;
 }
 
-.code-file-source mark {
+.code-file-source mark,
+.code-file-highlighted mark {
   border-radius: 1px;
   background: color-mix(in srgb, var(--accent-primary) 36%, transparent);
   color: inherit;
