@@ -2,13 +2,21 @@
 type: log
 tags: [log, done]
 created: 2026-07-06
-updated: 2026-07-14
+updated: 2026-07-15
 ---
 
 # Done
 
+## 2026-07-15
+
+- **wiki** — WIKI-119 non-markdown file open — scoped file API + code viewer pane merged (#93, 0b6f391); 3 gate iterations, sol caught symlink-alias/TOCTOU class issues round 1, descriptor containment + exact-cap fixes round 3
+
 ## 2026-07-14
 
+- PHO-13733 admin tool surface docs merged (#11375, 5 gate iterations, PHO-13759 spun out)
+- WIKI-120 merged (#92): terminal fidelity (batching, safe PTY spawn, binary WS w/ capability negotiation, single-owner fd) + Cmd+F scrollback search. First full Fable→luna→sol pipeline run: 3 iterations, sol caught 4 BLOCKING (fork-in-threads, parent-PGID kill, frozen-build dispatch, fd-reuse races) + 2 HIGH; subsumes wiki-43/87cf014
+- PHO-13736 customer-predicate word-boundary regex merged (#11364)
+- PHO-13735 lifecycle_state_series cohort_anchor_date fallback merged (#11365)
 - WIKI-115 merged (#91): cdx render_artifact mcpToolCall results now normalize to kind=artifact events (write-time + read-time heal for archived runs); gate found WIKI-117 (test env-sensitivity) + WIKI-118 (hardening bundle); needs native-build+relaunch
 - [WIKI-114](https://github.com/hwang2409/wiki/pull/90) legible compact preview for large mermaid/SVG artifacts — explicit px dims from viewBox (kills Chromium 300px fallback), 400px crop + bottom/right fades + click-to-inspect via existing pan/zoom. Gate: 2 iterations (2 BLOCKING: wide diagrams still 2-6px text via width:max-content fallback, viewBox-only SVGs collapsed 0x0; 1 HIGH: test passed by 276px-fixture coincidence — wide fixture + width assertions added). Merged e792f49 via #90.
 - **phoebe** — admin account note -> org-Slack admin-agent thread automation merged (#11339, no ticket yet — backfill after Linear re-auth)
