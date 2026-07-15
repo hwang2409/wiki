@@ -698,6 +698,7 @@ type TreeFolder = {
 
 type TreeFile = {
   path: string;
+  openPath: string;
   id: string;
   isNote: boolean;
 };
@@ -770,13 +771,35 @@ function readStoredCollapsed(): Set<string> {
 
 function buildTree(
   notes: NoteSummary[],
-  files: Array<Pick<FileSummary, "path"> | NoteSummary> = notes
+  files?: Pick<FileSummary, "path">[]
 ): TreeFolder {
-  const notePaths = new Map(notes.map((note) => [note.path, note]));
+  // The file API uses repo-relative paths; the note API keeps vault-relative IDs.
+  // Represent notes at vault/<path> in the merged tree, but retain their note ID
+  // as openPath so clicking and note actions continue to use the note API.
+  const repoNotePaths = new Set(notes.map((note) => `vault/${note.path}`));
+  const treeFiles =
+    files === undefined
+      ? notes.map((note) => ({
+          id: note.id,
+          isNote: true,
+          openPath: note.path,
+          path: note.path,
+        }))
+      : [
+          ...files
+            .filter((file) => !repoNotePaths.has(file.path))
+            .map((file) => ({ id: file.path, isNote: false, openPath: file.path, path: file.path })),
+          ...notes.map((note) => ({
+            id: note.id,
+            isNote: true,
+            openPath: note.path,
+            path: `vault/${note.path}`,
+          })),
+        ];
   const root: TreeFolder = { name: "", path: "", folders: [], files: [] };
   const folderIndex = new Map<string, TreeFolder>([["", root]]);
 
-  for (const file of files) {
+  for (const file of treeFiles) {
     const parts = file.path.split("/");
     let current = root;
 
@@ -792,8 +815,9 @@ function buildTree(
     }
 
     current.files.push({
-      id: "id" in file ? file.id : file.path,
-      isNote: notePaths.has(file.path),
+      id: file.id,
+      isNote: file.isNote,
+      openPath: file.openPath,
       path: file.path,
     });
   }
@@ -1077,15 +1101,15 @@ function FolderTree({
           key={file.id}
           style={{ paddingInlineStart: `${depth * 17 + 24}px` }}
           type="button"
-          onClick={() => onOpenFile(file.path)}
-          onContextMenu={file.isNote ? (event) => onContextMenu(event, "file", file.path) : undefined}
+          onClick={() => onOpenFile(file.openPath)}
+          onContextMenu={file.isNote ? (event) => onContextMenu(event, "file", file.openPath) : undefined}
           onDragEnd={file.isNote ? onNoteDragEnd : undefined}
           onDragStart={
             file.isNote
               ? (event) => {
                   event.dataTransfer.effectAllowed = "copyMove";
-                  event.dataTransfer.setData("text/plain", file.path);
-                  onNoteDragStart(file.path);
+                  event.dataTransfer.setData("text/plain", file.openPath);
+                  onNoteDragStart(file.openPath);
                 }
               : undefined
           }
@@ -1406,7 +1430,7 @@ export default function App() {
   }, [agentsState.workers]);
 
   const tree = useMemo(
-    () => buildTree(notes, showAllFiles && files.length > 0 ? files : undefined),
+    () => buildTree(notes, showAllFiles ? files : undefined),
     [files, notes, showAllFiles]
   );
   const activeWindow = useMemo(
@@ -2411,9 +2435,16 @@ export default function App() {
   }
 
   function promptNewNoteIn(folderPath: string) {
+    const noteFolder = showAllFiles
+      ? folderPath === "vault"
+        ? ""
+        : folderPath.startsWith("vault/")
+          ? folderPath.slice("vault/".length)
+          : folderPath
+      : folderPath;
     setDialog({
       title: "New note",
-      input: `${folderPath}/`,
+      input: noteFolder ? `${noteFolder}/` : "",
       confirmLabel: "Create",
       onConfirm: (value) => {
         if (value && !value.endsWith("/")) createFromPath(value);
@@ -2443,7 +2474,14 @@ export default function App() {
     const source = draggingNotePath;
     setDraggingNotePath(null);
     if (!source) return;
-    const dest = `${folderPath}/${basename(source)}.md`;
+    const noteFolder = showAllFiles
+      ? folderPath === "vault"
+        ? ""
+        : folderPath.startsWith("vault/")
+          ? folderPath.slice("vault/".length)
+          : folderPath
+      : folderPath;
+    const dest = noteFolder ? `${noteFolder}/${basename(source)}.md` : `${basename(source)}.md`;
     if (dest !== source) doRename(source, dest);
   }
 
@@ -3209,7 +3247,11 @@ export default function App() {
                       mode === "file"
                         ? focusedPanePath
                         : mode === "view" || mode === "edit"
-                          ? activeNote?.path ?? null
+                          ? activeNote
+                            ? showAllFiles
+                              ? `vault/${activeNote.path}`
+                              : activeNote.path
+                            : null
                           : null
                     }
                     collapsed={collapsedFolders}
