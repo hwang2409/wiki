@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import fcntl
 import os
+import signal
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 from unittest import TestCase
+from unittest.mock import patch
 
 from backend.app.native_lifecycle import hold_app_lock, hold_runtime_locks
+import scripts.atomic_swap as atomic_swap_module
 from scripts.atomic_swap import atomic_replace
 from scripts.native_build_guard import inspect_runtime
 
@@ -106,3 +109,36 @@ class NativeBuildGuardTests(TestCase):
                 self.assertNotEqual(probe.returncode, 0)
             self.assertTrue((root / "stage" / ".swap-complete").exists())
             self.assertFalse(inspect_runtime(runtime).running)
+
+    def test_interrupt_after_exchange_writes_sentinel_and_retry_is_noop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            live = root / "live" / "Wiki.app"
+            staged = root / "stage" / "Wiki.app"
+            live.mkdir(parents=True)
+            staged.mkdir(parents=True)
+            (live / "marker").write_text("old", encoding="utf-8")
+            (staged / "marker").write_text("new", encoding="utf-8")
+            sentinel = root / "stage" / ".swap-complete"
+            intent = root / "stage" / ".swap-intent"
+
+            real_swap = atomic_swap_module._rename_swap
+
+            def interrupt_after_exchange(first: Path, second: Path) -> bool:
+                result = real_swap(first, second)
+                os.kill(os.getpid(), signal.SIGINT)
+                return result
+
+            with patch.object(
+                atomic_swap_module,
+                "_rename_swap",
+                side_effect=interrupt_after_exchange,
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    atomic_swap_module.atomic_replace(staged, live, sentinel, intent)
+
+            self.assertEqual((live / "marker").read_text(encoding="utf-8"), "new")
+            self.assertEqual((staged / "marker").read_text(encoding="utf-8"), "old")
+            self.assertTrue(sentinel.exists())
+            self.assertFalse(atomic_swap_module.atomic_replace(staged, live, sentinel, intent))
+            self.assertEqual((live / "marker").read_text(encoding="utf-8"), "new")

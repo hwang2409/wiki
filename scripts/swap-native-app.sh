@@ -16,7 +16,8 @@ fi
 
 staged_bundle="$stage_root/target/release/bundle/macos/Wiki.app"
 live_bundle="$ROOT/src-tauri/target/release/bundle/macos/Wiki.app"
-if [[ ! -d "$staged_bundle" ]]; then
+swap_intent="$stage_root/.swap-intent"
+if [[ ! -d "$staged_bundle" && ! -f "$swap_intent" ]]; then
   echo "missing staged Wiki.app at $staged_bundle" >&2
   exit 1
 fi
@@ -26,6 +27,7 @@ python3 "$ROOT/scripts/atomic_swap.py" \
   "$live_bundle" \
   --runtime-dir "$runtime_dir" \
   --success-sentinel "$stage_root/.swap-complete" \
+  --swap-intent "$swap_intent" \
   "${allow_missing_args[@]}"
 
 rm -rf "$stage_root"

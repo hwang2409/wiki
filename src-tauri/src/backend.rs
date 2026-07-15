@@ -150,8 +150,7 @@ enum SidecarAction {
     ShowError(String, PathBuf),
 }
 
-pub fn setup(app: &mut App) -> Result<(), Box<dyn Error>> {
-    let app_lock = acquire_app_lock()?;
+pub fn setup(app: &mut App, app_lock: File) -> Result<(), Box<dyn Error>> {
     app.manage(NativeAppState {
         _app_lock: Some(app_lock),
         ..NativeAppState::default()
@@ -194,7 +193,7 @@ fn runtime_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".wiki/agent-runtime"))
 }
 
-fn acquire_app_lock() -> Result<File, Box<dyn Error>> {
+pub fn acquire_app_lock() -> io::Result<File> {
     let runtime_dir = runtime_dir();
     fs::create_dir_all(&runtime_dir)?;
     fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700))?;
@@ -220,8 +219,7 @@ fn acquire_app_lock() -> Result<File, Box<dyn Error>> {
                 "Wiki.app is already running (app lock held at {})",
                 path.display()
             ),
-        )
-        .into());
+        ));
     }
     Err(io::Error::new(
         error.kind(),
@@ -229,8 +227,17 @@ fn acquire_app_lock() -> Result<File, Box<dyn Error>> {
             "cannot acquire Wiki.app lock at {}: {error}",
             path.display()
         ),
-    )
-    .into())
+    ))
+}
+
+pub fn show_already_running_dialog() {
+    let script = r#"display dialog "Wiki is already running.\n\nThe existing Wiki window remains active." with title "Wiki" buttons {"OK"} default button "OK" with icon caution"#;
+    if let Err(error) = std::process::Command::new("/usr/bin/osascript")
+        .args(["-e", script])
+        .status()
+    {
+        eprintln!("Wiki is already running; unable to show native dialog: {error}");
+    }
 }
 
 pub fn handle_window_event(window: &tauri::Window, event: &WindowEvent) {
