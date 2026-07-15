@@ -44,7 +44,7 @@ import {
   searchNotes,
   updateNote
 } from "./api";
-import type { AgentWorker, ArchivedWorker, FileSummary, NoteLinks, Orchestrator } from "./api";
+import { ApiError, type AgentWorker, type ArchivedWorker, type FileSummary, type NoteLinks, type Orchestrator } from "./api";
 import {
   FleetSwitcher,
   QuickSwitcher,
@@ -1278,7 +1278,6 @@ export default function App() {
   const [files, setFiles] = useState<FileSummary[]>([]);
   const [filesLoaded, setFilesLoaded] = useState(false);
   const [filesLoading, setFilesLoading] = useState(false);
-  const [filesLoadAttempted, setFilesLoadAttempted] = useState(false);
   const [filesTruncated, setFilesTruncated] = useState(false);
   const [showAllFiles, setShowAllFiles] = useState(
     () => localStorage.getItem("wiki-show-all-files") === "true"
@@ -1340,6 +1339,7 @@ export default function App() {
   const preserveViewScrollRef = useRef(false);
   const appliedHashRef = useRef<string | null>(null);
   const closedTicketsRef = useRef<Set<string>>(new Set());
+  const filesLoadPromiseRef = useRef<Promise<void> | null>(null);
 
   function nextPaneId() {
     paneIdRef.current += 1;
@@ -1520,10 +1520,9 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if ((!showAllFiles && !switcherOpen) || filesLoadAttempted || filesLoading) return;
-    setFilesLoadAttempted(true);
+    if ((!showAllFiles && !switcherOpen) || filesLoaded || filesLoadPromiseRef.current) return;
     setFilesLoading(true);
-    listFiles()
+    const request = listFiles()
       .then((nextTree) => {
         setFiles(nextTree.files);
         setFilesTruncated(nextTree.truncated);
@@ -1534,8 +1533,12 @@ export default function App() {
         setFilesTruncated(false);
         setFilesLoaded(false);
       })
-      .finally(() => setFilesLoading(false));
-  }, [showAllFiles, switcherOpen]);
+      .finally(() => {
+        if (filesLoadPromiseRef.current === request) filesLoadPromiseRef.current = null;
+        setFilesLoading(false);
+      });
+    filesLoadPromiseRef.current = request;
+  }, [filesLoaded, showAllFiles, switcherOpen]);
 
   useEffect(() => {
     for (const window of windowState.windows) {
@@ -1596,12 +1599,12 @@ export default function App() {
   );
   const visibleRecentResources = useMemo(() => {
     const notePaths = notesLoaded ? new Set(notes.map((note) => note.path)) : null;
-    const filePaths = filesLoaded ? new Set(files.map((file) => file.path)) : null;
+    const filePaths = filesLoaded && !filesTruncated ? new Set(files.map((file) => file.path)) : null;
     return recentResources.filter((item) => {
       if (item.kind === "note") return notePaths === null || notePaths.has(item.path);
       return filePaths === null || filePaths.has(item.path);
     });
-  }, [files, filesLoaded, notes, notesLoaded, recentResources, showAllFiles]);
+  }, [files, filesLoaded, filesTruncated, notes, notesLoaded, recentResources]);
   useEffect(() => {
     const visibleKeys = new Set(visibleRecentResources.map(recentResourceKey));
     setRecentResources((current) => {
@@ -1969,7 +1972,9 @@ export default function App() {
         setMode("view");
       }
     } catch (err) {
-      forgetRecentResource("note", path);
+      if (err instanceof ApiError && (err.status === 404 || err.status === 410)) {
+        forgetRecentResource("note", path);
+      }
       setError(err instanceof Error ? err.message : "Could not open note");
     }
   }
@@ -1984,7 +1989,7 @@ export default function App() {
     if (kind === "note") {
       return notesLoaded ? notes.some((note) => note.path === path) : null;
     }
-    if (!showAllFiles || !filesLoaded) return null;
+    if (!showAllFiles || !filesLoaded || filesTruncated) return null;
     return files.some((file) => file.path === path);
   }
 
@@ -2039,8 +2044,12 @@ export default function App() {
       }
       try {
         await getFileContent(item.path);
-      } catch {
-        forgetRecentResource("file", item.path);
+      } catch (error) {
+        if (error instanceof ApiError && (error.status === 404 || error.status === 410)) {
+          forgetRecentResource("file", item.path);
+        }
+        if (error instanceof Error) setError(error.message);
+        else setError("Could not open file");
         return;
       }
     }
