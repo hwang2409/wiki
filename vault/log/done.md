@@ -9,6 +9,9 @@ updated: 2026-07-15
 
 ## 2026-07-15
 
+- WIKI-121 CodeMirror 6 editor merged (#95): markdown+lazy langs, CSS-var theme, history/undo, code-split; 6 review rounds incl. fallback design simplification
+- WIKI-125 note rendering merged (#97): mermaid (lazy/strict/theme-synced), vault asset endpoint, image/svg embeds, table styling; 4 review rounds
+- WIKI-122 explorer polish merged (#96): extension icons, repo files + boundary fuzzy in Cmd+K, Recent group; 4 review rounds
 - **wiki** — WIKI-123 repo-scoped file browsing merged (#94, 0b6e9ad) — file API re-rooted at repo, 2-round sol gate
 - PHO-13783 analysis-log note Slack automation merged (#11397, 02f633ea47)
 - PHO-13780 account-health tick cron registered + barrel-registration guard merged (#11398, 0e4974121f)

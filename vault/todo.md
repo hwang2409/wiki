@@ -15,6 +15,8 @@ Todo:
 - [P2] WIKI-124: accepted svg artifact silently not rendered in session view above size threshold — 24KB svg (id 4907cf6e, 14:48Z 2026-07-15) accepted server-side, never displayed; 800B probe (1acaeef1) rendered fine. Silent accept-then-drop masks failure from sender. Fix: render large svg (scroll/scale) OR visible reject like source-validation errors. Bisect threshold; check overlap with mermaid >20-node compact-preview machinery. Related [[WIKI-116]]
 - [P2] PHO-13800 customer_churned_date timing unreliable (19/29 in one entry window; zero churns Jan-Apr) — backfill true dates or document entry-date semantic; related PHO-13735
 - [P2] PHO-13763 PARKED by Henry 2026-07-15: PR 11383 drafted at 909ef288ce, gate-passed (CI green, 0 threads, sol REVIEW4 merge-ready), worker archived — resume = un-draft, re-verify freshness vs main, merge
+- [P1] amd-shadow migration: KORGAN owns (Henry 2026-07-15). PR 11416 closed w/ handoff evidence comment. Prod: invalid 0-byte index, no schema_migrations row; correct fix = NEW migration w/ SET timeout + DROP CONCURRENTLY first. Watch next prod deploy
+- [P3] WIKI-126: surface rebrand — rename app-facing identity only (app display name, window title, README header); NAME NOT YET CHOSEN by Henry, blocked until he picks. Internal identifiers stay (repo, wiki CLI, WIKI-* tickets, MCP names, vault paths — codename doctrine, Henry 2026-07-15)
 
 In Progress:
 
@@ -25,8 +27,7 @@ In Progress:
 - [P4] [PHO-13368](https://linear.app/phoebework/issue/PHO-13368): admin agent run events monospace font — cc:PHO-13368 worker
 - [P2] [PHO-13669](https://linear.app/phoebework/issue/PHO-13669): Core email/account-book gaps — cdx:PHO-13669 (gpt-5.6-terra)
 - PHO-13763 per-org scratchpad (worker cdx:PHO-13763, run bd90b506)
-- [P1] WIKI-121: CodeMirror 6 source editor — replace pane.tsx:305 textarea with CM6 (markdown + fenced-code-block language highlighting, theme sync to CSS vars, preserve draft/save contract). Code-editor arc wave 2 — cdx:WIKI-121 worker (luna, run ebd92126)
-- [P2] WIKI-122: file-explorer polish — file-type icons by extension, full-path fuzzy match in Cmd+K switcher, recent-files group. Code-editor arc wave 2 — cdx:WIKI-122 worker (luna, run c07f6bc5)
+- [P2] PHO-13804 admin agent full Intercom messages: Core getConversation(parts) + admin-agent endpoint + audit-scoped tool, live-fetch only (PII), spill-cap output
 
 Backlog:
 

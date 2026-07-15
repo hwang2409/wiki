@@ -19,7 +19,7 @@ Unless a ticket or Henry specifies otherwise:
 | Implement worker | cdx | gpt-5.6-luna |
 | Review worker | cdx | gpt-5.6-sol |
 
-Flow: Fable spawns luna implementer → worker signals merge-ready → Fable spawns (or steers existing) sol reviewer as the gate's deep-review step → sol's severity-tagged findings return to Fable → Fable structures them into a steer to the luna implementer (observed → why wrong → do instead → constraint, one item per finding) → loop until sol returns MERGE-READY clean → merge per repo authority. Sol never steers luna directly; all routing goes through the orchestrator. Iteration cap and Henry-interrupt rules follow the gate-loop section below. Explicit `--model`/`--effort` overrides remain allowed per ticket.
+Flow: Fable spawns luna implementer → worker signals merge-ready → Fable spawns sol reviewer as the gate's deep-review step (one reviewer per round: archive the reviewer `closed` as soon as its verdict is routed, then spawn a fresh `<TICKET>-REVIEW<n>` pinned at the new head SHA next round — every SHA gets fresh eyes and idle reviewers don't burn soft-cap slots; Henry 2026-07-15) → sol's severity-tagged findings return to Fable → Fable structures them into a steer to the luna implementer (observed → why wrong → do instead → constraint, one item per finding) → loop until sol returns MERGE-READY clean → merge per repo authority. Sol never steers luna directly; all routing goes through the orchestrator. Iteration cap and Henry-interrupt rules follow the gate-loop section below. Explicit `--model`/`--effort` overrides remain allowed per ticket.
 
 ## Identity
 
@@ -153,6 +153,8 @@ curl -sS -X POST "$BASE/api/agents/<TICKET>/archive" \
 ```
 
 Then stop the ticket's state Monitor (orchestrator-side `TaskStop`), remove the worktree if merged AND clean, and log the outcome. There is no tmux window to kill and no `/tmp/cdx-<TICKET>*` files to delete — the supervisor stores everything under `WIKI_AGENT_RUNTIME_DIR/runs/<run-id>/` and the archive endpoint persists it in place.
+
+**Sweep ALL of the ticket's workers, not just the implementer.** Wrap-up (merge, park, or abandon) must `list_agents` and archive every worker whose ticket prefix matches the wrapped ticket — including every `<TICKET>-REVIEW`/`-REVIEW-N` spawn (reviewers: `outcome=closed`). A leaked reviewer holds a provider subprocess and clutters the fleet (Henry correction 2026-07-15, PHO-13763 park left REVIEW4 live).
 
 ### Legacy tmux worker (pre-WIKI-42)
 
