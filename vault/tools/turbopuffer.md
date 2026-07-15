@@ -11,6 +11,16 @@ Serverless vector + full-text search database built on object storage (S3/GCS): 
 
 ## Core model
 
+```mermaid
+flowchart LR
+    C[Client] -->|upsert| Q[Query/Write nodes]
+    C -->|query| Q
+    Q -->|write WAL + index| OS[(Object storage<br/>S3/GCS — source of truth)]
+    Q -->|cache miss| OS
+    Q --- NC[NVMe/RAM cache<br/>hot namespaces]
+    OS -.->|cold namespace:<br/>first-query fetch| NC
+```
+
 - Storage-compute separation: writes land in object storage; queries served from cache layer.
 - Namespaces = many small isolated indexes, cheap at millions of tenants — per-user / per-doc / per-repo search is the native shape.
 - Search: ANN vector + BM25 full-text + attribute filters; hybrid queries.
