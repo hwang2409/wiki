@@ -2922,6 +2922,14 @@ body.is-resizing-panes .pane-cell {
   height: auto;
 }
 
+.markdown-mermaid-scratch {
+  position: absolute;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
 .markdown-mermaid-loading,
 .markdown-mermaid-error {
   padding: 12px 16px;

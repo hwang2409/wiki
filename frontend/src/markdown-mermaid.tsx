@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { useCurrentTheme } from "./shiki";
 
 function cssVariable(name: string) {
@@ -23,12 +23,19 @@ function mermaidThemeVariables() {
 export function MermaidBlock({ source }: { source: string }) {
   const theme = useCurrentTheme();
   const reactId = useId();
+  const scratchRef = useRef<HTMLDivElement>(null);
   const [html, setHtml] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     const id = `wiki-note-mermaid-${reactId.replace(/[^a-zA-Z0-9_-]/g, "")}`;
+    const cleanup = () => {
+      document.getElementById(id)?.remove();
+      document.getElementById(`d${id}`)?.remove();
+      document.getElementById(`i${id}`)?.remove();
+      scratchRef.current?.replaceChildren();
+    };
     setHtml("");
     setError(null);
     void import("mermaid").then(async ({ default: mermaid }) => {
@@ -36,20 +43,24 @@ export function MermaidBlock({ source }: { source: string }) {
         mermaid.initialize({
           startOnLoad: false,
           securityLevel: "strict",
+          suppressErrorRendering: true,
           theme: "base",
           themeVariables: mermaidThemeVariables()
         });
-        const rendered = await mermaid.render(id, source);
+        const rendered = await mermaid.render(id, source, scratchRef.current ?? undefined);
         if (!cancelled) setHtml(rendered.svg);
       } catch (reason) {
         if (!cancelled) {
           setHtml("");
           setError(reason instanceof Error ? reason.message : "Mermaid could not render this source.");
         }
+      } finally {
+        cleanup();
       }
     });
     return () => {
       cancelled = true;
+      cleanup();
     };
   }, [reactId, source, theme]);
 
@@ -58,9 +69,22 @@ export function MermaidBlock({ source }: { source: string }) {
       <div className="markdown-mermaid-error" role="alert">
         <div>{error}</div>
         <pre><code>{source}</code></pre>
+        <div ref={scratchRef} className="markdown-mermaid-scratch" aria-hidden="true" />
       </div>
     );
   }
-  if (!html) return <div className="markdown-mermaid-loading">Rendering diagram…</div>;
-  return <div className="markdown-mermaid" dangerouslySetInnerHTML={{ __html: html }} />;
+  if (!html) {
+    return (
+      <div className="markdown-mermaid-loading">
+        Rendering diagram…
+        <div ref={scratchRef} className="markdown-mermaid-scratch" aria-hidden="true" />
+      </div>
+    );
+  }
+  return (
+    <div className="markdown-mermaid">
+      <div dangerouslySetInnerHTML={{ __html: html }} />
+      <div ref={scratchRef} className="markdown-mermaid-scratch" aria-hidden="true" />
+    </div>
+  );
 }

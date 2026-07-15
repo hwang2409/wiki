@@ -99,6 +99,10 @@ async function main() {
       (await page.locator(".markdown-mermaid-error").innerText()).includes("this is not a mermaid diagram"),
       "malformed Mermaid source was not shown in the error fallback",
     );
+    assert(
+      await page.locator('body [id^="dwiki-note-mermaid-"]').count() === 0,
+      "malformed Mermaid left a scratch container in document.body",
+    );
     await page.locator(".markdown-mermaid svg").waitFor({ state: "visible" });
     assert(await page.locator(".markdown-mermaid-error svg").count() === 0, "error fallback rendered outside its diagram container");
 
