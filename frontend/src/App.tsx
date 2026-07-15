@@ -70,8 +70,10 @@ import {
   parseFilePanePath,
   parseStoredRecentResources,
   reconcileWorkspaceState,
+  shouldAcceptWorkspaceResponse,
   type TreeFile,
   type TreeFolder,
+  workspaceCacheKey,
 } from "./file-workspaces";
 import { SettingsModal, applyStoredFonts } from "./settings";
 import { ActivityFeed } from "./activity";
@@ -1271,6 +1273,7 @@ export default function App() {
   const appliedHashRef = useRef<string | null>(null);
   const closedTicketsRef = useRef<Set<string>>(new Set());
   const filesLoadPromiseRef = useRef(new Map<string, Promise<void>>());
+  const workspaceRefreshVersionRef = useRef(0);
 
   function nextPaneId() {
     paneIdRef.current += 1;
@@ -1365,6 +1368,7 @@ export default function App() {
     listWorkspaces()
       .then((result) => {
         if (ignore) return;
+        workspaceRefreshVersionRef.current += 1;
         setWorkspaces(result.workspaces);
         setActiveWorkspace((current) =>
           reconcileWorkspaceState(result.workspaces, current, {}).activeWorkspace
@@ -1479,38 +1483,56 @@ export default function App() {
     };
   }, []);
 
-  const activeFileState = filesByWorkspace[activeWorkspace];
+  const activeWorkspaceInfo = workspaces.find((workspace) => workspace.id === activeWorkspace);
+  const activeFileCacheKey = activeWorkspaceInfo ? workspaceCacheKey(activeWorkspaceInfo) : null;
+  const activeFileState = activeFileCacheKey ? filesByWorkspace[activeFileCacheKey] : undefined;
   const files = activeFileState?.files ?? [];
   const filesLoaded = activeFileState?.loaded ?? false;
   const filesLoading = activeFileState?.loading ?? false;
   const filesTruncated = activeFileState?.truncated ?? false;
 
   useEffect(() => {
-    if ((!showAllFiles && !switcherOpen) || !activeWorkspace || activeFileState?.loaded) return;
-    if (filesLoadPromiseRef.current.has(activeWorkspace)) return;
+    if (
+      (!showAllFiles && !switcherOpen) ||
+      !activeWorkspaceInfo ||
+      !activeWorkspaceInfo.live ||
+      activeFileState?.loaded
+    ) return;
+    const cacheKey = workspaceCacheKey(activeWorkspaceInfo);
+    if (filesLoadPromiseRef.current.has(cacheKey)) return;
     setFilesByWorkspace((current) => ({
       ...current,
-      [activeWorkspace]: { ...(current[activeWorkspace] ?? { files: [], truncated: false, loaded: false }), loading: true },
+      [cacheKey]: { ...(current[cacheKey] ?? { files: [], truncated: false, loaded: false }), loading: true },
     }));
     const workspace = activeWorkspace;
+    const requestedWorkspace = activeWorkspaceInfo;
+    const requestVersion = workspaceRefreshVersionRef.current;
     const request = listFiles(workspace)
       .then((nextTree) => {
+        if (!shouldAcceptWorkspaceResponse(requestVersion, workspaceRefreshVersionRef.current, requestedWorkspace, cacheKey)) {
+          return;
+        }
         setFilesByWorkspace((current) => ({
           ...current,
-          [workspace]: { files: nextTree.files, truncated: nextTree.truncated, loaded: true, loading: false },
+          [cacheKey]: { files: nextTree.files, truncated: nextTree.truncated, loaded: true, loading: false },
         }));
       })
       .catch(() => {
+        if (!shouldAcceptWorkspaceResponse(requestVersion, workspaceRefreshVersionRef.current, requestedWorkspace, cacheKey)) {
+          return;
+        }
         setFilesByWorkspace((current) => ({
           ...current,
-          [workspace]: { files: [], truncated: false, loaded: false, loading: false },
+          [cacheKey]: { files: [], truncated: false, loaded: false, loading: false },
         }));
       })
       .finally(() => {
-        filesLoadPromiseRef.current.delete(workspace);
+        if (filesLoadPromiseRef.current.get(cacheKey) === request) {
+          filesLoadPromiseRef.current.delete(cacheKey);
+        }
       });
-    filesLoadPromiseRef.current.set(workspace, request);
-  }, [activeFileState?.loaded, activeWorkspace, refreshTick, showAllFiles, switcherOpen, workspaces]);
+    filesLoadPromiseRef.current.set(cacheKey, request);
+  }, [activeFileState?.loaded, activeWorkspace, activeWorkspaceInfo, refreshTick, showAllFiles, switcherOpen, workspaces]);
 
   useEffect(() => {
     for (const window of windowState.windows) {

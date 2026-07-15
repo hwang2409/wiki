@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import resource
 import tempfile
 import unittest
 from pathlib import Path
@@ -322,6 +323,42 @@ class FilesApiTests(unittest.TestCase):
 
         self.assertEqual([entry.path for entry in tree.files], ["inside.txt"])
         self.assertTrue(tree.truncated)
+
+    def test_tree_truncation_does_not_leak_queued_directory_fds(self) -> None:
+        for index in range(40):
+            directory = self.other_repo / f"wide-{index}"
+            directory.mkdir()
+            (directory / "file.txt").write_text("file", encoding="utf-8")
+        with mock.patch.object(main, "FILES_ROOT", self.other_repo), mock.patch.object(
+            main, "MAX_FILE_TREE_ENTRIES", 1
+        ):
+            before = len(os.listdir("/dev/fd"))
+            tree = main.list_files()
+            after = len(os.listdir("/dev/fd"))
+
+        self.assertTrue(tree.truncated)
+        self.assertLessEqual(after, before + 1)
+
+    def test_wide_tree_is_complete_under_low_file_descriptor_limit(self) -> None:
+        limited_root = self.other_repo / "low-limit-root"
+        limited_root.mkdir()
+        for index in range(100):
+            directory = limited_root / f"limited-{index}"
+            directory.mkdir()
+            (directory / "file.txt").write_text("file", encoding="utf-8")
+        soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if hard_limit < 48:
+            self.skipTest("host file descriptor hard limit is below regression limit")
+
+        with mock.patch.object(main, "FILES_ROOT", limited_root):
+            resource.setrlimit(resource.RLIMIT_NOFILE, (48, hard_limit))
+            try:
+                tree = main.list_files()
+            finally:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (soft_limit, hard_limit))
+
+        self.assertEqual(len(tree.files), 100)
+        self.assertFalse(tree.truncated)
 
     def test_tree_prunes_excluded_directories_before_descending(self) -> None:
         (self.repo / ".git").mkdir()

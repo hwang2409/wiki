@@ -28,6 +28,7 @@ export type TreeFolder = {
 
 type WorkspaceStatus = {
   id: string;
+  root: string;
   live: boolean;
 };
 
@@ -60,6 +61,19 @@ export function fileResourceKey(workspace: string, path: string): string {
 
 export function isActiveFilePath(activePath: string | null, workspace: string, path: string): boolean {
   return activePath === filePanePath(workspace, path);
+}
+
+export function workspaceCacheKey(workspace: WorkspaceStatus): string {
+  return `${workspace.id}\u0000${workspace.root}`;
+}
+
+export function shouldAcceptWorkspaceResponse(
+  requestVersion: number,
+  currentVersion: number,
+  workspace: WorkspaceStatus,
+  cacheKey: string
+): boolean {
+  return requestVersion === currentVersion && workspace.live && workspaceCacheKey(workspace) === cacheKey;
 }
 
 export function buildTree(
@@ -136,10 +150,11 @@ export function reconcileWorkspaceState<T>(
   cache: Record<string, T>
 ): { activeWorkspace: string; cache: Record<string, T> } {
   const liveIds = new Set(workspaces.filter((workspace) => workspace.live).map((workspace) => workspace.id));
+  const liveCacheKeys = new Set(workspaces.filter((workspace) => workspace.live).map(workspaceCacheKey));
   const fallback = liveIds.has("wiki") ? "wiki" : workspaces.find((workspace) => workspace.live)?.id ?? "wiki";
   return {
     activeWorkspace: liveIds.has(activeWorkspace) ? activeWorkspace : fallback,
-    cache: Object.fromEntries(Object.entries(cache).filter(([workspace]) => liveIds.has(workspace))),
+    cache: Object.fromEntries(Object.entries(cache).filter(([key]) => liveCacheKeys.has(key))),
   };
 }
 

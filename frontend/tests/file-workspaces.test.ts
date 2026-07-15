@@ -9,7 +9,9 @@ import {
   parseFilePanePath,
   parseStoredRecentResources,
   reconcileWorkspaceState,
+  shouldAcceptWorkspaceResponse,
   workspaceFileSearchPath,
+  workspaceCacheKey,
 } from "../src/file-workspaces.ts";
 import { fileContentRequestPath } from "../src/api.ts";
 
@@ -75,26 +77,47 @@ test("built trees preserve workspace identity for shared relative paths", () => 
 });
 
 test("workspace refresh reconciles stopped and newly live workspaces", () => {
-  const cache = { wiki: "wiki-files", phoebe: "phoebe-files" };
+  const wiki = { id: "wiki", root: "/wiki", live: true };
+  const phoebe = { id: "phoebe", root: "/phoebe", live: true };
+  const cache = { [workspaceCacheKey(wiki)]: "wiki-files", [workspaceCacheKey(phoebe)]: "phoebe-files" };
   const stopped = reconcileWorkspaceState(
     [
-      { id: "wiki", live: true },
-      { id: "phoebe", live: false },
+      wiki,
+      { ...phoebe, live: false },
     ],
     "phoebe",
     cache
   );
   assert.equal(stopped.activeWorkspace, "wiki");
-  assert.deepEqual(stopped.cache, { wiki: "wiki-files" });
+  assert.deepEqual(stopped.cache, { [workspaceCacheKey(wiki)]: "wiki-files" });
 
   const newlyLive = reconcileWorkspaceState(
     [
-      { id: "wiki", live: true },
-      { id: "phoebe", live: true },
+      wiki,
+      phoebe,
     ],
     "phoebe",
     stopped.cache
   );
   assert.equal(newlyLive.activeWorkspace, "phoebe");
-  assert.deepEqual(newlyLive.cache, { wiki: "wiki-files" });
+  assert.deepEqual(newlyLive.cache, { [workspaceCacheKey(wiki)]: "wiki-files" });
+});
+
+test("workspace cache keys invalidate same-ID root changes", () => {
+  const oldWorkspace = { id: "misc", root: "/old", live: true };
+  const newWorkspace = { id: "misc", root: "/new", live: true };
+  const oldKey = workspaceCacheKey(oldWorkspace);
+  const next = reconcileWorkspaceState([newWorkspace], "misc", { [oldKey]: "stale" });
+
+  assert.equal(next.activeWorkspace, "misc");
+  assert.deepEqual(next.cache, {});
+  assert.notEqual(oldKey, workspaceCacheKey(newWorkspace));
+});
+
+test("delayed file responses are ignored after a workspace lifecycle refresh", () => {
+  const workspace = { id: "phoebe", root: "/phoebe", live: true };
+  const key = workspaceCacheKey(workspace);
+
+  assert.equal(shouldAcceptWorkspaceResponse(4, 4, workspace, key), true);
+  assert.equal(shouldAcceptWorkspaceResponse(4, 5, { ...workspace, live: false }, key), false);
 });

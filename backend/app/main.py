@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import os
 import re
@@ -330,6 +331,25 @@ def open_relative_file(root_fd: int, relative_parts: tuple[str, ...]) -> int:
         raise
 
 
+def open_relative_directory(root_fd: int, relative_parts: tuple[str, ...]) -> int:
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    current_fd = os.dup(root_fd)
+    try:
+        for component in relative_parts:
+            next_fd = os.open(
+                component,
+                os.O_RDONLY | directory_flag | no_follow,
+                dir_fd=current_fd,
+            )
+            os.close(current_fd)
+            current_fd = next_fd
+        return current_fd
+    except BaseException:
+        os.close(current_fd)
+        raise
+
+
 def iter_repo_files(file_root: Path, root_fd: int | None = None) -> tuple[list[Path], bool]:
     if root_fd is not None:
         return iter_repo_files_from_fd(file_root, root_fd)
@@ -383,13 +403,18 @@ def iter_repo_files(file_root: Path, root_fd: int | None = None) -> tuple[list[P
 
 def iter_repo_files_from_fd(file_root: Path, root_fd: int) -> tuple[list[Path], bool]:
     files: list[Path] = []
-    directories: list[tuple[int, tuple[str, ...]]] = [(os.dup(root_fd), ())]
+    directories: list[tuple[str, ...]] = [()]
     truncated = False
     no_follow = getattr(os, "O_NOFOLLOW", 0)
-    directory_flag = getattr(os, "O_DIRECTORY", 0)
 
     while directories:
-        directory_fd, directory_parts = directories.pop()
+        directory_parts = directories.pop()
+        try:
+            directory_fd = open_relative_directory(root_fd, directory_parts)
+        except OSError as exc:
+            if exc.errno in {errno.EMFILE, errno.ENFILE}:
+                return files, True
+            continue
         try:
             with os.scandir(directory_fd) as scanner:
                 entries = sorted(scanner, key=lambda entry: entry.name)
@@ -399,12 +424,7 @@ def iter_repo_files_from_fd(file_root: Path, root_fd: int) -> tuple[list[Path], 
                     continue
                 try:
                     if entry.is_dir(follow_symlinks=False):
-                        child_fd = os.open(
-                            entry.name,
-                            os.O_RDONLY | directory_flag | no_follow,
-                            dir_fd=directory_fd,
-                        )
-                        directories.append((child_fd, relative_parts))
+                        directories.append(relative_parts)
                         continue
                     if not entry.is_file(follow_symlinks=False):
                         continue
@@ -418,13 +438,17 @@ def iter_repo_files_from_fd(file_root: Path, root_fd: int) -> tuple[list[Path], 
                             continue
                     finally:
                         os.close(file_fd)
-                except OSError:
+                except OSError as exc:
+                    if exc.errno in {errno.EMFILE, errno.ENFILE}:
+                        return files, True
                     continue
                 if len(files) >= MAX_FILE_TREE_ENTRIES:
                     truncated = True
                     return files, truncated
                 files.append(file_root.joinpath(*relative_parts))
-        except OSError:
+        except OSError as exc:
+            if exc.errno in {errno.EMFILE, errno.ENFILE}:
+                return files, True
             continue
         finally:
             os.close(directory_fd)
