@@ -9,10 +9,8 @@ updated: 2026-07-15
 Todo:
 
 - [P2] wiki: compact mermaid artifact preview illegible for large diagrams — styles.css:6684 caps svg at 400px, scale-to-fit squeezes text to ~3px; fix = crop + click-to-inspect or min-scale floor (pan/zoom detail exists). File as WIKI ticket when Linear reauthed
-- [P2] WIKI-116: render_artifact accepts syntactically-invalid mermaid silently — worker got success, Henry got 'lexical error on line 79'. Validate mermaid at render time (mermaid.parse in frontend-side check is too late; consider bundled mmdc/headless parse in MCP server) OR feed render errors back into session so agents self-correct. Found via TEST-1 artifact (unquoted [/tmp/... label = trapezoid syntax)
 - [P2] WIKI-117: test_wiki_artifacts_server role tests inherit WIKI_AGENT_ROLE from environment — fails on untouched main when run from an orchestrator session (worker tools/list shows fleet ops). Tests must clear/pin WIKI_AGENT_ROLE + WIKI_AGENT_ID. Found during #91 gate
 - [P3] WIKI-118: #91 hardening follow-ups from gate review — (M) dedupe artifact events by artifact_id in transcripts parse state (raw function_call pair could double-render); (L) completed-but-unparseable sentinel mislabeled 'rejected'; (L) assert in prod path stripped under -O; (L) artifact_from_text skips _validate_text_payload on write path (worker-forged oversized bodies); (L) missing write-time failed-render normalizer test
-- [P2] WIKI-124: accepted svg artifact silently not rendered in session view above size threshold — 24KB svg (id 4907cf6e, 14:48Z 2026-07-15) accepted server-side, never displayed; 800B probe (1acaeef1) rendered fine. Silent accept-then-drop masks failure from sender. Fix: render large svg (scroll/scale) OR visible reject like source-validation errors. Bisect threshold; check overlap with mermaid >20-node compact-preview machinery. Related [[WIKI-116]]
 - [P2] PHO-13800 customer_churned_date timing unreliable (19/29 in one entry window; zero churns Jan-Apr) — backfill true dates or document entry-date semantic; related PHO-13735
 - [P2] PHO-13763 PARKED by Henry 2026-07-15: PR 11383 drafted at 909ef288ce, gate-passed (CI green, 0 threads, sol REVIEW4 merge-ready), worker archived — resume = un-draft, re-verify freshness vs main, merge
 - [P3] WIKI-126: surface rebrand — rename app-facing identity only (app display name, window title, README header); NAME NOT YET CHOSEN by Henry, blocked until he picks. Internal identifiers stay (repo, wiki CLI, WIKI-* tickets, MCP names, vault paths — codename doctrine, Henry 2026-07-15)
@@ -29,8 +27,11 @@ In Progress:
 - [P4] [PHO-13368](https://linear.app/phoebework/issue/PHO-13368): admin agent run events monospace font — cc:PHO-13368 worker
 - [P2] [PHO-13669](https://linear.app/phoebework/issue/PHO-13669): Core email/account-book gaps — cdx:PHO-13669 (gpt-5.6-terra)
 - PHO-13763 per-org scratchpad (worker cdx:PHO-13763, run bd90b506)
-- PUF-1..4: pufferclone — v0 turbopuffer clone in Rust (~/me/fun/misc/pufferclone, spec in docs/superpowers/specs/)
 - [P2] PHO-13830 live EHR record fetch tool (admin agent) — worker live
+- [P2] PHO-13832 shift classification + calendar artifact (admin agent) — worker live
+- [P2] WIKI-124: accepted svg artifact silently not rendered in session view above size threshold — 24KB svg (id 4907cf6e, 14:48Z 2026-07-15) accepted server-side, never displayed; 800B probe (1acaeef1) rendered fine. Silent accept-then-drop masks failure from sender. Fix: render large svg (scroll/scale) OR visible reject like source-validation errors. Bisect threshold; check overlap with mermaid >20-node compact-preview machinery. Related [[WIKI-116]] — cdx:WIKI-116 worker (bundled w/ 116)
+- [P2] WIKI-112: dead-archive.playwright.mjs flake — TimeoutError waiting for WIKI-7801 Archive button on untouched main; bit all 9 review rounds wave 3; root-cause test rot vs real dead-archive UI regression — cdx:WIKI-112 worker
+- [P2] WIKI-116: render_artifact accepts syntactically-invalid mermaid silently — worker got success, Henry got 'lexical error on line 79'. Validate mermaid at render time (mermaid.parse in frontend-side check is too late; consider bundled mmdc/headless parse in MCP server) OR feed render errors back into session so agents self-correct. Found via TEST-1 artifact (unquoted [/tmp/... label = trapezoid syntax) — cdx:WIKI-116 worker (bundled w/ 124)
 
 Backlog:
 

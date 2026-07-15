@@ -11,12 +11,14 @@ Rolling ≤500-word session cache. Rewrite (don't append) at work-arc boundaries
 
 ## Active threads
 
-- **2026-07-15 night: WAVE 3 COMPLETE, wiki fleet EMPTY** — WIKI-127 multi-workspace file browsing (#98, 6 review rounds) + WIKI-128 code-viewer density (#99, 3 rounds) merged; main at 50e5917. Post-crash recovery worked: workers respawned in preserved worktrees with crash-resume brief addendum, lost no work.
+- **2026-07-15 night: WAVE 3 COMPLETE** — WIKI-127 multi-workspace file browsing (#98, 6 review rounds) + WIKI-128 code-viewer density (#99, 3 rounds) merged; main at 50e5917. Post-crash recovery worked: workers respawned in preserved worktrees with crash-resume brief addendum, lost no work.
+- **WAVE 4 LIVE (Henry-approved)**: WIKI-116+124 bundled (artifact render trust: mermaid write-time validation + large-SVG drop; worker cdx in .codex/worktrees/wiki-116-artifact-trust) + WIKI-112 (dead-archive flake root-cause; .codex/worktrees/wiki-112-dead-archive). Both luna/high, monitors armed.
 - **NEEDS HENRY: app relaunch for 127 backend** — 127 added backend endpoints (/api/workspaces, workspace param); live sidecar runs OLD backend. Frontend dist rebuilt (degrades gracefully to wiki-only until relaunch). Sequence per WIKI-129 gotcha: QUIT Wiki.app first → `make native-build` → relaunch. Never build under running app (kills supervisor; orch session dies with quit — status file carries resume state).
 - **127 security arc (6 rounds, sol reviewer earned keep)**: root-swap TOCTOU → fd-pinned roots; fd-lifetime bugged rounds 2-3 → orchestrator issued design directive (constant-descriptor walk: queue relpath tuples, reopen from root fd) → clean after. 121 lesson reconfirmed: mechanism bugs 2+ rounds → order redesign, don't patch.
 - **Open design threads (Henry engaged, unticketed)**: (1) daemon-ize backend (launchd; kills relaunch-fleet-wipe + WIKI-129 class) — Henry interested; (2) WIKI-126 surface rebrand BLOCKED on Henry name pick; (3) WIKI-129 native-build staging-dir/atomic-swap fix — ticketed, unstarted.
-- **Open wiki tickets**: WIKI-112 (dead-archive playwright flake — bit every review round again this wave; worth prioritizing), WIKI-113, WIKI-116/117/118, WIKI-106/107, WIKI-124 (svg threshold — maybe fixed by #97, verify first), WIKI-129. Also WIKI-92/WIKI-109 frontend tests fail deterministically at main — untracked, ticket if Henry wants.
+- **Open wiki tickets (not in wave 4)**: WIKI-117/118, WIKI-129, WIKI-126 (blocked on name), compact-mermaid-preview (unfiled). WIKI-92/WIKI-109 frontend tests fail deterministically at main — untracked, ticket if Henry wants.
 - **Phoebe**: PHO-13804 (PR 11420, 2 review rounds so far) + PHO-13815 workers active under phoebe orch.
+- **2026-07-15 eve: pufferclone v0 COMPLETE (misc orch)** — Rust turbopuffer clone at ~/me/fun/misc/pufferclone, local-only repo main@3ee62c5: object-store foundation (write-once via hard-link, fsync-honest), exact-scan vector + BM25 (mergeable/live-id-aware stats) + filters + RRF, crc32 segment container, engine/axum API; 46 tests + HTTP smoke green. 12 sol review rounds total across PUF-1..4, all converged (7→4→1→clean pattern). Fleet swept clean. v0.5 candidates (unticketed): HNSW behind VectorIndex trait, segment merge compaction, WIKI semantic-search integration per [[turbopuffer]] verdict.
 
 ## Recent facts
 
