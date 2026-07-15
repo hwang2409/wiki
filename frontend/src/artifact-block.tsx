@@ -648,7 +648,7 @@ export function ArtifactBlock({
   const [copied, setCopied] = useState(false);
   const [imageBounds, setImageBounds] = useState<{ width: number; height: number } | null>(null);
   const [renderFailure, setRenderFailure] = useState<ArtifactRenderFailure | null>(null);
-  const [deliveryStatus, setDeliveryStatus] = useState<"pending" | "queued" | "sent" | "failed" | null>(null);
+  const [deliveryStatus, setDeliveryStatus] = useState<"pending" | "queued" | "deduplicated" | "sent" | "failed" | null>(null);
   const copiedTimer = useRef<number | null>(null);
   const reportedRenderFailure = useRef<string | null>(null);
   const renderFailureArtifactId = useRef(event.artifact_id);
@@ -686,8 +686,10 @@ export function ArtifactBlock({
           case "queued":
             setDeliveryStatus("queued");
             break;
-          case "sent":
           case "deduplicated":
+            setDeliveryStatus("deduplicated");
+            break;
+          case "sent":
             setDeliveryStatus("sent");
             break;
           default:
@@ -805,7 +807,9 @@ export function ArtifactBlock({
                 ? "Render failed; reporting to agent…"
                 : deliveryStatus === "queued"
                   ? "Render failed; diagnostic queued for agent."
-                : "Render failed; diagnostic sent to agent."}
+                  : deliveryStatus === "deduplicated"
+                    ? "Render failed; diagnostic already reported."
+                    : "Render failed; diagnostic sent to agent."}
           </div>
         ) : null}
       </section>

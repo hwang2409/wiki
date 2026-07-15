@@ -74,13 +74,14 @@ async function main() {
   const reports = [];
   await context.route(`**/api/agents/${TICKET}/message`, async (route) => {
     reports.push(JSON.parse(route.request().postData() || "{}"));
+    const status = reports.length === 1 ? "queued" : "deduplicated";
     await route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify({ status: "queued", position: 1, messages: [] }),
+      body: JSON.stringify({ status, position: 1, messages: [] }),
     });
   });
-  async function openSession(target) {
+  async function openSession(target, expectedBanner) {
     await target.addInitScript(() => {
       localStorage.setItem("wiki-window-layout-v2", JSON.stringify({
         version: 2,
@@ -94,18 +95,20 @@ async function main() {
     await artifact.locator(".artifact-error").waitFor({ state: "visible" });
     await target.waitForFunction((id) => document.querySelector(`[data-artifact-id="${id}"]`)?.getAttribute("data-artifact-render-status") === "failed", event.id);
     await artifact.getByText(/Render failed;/).waitFor({ state: "visible" });
-    await artifact.getByText("Render failed; diagnostic queued for agent.").waitFor({ state: "visible" });
+    await artifact.getByText(expectedBanner).waitFor({ state: "visible" });
   }
   try {
-    await openSession(page);
+    await openSession(page, "Render failed; diagnostic queued for agent.");
     for (let attempt = 0; attempt < 50 && reports.length === 0; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     if (reports.length !== 1) throw new Error(`Expected one render failure report, got ${JSON.stringify(reports)}`);
     await page.reload({ waitUntil: "domcontentloaded" });
-    await page.locator(`[data-artifact-id="${event.id}"] .artifact-error`).waitFor({ state: "visible" });
+    const reloadedArtifact = page.locator(`[data-artifact-id="${event.id}"]`);
+    await reloadedArtifact.locator(".artifact-error").waitFor({ state: "visible" });
+    await reloadedArtifact.getByText("Render failed; diagnostic already reported.").waitFor({ state: "visible" });
     const secondViewer = await context.newPage();
-    await openSession(secondViewer);
+    await openSession(secondViewer, "Render failed; diagnostic already reported.");
     for (let attempt = 0; attempt < 50 && reports.length < 3; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
@@ -129,7 +132,7 @@ async function main() {
     await browser.close();
     await backend.stop();
   }
-  console.error("[wiki-116-playwright] render failure was marked, shown, and reported once");
+  console.error("[wiki-116-playwright] render failure was marked, queued once, and deduplicated on reload/second viewer");
 }
 
 await main();
