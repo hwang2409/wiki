@@ -27,6 +27,7 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[mcp-vs-native-agent-tooling]] — Henry's position: MCP is generally a bad way to build agent tooling — prefer native, code-aware tools; Core MCP serves external clients only
 - [[multi-account-auth-rotation]] — codex/claude multi-account auth mechanics + rotation design (WIKI-15 watchdog)
 - [[instance-pinning-verification]] — Failure shape: verification targets a different instance than the consumer uses (main-vs-worktree, hot-vs-frozen backend, stale checkout); always pin the instance
+- [[turbopuffer]] — Serverless vector+FTS search DB on object storage — what it is, when to use
 
 ## Phoebe
 

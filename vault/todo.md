@@ -12,9 +12,8 @@ Todo:
 - [P2] WIKI-116: render_artifact accepts syntactically-invalid mermaid silently — worker got success, Henry got 'lexical error on line 79'. Validate mermaid at render time (mermaid.parse in frontend-side check is too late; consider bundled mmdc/headless parse in MCP server) OR feed render errors back into session so agents self-correct. Found via TEST-1 artifact (unquoted [/tmp/... label = trapezoid syntax)
 - [P2] WIKI-117: test_wiki_artifacts_server role tests inherit WIKI_AGENT_ROLE from environment — fails on untouched main when run from an orchestrator session (worker tools/list shows fleet ops). Tests must clear/pin WIKI_AGENT_ROLE + WIKI_AGENT_ID. Found during #91 gate
 - [P3] WIKI-118: #91 hardening follow-ups from gate review — (M) dedupe artifact events by artifact_id in transcripts parse state (raw function_call pair could double-render); (L) completed-but-unparseable sentinel mislabeled 'rejected'; (L) assert in prod path stripped under -O; (L) artifact_from_text skips _validate_text_payload on write path (worker-forged oversized bodies); (L) missing write-time failed-render normalizer test
-- [P1] WIKI-121: CodeMirror 6 source editor — replace pane.tsx:305 textarea with CM6 (markdown + fenced-code-block language highlighting, theme sync to CSS vars, preserve draft/save contract). Code-editor arc wave 2 (after 119/120)
-- [P2] WIKI-122: file-explorer polish — file-type icons by extension, full-path fuzzy match in Cmd+K switcher, recent-files group. Code-editor arc wave 2
 - [P2] WIKI-124: accepted svg artifact silently not rendered in session view above size threshold — 24KB svg (id 4907cf6e, 14:48Z 2026-07-15) accepted server-side, never displayed; 800B probe (1acaeef1) rendered fine. Silent accept-then-drop masks failure from sender. Fix: render large svg (scroll/scale) OR visible reject like source-validation errors. Bisect threshold; check overlap with mermaid >20-node compact-preview machinery. Related [[WIKI-116]]
+- [P2] PHO-13800 customer_churned_date timing unreliable (19/29 in one entry window; zero churns Jan-Apr) — backfill true dates or document entry-date semantic; related PHO-13735
 
 In Progress:
 
@@ -25,6 +24,8 @@ In Progress:
 - [P4] [PHO-13368](https://linear.app/phoebework/issue/PHO-13368): admin agent run events monospace font — cc:PHO-13368 worker
 - [P2] [PHO-13669](https://linear.app/phoebework/issue/PHO-13669): Core email/account-book gaps — cdx:PHO-13669 (gpt-5.6-terra)
 - PHO-13763 per-org scratchpad (worker cdx:PHO-13763, run bd90b506)
+- [P1] WIKI-121: CodeMirror 6 source editor — replace pane.tsx:305 textarea with CM6 (markdown + fenced-code-block language highlighting, theme sync to CSS vars, preserve draft/save contract). Code-editor arc wave 2 — cdx:WIKI-121 worker (luna, run ebd92126)
+- [P2] WIKI-122: file-explorer polish — file-type icons by extension, full-path fuzzy match in Cmd+K switcher, recent-files group. Code-editor arc wave 2 — cdx:WIKI-122 worker (luna, run c07f6bc5)
 
 Backlog:
 
