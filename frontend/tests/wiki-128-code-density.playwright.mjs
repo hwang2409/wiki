@@ -82,7 +82,7 @@ async function main() {
         }),
       })
     );
-    await page.route("**/api/files/content?path=**", (route) => {
+    await page.route("**/api/files/content**", (route) => {
       const path = new URL(route.request().url()).searchParams.get("path");
       const content = path ? FILES[path] : undefined;
       return route.fulfill({

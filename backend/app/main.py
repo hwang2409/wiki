@@ -1091,10 +1091,14 @@ def _derive_workspace_candidates() -> list[WorkspaceCandidate]:
     candidates_by_root: dict[Path, list[WorkspaceCandidate]] = {}
     for candidate in candidates:
         candidates_by_root.setdefault(candidate.root, []).append(candidate)
-    return [
-        min(grouped, key=lambda candidate: (not candidate.workspace.live, candidate.workspace.id))
-        for grouped in candidates_by_root.values()
-    ]
+    selected: list[WorkspaceCandidate] = []
+    for root, grouped in candidates_by_root.items():
+        if root == own_root:
+            canonical = next(candidate for candidate in grouped if candidate.workspace.id == "wiki")
+            selected.append(canonical)
+        else:
+            selected.append(min(grouped, key=lambda candidate: (not candidate.workspace.live, candidate.workspace.id)))
+    return selected
 
 
 def derive_workspaces() -> list[Workspace]:

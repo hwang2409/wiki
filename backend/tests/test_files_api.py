@@ -143,6 +143,27 @@ class FilesApiTests(unittest.TestCase):
         self.assertEqual([workspace.id for workspace in workspaces], ["wiki", "z-live"])
         self.assertTrue(workspaces[-1].live)
 
+    def test_wiki_remains_canonical_when_live_orchestrator_aliases_own_root(self) -> None:
+        registry = {
+            "aaa": {
+                "current": {
+                    "role": "orchestrator",
+                    "cwd": str(self.repo),
+                    "run_id": "aaa-run",
+                    "control_attached": True,
+                }
+            }
+        }
+
+        with mock.patch.object(main, "FILES_ROOT", self.repo), mock.patch.object(
+            main, "_read_agent_registry", return_value=registry
+        ), mock.patch.object(main, "_supervisor_pid_is_alive", return_value=True):
+            workspaces = main.list_workspaces().workspaces
+            default_tree = main.list_files()
+
+        self.assertEqual([workspace.id for workspace in workspaces], ["wiki"])
+        self.assertEqual([entry.path for entry in default_tree.files], ["src/app.py", "vault/note.md"])
+
     def test_workspace_file_endpoints_use_the_selected_root_and_default_to_wiki(self) -> None:
         registry = {
             "misc": {
