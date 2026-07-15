@@ -4,14 +4,20 @@ import {
   AlertCircle,
   BookOpen,
   Bot,
+  Code2,
   ChevronRight,
   ChevronsDownUp,
   FilePlus2,
   Files,
   FileCode2,
+  FileImage,
+  FileJson,
+  FileText,
+  File as FileIcon,
   Folder as FolderIcon,
   HeartPulse,
   History,
+  Lock,
   Moon,
   Pencil,
   Search,
@@ -24,6 +30,7 @@ import {
   Waypoints,
   X
 } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import {
   createNote,
   deleteNote,
@@ -41,6 +48,7 @@ import {
   FleetSwitcher,
   QuickSwitcher,
   type FleetSwitcherItem,
+  type RecentSwitcherItem,
   type QuickSwitcherSession,
 } from "./switcher";
 import { SettingsModal, applyStoredFonts } from "./settings";
@@ -738,6 +746,31 @@ function isMarkdownPath(path: string) {
   return path.toLowerCase().endsWith(".md");
 }
 
+function fileIconForPath(path: string): LucideIcon {
+  const name = path.split("/").pop()?.toLowerCase() ?? path.toLowerCase();
+  const extension = name.includes(".") ? name.split(".").pop() ?? "" : "";
+
+  if (name.endsWith(".lock") || name.includes(".lock.")) return Lock;
+  if (name.endsWith(".config") || name.includes(".config.")) return Settings;
+  if (["ts", "tsx", "js", "jsx", "mjs", "cjs"].includes(extension)) return FileCode2;
+  if (["py", "rb", "go", "rs", "java", "c", "cc", "cpp", "h", "hpp"].includes(extension)) {
+    return Code2;
+  }
+  if (["json", "yaml", "yml", "toml"].includes(extension)) return FileJson;
+  if (["css", "scss", "sass", "less"].includes(extension)) return Settings;
+  if (["html", "htm", "xml", "svg"].includes(extension)) return Code2;
+  if (["md", "markdown", "txt", "rst"].includes(extension)) return FileText;
+  if (["png", "jpg", "jpeg", "gif", "webp", "ico", "bmp", "avif"].includes(extension)) {
+    return FileImage;
+  }
+  if (["env"].includes(extension) || [".env", ".gitignore", ".dockerignore"].includes(name)) {
+    return Lock;
+  }
+  if (["sh", "bash", "zsh", "fish", "ps1", "bat", "cmd"].includes(extension)) return TerminalIcon;
+  if (["conf", "config", "ini"].includes(extension)) return Settings;
+  return FileIcon;
+}
+
 type Route =
   | { kind: "empty" }
   | { kind: "new" }
@@ -791,6 +824,36 @@ function readStoredCollapsed(): Set<string> {
     return new Set(Array.isArray(parsed) ? parsed.filter((p): p is string => typeof p === "string") : []);
   } catch {
     return new Set();
+  }
+}
+
+const RECENT_RESOURCES_STORAGE_KEY = "wiki-recent-resources";
+const MAX_RECENT_RESOURCES = 15;
+
+function readStoredRecentResources(): RecentSwitcherItem[] {
+  try {
+    const raw = localStorage.getItem(RECENT_RESOURCES_STORAGE_KEY);
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    if (!Array.isArray(parsed)) return [];
+    const seen = new Set<string>();
+    return parsed
+      .filter(
+        (item): item is RecentSwitcherItem =>
+          Boolean(item) &&
+          typeof item === "object" &&
+          (item as { kind?: unknown }).kind !== undefined &&
+          ((item as { kind?: unknown }).kind === "note" || (item as { kind?: unknown }).kind === "file") &&
+          typeof (item as { path?: unknown }).path === "string"
+      )
+      .filter((item) => {
+        const key = `${item.kind}:${item.path}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .slice(0, MAX_RECENT_RESOURCES);
+  } catch {
+    return [];
   }
 }
 
@@ -1149,7 +1212,12 @@ function FolderTree({
               : undefined
           }
         >
-          {!file.isNote ? <FileCode2 className="tree-file-icon" size={13} /> : null}
+          {!file.isNote
+            ? (() => {
+                const Icon = fileIconForPath(file.path);
+                return <Icon className="tree-file-icon" size={13} />;
+              })()
+            : null}
           <span className="tree-item-name">{basename(file.path)}</span>
         </button>
       ))}
@@ -1184,6 +1252,9 @@ export default function App() {
   }, []);
 
   const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(readStoredCollapsed);
+  const [recentResources, setRecentResources] = useState<RecentSwitcherItem[]>(
+    readStoredRecentResources
+  );
   const [switcherOpen, setSwitcherOpen] = useState(false);
   const [sidebarVisible, setSidebarVisible] = useState(
     () => localStorage.getItem("wiki-sidebar-visible") !== "false"
@@ -1301,6 +1372,10 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem("wiki-show-all-files", String(showAllFiles));
   }, [showAllFiles]);
+
+  useEffect(() => {
+    localStorage.setItem(RECENT_RESOURCES_STORAGE_KEY, JSON.stringify(recentResources));
+  }, [recentResources]);
 
   useEffect(() => {
     localStorage.setItem(
@@ -1838,6 +1913,12 @@ export default function App() {
     options: { focusExisting?: boolean; syncHash?: boolean; edit?: boolean } = {}
   ) {
     const { edit = false, focusExisting = true, syncHash = true } = options;
+    if (resourceKind === "note" || resourceKind === "file") {
+      setRecentResources((current) => [
+        { kind: resourceKind, path },
+        ...current.filter((item) => !(item.kind === resourceKind && item.path === path)),
+      ].slice(0, MAX_RECENT_RESOURCES));
+    }
     const existing = focusExisting
       ? findPaneLocationByResource(path, resourceKind, activeWindow?.id ?? null)
       : null;
@@ -3593,7 +3674,9 @@ export default function App() {
       ) : null}
       {switcherOpen ? (
         <QuickSwitcher
+          files={showAllFiles ? files : []}
           notes={notes}
+          recent={recentResources}
           sessions={quickSwitcherSessions}
           onClose={() => {
             setSwitcherOpen(false);
@@ -3602,6 +3685,18 @@ export default function App() {
           onOpen={(path) => {
             setSwitcherOpen(false);
             openNote(path);
+          }}
+          onOpenFile={(path) => {
+            setSwitcherOpen(false);
+            openFile(path);
+          }}
+          onOpenRecent={(item) => {
+            setSwitcherOpen(false);
+            if (item.kind === "file") {
+              openFile(item.path);
+            } else {
+              openNote(item.path);
+            }
           }}
           onOpenSession={(ticket) => {
             setSwitcherOpen(false);

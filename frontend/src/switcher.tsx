@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent, ReactNode } from "react";
-import { Bot, FileText, HeartPulse, History, Waypoints } from "lucide-react";
+import { Bot, FileCode2, FileText, HeartPulse, History, Waypoints } from "lucide-react";
 import type { NoteSummary } from "./types";
 
 export type SwitcherPage = "graph" | "activity" | "health" | "agents";
@@ -12,6 +12,15 @@ export type QuickSwitcherSession = {
   provider: string | null;
   role: string | null;
   sessionKind: "orchestrator" | "worker";
+};
+
+export type QuickSwitcherFile = {
+  path: string;
+};
+
+export type RecentSwitcherItem = {
+  kind: "note" | "file";
+  path: string;
 };
 
 export type FleetSwitcherItem = {
@@ -31,6 +40,8 @@ export type FleetSwitcherItem = {
 
 type SwitcherItem =
   | { kind: "note"; note: NoteSummary }
+  | { kind: "file"; file: QuickSwitcherFile }
+  | { kind: "recent"; recent: RecentSwitcherItem }
   | { kind: "page"; page: SwitcherPage; label: string }
   | { kind: "session"; session: QuickSwitcherSession };
 
@@ -57,13 +68,44 @@ function basename(path: string) {
   return path.split("/").pop()?.replace(/\.md$/, "") ?? path;
 }
 
-function isSubsequence(needle: string, haystack: string) {
-  let index = 0;
-  for (const char of haystack) {
-    if (char === needle[index]) index += 1;
-    if (index === needle.length) return true;
+function matchScore(text: string, query: string): number | null {
+  if (text === query) return 0;
+  if (text.startsWith(query)) return 4;
+
+  const segmentStart = text
+    .split(/[\\/._\-\s]+/)
+    .some((segment) => segment.startsWith(query));
+  if (segmentStart) return 8;
+  if (text.includes(query)) return 12 + text.indexOf(query) / Math.max(text.length, 1);
+
+  const boundaries = new Set(["/", "\\", ".", "_", "-", " "]);
+  const matchedIndexes: number[] = [];
+  let queryIndex = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] !== query[queryIndex]) continue;
+    matchedIndexes.push(index);
+    queryIndex += 1;
+    if (queryIndex === query.length) break;
   }
-  return needle.length === 0;
+  if (queryIndex !== query.length) return null;
+
+  const first = matchedIndexes[0] ?? 0;
+  const last = matchedIndexes[matchedIndexes.length - 1] ?? first;
+  const boundaryMatches = matchedIndexes.filter(
+    (index) => index === 0 || boundaries.has(text[index - 1] ?? "")
+  ).length;
+  const gaps = last - first + 1 - query.length;
+  return 40 + (query.length - boundaryMatches) * 4 + gaps + first / Math.max(text.length, 1);
+}
+
+function scorePath(path: string, query: string): number | null {
+  const segments = path.split(/[\\/._\-\s]+/).filter(Boolean);
+  const segmentScore = segments
+    .map((segment) => matchScore(segment, query))
+    .filter((score): score is number => score !== null)
+    .sort((a, b) => a - b)[0];
+  if (segmentScore !== undefined) return 10 + segmentScore;
+  return matchScore(path, query);
 }
 
 function scoreNote(note: NoteSummary, query: string): number | null {
@@ -71,11 +113,12 @@ function scoreNote(note: NoteSummary, query: string): number | null {
   const path = note.path.toLowerCase();
   const title = note.title.toLowerCase();
 
-  if (name.startsWith(query) || title.startsWith(query)) return 0;
-  if (name.includes(query) || title.includes(query)) return 1;
-  if (path.includes(query)) return 2;
-  if (isSubsequence(query, path)) return 3;
-  return null;
+  const titleScore = matchScore(title, query);
+  if (titleScore !== null) return titleScore;
+  const nameScore = scorePath(name, query);
+  if (nameScore !== null) return 10 + nameScore;
+  const pathScore = scorePath(path, query);
+  return pathScore === null ? null : 20 + pathScore;
 }
 
 function scoreSession(session: QuickSwitcherSession, query: string): number | null {
@@ -90,12 +133,14 @@ function scoreSession(session: QuickSwitcherSession, query: string): number | nu
 
   if (fields.some((field) => field.startsWith(query))) return 0;
   if (fields.some((field) => field.includes(query))) return 1;
-  if (fields.some((field) => isSubsequence(query, field))) return 2;
+  if (fields.some((field) => matchScore(field, query) !== null)) return 2;
   return null;
 }
 
 function itemKey(item: SwitcherItem) {
   if (item.kind === "note") return `note:${item.note.id}`;
+  if (item.kind === "file") return `file:${item.file.path}`;
+  if (item.kind === "recent") return `recent:${item.recent.kind}:${item.recent.path}`;
   if (item.kind === "page") return `page:${item.page}`;
   return `session:${item.session.id}`;
 }
@@ -108,16 +153,24 @@ function sessionMeta(session: QuickSwitcherSession) {
 
 export function QuickSwitcher({
   notes,
+  files,
+  recent,
   sessions,
   onClose,
   onOpen,
+  onOpenFile,
+  onOpenRecent,
   onOpenSession,
   onOpenPage
 }: {
   notes: NoteSummary[];
+  files: QuickSwitcherFile[];
+  recent: RecentSwitcherItem[];
   sessions: QuickSwitcherSession[];
   onClose: () => void;
   onOpen: (path: string) => void;
+  onOpenFile: (path: string) => void;
+  onOpenRecent: (item: RecentSwitcherItem) => void;
   onOpenSession: (id: string) => void;
   onOpenPage: (page: SwitcherPage) => void;
 }) {
@@ -128,6 +181,10 @@ export function QuickSwitcher({
     const needle = query.trim().toLowerCase();
     if (!needle) {
       return [
+        {
+          label: "Recent",
+          items: recent.slice(0, 15).map((item): SwitcherItem => ({ kind: "recent", recent: item })),
+        },
         {
           label: "Sessions",
           items: sessions.slice(0, 10).map((session): SwitcherItem => ({ kind: "session", session })),
@@ -157,6 +214,15 @@ export function QuickSwitcher({
       .slice(0, 10)
       .map((entry): SwitcherItem => ({ kind: "note", note: entry.note }));
 
+    const notePaths = new Set(notes.map((note) => `vault/${note.path}`));
+    const fileItems = files
+      .filter((file) => !notePaths.has(file.path))
+      .map((file) => ({ file, score: scorePath(file.path.toLowerCase(), needle) }))
+      .filter((entry): entry is { file: QuickSwitcherFile; score: number } => entry.score !== null)
+      .sort((a, b) => a.score - b.score || a.file.path.localeCompare(b.file.path))
+      .slice(0, 10)
+      .map((entry): SwitcherItem => ({ kind: "file", file: entry.file }));
+
     const pageItems = PAGES.filter((entry) =>
       entry.label.toLowerCase().includes(needle)
     ).map((entry): SwitcherItem => ({ kind: "page", ...entry }));
@@ -164,15 +230,20 @@ export function QuickSwitcher({
     return [
       { label: "Sessions", items: sessionItems },
       { label: "Notes", items: noteItems },
+      { label: "Files", items: fileItems },
       { label: "Views", items: pageItems },
     ].filter((group) => group.items.length > 0);
-  }, [notes, query, sessions]);
+  }, [files, notes, query, recent, sessions]);
 
   const results = useMemo(() => groups.flatMap((group) => group.items), [groups]);
 
   function activate(item: SwitcherItem) {
     if (item.kind === "note") {
       onOpen(item.note.path);
+    } else if (item.kind === "file") {
+      onOpenFile(item.file.path);
+    } else if (item.kind === "recent") {
+      onOpenRecent(item.recent);
     } else if (item.kind === "session") {
       onOpenSession(item.session.id);
     } else {
@@ -213,7 +284,7 @@ export function QuickSwitcher({
       >
         <input
           autoFocus
-          placeholder="Find a note or session..."
+          placeholder="Find a note, file, or session..."
           type="text"
           value={query}
           onChange={(event) => setQuery(event.target.value)}
@@ -229,9 +300,15 @@ export function QuickSwitcher({
                   const Icon =
                     item.kind === "note"
                       ? FileText
-                      : item.kind === "session"
-                        ? Bot
-                        : PAGE_ICONS[item.page];
+                      : item.kind === "file"
+                        ? FileCode2
+                        : item.kind === "recent"
+                          ? item.recent.kind === "file"
+                            ? FileCode2
+                            : FileText
+                          : item.kind === "session"
+                            ? Bot
+                            : PAGE_ICONS[item.page];
                   return (
                     <button
                       className={`quick-switcher-result${index === selected ? " is-selected" : ""}`}
@@ -245,6 +322,17 @@ export function QuickSwitcher({
                         <>
                           <span className="quick-switcher-name">{basename(item.note.path)}</span>
                           <span className="quick-switcher-path">{item.note.path}</span>
+                        </>
+                      ) : item.kind === "file" || item.kind === "recent" ? (
+                        <>
+                          <span className="quick-switcher-name">
+                            {item.kind === "file"
+                              ? item.file.path.split("/").pop() ?? item.file.path
+                              : item.recent.path.split("/").pop() ?? item.recent.path}
+                          </span>
+                          <span className="quick-switcher-path">
+                            {item.kind === "file" ? item.file.path : item.recent.path}
+                          </span>
                         </>
                       ) : item.kind === "session" ? (
                         <>
