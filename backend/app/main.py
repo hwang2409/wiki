@@ -3447,7 +3447,10 @@ def list_files(workspace: str = "wiki") -> FileTree:
                     stat_result = os.fstat(fd)
                 finally:
                     os.close(fd)
-            except OSError:
+            except OSError as exc:
+                if exc.errno in {errno.EMFILE, errno.ENFILE}:
+                    truncated = True
+                    break
                 continue
             if not stat.S_ISREG(stat_result.st_mode):
                 continue

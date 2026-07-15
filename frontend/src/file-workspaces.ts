@@ -63,6 +63,10 @@ export function isActiveFilePath(activePath: string | null, workspace: string, p
   return activePath === filePanePath(workspace, path);
 }
 
+export function shouldDiscoverWorkspaces(sidebarTab: string, switcherOpen: boolean): boolean {
+  return sidebarTab === "files" || switcherOpen;
+}
+
 export function workspaceCacheKey(workspace: WorkspaceStatus): string {
   return `${workspace.id}\u0000${workspace.root}`;
 }
@@ -74,6 +78,36 @@ export function shouldAcceptWorkspaceResponse(
   cacheKey: string
 ): boolean {
   return requestVersion === currentVersion && workspace.live && workspaceCacheKey(workspace) === cacheKey;
+}
+
+export type WorkspaceRequest = {
+  generation: number;
+  token: symbol;
+};
+
+export class WorkspaceRequestTracker {
+  private generation = 0;
+  private pending = new Map<string, symbol>();
+
+  invalidate(): void {
+    this.generation += 1;
+    this.pending.clear();
+  }
+
+  begin(key: string): WorkspaceRequest | null {
+    if (this.pending.has(key)) return null;
+    const request = { generation: this.generation, token: Symbol(key) };
+    this.pending.set(key, request.token);
+    return request;
+  }
+
+  isCurrent(key: string, request: WorkspaceRequest): boolean {
+    return request.generation === this.generation && this.pending.get(key) === request.token;
+  }
+
+  finish(key: string, request: WorkspaceRequest): void {
+    if (this.pending.get(key) === request.token) this.pending.delete(key);
+  }
 }
 
 export function buildTree(

@@ -71,8 +71,10 @@ import {
   parseStoredRecentResources,
   reconcileWorkspaceState,
   shouldAcceptWorkspaceResponse,
+  shouldDiscoverWorkspaces,
   type TreeFile,
   type TreeFolder,
+  WorkspaceRequestTracker,
   workspaceCacheKey,
 } from "./file-workspaces";
 import { SettingsModal, applyStoredFonts } from "./settings";
@@ -1272,7 +1274,7 @@ export default function App() {
   const preserveViewScrollRef = useRef(false);
   const appliedHashRef = useRef<string | null>(null);
   const closedTicketsRef = useRef<Set<string>>(new Set());
-  const filesLoadPromiseRef = useRef(new Map<string, Promise<void>>());
+  const filesRequestTrackerRef = useRef(new WorkspaceRequestTracker());
   const workspaceRefreshVersionRef = useRef(0);
 
   function nextPaneId() {
@@ -1363,12 +1365,13 @@ export default function App() {
   }, [activeWorkspace]);
 
   useEffect(() => {
-    if (sidebarTab !== "files") return;
+    if (!shouldDiscoverWorkspaces(sidebarTab, switcherOpen)) return;
     let ignore = false;
     listWorkspaces()
       .then((result) => {
         if (ignore) return;
         workspaceRefreshVersionRef.current += 1;
+        filesRequestTrackerRef.current.invalidate();
         setWorkspaces(result.workspaces);
         setActiveWorkspace((current) =>
           reconcileWorkspaceState(result.workspaces, current, {}).activeWorkspace
@@ -1379,6 +1382,8 @@ export default function App() {
       })
       .catch(() => {
         if (!ignore) {
+          workspaceRefreshVersionRef.current += 1;
+          filesRequestTrackerRef.current.invalidate();
           setWorkspaces([]);
           setActiveWorkspace("wiki");
         }
@@ -1386,7 +1391,7 @@ export default function App() {
     return () => {
       ignore = true;
     };
-  }, [refreshTick, sidebarTab]);
+  }, [refreshTick, sidebarTab, switcherOpen]);
 
   useEffect(() => {
     localStorage.setItem(
@@ -1499,7 +1504,8 @@ export default function App() {
       activeFileState?.loaded
     ) return;
     const cacheKey = workspaceCacheKey(activeWorkspaceInfo);
-    if (filesLoadPromiseRef.current.has(cacheKey)) return;
+    const requestToken = filesRequestTrackerRef.current.begin(cacheKey);
+    if (!requestToken) return;
     setFilesByWorkspace((current) => ({
       ...current,
       [cacheKey]: { ...(current[cacheKey] ?? { files: [], truncated: false, loaded: false }), loading: true },
@@ -1507,9 +1513,12 @@ export default function App() {
     const workspace = activeWorkspace;
     const requestedWorkspace = activeWorkspaceInfo;
     const requestVersion = workspaceRefreshVersionRef.current;
-    const request = listFiles(workspace)
+    listFiles(workspace)
       .then((nextTree) => {
-        if (!shouldAcceptWorkspaceResponse(requestVersion, workspaceRefreshVersionRef.current, requestedWorkspace, cacheKey)) {
+        if (
+          !filesRequestTrackerRef.current.isCurrent(cacheKey, requestToken) ||
+          !shouldAcceptWorkspaceResponse(requestVersion, workspaceRefreshVersionRef.current, requestedWorkspace, cacheKey)
+        ) {
           return;
         }
         setFilesByWorkspace((current) => ({
@@ -1518,7 +1527,10 @@ export default function App() {
         }));
       })
       .catch(() => {
-        if (!shouldAcceptWorkspaceResponse(requestVersion, workspaceRefreshVersionRef.current, requestedWorkspace, cacheKey)) {
+        if (
+          !filesRequestTrackerRef.current.isCurrent(cacheKey, requestToken) ||
+          !shouldAcceptWorkspaceResponse(requestVersion, workspaceRefreshVersionRef.current, requestedWorkspace, cacheKey)
+        ) {
           return;
         }
         setFilesByWorkspace((current) => ({
@@ -1527,11 +1539,8 @@ export default function App() {
         }));
       })
       .finally(() => {
-        if (filesLoadPromiseRef.current.get(cacheKey) === request) {
-          filesLoadPromiseRef.current.delete(cacheKey);
-        }
+        filesRequestTrackerRef.current.finish(cacheKey, requestToken);
       });
-    filesLoadPromiseRef.current.set(cacheKey, request);
   }, [activeFileState?.loaded, activeWorkspace, activeWorkspaceInfo, refreshTick, showAllFiles, switcherOpen, workspaces]);
 
   useEffect(() => {

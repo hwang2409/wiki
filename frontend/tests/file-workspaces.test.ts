@@ -10,6 +10,8 @@ import {
   parseStoredRecentResources,
   reconcileWorkspaceState,
   shouldAcceptWorkspaceResponse,
+  shouldDiscoverWorkspaces,
+  WorkspaceRequestTracker,
   workspaceFileSearchPath,
   workspaceCacheKey,
 } from "../src/file-workspaces.ts";
@@ -120,4 +122,28 @@ test("delayed file responses are ignored after a workspace lifecycle refresh", (
 
   assert.equal(shouldAcceptWorkspaceResponse(4, 4, workspace, key), true);
   assert.equal(shouldAcceptWorkspaceResponse(4, 5, { ...workspace, live: false }, key), false);
+});
+
+test("workspace reactivation replaces a stale in-flight request", () => {
+  const tracker = new WorkspaceRequestTracker();
+  const first = tracker.begin("phoebe\u0000/phoebe");
+  assert.ok(first);
+
+  tracker.invalidate();
+  const replacement = tracker.begin("phoebe\u0000/phoebe");
+  assert.ok(replacement);
+  assert.notEqual(first.token, replacement.token);
+  assert.equal(tracker.isCurrent("phoebe\u0000/phoebe", first), false);
+  assert.equal(tracker.isCurrent("phoebe\u0000/phoebe", replacement), true);
+
+  tracker.finish("phoebe\u0000/phoebe", first);
+  assert.equal(tracker.isCurrent("phoebe\u0000/phoebe", replacement), true);
+});
+
+test("switcher opening bootstraps workspaces from persisted non-files tabs", () => {
+  assert.equal(shouldDiscoverWorkspaces("search", false), false);
+  assert.equal(shouldDiscoverWorkspaces("agents", false), false);
+  assert.equal(shouldDiscoverWorkspaces("search", true), true);
+  assert.equal(shouldDiscoverWorkspaces("agents", true), true);
+  assert.equal(shouldDiscoverWorkspaces("files", false), true);
 });

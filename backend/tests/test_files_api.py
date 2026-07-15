@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import os
 import resource
 import tempfile
@@ -359,6 +360,18 @@ class FilesApiTests(unittest.TestCase):
 
         self.assertEqual(len(tree.files), 100)
         self.assertFalse(tree.truncated)
+
+    def test_summary_fd_pressure_marks_tree_truncated(self) -> None:
+        (self.other_repo / "summary.txt").write_text("summary", encoding="utf-8")
+        with mock.patch.object(main, "FILES_ROOT", self.other_repo), mock.patch.object(
+            main,
+            "open_relative_file",
+            side_effect=OSError(errno.EMFILE, "too many open files"),
+        ):
+            tree = main.list_files()
+
+        self.assertEqual(tree.files, [])
+        self.assertTrue(tree.truncated)
 
     def test_tree_prunes_excluded_directories_before_descending(self) -> None:
         (self.repo / ".git").mkdir()
