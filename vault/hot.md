@@ -2,7 +2,7 @@
 type: reference
 tags: [hot]
 created: 2026-07-06
-updated: 2026-07-15
+updated: 2026-07-16
 ---
 
 # Hot Context
@@ -11,27 +11,28 @@ Rolling ≤500-word session cache. Rewrite (don't append) at work-arc boundaries
 
 ## Active threads
 
-- **2026-07-15 night: WAVE 3 COMPLETE** — WIKI-127 multi-workspace file browsing (#98, 6 review rounds) + WIKI-128 code-viewer density (#99, 3 rounds) merged; main at 50e5917. Post-crash recovery worked: workers respawned in preserved worktrees with crash-resume brief addendum, lost no work.
-- **WAVE 4 LIVE (Henry-approved)**: WIKI-116+124 bundled (artifact render trust: mermaid write-time validation + large-SVG drop; worker cdx in .codex/worktrees/wiki-116-artifact-trust) + WIKI-112 (dead-archive flake root-cause; .codex/worktrees/wiki-112-dead-archive). Both luna/high, monitors armed.
-- **NEEDS HENRY: app relaunch for 127 backend** — 127 added backend endpoints (/api/workspaces, workspace param); live sidecar runs OLD backend. Frontend dist rebuilt (degrades gracefully to wiki-only until relaunch). Sequence per WIKI-129 gotcha: QUIT Wiki.app first → `make native-build` → relaunch. Never build under running app (kills supervisor; orch session dies with quit — status file carries resume state).
-- **127 security arc (6 rounds, sol reviewer earned keep)**: root-swap TOCTOU → fd-pinned roots; fd-lifetime bugged rounds 2-3 → orchestrator issued design directive (constant-descriptor walk: queue relpath tuples, reopen from root fd) → clean after. 121 lesson reconfirmed: mechanism bugs 2+ rounds → order redesign, don't patch.
-- **Open design threads (Henry engaged, unticketed)**: (1) daemon-ize backend (launchd; kills relaunch-fleet-wipe + WIKI-129 class) — Henry interested; (2) WIKI-126 surface rebrand BLOCKED on Henry name pick; (3) WIKI-129 native-build staging-dir/atomic-swap fix — ticketed, unstarted.
-- **Open wiki tickets (not in wave 4)**: WIKI-117/118, WIKI-129, WIKI-126 (blocked on name), compact-mermaid-preview (unfiled). WIKI-92/WIKI-109 frontend tests fail deterministically at main — untracked, ticket if Henry wants.
-- **Phoebe**: PHO-13804 (PR 11420, 2 review rounds so far) + PHO-13815 workers active under phoebe orch.
-- **2026-07-15 eve: pufferclone v0 COMPLETE (misc orch)** — Rust turbopuffer clone at ~/me/fun/misc/pufferclone, local-only repo main@3ee62c5: object-store foundation (write-once via hard-link, fsync-honest), exact-scan vector + BM25 (mergeable/live-id-aware stats) + filters + RRF, crc32 segment container, engine/axum API; 46 tests + HTTP smoke green. 12 sol review rounds total across PUF-1..4, all converged (7→4→1→clean pattern). Fleet swept clean. v0.5 candidates (unticketed): HNSW behind VectorIndex trait, segment merge compaction, WIKI semantic-search integration per [[turbopuffer]] verdict.
+- **2026-07-16 early: WAVE 4 COMPLETE** — WIKI-112 flake fix (#101, 2 rounds), WIKI-116+124 artifact render trust (#100, 5 rounds), WIKI-129 native-build safety (#102, 4 rounds) all merged; main at ef261ac. Wave 3 earlier same night: WIKI-127 (#98) + WIKI-128 (#99). Henry AFK ("up to you") — orchestrator running approved queue autonomously.
+- **WAVE 4b LIVE**: WIKI-117+118 bundled (test-env hygiene + #91 hardening follow-ups) — check todo.md In Progress for worker state.
+- **NEEDS HENRY: quit app → `make native-build` → relaunch.** Backend changes stacked awaiting native rebuild: 127 workspace endpoints, 116 diagnostic dedupe (store.py), 129 app.lock acquisition (guard protection only fully active once rebuilt GUI/sidecar deployed). New build flow post-129: staged + atomic, refuses under running app, `FORCE_STAGE_ONLY=1` to prepare while app open. Frontend dist current (rebuilt after each merge).
+- **Review-loop quality this arc**: sol reviewers reproduced every claimed fix, caught fake regression tests (124 test passing pre-fix), prompt-injection channel in diagnostics, GUI-vs-sidecar lock scoping. Pattern held: converging finding counts each round; design directives (constant-fd walk, GUI-owned lock, feedback-loop architecture) beat cleanup patches.
+- **Open design threads**: (1) daemon-ize backend (launchd) — Henry interested, unticketed, next big structural win; (2) WIKI-126 rebrand BLOCKED on name pick; (3) cross-workspace switcher, file editing, semantic search (sqlite-vec) — surfaced in improvements discussion 2026-07-15, unticketed.
+- **Open wiki tickets**: WIKI-117/118 (wave 4b), compact-mermaid-preview (unfiled), WIKI-92/WIKI-109 deterministic frontend test failures at main (untracked — candidates for filing), WIKI-94 latency guard flaked 4x under host load (candidate ticket).
+- **Phoebe**: PHO-13804/13815 workers under phoebe orch (separate).
 
 ## Recent facts
 
-- Reviewer state field unreliable both directions (merge-ready state w/ NOT-MERGE-READY text and reverse) — verdict step text authoritative, always.
-- cdx spawns can hang at provider startup under fleet load (raw.jsonl stalls at MCP-startup events, no status file ever) — detect via missing status file ~10min, fix via replace_agent. Monitor template now includes startup-hang check.
-- Worker staleness alarms false-fire on idle merge-ready workers awaiting review — check runtime_state=idle before panicking.
-- `wiki` CLI: `log-done` + `todo complete` (no `done` subcommand); todo complete doesn't auto-write done.md line.
-- Backend serves frontend live from frontend/dist (rebuild → reload); backend code needs native-build + relaunch.
+- Reviewer state field unreliable — verdict step text authoritative, always.
+- cdx spawns can hang at provider startup under fleet load (no status file ever) — startup-hang check in monitor template; fix via replace_agent.
+- Supervisor MCP ops can 1s-timeout under 14-worker load — verify effect (read_agent/pending) before retrying steers.
+- Worker staleness alarms false-fire on idle merge-ready workers — check runtime_state first.
+- `wiki` CLI: log-done + todo add/move/complete; todo section arg is "In Progress" (exact); todo complete needs unique substring.
+- Artifact diagnostics (116) reach agents as user messages — normalized metadata only, injection-tested.
 
 ## Watchouts
 
-- Next free ticket ID: WIKI-130 (check todo.md collisions before filing).
-- Pin review worktrees + gate verification to SHA under review; `--expect-sha` on every gate.
-- After merges: checkout package-lock.json before pull (generated-file churn blocks pull).
-- Stop BOTH worker and reviewer monitors at ticket wrap-up (clean this wave — keep it up).
-- `.codex/worktrees/` still has ~40 stale entries from older arcs — prune pending Henry (this wave's 11 all cleaned).
+- Next free ticket ID: WIKI-130.
+- Pin review worktrees + gates to SHA under review (`--expect-sha`).
+- checkout package-lock.json before pull after merges.
+- Stop BOTH worker+reviewer monitors at wrap-up; archive reviewer immediately after verdict routed.
+- Workers' PR bodies can overclaim (116 claimed a fix it hadn't made) — reviewers verify claims, keep ordering it.
+- `.codex/worktrees/` ~40 stale entries from older arcs — prune pending Henry (waves 3+4's 25 all cleaned).

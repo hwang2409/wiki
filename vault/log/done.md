@@ -9,6 +9,8 @@ updated: 2026-07-15
 
 ## 2026-07-15
 
+- **pufferclone** — PUF-6 segment compaction merged (newest-wins, tombstone lifetime, crash-safe, 2 sol rounds, main@870292b)
+- WIKI-129 merged (#102, 4 rounds): native-build safety — GUI-lifetime app.lock, guard+swap hold locks through atomic RENAME_SWAP, staged out-of-place builds, PID-reuse/stale-lock safe, second-instance clean exit, interrupt-safe sentinel
 - WIKI-116+124 merged (#100, 5 rounds): artifact render trust — render-error feedback loop (durable dedupe, injection-safe normalized diagnostics, truthful delivery states) + SVG root-geometry parse fix (descendant width/viewBox no longer shrink previews)
 - **pufferclone** — PUF-5 hand-rolled HNSW merged (incremental insertion, two-heap search, filtered beam, 3 sol rounds incl. full rebuild directive, main@fa274a9)
 - **pufferclone** — PUF-7 S3Store merged (conditional-put write-once, conformance suite, 3 sol rounds, main@21951c8) — MinIO-ready for local-cloud

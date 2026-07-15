@@ -9,8 +9,6 @@ updated: 2026-07-15
 Todo:
 
 - [P2] wiki: compact mermaid artifact preview illegible for large diagrams — styles.css:6684 caps svg at 400px, scale-to-fit squeezes text to ~3px; fix = crop + click-to-inspect or min-scale floor (pan/zoom detail exists). File as WIKI ticket when Linear reauthed
-- [P2] WIKI-117: test_wiki_artifacts_server role tests inherit WIKI_AGENT_ROLE from environment — fails on untouched main when run from an orchestrator session (worker tools/list shows fleet ops). Tests must clear/pin WIKI_AGENT_ROLE + WIKI_AGENT_ID. Found during #91 gate
-- [P3] WIKI-118: #91 hardening follow-ups from gate review — (M) dedupe artifact events by artifact_id in transcripts parse state (raw function_call pair could double-render); (L) completed-but-unparseable sentinel mislabeled 'rejected'; (L) assert in prod path stripped under -O; (L) artifact_from_text skips _validate_text_payload on write path (worker-forged oversized bodies); (L) missing write-time failed-render normalizer test
 - [P2] PHO-13800 customer_churned_date timing unreliable (19/29 in one entry window; zero churns Jan-Apr) — backfill true dates or document entry-date semantic; related PHO-13735
 - [P2] PHO-13763 PARKED by Henry 2026-07-15: PR 11383 drafted at 909ef288ce, gate-passed (CI green, 0 threads, sol REVIEW4 merge-ready), worker archived — resume = un-draft, re-verify freshness vs main, merge
 - [P3] WIKI-126: surface rebrand — rename app-facing identity only (app display name, window title, README header); NAME NOT YET CHOSEN by Henry, blocked until he picks. Internal identifiers stay (repo, wiki CLI, WIKI-* tickets, MCP names, vault paths — codename doctrine, Henry 2026-07-15)
@@ -30,7 +28,8 @@ In Progress:
 - [P2] PHO-13832 shift classification + calendar artifact (admin agent) — worker live
 - [P2] PHO-13826 ModalSandboxBackend + PHO-13827 sandbox ownership — workers live (Modal replaces exe.dev for v0; 13828 lifecycle + 13829 egress design queued)
 - PUF-5..8: pufferclone v1 — HNSW, compaction, S3 store, non-blocking reads (spec: docs/superpowers/specs/2026-07-15-pufferclone-v1-design.md)
-- [P2] WIKI-129: make native-build while Wiki.app running breaks live supervisor — bundle swap clobbers running sidecar's _internal (ENOENT on supervisor channel, respawn blocked by stale supervisor.lock, worker spawn/replace dead until app relaunch; hit 2026-07-15 eve). Fix: build to staging dir + atomic swap on app quit, or preflight check refusing rebuild while app runs
+- [P2] WIKI-117: test_wiki_artifacts_server role tests inherit WIKI_AGENT_ROLE from environment — fails on untouched main when run from an orchestrator session (worker tools/list shows fleet ops). Tests must clear/pin WIKI_AGENT_ROLE + WIKI_AGENT_ID. Found during #91 gate
+- [P3] WIKI-118: #91 hardening follow-ups from gate review — (M) dedupe artifact events by artifact_id in transcripts parse state (raw function_call pair could double-render); (L) completed-but-unparseable sentinel mislabeled 'rejected'; (L) assert in prod path stripped under -O; (L) artifact_from_text skips _validate_text_payload on write path (worker-forged oversized bodies); (L) missing write-time failed-render normalizer test
 
 Backlog:
 
