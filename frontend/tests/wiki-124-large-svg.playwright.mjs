@@ -18,6 +18,16 @@ function svgProbe(targetBytes, width, height) {
   return `${prefix}<title>${padding}</title>${suffix}`;
 }
 
+function incidentSvg(elementCount) {
+  const elements = Array.from({ length: elementCount }, (_, index) => {
+    const x = (index % 16) * 40;
+    const y = Math.floor(index / 16) * 42;
+    const fill = (index * 9973 % 0xffffff).toString(16).padStart(6, "0");
+    return `<rect x="${x}" y="${y}" width="34" height="34" fill="#${fill}"/><text x="${x + 4}" y="${y + 22}" font-size="12">Node ${index} checkpoint</text>`;
+  }).join("");
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 900">${elements}</svg>`;
+}
+
 function invokeArtifactTool(fixtures, inputs) {
   const requests = [
     {
@@ -70,15 +80,18 @@ async function writeTranscript(fixtures, inputs, results) {
 
 async function main() {
   const fixtures = makeFixtureRoot("wiki-124-large-svg-");
-  const sizes = [800, 8_000, 16_000, 24_000, 32_000, 64_000];
-  const sources = sizes.map((size) => svgProbe(size, size === 800 ? 320 : 800, size === 800 ? 240 : 600));
+  const sources = [
+    svgProbe(800, 320, 240),
+    incidentSvg(134),
+    incidentSvg(200),
+  ];
   const inputs = sources.map((source, index) => ({
     kind: "svg",
-    title: `SVG size probe ${sizes[index]} bytes`,
+    title: index === 0 ? "Small SVG control" : `SVG incident-shape probe ${index}`,
     payload: { source },
   }));
   const actualSizes = sources.map((source) => Buffer.byteLength(source));
-  if (actualSizes[0] >= 2_000 || actualSizes[3] < 20_000 || actualSizes[3] > 30_000) {
+  if (actualSizes[0] >= 2_000 || actualSizes[1] < 16_000 || actualSizes[1] > 17_000) {
     throw new Error(`SVG probes missed target sizes: ${actualSizes.join(", ")}`);
   }
   const results = invokeArtifactTool(fixtures, inputs);
@@ -104,17 +117,36 @@ async function main() {
       const artifact = page.locator(`[data-artifact-id="${result.id}"]`);
       await artifact.locator(".artifact-svg > svg").waitFor({ state: "visible" });
       const metrics = await artifact.locator(".artifact-svg > svg").evaluate((element) => ({
+        heightAttribute: element.getAttribute("height"),
         height: element.getBoundingClientRect().height,
+        rectCount: element.querySelectorAll("rect").length,
+        textCount: element.querySelectorAll("text").length,
+        viewBox: element.getAttribute("viewBox"),
+        widthAttribute: element.getAttribute("width"),
         width: element.getBoundingClientRect().width,
       }));
       if (metrics.width <= 0 || metrics.height <= 0) {
-        throw new Error(`SVG size probe ${sizes[index]} rendered with empty bounds: ${JSON.stringify(metrics)}`);
+        throw new Error(`SVG size probe ${actualSizes[index]} rendered with empty bounds: ${JSON.stringify(metrics)}`);
       }
       if (index === 0 && await artifact.getAttribute("data-artifact-compact")) {
         throw new Error("800-byte SVG was unexpectedly compacted");
       }
-      if (index > 0 && (await artifact.getAttribute("data-artifact-compact")) !== "true") {
-        throw new Error(`${actualSizes[index]}-byte SVG did not enter the inspectable compact preview`);
+      if (index > 0) {
+        if ((await artifact.getAttribute("data-artifact-compact")) !== "true") {
+          throw new Error(`${actualSizes[index]}-byte SVG did not enter the inspectable compact preview`);
+        }
+        if (metrics.rectCount < 100 || metrics.textCount < 100) {
+          throw new Error(`SVG incident-shape probe lost elements: ${JSON.stringify(metrics)}`);
+        }
+        if (
+          metrics.viewBox !== "0 0 640 900"
+          || metrics.widthAttribute !== "640"
+          || metrics.heightAttribute !== "900"
+          || Math.abs(metrics.width - 640) > 1
+          || Math.abs(metrics.height - 900) > 1
+        ) {
+          throw new Error(`ViewBox-only SVG did not retain native dimensions: ${JSON.stringify(metrics)}`);
+        }
       }
     }
   } finally {

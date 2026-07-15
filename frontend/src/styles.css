@@ -7123,6 +7123,15 @@ body.is-resizing-panes .pane-cell {
   color: var(--accent-danger);
 }
 
+.artifact-render-failure {
+  padding: 7px 10px;
+  border-top: 1px solid color-mix(in srgb, var(--accent-danger) 35%, transparent);
+  background: color-mix(in srgb, var(--accent-danger) 8%, transparent);
+  color: var(--accent-danger);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+}
+
 .artifact-mermaid,
 .artifact-svg,
 .artifact-plot {
