@@ -159,6 +159,27 @@ class WikiArtifactsTests(unittest.TestCase):
 
         self.assertIsNone(wiki_artifacts.artifact_from_text(wiki_artifacts.sentinel_text(event)))
 
+    def test_sentinel_parser_rejects_wrong_typed_table_column_types(self) -> None:
+        for column_type in ([], {}, None, 42):
+            with self.subTest(column_type=column_type):
+                event = {
+                    "kind": "artifact",
+                    "id": RUN_ID,
+                    "artifact": {
+                        "kind": "table",
+                        "columns": [
+                            {"key": "id", "label": "ID", "type": column_type}
+                        ],
+                        "rows": [[1]],
+                    },
+                }
+
+                self.assertIsNone(
+                    wiki_artifacts.artifact_from_text(
+                        wiki_artifacts.sentinel_text(event)
+                    )
+                )
+
     def test_stdio_server_lists_tool_and_returns_sentinel_result(self) -> None:
         requests = [
             {

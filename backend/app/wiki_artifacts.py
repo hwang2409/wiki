@@ -118,7 +118,10 @@ def _validate_text_payload(kind: str, payload: dict[str, Any]) -> dict[str, Any]
             _require_keys(column, required={"key", "label", "type"})
             key = _require_string(column["key"], f"payload.columns[{index}].key")
             _require_string(column["label"], f"payload.columns[{index}].label")
-            if column["type"] not in TABLE_COLUMN_TYPES:
+            if (
+                not isinstance(column["type"], str)
+                or column["type"] not in TABLE_COLUMN_TYPES
+            ):
                 raise ArtifactValidationError(
                     f"payload.columns[{index}].type must be string, number, date, or link"
                 )

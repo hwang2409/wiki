@@ -723,6 +723,22 @@ class RunStoreTests(unittest.TestCase):
             self.assertEqual(legacy["outcome"], "handoff")
             self.assertEqual(legacy["migration"], "headless-supervisor")
 
+    def test_create_rejects_malformed_legacy_orchestrator_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            paths.registry_path.parent.mkdir(parents=True)
+            paths.registry_path.write_text(
+                json.dumps({"_orchestrators": []}),
+                encoding="utf-8",
+            )
+
+            store = RunStore(paths)
+            with self.assertRaisesRegex(
+                StoreError, "legacy orchestrator registry must be an object"
+            ):
+                store.create(_record(root))
+
     def test_create_archives_stale_legacy_orchestrator_only_when_explicit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
