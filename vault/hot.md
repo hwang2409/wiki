@@ -13,10 +13,11 @@ Rolling ≤500-word session cache. Rewrite (don't append) at work-arc boundaries
 
 - **2026-07-16 early: WAVE 4 COMPLETE** — WIKI-112 flake fix (#101, 2 rounds), WIKI-116+124 artifact render trust (#100, 5 rounds), WIKI-129 native-build safety (#102, 4 rounds) all merged; main at ef261ac. Wave 3 earlier same night: WIKI-127 (#98) + WIKI-128 (#99). Henry AFK ("up to you") — orchestrator running approved queue autonomously.
 - **WAVE 4b LIVE**: WIKI-117+118 bundled (test-env hygiene + #91 hardening follow-ups) — check todo.md In Progress for worker state.
-- **NEEDS HENRY: quit app → `make native-build` → relaunch.** Backend changes stacked awaiting native rebuild: 127 workspace endpoints, 116 diagnostic dedupe (store.py), 129 app.lock acquisition (guard protection only fully active once rebuilt GUI/sidecar deployed). New build flow post-129: staged + atomic, refuses under running app, `FORCE_STAGE_ONLY=1` to prepare while app open. Frontend dist current (rebuilt after each merge).
+- **REBUILD BLOCKED on WIKI-130 (P1)**: app launch broken — WIKI-129 build compiles from staging copy, baking `.native-build-staging/...` into `resolve_repo_dir()` (compile-time CARGO_MANIFEST_DIR, backend.rs:701); staging dir deleted post-swap → sidecar spawn "os error 2". Rebuild without fix re-bakes bug. Fix sketch in todo.md; workaround `WIKI_NATIVE_REPO_DIR` env.
+- **NEEDS HENRY (after WIKI-130 fix): quit app → `make native-build` → relaunch.** Backend changes stacked awaiting native rebuild: 127 workspace endpoints, 116 diagnostic dedupe (store.py), 129 app.lock acquisition (guard protection only fully active once rebuilt GUI/sidecar deployed). New build flow post-129: staged + atomic, refuses under running app, `FORCE_STAGE_ONLY=1` to prepare while app open. Frontend dist current (rebuilt after each merge).
 - **Review-loop quality this arc**: sol reviewers reproduced every claimed fix, caught fake regression tests (124 test passing pre-fix), prompt-injection channel in diagnostics, GUI-vs-sidecar lock scoping. Pattern held: converging finding counts each round; design directives (constant-fd walk, GUI-owned lock, feedback-loop architecture) beat cleanup patches.
 - **Open design threads**: (1) daemon-ize backend (launchd) — Henry interested, unticketed, next big structural win; (2) WIKI-126 rebrand BLOCKED on name pick; (3) cross-workspace switcher, file editing, semantic search (sqlite-vec) — surfaced in improvements discussion 2026-07-15, unticketed.
-- **Open wiki tickets**: WIKI-117/118 (wave 4b), compact-mermaid-preview (unfiled), WIKI-92/WIKI-109 deterministic frontend test failures at main (untracked — candidates for filing), WIKI-94 latency guard flaked 4x under host load (candidate ticket).
+- **Open wiki tickets**: WIKI-130 (P1 launch regression), WIKI-117/118 (wave 4b), compact-mermaid-preview (unfiled), WIKI-92/WIKI-109 deterministic frontend test failures at main (untracked — candidates for filing), WIKI-94 latency guard flaked 4x under host load (candidate ticket).
 - **Phoebe**: PHO-13804/13815 workers under phoebe orch (separate).
 
 ## Recent facts
@@ -30,7 +31,7 @@ Rolling ≤500-word session cache. Rewrite (don't append) at work-arc boundaries
 
 ## Watchouts
 
-- Next free ticket ID: WIKI-130.
+- Next free ticket ID: WIKI-131.
 - Pin review worktrees + gates to SHA under review (`--expect-sha`).
 - checkout package-lock.json before pull after merges.
 - Stop BOTH worker+reviewer monitors at wrap-up; archive reviewer immediately after verdict routed.

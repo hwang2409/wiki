@@ -703,12 +703,14 @@ fn resolve_repo_dir() -> PathBuf {
         return PathBuf::from(value);
     }
 
-    let repo_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .to_path_buf();
+    repo_dir_from_manifest_dir(Path::new(env!("CARGO_MANIFEST_DIR")))
+}
+
+fn repo_dir_from_manifest_dir(manifest_dir: &Path) -> PathBuf {
+    let repo_dir = manifest_dir.parent().unwrap().to_path_buf();
     for ancestor in repo_dir.ancestors() {
-        if ancestor.file_name() == Some(OsStr::new(".codex")) {
+        let name = ancestor.file_name();
+        if name == Some(OsStr::new(".codex")) || name == Some(OsStr::new(".native-build-staging")) {
             if let Some(parent) = ancestor.parent() {
                 return parent.to_path_buf();
             }
@@ -754,3 +756,37 @@ fn request_graceful_shutdown(pid: u32) {
 
 #[cfg(not(unix))]
 fn request_graceful_shutdown(_pid: u32) {}
+
+#[cfg(test)]
+mod tests {
+    use super::repo_dir_from_manifest_dir;
+    use std::path::Path;
+
+    #[test]
+    fn repo_dir_defaults_to_manifest_parent() {
+        assert_eq!(
+            repo_dir_from_manifest_dir(Path::new("/Users/henry/me/fun/wiki/src-tauri")),
+            Path::new("/Users/henry/me/fun/wiki")
+        );
+    }
+
+    #[test]
+    fn repo_dir_escapes_codex_worktree() {
+        assert_eq!(
+            repo_dir_from_manifest_dir(Path::new(
+                "/Users/henry/me/fun/wiki/.codex/worktrees/wt-1/src-tauri"
+            )),
+            Path::new("/Users/henry/me/fun/wiki")
+        );
+    }
+
+    #[test]
+    fn repo_dir_escapes_native_build_staging() {
+        assert_eq!(
+            repo_dir_from_manifest_dir(Path::new(
+                "/Users/henry/me/fun/wiki/.native-build-staging/20260715-183651-3939/src-tauri"
+            )),
+            Path::new("/Users/henry/me/fun/wiki")
+        );
+    }
+}

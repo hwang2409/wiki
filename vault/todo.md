@@ -14,6 +14,7 @@ Todo:
 - [P3] WIKI-126: surface rebrand — rename app-facing identity only (app display name, window title, README header); NAME NOT YET CHOSEN by Henry, blocked until he picks. Internal identifiers stay (repo, wiki CLI, WIKI-* tickets, MCP names, vault paths — codename doctrine, Henry 2026-07-15)
 - [P2] amd-shadow invalid index: KORGAN owns fix (PR 11416 closed w/ evidence); prod index still INVALID 0-byte — watch deploys
 - [P2] PHO-13826/27/28 exe.dev sandbox arc: enable (SSH key secret + smoke) -> ownership fix -> TTL sweeper; PHO-13829 egress design backlog. Surface merged since PHO-13073/#10608, dormant on missing key
+- [P1] WIKI-130: Wiki.app backend fails to start — 'No such file or directory (os error 2)'. WIKI-129 regression: build-native-app.sh compiles from .native-build-staging/<ts>-<pid>/src-tauri, so env!(CARGO_MANIFEST_DIR) bakes staging path into resolve_repo_dir() (src-tauri/src/backend.rs:701); staging dir deleted after swap, GUI spawn .current_dir(repo) fails. Fix: ancestor walk already handles .codex — add .native-build-staging marker -> return its parent. Then rebuild. Workaround: WIKI_NATIVE_REPO_DIR env override
 
 In Progress:
 
