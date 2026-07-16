@@ -9,6 +9,7 @@ updated: 2026-07-15
 
 ## 2026-07-15
 
+- WIKI-130 deployed: supervisor graceful stop -> atomic swap -> app relaunch verified (repo=/Users/henry/me/fun/wiki, API 200); fleet auto-resumed (5 codex + 3 claude under new supervisor); stacked 127/116/129 backend changes now live
 - WIKI-130 fix committed (1b1cacb): resolve_repo_dir escapes .native-build-staging like .codex; 3 Rust unit tests added (first in src-tauri); staged bundle built, swap pending fleet-idle
 - PHO-13830 live EHR record fetch merged (#11441), PHO-13832 shift classification calendar merged (#11444), PHO-13827 sandbox run ownership merged (#11445) — phoebe orch batch merge for Henry; workers respawned for PHO-13826 (#11447 dirty+CI red) and PHO-13763 (draft #11383 resumed)
 - GAZELLE-HOTFIX merged as https://github.com/phoebe-health/phoebe/pull/11455 (main unred: 11342 gazelle drift)
