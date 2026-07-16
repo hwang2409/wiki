@@ -118,7 +118,10 @@ def _validate_text_payload(kind: str, payload: dict[str, Any]) -> dict[str, Any]
             _require_keys(column, required={"key", "label", "type"})
             key = _require_string(column["key"], f"payload.columns[{index}].key")
             _require_string(column["label"], f"payload.columns[{index}].label")
-            if column["type"] not in TABLE_COLUMN_TYPES:
+            if (
+                not isinstance(column["type"], str)
+                or column["type"] not in TABLE_COLUMN_TYPES
+            ):
                 raise ArtifactValidationError(
                     f"payload.columns[{index}].type must be string, number, date, or link"
                 )
@@ -277,6 +280,18 @@ def artifact_from_text(value: Any) -> dict[str, Any] | None:
     artifact = event.get("artifact")
     if not isinstance(artifact, dict) or artifact.get("kind") not in ARTIFACT_KINDS:
         return None
+    for field, limit in (("title", 200), ("caption", 500)):
+        if field in event and (
+            not isinstance(event[field], str) or len(event[field]) > limit
+        ):
+            return None
+    kind = artifact["kind"]
+    if kind != "image":
+        payload = {key: item for key, item in artifact.items() if key != "kind"}
+        try:
+            _validate_text_payload(kind, payload)
+        except ArtifactValidationError:
+            return None
     try:
         _validated_run_id(str(event.get("id") or ""))
     except ArtifactValidationError:

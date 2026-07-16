@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from unittest import mock
 from uuid import uuid4
 
+from backend.app import transcripts
 from backend.app.agent_runtime.fake import WireFixture
 from backend.app.agent_runtime.normalizer import normalize_provider_event
 from backend.app.agent_runtime.provider import AdapterStatus
@@ -192,6 +194,118 @@ class ProtocolFixtureTests(unittest.TestCase):
             normalized.payload["artifact"],
             {"kind": "mermaid", "source": "flowchart TB\n  worker --> artifact"},
         )
+
+    def test_codex_failed_render_completion_preserves_write_time_event(self) -> None:
+        row = json.loads(
+            (FIXTURES / "codex_render_artifact_completed.jsonl").read_text(
+                encoding="utf-8"
+            )
+        )
+        failure_cases = (
+            ("status", {"status": "failed"}),
+            ("error", {"error": "artifact server rejected the request"}),
+            ("result.isError", None),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(_paths(root))
+            record = store.create(_record(root))
+            persisted = []
+            for label, failure_update in failure_cases:
+                message = deepcopy(row["message"])
+                item = message["params"]["item"]
+                item["status"] = "completed"
+                item["error"] = None
+                item["result"]["isError"] = False
+                if failure_update is None:
+                    item["result"]["isError"] = True
+                else:
+                    item.update(failure_update)
+
+                normalized = normalize_provider_event(ProviderKind.CODEX, message)
+                self.assertEqual(
+                    normalized.disposition, EventDisposition.RENDERED, label
+                )
+                self.assertEqual(normalized.kind, "item_completed", label)
+
+                raw = store.append_raw(
+                    record.run_id,
+                    provider="codex",
+                    direction="server",
+                    payload=message,
+                )
+                persisted.append(
+                    store.append_normalized(
+                        record.run_id,
+                        raw_seq=raw["seq"],
+                        disposition=normalized.disposition,
+                        kind=normalized.kind,
+                        payload=normalized.payload,
+                        lifecycle_state=normalized.lifecycle_state,
+                    )
+                )
+
+            unparseable = deepcopy(row["message"])
+            item = unparseable["params"]["item"]
+            item["status"] = "completed"
+            item["error"] = None
+            item["result"]["isError"] = False
+            item["result"]["content"][0]["text"] = "not a wiki artifact sentinel"
+            normalized = normalize_provider_event(ProviderKind.CODEX, unparseable)
+            raw = store.append_raw(
+                record.run_id,
+                provider="codex",
+                direction="server",
+                payload=unparseable,
+            )
+            persisted.append(
+                store.append_normalized(
+                    record.run_id,
+                    raw_seq=raw["seq"],
+                    disposition=normalized.disposition,
+                    kind=normalized.kind,
+                    payload=normalized.payload,
+                    lifecycle_state=normalized.lifecycle_state,
+                )
+            )
+
+            stored_lines = store.normalized_events_path(record.run_id).read_text(
+                encoding="utf-8"
+            ).splitlines()
+            self.assertEqual([json.loads(line) for line in stored_lines], persisted)
+            self.assertEqual(
+                [event["payload"]["params"]["item"]["status"] for event in persisted],
+                ["failed", "completed", "completed", "completed"],
+            )
+            self.assertEqual(
+                persisted[1]["payload"]["params"]["item"]["error"],
+                "artifact server rejected the request",
+            )
+            self.assertTrue(
+                persisted[2]["payload"]["params"]["item"]["result"]["isError"]
+            )
+
+            transcripts._cache.clear()
+            parsed = transcripts.read_session_events(
+                "codex-normalized", store.normalized_events_path(record.run_id)
+            )
+            self.assertEqual(len(parsed["events"]), 4)
+            for event in parsed["events"][:3]:
+                self.assertEqual(event["kind"], "tool")
+                self.assertFalse(event["tool"]["ok"])
+                self.assertEqual(event["tool"]["summary"], "render_artifact rejected")
+                self.assertIn("<<wiki-artifact:v1>>", event["tool"]["output"])
+
+            completed_unparseable = parsed["events"][3]
+            self.assertEqual(completed_unparseable["kind"], "tool")
+            self.assertTrue(completed_unparseable["tool"]["ok"])
+            self.assertEqual(
+                completed_unparseable["tool"]["summary"],
+                "render_artifact completed without a parseable artifact",
+            )
+            self.assertEqual(
+                completed_unparseable["tool"]["output"], "not a wiki artifact sentinel"
+            )
 
 
 class LifecycleTests(unittest.TestCase):
@@ -608,6 +722,22 @@ class RunStoreTests(unittest.TestCase):
             self.assertEqual(legacy["window"], "@9999")
             self.assertEqual(legacy["outcome"], "handoff")
             self.assertEqual(legacy["migration"], "headless-supervisor")
+
+    def test_create_rejects_malformed_legacy_orchestrator_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            paths.registry_path.parent.mkdir(parents=True)
+            paths.registry_path.write_text(
+                json.dumps({"_orchestrators": []}),
+                encoding="utf-8",
+            )
+
+            store = RunStore(paths)
+            with self.assertRaisesRegex(
+                StoreError, "legacy orchestrator registry must be an object"
+            ):
+                store.create(_record(root))
 
     def test_create_archives_stale_legacy_orchestrator_only_when_explicit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -131,6 +131,101 @@ class ArtifactTranscriptTests(unittest.TestCase):
                 self.assertEqual(event["artifact"], protocol_event["artifact"])
                 self.assertEqual(event["title"], f"Fixture {kind}")
 
+    def test_artifact_events_dedupe_by_artifact_id(self) -> None:
+        protocol_event = _artifact_protocol_event("mermaid", 99)
+        rows = []
+        for index in range(2):
+            call_id = f"duplicate-artifact-{index}"
+            rows.extend(
+                [
+                    {
+                        "type": "response_item",
+                        "timestamp": f"2026-07-13T12:00:0{index}Z",
+                        "payload": {
+                            "type": "function_call",
+                            "call_id": call_id,
+                            "name": "mcp__wiki_artifacts__render_artifact",
+                            "arguments": json.dumps(
+                                {
+                                    "kind": "mermaid",
+                                    "payload": {"source": "graph TD; A-->B"},
+                                }
+                            ),
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": f"2026-07-13T12:00:1{index}Z",
+                        "payload": {
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": sentinel_text(protocol_event),
+                        },
+                    },
+                ]
+            )
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "codex.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+            parsed = transcripts.read_session_events("codex", path)
+
+        self.assertEqual(
+            [event for event in parsed["events"] if event["kind"] == "artifact"],
+            [
+                {
+                    **{
+                        "kind": "artifact",
+                        "ts": protocol_event["ts"],
+                        "text": protocol_event["title"],
+                        "artifact_id": protocol_event["id"],
+                        "title": protocol_event["title"],
+                        "caption": protocol_event["caption"],
+                        "artifact": protocol_event["artifact"],
+                    },
+                    "disposition": "rendered",
+                    "id": 0,
+                }
+            ],
+        )
+
+    def test_completed_unparseable_artifact_is_not_rejected(self) -> None:
+        call_id = "completed-without-sentinel"
+        rows = [
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": "mcp__wiki_artifacts__render_artifact",
+                    "arguments": json.dumps(
+                        {"kind": "mermaid", "payload": {"source": "graph TD; A-->B"}}
+                    ),
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": "artifact rendered",
+                },
+            },
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "codex.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+            parsed = transcripts.read_session_events("codex", path)
+
+        event = parsed["events"][0]
+        self.assertEqual(event["kind"], "tool")
+        self.assertTrue(event["tool"]["ok"])
+        self.assertEqual(
+            event["tool"]["summary"],
+            "render_artifact completed without a parseable artifact",
+        )
+
     def test_claude_structured_content_result_reconstructs_artifact_event(self) -> None:
         path = FIXTURES_DIR / "claude_artifact_structured_content.jsonl"
 
@@ -201,6 +296,86 @@ class ArtifactTranscriptTests(unittest.TestCase):
         self.assertEqual(failed_event["kind"], "tool")
         self.assertFalse(failed_event["tool"]["ok"])
         self.assertEqual(failed_event["tool"]["summary"], "render_artifact rejected")
+
+    def test_codex_normalized_artifact_and_diagnostic_events_do_not_duplicate(self) -> None:
+        protocol_event = _artifact_protocol_event("mermaid", 100)
+        item = {
+            "arguments": {
+                "kind": "mermaid",
+                "payload": {"source": "graph TD; A-->B"},
+            },
+            "error": None,
+            "id": "exec-duplicate",
+            "result": {
+                "content": [
+                    {"type": "text", "text": sentinel_text(protocol_event)}
+                ],
+            },
+            "server": "wiki_artifacts",
+            "status": "completed",
+            "tool": "render_artifact",
+            "type": "mcpToolCall",
+        }
+        rows = [
+            {
+                "kind": "artifact",
+                "disposition": "rendered",
+                "payload": protocol_event,
+                "normalized_at": "2026-07-14T22:09:40+00:00",
+            },
+            {
+                "kind": "item_completed",
+                "disposition": "rendered",
+                "payload": {
+                    "method": "item/completed",
+                    "params": {"item": item},
+                },
+                "normalized_at": "2026-07-14T22:09:41+00:00",
+            },
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "events.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+            parsed = transcripts.read_session_events("codex-normalized", path)
+
+        self.assertEqual(
+            [event["artifact_id"] for event in parsed["events"] if event["kind"] == "artifact"],
+            [protocol_event["id"]],
+        )
+
+    def test_codex_normalized_completed_unparseable_artifact_is_not_rejected(self) -> None:
+        item = {
+            "arguments": {
+                "kind": "mermaid",
+                "payload": {"source": "graph TD; A-->B"},
+            },
+            "error": None,
+            "id": "exec-unparseable",
+            "result": {"content": [{"type": "text", "text": "artifact rendered"}]},
+            "server": "wiki_artifacts",
+            "status": "completed",
+            "tool": "render_artifact",
+            "type": "mcpToolCall",
+        }
+        row = {
+            "kind": "item_completed",
+            "disposition": "rendered",
+            "payload": {"method": "item/completed", "params": {"item": item}},
+            "normalized_at": "2026-07-14T22:09:41+00:00",
+        }
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "events.jsonl"
+            path.write_text(json.dumps(row) + "\n")
+
+            parsed = transcripts.read_session_events("codex-normalized", path)
+
+        event = parsed["events"][0]
+        self.assertTrue(event["tool"]["ok"])
+        self.assertEqual(
+            event["tool"]["summary"],
+            "render_artifact completed without a parseable artifact",
+        )
 
     def test_structured_image_result_reconstructs_artifact_reference(self) -> None:
         artifact_id = "33b1c159-9d1e-4804-9b14-3d880ac2e3c7"
@@ -287,8 +462,16 @@ class ArtifactTranscriptTests(unittest.TestCase):
                 self.assertEqual(len(parsed["events"]), 1)
                 event = parsed["events"][0]
                 self.assertEqual(event["kind"], "tool")
-                self.assertFalse(event["tool"]["ok"])
-                self.assertEqual(event["tool"]["summary"], "render_artifact rejected")
+                expected_ok = index in {0, 2, 3, 4, 5}
+                self.assertEqual(event["tool"]["ok"], expected_ok)
+                self.assertEqual(
+                    event["tool"]["summary"],
+                    (
+                        "render_artifact completed without a parseable artifact"
+                        if expected_ok
+                        else "render_artifact rejected"
+                    ),
+                )
 
 
 def _write_rollout(day_dir: Path, name: str, cwd: str, session_id: str,

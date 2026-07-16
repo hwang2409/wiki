@@ -57,6 +57,8 @@ class WikiArtifactsTests(unittest.TestCase):
             {
                 "WIKI_AGENT_RUNTIME_DIR": str(self.root / "runtime"),
                 "WIKI_RUN_ID": RUN_ID,
+                "WIKI_AGENT_ROLE": "worker",
+                "WIKI_AGENT_ID": "test-worker",
             },
         )
         self.env.start()
@@ -144,6 +146,39 @@ class WikiArtifactsTests(unittest.TestCase):
                     "payload": {"data_base64": image, "mime": "image/png"},
                 }
             )
+
+    def test_sentinel_parser_revalidates_text_payload_caps(self) -> None:
+        event = {
+            "kind": "artifact",
+            "id": RUN_ID,
+            "artifact": {
+                "kind": "mermaid",
+                "source": "x" * (wiki_artifacts.TEXT_LIMIT + 1),
+            },
+        }
+
+        self.assertIsNone(wiki_artifacts.artifact_from_text(wiki_artifacts.sentinel_text(event)))
+
+    def test_sentinel_parser_rejects_wrong_typed_table_column_types(self) -> None:
+        for column_type in ([], {}, None, 42):
+            with self.subTest(column_type=column_type):
+                event = {
+                    "kind": "artifact",
+                    "id": RUN_ID,
+                    "artifact": {
+                        "kind": "table",
+                        "columns": [
+                            {"key": "id", "label": "ID", "type": column_type}
+                        ],
+                        "rows": [[1]],
+                    },
+                }
+
+                self.assertIsNone(
+                    wiki_artifacts.artifact_from_text(
+                        wiki_artifacts.sentinel_text(event)
+                    )
+                )
 
     def test_stdio_server_lists_tool_and_returns_sentinel_result(self) -> None:
         requests = [

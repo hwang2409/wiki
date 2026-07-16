@@ -861,9 +861,13 @@ class RunStore:
             entry = registry.get(record.agent_id)
             current = entry.get("current") if isinstance(entry, dict) else None
             legacy_orchestrators = registry.get("_orchestrators")
+            if legacy_orchestrators is not None and not isinstance(
+                legacy_orchestrators, dict
+            ):
+                raise StoreError("legacy orchestrator registry must be an object")
             legacy_orchestrator = (
                 legacy_orchestrators.get(record.agent_id)
-                if isinstance(legacy_orchestrators, dict)
+                if legacy_orchestrators is not None
                 else None
             )
             if isinstance(current, dict) and current.get("run_id"):
@@ -916,7 +920,6 @@ class RunStore:
                         "migration": "headless-supervisor",
                     }
                 )
-                assert isinstance(legacy_orchestrators, dict)
                 legacy_orchestrators.pop(record.agent_id)
                 if not legacy_orchestrators:
                     registry.pop("_orchestrators", None)

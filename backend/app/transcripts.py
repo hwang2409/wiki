@@ -568,7 +568,28 @@ def _artifact_event(protocol_event: dict, ts: str | None) -> dict:
     }
 
 
-def _failed_artifact_tool(meta: dict, output: str, ts: str | None) -> dict:
+def _append_artifact_event(
+    state: dict,
+    protocol_event: dict,
+    ts: str | None,
+) -> bool:
+    artifact_id = protocol_event.get("id")
+    artifact_ids: set[str] = state.setdefault("artifact_ids", set())
+    if artifact_id in artifact_ids:
+        return False
+    artifact_ids.add(artifact_id)
+    _append_event(state, _artifact_event(protocol_event, ts))
+    return True
+
+
+def _artifact_tool_status(
+    meta: dict,
+    output: str,
+    ts: str | None,
+    *,
+    ok: bool,
+    summary: str,
+) -> dict:
     raw_input = meta.get("input") or {}
     return {
         "kind": "tool",
@@ -578,11 +599,31 @@ def _failed_artifact_tool(meta: dict, output: str, ts: str | None) -> dict:
             "name": meta.get("name") or "render_artifact",
             "input": _clip(json.dumps(raw_input), MAX_TOOL_IO),
             "output": _clip(output, MAX_TOOL_IO),
-            "ok": False,
+            "ok": ok,
             "archetype": "tool",
-            "summary": "render_artifact rejected",
+            "summary": summary,
         },
     }
+
+
+def _failed_artifact_tool(meta: dict, output: str, ts: str | None) -> dict:
+    return _artifact_tool_status(
+        meta,
+        output,
+        ts,
+        ok=False,
+        summary="render_artifact rejected",
+    )
+
+
+def _unparseable_artifact_tool(meta: dict, output: str, ts: str | None) -> dict:
+    return _artifact_tool_status(
+        meta,
+        output,
+        ts,
+        ok=True,
+        summary="render_artifact completed without a parseable artifact",
+    )
 
 
 def _codex_mcp_tool_result_text(item: dict) -> str:
@@ -649,6 +690,14 @@ def _artifact_from_structured_result(meta: dict, output: str) -> dict | None:
     return artifact_from_text(sentinel_text(protocol_event))
 
 
+def _structured_artifact_result_failed(output: str) -> bool:
+    try:
+        result = json.loads(output)
+    except ValueError:
+        return False
+    return isinstance(result, dict) and result.get("ok") is False
+
+
 def _complete_artifact(
     state: dict,
     call_id: object,
@@ -660,15 +709,19 @@ def _complete_artifact(
     meta = state.get("pending_artifacts", {}).pop(call_id, None)
     if meta is None:
         return False
+    failed = failed or _structured_artifact_result_failed(output)
     protocol_event = None if failed else artifact_from_text(output)
     if protocol_event is None and not failed:
         protocol_event = _artifact_from_structured_result(meta, output)
-    event = (
-        _artifact_event(protocol_event, ts)
-        if protocol_event is not None
-        else _failed_artifact_tool(meta, output, ts)
-    )
-    _append_event(state, event)
+    if protocol_event is not None:
+        _append_artifact_event(state, protocol_event, ts)
+    else:
+        _append_event(
+            state,
+            _failed_artifact_tool(meta, output, ts)
+            if failed
+            else _unparseable_artifact_tool(meta, output, ts),
+        )
     return True
 
 
@@ -983,7 +1036,7 @@ def _codex_normalized_apply(state: dict, row: dict) -> None:
         _apply_normalized_payload(state, row, _codex_apply, None)
         return
     if row.get("kind") == "artifact" and payload.get("kind") == "artifact":
-        _append_event(state, _artifact_event(payload, row.get("normalized_at")))
+        _append_artifact_event(state, payload, row.get("normalized_at"))
         _record_row_disposition(state, _normalized_disposition(row))
         return
     method = payload.get("method")
@@ -1003,20 +1056,33 @@ def _codex_normalized_apply(state: dict, row: dict) -> None:
         item = params.get("item")
         artifact = artifact_from_codex_mcp_tool_result(item)
         if artifact is not None:
-            _append_event(state, _artifact_event(artifact, ts))
+            _append_artifact_event(state, artifact, ts)
             _record_row_disposition(state, _normalized_disposition(row))
             return
         if _is_codex_render_artifact_call(item):
-            assert isinstance(item, dict)
+            completed = (
+                item.get("status") == "completed"
+                and item.get("error") is None
+                and not (
+                    isinstance(item.get("result"), dict)
+                    and item["result"].get("isError") is True
+                )
+            )
             _append_event(
                 state,
-                _failed_artifact_tool(
+                _artifact_tool_status(
                     {
                         "name": "render_artifact",
                         "input": _tool_arguments(item.get("arguments")) or {},
                     },
                     _codex_mcp_tool_result_text(item),
                     ts,
+                    ok=completed,
+                    summary=(
+                        "render_artifact completed without a parseable artifact"
+                        if completed
+                        else "render_artifact rejected"
+                    ),
                 ),
             )
             _record_row_disposition(state, _normalized_disposition(row))
@@ -1857,6 +1923,7 @@ def _new_parse_state(fmt: str) -> dict:
         "session_meta": {},
         "task_inputs": {},
         "task_activeform": {},
+        "artifact_ids": set(),
         "dedupe_credits": {},
         "dispositions": {"rendered": 0, "summarized": 0, "ignored": 0, "unknown": 0},
     }
