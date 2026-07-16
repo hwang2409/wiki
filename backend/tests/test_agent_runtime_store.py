@@ -193,6 +193,55 @@ class ProtocolFixtureTests(unittest.TestCase):
             {"kind": "mermaid", "source": "flowchart TB\n  worker --> artifact"},
         )
 
+    def test_codex_failed_render_completion_preserves_write_time_event(self) -> None:
+        row = json.loads(
+            (FIXTURES / "codex_render_artifact_completed.jsonl").read_text(
+                encoding="utf-8"
+            )
+        )
+        item = row["message"]["params"]["item"]
+        item["status"] = "failed"
+        item["error"] = "artifact server rejected the request"
+        item["result"] = {
+            "content": [{"type": "text", "text": "artifact rejected"}],
+            "isError": True,
+        }
+
+        normalized = normalize_provider_event(ProviderKind.CODEX, row["message"])
+
+        self.assertEqual(normalized.disposition, EventDisposition.RENDERED)
+        self.assertEqual(normalized.kind, "item_completed")
+        self.assertEqual(normalized.payload, row["message"])
+        self.assertEqual(normalized.payload["params"]["item"], item)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(_paths(root))
+            record = store.create(_record(root))
+            raw = store.append_raw(
+                record.run_id,
+                provider="codex",
+                direction="server",
+                payload=row["message"],
+            )
+            persisted = store.append_normalized(
+                record.run_id,
+                raw_seq=raw["seq"],
+                disposition=normalized.disposition,
+                kind=normalized.kind,
+                payload=normalized.payload,
+                lifecycle_state=normalized.lifecycle_state,
+            )
+
+            stored_lines = store.normalized_events_path(record.run_id).read_text(
+                encoding="utf-8"
+            ).splitlines()
+            self.assertEqual(len(stored_lines), 1)
+            self.assertEqual(json.loads(stored_lines[0]), persisted)
+            self.assertEqual(persisted["disposition"], "rendered")
+            self.assertEqual(persisted["kind"], "item_completed")
+            self.assertEqual(persisted["payload"], row["message"])
+
 
 class LifecycleTests(unittest.TestCase):
     def test_restart_recovery_table_is_closed_and_only_working_idle_resume(
