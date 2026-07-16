@@ -29,6 +29,7 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[multi-account-auth-rotation]] — codex/claude multi-account auth mechanics + rotation design (WIKI-15 watchdog)
 - [[instance-pinning-verification]] — Failure shape: verification targets a different instance than the consumer uses (main-vs-worktree, hot-vs-frozen backend, stale checkout); always pin the instance
 - [[turbopuffer]] — Serverless vector+FTS search DB on object storage — what it is, when to use
+- [[local-cloud]] — local-cloud: Henry's self-hosted service stack on GPU machine — direction, stack picks, pufferclone's role
 
 ## Phoebe
 
