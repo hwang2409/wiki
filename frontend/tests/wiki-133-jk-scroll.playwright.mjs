@@ -14,26 +14,33 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
-async function dispatchGlobalKey(page, target, { isComposing = false } = {}) {
-  await target.evaluate((element, composing) => {
+async function dispatchGlobalKey(page, target, { isComposing = false, bubbleToDocument = false } = {}) {
+  await target.evaluate((element, { composing, bubble }) => {
     const event = new KeyboardEvent("keydown", {
       bubbles: true,
       cancelable: true,
       isComposing: composing,
       key: "j",
     });
+    if (bubble) {
+      element.dispatchEvent(event);
+      return;
+    }
     Object.defineProperty(event, "target", { configurable: true, value: element });
     window.dispatchEvent(event);
-  }, isComposing);
+  }, { composing: isComposing, bubble: bubbleToDocument });
 }
 
 async function assertTextEntryDoesNotScroll(page, scroller, target, label, options) {
   await scroller.evaluate((element) => element.scrollTo({ top: 0, behavior: "auto" }));
   await page.locator(".pane-frame.is-focused").focus();
+  const paneBefore = await page.locator(".pane-frame.is-focused").getAttribute("data-pane-key");
   const before = await scroller.evaluate((element) => element.scrollTop);
   await dispatchGlobalKey(page, target, options);
   await page.waitForTimeout(100);
   const after = await scroller.evaluate((element) => element.scrollTop);
+  const paneAfter = await page.locator(".pane-frame.is-focused").getAttribute("data-pane-key");
+  assert(paneAfter === paneBefore, `${label} moved focus from ${paneBefore} to ${paneAfter}`);
   assert(after === before, `${label} allowed j to scroll from ${before} to ${after}`);
 }
 
@@ -148,6 +155,21 @@ async function main() {
       `j stole focus from a focused input and scrolled from ${beforeInput} to ${inputScrollTop}`,
     );
 
+    await page.locator(".pane-frame.is-focused").focus();
+    await page.keyboard.press("Control+a");
+    await page.getByLabel("Settings", { exact: true }).click();
+    const settings = page.locator(".settings-modal");
+    await settings.waitFor({ state: "visible" });
+    await assertTextEntryDoesNotScroll(
+      page,
+      scroller,
+      settings.locator("select").first(),
+      "modal",
+      { bubbleToDocument: true },
+    );
+    await settings.getByRole("button", { name: "Close settings" }).click();
+    await page.keyboard.press("Escape");
+
     await page.locator(".session-composer textarea").waitFor({ state: "visible" });
     await assertTextEntryDoesNotScroll(
       page,
@@ -170,12 +192,6 @@ async function main() {
     await switcherInput.focus();
     await page.keyboard.press("Escape");
 
-    await page.getByLabel("Settings", { exact: true }).click();
-    const settings = page.locator(".settings-modal");
-    await settings.waitFor({ state: "visible" });
-    await assertTextEntryDoesNotScroll(page, scroller, settings.locator("select").first(), "modal");
-    await settings.getByRole("button", { name: "Close settings" }).click();
-
     await page.goto(`${backend.baseUrl}/#/edit/scroll.md`, { waitUntil: "domcontentloaded" });
     const editor = page.locator(".cm-content[contenteditable='true']");
     await editor.waitFor({ state: "visible" });
@@ -187,7 +203,13 @@ async function main() {
       element.append(preview);
     });
     await assertTextEntryDoesNotScroll(page, editorView, editor, "editor contenteditable");
-    await assertTextEntryDoesNotScroll(page, editorView, editor, "IME", { isComposing: true });
+    await assertTextEntryDoesNotScroll(
+      page,
+      editorView,
+      editorView,
+      "IME",
+      { isComposing: true, bubbleToDocument: true },
+    );
 
     await page.goto(`${backend.baseUrl}/#/agent/WIKI-133`, { waitUntil: "domcontentloaded" });
     const sessionScroller = page.locator(".pane-frame.is-focused .session-scroll");
@@ -204,7 +226,18 @@ async function main() {
     await page.getByLabel("Agents", { exact: true }).click();
     const agentsView = page.locator(".pane-frame.is-focused .view-content");
     await agentsView.waitFor({ state: "visible" });
+    await agentsView.evaluate((element) => {
+      const filler = document.createElement("div");
+      filler.style.height = "2000px";
+      filler.dataset.wiki133Overflow = "true";
+      element.append(filler);
+    });
+    await page.waitForFunction(() => {
+      const element = document.querySelector(".pane-frame.is-focused .view-content");
+      return element instanceof HTMLElement && element.scrollHeight > element.clientHeight;
+    });
     await page.locator(".pane-frame.is-focused").focus();
+    await agentsView.evaluate((element) => element.scrollTo({ top: 0, behavior: "auto" }));
     const agentsBefore = await agentsView.evaluate((element) => element.scrollTop);
     await page.keyboard.press("j");
     await page.waitForTimeout(100);
