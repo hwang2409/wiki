@@ -182,6 +182,27 @@ export function getAgents() {
   }>("/api/agents");
 }
 
+export type DashboardTicket = {
+  ticket: string;
+  description: string;
+  pr: string | null;
+  repo: string | null;
+  enriched: boolean;
+  status: string;
+  detail: string | null;
+  date: string | null;
+  live: boolean;
+  role: string | null;
+  kind: string | null;
+};
+
+export function getDashboardTickets(signal?: AbortSignal) {
+  return request<{ tickets: DashboardTicket[]; repo_allowlist: string[] }>(
+    "/api/dashboard/tickets",
+    signal ? { signal } : undefined
+  );
+}
+
 export type SpawnWorkerKind = "cdx" | "cc";
 export type SpawnWorkerRole = "plan" | "implement" | "review";
 export type SpawnWorkerEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
