@@ -2341,9 +2341,11 @@ export default function App() {
   function paneScopeScroll(delta: number): boolean {
     const frame = activePaneFrame();
     if (!frame) return false;
-    const scroller = frame.querySelector<HTMLDivElement>(".session-scroll");
+    const notePreview = frame.querySelector<HTMLElement>(".markdown-preview-view");
+    const scroller = notePreview?.closest<HTMLDivElement>(".view-content") ??
+      frame.querySelector<HTMLDivElement>(".session-scroll");
     if (!scroller) return false;
-    scroller.scrollBy({ top: delta });
+    scroller.scrollBy({ top: delta, behavior: notePreview ? "smooth" : "auto" });
     return true;
   }
 
@@ -2376,6 +2378,21 @@ export default function App() {
 
   function handlePaneScopeKey(event: globalThis.KeyboardEvent): boolean {
     if (event.ctrlKey || event.metaKey || event.altKey) return false;
+    const textEntryTarget = [
+      event.target instanceof Element ? event.target : null,
+      document.activeElement instanceof Element ? document.activeElement : null,
+    ].some((element) => {
+      if (!element) return false;
+      if (
+        element instanceof HTMLInputElement ||
+        element instanceof HTMLTextAreaElement ||
+        element instanceof HTMLSelectElement
+      ) {
+        return true;
+      }
+      return element instanceof HTMLElement && element.isContentEditable;
+    });
+    if (textEntryTarget) return false;
     const key = event.key;
     const lowerKey = key.toLowerCase();
     if (lowerKey === "j") return paneScopeScroll(60);
