@@ -2,13 +2,44 @@
 type: log
 tags: [log, done]
 created: 2026-07-06
-updated: 2026-07-15
+updated: 2026-07-16
 ---
 
 # Done
 
+## 2026-07-16
+
+- PHO-13944 WS3 feature catalog PR #11581 merge-ready, worker archived, handed to Henry for manual merge (PR 2 auto-apply weekly sweep still unbuilt)
+- PHO-13943 Granola-org matching + agent meeting-context tool merged (#11580, 3 sol rounds / 3 blockers+6 majors: free-mail linking, override leakage, unwrapped evidence, write-by-default backfill, O(NxM) sync, atomicity) — PHO-13940 workstream 1 done; post-deploy: run match-backfill --write against prod Core
+- CORE-BODY-UUID-HOTFIX merged (#11623): prod TypeError on admin Linear-ticket creation (DEP-108 idempotency_key UUID) — root fix mode=json in CoreRequestModel.core_body, orchestrator-authored + worker-shipped
+- gauge — GAU-4 CLI + wiring merged (terminal charts, grapheme-safe width, query API wired, 5 sol rounds, master@9d32f0b) — v0 COMPLETE, success criterion verified live
+- PHO-13884 /admin/agent UI reimagine merged (#11542, cc/fable worker: Wiki-style progressive disclosure, settled-turn promotion, purple identity; 4 sol rounds + 4 Henry live-feedback rounds; shared chat_view changes gated behind groupActivityEntries prop)
+- gauge — GAU-2 scraper merged (reqwest hardened client, deadline cadence, target identity, staleness, 4 sol rounds, master@bf472be)
+- gauge — GAU-3 query engine merged (expr parser/eval w/ depth+point budgets, counter-aware rate, mountable API, 3 sol rounds, master@1646ec8)
+- gauge — GAU-1 storage engine merged (bit-packed Gorilla, WAL, atomic partitions, unlink-safe indexed reads, corruption hardening, 7 sol rounds, master@444a60c)
+- DEP-108 Linear-Core accounts + ticket creation merged (#11487, dash's PR + our fixer through 7 sol rounds: dup customers, idempotency redesign to stateful attempt machine, classification table, status-first parsing) — unlocks PHO-13940 workstream 4
+- PHO-13938 persona in posthog.identify merged (#11567, orchestrator direct-read review — diff exactly to spec)
+- gauge — GAU-5 exporters merged (gauge-node + gauge-proc, nonblocking cached scrapes, panic recovery, 5 sol rounds, master@bd094bf)
+- PHO-13882 dynamic skill editing merged (#11533, 2 sol rounds: hostile-draft diff DoS + per-skill approval race caught/fixed) — agent proposes skill-body drafts, human approves in admin panel, versioned rollback
+- PHO-13898 sandbox transport merged (#11535, 2 sol rounds: lying-truncated-flag trust, ExeDev prompt mismatch, image-param contradiction, artifact spill) — matplotlib-in-chat pipeline live: analysis image + base64 reads + admin.image@1 artifacts
+- PHO-13911 worker-admin pool PARKED by Henry: app-side PR #11541 mergeable after 2 sol rounds but deliberately closed; branch preserved at 952171cf35; handoff context in ticket for Henry's lead
+- pufferclone — PUF-11 memory budget + LRU eviction merged (drain-aware policy, serialized accounting, loader extraction, 3 sol rounds, main@6bc5d64) — v2 COMPLETE
+- Snowflake IAM hotfix merged by Henry (#11534, TF secret shell + grant, sol MERGE-READY, security assessor high = manual approval path)
+- pufferclone — PUF-12 puf CLI merged (thin HTTP client, certainty-tracked batch upserts, hybrid query, source-aware abort accounting, 6 sol rounds, main@d784b30)
+- Prod Snowflake migration incident closed: root cause = deploy job authored with secret existing only in dev + no IAM grant (latent since birth, continue-on-error masked). Fix: TF secret shell + grant (Henry applied), key copied dev->prod, job rerun SUCCESS — #11491 QHS loaders live in warehouse. PR #11534 pending 2nd human approval (security assessor rated high). Follow-up candidate: separate prod Snowflake keypair
+- tix — TIX-1 v0 merged (ticket tracker CLI: atomic durable JSON storage, flock mutations, O_EXCL ID allocation, 6 sol rounds, master@9524a17)
+- PHO-13881 admin agent tools/ subpackage move merged (#11527, 2 sol rounds: incomplete move + orphaned test + purity noqa caught then fixed; barrel exports byte-identical)
+- pufferclone — PUF-10 benchmark suite merged (criterion + 100k rows, deterministic admission probe, recall harness, BENCHMARKS.md, 2 sol rounds, main@f5abeec)
+- Modal sandbox backend ACTIVATED: #11522 merged (.env.keys injection) + CODE_SANDBOX_BACKEND=modal set in staging+prod phoebe-app-env-vars (verified single-key delta, AWSPREVIOUS rollback); staging live on autodeploy, prod on next deploy
+- pufferclone — PUF-9 MinIO end-to-end merged (compose fixture, gated s3_e2e, hardened smoke, 2 sol rounds, main@58436ca)
+- PHO-13826 live Modal smoke PASS (dev env): full verb cycle create/exec/write70KB/read-roundtrip/list/destroy + egress blocked; stdin write fix verified against real Modal; activation gate = CODE_SANDBOX_BACKEND=modal
+- PHO-13826 Modal sandbox backend merged (#11447, 3 sol rounds: silent param drop, 64KB argv limit, stdin-heredoc empty-write regression) + PHO-13855 Slack admin agent self-join merged (#11472, 4 sol rounds converging 3maj->1maj->1min->clean; needs manual admin-bot Slack reauth for channels:join) — both admin-merged by Henry auth via phoebe orch
+
 ## 2026-07-15
 
+- PHO-13826 PR #11447 round-2 write_file fix pushed at c8f8ab6a1890885f50381449fbd046c18f4eb290; Modal script now uses python3 -c with stdin content and 64KiB read-back regression passes
+- PHO-13826 PR #11447 refreshed onto origin/main at 18c8eef6fd3fec1e00780ff8ba285ded69655556; CI green, awaiting round-2 review
+- pufferclone — PUF-8 non-blocking cold loads merged (bounded admission, lifecycle coordinator extraction, cancellation-safe finalizers, 5 sol rounds, main@87cad8d) — v1 COMPLETE
 - WIKI-117/118 merged (#103, squash 8f68d53): artifact test env isolation + #91 hardening; 4 review rounds (sol), mutation-verified
 - WIKI-130 deployed: supervisor graceful stop -> atomic swap -> app relaunch verified (repo=/Users/henry/me/fun/wiki, API 200); fleet auto-resumed (5 codex + 3 claude under new supervisor); stacked 127/116/129 backend changes now live
 - WIKI-130 fix committed (1b1cacb): resolve_repo_dir escapes .native-build-staging like .codex; 3 Rust unit tests added (first in src-tauri); staged bundle built, swap pending fleet-idle

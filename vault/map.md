@@ -34,6 +34,7 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 ## Phoebe
 
 - [[repo-guide]] — phoebe monorepo 0→1 routing: read-first stack per task, cold-start mistake list, documented gaps. Start here for any phoebe repo work.
+- [[admin-agent-dynamic-skills]] — Dynamic skill editing decision: DB overlay, draft→approve only, text-only boundary (PHO-13882); OpenClaw research notes
 - [[admin-agent]] — Internal Admin Agent FULL architecture + state doc: code map, runtime, tool inventory, safety model, incidents, chronology, active work. THE one-read context for any admin-agent session.
 - [[admin-agent-audit-2026-07-14]] — Full 15-domain e2e audit of admin agent @ origin/main af8173bbfb: 134 tools, 63 endpoints, maturity assessment, ranked gaps/risks (5 HIGH), half-finished arcs.
 - [[recommendation-subagents]] — recommendation-subagents campaign (June–July 2026): changes, eval numbers, overfit arc.
@@ -61,6 +62,10 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 ## Phoebe/decisions
 
 - [[admin-db-reads-generated-catalog]] — Admin agent DB access: schema-wide reads via migrate-apply generated catalog + secret deny-tier + cost guardrails; allow-list curation retired (PHO-13273)
+
+## Phoebe/features
+
+- [[meeting-booking-onboarding]] — Phoebe meeting booking: customer onboarding and Core/admin-agent seams
 
 ## Families (path patterns, not enumerated)
 

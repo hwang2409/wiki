@@ -3,7 +3,7 @@ type: reference
 view: kanban
 tags: [todo]
 created: 2026-07-06
-updated: 2026-07-15
+updated: 2026-07-16
 ---
 
 Todo:
@@ -14,6 +14,8 @@ Todo:
 - [P3] WIKI-126: surface rebrand — rename app-facing identity only (app display name, window title, README header); NAME NOT YET CHOSEN by Henry, blocked until he picks. Internal identifiers stay (repo, wiki CLI, WIKI-* tickets, MCP names, vault paths — codename doctrine, Henry 2026-07-15)
 - [P2] amd-shadow invalid index: KORGAN owns fix (PR 11416 closed w/ evidence); prod index still INVALID 0-byte — watch deploys
 - [P2] PHO-13826/27/28 exe.dev sandbox arc: enable (SSH key secret + smoke) -> ownership fix -> TTL sweeper; PHO-13829 egress design backlog. Surface merged since PHO-13073/#10608, dormant on missing key
+- [P3] wiki backend /metrics endpoint (gauge follow-up)
+- [P3] pufferclone /metrics endpoint (gauge follow-up)
 
 In Progress:
 
@@ -27,7 +29,7 @@ In Progress:
 - [P2] PHO-13830 live EHR record fetch tool (admin agent) — worker live
 - [P2] PHO-13832 shift classification + calendar artifact (admin agent) — worker live
 - [P2] PHO-13826 ModalSandboxBackend + PHO-13827 sandbox ownership — workers live (Modal replaces exe.dev for v0; 13828 lifecycle + 13829 egress design queued)
-- PUF-5..8: pufferclone v1 — HNSW, compaction, S3 store, non-blocking reads (spec: docs/superpowers/specs/2026-07-15-pufferclone-v1-design.md)
+- mitmweb rebuild: scope and build a clearer live proxy-traffic inspector — owner (misc)
 
 Backlog:
 
