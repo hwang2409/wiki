@@ -2,7 +2,7 @@
 type: campaign
 tags: [mitmproxy, proxy, frontend]
 created: 2026-07-16
-updated: 2026-07-16
+updated: 2026-07-17
 ---
 
 # Mitmweb Rebuild
@@ -24,4 +24,4 @@ Build a clearer, high-density local inspector for live mitmproxy HTTP(S) flows, 
 
 ## State
 
-Planning complete from supervisor runs `MITMWEB-ARCH`, `MITMWEB-INGEST`, `MITMWEB-UX`, and `MITMWEB-SCOPE`; foundation ticket S0 is next. Architecture follows [[public-hook-adapter]]. Verified against [mitmproxy 12.2.3](https://github.com/mitmproxy/mitmproxy/releases/tag/v12.2.3), [event hooks](https://docs.mitmproxy.org/stable/api/events.html), and [Anthropic streaming semantics](https://platform.claude.com/docs/en/build-with-claude/streaming).
+Planning complete from supervisor runs `MITMWEB-ARCH`, `MITMWEB-INGEST`, `MITMWEB-UX`, and `MITMWEB-SCOPE`. Foundation S0 merged locally to `mitm-inspector/main` at `420f2e2` after seven review rounds; its contract/schema, Python and TypeScript boundaries, redaction policy, memory-store seam, API seam, runtime seam, and UI shell are green (153 Python tests, 13 frontend tests, strict types, lint, production build). The parallel B1 runtime, B2 capture/store, F1 frontend shell/client, and F3 inspector wave is next. Architecture follows [[public-hook-adapter]]. Verified against [mitmproxy 12.2.3](https://github.com/mitmproxy/mitmproxy/releases/tag/v12.2.3), [event hooks](https://docs.mitmproxy.org/stable/api/events.html), and [Anthropic streaming semantics](https://platform.claude.com/docs/en/build-with-claude/streaming).
