@@ -174,6 +174,49 @@ class RowBuildingTests(unittest.TestCase):
             datetime.fromtimestamp(1752760000.0, tz=timezone.utc).isoformat(),
         )
 
+    def test_status_older_than_spawned_by_subsecond_is_ignored(self) -> None:
+        # Even a 500ms-old status file must not leak into a fresh session.
+        spawned = datetime(2026, 7, 17, 12, 0, 0, tzinfo=timezone.utc)
+        registry = {
+            "WIKI-3": {
+                "current": {
+                    "role": "implement",
+                    "kind": "cc",
+                    "state": "working",
+                    "spawned_at": spawned.isoformat(),
+                    "pr": None,
+                }
+            }
+        }
+        stale = {
+            "state": "merge-ready",
+            "step": "old",
+            "pr": "https://github.com/hwang2409/wiki/pull/9",
+            "_mtime": spawned.timestamp() - 0.5,
+        }
+        rows = dashboard.live_worker_rows(registry, {"WIKI-3": stale})
+        row = rows[0]
+        self.assertEqual(row["state"], "working")
+        self.assertIsNone(row["pr"])
+        self.assertIsNone(row["step"])
+
+    def test_status_at_spawned_at_is_accepted(self) -> None:
+        spawned = datetime(2026, 7, 17, 12, 0, 0, tzinfo=timezone.utc)
+        registry = {
+            "WIKI-4": {
+                "current": {
+                    "role": "implement",
+                    "kind": "cc",
+                    "spawned_at": spawned.isoformat(),
+                    "pr": None,
+                }
+            }
+        }
+        fresh = {"state": "merge-ready", "step": "done", "_mtime": spawned.timestamp()}
+        rows = dashboard.live_worker_rows(registry, {"WIKI-4": fresh})
+        self.assertEqual(rows[0]["state"], "merge-ready")
+        self.assertEqual(rows[0]["step"], "done")
+
     def test_stale_status_older_than_spawned_at_is_ignored(self) -> None:
         spawned = datetime(2026, 7, 17, 12, 0, 0, tzinfo=timezone.utc)
         registry = {
@@ -327,6 +370,54 @@ class ProdDeploySingleFlightTests(unittest.TestCase):
         dashboard._deploy_sha_cache.clear()
         dashboard._deploy_sha_inflight.clear()
 
+    def test_owner_failure_releases_inflight_and_next_call_retries(self) -> None:
+        release = threading.Event()
+        outcomes: list[str] = []
+        outcomes_lock = threading.Lock()
+        call_count = 0
+        call_lock = threading.Lock()
+
+        def fetch(repo):
+            nonlocal call_count
+            with call_lock:
+                call_count += 1
+                current = call_count
+            if current == 1:
+                # Wait for the second caller to arrive on the inflight event…
+                release.wait(timeout=5)
+                raise RuntimeError("gh explosion")
+            return "def456"
+
+        def call(label):
+            with mock.patch.object(dashboard, "_fetch_prod_deploy_sha", fetch):
+                try:
+                    sha = dashboard._prod_deploy_sha("phoebe-health/phoebe")
+                    with outcomes_lock:
+                        outcomes.append(f"{label}:{sha}")
+                except RuntimeError as exc:
+                    with outcomes_lock:
+                        outcomes.append(f"{label}:err:{exc}")
+
+        owner = threading.Thread(target=call, args=("owner",))
+        owner.start()
+        # Wait until owner is inside the fetch (call_count == 1) then release
+        # so it raises. The retry after join must fetch anew (no stale cache,
+        # no stuck inflight entry).
+        for _ in range(200):
+            with call_lock:
+                if call_count >= 1:
+                    break
+            time.sleep(0.01)
+        release.set()
+        owner.join(timeout=5)
+        # Inflight must be cleared even though the owner raised.
+        with dashboard._deploy_sha_lock:
+            self.assertNotIn("phoebe-health/phoebe", dashboard._deploy_sha_inflight)
+            self.assertNotIn("phoebe-health/phoebe", dashboard._deploy_sha_cache)
+        call("retry")
+        self.assertIn("retry:def456", outcomes)
+        self.assertEqual(call_count, 2)
+
     def test_concurrent_misses_share_one_fetch(self) -> None:
         release = threading.Event()
         call_count = 0
@@ -474,6 +565,32 @@ class DashboardEndpointTests(unittest.TestCase):
     def test_endpoint_survives_missing_inputs(self) -> None:
         payload = main.dashboard_tickets()
         self.assertEqual(payload["tickets"], [])
+
+    def test_endpoint_dedups_before_capping_archive(self) -> None:
+        # 30 recent sessions for one ticket + 1 older session for a second
+        # ticket. If dedup happened AFTER a session-count cap (as pre-fix),
+        # the second ticket would fall off the tail. Both must surface.
+        base_year = 2026
+        crowded = self.archive / "PHO-1"
+        crowded.mkdir()
+        # 30 sessions across 2026-07-15 and 2026-07-16, all newer than PHO-2.
+        for idx in range(30):
+            day, hour = (15 if idx < 24 else 16, idx if idx < 24 else idx - 24)
+            session = crowded / f"{base_year:04d}07{day:02d}-{hour:02d}0000"
+            session.mkdir()
+            (session / "meta.json").write_text(
+                json.dumps({"worker": {"kind": "cc", "role": "implement"}}),
+                encoding="utf-8",
+            )
+        older = self.archive / "PHO-2" / f"{base_year:04d}0710-090000"
+        older.mkdir(parents=True)
+        (older / "meta.json").write_text(
+            json.dumps({"worker": {"kind": "cc", "role": "implement"}, "outcome": "merged"}),
+            encoding="utf-8",
+        )
+        payload = main.dashboard_tickets()
+        tickets = {row["ticket"] for row in payload["tickets"]}
+        self.assertEqual(tickets, {"PHO-1", "PHO-2"})
 
 
 if __name__ == "__main__":

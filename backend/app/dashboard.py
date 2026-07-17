@@ -156,11 +156,15 @@ def _prod_deploy_sha(repo: str) -> str | None:
             continue
         try:
             sha = _fetch_prod_deploy_sha(repo)
-        finally:
+        except BaseException:
             with _deploy_sha_lock:
-                _deploy_sha_cache[repo] = (time.time(), sha)
                 _deploy_sha_inflight.pop(repo, None)
             waiter.set()
+            raise
+        with _deploy_sha_lock:
+            _deploy_sha_cache[repo] = (time.time(), sha)
+            _deploy_sha_inflight.pop(repo, None)
+        waiter.set()
         return sha
 
 
@@ -316,7 +320,7 @@ def _status_for_current(
     mtime = status.get("_mtime")
     spawned = _parse_when(current.get("spawned_at"))
     if isinstance(mtime, (int, float)) and spawned is not None:
-        if mtime + 1 < spawned.timestamp():
+        if mtime < spawned.timestamp():
             return {}
     return status
 
