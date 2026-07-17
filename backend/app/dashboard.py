@@ -77,7 +77,12 @@ def _summarize_checks(checks: list[dict[str, Any]]) -> tuple[str | None, str | N
 
 
 def fetch_pr_summary(pr_url: str, repo: str) -> dict[str, Any]:
-    """One gh round-trip bundle for a PR. Runs on a background thread."""
+    """One gh round-trip bundle for a PR. Runs on a background thread.
+
+    The `deployed` key is only present when the repo is deployment-tracked;
+    absence signals "untracked, treat MERGED as terminal", None signals
+    "tracked but not yet confirmed — keep refreshing".
+    """
     view = _run_gh_json(
         [
             "pr",
@@ -108,12 +113,7 @@ def fetch_pr_summary(pr_url: str, repo: str) -> dict[str, Any]:
             for node in connection.get("nodes") or []
             if isinstance(node, dict) and not node.get("isResolved")
         )
-    deployed: bool | None = None
-    if state == "MERGED" and repo in DEPLOY_ENVIRONMENT_BY_REPO:
-        merge_sha = (view.get("mergeCommit") or {}).get("oid")
-        if isinstance(merge_sha, str) and merge_sha:
-            deployed = _merge_deployed(repo, merge_sha)
-    return {
+    summary: dict[str, Any] = {
         "title": view.get("title"),
         "state": state,
         "updated_at": view.get("updatedAt"),
@@ -122,22 +122,50 @@ def fetch_pr_summary(pr_url: str, repo: str) -> dict[str, Any]:
         "failing_check": failing_check,
         "thread_total": thread_total,
         "thread_unresolved": thread_unresolved,
-        "deployed": deployed,
     }
+    if state == "MERGED" and repo in DEPLOY_ENVIRONMENT_BY_REPO:
+        merge_sha = (view.get("mergeCommit") or {}).get("oid")
+        summary["deployed"] = (
+            _merge_deployed(repo, merge_sha)
+            if isinstance(merge_sha, str) and merge_sha
+            else None
+        )
+    return summary
 
 
 _deploy_sha_cache: dict[str, tuple[float, str | None]] = {}
+_deploy_sha_inflight: dict[str, threading.Event] = {}
 _deploy_sha_lock = threading.Lock()
 
 
 def _prod_deploy_sha(repo: str) -> str | None:
-    now = time.time()
-    with _deploy_sha_lock:
-        cached = _deploy_sha_cache.get(repo)
-        if cached and now - cached[0] < CACHE_TTL_SECONDS:
-            return cached[1]
+    while True:
+        with _deploy_sha_lock:
+            cached = _deploy_sha_cache.get(repo)
+            if cached and time.time() - cached[0] < CACHE_TTL_SECONDS:
+                return cached[1]
+            waiter = _deploy_sha_inflight.get(repo)
+            if waiter is None:
+                waiter = threading.Event()
+                _deploy_sha_inflight[repo] = waiter
+                owner = True
+            else:
+                owner = False
+        if not owner:
+            waiter.wait(timeout=60)
+            continue
+        try:
+            sha = _fetch_prod_deploy_sha(repo)
+        finally:
+            with _deploy_sha_lock:
+                _deploy_sha_cache[repo] = (time.time(), sha)
+                _deploy_sha_inflight.pop(repo, None)
+            waiter.set()
+        return sha
+
+
+def _fetch_prod_deploy_sha(repo: str) -> str | None:
     environment = DEPLOY_ENVIRONMENT_BY_REPO[repo]
-    sha: str | None = None
     deployments = _run_gh_json(
         ["api", f"repos/{repo}/deployments?environment={quote(environment, safe='')}&per_page=5"],
         timeout=30,
@@ -153,11 +181,8 @@ def _prod_deploy_sha(repo: str) -> str | None:
         if isinstance(latest, dict) and latest.get("state") == "success":
             candidate = deployment.get("sha")
             if isinstance(candidate, str) and candidate:
-                sha = candidate
-                break
-    with _deploy_sha_lock:
-        _deploy_sha_cache[repo] = (now, sha)
-    return sha
+                return candidate
+    return None
 
 
 def _merge_deployed(repo: str, merge_sha: str) -> bool | None:
@@ -229,7 +254,13 @@ def _is_terminal(data: dict[str, Any]) -> bool:
     state = data.get("state")
     if state == "CLOSED":
         return True
-    return state == "MERGED" and data.get("deployed") in (True, None)
+    if state != "MERGED":
+        return False
+    # Absence of `deployed` = repo not deployment-tracked → merged is terminal.
+    # None = tracked but unknown → keep refreshing.
+    if "deployed" not in data:
+        return True
+    return data["deployed"] is True
 
 
 PR_CACHE = PrCache()
@@ -239,12 +270,15 @@ def live_worker_rows(
     registry: dict[str, Any],
     statuses: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """One row per live (registered or status-file-only) non-orchestrator ticket.
+    """One row per live registered non-orchestrator ticket.
 
-    statuses: ticket -> status-file dict with optional "_mtime" float.
+    Status files are correlated with the registry entry's `spawned_at` — an
+    older status file (from a previous session that outlived its worker)
+    is ignored so a restarted ticket doesn't inherit the previous session's
+    PR/state. Status files with no matching registry entry are never
+    surfaced as live; they belong to the archive path.
     """
     rows: list[dict[str, Any]] = []
-    seen: set[str] = set((registry.get("_orchestrators") or {}).keys())
     for ticket, entry in sorted(registry.items()):
         if ticket.startswith("_") or not isinstance(entry, dict):
             continue
@@ -252,10 +286,8 @@ def live_worker_rows(
         if not isinstance(current, dict):
             continue
         if current.get("role") == "orchestrator":
-            seen.add(ticket)
             continue
-        seen.add(ticket)
-        status = statuses.get(ticket) or {}
+        status = _status_for_current(statuses.get(ticket), current)
         rows.append(
             {
                 "ticket": ticket,
@@ -272,24 +304,21 @@ def live_worker_rows(
                 or current.get("spawned_at"),
             }
         )
-    for ticket, status in sorted(statuses.items()):
-        if ticket in seen or not isinstance(status, dict):
-            continue
-        rows.append(
-            {
-                "ticket": ticket,
-                "live": True,
-                "role": None,
-                "kind": None,
-                "state": status.get("state"),
-                "step": status.get("step"),
-                "blocker": status.get("blocker"),
-                "pr": _normalize_pr_url(status.get("pr")),
-                "outcome": None,
-                "updated_at": _status_mtime_iso(status),
-            }
-        )
     return rows
+
+
+def _status_for_current(
+    status: dict[str, Any] | None, current: dict[str, Any]
+) -> dict[str, Any]:
+    """Return `status` only if its mtime is at/after `current.spawned_at`."""
+    if not isinstance(status, dict):
+        return {}
+    mtime = status.get("_mtime")
+    spawned = _parse_when(current.get("spawned_at"))
+    if isinstance(mtime, (int, float)) and spawned is not None:
+        if mtime + 1 < spawned.timestamp():
+            return {}
+    return status
 
 
 def _status_mtime_iso(status: dict[str, Any]) -> str | None:

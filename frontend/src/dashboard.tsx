@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowDown, ArrowUp } from "lucide-react";
 import { getDashboardTickets, type DashboardTicket } from "./api";
 import { externalLinkProps } from "./external-links";
@@ -30,10 +30,21 @@ function prNumber(url: string): string {
   return match ? `#${match[1]}` : url;
 }
 
-function compareTickets(a: DashboardTicket, b: DashboardTicket, key: SortKey): number {
-  if (key === "date") return (a.date ?? "").localeCompare(b.date ?? "");
-  if (key === "pr") return (a.pr ?? "").localeCompare(b.pr ?? "");
-  return (a[key] ?? "").localeCompare(b[key] ?? "");
+function fieldValue(ticket: DashboardTicket, key: SortKey): string {
+  if (key === "date") return ticket.date ?? "";
+  if (key === "pr") return ticket.pr ?? "";
+  return ticket[key] ?? "";
+}
+
+function compareTickets(
+  a: DashboardTicket,
+  b: DashboardTicket,
+  key: SortKey,
+  asc: boolean
+): number {
+  const cmp = fieldValue(a, key).localeCompare(fieldValue(b, key));
+  const signed = asc ? cmp : -cmp;
+  return signed !== 0 ? signed : a.ticket.localeCompare(b.ticket);
 }
 
 export function DashboardView() {
@@ -42,36 +53,46 @@ export function DashboardView() {
   const [sortKey, setSortKey] = useState<SortKey>("date");
   const [sortAsc, setSortAsc] = useState(false);
   const [nowMs, setNowMs] = useState(() => Date.now());
+  const controllerRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     let cancelled = false;
+    let timer: number | null = null;
+    const scheduleNext = () => {
+      if (cancelled) return;
+      timer = window.setTimeout(() => void load(), REFRESH_INTERVAL_MS);
+    };
     const load = async () => {
+      // Abort the previous inflight request so slow/hung polls don't stack.
+      controllerRef.current?.abort();
+      const controller = new AbortController();
+      controllerRef.current = controller;
       try {
-        const payload = await getDashboardTickets();
-        if (cancelled) return;
+        const payload = await getDashboardTickets(controller.signal);
+        if (cancelled || controller.signal.aborted) return;
         setTickets(payload.tickets);
         setError(null);
+        setNowMs(Date.now());
       } catch (err) {
-        if (cancelled) return;
+        if (cancelled || controller.signal.aborted) return;
         setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        if (controllerRef.current === controller) controllerRef.current = null;
+        scheduleNext();
       }
     };
     void load();
-    const interval = window.setInterval(() => {
-      setNowMs(Date.now());
-      void load();
-    }, REFRESH_INTERVAL_MS);
     return () => {
       cancelled = true;
-      window.clearInterval(interval);
+      if (timer !== null) window.clearTimeout(timer);
+      controllerRef.current?.abort();
+      controllerRef.current = null;
     };
   }, []);
 
   const sorted = useMemo(() => {
     if (!tickets) return [];
-    const next = [...tickets].sort((a, b) => compareTickets(a, b, sortKey));
-    if (!sortAsc) next.reverse();
-    return next;
+    return [...tickets].sort((a, b) => compareTickets(a, b, sortKey, sortAsc));
   }, [tickets, sortKey, sortAsc]);
 
   function toggleSort(key: SortKey) {

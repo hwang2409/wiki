@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -142,9 +144,17 @@ class DeriveStatusTests(unittest.TestCase):
 
 
 class RowBuildingTests(unittest.TestCase):
-    def test_live_worker_rows_skip_orchestrators(self) -> None:
+    def test_live_worker_rows_only_include_registered(self) -> None:
+        spawned = datetime(2025, 7, 17, 8, 0, 0, tzinfo=timezone.utc)
         registry = {
-            "WIKI-1": {"current": {"role": "implement", "kind": "cc", "updated_at": "2026-07-17T09:00:00+00:00"}},
+            "WIKI-1": {
+                "current": {
+                    "role": "implement",
+                    "kind": "cc",
+                    "spawned_at": spawned.isoformat(),
+                    "updated_at": "2025-07-17T09:00:00+00:00",
+                }
+            },
             "wiki-orch": {"current": {"role": "orchestrator", "kind": "cc"}},
             "_orchestrators": {"misc": {"window": "@1"}},
         }
@@ -156,14 +166,39 @@ class RowBuildingTests(unittest.TestCase):
         }
         rows = dashboard.live_worker_rows(registry, statuses)
         tickets = {row["ticket"] for row in rows}
-        self.assertEqual(tickets, {"WIKI-1", "WIKI-9"})
-        by_ticket = {row["ticket"]: row for row in rows}
-        self.assertEqual(by_ticket["WIKI-1"]["state"], "working")
+        self.assertEqual(tickets, {"WIKI-1"})
+        row = rows[0]
+        self.assertEqual(row["state"], "working")
         self.assertEqual(
-            by_ticket["WIKI-1"]["updated_at"],
+            row["updated_at"],
             datetime.fromtimestamp(1752760000.0, tz=timezone.utc).isoformat(),
         )
-        self.assertEqual(by_ticket["WIKI-9"]["state"], "merge-ready")
+
+    def test_stale_status_older_than_spawned_at_is_ignored(self) -> None:
+        spawned = datetime(2026, 7, 17, 12, 0, 0, tzinfo=timezone.utc)
+        registry = {
+            "WIKI-2": {
+                "current": {
+                    "role": "implement",
+                    "kind": "cc",
+                    "state": "working",
+                    "spawned_at": spawned.isoformat(),
+                    "pr": None,
+                }
+            }
+        }
+        # Status file predates the current session's spawn — must be ignored.
+        stale = {
+            "state": "merge-ready",
+            "step": "old",
+            "pr": "https://github.com/hwang2409/wiki/pull/99",
+            "_mtime": spawned.timestamp() - 3600,
+        }
+        rows = dashboard.live_worker_rows(registry, {"WIKI-2": stale})
+        row = rows[0]
+        self.assertEqual(row["state"], "working")
+        self.assertIsNone(row["pr"])
+        self.assertIsNone(row["step"])
 
     def test_archived_rows_keep_newest_session_per_ticket(self) -> None:
         archived = [
@@ -222,6 +257,34 @@ class PrCacheTests(unittest.TestCase):
         cache.request_refresh("https://github.com/phoebe-health/phoebe/pull/2", "phoebe-health/phoebe")
         self.assertEqual(len(calls), 1)
 
+    def test_cold_lookup_returns_before_fetch_completes(self) -> None:
+        release = threading.Event()
+        fetch_started = threading.Event()
+
+        def fetch(url, repo):
+            fetch_started.set()
+            release.wait(timeout=5)
+            return _enrich(title="warm")
+
+        cache = dashboard.PrCache(fetch)
+        pr = "https://github.com/phoebe-health/phoebe/pull/5"
+        archived = [{"ticket": "PHO-5", "archived_at": "2026-07-17T09:00:00+00:00", "pr": pr}]
+        try:
+            t0 = time.monotonic()
+            payload = dashboard.build_payload({}, {}, archived, cache=cache)
+            elapsed = time.monotonic() - t0
+            self.assertLess(elapsed, 0.5, "build_payload blocked on network fetch")
+            self.assertTrue(fetch_started.wait(timeout=5), "background fetch never started")
+            self.assertFalse(payload["tickets"][0]["enriched"])
+            self.assertEqual(payload["tickets"][0]["status"], "pr-open")
+        finally:
+            release.set()
+            # Drain the executor so the thread exits before test teardown.
+            with cache._lock:
+                executor = cache._executor
+            if executor is not None:
+                executor.shutdown(wait=True)
+
     def test_terminal_states_are_not_refetched(self) -> None:
         calls = []
 
@@ -235,6 +298,66 @@ class PrCacheTests(unittest.TestCase):
         with mock.patch.object(dashboard.time, "time", return_value=cache._entries[url]["checked_at"] + 10_000):
             cache.request_refresh(url, "phoebe-health/phoebe")
         self.assertEqual(len(calls), 1)
+
+    def test_merged_untracked_repo_is_terminal(self) -> None:
+        # No `deployed` key → repo isn't deployment-tracked → merged is terminal.
+        data = {"state": "MERGED", "title": "x"}
+        self.assertTrue(dashboard._is_terminal(data))
+
+    def test_merged_tracked_unknown_keeps_refreshing(self) -> None:
+        calls = []
+
+        def fetch(url, repo):
+            calls.append(url)
+            return {"state": "MERGED", "deployed": None}
+
+        cache = self._inline_cache(fetch)
+        url = "https://github.com/phoebe-health/phoebe/pull/8"
+        cache.request_refresh(url, "phoebe-health/phoebe")
+        self.assertFalse(dashboard._is_terminal(cache.lookup(url)))
+        with mock.patch.object(
+            dashboard.time, "time", return_value=cache._entries[url]["checked_at"] + dashboard.CACHE_TTL_SECONDS + 1
+        ):
+            cache.request_refresh(url, "phoebe-health/phoebe")
+        self.assertEqual(len(calls), 2)
+
+
+class ProdDeploySingleFlightTests(unittest.TestCase):
+    def setUp(self) -> None:
+        dashboard._deploy_sha_cache.clear()
+        dashboard._deploy_sha_inflight.clear()
+
+    def test_concurrent_misses_share_one_fetch(self) -> None:
+        release = threading.Event()
+        call_count = 0
+        call_lock = threading.Lock()
+
+        def fetch(repo):
+            nonlocal call_count
+            with call_lock:
+                call_count += 1
+            release.wait(timeout=5)
+            return "abc123"
+
+        results: list[str | None] = []
+        results_lock = threading.Lock()
+
+        def worker():
+            with mock.patch.object(dashboard, "_fetch_prod_deploy_sha", fetch):
+                sha = dashboard._prod_deploy_sha("phoebe-health/phoebe")
+                with results_lock:
+                    results.append(sha)
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        # Give threads a moment to enter and pick the same inflight event.
+        time.sleep(0.05)
+        release.set()
+        for thread in threads:
+            thread.join(timeout=5)
+        self.assertEqual(call_count, 1)
+        self.assertEqual(results, ["abc123"] * 4)
 
 
 class StubCache:

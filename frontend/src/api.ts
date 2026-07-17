@@ -196,9 +196,10 @@ export type DashboardTicket = {
   kind: string | null;
 };
 
-export function getDashboardTickets() {
+export function getDashboardTickets(signal?: AbortSignal) {
   return request<{ tickets: DashboardTicket[]; repo_allowlist: string[] }>(
-    "/api/dashboard/tickets"
+    "/api/dashboard/tickets",
+    signal ? { signal } : undefined
   );
 }
 
