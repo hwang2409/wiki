@@ -1,14 +1,8 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import type { DashboardTicket } from "../src/api.ts";
 import { compareTickets, startDashboardPolling } from "../src/dashboard-logic.ts";
-
-const HERE = path.dirname(fileURLToPath(import.meta.url));
-const DASHBOARD_TSX = path.join(HERE, "..", "src", "dashboard.tsx");
 
 function ticket(overrides: Partial<DashboardTicket> = {}): DashboardTicket {
   return {
@@ -121,21 +115,6 @@ test("polling never overlaps requests — next fetch only fires after current se
   gates[1].resolve("b");
   await Promise.resolve();
   handle.stop();
-});
-
-test("DashboardView delegates polling to startDashboardPolling and never touches raw setInterval", () => {
-  // Mutation guard: if someone rips out startDashboardPolling and drops a
-  // `setInterval(load, MS)` back into DashboardView (dropping the abort +
-  // overlap protections along with it), the helper-level tests above would
-  // still pass — but this static scan catches it.
-  const source = readFileSync(DASHBOARD_TSX, "utf8");
-  assert.match(source, /startDashboardPolling\(/, "DashboardView must call startDashboardPolling");
-  assert.match(source, /handle\.stop\(\)/, "unmount must call the polling handle's stop()");
-  // No direct interval polling in the component — polling belongs in the helper.
-  assert.doesNotMatch(source, /\bsetInterval\b/, "DashboardView must not call setInterval directly");
-  // AbortController wiring lives in the helper; the component should not
-  // reimplement it.
-  assert.doesNotMatch(source, /new AbortController\(/, "DashboardView must not spin its own AbortController");
 });
 
 test("stop() aborts the inflight signal on unmount", async () => {

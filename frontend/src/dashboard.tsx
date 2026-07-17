@@ -29,7 +29,20 @@ function prNumber(url: string): string {
   return match ? `#${match[1]}` : url;
 }
 
-export function DashboardView() {
+export type DashboardTicketsPayload = {
+  tickets: DashboardTicket[];
+  repo_allowlist: string[];
+};
+
+export type DashboardViewProps = {
+  fetchTickets?: (signal: AbortSignal) => Promise<DashboardTicketsPayload>;
+  pollMs?: number;
+};
+
+export function DashboardView({
+  fetchTickets = getDashboardTickets,
+  pollMs = REFRESH_INTERVAL_MS,
+}: DashboardViewProps = {}) {
   const [tickets, setTickets] = useState<DashboardTicket[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [sortKey, setSortKey] = useState<SortKey>("date");
@@ -38,17 +51,17 @@ export function DashboardView() {
 
   useEffect(() => {
     const handle = startDashboardPolling({
-      fetch: (signal) => getDashboardTickets(signal),
+      fetch: (signal) => fetchTickets(signal),
       onData: (payload) => {
         setTickets(payload.tickets);
         setError(null);
         setNowMs(Date.now());
       },
       onError: (message) => setError(message),
-      intervalMs: REFRESH_INTERVAL_MS,
+      intervalMs: pollMs,
     });
     return () => handle.stop();
-  }, []);
+  }, [fetchTickets, pollMs]);
 
   const sorted = useMemo(() => {
     if (!tickets) return [];
