@@ -67,6 +67,14 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 
 - [[meeting-booking-onboarding]] — Phoebe meeting booking: customer onboarding and Core/admin-agent seams
 
+## Mitm-inspector
+
+- [[mitmweb-rebuild]] — Mitmweb rebuild campaign: local-only bounded traffic inspector, plan and ticket graph
+
+## Mitm-inspector/decisions
+
+- [[public-hook-adapter]] — Architecture: public mitmproxy hook addon and independent UI; private mitmweb API rejected
+
 ## Families (path patterns, not enumerated)
 
 - `log/YYYY-MM-DD.md` — daily end-of-day changelogs, cross-project.
