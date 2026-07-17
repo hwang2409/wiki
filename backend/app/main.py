@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 from . import (
     accounts,
     backend_runtime,
+    dashboard,
     github_pr,
     github_preview,
     knowledge,
@@ -1333,6 +1334,24 @@ def agents() -> dict[str, object]:
         "archived": list_archived(),
         "supervisor": supervisor_health,
     }
+
+
+@app.get("/api/dashboard/tickets")
+def dashboard_tickets() -> dict[str, object]:
+    registry: dict = {}
+    try:
+        value = json.loads(AGENT_REGISTRY_PATH.read_text(encoding="utf-8"))
+        if isinstance(value, dict):
+            registry = value
+    except (OSError, ValueError):
+        pass
+    statuses: dict[str, dict] = {}
+    if AGENT_STATUS_DIR.is_dir():
+        for path in sorted(AGENT_STATUS_DIR.glob("*.json")):
+            status = read_agent_status(path.stem)
+            if status:
+                statuses[path.stem] = status
+    return dashboard.build_payload(registry, statuses, list_archived(limit=500))
 
 
 @app.get("/api/agents/{ticket}/pr")

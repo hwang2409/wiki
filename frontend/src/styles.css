@@ -7814,3 +7814,110 @@ body.is-resizing-panes .pane-cell {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* Ticket dashboard */
+
+.dashboard-view {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  height: 100%;
+  padding: 16px 20px 20px;
+  min-height: 0;
+}
+
+.dashboard-header {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.dashboard-header h2 {
+  margin: 0;
+  font-size: var(--font-ui-large);
+}
+
+.dashboard-count {
+  color: var(--text-faint);
+  font-size: var(--font-ui-smaller);
+}
+
+.dashboard-error {
+  padding: 8px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent-danger) 45%, var(--background-modifier-border));
+  border-radius: var(--radius-s);
+  color: var(--accent-danger);
+  font-size: var(--font-ui-small);
+}
+
+.dashboard-empty {
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+}
+
+.dashboard-table-scroll {
+  flex: 1;
+  min-height: 0;
+}
+
+.dashboard-ticket {
+  font-weight: 600;
+}
+
+.dashboard-description {
+  max-width: 420px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dashboard-muted {
+  color: var(--text-faint);
+}
+
+.dashboard-date {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.dashboard-table-scroll .artifact-table a {
+  color: var(--accent-primary);
+  text-decoration: none;
+}
+
+.dashboard-table-scroll .artifact-table a:hover {
+  text-decoration: underline;
+}
+
+.agent-state.is-pr-open {
+  border: 1.5px solid var(--accent-primary);
+  color: var(--accent-primary);
+}
+
+.agent-state.is-checks-pending {
+  border: 1.5px solid var(--background-modifier-border);
+  color: var(--text-muted);
+}
+
+.agent-state.is-failing {
+  border: 1.5px solid color-mix(in srgb, var(--accent-danger) 45%, var(--background-modifier-border));
+  background-color: color-mix(in srgb, var(--accent-danger) 10%, transparent);
+  color: var(--accent-danger);
+}
+
+.agent-state.is-has-comments {
+  border: 1.5px solid color-mix(in srgb, var(--accent-warning) 45%, var(--background-modifier-border));
+  background-color: color-mix(in srgb, var(--accent-warning) 10%, transparent);
+  color: var(--accent-warning);
+}
+
+.agent-state.is-passing {
+  border: 1.5px solid color-mix(in srgb, var(--accent-success) 45%, var(--background-modifier-border));
+  color: var(--accent-success);
+}
+
+.agent-state.is-prod {
+  border: 1.5px solid var(--accent-success);
+  background-color: color-mix(in srgb, var(--accent-success) 12%, transparent);
+  color: var(--accent-success);
+  font-weight: 700;
+}

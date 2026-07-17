@@ -4,6 +4,7 @@ import {
   AlertCircle,
   BookOpen,
   Bot,
+  ClipboardList,
   Code2,
   ChevronRight,
   ChevronsDownUp,
@@ -90,6 +91,7 @@ import { LoadingPlaceholder } from "./loading";
 import { GraphView } from "./graph";
 import { HealthView } from "./health";
 import { TokensView } from "./tokens";
+import { DashboardView } from "./dashboard";
 import { appendDoneEntry } from "./kanban";
 import { WorkspacePane, type PaneNoteFocusState } from "./pane";
 import { prepareMarkdown, splitFrontmatter } from "./markdown";
@@ -118,9 +120,10 @@ type Mode =
   | "health"
   | "agents"
   | "tokens"
+  | "dashboard"
   | "agent"
   | "terminal";
-type UtilityMode = "activity" | "graph" | "health" | "agents" | "tokens";
+type UtilityMode = "activity" | "graph" | "health" | "agents" | "tokens" | "dashboard";
 type SidebarTab = "files" | "search" | "agents";
 type SplitPosition = "left" | "right" | "top" | "bottom";
 type DropZone = SplitPosition | "center";
@@ -844,7 +847,14 @@ type Route =
   | { kind: "terminal"; id: string }
   | { kind: "note" | "edit" | "file"; path: string };
 
-const UTILITY_ROUTES: readonly UtilityMode[] = ["activity", "graph", "health", "agents", "tokens"];
+const UTILITY_ROUTES: readonly UtilityMode[] = [
+  "activity",
+  "graph",
+  "health",
+  "agents",
+  "tokens",
+  "dashboard"
+];
 
 function routeHash(route: Route): string {
   if (route.kind === "empty") return "#/";
@@ -3060,7 +3070,8 @@ export default function App() {
     graph: "Graph",
     health: "Health",
     agents: "Agents",
-    tokens: "Tokens"
+    tokens: "Tokens",
+    dashboard: "Dashboard"
   };
   const themeToggleTarget = toggleThemePolarity(theme);
   const themeToggleTargetLabel = getTheme(themeToggleTarget).label;
@@ -3237,6 +3248,9 @@ export default function App() {
     }
     if (mode === "tokens") {
       return <TokensView />;
+    }
+    if (mode === "dashboard") {
+      return <DashboardView />;
     }
     if (mode === "agents") {
       return (
@@ -3503,6 +3517,15 @@ export default function App() {
         >
           <TrendingUp size={18} />
         </button>
+        <button
+          aria-label="Ticket dashboard"
+          className={`ribbon-action${mode === "dashboard" ? " is-active" : ""}`}
+          title="Ticket dashboard"
+          type="button"
+          onClick={() => openUtilityView("dashboard")}
+        >
+          <ClipboardList size={18} />
+        </button>
         <div className="ribbon-spacer" />
         <button
           aria-label="Settings"
@@ -3749,6 +3772,8 @@ export default function App() {
                 />
               ) : mode === "tokens" ? (
                 <TokensView />
+              ) : mode === "dashboard" ? (
+                <DashboardView />
               ) : mode === "empty" ? (
                 <div className="empty-state">
                   <div className="empty-state-title">No file is open</div>
