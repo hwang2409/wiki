@@ -680,7 +680,7 @@ function MarkdownImage({ alt, className, "data-obsidian-width": dataWidth, node,
   );
 }
 
-function MarkdownTable({ children, ...props }: TableHTMLAttributes<HTMLTableElement>) {
+export function MarkdownTable({ children, ...props }: TableHTMLAttributes<HTMLTableElement>) {
   return (
     <div className="markdown-table-scroll">
       <table {...props}>{children}</table>

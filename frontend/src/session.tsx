@@ -42,7 +42,7 @@ import {
 import type { LucideIcon } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { MarkdownPre, prepareTranscriptMarkdown, rehypeEscapeRawHtml } from "./markdown";
+import { MarkdownPre, MarkdownTable, prepareTranscriptMarkdown, rehypeEscapeRawHtml } from "./markdown";
 import { ShikiCode } from "./shiki";
 import {
   cancelAgentModelChange,
@@ -1174,6 +1174,7 @@ function SessionMarkdownLink({ href, ...props }: ComponentProps<"a">) {
 const sessionMarkdownComponents = {
   a: SessionMarkdownLink,
   pre: MarkdownPre,
+  table: MarkdownTable,
 };
 
 function BashBlock({
