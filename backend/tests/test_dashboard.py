@@ -5,7 +5,7 @@ import tempfile
 import threading
 import time
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -370,6 +370,73 @@ class ProdDeploySingleFlightTests(unittest.TestCase):
         dashboard._deploy_sha_cache.clear()
         dashboard._deploy_sha_inflight.clear()
 
+    def test_inflight_owner_failure_wakes_waiter_and_retries(self) -> None:
+        """Concurrent waiter must wake, retry, and get the successful SHA.
+
+        Removing the failure-path `waiter.set()` would leave the waiter
+        blocked on the inflight Event (60s wait) and the join(5) below
+        would find the waiter thread still alive.
+        """
+        release_owner = threading.Event()
+        owner_started = threading.Event()
+        waiter_entered = threading.Event()
+        call_count = 0
+        call_lock = threading.Lock()
+
+        def flaky_fetch(repo):
+            nonlocal call_count
+            with call_lock:
+                call_count += 1
+                n = call_count
+            if n == 1:
+                owner_started.set()
+                self.assertTrue(release_owner.wait(timeout=5))
+                raise RuntimeError("simulated network failure")
+            return "def456"
+
+        owner_err: dict[str, Exception] = {}
+        waiter_result: dict[str, str | None] = {}
+
+        def run_owner():
+            try:
+                dashboard._prod_deploy_sha("phoebe-health/phoebe")
+            except Exception as exc:
+                owner_err["err"] = exc
+
+        def run_waiter():
+            self.assertTrue(owner_started.wait(timeout=5))
+            waiter_entered.set()
+            waiter_result["sha"] = dashboard._prod_deploy_sha("phoebe-health/phoebe")
+
+        original_fetch = dashboard._fetch_prod_deploy_sha
+        dashboard._fetch_prod_deploy_sha = flaky_fetch
+        try:
+            owner_t = threading.Thread(target=run_owner)
+            waiter_t = threading.Thread(target=run_waiter)
+            owner_t.start()
+            waiter_t.start()
+            self.assertTrue(waiter_entered.wait(timeout=5))
+            # Give the waiter a beat to actually enter `waiter.wait(timeout=60)`.
+            time.sleep(0.1)
+            release_owner.set()
+            owner_t.join(timeout=5)
+            waiter_t.join(timeout=5)
+        finally:
+            dashboard._fetch_prod_deploy_sha = original_fetch
+
+        self.assertFalse(owner_t.is_alive(), "owner did not complete")
+        self.assertFalse(
+            waiter_t.is_alive(),
+            "waiter still blocked — owner's failure path did not wake it",
+        )
+        self.assertIsInstance(owner_err.get("err"), RuntimeError)
+        self.assertEqual(waiter_result.get("sha"), "def456")
+        self.assertEqual(call_count, 2, "one owner call + one waiter retry — no more, no fewer")
+        with dashboard._deploy_sha_lock:
+            self.assertNotIn("phoebe-health/phoebe", dashboard._deploy_sha_inflight)
+            # Cache holds the successful retry result.
+            self.assertEqual(dashboard._deploy_sha_cache["phoebe-health/phoebe"][1], "def456")
+
     def test_owner_failure_releases_inflight_and_next_call_retries(self) -> None:
         release = threading.Event()
         outcomes: list[str] = []
@@ -434,19 +501,23 @@ class ProdDeploySingleFlightTests(unittest.TestCase):
         results_lock = threading.Lock()
 
         def worker():
-            with mock.patch.object(dashboard, "_fetch_prod_deploy_sha", fetch):
-                sha = dashboard._prod_deploy_sha("phoebe-health/phoebe")
-                with results_lock:
-                    results.append(sha)
+            sha = dashboard._prod_deploy_sha("phoebe-health/phoebe")
+            with results_lock:
+                results.append(sha)
 
-        threads = [threading.Thread(target=worker) for _ in range(4)]
-        for thread in threads:
-            thread.start()
-        # Give threads a moment to enter and pick the same inflight event.
-        time.sleep(0.05)
-        release.set()
-        for thread in threads:
-            thread.join(timeout=5)
+        original_fetch = dashboard._fetch_prod_deploy_sha
+        dashboard._fetch_prod_deploy_sha = fetch
+        try:
+            threads = [threading.Thread(target=worker) for _ in range(4)]
+            for thread in threads:
+                thread.start()
+            # Give threads a moment to enter and pick the same inflight event.
+            time.sleep(0.05)
+            release.set()
+            for thread in threads:
+                thread.join(timeout=5)
+        finally:
+            dashboard._fetch_prod_deploy_sha = original_fetch
         self.assertEqual(call_count, 1)
         self.assertEqual(results, ["abc123"] * 4)
 
@@ -566,23 +637,30 @@ class DashboardEndpointTests(unittest.TestCase):
         payload = main.dashboard_tickets()
         self.assertEqual(payload["tickets"], [])
 
-    def test_endpoint_dedups_before_capping_archive(self) -> None:
-        # 30 recent sessions for one ticket + 1 older session for a second
-        # ticket. If dedup happened AFTER a session-count cap (as pre-fix),
-        # the second ticket would fall off the tail. Both must surface.
-        base_year = 2026
-        crowded = self.archive / "PHO-1"
+    def test_archive_dedup_before_ticket_limit_survives_500_session_burst(self) -> None:
+        """500 newer sessions for one ticket must not push a smaller older ticket out.
+
+        Mutation to catch: restoring `list_archived(limit=500)` (i.e.
+        dropping `latest_per_ticket=True` and applying the cap first).
+        With this fixture, that mutation returns 500 rows all for
+        PHO-CROWD; PHO-OLD falls off the tail and disappears from the
+        dashboard.
+        """
+        base = datetime(2026, 1, 1, 0, 0, 0)
+        crowded = self.archive / "PHO-CROWD"
         crowded.mkdir()
-        # 30 sessions across 2026-07-15 and 2026-07-16, all newer than PHO-2.
-        for idx in range(30):
-            day, hour = (15 if idx < 24 else 16, idx if idx < 24 else idx - 24)
-            session = crowded / f"{base_year:04d}07{day:02d}-{hour:02d}0000"
+        # 500 sessions spread over ~500 hours so all timestamps are unique
+        # AND every one is strictly newer than PHO-OLD below.
+        for idx in range(500):
+            ts = base + timedelta(hours=idx)
+            session = crowded / ts.strftime("%Y%m%d-%H%M%S")
             session.mkdir()
             (session / "meta.json").write_text(
                 json.dumps({"worker": {"kind": "cc", "role": "implement"}}),
                 encoding="utf-8",
             )
-        older = self.archive / "PHO-2" / f"{base_year:04d}0710-090000"
+        older_ts = base - timedelta(days=30)
+        older = self.archive / "PHO-OLD" / older_ts.strftime("%Y%m%d-%H%M%S")
         older.mkdir(parents=True)
         (older / "meta.json").write_text(
             json.dumps({"worker": {"kind": "cc", "role": "implement"}, "outcome": "merged"}),
@@ -590,7 +668,12 @@ class DashboardEndpointTests(unittest.TestCase):
         )
         payload = main.dashboard_tickets()
         tickets = {row["ticket"] for row in payload["tickets"]}
-        self.assertEqual(tickets, {"PHO-1", "PHO-2"})
+        self.assertIn("PHO-CROWD", tickets)
+        self.assertIn(
+            "PHO-OLD",
+            tickets,
+            "older ticket must survive dedup-before-limit — otherwise pre-dedup 500-cap regressed",
+        )
 
 
 if __name__ == "__main__":
