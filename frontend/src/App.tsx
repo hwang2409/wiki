@@ -882,6 +882,28 @@ function notesFingerprint(notes: NoteSummary[]) {
   return notes.map((note) => `${note.id}@${note.updated_at}`).join("|");
 }
 
+function isTextEntryElement(element: Element | null): boolean {
+  if (!element) return false;
+  if (
+    element instanceof HTMLInputElement ||
+    element instanceof HTMLTextAreaElement ||
+    element instanceof HTMLSelectElement
+  ) {
+    return true;
+  }
+  return element instanceof HTMLElement && element.isContentEditable;
+}
+
+function isTextEntryEvent(event: globalThis.KeyboardEvent): boolean {
+  return (
+    event.isComposing ||
+    event.key === "Process" ||
+    event.keyCode === 229 ||
+    isTextEntryElement(event.target instanceof Element ? event.target : null) ||
+    isTextEntryElement(document.activeElement instanceof Element ? document.activeElement : null)
+  );
+}
+
 function readStoredCollapsed(): Set<string> {
   try {
     const raw = localStorage.getItem("wiki-collapsed-folders");
@@ -2342,10 +2364,9 @@ export default function App() {
     const frame = activePaneFrame();
     if (!frame) return false;
     const notePreview = frame.querySelector<HTMLElement>(".markdown-preview-view");
-    const scroller = notePreview?.closest<HTMLDivElement>(".view-content") ??
-      frame.querySelector<HTMLDivElement>(".session-scroll");
+    const scroller = notePreview?.closest<HTMLDivElement>(".view-content");
     if (!scroller) return false;
-    scroller.scrollBy({ top: delta, behavior: notePreview ? "smooth" : "auto" });
+    scroller.scrollBy({ top: delta, behavior: "smooth" });
     return true;
   }
 
@@ -2378,21 +2399,6 @@ export default function App() {
 
   function handlePaneScopeKey(event: globalThis.KeyboardEvent): boolean {
     if (event.ctrlKey || event.metaKey || event.altKey) return false;
-    const textEntryTarget = [
-      event.target instanceof Element ? event.target : null,
-      document.activeElement instanceof Element ? document.activeElement : null,
-    ].some((element) => {
-      if (!element) return false;
-      if (
-        element instanceof HTMLInputElement ||
-        element instanceof HTMLTextAreaElement ||
-        element instanceof HTMLSelectElement
-      ) {
-        return true;
-      }
-      return element instanceof HTMLElement && element.isContentEditable;
-    });
-    if (textEntryTarget) return false;
     const key = event.key;
     const lowerKey = key.toLowerCase();
     if (lowerKey === "j") return paneScopeScroll(60);
@@ -2929,6 +2935,8 @@ export default function App() {
 
       if (terminalPane && (event.metaKey || event.ctrlKey) && lowerKey === "f") return;
 
+      if (isTextEntryEvent(event)) return;
+
       if (leaderArmedRef.current) {
         if (modifierOnly) return;
         event.preventDefault();
@@ -2966,7 +2974,7 @@ export default function App() {
       const key = event.key;
       const lowerKey = key.toLowerCase();
 
-      if (modalOpen) return;
+      if (modalOpen || isTextEntryEvent(event)) return;
       if (
         document.activeElement instanceof HTMLTextAreaElement &&
         document.activeElement.dataset.terminalInput === "true"
