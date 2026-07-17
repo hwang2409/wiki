@@ -2,13 +2,20 @@
 type: log
 tags: [log, done]
 created: 2026-07-06
-updated: 2026-07-16
+updated: 2026-07-17
 ---
 
 # Done
 
+## 2026-07-17
+
+- WIKI-131 fixed (e5370de): chat tables now horizontally scrollable — session markdown was missing the table scroll-wrapper override
+- MITMWEB-B2 merged (mitm-inspector main@712df98, candidate 9a1d1dc, 15 review rounds): capture store/adapter/sequencer/sink hardened; final fix = discarded-flow guard in _refresh_state_weight killing phantom metadata recharge; suite+ruff+mypy green on merged main. Arc survived codex quota exhaustion (locked to Jul 23) + 2 dead orch/worker processes.
+- PHO-13957 run_admin_python_snippet retired, sandbox-only run_code_in_sandbox merged (#11637, 4 sol rounds: reap-replay, per-invocation namespacing, path canonicalization, caps-pipeline routing)
+
 ## 2026-07-16
 
+- PHO-13950 stub previews + sandbox hydration merged (#11594, 7 sol review rounds — caps invariant saga: node-cap loss, cell-cap bypass, UUID corruption, key-spoofing all regression-locked)
 - PHO-13944 WS3 feature catalog PR #11581 merge-ready, worker archived, handed to Henry for manual merge (PR 2 auto-apply weekly sweep still unbuilt)
 - PHO-13943 Granola-org matching + agent meeting-context tool merged (#11580, 3 sol rounds / 3 blockers+6 majors: free-mail linking, override leakage, unwrapped evidence, write-by-default backfill, O(NxM) sync, atomicity) — PHO-13940 workstream 1 done; post-deploy: run match-backfill --write against prod Core
 - CORE-BODY-UUID-HOTFIX merged (#11623): prod TypeError on admin Linear-ticket creation (DEP-108 idempotency_key UUID) — root fix mode=json in CoreRequestModel.core_body, orchestrator-authored + worker-shipped
