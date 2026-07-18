@@ -2,13 +2,31 @@
 type: log
 tags: [log, done]
 created: 2026-07-06
-updated: 2026-07-17
+updated: 2026-07-18
 ---
 
 # Done
 
+## 2026-07-18
+
+- **phoebe** — PHO-13944 PR #11630 merged at 0e40d33efc; weekly feature-catalog sweep shipped; classifier edge cases deferred to PHO-14034
+
 ## 2026-07-17
 
+- MITMWEB-F6 density+right-panel merged to main@f3ab43a (candidate be11314, no review round — Henry live-iterate mode; cc/opus-4.7 implement; right-side inspector dock, kill body-panel chrome, uncap frontend decoder to wire ceiling, raise backend prefix default, JSON tree default view)
+- MITMWEB-F5 minimalist b/w merged to main@ba80c53 (candidate 874280f, 3 review rounds cc/opus-4.7 implement + cdx/sol review; light-default palette, JSON tree, SSE frames, /v1/messages summary, useSeenFlows hook, palette allowlist)
+- MITMWEB-F4 restyle merged to main@e0f474b (candidate 7da535b, 4 review rounds cdx/luna implement + cdx/sol review; wiki-app tokens/shell/flows/inspector + Playwright e2e responsive pin)
+- WIKI-132 merged as https://github.com/hwang2409/wiki/pull/105 (6c52a60a squash, 5 review rounds)
+- MITMWEB-I1 merged to main@8e73838 (candidate fe2b8e7, 3 rounds cdx/luna implement + cdx/sol review)
+- WIKI-133 merged as https://github.com/hwang2409/wiki/pull/104 (643628b2 squash)
+- PHO-13986 sandbox allowlisted egress merged (#11669: pypi-only, reviewed-constant governance, literal-policy test — 2 sol rounds; Henry manual approval cleared skipped auto-approve)
+- PHO-13987 dana mode merged (#11676: data-analysis skill + stats guardrails + phoebe chart style w/ traceable UI tokens — 1 clean sol round)
+- PHO-13983 matcher fixes merged (#11664: own-domain exclusion, attio type-separated associations, contamination cleanup — 2 sol rounds + diff verify). PHO-13988 generalized inline artifacts merged (#11670: type@version registry, chip fallback — 2 sol rounds).
+- PHO-13979 skill overrides auto-apply merged (#11659, 2 sol rounds: DB-level append-only audit trigger + RESTRICT attribution; /admin/agent-skills page removed)
+- PHO-13980 inline calendar artifacts + hover merged (#11656, 2 sol rounds + orchestrator diff-verify; scope-creep AGENTS.md edit caught and reverted)
+- PHO-12880 worker archived (PR #11548 stays open, parked for lead discussion; worktree + branch retained). Slack admin-bot channels:join reauth + persona identify check completed by Henry.
+- MITMWEB-B3 merged (mitm-inspector main@2bef0c8, candidate 21e98c7, 2 review rounds): loopback HTTP+WS protocol-v1 delivery (snapshot/delta/cursor/gap/resync), JSONL unix-socket ingest, readiness probes, live CLI wiring; Review1 MEDIUM (close() hang on live connections, py3.12 wait_closed) fixed + empirically verified. Wave 2 complete — all foundational tickets merged.
+- MITMWEB-F2 merged (mitm-inspector main@b0dee31, candidate 8c99d3c, 1 review round): virtualized 28px flow grid + mitmproxy-compatible filter language + follow-live/selection workspace wired to F3 inspector; 133 vitest, Playwright desktop+mobile, all gates green on merged main. 4 LOW findings deferred to I1 (flow-limit boundary test, refreeze O(512x32) hot path, ~t param fidelity, lifecycle truncation marker).
 - WIKI-131 fixed (e5370de): chat tables now horizontally scrollable — session markdown was missing the table scroll-wrapper override
 - MITMWEB-B2 merged (mitm-inspector main@712df98, candidate 9a1d1dc, 15 review rounds): capture store/adapter/sequencer/sink hardened; final fix = discarded-flow guard in _refresh_state_weight killing phantom metadata recharge; suite+ruff+mypy green on merged main. Arc survived codex quota exhaustion (locked to Jul 23) + 2 dead orch/worker processes.
 - PHO-13957 run_admin_python_snippet retired, sandbox-only run_code_in_sandbox merged (#11637, 4 sol rounds: reap-replay, per-invocation namespacing, path canonicalization, caps-pipeline routing)
