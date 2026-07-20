@@ -36,18 +36,39 @@ export function ProviderHealthBadge({
   pollMs = DEFAULT_POLL_MS,
 }: ProviderHealthBadgeProps = {}) {
   const [snapshot, setSnapshot] = useState<ProviderHealthSnapshot | null>(null);
+  const [initialLoadError, setInitialLoadError] = useState(false);
+  const hasLoaded = snapshot !== null;
 
   useEffect(() => {
+    let receivedData = false;
     const handle = startDashboardPolling<ProviderHealthSnapshot>({
       fetch: (signal) => fetchHealth(signal),
-      onData: (data) => setSnapshot(data),
+      onData: (data) => {
+        receivedData = true;
+        setSnapshot(data);
+        setInitialLoadError(false);
+      },
       onError: () => {
-        // Endpoint failures don't clear the badge; keep the last known state.
+        if (!receivedData) setInitialLoadError(true);
       },
       intervalMs: pollMs,
     });
     return () => handle.stop();
   }, [fetchHealth, pollMs]);
+
+  if (!hasLoaded && initialLoadError) {
+    return (
+      <div
+        className="provider-health-badges"
+        data-state="error"
+        data-testid="provider-health-badges"
+        role="status"
+        aria-live="polite"
+      >
+        <span className="provider-health-badge is-error">provider auth unavailable</span>
+      </div>
+    );
+  }
 
   if (!snapshot) {
     return (

@@ -66,3 +66,19 @@ test("probing status is distinct from unknown", () => {
   expect(screen.getByText("checking provider auth")).toBeTruthy();
   expect(badges.querySelector(".is-probing")).toBeTruthy();
 });
+
+test("initial request failure renders a fixed neutral error state", async () => {
+  const fetchHealth = vi.fn(async (_signal: AbortSignal): Promise<ProviderHealthSnapshot> => {
+    throw new Error("raw token /Users/secret/auth.json");
+  });
+  render(<ProviderHealthBadge fetchHealth={fetchHealth} pollMs={60_000} />);
+
+  const badges = await screen.findByTestId("provider-health-badges");
+  expect(badges.getAttribute("data-state")).toBe("error");
+  expect(badges.getAttribute("role")).toBe("status");
+  expect(screen.getByText("provider auth unavailable")).toBeTruthy();
+  expect(badges.querySelector(".is-error")).toBeTruthy();
+  expect(screen.queryByText("checking provider auth")).toBeNull();
+  expect(badges.textContent).not.toContain("raw token");
+  expect(badges.textContent).not.toContain("auth.json");
+});

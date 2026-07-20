@@ -301,7 +301,8 @@ button:disabled {
 }
 
 .provider-health-badge.is-unknown,
-.provider-health-badge.is-probing {
+.provider-health-badge.is-probing,
+.provider-health-badge.is-error {
   color: var(--text-muted);
   background: var(--background-secondary);
   border: 1px solid var(--background-modifier-border);

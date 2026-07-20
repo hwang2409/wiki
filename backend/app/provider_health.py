@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import threading
+import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -165,6 +166,8 @@ def probe_codex(*, now: str | None = None) -> ProviderHealth:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return ProviderHealth("unknown", checked_at, "credentials_missing")
+    except UnicodeError:
+        return ProviderHealth("unauthorized", checked_at, "credentials_invalid")
     except OSError:
         return ProviderHealth("unknown", checked_at, "verification_unavailable")
     try:
@@ -189,6 +192,8 @@ def probe_claude(*, now: str | None = None) -> ProviderHealth:
         # Claude may keep credentials in the macOS keychain, so the status CLI
         # is the only supported way to turn this into an operational result.
         return _verified_health("cc", checked_at=checked_at)
+    except UnicodeError:
+        return ProviderHealth("unauthorized", checked_at, "credentials_invalid")
     except OSError:
         return ProviderHealth("unknown", checked_at, "verification_unavailable")
     try:
@@ -230,6 +235,7 @@ class ProviderHealthTracker:
         self._lock = threading.RLock()
         self._refresh_condition = threading.Condition(self._lock)
         self._refresh_inflight = False
+        self._last_refresh_at: float | None = None
 
     @staticmethod
     def _default_credential_path(kind: str) -> Path:
@@ -247,13 +253,24 @@ class ProviderHealthTracker:
         with self._lock:
             return self._state[kind]
 
-    def refresh(self, *, kinds: Iterable[str] | None = None) -> dict[str, dict[str, object]]:
+    def refresh(
+        self,
+        *,
+        kinds: Iterable[str] | None = None,
+        min_interval_seconds: float = 0.0,
+    ) -> dict[str, dict[str, object]]:
         """Run one probe batch; concurrent callers share the in-flight result."""
 
         with self._refresh_condition:
             if self._refresh_inflight:
                 while self._refresh_inflight:
                     self._refresh_condition.wait()
+                return self.snapshot()
+            if (
+                min_interval_seconds > 0
+                and self._last_refresh_at is not None
+                and time.monotonic() - self._last_refresh_at < min_interval_seconds
+            ):
                 return self.snapshot()
             self._refresh_inflight = True
         try:
@@ -289,14 +306,43 @@ class ProviderHealthTracker:
         finally:
             with self._refresh_condition:
                 self._refresh_inflight = False
+                self._last_refresh_at = time.monotonic()
                 self._refresh_condition.notify_all()
 
     async def refresh_async(
-        self, *, kinds: Iterable[str] | None = None
+        self,
+        *,
+        kinds: Iterable[str] | None = None,
+        min_interval_seconds: float = 0.0,
     ) -> dict[str, dict[str, object]]:
         """Run the blocking probe batch away from the asyncio event loop."""
 
-        return await asyncio.to_thread(self.refresh, kinds=kinds)
+        return await asyncio.to_thread(
+            self.refresh,
+            kinds=kinds,
+            min_interval_seconds=min_interval_seconds,
+        )
+
+    def mark_authenticated(self, kind: str) -> bool:
+        """Clear auth-dead only after a successful run with a new credential."""
+
+        if kind not in self._state:
+            return False
+        with self._lock:
+            if not self._sticky[kind]:
+                return False
+            current_fingerprint = _credential_fingerprint(self._credential_path_fn(kind))
+            if current_fingerprint is None or current_fingerprint == self._sticky_fingerprint[kind]:
+                return False
+            self._generation[kind] += 1
+            self._sticky[kind] = False
+            self._sticky_fingerprint[kind] = None
+            self._state[kind] = replace(
+                self._state[kind],
+                status="ok",
+                reason_code=None,
+            )
+            return True
 
     def mark_unauthorized(self, kind: str) -> None:
         """Mark an exhausted current-credential auth failure with a fixed code."""

@@ -636,6 +636,24 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         await self._publish(
             {"type": "session", "ticket": record.agent_id, "surface": "session"}
         )
+        params = event.payload.get("params")
+        turn = params.get("turn") if isinstance(params, dict) else None
+        turn_status = turn.get("status") if isinstance(turn, dict) else None
+        if (
+            event.provider is ProviderKind.CODEX
+            and event.direction != "client"
+            and event.payload.get("method") == "turn/completed"
+            and turn_status == "completed"
+        ):
+            await self._publish(
+                {
+                    "type": "codex_auth_verified",
+                    "provider": "codex",
+                    "credential_source": "current",
+                    "success": True,
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                }
+            )
         self._schedule_monitor_actions(
             run_id,
             adapter,

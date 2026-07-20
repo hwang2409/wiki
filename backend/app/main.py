@@ -3315,6 +3315,14 @@ def _consume_provider_health_signal(event: dict) -> None:
     """Mark only exhausted current-credential auth failures as unauthorized."""
 
     if (
+        event.get("type") == "codex_auth_verified"
+        and event.get("provider") == "codex"
+        and event.get("credential_source") == "current"
+        and event.get("success") is True
+    ):
+        PROVIDER_HEALTH.mark_authenticated("cdx")
+        return
+    if (
         event.get("type") != "codex_auth_dead_exhausted"
         or event.get("provider") != "codex"
         or event.get("failure") != "auth"
@@ -3699,7 +3707,7 @@ def get_accounts() -> dict[str, object]:
 @app.get("/api/providers/health")
 def get_provider_health(refresh: bool = False) -> dict[str, dict[str, object]]:
     if refresh:
-        return PROVIDER_HEALTH.refresh()
+        return PROVIDER_HEALTH.refresh(min_interval_seconds=5.0)
     return PROVIDER_HEALTH.snapshot()
 
 
