@@ -887,6 +887,10 @@ class RunStore:
                     "agent has a legacy orchestrator registration requiring "
                     f"explicit migration: {record.agent_id}"
                 )
+            # A status file belongs to the run that creates it. Clear any
+            # orphan from a prior run before this record becomes current; the
+            # supervisor calls create() while holding the per-agent lock.
+            self.status_path(record.agent_id).unlink(missing_ok=True)
             self._create_run_files(record)
             history = (
                 list((entry or {}).get("history") or [])

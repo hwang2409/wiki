@@ -430,6 +430,7 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         )
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
         await self._spawn("WIKI-1890", role="implement", orch="WIKI-ORCH")
+        self.assertFalse(self.store.status_path("WIKI-1890").exists())
 
         first = await self.monitor.tick()
         self.assertEqual(
@@ -451,6 +452,41 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(status), 1)
         self.assertIn("none -> merge-ready", status[0].message)
         self.assertIn("old-pr", status[0].message)
+
+    async def test_post_spawn_coarse_mtime_status_is_accepted(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        worker = await self._spawn("WIKI-1891", role="implement", orch="WIKI-ORCH")
+        created_at = datetime.fromisoformat(worker.created_at).timestamp()
+        _write_status(
+            self.store,
+            "WIKI-1891",
+            {"state": "merge-ready", "pr": "coarse-pr", "step": "ready", "blocker": None},
+            mtime=int(created_at),
+        )
+
+        notes = await self.monitor.tick()
+        status = [
+            note for note in notes if note.event_type == "status-transition"
+        ]
+        self.assertEqual(len(status), 1)
+        self.assertIn("coarse-pr", status[0].message)
+
+    async def test_post_spawn_backward_clock_status_is_accepted(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        await self._spawn("WIKI-1892", role="implement", orch="WIKI-ORCH")
+        _write_status(
+            self.store,
+            "WIKI-1892",
+            {"state": "merge-ready", "pr": "rollback-pr", "step": "ready", "blocker": None},
+            mtime=time.time() - 3600,
+        )
+
+        notes = await self.monitor.tick()
+        status = [
+            note for note in notes if note.event_type == "status-transition"
+        ]
+        self.assertEqual(len(status), 1)
+        self.assertIn("rollback-pr", status[0].message)
 
     async def test_archive_respawn_same_id_resets_run_dedupe_state(self) -> None:
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)

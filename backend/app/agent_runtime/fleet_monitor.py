@@ -16,7 +16,6 @@ import time
 import traceback
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from typing import Any
 
 from .store import RunStore
@@ -105,16 +104,6 @@ def _string_or_none(value: Any) -> str | None:
     if isinstance(value, str) and value.strip():
         return value
     return None
-
-
-def _created_at_timestamp(value: str) -> float | None:
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except (AttributeError, TypeError, ValueError):
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.timestamp()
 
 
 def _ticket_prefix(agent_id: str) -> str:
@@ -261,13 +250,6 @@ class FleetMonitor:
             status_data, mtime = _read_status_file(
                 self.store.status_path(record.agent_id)
             )
-            if (
-                status_data is not None
-                and mtime is not None
-                and (created_at := _created_at_timestamp(record.created_at)) is not None
-                and mtime < created_at
-            ):
-                status_data = None
             if status_data is None:
                 views.append(
                     _WorkerView(
