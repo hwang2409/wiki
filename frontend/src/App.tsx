@@ -2374,7 +2374,9 @@ export default function App() {
     const frame = activePaneFrame();
     if (!frame) return false;
     const notePreview = frame.querySelector<HTMLElement>(".markdown-preview-view");
-    const scroller = notePreview?.closest<HTMLDivElement>(".view-content");
+    const scroller =
+      notePreview?.closest<HTMLDivElement>(".view-content") ??
+      frame.querySelector<HTMLDivElement>(".dashboard-table-scroll");
     if (!scroller) return false;
     scroller.scrollBy({ top: delta, behavior: "smooth" });
     return true;
