@@ -295,12 +295,13 @@ class FleetMonitor:
                 snapshot.merge_ready_since = monotonic_now
             snapshot.seeded = True
 
-        if view.status_state != snapshot.status_state:
+        current_status_context = self._status_context_tuple(view)
+        prior_status_context = self._snapshot_status_context(snapshot)
+        if current_status_context != prior_status_context:
             dedupe_key = self._transition_dedupe_key(
                 view,
                 event_type="status-transition",
-                prior_status=snapshot.status_state,
-                prior_runtime=snapshot.runtime_state,
+                snapshot=snapshot,
             )
             notif = await self._emit(
                 view,
@@ -311,14 +312,13 @@ class FleetMonitor:
             if notif is not None:
                 results.append(notif)
             if notif is not None or self._dedupe_was_sent(view, dedupe_key):
-                snapshot.status_state = view.status_state
+                self._apply_status_context(snapshot, current_status_context)
 
         if record.state != snapshot.runtime_state:
             dedupe_key = self._transition_dedupe_key(
                 view,
                 event_type="runtime-transition",
-                prior_status=snapshot.status_state,
-                prior_runtime=snapshot.runtime_state,
+                snapshot=snapshot,
             )
             notif = await self._emit(
                 view,
@@ -348,9 +348,6 @@ class FleetMonitor:
         )
         results.extend(await self._maybe_staleness(view, snapshot, wall_now))
 
-        snapshot.pr = view.pr
-        snapshot.step = view.step
-        snapshot.blocker = view.blocker
         snapshot.status_mtime = view.status_mtime
         self._snapshots[record.agent_id] = snapshot
         return results
@@ -360,12 +357,19 @@ class FleetMonitor:
         view: _WorkerView,
         *,
         event_type: str,
-        prior_status: str | None,
-        prior_runtime: LifecycleState | None,
+        snapshot: _WorkerSnapshot,
     ) -> str:
+        prior_status, prior_step, prior_pr, prior_blocker = (
+            self._snapshot_status_context(snapshot)
+        )
         payload = {
             "from_status": prior_status,
-            "from_runtime": prior_runtime.value if prior_runtime else None,
+            "from_step": prior_step,
+            "from_pr": prior_pr,
+            "from_blocker": prior_blocker,
+            "from_runtime": (
+                snapshot.runtime_state.value if snapshot.runtime_state else None
+            ),
             "status": view.status_state,
             "runtime": view.record.state.value,
             "pr": view.pr,
@@ -374,6 +378,35 @@ class FleetMonitor:
         }
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return f"fleet:{view.record.agent_id}:{event_type}:{encoded}"
+
+    @staticmethod
+    def _status_context_tuple(
+        view: _WorkerView,
+    ) -> tuple[str | None, str | None, str | None, str | None]:
+        return (view.status_state, view.step, view.pr, view.blocker)
+
+    @staticmethod
+    def _snapshot_status_context(
+        snapshot: _WorkerSnapshot,
+    ) -> tuple[str | None, str | None, str | None, str | None]:
+        return (
+            snapshot.status_state,
+            snapshot.step,
+            snapshot.pr,
+            snapshot.blocker,
+        )
+
+    @staticmethod
+    def _apply_status_context(
+        snapshot: _WorkerSnapshot,
+        context: tuple[str | None, str | None, str | None, str | None],
+    ) -> None:
+        (
+            snapshot.status_state,
+            snapshot.step,
+            snapshot.pr,
+            snapshot.blocker,
+        ) = context
 
     @staticmethod
     def _dedupe_identity(
