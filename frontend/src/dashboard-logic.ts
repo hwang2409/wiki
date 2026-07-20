@@ -19,6 +19,96 @@ export function compareTickets(
   return asc ? cmp : -cmp;
 }
 
+export type DashboardFilters = {
+  projects: string[];
+  states: string[];
+  dateFrom: string | null;
+  dateTo: string | null;
+};
+
+export function emptyFilters(): DashboardFilters {
+  return { projects: [], states: [], dateFrom: null, dateTo: null };
+}
+
+export function filtersActive(filters: DashboardFilters): boolean {
+  return (
+    filters.projects.length > 0 ||
+    filters.states.length > 0 ||
+    filters.dateFrom !== null ||
+    filters.dateTo !== null
+  );
+}
+
+/**
+ * Ticket project prefix: everything before the last `-`. `WIKI-134` → `WIKI`,
+ * `MITMWEB-B2` → `MITMWEB`. Falls back to the full ticket string when no `-`.
+ */
+export function ticketProject(ticket: string): string {
+  const idx = ticket.lastIndexOf("-");
+  return idx > 0 ? ticket.slice(0, idx) : ticket;
+}
+
+export function collectProjects(tickets: DashboardTicket[]): string[] {
+  const set = new Set<string>();
+  for (const t of tickets) set.add(ticketProject(t.ticket));
+  return Array.from(set).sort((a, b) => a.localeCompare(b));
+}
+
+export function collectStates(tickets: DashboardTicket[]): string[] {
+  const set = new Set<string>();
+  for (const t of tickets) set.add(t.status);
+  return Array.from(set).sort((a, b) => a.localeCompare(b));
+}
+
+function matchesDateBounds(dateIso: string | null, from: string | null, to: string | null): boolean {
+  if (from === null && to === null) return true;
+  if (!dateIso) return false;
+  const day = dateIso.slice(0, 10);
+  if (from !== null && day < from) return false;
+  if (to !== null && day > to) return false;
+  return true;
+}
+
+export function ticketMatchesFilters(ticket: DashboardTicket, filters: DashboardFilters): boolean {
+  if (filters.projects.length > 0 && !filters.projects.includes(ticketProject(ticket.ticket))) {
+    return false;
+  }
+  if (filters.states.length > 0 && !filters.states.includes(ticket.status)) {
+    return false;
+  }
+  if (!matchesDateBounds(ticket.date, filters.dateFrom, filters.dateTo)) {
+    return false;
+  }
+  return true;
+}
+
+export function filterTickets(
+  tickets: DashboardTicket[],
+  filters: DashboardFilters
+): DashboardTicket[] {
+  if (!filtersActive(filters)) return tickets;
+  return tickets.filter((t) => ticketMatchesFilters(t, filters));
+}
+
+export function parseStoredFilters(raw: string | null): DashboardFilters {
+  if (!raw) return emptyFilters();
+  try {
+    const parsed = JSON.parse(raw) as Partial<DashboardFilters> | null;
+    if (!parsed || typeof parsed !== "object") return emptyFilters();
+    const projects = Array.isArray(parsed.projects)
+      ? parsed.projects.filter((v): v is string => typeof v === "string")
+      : [];
+    const states = Array.isArray(parsed.states)
+      ? parsed.states.filter((v): v is string => typeof v === "string")
+      : [];
+    const dateFrom = typeof parsed.dateFrom === "string" && parsed.dateFrom ? parsed.dateFrom : null;
+    const dateTo = typeof parsed.dateTo === "string" && parsed.dateTo ? parsed.dateTo : null;
+    return { projects, states, dateFrom, dateTo };
+  } catch {
+    return emptyFilters();
+  }
+}
+
 export type PollingDeps<T> = {
   fetch: (signal: AbortSignal) => Promise<T>;
   onData: (data: T) => void;

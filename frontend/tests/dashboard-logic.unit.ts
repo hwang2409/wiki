@@ -2,7 +2,18 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { DashboardTicket } from "../src/api.ts";
-import { compareTickets, startDashboardPolling } from "../src/dashboard-logic.ts";
+import {
+  collectProjects,
+  collectStates,
+  compareTickets,
+  emptyFilters,
+  filterTickets,
+  filtersActive,
+  parseStoredFilters,
+  startDashboardPolling,
+  ticketMatchesFilters,
+  ticketProject,
+} from "../src/dashboard-logic.ts";
 
 function ticket(overrides: Partial<DashboardTicket> = {}): DashboardTicket {
   return {
@@ -115,6 +126,147 @@ test("polling never overlaps requests — next fetch only fires after current se
   gates[1].resolve("b");
   await Promise.resolve();
   handle.stop();
+});
+
+test("ticketProject splits on the last hyphen", () => {
+  assert.equal(ticketProject("WIKI-134"), "WIKI");
+  assert.equal(ticketProject("PHO-14053"), "PHO");
+  assert.equal(ticketProject("MITMWEB-B2"), "MITMWEB");
+  assert.equal(ticketProject("ORG-TEAM-42"), "ORG-TEAM");
+  assert.equal(ticketProject("NOHYPHEN"), "NOHYPHEN");
+});
+
+test("collectProjects/collectStates returns sorted unique values", () => {
+  const rows = [
+    ticket({ ticket: "WIKI-1", status: "working" }),
+    ticket({ ticket: "PHO-2", status: "merge-ready" }),
+    ticket({ ticket: "WIKI-3", status: "working" }),
+    ticket({ ticket: "MITMWEB-B4", status: "blocked" }),
+  ];
+  assert.deepEqual(collectProjects(rows), ["MITMWEB", "PHO", "WIKI"]);
+  assert.deepEqual(collectStates(rows), ["blocked", "merge-ready", "working"]);
+});
+
+test("emptyFilters is inactive; setting any dimension makes it active", () => {
+  const f = emptyFilters();
+  assert.equal(filtersActive(f), false);
+  assert.equal(filtersActive({ ...f, projects: ["WIKI"] }), true);
+  assert.equal(filtersActive({ ...f, states: ["working"] }), true);
+  assert.equal(filtersActive({ ...f, dateFrom: "2026-07-01" }), true);
+  assert.equal(filtersActive({ ...f, dateTo: "2026-07-31" }), true);
+});
+
+test("project filter keeps only tickets whose prefix is in the selection (OR within)", () => {
+  const rows = [
+    ticket({ ticket: "WIKI-1" }),
+    ticket({ ticket: "PHO-2" }),
+    ticket({ ticket: "MITMWEB-B3" }),
+  ];
+  const out = filterTickets(rows, { ...emptyFilters(), projects: ["WIKI", "MITMWEB"] });
+  assert.deepEqual(
+    out.map((r) => r.ticket),
+    ["WIKI-1", "MITMWEB-B3"]
+  );
+});
+
+test("state filter keeps only tickets whose status is in the selection", () => {
+  const rows = [
+    ticket({ ticket: "A-1", status: "working" }),
+    ticket({ ticket: "A-2", status: "merge-ready" }),
+    ticket({ ticket: "A-3", status: "blocked" }),
+  ];
+  const out = filterTickets(rows, { ...emptyFilters(), states: ["working", "blocked"] });
+  assert.deepEqual(
+    out.map((r) => r.ticket),
+    ["A-1", "A-3"]
+  );
+});
+
+test("date bounds are inclusive on both ends and each bound is optional", () => {
+  const rows = [
+    ticket({ ticket: "A-1", date: "2026-07-01T00:00:00Z" }),
+    ticket({ ticket: "A-2", date: "2026-07-15T23:59:59Z" }),
+    ticket({ ticket: "A-3", date: "2026-07-31T12:00:00Z" }),
+    ticket({ ticket: "A-4", date: null }),
+  ];
+  const both = filterTickets(rows, {
+    ...emptyFilters(),
+    dateFrom: "2026-07-01",
+    dateTo: "2026-07-31",
+  });
+  assert.deepEqual(
+    both.map((r) => r.ticket),
+    ["A-1", "A-2", "A-3"],
+    "inclusive on both bounds; null-date rows excluded when any bound set"
+  );
+  const openLower = filterTickets(rows, { ...emptyFilters(), dateTo: "2026-07-15" });
+  assert.deepEqual(
+    openLower.map((r) => r.ticket),
+    ["A-1", "A-2"]
+  );
+  const openUpper = filterTickets(rows, { ...emptyFilters(), dateFrom: "2026-07-15" });
+  assert.deepEqual(
+    openUpper.map((r) => r.ticket),
+    ["A-2", "A-3"]
+  );
+});
+
+test("filters compose with AND across dimensions", () => {
+  const rows = [
+    ticket({ ticket: "WIKI-1", status: "working", date: "2026-07-05T00:00:00Z" }),
+    ticket({ ticket: "WIKI-2", status: "blocked", date: "2026-07-05T00:00:00Z" }),
+    ticket({ ticket: "PHO-3", status: "working", date: "2026-07-05T00:00:00Z" }),
+    ticket({ ticket: "WIKI-4", status: "working", date: "2026-08-05T00:00:00Z" }),
+  ];
+  const out = filterTickets(rows, {
+    projects: ["WIKI"],
+    states: ["working"],
+    dateFrom: "2026-07-01",
+    dateTo: "2026-07-31",
+  });
+  assert.deepEqual(
+    out.map((r) => r.ticket),
+    ["WIKI-1"]
+  );
+});
+
+test("filterTickets is a no-op when no filters are active", () => {
+  const rows = [ticket({ ticket: "A-1" }), ticket({ ticket: "B-2" })];
+  const out = filterTickets(rows, emptyFilters());
+  assert.equal(out, rows, "returns the same array reference when inactive");
+});
+
+test("ticketMatchesFilters handles null date row correctly", () => {
+  const row = ticket({ ticket: "A-1", date: null });
+  assert.equal(ticketMatchesFilters(row, emptyFilters()), true);
+  assert.equal(
+    ticketMatchesFilters(row, { ...emptyFilters(), dateFrom: "2026-01-01" }),
+    false,
+    "null date excluded when any date bound is set"
+  );
+});
+
+test("parseStoredFilters tolerates missing/malformed input", () => {
+  assert.deepEqual(parseStoredFilters(null), emptyFilters());
+  assert.deepEqual(parseStoredFilters(""), emptyFilters());
+  assert.deepEqual(parseStoredFilters("not-json"), emptyFilters());
+  assert.deepEqual(parseStoredFilters("[]"), emptyFilters());
+  assert.deepEqual(
+    parseStoredFilters(
+      JSON.stringify({ projects: ["WIKI", 3, null], states: ["working"], dateFrom: "2026-07-01" })
+    ),
+    { projects: ["WIKI"], states: ["working"], dateFrom: "2026-07-01", dateTo: null }
+  );
+});
+
+test("parseStoredFilters roundtrips a serialized active filter", () => {
+  const original = {
+    projects: ["WIKI", "PHO"],
+    states: ["working", "merge-ready"],
+    dateFrom: "2026-07-01",
+    dateTo: "2026-07-31",
+  };
+  assert.deepEqual(parseStoredFilters(JSON.stringify(original)), original);
 });
 
 test("stop() aborts the inflight signal on unmount", async () => {
