@@ -274,6 +274,32 @@ button:disabled {
   flex: 1;
 }
 
+.provider-health-badges {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+  padding: 4px 6px;
+}
+
+.provider-health-badge {
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1;
+  letter-spacing: 0.02em;
+  text-transform: lowercase;
+  padding: 4px 6px;
+  border-radius: var(--radius-s);
+  text-align: center;
+  cursor: help;
+}
+
+.provider-health-badge.is-unauthorized {
+  color: var(--accent-danger);
+  background: color-mix(in srgb, var(--accent-danger) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent-danger) 40%, transparent);
+}
+
 .theme-icon-stack {
   position: relative;
   display: flex;

@@ -28,6 +28,7 @@ from . import (
     github_pr,
     github_preview,
     knowledge,
+    provider_health,
     terminal,
     tokens,
     transcripts,
@@ -79,6 +80,8 @@ IGNORED_FILE_PARTS = {
 
 VAULT_DIR.mkdir(parents=True, exist_ok=True)
 
+PROVIDER_HEALTH = provider_health.ProviderHealthTracker()
+
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -87,6 +90,8 @@ async def lifespan(_app: FastAPI):
     if configured_backend:
         backend_runtime.publish_backend_url(configured_backend)
     terminal.refresh_boot_token()
+    # Prime the tracker so the first /api/providers/health request is populated.
+    PROVIDER_HEALTH.refresh()
     dispatcher_task, watchdog_task, token_task = await _start_dispatcher()
     knowledge_task = asyncio.create_task(
         knowledge.background_index_loop(
@@ -98,6 +103,10 @@ async def lifespan(_app: FastAPI):
         ),
         name="wiki-knowledge-indexer",
     )
+    provider_health_task = asyncio.create_task(
+        provider_health.probe_loop(PROVIDER_HEALTH),
+        name="wiki-provider-health-probe",
+    )
     try:
         yield
     finally:
@@ -105,11 +114,13 @@ async def lifespan(_app: FastAPI):
         watchdog_task.cancel()
         token_task.cancel()
         knowledge_task.cancel()
+        provider_health_task.cancel()
         await asyncio.gather(
             dispatcher_task,
             watchdog_task,
             token_task,
             knowledge_task,
+            provider_health_task,
             return_exceptions=True,
         )
         await asyncio.to_thread(terminal.TERMINAL_MANAGER.close_all)
@@ -3028,8 +3039,14 @@ def spawn_agent(
         "log": registration.get("log"),
         "prompt_path": None,
     }
+    warnings = []
     if isinstance(result.get("warning"), str):
-        response["warning"] = result["warning"]
+        warnings.append(result["warning"])
+    auth_hint = PROVIDER_HEALTH.spawn_hint(kind)
+    if auth_hint:
+        warnings.append(auth_hint)
+    if warnings:
+        response["warning"] = " ".join(warnings)
     return response
 
 
@@ -3145,13 +3162,17 @@ def spawn_orchestrator(
     refreshed = _registry_agent(_read_agent_registry(), orch_id)
     registration = refreshed[2] if refreshed is not None else {}
 
-    return {
+    response: dict[str, object] = {
         "window": None,
         "run_id": result.get("run_id"),
         "log": registration.get("log"),
         "prompt_path": None,
         "note": "orchestrator registered under the durable supervisor",
     }
+    auth_hint = PROVIDER_HEALTH.spawn_hint(kind)
+    if auth_hint:
+        response["warning"] = auth_hint
+    return response
 
 
 @app.post("/api/agents/spawn-orchestrator")
@@ -3279,6 +3300,7 @@ async def supervisor_event_bridge() -> None:
                     if isinstance(value, str)
                 }
                 _invalidate_session_paths(changed)
+                _consume_provider_health_signal(event)
                 await publish_agent_event(event)
         except asyncio.CancelledError:
             raise
@@ -3287,6 +3309,25 @@ async def supervisor_event_bridge() -> None:
             # requests autostart it; this bridge reconnects without owning it.
             pass
         await asyncio.sleep(1)
+
+
+def _consume_provider_health_signal(event: dict) -> None:
+    """Flip provider auth health to unauthorized on auth-dead supervisor events."""
+
+    event_type = event.get("type")
+    if event_type in {"codex_auth_dead_exhausted", "codex_auth_dead_revival"}:
+        detail = None
+        reasons = event.get("failed_reasons")
+        if isinstance(reasons, dict) and reasons:
+            first_reason = next(iter(reasons.values()), None)
+            if isinstance(first_reason, str) and first_reason.strip():
+                detail = first_reason.strip()
+        if detail is None:
+            if event_type == "codex_auth_dead_exhausted":
+                detail = "codex auth revival exhausted; run `codex login`"
+            else:
+                detail = "codex reported access token could not be refreshed"
+        PROVIDER_HEALTH.mark_unauthorized("cdx", detail=detail)
 
 
 async def agent_runtime_dispatchers() -> None:
@@ -3658,6 +3699,13 @@ class AccountRotateIn(BaseModel):
 @app.get("/api/accounts")
 def get_accounts() -> dict[str, object]:
     return accounts.snapshot()
+
+
+@app.get("/api/providers/health")
+def get_provider_health(refresh: bool = False) -> dict[str, dict[str, object]]:
+    if refresh:
+        return PROVIDER_HEALTH.refresh()
+    return PROVIDER_HEALTH.snapshot()
 
 
 @app.post("/api/accounts/rotate")
