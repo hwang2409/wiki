@@ -904,11 +904,13 @@ function isTextEntryElement(element: Element | null): boolean {
   return element instanceof HTMLElement && element.isContentEditable;
 }
 
+function isCompositionEvent(event: globalThis.KeyboardEvent): boolean {
+  return event.isComposing || event.key === "Process" || event.keyCode === 229;
+}
+
 function isTextEntryEvent(event: globalThis.KeyboardEvent): boolean {
   return (
-    event.isComposing ||
-    event.key === "Process" ||
-    event.keyCode === 229 ||
+    isCompositionEvent(event) ||
     isTextEntryElement(event.target instanceof Element ? event.target : null) ||
     isTextEntryElement(document.activeElement instanceof Element ? document.activeElement : null)
   );
@@ -2947,7 +2949,7 @@ export default function App() {
 
       if (terminalPane && (event.metaKey || event.ctrlKey) && lowerKey === "f") return;
 
-      if (isTextEntryEvent(event)) return;
+      if (isCompositionEvent(event)) return;
 
       if (leaderArmedRef.current) {
         if (modifierOnly) return;
