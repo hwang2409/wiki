@@ -174,6 +174,57 @@ class RowBuildingTests(unittest.TestCase):
             datetime.fromtimestamp(1752760000.0, tz=timezone.utc).isoformat(),
         )
 
+    def test_live_worker_rows_only_include_implementation_workers(self) -> None:
+        registry = {
+            "WIKI-IMPLEMENT": {"current": {"role": "implement", "kind": "cc"}},
+            "WIKI-REVIEW1": {"current": {"role": "review", "kind": "cc"}},
+            "WIKI-PLAN": {"current": {"role": "plan", "kind": "cc"}},
+            "WIKI-ORCH": {"current": {"role": "orchestrator", "kind": "cc"}},
+            "WIKI-LEGACY": {"current": {"kind": "cc"}},
+            "WIKI-SIM1": {"current": {"kind": "cc"}},
+        }
+
+        rows = dashboard.live_worker_rows(registry, {})
+
+        self.assertEqual(
+            {row["ticket"] for row in rows},
+            {"WIKI-IMPLEMENT", "WIKI-LEGACY"},
+        )
+
+    def test_missing_role_fallback_is_anchored_and_covers_one_shot_suffixes(self) -> None:
+        included = [
+            "WIKI-REVIEWING",
+            "WIKI-SIM",
+            "WIKI-123-ORDINARY",
+            "WIKI-TEST",
+        ]
+        excluded = [
+            "WIKI-REVIEW",
+            "WIKI-REVIEW1",
+            "WIKI-SIM1",
+            "WIKI-EVAL2",
+            "WIKI-AUDIT3",
+            "WIKI-CANARY4",
+            "WIKI-THERMO5",
+            "WIKI-DEMO6",
+            "WIKI-TEST7",
+        ]
+        registry = {
+            ticket: {"current": {"kind": "cc"}}
+            for ticket in included + excluded
+        }
+
+        rows = dashboard.live_worker_rows(registry, {})
+
+        self.assertEqual({row["ticket"] for row in rows}, set(included))
+
+    def test_orchestrator_is_still_excluded(self) -> None:
+        rows = dashboard.live_worker_rows(
+            {"WIKI-ORCH": {"current": {"role": "orchestrator", "kind": "cc"}}},
+            {},
+        )
+        self.assertEqual(rows, [])
+
     def test_status_older_than_spawned_by_subsecond_is_ignored(self) -> None:
         # Even a 500ms-old status file must not leak into a fresh session.
         spawned = datetime(2026, 7, 17, 12, 0, 0, tzinfo=timezone.utc)
@@ -251,6 +302,34 @@ class RowBuildingTests(unittest.TestCase):
         rows = dashboard.archived_rows(archived)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["outcome"], "merged")
+
+    def test_archived_rows_apply_worker_filter_and_keep_newest_session(self) -> None:
+        archived = [
+            {
+                "ticket": "WIKI-REVIEW1",
+                "archived_at": "2026-07-17T10:00:00+00:00",
+                "role": "review",
+            },
+            {"ticket": "WIKI-SIM1", "archived_at": "2026-07-17T09:00:00+00:00"},
+            {
+                "ticket": "WIKI-IMPLEMENT",
+                "archived_at": "2026-07-17T08:00:00+00:00",
+                "role": "implement",
+            },
+            {"ticket": "WIKI-LEGACY", "archived_at": "2026-07-17T07:00:00+00:00"},
+            {
+                "ticket": "WIKI-ORCH",
+                "archived_at": "2026-07-17T06:00:00+00:00",
+                "role": "orchestrator",
+            },
+        ]
+
+        rows = dashboard.archived_rows(archived)
+
+        self.assertEqual(
+            {row["ticket"] for row in rows},
+            {"WIKI-IMPLEMENT", "WIKI-LEGACY"},
+        )
 
     def test_merge_rows_prefers_live(self) -> None:
         live = [_row(ticket="T-1", live=True, state="working")]

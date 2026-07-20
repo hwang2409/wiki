@@ -1,11 +1,28 @@
 // @vitest-environment jsdom
-import { cleanup, render } from "@testing-library/react";
+import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, expect, test, vi } from "vitest";
 
 import type { DashboardTicketsPayload } from "../src/dashboard";
 import { DashboardView } from "../src/dashboard";
 
 const EMPTY_PAYLOAD: DashboardTicketsPayload = { tickets: [], repo_allowlist: [] };
+
+function ticket(overrides: Partial<DashboardTicketsPayload["tickets"][number]> = {}) {
+  return {
+    ticket: "WIKI-1",
+    description: "implementation",
+    pr: null,
+    repo: null,
+    enriched: false,
+    status: "implementing",
+    detail: null,
+    date: "2026-07-20T12:00:00+00:00",
+    live: true,
+    role: "implement",
+    kind: "cc",
+    ...overrides,
+  };
+}
 
 afterEach(() => {
   cleanup();
@@ -46,4 +63,23 @@ test("unmount aborts inflight fetch", async () => {
   await Promise.resolve();
   unmount();
   expect(abortSpy).toHaveBeenCalled();
+});
+
+test("renders the backend-filtered implementation payload without changing its count", async () => {
+  const fetchFn = vi.fn(async (): Promise<DashboardTicketsPayload> => ({
+    tickets: [
+      ticket({ ticket: "WIKI-IMPLEMENT", role: "implement" }),
+      ticket({ ticket: "WIKI-LEGACY", role: null, live: false }),
+    ],
+    repo_allowlist: [],
+  }));
+
+  render(<DashboardView fetchTickets={fetchFn} pollMs={60_000} />);
+
+  expect(await screen.findByText("WIKI-IMPLEMENT")).toBeTruthy();
+  expect(screen.getByText("WIKI-LEGACY")).toBeTruthy();
+  expect(screen.getByText("2 tickets")).toBeTruthy();
+  expect(screen.queryByText("WIKI-REVIEW1")).toBeNull();
+  expect(screen.queryByText("WIKI-SIM1")).toBeNull();
+  expect(screen.queryByText("WIKI-ORCH")).toBeNull();
 });

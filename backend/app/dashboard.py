@@ -8,6 +8,7 @@ TTL cache — building the payload never blocks on the network.
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -35,6 +36,10 @@ DEPLOY_ENVIRONMENT_BY_REPO: dict[str, str] = {
 }
 CACHE_TTL_SECONDS = 300
 GH_MAX_WORKERS = 3
+ONE_SHOT_TICKET_SUFFIX = re.compile(
+    r"-(?:REVIEW\d*|SIM\d+|EVAL\d+|AUDIT\d+|CANARY\d+|THERMO\d+|DEMO\d+|TEST\d+)$",
+    re.IGNORECASE,
+)
 
 REVIEW_THREAD_COUNT_QUERY = """
 query ReviewThreadCounts($url: URI!) {
@@ -270,6 +275,20 @@ def _is_terminal(data: dict[str, Any]) -> bool:
 PR_CACHE = PrCache()
 
 
+def _is_dashboard_worker(ticket: str, role: Any) -> bool:
+    """Return whether a registry/archive entry belongs on the ticket dashboard.
+
+    Current entries have a reliable role field, so only implementation workers
+    are included. Older archive records may not have a role; retain those
+    unless their ticket uses a known one-shot worker suffix.
+    """
+    if role == "implement":
+        return True
+    if role not in (None, ""):
+        return False
+    return ONE_SHOT_TICKET_SUFFIX.search(ticket) is None
+
+
 def live_worker_rows(
     registry: dict[str, Any],
     statuses: dict[str, dict[str, Any]],
@@ -289,14 +308,17 @@ def live_worker_rows(
         current = entry.get("current")
         if not isinstance(current, dict):
             continue
-        if current.get("role") == "orchestrator":
+        role = current.get("role")
+        if role == "orchestrator":
+            continue
+        if not _is_dashboard_worker(ticket, role):
             continue
         status = _status_for_current(statuses.get(ticket), current)
         rows.append(
             {
                 "ticket": ticket,
                 "live": True,
-                "role": current.get("role"),
+                "role": role,
                 "kind": current.get("kind"),
                 "state": status.get("state") or current.get("state"),
                 "step": status.get("step"),
@@ -341,11 +363,14 @@ def archived_rows(archived: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not isinstance(ticket, str) or ticket in seen:
             continue
         seen.add(ticket)
+        role = entry.get("role")
+        if not _is_dashboard_worker(ticket, role):
+            continue
         rows.append(
             {
                 "ticket": ticket,
                 "live": False,
-                "role": entry.get("role"),
+                "role": role,
                 "kind": entry.get("kind"),
                 "state": entry.get("state"),
                 "step": entry.get("step"),
