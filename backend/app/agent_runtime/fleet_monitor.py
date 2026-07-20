@@ -313,6 +313,7 @@ class FleetMonitor:
                 results.append(notif)
             if notif is not None or self._dedupe_was_sent(view, dedupe_key):
                 self._apply_status_context(snapshot, current_status_context)
+                self._clear_dedupe_key(view, dedupe_key)
 
         if record.state != snapshot.runtime_state:
             dedupe_key = self._transition_dedupe_key(
@@ -330,6 +331,7 @@ class FleetMonitor:
                 results.append(notif)
             if notif is not None or self._dedupe_was_sent(view, dedupe_key):
                 snapshot.runtime_state = record.state
+                self._clear_dedupe_key(view, dedupe_key)
 
         if view.status_state == "merge-ready":
             if snapshot.merge_ready_since is None:
@@ -416,6 +418,9 @@ class FleetMonitor:
 
     def _dedupe_was_sent(self, view: _WorkerView, dedupe_key: str) -> bool:
         return self._dedupe_identity(view, dedupe_key) in self._sent_dedupe_keys
+
+    def _clear_dedupe_key(self, view: _WorkerView, dedupe_key: str) -> None:
+        self._sent_dedupe_keys.discard(self._dedupe_identity(view, dedupe_key))
 
     async def _maybe_unrouted_verdict(
         self,

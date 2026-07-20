@@ -354,6 +354,58 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(status), 1)
         self.assertIn("step: testing", status[0].message)
 
+    async def test_repeated_status_context_cycle_emits_each_occurrence(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        await self._spawn("WIKI-1870", role="implement", orch="WIKI-ORCH")
+        context_a = {
+            "state": "working",
+            "pr": None,
+            "step": "coding",
+            "blocker": None,
+        }
+        context_b = {**context_a, "step": "testing"}
+        _write_status(self.store, "WIKI-1870", context_a)
+        await self.monitor.tick()
+        self.send.calls.clear()
+
+        emitted: list[Notification] = []
+        for payload in (context_b, context_a, context_b):
+            _write_status(self.store, "WIKI-1870", payload)
+            emitted.extend(
+                note
+                for note in await self.monitor.tick()
+                if note.event_type == "status-transition"
+            )
+
+        self.assertEqual(len(emitted), 3)
+        self.assertIn("step: testing", emitted[0].message)
+        self.assertIn("step: coding", emitted[1].message)
+        self.assertIn("step: testing", emitted[2].message)
+
+    async def test_repeated_runtime_transition_cycle_emits_each_occurrence(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        worker = await self._spawn("WIKI-1880", role="implement", orch="WIKI-ORCH")
+        await self.monitor.tick()
+        self.send.calls.clear()
+
+        emitted: list[Notification] = []
+        for state in (
+            LifecycleState.WORKING,
+            LifecycleState.IDLE,
+            LifecycleState.WORKING,
+        ):
+            self.store.transition(worker.run_id, state, reason="cycle")
+            emitted.extend(
+                note
+                for note in await self.monitor.tick()
+                if note.event_type == "runtime-transition"
+            )
+
+        self.assertEqual(len(emitted), 3)
+        self.assertIn("idle -> working", emitted[0].message)
+        self.assertIn("working -> idle", emitted[1].message)
+        self.assertIn("idle -> working", emitted[2].message)
+
     async def test_archive_respawn_same_id_resets_run_dedupe_state(self) -> None:
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
         first = await self._spawn("WIKI-1800", role="implement", orch="WIKI-ORCH")
@@ -372,7 +424,10 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
                 for note in first_notes
             )
         )
-        self.assertTrue(self.monitor._sent_dedupe_keys)
+        self.assertEqual(
+            self.monitor._snapshots["WIKI-1800"].run_id,
+            first.run_id,
+        )
 
         await self.supervisor.archive(first.run_id, outcome="replaced")
         await self.monitor.tick()
