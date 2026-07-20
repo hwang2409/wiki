@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 class _WorkerSnapshot:
     """Last observed state for one worker; used to detect transitions."""
 
+    run_id: str | None = None
     status_state: str | None = None
     runtime_state: LifecycleState | None = None
     pr: str | None = None
@@ -160,7 +161,7 @@ class FleetMonitor:
         self.send_timeout = send_timeout
         self.max_concurrent_sends = max_concurrent_sends
         self._snapshots: dict[str, _WorkerSnapshot] = {}
-        self._sent_dedupe_keys: set[str] = set()
+        self._sent_dedupe_keys: set[tuple[str, str, str]] = set()
         self._send_semaphores: dict[str, asyncio.Semaphore] = {}
 
     async def run(self, stop: asyncio.Event) -> None:
@@ -182,10 +183,10 @@ class FleetMonitor:
         views = await asyncio.to_thread(self._collect_views)
         # Drop snapshots for workers that are no longer live so archived
         # tickets don't burn memory forever.
-        live_ids = {view.record.agent_id for view in views}
-        for agent_id in list(self._snapshots):
-            if agent_id not in live_ids:
-                self._snapshots.pop(agent_id, None)
+        current_run_ids = {
+            view.record.agent_id: view.record.run_id for view in views
+        }
+        self._reconcile_worker_state(current_run_ids)
 
         wall_now = self.wall_clock()
         monotonic_now = self.monotonic_clock()
@@ -212,6 +213,26 @@ class FleetMonitor:
                 continue
             notifications.extend(batch)
         return notifications
+
+    def _reconcile_worker_state(self, current_run_ids: dict[str, str]) -> None:
+        """Forget snapshots and dedupe state for archived or replaced runs."""
+
+        for agent_id, snapshot in list(self._snapshots.items()):
+            if current_run_ids.get(agent_id) != snapshot.run_id:
+                self._snapshots.pop(agent_id, None)
+        self._sent_dedupe_keys = {
+            identity
+            for identity in self._sent_dedupe_keys
+            if current_run_ids.get(identity[0]) == identity[1]
+        }
+
+    def _reset_agent_state(self, agent_id: str) -> None:
+        self._snapshots.pop(agent_id, None)
+        self._sent_dedupe_keys = {
+            identity
+            for identity in self._sent_dedupe_keys
+            if identity[0] != agent_id
+        }
 
     def _collect_views(self) -> list[_WorkerView]:
         views: list[_WorkerView] = []
@@ -263,7 +284,10 @@ class FleetMonitor:
         monotonic_now: float,
     ) -> list[Notification]:
         record = view.record
-        snapshot = self._snapshots.get(record.agent_id) or _WorkerSnapshot()
+        snapshot = self._snapshots.get(record.agent_id)
+        if snapshot is None or snapshot.run_id != record.run_id:
+            self._reset_agent_state(record.agent_id)
+            snapshot = _WorkerSnapshot(run_id=record.run_id)
         results: list[Notification] = []
 
         if not snapshot.seeded:
@@ -286,7 +310,7 @@ class FleetMonitor:
             )
             if notif is not None:
                 results.append(notif)
-            if notif is not None or dedupe_key in self._sent_dedupe_keys:
+            if notif is not None or self._dedupe_was_sent(view, dedupe_key):
                 snapshot.status_state = view.status_state
 
         if record.state != snapshot.runtime_state:
@@ -304,7 +328,7 @@ class FleetMonitor:
             )
             if notif is not None:
                 results.append(notif)
-            if notif is not None or dedupe_key in self._sent_dedupe_keys:
+            if notif is not None or self._dedupe_was_sent(view, dedupe_key):
                 snapshot.runtime_state = record.state
 
         if view.status_state == "merge-ready":
@@ -350,6 +374,15 @@ class FleetMonitor:
         }
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return f"fleet:{view.record.agent_id}:{event_type}:{encoded}"
+
+    @staticmethod
+    def _dedupe_identity(
+        view: _WorkerView, dedupe_key: str
+    ) -> tuple[str, str, str]:
+        return (view.record.agent_id, view.record.run_id, dedupe_key)
+
+    def _dedupe_was_sent(self, view: _WorkerView, dedupe_key: str) -> bool:
+        return self._dedupe_identity(view, dedupe_key) in self._sent_dedupe_keys
 
     async def _maybe_unrouted_verdict(
         self,
@@ -526,7 +559,8 @@ class FleetMonitor:
         # Supervisor.send_now persists its dedupe key. Fleet-monitor delivery
         # is intentionally local: a later cycle with new step/PR context must
         # not be swallowed by an old supervisor key.
-        if dedupe_key in self._sent_dedupe_keys:
+        dedupe_identity = self._dedupe_identity(view, dedupe_key)
+        if dedupe_identity in self._sent_dedupe_keys:
             return None
         try:
             async with self._send_semaphore(orch_agent_id):
@@ -545,7 +579,7 @@ class FleetMonitor:
                 exc,
             )
             return None
-        self._sent_dedupe_keys.add(dedupe_key)
+        self._sent_dedupe_keys.add(dedupe_identity)
         return Notification(
             ticket=view.record.agent_id,
             orch_agent_id=orch_agent_id,

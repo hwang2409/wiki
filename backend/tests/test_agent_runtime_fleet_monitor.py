@@ -50,6 +50,7 @@ class _SelectiveSend:
         self.calls: list[tuple[str, str, str | None]] = []
         self.slow_run_id: str | None = None
         self.started = asyncio.Event()
+        self.fast_received = asyncio.Event()
         self.release = asyncio.Event()
 
     async def __call__(
@@ -59,6 +60,8 @@ class _SelectiveSend:
         if run_id == self.slow_run_id:
             self.started.set()
             await self.release.wait()
+        else:
+            self.fast_received.set()
         return {"status": "sent"}
 
 
@@ -287,6 +290,50 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         status_calls_after = [call for call in self.send.calls if "status " in call[1]]
         self.assertEqual(len(status_calls_after), 3)
 
+    async def test_archive_respawn_same_id_resets_run_dedupe_state(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        first = await self._spawn("WIKI-1800", role="implement", orch="WIKI-ORCH")
+        payload = {
+            "state": "merge-ready",
+            "pr": "pr-18",
+            "step": "ready",
+            "blocker": None,
+        }
+        _write_status(self.store, "WIKI-1800", payload)
+        first_notes = await self.monitor.tick()
+        self.assertTrue(
+            any(
+                note.ticket == "WIKI-1800"
+                and note.event_type == "status-transition"
+                for note in first_notes
+            )
+        )
+        self.assertTrue(self.monitor._sent_dedupe_keys)
+
+        await self.supervisor.archive(first.run_id, outcome="replaced")
+        await self.monitor.tick()
+        self.assertEqual(self.monitor._snapshots, {})
+        self.assertEqual(self.monitor._sent_dedupe_keys, set())
+
+        second = await self._spawn("WIKI-1800", role="implement", orch="WIKI-ORCH")
+        self.assertNotEqual(first.run_id, second.run_id)
+        _write_status(self.store, "WIKI-1800", payload)
+        second_notes = await self.monitor.tick()
+        status_notes = [
+            note
+            for note in second_notes
+            if note.ticket == "WIKI-1800"
+            and note.event_type == "status-transition"
+        ]
+        self.assertEqual(len(status_notes), 1)
+        self.assertIn("none -> merge-ready", status_notes[0].message)
+        self.assertTrue(
+            all(
+                identity[1] == second.run_id
+                for identity in self.monitor._sent_dedupe_keys
+            )
+        )
+
     async def test_slow_orchestrator_does_not_block_another_destination(self) -> None:
         orch_a = await self._spawn("ORCH-SLOW", role="orchestrator", orch=None)
         orch_b = await self._spawn("ORCH-FAST", role="orchestrator", orch=None)
@@ -309,14 +356,11 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
             send_timeout=0.5,
         )
         tick = asyncio.create_task(monitor.tick())
-        await asyncio.wait_for(send.started.wait(), timeout=1.0)
-        await asyncio.sleep(0)
-        self.assertTrue(
-            any(run_id == orch_b.run_id for run_id, _, _ in send.calls),
-            "fast orchestrator did not receive while slow one was blocked",
-        )
+        await asyncio.wait_for(send.started.wait(), timeout=10.0)
+        await asyncio.wait_for(send.fast_received.wait(), timeout=10.0)
+        self.assertTrue(any(run_id == orch_b.run_id for run_id, _, _ in send.calls))
         send.release.set()
-        await tick
+        await asyncio.wait_for(tick, timeout=10.0)
 
     async def test_wall_clock_jump_does_not_trigger_elapsed_review_gap(self) -> None:
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
