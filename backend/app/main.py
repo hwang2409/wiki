@@ -91,7 +91,7 @@ async def lifespan(_app: FastAPI):
         backend_runtime.publish_backend_url(configured_backend)
     terminal.refresh_boot_token()
     # Prime the tracker so the first /api/providers/health request is populated.
-    PROVIDER_HEALTH.refresh()
+    await PROVIDER_HEALTH.refresh_async()
     dispatcher_task, watchdog_task, token_task = await _start_dispatcher()
     knowledge_task = asyncio.create_task(
         knowledge.background_index_loop(
@@ -3267,6 +3267,7 @@ _event_subscribers: set[asyncio.Queue[dict]] = set()
 
 
 async def publish_agent_event(event: dict) -> None:
+    _consume_provider_health_signal(event)
     dead: list[asyncio.Queue[dict]] = []
     for queue_ in list(_event_subscribers):
         try:
@@ -3300,7 +3301,6 @@ async def supervisor_event_bridge() -> None:
                     if isinstance(value, str)
                 }
                 _invalidate_session_paths(changed)
-                _consume_provider_health_signal(event)
                 await publish_agent_event(event)
         except asyncio.CancelledError:
             raise

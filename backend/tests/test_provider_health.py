@@ -5,6 +5,8 @@ All paths in these tests are temp dirs — no real credentials are touched.
 
 from __future__ import annotations
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import threading
@@ -53,12 +55,12 @@ class ProbeTests(unittest.TestCase):
         self._env_patch.stop()
         self._tmp.cleanup()
 
-    def test_codex_ok_when_refresh_token_present(self) -> None:
+    def test_codex_credential_presence_stays_unknown(self) -> None:
         _write_codex_auth(self.root)
         with mock.patch.object(provider_health, "_verify_operationally", return_value=True):
             health = provider_health.probe_codex()
-        self.assertEqual(health.status, "ok")
-        self.assertIsNone(health.reason_code)
+        self.assertEqual(health.status, "unknown")
+        self.assertEqual(health.reason_code, "verification_unavailable")
         self.assertIsNotNone(health.checked_at)
 
     def test_codex_unauthorized_when_refresh_token_missing(self) -> None:
@@ -80,11 +82,12 @@ class ProbeTests(unittest.TestCase):
         health = provider_health.probe_codex()
         self.assertEqual(health.status, "unknown")
 
-    def test_claude_ok_when_credentials_present(self) -> None:
+    def test_claude_credential_presence_stays_unknown(self) -> None:
         _write_claude_creds(self.root)
         with mock.patch.object(provider_health, "_verify_operationally", return_value=True):
             health = provider_health.probe_claude()
-        self.assertEqual(health.status, "ok")
+        self.assertEqual(health.status, "unknown")
+        self.assertEqual(health.reason_code, "verification_unavailable")
 
     def test_claude_unauthorized_when_credentials_empty(self) -> None:
         claude_dir = self.root / ".claude"
@@ -119,10 +122,33 @@ class ProbeTests(unittest.TestCase):
         with mock.patch.object(provider_health, "_verify_operationally", return_value=False):
             health = provider_health.probe_codex()
         payload = health.to_dict()
-        self.assertEqual(health.status, "unauthorized")
-        self.assertEqual(health.reason_code, "verification_failed")
+        self.assertEqual(health.status, "unknown")
+        self.assertEqual(health.reason_code, "verification_unavailable")
         self.assertNotIn(secret, repr(payload))
         self.assertNotIn(str(self.root), repr(payload))
+
+    def test_status_boundary_decodes_real_child_bytes(self) -> None:
+        script = self.root / "status-probe"
+        script.write_text("#!/bin/sh\nprintf '%s' '{\"loggedIn\":true}'\n", encoding="utf-8")
+        script.chmod(0o755)
+        result = provider_health._run_status_command([str(script)], parse_json=True)
+        self.assertTrue(result)
+
+    def test_local_status_probe_uses_isolated_config_homes(self) -> None:
+        _write_codex_auth(self.root)
+        seen: dict[str, str] = {}
+
+        def capture(args: list[str], **kwargs: object) -> None:
+            env = kwargs["env"]
+            assert isinstance(env, dict)
+            seen.update({key: str(env[key]) for key in ("HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR")})
+            return None
+
+        with mock.patch.object(provider_health, "_run_status_command", side_effect=capture):
+            provider_health.probe_codex()
+        self.assertNotEqual(seen["HOME"], str(Path.home()))
+        self.assertNotIn(str(Path.home() / ".codex"), seen["CODEX_HOME"])
+        self.assertNotIn(str(Path.home() / ".claude"), seen["CLAUDE_CONFIG_DIR"])
 
 
 class TrackerTests(unittest.TestCase):
@@ -170,6 +196,22 @@ class TrackerTests(unittest.TestCase):
         # Other providers must be unaffected.
         self.assertEqual(snapshot["cc"]["status"], "ok")
 
+    def test_fake_plausible_credential_cannot_clear_auth_dead(self) -> None:
+        tracker = provider_health.ProviderHealthTracker(
+            probe_codex_fn=provider_health.probe_codex,
+            probe_claude_fn=lambda: provider_health.ProviderHealth(status="unknown"),
+            credential_path_fn=lambda kind: self.codex_auth,
+        )
+        with mock.patch.object(provider_health.accounts, "codex_auth_path", return_value=self.codex_auth), mock.patch.object(
+            provider_health, "_verify_operationally", return_value=True
+        ):
+            tracker.refresh(kinds=["cdx"])
+            self.assertEqual(tracker.get("cdx").status, "unknown")
+            tracker.mark_unauthorized("cdx")
+            snapshot = tracker.refresh(kinds=["cdx"])
+        self.assertEqual(snapshot["cdx"]["status"], "unauthorized")
+        self.assertEqual(snapshot["cdx"]["reason_code"], "auth_dead")
+
     def test_credential_fingerprint_change_clears_sticky_mark_without_mtime_change(self) -> None:
         self.tracker.refresh()
         self.tracker.mark_unauthorized("cdx")
@@ -216,6 +258,33 @@ class TrackerTests(unittest.TestCase):
         self.assertFalse(refresh_thread.is_alive())
         self.assertEqual(tracker.get("cdx").status, "unauthorized")
         self.assertEqual(tracker.get("cdx").reason_code, "auth_dead")
+
+    def test_concurrent_refreshes_are_singleflight(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        calls = 0
+        calls_lock = threading.Lock()
+
+        def blocked_probe() -> provider_health.ProviderHealth:
+            nonlocal calls
+            with calls_lock:
+                calls += 1
+            entered.set()
+            self.assertTrue(release.wait(timeout=2))
+            return provider_health.ProviderHealth(status="unknown", checked_at="t1")
+
+        tracker = provider_health.ProviderHealthTracker(
+            probe_codex_fn=blocked_probe,
+            probe_claude_fn=lambda: provider_health.ProviderHealth(status="unknown"),
+            credential_path_fn=lambda kind: self.codex_auth,
+        )
+        with ThreadPoolExecutor(max_workers=12) as pool:
+            futures = [pool.submit(tracker.refresh, kinds=["cdx"]) for _ in range(12)]
+            self.assertTrue(entered.wait(timeout=2))
+            release.set()
+            snapshots = [future.result(timeout=2) for future in futures]
+        self.assertEqual(calls, 1)
+        self.assertTrue(all(snapshot["cdx"]["checked_at"] == "t1" for snapshot in snapshots))
 
     def test_mark_reason_only_fires_for_auth_keywords(self) -> None:
         self.assertFalse(self.tracker.mark_reason("cdx", "adapter_lost"))
@@ -344,6 +413,22 @@ class MainWiringTests(unittest.TestCase):
         )
         snapshot = self._main.PROVIDER_HEALTH.snapshot()
         self.assertEqual(snapshot["cdx"]["status"], "ok")
+
+    def test_publish_agent_event_consumes_legacy_watchdog_health_signal(self) -> None:
+        self._main.get_provider_health(refresh=True)
+        asyncio.run(
+            self._main.publish_agent_event(
+                {
+                    "type": "codex_auth_dead_exhausted",
+                    "provider": "codex",
+                    "failure": "auth",
+                    "credential_source": "current",
+                    "exhausted": True,
+                    "tickets": ["WIKI-99"],
+                }
+            )
+        )
+        self.assertEqual(self._main.PROVIDER_HEALTH.get("cdx").status, "unauthorized")
 
 
 if __name__ == "__main__":

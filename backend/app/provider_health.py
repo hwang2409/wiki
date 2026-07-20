@@ -13,6 +13,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Literal
 
 from . import accounts
@@ -83,6 +84,7 @@ def _run_status_command(
             timeout=PROBE_TIMEOUT_SECONDS,
             check=False,
             env=env,
+            text=True,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -98,15 +100,36 @@ def _run_status_command(
 
 
 def _verify_operationally(kind: str) -> bool | None:
-    env = os.environ.copy()
-    if kind == "cdx":
-        env["CODEX_HOME"] = str(accounts.codex_auth_path().parent)
-        return _run_status_command(["codex", "login", "status"], env=env)
-    if kind == "cc":
-        env["CLAUDE_CONFIG_DIR"] = str(claude_credentials_path().parent)
-        return _run_status_command(
-            ["claude", "auth", "status", "--json"], parse_json=True, env=env
+    """Run local status only as a bounded diagnostic; it never proves auth.
+
+    The CLIs may refresh tokens or write config while inspecting status. Keep
+    that behavior inside an isolated temporary home, and deliberately discard
+    the result: local status cannot establish that the current credential can
+    perform a remote authenticated request.
+    """
+
+    if kind not in {"cdx", "cc"}:
+        return None
+    with TemporaryDirectory(prefix="wiki-provider-probe-") as isolated:
+        isolated_home = Path(isolated)
+        (isolated_home / "tmp").mkdir()
+        env = os.environ.copy()
+        env.update(
+            {
+                "HOME": str(isolated_home),
+                "TMPDIR": str(isolated_home / "tmp"),
+                "XDG_CONFIG_HOME": str(isolated_home / "xdg-config"),
+                "XDG_CACHE_HOME": str(isolated_home / "xdg-cache"),
+                "CODEX_HOME": str(isolated_home / ".codex"),
+                "CLAUDE_CONFIG_DIR": str(isolated_home / ".claude"),
+            }
         )
+        if kind == "cdx":
+            _run_status_command(["codex", "login", "status"], env=env)
+        else:
+            _run_status_command(
+                ["claude", "auth", "status", "--json"], parse_json=True, env=env
+            )
     return None
 
 
@@ -125,15 +148,7 @@ class ProviderHealth:
 
 
 def _verified_health(kind: str, *, checked_at: str) -> ProviderHealth:
-    verified = _verify_operationally(kind)
-    if verified is True:
-        return ProviderHealth(status="ok", checked_at=checked_at)
-    if verified is False:
-        return ProviderHealth(
-            status="unauthorized",
-            checked_at=checked_at,
-            reason_code="verification_failed",
-        )
+    _verify_operationally(kind)
     return ProviderHealth(
         status="unknown",
         checked_at=checked_at,
@@ -213,6 +228,8 @@ class ProviderHealthTracker:
         self._sticky_fingerprint: dict[str, str | None] = {kind: None for kind in self.KINDS}
         self._generation: dict[str, int] = {kind: 0 for kind in self.KINDS}
         self._lock = threading.RLock()
+        self._refresh_condition = threading.Condition(self._lock)
+        self._refresh_inflight = False
 
     @staticmethod
     def _default_credential_path(kind: str) -> Path:
@@ -231,35 +248,55 @@ class ProviderHealthTracker:
             return self._state[kind]
 
     def refresh(self, *, kinds: Iterable[str] | None = None) -> dict[str, dict[str, object]]:
-        """Run real probes and discard results that began before a newer event."""
+        """Run one probe batch; concurrent callers share the in-flight result."""
 
-        for kind in kinds or self.KINDS:
-            if kind not in self._state:
-                continue
-            with self._lock:
-                generation = self._generation[kind]
-                sticky = self._sticky[kind]
-                sticky_fingerprint = self._sticky_fingerprint[kind]
-            result = self._probe_fns[kind]()
-            current_fingerprint = _credential_fingerprint(self._credential_path_fn(kind))
-            with self._lock:
-                if self._generation[kind] != generation:
-                    # A concurrent auth-dead event wins over this stale probe.
+        with self._refresh_condition:
+            if self._refresh_inflight:
+                while self._refresh_inflight:
+                    self._refresh_condition.wait()
+                return self.snapshot()
+            self._refresh_inflight = True
+        try:
+            for kind in kinds or self.KINDS:
+                if kind not in self._state:
                     continue
-                if sticky and self._sticky[kind]:
-                    explicit_success = result.status == "ok"
-                    fingerprint_changed = current_fingerprint != sticky_fingerprint
-                    if not (explicit_success or fingerprint_changed):
-                        prior = self._state[kind]
-                        self._state[kind] = replace(
-                            prior,
-                            checked_at=result.checked_at,
-                        )
+                with self._lock:
+                    generation = self._generation[kind]
+                    sticky = self._sticky[kind]
+                    sticky_fingerprint = self._sticky_fingerprint[kind]
+                result = self._probe_fns[kind]()
+                current_fingerprint = _credential_fingerprint(self._credential_path_fn(kind))
+                with self._lock:
+                    if self._generation[kind] != generation:
+                        # A concurrent auth-dead event wins over this stale probe.
                         continue
-                    self._sticky[kind] = False
-                    self._sticky_fingerprint[kind] = None
-                self._state[kind] = result
-        return self.snapshot()
+                    if sticky and self._sticky[kind]:
+                        explicit_success = result.status == "ok"
+                        fingerprint_changed = current_fingerprint != sticky_fingerprint
+                        # A changed credential fingerprint is only a recovery
+                        # signal when paired with an explicit successful probe.
+                        if not (explicit_success and (fingerprint_changed or result.reason_code is None)):
+                            prior = self._state[kind]
+                            self._state[kind] = replace(
+                                prior,
+                                checked_at=result.checked_at,
+                            )
+                            continue
+                        self._sticky[kind] = False
+                        self._sticky_fingerprint[kind] = None
+                    self._state[kind] = result
+            return self.snapshot()
+        finally:
+            with self._refresh_condition:
+                self._refresh_inflight = False
+                self._refresh_condition.notify_all()
+
+    async def refresh_async(
+        self, *, kinds: Iterable[str] | None = None
+    ) -> dict[str, dict[str, object]]:
+        """Run the blocking probe batch away from the asyncio event loop."""
+
+        return await asyncio.to_thread(self.refresh, kinds=kinds)
 
     def mark_unauthorized(self, kind: str) -> None:
         """Mark an exhausted current-credential auth failure with a fixed code."""
@@ -308,7 +345,7 @@ async def probe_loop(
 
     while True:
         try:
-            tracker.refresh()
+            await tracker.refresh_async()
         except Exception:
             pass
         if stop is not None:
