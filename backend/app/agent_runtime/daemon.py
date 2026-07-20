@@ -11,6 +11,7 @@ from typing import BinaryIO
 
 from .factory import RealAdapterFactory
 from .fake import FixtureAdapterFactory
+from .fleet_monitor import FleetMonitor
 from .protocol import UnixSupervisorServer
 from .store import RunStore, RuntimePaths
 from .supervisor import Supervisor
@@ -87,6 +88,7 @@ async def run_daemon(args: argparse.Namespace) -> None:
         except NotImplementedError:
             pass
     recovery_task: asyncio.Task[None] | None = None
+    fleet_task: asyncio.Task[None] | None = None
     try:
         await server.start()
         await supervisor.recover_on_start()
@@ -94,11 +96,24 @@ async def run_daemon(args: argparse.Namespace) -> None:
             _recovery_loop(supervisor, stop),
             name="agent-supervisor-recovery",
         )
+        fleet_monitor = FleetMonitor(
+            supervisor.store,
+            lambda run_id, message, dedupe_key: supervisor.send_now(
+                run_id, message, dedupe_key=dedupe_key
+            ),
+        )
+        fleet_task = asyncio.create_task(
+            fleet_monitor.run(stop),
+            name="agent-supervisor-fleet-monitor",
+        )
         await stop.wait()
     finally:
-        if recovery_task is not None:
-            recovery_task.cancel()
-            await asyncio.gather(recovery_task, return_exceptions=True)
+        for task in (recovery_task, fleet_task):
+            if task is not None:
+                task.cancel()
+        pending = [task for task in (recovery_task, fleet_task) if task is not None]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         await server.close()
         await supervisor.close()
         paths.pid_path.unlink(missing_ok=True)
