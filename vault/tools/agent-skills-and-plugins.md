@@ -2,14 +2,14 @@
 type: reference
 tags: [tools, claude, codex, skills]
 created: 2026-07-06
-updated: 2026-07-06
+updated: 2026-07-20
 ---
 
 # Agent Skills & Plugins — Current State
 
 Living inventory. **Update in place on any skill/plugin change.** Current state only, no changelog trail.
 
-## Global Claude skills (`~/.claude/skills/`)
+## Global Claude skills (`~/.claude/skills/`) — 15
 
 | Skill | Purpose |
 |---|---|
@@ -20,17 +20,19 @@ Living inventory. **Update in place on any skill/plugin change.** Current state 
 | tmux-ticket-claude / tmux-ticket-codex | Spawn ticket worker in tmux window (cc:/cx: prefix) |
 | tmux-ticket-pr-window-naming | Rename window to ticket/PR; never rename `thinker`. RECONSTRUCTED 2026-07-06 after accidental deletion — review pending |
 | linear-ticket-to-pr | Ticket → worktree → PR → babysit pipeline |
-| make-interfaces-feel-better | UI polish (symlink into phoebe `.agents/skills` — broken outside phoebe) |
 | henry-review | Review in Henry's style |
 | thermo-nuclear-code-quality-review | Max-severity review |
 | prompt-polish | Prompt cleanup |
 | karpathy-guidelines | Coding guidelines |
+| admin-run-audit | Audit orchestrated agent runs |
+| mastermind-merge-ready-loop | Autonomous merge-ready review loop |
+| check-aliveness | Check worker/session health |
 
 wiki-vault, handoff, codex-goal-loop, folder-specific adapted 2026-07-06 from [davidondrej/skills](https://github.com/davidondrej/skills) + original work.
 
-## Codex skills (`~/.codex/skills/`) — 29
+## Codex skills (`~/.codex/skills/`) — 32
 
-Synced ports (copies, NOT symlinks — edits on Claude side need manual re-copy): caveman ×5, tmux-ticket-claude/codex, tmux-ticket-pr-window-naming, linear-ticket-to-pr, thermo-nuclear, wiki-vault, handoff, codex-goal-loop.
+Synced ports (copies, NOT symlinks — edits on Claude side need manual re-copy): caveman ×7 (`caveman`, commit, compress, help, review, stats, cavecrew), admin-run-audit, tmux-ticket-claude/codex, tmux-ticket-pr-window-naming, linear-ticket-to-pr, thermo-nuclear, wiki-vault, handoff, codex-goal-loop.
 
 Codex-native keepers: gh-fix-ci, gh-address-comments, pr-review-ci-fix, review, create-plan, issue-triage, sentry-triage, datadog-logs, langsmith-fetch, webapp-testing, codebase-migrate, changelog-generator, linear, mcp-builder, agent-deep-links, ponytail-review.
 
@@ -42,7 +44,7 @@ Clusters: PR lifecycle (ship-pr, babysit-pr, own-pr, commit-push-pr, pushing-cod
 
 | Host | Plugin | Ships |
 |---|---|---|
-| Claude | caveman | 7 skills + 3 cavecrew agents + mode hooks |
+| Claude + Codex | caveman | Native plugins + startup hooks; 7 Codex global skills; `full` default |
 | Claude | claude-plugins-official | superpowers (14 skills), frontend-design |
 | Claude | openai-codex | codex:* skills + codex-rescue agent |
 | Claude + Codex | posthog | ~140 skills + MCP tools — flagged as biggest cleanse lever if unused; all-or-nothing (plugin skills can't be cherry-picked) |
@@ -50,9 +52,11 @@ Clusters: PR lifecycle (ship-pr, babysit-pr, own-pr, commit-push-pr, pushing-cod
 | Codex | rename-pane@personal | tmux helper |
 | Codex | frontend-design | same as Claude side |
 
-## Cross-machine sync (2026-07-06)
+Caveman source: [JuliusBrussee/caveman](https://github.com/JuliusBrussee/caveman), v1.9.1 / commit `0d95a81d35a9f2d123a5e9430d1cfc43d55f1bb0`. Claude and Codex native marketplace plugins are installed and enabled. Claude's plugin hook and Codex's plugin hook activate `full` on session start; global `CLAUDE.md` / `AGENTS.md` rules provide a fallback and make caveman the primary terseness rule when other style skills are active. Fresh-session smoke checks returned `style=caveman; intensity=full` for both CLIs.
 
-Canonical portable copy lives in the private repo **github.com/hwang2409/agent-config** (local checkout `~/me/fun/config`). Contains `claude/skills/` (13), `codex/skills/` (29), global `CLAUDE.md`/`AGENTS.md`, `install.sh` (idempotent, copy-mode, conflict-safe on instruction files) and `sync.sh` (live → repo, commit+push). Flow: edit live skills → `./sync.sh` → other laptop `git pull && ./install.sh`. Plugins/MCP/settings.json deliberately NOT synced (machine-specific); plugin list documented in the repo README. After any skill edit session, run sync.sh or the repo drifts.
+## Cross-machine sync (2026-07-20)
+
+Canonical portable copy lives in the private repo **github.com/hwang2409/agent-config** (local checkout `~/me/fun/config`). Contains `claude/skills/` (13), `codex/skills/` (31), global `CLAUDE.md`/`AGENTS.md`, `install.sh` (idempotent, copy-mode, conflict-safe on instruction files) and `sync.sh` (live → repo, commit+push). Caveman refresh/default rules are synced at commit `7920bf4`. Flow: edit live skills → `./sync.sh` → other laptop `git pull && ./install.sh`. Plugins/MCP/settings.json deliberately NOT synced (machine-specific); plugin list documented in the repo README. After any skill edit session, run sync.sh or the repo drifts.
 
 ## Cleanse log (2026-07-06)
 
