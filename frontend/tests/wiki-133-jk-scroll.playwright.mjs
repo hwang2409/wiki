@@ -69,6 +69,16 @@ async function main() {
     ).join("\n") + "\n",
   );
   writeRegistry(fixtures.registryPath, [["WIKI-133", transcript]]);
+  const registry = JSON.parse(await fs.readFile(fixtures.registryPath, "utf8"));
+  registry["WIKI-133"] = {
+    current: {
+      kind: "cdx",
+      role: "implement",
+      spawned_at: "2026-07-17T11:00:00Z",
+      transcript,
+    },
+  };
+  await fs.writeFile(fixtures.registryPath, JSON.stringify(registry, null, 2));
   writeQueue(fixtures.queuePath, "WIKI-133", []);
 
   const backend = await startBackend(fixtures);
@@ -283,6 +293,48 @@ async function main() {
     assert(
       (await agentsView.evaluate((element) => element.scrollTop)) === agentsBefore,
       "j scrolled the agents view",
+    );
+
+    await page.getByLabel("Ticket dashboard", { exact: true }).click();
+    const dashboardScroller = page.locator(".pane-frame.is-focused .dashboard-table-scroll");
+    await dashboardScroller.waitFor({ state: "visible" });
+    await dashboardScroller.evaluate((element) => {
+      const filler = document.createElement("div");
+      filler.style.height = "2000px";
+      filler.dataset.wiki136Overflow = "true";
+      element.append(filler);
+    });
+    await page.locator(".pane-frame.is-focused").focus();
+    await dashboardScroller.evaluate((element) => element.scrollTo({ top: 0, behavior: "auto" }));
+    await page.keyboard.press("j");
+    await page.waitForFunction(() => {
+      const element = document.querySelector(".pane-frame.is-focused .dashboard-table-scroll");
+      return element instanceof HTMLElement && element.scrollTop > 0;
+    });
+    const dashboardAfterJ = await dashboardScroller.evaluate((element) => element.scrollTop);
+    assert(dashboardAfterJ > 0, `j did not scroll dashboard: ${dashboardAfterJ}`);
+
+    await page.keyboard.press("k");
+    await page.waitForFunction((before) => {
+      const element = document.querySelector(".pane-frame.is-focused .dashboard-table-scroll");
+      return element instanceof HTMLElement && element.scrollTop < before;
+    }, dashboardAfterJ);
+    const dashboardAfterK = await dashboardScroller.evaluate((element) => element.scrollTop);
+    assert(
+      dashboardAfterK < dashboardAfterJ,
+      `k did not scroll dashboard back: ${dashboardAfterK} >= ${dashboardAfterJ}`,
+    );
+
+    await dashboardScroller.evaluate((scroller) => {
+      const textarea = document.createElement("textarea");
+      textarea.dataset.wiki136Textarea = "true";
+      scroller.append(textarea);
+    });
+    await assertTextEntryDoesNotScroll(
+      page,
+      dashboardScroller,
+      page.locator('textarea[data-wiki136-textarea="true"]'),
+      "dashboard textarea",
     );
   } finally {
     await browser.close();
