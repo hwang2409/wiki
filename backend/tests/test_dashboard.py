@@ -181,7 +181,9 @@ class RowBuildingTests(unittest.TestCase):
             "WIKI-PLAN": {"current": {"role": "plan", "kind": "cc"}},
             "WIKI-ORCH": {"current": {"role": "orchestrator", "kind": "cc"}},
             "WIKI-LEGACY": {"current": {"kind": "cc"}},
-            "WIKI-SIM1": {"current": {"kind": "cc"}},
+            "WIKI-SIM1": {"current": {"role": "implement", "kind": "cc"}},
+            "WIKI-DEMO": {"current": {"role": "implement", "kind": "cc"}},
+            "TEST-1": {"current": {"role": "implement", "kind": "cc"}},
         }
 
         rows = dashboard.live_worker_rows(registry, {})
@@ -194,20 +196,27 @@ class RowBuildingTests(unittest.TestCase):
     def test_missing_role_fallback_is_anchored_and_covers_one_shot_suffixes(self) -> None:
         included = [
             "WIKI-REVIEWING",
-            "WIKI-SIM",
             "WIKI-123-ORDINARY",
-            "WIKI-TEST",
         ]
         excluded = [
             "WIKI-REVIEW",
             "WIKI-REVIEW1",
+            "WIKI-SIM",
             "WIKI-SIM1",
+            "WIKI-EVAL",
             "WIKI-EVAL2",
+            "WIKI-AUDIT",
             "WIKI-AUDIT3",
+            "WIKI-CANARY",
             "WIKI-CANARY4",
+            "WIKI-THERMO",
             "WIKI-THERMO5",
+            "WIKI-DEMO",
             "WIKI-DEMO6",
+            "WIKI-TEST",
             "WIKI-TEST7",
+            "TEST-1",
+            "DEMO-2",
         ]
         registry = {
             ticket: {"current": {"kind": "cc"}}
@@ -330,6 +339,12 @@ class RowBuildingTests(unittest.TestCase):
             {row["ticket"] for row in rows},
             {"WIKI-IMPLEMENT", "WIKI-LEGACY"},
         )
+
+    def test_one_shot_names_override_implement_role(self) -> None:
+        for ticket in ("PHO-13944-SIM", "PHO-12880-DEMO", "WIKI-54-DEMO", "TEST-1"):
+            self.assertFalse(dashboard._is_dashboard_worker(ticket, "implement"))
+        for ticket in ("WIKI-134", "PHO-13944"):
+            self.assertTrue(dashboard._is_dashboard_worker(ticket, "implement"))
 
     def test_merge_rows_prefers_live(self) -> None:
         live = [_row(ticket="T-1", live=True, state="working")]
@@ -711,6 +726,31 @@ class DashboardEndpointTests(unittest.TestCase):
         self.assertEqual(by_ticket["GAU-1"]["status"], "merged (local)")
         self.assertFalse(by_ticket["GAU-1"]["live"])
         self.assertEqual(payload["tickets"][0]["ticket"], "WIKI-50")
+
+    def test_endpoint_excludes_real_live_and_archived_one_shot_workers(self) -> None:
+        self.registry.write_text(
+            json.dumps(
+                {
+                    "WIKI-135": {"current": {"role": "implement", "kind": "cc"}},
+                    "PHO-13944-SIM2": {
+                        "current": {"role": "implement", "kind": "cdx"}
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        for ticket in ("PHO-13944-SIM", "PHO-12880-DEMO", "WIKI-54-DEMO", "TEST-1"):
+            session = self.archive / ticket / "20260719-120000"
+            session.mkdir(parents=True)
+            (session / "meta.json").write_text(
+                json.dumps({"worker": {"kind": "cc", "role": "implement"}}),
+                encoding="utf-8",
+            )
+
+        payload = main.dashboard_tickets()
+
+        self.assertEqual([row["ticket"] for row in payload["tickets"]], ["WIKI-135"])
+        self.assertEqual(len(payload["tickets"]), 1)
 
     def test_endpoint_survives_missing_inputs(self) -> None:
         payload = main.dashboard_tickets()

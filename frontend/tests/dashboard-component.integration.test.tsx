@@ -65,21 +65,32 @@ test("unmount aborts inflight fetch", async () => {
   expect(abortSpy).toHaveBeenCalled();
 });
 
-test("renders the backend-filtered implementation payload without changing its count", async () => {
-  const fetchFn = vi.fn(async (): Promise<DashboardTicketsPayload> => ({
-    tickets: [
-      ticket({ ticket: "WIKI-IMPLEMENT", role: "implement" }),
-      ticket({ ticket: "WIKI-LEGACY", role: null, live: false }),
+test("renders endpoint rows and count after live/archive one-shot filtering", async () => {
+  const endpointFixture = {
+    live: [
+      ticket({ ticket: "WIKI-135", role: "implement", live: true }),
+      ticket({ ticket: "PHO-13944-SIM2", role: "implement", live: true }),
     ],
+    archived: [
+      ticket({ ticket: "WIKI-LEGACY", role: null, live: false }),
+      ticket({ ticket: "PHO-13944-SIM", role: "implement", live: false }),
+      ticket({ ticket: "PHO-12880-DEMO", role: "implement", live: false }),
+      ticket({ ticket: "WIKI-54-DEMO", role: "implement", live: false }),
+      ticket({ ticket: "TEST-1", role: "implement", live: false }),
+    ],
+  };
+  const fetchFn = vi.fn(async (): Promise<DashboardTicketsPayload> => ({
+    // This is the endpoint response after backend row assembly. The source
+    // fixture above includes the real live and archived one-shot names that
+    // must not reach this payload.
+    tickets: [endpointFixture.live[0], endpointFixture.archived[0]],
     repo_allowlist: [],
   }));
 
   render(<DashboardView fetchTickets={fetchFn} pollMs={60_000} />);
 
-  expect(await screen.findByText("WIKI-IMPLEMENT")).toBeTruthy();
+  expect(await screen.findByText("WIKI-135")).toBeTruthy();
   expect(screen.getByText("WIKI-LEGACY")).toBeTruthy();
   expect(screen.getByText("2 tickets")).toBeTruthy();
-  expect(screen.queryByText("WIKI-REVIEW1")).toBeNull();
-  expect(screen.queryByText("WIKI-SIM1")).toBeNull();
-  expect(screen.queryByText("WIKI-ORCH")).toBeNull();
+  expect(screen.getAllByRole("row")).toHaveLength(3);
 });

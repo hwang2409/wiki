@@ -37,9 +37,10 @@ DEPLOY_ENVIRONMENT_BY_REPO: dict[str, str] = {
 CACHE_TTL_SECONDS = 300
 GH_MAX_WORKERS = 3
 ONE_SHOT_TICKET_SUFFIX = re.compile(
-    r"-(?:REVIEW\d*|SIM\d+|EVAL\d+|AUDIT\d+|CANARY\d+|THERMO\d+|DEMO\d+|TEST\d+)$",
+    r"-(?:REVIEW|SIM|EVAL|AUDIT|CANARY|THERMO|DEMO|TEST)\d*$",
     re.IGNORECASE,
 )
+STANDALONE_ONE_SHOT_TICKET = re.compile(r"(?:TEST|DEMO)(?:-\d+)?$", re.IGNORECASE)
 
 REVIEW_THREAD_COUNT_QUERY = """
 query ReviewThreadCounts($url: URI!) {
@@ -278,15 +279,20 @@ PR_CACHE = PrCache()
 def _is_dashboard_worker(ticket: str, role: Any) -> bool:
     """Return whether a registry/archive entry belongs on the ticket dashboard.
 
-    Current entries have a reliable role field, so only implementation workers
-    are included. Older archive records may not have a role; retain those
-    unless their ticket uses a known one-shot worker suffix.
+    Role is the primary signal, but one-shot ticket names override it because
+    archived one-shot workers can be recorded with role=implement. Older
+    archive records may not have a role; retain those unless their ticket uses
+    a known one-shot worker name.
     """
+    if ONE_SHOT_TICKET_SUFFIX.search(ticket) or STANDALONE_ONE_SHOT_TICKET.fullmatch(
+        ticket
+    ):
+        return False
     if role == "implement":
         return True
     if role not in (None, ""):
         return False
-    return ONE_SHOT_TICKET_SUFFIX.search(ticket) is None
+    return True
 
 
 def live_worker_rows(
