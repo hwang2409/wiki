@@ -1539,6 +1539,10 @@ async def _check_once(
                     watch.auth_dead_alert_at[ticket] = now_mono
                 await emit({
                     "type": "codex_auth_dead_exhausted",
+                    "provider": "codex",
+                    "failure": "auth",
+                    "credential_source": "current",
+                    "exhausted": True,
                     "tickets": need_alert,
                     "ts": datetime.now(timezone.utc).isoformat(),
                 })
@@ -1546,6 +1550,9 @@ async def _check_once(
             result = await asyncio.to_thread(revive_auth_dead, eligible)
             await emit({
                 "type": "codex_auth_dead_revival",
+                "provider": "codex",
+                "failure": "auth",
+                "credential_source": "current",
                 "revived": result.revived,
                 "failed": result.failed,
                 "failed_reasons": result.failed_reasons,

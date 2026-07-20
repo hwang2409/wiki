@@ -28,6 +28,7 @@ from . import (
     github_pr,
     github_preview,
     knowledge,
+    provider_health,
     terminal,
     tokens,
     transcripts,
@@ -79,6 +80,8 @@ IGNORED_FILE_PARTS = {
 
 VAULT_DIR.mkdir(parents=True, exist_ok=True)
 
+PROVIDER_HEALTH = provider_health.ProviderHealthTracker()
+
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -87,6 +90,13 @@ async def lifespan(_app: FastAPI):
     if configured_backend:
         backend_runtime.publish_backend_url(configured_backend)
     terminal.refresh_boot_token()
+    # Prime the tracker so the first /api/providers/health request is populated.
+    try:
+        await PROVIDER_HEALTH.refresh_async()
+    except Exception:
+        # Health is optional; a broken provider CLI or probe must not prevent
+        # the backend from starting.
+        pass
     dispatcher_task, watchdog_task, token_task = await _start_dispatcher()
     knowledge_task = asyncio.create_task(
         knowledge.background_index_loop(
@@ -98,6 +108,10 @@ async def lifespan(_app: FastAPI):
         ),
         name="wiki-knowledge-indexer",
     )
+    provider_health_task = asyncio.create_task(
+        provider_health.probe_loop(PROVIDER_HEALTH),
+        name="wiki-provider-health-probe",
+    )
     try:
         yield
     finally:
@@ -105,11 +119,13 @@ async def lifespan(_app: FastAPI):
         watchdog_task.cancel()
         token_task.cancel()
         knowledge_task.cancel()
+        provider_health_task.cancel()
         await asyncio.gather(
             dispatcher_task,
             watchdog_task,
             token_task,
             knowledge_task,
+            provider_health_task,
             return_exceptions=True,
         )
         await asyncio.to_thread(terminal.TERMINAL_MANAGER.close_all)
@@ -3028,8 +3044,14 @@ def spawn_agent(
         "log": registration.get("log"),
         "prompt_path": None,
     }
+    warnings = []
     if isinstance(result.get("warning"), str):
-        response["warning"] = result["warning"]
+        warnings.append(result["warning"])
+    auth_hint = PROVIDER_HEALTH.spawn_hint(kind)
+    if auth_hint:
+        warnings.append(auth_hint)
+    if warnings:
+        response["warning"] = " ".join(warnings)
     return response
 
 
@@ -3145,13 +3167,17 @@ def spawn_orchestrator(
     refreshed = _registry_agent(_read_agent_registry(), orch_id)
     registration = refreshed[2] if refreshed is not None else {}
 
-    return {
+    response: dict[str, object] = {
         "window": None,
         "run_id": result.get("run_id"),
         "log": registration.get("log"),
         "prompt_path": None,
         "note": "orchestrator registered under the durable supervisor",
     }
+    auth_hint = PROVIDER_HEALTH.spawn_hint(kind)
+    if auth_hint:
+        response["warning"] = auth_hint
+    return response
 
 
 @app.post("/api/agents/spawn-orchestrator")
@@ -3246,6 +3272,7 @@ _event_subscribers: set[asyncio.Queue[dict]] = set()
 
 
 async def publish_agent_event(event: dict) -> None:
+    _consume_provider_health_signal(event)
     dead: list[asyncio.Queue[dict]] = []
     for queue_ in list(_event_subscribers):
         try:
@@ -3287,6 +3314,32 @@ async def supervisor_event_bridge() -> None:
             # requests autostart it; this bridge reconnects without owning it.
             pass
         await asyncio.sleep(1)
+
+
+def _consume_provider_health_signal(event: dict) -> None:
+    """Mark only exhausted current-credential auth failures as unauthorized."""
+
+    if (
+        event.get("type") == "codex_auth_verified"
+        and event.get("provider") == "codex"
+        and event.get("credential_source") == "current"
+        and event.get("success") is True
+    ):
+        fingerprint = event.get("credential_fingerprint")
+        if isinstance(fingerprint, str):
+            PROVIDER_HEALTH.mark_authenticated(
+                "cdx", credential_fingerprint=fingerprint
+            )
+        return
+    if (
+        event.get("type") != "codex_auth_dead_exhausted"
+        or event.get("provider") != "codex"
+        or event.get("failure") != "auth"
+        or event.get("credential_source") != "current"
+        or event.get("exhausted") is not True
+    ):
+        return
+    PROVIDER_HEALTH.mark_unauthorized("cdx")
 
 
 async def agent_runtime_dispatchers() -> None:
@@ -3658,6 +3711,13 @@ class AccountRotateIn(BaseModel):
 @app.get("/api/accounts")
 def get_accounts() -> dict[str, object]:
     return accounts.snapshot()
+
+
+@app.get("/api/providers/health")
+def get_provider_health(refresh: bool = False) -> dict[str, dict[str, object]]:
+    if refresh:
+        return PROVIDER_HEALTH.refresh(min_interval_seconds=5.0)
+    return PROVIDER_HEALTH.snapshot()
 
 
 @app.post("/api/accounts/rotate")

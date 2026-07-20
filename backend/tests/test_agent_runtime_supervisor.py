@@ -19,6 +19,7 @@ from unittest import mock
 from uuid import uuid4
 
 from backend.app import accounts
+from backend.app import provider_health
 from backend.app.agent_runtime.client import (
     SupervisorClient,
     SupervisorRemoteError,
@@ -354,6 +355,24 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             {"type": "session", "ticket": "WIKI-42", "surface": "queue"},
             session_events,
         )
+        self.supervisor.unsubscribe(queue)
+
+    async def test_codex_success_event_carries_turn_credential_fingerprint(self) -> None:
+        queue = self.supervisor.subscribe()
+        with mock.patch.object(
+            provider_health, "credential_fingerprint", return_value="fp-old"
+        ):
+            await self.supervisor.start_run(
+                agent_id="WIKI-AUTH-FINGERPRINT",
+                provider=ProviderKind.CODEX,
+                role="implement",
+                model="fixture-codex",
+                effort="high",
+                worktree=str(self.worktree),
+                prompt="Work on ticket WIKI-AUTH-FINGERPRINT",
+            )
+            verified = await _wait_for_published(queue, "codex_auth_verified")
+        self.assertEqual(verified["credential_fingerprint"], "fp-old")
         self.supervisor.unsubscribe(queue)
 
     async def test_artifact_failure_message_deduplicates_durably(self) -> None:

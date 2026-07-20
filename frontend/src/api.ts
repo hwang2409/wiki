@@ -808,3 +808,17 @@ export function getTokens(params: TokensQuery = {}) {
   const qs = search.toString();
   return request<TokensResponse>(`/api/tokens${qs ? `?${qs}` : ""}`);
 }
+
+export type ProviderHealthStatus = "ok" | "unauthorized" | "unknown";
+
+export type ProviderHealthEntry = {
+  status: ProviderHealthStatus;
+  checked_at: string | null;
+  reason_code: string | null;
+};
+
+export type ProviderHealthSnapshot = Record<string, ProviderHealthEntry>;
+
+export function getProviderHealth(signal?: AbortSignal) {
+  return request<ProviderHealthSnapshot>("/api/providers/health", { signal });
+}

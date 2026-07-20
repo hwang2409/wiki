@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
-from .. import accounts
+from .. import accounts, provider_health
 from .normalizer import NormalizedProviderEvent, normalize_provider_event
 from .process import (
     ProviderProcessStatus,
@@ -238,6 +238,7 @@ class Supervisor:
         self.auth_dead_attempts: dict[str, list[float]] = {}
         self.auth_dead_alert_at: dict[str, float] = {}
         self.auth_dead_recoveries: dict[str, asyncio.Task[None]] = {}
+        self.codex_turn_fingerprints: dict[tuple[str, str], str | None] = {}
         self.last_limit_alert_at: dict[str, float] = {}
         self.last_no_eligible_alert: float = 0.0
         self.idempotency_cache_size = idempotency_cache_size
@@ -633,9 +634,50 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
 
         # Preserve the existing external SSE invalidation contract. The backend
         # will proxy these dictionaries unchanged when it switches transports.
+        params = event.payload.get("params")
+        turn = params.get("turn") if isinstance(params, dict) else None
+        turn_id = turn.get("id") if isinstance(turn, dict) else None
+        method = event.payload.get("method")
+        if (
+            event.provider is ProviderKind.CODEX
+            and event.direction != "client"
+            and method == "turn/started"
+            and isinstance(turn_id, str)
+        ):
+            self.codex_turn_fingerprints[(run_id, turn_id)] = (
+                provider_health.credential_fingerprint("cdx")
+            )
+
         await self._publish(
             {"type": "session", "ticket": record.agent_id, "surface": "session"}
         )
+        turn_status = turn.get("status") if isinstance(turn, dict) else None
+        credential_fingerprint = (
+            self.codex_turn_fingerprints.pop((run_id, turn_id), None)
+            if (
+                event.provider is ProviderKind.CODEX
+                and event.direction != "client"
+                and method == "turn/completed"
+                and isinstance(turn_id, str)
+            )
+            else None
+        )
+        if (
+            event.provider is ProviderKind.CODEX
+            and event.direction != "client"
+            and method == "turn/completed"
+            and turn_status == "completed"
+        ):
+            verified_event: dict[str, Any] = {
+                "type": "codex_auth_verified",
+                "provider": "codex",
+                "credential_source": "current",
+                "success": True,
+                "ts": datetime.now(timezone.utc).isoformat(),
+            }
+            if credential_fingerprint is not None:
+                verified_event["credential_fingerprint"] = credential_fingerprint
+            await self._publish(verified_event)
         self._schedule_monitor_actions(
             run_id,
             adapter,
@@ -854,6 +896,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             await self._publish(
                 {
                     "type": "codex_auth_dead_revival",
+                    "provider": "codex",
+                    "failure": "auth",
+                    "credential_source": "current",
                     "revived": revived,
                     "failed": failed,
                     "failed_reasons": failed_reasons,
@@ -875,6 +920,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         await self._publish(
             {
                 "type": "codex_auth_dead_exhausted",
+                "provider": "codex",
+                "failure": "auth",
+                "credential_source": "current",
+                "exhausted": True,
                 "tickets": [agent_id],
                 "ts": datetime.now(timezone.utc).isoformat(),
             }
