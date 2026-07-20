@@ -154,12 +154,22 @@ async function main() {
       inputScrollTop === beforeInput,
       `j stole focus from a focused input and scrolled from ${beforeInput} to ${inputScrollTop}`,
     );
+    await page.keyboard.type("k");
+    await page.waitForTimeout(100);
+    const afterKInput = await scroller.evaluate((element) => element.scrollTop);
+    const inputValueWithK = await page.locator('input[data-wiki133-input="true"]').inputValue();
+    assert(inputValueWithK === "jk", `k did not remain text in the focused input: ${inputValueWithK}`);
+    assert(
+      afterKInput === beforeInput,
+      `k stole focus from a focused input and scrolled from ${beforeInput} to ${afterKInput}`,
+    );
 
     await page.locator(".pane-frame.is-focused").focus();
     await page.keyboard.press("Control+a");
     await page.getByLabel("Settings", { exact: true }).click();
     const settings = page.locator(".settings-modal");
     await settings.waitFor({ state: "visible" });
+    await page.keyboard.press("Escape");
     await assertTextEntryDoesNotScroll(
       page,
       scroller,
@@ -176,6 +186,35 @@ async function main() {
       scroller,
       page.locator(".session-composer textarea"),
       "composer",
+    );
+
+    const paneTwo = page.locator(".pane-frame[data-pane-key='pane-2']");
+    await paneTwo.focus();
+    await page.waitForFunction(() => {
+      const frame = document.querySelector(".pane-frame[data-pane-key='pane-2']");
+      return frame instanceof HTMLElement &&
+        frame.classList.contains("is-focused") &&
+        document.activeElement === frame;
+    });
+
+    const composer = paneTwo.locator(".session-composer textarea");
+    await composer.focus();
+    assert(
+      await page.evaluate(() => {
+        const frame = document.querySelector(".pane-frame[data-pane-key='pane-2']");
+        const textarea = frame?.querySelector(".session-composer textarea");
+        return textarea instanceof HTMLTextAreaElement && document.activeElement === textarea;
+      }),
+      "composer did not receive focus before leader chord",
+    );
+    await page.keyboard.press("Control+a");
+    await page.keyboard.press("j");
+    await page.waitForFunction(() =>
+      document.querySelector(".pane-frame.is-focused")?.getAttribute("data-pane-key") === "pane-1",
+    );
+    assert(
+      (await composer.inputValue()) === "",
+      "leader chord was not consumed and inserted text into the focused composer",
     );
 
     await page.getByLabel("Search", { exact: true }).click();
