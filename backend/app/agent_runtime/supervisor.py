@@ -2546,12 +2546,21 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             return await self._launch_record(replacement, prompt)
 
         if target_provider is not old.provider:
-            await self._close_and_drain_adapter(
-                run_id,
-                old_adapter,
-                finalize="stop",
-                suppress_operation_errors=False,
-            )
+            try:
+                await self._close_and_drain_adapter(
+                    run_id,
+                    old_adapter,
+                    finalize="stop",
+                    suppress_operation_errors=False,
+                )
+            except asyncio.CancelledError:
+                await self._cleanup_cancelled_replacement(
+                    old,
+                    replacement,
+                    old_adapter,
+                    published=False,
+                )
+                raise
             self._reset_status_for_replacement(old.agent_id)
             self.store.replace(old.run_id, replacement, reset_status=False)
             return await self._launch_record(replacement, prompt)

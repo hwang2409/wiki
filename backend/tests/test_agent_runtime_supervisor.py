@@ -46,6 +46,7 @@ from backend.app.agent_runtime.types import (
     LifecycleState,
     ProviderKind,
     RunRecord,
+    restart_recovery_decision,
 )
 from backend.app.agent_runtime.version import RUNTIME_FINGERPRINT
 
@@ -1221,6 +1222,73 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             ProviderKind.CLAUDE,
         )
         self.supervisor.unsubscribe(published)
+
+    async def test_cross_provider_codex_to_claude_cancellation_cleans_old_run(self) -> None:
+        await self._assert_cross_provider_replace_cancellation(
+            ProviderKind.CODEX,
+            ProviderKind.CLAUDE,
+            "WIKI-CROSS-CANCEL-CODEX-CLAUDE",
+        )
+
+    async def test_cross_provider_claude_to_codex_cancellation_cleans_old_run(self) -> None:
+        await self._assert_cross_provider_replace_cancellation(
+            ProviderKind.CLAUDE,
+            ProviderKind.CODEX,
+            "WIKI-CROSS-CANCEL-CLAUDE-CODEX",
+        )
+
+    async def _assert_cross_provider_replace_cancellation(
+        self,
+        old_provider: ProviderKind,
+        new_provider: ProviderKind,
+        agent_id: str,
+    ) -> None:
+        old = await self.supervisor.start_run(
+            agent_id=agent_id,
+            provider=old_provider,
+            role="implement",
+            model="fixture-codex" if old_provider is ProviderKind.CODEX else "fixture-claude",
+            effort="high" if old_provider is ProviderKind.CODEX else None,
+            worktree=str(self.worktree),
+            prompt="original cross-provider prompt",
+        )
+        adapter = self.supervisor.adapters[old.run_id]
+        stop_started = asyncio.Event()
+
+        async def paused_stop() -> AdapterStatus:
+            stop_started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("paused stop should only finish through cancellation")
+
+        with mock.patch.object(adapter, "stop", side_effect=paused_stop):
+            replacement_task = asyncio.create_task(
+                self.supervisor.replace(
+                    old.run_id,
+                    "replacement cross-provider prompt",
+                    model="fixture-codex" if new_provider is ProviderKind.CODEX else "fixture-claude",
+                    provider=new_provider,
+                    effort="high" if new_provider is ProviderKind.CODEX else None,
+                )
+            )
+            await asyncio.wait_for(stop_started.wait(), timeout=2)
+            replacement_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await replacement_task
+
+        current = self.store.get(old.run_id)
+        self.assertEqual(self.store.current_run_id(agent_id), old.run_id)
+        self.assertEqual(current.state, LifecycleState.DEAD)
+        self.assertIsNone(current.provider_pid)
+        self.assertTrue(adapter.closed)
+        self.assertNotIn(old.run_id, self.supervisor.adapters)
+        self.assertNotIn(old.run_id, self.supervisor.event_tasks)
+        decision = restart_recovery_decision(
+            current,
+            is_current=True,
+            provider_pid_alive=False,
+            provider_control_attached=False,
+        )
+        self.assertNotEqual(decision.action.value, "resume")
 
     async def test_queue_model_change_persists_then_applies_at_idle_boundary(
         self,

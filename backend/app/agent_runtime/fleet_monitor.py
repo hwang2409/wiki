@@ -2,9 +2,10 @@
 
 Watches every live worker and pushes state-transition notifications to the
 owning orchestrator session via ``send_now``. Also fires the fleet-doctrine
-re-alarms (unrouted verdict, review-gap, staleness). Dedupe is in-memory
-per (ticket, event-type, payload); supervisor restarts intentionally clear
-that memory (the ticket accepts re-emit as a tradeoff).
+re-alarms (unrouted verdict, review-gap, staleness). Transition dedupe is
+per-run and per-occurrence, with a stable retry token passed to ``send_now``;
+supervisor restarts intentionally clear that memory (the ticket accepts
+re-emitting as a tradeoff).
 """
 
 from __future__ import annotations
