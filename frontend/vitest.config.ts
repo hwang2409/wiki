@@ -5,6 +5,13 @@ export default defineConfig({
   plugins: [react()],
   test: {
     environment: "jsdom",
+    environmentOptions: {
+      jsdom: {
+        // Set an origin so document.URL is a real URL under test.
+        url: "http://localhost/",
+      },
+    },
+    setupFiles: ["./vitest.setup.ts"],
     include: ["tests/**/*.integration.test.tsx"],
   },
 });

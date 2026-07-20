@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
-import { cleanup, render, screen } from "@testing-library/react";
-import { afterEach, expect, test, vi } from "vitest";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 
 import type { DashboardTicketsPayload } from "../src/dashboard";
 import { DashboardView } from "../src/dashboard";
@@ -24,9 +24,14 @@ function ticket(overrides: Partial<DashboardTicketsPayload["tickets"][number]> =
   };
 }
 
+beforeEach(() => {
+  window.localStorage.clear();
+});
+
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
+  window.localStorage.clear();
 });
 
 test("polling does not overlap: next fetch waits for prior completion", async () => {
@@ -80,4 +85,100 @@ test("renders endpoint rows and their count", async () => {
   expect(screen.getByText("WIKI-LEGACY")).toBeTruthy();
   expect(screen.getByText("2 tickets")).toBeTruthy();
   expect(screen.getAllByRole("row")).toHaveLength(3);
+});
+
+test("filter bar filters rows, updates count with X / Y, and persists to localStorage", async () => {
+  const fetchFn = vi.fn(async (): Promise<DashboardTicketsPayload> => ({
+    tickets: [
+      ticket({ ticket: "WIKI-135", status: "working", date: "2026-07-20T12:00:00Z" }),
+      ticket({ ticket: "WIKI-140", status: "merge-ready", date: "2026-07-20T12:00:00Z" }),
+      ticket({ ticket: "PHO-14053", status: "working", date: "2026-07-20T12:00:00Z" }),
+    ],
+    repo_allowlist: [],
+  }));
+
+  render(<DashboardView fetchTickets={fetchFn} pollMs={60_000} />);
+
+  await screen.findByText("WIKI-135");
+  expect(screen.getByText("3 tickets")).toBeTruthy();
+
+  // Open the Project dropdown and pick WIKI
+  const projectTrigger = screen.getByRole("button", { name: /^Project$/ });
+  fireEvent.click(projectTrigger);
+  const wikiOption = await screen.findByRole("checkbox", { name: "WIKI" });
+  await act(async () => {
+    fireEvent.click(wikiOption);
+  });
+
+  // Count now reflects filtered vs total
+  expect(screen.getByText("2 / 3 tickets")).toBeTruthy();
+  expect(screen.queryByText("PHO-14053")).toBeNull();
+  expect(screen.getByText("WIKI-135")).toBeTruthy();
+  expect(screen.getByText("WIKI-140")).toBeTruthy();
+
+  // localStorage was updated
+  const stored = window.localStorage.getItem("wiki-dashboard-filters");
+  expect(stored).toBeTruthy();
+  expect(JSON.parse(stored!)).toEqual({
+    projects: ["WIKI"],
+    states: [],
+    dateFrom: null,
+    dateTo: null,
+  });
+
+  // Clear all restores full list and removes stored key
+  const clearButton = screen.getByRole("button", { name: "Clear" });
+  await act(async () => {
+    fireEvent.click(clearButton);
+  });
+  expect(screen.getByText("3 tickets")).toBeTruthy();
+  expect(screen.getByText("PHO-14053")).toBeTruthy();
+  expect(window.localStorage.getItem("wiki-dashboard-filters")).toBeNull();
+});
+
+test("persisted filters hydrate on mount", async () => {
+  window.localStorage.setItem(
+    "wiki-dashboard-filters",
+    JSON.stringify({ projects: ["PHO"], states: [], dateFrom: null, dateTo: null })
+  );
+  const fetchFn = vi.fn(async (): Promise<DashboardTicketsPayload> => ({
+    tickets: [
+      ticket({ ticket: "WIKI-135", status: "working" }),
+      ticket({ ticket: "PHO-14053", status: "working" }),
+    ],
+    repo_allowlist: [],
+  }));
+
+  render(<DashboardView fetchTickets={fetchFn} pollMs={60_000} />);
+
+  await screen.findByText("PHO-14053");
+  expect(screen.queryByText("WIKI-135")).toBeNull();
+  expect(screen.getByText("1 / 2 tickets")).toBeTruthy();
+});
+
+test("shows empty-filtered message when filters exclude all tickets", async () => {
+  const fetchFn = vi.fn(async (): Promise<DashboardTicketsPayload> => ({
+    tickets: [ticket({ ticket: "WIKI-135", status: "working" })],
+    repo_allowlist: [],
+  }));
+
+  render(<DashboardView fetchTickets={fetchFn} pollMs={60_000} />);
+  await screen.findByText("WIKI-135");
+
+  const stateTrigger = screen.getByRole("button", { name: /^State$/ });
+  fireEvent.click(stateTrigger);
+  const blockedOption = await screen.findByRole("checkbox", { name: "working" });
+  await act(async () => {
+    fireEvent.click(blockedOption);
+  });
+  // Toggle it off then set a state that no ticket has via date filter
+  await act(async () => {
+    fireEvent.click(screen.getByRole("checkbox", { name: "working" }));
+  });
+  const fromInput = screen.getByLabelText("Filter tickets from date") as HTMLInputElement;
+  await act(async () => {
+    fireEvent.change(fromInput, { target: { value: "2099-01-01" } });
+  });
+  expect(screen.getByText("No tickets match the current filters.")).toBeTruthy();
+  expect(screen.getByText("0 / 1 tickets")).toBeTruthy();
 });
