@@ -43,6 +43,25 @@ class _RecordingSend:
         return {"status": "sent"}
 
 
+class _SelectiveSend:
+    """Block one orchestrator while allowing another to receive messages."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, str | None]] = []
+        self.slow_run_id: str | None = None
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def __call__(
+        self, run_id: str, message: str, dedupe_key: str | None
+    ) -> dict:
+        self.calls.append((run_id, message, dedupe_key))
+        if run_id == self.slow_run_id:
+            self.started.set()
+            await self.release.wait()
+        return {"status": "sent"}
+
+
 class _Clock:
     def __init__(self, now: float = 1_000_000.0) -> None:
         self.now = now
@@ -115,10 +134,12 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         worker = await self._spawn("WIKI-100", role="implement", orch="WIKI-ORCH")
         _write_status(self.store, "WIKI-100", {"state": "working", "pr": None, "step": "coding", "blocker": None})
 
-        # Seeding tick: no emit on first observation.
+        # The first observation is an explicit none -> current transition.
         seed = await self.monitor.tick()
         seed_status = [n for n in seed if n.event_type == "status-transition"]
-        self.assertEqual(seed_status, [])
+        self.assertEqual(len(seed_status), 1)
+        self.assertIn("none -> working", seed_status[0].message)
+        self.send.calls.clear()
 
         _write_status(
             self.store,
@@ -169,6 +190,201 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(runtime[0].orch_run_id, orch.run_id)
         self.assertIn("runtime", runtime[0].message)
         self.assertIn("blocked", runtime[0].message)
+
+    async def test_initial_merge_ready_and_waiting_approval_are_emitted(self) -> None:
+        orch = await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        await self._spawn("WIKI-1100", role="implement", orch="WIKI-ORCH")
+        waiting = await self._spawn(
+            "WIKI-1101", role="implement", orch="WIKI-ORCH"
+        )
+        self.store.transition(
+            waiting.run_id,
+            LifecycleState.WAITING_APPROVAL,
+            reason="tester",
+        )
+        _write_status(
+            self.store,
+            "WIKI-1100",
+            {
+                "state": "merge-ready",
+                "pr": "https://gh/x/pull/11",
+                "step": "PR open",
+                "blocker": None,
+            },
+        )
+        _write_status(
+            self.store,
+            "WIKI-1101",
+            {
+                "state": "waiting-approval",
+                "pr": None,
+                "step": "approval",
+                "blocker": "needs approval",
+            },
+        )
+
+        notes = await self.monitor.tick()
+        status = {note.ticket: note for note in notes if note.event_type == "status-transition"}
+        runtime = {note.ticket: note for note in notes if note.event_type == "runtime-transition"}
+        self.assertIn("none -> merge-ready", status["WIKI-1100"].message)
+        self.assertIn("none -> waiting-approval", status["WIKI-1101"].message)
+        self.assertIn("none -> waiting-approval", runtime["WIKI-1101"].message)
+        self.assertEqual(status["WIKI-1100"].orch_run_id, orch.run_id)
+
+    async def test_failed_transition_retries_after_delivery_recovers(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        await self._spawn("WIKI-1200", role="implement", orch="WIKI-ORCH")
+        _write_status(
+            self.store,
+            "WIKI-1200",
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+        )
+        await self.monitor.tick()
+        self.send.calls.clear()
+
+        _write_status(
+            self.store,
+            "WIKI-1200",
+            {"state": "merge-ready", "pr": "pr-1", "step": "ready", "blocker": None},
+        )
+        self.send.fail_with = RuntimeError("adapter gone")
+        self.assertEqual(await self.monitor.tick(), [])
+        self.assertEqual(len(self.send.calls), 1)
+
+        self.send.fail_with = None
+        notes = await self.monitor.tick()
+        self.assertEqual(
+            len([note for note in notes if note.event_type == "status-transition"]),
+            1,
+        )
+        self.assertEqual(len(self.send.calls), 2)
+
+    async def test_transition_payload_is_local_dedupe_context(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        await self._spawn("WIKI-1300", role="implement", orch="WIKI-ORCH")
+        _write_status(
+            self.store,
+            "WIKI-1300",
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+        )
+        await self.monitor.tick()
+        self.send.calls.clear()
+
+        for payload in (
+            {"state": "merge-ready", "pr": "pr-1", "step": "ready-1", "blocker": None},
+            {"state": "working", "pr": None, "step": "rework", "blocker": None},
+            {"state": "merge-ready", "pr": "pr-2", "step": "ready-2", "blocker": None},
+        ):
+            _write_status(self.store, "WIKI-1300", payload)
+            await self.monitor.tick()
+
+        status_calls = [call for call in self.send.calls if "status " in call[1]]
+        self.assertEqual(len(status_calls), 3)
+        self.assertIn("pr-1", status_calls[0][1])
+        self.assertIn("pr-2", status_calls[2][1])
+
+        await self.monitor.tick()
+        status_calls_after = [call for call in self.send.calls if "status " in call[1]]
+        self.assertEqual(len(status_calls_after), 3)
+
+    async def test_slow_orchestrator_does_not_block_another_destination(self) -> None:
+        orch_a = await self._spawn("ORCH-SLOW", role="orchestrator", orch=None)
+        orch_b = await self._spawn("ORCH-FAST", role="orchestrator", orch=None)
+        await self._spawn("WIKI-1400", role="implement", orch="ORCH-SLOW")
+        await self._spawn("WIKI-1401", role="implement", orch="ORCH-FAST")
+        for agent_id in ("WIKI-1400", "WIKI-1401"):
+            _write_status(
+                self.store,
+                agent_id,
+                {"state": "working", "pr": None, "step": "coding", "blocker": None},
+            )
+
+        send = _SelectiveSend()
+        send.slow_run_id = orch_a.run_id
+        monitor = FleetMonitor(
+            self.store,
+            send,
+            clock=self.clock,
+            monotonic_clock=self.clock,
+            send_timeout=0.5,
+        )
+        tick = asyncio.create_task(monitor.tick())
+        await asyncio.wait_for(send.started.wait(), timeout=1.0)
+        await asyncio.sleep(0)
+        self.assertTrue(
+            any(run_id == orch_b.run_id for run_id, _, _ in send.calls),
+            "fast orchestrator did not receive while slow one was blocked",
+        )
+        send.release.set()
+        await tick
+
+    async def test_wall_clock_jump_does_not_trigger_elapsed_review_gap(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        await self._spawn("WIKI-1500", role="implement", orch="WIKI-ORCH")
+        wall_clock = _Clock(self.clock.now)
+        monotonic_clock = _Clock(5_000.0)
+        _write_status(
+            self.store,
+            "WIKI-1500",
+            {"state": "merge-ready", "pr": "pr", "step": "ready", "blocker": None},
+            mtime=wall_clock.now,
+        )
+        monitor = FleetMonitor(
+            self.store,
+            self.send,
+            clock=wall_clock,
+            monotonic_clock=monotonic_clock,
+        )
+        await monitor.tick()
+        wall_clock.advance(3600)
+        self.assertEqual(
+            [note for note in await monitor.tick() if note.event_type == "review-gap"],
+            [],
+        )
+        monotonic_clock.advance(301)
+        self.assertEqual(
+            len([note for note in await monitor.tick() if note.event_type == "review-gap"]),
+            1,
+        )
+
+    async def test_plan_worker_does_not_trigger_review_gap(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        await self._spawn("WIKI-1600", role="plan", orch="WIKI-ORCH")
+        _write_status(
+            self.store,
+            "WIKI-1600",
+            {"state": "merge-ready", "pr": "pr", "step": "ready", "blocker": None},
+        )
+        await self.monitor.tick()
+        self.clock.advance(301)
+        self.assertEqual(
+            [note for note in await self.monitor.tick() if note.event_type == "review-gap"],
+            [],
+        )
+
+    async def test_runtime_transition_includes_status_context(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        worker = await self._spawn("WIKI-1700", role="implement", orch="WIKI-ORCH")
+        _write_status(
+            self.store,
+            "WIKI-1700",
+            {
+                "state": "working",
+                "pr": "pr-17",
+                "step": "coding",
+                "blocker": "waiting on test",
+            },
+        )
+        await self.monitor.tick()
+        self.store.transition(worker.run_id, LifecycleState.BLOCKED, reason="tester")
+        notes = await self.monitor.tick()
+        runtime = [note for note in notes if note.event_type == "runtime-transition"]
+        self.assertEqual(len(runtime), 1)
+        self.assertEqual(
+            runtime[0].message,
+            "[fleet] WIKI-1700 (implement): runtime idle -> blocked | "
+            "step: coding | pr: pr-17 | blocker: waiting on test",
+        )
 
     async def test_orchestrator_scoping_isolates_workers(self) -> None:
         orch_a = await self._spawn("ORCH-A", role="orchestrator", orch=None)
@@ -343,6 +559,7 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
             self.store, "WIKI-900", {"state": "working", "pr": None, "step": "s", "blocker": None}
         )
         await self.monitor.tick()  # seed
+        self.send.calls.clear()
         self.send.fail_with = RuntimeError("adapter gone")
 
         _write_status(

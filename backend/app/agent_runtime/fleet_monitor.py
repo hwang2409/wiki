@@ -30,6 +30,8 @@ DEFAULT_UNROUTED_VERDICT_REALARM_SECONDS = 300.0
 DEFAULT_REVIEW_GAP_THRESHOLD_SECONDS = 300.0
 DEFAULT_REVIEW_GAP_REALARM_SECONDS = 600.0
 DEFAULT_STALENESS_THRESHOLD_SECONDS = 1800.0
+DEFAULT_SEND_TIMEOUT_SECONDS = 10.0
+DEFAULT_MAX_CONCURRENT_SENDS = 4
 
 
 logger = logging.getLogger(__name__)
@@ -127,21 +129,39 @@ class FleetMonitor:
         send_now: SendNow,
         *,
         clock: Callable[[], float] = time.time,
+        monotonic_clock: Callable[[], float] | None = None,
         interval: float = DEFAULT_INTERVAL_SECONDS,
         unrouted_verdict_realarm: float = DEFAULT_UNROUTED_VERDICT_REALARM_SECONDS,
         review_gap_threshold: float = DEFAULT_REVIEW_GAP_THRESHOLD_SECONDS,
         review_gap_realarm: float = DEFAULT_REVIEW_GAP_REALARM_SECONDS,
         staleness_threshold: float = DEFAULT_STALENESS_THRESHOLD_SECONDS,
+        send_timeout: float = DEFAULT_SEND_TIMEOUT_SECONDS,
+        max_concurrent_sends: int = DEFAULT_MAX_CONCURRENT_SENDS,
     ):
         self.store = store
         self.send_now = send_now
-        self.clock = clock
+        self.wall_clock = clock
+        # Keep the old injected ``clock`` useful for deterministic callers,
+        # while the daemon uses a real monotonic clock for elapsed timers.
+        self.monotonic_clock = (
+            monotonic_clock
+            if monotonic_clock is not None
+            else (time.monotonic if clock is time.time else clock)
+        )
         self.interval = interval
         self.unrouted_verdict_realarm = unrouted_verdict_realarm
         self.review_gap_threshold = review_gap_threshold
         self.review_gap_realarm = review_gap_realarm
         self.staleness_threshold = staleness_threshold
+        if send_timeout <= 0:
+            raise ValueError("send_timeout must be positive")
+        if max_concurrent_sends < 1:
+            raise ValueError("max_concurrent_sends must be positive")
+        self.send_timeout = send_timeout
+        self.max_concurrent_sends = max_concurrent_sends
         self._snapshots: dict[str, _WorkerSnapshot] = {}
+        self._sent_dedupe_keys: set[str] = set()
+        self._send_semaphores: dict[str, asyncio.Semaphore] = {}
 
     async def run(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
@@ -156,7 +176,10 @@ class FleetMonitor:
                     traceback.print_exc()
 
     async def tick(self) -> list[Notification]:
-        views = self._collect_views()
+        # RunStore.list_runs() and status-file reads are synchronous historical
+        # scans. Keep them off the daemon event loop so a large archive cannot
+        # delay sends or the recovery loop.
+        views = await asyncio.to_thread(self._collect_views)
         # Drop snapshots for workers that are no longer live so archived
         # tickets don't burn memory forever.
         live_ids = {view.record.agent_id for view in views}
@@ -164,10 +187,30 @@ class FleetMonitor:
             if agent_id not in live_ids:
                 self._snapshots.pop(agent_id, None)
 
-        now = self.clock()
+        wall_now = self.wall_clock()
+        monotonic_now = self.monotonic_clock()
+        batches = await asyncio.gather(
+            *(
+                self._process_worker(
+                    view,
+                    views,
+                    wall_now,
+                    monotonic_now,
+                )
+                for view in views
+            ),
+            return_exceptions=True,
+        )
         notifications: list[Notification] = []
-        for view in views:
-            notifications.extend(await self._process_worker(view, views, now))
+        for batch in batches:
+            if isinstance(batch, Exception):
+                logger.error(
+                    "fleet_monitor: worker scan failed: %s",
+                    batch,
+                    exc_info=(type(batch), batch, batch.__traceback__),
+                )
+                continue
+            notifications.extend(batch)
         return notifications
 
     def _collect_views(self) -> list[_WorkerView]:
@@ -216,77 +259,97 @@ class FleetMonitor:
         self,
         view: _WorkerView,
         all_views: list[_WorkerView],
-        now: float,
+        wall_now: float,
+        monotonic_now: float,
     ) -> list[Notification]:
         record = view.record
         snapshot = self._snapshots.get(record.agent_id) or _WorkerSnapshot()
         results: list[Notification] = []
 
         if not snapshot.seeded:
-            snapshot.status_state = view.status_state
-            snapshot.runtime_state = record.state
-            snapshot.pr = view.pr
-            snapshot.step = view.step
-            snapshot.blocker = view.blocker
-            snapshot.status_mtime = view.status_mtime
             if view.status_state == "merge-ready":
-                snapshot.merge_ready_since = now
+                snapshot.merge_ready_since = monotonic_now
             snapshot.seeded = True
-            self._snapshots[record.agent_id] = snapshot
-            # Threshold detectors are not transition-based: fire on seed too so
-            # a supervisor restart still surfaces a still-stale worker.
-            results.extend(await self._maybe_staleness(view, snapshot, now))
-            return results
 
         if view.status_state != snapshot.status_state:
+            dedupe_key = self._transition_dedupe_key(
+                view,
+                event_type="status-transition",
+                prior_status=snapshot.status_state,
+                prior_runtime=snapshot.runtime_state,
+            )
             notif = await self._emit(
                 view,
                 event_type="status-transition",
                 message=self._status_transition_message(view, snapshot),
-                dedupe_key=(
-                    f"fleet:{record.agent_id}:status-transition:"
-                    f"{snapshot.status_state or 'none'}-to-"
-                    f"{view.status_state or 'none'}"
-                ),
+                dedupe_key=dedupe_key,
             )
             if notif is not None:
                 results.append(notif)
+            if notif is not None or dedupe_key in self._sent_dedupe_keys:
+                snapshot.status_state = view.status_state
 
         if record.state != snapshot.runtime_state:
+            dedupe_key = self._transition_dedupe_key(
+                view,
+                event_type="runtime-transition",
+                prior_status=snapshot.status_state,
+                prior_runtime=snapshot.runtime_state,
+            )
             notif = await self._emit(
                 view,
                 event_type="runtime-transition",
                 message=self._runtime_transition_message(view, snapshot),
-                dedupe_key=(
-                    f"fleet:{record.agent_id}:runtime-transition:"
-                    f"{(snapshot.runtime_state.value if snapshot.runtime_state else 'none')}"
-                    f"-to-{record.state.value}"
-                ),
+                dedupe_key=dedupe_key,
             )
             if notif is not None:
                 results.append(notif)
+            if notif is not None or dedupe_key in self._sent_dedupe_keys:
+                snapshot.runtime_state = record.state
 
         if view.status_state == "merge-ready":
             if snapshot.merge_ready_since is None:
-                snapshot.merge_ready_since = now
+                snapshot.merge_ready_since = monotonic_now
         else:
             snapshot.merge_ready_since = None
             snapshot.last_review_gap_alarm_at = None
 
-        results.extend(await self._maybe_unrouted_verdict(view, snapshot, now))
         results.extend(
-            await self._maybe_review_gap(view, snapshot, all_views, now)
+            await self._maybe_unrouted_verdict(view, snapshot, monotonic_now)
         )
-        results.extend(await self._maybe_staleness(view, snapshot, now))
+        results.extend(
+            await self._maybe_review_gap(
+                view, snapshot, all_views, monotonic_now
+            )
+        )
+        results.extend(await self._maybe_staleness(view, snapshot, wall_now))
 
-        snapshot.status_state = view.status_state
-        snapshot.runtime_state = record.state
         snapshot.pr = view.pr
         snapshot.step = view.step
         snapshot.blocker = view.blocker
         snapshot.status_mtime = view.status_mtime
         self._snapshots[record.agent_id] = snapshot
         return results
+
+    def _transition_dedupe_key(
+        self,
+        view: _WorkerView,
+        *,
+        event_type: str,
+        prior_status: str | None,
+        prior_runtime: LifecycleState | None,
+    ) -> str:
+        payload = {
+            "from_status": prior_status,
+            "from_runtime": prior_runtime.value if prior_runtime else None,
+            "status": view.status_state,
+            "runtime": view.record.state.value,
+            "pr": view.pr,
+            "step": view.step,
+            "blocker": view.blocker,
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return f"fleet:{view.record.agent_id}:{event_type}:{encoded}"
 
     async def _maybe_unrouted_verdict(
         self,
@@ -326,7 +389,7 @@ class FleetMonitor:
         now: float,
     ) -> list[Notification]:
         record = view.record
-        if record.role not in {"implement", "plan"}:
+        if record.role != "implement":
             return []
         if view.status_state != "merge-ready":
             return []
@@ -402,26 +465,39 @@ class FleetMonitor:
         self, view: _WorkerView, snapshot: _WorkerSnapshot
     ) -> str:
         record = view.record
-        parts = [
+        return " | ".join(
+            [
             f"[fleet] {record.agent_id} ({record.role}): status "
             f"{snapshot.status_state or 'none'} -> {view.status_state or 'none'}"
+            ]
+            + self._status_context(view)
+        )
+
+    @staticmethod
+    def _status_context(view: _WorkerView) -> list[str]:
+        return [
+            f"step: {view.step or 'none'}",
+            f"pr: {view.pr or 'none'}",
+            f"blocker: {view.blocker or 'none'}",
         ]
-        if view.step:
-            parts.append(f"step: {view.step}")
-        if view.pr:
-            parts.append(f"pr: {view.pr}")
-        if view.blocker:
-            parts.append(f"blocker: {view.blocker}")
-        return " | ".join(parts)
 
     def _runtime_transition_message(
         self, view: _WorkerView, snapshot: _WorkerSnapshot
     ) -> str:
         record = view.record
         prior = snapshot.runtime_state.value if snapshot.runtime_state else "none"
-        return (
-            f"[fleet] {record.agent_id} ({record.role}): runtime {prior} -> "
-            f"{record.state.value}"
+        return " | ".join(
+            [
+                f"[fleet] {record.agent_id} ({record.role}): runtime {prior} -> "
+                f"{record.state.value}"
+            ]
+            + self._status_context(view)
+        )
+
+    def _send_semaphore(self, orch_agent_id: str) -> asyncio.Semaphore:
+        return self._send_semaphores.setdefault(
+            orch_agent_id,
+            asyncio.Semaphore(self.max_concurrent_sends),
         )
 
     async def _emit(
@@ -447,8 +523,17 @@ class FleetMonitor:
             return None
         if orch_record.state in TERMINAL_STATES:
             return None
+        # Supervisor.send_now persists its dedupe key. Fleet-monitor delivery
+        # is intentionally local: a later cycle with new step/PR context must
+        # not be swallowed by an old supervisor key.
+        if dedupe_key in self._sent_dedupe_keys:
+            return None
         try:
-            await self.send_now(orch_run_id, message, dedupe_key)
+            async with self._send_semaphore(orch_agent_id):
+                await asyncio.wait_for(
+                    self.send_now(orch_run_id, message, None),
+                    timeout=self.send_timeout,
+                )
         except Exception as exc:
             # A dead orchestrator adapter or a race with archive must not
             # break the monitor loop; log for the supervisor operator.
@@ -460,6 +545,7 @@ class FleetMonitor:
                 exc,
             )
             return None
+        self._sent_dedupe_keys.add(dedupe_key)
         return Notification(
             ticket=view.record.agent_id,
             orch_agent_id=orch_agent_id,
