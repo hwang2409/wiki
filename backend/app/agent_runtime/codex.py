@@ -735,8 +735,8 @@ class CodexAppServerAdapter(ProviderAdapter):
             await self._spawn(generation)
             try:
                 await self._start_thread(request.prompt, generation)
-            except Exception:
-                await terminate_process_group(self._process)
+            except BaseException:
+                await asyncio.shield(terminate_process_group(self._process))
                 raise
             return self._status()
 
@@ -773,8 +773,8 @@ class CodexAppServerAdapter(ProviderAdapter):
                         "from your current step."
                     )
                 await self._refresh_identity(required=True)
-            except Exception:
-                await terminate_process_group(self._process)
+            except BaseException:
+                await asyncio.shield(terminate_process_group(self._process))
                 raise
             return self._status()
 
@@ -872,8 +872,8 @@ class CodexAppServerAdapter(ProviderAdapter):
                 await self._spawn(generation)
                 try:
                     await self._start_thread(new_prompt, generation)
-                except Exception:
-                    await terminate_process_group(self._process)
+                except BaseException:
+                    await asyncio.shield(terminate_process_group(self._process))
                     raise
                 return self._status()
             if self._active_turn_id:

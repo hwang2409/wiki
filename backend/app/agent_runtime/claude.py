@@ -738,8 +738,8 @@ class ClaudeStreamAdapter(ProviderAdapter):
             try:
                 await self._send_user(request.prompt)
                 await self._refresh_transcript(wait_for_file=True)
-            except Exception:
-                await terminate_process_group(self._process)
+            except BaseException:
+                await asyncio.shield(terminate_process_group(self._process))
                 raise
             return self._status()
 
@@ -759,8 +759,8 @@ class ClaudeStreamAdapter(ProviderAdapter):
                         "from your current step."
                     )
                 await self._refresh_transcript()
-            except Exception:
-                await terminate_process_group(self._process)
+            except BaseException:
+                await asyncio.shield(terminate_process_group(self._process))
                 raise
             return self._status()
 
@@ -847,8 +847,8 @@ class ClaudeStreamAdapter(ProviderAdapter):
                     await self._spawn(session_id, resume=False, generation=generation)
                     await self._send_user(new_prompt)
                     await self._refresh_transcript(wait_for_file=True)
-                except Exception:
-                    await terminate_process_group(self._process)
+                except BaseException:
+                    await asyncio.shield(terminate_process_group(self._process))
                     raise
                 return self._status()
             await self._end_session("wiki-replace", suppress_stream_end=True)
@@ -858,8 +858,8 @@ class ClaudeStreamAdapter(ProviderAdapter):
                 await self._spawn(session_id, resume=False, generation=generation)
                 await self._send_user(new_prompt)
                 await self._refresh_transcript(wait_for_file=True)
-            except Exception:
-                await terminate_process_group(self._process)
+            except BaseException:
+                await asyncio.shield(terminate_process_group(self._process))
                 raise
             return self._status()
 

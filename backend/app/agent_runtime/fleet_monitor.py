@@ -10,13 +10,16 @@ that memory (the ticket accepts re-emit as a tradeoff).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
 import traceback
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
+from uuid import uuid4
 
 from .store import RunStore
 from .types import LifecycleState, RunRecord, TERMINAL_STATES
@@ -47,7 +50,12 @@ class _WorkerSnapshot:
     pr: str | None = None
     step: str | None = None
     blocker: str | None = None
-    status_mtime: float | None = None
+    pending_status_context: tuple[str | None, str | None, str | None, str | None] | None = None
+    pending_status_dedupe_key: str | None = None
+    status_occurrence: int = 0
+    pending_runtime_state: LifecycleState | None = None
+    pending_runtime_dedupe_key: str | None = None
+    runtime_occurrence: int = 0
     merge_ready_since: float | None = None
     last_unrouted_verdict_alarm_at: float | None = None
     last_review_gap_alarm_at: float | None = None
@@ -77,7 +85,6 @@ class _WorkerView:
     step: str | None
     blocker: str | None
     status_mtime: float | None
-    status_file_present: bool
 
 
 def _read_status_file(path) -> tuple[dict[str, Any] | None, float | None]:
@@ -138,6 +145,7 @@ class FleetMonitor:
         staleness_threshold: float = DEFAULT_STALENESS_THRESHOLD_SECONDS,
         send_timeout: float = DEFAULT_SEND_TIMEOUT_SECONDS,
         max_concurrent_sends: int = DEFAULT_MAX_CONCURRENT_SENDS,
+        ownership_lock: Callable[[str], asyncio.Lock] | None = None,
     ):
         self.store = store
         self.send_now = send_now
@@ -160,6 +168,8 @@ class FleetMonitor:
             raise ValueError("max_concurrent_sends must be positive")
         self.send_timeout = send_timeout
         self.max_concurrent_sends = max_concurrent_sends
+        self.ownership_lock = ownership_lock
+        self._instance_id = uuid4().hex[:12]
         self._snapshots: dict[str, _WorkerSnapshot] = {}
         self._sent_dedupe_keys: set[tuple[str, str, str]] = set()
         self._send_semaphores: dict[str, asyncio.Semaphore] = {}
@@ -259,7 +269,6 @@ class FleetMonitor:
                         step=None,
                         blocker=None,
                         status_mtime=mtime,
-                        status_file_present=mtime is not None,
                     )
                 )
                 continue
@@ -271,7 +280,6 @@ class FleetMonitor:
                     step=_string_or_none(status_data.get("step")),
                     blocker=_string_or_none(status_data.get("blocker")),
                     status_mtime=mtime,
-                    status_file_present=True,
                 )
             )
         return views
@@ -298,11 +306,16 @@ class FleetMonitor:
         current_status_context = self._status_context_tuple(view)
         prior_status_context = self._snapshot_status_context(snapshot)
         if current_status_context != prior_status_context:
-            dedupe_key = self._transition_dedupe_key(
-                view,
-                event_type="status-transition",
-                snapshot=snapshot,
-            )
+            if snapshot.pending_status_context != current_status_context:
+                snapshot.status_occurrence += 1
+                snapshot.pending_status_context = current_status_context
+                snapshot.pending_status_dedupe_key = self._transition_dedupe_key(
+                    view,
+                    event_type="status-transition",
+                    occurrence=snapshot.status_occurrence,
+                )
+            dedupe_key = snapshot.pending_status_dedupe_key
+            assert dedupe_key is not None
             notif = await self._emit(
                 view,
                 event_type="status-transition",
@@ -313,14 +326,21 @@ class FleetMonitor:
                 results.append(notif)
             if notif is not None or self._dedupe_was_sent(view, dedupe_key):
                 self._apply_status_context(snapshot, current_status_context)
+                snapshot.pending_status_context = None
+                snapshot.pending_status_dedupe_key = None
                 self._clear_dedupe_key(view, dedupe_key)
 
         if record.state != snapshot.runtime_state:
-            dedupe_key = self._transition_dedupe_key(
-                view,
-                event_type="runtime-transition",
-                snapshot=snapshot,
-            )
+            if snapshot.pending_runtime_state is not record.state:
+                snapshot.runtime_occurrence += 1
+                snapshot.pending_runtime_state = record.state
+                snapshot.pending_runtime_dedupe_key = self._transition_dedupe_key(
+                    view,
+                    event_type="runtime-transition",
+                    occurrence=snapshot.runtime_occurrence,
+                )
+            dedupe_key = snapshot.pending_runtime_dedupe_key
+            assert dedupe_key is not None
             notif = await self._emit(
                 view,
                 event_type="runtime-transition",
@@ -331,6 +351,8 @@ class FleetMonitor:
                 results.append(notif)
             if notif is not None or self._dedupe_was_sent(view, dedupe_key):
                 snapshot.runtime_state = record.state
+                snapshot.pending_runtime_state = None
+                snapshot.pending_runtime_dedupe_key = None
                 self._clear_dedupe_key(view, dedupe_key)
 
         if view.status_state == "merge-ready":
@@ -350,7 +372,6 @@ class FleetMonitor:
         )
         results.extend(await self._maybe_staleness(view, snapshot, wall_now))
 
-        snapshot.status_mtime = view.status_mtime
         self._snapshots[record.agent_id] = snapshot
         return results
 
@@ -359,19 +380,9 @@ class FleetMonitor:
         view: _WorkerView,
         *,
         event_type: str,
-        snapshot: _WorkerSnapshot,
+        occurrence: int,
     ) -> str:
-        prior_status, prior_step, prior_pr, prior_blocker = (
-            self._snapshot_status_context(snapshot)
-        )
         payload = {
-            "from_status": prior_status,
-            "from_step": prior_step,
-            "from_pr": prior_pr,
-            "from_blocker": prior_blocker,
-            "from_runtime": (
-                snapshot.runtime_state.value if snapshot.runtime_state else None
-            ),
             "status": view.status_state,
             "runtime": view.record.state.value,
             "pr": view.pr,
@@ -379,7 +390,11 @@ class FleetMonitor:
             "blocker": view.blocker,
         }
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-        return f"fleet:{view.record.agent_id}:{event_type}:{encoded}"
+        digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:24]
+        return (
+            f"fleet:{self._instance_id}:{view.record.agent_id}:"
+            f"{event_type}:{occurrence}:{digest}"
+        )
 
     @staticmethod
     def _status_context_tuple(
@@ -579,50 +594,74 @@ class FleetMonitor:
         message: str,
         dedupe_key: str,
     ) -> Notification | None:
-        orch_agent_id = view.record.orchestrator_id
-        if not orch_agent_id:
-            return None
-        try:
-            orch_run_id = self.store.current_run_id(orch_agent_id)
-        except Exception:
-            return None
-        if not orch_run_id:
-            return None
-        try:
-            orch_record = self.store.get(orch_run_id)
-        except Exception:
-            return None
-        if orch_record.state in TERMINAL_STATES:
-            return None
-        # Supervisor.send_now persists its dedupe key. Fleet-monitor delivery
-        # is intentionally local: a later cycle with new step/PR context must
-        # not be swallowed by an old supervisor key.
-        dedupe_identity = self._dedupe_identity(view, dedupe_key)
-        if dedupe_identity in self._sent_dedupe_keys:
-            return None
-        try:
-            async with self._send_semaphore(orch_agent_id):
-                await asyncio.wait_for(
-                    self.send_now(orch_run_id, message, None),
-                    timeout=self.send_timeout,
+        async with self._ownership_context(view.record.agent_id):
+            if not self._worker_is_current(view):
+                return None
+            orch_agent_id = view.record.orchestrator_id
+            if not orch_agent_id:
+                return None
+            try:
+                orch_run_id = self.store.current_run_id(orch_agent_id)
+            except Exception:
+                return None
+            if not orch_run_id:
+                return None
+            try:
+                orch_record = self.store.get(orch_run_id)
+            except Exception:
+                return None
+            if orch_record.state in TERMINAL_STATES:
+                return None
+            dedupe_identity = self._dedupe_identity(view, dedupe_key)
+            if dedupe_identity in self._sent_dedupe_keys:
+                return None
+            try:
+                async with self._send_semaphore(orch_agent_id):
+                    await asyncio.wait_for(
+                        self.send_now(
+                            orch_run_id,
+                            message,
+                            dedupe_key=dedupe_key,
+                        ),
+                        timeout=self.send_timeout,
+                    )
+            except Exception as exc:
+                logger.info(
+                    "fleet_monitor: send_now failed for %s -> %s (%s): %s",
+                    view.record.agent_id,
+                    orch_agent_id,
+                    event_type,
+                    exc,
                 )
-        except Exception as exc:
-            # A dead orchestrator adapter or a race with archive must not
-            # break the monitor loop; log for the supervisor operator.
-            logger.info(
-                "fleet_monitor: send_now failed for %s -> %s (%s): %s",
-                view.record.agent_id,
-                orch_agent_id,
-                event_type,
-                exc,
+                return None
+            self._sent_dedupe_keys.add(dedupe_identity)
+            return Notification(
+                ticket=view.record.agent_id,
+                orch_agent_id=orch_agent_id,
+                orch_run_id=orch_run_id,
+                event_type=event_type,
+                message=message,
+                dedupe_key=dedupe_key,
             )
-            return None
-        self._sent_dedupe_keys.add(dedupe_identity)
-        return Notification(
-            ticket=view.record.agent_id,
-            orch_agent_id=orch_agent_id,
-            orch_run_id=orch_run_id,
-            event_type=event_type,
-            message=message,
-            dedupe_key=dedupe_key,
+
+    @asynccontextmanager
+    async def _ownership_context(self, agent_id: str) -> AsyncIterator[None]:
+        if self.ownership_lock is None:
+            yield
+            return
+        async with self.ownership_lock(agent_id):
+            yield
+
+    def _worker_is_current(self, view: _WorkerView) -> bool:
+        try:
+            if self.store.current_run_id(view.record.agent_id) != view.record.run_id:
+                return False
+            record = self.store.get(view.record.run_id)
+        except Exception:
+            return False
+        return (
+            record.run_id == view.record.run_id
+            and record.replaced_by_run_id is None
+            and record.state not in TERMINAL_STATES
+            and self.store.is_current(record)
         )

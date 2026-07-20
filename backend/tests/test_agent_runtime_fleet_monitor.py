@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime, timezone
@@ -117,6 +118,7 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
             review_gap_threshold=300.0,
             review_gap_realarm=600.0,
             staleness_threshold=1800.0,
+            ownership_lock=self.supervisor._agent_lock,  # noqa: SLF001
         )
 
     async def asyncTearDown(self) -> None:
@@ -364,6 +366,58 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(status), 1)
         self.assertIn("step: testing", status[0].message)
 
+    async def test_delivery_timeout_retries_same_occurrence_token(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        await self._spawn("WIKI-1865", role="implement", orch="WIKI-ORCH")
+        _write_status(
+            self.store,
+            "WIKI-1865",
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+        )
+        first_started = asyncio.Event()
+        calls: list[tuple[str, str, str | None]] = []
+        fail_next = False
+
+        async def accept_then_timeout(
+            run_id: str, message: str, dedupe_key: str | None
+        ) -> dict:
+            nonlocal fail_next
+            calls.append((run_id, message, dedupe_key))
+            if fail_next:
+                fail_next = False
+                first_started.set()
+                try:
+                    await asyncio.sleep(60)
+                except asyncio.CancelledError as exc:
+                    raise TimeoutError("ack timeout after acceptance") from exc
+            return {"status": "sent"}
+
+        monitor = FleetMonitor(
+            self.store,
+            accept_then_timeout,
+            clock=self.clock,
+            send_timeout=0.01,
+        )
+        await monitor.tick()
+        fail_next = True
+        _write_status(
+            self.store,
+            "WIKI-1865",
+            {"state": "working", "pr": None, "step": "testing", "blocker": None},
+        )
+        self.assertEqual(await monitor.tick(), [])
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+        notes = await monitor.tick()
+        self.assertEqual(
+            [note.event_type for note in notes],
+            ["status-transition"],
+        )
+        transition_calls = [call for call in calls if "step: testing" in call[1]]
+        self.assertEqual(len(transition_calls), 2)
+        self.assertIsNotNone(transition_calls[0][2])
+        self.assertEqual(transition_calls[0][2], transition_calls[1][2])
+        self.assertLessEqual(len(transition_calls[0][2] or ""), 200)
+
     async def test_repeated_status_context_cycle_emits_each_occurrence(self) -> None:
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
         await self._spawn("WIKI-1870", role="implement", orch="WIKI-ORCH")
@@ -416,8 +470,8 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("working -> idle", emitted[1].message)
         self.assertIn("idle -> working", emitted[2].message)
 
-    async def test_stale_status_file_is_ignored_until_fresh_run_rewrite(self) -> None:
-        stale_payload = {
+    async def test_run_creation_resets_prior_status_before_fresh_rewrite(self) -> None:
+        prior_payload = {
             "state": "merge-ready",
             "pr": "old-pr",
             "step": "old step",
@@ -426,7 +480,7 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         _write_status(
             self.store,
             "WIKI-1890",
-            stale_payload,
+            prior_payload,
             mtime=time.time() - 3600,
         )
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
@@ -443,7 +497,7 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         _write_status(
             self.store,
             "WIKI-1890",
-            stale_payload,
+            prior_payload,
             mtime=time.time() + 1,
         )
         second = await self.monitor.tick()
@@ -454,7 +508,7 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("none -> merge-ready", status[0].message)
         self.assertIn("old-pr", status[0].message)
 
-    async def test_replace_resets_stale_status_before_new_run_is_current(self) -> None:
+    async def test_replace_resets_prior_status_before_new_run_is_current(self) -> None:
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
         old = await self._spawn(
             "WIKI-1893", role="implement", orch="WIKI-ORCH"
@@ -491,7 +545,7 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, [])
         self.assertNotIn("old-replace-pr", "\n".join(note.message for note in notes))
 
-    async def test_replace_accepts_immediate_fresh_status_with_coarse_and_backward_mtime(
+    async def test_replace_accepts_immediate_status_after_reset_with_coarse_and_backward_clock(
         self,
     ) -> None:
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
@@ -593,12 +647,29 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
                     },
                     mtime=mtime,
                 )
-                gap_notes = await self.monitor.tick()
-                self.assertIn(
+                collected = threading.Event()
+                original_collect = self.monitor._collect_views  # noqa: SLF001
+
+                def collect_with_fence_probe():
+                    views = original_collect()
+                    collected.set()
+                    return views
+
+                with mock.patch.object(
+                    self.monitor,
+                    "_collect_views",  # noqa: SLF001
+                    side_effect=collect_with_fence_probe,
+                ):
+                    tick = asyncio.create_task(self.monitor.tick())
+                    await asyncio.wait_for(
+                        asyncio.to_thread(collected.wait, 2), timeout=2
+                    )
+                    allow_stop_return.set()
+                    gap_notes = await asyncio.wait_for(tick, timeout=2)
+                self.assertNotIn(
                     f"old-concurrent-{agent_id}",
                     "\n".join(note.message for note in gap_notes),
                 )
-                allow_stop_return.set()
                 replacement = await asyncio.wait_for(replacement_task, timeout=2)
 
             self.assertEqual(reset_after_stop, [True])
@@ -690,7 +761,7 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(self.store.current_run_id(agent_id), replacement.run_id)
 
-    async def test_post_spawn_coarse_mtime_status_is_accepted(self) -> None:
+    async def test_post_spawn_status_is_accepted_after_reset_with_coarse_clock(self) -> None:
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
         worker = await self._spawn("WIKI-1891", role="implement", orch="WIKI-ORCH")
         created_at = datetime.fromisoformat(worker.created_at).timestamp()
@@ -708,7 +779,7 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(status), 1)
         self.assertIn("coarse-pr", status[0].message)
 
-    async def test_post_spawn_backward_clock_status_is_accepted(self) -> None:
+    async def test_post_spawn_status_is_accepted_after_reset_with_backward_clock(self) -> None:
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
         await self._spawn("WIKI-1892", role="implement", orch="WIKI-ORCH")
         _write_status(

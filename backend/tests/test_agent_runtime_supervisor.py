@@ -983,6 +983,137 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         old_result = next(item for item in recovery if item["run_id"] == old.run_id)
         self.assertEqual(old_result["action"], "skip")
 
+    async def test_replace_cancellation_during_quiesce_terminalizes_old_run(self) -> None:
+        old = await self.supervisor.start_run(
+            agent_id="WIKI-REPLACE-CANCEL-STOP",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="original prompt",
+        )
+        adapter = self.supervisor.adapters[old.run_id]
+        first_stop_started = asyncio.Event()
+        release_first_stop = asyncio.Event()
+        original_stop = adapter.stop
+        stop_calls = 0
+
+        async def cancellable_stop():
+            nonlocal stop_calls
+            stop_calls += 1
+            if stop_calls == 1:
+                first_stop_started.set()
+                await release_first_stop.wait()
+            return await original_stop()
+
+        with mock.patch.object(adapter, "stop", side_effect=cancellable_stop):
+            replacement_task = asyncio.create_task(
+                self.supervisor.replace(old.run_id, "replacement prompt")
+            )
+            await asyncio.wait_for(first_stop_started.wait(), timeout=2)
+            replacement_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await replacement_task
+
+        current = self.store.get(old.run_id)
+        self.assertEqual(current.state, LifecycleState.DEAD)
+        self.assertIsNone(current.provider_pid)
+        self.assertEqual(self.store.current_run_id(old.agent_id), old.run_id)
+        self.assertNotIn(old.run_id, self.supervisor.adapters)
+        self.assertNotIn(old.run_id, self.supervisor.event_tasks)
+        self.assertEqual(stop_calls, 1)
+        self.assertTrue(adapter.closed)
+
+    async def test_replace_cancellation_after_publication_rolls_back_child(self) -> None:
+        old = await self.supervisor.start_run(
+            agent_id="WIKI-REPLACE-CANCEL-PUBLISH",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="original prompt",
+        )
+        adapter = self.supervisor.adapters[old.run_id]
+        published = asyncio.Event()
+        original_replace = adapter.replace
+
+        async def paused_replace(
+            prompt: str,
+            model: str | None = None,
+            effort: str | None = None,
+        ) -> AdapterStatus:
+            published.set()
+            await asyncio.Event().wait()
+            return await original_replace(prompt, model, effort)
+
+        with mock.patch.object(adapter, "replace", side_effect=paused_replace):
+            replacement_task = asyncio.create_task(
+                self.supervisor.replace(old.run_id, "replacement prompt")
+            )
+            await asyncio.wait_for(published.wait(), timeout=2)
+            replacement_id = self.store.current_run_id(old.agent_id)
+            self.assertIsNotNone(replacement_id)
+            self.assertNotEqual(replacement_id, old.run_id)
+            replacement_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await replacement_task
+
+        current = self.store.get(old.run_id)
+        self.assertEqual(self.store.current_run_id(old.agent_id), old.run_id)
+        self.assertEqual(current.state, LifecycleState.BLOCKED)
+        self.assertIsNone(current.provider_pid)
+        self.assertNotIn(old.run_id, self.supervisor.adapters)
+        self.assertNotIn(old.run_id, self.supervisor.event_tasks)
+        self.assertFalse(self.store.status_path(old.agent_id).exists())
+
+    async def test_start_cancellation_terminalizes_spawned_run(self) -> None:
+        started = asyncio.Event()
+        allow_start = asyncio.Event()
+        captured: list[CodexFixtureAdapter] = []
+        original_factory = self.supervisor.adapter_factory
+
+        def paused_factory(record: RunRecord):
+            adapter = original_factory(record)
+            assert isinstance(adapter, CodexFixtureAdapter)
+            captured.append(adapter)
+
+            async def paused_start(request: StartRequest) -> AdapterStatus:
+                started.set()
+                await allow_start.wait()
+                return await CodexFixtureAdapter.start(adapter, request)
+
+            adapter.start = paused_start  # type: ignore[method-assign]
+            return adapter
+
+        self.supervisor.adapter_factory = paused_factory
+        start_task = asyncio.create_task(
+            self.supervisor.start_run(
+                agent_id="WIKI-REPLACE-CANCEL-SPAWN",
+                provider=ProviderKind.CODEX,
+                role="implement",
+                model="fixture-codex",
+                effort="high",
+                worktree=str(self.worktree),
+                prompt="spawn prompt",
+            )
+        )
+        await asyncio.wait_for(started.wait(), timeout=2)
+        run_id = self.store.current_run_id("WIKI-REPLACE-CANCEL-SPAWN")
+        self.assertIsNotNone(run_id)
+        start_task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await start_task
+
+        assert run_id is not None
+        current = self.store.get(run_id)
+        self.assertEqual(current.state, LifecycleState.DEAD)
+        self.assertIsNone(current.provider_pid)
+        self.assertNotIn(run_id, self.supervisor.adapters)
+        self.assertNotIn(run_id, self.supervisor.event_tasks)
+        self.assertTrue(captured[0].closed)
+
     async def test_replace_terminates_verified_orphan_before_fresh_launch(self) -> None:
         old = RunRecord.new(
             agent_id="WIKI-SWAP",

@@ -101,6 +101,7 @@ async def run_daemon(args: argparse.Namespace) -> None:
             lambda run_id, message, dedupe_key: supervisor.send_now(
                 run_id, message, dedupe_key=dedupe_key
             ),
+            ownership_lock=supervisor._agent_lock,  # noqa: SLF001
         )
         fleet_task = asyncio.create_task(
             fleet_monitor.run(stop),
