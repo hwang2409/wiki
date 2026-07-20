@@ -2275,7 +2275,11 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         adapter = self.supervisor.adapters[old.run_id]
         attempted: dict[str, RunRecord] = {}
 
-        def fail_registry_commit(_old_run_id: str, replacement: RunRecord):
+        def fail_registry_commit(
+            _old_run_id: str,
+            replacement: RunRecord,
+            **_kwargs: object,
+        ):
             attempted["replacement"] = replacement
             raise OSError("fixture registry commit failed")
 

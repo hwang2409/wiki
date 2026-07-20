@@ -1221,12 +1221,16 @@ class RunStoreTests(unittest.TestCase):
             paths = _paths(root)
             store = RunStore(paths)
             old = store.create(_record(root))
+            status_path = paths.status_dir / "WIKI-42.json"
+            status_path.parent.mkdir(parents=True, exist_ok=True)
+            status_path.write_text('{"state":"merge-ready"}', encoding="utf-8")
             replacement = _record(root)
             replacement.replaces_run_id = old.run_id
             archived, current = store.replace(old.run_id, replacement)
             self.assertEqual(archived.replaced_by_run_id, current.run_id)
             self.assertEqual(archived.outcome, "handoff")
             self.assertEqual(store.current_run_id("WIKI-42"), current.run_id)
+            self.assertFalse(status_path.exists())
             registry = json.loads(paths.registry_path.read_text(encoding="utf-8"))
             self.assertEqual(registry["WIKI-42"]["history"][0]["outcome"], "handoff")
             with self.assertRaisesRegex(StoreConflict, "no longer current"):

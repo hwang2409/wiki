@@ -1159,6 +1159,15 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             raise operation_error
         return status
 
+    def _reset_status_for_replacement(self, agent_id: str) -> None:
+        """Detach the prior run's status before replacement ownership changes."""
+
+        # Callers hold the per-agent lock. The old provider has already been
+        # detached or drained, so no old-run status survives into the
+        # replacement boundary; replacement launch paths call this before
+        # publishing the new current projection.
+        self.store.status_path(agent_id).unlink(missing_ok=True)
+
     async def start_run(
         self,
         *,
@@ -2383,7 +2392,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         detail="orphan stopped for replacement",
                     ),
                 )
-            self.store.replace(old.run_id, replacement)
+            self._reset_status_for_replacement(old.agent_id)
+            self.store.replace(old.run_id, replacement, reset_status=False)
             return await self._launch_record(replacement, prompt)
 
         if target_provider is not old.provider:
@@ -2393,9 +2403,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 finalize="stop",
                 suppress_operation_errors=False,
             )
-            self.store.replace(old.run_id, replacement)
+            self._reset_status_for_replacement(old.agent_id)
+            self.store.replace(old.run_id, replacement, reset_status=False)
             return await self._launch_record(replacement, prompt)
         await self._detach_adapter(run_id, preserve_event_routes=True)
+        self._reset_status_for_replacement(old.agent_id)
 
         try:
             old_adapter.prepare_replacement(replacement)
@@ -2432,7 +2444,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         replacement.active_turn_id = status.active_turn_id
         replacement.transcript_path = status.transcript_path
         try:
-            self.store.replace(old.run_id, replacement)
+            self.store.replace(old.run_id, replacement, reset_status=False)
         except Exception as exc:
             try:
                 self.store.get(replacement.run_id)

@@ -1554,7 +1554,11 @@ class RunStore:
             return record
 
     def replace(
-        self, old_run_id: str, new_record: RunRecord
+        self,
+        old_run_id: str,
+        new_record: RunRecord,
+        *,
+        reset_status: bool = True,
     ) -> tuple[RunRecord, RunRecord]:
         with self._lock:
             old = self.get(old_run_id)
@@ -1567,6 +1571,11 @@ class RunStore:
             current = entry.get("current") or {}
             if current.get("run_id") != old.run_id:
                 raise StoreConflict("replacement target is no longer current")
+            if reset_status:
+                # Direct store callers have no supervisor lock boundary to do
+                # this first. Supervisor replacement passes False only after
+                # quiescing the old provider and resetting under that lock.
+                self.status_path(old.agent_id).unlink(missing_ok=True)
 
             # Replacements are a continuation of the same logical composer
             # session. Provider echoes can arrive after the run-id swap, and

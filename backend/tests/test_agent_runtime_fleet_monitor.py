@@ -453,6 +453,95 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("none -> merge-ready", status[0].message)
         self.assertIn("old-pr", status[0].message)
 
+    async def test_replace_resets_stale_status_before_new_run_is_current(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        old = await self._spawn(
+            "WIKI-1893", role="implement", orch="WIKI-ORCH"
+        )
+        _write_status(
+            self.store,
+            "WIKI-1893",
+            {
+                "state": "merge-ready",
+                "pr": "old-replace-pr",
+                "step": "old replacement",
+                "blocker": None,
+            },
+        )
+
+        replacement = await self.supervisor.replace(
+            old.run_id, "replacement prompt for WIKI-1893"
+        )
+        self.assertEqual(self.store.current_run_id("WIKI-1893"), replacement.run_id)
+        self.assertFalse(self.store.status_path("WIKI-1893").exists())
+
+        monitor = FleetMonitor(
+            self.store,
+            self.send,
+            clock=self.clock,
+            interval=0.01,
+            unrouted_verdict_realarm=300.0,
+            review_gap_threshold=300.0,
+            review_gap_realarm=600.0,
+            staleness_threshold=1800.0,
+        )
+        notes = await monitor.tick()
+        status = [note for note in notes if note.event_type == "status-transition"]
+        self.assertEqual(status, [])
+        self.assertNotIn("old-replace-pr", "\n".join(note.message for note in notes))
+
+    async def test_replace_accepts_immediate_fresh_status_with_coarse_and_backward_mtime(
+        self,
+    ) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        for agent_id, mtime in (
+            ("WIKI-1894", 0.0),
+            ("WIKI-1895", time.time() - 3600),
+        ):
+            old = await self._spawn(agent_id, role="implement", orch="WIKI-ORCH")
+            _write_status(
+                self.store,
+                agent_id,
+                {
+                    "state": "working",
+                    "pr": "old-replace-pr",
+                    "step": "old replacement",
+                    "blocker": None,
+                },
+            )
+            replacement = await self.supervisor.replace(
+                old.run_id, f"replacement prompt for {agent_id}"
+            )
+            created_at = datetime.fromisoformat(replacement.created_at).timestamp()
+            fresh_mtime = int(created_at) if mtime == 0.0 else mtime
+            _write_status(
+                self.store,
+                agent_id,
+                {
+                    "state": "merge-ready",
+                    "pr": f"fresh-{agent_id}",
+                    "step": "fresh replacement",
+                    "blocker": None,
+                },
+                mtime=fresh_mtime,
+            )
+
+            notes = await self.monitor.tick()
+            status = [
+                note for note in notes if note.event_type == "status-transition"
+            ]
+            self.assertEqual(len(status), 1, notes)
+            self.assertIn("none -> merge-ready", status[0].message)
+            self.assertIn(f"fresh-{agent_id}", status[0].message)
+            self.assertEqual(
+                [
+                    note
+                    for note in await self.monitor.tick()
+                    if note.event_type == "status-transition"
+                ],
+                [],
+            )
+
     async def test_post_spawn_coarse_mtime_status_is_accepted(self) -> None:
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
         worker = await self._spawn("WIKI-1891", role="implement", orch="WIKI-ORCH")
