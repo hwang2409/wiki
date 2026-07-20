@@ -1168,6 +1168,25 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         # publishing the new current projection.
         self.store.status_path(agent_id).unlink(missing_ok=True)
 
+    async def _quiesce_adapter_for_replacement(
+        self,
+        run_id: str,
+        adapter: ProviderAdapter,
+    ) -> None:
+        """Stop the old provider before its status ownership is reset."""
+
+        stream_key = id(adapter)
+        self.expected_stream_ends.add(stream_key)
+        try:
+            # Stop the event pump before stopping the provider. The provider
+            # may emit terminal protocol events while it is quiescing; those
+            # events belong to the old run and must not race the ownership
+            # reset or make the old record terminal before the handoff.
+            await self._detach_adapter(run_id, preserve_event_routes=True)
+            await adapter.stop()
+        finally:
+            self.expected_stream_ends.discard(stream_key)
+
     async def start_run(
         self,
         *,
@@ -2406,21 +2425,27 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             self._reset_status_for_replacement(old.agent_id)
             self.store.replace(old.run_id, replacement, reset_status=False)
             return await self._launch_record(replacement, prompt)
-        await self._detach_adapter(run_id, preserve_event_routes=True)
+        await self._quiesce_adapter_for_replacement(run_id, old_adapter)
         self._reset_status_for_replacement(old.agent_id)
 
         try:
             old_adapter.prepare_replacement(replacement)
-            status = await old_adapter.replace(prompt, model, target_effort)
+            self.store.replace(old.run_id, replacement, reset_status=False)
         except Exception as exc:
             await self._close_and_drain_adapter(run_id, old_adapter)
             try:
+                current = self.store.get(run_id)
+                failure_state = (
+                    LifecycleState.DEAD
+                    if current.state is LifecycleState.DEAD
+                    else LifecycleState.BLOCKED
+                )
                 self.store.transition(
                     run_id,
-                    LifecycleState.BLOCKED,
-                    reason=f"provider replacement failed: {exc}",
+                    failure_state,
+                    reason=f"replacement metadata commit failed: {exc}",
                     adapter_status=AdapterStatus(
-                        state=LifecycleState.BLOCKED,
+                        state=failure_state,
                         session_id=old.provider_session_id,
                         pid=None,
                         generation=old.provider_generation,
@@ -2433,47 +2458,21 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             await self._publish_agent_change(old.agent_id)
             raise
 
-        # The replacement run file is the crash-recovery authority. Seed it
-        # with live provider identity before the multi-file registry swap, so
-        # reconciliation can exact-session resume after a partial commit.
-        replacement.state = status.state
-        replacement.state_reason = status.detail
-        replacement.provider_session_id = status.session_id
-        replacement.provider_pid = status.pid
-        replacement.provider_generation = status.generation
-        replacement.active_turn_id = status.active_turn_id
-        replacement.transcript_path = status.transcript_path
         try:
-            self.store.replace(old.run_id, replacement, reset_status=False)
+            status = await old_adapter.replace(prompt, model, target_effort)
         except Exception as exc:
-            try:
-                self.store.get(replacement.run_id)
-            except RunNotFound:
-                pass
-            else:
-                self._route_adapter_generation(
-                    replacement.run_id,
-                    old_adapter,
-                    status.generation,
-                )
             await self._close_and_drain_adapter(
                 old.run_id,
                 old_adapter,
                 finalize="stop",
             )
             try:
-                current = self.store.get(old.run_id)
-                failure_state = (
-                    LifecycleState.DEAD
-                    if current.state is LifecycleState.DEAD
-                    else LifecycleState.BLOCKED
-                )
-                self.store.transition(
+                self.store.abort_replace(
                     old.run_id,
-                    failure_state,
-                    reason=f"replacement metadata commit failed: {exc}",
+                    replacement.run_id,
+                    reason=f"provider replacement failed: {exc}",
                     adapter_status=AdapterStatus(
-                        state=failure_state,
+                        state=LifecycleState.BLOCKED,
                         session_id=old.provider_session_id,
                         pid=None,
                         generation=old.provider_generation,
@@ -2485,6 +2484,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 pass
             await self._publish_agent_change(old.agent_id)
             raise
+        replacement = self.store.update_adapter_status(replacement.run_id, status)
         self._route_adapter_generation(
             replacement.run_id, old_adapter, status.generation
         )

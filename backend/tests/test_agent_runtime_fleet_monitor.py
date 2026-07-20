@@ -8,6 +8,7 @@ import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 from backend.app.agent_runtime.fake import FixtureAdapterFactory
 from backend.app.agent_runtime.fleet_monitor import FleetMonitor, Notification
@@ -541,6 +542,153 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
                 ],
                 [],
             )
+
+    async def test_replace_resets_only_after_old_provider_quiesces(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        for index, mtime_kind in enumerate(("coarse", "backward"), start=1):
+            agent_id = f"WIKI-189{5 + index}"
+            old = await self._spawn(agent_id, role="implement", orch="WIKI-ORCH")
+            adapter = self.supervisor.adapters[old.run_id]
+            stop_completed = asyncio.Event()
+            allow_stop_return = asyncio.Event()
+            reset_after_stop: list[bool] = []
+            original_stop = adapter.stop
+            original_reset = self.supervisor._reset_status_for_replacement  # noqa: SLF001
+
+            async def delayed_stop():
+                status = await original_stop()
+                stop_completed.set()
+                await allow_stop_return.wait()
+                return status
+
+            def checked_reset(agent: str) -> None:
+                reset_after_stop.append(stop_completed.is_set())
+                original_reset(agent)
+
+            mtime = (
+                int(datetime.fromisoformat(old.created_at).timestamp())
+                if mtime_kind == "coarse"
+                else time.time() - 3600
+            )
+            with (
+                mock.patch.object(adapter, "stop", side_effect=delayed_stop),
+                mock.patch.object(
+                    self.supervisor,
+                    "_reset_status_for_replacement",  # noqa: SLF001
+                    side_effect=checked_reset,
+                ),
+            ):
+                replacement_task = asyncio.create_task(
+                    self.supervisor.replace(old.run_id, f"replacement {agent_id}")
+                )
+                await asyncio.wait_for(stop_completed.wait(), timeout=2)
+                _write_status(
+                    self.store,
+                    agent_id,
+                    {
+                        "state": "merge-ready",
+                        "pr": f"old-concurrent-{agent_id}",
+                        "step": "old provider write",
+                        "blocker": None,
+                    },
+                    mtime=mtime,
+                )
+                gap_notes = await self.monitor.tick()
+                self.assertIn(
+                    f"old-concurrent-{agent_id}",
+                    "\n".join(note.message for note in gap_notes),
+                )
+                allow_stop_return.set()
+                replacement = await asyncio.wait_for(replacement_task, timeout=2)
+
+            self.assertEqual(reset_after_stop, [True])
+            self.assertEqual(
+                self.store.current_run_id(agent_id), replacement.run_id
+            )
+            self.assertFalse(self.store.status_path(agent_id).exists())
+            post_notes = await FleetMonitor(
+                self.store,
+                self.send,
+                clock=self.clock,
+                interval=0.01,
+                unrouted_verdict_realarm=300.0,
+                review_gap_threshold=300.0,
+                review_gap_realarm=600.0,
+                staleness_threshold=1800.0,
+            ).tick()
+            self.assertNotIn(
+                f"old-concurrent-{agent_id}",
+                "\n".join(note.message for note in post_notes),
+            )
+
+    async def test_earliest_replacement_status_is_current_and_emits_once(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        for index, mtime_kind in enumerate(("coarse", "backward"), start=1):
+            agent_id = f"WIKI-190{index}"
+            old = await self._spawn(agent_id, role="implement", orch="WIKI-ORCH")
+            adapter = self.supervisor.adapters[old.run_id]
+            wrote_status = asyncio.Event()
+            allow_start = asyncio.Event()
+            monitor = FleetMonitor(
+                self.store,
+                self.send,
+                clock=self.clock,
+                interval=0.01,
+                unrouted_verdict_realarm=300.0,
+                review_gap_threshold=300.0,
+                review_gap_realarm=600.0,
+                staleness_threshold=1800.0,
+            )
+            first_notes: list[Notification] = []
+            original_replace = adapter.replace
+
+            async def earliest_replace(
+                prompt: str,
+                model: str | None = None,
+                effort: str | None = None,
+            ):
+                _write_status(
+                    self.store,
+                    agent_id,
+                    {
+                        "state": "merge-ready",
+                        "pr": f"fresh-earliest-{agent_id}",
+                        "step": "fresh provider write",
+                        "blocker": None,
+                    },
+                    mtime=(
+                        int(time.time())
+                        if mtime_kind == "coarse"
+                        else time.time() - 3600
+                    ),
+                )
+                wrote_status.set()
+                first_notes.extend(await monitor.tick())
+                await allow_start.wait()
+                return await original_replace(prompt, model, effort)
+
+            with mock.patch.object(
+                adapter, "replace", side_effect=earliest_replace
+            ):
+                replacement_task = asyncio.create_task(
+                    self.supervisor.replace(old.run_id, f"replacement {agent_id}")
+                )
+                await asyncio.wait_for(wrote_status.wait(), timeout=2)
+                self.assertNotEqual(self.store.current_run_id(agent_id), old.run_id)
+                allow_start.set()
+                replacement = await asyncio.wait_for(replacement_task, timeout=2)
+
+            after_notes = await monitor.tick()
+            status_notes = [
+                note
+                for note in [*first_notes, *after_notes]
+                if note.event_type == "status-transition" and note.ticket == agent_id
+            ]
+            self.assertEqual(len(status_notes), 1, status_notes)
+            self.assertIn(
+                f"fresh-earliest-{agent_id}", status_notes[0].message
+            )
+            self.assertEqual(self.store.current_run_id(agent_id), replacement.run_id)
 
     async def test_post_spawn_coarse_mtime_status_is_accepted(self) -> None:
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)

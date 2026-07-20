@@ -2310,10 +2310,12 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual((await adapter.status()).state, LifecycleState.DEAD)
         replacement = attempted["replacement"]
-        self.assertNotEqual(replacement.state, LifecycleState.STARTING)
-        self.assertIsNotNone(replacement.provider_session_id)
-        self.assertGreater(replacement.provider_generation, 0)
-        self.assertIsNotNone(replacement.provider_pid)
+        # The replacement is published before its fresh provider session is
+        # started, so a commit failure cannot expose stale provider identity.
+        self.assertEqual(replacement.state, LifecycleState.STARTING)
+        self.assertIsNone(replacement.provider_session_id)
+        self.assertEqual(replacement.provider_generation, 0)
+        self.assertIsNone(replacement.provider_pid)
 
     async def test_provider_replace_failure_drains_event_and_keeps_old_identity(
         self,
