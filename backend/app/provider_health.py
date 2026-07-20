@@ -71,6 +71,18 @@ def _credential_fingerprint(path: Path) -> str | None:
         return None
 
 
+def credential_fingerprint(kind: str) -> str | None:
+    """Return the current provider credential fingerprint without exposing it."""
+
+    if kind == "cdx":
+        path = accounts.codex_auth_path()
+    elif kind == "cc":
+        path = claude_credentials_path()
+    else:
+        return None
+    return _credential_fingerprint(path)
+
+
 def _run_status_command(
     args: list[str], *, parse_json: bool = False, env: dict[str, str] | None = None
 ) -> bool | None:
@@ -85,17 +97,16 @@ def _run_status_command(
             timeout=PROBE_TIMEOUT_SECONDS,
             check=False,
             env=env,
-            text=True,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired, UnicodeError):
         return None
     if not parse_json:
         return result.returncode == 0
-    if result.returncode != 0 or not isinstance(result.stdout, str):
+    if result.returncode != 0 or not isinstance(result.stdout, bytes):
         return False
     try:
-        payload = json.loads(result.stdout)
-    except ValueError:
+        payload = json.loads(result.stdout.decode("utf-8"))
+    except (UnicodeError, ValueError):
         return None
     return payload.get("loggedIn") is True if isinstance(payload, dict) else None
 
@@ -281,7 +292,14 @@ class ProviderHealthTracker:
                     generation = self._generation[kind]
                     sticky = self._sticky[kind]
                     sticky_fingerprint = self._sticky_fingerprint[kind]
-                result = self._probe_fns[kind]()
+                try:
+                    result = self._probe_fns[kind]()
+                except Exception:
+                    result = ProviderHealth(
+                        status="unknown",
+                        checked_at=_now_iso(),
+                        reason_code="verification_unavailable",
+                    )
                 current_fingerprint = _credential_fingerprint(self._credential_path_fn(kind))
                 with self._lock:
                     if self._generation[kind] != generation:
@@ -323,7 +341,9 @@ class ProviderHealthTracker:
             min_interval_seconds=min_interval_seconds,
         )
 
-    def mark_authenticated(self, kind: str) -> bool:
+    def mark_authenticated(
+        self, kind: str, *, credential_fingerprint: str | None = None
+    ) -> bool:
         """Clear auth-dead only after a successful run with a new credential."""
 
         if kind not in self._state:
@@ -332,7 +352,12 @@ class ProviderHealthTracker:
             if not self._sticky[kind]:
                 return False
             current_fingerprint = _credential_fingerprint(self._credential_path_fn(kind))
-            if current_fingerprint is None or current_fingerprint == self._sticky_fingerprint[kind]:
+            if (
+                credential_fingerprint is None
+                or current_fingerprint is None
+                or credential_fingerprint != current_fingerprint
+                or credential_fingerprint == self._sticky_fingerprint[kind]
+            ):
                 return False
             self._generation[kind] += 1
             self._sticky[kind] = False

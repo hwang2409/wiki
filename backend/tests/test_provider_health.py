@@ -151,6 +151,13 @@ class ProbeTests(unittest.TestCase):
         result = provider_health._run_status_command([str(script)], parse_json=True)
         self.assertTrue(result)
 
+    def test_status_boundary_fails_closed_on_malformed_child_bytes(self) -> None:
+        script = self.root / "malformed-status-probe"
+        script.write_text("#!/bin/sh\nprintf '\\377'\n", encoding="utf-8")
+        script.chmod(0o755)
+        result = provider_health._run_status_command([str(script)], parse_json=True)
+        self.assertIsNone(result)
+
     def test_local_status_probe_uses_isolated_config_homes(self) -> None:
         _write_codex_auth(self.root)
         seen: dict[str, str] = {}
@@ -257,7 +264,14 @@ class TrackerTests(unittest.TestCase):
         )
         tracker.refresh(kinds=["cdx"])
         self.assertEqual(tracker.get("cdx").status, "unauthorized")
-        self.assertTrue(tracker.mark_authenticated("cdx"))
+        self.assertTrue(
+            tracker.mark_authenticated(
+                "cdx",
+                credential_fingerprint=provider_health._credential_fingerprint(
+                    self.codex_auth
+                ),
+            )
+        )
         self.assertEqual(tracker.get("cdx").status, "ok")
         self.assertIsNone(tracker.get("cdx").reason_code)
 
@@ -509,6 +523,83 @@ class MainWiringTests(unittest.TestCase):
         ):
             asyncio.run(exercise())
 
+    def test_lifespan_survives_malformed_probe_command_output(self) -> None:
+        bin_dir = Path(self._tmp.name) / "bin"
+        bin_dir.mkdir()
+        claude = bin_dir / "claude"
+        claude.write_text("#!/bin/sh\nprintf '\\377'\n", encoding="utf-8")
+        claude.chmod(0o755)
+        claude_creds = self._claude_creds
+        tracker = provider_health.ProviderHealthTracker(
+            probe_codex_fn=lambda: provider_health.ProviderHealth(status="unknown"),
+            probe_claude_fn=provider_health.probe_claude,
+            credential_path_fn=lambda kind: self._codex_auth
+            if kind == "cdx"
+            else claude_creds,
+        )
+        self._main.PROVIDER_HEALTH = tracker
+
+        async def wait_forever(*args: object, **kwargs: object) -> None:
+            await asyncio.Future()
+
+        async def fake_dispatcher() -> tuple[asyncio.Task, asyncio.Task, asyncio.Task]:
+            return tuple(
+                asyncio.create_task(wait_forever()) for _ in range(3)
+            )  # type: ignore[return-value]
+
+        async def exercise() -> None:
+            async with self._main.lifespan(self._main.app):
+                self.assertEqual(
+                    self._main.PROVIDER_HEALTH.get("cc").reason_code,
+                    "verification_unavailable",
+                )
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"},
+            ),
+            mock.patch.object(
+                self._main.provider_health,
+                "claude_credentials_path",
+                return_value=claude_creds,
+            ),
+            mock.patch.object(self._main, "_start_dispatcher", side_effect=fake_dispatcher),
+            mock.patch.object(self._main.knowledge, "background_index_loop", side_effect=wait_forever),
+            mock.patch.object(self._main.provider_health, "probe_loop", side_effect=wait_forever),
+            mock.patch.object(self._main.terminal.TERMINAL_MANAGER, "close_all"),
+        ):
+            asyncio.run(exercise())
+
+    def test_lifespan_ignores_unexpected_prime_probe_exception(self) -> None:
+        tracker = provider_health.ProviderHealthTracker()
+        self._main.PROVIDER_HEALTH = tracker
+
+        async def wait_forever(*args: object, **kwargs: object) -> None:
+            await asyncio.Future()
+
+        async def fake_dispatcher() -> tuple[asyncio.Task, asyncio.Task, asyncio.Task]:
+            return tuple(
+                asyncio.create_task(wait_forever()) for _ in range(3)
+            )  # type: ignore[return-value]
+
+        async def exercise() -> None:
+            async with self._main.lifespan(self._main.app):
+                self.assertIsNotNone(self._main.PROVIDER_HEALTH)
+
+        with (
+            mock.patch.object(
+                tracker,
+                "refresh_async",
+                side_effect=RuntimeError("fixture probe failure"),
+            ),
+            mock.patch.object(self._main, "_start_dispatcher", side_effect=fake_dispatcher),
+            mock.patch.object(self._main.knowledge, "background_index_loop", side_effect=wait_forever),
+            mock.patch.object(self._main.provider_health, "probe_loop", side_effect=wait_forever),
+            mock.patch.object(self._main.terminal.TERMINAL_MANAGER, "close_all"),
+        ):
+            asyncio.run(exercise())
+
     def test_successful_authenticated_event_clears_changed_credential(self) -> None:
         self._main.get_provider_health(refresh=True)
         self._main.PROVIDER_HEALTH.mark_unauthorized("cdx")
@@ -517,6 +608,7 @@ class MainWiringTests(unittest.TestCase):
             json.dumps({"tokens": {"refresh_token": "new"}}), encoding="utf-8"
         )
         os.utime(self._codex_auth, (original_mtime, original_mtime))
+        fingerprint = provider_health._credential_fingerprint(self._codex_auth)
         asyncio.run(
             self._main.publish_agent_event(
                 {
@@ -524,10 +616,34 @@ class MainWiringTests(unittest.TestCase):
                     "provider": "codex",
                     "credential_source": "current",
                     "success": True,
+                    "credential_fingerprint": fingerprint,
                 }
             )
         )
         self.assertEqual(self._main.PROVIDER_HEALTH.get("cdx").status, "ok")
+
+    def test_old_turn_fingerprint_cannot_clear_new_credential(self) -> None:
+        self._main.get_provider_health(refresh=True)
+        self._main.PROVIDER_HEALTH.mark_unauthorized("cdx")
+        old_fingerprint = provider_health._credential_fingerprint(self._codex_auth)
+        self._codex_auth.write_text(
+            json.dumps({"tokens": {"refresh_token": "new"}}), encoding="utf-8"
+        )
+        asyncio.run(
+            self._main.publish_agent_event(
+                {
+                    "type": "codex_auth_verified",
+                    "provider": "codex",
+                    "credential_source": "current",
+                    "success": True,
+                    "credential_fingerprint": old_fingerprint,
+                }
+            )
+        )
+        self.assertEqual(self._main.PROVIDER_HEALTH.get("cdx").status, "unauthorized")
+        self.assertEqual(
+            self._main.PROVIDER_HEALTH.get("cdx").reason_code, "auth_dead"
+        )
 
     def test_codex_auth_dead_event_marks_cdx_unauthorized(self) -> None:
         self._main.get_provider_health(refresh=True)

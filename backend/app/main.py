@@ -91,7 +91,12 @@ async def lifespan(_app: FastAPI):
         backend_runtime.publish_backend_url(configured_backend)
     terminal.refresh_boot_token()
     # Prime the tracker so the first /api/providers/health request is populated.
-    await PROVIDER_HEALTH.refresh_async()
+    try:
+        await PROVIDER_HEALTH.refresh_async()
+    except Exception:
+        # Health is optional; a broken provider CLI or probe must not prevent
+        # the backend from starting.
+        pass
     dispatcher_task, watchdog_task, token_task = await _start_dispatcher()
     knowledge_task = asyncio.create_task(
         knowledge.background_index_loop(
@@ -3320,7 +3325,11 @@ def _consume_provider_health_signal(event: dict) -> None:
         and event.get("credential_source") == "current"
         and event.get("success") is True
     ):
-        PROVIDER_HEALTH.mark_authenticated("cdx")
+        fingerprint = event.get("credential_fingerprint")
+        if isinstance(fingerprint, str):
+            PROVIDER_HEALTH.mark_authenticated(
+                "cdx", credential_fingerprint=fingerprint
+            )
         return
     if (
         event.get("type") != "codex_auth_dead_exhausted"
