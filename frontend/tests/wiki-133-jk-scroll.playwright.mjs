@@ -188,10 +188,24 @@ async function main() {
       "composer",
     );
 
-    const composer = page.locator(".session-composer textarea");
+    const paneTwo = page.locator(".pane-frame[data-pane-key='pane-2']");
+    await paneTwo.focus();
+    await page.waitForFunction(() => {
+      const frame = document.querySelector(".pane-frame[data-pane-key='pane-2']");
+      return frame instanceof HTMLElement &&
+        frame.classList.contains("is-focused") &&
+        document.activeElement === frame;
+    });
+
+    const composer = paneTwo.locator(".session-composer textarea");
     await composer.focus();
-    await page.waitForFunction(() =>
-      document.querySelector(".pane-frame.is-focused")?.getAttribute("data-pane-key") === "pane-2",
+    assert(
+      await page.evaluate(() => {
+        const frame = document.querySelector(".pane-frame[data-pane-key='pane-2']");
+        const textarea = frame?.querySelector(".session-composer textarea");
+        return textarea instanceof HTMLTextAreaElement && document.activeElement === textarea;
+      }),
+      "composer did not receive focus before leader chord",
     );
     await page.keyboard.press("Control+a");
     await page.keyboard.press("j");
