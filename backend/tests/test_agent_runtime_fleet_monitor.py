@@ -4,7 +4,9 @@ import asyncio
 import json
 import os
 import tempfile
+import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 from backend.app.agent_runtime.fake import FixtureAdapterFactory
@@ -82,6 +84,13 @@ def _write_status(store: RunStore, agent_id: str, payload: dict, mtime: float | 
     path.write_text(json.dumps(payload), encoding="utf-8")
     if mtime is not None:
         os.utime(path, (mtime, mtime))
+
+
+def _set_created_at(store: RunStore, record, timestamp: float) -> None:
+    record.created_at = datetime.fromtimestamp(
+        timestamp, tz=timezone.utc
+    ).isoformat()
+    store._write_record(record)
 
 
 class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
@@ -406,6 +415,43 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("working -> idle", emitted[1].message)
         self.assertIn("idle -> working", emitted[2].message)
 
+    async def test_stale_status_file_is_ignored_until_fresh_run_rewrite(self) -> None:
+        stale_payload = {
+            "state": "merge-ready",
+            "pr": "old-pr",
+            "step": "old step",
+            "blocker": None,
+        }
+        _write_status(
+            self.store,
+            "WIKI-1890",
+            stale_payload,
+            mtime=time.time() - 3600,
+        )
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        await self._spawn("WIKI-1890", role="implement", orch="WIKI-ORCH")
+
+        first = await self.monitor.tick()
+        self.assertEqual(
+            [note for note in first if note.event_type == "status-transition"],
+            [],
+        )
+        self.assertNotIn("old-pr", "\n".join(note.message for note in first))
+
+        _write_status(
+            self.store,
+            "WIKI-1890",
+            stale_payload,
+            mtime=time.time() + 1,
+        )
+        second = await self.monitor.tick()
+        status = [
+            note for note in second if note.event_type == "status-transition"
+        ]
+        self.assertEqual(len(status), 1)
+        self.assertIn("none -> merge-ready", status[0].message)
+        self.assertIn("old-pr", status[0].message)
+
     async def test_archive_respawn_same_id_resets_run_dedupe_state(self) -> None:
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
         first = await self._spawn("WIKI-1800", role="implement", orch="WIKI-ORCH")
@@ -483,9 +529,12 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_wall_clock_jump_does_not_trigger_elapsed_review_gap(self) -> None:
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
-        await self._spawn("WIKI-1500", role="implement", orch="WIKI-ORCH")
+        worker = await self._spawn(
+            "WIKI-1500", role="implement", orch="WIKI-ORCH"
+        )
         wall_clock = _Clock(self.clock.now)
         monotonic_clock = _Clock(5_000.0)
+        _set_created_at(self.store, worker, wall_clock.now - 1)
         _write_status(
             self.store,
             "WIKI-1500",
@@ -691,10 +740,11 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_staleness_alarm_after_30_min_silent(self) -> None:
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
-        await self._spawn("WIKI-800", role="implement", orch="WIKI-ORCH")
+        worker = await self._spawn("WIKI-800", role="implement", orch="WIKI-ORCH")
 
         # Write status ~35 minutes ago. clock starts at 1_000_000.
         stale_mtime = self.clock.now - 2100
+        _set_created_at(self.store, worker, stale_mtime - 1)
         _write_status(
             self.store,
             "WIKI-800",
