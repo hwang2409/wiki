@@ -186,6 +186,10 @@ class RowBuildingTests(unittest.TestCase):
             "TEST-1": {"current": {"role": "implement", "kind": "cc"}},
             "WIKI-85-DEMO-CC": {"current": {"role": "implement", "kind": "cc"}},
             "WIKI-85-VERIFY": {"current": {"role": "implement", "kind": "cc"}},
+            "MITMWEB-B2-REVIEW20C": {"current": {"role": "implement", "kind": "cc"}},
+            "MITMWEB-B2-REVIEW5B": {"current": {"role": "implement", "kind": "cc"}},
+            "MITMWEB-F1-REVIEW4B": {"current": {"role": "implement", "kind": "cc"}},
+            "REVIEW-10983": {"current": {"role": "implement", "kind": "cc"}},
         }
 
         rows = dashboard.live_worker_rows(registry, {})
@@ -195,14 +199,15 @@ class RowBuildingTests(unittest.TestCase):
             {"WIKI-IMPLEMENT", "WIKI-LEGACY"},
         )
 
-    def test_missing_role_fallback_is_anchored_and_covers_one_shot_suffixes(self) -> None:
+    def test_missing_role_fallback_uses_anchored_one_shot_tokens(self) -> None:
         included = [
-            "WIKI-REVIEWING",
+            "WIKI-ORDINARY",
             "WIKI-123-ORDINARY",
         ]
         excluded = [
             "WIKI-REVIEW",
             "WIKI-REVIEW1",
+            "WIKI-REVIEWING",
             "WIKI-SIM",
             "WIKI-SIM1",
             "WIKI-EVAL",
@@ -352,6 +357,10 @@ class RowBuildingTests(unittest.TestCase):
             "WIKI-54-DEMO",
             "WIKI-85-DEMO-CC",
             "WIKI-85-VERIFY",
+            "MITMWEB-B2-REVIEW20C",
+            "MITMWEB-B2-REVIEW5B",
+            "MITMWEB-F1-REVIEW4B",
+            "REVIEW-10983",
             "TEST-1",
         ):
             self.assertFalse(dashboard._is_dashboard_worker(ticket, "implement"))
@@ -753,6 +762,18 @@ class DashboardEndpointTests(unittest.TestCase):
                     "WIKI-85-VERIFY": {
                         "current": {"role": "implement", "kind": "cc"}
                     },
+                    "MITMWEB-B2-REVIEW20C": {
+                        "current": {"role": "implement", "kind": "cc"}
+                    },
+                    "MITMWEB-B2-REVIEW5B": {
+                        "current": {"role": "implement", "kind": "cc"}
+                    },
+                    "MITMWEB-F1-REVIEW4B": {
+                        "current": {"role": "implement", "kind": "cc"}
+                    },
+                    "REVIEW-10983": {
+                        "current": {"role": "implement", "kind": "cc"}
+                    },
                 }
             ),
             encoding="utf-8",
@@ -763,6 +784,10 @@ class DashboardEndpointTests(unittest.TestCase):
             "WIKI-54-DEMO",
             "WIKI-85-DEMO-CC",
             "WIKI-85-VERIFY",
+            "MITMWEB-B2-REVIEW20C",
+            "MITMWEB-B2-REVIEW5B",
+            "MITMWEB-F1-REVIEW4B",
+            "REVIEW-10983",
             "TEST-1",
         ):
             session = self.archive / ticket / "20260719-120000"

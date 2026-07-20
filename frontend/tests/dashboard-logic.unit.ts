@@ -48,7 +48,7 @@ test("compareTickets flips sign for descending on distinct values", () => {
   assert.ok(compareTickets(a, b, "date", false) > 0);
 });
 
-test("frontend sorting preserves every row accepted by the backend filter", () => {
+test("sorting supports implementation and legacy rows", () => {
   const rows = [
     ticket({ ticket: "WIKI-IMPLEMENT", role: "implement", live: true }),
     ticket({ ticket: "WIKI-LEGACY", role: null, live: false }),
@@ -59,7 +59,7 @@ test("frontend sorting preserves every row accepted by the backend filter", () =
   assert.deepEqual(
     sorted.map((row) => row.ticket),
     ["WIKI-IMPLEMENT", "WIKI-LEGACY"],
-    "the frontend must not apply a second role or suffix filter"
+    "rows remain sorted by their ticket names"
   );
 });
 

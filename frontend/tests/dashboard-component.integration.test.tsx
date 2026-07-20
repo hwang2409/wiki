@@ -65,25 +65,12 @@ test("unmount aborts inflight fetch", async () => {
   expect(abortSpy).toHaveBeenCalled();
 });
 
-test("renders endpoint rows and count after live/archive one-shot filtering", async () => {
-  const endpointFixture = {
-    live: [
-      ticket({ ticket: "WIKI-135", role: "implement", live: true }),
-      ticket({ ticket: "PHO-13944-SIM2", role: "implement", live: true }),
-    ],
-    archived: [
-      ticket({ ticket: "WIKI-LEGACY", role: null, live: false }),
-      ticket({ ticket: "PHO-13944-SIM", role: "implement", live: false }),
-      ticket({ ticket: "PHO-12880-DEMO", role: "implement", live: false }),
-      ticket({ ticket: "WIKI-54-DEMO", role: "implement", live: false }),
-      ticket({ ticket: "TEST-1", role: "implement", live: false }),
-    ],
-  };
+test("renders endpoint rows and their count", async () => {
   const fetchFn = vi.fn(async (): Promise<DashboardTicketsPayload> => ({
-    // This is the endpoint response after backend row assembly. The source
-    // fixture above includes the real live and archived one-shot names that
-    // must not reach this payload.
-    tickets: [endpointFixture.live[0], endpointFixture.archived[0]],
+    tickets: [
+      ticket({ ticket: "WIKI-135", role: "implement", live: true }),
+      ticket({ ticket: "WIKI-LEGACY", role: null, live: false }),
+    ],
     repo_allowlist: [],
   }));
 

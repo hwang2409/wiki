@@ -36,12 +36,9 @@ DEPLOY_ENVIRONMENT_BY_REPO: dict[str, str] = {
 }
 CACHE_TTL_SECONDS = 300
 GH_MAX_WORKERS = 3
-ONE_SHOT_TICKET_SUFFIX = re.compile(
-    r"-(?:REVIEW|SIM|EVAL|AUDIT|CANARY|THERMO|DEMO|TEST|VERIFY)\d*(?:-[A-Z0-9]+)*$",
+ONE_SHOT_TICKET_TOKEN = re.compile(
+    r"^(?:REVIEW|SIM|EVAL|AUDIT|CANARY|THERMO|DEMO|TEST|VERIFY)[0-9]*[A-Z]*$",
     re.IGNORECASE,
-)
-STANDALONE_ONE_SHOT_TICKET = re.compile(
-    r"(?:TEST|DEMO)(?:-\d+)?(?:-[A-Z0-9]+)*$", re.IGNORECASE
 )
 
 REVIEW_THREAD_COUNT_QUERY = """
@@ -286,9 +283,7 @@ def _is_dashboard_worker(ticket: str, role: Any) -> bool:
     archive records may not have a role; retain those unless their ticket uses
     a known one-shot worker name.
     """
-    if ONE_SHOT_TICKET_SUFFIX.search(ticket) or STANDALONE_ONE_SHOT_TICKET.fullmatch(
-        ticket
-    ):
+    if any(ONE_SHOT_TICKET_TOKEN.fullmatch(token) for token in ticket.split("-")):
         return False
     if role == "implement":
         return True
