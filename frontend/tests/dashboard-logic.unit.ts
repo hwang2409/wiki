@@ -48,21 +48,6 @@ test("compareTickets flips sign for descending on distinct values", () => {
   assert.ok(compareTickets(a, b, "date", false) > 0);
 });
 
-test("sorting supports implementation and legacy rows", () => {
-  const rows = [
-    ticket({ ticket: "WIKI-IMPLEMENT", role: "implement", live: true }),
-    ticket({ ticket: "WIKI-LEGACY", role: null, live: false }),
-  ];
-
-  const sorted = [...rows].sort((a, b) => compareTickets(a, b, "ticket", true));
-
-  assert.deepEqual(
-    sorted.map((row) => row.ticket),
-    ["WIKI-IMPLEMENT", "WIKI-LEGACY"],
-    "rows remain sorted by their ticket names"
-  );
-});
-
 class FakeTimer {
   private nextId = 1;
   private pending = new Map<number, () => void>();

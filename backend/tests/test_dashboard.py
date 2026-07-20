@@ -203,11 +203,16 @@ class RowBuildingTests(unittest.TestCase):
         included = [
             "WIKI-ORDINARY",
             "WIKI-123-ORDINARY",
+            "WIKI-REVIEWING",
+            "WIKI-TESTING",
+            "WIKI-SIMULATION",
+            "WIKI-EVALUATION",
+            "WIKI-AUDITOR",
+            "WIKI-DEMOGRAPHIC",
         ]
         excluded = [
             "WIKI-REVIEW",
             "WIKI-REVIEW1",
-            "WIKI-REVIEWING",
             "WIKI-SIM",
             "WIKI-SIM1",
             "WIKI-EVAL",
