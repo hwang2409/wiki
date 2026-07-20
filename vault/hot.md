@@ -2,7 +2,7 @@
 type: reference
 tags: [hot]
 created: 2026-07-06
-updated: 2026-07-17
+updated: 2026-07-18
 ---
 
 # Hot Context
@@ -16,10 +16,7 @@ Rolling ≤500-word session cache. Rewrite (don't append) at work-arc boundaries
 - **CLAUDE-FABLE-5 OFF-PLAN 2026-07-17**: fable-5 no longer covered on Henry's plan — every spawn blocks "Usage credits are required for this model." Requires paid credits, never use as default. Default cc model = claude opus-4.7 (or route implement work through cdx/luna). Only pick fable-5 if Henry explicitly asks and accepts credit charge. Applies to future workers too (e.g. F4 restyle).
 - **Misc clone arc** (2026-07-16): pufferclone v1+v2 (PUF-8..12, main@6bc5d64), `tix` (TIX-1), `gauge` TSDB v0 (GAU-1..5, master@9d32f0b). Next clone candidates in [[local-cloud]]: Temporal-lite vs LSM KV — Henry pending. Unticketed: cargo install tix/puf/gauge, tix vault migration, PUF-13 NVMe tier.
 - **Wiki 2026-07-17 double merge**: WIKI-132 (ticket/PR dashboard, #105@6c52a60 squash, 5 rounds) + WIKI-133 (j/k scroll, #104@643628b squash, 3 rounds). 132 had rebase-on-main mid-loop after 133 landed. Dashboard = `/api/dashboard/tickets` merging supervisor registry + status files + archives + phoebe-allowlist gh-PR-cache w/ prod-deploy compare; 15s poll; component-integration tests via @testing-library/react (dev dep added). Sidecar rebuild debt: #103 backend changes not in deployed sidecar; NOW also #105 backend + frontend not deployed — fold into next swap (staged flow: FORCE_STAGE_ONLY=1, SIGTERM supervisor, swap-native-app.sh, relaunch). Open: daemon-ize backend, WIKI-126 rebrand blocked on name, compact-mermaid-preview unfiled, WIKI-92/109/94 flake candidates.
-- **Phoebe** (phoebe orch): admin security doctrine complete (PHO-13950 #11594 + PHO-13957 #11637 merged — sandbox-only agent code). PHO-13944-PR2 #11630 merged at 0e40d33efc; classifier edge cases deferred to PHO-14034. Live: PHO-12880 #11548 (CI blocked by GH incident), PHO-13979, PHO-13980 #11656. Parked drafts: #11383 scratchpad (resume before merge-driving), #11475 tpuf scoping (awaiting Henry). Roadmap: PHO-13940 org context graph next big arc. Flakes: PHO-13860.
-
-## Recent facts
-
+- **Phoebe** (phoebe orch, RCA-driven ops 07-18/19 — 5 merges): 07-19: PHO-14060 exception-noise cleanup MERGED (#11763 squash 236463b2, 1 clean sol round — wellsky api_host_forbidden + rollback-observability skips no longer log exc_info, kills ~2.5k fake exceptions/day). PHO-14061 agent-correctable admin tool validation errors MERGED (#11764 squash b9371707, 4 sol rounds — boundary ValidationError->corrective field messages, provider schema honesty for Any/null, fields-set presence). 07-18: PHO-14053 wellsky clock-out (#11747 0fae1222, 4 rounds), PHO-14047 DRI auto-join (#11745 946ba0c9), PHO-14046 retry observability (#11744 a72d5435). RECURRING: logfire 30-min sweep loop ARMED (session cron e720f044, 11,41 * * * *, auto-RCA + spawn-if-urgent, known-noise baseline in prompt). OPEN GATES (Henry): PROD DEPLOY GAP — last deploy 07-18 19:09Z @ 946ba0c9; #11747/#11763/#11764 + others undeployed, deploys manual/scheduled not merge-triggered. Avondale HHAX -9 GetPatientDeclinedCaregivers CS escalation (client sync dead since 07-14; optional code fix unticketed). Green Tree voicemail-transfer = CS config (ivr+post_dial_digits recipe, org on nonFixedVoip/Sinch; no code). Sign-in circular-JSON RCA parked (posthog empty, sentry CLI unauthed). PHO-14023 gallery pick, PHO-14029 prod dedupe apply, checkout disposition all still pending. rca skill at .claude/skills/rca/SKILL.md (uncommitted, works well). Fleet doctrine addition: fold adjacent cases into open PR (no dud PRs); quiet parked merge-ready re-alarms by clearing watchlist row.
 - mitm-inspector requires Python 3.12 — sequencer intentionally rejects 3.13; `uv sync --python 3.12` in every new worktree (uv defaults to 3.13).
 - mitm merge flow: local repo, no remote/PR — merge --no-ff into main, gates on merged main, remove worktrees, delete branch.
 - Reviewer state field unreliable — verdict step text authoritative, always.

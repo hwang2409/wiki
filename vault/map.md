@@ -39,6 +39,7 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[admin-agent-audit-2026-07-14]] — Full 15-domain e2e audit of admin agent @ origin/main af8173bbfb: 134 tools, 63 endpoints, maturity assessment, ranked gaps/risks (5 HIGH), half-finished arcs.
 - [[recommendation-subagents]] — recommendation-subagents campaign (June–July 2026): changes, eval numbers, overfit arc.
 - [[pr10475-parity-loop]] — PR-10475 parity iteration protocol: OFF frozen, no eval overfit, 6-step loop until ON hits OFF-vs-OFF noise floor
+- [[datasource-sync-auto-disable]] — axiscare sync auto-disable: self-heals via 10:10Z daily forced sync; retry logs blind to status on result-based retries
 
 ## Phoebe/til
 
@@ -78,6 +79,7 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 ## Families (path patterns, not enumerated)
 
 - `log/YYYY-MM-DD.md` — daily end-of-day changelogs, cross-project.
+- `log/weekly-YYYY-MM-DD.md` — weekly shipped-work summaries (date = week end, Sunday); merged PRs by theme per repo.
 - `<topic>/decisions/` — locked decisions + rationale.
 - `<topic>/til/` — gotchas, tool quirks (greppable exact strings).
 - `<topic>/features/` — feature breakdowns.

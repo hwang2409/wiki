@@ -3,7 +3,7 @@ type: reference
 view: kanban
 tags: [todo]
 created: 2026-07-06
-updated: 2026-07-16
+updated: 2026-07-20
 ---
 
 Todo:
@@ -16,6 +16,8 @@ Todo:
 - [P2] PHO-13826/27/28 exe.dev sandbox arc: enable (SSH key secret + smoke) -> ownership fix -> TTL sweeper; PHO-13829 egress design backlog. Surface merged since PHO-13073/#10608, dormant on missing key
 - [P3] wiki backend /metrics endpoint (gauge follow-up)
 - [P3] pufferclone /metrics endpoint (gauge follow-up)
+- MITMWEB-F4: full restyle of mitm-inspector web UI for clarity — adopt theme/layout language of ~/me/fun/wiki frontend; spawn fable worker after I1 integration merges — owner (misc)
+- Slack admin agent access for Corey Grissom — confirm with Corey his @phoebe.work email + provisioning plan, then either (a) have him sign into app.phoebe.work with @phoebe.work Google Workspace so Kratos provisions the user row + flip admin=true, or (b) one-time hotfix INSERT app.users row + backfill org_slack_user_mappings.user_id for slack_user_id U0AGES89BLZ (2 org rows: Phoebe Home Care + Orchard St. Homecare, both currently user_id=null). Root cause: no app.users row exists at all — his Slack identity is known but unmapped. Full diagnostic + proposed SQL in phoebe session 2026-07-17.
 
 In Progress:
 
@@ -30,6 +32,7 @@ In Progress:
 - [P2] PHO-13832 shift classification + calendar artifact (admin agent) — worker live
 - [P2] PHO-13826 ModalSandboxBackend + PHO-13827 sandbox ownership — workers live (Modal replaces exe.dev for v0; 13828 lifecycle + 13829 egress design queued)
 - mitmweb rebuild: scope and build a clearer live proxy-traffic inspector — owner (misc)
+- WIKI-135 dashboard: implementation workers only (drop reviewers/one-shots) — owner cdx:WIKI-135 (luna)
 
 Backlog:
 

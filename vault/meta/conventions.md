@@ -2,7 +2,7 @@
 type: reference
 tags: [meta]
 created: 2026-07-06
-updated: 2026-07-06
+updated: 2026-07-20
 ---
 
 # Vault Conventions
@@ -25,6 +25,7 @@ Shared memory for Henry's agents (Claude Code, Codex, others); sometimes read by
 | Family | Path | Content |
 |---|---|---|
 | Daily log | `log/YYYY-MM-DD.md` | End-of-day changelog, sections per project |
+| Weekly log | `log/weekly-YYYY-MM-DD.md` | Weekly shipped-work summary (date = week end, Sunday); merged PRs grouped by theme, per repo |
 | Decisions | `<topic>/decisions/<slug>.md` | Choice + rationale + rejected alternatives |
 | TILs | `<topic>/til/<slug>.md` | Gotchas, tool quirks |
 | Features | `<topic>/features/<slug>.md` | How a feature works |

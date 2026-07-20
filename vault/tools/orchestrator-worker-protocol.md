@@ -2,24 +2,47 @@
 type: reference
 tags: [tools, agents, tmux]
 created: 2026-07-07
-updated: 2026-07-14
+updated: 2026-07-17
 ---
 
 # Orchestrator ↔ Worker Protocol (file/tmux schema)
 
 Machine-readable contract between the mastermind orchestrator session and tmux worker sessions. Canonical behavior lives in the `tmux-ticket-codex` / `tmux-ticket-claude` skills (synced via github.com/hwang2409/agent-config); this note is the SCHEMA — what exists on disk/tmux and who reads/writes it. Written for a future "agents" page in the wiki app to render live state from these files.
 
-## Default role→model pipeline (Henry 2026-07-14)
+## Default role→model pipeline (Henry 2026-07-17)
 
 Unless a ticket or Henry specifies otherwise:
 
 | Role | Runtime | Model |
 |---|---|---|
-| Orchestrator | cc | claude-fable-5 ("Fable") |
+| Orchestrator | cc | claude opus-4.7 |
 | Implement worker | cdx | gpt-5.6-luna |
 | Review worker | cdx | gpt-5.6-sol |
 
-Flow: Fable spawns luna implementer → worker signals merge-ready → Fable spawns sol reviewer as the gate's deep-review step (one reviewer per round: archive the reviewer `closed` as soon as its verdict is routed, then spawn a fresh `<TICKET>-REVIEW<n>` pinned at the new head SHA next round — every SHA gets fresh eyes and idle reviewers don't burn soft-cap slots; Henry 2026-07-15) → sol's severity-tagged findings return to Fable → Fable structures them into a steer to the luna implementer (observed → why wrong → do instead → constraint, one item per finding) → loop until sol returns MERGE-READY clean → merge per repo authority. Sol never steers luna directly; all routing goes through the orchestrator. Iteration cap and Henry-interrupt rules follow the gate-loop section below. Explicit `--model`/`--effort` overrides remain allowed per ticket.
+**claude-fable-5 is OFF-PLAN (Henry 2026-07-17)** — requires paid Anthropic credits, spawns immediately blocked "Usage credits are required for this model." Never use as default for orchestrator or workers. Only pick fable-5 if Henry explicitly asks and accepts the credit charge.
+
+Flow: orchestrator spawns luna implementer → worker signals merge-ready → orchestrator spawns sol reviewer as the gate's deep-review step (one reviewer per round: archive the reviewer `closed` as soon as its verdict is routed, then spawn a fresh `<TICKET>-REVIEW<n>` pinned at the new head SHA next round — every SHA gets fresh eyes and idle reviewers don't burn soft-cap slots; Henry 2026-07-15) → sol's severity-tagged findings return to orchestrator → orchestrator structures them into a steer to the luna implementer (observed → why wrong → do instead → constraint, one item per finding) → loop until sol returns MERGE-READY clean → merge per repo authority. Sol never steers luna directly; all routing goes through the orchestrator. Iteration cap and Henry-interrupt rules follow the gate-loop section below. Explicit `--model`/`--effort` overrides remain allowed per ticket.
+
+**Immediate-archive rule applies to ALL one-shot verification workers, not just reviewers (Henry 2026-07-17b).** Sim runners (`-SIM<n>`), eval runners (`-EVAL<n>`), auditors (`-AUDIT<n>`), canary runs (`-CANARY<n>`), thermo-nuclear reviews (`-THERMO<n>`), and any other "produce one report → done" worker follows the same rule: the moment their output is routed (steered to the implementer OR clean-pass surfaced), the very next tool call is `archive_agent` on that worker with `outcome=closed`. Leaving them idle-merge-ready burns a soft-cap slot and (for reviewers) triggers unrouted-verdict re-alarms every 5 min. Applied case 2026-07-17b: PHO-13944-SIM4 findings routed to PHO-13944-PR2 but sim worker not archived; Henry corrected — rule widened from reviewers-only to every one-shot verification worker.
+
+## Autonomy invariant (Henry 2026-07-17)
+
+**The orchestrator is autonomous. The only human checkpoint is merge authorization.** Every intermediate step — spawn, steer, respawn, sim, review, eval, audit, thermo, rerun — is orchestrator action, taken without confirming with Henry.
+
+If a spawned worker (sim, review, audit, eval, canary, thermo) returns a NO-GO / findings / regression, the very next tool call is a `steer_agent` on the implementer (or a fresh `spawn_agent` if the implementer was archived) with the findings structured as fix items. **Never a status message to Henry.** Reporting the finding to Henry and waiting for him to say "steer them to fix this" is the exact violation this invariant was created to stop.
+
+Applied loop (2026-07-17 PHO-13944-PR2 case):
+- PHO-13944-SIM3 returned NO-GO with 3 defects (output-cap truncation, intra-pass semantic dedupe, input-token overshoot).
+- WRONG: report "sim3 no-go" to Henry, wait for direction.
+- RIGHT: respawn PHO-13944-PR2 implementer with the sim findings as a structured fix steer (observed → why wrong → do instead → constraint), let it push fixes, spawn PHO-13944-SIM4 on the new head SHA, loop.
+
+Only stop the loop for:
+1. Merge authorization (surface: "PR #N clean, ready for your merge auth"). NEVER self-merge.
+2. Product/scope/security decision only Henry can own.
+3. Iteration cap (3+ consecutive review rounds with no net progress).
+4. Blocker the worker literally cannot resolve (missing credential, external outage, external decision).
+
+Sim/eval/audit outputs are DRIVERS, not FYIs. Reading the report is the middle of the loop; steering the implementer is the next step. See `~/.claude/skills/mastermind-merge-ready-loop/SKILL.md` §"Autonomy invariant" for the loop-skill mirror of this rule.
 
 ## Identity
 
@@ -61,6 +84,8 @@ Flow: Fable spawns luna implementer → worker signals merge-ready → Fable spa
 
 Monitors = persistent background shell loops (Claude Code Monitor tool), one per worker, ~180s poll; each stdout line becomes an orchestrator notification. Dedupe per event type or they spam.
 
+**Monitors are the PRIMARY wake signal.** `ScheduleWakeup`/cron ticks are a fallback heartbeat only (idle at 1200–1800s) — never the path a merge-ready/blocked transition travels. Orchestrator that drives iteration cadence off timed ticks instead of state-transition monitors is broken by construction: it misses fast transitions, burns tokens, and drifts against the "watchlist file + re-alarms" doctrine (`hot.md`). If you catch yourself scheduling a short wakeup to re-check `merge-ready`, stop — arm the Monitor instead.
+
 **Monitor construction rules (MANDATORY — a merge-ready sat undetected 21min on 2026-07-15 because of rule 1):**
 
 1. **Extract fields, never truncate raw JSON.** `wiki agent status` serializes keys alphabetically — `state`/`step`/`status_age_seconds` land PAST character 400. Any `cut -c1-N` / `head -c` on the raw JSON silently blinds the monitor to state transitions while early fields (`blocker`, `pr`) still produce events, so the monitor LOOKS alive. Always parse: `python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('state'),'|',d.get('step'),'|',d.get('pr'),'|',d.get('blocker'))"`.
@@ -75,6 +100,8 @@ Monitors = persistent background shell loops (Claude Code Monitor tool), one per
 `tmux send-keys -t <window_id> -l "<msg>"` then `sleep 0.5` then `send-keys Enter`, then VERIFY submitted (~2s later, capture pane; text still in composer ⇒ bare Enter again). The 0.5s is load-bearing: composers paste-detect rapid bursts and treat same-cycle Enter as a newline. Steer shape: observed → why wrong → do instead → constraint.
 
 **Fleet monitoring discipline (Henry 2026-07-16): one persistent watchlist-driven monitor, never rebuilt.** Per-spawn monitor rebuilds re-emit current states as fake events, training the orchestrator to dismiss real transitions — that is how stale workers get missed. Instead: the monitor reads its ticket set from a watchlist file (`/tmp/agent-status/.<orch>-watchlist`) each cycle; spawns/archives update the FILE only. Required detectors: (1) state transitions + blockers; (2) unrouted-verdict re-alarm — a live reviewer whose step contains a MERGE-READY/NOT-MERGE-READY verdict re-alarms every 5 min until archived, so deferred routing self-corrects; (3) review-gap alarm — implement worker at merge-ready >5 min with no live reviewer for its ticket, re-alarm q10m; (4) staleness probe — state=working with status file silent 30+ min → verify runtime via read_agent. Verdict routing preempts all other orchestration work in a turn.
+
+**Spawn discipline — every worker MUST be on the watchlist before the spawn is "done" (Henry 2026-07-17).** Every `spawn_agent` / `replace_agent` call must be followed, in the same tool batch and before surfacing to Henry, by an append to `/tmp/agent-status/.<orch>-watchlist`. Every `archive_agent` must be followed by removing the line. This applies to implementers AND reviewers — a `-REVIEW<n>` sibling is a first-class watchlist row and drives the unrouted-verdict + review-gap detectors. A worker that isn't on the watchlist is invisible to the fleet monitor; silence looks identical to "still working" and the loop stalls silently. Applied case 2026-07-17: PHO-14003 + PHO-13944-SIM3 spawned without watchlist adds → fleet ran without state-change detection until Henry asked "did you set up monitors?" — codified here so future spawns can't skip it.
 
 **Steer mode discipline (Henry 2026-07-16): default `mode: now`.** `on-idle` queues the message until the worker’s current turn ends — for a worker mid-suite or mid-implementation that can be an hour later, which defeats the point of steering. Use `now` for anything meant to influence work in progress (policy changes, review findings, stop-doing-X, rebase-before-push). Reserve `on-idle` ONLY for messages that are genuinely next-task input and harmless if delayed. If a message was mistakenly queued on-idle, resend as `now` with a "supersedes the queued copy" note so the duplicate is ignored.
 

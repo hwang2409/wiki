@@ -2,13 +2,31 @@
 type: log
 tags: [log, done]
 created: 2026-07-06
-updated: 2026-07-18
+updated: 2026-07-20
 ---
 
 # Done
 
+## 2026-07-20
+
+- WIKI-136 dashboard j/k scrolling (#108 squash c3c3278, 1 review round + post-merge sync, patch-id verified)
+- WIKI-134 C-a leader keybind regression fixed (#107 squash 1283ed0, 2 review rounds)
+- PHO-14067 churned-org DRI staleness filter merged (#11795 squash 4aa28e53, 1 sol round clean)
+
+## 2026-07-19
+
+- PHO-14061 agent-correctable admin tool validation errors merged (#11764 squash b9371707, 4 sol review rounds)
+- PHO-14060 exception-noise cleanup merged (#11763 squash 236463b2, 1 sol round clean)
+
 ## 2026-07-18
 
+- PHO-14053 wellsky clock-out notify-once + stale-date recovery merged (#11747 squash 0fae1222, 4 sol review rounds)
+- PHO-14047 DRI staleness auto-join + taxonomy fix merged (#11745 squash 946ba0c9, 3 sol review rounds)
+- PHO-14046 vendor retry observability fix merged (#11744 squash a72d5435, 2 sol review rounds)
+- mitm-inspector — MITMWEB-S1 durable SQLite persistence merged to local main@07f2b53 (candidate bfd092a, final clean sol review round 8; 577 pytest + 207 vitest + lint/type gates green on the clean merge tree)
+- phoebe — PHO-14029 people dedup merged (#11739 at 2026-07-18 06:16Z squash 323c75bdd4; 6 sol review rounds; canonical-row consolidation + lower(email) unique index + dry-run/apply CLI; prod apply still pending Henry)
+- phoebe — PHO-14003 capabilities page refactor merged (#11688 at 2026-07-17 19:56Z; Skills+Tools tabs, 3-column minimal table, source_file_path backend field)
+- phoebe — PHO-13989 S3 spill tier for admin artifacts merged (#11671 at 2026-07-17 22:14Z; inline jsonb under threshold, S3 above; hydration round-trips + DB spill persistence tests; review rounds cdx/sol)
 - **phoebe** — PHO-13944 PR #11630 merged at 0e40d33efc; weekly feature-catalog sweep shipped; classifier edge cases deferred to PHO-14034
 
 ## 2026-07-17
