@@ -854,6 +854,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             await self._publish(
                 {
                     "type": "codex_auth_dead_revival",
+                    "provider": "codex",
+                    "failure": "auth",
+                    "credential_source": "current",
                     "revived": revived,
                     "failed": failed,
                     "failed_reasons": failed_reasons,
@@ -875,6 +878,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         await self._publish(
             {
                 "type": "codex_auth_dead_exhausted",
+                "provider": "codex",
+                "failure": "auth",
+                "credential_source": "current",
+                "exhausted": True,
                 "tickets": [agent_id],
                 "ts": datetime.now(timezone.utc).isoformat(),
             }

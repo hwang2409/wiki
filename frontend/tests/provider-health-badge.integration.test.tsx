@@ -12,8 +12,8 @@ afterEach(() => {
 test("renders nothing when every provider is ok", async () => {
   const fetchHealth = vi.fn(
     async (_signal: AbortSignal): Promise<ProviderHealthSnapshot> => ({
-      cdx: { status: "ok", checked_at: "t0", detail: null },
-      cc: { status: "ok", checked_at: "t0", detail: null },
+      cdx: { status: "ok", checked_at: "t0", reason_code: null },
+      cc: { status: "ok", checked_at: "t0", reason_code: null },
     })
   );
   const { container } = render(<ProviderHealthBadge fetchHealth={fetchHealth} pollMs={60_000} />);
@@ -22,35 +22,47 @@ test("renders nothing when every provider is ok", async () => {
   expect(container.querySelector("[data-testid='provider-health-badges']")).toBeNull();
 });
 
-test("shows only the unhealthy providers with tooltip detail", async () => {
+test("shows only the unauthorized providers with fixed remediation", async () => {
   const fetchHealth = vi.fn(
     async (_signal: AbortSignal): Promise<ProviderHealthSnapshot> => ({
       cdx: {
         status: "unauthorized",
         checked_at: "2026-07-20T00:00:00Z",
-        detail: "codex reported access token could not be refreshed",
+        reason_code: "auth_dead",
       },
-      cc: { status: "ok", checked_at: "t0", detail: null },
+      cc: { status: "ok", checked_at: "t0", reason_code: null },
     })
   );
   render(<ProviderHealthBadge fetchHealth={fetchHealth} pollMs={60_000} />);
 
-  const badge = await screen.findByText("cdx auth dead");
+  const badge = await screen.findByText("cdx auth unavailable");
   expect(badge).toBeTruthy();
-  expect(badge.getAttribute("title") || "").toContain("could not be refreshed");
+  expect(badge.getAttribute("title") || "").toContain("codex login");
   expect(badge.getAttribute("data-provider")).toBe("cdx");
   // Healthy provider must not render its own badge.
-  expect(screen.queryByText("cc auth dead")).toBeNull();
+  expect(screen.queryByText("cc auth unavailable")).toBeNull();
 });
 
-test("unknown status is treated as healthy (no badge)", async () => {
+test("unknown status renders a distinct neutral accessible badge", async () => {
   const fetchHealth = vi.fn(
     async (_signal: AbortSignal): Promise<ProviderHealthSnapshot> => ({
-      cdx: { status: "unknown", checked_at: "t0", detail: "no auth.json yet" },
-      cc: { status: "unknown", checked_at: "t0", detail: null },
+      cdx: { status: "unknown", checked_at: "t0", reason_code: "credentials_missing" },
+      cc: { status: "unknown", checked_at: "t0", reason_code: "verification_unavailable" },
     })
   );
-  const { container } = render(<ProviderHealthBadge fetchHealth={fetchHealth} pollMs={60_000} />);
-  await waitFor(() => expect(fetchHealth).toHaveBeenCalled());
-  expect(container.querySelector("[data-testid='provider-health-badges']")).toBeNull();
+  render(<ProviderHealthBadge fetchHealth={fetchHealth} pollMs={60_000} />);
+  const badges = await screen.findByTestId("provider-health-badges");
+  expect(badges.getAttribute("role")).toBe("status");
+  expect(screen.getByText("cdx auth status unknown")).toBeTruthy();
+  expect(screen.getByText("cc auth status unknown")).toBeTruthy();
+  expect(badges.querySelector(".is-unknown")).toBeTruthy();
+});
+
+test("probing status is distinct from unknown", () => {
+  const fetchHealth = vi.fn(() => new Promise<ProviderHealthSnapshot>(() => {}));
+  render(<ProviderHealthBadge fetchHealth={fetchHealth} pollMs={60_000} />);
+  const badges = screen.getByTestId("provider-health-badges");
+  expect(badges.getAttribute("data-state")).toBe("probing");
+  expect(screen.getByText("checking provider auth")).toBeTruthy();
+  expect(badges.querySelector(".is-probing")).toBeTruthy();
 });

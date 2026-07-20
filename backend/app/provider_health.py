@@ -1,23 +1,14 @@
-"""Provider auth health probe + tracker.
-
-Watches whether the local codex / claude CLIs still have working credentials.
-Two signals:
-
-- **Periodic probe** — reads credential files (non-destructive) to spot
-  obvious "not logged in" states before a spawn fails.
-- **Event-driven mark** — auth-dead events from the supervisor (or any caller)
-  immediately flip a provider to `unauthorized`. This mark is sticky: it stays
-  until the credential file's mtime advances (i.e. the user ran `codex login`
-  or `claude login`), so a passing probe cannot silently clear a real failure.
-"""
+"""Bounded provider-auth probes and concurrency-safe health tracking."""
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
-import time
+import subprocess
+import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -28,9 +19,21 @@ from . import accounts
 
 
 Status = Literal["ok", "unauthorized", "unknown"]
+ReasonCode = Literal[
+    "credentials_missing",
+    "credentials_invalid",
+    "verification_failed",
+    "verification_unavailable",
+    "auth_dead",
+]
 
-DEFAULT_PROBE_INTERVAL_SECONDS = 600.0  # 10 minutes
+DEFAULT_PROBE_INTERVAL_SECONDS = 600.0
+PROBE_TIMEOUT_SECONDS = 5.0
 _AUTH_KEYWORDS = re.compile(r"unauthori[sz]ed|token|refresh|\blogin\b", re.IGNORECASE)
+_REMEDIATION: dict[str, str] = {
+    "cdx": "run codex login, then retry",
+    "cc": "run claude login, then retry",
+}
 
 
 def _now_iso() -> str:
@@ -38,7 +41,6 @@ def _now_iso() -> str:
 
 
 def claude_credentials_path() -> Path:
-    """Where Claude Code stores its credential file on Linux/non-keychain hosts."""
     override = os.environ.get("WIKI_CLAUDE_CREDENTIALS_PATH")
     if override:
         return Path(override).expanduser()
@@ -54,109 +56,138 @@ def claude_home_path() -> Path:
     return home / ".claude"
 
 
-def _file_mtime(path: Path) -> float | None:
+def _credential_fingerprint(path: Path) -> str | None:
+    """Hash credential bytes without ever returning or logging the contents."""
+
     try:
-        return path.stat().st_mtime
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+        return digest.hexdigest()
     except OSError:
         return None
+
+
+def _run_status_command(
+    args: list[str], *, parse_json: bool = False, env: dict[str, str] | None = None
+) -> bool | None:
+    """Return auth success/failure, or None when verification was unavailable."""
+
+    try:
+        result = subprocess.run(
+            args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE if parse_json else subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=PROBE_TIMEOUT_SECONDS,
+            check=False,
+            env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if not parse_json:
+        return result.returncode == 0
+    if result.returncode != 0 or not isinstance(result.stdout, str):
+        return False
+    try:
+        payload = json.loads(result.stdout)
+    except ValueError:
+        return None
+    return payload.get("loggedIn") is True if isinstance(payload, dict) else None
+
+
+def _verify_operationally(kind: str) -> bool | None:
+    env = os.environ.copy()
+    if kind == "cdx":
+        env["CODEX_HOME"] = str(accounts.codex_auth_path().parent)
+        return _run_status_command(["codex", "login", "status"], env=env)
+    if kind == "cc":
+        env["CLAUDE_CONFIG_DIR"] = str(claude_credentials_path().parent)
+        return _run_status_command(
+            ["claude", "auth", "status", "--json"], parse_json=True, env=env
+        )
+    return None
 
 
 @dataclass(frozen=True)
 class ProviderHealth:
     status: Status = "unknown"
     checked_at: str | None = None
-    detail: str | None = None
+    reason_code: ReasonCode | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
             "status": self.status,
             "checked_at": self.checked_at,
-            "detail": self.detail,
+            "reason_code": self.reason_code,
         }
 
 
+def _verified_health(kind: str, *, checked_at: str) -> ProviderHealth:
+    verified = _verify_operationally(kind)
+    if verified is True:
+        return ProviderHealth(status="ok", checked_at=checked_at)
+    if verified is False:
+        return ProviderHealth(
+            status="unauthorized",
+            checked_at=checked_at,
+            reason_code="verification_failed",
+        )
+    return ProviderHealth(
+        status="unknown",
+        checked_at=checked_at,
+        reason_code="verification_unavailable",
+    )
+
+
 def probe_codex(*, now: str | None = None) -> ProviderHealth:
-    """File-only probe. Existence + non-empty refresh token = ok; missing = unknown."""
-    path = accounts.codex_auth_path()
+    """Check auth-file shape, then require ``codex login status`` for ``ok``."""
+
     checked_at = now or _now_iso()
+    path = accounts.codex_auth_path()
     try:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        return ProviderHealth(
-            status="unknown",
-            checked_at=checked_at,
-            detail=f"{path} not found; run `codex login`",
-        )
-    except OSError as exc:
-        return ProviderHealth(
-            status="unknown",
-            checked_at=checked_at,
-            detail=f"cannot read {path}: {exc}",
-        )
+        return ProviderHealth("unknown", checked_at, "credentials_missing")
+    except OSError:
+        return ProviderHealth("unknown", checked_at, "verification_unavailable")
     try:
         data = json.loads(raw)
-    except ValueError as exc:
-        return ProviderHealth(
-            status="unauthorized",
-            checked_at=checked_at,
-            detail=f"auth.json is not valid JSON: {exc}",
-        )
+    except ValueError:
+        return ProviderHealth("unauthorized", checked_at, "credentials_invalid")
     tokens = data.get("tokens") if isinstance(data, dict) else None
     refresh = tokens.get("refresh_token") if isinstance(tokens, dict) else None
     if not isinstance(refresh, str) or not refresh.strip():
-        return ProviderHealth(
-            status="unauthorized",
-            checked_at=checked_at,
-            detail="auth.json missing refresh_token; run `codex login`",
-        )
-    return ProviderHealth(status="ok", checked_at=checked_at, detail=None)
+        return ProviderHealth("unauthorized", checked_at, "credentials_invalid")
+    return _verified_health("cdx", checked_at=checked_at)
 
 
 def probe_claude(*, now: str | None = None) -> ProviderHealth:
-    """File-only probe. macOS Keychain users show as unknown (no file to read)."""
+    """Require ``claude auth status``; credential-file presence alone is unknown."""
+
     checked_at = now or _now_iso()
     creds = claude_credentials_path()
     try:
         raw = creds.read_text(encoding="utf-8")
     except FileNotFoundError:
-        # macOS stores creds in Keychain — no cheap file read available.
-        # Fall through to unknown so the badge stays subtle.
-        if claude_home_path().is_dir():
-            return ProviderHealth(
-                status="unknown",
-                checked_at=checked_at,
-                detail=f"{creds} not found (macOS Keychain?)",
-            )
-        return ProviderHealth(
-            status="unknown",
-            checked_at=checked_at,
-            detail=f"{claude_home_path()} not found; run `claude login`",
-        )
-    except OSError as exc:
-        return ProviderHealth(
-            status="unknown",
-            checked_at=checked_at,
-            detail=f"cannot read {creds}: {exc}",
-        )
+        # Claude may keep credentials in the macOS keychain, so the status CLI
+        # is the only supported way to turn this into an operational result.
+        return _verified_health("cc", checked_at=checked_at)
+    except OSError:
+        return ProviderHealth("unknown", checked_at, "verification_unavailable")
     try:
         data = json.loads(raw)
-    except ValueError as exc:
-        return ProviderHealth(
-            status="unauthorized",
-            checked_at=checked_at,
-            detail=f"credentials file is not valid JSON: {exc}",
-        )
+    except ValueError:
+        return ProviderHealth("unauthorized", checked_at, "credentials_invalid")
     if not isinstance(data, dict) or not data:
-        return ProviderHealth(
-            status="unauthorized",
-            checked_at=checked_at,
-            detail="credentials file is empty; run `claude login`",
-        )
-    return ProviderHealth(status="ok", checked_at=checked_at, detail=None)
+        return ProviderHealth("unauthorized", checked_at, "credentials_invalid")
+    return _verified_health("cc", checked_at=checked_at)
 
 
 def state_reason_indicates_auth(reason: str | None) -> bool:
     """True when a blocked-state reason mentions auth/token/login keywords."""
+
     return bool(reason and _AUTH_KEYWORDS.search(reason))
 
 
@@ -164,7 +195,7 @@ ProbeFn = Callable[[], ProviderHealth]
 
 
 class ProviderHealthTracker:
-    """Per-provider in-memory health with sticky event-driven downgrades."""
+    """Per-provider health with sticky, generation-checked event downgrades."""
 
     KINDS: tuple[str, ...] = ("cdx", "cc")
 
@@ -175,15 +206,13 @@ class ProviderHealthTracker:
         probe_claude_fn: ProbeFn = probe_claude,
         credential_path_fn: Callable[[str], Path] | None = None,
     ) -> None:
-        self._probe_fns: dict[str, ProbeFn] = {
-            "cdx": probe_codex_fn,
-            "cc": probe_claude_fn,
-        }
+        self._probe_fns: dict[str, ProbeFn] = {"cdx": probe_codex_fn, "cc": probe_claude_fn}
         self._credential_path_fn = credential_path_fn or self._default_credential_path
         self._state: dict[str, ProviderHealth] = {kind: ProviderHealth() for kind in self.KINDS}
-        # sticky_mtime[kind] = credential mtime at moment of unauthorized mark;
-        # None means no sticky mark active.
-        self._sticky_mtime: dict[str, float | None] = {kind: None for kind in self.KINDS}
+        self._sticky: dict[str, bool] = {kind: False for kind in self.KINDS}
+        self._sticky_fingerprint: dict[str, str | None] = {kind: None for kind in self.KINDS}
+        self._generation: dict[str, int] = {kind: 0 for kind in self.KINDS}
+        self._lock = threading.RLock()
 
     @staticmethod
     def _default_credential_path(kind: str) -> Path:
@@ -194,65 +223,79 @@ class ProviderHealthTracker:
         raise ValueError(f"unknown provider kind: {kind}")
 
     def snapshot(self) -> dict[str, dict[str, object]]:
-        return {kind: entry.to_dict() for kind, entry in self._state.items()}
+        with self._lock:
+            return {kind: entry.to_dict() for kind, entry in self._state.items()}
 
     def get(self, kind: str) -> ProviderHealth:
-        return self._state[kind]
+        with self._lock:
+            return self._state[kind]
 
     def refresh(self, *, kinds: Iterable[str] | None = None) -> dict[str, dict[str, object]]:
-        """Re-probe each kind. A sticky unauthorized mark blocks the fresh
-        probe from clearing state until the credential file mtime advances."""
+        """Run real probes and discard results that began before a newer event."""
 
         for kind in kinds or self.KINDS:
             if kind not in self._state:
                 continue
-            sticky = self._sticky_mtime.get(kind)
-            if sticky is not None:
-                current_mtime = _file_mtime(self._credential_path_fn(kind))
-                if current_mtime is not None and current_mtime > sticky:
-                    # User re-authenticated — clear sticky and re-probe fresh.
-                    self._sticky_mtime[kind] = None
-                else:
-                    # Preserve the sticky unauthorized state; bump checked_at.
-                    prior = self._state[kind]
-                    self._state[kind] = replace(prior, checked_at=_now_iso())
+            with self._lock:
+                generation = self._generation[kind]
+                sticky = self._sticky[kind]
+                sticky_fingerprint = self._sticky_fingerprint[kind]
+            result = self._probe_fns[kind]()
+            current_fingerprint = _credential_fingerprint(self._credential_path_fn(kind))
+            with self._lock:
+                if self._generation[kind] != generation:
+                    # A concurrent auth-dead event wins over this stale probe.
                     continue
-            self._state[kind] = self._probe_fns[kind]()
+                if sticky and self._sticky[kind]:
+                    explicit_success = result.status == "ok"
+                    fingerprint_changed = current_fingerprint != sticky_fingerprint
+                    if not (explicit_success or fingerprint_changed):
+                        prior = self._state[kind]
+                        self._state[kind] = replace(
+                            prior,
+                            checked_at=result.checked_at,
+                        )
+                        continue
+                    self._sticky[kind] = False
+                    self._sticky_fingerprint[kind] = None
+                self._state[kind] = result
         return self.snapshot()
 
-    def mark_unauthorized(self, kind: str, *, detail: str | None = None) -> None:
-        """Event-driven downgrade. Sticks until credential file mtime advances."""
+    def mark_unauthorized(self, kind: str) -> None:
+        """Mark an exhausted current-credential auth failure with a fixed code."""
 
         if kind not in self._state:
             return
-        mtime = _file_mtime(self._credential_path_fn(kind))
-        self._sticky_mtime[kind] = mtime if mtime is not None else time.time()
-        self._state[kind] = ProviderHealth(
-            status="unauthorized",
-            checked_at=_now_iso(),
-            detail=detail or "auth-dead event",
-        )
+        with self._lock:
+            self._generation[kind] += 1
+            self._sticky[kind] = True
+            self._sticky_fingerprint[kind] = _credential_fingerprint(
+                self._credential_path_fn(kind)
+            )
+            # checked_at is probe-owned; an event must not pretend a probe ran.
+            self._state[kind] = replace(
+                self._state[kind],
+                status="unauthorized",
+                reason_code="auth_dead",
+            )
 
     def mark_reason(self, kind: str, reason: str | None) -> bool:
-        """If reason mentions auth keywords, mark unauthorized. Returns True on mark."""
+        """Compatibility helper for callers that only have a coarse auth reason."""
 
         if not state_reason_indicates_auth(reason):
             return False
-        self.mark_unauthorized(kind, detail=(reason or "").strip() or "auth-related blocker")
+        self.mark_unauthorized(kind)
         return True
 
     def spawn_hint(self, kind: str) -> str | None:
-        """Human-readable warning to attach to spawn responses when unhealthy."""
+        """Return fixed remediation only; never include probe data."""
 
-        entry = self._state.get(kind)
-        if entry is None or entry.status != "unauthorized":
-            return None
-        cli = "codex login" if kind == "cdx" else "claude login"
-        detail = f" ({entry.detail})" if entry.detail else ""
-        return (
-            f"provider auth marked unhealthy for {kind}{detail}. "
-            f"if the spawn fails, re-run `{cli}` and retry."
-        )
+        with self._lock:
+            entry = self._state.get(kind)
+            if entry is None or entry.status != "unauthorized":
+                return None
+        label = "codex" if kind == "cdx" else "claude"
+        return f"{label} auth is unavailable; {_REMEDIATION.get(kind, 'sign in again and retry')}"
 
 
 async def probe_loop(
@@ -261,13 +304,12 @@ async def probe_loop(
     interval_seconds: float = DEFAULT_PROBE_INTERVAL_SECONDS,
     stop: asyncio.Event | None = None,
 ) -> None:
-    """Background task: refresh probes every `interval_seconds`. Cancel-safe."""
+    """Background task: refresh probes every interval; cancel-safe."""
 
     while True:
         try:
             tracker.refresh()
         except Exception:
-            # Probes must not tear down the loop; try again next tick.
             pass
         if stop is not None:
             try:

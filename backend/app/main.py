@@ -3312,22 +3312,17 @@ async def supervisor_event_bridge() -> None:
 
 
 def _consume_provider_health_signal(event: dict) -> None:
-    """Flip provider auth health to unauthorized on auth-dead supervisor events."""
+    """Mark only exhausted current-credential auth failures as unauthorized."""
 
-    event_type = event.get("type")
-    if event_type in {"codex_auth_dead_exhausted", "codex_auth_dead_revival"}:
-        detail = None
-        reasons = event.get("failed_reasons")
-        if isinstance(reasons, dict) and reasons:
-            first_reason = next(iter(reasons.values()), None)
-            if isinstance(first_reason, str) and first_reason.strip():
-                detail = first_reason.strip()
-        if detail is None:
-            if event_type == "codex_auth_dead_exhausted":
-                detail = "codex auth revival exhausted; run `codex login`"
-            else:
-                detail = "codex reported access token could not be refreshed"
-        PROVIDER_HEALTH.mark_unauthorized("cdx", detail=detail)
+    if (
+        event.get("type") != "codex_auth_dead_exhausted"
+        or event.get("provider") != "codex"
+        or event.get("failure") != "auth"
+        or event.get("credential_source") != "current"
+        or event.get("exhausted") is not True
+    ):
+        return
+    PROVIDER_HEALTH.mark_unauthorized("cdx")
 
 
 async def agent_runtime_dispatchers() -> None:

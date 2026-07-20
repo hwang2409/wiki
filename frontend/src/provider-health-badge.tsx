@@ -18,19 +18,17 @@ export type ProviderHealthBadgeProps = {
   pollMs?: number;
 };
 
-function isUnhealthy(entry: ProviderHealthEntry | undefined): boolean {
-  return Boolean(entry && entry.status === "unauthorized");
-}
-
-function badgeText(kind: string): string {
+function badgeText(kind: string, status: ProviderHealthEntry["status"]): string {
   const label = KIND_LABEL[kind] ?? kind;
-  return `${label} auth dead`;
+  if (status === "unauthorized") return `${label} auth unavailable`;
+  return `${label} auth status unknown`;
 }
 
-function badgeTitle(entry: ProviderHealthEntry): string {
-  const detail = entry.detail?.trim();
-  const stamp = entry.checked_at ? ` · checked ${entry.checked_at}` : "";
-  return `${detail ?? "provider auth unhealthy"}${stamp}`;
+function badgeTitle(kind: string, status: ProviderHealthEntry["status"]): string {
+  if (status === "unauthorized") {
+    return `provider auth is unavailable; run ${kind === "cdx" ? "codex" : "claude"} login, then retry`;
+  }
+  return "provider auth status is unknown; retry or sign in again";
 }
 
 export function ProviderHealthBadge({
@@ -51,20 +49,37 @@ export function ProviderHealthBadge({
     return () => handle.stop();
   }, [fetchHealth, pollMs]);
 
-  if (!snapshot) return null;
-  const unhealthy = Object.entries(snapshot).filter(([, entry]) => isUnhealthy(entry));
+  if (!snapshot) {
+    return (
+      <div
+        className="provider-health-badges"
+        data-state="probing"
+        data-testid="provider-health-badges"
+        role="status"
+        aria-live="polite"
+      >
+        <span className="provider-health-badge is-probing">checking provider auth</span>
+      </div>
+    );
+  }
+  const unhealthy = Object.entries(snapshot).filter(([, entry]) => entry.status !== "ok");
   if (unhealthy.length === 0) return null;
 
   return (
-    <div className="provider-health-badges" data-testid="provider-health-badges">
+    <div
+      className="provider-health-badges"
+      data-testid="provider-health-badges"
+      role="status"
+      aria-live="polite"
+    >
       {unhealthy.map(([kind, entry]) => (
         <span
-          className="provider-health-badge is-unauthorized"
+          className={`provider-health-badge is-${entry.status}`}
           data-provider={kind}
           key={kind}
-          title={badgeTitle(entry)}
+          title={badgeTitle(kind, entry.status)}
         >
-          {badgeText(kind)}
+          {badgeText(kind, entry.status)}
         </span>
       ))}
     </div>

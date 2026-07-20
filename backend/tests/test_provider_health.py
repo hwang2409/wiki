@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import os
-import time
+import threading
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -55,9 +55,10 @@ class ProbeTests(unittest.TestCase):
 
     def test_codex_ok_when_refresh_token_present(self) -> None:
         _write_codex_auth(self.root)
-        health = provider_health.probe_codex()
+        with mock.patch.object(provider_health, "_verify_operationally", return_value=True):
+            health = provider_health.probe_codex()
         self.assertEqual(health.status, "ok")
-        self.assertIsNone(health.detail)
+        self.assertIsNone(health.reason_code)
         self.assertIsNotNone(health.checked_at)
 
     def test_codex_unauthorized_when_refresh_token_missing(self) -> None:
@@ -67,7 +68,7 @@ class ProbeTests(unittest.TestCase):
         )
         health = provider_health.probe_codex()
         self.assertEqual(health.status, "unauthorized")
-        self.assertIn("refresh_token", (health.detail or ""))
+        self.assertEqual(health.reason_code, "credentials_invalid")
 
     def test_codex_unauthorized_when_auth_json_corrupt(self) -> None:
         (self.root / ".codex").mkdir(parents=True, exist_ok=True)
@@ -81,7 +82,8 @@ class ProbeTests(unittest.TestCase):
 
     def test_claude_ok_when_credentials_present(self) -> None:
         _write_claude_creds(self.root)
-        health = provider_health.probe_claude()
+        with mock.patch.object(provider_health, "_verify_operationally", return_value=True):
+            health = provider_health.probe_claude()
         self.assertEqual(health.status, "ok")
 
     def test_claude_unauthorized_when_credentials_empty(self) -> None:
@@ -95,12 +97,32 @@ class ProbeTests(unittest.TestCase):
         # Directory exists (Claude is installed) but no credentials file
         # (macOS Keychain user). Should not raise a false unauthorized alarm.
         (self.root / ".claude").mkdir(parents=True, exist_ok=True)
-        health = provider_health.probe_claude()
+        with mock.patch.object(provider_health, "_verify_operationally", return_value=None):
+            health = provider_health.probe_claude()
         self.assertEqual(health.status, "unknown")
 
     def test_claude_unknown_when_home_missing(self) -> None:
-        health = provider_health.probe_claude()
+        with mock.patch.object(provider_health, "_verify_operationally", return_value=None):
+            health = provider_health.probe_claude()
         self.assertEqual(health.status, "unknown")
+
+    def test_credential_presence_without_operational_verification_is_unknown(self) -> None:
+        _write_codex_auth(self.root)
+        with mock.patch.object(provider_health, "_verify_operationally", return_value=None):
+            health = provider_health.probe_codex()
+        self.assertEqual(health.status, "unknown")
+        self.assertEqual(health.reason_code, "verification_unavailable")
+
+    def test_operational_verification_failure_is_coarse_and_secret_free(self) -> None:
+        secret = "refresh-token-secret-value"
+        _write_codex_auth(self.root, refresh=secret)
+        with mock.patch.object(provider_health, "_verify_operationally", return_value=False):
+            health = provider_health.probe_codex()
+        payload = health.to_dict()
+        self.assertEqual(health.status, "unauthorized")
+        self.assertEqual(health.reason_code, "verification_failed")
+        self.assertNotIn(secret, repr(payload))
+        self.assertNotIn(str(self.root), repr(payload))
 
 
 class TrackerTests(unittest.TestCase):
@@ -115,10 +137,10 @@ class TrackerTests(unittest.TestCase):
 
         self.tracker = provider_health.ProviderHealthTracker(
             probe_codex_fn=lambda: provider_health.ProviderHealth(
-                status="ok", checked_at="t0", detail=None
+                status="ok", checked_at="t0", reason_code=None
             ),
             probe_claude_fn=lambda: provider_health.ProviderHealth(
-                status="ok", checked_at="t0", detail=None
+                status="ok", checked_at="t0", reason_code=None
             ),
             credential_path_fn=codex_path,
         )
@@ -138,21 +160,62 @@ class TrackerTests(unittest.TestCase):
 
     def test_mark_unauthorized_survives_probe(self) -> None:
         self.tracker.refresh()
-        self.tracker.mark_unauthorized("cdx", detail="refresh failed")
+        self.tracker.mark_unauthorized("cdx")
+        self.tracker._probe_fns["cdx"] = lambda: provider_health.ProviderHealth(
+            status="unauthorized", checked_at="t1", reason_code="verification_failed"
+        )
         snapshot = self.tracker.refresh()
         self.assertEqual(snapshot["cdx"]["status"], "unauthorized")
-        self.assertEqual(snapshot["cdx"]["detail"], "refresh failed")
+        self.assertEqual(snapshot["cdx"]["reason_code"], "auth_dead")
         # Other providers must be unaffected.
         self.assertEqual(snapshot["cc"]["status"], "ok")
 
-    def test_credential_file_advance_clears_sticky_mark(self) -> None:
+    def test_credential_fingerprint_change_clears_sticky_mark_without_mtime_change(self) -> None:
         self.tracker.refresh()
-        self.tracker.mark_unauthorized("cdx", detail="refresh failed")
-        # Bump mtime so the sticky mark expires on next refresh.
-        past = time.time() + 60
-        os.utime(self.codex_auth, (past, past))
+        self.tracker.mark_unauthorized("cdx")
+        original_mtime = self.codex_auth.stat().st_mtime
+        self.codex_auth.write_text(json.dumps({"tokens": {"refresh_token": "new"}}), encoding="utf-8")
+        os.utime(self.codex_auth, (original_mtime, original_mtime))
         snapshot = self.tracker.refresh()
         self.assertEqual(snapshot["cdx"]["status"], "ok")
+
+    def test_explicit_success_clears_sticky_mark_without_file_change(self) -> None:
+        self.tracker.refresh()
+        self.tracker.mark_unauthorized("cdx")
+        snapshot = self.tracker.refresh()
+        self.assertEqual(snapshot["cdx"]["status"], "ok")
+
+    def test_checked_at_changes_only_when_a_probe_runs(self) -> None:
+        self.tracker.refresh()
+        self.assertEqual(self.tracker.get("cdx").checked_at, "t0")
+        self.tracker.mark_unauthorized("cdx")
+        self.assertEqual(self.tracker.get("cdx").checked_at, "t0")
+        snapshot = self.tracker.refresh()
+        self.assertEqual(snapshot["cdx"]["checked_at"], "t0")
+
+    def test_stale_refresh_cannot_overwrite_newer_auth_dead_event(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocked_probe() -> provider_health.ProviderHealth:
+            entered.set()
+            self.assertTrue(release.wait(timeout=2))
+            return provider_health.ProviderHealth(status="ok", checked_at="stale")
+
+        tracker = provider_health.ProviderHealthTracker(
+            probe_codex_fn=blocked_probe,
+            probe_claude_fn=lambda: provider_health.ProviderHealth(status="unknown"),
+            credential_path_fn=lambda kind: self.codex_auth,
+        )
+        refresh_thread = threading.Thread(target=tracker.refresh, kwargs={"kinds": ["cdx"]})
+        refresh_thread.start()
+        self.assertTrue(entered.wait(timeout=2))
+        tracker.mark_unauthorized("cdx")
+        release.set()
+        refresh_thread.join(timeout=2)
+        self.assertFalse(refresh_thread.is_alive())
+        self.assertEqual(tracker.get("cdx").status, "unauthorized")
+        self.assertEqual(tracker.get("cdx").reason_code, "auth_dead")
 
     def test_mark_reason_only_fires_for_auth_keywords(self) -> None:
         self.assertFalse(self.tracker.mark_reason("cdx", "adapter_lost"))
@@ -171,13 +234,13 @@ class TrackerTests(unittest.TestCase):
     def test_spawn_hint_only_when_unauthorized(self) -> None:
         self.tracker.refresh()
         self.assertIsNone(self.tracker.spawn_hint("cdx"))
-        self.tracker.mark_unauthorized("cdx", detail="refresh failed")
+        self.tracker.mark_unauthorized("cdx")
         hint = self.tracker.spawn_hint("cdx")
         self.assertIsNotNone(hint)
         self.assertIn("codex login", hint or "")
 
     def test_unknown_kind_is_noop(self) -> None:
-        self.tracker.mark_unauthorized("bogus", detail="ignored")
+        self.tracker.mark_unauthorized("bogus")
         self.assertNotIn("bogus", self.tracker.snapshot())
 
 
@@ -199,10 +262,10 @@ class MainWiringTests(unittest.TestCase):
 
         main.PROVIDER_HEALTH = provider_health.ProviderHealthTracker(
             probe_codex_fn=lambda: provider_health.ProviderHealth(
-                status="ok", checked_at="t0", detail=None
+                status="ok", checked_at="t0", reason_code=None
             ),
             probe_claude_fn=lambda: provider_health.ProviderHealth(
-                status="ok", checked_at="t0", detail=None
+                status="ok", checked_at="t0", reason_code=None
             ),
             credential_path_fn=credential_path,
         )
@@ -227,16 +290,20 @@ class MainWiringTests(unittest.TestCase):
         self._main._consume_provider_health_signal(
             {
                 "type": "codex_auth_dead_exhausted",
+                "provider": "codex",
+                "failure": "auth",
+                "credential_source": "current",
+                "exhausted": True,
                 "tickets": ["WIKI-99"],
             }
         )
         snapshot = self._main.PROVIDER_HEALTH.snapshot()
         self.assertEqual(snapshot["cdx"]["status"], "unauthorized")
-        self.assertIn("exhausted", (snapshot["cdx"]["detail"] or "").lower())
+        self.assertEqual(snapshot["cdx"]["reason_code"], "auth_dead")
         # cc must not be flipped by codex-scoped events.
         self.assertEqual(snapshot["cc"]["status"], "ok")
 
-    def test_codex_auth_dead_revival_uses_failed_reason_detail(self) -> None:
+    def test_successful_or_failed_revival_does_not_mark_provider_dead(self) -> None:
         self._main.get_provider_health(refresh=True)
         self._main._consume_provider_health_signal(
             {
@@ -247,8 +314,28 @@ class MainWiringTests(unittest.TestCase):
             }
         )
         snapshot = self._main.PROVIDER_HEALTH.snapshot()
-        self.assertEqual(snapshot["cdx"]["status"], "unauthorized")
-        self.assertEqual(snapshot["cdx"]["detail"], "token could not be refreshed")
+        self.assertEqual(snapshot["cdx"]["status"], "ok")
+
+    def test_non_auth_or_non_current_exhaustion_does_not_mark_provider_dead(self) -> None:
+        self._main.get_provider_health(refresh=True)
+        for event in (
+            {
+                "type": "codex_auth_dead_exhausted",
+                "provider": "codex",
+                "failure": "runtime",
+                "credential_source": "current",
+                "exhausted": True,
+            },
+            {
+                "type": "codex_auth_dead_exhausted",
+                "provider": "codex",
+                "failure": "auth",
+                "credential_source": "rotated",
+                "exhausted": True,
+            },
+        ):
+            self._main._consume_provider_health_signal(event)
+        self.assertEqual(self._main.PROVIDER_HEALTH.get("cdx").status, "ok")
 
     def test_unrelated_events_leave_health_alone(self) -> None:
         self._main.get_provider_health(refresh=True)

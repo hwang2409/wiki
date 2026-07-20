@@ -300,6 +300,13 @@ button:disabled {
   border: 1px solid color-mix(in srgb, var(--accent-danger) 40%, transparent);
 }
 
+.provider-health-badge.is-unknown,
+.provider-health-badge.is-probing {
+  color: var(--text-muted);
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+}
+
 .theme-icon-stack {
   position: relative;
   display: flex;

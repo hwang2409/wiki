@@ -814,7 +814,7 @@ export type ProviderHealthStatus = "ok" | "unauthorized" | "unknown";
 export type ProviderHealthEntry = {
   status: ProviderHealthStatus;
   checked_at: string | null;
-  detail: string | null;
+  reason_code: string | null;
 };
 
 export type ProviderHealthSnapshot = Record<string, ProviderHealthEntry>;
