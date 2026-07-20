@@ -37,10 +37,12 @@ DEPLOY_ENVIRONMENT_BY_REPO: dict[str, str] = {
 CACHE_TTL_SECONDS = 300
 GH_MAX_WORKERS = 3
 ONE_SHOT_TICKET_SUFFIX = re.compile(
-    r"-(?:REVIEW|SIM|EVAL|AUDIT|CANARY|THERMO|DEMO|TEST)\d*$",
+    r"-(?:REVIEW|SIM|EVAL|AUDIT|CANARY|THERMO|DEMO|TEST|VERIFY)\d*(?:-[A-Z0-9]+)*$",
     re.IGNORECASE,
 )
-STANDALONE_ONE_SHOT_TICKET = re.compile(r"(?:TEST|DEMO)(?:-\d+)?$", re.IGNORECASE)
+STANDALONE_ONE_SHOT_TICKET = re.compile(
+    r"(?:TEST|DEMO)(?:-\d+)?(?:-[A-Z0-9]+)*$", re.IGNORECASE
+)
 
 REVIEW_THREAD_COUNT_QUERY = """
 query ReviewThreadCounts($url: URI!) {

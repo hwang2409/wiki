@@ -184,6 +184,8 @@ class RowBuildingTests(unittest.TestCase):
             "WIKI-SIM1": {"current": {"role": "implement", "kind": "cc"}},
             "WIKI-DEMO": {"current": {"role": "implement", "kind": "cc"}},
             "TEST-1": {"current": {"role": "implement", "kind": "cc"}},
+            "WIKI-85-DEMO-CC": {"current": {"role": "implement", "kind": "cc"}},
+            "WIKI-85-VERIFY": {"current": {"role": "implement", "kind": "cc"}},
         }
 
         rows = dashboard.live_worker_rows(registry, {})
@@ -217,6 +219,9 @@ class RowBuildingTests(unittest.TestCase):
             "WIKI-TEST7",
             "TEST-1",
             "DEMO-2",
+            "WIKI-DEMO2-X",
+            "WIKI-VERIFY",
+            "WIKI-VERIFY-CC",
         ]
         registry = {
             ticket: {"current": {"kind": "cc"}}
@@ -341,7 +346,14 @@ class RowBuildingTests(unittest.TestCase):
         )
 
     def test_one_shot_names_override_implement_role(self) -> None:
-        for ticket in ("PHO-13944-SIM", "PHO-12880-DEMO", "WIKI-54-DEMO", "TEST-1"):
+        for ticket in (
+            "PHO-13944-SIM",
+            "PHO-12880-DEMO",
+            "WIKI-54-DEMO",
+            "WIKI-85-DEMO-CC",
+            "WIKI-85-VERIFY",
+            "TEST-1",
+        ):
             self.assertFalse(dashboard._is_dashboard_worker(ticket, "implement"))
         for ticket in ("WIKI-134", "PHO-13944"):
             self.assertTrue(dashboard._is_dashboard_worker(ticket, "implement"))
@@ -735,11 +747,24 @@ class DashboardEndpointTests(unittest.TestCase):
                     "PHO-13944-SIM2": {
                         "current": {"role": "implement", "kind": "cdx"}
                     },
+                    "WIKI-85-DEMO-CC": {
+                        "current": {"role": "implement", "kind": "cc"}
+                    },
+                    "WIKI-85-VERIFY": {
+                        "current": {"role": "implement", "kind": "cc"}
+                    },
                 }
             ),
             encoding="utf-8",
         )
-        for ticket in ("PHO-13944-SIM", "PHO-12880-DEMO", "WIKI-54-DEMO", "TEST-1"):
+        for ticket in (
+            "PHO-13944-SIM",
+            "PHO-12880-DEMO",
+            "WIKI-54-DEMO",
+            "WIKI-85-DEMO-CC",
+            "WIKI-85-VERIFY",
+            "TEST-1",
+        ):
             session = self.archive / ticket / "20260719-120000"
             session.mkdir(parents=True)
             (session / "meta.json").write_text(
