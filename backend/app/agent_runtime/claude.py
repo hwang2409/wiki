@@ -738,8 +738,8 @@ class ClaudeStreamAdapter(ProviderAdapter):
             try:
                 await self._send_user(request.prompt)
                 await self._refresh_transcript(wait_for_file=True)
-            except Exception:
-                await terminate_process_group(self._process)
+            except BaseException:
+                await asyncio.shield(terminate_process_group(self._process))
                 raise
             return self._status()
 
@@ -759,8 +759,8 @@ class ClaudeStreamAdapter(ProviderAdapter):
                         "from your current step."
                     )
                 await self._refresh_transcript()
-            except Exception:
-                await terminate_process_group(self._process)
+            except BaseException:
+                await asyncio.shield(terminate_process_group(self._process))
                 raise
             return self._status()
 
@@ -835,21 +835,31 @@ class ClaudeStreamAdapter(ProviderAdapter):
         effort: str | None = None,
     ) -> AdapterStatus:
         async with self._operation_lock:
-            if not self._process_is_alive():
-                raise ProviderProcessError(
-                    "Claude replacement requires an attached provider"
-                )
-            await self._end_session("wiki-replace", suppress_stream_end=True)
             self.model = model or self.model
             self.effort = effort
+            if not self._process_is_alive():
+                # Supervisor replacement quiesces this adapter before
+                # publishing the new current run. Start the new session only
+                # after that publication has completed.
+                generation = self._generation + 1
+                session_id = str(uuid4())
+                try:
+                    await self._spawn(session_id, resume=False, generation=generation)
+                    await self._send_user(new_prompt)
+                    await self._refresh_transcript(wait_for_file=True)
+                except BaseException:
+                    await asyncio.shield(terminate_process_group(self._process))
+                    raise
+                return self._status()
+            await self._end_session("wiki-replace", suppress_stream_end=True)
             generation = self._generation + 1
             session_id = str(uuid4())
             try:
                 await self._spawn(session_id, resume=False, generation=generation)
                 await self._send_user(new_prompt)
                 await self._refresh_transcript(wait_for_file=True)
-            except Exception:
-                await terminate_process_group(self._process)
+            except BaseException:
+                await asyncio.shield(terminate_process_group(self._process))
                 raise
             return self._status()
 

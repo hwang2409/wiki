@@ -886,12 +886,19 @@ class RunStoreTests(unittest.TestCase):
             paths = _paths(root)
             store = RunStore(paths)
             old = store.create(_record(root))
+            store.status_path(old.agent_id).parent.mkdir(parents=True, exist_ok=True)
+            store.status_path(old.agent_id).write_text(
+                json.dumps(
+                    {
+                        "state": "merge-ready",
+                        "pr": "old-replace-pr",
+                        "step": "old provider",
+                        "blocker": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
             replacement = _record(root)
-            replacement.state = LifecycleState.WORKING
-            replacement.provider_session_id = "replacement-session"
-            replacement.provider_pid = 4242
-            replacement.provider_generation = 2
-            replacement.transcript_path = "/isolated/replacement-rollout.jsonl"
             with mock.patch.object(
                 store,
                 "_write_registry",
@@ -906,12 +913,25 @@ class RunStoreTests(unittest.TestCase):
             self.assertEqual(restarted.current_run_id("WIKI-42"), replacement.run_id)
             self.assertEqual(repaired_old.replaced_by_run_id, replacement.run_id)
             self.assertEqual(repaired_old.state, LifecycleState.COMPLETED)
-            self.assertEqual(repaired_replacement.state, LifecycleState.WORKING)
-            self.assertEqual(
-                repaired_replacement.provider_session_id,
-                "replacement-session",
+            self.assertEqual(repaired_replacement.state, LifecycleState.STARTING)
+            self.assertIsNone(repaired_replacement.provider_session_id)
+            self.assertIsNone(repaired_replacement.provider_pid)
+            self.assertEqual(repaired_replacement.provider_generation, 0)
+            self.assertFalse(store.status_path(old.agent_id).exists())
+            replacement_decision = restart_recovery_decision(
+                repaired_replacement,
+                is_current=True,
+                provider_pid_alive=False,
+                provider_control_attached=False,
             )
-            self.assertEqual(repaired_replacement.provider_generation, 2)
+            self.assertEqual(replacement_decision.action, RecoveryAction.BLOCK)
+            old_decision = restart_recovery_decision(
+                repaired_old,
+                is_current=False,
+                provider_pid_alive=False,
+                provider_control_attached=False,
+            )
+            self.assertEqual(old_decision.action, RecoveryAction.SKIP)
             registry = json.loads(paths.registry_path.read_text(encoding="utf-8"))
             self.assertEqual(registry["WIKI-42"]["history"][0]["run_id"], old.run_id)
 
@@ -1221,12 +1241,16 @@ class RunStoreTests(unittest.TestCase):
             paths = _paths(root)
             store = RunStore(paths)
             old = store.create(_record(root))
+            status_path = paths.status_dir / "WIKI-42.json"
+            status_path.parent.mkdir(parents=True, exist_ok=True)
+            status_path.write_text('{"state":"merge-ready"}', encoding="utf-8")
             replacement = _record(root)
             replacement.replaces_run_id = old.run_id
             archived, current = store.replace(old.run_id, replacement)
             self.assertEqual(archived.replaced_by_run_id, current.run_id)
             self.assertEqual(archived.outcome, "handoff")
             self.assertEqual(store.current_run_id("WIKI-42"), current.run_id)
+            self.assertFalse(status_path.exists())
             registry = json.loads(paths.registry_path.read_text(encoding="utf-8"))
             self.assertEqual(registry["WIKI-42"]["history"][0]["outcome"], "handoff")
             with self.assertRaisesRegex(StoreConflict, "no longer current"):

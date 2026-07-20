@@ -735,8 +735,8 @@ class CodexAppServerAdapter(ProviderAdapter):
             await self._spawn(generation)
             try:
                 await self._start_thread(request.prompt, generation)
-            except Exception:
-                await terminate_process_group(self._process)
+            except BaseException:
+                await asyncio.shield(terminate_process_group(self._process))
                 raise
             return self._status()
 
@@ -773,8 +773,8 @@ class CodexAppServerAdapter(ProviderAdapter):
                         "from your current step."
                     )
                 await self._refresh_identity(required=True)
-            except Exception:
-                await terminate_process_group(self._process)
+            except BaseException:
+                await asyncio.shield(terminate_process_group(self._process))
                 raise
             return self._status()
 
@@ -857,10 +857,25 @@ class CodexAppServerAdapter(ProviderAdapter):
         effort: str | None = None,
     ) -> AdapterStatus:
         async with self._operation_lock:
+            self.model = model or self.model
+            self.effort = effort or self.effort
             if not self._process_is_alive() or not self._session_id:
-                raise ProviderProcessError(
-                    "Codex replacement requires an attached provider"
-                )
+                # Supervisor replacement quiesces this adapter before
+                # publishing the new current run. Restart the same transport
+                # only after that publication, so no provider can write
+                # status under the old run.
+                self._session_id = None
+                self._active_turn_id = None
+                self._state = LifecycleState.STARTING
+                self._restart_for_runtime_change = False
+                generation = self._generation + 1
+                await self._spawn(generation)
+                try:
+                    await self._start_thread(new_prompt, generation)
+                except BaseException:
+                    await asyncio.shield(terminate_process_group(self._process))
+                    raise
+                return self._status()
             if self._active_turn_id:
                 try:
                     await self._rpc(
@@ -872,8 +887,6 @@ class CodexAppServerAdapter(ProviderAdapter):
             await self._cancel_turn_tasks()
             self._server_request_ids.clear()
             await self._rpc("thread/archive", {"threadId": self._session_id})
-            self.model = model or self.model
-            self.effort = effort or self.effort
             generation = self._generation + 1
             if self._restart_for_runtime_change:
                 self._suppress_stream_end.add(self._generation)

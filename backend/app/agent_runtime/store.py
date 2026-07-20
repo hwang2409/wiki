@@ -887,6 +887,10 @@ class RunStore:
                     "agent has a legacy orchestrator registration requiring "
                     f"explicit migration: {record.agent_id}"
                 )
+            # A status file belongs to the run that creates it. Clear any
+            # orphan from a prior run before this record becomes current; the
+            # supervisor calls create() while holding the per-agent lock.
+            self.status_path(record.agent_id).unlink(missing_ok=True)
             self._create_run_files(record)
             history = (
                 list((entry or {}).get("history") or [])
@@ -1550,7 +1554,11 @@ class RunStore:
             return record
 
     def replace(
-        self, old_run_id: str, new_record: RunRecord
+        self,
+        old_run_id: str,
+        new_record: RunRecord,
+        *,
+        reset_status: bool = True,
     ) -> tuple[RunRecord, RunRecord]:
         with self._lock:
             old = self.get(old_run_id)
@@ -1563,6 +1571,11 @@ class RunStore:
             current = entry.get("current") or {}
             if current.get("run_id") != old.run_id:
                 raise StoreConflict("replacement target is no longer current")
+            if reset_status:
+                # Direct store callers have no supervisor lock boundary to do
+                # this first. Supervisor replacement passes False only after
+                # quiescing the old provider and resetting under that lock.
+                self.status_path(old.agent_id).unlink(missing_ok=True)
 
             # Replacements are a continuation of the same logical composer
             # session. Provider echoes can arrive after the run-id swap, and
@@ -1599,6 +1612,57 @@ class RunStore:
             }
             self._write_registry(registry)
             return old, new_record
+
+    def abort_replace(
+        self,
+        old_run_id: str,
+        replacement_run_id: str,
+        *,
+        reason: str,
+        adapter_status: AdapterStatus,
+    ) -> RunRecord:
+        """Roll back a published replacement whose new provider failed."""
+
+        with self._lock:
+            old = self.get(old_run_id)
+            replacement = self.get(replacement_run_id)
+            if replacement.agent_id != old.agent_id:
+                raise StoreConflict("replacement agent id must match")
+            registry = self._read_registry()
+            entry = registry.get(old.agent_id) or {}
+            current = entry.get("current") or {}
+            if current.get("run_id") != replacement_run_id:
+                raise StoreConflict("replacement target is no longer current")
+
+            self.status_path(old.agent_id).unlink(missing_ok=True)
+            old.replaced_by_run_id = None
+            old.outcome = None
+            old.state = LifecycleState.BLOCKED
+            old.state_reason = reason
+            old.provider_session_id = adapter_status.session_id
+            old.provider_pid = adapter_status.pid
+            old.provider_generation = adapter_status.generation
+            old.active_turn_id = adapter_status.active_turn_id
+            if adapter_status.transcript_path is not None:
+                old.transcript_path = adapter_status.transcript_path
+            self._write_record(old)
+
+            history = [
+                item
+                for item in (entry.get("history") or [])
+                if not (
+                    isinstance(item, dict)
+                    and item.get("run_id") == old.run_id
+                    and item.get("replaced_by_run_id") == replacement_run_id
+                )
+            ]
+            registry[old.agent_id] = {
+                "history": history,
+                "current": self._registry_current(old),
+            }
+            shutil.rmtree(self.run_dir(replacement_run_id))
+            self._write_registry(registry)
+            return old
 
     def read_raw_events(
         self,

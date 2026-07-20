@@ -1208,6 +1208,158 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             raise operation_error
         return status
 
+    def _reset_status_for_replacement(self, agent_id: str) -> None:
+        """Detach the prior run's status before replacement ownership changes."""
+
+        # Callers hold the per-agent lock. The old provider has already been
+        # detached or drained, so no old-run status survives into the
+        # replacement boundary; replacement launch paths call this before
+        # publishing the new current projection.
+        self.store.status_path(agent_id).unlink(missing_ok=True)
+
+    async def _quiesce_adapter_for_replacement(
+        self,
+        run_id: str,
+        adapter: ProviderAdapter,
+    ) -> None:
+        """Stop the old provider before its status ownership is reset."""
+
+        stream_key = id(adapter)
+        self.expected_stream_ends.add(stream_key)
+        try:
+            # Stop the event pump before stopping the provider. The provider
+            # may emit terminal protocol events while it is quiescing; those
+            # events belong to the old run and must not race the ownership
+            # reset or make the old record terminal before the handoff.
+            await self._detach_adapter(run_id, preserve_event_routes=True)
+            await adapter.stop()
+        finally:
+            self.expected_stream_ends.discard(stream_key)
+
+    async def _await_cleanup(self, awaitable: Any) -> Any:
+        """Finish a cleanup operation even when its caller is cancelled."""
+
+        task = asyncio.create_task(awaitable)
+        while True:
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if task.done():
+                    try:
+                        return task.result()
+                    except BaseException:
+                        return None
+
+    async def _cleanup_cancelled_replacement(
+        self,
+        old: RunRecord,
+        replacement: RunRecord,
+        adapter: ProviderAdapter,
+        *,
+        published: bool,
+    ) -> None:
+        """Leave no live provider or unowned current run after cancellation."""
+
+        cleanup_run_id = replacement.run_id if published else old.run_id
+        try:
+            # Do not wait for a second provider RPC after cancellation. The
+            # adapter close contract terminates the process group and drains
+            # its reader tasks, which is the hard ownership boundary needed
+            # for this abort path.
+            await self._await_cleanup(adapter.close())
+        except BaseException:
+            # A provider can reject close while its process is still live. A
+            # second close attempt is deliberately cancellation-shielded too;
+            # close is the adapter contract's hard process-group teardown.
+            try:
+                await self._await_cleanup(adapter.close())
+            except BaseException:
+                pass
+        finally:
+            await self._await_cleanup(self._detach_adapter(cleanup_run_id))
+
+        terminal_status = AdapterStatus(
+            state=LifecycleState.DEAD,
+            session_id=None,
+            pid=None,
+            generation=0,
+            active_turn_id=None,
+            transcript_path=None,
+        )
+        if published:
+            try:
+                self.store.abort_replace(
+                    old.run_id,
+                    replacement.run_id,
+                    reason="replacement cancelled",
+                    adapter_status=terminal_status,
+                )
+            except BaseException:
+                # If rollback itself lost a filesystem race, terminalize the
+                # published child rather than leaving a nonterminal run with
+                # no adapter control.
+                try:
+                    child = self.store.get(replacement.run_id)
+                    if child.state not in TERMINAL_STATES:
+                        self.store.transition(
+                            replacement.run_id,
+                            LifecycleState.DEAD,
+                            reason="replacement cancelled",
+                            adapter_status=terminal_status,
+                        )
+                except BaseException:
+                    pass
+        else:
+            try:
+                current = self.store.get(old.run_id)
+                if current.state not in TERMINAL_STATES:
+                    self.store.transition(
+                        old.run_id,
+                        LifecycleState.DEAD,
+                        reason="replacement cancelled before publication",
+                        adapter_status=terminal_status,
+                    )
+            except BaseException:
+                pass
+        try:
+            await self._publish_agent_change(old.agent_id)
+        except BaseException:
+            pass
+
+    async def _cleanup_cancelled_launch(
+        self,
+        record: RunRecord,
+        adapter: ProviderAdapter,
+    ) -> None:
+        """Abort a cancelled provider start/resume without leaving controlless state."""
+
+        try:
+            await self._await_cleanup(adapter.close())
+        except BaseException:
+            pass
+        finally:
+            await self._await_cleanup(self._detach_adapter(record.run_id))
+        terminal_status = AdapterStatus(
+            state=LifecycleState.DEAD,
+            session_id=None,
+            pid=None,
+            generation=0,
+            active_turn_id=None,
+            transcript_path=None,
+        )
+        try:
+            current = self.store.get(record.run_id)
+            if current.state not in TERMINAL_STATES:
+                self.store.transition(
+                    record.run_id,
+                    LifecycleState.DEAD,
+                    reason="provider launch cancelled",
+                    adapter_status=terminal_status,
+                )
+            await self._publish_agent_change(current.agent_id)
+        except BaseException:
+            pass
+
     async def start_run(
         self,
         *,
@@ -1282,6 +1434,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             status = await adapter.start(request)
             record = self.store.update_adapter_status(record.run_id, status)
             self._route_adapter_generation(record.run_id, adapter, status.generation)
+        except asyncio.CancelledError:
+            await self._cleanup_cancelled_launch(record, adapter)
+            raise
         except Exception as exc:
             await self._close_and_drain_adapter(record.run_id, adapter)
             record = self.store.transition(
@@ -1340,6 +1495,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         self._attach_adapter(record.run_id, adapter)
         try:
             status = await adapter.resume(session_id)
+        except asyncio.CancelledError:
+            await self._cleanup_cancelled_launch(record, adapter)
+            raise
         except Exception:
             await self._close_and_drain_adapter(record.run_id, adapter)
             raise
@@ -2432,32 +2590,59 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         detail="orphan stopped for replacement",
                     ),
                 )
-            self.store.replace(old.run_id, replacement)
+            self._reset_status_for_replacement(old.agent_id)
+            self.store.replace(old.run_id, replacement, reset_status=False)
             return await self._launch_record(replacement, prompt)
 
         if target_provider is not old.provider:
-            await self._close_and_drain_adapter(
-                run_id,
-                old_adapter,
-                finalize="stop",
-                suppress_operation_errors=False,
-            )
-            self.store.replace(old.run_id, replacement)
+            try:
+                await self._close_and_drain_adapter(
+                    run_id,
+                    old_adapter,
+                    finalize="stop",
+                    suppress_operation_errors=False,
+                )
+            except asyncio.CancelledError:
+                await self._cleanup_cancelled_replacement(
+                    old,
+                    replacement,
+                    old_adapter,
+                    published=False,
+                )
+                raise
+            self._reset_status_for_replacement(old.agent_id)
+            self.store.replace(old.run_id, replacement, reset_status=False)
             return await self._launch_record(replacement, prompt)
-        await self._detach_adapter(run_id, preserve_event_routes=True)
-
+        published = False
         try:
+            await self._quiesce_adapter_for_replacement(run_id, old_adapter)
+            self._reset_status_for_replacement(old.agent_id)
             old_adapter.prepare_replacement(replacement)
-            status = await old_adapter.replace(prompt, model, target_effort)
+            self.store.replace(old.run_id, replacement, reset_status=False)
+            published = True
+        except asyncio.CancelledError:
+            await self._cleanup_cancelled_replacement(
+                old,
+                replacement,
+                old_adapter,
+                published=published,
+            )
+            raise
         except Exception as exc:
             await self._close_and_drain_adapter(run_id, old_adapter)
             try:
+                current = self.store.get(run_id)
+                failure_state = (
+                    LifecycleState.DEAD
+                    if current.state is LifecycleState.DEAD
+                    else LifecycleState.BLOCKED
+                )
                 self.store.transition(
                     run_id,
-                    LifecycleState.BLOCKED,
-                    reason=f"provider replacement failed: {exc}",
+                    failure_state,
+                    reason=f"replacement metadata commit failed: {exc}",
                     adapter_status=AdapterStatus(
-                        state=LifecycleState.BLOCKED,
+                        state=failure_state,
                         session_id=old.provider_session_id,
                         pid=None,
                         generation=old.provider_generation,
@@ -2470,47 +2655,29 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             await self._publish_agent_change(old.agent_id)
             raise
 
-        # The replacement run file is the crash-recovery authority. Seed it
-        # with live provider identity before the multi-file registry swap, so
-        # reconciliation can exact-session resume after a partial commit.
-        replacement.state = status.state
-        replacement.state_reason = status.detail
-        replacement.provider_session_id = status.session_id
-        replacement.provider_pid = status.pid
-        replacement.provider_generation = status.generation
-        replacement.active_turn_id = status.active_turn_id
-        replacement.transcript_path = status.transcript_path
         try:
-            self.store.replace(old.run_id, replacement)
+            status = await old_adapter.replace(prompt, model, target_effort)
+        except asyncio.CancelledError:
+            await self._cleanup_cancelled_replacement(
+                old,
+                replacement,
+                old_adapter,
+                published=True,
+            )
+            raise
         except Exception as exc:
-            try:
-                self.store.get(replacement.run_id)
-            except RunNotFound:
-                pass
-            else:
-                self._route_adapter_generation(
-                    replacement.run_id,
-                    old_adapter,
-                    status.generation,
-                )
             await self._close_and_drain_adapter(
                 old.run_id,
                 old_adapter,
                 finalize="stop",
             )
             try:
-                current = self.store.get(old.run_id)
-                failure_state = (
-                    LifecycleState.DEAD
-                    if current.state is LifecycleState.DEAD
-                    else LifecycleState.BLOCKED
-                )
-                self.store.transition(
+                self.store.abort_replace(
                     old.run_id,
-                    failure_state,
-                    reason=f"replacement metadata commit failed: {exc}",
+                    replacement.run_id,
+                    reason=f"provider replacement failed: {exc}",
                     adapter_status=AdapterStatus(
-                        state=failure_state,
+                        state=LifecycleState.BLOCKED,
                         session_id=old.provider_session_id,
                         pid=None,
                         generation=old.provider_generation,
@@ -2522,6 +2689,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 pass
             await self._publish_agent_change(old.agent_id)
             raise
+        replacement = self.store.update_adapter_status(replacement.run_id, status)
         self._route_adapter_generation(
             replacement.run_id, old_adapter, status.generation
         )
