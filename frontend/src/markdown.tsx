@@ -1,8 +1,10 @@
 import { Children, isValidElement, lazy, Suspense, useEffect, useMemo, useState } from "react";
 import type { MouseEvent, ReactNode, TableHTMLAttributes } from "react";
 import ReactMarkdown from "react-markdown";
+import rehypeKatex from "rehype-katex";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
 import { ShikiCode } from "./shiki";
 import {
   AlertTriangle,
@@ -782,7 +784,8 @@ export function ObsidianMarkdown({
   return (
     <ReactMarkdown
       components={components}
-      remarkPlugins={[remarkGfm, remarkObsidianInline, remarkBreaks]}
+      rehypePlugins={[rehypeKatex]}
+      remarkPlugins={[remarkGfm, remarkMath, remarkObsidianInline, remarkBreaks]}
     >
       {prepared}
     </ReactMarkdown>
