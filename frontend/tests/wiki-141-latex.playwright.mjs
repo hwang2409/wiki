@@ -10,6 +10,8 @@ import {
   writeRegistry,
 } from "../scripts/wiki32-harness.mjs";
 
+// Keep rehypeKatex before raw-HTML escaping. The mixed message below guards
+// both transforms and protects this order if either plugin becomes broader.
 const TICKET = "WIKI-141";
 const OUT_DIR = process.env.WIKI_PLAYWRIGHT_OUT_DIR || "/tmp/wiki-141-playwright-evidence";
 
@@ -29,6 +31,12 @@ const mathMarkdown = [
   "Plain text $foo",
 ].join("\n");
 
+const transcriptMarkdown = [
+  'Raw HTML stays literal: <span data-wiki-141-probe="live">raw probe</span>',
+  "",
+  mathMarkdown,
+].join("\n");
+
 async function main() {
   await fs.mkdir(OUT_DIR, { recursive: true });
   const fixtures = makeFixtureRoot("wiki-141-latex-");
@@ -41,7 +49,7 @@ async function main() {
     transcript,
     [
       { type: "mode", mode: "normal", sessionId: "wiki-141-latex" },
-      codexAssistant(mathMarkdown, "2026-07-21T18:00:00Z"),
+      codexAssistant(transcriptMarkdown, "2026-07-21T18:00:00Z"),
     ]
       .map((row) => JSON.stringify(row))
       .join("\n") + "\n",
@@ -85,7 +93,17 @@ async function main() {
     await assistant.waitFor({ state: "visible" });
     await assistant.locator(".katex").first().waitFor({ state: "visible" });
     await assistant.locator(".katex-display").waitFor({ state: "visible" });
+    const escapedRawHtml = assistant.locator("code.transcript-raw-html").first();
+    await escapedRawHtml.waitFor({ state: "visible" });
     assert(await assistant.locator(".katex").count() >= 2, "transcript inline and block math did not render");
+    const escapedRawText = (await assistant.locator("code.transcript-raw-html").allTextContents()).join("");
+    assert(
+      escapedRawText.includes('<span data-wiki-141-probe="live">') &&
+        escapedRawText.includes("</span>"),
+      `raw transcript HTML was not preserved as literal text: ${escapedRawText}`,
+    );
+    assert((await assistant.innerText()).includes("raw probe"), "raw transcript text content disappeared");
+    assert(await assistant.locator('span[data-wiki-141-probe="live"]').count() === 0, "raw transcript HTML became live markup");
     assert((await assistant.innerText()).includes("Plain text $foo"), "unclosed transcript dollar stayed false-positive math");
 
     await page.locator(".session-scroll").screenshot({ path: path.join(OUT_DIR, "wiki-141-latex.png") });
