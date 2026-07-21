@@ -92,7 +92,6 @@ import { GraphView } from "./graph";
 import { HealthView } from "./health";
 import { TokensView } from "./tokens";
 import { DashboardView } from "./dashboard";
-import { ProviderHealthBadge } from "./provider-health-badge";
 import { appendDoneEntry } from "./kanban";
 import { WorkspacePane, type PaneNoteFocusState } from "./pane";
 import { prepareMarkdown, splitFrontmatter } from "./markdown";
@@ -3532,7 +3531,6 @@ export default function App() {
           <ClipboardList size={18} />
         </button>
         <div className="ribbon-spacer" />
-        <ProviderHealthBadge />
         <button
           aria-label="Settings"
           className="ribbon-action"
