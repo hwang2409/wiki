@@ -200,6 +200,18 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
             [n for n in notes if n.event_type == "runtime-transition"], []
         )
 
+    async def test_runtime_none_to_starting_is_silent(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        worker = await self._spawn("WIKI-109", role="implement", orch="WIKI-ORCH")
+        worker.state = LifecycleState.STARTING
+        self.store._write_record(worker)
+
+        notes = await self.monitor.tick()
+
+        self.assertEqual(
+            [n for n in notes if n.event_type == "runtime-transition"], []
+        )
+
     async def test_runtime_working_to_idle_is_silent(self) -> None:
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
         worker = await self._spawn("WIKI-104", role="implement", orch="WIKI-ORCH")
@@ -226,6 +238,42 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(runtime), 1)
         self.assertEqual(runtime[0].orch_run_id, orch.run_id)
         self.assertIn("working -> blocked", runtime[0].message)
+
+    async def test_runtime_working_to_interrupted_emits(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        worker = await self._spawn("WIKI-111", role="implement", orch="WIKI-ORCH")
+        self.store.transition(worker.run_id, LifecycleState.WORKING, reason="tester")
+        await self.monitor.tick()
+
+        self.store.transition(
+            worker.run_id, LifecycleState.INTERRUPTED, reason="tester"
+        )
+        notes = await self.monitor.tick()
+
+        runtime = [n for n in notes if n.event_type == "runtime-transition"]
+        self.assertEqual(len(runtime), 1)
+        self.assertIn("working -> interrupted", runtime[0].message)
+
+    async def test_runtime_working_to_dead_emits_once(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        worker = await self._spawn("WIKI-112", role="implement", orch="WIKI-ORCH")
+        self.store.transition(worker.run_id, LifecycleState.WORKING, reason="tester")
+        await self.monitor.tick()
+
+        self.store.transition(worker.run_id, LifecycleState.DEAD, reason="tester")
+        notes = await self.monitor.tick()
+        runtime = [n for n in notes if n.event_type == "runtime-transition"]
+
+        self.assertEqual(len(runtime), 1)
+        self.assertIn("working -> dead", runtime[0].message)
+        self.assertEqual(
+            [
+                n
+                for n in await self.monitor.tick()
+                if n.event_type == "runtime-transition"
+            ],
+            [],
+        )
 
     async def test_status_working_to_merge_ready_emits(self) -> None:
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
@@ -1051,20 +1099,19 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         notes = await self.monitor.tick()
         self.assertEqual(notes, [])
 
-    async def test_terminal_worker_is_skipped(self) -> None:
+    async def test_terminal_worker_emits_once_then_is_skipped(self) -> None:
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
         worker = await self._spawn("WIKI-400", role="implement", orch="WIKI-ORCH")
         await self.monitor.tick()
 
         # Move worker to terminal DEAD.
         self.store.transition(worker.run_id, LifecycleState.DEAD, reason="tester")
-        _write_status(
-            self.store,
-            "WIKI-400",
-            {"state": "blocked", "pr": None, "step": "x", "blocker": "y"},
-        )
         notes = await self.monitor.tick()
-        self.assertEqual(notes, [])
+        runtime = [n for n in notes if n.event_type == "runtime-transition"]
+        self.assertEqual(len(runtime), 1)
+        self.assertIn("idle -> dead", runtime[0].message)
+
+        self.assertEqual(await self.monitor.tick(), [])
 
     async def test_unrouted_verdict_realarm_every_5min(self) -> None:
         orch = await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)

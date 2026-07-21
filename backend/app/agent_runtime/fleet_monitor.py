@@ -264,7 +264,8 @@ class FleetMonitor:
             if record.role == "orchestrator":
                 continue
             if record.state in TERMINAL_STATES:
-                continue
+                if not self._is_new_terminal_transition(record):
+                    continue
             if record.replaced_by_run_id:
                 continue
             if not self.store.is_current(record):
@@ -659,6 +660,19 @@ class FleetMonitor:
         return (
             record.run_id == view.record.run_id
             and record.replaced_by_run_id is None
-            and record.state not in TERMINAL_STATES
             and self.store.is_current(record)
+            and (
+                record.state not in TERMINAL_STATES
+                or self._is_new_terminal_transition(record)
+            )
+        )
+
+    def _is_new_terminal_transition(self, record: RunRecord) -> bool:
+        snapshot = self._snapshots.get(record.agent_id)
+        return (
+            record.state in TERMINAL_STATES
+            and snapshot is not None
+            and snapshot.run_id == record.run_id
+            and snapshot.runtime_state is not None
+            and snapshot.runtime_state not in TERMINAL_STATES
         )
