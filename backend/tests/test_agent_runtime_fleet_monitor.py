@@ -152,8 +152,7 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         # The first observation is an explicit none -> current transition.
         seed = await self.monitor.tick()
         seed_status = [n for n in seed if n.event_type == "status-transition"]
-        self.assertEqual(len(seed_status), 1)
-        self.assertIn("none -> working", seed_status[0].message)
+        self.assertEqual(seed_status, [])
         self.send.calls.clear()
 
         _write_status(
@@ -189,6 +188,105 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         await self.monitor.tick()
         await self.monitor.tick()
         self.assertEqual(self.send.calls, [])
+
+    async def test_runtime_none_to_working_is_silent(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        worker = await self._spawn("WIKI-103", role="implement", orch="WIKI-ORCH")
+        self.store.transition(worker.run_id, LifecycleState.WORKING, reason="tester")
+
+        notes = await self.monitor.tick()
+
+        self.assertEqual(
+            [n for n in notes if n.event_type == "runtime-transition"], []
+        )
+
+    async def test_runtime_working_to_idle_is_silent(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        worker = await self._spawn("WIKI-104", role="implement", orch="WIKI-ORCH")
+        self.store.transition(worker.run_id, LifecycleState.WORKING, reason="tester")
+        await self.monitor.tick()
+
+        self.store.transition(worker.run_id, LifecycleState.IDLE, reason="tester")
+        notes = await self.monitor.tick()
+
+        self.assertEqual(
+            [n for n in notes if n.event_type == "runtime-transition"], []
+        )
+
+    async def test_runtime_working_to_blocked_emits(self) -> None:
+        orch = await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        worker = await self._spawn("WIKI-105", role="implement", orch="WIKI-ORCH")
+        self.store.transition(worker.run_id, LifecycleState.WORKING, reason="tester")
+        await self.monitor.tick()
+
+        self.store.transition(worker.run_id, LifecycleState.BLOCKED, reason="tester")
+        notes = await self.monitor.tick()
+        runtime = [n for n in notes if n.event_type == "runtime-transition"]
+
+        self.assertEqual(len(runtime), 1)
+        self.assertEqual(runtime[0].orch_run_id, orch.run_id)
+        self.assertIn("working -> blocked", runtime[0].message)
+
+    async def test_status_working_to_merge_ready_emits(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        await self._spawn("WIKI-106", role="implement", orch="WIKI-ORCH")
+        _write_status(
+            self.store,
+            "WIKI-106",
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+        )
+        self.assertEqual(
+            [n for n in await self.monitor.tick() if n.event_type == "status-transition"],
+            [],
+        )
+
+        _write_status(
+            self.store,
+            "WIKI-106",
+            {"state": "merge-ready", "pr": "pr-1", "step": "ready", "blocker": None},
+        )
+        notes = await self.monitor.tick()
+
+        status = [n for n in notes if n.event_type == "status-transition"]
+        self.assertEqual(len(status), 1)
+        self.assertIn("working -> merge-ready", status[0].message)
+
+    async def test_status_none_to_working_is_silent(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        await self._spawn("WIKI-107", role="implement", orch="WIKI-ORCH")
+        _write_status(
+            self.store,
+            "WIKI-107",
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+        )
+
+        notes = await self.monitor.tick()
+
+        self.assertEqual(
+            [n for n in notes if n.event_type == "status-transition"], []
+        )
+
+    async def test_runtime_transition_advances_snapshot_even_when_silent(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        worker = await self._spawn("WIKI-108", role="implement", orch="WIKI-ORCH")
+        self.store.transition(worker.run_id, LifecycleState.WORKING, reason="tester")
+        self.assertEqual(
+            [n for n in await self.monitor.tick() if n.event_type == "runtime-transition"],
+            [],
+        )
+
+        self.store.transition(worker.run_id, LifecycleState.IDLE, reason="tester")
+        self.assertEqual(
+            [n for n in await self.monitor.tick() if n.event_type == "runtime-transition"],
+            [],
+        )
+
+        self.store.transition(worker.run_id, LifecycleState.BLOCKED, reason="tester")
+        notes = await self.monitor.tick()
+        runtime = [n for n in notes if n.event_type == "runtime-transition"]
+
+        self.assertEqual(len(runtime), 1)
+        self.assertIn("idle -> blocked", runtime[0].message)
 
     async def test_runtime_state_transition_emits(self) -> None:
         orch = await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
@@ -242,7 +340,7 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         status = {note.ticket: note for note in notes if note.event_type == "status-transition"}
         runtime = {note.ticket: note for note in notes if note.event_type == "runtime-transition"}
         self.assertIn("none -> merge-ready", status["WIKI-1100"].message)
-        self.assertIn("none -> waiting-approval", status["WIKI-1101"].message)
+        self.assertNotIn("WIKI-1101", status)
         self.assertIn("none -> waiting-approval", runtime["WIKI-1101"].message)
         self.assertEqual(status["WIKI-1100"].orch_run_id, orch.run_id)
 
@@ -294,13 +392,13 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
             await self.monitor.tick()
 
         status_calls = [call for call in self.send.calls if "status " in call[1]]
-        self.assertEqual(len(status_calls), 3)
+        self.assertEqual(len(status_calls), 2)
         self.assertIn("pr-1", status_calls[0][1])
-        self.assertIn("pr-2", status_calls[2][1])
+        self.assertIn("pr-2", status_calls[1][1])
 
         await self.monitor.tick()
         status_calls_after = [call for call in self.send.calls if "status " in call[1]]
-        self.assertEqual(len(status_calls_after), 3)
+        self.assertEqual(len(status_calls_after), 2)
 
     async def test_same_state_context_changes_do_not_emit(self) -> None:
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
@@ -423,10 +521,9 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
                 if note.event_type == "status-transition"
             )
 
-        self.assertEqual(len(emitted), 3)
+        self.assertEqual(len(emitted), 2)
         self.assertIn("step: testing", emitted[0].message)
-        self.assertIn("step: coding", emitted[1].message)
-        self.assertIn("step: testing", emitted[2].message)
+        self.assertIn("step: testing", emitted[1].message)
 
     async def test_repeated_runtime_transition_cycle_emits_each_occurrence(self) -> None:
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
@@ -436,9 +533,9 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
 
         emitted: list[Notification] = []
         for state in (
+            LifecycleState.BLOCKED,
             LifecycleState.WORKING,
-            LifecycleState.IDLE,
-            LifecycleState.WORKING,
+            LifecycleState.BLOCKED,
         ):
             self.store.transition(worker.run_id, state, reason="cycle")
             emitted.extend(
@@ -447,10 +544,9 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
                 if note.event_type == "runtime-transition"
             )
 
-        self.assertEqual(len(emitted), 3)
-        self.assertIn("idle -> working", emitted[0].message)
-        self.assertIn("working -> idle", emitted[1].message)
-        self.assertIn("idle -> working", emitted[2].message)
+        self.assertEqual(len(emitted), 2)
+        self.assertIn("idle -> blocked", emitted[0].message)
+        self.assertIn("working -> blocked", emitted[1].message)
 
     async def test_run_creation_resets_prior_status_before_fresh_rewrite(self) -> None:
         prior_payload = {
@@ -834,7 +930,7 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
             _write_status(
                 self.store,
                 agent_id,
-                {"state": "working", "pr": None, "step": "coding", "blocker": None},
+                {"state": "blocked", "pr": None, "step": "blocked", "blocker": "tester"},
             )
 
         send = _SelectiveSend()

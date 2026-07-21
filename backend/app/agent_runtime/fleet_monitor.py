@@ -129,6 +129,22 @@ class FleetMonitor:
     and for the loop implementation.
     """
 
+    ACTIONABLE_STATUS_STATES: frozenset[str] = frozenset(
+        {
+            "merge-ready",
+            "blocked",
+            "abandoned",
+        }
+    )
+    ACTIONABLE_RUNTIME_STATES: frozenset[LifecycleState] = frozenset(
+        {
+            LifecycleState.BLOCKED,
+            LifecycleState.WAITING_APPROVAL,
+            LifecycleState.DEAD,
+            LifecycleState.INTERRUPTED,
+        }
+    )
+
     def __init__(
         self,
         store: RunStore,
@@ -306,54 +322,64 @@ class FleetMonitor:
         # events, and steering the orchestrator on each one is pure noise.
         current_status_state = (view.status_state,)
         if current_status_state != (snapshot.status_state,):
-            if snapshot.pending_status_state != current_status_state:
-                snapshot.status_occurrence += 1
-                snapshot.pending_status_state = current_status_state
-                snapshot.pending_status_dedupe_key = self._transition_dedupe_key(
-                    view,
-                    event_type="status-transition",
-                    occurrence=snapshot.status_occurrence,
-                )
-            dedupe_key = snapshot.pending_status_dedupe_key
-            assert dedupe_key is not None
-            notif = await self._emit(
-                view,
-                event_type="status-transition",
-                message=self._status_transition_message(view, snapshot),
-                dedupe_key=dedupe_key,
-            )
-            if notif is not None:
-                results.append(notif)
-            if notif is not None or self._dedupe_was_sent(view, dedupe_key):
+            if view.status_state not in self.ACTIONABLE_STATUS_STATES:
                 snapshot.status_state = current_status_state[0]
                 snapshot.pending_status_state = None
                 snapshot.pending_status_dedupe_key = None
-                self._clear_dedupe_key(view, dedupe_key)
+            else:
+                if snapshot.pending_status_state != current_status_state:
+                    snapshot.status_occurrence += 1
+                    snapshot.pending_status_state = current_status_state
+                    snapshot.pending_status_dedupe_key = self._transition_dedupe_key(
+                        view,
+                        event_type="status-transition",
+                        occurrence=snapshot.status_occurrence,
+                    )
+                dedupe_key = snapshot.pending_status_dedupe_key
+                assert dedupe_key is not None
+                notif = await self._emit(
+                    view,
+                    event_type="status-transition",
+                    message=self._status_transition_message(view, snapshot),
+                    dedupe_key=dedupe_key,
+                )
+                if notif is not None:
+                    results.append(notif)
+                if notif is not None or self._dedupe_was_sent(view, dedupe_key):
+                    snapshot.status_state = current_status_state[0]
+                    snapshot.pending_status_state = None
+                    snapshot.pending_status_dedupe_key = None
+                    self._clear_dedupe_key(view, dedupe_key)
 
         if record.state != snapshot.runtime_state:
-            if snapshot.pending_runtime_state is not record.state:
-                snapshot.runtime_occurrence += 1
-                snapshot.pending_runtime_state = record.state
-                snapshot.pending_runtime_dedupe_key = self._transition_dedupe_key(
-                    view,
-                    event_type="runtime-transition",
-                    occurrence=snapshot.runtime_occurrence,
-                )
-            dedupe_key = snapshot.pending_runtime_dedupe_key
-            assert dedupe_key is not None
-            notif = await self._emit(
-                view,
-                event_type="runtime-transition",
-                message=self._runtime_transition_message(view, snapshot),
-                dedupe_key=dedupe_key,
-            )
-            if notif is not None:
-                results.append(notif)
-            if notif is not None or self._dedupe_was_sent(view, dedupe_key):
+            if record.state not in self.ACTIONABLE_RUNTIME_STATES:
                 snapshot.runtime_state = record.state
                 snapshot.pending_runtime_state = None
                 snapshot.pending_runtime_dedupe_key = None
-                self._clear_dedupe_key(view, dedupe_key)
+            else:
+                if snapshot.pending_runtime_state is not record.state:
+                    snapshot.runtime_occurrence += 1
+                    snapshot.pending_runtime_state = record.state
+                    snapshot.pending_runtime_dedupe_key = self._transition_dedupe_key(
+                        view,
+                        event_type="runtime-transition",
+                        occurrence=snapshot.runtime_occurrence,
+                    )
+                dedupe_key = snapshot.pending_runtime_dedupe_key
+                assert dedupe_key is not None
+                notif = await self._emit(
+                    view,
+                    event_type="runtime-transition",
+                    message=self._runtime_transition_message(view, snapshot),
+                    dedupe_key=dedupe_key,
+                )
+                if notif is not None:
+                    results.append(notif)
+                if notif is not None or self._dedupe_was_sent(view, dedupe_key):
+                    snapshot.runtime_state = record.state
+                    snapshot.pending_runtime_state = None
+                    snapshot.pending_runtime_dedupe_key = None
+                    self._clear_dedupe_key(view, dedupe_key)
 
         if view.status_state == "merge-ready":
             if snapshot.merge_ready_since is None:
