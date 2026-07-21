@@ -383,6 +383,7 @@ const ALWAYS_AVAILABLE_FAMILIES = new Set([
   "ui-monospace",
   "-apple-system",
   "Consolas for Powerline",
+  "Moxy Static",
 ]);
 
 function isAvailable(choice: FontChoice): boolean {
