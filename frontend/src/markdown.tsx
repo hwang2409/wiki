@@ -115,6 +115,11 @@ export function prepareMarkdown(content: string) {
 
 export function rehypeEscapeRawHtml() {
   return (tree: HtmlNode) => {
+    function textContent(node: HtmlNode): string {
+      if (node.type === "text") return node.value ?? "";
+      return node.children?.map(textContent).join("") ?? "";
+    }
+
     function escapeNode(node: HtmlNode): HtmlNode {
       if (node.type === "raw") {
         return {
@@ -122,6 +127,17 @@ export function rehypeEscapeRawHtml() {
           tagName: "code",
           properties: { className: ["transcript-raw-html"] },
           children: [{ type: "text", value: node.value ?? "" }]
+        };
+      }
+
+      const className = node.properties?.className;
+      const classes = Array.isArray(className) ? className : typeof className === "string" ? className.split(/\s+/) : [];
+      if (node.type === "element" && classes.some((name) => ["math-inline", "math-display", "language-math"].includes(name))) {
+        return {
+          type: "element",
+          tagName: "code",
+          properties: { className: ["transcript-raw-html"] },
+          children: [{ type: "text", value: textContent(node) }]
         };
       }
 
