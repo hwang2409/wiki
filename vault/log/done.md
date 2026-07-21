@@ -2,10 +2,14 @@
 type: log
 tags: [log, done]
 created: 2026-07-06
-updated: 2026-07-20
+updated: 2026-07-21
 ---
 
 # Done
+
+## 2026-07-21
+
+- **wiki** — Moxy Static font bundled + added to mono font picker (5bbb71b, direct commit)
 
 ## 2026-07-20
 
