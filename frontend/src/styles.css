@@ -26,6 +26,34 @@
   font-style: italic;
   font-display: swap;
 }
+@font-face {
+  font-family: "Moxy Static";
+  src: url("/fonts/MoxyStatic-Regular.ttf") format("truetype");
+  font-weight: normal;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Moxy Static";
+  src: url("/fonts/MoxyStatic-Bold.ttf") format("truetype");
+  font-weight: bold;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Moxy Static";
+  src: url("/fonts/MoxyStatic-Italic.ttf") format("truetype");
+  font-weight: normal;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Moxy Static";
+  src: url("/fonts/MoxyStatic-BoldItalic.ttf") format("truetype");
+  font-weight: bold;
+  font-style: italic;
+  font-display: swap;
+}
 
 :root {
   --titlebar-height: 40px;

@@ -173,6 +173,11 @@ export const MONO_FONTS: FontChoice[] = [
     family: "Consolas for Powerline",
     stack: `"Consolas for Powerline", ${MONO_TAIL}`,
   },
+  {
+    label: "Moxy Static",
+    family: "Moxy Static",
+    stack: `"Moxy Static", ${MONO_TAIL}`,
+  },
   { label: "Courier New", family: "Courier New", stack: `"Courier New", ${MONO_TAIL}` },
   { label: "Andale Mono", family: "Andale Mono", stack: `"Andale Mono", ${MONO_TAIL}` },
   { label: "PT Mono", family: "PT Mono", stack: `"PT Mono", ${MONO_TAIL}` },
