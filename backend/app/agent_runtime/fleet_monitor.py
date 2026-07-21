@@ -48,10 +48,7 @@ class _WorkerSnapshot:
     run_id: str | None = None
     status_state: str | None = None
     runtime_state: LifecycleState | None = None
-    pr: str | None = None
-    step: str | None = None
-    blocker: str | None = None
-    pending_status_context: tuple[str | None, str | None, str | None, str | None] | None = None
+    pending_status_state: tuple[str | None] | None = None
     pending_status_dedupe_key: str | None = None
     status_occurrence: int = 0
     pending_runtime_state: LifecycleState | None = None
@@ -304,12 +301,14 @@ class FleetMonitor:
                 snapshot.merge_ready_since = monotonic_now
             snapshot.seeded = True
 
-        current_status_context = self._status_context_tuple(view)
-        prior_status_context = self._snapshot_status_context(snapshot)
-        if current_status_context != prior_status_context:
-            if snapshot.pending_status_context != current_status_context:
+        # Notify only on state transitions (e.g. working -> merge-ready);
+        # step/pr/blocker rewrites within the same state are context, not
+        # events, and steering the orchestrator on each one is pure noise.
+        current_status_state = (view.status_state,)
+        if current_status_state != (snapshot.status_state,):
+            if snapshot.pending_status_state != current_status_state:
                 snapshot.status_occurrence += 1
-                snapshot.pending_status_context = current_status_context
+                snapshot.pending_status_state = current_status_state
                 snapshot.pending_status_dedupe_key = self._transition_dedupe_key(
                     view,
                     event_type="status-transition",
@@ -326,8 +325,8 @@ class FleetMonitor:
             if notif is not None:
                 results.append(notif)
             if notif is not None or self._dedupe_was_sent(view, dedupe_key):
-                self._apply_status_context(snapshot, current_status_context)
-                snapshot.pending_status_context = None
+                snapshot.status_state = current_status_state[0]
+                snapshot.pending_status_state = None
                 snapshot.pending_status_dedupe_key = None
                 self._clear_dedupe_key(view, dedupe_key)
 
@@ -396,35 +395,6 @@ class FleetMonitor:
             f"fleet:{self._instance_id}:{view.record.agent_id}:"
             f"{event_type}:{occurrence}:{digest}"
         )
-
-    @staticmethod
-    def _status_context_tuple(
-        view: _WorkerView,
-    ) -> tuple[str | None, str | None, str | None, str | None]:
-        return (view.status_state, view.step, view.pr, view.blocker)
-
-    @staticmethod
-    def _snapshot_status_context(
-        snapshot: _WorkerSnapshot,
-    ) -> tuple[str | None, str | None, str | None, str | None]:
-        return (
-            snapshot.status_state,
-            snapshot.step,
-            snapshot.pr,
-            snapshot.blocker,
-        )
-
-    @staticmethod
-    def _apply_status_context(
-        snapshot: _WorkerSnapshot,
-        context: tuple[str | None, str | None, str | None, str | None],
-    ) -> None:
-        (
-            snapshot.status_state,
-            snapshot.step,
-            snapshot.pr,
-            snapshot.blocker,
-        ) = context
 
     @staticmethod
     def _dedupe_identity(

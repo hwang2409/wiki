@@ -302,7 +302,7 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         status_calls_after = [call for call in self.send.calls if "status " in call[1]]
         self.assertEqual(len(status_calls_after), 3)
 
-    async def test_same_state_status_context_changes_emit(self) -> None:
+    async def test_same_state_context_changes_do_not_emit(self) -> None:
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
         await self._spawn("WIKI-1850", role="implement", orch="WIKI-ORCH")
         initial = {
@@ -328,43 +328,25 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         for payload in contexts:
             _write_status(self.store, "WIKI-1850", payload)
             notes = await self.monitor.tick()
-            status = [
-                note for note in notes if note.event_type == "status-transition"
-            ]
-            self.assertEqual(len(status), 1)
-            self.assertIn("working -> working", status[0].message)
+            self.assertEqual(
+                [note for note in notes if note.event_type == "status-transition"],
+                [],
+            )
+        self.assertEqual(self.send.calls, [])
 
-        status_calls = [call for call in self.send.calls if "status " in call[1]]
-        self.assertEqual(len(status_calls), 3)
-        self.assertIn("step: testing", status_calls[0][1])
-        self.assertIn("pr: pr-18", status_calls[1][1])
-        self.assertIn("blocker: waiting on test", status_calls[2][1])
-
-    async def test_same_state_context_delivery_failure_retries_context(self) -> None:
-        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
-        await self._spawn("WIKI-1860", role="implement", orch="WIKI-ORCH")
+        # The context that changed silently still rides along on the next
+        # real state transition.
         _write_status(
             self.store,
-            "WIKI-1860",
-            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+            "WIKI-1850",
+            {"state": "blocked", "pr": "pr-18", "step": "testing", "blocker": "waiting on test"},
         )
-        await self.monitor.tick()
-        self.send.calls.clear()
-
-        self.send.fail_with = RuntimeError("adapter gone")
-        _write_status(
-            self.store,
-            "WIKI-1860",
-            {"state": "working", "pr": None, "step": "testing", "blocker": None},
-        )
-        self.assertEqual(await self.monitor.tick(), [])
-        self.assertEqual(len(self.send.calls), 1)
-
-        self.send.fail_with = None
         notes = await self.monitor.tick()
         status = [note for note in notes if note.event_type == "status-transition"]
         self.assertEqual(len(status), 1)
-        self.assertIn("step: testing", status[0].message)
+        self.assertIn("working -> blocked", status[0].message)
+        self.assertIn("pr: pr-18", status[0].message)
+        self.assertIn("blocker: waiting on test", status[0].message)
 
     async def test_delivery_timeout_retries_same_occurrence_token(self) -> None:
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
@@ -403,7 +385,7 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         _write_status(
             self.store,
             "WIKI-1865",
-            {"state": "working", "pr": None, "step": "testing", "blocker": None},
+            {"state": "merge-ready", "pr": None, "step": "testing", "blocker": None},
         )
         self.assertEqual(await monitor.tick(), [])
         await asyncio.wait_for(first_started.wait(), timeout=1)
@@ -427,7 +409,7 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
             "step": "coding",
             "blocker": None,
         }
-        context_b = {**context_a, "step": "testing"}
+        context_b = {**context_a, "state": "merge-ready", "step": "testing"}
         _write_status(self.store, "WIKI-1870", context_a)
         await self.monitor.tick()
         self.send.calls.clear()
