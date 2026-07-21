@@ -9,6 +9,7 @@ updated: 2026-07-21
 
 ## 2026-07-21
 
+- **wiki** — dropped provider auth ribbon badge (b21bc5c) — sidecar probe stuck unknown, chips pure noise; backend probe kept
 - **mitm-inspector** — MITMWEB-B4+F7 flow-summary enrichment, body search, conversation view merged (tooling PRs #2, #3, 2026-07-20) — restored after vault rollback
 - **mitm-inspector** — MITMWEB-F8 session-first UX merged (tooling PR #5, squash cd1430b) — session-list home, canonical-thread chat drill-in with manual picker, sanitized markdown; 12 sol review rounds + in-session fallback pass
 - **wiki** — Moxy Static font bundled + added to mono font picker (5bbb71b, direct commit)
