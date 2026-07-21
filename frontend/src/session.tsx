@@ -41,7 +41,9 @@ import {
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import ReactMarkdown from "react-markdown";
+import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
 import { MarkdownPre, MarkdownTable, prepareTranscriptMarkdown, rehypeEscapeRawHtml } from "./markdown";
 import { ShikiCode } from "./shiki";
 import {
@@ -1508,8 +1510,8 @@ const MessageBlock = memo(function MessageBlock({
     <div className="session-assistant markdown-preview-view">
       <ReactMarkdown
         components={sessionMarkdownComponents}
-        rehypePlugins={[rehypeEscapeRawHtml]}
-        remarkPlugins={[remarkGfm]}
+        rehypePlugins={[rehypeKatex, rehypeEscapeRawHtml]}
+        remarkPlugins={[remarkGfm, remarkMath]}
       >
         {prepareTranscriptMarkdown(event.text)}
       </ReactMarkdown>
