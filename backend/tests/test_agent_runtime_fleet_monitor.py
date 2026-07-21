@@ -254,6 +254,18 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(runtime), 1)
         self.assertIn("working -> interrupted", runtime[0].message)
 
+        self.store.transition(worker.run_id, LifecycleState.WORKING, reason="tester")
+        notes = await self.monitor.tick()
+        self.assertEqual(
+            [n for n in notes if n.event_type == "runtime-transition"], []
+        )
+
+        self.store.transition(worker.run_id, LifecycleState.BLOCKED, reason="tester")
+        notes = await self.monitor.tick()
+        runtime = [n for n in notes if n.event_type == "runtime-transition"]
+        self.assertEqual(len(runtime), 1)
+        self.assertIn("working -> blocked", runtime[0].message)
+
     async def test_runtime_working_to_dead_emits_once(self) -> None:
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
         worker = await self._spawn("WIKI-112", role="implement", orch="WIKI-ORCH")
