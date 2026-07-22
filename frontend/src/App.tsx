@@ -1614,6 +1614,11 @@ export default function App() {
         },
       };
     });
+    // WIKI-151: without this bump the loading effect's [activeFileState?.loaded]
+    // dependency never changes on retry (loaded was already false when the
+    // error was set), so the fetch never fires again. Advancing refreshTick
+    // — which the same effect already depends on — forces it to re-run.
+    setRefreshTick((tick) => tick + 1);
   };
 
   useEffect(() => {
@@ -3756,8 +3761,17 @@ export default function App() {
                 value={activeWorkspace}
                 onChange={(event) => setActiveWorkspace(event.target.value)}
               >
-                {(workspaces.length > 0 ? workspaces : [{ id: "wiki", root: "", live: true }]).map(
-                  (workspace) => {
+                {(() => {
+                  const base = workspaces.length > 0 ? workspaces : [{ id: "wiki", root: "", live: true }];
+                  // WIKI-151: synthesize a placeholder entry when the persisted
+                  // selection isn't present in discovery, so the native <select>
+                  // does not silently show a different workspace as the current
+                  // value. The synthesized row is explicitly marked unavailable.
+                  const knownIds = new Set(base.map((w) => w.id));
+                  const options = knownIds.has(activeWorkspace)
+                    ? base
+                    : [...base, { id: activeWorkspace, root: "", live: false }];
+                  return options.map((workspace) => {
                     const friendly = workspaceLabel(workspace);
                     const hint = workspacePathHint(workspace);
                     const unavailable = !workspace.live;
@@ -3771,8 +3785,8 @@ export default function App() {
                         {friendly}{hint ? ` — ${hint}` : ""}{suffix}
                       </option>
                     );
-                  }
-                )}
+                  });
+                })()}
               </select>
             </label>
             <div className="nav-files-container">

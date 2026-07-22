@@ -142,6 +142,13 @@ try {
     if (!localStorage.getItem("wiki-sidebar-tab")) {
       localStorage.setItem("wiki-sidebar-tab", "files");
     }
+    // WIKI-151 HIGH#1 regression: pre-seed the persisted files-workspace to
+    // an unavailable id so we exercise the "preserve unavailable selection"
+    // branch. The test later asserts activeWorkspace stayed "phoebe" instead
+    // of silently swapping onto "wiki".
+    if (!localStorage.getItem("wiki-files-workspace")) {
+      localStorage.setItem("wiki-files-workspace", "phoebe");
+    }
   });
 
   // Mock /api/workspaces with one live + one unavailable root so we can verify
@@ -301,39 +308,61 @@ try {
     `unavailable workspace must be marked "(unavailable)", got "${phoebeOpt.text}"`,
   );
 
+  // WIKI-151 HIGH#1 regression: the persisted `phoebe` selection must remain
+  // active even though discovery reports live:false. Prior code silently
+  // fell back to "wiki" here, and Playwright would have observed the wiki
+  // option as the <select>'s current value.
+  const selectedValue = await page.locator('[data-testid="workspace-select"]').inputValue();
+  assert(
+    selectedValue === "phoebe",
+    `persisted unavailable workspace must stay selected — expected "phoebe", got "${selectedValue}"`,
+  );
+
   await page.screenshot({ path: path.join(OUT_DIR, "nav-ia.png") });
 
-  // 7. File explorer retry: intercept /api/files/tree to fail; expect the
-  // retry row to render AND the workspace unavailable state to NOT clobber the
-  // last successful tree if any existed. Seed one file via a first successful
-  // response, then flip to failing.
+  // 7. File explorer retry: enable the all-files loader (so the effect at
+  // App.tsx:1619 actually fires) on a LIVE workspace, intercept
+  // /api/files/tree to fail, then click Retry and prove a SECOND request was
+  // issued. The previous version of this block never enabled all-files
+  // loading and never reached the failure branch — meaning it silently
+  // passed even when retry was broken (HIGH#2).
   let treeCalls = 0;
   await page.unroute("**/api/files/tree*");
   await page.route("**/api/files/tree*", async (route) => {
     treeCalls += 1;
-    if (treeCalls === 1) {
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify({
-          files: [{ path: "seeded.md", modified_at: null, size: 0 }],
-          truncated: false,
-        }),
-      });
-    } else {
-      await route.fulfill({
-        status: 500,
-        contentType: "application/json",
-        body: JSON.stringify({ detail: "boom" }),
-      });
-    }
+    await route.fulfill({
+      status: 500,
+      contentType: "application/json",
+      body: JSON.stringify({ detail: `boom-${treeCalls}` }),
+    });
+  });
+  // Switch to the live wiki workspace so the effect actually runs (the
+  // unavailable phoebe workspace short-circuits the fetch), then enable
+  // showAllFiles.
+  await page.selectOption('[data-testid="workspace-select"]', "wiki");
+  await page.evaluate(() => {
+    localStorage.setItem("wiki-show-all-files", "true");
+    localStorage.setItem("wiki-sidebar-tab", "files");
+    localStorage.setItem("wiki-files-workspace", "wiki");
   });
   await page.reload({ waitUntil: "domcontentloaded" });
   await page.waitForSelector('.sidebar-mode[data-mode="files"]');
-  // Trigger a workspace switch to force a re-fetch.
-  await page.selectOption('[data-testid="workspace-select"]', "wiki");
-  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
-  await page.waitForTimeout(400);
+  await page.waitForSelector('[data-testid="files-fetch-error"]', { timeout: 15_000 });
+  assert(treeCalls >= 1, `expected initial /api/files/tree fetch, saw ${treeCalls}`);
+  const callsBeforeRetry = treeCalls;
+
+  // Click Retry — this must re-issue the request. Before the HIGH#2 fix
+  // retryFiles() only mutated refs and the loading effect had no changed
+  // dependency, so the number of calls stayed at 1.
+  await page.locator('[data-testid="files-fetch-error"] .nav-inline-retry').click();
+  const deadline = Date.now() + 8_000;
+  while (treeCalls <= callsBeforeRetry && Date.now() < deadline) {
+    await page.waitForTimeout(100);
+  }
+  assert(
+    treeCalls > callsBeforeRetry,
+    `Retry must re-issue /api/files/tree — before=${callsBeforeRetry} after=${treeCalls}`,
+  );
 
   // 8. Empty-state CTA: seed a fixture with ZERO agents to prove the empty
   // sidebar CTA renders. Reuse the same page — remove the registry entries
