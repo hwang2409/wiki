@@ -4642,6 +4642,39 @@ body.is-resizing-panes .pane-cell {
   border-color: color-mix(in srgb, var(--accent-danger) 50%, var(--background-modifier-border));
 }
 
+.session-synthetic-source {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  align-self: flex-start;
+  max-width: min(90%, 640px);
+  padding: 2px 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-left: 2px solid color-mix(in srgb, var(--text-muted) 60%, var(--background-modifier-border));
+  border-radius: var(--radius-xs);
+  background-color: transparent;
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.55;
+  overflow: hidden;
+}
+
+.session-synthetic-source-chip {
+  flex-shrink: 0;
+  color: var(--text-faint);
+  letter-spacing: 0.02em;
+  text-transform: none;
+}
+
+.session-synthetic-source-text {
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .session-marker-hidden {
   align-self: flex-start;
   font-family: var(--font-monospace);

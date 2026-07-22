@@ -998,6 +998,58 @@ def _codex_apply(state: dict, row: dict) -> None:
         _record_row_disposition(state, EVENT_DISPOSITION_UNKNOWN)
 
 
+_SYNTHETIC_SOURCE_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+
+
+def _validated_normalized_source(payload: object) -> str | None:
+    """Read `source` off a normalized-event payload with the same validation
+    used at ingest (matches supervisor._validated_source). Archived events
+    are historical: reject rather than persist unrecognized shapes."""
+
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("source")
+    if not isinstance(value, str) or not _SYNTHETIC_SOURCE_PATTERN.match(value):
+        return None
+    return value
+
+
+_PENDING_ID_PATTERN = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+
+
+def _validated_normalized_pending_id(payload: object) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("pending_id")
+    if not isinstance(value, str) or not _PENDING_ID_PATTERN.match(value):
+        return None
+    return value
+
+
+def _stamp_last_user_event_source(
+    state: dict,
+    source: str | None,
+    pending_id: str | None = None,
+) -> None:
+    """Attach a validated synthetic source (and durable pending_id, when
+    present) to the most recent user event so archived-session parsers
+    preserve the marker-row rendering that the live composer_messages
+    surface produces."""
+
+    if not source and not pending_id:
+        return
+    events = state.get("events") or []
+    for event in reversed(events):
+        if event.get("kind") == "user":
+            if source:
+                event["source"] = source
+            if pending_id:
+                event["pending_id"] = pending_id
+            return
+
+
 def _normalized_disposition(row: dict) -> str:
     disposition = row.get("disposition")
     if disposition == "ignored":
@@ -1138,6 +1190,11 @@ def _codex_normalized_apply(state: dict, row: dict) -> None:
             }
 
     _apply_normalized_payload(state, row, _codex_apply, native_row)
+    _stamp_last_user_event_source(
+        state,
+        _validated_normalized_source(payload),
+        _validated_normalized_pending_id(payload),
+    )
 
 
 def _claude_normalized_apply(state: dict, row: dict) -> None:
@@ -1146,6 +1203,11 @@ def _claude_normalized_apply(state: dict, row: dict) -> None:
     if native_row is not None and not native_row.get("timestamp"):
         native_row["timestamp"] = row.get("normalized_at")
     _apply_normalized_payload(state, row, _claude_apply, native_row)
+    _stamp_last_user_event_source(
+        state,
+        _validated_normalized_source(payload),
+        _validated_normalized_pending_id(payload),
+    )
 
 
 # ---------------------------------------------------------------- claude parser

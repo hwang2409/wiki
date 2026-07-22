@@ -167,6 +167,11 @@ class RunRecord:
     outcome: str | None = None
     raw_event_count: int = 0
     normalized_event_count: int = 0
+    # Every normalized event bumps ``normalized_event_count`` — including the
+    # synthetic user echoes injected by fleet monitor / supervisor steers.
+    # The unread-dot surface must not light on those, so we track a parallel
+    # counter that advances only on genuinely agent-originated events.
+    unread_event_seq: int = 0
     last_lifecycle_event_seq: int = 0
     disposition_counts: dict[str, int] = field(
         default_factory=lambda: {item.value: 0 for item in EventDisposition}
@@ -244,6 +249,7 @@ class RunRecord:
             "outcome": self.outcome,
             "raw_event_count": self.raw_event_count,
             "normalized_event_count": self.normalized_event_count,
+            "unread_event_seq": self.unread_event_seq,
             "last_lifecycle_event_seq": self.last_lifecycle_event_seq,
             "disposition_counts": dict(self.disposition_counts),
             "pending_requests": {
@@ -302,6 +308,12 @@ class RunRecord:
             outcome=value.get("outcome"),
             raw_event_count=int(value.get("raw_event_count", 0)),
             normalized_event_count=int(value.get("normalized_event_count", 0)),
+            unread_event_seq=int(
+                value.get(
+                    "unread_event_seq",
+                    value.get("normalized_event_count", 0),
+                )
+            ),
             last_lifecycle_event_seq=int(value.get("last_lifecycle_event_seq", 0)),
             disposition_counts={
                 item.value: int(

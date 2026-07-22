@@ -1117,7 +1117,13 @@ def _load_run_freshness(run_id: str | None) -> tuple[str | None, int | None]:
     if not isinstance(payload, dict):
         return None, None
     updated_at = payload.get("updated_at")
-    seq = payload.get("normalized_event_count")
+    # ``unread_event_seq`` skips synthetic supervisor/fleet user echoes so an
+    # orchestrator wake doesn't light the worker's unread dot before the
+    # worker has produced any response. Legacy run.json files that predate
+    # WIKI-161 fall back to ``normalized_event_count``.
+    seq = payload.get("unread_event_seq")
+    if not isinstance(seq, int):
+        seq = payload.get("normalized_event_count")
     if not isinstance(updated_at, str):
         updated_at = None
     if not isinstance(seq, int):
@@ -2982,6 +2988,12 @@ class MessageIn(BaseModel):
     pending_id: UUID | None = None
     request_id: str | None = Field(default=None, min_length=1, max_length=200)
     dedupe_key: str | None = Field(default=None, min_length=1, max_length=200)
+    source: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_.:-]+$",
+    )
 
 
 class AgentRespondIn(BaseModel):
@@ -4101,16 +4113,16 @@ def agent_message(ticket: str, body: MessageIn, background: BackgroundTasks) -> 
     resolved = _registry_agent(registry, ticket)
     if resolved is not None and _is_headless(resolved[2]):
         method = "run/send_now" if body.mode == "now" else "run/send_on_idle"
-        result = _supervisor_request(
-            method,
-            {
-                "agent_id": resolved[0],
-                "text": body.text,
-                "pending_id": str(body.pending_id) if body.pending_id else None,
-                "request_id": body.request_id,
-                "dedupe_key": body.dedupe_key,
-            },
-        )
+        params: dict[str, Any] = {
+            "agent_id": resolved[0],
+            "text": body.text,
+            "pending_id": str(body.pending_id) if body.pending_id else None,
+            "request_id": body.request_id,
+            "dedupe_key": body.dedupe_key,
+        }
+        if body.source:
+            params["source"] = body.source
+        result = _supervisor_request(method, params)
         if not isinstance(result, dict):
             raise HTTPException(
                 status_code=502,

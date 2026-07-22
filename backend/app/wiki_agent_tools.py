@@ -97,7 +97,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "steer_agent",
         "description": (
             "Send a supervisor-native message now or once the run is idle. request_id "
-            "is generated when omitted; reuse an explicit value on retry."
+            "is generated when omitted; reuse an explicit value on retry. The turn is "
+            "tagged as a synthetic supervisor-steer source so the receiving session "
+            "renders it as a system marker rather than a Henry-authored message; pass "
+            "an explicit source (e.g. 'mastermind') to override that label."
         ),
         "inputSchema": {
             "type": "object",
@@ -108,6 +111,13 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "message": {"type": "string", "minLength": 1, "maxLength": 4000},
                 "mode": {"enum": ["now", "on-idle"], "default": "now"},
                 "request_id": {"type": "string", "minLength": 1, "maxLength": 200},
+                "source": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64,
+                    "pattern": "^[A-Za-z0-9_.:-]+$",
+                    "default": "supervisor-steer",
+                },
             },
         },
     },
@@ -254,14 +264,20 @@ def steer_agent(arguments: Any) -> dict[str, Any]:
     values = _arguments(
         arguments,
         required={"id", "message"},
-        optional={"mode", "request_id"},
+        optional={"mode", "request_id", "source"},
     )
     agent_id = _string(values.pop("id"), "id")
     message = _string(values.pop("message"), "message")
-    payload = {
+    source = values.get("source")
+    if source is not None and not isinstance(source, str):
+        raise AgentToolError("source must be a string")
+    payload: dict[str, Any] = {
         "text": message,
         "mode": values.get("mode", "now"),
         "request_id": values.get("request_id") or str(uuid4()),
+        # Orchestrator-initiated steers are system messages, not Henry — the
+        # frontend renders them as marker rows rather than user bubbles.
+        "source": source or "supervisor-steer",
     }
     return _backend_api(
         "POST",

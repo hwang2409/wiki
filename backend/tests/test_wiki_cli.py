@@ -603,6 +603,19 @@ class AgentControlCliTests(unittest.TestCase):
             self.assertEqual(json.loads(steer.stdout)["status"], "sent")
             self.assertEqual(json.loads(archive.stdout)["outcome"], "merged")
 
+            # CLI steers are orchestrator-originated, not typed by Henry — they
+            # must carry a synthetic source tag so the receiving session
+            # renders them as system markers instead of user bubbles.
+            message_requests = [
+                payload
+                for method, path, payload in api.requests
+                if method == "POST"
+                and path.endswith("/message")
+                and payload.get("request_id") == "cli-steer-1"
+            ]
+            self.assertEqual(len(message_requests), 1)
+            self.assertEqual(message_requests[0].get("source"), "supervisor-steer")
+
             spawn_requests = [
                 payload
                 for method, path, payload in api.requests

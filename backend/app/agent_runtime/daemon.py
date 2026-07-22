@@ -98,8 +98,8 @@ async def run_daemon(args: argparse.Namespace) -> None:
         )
         fleet_monitor = FleetMonitor(
             supervisor.store,
-            lambda run_id, message, dedupe_key: supervisor.send_now(
-                run_id, message, dedupe_key=dedupe_key
+            lambda run_id, message, dedupe_key, source: supervisor.send_now(
+                run_id, message, dedupe_key=dedupe_key, source=source
             ),
             ownership_lock=supervisor._agent_lock,  # noqa: SLF001
         )

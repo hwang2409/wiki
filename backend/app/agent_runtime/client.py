@@ -154,6 +154,7 @@ class SupervisorClient:
         pending_id: str | None = None,
         request_id: str | None = None,
         dedupe_key: str | None = None,
+        source: str | None = None,
     ) -> dict[str, Any]:
         """Preserve POST /api/agents/<id>/message's now/on-idle contract."""
 
@@ -167,6 +168,8 @@ class SupervisorClient:
             params["request_id"] = request_id
         if dedupe_key is not None:
             params["dedupe_key"] = dedupe_key
+        if source is not None:
+            params["source"] = source
         return dict(self.request(method, params))
 
     def queue(self, agent_id: str) -> dict[str, Any]:

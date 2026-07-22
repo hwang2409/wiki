@@ -57,6 +57,7 @@ import {
 } from "./api";
 import type {
   AgentModelOption,
+  ComposerMessage,
   ProviderEventInspector,
   ProviderPendingRequest,
   QueuedMessage,
@@ -669,34 +670,103 @@ function modelChangedMarkers(session: TranscriptSession | null): SessionEvent[] 
     });
 }
 
-function composerMessageEvents(session: TranscriptSession): SessionEvent[] {
-  const unmatchedUsers = session.events
-    .filter((event) => event.kind === "user")
-    .map((event) => ({ event, matched: false }));
-  const synthetic: SessionEvent[] = [];
-  for (const message of session.composerMessages) {
-    const sentAt = message.sent_at ? Date.parse(message.sent_at) : Number.NaN;
-    const match = unmatchedUsers.find((candidate) => {
-      if (candidate.matched) return false;
-      const eventAt = candidate.event.ts ? Date.parse(candidate.event.ts) : Number.NaN;
-      if (Number.isFinite(sentAt) && Number.isFinite(eventAt) && eventAt < sentAt - 2_000) {
-        return false;
-      }
-      return composerTextMatches(candidate.event.text, message.text);
-    });
-    if (match) {
-      match.matched = true;
+function correlateComposerMessages(
+  events: SessionEvent[],
+  composerMessages: ComposerMessage[],
+): { claimed: Map<number, string | null>; unmatched: ComposerMessage[] } {
+  // Reserve real transcript user events for composer messages FIFO. Every
+  // composer message competes for a slot — unsourced (Henry) rows reserve
+  // before sourced rows can claim, so an identical human turn within a
+  // synthetic turn's 2s window can never be mislabelled as synthetic.
+  const claimed = new Map<number, string | null>();
+  const unmatched: ComposerMessage[] = [];
+  const byPendingId = new Map<string, number>();
+  events.forEach((event, index) => {
+    if (event.kind !== "user") return;
+    const pendingId = event.pending_id;
+    if (pendingId && !byPendingId.has(pendingId)) {
+      byPendingId.set(pendingId, index);
+    }
+  });
+  for (const message of composerMessages) {
+    // Canonical mapping: durable pending_id is unambiguous when present.
+    const durableIndex = byPendingId.get(message.pending_id);
+    if (durableIndex !== undefined && !claimed.has(durableIndex)) {
+      claimed.set(durableIndex, message.source ?? null);
       continue;
     }
-    synthetic.push({
-      id: 2_000_000 + message.seq,
-      kind: "user",
-      ts: message.echoed_at,
-      text: message.text,
-      disposition: "rendered",
+    // Text fallback for providers that do not echo pending_id. Scan FIFO so
+    // an earlier unsourced composer message reserves its Henry-bubble slot
+    // before a later synthetic one is allowed to take it. The match window
+    // is bounded on BOTH sides of the composer's echoed_at (falling back to
+    // sent_at when the provider has not yet echoed): composer_messages is
+    // unbounded across run replacement while the transcript window is
+    // trimmed, so an old sourced row whose real event has fallen out must
+    // not be allowed to claim a later identical terminal-typed Henry row.
+    const anchorAt = (() => {
+      const echoed = message.echoed_at ? Date.parse(message.echoed_at) : Number.NaN;
+      if (Number.isFinite(echoed)) return echoed;
+      const sent = message.sent_at ? Date.parse(message.sent_at) : Number.NaN;
+      return Number.isFinite(sent) ? sent : Number.NaN;
+    })();
+    const FALLBACK_LOOKBACK_MS = 2_000;
+    const FALLBACK_LOOKAHEAD_MS = 60_000;
+    const matchIndex = events.findIndex((event, index) => {
+      if (claimed.has(index) || event.kind !== "user") return false;
+      if (event.pending_id) return false;
+      const eventAt = event.ts ? Date.parse(event.ts) : Number.NaN;
+      if (Number.isFinite(anchorAt) && Number.isFinite(eventAt)) {
+        if (eventAt < anchorAt - FALLBACK_LOOKBACK_MS) return false;
+        if (eventAt > anchorAt + FALLBACK_LOOKAHEAD_MS) return false;
+      } else if (Number.isFinite(anchorAt) !== Number.isFinite(eventAt)) {
+        // Composer has a durable anchor but the event does not (or vice
+        // versa): without both timestamps the window guard is meaningless,
+        // so refuse the fallback rather than allow an unbounded match.
+        return false;
+      }
+      return composerTextMatches(event.text, message.text);
     });
+    if (matchIndex >= 0) {
+      claimed.set(matchIndex, message.source ?? null);
+      continue;
+    }
+    unmatched.push(message);
   }
-  return synthetic;
+  return { claimed, unmatched };
+}
+
+function composerMessageEvents(session: TranscriptSession): SessionEvent[] {
+  const { unmatched } = correlateComposerMessages(
+    session.events,
+    session.composerMessages,
+  );
+  return unmatched.map((message) => ({
+    id: 2_000_000 + message.seq,
+    kind: "user" as const,
+    ts: message.echoed_at,
+    text: message.text,
+    disposition: "rendered" as const,
+    source: message.source ?? null,
+    pending_id: message.pending_id,
+  }));
+}
+
+function applyComposerSources(
+  events: SessionEvent[],
+  composerMessages: ComposerMessage[],
+): SessionEvent[] {
+  if (composerMessages.length === 0) return events;
+  const { claimed } = correlateComposerMessages(events, composerMessages);
+  let mutated = false;
+  const next = events.map((event, index) => {
+    if (!claimed.has(index)) return event;
+    const source = claimed.get(index);
+    if (!source) return event;
+    if (event.source === source) return event;
+    mutated = true;
+    return { ...event, source };
+  });
+  return mutated ? next : events;
 }
 
 function mergeComposerEvents(events: SessionEvent[], composerEvents: SessionEvent[]): SessionEvent[] {
@@ -1310,6 +1380,20 @@ const MARKER_ICON: Record<MarkerSeverity, LucideIcon> = {
   error: AlertTriangle,
 };
 
+function SyntheticSourceRow({ source, text }: { source: string; text: string }) {
+  const collapsed = text.replace(/\s+/g, " ").trim();
+  return (
+    <div
+      className="session-synthetic-source"
+      data-source={source}
+      data-testid="session-synthetic-source"
+    >
+      <span className="session-synthetic-source-chip">[{source}]</span>
+      <span className="session-synthetic-source-text">{collapsed}</span>
+    </div>
+  );
+}
+
 function MarkerRow({ text, marker }: { text: string; marker?: string }) {
   const rule = markerRule(marker);
   if (!rule) {
@@ -1481,6 +1565,9 @@ const MessageBlock = memo(function MessageBlock({
     return <ArtifactBlock event={event} onOpen={onOpenArtifact} ticket={ticket} />;
   }
   if (event.kind === "user") {
+    if (event.source) {
+      return <SyntheticSourceRow source={event.source} text={event.text} />;
+    }
     return (
       <div className="session-user">
         <UserText imageNums={imageNums} text={event.text} />
@@ -1638,7 +1725,8 @@ function groupTimestamp(group: EventGroup): string | null {
 }
 
 function groupAlign(group: EventGroup): "end" | "start" {
-  return group.kind === "message" && group.event.kind === "user" ? "end" : "start";
+  if (group.kind !== "message" || group.event.kind !== "user") return "start";
+  return group.event.source ? "start" : "end";
 }
 
 function computeTimestampKeys(groups: EventGroup[]): Set<number> {
@@ -2095,7 +2183,10 @@ export function SessionTab({
     () => {
       if (!session) return [];
       return [
-        ...mergeComposerEvents(session.events, composerMessageEvents(session)),
+        ...mergeComposerEvents(
+          applyComposerSources(session.events, session.composerMessages),
+          composerMessageEvents(session),
+        ),
         ...modelChangedMarkers(session),
       ];
     },
@@ -2364,15 +2455,24 @@ export function SessionTab({
   );
 
   // K/J recall in the composer — user messages from the transcript itself
-  // (covers terminal-typed AND wiki-sent, no separate storage).
-  const userHistory = useMemo(
-    () =>
-      (session?.events ?? [])
-        .filter((event) => event.kind === "user" && event.text.length <= 2000)
-        .map((event) => event.text)
-        .slice(-50),
-    [session]
-  );
+  // (covers terminal-typed AND wiki-sent, no separate storage). Synthetic
+  // fleet/steer/mastermind turns are system messages, not Henry input, so
+  // they must not surface as recall candidates. Apply the composer-source
+  // correlation first so that composer_messages-tagged turns are excluded
+  // alongside transcript-tagged ones.
+  const userHistory = useMemo(() => {
+    if (!session) return [];
+    const enriched = applyComposerSources(session.events, session.composerMessages);
+    return enriched
+      .filter(
+        (event) =>
+          event.kind === "user" &&
+          !event.source &&
+          event.text.length <= 2000,
+      )
+      .map((event) => event.text)
+      .slice(-50);
+  }, [session]);
 
   const taskCounts = useMemo(() => {
     const c = { total: 0, done: 0, progress: 0, open: 0 };

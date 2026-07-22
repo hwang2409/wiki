@@ -762,6 +762,9 @@ def cmd_agent_steer(args: argparse.Namespace) -> None:
             "text": text,
             "mode": args.mode,
             "request_id": _request_id(args.request_id),
+            # Every CLI steer is orchestrator-originated, not typed by Henry —
+            # tag it so the frontend renders a system marker row, not a bubble.
+            "source": args.source or "supervisor-steer",
         },
     )
 
@@ -1556,6 +1559,15 @@ def main() -> None:
     steer_input.add_argument("--file")
     steer.add_argument("--mode", choices=("now", "on-idle"), default="now")
     steer.add_argument("--request-id", help="idempotency key; defaults to a generated UUID")
+    steer.add_argument(
+        "--source",
+        help=(
+            "synthetic source tag (default supervisor-steer); use fleet-monitor / "
+            "mastermind for those producers. Renders as a system marker row, not a "
+            "Henry-authored bubble."
+        ),
+        default=None,
+    )
     steer.set_defaults(func=cmd_agent_steer)
 
     replace = agent_sub.add_parser("replace", help="replace a supervisor-owned worker or orchestrator")

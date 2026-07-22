@@ -26,7 +26,8 @@ from .store import RunStore
 from .types import LifecycleState, RunRecord, TERMINAL_STATES
 
 
-SendNow = Callable[[str, str, str | None], Awaitable[Any]]
+SendNow = Callable[[str, str, str | None, str | None], Awaitable[Any]]
+FLEET_MONITOR_SOURCE = "fleet-monitor"
 
 
 DEFAULT_INTERVAL_SECONDS = 15.0
@@ -619,7 +620,8 @@ class FleetMonitor:
                         self.send_now(
                             orch_run_id,
                             message,
-                            dedupe_key=dedupe_key,
+                            dedupe_key,
+                            FLEET_MONITOR_SOURCE,
                         ),
                         timeout=self.send_timeout,
                     )

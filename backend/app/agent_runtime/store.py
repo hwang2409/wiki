@@ -125,6 +125,114 @@ def _apply_pending_request_event(
         record.pending_requests.pop(_provider_request_key(request_id), None)
 
 
+_UNREAD_SKIP_KIND_SUFFIXES = ("_client_message", "_stderr")
+
+# Codex protocol rows that fire around a turn (before/after any actual worker
+# output) but do not represent a new view for Henry. Names match the
+# ``method.replace("/", "_")`` conversion used by _normalize_codex.
+_CODEX_UNREAD_SKIP_KINDS = frozenset(
+    {
+        "thread_started",
+        "thread_archived",
+        "thread_closed",
+        "thread_status_changed",
+        "thread_tokenUsage_updated",
+        "thread_settings_updated",
+        "thread_goal_cleared",
+        "turn_started",
+        "turn_completed",
+        "turn_aborted",
+        "context_compacted",
+        "serverRequest_resolved",
+        "account_rateLimits_updated",
+        "account_chatgptAuthTokens_refresh",
+    }
+)
+
+_UNREAD_SKIP_KINDS = frozenset(
+    _CODEX_UNREAD_SKIP_KINDS
+    | {
+        # Inbound Claude user echo — same rule as Codex user items below.
+        "claude_user",
+        # (``codex_user`` is unreachable in practice — Codex user turns are
+        #  ``item_started`` / ``item_completed`` with ``item.type ==
+        #  "userMessage"``; those are filtered by payload inspection below.)
+        "codex_user",
+        # Approval-side and provider-lifecycle rows.
+        "approval",
+        "approval_response",
+        "approval_cancelled",
+        "approval_resolved",
+        "provider_process_exit",
+        "provider_protocol_error",
+        "rpc_response",
+        "unknown",
+        "normalization_error",
+    }
+)
+
+
+def _codex_item_type(payload: dict[str, Any]) -> str | None:
+    params = payload.get("params")
+    if not isinstance(params, dict):
+        return None
+    item = params.get("item")
+    if not isinstance(item, dict):
+        return None
+    item_type = item.get("type")
+    return item_type if isinstance(item_type, str) else None
+
+
+def _claude_payload_type(payload: dict[str, Any]) -> str | None:
+    value = payload.get("type")
+    return value if isinstance(value, str) else None
+
+
+def _is_unread_worthy(kind: str, payload: dict[str, Any] | None, disposition: str) -> bool:
+    """Whether a normalized event should advance ``unread_event_seq``.
+
+    Unread is "new worker-authored output Henry has not seen yet". Anything
+    else — outbound client_message rows, provider-lifecycle boundaries,
+    approval/response bookkeeping, both directions of user echoes (Henry
+    typed and synthetic supervisor wakes), token metrics, and any payload
+    carrying an explicit ``source`` tag — must leave the counter alone so a
+    fleet-monitor turn cannot light the dot before the worker responds.
+    """
+
+    if disposition == EventDisposition.IGNORED.value:
+        return False
+    if kind in _UNREAD_SKIP_KINDS:
+        return False
+    if any(kind.endswith(suffix) for suffix in _UNREAD_SKIP_KIND_SUFFIXES):
+        return False
+    if not isinstance(payload, dict):
+        # Kind alone survived every skip above; still not a rendered surface.
+        return False
+    source = payload.get("source")
+    if isinstance(source, str) and source:
+        return False
+    # Codex normalizes real user turns as ``item_started`` / ``item_completed``
+    # envelopes whose inner ``item.type == "userMessage"``. Those look agent-
+    # originated from the kind alone and would otherwise sneak past the
+    # (deliberately unreachable) ``codex_user`` allowlist entry above.
+    if kind in {"item_started", "item_completed"}:
+        item_type = _codex_item_type(payload)
+        if item_type == "userMessage":
+            return False
+        # Only ``item_completed`` finalizes a visible surface. The paired
+        # ``item_started`` is a lifecycle boundary — dropping it prevents
+        # each streamed assistant turn from double-counting.
+        if kind == "item_started":
+            return False
+    # Claude payloads with ``type == "user"`` are user inbound echoes even
+    # when the outer normalized ``kind`` failed to be ``claude_user`` (e.g.
+    # source-tagged wakes surface here with the fleet ``source`` filter
+    # above, but defence-in-depth catches any missed labelling).
+    if _claude_payload_type(payload) == "user":
+        return False
+    return True
+
+
 def _apply_composer_message_event(
     record: RunRecord,
     *,
@@ -137,6 +245,8 @@ def _apply_composer_message_event(
     sent_at = payload.get("composer_sent_at")
     if not all(isinstance(value, str) for value in (pending_id, text, sent_at)):
         return
+    source_raw = payload.get("source")
+    source = source_raw if isinstance(source_raw, str) and source_raw else None
     record.pending_user_messages = [
         message
         for message in record.pending_user_messages
@@ -147,15 +257,16 @@ def _apply_composer_message_event(
         for message in record.composer_messages
     ):
         return
-    record.composer_messages.append(
-        {
-            "pending_id": pending_id,
-            "text": text,
-            "sent_at": sent_at,
-            "echoed_at": normalized_at,
-            "seq": seq,
-        }
-    )
+    entry: dict[str, Any] = {
+        "pending_id": pending_id,
+        "text": text,
+        "sent_at": sent_at,
+        "echoed_at": normalized_at,
+        "seq": seq,
+    }
+    if source is not None:
+        entry["source"] = source
+    record.composer_messages.append(entry)
 
 
 def _resolved_parent(path: Path) -> Path:
@@ -530,15 +641,17 @@ class RunStore:
                 previous_composer_messages = list(record.composer_messages)
                 record.pending_requests = {}
                 lifecycle_checkpoint = record.last_lifecycle_event_seq
+                rebuilt_unread_seq = 0
                 for event in normalized_events:
                     disposition = event.get("disposition")
                     if disposition in counts:
                         counts[disposition] += 1
                     payload = event.get("payload")
+                    kind_value = str(event.get("kind") or "unknown")
                     if isinstance(payload, dict):
                         _apply_pending_request_event(
                             record,
-                            kind=str(event.get("kind") or "unknown"),
+                            kind=kind_value,
                             payload=payload,
                             raw_seq=int(event.get("raw_seq", 0)),
                             normalized_at=str(event.get("normalized_at") or utc_now()),
@@ -551,6 +664,15 @@ class RunStore:
                             seq=seq,
                             normalized_at=str(event.get("normalized_at") or utc_now()),
                         )
+                    # Rebuild the WIKI-161 unread-worthy counter alongside
+                    # normalized_event_count so a crash between JSONL fsync
+                    # and run.json replace cannot leave a stale value on disk.
+                    if _is_unread_worthy(
+                        kind_value,
+                        payload if isinstance(payload, dict) else None,
+                        str(disposition or ""),
+                    ):
+                        rebuilt_unread_seq = seq
                     if seq <= lifecycle_checkpoint:
                         continue
                     lifecycle_value = event.get("lifecycle_state")
@@ -587,11 +709,13 @@ class RunStore:
                     or previous_pending_user_messages != record.pending_user_messages
                     or previous_composer_messages != record.composer_messages
                     or record.last_lifecycle_event_seq != lifecycle_checkpoint
+                    or record.unread_event_seq != rebuilt_unread_seq
                 ):
                     record.raw_event_count = raw_count
                     record.normalized_event_count = normalized_count
                     record.disposition_counts = counts
                     record.last_lifecycle_event_seq = lifecycle_checkpoint
+                    record.unread_event_seq = rebuilt_unread_seq
                     self._write_record(record)
             except (OSError, StoreError, TypeError, ValueError):
                 # A corrupt run remains on disk for the inspector; one bad run
@@ -1187,6 +1311,12 @@ class RunStore:
             }
             _append_json_line(self.normalized_events_path(run_id), envelope)
             record.normalized_event_count = int(envelope["seq"])
+            # Unread advances only on genuinely worker-authored surface events
+            # (see _is_unread_worthy). Synthetic supervisor wakes, outbound
+            # client_message rows, provider-lifecycle boundaries, and user
+            # inbound echoes all leave the counter alone.
+            if _is_unread_worthy(kind, payload, disposition.value):
+                record.unread_event_seq = int(envelope["seq"])
             record.disposition_counts[disposition.value] = (
                 record.disposition_counts.get(disposition.value, 0) + 1
             )
@@ -1412,12 +1542,18 @@ class RunStore:
         run_id: str,
         pending_id: str,
         text: str,
+        source: str | None = None,
     ) -> RunRecord:
         with self._lock:
             record = self.get(run_id)
-            record.pending_user_messages.append(
-                {"pending_id": pending_id, "text": text, "sent_at": utc_now()}
-            )
+            entry: dict[str, Any] = {
+                "pending_id": pending_id,
+                "text": text,
+                "sent_at": utc_now(),
+            }
+            if isinstance(source, str) and source:
+                entry["source"] = source
+            record.pending_user_messages.append(entry)
             self._write_record(record)
             return record
 
@@ -1475,12 +1611,15 @@ class RunStore:
         run_id: str,
         text: str,
         pending_id: str | None = None,
+        source: str | None = None,
     ) -> RunRecord:
         with self._lock:
             record = self.get(run_id)
-            message = {"text": text, "queued_at": utc_now()}
+            message: dict[str, Any] = {"text": text, "queued_at": utc_now()}
             if pending_id is not None:
                 message["pending_id"] = pending_id
+            if isinstance(source, str) and source:
+                message["source"] = source
             record.queued_messages.append(message)
             self._write_record(record)
             return record
