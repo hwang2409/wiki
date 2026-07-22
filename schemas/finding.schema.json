@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wiki.henry/schemas/finding.json",
+  "type": "object",
+  "required": [
+    "id",
+    "severity",
+    "title",
+    "observed",
+    "why_wrong",
+    "do_instead",
+    "source_worker",
+    "source_sha",
+    "created_at"
+  ],
+  "properties": {
+    "id": {"type": "string", "pattern": "^F-[a-z0-9]{6}$"},
+    "severity": {"enum": ["BLOCKING", "HIGH", "MEDIUM", "LOW", "INFO"]},
+    "title": {"type": "string", "maxLength": 140},
+    "file": {"type": "string"},
+    "line": {"type": "integer", "minimum": 1},
+    "observed": {"type": "string"},
+    "why_wrong": {"type": "string"},
+    "do_instead": {"type": "string"},
+    "constraint": {"type": "string"},
+    "source_worker": {"type": "string", "description": "worker id, e.g. PHO-14060-REVIEW3"},
+    "source_kind": {"enum": ["review", "sim", "thermo", "audit", "canary", "eval", "human"]},
+    "source_sha": {"type": "string", "pattern": "^[a-f0-9]{7,40}$"},
+    "linked_findings": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "F-* ids that supersede/duplicate this one"
+    },
+    "resolved_by": {"type": ["string", "null"], "description": "sha or null while open"},
+    "created_at": {"type": "string", "format": "date-time"},
+    "sla_deadline": {"type": ["string", "null"], "format": "date-time"}
+  },
+  "additionalProperties": false
+}

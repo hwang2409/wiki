@@ -8,6 +8,7 @@ Hot-path writes with validation, so conventions hold mechanically:
   wiki todo complete "substring" [--done-line "terse completion"]
   wiki agent spawn <ticket> --kind cdx --role implement --model gpt-5.4 --effort high --prompt-file prompt.md --workdir /path
   wiki agent steer <id> --message "text" [--mode now|on-idle]
+  wiki graph lint <path> [--schema finding|verdict|steer|edge|workgraph]
   wiki agent replace <id> [--kind cc|cdx] [--model model] [--effort effort]
   wiki agent archive <id> --outcome merged|closed|abandoned
   wiki agent watch <ticket> [--json] [--until merge-ready|terminal|merged]
@@ -38,6 +39,7 @@ from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from backend.app import backend_runtime, knowledge, vaultops  # noqa: E402
+from wiki_cli import graph_lint  # noqa: E402
 
 VAULT = Path(
     os.environ.get("WIKI_VAULT_DIR") or Path(__file__).resolve().parent / "vault"
@@ -1271,6 +1273,14 @@ def cmd_gate(args: argparse.Namespace) -> None:
     raise SystemExit(0 if result["ready"] else 1)
 
 
+def cmd_graph_lint(args: argparse.Namespace) -> None:
+    violations = graph_lint.lint_path(args.path, args.schema)
+    if violations:
+        print("\n".join(violations))
+        raise SystemExit(1)
+    print(f"{args.path}: valid")
+
+
 def cmd_note_rename(args: argparse.Namespace) -> None:
     old = args.old.removesuffix(".md") + ".md"
     new = args.new.removesuffix(".md") + ".md"
@@ -1659,6 +1669,16 @@ def main() -> None:
     gate.add_argument("--expect-sha", help="required prefix of the PR head SHA")
     gate.add_argument("--json", action="store_true", help="emit a JSON verdict")
     gate.set_defaults(func=cmd_gate)
+
+    graph = sub.add_parser("graph", help="validate graph artifacts")
+    graph_sub = graph.add_subparsers(dest="graph_command", required=True)
+    graph_lint_parser = graph_sub.add_parser("lint", help="validate a graph JSON artifact")
+    graph_lint_parser.add_argument("path")
+    graph_lint_parser.add_argument(
+        "--schema",
+        help="schema name or path; otherwise detect from the artifact shape",
+    )
+    graph_lint_parser.set_defaults(func=cmd_graph_lint)
 
     lint = sub.add_parser("lint", help="validate vault conventions")
     lint.set_defaults(func=cmd_lint)

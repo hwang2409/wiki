@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wiki.henry/schemas/verdict.json",
+  "type": "object",
+  "required": ["worker", "sha", "state", "findings", "created_at"],
+  "properties": {
+    "worker": {"type": "string"},
+    "sha": {"type": "string"},
+    "state": {"enum": ["MERGE-READY", "NOT-MERGE-READY", "NO-GO", "INSUFFICIENT-CONTEXT"]},
+    "findings": {"type": "array", "items": {"$ref": "finding.json"}},
+    "summary": {"type": "string", "maxLength": 500},
+    "created_at": {"type": "string", "format": "date-time"}
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,7 @@
+{
+  "worker": "WIKI-162-REVIEW1",
+  "sha": "0123456",
+  "state": "MERGE-READY",
+  "findings": "not-an-array",
+  "created_at": "not-a-date"
+}

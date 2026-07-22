@@ -1,0 +1,7 @@
+{
+  "kind": "spawn",
+  "from": "N-1",
+  "to": "N-2",
+  "payload": {"ticket": "WIKI-162"},
+  "created_at": "2026-07-22T18:00:00Z"
+}
