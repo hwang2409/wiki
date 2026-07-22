@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
@@ -124,7 +126,10 @@ def _validator(schema_name: str):
     )
 
 
-def _sha_violations(document: Any) -> list[tuple[str, str]]:
+def _sha_violations(
+    document: Any,
+    pointer_prefix: str = "",
+) -> list[tuple[str, str]]:
     if not isinstance(document, dict):
         return []
     verdict_sha = document.get("sha")
@@ -139,11 +144,68 @@ def _sha_violations(document: Any) -> list[tuple[str, str]]:
         if isinstance(source_sha, str) and source_sha != verdict_sha:
             violations.append(
                 (
-                    f"/findings/{index}/source_sha",
+                    f"{pointer_prefix}/findings/{index}/source_sha",
                     f"must match verdict sha {verdict_sha!r} (got {source_sha!r})",
                 )
             )
     return violations
+
+
+def _nested_verdicts(document: Any, schema_name: str) -> list[tuple[str, Any]]:
+    """Return verdict payloads and their JSON-pointer roots."""
+    if schema_name == "verdict":
+        return [("", document)]
+    if schema_name == "edge":
+        if isinstance(document, dict) and document.get("kind") == "verdict":
+            return [("/payload", document.get("payload"))]
+        return []
+    if schema_name == "workgraph" and isinstance(document, dict):
+        edges = document.get("edges")
+        if isinstance(edges, list):
+            return [
+                (f"/edges/{index}/payload", edge.get("payload"))
+                for index, edge in enumerate(edges)
+                if isinstance(edge, dict) and edge.get("kind") == "verdict"
+            ]
+    return []
+
+
+def compose_steer_document(
+    target_worker: str,
+    mode: str,
+    message: str,
+    *,
+    source_worker: str = "supervisor-steer",
+    request_id: str = "",
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    """Represent a legacy free-form steer as a schema-valid Steer document.
+
+    The backend message API remains a text API. This typed companion document is
+    validated before that API is called, preserving the existing response contract.
+    """
+    timestamp = created_at or datetime.now(timezone.utc).isoformat(timespec="seconds")
+    digest = hashlib.sha256(f"{request_id}\0{message}".encode()).hexdigest()
+    return {
+        "target_worker": target_worker,
+        "mode": mode,
+        "findings": [
+            {
+                "id": f"F-{digest[:6]}",
+                "severity": "INFO",
+                "title": "supervisor steer instruction",
+                "observed": message,
+                "why_wrong": "the worker needs this steering instruction",
+                "do_instead": message,
+                "source_worker": source_worker,
+                "source_kind": "human",
+                "source_sha": digest[:7],
+                "created_at": timestamp,
+            }
+        ],
+        "preamble": message.splitlines()[0][:140],
+        "created_at": timestamp,
+    }
 
 
 def validate_document(document: Any, schema_name: str) -> list[tuple[str, str]]:
@@ -152,8 +214,8 @@ def validate_document(document: Any, schema_name: str) -> list[tuple[str, str]]:
         (_json_pointer(error.absolute_path), _message(error.message))
         for error in _validator(schema_name).iter_errors(document)
     ]
-    if schema_name == "verdict":
-        errors.extend(_sha_violations(document))
+    for pointer_prefix, verdict in _nested_verdicts(document, schema_name):
+        errors.extend(_sha_violations(verdict, pointer_prefix))
     return sorted(errors, key=lambda item: (item[0], item[1]))
 
 

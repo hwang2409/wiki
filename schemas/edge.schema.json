@@ -105,9 +105,7 @@
       "required": ["capability", "granted_by"],
       "properties": {
         "capability": {"type": "string"},
-        "granted_by": {"type": "string"},
-        "ticket": {"type": "string"},
-        "reason": {"type": "string"}
+        "granted_by": {"type": "string"}
       },
       "additionalProperties": false
     },

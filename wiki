@@ -708,6 +708,16 @@ def _request_id(value: str | None) -> str:
     return request_id
 
 
+def _validate_steer_document(document: dict) -> None:
+    try:
+        violations = graph_lint.validate_document(document, "steer")
+    except graph_lint.GraphLintError as exc:
+        fail(f"could not validate Steer: {exc}")
+    if violations:
+        formatted = "; ".join(f"{pointer}: {message}" for pointer, message in violations)
+        fail(f"invalid Steer: {formatted}")
+
+
 def _print_backend_call(path: str, payload: dict | None = None) -> dict:
     try:
         result = _backend_post(path, payload)
@@ -758,15 +768,26 @@ def cmd_agent_steer(args: argparse.Namespace) -> None:
     )
     if not text.strip():
         fail("steer message must not be empty")
+    request_id = _request_id(args.request_id)
+    source = args.source or "supervisor-steer"
+    _validate_steer_document(
+        graph_lint.compose_steer_document(
+            agent_id,
+            args.mode,
+            text,
+            source_worker=source,
+            request_id=request_id,
+        )
+    )
     _print_backend_call(
         f"/api/agents/{quote(agent_id)}/message",
         {
             "text": text,
             "mode": args.mode,
-            "request_id": _request_id(args.request_id),
+            "request_id": request_id,
             # Every CLI steer is orchestrator-originated, not typed by Henry —
             # tag it so the frontend renders a system marker row, not a bubble.
-            "source": args.source or "supervisor-steer",
+            "source": source,
         },
     )
 

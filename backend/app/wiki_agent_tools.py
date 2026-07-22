@@ -261,6 +261,8 @@ def spawn_agent(arguments: Any) -> dict[str, Any]:
 
 
 def steer_agent(arguments: Any) -> dict[str, Any]:
+    from wiki_cli import graph_lint
+
     values = _arguments(
         arguments,
         required={"id", "message"},
@@ -271,10 +273,26 @@ def steer_agent(arguments: Any) -> dict[str, Any]:
     source = values.get("source")
     if source is not None and not isinstance(source, str):
         raise AgentToolError("source must be a string")
+    mode = values.get("mode", "now")
+    request_id = values.get("request_id") or str(uuid4())
+    typed_steer = graph_lint.compose_steer_document(
+        agent_id,
+        mode,
+        message,
+        source_worker=source or "supervisor-steer",
+        request_id=request_id,
+    )
+    try:
+        violations = graph_lint.validate_document(typed_steer, "steer")
+    except graph_lint.GraphLintError as exc:
+        raise AgentToolError(f"could not validate Steer: {exc}") from exc
+    if violations:
+        formatted = "; ".join(f"{pointer}: {error}" for pointer, error in violations)
+        raise AgentToolError(f"invalid Steer: {formatted}")
     payload: dict[str, Any] = {
         "text": message,
-        "mode": values.get("mode", "now"),
-        "request_id": values.get("request_id") or str(uuid4()),
+        "mode": mode,
+        "request_id": request_id,
         # Orchestrator-initiated steers are system messages, not Henry — the
         # frontend renders them as marker rows rather than user bubbles.
         "source": source or "supervisor-steer",
