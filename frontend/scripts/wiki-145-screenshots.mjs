@@ -21,13 +21,17 @@ function resolvePython() {
     path.resolve(ROOT, "..", "..", "..", ".venv", "bin", "python"),
   ].filter(Boolean);
   const found = candidates.find((candidate) => existsSync(candidate));
-  if (!found) {
-    throw new Error(
-      `No Python runtime found for artifact fixture worker. Tried: ${candidates.join(", ")}. ` +
-        `Set WIKI_PYTHON to override.`,
-    );
+  if (found) return found;
+  for (const name of ["python3", "python"]) {
+    const which = spawnSync("/usr/bin/env", ["which", name], { encoding: "utf8" });
+    const resolved = (which.stdout || "").trim();
+    if (which.status === 0 && resolved && existsSync(resolved)) return resolved;
   }
-  return found;
+  throw new Error(
+    `No Python runtime found for artifact fixture worker. Tried: ${candidates.join(", ")}, ` +
+      `then \`which python3\` and \`which python\` on PATH. ` +
+      `Set WIKI_PYTHON to override.`,
+  );
 }
 
 const PYTHON = resolvePython();
