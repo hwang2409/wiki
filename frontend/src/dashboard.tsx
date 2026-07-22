@@ -14,26 +14,27 @@ import {
   type SortKey,
 } from "./dashboard-logic";
 import { externalLinkProps } from "./external-links";
+import { StatusBadge } from "./status-badge";
 import { formatRelative } from "./timestamp-format";
 
 const REFRESH_INTERVAL_MS = 15_000;
 const FILTERS_STORAGE_KEY = "wiki-dashboard-filters";
 
-const STATUS_CLASS: Record<string, string> = {
-  implementing: "is-working",
-  working: "is-working",
-  blocked: "is-blocked",
-  "merge-ready": "is-merge-ready",
-  "pr-open": "is-pr-open",
-  "checks-pending": "is-checks-pending",
-  failing: "is-failing",
-  "has-comments": "is-has-comments",
-  passing: "is-passing",
-  merged: "is-outcome-merged",
-  "merged (local)": "is-outcome-merged",
-  prod: "is-prod",
-  closed: "is-outcome-closed",
-  abandoned: "is-outcome-abandoned",
+const STATUS_STATE: Record<string, string> = {
+  implementing: "working",
+  working: "working",
+  blocked: "blocked",
+  "merge-ready": "merge-ready",
+  "pr-open": "pr-open",
+  "checks-pending": "checks-pending",
+  failing: "failing",
+  "has-comments": "has-comments",
+  passing: "passing",
+  merged: "outcome-merged",
+  "merged (local)": "outcome-merged",
+  prod: "prod",
+  closed: "outcome-closed",
+  abandoned: "outcome-abandoned",
 };
 
 function prNumber(url: string): string {
@@ -202,12 +203,11 @@ export function DashboardView({
                     )}
                   </td>
                   <td>
-                    <span
-                      className={`agent-state ${STATUS_CLASS[ticket.status] ?? "is-unknown"}`}
-                      title={ticket.detail ?? undefined}
-                    >
-                      {ticket.status}
-                    </span>
+                    <StatusBadge
+                      label={ticket.status}
+                      state={STATUS_STATE[ticket.status] ?? "unknown"}
+                      title={ticket.detail ?? ticket.status}
+                    />
                   </td>
                   <td className="dashboard-date" title={ticket.date ?? undefined}>
                     {ticket.date ? formatRelative(ticket.date, nowMs) : "—"}

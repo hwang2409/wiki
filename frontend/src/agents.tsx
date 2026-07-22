@@ -4,7 +4,6 @@ import {
   Archive,
   Bot,
   ExternalLink,
-  GitBranch,
   GitPullRequest,
   Plus,
   RefreshCw,
@@ -36,6 +35,8 @@ import { LoadingPlaceholder } from "./loading";
 import { ReplaceAgentModal, type ReplaceAgentTarget } from "./replace-agent-modal";
 import { SessionSidebar } from "./session";
 import type { SidebarTarget } from "./session";
+import { BranchPill } from "./branch-pill";
+import { StatusBadge } from "./status-badge";
 
 const STALE_SECONDS = 5 * 60;
 const SPAWN_TICKET_PATTERN = /^[A-Z0-9-]+$/;
@@ -1062,7 +1063,7 @@ export function AgentsView({
     const pending = archivePending === id;
     return (
       <>
-        <span className="agent-state is-detached">{DEAD_RUN_COPY}</span>
+        <StatusBadge label={DEAD_RUN_COPY} state="detached" />
         <button
           className="agent-archive-button"
           disabled={Boolean(archivePending)}
@@ -1099,7 +1100,7 @@ export function AgentsView({
           {deadRun ? (
             <DeadRunAffordance id={worker.ticket} />
           ) : (
-            <span className={`agent-state is-${worker.state ?? "unknown"}`}>{state}</span>
+            <StatusBadge label={state} state={worker.state ?? "unknown"} />
           )}
           <span className="agent-age tabular-nums">{ageLabel(worker.status_age_seconds)}</span>
         </header>
@@ -1141,10 +1142,10 @@ export function AgentsView({
             </span>
           ) : null}
           {worker.worktree ? (
-            <span className="agent-worktree" title={worker.worktree}>
-              <GitBranch size={11} />
-              {worker.worktree.split("/").slice(-1)[0]}
-            </span>
+            <BranchPill
+              branch={worker.worktree.split("/").slice(-1)[0] ?? worker.worktree}
+              title={worker.worktree}
+            />
           ) : null}
           {worker.pr ? (
             <a className="agent-pr" href={worker.pr} {...externalLinkProps(worker.pr)}>
@@ -1231,9 +1232,10 @@ export function AgentsView({
                   deadRun ? (
                     <DeadRunAffordance id={orch.id} />
                   ) : (
-                    <span className={`agent-state is-${orch.runtime_state ?? "unknown"}`}>
-                      {stateValueLabel(orch.runtime_state)}
-                    </span>
+                    <StatusBadge
+                      label={stateValueLabel(orch.runtime_state)}
+                      state={orch.runtime_state ?? "unknown"}
+                    />
                   )
                 ) : null}
                 {orch.run_id ? (
@@ -1314,11 +1316,9 @@ export function AgentsView({
                     {entry.role ? <span className="agent-chip">{entry.role}</span> : null}
                     {entry.model ? <span className="agent-chip is-faint">{entry.model}</span> : null}
                     {entry.outcome ? (
-                      <span className={`agent-state is-outcome-${entry.outcome}`}>
-                        {entry.outcome}
-                      </span>
+                      <StatusBadge label={entry.outcome} state={`outcome-${entry.outcome}`} />
                     ) : entry.state ? (
-                      <span className={`agent-state is-${entry.state}`}>{entry.state}</span>
+                      <StatusBadge label={entry.state} state={entry.state} />
                     ) : null}
                     <span className="agent-age tabular-nums">{archivedAge(entry.archived_at)}</span>
                   </header>

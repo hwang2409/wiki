@@ -20,7 +20,7 @@ TEXT_LIMIT = 100_000
 IMAGE_LIMIT = 5 * 1024 * 1024
 SENTINEL_START = "<<wiki-artifact:v1>>"
 SENTINEL_END = "<<end>>"
-ARTIFACT_KINDS = {"mermaid", "svg", "image", "table", "plot", "code"}
+ARTIFACT_KINDS = {"mermaid", "svg", "image", "table", "plot", "code", "diff", "file-list", "json"}
 IMAGE_TYPES = {
     "image/png": "png",
     "image/jpeg": "jpg",
@@ -152,6 +152,31 @@ def _validate_text_payload(kind: str, payload: dict[str, Any]) -> dict[str, Any]
         for field in ("filename", "diff_from"):
             if field in payload and not isinstance(payload[field], str):
                 raise ArtifactValidationError(f"payload.{field} must be a string")
+    elif kind == "diff":
+        _require_keys(payload, required={"source"})
+        _require_string(payload["source"], "payload.source", allow_empty=True)
+    elif kind == "file-list":
+        _require_keys(payload, required={"files"})
+        files = payload["files"]
+        if not isinstance(files, list):
+            raise ArtifactValidationError("payload.files must be an array")
+        for index, entry in enumerate(files):
+            if not isinstance(entry, dict):
+                raise ArtifactValidationError(f"payload.files[{index}] must be an object")
+            _require_keys(
+                entry,
+                required={"path"},
+                optional={"label", "size", "status"},
+            )
+            _require_string(entry["path"], f"payload.files[{index}].path")
+            if "label" in entry and not isinstance(entry["label"], str):
+                raise ArtifactValidationError(f"payload.files[{index}].label must be a string")
+            if "status" in entry and not isinstance(entry["status"], str):
+                raise ArtifactValidationError(f"payload.files[{index}].status must be a string")
+            if "size" in entry and not isinstance(entry["size"], (int, float)):
+                raise ArtifactValidationError(f"payload.files[{index}].size must be a number")
+    elif kind == "json":
+        _require_keys(payload, required={"json_data"})
     if _text_size(payload) > TEXT_LIMIT:
         raise ArtifactValidationError(
             f"{kind} payload exceeds the {TEXT_LIMIT // 1000}KB text limit"

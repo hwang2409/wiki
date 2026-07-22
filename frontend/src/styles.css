@@ -64,6 +64,32 @@
   --radius-m: 8px;
   --pane-focus-ring: color-mix(in srgb, var(--text-normal) 40%, transparent);
 
+  --fs-2xs: 10px;
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs-md: 13px;
+  --fs-base: 14px;
+  --fs-lg: 15px;
+  --fs-xl: 16px;
+  --fs-2xl: 18px;
+  --fs-3xl: 22px;
+  --fs-4xl: 28px;
+  --fs-5xl: 34px;
+
+  --fw-regular: 400;
+  --fw-medium: 500;
+  --fw-semibold: 600;
+  --fw-display: 700;
+
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 10px;
+  --radius-xl: 12px;
+  --radius-full: 999px;
+
+  --readable-col: var(--file-line-width);
+
   --font-interface: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue",
     Helvetica, Arial, sans-serif;
   --font-text: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue",
@@ -168,7 +194,7 @@ button:disabled {
 .loading-line {
   display: block;
   height: 10px;
-  border-radius: 999px;
+  border-radius: var(--radius-full);
   background: linear-gradient(
     90deg,
     var(--background-secondary) 0%,
@@ -442,7 +468,7 @@ button:disabled {
 }
 
 .nav-folder-title {
-  font-weight: 500;
+  font-weight: var(--fw-medium);
 }
 
 .nav-code-file-title {
@@ -532,7 +558,7 @@ button:disabled {
 .search-result-title {
   color: var(--text-normal);
   font-size: var(--font-ui-small);
-  font-weight: 500;
+  font-weight: var(--fw-medium);
 }
 
 .search-result-path {
@@ -880,7 +906,7 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-faint);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: 10px;
+  font-size: var(--fs-2xs);
 }
 
 .code-file-language {
@@ -971,7 +997,7 @@ body.is-resizing-panes .pane-cell {
 
 .code-file-source mark,
 .code-file-highlighted mark {
-  border-radius: 1px;
+  border-radius: var(--radius-xs);
   background: color-mix(in srgb, var(--accent-primary) 36%, transparent);
   color: inherit;
 }
@@ -1037,7 +1063,7 @@ body.is-resizing-panes .pane-cell {
   min-height: 26px;
   padding: 0 4px 0 8px;
   border: 1px solid var(--terminal-border);
-  border-radius: 999px;
+  border-radius: var(--radius-full);
   background: var(--terminal-surface);
 }
 
@@ -1057,7 +1083,7 @@ body.is-resizing-panes .pane-cell {
   flex: 0 0 auto;
   color: var(--terminal-muted);
   font-family: var(--font-monospace);
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   white-space: nowrap;
 }
 
@@ -1066,10 +1092,10 @@ body.is-resizing-panes .pane-cell {
   min-height: 22px;
   padding: 0 4px;
   border: 0;
-  border-radius: 999px;
+  border-radius: var(--radius-full);
   color: var(--terminal-muted);
   font-family: var(--font-monospace);
-  font-size: 10px;
+  font-size: var(--fs-2xs);
 }
 
 .terminal-pane-find-button:hover:not(:disabled) {
@@ -1092,7 +1118,7 @@ body.is-resizing-panes .pane-cell {
   max-width: 100%;
   padding: 0 10px;
   border: 1px solid var(--terminal-border);
-  border-radius: 999px;
+  border-radius: var(--radius-full);
   background-color: var(--terminal-surface);
   color: var(--terminal-muted);
   font-family: var(--font-monospace);
@@ -1166,7 +1192,7 @@ body.is-resizing-panes .pane-cell {
   gap: 12px;
   padding: 8px 10px;
   border: 1px solid var(--terminal-border);
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   background-color: var(--terminal-overlay);
   backdrop-filter: blur(6px);
 }
@@ -1189,7 +1215,7 @@ body.is-resizing-panes .pane-cell {
 .pane-drop-zone {
   position: absolute;
   border: 2px dashed transparent;
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   transition-property: background-color, border-color;
   transition-duration: 100ms;
   transition-timing-function: ease-out;
@@ -1302,7 +1328,7 @@ body.is-resizing-panes .pane-cell {
   min-width: 160px;
   padding: 4px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   background-color: var(--background-primary);
   box-shadow: var(--shadow-floating);
   animation: switcher-in 100ms cubic-bezier(0.2, 0, 0, 1) both;
@@ -1382,7 +1408,7 @@ body.is-resizing-panes .pane-cell {
 .settings-row-name {
   color: var(--text-normal);
   font-size: var(--font-ui-small);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
 }
 
 .settings-row-desc {
@@ -1395,7 +1421,7 @@ body.is-resizing-panes .pane-cell {
   flex-shrink: 0;
   padding: 6px 28px 6px 10px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 3px;
+  border-radius: var(--radius-xs);
   background-color: var(--background-secondary);
   color: var(--text-normal);
   font-family: var(--font-monospace);
@@ -1457,7 +1483,7 @@ body.is-resizing-panes .pane-cell {
   align-self: flex-start;
   padding: 4px 10px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 3px;
+  border-radius: var(--radius-xs);
   color: var(--text-muted);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
@@ -1471,7 +1497,7 @@ body.is-resizing-panes .pane-cell {
 .settings-preview {
   padding: 10px 12px;
   border: 1px dashed var(--background-modifier-border);
-  border-radius: 3px;
+  border-radius: var(--radius-xs);
   color: var(--text-muted);
   font-size: var(--font-ui-small);
 }
@@ -1494,7 +1520,7 @@ body.is-resizing-panes .pane-cell {
   max-width: 100%;
   padding: 6px 8px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 3px;
+  border-radius: var(--radius-xs);
   background-color: var(--background-secondary);
   color: var(--text-normal);
   font-family: var(--font-monospace);
@@ -1523,7 +1549,7 @@ body.is-resizing-panes .pane-cell {
   width: 100%;
   padding: 6px 10px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 3px;
+  border-radius: var(--radius-xs);
   background-color: var(--background-secondary);
   color: var(--text-normal);
   font-size: var(--font-ui-smaller);
@@ -1560,7 +1586,7 @@ body.is-resizing-panes .pane-cell {
   max-height: 320px;
   padding: 4px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 3px;
+  border-radius: var(--radius-xs);
   background-color: var(--background-primary);
   box-shadow: var(--shadow-floating);
   overflow-y: auto;
@@ -1573,7 +1599,7 @@ body.is-resizing-panes .pane-cell {
   gap: 12px;
   min-width: 0;
   padding: 6px 10px;
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   color: var(--text-muted);
   text-align: left;
   cursor: pointer;
@@ -1589,7 +1615,7 @@ body.is-resizing-panes .pane-cell {
   flex-shrink: 0;
   color: var(--text-normal);
   font-size: var(--font-ui-smaller);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
 }
 
 .font-picker-option-sample {
@@ -1613,7 +1639,7 @@ body.is-resizing-panes .pane-cell {
   gap: 8px;
   padding: 10px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   background-color: var(--background-secondary);
   color: var(--text-muted);
   text-align: left;
@@ -1643,14 +1669,14 @@ body.is-resizing-panes .pane-cell {
 .theme-choice-swatch {
   height: 22px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 4px;
+  border-radius: var(--radius-xs);
 }
 
 .theme-choice-name {
   color: var(--text-normal);
   font-family: var(--font-monospace);
   font-size: var(--font-ui-smaller);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
   line-height: 1.35;
 }
 
@@ -1681,7 +1707,7 @@ body.is-resizing-panes .pane-cell {
   width: min(480px, calc(100vw - 32px));
   padding: 18px 18px 16px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 12px;
+  border-radius: var(--radius-xl);
   background-color: var(--background-primary);
   box-shadow: var(--shadow-modal);
   translate: -50% 0;
@@ -1690,8 +1716,8 @@ body.is-resizing-panes .pane-cell {
 
 .dialog-title {
   color: var(--text-normal);
-  font-size: 15px;
-  font-weight: 600;
+  font-size: var(--fs-lg);
+  font-weight: var(--fw-semibold);
   letter-spacing: -0.01em;
 }
 
@@ -1699,7 +1725,7 @@ body.is-resizing-panes .pane-cell {
   width: 100%;
   padding: 9px 12px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   background-color: var(--background-primary);
   color: var(--text-normal);
   font-family: var(--font-monospace);
@@ -1732,7 +1758,7 @@ body.is-resizing-panes .pane-cell {
   min-height: 32px;
   padding: 6px 14px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   color: var(--text-muted);
   font-size: var(--font-ui-small);
   transition-property: background-color, color, border-color, scale;
@@ -1857,7 +1883,7 @@ body.is-resizing-panes .pane-cell {
 .agent-spawn-label {
   color: var(--text-muted);
   font-size: var(--font-ui-smaller);
-  font-weight: 500;
+  font-weight: var(--fw-medium);
   letter-spacing: 0.01em;
 }
 
@@ -1867,7 +1893,7 @@ body.is-resizing-panes .pane-cell {
   min-height: 36px;
   padding: 9px 12px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   background-color: var(--background-primary);
   color: var(--text-normal);
   font-family: var(--font-monospace);
@@ -1920,7 +1946,7 @@ body.is-resizing-panes .pane-cell {
 .agent-spawn-error {
   padding: 8px 12px;
   border: 1px dashed var(--text-muted);
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   color: var(--text-muted);
   background-color: var(--background-secondary);
   font-family: var(--font-monospace);
@@ -1962,7 +1988,7 @@ body.is-resizing-panes .pane-cell {
   max-height: 60vh;
   overflow: hidden;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 10px;
+  border-radius: var(--radius-lg);
   background-color: var(--background-primary);
   box-shadow: var(--shadow-modal);
   translate: -50% 0;
@@ -2042,7 +2068,7 @@ body.is-resizing-panes .pane-cell {
 
 .quick-switcher-name {
   color: var(--text-normal);
-  font-weight: 500;
+  font-weight: var(--fw-medium);
   white-space: nowrap;
 }
 
@@ -2083,13 +2109,13 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-normal);
   font-family: var(--font-monospace);
   font-size: var(--font-ui-small);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
 }
 
 .fleet-switcher-count {
   color: var(--text-faint);
   font-size: var(--font-ui-smaller);
-  font-weight: 400;
+  font-weight: var(--fw-regular);
 }
 
 .fleet-switcher-result {
@@ -2165,7 +2191,7 @@ body.is-resizing-panes .pane-cell {
   gap: 1px;
   height: 22px;
   padding: 0 8px;
-  border-radius: 999px;
+  border-radius: var(--radius-full);
   color: var(--text-faint);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
@@ -2222,7 +2248,7 @@ body.is-resizing-panes .pane-cell {
   z-index: 80;
   padding: 3px 8px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 999px;
+  border-radius: var(--radius-full);
   background-color: var(--background-primary);
   color: var(--text-normal);
   font-family: var(--font-monospace);
@@ -2272,7 +2298,7 @@ body.is-resizing-panes .pane-cell {
   margin: 12px 0 20px;
   color: var(--text-normal);
   font-size: 1.802em;
-  font-weight: 700;
+  font-weight: var(--fw-display);
   line-height: 1.3;
   font-family: var(--font-text);
   text-wrap: balance;
@@ -2381,7 +2407,7 @@ body.is-resizing-panes .pane-cell {
   max-height: 100%;
   min-height: 0;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   background-color: var(--kanban-lane);
   animation: fade-slide-in 200ms cubic-bezier(0.2, 0, 0, 1) both;
 }
@@ -2401,13 +2427,13 @@ body.is-resizing-panes .pane-cell {
   gap: 6px;
   padding: 10px 12px 8px;
   font-size: var(--font-ui-small);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
 }
 
 .kanban-column-count {
   color: var(--text-faint);
   font-size: var(--font-ui-smaller);
-  font-weight: 500;
+  font-weight: var(--fw-medium);
   font-variant-numeric: tabular-nums;
 }
 
@@ -2425,7 +2451,7 @@ body.is-resizing-panes .pane-cell {
   content: "";
   grid-column: 1 / -1;
   height: 2px;
-  border-radius: 1px;
+  border-radius: var(--radius-xs);
   background-color: var(--text-normal);
 }
 
@@ -2434,7 +2460,7 @@ body.is-resizing-panes .pane-cell {
   overflow: hidden;
   padding: 8px 10px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   background-color: var(--kanban-card);
   box-shadow: var(--kanban-card-shadow);
   cursor: grab;
@@ -2462,7 +2488,7 @@ body.is-resizing-panes .pane-cell {
   bottom: 3px;
   left: -5px;
   width: 2px;
-  border-radius: 1px;
+  border-radius: var(--radius-xs);
   background-color: var(--text-normal);
 }
 
@@ -2476,7 +2502,7 @@ body.is-resizing-panes .pane-cell {
   gap: 8px;
   padding: 10px 18px;
   border: 1.5px dashed var(--text-faint);
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   background-color: var(--background-primary);
   box-shadow: var(--shadow-lifted);
   color: var(--text-muted);
@@ -2508,7 +2534,7 @@ body.is-resizing-panes .pane-cell {
   gap: 6px;
   width: 100%;
   padding: 6px 8px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   color: var(--text-faint);
   font-size: var(--font-ui-small);
   transition-property: background-color, color, scale;
@@ -2554,7 +2580,7 @@ body.is-resizing-panes .pane-cell {
   width: 100%;
   padding: 8px 10px;
   border: 1px solid var(--text-faint);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   background-color: var(--kanban-card);
   color: var(--text-normal);
   font-family: inherit;
@@ -2620,7 +2646,7 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-normal);
   font-family: var(--font-text);
   font-size: 1.802em;
-  font-weight: 700;
+  font-weight: var(--fw-display);
   line-height: 1.3;
   outline: none;
 }
@@ -2710,7 +2736,7 @@ body.is-resizing-panes .pane-cell {
 .markdown-preview-view h6 {
   margin: 1em 0 0.5em;
   color: var(--text-normal);
-  font-weight: 700;
+  font-weight: var(--fw-display);
   line-height: 1.3;
   text-wrap: balance;
 }
@@ -2729,17 +2755,17 @@ body.is-resizing-panes .pane-cell {
 
 .markdown-preview-view h4 {
   font-size: 1.266em;
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
 }
 
 .markdown-preview-view h5 {
   font-size: 1.125em;
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
 }
 
 .markdown-preview-view h6 {
   font-size: 1em;
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
   color: var(--text-muted);
 }
 
@@ -2779,7 +2805,7 @@ body.is-resizing-panes .pane-cell {
 }
 
 .markdown-preview-view strong {
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
 }
 
 /* Links */
@@ -2842,7 +2868,7 @@ body.is-resizing-panes .pane-cell {
   border-radius: var(--radius-s);
   font-family: var(--font-monospace);
   font-size: 0.72em;
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
   line-height: 1.65;
   vertical-align: 0.12em;
   text-align: center;
@@ -2905,7 +2931,7 @@ body.is-resizing-panes .pane-cell {
 .markdown-preview-view mark {
   background-color: var(--text-normal);
   color: var(--background-primary);
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   padding: 0 3px;
 }
 
@@ -2932,7 +2958,7 @@ body.is-resizing-panes .pane-cell {
 .markdown-preview-view h6 code {
   padding: 0.06em 0.3em;
   font-size: 0.68em;
-  font-weight: 500;
+  font-weight: var(--fw-medium);
   vertical-align: 0.12em;
 }
 
@@ -3080,7 +3106,7 @@ body.is-resizing-panes .pane-cell {
   padding: 2px 0;
   border-radius: var(--radius-s);
   color: var(--text-normal);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
   font-size: inherit;
   line-height: 1.3;
   transition-property: color, transform;
@@ -3198,7 +3224,7 @@ body.is-resizing-panes .pane-cell {
   border-bottom-color: var(--text-faint);
   background: var(--background-secondary);
   color: var(--text-normal);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
 }
 
 .markdown-preview-view tbody tr:last-child td {
@@ -3295,7 +3321,7 @@ body.is-resizing-panes .pane-cell {
 /* Activity feed */
 
 .activity-feed {
-  max-width: 760px;
+  max-width: var(--readable-col);
   margin: 0 auto;
   padding: 16px 24px 120px;
 }
@@ -3311,7 +3337,7 @@ body.is-resizing-panes .pane-cell {
   margin: 24px 0 8px;
   color: var(--text-muted);
   font-size: var(--font-ui-small);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
   font-variant-numeric: tabular-nums;
 }
 
@@ -3420,7 +3446,7 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-normal);
   font-family: var(--font-monospace);
   font-size: var(--font-ui-smaller);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
 }
 
 .split-diff-grid {
@@ -3457,7 +3483,7 @@ body.is-resizing-panes .pane-cell {
 .split-cell.is-add {
   background-color: var(--diff-add-background);
   color: var(--diff-add-foreground);
-  font-weight: 500;
+  font-weight: var(--fw-medium);
 }
 
 .split-cell.is-blank {
@@ -3494,7 +3520,7 @@ body.is-resizing-panes .pane-cell {
 /* Vault health */
 
 .health-view {
-  max-width: 760px;
+  max-width: var(--readable-col);
   margin: 0 auto;
   padding: 24px 24px 120px;
 }
@@ -3518,7 +3544,7 @@ body.is-resizing-panes .pane-cell {
 
 .health-stat-count {
   font-size: 1.2em;
-  font-weight: 700;
+  font-weight: var(--fw-display);
   font-variant-numeric: tabular-nums;
 }
 
@@ -3586,7 +3612,7 @@ body.is-resizing-panes .pane-cell {
 
 .health-name {
   color: var(--text-normal);
-  font-weight: 500;
+  font-weight: var(--fw-medium);
   white-space: nowrap;
 }
 
@@ -3616,7 +3642,7 @@ body.is-resizing-panes .pane-cell {
 
 .health-row.is-stale .health-age {
   color: var(--text-normal);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
 }
 
 .health-row.is-fresh .health-age {
@@ -3635,7 +3661,7 @@ body.is-resizing-panes .pane-cell {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  max-width: 760px;
+  max-width: var(--readable-col);
   margin: 0 auto;
   padding: 24px 24px 120px;
 }
@@ -3659,7 +3685,7 @@ body.is-resizing-panes .pane-cell {
   justify-content: space-between;
   gap: 16px;
   width: 100%;
-  max-width: 760px;
+  max-width: var(--readable-col);
   align-self: center;
 }
 
@@ -3667,7 +3693,7 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-normal);
   font-family: var(--font-monospace);
   font-size: var(--font-ui-small);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
 }
 
 .agents-toolbar-meta {
@@ -3703,7 +3729,7 @@ body.is-resizing-panes .pane-cell {
 
 .agents-notice {
   width: 100%;
-  max-width: 760px;
+  max-width: var(--readable-col);
   align-self: center;
   padding: 10px 12px;
   border: 1px solid var(--background-modifier-border);
@@ -3731,7 +3757,7 @@ body.is-resizing-panes .pane-cell {
   flex-direction: column;
   gap: 4px;
   width: 100%;
-  max-width: 760px;
+  max-width: var(--readable-col);
   align-self: center;
 }
 
@@ -3742,7 +3768,7 @@ body.is-resizing-panes .pane-cell {
   padding: 8px 10px;
   border: 1px solid var(--background-modifier-border);
   border-left-width: 3px;
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   background-color: var(--background-secondary);
   color: var(--text-normal);
   font-family: var(--font-monospace);
@@ -3787,7 +3813,7 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-normal);
   font-family: var(--font-monospace);
   font-size: var(--font-ui-small);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
   text-decoration: none;
 }
 
@@ -3815,7 +3841,7 @@ body.is-resizing-panes .pane-cell {
   border-radius: var(--radius-s);
   font-family: var(--font-monospace);
   font-size: var(--font-ui-smaller);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
   text-transform: lowercase;
 }
 
@@ -4006,7 +4032,7 @@ body.is-resizing-panes .pane-cell {
   color: var(--accent-warning);
   font-family: var(--font-monospace);
   font-size: var(--font-ui-smaller);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
   transition-property: background-color, border-color, color, scale;
   transition-duration: 100ms;
   transition-timing-function: ease-out;
@@ -4042,7 +4068,7 @@ body.is-resizing-panes .pane-cell {
   align-items: center;
   gap: 6px;
   width: 100%;
-  max-width: 760px;
+  max-width: var(--readable-col);
   align-self: center;
   margin-top: 16px;
   color: var(--text-faint);
@@ -4060,7 +4086,7 @@ body.is-resizing-panes .pane-cell {
   align-self: flex-start;
   padding: 5px 12px 5px 10px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   background-color: var(--background-secondary);
   color: var(--text-muted);
   font-family: var(--font-monospace);
@@ -4085,7 +4111,7 @@ body.is-resizing-panes .pane-cell {
   margin: 0;
   padding: 10px 12px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 10px;
+  border-radius: var(--radius-lg);
   background-color: var(--code-background);
   color: var(--text-muted);
   font-family: var(--font-monospace);
@@ -4119,7 +4145,7 @@ body.is-resizing-panes .pane-cell {
   gap: 6px;
   padding: 3px 8px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   background-color: var(--background-primary);
   color: var(--text-muted);
   text-decoration: none;
@@ -4130,7 +4156,7 @@ body.is-resizing-panes .pane-cell {
   align-items: center;
   padding: 3px 8px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   background-color: var(--background-primary);
   color: var(--text-normal);
 }
@@ -4153,7 +4179,7 @@ body.is-resizing-panes .pane-cell {
   flex-direction: column;
   align-self: stretch;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   background-color: var(--background-secondary);
   overflow: hidden;
 }
@@ -4251,7 +4277,7 @@ body.is-resizing-panes .pane-cell {
   align-self: flex-start;
   padding: 3px 10px;
   border: 1px solid color-mix(in srgb, var(--accent-danger) 40%, var(--background-modifier-border));
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   background-color: color-mix(in srgb, var(--accent-danger) 8%, transparent);
   color: var(--accent-danger);
   font-family: var(--font-monospace);
@@ -4266,7 +4292,7 @@ body.is-resizing-panes .pane-cell {
   align-self: flex-start;
   padding: 3px 10px;
   border: 1px solid color-mix(in srgb, var(--accent-primary) 40%, var(--background-modifier-border));
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   background-color: color-mix(in srgb, var(--accent-primary) 8%, transparent);
   color: var(--accent-primary);
   font-family: var(--font-monospace);
@@ -4288,7 +4314,7 @@ body.is-resizing-panes .pane-cell {
   margin: 2px 0;
   padding: 7px 10px;
   border: 1px solid color-mix(in srgb, var(--accent-primary) 24%, var(--background-modifier-border));
-  border-radius: 4px;
+  border-radius: var(--radius-xs);
   background:
     linear-gradient(
       135deg,
@@ -4314,7 +4340,7 @@ body.is-resizing-panes .pane-cell {
   overflow: hidden;
   color: var(--text-normal);
   font-size: var(--font-ui-small);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
   line-height: 1.35;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -4343,7 +4369,7 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-muted);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   line-height: 1;
   text-transform: lowercase;
   white-space: nowrap;
@@ -4366,7 +4392,7 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-faint);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   white-space: nowrap;
 }
 
@@ -4375,7 +4401,7 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-faint);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   letter-spacing: 0.03em;
   text-transform: uppercase;
 }
@@ -4387,7 +4413,7 @@ body.is-resizing-panes .pane-cell {
   align-self: flex-start;
   padding: 2px 8px;
   border: 1px dashed var(--background-modifier-border);
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   background-color: transparent;
   color: var(--text-faint);
   font-family: var(--font-monospace);
@@ -4414,14 +4440,14 @@ body.is-resizing-panes .pane-cell {
   font-size: var(--font-ui-smaller);
   background: var(--background-primary);
   border: 1px solid var(--background-modifier-border);
-  border-radius: 4px;
+  border-radius: var(--radius-xs);
   pointer-events: none;
 }
 
 .session-provider-inspector {
   margin: 5px 12px 0;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 3px;
+  border-radius: var(--radius-xs);
   background-color: color-mix(in srgb, var(--background-secondary) 72%, transparent);
   color: var(--text-faint);
   font-family: var(--font-monospace);
@@ -4468,7 +4494,7 @@ body.is-resizing-panes .pane-cell {
 .session-provider-pending {
   padding: 1px 5px;
   border: 1px solid color-mix(in srgb, var(--accent-warning) 45%, var(--background-modifier-border));
-  border-radius: 999px;
+  border-radius: var(--radius-full);
   color: var(--accent-warning);
 }
 
@@ -4487,7 +4513,7 @@ body.is-resizing-panes .pane-cell {
 
 .session-provider-request-head span:first-child {
   color: var(--accent-warning);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
   text-transform: uppercase;
 }
 
@@ -4514,7 +4540,7 @@ body.is-resizing-panes .pane-cell {
   width: 100%;
   padding: 6px 7px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   background-color: var(--background-primary);
   color: var(--text-normal);
   font: inherit;
@@ -4547,7 +4573,7 @@ body.is-resizing-panes .pane-cell {
 .session-provider-request-actions button {
   padding: 3px 7px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
 }
 
 .session-provider-request-actions button:hover {
@@ -4637,7 +4663,7 @@ body.is-resizing-panes .pane-cell {
 .agents-layout .agent-card,
 .agents-layout .agents-empty {
   width: 100%;
-  max-width: 760px;
+  max-width: var(--readable-col);
   align-self: center;
 }
 
@@ -4688,7 +4714,7 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-normal);
   font-family: var(--font-monospace);
   font-size: var(--font-ui-small);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
 }
 
 .session-close {
@@ -4770,6 +4796,8 @@ body.is-resizing-panes .pane-cell {
 .session-scroll-inner {
   position: relative;
   min-height: 100%;
+  max-width: var(--readable-col);
+  margin: 0 auto;
   padding: 16px 16px 12px;
 }
 
@@ -4786,7 +4814,7 @@ body.is-resizing-panes .pane-cell {
 
 .session-load-older button {
   border: 1px solid var(--background-modifier-border);
-  border-radius: 3px;
+  border-radius: var(--radius-xs);
   padding: 4px 10px;
   background: var(--background-secondary);
   color: var(--text-muted);
@@ -4886,7 +4914,7 @@ body.is-resizing-panes .pane-cell {
   gap: 6px;
   min-height: 20px;
   padding: 1px 5px;
-  border-radius: 3px;
+  border-radius: var(--radius-xs);
   cursor: pointer;
 }
 
@@ -4910,7 +4938,7 @@ body.is-resizing-panes .pane-cell {
   width: 18px;
   height: 18px;
   padding: 0;
-  border-radius: 3px;
+  border-radius: var(--radius-xs);
   cursor: pointer;
 }
 
@@ -4923,7 +4951,7 @@ body.is-resizing-panes .pane-cell {
   min-width: 220px;
   padding: 6px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 4px;
+  border-radius: var(--radius-xs);
   background: var(--background-primary);
   box-shadow: 0 8px 24px rgb(0 0 0 / 18%);
 }
@@ -4936,7 +4964,7 @@ body.is-resizing-panes .pane-cell {
   width: 100%;
   padding: 5px 7px;
   border-color: transparent;
-  border-radius: 3px;
+  border-radius: var(--radius-xs);
   cursor: pointer;
   text-align: left;
 }
@@ -4975,7 +5003,7 @@ body.is-resizing-panes .pane-cell {
 
 .session-model-confirm button {
   padding: 4px 8px;
-  border-radius: 3px;
+  border-radius: var(--radius-xs);
   cursor: pointer;
 }
 
@@ -5037,7 +5065,7 @@ body.is-resizing-panes .pane-cell {
   gap: 4px;
   padding: 3px 8px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 999px;
+  border-radius: var(--radius-full);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-ui-smaller);
@@ -5149,7 +5177,7 @@ body.is-resizing-panes .pane-cell {
 .pr-review-thread-path {
   color: var(--text-normal);
   font-family: var(--font-monospace);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
 }
 
 .pr-review-check-name,
@@ -5184,7 +5212,7 @@ body.is-resizing-panes .pane-cell {
   width: 18px;
   height: 18px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 999px;
+  border-radius: var(--radius-full);
   background-color: var(--background-secondary);
 }
 
@@ -5260,7 +5288,7 @@ body.is-resizing-panes .pane-cell {
   max-width: min(90%, 640px);
   padding: 9px 13px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   background-color: var(--background-secondary);
   color: var(--text-normal);
   font-family: var(--font-monospace);
@@ -5325,7 +5353,7 @@ body.is-resizing-panes .pane-cell {
   min-width: 0;
   padding: 5px 12px 5px 8px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   background-color: var(--background-secondary);
   color: var(--text-muted);
   font-family: var(--font-monospace);
@@ -5345,7 +5373,7 @@ body.is-resizing-panes .pane-cell {
   gap: 6px;
   min-width: 0;
   padding: 5px 8px;
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   color: var(--text-muted);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
@@ -5414,9 +5442,9 @@ body.is-resizing-panes .pane-cell {
   flex-shrink: 0;
   padding: 1px 7px;
   border: 1px solid var(--text-muted);
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   letter-spacing: 0.02em;
   text-transform: uppercase;
 }
@@ -5432,7 +5460,7 @@ body.is-resizing-panes .pane-cell {
   max-height: 240px;
   margin: 0;
   padding: 8px 10px;
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   background-color: var(--code-background);
   color: var(--text-muted);
   font-family: var(--font-monospace);
@@ -5478,11 +5506,11 @@ body.is-resizing-panes .pane-cell {
   margin-right: 8px;
   padding: 1px 6px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   color: var(--text-muted);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   font-style: normal;
   letter-spacing: 0.03em;
   text-transform: uppercase;
@@ -5494,7 +5522,7 @@ body.is-resizing-panes .pane-cell {
   gap: 10px;
   padding: 10px 12px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   background-color: var(--background-secondary);
 }
 
@@ -5527,7 +5555,7 @@ body.is-resizing-panes .pane-cell {
   gap: 8px;
   padding: 6px 8px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   background: transparent;
   color: var(--text-muted);
   font-family: var(--font-monospace);
@@ -5581,7 +5609,7 @@ body.is-resizing-panes .pane-cell {
   flex: 1 1 auto;
   padding: 3px 6px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   background: var(--background-primary);
   color: var(--text-normal);
   font: inherit;
@@ -5607,7 +5635,7 @@ body.is-resizing-panes .pane-cell {
 .session-question-actions button {
   padding: 5px 10px;
   border: 1px solid color-mix(in srgb, var(--accent-primary) 45%, var(--background-modifier-border));
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   background: color-mix(in srgb, var(--accent-primary) 10%, var(--background-primary));
   color: var(--text-normal);
   font-family: var(--font-monospace);
@@ -5638,7 +5666,7 @@ body.is-resizing-panes .pane-cell {
 .session-bash {
   padding: 10px 12px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 10px;
+  border-radius: var(--radius-lg);
   background-color: var(--background-secondary);
   color: var(--text-muted);
   font-family: var(--font-monospace);
@@ -5652,14 +5680,14 @@ body.is-resizing-panes .pane-cell {
   gap: 10px;
   padding: 8px 10px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 7px;
+  border-radius: var(--radius-sm);
   background-color: var(--code-background);
 }
 
 .session-bash-prompt {
   flex-shrink: 0;
   color: var(--text-normal);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
 }
 
 .session-bash-command pre,
@@ -5698,7 +5726,7 @@ body.is-resizing-panes .pane-cell {
 .session-bash-stderr {
   padding: 8px 10px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 7px;
+  border-radius: var(--radius-sm);
   background-color: var(--code-background);
 }
 
@@ -5713,7 +5741,7 @@ body.is-resizing-panes .pane-cell {
    dark) via light-dark(). Only 8 base + 8 bright fg/bg are supported; 256-
    and truecolor codes are stripped upstream. */
 
-.ansi-bold { font-weight: 700; }
+.ansi-bold { font-weight: var(--fw-display); }
 .ansi-italic { font-style: italic; }
 .ansi-underline { text-decoration: underline; }
 
@@ -5771,12 +5799,12 @@ body.is-resizing-panes .pane-cell {
   margin-bottom: 8px;
   color: var(--text-muted);
   font-size: var(--font-ui-small);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
 }
 
 .backlinks-count {
   color: var(--text-faint);
-  font-weight: 500;
+  font-weight: var(--fw-medium);
   font-variant-numeric: tabular-nums;
 }
 
@@ -5805,7 +5833,7 @@ body.is-resizing-panes .pane-cell {
 
 .backlink-name {
   color: var(--text-normal);
-  font-weight: 500;
+  font-weight: var(--fw-medium);
   white-space: nowrap;
 }
 
@@ -5842,7 +5870,7 @@ body.is-resizing-panes .pane-cell {
 
 ::-webkit-scrollbar-thumb {
   border: 3px solid transparent;
-  border-radius: 999px;
+  border-radius: var(--radius-full);
   background-clip: padding-box;
   background-color: var(--scrollbar-thumb);
   min-height: 40px;
@@ -5964,7 +5992,7 @@ body.is-resizing-panes .pane-cell {
 .nav-agent-ticket {
   flex-shrink: 0;
   overflow: hidden;
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -5987,7 +6015,7 @@ body.is-resizing-panes .pane-cell {
 
 .nav-agent.is-orch {
   color: var(--text-normal);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
 }
 
 .nav-agent.is-orch svg {
@@ -5996,7 +6024,7 @@ body.is-resizing-panes .pane-cell {
 }
 
 .nav-agent.is-orch .nav-agent-meta {
-  font-weight: 400;
+  font-weight: var(--fw-regular);
 }
 
 .nav-agent.is-owned {
@@ -6008,7 +6036,7 @@ body.is-resizing-panes .pane-cell {
   flex-direction: column;
   gap: 12px;
   width: 100%;
-  max-width: 760px;
+  max-width: var(--readable-col);
   align-self: center;
 }
 
@@ -6023,7 +6051,7 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-normal);
   font-family: var(--font-monospace);
   font-size: var(--font-ui-small);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
 }
 
 .agents-orch-head svg {
@@ -6034,7 +6062,7 @@ body.is-resizing-panes .pane-cell {
 .agents-orch-dead {
   color: var(--text-faint);
   font-size: var(--font-ui-smaller);
-  font-weight: 400;
+  font-weight: var(--fw-regular);
 }
 
 .agents-orch-dead {
@@ -6083,7 +6111,7 @@ body.is-resizing-panes .pane-cell {
 
 .agent-session-surface.is-full .session-composer {
   width: 100%;
-  max-width: 900px;
+  max-width: var(--readable-col);
   margin: 0 auto;
   padding: 16px 20px 8px;
   border-top: 1px solid var(--background-modifier-border);
@@ -6095,7 +6123,7 @@ body.is-resizing-panes .pane-cell {
   gap: 8px;
   padding: 8px 10px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   background-color: var(--background-primary-alt);
   transition-property: border-color, background-color, box-shadow;
   transition-duration: 120ms;
@@ -6174,7 +6202,7 @@ body.is-resizing-panes .pane-cell {
   width: 32px;
   height: 32px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   background-color: var(--background-primary);
   color: var(--text-muted);
 }
@@ -6208,7 +6236,7 @@ body.is-resizing-panes .pane-cell {
   gap: 8px;
   padding: 6px 12px;
   border: 1px dashed var(--background-modifier-border);
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   background-color: var(--background-secondary);
   color: var(--text-muted);
   font-family: var(--font-monospace);
@@ -6229,7 +6257,7 @@ body.is-resizing-panes .pane-cell {
   max-width: min(360px, 80vw);
   padding: 5px 8px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   background-color: var(--background-primary);
   color: var(--text-normal);
   box-shadow: 0 4px 14px rgb(0 0 0 / 18%);
@@ -6299,7 +6327,7 @@ body.is-resizing-panes .pane-cell {
 .session-pending-status button {
   padding: 1px 4px;
   border: 1px solid currentColor;
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   color: inherit;
   font-size: inherit;
 }
@@ -6335,9 +6363,9 @@ body.is-resizing-panes .pane-cell {
   flex-shrink: 0;
   padding: 1px 8px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   cursor: pointer;
 }
 
@@ -6384,7 +6412,8 @@ body.is-resizing-panes .pane-cell {
 }
 
 .session-side-panel .session-scroll-inner,
-.session-side-panel .session-footer {
+.session-side-panel .session-footer,
+.session-side-panel .session-composer {
   max-width: none;
   margin: 0;
 }
@@ -6398,7 +6427,7 @@ body.is-resizing-panes .pane-cell {
   display: inline-flex;
   padding: 2px 9px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 3px;
+  border-radius: var(--radius-xs);
   background-color: var(--background-secondary);
   color: var(--text-muted);
   font-family: var(--font-monospace);
@@ -6430,7 +6459,7 @@ body.is-resizing-panes .pane-cell {
   display: block;
   max-width: 360px;
   max-height: 260px;
-  border-radius: 3px;
+  border-radius: var(--radius-xs);
 }
 
 .session-attachments {
@@ -6448,7 +6477,7 @@ body.is-resizing-panes .pane-cell {
   width: 64px;
   height: 64px;
   border: 1px solid var(--image-outline);
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   object-fit: cover;
 }
 
@@ -6462,7 +6491,7 @@ body.is-resizing-panes .pane-cell {
   width: 20px;
   height: 20px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   background-color: var(--background-primary);
   color: var(--text-muted);
   box-shadow: var(--shadow-lifted);
@@ -6478,7 +6507,7 @@ body.is-resizing-panes .pane-cell {
   max-height: 260px;
   padding: 4px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   background-color: var(--background-primary);
   box-shadow: var(--shadow-floating);
   overflow-y: auto;
@@ -6490,7 +6519,7 @@ body.is-resizing-panes .pane-cell {
   gap: 10px;
   min-width: 0;
   padding: 6px 10px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   text-align: left;
 }
 
@@ -6504,7 +6533,7 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-normal);
   font-family: var(--font-monospace);
   font-size: var(--font-ui-smaller);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
 }
 
 .session-skill-desc {
@@ -6562,7 +6591,7 @@ body.is-resizing-panes .pane-cell {
 
 .session-vim-mode.is-normal {
   color: var(--text-normal);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
 }
 
 .agent-pane > .agent-session-surface-row {
@@ -6594,7 +6623,7 @@ body.is-resizing-panes .pane-cell {
   gap: 6px;
   padding: 3px 10px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   background-color: var(--background-secondary);
   color: var(--text-muted);
   font-family: var(--font-monospace);
@@ -6629,7 +6658,7 @@ body.is-resizing-panes .pane-cell {
 .agent-session-surface.is-full .session-scroll-inner,
 .agent-session-surface.is-full .session-footer {
   width: 100%;
-  max-width: 900px;
+  max-width: var(--readable-col);
   margin: 0 auto;
   border-top: none;
 }
@@ -6670,7 +6699,7 @@ body.is-resizing-panes .pane-cell {
 
 .tokens-filter-label {
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   text-transform: uppercase;
   letter-spacing: 0.05em;
   margin-right: 4px;
@@ -6682,8 +6711,8 @@ body.is-resizing-panes .pane-cell {
   background: var(--background-primary);
   color: var(--text-muted);
   padding: 3px 10px;
-  font-size: 12px;
-  border-radius: 2px;
+  font-size: var(--fs-sm);
+  border-radius: var(--radius-xs);
   cursor: pointer;
   font-family: inherit;
   transition: background 100ms ease, color 100ms ease;
@@ -6704,7 +6733,7 @@ body.is-resizing-panes .pane-cell {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-muted);
   cursor: pointer;
 }
@@ -6718,10 +6747,10 @@ body.is-resizing-panes .pane-cell {
   align-items: center;
   padding: 3px 8px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   background: var(--background-primary-alt);
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   line-height: 1.2;
 }
 
@@ -6731,7 +6760,7 @@ body.is-resizing-panes .pane-cell {
   gap: 24px;
   padding: 10px 12px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   background: var(--background-primary-alt);
 }
 
@@ -6743,20 +6772,20 @@ body.is-resizing-panes .pane-cell {
 
 .tokens-total-label {
   color: var(--text-muted);
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   text-transform: uppercase;
   letter-spacing: 0.06em;
 }
 
 .tokens-total-value {
   color: var(--text-normal);
-  font-size: 15px;
-  font-weight: 500;
+  font-size: var(--fs-lg);
+  font-weight: var(--fw-medium);
 }
 
 .tokens-total-secondary .tokens-total-value {
   color: var(--text-muted);
-  font-weight: 400;
+  font-weight: var(--fw-regular);
 }
 
 .tokens-chart {
@@ -6764,7 +6793,7 @@ body.is-resizing-panes .pane-cell {
   flex: 1 1 auto;
   min-height: 240px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   background: var(--background-primary);
   overflow: hidden;
 }
@@ -6777,9 +6806,9 @@ body.is-resizing-panes .pane-cell {
   position: absolute;
   background: var(--background-primary);
   border: 1px solid var(--background-modifier-border);
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   padding: 8px 10px;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   min-width: 200px;
   pointer-events: none;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
@@ -6788,7 +6817,7 @@ body.is-resizing-panes .pane-cell {
 
 .tokens-tooltip-title {
   color: var(--text-normal);
-  font-weight: 500;
+  font-weight: var(--fw-medium);
   margin-bottom: 6px;
 }
 
@@ -6813,7 +6842,7 @@ body.is-resizing-panes .pane-cell {
 .tokens-tooltip-swatch {
   width: 8px;
   height: 8px;
-  border-radius: 1px;
+  border-radius: var(--radius-xs);
 }
 
 .tokens-tooltip-name {
@@ -6833,7 +6862,7 @@ body.is-resizing-panes .pane-cell {
   flex-wrap: wrap;
   gap: 12px;
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: var(--fs-xs);
 }
 
 .tokens-legend-item {
@@ -6845,7 +6874,7 @@ body.is-resizing-panes .pane-cell {
 .tokens-legend-swatch {
   width: 10px;
   height: 10px;
-  border-radius: 1px;
+  border-radius: var(--radius-xs);
   display: inline-block;
 }
 
@@ -6855,7 +6884,7 @@ body.is-resizing-panes .pane-cell {
 
 .tokens-error {
   color: var(--accent-danger);
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 
 /* Native artifacts: content is the visual signature; chrome stays quiet and flat. */
@@ -6877,7 +6906,7 @@ body.is-resizing-panes .pane-cell {
   min-width: 0;
   border: 1px solid var(--background-modifier-border);
   border-left: 0;
-  border-radius: 0 2px 2px 0;
+  border-radius: 0 var(--radius-xs) var(--radius-xs) 0;
   background: var(--background-primary);
   overflow: visible;
 }
@@ -6915,7 +6944,7 @@ body.is-resizing-panes .pane-cell {
 .artifact-title {
   color: var(--text-normal);
   font-size: var(--font-ui-small);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
   line-height: 1.25;
   text-transform: none;
 }
@@ -6925,7 +6954,7 @@ body.is-resizing-panes .pane-cell {
   margin-top: 2px;
   color: var(--text-muted);
   font-size: var(--font-ui-smaller);
-  font-weight: 400;
+  font-weight: var(--fw-regular);
   line-height: 1.35;
 }
 
@@ -6933,9 +6962,9 @@ body.is-resizing-panes .pane-cell {
   flex: 0 0 auto;
   padding: 1px 5px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   color: var(--text-faint);
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   line-height: 1.4;
 }
 
@@ -6950,11 +6979,11 @@ body.is-resizing-panes .pane-cell {
   min-height: 24px;
   padding: 3px 6px;
   border: 1px solid transparent;
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   color: var(--text-muted);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   white-space: nowrap;
 }
 
@@ -6987,18 +7016,18 @@ body.is-resizing-panes .pane-cell {
   min-width: 128px;
   padding: 3px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   background: var(--background-primary);
   box-shadow: var(--shadow-floating);
 }
 
 .artifact-copy-options button {
   padding: 5px 7px;
-  border-radius: 1px;
+  border-radius: var(--radius-xs);
   color: var(--text-muted);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   text-align: left;
 }
 
@@ -7037,12 +7066,12 @@ body.is-resizing-panes .pane-cell {
   margin: 9px;
   padding: 3px 7px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 999px;
+  border-radius: var(--radius-full);
   background: var(--background-secondary);
   color: var(--text-muted);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: 10px;
+  font-size: var(--fs-2xs);
 }
 
 .artifact-compact-code {
@@ -7122,12 +7151,12 @@ body.is-resizing-panes .pane-cell {
   z-index: 2;
   padding: 3px 7px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 999px;
+  border-radius: var(--radius-full);
   background: var(--background-secondary);
   color: var(--text-muted);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   pointer-events: none;
 }
 
@@ -7224,7 +7253,7 @@ body.is-resizing-panes .pane-cell {
   padding: 0;
   background: var(--background-secondary);
   color: var(--text-muted);
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
 }
 
 .artifact-table th button {
@@ -7286,7 +7315,7 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-faint);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: 10px;
+  font-size: var(--fs-2xs);
 }
 
 .artifact-code .shiki-block,
@@ -7316,7 +7345,7 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-muted);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   text-transform: uppercase;
   letter-spacing: 0.06em;
 }
@@ -7326,7 +7355,7 @@ body.is-resizing-panes .pane-cell {
   width: 24px;
   height: 24px;
   place-items: center;
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   color: var(--text-muted);
 }
 
@@ -7344,7 +7373,7 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-muted);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   line-height: 1.5;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -7398,8 +7427,8 @@ body.is-resizing-panes .pane-cell {
 .artifact-panel-tab-main span {
   overflow: hidden;
   font-family: var(--font-monospace);
-  font-size: 10px;
-  font-weight: 600;
+  font-size: var(--fs-2xs);
+  font-weight: var(--fw-semibold);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -7408,7 +7437,7 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-faint);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: 9px;
+  font-size: var(--fs-2xs);
 }
 
 .artifact-panel-tab-action,
@@ -7442,7 +7471,7 @@ body.is-resizing-panes .pane-cell {
   min-width: 170px;
   padding: 4px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   background: var(--background-primary);
   box-shadow: var(--shadow-floating);
 }
@@ -7456,7 +7485,7 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-faint);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   text-align: left;
 }
 
@@ -7475,7 +7504,7 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-faint);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: 9px;
+  font-size: var(--fs-2xs);
   overflow-x: auto;
 }
 
@@ -7489,7 +7518,7 @@ body.is-resizing-panes .pane-cell {
   flex: 0 0 auto;
   padding: 2px 6px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 999px;
+  border-radius: var(--radius-full);
   color: var(--text-muted);
 }
 
@@ -7536,11 +7565,11 @@ body.is-resizing-panes .pane-cell {
   min-height: 25px;
   padding: 4px 7px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   color: var(--text-muted);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   white-space: nowrap;
 }
 
@@ -7565,7 +7594,7 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-faint);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: 10px;
+  font-size: var(--fs-2xs);
 }
 
 .artifact-panzoom-viewport {
@@ -7631,7 +7660,7 @@ body.is-resizing-panes .pane-cell {
   min-width: 180px;
   padding: 3px 7px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   color: var(--text-faint);
   background: var(--background-primary);
 }
@@ -7645,14 +7674,14 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-normal);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: 10px;
+  font-size: var(--fs-2xs);
 }
 
 .artifact-table-result-count {
   color: var(--text-faint);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: 10px;
+  font-size: var(--fs-2xs);
 }
 
 .artifact-table-detail-scroll {
@@ -7708,7 +7737,7 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-faint);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: 10px;
+  font-size: var(--fs-2xs);
 }
 
 .artifact-code-detail-source {
@@ -7750,9 +7779,9 @@ body.is-resizing-panes .pane-cell {
   height: 16px;
   place-items: center;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 2px;
+  border-radius: var(--radius-xs);
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: var(--fs-xs);
 }
 
 .artifact-code-line code {
@@ -7761,7 +7790,7 @@ body.is-resizing-panes .pane-cell {
 }
 
 .artifact-code-line mark {
-  border-radius: 1px;
+  border-radius: var(--radius-xs);
   background: color-mix(in srgb, var(--accent-primary) 36%, transparent);
   color: inherit;
 }
@@ -7781,7 +7810,7 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-faint);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
-  font-size: 9px;
+  font-size: var(--fs-2xs);
 }
 
 .artifact-code-find button {
@@ -8014,7 +8043,7 @@ body.is-resizing-panes .pane-cell {
 }
 
 .dashboard-ticket {
-  font-weight: 600;
+  font-weight: var(--fw-semibold);
 }
 
 .dashboard-description {
@@ -8072,5 +8101,366 @@ body.is-resizing-panes .pane-cell {
   border: 1.5px solid var(--accent-success);
   background-color: color-mix(in srgb, var(--accent-success) 12%, transparent);
   color: var(--accent-success);
-  font-weight: 700;
+  font-weight: var(--fw-display);
+}
+
+/* ---------- WIKI-143: shared StatusBadge + BranchPill ---------- */
+
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  border: 1.5px solid transparent;
+  border-radius: var(--radius-full);
+  background: transparent;
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  line-height: 1.4;
+  text-transform: lowercase;
+  letter-spacing: 0.01em;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  vertical-align: baseline;
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease,
+    color 120ms ease;
+}
+
+.status-badge.is-compact {
+  padding: 1px 6px;
+  font-size: var(--fs-2xs);
+}
+
+.status-badge-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-full);
+  background: currentColor;
+  flex-shrink: 0;
+}
+
+.status-badge.is-working {
+  border-color: var(--status-working-border);
+  background-color: var(--status-working-background);
+  color: var(--status-working-color);
+}
+
+.status-badge.is-merge-ready {
+  border-color: var(--status-merge-ready-border);
+  background-color: var(--status-merge-ready-background);
+  color: var(--status-merge-ready-color);
+}
+
+.status-badge.is-blocked {
+  border: 1.5px dashed var(--status-blocked-border);
+  background-color: var(--status-blocked-background);
+  color: var(--status-blocked-color);
+}
+
+.status-badge.is-abandoned {
+  border-color: var(--text-muted);
+  color: var(--text-muted);
+  text-decoration: line-through;
+}
+
+.status-badge.is-idle {
+  border-color: var(--background-modifier-border);
+  color: var(--text-muted);
+}
+
+.status-badge.is-waiting-approval,
+.status-badge.is-interrupted {
+  border-color: color-mix(in srgb, var(--accent-warning) 45%, var(--background-modifier-border));
+  background-color: color-mix(in srgb, var(--accent-warning) 10%, transparent);
+  color: var(--accent-warning);
+}
+
+.status-badge.is-dead {
+  border: 1.5px solid var(--text-muted);
+  background-color: color-mix(in srgb, var(--accent-danger) 6%, transparent);
+  color: var(--text-muted);
+  text-decoration: line-through;
+}
+
+.status-badge.is-ok {
+  border-color: color-mix(in srgb, var(--accent-success) 45%, var(--background-modifier-border));
+  color: var(--accent-success);
+}
+
+.status-badge.is-warning {
+  border-color: color-mix(in srgb, var(--accent-warning) 45%, var(--background-modifier-border));
+  color: var(--accent-warning);
+}
+
+.status-badge.is-error {
+  border-color: color-mix(in srgb, var(--accent-danger) 45%, var(--background-modifier-border));
+  background-color: color-mix(in srgb, var(--accent-danger) 10%, transparent);
+  color: var(--accent-danger);
+}
+
+.status-badge.is-unknown {
+  background-color: var(--background-modifier-hover);
+  color: var(--text-faint);
+}
+
+.branch-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 220px;
+  padding: 1px 6px 1px 5px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-sm);
+  background-color: color-mix(in srgb, var(--text-normal) 4%, transparent);
+  color: var(--text-normal);
+  font-family: var(--font-monospace);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  line-height: 1.4;
+  vertical-align: baseline;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.branch-pill.is-clickable {
+  cursor: pointer;
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease;
+}
+
+.branch-pill.is-clickable:hover {
+  border-color: var(--accent-primary);
+  background-color: color-mix(in srgb, var(--accent-primary) 10%, transparent);
+}
+
+.branch-pill.is-clickable:focus-visible {
+  outline: 2px solid var(--pane-focus-ring);
+  outline-offset: 1px;
+}
+
+.branch-pill-icon {
+  flex-shrink: 0;
+  opacity: 0.75;
+}
+
+.branch-pill-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+/* WIKI-143: extend .status-badge with legacy exotic states from .agent-state */
+
+.status-badge.is-completed,
+.status-badge.is-outcome-merged {
+  border-color: var(--status-merge-ready-border);
+  background-color: var(--status-merge-ready-background);
+  color: var(--status-merge-ready-color);
+}
+
+.status-badge.is-outcome-closed,
+.status-badge.is-outcome-abandoned {
+  border-color: var(--text-muted);
+  color: var(--text-muted);
+  text-decoration: line-through;
+}
+
+.status-badge.is-outcome-plan-ready,
+.status-badge.is-plan-ready {
+  border-color: var(--text-normal);
+  color: var(--text-normal);
+}
+
+.status-badge.is-detached {
+  border: 1.5px solid
+    color-mix(in srgb, var(--accent-warning) 45%, var(--background-modifier-border));
+  background-color: color-mix(in srgb, var(--accent-warning) 10%, transparent);
+  color: var(--accent-warning);
+}
+
+.status-badge.is-starting {
+  border-color: color-mix(in srgb, var(--accent-primary) 45%, var(--background-modifier-border));
+  color: var(--accent-primary);
+}
+
+.status-badge.is-checks-pending {
+  border-color: var(--background-modifier-border);
+  color: var(--text-muted);
+}
+
+.status-badge.is-failing {
+  border-color: color-mix(in srgb, var(--accent-danger) 45%, var(--background-modifier-border));
+  background-color: color-mix(in srgb, var(--accent-danger) 10%, transparent);
+  color: var(--accent-danger);
+}
+
+.status-badge.is-has-comments {
+  border-color: color-mix(in srgb, var(--accent-warning) 45%, var(--background-modifier-border));
+  background-color: color-mix(in srgb, var(--accent-warning) 10%, transparent);
+  color: var(--accent-warning);
+}
+
+.status-badge.is-passing {
+  border-color: color-mix(in srgb, var(--accent-success) 45%, var(--background-modifier-border));
+  color: var(--accent-success);
+}
+
+.status-badge.is-prod {
+  border-color: var(--accent-success);
+  background-color: color-mix(in srgb, var(--accent-success) 12%, transparent);
+  color: var(--accent-success);
+  font-weight: var(--fw-display);
+}
+
+.status-badge.is-pr-open {
+  border-color: var(--accent-primary);
+  color: var(--accent-primary);
+}
+
+/* ---------- WIKI-143: react-diff-view themed via wiki tokens ---------- */
+
+.split-diff-file .wiki-diff,
+.wiki-diff {
+  --diff-background-color: var(--code-background);
+  --diff-text-color: var(--text-normal);
+  --diff-font-family: var(--font-monospace);
+  --diff-selection-background-color: color-mix(in srgb, var(--accent-primary) 25%, transparent);
+  --diff-gutter-insert-background-color: color-mix(
+    in srgb,
+    var(--diff-add-background) 65%,
+    var(--code-background)
+  );
+  --diff-gutter-insert-text-color: var(--diff-add-foreground);
+  --diff-gutter-delete-background-color: color-mix(
+    in srgb,
+    var(--diff-remove-background) 65%,
+    var(--code-background)
+  );
+  --diff-gutter-delete-text-color: var(--diff-remove-foreground);
+  --diff-gutter-selected-background-color: color-mix(in srgb, var(--accent-warning) 25%, transparent);
+  --diff-code-insert-background-color: var(--diff-add-background);
+  --diff-code-insert-text-color: var(--diff-add-foreground);
+  --diff-code-delete-background-color: var(--diff-remove-background);
+  --diff-code-delete-text-color: var(--diff-remove-foreground);
+  --diff-code-insert-edit-background-color: color-mix(
+    in srgb,
+    var(--accent-success) 30%,
+    var(--diff-add-background)
+  );
+  --diff-code-insert-edit-text-color: var(--diff-add-foreground);
+  --diff-code-delete-edit-background-color: color-mix(
+    in srgb,
+    var(--accent-danger) 30%,
+    var(--diff-remove-background)
+  );
+  --diff-code-delete-edit-text-color: var(--diff-remove-foreground);
+  --diff-code-selected-background-color: color-mix(in srgb, var(--accent-warning) 25%, transparent);
+  --diff-code-selected-text-color: var(--text-normal);
+  --diff-omit-gutter-line-color: var(--accent-warning);
+
+  font-size: var(--fs-sm);
+}
+
+.wiki-diff td {
+  font-family: var(--font-monospace);
+}
+
+/* WIKI-143: artifact renderers */
+
+.artifact-diff {
+  overflow-x: auto;
+  padding: 6px 0;
+  font-family: var(--font-monospace);
+  font-size: var(--fs-sm);
+}
+
+.artifact-diff-empty {
+  padding: 8px 12px;
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-size: var(--fs-sm);
+}
+
+.artifact-file-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 6px 4px;
+  list-style: none;
+}
+
+.artifact-file-list-item {
+  display: flex;
+  align-items: stretch;
+}
+
+.artifact-file-list-button,
+.artifact-file-list-static {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 4px 8px;
+  border: 0;
+  border-radius: var(--radius-xs);
+  background: transparent;
+  color: var(--text-normal);
+  font-family: var(--font-monospace);
+  font-size: var(--fs-sm);
+  text-align: left;
+  cursor: default;
+}
+
+.artifact-file-list-button {
+  cursor: pointer;
+  transition: background-color 120ms ease;
+}
+
+.artifact-file-list-button:hover,
+.artifact-file-list-button:focus-visible {
+  background-color: var(--background-modifier-hover);
+  outline: none;
+}
+
+.artifact-file-list-icon {
+  flex-shrink: 0;
+  opacity: 0.7;
+}
+
+.artifact-file-list-label {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.artifact-file-list-status {
+  margin-left: auto;
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.artifact-file-list-empty {
+  padding: 8px 12px;
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+}
+
+.artifact-json {
+  margin: 0;
+  padding: 8px 12px;
+  overflow: auto;
+  font-family: var(--font-monospace);
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+  color: var(--text-normal);
 }

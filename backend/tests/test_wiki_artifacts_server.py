@@ -45,6 +45,29 @@ def _payload(kind: str) -> dict:
             "source": "print('new')\n",
             "diff_from": "print('old')\n",
         },
+        "diff": {
+            "source": (
+                "diff --git a/hello.py b/hello.py\n"
+                "--- a/hello.py\n"
+                "+++ b/hello.py\n"
+                "@@ -1 +1 @@\n"
+                "-print('old')\n"
+                "+print('new')\n"
+            ),
+        },
+        "file-list": {
+            "files": [
+                {"path": "hello.py", "label": "hello.py", "status": "modified"},
+                {"path": "goodbye.py", "status": "added", "size": 42},
+            ],
+        },
+        "json": {
+            "json_data": {
+                "ticket": "WIKI-143",
+                "counts": {"added": 2, "modified": 1},
+                "flags": [True, False, True],
+            },
+        },
     }[kind]
 
 
@@ -111,6 +134,9 @@ class WikiArtifactsTests(unittest.TestCase):
             },
             "plot": {"spec_vega_lite": []},
             "code": {"language": 1, "source": "x"},
+            "diff": {},
+            "file-list": {"files": [{"label": "missing path"}]},
+            "json": {},
         }
         for kind, payload in malformed.items():
             with self.subTest(kind=kind), self.assertRaises(
@@ -129,6 +155,11 @@ class WikiArtifactsTests(unittest.TestCase):
             },
             "plot": {"spec_vega_lite": {"description": oversized_text}},
             "code": {"language": "text", "source": oversized_text},
+            "diff": {"source": oversized_text},
+            "file-list": {
+                "files": [{"path": oversized_text, "label": oversized_text}],
+            },
+            "json": {"json_data": {"body": oversized_text}},
         }
         for kind, payload in text_payloads.items():
             with self.subTest(kind=kind), self.assertRaisesRegex(
