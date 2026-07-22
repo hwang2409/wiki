@@ -1,4 +1,5 @@
 import { forwardRef } from "react";
+import type { AriaRole } from "react";
 
 export type StatusBadgeState =
   | "working"
@@ -12,6 +13,8 @@ export type StatusBadgeState =
   | "ok"
   | "warning"
   | "error"
+  | "neutral"
+  | "faint"
   | "unknown";
 
 const DEFAULT_LABEL: Partial<Record<StatusBadgeState, string>> = {
@@ -29,6 +32,8 @@ const DEFAULT_LABEL: Partial<Record<StatusBadgeState, string>> = {
   unknown: "unknown",
 };
 
+const TAG_STATES = new Set<StatusBadgeState>(["neutral", "faint"]);
+
 export type StatusBadgeProps = {
   state: StatusBadgeState | (string & {});
   label?: string;
@@ -36,10 +41,11 @@ export type StatusBadgeProps = {
   compact?: boolean;
   title?: string;
   className?: string;
+  role?: AriaRole;
 };
 
 export const StatusBadge = forwardRef<HTMLSpanElement, StatusBadgeProps>(function StatusBadge(
-  { state, label, withDot = false, compact = false, title, className },
+  { state, label, withDot = false, compact = false, title, className, role },
   ref,
 ) {
   const classes = ["status-badge", `is-${state}`];
@@ -47,12 +53,13 @@ export const StatusBadge = forwardRef<HTMLSpanElement, StatusBadgeProps>(functio
   if (compact) classes.push("is-compact");
   if (className) classes.push(className);
   const text = label ?? DEFAULT_LABEL[state as StatusBadgeState] ?? state;
+  const resolvedRole = role ?? (TAG_STATES.has(state as StatusBadgeState) ? undefined : "status");
   return (
     <span
       className={classes.join(" ")}
       data-state={state}
       ref={ref}
-      role="status"
+      role={resolvedRole}
       title={title ?? text}
     >
       {withDot ? <span aria-hidden="true" className="status-badge-dot" /> : null}

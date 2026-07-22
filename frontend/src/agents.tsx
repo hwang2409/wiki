@@ -1094,9 +1094,9 @@ export function AgentsView({
           >
             {worker.ticket}
           </a>
-          {worker.kind ? <span className="agent-chip">{worker.kind}</span> : null}
-          {worker.role ? <span className="agent-chip">{worker.role}</span> : null}
-          {worker.model ? <span className="agent-chip is-faint">{worker.model}</span> : null}
+          {worker.kind ? <StatusBadge compact label={worker.kind} state="neutral" /> : null}
+          {worker.role ? <StatusBadge compact label={worker.role} state="neutral" /> : null}
+          {worker.model ? <StatusBadge compact label={worker.model} state="faint" /> : null}
           {deadRun ? (
             <DeadRunAffordance id={worker.ticket} />
           ) : (
@@ -1223,8 +1223,8 @@ export function AgentsView({
               <div className="agents-orch-head">
                 <Bot size={13} />
                 <span className="agents-orch-id">{orch.id}</span>
-                {orch.kind ? <span className="agent-chip">{orch.kind}</span> : null}
-                {orch.model ? <span className="agent-chip is-faint">{orch.model}</span> : null}
+                {orch.kind ? <StatusBadge compact label={orch.kind} state="neutral" /> : null}
+                {orch.model ? <StatusBadge compact label={orch.model} state="faint" /> : null}
                 {orch.cwd ? (
                   <span className="agents-orch-cwd">{orch.cwd.split("/").slice(-1)[0]}</span>
                 ) : null}
@@ -1312,9 +1312,9 @@ export function AgentsView({
                     >
                       {entry.ticket}
                     </a>
-                    {entry.kind ? <span className="agent-chip">{entry.kind}</span> : null}
-                    {entry.role ? <span className="agent-chip">{entry.role}</span> : null}
-                    {entry.model ? <span className="agent-chip is-faint">{entry.model}</span> : null}
+                    {entry.kind ? <StatusBadge compact label={entry.kind} state="neutral" /> : null}
+                    {entry.role ? <StatusBadge compact label={entry.role} state="neutral" /> : null}
+                    {entry.model ? <StatusBadge compact label={entry.model} state="faint" /> : null}
                     {entry.outcome ? (
                       <StatusBadge label={entry.outcome} state={`outcome-${entry.outcome}`} />
                     ) : entry.state ? (

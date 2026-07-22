@@ -13,6 +13,7 @@ import { deletePaneStateEntries } from "./pane-state-cache";
 import { ReplaceAgentModal } from "./replace-agent-modal";
 import type { SessionEvent, SpawnWorkerEffort, SpawnWorkerKind } from "./api";
 import { SessionTab, usePollTick } from "./session";
+import { StatusBadge } from "./status-badge";
 import {
   readPanelState,
   writePanelState,
@@ -139,7 +140,7 @@ function SessionSidePanel({
       <header className="session-header">
         {icon}
         <span className="session-ticket">{title}</span>
-        {badge ? <span className="agent-chip is-faint">{badge}</span> : null}
+        {badge ? <StatusBadge compact label={badge} state="faint" /> : null}
         <button
           aria-label="Close"
           className="session-close"
@@ -476,9 +477,9 @@ export function AgentSessionSurface({
       <section className={`agent-session-surface is-${context}`}>
         <header className="session-header agent-session-surface-head">
           <span className="session-ticket">{worker.ticket}</span>
-          {worker.kind ? <span className="agent-chip">{worker.kind}</span> : null}
-          {worker.role ? <span className="agent-chip">{worker.role}</span> : null}
-          {worker.model ? <span className="agent-chip is-faint">{worker.model}</span> : null}
+          {worker.kind ? <StatusBadge compact label={worker.kind} state="neutral" /> : null}
+          {worker.role ? <StatusBadge compact label={worker.role} state="neutral" /> : null}
+          {worker.model ? <StatusBadge compact label={worker.model} state="faint" /> : null}
           {canReview || worker.canReplace || onClose ? (
             <div className="agent-surface-actions">
               {worker.canReplace && worker.kind && worker.model ? (

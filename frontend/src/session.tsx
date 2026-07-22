@@ -78,6 +78,7 @@ import {
 import { LoadingPlaceholder } from "./loading";
 import { createStateKeyWriteBarrier, deletePaneStateEntries } from "./pane-state-cache";
 import { Timestamp } from "./timestamp";
+import { StatusBadge } from "./status-badge";
 import {
   addPendingUserMessage,
   composerTextMatches,
@@ -3395,9 +3396,9 @@ export function SessionSidebar({
       <div className="session-sidebar-inner">
         <header className="session-header">
           <span className="session-ticket">{worker.ticket}</span>
-          {worker.kind ? <span className="agent-chip">{worker.kind}</span> : null}
-          {worker.role ? <span className="agent-chip">{worker.role}</span> : null}
-          {worker.model ? <span className="agent-chip is-faint">{worker.model}</span> : null}
+          {worker.kind ? <StatusBadge compact label={worker.kind} state="neutral" /> : null}
+          {worker.role ? <StatusBadge compact label={worker.role} state="neutral" /> : null}
+          {worker.model ? <StatusBadge compact label={worker.model} state="faint" /> : null}
           <div className="agent-surface-actions">
             <button
               className="agent-surface-action"
