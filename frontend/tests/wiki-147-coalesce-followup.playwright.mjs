@@ -294,24 +294,16 @@ async function main() {
       `follow-up POST must persist coalesced max seq. saw last_viewed_seq=${lastServer}, attempts=${JSON.stringify(attemptedSeqs)}`,
     );
 
-    // The 3-attempt budget from R3 still holds under an SSE burst. R5 must
-    // not widen the retry budget — attempts include the initial POST + the
-    // follow-up, and any transient retry beyond that.
-    assert.ok(
-      attemptCount <= 3,
-      `attempts must stay within MAX_ATTEMPTS=3 budget. saw ${attemptCount}: ${JSON.stringify(attemptedSeqs)}`,
-    );
-    // We must have actually issued the follow-up (otherwise the assertion
-    // above is trivially satisfied by the held first POST alone).
-    assert.ok(
-      attemptCount >= 2,
-      `follow-up POST expected after coalescing. saw ${attemptCount}: ${JSON.stringify(attemptedSeqs)}`,
-    );
-    // And the follow-up must have targeted the coalesced max (seq=12), not
-    // an intermediate value.
-    assert.ok(
-      attemptedSeqs.includes(12),
-      `follow-up must target coalesced max. attempts=${JSON.stringify(attemptedSeqs)}`,
+    // Full coalesce contract: observed POST sequence must be EXACTLY
+    // [1, 12] — the initial in-flight POST at seq=1, then one coalesced
+    // follow-up at the SSE max seq=12. No third POST, no reordering, no
+    // intermediate seq. This is strictly tighter than the earlier
+    // "<=3 attempts and includes(12)" formulation, which allowed
+    // [1, 12, 12] and other pathological retry chains to pass.
+    assert.deepStrictEqual(
+      attemptedSeqs,
+      [1, 12],
+      `POST sequence must be exactly [1, 12]. saw ${JSON.stringify(attemptedSeqs)}`,
     );
 
     // The failed-indicator must NOT appear — the burst was fully absorbed.
