@@ -697,17 +697,31 @@ function correlateComposerMessages(
     }
     // Text fallback for providers that do not echo pending_id. Scan FIFO so
     // an earlier unsourced composer message reserves its Henry-bubble slot
-    // before a later synthetic one is allowed to take it.
-    const sentAt = message.sent_at ? Date.parse(message.sent_at) : Number.NaN;
+    // before a later synthetic one is allowed to take it. The match window
+    // is bounded on BOTH sides of the composer's echoed_at (falling back to
+    // sent_at when the provider has not yet echoed): composer_messages is
+    // unbounded across run replacement while the transcript window is
+    // trimmed, so an old sourced row whose real event has fallen out must
+    // not be allowed to claim a later identical terminal-typed Henry row.
+    const anchorAt = (() => {
+      const echoed = message.echoed_at ? Date.parse(message.echoed_at) : Number.NaN;
+      if (Number.isFinite(echoed)) return echoed;
+      const sent = message.sent_at ? Date.parse(message.sent_at) : Number.NaN;
+      return Number.isFinite(sent) ? sent : Number.NaN;
+    })();
+    const FALLBACK_LOOKBACK_MS = 2_000;
+    const FALLBACK_LOOKAHEAD_MS = 60_000;
     const matchIndex = events.findIndex((event, index) => {
       if (claimed.has(index) || event.kind !== "user") return false;
       if (event.pending_id) return false;
       const eventAt = event.ts ? Date.parse(event.ts) : Number.NaN;
-      if (
-        Number.isFinite(sentAt) &&
-        Number.isFinite(eventAt) &&
-        eventAt < sentAt - 2_000
-      ) {
+      if (Number.isFinite(anchorAt) && Number.isFinite(eventAt)) {
+        if (eventAt < anchorAt - FALLBACK_LOOKBACK_MS) return false;
+        if (eventAt > anchorAt + FALLBACK_LOOKAHEAD_MS) return false;
+      } else if (Number.isFinite(anchorAt) !== Number.isFinite(eventAt)) {
+        // Composer has a durable anchor but the event does not (or vice
+        // versa): without both timestamps the window guard is meaningless,
+        // so refuse the fallback rather than allow an unbounded match.
         return false;
       }
       return composerTextMatches(event.text, message.text);

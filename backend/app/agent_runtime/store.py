@@ -125,6 +125,56 @@ def _apply_pending_request_event(
         record.pending_requests.pop(_provider_request_key(request_id), None)
 
 
+_UNREAD_SKIP_KIND_SUFFIXES = ("_client_message", "_stderr")
+_UNREAD_SKIP_KINDS = frozenset(
+    {
+        # Inbound provider "user turn" echoes are not worker output — Henry
+        # typing and fleet/steer synthetic wakes both come through these.
+        "claude_user",
+        "codex_user",
+        # Approval-side and provider-lifecycle rows are surface noise: they
+        # advance the counter but never reflect a new worker-authored view.
+        "approval",
+        "approval_response",
+        "approval_cancelled",
+        "approval_resolved",
+        "provider_process_exit",
+        "provider_protocol_error",
+        # Turn boundaries are lifecycle only.
+        "turn_started",
+        "turn_completed",
+        "turn_aborted",
+        "thread_status_changed",
+        "context_compacted",
+        "rpc_response",
+        "unknown",
+        "normalization_error",
+    }
+)
+
+
+def _is_unread_worthy(kind: str, payload: dict[str, Any] | None, disposition: str) -> bool:
+    """Whether a normalized event should advance ``unread_event_seq``.
+
+    Unread is a "new worker output for Henry" signal. Client-authored, user-
+    inbound, approval, lifecycle, and synthetic supervisor turns must all
+    leave the counter alone so an orchestrator wake doesn't light the
+    worker's dot before the worker has produced any response.
+    """
+
+    if disposition == EventDisposition.IGNORED.value:
+        return False
+    if kind in _UNREAD_SKIP_KINDS:
+        return False
+    if any(kind.endswith(suffix) for suffix in _UNREAD_SKIP_KIND_SUFFIXES):
+        return False
+    if isinstance(payload, dict):
+        source = payload.get("source")
+        if isinstance(source, str) and source:
+            return False
+    return True
+
+
 def _apply_composer_message_event(
     record: RunRecord,
     *,
@@ -533,15 +583,17 @@ class RunStore:
                 previous_composer_messages = list(record.composer_messages)
                 record.pending_requests = {}
                 lifecycle_checkpoint = record.last_lifecycle_event_seq
+                rebuilt_unread_seq = 0
                 for event in normalized_events:
                     disposition = event.get("disposition")
                     if disposition in counts:
                         counts[disposition] += 1
                     payload = event.get("payload")
+                    kind_value = str(event.get("kind") or "unknown")
                     if isinstance(payload, dict):
                         _apply_pending_request_event(
                             record,
-                            kind=str(event.get("kind") or "unknown"),
+                            kind=kind_value,
                             payload=payload,
                             raw_seq=int(event.get("raw_seq", 0)),
                             normalized_at=str(event.get("normalized_at") or utc_now()),
@@ -554,6 +606,15 @@ class RunStore:
                             seq=seq,
                             normalized_at=str(event.get("normalized_at") or utc_now()),
                         )
+                    # Rebuild the WIKI-161 unread-worthy counter alongside
+                    # normalized_event_count so a crash between JSONL fsync
+                    # and run.json replace cannot leave a stale value on disk.
+                    if _is_unread_worthy(
+                        kind_value,
+                        payload if isinstance(payload, dict) else None,
+                        str(disposition or ""),
+                    ):
+                        rebuilt_unread_seq = seq
                     if seq <= lifecycle_checkpoint:
                         continue
                     lifecycle_value = event.get("lifecycle_state")
@@ -590,11 +651,13 @@ class RunStore:
                     or previous_pending_user_messages != record.pending_user_messages
                     or previous_composer_messages != record.composer_messages
                     or record.last_lifecycle_event_seq != lifecycle_checkpoint
+                    or record.unread_event_seq != rebuilt_unread_seq
                 ):
                     record.raw_event_count = raw_count
                     record.normalized_event_count = normalized_count
                     record.disposition_counts = counts
                     record.last_lifecycle_event_seq = lifecycle_checkpoint
+                    record.unread_event_seq = rebuilt_unread_seq
                     self._write_record(record)
             except (OSError, StoreError, TypeError, ValueError):
                 # A corrupt run remains on disk for the inspector; one bad run
@@ -1190,12 +1253,11 @@ class RunStore:
             }
             _append_json_line(self.normalized_events_path(run_id), envelope)
             record.normalized_event_count = int(envelope["seq"])
-            # Sourced user echoes are supervisor/fleet-generated wakes, not
-            # worker output — the unread dot must not light on them. Every
-            # other normalized event advances the freshness counter.
-            source_tag = payload.get("source") if isinstance(payload, dict) else None
-            is_synthetic_user = isinstance(source_tag, str) and bool(source_tag)
-            if not is_synthetic_user:
+            # Unread advances only on genuinely worker-authored surface events
+            # (see _is_unread_worthy). Synthetic supervisor wakes, outbound
+            # client_message rows, provider-lifecycle boundaries, and user
+            # inbound echoes all leave the counter alone.
+            if _is_unread_worthy(kind, payload, disposition.value):
                 record.unread_event_seq = int(envelope["seq"])
             record.disposition_counts[disposition.value] = (
                 record.disposition_counts.get(disposition.value, 0) + 1

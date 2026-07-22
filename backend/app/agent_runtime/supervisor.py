@@ -2249,18 +2249,28 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             # Source metadata is only propagated through pending_user_messages,
             # so mint a durable id for synthetic sources without a composer id.
             pending_id = str(uuid4())
-        pending_tracked = False
+        # Cleanup obligation is established BEFORE the tracker runs. A partial
+        # tracker success (atomic os.replace committed but a follow-up chmod
+        # or dir fsync raises) would otherwise leak a durable pending row
+        # while releasing the dedupe key — a retry would then land a second
+        # pending row for the same pending_id, and the stale first row could
+        # consume the retry's provider echo.
         try:
             if pending_id is not None:
-                self.store.track_pending_user_message(
-                    run_id, pending_id, message, source=source
-                )
-                pending_tracked = True
+                try:
+                    self.store.track_pending_user_message(
+                        run_id, pending_id, message, source=source
+                    )
+                except Exception:
+                    # Even a raise here may have persisted a partial row —
+                    # unconditionally discard by pending_id before rethrowing.
+                    self.store.discard_pending_user_message(run_id, pending_id)
+                    raise
             status = await adapter.send_now(message)
         except Exception:
             if dedupe_key is not None:
                 self.store.release_message_dedupe_key(run_id, dedupe_key)
-            if pending_tracked and pending_id is not None:
+            if pending_id is not None:
                 self.store.discard_pending_user_message(run_id, pending_id)
             raise
         record = self.store.update_adapter_status(run_id, status)

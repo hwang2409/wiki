@@ -212,58 +212,73 @@ class SendNowSourceTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
 
-    async def test_sourced_user_echo_does_not_advance_unread_seq(self) -> None:
-        """WIKI-161 review R6: fleet-monitor / supervisor-steer wakes must not
-        light the worker's unread dot before the worker has responded. Each
-        such normalized event advances ``normalized_event_count`` but must
-        leave ``unread_event_seq`` untouched."""
+    async def test_unread_event_seq_only_advances_on_worker_output(self) -> None:
+        """WIKI-161 review R6+R2R3: the unread dot must light only when the
+        worker produces new output. Sourced supervisor turns AND unsourced
+        outbound client_message journals AND user echoes (whether Henry-
+        typed or synthetic) AND turn/lifecycle rows must all leave the
+        counter alone; only assistant/tool/etc. output advances it."""
 
         run_id = await self._start_claude("WIKI-161-H")
         baseline_unread = self.store.get(run_id).unread_event_seq
-        baseline_total = self.store.get(run_id).normalized_event_count
 
-        # Assistant-originated output DOES advance the unread counter.
+        # 1. Outbound client_message row (adapters journal these before any
+        # provider response) must NOT advance unread.
+        pre_outbound = self.store.get(run_id)
         self.store.append_normalized(
             run_id,
-            raw_seq=self.store.get(run_id).raw_event_count,
-            disposition=EventDisposition.RENDERED,
-            kind="claude_assistant",
-            payload={"text": "worker response"},
+            raw_seq=pre_outbound.raw_event_count,
+            disposition=EventDisposition.IGNORED,
+            kind="claude_client_message",
+            payload={"type": "user", "message": {"role": "user"}},
         )
-        after_worker = self.store.get(run_id)
-        self.assertEqual(after_worker.unread_event_seq, baseline_total + 1)
-        self.assertEqual(after_worker.normalized_event_count, baseline_total + 1)
+        after_outbound = self.store.get(run_id)
+        self.assertEqual(
+            after_outbound.normalized_event_count,
+            pre_outbound.normalized_event_count + 1,
+        )
+        self.assertEqual(after_outbound.unread_event_seq, pre_outbound.unread_event_seq)
 
-        # A synthetic supervisor-steer user echo advances the total counter
-        # but must NOT advance unread_event_seq.
-        pre_synthetic = self.store.get(run_id)
+        # 2. Sourced user echo (supervisor-steer / fleet-monitor wake) — no
+        # advance either.
+        pre_sourced = self.store.get(run_id)
         self.store.append_normalized(
             run_id,
-            raw_seq=pre_synthetic.raw_event_count,
+            raw_seq=pre_sourced.raw_event_count,
             disposition=EventDisposition.RENDERED,
             kind="claude_user",
             payload={
                 "type": "user",
                 "message": {
                     "role": "user",
-                    "content": [{"type": "text", "text": "wake up"}],
+                    "content": [{"type": "text", "text": "[fleet] wake up"}],
                 },
                 "source": "fleet-monitor",
             },
         )
-        after_synthetic = self.store.get(run_id)
-        self.assertEqual(
-            after_synthetic.normalized_event_count,
-            pre_synthetic.normalized_event_count + 1,
-        )
-        self.assertEqual(
-            after_synthetic.unread_event_seq,
-            pre_synthetic.unread_event_seq,
-        )
-        # And a real Henry-typed user echo (no source) DOES advance unread.
+        after_sourced = self.store.get(run_id)
+        self.assertEqual(after_sourced.unread_event_seq, pre_sourced.unread_event_seq)
+
+        # 3. Turn/lifecycle boundary (turn_started) — no advance.
+        pre_lifecycle = self.store.get(run_id)
         self.store.append_normalized(
             run_id,
-            raw_seq=after_synthetic.raw_event_count,
+            raw_seq=pre_lifecycle.raw_event_count,
+            disposition=EventDisposition.RENDERED,
+            kind="turn_started",
+            payload={"method": "turn/started"},
+        )
+        after_lifecycle = self.store.get(run_id)
+        self.assertEqual(
+            after_lifecycle.unread_event_seq, pre_lifecycle.unread_event_seq
+        )
+
+        # 4. Henry-typed user echo (unsourced) also does not advance unread —
+        # Henry just sent it, so it can't be "unread" for him.
+        pre_henry = self.store.get(run_id)
+        self.store.append_normalized(
+            run_id,
+            raw_seq=pre_henry.raw_event_count,
             disposition=EventDisposition.RENDERED,
             kind="claude_user",
             payload={
@@ -274,12 +289,69 @@ class SendNowSourceTests(unittest.IsolatedAsyncioTestCase):
                 },
             },
         )
-        after_human = self.store.get(run_id)
-        self.assertEqual(
-            after_human.unread_event_seq,
-            after_synthetic.normalized_event_count + 1,
+        after_henry = self.store.get(run_id)
+        self.assertEqual(after_henry.unread_event_seq, pre_henry.unread_event_seq)
+
+        # 5. Only genuine worker output (assistant message here) advances.
+        pre_worker = self.store.get(run_id)
+        self.store.append_normalized(
+            run_id,
+            raw_seq=pre_worker.raw_event_count,
+            disposition=EventDisposition.RENDERED,
+            kind="claude_assistant",
+            payload={"text": "worker response"},
         )
-        del baseline_unread
+        after_worker = self.store.get(run_id)
+        self.assertEqual(
+            after_worker.unread_event_seq,
+            pre_worker.normalized_event_count + 1,
+        )
+        # Baseline started at whatever start_run produced; the assistant
+        # message is the first genuinely unread-worthy event we appended.
+        self.assertGreater(after_worker.unread_event_seq, baseline_unread)
+
+    async def test_unread_event_seq_rebuilt_from_normalized_jsonl(self) -> None:
+        """WIKI-161 R2 R3: a crash between normalized JSONL fsync and run.json
+        replace currently repairs ``normalized_event_count`` but must also
+        repair the new ``unread_event_seq`` — otherwise the on-disk value
+        stays stale and the unread dot lights wrong on restart."""
+
+        run_id = await self._start_claude("WIKI-161-J")
+        # Two synthetic + one assistant. Only the assistant is unread-worthy.
+        pre = self.store.get(run_id)
+        self.store.append_normalized(
+            run_id,
+            raw_seq=pre.raw_event_count,
+            disposition=EventDisposition.RENDERED,
+            kind="claude_user",
+            payload={
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "[steer] focus"}],
+                },
+                "source": "supervisor-steer",
+            },
+        )
+        pre = self.store.get(run_id)
+        self.store.append_normalized(
+            run_id,
+            raw_seq=pre.raw_event_count,
+            disposition=EventDisposition.RENDERED,
+            kind="claude_assistant",
+            payload={"text": "worker output"},
+        )
+        expected_unread = self.store.get(run_id).unread_event_seq
+
+        # Simulate a crash after fsync but before run.json replace: reset
+        # the field on disk and reload via a fresh RunStore reconcile.
+        record = self.store.get(run_id)
+        record.unread_event_seq = 0
+        self.store._write_record(record)  # noqa: SLF001
+
+        fresh = RunStore(self.paths)
+        rebuilt = fresh.get(run_id)
+        self.assertEqual(rebuilt.unread_event_seq, expected_unread)
 
     async def test_pending_track_failure_releases_dedupe_and_pending(self) -> None:
         """Regression for WIKI-161 review: pre-acceptance failures in the
@@ -327,6 +399,91 @@ class SendNowSourceTests(unittest.IsolatedAsyncioTestCase):
         pending = self.store.get(run_id).pending_user_messages
         self.assertEqual(len(pending), 1)
         self.assertEqual(pending[0]["source"], "fleet-monitor")
+
+
+    async def test_pending_track_post_commit_failure_rolls_back_and_retries_cleanly(
+        self,
+    ) -> None:
+        """WIKI-161 review R2 HIGH: track_pending_user_message()'s atomic
+        os.replace may commit and a follow-up chmod/directory-fsync may then
+        raise. The pending row is durable at that point, so the rollback
+        MUST unconditionally discard by pending_id — otherwise the retry
+        lands a second pending row and the stale first row can consume the
+        retry's provider echo. Adapter is spied to prove the retry actually
+        reached the provider (status alone would not distinguish a real
+        send from a deduplicated short-circuit)."""
+
+        run_id = await self._start_claude("WIKI-161-I")
+        dedupe_key = "fleet:wiki-161-i:merge-ready"
+
+        real_track = self.store.track_pending_user_message
+
+        def track_that_commits_then_raises(
+            passed_run_id: str,
+            pending_id: str,
+            text: str,
+            source: str | None = None,
+        ):
+            # Simulate the post-commit code path: the durable write lands
+            # (so the pending row is on disk) and then a follow-up filesystem
+            # step (chmod / dir fsync / stat) raises.
+            real_track(passed_run_id, pending_id, text, source=source)
+            raise OSError("simulated post-commit fs failure")
+
+        self.store.track_pending_user_message = (  # type: ignore[method-assign]
+            track_that_commits_then_raises
+        )
+        try:
+            with self.assertRaises(OSError):
+                await self.supervisor.send_now(
+                    run_id,
+                    "[fleet] partial-commit path",
+                    dedupe_key=dedupe_key,
+                    source="fleet-monitor",
+                )
+        finally:
+            self.store.track_pending_user_message = (  # type: ignore[method-assign]
+                real_track
+            )
+
+        record = self.store.get(run_id)
+        self.assertNotIn(dedupe_key, record.message_dedupe_keys)
+        # The whole point of the fix: no orphan pending row after post-commit
+        # failure — otherwise the retry lands a second row and echoes swap.
+        self.assertEqual(record.pending_user_messages, [])
+
+        adapter = self.supervisor.adapters[run_id]
+        real_send = adapter.send_now
+        send_calls: list[str] = []
+
+        async def send_spy(text: str):
+            send_calls.append(text)
+            return await real_send(text)
+
+        adapter.send_now = send_spy  # type: ignore[assignment]
+        try:
+            result = await self.supervisor.send_now(
+                run_id,
+                "[fleet] partial-commit path",
+                dedupe_key=dedupe_key,
+                source="fleet-monitor",
+            )
+        finally:
+            adapter.send_now = real_send  # type: ignore[assignment]
+
+        self.assertEqual(result["status"], "sent")
+        self.assertEqual(result["dedupe_key"], dedupe_key)
+        # Adapter spy confirms the retry actually flowed to the provider
+        # instead of short-circuiting on the still-claimed dedupe key.
+        self.assertEqual(send_calls, ["[fleet] partial-commit path"])
+        pending = self.store.get(run_id).pending_user_messages
+        self.assertEqual(
+            len(pending),
+            1,
+            f"exactly one pending row expected after retry, got {pending}",
+        )
+        self.assertEqual(pending[0]["source"], "fleet-monitor")
+        self.assertEqual(pending[0]["text"], "[fleet] partial-commit path")
 
 
 if __name__ == "__main__":

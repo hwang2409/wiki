@@ -36,12 +36,25 @@ const STEER_TS = "2026-07-22T18:00:10Z";
 // arrives ~1.5s later with the same body.
 const COLLISION_HUMAN_TS = "2026-07-22T18:00:20Z";
 const COLLISION_FLEET_TS = "2026-07-22T18:00:21.500Z";
+// R2 review R2: an old sourced composer whose real transcript event has
+// fallen out of the window must NOT claim a later identical terminal-
+// typed Henry row (composer_messages survives run replacement while the
+// transcript window is trimmed).
+const STALE_FLEET_ECHO_TS = "2026-07-22T17:00:00Z";
+const LATE_HENRY_TS = "2026-07-22T18:00:40Z";
+// R2 review R2: archived-source rendering — the composer_messages surface
+// serves a sourced row that has no matching real transcript event, so
+// the frontend must synthesize a marker (same rendering path an archived
+// normalized user turn whose payload carried `source` would exercise).
+const ARCHIVED_STEER_TS = "2026-07-22T17:30:00Z";
 
 const HENRY_TEXT = "hi from henry";
 const FLEET_TEXT = "[fleet] WIKI-1234 merged";
 const FLEET_TEXT_2 = "[fleet] WIKI-1235 blocked";
 const STEER_TEXT = "supervisor steer body";
 const COLLISION_TEXT = "please check queue";
+const STALE_FLEET_TEXT = "[fleet] stale-window ping";
+const ARCHIVED_STEER_TEXT = "[archived] historical supervisor steer";
 
 // Native transcript is the authoritative event stream in this fixture; the
 // events/read RPC only needs to expose `composer_messages` to the frontend.
@@ -98,6 +111,30 @@ const COMPOSER_MESSAGES = [
     echoed_at: COLLISION_FLEET_TS,
     seq: 6,
     source: "fleet-monitor",
+  },
+  // Stale-window fleet composer: sent AND echoed ~1h before the transcript
+  // window; a later transcript row has the same text but is genuinely
+  // Henry-typed. Correlator's text fallback must reject on the upper
+  // timestamp bound and leave the Henry row as a bubble.
+  {
+    pending_id: "77777777-7777-4777-8777-777777777777",
+    text: STALE_FLEET_TEXT,
+    sent_at: STALE_FLEET_ECHO_TS,
+    echoed_at: STALE_FLEET_ECHO_TS,
+    seq: 7,
+    source: "fleet-monitor",
+  },
+  // Archived-source rendering path: no matching transcript event, so the
+  // frontend synthesizes the row from composer_messages alone. This
+  // exercises the same MessageBlock render path an archived normalized
+  // user turn with payload.source would take.
+  {
+    pending_id: "88888888-8888-4888-8888-888888888888",
+    text: ARCHIVED_STEER_TEXT,
+    sent_at: ARCHIVED_STEER_TS,
+    echoed_at: ARCHIVED_STEER_TS,
+    seq: 8,
+    source: "supervisor-steer",
   },
 ];
 
@@ -201,6 +238,11 @@ async function main() {
     codexUser(STEER_TEXT, STEER_TS),
     codexUser(COLLISION_TEXT, COLLISION_HUMAN_TS),
     codexUser(COLLISION_TEXT, COLLISION_FLEET_TS),
+    // Late Henry-typed row whose text matches the STALE_FLEET composer row
+    // above. The composer's echoed_at is ~1h before this timestamp, so the
+    // correlator's upper timestamp bound must reject the fallback match and
+    // leave this row rendered as a Henry bubble.
+    codexUser(STALE_FLEET_TEXT, LATE_HENRY_TS),
   ];
   await fs.writeFile(
     transcript,
@@ -262,24 +304,29 @@ async function main() {
     );
 
     // Source-tagged turns render as marker rows, not user bubbles. Two
-    // fleet turns (WIKI-1234 / WIKI-1235) plus the fleet half of the
-    // identical-text collision pair → three fleet markers total.
+    // basic fleet turns (WIKI-1234 / WIKI-1235), the fleet half of the
+    // identical-text collision pair, and the stale-window fleet composer
+    // that synthesizes on its own (no matching transcript row) → four
+    // fleet markers total.
     const fleetMarker = page.locator(
       "[data-testid='session-synthetic-source'][data-source='fleet-monitor']",
     );
     await fleetMarker.first().waitFor({ state: "attached" });
     const fleetCount = await fleetMarker.count();
     assert(
-      fleetCount === 3,
-      `expected 3 fleet-monitor marker rows, saw ${fleetCount}`,
+      fleetCount === 4,
+      `expected 4 fleet-monitor marker rows, saw ${fleetCount}`,
     );
     const steerMarker = page.locator(
       "[data-testid='session-synthetic-source'][data-source='supervisor-steer']",
     );
     await steerMarker.first().waitFor({ state: "attached" });
+    // Two supervisor-steer markers: the STEER_TEXT transcript row matched
+    // against its composer, and the archived-source composer that has no
+    // matching transcript row and synthesizes a marker on its own.
     assert(
-      (await steerMarker.count()) === 1,
-      "expected a single supervisor-steer marker row",
+      (await steerMarker.count()) === 2,
+      `expected 2 supervisor-steer marker rows, saw ${await steerMarker.count()}`,
     );
 
     // Marker rows carry a plain-text source chip, not an avatar/bubble.
@@ -299,10 +346,12 @@ async function main() {
       .count();
     assert(steerAsBubble === 0, "steer marker leaked into a .session-user bubble");
 
-    // R4/R7: identical-text collision — Henry's earlier transcript row must
-    // stay a bubble; only the second (fleet) row becomes a marker. If the
-    // correlator swapped them, the bubble would carry the fleet timestamp
-    // and no fleet marker would exist for the collision text.
+    // R4/R7 + R2 R4: identical-text collision. Not only must there be one
+    // bubble + one marker, but the BUBBLE must be the EARLIER (Henry) row
+    // and the MARKER must be the LATER (fleet) row. A mutation that
+    // simply swapped ownership would still land 1+1; the DOM-order check
+    // rules it out. All matching nodes are read from the same scroll, so
+    // documentPosition tells us which was rendered above the other.
     const collisionBubbles = await page
       .locator(".session-user", { hasText: COLLISION_TEXT })
       .count();
@@ -319,6 +368,89 @@ async function main() {
     assert(
       collisionMarkers === 1,
       `collision text should render exactly one fleet marker, saw ${collisionMarkers}`,
+    );
+    const collisionOwnership = await page.evaluate((text) => {
+      const bubble = Array.from(document.querySelectorAll(".session-user"))
+        .find((el) => (el.textContent || "").includes(text));
+      const marker = Array.from(
+        document.querySelectorAll(
+          "[data-testid='session-synthetic-source'][data-source='fleet-monitor']",
+        ),
+      ).find((el) => (el.textContent || "").includes(text));
+      if (!bubble || !marker) return { ok: false, reason: "missing node" };
+      const relation = bubble.compareDocumentPosition(marker);
+      // Node.DOCUMENT_POSITION_FOLLOWING === 4: marker follows bubble in
+      // document order — i.e. bubble is the earlier Henry event, marker
+      // is the later fleet event. Any swap flips this bit.
+      return {
+        ok: (relation & Node.DOCUMENT_POSITION_FOLLOWING) !== 0,
+        relation,
+      };
+    }, COLLISION_TEXT);
+    assert(
+      collisionOwnership.ok,
+      `collision bubble must precede marker in DOM order (Henry earlier, fleet later); ` +
+        `saw relation=${collisionOwnership.relation ?? collisionOwnership.reason}`,
+    );
+
+    // R2 R2: stale-window fallback. An old sourced composer (echoed_at ~1h
+    // before this transcript) whose real event has fallen out of the
+    // trimmed window must NOT tag a later identical Henry-typed row. If
+    // the upper timestamp bound is missing, the late Henry row is
+    // silently converted into a fleet marker and no Henry bubble remains.
+    // The composer still surfaces itself as a synthesized marker (that is
+    // the intended archived-render path); the failure signature is a
+    // missing Henry bubble, not a missing composer marker.
+    const staleBubble = await page
+      .locator(".session-user", { hasText: STALE_FLEET_TEXT })
+      .count();
+    assert(
+      staleBubble === 1,
+      `late Henry row with stale composer match must render as a bubble; saw ${staleBubble}`,
+    );
+    // The bubble must render AFTER the stale composer's synthesized marker
+    // in DOM order (Henry row is at 18:00:40, composer's echoed_at is
+    // ~1h earlier). This proves the composer did not steal the bubble.
+    const staleOrdering = await page.evaluate((text) => {
+      const bubble = Array.from(document.querySelectorAll(".session-user"))
+        .find((el) => (el.textContent || "").includes(text));
+      const marker = Array.from(
+        document.querySelectorAll(
+          "[data-testid='session-synthetic-source'][data-source='fleet-monitor']",
+        ),
+      ).find((el) => (el.textContent || "").includes(text));
+      if (!bubble || !marker) return { ok: false, reason: "missing node" };
+      const relation = marker.compareDocumentPosition(bubble);
+      return {
+        ok: (relation & Node.DOCUMENT_POSITION_FOLLOWING) !== 0,
+        relation,
+      };
+    }, STALE_FLEET_TEXT);
+    assert(
+      staleOrdering.ok,
+      `stale-window Henry bubble must follow the archived composer marker; ` +
+        `saw ${staleOrdering.relation ?? staleOrdering.reason}`,
+    );
+
+    // R2 R4 (archived rendering): the archived supervisor-steer composer
+    // has no matching transcript event, so the frontend synthesizes a
+    // marker from composer_messages alone. Same MessageBlock render path
+    // an archived normalized user turn with payload.source takes.
+    const archivedMarker = page.locator(
+      "[data-testid='session-synthetic-source'][data-source='supervisor-steer']",
+      { hasText: ARCHIVED_STEER_TEXT },
+    );
+    await archivedMarker.waitFor({ state: "attached" });
+    assert(
+      (await archivedMarker.count()) === 1,
+      "archived-source composer must render exactly one synthetic marker",
+    );
+    const archivedAsBubble = await page
+      .locator(".session-user", { hasText: ARCHIVED_STEER_TEXT })
+      .count();
+    assert(
+      archivedAsBubble === 0,
+      "archived-source composer must not render as a Henry bubble",
     );
 
     // Multiple synthetic messages back-to-back render as separate marker rows,
