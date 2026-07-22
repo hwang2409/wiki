@@ -26,9 +26,17 @@ import type {
 } from "./api";
 import { classifyArtifact } from "./artifact-kind";
 import { DiffPatchView } from "./diff-view";
+import { ArtifactError, ArtifactPlaceholder } from "./artifact-state";
+import type { ArtifactPlaceholderShape } from "./artifact-state";
 import { ShikiCode, useCurrentTheme } from "./shiki";
 import { SplitDiffView } from "./split-diff";
 import { StatusBadge, statusToTone } from "./status-badge";
+import {
+  readInlineArtifactState,
+  subscribeInlineArtifactState,
+  writeInlineArtifactState,
+} from "./transcript-store";
+import { useSyncExternalStore } from "react";
 
 const TABLE_ROW_HEIGHT = 32;
 const TABLE_VIEWPORT_HEIGHT = 320;
@@ -219,6 +227,7 @@ export function MermaidRenderer({
   const reactId = useId();
   const [html, setHtml] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [nonce, setNonce] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -250,10 +259,21 @@ export function MermaidRenderer({
     return () => {
       cancelled = true;
     };
-  }, [compact, onRenderError, reactId, source, theme]);
+  }, [compact, nonce, onRenderError, reactId, source, theme]);
 
-  if (error) return <div className="artifact-error">{error}</div>;
-  if (!html) return <div className="artifact-loading">Rendering diagram…</div>;
+  if (error) {
+    return (
+      <ArtifactError
+        detail={error}
+        onRetry={() => {
+          setError(null);
+          setNonce((value) => value + 1);
+        }}
+        title="Diagram couldn’t render."
+      />
+    );
+  }
+  if (!html) return <ArtifactPlaceholder label="Rendering diagram…" shape="diagram" />;
   return <div className="artifact-mermaid" dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
@@ -268,6 +288,7 @@ export function SvgRenderer({
 }) {
   const [html, setHtml] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [nonce, setNonce] = useState(0);
   useEffect(() => {
     let cancelled = false;
     const reportFailure = (reason: unknown) => {
@@ -297,9 +318,20 @@ export function SvgRenderer({
     return () => {
       cancelled = true;
     };
-  }, [compact, onRenderError, source]);
-  if (error) return <div className="artifact-error">{error}</div>;
-  if (!html) return <div className="artifact-loading">Sanitizing SVG…</div>;
+  }, [compact, nonce, onRenderError, source]);
+  if (error) {
+    return (
+      <ArtifactError
+        detail={error}
+        onRetry={() => {
+          setError(null);
+          setNonce((value) => value + 1);
+        }}
+        title="Image couldn’t render."
+      />
+    );
+  }
+  if (!html) return <ArtifactPlaceholder label="Preparing image…" shape="image" />;
   return <div className="artifact-svg" dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
@@ -431,7 +463,10 @@ export function PlotRenderer({ actions = false, spec }: { actions?: boolean; spe
   const theme = useCurrentTheme();
   const container = useRef<HTMLDivElement>(null);
   const [error, setError] = useState<string | null>(null);
+  const [ready, setReady] = useState(false);
+  const [nonce, setNonce] = useState(0);
   useEffect(() => {
+    setReady(false);
     const target = container.current;
     if (!target) return;
     let finalized = false;
@@ -466,7 +501,10 @@ export function PlotRenderer({ actions = false, spec }: { actions?: boolean; spe
       try {
         const result = await embed(target, themedSpec, { actions, renderer: "svg" });
         finalize = result.finalize;
-        if (!finalized) setError(null);
+        if (!finalized) {
+          setError(null);
+          setReady(true);
+        }
       } catch (reason) {
         if (!finalized) setError(reason instanceof Error ? reason.message : "Plot could not render this spec.");
       }
@@ -476,8 +514,25 @@ export function PlotRenderer({ actions = false, spec }: { actions?: boolean; spe
       finalize?.();
       target.replaceChildren();
     };
-  }, [actions, spec, theme]);
-  return error ? <div className="artifact-error">{error}</div> : <div className="artifact-plot" ref={container} />;
+  }, [actions, nonce, spec, theme]);
+  if (error) {
+    return (
+      <ArtifactError
+        detail={error}
+        onRetry={() => {
+          setError(null);
+          setNonce((value) => value + 1);
+        }}
+        title="Plot couldn’t render."
+      />
+    );
+  }
+  return (
+    <div className="artifact-plot-wrap">
+      {!ready ? <ArtifactPlaceholder label="Rendering plot…" shape="plot" /> : null}
+      <div className="artifact-plot" ref={container} style={ready ? undefined : { visibility: "hidden", position: "absolute" }} />
+    </div>
+  );
 }
 
 function CodeRenderer({ artifact }: { artifact: SessionArtifact }) {
@@ -689,15 +744,15 @@ export function artifactExceedsInlineThreshold(
 ): boolean {
   switch (classifyArtifact(artifact)) {
     case "table": return (artifact.rows?.length ?? 0) > 30;
-    case "code": return (artifact.source ?? "").split("\n").length > 100;
+    case "code": return (artifact.source ?? "").split("\n").length > 30;
     case "image": return Boolean(imageBounds && (imageBounds.width > 400 || imageBounds.height > 400));
-    case "mermaid": return mermaidNodeCount(artifact.source ?? "") > 20;
+    case "mermaid": return mermaidNodeCount(artifact.source ?? "") > 12;
     case "svg": {
       const bounds = svgBounds(artifact.source ?? "");
       return Boolean(bounds && (bounds.width > 400 || bounds.height > 400));
     }
     case "plot": return plotExceedsInlineBounds(artifact.spec_vega_lite ?? {});
-    case "diff": return (artifact.source ?? "").split("\n").length > 100;
+    case "diff": return (artifact.source ?? "").split("\n").length > 40;
     case "file-list": return (artifact.files ?? []).length > 30;
     case "json": {
       const text = typeof artifact.json_data === "string"
@@ -706,6 +761,23 @@ export function artifactExceedsInlineThreshold(
       return text.length > 4000;
     }
   }
+}
+
+function useInlineExpanded(artifactId: string | undefined): [boolean, (next: boolean) => void] {
+  const id = artifactId ?? "";
+  const state = useSyncExternalStore<{ expanded?: boolean }>(
+    (listener) => id ? subscribeInlineArtifactState(id, listener) : () => {},
+    () => (id ? readInlineArtifactState(id) : {}),
+    () => ({}),
+  );
+  const setExpanded = useCallback(
+    (next: boolean) => {
+      if (!id) return;
+      writeInlineArtifactState(id, { ...readInlineArtifactState(id), expanded: next });
+    },
+    [id],
+  );
+  return [Boolean(state.expanded), setExpanded];
 }
 
 function CompactPreview({ artifact, event, onRenderError, ticket }: ArtifactRendererProps) {
@@ -828,11 +900,22 @@ export function ArtifactBlock({
         setDeliveryStatus("failed");
       });
   }, [artifact?.kind, event.artifact_id, ticket]);
-  if (!artifact) return <div className="artifact-error">Artifact payload missing.</div>;
+  const [inlineExpanded, setInlineExpanded] = useInlineExpanded(event.artifact_id);
+  if (!artifact) {
+    return (
+      <div className="artifact-block-shell">
+        <ArtifactError title="Artifact payload missing." />
+      </div>
+    );
+  }
   const resolvedArtifact = artifact;
   const Icon = KIND_ICONS[resolvedArtifact.kind] ?? FileJson;
   const rowCount = resolvedArtifact.kind === "table" ? resolvedArtifact.rows?.length ?? 0 : null;
   const oversized = artifactExceedsInlineThreshold(resolvedArtifact, imageBounds);
+  const showCompact = oversized && !inlineExpanded;
+  const primaryTitle = event.title || resolvedArtifact.filename || null;
+  const headingTitle = primaryTitle || resolvedArtifact.kind;
+  const descriptionText = event.caption || (primaryTitle && resolvedArtifact.filename && resolvedArtifact.filename !== primaryTitle ? resolvedArtifact.filename : null);
 
   function showCopied() {
     setCopied(true);
@@ -873,36 +956,56 @@ export function ArtifactBlock({
   return (
     <div className={`artifact-block-shell${inspect ? " has-inspect" : ""}`}>
       <section
-        className={`artifact-block${oversized ? " is-compact" : ""}`}
-        data-artifact-compact={oversized || undefined}
+        className={`artifact-block${showCompact ? " is-compact" : ""}${inlineExpanded ? " is-expanded" : ""}`}
+        data-artifact-compact={showCompact || undefined}
+        data-artifact-expanded={inlineExpanded || undefined}
         data-artifact-id={event.artifact_id}
         data-artifact-kind={resolvedArtifact.kind}
         data-artifact-render-status={renderFailure ? "failed" : undefined}
       >
         <header className="artifact-header">
           <div className="artifact-heading">
-            <Icon size={14} />
-            <div>
-              <div className="artifact-title">{event.title || resolvedArtifact.kind}</div>
-              {event.caption ? <div className="artifact-caption">{event.caption}</div> : null}
-            </div>
-            {rowCount !== null ? <span className="artifact-count tabular-nums">{rowCount} rows</span> : null}
+            <Icon aria-hidden="true" size={13} />
+            <span className="artifact-title" title={headingTitle}>{headingTitle}</span>
+            {descriptionText ? (
+              <span className="artifact-caption" title={descriptionText}>{descriptionText}</span>
+            ) : null}
+            {rowCount !== null ? (
+              <span className="artifact-count tabular-nums">{rowCount} rows</span>
+            ) : null}
           </div>
           <div className="artifact-actions">
+            {oversized ? (
+              <button
+                aria-expanded={inlineExpanded}
+                className="artifact-action artifact-action-expand"
+                type="button"
+                onClick={() => setInlineExpanded(!inlineExpanded)}
+              >
+                {inlineExpanded ? "Show less" : "Show all"}
+              </button>
+            ) : null}
             {oversized && onOpen ? (
-              <button className="artifact-action artifact-open-panel" type="button" onClick={() => onOpen?.(event)}>
-                <PanelRightOpen size={12} /> Open in panel
+              <button
+                className="artifact-action artifact-open-panel"
+                type="button"
+                onClick={() => onOpen?.(event)}
+              >
+                <PanelRightOpen aria-hidden="true" size={12} />
+                <span className="artifact-action-label">Open in panel</span>
               </button>
             ) : null}
             {resolvedArtifact.kind === "table" ? (
               <TableCopyMenu artifact={resolvedArtifact} onCopied={showCopied} />
             ) : (
               <button className="artifact-action" type="button" onClick={() => void copy()}>
-                <Copy size={12} /> {copied ? "Copied" : "Copy"}
+                <Copy aria-hidden="true" size={12} />
+                <span className="artifact-action-label">{copied ? "Copied" : "Copy"}</span>
               </button>
             )}
             <button className="artifact-action" type="button" onClick={() => void download()}>
-              <Download size={12} /> Download
+              <Download aria-hidden="true" size={12} />
+              <span className="artifact-action-label">Download</span>
             </button>
             <button
               aria-expanded={inspect}
@@ -910,12 +1013,16 @@ export function ArtifactBlock({
               type="button"
               onClick={() => setInspect((value) => !value)}
             >
-              <Info size={12} /> Inspect
+              <Info aria-hidden="true" size={12} />
+              <span className="artifact-action-label">Inspect</span>
             </button>
           </div>
         </header>
-        <div className="artifact-body" onClick={oversized && onOpen ? () => onOpen(event) : undefined}>
-          {oversized ? (
+        <div
+          className="artifact-body"
+          onClick={showCompact && onOpen ? () => onOpen(event) : undefined}
+        >
+          {showCompact ? (
             <CompactPreview artifact={resolvedArtifact} event={event} onRenderError={reportRenderFailure} ticket={ticket} />
           ) : (
             <ArtifactRenderer

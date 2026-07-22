@@ -55,6 +55,7 @@ export type TranscriptSnapshot = {
 };
 
 export type ArtifactViewState = {
+  expanded?: boolean;
   filter?: string;
   find?: string;
   findOpen?: boolean;
@@ -125,6 +126,30 @@ export function readPanelState(sessionKey: string): PanelState {
 
 export function writePanelState(sessionKey: string, state: PanelState) {
   panelStates.set(sessionKey, state);
+}
+
+type InlineArtifactState = { expanded?: boolean };
+const inlineArtifactStates = new Map<string, InlineArtifactState>();
+const inlineArtifactListeners = new Map<string, Set<Listener>>();
+const EMPTY_INLINE_ARTIFACT_STATE: InlineArtifactState = Object.freeze({});
+
+export function readInlineArtifactState(artifactId: string): InlineArtifactState {
+  return inlineArtifactStates.get(artifactId) ?? EMPTY_INLINE_ARTIFACT_STATE;
+}
+
+export function writeInlineArtifactState(artifactId: string, state: InlineArtifactState) {
+  inlineArtifactStates.set(artifactId, state);
+  inlineArtifactListeners.get(artifactId)?.forEach((listener) => listener());
+}
+
+export function subscribeInlineArtifactState(artifactId: string, listener: Listener): () => void {
+  const listeners = inlineArtifactListeners.get(artifactId) ?? new Set<Listener>();
+  listeners.add(listener);
+  inlineArtifactListeners.set(artifactId, listeners);
+  return () => {
+    listeners.delete(listener);
+    if (listeners.size === 0) inlineArtifactListeners.delete(artifactId);
+  };
 }
 
 function targetKey(target: TranscriptTarget): string {

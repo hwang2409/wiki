@@ -189,10 +189,10 @@ async function main() {
     await panel.getByRole("tab", { name: /Artifact dependency map/ }).waitFor({ state: "visible" });
     if ((await panel.getByRole("tab").count()) !== 2) throw new Error("Second artifact tab did not open");
     await page.screenshot({ path: SCREENSHOTS.split });
-    await panel.getByRole("button", { name: /Artifact menu for Artifact dependency map/ }).click();
-    const pin = panel.getByRole("menuitem", { name: /Pin to vault/ });
-    if (!(await pin.isDisabled()) || (await pin.getAttribute("title")) !== "Coming soon") throw new Error("Pin-to-vault hook is not a disabled Coming soon stub");
-    await panel.getByRole("button", { name: /Artifact menu for Artifact dependency map/ }).click();
+    // WIKI-156: Pin-to-vault "Coming soon" control removed; panel exposes only concrete affordances.
+    if ((await panel.getByRole("menuitem", { name: /Pin to vault/ }).count()) !== 0) {
+      throw new Error("Pin-to-vault Coming-soon stub should be removed");
+    }
 
     const resize = panel.getByLabel("Resize artifact panel");
     const beforeResize = await panel.boundingBox();
@@ -215,8 +215,11 @@ async function main() {
 
     await panel.getByRole("tab", { name: /Artifact dependency map/ }).click();
     await panel.getByRole("button", { name: /Close Artifact dependency map/ }).click();
-    await panel.getByLabel("Recently closed artifacts").getByRole("button", { name: "Artifact dependency map" }).waitFor({ state: "visible" });
-    await panel.getByLabel("Recently closed artifacts").getByRole("button", { name: "Artifact dependency map" }).click();
+    // WIKI-156: Recently closed moved into the panel overflow menu.
+    await panel.getByRole("button", { name: "Artifact panel menu" }).click();
+    const overflowMenu = panel.locator("#artifact-panel-overflow-menu");
+    await overflowMenu.waitFor({ state: "visible" });
+    await overflowMenu.getByRole("menuitem", { name: "Artifact dependency map" }).click();
 
     await panel.focus();
     await page.keyboard.press("Meta+Shift+BracketLeft");
