@@ -44,7 +44,9 @@ async function main() {
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
 
-  let spawnPayload = null;
+  const spawnPayloads = [];
+  const archivePayloads = [];
+  const provisionPayloads = [];
   let messagePayload = null;
   let gatePayload = null;
   let messageCalls = 0;
@@ -79,8 +81,21 @@ async function main() {
       });
     });
 
+    await page.route("**/api/composer/provision-worktree", async (route) => {
+      const body = route.request().postDataJSON();
+      provisionPayloads.push(body);
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          workdir: `/fake/repo/.claude/worktrees/${body.ticket.toLowerCase()}`,
+          provisioned: false,
+        }),
+      });
+    });
+
     await page.route("**/api/agents/spawn", async (route) => {
-      spawnPayload = route.request().postDataJSON();
+      spawnPayloads.push(route.request().postDataJSON());
       await route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -100,6 +115,22 @@ async function main() {
         status: 200,
         contentType: "application/json",
         body: JSON.stringify({ status: "sent", messages: [] }),
+      });
+    });
+
+    await page.route("**/api/agents/WIKI-149/archive", async (route) => {
+      archivePayloads.push({
+        method: route.request().method(),
+        body: route.request().postData(),
+      });
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          run_id: "mock",
+          agent_id: "WIKI-149",
+          state: "archived",
+        }),
       });
     });
 
@@ -146,9 +177,28 @@ async function main() {
     if (await items.count() !== 5) {
       throw new Error(`expected 5 commands, got ${await items.count()}`);
     }
+    // combobox ARIA — expanded, controls, activedescendant
+    const ariaExpanded = await composer.getAttribute("aria-expanded");
+    if (ariaExpanded !== "true") {
+      throw new Error(`aria-expanded should be "true" when menu open, got ${ariaExpanded}`);
+    }
+    const ariaControls = await composer.getAttribute("aria-controls");
+    if (ariaControls !== "composer-slash-menu") {
+      throw new Error(`aria-controls wrong: ${ariaControls}`);
+    }
+    const activeInitial = await composer.getAttribute("aria-activedescendant");
+    if (activeInitial !== "composer-slash-menu-option-0") {
+      throw new Error(`aria-activedescendant initial wrong: ${activeInitial}`);
+    }
+    await composer.press("ArrowDown");
+    const activeAfter = await composer.getAttribute("aria-activedescendant");
+    if (activeAfter !== "composer-slash-menu-option-1") {
+      throw new Error(`aria-activedescendant after arrow wrong: ${activeAfter}`);
+    }
+    await composer.press("ArrowUp");
     await page.screenshot({ path: SCREENSHOTS.menu, fullPage: false });
 
-    // filter narrows: /spa → spawn is first
+    // fuzzy filter narrows: /spa → spawn is first
     await composer.pressSequentially("spa", { delay: 15 });
     const spawnItem = menu.locator(".composer-slash-item").first();
     const firstName = await spawnItem.locator(".composer-slash-name").textContent();
@@ -156,7 +206,7 @@ async function main() {
       throw new Error(`filter failed — first item is "${firstName}" (expected "/spawn")`);
     }
 
-    // Enter inserts chip / opens command form
+    // Enter opens command form
     await composer.press("Enter");
     const form = page.locator(".composer-command-form");
     await form.waitFor();
@@ -165,32 +215,58 @@ async function main() {
     }
     await page.screenshot({ path: SCREENSHOTS.form, fullPage: false });
 
-    // submit disabled until required args filled
     const submit = form.locator(".composer-command-submit");
     if (!(await submit.isDisabled())) {
       throw new Error("submit should be disabled with empty required args");
     }
 
-    // fill args
+    // First spawn: cdx worker — assert effort default high
     await form.getByLabel("ticket").fill("WIKI-149");
-    // kind + role already default to cc / implement
-    await form.getByLabel("model").fill("claude-opus-4-7");
-    await form.getByLabel("goal").fill("Verify slash menu wiring works end-to-end.");
+    await form.getByLabel("kind").selectOption("cdx");
+    await form.getByLabel("model").fill("gpt-5.6-luna");
+    await form.getByLabel("goal").fill("Verify cdx worker payload carries effort.");
+    // leave effort blank — should default to high
 
     if (await submit.isDisabled()) {
       throw new Error("submit should be enabled once required args are filled");
     }
     await submit.click();
     await page.waitForFunction(() => document.querySelector(".composer-command-form") === null);
-    if (!spawnPayload) throw new Error("spawn call did not fire");
-    if (spawnPayload.ticket !== "WIKI-149" || spawnPayload.kind !== "cc" || spawnPayload.role !== "implement") {
-      throw new Error(`spawn payload wrong: ${JSON.stringify(spawnPayload)}`);
+    if (provisionPayloads.length !== 1 || provisionPayloads[0].ticket !== "WIKI-149") {
+      throw new Error(`provision not called: ${JSON.stringify(provisionPayloads)}`);
     }
-    if (spawnPayload.orch !== TICKET) {
-      throw new Error(`orch not threaded: ${JSON.stringify(spawnPayload)}`);
+    if (spawnPayloads.length !== 1) {
+      throw new Error(`spawn should fire once, got ${spawnPayloads.length}`);
     }
-    if (!spawnPayload.prompt?.includes("Verify slash menu")) {
-      throw new Error(`prompt not sent: ${JSON.stringify(spawnPayload)}`);
+    const cdxPayload = spawnPayloads[0];
+    if (cdxPayload.kind !== "cdx" || cdxPayload.effort !== "high") {
+      throw new Error(`cdx effort default missing: ${JSON.stringify(cdxPayload)}`);
+    }
+    if (cdxPayload.workdir !== "/fake/repo/.claude/worktrees/wiki-149") {
+      throw new Error(`workdir not from provision: ${JSON.stringify(cdxPayload)}`);
+    }
+    if (cdxPayload.orch !== TICKET) {
+      throw new Error(`orch not threaded: ${JSON.stringify(cdxPayload)}`);
+    }
+
+    // Second spawn: cc worker — effort must be null
+    await composer.focus();
+    await composer.press("/");
+    await composer.pressSequentially("spawn", { delay: 10 });
+    await composer.press("Enter");
+    const form2 = page.locator(".composer-command-form");
+    await form2.waitFor();
+    await form2.getByLabel("ticket").fill("WIKI-149");
+    await form2.getByLabel("model").fill("claude-opus-4-7");
+    await form2.getByLabel("goal").fill("cc worker.");
+    await form2.locator(".composer-command-submit").click();
+    await page.waitForFunction(() => document.querySelector(".composer-command-form") === null);
+    if (spawnPayloads.length !== 2) {
+      throw new Error(`expected second spawn, got ${spawnPayloads.length}`);
+    }
+    const ccPayload = spawnPayloads[1];
+    if (ccPayload.kind !== "cc" || ccPayload.effort !== null) {
+      throw new Error(`cc payload wrong: ${JSON.stringify(ccPayload)}`);
     }
 
     // steer command dispatches sendAgentMessage
@@ -225,21 +301,69 @@ async function main() {
       throw new Error(`gate payload wrong: ${JSON.stringify(gatePayload)}`);
     }
 
-    // escape cancels form and preserves \/name for raw send
+    // archive — outcome flows through to backend
     await composer.focus();
     await composer.press("/");
     await composer.pressSequentially("archive", { delay: 10 });
     await composer.press("Enter");
-    await page.locator(".composer-command-form").waitFor();
+    const archiveForm = page.locator(".composer-command-form");
+    await archiveForm.waitFor();
+    await archiveForm.getByLabel("agent-id").fill("WIKI-149");
+    await archiveForm.getByLabel("outcome").selectOption("closed");
+    await archiveForm.locator(".composer-command-submit").click();
+    await page.waitForFunction(() => document.querySelector(".composer-command-form") === null);
+    if (archivePayloads.length !== 1) {
+      throw new Error(`expected 1 archive call, got ${archivePayloads.length}`);
+    }
+    let parsedArchive = null;
+    try {
+      parsedArchive = archivePayloads[0].body ? JSON.parse(archivePayloads[0].body) : null;
+    } catch {
+      parsedArchive = null;
+    }
+    if (!parsedArchive || parsedArchive.outcome !== "closed") {
+      throw new Error(`archive payload missing outcome: ${JSON.stringify(archivePayloads[0])}`);
+    }
+
+    // cancel preserves populated args in the raw fallback
+    await composer.focus();
+    await composer.press("/");
+    await composer.pressSequentially("archive", { delay: 10 });
+    await composer.press("Enter");
+    const cancelForm = page.locator(".composer-command-form");
+    await cancelForm.waitFor();
+    await cancelForm.getByLabel("agent-id").fill("WIKI-149");
+    await cancelForm.getByLabel("outcome").selectOption("merged");
     await page.locator(".composer-command-cancel").click();
     await page.waitForFunction(() => document.querySelector(".composer-command-form") === null);
     const restored = await composer.inputValue();
     if (!restored.startsWith("\\/archive")) {
-      throw new Error(`esc cancel should preserve \\/archive prefix, got "${restored}"`);
+      throw new Error(`cancel should preserve \\/archive prefix, got "${restored}"`);
     }
-    // menu should NOT appear again for \/archive
+    if (!restored.includes("WIKI-149") || !restored.includes("merged")) {
+      throw new Error(`cancel should preserve populated args, got "${restored}"`);
+    }
     if (await page.locator(".composer-slash-menu").count()) {
       throw new Error("backslash escape should suppress slash menu");
+    }
+
+    // outside-click dismisses menu without discarding raw text
+    await composer.focus();
+    // clear whatever is in the composer, type fresh /steer prefix
+    await composer.press("Meta+A");
+    await composer.press("Backspace");
+    await composer.press("/");
+    await composer.pressSequentially("ste", { delay: 15 });
+    await page.locator(".composer-slash-menu").waitFor();
+    const rawBefore = await composer.inputValue();
+    await page.locator(".session-scroll").click({ position: { x: 5, y: 5 } });
+    await delay(200);
+    if (await page.locator(".composer-slash-menu").count()) {
+      throw new Error("outside pointer-down should close menu");
+    }
+    const rawAfter = await composer.inputValue();
+    if (rawAfter !== rawBefore) {
+      throw new Error(`outside click must preserve raw text, got "${rawAfter}" (was "${rawBefore}")`);
     }
   } finally {
     await page.close();

@@ -6,6 +6,10 @@ import {
   type ComposerCommand,
 } from "./composer-commands";
 
+export const SLASH_MENU_ID = "composer-slash-menu";
+export const slashMenuOptionId = (index: number) =>
+  `${SLASH_MENU_ID}-option-${index}`;
+
 export type SlashMenuProps = {
   commands: readonly ComposerCommand[];
   activeIndex: number;
@@ -16,11 +20,17 @@ export type SlashMenuProps = {
 export function SlashMenu({ commands, activeIndex, onSelect, onHover }: SlashMenuProps) {
   if (commands.length === 0) return null;
   return (
-    <div className="composer-slash-menu" role="listbox" aria-label="Slash commands">
+    <div
+      className="composer-slash-menu"
+      id={SLASH_MENU_ID}
+      role="listbox"
+      aria-label="Slash commands"
+    >
       {commands.map((command, index) => (
         <button
           className={`composer-slash-item${index === activeIndex ? " is-active" : ""}`}
           key={command.name}
+          id={slashMenuOptionId(index)}
           role="option"
           aria-selected={index === activeIndex}
           type="button"

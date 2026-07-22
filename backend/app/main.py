@@ -3680,6 +3680,72 @@ class ComposerGateIn(BaseModel):
     expect_sha: str | None = Field(default=None, max_length=64)
 
 
+class ComposerProvisionIn(BaseModel):
+    ticket: str = Field(..., min_length=1, max_length=80)
+
+
+@app.post("/api/composer/provision-worktree")
+def composer_provision_worktree(body: ComposerProvisionIn) -> dict[str, object]:
+    """Ensure `.claude/worktrees/<ticket-lower>` exists as a git worktree off origin/main.
+
+    Backs the composer `/spawn` slash command. Idempotent: existing worktrees
+    are returned as-is; missing paths get `git worktree add -B <branch> <path>
+    origin/main`. Fetches origin/main first so the worktree tracks fresh trunk.
+    """
+
+    ticket = body.ticket.strip()
+    if not ticket or not SPAWN_TICKET_PATTERN.fullmatch(ticket):
+        raise HTTPException(
+            status_code=400,
+            detail="Ticket must be uppercase letters, numbers, or dashes",
+        )
+    branch = ticket.lower()
+    workdir = (ROOT_DIR / ".claude" / "worktrees" / branch).resolve()
+    if workdir.exists():
+        if not workdir.is_dir():
+            raise HTTPException(
+                status_code=409,
+                detail=f"{workdir} exists but is not a directory",
+            )
+        return {"workdir": str(workdir), "provisioned": False}
+    workdir.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.run(
+            ["git", "-C", str(ROOT_DIR), "fetch", "origin", "main"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(ROOT_DIR),
+                "worktree",
+                "add",
+                "-B",
+                branch,
+                str(workdir),
+                "origin/main",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"git worktree add failed: {exc}",
+        ) from exc
+    if result.returncode != 0:
+        raise HTTPException(
+            status_code=502,
+            detail=(result.stderr or result.stdout or "git worktree add failed").strip()[:400],
+        )
+    return {"workdir": str(workdir), "provisioned": True}
+
+
 @app.post("/api/composer/gate")
 def composer_gate(body: ComposerGateIn) -> dict[str, object]:
     """Run `wiki gate <pr> --json` and normalise the verdict.

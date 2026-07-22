@@ -3,6 +3,8 @@ import {
   replaceAgent,
   sendAgentMessage,
   spawnAgentWorker,
+  type ArchiveOutcome,
+  type SpawnWorkerEffort,
   type SpawnWorkerKind,
   type SpawnWorkerRole,
 } from "./api";
@@ -39,6 +41,22 @@ export type CommandResult = {
 const KINDS = ["cc", "cdx"] as const;
 const ROLES = ["plan", "implement", "review"] as const;
 const OUTCOMES = ["merged", "closed", "abandoned"] as const;
+const EFFORTS = ["low", "medium", "high"] as const;
+
+async function provisionWorktree(ticket: string): Promise<string> {
+  const response = await fetch("/api/composer/provision-worktree", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ticket }),
+  });
+  const body = (await response.json().catch(() => null)) as
+    | { workdir?: string; detail?: string }
+    | null;
+  if (!response.ok || !body?.workdir) {
+    throw new Error(body?.detail ?? `Provision failed (${response.status})`);
+  }
+  return body.workdir;
+}
 
 export const COMMANDS: readonly ComposerCommand[] = [
   {
@@ -106,6 +124,13 @@ export const COMMANDS: readonly ComposerCommand[] = [
         placeholder: "claude-opus-4-7",
       },
       {
+        name: "effort",
+        type: "enum",
+        required: false,
+        hint: "cdx reasoning effort (defaults to high) — ignored for cc",
+        options: EFFORTS,
+      },
+      {
         name: "goal",
         type: "long-text",
         required: true,
@@ -119,13 +144,16 @@ export const COMMANDS: readonly ComposerCommand[] = [
       const role = values["role"].trim() as SpawnWorkerRole;
       const model = values["model"].trim();
       const prompt = values["goal"].trim();
-      const workdir = `.claude/worktrees/${ticket.toLowerCase()}`;
+      const effortRaw = (values["effort"]?.trim() || "") as SpawnWorkerEffort | "";
+      const effort: SpawnWorkerEffort | null =
+        kind === "cdx" ? (effortRaw || "high") : null;
+      const workdir = await provisionWorktree(ticket);
       const result = await spawnAgentWorker({
         ticket,
         kind,
         role,
         model,
-        effort: null,
+        effort,
         workdir,
         orch: context.ticket,
         prompt,
@@ -203,8 +231,8 @@ export const COMMANDS: readonly ComposerCommand[] = [
     ],
     async dispatch(values) {
       const target = values["agent-id"].trim();
-      const outcome = values["outcome"]?.trim() || null;
-      const result = await archiveAgent(target);
+      const outcome = (values["outcome"]?.trim() || null) as ArchiveOutcome | null;
+      const result = await archiveAgent(target, { outcome });
       return {
         ok: true,
         summary: outcome ? `archived ${target} (${outcome})` : `archived ${target}`,
@@ -262,9 +290,33 @@ export function commandByName(name: string): ComposerCommand | undefined {
 export function filterCommands(partial: string): ComposerCommand[] {
   const query = partial.toLowerCase();
   if (!query) return [...COMMANDS];
-  const starts = COMMANDS.filter((command) => command.name.startsWith(query));
-  if (starts.length > 0) return starts;
-  return COMMANDS.filter((command) => command.name.includes(query));
+  const scored: Array<{ command: ComposerCommand; score: number }> = [];
+  for (const command of COMMANDS) {
+    const score = fuzzyScore(command.name, query);
+    if (score !== null) scored.push({ command, score });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return scored.map((entry) => entry.command);
+}
+
+function fuzzyScore(name: string, query: string): number | null {
+  if (query.length === 0) return 0;
+  let score = 0;
+  let cursor = 0;
+  let lastMatch = -1;
+  for (const ch of query) {
+    const idx = name.indexOf(ch, cursor);
+    if (idx === -1) return null;
+    if (idx === 0) score += 20;
+    if (idx === lastMatch + 1) score += 5;
+    if (idx === cursor) score += 3;
+    score += 1;
+    lastMatch = idx;
+    cursor = idx + 1;
+  }
+  if (name.startsWith(query)) score += 100;
+  score -= (name.length - query.length) * 0.1;
+  return score;
 }
 
 export function initialValues(command: ComposerCommand): Record<string, string> {
@@ -278,4 +330,21 @@ export function missingRequired(
   values: Record<string, string>,
 ): CommandArg[] {
   return command.args.filter((arg) => arg.required && !(values[arg.name] ?? "").trim());
+}
+
+export function serializeCommand(
+  command: ComposerCommand,
+  values: Record<string, string>,
+): string {
+  const parts = [`\\/${command.name}`];
+  for (const arg of command.args) {
+    const raw = (values[arg.name] ?? "").trim();
+    if (!raw) continue;
+    parts.push(needsQuoting(raw) ? JSON.stringify(raw) : raw);
+  }
+  return parts.join(" ") + " ";
+}
+
+function needsQuoting(raw: string): boolean {
+  return /[\s"\\]/.test(raw);
 }

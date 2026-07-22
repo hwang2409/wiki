@@ -371,9 +371,14 @@ export function controlAgent(id: string, action: AgentControlAction) {
   );
 }
 
-export function archiveAgent(id: string) {
+export type ArchiveOutcome = "merged" | "closed" | "abandoned";
+
+export function archiveAgent(id: string, options: { outcome?: ArchiveOutcome | null } = {}) {
+  const body =
+    options.outcome != null ? JSON.stringify({ outcome: options.outcome }) : undefined;
   return request<AgentControlResult>(`/api/agents/${encodeURIComponent(id)}/archive`, {
     method: "POST",
+    body,
   });
 }
 

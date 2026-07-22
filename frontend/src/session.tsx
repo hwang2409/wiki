@@ -71,9 +71,15 @@ import {
   filterCommands,
   initialValues,
   missingRequired,
+  serializeCommand,
   type ComposerCommand,
 } from "./composer-commands";
-import { CommandForm, SlashMenu } from "./composer-slash-menu";
+import {
+  CommandForm,
+  SLASH_MENU_ID,
+  SlashMenu,
+  slashMenuOptionId,
+} from "./composer-slash-menu";
 import { externalLinkProps } from "./external-links";
 import {
   GhPreviewCard,
@@ -2664,6 +2670,23 @@ function MessageComposer({
       ? skills.filter((s) => s.name.startsWith(trigger.partial)).slice(0, 8)
       : [];
 
+  const menuOpen = commandMatches.length > 0 || menuItems.length > 0;
+  useEffect(() => {
+    if (!menuOpen) return;
+    function onPointerDown(event: PointerEvent) {
+      const target = event.target as Node | null;
+      if (!target) return;
+      if (inputRef.current && inputRef.current.contains(target)) return;
+      const menuEl = document.getElementById(SLASH_MENU_ID);
+      if (menuEl && menuEl.contains(target)) return;
+      const skillMenu = document.querySelector(".session-skill-menu");
+      if (skillMenu && skillMenu.contains(target)) return;
+      setMenuDismissed(true);
+    }
+    window.addEventListener("pointerdown", onPointerDown);
+    return () => window.removeEventListener("pointerdown", onPointerDown);
+  }, [menuOpen]);
+
   function rememberSelection(start: number, end = start, caret = start) {
     selectionRef.current = { start, end };
     setCaretPos(caret);
@@ -2713,12 +2736,13 @@ function MessageComposer({
 
   function cancelCommand({ restoreText = true }: { restoreText?: boolean } = {}) {
     const command = activeCommand;
+    const values = commandValues;
     setActiveCommand(null);
     setCommandValues({});
     setCommandBusy(false);
     setCommandError(null);
     if (restoreText && command) {
-      const fallback = `\\/${command.name} `;
+      const fallback = serializeCommand(command, values);
       setText(fallback);
       requestAnimationFrame(() => {
         const pos = fallback.length;
@@ -3326,6 +3350,15 @@ function MessageComposer({
           ref={inputRef}
           rows={2}
           value={text}
+          role="combobox"
+          aria-expanded={commandMatches.length > 0}
+          aria-controls={commandMatches.length > 0 ? SLASH_MENU_ID : undefined}
+          aria-activedescendant={
+            commandMatches.length > 0
+              ? slashMenuOptionId(Math.min(menuIndex, commandMatches.length - 1))
+              : undefined
+          }
+          aria-autocomplete="list"
           onFocus={(event) => {
             if (vimMode !== "insert") enterInsert(event.currentTarget.selectionEnd ?? text.length);
             else captureSelection(event.currentTarget);
