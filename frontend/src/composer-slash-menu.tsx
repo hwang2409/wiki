@@ -86,21 +86,27 @@ export function CommandForm({
       : undefined;
 
   function handleKeyDown(event: React.KeyboardEvent) {
+    // Escape only fires cancel when nothing is in-flight; while busy the
+    // form stays open so the user isn't tricked into thinking cancel
+    // aborted an already-dispatched destructive `/spawn` / `/archive`.
+    // Round-7 REVIEW finding [MEDIUM] (composer-slash-menu.tsx:88).
     if (event.key === "Escape") {
+      if (busy) return;
       event.preventDefault();
       onCancel();
       return;
     }
-    if (event.key === "Enter" && !event.shiftKey && !disabled) {
-      const target = event.target as HTMLElement;
-      if (target.tagName === "TEXTAREA" && !(event.metaKey || event.ctrlKey)) return;
-      event.preventDefault();
-      onSubmit();
-    }
-    if (event.key === "Enter" && (event.metaKey || event.ctrlKey) && !disabled) {
-      event.preventDefault();
-      onSubmit();
-    }
+    if (event.key !== "Enter" || event.shiftKey || disabled) return;
+    // Textareas swallow plain Enter for newlines; only submit when the
+    // user adds Meta / Ctrl.
+    const isTextarea = (event.target as HTMLElement).tagName === "TEXTAREA";
+    const hasModifier = event.metaKey || event.ctrlKey;
+    if (isTextarea && !hasModifier) return;
+    // Round-7 REVIEW [HIGH]: submit exactly once. The prior code had two
+    // sequential `if` branches so Meta+Enter on a non-textarea input hit
+    // both and dispatched twice before React re-rendered with `busy`.
+    event.preventDefault();
+    onSubmit();
   }
 
   return (
@@ -119,7 +125,8 @@ export function CommandForm({
           className="composer-command-cancel"
           type="button"
           onClick={onCancel}
-          title="Cancel (Esc)"
+          disabled={busy}
+          title={busy ? "cannot cancel while sending" : "Cancel (Esc)"}
         >
           esc
         </button>

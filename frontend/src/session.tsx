@@ -2580,6 +2580,24 @@ function MessageComposer({
   const [commandValues, setCommandValues] = useState<Record<string, string>>({});
   const [commandBusy, setCommandBusy] = useState(false);
   const [commandError, setCommandError] = useState<string | null>(null);
+  // Round-7 REVIEW [MEDIUM]: multi-line composer drafts must survive
+  // opening a structured command. We capture the composer slices around
+  // the `/foo` sigil at open time and stitch them back on cancel or
+  // successful run so `existing draft\n/sp` no longer discards
+  // `existing draft`.
+  const [commandDraftContext, setCommandDraftContext] = useState<
+    { before: string; after: string } | null
+  >(null);
+  // Round-7 REVIEW [MEDIUM]: a passing `/gate` or `/archive` used to
+  // clear the form silently, contradicting the success-summary
+  // contract. Persist a short-lived notice so the result is visible.
+  const [commandNotice, setCommandNotice] = useState<
+    { summary: string; detail?: string } | null
+  >(null);
+  // Round-7 REVIEW [HIGH]: synchronous guard for double-submit. React
+  // schedules `commandBusy = true`, but two synchronous submit events in
+  // the same tick see the old value; this ref flips immediately.
+  const commandInFlightRef = useRef(false);
   const visualAnchorRef = useRef(0);
   const visualHeadRef = useRef(0);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -2724,10 +2742,20 @@ function MessageComposer({
   }
 
   function acceptCommand(command: ComposerCommand) {
+    // Snapshot the composer text around the `/foo` sigil so cancel /
+    // success can restore any surrounding multi-line draft. Round-7
+    // REVIEW [MEDIUM] (session.tsx:2645).
+    const before = trigger ? text.slice(0, trigger.start) : "";
+    const after = trigger
+      ? text.slice(trigger.start + 1 + trigger.partial.length)
+      : "";
+    setCommandDraftContext({ before, after });
     setActiveCommand(command);
     setCommandValues(initialValues(command));
     setCommandBusy(false);
     setCommandError(null);
+    setCommandNotice(null);
+    commandInFlightRef.current = false;
     setMenuIndex(0);
     setMenuDismissed(false);
     setText("");
@@ -2735,17 +2763,28 @@ function MessageComposer({
   }
 
   function cancelCommand({ restoreText = true }: { restoreText?: boolean } = {}) {
+    // Belt-and-braces: `<CommandForm>` blocks cancel while busy, but the
+    // programmatic path (e.g. keyboard shortcuts wired elsewhere) is
+    // guarded here too so an in-flight destructive command can't be
+    // pulled out from under the user. Round-7 REVIEW [MEDIUM].
+    if (commandBusy) return;
     const command = activeCommand;
     const values = commandValues;
+    const draft = commandDraftContext;
     setActiveCommand(null);
     setCommandValues({});
     setCommandBusy(false);
     setCommandError(null);
+    setCommandDraftContext(null);
+    commandInFlightRef.current = false;
     if (restoreText && command) {
       const fallback = serializeCommand(command, values);
-      setText(fallback);
+      const before = draft?.before ?? "";
+      const after = draft?.after ?? "";
+      const restored = `${before}${fallback}${after}`;
+      setText(restored);
       requestAnimationFrame(() => {
-        const pos = fallback.length;
+        const pos = before.length + fallback.length;
         inputRef.current?.setSelectionRange(pos, pos);
         inputRef.current?.focus();
         rememberSelection(pos);
@@ -2757,25 +2796,52 @@ function MessageComposer({
 
   async function runCommand() {
     if (!activeCommand || commandBusy) return;
+    // Round-7 REVIEW [HIGH]: block double-fire *within the same tick*.
+    // Two synchronous submit events (e.g. Meta+Enter routing through
+    // both a form-level and keydown-level handler) would otherwise both
+    // pass the React-state check and dispatch.
+    if (commandInFlightRef.current) return;
     const missing = missingRequired(activeCommand, commandValues);
     if (missing.length > 0) {
       setCommandError(`Fill required arg: ${missing.map((arg) => arg.name).join(", ")}`);
       return;
     }
+    commandInFlightRef.current = true;
     setCommandBusy(true);
     setCommandError(null);
+    const command = activeCommand;
+    const draft = commandDraftContext;
     try {
-      const result = await activeCommand.dispatch(commandValues, { ticket });
+      const result = await command.dispatch(commandValues, { ticket });
       if (!result.ok) {
         setCommandError(result.detail ? `${result.summary} · ${result.detail}` : result.summary);
         return;
       }
+      const notice: { summary: string; detail?: string } = { summary: result.summary };
+      if (result.detail) notice.detail = result.detail;
+      setCommandNotice(notice);
       setActiveCommand(null);
       setCommandValues({});
+      setCommandDraftContext(null);
+      // Restore surrounding draft (the parts of the composer that
+      // weren't part of the `/foo` invocation). Round-7 REVIEW [MEDIUM].
+      const before = draft?.before ?? "";
+      const after = draft?.after ?? "";
+      const restored = `${before}${after}`;
+      setText(restored);
+      if (restored.length > 0) {
+        requestAnimationFrame(() => {
+          const pos = before.length;
+          inputRef.current?.setSelectionRange(pos, pos);
+          inputRef.current?.focus();
+          rememberSelection(pos);
+        });
+      }
     } catch (err) {
       setCommandError(err instanceof Error ? err.message : "Command failed");
     } finally {
       setCommandBusy(false);
+      commandInFlightRef.current = false;
     }
   }
 
@@ -3318,6 +3384,30 @@ function MessageComposer({
               </button>
             </div>
           ))}
+        </div>
+      ) : null}
+      {commandNotice ? (
+        <div
+          className="composer-command-notice"
+          role="status"
+          aria-live="polite"
+        >
+          <span className="composer-command-notice-summary">
+            {commandNotice.summary}
+          </span>
+          {commandNotice.detail ? (
+            <span className="composer-command-notice-detail">
+              {commandNotice.detail}
+            </span>
+          ) : null}
+          <button
+            className="composer-command-notice-dismiss"
+            type="button"
+            aria-label="Dismiss command result"
+            onClick={() => setCommandNotice(null)}
+          >
+            ×
+          </button>
         </div>
       ) : null}
       {activeCommand ? (

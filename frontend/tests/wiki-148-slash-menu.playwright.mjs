@@ -337,7 +337,12 @@ async function main() {
       throw new Error(`cc payload wrong: ${JSON.stringify(ccPayload)}`);
     }
 
-    // steer command dispatches sendAgentMessage
+    // steer command dispatches sendAgentMessage — Meta+Enter from the
+    // textarea must dispatch EXACTLY ONCE. Round-7 REVIEW [HIGH]
+    // (composer-slash-menu.tsx:94): the prior handler had two
+    // sequential `if` branches, so Meta+Enter fired both onSubmits
+    // before React re-rendered with `commandBusy=true` and the second
+    // call sneaked through. This assertion is the review's own repro.
     await composer.focus();
     await composer.press("/");
     await composer.pressSequentially("steer", { delay: 10 });
@@ -346,15 +351,20 @@ async function main() {
     const steerForm = page.locator(".composer-command-form");
     await steerForm.waitFor();
     await steerForm.getByLabel("agent-id").fill("WIKI-149");
-    await steerForm.getByLabel("message").fill("hurry up");
-    await steerForm.locator(".composer-command-submit").click();
+    const messageBox = steerForm.getByLabel("message");
+    await messageBox.fill("hurry up");
+    await messageBox.focus();
+    await messageBox.press("Meta+Enter");
     await page.waitForFunction(() => document.querySelector(".composer-command-form") === null);
     if (messageCalls !== 1) throw new Error(`expected 1 steer send, got ${messageCalls}`);
     if (messagePayload?.text !== "hurry up" || messagePayload?.mode !== "now") {
       throw new Error(`steer payload wrong: ${JSON.stringify(messagePayload)}`);
     }
 
-    // gate command dispatches gate endpoint
+    // gate command dispatches gate endpoint; success summary must be
+    // visible after the form clears. Round-7 REVIEW [MEDIUM]
+    // (session.tsx:2768): silent clears violate the success-summary
+    // contract.
     await composer.focus();
     await composer.press("/");
     await composer.pressSequentially("gate", { delay: 10 });
@@ -367,6 +377,20 @@ async function main() {
     await page.waitForFunction(() => document.querySelector(".composer-command-form") === null);
     if (!gatePayload || gatePayload.pr !== "https://github.com/hwang2409/wiki/pull/999") {
       throw new Error(`gate payload wrong: ${JSON.stringify(gatePayload)}`);
+    }
+    const gateNotice = page.locator(".composer-command-notice");
+    await gateNotice.waitFor({ state: "visible", timeout: 2000 });
+    const gateSummary = await gateNotice
+      .locator(".composer-command-notice-summary")
+      .textContent();
+    if (!gateSummary || !gateSummary.toLowerCase().includes("gate")) {
+      throw new Error(`gate success notice missing/wrong: "${gateSummary}"`);
+    }
+    // Notice should be dismissable so it doesn't linger before the next
+    // command opens.
+    await gateNotice.locator(".composer-command-notice-dismiss").click();
+    if (await page.locator(".composer-command-notice").count()) {
+      throw new Error("dismiss button should hide notice");
     }
 
     // archive — outcome flows through to backend
@@ -432,6 +456,119 @@ async function main() {
     const rawAfter = await composer.inputValue();
     if (rawAfter !== rawBefore) {
       throw new Error(`outside click must preserve raw text, got "${rawAfter}" (was "${rawBefore}")`);
+    }
+
+    // Multiline-draft preservation. Round-7 REVIEW [MEDIUM]
+    // (session.tsx:2645): opening `/spawn` from `existing draft\n/sp`
+    // used to clear the whole composer; the surrounding draft must
+    // survive both cancel and successful dispatch.
+    await composer.focus();
+    await composer.press("Meta+A");
+    await composer.press("Backspace");
+    // Prime the composer with a multi-line draft and place the caret
+    // immediately after `/sp` so the slash-menu trigger fires (plain
+    // Enter in the composer sends the message, so we can't type the
+    // newline with a key press).
+    await composer.fill("existing draft\n/sp");
+    // Nudge input events so the menu recomputes with an alive trigger.
+    await composer.press("End");
+    await page.locator(".composer-slash-menu").waitFor();
+    await composer.press("Enter");
+    const draftForm = page.locator(".composer-command-form");
+    await draftForm.waitFor();
+    // cancel should stitch surrounding draft back in with the serialized command
+    await page.locator(".composer-command-cancel").click();
+    await page.waitForFunction(() => document.querySelector(".composer-command-form") === null);
+    const restoredWithDraft = await composer.inputValue();
+    if (!restoredWithDraft.startsWith("existing draft\n")) {
+      throw new Error(
+        `cancel dropped surrounding draft, got "${restoredWithDraft}"`
+      );
+    }
+    if (!restoredWithDraft.includes("/spawn") && !restoredWithDraft.includes("\\/spawn")) {
+      throw new Error(
+        `cancel should restore command text after the draft, got "${restoredWithDraft}"`
+      );
+    }
+
+    // Successful dispatch must also preserve the surrounding draft
+    // (drop only the `/foo ...` command portion). Reset first.
+    await composer.focus();
+    await composer.press("Meta+A");
+    await composer.press("Backspace");
+    await composer.fill("keep me around\n");
+    await composer.press("/");
+    await composer.pressSequentially("gate", { delay: 15 });
+    await page.locator(".composer-slash-menu").waitFor();
+    await composer.press("Enter");
+    const gateAgain = page.locator(".composer-command-form");
+    await gateAgain.waitFor();
+    await gateAgain.getByLabel("pr").fill("https://github.com/hwang2409/wiki/pull/1000");
+    await gateAgain.locator(".composer-command-submit").click();
+    await page.waitForFunction(() => document.querySelector(".composer-command-form") === null);
+    const afterSuccess = await composer.inputValue();
+    if (!afterSuccess.startsWith("keep me around")) {
+      throw new Error(
+        `successful dispatch discarded surrounding draft, got "${afterSuccess}"`
+      );
+    }
+    // clean up notice for later assertions
+    const lingering = page.locator(".composer-command-notice-dismiss");
+    if (await lingering.count()) await lingering.click();
+
+    // Busy-cancel guard. Round-7 REVIEW [MEDIUM]
+    // (composer-slash-menu.tsx:88): cancel must NOT fire while a
+    // destructive command is in flight; the button is disabled and
+    // Escape becomes a no-op until the request resolves.
+    let releaseSteer = () => {};
+    const steerGate = new Promise((resolve) => {
+      releaseSteer = resolve;
+    });
+    let steerBusyCalls = 0;
+    await page.route("**/api/agents/WIKI-150/message", async (route) => {
+      steerBusyCalls += 1;
+      await steerGate;
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ status: "sent", messages: [] }),
+      });
+    });
+    await composer.focus();
+    await composer.press("Meta+A");
+    await composer.press("Backspace");
+    await composer.press("/");
+    await composer.pressSequentially("steer", { delay: 10 });
+    await page.locator(".composer-slash-menu").waitFor();
+    await composer.press("Enter");
+    const busyForm = page.locator(".composer-command-form");
+    await busyForm.waitFor();
+    await busyForm.getByLabel("agent-id").fill("WIKI-150");
+    await busyForm.getByLabel("message").fill("in flight");
+    await busyForm.locator(".composer-command-submit").click();
+    const cancelBtn = page.locator(".composer-command-cancel");
+    await cancelBtn.waitFor();
+    // busy → cancel button disabled
+    await page.waitForFunction(
+      () => {
+        const btn = document.querySelector(".composer-command-cancel");
+        return !!btn && btn.hasAttribute("disabled");
+      },
+      { timeout: 2000 }
+    );
+    // clicking a disabled button is a no-op
+    await cancelBtn.click({ force: true }).catch(() => {});
+    // Escape must ALSO be a no-op while busy
+    await page.locator(".composer-command-form").press("Escape");
+    await delay(100);
+    if (!(await page.locator(".composer-command-form").count())) {
+      throw new Error("Escape must not close the form while a command is in flight");
+    }
+    // resolve the request; form should close and exactly one dispatch happened
+    releaseSteer();
+    await page.waitForFunction(() => document.querySelector(".composer-command-form") === null);
+    if (steerBusyCalls !== 1) {
+      throw new Error(`busy-cancel: expected 1 message call, got ${steerBusyCalls}`);
     }
   } finally {
     await page.close();
