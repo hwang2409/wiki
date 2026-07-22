@@ -159,26 +159,13 @@ async function main() {
   /** @type {(() => void) | null} */
   let holdResolvedNotifier = null;
 
-  // Track the highest latest_event_seq the UI has *actually* fetched from
-  // /api/agents for our worker. R6: we must wait for this to reach 12 while
-  // the first POST is still held — that proves in-flight coalescing, not
-  // coalesce-after-fresh-cycle. Without this gate, releasing after ~360ms
-  // could let the old buggy code path pass by firing a fresh seq=12 POST
-  // once the first controller cleared.
-  let uiObservedSeq = 0;
-  page.on("response", async (response) => {
-    const url = response.url();
-    if (!url.endsWith("/api/agents")) return;
-    if (response.request().method() !== "GET") return;
-    try {
-      const body = await response.json();
-      const row = body?.workers?.find?.((worker) => worker.ticket === WORKER);
-      const seq = typeof row?.latest_event_seq === "number" ? row.latest_event_seq : 0;
-      if (seq > uiObservedSeq) uiObservedSeq = seq;
-    } catch {
-      /* body may still be streaming or non-json */
-    }
-  });
+  // R7: instead of listening for network responses + sleeping, we wait for
+  // the React component itself to publish a UI-owned signal that the
+  // coalesce-during-flight branch actually ran. `window.__wiki147CoalesceObserved`
+  // is set INSIDE the effect's `if (existing controller)` branch — so its
+  // presence + targetSeq >= 12 proves React committed the bumped target
+  // while the first POST was still in flight. The fresh-cycle-after-cleanup
+  // path never enters that branch and never sets this signal.
 
   await page.route(viewedRoute, async (route) => {
     attemptCount += 1;
@@ -243,26 +230,35 @@ async function main() {
       await new Promise((resolve) => setTimeout(resolve, 40));
     }
 
-    // R6 tightening: WAIT until the UI has actually consumed a /api/agents
-    // response containing latest_event_seq >= 12 for our worker WHILE the
-    // first POST is still held. Only then does the coalesce path in
-    // viewedInflight get to bump targetSeq to 12 in-flight. The prior
-    // ~360ms sleep let the buggy code pass by clearing the controller
-    // first and firing a fresh POST at seq=12 (coalesce-after-cycle, not
-    // coalesce-during-flight).
-    assert.ok(pendingHold, "first POST must still be held before UI observes seq=12");
+    // R7 tightening: wait for the React component to publish the coalesce
+    // signal with targetSeq >= 12 WHILE the first POST is still held. This
+    // is a UI-owned signal (set inside the effect's `if (existing controller)`
+    // branch, in the same synchronous tick that bumps existing.targetSeq).
+    // It fires only on the coalesce-during-flight path — the pre-R5 buggy
+    // path (fresh POST after controller cleanup) never enters that branch
+    // and never sets this signal.
+    assert.ok(pendingHold, "first POST must still be held before UI signals coalesce=12");
     const observeDeadline = Date.now() + 6_000;
-    while (uiObservedSeq < 12 && Date.now() < observeDeadline) {
+    let coalesceSignal = null;
+    while (Date.now() < observeDeadline) {
+      coalesceSignal = await page.evaluate(() => window.__wiki147CoalesceObserved ?? null);
+      if (coalesceSignal && coalesceSignal.targetSeq >= 12) break;
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
     assert.ok(
-      uiObservedSeq >= 12,
-      `UI must consume seq=12 while first POST held. observed=${uiObservedSeq}`,
+      coalesceSignal && coalesceSignal.targetSeq >= 12,
+      `React coalesce signal must reach targetSeq>=12 while first POST held. saw=${JSON.stringify(coalesceSignal)}`,
     );
-    assert.ok(pendingHold, "first POST must still be held while UI consumes seq=12");
-    // One more beat so the mark-viewed effect runs after the /api/agents
-    // response commits (React state batch + effect fire). Still holding.
-    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.equal(
+      coalesceSignal.runId,
+      RUN_ID,
+      `coalesce signal must be for our run. saw=${JSON.stringify(coalesceSignal)}`,
+    );
+    assert.ok(
+      coalesceSignal.count >= 1,
+      `coalesce branch must have run at least once. saw=${JSON.stringify(coalesceSignal)}`,
+    );
+    assert.ok(pendingHold, "first POST must still be held once coalesce signal fires");
     // Attempt count must still be 1 — during the held first POST the coalesce
     // path updates targetSeq inside the inflight controller, it must NOT fire
     // a new POST. If it did, that would be the pre-R5 double-POST bug.

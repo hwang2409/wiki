@@ -39,6 +39,16 @@ import type { SidebarTarget } from "./session";
 import { BranchPill } from "./branch-pill";
 import { StatusBadge } from "./status-badge";
 
+declare global {
+  interface Window {
+    __wiki147CoalesceObserved?: {
+      runId: string;
+      targetSeq: number;
+      count: number;
+    };
+  }
+}
+
 const STALE_SECONDS = 5 * 60;
 
 const SPAWN_TICKET_PATTERN = /^[A-Z0-9-]+$/;
@@ -1588,6 +1598,18 @@ export function AgentsSidebar({
       // request fires; the in-flight (or scheduled) attempt picks up the
       // highest seq at post-time. Attempt cap stays intact.
       if (observedSeq > existing.targetSeq) existing.targetSeq = observedSeq;
+      // WIKI-147 R7 H1: UI-owned signal that the coalesce-during-flight
+      // branch actually ran. Test observers wait on this to release the
+      // held first POST — proves React committed the bumped targetSeq
+      // while the initial controller was still alive, not after a fresh
+      // cycle. Behavioral no-op.
+      const prior = window.__wiki147CoalesceObserved;
+      const priorCount = prior && prior.runId === runId ? prior.count : 0;
+      window.__wiki147CoalesceObserved = {
+        runId,
+        targetSeq: existing.targetSeq,
+        count: priorCount + 1,
+      };
       return;
     }
 
