@@ -3675,6 +3675,58 @@ def spawn_orchestrator_route(
     )
 
 
+class ComposerGateIn(BaseModel):
+    pr: str = Field(..., min_length=1, max_length=512)
+    expect_sha: str | None = Field(default=None, max_length=64)
+
+
+@app.post("/api/composer/gate")
+def composer_gate(body: ComposerGateIn) -> dict[str, object]:
+    """Run `wiki gate <pr> --json` and normalise the verdict.
+
+    Backs the composer `/gate` slash command. Read-only relative to git — the
+    underlying CLI only shells out to `gh` for PR view + check status.
+    """
+
+    wiki_cli = ROOT_DIR / "wiki"
+    if not wiki_cli.exists():
+        raise HTTPException(status_code=500, detail=f"wiki CLI missing at {wiki_cli}")
+    cmd = [str(wiki_cli), "gate", body.pr, "--json"]
+    if body.expect_sha:
+        cmd += ["--expect-sha", body.expect_sha]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=str(ROOT_DIR),
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(status_code=504, detail="wiki gate timed out") from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"wiki gate exec failed: {exc}") from exc
+    parsed: dict[str, object] | None = None
+    if proc.stdout:
+        try:
+            parsed = json.loads(proc.stdout.strip().splitlines()[-1])
+        except json.JSONDecodeError:
+            parsed = None
+    if proc.returncode == 2 or parsed is None:
+        raise HTTPException(
+            status_code=502,
+            detail=(proc.stderr or proc.stdout or "wiki gate returned no verdict").strip(),
+        )
+    ready = bool(parsed.get("ready"))
+    reasons = parsed.get("reasons") or []
+    summary = "ready" if ready else ", ".join(str(reason) for reason in reasons) or "not ready"
+    return {
+        "verdict": "pass" if ready else "fail",
+        "summary": summary,
+        "raw": parsed,
+    }
+
+
 @app.post("/api/agents/{ticket}/message")
 def agent_message(ticket: str, body: MessageIn, background: BackgroundTasks) -> dict[str, object]:
     if not valid_agent_id(ticket):

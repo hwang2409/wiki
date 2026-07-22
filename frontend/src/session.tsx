@@ -67,6 +67,13 @@ import type {
 } from "./api";
 import { renderAnsi } from "./ansi";
 import { ArtifactBlock } from "./artifact-block";
+import {
+  filterCommands,
+  initialValues,
+  missingRequired,
+  type ComposerCommand,
+} from "./composer-commands";
+import { CommandForm, SlashMenu } from "./composer-slash-menu";
 import { externalLinkProps } from "./external-links";
 import {
   GhPreviewCard,
@@ -2563,6 +2570,10 @@ function MessageComposer({
   const skills = useSkills();
   const [menuIndex, setMenuIndex] = useState(0);
   const [menuDismissed, setMenuDismissed] = useState(false);
+  const [activeCommand, setActiveCommand] = useState<ComposerCommand | null>(null);
+  const [commandValues, setCommandValues] = useState<Record<string, string>>({});
+  const [commandBusy, setCommandBusy] = useState(false);
+  const [commandError, setCommandError] = useState<string | null>(null);
   const visualAnchorRef = useRef(0);
   const visualHeadRef = useRef(0);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -2628,11 +2639,28 @@ function MessageComposer({
   const trigger = (() => {
     const el = inputRef.current;
     const caretAt = el && document.activeElement === el ? el.selectionStart : text.length;
-    const match = SKILL_TRIGGER.exec(text.slice(0, caretAt ?? text.length));
-    return match ? { sigil: match[1], partial: match[2], start: (caretAt ?? 0) - match[2].length - 1 } : null;
+    const slice = text.slice(0, caretAt ?? text.length);
+    const match = SKILL_TRIGGER.exec(slice);
+    if (!match) return null;
+    const start = (caretAt ?? 0) - match[2].length - 1;
+    // \/foo escape — backslash immediately before sigil suppresses trigger
+    if (start > 0 && text[start - 1] === "\\") return null;
+    // command menu only fires on `/` (not `$`) at start-of-line — first char or preceded by newline
+    const atLineStart =
+      match[1] === "/" && (start === 0 || text[start - 1] === "\n");
+    return {
+      sigil: match[1],
+      partial: match[2],
+      start,
+      atLineStart,
+    };
   })();
+  const commandMatches =
+    trigger?.atLineStart && vimMode === "insert" && !menuDismissed
+      ? filterCommands(trigger.partial).slice(0, 8)
+      : [];
   const menuItems =
-    trigger && vimMode === "insert" && !menuDismissed
+    trigger && commandMatches.length === 0 && vimMode === "insert" && !menuDismissed
       ? skills.filter((s) => s.name.startsWith(trigger.partial)).slice(0, 8)
       : [];
 
@@ -2670,6 +2698,61 @@ function MessageComposer({
       inputRef.current?.setSelectionRange(pos, pos);
       rememberSelection(pos);
     });
+  }
+
+  function acceptCommand(command: ComposerCommand) {
+    setActiveCommand(command);
+    setCommandValues(initialValues(command));
+    setCommandBusy(false);
+    setCommandError(null);
+    setMenuIndex(0);
+    setMenuDismissed(false);
+    setText("");
+    rememberSelection(0);
+  }
+
+  function cancelCommand({ restoreText = true }: { restoreText?: boolean } = {}) {
+    const command = activeCommand;
+    setActiveCommand(null);
+    setCommandValues({});
+    setCommandBusy(false);
+    setCommandError(null);
+    if (restoreText && command) {
+      const fallback = `\\/${command.name} `;
+      setText(fallback);
+      requestAnimationFrame(() => {
+        const pos = fallback.length;
+        inputRef.current?.setSelectionRange(pos, pos);
+        inputRef.current?.focus();
+        rememberSelection(pos);
+      });
+    } else {
+      requestAnimationFrame(() => inputRef.current?.focus());
+    }
+  }
+
+  async function runCommand() {
+    if (!activeCommand || commandBusy) return;
+    const missing = missingRequired(activeCommand, commandValues);
+    if (missing.length > 0) {
+      setCommandError(`Fill required arg: ${missing.map((arg) => arg.name).join(", ")}`);
+      return;
+    }
+    setCommandBusy(true);
+    setCommandError(null);
+    try {
+      const result = await activeCommand.dispatch(commandValues, { ticket });
+      if (!result.ok) {
+        setCommandError(result.detail ? `${result.summary} · ${result.detail}` : result.summary);
+        return;
+      }
+      setActiveCommand(null);
+      setCommandValues({});
+    } catch (err) {
+      setCommandError(err instanceof Error ? err.message : "Command failed");
+    } finally {
+      setCommandBusy(false);
+    }
   }
 
   async function attachFiles(files: FileList | File[]) {
@@ -3066,8 +3149,10 @@ function MessageComposer({
   }
 
   async function send(mode: "now" | "on-idle") {
-    const value = text.trim();
-    if (!value || busy) return;
+    const raw = text.trim();
+    if (!raw || busy) return;
+    // \/foo escape — user typed \/steer to send literal /steer
+    const value = raw.startsWith("\\/") ? raw.slice(1) : raw;
     setBusy(true);
     setError(null);
     setText("");
@@ -3158,6 +3243,14 @@ function MessageComposer({
           </span>
         </div>
       ))}
+      {commandMatches.length > 0 ? (
+        <SlashMenu
+          commands={commandMatches}
+          activeIndex={Math.min(menuIndex, commandMatches.length - 1)}
+          onSelect={acceptCommand}
+          onHover={setMenuIndex}
+        />
+      ) : null}
       {menuItems.length > 0 ? (
         <div className="session-skill-menu">
           {menuItems.map((skill, i) => (
@@ -3203,6 +3296,19 @@ function MessageComposer({
           ))}
         </div>
       ) : null}
+      {activeCommand ? (
+        <CommandForm
+          command={activeCommand}
+          values={commandValues}
+          onChange={(name, value) =>
+            setCommandValues((current) => ({ ...current, [name]: value }))
+          }
+          onSubmit={() => void runCommand()}
+          onCancel={() => cancelCommand()}
+          busy={commandBusy}
+          error={commandError}
+        />
+      ) : (
       <div className="session-composer-row">
         <div className="session-input-wrap">
         {overlayPos ? (
@@ -3258,6 +3364,33 @@ function MessageComposer({
             if (vimMode === "visual") {
               handleVisualKey(event);
               return;
+            }
+            if (commandMatches.length > 0) {
+              if (event.key === "ArrowDown" || (event.ctrlKey && event.key === "j")) {
+                event.preventDefault();
+                setMenuIndex((i) => (i + 1) % commandMatches.length);
+                return;
+              }
+              if (
+                event.key === "ArrowUp" ||
+                (event.ctrlKey && event.key === "k") ||
+                (event.key === "Tab" && event.shiftKey)
+              ) {
+                event.preventDefault();
+                setMenuIndex((i) => (i - 1 + commandMatches.length) % commandMatches.length);
+                return;
+              }
+              if (event.key === "Enter" || (event.key === "Tab" && !event.shiftKey)) {
+                event.preventDefault();
+                const chosen = commandMatches[Math.min(menuIndex, commandMatches.length - 1)];
+                acceptCommand(chosen);
+                return;
+              }
+              if (event.key === "Escape") {
+                event.preventDefault();
+                setMenuDismissed(true);
+                return;
+              }
             }
             if (menuItems.length > 0) {
               if (event.key === "ArrowDown" || (event.ctrlKey && event.key === "j")) {
@@ -3318,6 +3451,7 @@ function MessageComposer({
           <SendHorizontal size={14} />
         </button>
       </div>
+      )}
       <div className="session-composer-status">
         {thinking ? <span className="session-thinking-indicator">thinking</span> : null}
         <div className="session-subagents">
