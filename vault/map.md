@@ -38,6 +38,7 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[harness-opencode]] — OpenCode harness breakdown: open-source stack, plugin model
 - [[harness-pi-coding-agent]] — Pi coding agent harness breakdown: runtime, tool surface
 - [[llm-rigorous-proving]] — LLMs on rigorous mathematical proving: current SOTA, failure modes, benchmarks
+- [[graph-engineering]] — graph engineering as next layer after loop engineering; org-graph + work-graph, nodes/edges/shared-state, maps onto orchestrator/worker stack
 
 ## Design
 
@@ -83,6 +84,10 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 ## Phoebe/features
 
 - [[meeting-booking-onboarding]] — Phoebe meeting booking: customer onboarding and Core/admin-agent seams
+
+## Wiki
+
+- [[polish-census]] — WIKI-150 systematic polish audit of Wiki.app surfaces (rubric + tags + census tables); fans out into 8-12 small polish tickets
 
 ## Mitm-inspector
 
