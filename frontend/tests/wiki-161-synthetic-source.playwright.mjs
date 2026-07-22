@@ -56,6 +56,20 @@ const COLLISION_TEXT = "please check queue";
 const STALE_FLEET_TEXT = "[fleet] stale-window ping";
 const ARCHIVED_STEER_TEXT = "[archived] historical supervisor steer";
 
+// R3 review R2: real archived-session case. A ticket with no registry
+// current row, only an archive directory containing `events.jsonl` with a
+// normalized user event whose payload carries `source`. Backend must route
+// through main._archived_events_payload() and transcripts.read_session_delta
+// on the `codex-normalized` format; the source-stamping in transcripts.py
+// then flows the marker through to the frontend renderer.
+const ARCHIVED_TICKET = "WIKI-161ARC";
+const ARCHIVED_RUN_ID = "00000000-0000-4000-8000-000000000162";
+const ARCHIVED_SESSION_DIR_NAME = "20260722-170000";
+const ARCHIVED_NORMALIZED_TS = "2026-07-22T17:00:00Z";
+const ARCHIVED_ROW_HENRY_TEXT = "archived henry bubble";
+const ARCHIVED_ROW_STEER_TEXT = "[archived-steer] historical supervisor push";
+const ARCHIVED_ROW_ASSISTANT_TEXT = "archived worker acknowledgement";
+
 // Native transcript is the authoritative event stream in this fixture; the
 // events/read RPC only needs to expose `composer_messages` to the frontend.
 const NORMALIZED_EVENTS = [];
@@ -273,6 +287,105 @@ async function main() {
   await fs.writeFile(fixtures.registryPath, JSON.stringify(registry, null, 2));
   await fs.writeFile(fixtures.queuePath, "{}\n");
 
+  // R3 review R2: real archived-session fixture. No registry entry for
+  // ARCHIVED_TICKET — the backend must fall through to
+  // main._archive_hint()/_archived_events_payload() and read the
+  // normalized events.jsonl below. Every row is what a codex-normalized
+  // events.jsonl looks like after WIKI-161 source stamping (payload.source
+  // preserved on the sourced user turn, absent on the unsourced ones).
+  const archiveTicketDir = path.join(
+    fixtures.root,
+    "archive",
+    ARCHIVED_TICKET,
+    ARCHIVED_SESSION_DIR_NAME,
+  );
+  await fs.mkdir(archiveTicketDir, { recursive: true });
+  await fs.writeFile(
+    path.join(archiveTicketDir, "run.json"),
+    JSON.stringify({
+      run_id: ARCHIVED_RUN_ID,
+      provider: "codex",
+      kind: "cdx",
+      model: "gpt-5.4",
+      role: "orchestrator",
+      state: "completed",
+      spawned_at: ARCHIVED_NORMALIZED_TS,
+    }),
+  );
+  await fs.writeFile(
+    path.join(archiveTicketDir, "meta.json"),
+    JSON.stringify({
+      worker: {
+        kind: "cdx",
+        model: "gpt-5.4",
+        role: "orchestrator",
+      },
+    }),
+  );
+  // Marker file the archive-hint uses to classify kind=cdx.
+  await fs.writeFile(path.join(archiveTicketDir, "cdx-session.log"), "");
+  const archivedEvents = [
+    {
+      seq: 1,
+      raw_seq: 1,
+      normalized_at: ARCHIVED_NORMALIZED_TS,
+      disposition: "rendered",
+      kind: "item_completed",
+      payload: {
+        method: "item/completed",
+        params: {
+          item: {
+            type: "userMessage",
+            content: [{ type: "text", text: ARCHIVED_ROW_HENRY_TEXT }],
+          },
+        },
+      },
+      lifecycle_state: null,
+    },
+    {
+      seq: 2,
+      raw_seq: 2,
+      normalized_at: "2026-07-22T17:00:05Z",
+      disposition: "rendered",
+      kind: "item_completed",
+      payload: {
+        method: "item/completed",
+        params: {
+          item: {
+            type: "userMessage",
+            content: [{ type: "text", text: ARCHIVED_ROW_STEER_TEXT }],
+          },
+        },
+        // The critical piece: source flows through the codex-normalized
+        // parser onto the emitted SessionEvent, and the renderer branches
+        // it into the SyntheticSourceRow.
+        source: "supervisor-steer",
+      },
+      lifecycle_state: null,
+    },
+    {
+      seq: 3,
+      raw_seq: 3,
+      normalized_at: "2026-07-22T17:00:10Z",
+      disposition: "rendered",
+      kind: "item_completed",
+      payload: {
+        method: "item/completed",
+        params: {
+          item: {
+            type: "agentMessage",
+            text: ARCHIVED_ROW_ASSISTANT_TEXT,
+          },
+        },
+      },
+      lifecycle_state: null,
+    },
+  ];
+  await fs.writeFile(
+    path.join(archiveTicketDir, "events.jsonl"),
+    archivedEvents.map((row) => JSON.stringify(row)).join("\n") + "\n",
+  );
+
   logStep("starting fake supervisor + backend");
   const supervisor = await startFakeSupervisor(fixtures, current);
   const backend = await startBackend(fixtures);
@@ -472,6 +585,88 @@ async function main() {
 
     await page.screenshot({
       path: path.join(OUT_DIR, "wiki-161-synthetic-source.png"),
+      fullPage: true,
+    });
+
+    // R3 review R2: real archived-session case. Navigate to the ticket with
+    // NO registry current row — the backend must route through
+    // main._archived_events_payload() → transcripts.read_session_delta(
+    // "codex-normalized", ...) → the WIKI-161 source-stamping in
+    // transcripts._stamp_last_user_event_source(). The archived sourced
+    // user event must render as a marker, the unsourced ones as bubbles,
+    // and the assistant message as normal assistant content.
+    logStep("navigating to archived session");
+    await page.goto(`${backend.baseUrl}/#/agent/${ARCHIVED_TICKET}`, {
+      waitUntil: "domcontentloaded",
+    });
+    await page.locator(".session-scroll").waitFor();
+    await page.waitForFunction(
+      ({ henry, steer, assistant }) => {
+        const bodies = Array.from(document.querySelectorAll(".session-scroll *"))
+          .map((el) => el.textContent || "")
+          .join(" ");
+        return (
+          bodies.includes(henry) &&
+          bodies.includes(steer) &&
+          bodies.includes(assistant)
+        );
+      },
+      {
+        henry: ARCHIVED_ROW_HENRY_TEXT,
+        steer: ARCHIVED_ROW_STEER_TEXT,
+        assistant: ARCHIVED_ROW_ASSISTANT_TEXT,
+      },
+    );
+
+    const archivedHenryBubble = await page
+      .locator(".session-user", { hasText: ARCHIVED_ROW_HENRY_TEXT })
+      .count();
+    assert(
+      archivedHenryBubble === 1,
+      `archived unsourced user event must render as a bubble; saw ${archivedHenryBubble}`,
+    );
+    const archivedSteerBubble = await page
+      .locator(".session-user", { hasText: ARCHIVED_ROW_STEER_TEXT })
+      .count();
+    assert(
+      archivedSteerBubble === 0,
+      `archived sourced user event must NOT render as a bubble; saw ${archivedSteerBubble}`,
+    );
+    const archivedSteerMarker = page.locator(
+      "[data-testid='session-synthetic-source'][data-source='supervisor-steer']",
+      { hasText: ARCHIVED_ROW_STEER_TEXT },
+    );
+    await archivedSteerMarker.waitFor({ state: "attached" });
+    assert(
+      (await archivedSteerMarker.count()) === 1,
+      "archived sourced user event must render as a synthetic marker row",
+    );
+
+    // Confirm the backend actually served this via the archive path — the
+    // format string identifies which branch produced the payload, so a
+    // regression that stopped routing archived requests would surface
+    // here even before the DOM check.
+    const archivedSessionPayload = await page.evaluate(
+      async (ticket) => (await fetch(`/api/agents/${ticket}/session`)).json(),
+      ARCHIVED_TICKET,
+    );
+    assert(
+      archivedSessionPayload.format === "provider-events",
+      `archived route must return format=provider-events; saw ${archivedSessionPayload.format}`,
+    );
+    const archivedUserEvents = (archivedSessionPayload.events || []).filter(
+      (event) => event.kind === "user",
+    );
+    const sourceTaggedArchivedEvents = archivedUserEvents.filter(
+      (event) => event.source === "supervisor-steer",
+    );
+    assert(
+      sourceTaggedArchivedEvents.length === 1,
+      `archived events.jsonl source must land on exactly one SessionEvent; saw ${sourceTaggedArchivedEvents.length}`,
+    );
+
+    await page.screenshot({
+      path: path.join(OUT_DIR, "wiki-161-archived-session.png"),
       fullPage: true,
     });
 

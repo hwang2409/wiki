@@ -310,6 +310,177 @@ class SendNowSourceTests(unittest.IsolatedAsyncioTestCase):
         # message is the first genuinely unread-worthy event we appended.
         self.assertGreater(after_worker.unread_event_seq, baseline_unread)
 
+    async def test_unread_event_seq_codex_turn_sequence_stays_flat_until_output(
+        self,
+    ) -> None:
+        """WIKI-161 review R3.1: the captured Codex adapter sequence around a
+        source-tagged send previously advanced unread from 30->33 before any
+        assistant output. Every Codex protocol row emitted between the
+        outbound send and the eventual agent response — token metrics,
+        thread bookkeeping, turn boundary, user echo (which normalizes as
+        ``item_completed`` with ``item.type == "userMessage"``, NOT the
+        unreachable ``codex_user`` allowlist entry) — must leave
+        ``unread_event_seq`` untouched. Only the real ``item_completed``
+        agentMessage advances it."""
+
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-161-K",
+            provider=ProviderKind.CODEX,
+            role="orchestrator",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="Work on ticket WIKI-161-K",
+        )
+        run_id = record.run_id
+        await _wait_for_events(self.store, run_id, 1)
+        baseline_unread = self.store.get(run_id).unread_event_seq
+
+        # Real Codex protocol sequence: outbound client_message → token
+        # usage → RPC ack → thread bookkeeping → turn started → sourced
+        # user echo (item_completed / userMessage with source).
+        codex_pre_output_rows: list[tuple[EventDisposition, str, dict[str, Any]]] = [
+            (
+                EventDisposition.IGNORED,
+                "codex_client_message",
+                {"id": 1, "method": "sendUserMessage", "params": {"text": "wake"}},
+            ),
+            (
+                EventDisposition.SUMMARIZED,
+                "thread_tokenUsage_updated",
+                {
+                    "method": "thread/tokenUsage/updated",
+                    "params": {"tokenUsage": {"total": {"total_tokens": 100}}},
+                },
+            ),
+            (
+                EventDisposition.IGNORED,
+                "rpc_response",
+                {"id": 1, "result": {}},
+            ),
+            (
+                EventDisposition.IGNORED,
+                "thread_goal_cleared",
+                {"method": "thread/goal/cleared", "params": {}},
+            ),
+            (
+                EventDisposition.IGNORED,
+                "thread_settings_updated",
+                {"method": "thread/settings/updated", "params": {}},
+            ),
+            (
+                EventDisposition.SUMMARIZED,
+                "thread_status_changed",
+                {"method": "thread/status/changed", "params": {"status": {}}},
+            ),
+            (
+                EventDisposition.RENDERED,
+                "turn_started",
+                {"method": "turn/started", "params": {"turn": {"id": "t1"}}},
+            ),
+            (
+                EventDisposition.RENDERED,
+                "item_completed",
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "item": {
+                            "type": "userMessage",
+                            "content": [
+                                {"type": "text", "text": "[fleet] wake up"}
+                            ],
+                        }
+                    },
+                    "source": "fleet-monitor",
+                },
+            ),
+        ]
+        for disposition, kind, payload in codex_pre_output_rows:
+            pre = self.store.get(run_id)
+            self.store.append_normalized(
+                run_id,
+                raw_seq=pre.raw_event_count,
+                disposition=disposition,
+                kind=kind,
+                payload=payload,
+            )
+            after = self.store.get(run_id)
+            self.assertEqual(
+                after.unread_event_seq,
+                baseline_unread,
+                f"unread_event_seq must not advance on {kind}; "
+                f"jumped {baseline_unread} -> {after.unread_event_seq}",
+            )
+
+        # An UNSOURCED Codex user turn (Henry typing directly into the
+        # native CLI, echoed by the provider) also normalizes as
+        # item_completed / userMessage. Henry just sent it, so it must
+        # not light his own unread dot either.
+        pre_henry = self.store.get(run_id)
+        self.store.append_normalized(
+            run_id,
+            raw_seq=pre_henry.raw_event_count,
+            disposition=EventDisposition.RENDERED,
+            kind="item_completed",
+            payload={
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "type": "userMessage",
+                        "content": [{"type": "text", "text": "hi henry"}],
+                    }
+                },
+            },
+        )
+        after_henry = self.store.get(run_id)
+        self.assertEqual(after_henry.unread_event_seq, baseline_unread)
+
+        # An ``item_started`` boundary (streaming assistant start) must not
+        # double-count — the paired ``item_completed`` finalizes the row.
+        pre_start = self.store.get(run_id)
+        self.store.append_normalized(
+            run_id,
+            raw_seq=pre_start.raw_event_count,
+            disposition=EventDisposition.RENDERED,
+            kind="item_started",
+            payload={
+                "method": "item/started",
+                "params": {
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "a1",
+                    }
+                },
+            },
+        )
+        after_start = self.store.get(run_id)
+        self.assertEqual(after_start.unread_event_seq, baseline_unread)
+
+        # Finally: the real agent response. This one MUST advance.
+        pre_output = self.store.get(run_id)
+        self.store.append_normalized(
+            run_id,
+            raw_seq=pre_output.raw_event_count,
+            disposition=EventDisposition.RENDERED,
+            kind="item_completed",
+            payload={
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "a1",
+                        "text": "worker reply",
+                    }
+                },
+            },
+        )
+        after_output = self.store.get(run_id)
+        self.assertEqual(
+            after_output.unread_event_seq,
+            pre_output.normalized_event_count + 1,
+        )
+        self.assertGreater(after_output.unread_event_seq, baseline_unread)
+
     async def test_unread_event_seq_rebuilt_from_normalized_jsonl(self) -> None:
         """WIKI-161 R2 R3: a crash between normalized JSONL fsync and run.json
         replace currently repairs ``normalized_event_count`` but must also

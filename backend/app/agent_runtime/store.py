@@ -126,26 +126,45 @@ def _apply_pending_request_event(
 
 
 _UNREAD_SKIP_KIND_SUFFIXES = ("_client_message", "_stderr")
-_UNREAD_SKIP_KINDS = frozenset(
+
+# Codex protocol rows that fire around a turn (before/after any actual worker
+# output) but do not represent a new view for Henry. Names match the
+# ``method.replace("/", "_")`` conversion used by _normalize_codex.
+_CODEX_UNREAD_SKIP_KINDS = frozenset(
     {
-        # Inbound provider "user turn" echoes are not worker output — Henry
-        # typing and fleet/steer synthetic wakes both come through these.
+        "thread_started",
+        "thread_archived",
+        "thread_closed",
+        "thread_status_changed",
+        "thread_tokenUsage_updated",
+        "thread_settings_updated",
+        "thread_goal_cleared",
+        "turn_started",
+        "turn_completed",
+        "turn_aborted",
+        "context_compacted",
+        "serverRequest_resolved",
+        "account_rateLimits_updated",
+        "account_chatgptAuthTokens_refresh",
+    }
+)
+
+_UNREAD_SKIP_KINDS = frozenset(
+    _CODEX_UNREAD_SKIP_KINDS
+    | {
+        # Inbound Claude user echo — same rule as Codex user items below.
         "claude_user",
+        # (``codex_user`` is unreachable in practice — Codex user turns are
+        #  ``item_started`` / ``item_completed`` with ``item.type ==
+        #  "userMessage"``; those are filtered by payload inspection below.)
         "codex_user",
-        # Approval-side and provider-lifecycle rows are surface noise: they
-        # advance the counter but never reflect a new worker-authored view.
+        # Approval-side and provider-lifecycle rows.
         "approval",
         "approval_response",
         "approval_cancelled",
         "approval_resolved",
         "provider_process_exit",
         "provider_protocol_error",
-        # Turn boundaries are lifecycle only.
-        "turn_started",
-        "turn_completed",
-        "turn_aborted",
-        "thread_status_changed",
-        "context_compacted",
         "rpc_response",
         "unknown",
         "normalization_error",
@@ -153,13 +172,31 @@ _UNREAD_SKIP_KINDS = frozenset(
 )
 
 
+def _codex_item_type(payload: dict[str, Any]) -> str | None:
+    params = payload.get("params")
+    if not isinstance(params, dict):
+        return None
+    item = params.get("item")
+    if not isinstance(item, dict):
+        return None
+    item_type = item.get("type")
+    return item_type if isinstance(item_type, str) else None
+
+
+def _claude_payload_type(payload: dict[str, Any]) -> str | None:
+    value = payload.get("type")
+    return value if isinstance(value, str) else None
+
+
 def _is_unread_worthy(kind: str, payload: dict[str, Any] | None, disposition: str) -> bool:
     """Whether a normalized event should advance ``unread_event_seq``.
 
-    Unread is a "new worker output for Henry" signal. Client-authored, user-
-    inbound, approval, lifecycle, and synthetic supervisor turns must all
-    leave the counter alone so an orchestrator wake doesn't light the
-    worker's dot before the worker has produced any response.
+    Unread is "new worker-authored output Henry has not seen yet". Anything
+    else — outbound client_message rows, provider-lifecycle boundaries,
+    approval/response bookkeeping, both directions of user echoes (Henry
+    typed and synthetic supervisor wakes), token metrics, and any payload
+    carrying an explicit ``source`` tag — must leave the counter alone so a
+    fleet-monitor turn cannot light the dot before the worker responds.
     """
 
     if disposition == EventDisposition.IGNORED.value:
@@ -168,10 +205,31 @@ def _is_unread_worthy(kind: str, payload: dict[str, Any] | None, disposition: st
         return False
     if any(kind.endswith(suffix) for suffix in _UNREAD_SKIP_KIND_SUFFIXES):
         return False
-    if isinstance(payload, dict):
-        source = payload.get("source")
-        if isinstance(source, str) and source:
+    if not isinstance(payload, dict):
+        # Kind alone survived every skip above; still not a rendered surface.
+        return False
+    source = payload.get("source")
+    if isinstance(source, str) and source:
+        return False
+    # Codex normalizes real user turns as ``item_started`` / ``item_completed``
+    # envelopes whose inner ``item.type == "userMessage"``. Those look agent-
+    # originated from the kind alone and would otherwise sneak past the
+    # (deliberately unreachable) ``codex_user`` allowlist entry above.
+    if kind in {"item_started", "item_completed"}:
+        item_type = _codex_item_type(payload)
+        if item_type == "userMessage":
             return False
+        # Only ``item_completed`` finalizes a visible surface. The paired
+        # ``item_started`` is a lifecycle boundary — dropping it prevents
+        # each streamed assistant turn from double-counting.
+        if kind == "item_started":
+            return False
+    # Claude payloads with ``type == "user"`` are user inbound echoes even
+    # when the outer normalized ``kind`` failed to be ``claude_user`` (e.g.
+    # source-tagged wakes surface here with the fleet ``source`` filter
+    # above, but defence-in-depth catches any missed labelling).
+    if _claude_payload_type(payload) == "user":
+        return False
     return True
 
 
