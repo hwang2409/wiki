@@ -1,5 +1,5 @@
 import type { ArtifactViewState } from "../transcript-store";
-import { SvgRenderer } from "../artifact-block";
+import { SvgRenderer } from "../artifact-renderers";
 import { PanZoomCanvas } from "./shared";
 
 export function SvgArtifactDetail({

@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
-import type { ReactNode } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
+import type { CSSProperties, ReactNode } from "react";
 import { ChevronDown, Copy, FileJson } from "lucide-react";
 import type {
   ArtifactColumn,
@@ -8,21 +8,27 @@ import type {
   SessionEvent,
 } from "./api";
 import { classifyArtifact } from "./artifact-kind";
-import {
-  ImageRenderer,
-  MermaidRenderer,
-  PlotRenderer,
-  SvgRenderer,
-  artifactUrl,
-  type ArtifactRenderFailure,
-} from "./artifact-block";
+import { ArtifactError, ArtifactPlaceholder } from "./artifact-state";
 import { DiffPatchView } from "./diff-view";
-import { ShikiCode } from "./shiki";
+import { ShikiCode, useCurrentTheme } from "./shiki";
 import { StatusBadge, statusToTone } from "./status-badge";
 
 const TABLE_ROW_HEIGHT = 32;
 const TABLE_VIEWPORT_HEIGHT = 320;
 const TABLE_OVERSCAN = 8;
+
+const SVG_TAGS = [
+  "svg", "g", "path", "rect", "circle", "ellipse", "line", "polyline",
+  "polygon", "text", "tspan", "defs", "use", "symbol", "title", "desc",
+  "style", "lineargradient", "radialgradient", "stop", "pattern",
+  "clippath", "mask", "image", "marker",
+];
+
+export type ArtifactRenderFailure = {
+  failureClass: "mermaid-render" | "svg-render";
+  errorCode: string;
+  position?: string;
+};
 
 export type ArtifactRendererProps = {
   artifact: SessionArtifact;
@@ -33,6 +39,329 @@ export type ArtifactRendererProps = {
   onRenderError?: (failure: ArtifactRenderFailure) => void;
   ticket: string;
 };
+
+export function artifactUrl(ticket: string, event: SessionEvent): string {
+  return `/api/agents/${encodeURIComponent(ticket)}/artifact/${encodeURIComponent(event.artifact_id ?? "")}`;
+}
+
+function normalizeRenderFailure(
+  failureClass: ArtifactRenderFailure["failureClass"],
+  reason: unknown,
+): ArtifactRenderFailure {
+  const message = reason instanceof Error ? reason.message : "";
+  const errorCode = failureClass === "mermaid-render"
+    ? /lexical error/i.test(message)
+      ? "LEXICAL_ERROR"
+      : /parse error/i.test(message)
+        ? "PARSE_ERROR"
+        : "MERMAID_RENDER_ERROR"
+    : "SVG_RENDER_ERROR";
+  const line = message.match(/\bline\s+(\d{1,5})\b/i)?.[1];
+  const column = message.match(/\bcolumn\s+(\d{1,5})\b/i)?.[1];
+  const position = line ? `line ${line}${column ? `, column ${column}` : ""}` : undefined;
+  return { failureClass, errorCode, ...(position ? { position } : {}) };
+}
+
+function viewBoxBounds(source: string): { width: number; height: number } | null {
+  const openTag = source.match(/<svg\b[^>]*>/i)?.[0] ?? "";
+  const viewBox = openTag.match(/(?:^|\s)viewBox\s*=\s*["']\s*[-0-9.]+\s+[-0-9.]+\s+([0-9.]+)\s+([0-9.]+)\s*["']/i);
+  if (!viewBox) return null;
+  const width = Number(viewBox[1]);
+  const height = Number(viewBox[2]);
+  return Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0 ? { width, height } : null;
+}
+
+function numericSvgAttribute(source: string, name: string): number | null {
+  const openTag = source.match(/<svg\b[^>]*>/i)?.[0] ?? "";
+  const match = openTag.match(new RegExp(`(?:^|\\s)${name}\\s*=\\s*["']([0-9.]+)(?:px)?["']`, "i"));
+  if (!match) return null;
+  const value = Number(match[1]);
+  return Number.isFinite(value) ? value : null;
+}
+
+export function svgBounds(source: string): { width: number; height: number } | null {
+  const width = numericSvgAttribute(source, "width");
+  const height = numericSvgAttribute(source, "height");
+  if (width !== null && height !== null) return { width, height };
+  return viewBoxBounds(source);
+}
+
+function withExplicitSvgDimensions(source: string): string {
+  const bounds = svgBounds(source);
+  const openTag = source.match(/<svg\b[^>]*>/i)?.[0];
+  if (!bounds || !openTag) return source;
+  const dimensions = `width: ${bounds.width}px !important; height: ${bounds.height}px !important; max-width: none !important; max-height: none !important;`;
+  const withoutDimensions = openTag.replace(/\s(?:width|height)\s*=\s*(?:"[^"]*"|'[^']*')/gi, "");
+  const withStyle = /\sstyle=(["'])(.*?)\1/i.test(withoutDimensions)
+    ? withoutDimensions.replace(/\sstyle=(["'])(.*?)\1/i, (_match, quote: string, style: string) => ` style=${quote}${style}; ${dimensions}${quote}`)
+    : `${withoutDimensions.slice(0, -1)} style="${dimensions}">`;
+  const sizedTag = withStyle.replace(/>$/, ` width="${bounds.width}" height="${bounds.height}">`);
+  return source.replace(openTag, sizedTag);
+}
+
+export function MermaidRenderer({
+  compact = false,
+  onRenderError,
+  source,
+}: {
+  compact?: boolean;
+  onRenderError?: (failure: ArtifactRenderFailure) => void;
+  source: string;
+}) {
+  const theme = useCurrentTheme();
+  const reactId = useId();
+  const [html, setHtml] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [nonce, setNonce] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    const id = `wiki-artifact-${reactId.replace(/[^a-zA-Z0-9_-]/g, "")}`;
+    const reportFailure = (reason: unknown) => {
+      if (cancelled) return;
+      setHtml("");
+      const message = reason instanceof Error ? reason.message : "Mermaid could not render this source.";
+      setError(message);
+      onRenderError?.(normalizeRenderFailure("mermaid-render", reason));
+    };
+    void import("mermaid").then(async ({ default: mermaid }) => {
+      try {
+        mermaid.initialize({
+          startOnLoad: false,
+          securityLevel: "strict",
+          theme: theme.includes("light") ? "default" : "dark",
+          fontFamily: getComputedStyle(document.documentElement).getPropertyValue("--font-monospace"),
+        });
+        const rendered = await mermaid.render(id, source);
+        if (!cancelled) {
+          setHtml(compact ? withExplicitSvgDimensions(rendered.svg) : rendered.svg);
+          setError(null);
+        }
+      } catch (reason) {
+        reportFailure(reason);
+      }
+    }).catch(reportFailure);
+    return () => {
+      cancelled = true;
+    };
+  }, [compact, nonce, onRenderError, reactId, source, theme]);
+
+  if (error) {
+    return (
+      <ArtifactError
+        detail={error}
+        onRetry={() => {
+          setError(null);
+          setNonce((value) => value + 1);
+        }}
+        title="Diagram couldn’t render."
+      />
+    );
+  }
+  if (!html) return <ArtifactPlaceholder label="Rendering diagram…" shape="diagram" />;
+  return <div className="artifact-mermaid" dangerouslySetInnerHTML={{ __html: html }} />;
+}
+
+export function SvgRenderer({
+  compact = false,
+  onRenderError,
+  source,
+}: {
+  compact?: boolean;
+  onRenderError?: (failure: ArtifactRenderFailure) => void;
+  source: string;
+}) {
+  const [html, setHtml] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [nonce, setNonce] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    const reportFailure = (reason: unknown) => {
+      if (cancelled) return;
+      setHtml("");
+      const message = reason instanceof Error ? reason.message : "SVG could not render this source.";
+      setError(message);
+      onRenderError?.(normalizeRenderFailure("svg-render", reason));
+    };
+    void import("dompurify").then(({ default: DOMPurify }) => {
+      try {
+        const sanitized = DOMPurify.sanitize(source, {
+          ALLOWED_TAGS: SVG_TAGS,
+          FORBID_TAGS: ["script", "foreignObject", "iframe"],
+        });
+        if (!/<svg(?:\s|>)/i.test(sanitized)) {
+          throw new Error("SVG sanitizer produced no <svg> output.");
+        }
+        if (!cancelled) {
+          setHtml(compact ? withExplicitSvgDimensions(sanitized) : sanitized);
+          setError(null);
+        }
+      } catch (reason) {
+        reportFailure(reason);
+      }
+    }).catch(reportFailure);
+    return () => {
+      cancelled = true;
+    };
+  }, [compact, nonce, onRenderError, source]);
+  if (error) {
+    return (
+      <ArtifactError
+        detail={error}
+        onRetry={() => {
+          setError(null);
+          setNonce((value) => value + 1);
+        }}
+        title="Image couldn’t render."
+      />
+    );
+  }
+  if (!html) return <ArtifactPlaceholder label="Preparing image…" shape="image" />;
+  return <div className="artifact-svg" dangerouslySetInnerHTML={{ __html: html }} />;
+}
+
+export function SharedImageRenderer({
+  alt,
+  imgClassName,
+  onImageLoad,
+  source,
+  style,
+  wrapClassName,
+}: {
+  alt: string;
+  imgClassName?: string;
+  onImageLoad?: (image: HTMLImageElement) => void;
+  source: string;
+  style?: CSSProperties;
+  wrapClassName?: string;
+}) {
+  const [state, setState] = useState<"loading" | "ready" | "error">("loading");
+  const [nonce, setNonce] = useState(0);
+  useEffect(() => setState("loading"), [source, nonce]);
+  if (state === "error") {
+    return (
+      <div className={`artifact-image-wrap${wrapClassName ? ` ${wrapClassName}` : ""}`}>
+        <ArtifactError
+          detail={`Failed to load ${source.startsWith("data:") ? "inline image data" : source}`}
+          onRetry={() => setNonce((value) => value + 1)}
+          title="Image couldn’t load."
+        />
+      </div>
+    );
+  }
+  return (
+    <div className={`artifact-image-wrap${wrapClassName ? ` ${wrapClassName}` : ""}`}>
+      {state === "loading" ? <ArtifactPlaceholder label="Loading image…" shape="image" /> : null}
+      <img
+        key={nonce}
+        alt={alt}
+        className={imgClassName}
+        loading="lazy"
+        src={source}
+        style={state === "loading" ? { visibility: "hidden", position: "absolute", inset: 0, ...style } : style}
+        onError={() => setState("error")}
+        onLoad={(loadEvent) => {
+          setState("ready");
+          onImageLoad?.(loadEvent.currentTarget);
+        }}
+      />
+    </div>
+  );
+}
+
+export function ImageRenderer({ artifact, event, onImageLoad, ticket }: ArtifactRendererProps) {
+  const source = artifact.data_base64
+    ? `data:${artifact.mime ?? "image/png"};base64,${artifact.data_base64}`
+    : artifactUrl(ticket, event);
+  return (
+    <SharedImageRenderer
+      alt={event.title || event.caption || "Agent artifact"}
+      imgClassName="artifact-image"
+      onImageLoad={onImageLoad}
+      source={source}
+    />
+  );
+}
+
+export function PlotRenderer({ actions = false, spec }: { actions?: boolean; spec: Record<string, unknown> }) {
+  const theme = useCurrentTheme();
+  const container = useRef<HTMLDivElement>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [ready, setReady] = useState(false);
+  const [nonce, setNonce] = useState(0);
+  useEffect(() => {
+    setReady(false);
+    const target = container.current;
+    if (!target) return;
+    let finalized = false;
+    let finalize: (() => void) | undefined;
+    const styles = getComputedStyle(document.documentElement);
+    const text = styles.getPropertyValue("--text-normal").trim();
+    const muted = styles.getPropertyValue("--text-muted").trim();
+    const border = styles.getPropertyValue("--background-modifier-border").trim();
+    const background = styles.getPropertyValue("--background-primary").trim();
+    const accent = styles.getPropertyValue("--accent-primary").trim();
+    const font = styles.getPropertyValue("--font-monospace").trim();
+    const sourceConfig: Record<string, unknown> =
+      typeof spec.config === "object" && spec.config ? spec.config as Record<string, unknown> : {};
+    const sourceAxis = typeof sourceConfig.axis === "object" && sourceConfig.axis ? sourceConfig.axis : {};
+    const sourceLegend = typeof sourceConfig.legend === "object" && sourceConfig.legend ? sourceConfig.legend : {};
+    const sourceTitle = typeof sourceConfig.title === "object" && sourceConfig.title ? sourceConfig.title : {};
+    const sourceRange = typeof sourceConfig.range === "object" && sourceConfig.range ? sourceConfig.range : {};
+    const themedSpec = {
+      ...spec,
+      background,
+      config: {
+        ...sourceConfig,
+        font,
+        background,
+        axis: { ...sourceAxis, domainColor: border, gridColor: border, labelColor: muted, titleColor: text },
+        legend: { ...sourceLegend, labelColor: muted, titleColor: text },
+        title: { ...sourceTitle, color: text, font },
+        range: { ...sourceRange, category: [accent, text, muted, border] },
+      },
+    };
+    const reportPlotFailure = (reason: unknown) => {
+      if (finalized) return;
+      setError(reason instanceof Error ? reason.message : "Plot could not render this spec.");
+    };
+    import("vega-embed").then(async ({ default: embed }) => {
+      try {
+        const result = await embed(target, themedSpec, { actions, renderer: "svg" });
+        finalize = result.finalize;
+        if (!finalized) {
+          setError(null);
+          setReady(true);
+        }
+      } catch (reason) {
+        reportPlotFailure(reason);
+      }
+    }).catch(reportPlotFailure);
+    return () => {
+      finalized = true;
+      finalize?.();
+      target.replaceChildren();
+    };
+  }, [actions, nonce, spec, theme]);
+  if (error) {
+    return (
+      <ArtifactError
+        detail={error}
+        onRetry={() => {
+          setError(null);
+          setNonce((value) => value + 1);
+        }}
+        title="Plot couldn’t render."
+      />
+    );
+  }
+  return (
+    <div className="artifact-plot-wrap">
+      {!ready ? <ArtifactPlaceholder label="Rendering plot…" shape="plot" /> : null}
+      <div className="artifact-plot" ref={container} style={ready ? undefined : { visibility: "hidden", position: "absolute" }} />
+    </div>
+  );
+}
 
 function csvCell(value: unknown): string {
   const text = value == null ? "" : String(value);
@@ -367,7 +696,14 @@ export function CompactPreview({ artifact, event, onRenderError, ticket }: Artif
     const source = artifact.data_base64
       ? `data:${artifact.mime ?? "image/png"};base64,${artifact.data_base64}`
       : artifactUrl(ticket, event);
-    return <img alt={event.title || event.caption || "Agent artifact"} className="artifact-image artifact-compact-image" loading="lazy" src={source} />;
+    return (
+      <SharedImageRenderer
+        alt={event.title || event.caption || "Agent artifact"}
+        imgClassName="artifact-image artifact-compact-image"
+        source={source}
+        wrapClassName="artifact-image-compact-wrap"
+      />
+    );
   }
   if (effectiveKind === "mermaid" || effectiveKind === "svg") {
     return (

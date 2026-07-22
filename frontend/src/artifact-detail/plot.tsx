@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { RotateCcw } from "lucide-react";
-import { PlotRenderer } from "../artifact-block";
+import { PlotRenderer } from "../artifact-renderers";
 
 export function PlotArtifactDetail({ spec }: { spec: Record<string, unknown> }) {
   const [renderKey, setRenderKey] = useState(0);

@@ -1,6 +1,6 @@
 import type { SessionArtifact, SessionEvent } from "../api";
 import type { ArtifactViewState } from "../transcript-store";
-import { artifactUrl } from "../artifact-block";
+import { SharedImageRenderer, artifactUrl } from "../artifact-renderers";
 import { PanZoomCanvas } from "./shared";
 
 export function ImageArtifactDetail({
@@ -21,7 +21,12 @@ export function ImageArtifactDetail({
     : artifactUrl(ticket, event);
   return (
     <PanZoomCanvas label="Image pan and zoom canvas" onChange={onChange} state={state}>
-      <img alt={event.title || event.caption || "Agent artifact"} className="artifact-detail-image" src={source} />
+      <SharedImageRenderer
+        alt={event.title || event.caption || "Agent artifact"}
+        imgClassName="artifact-detail-image"
+        source={source}
+        wrapClassName="artifact-image-detail-wrap"
+      />
     </PanZoomCanvas>
   );
 }

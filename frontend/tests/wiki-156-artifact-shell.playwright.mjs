@@ -60,6 +60,8 @@ function inputs() {
     { kind: "svg", title: "Titled svg", payload: { source: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 60"><rect width="120" height="60" fill="#123"/></svg>' } },
     { kind: "plot", title: "Trend plot", payload: { spec_vega_lite: largePlot() } },
     { kind: "code", payload: { language: "typescript", source: "export const answer = 42;\n" } },
+    // Invalid inline image — base64 payload is not decodable PNG data, so <img> fires onError.
+    { kind: "image", title: "Broken image", payload: { data_base64: "bm90LXJlYWwtcG5nLWJ5dGVz", mime: "image/png" } },
   ];
 }
 
@@ -84,14 +86,14 @@ function invokeArtifactTool(fixtures, entries) {
   });
 }
 
-async function writeTranscript(fixtures, entries, results) {
-  const rows = [{ type: "mode", mode: "normal", sessionId: "wiki-156-artifact-shell" }];
+async function writeTranscript(fixtures, entries, results, { filename = "wiki-156-artifact-shell.jsonl", sessionId = "wiki-156-artifact-shell" } = {}) {
+  const rows = [{ type: "mode", mode: "normal", sessionId }];
   entries.forEach((entry, index) => {
     const id = `toolu_wiki156_${index}`;
     rows.push({ type: "assistant", timestamp: `2026-07-22T15:00:${String(index * 2).padStart(2, "0")}Z`, message: { role: "assistant", content: [{ type: "tool_use", id, name: "mcp__wiki-artifacts__render_artifact", input: entry }] } });
     rows.push({ type: "user", timestamp: `2026-07-22T15:00:${String(index * 2 + 1).padStart(2, "0")}Z`, message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: results[index].sentinel }] } });
   });
-  const transcript = path.join(fixtures.root, "wiki-156-artifact-shell.jsonl");
+  const transcript = path.join(fixtures.root, filename);
   await fs.writeFile(transcript, rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
   return transcript;
 }
@@ -112,12 +114,20 @@ async function setPanelUrl(page, tabs, focus) {
   }, { ticket: TICKET, tabs, focus });
 }
 
+const SECOND_TICKET = "WIKI-156B";
+
 async function main() {
   const fixtures = makeFixtureRoot("wiki-156-artifact-shell-");
   const entries = inputs();
   const results = invokeArtifactTool(fixtures, entries);
   const transcript = await writeTranscript(fixtures, entries, results);
-  writeRegistry(fixtures.registryPath, [[TICKET, transcript]]);
+  // Second ticket references the SAME artifact ids via a distinct transcript path — proves
+  // the inline-expand store keys by (ticket, subagent, session.path), not artifactId alone.
+  const secondTranscript = await writeTranscript(fixtures, entries, results, {
+    filename: "wiki-156-artifact-shell-second.jsonl",
+    sessionId: "wiki-156-artifact-shell-second",
+  });
+  writeRegistry(fixtures.registryPath, [[TICKET, transcript], [SECOND_TICKET, secondTranscript]]);
   writeQueue(fixtures.queuePath, TICKET, []);
   const backend = await startBackend(fixtures);
   const browser = await chromium.launch({ headless: true });
@@ -128,7 +138,7 @@ async function main() {
     if (message.type() === "error") console.error(`[wiki-156-playwright] console: ${message.text()}`);
   });
 
-  const [smallMermaidId, largeMermaidAId, largeMermaidBId, svgId, plotId, codeId] = results.map((r) => r.id);
+  const [smallMermaidId, largeMermaidAId, largeMermaidBId, svgId, plotId, codeId, brokenImageId] = results.map((r) => r.id);
 
   try {
     await page.addInitScript(({ layout }) => {
@@ -175,14 +185,36 @@ async function main() {
     );
 
     // --- Actions hover-visible ---
+    // Wait for mermaid to finish rendering + layout to settle so hover target is stable.
+    await smallBlock.locator(".artifact-mermaid svg").waitFor({ state: "visible", timeout: 8000 });
+    await page.waitForFunction((id) => {
+      const el = document.querySelector(`[data-artifact-id="${id}"]`);
+      if (!el) return false;
+      const rect = el.getBoundingClientRect();
+      return rect.height > 60 && rect.width > 60;
+    }, smallMermaidId, { timeout: 4000 });
+    // Take a stable rect snapshot; re-hover after the async CSS transition kicks in.
     const actionsSelector = ".artifact-actions";
     const hiddenOpacity = await smallBlock.locator(actionsSelector).evaluate((node) => parseFloat(getComputedStyle(node).opacity));
     assert(hiddenOpacity < 0.5, `actions should be hidden by default, opacity=${hiddenOpacity}`);
+    // Move pointer off the block first so hover event is guaranteed to fire on the next move.
+    await page.mouse.move(0, 0);
+    await page.waitForTimeout(50);
     await smallBlock.hover();
+    // Retry hover if opacity hasn't advanced yet — reflow between the first hover and the CSS
+    // transition can move the target off the pointer.
     await page.waitForFunction(({ id }) => {
       const block = document.querySelector(`[data-artifact-id="${id}"] .artifact-actions`);
-      return block && parseFloat(getComputedStyle(block).opacity) > 0.9;
-    }, { id: smallMermaidId }, { timeout: 2000 });
+      if (!block) return false;
+      return parseFloat(getComputedStyle(block).opacity) > 0.9;
+    }, { id: smallMermaidId }, { timeout: 4000 }).catch(async () => {
+      await smallBlock.hover({ position: { x: 120, y: 12 } });
+      await page.waitForFunction(({ id }) => {
+        const block = document.querySelector(`[data-artifact-id="${id}"] .artifact-actions`);
+        if (!block) return false;
+        return parseFloat(getComputedStyle(block).opacity) > 0.9;
+      }, { id: smallMermaidId }, { timeout: 4000 });
+    });
     const shownOpacity = await smallBlock.locator(actionsSelector).evaluate((node) => parseFloat(getComputedStyle(node).opacity));
     assert(shownOpacity > 0.9, `actions should be visible on hover, opacity=${shownOpacity}`);
 
@@ -311,13 +343,72 @@ async function main() {
       `missing-payload tab must not leak the artifact ID slice, got "${ghostTabText}"`,
     );
 
-    // --- Invalid image routes through shared error surface ---
+    // --- Invalid image routes through shared error surface (inline) ---
     await panel.getByRole("button", { name: "Close artifact panel" }).click();
-    await page.evaluate(() => {
-      const img = document.querySelector(".artifact-image-wrap img");
+    const brokenBlock = page.locator(`[data-artifact-id="${brokenImageId}"]`);
+    await brokenBlock.scrollIntoViewIfNeeded();
+    await brokenBlock.waitFor({ state: "visible" });
+    // Force the <img> to fail — data URL may still render partial bytes in some engines, so
+    // dispatch onError explicitly to prove the shared surface transitions to error state.
+    await brokenBlock.evaluate((node) => {
+      const img = node.querySelector(".artifact-image-wrap img");
       if (img) img.dispatchEvent(new Event("error"));
     });
-    // Nothing to assert if no image on screen; skip if not applicable.
+    await brokenBlock.locator(".artifact-render-error-title").waitFor({ state: "visible", timeout: 3000 });
+    const inlineErrorText = (await brokenBlock.locator(".artifact-render-error-title").textContent())?.trim();
+    assert(inlineErrorText === "Image couldn’t load.", `inline broken image should route through shared error surface, got "${inlineErrorText}"`);
+    const inlineRetry = await brokenBlock.locator(".artifact-render-error-retry").count();
+    assert(inlineRetry === 1, `inline broken image should offer Retry recovery action, got ${inlineRetry}`);
+
+    // --- Invalid image routes through shared error surface (panel) ---
+    await setPanelUrl(page, [brokenImageId], brokenImageId);
+    await panel.waitFor({ state: "visible" });
+    await panel.locator(".artifact-image-detail-wrap img").waitFor({ state: "attached", timeout: 4000 }).catch(() => {});
+    await panel.evaluate((node) => {
+      const img = node.querySelector(".artifact-image-detail-wrap img");
+      if (img) img.dispatchEvent(new Event("error"));
+    });
+    await panel.locator(".artifact-render-error-title").waitFor({ state: "visible", timeout: 3000 });
+    const panelErrorText = (await panel.locator(".artifact-render-error-title").textContent())?.trim();
+    assert(panelErrorText === "Image couldn’t load.", `panel broken image should route through shared error surface, got "${panelErrorText}"`);
+    const panelRetry = await panel.locator(".artifact-render-error-retry").count();
+    assert(panelRetry >= 1, `panel broken image should offer Retry recovery action, got ${panelRetry}`);
+    await panel.getByRole("button", { name: "Close artifact panel" }).click();
+
+    // --- Cross-session no-carryover: same artifactId, different session, expand state stays scoped ---
+    // Ensure the largeMermaidA in the primary session is expanded, then navigate to the second
+    // ticket whose transcript reuses the SAME artifact ids. That artifact must render collapsed
+    // there — the inline-expand store must key on (ticket, subagent, session.path), not just id.
+    const largeA = page.locator(`[data-artifact-id="${largeMermaidAId}"]`).first();
+    await largeA.scrollIntoViewIfNeeded();
+    if ((await largeA.getAttribute("data-artifact-expanded")) !== "true") {
+      await largeA.hover();
+      const showAllBtn = largeA.getByRole("button", { name: "Show all" });
+      if ((await showAllBtn.count()) > 0) {
+        await showAllBtn.click();
+        await page.waitForFunction((id) => {
+          const el = document.querySelector(`[data-artifact-id="${id}"]`);
+          return el?.getAttribute("data-artifact-expanded") === "true";
+        }, largeMermaidAId, { timeout: 3000 });
+      }
+    }
+    // Switch to the second ticket (fresh session.path, same artifact ids in transcript).
+    await page.evaluate((secondTicket) => {
+      const layout = {
+        version: 2,
+        activeWindowId: "window-0",
+        windows: [{ id: "window-0", focusedPaneId: "pane-1", layout: { kind: "pane", id: "pane-1", path: `agent://${secondTicket}` } }],
+      };
+      localStorage.setItem("wiki-window-layout-v2", JSON.stringify(layout));
+    }, SECOND_TICKET);
+    await page.goto(`${backend.baseUrl}/#/agent/${SECOND_TICKET}`, { waitUntil: "domcontentloaded" });
+    await page.locator(".session-scroll").waitFor({ state: "visible" });
+    const secondLargeA = page.locator(`[data-artifact-id="${largeMermaidAId}"]`).first();
+    await secondLargeA.waitFor({ state: "visible" });
+    assert(
+      (await secondLargeA.getAttribute("data-artifact-expanded")) !== "true",
+      "expand state must not leak from a prior session into a fresh transcript session that reuses the same artifact id",
+    );
   } finally {
     await context.close();
     await browser.close();

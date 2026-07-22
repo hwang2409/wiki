@@ -1872,7 +1872,6 @@ export function SessionTab({
   rowHeightVersionRef.current = rowHeightVersion;
 
   if (rowHeightsKeyRef.current !== resetKey) {
-    clearInlineArtifactStates(rowHeightsKeyRef.current);
     rowHeightsKeyRef.current = resetKey;
     rowHeightsRef.current = new Map();
     groupCacheRef.current = null;
@@ -1886,6 +1885,17 @@ export function SessionTab({
   );
   const visible = useElementVisible(containerRef);
   const { session, pendingUserMessages, error, loading } = useTranscriptSession(target, visible);
+  const inlineArtifactKey = `${ticket}:${subagent ?? ""}:${session?.path ?? ""}`;
+  const inlineArtifactKeyRef = useRef(inlineArtifactKey);
+  if (inlineArtifactKeyRef.current !== inlineArtifactKey) {
+    clearInlineArtifactStates(inlineArtifactKeyRef.current);
+    inlineArtifactKeyRef.current = inlineArtifactKey;
+  }
+  useEffect(() => {
+    return () => {
+      clearInlineArtifactStates(inlineArtifactKeyRef.current);
+    };
+  }, []);
   const [questionDrafts, setQuestionDrafts] = useState<Record<string, QuestionDraft>>({});
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [olderError, setOlderError] = useState<string | null>(null);
@@ -2471,7 +2481,7 @@ export function SessionTab({
                 onHeightChange={reportRowHeight}
                 onInspect={onInspect}
                 onOpenArtifact={onOpenArtifact}
-                sessionKey={resetKey}
+                sessionKey={inlineArtifactKey}
                 showTimestamp={timestampKeys.has(group.key)}
                 ticket={ticket}
                 top={top}
