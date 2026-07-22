@@ -6117,6 +6117,11 @@ body.is-resizing-panes .pane-cell {
   pointer-events: none;
 }
 
+.nav-agent-unread.is-failed {
+  background-color: var(--text-error, #c05252);
+  outline: 1px solid var(--text-error, #c05252);
+}
+
 .sr-only {
   position: absolute;
   width: 1px;

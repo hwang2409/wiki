@@ -1517,7 +1517,14 @@ export function AgentsSidebar({
   // viewed at — comparing seqs (monotonic int) sidesteps timestamp-format
   // and wall-clock issues from the round 1 implementation.
   const [viewedOverrides, setViewedOverrides] = useState<Record<string, number>>({});
+  // Runs whose mark-viewed request permanently failed (all retries exhausted).
+  // Bounded to prevent the round 2 H1 request loop: on failure we keep the
+  // optimistic override intact AND set this flag so the effect stops firing;
+  // the row renders a distinct failed indicator so the user can see why.
+  const [viewedFailed, setViewedFailed] = useState<Record<string, boolean>>({});
   const viewedInflight = useRef<Map<string, boolean>>(new Map());
+  const viewedAttempts = useRef<Map<string, number>>(new Map());
+  const viewedRetryTimers = useRef<Map<string, number>>(new Map());
 
   useEffect(() => {
     if (data) return;
@@ -1549,6 +1556,12 @@ export function AgentsSidebar({
     const observedSeq = worker?.latest_event_seq ?? null;
     if (!runId || observedSeq === null) return;
 
+    // Round 2 H1: once a run's mark-viewed has permanently failed, do not
+    // keep firing new requests each render. The optimistic override remains
+    // (so the row still visually reflects the user's action) and the failed
+    // badge tells them the server didn't persist the state.
+    if (viewedFailed[runId]) return;
+
     // Skip if we (or the server) have already recorded a viewed seq that
     // covers everything visible in this refresh. Prevents the effect from
     // POSTing on every /api/agents refresh (the round 1 regression), while
@@ -1572,27 +1585,43 @@ export function AgentsSidebar({
       return;
     }
 
-    const post = (seq: number, retried: boolean): void => {
+    const MAX_ATTEMPTS = 3;
+    const backoffMs = (attempt: number) => 500 * 2 ** (attempt - 1);
+
+    const post = (seq: number): void => {
       viewedInflight.current.set(runId, false);
+      viewedAttempts.current.set(
+        runId,
+        (viewedAttempts.current.get(runId) ?? 0) + 1
+      );
       markRunViewed(runId, seq)
         .then((result) => {
+          viewedAttempts.current.delete(runId);
           setViewedOverrides((current) => ({
             ...current,
             [runId]: result.last_viewed_seq,
           }));
         })
         .catch(() => {
-          // Rollback the optimistic override so the dot re-appears; retry
-          // once with the latest observed seq before giving up.
-          setViewedOverrides((current) => {
-            if (current[runId] === undefined) return current;
-            const next = { ...current };
-            delete next[runId];
-            return next;
-          });
-          if (!retried) {
-            window.setTimeout(() => post(seq, true), 500);
+          // Round 2 H1: preserve the optimistic override on failure. Retry
+          // with exponential backoff up to MAX_ATTEMPTS; flip to failed
+          // afterwards so the effect stops firing and the user sees the
+          // failed badge.
+          const attempts = viewedAttempts.current.get(runId) ?? MAX_ATTEMPTS;
+          if (attempts < MAX_ATTEMPTS) {
+            const delay = backoffMs(attempts);
+            const timer = window.setTimeout(() => {
+              viewedRetryTimers.current.delete(runId);
+              post(seq);
+            }, delay);
+            viewedRetryTimers.current.set(runId, timer);
+            return;
           }
+          viewedAttempts.current.delete(runId);
+          setViewedFailed((current) => {
+            if (current[runId]) return current;
+            return { ...current, [runId]: true };
+          });
         })
         .finally(() => {
           const wasQueued = viewedInflight.current.get(runId) === true;
@@ -1602,14 +1631,22 @@ export function AgentsSidebar({
           // seq observed on the freshest render.
           setViewedOverrides((current) => {
             const seqNow = current[runId];
-            if (seqNow !== undefined) post(seqNow, false);
+            if (seqNow !== undefined && !viewedFailed[runId]) post(seqNow);
             return current;
           });
         });
     };
 
-    post(observedSeq, false);
-  }, [activeTicket, workers, viewedOverrides]);
+    post(observedSeq);
+  }, [activeTicket, workers, viewedOverrides, viewedFailed]);
+
+  useEffect(() => {
+    const timers = viewedRetryTimers.current;
+    return () => {
+      for (const handle of timers.values()) window.clearTimeout(handle);
+      timers.clear();
+    };
+  }, []);
 
   if (workers === null) {
     return (
@@ -1647,18 +1684,30 @@ export function AgentsSidebar({
 
   const workerRow = (worker: AgentWorker, indent: boolean) => {
     const unread = hasUnread(worker);
+    const failed = worker.run_id ? viewedFailed[worker.run_id] === true : false;
     return (
       <button
-        className={`nav-agent${indent ? " is-owned" : ""}${activeTicket === worker.ticket ? " is-active" : ""}${unread ? " has-unread" : ""}`}
+        className={`nav-agent${indent ? " is-owned" : ""}${activeTicket === worker.ticket ? " is-active" : ""}${unread ? " has-unread" : ""}${failed ? " has-viewed-failure" : ""}`}
         key={worker.ticket}
         type="button"
         onClick={() => onOpen(worker.ticket)}
+        title={failed ? "Failed to persist read state to the server" : undefined}
         {...dragProps(worker.ticket)}
       >
         {unread ? (
           <>
             <span aria-hidden="true" className="nav-agent-unread" data-testid="nav-agent-unread" />
             <span className="sr-only">unread</span>
+          </>
+        ) : null}
+        {failed ? (
+          <>
+            <span
+              aria-hidden="true"
+              className="nav-agent-unread is-failed"
+              data-testid="nav-agent-viewed-failed"
+            />
+            <span className="sr-only">read state failed to save</span>
           </>
         ) : null}
         <span className={`nav-agent-dot is-${worker.state ?? "unknown"}`} />

@@ -93,6 +93,8 @@ async def lifespan(_app: FastAPI):
     configured_backend = os.environ.get("WIKI_BACKEND_URL")
     if configured_backend:
         backend_runtime.publish_backend_url(configured_backend)
+    # Stamp the WIKI-147 unread-dot deploy cutoff BEFORE any request handling.
+    _ensure_deploy_timestamp()
     terminal.refresh_boot_token()
     # Prime the tracker so the first /api/providers/health request is populated.
     try:
@@ -780,6 +782,13 @@ AGENT_RUNS_DIR = Path(os.environ.get("WIKI_AGENT_RUNS_DIR") or AGENT_RUNTIME_DIR
 AGENT_VIEWED_PATH = Path(
     os.environ.get("WIKI_AGENT_VIEWED_PATH") or AGENT_RUNTIME_DIR / "agent-viewed.json"
 )
+AGENT_DEPLOY_MARKER_PATH = Path(
+    os.environ.get("WIKI_AGENT_DEPLOY_MARKER_PATH")
+    or AGENT_RUNTIME_DIR / "deploy-timestamp.txt"
+)
+# Populated at supervisor startup by :func:`_ensure_deploy_timestamp` and used
+# by :func:`_resolve_viewed_fields` to classify legacy vs post-deploy runs.
+_DEPLOY_TIMESTAMP: str | None = None
 AGENT_ARCHIVE_DIR = Path(
     os.environ.get("WIKI_AGENT_ARCHIVE_DIR") or Path.home() / "me" / "fun" / "agent-archive"
 )
@@ -1051,34 +1060,59 @@ def _run_exists(run_id: str) -> bool:
     return (AGENT_RUNS_DIR / run_id / "run.json").is_file()
 
 
-def _migrate_viewed_store_if_needed() -> None:
-    """One-time backfill: mark every pre-deploy run as viewed at its current seq.
+def _ensure_deploy_timestamp() -> str:
+    """Return the wiki-supervisor deploy cutoff, initializing the marker if absent.
 
-    Runs exactly once per install (detected by absence of ``agent-viewed.json``).
-    Sessions created AFTER migration are NOT in the store and therefore render
-    unread if any real event exists — the WIKI-147 R2 B1 contract.
+    Called from the FastAPI lifespan on boot so the cutoff is stamped BEFORE any
+    request handling. Runs created before this timestamp are classified as
+    "seen already" (pre-deploy backfill); runs created at/after render unread on
+    first paint. Persisted to a marker file so restarts keep the same cutoff —
+    a reboot must not silently re-classify runs.
     """
 
-    if AGENT_VIEWED_PATH.exists():
-        return
-    with _viewed_lock(exclusive=True):
-        # Recheck under the lock — a concurrent request may have migrated.
-        if AGENT_VIEWED_PATH.exists():
-            return
-        migrated: dict[str, Any] = {}
-        if AGENT_RUNS_DIR.is_dir():
-            for run_dir in AGENT_RUNS_DIR.iterdir():
-                if not run_dir.is_dir():
-                    continue
-                run_id = run_dir.name
-                if not RUN_ID_PATTERN.fullmatch(run_id):
-                    continue
-                updated_at, seq = _load_run_freshness(run_id)
-                if updated_at is None or seq is None:
-                    continue
-                migrated[run_id] = {"seq": seq, "at": updated_at}
-        migrated["_migrated_at"] = datetime.now(tz=timezone.utc).isoformat()
-        _write_viewed_map_locked(migrated)
+    global _DEPLOY_TIMESTAMP
+    if _DEPLOY_TIMESTAMP is not None:
+        return _DEPLOY_TIMESTAMP
+    try:
+        existing = AGENT_DEPLOY_MARKER_PATH.read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):
+        existing = ""
+    if existing:
+        _DEPLOY_TIMESTAMP = existing
+        return existing
+    now_iso = datetime.now(tz=timezone.utc).isoformat()
+    AGENT_DEPLOY_MARKER_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fd, raw_tmp = tempfile.mkstemp(
+        prefix=f".{AGENT_DEPLOY_MARKER_PATH.name}.",
+        dir=AGENT_DEPLOY_MARKER_PATH.parent,
+    )
+    tmp = Path(raw_tmp)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(now_iso)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, AGENT_DEPLOY_MARKER_PATH)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+    _DEPLOY_TIMESTAMP = now_iso
+    return now_iso
+
+
+def _load_run_created_at(run_id: str) -> str | None:
+    """Return ``created_at`` from ``runs/<id>/run.json`` or ``None``."""
+
+    if not RUN_ID_PATTERN.fullmatch(run_id):
+        return None
+    try:
+        payload = json.loads((AGENT_RUNS_DIR / run_id / "run.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    created_at = payload.get("created_at")
+    return created_at if isinstance(created_at, str) else None
 
 
 def _resolve_viewed_fields(
@@ -1087,17 +1121,28 @@ def _resolve_viewed_fields(
 ) -> tuple[str | None, int | None, str | None, int | None]:
     """Return ``(latest_event_at, latest_event_seq, last_viewed_at, last_viewed_seq)``.
 
-    New sessions (run_id not in ``viewed_map``) resolve to ``last_viewed_*=None``
-    so any existing event renders as unread.
+    Order of precedence for the viewed pair:
+      1. Explicit entry in ``viewed_map`` (user marked the row viewed).
+      2. Pre-deploy classification: the run was created before this supervisor's
+         deploy cutoff (or the run predates the ``created_at`` schema) — treat
+         as viewed at whatever the current durable seq is, so legacy sessions
+         don't all show a dot after upgrade. WIKI-147 R2 B1 contract.
+      3. Post-deploy new session (created_at >= deploy cutoff) — leave ``None``
+         so any recorded event renders as unread.
     """
 
     latest_at, latest_seq = _load_run_freshness(run_id)
     if not run_id or latest_at is None:
         return latest_at, latest_seq, None, None
     entry = viewed_map.get(run_id)
-    if entry is None:
-        return latest_at, latest_seq, None, None
-    return latest_at, latest_seq, entry.get("at"), entry.get("seq")
+    if entry is not None:
+        return latest_at, latest_seq, entry.get("at"), entry.get("seq")
+    created_at = _load_run_created_at(run_id)
+    deploy_at = _ensure_deploy_timestamp()
+    if created_at is None or created_at < deploy_at:
+        # Legacy / pre-deploy — no dot on first paint.
+        return latest_at, latest_seq, latest_at, latest_seq
+    return latest_at, latest_seq, None, None
 
 
 def _archive_role(session_dir: Path) -> str | None:
@@ -1399,7 +1444,6 @@ def agents() -> dict[str, object]:
         if not supervisor_alive:
             supervisor_health["detail"] = "supervisor PID is absent or not running"
     now = datetime.now(tz=timezone.utc).timestamp()
-    _migrate_viewed_store_if_needed()
     viewed_map = _read_viewed_map()
     workers = []
     orchestrators = []

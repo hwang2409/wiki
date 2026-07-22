@@ -14,38 +14,52 @@ function line(value) {
   return `${JSON.stringify(value)}\n`;
 }
 
+/**
+ * Fake supervisor speaking the same UDS wire protocol as the real one — respond
+ * to `events/subscribe` with `{result: {subscribed: true}}` on the same line the
+ * request arrived, then hold the socket open and stream `{event: {...}}\n`
+ * frames whenever `emit()` is called. Non-subscription requests get one-shot
+ * responses like the previous fixture.
+ */
 async function startFakeSupervisor(fixtures, runs) {
   const subscribers = new Set();
   const server = net.createServer((socket) => {
     let buffer = "";
+    let subscribed = false;
     socket.on("data", (chunk) => {
       buffer += chunk.toString();
-      const newline = buffer.indexOf("\n");
-      if (newline < 0) return;
-      const request = JSON.parse(buffer.slice(0, newline));
-      const { id, method } = request;
-      if (method === "events/subscribe") {
-        subscribers.add(socket);
-        socket.write(line({ id, result: { subscribed: true } }));
-        socket.on("close", () => subscribers.delete(socket));
+      let newline;
+      while (!subscribed && (newline = buffer.indexOf("\n")) >= 0) {
+        const requestLine = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        if (!requestLine.trim()) continue;
+        const request = JSON.parse(requestLine);
+        const { id, method } = request;
+        if (method === "events/subscribe") {
+          subscribed = true;
+          subscribers.add(socket);
+          socket.write(line({ id, result: { subscribed: true } }));
+          socket.on("close", () => subscribers.delete(socket));
+          return;
+        }
+        const result =
+          method === "ping"
+            ? { status: "ok", pid: process.pid }
+            : method === "run/list"
+              ? { status: "ok", pid: process.pid, runs }
+              : method === "run/status"
+                ? runs.find((run) => run.run_id === request.params?.run_id) ?? null
+                : method === "run/queue"
+                  ? { messages: [] }
+                  : null;
+        if (result === null) {
+          socket.write(line({ id, error: { type: "ValueError", message: `unsupported: ${method}` } }));
+        } else {
+          socket.write(line({ id, result }));
+        }
+        socket.end();
         return;
       }
-      const result =
-        method === "ping"
-          ? { status: "ok", pid: process.pid }
-          : method === "run/list"
-            ? { status: "ok", pid: process.pid, runs }
-            : method === "run/status"
-              ? runs.find((run) => run.run_id === request.params?.run_id) ?? null
-              : method === "run/queue"
-                ? { messages: [] }
-                : null;
-      if (result === null) {
-        socket.write(line({ id, error: { type: "ValueError", message: `unsupported: ${method}` } }));
-      } else {
-        socket.write(line({ id, result }));
-      }
-      socket.end();
     });
   });
 
@@ -55,6 +69,26 @@ async function startFakeSupervisor(fixtures, runs) {
     server.listen(fixtures.supervisorSocketPath, resolve);
   });
   return {
+    subscribers,
+    emit(event) {
+      const frame = line({ event });
+      for (const socket of subscribers) {
+        try {
+          socket.write(frame);
+        } catch {
+          /* subscriber already gone */
+        }
+      }
+    },
+    async waitForSubscriber(timeoutMs = 5_000) {
+      const deadline = Date.now() + timeoutMs;
+      while (subscribers.size === 0) {
+        if (Date.now() >= deadline) {
+          throw new Error("timed out waiting for supervisor subscriber");
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    },
     async stop() {
       for (const socket of subscribers) socket.destroy();
       await new Promise((resolve) => server.close(resolve));
@@ -70,20 +104,18 @@ async function startFakeSupervisor(fixtures, runs) {
  * from `run.json` (WIKI-147 R2 B2 contract). Tests must NOT touch the
  * status file mtime as a proxy for freshness.
  */
-async function appendDurableEvent(fixtures, runId, seq) {
+async function appendDurableEvent(fixtures, runId, seq, createdAt) {
   const runDir = path.join(fixtures.runtimeDir, "runs", runId);
   await fs.mkdir(runDir, { recursive: true });
   const runPath = path.join(runDir, "run.json");
   const updatedAt = new Date().toISOString();
-  await fs.writeFile(
-    runPath,
-    JSON.stringify({
-      run_id: runId,
-      normalized_event_count: seq,
-      updated_at: updatedAt,
-    }),
-    "utf-8",
-  );
+  const payload = {
+    run_id: runId,
+    normalized_event_count: seq,
+    updated_at: updatedAt,
+  };
+  if (createdAt) payload.created_at = createdAt;
+  await fs.writeFile(runPath, JSON.stringify(payload), "utf-8");
   return updatedAt;
 }
 
@@ -106,8 +138,8 @@ async function unreadCount(page, ticket) {
   }, ticket);
 }
 
-async function waitForUnread(page, ticket, want, message) {
-  const deadline = Date.now() + 5_000;
+async function waitForUnread(page, ticket, want, message, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
   let last = null;
   while (Date.now() < deadline) {
     last = await unreadCount(page, ticket);
@@ -128,6 +160,14 @@ async function main() {
   await fs.mkdir(OUT_DIR, { recursive: true });
   const fixtures = makeFixtureRoot("wiki-147-unread-dot-");
   await fs.writeFile(fixtures.queuePath, "{}\n");
+
+  // Freeze the deploy cutoff BEFORE the backend boots so we can classify the
+  // seeded run as post-deploy by writing its created_at strictly after this
+  // timestamp. Matches the WIKI-147 R2 B1 contract: the marker is stamped at
+  // startup, not on first request.
+  const deployAt = new Date("2026-07-21T00:00:00Z").toISOString();
+  const runCreatedAt = new Date("2026-07-21T00:00:01Z").toISOString();
+  await fs.writeFile(path.join(fixtures.root, "deploy-timestamp.txt"), deployAt, "utf-8");
 
   const liveWorker = {
     ticket: WORKER,
@@ -165,20 +205,19 @@ async function main() {
       localStorage.removeItem("wiki-window-layout-v2");
     });
 
-    // Scenario 1: session created AFTER first migration (i.e., after backend
-    // has migrated the currently-empty runs dir). It must show unread on
-    // first appearance — the WIKI-147 R2 B1 contract.
+    // Scenario 1: a run whose created_at is strictly AFTER the deploy cutoff
+    // must render unread on first paint. WIKI-147 R2 B1 contract.
+    await appendDurableEvent(fixtures, RUN_ID, 1, runCreatedAt);
     await page.goto(`${backend.baseUrl}/`, { waitUntil: "domcontentloaded" });
     await page.locator(".nav-agents").waitFor();
-    // The initial /api/agents call triggers the one-time migration on the
-    // empty runs dir. Wait for the viewed store file to prove migration ran.
-    await pokeAgents(page);
-    // Now create the run in the durable store — POST-migration.
-    await appendDurableEvent(fixtures, RUN_ID, 1);
-    await page.reload({ waitUntil: "domcontentloaded" });
     await page.locator(`.nav-agent .nav-agent-ticket:has-text("${WORKER}")`).waitFor();
-    await waitForUnread(page, WORKER, 1, "new post-migration session must show unread");
+    await waitForUnread(page, WORKER, 1, "post-deploy session must show unread on first paint");
     await page.screenshot({ path: path.join(OUT_DIR, "1-unread.png"), fullPage: false });
+
+    // Backend must have subscribed to the fake supervisor once the browser's
+    // EventSource opened. That's the plumbing we're about to exercise in
+    // scenario 3.
+    await supervisor.waitForSubscriber();
 
     // Scenario 2: open the row → optimistic clear + POST /viewed with the
     // observed seq. Dot must disappear without waiting for the network.
@@ -186,38 +225,50 @@ async function main() {
     await waitForUnread(page, WORKER, 0, "click should clear unread optimistically");
     await page.screenshot({ path: path.join(OUT_DIR, "2-cleared.png"), fullPage: false });
 
-    // Confirm the backend persisted the viewed seq.
     const persisted = await pokeAgents(page);
     const rowAfterView = persisted.workers.find((worker) => worker.ticket === WORKER);
     assert.equal(rowAfterView.last_viewed_seq, 1, "backend must persist last_viewed_seq");
     assert.equal(rowAfterView.latest_event_seq, 1);
 
-    // Scenario 3: a REAL provider event lands in the durable store — the
-    // supervisor's append_normalized path advances normalized_event_count
-    // and updated_at in run.json. NO status-file mtime touch.
-    await appendDurableEvent(fixtures, RUN_ID, 2);
-
-    const advanced = await pokeAgents(page);
-    const rowAdvanced = advanced.workers.find((worker) => worker.ticket === WORKER);
-    assert.equal(rowAdvanced.latest_event_seq, 2);
-    assert.equal(rowAdvanced.last_viewed_seq, 1);
-
-    // Clear the URL hash + saved layout so the ticket is NOT active on
-    // reload. Otherwise the active-ticket effect would immediately re-mark
-    // the row viewed and hide the dot we're trying to observe.
+    // Navigate away from the ticket so the sidebar's active-ticket effect
+    // does NOT auto-mark it viewed when the next event arrives. Without
+    // this, the dot would flash and disappear before the assertion runs.
+    // The activity route deliberately has no run_id, so no mark-viewed
+    // POST is scheduled.
     await page.evaluate(() => {
-      history.replaceState(null, "", "/");
-      localStorage.removeItem("wiki-window-layout-v2");
+      window.location.hash = "#/activity";
     });
-    // Reload — sidebar must show the dot again because seq advanced past
-    // the recorded viewed seq.
-    await page.reload({ waitUntil: "domcontentloaded" });
-    await page.locator(`.nav-agent .nav-agent-ticket:has-text("${WORKER}")`).waitFor();
+    await page.waitForFunction(() => {
+      const active = document.querySelector(".nav-agent.is-active");
+      return active === null;
+    });
+
+    // Scenario 3: exercise the FULL supervisor -> SSE -> UI re-fetch path,
+    // WITHOUT a page reload. This is the R2 H2 contract — the previous
+    // rewrite mutated run.json + reloaded, so a regression that broke SSE
+    // freshness (like R1 B2) could silently pass. Now:
+    //   supervisor.emit(session event)
+    //     -> backend's /api/events forwards it
+    //     -> App.tsx onmessage with type='session'
+    //     -> refreshTick advances
+    //     -> AgentsSidebar re-fetches /api/agents
+    //     -> row's latest_event_seq advances past last_viewed_seq
+    //     -> dot re-appears
+    // The durable seq bump is written FIRST so the re-fetch has fresh data.
+    await appendDurableEvent(fixtures, RUN_ID, 2, runCreatedAt);
+    supervisor.emit({
+      type: "session",
+      ticket: WORKER,
+      surface: "agents",
+      run_id: RUN_ID,
+    });
+
     await waitForUnread(
       page,
       WORKER,
       1,
-      "real durable event should re-show the unread dot without touching status mtime",
+      "SSE-delivered session event must re-show the unread dot without a page reload",
+      8_000,
     );
     await page.screenshot({ path: path.join(OUT_DIR, "3-reappeared.png"), fullPage: false });
 
@@ -250,11 +301,13 @@ async function main() {
         {
           worker: WORKER,
           run_id: RUN_ID,
+          deploy_timestamp: deployAt,
+          run_created_at: runCreatedAt,
           screenshots: ["1-unread.png", "2-cleared.png", "3-reappeared.png"],
           scenarios: [
-            "post-migration new session shows unread",
+            "post-deploy new session shows unread on first paint",
             "open clears dot optimistically + server persists",
-            "durable seq advance re-shows dot without status mtime touch",
+            "SSE session event advances seq and re-shows dot (no reload)",
             "accessible name includes 'unread'",
             "unknown run_id -> 404",
           ],
