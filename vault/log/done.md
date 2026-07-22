@@ -9,6 +9,7 @@ updated: 2026-07-22
 
 ## 2026-07-22
 
+- **wiki** — WIKI-144 badge sweep — unified StatusBadge across dashboard/session-header/artifact rows/artifact-panel file-list; centralized statusToTone; WCAG-AA-compliant compact-badge token + contrast assertion; real-surface playwright — PR #118 squash f5214ad (2 review rounds)
 - **wiki** — WIKI-145 UI refresh II — 12 audit treatments (narrower rail, transparent workspace-sidebar+tab-header, hairline tabs, left-accent active row, borderless session-header, plain-prose assistant, downgraded notice/composer/activity-head, text-toggle chips); honest screenshot fixture + resilient python resolver; new layout/noise/typography playwright suites — PR #116 squash 7be5561 (3 review rounds)
 
 ## 2026-07-21
