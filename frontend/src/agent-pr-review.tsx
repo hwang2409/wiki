@@ -4,7 +4,6 @@ import {
   CircleCheck,
   LoaderCircle,
   ExternalLink,
-  GitBranch,
   GitPullRequest,
   ListChecks,
   MessageSquareQuote,
@@ -13,8 +12,10 @@ import {
 } from "lucide-react";
 import { approveAgentPr, getAgentPr } from "./api";
 import type { AgentPrCheck, AgentPrData } from "./api";
+import { BranchPill } from "./branch-pill";
 import { externalLinkProps } from "./external-links";
 import { SplitDiffView } from "./split-diff";
+import { StatusBadge } from "./status-badge";
 
 function humanizeEnum(value: string | null | undefined, fallback = "unknown"): string {
   if (!value) return fallback;
@@ -145,7 +146,7 @@ export function AgentPrReviewPanel({
             </span>
           ) : confirming ? (
             <>
-              <span className="pr-review-pill">{data.repo}</span>
+              <StatusBadge label={data.repo} state="unknown" />
               <button
                 className="pr-review-action is-strong"
                 disabled={submitting}
@@ -178,16 +179,17 @@ export function AgentPrReviewPanel({
         </div>
         <h2 className="pr-review-title">{data.title}</h2>
         <div className="pr-review-meta">
-          <span className="pr-review-pill">{humanizeEnum(data.state)}</span>
-          <span className="pr-review-pill">{humanizeEnum(data.reviewDecision, "review undecided")}</span>
-          <span className="pr-review-pill">{humanizeEnum(data.mergeable)}</span>
-          <span className="pr-review-pill">{humanizeEnum(data.mergeStateStatus)}</span>
-          {data.headRefName ? (
-            <span className="pr-review-pill">
-              <GitBranch size={11} />
-              {data.headRefName}
-            </span>
-          ) : null}
+          <StatusBadge label={humanizeEnum(data.state)} state={humanizeEnum(data.state)} />
+          <StatusBadge
+            label={humanizeEnum(data.reviewDecision, "review undecided")}
+            state={humanizeEnum(data.reviewDecision, "unknown")}
+          />
+          <StatusBadge label={humanizeEnum(data.mergeable)} state={humanizeEnum(data.mergeable)} />
+          <StatusBadge
+            label={humanizeEnum(data.mergeStateStatus)}
+            state={humanizeEnum(data.mergeStateStatus)}
+          />
+          {data.headRefName ? <BranchPill branch={data.headRefName} /> : null}
         </div>
         <div className="pr-review-stats">
           <span>{data.changedFiles} files</span>

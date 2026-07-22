@@ -17,8 +17,15 @@ import {
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { sendAgentMessage } from "./api";
-import type { ArtifactColumn, ArtifactKind, SessionArtifact, SessionEvent } from "./api";
+import type {
+  ArtifactColumn,
+  ArtifactFileEntry,
+  ArtifactKind,
+  SessionArtifact,
+  SessionEvent,
+} from "./api";
 import { ShikiCode, useCurrentTheme } from "./shiki";
+import { SplitDiffView } from "./split-diff";
 
 const TABLE_ROW_HEIGHT = 32;
 const TABLE_VIEWPORT_HEIGHT = 320;
@@ -58,7 +65,24 @@ const KIND_ICONS: Record<ArtifactKind, LucideIcon> = {
   table: Table2,
   plot: BarChart3,
   code: Code2,
+  diff: GitBranch,
+  "file-list": FileJson,
+  json: FileJson,
 };
+
+const DIFF_HEAD_PATTERN = /^\s*(?:diff --git |--- [ab]?\/|\*\*\* )/m;
+
+export function looksLikeUnifiedDiff(text: string | undefined | null): boolean {
+  if (!text) return false;
+  return DIFF_HEAD_PATTERN.test(text);
+}
+
+export function classifyArtifact(artifact: SessionArtifact): ArtifactKind {
+  if (artifact.kind !== "code" && artifact.kind !== "diff") return artifact.kind;
+  if (artifact.kind === "diff") return "diff";
+  if (looksLikeUnifiedDiff(artifact.source)) return "diff";
+  return "code";
+}
 
 export function artifactUrl(ticket: string, event: SessionEvent): string {
   return `/api/agents/${encodeURIComponent(ticket)}/artifact/${encodeURIComponent(event.artifact_id ?? "")}`;
@@ -95,6 +119,7 @@ function textPayload(artifact: SessionArtifact): string {
     case "mermaid":
     case "svg":
     case "code":
+    case "diff":
       return artifact.source ?? "";
     case "table":
       return tableText(artifact, "tsv");
@@ -102,6 +127,12 @@ function textPayload(artifact: SessionArtifact): string {
       return JSON.stringify(artifact.spec_vega_lite ?? {}, null, 2);
     case "image":
       return artifact.data_base64 ?? artifact.ref ?? "";
+    case "file-list":
+      return (artifact.files ?? []).map((entry) => entry.path).join("\n");
+    case "json":
+      return typeof artifact.json_data === "string"
+        ? artifact.json_data
+        : JSON.stringify(artifact.json_data ?? {}, null, 2);
   }
 }
 
@@ -132,6 +163,9 @@ function downloadName(event: SessionEvent): string {
     table: "csv",
     plot: "json",
     code: artifact.language?.replace(/[^a-zA-Z0-9]/g, "") || "txt",
+    diff: "diff",
+    "file-list": "txt",
+    json: "json",
   }[artifact.kind];
   return `${base}.${extension}`;
 }
@@ -495,13 +529,15 @@ export type ArtifactRendererProps = {
   compact?: boolean;
   event: SessionEvent;
   onImageLoad?: (image: HTMLImageElement) => void;
+  onOpenFile?: (entry: ArtifactFileEntry) => void;
   onRenderError?: (failure: ArtifactRenderFailure) => void;
   ticket: string;
 };
 
 export function ArtifactRenderer(props: ArtifactRendererProps): ReactNode {
   const { artifact } = props;
-  switch (artifact.kind) {
+  const effectiveKind = classifyArtifact(artifact);
+  switch (effectiveKind) {
     case "mermaid":
       return <MermaidRenderer compact={props.compact} onRenderError={props.onRenderError} source={artifact.source ?? ""} />;
     case "svg":
@@ -512,9 +548,85 @@ export function ArtifactRenderer(props: ArtifactRendererProps): ReactNode {
       return <TableRenderer artifact={artifact} />;
     case "plot":
       return <PlotRenderer spec={artifact.spec_vega_lite ?? {}} />;
+    case "diff":
+      return <DiffRenderer artifact={artifact} />;
+    case "file-list":
+      return <FileListRenderer artifact={artifact} onOpenFile={props.onOpenFile} />;
+    case "json":
+      return <JsonRenderer artifact={artifact} />;
     case "code":
       return <CodeRenderer artifact={artifact} />;
   }
+}
+
+function DiffRenderer({ artifact }: { artifact: SessionArtifact }) {
+  const patch = artifact.source ?? "";
+  return (
+    <SplitDiffView
+      className="artifact-diff"
+      emptyClassName="artifact-diff-empty"
+      emptyMessage="No diff to display."
+      patch={patch}
+      viewType="unified"
+    />
+  );
+}
+
+function FileListRenderer({
+  artifact,
+  onOpenFile,
+}: {
+  artifact: SessionArtifact;
+  onOpenFile?: (entry: ArtifactFileEntry) => void;
+}) {
+  const files = artifact.files ?? [];
+  if (files.length === 0) {
+    return <div className="artifact-file-list-empty">No files.</div>;
+  }
+  return (
+    <ul className="artifact-file-list">
+      {files.map((entry, index) => {
+        const label = entry.label ?? entry.path;
+        const clickable = Boolean(onOpenFile);
+        return (
+          <li className="artifact-file-list-item" key={`${entry.path}-${index}`}>
+            {clickable ? (
+              <button
+                className="artifact-file-list-button"
+                onClick={() => onOpenFile?.(entry)}
+                title={entry.path}
+                type="button"
+              >
+                <FileJson aria-hidden="true" className="artifact-file-list-icon" size={12} />
+                <span className="artifact-file-list-label">{label}</span>
+                {entry.status ? (
+                  <span className="artifact-file-list-status">{entry.status}</span>
+                ) : null}
+              </button>
+            ) : (
+              <span className="artifact-file-list-static" title={entry.path}>
+                <FileJson aria-hidden="true" className="artifact-file-list-icon" size={12} />
+                <span className="artifact-file-list-label">{label}</span>
+                {entry.status ? (
+                  <span className="artifact-file-list-status">{entry.status}</span>
+                ) : null}
+              </span>
+            )}
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
+function JsonRenderer({ artifact }: { artifact: SessionArtifact }) {
+  const value = artifact.json_data !== undefined ? artifact.json_data : artifact.source;
+  const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  return (
+    <pre className="artifact-json">
+      <code>{text}</code>
+    </pre>
+  );
 }
 
 function TableCopyMenu({ artifact, onCopied }: { artifact: SessionArtifact; onCopied: () => void }) {
@@ -590,6 +702,14 @@ export function artifactExceedsInlineThreshold(
       return Boolean(bounds && (bounds.width > 400 || bounds.height > 400));
     }
     case "plot": return plotExceedsInlineBounds(artifact.spec_vega_lite ?? {});
+    case "diff": return (artifact.source ?? "").split("\n").length > 100;
+    case "file-list": return (artifact.files ?? []).length > 30;
+    case "json": {
+      const text = typeof artifact.json_data === "string"
+        ? artifact.json_data
+        : JSON.stringify(artifact.json_data ?? "");
+      return text.length > 4000;
+    }
   }
 }
 

@@ -424,7 +424,23 @@ export type ProviderEventInspector = {
   raw?: ProviderRawEvent[] | null;
 };
 
-export type ArtifactKind = "mermaid" | "svg" | "image" | "table" | "plot" | "code";
+export type ArtifactKind =
+  | "mermaid"
+  | "svg"
+  | "image"
+  | "table"
+  | "plot"
+  | "code"
+  | "diff"
+  | "file-list"
+  | "json";
+
+export type ArtifactFileEntry = {
+  path: string;
+  label?: string | null;
+  size?: number | null;
+  status?: string | null;
+};
 
 export type ArtifactColumn = {
   key: string;
@@ -445,6 +461,8 @@ export type SessionArtifact = {
   language?: string;
   filename?: string;
   diff_from?: string;
+  files?: ArtifactFileEntry[];
+  json_data?: unknown;
 };
 
 export type SessionEvent = {
