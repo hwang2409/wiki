@@ -72,7 +72,7 @@ import {
   GhPreviewCard,
   containsGitHubPreviewUrl,
   isGitHubPreviewUrl,
-  splitGitHubPreviewSegments,
+  renderAnsiWithGitHubPreviews,
 } from "./github-preview";
 import { LoadingPlaceholder } from "./loading";
 import { createStateKeyWriteBarrier, deletePaneStateEntries } from "./pane-state-cache";
@@ -1043,22 +1043,13 @@ function ToolRow({
                 label="output"
                 text={tool.output ?? ""}
                 tone={tool.ok === false ? "error" : "normal"}
-                renderBody={({ text }) => {
-                  const segments = splitGitHubPreviewSegments(text);
-                  return (
-                    <div className="session-tool-output-blocks">
-                      {segments.map((segment, index) =>
-                        segment.type === "url" ? (
-                          <GhPreviewCard key={`${segment.value}:${index}`} url={segment.value} />
-                        ) : segment.value ? (
-                          <span key={`text:${index}`} className="session-tool-output-text">
-                            {renderAnsi(segment.value)}
-                          </span>
-                        ) : null
-                      )}
-                    </div>
-                  );
-                }}
+                renderBody={({ text }) => (
+                  <div className="session-tool-output-blocks">
+                    <span className="session-tool-output-text">
+                      {renderAnsiWithGitHubPreviews(text)}
+                    </span>
+                  </div>
+                )}
               />
             ) : tool.output ? (
               <BoundedPreview
