@@ -2,7 +2,7 @@
 type: reference
 tags: [meta, wiki-app]
 created: 2026-07-06
-updated: 2026-07-06
+updated: 2026-07-22
 ---
 
 ## Text styling
@@ -47,6 +47,24 @@ def egg_throw(angle: float) -> str:
     if angle > 45:
         return "high"
     return "low"
+```
+
+Hover the code block above — a small `copy` pill fades in top-right and copies the raw block to the clipboard.
+
+## Diff
+
+The `diff` artifact renders unified patches with hairline hunk separators, add/remove tones from the theme palette, and horizontal scroll on long lines. Sample source:
+
+```diff
+--- a/frontend/src/session.tsx
++++ b/frontend/src/session.tsx
+@@ -14,7 +14,8 @@ export function SessionView() {
+   const [open, setOpen] = useState(false);
+-  const items = load();
++  const items = load({ recent: true });
++  const now = Date.now();
+   return items.map(render);
+ }
 ```
 
 ## Table

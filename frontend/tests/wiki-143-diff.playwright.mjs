@@ -214,32 +214,31 @@ try {
   assert(blockCount === 2, `expected 2 code artifacts (small + oversized diff), got ${blockCount}`);
 
   const smallBlock = codeBlocks.nth(0);
-  await smallBlock.locator(".wiki-diff").waitFor({ state: "visible" });
-  const inserts = await smallBlock.locator(".wiki-diff .diff-code-insert").count();
-  const deletes = await smallBlock.locator(".wiki-diff .diff-code-delete").count();
+  await smallBlock.locator(".diff-view").waitFor({ state: "visible" });
+  const inserts = await smallBlock.locator(".diff-view .diff-line.is-add").count();
+  const deletes = await smallBlock.locator(".diff-view .diff-line.is-remove").count();
   assert(inserts >= 1, `expected inserts >=1 on small diff, got ${inserts}`);
   assert(deletes >= 1, `expected deletes >=1 on small diff, got ${deletes}`);
 
-  const themedColors = await smallBlock.locator(".wiki-diff").evaluate((node) => {
+  const themedStyles = await smallBlock.locator(".diff-view .diff-line.is-add").first().evaluate((node) => {
     const style = getComputedStyle(node);
-    return {
-      insertVar: style.getPropertyValue("--diff-code-insert-background-color").trim(),
-      deleteVar: style.getPropertyValue("--diff-code-delete-background-color").trim(),
-      fontFamily: style.fontFamily,
-    };
+    return { background: style.backgroundColor, fontFamily: style.fontFamily };
   });
-  assert(themedColors.insertVar.length > 0, "wiki-diff missing --diff-code-insert-background-color override");
-  assert(themedColors.deleteVar.length > 0, "wiki-diff missing --diff-code-delete-background-color override");
+  const removeStyle = await smallBlock.locator(".diff-view .diff-line.is-remove").first().evaluate((node) => {
+    return getComputedStyle(node).backgroundColor;
+  });
+  assert(themedStyles.background && themedStyles.background !== "rgba(0, 0, 0, 0)", `add line should have themed background, got ${themedStyles.background}`);
+  assert(removeStyle && removeStyle !== "rgba(0, 0, 0, 0)", `remove line should have themed background, got ${removeStyle}`);
   assert(
-    /mono|Consolas|JetBrains|SFMono|Menlo/i.test(themedColors.fontFamily),
-    `wiki-diff should inherit monospace font, got ${themedColors.fontFamily}`,
+    /mono|Consolas|JetBrains|SFMono|Menlo/i.test(themedStyles.fontFamily),
+    `diff line should inherit monospace font, got ${themedStyles.fontFamily}`,
   );
 
   const oversizedBlock = codeBlocks.nth(1);
   await oversizedBlock.waitFor({ state: "visible" });
   const oversizedCompact = await oversizedBlock.getAttribute("data-artifact-compact");
   assert(oversizedCompact === "true", `oversized diff should compact, got data-artifact-compact=${oversizedCompact}`);
-  const compactDiff = await oversizedBlock.locator(".artifact-compact-diff .wiki-diff").count();
+  const compactDiff = await oversizedBlock.locator(".artifact-compact-diff .diff-view").count();
   const compactCode = await oversizedBlock.locator(".artifact-compact-code").count();
   assert(compactDiff >= 1, `oversized diff should render via compact DiffRenderer, got .artifact-compact-diff count=${compactDiff}`);
   assert(compactCode === 0, `oversized diff must NOT fall through to .artifact-compact-code, got count=${compactCode}`);
@@ -250,8 +249,8 @@ try {
   await oversizedBlock.getByRole("button", { name: "Open in panel" }).click();
   const panel = page.getByRole("complementary", { name: "Artifact panel" });
   await panel.waitFor({ state: "visible" });
-  await panel.locator(".artifact-detail-diff .wiki-diff").waitFor({ state: "visible" });
-  const panelInserts = await panel.locator(".artifact-detail-diff .wiki-diff .diff-code-insert").count();
+  await panel.locator(".artifact-detail-diff .diff-view").waitFor({ state: "visible" });
+  const panelInserts = await panel.locator(".artifact-detail-diff .diff-view .diff-line.is-add").count();
   assert(panelInserts >= 1, `panel diff detail expected inserts >=1, got ${panelInserts}`);
   const panelMissing = await panel.locator(".artifact-panel-missing").count();
   assert(panelMissing === 0, `panel should route diff kind; got .artifact-panel-missing count=${panelMissing}`);
