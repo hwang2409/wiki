@@ -27,15 +27,7 @@ import type {
 import { classifyArtifact } from "./artifact-kind";
 import { ShikiCode, useCurrentTheme } from "./shiki";
 import { SplitDiffView } from "./split-diff";
-import { StatusBadge } from "./status-badge";
-
-const FILE_STATUS_STATE: Record<string, string> = {
-  added: "ok",
-  modified: "warning",
-  removed: "error",
-  deleted: "error",
-  renamed: "neutral",
-};
+import { StatusBadge, statusToTone } from "./status-badge";
 
 const TABLE_ROW_HEIGHT = 32;
 const TABLE_VIEWPORT_HEIGHT = 320;
@@ -601,7 +593,7 @@ function FileListRenderer({
                     className="artifact-file-list-status"
                     compact
                     label={entry.status}
-                    state={FILE_STATUS_STATE[entry.status.toLowerCase()] ?? "neutral"}
+                    state={statusToTone(entry.status)}
                   />
                 ) : null}
               </button>
@@ -614,7 +606,7 @@ function FileListRenderer({
                     className="artifact-file-list-status"
                     compact
                     label={entry.status}
-                    state={FILE_STATUS_STATE[entry.status.toLowerCase()] ?? "neutral"}
+                    state={statusToTone(entry.status)}
                   />
                 ) : null}
               </span>

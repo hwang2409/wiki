@@ -8228,6 +8228,14 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-faint);
 }
 
+/* WIKI-144: at compact (10px) sizes the ambient `faint` tone must clear
+   WCAG-AA 4.5:1 for normal text. `--text-faint` is too low-contrast at 10px in
+   mono-light / gruvbox-dark, so compact faint badges promote to `--text-muted`
+   which meets AA against the base background in both themes. */
+.status-badge.is-faint.is-compact {
+  color: var(--text-muted);
+}
+
 .status-badge.is-neutral.has-dot .status-badge-dot,
 .status-badge.is-faint.has-dot .status-badge-dot {
   background: currentColor;

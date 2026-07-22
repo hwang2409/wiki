@@ -34,6 +34,22 @@ const DEFAULT_LABEL: Partial<Record<StatusBadgeState, string>> = {
 
 const TAG_STATES = new Set<StatusBadgeState>(["neutral", "faint"]);
 
+const FILE_STATUS_TONE: Record<string, StatusBadgeState> = {
+  added: "ok",
+  modified: "warning",
+  removed: "error",
+  deleted: "error",
+  renamed: "neutral",
+};
+
+// Shared status-to-tone lookup for artifact file rows. Consolidates the
+// mapping so both the block renderer (`artifact-block.tsx`) and the panel
+// renderer (`artifact-detail/file-list.tsx`) never drift.
+export function statusToTone(status: string | null | undefined): StatusBadgeState {
+  if (!status) return "neutral";
+  return FILE_STATUS_TONE[status.toLowerCase()] ?? "neutral";
+}
+
 export type StatusBadgeProps = {
   state: StatusBadgeState | (string & {});
   label?: string;
