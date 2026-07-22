@@ -27,6 +27,7 @@ import type {
 import { classifyArtifact } from "./artifact-kind";
 import { ShikiCode, useCurrentTheme } from "./shiki";
 import { SplitDiffView } from "./split-diff";
+import { StatusBadge, statusToTone } from "./status-badge";
 
 const TABLE_ROW_HEIGHT = 32;
 const TABLE_VIEWPORT_HEIGHT = 320;
@@ -588,7 +589,12 @@ function FileListRenderer({
                 <FileJson aria-hidden="true" className="artifact-file-list-icon" size={12} />
                 <span className="artifact-file-list-label">{label}</span>
                 {entry.status ? (
-                  <span className="artifact-file-list-status">{entry.status}</span>
+                  <StatusBadge
+                    className="artifact-file-list-status"
+                    compact
+                    label={entry.status}
+                    state={statusToTone(entry.status)}
+                  />
                 ) : null}
               </button>
             ) : (
@@ -596,7 +602,12 @@ function FileListRenderer({
                 <FileJson aria-hidden="true" className="artifact-file-list-icon" size={12} />
                 <span className="artifact-file-list-label">{label}</span>
                 {entry.status ? (
-                  <span className="artifact-file-list-status">{entry.status}</span>
+                  <StatusBadge
+                    className="artifact-file-list-status"
+                    compact
+                    label={entry.status}
+                    state={statusToTone(entry.status)}
+                  />
                 ) : null}
               </span>
             )}

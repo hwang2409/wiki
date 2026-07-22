@@ -3830,20 +3830,7 @@ body.is-resizing-panes .pane-cell {
   text-decoration: underline;
 }
 
-.agent-chip {
-  padding: 0 7px;
-  border: 1px solid var(--background-modifier-border);
-  border-radius: 2em;
-  color: var(--text-muted);
-  font-family: var(--font-monospace);
-  font-weight: var(--font-monospace-weight);
-  font-size: var(--font-ui-smaller);
-}
-
-.agent-chip.is-faint {
-  border-style: dashed;
-  color: var(--text-faint);
-}
+/* WIKI-144: .agent-chip replaced by StatusBadge is-neutral / is-faint tones. */
 
 .agent-state {
   padding: 0 8px;
@@ -7438,11 +7425,10 @@ body.is-resizing-panes .pane-cell {
   white-space: nowrap;
 }
 
-.artifact-panel-tab-main small {
-  color: var(--text-faint);
-  font-family: var(--font-monospace);
-  font-weight: var(--font-monospace-weight);
-  font-size: var(--fs-2xs);
+/* WIKI-144: artifact kind label rendered via StatusBadge is-faint compact. */
+.artifact-panel-tab-main .artifact-panel-tab-kind {
+  align-self: flex-start;
+  padding: 0;
 }
 
 .artifact-panel-tab-action,
@@ -8224,6 +8210,38 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-faint);
 }
 
+/* WIKI-144: ambient tag tones — text-with-optional-dot, no chrome. Used for
+   role/kind/model/source labels that name a thing rather than announce a
+   changing status. Pair with `withDot` when a category color helps scanning. */
+
+.status-badge.is-neutral {
+  padding: 1px 6px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.status-badge.is-faint {
+  padding: 1px 6px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-faint);
+}
+
+/* WIKI-144: at compact (10px) sizes the ambient `faint` tone must clear
+   WCAG-AA 4.5:1 for normal text. `--text-faint` is too low-contrast at 10px in
+   mono-light / gruvbox-dark, so compact faint badges promote to `--text-muted`
+   which meets AA against the base background in both themes. */
+.status-badge.is-faint.is-compact {
+  color: var(--text-muted);
+}
+
+.status-badge.is-neutral.has-dot .status-badge-dot,
+.status-badge.is-faint.has-dot .status-badge-dot {
+  background: currentColor;
+  opacity: 0.7;
+}
+
 .branch-pill {
   display: inline-flex;
   align-items: center;
@@ -8460,10 +8478,6 @@ body.is-resizing-panes .pane-cell {
 
 .artifact-file-list-status {
   margin-left: auto;
-  color: var(--text-muted);
-  font-size: var(--fs-xs);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
 }
 
 .artifact-file-list-empty {

@@ -12,6 +12,7 @@ import { PlotArtifactDetail } from "./artifact-detail/plot";
 import { SvgArtifactDetail } from "./artifact-detail/svg";
 import { TableArtifactDetail } from "./artifact-detail/table";
 import { classifyArtifact } from "./artifact-kind";
+import { StatusBadge } from "./status-badge";
 import type { ArtifactViewState, PanelState } from "./transcript-store";
 
 function titleFor(event: SessionEvent | undefined, id: string) {
@@ -105,7 +106,14 @@ export function ArtifactPanel({
                 onClick={() => onFocusTab(artifactId)}
               >
                 <span>{titleFor(event, artifactId)}</span>
-                {event?.artifact?.kind ? <small>{event.artifact.kind}</small> : null}
+                {event?.artifact?.kind ? (
+                  <StatusBadge
+                    className="artifact-panel-tab-kind"
+                    compact
+                    label={event.artifact.kind}
+                    state="faint"
+                  />
+                ) : null}
               </button>
               <button aria-label={`Artifact menu for ${titleFor(event, artifactId)}`} className="artifact-panel-tab-action" type="button" onClick={() => setOpenMenu((current) => current === artifactId ? null : artifactId)}><MoreHorizontal size={12} /></button>
               {openMenu === artifactId ? (

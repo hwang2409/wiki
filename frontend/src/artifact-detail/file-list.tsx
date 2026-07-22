@@ -1,5 +1,6 @@
 import { FileJson } from "lucide-react";
 import type { ArtifactFileEntry, SessionArtifact } from "../api";
+import { StatusBadge, statusToTone } from "../status-badge";
 
 export function FileListArtifactDetail({
   artifact,
@@ -27,7 +28,12 @@ export function FileListArtifactDetail({
             <FileJson aria-hidden="true" className="artifact-file-list-icon" size={12} />
             <span className="artifact-file-list-label">{label}</span>
             {entry.status ? (
-              <span className="artifact-file-list-status">{entry.status}</span>
+              <StatusBadge
+                className="artifact-file-list-status"
+                compact
+                label={entry.status}
+                state={statusToTone(entry.status)}
+              />
             ) : null}
           </>
         );
