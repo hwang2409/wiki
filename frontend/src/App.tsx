@@ -3915,10 +3915,7 @@ export default function App() {
       ) : null}
       {paletteOpen ? (
         <CommandPalette
-          onClose={() => {
-            setPaletteOpen(false);
-            requestAnimationFrame(() => focusedPaneId && paneRefs.current.get(focusedPaneId)?.focus());
-          }}
+          onClose={() => setPaletteOpen(false)}
           onOpen={(result: PaletteResult) => {
             setPaletteOpen(false);
             const url = result.url;
@@ -3930,22 +3927,30 @@ export default function App() {
               openNote(url.slice("#/note/".length));
               return;
             }
+            // Artifact deep-link: URL carries `panel`/`artifact`/`tab`/`focus`
+            // search params + `#/agent/<ticket>` hash. Apply the search params
+            // via replaceState BEFORE mounting the surface so the mount effect
+            // reads them out of `window.location.search`. For a same-session
+            // hit, dispatch a synthetic popstate so the existing surface's
+            // popstate handler picks up the new URL.
+            const hasSearch = url.includes("?") && url.includes("panel=");
+            if (hasSearch) {
+              const parsed = new URL(url, window.location.origin);
+              const hashMatch = parsed.hash.match(/^#\/agent\/([^\/]+)/);
+              if (hashMatch) {
+                const ticket = decodeURIComponent(hashMatch[1]);
+                const target = new URL(window.location.href);
+                target.search = parsed.search;
+                target.hash = parsed.hash;
+                window.history.replaceState(null, "", target);
+                openSessionFromSwitcher(ticket);
+                window.dispatchEvent(new PopStateEvent("popstate"));
+                return;
+              }
+            }
             if (url.startsWith("#/agent/")) {
               const ticket = url.slice("#/agent/".length).replace(/\/.*$/, "");
               openSessionFromSwitcher(ticket);
-              const artifactId = result.artifact_id;
-              if (artifactId) {
-                // Agent surface listens for this and opens the panel with the
-                // requested artifact focused. Fires after openSessionFromSwitcher
-                // has scheduled the mount so the listener is attached in time.
-                requestAnimationFrame(() =>
-                  window.dispatchEvent(
-                    new CustomEvent("wiki:open-artifact", {
-                      detail: { ticket, artifactId },
-                    })
-                  )
-                );
-              }
               return;
             }
             if (url.startsWith("#/")) {

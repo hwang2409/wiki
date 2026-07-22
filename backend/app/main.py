@@ -1385,21 +1385,52 @@ def dashboard_tickets() -> dict[str, object]:
 
 
 @app.get("/api/palette/search")
-def palette_search(
+async def palette_search(
+    request: Request,
     q: str = "",
     limit: int = palette.DEFAULT_LIMIT,
 ) -> dict[str, object]:
     agents_payload = agents()
-    return {
-        "results": palette.search(
+
+    # Palette walk (session index + vault stat + artifact scan) runs in the
+    # threadpool. Concurrently, poll `is_disconnected()` from the event loop
+    # so the walk aborts if the client cancelled mid-scan.
+    cancelled = asyncio.Event()
+
+    async def watch_disconnect() -> None:
+        try:
+            while not cancelled.is_set():
+                if await request.is_disconnected():
+                    cancelled.set()
+                    return
+                await asyncio.sleep(0.1)
+        except asyncio.CancelledError:
+            return
+
+    def _run() -> list[dict[str, object]]:
+        return palette.search(
             q,
             limit,
             agents_payload=agents_payload,
             vault_dir=VAULT_DIR,
             runs_dir=SUPERVISOR_CLIENT.paths.runs_dir,
             archive_dir=AGENT_ARCHIVE_DIR,
+            should_cancel=cancelled.is_set,
         )
-    }
+
+    watcher = asyncio.create_task(watch_disconnect())
+    try:
+        results = await asyncio.to_thread(_run)
+    except palette.PaletteCancelled:
+        raise HTTPException(status_code=499, detail="client closed request")
+    finally:
+        cancelled.set()
+        watcher.cancel()
+        try:
+            await watcher
+        except asyncio.CancelledError:
+            pass
+    return {"results": results}
 
 
 @app.get("/api/agents/{ticket}/pr")

@@ -25,10 +25,15 @@ import math
 import os
 import re
 import threading
+from urllib.parse import quote
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
+
+
+class PaletteCancelled(Exception):
+    """Raised when a caller signalled cancellation mid-walk."""
 
 TICKET_ID_PATTERN = re.compile(r"\b([A-Z]{2,10})-(\d{1,6})\b")
 
@@ -551,7 +556,19 @@ def _make_artifact_item(
         subtitle_parts.append(caption[:60])
     subtitle = " · ".join(part for part in subtitle_parts if part)
     if ticket:
-        url = f"#/agent/{ticket}"
+        # Durable deep-link: agent-session-surface reads panel state
+        # from `panel`/`artifact`/`tab`/`focus` search params on mount +
+        # popstate. Emitting them here means a refresh (or paste of this
+        # URL into a new tab) reopens the same artifact tab focused.
+        encoded_ticket = quote(ticket, safe="")
+        encoded_artifact = quote(artifact_id, safe="")
+        params = (
+            f"panel={encoded_ticket}"
+            f"&artifact={encoded_artifact}"
+            f"&tab={encoded_artifact}"
+            f"&focus={encoded_artifact}"
+        )
+        url = f"?{params}#/agent/{encoded_ticket}"
     else:
         url = "#/agents"
     haystack = " ".join(
@@ -713,9 +730,14 @@ def _title_from_note(note_path: Path, content: str) -> tuple[str, str]:
     return title, first
 
 
-@dataclass
+@dataclass(frozen=True)
 class _NoteCacheEntry:
-    signature: tuple[int, int]
+    # Per-file signature (relative posix path -> st_mtime_ns). Editing a note
+    # updates only the file's mtime, not the vault directory's mtime, so a
+    # directory-level signature would stay stuck. Cheap-statting every .md on
+    # each request costs O(files) which is dwarfed by anything else the walk
+    # does.
+    signature: frozenset[tuple[str, int]]
     items: tuple[PaletteItem, ...] = ()
 
 
@@ -728,29 +750,33 @@ class _NoteCache:
 _note_cache = _NoteCache()
 
 
-def _vault_signature(vault_dir: Path) -> tuple[int, int]:
-    try:
-        stat = vault_dir.stat()
-    except OSError:
-        return (0, 0)
-    return (int(stat.st_mtime_ns), int(stat.st_size))
+def _check_cancelled(should_cancel: Callable[[], bool] | None) -> None:
+    if should_cancel is not None and should_cancel():
+        raise PaletteCancelled()
 
 
-def _walk_vault(vault_dir: Path) -> list[PaletteItem]:
+def _iter_vault_md(
+    vault_dir: Path,
+    should_cancel: Callable[[], bool] | None = None,
+) -> Iterable[tuple[Path, str]]:
+    """Yield (path, relative_posix) for every safe .md under the vault.
+
+    Rejects symlinks and paths that resolve outside the vault, and caps total
+    files at VAULT_MAX_FILES.
+    """
     resolved_vault = vault_dir.resolve(strict=False)
-    items: list[PaletteItem] = []
-    count = 0
     try:
         candidates = vault_dir.rglob("*.md")
     except OSError:
-        return items
+        return
+    count = 0
     for path in candidates:
         if count >= VAULT_MAX_FILES:
-            break
+            return
+        if count % 200 == 0:
+            _check_cancelled(should_cancel)
         try:
-            if path.is_symlink():
-                continue
-            if not path.is_file():
+            if path.is_symlink() or not path.is_file():
                 continue
         except OSError:
             continue
@@ -760,6 +786,35 @@ def _walk_vault(vault_dir: Path) -> list[PaletteItem]:
         except (OSError, ValueError):
             continue
         try:
+            relative = path.relative_to(vault_dir).as_posix()
+        except ValueError:
+            continue
+        yield path, relative
+        count += 1
+
+
+def _vault_signature(
+    vault_dir: Path,
+    should_cancel: Callable[[], bool] | None = None,
+) -> frozenset[tuple[str, int]]:
+    entries: list[tuple[str, int]] = []
+    for path, relative in _iter_vault_md(vault_dir, should_cancel):
+        try:
+            mtime_ns = int(path.stat().st_mtime_ns)
+        except OSError:
+            continue
+        entries.append((relative, mtime_ns))
+    return frozenset(entries)
+
+
+def _walk_vault(
+    vault_dir: Path,
+    should_cancel: Callable[[], bool] | None = None,
+) -> list[PaletteItem]:
+    items: list[PaletteItem] = []
+    for path, relative in _iter_vault_md(vault_dir, should_cancel):
+        _check_cancelled(should_cancel)
+        try:
             with path.open("rb") as handle:
                 raw = handle.read(VAULT_MAX_FILE_BYTES)
         except OSError:
@@ -767,10 +822,6 @@ def _walk_vault(vault_dir: Path) -> list[PaletteItem]:
         try:
             content = raw.decode("utf-8", errors="ignore")
         except UnicodeDecodeError:
-            continue
-        try:
-            relative = path.relative_to(vault_dir).as_posix()
-        except ValueError:
             continue
         title, first_para = _title_from_note(path, content)
         subtitle = first_para or relative
@@ -786,23 +837,29 @@ def _walk_vault(vault_dir: Path) -> list[PaletteItem]:
                 haystack=f"{title} {relative} {first_para}",
             )
         )
-        count += 1
     return items
 
 
-def collect_note_items(vault_dir: Path) -> list[PaletteItem]:
+def collect_note_items(
+    vault_dir: Path,
+    should_cancel: Callable[[], bool] | None = None,
+) -> list[PaletteItem]:
     if not vault_dir.is_dir() or vault_dir.is_symlink():
         return []
     key = str(vault_dir.resolve(strict=False))
-    signature = _vault_signature(vault_dir)
+    signature = _vault_signature(vault_dir, should_cancel)
     with _note_cache.lock:
         cached = _note_cache.entries.get(key)
         if cached is not None and cached.signature == signature:
             return list(cached.items)
-    items = _walk_vault(vault_dir)
+    # Build fresh outside the lock so concurrent readers can keep hitting the
+    # old cache. Publish atomically once complete — never expose a
+    # half-populated view.
+    fresh_items = _walk_vault(vault_dir, should_cancel)
+    fresh_entry = _NoteCacheEntry(signature=signature, items=tuple(fresh_items))
     with _note_cache.lock:
-        _note_cache.entries[key] = _NoteCacheEntry(signature=signature, items=tuple(items))
-    return items
+        _note_cache.entries[key] = fresh_entry
+    return list(fresh_entry.items)
 
 
 def collect_all_items(
@@ -811,8 +868,10 @@ def collect_all_items(
     vault_dir: Path,
     runs_dir: Path,
     archive_dir: Path,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> list[PaletteItem]:
     session_items = collect_session_items(agents_payload)
+    _check_cancelled(should_cancel)
     session_ids = {item.id for item in session_items}
     ticket_by_run: dict[str, str] = {}
     workers = agents_payload.get("workers")
@@ -824,12 +883,12 @@ def collect_all_items(
             ticket = worker.get("ticket")
             if isinstance(run_id, str) and isinstance(ticket, str):
                 ticket_by_run[run_id] = ticket
-    return (
-        session_items
-        + collect_ticket_items(vault_dir, session_ids)
-        + collect_artifact_items(runs_dir, archive_dir, ticket_by_run=ticket_by_run)
-        + collect_note_items(vault_dir)
-    )
+    ticket_items = collect_ticket_items(vault_dir, session_ids)
+    _check_cancelled(should_cancel)
+    artifact_items = collect_artifact_items(runs_dir, archive_dir, ticket_by_run=ticket_by_run)
+    _check_cancelled(should_cancel)
+    note_items = collect_note_items(vault_dir, should_cancel)
+    return session_items + ticket_items + artifact_items + note_items
 
 
 def search(
@@ -840,6 +899,7 @@ def search(
     vault_dir: Path,
     runs_dir: Path,
     archive_dir: Path,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> list[dict[str, Any]]:
     limit = max(1, min(limit, MAX_LIMIT))
     if len(query) > DEFAULT_QUERY_MAX:
@@ -849,5 +909,7 @@ def search(
         vault_dir=vault_dir,
         runs_dir=runs_dir,
         archive_dir=archive_dir,
+        should_cancel=should_cancel,
     )
+    _check_cancelled(should_cancel)
     return rank(items, query, limit)

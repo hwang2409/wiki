@@ -312,7 +312,12 @@ class PaletteSearchTests(unittest.TestCase):
             top = next(row for row in artifact_rows if row["id"] == artifact_id)
             self.assertEqual(top["artifact_id"], artifact_id)
             self.assertEqual(top["ticket"], "WIKI-99")
-            self.assertEqual(top["url"], "#/agent/WIKI-99")
+            url = top["url"]
+            self.assertTrue(url.endswith("#/agent/WIKI-99"), url)
+            self.assertIn(f"panel=WIKI-99", url)
+            self.assertIn(f"artifact={artifact_id}", url)
+            self.assertIn(f"focus={artifact_id}", url)
+            self.assertIn(f"tab={artifact_id}", url)
 
     def test_artifact_kinds_all_indexed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -369,9 +374,9 @@ class PaletteSearchTests(unittest.TestCase):
             counter = {"calls": 0}
             real_walk = palette._walk_vault
 
-            def counting_walk(vault_dir: Path) -> list:
+            def counting_walk(vault_dir: Path, should_cancel=None) -> list:
                 counter["calls"] += 1
-                return real_walk(vault_dir)
+                return real_walk(vault_dir, should_cancel)
 
             palette._walk_vault = counting_walk  # type: ignore[assignment]
             try:
@@ -381,6 +386,61 @@ class PaletteSearchTests(unittest.TestCase):
                 self.assertEqual(counter["calls"], 1)
             finally:
                 palette._walk_vault = real_walk  # type: ignore[assignment]
+
+    def test_note_cache_invalidates_on_file_edit(self):
+        # Editing an existing note updates only its mtime, not the vault dir
+        # mtime. A directory-signature-only cache would go stale forever.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            vault = _make_vault(root)
+            hot = vault / "hot.md"
+            first = palette.search(
+                "unique-marker-alpha",
+                5,
+                agents_payload=_agents_payload(),
+                vault_dir=vault,
+                runs_dir=root / "no-runs",
+                archive_dir=root / "no-archive",
+            )
+            self.assertFalse(any("unique-marker-alpha" in row.get("subtitle", "") for row in first))
+
+            hot.write_text(
+                "---\ntype: reference\n---\n\n# Hot Context\n\nunique-marker-alpha rolling cache of active threads.\n",
+                encoding="utf-8",
+            )
+            # Bump mtime deterministically so the test doesn't race
+            # sub-nanosecond filesystem resolution on fast machines.
+            future = hot.stat().st_mtime + 5
+            os.utime(hot, (future, future))
+
+            second = palette.search(
+                "unique-marker-alpha",
+                5,
+                agents_payload=_agents_payload(),
+                vault_dir=vault,
+                runs_dir=root / "no-runs",
+                archive_dir=root / "no-archive",
+            )
+            self.assertTrue(
+                any("unique-marker-alpha" in row.get("subtitle", "") for row in second),
+                f"expected refreshed note in {second}",
+            )
+
+    def test_should_cancel_aborts_walk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            vault = _make_vault(root)
+            palette._note_cache.entries.clear()
+            with self.assertRaises(palette.PaletteCancelled):
+                palette.search(
+                    "hot",
+                    5,
+                    agents_payload=_agents_payload(),
+                    vault_dir=vault,
+                    runs_dir=root / "no-runs",
+                    archive_dir=root / "no-archive",
+                    should_cancel=lambda: True,
+                )
 
     def test_result_payload_shape(self):
         with tempfile.TemporaryDirectory() as tmp:

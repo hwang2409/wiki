@@ -234,16 +234,46 @@ async function main() {
 
     // 8. Cmd-K opens palette even while focus is inside a text input.
     //    Focus the pane's message composer / any input, then trigger Meta+K.
-    await page.evaluate(() => {
+    const composerHandle = await page.evaluateHandle(() => {
       const first = document.querySelector("textarea, input[type='text']");
       if (first && typeof first.focus === "function") first.focus();
+      return first;
     });
     await page.keyboard.press("Meta+k");
     await dialog.waitFor({ timeout: 5000 });
     await page.keyboard.press("Escape");
     await page.waitForSelector('[role="dialog"][aria-label="Command palette"]', { state: "detached" });
 
-    console.error("[wiki-146-palette] palette open/type/enter/close/trap/inert/linear/composer passed");
+    // 9. Focus restore: after Escape closes the palette, the invoker (the
+    //    composer we focused above) still has focus. Guards against a parent
+    //    onClose handler overwriting CommandPalette's invoker restore.
+    const composerRetainsFocus = await page.evaluate((expected) => {
+      return expected && document.activeElement === expected;
+    }, composerHandle);
+    assert.ok(composerRetainsFocus, "composer should still have focus after palette closes");
+
+    // 10. Durable artifact URL: the panel/artifact/tab/focus convention is
+    //     what session surfaces read on mount + popstate. Loading a URL that
+    //     carries those params should reopen the artifact panel even after a
+    //     full page reload.
+    const ticketParam = encodeURIComponent(WORKER);
+    const artifactParam = encodeURIComponent("11111111-2222-4333-8444-555555555555");
+    const deepLink =
+      `${backend.baseUrl}/?panel=${ticketParam}` +
+      `&artifact=${artifactParam}` +
+      `&tab=${artifactParam}` +
+      `&focus=${artifactParam}` +
+      `#/agent/${ticketParam}`;
+    await page.goto(deepLink, { waitUntil: "domcontentloaded" });
+    await page.waitForSelector("aside.artifact-panel", { timeout: 5000 });
+    const focused = await page.getAttribute("aside.artifact-panel", "data-focused-artifact");
+    assert.equal(
+      decodeURIComponent(focused ?? ""),
+      "11111111-2222-4333-8444-555555555555",
+      `artifact panel should focus the deep-linked artifact (got ${focused})`,
+    );
+
+    console.error("[wiki-146-palette] palette open/type/enter/close/trap/inert/linear/composer/restore/durable passed");
   } finally {
     await page.close();
     await browser.close();

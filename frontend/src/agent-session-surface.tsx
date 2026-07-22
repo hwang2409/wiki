@@ -416,37 +416,11 @@ export function AgentSessionSurface({
     return () => window.removeEventListener("keydown", onShortcut);
   }, [closeArtifactTab, commitPanelState, panelState.focusedTab, panelState.open, panelState.tabs]);
 
-  const pendingDeepLinkRef = useRef<string | null>(null);
-  const artifactsRef = useRef(artifacts);
-  artifactsRef.current = artifacts;
-
   const handleArtifactsChange = useCallback((events: SessionEvent[]) => {
-    const next = new Map(
-      events.flatMap((event) => (event.artifact_id ? [[event.artifact_id, event] as const] : []))
+    setArtifacts(
+      new Map(events.flatMap((event) => (event.artifact_id ? [[event.artifact_id, event] as const] : [])))
     );
-    setArtifacts(next);
-    const pending = pendingDeepLinkRef.current;
-    if (pending && next.has(pending)) {
-      pendingDeepLinkRef.current = null;
-      reopenArtifact(pending);
-    }
-  }, [reopenArtifact]);
-
-  useEffect(() => {
-    function onOpen(event: Event) {
-      const detail = (event as CustomEvent<{ ticket?: string; artifactId?: string }>).detail;
-      if (!detail?.ticket || detail.ticket !== worker.ticket) return;
-      const artifactId = detail.artifactId;
-      if (!artifactId) return;
-      if (artifactsRef.current.has(artifactId)) {
-        reopenArtifact(artifactId);
-      } else {
-        pendingDeepLinkRef.current = artifactId;
-      }
-    }
-    window.addEventListener("wiki:open-artifact", onOpen as EventListener);
-    return () => window.removeEventListener("wiki:open-artifact", onOpen as EventListener);
-  }, [reopenArtifact, worker.ticket]);
+  }, []);
 
   const resizePanel = (event: ReactPointerEvent<HTMLDivElement>) => {
     event.preventDefault();
