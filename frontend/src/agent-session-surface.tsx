@@ -417,7 +417,9 @@ export function AgentSessionSurface({
   }, [closeArtifactTab, commitPanelState, panelState.focusedTab, panelState.open, panelState.tabs]);
 
   const handleArtifactsChange = useCallback((events: SessionEvent[]) => {
-    setArtifacts(new Map(events.flatMap((event) => event.artifact_id ? [[event.artifact_id, event] as const] : [])));
+    setArtifacts(
+      new Map(events.flatMap((event) => (event.artifact_id ? [[event.artifact_id, event] as const] : [])))
+    );
   }, []);
 
   const resizePanel = (event: ReactPointerEvent<HTMLDivElement>) => {

@@ -108,10 +108,10 @@ function windowById(layout, id) {
 }
 
 async function openSwitcher(page, query) {
-  await page.keyboard.press("Meta+k");
+  await page.keyboard.press("Meta+p");
   const dialog = page.getByRole("dialog", { name: "Quick switcher" });
   await dialog.waitFor();
-  const input = dialog.getByPlaceholder("Find a note or session...");
+  const input = dialog.getByPlaceholder("Find a note, file, or session...");
   await input.fill(query);
   return dialog;
 }
@@ -226,7 +226,7 @@ async function main() {
     await orchPalette.getByText("Sessions", { exact: true }).waitFor();
     await orchPalette.getByText(ORCHESTRATOR, { exact: true }).waitFor();
     await orchPalette.getByText("orchestrator", { exact: true }).waitFor();
-    await orchPalette.getByPlaceholder("Find a note or session...").press("Enter");
+    await orchPalette.getByPlaceholder("Find a note, file, or session...").press("Enter");
     let layout = await waitForLayout(
       page,
       (current) => current.activeWindowId === "window-orchestrator",
@@ -238,7 +238,7 @@ async function main() {
 
     const workerPalette = await openSwitcher(page, "WIKI-109");
     await workerPalette.getByText(WORKER, { exact: true }).waitFor();
-    await workerPalette.getByPlaceholder("Find a note or session...").press("Enter");
+    await workerPalette.getByPlaceholder("Find a note, file, or session...").press("Enter");
     layout = await waitForLayout(
       page,
       (current) => current.activeWindowId === "window-source",
@@ -266,7 +266,7 @@ async function main() {
     assert.ok(blankPane, "blank pane placeholder was not persisted");
     await page.getByText("New pane", { exact: true }).waitFor();
 
-    await page.keyboard.press("Meta+k");
+    await page.keyboard.press("Meta+p");
     await page.keyboard.press("Escape");
     layout = await waitForLayout(
       page,
@@ -278,7 +278,7 @@ async function main() {
     const movePalette = await openSwitcher(page, "WIKI-109");
     await movePalette.getByText(WORKER, { exact: true }).waitFor();
     await movePalette.screenshot({ path: path.join(OUT_DIR, "palette-session-results.png") });
-    const moveInput = movePalette.getByPlaceholder("Find a note or session...");
+    const moveInput = movePalette.getByPlaceholder("Find a note, file, or session...");
     await moveInput.focus();
     await moveInput.press("Enter");
     layout = await waitForLayout(

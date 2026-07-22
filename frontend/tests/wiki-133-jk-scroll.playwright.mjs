@@ -234,7 +234,7 @@ async function main() {
 
     await page.locator(".pane-frame.is-focused").focus();
     await page.waitForFunction(() => document.activeElement?.classList.contains("pane-frame"));
-    await page.keyboard.press("Meta+k");
+    await page.keyboard.press("Meta+p");
     const switcherInput = page.getByPlaceholder("Find a note, file, or session...");
     await switcherInput.waitFor({ state: "visible" });
     await assertTextEntryDoesNotScroll(page, scroller, switcherInput, "command palette");

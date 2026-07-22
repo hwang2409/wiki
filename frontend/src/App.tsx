@@ -107,6 +107,8 @@ import {
   toggleThemePolarity,
   type ThemeId
 } from "./themes";
+import { CommandPalette } from "./command-palette";
+import type { PaletteResult } from "./api";
 import type { Note, NoteDraft, NoteSummary } from "./types";
 
 type Mode =
@@ -1275,6 +1277,7 @@ export default function App() {
     readStoredRecentResources
   );
   const [switcherOpen, setSwitcherOpen] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
   const [sidebarVisible, setSidebarVisible] = useState(
     () => localStorage.getItem("wiki-sidebar-visible") !== "false"
   );
@@ -1731,7 +1734,12 @@ export default function App() {
   );
   const activeAgentWorker = agentTicket ? agentWorkers.get(agentTicket) ?? { ticket: agentTicket } : null;
   const modalOpen =
-    switcherOpen || settingsOpen || windowChooserOpen || dialog !== null || contextMenu !== null;
+    switcherOpen ||
+    paletteOpen ||
+    settingsOpen ||
+    windowChooserOpen ||
+    dialog !== null ||
+    contextMenu !== null;
   const windowChooserItems = useMemo(() => {
     const agentLocations = new Map<string, { windowId: string; paneId: string }>();
     for (const window of windowState.windows) {
@@ -2988,6 +2996,18 @@ export default function App() {
       const key = event.key;
       const lowerKey = key.toLowerCase();
 
+      const commandModifier = event.metaKey || event.ctrlKey;
+
+      // Meta/Ctrl-K opens the palette from ANYWHERE (composer, editor,
+      // terminal). The text-entry guard below still blocks unmodified
+      // shortcuts like `j`/`k`/`b` while typing.
+      if (commandModifier && !event.altKey && !event.shiftKey && lowerKey === "k") {
+        event.preventDefault();
+        event.stopPropagation();
+        if (!modalOpen) setPaletteOpen((open) => !open);
+        return;
+      }
+
       if (modalOpen || isTextEntryEvent(event)) return;
       if (
         document.activeElement instanceof HTMLTextAreaElement &&
@@ -2996,7 +3016,7 @@ export default function App() {
         return;
       }
 
-      if ((event.metaKey || event.ctrlKey) && lowerKey === "k") {
+      if (commandModifier && lowerKey === "p") {
         event.preventDefault();
         setSwitcherOpen((open) => !open);
       } else if ((event.metaKey || event.ctrlKey) && lowerKey === "b") {
@@ -3007,8 +3027,24 @@ export default function App() {
       }
     }
 
+    // Capture-phase Meta/Ctrl-K so terminals + editors + composers can't
+    // intercept the palette shortcut before we see it.
+    function onPaletteCapture(event: globalThis.KeyboardEvent) {
+      if (event.defaultPrevented) return;
+      if (!(event.metaKey || event.ctrlKey)) return;
+      if (event.altKey || event.shiftKey) return;
+      if (event.key.toLowerCase() !== "k") return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (!modalOpen) setPaletteOpen((open) => !open);
+    }
+
+    window.addEventListener("keydown", onPaletteCapture, true);
     window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onPaletteCapture, true);
+      window.removeEventListener("keydown", onKeyDown);
+    };
   }, [
     modalOpen,
     handlePaneScopeKey,
@@ -3876,6 +3912,52 @@ export default function App() {
 
       {settingsOpen ? (
         <SettingsModal theme={theme} onClose={() => setSettingsOpen(false)} onThemeChange={setTheme} />
+      ) : null}
+      {paletteOpen ? (
+        <CommandPalette
+          onClose={() => setPaletteOpen(false)}
+          onOpen={(result: PaletteResult) => {
+            setPaletteOpen(false);
+            const url = result.url;
+            if (/^https?:\/\//.test(url)) {
+              window.open(url, "_blank", "noopener,noreferrer");
+              return;
+            }
+            if (url.startsWith("#/note/")) {
+              openNote(url.slice("#/note/".length));
+              return;
+            }
+            // Artifact deep-link: URL carries `panel`/`artifact`/`tab`/`focus`
+            // search params + `#/agent/<ticket>` hash. Apply the search params
+            // via replaceState BEFORE mounting the surface so the mount effect
+            // reads them out of `window.location.search`. For a same-session
+            // hit, dispatch a synthetic popstate so the existing surface's
+            // popstate handler picks up the new URL.
+            const hasSearch = url.includes("?") && url.includes("panel=");
+            if (hasSearch) {
+              const parsed = new URL(url, window.location.origin);
+              const hashMatch = parsed.hash.match(/^#\/agent\/([^\/]+)/);
+              if (hashMatch) {
+                const ticket = decodeURIComponent(hashMatch[1]);
+                const target = new URL(window.location.href);
+                target.search = parsed.search;
+                target.hash = parsed.hash;
+                window.history.replaceState(null, "", target);
+                openSessionFromSwitcher(ticket);
+                window.dispatchEvent(new PopStateEvent("popstate"));
+                return;
+              }
+            }
+            if (url.startsWith("#/agent/")) {
+              const ticket = url.slice("#/agent/".length).replace(/\/.*$/, "");
+              openSessionFromSwitcher(ticket);
+              return;
+            }
+            if (url.startsWith("#/")) {
+              window.location.hash = url.slice(1);
+            }
+          }}
+        />
       ) : null}
       {switcherOpen ? (
         <QuickSwitcher
