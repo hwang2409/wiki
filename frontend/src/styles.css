@@ -8559,7 +8559,58 @@ body.is-resizing-panes .pane-cell {
   pointer-events: auto;
 }
 
+@media (hover: none) {
+  .markdown-code-copy {
+    opacity: 1;
+    transform: translateY(0);
+    pointer-events: auto;
+  }
+}
+
 /* WIKI-149 — diff artifact renderer */
+
+.artifact-detail-diff {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.artifact-detail-diff-scroll {
+  flex: 1;
+  min-height: 0;
+  padding: 12px;
+  overflow: auto;
+}
+
+.diff-file-kind {
+  margin-left: auto;
+  padding: 1px 6px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-xs);
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: calc(var(--font-ui-smaller) - 1px);
+  letter-spacing: 0.02em;
+  text-transform: lowercase;
+  white-space: nowrap;
+}
+
+.diff-file-meta {
+  padding: 6px 12px;
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--font-ui-smaller);
+  font-style: italic;
+  line-height: 1.55;
+}
+
+.diff-file-meta-line + .diff-file-meta-line {
+  margin-top: 2px;
+}
 
 .diff-view {
   overflow: hidden;

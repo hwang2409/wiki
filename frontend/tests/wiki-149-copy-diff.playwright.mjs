@@ -39,6 +39,31 @@ const DIFF_SOURCE = [
   " export const enabled = true;",
 ].join("\n");
 
+function buildLongDiff() {
+  const contextCount = 40;
+  const addCount = 40;
+  const removeCount = 20;
+  const lines = [
+    "diff --git a/frontend/src/long.txt b/frontend/src/long.txt",
+    "index abcdef1..abcdef2 100644",
+    "--- a/frontend/src/long.txt",
+    "+++ b/frontend/src/long.txt",
+    `@@ -1,${contextCount + removeCount} +1,${contextCount + addCount} @@`,
+  ];
+  for (let i = 0; i < contextCount; i += 1) lines.push(` context line ${i + 1}`);
+  for (let i = 0; i < removeCount; i += 1) lines.push(`-remove line ${i + 1}`);
+  for (let i = 0; i < addCount; i += 1) lines.push(`+add line ${i + 1}`);
+  return lines.join("\n");
+}
+
+const LONG_DIFF_SOURCE = buildLongDiff();
+
+const BINARY_DIFF_SOURCE = [
+  "diff --git a/assets/logo.png b/assets/logo.png",
+  "index 3333333..4444444 100644",
+  "Binary files a/assets/logo.png and b/assets/logo.png differ",
+].join("\n");
+
 function invokeFixtureWorker(fixtures, inputs) {
   const requests = [
     {
@@ -172,6 +197,8 @@ try {
 
   const inputs = [
     { kind: "diff", title: "WIKI-149 diff", payload: { source: DIFF_SOURCE } },
+    { kind: "diff", title: "WIKI-149 long diff", payload: { source: LONG_DIFF_SOURCE } },
+    { kind: "diff", title: "WIKI-149 binary diff", payload: { source: BINARY_DIFF_SOURCE } },
   ];
   const results = invokeFixtureWorker(fixtures, inputs);
   const transcript = await writeTranscript(fixtures, inputs, results);
@@ -301,8 +328,135 @@ try {
 
   await diffBlock.screenshot({ path: path.join(OUT_DIR, "wiki-149-diff.png") });
 
+  // --- Artifact panel: line-number toggle + vertical scroll for long diff ---
+  const longDiffId = results[1].artifactId;
+  const binaryDiffId = results[2].artifactId;
+  async function openPanel(page, tabs, focus) {
+    await page.evaluate(({ ticket, tabs, focus }) => {
+      const url = new URL(window.location.href);
+      url.searchParams.set("panel", ticket);
+      url.searchParams.set("artifact", focus);
+      url.searchParams.set("tab", tabs.join(","));
+      url.searchParams.set("focus", focus);
+      history.pushState(null, "", url);
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    }, { ticket: TICKET, tabs, focus });
+  }
+
+  await openPanel(sessionPage, [longDiffId], longDiffId);
+  const artifactPanel = sessionPage.getByRole("complementary", { name: "Artifact panel" });
+  await artifactPanel.waitFor({ state: "visible" });
+  const panelDiff = artifactPanel.locator(".artifact-detail-diff");
+  await panelDiff.waitFor({ state: "visible" });
+  const scrollContainer = panelDiff.locator(".artifact-detail-diff-scroll");
+  await scrollContainer.waitFor({ state: "visible" });
+
+  const scrollGeometry = await scrollContainer.evaluate((node) => ({
+    scrollHeight: node.scrollHeight,
+    clientHeight: node.clientHeight,
+    computedOverflowY: getComputedStyle(node).overflowY,
+  }));
+  assert(
+    scrollGeometry.scrollHeight > scrollGeometry.clientHeight + 40,
+    `long diff should overflow scroll container, geometry=${JSON.stringify(scrollGeometry)}`,
+  );
+  assert(
+    /auto|scroll/.test(scrollGeometry.computedOverflowY),
+    `scroll container should be scrollable, got overflow-y=${scrollGeometry.computedOverflowY}`,
+  );
+
+  await scrollContainer.evaluate((node) => { node.scrollTop = node.scrollHeight; });
+  const scrolled = await scrollContainer.evaluate((node) => ({
+    scrollTop: node.scrollTop,
+    max: node.scrollHeight - node.clientHeight,
+  }));
+  assert(
+    scrolled.scrollTop > 0 && Math.abs(scrolled.scrollTop - scrolled.max) < 4,
+    `scrollTop should reach end of long diff, got ${JSON.stringify(scrolled)}`,
+  );
+
+  const initialGutter = await panelDiff.locator(".diff-gutter").count();
+  assert(initialGutter === 0, `line-number gutter should be off by default in panel, got ${initialGutter}`);
+
+  const toggleButton = artifactPanel.locator("[data-diff-line-numbers-toggle]");
+  await toggleButton.waitFor({ state: "visible" });
+  assert(
+    (await toggleButton.getAttribute("aria-pressed")) === "false",
+    "line-number toggle should start aria-pressed=false",
+  );
+  await toggleButton.click();
+  await sessionPage.waitForFunction(() => {
+    const gutters = document.querySelectorAll(".artifact-detail-diff .diff-gutter");
+    return gutters.length > 0;
+  }, null, { timeout: 2000 });
+  const enabledGutter = await panelDiff.locator(".diff-gutter").count();
+  assert(enabledGutter > 0, `toggling line numbers on should render gutter cells, got ${enabledGutter}`);
+  assert(
+    (await toggleButton.getAttribute("aria-pressed")) === "true",
+    "line-number toggle should flip aria-pressed to true after click",
+  );
+
+  await openPanel(sessionPage, [binaryDiffId], binaryDiffId);
+  await sessionPage.waitForFunction((id) => {
+    const kind = document
+      .querySelector(".artifact-panel-detail")
+      ?.getAttribute("data-artifact-detail-kind");
+    return kind === "diff" && !!document.querySelector('.diff-file[data-file-kind="binary"]');
+  }, binaryDiffId, { timeout: 4000 });
+  const binaryFile = artifactPanel.locator('.diff-file[data-file-kind="binary"]');
+  const binaryKindLabel = (await binaryFile.locator(".diff-file-kind").textContent())?.trim();
+  assert(binaryKindLabel === "binary", `binary artifact should show kind label, got ${binaryKindLabel}`);
+  const binaryPath = (await binaryFile.locator(".diff-file-path").textContent())?.trim();
+  assert(binaryPath === "assets/logo.png", `binary artifact should show path, got ${binaryPath}`);
+  const binaryMeta = (await binaryFile.locator(".diff-file-meta-line").first().textContent())?.trim();
+  assert(
+    binaryMeta?.startsWith("Binary files "),
+    `binary artifact should render Binary-files meta line, got ${binaryMeta}`,
+  );
+  const binaryEmpty = await artifactPanel.locator(".diff-view-empty").count();
+  assert(binaryEmpty === 0, `binary artifact must not fall back to 'No diff', got ${binaryEmpty} empty nodes`);
+
   await notePage.close();
   await sessionPage.close();
+
+  // --- Copy button reachable on touch-only viewport (hover: none) ---
+  const touchContext = await browser.newContext({
+    viewport: { width: 900, height: 1200 },
+    hasTouch: true,
+    isMobile: true,
+    deviceScaleFactor: 2,
+  });
+  const touchPage = await touchContext.newPage();
+  await touchPage.addInitScript(({ layout }) => {
+    localStorage.setItem("wiki-window-layout-v2", JSON.stringify(layout));
+    localStorage.setItem("wiki-sidebar-visible", "false");
+  }, { layout: noteLayout("sample.md") });
+  await touchPage.goto(`${backend.baseUrl}/#/note/sample.md`, { waitUntil: "domcontentloaded" });
+
+  await touchPage.waitForFunction(() => {
+    return !!document.querySelector(".markdown-code-block-wrap .copy-pill");
+  }, null, { timeout: 8000 });
+
+  const hoverNoneMatches = await touchPage.evaluate(() => window.matchMedia("(hover: none)").matches);
+  assert(hoverNoneMatches, "touch context should report (hover: none) matches=true");
+
+  const touchStyle = await touchPage.evaluate(() => {
+    const node = document.querySelector(".markdown-code-block-wrap .copy-pill");
+    if (!node) return null;
+    const style = getComputedStyle(node);
+    return { opacity: parseFloat(style.opacity), pointerEvents: style.pointerEvents };
+  });
+  assert(touchStyle, "expected a .copy-pill element under touch viewport");
+  assert(
+    touchStyle.opacity > 0.9,
+    `copy pill should be visible under (hover: none), opacity=${touchStyle.opacity}`,
+  );
+  assert(
+    touchStyle.pointerEvents !== "none",
+    `copy pill should be interactive under (hover: none), pointer-events=${touchStyle.pointerEvents}`,
+  );
+
+  await touchContext.close();
 } finally {
   if (browser) await browser.close();
   if (backend) await backend.stop();
