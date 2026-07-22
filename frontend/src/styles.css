@@ -2095,6 +2095,60 @@ body.is-resizing-panes .pane-cell {
   font-size: var(--font-ui-small);
 }
 
+.command-palette-backdrop {
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+}
+
+.command-palette {
+  width: min(620px, calc(100vw - 32px));
+  top: 12vh;
+  max-height: 66vh;
+}
+
+.command-palette input {
+  padding: 14px 16px;
+  font-size: var(--font-text-size);
+}
+
+.command-palette-result {
+  display: grid;
+  grid-template-columns: 16px minmax(0, auto) minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: 10px;
+  padding: 8px 12px;
+}
+
+.command-palette-name {
+  color: var(--text-normal);
+  font-weight: var(--fw-medium);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.command-palette-subtitle {
+  color: var(--text-faint);
+  font-size: var(--font-ui-smaller);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.command-palette-time {
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  min-width: 32px;
+}
+
+.command-palette-group + .command-palette-group {
+  margin-top: 8px;
+  padding-top: 6px;
+}
+
 .fleet-switcher {
   max-height: 68vh;
 }

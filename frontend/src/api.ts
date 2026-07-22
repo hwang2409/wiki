@@ -44,6 +44,25 @@ export function searchNotes(query: string) {
   return request<NoteSummary[]>(`/api/notes?q=${encodeURIComponent(query)}`);
 }
 
+export type PaletteResultKind = "session" | "ticket" | "artifact" | "note";
+
+export type PaletteResult = {
+  kind: PaletteResultKind;
+  id: string;
+  title: string;
+  subtitle: string;
+  url: string;
+  updated_at: string | null;
+  score: number;
+};
+
+export function searchPalette(query: string, limit = 30, signal?: AbortSignal) {
+  const params = new URLSearchParams({ q: query, limit: String(limit) });
+  return request<{ results: PaletteResult[] }>(`/api/palette/search?${params}`, {
+    signal,
+  });
+}
+
 export type FileSummary = {
   path: string;
   size: number;

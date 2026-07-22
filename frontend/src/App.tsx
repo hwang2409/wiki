@@ -107,6 +107,8 @@ import {
   toggleThemePolarity,
   type ThemeId
 } from "./themes";
+import { CommandPalette } from "./command-palette";
+import type { PaletteResult } from "./api";
 import type { Note, NoteDraft, NoteSummary } from "./types";
 
 type Mode =
@@ -1275,6 +1277,7 @@ export default function App() {
     readStoredRecentResources
   );
   const [switcherOpen, setSwitcherOpen] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
   const [sidebarVisible, setSidebarVisible] = useState(
     () => localStorage.getItem("wiki-sidebar-visible") !== "false"
   );
@@ -1731,7 +1734,12 @@ export default function App() {
   );
   const activeAgentWorker = agentTicket ? agentWorkers.get(agentTicket) ?? { ticket: agentTicket } : null;
   const modalOpen =
-    switcherOpen || settingsOpen || windowChooserOpen || dialog !== null || contextMenu !== null;
+    switcherOpen ||
+    paletteOpen ||
+    settingsOpen ||
+    windowChooserOpen ||
+    dialog !== null ||
+    contextMenu !== null;
   const windowChooserItems = useMemo(() => {
     const agentLocations = new Map<string, { windowId: string; paneId: string }>();
     for (const window of windowState.windows) {
@@ -2998,6 +3006,9 @@ export default function App() {
 
       if ((event.metaKey || event.ctrlKey) && lowerKey === "k") {
         event.preventDefault();
+        setPaletteOpen((open) => !open);
+      } else if ((event.metaKey || event.ctrlKey) && lowerKey === "p") {
+        event.preventDefault();
         setSwitcherOpen((open) => !open);
       } else if ((event.metaKey || event.ctrlKey) && lowerKey === "b") {
         event.preventDefault();
@@ -3876,6 +3887,34 @@ export default function App() {
 
       {settingsOpen ? (
         <SettingsModal theme={theme} onClose={() => setSettingsOpen(false)} onThemeChange={setTheme} />
+      ) : null}
+      {paletteOpen ? (
+        <CommandPalette
+          onClose={() => {
+            setPaletteOpen(false);
+            requestAnimationFrame(() => focusedPaneId && paneRefs.current.get(focusedPaneId)?.focus());
+          }}
+          onOpen={(result: PaletteResult) => {
+            setPaletteOpen(false);
+            const url = result.url;
+            if (/^https?:\/\//.test(url)) {
+              window.open(url, "_blank", "noopener,noreferrer");
+              return;
+            }
+            if (url.startsWith("#/note/")) {
+              openNote(url.slice("#/note/".length));
+              return;
+            }
+            if (url.startsWith("#/agent/")) {
+              const ticket = url.slice("#/agent/".length).replace(/\/.*$/, "");
+              openSessionFromSwitcher(ticket);
+              return;
+            }
+            if (url.startsWith("#/")) {
+              window.location.hash = url.slice(1);
+            }
+          }}
+        />
       ) : null}
       {switcherOpen ? (
         <QuickSwitcher

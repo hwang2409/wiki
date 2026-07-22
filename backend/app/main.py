@@ -28,6 +28,7 @@ from . import (
     github_pr,
     github_preview,
     knowledge,
+    palette,
     provider_health,
     terminal,
     tokens,
@@ -1381,6 +1382,24 @@ def dashboard_tickets() -> dict[str, object]:
     return dashboard.build_payload(
         registry, statuses, list_archived(limit=None, latest_per_ticket=True)
     )
+
+
+@app.get("/api/palette/search")
+def palette_search(
+    q: str = "",
+    limit: int = palette.DEFAULT_LIMIT,
+) -> dict[str, object]:
+    agents_payload = agents()
+    return {
+        "results": palette.search(
+            q,
+            limit,
+            agents_payload=agents_payload,
+            vault_dir=VAULT_DIR,
+            runs_dir=SUPERVISOR_CLIENT.paths.runs_dir,
+            archive_dir=AGENT_ARCHIVE_DIR,
+        )
+    }
 
 
 @app.get("/api/agents/{ticket}/pr")
