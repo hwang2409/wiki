@@ -186,7 +186,64 @@ async function main() {
     await reopenedInput.press("Enter");
     await page.waitForSelector('[role="dialog"][aria-label="Command palette"]', { state: "detached" });
 
-    console.error("[wiki-146-palette] palette open/type/enter/close passed");
+    // 5. Focus trap: Tab loops within the dialog; Esc closes even from a
+    //    focused result button (dialog-scope key handler).
+    await page.keyboard.press("Meta+k");
+    await dialog.waitFor();
+    const trappedInput = page.getByPlaceholder("Search sessions, tickets, artifacts, notes…");
+    await trappedInput.waitFor();
+    await trappedInput.fill("WIKI-146");
+    await dialog.getByRole("option").first().waitFor();
+    // Move focus onto a result button then press Escape from there.
+    await dialog.getByRole("option").first().focus();
+    const focusedInsideDialog = await page.evaluate(() => {
+      const dialog = document.querySelector('[role="dialog"][aria-label="Command palette"]');
+      return dialog?.contains(document.activeElement) ?? false;
+    });
+    assert.ok(focusedInsideDialog, "focus should remain inside the palette dialog");
+    await page.keyboard.press("Escape");
+    await page.waitForSelector('[role="dialog"][aria-label="Command palette"]', { state: "detached" });
+
+    // 6. Background is marked inert while the palette is open.
+    await page.keyboard.press("Meta+k");
+    await dialog.waitFor();
+    const inertCount = await page.evaluate(() => {
+      const bodyChildren = Array.from(document.body.children);
+      return bodyChildren.filter((el) => el.hasAttribute("inert")).length;
+    });
+    assert.ok(inertCount >= 1, "at least one background sibling should be inert");
+    await page.keyboard.press("Escape");
+    await page.waitForSelector('[role="dialog"][aria-label="Command palette"]', { state: "detached" });
+    const cleaned = await page.evaluate(() => {
+      const bodyChildren = Array.from(document.body.children);
+      return bodyChildren.filter((el) => el.hasAttribute("inert")).length;
+    });
+    assert.equal(cleaned, 0, "inert attributes should be cleared on close");
+
+    // 7. Ticket without a session routes to Linear when the session drops.
+    //    Search for a ticket that only appears in todo.md (PHO-99999).
+    await page.keyboard.press("Meta+k");
+    await dialog.waitFor();
+    const linearInput = page.getByPlaceholder("Search sessions, tickets, artifacts, notes…");
+    await linearInput.fill("PHO-99999");
+    await dialog.getByRole("option").first().waitFor();
+    const linearText = (await dialog.getByRole("option").first().textContent()) ?? "";
+    assert.ok(linearText.includes("PHO-99999"), `Linear route result mentions ticket: ${linearText}`);
+    await page.keyboard.press("Escape");
+    await page.waitForSelector('[role="dialog"][aria-label="Command palette"]', { state: "detached" });
+
+    // 8. Cmd-K opens palette even while focus is inside a text input.
+    //    Focus the pane's message composer / any input, then trigger Meta+K.
+    await page.evaluate(() => {
+      const first = document.querySelector("textarea, input[type='text']");
+      if (first && typeof first.focus === "function") first.focus();
+    });
+    await page.keyboard.press("Meta+k");
+    await dialog.waitFor({ timeout: 5000 });
+    await page.keyboard.press("Escape");
+    await page.waitForSelector('[role="dialog"][aria-label="Command palette"]', { state: "detached" });
+
+    console.error("[wiki-146-palette] palette open/type/enter/close/trap/inert/linear/composer passed");
   } finally {
     await page.close();
     await browser.close();

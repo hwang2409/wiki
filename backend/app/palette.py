@@ -5,30 +5,63 @@ It reuses upstream stores (never rebuilds them):
 
 - sessions:  live agent registry + status files + archive index
 - tickets:   vault/todo.md + vault/log/done.md ticket ID extraction
-- artifacts: runtime runs/*/artifacts + archive */*/artifacts image files
+- artifacts: normalized events.jsonl entries with `kind: "artifact"`
 - notes:     vault/**/*.md titles and first paragraph
 
-Ranking = fuzzy subsequence score with boundary bonus, blended with a
-recency boost that decays over ~30 days.
+Ranking is class-based (exact / prefix / word-boundary / substring /
+subsequence). Recency and kind bias never cross a class; recency is a
+bounded tie-breaker inside a class.
+
+Vault walk enforces containment (rejects symlinks and paths that resolve
+outside the vault) and bounds file count + per-file bytes. Results are
+cached against the vault mtime signature so back-to-back searches don't
+re-walk.
 """
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
 TICKET_ID_PATTERN = re.compile(r"\b([A-Z]{2,10})-(\d{1,6})\b")
-LINEAR_TICKET_PREFIX = "https://linear.app/phoebework/issue/"
-ARTIFACT_MEDIA_EXTS = (".png", ".jpg", ".jpeg", ".webp")
+
+LINEAR_PROJECT_URLS: dict[str, str] = {
+    "PHO": "https://linear.app/phoebework/issue/",
+    "WIKI": "https://linear.app/phoebework/issue/",
+    "MITMWEB": "https://linear.app/phoebework/issue/",
+    "TIX": "https://linear.app/phoebework/issue/",
+    "GAU": "https://linear.app/phoebework/issue/",
+    "PUF": "https://linear.app/phoebework/issue/",
+}
+
+ARTIFACT_KINDS: tuple[str, ...] = (
+    "code",
+    "diff",
+    "file-list",
+    "image",
+    "json",
+    "mermaid",
+    "plot",
+    "svg",
+    "table",
+)
 
 DEFAULT_LIMIT = 30
 MAX_LIMIT = 100
 DEFAULT_QUERY_MAX = 200
+
+VAULT_MAX_FILES = 5000
+VAULT_MAX_FILE_BYTES = 100_000
+
+ARTIFACT_MAX_RUN_DIRS = 40
+ARTIFACT_MAX_PER_DIR = 20
 
 RECENCY_HALF_LIFE_DAYS = 30.0
 
@@ -42,9 +75,11 @@ class PaletteItem:
     url: str
     updated_at: datetime | None
     haystack: str
+    artifact_id: str | None = None
+    ticket: str | None = None
 
     def to_payload(self, score: float) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "kind": self.kind,
             "id": self.id,
             "title": self.title,
@@ -55,6 +90,11 @@ class PaletteItem:
             else None,
             "score": round(score, 4),
         }
+        if self.artifact_id:
+            payload["artifact_id"] = self.artifact_id
+        if self.ticket:
+            payload["ticket"] = self.ticket
+        return payload
 
 
 def _parse_iso(value: object) -> datetime | None:
@@ -77,29 +117,38 @@ def _stat_mtime(path: Path) -> datetime | None:
 
 
 def _linear_url_for(prefix: str, number: str) -> str | None:
-    if prefix in {"PHO"}:
-        return f"{LINEAR_TICKET_PREFIX}{prefix}-{number}"
-    return None
+    base = LINEAR_PROJECT_URLS.get(prefix)
+    if not base:
+        return None
+    return f"{base}{prefix}-{number}"
 
 
 def _is_boundary(character: str) -> bool:
     return character in {"/", "\\", ".", "_", "-", " ", "\t"}
 
 
+# Match classes — smaller is better. Recency and kind bias cannot bridge
+# these gaps (each class is >= 4 units wide, adjustments stay < 2).
+CLASS_EXACT = 0.0
+CLASS_PREFIX = 8.0
+CLASS_WORD_BOUNDARY = 16.0
+CLASS_SUBSTRING = 24.0
+CLASS_SUBSEQUENCE = 40.0
+
+
 def _subsequence_score(haystack: str, needle: str) -> float | None:
     if not needle:
-        return 0.0
+        return CLASS_EXACT
     text = haystack.lower()
     query = needle.lower()
     n = len(query)
     if n == 0:
-        return 0.0
+        return CLASS_EXACT
 
     cursor = 0
     first = -1
     last = -1
     boundary_hits = 0
-    contiguous_runs = 0
     gaps = 0
 
     for character in query:
@@ -117,36 +166,31 @@ def _subsequence_score(haystack: str, needle: str) -> float | None:
         if first < 0:
             first = found
         if last >= 0:
-            if found == last + 1:
-                contiguous_runs += 1
-            else:
-                gaps += found - last - 1
+            gaps += found - last - 1
         last = found
         cursor = found + 1
 
     missing_boundary = n - boundary_hits
-    return (
-        40.0
-        + missing_boundary * 12.0
-        + gaps * 3.0
-        - contiguous_runs * 2.0
-        + first / max(len(text), 1)
-    )
+    # Stay strictly within the subsequence class band. Cap the penalty so
+    # every subsequence match ranks below every substring match, and use
+    # the sub-unit remainder as a within-class ordering hint.
+    penalty = min(3.5, missing_boundary * 0.4 + gaps * 0.05)
+    tail = first / max(len(text), 1) * 0.4
+    return CLASS_SUBSEQUENCE + penalty + tail
 
 
 def _basic_score(text: str, query: str) -> float | None:
-    """Prefix/word-boundary/substring beats subsequence."""
     if not query:
-        return 0.0
+        return CLASS_EXACT
     if text == query:
-        return 0.0
+        return CLASS_EXACT
     if text.startswith(query):
-        return 4.0
+        return CLASS_PREFIX + (1.0 - len(query) / max(len(text), 1)) * 3.0
     for index in range(1, len(text)):
         if _is_boundary(text[index - 1]) and text.startswith(query, index):
-            return 8.0
+            return CLASS_WORD_BOUNDARY + index / max(len(text), 1) * 3.0
     if query in text:
-        return 12.0 + text.index(query) / max(len(text), 1)
+        return CLASS_SUBSTRING + text.index(query) / max(len(text), 1) * 3.0
     return _subsequence_score(text, query)
 
 
@@ -154,8 +198,6 @@ def _match_score(haystack: str, query: str) -> float | None:
     text = haystack.lower()
     q = query.lower()
     direct = _basic_score(text, q)
-    # Per-segment scores hunt for the query landing inside a single token
-    # (e.g. "vault/tools/x.md" — segments "vault", "tools", "x.md").
     segment_best: float | None = None
     segment_start = 0
     for index in range(len(text) + 1):
@@ -189,19 +231,11 @@ _KIND_BIAS = {
 }
 
 
-def _combined_score(match: float, boost: float, kind_bias: float) -> float:
-    return match - boost * 8.0 + kind_bias
-
-
 def score_item(item: PaletteItem, query: str, now: datetime) -> float | None:
     match = _match_score(item.haystack, query)
     if match is None:
         return None
-    return _combined_score(
-        match,
-        _recency_boost(item.updated_at, now),
-        _KIND_BIAS.get(item.kind, 0.0),
-    )
+    return match + _KIND_BIAS.get(item.kind, 0.0)
 
 
 def _sort_key(item_score: tuple[PaletteItem, float]) -> tuple[float, float]:
@@ -214,7 +248,6 @@ def _empty_ranking(items: Iterable[PaletteItem], limit: int) -> list[tuple[Palet
     ranked: list[tuple[PaletteItem, float]] = []
     for item in items:
         updated = item.updated_at or datetime.fromtimestamp(0, tz=timezone.utc)
-        # Score = -updated timestamp so newer wins in ascending sort.
         ranked.append((item, -updated.timestamp()))
     ranked.sort(key=lambda pair: pair[1])
     return ranked[:limit]
@@ -286,6 +319,7 @@ def collect_session_items(agents_payload: dict[str, Any]) -> list[PaletteItem]:
                     url=f"#/agent/{ticket}",
                     updated_at=updated,
                     haystack=haystack,
+                    ticket=ticket,
                 )
             )
 
@@ -357,6 +391,7 @@ def collect_session_items(agents_payload: dict[str, Any]) -> list[PaletteItem]:
                             [ticket, str(role), str(kind), str(outcome)],
                         )
                     ),
+                    ticket=ticket,
                 )
             )
     return items
@@ -405,28 +440,31 @@ def collect_ticket_items(
     except (OSError, UnicodeDecodeError):
         pass
 
+    def ticket_url(ticket: str, has_session: bool) -> tuple[str, str]:
+        prefix, number = ticket.split("-", 1)
+        if has_session:
+            return f"#/agent/{ticket}", "session live"
+        linear = _linear_url_for(prefix, number)
+        if linear:
+            return linear, "linear"
+        return f"#/agent/{ticket}", "no session"
+
     for ticket, (context, section) in todo_entries.items():
         if ticket in seen:
             continue
         seen.add(ticket)
-        prefix, number = ticket.split("-", 1)
         has_session = ticket in session_ticket_ids
-        if has_session:
-            url = f"#/agent/{ticket}"
-            subtitle = "todo · session live"
-        else:
-            linear = _linear_url_for(prefix, number)
-            url = linear if linear else f"#/agent/{ticket}"
-            subtitle = f"todo · {section.lower()}"
+        url, route = ticket_url(ticket, has_session)
         items.append(
             PaletteItem(
                 kind="ticket",
                 id=ticket,
                 title=ticket,
-                subtitle=subtitle,
+                subtitle=f"todo · {section.lower()} · {route}",
                 url=url,
                 updated_at=todo_updated,
                 haystack=f"{ticket} {context}",
+                ticket=ticket,
             )
         )
 
@@ -434,40 +472,149 @@ def collect_ticket_items(
         if ticket in seen:
             continue
         seen.add(ticket)
-        prefix, number = ticket.split("-", 1)
-        linear = _linear_url_for(prefix, number)
-        url = linear if linear else f"#/agent/{ticket}"
+        has_session = ticket in session_ticket_ids
+        url, route = ticket_url(ticket, has_session)
         items.append(
             PaletteItem(
                 kind="ticket",
                 id=ticket,
                 title=ticket,
-                subtitle=f"done · {section.lower()}",
+                subtitle=f"done · {section.lower()} · {route}",
                 url=url,
                 updated_at=done_updated,
                 haystack=f"{ticket} {context}",
+                ticket=ticket,
             )
         )
 
     return items
 
 
-def _iter_artifact_files(directory: Path, limit_per_dir: int = 20) -> list[Path]:
-    if not directory.is_dir() or directory.is_symlink():
-        return []
-    candidates: list[Path] = []
+def _iter_events_jsonl(events_path: Path, max_bytes: int = 5_000_000) -> Iterable[dict[str, Any]]:
     try:
-        for entry in os.scandir(directory):
-            name = entry.name.lower()
-            if not name.endswith(ARTIFACT_MEDIA_EXTS):
-                continue
-            if entry.is_symlink() or not entry.is_file():
-                continue
-            candidates.append(Path(entry.path))
+        with events_path.open("r", encoding="utf-8") as handle:
+            budget = max_bytes
+            for line in handle:
+                budget -= len(line)
+                if budget < 0:
+                    return
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(event, dict):
+                    yield event
     except OSError:
+        return
+
+
+def _artifact_payload_from_event(event: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    """Return (artifact_id, artifact_dict) when this event describes an artifact."""
+    if event.get("kind") == "artifact":
+        payload = event.get("payload")
+        if isinstance(payload, dict) and payload.get("kind") == "artifact":
+            artifact = payload.get("artifact")
+            artifact_id = payload.get("id") or event.get("artifact_id")
+            if isinstance(artifact, dict) and isinstance(artifact_id, str):
+                return artifact_id, {**payload, "artifact": artifact}
+        payload = event
+        artifact = payload.get("artifact")
+        artifact_id = payload.get("id")
+        if isinstance(artifact, dict) and isinstance(artifact_id, str):
+            return artifact_id, payload
+    return None
+
+
+def _make_artifact_item(
+    artifact_id: str,
+    payload: dict[str, Any],
+    ticket: str | None,
+    updated: datetime | None,
+) -> PaletteItem | None:
+    artifact = payload.get("artifact")
+    if not isinstance(artifact, dict):
+        return None
+    kind = str(artifact.get("kind") or "").strip()
+    if kind not in ARTIFACT_KINDS:
+        return None
+    title = str(payload.get("title") or artifact.get("filename") or "").strip()
+    if not title:
+        title = f"artifact {artifact_id[:8]}"
+    caption = str(payload.get("caption") or "").strip()
+    subtitle_parts = [kind]
+    if ticket:
+        subtitle_parts.append(ticket)
+    if caption:
+        subtitle_parts.append(caption[:60])
+    subtitle = " · ".join(part for part in subtitle_parts if part)
+    if ticket:
+        url = f"#/agent/{ticket}"
+    else:
+        url = "#/agents"
+    haystack = " ".join(
+        filter(
+            None,
+            [
+                artifact_id,
+                title,
+                kind,
+                ticket or "",
+                caption,
+                str(artifact.get("filename") or ""),
+                str(artifact.get("language") or ""),
+            ],
+        )
+    )
+    return PaletteItem(
+        kind="artifact",
+        id=artifact_id,
+        title=title,
+        subtitle=subtitle,
+        url=url,
+        updated_at=updated,
+        haystack=haystack,
+        artifact_id=artifact_id,
+        ticket=ticket,
+    )
+
+
+def _artifact_ts(payload: dict[str, Any], fallback: datetime | None) -> datetime | None:
+    ts = _parse_iso(payload.get("ts")) or _parse_iso(payload.get("normalized_at"))
+    return ts or fallback
+
+
+def _collect_from_run_dir(
+    run_dir: Path,
+    ticket: str | None,
+) -> list[PaletteItem]:
+    events_path = run_dir / "events.jsonl"
+    if not events_path.is_file() or events_path.is_symlink():
         return []
-    candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
-    return candidates[:limit_per_dir]
+    dir_mtime = _stat_mtime(events_path)
+    items: list[PaletteItem] = []
+    seen: set[str] = set()
+    for event in _iter_events_jsonl(events_path):
+        extracted = _artifact_payload_from_event(event)
+        if not extracted:
+            continue
+        artifact_id, payload = extracted
+        if artifact_id in seen:
+            continue
+        seen.add(artifact_id)
+        item = _make_artifact_item(
+            artifact_id,
+            payload,
+            ticket,
+            _artifact_ts(payload, dir_mtime),
+        )
+        if item is not None:
+            items.append(item)
+        if len(items) >= ARTIFACT_MAX_PER_DIR:
+            break
+    return items
 
 
 def collect_artifact_items(
@@ -475,12 +622,12 @@ def collect_artifact_items(
     archive_dir: Path,
     *,
     ticket_by_run: dict[str, str] | None = None,
-    max_dirs: int = 40,
+    max_dirs: int = ARTIFACT_MAX_RUN_DIRS,
 ) -> list[PaletteItem]:
     items: list[PaletteItem] = []
     dirs_seen = 0
 
-    if runs_dir.is_dir():
+    if runs_dir.is_dir() and not runs_dir.is_symlink():
         try:
             run_entries = list(os.scandir(runs_dir))
         except OSError:
@@ -491,41 +638,14 @@ def collect_artifact_items(
                 break
             if not entry.is_dir() or entry.is_symlink():
                 continue
-            artifact_dir = Path(entry.path) / "artifacts"
-            files = _iter_artifact_files(artifact_dir)
-            if not files:
-                continue
-            dirs_seen += 1
+            run_dir = Path(entry.path)
             ticket = (ticket_by_run or {}).get(entry.name)
-            for path in files:
-                artifact_id = path.stem
-                updated = _stat_mtime(path)
-                title = f"artifact {artifact_id[:8]}"
-                subtitle_parts = [path.suffix.lstrip("."), ticket or "run"]
-                subtitle = " · ".join(part for part in subtitle_parts if part)
-                url = (
-                    f"#/agent/{ticket}"
-                    if ticket
-                    else "#/agents"
-                )
-                items.append(
-                    PaletteItem(
-                        kind="artifact",
-                        id=artifact_id,
-                        title=title,
-                        subtitle=subtitle,
-                        url=url,
-                        updated_at=updated,
-                        haystack=" ".join(
-                            filter(
-                                None,
-                                [artifact_id, ticket or "", path.suffix.lstrip(".")],
-                            )
-                        ),
-                    )
-                )
+            found = _collect_from_run_dir(run_dir, ticket)
+            if found:
+                dirs_seen += 1
+                items.extend(found)
 
-    if archive_dir.is_dir():
+    if archive_dir.is_dir() and not archive_dir.is_symlink():
         try:
             ticket_dirs = list(os.scandir(archive_dir))
         except OSError:
@@ -546,32 +666,12 @@ def collect_artifact_items(
             for session_entry in session_dirs[:3]:
                 if not session_entry.is_dir() or session_entry.is_symlink():
                     continue
-                artifact_dir = Path(session_entry.path) / "artifacts"
-                files = _iter_artifact_files(artifact_dir)
-                if not files:
-                    continue
-                dirs_seen += 1
-                for path in files:
-                    artifact_id = path.stem
-                    updated = _stat_mtime(path)
-                    title = f"artifact {artifact_id[:8]}"
-                    subtitle = " · ".join(
-                        part for part in [path.suffix.lstrip("."), ticket_entry.name] if part
-                    )
-                    items.append(
-                        PaletteItem(
-                            kind="artifact",
-                            id=artifact_id,
-                            title=title,
-                            subtitle=subtitle,
-                            url=f"#/agent/{ticket_entry.name}",
-                            updated_at=updated,
-                            haystack=" ".join(
-                                [artifact_id, ticket_entry.name, path.suffix.lstrip(".")]
-                            ),
-                        )
-                    )
-                break  # one session dir per ticket keeps the list focused
+                found = _collect_from_run_dir(Path(session_entry.path), ticket_entry.name)
+                if found:
+                    dirs_seen += 1
+                    items.extend(found)
+                    break
+
     return items
 
 
@@ -613,18 +713,65 @@ def _title_from_note(note_path: Path, content: str) -> tuple[str, str]:
     return title, first
 
 
-def collect_note_items(vault_dir: Path) -> list[PaletteItem]:
-    if not vault_dir.is_dir():
-        return []
+@dataclass
+class _NoteCacheEntry:
+    signature: tuple[int, int]
+    items: tuple[PaletteItem, ...] = ()
+
+
+@dataclass
+class _NoteCache:
+    entries: dict[str, _NoteCacheEntry] = field(default_factory=dict)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+_note_cache = _NoteCache()
+
+
+def _vault_signature(vault_dir: Path) -> tuple[int, int]:
+    try:
+        stat = vault_dir.stat()
+    except OSError:
+        return (0, 0)
+    return (int(stat.st_mtime_ns), int(stat.st_size))
+
+
+def _walk_vault(vault_dir: Path) -> list[PaletteItem]:
+    resolved_vault = vault_dir.resolve(strict=False)
     items: list[PaletteItem] = []
-    for path in vault_dir.rglob("*.md"):
-        if not path.is_file():
-            continue
+    count = 0
+    try:
+        candidates = vault_dir.rglob("*.md")
+    except OSError:
+        return items
+    for path in candidates:
+        if count >= VAULT_MAX_FILES:
+            break
         try:
-            content = path.read_text(encoding="utf-8", errors="ignore")
+            if path.is_symlink():
+                continue
+            if not path.is_file():
+                continue
         except OSError:
             continue
-        relative = path.relative_to(vault_dir).as_posix()
+        try:
+            resolved = path.resolve(strict=False)
+            resolved.relative_to(resolved_vault)
+        except (OSError, ValueError):
+            continue
+        try:
+            with path.open("rb") as handle:
+                raw = handle.read(VAULT_MAX_FILE_BYTES)
+        except OSError:
+            continue
+        try:
+            content = raw.decode("utf-8", errors="ignore")
+        except UnicodeDecodeError:
+            continue
+        try:
+            relative = path.relative_to(vault_dir).as_posix()
+        except ValueError:
+            continue
         title, first_para = _title_from_note(path, content)
         subtitle = first_para or relative
         updated = _stat_mtime(path)
@@ -639,6 +786,22 @@ def collect_note_items(vault_dir: Path) -> list[PaletteItem]:
                 haystack=f"{title} {relative} {first_para}",
             )
         )
+        count += 1
+    return items
+
+
+def collect_note_items(vault_dir: Path) -> list[PaletteItem]:
+    if not vault_dir.is_dir() or vault_dir.is_symlink():
+        return []
+    key = str(vault_dir.resolve(strict=False))
+    signature = _vault_signature(vault_dir)
+    with _note_cache.lock:
+        cached = _note_cache.entries.get(key)
+        if cached is not None and cached.signature == signature:
+            return list(cached.items)
+    items = _walk_vault(vault_dir)
+    with _note_cache.lock:
+        _note_cache.entries[key] = _NoteCacheEntry(signature=signature, items=tuple(items))
     return items
 
 

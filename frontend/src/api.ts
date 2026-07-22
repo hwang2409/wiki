@@ -54,6 +54,8 @@ export type PaletteResult = {
   url: string;
   updated_at: string | null;
   score: number;
+  artifact_id?: string;
+  ticket?: string;
 };
 
 export function searchPalette(query: string, limit = 30, signal?: AbortSignal) {

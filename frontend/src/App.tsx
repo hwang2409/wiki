@@ -2996,6 +2996,18 @@ export default function App() {
       const key = event.key;
       const lowerKey = key.toLowerCase();
 
+      const commandModifier = event.metaKey || event.ctrlKey;
+
+      // Meta/Ctrl-K opens the palette from ANYWHERE (composer, editor,
+      // terminal). The text-entry guard below still blocks unmodified
+      // shortcuts like `j`/`k`/`b` while typing.
+      if (commandModifier && !event.altKey && !event.shiftKey && lowerKey === "k") {
+        event.preventDefault();
+        event.stopPropagation();
+        if (!modalOpen) setPaletteOpen((open) => !open);
+        return;
+      }
+
       if (modalOpen || isTextEntryEvent(event)) return;
       if (
         document.activeElement instanceof HTMLTextAreaElement &&
@@ -3004,10 +3016,7 @@ export default function App() {
         return;
       }
 
-      if ((event.metaKey || event.ctrlKey) && lowerKey === "k") {
-        event.preventDefault();
-        setPaletteOpen((open) => !open);
-      } else if ((event.metaKey || event.ctrlKey) && lowerKey === "p") {
+      if (commandModifier && lowerKey === "p") {
         event.preventDefault();
         setSwitcherOpen((open) => !open);
       } else if ((event.metaKey || event.ctrlKey) && lowerKey === "b") {
@@ -3018,8 +3027,24 @@ export default function App() {
       }
     }
 
+    // Capture-phase Meta/Ctrl-K so terminals + editors + composers can't
+    // intercept the palette shortcut before we see it.
+    function onPaletteCapture(event: globalThis.KeyboardEvent) {
+      if (event.defaultPrevented) return;
+      if (!(event.metaKey || event.ctrlKey)) return;
+      if (event.altKey || event.shiftKey) return;
+      if (event.key.toLowerCase() !== "k") return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (!modalOpen) setPaletteOpen((open) => !open);
+    }
+
+    window.addEventListener("keydown", onPaletteCapture, true);
     window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onPaletteCapture, true);
+      window.removeEventListener("keydown", onKeyDown);
+    };
   }, [
     modalOpen,
     handlePaneScopeKey,
@@ -3908,6 +3933,19 @@ export default function App() {
             if (url.startsWith("#/agent/")) {
               const ticket = url.slice("#/agent/".length).replace(/\/.*$/, "");
               openSessionFromSwitcher(ticket);
+              const artifactId = result.artifact_id;
+              if (artifactId) {
+                // Agent surface listens for this and opens the panel with the
+                // requested artifact focused. Fires after openSessionFromSwitcher
+                // has scheduled the mount so the listener is attached in time.
+                requestAnimationFrame(() =>
+                  window.dispatchEvent(
+                    new CustomEvent("wiki:open-artifact", {
+                      detail: { ticket, artifactId },
+                    })
+                  )
+                );
+              }
               return;
             }
             if (url.startsWith("#/")) {

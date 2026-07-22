@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent } from "react";
 import { createPortal } from "react-dom";
 import { Bot, Ticket, Image as ImageIcon, FileText } from "lucide-react";
@@ -22,6 +22,15 @@ const KIND_ICON: Record<PaletteResultKind, LucideIcon> = {
 };
 
 const DEBOUNCE_MS = 80;
+
+const FOCUSABLE_SELECTOR = [
+  "a[href]",
+  "button:not([disabled])",
+  "input:not([disabled])",
+  "select:not([disabled])",
+  "textarea:not([disabled])",
+  '[tabindex]:not([tabindex="-1"])',
+].join(",");
 
 export type CommandPaletteProps = {
   onClose: () => void;
@@ -50,9 +59,34 @@ export function CommandPalette({ onClose, onOpen }: CommandPaletteProps) {
   const [selected, setSelected] = useState(0);
   const inputRef = useRef<HTMLInputElement | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  const invokerRef = useRef<HTMLElement | null>(null);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
+    const active = document.activeElement;
+    invokerRef.current = active instanceof HTMLElement ? active : null;
+    // Mark every top-level sibling of the portal target inert so background
+    // widgets can't grab Tab or receive pointer events while the modal is up.
+    const body = document.body;
+    const marked: Element[] = [];
+    for (const child of Array.from(body.children)) {
+      if (child.contains(dialogRef.current)) continue;
+      if (child.tagName === "SCRIPT" || child.tagName === "STYLE") continue;
+      marked.push(child);
+      child.setAttribute("inert", "");
+      child.setAttribute("aria-hidden", "true");
+    }
     inputRef.current?.focus();
+    return () => {
+      for (const child of marked) {
+        child.removeAttribute("inert");
+        child.removeAttribute("aria-hidden");
+      }
+      const invoker = invokerRef.current;
+      if (invoker && document.contains(invoker) && typeof invoker.focus === "function") {
+        invoker.focus();
+      }
+    };
   }, []);
 
   useEffect(() => {
@@ -104,21 +138,20 @@ export function CommandPalette({ onClose, onOpen }: CommandPaletteProps) {
     onOpen(result);
   }
 
-  function handleKeyDown(event: KeyboardEvent<HTMLInputElement>) {
-    if (event.key === "ArrowDown" || (event.ctrlKey && event.key.toLowerCase() === "j")) {
-      event.preventDefault();
-      setSelected((index) =>
-        flatResults.length === 0 ? 0 : (index + 1) % flatResults.length
-      );
+  function moveSelection(delta: number) {
+    if (flatResults.length === 0) {
+      setSelected(0);
       return;
     }
-    if (event.key === "ArrowUp" || (event.ctrlKey && event.key.toLowerCase() === "k")) {
+    setSelected((index) => (index + delta + flatResults.length) % flatResults.length);
+  }
+
+  function handleDialogKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+    // Dialog-scope handler so arrow keys / Enter / Esc / Tab still work
+    // even after focus leaves the input (e.g. after clicking a result).
+    if (event.key === "Escape") {
       event.preventDefault();
-      setSelected((index) =>
-        flatResults.length === 0
-          ? 0
-          : (index - 1 + flatResults.length) % flatResults.length
-      );
+      onClose();
       return;
     }
     if (event.key === "Enter") {
@@ -126,9 +159,41 @@ export function CommandPalette({ onClose, onOpen }: CommandPaletteProps) {
       activate(flatResults[selected]);
       return;
     }
-    if (event.key === "Escape") {
+    if (event.key === "ArrowDown" || (event.ctrlKey && event.key.toLowerCase() === "j")) {
       event.preventDefault();
-      onClose();
+      moveSelection(1);
+      return;
+    }
+    if (event.key === "ArrowUp" || (event.ctrlKey && event.key.toLowerCase() === "k")) {
+      event.preventDefault();
+      moveSelection(-1);
+      return;
+    }
+    if (event.key === "Tab") {
+      const dialog = dialogRef.current;
+      if (!dialog) return;
+      const focusables = Array.from(
+        dialog.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)
+      ).filter((element) => !element.hasAttribute("disabled") && element.tabIndex !== -1);
+      if (focusables.length === 0) {
+        event.preventDefault();
+        inputRef.current?.focus();
+        return;
+      }
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      const active = document.activeElement;
+      if (event.shiftKey) {
+        if (active === first || !dialog.contains(active)) {
+          event.preventDefault();
+          last.focus();
+        }
+      } else {
+        if (active === last) {
+          event.preventDefault();
+          first.focus();
+        }
+      }
     }
   }
 
@@ -139,7 +204,9 @@ export function CommandPalette({ onClose, onOpen }: CommandPaletteProps) {
         className="quick-switcher command-palette"
         role="dialog"
         aria-modal="true"
+        ref={dialogRef}
         onClick={(event) => event.stopPropagation()}
+        onKeyDown={handleDialogKeyDown}
       >
         <input
           ref={inputRef}
@@ -154,7 +221,6 @@ export function CommandPalette({ onClose, onOpen }: CommandPaletteProps) {
           type="text"
           value={query}
           onChange={(event) => setQuery(event.target.value)}
-          onKeyDown={handleKeyDown}
         />
         <div
           id="command-palette-results"
