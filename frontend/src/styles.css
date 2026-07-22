@@ -6111,7 +6111,7 @@ body.is-resizing-panes .pane-cell {
 
 .agent-session-surface.is-full .session-composer {
   width: 100%;
-  max-width: 900px;
+  max-width: var(--readable-col);
   margin: 0 auto;
   padding: 16px 20px 8px;
   border-top: 1px solid var(--background-modifier-border);
@@ -6658,7 +6658,7 @@ body.is-resizing-panes .pane-cell {
 .agent-session-surface.is-full .session-scroll-inner,
 .agent-session-surface.is-full .session-footer {
   width: 100%;
-  max-width: 900px;
+  max-width: var(--readable-col);
   margin: 0 auto;
   border-top: none;
 }

@@ -1,12 +1,19 @@
+import fs from "node:fs/promises";
 import { mkdirSync, rmSync } from "node:fs";
 import path from "node:path";
 import { chromium } from "playwright";
 
-import { makeFixtureRoot, startBackend } from "../scripts/wiki32-harness.mjs";
+import {
+  codexAssistant,
+  makeFixtureRoot,
+  startBackend,
+  writeQueue,
+  writeRegistry,
+} from "../scripts/wiki32-harness.mjs";
 
+const TICKET = "WIKI-143";
 const OUT_DIR = process.env.WIKI_PLAYWRIGHT_OUT_DIR || "/tmp/wiki-143-tokens-evidence";
 mkdirSync(OUT_DIR, { recursive: true });
-const fixtures = makeFixtureRoot("wiki-143-tokens-");
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -14,13 +21,47 @@ function assert(condition, message) {
 
 let browser;
 let backend;
+const fixtures = makeFixtureRoot("wiki-143-tokens-");
 
 try {
+  const transcript = path.join(fixtures.root, "wiki-143-tokens.jsonl");
+  await fs.writeFile(
+    transcript,
+    [
+      { type: "mode", mode: "normal", sessionId: "wiki-143-tokens" },
+      codexAssistant("Chat message body for token cap measurement.", "2026-07-22T15:00:00Z"),
+    ]
+      .map((row) => JSON.stringify(row))
+      .join("\n") + "\n",
+  );
+  writeRegistry(fixtures.registryPath, [[TICKET, transcript]]);
+  writeQueue(fixtures.queuePath, TICKET, []);
+
   backend = await startBackend(fixtures);
   browser = await chromium.launch({ headless: true });
   const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
-  await page.goto(`${backend.baseUrl}/`, { waitUntil: "domcontentloaded" });
+
+  await page.addInitScript(() => {
+    localStorage.setItem("wiki-sidebar-visible", "false");
+    localStorage.setItem(
+      "wiki-window-layout-v2",
+      JSON.stringify({
+        version: 2,
+        activeWindowId: "window-0",
+        windows: [
+          {
+            id: "window-0",
+            focusedPaneId: "pane-1",
+            layout: { kind: "pane", id: "pane-1", path: "agent://WIKI-143" },
+          },
+        ],
+      }),
+    );
+  });
+  await page.goto(`${backend.baseUrl}/#/agent/${TICKET}`, { waitUntil: "domcontentloaded" });
   await page.waitForSelector(":root");
+  await page.locator(".agent-session-surface").waitFor({ state: "visible" });
+  await page.locator(".session-scroll-inner").waitFor({ state: "visible" });
 
   const tokens = await page.evaluate(() => {
     const style = getComputedStyle(document.documentElement);
@@ -103,16 +144,44 @@ try {
     `--radius-md expected 8px, got ${scaleBinding.borderRadius}`,
   );
 
-  const scrollWidth = await page.evaluate(() => {
-    const inner = document.createElement("div");
-    inner.className = "session-scroll-inner";
-    document.body.append(inner);
-    const style = getComputedStyle(inner);
-    const result = style.maxWidth;
-    inner.remove();
-    return result;
+  const measureChatMaxWidth = () =>
+    page.evaluate(() => {
+      const inner = document.querySelector(".agent-session-surface.is-full .session-scroll-inner");
+      if (!(inner instanceof HTMLElement)) return null;
+      const style = getComputedStyle(inner);
+      return {
+        maxWidth: style.maxWidth,
+        actualWidth: Math.round(inner.getBoundingClientRect().width),
+      };
+    });
+
+  const baseline = await measureChatMaxWidth();
+  assert(baseline, "could not find .agent-session-surface.is-full .session-scroll-inner in live DOM");
+  assert(
+    baseline.maxWidth === "760px",
+    `real chat .session-scroll-inner max-width expected 760px, got ${baseline.maxWidth}`,
+  );
+  assert(
+    baseline.actualWidth <= 760,
+    `chat inner width expected <=760, got ${baseline.actualWidth}`,
+  );
+
+  await page.evaluate(() => {
+    document.documentElement.style.setProperty("--readable-col", "900px");
   });
-  assert(scrollWidth === "760px", `session-scroll-inner max-width expected 760px, got ${scrollWidth}`);
+  const mutated = await measureChatMaxWidth();
+  assert(
+    mutated?.maxWidth === "900px",
+    `mutation flip: expected 900px after overriding --readable-col, got ${mutated?.maxWidth}`,
+  );
+  await page.evaluate(() => {
+    document.documentElement.style.removeProperty("--readable-col");
+  });
+  const restored = await measureChatMaxWidth();
+  assert(
+    restored?.maxWidth === "760px",
+    `restore: expected 760px after removing override, got ${restored?.maxWidth}`,
+  );
 
   await page.screenshot({ path: path.join(OUT_DIR, "wiki-143-tokens.png") });
 } finally {

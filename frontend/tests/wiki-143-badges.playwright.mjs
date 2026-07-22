@@ -60,6 +60,9 @@ try {
   backend = await startBackend(fixtures);
   browser = await chromium.launch({ headless: true });
   const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
+  await page.addInitScript(() => {
+    localStorage.setItem("wiki-theme", "gruvbox-dark");
+  });
   await page.goto(`${backend.baseUrl}/`, { waitUntil: "domcontentloaded" });
   await page.waitForSelector(":root");
 

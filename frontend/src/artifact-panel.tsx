@@ -3,11 +3,15 @@ import type { KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerE
 import { Clock3, MoreHorizontal, Pin, X } from "lucide-react";
 import type { SessionEvent } from "./api";
 import { CodeArtifactDetail } from "./artifact-detail/code";
+import { DiffArtifactDetail } from "./artifact-detail/diff";
+import { FileListArtifactDetail } from "./artifact-detail/file-list";
 import { ImageArtifactDetail } from "./artifact-detail/image";
+import { JsonArtifactDetail } from "./artifact-detail/json";
 import { MermaidArtifactDetail } from "./artifact-detail/mermaid";
 import { PlotArtifactDetail } from "./artifact-detail/plot";
 import { SvgArtifactDetail } from "./artifact-detail/svg";
 import { TableArtifactDetail } from "./artifact-detail/table";
+import { classifyArtifact } from "./artifact-kind";
 import type { ArtifactViewState, PanelState } from "./transcript-store";
 
 function titleFor(event: SessionEvent | undefined, id: string) {
@@ -63,12 +67,15 @@ export function ArtifactPanel({
   const viewState = focusedId ? state.viewState[focusedId] ?? {} : {};
   const detail = focusedEvent && artifact && focusedId ? (() => {
     const onChange = (next: ArtifactViewState) => onUpdateViewState(focusedId, next);
-    switch (artifact.kind) {
+    switch (classifyArtifact(artifact)) {
       case "table": return <TableArtifactDetail artifact={artifact} onChange={onChange} state={viewState} />;
       case "image": return <ImageArtifactDetail artifact={artifact} event={focusedEvent} onChange={onChange} state={viewState} ticket={ticket} />;
       case "mermaid": return <MermaidArtifactDetail onChange={onChange} source={artifact.source ?? ""} state={viewState} />;
       case "svg": return <SvgArtifactDetail onChange={onChange} source={artifact.source ?? ""} state={viewState} />;
       case "plot": return <PlotArtifactDetail spec={artifact.spec_vega_lite ?? {}} />;
+      case "diff": return <DiffArtifactDetail artifact={artifact} />;
+      case "file-list": return <FileListArtifactDetail artifact={artifact} />;
+      case "json": return <JsonArtifactDetail artifact={artifact} />;
       case "code": return <CodeArtifactDetail artifact={artifact} onChange={onChange} state={viewState} />;
     }
   })() : null;

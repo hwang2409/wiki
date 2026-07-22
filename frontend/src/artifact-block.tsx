@@ -24,6 +24,7 @@ import type {
   SessionArtifact,
   SessionEvent,
 } from "./api";
+import { classifyArtifact } from "./artifact-kind";
 import { ShikiCode, useCurrentTheme } from "./shiki";
 import { SplitDiffView } from "./split-diff";
 
@@ -69,20 +70,6 @@ const KIND_ICONS: Record<ArtifactKind, LucideIcon> = {
   "file-list": FileJson,
   json: FileJson,
 };
-
-const DIFF_HEAD_PATTERN = /^\s*(?:diff --git |--- [ab]?\/|\*\*\* )/m;
-
-export function looksLikeUnifiedDiff(text: string | undefined | null): boolean {
-  if (!text) return false;
-  return DIFF_HEAD_PATTERN.test(text);
-}
-
-export function classifyArtifact(artifact: SessionArtifact): ArtifactKind {
-  if (artifact.kind !== "code" && artifact.kind !== "diff") return artifact.kind;
-  if (artifact.kind === "diff") return "diff";
-  if (looksLikeUnifiedDiff(artifact.source)) return "diff";
-  return "code";
-}
 
 export function artifactUrl(ticket: string, event: SessionEvent): string {
   return `/api/agents/${encodeURIComponent(ticket)}/artifact/${encodeURIComponent(event.artifact_id ?? "")}`;
@@ -150,10 +137,11 @@ async function imageBase64(url: string): Promise<string> {
 
 function downloadName(event: SessionEvent): string {
   const artifact = event.artifact!;
-  const base = (event.title || `artifact-${event.artifact_id?.slice(0, 8) || artifact.kind}`)
+  const effectiveKind = classifyArtifact(artifact);
+  const base = (event.title || `artifact-${event.artifact_id?.slice(0, 8) || effectiveKind}`)
     .replace(/[^a-zA-Z0-9._-]+/g, "-")
     .replace(/^-+|-+$/g, "") || "artifact";
-  if (artifact.kind === "code" && artifact.filename) {
+  if (effectiveKind === "code" && artifact.filename) {
     return artifact.filename.split(/[\\/]/).pop() || `${base}.txt`;
   }
   const extension = {
@@ -166,7 +154,7 @@ function downloadName(event: SessionEvent): string {
     diff: "diff",
     "file-list": "txt",
     json: "json",
-  }[artifact.kind];
+  }[effectiveKind];
   return `${base}.${extension}`;
 }
 
@@ -692,7 +680,7 @@ export function artifactExceedsInlineThreshold(
   artifact: SessionArtifact,
   imageBounds?: { width: number; height: number } | null,
 ): boolean {
-  switch (artifact.kind) {
+  switch (classifyArtifact(artifact)) {
     case "table": return (artifact.rows?.length ?? 0) > 30;
     case "code": return (artifact.source ?? "").split("\n").length > 100;
     case "image": return Boolean(imageBounds && (imageBounds.width > 400 || imageBounds.height > 400));
@@ -714,7 +702,8 @@ export function artifactExceedsInlineThreshold(
 }
 
 function CompactPreview({ artifact, event, onRenderError, ticket }: ArtifactRendererProps) {
-  if (artifact.kind === "table") {
+  const effectiveKind = classifyArtifact(artifact);
+  if (effectiveKind === "table") {
     const columns = artifact.columns ?? [];
     const rows = artifact.rows ?? [];
     return (
@@ -727,7 +716,23 @@ function CompactPreview({ artifact, event, onRenderError, ticket }: ArtifactRend
       </div>
     );
   }
-  if (artifact.kind === "code") {
+  if (effectiveKind === "diff") {
+    const lines = (artifact.source ?? "").split("\n");
+    const previewSource = lines.slice(0, 40).join("\n");
+    return (
+      <div className="artifact-compact-diff">
+        <SplitDiffView
+          className="artifact-diff"
+          emptyClassName="artifact-diff-empty"
+          emptyMessage="No diff to display."
+          patch={previewSource}
+          viewType="unified"
+        />
+        <span className="artifact-compact-summary">… {Math.max(0, lines.length - 40)} lines folded · Open in panel</span>
+      </div>
+    );
+  }
+  if (effectiveKind === "code") {
     const lines = (artifact.source ?? "").split("\n");
     return (
       <div className="artifact-compact-code">
@@ -737,13 +742,13 @@ function CompactPreview({ artifact, event, onRenderError, ticket }: ArtifactRend
       </div>
     );
   }
-  if (artifact.kind === "image") {
+  if (effectiveKind === "image") {
     const source = artifact.data_base64
       ? `data:${artifact.mime ?? "image/png"};base64,${artifact.data_base64}`
       : artifactUrl(ticket, event);
     return <img alt={event.title || event.caption || "Agent artifact"} className="artifact-image artifact-compact-image" loading="lazy" src={source} />;
   }
-  if (artifact.kind === "mermaid" || artifact.kind === "svg") {
+  if (effectiveKind === "mermaid" || effectiveKind === "svg") {
     return (
       <div className="artifact-compact-diagram">
         <ArtifactRenderer artifact={artifact} compact event={event} onRenderError={onRenderError} ticket={ticket} />
