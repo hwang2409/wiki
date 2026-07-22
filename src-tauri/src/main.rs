@@ -2,6 +2,11 @@
 
 mod backend;
 
+// The Tauri app entry point embeds resources (`generate_context!`) that can
+// only be linked once per binary. Tests inside the `backend` module also
+// call `generate_context!` — gating `main` out of the test build keeps the
+// resource symbols single-defined. WIKI-148 round 7.
+#[cfg(not(test))]
 fn main() {
     let app_lock = match backend::acquire_app_lock() {
         Ok(lock) => lock,

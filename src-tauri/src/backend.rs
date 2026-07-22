@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     env,
     error::Error,
     ffi::OsStr,
@@ -15,8 +16,8 @@ use std::{
 
 use reqwest::{blocking::Client, Url};
 use tauri::{
-    webview::NewWindowResponse, App, AppHandle, Manager, RunEvent, WebviewUrl,
-    WebviewWindowBuilder, WindowEvent,
+    ipc::CapabilityBuilder, webview::NewWindowResponse, App, AppHandle, Manager, RunEvent,
+    WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 use tauri_plugin_opener::OpenerExt;
@@ -140,6 +141,12 @@ struct LifecycleState {
     // invoke bridge and cannot pull the value, so `/api/composer/*` calls
     // from workers fail with 403. WIKI-148 round 6, Path B.
     wiki_app_secret: Option<String>,
+    // Loopback origins for which a remote-scoped ACL capability granting
+    // `allow-get-wiki-app-secret` has already been registered via
+    // `AppHandle::add_capability`. Sidecar restarts pick a fresh port and
+    // therefore need a fresh capability; tracking prevents duplicate
+    // registration for the same origin. WIKI-148 round 7.
+    ipc_authorized_origins: HashSet<String>,
 }
 
 const WIKI_APP_SECRET_MARKER: &str = "[[WIKI_APP_SECRET_BOOT]]=";
@@ -625,9 +632,62 @@ fn set_app_origin(app: &AppHandle, launch_url: &str) {
     let origin = Url::parse(launch_url)
         .ok()
         .map(|url| url.origin().ascii_serialization());
-    let app_state = app.state::<NativeAppState>();
-    let mut state = app_state.inner.lock().unwrap();
-    state.app_origin = origin;
+    {
+        let app_state = app.state::<NativeAppState>();
+        let mut state = app_state.inner.lock().unwrap();
+        state.app_origin = origin.clone();
+    }
+    if let Err(err) = register_wiki_app_secret_capability(app, launch_url) {
+        eprintln!(
+            "failed to register get_wiki_app_secret capability for {launch_url}: {err}"
+        );
+    }
+}
+
+/// Register a narrowly-scoped remote ACL capability that grants the main
+/// webview permission to invoke `get_wiki_app_secret` when its document
+/// origin exactly matches the sidecar loopback origin. Tauri 2.11 treats
+/// `http://127.0.0.1:PORT/` as a remote origin, so the compiled-in
+/// `default.json` capability (local-only, no remote URLs) does not
+/// authorize any custom commands from that document — the invoke silently
+/// fails and `/spawn`/`/gate` cannot obtain the secret. Registering here
+/// (rather than in `default.json`) avoids wildcard `remote.urls` and pins
+/// authorization to the exact scheme+host+port picked at sidecar boot;
+/// the pattern `<scheme>://<host>[:port]/*` matches every path under
+/// that single loopback origin and nothing else. WIKI-148 round 7.
+fn register_wiki_app_secret_capability<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    launch_url: &str,
+) -> Result<(), Box<dyn Error>> {
+    let parsed = Url::parse(launch_url)
+        .map_err(|err| format!("invalid launch url {launch_url}: {err}"))?;
+    let origin = parsed.origin().ascii_serialization();
+    // urlpattern-style: origin + wildcard pathname keeps this scoped to
+    // the exact scheme/host/port while allowing the SPA to navigate
+    // between paths. This is host+port specificity, NOT a `http://*`
+    // wildcard.
+    let url_pattern = format!("{origin}/*");
+    {
+        let app_state = app.state::<NativeAppState>();
+        let mut state = app_state.inner.lock().unwrap();
+        if !state.ipc_authorized_origins.insert(origin.clone()) {
+            return Ok(());
+        }
+    }
+    let identifier = format!(
+        "wiki-app-secret-loopback-{}",
+        origin
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect::<String>()
+    );
+    let capability = CapabilityBuilder::new(identifier)
+        .local(false)
+        .remote(url_pattern)
+        .window(MAIN_WINDOW_LABEL)
+        .permission("allow-get-wiki-app-secret");
+    app.add_capability(capability)?;
+    Ok(())
 }
 
 fn app_origin(app: &AppHandle) -> Option<String> {
@@ -829,5 +889,114 @@ mod tests {
             )),
             Path::new("/Users/henry/me/fun/wiki")
         );
+    }
+
+    // WIKI-148 round 7: exercise the REAL Tauri IPC + ACL path for the
+    // `get_wiki_app_secret` invoke command. Playwright cannot run this
+    // (no Tauri IPC transport in vanilla Chromium), so the security
+    // contract is enforced here. Covers:
+    //   1. A webview on the registered loopback origin can invoke the
+    //      command and receives the secret.
+    //   2. A webview on a different origin (arbitrary URL) is rejected
+    //      by the ACL — the invoke returns an error, not the secret.
+    //   3. Registering the same origin twice is idempotent (HashSet
+    //      short-circuit) so sidecar re-issues of `set_app_origin` for
+    //      the same URL don't spam the authority table.
+    mod capability {
+        use super::super::{
+            get_wiki_app_secret, register_wiki_app_secret_capability, NativeAppState,
+        };
+        use reqwest::Url;
+        use tauri::{
+            ipc::{CallbackFn, InvokeBody},
+            test::{get_ipc_response, mock_builder, INVOKE_KEY},
+            webview::InvokeRequest,
+            Manager, WebviewUrl, WebviewWindowBuilder,
+        };
+
+        const LOOPBACK_URL: &str = "http://127.0.0.1:12345/";
+        const EVIL_URL: &str = "https://evil.example.com/";
+        const FIXTURE_SECRET: &str = "test-wiki-app-secret";
+
+        fn build_app_with_secret() -> tauri::App<tauri::test::MockRuntime> {
+            let app = mock_builder()
+                .invoke_handler(tauri::generate_handler![get_wiki_app_secret])
+                .manage(NativeAppState::default())
+                .build(tauri::generate_context!())
+                .expect("mock app build");
+            {
+                let state = app.state::<NativeAppState>();
+                let mut guard = state.inner.lock().unwrap();
+                guard.wiki_app_secret = Some(FIXTURE_SECRET.to_string());
+            }
+            app
+        }
+
+        fn invoke_get_secret(
+            webview: &tauri::WebviewWindow<tauri::test::MockRuntime>,
+            document_url: &str,
+        ) -> Result<String, serde_json::Value> {
+            let request = InvokeRequest {
+                cmd: "get_wiki_app_secret".into(),
+                callback: CallbackFn(0),
+                error: CallbackFn(1),
+                url: document_url.parse().unwrap(),
+                body: InvokeBody::default(),
+                headers: Default::default(),
+                invoke_key: INVOKE_KEY.to_string(),
+            };
+            get_ipc_response(webview, request).map(|body| body.deserialize().unwrap())
+        }
+
+        #[test]
+        fn loopback_origin_is_authorized() {
+            let app = build_app_with_secret();
+            let handle = app.handle().clone();
+            register_wiki_app_secret_capability(&handle, LOOPBACK_URL)
+                .expect("register capability");
+            let webview = WebviewWindowBuilder::new(
+                &app,
+                super::super::MAIN_WINDOW_LABEL,
+                WebviewUrl::External(LOOPBACK_URL.parse().unwrap()),
+            )
+            .build()
+            .expect("webview build");
+            let value = invoke_get_secret(&webview, LOOPBACK_URL)
+                .expect("ACL should authorize invoke from loopback origin");
+            assert_eq!(value, FIXTURE_SECRET);
+        }
+
+        #[test]
+        fn foreign_origin_is_rejected() {
+            let app = build_app_with_secret();
+            let handle = app.handle().clone();
+            register_wiki_app_secret_capability(&handle, LOOPBACK_URL)
+                .expect("register capability");
+            let webview = WebviewWindowBuilder::new(
+                &app,
+                super::super::MAIN_WINDOW_LABEL,
+                WebviewUrl::External(EVIL_URL.parse().unwrap()),
+            )
+            .build()
+            .expect("webview build");
+            let result = invoke_get_secret(&webview, EVIL_URL);
+            assert!(
+                result.is_err(),
+                "expected ACL rejection for foreign origin, got {result:?}"
+            );
+        }
+
+        #[test]
+        fn duplicate_origin_registration_is_idempotent() {
+            let app = build_app_with_secret();
+            let handle = app.handle().clone();
+            register_wiki_app_secret_capability(&handle, LOOPBACK_URL).unwrap();
+            register_wiki_app_secret_capability(&handle, LOOPBACK_URL).unwrap();
+            let state = app.state::<NativeAppState>();
+            let guard = state.inner.lock().unwrap();
+            let origin = Url::parse(LOOPBACK_URL).unwrap().origin().ascii_serialization();
+            assert!(guard.ipc_authorized_origins.contains(&origin));
+            assert_eq!(guard.ipc_authorized_origins.len(), 1);
+        }
     }
 }

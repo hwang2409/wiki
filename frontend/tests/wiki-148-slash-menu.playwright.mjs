@@ -81,13 +81,23 @@ async function main() {
       });
     });
 
-    // Round 6, Path B: the composer authenticates by attaching an
+    // Round 7, Path B: the composer authenticates by attaching an
     // X-Wiki-App-Secret header sourced from the Tauri invoke bridge
-    // (`get_wiki_app_secret`). Playwright fakes the bridge by injecting a
-    // known secret into `window.__WIKI_APP_SECRET__` via addInitScript
-    // below. The prior per-orch composer-token endpoint is gone — the
-    // frontend must send NO X-Wiki-Composer-Token header and MUST send
-    // X-Wiki-App-Secret with the fixture value.
+    // (`get_wiki_app_secret`). Round 7 removed the previous
+    // `window.__WIKI_APP_SECRET__` production fallback (any injected
+    // script could poison it), so Playwright now stubs the Tauri IPC
+    // bridge itself — `window.__TAURI_INTERNALS__.invoke` returns the
+    // fixture secret for the `get_wiki_app_secret` command. The prior
+    // per-orch composer-token endpoint is gone — the frontend must send
+    // NO X-Wiki-Composer-Token header and MUST send X-Wiki-App-Secret
+    // with the fixture value.
+    //
+    // Real end-to-end verification that the runtime-registered ACL
+    // capability actually authorizes the invoke (i.e., that the native
+    // shell path works with no injected shim) lives in the Rust
+    // integration test at
+    // `src-tauri/tests/wiki_app_secret_capability.rs`. Playwright cannot
+    // exercise the real Tauri IPC transport from a plain Chromium.
 
     await page.route("**/api/composer/provision-worktree", async (route) => {
       const request = route.request();
@@ -164,10 +174,31 @@ async function main() {
     });
 
     await page.addInitScript(() => {
-      // Round 6: composer requests carry X-Wiki-App-Secret sourced from
-      // the Tauri invoke bridge in production. Playwright has no Tauri —
-      // the frontend's getWikiAppSecret helper falls back to this global.
-      window.__WIKI_APP_SECRET__ = "playwright-wiki-app-secret-fixture";
+      // Round 7: composer requests carry X-Wiki-App-Secret sourced from
+      // the Tauri invoke bridge in production. Playwright has no Tauri,
+      // so stub `window.__TAURI_INTERNALS__` — the presence sentinel the
+      // frontend checks for + an `invoke` handler that answers only
+      // `get_wiki_app_secret` and rejects anything else. This exercises
+      // the same `import("@tauri-apps/api/core")`.invoke() code path the
+      // production build takes; the ACL-enforcement half of the security
+      // model is covered by the Rust test at
+      // `src-tauri/tests/wiki_app_secret_capability.rs`.
+      window.__TAURI_INTERNALS__ = {
+        transformCallback: (cb) => {
+          const id = Math.floor(Math.random() * 1_000_000);
+          window[`_${id}`] = cb;
+          return id;
+        },
+        unregisterCallback: (id) => {
+          delete window[`_${id}`];
+        },
+        invoke: async (cmd) => {
+          if (cmd !== "get_wiki_app_secret") {
+            throw new Error(`playwright IPC stub: unexpected command "${cmd}"`);
+          }
+          return "playwright-wiki-app-secret-fixture";
+        },
+      };
     });
     await page.addInitScript(({ ticket }) => {
       localStorage.setItem("wiki-sidebar-visible", "false");

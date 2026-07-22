@@ -43,22 +43,24 @@ const ROLES = ["plan", "implement", "review"] as const;
 const OUTCOMES = ["merged", "closed", "abandoned"] as const;
 const EFFORTS = ["low", "medium", "high"] as const;
 
-// --- Wiki.app origin secret (WIKI-148 round 6, Path B) ---------------------
+// --- Wiki.app origin secret (WIKI-148 round 7, Path B) ---------------------
 // Composer endpoints (`/api/composer/*`) require an `X-Wiki-App-Secret`
 // header that only the Wiki.app main process can produce. The secret is
 // minted per-startup by the backend, handed to the Tauri Rust host via a
 // marker line on stdout, and exposed to the webview through the
-// `get_wiki_app_secret` invoke command. Worker CLI sessions run outside
-// Tauri's IPC bridge and cannot obtain the value, so a curl straight to
-// `/api/composer/provision-worktree` from a worker fails with 403.
-//
-// For tests / dev outside Tauri, `window.__WIKI_APP_SECRET__` may be set
-// (playwright injects it via addInitScript). This is a testing seam, not
-// a fallback for production — production always requires Tauri.
+// `get_wiki_app_secret` invoke command (authorized by a runtime-registered
+// remote ACL capability restricted to the loopback origin — see
+// `register_wiki_app_secret_capability` in `src-tauri/src/backend.rs`).
+// Worker CLI sessions run outside Tauri's IPC bridge and cannot obtain
+// the value, so a curl straight to `/api/composer/provision-worktree`
+// from a worker fails with 403. Round 7 removes the pre-existing
+// `window.__WIKI_APP_SECRET__` global fallback because a production
+// fallback that any injected script could poison would defeat the point.
+// Playwright now stubs the Tauri IPC bridge itself; see
+// `frontend/tests/wiki-148-slash-menu.playwright.mjs`.
 
 type WindowWithComposerSecret = Window & {
   __TAURI_INTERNALS__?: unknown;
-  __WIKI_APP_SECRET__?: string;
 };
 
 let cachedWikiAppSecret: string | null = null;
@@ -69,13 +71,6 @@ async function getWikiAppSecret(): Promise<string> {
     throw new Error("Wiki.app origin secret unavailable outside a browser context");
   }
   const win = window as WindowWithComposerSecret;
-  const injected = typeof win.__WIKI_APP_SECRET__ === "string"
-    ? win.__WIKI_APP_SECRET__
-    : "";
-  if (injected) {
-    cachedWikiAppSecret = injected;
-    return injected;
-  }
   if (!("__TAURI_INTERNALS__" in win)) {
     throw new Error(
       "Composer /spawn requires the Wiki.app native shell — the Tauri IPC bridge is not available"
