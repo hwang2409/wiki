@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import {
   AlertTriangle,
   Archive,
@@ -15,6 +15,7 @@ import {
   controlAgent,
   getAgents,
   getAgentModels,
+  markAgentViewed,
   spawnAgentOrchestrator,
   spawnAgentWorker,
 } from "./api";
@@ -39,6 +40,13 @@ import { BranchPill } from "./branch-pill";
 import { StatusBadge } from "./status-badge";
 
 const STALE_SECONDS = 5 * 60;
+
+function pickLatestTimestamp(a: string | null | undefined, b: string | null | undefined): string | null {
+  if (!a) return b ?? null;
+  if (!b) return a;
+  return a > b ? a : b;
+}
+
 const SPAWN_TICKET_PATTERN = /^[A-Z0-9-]+$/;
 const ORCH_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 const DEFAULT_WORKDIR = "/Users/henry/me/fun/wiki";
@@ -1511,6 +1519,8 @@ export function AgentsSidebar({
   const [fetchedWorkers, setFetchedWorkers] = useState<AgentWorker[] | null>(null);
   const [fetchedOrchestrators, setFetchedOrchestrators] = useState<Orchestrator[]>([]);
   const [fetchedArchived, setFetchedArchived] = useState<ArchivedWorker[]>([]);
+  const [viewedOverrides, setViewedOverrides] = useState<Record<string, string>>({});
+  const viewedInflight = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     if (data) return;
@@ -1534,6 +1544,23 @@ export function AgentsSidebar({
   const workers = data?.workers ?? fetchedWorkers;
   const orchestrators = data?.orchestrators ?? fetchedOrchestrators;
   const archived = data?.archived ?? fetchedArchived;
+
+  useEffect(() => {
+    if (!activeTicket) return;
+    const worker = workers?.find((row) => row.ticket === activeTicket);
+    if (!worker) return;
+    const stamp = new Date().toISOString();
+    setViewedOverrides((current) =>
+      current[activeTicket] === stamp ? current : { ...current, [activeTicket]: stamp }
+    );
+    if (viewedInflight.current.has(activeTicket)) return;
+    viewedInflight.current.add(activeTicket);
+    markAgentViewed(activeTicket)
+      .catch(() => {})
+      .finally(() => {
+        viewedInflight.current.delete(activeTicket);
+      });
+  }, [activeTicket, workers]);
 
   if (workers === null) {
     return (
@@ -1559,20 +1586,32 @@ export function AgentsSidebar({
     onDragEnd: () => onDragEnd?.(),
   });
 
-  const workerRow = (worker: AgentWorker, indent: boolean) => (
-    <button
-      className={`nav-agent${indent ? " is-owned" : ""}${activeTicket === worker.ticket ? " is-active" : ""}`}
-      key={worker.ticket}
-      type="button"
-      onClick={() => onOpen(worker.ticket)}
-      {...dragProps(worker.ticket)}
-    >
-      <span className={`nav-agent-dot is-${worker.state ?? "unknown"}`} />
-      <span className="nav-agent-ticket">{worker.ticket}</span>
-      <span className="nav-agent-meta">{stateLabel(worker)}</span>
-      <span className="nav-agent-age tabular-nums">{ageLabel(worker.status_age_seconds)}</span>
-    </button>
-  );
+  const hasUnread = (worker: AgentWorker): boolean => {
+    if (!worker.latest_event_at) return false;
+    const override = viewedOverrides[worker.ticket];
+    const viewed = pickLatestTimestamp(worker.last_viewed_at, override);
+    if (!viewed) return true;
+    return worker.latest_event_at > viewed;
+  };
+
+  const workerRow = (worker: AgentWorker, indent: boolean) => {
+    const unread = hasUnread(worker);
+    return (
+      <button
+        className={`nav-agent${indent ? " is-owned" : ""}${activeTicket === worker.ticket ? " is-active" : ""}${unread ? " has-unread" : ""}`}
+        key={worker.ticket}
+        type="button"
+        onClick={() => onOpen(worker.ticket)}
+        {...dragProps(worker.ticket)}
+      >
+        {unread ? <span aria-label="unread" className="nav-agent-unread" data-testid="nav-agent-unread" /> : null}
+        <span className={`nav-agent-dot is-${worker.state ?? "unknown"}`} />
+        <span className="nav-agent-ticket">{worker.ticket}</span>
+        <span className="nav-agent-meta">{stateLabel(worker)}</span>
+        <span className="nav-agent-age tabular-nums">{ageLabel(worker.status_age_seconds)}</span>
+      </button>
+    );
+  };
 
   return (
     <div className="nav-agents">

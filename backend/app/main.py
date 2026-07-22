@@ -769,6 +769,7 @@ class NoteLinks(BaseModel):
 
 AGENT_REGISTRY_PATH = Path(os.environ.get("WIKI_AGENT_REGISTRY_PATH") or "/tmp/agent-registry.json")
 AGENT_STATUS_DIR = Path(os.environ.get("WIKI_AGENT_STATUS_DIR") or "/tmp/agent-status")
+AGENT_VIEWED_PATH = Path(os.environ.get("WIKI_AGENT_VIEWED_PATH") or "/tmp/agent-viewed.json")
 AGENT_ARCHIVE_DIR = Path(
     os.environ.get("WIKI_AGENT_ARCHIVE_DIR") or Path.home() / "me" / "fun" / "agent-archive"
 )
@@ -917,6 +918,31 @@ def read_agent_status(ticket: str) -> dict | None:
         return data
     except (OSError, ValueError):
         return None
+
+
+def _read_viewed_map() -> dict[str, str]:
+    try:
+        data = json.loads(AGENT_VIEWED_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        str(ticket): value
+        for ticket, value in data.items()
+        if isinstance(ticket, str) and isinstance(value, str)
+    }
+
+
+def _write_viewed_map(data: dict[str, str]) -> None:
+    AGENT_VIEWED_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = AGENT_VIEWED_PATH.with_suffix(AGENT_VIEWED_PATH.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+    tmp_path.replace(AGENT_VIEWED_PATH)
+
+
+def _isoformat_utc(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
 
 def _archive_role(session_dir: Path) -> str | None:
@@ -1218,6 +1244,8 @@ def agents() -> dict[str, object]:
         if not supervisor_alive:
             supervisor_health["detail"] = "supervisor PID is absent or not running"
     now = datetime.now(tz=timezone.utc).timestamp()
+    viewed_map = _read_viewed_map()
+    viewed_backfill: dict[str, str] = {}
     workers = []
     orchestrators = []
     seen_tickets = set()
@@ -1266,6 +1294,13 @@ def agents() -> dict[str, object]:
                 }
             )
             continue
+        latest_event_at = (
+            _isoformat_utc(status["_mtime"]) if status else None
+        )
+        last_viewed_at = viewed_map.get(ticket)
+        if latest_event_at is not None and last_viewed_at is None:
+            last_viewed_at = latest_event_at
+            viewed_backfill[ticket] = latest_event_at
         workers.append(
             {
                 "ticket": ticket,
@@ -1296,6 +1331,8 @@ def agents() -> dict[str, object]:
                 "status_age_seconds": (
                     int(now - status["_mtime"]) if status else None
                 ),
+                "latest_event_at": latest_event_at,
+                "last_viewed_at": last_viewed_at,
             }
         )
 
@@ -1306,6 +1343,13 @@ def agents() -> dict[str, object]:
             if ticket in seen_tickets:
                 continue
             status = read_agent_status(ticket)
+            latest_event_at = (
+                _isoformat_utc(status["_mtime"]) if status else None
+            )
+            last_viewed_at = viewed_map.get(ticket)
+            if latest_event_at is not None and last_viewed_at is None:
+                last_viewed_at = latest_event_at
+                viewed_backfill[ticket] = latest_event_at
             workers.append(
                 {
                     "ticket": ticket,
@@ -1328,6 +1372,8 @@ def agents() -> dict[str, object]:
                     "status_age_seconds": (
                         int(now - status["_mtime"]) if status else None
                     ),
+                    "latest_event_at": latest_event_at,
+                    "last_viewed_at": last_viewed_at,
                 }
             )
 
@@ -1356,12 +1402,31 @@ def agents() -> dict[str, object]:
             }
         )
 
+    if viewed_backfill:
+        merged = {**viewed_map, **viewed_backfill}
+        try:
+            _write_viewed_map(merged)
+        except OSError:
+            pass
+
     return {
         "workers": workers,
         "orchestrators": orchestrators,
         "archived": list_archived(),
         "supervisor": supervisor_health,
     }
+
+
+@app.post("/api/agents/{agent_id}/viewed")
+def mark_agent_viewed(agent_id: str) -> dict[str, str]:
+    raw_id = agent_id.strip()
+    if not raw_id or not valid_agent_id(raw_id):
+        raise HTTPException(status_code=400, detail="Bad agent id")
+    viewed_map = _read_viewed_map()
+    now_iso = datetime.now(tz=timezone.utc).isoformat()
+    viewed_map[raw_id] = now_iso
+    _write_viewed_map(viewed_map)
+    return {"ticket": raw_id, "last_viewed_at": now_iso}
 
 
 @app.get("/api/dashboard/tickets")

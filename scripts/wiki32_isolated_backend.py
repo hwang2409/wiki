@@ -61,6 +61,7 @@ def main_cli() -> None:
             "WIKI_AGENT_STATUS_DIR": str(args.status_dir),
             "WIKI_AGENT_ARCHIVE_DIR": str(archive_dir),
             "WIKI_AGENT_TMP_DIR": str(agent_tmp_dir),
+            "WIKI_AGENT_VIEWED_PATH": str(fixture_root / "agent-viewed.json"),
             "WIKI_MSG_QUEUE_PATH": str(args.queue),
             "WIKI_AGENT_RUNTIME_DIR": str(runtime_dir),
             "WIKI_KNOWLEDGE_DB_PATH": str(fixture_root / "knowledge.db"),
@@ -85,6 +86,7 @@ def main_cli() -> None:
     main.AGENT_STATUS_DIR = args.status_dir
     main.AGENT_ARCHIVE_DIR = archive_dir
     main.AGENT_TMP_DIR = agent_tmp_dir
+    main.AGENT_VIEWED_PATH = fixture_root / "agent-viewed.json"
     main.MSG_QUEUE_PATH = args.queue
     transcripts.CODEX_SESSIONS_DIR = args.codex_sessions_dir
     transcripts.CLAUDE_PROJECTS_DIR = claude_projects_dir

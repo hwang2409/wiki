@@ -162,6 +162,8 @@ export type AgentWorker = AgentSession & {
   step: string | null;
   blocker: string | null;
   status_age_seconds: number | null;
+  latest_event_at: string | null;
+  last_viewed_at: string | null;
 };
 
 export type ArchivedWorker = {
@@ -201,6 +203,13 @@ export function getAgents() {
     orchestrators: Orchestrator[];
     archived: ArchivedWorker[];
   }>("/api/agents");
+}
+
+export function markAgentViewed(ticket: string) {
+  return request<{ ticket: string; last_viewed_at: string }>(
+    `/api/agents/${encodeURIComponent(ticket)}/viewed`,
+    { method: "POST" }
+  );
 }
 
 export type DashboardTicket = {

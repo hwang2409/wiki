@@ -6090,6 +6090,7 @@ body.is-resizing-panes .pane-cell {
 }
 
 .nav-agent {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 7px;
@@ -6102,6 +6103,22 @@ body.is-resizing-panes .pane-cell {
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-ui-smaller);
   text-align: left;
+}
+
+.nav-agent-unread {
+  position: absolute;
+  top: 50%;
+  left: -1px;
+  width: 6px;
+  height: 6px;
+  transform: translateY(-50%);
+  border-radius: 50%;
+  background-color: var(--accent-primary);
+  pointer-events: none;
+}
+
+.nav-agent.has-unread .nav-agent-ticket {
+  color: var(--text-normal);
 }
 
 .nav-agent:hover {
