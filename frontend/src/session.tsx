@@ -25,7 +25,6 @@ import {
   GitPullRequest,
   Hourglass,
   ListTodo,
-  Lock,
   MessageCircleQuestion,
   Pencil,
   Radio,
@@ -73,12 +72,15 @@ import {
   GhPreviewCard,
   containsGitHubPreviewUrl,
   isGitHubPreviewUrl,
-  splitGitHubPreviewSegments,
+  renderAnsiWithGitHubPreviews,
 } from "./github-preview";
 import { LoadingPlaceholder } from "./loading";
 import { createStateKeyWriteBarrier, deletePaneStateEntries } from "./pane-state-cache";
 import { Timestamp } from "./timestamp";
 import { StatusBadge } from "./status-badge";
+import { BoundedPreview } from "./transcript-preview";
+import { markerRule } from "./hook-message-registry";
+import type { MarkerSeverity } from "./hook-message-registry";
 import {
   addPendingUserMessage,
   composerTextMatches,
@@ -463,8 +465,6 @@ function ProviderPendingRequestCard({
     <div className="session-provider-request">
       <div className="session-provider-request-head">
         <span>Action required</span>
-        <span>{request.request_kind}</span>
-        <span>request {String(request.request_id)}</span>
       </div>
       {questions.length > 0 ? (
         <div className="session-provider-questions">
@@ -512,7 +512,7 @@ function ProviderPendingRequestCard({
         </div>
       ) : (
         <label className="session-provider-json-response">
-          <span>Provider response JSON</span>
+          <span>Advanced response</span>
           <textarea
             spellCheck={false}
             value={responseText}
@@ -524,10 +524,6 @@ function ProviderPendingRequestCard({
         </label>
       )}
       <div className="session-provider-request-actions">
-        <details>
-          <summary>Raw request</summary>
-          <pre>{JSON.stringify(request.payload, null, 2)}</pre>
-        </details>
         <button disabled={sending || sent} type="button" onClick={() => void submit()}>
           {sent
             ? "Response sent"
@@ -535,9 +531,19 @@ function ProviderPendingRequestCard({
               ? "Sending…"
               : questions.length
                 ? "Send answers"
-                : "Send JSON"}
+                : "Send response"}
         </button>
       </div>
+      <details className="session-provider-request-details">
+        <summary>Details</summary>
+        <dl className="session-provider-request-meta">
+          <dt>kind</dt>
+          <dd>{request.request_kind}</dd>
+          <dt>request id</dt>
+          <dd>{String(request.request_id)}</dd>
+        </dl>
+        <pre>{JSON.stringify(request.payload, null, 2)}</pre>
+      </details>
       {error ? <div className="session-provider-request-error">{error}</div> : null}
     </div>
   );
@@ -986,10 +992,7 @@ function ToolRow({
   const Icon = ARCHETYPE_ICONS[tool.archetype] ?? Terminal;
   const summary = tool.summary || tool.input.split("\n")[0].slice(0, 120);
   const running = tool.output === null && tool.ok === null;
-  const outputSegments =
-    tool.output && containsGitHubPreviewUrl(tool.output)
-      ? splitGitHubPreviewSegments(tool.output)
-      : null;
+  const hasGitHubPreview = !!tool.output && containsGitHubPreviewUrl(tool.output);
   return (
     <div className={`session-tool${open ? " is-open" : ""}`}>
       <button className="session-tool-head" type="button" onClick={() => setOpen(!open)}>
@@ -999,7 +1002,7 @@ function ToolRow({
           {summary}
         </span>
         {running ? <span className="session-tool-running" title="running" /> : null}
-        {tool.ok === false ? <span className="session-tool-err">err</span> : null}
+        {tool.ok === false ? <span className="session-tool-err">failed</span> : null}
         {tool.agent_id && onInspect ? (
           <span
             className="session-tool-inspect"
@@ -1023,24 +1026,39 @@ function ToolRow({
       <div className={`session-collapsible session-tool-collapsible${open ? " is-open" : ""}`}>
         <div className="session-collapsible-inner">
           <div className="session-tool-body">
-            {tool.name === "Bash" ? (
-              <ShikiCode className="session-tool-input" code={tool.input} lang="bash" />
-            ) : (
-              <pre>{tool.input}</pre>
-            )}
-            {outputSegments ? (
-              <div className="session-tool-output-blocks">
-                {outputSegments.map((segment, index) =>
-                  segment.type === "url" ? (
-                    <GhPreviewCard key={`${segment.value}:${index}`} url={segment.value} />
-                  ) : segment.value ? (
-                    <pre className="session-tool-output" key={`text:${index}`}>
-                      {renderAnsi(segment.value)}
-                    </pre>
-                  ) : null
+            {tool.name === "Bash" && tool.input ? (
+              <BoundedPreview
+                label="input"
+                text={tool.input}
+                renderBody={({ text }) => (
+                  <ShikiCode className="session-tool-input" code={text} lang="bash" transparent />
                 )}
-              </div>
-            ) : tool.output ? <pre className="session-tool-output">{renderAnsi(tool.output)}</pre> : null}
+              />
+            ) : tool.input ? (
+              <BoundedPreview label="input" text={tool.input} />
+            ) : null}
+            {hasGitHubPreview ? (
+              <BoundedPreview
+                ansi
+                label="output"
+                text={tool.output ?? ""}
+                tone={tool.ok === false ? "error" : "normal"}
+                renderBody={({ text }) => (
+                  <div className="session-tool-output-blocks">
+                    <span className="session-tool-output-text">
+                      {renderAnsiWithGitHubPreviews(text)}
+                    </span>
+                  </div>
+                )}
+              />
+            ) : tool.output ? (
+              <BoundedPreview
+                ansi
+                label="output"
+                text={tool.output}
+                tone={tool.ok === false ? "error" : "normal"}
+              />
+            ) : null}
           </div>
         </div>
       </div>
@@ -1180,46 +1198,32 @@ const sessionMarkdownComponents = {
   table: MarkdownTable,
 };
 
-function BashBlock({
-  event,
-  stateKey,
-  uiState,
-}: {
-  event: SessionEvent;
-  stateKey: string;
-  uiState: SessionUiState;
-}) {
+function BashBlock({ event }: { event: SessionEvent }) {
   const bash = event.bash ?? { input: "", stdout: "", stderr: "" };
-  const output = [bash.stdout, bash.stderr].filter(Boolean).join("\n");
-  const canCollapse = output.length > 700 || output.split("\n").length > 14;
-  const [open, setOpen] = useStoredBooleanState(uiState, stateKey, !canCollapse);
   return (
-    <div className={`session-bash${open ? " is-open" : ""}${canCollapse ? " is-collapsible" : ""}`}>
+    <div className="session-bash">
       {bash.input ? (
-        <div className="session-bash-command">
-          <span className="session-bash-prompt">❯</span>
-          <ShikiCode
-            className="session-bash-command-code"
-            code={bash.input}
-            lang="bash"
-            transparent
-          />
-        </div>
-      ) : null}
-      {output ? (
-        <div className={`session-collapsible session-bash-collapsible${open ? " is-open" : ""}`}>
-          <div className="session-collapsible-inner">
-            <div className="session-bash-body">
-              {bash.stdout ? <pre className="session-bash-stdout">{renderAnsi(bash.stdout)}</pre> : null}
-              {bash.stderr ? <pre className="session-bash-stderr">{renderAnsi(bash.stderr)}</pre> : null}
+        <BoundedPreview
+          label="command"
+          text={bash.input}
+          renderBody={({ text }) => (
+            <div className="session-bash-command">
+              <span className="session-bash-prompt">❯</span>
+              <ShikiCode
+                className="session-bash-command-code"
+                code={text}
+                lang="bash"
+                transparent
+              />
             </div>
-          </div>
-        </div>
+          )}
+        />
       ) : null}
-      {canCollapse ? (
-        <button className="session-expand" type="button" onClick={() => setOpen((value) => !value)}>
-          {open ? "collapse output" : "expand output"}
-        </button>
+      {bash.stdout ? (
+        <BoundedPreview ansi label="output" text={bash.stdout} />
+      ) : null}
+      {bash.stderr ? (
+        <BoundedPreview ansi label="error" tone="error" text={bash.stderr} />
       ) : null}
     </div>
   );
@@ -1287,21 +1291,28 @@ function PrRow({ pr, text }: { pr: SessionPr | undefined; text: string }) {
   );
 }
 
+const MARKER_ICON: Record<MarkerSeverity, LucideIcon> = {
+  info: Radio,
+  warn: AlertTriangle,
+  error: AlertTriangle,
+};
+
 function MarkerRow({ text, marker }: { text: string; marker?: string }) {
-  const Icon =
-    marker === "api_error"
-      ? AlertTriangle
-      : marker === "permission-mode"
-        ? Lock
-        : marker === "progress" || marker === "subagent"
-          ? Bot
-          : marker === "tool_reference"
-            ? Wrench
-            : Radio;
+  const rule = markerRule(marker);
+  if (!rule) {
+    return (
+      <details className="session-marker-hidden">
+        <summary>run detail</summary>
+        <span>{text}</span>
+      </details>
+    );
+  }
+  const Icon = MARKER_ICON[rule.severity];
+  const rendered = rule.verb ? `${rule.verb} · ${text}` : text;
   return (
-    <div className={`session-marker is-${marker ?? "info"}`}>
+    <div className={`session-marker is-${rule.severity}`} data-marker={marker}>
       <Icon size={12} />
-      <span>{text}</span>
+      <span>{rendered}</span>
     </div>
   );
 }
@@ -1490,7 +1501,7 @@ const MessageBlock = memo(function MessageBlock({
     );
   }
   if (event.kind === "bash") {
-    return <BashBlock event={event} stateKey={`bash:${rowKey}`} uiState={uiState} />;
+    return <BashBlock event={event} />;
   }
   if (event.kind === "tasks") {
     return <TaskListRow event={event} stateKey={`tasks:${rowKey}`} uiState={uiState} />;

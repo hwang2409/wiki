@@ -132,7 +132,9 @@ async function main() {
     for (const tool of await tools.all()) {
       await tool.locator(".session-tool-head").click();
     }
-    const toolOutputs = page.locator(".session-tool-output");
+    const toolOutputs = page.locator(
+      ".session-tool .transcript-preview:has(.transcript-preview-label:text-is(\"output\")) .transcript-preview-body"
+    );
     const longToolOutput = toolOutputs.nth(0);
     const shortToolOutput = toolOutputs.nth(1);
     await shortToolOutput.waitFor({ state: "visible" });

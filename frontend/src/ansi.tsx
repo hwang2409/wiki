@@ -114,7 +114,7 @@ export function parseAnsi(text: string): AnsiSegment[] {
   return segments;
 }
 
-function classNamesFor(style: AnsiStyle): string {
+export function classNamesFor(style: AnsiStyle): string {
   const cs: string[] = [];
   if (style.bold) cs.push("ansi-bold");
   if (style.italic) cs.push("ansi-italic");

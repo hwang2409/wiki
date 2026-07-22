@@ -1,6 +1,7 @@
-import { Fragment, useEffect, useState } from "react";
+import { Fragment, useEffect, useState, type ReactNode } from "react";
 import { GitCommit, GitPullRequest, Info } from "lucide-react";
 import { externalLinkProps } from "./external-links";
+import { classNamesFor, parseAnsi } from "./ansi";
 import { getGhPreview, type GhPreviewData } from "./api";
 
 const GITHUB_PREVIEW_URL_PATTERN =
@@ -45,6 +46,34 @@ export function splitGitHubPreviewSegments(text: string): GitHubPreviewSegment[]
       type: isGitHubPreviewUrl(part) ? "url" : "text",
       value: part,
     }));
+}
+
+// Parse ANSI FIRST so SGR state and OSC escapes stay intact, then split each
+// styled visible-text run on GitHub URLs. Splitting raw bytes before ANSI parse
+// would sever SGR state across the URL boundary and could bisect OSC escapes.
+export function renderAnsiWithGitHubPreviews(text: string): ReactNode[] {
+  const ansiSegments = parseAnsi(text);
+  const nodes: ReactNode[] = [];
+  let key = 0;
+  for (const seg of ansiSegments) {
+    if (!seg.text) continue;
+    const ansiClass = classNamesFor(seg.style);
+    for (const part of splitGitHubPreviewSegments(seg.text)) {
+      if (!part.value) continue;
+      if (part.type === "url") {
+        nodes.push(<GhPreviewCard key={`url:${key++}:${part.value}`} url={part.value} />);
+      } else if (ansiClass) {
+        nodes.push(
+          <span key={`text:${key++}`} className={ansiClass}>
+            {part.value}
+          </span>
+        );
+      } else {
+        nodes.push(<Fragment key={`text:${key++}`}>{part.value}</Fragment>);
+      }
+    }
+  }
+  return nodes;
 }
 
 function humanizeState(value: string | null | undefined) {

@@ -166,7 +166,7 @@ async function main() {
       .filter({ hasText: "monitor: while true; do sleep 45; done" })
       .first();
     await monitorTool.locator(".session-tool-head").click();
-    await expectVisibleText(page, ".session-tool-output", "Monitor started (task task123");
+    await expectVisibleText(page, ".transcript-preview-body", "Monitor started (task task123");
 
     logStep("capturing Claude screenshot");
     await page.screenshot({ path: path.join(OUT_DIR, "claude-native-surfaces.png"), fullPage: true });
