@@ -93,8 +93,12 @@ async def lifespan(_app: FastAPI):
     configured_backend = os.environ.get("WIKI_BACKEND_URL")
     if configured_backend:
         backend_runtime.publish_backend_url(configured_backend)
-    # Stamp the WIKI-147 unread-dot deploy cutoff BEFORE any request handling.
+    # Stamp the WIKI-147 unread-dot deploy cutoff BEFORE any request handling
+    # and snapshot per-run viewed baselines for every pre-deploy run so events
+    # arriving between startup and the first /api/agents call still render as
+    # unread (WIKI-147 R5 B1).
     _ensure_deploy_timestamp()
+    _snapshot_startup_baselines()
     terminal.refresh_boot_token()
     # Prime the tracker so the first /api/providers/health request is populated.
     try:
@@ -1146,32 +1150,70 @@ def _ensure_run_baseline(
 
     Idempotent: once ``runs/<id>/viewed-baseline.json`` exists, subsequent calls
     return the persisted value verbatim — future events with seq > baseline_seq
-    then render as unread (WIKI-147 R4 B1). Uses O_EXCL to make the initial
-    write race-safe across concurrent readers.
+    then render as unread (WIKI-147 R4 B1). Writes atomically via a tempfile +
+    ``os.replace`` so concurrent readers never see a half-written sidecar
+    (WIKI-147 R5 B1).
     """
 
     existing_at, existing_seq = _load_run_baseline(run_id)
     if existing_seq is not None and existing_at is not None:
         return existing_at, existing_seq
     path = _baseline_path(run_id)
-    payload = json.dumps({"at": latest_at, "seq": latest_seq}, sort_keys=True)
     path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-    except FileExistsError:
-        stored_at, stored_seq = _load_run_baseline(run_id)
-        if stored_seq is not None and stored_at is not None:
-            return stored_at, stored_seq
-        return latest_at, latest_seq
+    payload = json.dumps({"at": latest_at, "seq": latest_seq}, sort_keys=True)
+    fd, raw_tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    tmp = Path(raw_tmp)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
+        os.replace(tmp, path)
     except Exception:
-        path.unlink(missing_ok=True)
+        tmp.unlink(missing_ok=True)
         raise
+    # A concurrent writer's replace() may have won the race; return whatever
+    # is now durable so every caller sees the same snapshot.
+    stored_at, stored_seq = _load_run_baseline(run_id)
+    if stored_seq is not None and stored_at is not None:
+        return stored_at, stored_seq
     return latest_at, latest_seq
+
+
+def _snapshot_startup_baselines() -> None:
+    """Freeze per-run viewed baselines for every pre-deploy run at boot.
+
+    Invoked from the FastAPI lifespan BEFORE requests are served so events
+    that land between startup and the first ``/api/agents`` call still render
+    as unread — without this, request-time lazy baselining would classify
+    those events as already-viewed. Runs created at/after the deploy cutoff
+    keep a NULL baseline and their events render as unread naturally
+    (WIKI-147 R5 B1).
+    """
+
+    if not AGENT_RUNS_DIR.is_dir():
+        return
+    deploy_at = _ensure_deploy_timestamp()
+    try:
+        entries = list(AGENT_RUNS_DIR.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        run_id = entry.name
+        if not RUN_ID_PATTERN.fullmatch(run_id) or not entry.is_dir():
+            continue
+        if _baseline_path(run_id).is_file():
+            continue
+        created_at = _load_run_created_at(run_id)
+        if created_at is not None and created_at >= deploy_at:
+            continue
+        latest_at, latest_seq = _load_run_freshness(run_id)
+        if latest_at is None or latest_seq is None:
+            continue
+        try:
+            _ensure_run_baseline(run_id, latest_at, latest_seq)
+        except OSError:
+            continue
 
 
 def _resolve_viewed_fields(

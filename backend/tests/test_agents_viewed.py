@@ -245,6 +245,127 @@ class AgentsViewedTests(unittest.TestCase):
         )
         self.assertEqual(baseline["seq"], 5)
 
+    def test_startup_snapshot_freezes_baseline_before_first_request(self) -> None:
+        # WIKI-147 R5 B1: baselines must be frozen at boot, not at first
+        # /api/agents request. Simulate a pre-deploy run, run the startup
+        # snapshot, then let a durable event advance seq — the event must
+        # render as unread instead of being classified as viewed.
+        run_id = _new_run_id()
+        self._seed_worker(
+            "WIKI-147-B1",
+            run_id=run_id,
+            seq=5,
+            updated_at=_iso(0),
+            created_at=_iso(-60),
+        )
+
+        # Boot-time snapshot: no requests have been served yet.
+        main._snapshot_startup_baselines()
+
+        # Event arrives BEFORE the first request. Under the pre-R5 code path
+        # this would be classified as viewed (baseline == latest at first
+        # request). Under R5 the baseline was frozen at boot at seq=5.
+        self._write_run(run_id, seq=8, updated_at=_iso(30), created_at=_iso(-60))
+
+        payload = main.agents()
+        worker = next(
+            row for row in cast(list[dict[str, Any]], payload["workers"])
+            if row["ticket"] == "WIKI-147-B1"
+        )
+        self.assertEqual(worker["latest_event_seq"], 8)
+        self.assertEqual(worker["last_viewed_seq"], 5)
+
+        baseline = json.loads(
+            (self.runs_dir / run_id / "viewed-baseline.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(baseline["seq"], 5)
+
+    def test_startup_snapshot_skips_post_deploy_runs(self) -> None:
+        # Runs created at/after the deploy cutoff must NOT be baselined at
+        # startup — their events should render as unread naturally.
+        run_id = _new_run_id()
+        self._seed_worker(
+            "WIKI-147-B1-POST",
+            run_id=run_id,
+            seq=2,
+            updated_at=_iso(120),
+            created_at=_iso(60),
+        )
+
+        main._snapshot_startup_baselines()
+
+        self.assertFalse(
+            (self.runs_dir / run_id / "viewed-baseline.json").exists(),
+            "post-deploy runs must not have a baseline written at startup",
+        )
+        payload = main.agents()
+        worker = next(
+            row for row in cast(list[dict[str, Any]], payload["workers"])
+            if row["ticket"] == "WIKI-147-B1-POST"
+        )
+        self.assertIsNone(worker["last_viewed_seq"])
+
+    def test_baseline_writes_leave_no_partial_files_on_concurrent_write(self) -> None:
+        # WIKI-147 R5 B1: the atomic tempfile+os.replace path must ensure a
+        # concurrent reader either sees a fully-formed sidecar or no file at
+        # all — never partial JSON. Drive many parallel writers and readers
+        # against the same run and verify no reader ever decodes garbage.
+        run_id = _new_run_id()
+        run_dir = self.runs_dir / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        errors: list[str] = []
+        stop = threading.Event()
+
+        def writer(seq: int) -> None:
+            path = run_dir / "viewed-baseline.json"
+            for _ in range(50):
+                # Force a fresh write each iteration by unlinking the sidecar
+                # and reinvoking the atomic write path.
+                path.unlink(missing_ok=True)
+                try:
+                    main._ensure_run_baseline(run_id, _iso(seq), seq)
+                except Exception as exc:  # pragma: no cover - defensive
+                    errors.append(f"writer{seq}: {exc!r}")
+
+        def reader() -> None:
+            path = run_dir / "viewed-baseline.json"
+            while not stop.is_set():
+                try:
+                    raw = path.read_text(encoding="utf-8")
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    errors.append(f"reader: {exc!r}")
+                    continue
+                try:
+                    payload = json.loads(raw)
+                except ValueError as exc:
+                    errors.append(f"reader partial-json: {exc!r}: {raw!r}")
+                    continue
+                if not isinstance(payload, dict) or "seq" not in payload or "at" not in payload:
+                    errors.append(f"reader partial-payload: {payload!r}")
+
+        writers = [threading.Thread(target=writer, args=(seq,)) for seq in range(1, 5)]
+        readers = [threading.Thread(target=reader) for _ in range(4)]
+        for thread in readers + writers:
+            thread.start()
+        for thread in writers:
+            thread.join()
+        stop.set()
+        for thread in readers:
+            thread.join()
+
+        self.assertFalse(errors, f"partial-file race observed: {errors[:5]}")
+
+        # No temp files should be left behind after successful writes.
+        leftovers = [
+            child.name
+            for child in run_dir.iterdir()
+            if child.name.startswith(".viewed-baseline.json.")
+        ]
+        self.assertFalse(leftovers, f"tempfile leftovers not cleaned: {leftovers}")
+
     def test_deploy_marker_persists_across_reboot(self) -> None:
         run_id = _new_run_id()
         self._seed_worker(

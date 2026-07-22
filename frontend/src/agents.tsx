@@ -1599,6 +1599,14 @@ export function AgentsSidebar({
     };
     viewedInflight.current.set(runId, controller);
 
+    const markFailed = () => {
+      viewedInflight.current.delete(runId);
+      setViewedFailed((current) => {
+        if (current[runId]) return current;
+        return { ...current, [runId]: true };
+      });
+    };
+
     const runPost = (): void => {
       const state = viewedInflight.current.get(runId);
       if (!state) return;
@@ -1606,13 +1614,28 @@ export function AgentsSidebar({
       const seq = state.targetSeq;
       markRunViewed(runId, seq)
         .then((result) => {
-          viewedInflight.current.delete(runId);
           setViewedOverrides((current) => {
             const prior = current[runId] ?? -1;
             const next = Math.max(prior, result.last_viewed_seq, seq);
             if (next <= prior) return current;
             return { ...current, [runId]: next };
           });
+          const active = viewedInflight.current.get(runId);
+          // Coalesced target advanced while THIS POST was in flight — the
+          // just-persisted seq is now stale. Issue a follow-up against the
+          // same attempt budget so the max target eventually reaches the
+          // server (WIKI-147 R5 H1). Success on the follow-up walks the
+          // override forward; budget exhaustion falls through to the failed
+          // indicator, matching catch()-path semantics.
+          if (active && active.targetSeq > seq) {
+            if (active.attempts >= MAX_ATTEMPTS) {
+              markFailed();
+              return;
+            }
+            runPost();
+            return;
+          }
+          viewedInflight.current.delete(runId);
         })
         .catch(() => {
           const active = viewedInflight.current.get(runId);
@@ -1626,11 +1649,7 @@ export function AgentsSidebar({
             viewedRetryTimers.current.set(runId, timer);
             return;
           }
-          viewedInflight.current.delete(runId);
-          setViewedFailed((current) => {
-            if (current[runId]) return current;
-            return { ...current, [runId]: true };
-          });
+          markFailed();
         });
     };
 
