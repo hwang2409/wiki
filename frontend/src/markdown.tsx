@@ -5,6 +5,7 @@ import rehypeKatex from "rehype-katex";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
+import { CopyPill } from "./copy-button";
 import { ShikiCode } from "./shiki";
 import {
   AlertTriangle,
@@ -606,7 +607,12 @@ export function MarkdownPre({
         </Suspense>
       );
     }
-    return <ShikiCode className="markdown-code-block" code={code} lang={lang} />;
+    return (
+      <div className="markdown-code-block-wrap" data-lang={lang ?? undefined}>
+        <ShikiCode className="markdown-code-block" code={code} lang={lang} />
+        <CopyPill className="markdown-code-copy" getText={() => code} />
+      </div>
+    );
   }
   return <pre {...rest}>{children}</pre>;
 }

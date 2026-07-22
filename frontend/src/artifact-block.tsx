@@ -25,6 +25,7 @@ import type {
   SessionEvent,
 } from "./api";
 import { classifyArtifact } from "./artifact-kind";
+import { DiffPatchView } from "./diff-view";
 import { ShikiCode, useCurrentTheme } from "./shiki";
 import { SplitDiffView } from "./split-diff";
 import { StatusBadge, statusToTone } from "./status-badge";
@@ -549,15 +550,10 @@ export function ArtifactRenderer(props: ArtifactRendererProps): ReactNode {
 }
 
 function DiffRenderer({ artifact }: { artifact: SessionArtifact }) {
-  const patch = artifact.source ?? "";
   return (
-    <SplitDiffView
-      className="artifact-diff"
-      emptyClassName="artifact-diff-empty"
-      emptyMessage="No diff to display."
-      patch={patch}
-      viewType="unified"
-    />
+    <div className="artifact-diff">
+      <DiffPatchView source={artifact.source ?? ""} />
+    </div>
   );
 }
 
@@ -732,13 +728,9 @@ function CompactPreview({ artifact, event, onRenderError, ticket }: ArtifactRend
     const previewSource = lines.slice(0, 40).join("\n");
     return (
       <div className="artifact-compact-diff">
-        <SplitDiffView
-          className="artifact-diff"
-          emptyClassName="artifact-diff-empty"
-          emptyMessage="No diff to display."
-          patch={previewSource}
-          viewType="unified"
-        />
+        <div className="artifact-diff">
+          <DiffPatchView source={previewSource} />
+        </div>
         <span className="artifact-compact-summary">… {Math.max(0, lines.length - 40)} lines folded · Open in panel</span>
       </div>
     );

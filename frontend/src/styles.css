@@ -8495,3 +8495,255 @@ body.is-resizing-panes .pane-cell {
   line-height: 1.5;
   color: var(--text-normal);
 }
+
+/* WIKI-149 — code-block copy button */
+
+.markdown-code-block-wrap {
+  position: relative;
+  margin: 0 0 1em;
+}
+
+.markdown-code-block-wrap .shiki-block {
+  margin: 0;
+}
+
+.copy-pill {
+  padding: 3px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-xs);
+  background-color: color-mix(in srgb, var(--background-primary) 88%, transparent);
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: 11px;
+  line-height: 1;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  backdrop-filter: blur(4px);
+  transition: color 120ms ease, background-color 120ms ease, border-color 120ms ease;
+}
+
+.copy-pill:hover {
+  color: var(--text-normal);
+  border-color: var(--text-faint);
+  background-color: var(--background-primary);
+}
+
+.copy-pill:focus-visible {
+  outline: none;
+  color: var(--text-normal);
+  border-color: var(--text-normal);
+}
+
+.copy-pill.is-copied {
+  color: var(--accent-success);
+  border-color: color-mix(in srgb, var(--accent-success) 55%, var(--background-modifier-border));
+}
+
+.markdown-code-copy {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  opacity: 0;
+  transform: translateY(-1px);
+  transition: opacity 120ms ease, transform 120ms ease;
+  pointer-events: none;
+}
+
+.markdown-code-block-wrap:hover .markdown-code-copy,
+.markdown-code-block-wrap:focus-within .markdown-code-copy,
+.markdown-code-copy:focus-visible,
+.markdown-code-copy.is-copied {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+
+@media (hover: none) {
+  .markdown-code-copy {
+    opacity: 1;
+    transform: translateY(0);
+    pointer-events: auto;
+  }
+}
+
+/* WIKI-149 — diff artifact renderer */
+
+.artifact-detail-diff {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.artifact-detail-diff-scroll {
+  flex: 1;
+  min-height: 0;
+  padding: 12px;
+  overflow: auto;
+}
+
+.diff-file-kind {
+  margin-left: auto;
+  padding: 1px 6px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-xs);
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: calc(var(--font-ui-smaller) - 1px);
+  letter-spacing: 0.02em;
+  text-transform: lowercase;
+  white-space: nowrap;
+}
+
+.diff-file-meta {
+  padding: 6px 12px;
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--font-ui-smaller);
+  font-style: italic;
+  line-height: 1.55;
+}
+
+.diff-file-meta-line + .diff-file-meta-line {
+  margin-top: 2px;
+}
+
+.diff-view {
+  overflow: hidden;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  background-color: var(--code-background);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--font-ui-smaller);
+  color: var(--text-normal);
+}
+
+.diff-view-empty {
+  padding: 10px 14px;
+  border: 1px dashed var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  background-color: var(--background-secondary);
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+}
+
+.diff-file + .diff-file {
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+.diff-file-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  background-color: var(--background-secondary);
+  color: var(--text-normal);
+}
+
+.diff-file-path {
+  overflow: hidden;
+  font-family: var(--font-monospace);
+  font-weight: var(--fw-semibold);
+  font-size: var(--font-ui-smaller);
+  letter-spacing: 0.01em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.diff-file-body {
+  overflow-x: auto;
+}
+
+.diff-hunk-header {
+  padding: 4px 12px;
+  border-top: 1px solid var(--background-modifier-border);
+  border-bottom: 1px solid var(--background-modifier-border);
+  background-color: color-mix(in srgb, var(--background-secondary) 60%, transparent);
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-size: calc(var(--font-ui-smaller) - 0.5px);
+  font-style: italic;
+  white-space: pre;
+}
+
+.diff-file-body > .diff-hunk-header:first-child {
+  border-top: none;
+}
+
+.diff-hunk-body {
+  display: block;
+  min-width: max-content;
+  padding: 4px 0;
+  line-height: 1.55;
+}
+
+.diff-line {
+  display: flex;
+  align-items: flex-start;
+  gap: 0;
+  padding: 0;
+  white-space: pre;
+}
+
+.diff-line.is-add {
+  background-color: var(--diff-add-background);
+  color: var(--diff-add-foreground);
+}
+
+.diff-line.is-remove {
+  background-color: var(--diff-remove-background);
+  color: var(--diff-remove-foreground);
+}
+
+.diff-line.is-context {
+  color: var(--text-muted);
+}
+
+.diff-line.is-meta {
+  color: var(--text-faint);
+  font-style: italic;
+}
+
+.diff-gutter {
+  flex: 0 0 auto;
+  min-width: 3ch;
+  padding: 0 6px;
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-size: calc(var(--font-ui-smaller) - 0.5px);
+  text-align: right;
+  user-select: none;
+}
+
+.diff-gutter-new {
+  border-right: 1px solid var(--background-modifier-border);
+  margin-right: 6px;
+}
+
+.diff-marker {
+  flex: 0 0 auto;
+  width: 1.5ch;
+  padding-left: 8px;
+  color: currentColor;
+  opacity: 0.6;
+  user-select: none;
+}
+
+.diff-line.is-add .diff-marker,
+.diff-line.is-remove .diff-marker {
+  opacity: 0.85;
+}
+
+.diff-code {
+  flex: 1 1 auto;
+  padding: 0 10px 0 6px;
+  white-space: pre;
+}
+

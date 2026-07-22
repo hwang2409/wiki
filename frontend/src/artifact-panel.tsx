@@ -74,7 +74,7 @@ export function ArtifactPanel({
       case "mermaid": return <MermaidArtifactDetail onChange={onChange} source={artifact.source ?? ""} state={viewState} />;
       case "svg": return <SvgArtifactDetail onChange={onChange} source={artifact.source ?? ""} state={viewState} />;
       case "plot": return <PlotArtifactDetail spec={artifact.spec_vega_lite ?? {}} />;
-      case "diff": return <DiffArtifactDetail artifact={artifact} />;
+      case "diff": return <DiffArtifactDetail artifact={artifact} onChange={onChange} state={viewState} />;
       case "file-list": return <FileListArtifactDetail artifact={artifact} />;
       case "json": return <JsonArtifactDetail artifact={artifact} />;
       case "code": return <CodeArtifactDetail artifact={artifact} onChange={onChange} state={viewState} />;
