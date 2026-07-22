@@ -6,6 +6,7 @@ import fcntl
 import json
 import os
 import re
+import secrets
 import stat
 import subprocess
 import tempfile
@@ -3683,65 +3684,168 @@ class ComposerGateIn(BaseModel):
 class ComposerProvisionIn(BaseModel):
     ticket: str = Field(..., min_length=1, max_length=80)
     # `orch` is retained for logging/debug only. The server derives the
-    # dispatching orchestrator from the caller's session id header and
-    # ignores this field for authorization (see H1 in WIKI-148 review3).
+    # dispatching orchestrator from the caller's composer-token header and
+    # ignores this field for authorization (see H1 in WIKI-148 review3/4).
     orch: str | None = Field(default=None, min_length=1, max_length=100)
 
 
-def _orch_from_caller_session(session_id: str | None) -> str:
-    """Return the orchestrator id whose registered session id matches the caller.
+COMPOSER_TOKEN_DIR = Path.home() / ".wiki" / "session-tokens"
+ORCH_ID_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 
-    Callers prove identity by sending `X-Wiki-Session-Id`. We look up the
-    session id in the agent registry and require the matching entry to have
-    role=orchestrator. Worker sessions and unknown ids are rejected — this
-    is what stops a worker from POSTing an arbitrary `orch` field and
-    provisioning a worktree in another orchestrator's repo.
+
+def _composer_token_path(orch_id: str) -> Path:
+    return COMPOSER_TOKEN_DIR / f"{orch_id}.token"
+
+
+def _write_composer_token_file(orch_id: str, token: str) -> None:
+    """Persist the composer token to a mode-0600 file for the local orch process.
+
+    Same-user co-processes CAN read the file — the token file is a local-trust
+    convenience, not a cross-user secret. See PR body / M1 notes.
     """
 
-    if not isinstance(session_id, str) or not session_id.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="X-Wiki-Session-Id header is required for composer provisioning",
-        )
-    needle = session_id.strip()
+    try:
+        COMPOSER_TOKEN_DIR.mkdir(parents=True, exist_ok=True)
+        path = _composer_token_path(orch_id)
+        tmp = path.with_suffix(".token.tmp")
+        tmp.write_text(token, encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        tmp.replace(path)
+    except OSError:
+        # Filesystem write is best-effort; the registry still holds the token.
+        pass
 
+
+def _registry_orch_current(registry: dict, orch_id: str) -> dict | None:
+    """Return the `current` dict for a registered orchestrator, or None."""
+
+    entry = registry.get(orch_id)
+    if isinstance(entry, dict):
+        current = entry.get("current")
+        if isinstance(current, dict) and current.get("role") == "orchestrator":
+            return current
+    legacy = registry.get("_orchestrators")
+    if isinstance(legacy, dict):
+        candidate = legacy.get(orch_id)
+        if isinstance(candidate, dict):
+            return candidate
+    return None
+
+
+def _ensure_composer_token(orch_id: str) -> str:
+    """Return the composer token for `orch_id`, minting one if needed.
+
+    Persists the token back into the registry and its on-disk file so future
+    lookups are stable. Raises HTTPException if the orch isn't registered.
+    """
+
+    if not ORCH_ID_TOKEN_PATTERN.fullmatch(orch_id):
+        raise HTTPException(status_code=400, detail="Invalid orchestrator id")
     try:
         registry = _read_agent_registry()
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(
-            status_code=500,
-            detail=f"agent registry unreadable: {exc}",
+            status_code=500, detail=f"agent registry unreadable: {exc}"
         ) from exc
-
     if not isinstance(registry, dict):
-        raise HTTPException(status_code=403, detail="No registered session matches caller")
+        raise HTTPException(status_code=404, detail=f"Unknown orchestrator '{orch_id}'")
+    entry = registry.get(orch_id)
+    ticket_current: dict | None = None
+    legacy_current: dict | None = None
+    if isinstance(entry, dict):
+        current = entry.get("current")
+        if isinstance(current, dict) and current.get("role") == "orchestrator":
+            ticket_current = current
+    if ticket_current is None:
+        legacy = registry.get("_orchestrators")
+        if isinstance(legacy, dict):
+            candidate = legacy.get(orch_id)
+            if isinstance(candidate, dict):
+                legacy_current = candidate
+    if ticket_current is None and legacy_current is None:
+        raise HTTPException(status_code=404, detail=f"Unknown orchestrator '{orch_id}'")
+    target = ticket_current if ticket_current is not None else legacy_current
+    assert target is not None  # for type-checker
+    token = target.get("composer_token")
+    if isinstance(token, str) and token.strip():
+        _write_composer_token_file(orch_id, token.strip())
+        return token.strip()
+    token = secrets.token_urlsafe(32)
+    target["composer_token"] = token
+    try:
+        AGENT_REGISTRY_PATH.write_text(
+            json.dumps(registry, indent=2, sort_keys=True), encoding="utf-8"
+        )
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500, detail=f"agent registry write failed: {exc}"
+        ) from exc
+    _write_composer_token_file(orch_id, token)
+    return token
 
-    match_ticket: str | None = None
-    match_role: str | None = None
-    for ticket_id, entry in registry.items():
-        if ticket_id == "_orchestrators" or not isinstance(entry, dict):
+
+def _orch_from_composer_token(token: str | None) -> str:
+    """Return the orchestrator id whose registered composer token matches.
+
+    Callers prove identity by sending `X-Wiki-Composer-Token`. The token is
+    NOT exposed via `/api/agents` (unlike the legacy session-id header) —
+    workers scanning the public agent list cannot obtain an orch's token by
+    lookup. Same-user local processes that read the on-disk token file are
+    still authorized: the composer explicitly trusts local callers. This is
+    documented in the PR body.
+    """
+
+    if not isinstance(token, str) or not token.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="X-Wiki-Composer-Token header is required for composer provisioning",
+        )
+    needle = token.strip()
+    if len(needle) < 16:
+        raise HTTPException(status_code=403, detail="Composer token rejected")
+    try:
+        registry = _read_agent_registry()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=500, detail=f"agent registry unreadable: {exc}"
+        ) from exc
+    if not isinstance(registry, dict):
+        raise HTTPException(
+            status_code=403, detail="No registered orchestrator matches composer token"
+        )
+
+    match_id: str | None = None
+    for orch_id, entry in registry.items():
+        if orch_id == "_orchestrators" or not isinstance(entry, dict):
             continue
         current = entry.get("current")
         if not isinstance(current, dict):
             continue
-        if current.get("session_id") == needle:
-            match_ticket = ticket_id
-            match_role = current.get("role") if isinstance(current.get("role"), str) else None
+        if current.get("role") != "orchestrator":
+            continue
+        candidate = current.get("composer_token")
+        if isinstance(candidate, str) and secrets.compare_digest(candidate, needle):
+            match_id = orch_id
             break
 
-    if match_ticket is None:
-        # Fall back to legacy orchestrator entries which don't carry session_id.
-        raise HTTPException(status_code=403, detail="No registered session matches caller")
+    if match_id is None:
+        legacy = registry.get("_orchestrators")
+        if isinstance(legacy, dict):
+            for orch_id, current in legacy.items():
+                if not isinstance(current, dict):
+                    continue
+                candidate = current.get("composer_token")
+                if isinstance(candidate, str) and secrets.compare_digest(
+                    candidate, needle
+                ):
+                    match_id = orch_id
+                    break
 
-    if match_role != "orchestrator":
+    if match_id is None:
         raise HTTPException(
-            status_code=403,
-            detail=(
-                f"/spawn must be dispatched from an orchestrator session; "
-                f"caller session belongs to '{match_ticket}' (role={match_role!r})"
-            ),
+            status_code=403, detail="No registered orchestrator matches composer token"
         )
-    return match_ticket
+    return match_id
 
 
 def _resolve_orchestrator_root(orch_id: str) -> Path:
@@ -3812,6 +3916,39 @@ def _resolve_orchestrator_root(orch_id: str) -> Path:
     return repo_root
 
 
+def _git_common_dir(path: Path) -> tuple[bool, Path | str]:
+    """Return `(True, canonical common-dir)` or `(False, stderr excerpt)`.
+
+    `--git-common-dir` returns a path relative to the invoking cwd, so we
+    canonicalize against `path`. Callers use this on BOTH sides of a
+    repo-identity compare so a primary worktree (where common-dir ==
+    `<root>/.git`) matches a linked worktree (where `<workdir>/.git` is a
+    file whose common-dir points to the primary's `.git`).
+    """
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except OSError as exc:
+        return False, str(exc)
+    if result.returncode != 0:
+        return False, (result.stderr or result.stdout or "git rev-parse failed").strip()[:200]
+    raw = result.stdout.strip()
+    if not raw:
+        return False, "git rev-parse --git-common-dir returned empty"
+    common = Path(raw)
+    if not common.is_absolute():
+        common = (path / common).resolve()
+    else:
+        common = common.resolve()
+    return True, common
+
+
 def _validate_existing_worktree(
     workdir: Path, repo_root: Path, branch: str
 ) -> None:
@@ -3821,41 +3958,32 @@ def _validate_existing_worktree(
     empty marker, or a checkout on the wrong branch would all pass a naive
     `.git.exists()` check. We verify:
 
-    - `git rev-parse --git-common-dir` points at `<repo_root>/.git` (same
-      upstream repository, not an unrelated one).
+    - `git rev-parse --git-common-dir` matches on BOTH sides (caller repo
+      and target workdir) — accepts linked worktrees whose `.git` file
+      points back to the primary's common-dir. (M1 in review4.)
     - `git rev-parse --abbrev-ref HEAD` matches the expected branch.
 
     Any mismatch is a 409 with a specific message so the caller can pick a
     different ticket or clean up manually.
     """
 
-    expected_common = (repo_root / ".git").resolve()
-    try:
-        common = subprocess.run(
-            ["git", "-C", str(workdir), "rev-parse", "--git-common-dir"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except OSError as exc:
+    root_ok, root_result = _git_common_dir(repo_root)
+    if not root_ok:
         raise HTTPException(
-            status_code=409,
-            detail=f"{workdir} exists but git could not inspect it: {exc}",
-        ) from exc
-    if common.returncode != 0:
+            status_code=500,
+            detail=f"orchestrator root {repo_root} common-dir unreadable: {root_result}",
+        )
+    expected_common = cast(Path, root_result)
+
+    workdir_ok, workdir_result = _git_common_dir(workdir)
+    if not workdir_ok:
         raise HTTPException(
             status_code=409,
             detail=(
-                f"{workdir} exists but is not a git worktree: "
-                f"{(common.stderr or common.stdout or 'git rev-parse failed').strip()[:200]}"
+                f"{workdir} exists but is not a git worktree: {workdir_result}"
             ),
         )
-    common_path = Path(common.stdout.strip())
-    if not common_path.is_absolute():
-        common_path = (workdir / common_path).resolve()
-    else:
-        common_path = common_path.resolve()
+    common_path = cast(Path, workdir_result)
     if common_path != expected_common:
         raise HTTPException(
             status_code=409,
@@ -3900,12 +4028,36 @@ def _validate_existing_worktree(
 @app.post("/api/composer/provision-worktree")
 def composer_provision_worktree_route(
     body: ComposerProvisionIn,
-    x_wiki_session_id: str | None = Header(default=None, alias="X-Wiki-Session-Id"),
+    x_wiki_composer_token: str | None = Header(
+        default=None, alias="X-Wiki-Composer-Token"
+    ),
 ) -> dict[str, object]:
-    """FastAPI wrapper that binds `orch` to the caller's session identity."""
+    """FastAPI wrapper that binds `orch` to the caller's composer token.
 
-    orch_id = _orch_from_caller_session(x_wiki_session_id)
+    The composer token is per-orchestrator, minted at first
+    `/api/composer/orch-token/{orch}` fetch, and NOT exposed via
+    `/api/agents`. Worker sessions never hold a token — a worker cannot
+    forge the header by scraping the public agent list.
+    """
+
+    orch_id = _orch_from_composer_token(x_wiki_composer_token)
     return composer_provision_worktree(body, orch_id)
+
+
+@app.get("/api/composer/orch-token/{orch_id}")
+def composer_orch_token(orch_id: str) -> dict[str, str]:
+    """Return the composer token for a registered orchestrator (local trust).
+
+    This endpoint intentionally trusts same-user local callers — the file at
+    `~/.wiki/session-tokens/<orch>.token` is likewise readable by co-user
+    processes. The security improvement over the legacy design is that the
+    token is NOT included in `/api/agents` responses, so worker sessions
+    that scrape the public agent list no longer harvest orchestrator
+    credentials by accident.
+    """
+
+    token = _ensure_composer_token(orch_id)
+    return {"orch": orch_id, "token": token}
 
 
 def composer_provision_worktree(

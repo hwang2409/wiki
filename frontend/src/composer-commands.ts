@@ -1,6 +1,5 @@
 import {
   archiveAgent,
-  getAgents,
   replaceAgent,
   sendAgentMessage,
   spawnAgentWorker,
@@ -44,27 +43,30 @@ const ROLES = ["plan", "implement", "review"] as const;
 const OUTCOMES = ["merged", "closed", "abandoned"] as const;
 const EFFORTS = ["low", "medium", "high"] as const;
 
-async function resolveOrchSessionId(orch: string): Promise<string> {
-  // Server derives the dispatching orchestrator from this session id (H1).
-  // Body `orch` is ignored for authorization — the caller must prove identity.
-  const agents = await getAgents();
-  const match = agents.orchestrators.find((entry) => entry.id === orch);
-  const sessionId = match?.provider_session_id?.trim();
-  if (!sessionId) {
-    throw new Error(
-      `no provider session id registered for orchestrator '${orch}' — is the UI attached to a live run?`
-    );
+async function fetchOrchComposerToken(orch: string): Promise<string> {
+  // Composer tokens are per-orchestrator and are NOT exposed via /api/agents
+  // (H1 fix): a worker session scraping the public agent list cannot forge
+  // this header. The token endpoint trusts same-user local callers.
+  const response = await fetch(
+    `/api/composer/orch-token/${encodeURIComponent(orch)}`,
+    { method: "GET" }
+  );
+  const body = (await response.json().catch(() => null)) as
+    | { token?: string; detail?: string }
+    | null;
+  if (!response.ok || !body?.token) {
+    throw new Error(body?.detail ?? `Could not fetch composer token (${response.status})`);
   }
-  return sessionId;
+  return body.token.trim();
 }
 
 async function provisionWorktree(ticket: string, orch: string): Promise<string> {
-  const sessionId = await resolveOrchSessionId(orch);
+  const token = await fetchOrchComposerToken(orch);
   const response = await fetch("/api/composer/provision-worktree", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "X-Wiki-Session-Id": sessionId,
+      "X-Wiki-Composer-Token": token,
     },
     body: JSON.stringify({ ticket, orch }),
   });

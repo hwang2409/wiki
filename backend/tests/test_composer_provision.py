@@ -340,8 +340,15 @@ class ProvisionWorktreeTests(unittest.TestCase):
         self.assertEqual(head, origin_head)
 
 
-class CallerSessionIdentityTests(unittest.TestCase):
-    """H1: `orch` derives from `X-Wiki-Session-Id`, not the request body."""
+ORCH_TOKEN = "orch-composer-token-1234567890abcdef"
+WORKER_TOKEN_ATTEMPT = "not-a-registered-token-zzzz"
+
+
+class ComposerTokenAuthTests(unittest.TestCase):
+    """H1 (round 5): auth binds to per-orch composer tokens, NOT to any
+    identifier exposed via /api/agents. Worker sessions never hold a token
+    and cannot forge the header by scraping the public agent list.
+    """
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -350,38 +357,48 @@ class CallerSessionIdentityTests(unittest.TestCase):
         self._registry_path = self.root / "agent-registry.json"
         self._registry_patch = mock.patch.object(main, "AGENT_REGISTRY_PATH", self._registry_path)
         self._registry_patch.start()
+        self._token_dir = self.root / "session-tokens"
+        self._token_patch = mock.patch.object(main, "COMPOSER_TOKEN_DIR", self._token_dir)
+        self._token_patch.start()
 
     def tearDown(self) -> None:
+        self._token_patch.stop()
         self._registry_patch.stop()
         self.tmp.cleanup()
 
     def _write_registry(self, payload: dict) -> None:
         self._registry_path.write_text(json.dumps(payload), encoding="utf-8")
 
-    def test_rejects_missing_session_header(self) -> None:
-        self._write_registry(
-            {
-                "wiki": {
-                    "current": {
-                        "role": "orchestrator",
-                        "cwd": str(self.repo),
-                        "worktree": str(self.repo),
-                        "kind": "cc",
-                        "session_id": ORCH_SID,
-                    },
-                    "history": [],
-                }
+    def _seed_orch_with_token(
+        self, orch_id: str, repo: Path | None = None, token: str = ORCH_TOKEN
+    ) -> None:
+        payload = {
+            orch_id: {
+                "current": {
+                    "role": "orchestrator",
+                    "cwd": str(repo or self.repo),
+                    "worktree": str(repo or self.repo),
+                    "kind": "cc",
+                    "session_id": ORCH_SID,
+                    "composer_token": token,
+                },
+                "history": [],
             }
-        )
+        }
+        self._write_registry(payload)
+
+    def test_rejects_missing_token_header(self) -> None:
+        self._seed_orch_with_token("wiki")
         body = main.ComposerProvisionIn(ticket="WIKI-999", orch="wiki")
         with self.assertRaises(HTTPException) as exc:
-            main.composer_provision_worktree_route(body, x_wiki_session_id=None)
+            main.composer_provision_worktree_route(body, x_wiki_composer_token=None)
         self.assertEqual(exc.exception.status_code, 400)
-        self.assertIn("X-Wiki-Session-Id", str(exc.exception.detail))
+        self.assertIn("X-Wiki-Composer-Token", str(exc.exception.detail))
 
-    def test_rejects_worker_session_even_when_body_names_orchestrator(self) -> None:
-        """The critical H1 spoof case: worker submits `orch: wiki` — server rejects
-        because the caller's registered role is worker, not orchestrator.
+    def test_rejects_forged_token_from_public_agent_list(self) -> None:
+        """Worker session forges a value the /api/agents list DOES expose (session id) as the
+        composer token — must be rejected, because the token is a distinct per-orch secret
+        that never appears in that list.
         """
 
         self._write_registry(
@@ -393,6 +410,7 @@ class CallerSessionIdentityTests(unittest.TestCase):
                         "worktree": str(self.repo),
                         "kind": "cc",
                         "session_id": ORCH_SID,
+                        "composer_token": ORCH_TOKEN,
                     },
                     "history": [],
                 },
@@ -409,16 +427,14 @@ class CallerSessionIdentityTests(unittest.TestCase):
                 },
             }
         )
-        # Body claims orch=wiki, but the caller's session id belongs to a worker.
+        # Attacker replays the wiki orch's session id (visible in /api/agents)
+        # as the composer token.
         body = main.ComposerProvisionIn(ticket="WIKI-999", orch="wiki")
         with self.assertRaises(HTTPException) as exc:
-            main.composer_provision_worktree_route(body, x_wiki_session_id=WORKER_SID)
+            main.composer_provision_worktree_route(body, x_wiki_composer_token=ORCH_SID)
         self.assertEqual(exc.exception.status_code, 403)
-        detail = str(exc.exception.detail)
-        self.assertIn("WIKI-148", detail)
-        self.assertIn("orchestrator", detail)
 
-    def test_rejects_unknown_session_id(self) -> None:
+    def test_rejects_worker_session_forging_arbitrary_token(self) -> None:
         self._write_registry(
             {
                 "wiki": {
@@ -428,39 +444,51 @@ class CallerSessionIdentityTests(unittest.TestCase):
                         "worktree": str(self.repo),
                         "kind": "cc",
                         "session_id": ORCH_SID,
+                        "composer_token": ORCH_TOKEN,
                     },
                     "history": [],
-                }
+                },
+                "WIKI-148": {
+                    "current": {
+                        "role": "implement",
+                        "cwd": str(self.repo),
+                        "worktree": str(self.repo),
+                        "kind": "cc",
+                        "orch": "wiki",
+                        "session_id": WORKER_SID,
+                    },
+                    "history": [],
+                },
             }
         )
         body = main.ComposerProvisionIn(ticket="WIKI-999", orch="wiki")
         with self.assertRaises(HTTPException) as exc:
-            main.composer_provision_worktree_route(body, x_wiki_session_id="not-a-known-sid")
+            main.composer_provision_worktree_route(
+                body, x_wiki_composer_token=WORKER_TOKEN_ATTEMPT
+            )
         self.assertEqual(exc.exception.status_code, 403)
 
-    def test_valid_orchestrator_session_provisions(self) -> None:
-        self._write_registry(
-            {
-                "wiki": {
-                    "current": {
-                        "role": "orchestrator",
-                        "cwd": str(self.repo),
-                        "worktree": str(self.repo),
-                        "kind": "cc",
-                        "session_id": ORCH_SID,
-                    },
-                    "history": [],
-                }
-            }
-        )
+    def test_rejects_unknown_token(self) -> None:
+        self._seed_orch_with_token("wiki")
+        body = main.ComposerProvisionIn(ticket="WIKI-999", orch="wiki")
+        with self.assertRaises(HTTPException) as exc:
+            main.composer_provision_worktree_route(
+                body, x_wiki_composer_token="stranger-token-not-in-registry"
+            )
+        self.assertEqual(exc.exception.status_code, 403)
+
+    def test_valid_orch_token_provisions(self) -> None:
+        self._seed_orch_with_token("wiki")
         body = main.ComposerProvisionIn(ticket="WIKI-999")
-        result = main.composer_provision_worktree_route(body, x_wiki_session_id=ORCH_SID)
+        result = main.composer_provision_worktree_route(
+            body, x_wiki_composer_token=ORCH_TOKEN
+        )
         self.assertTrue(result["provisioned"])
 
-    def test_body_orch_is_ignored_when_it_disagrees_with_session(self) -> None:
-        """If the caller's session id maps to `tooling`, provisioning goes to
-        the tooling repo — even if the body says `orch: wiki`. Body is a hint,
-        not authorization."""
+    def test_body_orch_ignored_when_token_maps_elsewhere(self) -> None:
+        """Body `orch` is a hint, not authorization. The token binds the request
+        to whichever orch holds it — even if the body claims a different orch.
+        """
 
         other = _init_repo(self.root / "tooling-tree")
         self._write_registry(
@@ -472,6 +500,7 @@ class CallerSessionIdentityTests(unittest.TestCase):
                         "worktree": str(self.repo),
                         "kind": "cc",
                         "session_id": ORCH_SID,
+                        "composer_token": ORCH_TOKEN,
                     },
                     "history": [],
                 },
@@ -482,16 +511,116 @@ class CallerSessionIdentityTests(unittest.TestCase):
                         "worktree": str(other),
                         "kind": "cc",
                         "session_id": "tooling-sid",
+                        "composer_token": "tooling-composer-token-abcdef123456",
                     },
                     "history": [],
                 },
             }
         )
         body = main.ComposerProvisionIn(ticket="TOOL-1", orch="wiki")
-        result = main.composer_provision_worktree_route(body, x_wiki_session_id="tooling-sid")
+        result = main.composer_provision_worktree_route(
+            body, x_wiki_composer_token="tooling-composer-token-abcdef123456"
+        )
         expected = (other / ".claude" / "worktrees" / "tool-1").resolve()
         self.assertEqual(result["workdir"], str(expected))
         self.assertFalse((self.repo / ".claude" / "worktrees" / "tool-1").exists())
+
+    def test_orch_token_endpoint_mints_and_persists_for_registered_orch(self) -> None:
+        # Registered but no token yet — endpoint mints one, persists to
+        # registry and mode-0600 token file.
+        self._write_registry(
+            {
+                "wiki": {
+                    "current": {
+                        "role": "orchestrator",
+                        "cwd": str(self.repo),
+                        "worktree": str(self.repo),
+                        "kind": "cc",
+                        "session_id": ORCH_SID,
+                    },
+                    "history": [],
+                }
+            }
+        )
+        first = main.composer_orch_token("wiki")
+        self.assertEqual(first["orch"], "wiki")
+        self.assertGreater(len(first["token"]), 30)
+        stored = json.loads(self._registry_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            stored["wiki"]["current"]["composer_token"], first["token"]
+        )
+        # File exists at 0600 and matches.
+        token_file = self._token_dir / "wiki.token"
+        self.assertTrue(token_file.is_file())
+        mode = token_file.stat().st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+        self.assertEqual(token_file.read_text(encoding="utf-8"), first["token"])
+        # Idempotent — second call returns same token.
+        second = main.composer_orch_token("wiki")
+        self.assertEqual(second["token"], first["token"])
+
+    def test_orch_token_endpoint_rejects_unknown_orch(self) -> None:
+        self._write_registry({})
+        with self.assertRaises(HTTPException) as exc:
+            main.composer_orch_token("nope")
+        self.assertEqual(exc.exception.status_code, 404)
+
+
+class LinkedWorktreeCommonDirTests(unittest.TestCase):
+    """M1 (round 5): _validate_existing_worktree normalizes common-dir on
+    BOTH sides — a linked worktree hosting the orchestrator must still be
+    accepted, because its `--git-common-dir` matches the primary repo's.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.repo = _init_repo(self.root)
+        self._registry_path = self.root / "agent-registry.json"
+        self._registry_patch = mock.patch.object(main, "AGENT_REGISTRY_PATH", self._registry_path)
+        self._registry_patch.start()
+
+    def tearDown(self) -> None:
+        self._registry_patch.stop()
+        self.tmp.cleanup()
+
+    def test_accepts_existing_worktree_when_orch_is_rooted_in_linked_worktree(
+        self,
+    ) -> None:
+        # Root the orch in a LINKED worktree of the primary repo (its
+        # `.git` is a file, not a directory).
+        linked_root = self.root / "linked-orch"
+        subprocess.run(
+            ["git", "-C", str(self.repo), "worktree", "add", "-b", "orch-linked", str(linked_root)],
+            check=True, capture_output=True,
+        )
+        self.assertTrue((linked_root / ".git").is_file())  # confirm it's linked
+        self._registry_path.write_text(
+            json.dumps(
+                {
+                    "wiki": {
+                        "current": {
+                            "role": "orchestrator",
+                            "cwd": str(linked_root),
+                            "worktree": str(linked_root),
+                            "kind": "cc",
+                            "session_id": ORCH_SID,
+                            "composer_token": ORCH_TOKEN,
+                        },
+                        "history": [],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        body = main.ComposerProvisionIn(ticket="WIKI-999")
+        result = main.composer_provision_worktree(body, "wiki")
+        expected = (linked_root / ".claude" / "worktrees" / "wiki-999").resolve()
+        self.assertEqual(result["workdir"], str(expected))
+        # Second call should re-validate the linked worktree successfully.
+        again = main.composer_provision_worktree(body, "wiki")
+        self.assertFalse(again["provisioned"])
+        self.assertEqual(again["workdir"], str(expected))
 
 
 if __name__ == "__main__":

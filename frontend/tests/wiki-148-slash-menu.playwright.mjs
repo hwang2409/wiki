@@ -81,31 +81,16 @@ async function main() {
       });
     });
 
-    // Composer now derives orch from the caller's session id header (H1). It
-    // fetches /api/agents to look up the current orch's provider_session_id
-    // and passes it as X-Wiki-Session-Id on the provision request.
-    await page.route("**/api/agents", async (route) => {
+    // Composer authenticates via a per-orch composer token minted server-side
+    // (H1, round 5). The token is NOT exposed in /api/agents — the frontend
+    // fetches it from /api/composer/orch-token/<id>, then sends it as
+    // X-Wiki-Composer-Token on the provision request. A worker scraping
+    // /api/agents cannot forge the header.
+    await page.route(`**/api/composer/orch-token/${TICKET}`, async (route) => {
       await route.fulfill({
         status: 200,
         contentType: "application/json",
-        body: JSON.stringify({
-          workers: [],
-          orchestrators: [
-            {
-              id: TICKET,
-              window: null,
-              window_alive: true,
-              provider_session_id: "orch-session-fake",
-              cwd: "/fake/repo",
-              kind: "cc",
-              model: "claude-opus-4-7",
-              effort: null,
-              spawned_at: null,
-              transcript_exists: true,
-            },
-          ],
-          archived: [],
-        }),
+        body: JSON.stringify({ orch: TICKET, token: "orch-composer-token-fake" }),
       });
     });
 
@@ -114,7 +99,10 @@ async function main() {
       const body = request.postDataJSON();
       provisionPayloads.push({
         body,
-        sessionHeader: request.headers()["x-wiki-session-id"] ?? null,
+        composerTokenHeader: request.headers()["x-wiki-composer-token"] ?? null,
+        // Ensure the legacy session-id header is NOT sent — the round-5
+        // rewrite must drop the spoofable path entirely.
+        legacySessionHeader: request.headers()["x-wiki-session-id"] ?? null,
       });
       await route.fulfill({
         status: 200,
@@ -267,9 +255,14 @@ async function main() {
     if (provisionPayloads.length !== 1 || provisionPayloads[0].body.ticket !== "WIKI-149") {
       throw new Error(`provision not called: ${JSON.stringify(provisionPayloads)}`);
     }
-    if (provisionPayloads[0].sessionHeader !== "orch-session-fake") {
+    if (provisionPayloads[0].composerTokenHeader !== "orch-composer-token-fake") {
       throw new Error(
-        `X-Wiki-Session-Id header missing/wrong: ${JSON.stringify(provisionPayloads[0])}`
+        `X-Wiki-Composer-Token header missing/wrong: ${JSON.stringify(provisionPayloads[0])}`
+      );
+    }
+    if (provisionPayloads[0].legacySessionHeader !== null) {
+      throw new Error(
+        `Legacy X-Wiki-Session-Id header must NOT be sent (H1 spoof surface): ${JSON.stringify(provisionPayloads[0])}`
       );
     }
     if (spawnPayloads.length !== 1) {
