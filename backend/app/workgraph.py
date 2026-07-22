@@ -137,11 +137,20 @@ EDGE_SCHEMA: dict[str, Any] = {
 WORKGRAPH_SCHEMA: dict[str, Any] = {
     "$id": "https://wiki.henry/schemas/workgraph.json",
     "type": "object",
-    "required": ["ticket", "orch", "created_at", "updated_at", "nodes", "edges", "composite_health"],
+    "required": [
+        "ticket",
+        "orch",
+        "template",
+        "created_at",
+        "updated_at",
+        "nodes",
+        "edges",
+        "composite_health",
+    ],
     "properties": {
         "ticket": {"type": "string"},
         "orch": {"type": "string"},
-        "template": {"type": ["string", "null"]},
+        "template": {"type": "string"},
         "created_at": {"type": "string", "format": "date-time"},
         "updated_at": {"type": "string", "format": "date-time"},
         "nodes": {
@@ -173,7 +182,7 @@ WORKGRAPH_SCHEMA: dict[str, Any] = {
                 "state": {"type": "string"},
                 "open_findings": {"type": "integer", "minimum": 0},
                 "blocking": {"type": "integer", "minimum": 0},
-                "slowest_node_stall_seconds": {"type": "integer", "minimum": 0},
+                "slowest_node_stall_seconds": {"type": "number", "minimum": 0},
                 "iteration_count": {"type": "integer", "minimum": 0},
             },
             "additionalProperties": False,
@@ -182,8 +191,10 @@ WORKGRAPH_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
-# Per-kind payload requirements (spec 1.5). steer/verdict payloads are the full
-# Steer/Verdict objects; the rest are small literal shapes.
+# Per-kind payload requirements. steer/verdict payloads are the full
+# Steer/Verdict objects; the rest mirror the $defs in the D1 edge schema
+# (schemas/edge.schema.json) so behavior is identical whether that file is
+# present or the embedded copies are in use.
 PAYLOAD_SCHEMAS: dict[str, dict[str, Any]] = {
     "spawn": {
         "type": "object",
@@ -192,7 +203,7 @@ PAYLOAD_SCHEMAS: dict[str, dict[str, Any]] = {
             "ticket": {"type": "string"},
             "role": {"type": "string"},
             "model": {"type": "string"},
-            "effort": {"type": ["string", "null"]},
+            "effort": {"type": "string"},
             "worktree": {"type": "string"},
             "request_id": {"type": "string"},
         },
@@ -223,11 +234,11 @@ PAYLOAD_SCHEMAS: dict[str, dict[str, Any]] = {
     },
     "monitor_alarm": {
         "type": "object",
-        "required": ["alarm_kind", "message"],
+        "required": ["alarm_kind", "message", "watchlist_row"],
         "properties": {
             "alarm_kind": {"type": "string"},
             "message": {"type": "string"},
-            "watchlist_row": {"type": ["string", "null"]},
+            "watchlist_row": {"oneOf": [{"type": "string"}, {"type": "object"}]},
         },
         "additionalProperties": False,
     },
@@ -237,22 +248,44 @@ PAYLOAD_SCHEMAS: dict[str, dict[str, Any]] = {
         "properties": {
             "capability": {"type": "string"},
             "granted_by": {"type": "string"},
-            "ticket": {"type": "string"},
-            "reason": {"type": "string"},
         },
         "additionalProperties": False,
     },
     "escalation": {
         "type": "object",
-        "required": ["reason", "target"],
+        "required": ["reason", "prior_findings", "target"],
         "properties": {
             "reason": {"type": "string"},
-            "prior_findings": {"type": "array", "items": {"type": "string"}},
+            "prior_findings": {"type": "array", "items": {"$ref": "finding.json"}},
             "target": {"enum": ["henry", "orchestrator"]},
         },
         "additionalProperties": False,
     },
 }
+
+# edge.schema.json $defs names for the literal payload shapes.
+_PAYLOAD_DEF_NAMES = {
+    "spawn": "spawnPayload",
+    "archive": "archivePayload",
+    "handoff": "handoffPayload",
+    "monitor_alarm": "monitorAlarmPayload",
+    "capability_grant": "capabilityGrantPayload",
+    "escalation": "escalationPayload",
+}
+
+
+def payload_schema_for(edge_kind: str) -> dict[str, Any] | None:
+    """Prefer the D1 schemas/ files: steer/verdict schemas directly, other
+    payload shapes from edge.schema.json $defs; embedded copies otherwise."""
+    if edge_kind in {"steer", "verdict"}:
+        return load_schema(edge_kind)
+    def_name = _PAYLOAD_DEF_NAMES.get(edge_kind)
+    if def_name is None:
+        return None
+    defs = load_schema("edge").get("$defs")
+    if isinstance(defs, dict) and isinstance(defs.get(def_name), dict):
+        return defs[def_name]
+    return PAYLOAD_SCHEMAS[edge_kind]
 
 _EMBEDDED_SCHEMAS: dict[str, dict[str, Any]] = {
     "finding": FINDING_SCHEMA,
@@ -277,8 +310,10 @@ def load_schema(name: str) -> dict[str, Any]:
 # --- minimal JSON Schema subset validator ---------------------------------
 # Covers exactly the keywords the spec schemas use: type (incl. unions), enum,
 # required, properties, additionalProperties: false, pattern, maxLength,
-# minimum, minItems, items, $ref (sibling schema by file name), format
-# (date-time only). Deliberately not a general validator.
+# minimum, minItems, items, oneOf (any-match), $ref (sibling schema by file
+# name), format (date-time only). Unknown keywords (allOf/if/then in the D1
+# edge schema) are ignored — per-kind payload checks come from
+# payload_schema_for() instead. Deliberately not a general validator.
 
 _TYPE_CHECKS = {
     "object": lambda v: isinstance(v, dict),
@@ -301,6 +336,12 @@ def validate_instance(instance: Any, schema: dict[str, Any], path: str = "$") ->
     ref = schema.get("$ref")
     if isinstance(ref, str):
         return validate_instance(instance, _resolve_ref(ref), path)
+
+    one_of = schema.get("oneOf")
+    if isinstance(one_of, list):
+        if not any(not validate_instance(instance, sub, path) for sub in one_of if isinstance(sub, dict)):
+            errors.append(f"{path}: matches no oneOf variant")
+            return errors
 
     expected = schema.get("type")
     if expected is not None:
@@ -352,7 +393,7 @@ def validate_instance(instance: Any, schema: dict[str, Any], path: str = "$") ->
 
 
 def validate_payload(edge_kind: str, payload: Any) -> list[str]:
-    schema = PAYLOAD_SCHEMAS.get(edge_kind)
+    schema = payload_schema_for(edge_kind)
     if schema is None:
         return [f"$: unknown edge kind {edge_kind!r}"]
     return validate_instance(payload, schema, "$.payload")
@@ -540,9 +581,12 @@ def create_workgraph(
     ticket: str, orch: str, template: str | None = None, created_at: str | None = None
 ) -> dict[str, Any]:
     created = created_at or now_iso()
-    graph: dict[str, Any] = {
+    return {
         "ticket": ticket,
         "orch": orch,
+        # The workgraph schema requires template; <orch>.implement matches the
+        # D3 selector fallback until templates are picked explicitly.
+        "template": template or f"{orch}.implement",
         "created_at": created,
         "updated_at": created,
         "nodes": [],
@@ -555,9 +599,6 @@ def create_workgraph(
             "iteration_count": 0,
         },
     }
-    if template:
-        graph["template"] = template
-    return graph
 
 
 def append_edge(
