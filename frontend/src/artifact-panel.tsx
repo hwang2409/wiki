@@ -12,19 +12,32 @@ import { PlotArtifactDetail } from "./artifact-detail/plot";
 import { SvgArtifactDetail } from "./artifact-detail/svg";
 import { TableArtifactDetail } from "./artifact-detail/table";
 import { classifyArtifact } from "./artifact-kind";
-import { StatusBadge } from "./status-badge";
+import { ArtifactFallback } from "./artifact-state";
 import type { ArtifactViewState, PanelState } from "./transcript-store";
 
-function titleFor(event: SessionEvent | undefined, id: string): string {
-  return event?.title
-    || event?.artifact?.filename
-    || event?.artifact?.kind
-    || `artifact ${id.slice(0, 8)}`;
+const KIND_LABELS: Record<string, string> = {
+  mermaid: "Diagram",
+  svg: "Image",
+  image: "Image",
+  table: "Table",
+  plot: "Plot",
+  code: "Code",
+  diff: "Diff",
+  "file-list": "File list",
+  json: "JSON",
+};
+
+function humanizeKind(kind: string | undefined): string {
+  if (!kind) return "Artifact";
+  return KIND_LABELS[kind] ?? kind.charAt(0).toUpperCase() + kind.slice(1);
 }
 
-function hasExplicitTitle(event: SessionEvent | undefined): boolean {
-  return Boolean(event?.title || event?.artifact?.filename);
+function titleFor(event: SessionEvent | undefined, _id: string): string {
+  return event?.title
+    || event?.artifact?.filename
+    || humanizeKind(event?.artifact?.kind);
 }
+
 
 export function ArtifactPanel({
   artifacts,
@@ -114,7 +127,6 @@ export function ArtifactPanel({
         {state.tabs.map((artifactId) => {
           const event = artifacts.get(artifactId);
           const selected = artifactId === focusedId;
-          const explicitTitle = hasExplicitTitle(event);
           const label = titleFor(event, artifactId);
           return (
             <div className={`artifact-panel-tab${selected ? " is-active" : ""}`} key={artifactId}>
@@ -127,14 +139,6 @@ export function ArtifactPanel({
                 onClick={() => onFocusTab(artifactId)}
               >
                 <span>{label}</span>
-                {event?.artifact?.kind && !explicitTitle ? (
-                  <StatusBadge
-                    className="artifact-panel-tab-kind"
-                    compact
-                    label={event.artifact.kind}
-                    state="faint"
-                  />
-                ) : null}
               </button>
               <button aria-label={`Close ${label}`} className="artifact-panel-tab-action" type="button" onClick={() => onCloseTab(artifactId)}><X size={12} /></button>
             </div>
@@ -183,7 +187,25 @@ export function ArtifactPanel({
         <button aria-label="Close artifact panel" className="artifact-panel-close" type="button" onClick={onClosePanel}><X size={14} /></button>
       </div>
       <div className="artifact-panel-detail" data-artifact-detail-kind={artifact?.kind}>
-        {detail ?? <div className="artifact-panel-missing">Artifact payload is not available in this session.</div>}
+        {detail ?? (
+          <div className="artifact-panel-missing">
+            <ArtifactFallback
+              actions={
+                focusedId ? (
+                  <button
+                    className="artifact-render-fallback-action"
+                    type="button"
+                    onClick={() => onCloseTab(focusedId)}
+                  >
+                    Close tab
+                  </button>
+                ) : null
+              }
+              detail="This session did not deliver a renderable payload for this artifact."
+              title="Artifact unavailable"
+            />
+          </div>
+        )}
       </div>
     </aside>
   );

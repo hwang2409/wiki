@@ -98,6 +98,7 @@ import {
   addPendingUserMessage,
   composerTextMatches,
   invalidateTranscript,
+  clearInlineArtifactStates,
   loadOlderEvents,
   removePendingUserMessage,
   refreshTranscript,
@@ -1467,6 +1468,7 @@ const MessageBlock = memo(function MessageBlock({
   imageNums,
   onOpenArtifact,
   rowKey,
+  sessionKey,
   ticket,
   uiState,
 }: {
@@ -1474,11 +1476,12 @@ const MessageBlock = memo(function MessageBlock({
   imageNums?: number[];
   onOpenArtifact?: (event: SessionEvent) => void;
   rowKey: number;
+  sessionKey: string;
   ticket: string;
   uiState: SessionUiState;
 }) {
   if (event.kind === "artifact") {
-    return <ArtifactBlock event={event} onOpen={onOpenArtifact} ticket={ticket} />;
+    return <ArtifactBlock event={event} onOpen={onOpenArtifact} sessionKey={sessionKey} ticket={ticket} />;
   }
   if (event.kind === "user") {
     return (
@@ -1674,6 +1677,7 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
   onHeightChange,
   onInspect,
   onOpenArtifact,
+  sessionKey,
   showTimestamp,
   top,
   ticket,
@@ -1684,6 +1688,7 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
   onHeightChange: (group: EventGroup, height: number) => void;
   onInspect?: (agentId: string) => void;
   onOpenArtifact?: (event: SessionEvent) => void;
+  sessionKey: string;
   showTimestamp: boolean;
   top: number;
   ticket: string;
@@ -1709,6 +1714,7 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
           imageNums={imageNums}
           onOpenArtifact={onOpenArtifact}
           rowKey={group.key}
+          sessionKey={sessionKey}
           ticket={ticket}
           uiState={uiState}
         />
@@ -1866,6 +1872,7 @@ export function SessionTab({
   rowHeightVersionRef.current = rowHeightVersion;
 
   if (rowHeightsKeyRef.current !== resetKey) {
+    clearInlineArtifactStates(rowHeightsKeyRef.current);
     rowHeightsKeyRef.current = resetKey;
     rowHeightsRef.current = new Map();
     groupCacheRef.current = null;
@@ -2464,6 +2471,7 @@ export function SessionTab({
                 onHeightChange={reportRowHeight}
                 onInspect={onInspect}
                 onOpenArtifact={onOpenArtifact}
+                sessionKey={resetKey}
                 showTimestamp={timestampKeys.has(group.key)}
                 ticket={ticket}
                 top={top}

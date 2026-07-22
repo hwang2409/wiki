@@ -8042,9 +8042,68 @@ textarea.composer-command-input {
   background: var(--background-modifier-hover);
 }
 
-.artifact-plot-wrap {
+.artifact-plot-wrap,
+.artifact-image-wrap {
   position: relative;
   width: 100%;
+}
+
+.artifact-render-fallback {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+  padding: 16px 18px;
+  border: 1px dashed var(--background-modifier-border);
+  border-radius: var(--radius-xs);
+  background: var(--background-secondary);
+}
+
+.artifact-render-fallback-icon {
+  flex: 0 0 auto;
+  color: var(--text-faint);
+}
+
+.artifact-render-fallback-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.artifact-render-fallback-title {
+  color: var(--text-normal);
+  font-family: var(--font-monospace);
+  font-weight: var(--fw-semibold);
+  font-size: var(--font-ui-small);
+}
+
+.artifact-render-fallback-detail {
+  margin-top: 4px;
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--fs-2xs);
+}
+
+.artifact-render-fallback-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.artifact-render-fallback-action {
+  display: inline-flex;
+  align-items: center;
+  min-height: 26px;
+  padding: 4px 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-xs);
+  background: var(--background-primary);
+  color: var(--text-normal);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--fs-2xs);
+}
+
+.artifact-render-fallback-action:hover {
+  background: var(--background-modifier-hover);
 }
 
 .artifact-render-failure {

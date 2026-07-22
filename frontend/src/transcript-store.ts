@@ -133,23 +133,41 @@ const inlineArtifactStates = new Map<string, InlineArtifactState>();
 const inlineArtifactListeners = new Map<string, Set<Listener>>();
 const EMPTY_INLINE_ARTIFACT_STATE: InlineArtifactState = Object.freeze({});
 
-export function readInlineArtifactState(artifactId: string): InlineArtifactState {
-  return inlineArtifactStates.get(artifactId) ?? EMPTY_INLINE_ARTIFACT_STATE;
+function inlineArtifactKey(sessionKey: string, artifactId: string): string {
+  return `${sessionKey}::${artifactId}`;
 }
 
-export function writeInlineArtifactState(artifactId: string, state: InlineArtifactState) {
-  inlineArtifactStates.set(artifactId, state);
-  inlineArtifactListeners.get(artifactId)?.forEach((listener) => listener());
+export function readInlineArtifactState(sessionKey: string, artifactId: string): InlineArtifactState {
+  return inlineArtifactStates.get(inlineArtifactKey(sessionKey, artifactId)) ?? EMPTY_INLINE_ARTIFACT_STATE;
 }
 
-export function subscribeInlineArtifactState(artifactId: string, listener: Listener): () => void {
-  const listeners = inlineArtifactListeners.get(artifactId) ?? new Set<Listener>();
+export function writeInlineArtifactState(sessionKey: string, artifactId: string, state: InlineArtifactState) {
+  const key = inlineArtifactKey(sessionKey, artifactId);
+  inlineArtifactStates.set(key, state);
+  inlineArtifactListeners.get(key)?.forEach((listener) => listener());
+}
+
+export function subscribeInlineArtifactState(sessionKey: string, artifactId: string, listener: Listener): () => void {
+  const key = inlineArtifactKey(sessionKey, artifactId);
+  const listeners = inlineArtifactListeners.get(key) ?? new Set<Listener>();
   listeners.add(listener);
-  inlineArtifactListeners.set(artifactId, listeners);
+  inlineArtifactListeners.set(key, listeners);
   return () => {
     listeners.delete(listener);
-    if (listeners.size === 0) inlineArtifactListeners.delete(artifactId);
+    if (listeners.size === 0) inlineArtifactListeners.delete(key);
   };
+}
+
+export function clearInlineArtifactStates(sessionKey: string) {
+  const prefix = `${sessionKey}::`;
+  for (const key of Array.from(inlineArtifactStates.keys())) {
+    if (key.startsWith(prefix)) inlineArtifactStates.delete(key);
+  }
+  for (const key of Array.from(inlineArtifactListeners.keys())) {
+    if (key.startsWith(prefix)) {
+      inlineArtifactListeners.get(key)?.forEach((listener) => listener());
+    }
+  }
 }
 
 function targetKey(target: TranscriptTarget): string {

@@ -1,5 +1,6 @@
 import { useState } from "react";
-import { RotateCcw } from "lucide-react";
+import type { ReactNode } from "react";
+import { FileQuestion, RotateCcw } from "lucide-react";
 
 export type ArtifactPlaceholderShape =
   | "diagram"
@@ -148,6 +149,29 @@ export function ArtifactError({
           Retry
         </button>
       ) : null}
+    </div>
+  );
+}
+
+export function ArtifactFallback({
+  actions,
+  detail,
+  title,
+}: {
+  actions?: ReactNode;
+  detail?: string | null;
+  title: string;
+}) {
+  return (
+    <div className="artifact-render-fallback" role="status">
+      <div className="artifact-render-fallback-icon" aria-hidden="true">
+        <FileQuestion size={22} />
+      </div>
+      <div className="artifact-render-fallback-body">
+        <div className="artifact-render-fallback-title">{title}</div>
+        {detail ? <div className="artifact-render-fallback-detail">{detail}</div> : null}
+      </div>
+      {actions ? <div className="artifact-render-fallback-actions">{actions}</div> : null}
     </div>
   );
 }

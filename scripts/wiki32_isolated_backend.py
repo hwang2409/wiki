@@ -76,6 +76,7 @@ def main_cli() -> None:
             "WIKI_CODEX_ACCOUNTS_DIR": str(account_home / "codex-accounts"),
             "WIKI_ROTATION_LOG_PATH": str(account_home / "rotation.log"),
             "WIKI_ACCOUNT_WATCHDOG": "off",
+            "WIKI_UI_STATE_PATH": str(fixture_root / "ui-state.json"),
             "CODEX_HOME": str(account_home / "codex"),
             "CLAUDE_CONFIG_DIR": str(account_home / "claude"),
             # WIKI-151: pin UI-state + token-cache paths under the fixture root
@@ -90,8 +91,9 @@ def main_cli() -> None:
         }
     )
 
-    from backend.app import main, transcripts
+    from backend.app import main, transcripts, uistate
 
+    uistate.UI_STATE_PATH = fixture_root / "ui-state.json"
     main.AGENT_REGISTRY_PATH = args.registry
     main.AGENT_STATUS_DIR = args.status_dir
     main.AGENT_ARCHIVE_DIR = archive_dir

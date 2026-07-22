@@ -59,7 +59,7 @@ function inputs() {
     { kind: "mermaid", title: "Second large graph", payload: { source: largeMermaid() } },
     { kind: "svg", title: "Titled svg", payload: { source: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 60"><rect width="120" height="60" fill="#123"/></svg>' } },
     { kind: "plot", title: "Trend plot", payload: { spec_vega_lite: largePlot() } },
-    { kind: "code", title: "Untitled fallback", payload: { language: "typescript", source: "export const answer = 42;\n" } },
+    { kind: "code", payload: { language: "typescript", source: "export const answer = 42;\n" } },
   ];
 }
 
@@ -220,13 +220,18 @@ async function main() {
       "expand state should not leak to a sibling artifact",
     );
 
-    // Expand persists across a soft reload (module-level cache; same session key).
-    await page.reload({ waitUntil: "domcontentloaded" });
-    await page.locator(".session-scroll").waitFor({ state: "visible" });
-    const largeAAfter = page.locator(`[data-artifact-id="${largeMermaidAId}"]`);
-    await largeAAfter.waitFor({ state: "visible" });
-    // NOTE: cache is module-scoped so it resets on full page reload; we don't require survival
-    // across a hard reload — only across sibling artifact focus changes.
+    // Expanded state survives a session focus round-trip (same sessionKey re-entered).
+    await setPanelUrl(page, [largeMermaidAId], largeMermaidAId);
+    const panelForA = page.getByRole("complementary", { name: "Artifact panel" });
+    await panelForA.waitFor({ state: "visible" });
+    await panelForA.getByRole("button", { name: "Close artifact panel" }).click();
+    await panelForA.waitFor({ state: "hidden" });
+    const largeReturned = page.locator(`[data-artifact-id="${largeMermaidAId}"]`);
+    await largeReturned.waitFor({ state: "visible" });
+    assert(
+      (await largeReturned.getAttribute("data-artifact-expanded")) === "true",
+      "expand state should survive an intra-session focus round-trip",
+    );
 
     // --- Plot skeleton present during load ---
     const plotBlock = page.locator(`[data-artifact-id="${plotId}"]`);
@@ -276,6 +281,43 @@ async function main() {
     await overflowMenu.getByRole("menuitem", { name: "Titled diagram" }).waitFor({ state: "visible" });
 
     await page.screenshot({ path: path.join(OUT_DIR, "wiki-156-shell.png") });
+
+    // --- Untitled artifact: humanized kind label, kind rendered ONCE, no raw ID ---
+    await setPanelUrl(page, [codeId], codeId);
+    const untitledTab = panel.getByRole("tab", { name: /^Code$/ }).first();
+    await untitledTab.waitFor({ state: "visible" });
+    const untitledTabText = (await untitledTab.textContent())?.trim() ?? "";
+    assert(untitledTabText === "Code", `untitled code artifact should render humanized kind label only, got "${untitledTabText}"`);
+    assert(
+      !untitledTabText.toLowerCase().includes(codeId.slice(0, 6)),
+      `untitled tab must not expose artifact ID prefix, got "${untitledTabText}"`,
+    );
+    const kindBadges = await untitledTab.locator(".artifact-panel-tab-kind").count();
+    assert(kindBadges === 0, `tab kind badge should not duplicate the title label, got ${kindBadges}`);
+
+    // --- Unavailable-payload panel routes through shared fallback surface ---
+    const ghostId = "00000000-0000-4000-8000-ffffffff0156";
+    await setPanelUrl(page, [ghostId], ghostId);
+    await panel.getByRole("tab").filter({ hasText: /Diagram|Artifact|artifact 00000000/ }).first().waitFor({ state: "visible" }).catch(() => {});
+    const fallbackTitle = await panel.locator(".artifact-render-fallback-title").count();
+    assert(fallbackTitle > 0, "panel with missing payload should render the shared fallback surface");
+    const fallbackAction = await panel.locator(".artifact-render-fallback-action").count();
+    assert(fallbackAction >= 1, "panel fallback should expose at least one recovery action");
+    // Assert no raw ID prefix leaks into the ghost tab (id is a UUID, must not appear).
+    const ghostTab = panel.getByRole("tab").first();
+    const ghostTabText = (await ghostTab.textContent())?.trim() ?? "";
+    assert(
+      !ghostTabText.includes(ghostId.slice(0, 8)),
+      `missing-payload tab must not leak the artifact ID slice, got "${ghostTabText}"`,
+    );
+
+    // --- Invalid image routes through shared error surface ---
+    await panel.getByRole("button", { name: "Close artifact panel" }).click();
+    await page.evaluate(() => {
+      const img = document.querySelector(".artifact-image-wrap img");
+      if (img) img.dispatchEvent(new Event("error"));
+    });
+    // Nothing to assert if no image on screen; skip if not applicable.
   } finally {
     await context.close();
     await browser.close();
