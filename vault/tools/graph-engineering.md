@@ -5,6 +5,8 @@ created: 2026-07-22
 updated: 2026-07-22
 ---
 
+
+
 # Graph Engineering
 
 The next layer after **loop engineering**: programming a multi-agent organization as a structured graph rather than a single agent's behavior cycle. Coined / popularized in mid-2026 discourse (0xCodez, explainx.ai, AI Builder Club). If loop engineering was the 2025 – mid-2026 skill, graph engineering picks up when you have more than one loop coordinating.
@@ -73,6 +75,53 @@ The vocabulary just makes what is already built explicit and portable to non-Wik
 - [[mastermind-merge-ready-loop]] — a loop-inside-graph pattern.
 - [[harness-claude-agent-sdk]] — Claude SDK's Agent/Task tool + sub-agents = graph primitives.
 - [[harness-codex-cli]] — Codex CLI has no sub-agent primitive, so graph engineering there means external orchestration.
+
+## Current-stack gap analysis (2026-07-22)
+
+Rated against Henry's mastermind / wiki / tooling orchestration stack.
+
+### Strengths
+
+- Org graph explicit — orchestrator / implement / review roles + model bindings.
+- Zone isolation via worktrees, hard rule.
+- Handoff schema on the status-file edge (4 fields).
+- Signal priority (monitor > gh ground truth > pane text).
+- Autonomy invariant limits Henry-checkpoints to merge auth.
+- Re-alarm + watchlist = graph observability with backpressure.
+- Immediate-archive-on-report keeps fleet slot count honest.
+- Sentinel + status-file dual-channel = redundant edge signal.
+
+### Gaps
+
+1. Work graph is only prose — DAG lives in the merge-ready-loop SKILL narrative, no on-disk artifact. No replay, no diff, no composite health per ticket.
+2. `Finding` payload not typed — sim / review / thermo / audit all emit prose; every steer improvises the "observed / why / do / constraint" shape. No schema, no linter.
+3. Edge kinds not enumerated — spawn / steer / verdict / archive / handoff exist informally. Adding a new one (unrouted-verdict re-alarm) took a real incident.
+4. Work-graph generators = orchestrator prompt — whether a ticket gets SIM before review or THERMO after is judgment each time. No per-ticket-kind template.
+5. Retry policy improvised — worker fails and orchestrator decides steer vs respawn vs handoff. No node-declared `on_failure`.
+6. Cross-orchestrator graph invisible — mastermind + wiki + tooling run in parallel. Fleet monitor is per-orch. WIKI-132 dashboard is close but wiki-scoped.
+7. Zone isolation is convention, not runtime enforcement — 4 leak incidents already codified.
+8. No graph dry-run — every new work-graph shape tested live on real tickets.
+9. Iteration cap policy scattered across hot.md, protocol note, feedback note.
+10. No graph-level SLA / escalation ladder — per-worker stall detected, no "any node blocked > 30 min → page Henry" policy.
+11. No per-ticket replay — `agent-archive` stores per-worker artifacts, not stitched DAG.
+12. Workers declare no capabilities — nothing says "this luna worker has migration authority" vs "read-only research". Orchestrator infers from ticket.
+
+### Top-5 highest-ROI changes
+
+1. **`Finding` + edge-payload JSON schemas** — unlocks gaps 2, 3, 5, 10.
+2. **Per-ticket `workgraph.json` DAG file + wiki-app renderer** — unlocks gaps 1, 6, 11.
+3. **Work-graph templates per ticket kind** — unlocks gaps 4, 9.
+4. **Worker-side pre-tool hook enforcing zone isolation** — unlocks gap 7.
+5. **Cross-orchestrator meta-registry** — unlocks gaps 6, 10.
+
+### Before / after diagrams
+
+Rendered as wiki artifacts in the session that produced this note (2026-07-22):
+
+- Work graph BEFORE (prose only) — no DAG file, no replay, no composite health, no per-ticket monitor.
+- Work graph AFTER (`workgraph.json`) — persistent DAG, template instantiation, per-node append, wiki renderer, composite health feedback, graph lint against template.
+- Finding payload BEFORE (prose ad-hoc) — every verification worker emits prose, orchestrator hand-batches into steer text; missing schema / linter / severity enum / source trace.
+- Finding payload AFTER (typed) — `Finding` + `Steer` + `Verdict` schemas, all verification workers emit `Finding[]`, orchestrator wraps in `Steer`, graph lint validates, wiki finding view + per-severity SLA / escalation ladder.
 
 ## Sources
 
