@@ -9018,3 +9018,20 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-faint);
   font-style: italic;
 }
+
+.transcript-preview-body.is-custom {
+  padding: 0;
+  background: transparent;
+  border: none;
+  max-height: none;
+  overflow: visible;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.transcript-preview-body.is-custom .session-tool-output-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: inherit;
+}

@@ -44,7 +44,18 @@ const ANSI_STDERR = [
   "permission denied: /tmp/does-not-exist",
 ].join("\n");
 
-const BASH_COMMAND_TEXT = `ls -la /tmp/wiki-153-fixture && cat /tmp/wiki-153-fixture/large.log | head -${LONG_OUTPUT_LINES}`;
+const BASH_COMMAND_TEXT = [
+  `ls -la /tmp/wiki-153-fixture \\`,
+  ...Array.from({ length: 10 }, (_, index) => `  --flag-${index + 1}=value_${index + 1} \\`),
+  `  && cat /tmp/wiki-153-fixture/large.log | head -${LONG_OUTPUT_LINES}`,
+].join("\n");
+
+const BASH_TOOL_INPUT = [
+  `#!/usr/bin/env bash`,
+  `set -euo pipefail`,
+  ...Array.from({ length: LONG_INPUT_LINES }, (_, index) => `echo "wiki-153 tool step ${index + 1}"`),
+  `exit 0`,
+].join("\n");
 
 const CLAUDE_TRANSCRIPT_ROWS = [
   { type: "mode", mode: "normal", sessionId: "fixture-wiki-153" },
@@ -95,6 +106,38 @@ const CLAUDE_TRANSCRIPT_ROWS = [
           tool_use_id: "toolu_read_fixture",
           content: FAILED_OUTPUT,
           is_error: true,
+        },
+      ],
+    },
+  },
+  {
+    type: "assistant",
+    timestamp: "2026-07-22T18:00:03.500Z",
+    message: {
+      role: "assistant",
+      content: [
+        {
+          type: "tool_use",
+          id: "toolu_bash_fixture",
+          name: "Bash",
+          input: {
+            command: BASH_TOOL_INPUT,
+            description: "wiki-153 bash tool fixture",
+          },
+        },
+      ],
+    },
+  },
+  {
+    type: "user",
+    timestamp: "2026-07-22T18:00:03.700Z",
+    message: {
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_bash_fixture",
+          content: "wiki-153 bash tool ran ok",
         },
       ],
     },
@@ -183,6 +226,18 @@ async function main() {
     }
     body.provider_inspector.state = "waiting-approval";
     body.provider_inspector.pending_requests = [PROVIDER_PENDING_REQUEST];
+    body.provider_inspector.events = [
+      ...(body.provider_inspector.events ?? []),
+      {
+        seq: 900,
+        kind: "model_changed",
+        normalized_at: "2026-07-22T18:00:06Z",
+        payload: {
+          to_model: "claude-opus-4-7",
+          message: "model changed to claude-opus-4-7",
+        },
+      },
+    ];
     await route.fulfill({
       status: response.status(),
       headers: response.headers(),
@@ -215,6 +270,11 @@ async function main() {
     logStep("hook messages: whitelist vs hidden");
     await expectVisibleText(page, ".session-marker.is-error", "529 Overloaded");
     await expectVisibleText(page, ".session-marker.is-info", "permissions");
+    await expectVisibleText(page, ".session-marker.is-info", "model changed to claude-opus-4-7");
+    const modelChangedHidden = await page.locator(".session-marker-hidden", { hasText: "model changed" }).count();
+    if (modelChangedHidden !== 0) {
+      throw new Error("model_changed should render as visible marker, not hidden run-detail");
+    }
     const hiddenMarkers = page.locator(".session-marker-hidden");
     await hiddenMarkers.first().waitFor({ state: "visible" });
     const hiddenSummaries = await hiddenMarkers.locator("summary", { hasText: "run detail" }).count();
@@ -251,10 +311,27 @@ async function main() {
     await outputPreview.locator(".transcript-chip", { hasText: "copy" }).click();
     await outputPreview.locator(".transcript-chip", { hasText: "copied" }).waitFor({ state: "visible" });
 
-    logStep("bash block: three sections, ansi preserved");
+    logStep("bash tool call: input routed through BoundedPreview + shiki");
+    const bashTool = page.locator(".session-tool", { has: page.locator(".session-tool-summary", { hasText: /wiki-153 tool step/ }) }).first();
+    await bashTool.waitFor({ state: "visible" });
+    await bashTool.locator(".session-tool-head").click();
+    const bashToolInput = bashTool.locator(".transcript-preview", { has: page.locator(".transcript-preview-label", { hasText: "input" }) }).first();
+    await bashToolInput.waitFor({ state: "visible" });
+    await bashToolInput.locator(".shiki-block[data-lang='bash']").waitFor({ state: "visible" });
+    const bashToolSummary = await bashToolInput.locator(".transcript-preview-summary").first().innerText();
+    if (!/\d+ lines · /.test(bashToolSummary)) throw new Error(`bash tool input summary malformed: ${bashToolSummary}`);
+    await bashToolInput.locator(".transcript-chip", { hasText: "copy" }).waitFor({ state: "visible" });
+    await bashToolInput.locator(".transcript-chip", { hasText: "expand" }).waitFor({ state: "visible" });
+
+    logStep("bash block: three labelled sections, ansi preserved");
     const bashBlock = page.locator(".session-bash").first();
     await bashBlock.waitFor({ state: "visible" });
-    await bashBlock.locator(".session-bash-command").waitFor({ state: "visible" });
+    const commandSection = bashBlock.locator(".transcript-preview", { has: page.locator(".transcript-preview-label", { hasText: "command" }) }).first();
+    await commandSection.waitFor({ state: "visible" });
+    await commandSection.locator(".session-bash-command .shiki-block[data-lang='bash']").waitFor({ state: "visible" });
+    const commandSummary = await commandSection.locator(".transcript-preview-summary").first().innerText();
+    if (!/\d+ lines · /.test(commandSummary)) throw new Error(`bash command summary malformed: ${commandSummary}`);
+    await commandSection.locator(".transcript-chip", { hasText: "copy" }).waitFor({ state: "visible" });
     const outputSection = bashBlock.locator(".transcript-preview", { has: page.locator(".transcript-preview-label", { hasText: "output" }) }).first();
     await outputSection.waitFor({ state: "visible" });
     const errorSection = bashBlock.locator(".transcript-preview.is-error", { has: page.locator(".transcript-preview-label", { hasText: "error" }) }).first();

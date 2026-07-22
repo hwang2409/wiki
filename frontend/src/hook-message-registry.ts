@@ -32,6 +32,7 @@ export const MARKER_WHITELIST: Record<string, MarkerRule> = {
   task_started: { severity: "info" },
   task_complete: { severity: "info" },
   local_command: { severity: "info" },
+  model_changed: { severity: "info" },
   scheduled_task_fire: { severity: "info", verb: "scheduled task fired" },
 };
 

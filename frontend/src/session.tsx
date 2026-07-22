@@ -1029,26 +1029,37 @@ function ToolRow({
       <div className={`session-collapsible session-tool-collapsible${open ? " is-open" : ""}`}>
         <div className="session-collapsible-inner">
           <div className="session-tool-body">
-            {tool.name === "Bash" ? (
-              <ShikiCode className="session-tool-input" code={tool.input} lang="bash" />
+            {tool.name === "Bash" && tool.input ? (
+              <BoundedPreview
+                label="input"
+                text={tool.input}
+                renderBody={({ text }) => (
+                  <ShikiCode className="session-tool-input" code={text} lang="bash" transparent />
+                )}
+              />
             ) : tool.input ? (
               <BoundedPreview label="input" text={tool.input} />
             ) : null}
             {outputSegments ? (
-              <div className="session-tool-output-blocks">
-                {outputSegments.map((segment, index) =>
-                  segment.type === "url" ? (
-                    <GhPreviewCard key={`${segment.value}:${index}`} url={segment.value} />
-                  ) : segment.value ? (
-                    <BoundedPreview
-                      ansi
-                      key={`text:${index}`}
-                      label="output"
-                      text={segment.value}
-                    />
-                  ) : null
+              <BoundedPreview
+                ansi
+                label="output"
+                text={tool.output ?? ""}
+                tone={tool.ok === false ? "error" : "normal"}
+                renderBody={() => (
+                  <div className="session-tool-output-blocks">
+                    {outputSegments.map((segment, index) =>
+                      segment.type === "url" ? (
+                        <GhPreviewCard key={`${segment.value}:${index}`} url={segment.value} />
+                      ) : segment.value ? (
+                        <span key={`text:${index}`} className="session-tool-output-text">
+                          {segment.value}
+                        </span>
+                      ) : null
+                    )}
+                  </div>
                 )}
-              </div>
+              />
             ) : tool.output ? (
               <BoundedPreview
                 ansi
@@ -1201,15 +1212,21 @@ function BashBlock({ event }: { event: SessionEvent }) {
   return (
     <div className="session-bash">
       {bash.input ? (
-        <div className="session-bash-command">
-          <span className="session-bash-prompt">❯</span>
-          <ShikiCode
-            className="session-bash-command-code"
-            code={bash.input}
-            lang="bash"
-            transparent
-          />
-        </div>
+        <BoundedPreview
+          label="command"
+          text={bash.input}
+          renderBody={({ text }) => (
+            <div className="session-bash-command">
+              <span className="session-bash-prompt">❯</span>
+              <ShikiCode
+                className="session-bash-command-code"
+                code={text}
+                lang="bash"
+                transparent
+              />
+            </div>
+          )}
+        />
       ) : null}
       {bash.stdout ? (
         <BoundedPreview ansi label="output" text={bash.stdout} />

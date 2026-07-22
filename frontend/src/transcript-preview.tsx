@@ -54,6 +54,14 @@ function ChipButton({ active, label, title, onClick }: ChipButtonProps) {
   );
 }
 
+export type BoundedPreviewRenderProps = {
+  text: string;
+  fullText: string;
+  expanded: boolean;
+  clipped: boolean;
+  hiddenCount: number;
+};
+
 type BoundedPreviewProps = {
   text: string;
   label?: string;
@@ -64,6 +72,9 @@ type BoundedPreviewProps = {
   className?: string;
   tone?: "normal" | "error";
   renderExpandedBody?: (text: string) => ReactNode;
+  renderBody?: (props: BoundedPreviewRenderProps) => ReactNode;
+  wrapAvailable?: boolean;
+  expandable?: boolean;
 };
 
 export function BoundedPreview({
@@ -75,6 +86,9 @@ export function BoundedPreview({
   className,
   tone = "normal",
   renderExpandedBody,
+  renderBody,
+  wrapAvailable: wrapAvailableOverride,
+  expandable = true,
 }: BoundedPreviewProps) {
   const [expanded, setExpanded] = useState(false);
   const [wrap, setWrap] = useState(true);
@@ -82,12 +96,13 @@ export function BoundedPreview({
 
   const lines = useMemo(() => (text.length === 0 ? [] : text.split("\n")), [text]);
   const totalLines = lines.length;
-  const shouldClip = !expanded && totalLines > previewLines;
+  const shouldClip = expandable && !expanded && totalLines > previewLines;
   const shownLines = shouldClip ? lines.slice(0, previewLines) : lines;
   const hiddenCount = totalLines - shownLines.length;
   const summary = showSummary ? summaryLabel(text) : null;
   const usesAnsi = ansi && hasAnsi(text);
-  const wrapAvailable = shownLines.some((line) => line.length > 120) || totalLines > 30;
+  const wrapAvailable = wrapAvailableOverride
+    ?? (shownLines.some((line) => line.length > 120) || totalLines > 30);
 
   const copy = useCallback(() => {
     void navigator.clipboard?.writeText(text).then(
@@ -100,11 +115,26 @@ export function BoundedPreview({
   }, [text]);
 
   const bodyText = shownLines.join("\n");
-  const bodyContent: ReactNode = renderExpandedBody && expanded
+  const custom = renderBody
+    ? renderBody({
+        text: shouldClip ? bodyText : text,
+        fullText: text,
+        expanded,
+        clipped: shouldClip,
+        hiddenCount,
+      })
+    : null;
+  const defaultBody: ReactNode = renderExpandedBody && expanded
     ? renderExpandedBody(text)
     : usesAnsi
       ? renderAnsi(bodyText)
       : bodyText;
+
+  const moreHint = shouldClip && hiddenCount > 0 ? (
+    <span className="transcript-preview-more">
+      <span>+{hiddenCount} more line{hiddenCount === 1 ? "" : "s"}</span>
+    </span>
+  ) : null;
 
   return (
     <div className={`transcript-preview${className ? ` ${className}` : ""} is-${tone}`}>
@@ -112,7 +142,7 @@ export function BoundedPreview({
         {label ? <span className="transcript-preview-label">{label}</span> : null}
         {summary ? <span className="transcript-preview-summary">{summary}</span> : null}
         <span className="transcript-preview-actions">
-          {wrapAvailable ? (
+          {wrapAvailable && !renderBody ? (
             <ChipButton
               active={!wrap}
               label={wrap ? "nowrap" : "wrap"}
@@ -120,7 +150,7 @@ export function BoundedPreview({
               onClick={() => setWrap((value) => !value)}
             />
           ) : null}
-          {totalLines > previewLines ? (
+          {expandable && totalLines > previewLines ? (
             <ChipButton
               active={expanded}
               label={expanded ? "collapse" : "expand"}
@@ -137,15 +167,17 @@ export function BoundedPreview({
           ) : null}
         </span>
       </div>
-      <pre className={`transcript-preview-body${wrap ? " is-wrap" : " is-nowrap"}`}>
-        {bodyContent}
-        {shouldClip && hiddenCount > 0 ? (
-          <span className="transcript-preview-more">
-            {"\n"}
-            <span>+{hiddenCount} more line{hiddenCount === 1 ? "" : "s"}</span>
-          </span>
-        ) : null}
-      </pre>
+      {custom ? (
+        <div className="transcript-preview-body is-custom">
+          {custom}
+          {moreHint}
+        </div>
+      ) : (
+        <pre className={`transcript-preview-body${wrap ? " is-wrap" : " is-nowrap"}`}>
+          {defaultBody}
+          {moreHint ? <>{"\n"}{moreHint}</> : null}
+        </pre>
+      )}
     </div>
   );
 }
