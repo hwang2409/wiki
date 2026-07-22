@@ -1522,8 +1522,13 @@ export function AgentsSidebar({
   // optimistic override intact AND set this flag so the effect stops firing;
   // the row renders a distinct failed indicator so the user can see why.
   const [viewedFailed, setViewedFailed] = useState<Record<string, boolean>>({});
-  const viewedInflight = useRef<Map<string, boolean>>(new Map());
-  const viewedAttempts = useRef<Map<string, number>>(new Map());
+  // One controller per run kept alive across backoff. `targetSeq` coalesces
+  // the HIGHEST seq observed while inflight (bursts collapse to a single
+  // additional post); `attempts` counts total requests within this chain and
+  // caps at MAX_ATTEMPTS so an SSE burst never widens the retry budget.
+  // WIKI-147 R4 H1.
+  type ViewedController = { targetSeq: number; attempts: number };
+  const viewedInflight = useRef<Map<string, ViewedController>>(new Map());
   const viewedRetryTimers = useRef<Map<string, number>>(new Map());
 
   useEffect(() => {
@@ -1577,67 +1582,59 @@ export function AgentsSidebar({
       return { ...current, [runId]: observedSeq };
     });
 
-    if (viewedInflight.current.has(runId)) {
-      // Do NOT drop this open — remember that a re-mark is desired once the
-      // in-flight request settles. Prevents a stuck "cleared" state if the
-      // seq advanced while we were mid-flight.
-      viewedInflight.current.set(runId, true);
+    const existing = viewedInflight.current.get(runId);
+    if (existing) {
+      // Controller alive — coalesce the target seq monotonically. No new
+      // request fires; the in-flight (or scheduled) attempt picks up the
+      // highest seq at post-time. Attempt cap stays intact.
+      if (observedSeq > existing.targetSeq) existing.targetSeq = observedSeq;
       return;
     }
 
     const MAX_ATTEMPTS = 3;
     const backoffMs = (attempt: number) => 500 * 2 ** (attempt - 1);
+    const controller: ViewedController = {
+      targetSeq: observedSeq,
+      attempts: 0,
+    };
+    viewedInflight.current.set(runId, controller);
 
-    const post = (seq: number): void => {
-      viewedInflight.current.set(runId, false);
-      viewedAttempts.current.set(
-        runId,
-        (viewedAttempts.current.get(runId) ?? 0) + 1
-      );
+    const runPost = (): void => {
+      const state = viewedInflight.current.get(runId);
+      if (!state) return;
+      state.attempts += 1;
+      const seq = state.targetSeq;
       markRunViewed(runId, seq)
         .then((result) => {
-          viewedAttempts.current.delete(runId);
-          setViewedOverrides((current) => ({
-            ...current,
-            [runId]: result.last_viewed_seq,
-          }));
+          viewedInflight.current.delete(runId);
+          setViewedOverrides((current) => {
+            const prior = current[runId] ?? -1;
+            const next = Math.max(prior, result.last_viewed_seq, seq);
+            if (next <= prior) return current;
+            return { ...current, [runId]: next };
+          });
         })
         .catch(() => {
-          // Round 2 H1: preserve the optimistic override on failure. Retry
-          // with exponential backoff up to MAX_ATTEMPTS; flip to failed
-          // afterwards so the effect stops firing and the user sees the
-          // failed badge.
-          const attempts = viewedAttempts.current.get(runId) ?? MAX_ATTEMPTS;
-          if (attempts < MAX_ATTEMPTS) {
-            const delay = backoffMs(attempts);
+          const active = viewedInflight.current.get(runId);
+          if (!active) return;
+          if (active.attempts < MAX_ATTEMPTS) {
+            const delay = backoffMs(active.attempts);
             const timer = window.setTimeout(() => {
               viewedRetryTimers.current.delete(runId);
-              post(seq);
+              runPost();
             }, delay);
             viewedRetryTimers.current.set(runId, timer);
             return;
           }
-          viewedAttempts.current.delete(runId);
+          viewedInflight.current.delete(runId);
           setViewedFailed((current) => {
             if (current[runId]) return current;
             return { ...current, [runId]: true };
           });
-        })
-        .finally(() => {
-          const wasQueued = viewedInflight.current.get(runId) === true;
-          viewedInflight.current.delete(runId);
-          if (!wasQueued) return;
-          // A later open happened while inflight — re-post with the current
-          // seq observed on the freshest render.
-          setViewedOverrides((current) => {
-            const seqNow = current[runId];
-            if (seqNow !== undefined && !viewedFailed[runId]) post(seqNow);
-            return current;
-          });
         });
     };
 
-    post(observedSeq);
+    runPost();
   }, [activeTicket, workers, viewedOverrides, viewedFailed]);
 
   useEffect(() => {

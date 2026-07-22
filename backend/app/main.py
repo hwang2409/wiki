@@ -1115,6 +1115,65 @@ def _load_run_created_at(run_id: str) -> str | None:
     return created_at if isinstance(created_at, str) else None
 
 
+def _baseline_path(run_id: str) -> Path:
+    return AGENT_RUNS_DIR / run_id / "viewed-baseline.json"
+
+
+def _load_run_baseline(run_id: str) -> tuple[str | None, int | None]:
+    """Return ``(baseline_at, baseline_seq)`` for a pre-deploy run, if written."""
+
+    try:
+        payload = json.loads(_baseline_path(run_id).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None, None
+    if not isinstance(payload, dict):
+        return None, None
+    seq = payload.get("seq")
+    at = payload.get("at")
+    if not isinstance(seq, int) or seq < 0:
+        return None, None
+    if not isinstance(at, str):
+        return None, None
+    return at, seq
+
+
+def _ensure_run_baseline(
+    run_id: str,
+    latest_at: str,
+    latest_seq: int,
+) -> tuple[str, int]:
+    """Freeze a per-run viewed baseline on FIRST observation and return it.
+
+    Idempotent: once ``runs/<id>/viewed-baseline.json`` exists, subsequent calls
+    return the persisted value verbatim — future events with seq > baseline_seq
+    then render as unread (WIKI-147 R4 B1). Uses O_EXCL to make the initial
+    write race-safe across concurrent readers.
+    """
+
+    existing_at, existing_seq = _load_run_baseline(run_id)
+    if existing_seq is not None and existing_at is not None:
+        return existing_at, existing_seq
+    path = _baseline_path(run_id)
+    payload = json.dumps({"at": latest_at, "seq": latest_seq}, sort_keys=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        stored_at, stored_seq = _load_run_baseline(run_id)
+        if stored_seq is not None and stored_at is not None:
+            return stored_at, stored_seq
+        return latest_at, latest_seq
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+    return latest_at, latest_seq
+
+
 def _resolve_viewed_fields(
     run_id: str | None,
     viewed_map: dict[str, ViewedEntry],
@@ -1124,15 +1183,16 @@ def _resolve_viewed_fields(
     Order of precedence for the viewed pair:
       1. Explicit entry in ``viewed_map`` (user marked the row viewed).
       2. Pre-deploy classification: the run was created before this supervisor's
-         deploy cutoff (or the run predates the ``created_at`` schema) — treat
-         as viewed at whatever the current durable seq is, so legacy sessions
-         don't all show a dot after upgrade. WIKI-147 R2 B1 contract.
+         deploy cutoff (or the run predates the ``created_at`` schema) — freeze
+         a per-run baseline at the first-observed durable seq so legacy sessions
+         don't show a dot after upgrade AND future events land as unread.
+         WIKI-147 R4 B1.
       3. Post-deploy new session (created_at >= deploy cutoff) — leave ``None``
          so any recorded event renders as unread.
     """
 
     latest_at, latest_seq = _load_run_freshness(run_id)
-    if not run_id or latest_at is None:
+    if not run_id or latest_at is None or latest_seq is None:
         return latest_at, latest_seq, None, None
     entry = viewed_map.get(run_id)
     if entry is not None:
@@ -1140,8 +1200,8 @@ def _resolve_viewed_fields(
     created_at = _load_run_created_at(run_id)
     deploy_at = _ensure_deploy_timestamp()
     if created_at is None or created_at < deploy_at:
-        # Legacy / pre-deploy — no dot on first paint.
-        return latest_at, latest_seq, latest_at, latest_seq
+        baseline_at, baseline_seq = _ensure_run_baseline(run_id, latest_at, latest_seq)
+        return latest_at, latest_seq, baseline_at, baseline_seq
     return latest_at, latest_seq, None, None
 
 

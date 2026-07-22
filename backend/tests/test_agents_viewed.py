@@ -206,6 +206,45 @@ class AgentsViewedTests(unittest.TestCase):
         self.assertIsNone(worker["last_viewed_seq"])
         self.assertIsNone(worker["last_viewed_at"])
 
+    def test_pre_deploy_baseline_frozen_on_first_observation(self) -> None:
+        # WIKI-147 R4 B1: pre-deploy run baselines at the first observed seq.
+        # Later events (seq > baseline_seq) must render as unread instead of
+        # being classified as viewed forever.
+        run_id = _new_run_id()
+        self._seed_worker(
+            "WIKI-93",
+            run_id=run_id,
+            seq=5,
+            updated_at=_iso(0),
+            created_at=_iso(-60),
+        )
+
+        first = main.agents()
+        first_worker = next(
+            row for row in cast(list[dict[str, Any]], first["workers"])
+            if row["ticket"] == "WIKI-93"
+        )
+        self.assertEqual(first_worker["latest_event_seq"], 5)
+        self.assertEqual(first_worker["last_viewed_seq"], 5)
+
+        # New durable event lands — seq advances, baseline stays.
+        self._write_run(run_id, seq=6, updated_at=_iso(30), created_at=_iso(-60))
+
+        second = main.agents()
+        second_worker = next(
+            row for row in cast(list[dict[str, Any]], second["workers"])
+            if row["ticket"] == "WIKI-93"
+        )
+        self.assertEqual(second_worker["latest_event_seq"], 6)
+        self.assertEqual(second_worker["last_viewed_seq"], 5)
+
+        # Baseline sidecar was frozen at the FIRST observation (seq=5) and
+        # was not recomputed on the second request.
+        baseline = json.loads(
+            (self.runs_dir / run_id / "viewed-baseline.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(baseline["seq"], 5)
+
     def test_deploy_marker_persists_across_reboot(self) -> None:
         run_id = _new_run_id()
         self._seed_worker(
