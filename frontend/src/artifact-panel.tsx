@@ -1,6 +1,6 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
-import { Clock3, MoreHorizontal, Pin, X } from "lucide-react";
+import { Clock3, MoreHorizontal, X } from "lucide-react";
 import type { SessionEvent } from "./api";
 import { CodeArtifactDetail } from "./artifact-detail/code";
 import { DiffArtifactDetail } from "./artifact-detail/diff";
@@ -12,12 +12,32 @@ import { PlotArtifactDetail } from "./artifact-detail/plot";
 import { SvgArtifactDetail } from "./artifact-detail/svg";
 import { TableArtifactDetail } from "./artifact-detail/table";
 import { classifyArtifact } from "./artifact-kind";
-import { StatusBadge } from "./status-badge";
+import { ArtifactFallback } from "./artifact-state";
 import type { ArtifactViewState, PanelState } from "./transcript-store";
 
-function titleFor(event: SessionEvent | undefined, id: string) {
-  return event?.title || event?.artifact?.filename || event?.artifact?.kind || `artifact ${id.slice(0, 8)}`;
+const KIND_LABELS: Record<string, string> = {
+  mermaid: "Diagram",
+  svg: "Image",
+  image: "Image",
+  table: "Table",
+  plot: "Plot",
+  code: "Code",
+  diff: "Diff",
+  "file-list": "File list",
+  json: "JSON",
+};
+
+function humanizeKind(kind: string | undefined): string {
+  if (!kind) return "Artifact";
+  return KIND_LABELS[kind] ?? kind.charAt(0).toUpperCase() + kind.slice(1);
 }
+
+function titleFor(event: SessionEvent | undefined, _id: string): string {
+  return event?.title
+    || event?.artifact?.filename
+    || humanizeKind(event?.artifact?.kind);
+}
+
 
 export function ArtifactPanel({
   artifacts,
@@ -42,10 +62,22 @@ export function ArtifactPanel({
   ticket: string;
   width: number;
 }) {
-  const [openMenu, setOpenMenu] = useState<string | null>(null);
+  const [overflowOpen, setOverflowOpen] = useState(false);
+  const overflowRef = useRef<HTMLDivElement | null>(null);
   const focusedId = state.focusedTab ?? state.tabs.at(-1) ?? null;
   const focusedEvent = focusedId ? artifacts.get(focusedId) : undefined;
   const artifact = focusedEvent?.artifact;
+
+  useEffect(() => {
+    if (!overflowOpen) return;
+    function onDocDown(nativeEvent: MouseEvent) {
+      if (overflowRef.current && !overflowRef.current.contains(nativeEvent.target as Node)) {
+        setOverflowOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", onDocDown);
+    return () => document.removeEventListener("mousedown", onDocDown);
+  }, [overflowOpen]);
 
   function onKeyDown(event: ReactKeyboardEvent<HTMLElement>) {
     const command = event.metaKey || event.ctrlKey;
@@ -95,49 +127,85 @@ export function ArtifactPanel({
         {state.tabs.map((artifactId) => {
           const event = artifacts.get(artifactId);
           const selected = artifactId === focusedId;
+          const label = titleFor(event, artifactId);
           return (
             <div className={`artifact-panel-tab${selected ? " is-active" : ""}`} key={artifactId}>
               <button
                 aria-selected={selected}
                 className="artifact-panel-tab-main"
                 role="tab"
-                title={titleFor(event, artifactId)}
+                title={label}
                 type="button"
                 onClick={() => onFocusTab(artifactId)}
               >
-                <span>{titleFor(event, artifactId)}</span>
-                {event?.artifact?.kind ? (
-                  <StatusBadge
-                    className="artifact-panel-tab-kind"
-                    compact
-                    label={event.artifact.kind}
-                    state="faint"
-                  />
-                ) : null}
+                <span>{label}</span>
               </button>
-              <button aria-label={`Artifact menu for ${titleFor(event, artifactId)}`} className="artifact-panel-tab-action" type="button" onClick={() => setOpenMenu((current) => current === artifactId ? null : artifactId)}><MoreHorizontal size={12} /></button>
-              {openMenu === artifactId ? (
-                <div className="artifact-panel-tab-menu" role="menu">
-                  <button disabled title="Coming soon" type="button" role="menuitem"><Pin size={11} /> Pin to vault <span>Coming soon</span></button>
-                </div>
-              ) : null}
-              <button aria-label={`Close ${titleFor(event, artifactId)}`} className="artifact-panel-tab-action" type="button" onClick={() => onCloseTab(artifactId)}><X size={12} /></button>
+              <button aria-label={`Close ${label}`} className="artifact-panel-tab-action" type="button" onClick={() => onCloseTab(artifactId)}><X size={12} /></button>
             </div>
           );
         })}
+        <div className="artifact-panel-overflow" ref={overflowRef}>
+          <button
+            aria-controls="artifact-panel-overflow-menu"
+            aria-expanded={overflowOpen}
+            aria-label="Artifact panel menu"
+            className="artifact-panel-close artifact-panel-overflow-toggle"
+            type="button"
+            onClick={() => setOverflowOpen((value) => !value)}
+          >
+            <MoreHorizontal size={14} />
+          </button>
+          {overflowOpen ? (
+            <div className="artifact-panel-overflow-menu" id="artifact-panel-overflow-menu" role="menu">
+              {state.recentlyClosed.length > 0 ? (
+                <>
+                  <div className="artifact-panel-overflow-heading" role="presentation">
+                    <Clock3 aria-hidden="true" size={11} />
+                    <span>Recently closed</span>
+                  </div>
+                  {state.recentlyClosed.map((artifactId) => (
+                    <button
+                      className="artifact-panel-overflow-item"
+                      key={artifactId}
+                      role="menuitem"
+                      type="button"
+                      onClick={() => {
+                        setOverflowOpen(false);
+                        onReopen(artifactId);
+                      }}
+                    >
+                      {titleFor(artifacts.get(artifactId), artifactId)}
+                    </button>
+                  ))}
+                </>
+              ) : (
+                <div className="artifact-panel-overflow-empty" role="presentation">No recently closed artifacts.</div>
+              )}
+            </div>
+          ) : null}
+        </div>
         <button aria-label="Close artifact panel" className="artifact-panel-close" type="button" onClick={onClosePanel}><X size={14} /></button>
       </div>
-      {state.recentlyClosed.length > 0 ? (
-        <div className="artifact-panel-recent" aria-label="Recently closed artifacts">
-          <Clock3 size={11} />
-          <span>Recently closed</span>
-          {state.recentlyClosed.map((artifactId) => (
-            <button key={artifactId} type="button" onClick={() => onReopen(artifactId)}>{titleFor(artifacts.get(artifactId), artifactId)}</button>
-          ))}
-        </div>
-      ) : null}
       <div className="artifact-panel-detail" data-artifact-detail-kind={artifact?.kind}>
-        {detail ?? <div className="artifact-panel-missing">Artifact payload is not available in this session.</div>}
+        {detail ?? (
+          <div className="artifact-panel-missing">
+            <ArtifactFallback
+              actions={
+                focusedId ? (
+                  <button
+                    className="artifact-render-fallback-action"
+                    type="button"
+                    onClick={() => onCloseTab(focusedId)}
+                  >
+                    Close tab
+                  </button>
+                ) : null
+              }
+              detail="This session did not deliver a renderable payload for this artifact."
+              title="Artifact unavailable"
+            />
+          </div>
+        )}
       </div>
     </aside>
   );

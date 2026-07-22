@@ -246,6 +246,8 @@ try {
   await smallBlock.screenshot({ path: path.join(OUT_DIR, "wiki-143-diff-small.png") });
   await oversizedBlock.screenshot({ path: path.join(OUT_DIR, "wiki-143-diff-oversized.png") });
 
+  // WIKI-156: artifact actions are hover-visible; hover first so playwright treats the button as visible.
+  await oversizedBlock.hover();
   await oversizedBlock.getByRole("button", { name: "Open in panel" }).click();
   const panel = page.getByRole("complementary", { name: "Artifact panel" });
   await panel.waitFor({ state: "visible" });
@@ -261,6 +263,7 @@ try {
   await fileListBlock.waitFor({ state: "visible" });
   const fileListCompact = await fileListBlock.getAttribute("data-artifact-compact");
   assert(fileListCompact === "true", `file-list should compact at 33 entries, got data-artifact-compact=${fileListCompact}`);
+  await fileListBlock.hover();
   await fileListBlock.getByRole("button", { name: "Open in panel" }).click();
   await panel.locator(".artifact-detail-file-list").waitFor({ state: "visible" });
   const panelFileIcons = await panel.locator(".artifact-detail-file-list .artifact-file-list-icon").count();
@@ -276,6 +279,7 @@ try {
 
   const jsonBlock = page.locator('[data-artifact-kind="json"]').first();
   await jsonBlock.waitFor({ state: "visible" });
+  await jsonBlock.hover();
   await jsonBlock.getByRole("button", { name: "Open in panel" }).click();
   await panel.locator(".artifact-detail-json").waitFor({ state: "visible" });
   const jsonText = await panel.locator(".artifact-detail-json code").innerText();

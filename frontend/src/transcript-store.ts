@@ -55,6 +55,7 @@ export type TranscriptSnapshot = {
 };
 
 export type ArtifactViewState = {
+  expanded?: boolean;
   filter?: string;
   find?: string;
   findOpen?: boolean;
@@ -125,6 +126,48 @@ export function readPanelState(sessionKey: string): PanelState {
 
 export function writePanelState(sessionKey: string, state: PanelState) {
   panelStates.set(sessionKey, state);
+}
+
+type InlineArtifactState = { expanded?: boolean };
+const inlineArtifactStates = new Map<string, InlineArtifactState>();
+const inlineArtifactListeners = new Map<string, Set<Listener>>();
+const EMPTY_INLINE_ARTIFACT_STATE: InlineArtifactState = Object.freeze({});
+
+function inlineArtifactKey(sessionKey: string, artifactId: string): string {
+  return `${sessionKey}::${artifactId}`;
+}
+
+export function readInlineArtifactState(sessionKey: string, artifactId: string): InlineArtifactState {
+  return inlineArtifactStates.get(inlineArtifactKey(sessionKey, artifactId)) ?? EMPTY_INLINE_ARTIFACT_STATE;
+}
+
+export function writeInlineArtifactState(sessionKey: string, artifactId: string, state: InlineArtifactState) {
+  const key = inlineArtifactKey(sessionKey, artifactId);
+  inlineArtifactStates.set(key, state);
+  inlineArtifactListeners.get(key)?.forEach((listener) => listener());
+}
+
+export function subscribeInlineArtifactState(sessionKey: string, artifactId: string, listener: Listener): () => void {
+  const key = inlineArtifactKey(sessionKey, artifactId);
+  const listeners = inlineArtifactListeners.get(key) ?? new Set<Listener>();
+  listeners.add(listener);
+  inlineArtifactListeners.set(key, listeners);
+  return () => {
+    listeners.delete(listener);
+    if (listeners.size === 0) inlineArtifactListeners.delete(key);
+  };
+}
+
+export function clearInlineArtifactStates(sessionKey: string) {
+  const prefix = `${sessionKey}::`;
+  for (const key of Array.from(inlineArtifactStates.keys())) {
+    if (key.startsWith(prefix)) inlineArtifactStates.delete(key);
+  }
+  for (const key of Array.from(inlineArtifactListeners.keys())) {
+    if (key.startsWith(prefix)) {
+      inlineArtifactListeners.get(key)?.forEach((listener) => listener());
+    }
+  }
 }
 
 function targetKey(target: TranscriptTarget): string {

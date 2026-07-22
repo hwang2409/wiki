@@ -99,6 +99,7 @@ import {
   addPendingUserMessage,
   composerTextMatches,
   invalidateTranscript,
+  clearInlineArtifactStates,
   loadOlderEvents,
   removePendingUserMessage,
   refreshTranscript,
@@ -1551,6 +1552,7 @@ const MessageBlock = memo(function MessageBlock({
   imageNums,
   onOpenArtifact,
   rowKey,
+  sessionKey,
   ticket,
   uiState,
 }: {
@@ -1558,11 +1560,12 @@ const MessageBlock = memo(function MessageBlock({
   imageNums?: number[];
   onOpenArtifact?: (event: SessionEvent) => void;
   rowKey: number;
+  sessionKey: string;
   ticket: string;
   uiState: SessionUiState;
 }) {
   if (event.kind === "artifact") {
-    return <ArtifactBlock event={event} onOpen={onOpenArtifact} ticket={ticket} />;
+    return <ArtifactBlock event={event} onOpen={onOpenArtifact} sessionKey={sessionKey} ticket={ticket} />;
   }
   if (event.kind === "user") {
     if (event.source) {
@@ -1762,6 +1765,7 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
   onHeightChange,
   onInspect,
   onOpenArtifact,
+  sessionKey,
   showTimestamp,
   top,
   ticket,
@@ -1772,6 +1776,7 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
   onHeightChange: (group: EventGroup, height: number) => void;
   onInspect?: (agentId: string) => void;
   onOpenArtifact?: (event: SessionEvent) => void;
+  sessionKey: string;
   showTimestamp: boolean;
   top: number;
   ticket: string;
@@ -1797,6 +1802,7 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
           imageNums={imageNums}
           onOpenArtifact={onOpenArtifact}
           rowKey={group.key}
+          sessionKey={sessionKey}
           ticket={ticket}
           uiState={uiState}
         />
@@ -1967,6 +1973,17 @@ export function SessionTab({
   );
   const visible = useElementVisible(containerRef);
   const { session, pendingUserMessages, error, loading } = useTranscriptSession(target, visible);
+  const inlineArtifactKey = `${ticket}:${subagent ?? ""}:${session?.path ?? ""}`;
+  const inlineArtifactKeyRef = useRef(inlineArtifactKey);
+  if (inlineArtifactKeyRef.current !== inlineArtifactKey) {
+    clearInlineArtifactStates(inlineArtifactKeyRef.current);
+    inlineArtifactKeyRef.current = inlineArtifactKey;
+  }
+  useEffect(() => {
+    return () => {
+      clearInlineArtifactStates(inlineArtifactKeyRef.current);
+    };
+  }, []);
   const [questionDrafts, setQuestionDrafts] = useState<Record<string, QuestionDraft>>({});
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [olderError, setOlderError] = useState<string | null>(null);
@@ -2564,6 +2581,7 @@ export function SessionTab({
                 onHeightChange={reportRowHeight}
                 onInspect={onInspect}
                 onOpenArtifact={onOpenArtifact}
+                sessionKey={inlineArtifactKey}
                 showTimestamp={timestampKeys.has(group.key)}
                 ticket={ticket}
                 top={top}

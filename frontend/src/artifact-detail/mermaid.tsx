@@ -1,5 +1,5 @@
 import type { ArtifactViewState } from "../transcript-store";
-import { MermaidRenderer } from "../artifact-block";
+import { MermaidRenderer } from "../artifact-renderers";
 import { PanZoomCanvas } from "./shared";
 
 export function MermaidArtifactDetail({

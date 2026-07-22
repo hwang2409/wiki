@@ -90,8 +90,9 @@ def main_cli() -> None:
         }
     )
 
-    from backend.app import main, transcripts
+    from backend.app import main, transcripts, uistate
 
+    uistate.UI_STATE_PATH = fixture_root / "ui-state.json"
     main.AGENT_REGISTRY_PATH = args.registry
     main.AGENT_STATUS_DIR = args.status_dir
     main.AGENT_ARCHIVE_DIR = archive_dir
