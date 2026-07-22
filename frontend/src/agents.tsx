@@ -1694,12 +1694,31 @@ export function AgentsSidebar({
     );
   }
   if (workers.length === 0 && archived.length === 0 && orchestrators.length === 0) {
-    return <div className="nav-empty">No workers</div>;
+    return (
+      <div className="nav-empty-cta" data-testid="nav-agents-empty">
+        <div className="nav-empty-title">No runs yet</div>
+        <div className="nav-empty-body">Runs you spawn will appear here.</div>
+        <button
+          className="nav-empty-primary"
+          type="button"
+          data-testid="nav-agents-empty-primary"
+          onClick={() => {
+            window.location.hash = "#/agents";
+          }}
+        >
+          Start a run
+        </button>
+        <a
+          className="nav-empty-secondary"
+          href="#/agents"
+          data-testid="nav-agents-empty-secondary"
+        >
+          Open Agents page
+        </a>
+      </div>
+    );
   }
 
-  const ungrouped = workers.filter(
-    (worker) => !worker.orch || !orchestrators.some((orch) => orch.id === worker.orch)
-  );
   const dragProps = (ticket: string) => ({
     draggable: true,
     onDragStart: (event: React.DragEvent) => {
@@ -1720,12 +1739,14 @@ export function AgentsSidebar({
     return latest > viewed;
   };
 
-  const workerRow = (worker: AgentWorker, indent: boolean) => {
+  const workerRow = (worker: AgentWorker) => {
     const unread = hasUnread(worker);
     const failed = worker.run_id ? viewedFailed[worker.run_id] === true : false;
+    const stateKey = worker.state ?? "unknown";
     return (
       <button
-        className={`nav-agent${indent ? " is-owned" : ""}${activeTicket === worker.ticket ? " is-active" : ""}${unread ? " has-unread" : ""}${failed ? " has-viewed-failure" : ""}`}
+        className={`nav-agent${activeTicket === worker.ticket ? " is-active" : ""}${unread ? " has-unread" : ""}${failed ? " has-viewed-failure" : ""}`}
+        data-state={stateKey}
         key={worker.ticket}
         type="button"
         onClick={() => onOpen(worker.ticket)}
@@ -1737,8 +1758,7 @@ export function AgentsSidebar({
             <span aria-hidden="true" className="nav-agent-unread" data-testid="nav-agent-unread" />
             <span className="sr-only">unread</span>
           </>
-        ) : null}
-        {failed ? (
+        ) : failed ? (
           <>
             <span
               aria-hidden="true"
@@ -1748,51 +1768,97 @@ export function AgentsSidebar({
             <span className="sr-only">read state failed to save</span>
           </>
         ) : null}
-        <span className={`nav-agent-dot is-${worker.state ?? "unknown"}`} />
         <span className="nav-agent-ticket">{worker.ticket}</span>
-        <span className="nav-agent-meta">{stateLabel(worker)}</span>
+        <span className="nav-agent-meta" data-state={stateKey}>{stateLabel(worker)}</span>
+        {worker.orch ? (
+          <span className="nav-agent-orch-chip" title={`Coordinator: ${worker.orch}`}>
+            {worker.orch}
+          </span>
+        ) : null}
         <span className="nav-agent-age tabular-nums">{ageLabel(worker.status_age_seconds)}</span>
       </button>
     );
   };
 
+  const orchestratorRow = (orch: Orchestrator) => {
+    const meta = orch.run_id
+      ? orch.runtime_state ?? "orchestrator"
+      : orch.window && !orch.window_alive
+        ? "window gone"
+        : "orchestrator";
+    return (
+      <button
+        className={`nav-agent is-orch${activeTicket === orch.id ? " is-active" : ""}`}
+        data-state="orchestrator"
+        key={orch.id}
+        type="button"
+        onClick={() => onOpen(orch.id)}
+        {...dragProps(orch.id)}
+      >
+        <Bot size={12} />
+        <span className="nav-agent-ticket">{orch.id}</span>
+        <span className="nav-agent-meta" data-state="orchestrator">{meta}</span>
+      </button>
+    );
+  };
+
+  const attentionRank = (worker: AgentWorker): number => {
+    switch (worker.state) {
+      case "blocked":
+        return 0;
+      case "merge-ready":
+        return 1;
+      case "working":
+        return 2;
+      default:
+        return 3;
+    }
+  };
+  const orderedWorkers = [...workers].sort((a, b) => {
+    const rank = attentionRank(a) - attentionRank(b);
+    if (rank !== 0) return rank;
+    const ageA = a.status_age_seconds ?? Number.MAX_SAFE_INTEGER;
+    const ageB = b.status_age_seconds ?? Number.MAX_SAFE_INTEGER;
+    return ageA - ageB;
+  });
+  const orderedOrchestrators = [...orchestrators].sort((a, b) => a.id.localeCompare(b.id));
+  const hasActive = orderedOrchestrators.length > 0 || orderedWorkers.length > 0;
+  const hasHistory = archived.length > 0;
+
   return (
     <div className="nav-agents">
-      {orchestrators.map((orch) => (
-        <div key={orch.id}>
-          <button
-            className={`nav-agent is-orch${activeTicket === orch.id ? " is-active" : ""}`}
-            type="button"
-            onClick={() => onOpen(orch.id)}
-            {...dragProps(orch.id)}
-          >
-            <Bot size={12} />
-            <span className="nav-agent-ticket">{orch.id}</span>
-            <span className="nav-agent-meta">
-              {orch.run_id
-                ? orch.runtime_state ?? "unknown"
-                : orch.window && !orch.window_alive
-                  ? "window gone"
-                  : "orchestrator"}
-            </span>
-          </button>
-          {workers
-            .filter((worker) => worker.orch === orch.id)
-            .map((worker) => workerRow(worker, true))}
+      {hasActive ? (
+        <div
+          className="nav-agents-group-title"
+          data-testid="nav-agents-group-active"
+        >
+          <span>Active</span>
+          <span className="nav-agents-group-count tabular-nums">
+            {orderedOrchestrators.length + orderedWorkers.length}
+          </span>
         </div>
-      ))}
-      {ungrouped.map((worker) => workerRow(worker, orchestrators.length > 0))}
-      {archived.length > 0 ? <div className="nav-agents-divider">archived</div> : null}
+      ) : null}
+      {orderedOrchestrators.map(orchestratorRow)}
+      {orderedWorkers.map(workerRow)}
+      {hasHistory ? (
+        <div
+          className="nav-agents-group-title"
+          data-testid="nav-agents-group-history"
+        >
+          <span>History</span>
+          <span className="nav-agents-group-count tabular-nums">{archived.length}</span>
+        </div>
+      ) : null}
       {archived.map((entry) => (
         <button
           className={`nav-agent is-archived${activeTicket === entry.ticket ? " is-active" : ""}`}
+          data-state="archived"
           key={`${entry.ticket}-${entry.archived_at}`}
           type="button"
           onClick={() => onOpen(entry.ticket)}
         >
-          <span className="nav-agent-dot is-done" />
           <span className="nav-agent-ticket">{entry.ticket}</span>
-          <span className="nav-agent-meta">{entry.outcome ?? entry.state ?? ""}</span>
+          <span className="nav-agent-meta" data-state="archived">{entry.outcome ?? entry.state ?? ""}</span>
           <span className="nav-agent-age tabular-nums">{archivedAge(entry.archived_at)}</span>
         </button>
       ))}

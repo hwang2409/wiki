@@ -1,0 +1,385 @@
+import fs from "node:fs/promises";
+import { mkdirSync, rmSync } from "node:fs";
+import path from "node:path";
+import { chromium } from "playwright";
+
+import {
+  codexAssistant,
+  makeFixtureRoot,
+  startBackend,
+  writeQueue,
+  writeRegistry,
+} from "../scripts/wiki32-harness.mjs";
+
+const OUT_DIR = process.env.WIKI_PLAYWRIGHT_OUT_DIR || "/tmp/wiki-151-nav-ia";
+mkdirSync(OUT_DIR, { recursive: true });
+
+function assert(condition, message) {
+  if (!condition) throw new Error(message);
+}
+
+let browser;
+let backend;
+const fixtures = makeFixtureRoot("wiki-151-nav-ia-");
+
+async function ribbonZoneCount(page) {
+  return page.evaluate(() => {
+    const ribbon = document.querySelector('[data-testid="workspace-ribbon"]');
+    if (!(ribbon instanceof HTMLElement)) return -1;
+    return ribbon.querySelectorAll(".ribbon-zone").length;
+  });
+}
+
+async function ribbonZoneNames(page) {
+  return page.evaluate(() => {
+    const ribbon = document.querySelector('[data-testid="workspace-ribbon"]');
+    if (!(ribbon instanceof HTMLElement)) return [];
+    return Array.from(ribbon.querySelectorAll(".ribbon-zone")).map((zone) =>
+      zone.getAttribute("data-zone"),
+    );
+  });
+}
+
+async function sidebarModeTitle(page) {
+  return page.evaluate(() => {
+    const title = document.querySelector(".sidebar-mode-title-label");
+    return title instanceof HTMLElement ? title.textContent?.trim() ?? "" : null;
+  });
+}
+
+async function sidebarModeTitleY(page) {
+  return page.evaluate(() => {
+    const title = document.querySelector(".sidebar-mode-title");
+    if (!(title instanceof HTMLElement)) return null;
+    return Math.round(title.getBoundingClientRect().top);
+  });
+}
+
+async function switchSidebarTo(page, tab) {
+  const label =
+    tab === "files" ? "Files" : tab === "search" ? "Search" : "Agent list";
+  await page.click(`[data-testid="workspace-ribbon"] [aria-label="${label}"]`);
+  await page.waitForSelector(`.sidebar-mode[data-mode="${tab}"]`);
+}
+
+try {
+  // A live worker (working state) — must be sorted before an idle one; also a
+  // blocked worker (highest attention) — must be sorted first regardless of
+  // recency. Verifies WIKI-151 attention-recency sort.
+  const activeTranscript = path.join(fixtures.root, "active.jsonl");
+  await fs.writeFile(
+    activeTranscript,
+    [
+      { type: "mode", mode: "normal", sessionId: "wiki-151-active" },
+      codexAssistant("Nav IA fixture.", "2026-07-22T15:00:00Z"),
+    ]
+      .map((row) => JSON.stringify(row))
+      .join("\n") + "\n",
+  );
+
+  const workerLive = {
+    ticket: "WIKI-151-LIVE",
+    provider: "codex",
+    kind: "cdx",
+    role: "implement",
+    state: "working",
+    orch: "wiki",
+    run_id: null,
+    provider_pid: process.pid,
+    control_attached: true,
+    provider_session_id: null,
+    worktree: fixtures.root,
+    cwd: fixtures.root,
+    model: "sol",
+    effort: null,
+    transcript: null,
+    log: null,
+    window: null,
+    spawned_at: "2026-07-22T15:00:00Z",
+  };
+  const workerBlocked = { ...workerLive, ticket: "WIKI-151-BLOCK", state: "blocked" };
+  const workerIdle = { ...workerLive, ticket: "WIKI-151-IDLE", state: "idle" };
+
+  const registry = {
+    _orchestrators: {
+      wiki: {
+        window: "@9999",
+        spawned_at: "2026-07-22T14:00:00Z",
+        transcript: activeTranscript,
+      },
+    },
+    "WIKI-151-LIVE": { history: [], current: workerLive },
+    "WIKI-151-BLOCK": { history: [], current: workerBlocked },
+    "WIKI-151-IDLE": { history: [], current: workerIdle },
+  };
+  await fs.writeFile(fixtures.registryPath, JSON.stringify(registry, null, 2));
+  writeQueue(fixtures.queuePath, "WIKI-151-LIVE", []);
+
+  // Seed status files for the three workers (fresh mtime → recency after
+  // attention).
+  for (const [ticket, state] of [
+    ["WIKI-151-LIVE", "working"],
+    ["WIKI-151-BLOCK", "blocked"],
+    ["WIKI-151-IDLE", "idle"],
+  ]) {
+    await fs.writeFile(
+      path.join(fixtures.statusDir, `${ticket}.json`),
+      JSON.stringify({ state, pr: null, step: "seeded", blocker: null }),
+    );
+  }
+
+  backend = await startBackend(fixtures);
+  browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  const page = await context.newPage();
+  page.on("console", (msg) => {
+    if (msg.type() === "error") console.error("[browser]", msg.text());
+  });
+  page.on("pageerror", (err) => console.error("[browser pageerror]", err.message));
+
+  await page.addInitScript(() => {
+    localStorage.setItem("wiki-sidebar-visible", "true");
+    if (!localStorage.getItem("wiki-sidebar-tab")) {
+      localStorage.setItem("wiki-sidebar-tab", "files");
+    }
+  });
+
+  // Mock /api/workspaces with one live + one unavailable root so we can verify
+  // the friendly-label + unavailable badge treatments without needing real
+  // discovery.
+  await page.route("**/api/workspaces", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        workspaces: [
+          { id: "wiki", root: "/Users/henry/me/fun/wiki", live: true },
+          { id: "phoebe", root: "/Users/henry/work/phoebe", live: false },
+        ],
+      }),
+    });
+  });
+
+  await page.goto(`${backend.baseUrl}/`, { waitUntil: "domcontentloaded" });
+  await page.waitForSelector(".app-container");
+  await page.waitForSelector('[data-testid="workspace-ribbon"]');
+
+  // 1. Ribbon: exactly three zones, ordered content / run-management / app-controls.
+  const zoneCount = await ribbonZoneCount(page);
+  assert(zoneCount === 3, `expected 3 ribbon zones, got ${zoneCount}`);
+  const zoneNames = await ribbonZoneNames(page);
+  assert(
+    JSON.stringify(zoneNames) === JSON.stringify(["content", "run-management", "app-controls"]),
+    `unexpected ribbon zone order: ${zoneNames.join(",")}`,
+  );
+
+  // 2. Ribbon overflow menu: opens, contains ≥ one secondary utility, primary
+  // destinations (new note, files, agents, settings, theme) remain 1-click.
+  const primaryLabels = [
+    "New note",
+    "Files",
+    "Search",
+    "Agent list",
+    "Agents",
+    "Settings",
+  ];
+  for (const label of primaryLabels) {
+    const count = await page
+      .locator(`[data-testid="workspace-ribbon"] [aria-label="${label}"]`)
+      .count();
+    assert(count === 1, `ribbon primary "${label}" expected exactly 1, got ${count}`);
+  }
+  await page.click('[data-testid="ribbon-more-button"]');
+  await page.waitForSelector('[data-testid="ribbon-more-menu"]');
+  const overflowItems = await page.locator('[data-testid="ribbon-more-menu"] [role="menuitem"]').count();
+  assert(overflowItems >= 3, `overflow menu expected ≥ 3 items, got ${overflowItems}`);
+  // Close menu again by clicking the button.
+  await page.click('[data-testid="ribbon-more-button"]');
+
+  // 3. Sidebar shell: mode-title present in all three modes; align at same
+  // vertical offset across modes (single-line header, no stacked headers).
+  await page.waitForSelector('.sidebar-mode[data-mode="files"]');
+  const filesTitle = await sidebarModeTitle(page);
+  assert(filesTitle === "Files", `files mode title expected "Files", got ${filesTitle}`);
+  const filesTitleY = await sidebarModeTitleY(page);
+
+  await switchSidebarTo(page, "search");
+  const searchTitle = await sidebarModeTitle(page);
+  assert(searchTitle === "Search", `search mode title expected "Search", got ${searchTitle}`);
+  const searchTitleY = await sidebarModeTitleY(page);
+
+  await switchSidebarTo(page, "agents");
+  const agentsTitle = await sidebarModeTitle(page);
+  assert(agentsTitle === "Runs", `agents mode title expected "Runs", got ${agentsTitle}`);
+  const agentsTitleY = await sidebarModeTitleY(page);
+
+  assert(
+    filesTitleY !== null && searchTitleY !== null && agentsTitleY !== null,
+    "sidebar mode titles must render in every mode",
+  );
+  assert(
+    Math.abs(filesTitleY - searchTitleY) <= 1 && Math.abs(filesTitleY - agentsTitleY) <= 1,
+    `sidebar mode titles must align vertically: files=${filesTitleY} search=${searchTitleY} agents=${agentsTitleY}`,
+  );
+
+  // 4. Tab header removed (WIKI-151 doctrine — bottom-rail tabs are canonical).
+  const tabHeaderCount = await page
+    .locator(".workspace-tab-header")
+    .count();
+  assert(tabHeaderCount === 0, `WIKI-151 removed .workspace-tab-header, got ${tabHeaderCount}`);
+
+  // 5. Session list under agents mode: assert group headers, attention-recency
+  // sort, standardized row anatomy, exactly ONE dot per row.
+  await page.waitForSelector('[data-testid="nav-agents-group-active"]');
+  const groupTexts = await page.evaluate(() =>
+    Array.from(document.querySelectorAll(".nav-agents-group-title")).map((el) =>
+      (el.firstElementChild?.textContent ?? "").trim(),
+    ),
+  );
+  assert(groupTexts.includes("Active"), `expected Active group, got ${groupTexts.join("/")}`);
+
+  const rowOrder = await page.evaluate(() =>
+    Array.from(document.querySelectorAll(".nav-agent"))
+      .filter((el) => !el.classList.contains("is-orch"))
+      .map((el) => ({
+        ticket: el.querySelector(".nav-agent-ticket")?.textContent?.trim() ?? "",
+        state: el.getAttribute("data-state"),
+        dotCount: el.querySelectorAll(
+          '.nav-agent-unread, .nav-agent-viewed-failure, .nav-agent-dot',
+        ).length,
+      })),
+  );
+  const rowsByTicket = Object.fromEntries(rowOrder.map((r) => [r.ticket, r]));
+  for (const ticket of ["WIKI-151-BLOCK", "WIKI-151-LIVE", "WIKI-151-IDLE"]) {
+    assert(rowsByTicket[ticket], `expected row for ${ticket}`);
+    assert(
+      rowsByTicket[ticket].dotCount <= 1,
+      `${ticket} must render ≤ 1 dot, got ${rowsByTicket[ticket].dotCount}`,
+    );
+    // WIKI-151 removed the state dot entirely; runtime state lives in the meta
+    // text color. Every row must have zero dot elements when unread + failure
+    // are absent (fixture rows have never been viewed via the sidebar).
+    assert(
+      rowsByTicket[ticket].dotCount === 0,
+      `${ticket} must not carry a legacy state dot (got ${rowsByTicket[ticket].dotCount}); ` +
+        `runtime state should live in meta text only`,
+    );
+  }
+  const activeWorkerTickets = rowOrder
+    .filter((r) => r.state !== "archived" && r.state !== "orchestrator")
+    .map((r) => r.ticket);
+  const idxBlock = activeWorkerTickets.indexOf("WIKI-151-BLOCK");
+  const idxLive = activeWorkerTickets.indexOf("WIKI-151-LIVE");
+  const idxIdle = activeWorkerTickets.indexOf("WIKI-151-IDLE");
+  assert(idxBlock >= 0 && idxLive >= 0 && idxIdle >= 0, "all three workers must be listed");
+  assert(
+    idxBlock < idxLive && idxLive < idxIdle,
+    `attention sort broken: block=${idxBlock} live=${idxLive} idle=${idxIdle}`,
+  );
+
+  // 6. Workspace selector (files mode): friendly label + abbreviated path;
+  // unavailable roots must be marked visibly. Go back to files first.
+  await switchSidebarTo(page, "files");
+  await page.waitForSelector('[data-testid="workspace-select"]');
+  const optionLabels = await page.evaluate(() =>
+    Array.from(document.querySelectorAll('[data-testid="workspace-select"] option')).map((opt) => ({
+      text: opt.textContent ?? "",
+      disabled: opt.hasAttribute("disabled"),
+      value: opt.value,
+    })),
+  );
+  const wikiOpt = optionLabels.find((o) => o.value === "wiki");
+  const phoebeOpt = optionLabels.find((o) => o.value === "phoebe");
+  assert(wikiOpt, "wiki workspace option missing");
+  assert(phoebeOpt, "phoebe workspace option missing");
+  assert(
+    wikiOpt.text.startsWith("wiki") && wikiOpt.text.includes("/"),
+    `wiki friendly label must include an abbreviated path hint, got "${wikiOpt.text}"`,
+  );
+  assert(
+    phoebeOpt.text.includes("(unavailable)"),
+    `unavailable workspace must be marked "(unavailable)", got "${phoebeOpt.text}"`,
+  );
+
+  await page.screenshot({ path: path.join(OUT_DIR, "nav-ia.png") });
+
+  // 7. File explorer retry: intercept /api/files/tree to fail; expect the
+  // retry row to render AND the workspace unavailable state to NOT clobber the
+  // last successful tree if any existed. Seed one file via a first successful
+  // response, then flip to failing.
+  let treeCalls = 0;
+  await page.unroute("**/api/files/tree*");
+  await page.route("**/api/files/tree*", async (route) => {
+    treeCalls += 1;
+    if (treeCalls === 1) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          files: [{ path: "seeded.md", modified_at: null, size: 0 }],
+          truncated: false,
+        }),
+      });
+    } else {
+      await route.fulfill({
+        status: 500,
+        contentType: "application/json",
+        body: JSON.stringify({ detail: "boom" }),
+      });
+    }
+  });
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForSelector('.sidebar-mode[data-mode="files"]');
+  // Trigger a workspace switch to force a re-fetch.
+  await page.selectOption('[data-testid="workspace-select"]', "wiki");
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await page.waitForTimeout(400);
+
+  // 8. Empty-state CTA: seed a fixture with ZERO agents to prove the empty
+  // sidebar CTA renders. Reuse the same page — remove the registry entries
+  // by rewriting registry.json + hitting /api/agents. But agents are cached
+  // per component, so easier to just intercept /api/agents.
+  await page.route("**/api/agents", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        workers: [],
+        archived: [],
+        orchestrators: [],
+        deploy_timestamp: null,
+      }),
+    });
+  });
+  await page.evaluate(() => localStorage.setItem("wiki-sidebar-tab", "agents"));
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForSelector('.sidebar-mode[data-mode="agents"]');
+  await page.waitForSelector('[data-testid="nav-agents-empty"]', { timeout: 10_000 });
+  const emptyTitle = await page.locator(".nav-empty-title").textContent();
+  assert(emptyTitle?.trim() === "No runs yet", `empty state title expected "No runs yet", got ${emptyTitle}`);
+  const primary = await page.locator('[data-testid="nav-agents-empty-primary"]').count();
+  assert(primary === 1, `expected 1 primary CTA, got ${primary}`);
+  const secondary = await page.locator('[data-testid="nav-agents-empty-secondary"]').count();
+  assert(secondary === 1, `expected 1 secondary link, got ${secondary}`);
+
+  await page.screenshot({ path: path.join(OUT_DIR, "empty-cta.png") });
+
+  await fs.writeFile(
+    path.join(OUT_DIR, "summary.json"),
+    JSON.stringify(
+      {
+        ribbon_zones: zoneNames,
+        overflow_items: overflowItems,
+        sidebar_mode_titles: { files: filesTitle, search: searchTitle, agents: agentsTitle },
+        sort_order: activeWorkerTickets,
+        workspace_labels: optionLabels,
+      },
+      null,
+      2,
+    ),
+  );
+} finally {
+  if (browser) await browser.close();
+  if (backend) await backend.stop();
+  rmSync(fixtures.root, { recursive: true, force: true });
+}
