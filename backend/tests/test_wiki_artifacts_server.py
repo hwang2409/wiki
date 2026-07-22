@@ -307,6 +307,14 @@ class WikiArtifactsTests(unittest.TestCase):
                     "request_id": "mcp-steer-1",
                 }
             )
+            wiki_agent_tools.steer_agent(
+                {
+                    "id": "WIKI-200",
+                    "message": "prepare for merge",
+                    "request_id": "mcp-steer-mastermind",
+                    "source": "mastermind",
+                }
+            )
             wiki_agent_tools.archive_agent(
                 {"id": "WIKI-200", "outcome": "merged"}
             )
@@ -336,6 +344,19 @@ class WikiArtifactsTests(unittest.TestCase):
                         "text": "Run tests",
                         "mode": "on-idle",
                         "request_id": "mcp-steer-1",
+                        # Default supervisor-steer source so orchestrator turns
+                        # render as system markers rather than Henry bubbles.
+                        "source": "supervisor-steer",
+                    },
+                ),
+                (
+                    "POST",
+                    "/api/agents/WIKI-200/message",
+                    {
+                        "text": "prepare for merge",
+                        "mode": "now",
+                        "request_id": "mcp-steer-mastermind",
+                        "source": "mastermind",
                     },
                 ),
                 (

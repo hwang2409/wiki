@@ -1117,7 +1117,13 @@ def _load_run_freshness(run_id: str | None) -> tuple[str | None, int | None]:
     if not isinstance(payload, dict):
         return None, None
     updated_at = payload.get("updated_at")
-    seq = payload.get("normalized_event_count")
+    # ``unread_event_seq`` skips synthetic supervisor/fleet user echoes so an
+    # orchestrator wake doesn't light the worker's unread dot before the
+    # worker has produced any response. Legacy run.json files that predate
+    # WIKI-161 fall back to ``normalized_event_count``.
+    seq = payload.get("unread_event_seq")
+    if not isinstance(seq, int):
+        seq = payload.get("normalized_event_count")
     if not isinstance(updated_at, str):
         updated_at = None
     if not isinstance(seq, int):

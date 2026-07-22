@@ -1190,6 +1190,13 @@ class RunStore:
             }
             _append_json_line(self.normalized_events_path(run_id), envelope)
             record.normalized_event_count = int(envelope["seq"])
+            # Sourced user echoes are supervisor/fleet-generated wakes, not
+            # worker output — the unread dot must not light on them. Every
+            # other normalized event advances the freshness counter.
+            source_tag = payload.get("source") if isinstance(payload, dict) else None
+            is_synthetic_user = isinstance(source_tag, str) and bool(source_tag)
+            if not is_synthetic_user:
+                record.unread_event_seq = int(envelope["seq"])
             record.disposition_counts[disposition.value] = (
                 record.disposition_counts.get(disposition.value, 0) + 1
             )

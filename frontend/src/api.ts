@@ -546,6 +546,7 @@ export type SessionEvent = {
   caption?: string | null;
   artifact?: SessionArtifact;
   source?: string | null;
+  pending_id?: string | null;
 };
 
 export type SubagentInfo = {

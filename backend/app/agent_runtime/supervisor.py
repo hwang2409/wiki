@@ -2249,16 +2249,18 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             # Source metadata is only propagated through pending_user_messages,
             # so mint a durable id for synthetic sources without a composer id.
             pending_id = str(uuid4())
-        if pending_id is not None:
-            self.store.track_pending_user_message(
-                run_id, pending_id, message, source=source
-            )
+        pending_tracked = False
         try:
+            if pending_id is not None:
+                self.store.track_pending_user_message(
+                    run_id, pending_id, message, source=source
+                )
+                pending_tracked = True
             status = await adapter.send_now(message)
         except Exception:
             if dedupe_key is not None:
                 self.store.release_message_dedupe_key(run_id, dedupe_key)
-            if pending_id is not None:
+            if pending_tracked and pending_id is not None:
                 self.store.discard_pending_user_message(run_id, pending_id)
             raise
         record = self.store.update_adapter_status(run_id, status)

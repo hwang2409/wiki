@@ -9,6 +9,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from backend.app.agent_runtime.fake import FixtureAdapterFactory
@@ -18,7 +19,7 @@ from backend.app.agent_runtime.supervisor import (
     Supervisor,
     _validated_source,
 )
-from backend.app.agent_runtime.types import ProviderKind
+from backend.app.agent_runtime.types import EventDisposition, ProviderKind
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "agent_runtime"
@@ -210,6 +211,122 @@ class SendNowSourceTests(unittest.IsolatedAsyncioTestCase):
                     "source": "has spaces",
                 },
             )
+
+    async def test_sourced_user_echo_does_not_advance_unread_seq(self) -> None:
+        """WIKI-161 review R6: fleet-monitor / supervisor-steer wakes must not
+        light the worker's unread dot before the worker has responded. Each
+        such normalized event advances ``normalized_event_count`` but must
+        leave ``unread_event_seq`` untouched."""
+
+        run_id = await self._start_claude("WIKI-161-H")
+        baseline_unread = self.store.get(run_id).unread_event_seq
+        baseline_total = self.store.get(run_id).normalized_event_count
+
+        # Assistant-originated output DOES advance the unread counter.
+        self.store.append_normalized(
+            run_id,
+            raw_seq=self.store.get(run_id).raw_event_count,
+            disposition=EventDisposition.RENDERED,
+            kind="claude_assistant",
+            payload={"text": "worker response"},
+        )
+        after_worker = self.store.get(run_id)
+        self.assertEqual(after_worker.unread_event_seq, baseline_total + 1)
+        self.assertEqual(after_worker.normalized_event_count, baseline_total + 1)
+
+        # A synthetic supervisor-steer user echo advances the total counter
+        # but must NOT advance unread_event_seq.
+        pre_synthetic = self.store.get(run_id)
+        self.store.append_normalized(
+            run_id,
+            raw_seq=pre_synthetic.raw_event_count,
+            disposition=EventDisposition.RENDERED,
+            kind="claude_user",
+            payload={
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "wake up"}],
+                },
+                "source": "fleet-monitor",
+            },
+        )
+        after_synthetic = self.store.get(run_id)
+        self.assertEqual(
+            after_synthetic.normalized_event_count,
+            pre_synthetic.normalized_event_count + 1,
+        )
+        self.assertEqual(
+            after_synthetic.unread_event_seq,
+            pre_synthetic.unread_event_seq,
+        )
+        # And a real Henry-typed user echo (no source) DOES advance unread.
+        self.store.append_normalized(
+            run_id,
+            raw_seq=after_synthetic.raw_event_count,
+            disposition=EventDisposition.RENDERED,
+            kind="claude_user",
+            payload={
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "hi henry"}],
+                },
+            },
+        )
+        after_human = self.store.get(run_id)
+        self.assertEqual(
+            after_human.unread_event_seq,
+            after_synthetic.normalized_event_count + 1,
+        )
+        del baseline_unread
+
+    async def test_pending_track_failure_releases_dedupe_and_pending(self) -> None:
+        """Regression for WIKI-161 review: pre-acceptance failures in the
+        pending metadata write left the dedupe key durably claimed, so any
+        retry with the same key returned ``deduplicated`` — the synthetic
+        turn was silently dropped and the orchestrator never woke."""
+
+        run_id = await self._start_claude("WIKI-161-G")
+        dedupe_key = "fleet:wiki-161-g:merge-ready"
+
+        real_track = self.store.track_pending_user_message
+        boom_calls = {"n": 0}
+
+        def track_that_fails_once(*args: Any, **kwargs: Any):
+            boom_calls["n"] += 1
+            if boom_calls["n"] == 1:
+                raise OSError("simulated disk failure")
+            return real_track(*args, **kwargs)
+
+        self.store.track_pending_user_message = track_that_fails_once  # type: ignore[method-assign]
+        try:
+            with self.assertRaises(OSError):
+                await self.supervisor.send_now(
+                    run_id,
+                    "[fleet] retry me",
+                    dedupe_key=dedupe_key,
+                    source="fleet-monitor",
+                )
+            # Rollback: dedupe claim released, pending row discarded.
+            record = self.store.get(run_id)
+            self.assertNotIn(dedupe_key, record.message_dedupe_keys)
+            self.assertEqual(record.pending_user_messages, [])
+        finally:
+            self.store.track_pending_user_message = real_track  # type: ignore[method-assign]
+
+        # Retry now reaches the adapter and completes normally.
+        result = await self.supervisor.send_now(
+            run_id,
+            "[fleet] retry me",
+            dedupe_key=dedupe_key,
+            source="fleet-monitor",
+        )
+        self.assertEqual(result["status"], "sent")
+        self.assertEqual(result["dedupe_key"], dedupe_key)
+        pending = self.store.get(run_id).pending_user_messages
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["source"], "fleet-monitor")
 
 
 if __name__ == "__main__":

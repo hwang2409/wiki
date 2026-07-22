@@ -670,50 +670,38 @@ function modelChangedMarkers(session: TranscriptSession | null): SessionEvent[] 
     });
 }
 
-function composerMessageEvents(session: TranscriptSession): SessionEvent[] {
-  const unmatchedUsers = session.events
-    .filter((event) => event.kind === "user")
-    .map((event) => ({ event, matched: false }));
-  const synthetic: SessionEvent[] = [];
-  for (const message of session.composerMessages) {
-    const sentAt = message.sent_at ? Date.parse(message.sent_at) : Number.NaN;
-    const match = unmatchedUsers.find((candidate) => {
-      if (candidate.matched) return false;
-      const eventAt = candidate.event.ts ? Date.parse(candidate.event.ts) : Number.NaN;
-      if (Number.isFinite(sentAt) && Number.isFinite(eventAt) && eventAt < sentAt - 2_000) {
-        return false;
-      }
-      return composerTextMatches(candidate.event.text, message.text);
-    });
-    if (match) {
-      match.matched = true;
-      continue;
-    }
-    synthetic.push({
-      id: 2_000_000 + message.seq,
-      kind: "user",
-      ts: message.echoed_at,
-      text: message.text,
-      disposition: "rendered",
-      source: message.source ?? null,
-    });
-  }
-  return synthetic;
-}
-
-function applyComposerSources(
+function correlateComposerMessages(
   events: SessionEvent[],
   composerMessages: ComposerMessage[],
-): SessionEvent[] {
-  const sourced = composerMessages.filter((message) => Boolean(message.source));
-  if (sourced.length === 0) return events;
-  const claimed = new Set<number>();
-  const bySource = new Map<number, string>();
-  for (const message of sourced) {
+): { claimed: Map<number, string | null>; unmatched: ComposerMessage[] } {
+  // Reserve real transcript user events for composer messages FIFO. Every
+  // composer message competes for a slot — unsourced (Henry) rows reserve
+  // before sourced rows can claim, so an identical human turn within a
+  // synthetic turn's 2s window can never be mislabelled as synthetic.
+  const claimed = new Map<number, string | null>();
+  const unmatched: ComposerMessage[] = [];
+  const byPendingId = new Map<string, number>();
+  events.forEach((event, index) => {
+    if (event.kind !== "user") return;
+    const pendingId = event.pending_id;
+    if (pendingId && !byPendingId.has(pendingId)) {
+      byPendingId.set(pendingId, index);
+    }
+  });
+  for (const message of composerMessages) {
+    // Canonical mapping: durable pending_id is unambiguous when present.
+    const durableIndex = byPendingId.get(message.pending_id);
+    if (durableIndex !== undefined && !claimed.has(durableIndex)) {
+      claimed.set(durableIndex, message.source ?? null);
+      continue;
+    }
+    // Text fallback for providers that do not echo pending_id. Scan FIFO so
+    // an earlier unsourced composer message reserves its Henry-bubble slot
+    // before a later synthetic one is allowed to take it.
     const sentAt = message.sent_at ? Date.parse(message.sent_at) : Number.NaN;
     const matchIndex = events.findIndex((event, index) => {
       if (claimed.has(index) || event.kind !== "user") return false;
-      if (event.source) return false;
+      if (event.pending_id) return false;
       const eventAt = event.ts ? Date.parse(event.ts) : Number.NaN;
       if (
         Number.isFinite(sentAt) &&
@@ -724,15 +712,47 @@ function applyComposerSources(
       }
       return composerTextMatches(event.text, message.text);
     });
-    if (matchIndex < 0) continue;
-    claimed.add(matchIndex);
-    bySource.set(matchIndex, message.source as string);
+    if (matchIndex >= 0) {
+      claimed.set(matchIndex, message.source ?? null);
+      continue;
+    }
+    unmatched.push(message);
   }
-  if (bySource.size === 0) return events;
-  return events.map((event, index) => {
-    const source = bySource.get(index);
-    return source ? { ...event, source } : event;
+  return { claimed, unmatched };
+}
+
+function composerMessageEvents(session: TranscriptSession): SessionEvent[] {
+  const { unmatched } = correlateComposerMessages(
+    session.events,
+    session.composerMessages,
+  );
+  return unmatched.map((message) => ({
+    id: 2_000_000 + message.seq,
+    kind: "user" as const,
+    ts: message.echoed_at,
+    text: message.text,
+    disposition: "rendered" as const,
+    source: message.source ?? null,
+    pending_id: message.pending_id,
+  }));
+}
+
+function applyComposerSources(
+  events: SessionEvent[],
+  composerMessages: ComposerMessage[],
+): SessionEvent[] {
+  if (composerMessages.length === 0) return events;
+  const { claimed } = correlateComposerMessages(events, composerMessages);
+  let mutated = false;
+  const next = events.map((event, index) => {
+    if (!claimed.has(index)) return event;
+    const source = claimed.get(index);
+    if (!source) return event;
+    if (event.source === source) return event;
+    mutated = true;
+    return { ...event, source };
   });
+  return mutated ? next : events;
 }
 
 function mergeComposerEvents(events: SessionEvent[], composerEvents: SessionEvent[]): SessionEvent[] {
@@ -2421,15 +2441,24 @@ export function SessionTab({
   );
 
   // K/J recall in the composer — user messages from the transcript itself
-  // (covers terminal-typed AND wiki-sent, no separate storage).
-  const userHistory = useMemo(
-    () =>
-      (session?.events ?? [])
-        .filter((event) => event.kind === "user" && event.text.length <= 2000)
-        .map((event) => event.text)
-        .slice(-50),
-    [session]
-  );
+  // (covers terminal-typed AND wiki-sent, no separate storage). Synthetic
+  // fleet/steer/mastermind turns are system messages, not Henry input, so
+  // they must not surface as recall candidates. Apply the composer-source
+  // correlation first so that composer_messages-tagged turns are excluded
+  // alongside transcript-tagged ones.
+  const userHistory = useMemo(() => {
+    if (!session) return [];
+    const enriched = applyComposerSources(session.events, session.composerMessages);
+    return enriched
+      .filter(
+        (event) =>
+          event.kind === "user" &&
+          !event.source &&
+          event.text.length <= 2000,
+      )
+      .map((event) => event.text)
+      .slice(-50);
+  }, [session]);
 
   const taskCounts = useMemo(() => {
     const c = { total: 0, done: 0, progress: 0, open: 0 };

@@ -4,7 +4,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
 
-import { makeFixtureRoot, startBackend } from "../scripts/wiki32-harness.mjs";
+import {
+  codexUser,
+  makeFixtureRoot,
+  startBackend,
+} from "../scripts/wiki32-harness.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const OUT_DIR = process.env.WIKI_PLAYWRIGHT_OUT_DIR || "/tmp/wiki-161-playwright-evidence";
@@ -27,82 +31,21 @@ const HENRY_TS = "2026-07-22T18:00:00Z";
 const FLEET_TS = "2026-07-22T18:00:05Z";
 const FLEET_TS_2 = "2026-07-22T18:00:07Z";
 const STEER_TS = "2026-07-22T18:00:10Z";
+// R4/R7: identical human + synthetic sends inside the 2s composer-match
+// window must not swap. The human turn arrives first; the fleet turn
+// arrives ~1.5s later with the same body.
+const COLLISION_HUMAN_TS = "2026-07-22T18:00:20Z";
+const COLLISION_FLEET_TS = "2026-07-22T18:00:21.500Z";
 
 const HENRY_TEXT = "hi from henry";
 const FLEET_TEXT = "[fleet] WIKI-1234 merged";
 const FLEET_TEXT_2 = "[fleet] WIKI-1235 blocked";
 const STEER_TEXT = "supervisor steer body";
+const COLLISION_TEXT = "please check queue";
 
-const NORMALIZED_EVENTS = [
-  {
-    seq: 1,
-    raw_seq: 1,
-    normalized_at: HENRY_TS,
-    disposition: "rendered",
-    kind: "codex_user",
-    payload: {
-      method: "item/completed",
-      params: {
-        item: {
-          type: "userMessage",
-          content: [{ type: "text", text: HENRY_TEXT }],
-        },
-      },
-    },
-    lifecycle_state: null,
-  },
-  {
-    seq: 2,
-    raw_seq: 2,
-    normalized_at: FLEET_TS,
-    disposition: "rendered",
-    kind: "codex_user",
-    payload: {
-      method: "item/completed",
-      params: {
-        item: {
-          type: "userMessage",
-          content: [{ type: "text", text: FLEET_TEXT }],
-        },
-      },
-    },
-    lifecycle_state: null,
-  },
-  {
-    seq: 3,
-    raw_seq: 3,
-    normalized_at: FLEET_TS_2,
-    disposition: "rendered",
-    kind: "codex_user",
-    payload: {
-      method: "item/completed",
-      params: {
-        item: {
-          type: "userMessage",
-          content: [{ type: "text", text: FLEET_TEXT_2 }],
-        },
-      },
-    },
-    lifecycle_state: null,
-  },
-  {
-    seq: 4,
-    raw_seq: 4,
-    normalized_at: STEER_TS,
-    disposition: "rendered",
-    kind: "codex_user",
-    payload: {
-      method: "item/completed",
-      params: {
-        item: {
-          type: "userMessage",
-          content: [{ type: "text", text: STEER_TEXT }],
-        },
-      },
-    },
-    lifecycle_state: null,
-  },
-];
+// Native transcript is the authoritative event stream in this fixture; the
+// events/read RPC only needs to expose `composer_messages` to the frontend.
+const NORMALIZED_EVENTS = [];
 
 const COMPOSER_MESSAGES = [
   // Henry — no source, matches real user event → should render as bubble.
@@ -136,6 +79,25 @@ const COMPOSER_MESSAGES = [
     echoed_at: STEER_TS,
     seq: 4,
     source: "supervisor-steer",
+  },
+  // Collision pair: same text, both composer rows. The Henry (unsourced)
+  // row is chronologically FIRST — FIFO reservation must claim the earlier
+  // transcript event for the Henry composer, leaving the fleet event to
+  // pick up the second transcript row.
+  {
+    pending_id: "55555555-5555-4555-8555-555555555555",
+    text: COLLISION_TEXT,
+    sent_at: COLLISION_HUMAN_TS,
+    echoed_at: COLLISION_HUMAN_TS,
+    seq: 5,
+  },
+  {
+    pending_id: "66666666-6666-4666-8666-666666666666",
+    text: COLLISION_TEXT,
+    sent_at: COLLISION_FLEET_TS,
+    echoed_at: COLLISION_FLEET_TS,
+    seq: 6,
+    source: "fleet-monitor",
   },
 ];
 
@@ -228,7 +190,22 @@ async function main() {
   const fixtures = makeFixtureRoot("wiki-161-synthetic-source-");
   const transcript = path.join(fixtures.root, "codex-source.jsonl");
   const rawLog = path.join(fixtures.root, "raw.jsonl");
-  await fs.writeFile(transcript, "");
+  // Native transcript with real user turns so the frontend actually runs
+  // `applyComposerSources` against transcript events. Without this the
+  // composer_messages surface synthesizes every row and the correlator
+  // path (finding R4/R7) is never exercised.
+  const transcriptRows = [
+    codexUser(HENRY_TEXT, HENRY_TS),
+    codexUser(FLEET_TEXT, FLEET_TS),
+    codexUser(FLEET_TEXT_2, FLEET_TS_2),
+    codexUser(STEER_TEXT, STEER_TS),
+    codexUser(COLLISION_TEXT, COLLISION_HUMAN_TS),
+    codexUser(COLLISION_TEXT, COLLISION_FLEET_TS),
+  ];
+  await fs.writeFile(
+    transcript,
+    transcriptRows.map((row) => JSON.stringify(row)).join("\n") + "\n",
+  );
   await fs.writeFile(rawLog, "");
 
   const current = {
@@ -266,14 +243,15 @@ async function main() {
     });
     await page.locator(".session-scroll").waitFor();
 
-    // Wait for all four user events to render.
+    // Wait for every transcript user turn to render (either as a Henry
+    // bubble or as a synthetic marker row).
     await page.waitForFunction((expected) => {
       const bubbles = document.querySelectorAll(".session-user").length;
       const markers = document.querySelectorAll(
         "[data-testid='session-synthetic-source']",
       ).length;
       return bubbles + markers >= expected;
-    }, NORMALIZED_EVENTS.length);
+    }, transcriptRows.length);
 
     // Regression: Henry's turn (no source) still renders as a normal bubble.
     const henryBubble = page.locator(".session-user", { hasText: HENRY_TEXT });
@@ -283,15 +261,17 @@ async function main() {
       "expected a single normal user bubble for Henry's turn",
     );
 
-    // Source-tagged turns render as marker rows, not user bubbles.
+    // Source-tagged turns render as marker rows, not user bubbles. Two
+    // fleet turns (WIKI-1234 / WIKI-1235) plus the fleet half of the
+    // identical-text collision pair → three fleet markers total.
     const fleetMarker = page.locator(
       "[data-testid='session-synthetic-source'][data-source='fleet-monitor']",
     );
     await fleetMarker.first().waitFor({ state: "attached" });
     const fleetCount = await fleetMarker.count();
     assert(
-      fleetCount === 2,
-      `expected 2 fleet-monitor marker rows, saw ${fleetCount}`,
+      fleetCount === 3,
+      `expected 3 fleet-monitor marker rows, saw ${fleetCount}`,
     );
     const steerMarker = page.locator(
       "[data-testid='session-synthetic-source'][data-source='supervisor-steer']",
@@ -318,6 +298,28 @@ async function main() {
       .locator(".session-user", { hasText: STEER_TEXT })
       .count();
     assert(steerAsBubble === 0, "steer marker leaked into a .session-user bubble");
+
+    // R4/R7: identical-text collision — Henry's earlier transcript row must
+    // stay a bubble; only the second (fleet) row becomes a marker. If the
+    // correlator swapped them, the bubble would carry the fleet timestamp
+    // and no fleet marker would exist for the collision text.
+    const collisionBubbles = await page
+      .locator(".session-user", { hasText: COLLISION_TEXT })
+      .count();
+    assert(
+      collisionBubbles === 1,
+      `collision text should render exactly one Henry bubble, saw ${collisionBubbles}`,
+    );
+    const collisionMarkers = await page
+      .locator(
+        "[data-testid='session-synthetic-source'][data-source='fleet-monitor']",
+        { hasText: COLLISION_TEXT },
+      )
+      .count();
+    assert(
+      collisionMarkers === 1,
+      `collision text should render exactly one fleet marker, saw ${collisionMarkers}`,
+    );
 
     // Multiple synthetic messages back-to-back render as separate marker rows,
     // not clustered as one user thread. Each row has its own DOM node.

@@ -511,6 +511,108 @@ def _write_claude_rollout(project_dir: Path, session_id: str, *,
     return path
 
 
+class NormalizedUserSourceTests(unittest.TestCase):
+    """WIKI-161: normalized archived events must preserve `source` on user
+    turns so archived synthetic messages keep rendering as marker rows."""
+
+    def _parse(self, kind: str, envelope: dict) -> dict:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "events.jsonl"
+            path.write_text(json.dumps(envelope) + "\n", encoding="utf-8")
+            return transcripts.read_session_events(kind, path)
+
+    def test_codex_normalized_user_event_carries_source(self) -> None:
+        envelope = {
+            "seq": 5,
+            "raw_seq": 5,
+            "normalized_at": "2026-07-22T20:00:00+00:00",
+            "disposition": "rendered",
+            "kind": "item_completed",
+            "payload": {
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "type": "userMessage",
+                        "content": [{"type": "text", "text": "[fleet] merged"}],
+                    }
+                },
+                "source": "fleet-monitor",
+            },
+        }
+        parsed = self._parse("codex-normalized", envelope)
+        user = [event for event in parsed["events"] if event["kind"] == "user"]
+        self.assertEqual(len(user), 1)
+        self.assertEqual(user[0]["source"], "fleet-monitor")
+
+    def test_codex_normalized_user_event_without_source_stays_untagged(self) -> None:
+        envelope = {
+            "seq": 6,
+            "raw_seq": 6,
+            "normalized_at": "2026-07-22T20:00:05+00:00",
+            "disposition": "rendered",
+            "kind": "item_completed",
+            "payload": {
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "type": "userMessage",
+                        "content": [{"type": "text", "text": "hi henry"}],
+                    }
+                },
+            },
+        }
+        parsed = self._parse("codex-normalized", envelope)
+        user = [event for event in parsed["events"] if event["kind"] == "user"]
+        self.assertEqual(len(user), 1)
+        self.assertNotIn("source", user[0])
+
+    def test_codex_normalized_rejects_invalid_source_shape(self) -> None:
+        envelope = {
+            "seq": 7,
+            "raw_seq": 7,
+            "normalized_at": "2026-07-22T20:00:10+00:00",
+            "disposition": "rendered",
+            "kind": "item_completed",
+            "payload": {
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "type": "userMessage",
+                        "content": [{"type": "text", "text": "attempt"}],
+                    }
+                },
+                # Untrusted archive rows may carry hostile shapes; the parser
+                # should silently drop anything the ingest validator would.
+                "source": "has spaces",
+            },
+        }
+        parsed = self._parse("codex-normalized", envelope)
+        user = [event for event in parsed["events"] if event["kind"] == "user"]
+        self.assertEqual(len(user), 1)
+        self.assertNotIn("source", user[0])
+
+    def test_claude_normalized_user_event_carries_source(self) -> None:
+        envelope = {
+            "seq": 8,
+            "raw_seq": 8,
+            "normalized_at": "2026-07-22T20:00:15+00:00",
+            "disposition": "rendered",
+            "kind": "claude_user",
+            "payload": {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "[steer] tighten focus"}],
+                },
+                "source": "supervisor-steer",
+            },
+        }
+        parsed = self._parse("claude-normalized", envelope)
+        user = [event for event in parsed["events"] if event["kind"] == "user"]
+        self.assertEqual(len(user), 1)
+        self.assertEqual(user[0]["source"], "supervisor-steer")
+
+
 class RegistryIdBeatsDiscoveryTests(unittest.TestCase):
     def test_registry_id_confines_result_to_anchor_cwd(self) -> None:
         """Discovery mode has a stale-worker foot-gun: a NEWER rollout in a
