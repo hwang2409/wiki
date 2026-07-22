@@ -945,6 +945,20 @@ def _isoformat_utc(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
 
+def _resolve_viewed_fields(
+    status: dict | None,
+    ticket: str,
+    viewed_map: dict[str, str],
+    viewed_backfill: dict[str, str],
+) -> tuple[str | None, str | None]:
+    latest_event_at = _isoformat_utc(status["_mtime"]) if status else None
+    last_viewed_at = viewed_map.get(ticket)
+    if latest_event_at is not None and last_viewed_at is None:
+        last_viewed_at = latest_event_at
+        viewed_backfill[ticket] = latest_event_at
+    return latest_event_at, last_viewed_at
+
+
 def _archive_role(session_dir: Path) -> str | None:
     prompts = list(session_dir.glob("*-prompt.md"))
     if not prompts:
@@ -1294,13 +1308,9 @@ def agents() -> dict[str, object]:
                 }
             )
             continue
-        latest_event_at = (
-            _isoformat_utc(status["_mtime"]) if status else None
+        latest_event_at, last_viewed_at = _resolve_viewed_fields(
+            status, ticket, viewed_map, viewed_backfill
         )
-        last_viewed_at = viewed_map.get(ticket)
-        if latest_event_at is not None and last_viewed_at is None:
-            last_viewed_at = latest_event_at
-            viewed_backfill[ticket] = latest_event_at
         workers.append(
             {
                 "ticket": ticket,
@@ -1343,13 +1353,9 @@ def agents() -> dict[str, object]:
             if ticket in seen_tickets:
                 continue
             status = read_agent_status(ticket)
-            latest_event_at = (
-                _isoformat_utc(status["_mtime"]) if status else None
+            latest_event_at, last_viewed_at = _resolve_viewed_fields(
+                status, ticket, viewed_map, viewed_backfill
             )
-            last_viewed_at = viewed_map.get(ticket)
-            if latest_event_at is not None and last_viewed_at is None:
-                last_viewed_at = latest_event_at
-                viewed_backfill[ticket] = latest_event_at
             workers.append(
                 {
                     "ticket": ticket,

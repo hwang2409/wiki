@@ -1547,12 +1547,8 @@ export function AgentsSidebar({
 
   useEffect(() => {
     if (!activeTicket) return;
-    const worker = workers?.find((row) => row.ticket === activeTicket);
-    if (!worker) return;
     const stamp = new Date().toISOString();
-    setViewedOverrides((current) =>
-      current[activeTicket] === stamp ? current : { ...current, [activeTicket]: stamp }
-    );
+    setViewedOverrides((current) => ({ ...current, [activeTicket]: stamp }));
     if (viewedInflight.current.has(activeTicket)) return;
     viewedInflight.current.add(activeTicket);
     markAgentViewed(activeTicket)
@@ -1560,7 +1556,7 @@ export function AgentsSidebar({
       .finally(() => {
         viewedInflight.current.delete(activeTicket);
       });
-  }, [activeTicket, workers]);
+  }, [activeTicket]);
 
   if (workers === null) {
     return (
