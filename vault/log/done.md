@@ -9,6 +9,8 @@ updated: 2026-07-22
 
 ## 2026-07-22
 
+- **wiki** — 07-22 quad-merge regression sweep fixed inline on main (3db94ae — sidebar orch->worker grouping restored, Cmd-K palette 14s->0.2s artifact-cache, visible tool-reference markers, synthetic-row spacing, composer echo-lag dedupe)
+- PHO-14258 preload closure widening merged (PR #12072 squash 748f4a4a, 5 sol rounds — classifier payload fix, multi-workflow closure, fallback budget, underscore-boundary regex, registry-derived mutation guard)
 - WIKI-156 artifact shell + renderer polish merged (#125 squash 316e015, 3 rounds)
 - WIKI-161 synthetic-source system messages merged (#123 squash c58b319, 4 rounds)
 - WIKI-151 nav + sidebar IA merged (#124 squash fdf77f0, 3 rounds)
