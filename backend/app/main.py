@@ -3682,15 +3682,90 @@ class ComposerGateIn(BaseModel):
 
 class ComposerProvisionIn(BaseModel):
     ticket: str = Field(..., min_length=1, max_length=80)
+    orch: str = Field(..., min_length=1, max_length=100)
+
+
+def _resolve_orchestrator_root(orch_id: str) -> Path:
+    """Return the repo root for the calling orchestrator, or raise.
+
+    Rejects unknown ids and worker sessions so `/spawn` never silently targets
+    the wrong repo. Multiple orchestrators (wiki, tooling, phoebe, misc, etc.)
+    share the composer backend, so we look each caller up in the live agent
+    registry rather than defaulting to Wiki's own `ROOT_DIR`.
+    """
+
+    try:
+        registry = _read_agent_registry()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=500,
+            detail=f"agent registry unreadable: {exc}",
+        ) from exc
+
+    orch_entry: dict[str, Any] | None = None
+    ticket_entry = registry.get(orch_id) if isinstance(registry, dict) else None
+    if isinstance(ticket_entry, dict):
+        current = ticket_entry.get("current")
+        if isinstance(current, dict) and current.get("role") == "orchestrator":
+            orch_entry = current
+        elif isinstance(current, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"/spawn must be dispatched from an orchestrator session; "
+                    f"'{orch_id}' is a worker (role={current.get('role')!r})"
+                ),
+            )
+    if orch_entry is None:
+        headless = (registry.get("_orchestrators") or {}) if isinstance(registry, dict) else {}
+        candidate = headless.get(orch_id) if isinstance(headless, dict) else None
+        if isinstance(candidate, dict):
+            orch_entry = candidate
+    if orch_entry is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown orchestrator '{orch_id}' — not registered",
+        )
+
+    raw_root = orch_entry.get("worktree") or orch_entry.get("cwd")
+    if not isinstance(raw_root, str) or not raw_root.strip():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Orchestrator '{orch_id}' has no worktree/cwd registered",
+        )
+    try:
+        repo_root = Path(raw_root).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Orchestrator '{orch_id}' root {raw_root!r} is invalid: {exc}",
+        ) from exc
+    if not repo_root.is_dir():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Orchestrator '{orch_id}' root {repo_root} is not a directory",
+        )
+    if not (repo_root / ".git").exists():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Orchestrator '{orch_id}' root {repo_root} is not a git repository",
+        )
+    return repo_root
 
 
 @app.post("/api/composer/provision-worktree")
 def composer_provision_worktree(body: ComposerProvisionIn) -> dict[str, object]:
-    """Ensure `.claude/worktrees/<ticket-lower>` exists as a git worktree off origin/main.
+    """Ensure `.claude/worktrees/<ticket-lower>` exists in the caller's repo.
 
-    Backs the composer `/spawn` slash command. Idempotent: existing worktrees
-    are returned as-is; missing paths get `git worktree add -B <branch> <path>
-    origin/main`. Fetches origin/main first so the worktree tracks fresh trunk.
+    Backs the composer `/spawn` slash command. The `orch` field identifies the
+    dispatching orchestrator; the repo root is looked up in the agent registry
+    so misc/tooling/phoebe orchestrators provision inside their own repos
+    rather than Wiki's `ROOT_DIR`. Worker sessions are rejected. Existing
+    worktrees are returned as-is only when they are valid git worktrees;
+    missing paths get `git worktree add -b <branch> <path> FETCH_HEAD` after a
+    fresh `git fetch origin main` (whose exit status is required to be zero).
+    Uses `-b` — never `-B` — so a colliding branch is a clean error, never a
+    silent force-reset of in-progress work.
     """
 
     ticket = body.ticket.strip()
@@ -3699,35 +3774,50 @@ def composer_provision_worktree(body: ComposerProvisionIn) -> dict[str, object]:
             status_code=400,
             detail="Ticket must be uppercase letters, numbers, or dashes",
         )
+    orch_id = body.orch.strip()
+    if not orch_id:
+        raise HTTPException(status_code=400, detail="orch is required")
+    repo_root = _resolve_orchestrator_root(orch_id)
+
     branch = ticket.lower()
-    workdir = (ROOT_DIR / ".claude" / "worktrees" / branch).resolve()
+    workdir = (repo_root / ".claude" / "worktrees" / branch).resolve()
     if workdir.exists():
         if not workdir.is_dir():
             raise HTTPException(
                 status_code=409,
                 detail=f"{workdir} exists but is not a directory",
             )
+        if not (workdir / ".git").exists():
+            raise HTTPException(
+                status_code=409,
+                detail=f"{workdir} exists but is not a git worktree",
+            )
         return {"workdir": str(workdir), "provisioned": False}
     workdir.parent.mkdir(parents=True, exist_ok=True)
     try:
-        subprocess.run(
-            ["git", "-C", str(ROOT_DIR), "fetch", "origin", "main"],
+        fetch = subprocess.run(
+            ["git", "-C", str(repo_root), "fetch", "origin", "main"],
             capture_output=True,
             text=True,
             timeout=30,
             check=False,
         )
+        if fetch.returncode != 0:
+            raise HTTPException(
+                status_code=502,
+                detail=(fetch.stderr or fetch.stdout or "git fetch failed").strip()[:400],
+            )
         result = subprocess.run(
             [
                 "git",
                 "-C",
-                str(ROOT_DIR),
+                str(repo_root),
                 "worktree",
                 "add",
-                "-B",
+                "-b",
                 branch,
                 str(workdir),
-                "origin/main",
+                "FETCH_HEAD",
             ],
             capture_output=True,
             text=True,

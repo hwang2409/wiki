@@ -43,11 +43,11 @@ const ROLES = ["plan", "implement", "review"] as const;
 const OUTCOMES = ["merged", "closed", "abandoned"] as const;
 const EFFORTS = ["low", "medium", "high"] as const;
 
-async function provisionWorktree(ticket: string): Promise<string> {
+async function provisionWorktree(ticket: string, orch: string): Promise<string> {
   const response = await fetch("/api/composer/provision-worktree", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ticket }),
+    body: JSON.stringify({ ticket, orch }),
   });
   const body = (await response.json().catch(() => null)) as
     | { workdir?: string; detail?: string }
@@ -147,7 +147,15 @@ export const COMMANDS: readonly ComposerCommand[] = [
       const effortRaw = (values["effort"]?.trim() || "") as SpawnWorkerEffort | "";
       const effort: SpawnWorkerEffort | null =
         kind === "cdx" ? (effortRaw || "high") : null;
-      const workdir = await provisionWorktree(ticket);
+      const orch = context.ticket.trim();
+      if (!orch) {
+        return {
+          ok: false,
+          summary: "cannot /spawn without orchestrator context",
+          detail: "composer must be attached to an orchestrator session",
+        };
+      }
+      const workdir = await provisionWorktree(ticket, orch);
       const result = await spawnAgentWorker({
         ticket,
         kind,
@@ -155,7 +163,7 @@ export const COMMANDS: readonly ComposerCommand[] = [
         model,
         effort,
         workdir,
-        orch: context.ticket,
+        orch,
         prompt,
       });
       return {
