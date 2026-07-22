@@ -109,6 +109,16 @@ async def lifespan(_app: FastAPI):
         # Health is optional; a broken provider CLI or probe must not prevent
         # the backend from starting.
         pass
+    # Warm the palette artifact cache off the event loop: the cold walk parses
+    # every events.jsonl (~14s observed) and would otherwise land on the first
+    # Cmd-K keystroke.
+    threading.Thread(
+        target=lambda: palette.collect_artifact_items(
+            SUPERVISOR_CLIENT.paths.runs_dir, AGENT_ARCHIVE_DIR
+        ),
+        name="palette-artifact-warm",
+        daemon=True,
+    ).start()
     dispatcher_task, watchdog_task, token_task = await _start_dispatcher()
     knowledge_task = asyncio.create_task(
         knowledge.background_index_loop(

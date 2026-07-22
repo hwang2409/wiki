@@ -603,6 +603,18 @@ def _artifact_ts(payload: dict[str, Any], fallback: datetime | None) -> datetime
     return ts or fallback
 
 
+@dataclass(frozen=True)
+class _ArtifactDirCacheEntry:
+    mtime_ns: int
+    items: tuple[PaletteItem, ...]
+
+
+# events.jsonl parsing dominates palette latency (multi-MB JSON per dir);
+# keyed on the file's mtime so unchanged dirs never re-parse.
+_artifact_dir_cache: dict[str, _ArtifactDirCacheEntry] = {}
+_artifact_dir_cache_lock = threading.Lock()
+
+
 def _collect_from_run_dir(
     run_dir: Path,
     ticket: str | None,
@@ -610,6 +622,15 @@ def _collect_from_run_dir(
     events_path = run_dir / "events.jsonl"
     if not events_path.is_file() or events_path.is_symlink():
         return []
+    try:
+        mtime_ns = int(events_path.stat().st_mtime_ns)
+    except OSError:
+        return []
+    cache_key = f"{events_path}|{ticket or ''}"
+    with _artifact_dir_cache_lock:
+        cached = _artifact_dir_cache.get(cache_key)
+        if cached is not None and cached.mtime_ns == mtime_ns:
+            return list(cached.items)
     dir_mtime = _stat_mtime(events_path)
     items: list[PaletteItem] = []
     seen: set[str] = set()
@@ -631,6 +652,10 @@ def _collect_from_run_dir(
             items.append(item)
         if len(items) >= ARTIFACT_MAX_PER_DIR:
             break
+    with _artifact_dir_cache_lock:
+        _artifact_dir_cache[cache_key] = _ArtifactDirCacheEntry(
+            mtime_ns=mtime_ns, items=tuple(items)
+        )
     return items
 
 

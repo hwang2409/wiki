@@ -696,30 +696,32 @@ function correlateComposerMessages(
       claimed.set(durableIndex, message.source ?? null);
       continue;
     }
-    // Text fallback for providers that do not echo pending_id. Scan FIFO so
-    // an earlier unsourced composer message reserves its Henry-bubble slot
+    // Text fallback for providers that do not echo pending_id (live claude
+    // sessions parse the raw transcript, which never carries one). Scan FIFO
+    // so an earlier unsourced composer message reserves its Henry-bubble slot
     // before a later synthetic one is allowed to take it. The match window
-    // is bounded on BOTH sides of the composer's echoed_at (falling back to
-    // sent_at when the provider has not yet echoed): composer_messages is
-    // unbounded across run replacement while the transcript window is
-    // trimmed, so an old sourced row whose real event has fallen out must
-    // not be allowed to claim a later identical terminal-typed Henry row.
-    const anchorAt = (() => {
-      const echoed = message.echoed_at ? Date.parse(message.echoed_at) : Number.NaN;
-      if (Number.isFinite(echoed)) return echoed;
-      const sent = message.sent_at ? Date.parse(message.sent_at) : Number.NaN;
-      return Number.isFinite(sent) ? sent : Number.NaN;
-    })();
+    // spans BOTH sent_at and echoed_at: the transcript event lands at
+    // ~sent_at while echo detection can lag by several seconds, so anchoring
+    // on echoed_at alone pushed real events outside the old 2s lookback and
+    // duplicated the message. The window stays bounded on both sides because
+    // composer_messages is unbounded across run replacement while the
+    // transcript window is trimmed — an old sourced row whose real event has
+    // fallen out must not claim a later identical terminal-typed Henry row.
+    const sentAt = message.sent_at ? Date.parse(message.sent_at) : Number.NaN;
+    const echoedAt = message.echoed_at ? Date.parse(message.echoed_at) : Number.NaN;
+    const anchorTimes = [sentAt, echoedAt].filter((value) => Number.isFinite(value));
+    const anchorLow = anchorTimes.length ? Math.min(...anchorTimes) : Number.NaN;
+    const anchorHigh = anchorTimes.length ? Math.max(...anchorTimes) : Number.NaN;
     const FALLBACK_LOOKBACK_MS = 2_000;
     const FALLBACK_LOOKAHEAD_MS = 60_000;
     const matchIndex = events.findIndex((event, index) => {
       if (claimed.has(index) || event.kind !== "user") return false;
       if (event.pending_id) return false;
       const eventAt = event.ts ? Date.parse(event.ts) : Number.NaN;
-      if (Number.isFinite(anchorAt) && Number.isFinite(eventAt)) {
-        if (eventAt < anchorAt - FALLBACK_LOOKBACK_MS) return false;
-        if (eventAt > anchorAt + FALLBACK_LOOKAHEAD_MS) return false;
-      } else if (Number.isFinite(anchorAt) !== Number.isFinite(eventAt)) {
+      if (Number.isFinite(anchorLow) && Number.isFinite(eventAt)) {
+        if (eventAt < anchorLow - FALLBACK_LOOKBACK_MS) return false;
+        if (eventAt > anchorHigh + FALLBACK_LOOKAHEAD_MS) return false;
+      } else if (Number.isFinite(anchorLow) !== Number.isFinite(eventAt)) {
         // Composer has a durable anchor but the event does not (or vice
         // versa): without both timestamps the window guard is meaningless,
         // so refuse the fallback rather than allow an unbounded match.
@@ -744,7 +746,9 @@ function composerMessageEvents(session: TranscriptSession): SessionEvent[] {
   return unmatched.map((message) => ({
     id: 2_000_000 + message.seq,
     kind: "user" as const,
-    ts: message.echoed_at,
+    // sent_at orders the fallback row where the message actually entered the
+    // conversation; echoed_at can lag several seconds behind ("in a moment").
+    ts: message.sent_at ?? message.echoed_at,
     text: message.text,
     disposition: "rendered" as const,
     source: message.source ?? null,
@@ -1398,11 +1402,14 @@ function SyntheticSourceRow({ source, text }: { source: string; text: string }) 
 function MarkerRow({ text, marker }: { text: string; marker?: string }) {
   const rule = markerRule(marker);
   if (!rule) {
+    // Non-whitelisted markers still render as a visible info row (Henry
+    // prefers verbose "tool reference"-style detail over hidden chips).
+    const FallbackIcon = marker === "tool_reference" ? Wrench : Radio;
     return (
-      <details className="session-marker-hidden">
-        <summary>run detail</summary>
+      <div className="session-marker is-info" data-marker={marker}>
+        <FallbackIcon size={12} />
         <span>{text}</span>
-      </details>
+      </div>
     );
   }
   const Icon = MARKER_ICON[rule.severity];

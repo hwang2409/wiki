@@ -316,18 +316,13 @@ async function main() {
     await expectVisibleText(page, ".session-marker.is-error", "529 Overloaded");
     await expectVisibleText(page, ".session-marker.is-info", "permissions");
     await expectVisibleText(page, ".session-marker.is-info", "model changed to claude-opus-4-7");
-    const modelChangedHidden = await page.locator(".session-marker-hidden", { hasText: "model changed" }).count();
-    if (modelChangedHidden !== 0) {
-      throw new Error("model_changed should render as visible marker, not hidden run-detail");
+    // Non-whitelisted markers render as visible info rows, never hidden
+    // "run detail" chips (Henry prefers verbose tool-reference-style detail).
+    const hiddenMarkers = await page.locator(".session-marker-hidden").count();
+    if (hiddenMarkers !== 0) {
+      throw new Error("non-whitelisted markers must render visibly, not as hidden run-detail chips");
     }
-    const hiddenMarkers = page.locator(".session-marker-hidden");
-    await hiddenMarkers.first().waitFor({ state: "visible" });
-    const hiddenSummaries = await hiddenMarkers.locator("summary", { hasText: "run detail" }).count();
-    if (hiddenSummaries < 1) throw new Error("expected at least one hidden run-detail chip");
-    const stopHookAsMarker = await page.locator(".session-marker", { hasText: "stop hook" }).count();
-    if (stopHookAsMarker !== 0) {
-      throw new Error("stop_hook_summary should NOT render as a top-level marker");
-    }
+    await expectVisibleText(page, ".session-marker.is-info", "stop hook");
 
     logStep("tool call: expand activity, assert failed + bounded preview");
     const activityToggle = page.locator(".session-activity-head").first();

@@ -1739,13 +1739,13 @@ export function AgentsSidebar({
     return latest > viewed;
   };
 
-  const workerRow = (worker: AgentWorker) => {
+  const workerRow = (worker: AgentWorker, owned: boolean) => {
     const unread = hasUnread(worker);
     const failed = worker.run_id ? viewedFailed[worker.run_id] === true : false;
     const stateKey = worker.state ?? "unknown";
     return (
       <button
-        className={`nav-agent${activeTicket === worker.ticket ? " is-active" : ""}${unread ? " has-unread" : ""}${failed ? " has-viewed-failure" : ""}`}
+        className={`nav-agent${owned ? " is-owned" : ""}${activeTicket === worker.ticket ? " is-active" : ""}${unread ? " has-unread" : ""}${failed ? " has-viewed-failure" : ""}`}
         data-state={stateKey}
         key={worker.ticket}
         type="button"
@@ -1770,7 +1770,7 @@ export function AgentsSidebar({
         ) : null}
         <span className="nav-agent-ticket">{worker.ticket}</span>
         <span className="nav-agent-meta" data-state={stateKey}>{stateLabel(worker)}</span>
-        {worker.orch ? (
+        {!owned && worker.orch ? (
           <span className="nav-agent-orch-chip" title={`Coordinator: ${worker.orch}`}>
             {worker.orch}
           </span>
@@ -1814,15 +1814,21 @@ export function AgentsSidebar({
         return 3;
     }
   };
-  const orderedWorkers = [...workers].sort((a, b) => {
-    const rank = attentionRank(a) - attentionRank(b);
-    if (rank !== 0) return rank;
-    const ageA = a.status_age_seconds ?? Number.MAX_SAFE_INTEGER;
-    const ageB = b.status_age_seconds ?? Number.MAX_SAFE_INTEGER;
-    return ageA - ageB;
-  });
+  const attentionOrder = (list: AgentWorker[]): AgentWorker[] =>
+    [...list].sort((a, b) => {
+      const rank = attentionRank(a) - attentionRank(b);
+      if (rank !== 0) return rank;
+      const ageA = a.status_age_seconds ?? Number.MAX_SAFE_INTEGER;
+      const ageB = b.status_age_seconds ?? Number.MAX_SAFE_INTEGER;
+      return ageA - ageB;
+    });
   const orderedOrchestrators = [...orchestrators].sort((a, b) => a.id.localeCompare(b.id));
-  const hasActive = orderedOrchestrators.length > 0 || orderedWorkers.length > 0;
+  const ungrouped = attentionOrder(
+    workers.filter(
+      (worker) => !worker.orch || !orchestrators.some((orch) => orch.id === worker.orch)
+    )
+  );
+  const hasActive = orderedOrchestrators.length > 0 || workers.length > 0;
   const hasHistory = archived.length > 0;
 
   return (
@@ -1834,12 +1840,19 @@ export function AgentsSidebar({
         >
           <span>Active</span>
           <span className="nav-agents-group-count tabular-nums">
-            {orderedOrchestrators.length + orderedWorkers.length}
+            {orderedOrchestrators.length + workers.length}
           </span>
         </div>
       ) : null}
-      {orderedOrchestrators.map(orchestratorRow)}
-      {orderedWorkers.map(workerRow)}
+      {orderedOrchestrators.map((orch) => (
+        <div key={orch.id}>
+          {orchestratorRow(orch)}
+          {attentionOrder(workers.filter((worker) => worker.orch === orch.id)).map(
+            (worker) => workerRow(worker, true)
+          )}
+        </div>
+      ))}
+      {ungrouped.map((worker) => workerRow(worker, false))}
       {hasHistory ? (
         <div
           className="nav-agents-group-title"
