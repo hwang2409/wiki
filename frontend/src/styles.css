@@ -6740,6 +6740,245 @@ body.is-resizing-panes .pane-cell {
   white-space: nowrap;
 }
 
+.composer-slash-menu {
+  display: flex;
+  flex-direction: column;
+  max-height: 288px;
+  padding: 4px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-xs);
+  background-color: var(--background-primary);
+  box-shadow: var(--shadow-floating);
+  overflow-y: auto;
+}
+
+.composer-slash-item {
+  display: grid;
+  grid-template-columns: max-content 1fr max-content;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  text-align: left;
+  transition: background-color 90ms ease;
+}
+
+.composer-slash-item.is-active,
+.composer-slash-item:hover {
+  background-color: var(--background-modifier-hover);
+}
+
+.composer-slash-name {
+  color: var(--text-normal);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  font-weight: var(--fw-semibold);
+  font-variant-numeric: tabular-nums;
+}
+
+.composer-slash-args {
+  overflow: hidden;
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smallest);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-slash-desc {
+  justify-self: end;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smallest);
+  white-space: nowrap;
+}
+
+.composer-command-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-sm);
+  background-color: var(--background-secondary);
+}
+
+.composer-command-header {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.composer-command-chip {
+  padding: 2px 8px;
+  border-radius: var(--radius-xs);
+  background-color: var(--background-modifier-hover);
+  color: var(--text-normal);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-small);
+  font-weight: var(--fw-semibold);
+}
+
+.composer-command-desc {
+  flex: 1;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
+.composer-command-cancel {
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smallest);
+  padding: 2px 6px;
+  border-radius: var(--radius-xs);
+}
+
+.composer-command-cancel:hover {
+  color: var(--text-normal);
+  background-color: var(--background-modifier-hover);
+}
+
+.composer-command-args {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.composer-command-slot {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  flex: 1 1 180px;
+  min-width: 160px;
+}
+
+.composer-command-slot:has(textarea) {
+  flex-basis: 100%;
+}
+
+.composer-command-label {
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smallest);
+  text-transform: lowercase;
+}
+
+.composer-command-optional {
+  color: var(--text-faint);
+}
+
+.composer-command-input {
+  width: 100%;
+  padding: 5px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-xs);
+  background-color: var(--background-primary);
+  color: var(--text-normal);
+  font-family: inherit;
+  font-size: var(--font-ui-small);
+  transition: border-color 90ms ease, box-shadow 90ms ease;
+}
+
+.composer-command-input:focus,
+.composer-command-input:focus-visible {
+  outline: none;
+  border-color: var(--interactive-accent);
+  box-shadow: 0 0 0 1px var(--interactive-accent);
+}
+
+.composer-command-input.is-missing {
+  border-color: var(--background-modifier-border);
+  border-style: dashed;
+}
+
+textarea.composer-command-input {
+  resize: vertical;
+  min-height: 60px;
+}
+
+.composer-command-hint {
+  color: var(--text-faint);
+  font-size: var(--font-ui-smallest);
+  line-height: 1.3;
+}
+
+.composer-command-error {
+  color: var(--text-error, #d64545);
+  font-size: var(--font-ui-smaller);
+  padding: 6px 8px;
+  border-radius: var(--radius-xs);
+  background-color: var(--background-modifier-error, rgba(214, 69, 69, 0.08));
+}
+
+.composer-command-notice {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 5px 10px;
+  margin: 4px 0;
+  border-radius: var(--radius-xs);
+  background-color: var(--background-modifier-success, rgba(68, 145, 79, 0.10));
+  color: var(--text-success, var(--text-normal));
+  font-size: var(--font-ui-smaller);
+  font-family: var(--font-monospace);
+}
+
+.composer-command-notice-summary {
+  font-weight: var(--fw-semibold);
+}
+
+.composer-command-notice-detail {
+  color: var(--text-faint);
+  flex: 1;
+}
+
+.composer-command-notice-dismiss {
+  margin-left: auto;
+  padding: 0 6px;
+  color: var(--text-faint);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font-size: var(--font-ui-small);
+  line-height: 1;
+}
+
+.composer-command-notice-dismiss:hover {
+  color: var(--text-normal);
+}
+
+.composer-command-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.composer-command-submit {
+  padding: 5px 12px;
+  border-radius: var(--radius-xs);
+  background-color: var(--interactive-accent);
+  color: var(--text-on-accent, #fff);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  font-weight: var(--fw-semibold);
+  transition: opacity 90ms ease, background-color 90ms ease;
+}
+
+.composer-command-submit:hover:not(:disabled) {
+  opacity: 0.9;
+}
+
+.composer-command-submit:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.composer-command-tip {
+  color: var(--text-faint);
+  font-size: var(--font-ui-smallest);
+  font-family: var(--font-monospace);
+}
+
 .session-composer-status {
   display: flex;
   align-items: center;

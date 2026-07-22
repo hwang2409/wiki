@@ -109,7 +109,17 @@ def main() -> None:
     args = parse_args()
     configure_environment(args)
 
-    from backend.app.main import app
+    from backend.app.main import app, wiki_app_secret_boot_line
+
+    # Emit the Wiki.app origin secret to stdout BEFORE uvicorn starts
+    # serving. The Tauri Rust host captures this line via its sidecar rx
+    # channel, strips it from the log stream, and stores the secret in
+    # process memory to hand to the webview via a `get_wiki_app_secret`
+    # invoke command. Worker CLI processes run outside Tauri's IPC bridge
+    # and never receive it — this is what gates /api/composer/* against
+    # non-Wiki.app callers (WIKI-148 round 6, Path B).
+    sys.stdout.write(wiki_app_secret_boot_line() + "\n")
+    sys.stdout.flush()
 
     config = uvicorn.Config(
         app,

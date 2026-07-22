@@ -67,6 +67,19 @@ import type {
 } from "./api";
 import { renderAnsi } from "./ansi";
 import { ArtifactBlock } from "./artifact-block";
+import {
+  filterCommands,
+  initialValues,
+  missingRequired,
+  serializeCommand,
+  type ComposerCommand,
+} from "./composer-commands";
+import {
+  CommandForm,
+  SLASH_MENU_ID,
+  SlashMenu,
+  slashMenuOptionId,
+} from "./composer-slash-menu";
 import { externalLinkProps } from "./external-links";
 import {
   GhPreviewCard,
@@ -2563,6 +2576,28 @@ function MessageComposer({
   const skills = useSkills();
   const [menuIndex, setMenuIndex] = useState(0);
   const [menuDismissed, setMenuDismissed] = useState(false);
+  const [activeCommand, setActiveCommand] = useState<ComposerCommand | null>(null);
+  const [commandValues, setCommandValues] = useState<Record<string, string>>({});
+  const [commandBusy, setCommandBusy] = useState(false);
+  const [commandError, setCommandError] = useState<string | null>(null);
+  // Round-7 REVIEW [MEDIUM]: multi-line composer drafts must survive
+  // opening a structured command. We capture the composer slices around
+  // the `/foo` sigil at open time and stitch them back on cancel or
+  // successful run so `existing draft\n/sp` no longer discards
+  // `existing draft`.
+  const [commandDraftContext, setCommandDraftContext] = useState<
+    { before: string; after: string } | null
+  >(null);
+  // Round-7 REVIEW [MEDIUM]: a passing `/gate` or `/archive` used to
+  // clear the form silently, contradicting the success-summary
+  // contract. Persist a short-lived notice so the result is visible.
+  const [commandNotice, setCommandNotice] = useState<
+    { summary: string; detail?: string } | null
+  >(null);
+  // Round-7 REVIEW [HIGH]: synchronous guard for double-submit. React
+  // schedules `commandBusy = true`, but two synchronous submit events in
+  // the same tick see the old value; this ref flips immediately.
+  const commandInFlightRef = useRef(false);
   const visualAnchorRef = useRef(0);
   const visualHeadRef = useRef(0);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -2628,13 +2663,47 @@ function MessageComposer({
   const trigger = (() => {
     const el = inputRef.current;
     const caretAt = el && document.activeElement === el ? el.selectionStart : text.length;
-    const match = SKILL_TRIGGER.exec(text.slice(0, caretAt ?? text.length));
-    return match ? { sigil: match[1], partial: match[2], start: (caretAt ?? 0) - match[2].length - 1 } : null;
+    const slice = text.slice(0, caretAt ?? text.length);
+    const match = SKILL_TRIGGER.exec(slice);
+    if (!match) return null;
+    const start = (caretAt ?? 0) - match[2].length - 1;
+    // \/foo escape — backslash immediately before sigil suppresses trigger
+    if (start > 0 && text[start - 1] === "\\") return null;
+    // command menu only fires on `/` (not `$`) at start-of-line — first char or preceded by newline
+    const atLineStart =
+      match[1] === "/" && (start === 0 || text[start - 1] === "\n");
+    return {
+      sigil: match[1],
+      partial: match[2],
+      start,
+      atLineStart,
+    };
   })();
+  const commandMatches =
+    trigger?.atLineStart && vimMode === "insert" && !menuDismissed
+      ? filterCommands(trigger.partial).slice(0, 8)
+      : [];
   const menuItems =
-    trigger && vimMode === "insert" && !menuDismissed
+    trigger && commandMatches.length === 0 && vimMode === "insert" && !menuDismissed
       ? skills.filter((s) => s.name.startsWith(trigger.partial)).slice(0, 8)
       : [];
+
+  const menuOpen = commandMatches.length > 0 || menuItems.length > 0;
+  useEffect(() => {
+    if (!menuOpen) return;
+    function onPointerDown(event: PointerEvent) {
+      const target = event.target as Node | null;
+      if (!target) return;
+      if (inputRef.current && inputRef.current.contains(target)) return;
+      const menuEl = document.getElementById(SLASH_MENU_ID);
+      if (menuEl && menuEl.contains(target)) return;
+      const skillMenu = document.querySelector(".session-skill-menu");
+      if (skillMenu && skillMenu.contains(target)) return;
+      setMenuDismissed(true);
+    }
+    window.addEventListener("pointerdown", onPointerDown);
+    return () => window.removeEventListener("pointerdown", onPointerDown);
+  }, [menuOpen]);
 
   function rememberSelection(start: number, end = start, caret = start) {
     selectionRef.current = { start, end };
@@ -2670,6 +2739,110 @@ function MessageComposer({
       inputRef.current?.setSelectionRange(pos, pos);
       rememberSelection(pos);
     });
+  }
+
+  function acceptCommand(command: ComposerCommand) {
+    // Snapshot the composer text around the `/foo` sigil so cancel /
+    // success can restore any surrounding multi-line draft. Round-7
+    // REVIEW [MEDIUM] (session.tsx:2645).
+    const before = trigger ? text.slice(0, trigger.start) : "";
+    const after = trigger
+      ? text.slice(trigger.start + 1 + trigger.partial.length)
+      : "";
+    setCommandDraftContext({ before, after });
+    setActiveCommand(command);
+    setCommandValues(initialValues(command));
+    setCommandBusy(false);
+    setCommandError(null);
+    setCommandNotice(null);
+    commandInFlightRef.current = false;
+    setMenuIndex(0);
+    setMenuDismissed(false);
+    setText("");
+    rememberSelection(0);
+  }
+
+  function cancelCommand({ restoreText = true }: { restoreText?: boolean } = {}) {
+    // Belt-and-braces: `<CommandForm>` blocks cancel while busy, but the
+    // programmatic path (e.g. keyboard shortcuts wired elsewhere) is
+    // guarded here too so an in-flight destructive command can't be
+    // pulled out from under the user. Round-7 REVIEW [MEDIUM].
+    if (commandBusy) return;
+    const command = activeCommand;
+    const values = commandValues;
+    const draft = commandDraftContext;
+    setActiveCommand(null);
+    setCommandValues({});
+    setCommandBusy(false);
+    setCommandError(null);
+    setCommandDraftContext(null);
+    commandInFlightRef.current = false;
+    if (restoreText && command) {
+      const fallback = serializeCommand(command, values);
+      const before = draft?.before ?? "";
+      const after = draft?.after ?? "";
+      const restored = `${before}${fallback}${after}`;
+      setText(restored);
+      requestAnimationFrame(() => {
+        const pos = before.length + fallback.length;
+        inputRef.current?.setSelectionRange(pos, pos);
+        inputRef.current?.focus();
+        rememberSelection(pos);
+      });
+    } else {
+      requestAnimationFrame(() => inputRef.current?.focus());
+    }
+  }
+
+  async function runCommand() {
+    if (!activeCommand || commandBusy) return;
+    // Round-7 REVIEW [HIGH]: block double-fire *within the same tick*.
+    // Two synchronous submit events (e.g. Meta+Enter routing through
+    // both a form-level and keydown-level handler) would otherwise both
+    // pass the React-state check and dispatch.
+    if (commandInFlightRef.current) return;
+    const missing = missingRequired(activeCommand, commandValues);
+    if (missing.length > 0) {
+      setCommandError(`Fill required arg: ${missing.map((arg) => arg.name).join(", ")}`);
+      return;
+    }
+    commandInFlightRef.current = true;
+    setCommandBusy(true);
+    setCommandError(null);
+    const command = activeCommand;
+    const draft = commandDraftContext;
+    try {
+      const result = await command.dispatch(commandValues, { ticket });
+      if (!result.ok) {
+        setCommandError(result.detail ? `${result.summary} · ${result.detail}` : result.summary);
+        return;
+      }
+      const notice: { summary: string; detail?: string } = { summary: result.summary };
+      if (result.detail) notice.detail = result.detail;
+      setCommandNotice(notice);
+      setActiveCommand(null);
+      setCommandValues({});
+      setCommandDraftContext(null);
+      // Restore surrounding draft (the parts of the composer that
+      // weren't part of the `/foo` invocation). Round-7 REVIEW [MEDIUM].
+      const before = draft?.before ?? "";
+      const after = draft?.after ?? "";
+      const restored = `${before}${after}`;
+      setText(restored);
+      if (restored.length > 0) {
+        requestAnimationFrame(() => {
+          const pos = before.length;
+          inputRef.current?.setSelectionRange(pos, pos);
+          inputRef.current?.focus();
+          rememberSelection(pos);
+        });
+      }
+    } catch (err) {
+      setCommandError(err instanceof Error ? err.message : "Command failed");
+    } finally {
+      setCommandBusy(false);
+      commandInFlightRef.current = false;
+    }
   }
 
   async function attachFiles(files: FileList | File[]) {
@@ -3066,8 +3239,10 @@ function MessageComposer({
   }
 
   async function send(mode: "now" | "on-idle") {
-    const value = text.trim();
-    if (!value || busy) return;
+    const raw = text.trim();
+    if (!raw || busy) return;
+    // \/foo escape — user typed \/steer to send literal /steer
+    const value = raw.startsWith("\\/") ? raw.slice(1) : raw;
     setBusy(true);
     setError(null);
     setText("");
@@ -3158,6 +3333,14 @@ function MessageComposer({
           </span>
         </div>
       ))}
+      {commandMatches.length > 0 ? (
+        <SlashMenu
+          commands={commandMatches}
+          activeIndex={Math.min(menuIndex, commandMatches.length - 1)}
+          onSelect={acceptCommand}
+          onHover={setMenuIndex}
+        />
+      ) : null}
       {menuItems.length > 0 ? (
         <div className="session-skill-menu">
           {menuItems.map((skill, i) => (
@@ -3203,6 +3386,43 @@ function MessageComposer({
           ))}
         </div>
       ) : null}
+      {commandNotice ? (
+        <div
+          className="composer-command-notice"
+          role="status"
+          aria-live="polite"
+        >
+          <span className="composer-command-notice-summary">
+            {commandNotice.summary}
+          </span>
+          {commandNotice.detail ? (
+            <span className="composer-command-notice-detail">
+              {commandNotice.detail}
+            </span>
+          ) : null}
+          <button
+            className="composer-command-notice-dismiss"
+            type="button"
+            aria-label="Dismiss command result"
+            onClick={() => setCommandNotice(null)}
+          >
+            ×
+          </button>
+        </div>
+      ) : null}
+      {activeCommand ? (
+        <CommandForm
+          command={activeCommand}
+          values={commandValues}
+          onChange={(name, value) =>
+            setCommandValues((current) => ({ ...current, [name]: value }))
+          }
+          onSubmit={() => void runCommand()}
+          onCancel={() => cancelCommand()}
+          busy={commandBusy}
+          error={commandError}
+        />
+      ) : (
       <div className="session-composer-row">
         <div className="session-input-wrap">
         {overlayPos ? (
@@ -3220,6 +3440,15 @@ function MessageComposer({
           ref={inputRef}
           rows={2}
           value={text}
+          role="combobox"
+          aria-expanded={commandMatches.length > 0}
+          aria-controls={commandMatches.length > 0 ? SLASH_MENU_ID : undefined}
+          aria-activedescendant={
+            commandMatches.length > 0
+              ? slashMenuOptionId(Math.min(menuIndex, commandMatches.length - 1))
+              : undefined
+          }
+          aria-autocomplete="list"
           onFocus={(event) => {
             if (vimMode !== "insert") enterInsert(event.currentTarget.selectionEnd ?? text.length);
             else captureSelection(event.currentTarget);
@@ -3258,6 +3487,33 @@ function MessageComposer({
             if (vimMode === "visual") {
               handleVisualKey(event);
               return;
+            }
+            if (commandMatches.length > 0) {
+              if (event.key === "ArrowDown" || (event.ctrlKey && event.key === "j")) {
+                event.preventDefault();
+                setMenuIndex((i) => (i + 1) % commandMatches.length);
+                return;
+              }
+              if (
+                event.key === "ArrowUp" ||
+                (event.ctrlKey && event.key === "k") ||
+                (event.key === "Tab" && event.shiftKey)
+              ) {
+                event.preventDefault();
+                setMenuIndex((i) => (i - 1 + commandMatches.length) % commandMatches.length);
+                return;
+              }
+              if (event.key === "Enter" || (event.key === "Tab" && !event.shiftKey)) {
+                event.preventDefault();
+                const chosen = commandMatches[Math.min(menuIndex, commandMatches.length - 1)];
+                acceptCommand(chosen);
+                return;
+              }
+              if (event.key === "Escape") {
+                event.preventDefault();
+                setMenuDismissed(true);
+                return;
+              }
             }
             if (menuItems.length > 0) {
               if (event.key === "ArrowDown" || (event.ctrlKey && event.key === "j")) {
@@ -3318,6 +3574,7 @@ function MessageComposer({
           <SendHorizontal size={14} />
         </button>
       </div>
+      )}
       <div className="session-composer-status">
         {thinking ? <span className="session-thinking-indicator">thinking</span> : null}
         <div className="session-subagents">

@@ -6,6 +6,7 @@ import fcntl
 import json
 import os
 import re
+import secrets
 import stat
 import subprocess
 import tempfile
@@ -19,7 +20,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, cast
 from uuid import UUID, uuid4
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -140,6 +141,69 @@ async def lifespan(_app: FastAPI):
             return_exceptions=True,
         )
         await asyncio.to_thread(terminal.TERMINAL_MANAGER.close_all)
+
+
+# --- Wiki.app origin secret (WIKI-148 round 6 — Path B) ---------------------
+# Per-startup random secret proving a request came from the Wiki.app main
+# process. The backend prints it once to stdout with a distinctive marker;
+# the Tauri Rust host captures that line via its sidecar rx channel, keeps
+# it in Rust memory only, and exposes it to the webview through an invoke
+# command (`get_wiki_app_secret`). Worker CLI sessions (Claude Code / Codex)
+# run outside Tauri's IPC bridge and never receive the secret, so a curl
+# straight to `/api/composer/*` from a worker fails with 403.
+#
+# Design points:
+#   - The secret is minted here at module-import time. `native_server.py`
+#     emits it to stdout before uvicorn starts serving so Tauri's log stream
+#     receives it deterministically.
+#   - The marker prefix `[[WIKI_APP_SECRET_BOOT]]=` is what Tauri matches on
+#     and strips before logging.
+#   - Tests override the secret via `set_wiki_app_secret(...)` so they don't
+#     depend on scraping stdout.
+_WIKI_APP_SECRET_MARKER = "[[WIKI_APP_SECRET_BOOT]]="
+_WIKI_APP_SECRET_HOLDER: dict[str, str] = {"value": secrets.token_urlsafe(32)}
+
+
+def wiki_app_secret() -> str:
+    return _WIKI_APP_SECRET_HOLDER["value"]
+
+
+def set_wiki_app_secret(value: str) -> None:
+    """Testing hook — override the minted secret for pytest fixtures."""
+
+    _WIKI_APP_SECRET_HOLDER["value"] = value
+
+
+def wiki_app_secret_boot_line() -> str:
+    """The line the backend prints on startup for Tauri to capture."""
+
+    return f"{_WIKI_APP_SECRET_MARKER}{wiki_app_secret()}"
+
+
+def require_wiki_app_origin(
+    x_wiki_app_secret: str | None = Header(default=None, alias="X-Wiki-App-Secret"),
+) -> None:
+    """FastAPI dependency — reject composer callers without the origin secret.
+
+    Constant-time compare against the module-level secret. Absent header,
+    empty header, or mismatch all return 403. This is the ONLY authentication
+    on composer endpoints in round 6 — the earlier client-supplied token was
+    fundamentally spoofable (a worker could fetch it from the public token
+    endpoint by orch id) and is removed entirely.
+    """
+
+    expected = wiki_app_secret()
+    supplied = (x_wiki_app_secret or "").strip()
+    if not supplied or not secrets.compare_digest(supplied, expected):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Composer endpoints require the Wiki.app origin secret. "
+                "The Wiki.app webview supplies it automatically via the "
+                "Tauri invoke bridge; direct HTTP callers (worker CLI "
+                "sessions, curl) cannot obtain it."
+            ),
+        )
 
 
 app = FastAPI(title="Wiki API", lifespan=lifespan)
@@ -3673,6 +3737,360 @@ def spawn_orchestrator_route(
         body,
         backend_base_url=request_backend_base_url(request),
     )
+
+
+class ComposerGateIn(BaseModel):
+    pr: str = Field(..., min_length=1, max_length=512)
+    expect_sha: str | None = Field(default=None, max_length=64)
+
+
+class ComposerProvisionIn(BaseModel):
+    ticket: str = Field(..., min_length=1, max_length=80)
+    # `orch` identifies which orchestrator's repo to provision under. Since
+    # only Wiki.app can reach this endpoint (Path B, round 6), the field is
+    # trusted at the transport layer once `require_wiki_app_origin` passes.
+    # The registry lookup in `_resolve_orchestrator_root` still rejects
+    # unknown ids and worker sessions with role != "orchestrator".
+    # Optional at the model layer so the internal `composer_provision_worktree`
+    # helper can be exercised directly by tests — the route wrapper enforces
+    # presence.
+    orch: str | None = Field(default=None, min_length=1, max_length=100)
+
+
+def _resolve_orchestrator_root(orch_id: str) -> Path:
+    """Return the repo root for the calling orchestrator, or raise.
+
+    Rejects unknown ids and worker sessions so `/spawn` never silently targets
+    the wrong repo. Multiple orchestrators (wiki, tooling, phoebe, misc, etc.)
+    share the composer backend, so we look each caller up in the live agent
+    registry rather than defaulting to Wiki's own `ROOT_DIR`.
+    """
+
+    try:
+        registry = _read_agent_registry()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=500,
+            detail=f"agent registry unreadable: {exc}",
+        ) from exc
+
+    orch_entry: dict[str, Any] | None = None
+    ticket_entry = registry.get(orch_id) if isinstance(registry, dict) else None
+    if isinstance(ticket_entry, dict):
+        current = ticket_entry.get("current")
+        if isinstance(current, dict) and current.get("role") == "orchestrator":
+            orch_entry = current
+        elif isinstance(current, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"/spawn must be dispatched from an orchestrator session; "
+                    f"'{orch_id}' is a worker (role={current.get('role')!r})"
+                ),
+            )
+    if orch_entry is None:
+        headless = (registry.get("_orchestrators") or {}) if isinstance(registry, dict) else {}
+        candidate = headless.get(orch_id) if isinstance(headless, dict) else None
+        if isinstance(candidate, dict):
+            orch_entry = candidate
+    if orch_entry is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown orchestrator '{orch_id}' — not registered",
+        )
+
+    raw_root = orch_entry.get("worktree") or orch_entry.get("cwd")
+    if not isinstance(raw_root, str) or not raw_root.strip():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Orchestrator '{orch_id}' has no worktree/cwd registered",
+        )
+    try:
+        repo_root = Path(raw_root).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Orchestrator '{orch_id}' root {raw_root!r} is invalid: {exc}",
+        ) from exc
+    if not repo_root.is_dir():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Orchestrator '{orch_id}' root {repo_root} is not a directory",
+        )
+    if not (repo_root / ".git").exists():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Orchestrator '{orch_id}' root {repo_root} is not a git repository",
+        )
+    return repo_root
+
+
+def _git_common_dir(path: Path) -> tuple[bool, Path | str]:
+    """Return `(True, canonical common-dir)` or `(False, stderr excerpt)`.
+
+    `--git-common-dir` returns a path relative to the invoking cwd, so we
+    canonicalize against `path`. Callers use this on BOTH sides of a
+    repo-identity compare so a primary worktree (where common-dir ==
+    `<root>/.git`) matches a linked worktree (where `<workdir>/.git` is a
+    file whose common-dir points to the primary's `.git`).
+    """
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except OSError as exc:
+        return False, str(exc)
+    if result.returncode != 0:
+        return False, (result.stderr or result.stdout or "git rev-parse failed").strip()[:200]
+    raw = result.stdout.strip()
+    if not raw:
+        return False, "git rev-parse --git-common-dir returned empty"
+    common = Path(raw)
+    if not common.is_absolute():
+        common = (path / common).resolve()
+    else:
+        common = common.resolve()
+    return True, common
+
+
+def _validate_existing_worktree(
+    workdir: Path, repo_root: Path, branch: str
+) -> None:
+    """Reject stale/unrelated worktrees before returning them as-is.
+
+    An `.git` file/dir alone is not proof — a leftover from a prior repo, an
+    empty marker, or a checkout on the wrong branch would all pass a naive
+    `.git.exists()` check. We verify:
+
+    - `git rev-parse --git-common-dir` matches on BOTH sides (caller repo
+      and target workdir) — accepts linked worktrees whose `.git` file
+      points back to the primary's common-dir. (M1 in review4.)
+    - `git rev-parse --abbrev-ref HEAD` matches the expected branch.
+
+    Any mismatch is a 409 with a specific message so the caller can pick a
+    different ticket or clean up manually.
+    """
+
+    root_ok, root_result = _git_common_dir(repo_root)
+    if not root_ok:
+        raise HTTPException(
+            status_code=500,
+            detail=f"orchestrator root {repo_root} common-dir unreadable: {root_result}",
+        )
+    expected_common = cast(Path, root_result)
+
+    workdir_ok, workdir_result = _git_common_dir(workdir)
+    if not workdir_ok:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{workdir} exists but is not a git worktree: {workdir_result}"
+            ),
+        )
+    common_path = cast(Path, workdir_result)
+    if common_path != expected_common:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"existing worktree at {workdir} belongs to a different repository "
+                f"({common_path}); expected {expected_common}"
+            ),
+        )
+
+    try:
+        head = subprocess.run(
+            ["git", "-C", str(workdir), "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except OSError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{workdir} exists but git could not read HEAD: {exc}",
+        ) from exc
+    if head.returncode != 0:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{workdir} exists but HEAD is unreadable: "
+                f"{(head.stderr or head.stdout or 'rev-parse HEAD failed').strip()[:200]}"
+            ),
+        )
+    actual_branch = head.stdout.strip()
+    if actual_branch != branch:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"existing worktree at {workdir} is on branch {actual_branch!r}, "
+                f"expected {branch!r}"
+            ),
+        )
+
+
+@app.post(
+    "/api/composer/provision-worktree",
+    dependencies=[Depends(require_wiki_app_origin)],
+)
+def composer_provision_worktree_route(body: ComposerProvisionIn) -> dict[str, object]:
+    """Provision a `.claude/worktrees/<ticket>` for the caller's orchestrator.
+
+    Gated by `require_wiki_app_origin` — only the Wiki.app main process
+    (via the Tauri invoke bridge) holds the in-memory secret. Worker CLI
+    sessions cannot reach this endpoint even if they craft the exact HTTP
+    request. There is no client-supplied credential path left: the earlier
+    per-orch composer-token endpoint and the legacy session-id header have
+    both been removed.
+    """
+
+    if not body.orch:
+        raise HTTPException(
+            status_code=400,
+            detail="ComposerProvisionIn.orch is required for /spawn dispatch",
+        )
+    return composer_provision_worktree(body, body.orch)
+
+
+def composer_provision_worktree(
+    body: ComposerProvisionIn, orch_id: str
+) -> dict[str, object]:
+    """Ensure `.claude/worktrees/<ticket-lower>` exists in the caller's repo.
+
+    Backs the composer `/spawn` slash command. The wrapping route runs the
+    Wiki.app-origin transport check (`require_wiki_app_origin`) before
+    calling us; `orch_id` therefore comes from the trusted body field and
+    is validated against the agent registry via `_resolve_orchestrator_root`
+    — unknown orch ids and worker sessions are rejected with 400.
+    Existing worktrees are returned as-is only when they are valid git
+    worktrees pointing at the expected repo and branch; missing paths get
+    `git worktree add -b <branch> <path> FETCH_HEAD` after a fresh
+    `git fetch origin main` (whose exit status is required to be zero).
+    Uses `-b` — never `-B` — so a colliding branch is a clean error, never a
+    silent force-reset of in-progress work.
+    """
+
+    ticket = body.ticket.strip()
+    if not ticket or not SPAWN_TICKET_PATTERN.fullmatch(ticket):
+        raise HTTPException(
+            status_code=400,
+            detail="Ticket must be uppercase letters, numbers, or dashes",
+        )
+    repo_root = _resolve_orchestrator_root(orch_id)
+
+    branch = ticket.lower()
+    workdir = (repo_root / ".claude" / "worktrees" / branch).resolve()
+    if workdir.exists():
+        if not workdir.is_dir():
+            raise HTTPException(
+                status_code=409,
+                detail=f"{workdir} exists but is not a directory",
+            )
+        if not (workdir / ".git").exists():
+            raise HTTPException(
+                status_code=409,
+                detail=f"{workdir} exists but is not a git worktree",
+            )
+        _validate_existing_worktree(workdir, repo_root, branch)
+        return {"workdir": str(workdir), "provisioned": False}
+    workdir.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fetch = subprocess.run(
+            ["git", "-C", str(repo_root), "fetch", "origin", "main"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if fetch.returncode != 0:
+            raise HTTPException(
+                status_code=502,
+                detail=(fetch.stderr or fetch.stdout or "git fetch failed").strip()[:400],
+            )
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                str(workdir),
+                "FETCH_HEAD",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"git worktree add failed: {exc}",
+        ) from exc
+    if result.returncode != 0:
+        raise HTTPException(
+            status_code=502,
+            detail=(result.stderr or result.stdout or "git worktree add failed").strip()[:400],
+        )
+    return {"workdir": str(workdir), "provisioned": True}
+
+
+@app.post(
+    "/api/composer/gate",
+    dependencies=[Depends(require_wiki_app_origin)],
+)
+def composer_gate(body: ComposerGateIn) -> dict[str, object]:
+    """Run `wiki gate <pr> --json` and normalise the verdict.
+
+    Backs the composer `/gate` slash command. Same Wiki.app-only origin
+    gate as `/api/composer/provision-worktree`: worker CLI sessions cannot
+    reach it. Read-only relative to git — the underlying CLI only shells
+    out to `gh` for PR view + check status.
+    """
+
+    wiki_cli = ROOT_DIR / "wiki"
+    if not wiki_cli.exists():
+        raise HTTPException(status_code=500, detail=f"wiki CLI missing at {wiki_cli}")
+    cmd = [str(wiki_cli), "gate", body.pr, "--json"]
+    if body.expect_sha:
+        cmd += ["--expect-sha", body.expect_sha]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=str(ROOT_DIR),
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(status_code=504, detail="wiki gate timed out") from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"wiki gate exec failed: {exc}") from exc
+    parsed: dict[str, object] | None = None
+    if proc.stdout:
+        try:
+            parsed = json.loads(proc.stdout.strip().splitlines()[-1])
+        except json.JSONDecodeError:
+            parsed = None
+    if proc.returncode == 2 or parsed is None:
+        raise HTTPException(
+            status_code=502,
+            detail=(proc.stderr or proc.stdout or "wiki gate returned no verdict").strip(),
+        )
+    ready = bool(parsed.get("ready"))
+    reasons = parsed.get("reasons") or []
+    summary = "ready" if ready else ", ".join(str(reason) for reason in reasons) or "not ready"
+    return {
+        "verdict": "pass" if ready else "fail",
+        "summary": summary,
+        "raw": parsed,
+    }
 
 
 @app.post("/api/agents/{ticket}/message")
