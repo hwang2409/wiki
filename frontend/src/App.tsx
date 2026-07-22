@@ -881,7 +881,9 @@ function routeHash(route: Route): string {
   if (route.kind === "new") return "#/new";
   if (route.kind === "agent") {
     const base = `#/agent/${encodeURIComponent(route.ticket)}`;
-    return route.panel === "review" ? `${base}/review` : base;
+    if (route.panel === "review") return `${base}/review`;
+    if (route.panel === "graph") return `${base}/graph`;
+    return base;
   }
   if (route.kind === "terminal") return `#/terminal/${encodeURIComponent(route.id)}`;
   if ((UTILITY_ROUTES as readonly string[]).includes(route.kind)) return `#/${route.kind}`;
@@ -894,8 +896,13 @@ function routeHash(route: Route): string {
 
 function parseRoute(hash: string): Route {
   if (hash === "#/new") return { kind: "new" };
-  const agent = hash.match(/^#\/agent\/([A-Za-z0-9-]+)(?:\/(review))?$/);
-  if (agent) return { kind: "agent", ticket: agent[1], panel: agent[2] === "review" ? "review" : null };
+  // `#/agents/<TICKET>/graph` is the spec-canonical workgraph URL (graph-engineering D2);
+  // `#/agent/<TICKET>/graph` is the app-native equivalent.
+  const agent = hash.match(/^#\/agents?\/([A-Za-z0-9-]+)(?:\/(review|graph))?$/);
+  if (agent) {
+    const panel = agent[2] === "review" ? "review" : agent[2] === "graph" ? "graph" : null;
+    return { kind: "agent", ticket: agent[1], panel };
+  }
   const terminal = hash.match(/^#\/terminal\/([A-Za-z0-9._-]+)$/);
   if (terminal) return { kind: "terminal", id: terminal[1] };
   const utility = UTILITY_ROUTES.find((kind) => hash === `#/${kind}`);

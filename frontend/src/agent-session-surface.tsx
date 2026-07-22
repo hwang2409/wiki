@@ -6,8 +6,9 @@ import {
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
 } from "react";
-import { Bot, GitPullRequest, RefreshCw, X } from "lucide-react";
+import { Bot, GitBranch, GitPullRequest, RefreshCw, X } from "lucide-react";
 import { AgentPrReviewPanel } from "./agent-pr-review";
+import { WorkgraphPanel } from "./workgraph-panel";
 import { ArtifactPanel } from "./artifact-panel";
 import { deletePaneStateEntries } from "./pane-state-cache";
 import { ReplaceAgentModal } from "./replace-agent-modal";
@@ -64,6 +65,7 @@ function writePanelUrl(ticket: string, state: PanelState, replace = false) {
 
 type SidePanelState =
   | { kind: "review" }
+  | { kind: "graph" }
   | { kind: "subagent"; subagent: string }
   | null;
 
@@ -72,7 +74,7 @@ type SurfaceState = {
   panelWidth: number;
 };
 
-export type AgentRoutePanel = "review" | null;
+export type AgentRoutePanel = "review" | "graph" | null;
 
 export type AgentSessionSurfaceWorker = {
   ticket: string;
@@ -107,7 +109,9 @@ function readSurfaceState(
     panel:
       initialPanel === "review" && canReview
         ? { kind: "review" }
-        : cachedPanel,
+        : initialPanel === "graph"
+          ? { kind: "graph" }
+          : cachedPanel,
     panelWidth: cached?.panelWidth ?? fallbackWidth,
   };
 }
@@ -181,6 +185,34 @@ function ReviewSidePanel({
       width={width}
     >
       <AgentPrReviewPanel canApprove={canApprove} ticket={ticket} tick={tick} />
+    </SessionSidePanel>
+  );
+}
+
+function WorkgraphSidePanel({
+  onClose,
+  onResizeStart,
+  ticket,
+  tick,
+  width,
+}: {
+  onClose: () => void;
+  onResizeStart: (event: ReactPointerEvent<HTMLDivElement>) => void;
+  ticket: string;
+  tick: number;
+  width: number;
+}) {
+  return (
+    <SessionSidePanel
+      badge="workgraph"
+      className="session-side-panel-graph"
+      icon={<GitBranch size={13} />}
+      onClose={onClose}
+      onResizeStart={onResizeStart}
+      title={ticket}
+      width={width}
+    >
+      <WorkgraphPanel ticket={ticket} tick={tick} />
     </SessionSidePanel>
   );
 }
@@ -347,6 +379,7 @@ export function AgentSessionSurface({
 
   useEffect(() => {
     if (initialPanel === "review" && canReview) setPanel({ kind: "review" });
+    if (initialPanel === "graph") setPanel({ kind: "graph" });
   }, [canReview, initialPanel]);
 
   useEffect(() => {
@@ -482,8 +515,7 @@ export function AgentSessionSurface({
           {worker.kind ? <StatusBadge compact label={worker.kind} state="neutral" /> : null}
           {worker.role ? <StatusBadge compact label={worker.role} state="neutral" /> : null}
           {worker.model ? <StatusBadge compact label={worker.model} state="faint" /> : null}
-          {canReview || worker.canReplace || onClose ? (
-            <div className="agent-surface-actions">
+          <div className="agent-surface-actions">
               {worker.canReplace && worker.kind && worker.model ? (
                 <button
                   className="agent-surface-action"
@@ -507,6 +539,17 @@ export function AgentSessionSurface({
                   Review
                 </button>
               ) : null}
+              <button
+                className={`agent-surface-action${panel?.kind === "graph" ? " is-active" : ""}`}
+                type="button"
+                onClick={() => {
+                  if (panelState.open) closeArtifactPanel();
+                  setPanel((current) => (current?.kind === "graph" ? null : { kind: "graph" }));
+                }}
+              >
+                <GitBranch size={13} />
+                Graph
+              </button>
               {onClose ? (
                 <button
                   aria-label="Close pane"
@@ -518,7 +561,6 @@ export function AgentSessionSurface({
                 </button>
               ) : null}
             </div>
-          ) : null}
         </header>
         <div className="agent-session-surface-main">
           <SessionTab
@@ -546,6 +588,14 @@ export function AgentSessionSurface({
       ) : panel?.kind === "review" ? (
         <ReviewSidePanel
           canApprove={canReview}
+          onClose={() => setPanel(null)}
+          onResizeStart={resizePanel}
+          ticket={worker.ticket}
+          tick={tick}
+          width={panelWidth}
+        />
+      ) : panel?.kind === "graph" ? (
+        <WorkgraphSidePanel
           onClose={() => setPanel(null)}
           onResizeStart={resizePanel}
           ticket={worker.ticket}
