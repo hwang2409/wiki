@@ -4462,20 +4462,72 @@ body.is-resizing-panes .pane-cell {
   gap: 6px;
   align-self: flex-start;
   padding: 2px 8px;
-  border: 1px dashed var(--background-modifier-border);
+  border: 1px solid var(--background-modifier-border);
   border-radius: var(--radius-xs);
   background-color: transparent;
-  color: var(--text-faint);
+  color: var(--text-muted);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-ui-smaller);
   overflow-wrap: anywhere;
 }
 
-.session-marker.is-api_error {
+.session-marker.is-info {
+  color: var(--text-muted);
+  border-color: var(--background-modifier-border);
+}
+
+.session-marker.is-info svg {
+  color: var(--text-faint);
+}
+
+.session-marker.is-warn {
+  color: color-mix(in srgb, var(--accent-warning, var(--accent-danger)) 85%, var(--text-normal));
+  border-color: color-mix(in srgb, var(--accent-warning, var(--accent-danger)) 45%, var(--background-modifier-border));
+}
+
+.session-marker.is-error {
   color: var(--accent-danger);
-  border-color: color-mix(in srgb, var(--accent-danger) 40%, var(--background-modifier-border));
+  border-color: color-mix(in srgb, var(--accent-danger) 50%, var(--background-modifier-border));
+}
+
+.session-marker-hidden {
+  align-self: flex-start;
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--font-ui-smaller);
+  color: var(--text-faint);
+}
+
+.session-marker-hidden > summary {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 8px;
+  border: 1px dashed var(--background-modifier-border);
+  border-radius: var(--radius-xs);
+  color: var(--text-faint);
+  cursor: pointer;
+  list-style: none;
+  letter-spacing: 0.02em;
+}
+
+.session-marker-hidden > summary::-webkit-details-marker {
+  display: none;
+}
+
+.session-marker-hidden[open] > summary {
   border-style: solid;
+  color: var(--text-muted);
+}
+
+.session-marker-hidden > span {
+  display: block;
+  margin-top: 4px;
+  padding: 6px 8px;
+  border-left: 2px solid var(--background-modifier-border);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
 .session-dispositions {
@@ -4637,6 +4689,66 @@ body.is-resizing-panes .pane-cell {
 
 .session-provider-request-actions pre {
   max-height: 220px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.session-provider-request-details {
+  margin-top: 8px;
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--font-ui-smaller);
+}
+
+.session-provider-request-details > summary {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 8px;
+  border: 1px dashed var(--background-modifier-border);
+  border-radius: var(--radius-xs);
+  color: var(--text-faint);
+  cursor: pointer;
+  list-style: none;
+  letter-spacing: 0.02em;
+}
+
+.session-provider-request-details > summary::-webkit-details-marker {
+  display: none;
+}
+
+.session-provider-request-details[open] > summary {
+  border-style: solid;
+  color: var(--text-muted);
+}
+
+.session-provider-request-meta {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 3px 12px;
+  margin: 8px 0;
+}
+
+.session-provider-request-meta dt {
+  color: var(--text-faint);
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.session-provider-request-meta dd {
+  margin: 0;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.session-provider-request-details > pre {
+  max-height: 220px;
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: var(--radius-xs);
+  background-color: var(--code-background);
+  color: var(--text-muted);
   overflow: auto;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -5707,6 +5819,9 @@ body.is-resizing-panes .pane-cell {
 }
 
 .session-bash {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
   padding: 10px 12px;
   border: 1px solid var(--background-modifier-border);
   border-radius: var(--radius-lg);
@@ -8801,3 +8916,105 @@ body.is-resizing-panes .pane-cell {
   white-space: pre;
 }
 
+/* WIKI-153 — bounded transcript preview shared by tool + bash blocks */
+
+.transcript-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.transcript-preview-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--fs-xs);
+  letter-spacing: 0.03em;
+  color: var(--text-faint);
+}
+
+.transcript-preview-label {
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.transcript-preview.is-error .transcript-preview-label {
+  color: color-mix(in srgb, var(--accent-danger) 70%, var(--text-faint));
+}
+
+.transcript-preview-summary {
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.transcript-preview-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.transcript-chip {
+  padding: 1px 7px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-xs);
+  background: transparent;
+  color: var(--text-faint);
+  font-family: inherit;
+  font-size: inherit;
+  letter-spacing: inherit;
+  text-transform: lowercase;
+  cursor: pointer;
+}
+
+.transcript-chip:hover {
+  border-color: var(--background-modifier-border);
+  color: var(--text-muted);
+}
+
+.transcript-chip.is-active {
+  border-color: var(--background-modifier-border);
+  color: var(--text-normal);
+}
+
+.transcript-preview-body {
+  max-height: 300px;
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-xs);
+  background-color: var(--code-background);
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.5;
+  overflow: auto;
+}
+
+.transcript-preview-body.is-wrap {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.transcript-preview-body.is-nowrap {
+  white-space: pre;
+  overflow-wrap: normal;
+}
+
+.transcript-preview.is-error .transcript-preview-body {
+  border-color: color-mix(in srgb, var(--accent-danger) 30%, var(--background-modifier-border));
+  color: color-mix(in srgb, var(--accent-danger) 20%, var(--text-muted));
+}
+
+.transcript-preview-more {
+  display: block;
+  color: var(--text-faint);
+  font-style: italic;
+}
