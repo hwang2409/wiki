@@ -57,6 +57,7 @@ import {
 } from "./api";
 import type {
   AgentModelOption,
+  ComposerMessage,
   ProviderEventInspector,
   ProviderPendingRequest,
   QueuedMessage,
@@ -694,9 +695,44 @@ function composerMessageEvents(session: TranscriptSession): SessionEvent[] {
       ts: message.echoed_at,
       text: message.text,
       disposition: "rendered",
+      source: message.source ?? null,
     });
   }
   return synthetic;
+}
+
+function applyComposerSources(
+  events: SessionEvent[],
+  composerMessages: ComposerMessage[],
+): SessionEvent[] {
+  const sourced = composerMessages.filter((message) => Boolean(message.source));
+  if (sourced.length === 0) return events;
+  const claimed = new Set<number>();
+  const bySource = new Map<number, string>();
+  for (const message of sourced) {
+    const sentAt = message.sent_at ? Date.parse(message.sent_at) : Number.NaN;
+    const matchIndex = events.findIndex((event, index) => {
+      if (claimed.has(index) || event.kind !== "user") return false;
+      if (event.source) return false;
+      const eventAt = event.ts ? Date.parse(event.ts) : Number.NaN;
+      if (
+        Number.isFinite(sentAt) &&
+        Number.isFinite(eventAt) &&
+        eventAt < sentAt - 2_000
+      ) {
+        return false;
+      }
+      return composerTextMatches(event.text, message.text);
+    });
+    if (matchIndex < 0) continue;
+    claimed.add(matchIndex);
+    bySource.set(matchIndex, message.source as string);
+  }
+  if (bySource.size === 0) return events;
+  return events.map((event, index) => {
+    const source = bySource.get(index);
+    return source ? { ...event, source } : event;
+  });
 }
 
 function mergeComposerEvents(events: SessionEvent[], composerEvents: SessionEvent[]): SessionEvent[] {
@@ -1310,6 +1346,20 @@ const MARKER_ICON: Record<MarkerSeverity, LucideIcon> = {
   error: AlertTriangle,
 };
 
+function SyntheticSourceRow({ source, text }: { source: string; text: string }) {
+  const collapsed = text.replace(/\s+/g, " ").trim();
+  return (
+    <div
+      className="session-synthetic-source"
+      data-source={source}
+      data-testid="session-synthetic-source"
+    >
+      <span className="session-synthetic-source-chip">[{source}]</span>
+      <span className="session-synthetic-source-text">{collapsed}</span>
+    </div>
+  );
+}
+
 function MarkerRow({ text, marker }: { text: string; marker?: string }) {
   const rule = markerRule(marker);
   if (!rule) {
@@ -1481,6 +1531,9 @@ const MessageBlock = memo(function MessageBlock({
     return <ArtifactBlock event={event} onOpen={onOpenArtifact} ticket={ticket} />;
   }
   if (event.kind === "user") {
+    if (event.source) {
+      return <SyntheticSourceRow source={event.source} text={event.text} />;
+    }
     return (
       <div className="session-user">
         <UserText imageNums={imageNums} text={event.text} />
@@ -1638,7 +1691,8 @@ function groupTimestamp(group: EventGroup): string | null {
 }
 
 function groupAlign(group: EventGroup): "end" | "start" {
-  return group.kind === "message" && group.event.kind === "user" ? "end" : "start";
+  if (group.kind !== "message" || group.event.kind !== "user") return "start";
+  return group.event.source ? "start" : "end";
 }
 
 function computeTimestampKeys(groups: EventGroup[]): Set<number> {
@@ -2095,7 +2149,10 @@ export function SessionTab({
     () => {
       if (!session) return [];
       return [
-        ...mergeComposerEvents(session.events, composerMessageEvents(session)),
+        ...mergeComposerEvents(
+          applyComposerSources(session.events, session.composerMessages),
+          composerMessageEvents(session),
+        ),
         ...modelChangedMarkers(session),
       ];
     },

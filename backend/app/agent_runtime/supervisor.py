@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import math
 import os
+import re
 import time
 import warnings
 from collections import OrderedDict
@@ -63,6 +64,24 @@ def _validated_dedupe_key(value: object) -> str | None:
         return None
     if not isinstance(value, str) or not value.strip() or len(value) > 200:
         raise ValueError("dedupe_key must be a non-empty string up to 200 characters")
+    return value
+
+
+_SOURCE_MAX_LENGTH = 64
+_SOURCE_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]+$")
+
+
+def _validated_source(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value or len(value) > _SOURCE_MAX_LENGTH:
+        raise ValueError(
+            f"source must be a non-empty string up to {_SOURCE_MAX_LENGTH} characters"
+        )
+    if not _SOURCE_PATTERN.match(value):
+        raise ValueError(
+            "source may only contain letters, digits, and _.:- characters"
+        )
     return value
 
 
@@ -612,6 +631,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     "composer_text": pending_message["text"],
                     "composer_sent_at": pending_message["sent_at"],
                 }
+                pending_source = pending_message.get("source")
+                if isinstance(pending_source, str) and pending_source:
+                    normalized_payload["source"] = pending_source
         self.store.append_normalized(
             run_id,
             raw_seq=int(raw["seq"]),
@@ -1018,11 +1040,13 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             if queued is None:
                 return
             pending_id = queued.get("pending_id")
+            queued_source = queued.get("source")
             if pending_id is not None:
                 self.store.track_pending_user_message(
                     run_id,
                     pending_id,
                     queued["text"],
+                    source=queued_source if isinstance(queued_source, str) else None,
                 )
             try:
                 status = await adapter.send_on_idle(queued["text"])
@@ -2190,9 +2214,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         message: str,
         pending_id: str | None = None,
         dedupe_key: str | None = None,
+        source: str | None = None,
     ) -> dict[str, Any]:
         async with self._run_lock(run_id):
-            return await self._send_now(run_id, message, pending_id, dedupe_key)
+            return await self._send_now(
+                run_id, message, pending_id, dedupe_key, source
+            )
 
     async def _send_now(
         self,
@@ -2200,6 +2227,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         message: str,
         pending_id: str | None = None,
         dedupe_key: str | None = None,
+        source: str | None = None,
     ) -> dict[str, Any]:
         adapter = self.adapters.get(run_id)
         if adapter is None:
@@ -2217,8 +2245,14 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             _, claimed = self.store.claim_message_dedupe_key(run_id, dedupe_key)
             if not claimed:
                 return {"status": "deduplicated", "dedupe_key": dedupe_key}
+        if pending_id is None and source is not None:
+            # Source metadata is only propagated through pending_user_messages,
+            # so mint a durable id for synthetic sources without a composer id.
+            pending_id = str(uuid4())
         if pending_id is not None:
-            self.store.track_pending_user_message(run_id, pending_id, message)
+            self.store.track_pending_user_message(
+                run_id, pending_id, message, source=source
+            )
         try:
             status = await adapter.send_now(message)
         except Exception:
@@ -2243,9 +2277,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         message: str,
         pending_id: str | None = None,
         dedupe_key: str | None = None,
+        source: str | None = None,
     ) -> dict[str, Any]:
         async with self._run_lock(run_id):
-            return await self._send_on_idle(run_id, message, pending_id, dedupe_key)
+            return await self._send_on_idle(
+                run_id, message, pending_id, dedupe_key, source
+            )
 
     async def _send_on_idle(
         self,
@@ -2253,6 +2290,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         message: str,
         pending_id: str | None = None,
         dedupe_key: str | None = None,
+        source: str | None = None,
     ) -> dict[str, Any]:
         adapter = self.adapters.get(run_id)
         if adapter is None:
@@ -2265,8 +2303,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     "dedupe_key": dedupe_key,
                     "messages": list(record.queued_messages),
                 }
+        if pending_id is None and source is not None:
+            pending_id = str(uuid4())
         try:
-            record = self.store.queue_message(run_id, message, pending_id)
+            record = self.store.queue_message(
+                run_id, message, pending_id, source=source
+            )
         except Exception:
             if dedupe_key is not None:
                 self.store.release_message_dedupe_key(run_id, dedupe_key)
@@ -2859,6 +2901,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 str(params["text"]),
                 _validated_pending_id(params.get("pending_id")),
                 _validated_dedupe_key(params.get("dedupe_key")),
+                _validated_source(params.get("source")),
             )
         if method == "run/send_on_idle":
             return await self.send_on_idle(
@@ -2866,6 +2909,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 str(params["text"]),
                 _validated_pending_id(params.get("pending_id")),
                 _validated_dedupe_key(params.get("dedupe_key")),
+                _validated_source(params.get("source")),
             )
         if method == "run/queue":
             run_id = self._resolve_run_id(params)

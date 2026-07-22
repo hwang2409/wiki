@@ -545,6 +545,7 @@ export type SessionEvent = {
   title?: string | null;
   caption?: string | null;
   artifact?: SessionArtifact;
+  source?: string | null;
 };
 
 export type SubagentInfo = {
@@ -591,6 +592,7 @@ export type ComposerMessage = {
   sent_at: string | null;
   echoed_at: string | null;
   seq: number;
+  source?: string | null;
 };
 
 export type AgentOlderSessionData = {

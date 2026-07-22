@@ -35,13 +35,17 @@ class _RecordingSend:
     """Async callable that captures send_now invocations for assertion."""
 
     def __init__(self) -> None:
-        self.calls: list[tuple[str, str, str | None]] = []
+        self.calls: list[tuple[str, str, str | None, str | None]] = []
         self.fail_with: Exception | None = None
 
     async def __call__(
-        self, run_id: str, message: str, dedupe_key: str | None
+        self,
+        run_id: str,
+        message: str,
+        dedupe_key: str | None,
+        source: str | None = None,
     ) -> dict:
-        self.calls.append((run_id, message, dedupe_key))
+        self.calls.append((run_id, message, dedupe_key, source))
         if self.fail_with is not None:
             raise self.fail_with
         return {"status": "sent"}
@@ -51,16 +55,20 @@ class _SelectiveSend:
     """Block one orchestrator while allowing another to receive messages."""
 
     def __init__(self) -> None:
-        self.calls: list[tuple[str, str, str | None]] = []
+        self.calls: list[tuple[str, str, str | None, str | None]] = []
         self.slow_run_id: str | None = None
         self.started = asyncio.Event()
         self.fast_received = asyncio.Event()
         self.release = asyncio.Event()
 
     async def __call__(
-        self, run_id: str, message: str, dedupe_key: str | None
+        self,
+        run_id: str,
+        message: str,
+        dedupe_key: str | None,
+        source: str | None = None,
     ) -> dict:
-        self.calls.append((run_id, message, dedupe_key))
+        self.calls.append((run_id, message, dedupe_key, source))
         if run_id == self.slow_run_id:
             self.started.set()
             await self.release.wait()
@@ -515,14 +523,17 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
             {"state": "working", "pr": None, "step": "coding", "blocker": None},
         )
         first_started = asyncio.Event()
-        calls: list[tuple[str, str, str | None]] = []
+        calls: list[tuple[str, str, str | None, str | None]] = []
         fail_next = False
 
         async def accept_then_timeout(
-            run_id: str, message: str, dedupe_key: str | None
+            run_id: str,
+            message: str,
+            dedupe_key: str | None,
+            source: str | None = None,
         ) -> dict:
             nonlocal fail_next
-            calls.append((run_id, message, dedupe_key))
+            calls.append((run_id, message, dedupe_key, source))
             if fail_next:
                 fail_next = False
                 first_started.set()
@@ -1005,7 +1016,7 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         tick = asyncio.create_task(monitor.tick())
         await asyncio.wait_for(send.started.wait(), timeout=10.0)
         await asyncio.wait_for(send.fast_received.wait(), timeout=10.0)
-        self.assertTrue(any(run_id == orch_b.run_id for run_id, _, _ in send.calls))
+        self.assertTrue(any(run_id == orch_b.run_id for run_id, *_ in send.calls))
         send.release.set()
         await asyncio.wait_for(tick, timeout=10.0)
 

@@ -137,6 +137,8 @@ def _apply_composer_message_event(
     sent_at = payload.get("composer_sent_at")
     if not all(isinstance(value, str) for value in (pending_id, text, sent_at)):
         return
+    source_raw = payload.get("source")
+    source = source_raw if isinstance(source_raw, str) and source_raw else None
     record.pending_user_messages = [
         message
         for message in record.pending_user_messages
@@ -147,15 +149,16 @@ def _apply_composer_message_event(
         for message in record.composer_messages
     ):
         return
-    record.composer_messages.append(
-        {
-            "pending_id": pending_id,
-            "text": text,
-            "sent_at": sent_at,
-            "echoed_at": normalized_at,
-            "seq": seq,
-        }
-    )
+    entry: dict[str, Any] = {
+        "pending_id": pending_id,
+        "text": text,
+        "sent_at": sent_at,
+        "echoed_at": normalized_at,
+        "seq": seq,
+    }
+    if source is not None:
+        entry["source"] = source
+    record.composer_messages.append(entry)
 
 
 def _resolved_parent(path: Path) -> Path:
@@ -1412,12 +1415,18 @@ class RunStore:
         run_id: str,
         pending_id: str,
         text: str,
+        source: str | None = None,
     ) -> RunRecord:
         with self._lock:
             record = self.get(run_id)
-            record.pending_user_messages.append(
-                {"pending_id": pending_id, "text": text, "sent_at": utc_now()}
-            )
+            entry: dict[str, Any] = {
+                "pending_id": pending_id,
+                "text": text,
+                "sent_at": utc_now(),
+            }
+            if isinstance(source, str) and source:
+                entry["source"] = source
+            record.pending_user_messages.append(entry)
             self._write_record(record)
             return record
 
@@ -1475,12 +1484,15 @@ class RunStore:
         run_id: str,
         text: str,
         pending_id: str | None = None,
+        source: str | None = None,
     ) -> RunRecord:
         with self._lock:
             record = self.get(run_id)
-            message = {"text": text, "queued_at": utc_now()}
+            message: dict[str, Any] = {"text": text, "queued_at": utc_now()}
             if pending_id is not None:
                 message["pending_id"] = pending_id
+            if isinstance(source, str) and source:
+                message["source"] = source
             record.queued_messages.append(message)
             self._write_record(record)
             return record

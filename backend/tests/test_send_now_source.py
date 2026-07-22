@@ -1,0 +1,216 @@
+"""WIKI-161: send_now/send_on_idle carry a `source` field that flows into
+pending_user_messages and composer_messages so the frontend can render
+synthetic-source user turns as marker rows without changing LLM semantics."""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from uuid import uuid4
+
+from backend.app.agent_runtime.fake import FixtureAdapterFactory
+from backend.app.agent_runtime.provider import ProviderEvent
+from backend.app.agent_runtime.store import RunStore, RuntimePaths
+from backend.app.agent_runtime.supervisor import (
+    Supervisor,
+    _validated_source,
+)
+from backend.app.agent_runtime.types import ProviderKind
+
+
+FIXTURES = Path(__file__).parent / "fixtures" / "agent_runtime"
+
+
+def _paths(root: Path) -> RuntimePaths:
+    return RuntimePaths(
+        runtime_dir=root / "runtime",
+        socket_path=root / "runtime" / "supervisor.sock",
+        registry_path=root / "isolated-registry.json",
+        archive_dir=root / "archive",
+        status_dir=root / "status",
+    )
+
+
+async def _wait_for_events(store: RunStore, run_id: str, minimum: int) -> None:
+    for _ in range(200):
+        record = store.get(run_id)
+        if record.raw_event_count >= minimum:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"run {run_id} did not reach {minimum} raw events")
+
+
+class SendNowSourceTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.worktree = self.root / "worktree"
+        self.worktree.mkdir()
+        self.paths = _paths(self.root)
+        self.store = RunStore(self.paths)
+        self.supervisor = Supervisor(
+            self.store,
+            FixtureAdapterFactory(FIXTURES, pid=os.getpid()),
+        )
+
+    async def asyncTearDown(self) -> None:
+        await self.supervisor.close()
+        self.tmp.cleanup()
+
+    async def _start_claude(self, ticket: str) -> str:
+        record = await self.supervisor.start_run(
+            agent_id=ticket,
+            provider=ProviderKind.CLAUDE,
+            role="orchestrator",
+            model="fixture-claude",
+            effort=None,
+            worktree=str(self.worktree),
+            prompt=f"Work on ticket {ticket}",
+        )
+        await _wait_for_events(self.store, record.run_id, 5)
+        return record.run_id
+
+    async def _echo_user_turn(self, run_id: str, text: str) -> None:
+        adapter = self.supervisor.adapters[run_id]
+        await self.supervisor._handle_provider_event(  # noqa: SLF001
+            run_id,
+            adapter,
+            ProviderEvent(
+                ProviderKind.CLAUDE,
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": text}],
+                    },
+                },
+            ),
+        )
+
+    async def _wait_for_composer_message(self, run_id: str) -> list[dict[str, str]]:
+        for _ in range(200):
+            messages = self.store.get(run_id).composer_messages
+            if messages:
+                return messages
+            await asyncio.sleep(0.01)
+        raise AssertionError("no composer message ever surfaced")
+
+    async def test_send_now_without_source_leaves_composer_untagged(self) -> None:
+        run_id = await self._start_claude("WIKI-161-A")
+        pending_id = str(uuid4())
+        result = await self.supervisor.send_now(
+            run_id,
+            "hi from henry",
+            pending_id,
+        )
+        self.assertEqual(result["status"], "sent")
+        pending = self.store.get(run_id).pending_user_messages
+        self.assertEqual(len(pending), 1)
+        self.assertNotIn("source", pending[0])
+        await self._echo_user_turn(run_id, "hi from henry")
+        composer_messages = await self._wait_for_composer_message(run_id)
+        self.assertNotIn("source", composer_messages[0])
+
+    async def test_send_now_with_source_persists_and_flows_to_composer(self) -> None:
+        run_id = await self._start_claude("WIKI-161-B")
+        pending_id = str(uuid4())
+        result = await self.supervisor.send_now(
+            run_id,
+            "[fleet] WIKI-1234 merged",
+            pending_id,
+            source="fleet-monitor",
+        )
+        self.assertEqual(result["status"], "sent")
+        pending = self.store.get(run_id).pending_user_messages
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["source"], "fleet-monitor")
+        self.assertEqual(pending[0]["text"], "[fleet] WIKI-1234 merged")
+
+        await self._echo_user_turn(run_id, "[fleet] WIKI-1234 merged")
+        composer_messages = await self._wait_for_composer_message(run_id)
+        self.assertEqual(composer_messages[0]["source"], "fleet-monitor")
+        self.assertEqual(composer_messages[0]["pending_id"], pending_id)
+        self.assertEqual(self.store.get(run_id).pending_user_messages, [])
+
+    async def test_send_now_source_without_pending_id_mints_one(self) -> None:
+        run_id = await self._start_claude("WIKI-161-C")
+        result = await self.supervisor.send_now(
+            run_id,
+            "supervisor-steer body",
+            source="supervisor-steer",
+        )
+        self.assertEqual(result["status"], "sent")
+        pending = self.store.get(run_id).pending_user_messages
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["source"], "supervisor-steer")
+        # Pending id must be minted so the source can be correlated back to the
+        # composer_messages record when the provider echoes the turn.
+        self.assertTrue(pending[0]["pending_id"])
+
+    async def test_send_on_idle_persists_source_on_queued_message(self) -> None:
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-161-D",
+            provider=ProviderKind.CODEX,
+            role="orchestrator",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="Work on ticket WIKI-161-D",
+        )
+        run_id = record.run_id
+        # Occupy the run so send_on_idle stays queued instead of delivering.
+        await self.supervisor.send_now(run_id, "start a long turn")
+        result = await self.supervisor.send_on_idle(
+            run_id,
+            "queued fleet ping",
+            source="fleet-monitor",
+        )
+        self.assertEqual(result["status"], "queued")
+        queued = self.store.get(run_id).queued_messages
+        self.assertEqual(queued[0]["source"], "fleet-monitor")
+
+    async def test_source_validation_rejects_bad_payloads(self) -> None:
+        with self.assertRaises(ValueError):
+            _validated_source("")
+        with self.assertRaises(ValueError):
+            _validated_source("has spaces")
+        with self.assertRaises(ValueError):
+            _validated_source("x" * 65)
+        with self.assertRaises(ValueError):
+            _validated_source(123)
+        self.assertIsNone(_validated_source(None))
+        self.assertEqual(_validated_source("fleet-monitor"), "fleet-monitor")
+        self.assertEqual(_validated_source("mastermind"), "mastermind")
+
+    async def test_supervisor_run_send_now_jsonrpc_accepts_source(self) -> None:
+        run_id = await self._start_claude("WIKI-161-E")
+        result = await self.supervisor.dispatch(
+            "run/send_now",
+            {
+                "run_id": run_id,
+                "text": "rpc-tagged body",
+                "source": "mastermind",
+            },
+        )
+        self.assertEqual(result["status"], "sent")
+        pending = self.store.get(run_id).pending_user_messages
+        self.assertEqual(pending[0]["source"], "mastermind")
+
+    async def test_supervisor_run_send_now_rejects_bad_source(self) -> None:
+        run_id = await self._start_claude("WIKI-161-F")
+        with self.assertRaises(ValueError):
+            await self.supervisor.dispatch(
+                "run/send_now",
+                {
+                    "run_id": run_id,
+                    "text": "attempted attack",
+                    "source": "has spaces",
+                },
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
