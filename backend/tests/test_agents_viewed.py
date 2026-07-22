@@ -366,6 +366,50 @@ class AgentsViewedTests(unittest.TestCase):
         ]
         self.assertFalse(leftovers, f"tempfile leftovers not cleaned: {leftovers}")
 
+    def test_concurrent_first_baseline_writers_agree(self) -> None:
+        # WIKI-147 R6 B1: two concurrent first-time baseline writers for the
+        # same run must be serialized by the per-run lock so exactly one wins
+        # and the late arriver returns the persisted snapshot on recheck.
+        # Without the lock, both writers race past the existence probe and
+        # can overwrite each other, silently advancing the supposedly frozen
+        # baseline past the winner's seq.
+        run_id = _new_run_id()
+        (self.runs_dir / run_id).mkdir(parents=True, exist_ok=True)
+
+        results: list[tuple[str, int]] = []
+        errors: list[str] = []
+        gate = threading.Barrier(2)
+
+        def call(at_offset: int, seq: int) -> None:
+            gate.wait(timeout=5)
+            try:
+                results.append(main._ensure_run_baseline(run_id, _iso(at_offset), seq))
+            except Exception as exc:
+                errors.append(repr(exc))
+
+        threads = [
+            threading.Thread(target=call, args=(10, 3)),
+            threading.Thread(target=call, args=(20, 7)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        self.assertFalse(errors, f"writer errors: {errors}")
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0], results[1], "concurrent writers disagreed")
+
+        stored_at, stored_seq = main._load_run_baseline(run_id)
+        self.assertEqual((stored_at, stored_seq), results[0])
+        self.assertIn(stored_seq, (3, 7))
+
+        # A subsequent call with a *different* (at, seq) MUST return the frozen
+        # snapshot, not the new args. This guards against the pre-lock bug where
+        # a late arriver would re-write and silently advance the baseline.
+        later = main._ensure_run_baseline(run_id, _iso(99), 99)
+        self.assertEqual(later, (stored_at, stored_seq))
+
     def test_deploy_marker_persists_across_reboot(self) -> None:
         run_id = _new_run_id()
         self._seed_worker(

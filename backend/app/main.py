@@ -9,6 +9,7 @@ import re
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 from collections.abc import Iterator
 from contextlib import asynccontextmanager, contextmanager
@@ -1123,6 +1124,19 @@ def _baseline_path(run_id: str) -> Path:
     return AGENT_RUNS_DIR / run_id / "viewed-baseline.json"
 
 
+_BASELINE_LOCKS: dict[str, threading.Lock] = {}
+_BASELINE_LOCKS_GUARD = threading.Lock()
+
+
+def _baseline_lock(run_id: str) -> threading.Lock:
+    with _BASELINE_LOCKS_GUARD:
+        lock = _BASELINE_LOCKS.get(run_id)
+        if lock is None:
+            lock = threading.Lock()
+            _BASELINE_LOCKS[run_id] = lock
+        return lock
+
+
 def _load_run_baseline(run_id: str) -> tuple[str | None, int | None]:
     """Return ``(baseline_at, baseline_seq)`` for a pre-deploy run, if written."""
 
@@ -1152,32 +1166,33 @@ def _ensure_run_baseline(
     return the persisted value verbatim — future events with seq > baseline_seq
     then render as unread (WIKI-147 R4 B1). Writes atomically via a tempfile +
     ``os.replace`` so concurrent readers never see a half-written sidecar
-    (WIKI-147 R5 B1).
+    (WIKI-147 R5 B1). Concurrent first-writers are serialized on a per-run
+    ``threading.Lock`` so exactly one writer freezes the snapshot; late-arrivers
+    observe the persisted value on recheck and no-op (WIKI-147 R6 B1).
     """
 
     existing_at, existing_seq = _load_run_baseline(run_id)
     if existing_seq is not None and existing_at is not None:
         return existing_at, existing_seq
-    path = _baseline_path(run_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps({"at": latest_at, "seq": latest_seq}, sort_keys=True)
-    fd, raw_tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    tmp = Path(raw_tmp)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, path)
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        raise
-    # A concurrent writer's replace() may have won the race; return whatever
-    # is now durable so every caller sees the same snapshot.
-    stored_at, stored_seq = _load_run_baseline(run_id)
-    if stored_seq is not None and stored_at is not None:
-        return stored_at, stored_seq
-    return latest_at, latest_seq
+    with _baseline_lock(run_id):
+        existing_at, existing_seq = _load_run_baseline(run_id)
+        if existing_seq is not None and existing_at is not None:
+            return existing_at, existing_seq
+        path = _baseline_path(run_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps({"at": latest_at, "seq": latest_seq}, sort_keys=True)
+        fd, raw_tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        tmp = Path(raw_tmp)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
+        return latest_at, latest_seq
 
 
 def _snapshot_startup_baselines() -> None:

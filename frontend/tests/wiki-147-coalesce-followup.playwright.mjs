@@ -159,6 +159,27 @@ async function main() {
   /** @type {(() => void) | null} */
   let holdResolvedNotifier = null;
 
+  // Track the highest latest_event_seq the UI has *actually* fetched from
+  // /api/agents for our worker. R6: we must wait for this to reach 12 while
+  // the first POST is still held — that proves in-flight coalescing, not
+  // coalesce-after-fresh-cycle. Without this gate, releasing after ~360ms
+  // could let the old buggy code path pass by firing a fresh seq=12 POST
+  // once the first controller cleared.
+  let uiObservedSeq = 0;
+  page.on("response", async (response) => {
+    const url = response.url();
+    if (!url.endsWith("/api/agents")) return;
+    if (response.request().method() !== "GET") return;
+    try {
+      const body = await response.json();
+      const row = body?.workers?.find?.((worker) => worker.ticket === WORKER);
+      const seq = typeof row?.latest_event_seq === "number" ? row.latest_event_seq : 0;
+      if (seq > uiObservedSeq) uiObservedSeq = seq;
+    } catch {
+      /* body may still be streaming or non-json */
+    }
+  });
+
   await page.route(viewedRoute, async (route) => {
     attemptCount += 1;
     const request = route.request();
@@ -218,12 +239,42 @@ async function main() {
     for (const seq of [4, 7, 12]) {
       await appendDurableEvent(fixtures, RUN_ID, seq, runCreatedAt);
       supervisor.emit({ type: "session", ticket: WORKER, surface: "agents", run_id: RUN_ID });
-      // Give the frontend a beat to run the effect and coalesce.
-      await new Promise((resolve) => setTimeout(resolve, 120));
+      // Small yield so the SSE event dispatches an /api/agents fetch.
+      await new Promise((resolve) => setTimeout(resolve, 40));
     }
 
-    // Release the held POST — the R5 fix must observe targetSeq>seq and
-    // issue a follow-up POST at the coalesced max.
+    // R6 tightening: WAIT until the UI has actually consumed a /api/agents
+    // response containing latest_event_seq >= 12 for our worker WHILE the
+    // first POST is still held. Only then does the coalesce path in
+    // viewedInflight get to bump targetSeq to 12 in-flight. The prior
+    // ~360ms sleep let the buggy code pass by clearing the controller
+    // first and firing a fresh POST at seq=12 (coalesce-after-cycle, not
+    // coalesce-during-flight).
+    assert.ok(pendingHold, "first POST must still be held before UI observes seq=12");
+    const observeDeadline = Date.now() + 6_000;
+    while (uiObservedSeq < 12 && Date.now() < observeDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.ok(
+      uiObservedSeq >= 12,
+      `UI must consume seq=12 while first POST held. observed=${uiObservedSeq}`,
+    );
+    assert.ok(pendingHold, "first POST must still be held while UI consumes seq=12");
+    // One more beat so the mark-viewed effect runs after the /api/agents
+    // response commits (React state batch + effect fire). Still holding.
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    // Attempt count must still be 1 — during the held first POST the coalesce
+    // path updates targetSeq inside the inflight controller, it must NOT fire
+    // a new POST. If it did, that would be the pre-R5 double-POST bug.
+    assert.equal(
+      attemptCount,
+      1,
+      `no second POST may fire while first is held (coalesce in-flight). attempts=${JSON.stringify(attemptedSeqs)}`,
+    );
+
+    // Now release the held POST — the R5 follow-up path must observe
+    // targetSeq(12) > seq(1) after success and issue exactly one
+    // coalesced follow-up POST at seq=12.
     assert.ok(pendingHold, "expected first POST still held");
     pendingHold.resolve();
     pendingHold = null;
