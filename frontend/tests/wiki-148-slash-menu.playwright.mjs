@@ -393,7 +393,10 @@ async function main() {
       throw new Error("dismiss button should hide notice");
     }
 
-    // archive — outcome flows through to backend
+    // archive — outcome flows through to backend AND surfaces as a
+    // visible success notice (round-8 REVIEW [MEDIUM]:396 — destructive
+    // /archive must have the same success-summary coverage /gate does,
+    // else a per-command notice-skip could regress silently).
     await composer.focus();
     await composer.press("/");
     await composer.pressSequentially("archive", { delay: 10 });
@@ -406,6 +409,28 @@ async function main() {
     await page.waitForFunction(() => document.querySelector(".composer-command-form") === null);
     if (archivePayloads.length !== 1) {
       throw new Error(`expected 1 archive call, got ${archivePayloads.length}`);
+    }
+    const archiveNotice = page.locator(".composer-command-notice");
+    await archiveNotice.waitFor({ state: "visible", timeout: 2000 });
+    const archiveSummary = await archiveNotice
+      .locator(".composer-command-notice-summary")
+      .textContent();
+    if (!archiveSummary || !archiveSummary.includes("archived WIKI-149 (closed)")) {
+      throw new Error(
+        `archive success notice missing/wrong summary: "${archiveSummary}"`
+      );
+    }
+    const archiveDetail = await archiveNotice
+      .locator(".composer-command-notice-detail")
+      .textContent();
+    if (!archiveDetail || !archiveDetail.toLowerCase().includes("archived")) {
+      throw new Error(
+        `archive success notice missing/wrong detail: "${archiveDetail}"`
+      );
+    }
+    await archiveNotice.locator(".composer-command-notice-dismiss").click();
+    if (await page.locator(".composer-command-notice").count()) {
+      throw new Error("archive notice dismiss should hide notice");
     }
     let parsedArchive = null;
     try {
@@ -548,18 +573,31 @@ async function main() {
     await busyForm.locator(".composer-command-submit").click();
     const cancelBtn = page.locator(".composer-command-cancel");
     await cancelBtn.waitFor();
-    // busy → cancel button disabled
+    // busy → cancel button disabled. waitForFunction signature is
+    // (pageFunction, arg, options); the options object MUST be the
+    // third argument or Playwright treats it as `arg` and falls back
+    // to the 30-second default — mutation failures would masquerade
+    // as flaky slowness (round-8 REVIEW [MEDIUM]:562).
     await page.waitForFunction(
       () => {
         const btn = document.querySelector(".composer-command-cancel");
         return !!btn && btn.hasAttribute("disabled");
       },
+      undefined,
       { timeout: 2000 }
     );
     // clicking a disabled button is a no-op
     await cancelBtn.click({ force: true }).catch(() => {});
-    // Escape must ALSO be a no-op while busy
-    await page.locator(".composer-command-form").press("Escape");
+    // Escape must ALSO be a no-op while busy. Round-8 REVIEW [MEDIUM]:
+    // pressing Escape on the <form> itself does nothing (forms are not
+    // focus-navigable, so the key event never bubbles); focus a live
+    // enabled descendant — the message textarea stays enabled while
+    // the request is in flight — so the busy guard in `handleKeyDown`
+    // is actually exercised. Prior version passed even when both
+    // production guards were removed.
+    const busyMessage = busyForm.getByLabel("message");
+    await busyMessage.focus();
+    await busyMessage.press("Escape");
     await delay(100);
     if (!(await page.locator(".composer-command-form").count())) {
       throw new Error("Escape must not close the form while a command is in flight");
