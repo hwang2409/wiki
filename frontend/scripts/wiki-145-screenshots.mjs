@@ -1,13 +1,11 @@
 import { spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
-import { mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
 
 import {
-  codexAssistant,
-  codexUser,
   makeFixtureRoot,
   startBackend,
   writeQueue,
@@ -15,7 +13,24 @@ import {
 } from "./wiki32-harness.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
-const PYTHON = path.join(ROOT, ".venv", "bin", "python");
+
+function resolvePython() {
+  const candidates = [
+    process.env.WIKI_PYTHON,
+    path.resolve(ROOT, ".venv", "bin", "python"),
+    path.resolve(ROOT, "..", "..", "..", ".venv", "bin", "python"),
+  ].filter(Boolean);
+  const found = candidates.find((candidate) => existsSync(candidate));
+  if (!found) {
+    throw new Error(
+      `No Python runtime found for artifact fixture worker. Tried: ${candidates.join(", ")}. ` +
+        `Set WIKI_PYTHON to override.`,
+    );
+  }
+  return found;
+}
+
+const PYTHON = resolvePython();
 const OUT = "/tmp";
 const TICKET = "WIKI-145";
 const RUN_ID = "00000000-0000-4000-8000-000000000145";
@@ -28,10 +43,15 @@ const THEMES = [
 // -------- fixture setup --------
 
 function artifactInputs() {
-  const diffLines = [];
+  const diffLines = [
+    "diff --git a/src/artifact.ts b/src/artifact.ts",
+    "--- a/src/artifact.ts",
+    "+++ b/src/artifact.ts",
+    "@@ -1,3 +1,3 @@",
+  ];
   for (let i = 0; i < 120; i += 1) {
-    diffLines.push(`- old line ${i}`);
-    diffLines.push(`+ new line ${i}`);
+    diffLines.push(`-const oldValue${i} = ${i};`);
+    diffLines.push(`+const newValue${i} = ${i * 2};`);
   }
   return [
     {
@@ -39,7 +59,7 @@ function artifactInputs() {
       title: "Parser change",
       caption: "Unified diff (oversized fixture, opens in panel)",
       payload: {
-        language: "typescript",
+        language: "diff",
         filename: "src/artifact.ts",
         source: diffLines.join("\n") + "\n",
       },
@@ -99,9 +119,22 @@ const CHAT_MD = [
 
 async function buildTranscript(fixtures, artifactResults) {
   const rows = [
-    { type: "mode", mode: "normal", sessionId: "wiki-145-chat" },
-    codexUser("Rewrite this helper to use tabular nums.", "2026-07-22T15:00:00Z"),
-    codexAssistant(CHAT_MD, "2026-07-22T15:00:01Z"),
+    {
+      type: "user",
+      timestamp: "2026-07-22T15:00:00Z",
+      message: {
+        role: "user",
+        content: "Rewrite this helper to use tabular nums.",
+      },
+    },
+    {
+      type: "assistant",
+      timestamp: "2026-07-22T15:00:01Z",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: CHAT_MD }],
+      },
+    },
     {
       type: "assistant",
       timestamp: "2026-07-22T15:00:02Z",
@@ -290,16 +323,56 @@ try {
     await page.waitForTimeout(400);
     await captureSurface(page, theme.label, "dashboard");
 
-    // (d) artifact panel: open via URL query params (panelStateFromUrl restores on mount).
-    const artifactId = artifactResults[0].artifactId;
-    const artifactHash = `?panel=${TICKET}&artifact=${artifactId}&tab=${artifactId}&focus=${artifactId}#/agent/${TICKET}`;
+    // (d) artifact panel: back to chat, click "Open in panel", wait for real diff payload.
     await gotoAndWait(
       page,
       backend,
-      artifactHash,
-      ".artifact-panel-tabs .artifact-panel-tab.is-active",
-      "artifact surface",
+      `#/agent/${TICKET}`,
+      ".session-scroll-inner",
+      "artifact surface (chat prep)",
     );
+    // Verify artifact block reached DOM before hunting for the button.
+    await page.waitForSelector('[data-artifact-kind]', { timeout: 15000 });
+    const artifactState = await page.evaluate(() => {
+      const block = document.querySelector("[data-artifact-kind]");
+      return {
+        kind: block?.getAttribute("data-artifact-kind") ?? null,
+        compact: block?.getAttribute("data-artifact-compact") ?? null,
+        openBtn: document.querySelectorAll("button.artifact-open-panel").length,
+      };
+    });
+    if (artifactState.compact !== "true" || artifactState.openBtn === 0) {
+      throw new Error(
+        `artifact block not oversized (kind=${artifactState.kind}, compact=${artifactState.compact}, openBtn=${artifactState.openBtn})`,
+      );
+    }
+    const openButton = page.locator("button.artifact-open-panel").first();
+    await openButton.waitFor({ state: "visible", timeout: 15000 });
+    await openButton.click();
+    // Real payload gates: active tab + diff detail renderer with real content.
+    await page.waitForSelector(
+      ".artifact-panel-tabs .artifact-panel-tab.is-active",
+      { timeout: 15000 },
+    );
+    await page.waitForSelector(
+      ".artifact-detail-diff .wiki-diff",
+      { timeout: 15000, state: "visible" },
+    );
+    const panelState = await page.evaluate(() => ({
+      missing: document.querySelectorAll(".artifact-panel-missing").length,
+      diffInserts: document.querySelectorAll(".artifact-detail-diff .wiki-diff .diff-code-insert").length,
+      diffDeletes: document.querySelectorAll(".artifact-detail-diff .wiki-diff .diff-code-delete").length,
+    }));
+    if (panelState.missing > 0) {
+      throw new Error(
+        "artifact panel rendered fallback 'not available' message instead of real payload",
+      );
+    }
+    if (panelState.diffInserts === 0 || panelState.diffDeletes === 0) {
+      throw new Error(
+        `artifact panel expected real diff content, got inserts=${panelState.diffInserts} deletes=${panelState.diffDeletes}`,
+      );
+    }
     await verifyTheme(page, theme.id);
     await page.waitForTimeout(500);
     await captureSurface(page, theme.label, "artifact");
