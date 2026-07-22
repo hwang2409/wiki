@@ -22,18 +22,18 @@ Todo:
 - [P2] WIKI-144 badge sweep: audit + unify status badges across dashboard, session-header, artifact-list — reuse WIKI-143 design tokens; remove redundant variants, consistent color/weight/shape
 - [P2] WIKI-146 command palette (Cmd-K): fuzzy search across sessions/tickets/artifacts/vault notes; keyboard-first modal, results ranked by recency+match; opens artifact/session/note on Enter
 - [P2] WIKI-147 session-list unread dot: left-edge dot on sessions with events since last-viewed_at; per-session last_viewed_at persisted (backend + frontend); clears on session open
-- [P2] WIKI-148 composer slash menu: inline /steer /spawn /gate /archive chips with arg hints + tab-complete; parses to structured MCP call; fuzzy filter as user types
 - [P2] WIKI-149 code-block copy button + diff artifact kind: hover copy on ``` blocks; new artifact renderer syntax-colors +/- with hunk headers; register kind:diff in artifact router
 - [P1] WIKI-150 polish census: audit every visible Wiki.app surface (panel/header/modal/empty/loading/error state), rate polish 1-5, catalog copy leakage + micro-inconsistency + dev cruft; census doc in vault/wiki/polish-census.md fans out into 8-12 small polish tickets
-- [P1] WIKI-151 nav + sidebar IA: ribbon zones, sidebar shell, file/workspace states, tab header, session list — three grouped ribbon zones, one sidebar frame across modes, Active/History run grouping, no silent workspace fallback (depends WIKI-147)
 - [P1] WIKI-152 agent-session chrome: header, provider inspector, action-required card, composer help, footer/status rail — kill 'Provider stream', raw/normalized counts, request IDs, Unknown 0, format/token telemetry, tmux punctuation from default chrome; diagnostics in Run details (depends WIKI-148)
 - [P1] WIKI-154 runs management productization: Agents page/cards/banners/actions/session preview/spawn+replace dialogs — Active/History hierarchy, decision-relevant fields only, IDs/tmux/log-paths in Technical details, provider/auth notices state user impact + next action
 - [P1] WIKI-155 session + dashboard state completeness: explicit zero-event/working/error variants with recovery, dashboard table skeleton, both empty variants contextual, last-good content survives refresh failure
-- [P2] WIKI-156 artifact shell + renderer-state polish — quiet inline header, no coming-soon controls or ID-prefix titles, shared loading/error/fallback component (depends WIKI-144, WIKI-149)
 - [P2] WIKI-157 utility-page refinement: activity/graph/health/token usage — title+loading+empty+error+retry everywhere, graph keyboard/noncanvas access, git/CLI terminology secondary, no false-zero token data
 - [P1] WIKI-158 global resilience + lifecycle states: first run, backend down, provider auth, update available, notices — coherent first-run path, backend outage != empty vault, persistent sign-in state, all states announce success recovery
 - [P2] WIKI-159 keyboard + dialog accessibility: kanban/dashboard filters/destructive dialog/context menu — keyboard equivalents for drag/double-click, listbox+menu+dialog semantics complete, focus trap+restore, destructive copy describes outcome+recovery
 - [P2] WIKI-160 design-token convergence + shared controls: spacing/radii/motion/icons/shadows, settings+status components — one spacing/radius/motion vocabulary, no dup radius aliases, theme-token shadows, weights cap 600, primitives everywhere (rebase after WIKI-144)
+- [P1] WIKI-162 graph-engineering D1: schemas + linter — Finding/Verdict/Steer/Edge/Workgraph JSON Schemas at ~/me/fun/wiki/schemas/; `wiki graph lint <path>` CLI; validation gate inside merge-ready loop before Steer send; reviewer-side JSON emitter (fold prereq — reviewers switch from prose to typed Finding[] output; worker helper writes /tmp/<TICKET>-review<n>-verdict.json). Zero behavior change. D1 must land before D2/D3 (spec: vault/wiki/specs/graph-engineering.md)
+- [P1] WIKI-163 graph-engineering D2: workgraph.json + wiki-app renderer — per-ticket /tmp/agent-status/<TICKET>.workgraph.json (typed DAG of orch actions: spawn/steer/verdict/archive/handoff/monitor_alarm); durable snapshots ~/.wiki/workgraphs/; single-writer `wiki graph append` CLI (validates + updates composite_health + atomic writes both copies); Wiki.app /agents/<TICKET>/graph route rendering DAG (live view P0, replay slider P2); `graph_health` composite monitor unifies verdict-q5m + review-gap-q10m + staleness-30m re-alarms into one signal. Depends WIKI-162 (spec: vault/wiki/specs/graph-engineering.md)
+- [P2] WIKI-164 graph-engineering D3 follow-up: work-graph templates — ~/me/fun/wiki/templates/workgraphs/*.workgraph.tpl.json per ticket kind (roles/models per repo); `wiki graph select-template` picks by ticket-prefix + label; kills hardcoded-model-in-prompt pattern. DEFER trigger-DSL from spec (keep orch logic as code, template just names role+model). Ticket-prefix fallback for repos without labels (WIKI-*/MITMWEB-*/etc). Depends WIKI-162+WIKI-163 (spec: vault/wiki/specs/graph-engineering.md D3)
 
 In Progress:
 
@@ -49,6 +49,10 @@ In Progress:
 - [P2] PHO-13826 ModalSandboxBackend + PHO-13827 sandbox ownership — workers live (Modal replaces exe.dev for v0; 13828 lifecycle + 13829 egress design queued)
 - mitmweb rebuild: scope and build a clearer live proxy-traffic inspector — owner (misc)
 - WIKI-135 dashboard: implementation workers only (drop reviewers/one-shots) — owner cdx:WIKI-135 (luna)
+- [P2] WIKI-148 composer slash menu: inline /steer /spawn /gate /archive chips with arg hints + tab-complete; parses to structured MCP call; fuzzy filter as user types — cc:WIKI-148 worker (PR #119)
+- [P1] WIKI-151 nav + sidebar IA: ribbon zones, sidebar shell, file/workspace states, tab header, session list — three grouped ribbon zones, one sidebar frame across modes, Active/History run grouping, no silent workspace fallback (depends WIKI-147) — cc:WIKI-151 worker
+- [P2] WIKI-156 artifact shell + renderer-state polish — quiet inline header, no coming-soon controls or ID-prefix titles, shared loading/error/fallback component (depends WIKI-144, WIKI-149) — cc:WIKI-156 worker
+- [P2] WIKI-161 synthetic-source system messages: extend send_now with source field (fleet-monitor/supervisor-steer/mastermind); frontend renders synthetic-source turns as marker/system rows (WIKI-153 hook-message-registry style), not user avatar+bubble; LLM still wakes on turn (reliability preserved); reduces user-facing 'fake Henry' noise — cc:WIKI-161 worker
 
 Backlog:
 

@@ -23,13 +23,15 @@ Non-goals: replacing LangGraph / adopting a graph library. This spec keeps every
 
 ## Five deliverables (ordered by ROI)
 
-D1. `Finding` + edge-payload JSON schemas + linter.
-D2. Per-ticket `workgraph.json` + wiki-app renderer + composite-health monitor.
-D3. Work-graph templates per ticket kind.
-D4. Worker-side pre-tool zone-isolation hook.
-D5. Cross-orchestrator meta-registry + global `/agents` view.
+D1. `Finding` + edge-payload JSON schemas + linter. — **WIKI-162** (P1, filed 2026-07-22)
+D2. Per-ticket `workgraph.json` + wiki-app renderer + composite-health monitor. — **WIKI-163** (P1, depends WIKI-162)
+D3. Work-graph templates per ticket kind. — **WIKI-164** (P2, depends WIKI-162+WIKI-163, trigger-DSL deferred)
+D4. Worker-side pre-tool zone-isolation hook. — unfiled, parallel work stream
+D5. Cross-orchestrator meta-registry + global `/agents` view. — unfiled, defer until D1-D4 land
 
 Ship in D1 → D2 → D3 → D4 → D5 order. D1 must land first because D2 and D3 both reference its schemas.
+
+**Wiki orchestrator assessment 2026-07-22**: full spec is ~10-15 solid weeks single-person, not "5 deliverables". D1+D2 are the real ROI arc (~4 weeks). D3 trigger-DSL deferred (keep orch logic as code, template just names role+model per repo). D4 (isolation hook) recommended as parallel work stream. D5 (unified view) deferred until D1-D4 land. Prereq folded into D1: reviewers currently emit prose — schema requires typed `Finding[]` JSON, so D1 scope includes reviewer-prompt rewrite + worker-side helper (`/tmp/<TICKET>-review<n>-verdict.json`). Verdict signing (open Q1) promoted from "nice-to-have" to v1. Selector fallback = ticket-prefix, not label (Wiki/misc/mitm tickets aren't labeled).
 
 ## D1 — Schemas + linter
 
