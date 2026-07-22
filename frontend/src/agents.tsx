@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import {
   AlertTriangle,
   Archive,
@@ -15,6 +15,7 @@ import {
   controlAgent,
   getAgents,
   getAgentModels,
+  markRunViewed,
   spawnAgentOrchestrator,
   spawnAgentWorker,
 } from "./api";
@@ -38,7 +39,18 @@ import type { SidebarTarget } from "./session";
 import { BranchPill } from "./branch-pill";
 import { StatusBadge } from "./status-badge";
 
+declare global {
+  interface Window {
+    __wiki147CoalesceObserved?: {
+      runId: string;
+      targetSeq: number;
+      count: number;
+    };
+  }
+}
+
 const STALE_SECONDS = 5 * 60;
+
 const SPAWN_TICKET_PATTERN = /^[A-Z0-9-]+$/;
 const ORCH_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 const DEFAULT_WORKDIR = "/Users/henry/me/fun/wiki";
@@ -1511,6 +1523,23 @@ export function AgentsSidebar({
   const [fetchedWorkers, setFetchedWorkers] = useState<AgentWorker[] | null>(null);
   const [fetchedOrchestrators, setFetchedOrchestrators] = useState<Orchestrator[]>([]);
   const [fetchedArchived, setFetchedArchived] = useState<ArchivedWorker[]>([]);
+  // Keyed by run_id (durable). Value is the observed seq we tried to mark
+  // viewed at — comparing seqs (monotonic int) sidesteps timestamp-format
+  // and wall-clock issues from the round 1 implementation.
+  const [viewedOverrides, setViewedOverrides] = useState<Record<string, number>>({});
+  // Runs whose mark-viewed request permanently failed (all retries exhausted).
+  // Bounded to prevent the round 2 H1 request loop: on failure we keep the
+  // optimistic override intact AND set this flag so the effect stops firing;
+  // the row renders a distinct failed indicator so the user can see why.
+  const [viewedFailed, setViewedFailed] = useState<Record<string, boolean>>({});
+  // One controller per run kept alive across backoff. `targetSeq` coalesces
+  // the HIGHEST seq observed while inflight (bursts collapse to a single
+  // additional post); `attempts` counts total requests within this chain and
+  // caps at MAX_ATTEMPTS so an SSE burst never widens the retry budget.
+  // WIKI-147 R4 H1.
+  type ViewedController = { targetSeq: number; attempts: number };
+  const viewedInflight = useRef<Map<string, ViewedController>>(new Map());
+  const viewedRetryTimers = useRef<Map<string, number>>(new Map());
 
   useEffect(() => {
     if (data) return;
@@ -1534,6 +1563,128 @@ export function AgentsSidebar({
   const workers = data?.workers ?? fetchedWorkers;
   const orchestrators = data?.orchestrators ?? fetchedOrchestrators;
   const archived = data?.archived ?? fetchedArchived;
+
+  useEffect(() => {
+    if (!activeTicket || workers === null) return;
+    const worker = workers.find((row) => row.ticket === activeTicket);
+    const runId = worker?.run_id ?? null;
+    const observedSeq = worker?.latest_event_seq ?? null;
+    if (!runId || observedSeq === null) return;
+
+    // Round 2 H1: once a run's mark-viewed has permanently failed, do not
+    // keep firing new requests each render. The optimistic override remains
+    // (so the row still visually reflects the user's action) and the failed
+    // badge tells them the server didn't persist the state.
+    if (viewedFailed[runId]) return;
+
+    // Skip if we (or the server) have already recorded a viewed seq that
+    // covers everything visible in this refresh. Prevents the effect from
+    // POSTing on every /api/agents refresh (the round 1 regression), while
+    // still re-POSTing when the active session's seq advances.
+    const priorOverride = viewedOverrides[runId];
+    const priorServer = worker?.last_viewed_seq ?? null;
+    const priorSeq = Math.max(priorOverride ?? -1, priorServer ?? -1);
+    if (priorSeq >= observedSeq) return;
+
+    setViewedOverrides((current) => {
+      const prior = current[runId];
+      if (prior !== undefined && prior >= observedSeq) return current;
+      return { ...current, [runId]: observedSeq };
+    });
+
+    const existing = viewedInflight.current.get(runId);
+    if (existing) {
+      // Controller alive — coalesce the target seq monotonically. No new
+      // request fires; the in-flight (or scheduled) attempt picks up the
+      // highest seq at post-time. Attempt cap stays intact.
+      if (observedSeq > existing.targetSeq) existing.targetSeq = observedSeq;
+      // WIKI-147 R7 H1: UI-owned signal that the coalesce-during-flight
+      // branch actually ran. Test observers wait on this to release the
+      // held first POST — proves React committed the bumped targetSeq
+      // while the initial controller was still alive, not after a fresh
+      // cycle. Behavioral no-op.
+      const prior = window.__wiki147CoalesceObserved;
+      const priorCount = prior && prior.runId === runId ? prior.count : 0;
+      window.__wiki147CoalesceObserved = {
+        runId,
+        targetSeq: existing.targetSeq,
+        count: priorCount + 1,
+      };
+      return;
+    }
+
+    const MAX_ATTEMPTS = 3;
+    const backoffMs = (attempt: number) => 500 * 2 ** (attempt - 1);
+    const controller: ViewedController = {
+      targetSeq: observedSeq,
+      attempts: 0,
+    };
+    viewedInflight.current.set(runId, controller);
+
+    const markFailed = () => {
+      viewedInflight.current.delete(runId);
+      setViewedFailed((current) => {
+        if (current[runId]) return current;
+        return { ...current, [runId]: true };
+      });
+    };
+
+    const runPost = (): void => {
+      const state = viewedInflight.current.get(runId);
+      if (!state) return;
+      state.attempts += 1;
+      const seq = state.targetSeq;
+      markRunViewed(runId, seq)
+        .then((result) => {
+          setViewedOverrides((current) => {
+            const prior = current[runId] ?? -1;
+            const next = Math.max(prior, result.last_viewed_seq, seq);
+            if (next <= prior) return current;
+            return { ...current, [runId]: next };
+          });
+          const active = viewedInflight.current.get(runId);
+          // Coalesced target advanced while THIS POST was in flight — the
+          // just-persisted seq is now stale. Issue a follow-up against the
+          // same attempt budget so the max target eventually reaches the
+          // server (WIKI-147 R5 H1). Success on the follow-up walks the
+          // override forward; budget exhaustion falls through to the failed
+          // indicator, matching catch()-path semantics.
+          if (active && active.targetSeq > seq) {
+            if (active.attempts >= MAX_ATTEMPTS) {
+              markFailed();
+              return;
+            }
+            runPost();
+            return;
+          }
+          viewedInflight.current.delete(runId);
+        })
+        .catch(() => {
+          const active = viewedInflight.current.get(runId);
+          if (!active) return;
+          if (active.attempts < MAX_ATTEMPTS) {
+            const delay = backoffMs(active.attempts);
+            const timer = window.setTimeout(() => {
+              viewedRetryTimers.current.delete(runId);
+              runPost();
+            }, delay);
+            viewedRetryTimers.current.set(runId, timer);
+            return;
+          }
+          markFailed();
+        });
+    };
+
+    runPost();
+  }, [activeTicket, workers, viewedOverrides, viewedFailed]);
+
+  useEffect(() => {
+    const timers = viewedRetryTimers.current;
+    return () => {
+      for (const handle of timers.values()) window.clearTimeout(handle);
+      timers.clear();
+    };
+  }, []);
 
   if (workers === null) {
     return (
@@ -1559,20 +1710,51 @@ export function AgentsSidebar({
     onDragEnd: () => onDragEnd?.(),
   });
 
-  const workerRow = (worker: AgentWorker, indent: boolean) => (
-    <button
-      className={`nav-agent${indent ? " is-owned" : ""}${activeTicket === worker.ticket ? " is-active" : ""}`}
-      key={worker.ticket}
-      type="button"
-      onClick={() => onOpen(worker.ticket)}
-      {...dragProps(worker.ticket)}
-    >
-      <span className={`nav-agent-dot is-${worker.state ?? "unknown"}`} />
-      <span className="nav-agent-ticket">{worker.ticket}</span>
-      <span className="nav-agent-meta">{stateLabel(worker)}</span>
-      <span className="nav-agent-age tabular-nums">{ageLabel(worker.status_age_seconds)}</span>
-    </button>
-  );
+  const hasUnread = (worker: AgentWorker): boolean => {
+    const latest = worker.latest_event_seq;
+    if (latest === null || latest === undefined) return false;
+    const override = worker.run_id ? viewedOverrides[worker.run_id] : undefined;
+    const serverSeq = worker.last_viewed_seq;
+    const viewed = Math.max(override ?? -1, serverSeq ?? -1);
+    if (viewed < 0) return true;
+    return latest > viewed;
+  };
+
+  const workerRow = (worker: AgentWorker, indent: boolean) => {
+    const unread = hasUnread(worker);
+    const failed = worker.run_id ? viewedFailed[worker.run_id] === true : false;
+    return (
+      <button
+        className={`nav-agent${indent ? " is-owned" : ""}${activeTicket === worker.ticket ? " is-active" : ""}${unread ? " has-unread" : ""}${failed ? " has-viewed-failure" : ""}`}
+        key={worker.ticket}
+        type="button"
+        onClick={() => onOpen(worker.ticket)}
+        title={failed ? "Failed to persist read state to the server" : undefined}
+        {...dragProps(worker.ticket)}
+      >
+        {unread ? (
+          <>
+            <span aria-hidden="true" className="nav-agent-unread" data-testid="nav-agent-unread" />
+            <span className="sr-only">unread</span>
+          </>
+        ) : null}
+        {failed ? (
+          <>
+            <span
+              aria-hidden="true"
+              className="nav-agent-unread is-failed"
+              data-testid="nav-agent-viewed-failed"
+            />
+            <span className="sr-only">read state failed to save</span>
+          </>
+        ) : null}
+        <span className={`nav-agent-dot is-${worker.state ?? "unknown"}`} />
+        <span className="nav-agent-ticket">{worker.ticket}</span>
+        <span className="nav-agent-meta">{stateLabel(worker)}</span>
+        <span className="nav-agent-age tabular-nums">{ageLabel(worker.status_age_seconds)}</span>
+      </button>
+    );
+  };
 
   return (
     <div className="nav-agents">

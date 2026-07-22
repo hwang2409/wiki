@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import fcntl
 import json
 import os
 import re
 import stat
 import subprocess
+import tempfile
+import threading
 import time
-from contextlib import asynccontextmanager
+from collections.abc import Iterator
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -90,6 +94,12 @@ async def lifespan(_app: FastAPI):
     configured_backend = os.environ.get("WIKI_BACKEND_URL")
     if configured_backend:
         backend_runtime.publish_backend_url(configured_backend)
+    # Stamp the WIKI-147 unread-dot deploy cutoff BEFORE any request handling
+    # and snapshot per-run viewed baselines for every pre-deploy run so events
+    # arriving between startup and the first /api/agents call still render as
+    # unread (WIKI-147 R5 B1).
+    _ensure_deploy_timestamp()
+    _snapshot_startup_baselines()
     terminal.refresh_boot_token()
     # Prime the tracker so the first /api/providers/health request is populated.
     try:
@@ -769,11 +779,29 @@ class NoteLinks(BaseModel):
 
 AGENT_REGISTRY_PATH = Path(os.environ.get("WIKI_AGENT_REGISTRY_PATH") or "/tmp/agent-registry.json")
 AGENT_STATUS_DIR = Path(os.environ.get("WIKI_AGENT_STATUS_DIR") or "/tmp/agent-status")
+_DEFAULT_RUNTIME_DIR = Path(
+    os.environ.get("WIKI_AGENT_RUNTIME_DIR") or Path.home() / ".wiki" / "agent-runtime"
+)
+AGENT_RUNTIME_DIR = _DEFAULT_RUNTIME_DIR
+AGENT_RUNS_DIR = Path(os.environ.get("WIKI_AGENT_RUNS_DIR") or AGENT_RUNTIME_DIR / "runs")
+AGENT_VIEWED_PATH = Path(
+    os.environ.get("WIKI_AGENT_VIEWED_PATH") or AGENT_RUNTIME_DIR / "agent-viewed.json"
+)
+AGENT_DEPLOY_MARKER_PATH = Path(
+    os.environ.get("WIKI_AGENT_DEPLOY_MARKER_PATH")
+    or AGENT_RUNTIME_DIR / "deploy-timestamp.txt"
+)
+# Populated at supervisor startup by :func:`_ensure_deploy_timestamp` and used
+# by :func:`_resolve_viewed_fields` to classify legacy vs post-deploy runs.
+_DEPLOY_TIMESTAMP: str | None = None
 AGENT_ARCHIVE_DIR = Path(
     os.environ.get("WIKI_AGENT_ARCHIVE_DIR") or Path.home() / "me" / "fun" / "agent-archive"
 )
 AGENT_TMP_DIR = Path(os.environ.get("WIKI_AGENT_TMP_DIR") or "/tmp")
 SUPERVISOR_CLIENT = SupervisorClient(RuntimePaths.from_env())
+RUN_ID_PATTERN = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
 ARCHIVE_TS_PATTERN = re.compile(r"^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})$")
 ANSI_PATTERN = re.compile(
     r"\x1b\[[0-9;?]*[ -/]*[@-~]"  # CSI incl. space-intermediate forms (e.g. ESC[0 q)
@@ -917,6 +945,321 @@ def read_agent_status(ticket: str) -> dict | None:
         return data
     except (OSError, ValueError):
         return None
+
+
+ViewedEntry = dict[str, Any]  # {"seq": int, "at": str}
+
+
+def _viewed_entry(value: Any) -> ViewedEntry | None:
+    if not isinstance(value, dict):
+        return None
+    seq = value.get("seq")
+    at = value.get("at")
+    if not isinstance(seq, int) or seq < 0:
+        return None
+    if not isinstance(at, str):
+        return None
+    return {"seq": seq, "at": at}
+
+
+@contextmanager
+def _viewed_lock(exclusive: bool) -> Iterator[Any]:
+    """Serialize read-modify-write cycles on the viewed store.
+
+    A separate lock file (never truncated) keeps the lock intact while
+    ``agent-viewed.json`` is atomically replaced.
+    """
+
+    AGENT_VIEWED_PATH.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = AGENT_VIEWED_PATH.with_suffix(AGENT_VIEWED_PATH.suffix + ".lock")
+    flags = os.O_RDWR | os.O_CREAT
+    fd = os.open(lock_path, flags, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        try:
+            yield fd
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _read_viewed_map_locked() -> dict[str, ViewedEntry]:
+    """Caller MUST already hold the viewed lock."""
+
+    try:
+        data = json.loads(AGENT_VIEWED_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    result: dict[str, ViewedEntry] = {}
+    for run_id, entry in data.items():
+        if not isinstance(run_id, str) or run_id.startswith("_"):
+            continue
+        if not RUN_ID_PATTERN.fullmatch(run_id):
+            continue
+        parsed = _viewed_entry(entry)
+        if parsed is None:
+            continue
+        result[run_id] = parsed
+    return result
+
+
+def _read_viewed_map() -> dict[str, ViewedEntry]:
+    with _viewed_lock(exclusive=False):
+        return _read_viewed_map_locked()
+
+
+def _write_viewed_map_locked(data: dict[str, Any]) -> None:
+    """Caller MUST already hold the viewed lock (exclusive)."""
+
+    AGENT_VIEWED_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fd, raw_tmp = tempfile.mkstemp(
+        prefix=f".{AGENT_VIEWED_PATH.name}.",
+        dir=AGENT_VIEWED_PATH.parent,
+    )
+    tmp = Path(raw_tmp)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, AGENT_VIEWED_PATH)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _isoformat_utc(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def _load_run_freshness(run_id: str | None) -> tuple[str | None, int | None]:
+    """Read the durable ``updated_at`` + normalized event count for a run.
+
+    Returns ``(None, None)`` when the run has no supervisor record — legacy
+    tmux workers, drift entries, or archived runs whose ``runs/<id>/run.json``
+    was removed. Never falls back to status-file ``mtime`` (WIKI-147 R2 B2).
+    """
+
+    if not run_id or not RUN_ID_PATTERN.fullmatch(run_id):
+        return None, None
+    run_path = AGENT_RUNS_DIR / run_id / "run.json"
+    try:
+        payload = json.loads(run_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None, None
+    if not isinstance(payload, dict):
+        return None, None
+    updated_at = payload.get("updated_at")
+    seq = payload.get("normalized_event_count")
+    if not isinstance(updated_at, str):
+        updated_at = None
+    if not isinstance(seq, int):
+        seq = None
+    return updated_at, seq
+
+
+def _run_exists(run_id: str) -> bool:
+    return (AGENT_RUNS_DIR / run_id / "run.json").is_file()
+
+
+def _ensure_deploy_timestamp() -> str:
+    """Return the wiki-supervisor deploy cutoff, initializing the marker if absent.
+
+    Called from the FastAPI lifespan on boot so the cutoff is stamped BEFORE any
+    request handling. Runs created before this timestamp are classified as
+    "seen already" (pre-deploy backfill); runs created at/after render unread on
+    first paint. Persisted to a marker file so restarts keep the same cutoff —
+    a reboot must not silently re-classify runs.
+    """
+
+    global _DEPLOY_TIMESTAMP
+    if _DEPLOY_TIMESTAMP is not None:
+        return _DEPLOY_TIMESTAMP
+    try:
+        existing = AGENT_DEPLOY_MARKER_PATH.read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):
+        existing = ""
+    if existing:
+        _DEPLOY_TIMESTAMP = existing
+        return existing
+    now_iso = datetime.now(tz=timezone.utc).isoformat()
+    AGENT_DEPLOY_MARKER_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fd, raw_tmp = tempfile.mkstemp(
+        prefix=f".{AGENT_DEPLOY_MARKER_PATH.name}.",
+        dir=AGENT_DEPLOY_MARKER_PATH.parent,
+    )
+    tmp = Path(raw_tmp)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(now_iso)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, AGENT_DEPLOY_MARKER_PATH)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+    _DEPLOY_TIMESTAMP = now_iso
+    return now_iso
+
+
+def _load_run_created_at(run_id: str) -> str | None:
+    """Return ``created_at`` from ``runs/<id>/run.json`` or ``None``."""
+
+    if not RUN_ID_PATTERN.fullmatch(run_id):
+        return None
+    try:
+        payload = json.loads((AGENT_RUNS_DIR / run_id / "run.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    created_at = payload.get("created_at")
+    return created_at if isinstance(created_at, str) else None
+
+
+def _baseline_path(run_id: str) -> Path:
+    return AGENT_RUNS_DIR / run_id / "viewed-baseline.json"
+
+
+_BASELINE_LOCKS: dict[str, threading.Lock] = {}
+_BASELINE_LOCKS_GUARD = threading.Lock()
+
+
+def _baseline_lock(run_id: str) -> threading.Lock:
+    with _BASELINE_LOCKS_GUARD:
+        lock = _BASELINE_LOCKS.get(run_id)
+        if lock is None:
+            lock = threading.Lock()
+            _BASELINE_LOCKS[run_id] = lock
+        return lock
+
+
+def _load_run_baseline(run_id: str) -> tuple[str | None, int | None]:
+    """Return ``(baseline_at, baseline_seq)`` for a pre-deploy run, if written."""
+
+    try:
+        payload = json.loads(_baseline_path(run_id).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None, None
+    if not isinstance(payload, dict):
+        return None, None
+    seq = payload.get("seq")
+    at = payload.get("at")
+    if not isinstance(seq, int) or seq < 0:
+        return None, None
+    if not isinstance(at, str):
+        return None, None
+    return at, seq
+
+
+def _ensure_run_baseline(
+    run_id: str,
+    latest_at: str,
+    latest_seq: int,
+) -> tuple[str, int]:
+    """Freeze a per-run viewed baseline on FIRST observation and return it.
+
+    Idempotent: once ``runs/<id>/viewed-baseline.json`` exists, subsequent calls
+    return the persisted value verbatim — future events with seq > baseline_seq
+    then render as unread (WIKI-147 R4 B1). Writes atomically via a tempfile +
+    ``os.replace`` so concurrent readers never see a half-written sidecar
+    (WIKI-147 R5 B1). Concurrent first-writers are serialized on a per-run
+    ``threading.Lock`` so exactly one writer freezes the snapshot; late-arrivers
+    observe the persisted value on recheck and no-op (WIKI-147 R6 B1).
+    """
+
+    existing_at, existing_seq = _load_run_baseline(run_id)
+    if existing_seq is not None and existing_at is not None:
+        return existing_at, existing_seq
+    with _baseline_lock(run_id):
+        existing_at, existing_seq = _load_run_baseline(run_id)
+        if existing_seq is not None and existing_at is not None:
+            return existing_at, existing_seq
+        path = _baseline_path(run_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps({"at": latest_at, "seq": latest_seq}, sort_keys=True)
+        fd, raw_tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        tmp = Path(raw_tmp)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
+        return latest_at, latest_seq
+
+
+def _snapshot_startup_baselines() -> None:
+    """Freeze per-run viewed baselines for every pre-deploy run at boot.
+
+    Invoked from the FastAPI lifespan BEFORE requests are served so events
+    that land between startup and the first ``/api/agents`` call still render
+    as unread — without this, request-time lazy baselining would classify
+    those events as already-viewed. Runs created at/after the deploy cutoff
+    keep a NULL baseline and their events render as unread naturally
+    (WIKI-147 R5 B1).
+    """
+
+    if not AGENT_RUNS_DIR.is_dir():
+        return
+    deploy_at = _ensure_deploy_timestamp()
+    try:
+        entries = list(AGENT_RUNS_DIR.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        run_id = entry.name
+        if not RUN_ID_PATTERN.fullmatch(run_id) or not entry.is_dir():
+            continue
+        if _baseline_path(run_id).is_file():
+            continue
+        created_at = _load_run_created_at(run_id)
+        if created_at is not None and created_at >= deploy_at:
+            continue
+        latest_at, latest_seq = _load_run_freshness(run_id)
+        if latest_at is None or latest_seq is None:
+            continue
+        try:
+            _ensure_run_baseline(run_id, latest_at, latest_seq)
+        except OSError:
+            continue
+
+
+def _resolve_viewed_fields(
+    run_id: str | None,
+    viewed_map: dict[str, ViewedEntry],
+) -> tuple[str | None, int | None, str | None, int | None]:
+    """Return ``(latest_event_at, latest_event_seq, last_viewed_at, last_viewed_seq)``.
+
+    Order of precedence for the viewed pair:
+      1. Explicit entry in ``viewed_map`` (user marked the row viewed).
+      2. Pre-deploy classification: the run was created before this supervisor's
+         deploy cutoff (or the run predates the ``created_at`` schema) — freeze
+         a per-run baseline at the first-observed durable seq so legacy sessions
+         don't show a dot after upgrade AND future events land as unread.
+         WIKI-147 R4 B1.
+      3. Post-deploy new session (created_at >= deploy cutoff) — leave ``None``
+         so any recorded event renders as unread.
+    """
+
+    latest_at, latest_seq = _load_run_freshness(run_id)
+    if not run_id or latest_at is None or latest_seq is None:
+        return latest_at, latest_seq, None, None
+    entry = viewed_map.get(run_id)
+    if entry is not None:
+        return latest_at, latest_seq, entry.get("at"), entry.get("seq")
+    created_at = _load_run_created_at(run_id)
+    deploy_at = _ensure_deploy_timestamp()
+    if created_at is None or created_at < deploy_at:
+        baseline_at, baseline_seq = _ensure_run_baseline(run_id, latest_at, latest_seq)
+        return latest_at, latest_seq, baseline_at, baseline_seq
+    return latest_at, latest_seq, None, None
 
 
 def _archive_role(session_dir: Path) -> str | None:
@@ -1218,6 +1561,7 @@ def agents() -> dict[str, object]:
         if not supervisor_alive:
             supervisor_health["detail"] = "supervisor PID is absent or not running"
     now = datetime.now(tz=timezone.utc).timestamp()
+    viewed_map = _read_viewed_map()
     workers = []
     orchestrators = []
     seen_tickets = set()
@@ -1266,6 +1610,12 @@ def agents() -> dict[str, object]:
                 }
             )
             continue
+        (
+            latest_event_at,
+            latest_event_seq,
+            last_viewed_at,
+            last_viewed_seq,
+        ) = _resolve_viewed_fields(current.get("run_id"), viewed_map)
         workers.append(
             {
                 "ticket": ticket,
@@ -1296,6 +1646,10 @@ def agents() -> dict[str, object]:
                 "status_age_seconds": (
                     int(now - status["_mtime"]) if status else None
                 ),
+                "latest_event_at": latest_event_at,
+                "latest_event_seq": latest_event_seq,
+                "last_viewed_at": last_viewed_at,
+                "last_viewed_seq": last_viewed_seq,
             }
         )
 
@@ -1306,6 +1660,15 @@ def agents() -> dict[str, object]:
             if ticket in seen_tickets:
                 continue
             status = read_agent_status(ticket)
+            # Drift entries have no run_id -> no durable freshness signal
+            # and no unread indicator (matches "derive from durable runtime
+            # events" contract; WIKI-147 R2 B2).
+            (
+                latest_event_at,
+                latest_event_seq,
+                last_viewed_at,
+                last_viewed_seq,
+            ) = _resolve_viewed_fields(None, viewed_map)
             workers.append(
                 {
                     "ticket": ticket,
@@ -1328,6 +1691,10 @@ def agents() -> dict[str, object]:
                     "status_age_seconds": (
                         int(now - status["_mtime"]) if status else None
                     ),
+                    "latest_event_at": latest_event_at,
+                    "latest_event_seq": latest_event_seq,
+                    "last_viewed_at": last_viewed_at,
+                    "last_viewed_seq": last_viewed_seq,
                 }
             )
 
@@ -1361,6 +1728,73 @@ def agents() -> dict[str, object]:
         "orchestrators": orchestrators,
         "archived": list_archived(),
         "supervisor": supervisor_health,
+    }
+
+
+class MarkViewedBody(BaseModel):
+    seq: int | None = None
+
+
+@app.post("/api/agents/runs/{run_id}/viewed")
+def mark_run_viewed(run_id: str, body: MarkViewedBody | None = None) -> dict[str, Any]:
+    """Server-authoritative "mark viewed" keyed by durable run id.
+
+    Body ``seq`` is the frontend's observed ``latest_event_seq``. The server
+    only accepts it if the run's current durable seq is at least that high,
+    and never overwrites a stored ``seq`` with a lower one (monotonic).
+
+    Returns 404 for run ids that do not exist in the runtime store — this
+    is the WIKI-147 R2 H1 contract.
+    """
+
+    if not RUN_ID_PATTERN.fullmatch(run_id):
+        raise HTTPException(status_code=400, detail="Bad run id")
+    if not _run_exists(run_id):
+        raise HTTPException(status_code=404, detail="Unknown run id")
+
+    current_at, current_seq = _load_run_freshness(run_id)
+    if current_seq is None or current_at is None:
+        raise HTTPException(status_code=404, detail="Run has no durable state")
+
+    requested_seq = body.seq if body and body.seq is not None else current_seq
+    if requested_seq < 0:
+        raise HTTPException(status_code=400, detail="seq must be non-negative")
+    # Client cannot claim to have seen events the server has not observed.
+    accepted_seq = min(requested_seq, current_seq)
+
+    with _viewed_lock(exclusive=True):
+        viewed_map = _read_viewed_map_locked()
+        prior = viewed_map.get(run_id)
+        # Monotonic: never overwrite a newer seq with an older one.
+        if prior is not None and prior.get("seq", 0) >= accepted_seq:
+            return {
+                "run_id": run_id,
+                "last_viewed_at": prior["at"],
+                "last_viewed_seq": prior["seq"],
+                "latest_event_at": current_at,
+                "latest_event_seq": current_seq,
+            }
+        now_iso = datetime.now(tz=timezone.utc).isoformat()
+        viewed_map[run_id] = {"seq": accepted_seq, "at": now_iso}
+        merged: dict[str, Any] = dict(viewed_map)
+        # Preserve the migration marker if present without letting it
+        # collide with a run entry (leading underscore already reserved
+        # by _read_viewed_map_locked).
+        try:
+            raw = json.loads(AGENT_VIEWED_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raw = {}
+        if isinstance(raw, dict):
+            for key, value in raw.items():
+                if isinstance(key, str) and key.startswith("_"):
+                    merged[key] = value
+        _write_viewed_map_locked(merged)
+    return {
+        "run_id": run_id,
+        "last_viewed_at": now_iso,
+        "last_viewed_seq": accepted_seq,
+        "latest_event_at": current_at,
+        "latest_event_seq": current_seq,
     }
 
 
