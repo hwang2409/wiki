@@ -9,6 +9,7 @@ updated: 2026-07-22
 
 ## 2026-07-22
 
+- WIKI-151 nav + sidebar IA merged (#124 squash fdf77f0, 3 rounds)
 - WIKI-148 composer slash menu merged (#119 squash 33c951a, 9 rounds)
 - PHO-14264 admin agent tool-discovery design + gated prototype merged (PR #12080 squash c0e3bdee); shipping chain PHO-14285..88 filed; PHO-14285 framework-prerequisite worker spawned (cdx luna)
 - **wiki** — WIKI-147 session-list unread dot — durable per-run viewed store keyed by run_id w/ 404 on unknown + OS flock monotonic writes; startup-baseline snapshot w/ per-run asyncio.Lock (concurrent first-writer safe); NULL-baseline for post-deploy runs; real-event freshness via supervisor SSE (no mtime hack); bounded 3-attempt exp-backoff retry w/ failed-state UI + one-controller coalesced follow-up POST; a11y unread label — PR #121 squash eb3e087f (8 review rounds + post-rebase R9)
