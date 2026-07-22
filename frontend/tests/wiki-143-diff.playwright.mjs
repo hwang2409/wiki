@@ -164,6 +164,34 @@ try {
   const inputs = [
     { kind: "code", title: "Diff sample", payload: { language: "diff", source: DIFF_SOURCE } },
     { kind: "code", title: "Oversized diff", payload: { language: "diff", source: LARGE_DIFF_SOURCE } },
+    {
+      kind: "file-list",
+      title: "Changed files",
+      payload: {
+        files: [
+          { path: "frontend/src/status-badge.tsx", label: "frontend/src/status-badge.tsx", status: "added" },
+          { path: "frontend/src/branch-pill.tsx", label: "frontend/src/branch-pill.tsx", status: "added" },
+          { path: "frontend/src/artifact-kind.ts", label: "frontend/src/artifact-kind.ts", status: "added" },
+          ...Array.from({ length: 30 }, (_, index) => ({
+            path: `frontend/src/generated/pad-${index}.tsx`,
+            label: `frontend/src/generated/pad-${index}.tsx`,
+            status: "modified",
+          })),
+        ],
+      },
+    },
+    {
+      kind: "json",
+      title: "Sample payload",
+      payload: {
+        json_data: {
+          ticket: "WIKI-143",
+          renderers: ["diff", "file-list", "json"],
+          nested: { ok: true, count: 3 },
+          padding: "wiki-143-json-padding-".repeat(200),
+        },
+      },
+    },
   ];
   const results = invokeFixtureWorker(fixtures, inputs);
   const transcript = await writeTranscript(fixtures, inputs, results);
@@ -230,52 +258,33 @@ try {
 
   await panel.screenshot({ path: path.join(OUT_DIR, "wiki-143-diff-panel.png") });
 
-  const fileListResult = await page.evaluate(() => {
-    const host = document.createElement("div");
-    host.className = "artifact-file-list-host";
-    document.body.append(host);
-    const list = document.createElement("ul");
-    list.className = "artifact-file-list";
-    const files = [
-      { path: "src/status-badge.tsx", label: "src/status-badge.tsx", status: "added" },
-      { path: "src/branch-pill.tsx", label: "src/branch-pill.tsx", status: "added" },
-    ];
-    for (const entry of files) {
-      const item = document.createElement("li");
-      item.className = "artifact-file-list-item";
-      const btn = document.createElement("button");
-      btn.className = "artifact-file-list-button";
-      btn.type = "button";
-      btn.title = entry.path;
-      btn.addEventListener("click", () => {
-        document.body.dataset.wiki143Clicked = entry.path;
-      });
-      const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-      icon.setAttribute("class", "artifact-file-list-icon lucide lucide-file");
-      icon.setAttribute("width", "12");
-      icon.setAttribute("height", "12");
-      const label = document.createElement("span");
-      label.className = "artifact-file-list-label";
-      label.textContent = entry.label;
-      const status = document.createElement("span");
-      status.className = "artifact-file-list-status";
-      status.textContent = entry.status;
-      btn.append(icon, label, status);
-      item.append(btn);
-      list.append(item);
-    }
-    host.append(list);
-    const iconCount = list.querySelectorAll(".artifact-file-list-icon").length;
-    return { iconCount, clickable: Boolean(list.querySelector("button")) };
-  });
-  assert(fileListResult.iconCount === 2, `expected 2 file icons, got ${fileListResult.iconCount}`);
-  assert(fileListResult.clickable, "file-list buttons missing");
+  const fileListBlock = page.locator('[data-artifact-kind="file-list"]').first();
+  await fileListBlock.waitFor({ state: "visible" });
+  const fileListCompact = await fileListBlock.getAttribute("data-artifact-compact");
+  assert(fileListCompact === "true", `file-list should compact at 33 entries, got data-artifact-compact=${fileListCompact}`);
+  await fileListBlock.getByRole("button", { name: "Open in panel" }).click();
+  await panel.locator(".artifact-detail-file-list").waitFor({ state: "visible" });
+  const panelFileIcons = await panel.locator(".artifact-detail-file-list .artifact-file-list-icon").count();
+  assert(panelFileIcons === 33, `panel file-list expected 33 icons, got ${panelFileIcons}`);
+  const panelFileLabels = await panel.locator(".artifact-detail-file-list .artifact-file-list-label").allTextContents();
+  assert(
+    panelFileLabels.includes("frontend/src/status-badge.tsx"),
+    `panel file-list missing expected label: ${panelFileLabels.join(",")}`,
+  );
+  const panelMissingAfterFileList = await panel.locator(".artifact-panel-missing").count();
+  assert(panelMissingAfterFileList === 0, `panel should route file-list; got .artifact-panel-missing=${panelMissingAfterFileList}`);
+  await panel.screenshot({ path: path.join(OUT_DIR, "wiki-143-file-list-panel.png") });
 
-  await page.locator(".artifact-file-list button").first().click();
-  const clickedAfter = await page.evaluate(() => document.body.dataset.wiki143Clicked ?? null);
-  assert(clickedAfter === "src/status-badge.tsx", `click handler not fired, dataset=${clickedAfter}`);
-
-  await page.locator(".artifact-file-list").screenshot({ path: path.join(OUT_DIR, "wiki-143-file-list.png") });
+  const jsonBlock = page.locator('[data-artifact-kind="json"]').first();
+  await jsonBlock.waitFor({ state: "visible" });
+  await jsonBlock.getByRole("button", { name: "Open in panel" }).click();
+  await panel.locator(".artifact-detail-json").waitFor({ state: "visible" });
+  const jsonText = await panel.locator(".artifact-detail-json code").innerText();
+  assert(jsonText.includes("\"ticket\": \"WIKI-143\""), `panel json detail missing ticket field: ${jsonText.slice(0, 200)}`);
+  assert(jsonText.includes("\"renderers\""), `panel json detail missing renderers field: ${jsonText.slice(0, 200)}`);
+  const panelMissingAfterJson = await panel.locator(".artifact-panel-missing").count();
+  assert(panelMissingAfterJson === 0, `panel should route json; got .artifact-panel-missing=${panelMissingAfterJson}`);
+  await panel.screenshot({ path: path.join(OUT_DIR, "wiki-143-json-panel.png") });
 } finally {
   if (browser) await browser.close();
   if (backend) await backend.stop();

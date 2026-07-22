@@ -10,9 +10,14 @@ export function FileListArtifactDetail({
 }) {
   const files = artifact.files ?? [];
   if (files.length === 0) {
-    return <div className="artifact-file-list-empty">No files.</div>;
+    return (
+      <div className="artifact-detail-file-list">
+        <div className="artifact-file-list-empty">No files.</div>
+      </div>
+    );
   }
   return (
+    <div className="artifact-detail-file-list">
     <ul className="artifact-file-list is-detail">
       {files.map((entry, index) => {
         const label = entry.label ?? entry.path;
@@ -46,5 +51,6 @@ export function FileListArtifactDetail({
         );
       })}
     </ul>
+    </div>
   );
 }

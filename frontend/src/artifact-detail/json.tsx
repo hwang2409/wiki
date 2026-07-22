@@ -4,8 +4,10 @@ export function JsonArtifactDetail({ artifact }: { artifact: SessionArtifact }) 
   const value = artifact.json_data !== undefined ? artifact.json_data : artifact.source;
   const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
   return (
-    <pre className="artifact-json is-detail">
-      <code>{text}</code>
-    </pre>
+    <div className="artifact-detail-json">
+      <pre className="artifact-json is-detail">
+        <code>{text}</code>
+      </pre>
+    </div>
   );
 }
