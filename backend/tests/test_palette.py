@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
+
+from fastapi import HTTPException
+from starlette.requests import Request
 
 from backend.app import palette
 
@@ -441,6 +447,64 @@ class PaletteSearchTests(unittest.TestCase):
                     archive_dir=root / "no-archive",
                     should_cancel=lambda: True,
                 )
+
+    def test_endpoint_cancels_walk_when_client_disconnects(self):
+        # Endpoint-level regression: a client disconnecting mid-walk must set
+        # the cancellation event, which the palette walk observes via
+        # `should_cancel`, which raises `PaletteCancelled`, which the endpoint
+        # converts to HTTP 499. The unit-level `test_should_cancel_aborts_walk`
+        # only proves the walk respects the flag when it is already set — this
+        # test proves the endpoint actually wires disconnect -> flag -> walk.
+        from backend.app import main as app_main
+
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/palette/search",
+            "query_string": b"q=hot",
+            "headers": [],
+        }
+
+        async def _receive() -> dict:
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        request = Request(scope, receive=_receive)
+
+        # Simulate the client disconnecting on the third disconnect poll,
+        # after the walk has definitely started polling `should_cancel`.
+        poll_count = {"n": 0}
+
+        async def fake_is_disconnected() -> bool:
+            poll_count["n"] += 1
+            return poll_count["n"] >= 3
+
+        request.is_disconnected = fake_is_disconnected  # type: ignore[method-assign]
+
+        walk_polls = {"n": 0}
+        walk_cancelled = {"raised": False}
+
+        def blocking_search(*args, should_cancel=None, **kwargs):
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                walk_polls["n"] += 1
+                if should_cancel and should_cancel():
+                    walk_cancelled["raised"] = True
+                    raise palette.PaletteCancelled()
+                time.sleep(0.02)
+            raise AssertionError("walk was never cancelled — endpoint plumbing broken")
+
+        async def drive() -> None:
+            with mock.patch("backend.app.main.agents", return_value={}), \
+                 mock.patch.object(palette, "search", side_effect=blocking_search):
+                with self.assertRaises(HTTPException) as caught:
+                    await app_main.palette_search(request, q="hot", limit=5)
+                self.assertEqual(caught.exception.status_code, 499)
+
+        asyncio.run(drive())
+
+        self.assertGreater(walk_polls["n"], 0, "walk should have started polling should_cancel")
+        self.assertTrue(walk_cancelled["raised"], "cancellation should have propagated to the walk")
+        self.assertGreaterEqual(poll_count["n"], 3, "disconnect watcher should have polled at least 3 times")
 
     def test_result_payload_shape(self):
         with tempfile.TemporaryDirectory() as tmp:
