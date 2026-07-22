@@ -295,7 +295,12 @@ async function main() {
       "j scrolled the agents view",
     );
 
-    await page.getByLabel("Ticket dashboard", { exact: true }).click();
+    // WIKI-151 moved "Ticket dashboard" under the ribbon overflow menu.
+    await page.locator('[data-testid="ribbon-more-button"]').click();
+    await page
+      .locator('[data-testid="ribbon-more-menu"]')
+      .getByText("Ticket dashboard", { exact: true })
+      .click();
     const dashboardScroller = page.locator(".pane-frame.is-focused .dashboard-table-scroll");
     await dashboardScroller.waitFor({ state: "visible" });
     await dashboardScroller.evaluate((element) => {

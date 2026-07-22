@@ -78,6 +78,15 @@ def main_cli() -> None:
             "WIKI_ACCOUNT_WATCHDOG": "off",
             "CODEX_HOME": str(account_home / "codex"),
             "CLAUDE_CONFIG_DIR": str(account_home / "claude"),
+            # WIKI-151: pin UI-state + token-cache paths under the fixture root
+            # unconditionally so every harness consumer is isolated from the
+            # developer's live ~/.wiki/ui-state.json (window layout, sidebar
+            # tab, dashboard filters, workspaces) and ~/.wiki/token-cache.json.
+            # Prior harness invocations that didn't set these explicitly
+            # inherited Henry's live state and could overwrite it on the
+            # debounced localStorage flush.
+            "WIKI_UI_STATE_PATH": str(fixture_root / "ui-state.json"),
+            "WIKI_TOKEN_CACHE_PATH": str(fixture_root / "token-cache.json"),
         }
     )
 

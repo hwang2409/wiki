@@ -70,8 +70,24 @@ async function waitForUtilityWindow(page, kind, expectedCount) {
   );
 }
 
+const OVERFLOW_LABELS = new Set([
+  "Activity feed",
+  "Graph view",
+  "Vault health",
+  "Token usage",
+  "Ticket dashboard",
+]);
+
 async function openSidebarPage(page, label, kind, expectedCount) {
-  await page.getByLabel(label, { exact: true }).click();
+  // WIKI-151 grouped secondary utilities under the ribbon overflow menu.
+  // Open it first for those labels; primary destinations still click directly.
+  if (OVERFLOW_LABELS.has(label)) {
+    await page.locator('[data-testid="ribbon-more-button"]').click();
+    await page.locator('[data-testid="ribbon-more-menu"]').waitFor();
+    await page.locator('[data-testid="ribbon-more-menu"]').getByText(label, { exact: true }).click();
+  } else {
+    await page.getByLabel(label, { exact: true }).click();
+  }
   await waitForUtilityWindow(page, kind, expectedCount);
 }
 

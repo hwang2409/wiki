@@ -183,13 +183,18 @@ export function reconcileWorkspaceState<T>(
   activeWorkspace: string,
   cache: Record<string, T>
 ): { activeWorkspace: string; cache: Record<string, T> } {
-  const liveIds = new Set(workspaces.filter((workspace) => workspace.live).map((workspace) => workspace.id));
+  const knownIds = new Set(workspaces.map((workspace) => workspace.id));
   const liveCacheKeys = new Set(workspaces.filter((workspace) => workspace.live).map(workspaceCacheKey));
-  const fallback = liveIds.has("wiki") ? "wiki" : workspaces.find((workspace) => workspace.live)?.id ?? "wiki";
-  return {
-    activeWorkspace: liveIds.has(activeWorkspace) ? activeWorkspace : fallback,
-    cache: Object.fromEntries(Object.entries(cache).filter(([key]) => liveCacheKeys.has(key))),
-  };
+  const filteredCache = Object.fromEntries(
+    Object.entries(cache).filter(([key]) => liveCacheKeys.has(key)),
+  );
+  // WIKI-151: always preserve the persisted selection so the UI can render it
+  // as an explicit unavailable option instead of silently swapping the user
+  // onto another root. When the id is unknown to discovery, the caller
+  // synthesizes a `{live: false}` entry so the selector still shows the
+  // persisted name with an "(unavailable)" marker rather than defaulting the
+  // native <select> to whatever happens to be first.
+  return { activeWorkspace, cache: filteredCache };
 }
 
 export function parseStoredRecentResources(raw: string | null): RecentResource[] {

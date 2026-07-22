@@ -96,29 +96,16 @@ try {
     `workspace-sidebar background expected transparent or body bg (${sidebarBorder.bodyBg}), got ${sidebarBorder.background}`,
   );
 
-  // Tab bar hairline: bottom border on workspace-tab-header, and no filled band.
-  const tabHeader = await page.evaluate(() => {
-    const el = document.querySelector(".workspace-tab-header");
-    if (!(el instanceof HTMLElement)) return null;
-    const cs = getComputedStyle(el);
-    return {
-      borderBottom: cs.borderBottomWidth,
-      background: cs.backgroundColor,
-      bodyBg: getComputedStyle(document.body).backgroundColor,
-    };
-  });
-  assert(tabHeader, "workspace-tab-header missing");
-  assert(
-    tabHeader.borderBottom === "1px",
-    `workspace-tab-header expected 1px hairline bottom, got ${tabHeader.borderBottom}`,
+  // WIKI-151 removed the phantom `.workspace-tab-header` bar entirely (the
+  // active-window title lives in the bottom tmux rail and the view-header
+  // carries breadcrumbs). Assert it's absent so a regression that reintroduces
+  // the bordered nonfunctional tab lands on this test.
+  const stillPresent = await page.evaluate(
+    () => document.querySelectorAll(".workspace-tab-header").length,
   );
-  const tabHeaderTransparent =
-    tabHeader.background === "rgba(0, 0, 0, 0)" ||
-    tabHeader.background === "transparent" ||
-    tabHeader.background === tabHeader.bodyBg;
   assert(
-    tabHeaderTransparent,
-    `workspace-tab-header background expected transparent or body bg (${tabHeader.bodyBg}), got ${tabHeader.background}`,
+    stillPresent === 0,
+    `WIKI-151 removed .workspace-tab-header, but ${stillPresent} still render`,
   );
 
   await page.screenshot({ path: path.join(OUT_DIR, "wiki-145-layout.png") });

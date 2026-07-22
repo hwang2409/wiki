@@ -90,7 +90,10 @@ test("workspace refresh reconciles stopped and newly live workspaces", () => {
     "phoebe",
     cache
   );
-  assert.equal(stopped.activeWorkspace, "wiki");
+  // WIKI-151: an unavailable-but-known workspace must be preserved as the
+  // selection so the user sees the missing root marked, not silently swapped
+  // onto a different one.
+  assert.equal(stopped.activeWorkspace, "phoebe");
   assert.deepEqual(stopped.cache, { [workspaceCacheKey(wiki)]: "wiki-files" });
 
   const newlyLive = reconcileWorkspaceState(
@@ -114,6 +117,29 @@ test("workspace cache keys invalidate same-ID root changes", () => {
   assert.equal(next.activeWorkspace, "misc");
   assert.deepEqual(next.cache, {});
   assert.notEqual(oldKey, workspaceCacheKey(newWorkspace));
+});
+
+test("persisted unavailable workspace stays selected instead of silently swapping to wiki", () => {
+  const wiki = { id: "wiki", root: "/wiki", live: true };
+  const phoebe = { id: "phoebe", root: "/phoebe", live: false };
+  const cache = { [workspaceCacheKey(wiki)]: "wiki-files" };
+  const preserved = reconcileWorkspaceState([wiki, phoebe], "phoebe", cache);
+  assert.equal(
+    preserved.activeWorkspace,
+    "phoebe",
+    "unavailable persisted workspace must not be silently swapped onto wiki",
+  );
+});
+
+test("unknown persisted workspace is preserved as an explicit unavailable selection, never swapped to wiki", () => {
+  const wiki = { id: "wiki", root: "/wiki", live: true };
+  const misc = { id: "misc", root: "/misc", live: true };
+  const next = reconcileWorkspaceState([wiki, misc], "ghost", {});
+  assert.equal(
+    next.activeWorkspace,
+    "ghost",
+    "missing persisted id must not be silently replaced — caller renders it as unavailable",
+  );
 });
 
 test("delayed file responses are ignored after a workspace lifecycle refresh", () => {

@@ -20,7 +20,9 @@ import {
   History,
   Lock,
   Moon,
+  MoreHorizontal,
   Pencil,
+  RefreshCw,
   Search,
   Settings,
   SquarePen,
@@ -181,6 +183,7 @@ type FileWorkspaceState = {
   truncated: boolean;
   loaded: boolean;
   loading: boolean;
+  error?: string | null;
 };
 
 type PaneGeometry = {
@@ -771,6 +774,21 @@ function isMarkdownPath(path: string) {
   return path.toLowerCase().endsWith(".md");
 }
 
+function workspaceLabel(workspace: { id: string; root: string }): string {
+  if (!workspace.root) return workspace.id;
+  const trimmed = workspace.root.replace(/\/+$/, "");
+  const last = trimmed.split("/").pop();
+  return last && last.length > 0 ? last : workspace.id;
+}
+
+function workspacePathHint(workspace: { id: string; root: string }): string {
+  if (!workspace.root) return "";
+  const trimmed = workspace.root.replace(/\/+$/, "");
+  const segments = trimmed.split("/").filter(Boolean);
+  if (segments.length <= 2) return trimmed;
+  return `…/${segments.slice(-2).join("/")}`;
+}
+
 const FILE_ICON_BY_EXTENSION: Record<string, LucideIcon> = {
   ts: FileCode2,
   tsx: FileCode2,
@@ -1267,6 +1285,8 @@ export default function App() {
   const [leaderArmed, setLeaderArmed] = useState(false);
   const [windowChooserOpen, setWindowChooserOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [ribbonMoreOpen, setRibbonMoreOpen] = useState(false);
+  const [workspaceDiscoveryError, setWorkspaceDiscoveryError] = useState<string | null>(null);
 
   useEffect(() => {
     applyStoredFonts();
@@ -1293,6 +1313,13 @@ export default function App() {
     error: null,
   });
   const [refreshTick, setRefreshTick] = useState(0);
+  // WIKI-151: dedicated nonce for the file-explorer retry. Bumping the shared
+  // refreshTick to re-run the file effect also re-triggers workspace
+  // discovery, agent listing, note listing, etc., and (per round-2 review)
+  // caused Retry to issue TWO /api/files/tree requests instead of one. This
+  // nonce is only in the file-loading effect's dep list, so a retry is
+  // strictly scoped to the file fetch.
+  const [filesRetryNonce, setFilesRetryNonce] = useState(0);
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [dialog, setDialog] = useState<DialogState | null>(null);
   const paneIdRef = useRef(0);
@@ -1323,6 +1350,27 @@ export default function App() {
     windowIdRef.current += 1;
     return `window-${windowIdRef.current}`;
   }
+
+  useEffect(() => {
+    if (!ribbonMoreOpen) return;
+    const handlePointer = (event: MouseEvent) => {
+      const target = event.target as Node | null;
+      if (!target) return;
+      const container = document.querySelector('[data-testid="ribbon-more-menu"]');
+      const button = document.querySelector('[data-testid="ribbon-more-button"]');
+      if (container?.contains(target) || button?.contains(target)) return;
+      setRibbonMoreOpen(false);
+    };
+    const handleKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setRibbonMoreOpen(false);
+    };
+    window.addEventListener("mousedown", handlePointer);
+    window.addEventListener("keydown", handleKey);
+    return () => {
+      window.removeEventListener("mousedown", handlePointer);
+      window.removeEventListener("keydown", handleKey);
+    };
+  }, [ribbonMoreOpen]);
 
   useEffect(() => {
     if (!contextMenu) return;
@@ -1427,6 +1475,7 @@ export default function App() {
         workspaceRefreshVersionRef.current += 1;
         filesRequestTrackerRef.current.invalidate();
         setWorkspaces(result.workspaces);
+        setWorkspaceDiscoveryError(null);
         setActiveWorkspace((current) =>
           reconcileWorkspaceState(result.workspaces, current, {}).activeWorkspace
         );
@@ -1434,13 +1483,17 @@ export default function App() {
           reconcileWorkspaceState(result.workspaces, "wiki", current).cache
         );
       })
-      .catch(() => {
-        if (!ignore) {
-          workspaceRefreshVersionRef.current += 1;
-          filesRequestTrackerRef.current.invalidate();
-          setWorkspaces([]);
-          setActiveWorkspace("wiki");
-        }
+      .catch((error: unknown) => {
+        if (ignore) return;
+        workspaceRefreshVersionRef.current += 1;
+        filesRequestTrackerRef.current.invalidate();
+        // Keep the prior workspace visible so a discovery outage doesn't
+        // silently pretend the user picked a different root. WIKI-151.
+        const message =
+          error instanceof Error && error.message
+            ? error.message
+            : "Could not reach workspace discovery.";
+        setWorkspaceDiscoveryError(message);
       });
     return () => {
       ignore = true;
@@ -1549,6 +1602,32 @@ export default function App() {
   const filesLoaded = activeFileState?.loaded ?? false;
   const filesLoading = activeFileState?.loading ?? false;
   const filesTruncated = activeFileState?.truncated ?? false;
+  const filesError = activeFileState?.error ?? null;
+  const workspaceUnavailable = !activeWorkspaceInfo || !activeWorkspaceInfo.live;
+  const retryFiles = () => {
+    if (!activeFileCacheKey) return;
+    workspaceRefreshVersionRef.current += 1;
+    filesRequestTrackerRef.current.invalidate();
+    setFilesByWorkspace((current) => {
+      const prior = current[activeFileCacheKey];
+      return {
+        ...current,
+        [activeFileCacheKey]: {
+          files: prior?.files ?? [],
+          truncated: prior?.truncated ?? false,
+          loaded: false,
+          loading: false,
+          error: null,
+        },
+      };
+    });
+    // WIKI-151 (round-2 HIGH#2): scope the retry to the files effect only.
+    // The prior implementation bumped the shared `refreshTick`, which also
+    // ran the workspace-discovery effect; discovery then replaced
+    // `workspaces` and triggered a SECOND file request in the same click.
+    // A per-effect nonce keeps the retry exactly-once.
+    setFilesRetryNonce((nonce) => nonce + 1);
+  };
 
   useEffect(() => {
     if (
@@ -1580,22 +1659,46 @@ export default function App() {
           [cacheKey]: { files: nextTree.files, truncated: nextTree.truncated, loaded: true, loading: false },
         }));
       })
-      .catch(() => {
+      .catch((error: unknown) => {
         if (
           !filesRequestTrackerRef.current.isCurrent(cacheKey, requestToken) ||
           !shouldAcceptWorkspaceResponse(requestVersion, workspaceRefreshVersionRef.current, requestedWorkspace, cacheKey)
         ) {
           return;
         }
-        setFilesByWorkspace((current) => ({
-          ...current,
-          [cacheKey]: { files: [], truncated: false, loaded: false, loading: false },
-        }));
+        // Preserve the last successful tree so a transient fetch failure
+        // does not collapse the sidebar to "No notes yet". WIKI-151.
+        const message =
+          error instanceof Error && error.message
+            ? error.message
+            : "Could not load workspace files.";
+        setFilesByWorkspace((current) => {
+          const prior = current[cacheKey];
+          return {
+            ...current,
+            [cacheKey]: {
+              files: prior?.files ?? [],
+              truncated: prior?.truncated ?? false,
+              loaded: prior?.loaded ?? false,
+              loading: false,
+              error: message,
+            },
+          };
+        });
       })
       .finally(() => {
         filesRequestTrackerRef.current.finish(cacheKey, requestToken);
       });
-  }, [activeFileState?.loaded, activeWorkspace, activeWorkspaceInfo, refreshTick, showAllFiles, switcherOpen, workspaces]);
+  }, [
+    activeFileState?.loaded,
+    activeWorkspace,
+    activeWorkspaceInfo,
+    filesRetryNonce,
+    refreshTick,
+    showAllFiles,
+    switcherOpen,
+    workspaces,
+  ]);
 
   useEffect(() => {
     for (const window of windowState.windows) {
@@ -1654,7 +1757,6 @@ export default function App() {
     () => buildTree(notes, showAllFiles ? files : undefined, activeWorkspace),
     [activeWorkspace, files, notes, showAllFiles]
   );
-  const liveWorkspaces = workspaces.filter((workspace) => workspace.live);
   const visibleRecentResources = useMemo(() => {
     const notePaths = notesLoaded ? new Set(notes.map((note) => note.path)) : null;
     const filePaths = filesLoaded && !filesTruncated ? new Set(files.map((file) => file.path)) : null;
@@ -3133,16 +3235,6 @@ export default function App() {
   const themeToggleTarget = toggleThemePolarity(theme);
   const themeToggleTargetLabel = getTheme(themeToggleTarget).label;
   const currentThemeIsDark = isDarkTheme(theme);
-  const tabTitle =
-    mode === "new"
-      ? "Untitled"
-      : mode === "file"
-        ? focusedPanePath?.split("/").pop() ?? "File"
-      : mode === "agent"
-        ? agentTicket ?? "Agent"
-        : mode === "terminal"
-          ? terminalRouteId ? `terminal:${terminalRouteId.slice(0, 8)}` : "Terminal"
-        : utilityTitles[mode] ?? (activeNote ? basename(activeNote.path) : "New tab");
   const breadcrumbs =
     mode === "new"
       ? ["Untitled"]
@@ -3481,137 +3573,155 @@ export default function App() {
     );
   }
 
+  const overflowItems: Array<{
+    label: string;
+    icon: LucideIcon;
+    mode: Mode;
+    view: "activity" | "graph" | "health" | "tokens" | "dashboard";
+  }> = [
+    { label: "Activity feed", icon: History, mode: "activity", view: "activity" },
+    { label: "Graph view", icon: Waypoints, mode: "graph", view: "graph" },
+    { label: "Vault health", icon: HeartPulse, mode: "health", view: "health" },
+    { label: "Token usage", icon: TrendingUp, mode: "tokens", view: "tokens" },
+    { label: "Ticket dashboard", icon: ClipboardList, mode: "dashboard", view: "dashboard" },
+  ];
+  const overflowActive = overflowItems.some((entry) => entry.mode === mode);
+
   return (
     <div className={`app-container${sidebarVisible ? "" : " sidebar-hidden"}`}>
-      <div className="workspace-ribbon">
-        <button
-          aria-label="New note"
-          className="ribbon-action"
-          title="New note"
-          type="button"
-          onClick={startNewNote}
-        >
-          <SquarePen size={18} />
-        </button>
-        <button
-          aria-label="Files"
-          className={`ribbon-action${sidebarTab === "files" ? " is-active" : ""}`}
-          title="Files"
-          type="button"
-          onClick={() => setSidebarTab("files")}
-        >
-          <FolderIcon size={18} />
-        </button>
-        <button
-          aria-label="Search"
-          className={`ribbon-action${sidebarTab === "search" ? " is-active" : ""}`}
-          title="Search"
-          type="button"
-          onClick={() => setSidebarTab("search")}
-        >
-          <Search size={18} />
-        </button>
-        <button
-          aria-label="Agent list"
-          className={`ribbon-action${sidebarTab === "agents" ? " is-active" : ""}`}
-          title="Agent list"
-          type="button"
-          onClick={() => setSidebarTab("agents")}
-        >
-          <SquareTerminal size={18} />
-        </button>
-        <button
-          aria-label="New terminal"
-          className="ribbon-action"
-          title="New terminal (C-a t)"
-          type="button"
-          onClick={createTerminalPane}
-        >
-          <TerminalIcon size={18} />
-        </button>
-        <button
-          aria-label="Activity feed"
-          className={`ribbon-action${mode === "activity" ? " is-active" : ""}`}
-          title="Activity feed"
-          type="button"
-          onClick={() => openUtilityView("activity")}
-        >
-          <History size={18} />
-        </button>
-        <button
-          aria-label="Graph view"
-          className={`ribbon-action${mode === "graph" ? " is-active" : ""}`}
-          title="Graph view"
-          type="button"
-          onClick={() => openUtilityView("graph")}
-        >
-          <Waypoints size={18} />
-        </button>
-        <button
-          aria-label="Vault health"
-          className={`ribbon-action${mode === "health" ? " is-active" : ""}`}
-          title="Vault health"
-          type="button"
-          onClick={() => openUtilityView("health")}
-        >
-          <HeartPulse size={18} />
-        </button>
-        <button
-          aria-label="Agents"
-          className={`ribbon-action${mode === "agents" ? " is-active" : ""}`}
-          title="Agents"
-          type="button"
-          onClick={() => openUtilityView("agents")}
-        >
-          <Bot size={18} />
-        </button>
-        <button
-          aria-label="Token usage"
-          className={`ribbon-action${mode === "tokens" ? " is-active" : ""}`}
-          title="Token usage"
-          type="button"
-          onClick={() => openUtilityView("tokens")}
-        >
-          <TrendingUp size={18} />
-        </button>
-        <button
-          aria-label="Ticket dashboard"
-          className={`ribbon-action${mode === "dashboard" ? " is-active" : ""}`}
-          title="Ticket dashboard"
-          type="button"
-          onClick={() => openUtilityView("dashboard")}
-        >
-          <ClipboardList size={18} />
-        </button>
+      <div className="workspace-ribbon" data-testid="workspace-ribbon">
+        <div className="ribbon-zone" data-zone="content">
+          <button
+            aria-label="New note"
+            className="ribbon-action"
+            title="New note"
+            type="button"
+            onClick={startNewNote}
+          >
+            <SquarePen size={18} />
+          </button>
+          <button
+            aria-label="Files"
+            className={`ribbon-action${sidebarTab === "files" ? " is-active" : ""}`}
+            title="Files"
+            type="button"
+            onClick={() => setSidebarTab("files")}
+          >
+            <FolderIcon size={18} />
+          </button>
+          <button
+            aria-label="Search"
+            className={`ribbon-action${sidebarTab === "search" ? " is-active" : ""}`}
+            title="Search"
+            type="button"
+            onClick={() => setSidebarTab("search")}
+          >
+            <Search size={18} />
+          </button>
+          <button
+            aria-label="New terminal"
+            className="ribbon-action"
+            title="New terminal (C-a t)"
+            type="button"
+            onClick={createTerminalPane}
+          >
+            <TerminalIcon size={18} />
+          </button>
+        </div>
+        <div className="ribbon-zone" data-zone="run-management">
+          <button
+            aria-label="Agent list"
+            className={`ribbon-action${sidebarTab === "agents" ? " is-active" : ""}`}
+            title="Agent list"
+            type="button"
+            onClick={() => setSidebarTab("agents")}
+          >
+            <SquareTerminal size={18} />
+          </button>
+          <button
+            aria-label="Agents"
+            className={`ribbon-action${mode === "agents" ? " is-active" : ""}`}
+            title="Agents"
+            type="button"
+            onClick={() => openUtilityView("agents")}
+          >
+            <Bot size={18} />
+          </button>
+          <div className="ribbon-more-container">
+            <button
+              aria-expanded={ribbonMoreOpen}
+              aria-haspopup="menu"
+              aria-label="More views"
+              className={`ribbon-action${ribbonMoreOpen || overflowActive ? " is-active" : ""}`}
+              data-testid="ribbon-more-button"
+              title="More views"
+              type="button"
+              onClick={() => setRibbonMoreOpen((open) => !open)}
+            >
+              <MoreHorizontal size={18} />
+            </button>
+            {ribbonMoreOpen ? (
+              <div
+                className="ribbon-more-menu"
+                data-testid="ribbon-more-menu"
+                role="menu"
+              >
+                <div className="ribbon-more-title">More views</div>
+                {overflowItems.map((entry) => {
+                  const Icon = entry.icon;
+                  const isActive = mode === entry.mode;
+                  return (
+                    <button
+                      className={`ribbon-more-item${isActive ? " is-active" : ""}`}
+                      key={entry.view}
+                      role="menuitem"
+                      type="button"
+                      onClick={() => {
+                        setRibbonMoreOpen(false);
+                        openUtilityView(entry.view);
+                      }}
+                    >
+                      <Icon size={16} />
+                      <span>{entry.label}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            ) : null}
+          </div>
+        </div>
         <div className="ribbon-spacer" />
-        <button
-          aria-label="Settings"
-          className="ribbon-action"
-          title="Settings"
-          type="button"
-          onClick={() => setSettingsOpen(true)}
-        >
-          <Settings size={18} />
-        </button>
-        <button
-          aria-label={currentThemeIsDark ? "Switch to light theme" : "Switch to dark theme"}
-          className="ribbon-action"
-          title={`Switch to ${themeToggleTargetLabel}`}
-          type="button"
-          onClick={() => setTheme((current) => toggleThemePolarity(current))}
-        >
-          <span className="theme-icon-stack">
-            <Sun className={`theme-icon${currentThemeIsDark ? " is-active" : ""}`} size={18} />
-            <Moon className={`theme-icon${currentThemeIsDark ? "" : " is-active"}`} size={18} />
-          </span>
-        </button>
+        <div className="ribbon-zone" data-zone="app-controls">
+          <button
+            aria-label="Settings"
+            className="ribbon-action"
+            title="Settings"
+            type="button"
+            onClick={() => setSettingsOpen(true)}
+          >
+            <Settings size={18} />
+          </button>
+          <button
+            aria-label={currentThemeIsDark ? "Switch to light theme" : "Switch to dark theme"}
+            className="ribbon-action"
+            title={`Switch to ${themeToggleTargetLabel}`}
+            type="button"
+            onClick={() => setTheme((current) => toggleThemePolarity(current))}
+          >
+            <span className="theme-icon-stack">
+              <Sun className={`theme-icon${currentThemeIsDark ? " is-active" : ""}`} size={18} />
+              <Moon className={`theme-icon${currentThemeIsDark ? "" : " is-active"}`} size={18} />
+            </span>
+          </button>
+        </div>
       </div>
 
       <aside className="workspace-sidebar">
         {sidebarTab === "files" ? (
-          <>
-            <div className="nav-header">
-              <div className="nav-buttons-container">
+          <div className="sidebar-mode" data-mode="files">
+            <div className="sidebar-mode-title">
+              <span className="sidebar-mode-title-label">Files</span>
+              <div className="sidebar-mode-actions">
                 <button
                   aria-label="New note"
                   className="nav-action-button"
@@ -3641,20 +3751,59 @@ export default function App() {
                 </button>
               </div>
             </div>
+            {workspaceDiscoveryError ? (
+              <div className="nav-inline-error" role="alert" data-testid="workspace-discovery-error">
+                <span className="nav-inline-error-message">
+                  Workspaces unavailable — {workspaceDiscoveryError}
+                </span>
+                <button
+                  className="nav-inline-retry"
+                  type="button"
+                  onClick={() => {
+                    setWorkspaceDiscoveryError(null);
+                    workspaceRefreshVersionRef.current += 1;
+                    setRefreshTick((tick) => tick + 1);
+                  }}
+                >
+                  <RefreshCw size={12} />
+                  <span>Retry</span>
+                </button>
+              </div>
+            ) : null}
             <label className="workspace-selector">
-              <span>Workspace</span>
+              <span className="workspace-selector-label">Workspace</span>
               <select
                 aria-label="Files workspace"
+                data-testid="workspace-select"
                 value={activeWorkspace}
                 onChange={(event) => setActiveWorkspace(event.target.value)}
               >
-                {(liveWorkspaces.length > 0 ? liveWorkspaces : [{ id: "wiki", root: "", live: true }]).map(
-                  (workspace) => (
-                    <option key={workspace.id} value={workspace.id}>
-                      {workspace.id}
-                    </option>
-                  )
-                )}
+                {(() => {
+                  const base = workspaces.length > 0 ? workspaces : [{ id: "wiki", root: "", live: true }];
+                  // WIKI-151: synthesize a placeholder entry when the persisted
+                  // selection isn't present in discovery, so the native <select>
+                  // does not silently show a different workspace as the current
+                  // value. The synthesized row is explicitly marked unavailable.
+                  const knownIds = new Set(base.map((w) => w.id));
+                  const options = knownIds.has(activeWorkspace)
+                    ? base
+                    : [...base, { id: activeWorkspace, root: "", live: false }];
+                  return options.map((workspace) => {
+                    const friendly = workspaceLabel(workspace);
+                    const hint = workspacePathHint(workspace);
+                    const unavailable = !workspace.live;
+                    const suffix = unavailable ? " (unavailable)" : "";
+                    return (
+                      <option
+                        key={workspace.id}
+                        value={workspace.id}
+                        disabled={unavailable && workspace.id !== activeWorkspace}
+                      >
+                        {friendly}{hint ? ` — ${hint}` : ""}{suffix}
+                      </option>
+                    );
+                  });
+                })()}
               </select>
             </label>
             <div className="nav-files-container">
@@ -3662,91 +3811,118 @@ export default function App() {
                 <div className="nav-empty">
                   <LoadingPlaceholder className="nav-loading" lines={[92, 86, 88, 74, 81]} />
                 </div>
-              ) : tree.files.length > 0 || tree.folders.length > 0 ? (
+              ) : workspaceUnavailable ? (
+                // WIKI-151: an unavailable workspace must render its own empty
+                // body — NEVER fall through to whatever `tree` happens to hold
+                // for the wiki vault. `buildTree(notes, undefined, ...)`
+                // populates the tree with wiki notes whenever showAllFiles is
+                // off, so a selected-but-not-live phoebe would otherwise leak
+                // wiki content into the sidebar (round-2 review HIGH#1).
+                <div className="nav-empty" data-testid="workspace-unavailable">
+                  Workspace unavailable
+                </div>
+              ) : (
                 <>
-                  <FolderTree
-                    activePath={
-                      mode === "file"
-                        ? focusedPanePath
-                        : mode === "view" || mode === "edit"
-                          ? activeNote
-                            ? showAllFiles
-                              ? `vault/${activeNote.path}`
-                              : activeNote.path
+                  {(tree.files.length > 0 || tree.folders.length > 0) ? (
+                    <FolderTree
+                      activePath={
+                        mode === "file"
+                          ? focusedPanePath
+                          : mode === "view" || mode === "edit"
+                            ? activeNote
+                              ? showAllFiles
+                                ? `vault/${activeNote.path}`
+                                : activeNote.path
+                              : null
                             : null
-                          : null
-                    }
-                    collapsed={collapsedFolders}
-                    canDropOnFolder={(path) => noteFolderFromTreePath(path, showAllFiles) !== null}
-                    depth={0}
-                    dragActive={draggingNotePath !== null}
-                    folder={tree}
-                    onContextMenu={handleTreeContextMenu}
-                    onDropOnFolder={handleDropOnFolder}
-                    onNoteDragEnd={() => setDraggingNotePath(null)}
-                    onNoteDragStart={setDraggingNotePath}
-                    onOpenFile={openTreeFile}
-                    onToggleFolder={toggleFolder}
-                  />
+                      }
+                      collapsed={collapsedFolders}
+                      canDropOnFolder={(path) => noteFolderFromTreePath(path, showAllFiles) !== null}
+                      depth={0}
+                      dragActive={draggingNotePath !== null}
+                      folder={tree}
+                      onContextMenu={handleTreeContextMenu}
+                      onDropOnFolder={handleDropOnFolder}
+                      onNoteDragEnd={() => setDraggingNotePath(null)}
+                      onNoteDragStart={setDraggingNotePath}
+                      onOpenFile={openTreeFile}
+                      onToggleFolder={toggleFolder}
+                    />
+                  ) : filesError ? null : filesLoaded ? (
+                    <div className="nav-empty" data-testid="nav-empty-notes">No notes yet</div>
+                  ) : null}
                   {filesTruncated ? <div className="nav-empty">File list truncated at 10,000 items</div> : null}
+                  {filesError ? (
+                    <div className="nav-files-retry" role="alert" data-testid="files-fetch-error">
+                      <span className="nav-files-retry-message">
+                        Couldn’t load files — {filesError}
+                      </span>
+                      <button className="nav-inline-retry" type="button" onClick={retryFiles}>
+                        <RefreshCw size={12} />
+                        <span>Retry</span>
+                      </button>
+                    </div>
+                  ) : null}
                 </>
-              ) : (
-                <div className="nav-empty">No notes yet</div>
-              )}
-            </div>
-          </>
-        ) : sidebarTab === "search" ? (
-          <div className="search-panel">
-            <div className="search-input-container">
-              <input
-                placeholder="Search..."
-                type="search"
-                value={query}
-                onChange={(event) => setQuery(event.target.value)}
-              />
-            </div>
-            <div className="search-results">
-              {query.trim() === "" ? (
-                <div className="nav-empty">Type to start searching</div>
-              ) : searchResults.length > 0 ? (
-                searchResults.map((note) => (
-                  <button
-                    className="search-result"
-                    key={note.id}
-                    type="button"
-                    onClick={() => openNote(note.path)}
-                  >
-                    <span className="search-result-title">{basename(note.path)}</span>
-                    <span className="search-result-path">{note.path}</span>
-                    {note.excerpt ? (
-                      <span className="search-result-excerpt">{note.excerpt}</span>
-                    ) : null}
-                  </button>
-                ))
-              ) : (
-                <div className="nav-empty">No matches found</div>
               )}
             </div>
           </div>
+        ) : sidebarTab === "search" ? (
+          <div className="sidebar-mode" data-mode="search">
+            <div className="sidebar-mode-title">
+              <span className="sidebar-mode-title-label">Search</span>
+            </div>
+            <div className="search-panel">
+              <div className="search-input-container">
+                <input
+                  placeholder="Search..."
+                  type="search"
+                  value={query}
+                  onChange={(event) => setQuery(event.target.value)}
+                />
+              </div>
+              <div className="search-results">
+                {query.trim() === "" ? (
+                  <div className="nav-empty">Type to start searching</div>
+                ) : searchResults.length > 0 ? (
+                  searchResults.map((note) => (
+                    <button
+                      className="search-result"
+                      key={note.id}
+                      type="button"
+                      onClick={() => openNote(note.path)}
+                    >
+                      <span className="search-result-title">{basename(note.path)}</span>
+                      <span className="search-result-path">{note.path}</span>
+                      {note.excerpt ? (
+                        <span className="search-result-excerpt">{note.excerpt}</span>
+                      ) : null}
+                    </button>
+                  ))
+                ) : (
+                  <div className="nav-empty">No matches found</div>
+                )}
+              </div>
+            </div>
+          </div>
         ) : (
-          <AgentsSidebar
-            activeTicket={mode === "agent" ? agentTicket : null}
-            data={agentsState}
-            refreshTick={refreshTick}
-            onDragEnd={() => setDraggingNotePath(null)}
-            onDragStart={(ticket) => setDraggingNotePath(`agent://${ticket}`)}
-            onOpen={openAgent}
-          />
+          <div className="sidebar-mode" data-mode="agents">
+            <div className="sidebar-mode-title">
+              <span className="sidebar-mode-title-label">Runs</span>
+            </div>
+            <AgentsSidebar
+              activeTicket={mode === "agent" ? agentTicket : null}
+              data={agentsState}
+              refreshTick={refreshTick}
+              onDragEnd={() => setDraggingNotePath(null)}
+              onDragStart={(ticket) => setDraggingNotePath(`agent://${ticket}`)}
+              onOpen={openAgent}
+            />
+          </div>
         )}
       </aside>
 
       <main className="workspace-leaf">
-        <div className="workspace-tab-header">
-          <div className="workspace-tab">
-            <span>{tabTitle}</span>
-          </div>
-        </div>
-
         <div className={`view-header${mode === "agent" || mode === "terminal" ? " is-hidden" : ""}`}>
           <div className="view-header-title-container">
             {breadcrumbs.map((crumb, index) => (

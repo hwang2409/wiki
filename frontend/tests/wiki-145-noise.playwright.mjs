@@ -40,18 +40,12 @@ function ruleBody(selector) {
   );
 }
 
-// Offender 4: .workspace-tab must NOT keep old top-round radii or background-primary fill.
+// Offender 4: WIKI-151 deleted the `.workspace-tab` rule outright — the
+// phantom header bar is gone (bottom-rail tabs are canonical). Assert absence
+// so a regression that revives the top tab band lands here.
 {
   const body = ruleBody(".workspace-tab");
-  assert(body, ".workspace-tab rule missing");
-  assert(
-    !/border-radius:\s*var\(--radius-s\)\s+var\(--radius-s\)\s+0\s+0/.test(body),
-    "workspace-tab still uses top-round radii — expected hairline underline treatment",
-  );
-  assert(
-    !/background-color:\s*var\(--background-primary\)/.test(body),
-    "workspace-tab still filled with background-primary — expected transparent",
-  );
+  assert(body === null, ".workspace-tab rule reintroduced — WIKI-151 removed the phantom tab header");
 }
 
 // Offender 5: .notice must NOT have full border + secondary fill.

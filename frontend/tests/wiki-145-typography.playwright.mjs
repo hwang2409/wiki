@@ -91,11 +91,14 @@ try {
     `dashboard header h2 weight expected 600, got ${dashboardHead.weight}`,
   );
 
-  // Sample 3: nav-agents-divider caption uses --fs-xs and uppercase.
+  // Sample 3: WIKI-151 renamed .nav-agents-divider -> .nav-agents-group-title
+  // (labeled Active/History groups). Still --fs-xs uppercase.
   const divider = await page.evaluate(() => {
     const el = document.createElement("div");
-    el.className = "nav-agents-divider";
-    el.textContent = "archived";
+    el.className = "nav-agents-group-title";
+    const label = document.createElement("span");
+    label.textContent = "archived";
+    el.appendChild(label);
     document.body.appendChild(el);
     const cs = getComputedStyle(el);
     const raw = getComputedStyle(document.documentElement).getPropertyValue("--fs-xs").trim();
@@ -110,11 +113,11 @@ try {
   });
   assert(
     divider.computed === divider.raw,
-    `nav-agents-divider expected ${divider.raw} (--fs-xs), got ${divider.computed}`,
+    `nav-agents-group-title expected ${divider.raw} (--fs-xs), got ${divider.computed}`,
   );
   assert(
     divider.textTransform === "uppercase",
-    `nav-agents-divider expected uppercase, got ${divider.textTransform}`,
+    `nav-agents-group-title expected uppercase, got ${divider.textTransform}`,
   );
 
   await page.screenshot({ path: path.join(OUT_DIR, "wiki-145-typography.png") });
