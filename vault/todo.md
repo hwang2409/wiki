@@ -50,7 +50,6 @@ In Progress:
 - mitmweb rebuild: scope and build a clearer live proxy-traffic inspector — owner (misc)
 - WIKI-135 dashboard: implementation workers only (drop reviewers/one-shots) — owner cdx:WIKI-135 (luna)
 - [P2] WIKI-156 artifact shell + renderer-state polish — quiet inline header, no coming-soon controls or ID-prefix titles, shared loading/error/fallback component (depends WIKI-144, WIKI-149) — cc:WIKI-156 worker
-- [P2] WIKI-161 synthetic-source system messages: extend send_now with source field (fleet-monitor/supervisor-steer/mastermind); frontend renders synthetic-source turns as marker/system rows (WIKI-153 hook-message-registry style), not user avatar+bubble; LLM still wakes on turn (reliability preserved); reduces user-facing 'fake Henry' noise — cc:WIKI-161 worker
 
 Backlog:
 

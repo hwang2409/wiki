@@ -9,6 +9,7 @@ updated: 2026-07-22
 
 ## 2026-07-22
 
+- WIKI-161 synthetic-source system messages merged (#123 squash c58b319, 4 rounds)
 - WIKI-151 nav + sidebar IA merged (#124 squash fdf77f0, 3 rounds)
 - WIKI-148 composer slash menu merged (#119 squash 33c951a, 9 rounds)
 - PHO-14264 admin agent tool-discovery design + gated prototype merged (PR #12080 squash c0e3bdee); shipping chain PHO-14285..88 filed; PHO-14285 framework-prerequisite worker spawned (cdx luna)
