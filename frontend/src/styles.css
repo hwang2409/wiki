@@ -6286,21 +6286,11 @@ body.is-resizing-panes .pane-cell {
   text-align: left;
 }
 
+/* Unread/failed markers stay in the DOM for tests + screen readers, but the
+   colored dot itself is not rendered (Henry 2026-07-22) — unread state reads
+   through the brighter ticket text via .has-unread instead. */
 .nav-agent-unread {
-  position: absolute;
-  top: 50%;
-  left: -1px;
-  width: 6px;
-  height: 6px;
-  transform: translateY(-50%);
-  border-radius: 50%;
-  background-color: var(--accent-primary);
-  pointer-events: none;
-}
-
-.nav-agent-unread.is-failed {
-  background-color: var(--text-error, #c05252);
-  outline: 1px solid var(--text-error, #c05252);
+  display: none;
 }
 
 .sr-only {
@@ -6401,7 +6391,9 @@ body.is-resizing-panes .pane-cell {
 }
 
 .nav-agent.is-owned {
-  padding-left: 22px;
+  /* 8px row pad + 12px orch icon + 7px gap: owned tickets align with the
+     orchestrator label text above them. */
+  padding-left: 27px;
 }
 
 .agents-orch-group {
