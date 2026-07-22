@@ -15,7 +15,7 @@ import {
   controlAgent,
   getAgents,
   getAgentModels,
-  markAgentViewed,
+  markRunViewed,
   spawnAgentOrchestrator,
   spawnAgentWorker,
 } from "./api";
@@ -40,12 +40,6 @@ import { BranchPill } from "./branch-pill";
 import { StatusBadge } from "./status-badge";
 
 const STALE_SECONDS = 5 * 60;
-
-function pickLatestTimestamp(a: string | null | undefined, b: string | null | undefined): string | null {
-  if (!a) return b ?? null;
-  if (!b) return a;
-  return a > b ? a : b;
-}
 
 const SPAWN_TICKET_PATTERN = /^[A-Z0-9-]+$/;
 const ORCH_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
@@ -1519,8 +1513,11 @@ export function AgentsSidebar({
   const [fetchedWorkers, setFetchedWorkers] = useState<AgentWorker[] | null>(null);
   const [fetchedOrchestrators, setFetchedOrchestrators] = useState<Orchestrator[]>([]);
   const [fetchedArchived, setFetchedArchived] = useState<ArchivedWorker[]>([]);
-  const [viewedOverrides, setViewedOverrides] = useState<Record<string, string>>({});
-  const viewedInflight = useRef<Set<string>>(new Set());
+  // Keyed by run_id (durable). Value is the observed seq we tried to mark
+  // viewed at — comparing seqs (monotonic int) sidesteps timestamp-format
+  // and wall-clock issues from the round 1 implementation.
+  const [viewedOverrides, setViewedOverrides] = useState<Record<string, number>>({});
+  const viewedInflight = useRef<Map<string, boolean>>(new Map());
 
   useEffect(() => {
     if (data) return;
@@ -1546,17 +1543,73 @@ export function AgentsSidebar({
   const archived = data?.archived ?? fetchedArchived;
 
   useEffect(() => {
-    if (!activeTicket) return;
-    const stamp = new Date().toISOString();
-    setViewedOverrides((current) => ({ ...current, [activeTicket]: stamp }));
-    if (viewedInflight.current.has(activeTicket)) return;
-    viewedInflight.current.add(activeTicket);
-    markAgentViewed(activeTicket)
-      .catch(() => {})
-      .finally(() => {
-        viewedInflight.current.delete(activeTicket);
-      });
-  }, [activeTicket]);
+    if (!activeTicket || workers === null) return;
+    const worker = workers.find((row) => row.ticket === activeTicket);
+    const runId = worker?.run_id ?? null;
+    const observedSeq = worker?.latest_event_seq ?? null;
+    if (!runId || observedSeq === null) return;
+
+    // Skip if we (or the server) have already recorded a viewed seq that
+    // covers everything visible in this refresh. Prevents the effect from
+    // POSTing on every /api/agents refresh (the round 1 regression), while
+    // still re-POSTing when the active session's seq advances.
+    const priorOverride = viewedOverrides[runId];
+    const priorServer = worker?.last_viewed_seq ?? null;
+    const priorSeq = Math.max(priorOverride ?? -1, priorServer ?? -1);
+    if (priorSeq >= observedSeq) return;
+
+    setViewedOverrides((current) => {
+      const prior = current[runId];
+      if (prior !== undefined && prior >= observedSeq) return current;
+      return { ...current, [runId]: observedSeq };
+    });
+
+    if (viewedInflight.current.has(runId)) {
+      // Do NOT drop this open — remember that a re-mark is desired once the
+      // in-flight request settles. Prevents a stuck "cleared" state if the
+      // seq advanced while we were mid-flight.
+      viewedInflight.current.set(runId, true);
+      return;
+    }
+
+    const post = (seq: number, retried: boolean): void => {
+      viewedInflight.current.set(runId, false);
+      markRunViewed(runId, seq)
+        .then((result) => {
+          setViewedOverrides((current) => ({
+            ...current,
+            [runId]: result.last_viewed_seq,
+          }));
+        })
+        .catch(() => {
+          // Rollback the optimistic override so the dot re-appears; retry
+          // once with the latest observed seq before giving up.
+          setViewedOverrides((current) => {
+            if (current[runId] === undefined) return current;
+            const next = { ...current };
+            delete next[runId];
+            return next;
+          });
+          if (!retried) {
+            window.setTimeout(() => post(seq, true), 500);
+          }
+        })
+        .finally(() => {
+          const wasQueued = viewedInflight.current.get(runId) === true;
+          viewedInflight.current.delete(runId);
+          if (!wasQueued) return;
+          // A later open happened while inflight — re-post with the current
+          // seq observed on the freshest render.
+          setViewedOverrides((current) => {
+            const seqNow = current[runId];
+            if (seqNow !== undefined) post(seqNow, false);
+            return current;
+          });
+        });
+    };
+
+    post(observedSeq, false);
+  }, [activeTicket, workers, viewedOverrides]);
 
   if (workers === null) {
     return (
@@ -1583,11 +1636,13 @@ export function AgentsSidebar({
   });
 
   const hasUnread = (worker: AgentWorker): boolean => {
-    if (!worker.latest_event_at) return false;
-    const override = viewedOverrides[worker.ticket];
-    const viewed = pickLatestTimestamp(worker.last_viewed_at, override);
-    if (!viewed) return true;
-    return worker.latest_event_at > viewed;
+    const latest = worker.latest_event_seq;
+    if (latest === null || latest === undefined) return false;
+    const override = worker.run_id ? viewedOverrides[worker.run_id] : undefined;
+    const serverSeq = worker.last_viewed_seq;
+    const viewed = Math.max(override ?? -1, serverSeq ?? -1);
+    if (viewed < 0) return true;
+    return latest > viewed;
   };
 
   const workerRow = (worker: AgentWorker, indent: boolean) => {
@@ -1600,7 +1655,12 @@ export function AgentsSidebar({
         onClick={() => onOpen(worker.ticket)}
         {...dragProps(worker.ticket)}
       >
-        {unread ? <span aria-label="unread" className="nav-agent-unread" data-testid="nav-agent-unread" /> : null}
+        {unread ? (
+          <>
+            <span aria-hidden="true" className="nav-agent-unread" data-testid="nav-agent-unread" />
+            <span className="sr-only">unread</span>
+          </>
+        ) : null}
         <span className={`nav-agent-dot is-${worker.state ?? "unknown"}`} />
         <span className="nav-agent-ticket">{worker.ticket}</span>
         <span className="nav-agent-meta">{stateLabel(worker)}</span>

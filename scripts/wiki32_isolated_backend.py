@@ -87,6 +87,8 @@ def main_cli() -> None:
     main.AGENT_ARCHIVE_DIR = archive_dir
     main.AGENT_TMP_DIR = agent_tmp_dir
     main.AGENT_VIEWED_PATH = fixture_root / "agent-viewed.json"
+    main.AGENT_RUNTIME_DIR = runtime_dir
+    main.AGENT_RUNS_DIR = runtime_dir / "runs"
     main.MSG_QUEUE_PATH = args.queue
     transcripts.CODEX_SESSIONS_DIR = args.codex_sessions_dir
     transcripts.CLAUDE_PROJECTS_DIR = claude_projects_dir

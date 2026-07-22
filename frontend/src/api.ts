@@ -163,7 +163,9 @@ export type AgentWorker = AgentSession & {
   blocker: string | null;
   status_age_seconds: number | null;
   latest_event_at: string | null;
+  latest_event_seq: number | null;
   last_viewed_at: string | null;
+  last_viewed_seq: number | null;
 };
 
 export type ArchivedWorker = {
@@ -205,10 +207,21 @@ export function getAgents() {
   }>("/api/agents");
 }
 
-export function markAgentViewed(ticket: string) {
-  return request<{ ticket: string; last_viewed_at: string }>(
-    `/api/agents/${encodeURIComponent(ticket)}/viewed`,
-    { method: "POST" }
+export type MarkViewedResult = {
+  run_id: string;
+  last_viewed_at: string;
+  last_viewed_seq: number;
+  latest_event_at: string;
+  latest_event_seq: number;
+};
+
+export function markRunViewed(runId: string, seq: number | null) {
+  return request<MarkViewedResult>(
+    `/api/agents/runs/${encodeURIComponent(runId)}/viewed`,
+    {
+      method: "POST",
+      body: JSON.stringify(seq === null ? {} : { seq }),
+    }
   );
 }
 

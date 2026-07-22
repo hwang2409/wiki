@@ -2,13 +2,13 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
 
 import { makeFixtureRoot, startBackend } from "../scripts/wiki32-harness.mjs";
 
 const OUT_DIR = process.env.WIKI_PLAYWRIGHT_OUT_DIR || "/tmp/wiki-147-unread-dot";
 const WORKER = "WIKI-147";
+const RUN_ID = "00000000-0000-4000-8000-000000000147";
 
 function line(value) {
   return `${JSON.stringify(value)}\n`;
@@ -63,14 +63,37 @@ async function startFakeSupervisor(fixtures, runs) {
   };
 }
 
-async function seedStatus(fixtures, ticket, mtimeSeconds) {
+/**
+ * Simulate a real provider event landing in the durable supervisor store.
+ * This is the SAME data path the production supervisor writes into after
+ * every `RunStore.append_normalized(...)` — the backend derives freshness
+ * from `run.json` (WIKI-147 R2 B2 contract). Tests must NOT touch the
+ * status file mtime as a proxy for freshness.
+ */
+async function appendDurableEvent(fixtures, runId, seq) {
+  const runDir = path.join(fixtures.runtimeDir, "runs", runId);
+  await fs.mkdir(runDir, { recursive: true });
+  const runPath = path.join(runDir, "run.json");
+  const updatedAt = new Date().toISOString();
+  await fs.writeFile(
+    runPath,
+    JSON.stringify({
+      run_id: runId,
+      normalized_event_count: seq,
+      updated_at: updatedAt,
+    }),
+    "utf-8",
+  );
+  return updatedAt;
+}
+
+async function seedStatus(fixtures, ticket) {
   const statusPath = path.join(fixtures.statusDir, `${ticket}.json`);
   await fs.writeFile(
     statusPath,
     JSON.stringify({ state: "working", pr: null, step: "editing", blocker: null }),
     "utf-8",
   );
-  await fs.utimes(statusPath, mtimeSeconds, mtimeSeconds);
   return statusPath;
 }
 
@@ -95,8 +118,9 @@ async function waitForUnread(page, ticket, want, message) {
 }
 
 async function pokeAgents(page) {
-  await page.evaluate(async () => {
-    await fetch("/api/agents", { cache: "no-store" });
+  return page.evaluate(async () => {
+    const res = await fetch("/api/agents", { cache: "no-store" });
+    return res.json();
   });
 }
 
@@ -107,7 +131,7 @@ async function main() {
 
   const liveWorker = {
     ticket: WORKER,
-    run_id: "00000000-0000-4000-8000-000000000147",
+    run_id: RUN_ID,
     provider: "claude",
     kind: "cc",
     role: "implement",
@@ -127,19 +151,7 @@ async function main() {
   };
   const registry = { [WORKER]: { history: [], current: liveWorker } };
   await fs.writeFile(fixtures.registryPath, JSON.stringify(registry, null, 2));
-
-  // Seed timestamps in the past so the click's real "now" viewed-mark clears
-  // the initial dot, and a follow-up event lands in the past-but-later window.
-  const nowSeconds = Math.floor(Date.now() / 1000);
-  const initialEvent = nowSeconds - 3600;
-  const initialViewedIso = new Date((initialEvent - 3600) * 1000).toISOString();
-  await fs.writeFile(
-    path.join(fixtures.root, "agent-viewed.json"),
-    JSON.stringify({ [WORKER]: initialViewedIso }),
-    "utf-8",
-  );
-  await seedStatus(fixtures, WORKER, initialEvent);
-  await fs.writeFile(fixtures.registryPath, JSON.stringify(registry, null, 2));
+  await seedStatus(fixtures, WORKER);
 
   const supervisor = await startFakeSupervisor(fixtures, [liveWorker]);
   const backend = await startBackend(fixtures);
@@ -152,60 +164,100 @@ async function main() {
       localStorage.setItem("wiki-sidebar-tab", "agents");
       localStorage.removeItem("wiki-window-layout-v2");
     });
+
+    // Scenario 1: session created AFTER first migration (i.e., after backend
+    // has migrated the currently-empty runs dir). It must show unread on
+    // first appearance — the WIKI-147 R2 B1 contract.
     await page.goto(`${backend.baseUrl}/`, { waitUntil: "domcontentloaded" });
     await page.locator(".nav-agents").waitFor();
+    // The initial /api/agents call triggers the one-time migration on the
+    // empty runs dir. Wait for the viewed store file to prove migration ran.
+    await pokeAgents(page);
+    // Now create the run in the durable store — POST-migration.
+    await appendDurableEvent(fixtures, RUN_ID, 1);
+    await page.reload({ waitUntil: "domcontentloaded" });
     await page.locator(`.nav-agent .nav-agent-ticket:has-text("${WORKER}")`).waitFor();
-    await waitForUnread(page, WORKER, 1, "initial fetch should show unread dot");
+    await waitForUnread(page, WORKER, 1, "new post-migration session must show unread");
     await page.screenshot({ path: path.join(OUT_DIR, "1-unread.png"), fullPage: false });
 
-    // Open the session by clicking the row; the sidebar clears optimistically
-    // and posts the viewed mark to the backend.
+    // Scenario 2: open the row → optimistic clear + POST /viewed with the
+    // observed seq. Dot must disappear without waiting for the network.
     await page.locator(`.nav-agent:has(.nav-agent-ticket:has-text("${WORKER}"))`).click();
     await waitForUnread(page, WORKER, 0, "click should clear unread optimistically");
     await page.screenshot({ path: path.join(OUT_DIR, "2-cleared.png"), fullPage: false });
 
-    // Confirm the backend persisted the viewed timestamp.
-    const viewedAfterClick = await page.evaluate(async () => {
-      const res = await fetch("/api/agents", { cache: "no-store" });
-      const body = await res.json();
-      const row = body.workers.find((worker) => worker.ticket === "WIKI-147");
-      return row?.last_viewed_at ?? null;
+    // Confirm the backend persisted the viewed seq.
+    const persisted = await pokeAgents(page);
+    const rowAfterView = persisted.workers.find((worker) => worker.ticket === WORKER);
+    assert.equal(rowAfterView.last_viewed_seq, 1, "backend must persist last_viewed_seq");
+    assert.equal(rowAfterView.latest_event_seq, 1);
+
+    // Scenario 3: a REAL provider event lands in the durable store — the
+    // supervisor's append_normalized path advances normalized_event_count
+    // and updated_at in run.json. NO status-file mtime touch.
+    await appendDurableEvent(fixtures, RUN_ID, 2);
+
+    const advanced = await pokeAgents(page);
+    const rowAdvanced = advanced.workers.find((worker) => worker.ticket === WORKER);
+    assert.equal(rowAdvanced.latest_event_seq, 2);
+    assert.equal(rowAdvanced.last_viewed_seq, 1);
+
+    // Clear the URL hash + saved layout so the ticket is NOT active on
+    // reload. Otherwise the active-ticket effect would immediately re-mark
+    // the row viewed and hide the dot we're trying to observe.
+    await page.evaluate(() => {
+      history.replaceState(null, "", "/");
+      localStorage.removeItem("wiki-window-layout-v2");
     });
-    assert.ok(viewedAfterClick, "backend should have recorded last_viewed_at after open");
-
-    // Simulate a fresh event landing after the user viewed the session — pin
-    // the mtime slightly in the future so it always exceeds the recorded view.
-    const newerEvent = Math.floor(Date.now() / 1000) + 30;
-    await seedStatus(fixtures, WORKER, newerEvent);
-    await pokeAgents(page);
-
-    const agentsAfter = await page.evaluate(async () => {
-      const res = await fetch("/api/agents", { cache: "no-store" });
-      const body = await res.json();
-      return body.workers.find((worker) => worker.ticket === "WIKI-147");
-    });
-    assert.ok(
-      agentsAfter.latest_event_at > agentsAfter.last_viewed_at,
-      `expected latest_event_at > last_viewed_at, got ${JSON.stringify(agentsAfter)}`,
-    );
-
-    // Reload the page to refetch the sidebar; the dot should return because a
-    // new event landed after the recorded view.
+    // Reload — sidebar must show the dot again because seq advanced past
+    // the recorded viewed seq.
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.locator(`.nav-agent .nav-agent-ticket:has-text("${WORKER}")`).waitFor();
-    // The row is not the active ticket on reload (we cleared the layout), so
-    // the automatic mark-viewed effect will not fire and the dot should reappear.
-    await waitForUnread(page, WORKER, 1, "new event should re-show the unread dot after reload");
+    await waitForUnread(
+      page,
+      WORKER,
+      1,
+      "real durable event should re-show the unread dot without touching status mtime",
+    );
     await page.screenshot({ path: path.join(OUT_DIR, "3-reappeared.png"), fullPage: false });
+
+    // Scenario 4: a11y — the accessible name of the row includes "unread"
+    // when the dot is present, so a screen reader announces it.
+    const accessibleName = await page.evaluate((t) => {
+      const rows = Array.from(document.querySelectorAll(".nav-agent"));
+      const row = rows.find((el) => el.querySelector(".nav-agent-ticket")?.textContent === t);
+      return row?.textContent?.trim() ?? "";
+    }, WORKER);
+    assert.ok(
+      accessibleName.includes("unread"),
+      `expected accessible text to include "unread", got: ${accessibleName}`,
+    );
+
+    // Scenario 5: POST /viewed with an unknown run_id must 404.
+    const notFoundStatus = await page.evaluate(async () => {
+      const res = await fetch("/api/agents/runs/00000000-0000-4000-8000-999999999999/viewed", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      return res.status;
+    });
+    assert.equal(notFoundStatus, 404, "POST /viewed for unknown run_id must 404");
 
     await fs.writeFile(
       path.join(OUT_DIR, "summary.json"),
       JSON.stringify(
         {
           worker: WORKER,
+          run_id: RUN_ID,
           screenshots: ["1-unread.png", "2-cleared.png", "3-reappeared.png"],
-          latest_event_at: agentsAfter.latest_event_at,
-          last_viewed_at: agentsAfter.last_viewed_at,
+          scenarios: [
+            "post-migration new session shows unread",
+            "open clears dot optimistically + server persists",
+            "durable seq advance re-shows dot without status mtime touch",
+            "accessible name includes 'unread'",
+            "unknown run_id -> 404",
+          ],
         },
         null,
         2,

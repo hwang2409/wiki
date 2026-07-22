@@ -6117,6 +6117,18 @@ body.is-resizing-panes .pane-cell {
   pointer-events: none;
 }
 
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .nav-agent.has-unread .nav-agent-ticket {
   color: var(--text-normal);
 }

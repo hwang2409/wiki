@@ -1338,6 +1338,7 @@ export default function App() {
   }, [contextMenu]);
 
   const [accountEvents, setAccountEvents] = useState<AccountEvent[]>([]);
+  const sessionRefreshTimeoutRef = useRef<number | null>(null);
   useEffect(() => {
     const source = new EventSource("/api/events");
     source.onmessage = (raw) => {
@@ -1346,6 +1347,16 @@ export default function App() {
         if (!payload || typeof payload.type !== "string") return;
         if (payload.type === "session" && typeof payload.ticket === "string") {
           invalidateTranscript(payload.ticket, payload.surface ?? null);
+          // Real session events must advance the sidebar's latest_event_seq
+          // so a fresh event re-shows the unread dot. Coalesce bursts of
+          // session events (which fire per-turn) into one /api/agents
+          // refresh so the endpoint isn't hammered.
+          if (sessionRefreshTimeoutRef.current === null) {
+            sessionRefreshTimeoutRef.current = window.setTimeout(() => {
+              sessionRefreshTimeoutRef.current = null;
+              setRefreshTick((tick) => tick + 1);
+            }, 400);
+          }
           return;
         }
         if (
@@ -1374,7 +1385,13 @@ export default function App() {
         /* ignore malformed frames */
       }
     };
-    return () => source.close();
+    return () => {
+      if (sessionRefreshTimeoutRef.current !== null) {
+        window.clearTimeout(sessionRefreshTimeoutRef.current);
+        sessionRefreshTimeoutRef.current = null;
+      }
+      source.close();
+    };
   }, []);
 
   useEffect(() => {

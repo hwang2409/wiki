@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import fcntl
 import json
 import os
 import re
 import stat
 import subprocess
+import tempfile
 import time
-from contextlib import asynccontextmanager
+from collections.abc import Iterator
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -769,12 +772,22 @@ class NoteLinks(BaseModel):
 
 AGENT_REGISTRY_PATH = Path(os.environ.get("WIKI_AGENT_REGISTRY_PATH") or "/tmp/agent-registry.json")
 AGENT_STATUS_DIR = Path(os.environ.get("WIKI_AGENT_STATUS_DIR") or "/tmp/agent-status")
-AGENT_VIEWED_PATH = Path(os.environ.get("WIKI_AGENT_VIEWED_PATH") or "/tmp/agent-viewed.json")
+_DEFAULT_RUNTIME_DIR = Path(
+    os.environ.get("WIKI_AGENT_RUNTIME_DIR") or Path.home() / ".wiki" / "agent-runtime"
+)
+AGENT_RUNTIME_DIR = _DEFAULT_RUNTIME_DIR
+AGENT_RUNS_DIR = Path(os.environ.get("WIKI_AGENT_RUNS_DIR") or AGENT_RUNTIME_DIR / "runs")
+AGENT_VIEWED_PATH = Path(
+    os.environ.get("WIKI_AGENT_VIEWED_PATH") or AGENT_RUNTIME_DIR / "agent-viewed.json"
+)
 AGENT_ARCHIVE_DIR = Path(
     os.environ.get("WIKI_AGENT_ARCHIVE_DIR") or Path.home() / "me" / "fun" / "agent-archive"
 )
 AGENT_TMP_DIR = Path(os.environ.get("WIKI_AGENT_TMP_DIR") or "/tmp")
 SUPERVISOR_CLIENT = SupervisorClient(RuntimePaths.from_env())
+RUN_ID_PATTERN = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
 ARCHIVE_TS_PATTERN = re.compile(r"^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})$")
 ANSI_PATTERN = re.compile(
     r"\x1b\[[0-9;?]*[ -/]*[@-~]"  # CSI incl. space-intermediate forms (e.g. ESC[0 q)
@@ -920,43 +933,171 @@ def read_agent_status(ticket: str) -> dict | None:
         return None
 
 
-def _read_viewed_map() -> dict[str, str]:
+ViewedEntry = dict[str, Any]  # {"seq": int, "at": str}
+
+
+def _viewed_entry(value: Any) -> ViewedEntry | None:
+    if not isinstance(value, dict):
+        return None
+    seq = value.get("seq")
+    at = value.get("at")
+    if not isinstance(seq, int) or seq < 0:
+        return None
+    if not isinstance(at, str):
+        return None
+    return {"seq": seq, "at": at}
+
+
+@contextmanager
+def _viewed_lock(exclusive: bool) -> Iterator[Any]:
+    """Serialize read-modify-write cycles on the viewed store.
+
+    A separate lock file (never truncated) keeps the lock intact while
+    ``agent-viewed.json`` is atomically replaced.
+    """
+
+    AGENT_VIEWED_PATH.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = AGENT_VIEWED_PATH.with_suffix(AGENT_VIEWED_PATH.suffix + ".lock")
+    flags = os.O_RDWR | os.O_CREAT
+    fd = os.open(lock_path, flags, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        try:
+            yield fd
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _read_viewed_map_locked() -> dict[str, ViewedEntry]:
+    """Caller MUST already hold the viewed lock."""
+
     try:
         data = json.loads(AGENT_VIEWED_PATH.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
     if not isinstance(data, dict):
         return {}
-    return {
-        str(ticket): value
-        for ticket, value in data.items()
-        if isinstance(ticket, str) and isinstance(value, str)
-    }
+    result: dict[str, ViewedEntry] = {}
+    for run_id, entry in data.items():
+        if not isinstance(run_id, str) or run_id.startswith("_"):
+            continue
+        if not RUN_ID_PATTERN.fullmatch(run_id):
+            continue
+        parsed = _viewed_entry(entry)
+        if parsed is None:
+            continue
+        result[run_id] = parsed
+    return result
 
 
-def _write_viewed_map(data: dict[str, str]) -> None:
+def _read_viewed_map() -> dict[str, ViewedEntry]:
+    with _viewed_lock(exclusive=False):
+        return _read_viewed_map_locked()
+
+
+def _write_viewed_map_locked(data: dict[str, Any]) -> None:
+    """Caller MUST already hold the viewed lock (exclusive)."""
+
     AGENT_VIEWED_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = AGENT_VIEWED_PATH.with_suffix(AGENT_VIEWED_PATH.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
-    tmp_path.replace(AGENT_VIEWED_PATH)
+    fd, raw_tmp = tempfile.mkstemp(
+        prefix=f".{AGENT_VIEWED_PATH.name}.",
+        dir=AGENT_VIEWED_PATH.parent,
+    )
+    tmp = Path(raw_tmp)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, AGENT_VIEWED_PATH)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _isoformat_utc(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
 
+def _load_run_freshness(run_id: str | None) -> tuple[str | None, int | None]:
+    """Read the durable ``updated_at`` + normalized event count for a run.
+
+    Returns ``(None, None)`` when the run has no supervisor record — legacy
+    tmux workers, drift entries, or archived runs whose ``runs/<id>/run.json``
+    was removed. Never falls back to status-file ``mtime`` (WIKI-147 R2 B2).
+    """
+
+    if not run_id or not RUN_ID_PATTERN.fullmatch(run_id):
+        return None, None
+    run_path = AGENT_RUNS_DIR / run_id / "run.json"
+    try:
+        payload = json.loads(run_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None, None
+    if not isinstance(payload, dict):
+        return None, None
+    updated_at = payload.get("updated_at")
+    seq = payload.get("normalized_event_count")
+    if not isinstance(updated_at, str):
+        updated_at = None
+    if not isinstance(seq, int):
+        seq = None
+    return updated_at, seq
+
+
+def _run_exists(run_id: str) -> bool:
+    return (AGENT_RUNS_DIR / run_id / "run.json").is_file()
+
+
+def _migrate_viewed_store_if_needed() -> None:
+    """One-time backfill: mark every pre-deploy run as viewed at its current seq.
+
+    Runs exactly once per install (detected by absence of ``agent-viewed.json``).
+    Sessions created AFTER migration are NOT in the store and therefore render
+    unread if any real event exists — the WIKI-147 R2 B1 contract.
+    """
+
+    if AGENT_VIEWED_PATH.exists():
+        return
+    with _viewed_lock(exclusive=True):
+        # Recheck under the lock — a concurrent request may have migrated.
+        if AGENT_VIEWED_PATH.exists():
+            return
+        migrated: dict[str, Any] = {}
+        if AGENT_RUNS_DIR.is_dir():
+            for run_dir in AGENT_RUNS_DIR.iterdir():
+                if not run_dir.is_dir():
+                    continue
+                run_id = run_dir.name
+                if not RUN_ID_PATTERN.fullmatch(run_id):
+                    continue
+                updated_at, seq = _load_run_freshness(run_id)
+                if updated_at is None or seq is None:
+                    continue
+                migrated[run_id] = {"seq": seq, "at": updated_at}
+        migrated["_migrated_at"] = datetime.now(tz=timezone.utc).isoformat()
+        _write_viewed_map_locked(migrated)
+
+
 def _resolve_viewed_fields(
-    status: dict | None,
-    ticket: str,
-    viewed_map: dict[str, str],
-    viewed_backfill: dict[str, str],
-) -> tuple[str | None, str | None]:
-    latest_event_at = _isoformat_utc(status["_mtime"]) if status else None
-    last_viewed_at = viewed_map.get(ticket)
-    if latest_event_at is not None and last_viewed_at is None:
-        last_viewed_at = latest_event_at
-        viewed_backfill[ticket] = latest_event_at
-    return latest_event_at, last_viewed_at
+    run_id: str | None,
+    viewed_map: dict[str, ViewedEntry],
+) -> tuple[str | None, int | None, str | None, int | None]:
+    """Return ``(latest_event_at, latest_event_seq, last_viewed_at, last_viewed_seq)``.
+
+    New sessions (run_id not in ``viewed_map``) resolve to ``last_viewed_*=None``
+    so any existing event renders as unread.
+    """
+
+    latest_at, latest_seq = _load_run_freshness(run_id)
+    if not run_id or latest_at is None:
+        return latest_at, latest_seq, None, None
+    entry = viewed_map.get(run_id)
+    if entry is None:
+        return latest_at, latest_seq, None, None
+    return latest_at, latest_seq, entry.get("at"), entry.get("seq")
 
 
 def _archive_role(session_dir: Path) -> str | None:
@@ -1258,8 +1399,8 @@ def agents() -> dict[str, object]:
         if not supervisor_alive:
             supervisor_health["detail"] = "supervisor PID is absent or not running"
     now = datetime.now(tz=timezone.utc).timestamp()
+    _migrate_viewed_store_if_needed()
     viewed_map = _read_viewed_map()
-    viewed_backfill: dict[str, str] = {}
     workers = []
     orchestrators = []
     seen_tickets = set()
@@ -1308,9 +1449,12 @@ def agents() -> dict[str, object]:
                 }
             )
             continue
-        latest_event_at, last_viewed_at = _resolve_viewed_fields(
-            status, ticket, viewed_map, viewed_backfill
-        )
+        (
+            latest_event_at,
+            latest_event_seq,
+            last_viewed_at,
+            last_viewed_seq,
+        ) = _resolve_viewed_fields(current.get("run_id"), viewed_map)
         workers.append(
             {
                 "ticket": ticket,
@@ -1342,7 +1486,9 @@ def agents() -> dict[str, object]:
                     int(now - status["_mtime"]) if status else None
                 ),
                 "latest_event_at": latest_event_at,
+                "latest_event_seq": latest_event_seq,
                 "last_viewed_at": last_viewed_at,
+                "last_viewed_seq": last_viewed_seq,
             }
         )
 
@@ -1353,9 +1499,15 @@ def agents() -> dict[str, object]:
             if ticket in seen_tickets:
                 continue
             status = read_agent_status(ticket)
-            latest_event_at, last_viewed_at = _resolve_viewed_fields(
-                status, ticket, viewed_map, viewed_backfill
-            )
+            # Drift entries have no run_id -> no durable freshness signal
+            # and no unread indicator (matches "derive from durable runtime
+            # events" contract; WIKI-147 R2 B2).
+            (
+                latest_event_at,
+                latest_event_seq,
+                last_viewed_at,
+                last_viewed_seq,
+            ) = _resolve_viewed_fields(None, viewed_map)
             workers.append(
                 {
                     "ticket": ticket,
@@ -1379,7 +1531,9 @@ def agents() -> dict[str, object]:
                         int(now - status["_mtime"]) if status else None
                     ),
                     "latest_event_at": latest_event_at,
+                    "latest_event_seq": latest_event_seq,
                     "last_viewed_at": last_viewed_at,
+                    "last_viewed_seq": last_viewed_seq,
                 }
             )
 
@@ -1408,13 +1562,6 @@ def agents() -> dict[str, object]:
             }
         )
 
-    if viewed_backfill:
-        merged = {**viewed_map, **viewed_backfill}
-        try:
-            _write_viewed_map(merged)
-        except OSError:
-            pass
-
     return {
         "workers": workers,
         "orchestrators": orchestrators,
@@ -1423,16 +1570,71 @@ def agents() -> dict[str, object]:
     }
 
 
-@app.post("/api/agents/{agent_id}/viewed")
-def mark_agent_viewed(agent_id: str) -> dict[str, str]:
-    raw_id = agent_id.strip()
-    if not raw_id or not valid_agent_id(raw_id):
-        raise HTTPException(status_code=400, detail="Bad agent id")
-    viewed_map = _read_viewed_map()
-    now_iso = datetime.now(tz=timezone.utc).isoformat()
-    viewed_map[raw_id] = now_iso
-    _write_viewed_map(viewed_map)
-    return {"ticket": raw_id, "last_viewed_at": now_iso}
+class MarkViewedBody(BaseModel):
+    seq: int | None = None
+
+
+@app.post("/api/agents/runs/{run_id}/viewed")
+def mark_run_viewed(run_id: str, body: MarkViewedBody | None = None) -> dict[str, Any]:
+    """Server-authoritative "mark viewed" keyed by durable run id.
+
+    Body ``seq`` is the frontend's observed ``latest_event_seq``. The server
+    only accepts it if the run's current durable seq is at least that high,
+    and never overwrites a stored ``seq`` with a lower one (monotonic).
+
+    Returns 404 for run ids that do not exist in the runtime store — this
+    is the WIKI-147 R2 H1 contract.
+    """
+
+    if not RUN_ID_PATTERN.fullmatch(run_id):
+        raise HTTPException(status_code=400, detail="Bad run id")
+    if not _run_exists(run_id):
+        raise HTTPException(status_code=404, detail="Unknown run id")
+
+    current_at, current_seq = _load_run_freshness(run_id)
+    if current_seq is None or current_at is None:
+        raise HTTPException(status_code=404, detail="Run has no durable state")
+
+    requested_seq = body.seq if body and body.seq is not None else current_seq
+    if requested_seq < 0:
+        raise HTTPException(status_code=400, detail="seq must be non-negative")
+    # Client cannot claim to have seen events the server has not observed.
+    accepted_seq = min(requested_seq, current_seq)
+
+    with _viewed_lock(exclusive=True):
+        viewed_map = _read_viewed_map_locked()
+        prior = viewed_map.get(run_id)
+        # Monotonic: never overwrite a newer seq with an older one.
+        if prior is not None and prior.get("seq", 0) >= accepted_seq:
+            return {
+                "run_id": run_id,
+                "last_viewed_at": prior["at"],
+                "last_viewed_seq": prior["seq"],
+                "latest_event_at": current_at,
+                "latest_event_seq": current_seq,
+            }
+        now_iso = datetime.now(tz=timezone.utc).isoformat()
+        viewed_map[run_id] = {"seq": accepted_seq, "at": now_iso}
+        merged: dict[str, Any] = dict(viewed_map)
+        # Preserve the migration marker if present without letting it
+        # collide with a run entry (leading underscore already reserved
+        # by _read_viewed_map_locked).
+        try:
+            raw = json.loads(AGENT_VIEWED_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raw = {}
+        if isinstance(raw, dict):
+            for key, value in raw.items():
+                if isinstance(key, str) and key.startswith("_"):
+                    merged[key] = value
+        _write_viewed_map_locked(merged)
+    return {
+        "run_id": run_id,
+        "last_viewed_at": now_iso,
+        "last_viewed_seq": accepted_seq,
+        "latest_event_at": current_at,
+        "latest_event_seq": current_seq,
+    }
 
 
 @app.get("/api/dashboard/tickets")
