@@ -9,6 +9,7 @@ updated: 2026-07-22
 
 ## 2026-07-22
 
+- **wiki** — WIKI-149 code-block copy button + kind:diff artifact renderer — state-aware unified-diff parser (multi-file, bare headers, hunk-content `-- `/`++ ` safety, binary/rename/mode-only headers, `\ No newline at end of file`), per-artifact line-number toggle via ArtifactViewState, scrollable viewport w/ final-line visibility, WCAG-AA copy button, `@media (hover: none)` touch reachability — PR #117 squash 57c00819 (4 review rounds; rebased on origin/main after WIKI-144 landed)
 - **wiki** — WIKI-144 badge sweep — unified StatusBadge across dashboard/session-header/artifact rows/artifact-panel file-list; centralized statusToTone; WCAG-AA-compliant compact-badge token + contrast assertion; real-surface playwright — PR #118 squash f5214ad (2 review rounds)
 - **wiki** — WIKI-145 UI refresh II — 12 audit treatments (narrower rail, transparent workspace-sidebar+tab-header, hairline tabs, left-accent active row, borderless session-header, plain-prose assistant, downgraded notice/composer/activity-head, text-toggle chips); honest screenshot fixture + resilient python resolver; new layout/noise/typography playwright suites — PR #116 squash 7be5561 (3 review rounds)
 
