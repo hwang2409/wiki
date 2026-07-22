@@ -31,14 +31,17 @@ export function makeFixtureRoot(prefix) {
   const statusDir = join(root, "status");
   const sessionsDir = join(root, "sessions");
   const runtimeDir = join(root, "runtime");
+  const workgraphsDir = join(root, "workgraphs");
   mkdirSync(statusDir, { recursive: true });
   mkdirSync(sessionsDir, { recursive: true });
   mkdirSync(runtimeDir, { recursive: true });
+  mkdirSync(workgraphsDir, { recursive: true });
   return {
     root,
     statusDir,
     sessionsDir,
     runtimeDir,
+    workgraphsDir,
     // AF_UNIX paths are short on macOS; keep the isolated socket under /tmp.
     supervisorSocketPath: join("/tmp", `wiki-${socketSuffix}.sock`),
     registryPath: join(root, "agent-registry.json"),

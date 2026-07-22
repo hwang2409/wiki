@@ -87,10 +87,11 @@ def main_cli() -> None:
             # debounced localStorage flush.
             "WIKI_UI_STATE_PATH": str(fixture_root / "ui-state.json"),
             "WIKI_TOKEN_CACHE_PATH": str(fixture_root / "token-cache.json"),
+            "WIKI_WORKGRAPH_SNAPSHOT_DIR": str(fixture_root / "workgraphs"),
         }
     )
 
-    from backend.app import main, transcripts, uistate
+    from backend.app import main, transcripts, uistate, workgraph
 
     uistate.UI_STATE_PATH = fixture_root / "ui-state.json"
     main.AGENT_REGISTRY_PATH = args.registry
@@ -104,6 +105,8 @@ def main_cli() -> None:
     main.MSG_QUEUE_PATH = args.queue
     transcripts.CODEX_SESSIONS_DIR = args.codex_sessions_dir
     transcripts.CLAUDE_PROJECTS_DIR = claude_projects_dir
+    workgraph.STATUS_DIR = args.status_dir
+    workgraph.SNAPSHOT_DIR = fixture_root / "workgraphs"
 
     uvicorn.run(main.app, host=args.host, port=args.port, log_level=args.log_level)
 

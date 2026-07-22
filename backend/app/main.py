@@ -40,6 +40,7 @@ from . import (
     transcripts,
     uistate,
     vaultops,
+    workgraph,
 )
 from .agent_models import (
     default_model_for_kind,
@@ -1959,6 +1960,37 @@ def agent_pr_approve(ticket: str) -> dict[str, str]:
     if not TICKET_PATTERN.fullmatch(ticket):
         raise HTTPException(status_code=400, detail="Bad ticket")
     return github_pr.approve_pr(ticket)
+
+
+def _load_workgraph_payload(ticket: str) -> tuple[dict[str, object], str]:
+    graph = workgraph.load_workgraph(ticket, AGENT_STATUS_DIR)
+    if graph is not None:
+        return graph, "live"
+    graph = workgraph.load_snapshot(ticket)
+    if graph is not None:
+        return graph, "snapshot"
+    raise HTTPException(status_code=404, detail="No workgraph found for this ticket")
+
+
+@app.get("/api/agents/{ticket}/workgraph")
+def agent_workgraph(ticket: str) -> dict[str, object]:
+    if not TICKET_PATTERN.fullmatch(ticket):
+        raise HTTPException(status_code=400, detail="Bad ticket")
+    graph, source = _load_workgraph_payload(ticket)
+    return {"ok": True, "source": source, "workgraph": graph}
+
+
+@app.get("/api/agents/{ticket}/workgraph/health")
+def agent_workgraph_health(ticket: str, cap: int = workgraph.DEFAULT_ITERATION_CAP) -> dict[str, object]:
+    if not TICKET_PATTERN.fullmatch(ticket):
+        raise HTTPException(status_code=400, detail="Bad ticket")
+    graph, source = _load_workgraph_payload(ticket)
+    return {
+        "ok": True,
+        "source": source,
+        "health": workgraph.compute_composite_health(graph),
+        "alarms": workgraph.health_alarms(graph, iteration_cap=cap),
+    }
 
 
 def capture_pane_tail(window: str, lines: int) -> str | None:
