@@ -60,9 +60,13 @@ const BASH_TOOL_INPUT = [
 
 const GH_PREVIEW_URL = "https://github.com/hwang2409/wiki/pull/122";
 const GH_MIX_OUTPUT_TAIL_MARKER = "wiki-153 gh mix tail marker";
+const GH_MIX_ANSI_HEAD_MARKER = "wiki-153 gh mix ansi head";
+const GH_MIX_ANSI_TAIL_MARKER = "wiki-153 gh mix ansi tail";
 const GH_MIX_OUTPUT = [
+  `[32m${GH_MIX_ANSI_HEAD_MARKER}[0m`,
   `opened ${GH_PREVIEW_URL}`,
   ...Array.from({ length: LONG_OUTPUT_LINES }, (_, index) => `  gh-mix log line ${String(index + 1).padStart(2, "0")}`),
+  `[31m${GH_MIX_ANSI_TAIL_MARKER}[0m`,
   GH_MIX_OUTPUT_TAIL_MARKER,
 ].join("\n");
 
@@ -379,12 +383,26 @@ async function main() {
     }
     await ghMixOutput.locator(`a.external-link[href='${GH_PREVIEW_URL}'], a.gh-preview-card[href='${GH_PREVIEW_URL}']`).first().waitFor({ state: "visible" });
     await ghMixOutput.locator(".transcript-chip", { hasText: /^(nowrap|wrap)$/ }).waitFor({ state: "visible" });
+    if (ghMixBodyBefore.includes("\x1b[")) {
+      throw new Error("gh-preview text segments must strip ANSI escapes via renderAnsi, not render them raw");
+    }
+    if (!ghMixBodyBefore.includes(GH_MIX_ANSI_HEAD_MARKER)) {
+      throw new Error("gh-preview mixed output should include the ANSI head marker text");
+    }
+    await ghMixBody.locator(".session-tool-output-text .ansi-fg-2").first().waitFor({ state: "visible" });
     await ghMixOutput.locator(".transcript-chip", { hasText: "expand" }).click();
     await ghMixOutput.locator(".transcript-chip", { hasText: "collapse" }).waitFor({ state: "visible" });
     const ghMixBodyAfter = await ghMixBody.innerText();
     if (!ghMixBodyAfter.includes(GH_MIX_OUTPUT_TAIL_MARKER)) {
       throw new Error("expanded gh-preview mixed output should include the tail marker");
     }
+    if (ghMixBodyAfter.includes("\x1b[")) {
+      throw new Error("expanded gh-preview text segments must strip ANSI escapes via renderAnsi");
+    }
+    if (!ghMixBodyAfter.includes(GH_MIX_ANSI_TAIL_MARKER)) {
+      throw new Error("expanded gh-preview mixed output should include the ANSI tail marker text");
+    }
+    await ghMixBody.locator(".session-tool-output-text .ansi-fg-1").first().waitFor({ state: "visible" });
     await ghMixOutput.locator(".transcript-chip", { hasText: "collapse" }).click();
 
     logStep("custom-body wrap chip: available on bash tool input");

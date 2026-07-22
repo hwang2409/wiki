@@ -1052,7 +1052,7 @@ function ToolRow({
                           <GhPreviewCard key={`${segment.value}:${index}`} url={segment.value} />
                         ) : segment.value ? (
                           <span key={`text:${index}`} className="session-tool-output-text">
-                            {segment.value}
+                            {renderAnsi(segment.value)}
                           </span>
                         ) : null
                       )}
