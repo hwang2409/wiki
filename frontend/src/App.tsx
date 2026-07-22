@@ -1313,6 +1313,13 @@ export default function App() {
     error: null,
   });
   const [refreshTick, setRefreshTick] = useState(0);
+  // WIKI-151: dedicated nonce for the file-explorer retry. Bumping the shared
+  // refreshTick to re-run the file effect also re-triggers workspace
+  // discovery, agent listing, note listing, etc., and (per round-2 review)
+  // caused Retry to issue TWO /api/files/tree requests instead of one. This
+  // nonce is only in the file-loading effect's dep list, so a retry is
+  // strictly scoped to the file fetch.
+  const [filesRetryNonce, setFilesRetryNonce] = useState(0);
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [dialog, setDialog] = useState<DialogState | null>(null);
   const paneIdRef = useRef(0);
@@ -1614,11 +1621,12 @@ export default function App() {
         },
       };
     });
-    // WIKI-151: without this bump the loading effect's [activeFileState?.loaded]
-    // dependency never changes on retry (loaded was already false when the
-    // error was set), so the fetch never fires again. Advancing refreshTick
-    // — which the same effect already depends on — forces it to re-run.
-    setRefreshTick((tick) => tick + 1);
+    // WIKI-151 (round-2 HIGH#2): scope the retry to the files effect only.
+    // The prior implementation bumped the shared `refreshTick`, which also
+    // ran the workspace-discovery effect; discovery then replaced
+    // `workspaces` and triggered a SECOND file request in the same click.
+    // A per-effect nonce keeps the retry exactly-once.
+    setFilesRetryNonce((nonce) => nonce + 1);
   };
 
   useEffect(() => {
@@ -1681,7 +1689,16 @@ export default function App() {
       .finally(() => {
         filesRequestTrackerRef.current.finish(cacheKey, requestToken);
       });
-  }, [activeFileState?.loaded, activeWorkspace, activeWorkspaceInfo, refreshTick, showAllFiles, switcherOpen, workspaces]);
+  }, [
+    activeFileState?.loaded,
+    activeWorkspace,
+    activeWorkspaceInfo,
+    filesRetryNonce,
+    refreshTick,
+    showAllFiles,
+    switcherOpen,
+    workspaces,
+  ]);
 
   useEffect(() => {
     for (const window of windowState.windows) {
@@ -3794,6 +3811,16 @@ export default function App() {
                 <div className="nav-empty">
                   <LoadingPlaceholder className="nav-loading" lines={[92, 86, 88, 74, 81]} />
                 </div>
+              ) : workspaceUnavailable ? (
+                // WIKI-151: an unavailable workspace must render its own empty
+                // body — NEVER fall through to whatever `tree` happens to hold
+                // for the wiki vault. `buildTree(notes, undefined, ...)`
+                // populates the tree with wiki notes whenever showAllFiles is
+                // off, so a selected-but-not-live phoebe would otherwise leak
+                // wiki content into the sidebar (round-2 review HIGH#1).
+                <div className="nav-empty" data-testid="workspace-unavailable">
+                  Workspace unavailable
+                </div>
               ) : (
                 <>
                   {(tree.files.length > 0 || tree.folders.length > 0) ? (
@@ -3821,11 +3848,7 @@ export default function App() {
                       onOpenFile={openTreeFile}
                       onToggleFolder={toggleFolder}
                     />
-                  ) : filesError ? null : workspaceUnavailable ? (
-                    <div className="nav-empty" data-testid="workspace-unavailable">
-                      Workspace unavailable
-                    </div>
-                  ) : filesLoaded ? (
+                  ) : filesError ? null : filesLoaded ? (
                     <div className="nav-empty" data-testid="nav-empty-notes">No notes yet</div>
                   ) : null}
                   {filesTruncated ? <div className="nav-empty">File list truncated at 10,000 items</div> : null}

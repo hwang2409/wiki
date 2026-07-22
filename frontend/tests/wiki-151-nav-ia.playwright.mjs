@@ -151,6 +151,34 @@ try {
     }
   });
 
+  // WIKI-151 round-2 HIGH#1: seed a NON-EMPTY vault so the wiki tree would
+  // populate `tree.files/folders` under a naïve fallback. If the unavailable
+  // branch is missing (or rendered after the tree check), phoebe-selected
+  // would silently show these wiki notes.
+  await page.route("**/api/notes", async (route) => {
+    if (route.request().method() !== "GET") {
+      await route.fallback();
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify([
+        {
+          id: "seed-wiki-note",
+          path: "seed.md",
+          title: "Seed",
+          created_at: "2026-07-22T15:00:00Z",
+          updated_at: "2026-07-22T15:00:00Z",
+          excerpt: null,
+          links: [],
+          backlinks: [],
+          size: 32,
+        },
+      ]),
+    });
+  });
+
   // Mock /api/workspaces with one live + one unavailable root so we can verify
   // the friendly-label + unavailable badge treatments without needing real
   // discovery.
@@ -318,6 +346,27 @@ try {
     `persisted unavailable workspace must stay selected — expected "phoebe", got "${selectedValue}"`,
   );
 
+  // WIKI-151 round-2 HIGH#1 regression: with a NON-EMPTY vault (seeded above)
+  // and the selection stuck on unavailable phoebe, the file explorer body
+  // MUST render the "Workspace unavailable" state — NOT the wiki tree the
+  // frontend loaded from /api/notes. Previously the render checked
+  // `tree.files/folders` before workspaceUnavailable, so the seeded wiki
+  // note leaked into a phoebe-selected sidebar.
+  const unavailableBodyCount = await page
+    .locator('[data-testid="workspace-unavailable"]')
+    .count();
+  assert(
+    unavailableBodyCount === 1,
+    `unavailable workspace body missing: expected 1 [data-testid="workspace-unavailable"], got ${unavailableBodyCount}`,
+  );
+  const leakedTreeItems = await page
+    .locator('.sidebar-mode[data-mode="files"] .nav-files-container .tree-item')
+    .count();
+  assert(
+    leakedTreeItems === 0,
+    `wiki tree items must not leak into a phoebe-selected sidebar — saw ${leakedTreeItems}`,
+  );
+
   await page.screenshot({ path: path.join(OUT_DIR, "nav-ia.png") });
 
   // 7. File explorer retry: enable the all-files loader (so the effect at
@@ -351,17 +400,23 @@ try {
   assert(treeCalls >= 1, `expected initial /api/files/tree fetch, saw ${treeCalls}`);
   const callsBeforeRetry = treeCalls;
 
-  // Click Retry — this must re-issue the request. Before the HIGH#2 fix
-  // retryFiles() only mutated refs and the loading effect had no changed
-  // dependency, so the number of calls stayed at 1.
+  // Click Retry — this must re-issue the request EXACTLY once. Round-2
+  // review HIGH#2: the prior implementation bumped shared refreshTick,
+  // which also re-ran workspace-discovery; discovery then triggered a
+  // second file request in the same click (observed before=1 after=3).
+  // The file-scoped nonce must keep this exactly-one.
   await page.locator('[data-testid="files-fetch-error"] .nav-inline-retry').click();
   const deadline = Date.now() + 8_000;
   while (treeCalls <= callsBeforeRetry && Date.now() < deadline) {
     await page.waitForTimeout(100);
   }
+  // Settle for a beat to let any straggler request land — then assert exact
+  // count. If the retry fanout leaks back, treeCalls will exceed
+  // callsBeforeRetry + 1 here.
+  await page.waitForTimeout(1_000);
   assert(
-    treeCalls > callsBeforeRetry,
-    `Retry must re-issue /api/files/tree — before=${callsBeforeRetry} after=${treeCalls}`,
+    treeCalls === callsBeforeRetry + 1,
+    `Retry must issue exactly ONE additional /api/files/tree — before=${callsBeforeRetry} after=${treeCalls}`,
   );
 
   // 8. Empty-state CTA: seed a fixture with ZERO agents to prove the empty
