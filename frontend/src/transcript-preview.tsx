@@ -60,6 +60,7 @@ export type BoundedPreviewRenderProps = {
   expanded: boolean;
   clipped: boolean;
   hiddenCount: number;
+  wrap: boolean;
 };
 
 type BoundedPreviewProps = {
@@ -122,6 +123,7 @@ export function BoundedPreview({
         expanded,
         clipped: shouldClip,
         hiddenCount,
+        wrap,
       })
     : null;
   const defaultBody: ReactNode = renderExpandedBody && expanded
@@ -142,7 +144,7 @@ export function BoundedPreview({
         {label ? <span className="transcript-preview-label">{label}</span> : null}
         {summary ? <span className="transcript-preview-summary">{summary}</span> : null}
         <span className="transcript-preview-actions">
-          {wrapAvailable && !renderBody ? (
+          {wrapAvailable ? (
             <ChipButton
               active={!wrap}
               label={wrap ? "nowrap" : "wrap"}
@@ -168,7 +170,7 @@ export function BoundedPreview({
         </span>
       </div>
       {custom ? (
-        <div className="transcript-preview-body is-custom">
+        <div className={`transcript-preview-body is-custom${wrap ? " is-wrap" : " is-nowrap"}`}>
           {custom}
           {moreHint}
         </div>

@@ -9035,3 +9035,14 @@ body.is-resizing-panes .pane-cell {
   overflow-wrap: anywhere;
   font-family: inherit;
 }
+
+.transcript-preview-body.is-custom.is-nowrap {
+  overflow-x: auto;
+}
+
+.transcript-preview-body.is-custom.is-nowrap .session-tool-output-text,
+.transcript-preview-body.is-custom.is-nowrap pre,
+.transcript-preview-body.is-custom.is-nowrap .shiki-block code {
+  white-space: pre;
+  overflow-wrap: normal;
+}

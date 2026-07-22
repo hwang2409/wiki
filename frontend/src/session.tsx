@@ -992,10 +992,7 @@ function ToolRow({
   const Icon = ARCHETYPE_ICONS[tool.archetype] ?? Terminal;
   const summary = tool.summary || tool.input.split("\n")[0].slice(0, 120);
   const running = tool.output === null && tool.ok === null;
-  const outputSegments =
-    tool.output && containsGitHubPreviewUrl(tool.output)
-      ? splitGitHubPreviewSegments(tool.output)
-      : null;
+  const hasGitHubPreview = !!tool.output && containsGitHubPreviewUrl(tool.output);
   return (
     <div className={`session-tool${open ? " is-open" : ""}`}>
       <button className="session-tool-head" type="button" onClick={() => setOpen(!open)}>
@@ -1040,25 +1037,28 @@ function ToolRow({
             ) : tool.input ? (
               <BoundedPreview label="input" text={tool.input} />
             ) : null}
-            {outputSegments ? (
+            {hasGitHubPreview ? (
               <BoundedPreview
                 ansi
                 label="output"
                 text={tool.output ?? ""}
                 tone={tool.ok === false ? "error" : "normal"}
-                renderBody={() => (
-                  <div className="session-tool-output-blocks">
-                    {outputSegments.map((segment, index) =>
-                      segment.type === "url" ? (
-                        <GhPreviewCard key={`${segment.value}:${index}`} url={segment.value} />
-                      ) : segment.value ? (
-                        <span key={`text:${index}`} className="session-tool-output-text">
-                          {segment.value}
-                        </span>
-                      ) : null
-                    )}
-                  </div>
-                )}
+                renderBody={({ text }) => {
+                  const segments = splitGitHubPreviewSegments(text);
+                  return (
+                    <div className="session-tool-output-blocks">
+                      {segments.map((segment, index) =>
+                        segment.type === "url" ? (
+                          <GhPreviewCard key={`${segment.value}:${index}`} url={segment.value} />
+                        ) : segment.value ? (
+                          <span key={`text:${index}`} className="session-tool-output-text">
+                            {segment.value}
+                          </span>
+                        ) : null
+                      )}
+                    </div>
+                  );
+                }}
               />
             ) : tool.output ? (
               <BoundedPreview

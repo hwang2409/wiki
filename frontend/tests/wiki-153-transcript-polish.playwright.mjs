@@ -50,11 +50,20 @@ const BASH_COMMAND_TEXT = [
   `  && cat /tmp/wiki-153-fixture/large.log | head -${LONG_OUTPUT_LINES}`,
 ].join("\n");
 
+const BASH_TOOL_INPUT_LINES = 34;
 const BASH_TOOL_INPUT = [
   `#!/usr/bin/env bash`,
   `set -euo pipefail`,
-  ...Array.from({ length: LONG_INPUT_LINES }, (_, index) => `echo "wiki-153 tool step ${index + 1}"`),
+  ...Array.from({ length: BASH_TOOL_INPUT_LINES }, (_, index) => `echo "wiki-153 tool step ${index + 1}"`),
   `exit 0`,
+].join("\n");
+
+const GH_PREVIEW_URL = "https://github.com/hwang2409/wiki/pull/122";
+const GH_MIX_OUTPUT_TAIL_MARKER = "wiki-153 gh mix tail marker";
+const GH_MIX_OUTPUT = [
+  `opened ${GH_PREVIEW_URL}`,
+  ...Array.from({ length: LONG_OUTPUT_LINES }, (_, index) => `  gh-mix log line ${String(index + 1).padStart(2, "0")}`),
+  GH_MIX_OUTPUT_TAIL_MARKER,
 ].join("\n");
 
 const CLAUDE_TRANSCRIPT_ROWS = [
@@ -138,6 +147,38 @@ const CLAUDE_TRANSCRIPT_ROWS = [
           type: "tool_result",
           tool_use_id: "toolu_bash_fixture",
           content: "wiki-153 bash tool ran ok",
+        },
+      ],
+    },
+  },
+  {
+    type: "assistant",
+    timestamp: "2026-07-22T18:00:03.800Z",
+    message: {
+      role: "assistant",
+      content: [
+        {
+          type: "tool_use",
+          id: "toolu_bash_ghmix",
+          name: "Bash",
+          input: {
+            command: "gh pr view 122 --json url",
+            description: "wiki-153 gh mix fixture",
+          },
+        },
+      ],
+    },
+  },
+  {
+    type: "user",
+    timestamp: "2026-07-22T18:00:03.900Z",
+    message: {
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_bash_ghmix",
+          content: GH_MIX_OUTPUT,
         },
       ],
     },
@@ -322,6 +363,32 @@ async function main() {
     if (!/\d+ lines · /.test(bashToolSummary)) throw new Error(`bash tool input summary malformed: ${bashToolSummary}`);
     await bashToolInput.locator(".transcript-chip", { hasText: "copy" }).waitFor({ state: "visible" });
     await bashToolInput.locator(".transcript-chip", { hasText: "expand" }).waitFor({ state: "visible" });
+
+    logStep("gh-preview mixed with long output: clip bounds output, expand reveals tail");
+    const ghMixTool = page.locator(".session-tool", { has: page.locator(".session-tool-summary", { hasText: /gh pr view 122/ }) }).first();
+    await ghMixTool.waitFor({ state: "visible" });
+    await ghMixTool.locator(".session-tool-head").click();
+    const ghMixOutput = ghMixTool.locator(".transcript-preview", { has: page.locator(".transcript-preview-label", { hasText: "output" }) }).first();
+    await ghMixOutput.waitFor({ state: "visible" });
+    const ghMixBody = ghMixOutput.locator(".transcript-preview-body.is-custom").first();
+    await ghMixBody.waitFor({ state: "visible" });
+    await ghMixOutput.locator(".transcript-preview-more").waitFor({ state: "visible" });
+    const ghMixBodyBefore = await ghMixBody.innerText();
+    if (ghMixBodyBefore.includes(GH_MIX_OUTPUT_TAIL_MARKER)) {
+      throw new Error("gh-preview mixed output should hide tail marker before expand — renderBody must clip via BoundedPreview text");
+    }
+    await ghMixOutput.locator(`a.external-link[href='${GH_PREVIEW_URL}'], a.gh-preview-card[href='${GH_PREVIEW_URL}']`).first().waitFor({ state: "visible" });
+    await ghMixOutput.locator(".transcript-chip", { hasText: /^(nowrap|wrap)$/ }).waitFor({ state: "visible" });
+    await ghMixOutput.locator(".transcript-chip", { hasText: "expand" }).click();
+    await ghMixOutput.locator(".transcript-chip", { hasText: "collapse" }).waitFor({ state: "visible" });
+    const ghMixBodyAfter = await ghMixBody.innerText();
+    if (!ghMixBodyAfter.includes(GH_MIX_OUTPUT_TAIL_MARKER)) {
+      throw new Error("expanded gh-preview mixed output should include the tail marker");
+    }
+    await ghMixOutput.locator(".transcript-chip", { hasText: "collapse" }).click();
+
+    logStep("custom-body wrap chip: available on bash tool input");
+    await bashToolInput.locator(".transcript-chip", { hasText: /^(nowrap|wrap)$/ }).waitFor({ state: "visible" });
 
     logStep("bash block: three labelled sections, ansi preserved");
     const bashBlock = page.locator(".session-bash").first();
