@@ -19,7 +19,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, cast
 from uuid import UUID, uuid4
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -3682,7 +3682,66 @@ class ComposerGateIn(BaseModel):
 
 class ComposerProvisionIn(BaseModel):
     ticket: str = Field(..., min_length=1, max_length=80)
-    orch: str = Field(..., min_length=1, max_length=100)
+    # `orch` is retained for logging/debug only. The server derives the
+    # dispatching orchestrator from the caller's session id header and
+    # ignores this field for authorization (see H1 in WIKI-148 review3).
+    orch: str | None = Field(default=None, min_length=1, max_length=100)
+
+
+def _orch_from_caller_session(session_id: str | None) -> str:
+    """Return the orchestrator id whose registered session id matches the caller.
+
+    Callers prove identity by sending `X-Wiki-Session-Id`. We look up the
+    session id in the agent registry and require the matching entry to have
+    role=orchestrator. Worker sessions and unknown ids are rejected — this
+    is what stops a worker from POSTing an arbitrary `orch` field and
+    provisioning a worktree in another orchestrator's repo.
+    """
+
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="X-Wiki-Session-Id header is required for composer provisioning",
+        )
+    needle = session_id.strip()
+
+    try:
+        registry = _read_agent_registry()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=500,
+            detail=f"agent registry unreadable: {exc}",
+        ) from exc
+
+    if not isinstance(registry, dict):
+        raise HTTPException(status_code=403, detail="No registered session matches caller")
+
+    match_ticket: str | None = None
+    match_role: str | None = None
+    for ticket_id, entry in registry.items():
+        if ticket_id == "_orchestrators" or not isinstance(entry, dict):
+            continue
+        current = entry.get("current")
+        if not isinstance(current, dict):
+            continue
+        if current.get("session_id") == needle:
+            match_ticket = ticket_id
+            match_role = current.get("role") if isinstance(current.get("role"), str) else None
+            break
+
+    if match_ticket is None:
+        # Fall back to legacy orchestrator entries which don't carry session_id.
+        raise HTTPException(status_code=403, detail="No registered session matches caller")
+
+    if match_role != "orchestrator":
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"/spawn must be dispatched from an orchestrator session; "
+                f"caller session belongs to '{match_ticket}' (role={match_role!r})"
+            ),
+        )
+    return match_ticket
 
 
 def _resolve_orchestrator_root(orch_id: str) -> Path:
@@ -3753,17 +3812,115 @@ def _resolve_orchestrator_root(orch_id: str) -> Path:
     return repo_root
 
 
+def _validate_existing_worktree(
+    workdir: Path, repo_root: Path, branch: str
+) -> None:
+    """Reject stale/unrelated worktrees before returning them as-is.
+
+    An `.git` file/dir alone is not proof — a leftover from a prior repo, an
+    empty marker, or a checkout on the wrong branch would all pass a naive
+    `.git.exists()` check. We verify:
+
+    - `git rev-parse --git-common-dir` points at `<repo_root>/.git` (same
+      upstream repository, not an unrelated one).
+    - `git rev-parse --abbrev-ref HEAD` matches the expected branch.
+
+    Any mismatch is a 409 with a specific message so the caller can pick a
+    different ticket or clean up manually.
+    """
+
+    expected_common = (repo_root / ".git").resolve()
+    try:
+        common = subprocess.run(
+            ["git", "-C", str(workdir), "rev-parse", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except OSError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{workdir} exists but git could not inspect it: {exc}",
+        ) from exc
+    if common.returncode != 0:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{workdir} exists but is not a git worktree: "
+                f"{(common.stderr or common.stdout or 'git rev-parse failed').strip()[:200]}"
+            ),
+        )
+    common_path = Path(common.stdout.strip())
+    if not common_path.is_absolute():
+        common_path = (workdir / common_path).resolve()
+    else:
+        common_path = common_path.resolve()
+    if common_path != expected_common:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"existing worktree at {workdir} belongs to a different repository "
+                f"({common_path}); expected {expected_common}"
+            ),
+        )
+
+    try:
+        head = subprocess.run(
+            ["git", "-C", str(workdir), "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except OSError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{workdir} exists but git could not read HEAD: {exc}",
+        ) from exc
+    if head.returncode != 0:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{workdir} exists but HEAD is unreadable: "
+                f"{(head.stderr or head.stdout or 'rev-parse HEAD failed').strip()[:200]}"
+            ),
+        )
+    actual_branch = head.stdout.strip()
+    if actual_branch != branch:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"existing worktree at {workdir} is on branch {actual_branch!r}, "
+                f"expected {branch!r}"
+            ),
+        )
+
+
 @app.post("/api/composer/provision-worktree")
-def composer_provision_worktree(body: ComposerProvisionIn) -> dict[str, object]:
+def composer_provision_worktree_route(
+    body: ComposerProvisionIn,
+    x_wiki_session_id: str | None = Header(default=None, alias="X-Wiki-Session-Id"),
+) -> dict[str, object]:
+    """FastAPI wrapper that binds `orch` to the caller's session identity."""
+
+    orch_id = _orch_from_caller_session(x_wiki_session_id)
+    return composer_provision_worktree(body, orch_id)
+
+
+def composer_provision_worktree(
+    body: ComposerProvisionIn, orch_id: str
+) -> dict[str, object]:
     """Ensure `.claude/worktrees/<ticket-lower>` exists in the caller's repo.
 
-    Backs the composer `/spawn` slash command. The `orch` field identifies the
-    dispatching orchestrator; the repo root is looked up in the agent registry
-    so misc/tooling/phoebe orchestrators provision inside their own repos
-    rather than Wiki's `ROOT_DIR`. Worker sessions are rejected. Existing
-    worktrees are returned as-is only when they are valid git worktrees;
-    missing paths get `git worktree add -b <branch> <path> FETCH_HEAD` after a
-    fresh `git fetch origin main` (whose exit status is required to be zero).
+    Backs the composer `/spawn` slash command. `orch_id` MUST come from the
+    caller's registered session identity (see `_orch_from_caller_session`) —
+    never from the request body. Body's `orch` field is ignored for
+    authorization. Worker sessions are rejected at the identity layer.
+    Existing worktrees are returned as-is only when they are valid git
+    worktrees pointing at the expected repo and branch; missing paths get
+    `git worktree add -b <branch> <path> FETCH_HEAD` after a fresh
+    `git fetch origin main` (whose exit status is required to be zero).
     Uses `-b` — never `-B` — so a colliding branch is a clean error, never a
     silent force-reset of in-progress work.
     """
@@ -3774,9 +3931,6 @@ def composer_provision_worktree(body: ComposerProvisionIn) -> dict[str, object]:
             status_code=400,
             detail="Ticket must be uppercase letters, numbers, or dashes",
         )
-    orch_id = body.orch.strip()
-    if not orch_id:
-        raise HTTPException(status_code=400, detail="orch is required")
     repo_root = _resolve_orchestrator_root(orch_id)
 
     branch = ticket.lower()
@@ -3792,6 +3946,7 @@ def composer_provision_worktree(body: ComposerProvisionIn) -> dict[str, object]:
                 status_code=409,
                 detail=f"{workdir} exists but is not a git worktree",
             )
+        _validate_existing_worktree(workdir, repo_root, branch)
         return {"workdir": str(workdir), "provisioned": False}
     workdir.parent.mkdir(parents=True, exist_ok=True)
     try:

@@ -81,9 +81,41 @@ async function main() {
       });
     });
 
+    // Composer now derives orch from the caller's session id header (H1). It
+    // fetches /api/agents to look up the current orch's provider_session_id
+    // and passes it as X-Wiki-Session-Id on the provision request.
+    await page.route("**/api/agents", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          workers: [],
+          orchestrators: [
+            {
+              id: TICKET,
+              window: null,
+              window_alive: true,
+              provider_session_id: "orch-session-fake",
+              cwd: "/fake/repo",
+              kind: "cc",
+              model: "claude-opus-4-7",
+              effort: null,
+              spawned_at: null,
+              transcript_exists: true,
+            },
+          ],
+          archived: [],
+        }),
+      });
+    });
+
     await page.route("**/api/composer/provision-worktree", async (route) => {
-      const body = route.request().postDataJSON();
-      provisionPayloads.push(body);
+      const request = route.request();
+      const body = request.postDataJSON();
+      provisionPayloads.push({
+        body,
+        sessionHeader: request.headers()["x-wiki-session-id"] ?? null,
+      });
       await route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -232,8 +264,13 @@ async function main() {
     }
     await submit.click();
     await page.waitForFunction(() => document.querySelector(".composer-command-form") === null);
-    if (provisionPayloads.length !== 1 || provisionPayloads[0].ticket !== "WIKI-149") {
+    if (provisionPayloads.length !== 1 || provisionPayloads[0].body.ticket !== "WIKI-149") {
       throw new Error(`provision not called: ${JSON.stringify(provisionPayloads)}`);
+    }
+    if (provisionPayloads[0].sessionHeader !== "orch-session-fake") {
+      throw new Error(
+        `X-Wiki-Session-Id header missing/wrong: ${JSON.stringify(provisionPayloads[0])}`
+      );
     }
     if (spawnPayloads.length !== 1) {
       throw new Error(`spawn should fire once, got ${spawnPayloads.length}`);

@@ -1,5 +1,6 @@
 import {
   archiveAgent,
+  getAgents,
   replaceAgent,
   sendAgentMessage,
   spawnAgentWorker,
@@ -43,10 +44,28 @@ const ROLES = ["plan", "implement", "review"] as const;
 const OUTCOMES = ["merged", "closed", "abandoned"] as const;
 const EFFORTS = ["low", "medium", "high"] as const;
 
+async function resolveOrchSessionId(orch: string): Promise<string> {
+  // Server derives the dispatching orchestrator from this session id (H1).
+  // Body `orch` is ignored for authorization — the caller must prove identity.
+  const agents = await getAgents();
+  const match = agents.orchestrators.find((entry) => entry.id === orch);
+  const sessionId = match?.provider_session_id?.trim();
+  if (!sessionId) {
+    throw new Error(
+      `no provider session id registered for orchestrator '${orch}' — is the UI attached to a live run?`
+    );
+  }
+  return sessionId;
+}
+
 async function provisionWorktree(ticket: string, orch: string): Promise<string> {
+  const sessionId = await resolveOrchSessionId(orch);
   const response = await fetch("/api/composer/provision-worktree", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "X-Wiki-Session-Id": sessionId,
+    },
     body: JSON.stringify({ ticket, orch }),
   });
   const body = (await response.json().catch(() => null)) as
