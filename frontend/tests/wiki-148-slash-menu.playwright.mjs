@@ -81,28 +81,24 @@ async function main() {
       });
     });
 
-    // Composer authenticates via a per-orch composer token minted server-side
-    // (H1, round 5). The token is NOT exposed in /api/agents — the frontend
-    // fetches it from /api/composer/orch-token/<id>, then sends it as
-    // X-Wiki-Composer-Token on the provision request. A worker scraping
-    // /api/agents cannot forge the header.
-    await page.route(`**/api/composer/orch-token/${TICKET}`, async (route) => {
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify({ orch: TICKET, token: "orch-composer-token-fake" }),
-      });
-    });
+    // Round 6, Path B: the composer authenticates by attaching an
+    // X-Wiki-App-Secret header sourced from the Tauri invoke bridge
+    // (`get_wiki_app_secret`). Playwright fakes the bridge by injecting a
+    // known secret into `window.__WIKI_APP_SECRET__` via addInitScript
+    // below. The prior per-orch composer-token endpoint is gone — the
+    // frontend must send NO X-Wiki-Composer-Token header and MUST send
+    // X-Wiki-App-Secret with the fixture value.
 
     await page.route("**/api/composer/provision-worktree", async (route) => {
       const request = route.request();
       const body = request.postDataJSON();
       provisionPayloads.push({
         body,
-        composerTokenHeader: request.headers()["x-wiki-composer-token"] ?? null,
-        // Ensure the legacy session-id header is NOT sent — the round-5
-        // rewrite must drop the spoofable path entirely.
+        appSecretHeader: request.headers()["x-wiki-app-secret"] ?? null,
+        // Round 6: neither the legacy session-id header nor the
+        // round-5 composer-token header must appear on this request.
         legacySessionHeader: request.headers()["x-wiki-session-id"] ?? null,
+        legacyTokenHeader: request.headers()["x-wiki-composer-token"] ?? null,
       });
       await route.fulfill({
         status: 200,
@@ -167,6 +163,12 @@ async function main() {
       });
     });
 
+    await page.addInitScript(() => {
+      // Round 6: composer requests carry X-Wiki-App-Secret sourced from
+      // the Tauri invoke bridge in production. Playwright has no Tauri —
+      // the frontend's getWikiAppSecret helper falls back to this global.
+      window.__WIKI_APP_SECRET__ = "playwright-wiki-app-secret-fixture";
+    });
     await page.addInitScript(({ ticket }) => {
       localStorage.setItem("wiki-sidebar-visible", "false");
       localStorage.setItem(
@@ -255,14 +257,19 @@ async function main() {
     if (provisionPayloads.length !== 1 || provisionPayloads[0].body.ticket !== "WIKI-149") {
       throw new Error(`provision not called: ${JSON.stringify(provisionPayloads)}`);
     }
-    if (provisionPayloads[0].composerTokenHeader !== "orch-composer-token-fake") {
+    if (provisionPayloads[0].appSecretHeader !== "playwright-wiki-app-secret-fixture") {
       throw new Error(
-        `X-Wiki-Composer-Token header missing/wrong: ${JSON.stringify(provisionPayloads[0])}`
+        `X-Wiki-App-Secret header missing/wrong: ${JSON.stringify(provisionPayloads[0])}`
       );
     }
     if (provisionPayloads[0].legacySessionHeader !== null) {
       throw new Error(
         `Legacy X-Wiki-Session-Id header must NOT be sent (H1 spoof surface): ${JSON.stringify(provisionPayloads[0])}`
+      );
+    }
+    if (provisionPayloads[0].legacyTokenHeader !== null) {
+      throw new Error(
+        `Legacy X-Wiki-Composer-Token header must NOT be sent (round-5 token endpoint gone): ${JSON.stringify(provisionPayloads[0])}`
       );
     }
     if (spawnPayloads.length !== 1) {

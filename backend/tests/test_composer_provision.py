@@ -340,14 +340,17 @@ class ProvisionWorktreeTests(unittest.TestCase):
         self.assertEqual(head, origin_head)
 
 
-ORCH_TOKEN = "orch-composer-token-1234567890abcdef"
-WORKER_TOKEN_ATTEMPT = "not-a-registered-token-zzzz"
+WIKI_APP_SECRET_FIXTURE = "wiki-app-origin-secret-fixture-abcdefghij"
 
 
-class ComposerTokenAuthTests(unittest.TestCase):
-    """H1 (round 5): auth binds to per-orch composer tokens, NOT to any
-    identifier exposed via /api/agents. Worker sessions never hold a token
-    and cannot forge the header by scraping the public agent list.
+class WikiAppOriginAuthTests(unittest.TestCase):
+    """H1 (round 6, Path B): composer endpoints require the in-memory
+    Wiki.app origin secret. There is NO client-supplied credential path
+    left — the earlier per-orch token endpoint was itself spoofable (any
+    caller who knew the orch id could fetch the token) and is removed
+    entirely. Worker CLI sessions run outside Tauri's IPC bridge and
+    cannot obtain the secret; they get 403 regardless of the body they
+    craft.
     """
 
     def setUp(self) -> None:
@@ -357,138 +360,130 @@ class ComposerTokenAuthTests(unittest.TestCase):
         self._registry_path = self.root / "agent-registry.json"
         self._registry_patch = mock.patch.object(main, "AGENT_REGISTRY_PATH", self._registry_path)
         self._registry_patch.start()
-        self._token_dir = self.root / "session-tokens"
-        self._token_patch = mock.patch.object(main, "COMPOSER_TOKEN_DIR", self._token_dir)
-        self._token_patch.start()
+        self._prior_secret = main.wiki_app_secret()
+        main.set_wiki_app_secret(WIKI_APP_SECRET_FIXTURE)
 
     def tearDown(self) -> None:
-        self._token_patch.stop()
+        main.set_wiki_app_secret(self._prior_secret)
         self._registry_patch.stop()
         self.tmp.cleanup()
 
     def _write_registry(self, payload: dict) -> None:
         self._registry_path.write_text(json.dumps(payload), encoding="utf-8")
 
-    def _seed_orch_with_token(
-        self, orch_id: str, repo: Path | None = None, token: str = ORCH_TOKEN
-    ) -> None:
-        payload = {
-            orch_id: {
-                "current": {
-                    "role": "orchestrator",
-                    "cwd": str(repo or self.repo),
-                    "worktree": str(repo or self.repo),
-                    "kind": "cc",
-                    "session_id": ORCH_SID,
-                    "composer_token": token,
-                },
-                "history": [],
+    def _seed_orch(self, orch_id: str, repo: Path | None = None) -> None:
+        self._write_registry(
+            {
+                orch_id: {
+                    "current": {
+                        "role": "orchestrator",
+                        "cwd": str(repo or self.repo),
+                        "worktree": str(repo or self.repo),
+                        "kind": "cc",
+                        "session_id": ORCH_SID,
+                    },
+                    "history": [],
+                }
             }
-        }
-        self._write_registry(payload)
+        )
 
-    def test_rejects_missing_token_header(self) -> None:
-        self._seed_orch_with_token("wiki")
-        body = main.ComposerProvisionIn(ticket="WIKI-999", orch="wiki")
+    def _seed_orch_and_worker(self, orch_id: str, worker_ticket: str) -> None:
+        self._write_registry(
+            {
+                orch_id: {
+                    "current": {
+                        "role": "orchestrator",
+                        "cwd": str(self.repo),
+                        "worktree": str(self.repo),
+                        "kind": "cc",
+                        "session_id": ORCH_SID,
+                    },
+                    "history": [],
+                },
+                worker_ticket: {
+                    "current": {
+                        "role": "implement",
+                        "cwd": str(self.repo),
+                        "worktree": str(self.repo),
+                        "kind": "cc",
+                        "orch": orch_id,
+                        "session_id": WORKER_SID,
+                    },
+                    "history": [],
+                },
+            }
+        )
+
+    # --- Transport gate -----------------------------------------------------
+
+    def test_rejects_missing_origin_header(self) -> None:
+        """No `X-Wiki-App-Secret` header → 403 with a specific message.
+
+        Reproduces the worker-curl scenario: worker forges the JSON body but
+        cannot mint the Wiki.app-only secret.
+        """
+
+        self._seed_orch("wiki")
         with self.assertRaises(HTTPException) as exc:
-            main.composer_provision_worktree_route(body, x_wiki_composer_token=None)
+            main.require_wiki_app_origin(x_wiki_app_secret=None)
+        self.assertEqual(exc.exception.status_code, 403)
+        self.assertIn("Wiki.app origin secret", str(exc.exception.detail))
+
+    def test_rejects_empty_origin_header(self) -> None:
+        with self.assertRaises(HTTPException) as exc:
+            main.require_wiki_app_origin(x_wiki_app_secret="   ")
+        self.assertEqual(exc.exception.status_code, 403)
+
+    def test_rejects_wrong_origin_secret(self) -> None:
+        """Attacker guesses a random string — constant-time compare rejects."""
+
+        with self.assertRaises(HTTPException) as exc:
+            main.require_wiki_app_origin(
+                x_wiki_app_secret="not-the-actual-wiki-app-secret-zzz"
+            )
+        self.assertEqual(exc.exception.status_code, 403)
+
+    def test_accepts_correct_origin_secret(self) -> None:
+        """Passing the exact minted secret is fine — no exception raised."""
+
+        self.assertIsNone(
+            main.require_wiki_app_origin(
+                x_wiki_app_secret=WIKI_APP_SECRET_FIXTURE
+            )
+        )
+
+    # --- End-to-end via the FastAPI route wrapper ---------------------------
+
+    def test_route_rejects_worker_ticket_body_even_with_valid_secret(self) -> None:
+        """Even with the origin secret, a worker orch id in the body is
+        rejected by the registry role check — Path B keeps the transport gate
+        AND the orch-role gate (defense in depth)."""
+
+        self._seed_orch_and_worker("wiki", "WIKI-148")
+        # Route wrapper needs the secret via `Depends` — simulate by calling
+        # the inner function directly after the transport gate has been
+        # exercised in tests above.
+        body = main.ComposerProvisionIn(ticket="WIKI-999", orch="WIKI-148")
+        with self.assertRaises(HTTPException) as exc:
+            main.composer_provision_worktree_route(body)
         self.assertEqual(exc.exception.status_code, 400)
-        self.assertIn("X-Wiki-Composer-Token", str(exc.exception.detail))
+        self.assertIn("worker", str(exc.exception.detail))
 
-    def test_rejects_forged_token_from_public_agent_list(self) -> None:
-        """Worker session forges a value the /api/agents list DOES expose (session id) as the
-        composer token — must be rejected, because the token is a distinct per-orch secret
-        that never appears in that list.
-        """
+    def test_route_provisions_when_orch_body_and_secret_are_valid(self) -> None:
+        """Happy path: Wiki.app-origin secret satisfied by the dependency
+        (verified above), body orch is a registered orchestrator, route
+        returns a provisioned worktree."""
 
-        self._write_registry(
-            {
-                "wiki": {
-                    "current": {
-                        "role": "orchestrator",
-                        "cwd": str(self.repo),
-                        "worktree": str(self.repo),
-                        "kind": "cc",
-                        "session_id": ORCH_SID,
-                        "composer_token": ORCH_TOKEN,
-                    },
-                    "history": [],
-                },
-                "WIKI-148": {
-                    "current": {
-                        "role": "implement",
-                        "cwd": str(self.repo),
-                        "worktree": str(self.repo),
-                        "kind": "cc",
-                        "orch": "wiki",
-                        "session_id": WORKER_SID,
-                    },
-                    "history": [],
-                },
-            }
-        )
-        # Attacker replays the wiki orch's session id (visible in /api/agents)
-        # as the composer token.
+        self._seed_orch("wiki")
         body = main.ComposerProvisionIn(ticket="WIKI-999", orch="wiki")
-        with self.assertRaises(HTTPException) as exc:
-            main.composer_provision_worktree_route(body, x_wiki_composer_token=ORCH_SID)
-        self.assertEqual(exc.exception.status_code, 403)
-
-    def test_rejects_worker_session_forging_arbitrary_token(self) -> None:
-        self._write_registry(
-            {
-                "wiki": {
-                    "current": {
-                        "role": "orchestrator",
-                        "cwd": str(self.repo),
-                        "worktree": str(self.repo),
-                        "kind": "cc",
-                        "session_id": ORCH_SID,
-                        "composer_token": ORCH_TOKEN,
-                    },
-                    "history": [],
-                },
-                "WIKI-148": {
-                    "current": {
-                        "role": "implement",
-                        "cwd": str(self.repo),
-                        "worktree": str(self.repo),
-                        "kind": "cc",
-                        "orch": "wiki",
-                        "session_id": WORKER_SID,
-                    },
-                    "history": [],
-                },
-            }
-        )
-        body = main.ComposerProvisionIn(ticket="WIKI-999", orch="wiki")
-        with self.assertRaises(HTTPException) as exc:
-            main.composer_provision_worktree_route(
-                body, x_wiki_composer_token=WORKER_TOKEN_ATTEMPT
-            )
-        self.assertEqual(exc.exception.status_code, 403)
-
-    def test_rejects_unknown_token(self) -> None:
-        self._seed_orch_with_token("wiki")
-        body = main.ComposerProvisionIn(ticket="WIKI-999", orch="wiki")
-        with self.assertRaises(HTTPException) as exc:
-            main.composer_provision_worktree_route(
-                body, x_wiki_composer_token="stranger-token-not-in-registry"
-            )
-        self.assertEqual(exc.exception.status_code, 403)
-
-    def test_valid_orch_token_provisions(self) -> None:
-        self._seed_orch_with_token("wiki")
-        body = main.ComposerProvisionIn(ticket="WIKI-999")
-        result = main.composer_provision_worktree_route(
-            body, x_wiki_composer_token=ORCH_TOKEN
-        )
+        result = main.composer_provision_worktree_route(body)
         self.assertTrue(result["provisioned"])
+        expected = (self.repo / ".claude" / "worktrees" / "wiki-999").resolve()
+        self.assertEqual(result["workdir"], str(expected))
 
-    def test_body_orch_ignored_when_token_maps_elsewhere(self) -> None:
-        """Body `orch` is a hint, not authorization. The token binds the request
-        to whichever orch holds it — even if the body claims a different orch.
-        """
+    def test_route_routes_body_orch_to_the_right_repo(self) -> None:
+        """Body `orch` is trusted (transport gate has already run) so a
+        request naming `tooling` provisions in tooling's repo, not wiki's."""
 
         other = _init_repo(self.root / "tooling-tree")
         self._write_registry(
@@ -500,7 +495,6 @@ class ComposerTokenAuthTests(unittest.TestCase):
                         "worktree": str(self.repo),
                         "kind": "cc",
                         "session_id": ORCH_SID,
-                        "composer_token": ORCH_TOKEN,
                     },
                     "history": [],
                 },
@@ -511,59 +505,53 @@ class ComposerTokenAuthTests(unittest.TestCase):
                         "worktree": str(other),
                         "kind": "cc",
                         "session_id": "tooling-sid",
-                        "composer_token": "tooling-composer-token-abcdef123456",
                     },
                     "history": [],
                 },
             }
         )
-        body = main.ComposerProvisionIn(ticket="TOOL-1", orch="wiki")
-        result = main.composer_provision_worktree_route(
-            body, x_wiki_composer_token="tooling-composer-token-abcdef123456"
-        )
+        body = main.ComposerProvisionIn(ticket="TOOL-1", orch="tooling")
+        result = main.composer_provision_worktree_route(body)
         expected = (other / ".claude" / "worktrees" / "tool-1").resolve()
         self.assertEqual(result["workdir"], str(expected))
         self.assertFalse((self.repo / ".claude" / "worktrees" / "tool-1").exists())
 
-    def test_orch_token_endpoint_mints_and_persists_for_registered_orch(self) -> None:
-        # Registered but no token yet — endpoint mints one, persists to
-        # registry and mode-0600 token file.
-        self._write_registry(
-            {
-                "wiki": {
-                    "current": {
-                        "role": "orchestrator",
-                        "cwd": str(self.repo),
-                        "worktree": str(self.repo),
-                        "kind": "cc",
-                        "session_id": ORCH_SID,
-                    },
-                    "history": [],
-                }
-            }
-        )
-        first = main.composer_orch_token("wiki")
-        self.assertEqual(first["orch"], "wiki")
-        self.assertGreater(len(first["token"]), 30)
-        stored = json.loads(self._registry_path.read_text(encoding="utf-8"))
-        self.assertEqual(
-            stored["wiki"]["current"]["composer_token"], first["token"]
-        )
-        # File exists at 0600 and matches.
-        token_file = self._token_dir / "wiki.token"
-        self.assertTrue(token_file.is_file())
-        mode = token_file.stat().st_mode & 0o777
-        self.assertEqual(mode, 0o600)
-        self.assertEqual(token_file.read_text(encoding="utf-8"), first["token"])
-        # Idempotent — second call returns same token.
-        second = main.composer_orch_token("wiki")
-        self.assertEqual(second["token"], first["token"])
+    def test_orch_token_endpoint_is_gone(self) -> None:
+        """Round 6: the previously spoofable token endpoint no longer exists.
 
-    def test_orch_token_endpoint_rejects_unknown_orch(self) -> None:
-        self._write_registry({})
+        Locking in the removal — any regression that re-adds the attribute
+        would let workers harvest secrets again.
+        """
+
+        self.assertFalse(hasattr(main, "composer_orch_token"))
+        self.assertFalse(hasattr(main, "_ensure_composer_token"))
+        self.assertFalse(hasattr(main, "_orch_from_composer_token"))
+        self.assertFalse(hasattr(main, "COMPOSER_TOKEN_DIR"))
+
+    def test_route_rejects_missing_orch_in_body(self) -> None:
+        """Round 6: the route requires `orch` in the body even after the
+        transport gate. Absent it, the request is a 400 — there's no
+        implicit caller identity to fall back on.
+        """
+
+        self._seed_orch("wiki")
+        body = main.ComposerProvisionIn(ticket="WIKI-999")
         with self.assertRaises(HTTPException) as exc:
-            main.composer_orch_token("nope")
-        self.assertEqual(exc.exception.status_code, 404)
+            main.composer_provision_worktree_route(body)
+        self.assertEqual(exc.exception.status_code, 400)
+        self.assertIn("orch", str(exc.exception.detail))
+
+    def test_boot_line_carries_current_secret(self) -> None:
+        """`wiki_app_secret_boot_line()` returns the marker line the backend
+        emits on stdout for Tauri to capture. Locks the wire format so a
+        careless rename doesn't silently break secret handoff.
+        """
+
+        line = main.wiki_app_secret_boot_line()
+        self.assertTrue(line.startswith("[[WIKI_APP_SECRET_BOOT]]="))
+        self.assertEqual(
+            line[len("[[WIKI_APP_SECRET_BOOT]]="):], WIKI_APP_SECRET_FIXTURE
+        )
 
 
 class LinkedWorktreeCommonDirTests(unittest.TestCase):
@@ -605,7 +593,6 @@ class LinkedWorktreeCommonDirTests(unittest.TestCase):
                             "worktree": str(linked_root),
                             "kind": "cc",
                             "session_id": ORCH_SID,
-                            "composer_token": ORCH_TOKEN,
                         },
                         "history": [],
                     }
@@ -613,7 +600,7 @@ class LinkedWorktreeCommonDirTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        body = main.ComposerProvisionIn(ticket="WIKI-999")
+        body = main.ComposerProvisionIn(ticket="WIKI-999", orch="wiki")
         result = main.composer_provision_worktree(body, "wiki")
         expected = (linked_root / ".claude" / "worktrees" / "wiki-999").resolve()
         self.assertEqual(result["workdir"], str(expected))

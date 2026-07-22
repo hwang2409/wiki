@@ -20,7 +20,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, cast
 from uuid import UUID, uuid4
 
-from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query, Request, Response, status
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -141,6 +141,69 @@ async def lifespan(_app: FastAPI):
             return_exceptions=True,
         )
         await asyncio.to_thread(terminal.TERMINAL_MANAGER.close_all)
+
+
+# --- Wiki.app origin secret (WIKI-148 round 6 — Path B) ---------------------
+# Per-startup random secret proving a request came from the Wiki.app main
+# process. The backend prints it once to stdout with a distinctive marker;
+# the Tauri Rust host captures that line via its sidecar rx channel, keeps
+# it in Rust memory only, and exposes it to the webview through an invoke
+# command (`get_wiki_app_secret`). Worker CLI sessions (Claude Code / Codex)
+# run outside Tauri's IPC bridge and never receive the secret, so a curl
+# straight to `/api/composer/*` from a worker fails with 403.
+#
+# Design points:
+#   - The secret is minted here at module-import time. `native_server.py`
+#     emits it to stdout before uvicorn starts serving so Tauri's log stream
+#     receives it deterministically.
+#   - The marker prefix `[[WIKI_APP_SECRET_BOOT]]=` is what Tauri matches on
+#     and strips before logging.
+#   - Tests override the secret via `set_wiki_app_secret(...)` so they don't
+#     depend on scraping stdout.
+_WIKI_APP_SECRET_MARKER = "[[WIKI_APP_SECRET_BOOT]]="
+_WIKI_APP_SECRET_HOLDER: dict[str, str] = {"value": secrets.token_urlsafe(32)}
+
+
+def wiki_app_secret() -> str:
+    return _WIKI_APP_SECRET_HOLDER["value"]
+
+
+def set_wiki_app_secret(value: str) -> None:
+    """Testing hook — override the minted secret for pytest fixtures."""
+
+    _WIKI_APP_SECRET_HOLDER["value"] = value
+
+
+def wiki_app_secret_boot_line() -> str:
+    """The line the backend prints on startup for Tauri to capture."""
+
+    return f"{_WIKI_APP_SECRET_MARKER}{wiki_app_secret()}"
+
+
+def require_wiki_app_origin(
+    x_wiki_app_secret: str | None = Header(default=None, alias="X-Wiki-App-Secret"),
+) -> None:
+    """FastAPI dependency — reject composer callers without the origin secret.
+
+    Constant-time compare against the module-level secret. Absent header,
+    empty header, or mismatch all return 403. This is the ONLY authentication
+    on composer endpoints in round 6 — the earlier client-supplied token was
+    fundamentally spoofable (a worker could fetch it from the public token
+    endpoint by orch id) and is removed entirely.
+    """
+
+    expected = wiki_app_secret()
+    supplied = (x_wiki_app_secret or "").strip()
+    if not supplied or not secrets.compare_digest(supplied, expected):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Composer endpoints require the Wiki.app origin secret. "
+                "The Wiki.app webview supplies it automatically via the "
+                "Tauri invoke bridge; direct HTTP callers (worker CLI "
+                "sessions, curl) cannot obtain it."
+            ),
+        )
 
 
 app = FastAPI(title="Wiki API", lifespan=lifespan)
@@ -3683,169 +3746,15 @@ class ComposerGateIn(BaseModel):
 
 class ComposerProvisionIn(BaseModel):
     ticket: str = Field(..., min_length=1, max_length=80)
-    # `orch` is retained for logging/debug only. The server derives the
-    # dispatching orchestrator from the caller's composer-token header and
-    # ignores this field for authorization (see H1 in WIKI-148 review3/4).
+    # `orch` identifies which orchestrator's repo to provision under. Since
+    # only Wiki.app can reach this endpoint (Path B, round 6), the field is
+    # trusted at the transport layer once `require_wiki_app_origin` passes.
+    # The registry lookup in `_resolve_orchestrator_root` still rejects
+    # unknown ids and worker sessions with role != "orchestrator".
+    # Optional at the model layer so the internal `composer_provision_worktree`
+    # helper can be exercised directly by tests — the route wrapper enforces
+    # presence.
     orch: str | None = Field(default=None, min_length=1, max_length=100)
-
-
-COMPOSER_TOKEN_DIR = Path.home() / ".wiki" / "session-tokens"
-ORCH_ID_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
-
-
-def _composer_token_path(orch_id: str) -> Path:
-    return COMPOSER_TOKEN_DIR / f"{orch_id}.token"
-
-
-def _write_composer_token_file(orch_id: str, token: str) -> None:
-    """Persist the composer token to a mode-0600 file for the local orch process.
-
-    Same-user co-processes CAN read the file — the token file is a local-trust
-    convenience, not a cross-user secret. See PR body / M1 notes.
-    """
-
-    try:
-        COMPOSER_TOKEN_DIR.mkdir(parents=True, exist_ok=True)
-        path = _composer_token_path(orch_id)
-        tmp = path.with_suffix(".token.tmp")
-        tmp.write_text(token, encoding="utf-8")
-        os.chmod(tmp, 0o600)
-        tmp.replace(path)
-    except OSError:
-        # Filesystem write is best-effort; the registry still holds the token.
-        pass
-
-
-def _registry_orch_current(registry: dict, orch_id: str) -> dict | None:
-    """Return the `current` dict for a registered orchestrator, or None."""
-
-    entry = registry.get(orch_id)
-    if isinstance(entry, dict):
-        current = entry.get("current")
-        if isinstance(current, dict) and current.get("role") == "orchestrator":
-            return current
-    legacy = registry.get("_orchestrators")
-    if isinstance(legacy, dict):
-        candidate = legacy.get(orch_id)
-        if isinstance(candidate, dict):
-            return candidate
-    return None
-
-
-def _ensure_composer_token(orch_id: str) -> str:
-    """Return the composer token for `orch_id`, minting one if needed.
-
-    Persists the token back into the registry and its on-disk file so future
-    lookups are stable. Raises HTTPException if the orch isn't registered.
-    """
-
-    if not ORCH_ID_TOKEN_PATTERN.fullmatch(orch_id):
-        raise HTTPException(status_code=400, detail="Invalid orchestrator id")
-    try:
-        registry = _read_agent_registry()
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(
-            status_code=500, detail=f"agent registry unreadable: {exc}"
-        ) from exc
-    if not isinstance(registry, dict):
-        raise HTTPException(status_code=404, detail=f"Unknown orchestrator '{orch_id}'")
-    entry = registry.get(orch_id)
-    ticket_current: dict | None = None
-    legacy_current: dict | None = None
-    if isinstance(entry, dict):
-        current = entry.get("current")
-        if isinstance(current, dict) and current.get("role") == "orchestrator":
-            ticket_current = current
-    if ticket_current is None:
-        legacy = registry.get("_orchestrators")
-        if isinstance(legacy, dict):
-            candidate = legacy.get(orch_id)
-            if isinstance(candidate, dict):
-                legacy_current = candidate
-    if ticket_current is None and legacy_current is None:
-        raise HTTPException(status_code=404, detail=f"Unknown orchestrator '{orch_id}'")
-    target = ticket_current if ticket_current is not None else legacy_current
-    assert target is not None  # for type-checker
-    token = target.get("composer_token")
-    if isinstance(token, str) and token.strip():
-        _write_composer_token_file(orch_id, token.strip())
-        return token.strip()
-    token = secrets.token_urlsafe(32)
-    target["composer_token"] = token
-    try:
-        AGENT_REGISTRY_PATH.write_text(
-            json.dumps(registry, indent=2, sort_keys=True), encoding="utf-8"
-        )
-    except OSError as exc:
-        raise HTTPException(
-            status_code=500, detail=f"agent registry write failed: {exc}"
-        ) from exc
-    _write_composer_token_file(orch_id, token)
-    return token
-
-
-def _orch_from_composer_token(token: str | None) -> str:
-    """Return the orchestrator id whose registered composer token matches.
-
-    Callers prove identity by sending `X-Wiki-Composer-Token`. The token is
-    NOT exposed via `/api/agents` (unlike the legacy session-id header) —
-    workers scanning the public agent list cannot obtain an orch's token by
-    lookup. Same-user local processes that read the on-disk token file are
-    still authorized: the composer explicitly trusts local callers. This is
-    documented in the PR body.
-    """
-
-    if not isinstance(token, str) or not token.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="X-Wiki-Composer-Token header is required for composer provisioning",
-        )
-    needle = token.strip()
-    if len(needle) < 16:
-        raise HTTPException(status_code=403, detail="Composer token rejected")
-    try:
-        registry = _read_agent_registry()
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(
-            status_code=500, detail=f"agent registry unreadable: {exc}"
-        ) from exc
-    if not isinstance(registry, dict):
-        raise HTTPException(
-            status_code=403, detail="No registered orchestrator matches composer token"
-        )
-
-    match_id: str | None = None
-    for orch_id, entry in registry.items():
-        if orch_id == "_orchestrators" or not isinstance(entry, dict):
-            continue
-        current = entry.get("current")
-        if not isinstance(current, dict):
-            continue
-        if current.get("role") != "orchestrator":
-            continue
-        candidate = current.get("composer_token")
-        if isinstance(candidate, str) and secrets.compare_digest(candidate, needle):
-            match_id = orch_id
-            break
-
-    if match_id is None:
-        legacy = registry.get("_orchestrators")
-        if isinstance(legacy, dict):
-            for orch_id, current in legacy.items():
-                if not isinstance(current, dict):
-                    continue
-                candidate = current.get("composer_token")
-                if isinstance(candidate, str) and secrets.compare_digest(
-                    candidate, needle
-                ):
-                    match_id = orch_id
-                    break
-
-    if match_id is None:
-        raise HTTPException(
-            status_code=403, detail="No registered orchestrator matches composer token"
-        )
-    return match_id
 
 
 def _resolve_orchestrator_root(orch_id: str) -> Path:
@@ -4025,39 +3934,27 @@ def _validate_existing_worktree(
         )
 
 
-@app.post("/api/composer/provision-worktree")
-def composer_provision_worktree_route(
-    body: ComposerProvisionIn,
-    x_wiki_composer_token: str | None = Header(
-        default=None, alias="X-Wiki-Composer-Token"
-    ),
-) -> dict[str, object]:
-    """FastAPI wrapper that binds `orch` to the caller's composer token.
+@app.post(
+    "/api/composer/provision-worktree",
+    dependencies=[Depends(require_wiki_app_origin)],
+)
+def composer_provision_worktree_route(body: ComposerProvisionIn) -> dict[str, object]:
+    """Provision a `.claude/worktrees/<ticket>` for the caller's orchestrator.
 
-    The composer token is per-orchestrator, minted at first
-    `/api/composer/orch-token/{orch}` fetch, and NOT exposed via
-    `/api/agents`. Worker sessions never hold a token — a worker cannot
-    forge the header by scraping the public agent list.
+    Gated by `require_wiki_app_origin` — only the Wiki.app main process
+    (via the Tauri invoke bridge) holds the in-memory secret. Worker CLI
+    sessions cannot reach this endpoint even if they craft the exact HTTP
+    request. There is no client-supplied credential path left: the earlier
+    per-orch composer-token endpoint and the legacy session-id header have
+    both been removed.
     """
 
-    orch_id = _orch_from_composer_token(x_wiki_composer_token)
-    return composer_provision_worktree(body, orch_id)
-
-
-@app.get("/api/composer/orch-token/{orch_id}")
-def composer_orch_token(orch_id: str) -> dict[str, str]:
-    """Return the composer token for a registered orchestrator (local trust).
-
-    This endpoint intentionally trusts same-user local callers — the file at
-    `~/.wiki/session-tokens/<orch>.token` is likewise readable by co-user
-    processes. The security improvement over the legacy design is that the
-    token is NOT included in `/api/agents` responses, so worker sessions
-    that scrape the public agent list no longer harvest orchestrator
-    credentials by accident.
-    """
-
-    token = _ensure_composer_token(orch_id)
-    return {"orch": orch_id, "token": token}
+    if not body.orch:
+        raise HTTPException(
+            status_code=400,
+            detail="ComposerProvisionIn.orch is required for /spawn dispatch",
+        )
+    return composer_provision_worktree(body, body.orch)
 
 
 def composer_provision_worktree(
@@ -4065,10 +3962,11 @@ def composer_provision_worktree(
 ) -> dict[str, object]:
     """Ensure `.claude/worktrees/<ticket-lower>` exists in the caller's repo.
 
-    Backs the composer `/spawn` slash command. `orch_id` MUST come from the
-    caller's registered session identity (see `_orch_from_caller_session`) —
-    never from the request body. Body's `orch` field is ignored for
-    authorization. Worker sessions are rejected at the identity layer.
+    Backs the composer `/spawn` slash command. The wrapping route runs the
+    Wiki.app-origin transport check (`require_wiki_app_origin`) before
+    calling us; `orch_id` therefore comes from the trusted body field and
+    is validated against the agent registry via `_resolve_orchestrator_root`
+    — unknown orch ids and worker sessions are rejected with 400.
     Existing worktrees are returned as-is only when they are valid git
     worktrees pointing at the expected repo and branch; missing paths get
     `git worktree add -b <branch> <path> FETCH_HEAD` after a fresh
@@ -4143,12 +4041,17 @@ def composer_provision_worktree(
     return {"workdir": str(workdir), "provisioned": True}
 
 
-@app.post("/api/composer/gate")
+@app.post(
+    "/api/composer/gate",
+    dependencies=[Depends(require_wiki_app_origin)],
+)
 def composer_gate(body: ComposerGateIn) -> dict[str, object]:
     """Run `wiki gate <pr> --json` and normalise the verdict.
 
-    Backs the composer `/gate` slash command. Read-only relative to git — the
-    underlying CLI only shells out to `gh` for PR view + check status.
+    Backs the composer `/gate` slash command. Same Wiki.app-only origin
+    gate as `/api/composer/provision-worktree`: worker CLI sessions cannot
+    reach it. Read-only relative to git — the underlying CLI only shells
+    out to `gh` for PR view + check status.
     """
 
     wiki_cli = ROOT_DIR / "wiki"

@@ -133,7 +133,16 @@ pub struct NativeAppState {
 struct LifecycleState {
     app_origin: Option<String>,
     sidecar: Option<SidecarState>,
+    // Wiki.app origin secret captured from the backend sidecar's stdout on
+    // startup (marker line `[[WIKI_APP_SECRET_BOOT]]=<hex>`). Held in Rust
+    // process memory only — the webview reads it via the
+    // `get_wiki_app_secret` invoke command. Worker CLI processes have no
+    // invoke bridge and cannot pull the value, so `/api/composer/*` calls
+    // from workers fail with 403. WIKI-148 round 6, Path B.
+    wiki_app_secret: Option<String>,
 }
+
+const WIKI_APP_SECRET_MARKER: &str = "[[WIKI_APP_SECRET_BOOT]]=";
 
 struct SidecarState {
     child: Option<CommandChild>,
@@ -373,7 +382,23 @@ fn spawn_sidecar_logger(
         while let Some(event) = rx.recv().await {
             match event {
                 CommandEvent::Stdout(line) => {
-                    let _ = append_log(&log_path, &format!("stdout {}", decode_line(&line)));
+                    let decoded = decode_line(&line);
+                    if let Some(secret) = decoded.strip_prefix(WIKI_APP_SECRET_MARKER) {
+                        // Capture the Wiki.app origin secret out of the
+                        // stdout stream BEFORE it ever hits the log. Worker
+                        // sessions can read the log file (same user), so the
+                        // marker line must never be persisted anywhere on
+                        // disk. WIKI-148 round 6, Path B.
+                        let app_state = app.state::<NativeAppState>();
+                        let mut state = app_state.inner.lock().unwrap();
+                        state.wiki_app_secret = Some(secret.trim().to_string());
+                        let _ = append_log(
+                            &log_path,
+                            "stdout <wiki-app-secret captured; line redacted>",
+                        );
+                    } else {
+                        let _ = append_log(&log_path, &format!("stdout {decoded}"));
+                    }
                 }
                 CommandEvent::Stderr(line) => {
                     let _ = append_log(&log_path, &format!("stderr {}", decode_line(&line)));
@@ -609,6 +634,22 @@ fn app_origin(app: &AppHandle) -> Option<String> {
     let app_state = app.state::<NativeAppState>();
     let state = app_state.inner.lock().unwrap();
     state.app_origin.clone()
+}
+
+/// Return the Wiki.app origin secret captured from the backend sidecar's
+/// startup stdout. Called by the webview via `invoke("get_wiki_app_secret")`
+/// to attach an `X-Wiki-App-Secret` header on composer requests. Fails while
+/// the sidecar is still coming up (secret not yet observed) — the webview
+/// retries once the composer form is dispatched. WIKI-148 round 6, Path B.
+#[tauri::command]
+pub fn get_wiki_app_secret(
+    state: tauri::State<'_, NativeAppState>,
+) -> Result<String, String> {
+    let guard = state.inner.lock().unwrap();
+    guard
+        .wiki_app_secret
+        .clone()
+        .ok_or_else(|| "wiki-app origin secret not yet captured".to_string())
 }
 
 fn allow_in_webview(app: &AppHandle, url: &Url) -> bool {

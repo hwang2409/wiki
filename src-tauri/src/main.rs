@@ -19,6 +19,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
+        .invoke_handler(tauri::generate_handler![backend::get_wiki_app_secret])
         .setup(move |app| backend::setup(app, app_lock))
         .on_window_event(backend::handle_window_event)
         .build(tauri::generate_context!());

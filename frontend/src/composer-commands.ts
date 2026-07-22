@@ -43,31 +43,64 @@ const ROLES = ["plan", "implement", "review"] as const;
 const OUTCOMES = ["merged", "closed", "abandoned"] as const;
 const EFFORTS = ["low", "medium", "high"] as const;
 
-async function fetchOrchComposerToken(orch: string): Promise<string> {
-  // Composer tokens are per-orchestrator and are NOT exposed via /api/agents
-  // (H1 fix): a worker session scraping the public agent list cannot forge
-  // this header. The token endpoint trusts same-user local callers.
-  const response = await fetch(
-    `/api/composer/orch-token/${encodeURIComponent(orch)}`,
-    { method: "GET" }
-  );
-  const body = (await response.json().catch(() => null)) as
-    | { token?: string; detail?: string }
-    | null;
-  if (!response.ok || !body?.token) {
-    throw new Error(body?.detail ?? `Could not fetch composer token (${response.status})`);
+// --- Wiki.app origin secret (WIKI-148 round 6, Path B) ---------------------
+// Composer endpoints (`/api/composer/*`) require an `X-Wiki-App-Secret`
+// header that only the Wiki.app main process can produce. The secret is
+// minted per-startup by the backend, handed to the Tauri Rust host via a
+// marker line on stdout, and exposed to the webview through the
+// `get_wiki_app_secret` invoke command. Worker CLI sessions run outside
+// Tauri's IPC bridge and cannot obtain the value, so a curl straight to
+// `/api/composer/provision-worktree` from a worker fails with 403.
+//
+// For tests / dev outside Tauri, `window.__WIKI_APP_SECRET__` may be set
+// (playwright injects it via addInitScript). This is a testing seam, not
+// a fallback for production — production always requires Tauri.
+
+type WindowWithComposerSecret = Window & {
+  __TAURI_INTERNALS__?: unknown;
+  __WIKI_APP_SECRET__?: string;
+};
+
+let cachedWikiAppSecret: string | null = null;
+
+async function getWikiAppSecret(): Promise<string> {
+  if (cachedWikiAppSecret) return cachedWikiAppSecret;
+  if (typeof window === "undefined") {
+    throw new Error("Wiki.app origin secret unavailable outside a browser context");
   }
-  return body.token.trim();
+  const win = window as WindowWithComposerSecret;
+  const injected = typeof win.__WIKI_APP_SECRET__ === "string"
+    ? win.__WIKI_APP_SECRET__
+    : "";
+  if (injected) {
+    cachedWikiAppSecret = injected;
+    return injected;
+  }
+  if (!("__TAURI_INTERNALS__" in win)) {
+    throw new Error(
+      "Composer /spawn requires the Wiki.app native shell — the Tauri IPC bridge is not available"
+    );
+  }
+  const { invoke } = await import("@tauri-apps/api/core");
+  const value = await invoke<string>("get_wiki_app_secret");
+  if (typeof value !== "string" || !value) {
+    throw new Error("Wiki.app origin secret is empty");
+  }
+  cachedWikiAppSecret = value;
+  return value;
+}
+
+async function composerFetch(input: string, init: RequestInit): Promise<Response> {
+  const secret = await getWikiAppSecret();
+  const headers = new Headers(init.headers);
+  headers.set("X-Wiki-App-Secret", secret);
+  return fetch(input, { ...init, headers });
 }
 
 async function provisionWorktree(ticket: string, orch: string): Promise<string> {
-  const token = await fetchOrchComposerToken(orch);
-  const response = await fetch("/api/composer/provision-worktree", {
+  const response = await composerFetch("/api/composer/provision-worktree", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Wiki-Composer-Token": token,
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ticket, orch }),
   });
   const body = (await response.json().catch(() => null)) as
@@ -216,7 +249,7 @@ export const COMMANDS: readonly ComposerCommand[] = [
     async dispatch(values) {
       const pr = values["pr"].trim();
       const expectSha = values["expect-sha"]?.trim() || undefined;
-      const response = await fetch("/api/composer/gate", {
+      const response = await composerFetch("/api/composer/gate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ pr, expect_sha: expectSha }),
