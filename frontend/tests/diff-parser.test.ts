@@ -232,3 +232,46 @@ test("\\ No newline at end of file marker in a hunk does not consume quota", () 
   const kinds = files[0].hunks[0].lines.map((line) => line.kind);
   assert.deepEqual(kinds, ["remove", "meta", "context", "add"]);
 });
+
+test("trailing \\ No newline marker after the final counted line is preserved", () => {
+  const source = [
+    "diff --git a/foo.txt b/foo.txt",
+    "--- a/foo.txt",
+    "+++ b/foo.txt",
+    "@@ -1,2 +1,2 @@",
+    " keep",
+    "-old",
+    "+new",
+    "\\ No newline at end of file",
+  ].join("\n");
+  const files = parseUnifiedDiff(source);
+  assert.equal(files.length, 1);
+  const lines = files[0].hunks[0].lines;
+  assert.equal(lines.length, 4, `expected trailing meta line preserved, got ${lines.length}`);
+  const last = lines[lines.length - 1];
+  assert.equal(last.kind, "meta");
+  assert.equal(last.text, "\\ No newline at end of file");
+});
+
+test("trailing \\ No newline marker is attributed to preceding file, not the next", () => {
+  const source = [
+    "diff --git a/a.txt b/a.txt",
+    "--- a/a.txt",
+    "+++ b/a.txt",
+    "@@ -1,1 +1,1 @@",
+    "-old",
+    "+new",
+    "\\ No newline at end of file",
+    "diff --git a/b.txt b/b.txt",
+    "--- a/b.txt",
+    "+++ b/b.txt",
+    "@@ -1,1 +1,1 @@",
+    "-x",
+    "+y",
+  ].join("\n");
+  const files = parseUnifiedDiff(source);
+  assert.equal(files.length, 2);
+  const firstLines = files[0].hunks[0].lines;
+  assert.equal(firstLines[firstLines.length - 1].kind, "meta");
+  assert.equal(files[1].hunks[0].lines.length, 2);
+});

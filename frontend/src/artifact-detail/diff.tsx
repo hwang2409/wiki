@@ -1,10 +1,18 @@
-import { useState } from "react";
 import { Hash } from "lucide-react";
 import type { SessionArtifact } from "../api";
 import { DiffPatchView } from "../diff-view";
+import type { ArtifactViewState } from "../transcript-store";
 
-export function DiffArtifactDetail({ artifact }: { artifact: SessionArtifact }) {
-  const [showLineNumbers, setShowLineNumbers] = useState(false);
+export function DiffArtifactDetail({
+  artifact,
+  onChange,
+  state,
+}: {
+  artifact: SessionArtifact;
+  onChange: (state: ArtifactViewState) => void;
+  state: ArtifactViewState;
+}) {
+  const showLineNumbers = state.showLineNumbers ?? false;
   return (
     <div className="artifact-detail-diff">
       <div className="artifact-detail-toolbar">
@@ -12,7 +20,7 @@ export function DiffArtifactDetail({ artifact }: { artifact: SessionArtifact }) 
           aria-pressed={showLineNumbers}
           data-diff-line-numbers-toggle
           type="button"
-          onClick={() => setShowLineNumbers((value) => !value)}
+          onClick={() => onChange({ ...state, showLineNumbers: !showLineNumbers })}
         >
           <Hash size={12} />
           {showLineNumbers ? "Hide line numbers" : "Show line numbers"}

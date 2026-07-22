@@ -61,6 +61,7 @@ export type ArtifactViewState = {
   foldedBlocks?: number[];
   panX?: number;
   panY?: number;
+  showLineNumbers?: boolean;
   sortColumn?: string | null;
   sortDirection?: "asc" | "desc" | null;
   zoom?: number;

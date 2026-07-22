@@ -375,6 +375,30 @@ try {
     `scrollTop should reach end of long diff, got ${JSON.stringify(scrolled)}`,
   );
 
+  const viewportVisibility = await scrollContainer.evaluate((node) => {
+    const lines = node.querySelectorAll(".diff-line");
+    const last = lines[lines.length - 1];
+    if (!last) return null;
+    const container = node.getBoundingClientRect();
+    const lastRect = last.getBoundingClientRect();
+    return {
+      containerTop: container.top,
+      containerBottom: container.bottom,
+      lastTop: lastRect.top,
+      lastBottom: lastRect.bottom,
+    };
+  });
+  assert(viewportVisibility, "expected a final .diff-line in the scroll container");
+  const tolerance = 2;
+  assert(
+    viewportVisibility.lastBottom <= viewportVisibility.containerBottom + tolerance,
+    `final diff line bottom (${viewportVisibility.lastBottom}) should be within container bottom (${viewportVisibility.containerBottom})`,
+  );
+  assert(
+    viewportVisibility.lastTop >= viewportVisibility.containerTop - tolerance,
+    `final diff line top (${viewportVisibility.lastTop}) should be within container top (${viewportVisibility.containerTop})`,
+  );
+
   const initialGutter = await panelDiff.locator(".diff-gutter").count();
   assert(initialGutter === 0, `line-number gutter should be off by default in panel, got ${initialGutter}`);
 
@@ -394,6 +418,43 @@ try {
   assert(
     (await toggleButton.getAttribute("aria-pressed")) === "true",
     "line-number toggle should flip aria-pressed to true after click",
+  );
+
+  // Isolation: switch to a different diff, its toggle should be off.
+  const smallDiffId = results[0].artifactId;
+  await openPanel(sessionPage, [longDiffId, smallDiffId], smallDiffId);
+  await sessionPage.waitForFunction((id) => {
+    const panel = document.querySelector('[data-focused-artifact]');
+    return panel?.getAttribute("data-focused-artifact") === id;
+  }, smallDiffId, { timeout: 3000 });
+  const smallToggle = artifactPanel.locator("[data-diff-line-numbers-toggle]");
+  await smallToggle.waitFor({ state: "visible" });
+  assert(
+    (await smallToggle.getAttribute("aria-pressed")) === "false",
+    "switching to a different diff should show its own (default off) toggle state, not leak the previous diff's on state",
+  );
+  const smallGutter = await sessionPage.locator(".artifact-detail-diff .diff-gutter").count();
+  assert(
+    smallGutter === 0,
+    `different diff should have no gutter cells despite previous diff having them on, got ${smallGutter}`,
+  );
+
+  // Persistence: switch back to the long diff, its toggle should remain on.
+  await openPanel(sessionPage, [longDiffId, smallDiffId], longDiffId);
+  await sessionPage.waitForFunction((id) => {
+    const panel = document.querySelector('[data-focused-artifact]');
+    return panel?.getAttribute("data-focused-artifact") === id;
+  }, longDiffId, { timeout: 3000 });
+  const longToggleAgain = artifactPanel.locator("[data-diff-line-numbers-toggle]");
+  await longToggleAgain.waitFor({ state: "visible" });
+  assert(
+    (await longToggleAgain.getAttribute("aria-pressed")) === "true",
+    "returning to the previously-toggled diff should preserve its on state",
+  );
+  const persistedGutter = await sessionPage.locator(".artifact-detail-diff .diff-gutter").count();
+  assert(
+    persistedGutter > 0,
+    `returning to previously-toggled diff should re-render gutter cells, got ${persistedGutter}`,
   );
 
   await openPanel(sessionPage, [binaryDiffId], binaryDiffId);

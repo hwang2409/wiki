@@ -98,15 +98,8 @@ export function parseUnifiedDiff(source: string): DiffFilePatch[] {
     return current;
   }
 
-  function endHunkIfDone() {
-    if (oldRemaining <= 0 && newRemaining <= 0) {
-      currentHunk = null;
-    }
-  }
-
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
-    const inHunk = currentHunk !== null && (oldRemaining > 0 || newRemaining > 0);
 
     if (line.startsWith(HUNK_MARKER)) {
       const file = ensureFile();
@@ -126,48 +119,51 @@ export function parseUnifiedDiff(source: string): DiffFilePatch[] {
       continue;
     }
 
-    if (inHunk && currentHunk) {
-      if (line.startsWith("+")) {
-        currentHunk.lines.push({
-          kind: "add",
-          text: line.slice(1),
-          oldNumber: null,
-          newNumber: newCounter,
-        });
-        newCounter += 1;
-        newRemaining -= 1;
-        endHunkIfDone();
-        continue;
-      }
-      if (line.startsWith("-")) {
-        currentHunk.lines.push({
-          kind: "remove",
-          text: line.slice(1),
-          oldNumber: oldCounter,
-          newNumber: null,
-        });
-        oldCounter += 1;
-        oldRemaining -= 1;
-        endHunkIfDone();
-        continue;
-      }
+    if (currentHunk) {
+      // Backslash metadata (`\ No newline at end of file`) belongs to the
+      // preceding hunk line even when the hunk quota is exhausted.
       if (line.startsWith("\\")) {
         currentHunk.lines.push({ kind: "meta", text: line, oldNumber: null, newNumber: null });
         continue;
       }
-      const body = line.startsWith(" ") ? line.slice(1) : line;
-      currentHunk.lines.push({
-        kind: "context",
-        text: body,
-        oldNumber: oldCounter,
-        newNumber: newCounter,
-      });
-      oldCounter += 1;
-      newCounter += 1;
-      oldRemaining -= 1;
-      newRemaining -= 1;
-      endHunkIfDone();
-      continue;
+      if (oldRemaining > 0 || newRemaining > 0) {
+        if (line.startsWith("+")) {
+          currentHunk.lines.push({
+            kind: "add",
+            text: line.slice(1),
+            oldNumber: null,
+            newNumber: newCounter,
+          });
+          newCounter += 1;
+          newRemaining -= 1;
+          continue;
+        }
+        if (line.startsWith("-")) {
+          currentHunk.lines.push({
+            kind: "remove",
+            text: line.slice(1),
+            oldNumber: oldCounter,
+            newNumber: null,
+          });
+          oldCounter += 1;
+          oldRemaining -= 1;
+          continue;
+        }
+        const body = line.startsWith(" ") ? line.slice(1) : line;
+        currentHunk.lines.push({
+          kind: "context",
+          text: body,
+          oldNumber: oldCounter,
+          newNumber: newCounter,
+        });
+        oldCounter += 1;
+        newCounter += 1;
+        oldRemaining -= 1;
+        newRemaining -= 1;
+        continue;
+      }
+      // Hunk quota consumed; hand off to file-boundary / header handling below.
+      currentHunk = null;
     }
 
     if (line.startsWith(FILE_MARKER_OLD)) {
