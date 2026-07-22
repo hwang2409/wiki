@@ -49,7 +49,6 @@ In Progress:
 - [P2] PHO-13826 ModalSandboxBackend + PHO-13827 sandbox ownership — workers live (Modal replaces exe.dev for v0; 13828 lifecycle + 13829 egress design queued)
 - mitmweb rebuild: scope and build a clearer live proxy-traffic inspector — owner (misc)
 - WIKI-135 dashboard: implementation workers only (drop reviewers/one-shots) — owner cdx:WIKI-135 (luna)
-- [P2] WIKI-156 artifact shell + renderer-state polish — quiet inline header, no coming-soon controls or ID-prefix titles, shared loading/error/fallback component (depends WIKI-144, WIKI-149) — cc:WIKI-156 worker
 
 Backlog:
 
