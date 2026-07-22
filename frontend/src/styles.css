@@ -141,6 +141,8 @@ body {
   font-size: var(--font-ui-small);
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
 }
 
 ::selection {
@@ -170,8 +172,9 @@ button:disabled {
 }
 
 :where(button, input, textarea, select, a, [role="button"]):focus-visible {
-  outline: none;
-  box-shadow: 0 0 0 2px var(--background-primary), 0 0 0 4px var(--text-normal);
+  outline: 1.5px solid var(--accent-primary, var(--text-normal));
+  outline-offset: 2px;
+  box-shadow: none;
 }
 
 :where(h1, h2, h3, .inline-title, .activity-day-heading, .dialog-title) {
@@ -275,7 +278,7 @@ button:disabled {
 
 .app-container {
   display: grid;
-  grid-template-columns: 44px 280px minmax(0, 1fr);
+  grid-template-columns: 44px 200px minmax(0, 1fr);
   height: 100vh;
 }
 
@@ -359,7 +362,6 @@ button:disabled {
   display: flex;
   flex-direction: column;
   min-height: 0;
-  background-color: var(--background-secondary);
   border-right: 1px solid var(--background-modifier-border);
 }
 
@@ -421,8 +423,8 @@ button:disabled {
 }
 
 .nav-action-button.is-active {
-  background-color: var(--background-modifier-active);
   color: var(--text-normal);
+  box-shadow: inset 0 -1px 0 var(--text-normal);
 }
 
 .nav-action-button:active {
@@ -457,8 +459,8 @@ button:disabled {
 }
 
 .tree-item-self.is-active {
-  background-color: var(--background-modifier-active);
   color: var(--text-normal);
+  box-shadow: inset 2px 0 0 var(--text-normal);
 }
 
 .tree-item-name {
@@ -587,10 +589,9 @@ button:disabled {
 
 .workspace-tab-header {
   display: flex;
-  align-items: center;
+  align-items: flex-end;
   height: var(--titlebar-height);
-  padding: 4px 8px 0;
-  background-color: var(--background-secondary);
+  padding: 4px 12px 0;
   border-bottom: 1px solid var(--background-modifier-border);
 }
 
@@ -599,11 +600,11 @@ button:disabled {
   align-items: center;
   max-width: 220px;
   height: 32px;
-  padding: 0 14px;
-  border-radius: var(--radius-s) var(--radius-s) 0 0;
-  background-color: var(--background-primary);
+  padding: 0 4px;
   color: var(--text-normal);
-  font-size: var(--font-ui-small);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  box-shadow: inset 0 -1px 0 var(--text-normal);
 }
 
 .workspace-tab span {
@@ -676,12 +677,10 @@ button:disabled {
   align-items: center;
   gap: 8px;
   margin: 0 12px 8px;
-  padding: 8px 12px;
-  border: 1px solid var(--background-modifier-border);
-  border-radius: var(--radius-s);
-  background-color: var(--background-secondary);
+  padding: 6px 10px;
+  border-left: 2px solid var(--accent-danger, var(--text-normal));
   color: var(--text-normal);
-  font-size: var(--font-ui-small);
+  font-size: var(--fs-sm);
 }
 
 .app-container.sidebar-hidden {
@@ -2297,11 +2296,12 @@ body.is-resizing-panes .pane-cell {
 .inline-title {
   margin: 12px 0 20px;
   color: var(--text-normal);
-  font-size: 1.802em;
-  font-weight: var(--fw-display);
-  line-height: 1.3;
+  font-size: var(--fs-3xl);
+  font-weight: var(--fw-semibold);
+  line-height: 1.25;
   font-family: var(--font-text);
   text-wrap: balance;
+  letter-spacing: -0.005em;
 }
 
 .markdown-reading-view .inline-title {
@@ -2802,6 +2802,15 @@ body.is-resizing-panes .pane-cell {
   margin: 2em 0;
   border: none;
   border-top: 1px solid var(--hr-color);
+}
+
+.markdown-preview-view img,
+.session-assistant img {
+  max-width: 100%;
+  height: auto;
+  border-radius: var(--radius-xs);
+  outline: 1px solid var(--background-modifier-border);
+  outline-offset: -1px;
 }
 
 .markdown-preview-view strong {
@@ -4706,8 +4715,7 @@ body.is-resizing-panes .pane-cell {
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
-  padding: 10px 12px;
-  border-bottom: 1px solid var(--background-modifier-border);
+  padding: 10px 14px;
 }
 
 .session-ticket {
@@ -5286,15 +5294,14 @@ body.is-resizing-panes .pane-cell {
 .session-user {
   align-self: flex-end;
   max-width: min(90%, 640px);
-  padding: 9px 13px;
-  border: 1px solid var(--background-modifier-border);
+  padding: 6px 10px;
   border-radius: var(--radius-xs);
   background-color: var(--background-secondary);
   color: var(--text-normal);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--font-ui-smaller);
-  line-height: 1.5;
+  line-height: 1.55;
 }
 
 .session-text {
@@ -5319,11 +5326,10 @@ body.is-resizing-panes .pane-cell {
 }
 
 .session-assistant {
-  padding: 2px 2px 2px 12px;
-  border-left: 2px solid var(--background-modifier-border);
+  padding: 2px 0;
   color: var(--text-normal);
   font-size: var(--font-ui-small);
-  line-height: 1.6;
+  line-height: 1.65;
   overflow-wrap: break-word;
 }
 
@@ -5351,10 +5357,7 @@ body.is-resizing-panes .pane-cell {
   gap: 6px;
   align-self: flex-start;
   min-width: 0;
-  padding: 5px 12px 5px 8px;
-  border: 1px solid var(--background-modifier-border);
-  border-radius: var(--radius-xs);
-  background-color: var(--background-secondary);
+  padding: 3px 4px;
   color: var(--text-muted);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
@@ -5363,7 +5366,6 @@ body.is-resizing-panes .pane-cell {
 }
 
 .session-activity-head:hover {
-  border-color: var(--text-faint);
   color: var(--text-normal);
 }
 
@@ -6093,11 +6095,15 @@ body.is-resizing-panes .pane-cell {
 }
 
 .nav-agents-divider {
-  margin: 10px 8px 4px;
+  margin: 12px 10px 4px;
+  padding-top: 8px;
+  border-top: 1px solid var(--background-modifier-border);
   color: var(--text-faint);
-  font-family: var(--font-monospace);
-  font-weight: var(--font-monospace-weight);
-  font-size: var(--font-ui-smaller);
+  font-family: var(--font-interface);
+  font-weight: var(--fw-medium);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  font-size: var(--fs-xs);
 }
 
 .session-composer {
@@ -6707,26 +6713,23 @@ body.is-resizing-panes .pane-cell {
 
 .tokens-chip {
   appearance: none;
-  border: 1px solid var(--background-modifier-border);
-  background: var(--background-primary);
-  color: var(--text-muted);
-  padding: 3px 10px;
+  border: none;
+  background: transparent;
+  color: var(--text-faint);
+  padding: 3px 6px;
   font-size: var(--fs-sm);
-  border-radius: var(--radius-xs);
   cursor: pointer;
   font-family: inherit;
-  transition: background 100ms ease, color 100ms ease;
+  transition: color 120ms ease;
 }
 
 .tokens-chip:hover {
-  background: var(--background-modifier-hover);
   color: var(--text-normal);
 }
 
 .tokens-chip.is-active {
-  background: var(--text-normal);
-  color: var(--background-primary);
-  border-color: var(--text-normal);
+  color: var(--text-normal);
+  box-shadow: inset 0 -1px 0 var(--text-normal);
 }
 
 .tokens-cached-toggle {
@@ -7392,10 +7395,9 @@ body.is-resizing-panes .pane-cell {
   position: relative;
   display: flex;
   flex: 0 0 auto;
-  min-height: 40px;
+  min-height: 36px;
   padding-right: 35px;
   border-bottom: 1px solid var(--background-modifier-border);
-  background: var(--background-secondary);
   overflow: visible;
 }
 
@@ -7405,14 +7407,17 @@ body.is-resizing-panes .pane-cell {
   flex: 1 1 132px;
   min-width: 0;
   max-width: 220px;
-  border-right: 1px solid var(--background-modifier-border);
-  color: var(--text-muted);
+  color: var(--text-faint);
+  transition: color 120ms ease;
+}
+
+.artifact-panel-tab:hover {
+  color: var(--text-normal);
 }
 
 .artifact-panel-tab.is-active {
-  background: var(--background-primary);
   color: var(--text-normal);
-  box-shadow: inset 0 -2px 0 var(--accent-primary);
+  box-shadow: inset 0 -1px 0 var(--text-normal);
 }
 
 .artifact-panel-tab-main {
@@ -7447,6 +7452,16 @@ body.is-resizing-panes .pane-cell {
   width: 22px;
   place-items: center;
   color: var(--text-faint);
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.artifact-panel-tab:hover .artifact-panel-tab-action,
+.artifact-panel-tab.is-active .artifact-panel-tab-action,
+.artifact-panel:hover .artifact-panel-close,
+.artifact-panel-tab-action:focus-visible,
+.artifact-panel-close:focus-visible {
+  opacity: 1;
 }
 
 .artifact-panel-tab-action:hover,
@@ -7892,7 +7907,9 @@ body.is-resizing-panes .pane-cell {
 
 .dashboard-header h2 {
   margin: 0;
-  font-size: var(--font-ui-large);
+  font-size: var(--fs-2xl);
+  font-weight: var(--fw-semibold);
+  letter-spacing: -0.005em;
 }
 
 .dashboard-count {
