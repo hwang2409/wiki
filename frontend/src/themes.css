@@ -54,11 +54,13 @@
   --status-blocked-border: var(--text-normal);
   --status-blocked-color: var(--text-normal);
 
-  --diff-add-background: var(--background-modifier-active);
+  /* Diffs are the one mono surface that keeps hue: add/remove polarity is
+     unreadable in grayscale on large rewrite hunks. */
+  --diff-add-background: rgba(40, 130, 60, 0.12);
   --diff-add-foreground: var(--text-normal);
-  --diff-remove-background: var(--background-modifier-hover);
-  --diff-remove-foreground: var(--text-faint);
-  --diff-hatch-color: var(--background-modifier-hover);
+  --diff-remove-background: rgba(200, 40, 50, 0.1);
+  --diff-remove-foreground: #8a3038;
+  --diff-hatch-color: rgba(200, 40, 50, 0.12);
 
   --selection-inverse-background: var(--text-faint);
   --selection-inverse-color: var(--background-primary);
@@ -120,11 +122,12 @@
   --status-blocked-border: var(--text-normal);
   --status-blocked-color: var(--text-normal);
 
-  --diff-add-background: var(--background-modifier-active);
+  /* Same mono exception as light: hue only for diff polarity. */
+  --diff-add-background: rgba(110, 190, 120, 0.16);
   --diff-add-foreground: var(--text-normal);
-  --diff-remove-background: var(--background-modifier-hover);
-  --diff-remove-foreground: var(--text-faint);
-  --diff-hatch-color: var(--background-modifier-hover);
+  --diff-remove-background: rgba(230, 100, 95, 0.14);
+  --diff-remove-foreground: #d98781;
+  --diff-hatch-color: rgba(230, 100, 95, 0.14);
 
   --selection-inverse-background: var(--text-faint);
   --selection-inverse-color: var(--background-primary);
