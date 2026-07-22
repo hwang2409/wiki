@@ -3,7 +3,7 @@ type: reference
 view: kanban
 tags: [todo]
 created: 2026-07-06
-updated: 2026-07-20
+updated: 2026-07-22
 ---
 
 Todo:
@@ -18,6 +18,7 @@ Todo:
 - [P3] pufferclone /metrics endpoint (gauge follow-up)
 - MITMWEB-F4: full restyle of mitm-inspector web UI for clarity — adopt theme/layout language of ~/me/fun/wiki frontend; spawn fable worker after I1 integration merges — owner (misc)
 - Slack admin agent access for Corey Grissom — confirm with Corey his @phoebe.work email + provisioning plan, then either (a) have him sign into app.phoebe.work with @phoebe.work Google Workspace so Kratos provisions the user row + flip admin=true, or (b) one-time hotfix INSERT app.users row + backfill org_slack_user_mappings.user_id for slack_user_id U0AGES89BLZ (2 org rows: Phoebe Home Care + Orchard St. Homecare, both currently user_id=null). Root cause: no app.users row exists at all — his Slack identity is known but unmapped. Full diagnostic + proposed SQL in phoebe session 2026-07-17.
+- [P1] PHO-14029 prod dedupe backfill (bun run people:dedupe-backfill --write) + PHO-14033 unique index migration on people(lower(email)) — EOD 2026-07-22
 
 In Progress:
 

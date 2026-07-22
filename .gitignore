@@ -15,3 +15,5 @@ build/
 /.native-build-staging/
 /.native-cargo-target/
 src-tauri/.native-build-staging/
+.claude/
+.codex/worktrees/

@@ -31,6 +31,21 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[instance-pinning-verification]] — Failure shape: verification targets a different instance than the consumer uses (main-vs-worktree, hot-vs-frozen backend, stale checkout); always pin the instance
 - [[turbopuffer]] — Serverless vector+FTS search DB on object storage — what it is, when to use
 - [[local-cloud]] — local-cloud: Henry's self-hosted service stack on GPU machine — direction, stack picks, pufferclone's role
+- [[harness-best-of-breed]] — cross-harness feature comparison; picks the strongest bits of each agent harness
+- [[harness-claude-agent-sdk]] — Claude Agent SDK harness breakdown: architecture, extension points, gotchas
+- [[harness-codex-cli]] — Codex CLI harness breakdown: run model, tool surface, prompt style
+- [[harness-gemini-cli]] — Gemini CLI harness breakdown: capabilities, sandboxing, limits
+- [[harness-opencode]] — OpenCode harness breakdown: open-source stack, plugin model
+- [[harness-pi-coding-agent]] — Pi coding agent harness breakdown: runtime, tool surface
+- [[llm-rigorous-proving]] — LLMs on rigorous mathematical proving: current SOTA, failure modes, benchmarks
+
+## Design
+
+- [[laws-of-ux]] — Laws of UX field notes: which laws bite where in Wiki/Phoebe UI decisions
+
+## Math
+
+- [[jacobian-conjecture-fable-2026]] — Fable-model exploration of the Jacobian conjecture (2026); status and dead ends
 
 ## Phoebe
 

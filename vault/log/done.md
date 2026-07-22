@@ -2,10 +2,14 @@
 type: log
 tags: [log, done]
 created: 2026-07-06
-updated: 2026-07-21
+updated: 2026-07-22
 ---
 
 # Done
+
+## 2026-07-22
+
+- **wiki** — WIKI-145 UI refresh II — 12 audit treatments (narrower rail, transparent workspace-sidebar+tab-header, hairline tabs, left-accent active row, borderless session-header, plain-prose assistant, downgraded notice/composer/activity-head, text-toggle chips); honest screenshot fixture + resilient python resolver; new layout/noise/typography playwright suites — PR #116 squash 7be5561 (3 review rounds)
 
 ## 2026-07-21
 
@@ -18,6 +22,10 @@ updated: 2026-07-21
 
 - WIKI-136 dashboard j/k scrolling (#108 squash c3c3278, 1 review round + post-merge sync, patch-id verified)
 - WIKI-134 C-a leader keybind regression fixed (#107 squash 1283ed0, 2 review rounds)
+- WIKI-137 frontend cache headers (#109 squash ce4216f)
+- WIKI-140 dashboard project/date/state filters (#110 squash 14cd5b4)
+- WIKI-139 provider auth health probe + badge (#112 squash 450dd47)
+- WIKI-138 supervisor-native fleet monitor — pushes worker state transitions to orchestrators (#111 squash f049c8e)
 - PHO-14067 churned-org DRI staleness filter merged (#11795 squash 4aa28e53, 1 sol round clean)
 
 ## 2026-07-19
