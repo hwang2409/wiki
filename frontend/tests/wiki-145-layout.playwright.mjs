@@ -68,14 +68,17 @@ try {
     `workspace-sidebar expected 180-240px (calm rail), got ${sidebarPx}`,
   );
 
-  // Sidebar right edge is a hairline (1px), not a filled band.
+  // Sidebar right edge is a hairline (1px), not a filled band; background must be transparent.
   const sidebarBorder = await page.evaluate(() => {
     const el = document.querySelector(".workspace-sidebar");
+    const body = document.body;
     if (!(el instanceof HTMLElement)) return null;
     const cs = getComputedStyle(el);
+    const bodyBg = getComputedStyle(body).backgroundColor;
     return {
       borderRight: cs.borderRightWidth,
       background: cs.backgroundColor,
+      bodyBg,
     };
   });
   assert(sidebarBorder, "workspace-sidebar missing");
@@ -83,8 +86,17 @@ try {
     sidebarBorder.borderRight === "1px",
     `workspace-sidebar right border expected 1px hairline, got ${sidebarBorder.borderRight}`,
   );
+  // Transparent OR matches the surrounding body background — either signals "no filled band".
+  const sidebarTransparent =
+    sidebarBorder.background === "rgba(0, 0, 0, 0)" ||
+    sidebarBorder.background === "transparent" ||
+    sidebarBorder.background === sidebarBorder.bodyBg;
+  assert(
+    sidebarTransparent,
+    `workspace-sidebar background expected transparent or body bg (${sidebarBorder.bodyBg}), got ${sidebarBorder.background}`,
+  );
 
-  // Tab bar hairline: bottom border on workspace-tab-header, and no background fill.
+  // Tab bar hairline: bottom border on workspace-tab-header, and no filled band.
   const tabHeader = await page.evaluate(() => {
     const el = document.querySelector(".workspace-tab-header");
     if (!(el instanceof HTMLElement)) return null;
@@ -92,12 +104,21 @@ try {
     return {
       borderBottom: cs.borderBottomWidth,
       background: cs.backgroundColor,
+      bodyBg: getComputedStyle(document.body).backgroundColor,
     };
   });
   assert(tabHeader, "workspace-tab-header missing");
   assert(
     tabHeader.borderBottom === "1px",
     `workspace-tab-header expected 1px hairline bottom, got ${tabHeader.borderBottom}`,
+  );
+  const tabHeaderTransparent =
+    tabHeader.background === "rgba(0, 0, 0, 0)" ||
+    tabHeader.background === "transparent" ||
+    tabHeader.background === tabHeader.bodyBg;
+  assert(
+    tabHeaderTransparent,
+    `workspace-tab-header background expected transparent or body bg (${tabHeader.bodyBg}), got ${tabHeader.background}`,
   );
 
   await page.screenshot({ path: path.join(OUT_DIR, "wiki-145-layout.png") });
