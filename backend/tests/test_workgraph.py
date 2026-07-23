@@ -11,6 +11,7 @@ from unittest import mock
 from fastapi import HTTPException
 
 from backend.app import main, workgraph
+from wiki_cli import graph_lint
 
 BASE_TS = 1_784_700_000.0
 
@@ -202,8 +203,8 @@ class WorkgraphWriterTests(unittest.TestCase):
         self.assertEqual([a["check"] for a in alarms], ["iteration_cap"])
 
 
-def validate_against_workgraph_schema(graph: dict) -> list[str]:
-    return workgraph.validate_instance(graph, workgraph.load_schema("workgraph"))
+def validate_against_workgraph_schema(graph: dict) -> list:
+    return graph_lint.validate_document(graph, "workgraph")
 
 
 class WorkgraphEndpointTests(unittest.TestCase):
