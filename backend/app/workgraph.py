@@ -9,6 +9,10 @@ by the hot copy under ``/tmp/agent-status``.
 
 Durability contract for ``append_edge``:
 
+- A per-ticket cross-process lock (``<ticket>.workgraph.lock`` next to the hot
+  file) is held from load/validation through both commits, so concurrent
+  backend requests and CLI appends serialize instead of last-writer-winning
+  away each other's edges.
 - Both output files are staged as temp files first; the snapshot commits
   BEFORE the hot pointer, so a failure can never leave a live edge without a
   durable copy. Temp files are removed on every error path and IO failures
@@ -16,8 +20,12 @@ Durability contract for ``append_edge``:
 - The hot file is the authoritative last commit. If the hot rename fails after
   the snapshot committed, retrying the same append is safe: the retry reloads
   the old hot graph and appends the edge once (the orphan snapshot is a benign
-  point-in-time copy). A retry whose edge exactly matches the newest hot edge
-  (same kind/from/to/payload) is treated as a replay and appends nothing.
+  point-in-time copy). Replays are detected by stable operation key across the
+  full edge history — the spawn payload's ``request_id``, or the steer
+  finding's request-digest fields — falling back to exact newest-edge equality
+  for keyless kinds. A replayed append mutates nothing.
+- Snapshot names carry epoch-ns plus pid and a per-process counter, so
+  same-instant appends can never overwrite one another's snapshots.
 - An existing-but-unreadable/invalid hot file fails closed
   (``WorkgraphCorruptError``); it is never silently replaced. Recovery is
   explicit via ``recover_from_snapshot`` / ``wiki graph recover``.
@@ -28,6 +36,9 @@ versioned ``schemas/`` files in both source checkouts and PyInstaller bundles.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
+import itertools
 import json
 import os
 import tempfile
@@ -111,6 +122,28 @@ def hot_path(ticket: str, status_dir: Path | None = None) -> Path:
     return (status_dir or STATUS_DIR) / f"{ticket}.workgraph.json"
 
 
+@contextlib.contextmanager
+def _ticket_lock(ticket: str, status_dir: Path | None = None):
+    """Cross-process mutex serializing every mutation of one ticket's graph.
+
+    Backend requests and ``wiki graph append`` share the same lockfile, so a
+    read-modify-write can never interleave with another writer's commit.
+    """
+    directory = status_dir or STATUS_DIR
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        handle = open(directory / f"{ticket}.workgraph.lock", "a+b")
+    except OSError as exc:
+        raise WorkgraphError(f"could not open workgraph lock for {ticket}: {exc}") from exc
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
 def load_workgraph(ticket: str, status_dir: Path | None = None) -> dict[str, Any] | None:
     """Return the hot graph, ``None`` if absent, or fail closed if damaged.
 
@@ -142,19 +175,42 @@ def load_workgraph(ticket: str, status_dir: Path | None = None) -> dict[str, Any
     return data
 
 
+# Per-process counter suffix for snapshot names: combined with epoch-ns and
+# pid, two appends can never produce the same name even at an identical
+# (injected or same-instant) clock reading.
+_SNAPSHOT_SEQ = itertools.count()
+
+
+def _snapshot_name(ticket: str, now_ts: float) -> str:
+    return (
+        f"{ticket}-{int(now_ts * 1_000_000_000)}-{os.getpid()}-{next(_SNAPSHOT_SEQ)}"
+        ".workgraph.json"
+    )
+
+
+def _snapshot_sort_key(suffix: str) -> tuple[int, int, int] | None:
+    parts = suffix.split("-")
+    if not parts or not all(part.isdigit() for part in parts):
+        return None
+    if len(parts) == 1:  # legacy millisecond names sort against epoch-ns names
+        return (int(parts[0]) * 1_000_000, 0, 0)
+    if len(parts) == 3:
+        return (int(parts[0]), int(parts[1]), int(parts[2]))
+    return None
+
+
 def newest_snapshot_path(ticket: str, snapshot_dir: Path | None = None) -> Path | None:
     directory = snapshot_dir or SNAPSHOT_DIR
-    best: tuple[int, Path] | None = None
+    best: tuple[tuple[int, int, int], Path] | None = None
     if not directory.is_dir():
         return None
     for path in directory.glob(f"{ticket}-*.workgraph.json"):
         stem = path.name.removesuffix(".workgraph.json")
-        epoch_text = stem[len(ticket) + 1 :]
-        if not epoch_text.isdigit():
+        key = _snapshot_sort_key(stem[len(ticket) + 1 :])
+        if key is None:
             continue
-        epoch = int(epoch_text)
-        if best is None or epoch > best[0]:
-            best = (epoch, path)
+        if best is None or key > best[0]:
+            best = (key, path)
     return best[1] if best else None
 
 
@@ -170,16 +226,26 @@ def load_snapshot(ticket: str, snapshot_dir: Path | None = None) -> dict[str, An
 
 
 def _stage_json(directory: Path, text: str) -> Path:
-    """Write serialized graph text to a temp file in ``directory``."""
+    """Write serialized graph text to a temp file in ``directory``.
+
+    The temp path is captured before any write so it can be unlinked on every
+    unsuccessful exit — a failed write or close must not leak a staging file.
+    """
     try:
         directory.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
+        handle = tempfile.NamedTemporaryFile(
             "w", dir=str(directory), suffix=".workgraph-tmp", delete=False, encoding="utf-8"
-        ) as handle:
-            handle.write(text)
-            return Path(handle.name)
+        )
     except OSError as exc:
         raise WorkgraphError(f"could not stage workgraph write under {directory}: {exc}") from exc
+    temp = Path(handle.name)
+    try:
+        with handle:
+            handle.write(text)
+    except OSError as exc:
+        temp.unlink(missing_ok=True)
+        raise WorkgraphError(f"could not stage workgraph write under {directory}: {exc}") from exc
+    return temp
 
 
 def _serialize(data: dict[str, Any]) -> str:
@@ -219,13 +285,14 @@ def recover_from_snapshot(
 
     hot = hot_path(ticket, status_dir)
     backup: Path | None = None
-    if hot.exists() or hot.is_symlink():
-        backup = hot.with_name(f"{hot.name}.corrupt-{int(CLOCK() * 1000)}")
-        try:
-            hot.rename(backup)
-        except OSError as exc:
-            raise WorkgraphError(f"could not preserve damaged hot file {hot}: {exc}") from exc
-    atomic_write_json(hot, data)
+    with _ticket_lock(ticket, status_dir):
+        if hot.exists() or hot.is_symlink():
+            backup = hot.with_name(f"{hot.name}.corrupt-{int(CLOCK() * 1000)}")
+            try:
+                hot.rename(backup)
+            except OSError as exc:
+                raise WorkgraphError(f"could not preserve damaged hot file {hot}: {exc}") from exc
+        atomic_write_json(hot, data)
     return {"snapshot": str(snapshot_path), "backup": str(backup) if backup else None}
 
 
@@ -392,10 +459,47 @@ def create_workgraph(
     }
 
 
+def _edge_op_key(edge: object) -> str | None:
+    """Stable operation key for supervisor-idempotent edge kinds.
+
+    Spawns carry the supervisor ``request_id`` verbatim. Composed steers
+    (``graph_lint.compose_steer_document``) derive the first finding's
+    ``id``/``source_sha`` from a digest of request id + message, so the same
+    steer request maps to the same key even though ``created_at`` churns on
+    every compose. Kinds without a request identity return ``None`` and fall
+    back to exact newest-edge equality.
+    """
+    if not isinstance(edge, dict):
+        return None
+    payload = edge.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    kind = edge.get("kind")
+    if kind == "spawn":
+        request_id = payload.get("request_id")
+        if isinstance(request_id, str) and request_id:
+            return f"spawn:{request_id}"
+        return None
+    if kind == "steer":
+        findings = payload.get("findings")
+        first = findings[0] if isinstance(findings, list) and findings else None
+        if isinstance(first, dict):
+            finding_id = first.get("id")
+            sha = first.get("source_sha")
+            if isinstance(finding_id, str) and finding_id and isinstance(sha, str) and sha:
+                return f"steer:{finding_id}:{sha}"
+    return None
+
+
 def _is_replay(graph: dict[str, Any], edge: dict[str, Any]) -> bool:
     edges = graph.get("edges")
     if not isinstance(edges, list) or not edges:
         return False
+    # Keyed kinds dedupe across the FULL history: a replay can arrive after
+    # other edges have landed, so newest-edge equality is not enough.
+    key = _edge_op_key(edge)
+    if key is not None:
+        return any(_edge_op_key(prior) == key for prior in edges)
     last = edges[-1]
     return isinstance(last, dict) and all(
         last.get(key) == edge.get(key) for key in ("kind", "from", "to", "payload")
@@ -434,64 +538,65 @@ def append_edge(
     # before any graph state is loaded or mutated.
     _validate(edge, "edge", f"{edge_kind} edge")
 
-    graph = load_workgraph(ticket, status_dir)
-    if graph is None:
-        if not orch:
-            raise WorkgraphError(f"no workgraph for {ticket} yet; pass --orch to create one")
-        graph = create_workgraph(ticket, orch, template, created_at=stamp)
-    else:
-        try:
-            _validate(graph, "workgraph", "existing workgraph")
-        except WorkgraphError as exc:
-            raise WorkgraphCorruptError(
-                f"existing hot workgraph for {ticket} is invalid and will not be replaced "
-                f"({exc}); run `wiki graph recover {ticket}` to restore the newest snapshot"
-            ) from exc
-        if _is_replay(graph, edge):
-            graph["_snapshot_path"] = None
-            graph["_replayed"] = True
-            return graph
-
-    known = _node_ids(graph)
-    graph_orch = str(graph.get("orch") or orch or "orch")
-    for role, node_id in (("from", from_node), ("to", to_node)):
-        if node_id not in known:
-            graph.setdefault("nodes", []).append(
-                _infer_node(node_id, edge_kind, role, payload, graph_orch)
-            )
-            known.add(node_id)
-
-    graph.setdefault("edges", []).append(edge)
-    graph["updated_at"] = stamp
-    graph["composite_health"] = compute_composite_health(graph, now_ts)
-
-    _validate(graph, "workgraph", "workgraph")
-
-    # Stage everything, then commit the durable snapshot BEFORE the hot
-    # pointer: a live edge must never exist without its durable copy.
-    serialized = _serialize(graph)
-    hot = hot_path(ticket, status_dir)
-    snapshot_path: Path | None = None
-    staged: list[tuple[Path, Path]] = []
-    if edge_kind in SNAPSHOT_EDGE_KINDS:
-        directory = snapshot_dir or SNAPSHOT_DIR
-        # Millisecond epoch: scripted sequences append faster than 1/s and the
-        # newest-snapshot lookup needs distinct, ordered names.
-        snapshot_path = directory / f"{ticket}-{int(now_ts * 1000)}.workgraph.json"
-        staged.append((_stage_json(directory, serialized), snapshot_path))
-    try:
-        staged.append((_stage_json(hot.parent, serialized), hot))
-        for temp, target in staged:
+    # The cross-process lock spans load through both commits: another writer
+    # can never interleave between our read and our rename.
+    with _ticket_lock(ticket, status_dir):
+        graph = load_workgraph(ticket, status_dir)
+        if graph is None:
+            if not orch:
+                raise WorkgraphError(f"no workgraph for {ticket} yet; pass --orch to create one")
+            graph = create_workgraph(ticket, orch, template, created_at=stamp)
+        else:
             try:
-                temp.rename(target)
-            except OSError as exc:
-                raise WorkgraphError(
-                    f"could not commit workgraph write to {target}: {exc}"
+                _validate(graph, "workgraph", "existing workgraph")
+            except WorkgraphError as exc:
+                raise WorkgraphCorruptError(
+                    f"existing hot workgraph for {ticket} is invalid and will not be replaced "
+                    f"({exc}); run `wiki graph recover {ticket}` to restore the newest snapshot"
                 ) from exc
-    except WorkgraphError:
-        for temp, _target in staged:
-            temp.unlink(missing_ok=True)
-        raise
+            if _is_replay(graph, edge):
+                graph["_snapshot_path"] = None
+                graph["_replayed"] = True
+                return graph
+
+        known = _node_ids(graph)
+        graph_orch = str(graph.get("orch") or orch or "orch")
+        for role, node_id in (("from", from_node), ("to", to_node)):
+            if node_id not in known:
+                graph.setdefault("nodes", []).append(
+                    _infer_node(node_id, edge_kind, role, payload, graph_orch)
+                )
+                known.add(node_id)
+
+        graph.setdefault("edges", []).append(edge)
+        graph["updated_at"] = stamp
+        graph["composite_health"] = compute_composite_health(graph, now_ts)
+
+        _validate(graph, "workgraph", "workgraph")
+
+        # Stage everything, then commit the durable snapshot BEFORE the hot
+        # pointer: a live edge must never exist without its durable copy.
+        serialized = _serialize(graph)
+        hot = hot_path(ticket, status_dir)
+        snapshot_path: Path | None = None
+        staged: list[tuple[Path, Path]] = []
+        if edge_kind in SNAPSHOT_EDGE_KINDS:
+            directory = snapshot_dir or SNAPSHOT_DIR
+            snapshot_path = directory / _snapshot_name(ticket, now_ts)
+            staged.append((_stage_json(directory, serialized), snapshot_path))
+        try:
+            staged.append((_stage_json(hot.parent, serialized), hot))
+            for temp, target in staged:
+                try:
+                    temp.rename(target)
+                except OSError as exc:
+                    raise WorkgraphError(
+                        f"could not commit workgraph write to {target}: {exc}"
+                    ) from exc
+        except WorkgraphError:
+            for temp, _target in staged:
+                temp.unlink(missing_ok=True)
+            raise
 
     graph["_snapshot_path"] = str(snapshot_path) if snapshot_path else None
     return graph

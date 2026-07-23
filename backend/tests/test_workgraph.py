@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import tempfile
 import unittest
 from pathlib import Path
@@ -442,6 +443,277 @@ class CommitOrderingTests(unittest.TestCase):
         self.assertIsNone(graph.get("_snapshot_path"))
         self.assertEqual(self.hot().read_bytes(), before)
         self.assertEqual(len(list(self.snapshot_dir.glob("TST-1-*.workgraph.json"))), 1)
+
+
+class _FakeStagingHandle:
+    """NamedTemporaryFile stand-in that can fail at the write or close boundary."""
+
+    def __init__(self, path: Path, fail_on: str | None, events: list[str]) -> None:
+        self._file = open(path, "w", encoding="utf-8")
+        self.name = str(path)
+        self._fail_on = fail_on
+        self._events = events
+
+    def __enter__(self) -> "_FakeStagingHandle":
+        return self
+
+    def __exit__(self, *exc_info: object) -> bool:
+        self.close()
+        return False
+
+    def write(self, text: str) -> None:
+        self._events.append("write")
+        if self._fail_on == "write":
+            raise OSError("injected write failure")
+        self._file.write(text)
+
+    def close(self) -> None:
+        self._events.append("close")
+        self._file.close()
+        if self._fail_on == "close":
+            raise OSError("injected close failure")
+
+
+class StagingCleanupTests(unittest.TestCase):
+    """Round 3: _stage_json must unlink its temp file on write/close failure."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.directory = Path(self.tmp.name) / "stage"
+        self.events: list[str] = []
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def stage(self, fail_on: str | None):
+        def fake_tempfile(mode, dir=None, suffix="", delete=True, encoding=None):
+            return _FakeStagingHandle(
+                Path(dir) / f"injected{suffix}", fail_on, self.events
+            )
+
+        with mock.patch.object(
+            workgraph.tempfile, "NamedTemporaryFile", fake_tempfile
+        ):
+            return workgraph._stage_json(self.directory, '{"ok": true}')
+
+    def temp_files(self) -> list[Path]:
+        return list(self.directory.glob("*.workgraph-tmp"))
+
+    def test_write_failure_unlinks_temp_file(self) -> None:
+        with self.assertRaises(workgraph.WorkgraphError) as ctx:
+            self.stage("write")
+        self.assertIn("injected write failure", str(ctx.exception))
+        self.assertEqual(self.events, ["write", "close"])
+        self.assertEqual(self.temp_files(), [])
+
+    def test_close_failure_unlinks_temp_file(self) -> None:
+        with self.assertRaises(workgraph.WorkgraphError) as ctx:
+            self.stage("close")
+        self.assertIn("injected close failure", str(ctx.exception))
+        self.assertEqual(self.events, ["write", "close"])
+        self.assertEqual(self.temp_files(), [])
+
+    def test_success_writes_bytes_in_order_and_keeps_temp(self) -> None:
+        temp = self.stage(None)
+        self.assertEqual(self.events, ["write", "close"])
+        self.assertEqual(self.temp_files(), [temp])
+        self.assertEqual(temp.read_text(encoding="utf-8"), '{"ok": true}')
+
+
+def _concurrent_append_worker(
+    barrier, status_dir: str, snapshot_dir: str, worker_index: int, count: int
+) -> None:
+    from backend.app import workgraph as wg
+
+    barrier.wait(timeout=30)
+    for i in range(count):
+        payload = {
+            "ticket": "TST-1",
+            "role": "implement",
+            "model": "gpt-5.6-luna",
+            "worktree": "/tmp/wt",
+            "request_id": f"req-{worker_index}-{i}",
+        }
+        wg.append_edge(
+            "TST-1",
+            "spawn",
+            "N-1",
+            f"N-{worker_index}-{i}",
+            payload,
+            orch="wiki",
+            status_dir=Path(status_dir),
+            snapshot_dir=Path(snapshot_dir),
+            # Same instant on purpose: snapshot names must still be unique.
+            now_ts=BASE_TS,
+        )
+
+
+class ConcurrentAppendTests(unittest.TestCase):
+    """Round 3: concurrent writers must never lose edges or snapshots (item 1)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.status_dir = root / "status"
+        self.snapshot_dir = root / "workgraphs"
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_barrier_concurrent_appends_keep_every_edge_and_snapshot(self) -> None:
+        ctx = multiprocessing.get_context("spawn")
+        barrier = ctx.Barrier(2)
+        processes = [
+            ctx.Process(
+                target=_concurrent_append_worker,
+                args=(barrier, str(self.status_dir), str(self.snapshot_dir), index, 5),
+            )
+            for index in (1, 2)
+        ]
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=120)
+        self.assertEqual([process.exitcode for process in processes], [0, 0])
+
+        graph = workgraph.load_workgraph("TST-1", self.status_dir)
+        self.assertEqual(validate_against_workgraph_schema(graph), [])
+        self.assertEqual(len(graph["edges"]), 10)
+        self.assertEqual(
+            {edge["payload"]["request_id"] for edge in graph["edges"]},
+            {f"req-{worker}-{i}" for worker in (1, 2) for i in range(5)},
+        )
+        snapshots = list(self.snapshot_dir.glob("TST-1-*.workgraph.json"))
+        self.assertEqual(len(snapshots), 10)
+        self.assertIsNotNone(workgraph.newest_snapshot_path("TST-1", self.snapshot_dir))
+
+    def test_same_instant_snapshot_names_do_not_collide(self) -> None:
+        for index in range(2):
+            workgraph.append_edge(
+                "TST-1",
+                "spawn",
+                "N-1",
+                f"N-{index}",
+                {**spawn_payload(), "request_id": f"req-{index}"},
+                orch="wiki",
+                status_dir=self.status_dir,
+                snapshot_dir=self.snapshot_dir,
+                now_ts=BASE_TS,
+            )
+        snapshots = list(self.snapshot_dir.glob("TST-1-*.workgraph.json"))
+        self.assertEqual(len(snapshots), 2)
+        newest = workgraph.newest_snapshot_path("TST-1", self.snapshot_dir)
+        newest_graph = json.loads(newest.read_text(encoding="utf-8"))
+        self.assertEqual(len(newest_graph["edges"]), 2)
+
+    def test_legacy_millisecond_snapshot_names_still_resolve(self) -> None:
+        self.snapshot_dir.mkdir(parents=True)
+        legacy = self.snapshot_dir / f"TST-1-{int(BASE_TS * 1000)}.workgraph.json"
+        legacy.write_text("{}", encoding="utf-8")
+        self.assertEqual(
+            workgraph.newest_snapshot_path("TST-1", self.snapshot_dir), legacy
+        )
+        graph = workgraph.append_edge(
+            "TST-1",
+            "spawn",
+            "N-1",
+            "N-2",
+            spawn_payload(),
+            orch="wiki",
+            status_dir=self.status_dir,
+            snapshot_dir=self.snapshot_dir,
+            now_ts=BASE_TS + 60,
+        )
+        newest = workgraph.newest_snapshot_path("TST-1", self.snapshot_dir)
+        self.assertEqual(str(newest), graph["_snapshot_path"])
+
+
+class ReplayIdempotencyTests(unittest.TestCase):
+    """Round 3: request id is the stable graph-operation key (item 2)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.status_dir = root / "status"
+        self.snapshot_dir = root / "workgraphs"
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def append(self, kind: str, from_node: str, to_node: str, payload: dict, ts: float, **kwargs):
+        return workgraph.append_edge(
+            "TST-1",
+            kind,
+            from_node,
+            to_node,
+            payload,
+            status_dir=self.status_dir,
+            snapshot_dir=self.snapshot_dir,
+            now_ts=ts,
+            **kwargs,
+        )
+
+    def compose_steer(self, request_id: str, message: str, created_at: str) -> dict:
+        return graph_lint.compose_steer_document(
+            "TST-1",
+            "now",
+            message,
+            source_worker="orch:wiki",
+            request_id=request_id,
+            created_at=created_at,
+        )
+
+    def test_spawn_replay_dedupes_across_full_history(self) -> None:
+        self.append("spawn", "N-1", "N-2", spawn_payload(), BASE_TS, orch="wiki")
+        self.append("steer", "N-1", "N-2", steer_payload(), BASE_TS + 60)
+        graph = self.append("spawn", "N-1", "N-2", spawn_payload(), BASE_TS + 120)
+        self.assertTrue(graph.get("_replayed"))
+        self.assertEqual([e["kind"] for e in graph["edges"]], ["spawn", "steer"])
+        on_disk = workgraph.load_workgraph("TST-1", self.status_dir)
+        self.assertEqual(sum(1 for e in on_disk["edges"] if e["kind"] == "spawn"), 1)
+        self.assertEqual(len(list(self.snapshot_dir.glob("TST-1-*.workgraph.json"))), 1)
+
+    def test_delayed_steer_replay_with_created_at_churn_dedupes(self) -> None:
+        self.append("spawn", "N-1", "N-2", spawn_payload(), BASE_TS, orch="wiki")
+        first = self.compose_steer("req-steer", "fix the cache", "2026-07-22T12:00:00Z")
+        self.append("steer", "N-1", "N-2", first, BASE_TS + 60)
+        self.append("verdict", "N-3", "N-1", verdict_payload(), BASE_TS + 120)
+        replay = self.compose_steer("req-steer", "fix the cache", "2026-07-22T12:09:00Z")
+        graph = self.append("steer", "N-1", "N-2", replay, BASE_TS + 180)
+        self.assertTrue(graph.get("_replayed"))
+        on_disk = workgraph.load_workgraph("TST-1", self.status_dir)
+        self.assertEqual(sum(1 for e in on_disk["edges"] if e["kind"] == "steer"), 1)
+
+    def test_distinct_steer_requests_with_same_text_both_land(self) -> None:
+        self.append("spawn", "N-1", "N-2", spawn_payload(), BASE_TS, orch="wiki")
+        self.append(
+            "steer",
+            "N-1",
+            "N-2",
+            self.compose_steer("req-a", "continue", "2026-07-22T12:00:00Z"),
+            BASE_TS + 60,
+        )
+        graph = self.append(
+            "steer",
+            "N-1",
+            "N-2",
+            self.compose_steer("req-b", "continue", "2026-07-22T12:01:00Z"),
+            BASE_TS + 120,
+        )
+        self.assertFalse(graph.get("_replayed"))
+        self.assertEqual(sum(1 for e in graph["edges"] if e["kind"] == "steer"), 2)
+
+    def test_spawn_with_different_request_id_appends(self) -> None:
+        self.append("spawn", "N-1", "N-2", spawn_payload(), BASE_TS, orch="wiki")
+        graph = self.append(
+            "spawn",
+            "N-1",
+            "N-3",
+            {**spawn_payload(), "request_id": "req-other"},
+            BASE_TS + 60,
+        )
+        self.assertFalse(graph.get("_replayed"))
+        self.assertEqual(sum(1 for e in graph["edges"] if e["kind"] == "spawn"), 2)
 
 
 class ValidationLayerTests(unittest.TestCase):
