@@ -24,8 +24,10 @@ Durability contract for ``append_edge``:
   full edge history — the spawn payload's ``request_id``, or the steer
   finding's request-digest fields — falling back to exact newest-edge equality
   for keyless kinds. A replayed append mutates nothing.
-- Snapshot names carry epoch-ns plus pid and a per-process counter, so
-  same-instant appends can never overwrite one another's snapshots.
+- Snapshot names carry a per-ticket monotonic revision assigned while the
+  ticket lock is held, so recovery ordering follows commit order — never wall
+  time, which is sampled before the lock and can invert under contention.
+  Epoch-ns, pid, and a per-process counter keep names collision-proof.
 - An existing-but-unreadable/invalid hot file fails closed
   (``WorkgraphCorruptError``); it is never silently replaced. Recovery is
   explicit via ``recover_from_snapshot`` / ``wiki graph recover``.
@@ -181,22 +183,43 @@ def load_workgraph(ticket: str, status_dir: Path | None = None) -> dict[str, Any
 _SNAPSHOT_SEQ = itertools.count()
 
 
-def _snapshot_name(ticket: str, now_ts: float) -> str:
+def _snapshot_name(ticket: str, revision: int, now_ts: float) -> str:
     return (
-        f"{ticket}-{int(now_ts * 1_000_000_000)}-{os.getpid()}-{next(_SNAPSHOT_SEQ)}"
-        ".workgraph.json"
+        f"{ticket}-r{revision}-{int(now_ts * 1_000_000_000)}"
+        f"-{os.getpid()}-{next(_SNAPSHOT_SEQ)}.workgraph.json"
     )
 
 
-def _snapshot_sort_key(suffix: str) -> tuple[int, int, int] | None:
+def _snapshot_sort_key(suffix: str) -> tuple[int, int, int, int] | None:
+    """(revision, epoch-ns, pid, seq) — revision dominates.
+
+    Legacy pre-revision names sort as revision 0, so any revisioned snapshot
+    outranks every legacy one regardless of embedded wall time.
+    """
     parts = suffix.split("-")
+    if len(parts) == 4 and parts[0][:1] == "r":
+        if parts[0][1:].isdigit() and all(part.isdigit() for part in parts[1:]):
+            return (int(parts[0][1:]), int(parts[1]), int(parts[2]), int(parts[3]))
+        return None
     if not parts or not all(part.isdigit() for part in parts):
         return None
     if len(parts) == 1:  # legacy millisecond names sort against epoch-ns names
-        return (int(parts[0]) * 1_000_000, 0, 0)
-    if len(parts) == 3:
-        return (int(parts[0]), int(parts[1]), int(parts[2]))
+        return (0, int(parts[0]) * 1_000_000, 0, 0)
+    if len(parts) == 3:  # legacy epoch-ns names, pre-revision
+        return (0, int(parts[0]), int(parts[1]), int(parts[2]))
     return None
+
+
+def _latest_snapshot_revision(ticket: str, directory: Path) -> int:
+    if not directory.is_dir():
+        return 0
+    best = 0
+    for path in directory.glob(f"{ticket}-*.workgraph.json"):
+        stem = path.name.removesuffix(".workgraph.json")
+        key = _snapshot_sort_key(stem[len(ticket) + 1 :])
+        if key is not None:
+            best = max(best, key[0])
+    return best
 
 
 def newest_snapshot_path(ticket: str, snapshot_dir: Path | None = None) -> Path | None:
@@ -582,7 +605,11 @@ def append_edge(
         staged: list[tuple[Path, Path]] = []
         if edge_kind in SNAPSHOT_EDGE_KINDS:
             directory = snapshot_dir or SNAPSHOT_DIR
-            snapshot_path = directory / _snapshot_name(ticket, now_ts)
+            # Revision is assigned while HOLDING the ticket lock, so it follows
+            # commit order even when a slower writer sampled an older now_ts
+            # before the lock. Recovery orders by revision, never wall time.
+            revision = _latest_snapshot_revision(ticket, directory) + 1
+            snapshot_path = directory / _snapshot_name(ticket, revision, now_ts)
             staged.append((_stage_json(directory, serialized), snapshot_path))
         try:
             staged.append((_stage_json(hot.parent, serialized), hot))

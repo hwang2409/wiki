@@ -585,7 +585,16 @@ class ConcurrentAppendTests(unittest.TestCase):
         )
         snapshots = list(self.snapshot_dir.glob("TST-1-*.workgraph.json"))
         self.assertEqual(len(snapshots), 10)
-        self.assertIsNotNone(workgraph.newest_snapshot_path("TST-1", self.snapshot_dir))
+        # Round 4: the recovery-SELECTED snapshot must be the complete graph.
+        # All writers share one injected now_ts, so only revision ordering
+        # (assigned under the lock, in commit order) can get this right.
+        newest = workgraph.newest_snapshot_path("TST-1", self.snapshot_dir)
+        newest_graph = json.loads(newest.read_text(encoding="utf-8"))
+        self.assertEqual(len(newest_graph["edges"]), 10)
+        self.assertEqual(
+            {edge["payload"]["request_id"] for edge in newest_graph["edges"]},
+            {f"req-{worker}-{i}" for worker in (1, 2) for i in range(5)},
+        )
 
     def test_same_instant_snapshot_names_do_not_collide(self) -> None:
         for index in range(2):
@@ -605,6 +614,47 @@ class ConcurrentAppendTests(unittest.TestCase):
         newest = workgraph.newest_snapshot_path("TST-1", self.snapshot_dir)
         newest_graph = json.loads(newest.read_text(encoding="utf-8"))
         self.assertEqual(len(newest_graph["edges"]), 2)
+
+    def test_recovery_orders_by_commit_order_not_wall_time(self) -> None:
+        # The second commit carries an OLDER wall clock — a slower writer that
+        # sampled now_ts before the lock. Recovery must still select it.
+        for request_id, ts in (("req-first", BASE_TS + 100), ("req-second", BASE_TS)):
+            workgraph.append_edge(
+                "TST-1",
+                "spawn",
+                "N-1",
+                f"N-{request_id}",
+                {**spawn_payload(), "request_id": request_id},
+                orch="wiki",
+                status_dir=self.status_dir,
+                snapshot_dir=self.snapshot_dir,
+                now_ts=ts,
+            )
+        newest = workgraph.newest_snapshot_path("TST-1", self.snapshot_dir)
+        newest_graph = json.loads(newest.read_text(encoding="utf-8"))
+        self.assertEqual(
+            [e["payload"]["request_id"] for e in newest_graph["edges"]],
+            ["req-first", "req-second"],
+        )
+
+    def test_revisioned_snapshot_outranks_legacy_with_future_timestamp(self) -> None:
+        self.snapshot_dir.mkdir(parents=True)
+        future_ns = int((BASE_TS + 9999) * 1_000_000_000)
+        legacy = self.snapshot_dir / f"TST-1-{future_ns}-99999-0.workgraph.json"
+        legacy.write_text("{}", encoding="utf-8")
+        graph = workgraph.append_edge(
+            "TST-1",
+            "spawn",
+            "N-1",
+            "N-2",
+            spawn_payload(),
+            orch="wiki",
+            status_dir=self.status_dir,
+            snapshot_dir=self.snapshot_dir,
+            now_ts=BASE_TS,
+        )
+        newest = workgraph.newest_snapshot_path("TST-1", self.snapshot_dir)
+        self.assertEqual(str(newest), graph["_snapshot_path"])
 
     def test_legacy_millisecond_snapshot_names_still_resolve(self) -> None:
         self.snapshot_dir.mkdir(parents=True)
