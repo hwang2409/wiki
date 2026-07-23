@@ -17,14 +17,20 @@ Durability contract for ``append_edge``:
   BEFORE the hot pointer, so a failure can never leave a live edge without a
   durable copy. Temp files are removed on every error path and IO failures
   surface as ``WorkgraphError``.
-- The hot file is the authoritative last commit. If the hot rename fails after
-  the snapshot committed, retrying the same append is safe: the retry reloads
-  the old hot graph and appends the edge once (the orphan snapshot is a benign
-  point-in-time copy). Replays are detected by stable operation key across the
-  full edge history — the edge-level ``request_id`` (the supervisor's exact
-  idempotency key), with legacy fallbacks to the spawn payload's
-  ``request_id`` or the steer finding's request-digest fields — and exact
-  newest-edge equality for keyless kinds. A replayed append mutates nothing.
+- The hot file is the authoritative last commit, and the commit protocol is
+  crash-consistent: if a writer dies between the snapshot rename and the hot
+  rename, the next append (under the same lock, before allocating a new
+  revision) detects the orphan snapshot — its edges strictly extend the hot
+  graph's — promotes it into the append base, and republishes hot from it.
+  The orphan's committed edge can therefore never be shadowed by a newer
+  revision or dropped from the recovered history, and retrying the failed
+  append dedupes against the promoted base. Replays are detected by stable
+  operation key across the full edge history — the edge-level ``request_id``
+  (the supervisor's exact idempotency key, mode-scoped for steer edges since
+  ``now``/``on-idle`` are distinct supervisor methods), with legacy fallbacks
+  to the spawn payload's ``request_id`` or the steer finding's request-digest
+  fields — and exact newest-edge equality for keyless kinds. A replayed
+  append mutates nothing.
 - Snapshot names carry a per-ticket monotonic revision assigned while the
   ticket lock is held, so recovery ordering follows commit order — never wall
   time, which is sampled before the lock and can invert under contention.
@@ -489,20 +495,28 @@ def _edge_op_key(edge: object) -> str | None:
     The edge-level ``request_id`` — the supervisor's exact idempotency key,
     persisted as operation metadata — dominates when present: it is
     body-independent, so a replay with altered text still dedupes and two
-    distinct operations can never collide. Older edges without it fall back
-    to the spawn payload's ``request_id``, then to the legacy steer digest
-    fields (``id``/``source_sha`` prefixes of one request-id+message digest).
+    distinct operations can never collide. Steer keys also carry the payload
+    ``mode``: ``now`` and ``on-idle`` are distinct supervisor methods
+    (``run/send_now`` vs ``run/send_on_idle``), so one request id used once
+    per mode is two operations and must record two edges. Older edges
+    without an edge-level id fall back to the spawn payload's
+    ``request_id``, then to the legacy steer digest fields
+    (``id``/``source_sha`` prefixes of one request-id+message digest).
     Kinds without any request identity return ``None`` and dedupe by exact
     newest-edge equality.
     """
     if not isinstance(edge, dict):
         return None
     kind = edge.get("kind")
+    payload = edge.get("payload")
+    payload = payload if isinstance(payload, dict) else None
+    mode = payload.get("mode") if payload else None
     request_id = edge.get("request_id")
     if isinstance(request_id, str) and request_id:
+        if kind == "steer":
+            return f"steer:{mode}:{request_id}"
         return f"{kind}:{request_id}"
-    payload = edge.get("payload")
-    if not isinstance(payload, dict):
+    if payload is None:
         return None
     if kind == "spawn":
         payload_request_id = payload.get("request_id")
@@ -516,8 +530,53 @@ def _edge_op_key(edge: object) -> str | None:
             finding_id = first.get("id")
             sha = first.get("source_sha")
             if isinstance(finding_id, str) and finding_id and isinstance(sha, str) and sha:
-                return f"steer:{finding_id}:{sha}"
+                return f"steer:{mode}:{finding_id}:{sha}"
     return None
+
+
+def _orphan_snapshot_graph(
+    ticket: str, hot_graph: dict[str, Any] | None, snapshot_dir: Path
+) -> dict[str, Any] | None:
+    """Return the newest snapshot iff it strictly extends the hot graph.
+
+    Commit order is snapshot first, hot second: a crash between the two
+    renames leaves the newest snapshot carrying a committed edge the hot
+    graph lacks. The caller (holding the ticket lock) promotes that orphan
+    into the append base BEFORE allocating the next revision — otherwise the
+    next append would commit revision N+1 from the stale hot graph and
+    recovery would silently drop the orphan's edge from the durable history.
+
+    Promotion requires the hot edge list to be a strict prefix of the
+    snapshot's (the only shape the crash window can produce; a missing hot
+    file counts as the empty prefix) and the snapshot to be schema-valid.
+    Anything else — equal/older snapshots (the normal state), unreadable or
+    invalid files (nothing recoverable to promote), divergent histories —
+    returns ``None`` and the hot graph stays authoritative.
+    """
+    path = newest_snapshot_path(ticket, snapshot_dir)
+    if path is None:
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    snapshot_edges = data.get("edges")
+    if not isinstance(snapshot_edges, list) or not snapshot_edges:
+        return None
+    hot_edges = hot_graph.get("edges", []) if hot_graph is not None else []
+    if not isinstance(hot_edges, list):
+        return None
+    if len(snapshot_edges) <= len(hot_edges):
+        return None
+    if snapshot_edges[: len(hot_edges)] != hot_edges:
+        return None
+    try:
+        _validate(data, "workgraph", f"orphan snapshot {path.name}")
+    except WorkgraphError:
+        return None
+    return data
 
 
 def _is_replay(graph: dict[str, Any], edge: dict[str, Any]) -> bool:
@@ -577,13 +636,11 @@ def append_edge(
 
     # The cross-process lock spans load through both commits: another writer
     # can never interleave between our read and our rename.
+    hot = hot_path(ticket, status_dir)
+    directory = snapshot_dir or SNAPSHOT_DIR
     with _ticket_lock(ticket, status_dir):
         graph = load_workgraph(ticket, status_dir)
-        if graph is None:
-            if not orch:
-                raise WorkgraphError(f"no workgraph for {ticket} yet; pass --orch to create one")
-            graph = create_workgraph(ticket, orch, template, created_at=stamp)
-        else:
+        if graph is not None:
             try:
                 _validate(graph, "workgraph", "existing workgraph")
             except WorkgraphError as exc:
@@ -591,10 +648,22 @@ def append_edge(
                     f"existing hot workgraph for {ticket} is invalid and will not be replaced "
                     f"({exc}); run `wiki graph recover {ticket}` to restore the newest snapshot"
                 ) from exc
-            if _is_replay(graph, edge):
-                graph["_snapshot_path"] = None
-                graph["_replayed"] = True
-                return graph
+        # Crash reconciliation (still under the lock): if a previous commit
+        # died between the snapshot and hot renames, promote the orphan
+        # snapshot into the append base — and republish hot immediately, so
+        # the store is consistent even if this append replays or fails.
+        orphan = _orphan_snapshot_graph(ticket, graph, directory)
+        if orphan is not None:
+            graph = orphan
+            atomic_write_json(hot, graph)
+        if graph is None:
+            if not orch:
+                raise WorkgraphError(f"no workgraph for {ticket} yet; pass --orch to create one")
+            graph = create_workgraph(ticket, orch, template, created_at=stamp)
+        elif _is_replay(graph, edge):
+            graph["_snapshot_path"] = None
+            graph["_replayed"] = True
+            return graph
 
         known = _node_ids(graph)
         graph_orch = str(graph.get("orch") or orch or "orch")
@@ -614,11 +683,9 @@ def append_edge(
         # Stage everything, then commit the durable snapshot BEFORE the hot
         # pointer: a live edge must never exist without its durable copy.
         serialized = _serialize(graph)
-        hot = hot_path(ticket, status_dir)
         snapshot_path: Path | None = None
         staged: list[tuple[Path, Path]] = []
         if edge_kind in SNAPSHOT_EDGE_KINDS:
-            directory = snapshot_dir or SNAPSHOT_DIR
             # Revision is assigned while HOLDING the ticket lock, so it follows
             # commit order even when a slower writer sampled an older now_ts
             # before the lock. Recovery orders by revision, never wall time.

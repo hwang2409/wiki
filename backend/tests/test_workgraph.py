@@ -444,6 +444,77 @@ class CommitOrderingTests(unittest.TestCase):
         self.assertEqual(self.hot().read_bytes(), before)
         self.assertEqual(len(list(self.snapshot_dir.glob("TST-1-*.workgraph.json"))), 1)
 
+    def crash_after_snapshot_rename(self, edge_kind: str, from_node: str, to_node: str,
+                                    payload: dict, ts: float) -> None:
+        """Simulate a process death between the snapshot and hot renames."""
+        original_rename = Path.rename
+
+        def crashing(path_self: Path, target):
+            result = original_rename(path_self, target)
+            if Path(target).parent == self.snapshot_dir:
+                raise RuntimeError("simulated crash between snapshot and hot rename")
+            return result
+
+        with mock.patch.object(Path, "rename", crashing):
+            with self.assertRaises(RuntimeError):
+                self.append(edge_kind, from_node, to_node, payload, ts)
+
+    def test_crash_between_renames_then_different_append_keeps_both_edges(self) -> None:
+        # Round 5 HIGH: a crash after the snapshot rename leaves orphan
+        # snapshot rN carrying edge A while hot lacks it. The next, different
+        # append must promote the orphan under the lock BEFORE allocating
+        # rN+1 — otherwise rN+1 commits without A and recovery silently
+        # drops A from the durable history.
+        self.append("spawn", "N-1", "N-2", spawn_payload(), BASE_TS, orch="wiki")
+        self.crash_after_snapshot_rename(
+            "verdict", "N-3", "N-1", verdict_payload(), BASE_TS + 60
+        )
+
+        # The crash window is real: hot lacks the verdict, the snapshot has it.
+        hot_stale = json.loads(self.hot().read_text(encoding="utf-8"))
+        self.assertEqual([e["kind"] for e in hot_stale["edges"]], ["spawn"])
+        orphan = workgraph.load_snapshot("TST-1", self.snapshot_dir)
+        self.assertEqual([e["kind"] for e in orphan["edges"]], ["spawn", "verdict"])
+
+        # A DIFFERENT append (new snapshot revision) after the crash.
+        self.append("archive", "N-1", "N-2", archive_payload(), BASE_TS + 120)
+
+        expected = ["spawn", "verdict", "archive"]
+        hot_after = json.loads(self.hot().read_text(encoding="utf-8"))
+        self.assertEqual([e["kind"] for e in hot_after["edges"]], expected)
+        selected = workgraph.newest_snapshot_path("TST-1", self.snapshot_dir)
+        self.assertIn("-r3-", selected.name)  # promoted base, not a shadow of r2
+        snapshot = json.loads(selected.read_text(encoding="utf-8"))
+        self.assertEqual([e["kind"] for e in snapshot["edges"]], expected)
+
+    def test_crash_between_renames_then_retry_dedupes_against_promoted_base(self) -> None:
+        self.append("spawn", "N-1", "N-2", spawn_payload(), BASE_TS, orch="wiki")
+        self.crash_after_snapshot_rename(
+            "verdict", "N-3", "N-1", verdict_payload(), BASE_TS + 60
+        )
+
+        graph = self.append("verdict", "N-3", "N-1", verdict_payload(), BASE_TS + 120)
+        self.assertTrue(graph.get("_replayed"))
+        # Promotion republished hot from the orphan even though the retry
+        # itself was a replay: the store is reconciled, the edge lands once.
+        hot_after = json.loads(self.hot().read_text(encoding="utf-8"))
+        self.assertEqual([e["kind"] for e in hot_after["edges"]], ["spawn", "verdict"])
+        self.assertEqual(
+            len(list(self.snapshot_dir.glob("TST-1-*.workgraph.json"))), 2
+        )
+
+    def test_missing_hot_with_valid_snapshot_promotes_snapshot_as_base(self) -> None:
+        # A crash before the FIRST hot rename ever lands is the same orphan
+        # shape with an empty hot prefix; the snapshot history must win over
+        # a fresh graph that would shadow it.
+        self.append("spawn", "N-1", "N-2", spawn_payload(), BASE_TS, orch="wiki")
+        self.hot().unlink()
+
+        graph = self.append("archive", "N-1", "N-2", archive_payload(), BASE_TS + 60)
+        self.assertEqual([e["kind"] for e in graph["edges"]], ["spawn", "archive"])
+        snapshot = workgraph.load_snapshot("TST-1", self.snapshot_dir)
+        self.assertEqual([e["kind"] for e in snapshot["edges"]], ["spawn", "archive"])
+
 
 class _FakeStagingHandle:
     """NamedTemporaryFile stand-in that can fail at the write or close boundary."""
@@ -703,10 +774,12 @@ class ReplayIdempotencyTests(unittest.TestCase):
             **kwargs,
         )
 
-    def compose_steer(self, request_id: str, message: str, created_at: str) -> dict:
+    def compose_steer(
+        self, request_id: str, message: str, created_at: str, mode: str = "now"
+    ) -> dict:
         return graph_lint.compose_steer_document(
             "TST-1",
-            "now",
+            mode,
             message,
             source_worker="orch:wiki",
             request_id=request_id,
@@ -784,6 +857,87 @@ class ReplayIdempotencyTests(unittest.TestCase):
         self.assertFalse(graph.get("_replayed"))
         steers = [e for e in graph["edges"] if e["kind"] == "steer"]
         self.assertEqual([s["request_id"] for s in steers], ["req-a", "req-b"])
+
+    def test_same_request_id_across_modes_records_both(self) -> None:
+        # Round 5 MEDIUM: `now` and `on-idle` are distinct supervisor methods
+        # (run/send_now vs run/send_on_idle) — one request id used once per
+        # mode is two operations, not a replay.
+        self.append("spawn", "N-1", "N-2", spawn_payload(), BASE_TS, orch="wiki")
+        self.append(
+            "steer",
+            "N-1",
+            "N-2",
+            self.compose_steer("req-steer", "fix the cache", "2026-07-22T12:00:00Z"),
+            BASE_TS + 60,
+            request_id="req-steer",
+        )
+        graph = self.append(
+            "steer",
+            "N-1",
+            "N-2",
+            self.compose_steer(
+                "req-steer", "fix the cache", "2026-07-22T12:01:00Z", mode="on-idle"
+            ),
+            BASE_TS + 120,
+            request_id="req-steer",
+        )
+        self.assertFalse(graph.get("_replayed"))
+        steers = [e for e in graph["edges"] if e["kind"] == "steer"]
+        self.assertEqual([s["payload"]["mode"] for s in steers], ["now", "on-idle"])
+
+    def test_replay_dedupes_within_each_mode_after_both_recorded(self) -> None:
+        # Same id + changed text within ONE mode stays a replay even after
+        # the other mode landed its own edge with that id.
+        self.append("spawn", "N-1", "N-2", spawn_payload(), BASE_TS, orch="wiki")
+        for offset, mode in ((60, "now"), (120, "on-idle")):
+            self.append(
+                "steer",
+                "N-1",
+                "N-2",
+                self.compose_steer(
+                    "req-steer", "fix the cache", "2026-07-22T12:00:00Z", mode=mode
+                ),
+                BASE_TS + offset,
+                request_id="req-steer",
+            )
+        for offset, mode in ((180, "now"), (240, "on-idle")):
+            graph = self.append(
+                "steer",
+                "N-1",
+                "N-2",
+                self.compose_steer(
+                    "req-steer", "fix the cache (edited)", "2026-07-22T12:09:00Z", mode=mode
+                ),
+                BASE_TS + offset,
+                request_id="req-steer",
+            )
+            self.assertTrue(graph.get("_replayed"), f"mode {mode} should replay")
+        on_disk = workgraph.load_workgraph("TST-1", self.status_dir)
+        self.assertEqual(sum(1 for e in on_disk["edges"] if e["kind"] == "steer"), 2)
+
+    def test_legacy_digest_key_is_also_mode_scoped(self) -> None:
+        # Edges without an edge-level request id fall back to the digest
+        # fields, which are body-derived and identical across modes; the
+        # fallback key must still tell the two supervisor methods apart.
+        self.append("spawn", "N-1", "N-2", spawn_payload(), BASE_TS, orch="wiki")
+        self.append(
+            "steer",
+            "N-1",
+            "N-2",
+            self.compose_steer("req-steer", "fix the cache", "2026-07-22T12:00:00Z"),
+            BASE_TS + 60,
+        )
+        graph = self.append(
+            "steer",
+            "N-1",
+            "N-2",
+            self.compose_steer(
+                "req-steer", "fix the cache", "2026-07-22T12:01:00Z", mode="on-idle"
+            ),
+            BASE_TS + 120,
+        )
+        self.assertFalse(graph.get("_replayed"))
+        self.assertEqual(sum(1 for e in graph["edges"] if e["kind"] == "steer"), 2)
 
     def test_spawn_with_different_request_id_appends(self) -> None:
         self.append("spawn", "N-1", "N-2", spawn_payload(), BASE_TS, orch="wiki")
