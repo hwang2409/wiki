@@ -320,6 +320,10 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         main._session_paths.clear()  # noqa: SLF001 - isolate transcript cache
         main._session_question_overlays.clear()  # noqa: SLF001 - isolate overlay cache
         main.transcripts._cache.clear()  # noqa: SLF001 - isolate transcript cache
+        # Canonical routes enqueue async workgraph deliveries; drain them while
+        # the patched paths and tmpdir still exist, or late writes race
+        # TemporaryDirectory cleanup.
+        main.workgraph_service.flush_outbox(timeout=10)
         for patcher in reversed(self.patchers):
             patcher.stop()
         self.tmp.cleanup()

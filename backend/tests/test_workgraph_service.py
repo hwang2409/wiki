@@ -46,8 +46,15 @@ class ServiceSequenceTests(unittest.TestCase):
         patcher = mock.patch.object(workgraph, "SNAPSHOT_DIR", self.snapshot_dir)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # Earlier suites may have run the app lifespan, whose shutdown leaves
+        # the module-global outbox closed; reopen it for this suite.
+        workgraph_service.start_outbox()
 
     def tearDown(self) -> None:
+        # Flush BEFORE removing the tmpdir: unittest runs tearDown ahead of
+        # addCleanup callbacks, so a flush registered there fires too late and
+        # in-flight outbox deliveries race TemporaryDirectory cleanup.
+        workgraph_service.flush_outbox(timeout=10)
         self.tmp.cleanup()
 
     def load(self, ticket: str = "WIKI-9") -> dict:
@@ -172,8 +179,10 @@ class CanonicalEndpointTests(unittest.TestCase):
         patcher = mock.patch.object(main.PROVIDER_HEALTH, "spawn_hint", return_value=None)
         patcher.start()
         self.addCleanup(patcher.stop)
+        workgraph_service.start_outbox()
 
     def tearDown(self) -> None:
+        workgraph_service.flush_outbox(timeout=10)
         self.tmp.cleanup()
 
     def spawn_body(self, ticket: str = "WIKI-9", role: str = "implement") -> dict:
@@ -370,9 +379,10 @@ class OutboxTests(unittest.TestCase):
         patcher = mock.patch.object(workgraph, "SNAPSHOT_DIR", self.snapshot_dir)
         patcher.start()
         self.addCleanup(patcher.stop)
-        self.addCleanup(workgraph_service.flush_outbox)
+        workgraph_service.start_outbox()
 
     def tearDown(self) -> None:
+        workgraph_service.flush_outbox(timeout=10)
         self.tmp.cleanup()
 
     def record_spawn(self, request_id: str = "req-1") -> None:
