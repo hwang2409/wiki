@@ -131,10 +131,20 @@ def _error_pointer(error: Any) -> str:
     path = list(error.absolute_path)
     if error.validator == "required" and isinstance(error.validator_value, list):
         instance = error.instance
-        missing = next(
-            (field for field in error.validator_value if field not in instance),
-            None,
-        ) if isinstance(instance, dict) else None
+        missing = (
+            next(
+                (
+                    field
+                    for field in error.validator_value
+                    if isinstance(instance, dict)
+                    and field not in instance
+                    and error.message == f"{field!r} is a required property"
+                ),
+                None,
+            )
+            if isinstance(instance, dict)
+            else None
+        )
         if missing is not None:
             path.append(missing)
     return _json_pointer(path)

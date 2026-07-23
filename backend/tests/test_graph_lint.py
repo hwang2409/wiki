@@ -203,6 +203,30 @@ class GraphLintTests(unittest.TestCase):
                     )
                 )
 
+    def test_missing_sibling_required_edge_fields_have_distinct_pointers(self) -> None:
+        document = copy.deepcopy(_valid_edge_documents()["spawn"])
+        del document["from"]
+        del document["to"]
+
+        violations = graph_lint.validate_document(document, "edge")
+
+        self.assertEqual(
+            {pointer for pointer, _ in violations},
+            {"/from", "/to"},
+        )
+
+    def test_missing_sibling_required_workgraph_fields_have_distinct_pointers(self) -> None:
+        document = _fixture("workgraph.valid.json")
+        del document["ticket"]
+        del document["orch"]
+
+        violations = graph_lint.validate_document(document, "workgraph")
+
+        self.assertEqual(
+            {pointer for pointer, _ in violations},
+            {"/orch", "/ticket"},
+        )
+
     def test_cli_reports_malformed_json(self) -> None:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as handle:
             handle.write("{not json")

@@ -58,6 +58,34 @@ class SteerValidationTests(unittest.TestCase):
         )
         self.assertEqual(cli.graph_lint.validate_document(document, "steer"), [])
 
+    def test_packaging_spec_keeps_graph_lint_and_all_schema_datas(self) -> None:
+        spec_path = REPO_ROOT / "packaging" / "wiki-backend.spec"
+        spec = spec_path.read_text(encoding="utf-8")
+        schema_names = sorted(
+            path.name for path in (REPO_ROOT / "schemas").glob("*.schema.json")
+        )
+
+        self.assertIn(
+            'SCHEMA_FILES = sorted((ROOT / "schemas").glob("*.schema.json"))',
+            spec,
+        )
+        self.assertIn(
+            '*((str(path), "schemas") for path in SCHEMA_FILES),',
+            spec,
+        )
+        self.assertIn("datas=datas,", spec)
+        self.assertIn('"wiki_cli.graph_lint",', spec)
+        self.assertEqual(
+            schema_names,
+            [
+                "edge.schema.json",
+                "finding.schema.json",
+                "steer.schema.json",
+                "verdict.schema.json",
+                "workgraph.schema.json",
+            ],
+        )
+
     def test_frozen_native_steer_uses_bundled_schemas_and_sends_once(self) -> None:
         from backend.app import wiki_agent_tools
         from wiki_cli import graph_lint
