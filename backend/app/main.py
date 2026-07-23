@@ -3671,17 +3671,19 @@ def spawn_agent(
     )
     if not isinstance(result, dict):
         raise HTTPException(status_code=502, detail="Agent supervisor returned a bad run")
-    if not replaying:
-        workgraph_service.record_spawn(
-            agent_id=ticket,
-            orch=orch or None,
-            role=role,
-            model=model,
-            effort=effort,
-            worktree=str(workdir_path),
-            request_id=body.request_id,
-            status_dir=AGENT_STATUS_DIR,
-        )
+    # Recorded on supervisor replays too: append_edge dedupes by request id
+    # across the full edge history, so a replay whose first append failed
+    # heals the graph while a successful one stays a no-op.
+    workgraph_service.record_spawn(
+        agent_id=ticket,
+        orch=orch or None,
+        role=role,
+        model=model,
+        effort=effort,
+        worktree=str(workdir_path),
+        request_id=body.request_id,
+        status_dir=AGENT_STATUS_DIR,
+    )
     refreshed = _registry_agent(_read_agent_registry(), ticket)
     registration = refreshed[2] if refreshed is not None else {}
     response: dict[str, object] = {

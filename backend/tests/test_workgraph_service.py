@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -19,6 +21,10 @@ from fastapi import BackgroundTasks
 
 from backend.app import main, workgraph, workgraph_service
 from wiki_cli import graph_lint
+
+
+def flush() -> None:
+    assert workgraph_service.flush_outbox(timeout=10)
 
 
 class BaseTicketTests(unittest.TestCase):
@@ -83,6 +89,7 @@ class ServiceSequenceTests(unittest.TestCase):
             outcome="merged",
             status_dir=self.status_dir,
         )
+        flush()
 
         graph = self.load()
         self.assertEqual(graph_lint.validate_document(graph, "workgraph"), [])
@@ -114,6 +121,7 @@ class ServiceSequenceTests(unittest.TestCase):
             request_id=None,
             status_dir=self.status_dir,
         )
+        flush()
         graph = self.load()
         self.assertEqual(graph["orch"], "henry")
         self.assertEqual(graph["nodes"][0]["id"], "orch:henry")
@@ -129,6 +137,7 @@ class ServiceSequenceTests(unittest.TestCase):
                     outcome="merged",
                     status_dir=self.status_dir,
                 )
+                flush()
 
 
 class CanonicalEndpointTests(unittest.TestCase):
@@ -192,6 +201,7 @@ class CanonicalEndpointTests(unittest.TestCase):
             BackgroundTasks(),
         )
         main.archive_agent("WIKI-9", main.AgentArchiveIn(outcome="merged"))
+        flush()
 
         graph = json.loads(
             (self.status_dir / "WIKI-9.workgraph.json").read_text(encoding="utf-8")
@@ -211,6 +221,7 @@ class CanonicalEndpointTests(unittest.TestCase):
     def test_reviewer_spawn_lands_on_base_ticket_graph(self) -> None:
         main.spawn_agent(self.spawn_body())
         main.spawn_agent(self.spawn_body("WIKI-9-REVIEW1", "review"))
+        flush()
         graph = json.loads(
             (self.status_dir / "WIKI-9.workgraph.json").read_text(encoding="utf-8")
         )
@@ -227,6 +238,7 @@ class CanonicalEndpointTests(unittest.TestCase):
             main.MessageIn(text="status?", mode="now"),
             BackgroundTasks(),
         )
+        flush()
         self.assertEqual(list(self.status_dir.glob("*.workgraph.json")), [])
 
     def test_workgraph_failure_never_fails_the_spawn(self) -> None:
@@ -235,12 +247,11 @@ class CanonicalEndpointTests(unittest.TestCase):
         ):
             with self.assertLogs("wiki.workgraph", level="ERROR"):
                 result = main.spawn_agent(self.spawn_body())
+                flush()
         self.assertEqual(result["run_id"], "r1")
         self.assertEqual(list(self.status_dir.glob("*.workgraph.json")), [])
 
-    def test_replayed_spawn_request_appends_no_duplicate_edge(self) -> None:
-        main.spawn_agent(self.spawn_body())
-        self.register_worker("WIKI-9", "implement")
+    def replay_supervisor(self):
         idempotent = {
             "idempotency/status": {"known": True},
         }
@@ -248,12 +259,193 @@ class CanonicalEndpointTests(unittest.TestCase):
         def supervisor(method: str, params=None):
             return idempotent.get(method, {"run_id": "r1"})
 
-        with mock.patch.object(main, "_supervisor_request", supervisor):
+        return mock.patch.object(main, "_supervisor_request", supervisor)
+
+    def test_replayed_spawn_request_appends_no_duplicate_edge(self) -> None:
+        main.spawn_agent(self.spawn_body())
+        self.register_worker("WIKI-9", "implement")
+        with self.replay_supervisor():
             main.spawn_agent(self.spawn_body())
+        flush()
         graph = json.loads(
             (self.status_dir / "WIKI-9.workgraph.json").read_text(encoding="utf-8")
         )
         self.assertEqual([e["kind"] for e in graph["edges"]], ["spawn"])
+
+    def test_replayed_spawn_heals_a_failed_first_append(self) -> None:
+        with mock.patch.object(
+            workgraph, "append_edge", side_effect=RuntimeError("graph exploded")
+        ):
+            with self.assertLogs("wiki.workgraph", level="ERROR"):
+                main.spawn_agent(self.spawn_body())
+                flush()
+        self.assertEqual(list(self.status_dir.glob("*.workgraph.json")), [])
+
+        # The supervisor treats the retried request as a replay; recording is
+        # still attempted, so the missing spawn edge heals exactly once.
+        self.register_worker("WIKI-9", "implement")
+        with self.replay_supervisor():
+            main.spawn_agent(self.spawn_body())
+            flush()
+            main.spawn_agent(self.spawn_body())
+            flush()
+        graph = json.loads(
+            (self.status_dir / "WIKI-9.workgraph.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual([e["kind"] for e in graph["edges"]], ["spawn"])
+        self.assertEqual(graph["edges"][0]["payload"]["request_id"], "req-WIKI-9")
+
+    def test_delayed_steer_replay_appends_no_duplicate(self) -> None:
+        main.spawn_agent(self.spawn_body())
+        self.register_worker("WIKI-9", "implement")
+        steer = main.MessageIn(
+            text="fix the cache",
+            mode="now",
+            source="supervisor-steer",
+            request_id="req-steer-1",
+        )
+        main.agent_message("WIKI-9", steer, BackgroundTasks())
+        main.agent_message(
+            "WIKI-9",
+            main.MessageIn(
+                text="then run the tests",
+                mode="now",
+                source="supervisor-steer",
+                request_id="req-steer-2",
+            ),
+            BackgroundTasks(),
+        )
+        # The delayed replay arrives after another steer landed: newest-edge
+        # equality can't catch it, the request-id key must.
+        main.agent_message("WIKI-9", steer, BackgroundTasks())
+        flush()
+        graph = json.loads(
+            (self.status_dir / "WIKI-9.workgraph.json").read_text(encoding="utf-8")
+        )
+        steers = [e for e in graph["edges"] if e["kind"] == "steer"]
+        self.assertEqual(
+            [s["payload"]["findings"][0]["observed"] for s in steers],
+            ["fix the cache", "then run the tests"],
+        )
+
+
+class OutboxTests(unittest.TestCase):
+    """Round 3: graph writes must never block the action response (item 3)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.status_dir = root / "status"
+        self.snapshot_dir = root / "workgraphs"
+        patcher = mock.patch.object(workgraph, "SNAPSHOT_DIR", self.snapshot_dir)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(workgraph_service.flush_outbox)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def record_spawn(self, request_id: str = "req-1") -> None:
+        workgraph_service.record_spawn(
+            agent_id="WIKI-9",
+            orch="wiki",
+            role="implement",
+            model="claude-opus-4-6",
+            effort=None,
+            worktree="/tmp/wt",
+            request_id=request_id,
+            status_dir=self.status_dir,
+        )
+
+    def test_record_returns_while_append_is_blocked(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        real_append = workgraph.append_edge
+
+        def blocking(*args, **kwargs):
+            entered.set()
+            assert release.wait(timeout=10)
+            return real_append(*args, **kwargs)
+
+        with mock.patch.object(workgraph, "append_edge", side_effect=blocking):
+            started = time.monotonic()
+            self.record_spawn()
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 1.0)
+            self.assertTrue(entered.wait(timeout=10))
+            # The write is still blocked: nothing on disk yet, response long gone.
+            self.assertFalse((self.status_dir / "WIKI-9.workgraph.json").exists())
+            release.set()
+            flush()
+        graph = json.loads(
+            (self.status_dir / "WIKI-9.workgraph.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual([e["kind"] for e in graph["edges"]], ["spawn"])
+
+    def test_per_ticket_delivery_order_is_preserved(self) -> None:
+        self.record_spawn()
+        for index, text in enumerate(["first steer", "second steer", "third steer"]):
+            workgraph_service.record_steer(
+                agent_id="WIKI-9",
+                orch="wiki",
+                mode="now",
+                text=text,
+                source="supervisor-steer",
+                request_id=f"req-steer-{index}",
+                status_dir=self.status_dir,
+            )
+        flush()
+        graph = json.loads(
+            (self.status_dir / "WIKI-9.workgraph.json").read_text(encoding="utf-8")
+        )
+        steers = [e for e in graph["edges"] if e["kind"] == "steer"]
+        self.assertEqual(
+            [s["payload"]["findings"][0]["observed"] for s in steers],
+            ["first steer", "second steer", "third steer"],
+        )
+
+    def test_failed_delivery_is_logged_and_later_edges_still_deliver(self) -> None:
+        real_append = workgraph.append_edge
+        calls = {"count": 0}
+
+        def flaky(*args, **kwargs):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise RuntimeError("first delivery exploded")
+            return real_append(*args, **kwargs)
+
+        with mock.patch.object(workgraph, "append_edge", side_effect=flaky):
+            with self.assertLogs("wiki.workgraph", level="ERROR"):
+                self.record_spawn("req-1")
+                self.record_spawn("req-2")
+                flush()
+        graph = json.loads(
+            (self.status_dir / "WIKI-9.workgraph.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            [e["payload"]["request_id"] for e in graph["edges"]], ["req-2"]
+        )
+
+    def test_full_outbox_drops_edge_and_logs(self) -> None:
+        outbox = workgraph_service._TelemetryOutbox(maxsize=1)
+        release = threading.Event()
+        entered = threading.Event()
+
+        def blocked() -> None:
+            entered.set()
+            assert release.wait(timeout=10)
+
+        try:
+            # First submission occupies the worker; second fills the queue.
+            self.assertTrue(outbox.submit("WIKI-9", "spawn", blocked))
+            self.assertTrue(entered.wait(timeout=10))
+            self.assertTrue(outbox.submit("WIKI-9", "steer", lambda: None))
+            with self.assertLogs("wiki.workgraph", level="ERROR") as logs:
+                self.assertFalse(outbox.submit("WIKI-9", "archive", lambda: None))
+            self.assertIn("outbox full", "\n".join(logs.output))
+        finally:
+            release.set()
+        self.assertTrue(outbox.flush(timeout=10))
 
 
 if __name__ == "__main__":

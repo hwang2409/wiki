@@ -6,15 +6,23 @@ tools, or the app UI (they all converge on the backend endpoints). Node IDs
 are stable and derived from agent identity: ``orch:<orch-id>`` for the acting
 orchestrator, the agent id itself for workers.
 
-Agent operations are primary; the graph is telemetry. A failed append is
-logged and swallowed — it must never fail the underlying action.
+Agent operations are primary; the graph is telemetry. Appends are delivered
+through a bounded single-worker outbox so a blocked filesystem write can never
+stall an already-successful agent action response: ``record_*`` enqueue and
+return immediately, delivery preserves per-ticket order (one global FIFO
+worker), and failures — append errors or a full outbox — are logged and
+swallowed. The CLI path (``wiki graph append``) stays synchronous; only the
+backend service path is asynchronous.
 """
 
 from __future__ import annotations
 
 import logging
+import queue
 import re
+import threading
 from pathlib import Path
+from typing import Callable
 from uuid import uuid4
 
 from wiki_cli import graph_lint
@@ -41,6 +49,79 @@ def orch_node_id(orch: str) -> str:
     return f"orch:{orch}"
 
 
+class _TelemetryOutbox:
+    """Bounded, serialized delivery of graph appends off the request path.
+
+    One daemon worker drains a global FIFO, which preserves per-ticket order
+    by construction. ``submit`` never blocks: a full queue drops the edge and
+    logs the loss (agent operations are primary; the graph is telemetry).
+    """
+
+    def __init__(self, maxsize: int = 256) -> None:
+        self._queue: queue.Queue[tuple[str, str, Callable[[], None]]] = queue.Queue(
+            maxsize=maxsize
+        )
+        self._idle = threading.Condition()
+        self._pending = 0
+        self._start_lock = threading.Lock()
+        self._worker: threading.Thread | None = None
+
+    def _ensure_worker(self) -> None:
+        with self._start_lock:
+            if self._worker is None or not self._worker.is_alive():
+                self._worker = threading.Thread(
+                    target=self._drain, name="workgraph-outbox", daemon=True
+                )
+                self._worker.start()
+
+    def submit(self, ticket: str, edge_kind: str, deliver: Callable[[], None]) -> bool:
+        self._ensure_worker()
+        with self._idle:
+            self._pending += 1
+        try:
+            self._queue.put_nowait((ticket, edge_kind, deliver))
+        except queue.Full:
+            with self._idle:
+                self._pending -= 1
+                self._idle.notify_all()
+            log.error(
+                "workgraph outbox full; dropping %s edge for %s "
+                "(the agent action itself succeeded)",
+                edge_kind,
+                ticket,
+            )
+            return False
+        return True
+
+    def _drain(self) -> None:
+        while True:
+            ticket, edge_kind, deliver = self._queue.get()
+            try:
+                deliver()
+            except Exception:
+                log.exception(
+                    "workgraph %s append failed for %s (the agent action itself succeeded)",
+                    edge_kind,
+                    ticket,
+                )
+            finally:
+                with self._idle:
+                    self._pending -= 1
+                    self._idle.notify_all()
+
+    def flush(self, timeout: float = 5.0) -> bool:
+        """Wait until every submitted edge has been delivered (tests only)."""
+        with self._idle:
+            return self._idle.wait_for(lambda: self._pending == 0, timeout)
+
+
+OUTBOX = _TelemetryOutbox()
+
+
+def flush_outbox(timeout: float = 5.0) -> bool:
+    return OUTBOX.flush(timeout)
+
+
 def _record(
     ticket: str,
     edge_kind: str,
@@ -50,7 +131,7 @@ def _record(
     orch: str,
     status_dir: Path | None,
 ) -> None:
-    try:
+    def deliver() -> None:
         workgraph.append_edge(
             ticket,
             edge_kind,
@@ -60,12 +141,8 @@ def _record(
             orch=orch,
             status_dir=status_dir,
         )
-    except Exception:
-        log.exception(
-            "workgraph %s append failed for %s (the agent action itself succeeded)",
-            edge_kind,
-            ticket,
-        )
+
+    OUTBOX.submit(ticket, edge_kind, deliver)
 
 
 def record_spawn(
