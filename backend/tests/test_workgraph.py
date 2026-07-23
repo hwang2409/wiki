@@ -753,6 +753,38 @@ class ReplayIdempotencyTests(unittest.TestCase):
         self.assertFalse(graph.get("_replayed"))
         self.assertEqual(sum(1 for e in graph["edges"] if e["kind"] == "steer"), 2)
 
+    def test_same_request_id_with_altered_body_is_replay(self) -> None:
+        # Round 4: the edge-level request id is the identity — a replay whose
+        # body text changed (different digest fields) must still dedupe.
+        self.append("spawn", "N-1", "N-2", spawn_payload(), BASE_TS, orch="wiki")
+        first = self.compose_steer("req-steer", "fix the cache", "2026-07-22T12:00:00Z")
+        self.append("steer", "N-1", "N-2", first, BASE_TS + 60, request_id="req-steer")
+        self.append("verdict", "N-3", "N-1", verdict_payload(), BASE_TS + 120)
+        altered = self.compose_steer(
+            "req-steer", "fix the cache (edited)", "2026-07-22T12:09:00Z"
+        )
+        graph = self.append(
+            "steer", "N-1", "N-2", altered, BASE_TS + 180, request_id="req-steer"
+        )
+        self.assertTrue(graph.get("_replayed"))
+        on_disk = workgraph.load_workgraph("TST-1", self.status_dir)
+        steers = [e for e in on_disk["edges"] if e["kind"] == "steer"]
+        self.assertEqual(len(steers), 1)
+        self.assertEqual(steers[0]["request_id"], "req-steer")
+
+    def test_distinct_request_ids_with_colliding_digest_fields_both_land(self) -> None:
+        # Round 4: identical finding id/source_sha simulate a digest-prefix
+        # collision; distinct exact request ids must both be recorded.
+        self.append("spawn", "N-1", "N-2", spawn_payload(), BASE_TS, orch="wiki")
+        colliding = steer_payload()
+        self.append("steer", "N-1", "N-2", colliding, BASE_TS + 60, request_id="req-a")
+        graph = self.append(
+            "steer", "N-1", "N-2", colliding, BASE_TS + 120, request_id="req-b"
+        )
+        self.assertFalse(graph.get("_replayed"))
+        steers = [e for e in graph["edges"] if e["kind"] == "steer"]
+        self.assertEqual([s["request_id"] for s in steers], ["req-a", "req-b"])
+
     def test_spawn_with_different_request_id_appends(self) -> None:
         self.append("spawn", "N-1", "N-2", spawn_payload(), BASE_TS, orch="wiki")
         graph = self.append(

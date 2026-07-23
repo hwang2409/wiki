@@ -130,6 +130,7 @@ def _record(
     payload: dict,
     orch: str,
     status_dir: Path | None,
+    request_id: str | None = None,
 ) -> None:
     def deliver() -> None:
         workgraph.append_edge(
@@ -140,6 +141,7 @@ def _record(
             payload,
             orch=orch,
             status_dir=status_dir,
+            request_id=request_id,
         )
 
     OUTBOX.submit(ticket, edge_kind, deliver)
@@ -157,12 +159,13 @@ def record_spawn(
     status_dir: Path | None = None,
 ) -> None:
     actor = orch or DEFAULT_ACTOR
+    operation_id = request_id or str(uuid4())
     payload = {
         "ticket": agent_id,
         "role": role,
         "model": model,
         "worktree": worktree,
-        "request_id": request_id or str(uuid4()),
+        "request_id": operation_id,
     }
     if effort:
         payload["effort"] = effort
@@ -174,6 +177,7 @@ def record_spawn(
         payload,
         actor,
         status_dir,
+        request_id=operation_id,
     )
 
 
@@ -188,12 +192,15 @@ def record_steer(
     status_dir: Path | None = None,
 ) -> None:
     actor = orch or DEFAULT_ACTOR
+    # The supervisor's exact request id rides on the edge itself: replay
+    # dedupe must not depend on digest prefixes derived from the body text.
+    operation_id = request_id or str(uuid4())
     payload = graph_lint.compose_steer_document(
         agent_id,
         mode,
         text,
         source_worker=source or DEFAULT_ACTOR,
-        request_id=request_id or str(uuid4()),
+        request_id=operation_id,
     )
     _record(
         base_ticket(agent_id),
@@ -203,6 +210,7 @@ def record_steer(
         payload,
         actor,
         status_dir,
+        request_id=operation_id,
     )
 
 

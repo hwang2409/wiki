@@ -21,9 +21,10 @@ Durability contract for ``append_edge``:
   the snapshot committed, retrying the same append is safe: the retry reloads
   the old hot graph and appends the edge once (the orphan snapshot is a benign
   point-in-time copy). Replays are detected by stable operation key across the
-  full edge history — the spawn payload's ``request_id``, or the steer
-  finding's request-digest fields — falling back to exact newest-edge equality
-  for keyless kinds. A replayed append mutates nothing.
+  full edge history — the edge-level ``request_id`` (the supervisor's exact
+  idempotency key), with legacy fallbacks to the spawn payload's
+  ``request_id`` or the steer finding's request-digest fields — and exact
+  newest-edge equality for keyless kinds. A replayed append mutates nothing.
 - Snapshot names carry a per-ticket monotonic revision assigned while the
   ticket lock is held, so recovery ordering follows commit order — never wall
   time, which is sampled before the lock and can invert under contention.
@@ -485,23 +486,28 @@ def create_workgraph(
 def _edge_op_key(edge: object) -> str | None:
     """Stable operation key for supervisor-idempotent edge kinds.
 
-    Spawns carry the supervisor ``request_id`` verbatim. Composed steers
-    (``graph_lint.compose_steer_document``) derive the first finding's
-    ``id``/``source_sha`` from a digest of request id + message, so the same
-    steer request maps to the same key even though ``created_at`` churns on
-    every compose. Kinds without a request identity return ``None`` and fall
-    back to exact newest-edge equality.
+    The edge-level ``request_id`` — the supervisor's exact idempotency key,
+    persisted as operation metadata — dominates when present: it is
+    body-independent, so a replay with altered text still dedupes and two
+    distinct operations can never collide. Older edges without it fall back
+    to the spawn payload's ``request_id``, then to the legacy steer digest
+    fields (``id``/``source_sha`` prefixes of one request-id+message digest).
+    Kinds without any request identity return ``None`` and dedupe by exact
+    newest-edge equality.
     """
     if not isinstance(edge, dict):
         return None
+    kind = edge.get("kind")
+    request_id = edge.get("request_id")
+    if isinstance(request_id, str) and request_id:
+        return f"{kind}:{request_id}"
     payload = edge.get("payload")
     if not isinstance(payload, dict):
         return None
-    kind = edge.get("kind")
     if kind == "spawn":
-        request_id = payload.get("request_id")
-        if isinstance(request_id, str) and request_id:
-            return f"spawn:{request_id}"
+        payload_request_id = payload.get("request_id")
+        if isinstance(payload_request_id, str) and payload_request_id:
+            return f"spawn:{payload_request_id}"
         return None
     if kind == "steer":
         findings = payload.get("findings")
@@ -541,8 +547,14 @@ def append_edge(
     status_dir: Path | None = None,
     snapshot_dir: Path | None = None,
     now_ts: float | None = None,
+    request_id: str | None = None,
 ) -> dict[str, Any]:
-    """Validate, append, recompute health, commit snapshot then hot copy."""
+    """Validate, append, recompute health, commit snapshot then hot copy.
+
+    ``request_id`` is the supervisor's exact idempotency key for this
+    operation; when given it is persisted on the edge and becomes the replay
+    dedupe key across the full edge history.
+    """
     if edge_kind not in EDGE_KINDS:
         raise WorkgraphError(f"unknown edge kind {edge_kind!r}; expected one of {EDGE_KINDS}")
     if not isinstance(payload, dict):
@@ -557,6 +569,8 @@ def append_edge(
         "payload": payload,
         "created_at": stamp,
     }
+    if request_id:
+        edge["request_id"] = request_id
     # The edge schema's per-kind conditionals validate the payload here,
     # before any graph state is loaded or mutated.
     _validate(edge, "edge", f"{edge_kind} edge")

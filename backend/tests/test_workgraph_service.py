@@ -327,6 +327,35 @@ class CanonicalEndpointTests(unittest.TestCase):
             [s["payload"]["findings"][0]["observed"] for s in steers],
             ["fix the cache", "then run the tests"],
         )
+        # Round 4: the supervisor's exact request id rides on the edge.
+        self.assertEqual(
+            [s["request_id"] for s in steers], ["req-steer-1", "req-steer-2"]
+        )
+
+    def test_steer_replay_with_altered_text_appends_no_duplicate(self) -> None:
+        main.spawn_agent(self.spawn_body())
+        self.register_worker("WIKI-9", "implement")
+        for text in ("fix the cache", "fix the cache (retry, edited)"):
+            main.agent_message(
+                "WIKI-9",
+                main.MessageIn(
+                    text=text,
+                    mode="now",
+                    source="supervisor-steer",
+                    request_id="req-steer-1",
+                ),
+                BackgroundTasks(),
+            )
+        flush()
+        graph = json.loads(
+            (self.status_dir / "WIKI-9.workgraph.json").read_text(encoding="utf-8")
+        )
+        steers = [e for e in graph["edges"] if e["kind"] == "steer"]
+        self.assertEqual(len(steers), 1)
+        self.assertEqual(steers[0]["request_id"], "req-steer-1")
+        self.assertEqual(
+            steers[0]["payload"]["findings"][0]["observed"], "fix the cache"
+        )
 
 
 class OutboxTests(unittest.TestCase):
