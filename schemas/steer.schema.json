@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wiki.henry/schemas/steer.json",
+  "type": "object",
+  "required": ["target_worker", "mode", "findings", "created_at"],
+  "properties": {
+    "target_worker": {"type": "string"},
+    "mode": {"enum": ["now", "on-idle"]},
+    "findings": {"type": "array", "items": {"$ref": "finding.json"}, "minItems": 1},
+    "preamble": {"type": "string", "description": "one line only"},
+    "constraint_bundle": {"type": "string"},
+    "created_at": {"type": "string", "format": "date-time"}
+  },
+  "additionalProperties": false
+}

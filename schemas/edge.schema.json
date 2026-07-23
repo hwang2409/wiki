@@ -1,0 +1,124 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wiki.henry/schemas/edge.json",
+  "type": "object",
+  "required": ["kind", "from", "to", "created_at"],
+  "properties": {
+    "kind": {
+      "enum": [
+        "spawn",
+        "steer",
+        "verdict",
+        "archive",
+        "handoff",
+        "monitor_alarm",
+        "capability_grant",
+        "escalation"
+      ]
+    },
+    "from": {"type": "string", "description": "node id"},
+    "to": {"type": "string", "description": "node id"},
+    "payload": {"type": "object", "description": "kind-specific; see per-kind sub-schemas"},
+    "created_at": {"type": "string", "format": "date-time"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"kind": {"const": "spawn"}}, "required": ["kind"]},
+      "then": {"required": ["payload"], "properties": {"payload": {"$ref": "#/$defs/spawnPayload"}}}
+    },
+    {
+      "if": {"properties": {"kind": {"const": "steer"}}, "required": ["kind"]},
+      "then": {"required": ["payload"], "properties": {"payload": {"$ref": "steer.json"}}}
+    },
+    {
+      "if": {"properties": {"kind": {"const": "verdict"}}, "required": ["kind"]},
+      "then": {"required": ["payload"], "properties": {"payload": {"$ref": "verdict.json"}}}
+    },
+    {
+      "if": {"properties": {"kind": {"const": "archive"}}, "required": ["kind"]},
+      "then": {"required": ["payload"], "properties": {"payload": {"$ref": "#/$defs/archivePayload"}}}
+    },
+    {
+      "if": {"properties": {"kind": {"const": "handoff"}}, "required": ["kind"]},
+      "then": {"required": ["payload"], "properties": {"payload": {"$ref": "#/$defs/handoffPayload"}}}
+    },
+    {
+      "if": {"properties": {"kind": {"const": "monitor_alarm"}}, "required": ["kind"]},
+      "then": {"required": ["payload"], "properties": {"payload": {"$ref": "#/$defs/monitorAlarmPayload"}}}
+    },
+    {
+      "if": {"properties": {"kind": {"const": "capability_grant"}}, "required": ["kind"]},
+      "then": {"required": ["payload"], "properties": {"payload": {"$ref": "#/$defs/capabilityGrantPayload"}}}
+    },
+    {
+      "if": {"properties": {"kind": {"const": "escalation"}}, "required": ["kind"]},
+      "then": {"required": ["payload"], "properties": {"payload": {"$ref": "#/$defs/escalationPayload"}}}
+    }
+  ],
+  "$defs": {
+    "spawnPayload": {
+      "type": "object",
+      "required": ["ticket", "role", "model", "worktree", "request_id"],
+      "properties": {
+        "ticket": {"type": "string"},
+        "role": {"type": "string"},
+        "model": {"type": "string"},
+        "effort": {"type": "string"},
+        "worktree": {"type": "string"},
+        "request_id": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "archivePayload": {
+      "type": "object",
+      "required": ["outcome", "ended_at"],
+      "properties": {
+        "outcome": {"type": "string"},
+        "ended_at": {"type": "string", "format": "date-time"}
+      },
+      "additionalProperties": false
+    },
+    "handoffPayload": {
+      "type": "object",
+      "required": ["from_session", "to_session", "worktree", "pr_url", "remaining_summary"],
+      "properties": {
+        "from_session": {"type": "string"},
+        "to_session": {"type": "string"},
+        "worktree": {"type": "string"},
+        "pr_url": {"type": ["string", "null"]},
+        "remaining_summary": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "monitorAlarmPayload": {
+      "type": "object",
+      "required": ["alarm_kind", "message", "watchlist_row"],
+      "properties": {
+        "alarm_kind": {"type": "string"},
+        "message": {"type": "string"},
+        "watchlist_row": {"oneOf": [{"type": "string"}, {"type": "object"}]}
+      },
+      "additionalProperties": false
+    },
+    "capabilityGrantPayload": {
+      "type": "object",
+      "required": ["capability", "granted_by"],
+      "properties": {
+        "capability": {"type": "string"},
+        "granted_by": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "escalationPayload": {
+      "type": "object",
+      "required": ["reason", "prior_findings", "target"],
+      "properties": {
+        "reason": {"type": "string"},
+        "prior_findings": {"type": "array", "items": {"$ref": "finding.json"}},
+        "target": {"enum": ["henry", "orchestrator"]}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

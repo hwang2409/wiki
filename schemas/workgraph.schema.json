@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wiki.henry/schemas/workgraph.json",
+  "type": "object",
+  "required": ["ticket", "orch", "template", "created_at", "updated_at", "nodes", "edges", "composite_health"],
+  "properties": {
+    "ticket": {"type": "string"},
+    "orch": {"type": "string"},
+    "template": {"type": "string"},
+    "created_at": {"type": "string", "format": "date-time"},
+    "updated_at": {"type": "string", "format": "date-time"},
+    "nodes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "kind", "label"],
+        "properties": {
+          "id": {"type": "string"},
+          "kind": {"type": "string"},
+          "label": {"type": "string"},
+          "worker_id": {"type": "string"},
+          "sha": {"type": "string"}
+        },
+        "additionalProperties": false
+      }
+    },
+    "edges": {"type": "array", "items": {"$ref": "edge.json"}},
+    "composite_health": {
+      "type": "object",
+      "required": ["state", "open_findings", "blocking", "slowest_node_stall_seconds", "iteration_count"],
+      "properties": {
+        "state": {"type": "string"},
+        "open_findings": {"type": "integer", "minimum": 0},
+        "blocking": {"type": "integer", "minimum": 0},
+        "slowest_node_stall_seconds": {"type": "number", "minimum": 0},
+        "iteration_count": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

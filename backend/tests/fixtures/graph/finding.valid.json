@@ -1,0 +1,17 @@
+{
+  "id": "F-a1b2c3",
+  "severity": "HIGH",
+  "title": "the edge accepts an incomplete payload",
+  "file": "wiki_cli/graph_lint.py",
+  "line": 42,
+  "observed": "a required field is not checked",
+  "why_wrong": "the graph can contain an action that cannot be replayed",
+  "do_instead": "validate the per-kind payload before appending the edge",
+  "source_worker": "WIKI-162-REVIEW1",
+  "source_kind": "review",
+  "source_sha": "0123456",
+  "linked_findings": [],
+  "resolved_by": null,
+  "created_at": "2026-07-22T18:00:00Z",
+  "sla_deadline": null
+}

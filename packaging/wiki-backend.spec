@@ -13,6 +13,7 @@ ONEDIR_NAME = "wiki-backend-sidecar"
 FRONTEND_DIST = Path(os.environ.get("WIKI_FRONTEND_DIST", ROOT / "frontend" / "dist"))
 PYINSTALLER_DIST = Path(os.environ.get("WIKI_PYINSTALLER_DIST", ROOT / "dist"))
 LAUNCHER_PATH = PYINSTALLER_DIST / "wiki-backend"
+SCHEMA_FILES = sorted((ROOT / "schemas").glob("*.schema.json"))
 
 
 def write_onedir_launcher() -> None:
@@ -53,6 +54,7 @@ hiddenimports = (
         "backend.app.main",
         "backend.app.transcripts",
         "backend.app.vaultops",
+        "wiki_cli.graph_lint",
         "uvicorn.lifespan.off",
         "uvicorn.lifespan.on",
         "uvicorn.loops.asyncio",
@@ -67,6 +69,7 @@ hiddenimports = (
 
 datas = [
     (str(FRONTEND_DIST), "frontend_dist"),
+    *((str(path), "schemas") for path in SCHEMA_FILES),
 ]
 
 

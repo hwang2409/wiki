@@ -1,0 +1,6 @@
+{
+  "id": "F-BAD",
+  "severity": "URGENT",
+  "title": "missing required finding fields",
+  "source_sha": "not-a-sha"
+}
