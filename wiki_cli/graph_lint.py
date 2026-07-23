@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sys
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -23,8 +24,23 @@ else:
     _JSONSCHEMA_IMPORT_ERROR = None
 
 
-SCHEMA_DIR = Path(__file__).resolve().parents[1] / "schemas"
+def _default_schema_dir() -> Path:
+    """Locate schemas in both source checkouts and PyInstaller bundles."""
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if bundle_root:
+        return Path(bundle_root) / "schemas"
+    return Path(__file__).resolve().parents[1] / "schemas"
+
+
+SCHEMA_DIR = _default_schema_dir()
 SCHEMA_NAMES = ("finding", "verdict", "steer", "edge", "workgraph")
+SCHEMA_SIGNATURES = (
+    ("workgraph", frozenset(("ticket", "nodes", "edges"))),
+    ("edge", frozenset(("kind", "from", "to"))),
+    ("steer", frozenset(("target_worker", "mode", "findings"))),
+    ("verdict", frozenset(("worker", "state", "findings"))),
+    ("finding", frozenset(("id", "severity", "observed", "why_wrong", "do_instead"))),
+)
 
 
 class GraphLintError(ValueError):
@@ -88,17 +104,14 @@ def detect_schema(document: Any) -> str | None:
     """Select the artifact schema from its top-level shape."""
     if not isinstance(document, dict):
         return None
-    if {"ticket", "nodes", "edges"}.issubset(document):
-        return "workgraph"
-    if {"kind", "from", "to"}.issubset(document):
-        return "edge"
-    if {"target_worker", "mode", "findings"}.issubset(document):
-        return "steer"
-    if {"worker", "state", "findings"}.issubset(document):
-        return "verdict"
-    if {"id", "severity", "observed", "why_wrong", "do_instead"}.issubset(document):
-        return "finding"
-    return None
+    matches = [
+        name for name, signature in SCHEMA_SIGNATURES if signature.issubset(document)
+    ]
+    if len(matches) > 1:
+        raise GraphLintError(
+            "ambiguous schema shape; matches " + ", ".join(matches)
+        )
+    return matches[0] if matches else None
 
 
 def _json_pointer(parts: Iterable[Any]) -> str:
@@ -111,6 +124,20 @@ def _json_pointer(parts: Iterable[Any]) -> str:
 
 def _message(value: str) -> str:
     return " ".join(value.splitlines())
+
+
+def _error_pointer(error: Any) -> str:
+    """Point required-property errors at the missing field itself."""
+    path = list(error.absolute_path)
+    if error.validator == "required" and isinstance(error.validator_value, list):
+        instance = error.instance
+        missing = next(
+            (field for field in error.validator_value if field not in instance),
+            None,
+        ) if isinstance(instance, dict) else None
+        if missing is not None:
+            path.append(missing)
+    return _json_pointer(path)
 
 
 def _validator(schema_name: str):
@@ -211,7 +238,7 @@ def compose_steer_document(
 def validate_document(document: Any, schema_name: str) -> list[tuple[str, str]]:
     """Return ``(JSON pointer, message)`` violations in stable order."""
     errors = [
-        (_json_pointer(error.absolute_path), _message(error.message))
+        (_error_pointer(error), _message(error.message))
         for error in _validator(schema_name).iter_errors(document)
     ]
     for pointer_prefix, verdict in _nested_verdicts(document, schema_name):

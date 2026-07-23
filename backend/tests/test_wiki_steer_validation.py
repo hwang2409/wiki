@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import importlib.util
+import os
+import shutil
 import sys
+import tempfile
 import unittest
 from argparse import Namespace
 from importlib.machinery import SourceFileLoader
@@ -54,6 +57,58 @@ class SteerValidationTests(unittest.TestCase):
             created_at="2026-07-22T18:00:00Z",
         )
         self.assertEqual(cli.graph_lint.validate_document(document, "steer"), [])
+
+    def test_frozen_native_steer_uses_bundled_schemas_and_sends_once(self) -> None:
+        from backend.app import wiki_agent_tools
+        from wiki_cli import graph_lint
+
+        with tempfile.TemporaryDirectory() as bundle_dir:
+            bundled_schemas = Path(bundle_dir) / "schemas"
+            bundled_schemas.mkdir()
+            for schema_path in (REPO_ROOT / "schemas").glob("*.schema.json"):
+                shutil.copy2(schema_path, bundled_schemas / schema_path.name)
+
+            calls: list[tuple[str, str, dict[str, str]]] = []
+
+            def backend_call(method: str, path: str, payload: dict[str, str]) -> dict:
+                calls.append((method, path, payload))
+                return {"ok": True}
+
+            with (
+                mock.patch.object(sys, "frozen", True, create=True),
+                mock.patch.object(sys, "_MEIPASS", bundle_dir, create=True),
+                mock.patch.dict(os.environ, {"WIKI_AGENT_ROLE": "orchestrator"}),
+                mock.patch.object(wiki_agent_tools, "_backend_api", side_effect=backend_call),
+            ):
+                importlib.reload(graph_lint)
+                response = wiki_agent_tools.steer_agent(
+                    {
+                        "id": "WIKI-162",
+                        "message": "preserve this exact native steer body",
+                        "mode": "on-idle",
+                        "request_id": "native-steer-1",
+                        "source": "mastermind",
+                    }
+                )
+
+            importlib.reload(graph_lint)
+
+        self.assertEqual(response, {"ok": True})
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "POST",
+                    "/api/agents/WIKI-162/message",
+                    {
+                        "text": "preserve this exact native steer body",
+                        "mode": "on-idle",
+                        "request_id": "native-steer-1",
+                        "source": "mastermind",
+                    },
+                )
+            ],
+        )
 
 
 if __name__ == "__main__":

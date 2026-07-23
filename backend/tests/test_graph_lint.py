@@ -171,6 +171,38 @@ class GraphLintTests(unittest.TestCase):
                         self.assertEqual(edge_violations, [])
                         self.assertEqual(workgraph_violations, [])
 
+    def test_nested_verdict_sha_binding_rejects_missing_fields_with_rooted_pointers(self) -> None:
+        for field, edge_pointer, workgraph_pointer in (
+            ("sha", "/payload/sha", "/edges/0/payload/sha"),
+            (
+                "source_sha",
+                "/payload/findings/0/source_sha",
+                "/edges/0/payload/findings/0/source_sha",
+            ),
+        ):
+            with self.subTest(field=field):
+                verdict = _fixture("verdict.valid.json")
+                if field == "sha":
+                    del verdict["sha"]
+                else:
+                    del verdict["findings"][0][field]
+
+                edge = _edge_document("verdict", verdict)
+                edge_violations = graph_lint.validate_document(edge, "edge")
+                self.assertTrue(
+                    any(pointer == edge_pointer for pointer, _ in edge_violations)
+                )
+
+                workgraph = _fixture("workgraph.valid.json")
+                workgraph["edges"] = [edge]
+                workgraph_violations = graph_lint.validate_document(workgraph, "workgraph")
+                self.assertTrue(
+                    any(
+                        pointer == workgraph_pointer
+                        for pointer, _ in workgraph_violations
+                    )
+                )
+
     def test_cli_reports_malformed_json(self) -> None:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as handle:
             handle.write("{not json")
@@ -185,7 +217,7 @@ class GraphLintTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("invalid JSON", result.stdout)
 
-    def test_cli_reports_ambiguous_shape(self) -> None:
+    def test_cli_reports_no_matching_schema(self) -> None:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as handle:
             json.dump({"not": "a graph artifact"}, handle)
             handle.flush()
@@ -198,6 +230,31 @@ class GraphLintTests(unittest.TestCase):
             )
         self.assertEqual(result.returncode, 1)
         self.assertIn("unable to auto-detect schema", result.stdout)
+
+    def test_cli_rejects_ambiguous_shape(self) -> None:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as handle:
+            json.dump(
+                {
+                    "target_worker": "WIKI-162",
+                    "mode": "now",
+                    "findings": [],
+                    "worker": "WIKI-162",
+                    "state": "MERGE-READY",
+                },
+                handle,
+            )
+            handle.flush()
+            result = subprocess.run(
+                [sys.executable, str(WIKI_CLI), "graph", "lint", handle.name],
+                capture_output=True,
+                text=True,
+                cwd=REPO_ROOT,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("ambiguous schema shape", result.stdout)
+        self.assertIn("steer", result.stdout)
+        self.assertIn("verdict", result.stdout)
 
     def test_cli_returns_one_and_prints_one_violation_per_line(self) -> None:
         result = subprocess.run(
