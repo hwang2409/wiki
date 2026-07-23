@@ -15,6 +15,7 @@ Hot-path writes with validation, so conventions hold mechanically:
   wiki gate <pr-number> [--expect-sha SHA] [--json]
   wiki graph append <TICKET> --edge-kind spawn --from N-1 --to N-2 --payload-file /tmp/spawn.json
   wiki graph health <TICKET> [--cap 8] [--json]
+  wiki graph recover <TICKET>
   wiki log-done "project: summary (links)"
   wiki note new <topic>/<slug> --type til --hook "map hook line" [--title T] [--tags a,b]
   wiki lint
@@ -1343,6 +1344,12 @@ def cmd_graph_append(args: argparse.Namespace) -> None:
 
     health = graph["composite_health"]
     snapshot = graph.pop("_snapshot_path", None)
+    if graph.pop("_replayed", False):
+        print(
+            f"{ticket}: {args.edge_kind} {args.from_node}->{args.to_node} matches the "
+            f"newest edge; treated as a retry replay, nothing appended"
+        )
+        return
     print(
         f"{ticket}: appended {args.edge_kind} {args.from_node}->{args.to_node} "
         f"(edge #{len(graph['edges'])})"
@@ -1361,17 +1368,33 @@ def cmd_graph_health(args: argparse.Namespace) -> None:
     from backend.app import workgraph
 
     ticket = args.ticket.strip().upper()
-    graph = workgraph.load_workgraph(ticket, AGENT_STATUS_DIR)
     source = "live"
+    try:
+        graph = workgraph.load_workgraph(ticket, AGENT_STATUS_DIR)
+    except workgraph.WorkgraphCorruptError as exc:
+        print(f"warning: {exc}", file=sys.stderr)
+        graph = None
     if graph is None:
         graph = workgraph.load_snapshot(ticket)
         source = "snapshot"
     if graph is None:
         fail(f"no workgraph found for {ticket} (hot or snapshot)")
-    alarms = workgraph.health_alarms(graph, iteration_cap=args.cap)
-    health = workgraph.compute_composite_health(graph)
+    current = workgraph.current_health(graph, iteration_cap=args.cap)
+    health = current["health"]
+    alarms = current["alarms"]
     if args.json:
-        print(json.dumps({"ticket": ticket, "source": source, "health": health, "alarms": alarms}, sort_keys=True))
+        print(
+            json.dumps(
+                {
+                    "ticket": ticket,
+                    "source": source,
+                    "health": health,
+                    "alarms": alarms,
+                    "computed_at": current["computed_at"],
+                },
+                sort_keys=True,
+            )
+        )
     else:
         print(
             f"{ticket} [{source}]: state={health['state']} open_findings={health['open_findings']} "
@@ -1381,6 +1404,21 @@ def cmd_graph_health(args: argparse.Namespace) -> None:
         for alarm in alarms:
             print(f"alarm: {alarm['check']}: {alarm['message']}")
     raise SystemExit(2 if alarms else 0)
+
+
+def cmd_graph_recover(args: argparse.Namespace) -> None:
+    from backend.app import workgraph
+
+    ticket = args.ticket.strip().upper()
+    if not CLI_TICKET_RE.fullmatch(ticket):
+        fail(f"bad ticket {ticket!r}")
+    try:
+        result = workgraph.recover_from_snapshot(ticket, status_dir=AGENT_STATUS_DIR)
+    except workgraph.WorkgraphError as exc:
+        fail(str(exc))
+    print(f"{ticket}: hot workgraph restored from {result['snapshot']}")
+    if result.get("backup"):
+        print(f"previous hot file preserved at {result['backup']}")
 
 
 def cmd_note_rename(args: argparse.Namespace) -> None:
@@ -1799,6 +1837,12 @@ def main() -> None:
     ghealth.add_argument("--cap", type=int, default=8, help="iteration cap (default 8)")
     ghealth.add_argument("--json", action="store_true")
     ghealth.set_defaults(func=cmd_graph_health)
+    grecover = graph_sub.add_parser(
+        "recover",
+        help="restore a damaged hot workgraph from its newest ~/.wiki snapshot",
+    )
+    grecover.add_argument("ticket")
+    grecover.set_defaults(func=cmd_graph_recover)
 
     gate = sub.add_parser("gate", help="report merge-gate plumbing for one GitHub PR; never merges or reviews (gh 2.37+)")
     gate.add_argument("pr", help="PR number or URL")

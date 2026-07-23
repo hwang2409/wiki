@@ -1,11 +1,26 @@
 """Per-ticket workgraph.json writer + composite health (graph-engineering D2).
 
 The orchestrator is the sole writer: every spawn/steer/verdict/archive action
-appends a typed edge via ``wiki graph append``, which validates the edge
-(including its kind-specific payload) against the canonical D1 schemas,
-recomputes ``composite_health``, and atomically rewrites the hot copy under
-``/tmp/agent-status`` plus a durable snapshot under ``~/.wiki/workgraphs`` on
-meaningful appends (spawn / verdict / archive).
+appends a typed edge (via the canonical agent endpoints or ``wiki graph
+append``), which validates the edge (including its kind-specific payload)
+against the canonical D1 schemas, recomputes ``composite_health``, and
+atomically rewrites the durable snapshot under ``~/.wiki/workgraphs`` followed
+by the hot copy under ``/tmp/agent-status``.
+
+Durability contract for ``append_edge``:
+
+- Both output files are staged as temp files first; the snapshot commits
+  BEFORE the hot pointer, so a failure can never leave a live edge without a
+  durable copy. Temp files are removed on every error path and IO failures
+  surface as ``WorkgraphError``.
+- The hot file is the authoritative last commit. If the hot rename fails after
+  the snapshot committed, retrying the same append is safe: the retry reloads
+  the old hot graph and appends the edge once (the orphan snapshot is a benign
+  point-in-time copy). A retry whose edge exactly matches the newest hot edge
+  (same kind/from/to/payload) is treated as a replay and appends nothing.
+- An existing-but-unreadable/invalid hot file fails closed
+  (``WorkgraphCorruptError``); it is never silently replaced. Recovery is
+  explicit via ``recover_from_snapshot`` / ``wiki graph recover``.
 
 Validation delegates to ``wiki_cli.graph_lint`` (WIKI-162), which loads the
 versioned ``schemas/`` files in both source checkouts and PyInstaller bundles.
@@ -19,7 +34,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from wiki_cli import graph_lint
 
@@ -43,9 +58,17 @@ SNAPSHOT_EDGE_KINDS = {"spawn", "verdict", "archive"}
 STALL_ALARM_SECONDS = 1800
 DEFAULT_ITERATION_CAP = 8
 
+# One injected clock for every stall/health computation so the renderer, the
+# health endpoint, and the CLI agree on "now" (and tests can freeze it).
+CLOCK: Callable[[], float] = time.time
+
 
 class WorkgraphError(ValueError):
     """Validation or IO failure while appending to a workgraph."""
+
+
+class WorkgraphCorruptError(WorkgraphError):
+    """An existing hot workgraph file cannot be read or parsed."""
 
 
 def _validate(document: dict[str, Any], schema_name: str, what: str) -> None:
@@ -63,8 +86,16 @@ def _validate(document: dict[str, Any], schema_name: str, what: str) -> None:
 # --- graph IO --------------------------------------------------------------
 
 
+def _stamp(now_ts: float) -> str:
+    return (
+        datetime.fromtimestamp(now_ts, timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return _stamp(CLOCK())
 
 
 def _parse_ts(value: object) -> float | None:
@@ -81,12 +112,34 @@ def hot_path(ticket: str, status_dir: Path | None = None) -> Path:
 
 
 def load_workgraph(ticket: str, status_dir: Path | None = None) -> dict[str, Any] | None:
+    """Return the hot graph, ``None`` if absent, or fail closed if damaged.
+
+    A missing file is a normal state (no graph yet). An existing file that
+    cannot be read or parsed raises ``WorkgraphCorruptError`` so a caller can
+    never mistake a damaged graph for a missing one and overwrite its edge
+    history.
+    """
     path = hot_path(ticket, status_dir)
+    recovery_hint = f"inspect it or run `wiki graph recover {ticket}` to restore the newest snapshot"
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
         return None
-    return data if isinstance(data, dict) else None
+    except OSError as exc:
+        raise WorkgraphCorruptError(
+            f"hot workgraph {path} exists but cannot be read ({exc}); {recovery_hint}"
+        ) from exc
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        raise WorkgraphCorruptError(
+            f"hot workgraph {path} is not valid JSON ({exc}); {recovery_hint}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise WorkgraphCorruptError(
+            f"hot workgraph {path} is not a JSON object; {recovery_hint}"
+        )
+    return data
 
 
 def newest_snapshot_path(ticket: str, snapshot_dir: Path | None = None) -> Path | None:
@@ -116,15 +169,64 @@ def load_snapshot(ticket: str, snapshot_dir: Path | None = None) -> dict[str, An
     return data if isinstance(data, dict) else None
 
 
+def _stage_json(directory: Path, text: str) -> Path:
+    """Write serialized graph text to a temp file in ``directory``."""
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w", dir=str(directory), suffix=".workgraph-tmp", delete=False, encoding="utf-8"
+        ) as handle:
+            handle.write(text)
+            return Path(handle.name)
+    except OSError as exc:
+        raise WorkgraphError(f"could not stage workgraph write under {directory}: {exc}") from exc
+
+
+def _serialize(data: dict[str, Any]) -> str:
+    return json.dumps(data, indent=1) + "\n"
+
+
 def atomic_write_json(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        "w", dir=str(path.parent), suffix=".workgraph-tmp", delete=False, encoding="utf-8"
-    ) as handle:
-        json.dump(data, handle, indent=1)
-        handle.write("\n")
-        temp_name = handle.name
-    Path(temp_name).rename(path)
+    temp = _stage_json(path.parent, _serialize(data))
+    try:
+        temp.rename(path)
+    except OSError as exc:
+        temp.unlink(missing_ok=True)
+        raise WorkgraphError(f"could not commit workgraph write to {path}: {exc}") from exc
+
+
+def recover_from_snapshot(
+    ticket: str,
+    status_dir: Path | None = None,
+    snapshot_dir: Path | None = None,
+) -> dict[str, str | None]:
+    """Explicitly restore the hot file from the newest durable snapshot.
+
+    The damaged hot file (if any) is preserved as ``<hot>.corrupt-<epoch>``,
+    never deleted.
+    """
+    snapshot_path = newest_snapshot_path(ticket, snapshot_dir)
+    if snapshot_path is None:
+        directory = snapshot_dir or SNAPSHOT_DIR
+        raise WorkgraphError(f"no snapshot found for {ticket} under {directory}")
+    try:
+        data = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise WorkgraphError(f"snapshot {snapshot_path} is unusable: {exc}") from exc
+    if not isinstance(data, dict):
+        raise WorkgraphError(f"snapshot {snapshot_path} is not a JSON object")
+    _validate(data, "workgraph", f"snapshot {snapshot_path.name}")
+
+    hot = hot_path(ticket, status_dir)
+    backup: Path | None = None
+    if hot.exists() or hot.is_symlink():
+        backup = hot.with_name(f"{hot.name}.corrupt-{int(CLOCK() * 1000)}")
+        try:
+            hot.rename(backup)
+        except OSError as exc:
+            raise WorkgraphError(f"could not preserve damaged hot file {hot}: {exc}") from exc
+    atomic_write_json(hot, data)
+    return {"snapshot": str(snapshot_path), "backup": str(backup) if backup else None}
 
 
 # --- graph mutation --------------------------------------------------------
@@ -134,13 +236,32 @@ def _node_ids(graph: dict[str, Any]) -> set[str]:
     return {node.get("id") for node in graph.get("nodes", []) if isinstance(node, dict)}
 
 
+# Explicit (edge kind -> from/to endpoint node kind) mapping for nodes first
+# seen through that edge. "spawned" resolves to the spawn payload's role so an
+# implement/review/plan worker lands with its real kind; monitor and review
+# sources must never default to "worker" or they corrupt composite health.
+_ENDPOINT_NODE_KINDS: dict[str, tuple[str, str]] = {
+    "spawn": ("orchestrator", "spawned"),
+    "steer": ("orchestrator", "worker"),
+    "verdict": ("review", "orchestrator"),
+    "archive": ("orchestrator", "worker"),
+    "handoff": ("worker", "worker"),
+    "monitor_alarm": ("monitor", "orchestrator"),
+    "capability_grant": ("orchestrator", "orchestrator"),
+    "escalation": ("monitor", "orchestrator"),
+}
+
+
 def _infer_node(
     node_id: str, edge_kind: str, role: str, payload: dict[str, Any], orch: str
 ) -> dict[str, Any]:
     """Auto-add shape for a node first referenced by this edge (spec 2.3)."""
-    if role == "from" and edge_kind in {"spawn", "steer", "archive"}:
+    kind = _ENDPOINT_NODE_KINDS[edge_kind][0 if role == "from" else 1]
+    if kind == "orchestrator":
         return {"id": node_id, "kind": "orchestrator", "label": f"{orch} orch"}
-    if role == "to" and edge_kind == "spawn":
+    if kind == "monitor":
+        return {"id": node_id, "kind": "monitor", "label": f"{node_id} monitor"}
+    if kind == "spawned":
         worker_ticket = payload.get("ticket") or node_id
         model = payload.get("model")
         label = f"{worker_ticket} {model}" if model else str(worker_ticket)
@@ -150,9 +271,16 @@ def _infer_node(
             "label": label,
             "worker_id": str(worker_ticket),
         }
-    if role == "to" and edge_kind in {"verdict", "handoff", "escalation", "monitor_alarm"}:
-        return {"id": node_id, "kind": "orchestrator", "label": f"{orch} orch"}
-    return {"id": node_id, "kind": "worker", "label": node_id}
+    if edge_kind == "verdict" and role == "from":
+        worker_id = payload.get("worker")
+        worker_id = worker_id if isinstance(worker_id, str) and worker_id else node_id
+        return {"id": node_id, "kind": "review", "label": worker_id, "worker_id": worker_id}
+    worker_id = node_id
+    if edge_kind == "steer" and role == "to":
+        target = payload.get("target_worker")
+        if isinstance(target, str) and target:
+            worker_id = target
+    return {"id": node_id, "kind": kind, "label": node_id, "worker_id": worker_id}
 
 
 def collect_findings(graph: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -190,7 +318,7 @@ def _live_worker_nodes(graph: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def compute_composite_health(graph: dict[str, Any], now_ts: float | None = None) -> dict[str, Any]:
-    now_ts = time.time() if now_ts is None else now_ts
+    now_ts = CLOCK() if now_ts is None else now_ts
     edges = [edge for edge in graph.get("edges", []) if isinstance(edge, dict)]
 
     findings = collect_findings(graph)
@@ -264,6 +392,16 @@ def create_workgraph(
     }
 
 
+def _is_replay(graph: dict[str, Any], edge: dict[str, Any]) -> bool:
+    edges = graph.get("edges")
+    if not isinstance(edges, list) or not edges:
+        return False
+    last = edges[-1]
+    return isinstance(last, dict) and all(
+        last.get(key) == edge.get(key) for key in ("kind", "from", "to", "payload")
+    )
+
+
 def append_edge(
     ticket: str,
     edge_kind: str,
@@ -277,18 +415,14 @@ def append_edge(
     snapshot_dir: Path | None = None,
     now_ts: float | None = None,
 ) -> dict[str, Any]:
-    """Validate, append, recompute health, atomic-write hot + snapshot copies."""
+    """Validate, append, recompute health, commit snapshot then hot copy."""
     if edge_kind not in EDGE_KINDS:
         raise WorkgraphError(f"unknown edge kind {edge_kind!r}; expected one of {EDGE_KINDS}")
     if not isinstance(payload, dict):
         raise WorkgraphError("payload must be a JSON object")
 
-    now_ts = time.time() if now_ts is None else now_ts
-    stamp = (
-        datetime.fromtimestamp(now_ts, timezone.utc)
-        .isoformat(timespec="seconds")
-        .replace("+00:00", "Z")
-    )
+    now_ts = CLOCK() if now_ts is None else now_ts
+    stamp = _stamp(now_ts)
     edge = {
         "kind": edge_kind,
         "from": from_node,
@@ -296,14 +430,27 @@ def append_edge(
         "payload": payload,
         "created_at": stamp,
     }
-    # The edge schema's per-kind conditionals validate the payload here.
+    # The edge schema's per-kind conditionals validate the payload here,
+    # before any graph state is loaded or mutated.
     _validate(edge, "edge", f"{edge_kind} edge")
 
     graph = load_workgraph(ticket, status_dir)
     if graph is None:
         if not orch:
             raise WorkgraphError(f"no workgraph for {ticket} yet; pass --orch to create one")
-        graph = create_workgraph(ticket, orch, template)
+        graph = create_workgraph(ticket, orch, template, created_at=stamp)
+    else:
+        try:
+            _validate(graph, "workgraph", "existing workgraph")
+        except WorkgraphError as exc:
+            raise WorkgraphCorruptError(
+                f"existing hot workgraph for {ticket} is invalid and will not be replaced "
+                f"({exc}); run `wiki graph recover {ticket}` to restore the newest snapshot"
+            ) from exc
+        if _is_replay(graph, edge):
+            graph["_snapshot_path"] = None
+            graph["_replayed"] = True
+            return graph
 
     known = _node_ids(graph)
     graph_orch = str(graph.get("orch") or orch or "orch")
@@ -320,14 +467,31 @@ def append_edge(
 
     _validate(graph, "workgraph", "workgraph")
 
-    atomic_write_json(hot_path(ticket, status_dir), graph)
+    # Stage everything, then commit the durable snapshot BEFORE the hot
+    # pointer: a live edge must never exist without its durable copy.
+    serialized = _serialize(graph)
+    hot = hot_path(ticket, status_dir)
     snapshot_path: Path | None = None
+    staged: list[tuple[Path, Path]] = []
     if edge_kind in SNAPSHOT_EDGE_KINDS:
         directory = snapshot_dir or SNAPSHOT_DIR
         # Millisecond epoch: scripted sequences append faster than 1/s and the
         # newest-snapshot lookup needs distinct, ordered names.
         snapshot_path = directory / f"{ticket}-{int(now_ts * 1000)}.workgraph.json"
-        atomic_write_json(snapshot_path, graph)
+        staged.append((_stage_json(directory, serialized), snapshot_path))
+    try:
+        staged.append((_stage_json(hot.parent, serialized), hot))
+        for temp, target in staged:
+            try:
+                temp.rename(target)
+            except OSError as exc:
+                raise WorkgraphError(
+                    f"could not commit workgraph write to {target}: {exc}"
+                ) from exc
+    except WorkgraphError:
+        for temp, _target in staged:
+            temp.unlink(missing_ok=True)
+        raise
 
     graph["_snapshot_path"] = str(snapshot_path) if snapshot_path else None
     return graph
@@ -375,3 +539,22 @@ def health_alarms(
             }
         )
     return alarms
+
+
+def current_health(
+    graph: dict[str, Any],
+    *,
+    iteration_cap: int = DEFAULT_ITERATION_CAP,
+    now_ts: float | None = None,
+) -> dict[str, Any]:
+    """Health + alarms computed from one clock read.
+
+    Every consumer (renderer endpoint, health endpoint, CLI) goes through this
+    so the same query at the same instant gives the same answer.
+    """
+    now_ts = CLOCK() if now_ts is None else now_ts
+    return {
+        "computed_at": _stamp(now_ts),
+        "health": compute_composite_health(graph, now_ts),
+        "alarms": health_alarms(graph, iteration_cap=iteration_cap, now_ts=now_ts),
+    }

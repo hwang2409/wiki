@@ -41,6 +41,7 @@ from . import (
     uistate,
     vaultops,
     workgraph,
+    workgraph_service,
 )
 from .agent_models import (
     default_model_for_kind,
@@ -1962,13 +1963,19 @@ def agent_pr_approve(ticket: str) -> dict[str, str]:
     return github_pr.approve_pr(ticket)
 
 
-def _load_workgraph_payload(ticket: str) -> tuple[dict[str, object], str]:
-    graph = workgraph.load_workgraph(ticket, AGENT_STATUS_DIR)
+def _load_workgraph_payload(ticket: str) -> tuple[dict[str, object], str, str | None]:
+    try:
+        graph = workgraph.load_workgraph(ticket, AGENT_STATUS_DIR)
+    except workgraph.WorkgraphCorruptError as exc:
+        snapshot = workgraph.load_snapshot(ticket)
+        if snapshot is not None:
+            return snapshot, "snapshot", str(exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     if graph is not None:
-        return graph, "live"
+        return graph, "live", None
     graph = workgraph.load_snapshot(ticket)
     if graph is not None:
-        return graph, "snapshot"
+        return graph, "snapshot", None
     raise HTTPException(status_code=404, detail="No workgraph found for this ticket")
 
 
@@ -1976,21 +1983,40 @@ def _load_workgraph_payload(ticket: str) -> tuple[dict[str, object], str]:
 def agent_workgraph(ticket: str) -> dict[str, object]:
     if not TICKET_PATTERN.fullmatch(ticket):
         raise HTTPException(status_code=400, detail="Bad ticket")
-    graph, source = _load_workgraph_payload(ticket)
-    return {"ok": True, "source": source, "workgraph": graph}
+    graph, source, warning = _load_workgraph_payload(ticket)
+    current = workgraph.current_health(graph)
+    # Refresh the stored health so the renderer shows now-relative stall — the
+    # same clock and computation the health endpoint uses.
+    graph["composite_health"] = current["health"]
+    payload: dict[str, object] = {
+        "ok": True,
+        "source": source,
+        "workgraph": graph,
+        "health": current["health"],
+        "alarms": current["alarms"],
+        "computed_at": current["computed_at"],
+    }
+    if warning:
+        payload["warning"] = warning
+    return payload
 
 
 @app.get("/api/agents/{ticket}/workgraph/health")
 def agent_workgraph_health(ticket: str, cap: int = workgraph.DEFAULT_ITERATION_CAP) -> dict[str, object]:
     if not TICKET_PATTERN.fullmatch(ticket):
         raise HTTPException(status_code=400, detail="Bad ticket")
-    graph, source = _load_workgraph_payload(ticket)
-    return {
+    graph, source, warning = _load_workgraph_payload(ticket)
+    current = workgraph.current_health(graph, iteration_cap=cap)
+    payload: dict[str, object] = {
         "ok": True,
         "source": source,
-        "health": workgraph.compute_composite_health(graph),
-        "alarms": workgraph.health_alarms(graph, iteration_cap=cap),
+        "health": current["health"],
+        "alarms": current["alarms"],
+        "computed_at": current["computed_at"],
     }
+    if warning:
+        payload["warning"] = warning
+    return payload
 
 
 def capture_pane_tail(window: str, lines: int) -> str | None:
@@ -3291,6 +3317,13 @@ def _control_headless_agent(
             status_code=502,
             detail="Agent supervisor returned a bad lifecycle response",
         )
+    if action == "archive" and current.get("role") in WORKER_ROLES:
+        workgraph_service.record_archive(
+            agent_id=resolved_id,
+            orch=current.get("orch") if isinstance(current.get("orch"), str) else None,
+            outcome=outcome,
+            status_dir=AGENT_STATUS_DIR,
+        )
     return dict(result)
 
 
@@ -3638,6 +3671,17 @@ def spawn_agent(
     )
     if not isinstance(result, dict):
         raise HTTPException(status_code=502, detail="Agent supervisor returned a bad run")
+    if not replaying:
+        workgraph_service.record_spawn(
+            agent_id=ticket,
+            orch=orch or None,
+            role=role,
+            model=model,
+            effort=effort,
+            worktree=str(workdir_path),
+            request_id=body.request_id,
+            status_dir=AGENT_STATUS_DIR,
+        )
     refreshed = _registry_agent(_read_agent_registry(), ticket)
     registration = refreshed[2] if refreshed is not None else {}
     response: dict[str, object] = {
@@ -4169,6 +4213,17 @@ def agent_message(ticket: str, body: MessageIn, background: BackgroundTasks) -> 
             raise HTTPException(
                 status_code=502,
                 detail="Agent supervisor returned a bad message response",
+            )
+        current = resolved[2]
+        if current.get("role") in WORKER_ROLES:
+            workgraph_service.record_steer(
+                agent_id=resolved[0],
+                orch=current.get("orch") if isinstance(current.get("orch"), str) else None,
+                mode=body.mode,
+                text=body.text,
+                source=body.source,
+                request_id=body.request_id,
+                status_dir=AGENT_STATUS_DIR,
             )
         return dict(result)
     del background

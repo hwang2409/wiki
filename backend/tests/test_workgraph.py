@@ -198,7 +198,10 @@ class WorkgraphWriterTests(unittest.TestCase):
         graph = None
         clean = verdict_payload("NOT-MERGE-READY", findings=[])
         for round_index in range(3):
-            graph = self.append("verdict", "N-3", "N-1", clean, BASE_TS + 2 + round_index)
+            # Distinct sha per round: identical repeated payloads would be
+            # collapsed by the retry-replay guard, as a real re-review never is.
+            round_payload = {**clean, "sha": f"abc123{round_index}"}
+            graph = self.append("verdict", "N-3", "N-1", round_payload, BASE_TS + 2 + round_index)
         alarms = workgraph.health_alarms(graph, iteration_cap=2, now_ts=BASE_TS + 10)
         self.assertEqual([a["check"] for a in alarms], ["iteration_cap"])
 
@@ -293,6 +296,494 @@ class WorkgraphEndpointTests(unittest.TestCase):
         self.assertEqual(payload["health"]["blocking"], 1)
         checks = [a["check"] for a in payload["alarms"]]
         self.assertIn("blocking_no_reviewer", checks)
+
+
+def handoff_payload():
+    return {
+        "from_session": "sess-a",
+        "to_session": "sess-b",
+        "worktree": "/tmp/wt",
+        "pr_url": None,
+        "remaining_summary": "finish the tests",
+    }
+
+
+def monitor_alarm_payload():
+    return {"alarm_kind": "node_stall", "message": "stalled 2000s", "watchlist_row": "TST-1"}
+
+
+def capability_grant_payload():
+    return {"capability": "review", "granted_by": "orch:wiki"}
+
+
+def escalation_payload():
+    return {"reason": "iteration cap", "prior_findings": [], "target": "henry"}
+
+
+class CommitOrderingTests(unittest.TestCase):
+    """Round 2: snapshot must commit before the hot pointer (items 2/6)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.status_dir = root / "status"
+        self.snapshot_dir = root / "workgraphs"
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def append(self, kind: str, from_node: str, to_node: str, payload: dict, ts: float, **kwargs):
+        return workgraph.append_edge(
+            "TST-1",
+            kind,
+            from_node,
+            to_node,
+            payload,
+            status_dir=self.status_dir,
+            snapshot_dir=self.snapshot_dir,
+            now_ts=ts,
+            **kwargs,
+        )
+
+    def hot(self) -> Path:
+        return self.status_dir / "TST-1.workgraph.json"
+
+    def assert_no_temp_files(self) -> None:
+        self.assertEqual(list(self.status_dir.glob("*.workgraph-tmp")), [])
+        if self.snapshot_dir.is_dir():
+            self.assertEqual(list(self.snapshot_dir.glob("*.workgraph-tmp")), [])
+
+    def test_snapshot_renamed_before_hot(self) -> None:
+        original_rename = Path.rename
+        commits: list[Path] = []
+
+        def tracking(path_self: Path, target):
+            commits.append(Path(target))
+            return original_rename(path_self, target)
+
+        with mock.patch.object(Path, "rename", tracking):
+            self.append("spawn", "N-1", "N-2", spawn_payload(), BASE_TS, orch="wiki")
+        targets = [c for c in commits if c.name.endswith(".workgraph.json")]
+        self.assertEqual(len(targets), 2)
+        self.assertEqual(targets[0].parent, self.snapshot_dir)
+        self.assertEqual(targets[1], self.hot())
+
+    def test_hot_commit_failure_keeps_old_hot_and_new_snapshot(self) -> None:
+        self.append("spawn", "N-1", "N-2", spawn_payload(), BASE_TS, orch="wiki")
+        before = self.hot().read_bytes()
+        original_rename = Path.rename
+
+        def failing(path_self: Path, target):
+            if Path(target) == self.hot():
+                raise OSError("disk full")
+            return original_rename(path_self, target)
+
+        with mock.patch.object(Path, "rename", failing):
+            with self.assertRaises(workgraph.WorkgraphError):
+                self.append("verdict", "N-3", "N-1", verdict_payload(), BASE_TS + 60)
+
+        # Hot pointer is byte-identical to the pre-append state; the durable
+        # snapshot committed first and carries the new edge.
+        self.assertEqual(self.hot().read_bytes(), before)
+        newest = workgraph.newest_snapshot_path("TST-1", self.snapshot_dir)
+        snapshot = json.loads(newest.read_text(encoding="utf-8"))
+        self.assertEqual([e["kind"] for e in snapshot["edges"]], ["spawn", "verdict"])
+        self.assert_no_temp_files()
+
+        # Retry is safe: the edge lands exactly once in the hot graph.
+        graph = self.append("verdict", "N-3", "N-1", verdict_payload(), BASE_TS + 120)
+        self.assertEqual([e["kind"] for e in graph["edges"]], ["spawn", "verdict"])
+        on_disk = json.loads(self.hot().read_text(encoding="utf-8"))
+        self.assertEqual(sum(1 for e in on_disk["edges"] if e["kind"] == "verdict"), 1)
+
+    def test_snapshot_commit_failure_commits_nothing(self) -> None:
+        self.append("spawn", "N-1", "N-2", spawn_payload(), BASE_TS, orch="wiki")
+        before = self.hot().read_bytes()
+        original_rename = Path.rename
+
+        def failing(path_self: Path, target):
+            if Path(target).parent == self.snapshot_dir:
+                raise OSError("disk full")
+            return original_rename(path_self, target)
+
+        with mock.patch.object(Path, "rename", failing):
+            with self.assertRaises(workgraph.WorkgraphError):
+                self.append("verdict", "N-3", "N-1", verdict_payload(), BASE_TS + 60)
+
+        self.assertEqual(self.hot().read_bytes(), before)
+        snapshots = list(self.snapshot_dir.glob("TST-1-*.workgraph.json"))
+        self.assertEqual(len(snapshots), 1)  # only the original spawn snapshot
+        self.assert_no_temp_files()
+
+    def test_stage_failure_wrapped_and_cleaned(self) -> None:
+        self.append("steer", "N-1", "N-2", steer_payload(), BASE_TS, orch="wiki")
+        before = self.hot().read_bytes()
+        blocked = self.snapshot_dir.parent / "not-a-dir"
+        blocked.write_text("file blocks mkdir", encoding="utf-8")
+        with self.assertRaises(workgraph.WorkgraphError):
+            workgraph.append_edge(
+                "TST-1",
+                "verdict",
+                "N-3",
+                "N-1",
+                verdict_payload(),
+                status_dir=self.status_dir,
+                snapshot_dir=blocked / "workgraphs",
+                now_ts=BASE_TS + 60,
+            )
+        self.assertEqual(self.hot().read_bytes(), before)
+        self.assert_no_temp_files()
+
+    def test_retry_replay_of_newest_edge_is_noop(self) -> None:
+        self.append("spawn", "N-1", "N-2", spawn_payload(), BASE_TS, orch="wiki")
+        before = self.hot().read_bytes()
+        graph = self.append("spawn", "N-1", "N-2", spawn_payload(), BASE_TS + 60)
+        self.assertTrue(graph.get("_replayed"))
+        self.assertIsNone(graph.get("_snapshot_path"))
+        self.assertEqual(self.hot().read_bytes(), before)
+        self.assertEqual(len(list(self.snapshot_dir.glob("TST-1-*.workgraph.json"))), 1)
+
+
+class ValidationLayerTests(unittest.TestCase):
+    """Round 2: each validation layer must hold independently (item 6)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.status_dir = root / "status"
+        self.snapshot_dir = root / "workgraphs"
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def append(self, kind: str, from_node: str, to_node: str, payload: dict, ts: float, **kwargs):
+        return workgraph.append_edge(
+            "TST-1",
+            kind,
+            from_node,
+            to_node,
+            payload,
+            status_dir=self.status_dir,
+            snapshot_dir=self.snapshot_dir,
+            now_ts=ts,
+            **kwargs,
+        )
+
+    def test_edge_validation_runs_before_any_graph_io(self) -> None:
+        with mock.patch.object(workgraph, "load_workgraph") as load:
+            with self.assertRaises(workgraph.WorkgraphError):
+                self.append("verdict", "N-3", "N-1", {"worker": "x"}, BASE_TS, orch="wiki")
+        load.assert_not_called()
+
+    def test_bad_payload_rejected_even_without_final_graph_validation(self) -> None:
+        self.append("spawn", "N-1", "N-2", spawn_payload(), BASE_TS, orch="wiki")
+        real = graph_lint.validate_document
+
+        def lenient(document, schema_name):
+            if schema_name == "workgraph":
+                return []
+            return real(document, schema_name)
+
+        with mock.patch.object(graph_lint, "validate_document", side_effect=lenient):
+            with self.assertRaises(workgraph.WorkgraphError):
+                self.append("verdict", "N-3", "N-1", {"worker": "x"}, BASE_TS + 60)
+
+    def test_final_graph_validation_failure_writes_nothing(self) -> None:
+        self.append("spawn", "N-1", "N-2", spawn_payload(), BASE_TS, orch="wiki")
+        hot = self.status_dir / "TST-1.workgraph.json"
+        before = hot.read_bytes()
+        real_validate = workgraph._validate
+
+        def strict(document, schema_name, what):
+            if what == "workgraph":
+                raise workgraph.WorkgraphError("injected final-validation failure")
+            return real_validate(document, schema_name, what)
+
+        with mock.patch.object(workgraph, "_validate", side_effect=strict):
+            with self.assertRaises(workgraph.WorkgraphError):
+                self.append("steer", "N-1", "N-2", steer_payload(), BASE_TS + 60)
+        self.assertEqual(hot.read_bytes(), before)
+        self.assertEqual(list(self.status_dir.glob("*.workgraph-tmp")), [])
+
+
+class CorruptHotFileTests(unittest.TestCase):
+    """Round 2: existing-but-invalid hot files fail closed (item 4)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.status_dir = root / "status"
+        self.snapshot_dir = root / "workgraphs"
+        self.status_dir.mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def append(self, kind: str, from_node: str, to_node: str, payload: dict, ts: float, **kwargs):
+        return workgraph.append_edge(
+            "TST-1",
+            kind,
+            from_node,
+            to_node,
+            payload,
+            status_dir=self.status_dir,
+            snapshot_dir=self.snapshot_dir,
+            now_ts=ts,
+            **kwargs,
+        )
+
+    def hot(self) -> Path:
+        return self.status_dir / "TST-1.workgraph.json"
+
+    def test_missing_file_loads_as_none(self) -> None:
+        self.assertIsNone(workgraph.load_workgraph("TST-1", self.status_dir))
+
+    def test_malformed_json_fails_closed(self) -> None:
+        self.hot().write_text("{not json", encoding="utf-8")
+        with self.assertRaises(workgraph.WorkgraphCorruptError):
+            workgraph.load_workgraph("TST-1", self.status_dir)
+        with self.assertRaises(workgraph.WorkgraphCorruptError):
+            self.append("spawn", "N-1", "N-2", spawn_payload(), BASE_TS, orch="wiki")
+        self.assertEqual(self.hot().read_text(encoding="utf-8"), "{not json")
+
+    def test_non_object_json_fails_closed(self) -> None:
+        self.hot().write_text("[1, 2, 3]", encoding="utf-8")
+        with self.assertRaises(workgraph.WorkgraphCorruptError):
+            self.append("spawn", "N-1", "N-2", spawn_payload(), BASE_TS, orch="wiki")
+        self.assertEqual(self.hot().read_text(encoding="utf-8"), "[1, 2, 3]")
+
+    def test_unreadable_hot_file_fails_closed(self) -> None:
+        self.hot().mkdir()  # read_text raises IsADirectoryError, an OSError
+        with self.assertRaises(workgraph.WorkgraphCorruptError):
+            workgraph.load_workgraph("TST-1", self.status_dir)
+        with self.assertRaises(workgraph.WorkgraphCorruptError):
+            self.append("spawn", "N-1", "N-2", spawn_payload(), BASE_TS, orch="wiki")
+
+    def test_schema_invalid_existing_graph_fails_closed(self) -> None:
+        self.hot().write_text('{"ticket": "TST-1"}', encoding="utf-8")
+        with self.assertRaises(workgraph.WorkgraphCorruptError):
+            self.append("spawn", "N-1", "N-2", spawn_payload(), BASE_TS, orch="wiki")
+        self.assertEqual(self.hot().read_text(encoding="utf-8"), '{"ticket": "TST-1"}')
+
+    def test_recover_from_snapshot_restores_and_preserves_damaged_file(self) -> None:
+        self.append("spawn", "N-1", "N-2", spawn_payload(), BASE_TS, orch="wiki")
+        good = self.hot().read_text(encoding="utf-8")
+        self.hot().write_text("{damaged", encoding="utf-8")
+        result = workgraph.recover_from_snapshot(
+            "TST-1", status_dir=self.status_dir, snapshot_dir=self.snapshot_dir
+        )
+        self.assertEqual(self.hot().read_text(encoding="utf-8"), good)
+        backups = list(self.status_dir.glob("TST-1.workgraph.json.corrupt-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_text(encoding="utf-8"), "{damaged")
+        self.assertEqual(result["backup"], str(backups[0]))
+
+    def test_recover_without_snapshot_fails(self) -> None:
+        with self.assertRaises(workgraph.WorkgraphError):
+            workgraph.recover_from_snapshot(
+                "TST-1", status_dir=self.status_dir, snapshot_dir=self.snapshot_dir
+            )
+
+    def test_append_after_recover_continues_history(self) -> None:
+        self.append("spawn", "N-1", "N-2", spawn_payload(), BASE_TS, orch="wiki")
+        self.hot().write_text("{damaged", encoding="utf-8")
+        workgraph.recover_from_snapshot(
+            "TST-1", status_dir=self.status_dir, snapshot_dir=self.snapshot_dir
+        )
+        graph = self.append("steer", "N-1", "N-2", steer_payload(), BASE_TS + 60)
+        self.assertEqual([e["kind"] for e in graph["edges"]], ["spawn", "steer"])
+
+
+class NodeRoleMatrixTests(unittest.TestCase):
+    """Round 2: explicit endpoint node kinds for every edge kind (item 5)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.status_dir = root / "status"
+        self.snapshot_dir = root / "workgraphs"
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def first_edge_nodes(self, kind: str, payload: dict) -> dict[str, str]:
+        graph = workgraph.append_edge(
+            "TST-1",
+            kind,
+            "N-from",
+            "N-to",
+            payload,
+            orch="wiki",
+            status_dir=self.status_dir,
+            snapshot_dir=self.snapshot_dir,
+            now_ts=BASE_TS,
+        )
+        return {node["id"]: node["kind"] for node in graph["nodes"]}
+
+    def test_every_edge_kind_infers_declared_endpoint_kinds(self) -> None:
+        cases = {
+            "spawn": (spawn_payload(role="implement"), "orchestrator", "implement"),
+            "steer": (steer_payload(), "orchestrator", "worker"),
+            "verdict": (verdict_payload(), "review", "orchestrator"),
+            "archive": (archive_payload(), "orchestrator", "worker"),
+            "handoff": (handoff_payload(), "worker", "worker"),
+            "monitor_alarm": (monitor_alarm_payload(), "monitor", "orchestrator"),
+            "capability_grant": (capability_grant_payload(), "orchestrator", "orchestrator"),
+            "escalation": (escalation_payload(), "monitor", "orchestrator"),
+        }
+        self.assertEqual(set(cases), set(workgraph.EDGE_KINDS))
+        for kind, (payload, expected_from, expected_to) in cases.items():
+            with self.subTest(kind=kind):
+                nodes = self.first_edge_nodes(kind, payload)
+                self.assertEqual(nodes["N-from"], expected_from)
+                self.assertEqual(nodes["N-to"], expected_to)
+            self.tearDown()
+            self.setUp()
+
+    def test_spawn_target_takes_role_from_payload(self) -> None:
+        nodes = self.first_edge_nodes("spawn", spawn_payload("TST-1-REVIEW1", "review"))
+        self.assertEqual(nodes["N-to"], "review")
+
+    def test_first_seen_monitor_does_not_count_as_live_worker(self) -> None:
+        graph = workgraph.append_edge(
+            "TST-1",
+            "monitor_alarm",
+            "N-mon",
+            "N-orch",
+            monitor_alarm_payload(),
+            orch="wiki",
+            status_dir=self.status_dir,
+            snapshot_dir=self.snapshot_dir,
+            now_ts=BASE_TS,
+        )
+        health = workgraph.compute_composite_health(graph, now_ts=BASE_TS + 5000)
+        self.assertEqual(health["slowest_node_stall_seconds"], 0)
+
+    def test_first_seen_verdict_source_counts_as_live_reviewer(self) -> None:
+        workgraph.append_edge(
+            "TST-1",
+            "spawn",
+            "N-1",
+            "N-2",
+            spawn_payload(),
+            orch="wiki",
+            status_dir=self.status_dir,
+            snapshot_dir=self.snapshot_dir,
+            now_ts=BASE_TS,
+        )
+        graph = workgraph.append_edge(
+            "TST-1",
+            "verdict",
+            "N-9",
+            "N-1",
+            verdict_payload(),
+            status_dir=self.status_dir,
+            snapshot_dir=self.snapshot_dir,
+            now_ts=BASE_TS + 60,
+        )
+        node_kinds = {node["id"]: node["kind"] for node in graph["nodes"]}
+        self.assertEqual(node_kinds["N-9"], "review")
+        alarms = workgraph.health_alarms(graph, now_ts=BASE_TS + 90)
+        self.assertNotIn("blocking_no_reviewer", [a["check"] for a in alarms])
+
+
+class ClockConsistencyTests(unittest.TestCase):
+    """Round 2: renderer and health endpoint share one injected clock (item 3)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.status_dir = root / "status"
+        self.snapshot_dir = root / "workgraphs"
+        workgraph.append_edge(
+            "TST-9",
+            "spawn",
+            "N-1",
+            "N-2",
+            spawn_payload("TST-9"),
+            orch="wiki",
+            status_dir=self.status_dir,
+            snapshot_dir=self.snapshot_dir,
+            now_ts=BASE_TS,
+        )
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_renderer_and_health_endpoint_agree_on_stall(self) -> None:
+        with (
+            mock.patch.object(main, "AGENT_STATUS_DIR", self.status_dir),
+            mock.patch.object(workgraph, "SNAPSHOT_DIR", self.snapshot_dir),
+            mock.patch.object(workgraph, "CLOCK", lambda: BASE_TS + 900),
+        ):
+            rendered = main.agent_workgraph("TST-9")
+            health = main.agent_workgraph_health("TST-9")
+        self.assertEqual(
+            rendered["workgraph"]["composite_health"]["slowest_node_stall_seconds"], 900
+        )
+        self.assertEqual(rendered["health"], health["health"])
+        self.assertEqual(rendered["alarms"], health["alarms"])
+        self.assertEqual(rendered["computed_at"], health["computed_at"])
+        self.assertEqual(health["health"]["slowest_node_stall_seconds"], 900)
+
+    def test_stall_tracks_the_injected_clock(self) -> None:
+        with (
+            mock.patch.object(main, "AGENT_STATUS_DIR", self.status_dir),
+            mock.patch.object(workgraph, "SNAPSHOT_DIR", self.snapshot_dir),
+            mock.patch.object(workgraph, "CLOCK", lambda: BASE_TS + 2000),
+        ):
+            rendered = main.agent_workgraph("TST-9")
+            health = main.agent_workgraph_health("TST-9")
+        self.assertEqual(
+            rendered["workgraph"]["composite_health"]["slowest_node_stall_seconds"], 2000
+        )
+        self.assertEqual([a["check"] for a in health["alarms"]], ["node_stall"])
+        self.assertEqual([a["check"] for a in rendered["alarms"]], ["node_stall"])
+
+
+class CorruptHotEndpointTests(unittest.TestCase):
+    """Round 2: serving endpoints surface hot-file corruption (item 4)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.status_dir = root / "status"
+        self.snapshot_dir = root / "workgraphs"
+        self.status_dir.mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_corrupt_hot_with_snapshot_serves_snapshot_with_warning(self) -> None:
+        workgraph.append_edge(
+            "TST-9",
+            "spawn",
+            "N-1",
+            "N-2",
+            spawn_payload("TST-9"),
+            orch="wiki",
+            status_dir=self.status_dir,
+            snapshot_dir=self.snapshot_dir,
+            now_ts=BASE_TS,
+        )
+        (self.status_dir / "TST-9.workgraph.json").write_text("{damaged", encoding="utf-8")
+        with (
+            mock.patch.object(main, "AGENT_STATUS_DIR", self.status_dir),
+            mock.patch.object(workgraph, "SNAPSHOT_DIR", self.snapshot_dir),
+        ):
+            payload = main.agent_workgraph("TST-9")
+        self.assertEqual(payload["source"], "snapshot")
+        self.assertIn("recover", payload["warning"])
+
+    def test_corrupt_hot_without_snapshot_is_500(self) -> None:
+        (self.status_dir / "TST-9.workgraph.json").write_text("{damaged", encoding="utf-8")
+        with (
+            mock.patch.object(main, "AGENT_STATUS_DIR", self.status_dir),
+            mock.patch.object(workgraph, "SNAPSHOT_DIR", self.snapshot_dir),
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                main.agent_workgraph("TST-9")
+        self.assertEqual(ctx.exception.status_code, 500)
 
 
 if __name__ == "__main__":
