@@ -32,6 +32,8 @@ Todo:
 - [P2] WIKI-159 keyboard + dialog accessibility: kanban/dashboard filters/destructive dialog/context menu — keyboard equivalents for drag/double-click, listbox+menu+dialog semantics complete, focus trap+restore, destructive copy describes outcome+recovery
 - [P2] WIKI-160 design-token convergence + shared controls: spacing/radii/motion/icons/shadows, settings+status components — one spacing/radius/motion vocabulary, no dup radius aliases, theme-token shadows, weights cap 600, primitives everywhere (rebase after WIKI-144)
 - [P2] WIKI-164 graph-engineering D3 follow-up: work-graph templates — ~/me/fun/wiki/templates/workgraphs/*.workgraph.tpl.json per ticket kind (roles/models per repo); `wiki graph select-template` picks by ticket-prefix + label; kills hardcoded-model-in-prompt pattern. DEFER trigger-DSL from spec (keep orch logic as code, template just names role+model). Ticket-prefix fallback for repos without labels (WIKI-*/MITMWEB-*/etc). Depends WIKI-162+WIKI-163 (spec: vault/wiki/specs/graph-engineering.md D3)
+- [P2] WIKI-165 graph-engineering D2 follow-up: FleetMonitor graph_health integration — install composite-health detector in backend/app/agent_runtime/fleet_monitor.py (blocking>0 + no live reviewer q5m re-alarm subsuming review-gap; stall>1800s escalation edge target henry + app notification; iteration_count>cap escalation), typed escalation appends through sole writer, one injected clock shared with renderer/health endpoint. Deferred from WIKI-163 round-1 review (spec D2.5)
+- [P3] WIKI-163 LOW follow-up: workgraph crash-test gaps — inject schema-invalid newest orphan (never promoted) + two-crash convergence through successive revisions (from REVIEW5 verdict)
 
 In Progress:
 
@@ -47,7 +49,6 @@ In Progress:
 - [P2] PHO-13826 ModalSandboxBackend + PHO-13827 sandbox ownership — workers live (Modal replaces exe.dev for v0; 13828 lifecycle + 13829 egress design queued)
 - mitmweb rebuild: scope and build a clearer live proxy-traffic inspector — owner (misc)
 - WIKI-135 dashboard: implementation workers only (drop reviewers/one-shots) — owner cdx:WIKI-135 (luna)
-- [P1] WIKI-163 graph-engineering D2: workgraph.json + wiki-app renderer — per-ticket /tmp/agent-status/<TICKET>.workgraph.json (typed DAG of orch actions: spawn/steer/verdict/archive/handoff/monitor_alarm); durable snapshots ~/.wiki/workgraphs/; single-writer `wiki graph append` CLI (validates + updates composite_health + atomic writes both copies); Wiki.app /agents/<TICKET>/graph route rendering DAG (live view P0, replay slider P2); `graph_health` composite monitor unifies verdict-q5m + review-gap-q10m + staleness-30m re-alarms into one signal. Depends WIKI-162 (spec: vault/wiki/specs/graph-engineering.md) — cc:WIKI-163 worker
 
 Backlog:
 

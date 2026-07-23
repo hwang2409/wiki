@@ -9,6 +9,8 @@ updated: 2026-07-22
 
 ## 2026-07-22
 
+- WIKI-163 graph-engineering D2 workgraph + renderer merged (#127 squash fd92d5f, 5 rounds — canonical-action edge wiring, snapshot-before-hot + orphan reconciliation under per-ticket lock, request-ID replay idempotency keyed by mode, lifespan-drained keyed outbox, injected clock, /agents/<T>/graph live+replay)
+- PHO-14260 merged: haiku-4.5 tier for admin agent mechanical map subagents (#12112 squash cb083488, 5 rounds — prose classifier killed for server-validated mechanical_contract, ~67.3% cost cut on that traffic, cross-provider fallback intact)
 - WIKI-162 graph-engineering D1 schemas + linter merged (#126 squash c06678f, 5 rounds — steer-path Steer validation, nested SHA binding, frozen-sidecar schema bundling + real PyInstaller MCP smoke, per-error required-key pointers)
 - PHO-14272 merged: admin agent graceful worker handoff + 48h interrupt-cause rollup (#12105 squash 736a0101, 4 rounds — shutdown-event-gated cancellation attribution, coordinated-deploy runbook w/ exact scalar query, lease-fenced idempotent recovery)
 - Corey admin-agent access fixed: users.admin was already true; real blocker was org_slack_user_mappings user_id NULL in Phoebe Home Care (link click had bound Orchard St. row instead). One-row prod UPDATE linked U0AGES89BLZ to ebcca7d3 (approved by Henry); Orchard St. row left as-is per Henry
