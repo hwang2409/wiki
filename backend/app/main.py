@@ -121,6 +121,9 @@ async def lifespan(_app: FastAPI):
         name="palette-artifact-warm",
         daemon=True,
     ).start()
+    # Lifespan owns the workgraph outbox: accepted telemetry writes are
+    # drained on shutdown instead of dying with a daemon thread.
+    workgraph_service.start_outbox()
     dispatcher_task, watchdog_task, token_task = await _start_dispatcher()
     knowledge_task = asyncio.create_task(
         knowledge.background_index_loop(
@@ -152,6 +155,9 @@ async def lifespan(_app: FastAPI):
             provider_health_task,
             return_exceptions=True,
         )
+        # Bounded drain: every accepted workgraph write is delivered or
+        # logged as undelivered before the process exits.
+        await asyncio.to_thread(workgraph_service.stop_outbox)
         await asyncio.to_thread(terminal.TERMINAL_MANAGER.close_all)
 
 

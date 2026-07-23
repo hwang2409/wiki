@@ -9,6 +9,7 @@ underlying agent operation.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import tempfile
 import threading
@@ -456,7 +457,7 @@ class OutboxTests(unittest.TestCase):
         )
 
     def test_full_outbox_drops_edge_and_logs(self) -> None:
-        outbox = workgraph_service._TelemetryOutbox(maxsize=1)
+        outbox = workgraph_service._TelemetryOutbox(max_pending=2)
         release = threading.Event()
         entered = threading.Event()
 
@@ -465,7 +466,8 @@ class OutboxTests(unittest.TestCase):
             assert release.wait(timeout=10)
 
         try:
-            # First submission occupies the worker; second fills the queue.
+            # First submission is in flight; second queues; third exceeds the
+            # pending bound and is dropped with a log line.
             self.assertTrue(outbox.submit("WIKI-9", "spawn", blocked))
             self.assertTrue(entered.wait(timeout=10))
             self.assertTrue(outbox.submit("WIKI-9", "steer", lambda: None))
@@ -475,6 +477,120 @@ class OutboxTests(unittest.TestCase):
         finally:
             release.set()
         self.assertTrue(outbox.flush(timeout=10))
+
+    def test_ticket_b_delivers_while_ticket_a_lock_is_held(self) -> None:
+        # Round 4: a synchronous CLI writer holding ticket A's flock must not
+        # stall other tickets' telemetry — the outbox is keyed per ticket.
+        self.status_dir.mkdir(parents=True, exist_ok=True)
+        handle = open(self.status_dir / "WIKI-1.workgraph.lock", "a+b")
+        self.addCleanup(handle.close)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+
+        def spawn(ticket: str) -> None:
+            workgraph_service.record_spawn(
+                agent_id=ticket,
+                orch="wiki",
+                role="implement",
+                model="claude-opus-4-6",
+                effort=None,
+                worktree="/tmp/wt",
+                request_id=f"req-{ticket}",
+                status_dir=self.status_dir,
+            )
+
+        spawn("WIKI-1")
+        spawn("WIKI-2")
+        b_hot = self.status_dir / "WIKI-2.workgraph.json"
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not b_hot.exists():
+            time.sleep(0.01)
+        self.assertTrue(b_hot.exists(), "ticket B stalled behind ticket A's held lock")
+        # A is still blocked on its lock: nothing delivered for it yet.
+        self.assertFalse((self.status_dir / "WIKI-1.workgraph.json").exists())
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        flush()
+        self.assertTrue((self.status_dir / "WIKI-1.workgraph.json").exists())
+
+    def test_per_ticket_order_preserved_under_keyed_delivery(self) -> None:
+        outbox = workgraph_service._TelemetryOutbox()
+        delivered: list[str] = []
+        gate = threading.Event()
+
+        def deliver(tag: str, wait: bool = False):
+            def run() -> None:
+                if wait:
+                    assert gate.wait(timeout=10)
+                delivered.append(tag)
+
+            return run
+
+        # A's first delivery blocks; A's second must still run after it while
+        # B proceeds independently.
+        self.assertTrue(outbox.submit("WIKI-1", "spawn", deliver("a1", wait=True)))
+        self.assertTrue(outbox.submit("WIKI-1", "steer", deliver("a2")))
+        self.assertTrue(outbox.submit("WIKI-2", "spawn", deliver("b1")))
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and "b1" not in delivered:
+            time.sleep(0.01)
+        self.assertEqual(delivered, ["b1"])
+        gate.set()
+        self.assertTrue(outbox.flush(timeout=10))
+        self.assertEqual(delivered, ["b1", "a1", "a2"])
+
+
+class OutboxLifecycleTests(unittest.TestCase):
+    """Round 4: lifespan-owned drain/stop — no silently discarded writes."""
+
+    def test_stop_drains_pending_write(self) -> None:
+        outbox = workgraph_service._TelemetryOutbox()
+        delivered: list[bool] = []
+        entered = threading.Event()
+
+        def slow() -> None:
+            entered.set()
+            time.sleep(0.1)
+            delivered.append(True)
+
+        self.assertTrue(outbox.submit("WIKI-9", "spawn", slow))
+        self.assertTrue(entered.wait(timeout=10))
+        self.assertTrue(outbox.stop(timeout=10))
+        self.assertEqual(delivered, [True])
+
+    def test_stop_timeout_logs_each_undelivered_item(self) -> None:
+        outbox = workgraph_service._TelemetryOutbox()
+        release = threading.Event()
+        entered = threading.Event()
+
+        def stuck() -> None:
+            entered.set()
+            assert release.wait(timeout=30)
+
+        try:
+            self.assertTrue(outbox.submit("WIKI-9", "spawn", stuck))
+            self.assertTrue(entered.wait(timeout=10))
+            self.assertTrue(outbox.submit("WIKI-9", "steer", lambda: None))
+            with self.assertLogs("wiki.workgraph", level="ERROR") as logs:
+                self.assertFalse(outbox.stop(timeout=0.2))
+            joined = "\n".join(logs.output)
+            self.assertIn("undelivered steer edge for WIKI-9", joined)
+            self.assertIn("spawn edge for WIKI-9 still delivering", joined)
+            # Stopped outbox refuses (and logs) new work instead of silently
+            # accepting writes that can never be delivered.
+            with self.assertLogs("wiki.workgraph", level="ERROR") as logs:
+                self.assertFalse(outbox.submit("WIKI-9", "archive", lambda: None))
+            self.assertIn("outbox stopped", "\n".join(logs.output))
+        finally:
+            release.set()
+
+    def test_start_reopens_a_stopped_outbox(self) -> None:
+        outbox = workgraph_service._TelemetryOutbox()
+        self.assertTrue(outbox.stop(timeout=1))
+        self.assertFalse(outbox.submit("WIKI-9", "spawn", lambda: None))
+        outbox.start()
+        delivered: list[bool] = []
+        self.assertTrue(outbox.submit("WIKI-9", "spawn", lambda: delivered.append(True)))
+        self.assertTrue(outbox.flush(timeout=10))
+        self.assertEqual(delivered, [True])
 
 
 if __name__ == "__main__":

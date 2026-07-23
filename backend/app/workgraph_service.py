@@ -7,20 +7,22 @@ are stable and derived from agent identity: ``orch:<orch-id>`` for the acting
 orchestrator, the agent id itself for workers.
 
 Agent operations are primary; the graph is telemetry. Appends are delivered
-through a bounded single-worker outbox so a blocked filesystem write can never
-stall an already-successful agent action response: ``record_*`` enqueue and
-return immediately, delivery preserves per-ticket order (one global FIFO
-worker), and failures — append errors or a full outbox — are logged and
-swallowed. The CLI path (``wiki graph append``) stays synchronous; only the
-backend service path is asynchronous.
+through a bounded keyed outbox so a blocked filesystem write can never stall
+an already-successful agent action response: ``record_*`` enqueue and return
+immediately, delivery keeps exactly one append in flight per ticket (per-
+ticket order preserved) while distinct tickets deliver concurrently, and
+failures — append errors or a full outbox — are logged and swallowed. The
+FastAPI lifespan owns the outbox lifecycle: shutdown drains with a bound and
+logs every undelivered item. The CLI path (``wiki graph append``) stays
+synchronous; only the backend service path is asynchronous.
 """
 
 from __future__ import annotations
 
 import logging
-import queue
 import re
 import threading
+from collections import deque
 from pathlib import Path
 from typing import Callable
 from uuid import uuid4
@@ -50,52 +52,74 @@ def orch_node_id(orch: str) -> str:
 
 
 class _TelemetryOutbox:
-    """Bounded, serialized delivery of graph appends off the request path.
+    """Bounded keyed delivery of graph appends off the request path.
 
-    One daemon worker drains a global FIFO, which preserves per-ticket order
-    by construction. ``submit`` never blocks: a full queue drops the edge and
-    logs the loss (agent operations are primary; the graph is telemetry).
+    Appends are keyed by ticket: exactly one delivery is in flight per ticket
+    (a per-ticket drain thread preserves order), while distinct tickets
+    deliver concurrently — one ticket's held append lock can never stall the
+    whole fleet's telemetry or force unrelated edges out of the bounded
+    buffer. ``submit`` never blocks: once ``max_pending`` undelivered items
+    accumulate, further edges are dropped and the loss logged (agent
+    operations are primary; the graph is telemetry). The FastAPI lifespan
+    owns ``start``/``stop``; ``stop`` drains with a bound and logs every
+    undelivered item so a backend restart can never silently discard
+    accepted writes.
     """
 
-    def __init__(self, maxsize: int = 256) -> None:
-        self._queue: queue.Queue[tuple[str, str, Callable[[], None]]] = queue.Queue(
-            maxsize=maxsize
-        )
-        self._idle = threading.Condition()
+    def __init__(self, max_pending: int = 256) -> None:
+        self._cond = threading.Condition()
+        self._queues: dict[str, deque[tuple[str, Callable[[], None]]]] = {}
+        self._active: set[str] = set()  # tickets with a live drain thread
+        self._delivering: dict[str, str] = {}  # ticket -> edge kind in flight
         self._pending = 0
-        self._start_lock = threading.Lock()
-        self._worker: threading.Thread | None = None
+        self._max_pending = max_pending
+        self._closed = False
 
-    def _ensure_worker(self) -> None:
-        with self._start_lock:
-            if self._worker is None or not self._worker.is_alive():
-                self._worker = threading.Thread(
-                    target=self._drain, name="workgraph-outbox", daemon=True
-                )
-                self._worker.start()
+    def start(self) -> None:
+        with self._cond:
+            self._closed = False
 
     def submit(self, ticket: str, edge_kind: str, deliver: Callable[[], None]) -> bool:
-        self._ensure_worker()
-        with self._idle:
+        with self._cond:
+            if self._closed:
+                log.error(
+                    "workgraph outbox stopped; dropping %s edge for %s "
+                    "(the agent action itself succeeded)",
+                    edge_kind,
+                    ticket,
+                )
+                return False
+            if self._pending >= self._max_pending:
+                log.error(
+                    "workgraph outbox full; dropping %s edge for %s "
+                    "(the agent action itself succeeded)",
+                    edge_kind,
+                    ticket,
+                )
+                return False
+            self._queues.setdefault(ticket, deque()).append((edge_kind, deliver))
             self._pending += 1
-        try:
-            self._queue.put_nowait((ticket, edge_kind, deliver))
-        except queue.Full:
-            with self._idle:
-                self._pending -= 1
-                self._idle.notify_all()
-            log.error(
-                "workgraph outbox full; dropping %s edge for %s "
-                "(the agent action itself succeeded)",
-                edge_kind,
-                ticket,
-            )
-            return False
+            if ticket not in self._active:
+                self._active.add(ticket)
+                threading.Thread(
+                    target=self._drain_ticket,
+                    args=(ticket,),
+                    name=f"workgraph-outbox-{ticket}",
+                    daemon=True,
+                ).start()
         return True
 
-    def _drain(self) -> None:
+    def _drain_ticket(self, ticket: str) -> None:
         while True:
-            ticket, edge_kind, deliver = self._queue.get()
+            with self._cond:
+                ticket_queue = self._queues.get(ticket)
+                if not ticket_queue:
+                    self._queues.pop(ticket, None)
+                    self._active.discard(ticket)
+                    self._cond.notify_all()
+                    return
+                edge_kind, deliver = ticket_queue.popleft()
+                self._delivering[ticket] = edge_kind
             try:
                 deliver()
             except Exception:
@@ -105,17 +129,54 @@ class _TelemetryOutbox:
                     ticket,
                 )
             finally:
-                with self._idle:
+                with self._cond:
+                    del self._delivering[ticket]
                     self._pending -= 1
-                    self._idle.notify_all()
+                    self._cond.notify_all()
 
     def flush(self, timeout: float = 5.0) -> bool:
-        """Wait until every submitted edge has been delivered (tests only)."""
-        with self._idle:
-            return self._idle.wait_for(lambda: self._pending == 0, timeout)
+        """Wait until every submitted edge has been delivered."""
+        with self._cond:
+            return self._cond.wait_for(lambda: self._pending == 0, timeout)
+
+    def stop(self, timeout: float = 5.0) -> bool:
+        """Refuse new work, drain with a bound, log anything undelivered."""
+        with self._cond:
+            self._closed = True
+        if self.flush(timeout):
+            return True
+        with self._cond:
+            for ticket, ticket_queue in self._queues.items():
+                for edge_kind, _deliver in ticket_queue:
+                    log.error(
+                        "workgraph outbox shutdown: undelivered %s edge for %s",
+                        edge_kind,
+                        ticket,
+                    )
+            for ticket, edge_kind in self._delivering.items():
+                log.error(
+                    "workgraph outbox shutdown: %s edge for %s still delivering "
+                    "at timeout",
+                    edge_kind,
+                    ticket,
+                )
+            # Drop queued work so drain threads exit; in-flight deliveries are
+            # daemon threads and die with the process.
+            self._pending -= sum(len(q) for q in self._queues.values())
+            self._queues.clear()
+            self._cond.notify_all()
+        return False
 
 
 OUTBOX = _TelemetryOutbox()
+
+
+def start_outbox() -> None:
+    OUTBOX.start()
+
+
+def stop_outbox(timeout: float = 5.0) -> bool:
+    return OUTBOX.stop(timeout)
 
 
 def flush_outbox(timeout: float = 5.0) -> bool:
