@@ -33,13 +33,21 @@ def _default_schema_dir() -> Path:
 
 
 SCHEMA_DIR = _default_schema_dir()
-SCHEMA_NAMES = ("finding", "verdict", "steer", "edge", "workgraph")
+SCHEMA_NAMES = (
+    "finding",
+    "verdict",
+    "steer",
+    "edge",
+    "workgraph",
+    "workgraph-template",
+)
 SCHEMA_SIGNATURES = (
     ("workgraph", frozenset(("ticket", "nodes", "edges"))),
     ("edge", frozenset(("kind", "from", "to"))),
     ("steer", frozenset(("target_worker", "mode", "findings"))),
     ("verdict", frozenset(("worker", "state", "findings"))),
     ("finding", frozenset(("id", "severity", "observed", "why_wrong", "do_instead"))),
+    ("workgraph-template", frozenset(("template_id", "roles", "iteration_cap"))),
 )
 
 
@@ -293,7 +301,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("path", help="JSON artifact to validate")
     parser.add_argument(
         "--schema",
-        help="schema name (finding, verdict, steer, edge, or workgraph) or schema path",
+        help="schema name (finding, verdict, steer, edge, workgraph, or workgraph-template) or schema path",
     )
     args = parser.parse_args(argv)
     violations = lint_path(args.path, args.schema)

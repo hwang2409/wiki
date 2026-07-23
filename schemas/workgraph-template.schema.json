@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wiki.henry/schemas/workgraph-template.json",
+  "title": "Work-graph template",
+  "type": "object",
+  "required": [
+    "template_id",
+    "applies_to",
+    "roles",
+    "edges",
+    "iteration_cap",
+    "on_failure"
+  ],
+  "properties": {
+    "template_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9_-]+\\.[a-z0-9_-]+$"
+    },
+    "applies_to": {"$ref": "#/$defs/appliesTo"},
+    "roles": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/role"}
+    },
+    "edges": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/edge"}
+    },
+    "iteration_cap": {"type": "integer", "minimum": 1},
+    "on_failure": {"$ref": "#/$defs/onFailure"}
+  },
+  "$defs": {
+    "appliesTo": {
+      "type": "object",
+      "required": ["repo", "labels_any", "labels_none"],
+      "properties": {
+        "repo": {"type": "string", "minLength": 1},
+        "labels_any": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        },
+        "labels_none": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        }
+      },
+      "additionalProperties": false
+    },
+    "role": {
+      "type": "object",
+      "required": ["kind", "runtime", "model", "effort"],
+      "properties": {
+        "kind": {"enum": ["plan", "implement", "sim", "review"]},
+        "runtime": {"enum": ["cc", "cdx"]},
+        "model": {"type": "string", "minLength": 1},
+        "effort": {
+          "type": ["string", "null"],
+          "enum": ["low", "medium", "high", null]
+        }
+      },
+      "additionalProperties": false
+    },
+    "edge": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": {"enum": ["spawn", "monitor", "verdict", "steer", "archive"]},
+        "from": {"type": "string", "minLength": 1},
+        "to": {"type": "string", "minLength": 1},
+        "on": {"type": "string", "minLength": 1},
+        "trigger": {"type": "string", "minLength": 1}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"kind": {"const": "spawn"}}, "required": ["kind"]},
+          "then": {"required": ["from", "to"]}
+        },
+        {
+          "if": {"properties": {"kind": {"const": "monitor"}}, "required": ["kind"]},
+          "then": {"required": ["on"]}
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {"enum": ["verdict", "steer", "archive"]}
+            },
+            "required": ["kind"]
+          },
+          "then": {"required": ["from", "to"]}
+        }
+      ],
+      "additionalProperties": false
+    },
+    "onFailure": {
+      "type": "object",
+      "required": [
+        "implement_stall_30min",
+        "review_no_verdict_2h",
+        "iteration_cap_reached"
+      ],
+      "properties": {
+        "implement_stall_30min": {"type": "string", "minLength": 1},
+        "review_no_verdict_2h": {"type": "string", "minLength": 1},
+        "iteration_cap_reached": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
