@@ -77,17 +77,24 @@ class WorkgraphTemplateSelectionTests(unittest.TestCase):
         self.assertEqual(payload["template_id"], "wiki.implement")
         self.assertEqual(payload["roles"][0]["model"], "gpt-5.6-luna")
 
-    def test_cli_unknown_prefix_is_nonzero_and_explains_supported_prefixes(self) -> None:
-        result = subprocess.run(
-            [sys.executable, str(WIKI_CLI), "graph", "select-template", "XYZ-1"],
-            cwd=REPO_ROOT,
-            capture_output=True,
-            text=True,
-            check=False,
+    def test_cli_unknown_and_malformed_ticket_ids_return_input_error(self) -> None:
+        cases = (
+            ("XYZ-1", "unknown ticket prefix", "WIKI"),
+            ("PHO", "invalid ticket id", "PREFIX-number"),
+            ("", "invalid ticket id", "PREFIX-number"),
         )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("unknown ticket prefix", result.stderr)
-        self.assertIn("WIKI", result.stderr)
+        for ticket, expected_error, expected_detail in cases:
+            with self.subTest(ticket=ticket):
+                result = subprocess.run(
+                    [sys.executable, str(WIKI_CLI), "graph", "select-template", ticket],
+                    cwd=REPO_ROOT,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(expected_error, result.stderr)
+                self.assertIn(expected_detail, result.stderr)
 
 
 if __name__ == "__main__":

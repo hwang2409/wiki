@@ -239,61 +239,89 @@ class GraphLintTests(unittest.TestCase):
             {"/orch", "/ticket"},
         )
 
-    def test_template_schema_rejects_each_missing_required_root_field(self) -> None:
+    def test_template_schema_rejects_each_missing_required_field(self) -> None:
         document = _fixture("workgraph-template.valid.json")
-        required = (
-            "template_id",
-            "applies_to",
-            "roles",
-            "edges",
-            "iteration_cap",
-            "on_failure",
+        object_scopes = (
+            (
+                "root",
+                (),
+                ("template_id", "applies_to", "roles", "edges", "iteration_cap", "on_failure"),
+            ),
+            ("applies_to", ("applies_to",), ("repo", "labels_any", "labels_none")),
+            ("role", ("roles", 0), ("kind", "runtime", "model", "effort")),
+            ("on_failure", ("on_failure",), (
+                "implement_stall_30min",
+                "review_no_verdict_2h",
+                "iteration_cap_reached",
+            )),
         )
-        for field in required:
-            with self.subTest(field=field):
-                candidate = copy.deepcopy(document)
-                del candidate[field]
-                violations = graph_lint.validate_document(candidate, "workgraph-template")
-                self.assertTrue(violations)
-                self.assertTrue(any(pointer == f"/{field}" for pointer, _ in violations))
+        for scope, object_path, required_fields in object_scopes:
+            for field in required_fields:
+                with self.subTest(scope=scope, field=field):
+                    candidate = copy.deepcopy(document)
+                    target = candidate
+                    for part in object_path:
+                        target = target[part]
+                    del target[field]
+                    expected_pointer = "/" + "/".join(
+                        str(part) for part in (*object_path, field)
+                    )
+                    violations = graph_lint.validate_document(
+                        candidate, "workgraph-template"
+                    )
+                    self.assertEqual(
+                        {pointer for pointer, _ in violations},
+                        {expected_pointer},
+                    )
 
-    def test_template_schema_rejects_each_missing_role_field(self) -> None:
-        required = ("kind", "runtime", "model", "effort")
-        for field in required:
-            with self.subTest(field=field):
-                document = _fixture("workgraph-template.valid.json")
-                del document["roles"][0][field]
-                violations = graph_lint.validate_document(document, "workgraph-template")
-                self.assertTrue(any(field in message for _, message in violations))
-
-    def test_template_schema_rejects_each_missing_edge_shape_field(self) -> None:
-        required_by_kind = {
-            "spawn": ("from", "to"),
-            "monitor": ("on",),
-            "verdict": ("from", "to"),
-            "steer": ("from", "to"),
-            "archive": ("from", "to"),
+        edge_shapes = {
+            "spawn": {"from": "a", "to": "b"},
+            "monitor": {"on": "a"},
+            "verdict": {"from": "a", "to": "b"},
+            "steer": {"from": "a", "to": "b"},
+            "archive": {"from": "a", "to": "b"},
         }
-        for kind, required in required_by_kind.items():
-            for field in required:
-                with self.subTest(kind=kind, field=field):
-                    document = _fixture("workgraph-template.valid.json")
-                    edge = {"kind": kind, **({"from": "a", "to": "b"} if kind != "monitor" else {"on": "a"})}
-                    del edge[field]
-                    document["edges"] = [edge]
-                    violations = graph_lint.validate_document(document, "workgraph-template")
-                    self.assertTrue(any(pointer == f"/edges/0/{field}" for pointer, _ in violations))
+        for kind, shape in edge_shapes.items():
+            for field in ("kind", *shape):
+                with self.subTest(scope="edge", kind=kind, field=field):
+                    candidate = copy.deepcopy(document)
+                    candidate["edges"] = [{"kind": kind, **shape}]
+                    del candidate["edges"][0][field]
+                    violations = graph_lint.validate_document(
+                        candidate, "workgraph-template"
+                    )
+                    self.assertEqual(
+                        {pointer for pointer, _ in violations},
+                        {f"/edges/0/{field}"},
+                    )
 
-    def test_template_schema_rejects_unexpected_properties(self) -> None:
-        document = _fixture("workgraph-template.valid.json")
-        document["unexpected"] = True
-        document["roles"][0]["unexpected"] = True
-        document["edges"][0]["unexpected"] = True
-        violations = graph_lint.validate_document(document, "workgraph-template")
-        self.assertEqual(
-            {pointer for pointer, _ in violations},
-            {"/", "/roles/0", "/edges/0"},
+    def test_template_schema_rejects_unexpected_properties_in_each_object_scope(self) -> None:
+        object_scopes = (
+            ("root", ()),
+            ("applies_to", ("applies_to",)),
+            ("role", ("roles", 0)),
+            ("edge", ("edges", 0)),
+            ("on_failure", ("on_failure",)),
         )
+        for scope, object_path in object_scopes:
+            with self.subTest(scope=scope):
+                candidate = _fixture("workgraph-template.valid.json")
+                target = candidate
+                for part in object_path:
+                    target = target[part]
+                target["unexpected"] = True
+                expected_pointer = (
+                    "/"
+                    if not object_path
+                    else "/" + "/".join(str(part) for part in object_path)
+                )
+                violations = graph_lint.validate_document(
+                    candidate, "workgraph-template"
+                )
+                self.assertEqual(
+                    {pointer for pointer, _ in violations},
+                    {expected_pointer},
+                )
 
     def test_template_files_are_auto_detected(self) -> None:
         template_paths = sorted((REPO_ROOT / "templates" / "workgraphs").glob("*.json"))
