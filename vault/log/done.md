@@ -9,6 +9,10 @@ updated: 2026-07-22
 
 ## 2026-07-22
 
+- WIKI-162 graph-engineering D1 schemas + linter merged (#126 squash c06678f, 5 rounds — steer-path Steer validation, nested SHA binding, frozen-sidecar schema bundling + real PyInstaller MCP smoke, per-error required-key pointers)
+- PHO-14272 merged: admin agent graceful worker handoff + 48h interrupt-cause rollup (#12105 squash 736a0101, 4 rounds — shutdown-event-gated cancellation attribution, coordinated-deploy runbook w/ exact scalar query, lease-fenced idempotent recovery)
+- Corey admin-agent access fixed: users.admin was already true; real blocker was org_slack_user_mappings user_id NULL in Phoebe Home Care (link click had bound Orchard St. row instead). One-row prod UPDATE linked U0AGES89BLZ to ebcca7d3 (approved by Henry); Orchard St. row left as-is per Henry
+- PHO-14285 merged: llm_framework anthropic defer_loading + tool_search_tool_regex_20251119 opt-in support (#12095 squash 62bc583a, 3 review rounds) — unblocks PHO-14286 eval harness
 - **wiki** — 07-22 quad-merge regression sweep fixed inline on main (3db94ae — sidebar orch->worker grouping restored, Cmd-K palette 14s->0.2s artifact-cache, visible tool-reference markers, synthetic-row spacing, composer echo-lag dedupe)
 - PHO-14258 preload closure widening merged (PR #12072 squash 748f4a4a, 5 sol rounds — classifier payload fix, multi-workflow closure, fallback budget, underscore-boundary regex, registry-derived mutation guard)
 - WIKI-156 artifact shell + renderer polish merged (#125 squash 316e015, 3 rounds)
