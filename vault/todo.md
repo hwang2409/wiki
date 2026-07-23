@@ -3,7 +3,7 @@ type: reference
 view: kanban
 tags: [todo]
 created: 2026-07-06
-updated: 2026-07-22
+updated: 2026-07-23
 ---
 
 Todo:
@@ -31,9 +31,9 @@ Todo:
 - [P1] WIKI-158 global resilience + lifecycle states: first run, backend down, provider auth, update available, notices — coherent first-run path, backend outage != empty vault, persistent sign-in state, all states announce success recovery
 - [P2] WIKI-159 keyboard + dialog accessibility: kanban/dashboard filters/destructive dialog/context menu — keyboard equivalents for drag/double-click, listbox+menu+dialog semantics complete, focus trap+restore, destructive copy describes outcome+recovery
 - [P2] WIKI-160 design-token convergence + shared controls: spacing/radii/motion/icons/shadows, settings+status components — one spacing/radius/motion vocabulary, no dup radius aliases, theme-token shadows, weights cap 600, primitives everywhere (rebase after WIKI-144)
-- [P2] WIKI-164 graph-engineering D3 follow-up: work-graph templates — ~/me/fun/wiki/templates/workgraphs/*.workgraph.tpl.json per ticket kind (roles/models per repo); `wiki graph select-template` picks by ticket-prefix + label; kills hardcoded-model-in-prompt pattern. DEFER trigger-DSL from spec (keep orch logic as code, template just names role+model). Ticket-prefix fallback for repos without labels (WIKI-*/MITMWEB-*/etc). Depends WIKI-162+WIKI-163 (spec: vault/wiki/specs/graph-engineering.md D3)
 - [P2] WIKI-165 graph-engineering D2 follow-up: FleetMonitor graph_health integration — install composite-health detector in backend/app/agent_runtime/fleet_monitor.py (blocking>0 + no live reviewer q5m re-alarm subsuming review-gap; stall>1800s escalation edge target henry + app notification; iteration_count>cap escalation), typed escalation appends through sole writer, one injected clock shared with renderer/health endpoint. Deferred from WIKI-163 round-1 review (spec D2.5)
 - [P3] WIKI-163 LOW follow-up: workgraph crash-test gaps — inject schema-invalid newest orphan (never promoted) + two-crash convergence through successive revisions (from REVIEW5 verdict)
+- phoebe: fix mock.calls[0] assertion bug in use_scratchpad_index.test.ts round-trip tests (rode into #12058 per Henry merge call)
 
 In Progress:
 

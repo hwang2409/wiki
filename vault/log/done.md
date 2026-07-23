@@ -2,13 +2,18 @@
 type: log
 tags: [log, done]
 created: 2026-07-06
-updated: 2026-07-22
+updated: 2026-07-23
 ---
 
 # Done
 
+## 2026-07-23
+
+- WIKI-164 graph-engineering D3 templates + selector merged (#128 squash 43c80b3, 2 rounds — 6 doctrine templates, template schema in wiki graph lint, select-template ticket-prefix resolver w/ repo.implement fallback, trigger-DSL deferred)
+
 ## 2026-07-22
 
+- PHO-14238 merged: admin agent scratchpad frontend vault UI + read-only API (#12058 squash 384a01a5, 8 rounds — contracted artifact route w/ redirect, canonical scope URLs, filter-bar uniformity per Henry screenshot; known residual: 2 new round-trip tests assert mock.calls[0] without clearing, fold fix into next PR touching use_scratchpad_index.test.ts)
 - WIKI-163 graph-engineering D2 workgraph + renderer merged (#127 squash fd92d5f, 5 rounds — canonical-action edge wiring, snapshot-before-hot + orphan reconciliation under per-ticket lock, request-ID replay idempotency keyed by mode, lifespan-drained keyed outbox, injected clock, /agents/<T>/graph live+replay)
 - PHO-14260 merged: haiku-4.5 tier for admin agent mechanical map subagents (#12112 squash cb083488, 5 rounds — prose classifier killed for server-validated mechanical_contract, ~67.3% cost cut on that traffic, cross-provider fallback intact)
 - WIKI-162 graph-engineering D1 schemas + linter merged (#126 squash c06678f, 5 rounds — steer-path Steer validation, nested SHA binding, frozen-sidecar schema bundling + real PyInstaller MCP smoke, per-error required-key pointers)
