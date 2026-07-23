@@ -795,6 +795,66 @@ export function approveAgentPr(ticket: string) {
   });
 }
 
+export type WorkgraphNode = {
+  id: string;
+  kind: string;
+  label: string;
+  worker_id?: string;
+  sha?: string;
+};
+
+export type WorkgraphFinding = {
+  id: string;
+  severity: "BLOCKING" | "HIGH" | "MEDIUM" | "LOW" | "INFO";
+  title: string;
+  file?: string;
+  line?: number;
+  observed?: string;
+  why_wrong?: string;
+  do_instead?: string;
+  source_worker?: string;
+  source_sha?: string;
+  resolved_by?: string | null;
+  created_at?: string;
+};
+
+export type WorkgraphEdge = {
+  kind: string;
+  from: string;
+  to: string;
+  payload?: Record<string, unknown> & { findings?: WorkgraphFinding[]; state?: string };
+  created_at: string;
+};
+
+export type WorkgraphHealth = {
+  state: string;
+  open_findings: number;
+  blocking: number;
+  slowest_node_stall_seconds: number;
+  iteration_count: number;
+};
+
+export type Workgraph = {
+  ticket: string;
+  orch: string;
+  template?: string | null;
+  created_at: string;
+  updated_at: string;
+  nodes: WorkgraphNode[];
+  edges: WorkgraphEdge[];
+  composite_health: WorkgraphHealth;
+};
+
+export type AgentWorkgraphData = {
+  ok: boolean;
+  source: "live" | "snapshot";
+  workgraph: Workgraph;
+};
+
+export function getAgentWorkgraph(ticket: string) {
+  return request<AgentWorkgraphData>(`/api/agents/${encodeURIComponent(ticket)}/workgraph`);
+}
+
 export type ActivityFile = {
   path: string;
   status: string;

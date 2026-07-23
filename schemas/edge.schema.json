@@ -19,7 +19,12 @@
     "from": {"type": "string", "description": "node id"},
     "to": {"type": "string", "description": "node id"},
     "payload": {"type": "object", "description": "kind-specific; see per-kind sub-schemas"},
-    "created_at": {"type": "string", "format": "date-time"}
+    "created_at": {"type": "string", "format": "date-time"},
+    "request_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "exact supervisor request id for this operation; replay dedupe key"
+    }
   },
   "allOf": [
     {

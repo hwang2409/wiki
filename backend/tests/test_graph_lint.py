@@ -106,6 +106,18 @@ class GraphLintTests(unittest.TestCase):
         self.assertTrue(violations)
         self.assertIn("'worker' is a required property", "\n".join(violations))
 
+    def test_edge_level_request_id_is_optional_string(self) -> None:
+        edge = _valid_edge_documents()["steer"]
+        self.assertEqual(graph_lint.validate_document(edge, "edge"), [])
+        edge["request_id"] = "req-1"
+        self.assertEqual(graph_lint.validate_document(edge, "edge"), [])
+        for bad in (7, ""):
+            edge["request_id"] = bad
+            violations = graph_lint.validate_document(edge, "edge")
+            self.assertTrue(
+                any(pointer == "/request_id" for pointer, _ in violations), bad
+            )
+
     def test_each_edge_kind_rejects_each_missing_required_payload_field(self) -> None:
         for kind, required in EDGE_REQUIRED_FIELDS.items():
             for field in required:

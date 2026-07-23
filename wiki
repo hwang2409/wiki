@@ -13,6 +13,9 @@ Hot-path writes with validation, so conventions hold mechanically:
   wiki agent archive <id> --outcome merged|closed|abandoned
   wiki agent watch <ticket> [--json] [--until merge-ready|terminal|merged]
   wiki gate <pr-number> [--expect-sha SHA] [--json]
+  wiki graph append <TICKET> --edge-kind spawn --from N-1 --to N-2 --payload-file /tmp/spawn.json
+  wiki graph health <TICKET> [--cap 8] [--json]
+  wiki graph recover <TICKET>
   wiki log-done "project: summary (links)"
   wiki note new <topic>/<slug> --type til --hook "map hook line" [--title T] [--tags a,b]
   wiki lint
@@ -1302,6 +1305,122 @@ def cmd_graph_lint(args: argparse.Namespace) -> None:
     print(f"{args.path}: valid")
 
 
+def _registry_orch(ticket: str) -> str | None:
+    entry = read_registry().get(ticket)
+    if not isinstance(entry, dict):
+        return None
+    current = entry.get("current")
+    orch = current.get("orch") if isinstance(current, dict) else None
+    return orch if isinstance(orch, str) and orch else None
+
+
+def cmd_graph_append(args: argparse.Namespace) -> None:
+    from backend.app import workgraph
+
+    ticket = args.ticket.strip().upper()
+    if not CLI_TICKET_RE.fullmatch(ticket):
+        fail(f"bad ticket {ticket!r}")
+    payload_path = Path(args.payload_file)
+    try:
+        payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        fail(f"cannot read {payload_path}: {exc}")
+    except ValueError as exc:
+        fail(f"{payload_path} is not valid JSON: {exc}")
+
+    try:
+        graph = workgraph.append_edge(
+            ticket,
+            args.edge_kind,
+            args.from_node,
+            args.to_node,
+            payload,
+            orch=args.orch or _registry_orch(ticket),
+            template=args.template,
+            status_dir=AGENT_STATUS_DIR,
+        )
+    except workgraph.WorkgraphError as exc:
+        fail(str(exc))
+
+    health = graph["composite_health"]
+    snapshot = graph.pop("_snapshot_path", None)
+    if graph.pop("_replayed", False):
+        print(
+            f"{ticket}: {args.edge_kind} {args.from_node}->{args.to_node} matches the "
+            f"newest edge; treated as a retry replay, nothing appended"
+        )
+        return
+    print(
+        f"{ticket}: appended {args.edge_kind} {args.from_node}->{args.to_node} "
+        f"(edge #{len(graph['edges'])})"
+    )
+    print(
+        f"health: state={health['state']} open_findings={health['open_findings']} "
+        f"blocking={health['blocking']} stall={health['slowest_node_stall_seconds']}s "
+        f"iterations={health['iteration_count']}"
+    )
+    print(f"hot: {workgraph.hot_path(ticket, AGENT_STATUS_DIR)}")
+    if snapshot:
+        print(f"snapshot: {snapshot}")
+
+
+def cmd_graph_health(args: argparse.Namespace) -> None:
+    from backend.app import workgraph
+
+    ticket = args.ticket.strip().upper()
+    source = "live"
+    try:
+        graph = workgraph.load_workgraph(ticket, AGENT_STATUS_DIR)
+    except workgraph.WorkgraphCorruptError as exc:
+        print(f"warning: {exc}", file=sys.stderr)
+        graph = None
+    if graph is None:
+        graph = workgraph.load_snapshot(ticket)
+        source = "snapshot"
+    if graph is None:
+        fail(f"no workgraph found for {ticket} (hot or snapshot)")
+    current = workgraph.current_health(graph, iteration_cap=args.cap)
+    health = current["health"]
+    alarms = current["alarms"]
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "ticket": ticket,
+                    "source": source,
+                    "health": health,
+                    "alarms": alarms,
+                    "computed_at": current["computed_at"],
+                },
+                sort_keys=True,
+            )
+        )
+    else:
+        print(
+            f"{ticket} [{source}]: state={health['state']} open_findings={health['open_findings']} "
+            f"blocking={health['blocking']} stall={health['slowest_node_stall_seconds']}s "
+            f"iterations={health['iteration_count']}"
+        )
+        for alarm in alarms:
+            print(f"alarm: {alarm['check']}: {alarm['message']}")
+    raise SystemExit(2 if alarms else 0)
+
+
+def cmd_graph_recover(args: argparse.Namespace) -> None:
+    from backend.app import workgraph
+
+    ticket = args.ticket.strip().upper()
+    if not CLI_TICKET_RE.fullmatch(ticket):
+        fail(f"bad ticket {ticket!r}")
+    try:
+        result = workgraph.recover_from_snapshot(ticket, status_dir=AGENT_STATUS_DIR)
+    except workgraph.WorkgraphError as exc:
+        fail(str(exc))
+    print(f"{ticket}: hot workgraph restored from {result['snapshot']}")
+    if result.get("backup"):
+        print(f"previous hot file preserved at {result['backup']}")
+
+
 def cmd_note_rename(args: argparse.Namespace) -> None:
     old = args.old.removesuffix(".md") + ".md"
     new = args.new.removesuffix(".md") + ".md"
@@ -1684,14 +1803,9 @@ def main() -> None:
     watch.add_argument("--no-retry", action="store_true", help="exit 3 when the backend is unavailable")
     watch.set_defaults(func=cmd_agent_watch)
 
-    gate = sub.add_parser("gate", help="report merge-gate plumbing for one GitHub PR; never merges or reviews (gh 2.37+)")
-    gate.add_argument("pr", help="PR number or URL")
-    gate.add_argument("--repo", help="GitHub OWNER/REPO (defaults to origin remote)")
-    gate.add_argument("--expect-sha", help="required prefix of the PR head SHA")
-    gate.add_argument("--json", action="store_true", help="emit a JSON verdict")
-    gate.set_defaults(func=cmd_gate)
-
-    graph = sub.add_parser("graph", help="validate graph artifacts")
+    graph = sub.add_parser(
+        "graph", help="workgraph operations: append edges, health checks, artifact linting"
+    )
     graph_sub = graph.add_subparsers(dest="graph_command", required=True)
     graph_lint_parser = graph_sub.add_parser("lint", help="validate a graph JSON artifact")
     graph_lint_parser.add_argument("path")
@@ -1700,6 +1814,42 @@ def main() -> None:
         help="schema name or path; otherwise detect from the artifact shape",
     )
     graph_lint_parser.set_defaults(func=cmd_graph_lint)
+    gappend = graph_sub.add_parser(
+        "append",
+        help="append a typed edge (orchestrator is the sole writer; workers never call this)",
+    )
+    gappend.add_argument("ticket")
+    gappend.add_argument("--edge-kind", required=True, choices=[
+        "spawn", "steer", "verdict", "archive", "handoff",
+        "monitor_alarm", "capability_grant", "escalation",
+    ])
+    gappend.add_argument("--from", dest="from_node", required=True, help="source node id, e.g. N-1")
+    gappend.add_argument("--to", dest="to_node", required=True, help="target node id, e.g. N-2")
+    gappend.add_argument("--payload-file", required=True, help="JSON payload validated against the edge-kind schema")
+    gappend.add_argument("--orch", help="orchestrator id when creating a new workgraph (default: registry lookup)")
+    gappend.add_argument("--template", help="workgraph template id recorded on creation")
+    gappend.set_defaults(func=cmd_graph_append)
+    ghealth = graph_sub.add_parser(
+        "health",
+        help="composite-health watchlist checks; exit 2 when any alarm fires",
+    )
+    ghealth.add_argument("ticket")
+    ghealth.add_argument("--cap", type=int, default=8, help="iteration cap (default 8)")
+    ghealth.add_argument("--json", action="store_true")
+    ghealth.set_defaults(func=cmd_graph_health)
+    grecover = graph_sub.add_parser(
+        "recover",
+        help="restore a damaged hot workgraph from its newest ~/.wiki snapshot",
+    )
+    grecover.add_argument("ticket")
+    grecover.set_defaults(func=cmd_graph_recover)
+
+    gate = sub.add_parser("gate", help="report merge-gate plumbing for one GitHub PR; never merges or reviews (gh 2.37+)")
+    gate.add_argument("pr", help="PR number or URL")
+    gate.add_argument("--repo", help="GitHub OWNER/REPO (defaults to origin remote)")
+    gate.add_argument("--expect-sha", help="required prefix of the PR head SHA")
+    gate.add_argument("--json", action="store_true", help="emit a JSON verdict")
+    gate.set_defaults(func=cmd_gate)
 
     lint = sub.add_parser("lint", help="validate vault conventions")
     lint.set_defaults(func=cmd_lint)

@@ -308,6 +308,9 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(main, "MSG_QUEUE_PATH", self.queue_path),
             mock.patch.object(main, "SUPERVISOR_CLIENT", self.client),
             mock.patch.object(main.transcripts, "find_session", return_value=None),
+            # Canonical actions write workgraph snapshots; keep the durable
+            # ~/.wiki store out of test runs.
+            mock.patch.object(main.workgraph, "SNAPSHOT_DIR", self.root / "workgraphs"),
         ]
         for patcher in self.patchers:
             patcher.start()
@@ -1323,6 +1326,9 @@ class BackendSupervisorEndToEndTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(main, "AGENT_TMP_DIR", self.root / "tmp"),
             mock.patch.object(main, "MSG_QUEUE_PATH", self.root / "legacy-queue.json"),
             mock.patch.object(main, "SUPERVISOR_CLIENT", self.client),
+            # Canonical actions write workgraph snapshots; keep the durable
+            # ~/.wiki store out of test runs.
+            mock.patch.object(main.workgraph, "SNAPSHOT_DIR", self.root / "workgraphs"),
         ]
         for patcher in self.patchers:
             patcher.start()
@@ -1476,6 +1482,7 @@ class DetachedHeadlessAcceptanceTests(unittest.TestCase):
             "TMUX_PANE": "",
             "WIKI_AGENT_REGISTRY_PATH": str(self.paths.registry_path),
             "WIKI_AGENT_STATUS_DIR": str(self.status_dir),
+            "WIKI_WORKGRAPH_SNAPSHOT_DIR": str(self.root / "workgraphs"),
             "WIKI_AGENT_ARCHIVE_DIR": str(self.archive_dir),
             "WIKI_AGENT_TMP_DIR": str(self.tmp_dir),
             "WIKI_MSG_QUEUE_PATH": str(self.queue_path),
