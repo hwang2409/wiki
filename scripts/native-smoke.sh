@@ -134,20 +134,11 @@ printf '%s\n' \
 mcp_status=$?
 set -e
 
-for _ in $(seq 1 60); do
-  if [[ -s "$capture_body_file" ]]; then
-    break
-  fi
-  if ! kill -0 "$capture_pid" 2>/dev/null; then
-    break
-  fi
-  sleep 0.1
-done
-if kill -0 "$capture_pid" 2>/dev/null; then
+wait "$capture_pid" 2>/dev/null || true
+if [[ ! -s "$capture_body_file" ]]; then
   echo "packaged MCP steer did not reach the capture backend" >&2
   exit 1
 fi
-wait "$capture_pid" 2>/dev/null || true
 if [[ "$mcp_status" -ne 0 ]]; then
   echo "packaged MCP steer failed:" >&2
   cat "$mcp_output_file" >&2
