@@ -239,6 +239,76 @@ class GraphLintTests(unittest.TestCase):
             {"/orch", "/ticket"},
         )
 
+    def test_template_schema_rejects_each_missing_required_root_field(self) -> None:
+        document = _fixture("workgraph-template.valid.json")
+        required = (
+            "template_id",
+            "applies_to",
+            "roles",
+            "edges",
+            "iteration_cap",
+            "on_failure",
+        )
+        for field in required:
+            with self.subTest(field=field):
+                candidate = copy.deepcopy(document)
+                del candidate[field]
+                violations = graph_lint.validate_document(candidate, "workgraph-template")
+                self.assertTrue(violations)
+                self.assertTrue(any(pointer == f"/{field}" for pointer, _ in violations))
+
+    def test_template_schema_rejects_each_missing_role_field(self) -> None:
+        required = ("kind", "runtime", "model", "effort")
+        for field in required:
+            with self.subTest(field=field):
+                document = _fixture("workgraph-template.valid.json")
+                del document["roles"][0][field]
+                violations = graph_lint.validate_document(document, "workgraph-template")
+                self.assertTrue(any(field in message for _, message in violations))
+
+    def test_template_schema_rejects_each_missing_edge_shape_field(self) -> None:
+        required_by_kind = {
+            "spawn": ("from", "to"),
+            "monitor": ("on",),
+            "verdict": ("from", "to"),
+            "steer": ("from", "to"),
+            "archive": ("from", "to"),
+        }
+        for kind, required in required_by_kind.items():
+            for field in required:
+                with self.subTest(kind=kind, field=field):
+                    document = _fixture("workgraph-template.valid.json")
+                    edge = {"kind": kind, **({"from": "a", "to": "b"} if kind != "monitor" else {"on": "a"})}
+                    del edge[field]
+                    document["edges"] = [edge]
+                    violations = graph_lint.validate_document(document, "workgraph-template")
+                    self.assertTrue(any(pointer == f"/edges/0/{field}" for pointer, _ in violations))
+
+    def test_template_schema_rejects_unexpected_properties(self) -> None:
+        document = _fixture("workgraph-template.valid.json")
+        document["unexpected"] = True
+        document["roles"][0]["unexpected"] = True
+        document["edges"][0]["unexpected"] = True
+        violations = graph_lint.validate_document(document, "workgraph-template")
+        self.assertEqual(
+            {pointer for pointer, _ in violations},
+            {"/", "/roles/0", "/edges/0"},
+        )
+
+    def test_template_files_are_auto_detected(self) -> None:
+        template_paths = sorted((REPO_ROOT / "templates" / "workgraphs").glob("*.json"))
+        self.assertEqual(len(template_paths), 6)
+        for path in template_paths:
+            with self.subTest(path=path.name):
+                self.assertEqual(graph_lint.lint_path(path), [])
+
+    def test_template_shape_is_ambiguous_with_another_graph_shape(self) -> None:
+        document = _fixture("workgraph-template.valid.json")
+        document.update({"ticket": "WIKI-164", "nodes": [], "composite_health": {}})
+        with self.assertRaises(graph_lint.GraphLintError) as context:
+            graph_lint.detect_schema(document)
+        self.assertIn("ambiguous schema shape", str(context.exception))
+
     def test_cli_reports_malformed_json(self) -> None:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as handle:
             handle.write("{not json")

@@ -1,0 +1,22 @@
+{
+  "template_id": "phoebe.implement",
+  "applies_to": {"repo": "phoebe", "labels_any": ["implement"], "labels_none": ["frontend", "migration", "plan"]},
+  "roles": [
+    {"kind": "implement", "runtime": "cdx", "model": "gpt-5.6-luna", "effort": "high"},
+    {"kind": "review", "runtime": "cdx", "model": "gpt-5.6-sol", "effort": "high"}
+  ],
+  "edges": [
+    {"kind": "spawn", "from": "orchestrator", "to": "implement"},
+    {"kind": "monitor", "on": "implement"},
+    {"kind": "spawn", "from": "orchestrator", "to": "review", "trigger": "implement.state == 'merge-ready'"},
+    {"kind": "verdict", "from": "review", "to": "orchestrator"},
+    {"kind": "steer", "from": "orchestrator", "to": "implement", "trigger": "verdict.state != 'MERGE-READY'"},
+    {"kind": "archive", "from": "orchestrator", "to": "review", "trigger": "verdict.routed"}
+  ],
+  "iteration_cap": 8,
+  "on_failure": {
+    "implement_stall_30min": "steer_ping",
+    "review_no_verdict_2h": "replace_review",
+    "iteration_cap_reached": "escalate_to_henry"
+  }
+}

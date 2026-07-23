@@ -9,6 +9,7 @@ Hot-path writes with validation, so conventions hold mechanically:
   wiki agent spawn <ticket> --kind cdx --role implement --model gpt-5.4 --effort high --prompt-file prompt.md --workdir /path
   wiki agent steer <id> --message "text" [--mode now|on-idle]
   wiki graph lint <path> [--schema finding|verdict|steer|edge|workgraph]
+  wiki graph select-template <ticket-id> [--json]  # unknown prefixes exit 2
   wiki agent replace <id> [--kind cc|cdx] [--model model] [--effort effort]
   wiki agent archive <id> --outcome merged|closed|abandoned
   wiki agent watch <ticket> [--json] [--until merge-ready|terminal|merged]
@@ -43,6 +44,7 @@ from uuid import uuid4
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from backend.app import backend_runtime, knowledge, vaultops  # noqa: E402
 from wiki_cli import graph_lint  # noqa: E402
+from wiki_cli import workgraph_templates  # noqa: E402
 
 VAULT = Path(
     os.environ.get("WIKI_VAULT_DIR") or Path(__file__).resolve().parent / "vault"
@@ -1305,6 +1307,32 @@ def cmd_graph_lint(args: argparse.Namespace) -> None:
     print(f"{args.path}: valid")
 
 
+def cmd_graph_select_template(args: argparse.Namespace) -> None:
+    try:
+        selection = workgraph_templates.select_template(
+            args.ticket,
+            labels=args.label,
+        )
+    except workgraph_templates.TemplateSelectionError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+
+    if args.json:
+        print(json.dumps(selection, sort_keys=True))
+        return
+
+    print(f"template: {selection['template_id']}")
+    print(f"repo: {selection['repo']}")
+    print(f"source: {selection['source']}")
+    print("roles:")
+    for role in selection["roles"]:
+        effort = role["effort"] if role["effort"] is not None else "none"
+        print(
+            f"  {role['kind']}: runtime={role['runtime']} "
+            f"model={role['model']} effort={effort}"
+        )
+
+
 def _registry_orch(ticket: str) -> str | None:
     entry = read_registry().get(ticket)
     if not isinstance(entry, dict):
@@ -1814,6 +1842,19 @@ def main() -> None:
         help="schema name or path; otherwise detect from the artifact shape",
     )
     graph_lint_parser.set_defaults(func=cmd_graph_lint)
+    graph_select_parser = graph_sub.add_parser(
+        "select-template",
+        help="select by ticket prefix; labels optional; unknown prefixes exit 2",
+    )
+    graph_select_parser.add_argument("ticket")
+    graph_select_parser.add_argument(
+        "--label",
+        action="append",
+        default=None,
+        help="optional label hint; repeat for multiple labels",
+    )
+    graph_select_parser.add_argument("--json", action="store_true")
+    graph_select_parser.set_defaults(func=cmd_graph_select_template)
     gappend = graph_sub.add_parser(
         "append",
         help="append a typed edge (orchestrator is the sole writer; workers never call this)",

@@ -1,0 +1,27 @@
+{
+  "template_id": "wiki.implement",
+  "applies_to": {
+    "repo": "wiki",
+    "labels_any": ["implement"],
+    "labels_none": ["frontend"]
+  },
+  "roles": [
+    {
+      "kind": "implement",
+      "runtime": "cdx",
+      "model": "gpt-5.6-luna",
+      "effort": "high"
+    }
+  ],
+  "edges": [
+    {"kind": "spawn", "from": "orchestrator", "to": "implement"},
+    {"kind": "monitor", "on": "implement"},
+    {"kind": "verdict", "from": "review", "to": "orchestrator"}
+  ],
+  "iteration_cap": 8,
+  "on_failure": {
+    "implement_stall_30min": "steer_ping",
+    "review_no_verdict_2h": "replace_review",
+    "iteration_cap_reached": "escalate_to_henry"
+  }
+}

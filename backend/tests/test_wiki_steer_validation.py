@@ -82,8 +82,17 @@ class SteerValidationTests(unittest.TestCase):
                 "finding.schema.json",
                 "steer.schema.json",
                 "verdict.schema.json",
+                "workgraph-template.schema.json",
                 "workgraph.schema.json",
             ],
+        )
+        self.assertIn(
+            'WORKGRAPH_TEMPLATE_FILES = sorted(',
+            spec,
+        )
+        self.assertIn(
+            '*((str(path), "templates/workgraphs") for path in WORKGRAPH_TEMPLATE_FILES),',
+            spec,
         )
 
     def test_frozen_native_steer_uses_bundled_schemas_and_sends_once(self) -> None:

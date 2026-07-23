@@ -1,0 +1,12 @@
+{
+  "template_id": "wiki.implement",
+  "applies_to": {"repo": "wiki", "labels_any": [], "labels_none": []},
+  "roles": [],
+  "edges": [],
+  "iteration_cap": 0,
+  "on_failure": {
+    "implement_stall_30min": "",
+    "review_no_verdict_2h": "",
+    "iteration_cap_reached": ""
+  }
+}

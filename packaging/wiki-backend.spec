@@ -14,6 +14,9 @@ FRONTEND_DIST = Path(os.environ.get("WIKI_FRONTEND_DIST", ROOT / "frontend" / "d
 PYINSTALLER_DIST = Path(os.environ.get("WIKI_PYINSTALLER_DIST", ROOT / "dist"))
 LAUNCHER_PATH = PYINSTALLER_DIST / "wiki-backend"
 SCHEMA_FILES = sorted((ROOT / "schemas").glob("*.schema.json"))
+WORKGRAPH_TEMPLATE_FILES = sorted(
+    (ROOT / "templates" / "workgraphs").glob("*.workgraph.tpl.json")
+)
 
 
 def write_onedir_launcher() -> None:
@@ -70,6 +73,7 @@ hiddenimports = (
 datas = [
     (str(FRONTEND_DIST), "frontend_dist"),
     *((str(path), "schemas") for path in SCHEMA_FILES),
+    *((str(path), "templates/workgraphs") for path in WORKGRAPH_TEMPLATE_FILES),
 ]
 
 
