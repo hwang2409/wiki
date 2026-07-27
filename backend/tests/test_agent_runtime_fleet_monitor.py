@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
-from backend.app import workgraph
+from backend.app import workgraph, workgraph_service
 from backend.app.agent_runtime.fake import FixtureAdapterFactory
 from backend.app.agent_runtime.fleet_monitor import FleetMonitor, Notification, _WorkerView
 from backend.app.agent_runtime.store import RunStore, RuntimePaths
@@ -368,32 +368,54 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
             "WIKI-904",
             {"state": "working", "pr": None, "step": "coding", "blocker": None},
         )
-        graph = self._graph(
-            "WIKI-904",
-            edges=[self._graph_edge("spawn", self.clock.now - 1801, to="WIKI-904")],
-        )
-        requests: list[str] = []
-
-        def record_escalation(**payload):
-            requests.append(payload["request_id"])
-            ack = Future()
-            ack.set_result(None)
-            return ack
-
-        with self._patch_graph(graph), mock.patch(
-            "backend.app.workgraph_service.record_escalation",
-            side_effect=record_escalation,
+        snapshot_dir = self.root / "workgraphs"
+        workgraph_service.start_outbox()
+        self.assertTrue(workgraph_service.flush_outbox(timeout=10))
+        with mock.patch.object(workgraph, "SNAPSHOT_DIR", snapshot_dir), mock.patch.object(
+            workgraph, "CLOCK", self.clock
         ):
-            first = await self.monitor.tick()
-            graph["edges"].append(
-                self._graph_edge(
-                    "steer",
-                    self.clock.now,
-                    to="WIKI-904",
-                    payload={"target_worker": "WIKI-904"},
-                )
+            self.clock.advance(-1801)
+            workgraph_service.record_spawn(
+                agent_id="WIKI-904",
+                orch="wiki",
+                role="implement",
+                model="fixture",
+                effort=None,
+                worktree=str(self.worktree),
+                request_id="spawn-WIKI-904",
+                status_dir=self.store.paths.status_dir,
             )
-            await self.monitor.tick()
+            self.assertTrue(workgraph_service.flush_outbox(timeout=10))
+            self.clock.advance(1801)
+
+            first = await self.monitor.tick()
+            first_note = next(
+                note for note in first if note.event_type == "graph-health-stall"
+            )
+            graph = workgraph.load_workgraph("WIKI-904", self.store.paths.status_dir)
+            self.assertIsNotNone(graph)
+            self.assertEqual(
+                [edge["kind"] for edge in graph["edges"]],
+                ["spawn", "escalation"],
+            )
+
+            workgraph_service.record_steer(
+                agent_id="WIKI-904",
+                orch="wiki",
+                mode="now",
+                text="resume after escalation",
+                source="WIKI-ORCH",
+                request_id="steer-WIKI-904-1",
+                status_dir=self.store.paths.status_dir,
+            )
+            self.assertTrue(workgraph_service.flush_outbox(timeout=10))
+            graph = workgraph.load_workgraph("WIKI-904", self.store.paths.status_dir)
+            self.assertIsNotNone(graph)
+            self.assertEqual(
+                [edge["kind"] for edge in graph["edges"]],
+                ["spawn", "escalation", "steer"],
+            )
+
             self.clock.advance(1801)
             restarted = FleetMonitor(
                 self.store,
@@ -406,12 +428,27 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
                 ownership_lock=self.supervisor._agent_lock,  # noqa: SLF001
             )
             second = await restarted.tick()
+            second_note = next(
+                note for note in second if note.event_type == "graph-health-stall"
+            )
+            self.assertTrue(workgraph_service.flush_outbox(timeout=10))
 
-        first_note = next(note for note in first if note.event_type == "graph-health-stall")
-        second_note = next(note for note in second if note.event_type == "graph-health-stall")
-        self.assertNotEqual(first_note.dedupe_key, second_note.dedupe_key)
-        self.assertEqual(len(requests), 2)
-        self.assertNotEqual(requests[0], requests[1])
+            persisted = workgraph.load_workgraph(
+                "WIKI-904", self.store.paths.status_dir
+            )
+            self.assertIsNotNone(persisted)
+            self.assertEqual(
+                [edge["kind"] for edge in persisted["edges"]],
+                ["spawn", "escalation", "steer", "escalation"],
+            )
+            escalation_edges = [
+                edge for edge in persisted["edges"] if edge["kind"] == "escalation"
+            ]
+            self.assertEqual(len(escalation_edges), 2)
+            self.assertNotEqual(
+                escalation_edges[0]["request_id"], escalation_edges[1]["request_id"]
+            )
+            self.assertNotEqual(first_note.dedupe_key, second_note.dedupe_key)
 
     async def test_new_verdict_after_route_is_not_suppressed(self) -> None:
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
