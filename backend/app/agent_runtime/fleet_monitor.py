@@ -14,11 +14,11 @@ import asyncio
 import hashlib
 import json
 import logging
-import time
 import traceback
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -35,11 +35,30 @@ DEFAULT_UNROUTED_VERDICT_REALARM_SECONDS = 300.0
 DEFAULT_REVIEW_GAP_THRESHOLD_SECONDS = 300.0
 DEFAULT_REVIEW_GAP_REALARM_SECONDS = 600.0
 DEFAULT_STALENESS_THRESHOLD_SECONDS = 1800.0
+DEFAULT_GRAPH_HEALTH_REALARM_SECONDS = 300.0
+DEFAULT_REVIEW_ROUTE_SUPPRESSION_SECONDS = 900.0
 DEFAULT_SEND_TIMEOUT_SECONDS = 10.0
 DEFAULT_MAX_CONCURRENT_SENDS = 4
 
 
 logger = logging.getLogger(__name__)
+
+
+def _workgraph_module():
+    """Load graph support lazily so backend-only daemon bundles still boot."""
+
+    from .. import workgraph
+
+    return workgraph
+
+
+def _default_clock() -> float:
+    try:
+        return _workgraph_module().CLOCK()
+    except ModuleNotFoundError:
+        # Historical daemon checkouts may contain only ``backend/`` and not
+        # the graph package. Their fleet monitor still needs a wall clock.
+        return datetime.now(timezone.utc).timestamp()
 
 
 @dataclass
@@ -60,6 +79,15 @@ class _WorkerSnapshot:
     last_review_gap_alarm_at: float | None = None
     staleness_alarmed_mtime: float | None = None
     seeded: bool = False
+
+
+@dataclass
+class _GraphHealthSnapshot:
+    """Alarm state for one ticket-level composite-health scan."""
+
+    last_blocking_no_reviewer_alarm_at: float | None = None
+    stall_alarmed: bool = False
+    iteration_cap_alarmed: bool = False
 
 
 @dataclass
@@ -151,32 +179,38 @@ class FleetMonitor:
         store: RunStore,
         send_now: SendNow,
         *,
-        clock: Callable[[], float] = time.time,
+        clock: Callable[[], float] | None = None,
         monotonic_clock: Callable[[], float] | None = None,
         interval: float = DEFAULT_INTERVAL_SECONDS,
         unrouted_verdict_realarm: float = DEFAULT_UNROUTED_VERDICT_REALARM_SECONDS,
         review_gap_threshold: float = DEFAULT_REVIEW_GAP_THRESHOLD_SECONDS,
         review_gap_realarm: float = DEFAULT_REVIEW_GAP_REALARM_SECONDS,
         staleness_threshold: float = DEFAULT_STALENESS_THRESHOLD_SECONDS,
+        graph_health_realarm: float = DEFAULT_GRAPH_HEALTH_REALARM_SECONDS,
+        review_route_suppression: float = DEFAULT_REVIEW_ROUTE_SUPPRESSION_SECONDS,
         send_timeout: float = DEFAULT_SEND_TIMEOUT_SECONDS,
         max_concurrent_sends: int = DEFAULT_MAX_CONCURRENT_SENDS,
         ownership_lock: Callable[[str], asyncio.Lock] | None = None,
     ):
         self.store = store
         self.send_now = send_now
-        self.wall_clock = clock
-        # Keep the old injected ``clock`` useful for deterministic callers,
-        # while the daemon uses a real monotonic clock for elapsed timers.
-        self.monotonic_clock = (
-            monotonic_clock
-            if monotonic_clock is not None
-            else (time.monotonic if clock is time.time else clock)
-        )
+        # Workgraph, its renderer, and its health endpoint all use
+        # workgraph.CLOCK. Defaulting to that callable keeps the detector on
+        # the same clock; tests can inject one clock into this monitor and
+        # pass the same value to the graph APIs.
+        self.wall_clock = clock or _default_clock
+        self.monotonic_clock = monotonic_clock or self.wall_clock
         self.interval = interval
         self.unrouted_verdict_realarm = unrouted_verdict_realarm
         self.review_gap_threshold = review_gap_threshold
         self.review_gap_realarm = review_gap_realarm
         self.staleness_threshold = staleness_threshold
+        if graph_health_realarm <= 0:
+            raise ValueError("graph_health_realarm must be positive")
+        if review_route_suppression < 0:
+            raise ValueError("review_route_suppression must not be negative")
+        self.graph_health_realarm = graph_health_realarm
+        self.review_route_suppression = review_route_suppression
         if send_timeout <= 0:
             raise ValueError("send_timeout must be positive")
         if max_concurrent_sends < 1:
@@ -186,6 +220,7 @@ class FleetMonitor:
         self.ownership_lock = ownership_lock
         self._instance_id = uuid4().hex[:12]
         self._snapshots: dict[str, _WorkerSnapshot] = {}
+        self._graph_health_snapshots: dict[str, _GraphHealthSnapshot] = {}
         self._sent_dedupe_keys: set[tuple[str, str, str]] = set()
         self._send_semaphores: dict[str, asyncio.Semaphore] = {}
 
@@ -237,6 +272,9 @@ class FleetMonitor:
                 )
                 continue
             notifications.extend(batch)
+        notifications.extend(
+            await self._process_graph_health(views, wall_now)
+        )
         return notifications
 
     def _reconcile_worker_state(self, current_run_ids: dict[str, str]) -> None:
@@ -403,6 +441,219 @@ class FleetMonitor:
         self._snapshots[record.agent_id] = snapshot
         return results
 
+    async def _process_graph_health(
+        self, views: list[_WorkerView], now: float
+    ) -> list[Notification]:
+        """Run the ticket-level ``graph_health`` detector once per ticket."""
+
+        by_ticket: dict[str, _WorkerView] = {}
+        for view in views:
+            ticket = _ticket_prefix(view.record.agent_id)
+            prior = by_ticket.get(ticket)
+            # Prefer the base implement worker: its orchestrator mapping and
+            # notification identity are the canonical ticket-level ones.
+            if prior is None or view.record.agent_id == ticket:
+                by_ticket[ticket] = view
+
+        results: list[Notification] = []
+        for ticket, view in by_ticket.items():
+            graph = self._load_graph(ticket)
+            if graph is None:
+                self._graph_health_snapshots.pop(ticket, None)
+                continue
+            try:
+                result = await self._maybe_graph_health(ticket, view, graph, now)
+            except Exception:
+                logger.exception("fleet_monitor: graph health scan failed for %s", ticket)
+                continue
+            results.extend(result)
+        return results
+
+    def _load_graph(self, ticket: str) -> dict[str, Any] | None:
+        try:
+            graph_module = _workgraph_module()
+            graph = graph_module.load_workgraph(ticket, self.store.paths.status_dir)
+        except ModuleNotFoundError:
+            return None
+        except graph_module.WorkgraphCorruptError as exc:
+            logger.warning("fleet_monitor: ignoring corrupt workgraph for %s: %s", ticket, exc)
+            return None
+        if graph is not None:
+            return graph
+        return graph_module.load_snapshot(ticket)
+
+    @staticmethod
+    def _iteration_cap(graph: dict[str, Any]) -> int:
+        graph_module = _workgraph_module()
+        direct = graph.get("iteration_cap")
+        if isinstance(direct, int) and not isinstance(direct, bool) and direct > 0:
+            return direct
+        template_id = graph.get("template")
+        if isinstance(template_id, str):
+            try:
+                from wiki_cli import workgraph_templates
+
+                template = workgraph_templates.load_templates().get(template_id)
+            except workgraph_templates.TemplateSelectionError:
+                template = None
+            if isinstance(template, dict):
+                cap = template.get("iteration_cap")
+                if isinstance(cap, int) and not isinstance(cap, bool) and cap > 0:
+                    return cap
+        return graph_module.DEFAULT_ITERATION_CAP
+
+    @staticmethod
+    def _review_route_time(graph: dict[str, Any], ticket: str) -> float | None:
+        """Return the latest verdict-to-implement steer timestamp."""
+
+        verdict_seen = False
+        routed_at: float | None = None
+        for edge in graph.get("edges", []):
+            if not isinstance(edge, dict):
+                continue
+            kind = edge.get("kind")
+            if kind == "verdict":
+                verdict_seen = True
+                continue
+            if kind != "steer" or not verdict_seen:
+                continue
+            payload = edge.get("payload")
+            target = payload.get("target_worker") if isinstance(payload, dict) else None
+            if target != ticket and edge.get("to") != ticket:
+                continue
+            timestamp = _workgraph_module()._parse_ts(edge.get("created_at"))  # noqa: SLF001
+            if timestamp is not None:
+                routed_at = timestamp
+        return routed_at
+
+    async def _maybe_graph_health(
+        self,
+        ticket: str,
+        view: _WorkerView,
+        graph: dict[str, Any],
+        now: float,
+    ) -> list[Notification]:
+        graph_module = _workgraph_module()
+        state = self._graph_health_snapshots.setdefault(ticket, _GraphHealthSnapshot())
+        cap = self._iteration_cap(graph)
+        current = graph_module.current_health(graph, iteration_cap=cap, now_ts=now)
+        health = current["health"]
+        alarms = {alarm["check"]: alarm for alarm in current["alarms"]}
+        results: list[Notification] = []
+
+        no_reviewer = "blocking_no_reviewer" in alarms
+        if not no_reviewer:
+            state.last_blocking_no_reviewer_alarm_at = None
+        else:
+            routed_at = self._review_route_time(graph, ticket)
+            suppressed = (
+                routed_at is not None
+                and now - routed_at < self.review_route_suppression
+            )
+            last = state.last_blocking_no_reviewer_alarm_at
+            if not suppressed and (
+                last is None or now - last >= self.graph_health_realarm
+            ):
+                blocking = health.get("blocking", 0)
+                window = int(now // max(self.graph_health_realarm, 1.0))
+                notif = await self._emit(
+                    view,
+                    event_type="graph-health",
+                    message=(
+                        f"[fleet] {ticket}: graph health has {blocking} BLOCKING "
+                        "finding(s) and no live reviewer. Spawn a reviewer or "
+                        "route the review."
+                    ),
+                    dedupe_key=f"fleet:{ticket}:graph-health:blocking-no-reviewer:{window}",
+                )
+                if notif is not None:
+                    state.last_blocking_no_reviewer_alarm_at = now
+                    results.append(notif)
+
+        if "node_stall" not in alarms:
+            state.stall_alarmed = False
+        elif not state.stall_alarmed:
+            stall = health.get("slowest_node_stall_seconds", 0)
+            self._record_escalation(
+                ticket,
+                view,
+                reason=f"node stall exceeded {graph_module.STALL_ALARM_SECONDS}s ({stall}s)",
+                prior_findings=self._open_findings(graph),
+                condition="stall",
+                now=now,
+            )
+            notif = await self._emit(
+                view,
+                event_type="graph-health-stall",
+                message=(
+                    f"[fleet] {ticket}: graph node stalled {stall}s "
+                    f"(> {graph_module.STALL_ALARM_SECONDS}s); escalation sent to Henry."
+                ),
+                dedupe_key=f"fleet:{ticket}:graph-health:stall",
+            )
+            state.stall_alarmed = True
+            if notif is not None:
+                results.append(notif)
+
+        if "iteration_cap" not in alarms:
+            state.iteration_cap_alarmed = False
+        elif not state.iteration_cap_alarmed:
+            iterations = health.get("iteration_count", 0)
+            self._record_escalation(
+                ticket,
+                view,
+                reason=f"iteration count exceeded cap {cap} ({iterations})",
+                prior_findings=self._open_findings(graph),
+                condition="iteration-cap",
+                now=now,
+            )
+            notif = await self._emit(
+                view,
+                event_type="graph-health-iteration-cap",
+                message=(
+                    f"[fleet] {ticket}: iteration count {iterations} exceeds "
+                    f"cap {cap}; escalation sent to Henry."
+                ),
+                dedupe_key=f"fleet:{ticket}:graph-health:iteration-cap",
+            )
+            state.iteration_cap_alarmed = True
+            if notif is not None:
+                results.append(notif)
+        return results
+
+    @staticmethod
+    def _open_findings(graph: dict[str, Any]) -> list[dict[str, Any]]:
+        return [
+            finding
+            for finding in _workgraph_module().collect_findings(graph).values()
+            if not finding.get("resolved_by")
+        ]
+
+    def _record_escalation(
+        self,
+        ticket: str,
+        view: _WorkerView,
+        *,
+        reason: str,
+        prior_findings: list[dict[str, Any]],
+        condition: str,
+        now: float,
+    ) -> None:
+        orch = view.record.orchestrator_id
+        request_id = f"fleet:{ticket}:graph-health:{condition}"
+        from .. import workgraph_service
+
+        workgraph_service.record_escalation(
+            ticket=ticket,
+            orch=orch,
+            reason=reason,
+            prior_findings=prior_findings,
+            target="henry",
+            request_id=request_id,
+            status_dir=self.store.paths.status_dir,
+            now_ts=now,
+        )
+
     def _transition_dedupe_key(
         self,
         view: _WorkerView,
@@ -475,6 +726,11 @@ class FleetMonitor:
     ) -> list[Notification]:
         record = view.record
         if record.role != "implement":
+            return []
+        # Tickets with a workgraph are handled exclusively by graph_health;
+        # retaining this branch only preserves compatibility for pre-D2 runs
+        # that have no graph artifact yet.
+        if self._load_graph(_ticket_prefix(record.agent_id)) is not None:
             return []
         if view.status_state != "merge-ready":
             return []

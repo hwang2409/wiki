@@ -192,6 +192,7 @@ def _record(
     orch: str,
     status_dir: Path | None,
     request_id: str | None = None,
+    now_ts: float | None = None,
 ) -> None:
     def deliver() -> None:
         workgraph.append_edge(
@@ -203,6 +204,7 @@ def _record(
             orch=orch,
             status_dir=status_dir,
             request_id=request_id,
+            now_ts=now_ts,
         )
 
     OUTBOX.submit(ticket, edge_kind, deliver)
@@ -292,4 +294,35 @@ def record_archive(
         payload,
         actor,
         status_dir,
+    )
+
+
+def record_escalation(
+    *,
+    ticket: str,
+    orch: str | None,
+    reason: str,
+    prior_findings: list[dict],
+    target: str,
+    request_id: str | None = None,
+    status_dir: Path | None = None,
+    now_ts: float | None = None,
+) -> None:
+    """Queue a typed monitor escalation through the canonical graph writer."""
+
+    actor = orch or DEFAULT_ACTOR
+    _record(
+        base_ticket(ticket),
+        "escalation",
+        "monitor:fleet",
+        orch_node_id(actor),
+        {
+            "reason": reason,
+            "prior_findings": prior_findings,
+            "target": target,
+        },
+        actor,
+        status_dir,
+        request_id=request_id,
+        now_ts=now_ts,
     )

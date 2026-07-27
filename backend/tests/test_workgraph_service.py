@@ -134,6 +134,35 @@ class ServiceSequenceTests(unittest.TestCase):
         self.assertEqual(graph["orch"], "henry")
         self.assertEqual(graph["nodes"][0]["id"], "orch:henry")
 
+    def test_typed_escalation_is_written_and_lints(self) -> None:
+        workgraph_service.record_spawn(
+            agent_id="WIKI-9",
+            orch="wiki",
+            role="implement",
+            model="gpt-5.6-luna",
+            effort="high",
+            worktree="/tmp/wt",
+            request_id="req-1",
+            status_dir=self.status_dir,
+        )
+        workgraph_service.record_escalation(
+            ticket="WIKI-9",
+            orch="wiki",
+            reason="node stall exceeded 1800s (1901s)",
+            prior_findings=[],
+            target="henry",
+            request_id="fleet:WIKI-9:graph-health:stall",
+            status_dir=self.status_dir,
+        )
+        flush()
+
+        graph = self.load()
+        self.assertEqual(graph_lint.validate_document(graph, "workgraph"), [])
+        escalation = graph["edges"][-1]
+        self.assertEqual(escalation["kind"], "escalation")
+        self.assertEqual(escalation["payload"]["target"], "henry")
+        self.assertEqual(graph_lint.validate_document(escalation, "edge"), [])
+
     def test_append_failure_is_swallowed_and_logged(self) -> None:
         with mock.patch.object(
             workgraph, "append_edge", side_effect=RuntimeError("boom")

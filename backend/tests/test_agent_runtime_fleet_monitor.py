@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
+from backend.app import workgraph
 from backend.app.agent_runtime.fake import FixtureAdapterFactory
 from backend.app.agent_runtime.fleet_monitor import FleetMonitor, Notification
 from backend.app.agent_runtime.store import RunStore, RuntimePaths
@@ -151,6 +152,166 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
             prompt=f"prompt for {agent_id}",
             orchestrator_id=orch,
         )
+
+    def _graph(self, ticket: str, *, edges: list[dict], nodes: list[dict] | None = None) -> dict:
+        return {
+            "ticket": ticket,
+            "orch": "wiki",
+            "template": "wiki.implement",
+            "created_at": "1970-01-01T00:00:00Z",
+            "updated_at": "1970-01-01T00:00:00Z",
+            "nodes": nodes or [{"id": ticket, "kind": "implement", "label": ticket}],
+            "edges": edges,
+            "composite_health": {},
+        }
+
+    def _graph_edge(self, kind: str, created_at: float, **extra: object) -> dict:
+        edge = {
+            "kind": kind,
+            "from": extra.pop("from", "orch:wiki"),
+            "to": extra.pop("to", "WIKI-900"),
+            "payload": extra.pop("payload", {}),
+            "created_at": datetime.fromtimestamp(created_at, timezone.utc).isoformat(),
+        }
+        edge.update(extra)
+        return edge
+
+    def _patch_graph(self, graph: dict):
+        return mock.patch.multiple(
+            workgraph,
+            load_workgraph=mock.Mock(return_value=graph),
+            load_snapshot=mock.Mock(return_value=None),
+        )
+
+    async def test_graph_health_blocking_no_reviewer_realarms_every_five_minutes(self) -> None:
+        orch = await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        await self._spawn("WIKI-900", role="implement", orch="WIKI-ORCH")
+        _write_status(
+            self.store,
+            "WIKI-900",
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+        )
+        graph = self._graph(
+            "WIKI-900",
+            edges=[
+                self._graph_edge(
+                    "verdict",
+                    self.clock.now,
+                    **{
+                        "from": "review",
+                        "to": "orch:wiki",
+                        "payload": {"findings": [{"id": "F-abc123", "severity": "BLOCKING"}]},
+                    },
+                )
+            ],
+        )
+        with self._patch_graph(graph):
+            first = await self.monitor.tick()
+            self.assertEqual([n.event_type for n in first], ["graph-health"])
+            self.assertEqual(first[0].orch_run_id, orch.run_id)
+
+            self.clock.advance(299)
+            self.assertEqual(
+                [n for n in await self.monitor.tick() if n.event_type == "graph-health"],
+                [],
+            )
+            self.clock.advance(1)
+            second = await self.monitor.tick()
+            self.assertEqual(
+                len([n for n in second if n.event_type == "graph-health"]), 1
+            )
+
+    async def test_graph_health_suppresses_alarm_after_verdict_route(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        await self._spawn("WIKI-901", role="implement", orch="WIKI-ORCH")
+        _write_status(
+            self.store,
+            "WIKI-901",
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+        )
+        graph = self._graph(
+            "WIKI-901",
+            edges=[
+                self._graph_edge(
+                    "verdict",
+                    self.clock.now - 1,
+                    **{
+                        "from": "review",
+                        "to": "orch:wiki",
+                        "payload": {"findings": [{"id": "F-abc123", "severity": "BLOCKING"}]},
+                    },
+                ),
+                self._graph_edge(
+                    "steer",
+                    self.clock.now,
+                    to="WIKI-901",
+                    payload={"target_worker": "WIKI-901"},
+                ),
+            ],
+        )
+        with self._patch_graph(graph):
+            self.assertEqual(
+                [n for n in await self.monitor.tick() if n.event_type == "graph-health"],
+                [],
+            )
+            self.clock.advance(899)
+            self.assertEqual(
+                [n for n in await self.monitor.tick() if n.event_type == "graph-health"],
+                [],
+            )
+            self.clock.advance(1)
+            self.assertEqual(
+                len([n for n in await self.monitor.tick() if n.event_type == "graph-health"]),
+                1,
+            )
+
+    async def test_graph_health_escalations_notify_and_use_typed_writer(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        await self._spawn("WIKI-902", role="implement", orch="WIKI-ORCH")
+        _write_status(
+            self.store,
+            "WIKI-902",
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+        )
+        old = self.clock.now - 1801
+        nodes = [{"id": "WIKI-902", "kind": "implement", "label": "WIKI-902"}]
+        graph = self._graph(
+            "WIKI-902",
+            nodes=nodes,
+            edges=[self._graph_edge("spawn", old, to="WIKI-902")]
+            + [
+                self._graph_edge(
+                    "verdict",
+                    old + index,
+                    **{
+                        "from": "review",
+                        "to": "orch:wiki",
+                        "payload": {"findings": [], "sha": f"abc123{index}"},
+                    },
+                )
+                for index in range(9)
+            ],
+        )
+        escalations: list[dict] = []
+
+        def record_escalation(**payload):
+            escalations.append(payload)
+
+        with self._patch_graph(graph), mock.patch(
+            "backend.app.workgraph_service.record_escalation",
+            side_effect=record_escalation,
+        ):
+            notes = await self.monitor.tick()
+
+        self.assertEqual(
+            {note.event_type for note in notes},
+            {"graph-health-stall", "graph-health-iteration-cap"},
+        )
+        self.assertEqual({entry["target"] for entry in escalations}, {"henry"})
+        self.assertEqual({entry["reason"] for entry in escalations}, {
+            "node stall exceeded 1800s (1801s)",
+            "iteration count exceeded cap 8 (9)",
+        })
 
     async def test_status_file_transition_emits_one_message(self) -> None:
         orch = await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
