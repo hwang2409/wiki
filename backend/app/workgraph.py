@@ -549,11 +549,11 @@ def _orphan_snapshot_graph(
     Promotion requires the hot edge list to be a strict prefix of the
     snapshot's (the only shape the crash window can produce; a missing hot
     file counts as the empty prefix) and the snapshot to be schema-valid.
-    Candidates are checked in descending revision order, so an invalid newer
-    file cannot hide an older valid orphan. Anything else — equal/older
-    snapshots (the normal state), unreadable or invalid files (nothing
-    recoverable to promote), divergent histories — returns ``None`` and the
-    hot graph stays authoritative.
+    Candidates are checked in descending revision order, so an unreadable or
+    invalid newer file cannot hide an older valid orphan. The first
+    schema-valid candidate decides the outcome: it is promoted only when it
+    strictly extends hot with the same prefix; equal or divergent history
+    returns ``None`` and leaves hot authoritative.
     """
     hot_edges = hot_graph.get("edges", []) if hot_graph is not None else []
     if not isinstance(hot_edges, list):
@@ -567,7 +567,8 @@ def _orphan_snapshot_graph(
                 candidates.append((key, path))
 
     # A damaged newest orphan must not hide an older valid orphan. Scan in
-    # commit order and validate each candidate before considering promotion.
+    # commit order, skipping only unreadable or invalid candidates. Once a
+    # valid candidate is found, its relationship to hot is authoritative.
     for _key, path in sorted(candidates, reverse=True):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -575,17 +576,17 @@ def _orphan_snapshot_graph(
             continue
         if not isinstance(data, dict):
             continue
-        snapshot_edges = data.get("edges")
-        if not isinstance(snapshot_edges, list) or not snapshot_edges:
-            continue
-        if len(snapshot_edges) <= len(hot_edges):
-            continue
-        if snapshot_edges[: len(hot_edges)] != hot_edges:
-            continue
         try:
             _validate(data, "workgraph", f"orphan snapshot {path.name}")
         except WorkgraphError:
             continue
+        snapshot_edges = data.get("edges")
+        if not isinstance(snapshot_edges, list) or not snapshot_edges:
+            return None
+        if len(snapshot_edges) <= len(hot_edges):
+            return None
+        if snapshot_edges[: len(hot_edges)] != hot_edges:
+            return None
         return data
     return None
 

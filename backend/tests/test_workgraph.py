@@ -537,6 +537,63 @@ class CommitOrderingTests(unittest.TestCase):
         self.assertEqual(hot_graph["edges"], graph["edges"])
         self.assertIn("nodes", hot_graph)
 
+    def test_valid_divergent_newest_orphan_does_not_promote_older_history(self) -> None:
+        self.append("spawn", "N-1", "N-2", spawn_payload(), BASE_TS, orch="wiki")
+        self.crash_after_snapshot_rename(
+            "verdict", "N-3", "N-1", verdict_payload(), BASE_TS + 60
+        )
+
+        valid_orphan = workgraph.newest_snapshot_path("TST-1", self.snapshot_dir)
+        valid_graph = json.loads(valid_orphan.read_text(encoding="utf-8"))
+        divergent_graph = {
+            **valid_graph,
+            "edges": [
+                valid_graph["edges"][0],
+                {
+                    "kind": "archive",
+                    "from": "N-1",
+                    "to": "N-2",
+                    "payload": archive_payload(),
+                    "created_at": "2026-07-22T12:01:30Z",
+                },
+            ],
+        }
+        divergent_orphan = self.snapshot_dir / (
+            "TST-1-r3-1784700090000000000-999999-0.workgraph.json"
+        )
+        divergent_orphan.write_text(json.dumps(divergent_graph), encoding="utf-8")
+
+        graph = self.append("archive", "N-1", "N-2", archive_payload(), BASE_TS + 120)
+
+        self.assertEqual([e["kind"] for e in graph["edges"]], ["spawn", "archive"])
+        hot_graph = json.loads(self.hot().read_text(encoding="utf-8"))
+        self.assertEqual([e["kind"] for e in hot_graph["edges"]], ["spawn", "archive"])
+
+    def test_normal_append_reads_only_newest_snapshot(self) -> None:
+        for index in range(100):
+            self.append(
+                "spawn",
+                "N-1",
+                f"N-{index + 10}",
+                {**spawn_payload(), "request_id": f"req-{index}"},
+                BASE_TS + index,
+                orch="wiki" if index == 0 else None,
+            )
+
+        original_read_text = Path.read_text
+        snapshot_reads = 0
+
+        def counting_read(path_self: Path, *args, **kwargs):
+            nonlocal snapshot_reads
+            if path_self.parent == self.snapshot_dir:
+                snapshot_reads += 1
+            return original_read_text(path_self, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", counting_read):
+            self.append("steer", "N-1", "N-10", steer_payload(), BASE_TS + 200)
+
+        self.assertEqual(snapshot_reads, 1)
+
     def test_two_crashes_converge_through_successive_revisions(self) -> None:
         self.append("spawn", "N-1", "N-2", spawn_payload(), BASE_TS, orch="wiki")
         self.crash_after_snapshot_rename(
