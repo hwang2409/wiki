@@ -1029,6 +1029,16 @@ def read_agent_status(ticket: str) -> dict | None:
         return None
 
 
+def _agent_status_paths() -> Iterator[Path]:
+    """Yield worker status files, excluding workgraph sidecars."""
+    if not AGENT_STATUS_DIR.is_dir():
+        return
+    for path in sorted(AGENT_STATUS_DIR.glob("*.json")):
+        if path.name.endswith(".workgraph.json"):
+            continue
+        yield path
+
+
 ViewedEntry = dict[str, Any]  # {"seq": int, "at": str}
 
 
@@ -1743,7 +1753,7 @@ def agents() -> dict[str, object]:
 
     # Status files without a registry entry — skill drift, surface flagged.
     if AGENT_STATUS_DIR.is_dir():
-        for path in sorted(AGENT_STATUS_DIR.glob("*.json")):
+        for path in _agent_status_paths():
             ticket = path.stem
             if ticket in seen_tickets:
                 continue
@@ -1896,11 +1906,10 @@ def dashboard_tickets() -> dict[str, object]:
     except (OSError, ValueError):
         pass
     statuses: dict[str, dict] = {}
-    if AGENT_STATUS_DIR.is_dir():
-        for path in sorted(AGENT_STATUS_DIR.glob("*.json")):
-            status = read_agent_status(path.stem)
-            if status:
-                statuses[path.stem] = status
+    for path in _agent_status_paths():
+        status = read_agent_status(path.stem)
+        if status:
+            statuses[path.stem] = status
     return dashboard.build_payload(
         registry, statuses, list_archived(limit=None, latest_per_ticket=True)
     )
@@ -4387,8 +4396,7 @@ def vault_snapshot() -> dict[str, float]:
     extras = [git_dir / "HEAD", git_dir / "packed-refs", *(git_dir / "refs" / "heads").glob("*")]
     # Agent state: registry + per-ticket status files.
     extras.append(AGENT_REGISTRY_PATH)
-    if AGENT_STATUS_DIR.is_dir():
-        extras.extend(AGENT_STATUS_DIR.glob("*.json"))
+    extras.extend(_agent_status_paths())
     for candidate in extras:
         try:
             snapshot[str(candidate)] = candidate.stat().st_mtime

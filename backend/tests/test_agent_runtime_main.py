@@ -625,6 +625,46 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(log["path"], str(self.raw))
         self.assertIn("turn/started", log["tail"])
 
+    async def test_workgraph_sidecars_are_excluded_from_agent_status_scans(self) -> None:
+        status_path = self.status_dir / "WIKI-166.json"
+        workgraph_path = self.status_dir / "WIKI-166.workgraph.json"
+        lock_path = self.status_dir / "WIKI-166.workgraph.lock"
+        status_path.write_text(
+            json.dumps(
+                {
+                    "state": "working",
+                    "pr": None,
+                    "step": "testing status scans",
+                    "blocker": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        workgraph_path.write_text(
+            json.dumps({"ticket": "WIKI-166", "edges": []}),
+            encoding="utf-8",
+        )
+        lock_path.touch()
+
+        payload = main.agents()
+        snapshot = main.vault_snapshot()
+        with mock.patch.object(
+            main,
+            "read_agent_status",
+            wraps=main.read_agent_status,
+        ) as read_status:
+            main.dashboard_tickets()
+
+        workers = cast(list[dict[str, Any]], payload["workers"])
+        self.assertEqual([worker["ticket"] for worker in workers], ["WIKI-166"])
+        self.assertIn(str(status_path), snapshot)
+        self.assertNotIn(str(workgraph_path), snapshot)
+        self.assertNotIn(str(lock_path), snapshot)
+        self.assertEqual(
+            [call.args[0] for call in read_status.call_args_list],
+            ["WIKI-166"],
+        )
+
     async def test_agents_fast_lane_never_waits_for_a_slow_supervisor(self) -> None:
         self._seed_headless()
 
