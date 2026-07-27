@@ -3,12 +3,13 @@ type: reference
 view: kanban
 tags: [todo]
 created: 2026-07-06
-updated: 2026-07-23
+updated: 2026-07-27
 ---
 
 Todo:
 
-- [P2] wiki: compact mermaid artifact preview illegible for large diagrams — styles.css:6684 caps svg at 400px, scale-to-fit squeezes text to ~3px; fix = crop + click-to-inspect or min-scale floor (pan/zoom detail exists). File as WIKI ticket when Linear reauthed
+- [P2] WIKI-167 compact mermaid artifact preview illegible for large diagrams — styles.css:6684 caps svg at 400px, scale-to-fit squeezes text to ~3px; fix = crop + click-to-inspect or min-scale floor (pan/zoom detail exists)
+- [P3] WIKI-168 daemon-ize wiki backend — open since graph-engineering D2; survive terminal close, launchd or equivalent
 - [P2] PHO-13800 customer_churned_date timing unreliable (19/29 in one entry window; zero churns Jan-Apr) — backfill true dates or document entry-date semantic; related PHO-13735
 - [P2] PHO-13763 PARKED by Henry 2026-07-15: PR 11383 drafted at 909ef288ce, gate-passed (CI green, 0 threads, sol REVIEW4 merge-ready), worker archived — resume = un-draft, re-verify freshness vs main, merge
 - [P3] WIKI-126: surface rebrand — rename app-facing identity only (app display name, window title, README header); NAME NOT YET CHOSEN by Henry, blocked until he picks. Internal identifiers stay (repo, wiki CLI, WIKI-* tickets, MCP names, vault paths — codename doctrine, Henry 2026-07-15)
@@ -20,10 +21,7 @@ Todo:
 - Slack admin agent access for Corey Grissom — confirm with Corey his @phoebe.work email + provisioning plan, then either (a) have him sign into app.phoebe.work with @phoebe.work Google Workspace so Kratos provisions the user row + flip admin=true, or (b) one-time hotfix INSERT app.users row + backfill org_slack_user_mappings.user_id for slack_user_id U0AGES89BLZ (2 org rows: Phoebe Home Care + Orchard St. Homecare, both currently user_id=null). Root cause: no app.users row exists at all — his Slack identity is known but unmapped. Full diagnostic + proposed SQL in phoebe session 2026-07-17.
 - [P1] PHO-14029 prod dedupe backfill (bun run people:dedupe-backfill --write) + PHO-14033 unique index migration on people(lower(email)) — EOD 2026-07-22
 - [P2] WIKI-144 badge sweep: audit + unify status badges across dashboard, session-header, artifact-list — reuse WIKI-143 design tokens; remove redundant variants, consistent color/weight/shape
-- [P2] WIKI-146 command palette (Cmd-K): fuzzy search across sessions/tickets/artifacts/vault notes; keyboard-first modal, results ranked by recency+match; opens artifact/session/note on Enter
-- [P2] WIKI-147 session-list unread dot: left-edge dot on sessions with events since last-viewed_at; per-session last_viewed_at persisted (backend + frontend); clears on session open
 - [P2] WIKI-149 code-block copy button + diff artifact kind: hover copy on ``` blocks; new artifact renderer syntax-colors +/- with hunk headers; register kind:diff in artifact router
-- [P1] WIKI-150 polish census: audit every visible Wiki.app surface (panel/header/modal/empty/loading/error state), rate polish 1-5, catalog copy leakage + micro-inconsistency + dev cruft; census doc in vault/wiki/polish-census.md fans out into 8-12 small polish tickets
 - [P1] WIKI-152 agent-session chrome: header, provider inspector, action-required card, composer help, footer/status rail — kill 'Provider stream', raw/normalized counts, request IDs, Unknown 0, format/token telemetry, tmux punctuation from default chrome; diagnostics in Run details (depends WIKI-148)
 - [P1] WIKI-154 runs management productization: Agents page/cards/banners/actions/session preview/spawn+replace dialogs — Active/History hierarchy, decision-relevant fields only, IDs/tmux/log-paths in Technical details, provider/auth notices state user impact + next action
 - [P1] WIKI-155 session + dashboard state completeness: explicit zero-event/working/error variants with recovery, dashboard table skeleton, both empty variants contextual, last-good content survives refresh failure
@@ -31,9 +29,8 @@ Todo:
 - [P1] WIKI-158 global resilience + lifecycle states: first run, backend down, provider auth, update available, notices — coherent first-run path, backend outage != empty vault, persistent sign-in state, all states announce success recovery
 - [P2] WIKI-159 keyboard + dialog accessibility: kanban/dashboard filters/destructive dialog/context menu — keyboard equivalents for drag/double-click, listbox+menu+dialog semantics complete, focus trap+restore, destructive copy describes outcome+recovery
 - [P2] WIKI-160 design-token convergence + shared controls: spacing/radii/motion/icons/shadows, settings+status components — one spacing/radius/motion vocabulary, no dup radius aliases, theme-token shadows, weights cap 600, primitives everywhere (rebase after WIKI-144)
-- [P2] WIKI-165 graph-engineering D2 follow-up: FleetMonitor graph_health integration — install composite-health detector in backend/app/agent_runtime/fleet_monitor.py (blocking>0 + no live reviewer q5m re-alarm subsuming review-gap; stall>1800s escalation edge target henry + app notification; iteration_count>cap escalation), typed escalation appends through sole writer, one injected clock shared with renderer/health endpoint. Deferred from WIKI-163 round-1 review (spec D2.5)
-- [P3] WIKI-163 LOW follow-up: workgraph crash-test gaps — inject schema-invalid newest orphan (never promoted) + two-crash convergence through successive revisions (from REVIEW5 verdict)
 - phoebe: fix mock.calls[0] assertion bug in use_scratchpad_index.test.ts round-trip tests (rode into #12058 per Henry merge call)
+- [P3] wiki backend: 2 pre-existing auth-dead timing tests fail on hosts with uptime <3600s (monotonic threshold; found by WIKI-166 REVIEW1 full-suite run 07-27) — make uptime-independent or skip-guard
 
 In Progress:
 

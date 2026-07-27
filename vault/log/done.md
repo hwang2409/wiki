@@ -2,13 +2,28 @@
 type: log
 tags: [log, done]
 created: 2026-07-06
-updated: 2026-07-23
+updated: 2026-07-27
 ---
 
 # Done
 
+## 2026-07-27
+
+- WIKI-165 merged 137bd45 — FleetMonitor graph_health integration (composite-health detector, typed escalation appends, snapshot fallback, durable episode markers, centralized role normalization); extracted graph_health.py + ticket.py modules; canonical end-to-end restart regression. 4 review rounds.
+- WIKI-163-P3 merged 977bd6b — divergent-newest orphan test now load-bearing (spawn request_id differs from hot), bounded-read + invalid-orphan fallback + two-crash convergence tests added; 3 review rounds
+- phoebe PR #12483 merged: conversation search relevance ranking fix (PHO-14590, luna worker, 2 sol review rounds)
+- phoebe PR #12482 merged: admin agent dock chat transcript scroll root-cause fix (DOCKSCROLL-1, fable-5 worker, sol gate clean)
+- **wiki** — WIKI-166 workgraph sidecars excluded from agent listings — phantom-worker fix ([#129](https://github.com/hwang2409/wiki/pull/129) merged ee887fe, 1 clean sol round, mutation-verified regression test)
+
+## 2026-07-24
+
+- PHO-14367 merged: accounts page IA overhaul — KPI tiles, 6 tabs, progressive disclosure, attio/granola meetings + linear tickets surfaces w/ bounded minimized reads, org-tz dates (#12186 squash bf57d589, 3 rounds, stacked on 14248 then unwound)
+
 ## 2026-07-23
 
+- PHO-14248 merged: agent-first chip integration (org + agent_trace chips w/ structured facts, causal preload hints, accounts context provider w/ bounded summary + lazy sections, read-back revalidation) + PHO-14242 accounts rework fold-in (#12173 squash 0ff93712, 4 rounds)
+- PHO-14247 merged: agent-first admin dock shell + Linear-style footer (#12066 squash 7c7e1743, 11 review rounds + Henry-directed fable footer redesign, variant A — dock/tabs/chips/persistence, activity-ordered footer previews, full race-regression package, screenshots-on-PR flow)
+- PHO-14250 merged: agent-first admin chat-vs-page skill doctrine + golden evals (#12103 squash ab016a66, 5 rounds — honest Linear fixtures via production result model, Henry-approved user_overrode audit field, un-droppable baseline preload, exact caregiver deep links)
 - WIKI-164 graph-engineering D3 templates + selector merged (#128 squash 43c80b3, 2 rounds — 6 doctrine templates, template schema in wiki graph lint, select-template ticket-prefix resolver w/ repo.implement fallback, trigger-DSL deferred)
 
 ## 2026-07-22
