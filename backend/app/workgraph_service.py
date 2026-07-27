@@ -20,8 +20,8 @@ synchronous; only the backend service path is asynchronous.
 from __future__ import annotations
 
 import logging
-import re
 import threading
+from concurrent.futures import Future
 from collections import deque
 from pathlib import Path
 from typing import Callable
@@ -30,21 +30,13 @@ from uuid import uuid4
 from wiki_cli import graph_lint
 
 from . import workgraph
+from .agent_runtime.ticket import base_ticket
 
 log = logging.getLogger("wiki.workgraph")
-
-# Worker agent ids extend the base ticket with a role suffix
-# (WIKI-163-REVIEW1, PHO-14060-PLAN2, ...); the workgraph lives on the base
-# ticket so all of a ticket's agents share one graph.
-_ROLE_SUFFIX = re.compile(r"-(?:REVIEW|PLAN|SIM)\d*$", re.IGNORECASE)
 
 # Fallback orchestrator identity for actions taken directly by Henry in the
 # app UI, where no orchestrator id accompanies the request.
 DEFAULT_ACTOR = "henry"
-
-
-def base_ticket(agent_id: str) -> str:
-    return _ROLE_SUFFIX.sub("", agent_id)
 
 
 def orch_node_id(orch: str) -> str:
@@ -68,7 +60,9 @@ class _TelemetryOutbox:
 
     def __init__(self, max_pending: int = 256) -> None:
         self._cond = threading.Condition()
-        self._queues: dict[str, deque[tuple[str, Callable[[], None]]]] = {}
+        self._queues: dict[
+            str, deque[tuple[str, Callable[[], None], Future[None] | None]]
+        ] = {}
         self._active: set[str] = set()  # tickets with a live drain thread
         self._delivering: dict[str, str] = {}  # ticket -> edge kind in flight
         self._pending = 0
@@ -79,7 +73,14 @@ class _TelemetryOutbox:
         with self._cond:
             self._closed = False
 
-    def submit(self, ticket: str, edge_kind: str, deliver: Callable[[], None]) -> bool:
+    def submit(
+        self,
+        ticket: str,
+        edge_kind: str,
+        deliver: Callable[[], None],
+        *,
+        ack: Future[None] | None = None,
+    ) -> bool:
         with self._cond:
             if self._closed:
                 log.error(
@@ -88,6 +89,8 @@ class _TelemetryOutbox:
                     edge_kind,
                     ticket,
                 )
+                if ack is not None:
+                    ack.set_exception(RuntimeError("workgraph outbox is stopped"))
                 return False
             if self._pending >= self._max_pending:
                 log.error(
@@ -96,8 +99,10 @@ class _TelemetryOutbox:
                     edge_kind,
                     ticket,
                 )
+                if ack is not None:
+                    ack.set_exception(RuntimeError("workgraph outbox is full"))
                 return False
-            self._queues.setdefault(ticket, deque()).append((edge_kind, deliver))
+            self._queues.setdefault(ticket, deque()).append((edge_kind, deliver, ack))
             self._pending += 1
             if ticket not in self._active:
                 self._active.add(ticket)
@@ -118,11 +123,15 @@ class _TelemetryOutbox:
                     self._active.discard(ticket)
                     self._cond.notify_all()
                     return
-                edge_kind, deliver = ticket_queue.popleft()
+                edge_kind, deliver, ack = ticket_queue.popleft()
                 self._delivering[ticket] = edge_kind
             try:
                 deliver()
-            except Exception:
+                if ack is not None:
+                    ack.set_result(None)
+            except Exception as exc:
+                if ack is not None:
+                    ack.set_exception(exc)
                 log.exception(
                     "workgraph %s append failed for %s (the agent action itself succeeded)",
                     edge_kind,
@@ -147,12 +156,14 @@ class _TelemetryOutbox:
             return True
         with self._cond:
             for ticket, ticket_queue in self._queues.items():
-                for edge_kind, _deliver in ticket_queue:
+                for edge_kind, _deliver, ack in ticket_queue:
                     log.error(
                         "workgraph outbox shutdown: undelivered %s edge for %s",
                         edge_kind,
                         ticket,
                     )
+                    if ack is not None:
+                        ack.set_exception(RuntimeError("workgraph outbox stopped"))
             for ticket, edge_kind in self._delivering.items():
                 log.error(
                     "workgraph outbox shutdown: %s edge for %s still delivering "
@@ -192,7 +203,11 @@ def _record(
     orch: str,
     status_dir: Path | None,
     request_id: str | None = None,
-) -> None:
+    now_ts: float | None = None,
+    wait_for_delivery: bool = False,
+) -> Future[None] | None:
+    ack: Future[None] | None = Future() if wait_for_delivery else None
+
     def deliver() -> None:
         workgraph.append_edge(
             ticket,
@@ -203,9 +218,11 @@ def _record(
             orch=orch,
             status_dir=status_dir,
             request_id=request_id,
+            now_ts=now_ts,
         )
 
-    OUTBOX.submit(ticket, edge_kind, deliver)
+    OUTBOX.submit(ticket, edge_kind, deliver, ack=ack)
+    return ack
 
 
 def record_spawn(
@@ -292,4 +309,37 @@ def record_archive(
         payload,
         actor,
         status_dir,
+    )
+
+
+def record_escalation(
+    *,
+    ticket: str,
+    orch: str | None,
+    reason: str,
+    prior_findings: list[dict],
+    target: str,
+    request_id: str | None = None,
+    status_dir: Path | None = None,
+    now_ts: float | None = None,
+    wait_for_delivery: bool = False,
+) -> Future[None] | None:
+    """Queue a typed monitor escalation through the canonical graph writer."""
+
+    actor = orch or DEFAULT_ACTOR
+    return _record(
+        base_ticket(ticket),
+        "escalation",
+        "monitor:fleet",
+        orch_node_id(actor),
+        {
+            "reason": reason,
+            "prior_findings": prior_findings,
+            "target": target,
+        },
+        actor,
+        status_dir,
+        request_id=request_id,
+        now_ts=now_ts,
+        wait_for_delivery=wait_for_delivery,
     )

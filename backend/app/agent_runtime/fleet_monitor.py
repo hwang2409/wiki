@@ -2,7 +2,7 @@
 
 Watches every live worker and pushes state-transition notifications to the
 owning orchestrator session via ``send_now``. Also fires the fleet-doctrine
-re-alarms (unrouted verdict, review-gap, staleness). Transition dedupe is
+re-alarms (unrouted verdict and staleness). Transition dedupe is
 per-run and per-occurrence, with a stable retry token passed to ``send_now``;
 supervisor restarts intentionally clear that memory (the ticket accepts
 re-emitting as a tradeoff).
@@ -14,7 +14,6 @@ import asyncio
 import hashlib
 import json
 import logging
-import time
 import traceback
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -23,6 +22,8 @@ from typing import Any
 from uuid import uuid4
 
 from .store import RunStore
+from .graph_health import GraphHealthMonitor, default_clock
+from .ticket import base_ticket
 from .types import LifecycleState, RunRecord, TERMINAL_STATES
 
 
@@ -35,6 +36,8 @@ DEFAULT_UNROUTED_VERDICT_REALARM_SECONDS = 300.0
 DEFAULT_REVIEW_GAP_THRESHOLD_SECONDS = 300.0
 DEFAULT_REVIEW_GAP_REALARM_SECONDS = 600.0
 DEFAULT_STALENESS_THRESHOLD_SECONDS = 1800.0
+DEFAULT_GRAPH_HEALTH_REALARM_SECONDS = 300.0
+DEFAULT_REVIEW_ROUTE_SUPPRESSION_SECONDS = 900.0
 DEFAULT_SEND_TIMEOUT_SECONDS = 10.0
 DEFAULT_MAX_CONCURRENT_SENDS = 4
 
@@ -55,9 +58,7 @@ class _WorkerSnapshot:
     pending_runtime_state: LifecycleState | None = None
     pending_runtime_dedupe_key: str | None = None
     runtime_occurrence: int = 0
-    merge_ready_since: float | None = None
     last_unrouted_verdict_alarm_at: float | None = None
-    last_review_gap_alarm_at: float | None = None
     staleness_alarmed_mtime: float | None = None
     seeded: bool = False
 
@@ -112,16 +113,6 @@ def _string_or_none(value: Any) -> str | None:
     return None
 
 
-def _ticket_prefix(agent_id: str) -> str:
-    """Trim -REVIEW*/-SIM*/-PLAN* siblings back to the base ticket id."""
-
-    for suffix in ("-REVIEW", "-SIM", "-PLAN", "-AUDIT", "-CANARY", "-THERMO", "-EVAL"):
-        marker = agent_id.find(suffix)
-        if marker != -1:
-            return agent_id[:marker]
-    return agent_id
-
-
 class FleetMonitor:
     """Poll live workers, dispatch state-transition notifications to their orchestrators.
 
@@ -151,32 +142,38 @@ class FleetMonitor:
         store: RunStore,
         send_now: SendNow,
         *,
-        clock: Callable[[], float] = time.time,
+        clock: Callable[[], float] | None = None,
         monotonic_clock: Callable[[], float] | None = None,
         interval: float = DEFAULT_INTERVAL_SECONDS,
         unrouted_verdict_realarm: float = DEFAULT_UNROUTED_VERDICT_REALARM_SECONDS,
         review_gap_threshold: float = DEFAULT_REVIEW_GAP_THRESHOLD_SECONDS,
         review_gap_realarm: float = DEFAULT_REVIEW_GAP_REALARM_SECONDS,
         staleness_threshold: float = DEFAULT_STALENESS_THRESHOLD_SECONDS,
+        graph_health_realarm: float = DEFAULT_GRAPH_HEALTH_REALARM_SECONDS,
+        review_route_suppression: float = DEFAULT_REVIEW_ROUTE_SUPPRESSION_SECONDS,
         send_timeout: float = DEFAULT_SEND_TIMEOUT_SECONDS,
         max_concurrent_sends: int = DEFAULT_MAX_CONCURRENT_SENDS,
         ownership_lock: Callable[[str], asyncio.Lock] | None = None,
     ):
         self.store = store
         self.send_now = send_now
-        self.wall_clock = clock
-        # Keep the old injected ``clock`` useful for deterministic callers,
-        # while the daemon uses a real monotonic clock for elapsed timers.
-        self.monotonic_clock = (
-            monotonic_clock
-            if monotonic_clock is not None
-            else (time.monotonic if clock is time.time else clock)
-        )
+        # Workgraph, its renderer, and its health endpoint all use
+        # workgraph.CLOCK. Defaulting to that callable keeps the detector on
+        # the same clock; tests can inject one clock into this monitor and
+        # pass the same value to the graph APIs.
+        self.wall_clock = clock or default_clock
+        self.monotonic_clock = monotonic_clock or self.wall_clock
         self.interval = interval
         self.unrouted_verdict_realarm = unrouted_verdict_realarm
         self.review_gap_threshold = review_gap_threshold
         self.review_gap_realarm = review_gap_realarm
         self.staleness_threshold = staleness_threshold
+        if graph_health_realarm <= 0:
+            raise ValueError("graph_health_realarm must be positive")
+        if review_route_suppression < 0:
+            raise ValueError("review_route_suppression must not be negative")
+        self.graph_health_realarm = graph_health_realarm
+        self.review_route_suppression = review_route_suppression
         if send_timeout <= 0:
             raise ValueError("send_timeout must be positive")
         if max_concurrent_sends < 1:
@@ -186,6 +183,14 @@ class FleetMonitor:
         self.ownership_lock = ownership_lock
         self._instance_id = uuid4().hex[:12]
         self._snapshots: dict[str, _WorkerSnapshot] = {}
+        self._graph_health = GraphHealthMonitor(
+            store=self.store,
+            emit=self._emit,
+            graph_health_realarm=graph_health_realarm,
+            review_route_suppression=review_route_suppression,
+            send_timeout=send_timeout,
+        )
+        self._graph_health_snapshots = self._graph_health.snapshots
         self._sent_dedupe_keys: set[tuple[str, str, str]] = set()
         self._send_semaphores: dict[str, asyncio.Semaphore] = {}
 
@@ -237,6 +242,9 @@ class FleetMonitor:
                 )
                 continue
             notifications.extend(batch)
+        notifications.extend(
+            await self._process_graph_health(views, wall_now)
+        )
         return notifications
 
     def _reconcile_worker_state(self, current_run_ids: dict[str, str]) -> None:
@@ -315,8 +323,6 @@ class FleetMonitor:
         results: list[Notification] = []
 
         if not snapshot.seeded:
-            if view.status_state == "merge-ready":
-                snapshot.merge_ready_since = monotonic_now
             snapshot.seeded = True
 
         # Notify only on state transitions (e.g. working -> merge-ready);
@@ -383,26 +389,21 @@ class FleetMonitor:
                     snapshot.pending_runtime_dedupe_key = None
                     self._clear_dedupe_key(view, dedupe_key)
 
-        if view.status_state == "merge-ready":
-            if snapshot.merge_ready_since is None:
-                snapshot.merge_ready_since = monotonic_now
-        else:
-            snapshot.merge_ready_since = None
-            snapshot.last_review_gap_alarm_at = None
-
         results.extend(
             await self._maybe_unrouted_verdict(view, snapshot, monotonic_now)
-        )
-        results.extend(
-            await self._maybe_review_gap(
-                view, snapshot, all_views, monotonic_now
-            )
         )
         results.extend(await self._maybe_staleness(view, snapshot, wall_now))
 
         self._snapshots[record.agent_id] = snapshot
         return results
 
+    async def _process_graph_health(
+        self, views: list[_WorkerView], now: float
+    ) -> list[Notification]:
+        return await self._graph_health.process(views, now)
+
+    def _load_graph(self, ticket: str) -> dict[str, Any] | None:
+        return self._graph_health.load_graph(ticket)
     def _transition_dedupe_key(
         self,
         view: _WorkerView,
@@ -463,54 +464,6 @@ class FleetMonitor:
         )
         if notif is not None:
             snapshot.last_unrouted_verdict_alarm_at = now
-            return [notif]
-        return []
-
-    async def _maybe_review_gap(
-        self,
-        view: _WorkerView,
-        snapshot: _WorkerSnapshot,
-        all_views: list[_WorkerView],
-        now: float,
-    ) -> list[Notification]:
-        record = view.record
-        if record.role != "implement":
-            return []
-        if view.status_state != "merge-ready":
-            return []
-        since = snapshot.merge_ready_since
-        if since is None:
-            return []
-        if (now - since) < self.review_gap_threshold:
-            return []
-        prefix = _ticket_prefix(record.agent_id)
-        has_reviewer = any(
-            other.record.role == "review"
-            and other.record.orchestrator_id == record.orchestrator_id
-            and _ticket_prefix(other.record.agent_id) == prefix
-            and other.record.agent_id != record.agent_id
-            for other in all_views
-        )
-        if has_reviewer:
-            snapshot.last_review_gap_alarm_at = None
-            return []
-        last = snapshot.last_review_gap_alarm_at
-        if last is not None and (now - last) < self.review_gap_realarm:
-            return []
-        window = int(now // max(self.review_gap_realarm, 1.0))
-        elapsed_min = int((now - since) // 60)
-        notif = await self._emit(
-            view,
-            event_type="review-gap",
-            message=(
-                f"[fleet] {record.agent_id} ({record.role}): merge-ready "
-                f"{elapsed_min}m with no live reviewer for {prefix}. "
-                "Spawn a reviewer or route the PR."
-            ),
-            dedupe_key=f"fleet:{record.agent_id}:review-gap:{window}",
-        )
-        if notif is not None:
-            snapshot.last_review_gap_alarm_at = now
             return [notif]
         return []
 
