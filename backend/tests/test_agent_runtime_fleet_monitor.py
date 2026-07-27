@@ -15,7 +15,7 @@ from unittest import mock
 
 from backend.app import workgraph
 from backend.app.agent_runtime.fake import FixtureAdapterFactory
-from backend.app.agent_runtime.fleet_monitor import FleetMonitor, Notification
+from backend.app.agent_runtime.fleet_monitor import FleetMonitor, Notification, _WorkerView
 from backend.app.agent_runtime.store import RunStore, RuntimePaths
 from backend.app.agent_runtime.supervisor import Supervisor
 from backend.app.agent_runtime.types import LifecycleState, ProviderKind
@@ -385,14 +385,27 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
             side_effect=record_escalation,
         ):
             first = await self.monitor.tick()
-            graph["edges"][-1]["created_at"] = datetime.fromtimestamp(
-                self.clock.now, timezone.utc
-            ).isoformat()
+            graph["edges"].append(
+                self._graph_edge(
+                    "steer",
+                    self.clock.now,
+                    to="WIKI-904",
+                    payload={"target_worker": "WIKI-904"},
+                )
+            )
             await self.monitor.tick()
-            graph["edges"][-1]["created_at"] = datetime.fromtimestamp(
-                self.clock.now - 1801, timezone.utc
-            ).isoformat()
-            second = await self.monitor.tick()
+            self.clock.advance(1801)
+            restarted = FleetMonitor(
+                self.store,
+                self.send,
+                clock=self.clock,
+                interval=0.01,
+                graph_health_realarm=300.0,
+                review_route_suppression=900.0,
+                send_timeout=10.0,
+                ownership_lock=self.supervisor._agent_lock,  # noqa: SLF001
+            )
+            second = await restarted.tick()
 
         first_note = next(note for note in first if note.event_type == "graph-health-stall")
         second_note = next(note for note in second if note.event_type == "graph-health-stall")
@@ -460,6 +473,132 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
             side_effect=workgraph.WorkgraphCorruptError("damaged hot graph"),
         ), mock.patch.object(workgraph, "load_snapshot", return_value=snapshot):
             self.assertEqual(monitor._load_graph("WIKI-906"), snapshot)  # noqa: SLF001
+
+    async def test_invalid_hot_graph_falls_back_and_alarms_degraded_health(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        await self._spawn("WIKI-907", role="implement", orch="WIKI-ORCH")
+        _write_status(
+            self.store,
+            "WIKI-907",
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+        )
+        snapshot = workgraph.create_workgraph(
+            "WIKI-907",
+            "wiki",
+            created_at="1970-01-01T00:00:00Z",
+        )
+        with mock.patch.object(
+            workgraph, "load_workgraph", return_value={}
+        ) as hot, mock.patch.object(
+            workgraph, "load_snapshot", return_value=snapshot
+        ) as durable:
+            first = await self.monitor.tick()
+            self.assertIn(
+                "graph-unavailable", {note.event_type for note in first}
+            )
+            self.assertNotIn("graph-health", {note.event_type for note in first})
+            self.clock.advance(299)
+            self.assertNotIn(
+                "graph-unavailable",
+                {note.event_type for note in await self.monitor.tick()},
+            )
+            self.clock.advance(1)
+            self.assertIn(
+                "graph-unavailable",
+                {note.event_type for note in await self.monitor.tick()},
+            )
+        self.assertEqual(hot.call_count, 3)
+        self.assertEqual(durable.call_count, 3)
+
+    async def test_invalid_hot_and_snapshot_graph_alarm_without_phantom_health(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        await self._spawn("WIKI-908", role="implement", orch="WIKI-ORCH")
+        _write_status(
+            self.store,
+            "WIKI-908",
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+        )
+        with mock.patch.object(
+            workgraph, "load_workgraph", return_value={"edges": "invalid"}
+        ), mock.patch.object(
+            workgraph, "load_snapshot", return_value={"edges": "invalid"}
+        ):
+            notes = await self.monitor.tick()
+
+        event_types = {note.event_type for note in notes}
+        self.assertIn("graph-unavailable", event_types)
+        self.assertNotIn("graph-health", event_types)
+
+    async def test_future_verdict_route_does_not_suppress_alarm(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        await self._spawn("WIKI-909", role="implement", orch="WIKI-ORCH")
+        _write_status(
+            self.store,
+            "WIKI-909",
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+        )
+        graph = self._graph(
+            "WIKI-909",
+            edges=[
+                self._graph_edge(
+                    "verdict",
+                    self.clock.now - 1,
+                    **{
+                        "from": "review",
+                        "to": "orch:wiki",
+                        "payload": {
+                            "findings": [{"id": "F-future", "severity": "BLOCKING"}]
+                        },
+                    },
+                ),
+                self._graph_edge(
+                    "steer",
+                    self.clock.now + 60,
+                    to="WIKI-909",
+                    payload={"target_worker": "WIKI-909"},
+                ),
+            ],
+        )
+        with self._patch_graph(graph):
+            notes = await self.monitor.tick()
+
+        self.assertEqual(
+            len([note for note in notes if note.event_type == "graph-health"]), 1
+        )
+
+    async def test_fleet_and_writer_normalize_every_role_suffix(self) -> None:
+        from backend.app import workgraph_service
+        from backend.app.agent_runtime import fleet_monitor
+
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        for suffix in ("REVIEW", "PLAN", "SIM", "AUDIT", "CANARY", "THERMO", "EVAL"):
+            with self.subTest(suffix=suffix):
+                agent_id = f"WIKI-910-{suffix}1"
+                record = await self._spawn(agent_id, role="implement", orch="WIKI-ORCH")
+                self.assertEqual(
+                    fleet_monitor.base_ticket(agent_id),
+                    workgraph_service.base_ticket(agent_id),
+                )
+                self.assertEqual(workgraph_service.base_ticket(agent_id), "WIKI-910")
+                view = _WorkerView(
+                    record=record,
+                    status_state="working",
+                    pr=None,
+                    step="coding",
+                    blocker=None,
+                    status_mtime=None,
+                )
+                with mock.patch.object(
+                    workgraph, "load_workgraph", return_value=None
+                ) as load_hot, mock.patch.object(
+                    workgraph, "load_snapshot", return_value=None
+                ):
+                    await self.monitor._process_graph_health(  # noqa: SLF001
+                        [view], self.clock.now
+                    )
+                load_hot.assert_called_once_with(
+                    "WIKI-910", self.store.paths.status_dir
+                )
 
     async def test_status_file_transition_emits_one_message(self) -> None:
         orch = await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)

@@ -20,7 +20,6 @@ synchronous; only the backend service path is asynchronous.
 from __future__ import annotations
 
 import logging
-import re
 import threading
 from concurrent.futures import Future
 from collections import deque
@@ -31,21 +30,13 @@ from uuid import uuid4
 from wiki_cli import graph_lint
 
 from . import workgraph
+from .agent_runtime.ticket import base_ticket
 
 log = logging.getLogger("wiki.workgraph")
-
-# Worker agent ids extend the base ticket with a role suffix
-# (WIKI-163-REVIEW1, PHO-14060-PLAN2, ...); the workgraph lives on the base
-# ticket so all of a ticket's agents share one graph.
-_ROLE_SUFFIX = re.compile(r"-(?:REVIEW|PLAN|SIM)\d*$", re.IGNORECASE)
 
 # Fallback orchestrator identity for actions taken directly by Henry in the
 # app UI, where no orchestrator id accompanies the request.
 DEFAULT_ACTOR = "henry"
-
-
-def base_ticket(agent_id: str) -> str:
-    return _ROLE_SUFFIX.sub("", agent_id)
 
 
 def orch_node_id(orch: str) -> str:
