@@ -545,10 +545,17 @@ class CommitOrderingTests(unittest.TestCase):
 
         valid_orphan = workgraph.newest_snapshot_path("TST-1", self.snapshot_dir)
         valid_graph = json.loads(valid_orphan.read_text(encoding="utf-8"))
+        divergent_first_edge = {
+            **valid_graph["edges"][0],
+            "payload": {
+                **valid_graph["edges"][0]["payload"],
+                "request_id": "req-divergent",
+            },
+        }
         divergent_graph = {
             **valid_graph,
             "edges": [
-                valid_graph["edges"][0],
+                divergent_first_edge,
                 {
                     "kind": "archive",
                     "from": "N-1",
