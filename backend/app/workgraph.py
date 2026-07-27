@@ -74,7 +74,7 @@ EDGE_KINDS = (
     "escalation",
 )
 # Appends that also write a durable ~/.wiki snapshot (spec 2.1).
-SNAPSHOT_EDGE_KINDS = {"spawn", "verdict", "archive"}
+SNAPSHOT_EDGE_KINDS = {"spawn", "verdict", "archive", "escalation"}
 STALL_ALARM_SECONDS = 1800
 DEFAULT_ITERATION_CAP = 8
 

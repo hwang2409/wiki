@@ -6,6 +6,8 @@ import os
 import tempfile
 import threading
 import time
+from concurrent.futures import Future
+from contextlib import ExitStack
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -177,11 +179,18 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         return edge
 
     def _patch_graph(self, graph: dict):
-        return mock.patch.multiple(
-            workgraph,
-            load_workgraph=mock.Mock(return_value=graph),
-            load_snapshot=mock.Mock(return_value=None),
+        stack = ExitStack()
+        stack.enter_context(
+            mock.patch.multiple(
+                workgraph,
+                load_workgraph=mock.Mock(return_value=graph),
+                load_snapshot=mock.Mock(return_value=None),
+            )
         )
+        stack.enter_context(
+            mock.patch.object(workgraph.graph_lint, "validate_document", return_value=[])
+        )
+        return stack
 
     async def test_graph_health_blocking_no_reviewer_realarms_every_five_minutes(self) -> None:
         orch = await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
@@ -296,6 +305,9 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
 
         def record_escalation(**payload):
             escalations.append(payload)
+            ack = Future()
+            ack.set_result(None)
+            return ack
 
         with self._patch_graph(graph), mock.patch(
             "backend.app.workgraph_service.record_escalation",
@@ -312,6 +324,142 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
             "node stall exceeded 1800s (1801s)",
             "iteration count exceeded cap 8 (9)",
         })
+
+    async def test_escalation_append_failure_retries_before_notification(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        await self._spawn("WIKI-903", role="implement", orch="WIKI-ORCH")
+        _write_status(
+            self.store,
+            "WIKI-903",
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+        )
+        graph = self._graph(
+            "WIKI-903",
+            edges=[self._graph_edge("spawn", self.clock.now - 1801, to="WIKI-903")],
+        )
+        attempts = 0
+
+        def record_escalation(**payload):
+            nonlocal attempts
+            attempts += 1
+            ack = Future()
+            if attempts == 1:
+                ack.set_exception(RuntimeError("simulated append failure"))
+            else:
+                ack.set_result(None)
+            return ack
+
+        with self._patch_graph(graph), mock.patch(
+            "backend.app.workgraph_service.record_escalation",
+            side_effect=record_escalation,
+        ):
+            first = await self.monitor.tick()
+            second = await self.monitor.tick()
+
+        self.assertNotIn("graph-health-stall", {note.event_type for note in first})
+        self.assertIn("graph-health-stall", {note.event_type for note in second})
+        self.assertEqual(attempts, 2)
+
+    async def test_escalation_episode_ids_reset_after_stall_recovery(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        await self._spawn("WIKI-904", role="implement", orch="WIKI-ORCH")
+        _write_status(
+            self.store,
+            "WIKI-904",
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+        )
+        graph = self._graph(
+            "WIKI-904",
+            edges=[self._graph_edge("spawn", self.clock.now - 1801, to="WIKI-904")],
+        )
+        requests: list[str] = []
+
+        def record_escalation(**payload):
+            requests.append(payload["request_id"])
+            ack = Future()
+            ack.set_result(None)
+            return ack
+
+        with self._patch_graph(graph), mock.patch(
+            "backend.app.workgraph_service.record_escalation",
+            side_effect=record_escalation,
+        ):
+            first = await self.monitor.tick()
+            graph["edges"][-1]["created_at"] = datetime.fromtimestamp(
+                self.clock.now, timezone.utc
+            ).isoformat()
+            await self.monitor.tick()
+            graph["edges"][-1]["created_at"] = datetime.fromtimestamp(
+                self.clock.now - 1801, timezone.utc
+            ).isoformat()
+            second = await self.monitor.tick()
+
+        first_note = next(note for note in first if note.event_type == "graph-health-stall")
+        second_note = next(note for note in second if note.event_type == "graph-health-stall")
+        self.assertNotEqual(first_note.dedupe_key, second_note.dedupe_key)
+        self.assertEqual(len(requests), 2)
+        self.assertNotEqual(requests[0], requests[1])
+
+    async def test_new_verdict_after_route_is_not_suppressed(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        await self._spawn("WIKI-905", role="implement", orch="WIKI-ORCH")
+        _write_status(
+            self.store,
+            "WIKI-905",
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+        )
+        graph = self._graph(
+            "WIKI-905",
+            edges=[
+                self._graph_edge(
+                    "verdict",
+                    self.clock.now - 1,
+                    **{"from": "review", "to": "orch:wiki", "payload": {}},
+                ),
+                self._graph_edge(
+                    "steer",
+                    self.clock.now,
+                    to="WIKI-905",
+                    payload={"target_worker": "WIKI-905"},
+                ),
+            ],
+        )
+        with self._patch_graph(graph):
+            self.assertEqual(
+                [n for n in await self.monitor.tick() if n.event_type == "graph-health"],
+                [],
+            )
+            graph["edges"].append(
+                self._graph_edge(
+                    "verdict",
+                    self.clock.now,
+                    **{
+                        "from": "review",
+                        "to": "orch:wiki",
+                        "payload": {
+                            "findings": [{"id": "F-new123", "severity": "BLOCKING"}]
+                        },
+                    },
+                )
+            )
+            notes = await self.monitor.tick()
+
+        self.assertEqual(len([n for n in notes if n.event_type == "graph-health"]), 1)
+
+    async def test_corrupt_hot_graph_falls_back_to_valid_snapshot(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        monitor = self.monitor
+        snapshot = workgraph.create_workgraph(
+            "WIKI-906",
+            "wiki",
+            created_at="1970-01-01T00:00:00Z",
+        )
+        with mock.patch.object(
+            workgraph,
+            "load_workgraph",
+            side_effect=workgraph.WorkgraphCorruptError("damaged hot graph"),
+        ), mock.patch.object(workgraph, "load_snapshot", return_value=snapshot):
+            self.assertEqual(monitor._load_graph("WIKI-906"), snapshot)  # noqa: SLF001
 
     async def test_status_file_transition_emits_one_message(self) -> None:
         orch = await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
@@ -1181,7 +1329,7 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         send.release.set()
         await asyncio.wait_for(tick, timeout=10.0)
 
-    async def test_wall_clock_jump_does_not_trigger_elapsed_review_gap(self) -> None:
+    async def test_backward_clock_resets_graph_unavailable_cadence(self) -> None:
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
         worker = await self._spawn(
             "WIKI-1500", role="implement", orch="WIKI-ORCH"
@@ -1202,18 +1350,18 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
             monotonic_clock=monotonic_clock,
         )
         await monitor.tick()
-        wall_clock.advance(3600)
+        wall_clock.advance(300)
         self.assertEqual(
-            [note for note in await monitor.tick() if note.event_type == "review-gap"],
-            [],
+            len([note for note in await monitor.tick() if note.event_type == "graph-unavailable"]),
+            1,
         )
-        monotonic_clock.advance(301)
+        wall_clock.advance(-1)
         self.assertEqual(
-            len([note for note in await monitor.tick() if note.event_type == "review-gap"]),
+            len([note for note in await monitor.tick() if note.event_type == "graph-unavailable"]),
             1,
         )
 
-    async def test_plan_worker_does_not_trigger_review_gap(self) -> None:
+    async def test_plan_worker_gets_graph_unavailable_alarm(self) -> None:
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
         await self._spawn("WIKI-1600", role="plan", orch="WIKI-ORCH")
         _write_status(
@@ -1221,11 +1369,15 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
             "WIKI-1600",
             {"state": "merge-ready", "pr": "pr", "step": "ready", "blocker": None},
         )
-        await self.monitor.tick()
+        first = await self.monitor.tick()
+        self.assertEqual(
+            len([note for note in first if note.event_type == "graph-unavailable"]),
+            1,
+        )
         self.clock.advance(301)
         self.assertEqual(
-            [note for note in await self.monitor.tick() if note.event_type == "review-gap"],
-            [],
+            len([note for note in await self.monitor.tick() if note.event_type == "graph-unavailable"]),
+            1,
         )
 
     async def test_runtime_transition_includes_status_context(self) -> None:
@@ -1334,8 +1486,8 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         third_v = [n for n in third if n.event_type == "unrouted-verdict"]
         self.assertEqual(len(third_v), 1)
 
-    async def test_review_gap_alarm_when_no_reviewer_present(self) -> None:
-        orch = await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+    async def test_graph_unavailable_alarm_realarms_every_five_minutes(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
         await self._spawn("WIKI-600", role="implement", orch="WIKI-ORCH")
         _write_status(
             self.store,
@@ -1343,35 +1495,34 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
             {"state": "merge-ready", "pr": "u", "step": "ready", "blocker": None},
         )
 
-        # Seed at t=0. merge_ready_since := 0.
-        await self.monitor.tick()
+        first = await self.monitor.tick()
+        self.assertEqual(
+            len([n for n in first if n.event_type == "graph-unavailable"]),
+            1,
+        )
         self.send.calls.clear()
 
-        # Not yet past threshold (5m).
         self.clock.advance(120)
         early = await self.monitor.tick()
-        self.assertEqual([n for n in early if n.event_type == "review-gap"], [])
+        self.assertEqual([n for n in early if n.event_type == "graph-unavailable"], [])
 
-        # Past 5-minute threshold — alarm once.
         self.clock.advance(200)
-        first = await self.monitor.tick()
-        gap = [n for n in first if n.event_type == "review-gap"]
-        self.assertEqual(len(gap), 1)
-        self.assertIn("merge-ready", gap[0].message)
-        self.assertIn("no live reviewer", gap[0].message)
-
-        # Re-alarm every 10 minutes.
-        self.clock.advance(300)
-        mid = await self.monitor.tick()
-        self.assertEqual([n for n in mid if n.event_type == "review-gap"], [])
-
-        self.clock.advance(400)
-        late = await self.monitor.tick()
+        second = await self.monitor.tick()
         self.assertEqual(
-            len([n for n in late if n.event_type == "review-gap"]), 1
+            len([n for n in second if n.event_type == "graph-unavailable"]), 1
         )
 
-    async def test_review_gap_silent_when_reviewer_present(self) -> None:
+        self.clock.advance(1)
+        mid = await self.monitor.tick()
+        self.assertEqual([n for n in mid if n.event_type == "graph-unavailable"], [])
+
+        self.clock.advance(299)
+        late = await self.monitor.tick()
+        self.assertEqual(
+            len([n for n in late if n.event_type == "graph-unavailable"]), 1
+        )
+
+    async def test_graph_unavailable_alarm_is_ticket_level(self) -> None:
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
         await self._spawn("WIKI-700", role="implement", orch="WIKI-ORCH")
         await self._spawn("WIKI-700-REVIEW1", role="review", orch="WIKI-ORCH")
@@ -1389,7 +1540,7 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         await self.monitor.tick()  # seed
         self.clock.advance(3600)
         notes = await self.monitor.tick()
-        self.assertEqual([n for n in notes if n.event_type == "review-gap"], [])
+        self.assertEqual(len([n for n in notes if n.event_type == "graph-unavailable"]), 1)
 
     async def test_staleness_alarm_after_30_min_silent(self) -> None:
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)

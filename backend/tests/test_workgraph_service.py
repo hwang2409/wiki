@@ -162,6 +162,10 @@ class ServiceSequenceTests(unittest.TestCase):
         self.assertEqual(escalation["kind"], "escalation")
         self.assertEqual(escalation["payload"]["target"], "henry")
         self.assertEqual(graph_lint.validate_document(escalation, "edge"), [])
+        snapshots = sorted(self.snapshot_dir.glob("WIKI-9-*.workgraph.json"))
+        self.assertTrue(snapshots)
+        durable = json.loads(snapshots[-1].read_text(encoding="utf-8"))
+        self.assertEqual(durable["edges"][-1]["kind"], "escalation")
 
     def test_append_failure_is_swallowed_and_logged(self) -> None:
         with mock.patch.object(
