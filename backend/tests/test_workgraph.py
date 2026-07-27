@@ -515,6 +515,60 @@ class CommitOrderingTests(unittest.TestCase):
         snapshot = workgraph.load_snapshot("TST-1", self.snapshot_dir)
         self.assertEqual([e["kind"] for e in snapshot["edges"]], ["spawn", "archive"])
 
+    def test_invalid_newest_orphan_falls_back_to_newest_valid_orphan(self) -> None:
+        self.append("spawn", "N-1", "N-2", spawn_payload(), BASE_TS, orch="wiki")
+        self.crash_after_snapshot_rename(
+            "verdict", "N-3", "N-1", verdict_payload(), BASE_TS + 60
+        )
+
+        valid_orphan = workgraph.newest_snapshot_path("TST-1", self.snapshot_dir)
+        valid_graph = json.loads(valid_orphan.read_text(encoding="utf-8"))
+        invalid_orphan = self.snapshot_dir / (
+            "TST-1-r3-1784700060000000000-999999-0.workgraph.json"
+        )
+        invalid_graph = {key: value for key, value in valid_graph.items() if key != "nodes"}
+        invalid_orphan.write_text(json.dumps(invalid_graph), encoding="utf-8")
+
+        graph = self.append("archive", "N-1", "N-2", archive_payload(), BASE_TS + 120)
+
+        self.assertEqual([e["kind"] for e in graph["edges"]], ["spawn", "verdict", "archive"])
+        self.assertEqual(graph["ticket"], "TST-1")
+        hot_graph = json.loads(self.hot().read_text(encoding="utf-8"))
+        self.assertEqual(hot_graph["edges"], graph["edges"])
+        self.assertIn("nodes", hot_graph)
+
+    def test_two_crashes_converge_through_successive_revisions(self) -> None:
+        self.append("spawn", "N-1", "N-2", spawn_payload(), BASE_TS, orch="wiki")
+        self.crash_after_snapshot_rename(
+            "verdict", "N-3", "N-1", verdict_payload(), BASE_TS + 60
+        )
+
+        # This append recovers the first orphan before committing its own
+        # revision, so the first crashed verdict remains in the graph.
+        self.append("archive", "N-1", "N-2", archive_payload(), BASE_TS + 120)
+
+        self.crash_after_snapshot_rename(
+            "verdict",
+            "N-4",
+            "N-1",
+            verdict_payload("MERGE-READY", findings=[]),
+            BASE_TS + 180,
+        )
+
+        # A second recovery must promote the second orphan before this final
+        # mutation, preserving every committed edge exactly once.
+        graph = self.append("archive", "N-1", "N-4", archive_payload(), BASE_TS + 240)
+
+        self.assertEqual(
+            [edge["kind"] for edge in graph["edges"]],
+            ["spawn", "verdict", "archive", "verdict", "archive"],
+        )
+        self.assertEqual(len({json.dumps(edge, sort_keys=True) for edge in graph["edges"]}), 5)
+        newest = workgraph.newest_snapshot_path("TST-1", self.snapshot_dir)
+        newest_graph = json.loads(newest.read_text(encoding="utf-8"))
+        self.assertEqual(newest_graph["edges"], graph["edges"])
+        self.assertEqual(validate_against_workgraph_schema(newest_graph), [])
+
 
 class _FakeStagingHandle:
     """NamedTemporaryFile stand-in that can fail at the write or close boundary."""

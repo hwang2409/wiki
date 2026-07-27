@@ -549,34 +549,45 @@ def _orphan_snapshot_graph(
     Promotion requires the hot edge list to be a strict prefix of the
     snapshot's (the only shape the crash window can produce; a missing hot
     file counts as the empty prefix) and the snapshot to be schema-valid.
-    Anything else — equal/older snapshots (the normal state), unreadable or
-    invalid files (nothing recoverable to promote), divergent histories —
-    returns ``None`` and the hot graph stays authoritative.
+    Candidates are checked in descending revision order, so an invalid newer
+    file cannot hide an older valid orphan. Anything else — equal/older
+    snapshots (the normal state), unreadable or invalid files (nothing
+    recoverable to promote), divergent histories — returns ``None`` and the
+    hot graph stays authoritative.
     """
-    path = newest_snapshot_path(ticket, snapshot_dir)
-    if path is None:
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    snapshot_edges = data.get("edges")
-    if not isinstance(snapshot_edges, list) or not snapshot_edges:
-        return None
     hot_edges = hot_graph.get("edges", []) if hot_graph is not None else []
     if not isinstance(hot_edges, list):
         return None
-    if len(snapshot_edges) <= len(hot_edges):
-        return None
-    if snapshot_edges[: len(hot_edges)] != hot_edges:
-        return None
-    try:
-        _validate(data, "workgraph", f"orphan snapshot {path.name}")
-    except WorkgraphError:
-        return None
-    return data
+    candidates: list[tuple[tuple[int, int, int, int], Path]] = []
+    if snapshot_dir.is_dir():
+        for path in snapshot_dir.glob(f"{ticket}-*.workgraph.json"):
+            stem = path.name.removesuffix(".workgraph.json")
+            key = _snapshot_sort_key(stem[len(ticket) + 1 :])
+            if key is not None:
+                candidates.append((key, path))
+
+    # A damaged newest orphan must not hide an older valid orphan. Scan in
+    # commit order and validate each candidate before considering promotion.
+    for _key, path in sorted(candidates, reverse=True):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        snapshot_edges = data.get("edges")
+        if not isinstance(snapshot_edges, list) or not snapshot_edges:
+            continue
+        if len(snapshot_edges) <= len(hot_edges):
+            continue
+        if snapshot_edges[: len(hot_edges)] != hot_edges:
+            continue
+        try:
+            _validate(data, "workgraph", f"orphan snapshot {path.name}")
+        except WorkgraphError:
+            continue
+        return data
+    return None
 
 
 def _is_replay(graph: dict[str, Any], edge: dict[str, Any]) -> bool:
