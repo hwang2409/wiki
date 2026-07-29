@@ -22,31 +22,16 @@ import {
   type FindMatch,
   type PageTextIndex,
 } from "../pdfjs-runtime";
+import {
+  applyKeyNav,
+  focalPreservedScroll,
+  resolveKeyNav,
+  resolveZoom,
+  snapToZoomStep,
+  type ZoomMode,
+} from "../pdf-nav";
 
-const ZOOM_STEPS = [0.5, 0.75, 1, 1.25, 1.5, 2] as const;
-
-type ZoomMode = "fit-width" | "fit-page" | number;
-
-function resolveZoom(mode: ZoomMode, viewport: { width: number; height: number }, page: { width: number; height: number }): number {
-  if (mode === "fit-width") return Math.max(0.1, (viewport.width - 48) / page.width);
-  if (mode === "fit-page") {
-    return Math.max(
-      0.1,
-      Math.min((viewport.width - 48) / page.width, (viewport.height - 48) / page.height),
-    );
-  }
-  return mode;
-}
-
-function nextZoomStep(current: number, direction: 1 | -1): number {
-  const steps = ZOOM_STEPS as readonly number[];
-  if (direction === 1) {
-    const found = steps.find((step) => step > current + 0.0001);
-    return found ?? steps[steps.length - 1];
-  }
-  const found = [...steps].reverse().find((step) => step < current - 0.0001);
-  return found ?? steps[0];
-}
+const TEXT_INDEX_BATCH_MS = 40;
 
 export function PdfArtifactDetail({
   artifact: _artifact,
@@ -69,18 +54,20 @@ export function PdfArtifactDetail({
   const [findOpen, setFindOpen] = useState(false);
   const [findValue, setFindValue] = useState("");
   const [textIndex, setTextIndex] = useState<PageTextIndex[]>([]);
-  const [textIndexPageCount, setTextIndexPageCount] = useState(0);
+  const [indexingState, setIndexingState] = useState<"idle" | "building" | "ready">("idle");
   const [currentMatch, setCurrentMatch] = useState<number>(0);
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const textLayerRef = useRef<HTMLDivElement | null>(null);
+  const pendingFocal = useRef<{ scrollLeft: number; scrollTop: number } | null>(null);
+  const previousZoom = useRef(1);
   const [pageBaseSize, setPageBaseSize] = useState<{ width: number; height: number } | null>(null);
   const numPages = loadState.status === "ready" ? loadState.pdf.numPages : 0;
 
   useEffect(() => {
     setPage(1);
     setTextIndex([]);
-    setTextIndexPageCount(0);
+    setIndexingState("idle");
     setPageBaseSize(null);
   }, [url]);
 
@@ -113,6 +100,21 @@ export function PdfArtifactDetail({
   }, [loadState, pageBaseSize, zoomMode]);
 
   useEffect(() => {
+    if (loadState.status !== "ready" || !pageBaseSize) return;
+    if (!viewportRef.current) return;
+    const observer = new ResizeObserver(() => {
+      if (!viewportRef.current) return;
+      const box = viewportRef.current.getBoundingClientRect();
+      if (typeof zoomMode === "string") {
+        const nextZoom = resolveZoom(zoomMode, { width: box.width, height: box.height }, pageBaseSize);
+        setZoom(nextZoom);
+      }
+    });
+    observer.observe(viewportRef.current);
+    return () => observer.disconnect();
+  }, [loadState, pageBaseSize, zoomMode]);
+
+  useEffect(() => {
     if (loadState.status !== "ready" || !canvasRef.current || !textLayerRef.current || !pageBaseSize) return;
     let cancelled = false;
     let active: { cancel: () => void } | null = null;
@@ -132,6 +134,12 @@ export function PdfArtifactDetail({
       } catch {
         textLayer.replaceChildren();
       }
+      if (pendingFocal.current && viewportRef.current) {
+        viewportRef.current.scrollLeft = pendingFocal.current.scrollLeft;
+        viewportRef.current.scrollTop = pendingFocal.current.scrollTop;
+        pendingFocal.current = null;
+      }
+      previousZoom.current = zoom;
     })();
     return () => {
       cancelled = true;
@@ -140,28 +148,39 @@ export function PdfArtifactDetail({
   }, [loadState, page, zoom, pageBaseSize]);
 
   useEffect(() => {
-    if (loadState.status !== "ready" || textIndexPageCount === loadState.pdf.numPages) return;
+    if (!findOpen) return;
+    if (loadState.status !== "ready") return;
+    if (indexingState !== "idle") return;
+    setIndexingState("building");
     let cancelled = false;
     (async () => {
       const accumulator: PageTextIndex[] = [];
-      for (let index = 1; index <= loadState.pdf.numPages; index += 1) {
+      const doc = loadState.pdf.doc;
+      for (let index = 1; index <= doc.numPages; index += 1) {
         if (cancelled) return;
-        const target = await loadState.pdf.doc.getPage(index);
+        const target = await doc.getPage(index);
         const text = await extractPageText(target);
+        // Release the page early; keeping every page pinned costs memory.
+        target.cleanup?.();
         accumulator.push({ page: index, text });
+        // Yield to the event loop between batches so large PDFs stay
+        // responsive; the find field remains editable while indexing runs.
+        if (index % 8 === 0) {
+          await new Promise((resolve) => setTimeout(resolve, TEXT_INDEX_BATCH_MS));
+        }
       }
       if (cancelled) return;
       setTextIndex(accumulator);
-      setTextIndexPageCount(loadState.pdf.numPages);
+      setIndexingState("ready");
     })();
     return () => {
       cancelled = true;
     };
-  }, [loadState, textIndexPageCount]);
+  }, [findOpen, indexingState, loadState]);
 
   const matches = useMemo<FindMatch[]>(
-    () => (findValue ? findMatches(textIndex, findValue) : []),
-    [findValue, textIndex],
+    () => (findValue && indexingState === "ready" ? findMatches(textIndex, findValue) : []),
+    [findValue, indexingState, textIndex],
   );
 
   useEffect(() => {
@@ -187,32 +206,64 @@ export function PdfArtifactDetail({
   useEffect(() => {
     function onKeyDown(nativeEvent: KeyboardEvent) {
       if (!viewportRef.current || !viewportRef.current.matches(":focus-within, :hover")) return;
-      const command = nativeEvent.metaKey || nativeEvent.ctrlKey;
-      if (command && nativeEvent.key === "ArrowLeft") {
-        nativeEvent.preventDefault();
-        goPrev();
-        return;
-      }
-      if (command && nativeEvent.key === "ArrowRight") {
-        nativeEvent.preventDefault();
-        goNext();
-        return;
-      }
-      if (command && nativeEvent.key.toLowerCase() === "f") {
-        nativeEvent.preventDefault();
+      const target = nativeEvent.target as HTMLElement | null;
+      const isEditable = Boolean(
+        target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable),
+      );
+      const intent = resolveKeyNav({
+        key: nativeEvent.key,
+        metaKey: nativeEvent.metaKey,
+        ctrlKey: nativeEvent.ctrlKey,
+        altKey: nativeEvent.altKey,
+        shiftKey: nativeEvent.shiftKey,
+        targetIsEditable: isEditable,
+      });
+      if (!intent) return;
+      nativeEvent.preventDefault();
+      if (intent.kind === "open-find") {
         setFindOpen(true);
+        return;
       }
+      setPage((value) => applyKeyNav(intent, value, numPages || value));
     }
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [goNext, goPrev]);
+  }, [numPages]);
 
   function update(next: Partial<ArtifactViewState>) {
     onChange({ ...state, ...next });
   }
 
+  function capturePendingFocal(nextZoom: number) {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    const box = viewport.getBoundingClientRect();
+    pendingFocal.current = focalPreservedScroll({
+      viewportWidth: box.width,
+      viewportHeight: box.height,
+      scrollLeft: viewport.scrollLeft,
+      scrollTop: viewport.scrollTop,
+      currentZoom: previousZoom.current || 1,
+      nextZoom,
+    });
+  }
+
   function setZoomStep(delta: 1 | -1) {
-    setZoomMode(nextZoomStep(zoom, delta));
+    const nextZoomValue = snapToZoomStep(zoom, delta);
+    capturePendingFocal(nextZoomValue);
+    setZoomMode(nextZoomValue);
+  }
+
+  function setZoomFit(mode: "fit-width" | "fit-page") {
+    setZoomMode(mode);
+    // Fit modes are viewport-driven; skip focal preservation so the layout
+    // fills the viewport symmetrically.
+    pendingFocal.current = null;
+  }
+
+  function setZoomExact(value: number) {
+    capturePendingFocal(value);
+    setZoomMode(value);
   }
 
   if (loadState.status === "error") {
@@ -231,6 +282,9 @@ export function PdfArtifactDetail({
     <div className="artifact-pdf-detail" data-artifact-pdf-detail>
       <div className="artifact-detail-toolbar artifact-pdf-toolbar">
         <div className="artifact-pdf-toolbar-group">
+          <button aria-label="First page" data-pdf-first="true" type="button" onClick={() => setPage(1)} disabled={page <= 1}>
+            «
+          </button>
           <button aria-label="Previous page" data-pdf-prev="true" type="button" onClick={goPrev} disabled={page <= 1}>
             <ChevronLeft size={12} />
           </button>
@@ -240,12 +294,15 @@ export function PdfArtifactDetail({
           <button aria-label="Next page" data-pdf-next="true" type="button" onClick={goNext} disabled={!numPages || page >= numPages}>
             <ChevronRight size={12} />
           </button>
+          <button aria-label="Last page" data-pdf-last="true" type="button" onClick={() => numPages && setPage(numPages)} disabled={!numPages || page >= numPages}>
+            »
+          </button>
         </div>
         <div className="artifact-pdf-toolbar-group">
-          <button aria-label="Fit width" type="button" onClick={() => setZoomMode("fit-width")} data-pdf-fit-width="true">
+          <button aria-label="Fit width" type="button" onClick={() => setZoomFit("fit-width")} data-pdf-fit-width="true">
             fit width
           </button>
-          <button aria-label="Fit page" type="button" onClick={() => setZoomMode("fit-page")} data-pdf-fit-page="true">
+          <button aria-label="Fit page" type="button" onClick={() => setZoomFit("fit-page")} data-pdf-fit-page="true">
             <Maximize2 size={12} /> fit page
           </button>
           <button aria-label="Zoom out" type="button" onClick={() => setZoomStep(-1)} data-pdf-zoom-out="true">
@@ -255,7 +312,7 @@ export function PdfArtifactDetail({
           <button aria-label="Zoom in" type="button" onClick={() => setZoomStep(1)} data-pdf-zoom-in="true">
             <Plus size={12} />
           </button>
-          <button data-panel-reset-zoom="true" type="button" onClick={() => setZoomMode(1)}>
+          <button data-panel-reset-zoom="true" type="button" onClick={() => setZoomExact(1)}>
             <RotateCcw size={12} /> 100%
           </button>
         </div>
@@ -280,8 +337,12 @@ export function PdfArtifactDetail({
                   }
                 }}
               />
-              <span className="tabular-nums">
-                {totalMatches ? `${activeMatch}/${totalMatches}` : "0 matches"}
+              <span className="tabular-nums" data-pdf-find-status="true">
+                {indexingState === "building" && !textIndex.length
+                  ? "indexing…"
+                  : totalMatches
+                    ? `${activeMatch}/${totalMatches}`
+                    : "0 matches"}
               </span>
               <button
                 aria-label="Close find"
@@ -321,8 +382,8 @@ export function PdfArtifactDetail({
             >
               <canvas className="artifact-pdf-page-canvas" ref={canvasRef} />
               <div
-                aria-hidden="true"
                 className="artifact-pdf-page-textlayer"
+                data-pdf-textlayer="true"
                 ref={textLayerRef}
               />
             </div>
@@ -344,18 +405,59 @@ function PdfThumbnailSidebar({
   onSelect: (page: number) => void;
   pdf: import("pdfjs-dist").PDFDocumentProxy | null;
 }) {
+  const sidebarRef = useRef<HTMLElement | null>(null);
+  const observerRef = useRef<IntersectionObserver | null>(null);
+  const visibility = useRef<Map<number, () => void>>(new Map());
+  const [visibleSet, setVisibleSet] = useState<ReadonlySet<number>>(() => new Set());
+
+  useEffect(() => {
+    if (!sidebarRef.current) return;
+    const map = visibility.current;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        setVisibleSet((current) => {
+          const next = new Set(current);
+          for (const entry of entries) {
+            const raw = (entry.target as HTMLElement).dataset.pdfThumbPage;
+            const pageNumber = raw ? Number(raw) : NaN;
+            if (Number.isNaN(pageNumber)) continue;
+            if (entry.isIntersecting) next.add(pageNumber);
+          }
+          return next;
+        });
+      },
+      { root: sidebarRef.current, rootMargin: "200px" },
+    );
+    observerRef.current = observer;
+    return () => {
+      observer.disconnect();
+      map.clear();
+      observerRef.current = null;
+    };
+  }, []);
+
+  const observeCallback = useCallback((element: HTMLElement | null, pageNumber: number) => {
+    if (!observerRef.current) return;
+    if (element) {
+      element.dataset.pdfThumbPage = String(pageNumber);
+      observerRef.current.observe(element);
+    }
+  }, []);
+
   if (!pdf || !numPages) {
-    return <aside className="artifact-pdf-thumbnails" aria-label="PDF thumbnails" />;
+    return <aside className="artifact-pdf-thumbnails" aria-label="PDF thumbnails" ref={sidebarRef} />;
   }
   return (
-    <aside className="artifact-pdf-thumbnails" aria-label="PDF thumbnails">
+    <aside className="artifact-pdf-thumbnails" aria-label="PDF thumbnails" ref={sidebarRef}>
       {Array.from({ length: numPages }, (_, index) => index + 1).map((pageNumber) => (
         <PdfThumbnail
           active={pageNumber === activePage}
           key={pageNumber}
+          onObserve={observeCallback}
           onSelect={onSelect}
           page={pageNumber}
           pdf={pdf}
+          visible={visibleSet.has(pageNumber)}
         />
       ))}
     </aside>
@@ -364,33 +466,25 @@ function PdfThumbnailSidebar({
 
 function PdfThumbnail({
   active,
+  onObserve,
   onSelect,
   page,
   pdf,
+  visible,
 }: {
   active: boolean;
+  onObserve: (element: HTMLElement | null, page: number) => void;
   onSelect: (page: number) => void;
   page: number;
   pdf: import("pdfjs-dist").PDFDocumentProxy;
+  visible: boolean;
 }) {
   const wrapperRef = useRef<HTMLButtonElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const [visible, setVisible] = useState(false);
 
   useEffect(() => {
-    const target = wrapperRef.current;
-    if (!target) return;
-    const observer = new IntersectionObserver(
-      (entries) => {
-        entries.forEach((entry) => {
-          if (entry.isIntersecting) setVisible(true);
-        });
-      },
-      { rootMargin: "200px" },
-    );
-    observer.observe(target);
-    return () => observer.disconnect();
-  }, []);
+    onObserve(wrapperRef.current, page);
+  }, [onObserve, page]);
 
   useEffect(() => {
     if (!visible || !canvasRef.current) return;
@@ -404,6 +498,7 @@ function PdfThumbnail({
       const render = renderPageToCanvas(target, canvasRef.current, scale, window.devicePixelRatio || 1);
       active = render;
       await render.promise;
+      target.cleanup?.();
     })();
     return () => {
       cancelled = true;

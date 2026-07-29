@@ -229,6 +229,30 @@ def _write_binary(artifact_dir: Path, artifact_id: str, extension: str, data: by
     return target
 
 
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        return path.is_relative_to(root)
+    except AttributeError:  # pragma: no cover - Python <3.9 fallback
+        try:
+            path.relative_to(root)
+            return True
+        except ValueError:
+            return False
+
+
+def _pdf_path_allowed_roots() -> list[Path]:
+    roots: list[Path] = []
+    for var in ("WIKI_VAULT_DIR", "WIKI_AGENT_RUNTIME_DIR", "WIKI_AGENT_ARCHIVE_DIR"):
+        value = os.environ.get(var)
+        if not value:
+            continue
+        try:
+            roots.append(Path(value).expanduser().resolve(strict=False))
+        except (OSError, RuntimeError):
+            continue
+    return roots
+
+
 def _read_pdf_path(raw: str) -> bytes:
     if not raw or not isinstance(raw, str):
         raise ArtifactValidationError("payload.path must be a non-empty string")
@@ -241,6 +265,15 @@ def _read_pdf_path(raw: str) -> bytes:
         resolved = candidate.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
         raise ArtifactValidationError(f"payload.path could not be resolved: {exc}") from exc
+    roots = _pdf_path_allowed_roots()
+    if not roots:
+        raise ArtifactValidationError(
+            "payload.path rejected: no allowed roots configured (set WIKI_VAULT_DIR or WIKI_AGENT_RUNTIME_DIR)"
+        )
+    if not any(_is_relative_to(resolved, root) for root in roots):
+        raise ArtifactValidationError(
+            "payload.path is outside the allowed roots (vault, runtime, or archive)"
+        )
     try:
         info = resolved.stat()
     except OSError as exc:

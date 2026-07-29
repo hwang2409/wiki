@@ -451,7 +451,9 @@ class WikiArtifactsTests(unittest.TestCase):
         self.assertEqual(base_event["artifact"]["mime"], wiki_artifacts.PDF_MIME)
         self.assertEqual(base_event["artifact"]["byte_size"], len(pdf_bytes))
 
-        source = self.root / "source.pdf"
+        # Path variant: source must live under an allowed root (runtime dir here).
+        (self.root / "runtime").mkdir(exist_ok=True)
+        source = self.root / "runtime" / "source.pdf"
         source.write_bytes(pdf_bytes)
         path_event = wiki_artifacts.render_artifact(
             {"kind": "pdf", "payload": {"path": str(source)}}
@@ -465,6 +467,49 @@ class WikiArtifactsTests(unittest.TestCase):
             / f"{path_event['id']}.pdf"
         )
         self.assertEqual(stored.read_bytes(), pdf_bytes)
+
+    def test_pdf_path_outside_allowed_roots_is_rejected(self) -> None:
+        pdf_bytes = b"%PDF-1.4\ncontent\n"
+        outside_root = self.root.parent / "outside-tree"
+        outside_root.mkdir(exist_ok=True)
+        outside = outside_root / "leaked.pdf"
+        outside.write_bytes(pdf_bytes)
+        try:
+            with self.assertRaisesRegex(
+                wiki_artifacts.ArtifactValidationError, "outside the allowed roots"
+            ):
+                wiki_artifacts.render_artifact(
+                    {"kind": "pdf", "payload": {"path": str(outside)}}
+                )
+        finally:
+            outside.unlink(missing_ok=True)
+            try:
+                outside_root.rmdir()
+            except OSError:
+                pass
+
+    def test_pdf_path_refused_when_no_allowed_roots_configured(self) -> None:
+        pdf_bytes = b"%PDF-1.4\nsource\n"
+        source = self.root / "runtime" / "keep.pdf"
+        source.parent.mkdir(exist_ok=True)
+        source.write_bytes(pdf_bytes)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "WIKI_VAULT_DIR": "",
+                "WIKI_AGENT_RUNTIME_DIR": "",
+                "WIKI_AGENT_ARCHIVE_DIR": "",
+                "WIKI_RUN_ID": RUN_ID,
+            },
+            clear=False,
+        ):
+            os.environ.pop("WIKI_VAULT_DIR", None)
+            os.environ.pop("WIKI_AGENT_RUNTIME_DIR", None)
+            os.environ.pop("WIKI_AGENT_ARCHIVE_DIR", None)
+            with self.assertRaisesRegex(
+                wiki_artifacts.ArtifactValidationError, "no allowed roots configured"
+            ):
+                wiki_artifacts._read_pdf_path(str(source))
 
     def test_pdf_rejects_ambiguous_and_unsafe_payloads(self) -> None:
         pdf_bytes = b"%PDF-1.4\nx\n"
