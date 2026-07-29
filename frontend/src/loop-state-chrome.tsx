@@ -87,6 +87,7 @@ export function LoopStateChrome({ ticket, tick }: Props) {
   const [loaded, setLoaded] = useState(false);
   const [open, setOpen] = useState(false);
   const detailRef = useRef<HTMLDivElement | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
 
   useEffect(() => {
     setState(null);
@@ -115,8 +116,14 @@ export function LoopStateChrome({ ticket, tick }: Props) {
   useEffect(() => {
     if (!open) return;
     const onDown = (event: MouseEvent) => {
-      if (!detailRef.current) return;
-      if (event.target instanceof Node && detailRef.current.contains(event.target)) return;
+      if (!(event.target instanceof Node)) return;
+      // Trigger AND detail belong to the same interactive surface — a
+      // pointer sequence on the trigger (mousedown -> click) must resolve
+      // to a clean toggle. Excluding the trigger from the outside-click
+      // handler prevents mousedown-close + click-reopen fighting each
+      // other and leaving the panel stuck open.
+      if (detailRef.current && detailRef.current.contains(event.target)) return;
+      if (triggerRef.current && triggerRef.current.contains(event.target)) return;
       setOpen(false);
     };
     const onKey = (event: KeyboardEvent) => {
@@ -187,6 +194,7 @@ export function LoopStateChrome({ ticket, tick }: Props) {
           open ? "Hide merge-ready loop history" : "Show merge-ready loop history"
         }
         className={`loop-chrome-trigger${open ? " is-open" : ""}`}
+        ref={triggerRef}
         type="button"
         onClick={() => setOpen((current) => !current)}
       >
