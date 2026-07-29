@@ -20,6 +20,7 @@ const SCREENSHOT_SUFFIX = process.env.WIKI_114_SCREENSHOT_SUFFIX ?? "";
 const CAPTURE_LEGACY_PREVIEW = process.env.WIKI_114_CAPTURE_LEGACY_PREVIEW === "1";
 const SCREENSHOTS = {
   compact: `/tmp/wiki-114-large-mermaid-compact${SCREENSHOT_SUFFIX}.png`,
+  hover: `/tmp/wiki-114-large-mermaid-hover${SCREENSHOT_SUFFIX}.png`,
   wide: `/tmp/wiki-114-wide-mermaid-compact${SCREENSHOT_SUFFIX}.png`,
   detail: `/tmp/wiki-114-large-mermaid-detail${SCREENSHOT_SUFFIX}.png`,
   legacy: "/tmp/wiki-114-large-mermaid-before.png",
@@ -45,6 +46,14 @@ function wideMermaidSource() {
   ].join("\n");
 }
 
+function mediumMermaidSource() {
+  const node = (index) => `M${index}["Release step ${index}"]`;
+  return [
+    "flowchart LR",
+    ...Array.from({ length: 9 }, (_, index) => `  ${node(index + 1)} --> ${node(index + 2)}`),
+  ].join("\n");
+}
+
 function artifactInputs() {
   return [
     {
@@ -61,6 +70,11 @@ function artifactInputs() {
       kind: "mermaid",
       title: "Small release path",
       payload: { source: "flowchart LR\n  Plan --> Build\n  Build --> Ship" },
+    },
+    {
+      kind: "mermaid",
+      title: "Medium release path",
+      payload: { source: mediumMermaidSource() },
     },
     {
       kind: "svg",
@@ -140,12 +154,14 @@ async function main() {
     const large = page.locator(`[data-artifact-id="${results[0].id}"]`);
     const wide = page.locator(`[data-artifact-id="${results[1].id}"]`);
     const small = page.locator(`[data-artifact-id="${results[2].id}"]`);
-    const largeSvg = page.locator(`[data-artifact-id="${results[3].id}"]`);
+    const medium = page.locator(`[data-artifact-id="${results[3].id}"]`);
+    const largeSvg = page.locator(`[data-artifact-id="${results[4].id}"]`);
     const preview = large.locator(".artifact-compact-diagram");
     await preview.waitFor({ state: "visible" });
     await large.locator(".artifact-mermaid svg").waitFor({ state: "visible" });
     await wide.locator(".artifact-mermaid svg").waitFor({ state: "visible" });
     await small.locator(".artifact-mermaid svg").waitFor({ state: "visible" });
+    await medium.locator(".artifact-mermaid svg").waitFor({ state: "visible" });
     await largeSvg.locator(".artifact-svg > svg").waitFor({ state: "visible" });
 
     if (CAPTURE_LEGACY_PREVIEW) {
@@ -186,6 +202,24 @@ async function main() {
     await large.getByText("Diagram continues · Click to inspect").waitFor({ state: "visible" });
     await large.screenshot({ path: SCREENSHOTS.compact });
 
+    const restingPreviewStyle = await preview.evaluate((element) => {
+      const style = getComputedStyle(element);
+      return { borderColor: style.borderColor, boxShadow: style.boxShadow };
+    });
+    await preview.hover();
+    await page.waitForTimeout(150);
+    const hoveredPreviewStyle = await preview.evaluate((element) => {
+      const style = getComputedStyle(element);
+      return { borderColor: style.borderColor, boxShadow: style.boxShadow };
+    });
+    if (hoveredPreviewStyle.borderColor === restingPreviewStyle.borderColor) {
+      throw new Error(`Compact Mermaid hover border did not resolve to the accent color: ${JSON.stringify({ restingPreviewStyle, hoveredPreviewStyle })}`);
+    }
+    if (hoveredPreviewStyle.boxShadow === "none" || /transparent|\/\s*0(?:[^\d.]|$)/i.test(hoveredPreviewStyle.boxShadow)) {
+      throw new Error(`Compact Mermaid hover ring did not resolve to a visible color: ${JSON.stringify(hoveredPreviewStyle)}`);
+    }
+    await large.screenshot({ path: SCREENSHOTS.hover });
+
     if ((await wide.getAttribute("data-artifact-compact")) !== "true") throw new Error("Wide Mermaid diagram did not compact");
     const wideMetrics = await wide.locator(".artifact-mermaid svg").evaluate((element) => {
       const viewBox = element.viewBox.baseVal;
@@ -218,6 +252,9 @@ async function main() {
     if (await small.getAttribute("data-artifact-compact")) throw new Error("Small Mermaid diagram was unexpectedly compacted");
     if ((await small.locator(".artifact-compact-diagram").count()) !== 0) throw new Error("Small Mermaid diagram gained crop chrome");
     if ((await small.getByText("Diagram continues · Click to inspect").count()) !== 0) throw new Error("Small Mermaid diagram gained an inspection affordance");
+
+    if (await medium.getAttribute("data-artifact-compact")) throw new Error("10-node Mermaid diagram was unexpectedly compacted");
+    if ((await medium.locator(".artifact-compact-diagram").count()) !== 0) throw new Error("10-node Mermaid diagram gained crop chrome");
 
     await large.locator(".artifact-body").click();
     const panel = page.getByRole("complementary", { name: "Artifact panel" });

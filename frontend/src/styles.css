@@ -7830,6 +7830,13 @@ textarea.composer-command-input {
   overflow: hidden;
   border: 1px solid var(--background-modifier-border);
   background: var(--background-primary);
+  cursor: zoom-in;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.artifact-compact-diagram:hover {
+  border-color: var(--accent-primary);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent-primary) 24%, transparent);
 }
 
 .artifact-compact-diagram .artifact-mermaid,
@@ -7880,7 +7887,8 @@ textarea.composer-command-input {
   border: 1px solid var(--background-modifier-border);
   border-radius: var(--radius-full);
   background: var(--background-secondary);
-  color: var(--text-muted);
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--background-primary) 45%, transparent);
+  color: var(--text-normal);
   font-family: var(--font-monospace);
   font-weight: var(--font-monospace-weight);
   font-size: var(--fs-2xs);
