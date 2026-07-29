@@ -56,6 +56,53 @@ def iteration_cap_for(graph: dict[str, Any]) -> int:
     return graph_module.DEFAULT_ITERATION_CAP
 
 
+def load_validated_graph(
+    ticket: str,
+    *,
+    status_dir: Any,
+    snapshot_dir: Any | None = None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Load one graph through the fleet monitor's hot/snapshot fallback.
+
+    The fleet graph endpoint uses the same fail-closed loader as composite
+    health.  ``source`` is ``live`` for a hot graph and ``snapshot`` for a
+    durable archive; callers can use it to classify edges without inspecting
+    the filesystem themselves.
+    """
+
+    try:
+        graph_module = _workgraph_module()
+    except ModuleNotFoundError:
+        return None, None
+
+    def valid(candidate: object) -> dict[str, Any] | None:
+        if not isinstance(candidate, dict):
+            return None
+        try:
+            violations = graph_module.graph_lint.validate_document(candidate, "workgraph")
+        except Exception:
+            logger.exception("fleet_graph: could not validate graph for %s", ticket)
+            return None
+        return candidate if not violations else None
+
+    try:
+        graph = graph_module.load_workgraph(ticket, status_dir)
+    except graph_module.WorkgraphCorruptError:
+        graph = None
+    if graph is not None:
+        graph = valid(graph)
+        if graph is not None:
+            return graph, "live"
+
+    try:
+        graph = graph_module.load_snapshot(ticket, snapshot_dir)
+    except Exception:
+        logger.exception("fleet_graph: could not load snapshot for %s", ticket)
+        return None, None
+    graph = valid(graph)
+    return (graph, "snapshot") if graph is not None else (None, None)
+
+
 @dataclass
 class GraphHealthSnapshot:
     """Alarm state for one ticket-level composite-health scan."""
@@ -134,73 +181,13 @@ class GraphHealthMonitor:
         """Load a validated hot graph, falling back to a validated snapshot."""
 
         self._degraded_tickets.discard(ticket)
-        try:
-            graph_module = _workgraph_module()
-        except ModuleNotFoundError as exc:
-            logger.error("fleet_monitor: graph support unavailable for %s: %s", ticket, exc)
+        graph, _source = load_validated_graph(
+            ticket,
+            status_dir=self.store.paths.status_dir,
+        )
+        if graph is None or _source != "live":
             self._degraded_tickets.add(ticket)
-            return None
-
-        def valid(candidate: object, source: str) -> dict[str, Any] | None:
-            if not isinstance(candidate, dict):
-                logger.error("fleet_monitor: %s graph for %s is not an object", source, ticket)
-                return None
-            try:
-                violations = graph_module.graph_lint.validate_document(
-                    candidate, "workgraph"
-                )
-            except Exception as exc:
-                logger.error(
-                    "fleet_monitor: could not validate %s workgraph for %s: %s",
-                    source,
-                    ticket,
-                    exc,
-                )
-                return None
-            if violations:
-                logger.error(
-                    "fleet_monitor: %s workgraph for %s failed schema validation: %s",
-                    source,
-                    ticket,
-                    violations,
-                )
-                return None
-            return candidate
-
-        try:
-            graph = graph_module.load_workgraph(ticket, self.store.paths.status_dir)
-        except ModuleNotFoundError:
-            self._degraded_tickets.add(ticket)
-            return None
-        except graph_module.WorkgraphCorruptError as exc:
-            logger.error(
-                "fleet_monitor: hot workgraph unavailable for %s; trying snapshot: %s",
-                ticket,
-                exc,
-            )
-            self._degraded_tickets.add(ticket)
-            graph = None
-        if graph is not None:
-            validated = valid(graph, "hot")
-            if validated is not None:
-                return validated
-            self._degraded_tickets.add(ticket)
-            logger.error(
-                "fleet_monitor: hot workgraph unavailable for %s; trying snapshot",
-                ticket,
-            )
-        else:
-            self._degraded_tickets.add(ticket)
-        try:
-            snapshot = graph_module.load_snapshot(ticket)
-        except Exception as exc:
-            self._degraded_tickets.add(ticket)
-            logger.error("fleet_monitor: could not load graph snapshot for %s: %s", ticket, exc)
-            return None
-        validated = valid(snapshot, "durable snapshot")
-        if validated is None:
-            self._degraded_tickets.add(ticket)
-        return validated
+        return graph
 
     _iteration_cap = staticmethod(iteration_cap_for)
 

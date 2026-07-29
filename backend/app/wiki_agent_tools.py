@@ -7,6 +7,7 @@ from urllib.parse import quote, urlencode
 from uuid import uuid4
 
 from . import backend_runtime
+from .next_review_schema import mcp_input_schema
 
 
 class AgentToolError(RuntimeError):
@@ -150,6 +151,16 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "id": {"type": "string", "minLength": 1},
                 "outcome": {"enum": ["merged", "closed", "abandoned"]},
             },
+        },
+    },
+    {
+        "name": "next_review",
+        "description": (
+            "Run the merge-ready gate and start the next pinned PR reviewer in one "
+            "idempotent operation. The reviewer stays grouped under this orchestrator."
+        ),
+        "inputSchema": {
+            **mcp_input_schema(),
         },
     },
 ]
@@ -328,6 +339,32 @@ def archive_agent(arguments: Any) -> dict[str, Any]:
     )
 
 
+def next_review(arguments: Any) -> dict[str, Any]:
+    values = _arguments(
+        arguments,
+        required={"ticket", "pr_number", "expected_sha"},
+        optional={
+            "reviewer_kind",
+            "reviewer_model",
+            "reviewer_effort",
+            "prompt_template",
+            "request_id",
+        },
+    )
+    reviewer_kind = values.setdefault("reviewer_kind", "cdx")
+    values.setdefault("reviewer_model", "gpt-5.6-sol")
+    if reviewer_kind == "cdx":
+        values.setdefault("reviewer_effort", "high")
+    else:
+        values.pop("reviewer_effort", None)
+    values.setdefault("request_id", str(uuid4()))
+    orch = os.environ.get("WIKI_AGENT_ID")
+    if not orch:
+        raise AgentToolError("WIKI_AGENT_ID is missing from the orchestrator runtime")
+    values["orch"] = orch
+    return _backend_api("POST", "/api/agents/next-review", values)
+
+
 TOOL_HANDLERS = {
     "list_agents": list_agents,
     "read_agent": read_agent,
@@ -337,6 +374,7 @@ TOOL_HANDLERS = {
     "steer_agent": steer_agent,
     "replace_agent": replace_agent,
     "archive_agent": archive_agent,
+    "next_review": next_review,
 }
 
 
