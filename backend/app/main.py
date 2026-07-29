@@ -4078,6 +4078,26 @@ def provision_pinned_worktree(
 
     workdir = workdir.resolve()
     repo_root = repo_root.resolve()
+    try:
+        canonical_sha_result = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "--verify", f"{expected_sha}^{{commit}}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"git rev-parse failed: {exc}") from exc
+    if canonical_sha_result.returncode != 0 or not canonical_sha_result.stdout.strip():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                canonical_sha_result.stderr
+                or canonical_sha_result.stdout
+                or f"could not resolve commit {expected_sha}"
+            ).strip()[:400],
+        )
+    expected_sha = canonical_sha_result.stdout.strip()
     if workdir.exists():
         if not workdir.is_dir() or not (workdir / ".git").exists():
             raise HTTPException(

@@ -1,16 +1,33 @@
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from backend.app.agent_runtime import next_review as next_review_module
+from backend.app import main
 from backend.app.main import SpawnWorkerIn
 
 
 class NextReviewTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.runtime_tmp = tempfile.TemporaryDirectory()
+        self.runtime_patch = mock.patch.object(
+            main, "AGENT_RUNTIME_DIR", Path(self.runtime_tmp.name)
+        )
+        self.runtime_patch.start()
         next_review_module._REQUEST_RESULTS.clear()  # noqa: SLF001
         next_review_module._REQUEST_STAGES.clear()  # noqa: SLF001
+        next_review_module._REQUEST_STATE_LOADED = False  # noqa: SLF001
+
+    def tearDown(self) -> None:
+        next_review_module._REQUEST_RESULTS.clear()  # noqa: SLF001
+        next_review_module._REQUEST_STAGES.clear()  # noqa: SLF001
+        next_review_module._REQUEST_STATE_LOADED = False  # noqa: SLF001
+        self.runtime_patch.stop()
+        self.runtime_tmp.cleanup()
 
     def test_happy_path_increments_round_spawns_and_archives_previous(self) -> None:
         calls: list[tuple[str, object]] = []
@@ -43,7 +60,6 @@ class NextReviewTests(unittest.TestCase):
             archive=archive,
             archived=lambda: [
                 {"ticket": "WIKI-171-REVIEW1"},
-                {"ticket": "WIKI-171-REVIEW3"},
             ],
             registry=lambda: {
                 "WIKI-171-REVIEW3": {"current": {"state": "completed"}}
@@ -125,23 +141,29 @@ class NextReviewTests(unittest.TestCase):
 
     def test_merge_ready_previous_reviewer_is_archived(self) -> None:
         archived: list[str] = []
-
-        result = next_review_module.next_review(
-            "WIKI-171",
-            171,
-            "d" * 40,
-            orch="wiki",
-            gate=lambda _pr, _sha: {"verdict": "pass"},
-            resolve_root=lambda _orch: Path("/repo"),
-            worktree=lambda **_kwargs: Path("/repo/review3"),
-            spawn=lambda _request: {"run_id": "run-3"},
-            archive=lambda reviewer: archived.append(reviewer) or {"outcome": "closed"},
-            archived=lambda: [{"ticket": "WIKI-171-REVIEW1"}],
-            registry=lambda: {
-                "WIKI-171-REVIEW2": {"current": {"state": "merge-ready"}}
-            },
-            request_id="merge-ready-previous",
+        status_dir = Path(self.runtime_tmp.name) / "status"
+        status_dir.mkdir()
+        (status_dir / "WIKI-171-REVIEW2.json").write_text(
+            json.dumps({"state": "merge-ready"}), encoding="utf-8"
         )
+
+        with mock.patch.object(main, "AGENT_STATUS_DIR", status_dir):
+            result = next_review_module.next_review(
+                "WIKI-171",
+                171,
+                "d" * 40,
+                orch="wiki",
+                gate=lambda _pr, _sha: {"verdict": "pass"},
+                resolve_root=lambda _orch: Path("/repo"),
+                worktree=lambda **_kwargs: Path("/repo/review3"),
+                spawn=lambda _request: {"run_id": "run-3"},
+                archive=lambda reviewer: archived.append(reviewer) or {"outcome": "closed"},
+                archived=lambda: [{"ticket": "WIKI-171-REVIEW1"}],
+                registry=lambda: {
+                    "WIKI-171-REVIEW2": {"current": {"state": "working"}}
+                },
+                request_id="merge-ready-previous",
+            )
 
         self.assertEqual(result["reviewer"], "WIKI-171-REVIEW3")
         self.assertEqual(archived, ["WIKI-171-REVIEW2"])
@@ -186,6 +208,108 @@ class NextReviewTests(unittest.TestCase):
         self.assertEqual(result["run_id"], "run-3")
         self.assertEqual(spawn_count, 1)
         self.assertEqual(archive_count, 2)
+
+    def test_spawn_boundary_retry_reuses_durable_reviewer_intent(self) -> None:
+        spawn_count = 0
+        spawned: dict[str, str] = {}
+        request_id = "spawn-boundary"
+
+        def spawn(request: SpawnWorkerIn) -> dict:
+            nonlocal spawn_count
+            if request.request_id not in spawned:
+                spawn_count += 1
+                spawned[request.request_id or ""] = "run-3"
+            return {"run_id": spawned[request.request_id or ""]}
+
+        original_persist = next_review_module._persist_request_state  # noqa: SLF001
+        raised = False
+
+        def fail_after_spawn() -> None:
+            nonlocal raised
+            staged = next_review_module._REQUEST_STAGES.get(request_id)  # noqa: SLF001
+            if staged and staged.get("spawn_completed") and not raised:
+                raised = True
+                raise RuntimeError("crash after spawn")
+            original_persist()
+
+        kwargs = dict(
+            ticket="WIKI-171",
+            pr_number=171,
+            expected_sha="1" * 40,
+            orch="wiki",
+            gate=lambda _pr, _sha: {"verdict": "pass"},
+            resolve_root=lambda _orch: Path("/repo"),
+            worktree=lambda **_kwargs: Path("/repo/review3"),
+            spawn=spawn,
+            archive=lambda _reviewer: {"outcome": "closed"},
+            archived=lambda: [],
+            registry=lambda: {
+                "WIKI-171-REVIEW2": {"current": {"state": "completed"}}
+            },
+            request_id=request_id,
+        )
+        with mock.patch.object(next_review_module, "_persist_request_state", fail_after_spawn):
+            with self.assertRaisesRegex(RuntimeError, "crash after spawn"):
+                next_review_module.next_review(**kwargs)
+
+        next_review_module._REQUEST_RESULTS.clear()  # noqa: SLF001
+        next_review_module._REQUEST_STAGES.clear()  # noqa: SLF001
+        next_review_module._REQUEST_STATE_LOADED = False  # noqa: SLF001
+        result = next_review_module.next_review(**kwargs)
+
+        self.assertEqual(result["reviewer"], "WIKI-171-REVIEW3")
+        self.assertEqual(result["run_id"], "run-3")
+        self.assertEqual(spawn_count, 1)
+
+    def test_archive_boundary_retry_verifies_archive_before_retrying(self) -> None:
+        archive_count = 0
+        archived_rows: list[dict[str, str]] = []
+        request_id = "archive-boundary"
+
+        def archive(reviewer: str) -> dict:
+            nonlocal archive_count
+            archive_count += 1
+            archived_rows.append({"ticket": reviewer})
+            return {"outcome": "closed"}
+
+        original_persist = next_review_module._persist_request_state  # noqa: SLF001
+        raised = False
+
+        def fail_after_archive() -> None:
+            nonlocal raised
+            staged = next_review_module._REQUEST_STAGES.get(request_id)  # noqa: SLF001
+            if staged and staged.get("archive_completed") and not raised:
+                raised = True
+                raise RuntimeError("crash after archive")
+            original_persist()
+
+        kwargs = dict(
+            ticket="WIKI-171",
+            pr_number=171,
+            expected_sha="2" * 40,
+            orch="wiki",
+            gate=lambda _pr, _sha: {"verdict": "pass"},
+            resolve_root=lambda _orch: Path("/repo"),
+            worktree=lambda **_kwargs: Path("/repo/review3"),
+            spawn=lambda _request: {"run_id": "run-3"},
+            archive=archive,
+            archived=lambda: list(archived_rows),
+            registry=lambda: {
+                "WIKI-171-REVIEW2": {"current": {"state": "completed"}}
+            },
+            request_id=request_id,
+        )
+        with mock.patch.object(next_review_module, "_persist_request_state", fail_after_archive):
+            with self.assertRaisesRegex(RuntimeError, "crash after archive"):
+                next_review_module.next_review(**kwargs)
+
+        next_review_module._REQUEST_RESULTS.clear()  # noqa: SLF001
+        next_review_module._REQUEST_STAGES.clear()  # noqa: SLF001
+        next_review_module._REQUEST_STATE_LOADED = False  # noqa: SLF001
+        result = next_review_module.next_review(**kwargs)
+
+        self.assertEqual(result["reviewer"], "WIKI-171-REVIEW3")
+        self.assertEqual(archive_count, 1)
 
     def test_claude_review_defaults_effort_to_none(self) -> None:
         captured: list[SpawnWorkerIn] = []

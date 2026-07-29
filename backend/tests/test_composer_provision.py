@@ -165,6 +165,23 @@ class ProvisionWorktreeTests(unittest.TestCase):
         result = main.composer_provision_worktree(body, "wiki")
         self.assertFalse(result["provisioned"])
 
+    def test_pinned_worktree_accepts_short_sha_for_existing_worktree(self) -> None:
+        full_sha = subprocess.check_output(
+            ["git", "-C", str(self.repo), "rev-parse", "origin/main"], text=True
+        ).strip()
+        short_sha = full_sha[:7]
+        workdir = self.repo / ".codex" / "worktrees" / "short-sha"
+
+        main.provision_pinned_worktree(self.repo, workdir, full_sha)
+        main.provision_pinned_worktree(self.repo, workdir, short_sha)
+
+        self.assertEqual(
+            subprocess.check_output(
+                ["git", "-C", str(workdir), "rev-parse", "HEAD"], text=True
+            ).strip(),
+            full_sha,
+        )
+
     def test_rejects_unknown_orchestrator(self) -> None:
         self._write_registry(self._orch_registry("wiki"))
         body = main.ComposerProvisionIn(ticket="WIKI-999")
