@@ -2,10 +2,18 @@
 type: log
 tags: [log, done]
 created: 2026-07-06
-updated: 2026-07-27
+updated: 2026-07-29
 ---
 
 # Done
+
+## 2026-07-29
+
+- WIKI-172 merged c604ad3 — merge-ready loop UI: ticket-level chrome (round N/8 subdued/warning/danger tiers, unrouted verdict badge {0,1}, plateau counter w/ first-line normalization + similarity, expandable history panel via canonical workgraph edges), backend loop_state.py derivation, cap chain graph→template→default (F4 rejection upheld, WIKI-164 doctrine). 3 rounds.
+- WIKI-171 merged c713e87 — next-review orchestrator primitive: single MCP tool + endpoint collapsing gate + worktree + spawn + prev-archive per merge-ready round (crash-safe journal-before-side-effect w/ archive reconciliation, status-file terminal-state derivation, short-SHA canonicalization, AGENT_STATUS_DIR + operations-journal test isolation, MCP schema shared w/ NextReviewIn, cc-optional effort). 4 rounds.
+- WIKI-170 merged 0f1493b — fleet-wide DAG rollup: /fleet/graph endpoint aggregating live workers + last N archived per orch via graph_health loader (bounded metadata-first slice, headless orch bucket seeding, endpoint classification via node_tickets for legacy N-* nodes), frontend fleet-graph.tsx w/ orch groups + client-side filter chips. 3 rounds.
+- WIKI-169 merged 63542b9 — workgraph timeline scrubber: per-ticket snapshot list endpoint (metadata-only, sidecar-persisted at write time), graph-at-revision endpoint w/ closest-older fallback, frontend slider + play/pause + AbortController on rapid scrubs. 2 rounds.
+- WIKI-167 merged 4f9ab19 — compact Mermaid preview readability: swapped scale-to-fit to native-size cropped preview w/ visible hover/click affordance; swapped --interactive-accent (undefined in all themes) to canonical --accent-primary; added computed border/ring regression w/ mutation proof + gruvbox-light screenshot. 2 rounds.
 
 ## 2026-07-27
 
