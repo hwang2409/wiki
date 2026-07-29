@@ -163,6 +163,24 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             **mcp_input_schema(),
         },
     },
+    {
+        "name": "rebase_dirty_pr",
+        "description": (
+            "If a PR gate reports CONFLICTING, start a scoped low-effort Codex "
+            "helper in the existing worker worktree to resolve mechanical "
+            "conflicts and escalate semantic conflicts."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["pr_number", "ticket", "worker_id"],
+            "properties": {
+                "pr_number": {"type": "integer", "minimum": 1},
+                "ticket": {"type": "string", "minLength": 1},
+                "worker_id": {"type": "string", "minLength": 1},
+            },
+        },
+    },
 ]
 
 
@@ -365,6 +383,13 @@ def next_review(arguments: Any) -> dict[str, Any]:
     return _backend_api("POST", "/api/agents/next-review", values)
 
 
+def rebase_dirty_pr(arguments: Any) -> dict[str, Any]:
+    values = _arguments(arguments, required={"pr_number", "ticket", "worker_id"})
+    if not isinstance(values["pr_number"], int) or isinstance(values["pr_number"], bool):
+        raise AgentToolError("pr_number must be an integer")
+    return _backend_api("POST", "/api/agents/rebase-dirty-pr", values)
+
+
 TOOL_HANDLERS = {
     "list_agents": list_agents,
     "read_agent": read_agent,
@@ -375,6 +400,7 @@ TOOL_HANDLERS = {
     "replace_agent": replace_agent,
     "archive_agent": archive_agent,
     "next_review": next_review,
+    "rebase_dirty_pr": rebase_dirty_pr,
 }
 
 

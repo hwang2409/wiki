@@ -3491,6 +3491,12 @@ class SpawnWorkerIn(BaseModel):
         return self
 
 
+class RebaseDirtyPrIn(BaseModel):
+    pr_number: int = Field(..., ge=1)
+    ticket: str = Field(..., min_length=1, max_length=80, pattern=r"^[A-Z0-9-]+$")
+    worker_id: str = Field(..., min_length=1, max_length=100)
+
+
 class SpawnOrchestratorIn(BaseModel):
     id: str = Field(..., min_length=1, max_length=100)
     workdir: str = Field(..., min_length=1, max_length=4096)
@@ -4120,6 +4126,19 @@ def next_review_route(body: NextReviewIn) -> dict[str, Any]:
         reviewer_effort=body.reviewer_effort,
         prompt_template=body.prompt_template,
         request_id=body.request_id,
+    )
+
+
+@app.post("/api/agents/rebase-dirty-pr")
+def rebase_dirty_pr_route(body: RebaseDirtyPrIn) -> dict[str, Any]:
+    """Start the scoped conflict helper only when the PR is DIRTY."""
+
+    from .agent_runtime.rebase_bot import rebase_dirty_pr
+
+    return rebase_dirty_pr(
+        pr_number=body.pr_number,
+        ticket=body.ticket,
+        worker_id=body.worker_id,
     )
 
 
