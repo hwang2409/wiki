@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 import threading
 from collections.abc import Callable, Mapping
+import json
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -22,11 +23,14 @@ _TERMINAL_STATES = {
     "completed",
     "dead",
     "failed",
+    "merge-ready",
     "stopped",
     "terminal",
 }
 _REQUEST_LOCK = threading.RLock()
 _REQUEST_RESULTS: dict[str, dict[str, Any]] = {}
+_REQUEST_STAGES: dict[str, dict[str, Any]] = {}
+_REQUEST_STATE_LOADED = False
 
 
 def _main() -> Any:
@@ -37,11 +41,46 @@ def _main() -> Any:
     return main
 
 
-def _gate(pr_number: int, expected_sha: str) -> Mapping[str, Any]:
-    main = _main()
-    return main.composer_gate(
-        main.ComposerGateIn(pr=str(pr_number), expect_sha=expected_sha)
+def _request_state_path() -> Path:
+    return Path(_main().AGENT_RUNTIME_DIR) / "next-review-operations.json"
+
+
+def _load_request_state() -> None:
+    global _REQUEST_STATE_LOADED
+    if _REQUEST_STATE_LOADED:
+        return
+    _REQUEST_STATE_LOADED = True
+    try:
+        payload = json.loads(_request_state_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(payload, Mapping):
+        return
+    completed = payload.get("completed")
+    staged = payload.get("staged")
+    if isinstance(completed, Mapping):
+        _REQUEST_RESULTS.update(
+            {key: dict(value) for key, value in completed.items() if isinstance(key, str) and isinstance(value, Mapping)}
+        )
+    if isinstance(staged, Mapping):
+        _REQUEST_STAGES.update(
+            {key: dict(value) for key, value in staged.items() if isinstance(key, str) and isinstance(value, Mapping)}
+        )
+
+
+def _persist_request_state() -> None:
+    path = _request_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(
+            {"completed": _REQUEST_RESULTS, "staged": _REQUEST_STAGES},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
     )
+    temporary.replace(path)
 
 
 def _resolve_root(orch: str) -> Path:
@@ -60,38 +99,6 @@ def _worktree(
     slug = ticket.lower()
     worktree = (repo_root / ".codex" / "worktrees" / f"{slug}-review{round_number}").resolve()
     return _main().provision_pinned_worktree(repo_root, worktree, expected_sha)
-
-
-def _spawn(
-    *,
-    reviewer_id: str,
-    kind: str,
-    model: str,
-    effort: str,
-    worktree: Path,
-    prompt: str,
-    orch: str,
-    request_id: str,
-) -> Mapping[str, Any]:
-    main = _main()
-    return main.spawn_agent(
-        main.SpawnWorkerIn(
-            ticket=reviewer_id,
-            kind=kind,
-            role="review",
-            model=model,
-            effort=effort,
-            workdir=str(worktree),
-            prompt=prompt,
-            orch=orch,
-            request_id=request_id,
-        )
-    )
-
-
-def _archive(reviewer_id: str) -> Mapping[str, Any]:
-    main = _main()
-    return main.archive_agent(reviewer_id, main.AgentArchiveIn(outcome="closed"))
 
 
 def _archived_reviewers(ticket: str, archived: list[Mapping[str, Any]]) -> dict[str, int]:
@@ -210,7 +217,7 @@ def next_review(
     expected_sha: str,
     reviewer_kind: str = "cdx",
     reviewer_model: str = "gpt-5.6-sol",
-    reviewer_effort: str = "high",
+    reviewer_effort: str | None = None,
     prompt_template: str | None = None,
     request_id: str | None = None,
     *,
@@ -235,6 +242,10 @@ def next_review(
         raise ValueError("expected_sha must be a git commit sha")
     if reviewer_kind not in {"cc", "cdx"}:
         raise ValueError("reviewer_kind must be cc or cdx")
+    if reviewer_kind == "cdx":
+        reviewer_effort = reviewer_effort or "high"
+    elif reviewer_effort is not None:
+        raise ValueError("Claude reviewers do not accept reasoning effort")
     if reviewer_kind == "cdx" and reviewer_effort not in {
         "minimal",
         "low",
@@ -243,18 +254,43 @@ def next_review(
         "xhigh",
     }:
         raise ValueError("reviewer_effort is invalid")
-    if reviewer_kind == "cc" and reviewer_effort:
-        raise ValueError("Claude reviewers do not accept reasoning effort")
-
     request_id = request_id or str(uuid4())
     with _REQUEST_LOCK:
+        _load_request_state()
         previous_result = _REQUEST_RESULTS.get(request_id)
         if previous_result is not None:
             return dict(previous_result)
 
-        gate_fn = gate or _gate
+        staged = _REQUEST_STAGES.get(request_id)
+        if staged is not None:
+            main = _main()
+            if (
+                staged.get("previous_reviewer") is not None
+                and not staged.get("archive_completed", False)
+            ):
+                if archive is not None:
+                    archive_result = archive(staged["previous_reviewer"])
+                else:
+                    archive_result = main.archive_agent(
+                        staged["previous_reviewer"], main.AgentArchiveIn(outcome="closed")
+                    )
+                staged["archive_completed"] = True
+                staged["archive_result"] = dict(archive_result)
+                _persist_request_state()
+            result = _staged_result(staged, staged.get("archive_result"))
+            _REQUEST_RESULTS[request_id] = dict(result)
+            _REQUEST_STAGES.pop(request_id, None)
+            _persist_request_state()
+            return result
+
+        main = _main()
         try:
-            verdict = gate_fn(pr_number, expected_sha)
+            if gate is not None:
+                verdict = gate(pr_number, expected_sha)
+            else:
+                verdict = main.composer_gate(
+                    main.ComposerGateIn(pr=str(pr_number), expect_sha=expected_sha)
+                )
         except Exception as exc:  # gate failures are a normal branch of this API
             return {"status": "gate_failed", "detail": str(exc)}
         if not isinstance(verdict, Mapping) or (
@@ -267,7 +303,6 @@ def next_review(
             ) or "merge-ready gate failed"
             return {"status": "gate_failed", "detail": str(detail)}
 
-        main = _main()
         if archived is None:
             archived_rows = list(main.list_archived(limit=None))
         else:
@@ -294,22 +329,20 @@ def next_review(
             round_number=round_number,
             previous_reviewer=previous_reviewer,
         )
-        spawn_result = (spawn or _spawn)(
-            reviewer_id=reviewer_id,
+        spawn_args = main.SpawnWorkerIn(
+            ticket=reviewer_id,
             kind=reviewer_kind,
+            role="review",
             model=reviewer_model,
             effort=reviewer_effort,
-            worktree=worktree_path,
+            workdir=str(worktree_path),
             prompt=prompt,
             orch=orch,
             request_id=request_id,
         )
-        archived_result = None
-        if previous_reviewer is not None:
-            archived_result = (archive or _archive)(previous_reviewer)
-
-        result: dict[str, Any] = {
-            "status": "spawned",
+        spawn_result = spawn(spawn_args) if spawn is not None else main.spawn_agent(spawn_args)
+        staged = {
+            "status": "staged",
             "ticket": ticket.upper(),
             "reviewer": reviewer_id,
             "round": round_number,
@@ -318,12 +351,49 @@ def next_review(
             "expected_sha": expected_sha,
             "orch": orch,
             "request_id": request_id,
+            "previous_reviewer": previous_reviewer,
+            "spawn_completed": True,
+            "archive_completed": previous_reviewer is None,
         }
+        _REQUEST_STAGES[request_id] = staged
+        _persist_request_state()
+        archived_result = None
         if previous_reviewer is not None:
-            result["archived_reviewer"] = previous_reviewer
-            result["archive"] = archived_result
+            if archive is not None:
+                archived_result = archive(previous_reviewer)
+            else:
+                archived_result = main.archive_agent(
+                    previous_reviewer, main.AgentArchiveIn(outcome="closed")
+                )
+            staged["archive_completed"] = True
+            staged["archive_result"] = dict(archived_result)
+            _persist_request_state()
+
+        result = _staged_result(staged, archived_result)
+        _REQUEST_STAGES.pop(request_id, None)
         _REQUEST_RESULTS[request_id] = dict(result)
+        _persist_request_state()
         return result
+
+
+def _staged_result(
+    staged: Mapping[str, Any], archive_result: Mapping[str, Any] | None
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "status": "spawned",
+        "ticket": staged["ticket"],
+        "reviewer": staged["reviewer"],
+        "round": staged["round"],
+        "run_id": staged["run_id"],
+        "worktree": staged["worktree"],
+        "expected_sha": staged["expected_sha"],
+        "orch": staged["orch"],
+        "request_id": staged["request_id"],
+    }
+    if staged.get("previous_reviewer") is not None:
+        result["archived_reviewer"] = staged["previous_reviewer"]
+        result["archive"] = archive_result
+    return result
 
 
 __all__ = ["next_review"]

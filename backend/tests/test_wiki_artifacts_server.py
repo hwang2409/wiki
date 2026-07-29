@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from backend.app import wiki_agent_tools, wiki_artifacts
+from backend.app.next_review_schema import NextReviewIn, mcp_input_schema
 
 
 RUN_ID = "00000000-0000-4000-8000-000000000085"
@@ -304,6 +305,13 @@ class WikiArtifactsTests(unittest.TestCase):
         assert calls[0][2] is not None
         self.assertEqual(calls[0][2]["orch"], "wiki")
         self.assertEqual(calls[0][2]["request_id"], "mcp-next-review-1")
+
+    def test_next_review_mcp_constraints_match_endpoint_model(self) -> None:
+        endpoint = NextReviewIn.model_json_schema()["properties"]
+        mcp = mcp_input_schema()["properties"]
+        for field in ("ticket", "expected_sha", "reviewer_model"):
+            self.assertEqual(mcp[field], endpoint[field])
+        self.assertNotIn("orch", mcp)
 
     def test_orchestrator_operations_route_through_the_live_backend(self) -> None:
         calls: list[tuple[str, str, dict | None]] = []

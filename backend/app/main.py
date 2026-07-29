@@ -57,6 +57,7 @@ from .agent_runtime.client import (
 )
 from .agent_runtime.store import RuntimePaths
 from .frontend_static import mount_frontend_static
+from .next_review_schema import NextReviewIn
 
 
 ROOT_DIR = Path(os.environ.get("WIKI_REPO_DIR", Path(__file__).resolve().parents[2])).resolve()
@@ -3140,18 +3141,6 @@ class SpawnOrchestratorIn(BaseModel):
 
 class AgentArchiveIn(BaseModel):
     outcome: str = Field(pattern="^(merged|closed|abandoned)$")
-
-
-class NextReviewIn(BaseModel):
-    ticket: str = Field(..., min_length=1, max_length=80, pattern=r"^[A-Z0-9-]+$")
-    pr_number: int = Field(..., ge=1)
-    expected_sha: str = Field(..., min_length=7, max_length=64, pattern=r"^[0-9a-fA-F]+$")
-    orch: str = Field(..., min_length=1, max_length=100)
-    reviewer_kind: str = Field(default="cdx", pattern="^(cc|cdx)$")
-    reviewer_model: str = Field(default="gpt-5.6-sol", min_length=2, max_length=64)
-    reviewer_effort: str = Field(default="high", pattern="^(minimal|low|medium|high|xhigh)$")
-    prompt_template: str | None = Field(default=None, max_length=100_000)
-    request_id: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 def _allowed_model_message(kind: str, model: str, *, target: str) -> str:
