@@ -3294,6 +3294,7 @@ ARTIFACT_MEDIA_TYPES = {
     "png": "image/png",
     "jpg": "image/jpeg",
     "webp": "image/webp",
+    "pdf": "application/pdf",
 }
 
 

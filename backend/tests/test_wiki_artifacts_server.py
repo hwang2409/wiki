@@ -69,6 +69,9 @@ def _payload(kind: str) -> dict:
                 "flags": [True, False, True],
             },
         },
+        "pdf": {
+            "data_base64": base64.b64encode(b"%PDF-1.4\n%fixture bytes\n").decode(),
+        },
     }[kind]
 
 
@@ -120,6 +123,20 @@ class WikiArtifactsTests(unittest.TestCase):
                     )
                     self.assertEqual(image.read_bytes(), b"fixture-png")
                     self.assertEqual(image.stat().st_mode & 0o777, 0o600)
+                elif kind == "pdf":
+                    self.assertNotIn("data_base64", event["artifact"])
+                    self.assertNotIn("path", event["artifact"])
+                    self.assertEqual(event["artifact"]["mime"], wiki_artifacts.PDF_MIME)
+                    pdf = (
+                        self.root
+                        / "runtime"
+                        / "runs"
+                        / RUN_ID
+                        / "artifacts"
+                        / f"{event['id']}.pdf"
+                    )
+                    self.assertTrue(pdf.read_bytes().startswith(b"%PDF-"))
+                    self.assertEqual(pdf.stat().st_mode & 0o777, 0o600)
                 else:
                     for key, value in _payload(kind).items():
                         self.assertEqual(event["artifact"][key], value)
@@ -138,6 +155,7 @@ class WikiArtifactsTests(unittest.TestCase):
             "diff": {},
             "file-list": {"files": [{"label": "missing path"}]},
             "json": {},
+            "pdf": {"data_base64": base64.b64encode(b"not a pdf").decode()},
         }
         for kind, payload in malformed.items():
             with self.subTest(kind=kind), self.assertRaises(
@@ -419,6 +437,64 @@ class WikiArtifactsTests(unittest.TestCase):
             / f"{event['id']}.png"
         )
         self.assertEqual(target.read_bytes(), b"fixture-png")
+
+    def test_pdf_accepts_base64_and_path_payload_variants(self) -> None:
+        pdf_bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n"
+
+        base_event = wiki_artifacts.render_artifact(
+            {
+                "kind": "pdf",
+                "title": "Base64 PDF",
+                "payload": {"data_base64": base64.b64encode(pdf_bytes).decode()},
+            }
+        )
+        self.assertEqual(base_event["artifact"]["mime"], wiki_artifacts.PDF_MIME)
+        self.assertEqual(base_event["artifact"]["byte_size"], len(pdf_bytes))
+
+        source = self.root / "source.pdf"
+        source.write_bytes(pdf_bytes)
+        path_event = wiki_artifacts.render_artifact(
+            {"kind": "pdf", "payload": {"path": str(source)}}
+        )
+        stored = (
+            self.root
+            / "runtime"
+            / "runs"
+            / RUN_ID
+            / "artifacts"
+            / f"{path_event['id']}.pdf"
+        )
+        self.assertEqual(stored.read_bytes(), pdf_bytes)
+
+    def test_pdf_rejects_ambiguous_and_unsafe_payloads(self) -> None:
+        pdf_bytes = b"%PDF-1.4\nx\n"
+        with self.assertRaises(wiki_artifacts.ArtifactValidationError):
+            wiki_artifacts.render_artifact(
+                {
+                    "kind": "pdf",
+                    "payload": {
+                        "data_base64": base64.b64encode(pdf_bytes).decode(),
+                        "path": "/etc/passwd",
+                    },
+                }
+            )
+        with self.assertRaises(wiki_artifacts.ArtifactValidationError):
+            wiki_artifacts.render_artifact({"kind": "pdf", "payload": {}})
+        with self.assertRaises(wiki_artifacts.ArtifactValidationError):
+            wiki_artifacts.render_artifact(
+                {"kind": "pdf", "payload": {"path": "relative/path.pdf"}}
+            )
+        symlink_target = self.root / "symlinked.pdf"
+        real = self.root / "real.pdf"
+        real.write_bytes(pdf_bytes)
+        try:
+            symlink_target.symlink_to(real)
+        except OSError:  # symlinks unsupported in this environment
+            return
+        with self.assertRaises(wiki_artifacts.ArtifactValidationError):
+            wiki_artifacts.render_artifact(
+                {"kind": "pdf", "payload": {"path": str(symlink_target)}}
+            )
 
     def test_storage_failure_returns_a_tool_error_without_crashing_server(self) -> None:
         with mock.patch.object(wiki_artifacts, "render_artifact", side_effect=OSError("disk full")):

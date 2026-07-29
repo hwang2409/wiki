@@ -10864,3 +10864,231 @@ textarea.composer-command-input {
   color: var(--text-faint);
   text-align: center;
 }
+
+
+/* PDF artifact — solid framing, dense chrome, silky page transitions. */
+
+.artifact-pdf-compact {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-self: flex-start;
+}
+
+.artifact-pdf-compact-frame {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-xs);
+  background: var(--background-secondary);
+  box-shadow: 0 1px 0 color-mix(in srgb, var(--background-primary) 60%, transparent) inset;
+  transition: border-color 150ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.artifact-pdf-compact-frame:hover {
+  border-color: color-mix(in srgb, var(--accent-primary) 30%, var(--background-modifier-border));
+}
+
+.artifact-pdf-compact-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  transition: opacity 150ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.artifact-pdf-compact-meta {
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--fs-2xs);
+}
+
+.artifact-pdf-detail {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.artifact-pdf-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  justify-content: flex-start;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+}
+
+.artifact-pdf-toolbar-group {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+  padding: 2px 4px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-xs);
+  background: var(--background-primary);
+}
+
+.artifact-pdf-toolbar-group button {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+  min-height: 24px;
+  padding: 2px 8px;
+  border: 0;
+  border-radius: var(--radius-xs);
+  background: transparent;
+  color: var(--text-normal);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--fs-2xs);
+  cursor: pointer;
+}
+
+.artifact-pdf-toolbar-group button:hover:not([disabled]) {
+  background: var(--background-modifier-hover);
+}
+
+.artifact-pdf-toolbar-group button[disabled] {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.artifact-pdf-page-indicator,
+.artifact-pdf-zoom-value {
+  padding: 0 6px;
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--fs-2xs);
+}
+
+.artifact-pdf-find {
+  gap: 6px;
+  align-items: center;
+}
+
+.artifact-pdf-find input {
+  min-width: 140px;
+}
+
+.artifact-pdf-detail-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.artifact-pdf-thumbnails {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  overflow-y: auto;
+  width: 128px;
+  padding: 10px 8px;
+  border-right: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+  scrollbar-width: thin;
+}
+
+.artifact-pdf-thumbnail {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  align-items: center;
+  padding: 4px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-xs);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: border-color 150ms cubic-bezier(0.2, 0, 0, 1),
+    background 150ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.artifact-pdf-thumbnail:hover {
+  border-color: var(--background-modifier-border);
+  background: var(--background-modifier-hover);
+}
+
+.artifact-pdf-thumbnail.is-active {
+  border-color: var(--accent-primary);
+  background: color-mix(in srgb, var(--accent-primary) 8%, transparent);
+  color: var(--text-normal);
+}
+
+.artifact-pdf-thumbnail-canvas {
+  display: block;
+  width: 96px;
+  height: auto;
+  background: var(--background-primary);
+  box-shadow: 0 1px 0 color-mix(in srgb, var(--background-primary) 40%, transparent) inset;
+}
+
+.artifact-pdf-thumbnail-label {
+  color: inherit;
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--fs-2xs);
+}
+
+.artifact-pdf-viewport {
+  position: relative;
+  flex: 1;
+  overflow: auto;
+  padding: 24px;
+  background: var(--background-primary);
+  scrollbar-width: thin;
+}
+
+.artifact-pdf-viewport:focus {
+  outline: none;
+}
+
+.artifact-pdf-viewport-loading {
+  display: grid;
+  place-items: center;
+  min-height: 320px;
+}
+
+.artifact-pdf-page {
+  position: relative;
+  margin: 0 auto;
+  border: 1px solid var(--background-modifier-border);
+  background: white;
+  box-shadow: 0 10px 30px color-mix(in srgb, var(--background-primary) 30%, transparent),
+    0 2px 6px color-mix(in srgb, var(--background-primary) 50%, transparent);
+  transition: width 150ms cubic-bezier(0.2, 0, 0, 1),
+    height 150ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.artifact-pdf-page-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.artifact-pdf-page-textlayer {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  color: transparent;
+  line-height: 1;
+  opacity: 0.999;
+  transform-origin: 0 0;
+}
+
+.artifact-pdf-page-textlayer > span,
+.artifact-pdf-page-textlayer br {
+  position: absolute;
+  transform-origin: 0 0;
+  color: transparent;
+  white-space: pre;
+  cursor: text;
+}
+
+.artifact-pdf-page-textlayer ::selection {
+  background: color-mix(in srgb, var(--accent-primary) 40%, transparent);
+}

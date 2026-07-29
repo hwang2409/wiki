@@ -18,14 +18,17 @@ from . import wiki_agent_tools
 
 TEXT_LIMIT = 100_000
 IMAGE_LIMIT = 5 * 1024 * 1024
+PDF_LIMIT = 25 * 1024 * 1024
+PDF_MAGIC = b"%PDF-"
 SENTINEL_START = "<<wiki-artifact:v1>>"
 SENTINEL_END = "<<end>>"
-ARTIFACT_KINDS = {"mermaid", "svg", "image", "table", "plot", "code", "diff", "file-list", "json"}
+ARTIFACT_KINDS = {"mermaid", "svg", "image", "table", "plot", "code", "diff", "file-list", "json", "pdf"}
 IMAGE_TYPES = {
     "image/png": "png",
     "image/jpeg": "jpg",
     "image/webp": "webp",
 }
+PDF_MIME = "application/pdf"
 TABLE_COLUMN_TYPES = {"string", "number", "date", "link"}
 
 
@@ -194,6 +197,103 @@ def _validated_run_id(raw: str) -> str:
     return raw
 
 
+def _artifact_run_dir() -> Path:
+    runtime_value = os.environ.get("WIKI_AGENT_RUNTIME_DIR")
+    if not runtime_value:
+        raise ArtifactValidationError("WIKI_AGENT_RUNTIME_DIR is required")
+    runtime_dir = Path(runtime_value).expanduser()
+    run_id = _validated_run_id(os.environ.get("WIKI_RUN_ID") or "")
+    artifact_dir = runtime_dir / "runs" / run_id / "artifacts"
+    artifact_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if artifact_dir.is_symlink():
+        raise ArtifactValidationError("refusing symlink artifact directory")
+    artifact_dir.chmod(0o700)
+    return artifact_dir
+
+
+def _write_binary(artifact_dir: Path, artifact_id: str, extension: str, data: bytes) -> Path:
+    target = artifact_dir / f"{artifact_id}.{extension}"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(target, flags, 0o600)
+    try:
+        os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+    return target
+
+
+def _read_pdf_path(raw: str) -> bytes:
+    if not raw or not isinstance(raw, str):
+        raise ArtifactValidationError("payload.path must be a non-empty string")
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        raise ArtifactValidationError("payload.path must be an absolute filesystem path")
+    if candidate.is_symlink():
+        raise ArtifactValidationError("refusing symlink pdf source")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ArtifactValidationError(f"payload.path could not be resolved: {exc}") from exc
+    try:
+        info = resolved.stat()
+    except OSError as exc:
+        raise ArtifactValidationError(f"payload.path is not readable: {exc}") from exc
+    if not stat.S_ISREG(info.st_mode):
+        raise ArtifactValidationError("payload.path must reference a regular file")
+    if info.st_size > PDF_LIMIT:
+        raise ArtifactValidationError(
+            f"pdf payload exceeds the {PDF_LIMIT // (1024 * 1024)}MB pdf limit"
+        )
+    try:
+        return resolved.read_bytes()
+    except OSError as exc:
+        raise ArtifactValidationError(f"payload.path could not be read: {exc}") from exc
+
+
+def _write_pdf(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
+    extra = payload.keys() - {"data_base64", "path"}
+    if extra:
+        raise ArtifactValidationError(f"unknown field: {sorted(extra)[0]}")
+    has_base64 = "data_base64" in payload
+    has_path = "path" in payload
+    if has_base64 == has_path:
+        raise ArtifactValidationError(
+            "pdf payload must include exactly one of data_base64 or path"
+        )
+    if has_base64:
+        encoded = _require_string(payload["data_base64"], "payload.data_base64")
+        if len(encoded) > ((PDF_LIMIT + 2) // 3) * 4 + 4:
+            raise ArtifactValidationError(
+                f"pdf payload exceeds the {PDF_LIMIT // (1024 * 1024)}MB pdf limit"
+            )
+        try:
+            data = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ArtifactValidationError("payload.data_base64 is not valid base64") from exc
+    else:
+        data = _read_pdf_path(str(payload["path"]))
+    if len(data) > PDF_LIMIT:
+        raise ArtifactValidationError(
+            f"pdf payload exceeds the {PDF_LIMIT // (1024 * 1024)}MB pdf limit"
+        )
+    if not data.startswith(PDF_MAGIC):
+        raise ArtifactValidationError("pdf payload is not a valid PDF (missing %PDF- header)")
+    artifact_dir = _artifact_run_dir()
+    _write_binary(artifact_dir, artifact_id, "pdf", data)
+    return {
+        "ref": f"artifact://{artifact_id}",
+        "mime": PDF_MIME,
+        "byte_size": len(data),
+    }
+
+
 def _write_image(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
     _require_keys(payload, required={"data_base64", "mime"})
     encoded = _require_string(payload["data_base64"], "payload.data_base64")
@@ -208,31 +308,8 @@ def _write_image(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
         raise ArtifactValidationError("payload.data_base64 is not valid base64") from exc
     if len(data) > IMAGE_LIMIT:
         raise ArtifactValidationError("image payload exceeds the 5MB image limit")
-
-    runtime_value = os.environ.get("WIKI_AGENT_RUNTIME_DIR")
-    if not runtime_value:
-        raise ArtifactValidationError("WIKI_AGENT_RUNTIME_DIR is required")
-    runtime_dir = Path(runtime_value).expanduser()
-    run_id = _validated_run_id(os.environ.get("WIKI_RUN_ID") or "")
-    artifact_dir = runtime_dir / "runs" / run_id / "artifacts"
-    artifact_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if artifact_dir.is_symlink():
-        raise ArtifactValidationError("refusing symlink artifact directory")
-    artifact_dir.chmod(0o700)
-    target = artifact_dir / f"{artifact_id}.{IMAGE_TYPES[mime]}"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = os.open(target, flags, 0o600)
-    try:
-        os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-    except Exception:
-        target.unlink(missing_ok=True)
-        raise
+    artifact_dir = _artifact_run_dir()
+    _write_binary(artifact_dir, artifact_id, IMAGE_TYPES[mime], data)
     return {
         "ref": f"artifact://{artifact_id}",
         "mime": mime,
@@ -264,6 +341,8 @@ def render_artifact(arguments: Any) -> dict[str, Any]:
     artifact = {"kind": kind}
     if kind == "image":
         artifact.update(_write_image(payload, artifact_id))
+    elif kind == "pdf":
+        artifact.update(_write_pdf(payload, artifact_id))
     else:
         artifact.update(_validate_text_payload(kind, payload))
     event: dict[str, Any] = {
@@ -311,7 +390,7 @@ def artifact_from_text(value: Any) -> dict[str, Any] | None:
         ):
             return None
     kind = artifact["kind"]
-    if kind != "image":
+    if kind not in {"image", "pdf"}:
         payload = {key: item for key, item in artifact.items() if key != "kind"}
         try:
             _validate_text_payload(kind, payload)

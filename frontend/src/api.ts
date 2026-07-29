@@ -523,7 +523,8 @@ export type ArtifactKind =
   | "code"
   | "diff"
   | "file-list"
-  | "json";
+  | "json"
+  | "pdf";
 
 export type ArtifactFileEntry = {
   path: string;
