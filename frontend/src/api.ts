@@ -898,6 +898,63 @@ export function getAgentWorkgraph(ticket: string) {
   return request<AgentWorkgraphData>(`/api/agents/${encodeURIComponent(ticket)}/workgraph`);
 }
 
+export type AutopilotAction = {
+  action: string;
+  at_ns: number;
+  source: "autopilot";
+  [key: string]: unknown;
+};
+
+export type AutopilotState = {
+  ticket?: string;
+  enabled: boolean;
+  iteration_cap: number;
+  plateau_guard: number;
+  henry_ack_required_for_merge: boolean;
+  last_action_at_ns: number;
+  halted: string | null;
+  merge_ack_at_ns: number | null;
+  merge_ack_sha?: string | null;
+  actions: AutopilotAction[];
+};
+
+export type AutopilotFleetStatus = {
+  tickets: Record<string, AutopilotState>;
+  enabled: number;
+  halted: number;
+  actions_last_hour: number;
+};
+
+export function getAutopilotStatus(ticket: string) {
+  return request<AutopilotState>(`/api/autopilot/${encodeURIComponent(ticket)}`);
+}
+
+export function getAutopilotFleetStatus(signal?: AbortSignal) {
+  return request<AutopilotFleetStatus>(
+    "/api/autopilot",
+    signal ? { signal } : undefined,
+  );
+}
+
+export function setAutopilotEnabled(ticket: string, enabled: boolean, henryAckRequired = false) {
+  return request<AutopilotState>(
+    `/api/autopilot/${encodeURIComponent(ticket)}/${enabled ? "enable" : "disable"}`,
+    enabled
+      ? {
+          method: "POST",
+          body: JSON.stringify({ henry_ack_required_for_merge: henryAckRequired }),
+        }
+      : { method: "POST" },
+  );
+}
+
+export function ackAutopilotMerge(ticket: string) {
+  return request<AutopilotState>(
+    `/api/autopilot/${encodeURIComponent(ticket)}/ack-merge`,
+    { method: "POST" },
+  );
+}
+
 export type FleetGraphTicket = {
   ticket: string;
   state: string;

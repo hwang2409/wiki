@@ -12,6 +12,7 @@ from typing import BinaryIO
 from .factory import RealAdapterFactory
 from .fake import FixtureAdapterFactory
 from .fleet_monitor import FleetMonitor
+from .autopilot import AutopilotController
 from .protocol import UnixSupervisorServer
 from .store import RunStore, RuntimePaths
 from .supervisor import Supervisor
@@ -102,6 +103,7 @@ async def run_daemon(args: argparse.Namespace) -> None:
                 run_id, message, dedupe_key=dedupe_key, source=source
             ),
             ownership_lock=supervisor._agent_lock,  # noqa: SLF001
+            on_transition=AutopilotController().on_transition,
         )
         fleet_task = asyncio.create_task(
             fleet_monitor.run(stop),

@@ -3517,6 +3517,10 @@ class AgentArchiveIn(BaseModel):
     outcome: str = Field(pattern="^(merged|closed|abandoned)$")
 
 
+class AutopilotEnableIn(BaseModel):
+    henry_ack_required_for_merge: bool = False
+
+
 def _allowed_model_message(kind: str, model: str, *, target: str) -> str:
     provider = {"cdx": "Codex", "cc": "Claude"}.get(kind, kind)
     allowed = ", ".join(model_ids_for_kind(kind))
@@ -4121,6 +4125,56 @@ def next_review_route(body: NextReviewIn) -> dict[str, Any]:
         prompt_template=body.prompt_template,
         request_id=body.request_id,
     )
+
+
+@app.post("/api/autopilot/{ticket}/enable")
+def autopilot_enable_route(ticket: str, body: AutopilotEnableIn | None = None) -> dict[str, Any]:
+    from .agent_runtime.autopilot import AutopilotController
+
+    try:
+        return AutopilotController().enable(
+            ticket,
+            henry_ack_required_for_merge=(body.henry_ack_required_for_merge if body else False),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/autopilot/{ticket}/disable")
+def autopilot_disable_route(ticket: str) -> dict[str, Any]:
+    from .agent_runtime.autopilot import AutopilotController
+
+    try:
+        return AutopilotController().disable(ticket)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/autopilot/{ticket}/ack-merge")
+def autopilot_ack_merge_route(ticket: str) -> dict[str, Any]:
+    from .agent_runtime.autopilot import AutopilotController
+
+    try:
+        return AutopilotController().ack_merge(ticket)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/autopilot")
+def autopilot_status_route() -> dict[str, Any]:
+    from .agent_runtime.autopilot import AutopilotController
+
+    return AutopilotController().status()
+
+
+@app.get("/api/autopilot/{ticket}")
+def autopilot_ticket_status_route(ticket: str) -> dict[str, Any]:
+    from .agent_runtime.autopilot import AutopilotController
+
+    try:
+        return AutopilotController().status(ticket)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def spawn_orchestrator(

@@ -1,6 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, ChevronDown, Repeat } from "lucide-react";
-import { getAgentWorkgraph, type LoopState, type LoopStateHistoryEntry } from "./api";
+import { AlertTriangle, ChevronDown, Power, Repeat } from "lucide-react";
+import {
+  getAgentWorkgraph,
+  getAutopilotStatus,
+  setAutopilotEnabled,
+  type AutopilotState,
+  type LoopState,
+  type LoopStateHistoryEntry,
+} from "./api";
 
 type Props = {
   ticket: string;
@@ -84,6 +91,7 @@ function HistoryRow({ entry }: { entry: LoopStateHistoryEntry }) {
 
 export function LoopStateChrome({ ticket, tick }: Props) {
   const [state, setState] = useState<LoopState | null>(null);
+  const [autopilot, setAutopilot] = useState<AutopilotState | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [open, setOpen] = useState(false);
   const detailRef = useRef<HTMLDivElement | null>(null);
@@ -91,6 +99,7 @@ export function LoopStateChrome({ ticket, tick }: Props) {
 
   useEffect(() => {
     setState(null);
+    setAutopilot(null);
     setLoaded(false);
     setOpen(false);
   }, [ticket]);
@@ -106,8 +115,15 @@ export function LoopStateChrome({ ticket, tick }: Props) {
       .catch(() => {
         if (cancelled) return;
         setState(null);
+        setAutopilot(null);
         setLoaded(true);
       });
+    getAutopilotStatus(ticket)
+      .then((data) => {
+        if (cancelled) return;
+        setAutopilot(typeof data.enabled === "boolean" ? data : null);
+      })
+      .catch(() => undefined);
     return () => {
       cancelled = true;
     };
@@ -182,30 +198,52 @@ export function LoopStateChrome({ ticket, tick }: Props) {
   }, [state]);
 
   if (!loaded) return null;
-  if (!state || (state.round === 0 && state.unrouted_verdict_count === 0)) {
+  if (!state && !autopilot) {
     return null;
   }
 
+  const hasLoopHistory =
+    state && (state.round > 0 || state.unrouted_verdict_count > 0);
+
   return (
-    <div className="loop-chrome" data-danger={state.danger}>
-      <button
-        aria-expanded={open}
-        aria-label={
-          open ? "Hide merge-ready loop history" : "Show merge-ready loop history"
-        }
-        className={`loop-chrome-trigger${open ? " is-open" : ""}`}
-        ref={triggerRef}
-        type="button"
-        onClick={() => setOpen((current) => !current)}
-      >
-        {chips}
-        <ChevronDown
-          aria-hidden
-          className={`loop-chrome-caret${open ? " is-open" : ""}`}
-          size={12}
-        />
-      </button>
-      {open ? (
+    <div className="loop-chrome" data-danger={state?.danger ?? "normal"}>
+      <div className="loop-chrome-controls">
+        {state && hasLoopHistory ? (
+          <button
+            aria-expanded={open}
+            aria-label={
+              open ? "Hide merge-ready loop history" : "Show merge-ready loop history"
+            }
+            className={`loop-chrome-trigger${open ? " is-open" : ""}`}
+            ref={triggerRef}
+            type="button"
+            onClick={() => setOpen((current) => !current)}
+          >
+            {chips}
+            <ChevronDown
+              aria-hidden
+              className={`loop-chrome-caret${open ? " is-open" : ""}`}
+              size={12}
+            />
+          </button>
+        ) : null}
+        {autopilot ? (
+          <button
+            aria-pressed={autopilot.enabled}
+            className={`loop-autopilot-toggle${autopilot.enabled ? " is-on" : ""}`}
+            type="button"
+            onClick={() => {
+              void setAutopilotEnabled(ticket, !autopilot.enabled)
+                .then(setAutopilot)
+                .catch(() => undefined);
+            }}
+          >
+            <Power aria-hidden size={12} />
+            autopilot {autopilot.enabled ? "on" : "off"}
+          </button>
+        ) : null}
+      </div>
+      {open && state ? (
         <div className="loop-chrome-detail" ref={detailRef} role="dialog">
           <header className="loop-chrome-detail-head">
             <span className="loop-chrome-detail-title">merge-ready loop</span>
@@ -238,6 +276,23 @@ export function LoopStateChrome({ ticket, tick }: Props) {
           ) : (
             <div className="loop-chrome-empty">no rounds recorded yet</div>
           )}
+          {autopilot?.actions?.length ? (
+            <div className="loop-autopilot-log">
+              <div className="loop-chrome-latest-label">autopilot log</div>
+              {autopilot.actions
+                .slice(-5)
+                .reverse()
+                .map((action) => (
+                  <div
+                    className="loop-autopilot-log-row"
+                    key={`${action.at_ns}-${action.action}`}
+                  >
+                    <span>{action.action}</span>
+                    {action.halted ? <span>{String(action.halted)}</span> : null}
+                  </div>
+                ))}
+            </div>
+          ) : null}
         </div>
       ) : null}
     </div>

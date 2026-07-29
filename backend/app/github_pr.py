@@ -313,3 +313,15 @@ def approve_pr(ticket: str) -> dict[str, str]:
     _run_gh(["pr", "review", pr_url, "--approve"], timeout=30)
     _pr_cache.pop(ticket, None)
     return {"status": "approved"}
+
+
+def merge_pr(ticket: str) -> dict[str, str]:
+    """Squash-merge a resolved ticket PR through the existing gh wrapper."""
+
+    resolved = resolve_pr(ticket)
+    if not resolved:
+        raise HTTPException(status_code=404, detail="No PR found for this agent")
+    pr_url, _repo = resolved
+    _run_gh(["pr", "merge", pr_url, "--squash"], timeout=60)
+    _pr_cache.pop(ticket, None)
+    return {"status": "merged", "url": pr_url}
