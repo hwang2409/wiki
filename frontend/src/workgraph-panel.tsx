@@ -27,6 +27,7 @@ type EdgeGroup = {
   to: string;
   count: number;
   lastIndex: number;
+  active: boolean;
 };
 
 function shortTime(value: string | undefined): string {
@@ -64,7 +65,7 @@ function visibleNodeIds(edges: WorkgraphEdge[]): Set<string> {
   return ids;
 }
 
-function groupEdges(edges: WorkgraphEdge[]): EdgeGroup[] {
+export function groupEdges(edges: WorkgraphEdge[]): EdgeGroup[] {
   const groups = new Map<string, EdgeGroup>();
   edges.forEach((edge, index) => {
     const key = `${edge.from}->${edge.to}:${edge.kind}`;
@@ -72,8 +73,17 @@ function groupEdges(edges: WorkgraphEdge[]): EdgeGroup[] {
     if (existing) {
       existing.count += 1;
       existing.lastIndex = index;
+      existing.active = existing.active || edge.active === true;
     } else {
-      groups.set(key, { key, kind: edge.kind, from: edge.from, to: edge.to, count: 1, lastIndex: index });
+      groups.set(key, {
+        key,
+        kind: edge.kind,
+        from: edge.from,
+        to: edge.to,
+        count: 1,
+        lastIndex: index,
+        active: edge.active === true,
+      });
     }
   });
   return [...groups.values()];
@@ -153,16 +163,18 @@ function edgeGeometry(
   };
 }
 
-function WorkgraphDag({
+export function WorkgraphDag({
   currentEdge,
   edges,
   nodes,
+  showAllNodes = false,
 }: {
   currentEdge: WorkgraphEdge | null;
   edges: WorkgraphEdge[];
   nodes: WorkgraphNode[];
+  showAllNodes?: boolean;
 }) {
-  const shown = visibleNodeIds(edges);
+  const shown = showAllNodes ? new Set(nodes.map((node) => node.id)) : visibleNodeIds(edges);
   const drawn = nodes.filter((node) => shown.has(node.id));
   const rightCount = drawn.filter((node) => node.kind !== "orchestrator").length;
   const height = Math.max(
@@ -208,7 +220,7 @@ function WorkgraphDag({
         const isCurrent = currentKey === group.key;
         return (
           <g
-            className={`workgraph-edge is-${group.kind}${isCurrent ? " is-current" : ""}`}
+            className={`workgraph-edge is-${group.kind}${group.active ? " is-active" : " is-historical"}${isCurrent ? " is-current" : ""}`}
             data-edge-kind={group.kind}
             key={group.key}
           >
@@ -227,6 +239,7 @@ function WorkgraphDag({
         const className = [
           "workgraph-node",
           `is-${node.kind}`,
+          node.state ? `is-state-${node.state.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}` : "",
           isArchived ? "is-archived" : "",
           isCurrent ? "is-current" : "",
         ]
@@ -234,7 +247,7 @@ function WorkgraphDag({
           .join(" ");
         return (
           <g className={className} data-node-id={node.id} key={node.id}>
-            <title>{`${node.id} · ${node.kind} · ${node.label}`}</title>
+            <title>{`${node.id} · ${node.kind} · ${node.label}${node.state ? ` · ${node.state}` : ""}`}</title>
             <rect height={NODE_HEIGHT} rx={6} width={NODE_WIDTH} x={node.x} y={node.y} />
             <text className="workgraph-node-kind" x={node.x + 10} y={node.y + 17}>
               {node.kind}

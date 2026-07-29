@@ -3,7 +3,7 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import type { AgentWorkgraphData, WorkgraphRevision } from "../src/api";
-import { WorkgraphPanel } from "../src/workgraph-panel";
+import { groupEdges, WorkgraphPanel } from "../src/workgraph-panel";
 
 const revisions: WorkgraphRevision[] = [
   { revision: 5, created_at_ns: 1_784_700_005_000_000_000, edge_count: 1 },
@@ -119,4 +119,17 @@ describe("workgraph revision loading", () => {
     expect(screen.queryByText("revision-5")).toBeNull();
     expect(screen.queryByText("revision-10")).toBeNull();
   });
+});
+
+test("legacy workgraph edges without active keep the historical style", () => {
+  const [edge] = groupEdges([
+    {
+      kind: "spawn",
+      from: "orch:wiki",
+      to: "WIKI-170",
+      created_at: "2026-07-29T12:00:00Z",
+    },
+  ]);
+
+  expect(edge.active).toBe(false);
 });

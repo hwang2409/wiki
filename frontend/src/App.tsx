@@ -94,6 +94,7 @@ import { GraphView } from "./graph";
 import { HealthView } from "./health";
 import { TokensView } from "./tokens";
 import { DashboardView } from "./dashboard";
+import { FleetGraphView } from "./fleet-graph";
 import { appendDoneEntry } from "./kanban";
 import { WorkspacePane, type PaneNoteFocusState } from "./pane";
 import { prepareMarkdown, splitFrontmatter } from "./markdown";
@@ -125,9 +126,10 @@ type Mode =
   | "agents"
   | "tokens"
   | "dashboard"
+  | "fleet-graph"
   | "agent"
   | "terminal";
-type UtilityMode = "activity" | "graph" | "health" | "agents" | "tokens" | "dashboard";
+type UtilityMode = "activity" | "graph" | "health" | "agents" | "tokens" | "dashboard" | "fleet-graph";
 type SidebarTab = "files" | "search" | "agents";
 type SplitPosition = "left" | "right" | "top" | "bottom";
 type DropZone = SplitPosition | "center";
@@ -873,7 +875,8 @@ const UTILITY_ROUTES: readonly UtilityMode[] = [
   "health",
   "agents",
   "tokens",
-  "dashboard"
+  "dashboard",
+  "fleet-graph"
 ];
 
 function routeHash(route: Route): string {
@@ -886,6 +889,7 @@ function routeHash(route: Route): string {
     return base;
   }
   if (route.kind === "terminal") return `#/terminal/${encodeURIComponent(route.id)}`;
+  if (route.kind === "fleet-graph") return "#/fleet/graph";
   if ((UTILITY_ROUTES as readonly string[]).includes(route.kind)) return `#/${route.kind}`;
   const encoded = (route as { path: string }).path
     .split("/")
@@ -896,6 +900,7 @@ function routeHash(route: Route): string {
 
 function parseRoute(hash: string): Route {
   if (hash === "#/new") return { kind: "new" };
+  if (hash === "#/fleet/graph") return { kind: "fleet-graph" };
   // `#/agents/<TICKET>/graph` is the spec-canonical workgraph URL (graph-engineering D2);
   // `#/agent/<TICKET>/graph` is the app-native equivalent.
   const agent = hash.match(/^#\/agents?\/([A-Za-z0-9-]+)(?:\/(review|graph))?$/);
@@ -3237,7 +3242,8 @@ export default function App() {
     health: "Health",
     agents: "Agents",
     tokens: "Tokens",
-    dashboard: "Dashboard"
+    dashboard: "Dashboard",
+    "fleet-graph": "Fleet graph"
   };
   const themeToggleTarget = toggleThemePolarity(theme);
   const themeToggleTargetLabel = getTheme(themeToggleTarget).label;
@@ -3407,6 +3413,9 @@ export default function App() {
     }
     if (mode === "dashboard") {
       return <DashboardView />;
+    }
+    if (mode === "fleet-graph") {
+      return <FleetGraphView refreshTick={refreshTick} />;
     }
     if (mode === "agents") {
       return (
@@ -3584,13 +3593,14 @@ export default function App() {
     label: string;
     icon: LucideIcon;
     mode: Mode;
-    view: "activity" | "graph" | "health" | "tokens" | "dashboard";
+    view: UtilityMode;
   }> = [
     { label: "Activity feed", icon: History, mode: "activity", view: "activity" },
     { label: "Graph view", icon: Waypoints, mode: "graph", view: "graph" },
     { label: "Vault health", icon: HeartPulse, mode: "health", view: "health" },
     { label: "Token usage", icon: TrendingUp, mode: "tokens", view: "tokens" },
     { label: "Ticket dashboard", icon: ClipboardList, mode: "dashboard", view: "dashboard" },
+    { label: "Fleet graph", icon: Waypoints, mode: "fleet-graph", view: "fleet-graph" },
   ];
   const overflowActive = overflowItems.some((entry) => entry.mode === mode);
 
@@ -4014,6 +4024,8 @@ export default function App() {
                 <TokensView />
               ) : mode === "dashboard" ? (
                 <DashboardView />
+              ) : mode === "fleet-graph" ? (
+                <FleetGraphView refreshTick={refreshTick} />
               ) : mode === "empty" ? (
                 <div className="empty-state">
                   <div className="empty-state-title">No file is open</div>

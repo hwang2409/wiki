@@ -799,6 +799,7 @@ export type WorkgraphNode = {
   id: string;
   kind: string;
   label: string;
+  state?: string;
   worker_id?: string;
   sha?: string;
 };
@@ -824,6 +825,7 @@ export type WorkgraphEdge = {
   to: string;
   payload?: Record<string, unknown> & { findings?: WorkgraphFinding[]; state?: string };
   created_at: string;
+  active?: boolean;
 };
 
 export type WorkgraphHealth = {
@@ -854,6 +856,28 @@ export type AgentWorkgraphData = {
 
 export function getAgentWorkgraph(ticket: string) {
   return request<AgentWorkgraphData>(`/api/agents/${encodeURIComponent(ticket)}/workgraph`);
+}
+
+export type FleetGraphTicket = {
+  ticket: string;
+  state: string;
+  role: string;
+  kind: string;
+  edges: WorkgraphEdge[];
+};
+
+export type FleetGraphGroup = {
+  orch: string;
+  tickets: FleetGraphTicket[];
+};
+
+export type FleetGraphData = {
+  groups: FleetGraphGroup[];
+  updated_at_ns: number;
+};
+
+export function getFleetGraph(limit = 10) {
+  return request<FleetGraphData>(`/api/fleet/graph?limit=${limit}`);
 }
 
 export type WorkgraphRevision = {

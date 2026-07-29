@@ -55,7 +55,9 @@ from .agent_runtime.client import (
     SupervisorUnavailable,
     replacement_prompt,
 )
+from .agent_runtime import graph_health
 from .agent_runtime.store import RuntimePaths
+from .agent_runtime.ticket import base_ticket
 from .frontend_static import mount_frontend_static
 
 
@@ -1386,54 +1388,159 @@ def _archive_sessions(ticket_dir: Path) -> list[tuple[datetime, Path]]:
     return sorted(sessions, reverse=True)
 
 
-def list_archived(limit: int | None = 20, *, latest_per_ticket: bool = False) -> list[dict]:
-    """Archived sessions sorted by archived_at desc.
+def _archive_orch_hints() -> tuple[dict[str, str], set[str]]:
+    """Build archive grouping hints without opening archived session bodies."""
 
-    latest_per_ticket=True dedups per ticket BEFORE `limit`, so the returned
-    list surfaces every ticket rather than being truncated to a fixed
-    session window. `limit=None` disables the cap.
-    """
+    registry = _read_agent_registry()
+    hints: dict[str, str] = {}
+    orchestrators = {
+        str(orch)
+        for orch in (registry.get("_orchestrators") or {})
+        if isinstance(orch, str)
+    }
+    # Seed buckets from the same orchestrator inventory exposed by list_agents:
+    # both headless registry keys and entries explicitly registered with the
+    # orchestrator role must get their own archive window, even with no live
+    # workers carrying an ``orch`` field.
+    for orch_id, _entry, _is_headless in _registered_orchestrators(registry):
+        orchestrators.add(orch_id)
+    for ticket, entry in registry.items():
+        if not isinstance(ticket, str) or not isinstance(entry, dict):
+            continue
+        rows = [entry.get("current")]
+        history = entry.get("history")
+        if isinstance(history, list):
+            rows.extend(history)
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            orch = row.get("orch") or row.get("orchestrator_id")
+            if isinstance(orch, str) and orch:
+                hints[ticket] = orch
+                orchestrators.add(orch)
+                break
+
+    # Headless archives are normally keyed with the same project prefix as
+    # their orchestrator (WIKI -> wiki, PHO -> phoebe). This is only a cheap
+    # grouping hint; the archived body remains authoritative after selection.
+    for ticket in set(hints) | set(orchestrators):
+        prefix = ticket.split("-", 1)[0].lower()
+        matches = [
+            orch
+            for orch in orchestrators
+            if orch.lower().startswith(prefix) or prefix.startswith(orch.lower())
+        ]
+        if len(matches) == 1:
+            hints.setdefault(ticket, matches[0])
+    return hints, orchestrators
+
+
+def _bounded_archive_candidates(
+    limit_per_orch: int,
+    *,
+    latest_per_ticket: bool,
+) -> list[tuple[str, datetime, Path]]:
+    """Select archive paths before reading any final-status or meta bodies."""
+
+    hints, orchestrators = _archive_orch_hints()
+    buckets: dict[str, list[tuple[tuple[float, int, str], str, datetime, Path]]] = {}
     if not AGENT_ARCHIVE_DIR.is_dir():
         return []
-    entries = []
     for ticket_dir in AGENT_ARCHIVE_DIR.iterdir():
         if not ticket_dir.is_dir() or not TICKET_PATTERN.fullmatch(ticket_dir.name):
             continue
         sessions = _archive_sessions(ticket_dir)
         if latest_per_ticket and sessions:
             sessions = sessions[:1]
+        orch = hints.get(ticket_dir.name)
+        if orch is None:
+            prefix = ticket_dir.name.split("-", 1)[0].lower()
+            matches = [
+                candidate
+                for candidate in orchestrators
+                if candidate.lower().startswith(prefix) or prefix.startswith(candidate.lower())
+            ]
+            orch = matches[0] if len(matches) == 1 else "unassigned"
+        bucket = buckets.setdefault(orch, [])
         for archived_at, session_dir in sessions:
-            status = {}
             try:
-                status = json.loads((session_dir / "final-status.json").read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                pass
-            meta = {}
-            try:
-                meta = json.loads((session_dir / "meta.json").read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                pass
-            worker = meta.get("worker") or {}
-            kind = worker.get("kind")
-            if not kind:
-                if any(session_dir.glob("cdx-*")):
-                    kind = "cdx"
-                elif any(session_dir.glob("cc-*")):
-                    kind = "cc"
-            entries.append(
-                {
-                    "ticket": ticket_dir.name,
-                    "archived_at": archived_at.isoformat(),
-                    "kind": kind,
-                    "role": worker.get("role") or _archive_role(session_dir),
-                    "model": worker.get("model"),
-                    "outcome": meta.get("outcome"),
-                    "state": status.get("state"),
-                    "pr": status.get("pr"),
-                    "step": status.get("step"),
-                }
+                mtime_ns = session_dir.stat().st_mtime_ns
+            except OSError:
+                mtime_ns = 0
+            key = (mtime_ns, archived_at.timestamp(), session_dir.name)
+            bucket.append((key, ticket_dir.name, archived_at, session_dir))
+        bucket.sort(key=lambda item: item[0], reverse=True)
+        del bucket[limit_per_orch:]
+
+    selected = [
+        (ticket, archived_at, session_dir)
+        for bucket in buckets.values()
+        for _key, ticket, archived_at, session_dir in bucket
+    ]
+    selected.sort(key=lambda item: (item[1], item[2].name), reverse=True)
+    return selected
+
+
+def list_archived(
+    limit: int | None = 20,
+    *,
+    latest_per_ticket: bool = False,
+    limit_per_orch: int | None = None,
+) -> list[dict]:
+    """Archived sessions sorted by archived_at desc.
+
+    latest_per_ticket=True dedups per ticket BEFORE `limit`, so the returned
+    list surfaces every ticket rather than being truncated to a fixed
+    session window. `limit=None` disables the cap. `limit_per_orch` keeps a
+    bounded recent window for every orchestrator instead of applying one
+    global cap.
+    """
+    if not AGENT_ARCHIVE_DIR.is_dir():
+        return []
+    entries: list[dict] = []
+    if limit_per_orch is not None:
+        candidates = _bounded_archive_candidates(
+            limit_per_orch,
+            latest_per_ticket=latest_per_ticket,
+        )
+    else:
+        candidates = [
+            (ticket_dir.name, archived_at, session_dir)
+            for ticket_dir in AGENT_ARCHIVE_DIR.iterdir()
+            if ticket_dir.is_dir() and TICKET_PATTERN.fullmatch(ticket_dir.name)
+            for archived_at, session_dir in (
+                _archive_sessions(ticket_dir)[:1]
+                if latest_per_ticket
+                else _archive_sessions(ticket_dir)
             )
+        ]
+    for ticket, archived_at, session_dir in candidates:
+        status = _read_json_object(session_dir / "final-status.json")
+        meta = _read_json_object(session_dir / "meta.json")
+        worker = meta.get("worker") or {}
+        kind = worker.get("kind")
+        if not kind:
+            if any(session_dir.glob("cdx-*")):
+                kind = "cdx"
+            elif any(session_dir.glob("cc-*")):
+                kind = "cc"
+        entries.append(
+            {
+                "ticket": ticket,
+                "archived_at": archived_at.isoformat(),
+                "kind": kind,
+                "role": worker.get("role") or _archive_role(session_dir),
+                "orch": worker.get("orch"),
+                "model": worker.get("model"),
+                "outcome": meta.get("outcome"),
+                "state": status.get("state"),
+                "pr": status.get("pr"),
+                "step": status.get("step"),
+            }
+        )
     entries.sort(key=lambda e: e["archived_at"], reverse=True)
+    if limit_per_orch is not None:
+        return entries
     if limit is None:
         return entries
     return entries[:limit]
@@ -1992,6 +2099,239 @@ def _load_workgraph_payload(ticket: str) -> tuple[dict[str, object], str, str | 
     if graph is not None:
         return graph, "snapshot", None
     raise HTTPException(status_code=404, detail="No workgraph found for this ticket")
+
+
+def _fleet_worker_metadata(registry: dict) -> dict[str, dict[str, object]]:
+    """Return current worker identity keyed by the exact worker ticket."""
+
+    workers: dict[str, dict[str, object]] = {}
+    for ticket, entry in registry.items():
+        if ticket.startswith("_") or not isinstance(entry, dict):
+            continue
+        current = entry.get("current")
+        if not isinstance(current, dict) or current.get("role") == "orchestrator":
+            continue
+        status = read_agent_status(ticket) or {}
+        workers[ticket] = {
+            "ticket": ticket,
+            "orch": current.get("orch"),
+            "state": status.get("state") or current.get("runtime_state") or "working",
+            "role": current.get("role") or "worker",
+            "kind": current.get("kind") or "unknown",
+        }
+    return workers
+
+
+def _fleet_edge_endpoint(
+    endpoint: object,
+    node_tickets: dict[str, str],
+    orch: str,
+) -> str | None:
+    if not isinstance(endpoint, str) or not endpoint:
+        return None
+    if endpoint in node_tickets:
+        return node_tickets[endpoint]
+    if endpoint == f"orch:{orch}" or endpoint.startswith("orch:"):
+        return endpoint
+    if endpoint.startswith("monitor:"):
+        return endpoint
+    return endpoint
+
+
+def _fleet_graph_ticket(
+    *,
+    graph: dict[str, object],
+    source: str,
+    worker_metadata: dict[str, dict[str, object]],
+    archived_metadata: dict[str, dict[str, object]],
+    allowed_tickets: set[str],
+) -> list[dict[str, object]]:
+    """Flatten one validated workgraph into worker nodes and normalized edges."""
+
+    orch = str(graph.get("orch") or "unassigned")
+    nodes = graph.get("nodes")
+    edges = graph.get("edges")
+    if not isinstance(nodes, list) or not isinstance(edges, list):
+        return []
+
+    node_tickets: dict[str, str] = {}
+    worker_nodes: list[tuple[dict[str, object], str]] = []
+    active_node_ids: set[str] = set()
+    try:
+        graph_module = workgraph
+        active_node_ids = {
+            str(node.get("id"))
+            for node in graph_module._live_worker_nodes(graph)  # noqa: SLF001
+            if isinstance(node, dict) and isinstance(node.get("id"), str)
+        }
+    except Exception:
+        active_node_ids = set()
+
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        node_id = node.get("id")
+        if not isinstance(node_id, str):
+            continue
+        if node.get("kind") == "orchestrator":
+            node_tickets[node_id] = f"orch:{orch}"
+            continue
+        if node.get("kind") == "monitor":
+            node_tickets[node_id] = node_id
+            continue
+        ticket = node.get("worker_id") or node_id
+        if not isinstance(ticket, str) or not ticket:
+            continue
+        node_tickets[node_id] = ticket
+        if ticket in allowed_tickets:
+            worker_nodes.append((node, ticket))
+
+    active_node_tickets = {
+        node_tickets.get(node_id, node_id) for node_id in active_node_ids
+    }
+    edges_by_ticket: dict[str, list[dict[str, object]]] = {ticket: [] for _, ticket in worker_nodes}
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        from_node = _fleet_edge_endpoint(edge.get("from"), node_tickets, orch)
+        to_node = _fleet_edge_endpoint(edge.get("to"), node_tickets, orch)
+        if from_node is None or to_node is None:
+            continue
+        worker_endpoint_tickets = [
+            node_tickets[endpoint]
+            for endpoint in (edge.get("from"), edge.get("to"))
+            if isinstance(endpoint, str)
+            and endpoint in node_tickets
+            and not node_tickets[endpoint].startswith(("orch:", "monitor:"))
+        ]
+        if any(ticket not in allowed_tickets for ticket in worker_endpoint_tickets):
+            continue
+        active = (
+            source == "live"
+            and edge.get("kind") != "archive"
+            and all(endpoint in active_node_tickets for endpoint in worker_endpoint_tickets)
+        )
+        normalized: dict[str, object] = {
+            "kind": edge.get("kind", "unknown"),
+            "from": from_node,
+            "to": to_node,
+            "created_at": edge.get("created_at", ""),
+            "active": active,
+        }
+        if isinstance(edge.get("payload"), dict):
+            normalized["payload"] = edge["payload"]
+        for ticket in {from_node, to_node}:
+            if ticket in edges_by_ticket:
+                edges_by_ticket[ticket].append(normalized)
+
+    result: list[dict[str, object]] = []
+    for node, ticket in worker_nodes:
+        metadata = worker_metadata.get(ticket) or archived_metadata.get(ticket) or {}
+        result.append(
+            {
+                "ticket": ticket,
+                "state": metadata.get("state")
+                or ("working" if node.get("id") in active_node_ids else "archived"),
+                "role": metadata.get("role") or node.get("kind") or "worker",
+                "kind": metadata.get("kind") or "unknown",
+                "edges": edges_by_ticket.get(ticket, []),
+            }
+        )
+    return result
+
+
+def _fleet_graph_payload(limit: int = 10) -> dict[str, object]:
+    registry = _read_agent_registry()
+    worker_metadata = _fleet_worker_metadata(registry)
+    archived_entries = (
+        list_archived(limit=limit, latest_per_ticket=True, limit_per_orch=limit)
+        if limit
+        else []
+    )
+    archived_metadata: dict[str, dict[str, object]] = {}
+    graph_tickets: set[str] = set()
+    for entry in archived_entries:
+        ticket = entry.get("ticket")
+        if not isinstance(ticket, str):
+            continue
+        archived_metadata[ticket] = entry
+        graph_tickets.add(base_ticket(ticket))
+    graph_tickets.update(base_ticket(ticket) for ticket in worker_metadata)
+
+    groups: dict[str, dict[str, dict[str, object]]] = {}
+    for ticket, metadata in worker_metadata.items():
+        orch = str(metadata.get("orch") or "unassigned")
+        groups.setdefault(orch, {})[ticket] = {
+            "ticket": ticket,
+            "state": metadata.get("state") or "working",
+            "role": metadata.get("role") or "worker",
+            "kind": metadata.get("kind") or "unknown",
+            "edges": [],
+        }
+    for ticket, metadata in archived_metadata.items():
+        orch = str(metadata.get("orch") or "unassigned")
+        groups.setdefault(orch, {}).setdefault(
+            ticket,
+            {
+                "ticket": ticket,
+                "state": metadata.get("state") or "archived",
+                "role": metadata.get("role") or "worker",
+                "kind": metadata.get("kind") or "unknown",
+                "edges": [],
+            },
+        )
+
+    for graph_ticket in sorted(graph_tickets):
+        graph, source = graph_health.load_validated_graph(
+            graph_ticket,
+            status_dir=AGENT_STATUS_DIR,
+        )
+        if graph is None:
+            continue
+        orch = str(graph.get("orch") or "unassigned")
+        allowed_tickets = {
+            ticket
+            for ticket, metadata in worker_metadata.items()
+            if base_ticket(ticket) == graph_ticket
+            and (metadata.get("orch") is None or str(metadata.get("orch")) == orch)
+        }
+        allowed_tickets.update(
+            ticket
+            for ticket, metadata in archived_metadata.items()
+            if base_ticket(ticket) == graph_ticket
+            and (metadata.get("orch") is None or str(metadata.get("orch")) == orch)
+        )
+        tickets = _fleet_graph_ticket(
+            graph=graph,
+            source=source or "snapshot",
+            worker_metadata=worker_metadata,
+            archived_metadata=archived_metadata,
+            allowed_tickets=allowed_tickets,
+        )
+        group = groups.setdefault(orch, {})
+        for ticket in tickets:
+            ticket_id = str(ticket["ticket"])
+            for other_orch, other_group in groups.items():
+                if other_orch != orch:
+                    other_group.pop(ticket_id, None)
+            group[ticket_id] = ticket
+
+    return {
+        "groups": [
+            {"orch": orch, "tickets": [group[ticket] for ticket in sorted(group)]}
+            for orch, group in sorted(groups.items())
+            if group
+        ],
+        "updated_at_ns": time.time_ns(),
+    }
+
+
+@app.get("/api/fleet/graph")
+@app.get("/fleet/graph", include_in_schema=False)
+def fleet_graph(limit: int = Query(default=10, ge=0, le=50)) -> dict[str, object]:
+    """Return one bounded, normalized DAG view across the worker fleet."""
+
+    return _fleet_graph_payload(limit)
 
 
 @app.get("/api/agents/{ticket}/workgraph")
