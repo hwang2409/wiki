@@ -55,6 +55,7 @@ from .agent_runtime.client import (
     SupervisorUnavailable,
     replacement_prompt,
 )
+from .agent_runtime.loop_state import derive_loop_state
 from .agent_runtime.store import RuntimePaths
 from .frontend_static import mount_frontend_static
 
@@ -2003,6 +2004,7 @@ def agent_workgraph(ticket: str) -> dict[str, object]:
     # Refresh the stored health so the renderer shows now-relative stall — the
     # same clock and computation the health endpoint uses.
     graph["composite_health"] = current["health"]
+    loop_state = derive_loop_state(graph)
     payload: dict[str, object] = {
         "ok": True,
         "source": source,
@@ -2010,6 +2012,7 @@ def agent_workgraph(ticket: str) -> dict[str, object]:
         "health": current["health"],
         "alarms": current["alarms"],
         "computed_at": current["computed_at"],
+        "loop_state": loop_state.to_json(),
     }
     if warning:
         payload["warning"] = warning

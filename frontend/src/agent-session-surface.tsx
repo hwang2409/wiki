@@ -8,6 +8,7 @@ import {
 } from "react";
 import { Bot, GitBranch, GitPullRequest, RefreshCw, X } from "lucide-react";
 import { AgentPrReviewPanel } from "./agent-pr-review";
+import { LoopStateChrome } from "./loop-state-chrome";
 import { WorkgraphPanel } from "./workgraph-panel";
 import { ArtifactPanel } from "./artifact-panel";
 import { deletePaneStateEntries } from "./pane-state-cache";
@@ -515,6 +516,7 @@ export function AgentSessionSurface({
           {worker.kind ? <StatusBadge compact label={worker.kind} state="neutral" /> : null}
           {worker.role ? <StatusBadge compact label={worker.role} state="neutral" /> : null}
           {worker.model ? <StatusBadge compact label={worker.model} state="faint" /> : null}
+          <LoopStateChrome ticket={worker.ticket} tick={tick} />
           <div className="agent-surface-actions">
               {worker.canReplace && worker.kind && worker.model ? (
                 <button

@@ -30,6 +30,32 @@ def default_clock() -> float:
         return datetime.now(timezone.utc).timestamp()
 
 
+def iteration_cap_for(graph: dict[str, Any]) -> int:
+    """Resolve the iteration cap: explicit -> template -> module default.
+
+    Shared with :mod:`loop_state` so ticket chrome and the monitor agree on
+    the cap when computing danger tiers.
+    """
+
+    graph_module = _workgraph_module()
+    direct = graph.get("iteration_cap")
+    if isinstance(direct, int) and not isinstance(direct, bool) and direct > 0:
+        return direct
+    template_id = graph.get("template")
+    if isinstance(template_id, str):
+        try:
+            from wiki_cli import workgraph_templates
+
+            template = workgraph_templates.load_templates().get(template_id)
+        except workgraph_templates.TemplateSelectionError:
+            template = None
+        if isinstance(template, dict):
+            cap = template.get("iteration_cap")
+            if isinstance(cap, int) and not isinstance(cap, bool) and cap > 0:
+                return cap
+    return graph_module.DEFAULT_ITERATION_CAP
+
+
 @dataclass
 class GraphHealthSnapshot:
     """Alarm state for one ticket-level composite-health scan."""
@@ -176,25 +202,7 @@ class GraphHealthMonitor:
             self._degraded_tickets.add(ticket)
         return validated
 
-    @staticmethod
-    def _iteration_cap(graph: dict[str, Any]) -> int:
-        graph_module = _workgraph_module()
-        direct = graph.get("iteration_cap")
-        if isinstance(direct, int) and not isinstance(direct, bool) and direct > 0:
-            return direct
-        template_id = graph.get("template")
-        if isinstance(template_id, str):
-            try:
-                from wiki_cli import workgraph_templates
-
-                template = workgraph_templates.load_templates().get(template_id)
-            except workgraph_templates.TemplateSelectionError:
-                template = None
-            if isinstance(template, dict):
-                cap = template.get("iteration_cap")
-                if isinstance(cap, int) and not isinstance(cap, bool) and cap > 0:
-                    return cap
-        return graph_module.DEFAULT_ITERATION_CAP
+    _iteration_cap = staticmethod(iteration_cap_for)
 
     @staticmethod
     def _edge_marker(edge: dict[str, Any], index: int) -> str:
