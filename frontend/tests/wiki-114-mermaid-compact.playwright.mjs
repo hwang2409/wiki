@@ -20,6 +20,7 @@ const SCREENSHOT_SUFFIX = process.env.WIKI_114_SCREENSHOT_SUFFIX ?? "";
 const CAPTURE_LEGACY_PREVIEW = process.env.WIKI_114_CAPTURE_LEGACY_PREVIEW === "1";
 const SCREENSHOTS = {
   compact: `/tmp/wiki-114-large-mermaid-compact${SCREENSHOT_SUFFIX}.png`,
+  hover: `/tmp/wiki-114-large-mermaid-hover${SCREENSHOT_SUFFIX}.png`,
   wide: `/tmp/wiki-114-wide-mermaid-compact${SCREENSHOT_SUFFIX}.png`,
   detail: `/tmp/wiki-114-large-mermaid-detail${SCREENSHOT_SUFFIX}.png`,
   legacy: "/tmp/wiki-114-large-mermaid-before.png",
@@ -200,6 +201,24 @@ async function main() {
     if (renderedHeight <= 400) throw new Error(`Large Mermaid SVG was scaled down instead of cropped: ${renderedHeight}`);
     await large.getByText("Diagram continues · Click to inspect").waitFor({ state: "visible" });
     await large.screenshot({ path: SCREENSHOTS.compact });
+
+    const restingPreviewStyle = await preview.evaluate((element) => {
+      const style = getComputedStyle(element);
+      return { borderColor: style.borderColor, boxShadow: style.boxShadow };
+    });
+    await preview.hover();
+    await page.waitForTimeout(150);
+    const hoveredPreviewStyle = await preview.evaluate((element) => {
+      const style = getComputedStyle(element);
+      return { borderColor: style.borderColor, boxShadow: style.boxShadow };
+    });
+    if (hoveredPreviewStyle.borderColor === restingPreviewStyle.borderColor) {
+      throw new Error(`Compact Mermaid hover border did not resolve to the accent color: ${JSON.stringify({ restingPreviewStyle, hoveredPreviewStyle })}`);
+    }
+    if (hoveredPreviewStyle.boxShadow === "none" || /transparent|\/\s*0(?:[^\d.]|$)/i.test(hoveredPreviewStyle.boxShadow)) {
+      throw new Error(`Compact Mermaid hover ring did not resolve to a visible color: ${JSON.stringify(hoveredPreviewStyle)}`);
+    }
+    await large.screenshot({ path: SCREENSHOTS.hover });
 
     if ((await wide.getAttribute("data-artifact-compact")) !== "true") throw new Error("Wide Mermaid diagram did not compact");
     const wideMetrics = await wide.locator(".artifact-mermaid svg").evaluate((element) => {

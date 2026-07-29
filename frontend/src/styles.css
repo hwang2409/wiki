@@ -7835,8 +7835,8 @@ textarea.composer-command-input {
 }
 
 .artifact-compact-diagram:hover {
-  border-color: var(--interactive-accent);
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--interactive-accent) 24%, transparent);
+  border-color: var(--accent-primary);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent-primary) 24%, transparent);
 }
 
 .artifact-compact-diagram .artifact-mermaid,
