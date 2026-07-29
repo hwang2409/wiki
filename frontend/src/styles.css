@@ -3731,6 +3731,141 @@ body.is-resizing-panes .pane-cell {
   display: block;
 }
 
+/* WIKI-170: bounded fleet-wide workgraph roll-up */
+
+.fleet-graph-view {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 14px;
+  min-height: 0;
+  padding: 22px 24px 80px;
+  overflow-y: auto;
+}
+
+.fleet-graph-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.fleet-graph-header h1 {
+  margin: 0;
+  color: var(--text-normal);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-large);
+  font-weight: 600;
+  text-transform: lowercase;
+}
+
+.fleet-graph-header p,
+.fleet-graph-updated,
+.fleet-graph-group-head span {
+  margin: 4px 0 0;
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+}
+
+.fleet-graph-updated {
+  white-space: nowrap;
+}
+
+.fleet-graph-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  background-color: var(--background-primary-alt);
+}
+
+.fleet-graph-filter {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.fleet-graph-filter-label {
+  margin-right: 2px;
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  text-transform: lowercase;
+}
+
+.fleet-graph-chip {
+  padding: 3px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-full);
+  background: transparent;
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  cursor: pointer;
+}
+
+.fleet-graph-chip:hover,
+.fleet-graph-chip.is-active {
+  border-color: var(--text-normal);
+  background-color: var(--text-normal);
+  color: var(--background-primary);
+}
+
+.fleet-graph-groups {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+  gap: 14px;
+}
+
+.fleet-graph-group {
+  min-width: 0;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  background-color: var(--background-secondary);
+  overflow: hidden;
+}
+
+.fleet-graph-group-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.fleet-graph-group-head h2 {
+  margin: 0;
+  color: var(--text-normal);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-medium);
+  font-weight: 600;
+}
+
+.fleet-graph-dag-wrap {
+  min-height: 120px;
+  padding: 10px;
+}
+
+.fleet-graph-empty,
+.fleet-graph-error {
+  padding: 18px 12px;
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  text-align: center;
+}
+
+.fleet-graph-error {
+  border: 1px solid color-mix(in srgb, var(--accent-danger) 45%, var(--background-modifier-border));
+  border-radius: var(--radius-m);
+  color: var(--accent-danger);
+  text-align: left;
+}
+
 /* Vault health */
 
 .health-view {
@@ -10011,6 +10146,18 @@ textarea.composer-command-input {
   stroke-width: 2.6;
 }
 
+.workgraph-edge.is-historical .workgraph-edge-line {
+  opacity: 0.28;
+}
+
+.workgraph-edge.is-historical .workgraph-edge-label {
+  opacity: 0.38;
+}
+
+.workgraph-edge.is-active .workgraph-edge-line {
+  stroke-width: 2;
+}
+
 .workgraph-edge-label {
   fill: var(--text-faint);
   font-family: var(--font-monospace);
@@ -10039,6 +10186,26 @@ textarea.composer-command-input {
 .workgraph-node.is-current rect {
   stroke: var(--text-normal);
   stroke-width: 1.6;
+}
+
+.workgraph-node.is-state-blocked rect,
+.workgraph-node.is-state-dead rect,
+.workgraph-node.is-state-interrupted rect {
+  stroke: var(--accent-danger);
+}
+
+.workgraph-node.is-state-working rect {
+  stroke: var(--accent-primary);
+}
+
+.workgraph-node.is-state-merge-ready rect,
+.workgraph-node.is-state-completed rect {
+  stroke: var(--accent-success);
+}
+
+.workgraph-node.is-state-iterating rect,
+.workgraph-node.is-state-waiting-approval rect {
+  stroke: var(--accent-warning);
 }
 
 .workgraph-node-kind {
