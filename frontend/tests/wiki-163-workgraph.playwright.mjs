@@ -173,6 +173,17 @@ async function expectText(locator, expected, label) {
   throw new Error(`${label}: expected "${expected}", got "${text}"`);
 }
 
+async function expectCount(locator, expected, label) {
+  const deadline = Date.now() + 5000;
+  let count = 0;
+  while (Date.now() < deadline) {
+    count = await locator.count();
+    if (count === expected) return;
+    await new Promise((resolveSleep) => setTimeout(resolveSleep, 100));
+  }
+  throw new Error(`${label}: expected ${expected}, got ${count}`);
+}
+
 async function main() {
   logStep("building live + archived workgraph fixtures through the real `wiki graph append` writer");
   const fixtures = makeFixtureRoot("wiki-163-workgraph-");
@@ -231,32 +242,23 @@ async function main() {
     await expectText(panel.locator(".workgraph-finding-detail"), "bust the merge cache", "finding detail");
     await panel.screenshot({ path: SCREENSHOTS.live });
 
-    logStep("replay view: scrub frames chronologically");
+    logStep("replay view: scrub snapshot revisions chronologically");
     await panel.getByRole("tab", { name: "replay" }).click();
     await panel.locator(".workgraph-scrubber").waitFor({ state: "visible" });
-    await expectText(panel.locator(".workgraph-frame-info"), "edge 4/4", "replay opens on the final frame");
-    if ((await panel.locator(".workgraph-tick").count()) !== 4) throw new Error("replay expected 4 edge ticks");
+    await expectText(panel.locator(".workgraph-frame-info"), "r3 of 3", "replay opens on the final revision");
 
-    await panel.locator(".workgraph-tick").first().click();
-    await expectText(panel.locator(".workgraph-frame-info"), "edge 1/4", "tick click scrubs to frame 1");
-    await expectText(panel.locator(".workgraph-frame-info"), "spawn N-1→N-2", "frame 1 is the first spawn edge");
-    const frameOneNodes = await panel.locator(".workgraph-node").count();
-    if (frameOneNodes !== 2) throw new Error(`frame 1 expected 2 nodes present, got ${frameOneNodes}`);
-    await panel.locator(".workgraph-findings-empty").waitFor({ state: "visible" });
+    await panel.locator(".workgraph-slider").fill("0");
+    await expectText(panel.locator(".workgraph-frame-info"), "r1 of 3", "slider scrubs to revision 1");
+    await expectCount(panel.locator(".workgraph-node"), 2, "revision 1 node count");
+    await expectCount(panel.locator(".workgraph-findings-empty"), 1, "revision 1 findings");
 
-    await panel.locator(".workgraph-step").nth(1).click(); // next-edge step
-    await expectText(panel.locator(".workgraph-frame-info"), "edge 2/4", "step advances one frame");
-    const frameTwoNodes = await panel.locator(".workgraph-node").count();
-    if (frameTwoNodes !== 3) throw new Error(`frame 2 expected 3 nodes present, got ${frameTwoNodes}`);
+    await panel.locator(".workgraph-slider").fill("1");
+    await expectText(panel.locator(".workgraph-frame-info"), "r2 of 3", "slider advances one revision");
+    await expectCount(panel.locator(".workgraph-node"), 3, "revision 2 node count");
 
-    await panel.locator(".workgraph-tick").nth(2).click(); // verdict frame
-    await expectText(panel.locator(".workgraph-frame-info"), "edge 3/4", "verdict frame selected");
-    if ((await panel.locator(".workgraph-finding-row").count()) !== 1) {
-      throw new Error("verdict frame should surface its finding in the table");
-    }
-    if ((await panel.locator(".workgraph-edge.is-current").count()) !== 1) {
-      throw new Error("replay should highlight the current edge");
-    }
+    await panel.locator(".workgraph-slider").fill("2");
+    await expectText(panel.locator(".workgraph-frame-info"), "r3 of 3", "revision 3 selected");
+    await expectCount(panel.locator(".workgraph-finding-row"), 1, "verdict revision finding");
     await panel.screenshot({ path: SCREENSHOTS.replay });
 
     logStep("archived ticket: renders from ~/.wiki snapshot after the hot copy is gone");
@@ -275,9 +277,9 @@ async function main() {
     }
 
     await archivedPanel.getByRole("tab", { name: "replay" }).click();
-    await expectText(archivedPanel.locator(".workgraph-frame-info"), "edge 3/3", "snapshot replay works");
-    await archivedPanel.locator(".workgraph-tick").first().click();
-    await expectText(archivedPanel.locator(".workgraph-frame-info"), "edge 1/3", "snapshot replay scrubs");
+    await expectText(archivedPanel.locator(".workgraph-frame-info"), "r3 of 3", "snapshot replay works");
+    await archivedPanel.locator(".workgraph-slider").fill("0");
+    await expectText(archivedPanel.locator(".workgraph-frame-info"), "r1 of 3", "snapshot replay scrubs");
     await archivedPanel.screenshot({ path: SCREENSHOTS.snapshot });
 
     await fs.writeFile(

@@ -1996,10 +1996,32 @@ def _load_workgraph_payload(ticket: str) -> tuple[dict[str, object], str, str | 
 
 
 @app.get("/api/agents/{ticket}/workgraph")
-def agent_workgraph(ticket: str) -> dict[str, object]:
+def agent_workgraph(ticket: str, revision: int | None = None) -> dict[str, object]:
     if not TICKET_PATTERN.fullmatch(ticket):
         raise HTTPException(status_code=400, detail="Bad ticket")
-    graph, source, warning = _load_workgraph_payload(ticket)
+    selected_revision: int | None = None
+    if revision is None:
+        graph, source, warning = _load_workgraph_payload(ticket)
+    else:
+        selected = workgraph.load_snapshot_revision(ticket, revision)
+        latest_snapshot_revision = workgraph.latest_snapshot_revision(ticket)
+        if selected is not None and (
+            selected[0] == revision or revision < latest_snapshot_revision
+        ):
+            selected_revision, graph = selected
+            source, warning = "snapshot", None
+        else:
+            # The live graph is the freshest representation of the latest
+            # revision when its durable snapshot is unavailable.
+            try:
+                graph = workgraph.load_workgraph(ticket, AGENT_STATUS_DIR)
+            except workgraph.WorkgraphCorruptError as exc:
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+            if graph is None:
+                raise HTTPException(status_code=404, detail="No workgraph found for this ticket")
+            source, warning = "live", None
+            revisions = workgraph.snapshot_revisions(ticket)
+            selected_revision = revisions[-1]["revision"] if revisions else revision
     current = workgraph.current_health(graph)
     # Refresh the stored health so the renderer shows now-relative stall — the
     # same clock and computation the health endpoint uses.
@@ -2014,9 +2036,18 @@ def agent_workgraph(ticket: str) -> dict[str, object]:
         "computed_at": current["computed_at"],
         "loop_state": loop_state.to_json(),
     }
+    if selected_revision is not None:
+        payload["revision"] = selected_revision
     if warning:
         payload["warning"] = warning
     return payload
+
+
+@app.get("/api/agents/{ticket}/workgraph/revisions")
+def agent_workgraph_revisions(ticket: str) -> list[dict[str, int]]:
+    if not TICKET_PATTERN.fullmatch(ticket):
+        raise HTTPException(status_code=400, detail="Bad ticket")
+    return workgraph.snapshot_revisions(ticket)
 
 
 @app.get("/api/agents/{ticket}/workgraph/health")
