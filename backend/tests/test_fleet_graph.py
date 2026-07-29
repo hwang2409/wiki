@@ -126,6 +126,36 @@ class FleetGraphTests(unittest.TestCase):
             self.assertEqual(len(loaded_paths), 20)
             self.assertFalse(any("-000000" in str(path) for path in loaded_paths))
 
+    def test_headless_orchestrators_each_get_archive_window(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            archive_root = Path(temp_dir)
+            registry = {
+                "wiki": {"current": {"role": "orchestrator", "control_attached": True}},
+                "phoebe": {"current": {"role": "orchestrator", "control_attached": True}},
+            }
+            for prefix, orch in (("WIKI", "wiki"), ("PHO", "phoebe")):
+                for index in range(5):
+                    session = archive_root / f"{prefix}-{index}" / f"20260729-00{index:04d}"
+                    session.mkdir(parents=True)
+                    (session / "meta.json").write_text(
+                        f'{{"worker":{{"orch":"{orch}","role":"review","kind":"cdx"}}}}',
+                        encoding="utf-8",
+                    )
+                    (session / "final-status.json").write_text(
+                        '{"state":"closed"}', encoding="utf-8"
+                    )
+
+            with (
+                mock.patch.object(main, "AGENT_ARCHIVE_DIR", archive_root),
+                mock.patch.object(main, "_read_agent_registry", return_value=registry),
+                mock.patch.object(main.graph_health, "load_validated_graph", return_value=(None, None)),
+            ):
+                payload = main.fleet_graph(limit=5)
+
+        counts = {group["orch"]: len(group["tickets"]) for group in payload["groups"]}
+        self.assertEqual(counts, {"phoebe": 5, "wiki": 5})
+        self.assertEqual(sum(counts.values()), 10)
+
     def test_selected_archives_bound_graph_nodes_and_edges(self) -> None:
         registry = {
             "WIKI-170": {
@@ -194,6 +224,36 @@ class FleetGraphTests(unittest.TestCase):
             {ticket["ticket"] for ticket in payload_without_archives["groups"][0]["tickets"]},
             {"WIKI-170"},
         )
+
+    def test_legacy_n_orchestrator_node_keeps_live_edge_active(self) -> None:
+        # This is the N-* node shape emitted by the existing workgraph writer
+        # fixture, before the fleet view normalizes the orchestrator endpoint.
+        legacy_graph = {
+            "ticket": "TST-1",
+            "orch": "wiki",
+            "nodes": [
+                {"id": "N-1", "kind": "orchestrator", "label": "wiki orch"},
+                {"id": "N-2", "kind": "implement", "label": "TST-1", "worker_id": "TST-1"},
+            ],
+            "edges": [
+                {
+                    "kind": "spawn",
+                    "from": "N-1",
+                    "to": "N-2",
+                    "created_at": "2026-07-29T12:00:00Z",
+                }
+            ],
+        }
+        tickets = main._fleet_graph_ticket(  # noqa: SLF001
+            graph=legacy_graph,
+            source="live",
+            worker_metadata={"TST-1": {"state": "working", "role": "implement", "kind": "cdx"}},
+            archived_metadata={},
+            allowed_tickets={"TST-1"},
+        )
+
+        self.assertEqual(tickets[0]["edges"][0]["from"], "orch:wiki")
+        self.assertTrue(tickets[0]["edges"][0]["active"])
 
     def test_live_worker_metadata_survives_missing_graph(self) -> None:
         registry = {

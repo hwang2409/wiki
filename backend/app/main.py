@@ -1398,6 +1398,12 @@ def _archive_orch_hints() -> tuple[dict[str, str], set[str]]:
         for orch in (registry.get("_orchestrators") or {})
         if isinstance(orch, str)
     }
+    # Seed buckets from the same orchestrator inventory exposed by list_agents:
+    # both headless registry keys and entries explicitly registered with the
+    # orchestrator role must get their own archive window, even with no live
+    # workers carrying an ``orch`` field.
+    for orch_id, _entry, _is_headless in _registered_orchestrators(registry):
+        orchestrators.add(orch_id)
     for ticket, entry in registry.items():
         if not isinstance(ticket, str) or not isinstance(entry, dict):
             continue
@@ -2180,6 +2186,9 @@ def _fleet_graph_ticket(
         if ticket in allowed_tickets:
             worker_nodes.append((node, ticket))
 
+    active_node_tickets = {
+        node_tickets.get(node_id, node_id) for node_id in active_node_ids
+    }
     edges_by_ticket: dict[str, list[dict[str, object]]] = {ticket: [] for _, ticket in worker_nodes}
     for edge in edges:
         if not isinstance(edge, dict):
@@ -2197,18 +2206,10 @@ def _fleet_graph_ticket(
         ]
         if any(ticket not in allowed_tickets for ticket in worker_endpoint_tickets):
             continue
-        worker_endpoints = [
-            endpoint
-            for endpoint in (edge.get("from"), edge.get("to"))
-            if isinstance(endpoint, str)
-            and endpoint in node_tickets
-            and endpoint not in {f"orch:{orch}"}
-            and not endpoint.startswith("monitor:")
-        ]
         active = (
             source == "live"
             and edge.get("kind") != "archive"
-            and all(endpoint in active_node_ids for endpoint in worker_endpoints)
+            and all(endpoint in active_node_tickets for endpoint in worker_endpoint_tickets)
         )
         normalized: dict[str, object] = {
             "kind": edge.get("kind", "unknown"),
