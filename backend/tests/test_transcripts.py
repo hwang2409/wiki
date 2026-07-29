@@ -798,6 +798,29 @@ class TranscriptSurfaceTests(unittest.TestCase):
         self.assertTrue(any(event["kind"] == "image" and event["text"].startswith("/api/transcript-images/") for event in result["events"]))
         self.assertEqual(result["tasks"][0]["status"], "in_progress")
 
+    def test_claude_provider_stream_renderers_preserve_structured_payloads(self) -> None:
+        rows = [
+            {"type": "system", "subtype": "thinking_tokens", "estimated_tokens": 12, "estimated_tokens_delta": 3},
+            {"type": "system", "subtype": "init", "model": "opus-4.7", "cwd": "/Users/henry/me/fun/wiki"},
+            {"type": "system", "subtype": "task_notification", "task_id": "task-1", "status": "running", "summary": "build", "output_file": "/tmp/task.out"},
+            {"type": "system", "subtype": "task_updated", "task_id": "task-1", "patch": {"status": "completed", "summary": "build done"}},
+            {"type": "system", "subtype": "api_retry", "attempt": 2, "max_retries": 3, "error_status": "529", "retry_delay_ms": 500},
+            {"type": "rate_limit_event", "status": "rejected", "rateLimitType": "five_hour", "resetsAt": 2_000_000_000},
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "claude-provider-renderers.jsonl"
+            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+            result = transcripts.read_session_events("claude", path)
+
+        self.assertEqual(result["dispositions"], {"rendered": 5, "summarized": 1, "ignored": 0, "unknown": 0})
+        kinds = [event["kind"] for event in result["events"]]
+        self.assertEqual(kinds, ["claude_init", "claude_task", "claude_api_retry", "claude_rate_limit"])
+        task = result["events"][1]["claude_task"]
+        self.assertEqual(task["status"], "completed")
+        self.assertEqual(task["summary"], "build done")
+        self.assertEqual(result["session_meta"]["thinking_tokens"]["total"], 12)
+        self.assertEqual(result["session_meta"]["rate_limit"]["status"], "rejected")
+
     def test_codex_native_surfaces_fixture(self) -> None:
         path = FIXTURES_DIR / "codex_native_surfaces.jsonl"
         result = transcripts.read_session_events("codex", path)

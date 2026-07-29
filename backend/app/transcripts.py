@@ -1280,6 +1280,73 @@ def _claude_system_text(row: dict) -> tuple[str, str] | None:
     return None
 
 
+def _claude_init_data(row: dict) -> dict:
+    return {
+        "claude_code_version": row.get("claude_code_version"),
+        "model": row.get("model"),
+        "output_style": row.get("output_style"),
+        "cwd": row.get("cwd"),
+        "mcp_servers": row.get("mcp_servers") if isinstance(row.get("mcp_servers"), list) else [],
+        "agents": row.get("agents") if isinstance(row.get("agents"), list) else [],
+        "memory_paths": row.get("memory_paths") if isinstance(row.get("memory_paths"), list) else [],
+        "fast_mode_state": row.get("fast_mode_state"),
+    }
+
+
+def _claude_task_data(row: dict) -> dict:
+    return {
+        "status": row.get("status"),
+        "summary": row.get("summary"),
+        "output_file": row.get("output_file"),
+        "task_id": row.get("task_id"),
+        "tool_use_id": row.get("tool_use_id"),
+    }
+
+
+def _claude_retry_data(row: dict) -> dict:
+    return {
+        "attempt": row.get("attempt"),
+        "max_retries": row.get("max_retries"),
+        "error": row.get("error"),
+        "error_status": row.get("error_status"),
+        "retry_delay_ms": row.get("retry_delay_ms"),
+    }
+
+
+def _claude_rate_limit_data(row: dict) -> dict:
+    return {
+        "status": row.get("status"),
+        "rateLimitType": row.get("rateLimitType"),
+        "isUsingOverage": row.get("isUsingOverage"),
+        "overageStatus": row.get("overageStatus"),
+        "overageDisabledReason": row.get("overageDisabledReason"),
+        "resetsAt": row.get("resetsAt"),
+    }
+
+
+def _claude_task_patch(value: object) -> dict:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return {}
+    if isinstance(value, dict):
+        return dict(value)
+    if not isinstance(value, list):
+        return {}
+    result: dict = {}
+    for operation in value:
+        if not isinstance(operation, dict):
+            continue
+        path = operation.get("path")
+        if not isinstance(path, str):
+            continue
+        key = path.rsplit("/", 1)[-1].replace("~1", "/").replace("~0", "~")
+        if key and operation.get("op") in {"add", "replace"}:
+            result[key] = operation.get("value")
+    return result
+
+
 def _claude_permission_text(row: dict) -> str:
     mode = row.get("permissionMode") or "unknown"
     label = str(mode)
@@ -1702,6 +1769,22 @@ def _claude_apply(state: dict, row: dict) -> None:
     rtype = row.get("type")
     ts = row.get("timestamp")
 
+    if rtype == "rate_limit_event":
+        rate_limit = _claude_rate_limit_data(row)
+        state.setdefault("session_meta", {})["rate_limit"] = rate_limit
+        if rate_limit.get("status") != "allowed":
+            _append_event(
+                state,
+                {
+                    "kind": "claude_rate_limit",
+                    "ts": ts,
+                    "text": str(rate_limit.get("status") or "rate limit"),
+                    "claude_rate_limit": rate_limit,
+                },
+            )
+        _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
+        return
+
     if rtype == "pr-link":
         number = row.get("prNumber")
         url = row.get("prUrl")
@@ -1742,6 +1825,81 @@ def _claude_apply(state: dict, row: dict) -> None:
         return
 
     if rtype == "system":
+        subtype = row.get("subtype")
+        if subtype == "thinking_tokens":
+            estimated = row.get("estimated_tokens")
+            delta = row.get("estimated_tokens_delta")
+            current = state.get("thinking_tokens", 0)
+            if isinstance(estimated, (int, float)):
+                current = int(estimated)
+            elif isinstance(delta, (int, float)):
+                current += int(delta)
+            state["thinking_tokens"] = max(0, current)
+            state.setdefault("session_meta", {})["thinking_tokens"] = {
+                "total": state["thinking_tokens"],
+                "estimated_tokens": estimated,
+                "estimated_tokens_delta": delta,
+            }
+            _record_row_disposition(state, EVENT_DISPOSITION_SUMMARIZED)
+            return
+        if subtype == "init":
+            init = _claude_init_data(row)
+            model = str(init.get("model") or "claude")
+            cwd = str(init.get("cwd") or "")
+            text = f"session started: {model}"
+            if cwd:
+                text += f" in {cwd}"
+            _append_event(
+                state,
+                {
+                    "kind": "claude_init",
+                    "ts": ts,
+                    "text": text,
+                    "claude_init": init,
+                },
+            )
+            _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
+            return
+        if subtype == "task_notification":
+            task = _claude_task_data(row)
+            event = {
+                "kind": "claude_task",
+                "ts": ts,
+                "text": str(task.get("summary") or "task notification"),
+                "claude_task": task,
+            }
+            _append_event(state, event)
+            task_id = task.get("task_id")
+            if task_id is not None:
+                state.setdefault("claude_task_events", {})[str(task_id)] = event
+            _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
+            return
+        if subtype == "task_updated":
+            patch = _claude_task_patch(row.get("patch"))
+            task_id = row.get("task_id") or patch.get("task_id")
+            event = state.setdefault("claude_task_events", {}).get(str(task_id)) if task_id is not None else None
+            if event is not None:
+                task = event.setdefault("claude_task", {})
+                task.update(patch)
+                status = task.get("status") or "updated"
+                summary = task.get("summary") or "task updated"
+                event["text"] = f"{status}: {summary}"
+                _mark_tail_changed(state, int(event["id"]) - int(state.get("base", 0)))
+            _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
+            return
+        if subtype == "api_retry":
+            retry = _claude_retry_data(row)
+            _append_event(
+                state,
+                {
+                    "kind": "claude_api_retry",
+                    "ts": ts,
+                    "text": str(retry.get("error_status") or retry.get("error") or "api retry"),
+                    "claude_api_retry": retry,
+                },
+            )
+            _record_row_disposition(state, EVENT_DISPOSITION_RENDERED)
+            return
         rendered = _claude_system_text(row)
         if rendered:
             subtype, text = rendered
@@ -1985,6 +2143,8 @@ def _new_parse_state(fmt: str) -> dict:
         "session_meta": {},
         "task_inputs": {},
         "task_activeform": {},
+        "claude_task_events": {},
+        "thinking_tokens": 0,
         "artifact_ids": set(),
         "dedupe_credits": {},
         "dispositions": {"rendered": 0, "summarized": 0, "ignored": 0, "unknown": 0},

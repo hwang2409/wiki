@@ -149,9 +149,13 @@ _CLAUDE_IGNORED_TYPES = {
 }
 _CLAUDE_RENDERED_SYSTEM_SUBTYPES = {
     "api_error",
+    "api_retry",
     "compact_boundary",
+    "init",
     "scheduled_task_fire",
     "stop_hook_summary",
+    "task_notification",
+    "task_updated",
     "turn_duration",
     "informational",
     "local_command",
@@ -164,6 +168,7 @@ _CLAUDE_SUMMARIZED_SYSTEM_SUBTYPES = {
     "hook_response",
     "task_started",
     "task_progress",
+    "thinking_tokens",
 }
 
 
@@ -250,6 +255,13 @@ def _normalize_claude(payload: dict[str, Any]) -> NormalizedProviderEvent:
         return NormalizedProviderEvent(
             disposition,
             "claude_attachment",
+            payload,
+            state,
+        )
+    if event_type == "rate_limit_event":
+        return NormalizedProviderEvent(
+            EventDisposition.RENDERED,
+            "claude_rate_limit_event",
             payload,
             state,
         )
