@@ -266,6 +266,69 @@ class WorkgraphEndpointTests(unittest.TestCase):
                 main.agent_workgraph("TST-9")
         self.assertEqual(ctx.exception.status_code, 404)
 
+    def test_lists_snapshot_metadata_and_loads_closest_older_revision(self) -> None:
+        self.build_graph()
+        workgraph.append_edge(
+            "TST-9",
+            "verdict",
+            "N-2",
+            "N-1",
+            verdict_payload(),
+            orch="wiki",
+            status_dir=self.status_dir,
+            snapshot_dir=self.snapshot_dir,
+            now_ts=BASE_TS + 60,
+        )
+        workgraph.append_edge(
+            "TST-9",
+            "archive",
+            "N-1",
+            "N-2",
+            archive_payload(),
+            orch="wiki",
+            status_dir=self.status_dir,
+            snapshot_dir=self.snapshot_dir,
+            now_ts=BASE_TS + 120,
+        )
+        revisions = workgraph.snapshot_revisions("TST-9", self.snapshot_dir)
+        self.assertEqual([item["revision"] for item in revisions], [1, 2, 3])
+        self.assertEqual([item["edge_count"] for item in revisions], [1, 2, 3])
+        self.assertTrue(all(item["created_at_ns"] > 0 for item in revisions))
+
+        selected = workgraph.load_snapshot_revision("TST-9", 2, self.snapshot_dir)
+        self.assertIsNotNone(selected)
+        assert selected is not None
+        self.assertEqual(selected[0], 2)
+        self.assertEqual(len(selected[1]["edges"]), 2)
+
+        selected = workgraph.load_snapshot_revision("TST-9", 99, self.snapshot_dir)
+        self.assertIsNotNone(selected)
+        assert selected is not None
+        self.assertEqual(selected[0], 3)
+
+    def test_revision_endpoint_returns_metadata_and_graph_revision(self) -> None:
+        self.build_graph()
+        workgraph.append_edge(
+            "TST-9",
+            "verdict",
+            "N-2",
+            "N-1",
+            verdict_payload(),
+            orch="wiki",
+            status_dir=self.status_dir,
+            snapshot_dir=self.snapshot_dir,
+            now_ts=BASE_TS + 60,
+        )
+        with (
+            mock.patch.object(main, "AGENT_STATUS_DIR", self.status_dir),
+            mock.patch.object(workgraph, "SNAPSHOT_DIR", self.snapshot_dir),
+        ):
+            revisions = main.agent_workgraph_revisions("TST-9")
+            payload = main.agent_workgraph("TST-9", revision=99)
+        self.assertEqual([item["revision"] for item in revisions], [1, 2])
+        self.assertEqual(payload["revision"], 2)
+        self.assertEqual(len(payload["workgraph"]["edges"]), 2)
+
     def test_health_endpoint_reports_alarms(self) -> None:
         workgraph.append_edge(
             "TST-9",

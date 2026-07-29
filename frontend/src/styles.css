@@ -10109,6 +10109,29 @@ textarea.composer-command-input {
   border-color: var(--text-muted);
 }
 
+.workgraph-play {
+  min-width: 48px;
+  padding: 3px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  background: transparent;
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  cursor: pointer;
+}
+
+.workgraph-play:hover {
+  color: var(--text-normal);
+  border-color: var(--text-muted);
+}
+
+.workgraph-play:focus-visible,
+.workgraph-slider:focus-visible {
+  outline: 2px solid var(--text-normal);
+  outline-offset: 2px;
+}
+
 .workgraph-slider {
   flex: 1;
   accent-color: var(--text-normal);

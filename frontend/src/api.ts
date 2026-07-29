@@ -849,10 +849,29 @@ export type AgentWorkgraphData = {
   ok: boolean;
   source: "live" | "snapshot";
   workgraph: Workgraph;
+  revision?: number;
 };
 
 export function getAgentWorkgraph(ticket: string) {
   return request<AgentWorkgraphData>(`/api/agents/${encodeURIComponent(ticket)}/workgraph`);
+}
+
+export type WorkgraphRevision = {
+  revision: number;
+  created_at_ns: number;
+  edge_count: number;
+};
+
+export function getAgentWorkgraphRevisions(ticket: string) {
+  return request<WorkgraphRevision[]>(
+    `/api/agents/${encodeURIComponent(ticket)}/workgraph/revisions`
+  );
+}
+
+export function getAgentWorkgraphRevision(ticket: string, revision: number) {
+  return request<AgentWorkgraphData>(
+    `/api/agents/${encodeURIComponent(ticket)}/workgraph?revision=${revision}`
+  );
 }
 
 export type ActivityFile = {

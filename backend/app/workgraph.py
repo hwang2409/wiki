@@ -244,6 +244,70 @@ def newest_snapshot_path(ticket: str, snapshot_dir: Path | None = None) -> Path 
     return best[1] if best else None
 
 
+def _snapshot_candidates(
+    ticket: str, snapshot_dir: Path | None = None
+) -> list[tuple[tuple[int, int, int, int], Path]]:
+    """Return parseable snapshot paths in commit order.
+
+    Snapshot ordering must stay in one place: `_snapshot_sort_key` knows about
+    both revisioned and legacy filenames, and revision is intentionally the
+    primary sort field.
+    """
+    directory = snapshot_dir or SNAPSHOT_DIR
+    if not directory.is_dir():
+        return []
+    candidates: list[tuple[tuple[int, int, int, int], Path]] = []
+    for path in directory.glob(f"{ticket}-*.workgraph.json"):
+        stem = path.name.removesuffix(".workgraph.json")
+        key = _snapshot_sort_key(stem[len(ticket) + 1 :])
+        if key is not None:
+            candidates.append((key, path))
+    return sorted(candidates)
+
+
+def snapshot_revisions(
+    ticket: str, snapshot_dir: Path | None = None
+) -> list[dict[str, int]]:
+    """List durable snapshot metadata without returning graph documents."""
+    revisions: list[dict[str, int]] = []
+    for key, path in _snapshot_candidates(ticket, snapshot_dir):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict) or not isinstance(data.get("edges"), list):
+            continue
+        revisions.append(
+            {
+                "revision": key[0],
+                "created_at_ns": key[1],
+                "edge_count": len(data["edges"]),
+            }
+        )
+    return revisions
+
+
+def latest_snapshot_revision(ticket: str, snapshot_dir: Path | None = None) -> int:
+    return _latest_snapshot_revision(ticket, snapshot_dir or SNAPSHOT_DIR)
+
+
+def load_snapshot_revision(
+    ticket: str, revision: int, snapshot_dir: Path | None = None
+) -> tuple[int, dict[str, Any]] | None:
+    """Load a requested snapshot revision, falling back to an older one."""
+    candidates = _snapshot_candidates(ticket, snapshot_dir)
+    for key, path in reversed(candidates):
+        if key[0] > revision:
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict):
+            return key[0], data
+    return None
+
+
 def load_snapshot(ticket: str, snapshot_dir: Path | None = None) -> dict[str, Any] | None:
     path = newest_snapshot_path(ticket, snapshot_dir)
     if path is None:

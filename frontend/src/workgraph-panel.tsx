@@ -1,11 +1,16 @@
 import { useEffect, useMemo, useState } from "react";
-import { getAgentWorkgraph } from "./api";
+import {
+  getAgentWorkgraph,
+  getAgentWorkgraphRevision,
+  getAgentWorkgraphRevisions,
+} from "./api";
 import type {
   AgentWorkgraphData,
   Workgraph,
   WorkgraphEdge,
   WorkgraphFinding,
   WorkgraphNode,
+  WorkgraphRevision,
 } from "./api";
 import { StatusBadge } from "./status-badge";
 
@@ -27,6 +32,10 @@ type EdgeGroup = {
 function shortTime(value: string | undefined): string {
   if (!value) return "";
   return value.slice(11, 19) || value;
+}
+
+function revisionTime(createdAtNs: number): string {
+  return new Date(createdAtNs / 1_000_000).toISOString().replace("T", " ").slice(0, 19) + "Z";
 }
 
 function humanStall(seconds: number): string {
@@ -346,16 +355,25 @@ function FindingRow({
 
 export function WorkgraphPanel({ ticket, tick }: { ticket: string; tick: number }) {
   const [data, setData] = useState<AgentWorkgraphData | null>(null);
+  const [revisions, setRevisions] = useState<WorkgraphRevision[]>([]);
+  const [revisionData, setRevisionData] = useState<AgentWorkgraphData | null>(null);
+  const [currentRevision, setCurrentRevision] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [revisionError, setRevisionError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [mode, setMode] = useState<"live" | "replay">("live");
-  const [frame, setFrame] = useState(1);
+  const [playing, setPlaying] = useState(false);
 
   useEffect(() => {
     setData(null);
+    setRevisions([]);
+    setRevisionData(null);
+    setCurrentRevision(null);
     setError(null);
+    setRevisionError(null);
     setLoading(true);
     setMode("live");
+    setPlaying(false);
   }, [ticket]);
 
   useEffect(() => {
@@ -378,16 +396,63 @@ export function WorkgraphPanel({ ticket, tick }: { ticket: string; tick: number 
     };
   }, [ticket, tick]);
 
-  const graph = data?.workgraph ?? null;
-  const edgeCount = graph?.edges.length ?? 0;
+  useEffect(() => {
+    let ignore = false;
+    getAgentWorkgraphRevisions(ticket)
+      .then((result) => {
+        if (ignore) return;
+        setRevisions(result);
+        setCurrentRevision(result.at(-1)?.revision ?? null);
+      })
+      .catch((err) => {
+        if (!ignore) setRevisionError(err instanceof Error ? err.message : "Could not load timeline");
+      });
+    return () => {
+      ignore = true;
+    };
+  }, [ticket]);
 
-  const clampedFrame = Math.min(Math.max(frame, 1), Math.max(edgeCount, 1));
-  const replaying = mode === "replay" && edgeCount > 0;
-  const shownEdges = useMemo(() => {
-    if (!graph) return [];
-    return replaying ? graph.edges.slice(0, clampedFrame) : graph.edges;
-  }, [clampedFrame, graph, replaying]);
-  const currentEdge = replaying ? shownEdges[shownEdges.length - 1] ?? null : null;
+  useEffect(() => {
+    if (mode !== "replay" || currentRevision === null) return;
+    let ignore = false;
+    const timer = window.setTimeout(() => {
+      getAgentWorkgraphRevision(ticket, currentRevision)
+        .then((result) => {
+          if (ignore) return;
+          setRevisionData(result);
+          setRevisionError(null);
+        })
+        .catch((err) => {
+          if (!ignore) setRevisionError(err instanceof Error ? err.message : "Could not load revision");
+        });
+    }, 150);
+    return () => {
+      ignore = true;
+      window.clearTimeout(timer);
+    };
+  }, [currentRevision, mode, ticket]);
+
+  useEffect(() => {
+    if (!playing || mode !== "replay" || currentRevision === null) return;
+    const timer = window.setInterval(() => {
+      const index = revisions.findIndex((item) => item.revision === currentRevision);
+      if (index < 0 || index >= revisions.length - 1) {
+        setPlaying(false);
+        return;
+      }
+      setCurrentRevision(revisions[index + 1].revision);
+    }, 600);
+    return () => window.clearInterval(timer);
+  }, [currentRevision, mode, playing, revisions]);
+
+  const replaying = mode === "replay" && revisions.length > 0;
+  const selectedData = replaying ? revisionData ?? data : data;
+  const graph = selectedData?.workgraph ?? null;
+  const revisionIndex = currentRevision === null
+    ? -1
+    : revisions.findIndex((item) => item.revision === currentRevision);
+  const latestRevision = revisions.at(-1)?.revision ?? null;
+  const shownEdges = useMemo(() => graph?.edges ?? [], [graph]);
   const findings = useMemo(() => collectFindings(shownEdges), [shownEdges]);
 
   if (loading && !data) return <div className="workgraph-empty">Loading workgraph…</div>;
@@ -404,7 +469,10 @@ export function WorkgraphPanel({ ticket, tick }: { ticket: string; tick: number 
             className={`workgraph-mode-tab${mode === "live" ? " is-active" : ""}`}
             role="tab"
             type="button"
-            onClick={() => setMode("live")}
+            onClick={() => {
+              setPlaying(false);
+              setMode("live");
+            }}
           >
             live
           </button>
@@ -414,14 +482,14 @@ export function WorkgraphPanel({ ticket, tick }: { ticket: string; tick: number 
             role="tab"
             type="button"
             onClick={() => {
-              setFrame(edgeCount);
+              setCurrentRevision(revisions.at(-1)?.revision ?? null);
               setMode("replay");
             }}
           >
             replay
           </button>
         </div>
-        <span className="workgraph-source">{data?.source === "snapshot" ? "snapshot" : "live file"}</span>
+        <span className="workgraph-source">{selectedData?.source === "snapshot" ? "snapshot" : "live file"}</span>
         <span className="workgraph-updated">{graph.orch} · updated {shortTime(graph.updated_at)}</span>
       </div>
 
@@ -431,53 +499,33 @@ export function WorkgraphPanel({ ticket, tick }: { ticket: string; tick: number 
         <div className="workgraph-scrubber">
           <div className="workgraph-scrubber-row">
             <button
-              aria-label="Previous edge"
-              className="workgraph-step"
-              disabled={clampedFrame <= 1}
+              aria-label={playing ? "Pause timeline" : "Play timeline"}
+              aria-pressed={playing}
+              className="workgraph-play"
               type="button"
-              onClick={() => setFrame(clampedFrame - 1)}
+              onClick={() => setPlaying((value) => !value)}
             >
-              ‹
+              {playing ? "pause" : "play"}
             </button>
             <input
-              aria-label="Replay position"
+              aria-label="Timeline revision"
               className="workgraph-slider"
-              max={edgeCount}
-              min={1}
+              disabled={revisions.length < 2}
+              max={Math.max(revisions.length - 1, 0)}
+              min={0}
               type="range"
-              value={clampedFrame}
-              onChange={(event) => setFrame(Number(event.target.value))}
+              value={Math.max(revisionIndex, 0)}
+              onChange={(event) => {
+                setPlaying(false);
+                setCurrentRevision(revisions[Number(event.target.value)]?.revision ?? null);
+              }}
             />
-            <button
-              aria-label="Next edge"
-              className="workgraph-step"
-              disabled={clampedFrame >= edgeCount}
-              type="button"
-              onClick={() => setFrame(clampedFrame + 1)}
-            >
-              ›
-            </button>
           </div>
-          <div className="workgraph-ticks">
-            {graph.edges.map((edge, index) => (
-              <button
-                aria-label={`Jump to edge ${index + 1} (${edge.kind})`}
-                className={`workgraph-tick is-${edge.kind}${index < clampedFrame ? " is-played" : ""}${
-                  index === clampedFrame - 1 ? " is-current" : ""
-                }`}
-                key={`${edge.kind}-${index}`}
-                title={`${edge.kind} ${edge.from}->${edge.to}`}
-                type="button"
-                onClick={() => setFrame(index + 1)}
-              />
-            ))}
+          <div className="workgraph-frame-info">
+            r{currentRevision} of {latestRevision} · {revisions[revisionIndex]?.edge_count ?? 0} edges ·{" "}
+            {revisions[revisionIndex] ? revisionTime(revisions[revisionIndex].created_at_ns) : ""}
+            {revisionError ? ` · ${revisionError}` : ""}
           </div>
-          {currentEdge ? (
-            <div className="workgraph-frame-info">
-              edge {clampedFrame}/{edgeCount} · {currentEdge.kind} {currentEdge.from}→{currentEdge.to} ·{" "}
-              {shortTime(currentEdge.created_at)}
-            </div>
-          ) : null}
         </div>
       ) : null}
 
@@ -485,7 +533,7 @@ export function WorkgraphPanel({ ticket, tick }: { ticket: string; tick: number 
         {shownEdges.length === 0 ? (
           <div className="workgraph-empty is-inline">no edges yet</div>
         ) : (
-          <WorkgraphDag currentEdge={currentEdge} edges={shownEdges} nodes={graph.nodes} />
+          <WorkgraphDag currentEdge={null} edges={shownEdges} nodes={graph.nodes} />
         )}
       </div>
 
