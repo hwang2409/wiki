@@ -805,7 +805,17 @@ class TranscriptSurfaceTests(unittest.TestCase):
             {"type": "system", "subtype": "task_notification", "task_id": "task-1", "status": "running", "summary": "build", "output_file": "/tmp/task.out"},
             {"type": "system", "subtype": "task_updated", "task_id": "task-1", "patch": {"status": "completed", "summary": "build done"}},
             {"type": "system", "subtype": "api_retry", "attempt": 2, "max_retries": 3, "error_status": "529", "retry_delay_ms": 500},
-            {"type": "rate_limit_event", "status": "rejected", "rateLimitType": "five_hour", "resetsAt": 2_000_000_000},
+            {
+                "type": "rate_limit_event",
+                "rate_limit_info": {
+                    "status": "rejected",
+                    "rateLimitType": "five_hour",
+                    "isUsingOverage": False,
+                    "overageStatus": "rejected",
+                    "overageDisabledReason": "out_of_credits",
+                    "resetsAt": 2_000_000_000,
+                },
+            },
         ]
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "claude-provider-renderers.jsonl"
@@ -820,6 +830,9 @@ class TranscriptSurfaceTests(unittest.TestCase):
         self.assertEqual(task["summary"], "build done")
         self.assertEqual(result["session_meta"]["thinking_tokens"]["total"], 12)
         self.assertEqual(result["session_meta"]["rate_limit"]["status"], "rejected")
+        self.assertFalse(result["session_meta"]["rate_limit"]["isUsingOverage"])
+        self.assertEqual(result["session_meta"]["rate_limit"]["overageStatus"], "rejected")
+        self.assertEqual(result["session_meta"]["rate_limit"]["overageDisabledReason"], "out_of_credits")
 
     def test_codex_native_surfaces_fixture(self) -> None:
         path = FIXTURES_DIR / "codex_native_surfaces.jsonl"

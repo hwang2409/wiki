@@ -170,6 +170,14 @@ _CLAUDE_SUMMARIZED_SYSTEM_SUBTYPES = {
     "task_progress",
     "thinking_tokens",
 }
+_CLAUDE_RATE_LIMIT_FIELDS = {
+    "status",
+    "rateLimitType",
+    "isUsingOverage",
+    "overageStatus",
+    "overageDisabledReason",
+    "resetsAt",
+}
 
 
 def _normalize_claude(payload: dict[str, Any]) -> NormalizedProviderEvent:
@@ -259,10 +267,16 @@ def _normalize_claude(payload: dict[str, Any]) -> NormalizedProviderEvent:
             state,
         )
     if event_type == "rate_limit_event":
+        rate_limit_info = payload.get("rate_limit_info")
+        rate_limit_info = rate_limit_info if isinstance(rate_limit_info, dict) else {}
+        normalized_payload = dict(payload)
+        for field in _CLAUDE_RATE_LIMIT_FIELDS:
+            if field in rate_limit_info:
+                normalized_payload[field] = rate_limit_info[field]
         return NormalizedProviderEvent(
             EventDisposition.RENDERED,
             "claude_rate_limit_event",
-            payload,
+            normalized_payload,
             state,
         )
     if event_type in _CLAUDE_RENDERED_TYPES:

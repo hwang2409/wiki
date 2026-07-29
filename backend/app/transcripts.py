@@ -1314,13 +1314,15 @@ def _claude_retry_data(row: dict) -> dict:
 
 
 def _claude_rate_limit_data(row: dict) -> dict:
+    info = row.get("rate_limit_info")
+    info = info if isinstance(info, dict) else {}
     return {
-        "status": row.get("status"),
-        "rateLimitType": row.get("rateLimitType"),
-        "isUsingOverage": row.get("isUsingOverage"),
-        "overageStatus": row.get("overageStatus"),
-        "overageDisabledReason": row.get("overageDisabledReason"),
-        "resetsAt": row.get("resetsAt"),
+        "status": info.get("status", row.get("status")),
+        "rateLimitType": info.get("rateLimitType", row.get("rateLimitType")),
+        "isUsingOverage": info.get("isUsingOverage", row.get("isUsingOverage")),
+        "overageStatus": info.get("overageStatus", row.get("overageStatus")),
+        "overageDisabledReason": info.get("overageDisabledReason", row.get("overageDisabledReason")),
+        "resetsAt": info.get("resetsAt", row.get("resetsAt")),
     }
 
 

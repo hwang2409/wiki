@@ -63,6 +63,7 @@ import type {
   QueuedMessage,
   SessionEvent,
   SessionInit,
+  SessionRateLimit,
   SessionPr,
   SkillInfo,
   SubagentInfo,
@@ -1155,7 +1156,7 @@ function ToolRow({
   );
 }
 
-type SessionUiState = {
+export type SessionUiState = {
   booleans: Map<string, boolean>;
 };
 
@@ -1372,7 +1373,7 @@ function claudePath(value: string | null | undefined): string {
   return value.replace(/^\/Users\/[^/]+/, "~");
 }
 
-function ClaudeInitRow({ event, stateKey, uiState }: { event: SessionEvent; stateKey: string; uiState: SessionUiState }) {
+export function ClaudeInitRow({ event, stateKey, uiState }: { event: SessionEvent; stateKey: string; uiState: SessionUiState }) {
   const [open, setOpen] = useStoredBooleanState(uiState, stateKey, false);
   const init: SessionInit = event.claude_init ?? {};
   const model = init.model || "claude";
@@ -1389,7 +1390,7 @@ function ClaudeInitRow({ event, stateKey, uiState }: { event: SessionEvent; stat
   ];
   return (
     <div className={`session-claude-init${open ? " is-open" : ""}`}>
-      <button className="session-claude-init-head" type="button" onClick={() => setOpen((value) => !value)}>
+      <button aria-expanded={open} className="session-claude-init-head" type="button" onClick={() => setOpen((value) => !value)}>
         <ChevronRight className={`collapse-icon${open ? "" : " is-collapsed"}`} size={12} />
         <span>session started: {model}{cwd !== "—" ? ` in ${cwd}` : ""}</span>
       </button>
@@ -1428,14 +1429,14 @@ function ClaudeTaskRow({ event }: { event: SessionEvent }) {
   );
 }
 
-function ClaudeApiRetryRow({ event }: { event: SessionEvent }) {
+export function ClaudeApiRetryRow({ event }: { event: SessionEvent }) {
   const retry = event.claude_api_retry ?? {};
   const attempt = retry.attempt ?? "?";
   const max = retry.max_retries ?? "?";
   const status = retry.error_status || "error";
   const delay = typeof retry.retry_delay_ms === "number" ? retry.retry_delay_ms : 0;
   return (
-    <div className="session-claude-retry">
+    <div className="session-claude-retry" data-testid="claude-api-retry-chip">
       <AlertTriangle size={12} />
       <span className="tabular-nums">retry {attempt}/{max}</span>
       <span>— {status} in {delay}ms</span>
@@ -1449,13 +1450,33 @@ function formatRateLimitReset(resetsAt: number | null | undefined): string | nul
   return `resets in ${hours < 1 ? `${Math.max(1, Math.round(hours * 60))}m` : `${Math.max(1, Math.round(hours))}h`}`;
 }
 
+export function ClaudeRateLimitChrome({ rate }: { rate: SessionRateLimit }) {
+  if (!rate.status || rate.status === "allowed") return null;
+  return (
+    <span className="session-state-rate-limit" data-testid="claude-rate-limit-session-pill">
+      <AlertTriangle size={12} />
+      <span>{rate.status}</span>
+      {rate.rateLimitType ? <span>{rate.rateLimitType}</span> : null}
+      {typeof rate.isUsingOverage === "boolean" ? (
+        <span>overage {rate.isUsingOverage ? "on" : "off"}</span>
+      ) : null}
+      {rate.overageStatus ? <span>overage status {rate.overageStatus}</span> : null}
+      {rate.overageDisabledReason ? <span>overage reason {rate.overageDisabledReason}</span> : null}
+      {formatRateLimitReset(rate.resetsAt) ? <span className="tabular-nums">{formatRateLimitReset(rate.resetsAt)}</span> : null}
+    </span>
+  );
+}
+
 function ClaudeRateLimitRow({ event }: { event: SessionEvent }) {
   const rate = event.claude_rate_limit ?? {};
   return (
-    <div className="session-claude-rate-limit is-prominent">
+    <div className="session-claude-rate-limit is-prominent" data-testid="claude-rate-limit-row">
       <AlertTriangle size={13} />
       <span>{rate.status || "rate limit"}</span>
       {rate.rateLimitType ? <span>{rate.rateLimitType}</span> : null}
+      {typeof rate.isUsingOverage === "boolean" ? <span>overage {rate.isUsingOverage ? "on" : "off"}</span> : null}
+      {rate.overageStatus ? <span>overage status {rate.overageStatus}</span> : null}
+      {rate.overageDisabledReason ? <span>overage reason {rate.overageDisabledReason}</span> : null}
       {formatRateLimitReset(rate.resetsAt) ? <span className="tabular-nums">{formatRateLimitReset(rate.resetsAt)}</span> : null}
     </div>
   );
@@ -2663,16 +2684,7 @@ export function SessionTab({
           {typeof thinkingTokens === "number" ? (
             <span className="session-state-meta tabular-nums">thinking {thinkingTokens} tokens</span>
           ) : null}
-          {rateLimit && rateLimit.status && rateLimit.status !== "allowed" ? (
-            <span className="session-state-rate-limit">
-              <AlertTriangle size={12} />
-              <span>{rateLimit.status}</span>
-              {rateLimit.rateLimitType ? <span>{rateLimit.rateLimitType}</span> : null}
-              {formatRateLimitReset(rateLimit.resetsAt) ? (
-                <span className="tabular-nums">{formatRateLimitReset(rateLimit.resetsAt)}</span>
-              ) : null}
-            </span>
-          ) : null}
+          {rateLimit ? <ClaudeRateLimitChrome rate={rateLimit} /> : null}
           {session.pr ? (
             <a
               className="session-state-pr"
