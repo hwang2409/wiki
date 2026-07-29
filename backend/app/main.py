@@ -1388,6 +1388,93 @@ def _archive_sessions(ticket_dir: Path) -> list[tuple[datetime, Path]]:
     return sorted(sessions, reverse=True)
 
 
+def _archive_orch_hints() -> tuple[dict[str, str], set[str]]:
+    """Build archive grouping hints without opening archived session bodies."""
+
+    registry = _read_agent_registry()
+    hints: dict[str, str] = {}
+    orchestrators = {
+        str(orch)
+        for orch in (registry.get("_orchestrators") or {})
+        if isinstance(orch, str)
+    }
+    for ticket, entry in registry.items():
+        if not isinstance(ticket, str) or not isinstance(entry, dict):
+            continue
+        rows = [entry.get("current")]
+        history = entry.get("history")
+        if isinstance(history, list):
+            rows.extend(history)
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            orch = row.get("orch") or row.get("orchestrator_id")
+            if isinstance(orch, str) and orch:
+                hints[ticket] = orch
+                orchestrators.add(orch)
+                break
+
+    # Headless archives are normally keyed with the same project prefix as
+    # their orchestrator (WIKI -> wiki, PHO -> phoebe). This is only a cheap
+    # grouping hint; the archived body remains authoritative after selection.
+    for ticket in set(hints) | set(orchestrators):
+        prefix = ticket.split("-", 1)[0].lower()
+        matches = [
+            orch
+            for orch in orchestrators
+            if orch.lower().startswith(prefix) or prefix.startswith(orch.lower())
+        ]
+        if len(matches) == 1:
+            hints.setdefault(ticket, matches[0])
+    return hints, orchestrators
+
+
+def _bounded_archive_candidates(
+    limit_per_orch: int,
+    *,
+    latest_per_ticket: bool,
+) -> list[tuple[str, datetime, Path]]:
+    """Select archive paths before reading any final-status or meta bodies."""
+
+    hints, orchestrators = _archive_orch_hints()
+    buckets: dict[str, list[tuple[tuple[float, int, str], str, datetime, Path]]] = {}
+    if not AGENT_ARCHIVE_DIR.is_dir():
+        return []
+    for ticket_dir in AGENT_ARCHIVE_DIR.iterdir():
+        if not ticket_dir.is_dir() or not TICKET_PATTERN.fullmatch(ticket_dir.name):
+            continue
+        sessions = _archive_sessions(ticket_dir)
+        if latest_per_ticket and sessions:
+            sessions = sessions[:1]
+        orch = hints.get(ticket_dir.name)
+        if orch is None:
+            prefix = ticket_dir.name.split("-", 1)[0].lower()
+            matches = [
+                candidate
+                for candidate in orchestrators
+                if candidate.lower().startswith(prefix) or prefix.startswith(candidate.lower())
+            ]
+            orch = matches[0] if len(matches) == 1 else "unassigned"
+        bucket = buckets.setdefault(orch, [])
+        for archived_at, session_dir in sessions:
+            try:
+                mtime_ns = session_dir.stat().st_mtime_ns
+            except OSError:
+                mtime_ns = 0
+            key = (mtime_ns, archived_at.timestamp(), session_dir.name)
+            bucket.append((key, ticket_dir.name, archived_at, session_dir))
+        bucket.sort(key=lambda item: item[0], reverse=True)
+        del bucket[limit_per_orch:]
+
+    selected = [
+        (ticket, archived_at, session_dir)
+        for bucket in buckets.values()
+        for _key, ticket, archived_at, session_dir in bucket
+    ]
+    selected.sort(key=lambda item: (item[1], item[2].name), reverse=True)
+    return selected
+
+
 def list_archived(
     limit: int | None = 20,
     *,
@@ -1405,33 +1492,35 @@ def list_archived(
     if not AGENT_ARCHIVE_DIR.is_dir():
         return []
     entries: list[dict] = []
-    entries_by_orch: dict[str, list[dict]] = {}
-    for ticket_dir in AGENT_ARCHIVE_DIR.iterdir():
-        if not ticket_dir.is_dir() or not TICKET_PATTERN.fullmatch(ticket_dir.name):
-            continue
-        sessions = _archive_sessions(ticket_dir)
-        if latest_per_ticket and sessions:
-            sessions = sessions[:1]
-        for archived_at, session_dir in sessions:
-            status = {}
-            try:
-                status = json.loads((session_dir / "final-status.json").read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                pass
-            meta = {}
-            try:
-                meta = json.loads((session_dir / "meta.json").read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                pass
-            worker = meta.get("worker") or {}
-            kind = worker.get("kind")
-            if not kind:
-                if any(session_dir.glob("cdx-*")):
-                    kind = "cdx"
-                elif any(session_dir.glob("cc-*")):
-                    kind = "cc"
-            entry = {
-                "ticket": ticket_dir.name,
+    if limit_per_orch is not None:
+        candidates = _bounded_archive_candidates(
+            limit_per_orch,
+            latest_per_ticket=latest_per_ticket,
+        )
+    else:
+        candidates = [
+            (ticket_dir.name, archived_at, session_dir)
+            for ticket_dir in AGENT_ARCHIVE_DIR.iterdir()
+            if ticket_dir.is_dir() and TICKET_PATTERN.fullmatch(ticket_dir.name)
+            for archived_at, session_dir in (
+                _archive_sessions(ticket_dir)[:1]
+                if latest_per_ticket
+                else _archive_sessions(ticket_dir)
+            )
+        ]
+    for ticket, archived_at, session_dir in candidates:
+        status = _read_json_object(session_dir / "final-status.json")
+        meta = _read_json_object(session_dir / "meta.json")
+        worker = meta.get("worker") or {}
+        kind = worker.get("kind")
+        if not kind:
+            if any(session_dir.glob("cdx-*")):
+                kind = "cdx"
+            elif any(session_dir.glob("cc-*")):
+                kind = "cc"
+        entries.append(
+            {
+                "ticket": ticket,
                 "archived_at": archived_at.isoformat(),
                 "kind": kind,
                 "role": worker.get("role") or _archive_role(session_dir),
@@ -1442,16 +1531,7 @@ def list_archived(
                 "pr": status.get("pr"),
                 "step": status.get("step"),
             }
-            if limit_per_orch is None:
-                entries.append(entry)
-                continue
-            orch_key = str(entry.get("orch") or "unassigned")
-            bucket = entries_by_orch.setdefault(orch_key, [])
-            bucket.append(entry)
-            bucket.sort(key=lambda item: item["archived_at"], reverse=True)
-            del bucket[limit_per_orch:]
-    if limit_per_orch is not None:
-        entries = [entry for bucket in entries_by_orch.values() for entry in bucket]
+        )
     entries.sort(key=lambda e: e["archived_at"], reverse=True)
     if limit_per_orch is not None:
         return entries
@@ -2058,6 +2138,7 @@ def _fleet_graph_ticket(
     source: str,
     worker_metadata: dict[str, dict[str, object]],
     archived_metadata: dict[str, dict[str, object]],
+    allowed_tickets: set[str],
 ) -> list[dict[str, object]]:
     """Flatten one validated workgraph into worker nodes and normalized edges."""
 
@@ -2096,7 +2177,8 @@ def _fleet_graph_ticket(
         if not isinstance(ticket, str) or not ticket:
             continue
         node_tickets[node_id] = ticket
-        worker_nodes.append((node, ticket))
+        if ticket in allowed_tickets:
+            worker_nodes.append((node, ticket))
 
     edges_by_ticket: dict[str, list[dict[str, object]]] = {ticket: [] for _, ticket in worker_nodes}
     for edge in edges:
@@ -2105,6 +2187,15 @@ def _fleet_graph_ticket(
         from_node = _fleet_edge_endpoint(edge.get("from"), node_tickets, orch)
         to_node = _fleet_edge_endpoint(edge.get("to"), node_tickets, orch)
         if from_node is None or to_node is None:
+            continue
+        worker_endpoint_tickets = [
+            node_tickets[endpoint]
+            for endpoint in (edge.get("from"), edge.get("to"))
+            if isinstance(endpoint, str)
+            and endpoint in node_tickets
+            and not node_tickets[endpoint].startswith(("orch:", "monitor:"))
+        ]
+        if any(ticket not in allowed_tickets for ticket in worker_endpoint_tickets):
             continue
         worker_endpoints = [
             endpoint
@@ -2167,36 +2258,62 @@ def _fleet_graph_payload(limit: int = 10) -> dict[str, object]:
     graph_tickets.update(base_ticket(ticket) for ticket in worker_metadata)
 
     groups: dict[str, dict[str, dict[str, object]]] = {}
+    for ticket, metadata in worker_metadata.items():
+        orch = str(metadata.get("orch") or "unassigned")
+        groups.setdefault(orch, {})[ticket] = {
+            "ticket": ticket,
+            "state": metadata.get("state") or "working",
+            "role": metadata.get("role") or "worker",
+            "kind": metadata.get("kind") or "unknown",
+            "edges": [],
+        }
+    for ticket, metadata in archived_metadata.items():
+        orch = str(metadata.get("orch") or "unassigned")
+        groups.setdefault(orch, {}).setdefault(
+            ticket,
+            {
+                "ticket": ticket,
+                "state": metadata.get("state") or "archived",
+                "role": metadata.get("role") or "worker",
+                "kind": metadata.get("kind") or "unknown",
+                "edges": [],
+            },
+        )
+
     for graph_ticket in sorted(graph_tickets):
         graph, source = graph_health.load_validated_graph(
             graph_ticket,
             status_dir=AGENT_STATUS_DIR,
         )
         if graph is None:
-            metadata = worker_metadata.get(graph_ticket) or archived_metadata.get(graph_ticket)
-            if metadata is None:
-                continue
-            orch = str(metadata.get("orch") or "unassigned")
-            groups.setdefault(orch, {})[graph_ticket] = {
-                "ticket": graph_ticket,
-                "state": metadata.get("state") or "archived",
-                "role": metadata.get("role") or "worker",
-                "kind": metadata.get("kind") or "unknown",
-                "edges": [],
-            }
             continue
         orch = str(graph.get("orch") or "unassigned")
+        allowed_tickets = {
+            ticket
+            for ticket, metadata in worker_metadata.items()
+            if base_ticket(ticket) == graph_ticket
+            and (metadata.get("orch") is None or str(metadata.get("orch")) == orch)
+        }
+        allowed_tickets.update(
+            ticket
+            for ticket, metadata in archived_metadata.items()
+            if base_ticket(ticket) == graph_ticket
+            and (metadata.get("orch") is None or str(metadata.get("orch")) == orch)
+        )
         tickets = _fleet_graph_ticket(
             graph=graph,
             source=source or "snapshot",
             worker_metadata=worker_metadata,
             archived_metadata=archived_metadata,
+            allowed_tickets=allowed_tickets,
         )
         group = groups.setdefault(orch, {})
         for ticket in tickets:
-            existing = group.get(str(ticket["ticket"]))
-            if existing is None or str(ticket.get("state")) != "archived":
-                group[str(ticket["ticket"])] = ticket
+            ticket_id = str(ticket["ticket"])
+            for other_orch, other_group in groups.items():
+                if other_orch != orch:
+                    other_group.pop(ticket_id, None)
+            group[ticket_id] = ticket
 
     return {
         "groups": [

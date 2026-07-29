@@ -56,7 +56,7 @@ function visibleNodeIds(edges: WorkgraphEdge[]): Set<string> {
   return ids;
 }
 
-function groupEdges(edges: WorkgraphEdge[]): EdgeGroup[] {
+export function groupEdges(edges: WorkgraphEdge[]): EdgeGroup[] {
   const groups = new Map<string, EdgeGroup>();
   edges.forEach((edge, index) => {
     const key = `${edge.from}->${edge.to}:${edge.kind}`;
@@ -64,7 +64,7 @@ function groupEdges(edges: WorkgraphEdge[]): EdgeGroup[] {
     if (existing) {
       existing.count += 1;
       existing.lastIndex = index;
-      existing.active = existing.active || edge.active !== false;
+      existing.active = existing.active || edge.active === true;
     } else {
       groups.set(key, {
         key,
@@ -73,7 +73,7 @@ function groupEdges(edges: WorkgraphEdge[]): EdgeGroup[] {
         to: edge.to,
         count: 1,
         lastIndex: index,
-        active: edge.active !== false,
+        active: edge.active === true,
       });
     }
   });

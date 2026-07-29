@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest import mock
 
 from backend.app import main
@@ -36,6 +38,7 @@ class FleetGraphTests(unittest.TestCase):
             source="live",
             worker_metadata={"WIKI-170": {"state": "working", "role": "implement", "kind": "cdx"}},
             archived_metadata={"WIKI-170-REVIEW1": {"state": "merge-ready", "role": "review", "kind": "cc"}},
+            allowed_tickets={"WIKI-170", "WIKI-170-REVIEW1"},
         )
 
         self.assertEqual({ticket["ticket"] for ticket in tickets}, {"WIKI-170", "WIKI-170-REVIEW1"})
@@ -77,6 +80,144 @@ class FleetGraphTests(unittest.TestCase):
         self.assertEqual(payload["groups"][0]["tickets"][0]["ticket"], "PHO-8")
         self.assertEqual(payload["groups"][1]["tickets"][0]["state"], "working")
         self.assertIsInstance(payload["updated_at_ns"], int)
+
+    def test_bounded_archive_read_loads_only_selected_bodies(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            archive_root = Path(temp_dir)
+            for prefix in ("WIKI", "PHO"):
+                for index in range(200):
+                    session = archive_root / f"{prefix}-{index}" / (
+                        f"20260729-{index // 60:02d}{index % 60:02d}00"
+                    )
+                    session.mkdir(parents=True)
+                    (session / "meta.json").write_text(
+                        '{"worker":{"orch":"wiki"}}' if prefix == "WIKI" else '{"worker":{"orch":"phoebe"}}',
+                        encoding="utf-8",
+                    )
+                    (session / "final-status.json").write_text(
+                        '{"state":"closed"}', encoding="utf-8"
+                    )
+
+            loaded_paths: list[Path] = []
+            original_read = main._read_json_object  # noqa: SLF001
+
+            def counted_read(path: Path) -> dict:
+                loaded_paths.append(path)
+                return original_read(path)
+
+            with (
+                mock.patch.object(main, "AGENT_ARCHIVE_DIR", archive_root),
+                mock.patch.object(
+                    main,
+                    "_read_agent_registry",
+                    return_value={"_orchestrators": {"wiki": {}, "phoebe": {}}},
+                ),
+                mock.patch.object(main, "_read_json_object", side_effect=counted_read),
+            ):
+                entries = main.list_archived(
+                    limit=5,
+                    latest_per_ticket=True,
+                    limit_per_orch=5,
+                )
+
+            loaded_sessions = {path.parent for path in loaded_paths}
+            self.assertEqual(len(entries), 10)
+            self.assertEqual(len(loaded_sessions), 10)
+            self.assertEqual(len(loaded_paths), 20)
+            self.assertFalse(any("-000000" in str(path) for path in loaded_paths))
+
+    def test_selected_archives_bound_graph_nodes_and_edges(self) -> None:
+        registry = {
+            "WIKI-170": {
+                "current": {"orch": "wiki", "role": "implement", "kind": "cdx"}
+            }
+        }
+        graph = {
+            "ticket": "WIKI-170",
+            "orch": "wiki",
+            "nodes": [
+                {"id": "orch:wiki", "kind": "orchestrator"},
+                {"id": "live", "kind": "implement", "worker_id": "WIKI-170"},
+                *[
+                    {"id": f"review{index}", "kind": "review", "worker_id": f"WIKI-170-REVIEW{index}"}
+                    for index in range(1, 6)
+                ],
+            ],
+            "edges": [
+                {"kind": "spawn", "from": "orch:wiki", "to": "live", "created_at": ""},
+                *[
+                    {
+                        "kind": "verdict",
+                        "from": f"review{index}",
+                        "to": f"review{index + 1}",
+                        "created_at": "",
+                    }
+                    for index in range(1, 5)
+                ],
+            ],
+        }
+        archive = [
+            {
+                "ticket": "WIKI-170-REVIEW1",
+                "orch": "wiki",
+                "state": "closed",
+                "role": "review",
+                "kind": "cdx",
+            },
+            {
+                "ticket": "WIKI-170-REVIEW2",
+                "orch": "wiki",
+                "state": "closed",
+                "role": "review",
+                "kind": "cdx",
+            },
+        ]
+        with (
+            mock.patch.object(main, "_read_agent_registry", return_value=registry),
+            mock.patch.object(main, "read_agent_status", return_value={"state": "working"}),
+            mock.patch.object(main, "list_archived", return_value=archive),
+            mock.patch.object(main.graph_health, "load_validated_graph", return_value=(graph, "snapshot")),
+        ):
+            payload = main._fleet_graph_payload(limit=2)  # noqa: SLF001
+            payload_without_archives = main._fleet_graph_payload(limit=0)  # noqa: SLF001
+
+        tickets = payload["groups"][0]["tickets"]
+        self.assertEqual(
+            {ticket["ticket"] for ticket in tickets},
+            {"WIKI-170", "WIKI-170-REVIEW1", "WIKI-170-REVIEW2"},
+        )
+        edge_text = repr([ticket["edges"] for ticket in tickets])
+        self.assertNotIn("WIKI-170-REVIEW3", edge_text)
+        self.assertNotIn("WIKI-170-REVIEW4", edge_text)
+        self.assertNotIn("WIKI-170-REVIEW5", edge_text)
+        self.assertEqual(
+            {ticket["ticket"] for ticket in payload_without_archives["groups"][0]["tickets"]},
+            {"WIKI-170"},
+        )
+
+    def test_live_worker_metadata_survives_missing_graph(self) -> None:
+        registry = {
+            "WIKI-172": {
+                "current": {"orch": "wiki", "role": "implement", "kind": "cdx"}
+            },
+            "WIKI-172-REVIEW1": {
+                "current": {"orch": "wiki", "role": "review", "kind": "cdx"}
+            },
+        }
+        with (
+            mock.patch.object(main, "_read_agent_registry", return_value=registry),
+            mock.patch.object(main, "read_agent_status", return_value={"state": "working"}),
+            mock.patch.object(main, "list_archived", return_value=[]),
+            mock.patch.object(main.graph_health, "load_validated_graph", return_value=(None, None)),
+        ):
+            payload = main._fleet_graph_payload(limit=10)  # noqa: SLF001
+
+        group = next(group for group in payload["groups"] if group["orch"] == "wiki")
+        self.assertEqual(
+            {ticket["ticket"] for ticket in group["tickets"]},
+            {"WIKI-172", "WIKI-172-REVIEW1"},
+        )
+        self.assertTrue(all(ticket["edges"] == [] for ticket in group["tickets"]))
 
 
 if __name__ == "__main__":
