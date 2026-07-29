@@ -59,6 +59,7 @@ from .agent_runtime import graph_health
 from .agent_runtime.store import RuntimePaths
 from .agent_runtime.ticket import base_ticket
 from .frontend_static import mount_frontend_static
+from .next_review_schema import NextReviewIn
 
 
 ROOT_DIR = Path(os.environ.get("WIKI_REPO_DIR", Path(__file__).resolve().parents[2])).resolve()
@@ -4100,6 +4101,25 @@ def spawn_agent_route(
     )
 
 
+@app.post("/api/agents/next-review")
+def next_review_route(body: NextReviewIn) -> dict[str, Any]:
+    """Gate a PR and start its next pinned reviewer as one idempotent action."""
+
+    from .agent_runtime.next_review import next_review
+
+    return next_review(
+        ticket=body.ticket,
+        pr_number=body.pr_number,
+        expected_sha=body.expected_sha,
+        orch=body.orch,
+        reviewer_kind=body.reviewer_kind,
+        reviewer_model=body.reviewer_model,
+        reviewer_effort=body.reviewer_effort,
+        prompt_template=body.prompt_template,
+        request_id=body.request_id,
+    )
+
+
 def spawn_orchestrator(
     body: dict[str, Any] | SpawnOrchestratorIn,
     *,
@@ -4418,6 +4438,94 @@ def _validate_existing_worktree(
                 f"expected {branch!r}"
             ),
         )
+
+
+def provision_pinned_worktree(
+    repo_root: Path,
+    workdir: Path,
+    expected_sha: str,
+) -> Path:
+    """Create or validate a detached worktree pinned to ``expected_sha``."""
+
+    workdir = workdir.resolve()
+    repo_root = repo_root.resolve()
+    try:
+        canonical_sha_result = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "--verify", f"{expected_sha}^{{commit}}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"git rev-parse failed: {exc}") from exc
+    if canonical_sha_result.returncode != 0 or not canonical_sha_result.stdout.strip():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                canonical_sha_result.stderr
+                or canonical_sha_result.stdout
+                or f"could not resolve commit {expected_sha}"
+            ).strip()[:400],
+        )
+    expected_sha = canonical_sha_result.stdout.strip()
+    if workdir.exists():
+        if not workdir.is_dir() or not (workdir / ".git").exists():
+            raise HTTPException(
+                status_code=409,
+                detail=f"review worktree path exists but is not a git worktree: {workdir}",
+            )
+        root_ok, root_result = _git_common_dir(repo_root)
+        work_ok, work_result = _git_common_dir(workdir)
+        if not root_ok or not work_ok or root_result != work_result:
+            raise HTTPException(
+                status_code=409,
+                detail=f"review worktree {workdir} belongs to a different repository",
+            )
+        head = subprocess.run(
+            ["git", "-C", str(workdir), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if head.returncode != 0 or head.stdout.strip() != expected_sha:
+            actual = (head.stdout or head.stderr).strip()[:200]
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"review worktree {workdir} is not pinned to {expected_sha} "
+                    f"(found {actual})"
+                ),
+            )
+        return workdir
+
+    workdir.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "worktree",
+                "add",
+                "--detach",
+                str(workdir),
+                expected_sha,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"git worktree add failed: {exc}") from exc
+    if result.returncode != 0:
+        raise HTTPException(
+            status_code=502,
+            detail=(result.stderr or result.stdout or "git worktree add failed").strip()[:400],
+        )
+    return workdir
 
 
 @app.post(
