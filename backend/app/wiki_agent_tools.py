@@ -152,6 +152,31 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "name": "next_review",
+        "description": (
+            "Run the merge-ready gate and start the next pinned PR reviewer in one "
+            "idempotent operation. The reviewer stays grouped under this orchestrator."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["ticket", "pr_number", "expected_sha"],
+            "properties": {
+                "ticket": {"type": "string", "minLength": 1},
+                "pr_number": {"type": "integer", "minimum": 1},
+                "expected_sha": {"type": "string", "minLength": 1, "maxLength": 64},
+                "reviewer_kind": {"enum": ["cc", "cdx"], "default": "cdx"},
+                "reviewer_model": {"type": "string", "minLength": 1, "default": "gpt-5.6-sol"},
+                "reviewer_effort": {
+                    "enum": ["minimal", "low", "medium", "high", "xhigh"],
+                    "default": "high",
+                },
+                "prompt_template": {"type": "string", "maxLength": 100000},
+                "request_id": {"type": "string", "minLength": 1, "maxLength": 200},
+            },
+        },
+    },
 ]
 
 
@@ -328,6 +353,29 @@ def archive_agent(arguments: Any) -> dict[str, Any]:
     )
 
 
+def next_review(arguments: Any) -> dict[str, Any]:
+    values = _arguments(
+        arguments,
+        required={"ticket", "pr_number", "expected_sha"},
+        optional={
+            "reviewer_kind",
+            "reviewer_model",
+            "reviewer_effort",
+            "prompt_template",
+            "request_id",
+        },
+    )
+    values.setdefault("reviewer_kind", "cdx")
+    values.setdefault("reviewer_model", "gpt-5.6-sol")
+    values.setdefault("reviewer_effort", "high")
+    values.setdefault("request_id", str(uuid4()))
+    orch = os.environ.get("WIKI_AGENT_ID")
+    if not orch:
+        raise AgentToolError("WIKI_AGENT_ID is missing from the orchestrator runtime")
+    values["orch"] = orch
+    return _backend_api("POST", "/api/agents/next-review", values)
+
+
 TOOL_HANDLERS = {
     "list_agents": list_agents,
     "read_agent": read_agent,
@@ -337,6 +385,7 @@ TOOL_HANDLERS = {
     "steer_agent": steer_agent,
     "replace_agent": replace_agent,
     "archive_agent": archive_agent,
+    "next_review": next_review,
 }
 
 

@@ -272,8 +272,38 @@ class WikiArtifactsTests(unittest.TestCase):
                 "read_agent",
                 "read_agent_events",
                 "read_agent_pr",
+                "next_review",
             }.issubset(names)
         )
+
+    def test_next_review_uses_runtime_orchestrator_grouping(self) -> None:
+        calls: list[tuple[str, str, dict | None]] = []
+
+        def backend(method: str, path: str, payload: dict | None = None) -> dict:
+            calls.append((method, path, payload))
+            return {"status": "spawned", "run_id": "review-run"}
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"WIKI_AGENT_ROLE": "orchestrator", "WIKI_AGENT_ID": "wiki"},
+            ),
+            mock.patch.object(wiki_agent_tools, "_backend_api", side_effect=backend),
+        ):
+            result = wiki_agent_tools.next_review(
+                {
+                    "ticket": "WIKI-171",
+                    "pr_number": 171,
+                    "expected_sha": "a" * 40,
+                    "request_id": "mcp-next-review-1",
+                }
+            )
+
+        self.assertEqual(result["run_id"], "review-run")
+        self.assertEqual(calls[0][0:2], ("POST", "/api/agents/next-review"))
+        assert calls[0][2] is not None
+        self.assertEqual(calls[0][2]["orch"], "wiki")
+        self.assertEqual(calls[0][2]["request_id"], "mcp-next-review-1")
 
     def test_orchestrator_operations_route_through_the_live_backend(self) -> None:
         calls: list[tuple[str, str, dict | None]] = []

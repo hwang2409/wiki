@@ -3142,6 +3142,18 @@ class AgentArchiveIn(BaseModel):
     outcome: str = Field(pattern="^(merged|closed|abandoned)$")
 
 
+class NextReviewIn(BaseModel):
+    ticket: str = Field(..., min_length=1, max_length=80, pattern=r"^[A-Z0-9-]+$")
+    pr_number: int = Field(..., ge=1)
+    expected_sha: str = Field(..., min_length=7, max_length=64, pattern=r"^[0-9a-fA-F]+$")
+    orch: str = Field(..., min_length=1, max_length=100)
+    reviewer_kind: str = Field(default="cdx", pattern="^(cc|cdx)$")
+    reviewer_model: str = Field(default="gpt-5.6-sol", min_length=2, max_length=64)
+    reviewer_effort: str = Field(default="high", pattern="^(minimal|low|medium|high|xhigh)$")
+    prompt_template: str | None = Field(default=None, max_length=100_000)
+    request_id: str | None = Field(default=None, min_length=1, max_length=200)
+
+
 def _allowed_model_message(kind: str, model: str, *, target: str) -> str:
     provider = {"cdx": "Codex", "cc": "Claude"}.get(kind, kind)
     allowed = ", ".join(model_ids_for_kind(kind))
@@ -3729,6 +3741,25 @@ def spawn_agent_route(
     )
 
 
+@app.post("/api/agents/next-review")
+def next_review_route(body: NextReviewIn) -> dict[str, Any]:
+    """Gate a PR and start its next pinned reviewer as one idempotent action."""
+
+    from .agent_runtime.next_review import next_review
+
+    return next_review(
+        ticket=body.ticket,
+        pr_number=body.pr_number,
+        expected_sha=body.expected_sha,
+        orch=body.orch,
+        reviewer_kind=body.reviewer_kind,
+        reviewer_model=body.reviewer_model,
+        reviewer_effort=body.reviewer_effort,
+        prompt_template=body.prompt_template,
+        request_id=body.request_id,
+    )
+
+
 def spawn_orchestrator(
     body: dict[str, Any] | SpawnOrchestratorIn,
     *,
@@ -4047,6 +4078,74 @@ def _validate_existing_worktree(
                 f"expected {branch!r}"
             ),
         )
+
+
+def provision_pinned_worktree(
+    repo_root: Path,
+    workdir: Path,
+    expected_sha: str,
+) -> Path:
+    """Create or validate a detached worktree pinned to ``expected_sha``."""
+
+    workdir = workdir.resolve()
+    repo_root = repo_root.resolve()
+    if workdir.exists():
+        if not workdir.is_dir() or not (workdir / ".git").exists():
+            raise HTTPException(
+                status_code=409,
+                detail=f"review worktree path exists but is not a git worktree: {workdir}",
+            )
+        root_ok, root_result = _git_common_dir(repo_root)
+        work_ok, work_result = _git_common_dir(workdir)
+        if not root_ok or not work_ok or root_result != work_result:
+            raise HTTPException(
+                status_code=409,
+                detail=f"review worktree {workdir} belongs to a different repository",
+            )
+        head = subprocess.run(
+            ["git", "-C", str(workdir), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if head.returncode != 0 or head.stdout.strip() != expected_sha:
+            actual = (head.stdout or head.stderr).strip()[:200]
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"review worktree {workdir} is not pinned to {expected_sha} "
+                    f"(found {actual})"
+                ),
+            )
+        return workdir
+
+    workdir.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "worktree",
+                "add",
+                "--detach",
+                str(workdir),
+                expected_sha,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"git worktree add failed: {exc}") from exc
+    if result.returncode != 0:
+        raise HTTPException(
+            status_code=502,
+            detail=(result.stderr or result.stdout or "git worktree add failed").strip()[:400],
+        )
+    return workdir
 
 
 @app.post(
