@@ -174,6 +174,67 @@ class ProtocolFixtureTests(unittest.TestCase):
         self.assertEqual(response.kind, "approval_response")
         self.assertEqual(response.disposition, EventDisposition.IGNORED)
 
+    def test_codex_stream_renderer_methods_have_explicit_dispositions(self) -> None:
+        rendered_methods = (
+            "turn/diff/updated",
+            "item/commandExecution/terminalInteraction",
+            "warning",
+            "skills/changed",
+            "turn/plan/updated",
+        )
+        summarized_methods = (
+            "item/reasoning/summaryPartAdded",
+            "hook/started",
+            "hook/completed",
+        )
+        ignored_methods = ("rawResponse/completed",)
+        for method in rendered_methods:
+            with self.subTest(method=method):
+                normalized = normalize_provider_event(
+                    ProviderKind.CODEX,
+                    {"method": method, "params": {}},
+                )
+                self.assertEqual(normalized.disposition, EventDisposition.RENDERED)
+                self.assertEqual(normalized.kind, method.replace("/", "_"))
+        for method in summarized_methods:
+            with self.subTest(method=method):
+                normalized = normalize_provider_event(
+                    ProviderKind.CODEX,
+                    {"method": method, "params": {}},
+                )
+                self.assertEqual(normalized.disposition, EventDisposition.SUMMARIZED)
+                self.assertEqual(normalized.kind, method.replace("/", "_"))
+        for method in ignored_methods:
+            with self.subTest(method=method):
+                normalized = normalize_provider_event(
+                    ProviderKind.CODEX,
+                    {"method": method, "params": {}},
+                )
+                self.assertEqual(normalized.disposition, EventDisposition.IGNORED)
+                self.assertEqual(normalized.kind, method.replace("/", "_"))
+
+    def test_codex_moderation_metadata_warns_only_for_non_safe_flags(self) -> None:
+        safe = normalize_provider_event(
+            ProviderKind.CODEX,
+            {
+                "method": "turn/moderationMetadata",
+                "params": {"flags": ["safe"]},
+            },
+        )
+        warning = normalize_provider_event(
+            ProviderKind.CODEX,
+            {
+                "method": "turn/moderationMetadata",
+                "params": {
+                    "flags": [{"name": "review", "message": "review required"}],
+                },
+            },
+        )
+        self.assertEqual(safe.disposition, EventDisposition.IGNORED)
+        self.assertEqual(safe.kind, "turn_moderationMetadata")
+        self.assertEqual(warning.disposition, EventDisposition.RENDERED)
+        self.assertEqual(warning.kind, "turn_moderationMetadata_warning")
+
     def test_codex_render_artifact_completion_normalizes_as_artifact(self) -> None:
         row = json.loads(
             (FIXTURES / "codex_render_artifact_completed.jsonl").read_text(
