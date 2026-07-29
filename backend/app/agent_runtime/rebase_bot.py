@@ -117,7 +117,7 @@ def _validate_pr_binding(worktree: Path, verdict: Mapping[str, Any]) -> None:
         not isinstance(gate_ref, str)
         or not branch
         or gate_ref != branch
-        or tracking_ref != gate_ref
+        or (tracking_ref is not None and tracking_ref != gate_ref)
     ):
         mismatches.append(
             f"head ref gate={gate_ref or 'unknown'} worktree={branch or 'detached'}"
@@ -337,9 +337,12 @@ def _run_formatters(worktree: Path, files: Sequence[str]) -> str | None:
     python_files = [
         filename for filename in files if filename.endswith((".py", ".pyi"))
     ]
-    if python_files and shutil.which("ruff"):
+    if python_files:
+        ruff = shutil.which("ruff")
+        if ruff is None:
+            return "ruff formatter unavailable; escalating instead of merging unformatted files"
         result = subprocess.run(
-            ["ruff", "format", *python_files],
+            [ruff, "format", *python_files],
             cwd=str(worktree),
             capture_output=True,
             text=True,
@@ -585,9 +588,20 @@ def _escalate_to_orchestrator(
     if not orchestrator:
         return
     main = _main()
-    message = f"rebase-bot escalated {worker_id}: " + "; ".join(
-        str(item) for item in result.get("escalated_hunks", [])
-    )
+    status = result.get("status")
+    if status == "resolved":
+        resolved_files = ", ".join(
+            str(item) for item in result.get("resolved_files", [])
+        )
+        message = f"rebase-bot resolved {worker_id}: " + (
+            resolved_files or "rebase completed"
+        )
+    elif status == "escalated":
+        message = f"rebase-bot escalated {worker_id}: " + "; ".join(
+            str(item) for item in result.get("escalated_hunks", [])
+        )
+    else:
+        return
     try:
         main.agent_message(
             orchestrator,

@@ -113,7 +113,7 @@ class RebaseBotTests(unittest.TestCase):
                 steer=lambda target, payload: steer_calls.append((target, payload)),
             )
         self.assertEqual(result["status"], "escalated")
-        self.assertEqual(helper_calls, [Path(tempfile.gettempdir())])
+        self.assertEqual(helper_calls, [Path(tempfile.gettempdir()).resolve()])
         self.assertEqual(steer_calls[0][0], "wiki")
         self.assertEqual(steer_calls[0][1]["source"], "rebase-bot")
 
@@ -170,7 +170,99 @@ class RebaseBotTests(unittest.TestCase):
             ).stdout.split()[0]
         self.assertEqual(result["status"], "resolved")
         self.assertEqual(remote, result["head_sha"])
-        self.assertEqual(formatter_calls, [(worktree, ["fixture.py"])])
+        self.assertEqual(formatter_calls, [(worktree.resolve(), ["fixture.py"])])
+
+    def test_dirty_gate_routes_status_specific_messages_without_override(self) -> None:
+        messages: list[tuple[str, str]] = []
+        results = [
+            {
+                "status": "resolved",
+                "head_sha": "abc",
+                "resolved_files": ["fixture.py"],
+                "escalated_hunks": [],
+                "source": "rebase-bot",
+            },
+            {
+                "status": "escalated",
+                "head_sha": "abc",
+                "resolved_files": [],
+                "escalated_hunks": ["semantic hunk"],
+                "source": "rebase-bot",
+            },
+        ]
+        fake_main = SimpleNamespace(
+            _registry_agent=lambda _registry, _worker: (
+                "WIKI-175-IMPL",
+                {},
+                {"worktree": tempfile.gettempdir(), "orch": "wiki"},
+            ),
+            _read_agent_registry=lambda: {},
+            MessageIn=lambda **kwargs: SimpleNamespace(**kwargs),
+            BackgroundTasks=lambda: object(),
+            agent_message=lambda target, message, _tasks: messages.append(
+                (target, message.text)
+            ),
+        )
+
+        with (
+            mock.patch.object(rebase_bot, "_main", return_value=fake_main),
+            mock.patch.object(rebase_bot, "_validate_pr_binding"),
+        ):
+            for expected_status in ("resolved", "escalated"):
+                result = rebase_bot.rebase_dirty_pr(
+                    175,
+                    "WIKI-175",
+                    "WIKI-175-IMPL",
+                    gate=lambda _pr: {
+                        "raw": {
+                            "mergeable": "CONFLICTING",
+                            "repo": "hwang2409/wiki",
+                            "head_ref_name": "feature",
+                            "head_sha": "abc",
+                        }
+                    },
+                    helper=lambda _worktree: results.pop(0),
+                )
+                self.assertEqual(result["status"], expected_status)
+
+        self.assertEqual([target for target, _message in messages], ["wiki", "wiki"])
+        self.assertIn("rebase-bot resolved", messages[0][1])
+        self.assertNotIn("escalated", messages[0][1])
+        self.assertIn("rebase-bot escalated", messages[1][1])
+
+    def test_missing_ruff_escalates_instead_of_silently_skipping_format(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            worktree = _conflicting_repo(Path(raw), whitespace=True)
+            with mock.patch.object(rebase_bot.shutil, "which", return_value=None):
+                result = rebase_bot.run_rebase_helper(
+                    worktree, smoke_commands=[], push=False
+                )
+        self.assertEqual(result["status"], "escalated")
+        self.assertIn("ruff formatter unavailable", result["escalated_hunks"][0])
+
+    def test_binding_allows_worktree_without_upstream(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            worktree = _conflicting_repo(Path(raw))
+            _run(
+                worktree,
+                "git",
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/hwang2409/wiki.git",
+            )
+            _run(worktree, "git", "branch", "--unset-upstream", check=False)
+            head_sha = _run(worktree, "git", "rev-parse", "HEAD").stdout.strip()
+            rebase_bot._validate_pr_binding(
+                worktree,
+                {
+                    "raw": {
+                        "repo": "hwang2409/wiki",
+                        "head_ref_name": "feature",
+                        "head_sha": head_sha,
+                    }
+                },
+            )
 
     def test_production_code_has_no_verification_bypass(self) -> None:
         source = Path(rebase_bot.__file__).read_text(encoding="utf-8")
