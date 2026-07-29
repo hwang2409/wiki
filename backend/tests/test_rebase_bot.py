@@ -9,22 +9,35 @@ from types import SimpleNamespace
 from unittest import mock
 
 from backend.app.agent_runtime import rebase_bot
+from backend.app.agent_runtime.rebase_bot import RebaseError
+from backend.app.rebase_schema import RebaseDirtyPrIn, mcp_input_schema
 
 
 def _run(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, cwd=cwd, text=True, capture_output=True, check=check)
 
 
-def _conflicting_repo(root: Path, *, semantic: bool = False) -> Path:
+def _conflicting_repo(
+    root: Path, *, semantic: bool = False, whitespace: bool = False
+) -> Path:
     origin = root / "origin.git"
     worktree = root / "worktree"
     _run(root, "git", "init", "--bare", str(origin))
     _run(root, "git", "init", str(worktree))
     _run(worktree, "git", "config", "user.email", "test@example.com")
     _run(worktree, "git", "config", "user.name", "test")
-    base = 'def value():\n    return "base"\n' if semantic else "import base\n"
-    ours = 'def value():\n    return "ours"\n' if semantic else "import ours\n"
-    theirs = 'def value():\n    return "theirs"\n' if semantic else "import theirs\n"
+    if semantic:
+        base = 'def value():\n    return "base"\n'
+        ours = 'def value():\n    return "ours"\n'
+        theirs = 'def value():\n    return "theirs"\n'
+    elif whitespace:
+        base = "value = 1\n"
+        ours = "value = 1  # same  \n"
+        theirs = "value=1 # same\n"
+    else:
+        base = "import base\n"
+        ours = "import ours\n"
+        theirs = "import theirs\n"
     (worktree / "fixture.py").write_text(base, encoding="utf-8")
     _run(worktree, "git", "add", "fixture.py")
     _run(worktree, "git", "commit", "-m", "base")
@@ -43,6 +56,11 @@ def _conflicting_repo(root: Path, *, semantic: bool = False) -> Path:
 
 
 class RebaseBotTests(unittest.TestCase):
+    def test_mcp_schema_matches_request_model_constraints(self) -> None:
+        endpoint = RebaseDirtyPrIn.model_json_schema()["properties"]
+        mcp = mcp_input_schema()["properties"]
+        self.assertEqual(mcp, endpoint)
+
     def test_clean_gate_is_a_noop(self) -> None:
         result = rebase_bot.rebase_dirty_pr(
             175,
@@ -53,34 +71,79 @@ class RebaseBotTests(unittest.TestCase):
         self.assertEqual(result["status"], "resolved")
         self.assertTrue(result["no_op"])
 
-    def test_dirty_gate_spawns_luna_helper_in_existing_worktree(self) -> None:
-        spawned: list[object] = []
+    def test_dirty_gate_invokes_helper_and_routes_escalation(self) -> None:
+        helper_calls: list[Path] = []
+        steer_calls: list[tuple[str, dict]] = []
         fake_main = SimpleNamespace(
-            SpawnWorkerIn=lambda **kwargs: SimpleNamespace(**kwargs),
             _registry_agent=lambda _registry, _worker: (
                 "WIKI-175-IMPL",
                 {},
                 {"worktree": tempfile.gettempdir(), "orch": "wiki"},
             ),
             _read_agent_registry=lambda: {},
-            spawn_agent=lambda request: (
-                spawned.append(request) or {"run_id": "run-rebase"}
-            ),
         )
-        with mock.patch.object(rebase_bot, "_main", return_value=fake_main):
+
+        def helper(worktree: Path) -> dict:
+            helper_calls.append(worktree)
+            return {
+                "status": "escalated",
+                "head_sha": "abc",
+                "resolved_files": [],
+                "escalated_hunks": ["semantic hunk"],
+                "source": "rebase-bot",
+            }
+
+        with (
+            mock.patch.object(rebase_bot, "_main", return_value=fake_main),
+            mock.patch.object(rebase_bot, "_validate_pr_binding"),
+        ):
             result = rebase_bot.rebase_dirty_pr(
                 175,
                 "WIKI-175",
                 "WIKI-175-IMPL",
-                gate=lambda _pr: {"raw": {"mergeable": "CONFLICTING"}},
+                gate=lambda _pr: {
+                    "raw": {
+                        "mergeable": "CONFLICTING",
+                        "repo": "hwang2409/wiki",
+                        "head_ref_name": "feature",
+                        "head_sha": "abc",
+                    }
+                },
+                helper=helper,
+                steer=lambda target, payload: steer_calls.append((target, payload)),
             )
         self.assertEqual(result["status"], "escalated")
-        self.assertEqual(len(spawned), 1)
-        request = spawned[0]
-        self.assertEqual(request.model, "gpt-5.6-luna")
-        self.assertEqual(request.effort, "low")
-        self.assertEqual(request.ticket, "WIKI-175-REBASE")
-        self.assertIn("never force-push", request.prompt)
+        self.assertEqual(helper_calls, [Path(tempfile.gettempdir())])
+        self.assertEqual(steer_calls[0][0], "wiki")
+        self.assertEqual(steer_calls[0][1]["source"], "rebase-bot")
+
+    def test_mismatched_pr_rejects_before_helper(self) -> None:
+        helper = mock.Mock()
+        fake_main = SimpleNamespace(
+            _registry_agent=lambda _registry, _worker: (
+                "WIKI-175-IMPL",
+                {},
+                {"worktree": tempfile.gettempdir(), "orch": "wiki"},
+            ),
+            _read_agent_registry=lambda: {},
+        )
+        with mock.patch.object(rebase_bot, "_main", return_value=fake_main):
+            with self.assertRaisesRegex(RebaseError, "binding mismatch"):
+                rebase_bot.rebase_dirty_pr(
+                    175,
+                    "WIKI-175",
+                    "WIKI-175-IMPL",
+                    gate=lambda _pr: {
+                        "raw": {
+                            "mergeable": "CONFLICTING",
+                            "repo": "other/repo",
+                            "head_ref_name": "other-branch",
+                            "head_sha": "deadbeef",
+                        }
+                    },
+                    helper=helper,
+                )
+        helper.assert_not_called()
 
     def test_mechanical_import_conflict_resolves(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -90,6 +153,28 @@ class RebaseBotTests(unittest.TestCase):
             )
         self.assertEqual(result["status"], "resolved")
         self.assertEqual(result["resolved_files"], ["fixture.py"])
+
+    def test_whitespace_resolution_runs_formatter_and_pushes(self) -> None:
+        formatter_calls: list[tuple[Path, list[str]]] = []
+
+        def formatter(worktree: Path, files: list[str]) -> None:
+            formatter_calls.append((worktree, list(files)))
+
+        with tempfile.TemporaryDirectory() as raw:
+            worktree = _conflicting_repo(Path(raw), whitespace=True)
+            result = rebase_bot.run_rebase_helper(
+                worktree, smoke_commands=[], formatter=formatter
+            )
+            remote = _run(
+                worktree, "git", "ls-remote", "origin", "refs/heads/feature"
+            ).stdout.split()[0]
+        self.assertEqual(result["status"], "resolved")
+        self.assertEqual(remote, result["head_sha"])
+        self.assertEqual(formatter_calls, [(worktree, ["fixture.py"])])
+
+    def test_production_code_has_no_verification_bypass(self) -> None:
+        source = Path(rebase_bot.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("--no-verify", source)
 
     def test_semantic_conflict_aborts_without_push(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

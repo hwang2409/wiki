@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from . import backend_runtime
 from .next_review_schema import mcp_input_schema
+from .rebase_schema import mcp_input_schema as rebase_input_schema
 
 
 class AgentToolError(RuntimeError):
@@ -171,14 +172,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "conflicts and escalate semantic conflicts."
         ),
         "inputSchema": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["pr_number", "ticket", "worker_id"],
-            "properties": {
-                "pr_number": {"type": "integer", "minimum": 1},
-                "ticket": {"type": "string", "minLength": 1},
-                "worker_id": {"type": "string", "minLength": 1},
-            },
+            **rebase_input_schema(),
         },
     },
 ]

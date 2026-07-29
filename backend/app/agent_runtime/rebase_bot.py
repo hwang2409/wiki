@@ -10,12 +10,12 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 
 LOCKFILES = {
@@ -66,6 +66,73 @@ def _git(
 def _head_sha(worktree: Path) -> str | None:
     result = _git(worktree, ["rev-parse", "HEAD"], timeout=15)
     return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _git_value(worktree: Path, args: Sequence[str]) -> str | None:
+    result = _git(worktree, args, timeout=15)
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip()
+    return value or None
+
+
+def _repo_name(value: str | None) -> str | None:
+    if not value:
+        return None
+    raw = value.strip().removesuffix(".git")
+    for prefix in (
+        "https://github.com/",
+        "http://github.com/",
+        "git@github.com:",
+        "ssh://git@github.com/",
+    ):
+        if raw.startswith(prefix):
+            raw = raw.removeprefix(prefix)
+            break
+    parts = [part for part in raw.strip("/").split("/") if part]
+    return "/".join(parts[-2:]) if len(parts) >= 2 else None
+
+
+def _validate_pr_binding(worktree: Path, verdict: Mapping[str, Any]) -> None:
+    raw = verdict.get("raw")
+    source = raw if isinstance(raw, Mapping) else verdict
+    gate_repo = _repo_name(
+        source.get("repo") if isinstance(source.get("repo"), str) else None
+    )
+    gate_ref = source.get("head_ref_name") or source.get("headRefName")
+    gate_sha = source.get("head_sha")
+    remote = _repo_name(_git_value(worktree, ["remote", "get-url", "origin"]))
+    branch = _git_value(worktree, ["symbolic-ref", "--short", "HEAD"])
+    tracking = _git_value(
+        worktree, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]
+    )
+    current_sha = _head_sha(worktree)
+    mismatches: list[str] = []
+    if not gate_repo or not remote or gate_repo.lower() != remote.lower():
+        mismatches.append(
+            f"repo gate={gate_repo or 'unknown'} worktree={remote or 'unknown'}"
+        )
+    tracking_ref = tracking.rsplit("/", 1)[-1] if tracking else None
+    if (
+        not isinstance(gate_ref, str)
+        or not branch
+        or gate_ref != branch
+        or tracking_ref != gate_ref
+    ):
+        mismatches.append(
+            f"head ref gate={gate_ref or 'unknown'} worktree={branch or 'detached'}"
+            f" tracking={tracking or 'none'}"
+        )
+    if (
+        not isinstance(gate_sha, str)
+        or not current_sha
+        or not current_sha.startswith(gate_sha)
+    ):
+        mismatches.append(
+            f"head sha gate={gate_sha or 'unknown'} worktree={current_sha or 'unknown'}"
+        )
+    if mismatches:
+        raise RebaseError("PR/worktree binding mismatch: " + "; ".join(mismatches))
 
 
 def _normal_lines(lines: Sequence[str]) -> list[str]:
@@ -264,6 +331,28 @@ def _default_smoke_commands(worktree: Path) -> list[tuple[list[str], Path]]:
     return commands
 
 
+def _run_formatters(worktree: Path, files: Sequence[str]) -> str | None:
+    """Run repository formatters before the merge commit is created."""
+
+    python_files = [
+        filename for filename in files if filename.endswith((".py", ".pyi"))
+    ]
+    if python_files and shutil.which("ruff"):
+        result = subprocess.run(
+            ["ruff", "format", *python_files],
+            cwd=str(worktree),
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+        if result.returncode != 0:
+            return (
+                f"ruff format failed: {(result.stderr or result.stdout).strip()[:600]}"
+            )
+    return None
+
+
 def _conflict_files(worktree: Path) -> list[str]:
     result = _git(worktree, ["diff", "--name-only", "--diff-filter=U"], timeout=15)
     if result.returncode != 0:
@@ -290,6 +379,7 @@ def run_rebase_helper(
     *,
     smoke_commands: Sequence[tuple[Sequence[str], Path]] | None = None,
     push: bool = True,
+    formatter: Callable[[Path, Sequence[str]], str | None] | None = None,
 ) -> dict[str, Any]:
     """Fetch, merge, mechanically resolve, smoke-test, and push.
 
@@ -339,6 +429,11 @@ def run_rebase_helper(
                     escalated.append(error)
                 else:
                     resolved_files.append(filename)
+        if not escalated:
+            format_error = (formatter or _run_formatters)(root, files)
+            if format_error:
+                _abort_merge(root)
+                return _escalated_result(initial_sha, resolved_files, [format_error])
         if escalated:
             _abort_merge(root)
             return _escalated_result(initial_sha, resolved_files, escalated)
@@ -416,6 +511,7 @@ def run_rebase_helper(
             )
     return {
         "status": "resolved",
+        "source": "rebase-bot",
         "head_sha": _head_sha(root),
         "resolved_files": resolved_files,
         "escalated_hunks": [],
@@ -427,6 +523,7 @@ def _escalated_result(
 ) -> dict[str, Any]:
     return {
         "status": "escalated",
+        "source": "rebase-bot",
         "head_sha": head_sha,
         "resolved_files": list(resolved_files),
         "escalated_hunks": list(hunks),
@@ -447,8 +544,8 @@ and report each conflicting file and hunk to the orchestrator.
 after a clean resolution run the minimum repository smoke set (backend tests
 and frontend build/typecheck when configured). if any smoke command fails,
 abort/escalate and do not push. push with `git push origin HEAD` only; never
-force-push and never use --no-verify. report status, head sha, resolved files,
-and escalated hunks. do not touch main directly.
+force-push or bypass repository verification hooks. report status, head sha,
+resolved files, and escalated hunks. do not touch main directly.
 """
 
 
@@ -509,7 +606,6 @@ def rebase_dirty_pr(
     worker_id: str,
     *,
     gate: Callable[[int], Mapping[str, Any]] | None = None,
-    spawn: Callable[[Any], Mapping[str, Any]] | None = None,
     helper: Callable[[Path], Mapping[str, Any]] | None = None,
     steer: Callable[[str, Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
@@ -536,41 +632,10 @@ def rebase_dirty_pr(
     if not isinstance(raw_worktree, str) or not raw_worktree.strip():
         raise RebaseError(f"worker {worker_id!r} has no worktree")
     worktree = Path(raw_worktree).resolve()
+    _validate_pr_binding(worktree, verdict)
     orchestrator = current.get("orch") if isinstance(current.get("orch"), str) else None
-    helper_ticket = f"{ticket.upper()}-REBASE"
-    prompt = helper_prompt(
-        ticket=ticket.upper(), pr_number=pr_number, worker_id=worker_id
-    )
-
-    if helper is not None:
-        result = dict(helper(worktree))
-    else:
-        spawn_args = main.SpawnWorkerIn(
-            ticket=helper_ticket,
-            kind="cdx",
-            role="implement",
-            model="gpt-5.6-luna",
-            effort="low",
-            workdir=str(worktree),
-            prompt=prompt,
-            orch=orchestrator,
-            request_id=f"rebase-{ticket.upper()}-{pr_number}-{uuid4().hex}",
-        )
-        spawned = (
-            spawn(spawn_args) if spawn is not None else main.spawn_agent(spawn_args)
-        )
-        result = {
-            "status": "escalated",
-            "head_sha": _head_sha(worktree),
-            "resolved_files": [],
-            "escalated_hunks": [
-                f"rebase helper {helper_ticket} started; awaiting its report"
-            ],
-            "helper_ticket": helper_ticket,
-            "helper_run_id": spawned.get("run_id"),
-            "pending": True,
-        }
-    if result.get("status") == "escalated" and not result.get("pending"):
+    result = dict((helper or run_rebase_helper)(worktree))
+    if result.get("status") in {"resolved", "escalated"}:
         if steer is not None:
             steer(orchestrator or worker_id, result)
         else:

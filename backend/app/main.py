@@ -61,6 +61,7 @@ from .agent_runtime.store import RuntimePaths
 from .agent_runtime.ticket import base_ticket
 from .frontend_static import mount_frontend_static
 from .next_review_schema import NextReviewIn
+from .rebase_schema import RebaseDirtyPrIn
 
 
 ROOT_DIR = Path(os.environ.get("WIKI_REPO_DIR", Path(__file__).resolve().parents[2])).resolve()
@@ -3489,12 +3490,6 @@ class SpawnWorkerIn(BaseModel):
         if kind == "cc" and effort is not None:
             raise ValueError("Claude workers do not accept reasoning effort")
         return self
-
-
-class RebaseDirtyPrIn(BaseModel):
-    pr_number: int = Field(..., ge=1)
-    ticket: str = Field(..., min_length=1, max_length=80, pattern=r"^[A-Z0-9-]+$")
-    worker_id: str = Field(..., min_length=1, max_length=100)
 
 
 class SpawnOrchestratorIn(BaseModel):
