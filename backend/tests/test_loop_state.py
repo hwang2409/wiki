@@ -146,7 +146,19 @@ class DeriveLoopStateTest(unittest.TestCase):
         self.assertEqual(state.unrouted_verdict_count, 0)
         self.assertEqual(state.plateau_length, 0)
         self.assertIsNone(state.latest_verdict)
+        self.assertIsNone(state.latest_verdict_finding)
         self.assertEqual(state.history, [])
+
+    def test_latest_verdict_finding_field_populated(self) -> None:
+        edges = [
+            _spawn_implementer(iso="2026-07-29T08:00:00Z"),
+            _spawn_review(1, iso="2026-07-29T08:05:00Z", request_id="rev-1"),
+            _verdict(1, iso="2026-07-29T08:15:00Z", title="cache warm-up crashes on empty payload"),
+        ]
+        state = derive_loop_state(_graph(edges=edges, iteration_cap=8))
+        # Contract: string first line of the latest verdict's top finding.
+        self.assertEqual(state.latest_verdict_finding, "cache warm-up crashes on empty payload")
+        self.assertIn("latest_verdict_finding", state.to_json())
 
     def test_one_round_fresh_verdict_unrouted(self) -> None:
         edges = [
@@ -199,6 +211,90 @@ class DeriveLoopStateTest(unittest.TestCase):
         for entry in state.history:
             self.assertIsNotNone(entry.routed_at)
             self.assertIsNotNone(entry.archived_at)
+
+    def test_plateau_collapses_near_duplicate_first_lines(self) -> None:
+        # Same substance, cosmetic drift (trailing punctuation, case). All
+        # three rounds must fold into one plateau — reverting to strict
+        # string equality regresses this to plateau_length == 1.
+        title_variants = [
+            "blocking foo",
+            "Blocking foo.",
+            "  BLOCKING FOO  ",
+        ]
+        edges = [_spawn_implementer(iso="2026-07-29T08:00:00Z")]
+        for round_index, variant in enumerate(title_variants, start=1):
+            base = 8 + round_index
+            edges.extend([
+                _spawn_review(
+                    round_index,
+                    iso=f"2026-07-29T{base:02d}:00:00Z",
+                    request_id=f"rev-{round_index}",
+                ),
+                _verdict(
+                    round_index,
+                    iso=f"2026-07-29T{base:02d}:10:00Z",
+                    title=variant,
+                    finding_id=f"F-var{round_index:03d}",
+                ),
+                _steer(round_index, iso=f"2026-07-29T{base:02d}:12:00Z"),
+                _archive_reviewer(round_index, iso=f"2026-07-29T{base:02d}:15:00Z"),
+            ])
+        state = derive_loop_state(_graph(edges=edges, iteration_cap=8))
+        self.assertEqual(state.plateau_length, 3)
+
+    def test_steer_with_mismatched_source_worker_does_not_route(self) -> None:
+        # Verdict from REVIEW1, then a steer whose source_worker is
+        # REVIEW2 — a route for a DIFFERENT reviewer must NOT count as
+        # having routed REVIEW1's verdict. Removing the source_worker
+        # equality check regresses this to unrouted_verdict_count == 0.
+        edges = [
+            _spawn_implementer(iso="2026-07-29T08:00:00Z"),
+            _spawn_review(1, iso="2026-07-29T09:00:00Z", request_id="rev-1"),
+            _verdict(1, iso="2026-07-29T09:10:00Z", title="first thing"),
+            # Steer arrives from the WRONG reviewer (REVIEW2, before it
+            # even has a verdict) — must be ignored for REVIEW1 routing.
+            {
+                "kind": "steer",
+                "from": ORCH_ID,
+                "to": IMPL_ID,
+                "payload": {
+                    "target_worker": IMPL_ID,
+                    "source_worker": f"{IMPL_ID}-REVIEW2",
+                    "mode": "now",
+                    "text": "unrelated steer",
+                    "findings": [],
+                    "request_id": "steer-noise",
+                },
+                "created_at": "2026-07-29T09:20:00Z",
+            },
+        ]
+        state = derive_loop_state(_graph(edges=edges, iteration_cap=8))
+        self.assertEqual(state.unrouted_verdict_count, 1)
+        assert state.latest_verdict is not None
+        self.assertIsNone(state.latest_verdict["routed_at"])
+
+        # A follow-up matching steer must clear the unrouted flag.
+        edges.append(_steer(1, iso="2026-07-29T09:25:00Z"))
+        cleared = derive_loop_state(_graph(edges=edges, iteration_cap=8))
+        self.assertEqual(cleared.unrouted_verdict_count, 0)
+
+    def test_unrouted_bounded_to_latest_verdict(self) -> None:
+        # Two historical unrouted verdicts + a routed latest verdict.
+        # ``unrouted_verdict_count`` is the LATEST-only flag → 0.
+        edges = [
+            _spawn_implementer(iso="2026-07-29T08:00:00Z"),
+            _spawn_review(1, iso="2026-07-29T09:00:00Z", request_id="rev-1"),
+            _verdict(1, iso="2026-07-29T09:10:00Z", title="first"),
+            _archive_reviewer(1, iso="2026-07-29T09:20:00Z"),  # verdict 1 never routed
+            _spawn_review(2, iso="2026-07-29T10:00:00Z", request_id="rev-2"),
+            _verdict(2, iso="2026-07-29T10:10:00Z", title="second"),
+            _archive_reviewer(2, iso="2026-07-29T10:20:00Z"),  # verdict 2 never routed
+            _spawn_review(3, iso="2026-07-29T11:00:00Z", request_id="rev-3"),
+            _verdict(3, iso="2026-07-29T11:10:00Z", title="third"),
+            _steer(3, iso="2026-07-29T11:12:00Z"),
+        ]
+        state = derive_loop_state(_graph(edges=edges, iteration_cap=8))
+        self.assertEqual(state.unrouted_verdict_count, 0)
 
     def test_plateau_breaks_when_signature_changes(self) -> None:
         edges = [

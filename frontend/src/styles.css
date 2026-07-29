@@ -10466,8 +10466,7 @@ textarea.composer-command-input {
 .loop-chrome-latest-label {
   color: var(--text-faint);
   font-size: var(--fs-2xs);
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
+  letter-spacing: 0.04em;
 }
 
 .loop-chrome-latest-title {

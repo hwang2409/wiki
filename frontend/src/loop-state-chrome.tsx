@@ -211,11 +211,13 @@ export function LoopStateChrome({ ticket, tick }: Props) {
                 : ""}
             </span>
           </header>
-          {state.latest_verdict?.top_finding?.title ? (
+          {state.latest_verdict_finding ?? state.latest_verdict?.top_finding?.title ? (
             <div className="loop-chrome-latest">
               <span className="loop-chrome-latest-label">latest finding</span>
               <span className="loop-chrome-latest-title">
-                {state.latest_verdict.top_finding.title}
+                {state.latest_verdict_finding ??
+                  state.latest_verdict?.top_finding?.title ??
+                  ""}
               </span>
             </div>
           ) : null}

@@ -880,6 +880,7 @@ export type LoopState = {
   unrouted_verdict_count: number;
   plateau_length: number;
   latest_verdict: LoopStateLatestVerdict | null;
+  latest_verdict_finding: string | null;
   history: LoopStateHistoryEntry[];
 };
 

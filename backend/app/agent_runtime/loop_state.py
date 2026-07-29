@@ -30,6 +30,12 @@ from typing import Any, Iterable
 from .graph_health import iteration_cap_for
 
 
+# Trailing punctuation stripped before comparing plateau signatures — a
+# reviewer that types "F-123: cache miss" and later "F-123: cache miss."
+# should count as the same finding for plateau purposes.
+_TERMINAL_PUNCTUATION = ".,;:!?—-"
+
+
 DANGER_NORMAL = "normal"
 DANGER_WARNING = "warning"
 DANGER_DANGER = "danger"
@@ -65,6 +71,7 @@ class LoopState:
     unrouted_verdict_count: int
     plateau_length: int
     latest_verdict: dict[str, Any] | None
+    latest_verdict_finding: str | None
     history: list[LoopHistoryEntry] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
@@ -75,6 +82,7 @@ class LoopState:
             "unrouted_verdict_count": self.unrouted_verdict_count,
             "plateau_length": self.plateau_length,
             "latest_verdict": self.latest_verdict,
+            "latest_verdict_finding": self.latest_verdict_finding,
             "history": [entry.__dict__ for entry in self.history],
         }
 
@@ -107,17 +115,29 @@ def _is_review_spawn(edge: dict[str, Any], nodes: dict[str, dict[str, Any]]) -> 
     return False
 
 
+def _normalize_first_line(text: str) -> str:
+    """Trim whitespace, casefold, and strip terminal punctuation.
+
+    Plateau detection is per-ticket cadence, not a diff-strict check —
+    two reviewers repeating "cache warm-up crashes" vs "cache warm-up
+    crashes." should collapse to the same signature so the operator sees
+    an accurate ``plateau_length`` count.
+    """
+
+    first = text.strip().splitlines()[0] if text.strip() else ""
+    normalized = first.strip().casefold().rstrip(_TERMINAL_PUNCTUATION).rstrip()
+    return normalized
+
+
 def _finding_signature(finding: dict[str, Any]) -> str:
     """Signature used to detect plateaus — dedupe by title then observed head."""
 
     title = finding.get("title")
     if isinstance(title, str) and title.strip():
-        return title.strip().casefold()
+        return _normalize_first_line(title)
     observed = finding.get("observed")
-    if isinstance(observed, str):
-        first = observed.strip().splitlines()[0] if observed.strip() else ""
-        if first:
-            return first.strip().casefold()
+    if isinstance(observed, str) and observed.strip():
+        return _normalize_first_line(observed)
     fid = finding.get("id")
     return str(fid) if isinstance(fid, str) else ""
 
@@ -244,21 +264,28 @@ def derive_loop_state(
     ]
     verdict_edges = [edge for edge in edges if edge.get("kind") == "verdict"]
 
+    # Ticket contract: unrouted = LATEST verdict without a matching
+    # subsequent steer. Kept as ``unrouted_verdict_count`` for schema
+    # continuity but bounded to {0, 1}: mid-loop only one verdict can be
+    # "the current thing not yet routed" at any moment.
     unrouted = 0
-    for index, edge in enumerate(edges):
-        if edge.get("kind") != "verdict":
-            continue
-        payload = edge.get("payload") if isinstance(edge.get("payload"), dict) else {}
-        state = payload.get("state")
-        if state == "MERGE-READY":
-            continue
-        later = edges[index + 1 :]
-        if _route_time_for(edge, later) is None:
-            unrouted += 1
+    latest_verdict_index = None
+    for index in range(len(edges) - 1, -1, -1):
+        if edges[index].get("kind") == "verdict":
+            latest_verdict_index = index
+            break
+    if latest_verdict_index is not None:
+        latest = edges[latest_verdict_index]
+        latest_payload = latest.get("payload") if isinstance(latest.get("payload"), dict) else {}
+        if latest_payload.get("state") != "MERGE-READY":
+            later = edges[latest_verdict_index + 1 :]
+            if _route_time_for(latest, later) is None:
+                unrouted = 1
 
     plateau_length = _plateau_length(verdict_edges)
 
     latest_verdict_payload: dict[str, Any] | None = None
+    latest_verdict_finding: str | None = None
     if verdict_edges:
         last = verdict_edges[-1]
         last_index = None
@@ -284,6 +311,18 @@ def derive_loop_state(
             "signature": _verdict_signature(last),
             "findings_count": len(_verdict_findings(last)),
         }
+        # Ticket contract field: first line of the latest verdict's top
+        # finding (title first, then observed body). Kept alongside the
+        # richer ``latest_verdict`` object so chrome can render a bare
+        # label without unwrapping the nested shape.
+        if top is not None:
+            title = top.get("title")
+            if isinstance(title, str) and title.strip():
+                latest_verdict_finding = title.strip().splitlines()[0].strip()
+            else:
+                observed = top.get("observed")
+                if isinstance(observed, str) and observed.strip():
+                    latest_verdict_finding = observed.strip().splitlines()[0].strip()
 
     history: list[LoopHistoryEntry] = []
     for round_number, (spawn_index, spawn_edge) in enumerate(spawn_events, start=1):
@@ -346,5 +385,6 @@ def derive_loop_state(
         unrouted_verdict_count=unrouted,
         plateau_length=plateau_length,
         latest_verdict=latest_verdict_payload,
+        latest_verdict_finding=latest_verdict_finding,
         history=history,
     )
