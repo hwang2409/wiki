@@ -244,6 +244,78 @@ def newest_snapshot_path(ticket: str, snapshot_dir: Path | None = None) -> Path 
     return best[1] if best else None
 
 
+def _snapshot_candidates(
+    ticket: str, snapshot_dir: Path | None = None
+) -> list[tuple[tuple[int, int, int, int], Path]]:
+    """Return parseable snapshot paths in commit order.
+
+    Snapshot ordering must stay in one place: `_snapshot_sort_key` knows about
+    both revisioned and legacy filenames, and revision is intentionally the
+    primary sort field.
+    """
+    directory = snapshot_dir or SNAPSHOT_DIR
+    if not directory.is_dir():
+        return []
+    candidates: list[tuple[tuple[int, int, int, int], Path]] = []
+    for path in directory.glob(f"{ticket}-*.workgraph.json"):
+        stem = path.name.removesuffix(".workgraph.json")
+        key = _snapshot_sort_key(stem[len(ticket) + 1 :])
+        if key is not None:
+            candidates.append((key, path))
+    return sorted(candidates)
+
+
+def _snapshot_metadata_path(snapshot_path: Path) -> Path:
+    return snapshot_path.with_name(f"{snapshot_path.name}.meta.json")
+
+
+def snapshot_revisions(
+    ticket: str, snapshot_dir: Path | None = None
+) -> list[dict[str, int]]:
+    """List durable snapshot metadata without opening graph documents."""
+    revisions: list[dict[str, int]] = []
+    for key, path in _snapshot_candidates(ticket, snapshot_dir):
+        try:
+            metadata = json.loads(_snapshot_metadata_path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(metadata, dict):
+            continue
+        if (
+            metadata.get("revision") != key[0]
+            or metadata.get("created_at_ns") != key[1]
+            or not isinstance(metadata.get("edge_count"), int)
+        ):
+            continue
+        revisions.append({
+            "revision": metadata["revision"],
+            "created_at_ns": metadata["created_at_ns"],
+            "edge_count": metadata["edge_count"],
+        })
+    return revisions
+
+
+def latest_snapshot_revision(ticket: str, snapshot_dir: Path | None = None) -> int:
+    return _latest_snapshot_revision(ticket, snapshot_dir or SNAPSHOT_DIR)
+
+
+def load_snapshot_revision(
+    ticket: str, revision: int, snapshot_dir: Path | None = None
+) -> tuple[int, dict[str, Any]] | None:
+    """Load a requested snapshot revision, falling back to an older one."""
+    candidates = _snapshot_candidates(ticket, snapshot_dir)
+    for key, path in reversed(candidates):
+        if key[0] > revision:
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict):
+            return key[0], data
+    return None
+
+
 def load_snapshot(ticket: str, snapshot_dir: Path | None = None) -> dict[str, Any] | None:
     path = newest_snapshot_path(ticket, snapshot_dir)
     if path is None:
@@ -697,14 +769,29 @@ def append_edge(
         serialized = _serialize(graph)
         snapshot_path: Path | None = None
         staged: list[tuple[Path, Path]] = []
-        if edge_kind in SNAPSHOT_EDGE_KINDS:
-            # Revision is assigned while HOLDING the ticket lock, so it follows
-            # commit order even when a slower writer sampled an older now_ts
-            # before the lock. Recovery orders by revision, never wall time.
-            revision = _latest_snapshot_revision(ticket, directory) + 1
-            snapshot_path = directory / _snapshot_name(ticket, revision, now_ts)
-            staged.append((_stage_json(directory, serialized), snapshot_path))
         try:
+            if edge_kind in SNAPSHOT_EDGE_KINDS:
+                # Revision is assigned while HOLDING the ticket lock, so it follows
+                # commit order even when a slower writer sampled an older now_ts
+                # before the lock. Recovery orders by revision, never wall time.
+                revision = _latest_snapshot_revision(ticket, directory) + 1
+                snapshot_path = directory / _snapshot_name(ticket, revision, now_ts)
+                metadata = {
+                    "revision": revision,
+                    "created_at_ns": int(now_ts * 1_000_000_000),
+                    "edge_count": len(graph["edges"]),
+                }
+                # Commit the tiny sidecar before the graph. A crash can leave
+                # an orphan sidecar, but never makes an incomplete graph look
+                # enumeratable; the graph and hot pointer retain their existing
+                # snapshot-before-hot ordering.
+                staged.append(
+                    (
+                        _stage_json(directory, _serialize(metadata)),
+                        _snapshot_metadata_path(snapshot_path),
+                    )
+                )
+                staged.append((_stage_json(directory, serialized), snapshot_path))
             staged.append((_stage_json(hot.parent, serialized), hot))
             for temp, target in staged:
                 try:
