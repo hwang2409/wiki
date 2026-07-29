@@ -847,11 +847,51 @@ export type Workgraph = {
   composite_health: WorkgraphHealth;
 };
 
+export type LoopStateDanger = "normal" | "warning" | "danger";
+
+export type LoopStateHistoryEntry = {
+  round: number;
+  reviewer: string | null;
+  spawned_at: string | null;
+  verdict_state: string | null;
+  verdict_at: string | null;
+  routed_at: string | null;
+  archived_at: string | null;
+  top_finding: string | null;
+  finding_signature: string | null;
+};
+
+export type LoopStateLatestVerdict = {
+  state: string | null;
+  reviewer: string | null;
+  created_at: string | null;
+  routed_at: string | null;
+  top_finding: {
+    id: string | null;
+    title: string | null;
+    severity: string | null;
+  } | null;
+  signature: string | null;
+  findings_count: number;
+};
+
+export type LoopState = {
+  round: number;
+  cap: number;
+  danger: LoopStateDanger;
+  unrouted_verdict_count: number;
+  plateau_length: number;
+  latest_verdict: LoopStateLatestVerdict | null;
+  latest_verdict_finding: string | null;
+  history: LoopStateHistoryEntry[];
+};
+
 export type AgentWorkgraphData = {
   ok: boolean;
   source: "live" | "snapshot";
   workgraph: Workgraph;
   revision?: number;
+  loop_state?: LoopState;
 };
 
 export function getAgentWorkgraph(ticket: string) {

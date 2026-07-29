@@ -56,6 +56,7 @@ from .agent_runtime.client import (
     replacement_prompt,
 )
 from .agent_runtime import graph_health
+from .agent_runtime.loop_state import derive_loop_state
 from .agent_runtime.store import RuntimePaths
 from .agent_runtime.ticket import base_ticket
 from .frontend_static import mount_frontend_static
@@ -2366,6 +2367,7 @@ def agent_workgraph(ticket: str, revision: int | None = None) -> dict[str, objec
     # Refresh the stored health so the renderer shows now-relative stall — the
     # same clock and computation the health endpoint uses.
     graph["composite_health"] = current["health"]
+    loop_state = derive_loop_state(graph)
     payload: dict[str, object] = {
         "ok": True,
         "source": source,
@@ -2373,6 +2375,7 @@ def agent_workgraph(ticket: str, revision: int | None = None) -> dict[str, objec
         "health": current["health"],
         "alarms": current["alarms"],
         "computed_at": current["computed_at"],
+        "loop_state": loop_state.to_json(),
     }
     if selected_revision is not None:
         payload["revision"] = selected_revision
