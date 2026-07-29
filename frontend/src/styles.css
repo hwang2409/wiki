@@ -4980,6 +4980,18 @@ body.is-resizing-panes .pane-cell {
   color: var(--accent-primary);
 }
 
+.codex-stream-command-stdin-badge {
+  padding: 1px 5px;
+  border: 1px solid color-mix(in srgb, var(--accent-primary) 50%, var(--background-modifier-border));
+  border-radius: var(--radius-full);
+  color: var(--accent-primary);
+  white-space: nowrap;
+}
+
+.codex-stream-command-input {
+  color: var(--text-normal);
+}
+
 .codex-stream-command-id {
   margin-left: auto;
   max-width: 24ch;

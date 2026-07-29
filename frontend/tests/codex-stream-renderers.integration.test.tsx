@@ -1,6 +1,9 @@
+import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import {
   applyDiffSnapshot,
+  commandExecutionCards,
+  CodexStreamHighlights,
   deriveHookChips,
   matchedTerminalInteractions,
 } from "../src/codex-stream-renderers";
@@ -39,16 +42,64 @@ describe("codex stream renderers", () => {
     ]);
   });
 
-  it("does not render terminal interaction without its command item", () => {
+  it("does not show a dangling hook chip for a started-only hook", () => {
+    const started = event("hook_started", 1, {
+      turnId: "turn-1",
+      run: { eventName: "userPromptSubmit", id: "hook-1" },
+    });
+    expect(deriveHookChips([started])).toEqual([]);
+    render(<CodexStreamHighlights events={[started]} />);
+    expect(screen.queryByTestId("codex-hook-chips")).toBeNull();
+  });
+
+  it("renders a hook chip only after the matching completion event", () => {
+    const started = event("hook_started", 1, {
+      turnId: "turn-1",
+      run: { eventName: "userPromptSubmit", id: "hook-1" },
+    });
+    const completed = event("hook_completed", 2, {
+      turnId: "turn-1",
+      run: { eventName: "userPromptSubmit", durationMs: 52 },
+    });
+    render(<CodexStreamHighlights events={[started, completed]} />);
+    expect(screen.getByTestId("codex-hook-chips")).toBeTruthy();
+    expect(screen.getByText("hook: userPromptSubmit")).toBeTruthy();
+  });
+
+  it("attaches terminal interaction to one command card and keeps empty stdin visible", () => {
     const orphan = event("item_commandExecution_terminalInteraction", 1, {
       itemId: "exec-1",
-      stdin: "yes",
+      stdin: "",
     });
     expect(matchedTerminalInteractions([orphan])).toEqual([]);
     const command = event("item_started", 2, {
-      item: { id: "exec-1", type: "commandExecution" },
+      item: { id: "exec-1", type: "commandExecution", command: "read prompt" },
     });
     expect(matchedTerminalInteractions([command, orphan])).toHaveLength(1);
+    const cards = commandExecutionCards([command, orphan]);
+    expect(cards).toHaveLength(1);
+    expect(cards[0]?.interactions).toHaveLength(1);
+    expect(cards[0]?.interactions[0]?.stdin).toBe("");
+    render(<CodexStreamHighlights events={[command, orphan]} />);
+    expect(document.querySelectorAll(".codex-stream-command-card")).toHaveLength(1);
+    expect(screen.getByText("empty stdin")).toBeTruthy();
+  });
+
+  it("renders the real empty skills-changed payload as a visible refresh chip", () => {
+    render(<CodexStreamHighlights events={[event("skills_changed", 1, {})]} />);
+    expect(screen.getByText("skills updated")).toBeTruthy();
+    expect(screen.getByText("list refreshed")).toBeTruthy();
+  });
+
+  it("renders nested moderation category flags in the warning chip", () => {
+    render(
+      <CodexStreamHighlights
+        events={[event("turn_moderationMetadata_warning", 1, {
+          metadata: { prompt: { omnimod: { outputs: [{ results: [{ category_flags: { violence: true } }] }] } } },
+        })]}
+      />,
+    );
+    expect(document.querySelector(".codex-stream-warning-flag")?.textContent).toBe("violence");
   });
 
   it("keeps rolling diff files keyed by path across snapshots", () => {

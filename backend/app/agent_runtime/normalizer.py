@@ -99,32 +99,39 @@ def _codex_state(payload: dict[str, Any]) -> LifecycleState | None:
     return None
 
 
-def _codex_moderation_is_warning(params: object) -> bool:
-    """Return true only when moderation metadata carries a non-safe flag."""
+def _codex_moderation_flags(params: object) -> list[str]:
+    """Extract active flags from Codex's nested moderation metadata maps."""
 
     if not isinstance(params, dict):
-        return False
-    candidates: list[object] = []
-    for container in (params, params.get("metadata")):
-        if not isinstance(container, dict):
-            continue
-        if "flag" in container:
-            candidates.append(container["flag"])
-        if "flags" in container:
-            candidates.append(container["flags"])
-    flattened: list[object] = []
-    for candidate in candidates:
-        if isinstance(candidate, list):
-            flattened.extend(candidate)
-        else:
-            flattened.append(candidate)
-    for flag in flattened:
-        value = flag
-        if isinstance(flag, dict):
-            value = flag.get("flag") or flag.get("name") or flag.get("type")
-        if isinstance(value, str) and value and value.lower() != "safe":
-            return True
-    return False
+        return []
+    flags: list[str] = []
+
+    def walk(value: object, *, in_flag_map: bool = False) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                is_flag_map = in_flag_map or key in {"flag", "flags", "category_flags"}
+                if is_flag_map and isinstance(child, bool):
+                    if child and key.lower() != "safe":
+                        flags.append(key)
+                elif isinstance(child, (dict, list)):
+                    walk(child, in_flag_map=is_flag_map)
+            return
+        if isinstance(value, list):
+            for child in value:
+                if isinstance(child, dict):
+                    name = child.get("flag") or child.get("name") or child.get("type")
+                    if isinstance(name, str) and name and name.lower() != "safe":
+                        flags.append(name)
+                    walk(child, in_flag_map=in_flag_map)
+                elif isinstance(child, str) and child.lower() != "safe":
+                    flags.append(child)
+
+    walk(params)
+    return list(dict.fromkeys(flags))
+
+
+def _codex_moderation_is_warning(params: object) -> bool:
+    return bool(_codex_moderation_flags(params))
 
 
 def _normalize_codex(payload: dict[str, Any]) -> NormalizedProviderEvent:

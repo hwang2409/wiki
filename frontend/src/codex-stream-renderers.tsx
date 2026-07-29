@@ -59,13 +59,12 @@ export function deriveHookChips(events: ProviderStreamEvent[]): HookChip[] {
     const key = hookKey(event);
     if (!key) continue;
     const start = starts.get(key)?.shift();
+    if (!start) continue;
     const run = eventRun(event);
     const explicitDuration = run.durationMs;
     const durationMs = typeof explicitDuration === "number"
       ? Math.max(0, explicitDuration)
-      : start
-        ? Math.max(0, Date.parse(event.normalized_at) - Date.parse(start.normalized_at))
-        : null;
+      : Math.max(0, Date.parse(event.normalized_at) - Date.parse(start.normalized_at));
     const name = stringValue(run.eventName) ?? stringValue(run.name) ?? key.split("\u0000")[0];
     chips.push({ key: `${key}\u0000${event.seq}`, name, durationMs, seq: event.seq });
   }
@@ -110,10 +109,42 @@ export function matchedTerminalInteractions(events: ProviderStreamEvent[]): Term
     .filter((event) => event.kind === "item_commandExecution_terminalInteraction")
     .map((event) => {
       const itemId = commandItemId(event);
-      const stdin = stringValue(eventParams(event).stdin);
-      return itemId && stdin ? { event, itemId, stdin } : null;
+      const stdin = eventParams(event).stdin;
+      return itemId && typeof stdin === "string" ? { event, itemId, stdin } : null;
     })
     .filter((interaction): interaction is TerminalInteraction => Boolean(interaction && ids.has(interaction.itemId)));
+}
+
+export type CommandExecutionCard = {
+  itemId: string;
+  command: string | null;
+  interactions: TerminalInteraction[];
+};
+
+export function commandExecutionCards(events: ProviderStreamEvent[]): CommandExecutionCard[] {
+  const interactions = matchedTerminalInteractions(events);
+  const byItem = new Map<string, TerminalInteraction[]>();
+  for (const interaction of interactions) {
+    const current = byItem.get(interaction.itemId) ?? [];
+    current.push(interaction);
+    byItem.set(interaction.itemId, current);
+  }
+  const cards = new Map<string, CommandExecutionCard>();
+  for (const event of events) {
+    if (event.kind !== "item_started" && event.kind !== "item_completed") continue;
+    const params = eventParams(event);
+    const item = recordValue(params.item);
+    if (stringValue(item?.type) !== "commandExecution") continue;
+    const itemId = commandItemId(event);
+    if (!itemId || !byItem.has(itemId)) continue;
+    const previous = cards.get(itemId);
+    cards.set(itemId, {
+      itemId,
+      command: stringValue(item?.command) ?? previous?.command ?? null,
+      interactions: previous?.interactions ?? byItem.get(itemId) ?? [],
+    });
+  }
+  return [...cards.values()];
 }
 
 function diffPath(file: DiffFilePatch): string {
@@ -141,14 +172,29 @@ function diffSnapshots(events: ProviderStreamEvent[]): Map<string, DiffFilePatch
 
 function WarningRenderer({ event, moderation = false }: { event: ProviderStreamEvent; moderation?: boolean }) {
   const params = eventParams(event);
-  const flags = Array.isArray(params.flags) ? params.flags : params.flag ? [params.flag] : [];
-  const details = flags
-    .map((flag) => {
-      const value = recordValue(flag);
-      return stringValue(value?.name) ?? stringValue(value?.flag) ?? stringValue(flag);
-    })
-    .filter((flag): flag is string => Boolean(flag && flag.toLowerCase() !== "safe"));
-  const message = stringValue(params.message) ?? (details.join(", ") || "moderation flag raised");
+  const details: string[] = [];
+  const addFlag = (name: string) => {
+    if (name.toLowerCase() !== "safe" && !details.includes(name)) details.push(name);
+  };
+  const visitFlags = (value: unknown, inFlagMap = false) => {
+    if (Array.isArray(value)) {
+      value.forEach((child) => visitFlags(child, inFlagMap));
+      return;
+    }
+    const record = recordValue(value);
+    if (!record) {
+      if (inFlagMap && typeof value === "string") addFlag(value);
+      return;
+    }
+    for (const [key, child] of Object.entries(record)) {
+      const childIsFlagMap = inFlagMap || key === "flag" || key === "flags" || key === "category_flags";
+      if (childIsFlagMap && child === true) addFlag(key);
+      else if (childIsFlagMap && typeof child === "string") addFlag(child);
+      else if (child && typeof child === "object") visitFlags(child, childIsFlagMap);
+    }
+  };
+  visitFlags(params);
+  const message = stringValue(params.message) ?? "moderation flag raised";
   return (
     <div className={`codex-stream-warning${moderation ? " is-moderation" : ""}`} role="status">
       <AlertTriangle aria-hidden="true" size={13} />
@@ -210,16 +256,23 @@ function DiffRenderer({ events }: { events: ProviderStreamEvent[] }) {
 }
 
 function TerminalInteractionRenderer({ events }: { events: ProviderStreamEvent[] }) {
-  const interactions = matchedTerminalInteractions(events);
-  if (!interactions.length) return null;
+  const cards = commandExecutionCards(events);
+  if (!cards.length) return null;
   return (
     <div className="codex-stream-command-cards" data-testid="codex-terminal-interactions">
-      {interactions.map(({ event, itemId, stdin }) => (
-        <div className="codex-stream-command-card" key={event.seq}>
+      {cards.map((card) => (
+        <div className="codex-stream-command-card" key={card.itemId}>
           <Terminal aria-hidden="true" size={13} />
-          <span className="codex-stream-command-label">stdin</span>
-          <code>{stdin}</code>
-          <span className="codex-stream-command-id">{itemId}</span>
+          <span className="codex-stream-command-label">command</span>
+          <code>{card.command ?? card.itemId}</code>
+          <span className="codex-stream-command-stdin-badge">
+            stdin{card.interactions.length > 1 ? ` ×${card.interactions.length}` : ""}
+          </span>
+          {card.interactions.map((interaction) => (
+            <code className="codex-stream-command-input" key={interaction.event.seq}>
+              {interaction.stdin || "empty stdin"}
+            </code>
+          ))}
         </div>
       ))}
     </div>
@@ -252,7 +305,7 @@ function SkillsChangedRenderer({ event }: { event: ProviderStreamEvent }) {
   return (
     <span className="codex-stream-chip codex-stream-skills-chip">
       <span>skills updated</span>
-      {diff.length ? <code>{diff.join(", ")}</code> : null}
+      <code>{diff.length ? diff.join(", ") : "list refreshed"}</code>
     </span>
   );
 }
@@ -282,7 +335,8 @@ export function CodexStreamHighlights({ events }: { events: ProviderStreamEvent[
   const moderationEvents = rendered.filter((event) => event.kind === "turn_moderationMetadata_warning");
   const skillEvents = rendered.filter((event) => event.kind === "skills_changed");
   const planEvents = rendered.filter((event) => event.kind === "turn_plan_updated");
-  if (!rendered.length) return null;
+  const hasHookEvents = events.some((event) => event.kind === "hook_started" || event.kind === "hook_completed");
+  if (!rendered.length && !hasHookEvents) return null;
   return (
     <div className="codex-stream-highlights">
       {warningEvents.map((event) => <WarningRenderer event={event} key={event.seq} />)}

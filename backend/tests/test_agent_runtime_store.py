@@ -218,7 +218,21 @@ class ProtocolFixtureTests(unittest.TestCase):
             ProviderKind.CODEX,
             {
                 "method": "turn/moderationMetadata",
-                "params": {"flags": ["safe"]},
+                "params": {
+                    "metadata": {
+                        "prompt": {
+                            "omnimod": {
+                                "outputs": [
+                                    {
+                                        "results": [
+                                            {"category_flags": {"sexual": False, "violence": False}}
+                                        ]
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                },
             },
         )
         warning = normalize_provider_event(
@@ -226,7 +240,19 @@ class ProtocolFixtureTests(unittest.TestCase):
             {
                 "method": "turn/moderationMetadata",
                 "params": {
-                    "flags": [{"name": "review", "message": "review required"}],
+                    "metadata": {
+                        "prompt": {
+                            "omnimod": {
+                                "outputs": [
+                                    {
+                                        "results": [
+                                            {"category_flags": {"sexual": False, "violence": True}}
+                                        ]
+                                    }
+                                ]
+                            }
+                        }
+                    }
                 },
             },
         )
