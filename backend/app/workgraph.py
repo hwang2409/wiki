@@ -265,25 +265,33 @@ def _snapshot_candidates(
     return sorted(candidates)
 
 
+def _snapshot_metadata_path(snapshot_path: Path) -> Path:
+    return snapshot_path.with_name(f"{snapshot_path.name}.meta.json")
+
+
 def snapshot_revisions(
     ticket: str, snapshot_dir: Path | None = None
 ) -> list[dict[str, int]]:
-    """List durable snapshot metadata without returning graph documents."""
+    """List durable snapshot metadata without opening graph documents."""
     revisions: list[dict[str, int]] = []
     for key, path in _snapshot_candidates(ticket, snapshot_dir):
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            metadata = json.loads(_snapshot_metadata_path(path).read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if not isinstance(data, dict) or not isinstance(data.get("edges"), list):
+        if not isinstance(metadata, dict):
             continue
-        revisions.append(
-            {
-                "revision": key[0],
-                "created_at_ns": key[1],
-                "edge_count": len(data["edges"]),
-            }
-        )
+        if (
+            metadata.get("revision") != key[0]
+            or metadata.get("created_at_ns") != key[1]
+            or not isinstance(metadata.get("edge_count"), int)
+        ):
+            continue
+        revisions.append({
+            "revision": metadata["revision"],
+            "created_at_ns": metadata["created_at_ns"],
+            "edge_count": metadata["edge_count"],
+        })
     return revisions
 
 
@@ -761,14 +769,29 @@ def append_edge(
         serialized = _serialize(graph)
         snapshot_path: Path | None = None
         staged: list[tuple[Path, Path]] = []
-        if edge_kind in SNAPSHOT_EDGE_KINDS:
-            # Revision is assigned while HOLDING the ticket lock, so it follows
-            # commit order even when a slower writer sampled an older now_ts
-            # before the lock. Recovery orders by revision, never wall time.
-            revision = _latest_snapshot_revision(ticket, directory) + 1
-            snapshot_path = directory / _snapshot_name(ticket, revision, now_ts)
-            staged.append((_stage_json(directory, serialized), snapshot_path))
         try:
+            if edge_kind in SNAPSHOT_EDGE_KINDS:
+                # Revision is assigned while HOLDING the ticket lock, so it follows
+                # commit order even when a slower writer sampled an older now_ts
+                # before the lock. Recovery orders by revision, never wall time.
+                revision = _latest_snapshot_revision(ticket, directory) + 1
+                snapshot_path = directory / _snapshot_name(ticket, revision, now_ts)
+                metadata = {
+                    "revision": revision,
+                    "created_at_ns": int(now_ts * 1_000_000_000),
+                    "edge_count": len(graph["edges"]),
+                }
+                # Commit the tiny sidecar before the graph. A crash can leave
+                # an orphan sidecar, but never makes an incomplete graph look
+                # enumeratable; the graph and hot pointer retain their existing
+                # snapshot-before-hot ordering.
+                staged.append(
+                    (
+                        _stage_json(directory, _serialize(metadata)),
+                        _snapshot_metadata_path(snapshot_path),
+                    )
+                )
+                staged.append((_stage_json(directory, serialized), snapshot_path))
             staged.append((_stage_json(hot.parent, serialized), hot))
             for temp, target in staged:
                 try:

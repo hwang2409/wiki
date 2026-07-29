@@ -358,6 +358,7 @@ export function WorkgraphPanel({ ticket, tick }: { ticket: string; tick: number 
   const [revisions, setRevisions] = useState<WorkgraphRevision[]>([]);
   const [revisionData, setRevisionData] = useState<AgentWorkgraphData | null>(null);
   const [currentRevision, setCurrentRevision] = useState<number | null>(null);
+  const [revisionLoading, setRevisionLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [revisionError, setRevisionError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -369,6 +370,7 @@ export function WorkgraphPanel({ ticket, tick }: { ticket: string; tick: number 
     setRevisions([]);
     setRevisionData(null);
     setCurrentRevision(null);
+    setRevisionLoading(false);
     setError(null);
     setRevisionError(null);
     setLoading(true);
@@ -415,20 +417,29 @@ export function WorkgraphPanel({ ticket, tick }: { ticket: string; tick: number 
   useEffect(() => {
     if (mode !== "replay" || currentRevision === null) return;
     let ignore = false;
+    const controller = new AbortController();
+    setRevisionData(null);
+    setRevisionError(null);
+    setRevisionLoading(true);
     const timer = window.setTimeout(() => {
-      getAgentWorkgraphRevision(ticket, currentRevision)
+      getAgentWorkgraphRevision(ticket, currentRevision, controller.signal)
         .then((result) => {
-          if (ignore) return;
+          if (ignore || controller.signal.aborted) return;
           setRevisionData(result);
           setRevisionError(null);
+          setRevisionLoading(false);
         })
         .catch((err) => {
-          if (!ignore) setRevisionError(err instanceof Error ? err.message : "Could not load revision");
+          if (ignore || controller.signal.aborted) return;
+          setRevisionData(null);
+          setRevisionError(err instanceof Error ? err.message : "Could not load revision");
+          setRevisionLoading(false);
         });
     }, 150);
     return () => {
       ignore = true;
       window.clearTimeout(timer);
+      controller.abort();
     };
   }, [currentRevision, mode, ticket]);
 
@@ -446,7 +457,7 @@ export function WorkgraphPanel({ ticket, tick }: { ticket: string; tick: number 
   }, [currentRevision, mode, playing, revisions]);
 
   const replaying = mode === "replay" && revisions.length > 0;
-  const selectedData = replaying ? revisionData ?? data : data;
+  const selectedData = replaying ? revisionData : data;
   const graph = selectedData?.workgraph ?? null;
   const revisionIndex = currentRevision === null
     ? -1
@@ -454,9 +465,10 @@ export function WorkgraphPanel({ ticket, tick }: { ticket: string; tick: number 
   const latestRevision = revisions.at(-1)?.revision ?? null;
   const shownEdges = useMemo(() => graph?.edges ?? [], [graph]);
   const findings = useMemo(() => collectFindings(shownEdges), [shownEdges]);
+  const chromeGraph = graph ?? data?.workgraph ?? null;
 
   if (loading && !data) return <div className="workgraph-empty">Loading workgraph…</div>;
-  if (!graph) {
+  if (!chromeGraph || (!graph && !replaying)) {
     return <div className="workgraph-empty">{error ?? "No workgraph recorded for this ticket."}</div>;
   }
 
@@ -490,10 +502,10 @@ export function WorkgraphPanel({ ticket, tick }: { ticket: string; tick: number 
           </button>
         </div>
         <span className="workgraph-source">{selectedData?.source === "snapshot" ? "snapshot" : "live file"}</span>
-        <span className="workgraph-updated">{graph.orch} · updated {shortTime(graph.updated_at)}</span>
+        <span className="workgraph-updated">{chromeGraph.orch} · updated {shortTime(chromeGraph.updated_at)}</span>
       </div>
 
-      {mode === "live" ? <HealthStrip graph={graph} /> : null}
+      {mode === "live" ? <HealthStrip graph={chromeGraph} /> : null}
 
       {replaying ? (
         <div className="workgraph-scrubber">
@@ -530,7 +542,11 @@ export function WorkgraphPanel({ ticket, tick }: { ticket: string; tick: number 
       ) : null}
 
       <div className="workgraph-dag-wrap">
-        {shownEdges.length === 0 ? (
+        {!graph ? (
+          <div className="workgraph-empty is-inline">
+            {revisionLoading ? `Loading revision r${currentRevision}…` : revisionError}
+          </div>
+        ) : shownEdges.length === 0 ? (
           <div className="workgraph-empty is-inline">no edges yet</div>
         ) : (
           <WorkgraphDag currentEdge={null} edges={shownEdges} nodes={graph.nodes} />

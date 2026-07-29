@@ -868,9 +868,10 @@ export function getAgentWorkgraphRevisions(ticket: string) {
   );
 }
 
-export function getAgentWorkgraphRevision(ticket: string, revision: number) {
+export function getAgentWorkgraphRevision(ticket: string, revision: number, signal?: AbortSignal) {
   return request<AgentWorkgraphData>(
-    `/api/agents/${encodeURIComponent(ticket)}/workgraph?revision=${revision}`
+    `/api/agents/${encodeURIComponent(ticket)}/workgraph?revision=${revision}`,
+    { signal }
   );
 }
 
