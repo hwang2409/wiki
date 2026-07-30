@@ -28,6 +28,8 @@ export type LightboxItem = {
   alt: string;
   caption?: string | null;
   downloadName?: string | null;
+  width?: number | null;
+  height?: number | null;
 };
 
 export type ArtifactLightboxProps = {
@@ -59,7 +61,10 @@ function guessDownloadName(item: LightboxItem, index: number) {
   return `image-${index + 1}`;
 }
 
-async function copySourceToClipboard(item: LightboxItem): Promise<boolean> {
+async function copySourceToClipboard(
+  item: LightboxItem,
+  signal: AbortSignal,
+): Promise<boolean> {
   if (!navigator.clipboard) return false;
   try {
     if (item.src.startsWith("data:")) {
@@ -67,27 +72,40 @@ async function copySourceToClipboard(item: LightboxItem): Promise<boolean> {
       const mime = meta.split(";")[0] || "image/png";
       if (typeof ClipboardItem !== "undefined") {
         const binary = atob(data);
+        if (signal.aborted) return false;
         const bytes = new Uint8Array(binary.length);
         for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
         const blob = new Blob([bytes], { type: mime });
         await navigator.clipboard.write([new ClipboardItem({ [mime]: blob })]);
-        return true;
+        return !signal.aborted;
       }
     } else if (typeof ClipboardItem !== "undefined") {
-      const response = await fetch(item.src);
+      const response = await fetch(item.src, { signal });
       const blob = await response.blob();
+      if (signal.aborted) return false;
       await navigator.clipboard.write([new ClipboardItem({ [blob.type || "image/png"]: blob })]);
-      return true;
+      return !signal.aborted;
     }
-  } catch {
+  } catch (error) {
+    if ((error as { name?: string }).name === "AbortError") return false;
     // fall through to URL copy
   }
   try {
+    if (signal.aborted) return false;
     await navigator.clipboard.writeText(item.src);
-    return true;
+    return !signal.aborted;
   } catch {
     return false;
   }
+}
+
+const FOCUSABLE_SELECTOR =
+  'button:not([disabled]), [href], input, select, textarea, [tabindex]:not([tabindex="-1"])';
+
+function focusableWithin(root: HTMLElement): HTMLElement[] {
+  return Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
+    (element) => !element.hasAttribute("aria-hidden") && element.offsetParent !== null,
+  );
 }
 
 export function ArtifactLightbox({
@@ -104,6 +122,8 @@ export function ArtifactLightbox({
   const pointers = useRef(new Map<number, { x: number; y: number }>());
   const lastDistance = useRef<number | null>(null);
   const viewportRef = useRef<HTMLDivElement | null>(null);
+  const copyControllerRef = useRef<AbortController | null>(null);
+  const copyTimerRef = useRef<number | null>(null);
 
   const active = items[index];
   const total = items.length;
@@ -114,6 +134,14 @@ export function ArtifactLightbox({
   useEffect(() => {
     reset();
     setLoaded(false);
+    // Cancel any in-flight copy from a previous item and clear its timer.
+    copyControllerRef.current?.abort();
+    copyControllerRef.current = null;
+    if (copyTimerRef.current != null) {
+      window.clearTimeout(copyTimerRef.current);
+      copyTimerRef.current = null;
+    }
+    setCopied(false);
   }, [index, active?.src, reset]);
 
   useEffect(() => {
@@ -121,9 +149,30 @@ export function ArtifactLightbox({
     dialogRef.current?.focus();
     const previousOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
+    // Inert every direct child of <body> except our portal parent so screen
+    // readers and tab focus can't wander into the underlying page.
+    const inertRoots: HTMLElement[] = [];
+    for (const child of Array.from(document.body.children)) {
+      if (!(child instanceof HTMLElement)) continue;
+      if (child.contains(dialogRef.current)) continue;
+      if (child.hasAttribute("inert")) continue;
+      child.setAttribute("inert", "");
+      child.setAttribute("aria-hidden", "true");
+      inertRoots.push(child);
+    }
     return () => {
       document.body.style.overflow = previousOverflow;
+      for (const root of inertRoots) {
+        root.removeAttribute("inert");
+        root.removeAttribute("aria-hidden");
+      }
       previouslyFocused.current?.focus?.();
+      copyControllerRef.current?.abort();
+      copyControllerRef.current = null;
+      if (copyTimerRef.current != null) {
+        window.clearTimeout(copyTimerRef.current);
+        copyTimerRef.current = null;
+      }
     };
   }, []);
 
@@ -141,6 +190,28 @@ export function ArtifactLightbox({
 
   const handleKeyDown = useCallback(
     (event: ReactKeyboardEvent<HTMLDivElement>) => {
+      if (event.key === "Tab" && dialogRef.current) {
+        const focusables = focusableWithin(dialogRef.current);
+        if (focusables.length === 0) {
+          event.preventDefault();
+          dialogRef.current.focus();
+          return;
+        }
+        const first = focusables[0];
+        const last = focusables[focusables.length - 1];
+        const active = document.activeElement as HTMLElement | null;
+        if (event.shiftKey && (active === first || active === dialogRef.current)) {
+          event.preventDefault();
+          last.focus();
+          return;
+        }
+        if (!event.shiftKey && active === last) {
+          event.preventDefault();
+          first.focus();
+          return;
+        }
+        return;
+      }
       switch (event.key) {
         case "Escape":
           event.preventDefault();
@@ -219,10 +290,21 @@ export function ArtifactLightbox({
 
   const copy = async () => {
     if (!active) return;
-    const ok = await copySourceToClipboard(active);
+    copyControllerRef.current?.abort();
+    if (copyTimerRef.current != null) {
+      window.clearTimeout(copyTimerRef.current);
+      copyTimerRef.current = null;
+    }
+    const controller = new AbortController();
+    copyControllerRef.current = controller;
+    const ok = await copySourceToClipboard(active, controller.signal);
+    if (controller.signal.aborted) return;
     if (ok) {
       setCopied(true);
-      window.setTimeout(() => setCopied(false), 1500);
+      copyTimerRef.current = window.setTimeout(() => {
+        setCopied(false);
+        copyTimerRef.current = null;
+      }, 1500);
     }
   };
 
@@ -351,13 +433,16 @@ export function ArtifactLightbox({
             alt={active.alt}
             className={`artifact-lightbox-image${loaded ? " is-loaded" : ""}`}
             draggable
+            height={active.height ?? undefined}
             onDragStart={onDragStart}
             onLoad={() => setLoaded(true)}
             src={active.src}
             style={{
               transform: `translate3d(${transform.panX}px, ${transform.panY}px, 0) scale(${transform.zoom})`,
               cursor: transform.zoom > 1 ? "grab" : "zoom-in",
+              ...(active.width && active.height ? { aspectRatio: `${active.width} / ${active.height}` } : {}),
             }}
+            width={active.width ?? undefined}
           />
         </div>
         {canPaginate ? (

@@ -439,6 +439,45 @@ class WikiArtifactsTests(unittest.TestCase):
             ],
         )
 
+    def test_image_scrub_strips_metadata_end_to_end(self) -> None:
+        # Mutation-proof: bytes that reach disk must not contain the GPS or
+        # camera-model strings the source payload embedded. If the scrub is
+        # ever disabled or bypassed this assertion trips.
+        from PIL import ExifTags, TiffImagePlugin
+
+        image = Image.new("RGB", (48, 32), color=(200, 50, 50))
+        exif = image.getexif()
+        exif[ExifTags.Base.Orientation.value] = 1
+        exif[ExifTags.Base.Make.value] = "GhostCam"
+        exif[ExifTags.Base.Model.value] = "SecretModel-42"
+        gps = exif.get_ifd(ExifTags.Base.GPSInfo.value)
+        gps[ExifTags.GPS.GPSLatitudeRef] = "N"
+        gps[ExifTags.GPS.GPSLatitude] = (
+            TiffImagePlugin.IFDRational(37, 1),
+            TiffImagePlugin.IFDRational(46, 1),
+            TiffImagePlugin.IFDRational(3060, 100),
+        )
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", exif=exif.tobytes(), quality=90)
+        payload = {"data_base64": base64.b64encode(buffer.getvalue()).decode(), "mime": "image/jpeg"}
+        event = wiki_artifacts.render_artifact({"kind": "image", "payload": payload})
+        target = (
+            self.root
+            / "runtime"
+            / "runs"
+            / RUN_ID
+            / "artifacts"
+            / f"{event['id']}.jpg"
+        )
+        stored = target.read_bytes()
+        self.assertNotIn(b"SecretModel-42", stored)
+        self.assertNotIn(b"GhostCam", stored)
+        self.assertNotIn(b"GPSLatitude", stored)
+        self.assertNotIn(b"Exif\x00\x00", stored)
+        # Metadata is stripped, but dimensions are preserved on the event.
+        self.assertEqual(event["artifact"]["width"], 48)
+        self.assertEqual(event["artifact"]["height"], 32)
+
     def test_orchestrator_render_artifact_uses_its_run_directory(self) -> None:
         with mock.patch.dict(os.environ, {"WIKI_AGENT_ROLE": "orchestrator"}):
             event = wiki_artifacts.render_artifact(

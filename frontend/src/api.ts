@@ -551,6 +551,9 @@ export type SessionArtifact = {
   mime?: "image/png" | "image/jpeg" | "image/webp";
   byte_size?: number;
   data_base64?: string;
+  width?: number;
+  height?: number;
+  preview_base64?: string;
   columns?: ArtifactColumn[];
   rows?: (string | number | boolean | null)[][];
   spec_vega_lite?: Record<string, unknown>;

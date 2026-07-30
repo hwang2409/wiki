@@ -420,10 +420,16 @@ async function main() {
     if (!liveResponse.ok() || liveResponse.headers()["content-type"] !== "image/png") {
       throw new Error(`Live image resolution failed: ${liveResponse.status()}`);
     }
-    assertValidPngWithDimensions(
-      Buffer.from(await liveResponse.body()),
-      { width: 360, height: 120, label: "Live" },
-    );
+    const storedLiveBytes = await fs.readFile(liveImage);
+    if (!Buffer.from(await liveResponse.body()).equals(storedLiveBytes)) {
+      throw new Error("Live image response does not match stored scrubbed bytes");
+    }
+    // The fixture PNG carries no metadata chunks so the scrubber's
+    // metadata-only strip should produce byte-identical output.
+    if (!storedLiveBytes.equals(Buffer.from(PNG_BASE64, "base64"))) {
+      throw new Error("Scrubbed fixture bytes drifted from the original PNG");
+    }
+    assertValidPngWithDimensions(storedLiveBytes, { width: 360, height: 120, label: "Live" });
     await fs.unlink(liveImage);
     const archivedResponse = await page.request.get(
       `${backend.baseUrl}/api/agents/${TICKET}/artifact/${imageResult.artifactId}?archived=1`
@@ -431,10 +437,11 @@ async function main() {
     if (!archivedResponse.ok() || archivedResponse.headers()["content-type"] !== "image/png") {
       throw new Error(`Archived image fallback failed: ${archivedResponse.status()}`);
     }
-    assertValidPngWithDimensions(
-      Buffer.from(await archivedResponse.body()),
-      { width: 360, height: 120, label: "Archived" },
-    );
+    const storedArchivedBytes = await fs.readFile(archivedImage);
+    if (!Buffer.from(await archivedResponse.body()).equals(storedArchivedBytes)) {
+      throw new Error("Archived image response does not match stored scrubbed bytes");
+    }
+    assertValidPngWithDimensions(storedArchivedBytes, { width: 360, height: 120, label: "Archived" });
     if (dialogs !== 0) throw new Error(`XSS regression opened ${dialogs} dialogs`);
 
     const fixtureSummary = {

@@ -14,7 +14,7 @@ from uuid import UUID, uuid4
 
 from . import knowledge
 from . import wiki_agent_tools
-from .image_scrub import ImageScrubError, scrub_image_bytes
+from .image_scrub import ImageScrubError, scrub_image
 from .pathwalk import open_relative_file
 
 
@@ -409,19 +409,24 @@ def _write_image(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
         raise ArtifactValidationError("image payload exceeds the 5MB image limit")
 
     try:
-        data = scrub_image_bytes(data, mime)
+        result = scrub_image(data, mime)
     except ImageScrubError as exc:
         raise ArtifactValidationError(f"image payload rejected: {exc}") from exc
-    if len(data) > IMAGE_LIMIT:
+    if len(result.data) > IMAGE_LIMIT:
         raise ArtifactValidationError("image payload exceeds the 5MB image limit")
 
     artifact_dir = _artifact_run_dir()
-    _write_binary(artifact_dir, artifact_id, IMAGE_TYPES[mime], data)
-    return {
+    _write_binary(artifact_dir, artifact_id, IMAGE_TYPES[mime], result.data)
+    normalized: dict[str, Any] = {
         "ref": f"artifact://{artifact_id}",
         "mime": mime,
-        "byte_size": len(data),
+        "byte_size": len(result.data),
+        "width": result.width,
+        "height": result.height,
     }
+    if result.preview_base64:
+        normalized["preview_base64"] = result.preview_base64
+    return normalized
 
 
 def render_artifact(arguments: Any) -> dict[str, Any]:

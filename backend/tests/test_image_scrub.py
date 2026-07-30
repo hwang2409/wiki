@@ -118,6 +118,64 @@ class ImageScrubTests(unittest.TestCase):
         with self.assertRaises(ImageScrubError):
             scrub_image_bytes(b"not an image", "image/png")
 
+    def test_pixel_bomb_rejected_before_decode(self) -> None:
+        # Craft a PNG header that advertises 60_000 x 60_000 (3.6 gigapixels)
+        # but do not deliver any IDAT bytes: the check must reject on shape
+        # alone rather than allocating pixel memory.
+        from zlib import crc32
+
+        def chunk(kind: bytes, payload: bytes) -> bytes:
+            return (
+                len(payload).to_bytes(4, "big") + kind + payload + crc32(kind + payload).to_bytes(4, "big")
+            )
+
+        header = (
+            (60_000).to_bytes(4, "big")
+            + (60_000).to_bytes(4, "big")
+            + b"\x08\x02\x00\x00\x00"  # bit depth 8, colour type 2 (RGB)
+        )
+        bomb = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IEND", b"")
+        with self.assertRaisesRegex(ImageScrubError, "pixel limit|side limit"):
+            scrub_image_bytes(bomb, "image/png")
+
+    def test_metadata_only_strip_preserves_bytes_when_no_metadata(self) -> None:
+        # A PNG built without eXIf/tEXt/iTXt/zTXt/tIME should be byte-identical
+        # after the scrub: no lossy re-encode, no chunk rewrite.
+        buffer = io.BytesIO()
+        Image.new("RGB", (4, 4), color=(255, 128, 0)).save(buffer, format="PNG")
+        original = buffer.getvalue()
+        self.assertEqual(scrub_image_bytes(original, "image/png"), original)
+
+    def test_scrub_returns_dimensions_and_preview(self) -> None:
+        from backend.app.image_scrub import scrub_image
+
+        buffer = io.BytesIO()
+        Image.new("RGB", (200, 100), color=(0, 128, 255)).save(buffer, format="PNG")
+        result = scrub_image(buffer.getvalue(), "image/png")
+        self.assertEqual((result.width, result.height), (200, 100))
+        self.assertIsNotNone(result.preview_base64)
+        self.assertTrue(result.preview_base64.startswith("data:image/jpeg;base64,"))
+
+    def test_scrub_omits_preview_for_tiny_images(self) -> None:
+        from backend.app.image_scrub import scrub_image
+
+        buffer = io.BytesIO()
+        Image.new("RGB", (16, 16), color=(0, 0, 0)).save(buffer, format="PNG")
+        result = scrub_image(buffer.getvalue(), "image/png")
+        self.assertIsNone(result.preview_base64)
+
+    def test_orientation_1_jpeg_skips_reencode(self) -> None:
+        # An orientation-1 JPEG must NOT be re-encoded — only its metadata is
+        # rebuilt. The stripped output should be within a few bytes of the
+        # source and the pixel data must be byte-identical.
+        buffer = io.BytesIO()
+        image = Image.new("RGB", (32, 24), color=(10, 200, 50))
+        image.save(buffer, format="JPEG", quality=90)
+        original = buffer.getvalue()
+        scrubbed = scrub_image_bytes(original, "image/jpeg")
+        # No metadata was present, so the strip should return the exact bytes.
+        self.assertEqual(scrubbed, original)
+
 
 if __name__ == "__main__":
     unittest.main()

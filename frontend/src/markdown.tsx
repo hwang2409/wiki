@@ -682,29 +682,90 @@ function nodeProperties(node: unknown): Record<string, unknown> {
   return typedNode.data?.hProperties ?? typedNode.properties ?? {};
 }
 
+type AssetMeta = {
+  width: number;
+  height: number;
+  previewBase64: string | null;
+};
+
+const assetMetaCache = new Map<string, AssetMeta | null>();
+const assetMetaPending = new Map<string, Promise<AssetMeta | null>>();
+
+function fetchAssetMeta(path: string, signal: AbortSignal): Promise<AssetMeta | null> {
+  const cached = assetMetaCache.get(path);
+  if (cached !== undefined) return Promise.resolve(cached);
+  const pending = assetMetaPending.get(path);
+  if (pending) return pending;
+  const encoded = path.split("/").map(encodeURIComponent).join("/");
+  const request = fetch(`/api/vault/asset-meta/${encoded}`, { signal })
+    .then(async (response) => {
+      if (!response.ok) return null;
+      const body = await response.json();
+      const meta: AssetMeta = {
+        width: Number(body.width) || 0,
+        height: Number(body.height) || 0,
+        previewBase64: typeof body.preview_base64 === "string" ? body.preview_base64 : null,
+      };
+      return meta;
+    })
+    .then((meta) => {
+      assetMetaCache.set(path, meta);
+      assetMetaPending.delete(path);
+      return meta;
+    })
+    .catch((error) => {
+      assetMetaPending.delete(path);
+      if ((error as { name?: string }).name === "AbortError") return null;
+      assetMetaCache.set(path, null);
+      return null;
+    });
+  assetMetaPending.set(path, request);
+  return request;
+}
+
 function MarkdownImage({ alt, className, "data-obsidian-width": dataWidth, node, notePath, src }: MarkdownImageProps) {
   const candidates = src ? assetCandidates(src, notePath) : [];
   const [failed, setFailed] = useState(false);
   const [state, setState] = useState<"loading" | "ready" | "error">("loading");
-  const [aspectRatio, setAspectRatio] = useState<number | null>(null);
+  const [meta, setMeta] = useState<AssetMeta | null>(null);
   const [lightboxOpen, setLightboxOpen] = useState(false);
+  const activeCandidate = candidates.length > 0
+    ? candidates[failed && candidates.length > 1 ? 1 : 0]
+    : null;
+
   useEffect(() => {
     setFailed(false);
     setState("loading");
-    setAspectRatio(null);
+    setMeta(null);
   }, [src, notePath]);
 
-  const currentSrc = src && candidates.length > 0
-    ? vaultAssetUrl(candidates[failed && candidates.length > 1 ? 1 : 0])
-    : src;
+  useEffect(() => {
+    if (!activeCandidate) return;
+    const controller = new AbortController();
+    let cancelled = false;
+    fetchAssetMeta(activeCandidate, controller.signal).then((info) => {
+      if (cancelled) return;
+      setMeta(info);
+    });
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [activeCandidate]);
+
+  const currentSrc = src && activeCandidate ? vaultAssetUrl(activeCandidate) : src;
   const widthValue = dataWidth ?? nodeProperties(node)["data-obsidian-width"];
-  const width = typeof widthValue === "number" ? widthValue : undefined;
+  const explicitWidth = typeof widthValue === "number" ? widthValue : undefined;
 
   if (!currentSrc) return null;
 
-  const style: React.CSSProperties = {};
-  if (width) style.width = `${width}px`;
-  if (aspectRatio && !width) style.aspectRatio = String(aspectRatio);
+  const knownRatio = meta && meta.width > 0 && meta.height > 0
+    ? meta.width / meta.height
+    : null;
+
+  const frameStyle: React.CSSProperties = {};
+  if (explicitWidth) frameStyle.width = `${explicitWidth}px`;
+  if (knownRatio) frameStyle.aspectRatio = `${meta!.width} / ${meta!.height}`;
 
   const label = alt || src?.split(/[\\/]/).pop() || "Image";
 
@@ -712,46 +773,61 @@ function MarkdownImage({ alt, className, "data-obsidian-width": dataWidth, node,
     <>
       <button
         aria-label={`Open ${label} in fullscreen`}
-        className={`markdown-image-frame${state === "ready" ? " is-loaded" : ""}${state === "error" ? " is-error" : ""}`}
+        className={`markdown-image-frame${state === "ready" ? " is-loaded" : ""}${state === "error" ? " is-error" : ""}${knownRatio ? " has-known-ratio" : ""}`}
         onClick={() => {
           if (state === "ready") setLightboxOpen(true);
         }}
-        style={style}
+        style={frameStyle}
         type="button"
       >
-        {state === "loading" ? <span className="markdown-image-shimmer" aria-hidden="true" /> : null}
+        {state === "loading" && meta?.previewBase64 ? (
+          <img
+            aria-hidden="true"
+            alt=""
+            className="markdown-image-preview"
+            decoding="sync"
+            src={meta.previewBase64}
+          />
+        ) : state === "loading" ? (
+          <span className="markdown-image-shimmer" aria-hidden="true" />
+        ) : null}
+        <img
+          alt={alt ?? ""}
+          className={className}
+          decoding="async"
+          height={meta?.height}
+          loading="lazy"
+          src={currentSrc}
+          style={explicitWidth ? { width: `${explicitWidth}px` } : undefined}
+          width={meta?.width}
+          onError={() => {
+            if (candidates.length > 1 && !failed) {
+              setFailed(true);
+              return;
+            }
+            // Only flip to the fallback overlay for vault-relative sources —
+            // external URLs stay in the DOM so consumers can still inspect
+            // them and let the browser render the native broken-image icon.
+            if (candidates.length > 0) setState("error");
+          }}
+          onLoad={() => setState("ready")}
+        />
         {state === "error" ? (
           <span className="markdown-image-error" role="img" aria-label={`Image failed to load: ${label}`}>
             image unavailable
           </span>
-        ) : (
-          <img
-            alt={alt ?? ""}
-            className={className}
-            decoding="async"
-            loading="lazy"
-            src={currentSrc}
-            onError={() => {
-              if (candidates.length > 1 && !failed) {
-                setFailed(true);
-                return;
-              }
-              setState("error");
-            }}
-            onLoad={(event) => {
-              const img = event.currentTarget;
-              if (img.naturalWidth > 0 && img.naturalHeight > 0) {
-                setAspectRatio(img.naturalWidth / img.naturalHeight);
-              }
-              setState("ready");
-            }}
-          />
-        )}
+        ) : null}
       </button>
       {lightboxOpen ? (
         <ArtifactLightbox
           index={0}
-          items={[{ src: currentSrc, alt: label, caption: alt || label }]}
+          items={[{
+            src: currentSrc,
+            alt: label,
+            caption: alt || label,
+            width: meta?.width,
+            height: meta?.height,
+          }]}
           onClose={() => setLightboxOpen(false)}
           onIndexChange={() => undefined}
         />

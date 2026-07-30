@@ -238,22 +238,28 @@ export function SharedImageRenderer({
   caption,
   downloadName,
   eager,
+  height,
   imgClassName,
   onImageLoad,
   openInLightbox = false,
+  previewBase64,
   source,
   style,
+  width,
   wrapClassName,
 }: {
   alt: string;
   caption?: string | null;
   downloadName?: string | null;
   eager?: boolean;
+  height?: number;
   imgClassName?: string;
   onImageLoad?: (image: HTMLImageElement) => void;
   openInLightbox?: boolean;
+  previewBase64?: string | null;
   source: string;
   style?: CSSProperties;
+  width?: number;
   wrapClassName?: string;
 }) {
   const [state, setState] = useState<"loading" | "ready" | "error">("loading");
@@ -271,16 +277,30 @@ export function SharedImageRenderer({
       </div>
     );
   }
-  const item: LightboxItem = { src: source, alt, caption, downloadName };
+  const item: LightboxItem = {
+    src: source,
+    alt,
+    caption,
+    downloadName,
+    width,
+    height,
+  };
+  const knownRatio = width && height ? width / height : null;
+  const composedStyle: CSSProperties = {
+    ...(style ?? {}),
+    ...(knownRatio ? { aspectRatio: `${width} / ${height}` } : {}),
+  };
   const image = (
     <img
       key={nonce}
       alt={alt}
       className={`${imgClassName ?? ""}${state === "ready" ? " is-loaded" : ""}`.trim()}
       decoding="async"
+      height={height}
       loading={eager ? "eager" : "lazy"}
       src={source}
-      style={style}
+      style={composedStyle}
+      width={width}
       onError={() => setState("error")}
       onLoad={(loadEvent) => {
         setState("ready");
@@ -288,10 +308,32 @@ export function SharedImageRenderer({
       }}
     />
   );
+  const placeholderStyle: CSSProperties = knownRatio
+    ? { aspectRatio: `${width} / ${height}` }
+    : {};
   return (
-    <div className={`artifact-image-wrap${wrapClassName ? ` ${wrapClassName}` : ""}`}>
+    <div
+      className={`artifact-image-wrap${wrapClassName ? ` ${wrapClassName}` : ""}${knownRatio ? " has-known-ratio" : ""}`}
+      style={knownRatio ? { aspectRatio: `${width} / ${height}` } : undefined}
+    >
       {state === "loading" ? (
-        <div className="artifact-image-blur" aria-hidden="true" data-shape="image" />
+        previewBase64 ? (
+          <img
+            aria-hidden="true"
+            alt=""
+            className="artifact-image-preview"
+            decoding="sync"
+            src={previewBase64}
+            style={placeholderStyle}
+          />
+        ) : (
+          <div
+            className="artifact-image-blur"
+            aria-hidden="true"
+            data-shape="image"
+            style={placeholderStyle}
+          />
+        )
       ) : null}
       {openInLightbox ? (
         <button
@@ -328,10 +370,13 @@ export function ImageRenderer({ artifact, event, onImageLoad, ticket }: Artifact
     <SharedImageRenderer
       alt={event.title || event.caption || "Agent artifact"}
       caption={event.caption || event.title || null}
+      height={artifact.height}
       imgClassName="artifact-image"
       onImageLoad={onImageLoad}
       openInLightbox
+      previewBase64={artifact.preview_base64 ?? null}
       source={source}
+      width={artifact.width}
     />
   );
 }
@@ -884,8 +929,11 @@ export function CompactPreview({ artifact, event, onRenderError, ticket }: Artif
     return (
       <SharedImageRenderer
         alt={event.title || event.caption || "Agent artifact"}
+        height={artifact.height}
         imgClassName="artifact-image artifact-compact-image"
+        previewBase64={artifact.preview_base64 ?? null}
         source={source}
+        width={artifact.width}
         wrapClassName="artifact-image-compact-wrap"
       />
     );

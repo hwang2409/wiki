@@ -145,14 +145,17 @@ describe("ImageGallery", () => {
     { path: "notes/three.webp", label: "Three" },
   ];
 
-  test("renders a tile per image with vault-asset URLs", () => {
+  test("renders a tile per image with bounded thumbnail srcset", () => {
     render(<ImageGallery files={files} />);
     const tiles = screen.getAllByRole("button", { name: /Open .+ in fullscreen/ });
     expect(tiles).toHaveLength(3);
-    const images = tiles.map((tile) => tile.querySelector("img"));
+    const images = tiles.map((tile) => tile.querySelector("img.artifact-gallery-image"));
     expect(images.every((img) => img?.getAttribute("loading") === "lazy")).toBe(true);
-    expect(images[0]?.getAttribute("src")).toBe("/api/vault/assets/notes/one.png");
-    expect(images[1]?.getAttribute("src")).toBe("/api/vault/assets/notes/two.jpg");
+    expect(images[0]?.getAttribute("src")).toBe("/api/vault/assets/notes/one.png?w=320");
+    const srcSet = images[0]?.getAttribute("srcset");
+    expect(srcSet).toContain("/api/vault/assets/notes/one.png?w=320 320w");
+    expect(srcSet).toContain("/api/vault/assets/notes/one.png?w=640 640w");
+    expect(images[0]?.getAttribute("sizes")).toContain("200px");
   });
 
   test("clicking a tile opens lightbox at that index", () => {
@@ -249,5 +252,200 @@ describe("SharedImageRenderer polish", () => {
     const img = container.querySelector("img")!;
     expect(img.getAttribute("loading")).toBe("lazy");
     expect(img.getAttribute("decoding")).toBe("async");
+  });
+
+  test("reserves aspect ratio from persisted width/height (CLS = 0)", () => {
+    const { container } = render(
+      <SharedImageRenderer
+        alt="pic"
+        height={720}
+        openInLightbox={false}
+        source="/api/agents/WIKI-1/artifact/abc.png"
+        width={1280}
+      />,
+    );
+    const wrap = container.querySelector(".artifact-image-wrap") as HTMLElement;
+    expect(wrap.style.aspectRatio).toBe("1280 / 720");
+    const img = container.querySelector("img") as HTMLImageElement;
+    expect(img.getAttribute("width")).toBe("1280");
+    expect(img.getAttribute("height")).toBe("720");
+  });
+
+  test("renders a persisted low-res preview blurred, not the shimmer", () => {
+    const preview = "data:image/jpeg;base64,ZmFrZS1wcmV2aWV3";
+    const { container } = render(
+      <SharedImageRenderer
+        alt="pic"
+        height={200}
+        openInLightbox={false}
+        previewBase64={preview}
+        source="/api/agents/WIKI-1/artifact/abc.png"
+        width={400}
+      />,
+    );
+    const previewImg = container.querySelector(".artifact-image-preview") as HTMLImageElement;
+    expect(previewImg).toBeTruthy();
+    expect(previewImg.src).toContain("data:image/jpeg;base64");
+    expect(container.querySelector(".artifact-image-blur")).toBeNull();
+  });
+});
+
+describe("ArtifactLightbox lifecycle cleanup", () => {
+  test("aborts an in-flight clipboard fetch when the item switches", async () => {
+    const aborted: boolean[] = [];
+    const originalFetch = globalThis.fetch;
+    const originalClipboard = navigator.clipboard;
+    let resolveFetch: ((response: Response) => void) | null = null;
+    const fetchMock = vi.fn((_url: RequestInfo | URL, init?: RequestInit) => {
+      const signal = init?.signal;
+      return new Promise<Response>((resolve, reject) => {
+        resolveFetch = resolve;
+        signal?.addEventListener("abort", () => {
+          aborted.push(true);
+          reject(new DOMException("aborted", "AbortError"));
+        });
+      });
+    });
+    globalThis.fetch = fetchMock as typeof fetch;
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: vi.fn().mockResolvedValue(undefined) },
+    });
+    // Ensure ClipboardItem branch is exercised
+    (globalThis as { ClipboardItem?: unknown }).ClipboardItem = class {
+      constructor(_types: Record<string, Blob>) {
+        // no-op
+      }
+    };
+    const items: LightboxItem[] = [
+      { src: "/api/vault/assets/first.png", alt: "First" },
+      { src: "/api/vault/assets/second.png", alt: "Second" },
+    ];
+    let currentIndex = 0;
+    const { rerender } = render(
+      <ArtifactLightbox
+        index={currentIndex}
+        items={items}
+        onClose={() => undefined}
+        onIndexChange={(next) => {
+          currentIndex = next;
+        }}
+      />,
+    );
+    const copyButton = screen.getByTitle(/Copy image/);
+    await act(async () => {
+      fireEvent.click(copyButton);
+    });
+    // switch to next item while fetch is pending
+    await act(async () => {
+      rerender(
+        <ArtifactLightbox
+          index={1}
+          items={items}
+          onClose={() => undefined}
+          onIndexChange={() => undefined}
+        />,
+      );
+    });
+    expect(aborted).toContain(true);
+    // Cleanup for other tests
+    resolveFetch?.(new Response(new Blob([], { type: "image/png" })));
+    globalThis.fetch = originalFetch;
+    if (originalClipboard) {
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: originalClipboard,
+      });
+    }
+  });
+
+  test("aborts the clipboard fetch on close", async () => {
+    const aborted: boolean[] = [];
+    const originalFetch = globalThis.fetch;
+    const originalClipboard = navigator.clipboard;
+    const fetchMock = vi.fn((_url: RequestInfo | URL, init?: RequestInit) => {
+      const signal = init?.signal;
+      return new Promise<Response>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => {
+          aborted.push(true);
+          reject(new DOMException("aborted", "AbortError"));
+        });
+      });
+    });
+    globalThis.fetch = fetchMock as typeof fetch;
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: vi.fn().mockResolvedValue(undefined) },
+    });
+    (globalThis as { ClipboardItem?: unknown }).ClipboardItem = class {
+      constructor(_types: Record<string, Blob>) {
+        // no-op
+      }
+    };
+    const items: LightboxItem[] = [{ src: "/api/vault/assets/first.png", alt: "First" }];
+    const { unmount } = render(
+      <ArtifactLightbox
+        index={0}
+        items={items}
+        onClose={() => undefined}
+        onIndexChange={() => undefined}
+      />,
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByTitle(/Copy image/));
+    });
+    await act(async () => {
+      unmount();
+    });
+    expect(aborted).toContain(true);
+    globalThis.fetch = originalFetch;
+    if (originalClipboard) {
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: originalClipboard,
+      });
+    }
+  });
+
+  test("inerts sibling nodes while open and restores on close", () => {
+    const outside = document.createElement("div");
+    outside.textContent = "background page";
+    document.body.appendChild(outside);
+    try {
+      const { unmount } = render(
+        <ArtifactLightbox
+          index={0}
+          items={[{ src: "/api/vault/assets/first.png", alt: "First" }]}
+          onClose={() => undefined}
+          onIndexChange={() => undefined}
+        />,
+      );
+      expect(outside.hasAttribute("inert")).toBe(true);
+      expect(outside.getAttribute("aria-hidden")).toBe("true");
+      unmount();
+      expect(outside.hasAttribute("inert")).toBe(false);
+      expect(outside.getAttribute("aria-hidden")).toBeNull();
+    } finally {
+      outside.remove();
+    }
+  });
+
+  test("Tab wraps focus inside the dialog", () => {
+    render(
+      <ArtifactLightbox
+        index={0}
+        items={[{ src: "/api/vault/assets/first.png", alt: "First" }]}
+        onClose={() => undefined}
+        onIndexChange={() => undefined}
+      />,
+    );
+    const dialog = screen.getByRole("dialog");
+    // In jsdom offsetParent is null for many elements; the trap should still
+    // preventDefault + push focus back inside the dialog when tab escapes.
+    const closeButton = screen.getByTitle(/Close/);
+    closeButton.focus();
+    fireEvent.keyDown(dialog, { key: "Tab" });
+    // The trap keeps document.activeElement inside the dialog subtree.
+    expect(dialog.contains(document.activeElement)).toBe(true);
   });
 });

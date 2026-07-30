@@ -5079,15 +5079,17 @@ def get_file_content(
     return FileContent(path=relative_path, size=size, content=content)
 
 
-@app.get("/api/vault/assets/{asset_path:path}")
-def get_vault_asset(asset_path: str) -> Response:
+_VAULT_ASSET_RESIZE_MIMES = {"image/png", "image/jpeg", "image/webp"}
+_VAULT_ASSET_RESIZE_WIDTHS = (160, 320, 640, 1280)
+
+
+def _read_vault_asset_bytes(asset_path: str) -> tuple[bytes, str]:
     target, _relative_path, media_type = resolve_vault_asset_path(asset_path)
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(target, flags)
     except OSError as exc:
         raise HTTPException(status_code=404, detail="File not found") from exc
-
     try:
         if not opened_file_is_safe(fd, target, VAULT_DIR.resolve()):
             file_not_found()
@@ -5107,7 +5109,51 @@ def get_vault_asset(asset_path: str) -> Response:
         raise HTTPException(status_code=404, detail="File not found")
     finally:
         os.close(fd)
+    return raw, media_type
 
+
+def _resize_asset_bytes(raw: bytes, media_type: str, width: int) -> tuple[bytes, str]:
+    from io import BytesIO
+
+    from PIL import Image
+
+    with Image.open(BytesIO(raw)) as source:
+        source.load()
+        source_width, source_height = source.size
+        if width >= source_width:
+            return raw, media_type
+        target_height = max(1, round(source_height * (width / source_width)))
+        oriented = source.convert("RGBA" if source.mode in {"RGBA", "LA", "PA"} else "RGB")
+        oriented = oriented.resize((width, target_height), Image.Resampling.LANCZOS)
+        buffer = BytesIO()
+        if media_type == "image/png":
+            oriented.save(buffer, format="PNG", optimize=True)
+            out_mime = "image/png"
+        elif media_type == "image/webp":
+            oriented.save(buffer, format="WEBP", quality=88, method=4)
+            out_mime = "image/webp"
+        else:
+            if oriented.mode != "RGB":
+                oriented = oriented.convert("RGB")
+            oriented.save(buffer, format="JPEG", quality=88, optimize=True, progressive=True)
+            out_mime = "image/jpeg"
+    return buffer.getvalue(), out_mime
+
+
+@app.get("/api/vault/assets/{asset_path:path}")
+def get_vault_asset(asset_path: str, w: int | None = None) -> Response:
+    raw, media_type = _read_vault_asset_bytes(asset_path)
+    if w is not None and media_type in _VAULT_ASSET_RESIZE_MIMES:
+        try:
+            width = int(w)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="w must be an integer") from exc
+        if width not in _VAULT_ASSET_RESIZE_WIDTHS:
+            raise HTTPException(status_code=400, detail="unsupported w value")
+        try:
+            raw, media_type = _resize_asset_bytes(raw, media_type, width)
+        except Exception as exc:  # noqa: BLE001 — Pillow raises many exceptions
+            raise HTTPException(status_code=422, detail=f"resize failed: {exc}") from exc
     headers = {
         "Cache-Control": "private, max-age=3600",
         "X-Content-Type-Options": "nosniff",
@@ -5115,6 +5161,32 @@ def get_vault_asset(asset_path: str) -> Response:
     if media_type == "image/svg+xml":
         headers["Content-Security-Policy"] = "default-src 'none'; style-src 'unsafe-inline'"
     return Response(content=raw, media_type=media_type, headers=headers)
+
+
+@app.get("/api/vault/asset-meta/{asset_path:path}")
+def get_vault_asset_meta(asset_path: str) -> dict[str, object]:
+    raw, media_type = _read_vault_asset_bytes(asset_path)
+    if media_type not in _VAULT_ASSET_RESIZE_MIMES:
+        raise HTTPException(status_code=415, detail="asset is not an image")
+    from .image_scrub import ImageScrubError, probe_dimensions, scrub_image
+
+    try:
+        width, height = probe_dimensions(raw, media_type)
+    except ImageScrubError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    preview: str | None = None
+    try:
+        preview = scrub_image(raw, media_type).preview_base64
+    except ImageScrubError:
+        preview = None
+    result: dict[str, object] = {
+        "width": width,
+        "height": height,
+        "media_type": media_type,
+    }
+    if preview:
+        result["preview_base64"] = preview
+    return result
 
 
 @app.get("/api/notes/{note_path:path}", response_model=Note)

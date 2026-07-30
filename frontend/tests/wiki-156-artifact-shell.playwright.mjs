@@ -60,8 +60,9 @@ function inputs() {
     { kind: "svg", title: "Titled svg", payload: { source: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 60"><rect width="120" height="60" fill="#123"/></svg>' } },
     { kind: "plot", title: "Trend plot", payload: { spec_vega_lite: largePlot() } },
     { kind: "code", payload: { language: "typescript", source: "export const answer = 42;\n" } },
-    // Invalid inline image — base64 payload is not decodable PNG data, so <img> fires onError.
-    { kind: "image", title: "Broken image", payload: { data_base64: "bm90LXJlYWwtcG5nLWJ5dGVz", mime: "image/png" } },
+    // Real 1x1 PNG so ingest passes the EXIF scrub — the test forces the
+    // browser to emit onError manually to exercise the render-error UI.
+    { kind: "image", title: "Broken image", payload: { data_base64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGL4z8AAAAMAAVpCWrwAAAAASUVORK5CYII=", mime: "image/png" } },
   ];
 }
 
