@@ -18,7 +18,8 @@ class PurgeRebaseBotTestJobsTests(unittest.TestCase):
             runtime_dir = Path(raw)
             state_path = runtime_dir / "rebase-bot" / "state.json"
             state_path.parent.mkdir(parents=True)
-            delivery_id = "175:retry-test-sha:escalated:retry-test-head"
+            first_delivery_id = "175:retry-test-sha:escalated:retry-test-head"
+            second_delivery_id = "176:retry-test-other:resolved:retry-test-other-head"
             state_path.write_text(
                 json.dumps(
                     {
@@ -31,10 +32,19 @@ class PurgeRebaseBotTestJobsTests(unittest.TestCase):
                                     "status": "escalated",
                                     "head_sha": "retry-test-head",
                                 },
-                            }
+                            },
+                            "176:retry-test-other": {
+                                "pr_number": 176,
+                                "expected_sha": "retry-test-other",
+                                "status": "completed",
+                                "result": {
+                                    "status": "resolved",
+                                    "head_sha": "retry-test-other-head",
+                                },
+                            },
                         },
                         "outbox": {},
-                        "delivered": [delivery_id],
+                        "delivered": [first_delivery_id, second_delivery_id],
                     }
                 ),
                 encoding="utf-8",
@@ -47,7 +57,7 @@ class PurgeRebaseBotTestJobsTests(unittest.TestCase):
                 check=True,
                 env=env,
             )
-            self.assertIn("purged 1 retry-test job(s)", first.stdout)
+            self.assertIn("purged 2 retry-test job(s)", first.stdout)
             cleaned = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertEqual(cleaned, {"jobs": {}, "outbox": {}, "delivered": []})
 

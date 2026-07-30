@@ -240,9 +240,36 @@ def _durable_key(pr_number: int, expected_sha: str) -> str:
 
 def _delivery_id(job: _RebaseJob, result: Mapping[str, Any]) -> str:
     # Stable across process restarts so a delivered event never re-enqueues.
-    status = str(result.get("status") or "")
-    head_sha = str(result.get("head_sha") or "")
-    return f"{job.pr_number}:{job.expected_sha}:{status}:{head_sha}"
+    return _delivery_id_from_parts(
+        job.pr_number,
+        job.expected_sha,
+        result.get("status"),
+        result.get("head_sha"),
+    )
+
+
+def _delivery_id_from_parts(
+    pr_number: Any,
+    expected_sha: Any,
+    status: Any,
+    head_sha: Any,
+) -> str:
+    parts = tuple(
+        str(part or "") for part in (pr_number, expected_sha, status, head_sha)
+    )
+    return ":".join(parts) if all(parts) else ""
+
+
+def _delivery_id_from_record(record: Mapping[str, Any]) -> str:
+    result = record.get("result")
+    if not isinstance(result, Mapping):
+        return ""
+    return _delivery_id_from_parts(
+        record.get("pr_number"),
+        record.get("expected_sha"),
+        result.get("status"),
+        result.get("head_sha"),
+    )
 
 
 def _prune_durable_jobs(clear_job_slot: Callable[[int, str], None] | None = None) -> None:
