@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import os
 import shutil
@@ -25,6 +26,7 @@ from backend.app.agent_runtime.client import (
     SupervisorRemoteError,
     SupervisorUnavailable,
 )
+from backend.app.agent_runtime import daemon as agent_daemon
 from backend.app.agent_runtime.codex import CodexAppServerAdapter
 from backend.app.agent_runtime.fake import CodexFixtureAdapter, FixtureAdapterFactory
 from backend.app.agent_runtime.process import (
@@ -3186,6 +3188,7 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
             self.paths,
             timeout=0.1,
             runtime_fingerprint="current-runtime",
+            runtime_frozen=True,
         )
         stale = {"status": "ok", "pid": 424_242}
         current = {
@@ -3217,6 +3220,7 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
             self.paths,
             timeout=0.1,
             runtime_fingerprint="current-runtime",
+            runtime_frozen=True,
             swap_drain_seconds=0,
         )
         idle = {
@@ -3323,6 +3327,7 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
             self.paths,
             timeout=0.1,
             runtime_fingerprint="current-runtime",
+            runtime_frozen=True,
         )
         with (
             mock.patch.object(
@@ -3354,6 +3359,81 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.dict(os.environ, {"WIKI_SUPERVISOR_AUTOSTART": "off"}),
         ):
             self.assertEqual(client.ensure_running(timeout=0.1), health)
+
+    def test_dev_client_uses_a_mismatched_supervisor_without_replacing_it(self) -> None:
+        """WIKI-217: worktree/dev code must never swap-kill the app's supervisor."""
+
+        client = SupervisorClient(
+            self.paths,
+            timeout=0.1,
+            runtime_fingerprint="dev-source-hash",
+            runtime_frozen=False,
+        )
+        health = {
+            "status": "ok",
+            "pid": 424_242,
+            "runtime_fingerprint": "frozen-binary-stat",
+        }
+        with (
+            mock.patch.object(client, "ping", return_value=health),
+            mock.patch.object(client, "request") as request,
+            mock.patch.object(client, "_spawn_detached") as spawn,
+            mock.patch("backend.app.agent_runtime.client.os.kill") as kill,
+        ):
+            self.assertEqual(client.ensure_running(timeout=0.1), health)
+        request.assert_not_called()
+        spawn.assert_not_called()
+        kill.assert_not_called()
+
+    async def test_close_leaves_a_replacement_daemons_socket_in_place(self) -> None:
+        """WIKI-217: a dying daemon must not unlink the socket a successor rebound."""
+
+        self.paths.socket_path.unlink()
+        replacement = UnixSupervisorServer(self.supervisor, self.paths.socket_path)
+        await replacement.start()
+        try:
+            await self.server.close()
+            self.assertTrue(self.paths.socket_path.exists())
+        finally:
+            await replacement.close()
+        self.server = replacement
+
+
+class DaemonShutdownTests(unittest.IsolatedAsyncioTestCase):
+    async def test_lock_and_pid_release_before_provider_drain(self) -> None:
+        """WIKI-217: a replacement must be able to start while the old daemon drains."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = _paths(Path(tmp))
+            lock = agent_daemon._acquire_single_instance(paths)
+            observed: dict[str, bool] = {}
+
+            class DrainingSupervisor:
+                async def close(self) -> None:
+                    probe = paths.lock_path.open("a+b")
+                    try:
+                        fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        observed["lock_free"] = True
+                        fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+                    except BlockingIOError:
+                        observed["lock_free"] = False
+                    finally:
+                        probe.close()
+                    observed["pid_gone"] = not paths.pid_path.exists()
+
+            class ClosedServer:
+                async def close(self) -> None:
+                    pass
+
+            await agent_daemon._shutdown(
+                ClosedServer(),
+                DrainingSupervisor(),
+                [],
+                lock,
+                paths,
+            )
+            self.assertTrue(observed["lock_free"])
+            self.assertTrue(observed["pid_gone"])
 
 
 class DaemonProcessTests(unittest.TestCase):
@@ -3480,6 +3560,7 @@ class DaemonProcessTests(unittest.TestCase):
                 paths,
                 timeout=1,
                 runtime_fingerprint=RUNTIME_FINGERPRINT,
+                runtime_frozen=True,
                 swap_drain_seconds=0.1,
             )
             new_pid: int | None = None
