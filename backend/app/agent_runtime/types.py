@@ -155,7 +155,6 @@ class RunRecord:
     current_turn_diff_turn_id: str | None = None
     current_turn_diff_started_seq: int = 0
     current_turn_diff_seq: int = 0
-    current_turn_diff: str | None = None
     transcript_path: str | None = None
     initial_prompt: str | None = None
     created_at: str = field(default_factory=utc_now)
@@ -247,7 +246,6 @@ class RunRecord:
             "current_turn_diff_turn_id": self.current_turn_diff_turn_id,
             "current_turn_diff_started_seq": self.current_turn_diff_started_seq,
             "current_turn_diff_seq": self.current_turn_diff_seq,
-            "current_turn_diff": self.current_turn_diff,
             "transcript_path": self.transcript_path,
             "initial_prompt": self.initial_prompt,
             "created_at": self.created_at,
@@ -310,7 +308,6 @@ class RunRecord:
             current_turn_diff_turn_id=value.get("current_turn_diff_turn_id"),
             current_turn_diff_started_seq=int(value.get("current_turn_diff_started_seq", 0)),
             current_turn_diff_seq=int(value.get("current_turn_diff_seq", 0)),
-            current_turn_diff=value.get("current_turn_diff"),
             transcript_path=value.get("transcript_path"),
             initial_prompt=value.get("initial_prompt"),
             created_at=str(value.get("created_at") or utc_now()),

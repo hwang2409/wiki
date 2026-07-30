@@ -108,27 +108,30 @@ def _codex_turn_id(payload: dict[str, Any]) -> str | None:
     return None
 
 
-def _apply_current_turn_diff(record: RunRecord, envelope: dict[str, Any]) -> None:
+def _current_turn_diff_update(
+    record: RunRecord,
+    envelope: dict[str, Any],
+) -> tuple[bool, str | None]:
     if record.provider is not ProviderKind.CODEX:
-        return
+        return False, None
     payload = envelope.get("payload")
     if not isinstance(payload, dict):
-        return
+        return False, None
     method = payload.get("method")
     seq = int(envelope.get("seq", 0))
     if method == "turn/started":
         record.current_turn_diff_turn_id = _codex_turn_id(payload)
         record.current_turn_diff_started_seq = seq
         record.current_turn_diff_seq = 0
-        record.current_turn_diff = None
-        return
+        return True, None
     if method != "turn/diff/updated" or record.current_turn_diff_started_seq <= 0:
-        return
+        return False, None
     params = payload.get("params")
     diff = params.get("diff") if isinstance(params, dict) else None
     if isinstance(diff, str):
         record.current_turn_diff_seq = seq
-        record.current_turn_diff = diff
+        return True, diff
+    return False, None
 
 
 def _apply_pending_request_event(
@@ -520,6 +523,9 @@ class RunStore:
     def normalized_events_path(self, run_id: str) -> Path:
         return self.run_dir(run_id) / "events.jsonl"
 
+    def current_turn_diff_path(self, run_id: str) -> Path:
+        return self.run_dir(run_id) / "current-turn-diff.json"
+
     def provider_log_path(self, run_id: str) -> Path:
         return self.run_dir(run_id) / "provider.log"
 
@@ -642,6 +648,19 @@ class RunStore:
         record.updated_at = utc_now()
         _atomic_write_json(self.run_path(record.run_id), record.to_dict())
 
+    def _write_current_turn_diff_snapshot(self, run_id: str, diff: str | None) -> None:
+        _atomic_write_json(self.current_turn_diff_path(run_id), {"diff": diff})
+
+    def _read_current_turn_diff_snapshot(self, run_id: str) -> str | None:
+        try:
+            value = _read_json(self.current_turn_diff_path(run_id))
+        except RunNotFound:
+            return None
+        if not isinstance(value, dict):
+            return None
+        diff = value.get("diff")
+        return diff if isinstance(diff, str) else None
+
     def _create_run_files(self, record: RunRecord) -> None:
         directory = self.run_dir(record.run_id)
         if directory.exists():
@@ -682,13 +701,13 @@ class RunStore:
                     record.current_turn_diff_turn_id,
                     record.current_turn_diff_started_seq,
                     record.current_turn_diff_seq,
-                    record.current_turn_diff,
                 )
                 record.pending_requests = {}
                 record.current_turn_diff_turn_id = None
                 record.current_turn_diff_started_seq = 0
                 record.current_turn_diff_seq = 0
-                record.current_turn_diff = None
+                current_diff: str | None = None
+                current_diff_dirty = False
                 lifecycle_checkpoint = record.last_lifecycle_event_seq
                 rebuilt_unread_seq = 0
                 for event in normalized_events:
@@ -713,7 +732,10 @@ class RunStore:
                             seq=seq,
                             normalized_at=str(event.get("normalized_at") or utc_now()),
                         )
-                    _apply_current_turn_diff(record, event)
+                    changed, snapshot = _current_turn_diff_update(record, event)
+                    if changed:
+                        current_diff = snapshot
+                        current_diff_dirty = True
                     # Rebuild the WIKI-161 unread-worthy counter alongside
                     # normalized_event_count so a crash between JSONL fsync
                     # and run.json replace cannot leave a stale value on disk.
@@ -765,8 +787,8 @@ class RunStore:
                         record.current_turn_diff_turn_id,
                         record.current_turn_diff_started_seq,
                         record.current_turn_diff_seq,
-                        record.current_turn_diff,
                     )
+                    or "current_turn_diff" in value
                 ):
                     record.raw_event_count = raw_count
                     record.normalized_event_count = normalized_count
@@ -774,6 +796,8 @@ class RunStore:
                     record.last_lifecycle_event_seq = lifecycle_checkpoint
                     record.unread_event_seq = rebuilt_unread_seq
                     self._write_record(record)
+                if current_diff_dirty:
+                    self._write_current_turn_diff_snapshot(record.run_id, current_diff)
             except (OSError, StoreError, TypeError, ValueError):
                 # A corrupt run remains on disk for the inspector; one bad run
                 # must not prevent the daemon from recovering healthy siblings.
@@ -998,6 +1022,10 @@ class RunStore:
             self._copy_archive_file(
                 self.normalized_events_path(run_id),
                 session_dir / "events.jsonl",
+            )
+            self._copy_archive_file(
+                self.current_turn_diff_path(run_id),
+                session_dir / "current-turn-diff.json",
             )
             # The normalized transcript is durable before the background index
             # hook is enqueued. A cache failure can never block archive
@@ -1367,7 +1395,9 @@ class RunStore:
                 "lifecycle_state": lifecycle_state.value if lifecycle_state else None,
             }
             _append_json_line(self.normalized_events_path(run_id), envelope)
-            _apply_current_turn_diff(record, envelope)
+            changed, snapshot = _current_turn_diff_update(record, envelope)
+            if changed:
+                self._write_current_turn_diff_snapshot(run_id, snapshot)
             record.normalized_event_count = int(envelope["seq"])
             # Unread advances only on genuinely worker-authored surface events
             # (see _is_unread_worthy). Synthetic supervisor wakes, outbound
@@ -1415,12 +1445,13 @@ class RunStore:
     def current_turn_diff(self, run_id: str) -> dict[str, Any] | None:
         with self._lock:
             record = self.get(run_id)
-            if record.provider is not ProviderKind.CODEX or record.current_turn_diff is None:
+            diff = self._read_current_turn_diff_snapshot(run_id)
+            if record.provider is not ProviderKind.CODEX or diff is None:
                 return None
             return {
                 "turn_id": record.current_turn_diff_turn_id,
                 "seq": record.current_turn_diff_seq,
-                "diff": record.current_turn_diff,
+                "diff": diff,
             }
 
     def clear_pending_request(

@@ -173,10 +173,43 @@ function diffPath(file: DiffFilePatch): string {
   return fileTitle(file);
 }
 
-export function parseDiffSnapshot(source: string): Map<string, DiffFilePatch> {
+const MAX_DIFF_SOURCE_BYTES = 512 * 1024;
+const MAX_DIFF_FILES = 100;
+
+export type ParsedDiffSnapshot = {
+  files: Map<string, DiffFilePatch>;
+  omittedFiles: boolean;
+};
+
+function boundedDiffSource(source: string): { source: string; truncated: boolean; fileLimited: boolean } {
+  const encoded = new TextEncoder().encode(source);
+  const truncated = encoded.byteLength > MAX_DIFF_SOURCE_BYTES;
+  const bounded = truncated
+    ? new TextDecoder().decode(encoded.slice(0, MAX_DIFF_SOURCE_BYTES))
+    : source;
+  const chunks = bounded.split(/(?=^diff --git )/m);
+  const firstFileChunk = chunks[0]?.startsWith("diff --git ") ? 0 : 1;
+  const fileCount = chunks.length - firstFileChunk;
+  if (fileCount <= MAX_DIFF_FILES) return { source: bounded, truncated, fileLimited: false };
+  return {
+    source: chunks.slice(0, firstFileChunk + MAX_DIFF_FILES).join(""),
+    truncated,
+    fileLimited: true,
+  };
+}
+
+export function parseDiffSnapshot(source: string): ParsedDiffSnapshot {
+  const bounded = boundedDiffSource(source);
+  const parsed = parseUnifiedDiff(bounded.source);
   const files = new Map<string, DiffFilePatch>();
-  for (const file of parseUnifiedDiff(source)) files.set(diffPath(file), file);
-  return files;
+  for (const file of parsed) {
+    if (files.size >= MAX_DIFF_FILES) break;
+    files.set(diffPath(file), file);
+  }
+  return {
+    files,
+    omittedFiles: bounded.truncated || bounded.fileLimited || parsed.length > MAX_DIFF_FILES,
+  };
 }
 
 function latestDiffSource(events: ProviderStreamEvent[]): string | null {
@@ -250,6 +283,7 @@ function textBytes(value: string): number {
 function diffFileStats(file: DiffFilePatch): { lineCount: number; byteCount: number } {
   let lineCount = 0;
   let byteCount = 0;
+  for (const header of file.extendedHeaders) byteCount += textBytes(header) + 1;
   for (const hunk of file.hunks) {
     byteCount += textBytes(hunk.header);
     for (const line of hunk.lines) {
@@ -268,6 +302,16 @@ function boundDiffFile(
   let lineCount = 0;
   let byteCount = 0;
   let truncated = false;
+  const extendedHeaders = [];
+  for (const header of file.extendedHeaders) {
+    const headerBytes = textBytes(header) + 1;
+    if (byteCount + headerBytes > maxBytes) {
+      truncated = true;
+      break;
+    }
+    extendedHeaders.push(header);
+    byteCount += headerBytes;
+  }
   const hunks = [];
   for (const hunk of file.hunks) {
     const lines = [];
@@ -286,7 +330,7 @@ function boundDiffFile(
     if (truncated) break;
   }
   return {
-    file: { ...file, hunks },
+    file: { ...file, extendedHeaders, hunks },
     lineCount,
     byteCount,
     truncated,
@@ -311,25 +355,31 @@ function boundDiffFiles(files: ReadonlyMap<string, DiffFilePatch>): Map<string, 
 }
 
 function DiffRenderer({ source }: { source: string | null }) {
-  const boundedFiles = useMemo(
+  const snapshot = useMemo(
     () => (source === null
-      ? new Map<string, BoundedDiffFile>()
-      : boundDiffFiles(parseDiffSnapshot(source))),
+      ? { files: new Map<string, DiffFilePatch>(), omittedFiles: false }
+      : parseDiffSnapshot(source)),
     [source],
   );
+  const boundedFiles = useMemo(() => boundDiffFiles(snapshot.files), [snapshot]);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [expandedLarge, setExpandedLarge] = useState<Set<string>>(new Set());
   useEffect(() => {
     setCollapsed(new Set());
     setExpandedLarge(new Set());
   }, [source]);
-  if (!boundedFiles.size) return null;
+  if (!boundedFiles.size && !snapshot.omittedFiles) return null;
   return (
     <div className="codex-stream-artifact codex-stream-diff" data-testid="codex-diff-renderer">
       <div className="codex-stream-artifact-head">
         <span>working diff</span>
         <span className="codex-stream-artifact-count tabular-nums">{boundedFiles.size} file{boundedFiles.size === 1 ? "" : "s"}</span>
       </div>
+      {snapshot.omittedFiles ? (
+        <div className="codex-stream-diff-omitted" data-testid="codex-diff-omitted" role="status">
+          additional diff files omitted from preview
+        </div>
+      ) : null}
       {[...boundedFiles.entries()].map(([path, bounded]) => {
         const { file } = bounded;
         const stats = diffFileStats(file);
@@ -469,14 +519,15 @@ export function CodexStreamHighlights({
   const skillEvents = rendered.filter((event) => event.kind === "skills_changed");
   const planEvents = rendered.filter((event) => event.kind === "turn_plan_updated");
   const hasHookEvents = events.some((event) => event.kind === "hook_started" || event.kind === "hook_completed");
-  if (!rendered.length && !hasHookEvents) return null;
+  const diffSource = currentTurnDiff === undefined ? latestDiffSource(events) : currentTurnDiff;
+  if (!rendered.length && !hasHookEvents && diffSource === null) return null;
   return (
     <div className="codex-stream-highlights">
       {warningEvents.map((event) => <WarningRenderer event={event} key={event.seq} />)}
       {moderationEvents.map((event) => <WarningRenderer event={event} key={event.seq} moderation />)}
       <HookLifecycleRenderer events={events} />
       <TerminalInteractionRenderer events={events} />
-      <DiffRenderer source={currentTurnDiff === undefined ? latestDiffSource(events) : currentTurnDiff} />
+      <DiffRenderer source={diffSource} />
       {skillEvents.map((event) => <SkillsChangedRenderer event={event} key={event.seq} />)}
       {planEvents.map((event) => <PlanRenderer event={event} key={event.seq} />)}
     </div>

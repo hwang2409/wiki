@@ -160,6 +160,17 @@ describe("codex stream renderers", () => {
     expect(reset.container.querySelector("[data-testid='codex-diff-renderer']")).toBeNull();
   });
 
+  it("renders a pinned diff when the event window contains only summarized events", () => {
+    const summarized = event("thread_tokenUsage_updated", 1, {});
+    summarized.disposition = "summarized";
+    const currentDiff = "diff --git a/current.txt b/current.txt\n--- a/current.txt\n+++ b/current.txt\n@@ -1,1 +1,1 @@\n-old\n+current";
+    const view = render(
+      <CodexStreamHighlights events={[summarized]} currentTurnDiff={currentDiff} />,
+    );
+    expect(view.container.querySelector("[data-testid='codex-diff-renderer']")).toBeTruthy();
+    expect(view.container.textContent).toContain("current.txt");
+  });
+
   it("parses a diff snapshot into files", () => {
     const source = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,1 +1,1 @@\n-old\n+new";
     expect(parseDiffSnapshot(source)).toStrictEqual(parseDiffSnapshot(source));
@@ -174,5 +185,14 @@ describe("codex stream renderers", () => {
     const renderedLines = view.container.querySelectorAll(".codex-stream-diff-line");
     expect(renderedLines.length).toBeGreaterThan(0);
     expect(renderedLines.length).toBeLessThan(200);
+  });
+
+  it("caps diff source bytes and file count before rendering", () => {
+    const source = Array.from({ length: 120 }, (_, index) => (
+      `diff --git a/file-${index}.txt b/file-${index}.txt\n--- a/file-${index}.txt\n+++ b/file-${index}.txt\n@@ -0,1 +0,1 @@\n+${"x".repeat(6_000)}`
+    )).join("\n");
+    const view = render(<CodexStreamHighlights events={[event("turn_diff_updated", 1, { diff: source })]} />);
+    expect(view.container.querySelectorAll(".codex-stream-diff-file").length).toBeLessThanOrEqual(100);
+    expect(view.getByTestId("codex-diff-omitted")).toBeTruthy();
   });
 });

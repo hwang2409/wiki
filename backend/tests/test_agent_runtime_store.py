@@ -596,6 +596,11 @@ class RunStoreTests(unittest.TestCase):
 
             append("turn/started", {"turn": {"id": "turn-1"}}, "turn_started")
             append("turn/diff/updated", {"diff": "diff one"}, "turn_diff_updated")
+            self.assertNotIn("diff one", store.run_path(record.run_id).read_text())
+            self.assertEqual(
+                json.loads(store.current_turn_diff_path(record.run_id).read_text()),
+                {"diff": "diff one"},
+            )
             for index in range(51):
                 append("warning", {"message": f"event {index}"}, "warning")
 
@@ -618,6 +623,39 @@ class RunStoreTests(unittest.TestCase):
                 restarted.current_turn_diff(record.run_id),
                 {"turn_id": "turn-2", "seq": 55, "diff": "diff two"},
             )
+
+    def test_current_turn_diff_sidecar_is_not_rewritten_for_unrelated_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(_paths(root))
+            record = store.create(_record(root))
+
+            def append(method: str, params: dict[str, Any], kind: str) -> None:
+                payload = {"method": method, "params": params}
+                raw = store.append_raw(
+                    record.run_id,
+                    provider="codex",
+                    direction="server",
+                    payload=payload,
+                )
+                store.append_normalized(
+                    record.run_id,
+                    raw_seq=raw["seq"],
+                    disposition=EventDisposition.RENDERED,
+                    kind=kind,
+                    payload=payload,
+                )
+
+            with mock.patch.object(
+                store,
+                "_write_current_turn_diff_snapshot",
+                wraps=store._write_current_turn_diff_snapshot,
+            ) as write_snapshot:
+                append("turn/started", {"turn": {"id": "turn-1"}}, "turn_started")
+                append("turn/diff/updated", {"diff": "large diff"}, "turn_diff_updated")
+                for index in range(200):
+                    append("warning", {"message": str(index)}, "warning")
+            self.assertEqual(write_snapshot.call_count, 2)
 
     def test_pending_user_message_matching_is_durable_and_fifo_safe(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
