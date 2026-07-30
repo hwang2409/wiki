@@ -2,10 +2,14 @@ import { useEffect, useState } from "react";
 import type { CSSProperties } from "react";
 import { ArtifactLightbox } from "./artifact-detail/lightbox";
 
-const vaultImagePattern = /\.(?:png|jpe?g|gif|webp|svg)$/i;
+const vaultImageExtension = /\.(?:png|jpe?g|gif|webp|svg)$/i;
 
+// Raw-string variant kept for callers that hand us un-split values (the
+// Obsidian wikilink resolver in markdown.tsx). Splits on the LITERAL query
+// / fragment delimiter first — see assetCandidates for the decode-safe
+// path used on markdown image destinations.
 export function isVaultImagePath(value: string) {
-  return vaultImagePattern.test(value.split(/[?#]/, 1)[0]);
+  return vaultImageExtension.test(value.split(/[?#]/, 1)[0]);
 }
 
 function decodeAssetPath(value: string) {
@@ -37,9 +41,19 @@ function vaultAssetUrl(path: string) {
 
 function assetCandidates(src: string, notePath?: string) {
   if (/^[a-z][a-z\d+.-]*:/i.test(src) || src.startsWith("//")) return [];
-  const decoded = decodeAssetPath(src.split(/[?#]/, 1)[0]);
+  // Split on the LITERAL query / fragment delimiters FIRST — mirrors the
+  // backend's `_extract_note_image_paths.note_relative`. Decoding before
+  // splitting would treat `hero%23draft.png` and `hero%3Fdraft.png` as
+  // if they carried real `#` / `?` delimiters and silently drop the
+  // filename tail; the backend would still ship metadata for those
+  // files and the tile would sit forever in shimmer.
+  const withoutQuery = src.split(/[?#]/, 1)[0];
+  const decoded = decodeAssetPath(withoutQuery);
   if (decoded.includes("\0") || decoded.startsWith("/")) return [];
-  if (!isVaultImagePath(decoded)) return [];
+  // Check the extension directly on the decoded name — do NOT re-split
+  // on `?`/`#`; any such characters here came from percent-encoded input
+  // and are part of the filename.
+  if (!vaultImageExtension.test(decoded)) return [];
   const rootPath = normalizeAssetPath(decoded);
   const notePathCandidate = notePath
     ? normalizeAssetPath(decoded, notePath.split("/").slice(0, -1))

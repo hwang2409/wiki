@@ -269,6 +269,71 @@ async function scenarioPreviewFadeOpacity(browser, backend) {
   }
 }
 
+async function scenarioEncodedDelimiters(browser, backend) {
+  // End-to-end proof that filenames containing percent-encoded `#` and `?`
+  // ride through the backend note-metadata pass AND the frontend resolver
+  // without either side truncating them. The buggy resolver would strip
+  // the tail after decode, produce no vault candidate, and leave the
+  // frame stuck in shimmer.
+  const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+  try {
+    await page.addInitScript(() => {
+      localStorage.setItem(
+        "wiki-window-layout-v2",
+        JSON.stringify({
+          version: 2,
+          activeWindowId: "window-0",
+          windows: [
+            {
+              id: "window-0",
+              focusedPaneId: "pane-1",
+              layout: { kind: "pane", id: "pane-1", path: "note-encoded.md" },
+            },
+          ],
+        }),
+      );
+    });
+    await page.goto(`${backend.baseUrl}/#/note/note-encoded.md`, { waitUntil: "domcontentloaded" });
+    await page.waitForSelector(".markdown-preview-view");
+    const frames = page.locator(".markdown-image-frame");
+    await frames.first().waitFor({ state: "visible", timeout: 5000 });
+    const count = await frames.count();
+    assert(count === 2, `expected 2 image frames, got ${count}`);
+
+    for (const [index, expected] of [
+      [0, "/api/vault/assets/hero%23draft.png"],
+      [1, "/api/vault/assets/hero%3Fdraft.png"],
+    ]) {
+      const frame = frames.nth(index);
+      const img = frame.locator("img[decoding='async']");
+      const src = await img.getAttribute("src");
+      assert(
+        src === expected,
+        `frame ${index} resolved to ${src}, expected ${expected}`,
+      );
+      // The dimensions from the note.asset_meta payload must be on the img
+      // (proving the resolver + backend both round-tripped the literal `#`
+      // / `?` in the filename).
+      const width = await img.getAttribute("width");
+      const height = await img.getAttribute("height");
+      assert(width && Number(width) > 0, `frame ${index} lost width`);
+      assert(height && Number(height) > 0, `frame ${index} lost height`);
+      const hasKnownRatio = await frame.evaluate((node) => node.className.includes("has-known-ratio"));
+      assert(hasKnownRatio, `frame ${index} did not receive has-known-ratio (metadata got dropped)`);
+      // Wait for the sharp image to finish loading — proves the encoded
+      // URL is actually served by the backend, not just a valid string.
+      await img.evaluate((node) => new Promise((resolve, reject) => {
+        if (node.complete && node.naturalWidth > 0) return resolve();
+        node.addEventListener("load", () => resolve(), { once: true });
+        node.addEventListener("error", () => reject(new Error("image failed to load")), { once: true });
+      }));
+    }
+    console.error("[wiki-189-cls] encoded-delimiter scenario: %23 and %3F filenames served + rendered");
+  } finally {
+    await page.close();
+  }
+}
+
 async function main() {
   const fixtures = makeFixtureRoot("wiki-189-cls-");
   const vault = path.join(fixtures.root, "vault");
@@ -277,6 +342,10 @@ async function main() {
   // Big enough that the backend's preview generator emits a base64 preview
   // (>24px long side) so the fade path actually renders.
   await fs.writeFile(path.join(vault, "big.png"), greyPng(640, 400));
+  // Literal `#` and `?` in filenames — the same filenames the backend +
+  // frontend delimiter fixture tests round-trip.
+  await fs.writeFile(path.join(vault, "hero#draft.png"), greyPng(320, 200));
+  await fs.writeFile(path.join(vault, "hero?draft.png"), greyPng(320, 200));
   await fs.writeFile(
     path.join(vault, "note.md"),
     ["# CLS fixture", "", "![hero](hero.png)", ""].join("\n"),
@@ -285,6 +354,18 @@ async function main() {
   await fs.writeFile(
     path.join(vault, "note-big.md"),
     ["# Fade fixture", "", "![big](big.png)", ""].join("\n"),
+    "utf-8",
+  );
+  await fs.writeFile(
+    path.join(vault, "note-encoded.md"),
+    [
+      "# Encoded delimiter fixture",
+      "",
+      "![hash](hero%23draft.png)",
+      "",
+      "![question](hero%3Fdraft.png)",
+      "",
+    ].join("\n"),
     "utf-8",
   );
   writeRegistry(fixtures.registryPath, []);
@@ -296,6 +377,7 @@ async function main() {
     await scenarioPreloadedMeta(browser, backend);
     await scenarioMetadataAfterImage(browser, backend);
     await scenarioPreviewFadeOpacity(browser, backend);
+    await scenarioEncodedDelimiters(browser, backend);
   } finally {
     await browser.close();
     await backend.stop();

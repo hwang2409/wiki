@@ -573,6 +573,54 @@ describe("MarkdownImage layout stability (WIKI-201)", () => {
   });
 });
 
+describe("MarkdownImage percent-encoded delimiter round-trip", () => {
+  test("hero%23draft.png resolves to /api/vault/assets/hero%23draft.png without shimmer", async () => {
+    const { MarkdownImage, seedAssetMetaCache } = await import("../src/markdown-image");
+    seedAssetMetaCache({
+      "hero#draft.png": { width: 800, height: 600, preview_base64: null },
+    });
+    const { container } = render(
+      <MarkdownImage src="hero%23draft.png" alt="hash" notePath="index.md" />,
+    );
+    // The RAW image element must render — no fallback to shimmer, no
+    // stuck-in-loading state — with a URL that re-encodes the literal `#`
+    // as `%23` so the backend's `_read_vault_asset_bytes` sees the real
+    // filename on disk.
+    const img = container.querySelector("img[decoding='async']") as HTMLImageElement | null;
+    expect(img).not.toBeNull();
+    expect(img!.getAttribute("src")).toBe("/api/vault/assets/hero%23draft.png");
+    // Dimensions from the cache flow through onto the frame + img, proving
+    // the resolver did not silently reject the filename.
+    expect(img!.getAttribute("width")).toBe("800");
+    expect(img!.getAttribute("height")).toBe("600");
+    const frame = container.querySelector(".markdown-image-frame") as HTMLElement;
+    expect(frame.style.aspectRatio).toBe("800 / 600");
+    // The frame carries has-known-ratio from the seeded cache — the
+    // has-known-ratio class is the signal that the resolver produced a
+    // vault candidate; the buggy path would have rejected the filename
+    // and left the frame in its unlocked min-height state.
+    expect(frame.className).toContain("has-known-ratio");
+  });
+
+  test("hero%3Fdraft.png resolves to /api/vault/assets/hero%3Fdraft.png without shimmer", async () => {
+    const { MarkdownImage, seedAssetMetaCache } = await import("../src/markdown-image");
+    seedAssetMetaCache({
+      "hero?draft.png": { width: 640, height: 480, preview_base64: null },
+    });
+    const { container } = render(
+      <MarkdownImage src="hero%3Fdraft.png" alt="question" notePath="index.md" />,
+    );
+    const img = container.querySelector("img[decoding='async']") as HTMLImageElement | null;
+    expect(img).not.toBeNull();
+    expect(img!.getAttribute("src")).toBe("/api/vault/assets/hero%3Fdraft.png");
+    expect(img!.getAttribute("width")).toBe("640");
+    expect(img!.getAttribute("height")).toBe("480");
+    const frame = container.querySelector(".markdown-image-frame") as HTMLElement;
+    expect(frame.style.aspectRatio).toBe("640 / 480");
+    expect(frame.className).toContain("has-known-ratio");
+  });
+});
+
 describe("gallery tile ratio lock (WIKI-192)", () => {
   test("tile ratio does not swap when metadata arrives after mount", async () => {
     // Give the batch endpoint a 60ms round-trip delay so the tile lives in
