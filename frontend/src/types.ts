@@ -8,8 +8,16 @@ export interface NoteSummary {
   meta_updated?: string | null;
 }
 
+export interface AssetMeta {
+  width: number;
+  height: number;
+  media_type: string;
+  preview_base64?: string | null;
+}
+
 export interface Note extends NoteSummary {
   content: string;
+  asset_meta?: Record<string, AssetMeta>;
 }
 
 export interface NoteDraft {
