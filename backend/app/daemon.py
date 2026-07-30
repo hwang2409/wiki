@@ -216,9 +216,14 @@ def _capture_plist(path: Path) -> tuple[bytes, int] | None:
 def _restore_plist(config: DaemonConfig, backup: tuple[bytes, int] | None) -> None:
     if backup is None:
         config.plist_path.unlink(missing_ok=True)
+        if config.plist_path.exists():
+            raise DaemonError(f"{config.plist_path} still exists after rollback")
         return
     content, mode = backup
     _write_atomic(config.plist_path, content, mode)
+    restored = _capture_plist(config.plist_path)
+    if restored != backup:
+        raise DaemonError(f"{config.plist_path} does not match its rollback copy")
 
 
 def _launchctl(config: DaemonConfig, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -301,11 +306,13 @@ def _rollback_install(
             _unload_and_verify_absent(config)
         except DaemonError as error:
             errors.append(f"cleanup failed: {error}")
+    plist_restored = False
     try:
         _restore_plist(config, backup)
-    except OSError as error:
+        plist_restored = True
+    except Exception as error:
         errors.append(f"plist rollback failed: {error}")
-    if backup is not None and was_loaded:
+    if plist_restored and backup is not None and was_loaded:
         try:
             _restore_prior_service(config, was_loaded)
         except DaemonError as error:
