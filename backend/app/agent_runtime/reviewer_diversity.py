@@ -80,6 +80,10 @@ def _finding_id(finding: Mapping[str, Any], sha: str) -> str:
     return "F-" + hashlib.sha256(material.encode()).hexdigest()[:6]
 
 
+def _finding_sort_key(finding: Mapping[str, Any]) -> str:
+    return json.dumps(dict(finding), sort_keys=True, separators=(",", ":"), default=str)
+
+
 def _schema_finding(raw: Mapping[str, Any], *, lens: str, reviewer: str, sha: str, created_at: str) -> dict[str, Any]:
     severity = str(raw.get("severity") or "MEDIUM").upper()
     if severity not in _SEVERITY_RANK:
@@ -136,14 +140,14 @@ def synthesize_diverse_verdicts(
         source_sha = str(value.get("source_sha") or value.get("sha") or "").lower()
         if source_sha != expected_sha:
             clean = False
-        if str(value.get("state") or "").upper() != "MERGE-READY" or list(value.get("findings") or []):
-            clean = False
-        reviewer = str(value.get("worker") or f"{ticket.upper()}-REVIEW{round_number}-{lens}")
         findings = value.get("findings")
         if not isinstance(findings, list):
             clean = False
             continue
-        for raw in findings:
+        if str(value.get("state") or "").upper() != "MERGE-READY" or findings:
+            clean = False
+        reviewer = str(value.get("worker") or f"{ticket.upper()}-REVIEW{round_number}-{lens}")
+        for raw in sorted(findings, key=lambda item: _finding_sort_key(item) if isinstance(item, Mapping) else repr(item)):
             if not isinstance(raw, Mapping):
                 clean = False
                 continue

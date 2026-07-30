@@ -41,6 +41,29 @@ class NextReviewTests(unittest.TestCase):
         self.runtime_patch.stop()
         self.runtime_tmp.cleanup()
 
+    def test_default_prompt_is_byte_stable(self) -> None:
+        expected = """review PR #151 for WIKI-181.
+
+reviewer: WIKI-181-REVIEW1
+round: 1
+pinned sha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+prior reviewer: none (first review round)
+
+inspect the pinned worktree, identify actionable correctness, security, reliability,
+and test issues, and report findings with file and line references. if the diff is
+clean, report that explicitly. follow the repository review protocol and do not
+modify the worktree. after the review, write the complete structured verdict to
+/tmp/WIKI-181-REVIEW1-verdict.json. use state, source_sha, and findings fields;
+each finding must include severity, path, line, problem, and fix.
+"""
+        self.assertEqual(
+            next_review_module._default_prompt(
+                ticket="WIKI-181", reviewer_id="WIKI-181-REVIEW1", pr_number=151,
+                expected_sha="a" * 40, round_number=1, previous_reviewer=None,
+            ),
+            expected,
+        )
+
     def test_happy_path_increments_round_spawns_and_archives_previous(self) -> None:
         calls: list[tuple[str, object]] = []
 
@@ -603,6 +626,70 @@ class NextReviewTests(unittest.TestCase):
         self.assertEqual(missing["state"], "NOT-MERGE-READY")
         self.assertEqual(stale["state"], "NOT-MERGE-READY")
 
+    def test_synthesis_marks_non_iterable_findings_dirty(self) -> None:
+        result = synthesize_diverse_verdicts(
+            "WIKI-181",
+            "f" * 40,
+            {
+                "correctness": {
+                    "state": "MERGE-READY",
+                    "source_sha": "f" * 40,
+                    "findings": {"unexpected": "mapping"},
+                }
+            },
+            expected_lenses=["correctness"],
+        )
+        self.assertEqual(result["state"], "NOT-MERGE-READY")
+
+    def test_collector_duplicate_is_idempotent_but_conflicts_are_rejected(self) -> None:
+        next_review_module.next_review(
+            "WIKI-181", 181, "4" * 40, orch="wiki", diversity=["correctness", "security"],
+            gate=lambda _pr, _sha: {"verdict": "pass"}, resolve_root=lambda _orch: Path("/repo"),
+            worktree=lambda **kwargs: Path(f"/repo/{kwargs['lens']}"),
+            spawn=lambda request: {"run_id": request.ticket}, archived=lambda: [], registry=lambda: {},
+            request_id="collector-duplicates",
+        )
+        calls: list[dict] = []
+        report = {
+            "worker": "WIKI-181-REVIEW1-correctness",
+            "state": "MERGE-READY",
+            "source_sha": "4" * 40,
+            "findings": [],
+        }
+        first = collect_diversity_verdict(
+            runtime_dir=Path(self.runtime_tmp.name), ticket="WIKI-181",
+            reviewer=report["worker"], verdict=report, record_verdict=lambda **kwargs: calls.append(kwargs),
+        )
+        duplicate = collect_diversity_verdict(
+            runtime_dir=Path(self.runtime_tmp.name), ticket="WIKI-181",
+            reviewer=report["worker"], verdict=dict(report), record_verdict=lambda **kwargs: calls.append(kwargs),
+        )
+        self.assertEqual(first["status"], "pending")
+        self.assertEqual(duplicate["status"], "pending")
+        with self.assertRaisesRegex(RuntimeError, "conflicting duplicate"):
+            collect_diversity_verdict(
+                runtime_dir=Path(self.runtime_tmp.name), ticket="WIKI-181",
+                reviewer=report["worker"],
+                verdict={**report, "state": "NOT-MERGE-READY"},
+                record_verdict=lambda **kwargs: calls.append(kwargs),
+            )
+        security = {
+            "worker": "WIKI-181-REVIEW1-security",
+            "state": "MERGE-READY",
+            "source_sha": "4" * 40,
+            "findings": [],
+        }
+        complete = collect_diversity_verdict(
+            runtime_dir=Path(self.runtime_tmp.name), ticket="WIKI-181",
+            reviewer=security["worker"], verdict=security, record_verdict=lambda **kwargs: calls.append(kwargs),
+        )
+        again = collect_diversity_verdict(
+            runtime_dir=Path(self.runtime_tmp.name), ticket="WIKI-181",
+            reviewer=security["worker"], verdict=dict(security), record_verdict=lambda **kwargs: calls.append(kwargs),
+        )
+        self.assertEqual(complete["state"], "MERGE-READY")
+        self.assertEqual(again, complete)
+
     def test_synthesis_is_byte_stable_and_different_lines_do_not_dedupe(self) -> None:
         verdicts = {
             "correctness": {
@@ -645,6 +732,13 @@ class NextReviewTests(unittest.TestCase):
                     "worktree": "/repo", "request_id": "graph-spawn",
                 }, orch="wiki", status_dir=status_dir, snapshot_dir=snapshot_dir,
             )
+            for lens in ("correctness", "security"):
+                workgraph.append_edge(
+                    "WIKI-181", "spawn", "WIKI-181", f"WIKI-181-REVIEW1-{lens}", {
+                        "ticket": f"WIKI-181-REVIEW1-{lens}", "role": "review", "model": "test",
+                        "worktree": f"/repo/{lens}", "request_id": f"graph-spawn:{lens}",
+                    }, orch="wiki", status_dir=status_dir, snapshot_dir=snapshot_dir,
+                )
             for call in calls:
                 workgraph.append_edge(
                     "WIKI-181", "verdict", call["reviewer"], "orch:wiki", call["payload"],

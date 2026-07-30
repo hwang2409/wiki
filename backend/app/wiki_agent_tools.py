@@ -415,6 +415,7 @@ def next_review(arguments: Any) -> dict[str, Any]:
             "reviewer_effort",
             "prompt_template",
             "request_id",
+            "diversity",
         },
     )
     reviewer_kind = values.setdefault("reviewer_kind", "cdx")

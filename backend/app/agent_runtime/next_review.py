@@ -10,15 +10,13 @@ from __future__ import annotations
 import re
 import threading
 import json
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Callable, Mapping
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 from uuid import uuid4
 
 from .ticket import parse_reviewer_id, reviewer_id as canonical_reviewer_id
-from .diversity_orchestration import create_journal
+from .diversity_orchestration import create_journal, run_diverse_review
 from .reviewer_diversity import (
     DEFAULT_DIVERSITY_LENSES,
     LENS_PROMPTS,
@@ -219,10 +217,10 @@ def _default_prompt(
     lens: str | None = None,
 ) -> str:
     prior = previous_reviewer or "none (first review round)"
-    prompt = f"""review PR #{pr_number} for {ticket}.
+    if lens is None:
+        return f"""review PR #{pr_number} for {ticket}.
 
 reviewer: {reviewer_id}
-lens: {lens or 'standard'}
 round: {round_number}
 pinned sha: {expected_sha}
 prior reviewer: {prior}
@@ -230,15 +228,26 @@ prior reviewer: {prior}
 inspect the pinned worktree, identify actionable correctness, security, reliability,
 and test issues, and report findings with file and line references. if the diff is
 clean, report that explicitly. follow the repository review protocol and do not
-modify the worktree. first verify PR headRefOid and git rev-parse HEAD match the
-pinned sha. if either check fails, stop with INSUFFICIENT-CONTEXT and STALE-SHA;
-do not review or report MERGE-READY. after the review, write the complete structured verdict to
+modify the worktree. after the review, write the complete structured verdict to
 /tmp/{reviewer_id}-verdict.json. use state, source_sha, and findings fields;
 each finding must include severity, path, line, problem, and fix.
 """
-    if lens:
-        return prompt + f"\n\nlens mandate: {LENS_PROMPTS[lens]}.\n"
-    return prompt
+    prompt = f"""review PR #{pr_number} for {ticket}.
+
+reviewer: {reviewer_id}
+lens: {lens}
+round: {round_number}
+pinned sha: {expected_sha}
+prior reviewer: {prior}
+
+inspect the pinned worktree, identify actionable correctness, security, reliability,
+and test issues, and report findings with file and line references. if the diff is
+clean, report that explicitly. follow the repository review protocol and do not
+modify the worktree. after the review, write the complete structured verdict to
+/tmp/{reviewer_id}-verdict.json. use state, source_sha, and findings fields;
+each finding must include severity, path, line, problem, and fix.
+"""
+    return prompt + f"\n\nreview contract: {REVIEW_CONTRACT}.\n\nlens mandate: {LENS_PROMPTS[lens]}.\n"
 
 
 def _build_prompt(
@@ -332,174 +341,6 @@ def _diverse_result(staged: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _next_review_diverse(
-    *,
-    staged: dict[str, Any] | None,
-    lenses: tuple[str, ...],
-    ticket: str,
-    pr_number: int,
-    expected_sha: str,
-    reviewer_kind: str,
-    reviewer_model: str,
-    reviewer_effort: str | None,
-    prompt_template: str | None,
-    request_id: str,
-    orch: str,
-    main: Any,
-    gate: Callable[[int, str], Mapping[str, Any]] | None,
-    resolve_root: Callable[[str], Path] | None,
-    worktree: Callable[..., Path] | None,
-    spawn: Callable[..., Mapping[str, Any]] | None,
-    archive: Callable[[str], Mapping[str, Any]] | None,
-    archived: Callable[[], list[Mapping[str, Any]]] | None,
-    registry: Callable[[], Mapping[str, Any]] | None,
-    status_reader: Callable[[str], Mapping[str, Any] | None] | None,
-) -> dict[str, Any]:
-    if staged is None:
-        try:
-            verdict = gate(pr_number, expected_sha) if gate is not None else main.composer_gate(
-                main.ComposerGateIn(pr=str(pr_number), expect_sha=expected_sha)
-            )
-        except Exception as exc:
-            return {"status": "gate_failed", "detail": str(exc)}
-        if not isinstance(verdict, Mapping) or (
-            verdict.get("verdict") != "pass" and verdict.get("ready") is not True
-        ):
-            detail = verdict.get("summary") if isinstance(verdict, Mapping) else "gate returned an invalid verdict"
-            return {"status": "gate_failed", "detail": str(detail or "merge-ready gate failed")}
-        archived_rows = list(archived()) if archived is not None else list(main.list_archived(limit=None))
-        registry_data = dict((registry or main._read_agent_registry)())  # noqa: SLF001
-        round_number = _next_round(ticket, archived_rows, registry_data)
-        prior = _previous_terminal_reviewers(ticket, round_number, registry_data, status_reader)
-        repo_root = (resolve_root or _resolve_root)(orch)
-        reviewers: dict[str, dict[str, Any]] = {}
-        for lens in lenses:
-            reviewer_id = canonical_reviewer_id(ticket, round_number, lens)
-            reviewers[lens] = {
-                "reviewer": reviewer_id,
-                "worktree": str(
-                    (repo_root / ".codex" / "worktrees" / f"{ticket.lower()}-review{round_number}-{lens}").resolve()
-                ),
-                "prompt": _build_prompt(
-                    prompt_template,
-                    ticket=ticket.upper(),
-                    reviewer_id=reviewer_id,
-                    pr_number=pr_number,
-                    expected_sha=expected_sha,
-                    round_number=round_number,
-                    previous_reviewer=prior[0] if prior else None,
-                    lens=lens,
-                ),
-                "worktree_provisioned": False,
-                "spawn_completed": False,
-                "run_id": None,
-            }
-        staged = {
-            "status": "staged",
-            "diversity": True,
-            "ticket": ticket.upper(),
-            "round": round_number,
-            "lenses": list(lenses),
-            "reviewers": reviewers,
-            "previous_reviewers": prior,
-            "archives": {reviewer: False for reviewer in prior},
-            "repo_root": str(repo_root),
-            "expected_sha": expected_sha,
-            "orch": orch,
-            "request_id": request_id,
-            "reviewer_kind": reviewer_kind,
-            "reviewer_model": reviewer_model,
-            "reviewer_effort": reviewer_effort,
-            "synthesis_created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        }
-        _REQUEST_STAGES[request_id] = staged
-        _persist_request_state()
-
-    # Each lens has its own pinned worktree. The intent is persisted before
-    # provisioning, so a crash resumes from the exact lens boundary.
-    for lens in staged["lenses"]:
-        details = staged["reviewers"][lens]
-        if details.get("worktree_provisioned"):
-            continue
-        _persist_request_state()
-        path = _diverse_worktree(
-            repo_root=Path(staged["repo_root"]),
-            ticket=staged["ticket"],
-            round_number=int(staged["round"]),
-            lens=lens,
-            expected_sha=staged["expected_sha"],
-            worktree=worktree,
-        )
-        details["worktree"] = str(path)
-        details["worktree_provisioned"] = True
-        _persist_request_state()
-
-    pending = [lens for lens in staged["lenses"] if not staged["reviewers"][lens].get("spawn_completed")]
-
-    def spawn_one(lens: str) -> tuple[str, Mapping[str, Any]]:
-        details = staged["reviewers"][lens]
-        spawn_args = main.SpawnWorkerIn(
-            ticket=details["reviewer"],
-            kind=staged["reviewer_kind"],
-            role="review",
-            model=staged["reviewer_model"],
-            effort=staged["reviewer_effort"],
-            workdir=details["worktree"],
-            prompt=details["prompt"],
-            orch=staged["orch"],
-            request_id=f"{staged['request_id']}:{lens}",
-        )
-        result = spawn(spawn_args) if spawn is not None else main.spawn_agent(spawn_args)
-        return lens, result
-
-    # Spawn calls are concurrent. Durable per-lens completion records make a
-    # partial fan-out retry safe with supervisor request-id idempotency.
-    with ThreadPoolExecutor(max_workers=len(pending) or 1) as executor:
-        futures = [executor.submit(spawn_one, lens) for lens in pending]
-        errors: list[Exception] = []
-        for future in as_completed(futures):
-            try:
-                lens, result = future.result()
-            except Exception as exc:
-                errors.append(exc)
-                continue
-            staged["reviewers"][lens]["run_id"] = result.get("run_id")
-            staged["reviewers"][lens]["spawn_completed"] = True
-            _persist_request_state()
-        if errors:
-            raise errors[0]
-
-    for reviewer in staged["previous_reviewers"]:
-        if staged["archives"].get(reviewer):
-            continue
-        if _is_archived(reviewer, archived=archived, main=main):
-            staged["archives"][reviewer] = True
-            _persist_request_state()
-            continue
-        archive_result = archive(reviewer) if archive is not None else main.archive_agent(
-            reviewer, main.AgentArchiveIn(outcome="closed")
-        )
-        staged["archives"][reviewer] = {"result": dict(archive_result)}
-        _persist_request_state()
-
-    create_journal(
-        main.AGENT_RUNTIME_DIR,
-        ticket=staged["ticket"],
-        round_number=int(staged["round"]),
-        expected_sha=staged["expected_sha"],
-        expected_lenses=staged["lenses"],
-        reviewers={lens: details["reviewer"] for lens, details in staged["reviewers"].items()},
-        orch=staged["orch"],
-        created_at=staged["synthesis_created_at"],
-    )
-
-    result = _diverse_result(staged)
-    _REQUEST_STAGES.pop(request_id, None)
-    _REQUEST_RESULTS[request_id] = dict(result)
-    _persist_request_state()
-    return result
-
-
 def next_review(
     ticket: str,
     pr_number: int,
@@ -556,7 +397,8 @@ def next_review(
         main = _main()
         staged = _REQUEST_STAGES.get(request_id)
         if diversity_lenses or (staged is not None and staged.get("diversity")):
-            return _next_review_diverse(
+            return run_diverse_review(
+                runtime=__import__(__name__, fromlist=["run_diverse_review"]),
                 staged=staged if staged is not None and staged.get("diversity") else None,
                 lenses=tuple(staged.get("lenses", ())) if staged is not None and staged.get("diversity") else diversity_lenses,
                 ticket=ticket,
