@@ -6,12 +6,14 @@ import shutil
 import struct
 import subprocess
 import tempfile
+import time
 import tracemalloc
 import unittest
 from pathlib import Path
 
 from backend.app import media_scrub
 from backend.app.media_scrub import gif as gif_scrubber
+from backend.app.media_scrub import _h264 as h264_scrubber
 from backend.app.media_scrub import mp4 as mp4_scrubber
 
 
@@ -1932,12 +1934,14 @@ class Mp4Round9SurvivorProbes(unittest.TestCase):
         else:
             ctts_size = struct.unpack(">I", real[ctts_pos - 4:ctts_pos])[0]
             insert_before = ctts_pos - 4
+        stsz_pos = real.find(b"stsz")
+        sample_count = struct.unpack(">I", real[stsz_pos + 12:stsz_pos + 16])[0]
         # v1 header: 0x01 version, zero flags, entry_count=1
-        # entry: sample_count=1 (u32), sample_offset=-42 (i32)
+        # entry: all samples in one run, sample_offset=-42 (i32)
         v1_body = (
             bytes([1, 0, 0, 0])
             + struct.pack(">I", 1)
-            + struct.pack(">I", 1)
+            + struct.pack(">I", sample_count)
             + struct.pack(">i", -42)
         )
         new_ctts = struct.pack(">I", 8 + len(v1_body)) + b"ctts" + v1_body
@@ -1965,7 +1969,7 @@ class Mp4Round9SurvivorProbes(unittest.TestCase):
             b"ctts"
             + bytes([1, 0, 0, 0])
             + struct.pack(">I", 1)
-            + struct.pack(">I", 1)
+            + struct.pack(">I", sample_count)
             + struct.pack(">i", -42)
         )
         self.assertIn(expected_ctts, result.data)
@@ -3133,6 +3137,158 @@ class Review18MediaProbeTests(unittest.TestCase):
         result = media_scrub.scrub_video(payload, "video/mp4")
         self.assertNotIn(extra_body, result.data)
         self.assertEqual(result.data[-len(extra_body):], b"\x00" * len(extra_body))
+
+
+class Review20MediaProbeTests(unittest.TestCase):
+    @staticmethod
+    def _oversized_sps() -> bytes:
+        writer = h264_scrubber._BitWriter()
+        writer.write_bits(100, 8)  # profile_idc, matching the fixture avcC
+        writer.write_bits(0, 8)  # constraint flags + reserved bits
+        writer.write_bits(10, 8)  # level_idc, matching the fixture avcC
+        writer.write_ue(0)  # seq_parameter_set_id
+        writer.write_ue(1)  # chroma_format_idc = 1
+        writer.write_ue(0)  # bit_depth_luma_minus8
+        writer.write_ue(0)  # bit_depth_chroma_minus8
+        writer.write_u1(0)  # qpprime_y_zero_transform_bypass_flag
+        writer.write_u1(0)  # seq_scaling_matrix_present_flag
+        writer.write_ue(0)  # log2_max_frame_num_minus4
+        writer.write_ue(0)  # pic_order_cnt_type
+        writer.write_ue(0)  # log2_max_pic_order_cnt_lsb_minus4
+        writer.write_ue(0)  # max_num_ref_frames
+        writer.write_u1(0)  # gaps_in_frame_num_value_allowed_flag
+        writer.write_ue(65535)  # pic_width_in_mbs_minus1
+        writer.write_ue(65535)  # pic_height_in_map_units_minus1
+        writer.write_u1(1)  # frame_mbs_only_flag
+        writer.write_u1(1)  # direct_8x8_inference_flag
+        writer.write_u1(0)  # frame_cropping_flag
+        writer.write_u1(0)  # vui_parameters_present_flag
+        writer.write_rbsp_trailing_bits()
+        return b"\x67" + h264_scrubber._rbsp_escape(writer.to_bytes())
+
+    @staticmethod
+    def _replace_sps(real: bytes, sps: bytes) -> bytes:
+        avcc_pos = real.find(b"avcC")
+        assert avcc_pos > 0
+        atom_start = avcc_pos - 4
+        old_size = struct.unpack(">I", real[atom_start:avcc_pos])[0]
+        body_start = avcc_pos + 4
+        old_sps_len = struct.unpack(">H", real[body_start + 6:body_start + 8])[0]
+        after_sps = body_start + 8 + old_sps_len
+        body = bytearray(real[body_start:atom_start + old_size])
+        body[6:8] = struct.pack(">H", len(sps))
+        body[8:8 + old_sps_len] = sps
+        del body[8 + len(sps):8 + len(sps) + max(0, old_sps_len - len(sps))]
+        replacement = struct.pack(">I", 8 + len(body)) + b"avcC" + body
+        payload = bytearray(real)
+        payload[atom_start:atom_start + old_size] = replacement
+        delta = len(replacement) - old_size
+        for parent in (b"avc1", b"stsd", b"stbl", b"minf", b"mdia", b"trak", b"moov"):
+            pos = payload.rfind(parent, 0, atom_start)
+            existing = struct.unpack(">I", bytes(payload[pos - 4:pos]))[0]
+            payload[pos - 4:pos] = struct.pack(">I", existing + delta)
+        if delta:
+            stco_pos = payload.find(b"stco")
+            count = struct.unpack(">I", bytes(payload[stco_pos + 8:stco_pos + 12]))[0]
+            for index in range(count):
+                value_pos = stco_pos + 12 + index * 4
+                value = struct.unpack(">I", bytes(payload[value_pos:value_pos + 4]))[0]
+                payload[value_pos:value_pos + 4] = struct.pack(">I", value + delta)
+        return bytes(payload)
+
+    def test_oversized_sps_is_rejected_before_decode(self) -> None:
+        payload = self._replace_sps(REAL_MP4.read_bytes(), self._oversized_sps())
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "SPS coded dimensions"):
+            media_scrub.scrub_video(payload, "video/mp4")
+
+    @staticmethod
+    def _remove_video_stts(real: bytes) -> bytes:
+        payload = bytearray(real)
+        stts_pos = payload.find(b"stts")
+        assert stts_pos > 0
+        stts_start = stts_pos - 4
+        stts_size = struct.unpack(">I", payload[stts_start:stts_pos])[0]
+        del payload[stts_start:stts_start + stts_size]
+        for parent in (b"stbl", b"minf", b"mdia", b"trak", b"moov"):
+            pos = payload.rfind(parent, 0, stts_start)
+            old_size = struct.unpack(">I", payload[pos - 4:pos])[0]
+            payload[pos - 4:pos] = struct.pack(">I", old_size - stts_size)
+        for track in Review17MediaProbeTests._track_info(payload):
+            stco_body = int(track["stco_body"])
+            count = struct.unpack(">I", payload[stco_body + 4:stco_body + 8])[0]
+            for index in range(count):
+                value_pos = stco_body + 8 + index * 4
+                value = struct.unpack(">I", payload[value_pos:value_pos + 4])[0]
+                payload[value_pos:value_pos + 4] = struct.pack(">I", value - stts_size)
+        return bytes(payload)
+
+    def test_missing_stts_is_rejected(self) -> None:
+        payload = self._remove_video_stts(REAL_MP4.read_bytes())
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "exactly one stts"):
+            media_scrub.scrub_video(payload, "video/mp4")
+
+    @staticmethod
+    def _many_mdat_uniform_fixture(
+        sample_count: int = 100_000, extra_mdat_count: int = 2_000,
+    ) -> bytes:
+        payload = bytearray(REAL_MP4.read_bytes())
+        stsz_pos = payload.find(b"stsz")
+        old_stsz_start = stsz_pos - 4
+        old_stsz_size = struct.unpack(">I", payload[old_stsz_start:stsz_pos])[0]
+        stsz_body = b"\x00\x00\x00\x00" + struct.pack(">II", 6, sample_count)
+        replacement = struct.pack(">I", 8 + len(stsz_body)) + b"stsz" + stsz_body
+        payload[old_stsz_start:old_stsz_start + old_stsz_size] = replacement
+        delta = len(replacement) - old_stsz_size
+        for parent in (b"stbl", b"minf", b"mdia", b"trak", b"moov"):
+            pos = payload.rfind(parent, 0, old_stsz_start)
+            old_size = struct.unpack(">I", payload[pos - 4:pos])[0]
+            payload[pos - 4:pos] = struct.pack(">I", old_size + delta)
+        stts_pos = payload.find(b"stts")
+        payload[stts_pos + 12:stts_pos + 16] = struct.pack(">I", sample_count)
+        stsc_pos = payload.find(b"stsc")
+        payload[stsc_pos + 16:stsc_pos + 20] = struct.pack(">I", sample_count)
+        ctts_pos = payload.find(b"ctts")
+        if ctts_pos > 0:
+            ctts_start = ctts_pos - 4
+            old_ctts_size = struct.unpack(">I", payload[ctts_start:ctts_pos])[0]
+            ctts_body = (
+                b"\x00\x00\x00\x00" + struct.pack(">I", 1)
+                + struct.pack(">II", sample_count, 0)
+            )
+            replacement_ctts = (
+                struct.pack(">I", 8 + len(ctts_body)) + b"ctts" + ctts_body
+            )
+            payload[ctts_start:ctts_start + old_ctts_size] = replacement_ctts
+            ctts_delta = len(replacement_ctts) - old_ctts_size
+            for parent in (b"stbl", b"minf", b"mdia", b"trak", b"moov"):
+                pos = payload.rfind(parent, 0, ctts_start)
+                old_size = struct.unpack(">I", payload[pos - 4:pos])[0]
+                payload[pos - 4:pos] = struct.pack(">I", old_size + ctts_delta)
+        stco_pos = payload.find(b"stco")
+        old_offset = struct.unpack(">I", payload[stco_pos + 12:stco_pos + 16])[0]
+        payload[stco_pos + 12:stco_pos + 16] = struct.pack(
+            ">I", old_offset + delta + (ctts_delta if ctts_pos > 0 else 0),
+        )
+        mdat_pos = payload.find(b"mdat")
+        mdat_start = mdat_pos - 4
+        old_mdat_size = struct.unpack(">I", payload[mdat_start:mdat_pos])[0]
+        sample = b"\x00\x00\x00\x02\x06\x80"
+        mdat_body = sample * sample_count
+        replacement_mdat = struct.pack(">I", 8 + len(mdat_body)) + b"mdat" + mdat_body
+        payload[mdat_start:mdat_start + old_mdat_size] = replacement_mdat
+        extra = b"".join(
+            struct.pack(">I", 9) + b"mdat" + b"\x00"
+            for _ in range(extra_mdat_count)
+        )
+        return bytes(payload) + extra
+
+    def test_many_mdats_do_not_restart_large_sample_walk(self) -> None:
+        payload = self._many_mdat_uniform_fixture()
+        started = time.perf_counter()
+        result = media_scrub.scrub_video(payload, "video/mp4")
+        elapsed = time.perf_counter() - started
+        self.assertEqual(len(result.data), len(payload))
+        self.assertLess(elapsed, 8.0, f"scrub took {elapsed:.2f}s")
 
 
 if __name__ == "__main__":

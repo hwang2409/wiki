@@ -22,6 +22,10 @@ from __future__ import annotations
 from .base import MediaScrubError
 
 
+_H264_MAX_DIMENSION = 8192
+_H264_MAX_PIXELS = 16_777_216
+
+
 class _BitReader:
     __slots__ = ("_data", "_bit_pos", "_total_bits")
 
@@ -303,7 +307,7 @@ def _copy_vui_parameters(reader: _BitReader, writer: _BitWriter) -> None:
         writer.write_ue(reader.read_ue())  # max_dec_frame_buffering
 
 
-def _parse_and_emit_sps_rbsp(rbsp: bytes) -> tuple[bytes, int]:
+def _parse_and_emit_sps_rbsp(rbsp: bytes) -> tuple[bytes, int, tuple[int, int]]:
     reader = _BitReader(rbsp)
     writer = _BitWriter()
 
@@ -322,6 +326,7 @@ def _parse_and_emit_sps_rbsp(rbsp: bytes) -> tuple[bytes, int]:
         raise MediaScrubError("h264 sps seq_parameter_set_id out of range")
     writer.write_ue(sps_id)
 
+    chroma_format_idc = 1
     if profile_idc in _HIGH_PROFILES:
         chroma_format_idc = reader.read_ue()
         if chroma_format_idc > 3:
@@ -368,20 +373,62 @@ def _parse_and_emit_sps_rbsp(rbsp: bytes) -> tuple[bytes, int]:
 
     writer.write_ue(reader.read_ue())  # max_num_ref_frames
     writer.write_u1(reader.read_u1())  # gaps_in_frame_num_value_allowed_flag
-    writer.write_ue(reader.read_ue())  # pic_width_in_mbs_minus1
-    writer.write_ue(reader.read_ue())  # pic_height_in_map_units_minus1
+    pic_width_in_mbs_minus1 = reader.read_ue()
+    pic_height_in_map_units_minus1 = reader.read_ue()
+    coded_width = (pic_width_in_mbs_minus1 + 1) * 16
+    coded_height_multiplier = 2
+    coded_height = (pic_height_in_map_units_minus1 + 1) * 16 * coded_height_multiplier
+    writer.write_ue(pic_width_in_mbs_minus1)
+    writer.write_ue(pic_height_in_map_units_minus1)
     frame_mbs_only_flag = reader.read_u1()
+    if frame_mbs_only_flag:
+        coded_height_multiplier = 1
+        coded_height = (pic_height_in_map_units_minus1 + 1) * 16
+    if (
+        coded_width > _H264_MAX_DIMENSION
+        or coded_height > _H264_MAX_DIMENSION
+        or coded_width * coded_height > _H264_MAX_PIXELS
+    ):
+        raise MediaScrubError("h264 SPS coded dimensions exceed scrubber limits")
     writer.write_u1(frame_mbs_only_flag)
     if not frame_mbs_only_flag:
         writer.write_u1(reader.read_u1())  # mb_adaptive_frame_field_flag
     writer.write_u1(reader.read_u1())  # direct_8x8_inference_flag
     frame_cropping_flag = reader.read_u1()
+    crop_left = crop_right = crop_top = crop_bottom = 0
     writer.write_u1(frame_cropping_flag)
     if frame_cropping_flag:
-        writer.write_ue(reader.read_ue())  # frame_crop_left_offset
-        writer.write_ue(reader.read_ue())  # frame_crop_right_offset
-        writer.write_ue(reader.read_ue())  # frame_crop_top_offset
-        writer.write_ue(reader.read_ue())  # frame_crop_bottom_offset
+        crop_left = reader.read_ue()
+        crop_right = reader.read_ue()
+        crop_top = reader.read_ue()
+        crop_bottom = reader.read_ue()
+        writer.write_ue(crop_left)
+        writer.write_ue(crop_right)
+        writer.write_ue(crop_top)
+        writer.write_ue(crop_bottom)
+
+    if chroma_format_idc == 0:
+        crop_unit_x = 1
+        crop_unit_y = coded_height_multiplier
+    elif chroma_format_idc == 1:
+        crop_unit_x = 2
+        crop_unit_y = 2 * coded_height_multiplier
+    elif chroma_format_idc == 2:
+        crop_unit_x = 2
+        crop_unit_y = coded_height_multiplier
+    else:
+        crop_unit_x = 1
+        crop_unit_y = coded_height_multiplier
+    display_width = coded_width - crop_unit_x * (crop_left + crop_right)
+    display_height = coded_height - crop_unit_y * (crop_top + crop_bottom)
+    if (
+        display_width <= 0
+        or display_height <= 0
+        or display_width > _H264_MAX_DIMENSION
+        or display_height > _H264_MAX_DIMENSION
+        or display_width * display_height > _H264_MAX_PIXELS
+    ):
+        raise MediaScrubError("h264 SPS cropped dimensions are invalid")
 
     vui_present = reader.read_u1()
     writer.write_u1(vui_present)
@@ -390,7 +437,28 @@ def _parse_and_emit_sps_rbsp(rbsp: bytes) -> tuple[bytes, int]:
 
     reader.read_rbsp_trailing_bits()
     writer.write_rbsp_trailing_bits()
-    return writer.to_bytes(), sps_id
+    return writer.to_bytes(), sps_id, (display_width, display_height)
+
+
+def canonicalise_sps_with_dimensions(
+    nal_bytes: bytes,
+) -> tuple[bytes, int, tuple[int, int]]:
+    """Canonicalise an SPS and return its identifier and display dimensions."""
+    if len(nal_bytes) < 1:
+        raise MediaScrubError("h264 NAL too short for header")
+    header = nal_bytes[0]
+    if header & 0x80 or header & 0x1F != 7:
+        raise MediaScrubError("h264 NAL is not a valid SPS")
+    rbsp = _rbsp_unescape(nal_bytes[1:])
+    if not rbsp:
+        raise MediaScrubError("h264 SPS RBSP is empty after unescape")
+    new_rbsp, sps_id, dimensions = _parse_and_emit_sps_rbsp(rbsp)
+    nal_ref_idc = (header >> 5) & 0x3
+    return (
+        bytes([(nal_ref_idc << 5) | 7]) + _rbsp_escape(new_rbsp),
+        sps_id,
+        dimensions,
+    )
 
 
 def _parse_and_emit_pps_rbsp(rbsp: bytes) -> tuple[bytes, int, int]:
@@ -491,7 +559,7 @@ def canonicalise_nal_with_ids(
         raise MediaScrubError("h264 RBSP is empty after unescape")
 
     if expected_nal_type == 7:
-        new_rbsp, sps_id = _parse_and_emit_sps_rbsp(rbsp)
+        new_rbsp, sps_id, _dimensions = _parse_and_emit_sps_rbsp(rbsp)
         return (
             bytes([(nal_ref_idc << 5) | nal_type]) + _rbsp_escape(new_rbsp),
             sps_id,
