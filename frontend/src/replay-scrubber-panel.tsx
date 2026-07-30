@@ -167,6 +167,13 @@ export function ReplayScrubberPanel({ ticket }: { ticket: string }) {
   const [rawLoading, setRawLoading] = useState(false);
   const [rawError, setRawError] = useState<string | null>(null);
   const loadingRef = useRef<AbortController | null>(null);
+  // Round-5 review item 3: prefetch request identity. Each new prefetch
+  // bumps ``prefetchRequestId``; the ``finally`` clears ``pageLoading``
+  // only when the completing request is still the latest. That way an
+  // aborted prefetch superseded by a new one still lets the fresh
+  // request drive the loading indicator, and an aborted prefetch with
+  // NO successor still clears the indicator (no stale spinner).
+  const prefetchRequestRef = useRef(0);
 
   useEffect(() => {
     let ignore = false;
@@ -247,19 +254,27 @@ export function ReplayScrubberPanel({ ticket }: { ticket: string }) {
     if (absoluteIndex + REPLAY_TUNABLES.prefetchMargin < trailingEdgeAbsolute) return;
     let ignore = false;
     const controller = new AbortController();
+    const myRequestId = ++prefetchRequestRef.current;
     setPageLoading(true);
     fetchNextPage(selectedRunId, timeline, controller.signal)
       .then((page) => {
         if (ignore || controller.signal.aborted) return;
         setTimeline((current) => (current ? mergePage(current, page) : current));
-        setPageLoading(false);
       })
       .catch((err) => {
         if (ignore || controller.signal.aborted) return;
         setTimelineError(
           err instanceof Error ? err.message : "Could not load next page",
         );
-        setPageLoading(false);
+      })
+      .finally(() => {
+        // Only clear the loading flag if this is still the LATEST
+        // prefetch request. A newer request in flight will drive the
+        // indicator on its own completion; if there is no successor,
+        // this branch fires and clears the stale spinner.
+        if (myRequestId === prefetchRequestRef.current) {
+          setPageLoading(false);
+        }
       });
     return () => {
       ignore = true;
@@ -284,8 +299,14 @@ export function ReplayScrubberPanel({ ticket }: { ticket: string }) {
       );
       setPlaying(false);
       (async () => {
+        // Round-5 review item 2: evict AFTER EACH PAGE during rewind so
+        // the timeline never accumulates the entire run in memory just
+        // because the target is late. ``absoluteEdge`` tracks the highest
+        // absolute index we've walked past — combined with ``droppedFromFront``
+        // it tells the loop when the target sits inside the loaded window.
         let cursor: string | null = null;
         let events: ReplayTimelineEvent[] = [];
+        let droppedFromFront = 0;
         let bookmarks: ReplayBookmark[] = [];
         let bookmarksTruncated = false;
         let warnings: string[] = [];
@@ -299,24 +320,27 @@ export function ReplayScrubberPanel({ ticket }: { ticket: string }) {
           });
           if (!run) run = page.run;
           events = [...events, ...page.events];
+          // Evict eagerly per page — round-4 rewind collected everything
+          // then sliced once at the end, which momentarily held the whole
+          // run in memory.
+          if (events.length > REPLAY_TUNABLES.windowSize) {
+            const overflow = events.length - REPLAY_TUNABLES.windowSize;
+            events = events.slice(overflow);
+            droppedFromFront += overflow;
+          }
           if (bookmarks.length === 0) bookmarks = page.bookmarks;
           bookmarksTruncated = bookmarksTruncated || page.bookmarks_truncated;
           warnings = Array.from(new Set([...warnings, ...page.warnings]));
           hasMore = page.has_more;
           cursor = page.next_cursor;
-          if (events.length > targetAbsolute + REPLAY_TUNABLES.prefetchMargin) break;
+          const absoluteEdge = droppedFromFront + events.length;
+          if (absoluteEdge > targetAbsolute + REPLAY_TUNABLES.prefetchMargin) break;
         }
         if (controller.signal.aborted) return;
-        let dropped = 0;
-        if (events.length > REPLAY_TUNABLES.windowSize) {
-          const overflow = events.length - REPLAY_TUNABLES.windowSize;
-          events = events.slice(overflow);
-          dropped = overflow;
-        }
         setTimeline({
           run: run!,
           events,
-          droppedFromFront: dropped,
+          droppedFromFront,
           hasMore,
           nextCursor: cursor,
           bookmarks,

@@ -150,9 +150,9 @@ def run_dir(runs_root: Path) -> Path:
     return run_dir
 
 
-def _open_reader(path: Path, **kwargs) -> replay._SnapshotReader:
+def _open_reader(path: Path, **kwargs) -> replay.SnapshotReader:
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    return replay._SnapshotReader(
+    return replay.SnapshotReader(
         fd,
         start_offset=kwargs.pop("start_offset", 0),
         start_skipping=kwargs.pop("start_skipping", False),
@@ -269,12 +269,127 @@ def test_timeline_pagination_via_opaque_cursor(
     assert second["bookmarks"] == []
 
 
-def test_cursor_is_opaque_and_encodes_skip_flag() -> None:
-    assert replay.decode_cursor(replay.encode_cursor(0)) == (0, False)
-    assert replay.decode_cursor(replay.encode_cursor(1024)) == (1024, False)
-    assert replay.decode_cursor(replay.encode_cursor(999, skipping=True)) == (999, True)
+def test_cursor_round_trip_preserves_offset_and_skip_state() -> None:
+    """Round-5 review item 1: skip-state must round-trip through the cursor.
+
+    Deleting the ``s`` field from encode/decode would cause the
+    ``test_scan_budget_cut_mid_oversized_record_resumes_via_skip_flag``
+    test to lose the skip state on the second page and re-buffer the
+    oversized record; this test locks the wiring in place.
+    """
+
+    assert replay.decode_cursor(replay.encode_cursor(0, run_id=RUN_ID), run_id=RUN_ID) == (0, False)
+    assert replay.decode_cursor(replay.encode_cursor(1024, run_id=RUN_ID), run_id=RUN_ID) == (1024, False)
+    assert replay.decode_cursor(
+        replay.encode_cursor(999, run_id=RUN_ID, skipping=True), run_id=RUN_ID
+    ) == (999, True)
+
+
+def test_cursor_rejects_signature_tamper() -> None:
+    """Any byte-level change to the signature portion MUST decode to 400.
+
+    We flip a byte in the middle of the base64 string so we're changing a
+    signature byte, not padding that base64 might tolerate.
+    """
+
+    good = replay.encode_cursor(512, run_id=RUN_ID)
+    mid = len(good) // 2
+    tampered = good[:mid] + ("A" if good[mid] != "A" else "B") + good[mid + 1 :]
+    assert tampered != good
     with pytest.raises(replay.ReplayError) as ctx:
-        replay.decode_cursor("this-is-not-base64!")
+        replay.decode_cursor(tampered, run_id=RUN_ID)
+    assert ctx.value.status_code == 400
+
+
+def test_cursor_rejects_wrong_run_id() -> None:
+    """A cursor bound to run A must not decode against run B."""
+
+    good = replay.encode_cursor(512, run_id=RUN_ID)
+    with pytest.raises(replay.ReplayError) as ctx:
+        replay.decode_cursor(good, run_id=OTHER_RUN)
+    assert ctx.value.status_code == 400
+
+
+def test_cursor_rejects_junk_encoding() -> None:
+    """Malformed base64 / non-envelope input must decode to 400."""
+
+    for bad in ("this-is-not-base64!", "AAAA", "\x00", "!"):
+        with pytest.raises(replay.ReplayError) as ctx:
+            replay.decode_cursor(bad, run_id=RUN_ID)
+        assert ctx.value.status_code == 400
+
+
+def test_cursor_rejects_negative_offset_via_forged_secret() -> None:
+    """A forged cursor with a negative offset must decode to 400 even when
+    signed correctly (the check is on payload contents, not just HMAC)."""
+
+    saved_secret = replay.cursor._CURSOR_SECRET
+    try:
+        replay.cursor._reset_secret_for_tests(b"probe-secret" * 3)
+        # Build a signed cursor with a negative offset manually — the
+        # production ``encode_cursor`` refuses this, so we bypass it to
+        # confirm ``decode_cursor`` also refuses.
+        import base64 as _b64
+        import hmac as _hmac
+        import json as _json
+        from hashlib import sha256 as _sha256
+        payload = _json.dumps(
+            {"o": -1, "s": False, "r": RUN_ID}, separators=(",", ":"), sort_keys=True
+        ).encode()
+        signature = _hmac.new(replay.cursor._CURSOR_SECRET, payload, _sha256).digest()
+        cursor = _b64.urlsafe_b64encode(payload + signature).rstrip(b"=").decode("ascii")
+        with pytest.raises(replay.ReplayError) as ctx:
+            replay.decode_cursor(cursor, run_id=RUN_ID)
+        assert ctx.value.status_code == 400
+    finally:
+        replay.cursor._reset_secret_for_tests(saved_secret)
+
+
+def test_cursor_rejects_wrong_type_fields() -> None:
+    """Signed cursor with wrong field types (bool offset, int skipping, etc)
+    must decode to 400."""
+
+    saved_secret = replay.cursor._CURSOR_SECRET
+    try:
+        replay.cursor._reset_secret_for_tests(b"probe-secret" * 3)
+        import base64 as _b64
+        import hmac as _hmac
+        import json as _json
+        from hashlib import sha256 as _sha256
+
+        def sign(payload_dict):
+            payload = _json.dumps(payload_dict, separators=(",", ":"), sort_keys=True).encode()
+            sig = _hmac.new(replay.cursor._CURSOR_SECRET, payload, _sha256).digest()
+            return _b64.urlsafe_b64encode(payload + sig).rstrip(b"=").decode("ascii")
+
+        # bool offset (Python bool is int; guard must catch this).
+        with pytest.raises(replay.ReplayError) as ctx:
+            replay.decode_cursor(sign({"o": True, "s": False, "r": RUN_ID}), run_id=RUN_ID)
+        assert ctx.value.status_code == 400
+        # int skipping.
+        with pytest.raises(replay.ReplayError) as ctx:
+            replay.decode_cursor(sign({"o": 0, "s": 1, "r": RUN_ID}), run_id=RUN_ID)
+        assert ctx.value.status_code == 400
+        # missing run field.
+        with pytest.raises(replay.ReplayError) as ctx:
+            replay.decode_cursor(sign({"o": 0, "s": False}), run_id=RUN_ID)
+        assert ctx.value.status_code == 400
+    finally:
+        replay.cursor._reset_secret_for_tests(saved_secret)
+
+
+def test_cursor_beyond_snapshot_size_rejected_at_endpoint(
+    run_dir: Path, runs_root: Path
+) -> None:
+    """A cursor pointing past ``st_size`` — legitimately signed but
+    invalid post-snapshot — must 400 in ``SnapshotReader.__init__``."""
+
+    events_path = run_dir / "events.jsonl"
+    size = os.stat(events_path).st_size
+    past_eof = replay.encode_cursor(size + 1024, run_id=RUN_ID)
+    with mock.patch.object(main, "AGENT_RUNS_DIR", runs_root):
+        with pytest.raises(HTTPException) as ctx:
+            main.agent_run_replay_timeline(RUN_ID, cursor=past_eof)
     assert ctx.value.status_code == 400
 
 
@@ -342,7 +457,7 @@ def test_bookmarks_truncated_flag_is_surfaced(
 
 def _events_from_fixture(path: Path) -> list[replay.TimelineEvent]:
     yielded = _yield_events_from_path(path)
-    events = [replay._timeline_event_from(e) for e in yielded]
+    events = [replay.classification.timeline_event_from(e) for e in yielded]
     return [e for e in events if e is not None]
 
 
@@ -432,7 +547,7 @@ def test_scan_budget_is_injectable_and_returns_resumable_cursor(
         ],
     )
     small_budget = 32 * 1024
-    with mock.patch.object(replay, "MAX_SCAN_BYTES", small_budget):
+    with mock.patch.object(replay.errors, "MAX_SCAN_BYTES", small_budget):
         cursor: str | None = None
         seen: list[int] = []
         while True:
@@ -471,7 +586,7 @@ def test_scan_budget_cut_mid_oversized_record_resumes_via_skip_flag(
     stats_a = replay._ScanStats()
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     try:
-        reader_a = replay._SnapshotReader(
+        reader_a = replay.SnapshotReader(
             fd,
             start_offset=0,
             start_skipping=False,
@@ -498,7 +613,7 @@ def test_scan_budget_cut_mid_oversized_record_resumes_via_skip_flag(
     stats_b = replay._ScanStats()
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     try:
-        reader_b = replay._SnapshotReader(
+        reader_b = replay.SnapshotReader(
             fd,
             start_offset=resume_offset,
             start_skipping=resume_skipping,
@@ -527,7 +642,7 @@ def test_reader_snapshot_size_bounds_reads(tmp_path: Path) -> None:
     stats = replay._ScanStats()
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     try:
-        reader = replay._SnapshotReader(
+        reader = replay.SnapshotReader(
             fd,
             start_offset=0,
             start_skipping=False,
@@ -551,16 +666,30 @@ def test_fifo_substituted_for_run_json_is_refused(
 ) -> None:
     """A FIFO named run.json used to block ``fstat`` indefinitely before
     the reader could check the mode. O_NONBLOCK on the open + S_ISREG
-    refusal must return promptly."""
+    refusal must return promptly.
+
+    Round-5 review item 4: bounded by SIGALRM so removing O_NONBLOCK
+    from ``_open_run_child_fd`` fails FAST (SIGALRM trips) instead of
+    hanging the whole suite until a global timeout.
+    """
+
+    import signal
+
+    def _timeout_handler(signum, frame):  # noqa: ARG001
+        raise AssertionError("FIFO open blocked >1s — O_NONBLOCK regressed")
 
     run_dir = runs_root / RUN_ID
     run_dir.mkdir()
     fifo_path = run_dir / "run.json"
     os.mkfifo(fifo_path)
+    original_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+    signal.alarm(1)
     try:
         with pytest.raises(replay.ReplayError) as ctx:
             replay._open_run_child_fd(runs_root_fd, RUN_ID, "run.json")
     finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, original_handler)
         fifo_path.unlink()
     assert ctx.value.status_code == 404
     assert "not a regular file" in str(ctx.value) or "not accessible" in str(ctx.value)
@@ -645,7 +774,7 @@ def test_resolve_ticket_runs_reports_truncation(
         run_dir.mkdir()
         meta = _base_run_json(run_id=rid, agent_id="WIKI-174")
         (run_dir / "run.json").write_text(json.dumps(meta), encoding="utf-8")
-    with mock.patch.object(replay, "MAX_RUN_LIST_ENTRIES", 3):
+    with mock.patch.object(replay.errors, "MAX_RUN_LIST_ENTRIES", 3):
         listing = replay.resolve_ticket_runs(runs_root_fd, "WIKI-174")
     assert len(listing.runs) == 3
     assert listing.truncated is True
@@ -671,7 +800,7 @@ def test_raw_event_lookup_walks_across_scan_budget(
     (run_dir / "raw.jsonl").write_text(
         "\n".join(json.dumps(e) for e in entries) + "\n", encoding="utf-8"
     )
-    with mock.patch.object(replay, "MAX_SCAN_BYTES", 8 * 1024):
+    with mock.patch.object(replay.errors, "MAX_SCAN_BYTES", 8 * 1024):
         entry = replay.load_raw_event(runs_root_fd, RUN_ID, 400)
     assert entry is not None
     assert entry["payload"] == {"idx": 400}
@@ -695,6 +824,64 @@ def test_timeline_endpoint_happy_path(run_dir: Path, runs_root: Path) -> None:
     assert payload["run"]["run_id"] == RUN_ID
     assert len(payload["events"]) == 4
     assert payload["has_more"] is False
+
+
+def test_endpoint_paginates_over_file_crossing_64mib(
+    runs_root: Path,
+) -> None:
+    """Round-5 review item 4: a committed test that walks the production
+    endpoint across a file larger than ``MAX_SCAN_BYTES``.
+
+    The events.jsonl is padded so its total size is >64 MiB; the client
+    paginates via signed cursors. Every event must be reachable across
+    the boundary. The write is buffered so this takes ~1 s of disk I/O.
+    """
+
+    run_dir = runs_root / RUN_ID
+    run_dir.mkdir()
+    (run_dir / "run.json").write_text(json.dumps(_base_run_json()), encoding="utf-8")
+    events_path = run_dir / "events.jsonl"
+
+    # Padded events ~4 KiB each; 20k events ≈ 80 MiB — crosses the 64 MiB
+    # scan budget within one page's worth of pagination attempts.
+    padding = "x" * 3800
+    target_events = 20_000
+    with events_path.open("wb") as f:
+        buf: list[bytes] = []
+        for i in range(1, target_events + 1):
+            entry = {
+                "seq": i,
+                "raw_seq": i,
+                "normalized_at": "2026-07-30T00:00:01+00:00",
+                "kind": "claude_stream_event",
+                "disposition": "rendered",
+                "payload": {"event": {"type": "delta"}, "pad": padding},
+            }
+            buf.append(json.dumps(entry).encode() + b"\n")
+            if len(buf) >= 500:
+                f.write(b"".join(buf))
+                buf.clear()
+        if buf:
+            f.write(b"".join(buf))
+    assert events_path.stat().st_size > 64 * 1024 * 1024, "test file did not cross 64 MiB"
+
+    seen: list[int] = []
+    cursor: str | None = None
+    pages = 0
+    with mock.patch.object(main, "AGENT_RUNS_DIR", runs_root):
+        while pages < 5000:
+            payload = main.agent_run_replay_timeline(RUN_ID, cursor=cursor, limit=1000)
+            seen.extend(e["seq"] for e in payload["events"])
+            pages += 1
+            if not payload["has_more"]:
+                break
+            cursor = payload["next_cursor"]
+    assert seen[0] == 1
+    assert seen[-1] == target_events
+    assert len(seen) == target_events
+    # The reader crossed the scan-budget boundary and continued via cursor.
+    # The final page's cursor is None (has_more=False), proving we
+    # exhausted the file — not silently stopped at the budget.
 
 
 def test_timeline_endpoint_rejects_bad_run_id(runs_root: Path) -> None:

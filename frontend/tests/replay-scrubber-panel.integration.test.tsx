@@ -450,4 +450,82 @@ describe("replay scrubber panel", () => {
     // The rewind starts from the beginning — first fetch has NO cursor.
     expect(rewindFetches[0].url).not.toContain("cursor=");
   });
+
+  // -------------------------------------------------------------------------
+  // Round-5 review items 3+4: stuck loading + empty-page warning render
+  // -------------------------------------------------------------------------
+
+  test("empty final page's warnings render visibly", async () => {
+    // Round-5 review item 4: the round-3/4 test only checked that
+    // the state carried the warning; this asserts the DOM actually
+    // renders it so a regression in ``ReplayLoadStatus`` breaks the
+    // test.
+    const firstPage: ReplayTimeline = {
+      run: runSummary({ total_events: 2 }),
+      events: [event(1), event(2)],
+      next_cursor: "Y3Vyc29yLTE=",
+      has_more: true,
+      bookmarks: [],
+      bookmarks_truncated: false,
+      warnings: ["scan budget reached — continuing via cursor"],
+    };
+    const emptyFinal: ReplayTimeline = {
+      run: runSummary({ total_events: 2 }),
+      events: [],
+      next_cursor: null,
+      has_more: false,
+      bookmarks: [],
+      bookmarks_truncated: false,
+      warnings: ["dropped 1 oversized event line(s)"],
+    };
+    (global.fetch as ReturnType<typeof vi.fn>).mockImplementation(async (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      record(url, init);
+      if (url.includes("/replay/timeline")) {
+        return jsonResponse(url.includes("cursor=") ? emptyFinal : firstPage);
+      }
+      if (url.endsWith("/replay/runs")) {
+        return jsonResponse({ ticket: "WIKI-174", runs: [runSummary()], runs_truncated: false });
+      }
+      if (url.includes("/replay/events/")) {
+        return jsonResponse({ run_id: RUN_ID, seq: 1, raw: {} });
+      }
+      return new Response("not found", { status: 404 });
+    });
+    render(<ReplayScrubberPanel ticket="WIKI-174" />);
+    await flushAsync(5);
+    // Both warnings must be visible in the DOM — the round-3/4 test
+    // stopped at state-level assertions.
+    expect(screen.getByText(/scan budget reached/)).toBeTruthy();
+    expect(screen.getByText(/dropped 1 oversized event line/)).toBeTruthy();
+  });
+
+  test("stale prefetch clears its own loading indicator via request identity", async () => {
+    // Round-5 review item 3: a superseded prefetch must not leave
+    // ``pageLoading`` stuck true. We resolve two overlapping fetches
+    // and confirm the "loading next page…" indicator disappears once
+    // both finish.
+    vi.useRealTimers();
+    REPLAY_TUNABLES.pageSize = 2;
+    REPLAY_TUNABLES.prefetchMargin = 1;
+    REPLAY_TUNABLES.windowSize = 100;
+    const pages = makePages(2, 3);
+    mockPagedFetch(pages);
+    render(<ReplayScrubberPanel ticket="WIKI-174" />);
+    await waitFor(() =>
+      expect(screen.getByRole("slider", { name: "Event cursor" })).toBeTruthy(),
+    );
+    // Scrub past the trailing edge to trigger a prefetch, then scrub back
+    // immediately to abort it. If ``finally`` guards on identity, the
+    // aborted request's stale ``pageLoading=true`` still clears.
+    const slider = screen.getByRole("slider", { name: "Event cursor" });
+    fireEvent.change(slider, { target: { value: "1" } });
+    fireEvent.change(slider, { target: { value: "0" } });
+    await new Promise((r) => setTimeout(r, 50));
+    await waitFor(() => {
+      // The "loading next page…" phrase must not persist once the
+      // prefetch chain settles.
+      expect(screen.queryByText(/loading next page/)).toBeNull();
+    });
+  });
 });
