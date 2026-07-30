@@ -432,40 +432,7 @@ def resolve_vault_asset_path(raw_path: str) -> tuple[Path, str, str]:
     return target, path.as_posix(), media_type
 
 
-def open_relative_file(root_fd: int, relative_parts: tuple[str, ...]) -> int:
-    no_follow = getattr(os, "O_NOFOLLOW", 0)
-    directory_flag = getattr(os, "O_DIRECTORY", 0)
-    current_fd = os.dup(root_fd)
-    try:
-        for index, component in enumerate(relative_parts):
-            is_final = index == len(relative_parts) - 1
-            flags = os.O_RDONLY | no_follow | (0 if is_final else directory_flag)
-            next_fd = os.open(component, flags, dir_fd=current_fd)
-            os.close(current_fd)
-            current_fd = next_fd
-        return current_fd
-    except BaseException:
-        os.close(current_fd)
-        raise
-
-
-def open_relative_directory(root_fd: int, relative_parts: tuple[str, ...]) -> int:
-    no_follow = getattr(os, "O_NOFOLLOW", 0)
-    directory_flag = getattr(os, "O_DIRECTORY", 0)
-    current_fd = os.dup(root_fd)
-    try:
-        for component in relative_parts:
-            next_fd = os.open(
-                component,
-                os.O_RDONLY | directory_flag | no_follow,
-                dir_fd=current_fd,
-            )
-            os.close(current_fd)
-            current_fd = next_fd
-        return current_fd
-    except BaseException:
-        os.close(current_fd)
-        raise
+from .pathwalk import open_relative_directory, open_relative_file  # noqa: E402
 
 
 def iter_repo_files(file_root: Path, root_fd: int | None = None) -> tuple[list[Path], bool]:
@@ -3298,6 +3265,7 @@ ARTIFACT_MEDIA_TYPES = {
     "png": "image/png",
     "jpg": "image/jpeg",
     "webp": "image/webp",
+    "pdf": "application/pdf",
 }
 
 
@@ -3472,6 +3440,8 @@ class MessageIn(BaseModel):
         max_length=64,
         pattern=r"^[A-Za-z0-9_.:-]+$",
     )
+    findings: list[dict[str, Any]] | None = None
+    constraint_bundle: str | None = Field(default=None, max_length=4000)
 
 
 class AgentRespondIn(BaseModel):
@@ -3535,6 +3505,10 @@ class SpawnOrchestratorIn(BaseModel):
 
 class AgentArchiveIn(BaseModel):
     outcome: str = Field(pattern="^(merged|closed|abandoned)$")
+
+
+class AutopilotEnableIn(BaseModel):
+    henry_ack_required_for_merge: bool = False
 
 
 def _allowed_model_message(kind: str, model: str, *, target: str) -> str:
@@ -4143,6 +4117,56 @@ def next_review_route(body: NextReviewIn) -> dict[str, Any]:
     )
 
 
+@app.post("/api/autopilot/{ticket}/enable")
+def autopilot_enable_route(ticket: str, body: AutopilotEnableIn | None = None) -> dict[str, Any]:
+    from .agent_runtime.autopilot import AutopilotController
+
+    try:
+        return AutopilotController(notify=AutopilotController.live_notify).enable(
+            ticket,
+            henry_ack_required_for_merge=(body.henry_ack_required_for_merge if body else False),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/autopilot/{ticket}/disable")
+def autopilot_disable_route(ticket: str) -> dict[str, Any]:
+    from .agent_runtime.autopilot import AutopilotController
+
+    try:
+        return AutopilotController(notify=AutopilotController.live_notify).disable(ticket)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/autopilot/{ticket}/ack-merge")
+def autopilot_ack_merge_route(ticket: str) -> dict[str, Any]:
+    from .agent_runtime.autopilot import AutopilotController
+
+    try:
+        return AutopilotController(notify=AutopilotController.live_notify).ack_merge(ticket)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/autopilot")
+def autopilot_status_route() -> dict[str, Any]:
+    from .agent_runtime.autopilot import AutopilotController
+
+    return AutopilotController(notify=AutopilotController.live_notify).status()
+
+
+@app.get("/api/autopilot/{ticket}")
+def autopilot_ticket_status_route(ticket: str) -> dict[str, Any]:
+    from .agent_runtime.autopilot import AutopilotController
+
+    try:
+        return AutopilotController(notify=AutopilotController.live_notify).status(ticket)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 def spawn_orchestrator(
     body: dict[str, Any] | SpawnOrchestratorIn,
     *,
@@ -4743,6 +4767,8 @@ def agent_message(ticket: str, body: MessageIn, background: BackgroundTasks) -> 
                 source=body.source,
                 request_id=body.request_id,
                 status_dir=AGENT_STATUS_DIR,
+                findings=body.findings,
+                constraint_bundle=body.constraint_bundle,
             )
         return dict(result)
     del background
