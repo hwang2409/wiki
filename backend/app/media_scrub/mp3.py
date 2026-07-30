@@ -206,6 +206,11 @@ def _mp3_validate_full_frame_stream(data: bytes, start: int, end: int) -> bytes:
     frames_seen = 0
     stream_signature: tuple[int, int] | None = None
     rebuilt = bytearray(data[start:end])
+    frame_specs: list[tuple[int, int, int]] = []
+    logical_segments: list[tuple[int, int, int]] = []
+    logical_ranges: list[tuple[int, int]] = []
+    logical_payload_bytes = 0
+    audio_floor_bytes: int | None = None
     while offset < end:
         frame_len = _mp3_frame_length(data, offset, end)
         if frame_len is None:
@@ -222,24 +227,26 @@ def _mp3_validate_full_frame_stream(data: bytes, start: int, end: int) -> bytes:
             )
         frame_offset = offset - start
         frame = data[offset:offset + frame_len]
-        if frames_seen == 0:
-            header = frame[:4]
-            side_info_start = _mp3_side_info_start(header)
-            metadata_end = _mp3_xing_metadata_end(frame, side_info_start)
-            if metadata_end is not None:
-                rebuilt[frame_offset + side_info_start:frame_offset + metadata_end] = (
-                    b"\x00" * (metadata_end - side_info_start)
-                )
-            else:
-                ancillary_start = _mp3_layer3_main_data_end(frame, header)
-                rebuilt[frame_offset + ancillary_start:frame_offset + frame_len] = (
-                    b"\x00" * (frame_len - ancillary_start)
-                )
-        else:
-            ancillary_start = _mp3_layer3_main_data_end(frame, frame[:4])
-            rebuilt[frame_offset + ancillary_start:frame_offset + frame_len] = (
-                b"\x00" * (frame_len - ancillary_start)
+        header = frame[:4]
+        side_info_start = _mp3_side_info_start(header)
+        metadata_end = (
+            _mp3_xing_metadata_end(frame, side_info_start)
+            if frames_seen == 0 else None
+        )
+        frame_specs.append((frame_offset, frame_len, side_info_start))
+        payload_length = frame_len - side_info_start
+        logical_segments.append((logical_payload_bytes, frame_offset + side_info_start, payload_length))
+        if metadata_end is None:
+            main_data_begin, main_data_bits, _main_data_start = _mp3_layer3_syntax(
+                frame, header,
             )
+            if audio_floor_bytes is None:
+                audio_floor_bytes = logical_payload_bytes
+            reservoir_start = logical_payload_bytes - main_data_begin
+            if reservoir_start < audio_floor_bytes:
+                raise MediaScrubError("mp3 Layer III reservoir reference is impossible")
+            logical_ranges.append((reservoir_start * 8, reservoir_start * 8 + main_data_bits))
+        logical_payload_bytes += payload_length
         offset += frame_len
         frames_seen += 1
     if offset != end:
@@ -248,7 +255,67 @@ def _mp3_validate_full_frame_stream(data: bytes, start: int, end: int) -> bytes:
         )
     if frames_seen < 1:
         raise MediaScrubError("mp3 frame stream contains zero frames")
+    protected_ranges = _mp3_map_logical_ranges(logical_segments, logical_ranges)
+    _mp3_zero_unowned_main_data(rebuilt, frame_specs, protected_ranges)
     return bytes(rebuilt)
+
+
+def _mp3_map_logical_ranges(
+    segments: list[tuple[int, int, int]],
+    ranges: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    """Map logical reservoir intervals to physical frame-payload intervals."""
+    physical: list[tuple[int, int]] = []
+    for range_start, range_end in ranges:
+        for logical_start, physical_start, length in segments:
+            segment_end = logical_start + length
+            if segment_end * 8 <= range_start:
+                continue
+            if logical_start * 8 >= range_end:
+                break
+            overlap_start = max(range_start, logical_start * 8)
+            overlap_end = min(range_end, segment_end * 8)
+            physical.append((
+                physical_start * 8 + (overlap_start - logical_start * 8),
+                physical_start * 8 + (overlap_end - logical_start * 8),
+            ))
+    return physical
+
+
+def _mp3_zero_unowned_main_data(
+    rebuilt: bytearray,
+    frame_specs: list[tuple[int, int, int]],
+    protected_ranges: list[tuple[int, int]],
+) -> None:
+    """Clear payload bits not owned by any Layer III main-data range."""
+    protected_ranges.sort()
+    merged: list[list[int]] = []
+    for start, end in protected_ranges:
+        if end <= start:
+            continue
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    interval_index = 0
+    for frame_offset, frame_len, side_info_start in frame_specs:
+        for byte_offset in range(frame_offset + side_info_start, frame_offset + frame_len):
+            bit_start = byte_offset * 8
+            bit_end = bit_start + 8
+            while (
+                interval_index < len(merged)
+                and merged[interval_index][1] <= bit_start
+            ):
+                interval_index += 1
+            mask = 0
+            index = interval_index
+            while index < len(merged) and merged[index][0] < bit_end:
+                overlap_start = max(bit_start, merged[index][0])
+                overlap_end = min(bit_end, merged[index][1])
+                for bit in range(overlap_start, overlap_end):
+                    mask |= 1 << (7 - (bit - bit_start))
+                index += 1
+            rebuilt[byte_offset] &= mask
 
 
 class _Mp3BitReader:
@@ -276,6 +343,12 @@ def _mp3_layer3_main_data_end(frame: bytes, header: bytes) -> int:
     The side-information lengths describe the exact number of coded main-data
     bits. Bytes after that boundary are ancillary data and are zeroed.
     """
+    _main_data_begin, main_data_bits, side_end = _mp3_layer3_syntax(frame, header)
+    return min(len(frame), side_end + (main_data_bits + 7) // 8)
+
+
+def _mp3_layer3_syntax(frame: bytes, header: bytes) -> tuple[int, int, int]:
+    """Parse side information and return reservoir, coded bits, and payload start."""
     side_start = 4 + (0 if header[1] & 1 else 2)
     side_length = _mp3_side_info_length(header)
     side_end = side_start + side_length
@@ -286,7 +359,7 @@ def _mp3_layer3_main_data_end(frame: bytes, header: bytes) -> int:
     channel_mode = (header[3] >> 6) & 0x03
     channels = 1 if channel_mode == 3 else 2
     mpeg1 = version_bits == 3
-    reader.read(9 if mpeg1 else 8)  # main_data_begin
+    main_data_begin = reader.read(9 if mpeg1 else 8)
     reader.read(5 if mpeg1 and channels == 1 else 3 if mpeg1 else 1 if channels == 1 else 3)
     if mpeg1:
         for _ in range(channels):
@@ -314,13 +387,7 @@ def _mp3_layer3_main_data_end(frame: bytes, header: bytes) -> int:
                 reader.read(1)  # preflag
             reader.read(1)  # scalefac_scale
             reader.read(1)  # count1table_select
-    main_data_bytes = (main_data_bits + 7) // 8
-    main_data_start = side_end
-    # main_data_begin may point into the bit reservoir. In that case the
-    # current frame contributes only part of the declared main data, and
-    # every byte through the frame end is coded audio. No ancillary region
-    # exists in this frame.
-    return min(len(frame), main_data_start + main_data_bytes)
+    return main_data_begin, main_data_bits, side_end
 
 
 def _mp3_side_info_length(header: bytes) -> int:

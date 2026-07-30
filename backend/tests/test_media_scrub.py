@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import resource
 import random
 import shutil
@@ -3360,6 +3361,48 @@ class Review21MediaProbeTests(unittest.TestCase):
             finally:
                 Path(stored_path).unlink(missing_ok=True)
 
+    def test_xing_tail_is_removed_and_pcm_matches_metadata_only_baseline(self) -> None:
+        if FFMPEG is None:
+            self.skipTest("ffmpeg not installed")
+        original = REAL_MP3.read_bytes()
+        start = 110
+        frame_length = mp3_scrubber._mp3_frame_length(original, start, len(original))
+        self.assertIsNotNone(frame_length)
+        assert frame_length is not None
+        frame = original[start:start + frame_length]
+        side_info_start = mp3_scrubber._mp3_side_info_start(frame[:4])
+        metadata_end = mp3_scrubber._mp3_xing_metadata_end(frame, side_info_start)
+        self.assertIsNotNone(metadata_end)
+        assert metadata_end is not None
+
+        mutated = bytearray(original)
+        marker = b"GPS-TAIL-MARKER"
+        mutated[start + metadata_end:start + metadata_end + len(marker)] = marker
+        scrubbed = media_scrub.scrub_audio(bytes(mutated), "audio/mpeg").data
+        self.assertNotIn(marker, scrubbed)
+
+        baseline = bytearray(mutated)
+        baseline[start + side_info_start:start + metadata_end] = b"\x00" * (
+            metadata_end - side_info_start
+        )
+
+        def pcm_md5(payload: bytes) -> tuple[str, int]:
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as handle:
+                handle.write(payload)
+                path = handle.name
+            try:
+                probe = subprocess.run(
+                    [FFMPEG, "-v", "error", "-i", path, "-f", "s16le", "-acodec", "pcm_s16le", "-"],
+                    capture_output=True,
+                    timeout=30,
+                )
+                self.assertEqual(probe.returncode, 0, probe.stderr.decode(errors="replace"))
+                return hashlib.md5(probe.stdout).hexdigest(), len(probe.stdout)
+            finally:
+                Path(path).unlink(missing_ok=True)
+
+        self.assertEqual(pcm_md5(scrubbed), pcm_md5(bytes(baseline)))
+
     def test_aac_sample_marker_is_rejected_before_storage(self) -> None:
         payload = bytearray(REAL_MIXED_MP4.read_bytes())
         audio = next(
@@ -3376,6 +3419,15 @@ class Review21MediaProbeTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(media_scrub.MediaScrubError, "AAC"):
             media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+    def test_aac_large_bit_copy_has_bounded_cpu_cost(self) -> None:
+        sample = b"\x5a" * (1_048_576 + 2)
+        writer = mp4_scrubber._AacBitWriter()
+        started = time.perf_counter()
+        mp4_scrubber._aac_copy_bits(writer, sample, 7, 7 + 1_048_576 * 8)
+        elapsed = time.perf_counter() - started
+        self.assertEqual(len(writer.to_bytes()), 1_048_576)
+        self.assertLess(elapsed, 1.0, f"AAC bit copy took {elapsed:.2f}s")
 
     def test_aac_post_channel_dse_is_rejected(self) -> None:
         payload = REAL_MIXED_MP4.read_bytes()

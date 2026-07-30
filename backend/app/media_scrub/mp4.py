@@ -849,6 +849,27 @@ class _AacBitWriter:
 def _aac_copy_bits(
     writer: _AacBitWriter, data: bytes, start_bit: int, end_bit: int,
 ) -> None:
+    if writer.bit_pos % 8 == 0:
+        full_bytes = (end_bit - start_bit) // 8
+        if full_bytes:
+            if start_bit % 8 == 0:
+                start_byte = start_bit // 8
+                writer.data.extend(data[start_byte:start_byte + full_bytes])
+            else:
+                start_byte = start_bit // 8
+                shift = start_bit % 8
+                source = int.from_bytes(
+                    data[start_byte:start_byte + full_bytes + 1], "big",
+                )
+                source_bits = (full_bytes + 1) * 8
+                value = (source >> (source_bits - shift - full_bytes * 8))
+                writer.data.extend(
+                    (value & ((1 << (full_bytes * 8)) - 1)).to_bytes(
+                        full_bytes, "big",
+                    )
+                )
+            writer.bit_pos += full_bytes * 8
+            start_bit += full_bytes * 8
     reader = _AacBitReader(data)
     reader.bit_pos = start_bit
     while reader.bit_pos < end_bit:
