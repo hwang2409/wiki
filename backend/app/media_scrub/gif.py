@@ -19,6 +19,7 @@ preserve).
 from __future__ import annotations
 
 import struct
+from dataclasses import dataclass
 from typing import Final
 
 from .base import MediaScrubError, MediaScrubResult
@@ -34,6 +35,77 @@ _GIF_APP_EXT_LABEL: Final = 0xFF
 _GIF_NETSCAPE_IDENT: Final = b"NETSCAPE2.0"
 _GIF_IMAGE_DESCRIPTOR: Final = 0x2C
 
+# GCE packed byte layout per GIF89a:
+#   bits 7-5: reserved (must be 000)
+#   bits 4-2: disposal method (0-3 defined; 4-7 reserved)
+#   bit 1:   user_input_flag
+#   bit 0:   transparent_color_flag
+_GIF_GCE_RESERVED_MASK: Final = 0b1110_0000
+_GIF_GCE_DISPOSAL_MASK: Final = 0b0001_1100
+_GIF_GCE_DISPOSAL_SHIFT: Final = 2
+_GIF_GCE_USER_INPUT_MASK: Final = 0b0000_0010
+_GIF_GCE_TRANSPARENT_MASK: Final = 0b0000_0001
+_GIF_GCE_DISPOSAL_MAX: Final = 3  # spec defines 0..3; 4..7 reserved
+
+
+@dataclass(frozen=True)
+class _PendingGCE:
+    """Parsed + validated Graphic Control Extension awaiting the next image
+    descriptor so the transparent_color_index can be validated against the
+    active color table (LCT overrides GCT). Round-10 review: pre-R10 the
+    packed byte and transparent index were emitted verbatim, leaking 11
+    ignored attacker-controlled bits per frame."""
+
+    packed_canonical: int
+    delay_time: int
+    transparent_index: int  # canonical 0 when transparency flag clear
+    transparent_flag: bool
+
+    def to_bytes(self) -> bytes:
+        return (
+            bytes([_GIF_EXT_INTRO, _GIF_GRAPHIC_CONTROL_LABEL, 0x04])
+            + bytes([self.packed_canonical])
+            + struct.pack("<H", self.delay_time)
+            + bytes([self.transparent_index, 0x00])
+        )
+
+
+def _parse_gce_body(body: bytes) -> _PendingGCE:
+    """Parse a GCE sub-block body into validated canonical fields.
+
+    Reserved bits reject; reserved disposal codes reject; transparent
+    index is normalised to zero when the transparent flag is clear so the
+    ignored input byte cannot pass through storage.
+    """
+    if len(body) != 4:
+        raise MediaScrubError("gif graphic control extension malformed")
+    packed_in = body[0]
+    if packed_in & _GIF_GCE_RESERVED_MASK:
+        raise MediaScrubError(
+            f"gif GCE packed byte 0x{packed_in:02x} has reserved bits (7-5) set"
+        )
+    disposal = (packed_in & _GIF_GCE_DISPOSAL_MASK) >> _GIF_GCE_DISPOSAL_SHIFT
+    if disposal > _GIF_GCE_DISPOSAL_MAX:
+        raise MediaScrubError(
+            f"gif GCE disposal method {disposal} is reserved (only 0..3 defined)"
+        )
+    user_input = (packed_in & _GIF_GCE_USER_INPUT_MASK) >> 1
+    transparent_flag = bool(packed_in & _GIF_GCE_TRANSPARENT_MASK)
+    delay_time = struct.unpack("<H", body[1:3])[0]
+    raw_index = body[3]
+    canonical_index = raw_index if transparent_flag else 0
+    packed_canonical = (
+        (disposal << _GIF_GCE_DISPOSAL_SHIFT)
+        | (user_input << 1)
+        | (1 if transparent_flag else 0)
+    )
+    return _PendingGCE(
+        packed_canonical=packed_canonical,
+        delay_time=delay_time,
+        transparent_index=canonical_index,
+        transparent_flag=transparent_flag,
+    )
+
 
 def scrub_gif(data: bytes) -> MediaScrubResult:
     if len(data) < 13:
@@ -47,7 +119,8 @@ def scrub_gif(data: bytes) -> MediaScrubResult:
     background_color_index = data[11]
     pixel_aspect_ratio = data[12]
     global_ct_flag = packed & 0x80
-    global_ct_size = 3 * (1 << ((packed & 0x07) + 1)) if global_ct_flag else 0
+    global_ct_entries = 1 << ((packed & 0x07) + 1) if global_ct_flag else 0
+    global_ct_size = 3 * global_ct_entries
 
     lsd_end = 13 + global_ct_size
     if lsd_end > len(data):
@@ -67,6 +140,7 @@ def scrub_gif(data: bytes) -> MediaScrubResult:
         out.extend(data[13:lsd_end])
 
     image_seen = False
+    pending_gce: _PendingGCE | None = None
     offset = lsd_end
     end = len(data)
     while offset < end:
@@ -82,19 +156,38 @@ def scrub_gif(data: bytes) -> MediaScrubResult:
             block_end, sub_blocks = _gif_walk_extension_subblocks(
                 data, sub_start, end,
             )
-            rebuilt = _rebuild_extension(label, sub_blocks)
-            if rebuilt is not None:
-                out.extend(rebuilt)
+            if label == _GIF_GRAPHIC_CONTROL_LABEL:
+                if len(sub_blocks) != 1:
+                    raise MediaScrubError("gif graphic control extension malformed")
+                if pending_gce is not None:
+                    # Two GCEs in a row: only the last one applies to the
+                    # following image per spec. Drop the earlier attacker-
+                    # smuggled GCE header rather than emitting it.
+                    pass
+                pending_gce = _parse_gce_body(sub_blocks[0])
+            else:
+                rebuilt = _rebuild_extension(label, sub_blocks)
+                if rebuilt is not None:
+                    out.extend(rebuilt)
             offset = block_end
             continue
         if marker == _GIF_IMAGE_DESCRIPTOR:
-            block_end = _emit_image_descriptor(data, offset, end, out)
+            block_end = _emit_image_descriptor(
+                data, offset, end, out,
+                pending_gce=pending_gce,
+                global_ct_entries=global_ct_entries,
+            )
+            pending_gce = None
             offset = block_end
             image_seen = True
             continue
         raise MediaScrubError(f"unexpected gif block marker: 0x{marker:02x}")
     if not image_seen:
         raise MediaScrubError("gif payload has no image data")
+    if pending_gce is not None:
+        # A trailing GCE with no following image is not preserved (has no
+        # image to control). Silently drop rather than emit an orphan.
+        pass
     out.append(_GIF_TRAILER)
     return MediaScrubResult(
         data=bytes(out),
@@ -125,21 +218,12 @@ def _gif_walk_extension_subblocks(
 
 
 def _rebuild_extension(label: int, sub_blocks: list[bytes]) -> bytes | None:
-    """Rebuild an extension from parsed sub-blocks. Return None to drop."""
-    if label == _GIF_GRAPHIC_CONTROL_LABEL:
-        # Graphic Control Extension: exactly one 4-byte sub-block.
-        # Body layout: packed(1), delay_time(2 LE), transparent_color_index(1).
-        if len(sub_blocks) != 1 or len(sub_blocks[0]) != 4:
-            raise MediaScrubError("gif graphic control extension malformed")
-        packed = sub_blocks[0][0]
-        delay_time = struct.unpack("<H", sub_blocks[0][1:3])[0]
-        transparent_index = sub_blocks[0][3]
-        return (
-            bytes([_GIF_EXT_INTRO, _GIF_GRAPHIC_CONTROL_LABEL, 0x04])
-            + bytes([packed])
-            + struct.pack("<H", delay_time)
-            + bytes([transparent_index, 0x00])
-        )
+    """Rebuild an extension from parsed sub-blocks. Return None to drop.
+
+    Graphic Control Extensions are handled inline in scrub_gif so the
+    transparent_color_index can be validated against the image's active
+    color table before emission — do not dispatch them here.
+    """
     if label == _GIF_APP_EXT_LABEL:
         # The application identifier lives in the first sub-block (must be
         # exactly 11 bytes: 8-byte identifier + 3-byte auth code).
@@ -168,6 +252,9 @@ def _rebuild_extension(label: int, sub_blocks: list[bytes]) -> bytes | None:
 
 def _emit_image_descriptor(
     data: bytes, offset: int, end: int, out: bytearray,
+    *,
+    pending_gce: _PendingGCE | None,
+    global_ct_entries: int,
 ) -> int:
     """Emit the image descriptor + local color table + LZW image data.
 
@@ -177,6 +264,12 @@ def _emit_image_descriptor(
     and boundaries are re-emitted from the parsed structure; the pixel
     bytes themselves must remain byte-identical because they encode the
     image the caller asked us to store.
+
+    Round-10 review: any preceding Graphic Control Extension is validated
+    against this image's active color table (LCT if present, else GCT)
+    before we emit the GCE + descriptor pair. A transparent index that
+    points past the color table rejects the file rather than pointing at
+    undefined palette memory.
     """
     if offset + 10 > end:
         raise MediaScrubError("gif image descriptor truncated")
@@ -185,16 +278,31 @@ def _emit_image_descriptor(
     img_w = struct.unpack("<H", data[offset + 5:offset + 7])[0]
     img_h = struct.unpack("<H", data[offset + 7:offset + 9])[0]
     local_packed = data[offset + 9]
-    local_ct_size = (
-        3 * (1 << ((local_packed & 0x07) + 1))
+    local_ct_entries = (
+        1 << ((local_packed & 0x07) + 1)
         if local_packed & 0x80
         else 0
     )
+    local_ct_size = 3 * local_ct_entries
     lct_start = offset + 10
     data_start = lct_start + local_ct_size
     if data_start + 1 > end:
         raise MediaScrubError("gif image data truncated")
     lzw_min_code_size = data[data_start]
+
+    if pending_gce is not None:
+        active_ct_entries = local_ct_entries if local_ct_entries else global_ct_entries
+        if pending_gce.transparent_flag:
+            if active_ct_entries == 0:
+                raise MediaScrubError(
+                    "gif GCE flags transparency but the image has no active color table"
+                )
+            if pending_gce.transparent_index >= active_ct_entries:
+                raise MediaScrubError(
+                    f"gif GCE transparent_color_index {pending_gce.transparent_index} "
+                    f"out of range for active color table ({active_ct_entries} entries)"
+                )
+        out.extend(pending_gce.to_bytes())
     # Descriptor field header:
     out.append(_GIF_IMAGE_DESCRIPTOR)
     out.extend(struct.pack("<HH", left, top))

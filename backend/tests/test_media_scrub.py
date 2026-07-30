@@ -936,10 +936,14 @@ class WavReconstructionRegressionTests(unittest.TestCase):
     def test_odd_data_chunk_gets_pad_byte_in_output(self) -> None:
         # Build a WAV whose data chunk is odd-length; reconstruction must
         # emit the pad byte to keep RIFF size even-aligned per the spec.
-        fmt_body = struct.pack("<HHIIHH", 1, 1, 8000, 16000, 2, 16)
+        # Use 8-bit mono so block_align=1 and a 3-byte data payload lands
+        # on frame boundaries — the pad byte comes from RIFF chunk
+        # padding, not misalignment. Round-10 review requires data-chunk
+        # length align to block_align; the pad byte is added outside the
+        # declared chunk size.
+        fmt_body = struct.pack("<HHIIHH", 1, 1, 8000, 8000, 1, 8)
         fmt_chunk = b"fmt " + struct.pack("<I", len(fmt_body)) + fmt_body
-        # 3-byte data payload — odd length.
-        odd_data = b"\x00\x00\x00"
+        odd_data = b"\x11\x22\x33"
         data_chunk = b"data" + struct.pack("<I", 3) + odd_data + b"\x00"  # includes pad
         body = b"WAVE" + fmt_chunk + data_chunk
         payload = b"RIFF" + struct.pack("<I", len(body)) + body
@@ -968,19 +972,27 @@ class WavFormatCodeAllowlistTests(unittest.TestCase):
     the extensible SubFormat GUID must resolve to PCM or float."""
 
     @staticmethod
-    def _wav_with_format(format_code: int, extensible_subformat: bytes | None = None) -> bytes:
+    def _wav_with_format(format_code: int, extensible_subformat: bytes | None = None,
+                         bits: int = 16) -> bytes:
         # Minimal WAV with the given format code. If subformat provided,
-        # emits an extensible fmt chunk (chunk_size = 40).
+        # emits an extensible fmt chunk (chunk_size = 40). Round-10:
+        # block_align and byte_rate must be internally consistent, and the
+        # data chunk length must be a multiple of block_align.
+        channels = 1
+        sample_rate = 16000
+        block_align = channels * (bits // 8)
+        byte_rate = sample_rate * block_align
         if extensible_subformat is not None:
             fmt_body = (
-                struct.pack("<HHIIHH", format_code, 1, 16000, 32000, 2, 16)
-                + struct.pack("<HHI", 22, 16, 0)
+                struct.pack("<HHIIHH", format_code, channels, sample_rate, byte_rate, block_align, bits)
+                + struct.pack("<HHI", 22, bits, 0)
                 + extensible_subformat
             )
         else:
-            fmt_body = struct.pack("<HHIIHH", format_code, 1, 16000, 32000, 2, 16)
+            fmt_body = struct.pack("<HHIIHH", format_code, channels, sample_rate, byte_rate, block_align, bits)
         fmt_chunk = b"fmt " + struct.pack("<I", len(fmt_body)) + fmt_body
-        data_chunk = b"data" + struct.pack("<I", 4) + b"\x00\x00\x00\x00"
+        # Aligned single-frame data payload.
+        data_chunk = b"data" + struct.pack("<I", block_align) + b"\x00" * block_align
         body = b"WAVE" + fmt_chunk + data_chunk
         return b"RIFF" + struct.pack("<I", len(body)) + body
 
@@ -992,7 +1004,7 @@ class WavFormatCodeAllowlistTests(unittest.TestCase):
         media_scrub.scrub_audio(self._wav_with_format(1), "audio/wav")
 
     def test_format_code_ieee_float_is_accepted(self) -> None:
-        media_scrub.scrub_audio(self._wav_with_format(3), "audio/wav")
+        media_scrub.scrub_audio(self._wav_with_format(3, bits=32), "audio/wav")
 
     def test_format_code_alaw_is_rejected(self) -> None:
         # 6 = WAVE_FORMAT_ALAW: valid ITU codec but not on our allowlist.
@@ -1022,6 +1034,7 @@ class WavFormatCodeAllowlistTests(unittest.TestCase):
         """
         subformat = media_scrub._WAV_KSDATAFORMAT_PCM
         # 16 base bytes + 2 cbSize + 22 extension = 40-byte fmt chunk.
+        # PCM 16-bit mono: block_align=2, byte_rate=32000.
         fmt_body = (
             struct.pack("<HHIIHH", 0xFFFE, 1, 16000, 32000, 2, 16)
             + struct.pack("<H", cb_size)
@@ -1029,6 +1042,7 @@ class WavFormatCodeAllowlistTests(unittest.TestCase):
             + subformat
         )
         fmt_chunk = b"fmt " + struct.pack("<I", len(fmt_body)) + fmt_body
+        # Data chunk aligned to block_align=2.
         data_chunk = b"data" + struct.pack("<I", 4) + b"\x00\x00\x00\x00"
         body = b"WAVE" + fmt_chunk + data_chunk
         return b"RIFF" + struct.pack("<I", len(body)) + body
@@ -1896,6 +1910,259 @@ class Mp4Round9SurvivorProbes(unittest.TestCase):
             f"tracemalloc peak {peak/1024/1024:.1f}MB exceeded 150MB ceiling; "
             "table rebuild is allocating per-entry Python objects again",
         )
+
+
+class Mp4Round10FullBoxFlagProbes(unittest.TestCase):
+    """Round-10 review found that FullBox flag bytes rode through many mp4
+    rebuilders verbatim (mvhd, sidx, elst, tkhd, mdhd, hdlr, vmhd, smhd,
+    nmhd, hmhd). Reserved bits carry attacker-controlled hidden bytes
+    through the metadata scrub. R10 requires per-box canonical flag masks
+    and rejects any bits outside them. These probes mutate each rebuilder's
+    flag field with a distinctive marker and assert rejection. Revert the
+    R10 validator and every probe would silently pass through, letting
+    3 attacker bytes per box land in storage."""
+
+    FLAG_MARKER = b"\x47\x50\x53"  # "GPS" per the R9 review verdict
+
+    @staticmethod
+    def _flag_offset_after(mp4: bytes, box_type: bytes) -> int:
+        """Return the byte offset of the 3 flag bytes for `box_type` in
+        the real fixture. Assumes each named box appears exactly once."""
+        pos = mp4.find(box_type)
+        assert pos > 0, f"fixture has no {box_type!r}"
+        # 4-byte size precedes the type; body starts after the 4-byte
+        # type token. Version is at body[0]; flags at body[1:4].
+        return pos + 4 + 1
+
+    def _run_mutation(self, box_type: bytes) -> None:
+        real = REAL_MP4.read_bytes()
+        flag_offset = self._flag_offset_after(real, box_type)
+        payload = bytearray(real)
+        payload[flag_offset:flag_offset + 3] = self.FLAG_MARKER
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "fullbox flags .* has reserved bits set"
+        ):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+    def test_mvhd_flag_mutation_is_rejected(self) -> None:
+        self._run_mutation(b"mvhd")
+
+    def test_tkhd_flag_high_bits_are_rejected(self) -> None:
+        # tkhd's low 4 bits ARE defined (track_enabled etc.), so the probe
+        # sets a high bit that must be rejected.
+        real = REAL_MP4.read_bytes()
+        flag_offset = self._flag_offset_after(real, b"tkhd")
+        payload = bytearray(real)
+        # Preserve any low nibble bits the fixture set; set bit 8 (0x100).
+        original = bytes(payload[flag_offset:flag_offset + 3])
+        payload[flag_offset:flag_offset + 3] = bytes([original[0], original[1] | 0x01, original[2]])
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "fullbox flags .* has reserved bits set"
+        ):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+    def test_mdhd_flag_mutation_is_rejected(self) -> None:
+        self._run_mutation(b"mdhd")
+
+    def test_hdlr_flag_mutation_is_rejected(self) -> None:
+        self._run_mutation(b"hdlr")
+
+    def test_vmhd_flag_high_bit_is_rejected(self) -> None:
+        # vmhd defines only bit 0 (no_lean_ahead). Mutate a higher bit.
+        real = REAL_MP4.read_bytes()
+        flag_offset = self._flag_offset_after(real, b"vmhd")
+        payload = bytearray(real)
+        payload[flag_offset:flag_offset + 3] = b"\x00\x00\x03"  # bit 1 set
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "fullbox flags .* has reserved bits set"
+        ):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+    def test_stco_flag_mutation_survives_r9_check(self) -> None:
+        # Sanity: the R9 stbl-table check already handles stco. The R10
+        # helper's mask=0 policy matches (this probe would also succeed via
+        # R9's `fullbox flags non-zero` path).
+        real = REAL_MP4.read_bytes()
+        flag_offset = self._flag_offset_after(real, b"stco")
+        payload = bytearray(real)
+        payload[flag_offset:flag_offset + 3] = self.FLAG_MARKER
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "fullbox flags"
+        ):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+
+class GifRound10GCEProbes(unittest.TestCase):
+    """Round-10 review: GCE packed byte and transparent_color_index were
+    copied without semantic validation. R10 rejects reserved packed bits
+    (7-5), rejects reserved disposal methods (4-7), normalises the
+    transparent index to zero when the flag is clear, and validates the
+    index against the active color table when the flag is set."""
+
+    @staticmethod
+    def _gif_with_gce(packed: int, index: int, *, gct_entries: int = 4) -> bytes:
+        # LSD: width/height 4x2, packed byte GCT_flag=1 with size code that
+        # yields gct_entries palette entries.
+        # gct_size_code = log2(entries) - 1; entries=4 -> code=1; entries=2 -> code=0
+        assert gct_entries in (2, 4, 8, 16, 32, 64, 128, 256)
+        size_code = (gct_entries.bit_length() - 1) - 1
+        packed_lsd = 0x80 | size_code  # GCT present + size code
+        lsd = struct.pack("<HH", 4, 2) + bytes([packed_lsd, 0x00, 0x00])
+        gct = bytes(gct_entries * 3)  # zero palette
+        # GCE: 21 f9 04 <packed> <delay lo hi> <index> 00
+        gce = bytes([0x21, 0xF9, 0x04, packed, 0x00, 0x00, index, 0x00])
+        # Image descriptor: 2c left/top/w/h + packed=0 (no LCT)
+        idesc = b"\x2c" + struct.pack("<HHHH", 0, 0, 4, 2) + b"\x00"
+        # LZW min code size + one sub-block of length 2 + terminator.
+        lzw = b"\x02\x02\x44\x01\x00"
+        trailer = b"\x3b"
+        return b"GIF89a" + lsd + gct + gce + idesc + lzw + trailer
+
+    def test_reserved_packed_bits_are_rejected(self) -> None:
+        # Bits 7-5 set (e.g., 0xE0). Transparency + disposal all zero.
+        payload = self._gif_with_gce(packed=0xE0, index=0x47)
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "reserved bits"
+        ):
+            media_scrub.scrub_video(payload, "image/gif")
+
+    def test_reserved_disposal_method_is_rejected(self) -> None:
+        # Disposal method 4 (bits 4-2 = 100). Reserved per spec.
+        packed = (4 << 2)
+        payload = self._gif_with_gce(packed=packed, index=0)
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "disposal method .* reserved"
+        ):
+            media_scrub.scrub_video(payload, "image/gif")
+
+    def test_ignored_transparent_index_is_zeroed_on_output(self) -> None:
+        # Transparent flag clear (bit 0 = 0) but the input smuggles an
+        # index byte 0x47. Under R10 the output must carry a zero byte
+        # there, not the attacker byte.
+        marker = 0x47
+        payload = self._gif_with_gce(packed=0, index=marker)
+        result = media_scrub.scrub_video(payload, "image/gif")
+        # Locate the GCE in the output and check the transparent index
+        # byte (byte 6 of the 8-byte GCE structure: 21 f9 04 packed
+        # dly_lo dly_hi index 00).
+        gce_pos = result.data.find(b"\x21\xf9\x04")
+        self.assertGreater(gce_pos, 0)
+        self.assertEqual(result.data[gce_pos + 6], 0,
+                         "ignored transparent_color_index must be canonical zero on output")
+
+    def test_transparent_index_past_color_table_is_rejected(self) -> None:
+        # gct_entries=4 (indices 0..3). Transparent flag set + index 5.
+        payload = self._gif_with_gce(
+            packed=_GCE_TRANSPARENT_FLAG, index=5, gct_entries=4,
+        )
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "transparent_color_index .* out of range"
+        ):
+            media_scrub.scrub_video(payload, "image/gif")
+
+    def test_valid_gce_round_trips_canonical_bytes(self) -> None:
+        # Baseline: disposal=1, transparent flag set, index=1 (in table).
+        packed = (1 << 2) | _GCE_TRANSPARENT_FLAG
+        payload = self._gif_with_gce(packed=packed, index=1, gct_entries=4)
+        result = media_scrub.scrub_video(payload, "image/gif")
+        # Reserved bits stay zero, disposal/user_input/trans preserved.
+        gce_pos = result.data.find(b"\x21\xf9\x04")
+        self.assertGreater(gce_pos, 0)
+        self.assertEqual(result.data[gce_pos + 3], packed)
+        self.assertEqual(result.data[gce_pos + 6], 1)
+
+
+_GCE_TRANSPARENT_FLAG = 0x01
+
+
+class WavRound10FmtConsistencyProbes(unittest.TestCase):
+    """Round-10 review: WAV fmt only rejected zero fields. block_align,
+    byte_rate, bit-depth legality, and data-frame alignment were
+    unvalidated, so a byte_rate=1 mutation on the fixture made the
+    half-second sample report a duration of 16000000ms. R10 validates
+    every cross-field invariant before rebuilding."""
+
+    @staticmethod
+    def _pcm_wav(*, channels: int, sample_rate: int, byte_rate: int,
+                 block_align: int, bits: int, data_len: int) -> bytes:
+        fmt_body = struct.pack(
+            "<HHIIHH", 1, channels, sample_rate, byte_rate, block_align, bits,
+        )
+        fmt_chunk = b"fmt " + struct.pack("<I", len(fmt_body)) + fmt_body
+        data_chunk = b"data" + struct.pack("<I", data_len) + b"\x00" * data_len
+        pad = data_len & 1
+        body = b"WAVE" + fmt_chunk + data_chunk + (b"\x00" if pad else b"")
+        return b"RIFF" + struct.pack("<I", len(body)) + body
+
+    def test_pcm_bit_depth_12_is_rejected(self) -> None:
+        payload = self._pcm_wav(
+            channels=1, sample_rate=16000, byte_rate=24000,
+            block_align=3, bits=12, data_len=6,
+        )
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "PCM bit depth 12 not in allowed set"
+        ):
+            media_scrub.scrub_audio(payload, "audio/wav")
+
+    def test_block_align_mismatch_is_rejected(self) -> None:
+        payload = self._pcm_wav(
+            channels=1, sample_rate=16000, byte_rate=32000,
+            block_align=7, bits=16, data_len=14,
+        )
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "block_align 7 != channels\\*bytes-per-sample 2"
+        ):
+            media_scrub.scrub_audio(payload, "audio/wav")
+
+    def test_byte_rate_mismatch_is_rejected(self) -> None:
+        # byte_rate=1 was the reviewer's specific mutation that made the
+        # fixture report duration 16000000ms.
+        payload = self._pcm_wav(
+            channels=1, sample_rate=16000, byte_rate=1,
+            block_align=2, bits=16, data_len=4,
+        )
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "byte_rate 1 != sample_rate\\*block_align 32000"
+        ):
+            media_scrub.scrub_audio(payload, "audio/wav")
+
+    def test_data_length_misaligned_to_block_align_is_rejected(self) -> None:
+        # 16-bit mono needs block_align=2; a 5-byte data payload is 2.5
+        # frames.
+        payload = self._pcm_wav(
+            channels=1, sample_rate=16000, byte_rate=32000,
+            block_align=2, bits=16, data_len=5,
+        )
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "data chunk length 5 is not aligned to block_align 2"
+        ):
+            media_scrub.scrub_audio(payload, "audio/wav")
+
+    def test_duration_uses_validated_frame_count(self) -> None:
+        # PCM 16-bit mono at 16000Hz. 8000 frames = 500ms.
+        payload = self._pcm_wav(
+            channels=1, sample_rate=16000, byte_rate=32000,
+            block_align=2, bits=16, data_len=16000,
+        )
+        result = media_scrub.scrub_audio(payload, "audio/wav")
+        self.assertEqual(result.duration_ms, 500)
+
+    def test_extensible_valid_bits_over_container_is_rejected(self) -> None:
+        subformat = media_scrub._WAV_KSDATAFORMAT_PCM
+        # container bits=16, valid_bits=20 (illegal).
+        fmt_body = (
+            struct.pack("<HHIIHH", 0xFFFE, 1, 16000, 32000, 2, 16)
+            + struct.pack("<HHI", 22, 20, 0)
+            + subformat
+        )
+        fmt_chunk = b"fmt " + struct.pack("<I", len(fmt_body)) + fmt_body
+        data_chunk = b"data" + struct.pack("<I", 4) + b"\x00\x00\x00\x00"
+        body = b"WAVE" + fmt_chunk + data_chunk
+        payload = b"RIFF" + struct.pack("<I", len(body)) + body
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "valid_bits 20 out of range"
+        ):
+            media_scrub.scrub_audio(payload, "audio/wav")
 
 
 class UnsupportedMimeTests(unittest.TestCase):

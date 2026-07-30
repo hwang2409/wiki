@@ -318,7 +318,7 @@ def _rebuild_sidx(data: bytes, atom: _Mp4Atom) -> bytes:
     if len(body) < 4:
         raise MediaScrubError("mp4 sidx body too short for full-box header")
     version = body[0]
-    flags = body[1:4]
+    flags = _validate_fullbox_flags(b"sidx", body[1:4])
     if version == 0:
         fixed_len = 4 + 4 + 4 + 4 + 4 + 2 + 2
     elif version == 1:
@@ -417,7 +417,7 @@ def _rebuild_mvhd(data: bytes, atom: _Mp4Atom) -> bytes:
             raise MediaScrubError(
                 f"mp4 mvhd v0 body length {len(body)} not the 100-byte spec size"
             )
-        flags = body[1:4]
+        flags = _validate_fullbox_flags(b"mvhd", body[1:4])
         creation = struct.unpack(">I", body[4:8])[0]
         modification = struct.unpack(">I", body[8:12])[0]
         timescale = struct.unpack(">I", body[12:16])[0]
@@ -442,7 +442,7 @@ def _rebuild_mvhd(data: bytes, atom: _Mp4Atom) -> bytes:
             raise MediaScrubError(
                 f"mp4 mvhd v1 body length {len(body)} not the 112-byte spec size"
             )
-        flags = body[1:4]
+        flags = _validate_fullbox_flags(b"mvhd", body[1:4])
         creation = struct.unpack(">Q", body[4:12])[0]
         modification = struct.unpack(">Q", body[12:20])[0]
         timescale = struct.unpack(">I", body[20:24])[0]
@@ -493,7 +493,7 @@ def _rebuild_tkhd(data: bytes, atom: _Mp4Atom) -> bytes:
             raise MediaScrubError(
                 f"mp4 tkhd v0 body length {len(body)} not the 84-byte spec size"
             )
-        flags = body[1:4]
+        flags = _validate_fullbox_flags(b"tkhd", body[1:4])
         creation = struct.unpack(">I", body[4:8])[0]
         modification = struct.unpack(">I", body[8:12])[0]
         track_id = struct.unpack(">I", body[12:16])[0]
@@ -520,7 +520,7 @@ def _rebuild_tkhd(data: bytes, atom: _Mp4Atom) -> bytes:
             raise MediaScrubError(
                 f"mp4 tkhd v1 body length {len(body)} not the 96-byte spec size"
             )
-        flags = body[1:4]
+        flags = _validate_fullbox_flags(b"tkhd", body[1:4])
         creation = struct.unpack(">Q", body[4:12])[0]
         modification = struct.unpack(">Q", body[12:20])[0]
         track_id = struct.unpack(">I", body[20:24])[0]
@@ -575,7 +575,7 @@ def _rebuild_edts(data: bytes, atom: _Mp4Atom) -> bytes:
     if len(body) < 8:
         raise MediaScrubError("mp4 elst body too short")
     version = body[0]
-    flags = body[1:4]
+    flags = _validate_fullbox_flags(b"elst", body[1:4])
     entry_count = struct.unpack(">I", body[4:8])[0]
     if version == 0:
         entry_size = 12  # segment_duration(4) + media_time(4 signed) + rate(4 fixed)
@@ -625,7 +625,7 @@ def _rebuild_mdhd(data: bytes, atom: _Mp4Atom) -> bytes:
             raise MediaScrubError(
                 f"mp4 mdhd v0 body length {len(body)} not the 24-byte spec size"
             )
-        flags = body[1:4]
+        flags = _validate_fullbox_flags(b"mdhd", body[1:4])
         creation = struct.unpack(">I", body[4:8])[0]
         modification = struct.unpack(">I", body[8:12])[0]
         timescale = struct.unpack(">I", body[12:16])[0]
@@ -643,7 +643,7 @@ def _rebuild_mdhd(data: bytes, atom: _Mp4Atom) -> bytes:
             raise MediaScrubError(
                 f"mp4 mdhd v1 body length {len(body)} not the 36-byte spec size"
             )
-        flags = body[1:4]
+        flags = _validate_fullbox_flags(b"mdhd", body[1:4])
         creation = struct.unpack(">Q", body[4:12])[0]
         modification = struct.unpack(">Q", body[12:20])[0]
         timescale = struct.unpack(">I", body[20:24])[0]
@@ -671,7 +671,7 @@ def _rebuild_hdlr(data: bytes, atom: _Mp4Atom) -> bytes:
     version = body[0]
     if version != 0:
         raise MediaScrubError(f"mp4 hdlr unknown version {version}")
-    flags = body[1:4]
+    flags = _validate_fullbox_flags(b"hdlr", body[1:4])
     handler_type = body[8:12]
     # Rebuild reserved fields as zeros; keep the handler_type token (real
     # value — decoders route on it) and emit an empty name so any
@@ -722,7 +722,9 @@ def _rebuild_vmhd(data: bytes, atom: _Mp4Atom) -> bytes:
         raise MediaScrubError(
             f"mp4 vmhd body length {len(body)} not the 12-byte spec size"
         )
-    flags = body[1:4]
+    if body[0] != 0:
+        raise MediaScrubError(f"mp4 vmhd unknown version {body[0]}")
+    flags = _validate_fullbox_flags(b"vmhd", body[1:4])
     graphics_mode = struct.unpack(">H", body[4:6])[0]
     opcolor = struct.unpack(">HHH", body[6:12])
     rebuilt = (
@@ -740,7 +742,9 @@ def _rebuild_smhd(data: bytes, atom: _Mp4Atom) -> bytes:
         raise MediaScrubError(
             f"mp4 smhd body length {len(body)} not the 8-byte spec size"
         )
-    flags = body[1:4]
+    if body[0] != 0:
+        raise MediaScrubError(f"mp4 smhd unknown version {body[0]}")
+    flags = _validate_fullbox_flags(b"smhd", body[1:4])
     balance = struct.unpack(">h", body[4:6])[0]
     rebuilt = bytes([0]) + flags + struct.pack(">h", balance) + b"\x00\x00"
     return _pack(b"smhd", rebuilt)
@@ -753,7 +757,9 @@ def _rebuild_nmhd(data: bytes, atom: _Mp4Atom) -> bytes:
         raise MediaScrubError(
             f"mp4 nmhd body length {len(body)} not the 4-byte spec size"
         )
-    flags = body[1:4]
+    if body[0] != 0:
+        raise MediaScrubError(f"mp4 nmhd unknown version {body[0]}")
+    flags = _validate_fullbox_flags(b"nmhd", body[1:4])
     return _pack(b"nmhd", bytes([0]) + flags)
 
 
@@ -765,7 +771,9 @@ def _rebuild_hmhd(data: bytes, atom: _Mp4Atom) -> bytes:
         raise MediaScrubError(
             f"mp4 hmhd body length {len(body)} not the 20-byte spec size"
         )
-    flags = body[1:4]
+    if body[0] != 0:
+        raise MediaScrubError(f"mp4 hmhd unknown version {body[0]}")
+    flags = _validate_fullbox_flags(b"hmhd", body[1:4])
     max_pdu = struct.unpack(">H", body[4:6])[0]
     avg_pdu = struct.unpack(">H", body[6:8])[0]
     max_bitrate = struct.unpack(">I", body[8:12])[0]
@@ -864,6 +872,50 @@ def _rebuild_stbl(
 
 
 _CANONICAL_FULLBOX_FLAGS = b"\x00\x00\x00"
+
+
+# Round-10 review: FullBox flag rebuilders across the mp4 tree captured
+# the input v+flags bytes then re-emitted them verbatim. The 24-bit flags
+# field is reserved for most box types (spec says shall be zero), so an
+# attacker could smuggle 3 bytes through the metadata scrub. This helper
+# enforces a per-box allowed-mask: bits outside the mask reject the file,
+# and the returned 3 bytes are canonical (bits inside the mask preserved).
+# For boxes with mask == 0, the return value is always three zero bytes.
+_MP4_FULLBOX_ALLOWED_FLAG_MASK: Final = {
+    b"sidx": 0,
+    b"mvhd": 0,
+    b"elst": 0,
+    b"tkhd": 0x00000F,  # track_enabled(1) + in_movie(2) + in_preview(4) + size_is_aspect_ratio(8)
+    b"mdhd": 0,
+    b"hdlr": 0,
+    b"vmhd": 0x000001,  # flags shall be 0x000001 (no_lean_ahead) per 14496-12
+    b"smhd": 0,
+    b"nmhd": 0,
+    b"hmhd": 0,
+}
+
+
+def _validate_fullbox_flags(box_type: bytes, flags_bytes: bytes) -> bytes:
+    """Reject FullBox flag bytes with reserved bits set; return canonical
+    3-byte flags (bits outside the allowed mask are zero on output).
+    """
+    if len(flags_bytes) != 3:
+        raise MediaScrubError(
+            f"mp4 {box_type!r} fullbox flags field must be 3 bytes"
+        )
+    allowed_mask = _MP4_FULLBOX_ALLOWED_FLAG_MASK.get(box_type)
+    if allowed_mask is None:
+        raise MediaScrubError(
+            f"mp4 {box_type!r} has no fullbox flag policy defined"
+        )
+    flags_val = int.from_bytes(flags_bytes, "big")
+    if flags_val & ~allowed_mask:
+        raise MediaScrubError(
+            f"mp4 {box_type!r} fullbox flags 0x{flags_val:06x} has reserved bits set "
+            f"(allowed mask 0x{allowed_mask:06x})"
+        )
+    canonical = flags_val & allowed_mask
+    return canonical.to_bytes(3, "big")
 
 
 def _rebuild_stbl_table(box_type: bytes, data: bytes, atom: _Mp4Atom) -> bytes:

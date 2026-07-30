@@ -24,6 +24,16 @@ _WAV_KSDATAFORMAT_IEEE_FLOAT: Final = (
     b"\x03\x00\x00\x00\x00\x00\x10\x00\x80\x00\x00\xaa\x00\x38\x9b\x71"
 )
 
+# Round-10 review: fmt cross-field consistency lockdown. WAVE_FORMAT_PCM
+# containers are byte-aligned at 8/16/24/32 bits; IEEE float is 32 or 64.
+# block_align must equal channels * (bits/8) and byte_rate must equal
+# sample_rate * block_align; the data chunk must contain an integer
+# number of frames. Pre-R10 the rebuild trusted the byte_rate field, so a
+# mutation to byte_rate=1 caused a half-second fixture to report a
+# duration of 16000000ms via the len(data) * 1000 / byte_rate formula.
+_WAV_PCM_ALLOWED_BITS: Final = frozenset({8, 16, 24, 32})
+_WAV_FLOAT_ALLOWED_BITS: Final = frozenset({32, 64})
+
 
 def scrub_wav(data: bytes) -> MediaScrubResult:
     if len(data) < 12:
@@ -44,6 +54,7 @@ def scrub_wav(data: bytes) -> MediaScrubResult:
     fmt_sample_rate = 0
     fmt_byte_rate = 0
     fmt_bits = 0
+    fmt_block_align = 0
 
     offset = 12
     end = len(data)
@@ -63,9 +74,8 @@ def scrub_wav(data: bytes) -> MediaScrubResult:
         if chunk_id == b"fmt ":
             if rebuilt_fmt is not None:
                 raise MediaScrubError("wav duplicate fmt chunk")
-            rebuilt_fmt, fmt_channels, fmt_sample_rate, fmt_byte_rate, fmt_bits = (
-                _wav_rebuild_fmt(payload)
-            )
+            (rebuilt_fmt, fmt_channels, fmt_sample_rate,
+             fmt_byte_rate, fmt_bits, fmt_block_align) = _wav_rebuild_fmt(payload)
         elif chunk_id == b"data":
             if data_payload is not None:
                 raise MediaScrubError("wav duplicate data chunk")
@@ -83,13 +93,20 @@ def scrub_wav(data: bytes) -> MediaScrubResult:
         raise MediaScrubError("wav payload missing data chunk")
 
     data_bytes = len(data_payload)
-    if fmt_byte_rate:
-        duration_ms = int(round(data_bytes * 1000 / fmt_byte_rate))
-    elif fmt_sample_rate and fmt_channels and fmt_bits:
-        frames = data_bytes // max(1, (fmt_channels * fmt_bits // 8))
-        duration_ms = int(round(frames * 1000 / fmt_sample_rate)) if frames else 0
-    else:
-        duration_ms = None
+    # Round-10 review: reject data chunks whose length is not an integer
+    # number of frames. A misaligned data chunk under any format is a
+    # decoder-visible corruption that the scrubber must not preserve.
+    if fmt_block_align <= 0 or data_bytes % fmt_block_align != 0:
+        raise MediaScrubError(
+            f"wav data chunk length {data_bytes} is not aligned to "
+            f"block_align {fmt_block_align}"
+        )
+    frames = data_bytes // fmt_block_align
+    # After R10 fmt cross-field validation, byte_rate == sample_rate *
+    # block_align exactly, so both duration formulas below are equivalent.
+    # Use the frames-based formula (it survives a future refactor where we
+    # drop the mandatory byte_rate emission).
+    duration_ms = int(round(frames * 1000 / fmt_sample_rate)) if frames else 0
     peaks = _wav_stream_peaks(
         data_payload, 0, len(data_payload), fmt_channels, fmt_bits,
     )
@@ -139,6 +156,10 @@ def _wav_rebuild_fmt(payload: bytes) -> tuple[bytes, int, int, int, int]:
 
     if channels == 0 or sample_rate == 0 or bits == 0:
         raise MediaScrubError("wav fmt fields include zero channels/sample_rate/bits")
+    if channels > 0xFFFF or sample_rate > 0xFFFFFFFF:
+        # struct.unpack already caps channels at 16 bits and sample_rate at 32
+        # bits, but keep a defensive guard for future refactors.
+        raise MediaScrubError("wav fmt channels or sample_rate exceed field width")
 
     if format_code == _WAV_FORMAT_EXTENSIBLE:
         if len(payload) < 40:
@@ -153,28 +174,71 @@ def _wav_rebuild_fmt(payload: bytes) -> tuple[bytes, int, int, int, int]:
         valid_bits = struct.unpack("<H", payload[18:20])[0]
         channel_mask = struct.unpack("<I", payload[20:24])[0]
         subformat = payload[24:40]
-        if subformat not in (_WAV_KSDATAFORMAT_PCM, _WAV_KSDATAFORMAT_IEEE_FLOAT):
+        if subformat == _WAV_KSDATAFORMAT_PCM:
+            allowed_bits = _WAV_PCM_ALLOWED_BITS
+        elif subformat == _WAV_KSDATAFORMAT_IEEE_FLOAT:
+            allowed_bits = _WAV_FLOAT_ALLOWED_BITS
+        else:
             raise MediaScrubError(
                 f"wav SubFormat GUID {subformat.hex()} is not PCM or float"
+            )
+        _wav_validate_bit_depth_and_alignment(
+            bits, allowed_bits, channels, block_align, byte_rate, sample_rate,
+            format_label=f"extensible/{subformat.hex()[:8]}",
+        )
+        if valid_bits == 0 or valid_bits > bits:
+            raise MediaScrubError(
+                f"wav extensible valid_bits {valid_bits} out of range for container bits {bits}"
             )
         rebuilt = (
             struct.pack("<HHIIHH", format_code, channels, sample_rate, byte_rate, block_align, bits)
             + struct.pack("<HHI", 22, valid_bits, channel_mask)
             + subformat
         )
-        return rebuilt, channels, sample_rate, byte_rate, bits
+        return rebuilt, channels, sample_rate, byte_rate, bits, block_align
 
-    if format_code not in _WAV_ALLOWED_FORMATS:
+    if format_code == _WAV_FORMAT_PCM:
+        allowed_bits = _WAV_PCM_ALLOWED_BITS
+    elif format_code == _WAV_FORMAT_IEEE_FLOAT:
+        allowed_bits = _WAV_FLOAT_ALLOWED_BITS
+    else:
         raise MediaScrubError(
             f"wav format code {format_code} is not PCM (1), float (3), or extensible"
         )
+    _wav_validate_bit_depth_and_alignment(
+        bits, allowed_bits, channels, block_align, byte_rate, sample_rate,
+        format_label={_WAV_FORMAT_PCM: "PCM", _WAV_FORMAT_IEEE_FLOAT: "float"}[format_code],
+    )
     # PCM/float layout is exactly 16 bytes. Anything past that in the input
     # was trailing junk (or hostile). Rebuild emits exactly the 16 bytes we
     # validated.
     rebuilt = struct.pack(
         "<HHIIHH", format_code, channels, sample_rate, byte_rate, block_align, bits,
     )
-    return rebuilt, channels, sample_rate, byte_rate, bits
+    return rebuilt, channels, sample_rate, byte_rate, bits, block_align
+
+
+def _wav_validate_bit_depth_and_alignment(
+    bits: int, allowed_bits: frozenset[int],
+    channels: int, block_align: int, byte_rate: int, sample_rate: int,
+    *, format_label: str,
+) -> None:
+    if bits not in allowed_bits:
+        raise MediaScrubError(
+            f"wav {format_label} bit depth {bits} not in allowed set {sorted(allowed_bits)}"
+        )
+    expected_block_align = channels * (bits // 8)
+    if block_align != expected_block_align:
+        raise MediaScrubError(
+            f"wav {format_label} block_align {block_align} != channels*bytes-per-sample "
+            f"{expected_block_align} (channels={channels}, bits={bits})"
+        )
+    expected_byte_rate = sample_rate * block_align
+    if byte_rate != expected_byte_rate:
+        raise MediaScrubError(
+            f"wav {format_label} byte_rate {byte_rate} != sample_rate*block_align "
+            f"{expected_byte_rate} (sample_rate={sample_rate}, block_align={block_align})"
+        )
 
 
 def _wav_rebuild_fact(payload: bytes) -> bytes:
