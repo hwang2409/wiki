@@ -259,6 +259,15 @@ def _service_absent(
     )
 
 
+def _bootout_absent(
+    _config: DaemonConfig, result: subprocess.CompletedProcess[str]
+) -> bool:
+    """Match launchctl bootout's distinct missing-service response."""
+
+    detail = _describe_failure(result).lower()
+    return result.returncode == 3 and "no such process" in detail
+
+
 def _service_loaded(config: DaemonConfig) -> bool:
     """Return service state, rejecting launchctl errors we cannot classify."""
 
@@ -274,7 +283,7 @@ def _service_loaded(config: DaemonConfig) -> bool:
 
 def _unload_and_verify_absent(config: DaemonConfig) -> None:
     unloaded = _launchctl(config, "bootout", config.target)
-    if unloaded.returncode != 0 and not _service_absent(config, unloaded):
+    if unloaded.returncode != 0 and not _bootout_absent(config, unloaded):
         raise DaemonError(
             f"cannot unload {config.target}: {_describe_failure(unloaded)}"
         )

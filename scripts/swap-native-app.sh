@@ -30,6 +30,11 @@ python3 "$ROOT/scripts/atomic_swap.py" \
   --swap-intent "$swap_intent" \
   "${allow_missing_args[@]}"
 
+python3 "$ROOT/scripts/native_daemon_restart.py" \
+  "$live_bundle" \
+  --runtime-dir "$runtime_dir" \
+  --repo-root "$ROOT"
+
 rm -rf "$stage_root"
 
 echo "swapped staged Wiki.app into $live_bundle"

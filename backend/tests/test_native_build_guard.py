@@ -14,6 +14,7 @@ from backend.app.native_lifecycle import hold_app_lock, hold_runtime_locks
 import scripts.atomic_swap as atomic_swap_module
 from scripts.atomic_swap import atomic_replace
 from scripts.native_build_guard import inspect_runtime
+from scripts.native_daemon_restart import restart_daemon_if_installed
 
 
 class NativeBuildGuardTests(TestCase):
@@ -142,3 +143,49 @@ class NativeBuildGuardTests(TestCase):
             self.assertTrue(sentinel.exists())
             self.assertFalse(atomic_swap_module.atomic_replace(staged, live, sentinel, intent))
             self.assertEqual((live / "marker").read_text(encoding="utf-8"), "new")
+
+    def test_swap_restarts_loaded_daemon_with_new_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            live_bundle = root / "target" / "release" / "bundle" / "macos" / "Wiki.app"
+            live_bundle.mkdir(parents=True)
+            runtime_dir = root / "runtime"
+            launch_agents = root / "LaunchAgents"
+            launch_agents.mkdir()
+            (launch_agents / "com.hwang2409.wiki.backend.plist").write_text(
+                "old daemon plist", encoding="utf-8"
+            )
+            launchctl_calls: list[list[str]] = []
+            command_calls: list[tuple[list[str], dict[str, str]]] = []
+
+            def fake_launchctl(
+                arguments: list[str], **_kwargs: object
+            ) -> subprocess.CompletedProcess[str]:
+                launchctl_calls.append(arguments)
+                return subprocess.CompletedProcess(arguments, 0, "", "")
+
+            def fake_command(
+                arguments: list[str], **kwargs: object
+            ) -> subprocess.CompletedProcess[str]:
+                command_calls.append((arguments, kwargs["env"]))
+                return subprocess.CompletedProcess(arguments, 0, "", "")
+
+            with patch.dict(
+                os.environ, {"WIKI_LAUNCH_AGENTS_DIR": str(launch_agents)}, clear=False
+            ):
+                self.assertTrue(
+                    restart_daemon_if_installed(
+                        live_bundle,
+                        runtime_dir,
+                        root,
+                        launchctl=fake_launchctl,
+                        command=fake_command,
+                    )
+                )
+
+            self.assertEqual(len(launchctl_calls), 1)
+            self.assertEqual(len(command_calls), 1)
+            command_args, command_env = command_calls[0]
+            self.assertEqual(command_args[-3:], ["daemon", "install", "--json"])
+            self.assertEqual(command_env["WIKI_APP_PATH"], str(live_bundle))
+            self.assertEqual(command_env["WIKI_AGENT_RUNTIME_DIR"], str(runtime_dir))

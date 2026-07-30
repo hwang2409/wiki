@@ -63,6 +63,23 @@ class LaunchAgentConfigTests(unittest.TestCase):
         )
         self.assertFalse(daemon._service_absent(config, wrong_domain))
 
+    def test_bootout_absence_matches_captured_macos_output(self) -> None:
+        config = self._config(Path("/tmp/LaunchAgents"))
+        captured = subprocess.CompletedProcess(
+            ["launchctl", "bootout", config.target],
+            3,
+            "",
+            "Boot-out failed: 3: No such process\n",
+        )
+        self.assertTrue(daemon._bootout_absent(config, captured))
+        wrong_output = subprocess.CompletedProcess(
+            captured.args,
+            3,
+            "",
+            "Boot-out failed: 3: Input/output error\n",
+        )
+        self.assertFalse(daemon._bootout_absent(config, wrong_output))
+
     def test_status_rejects_stale_running_backend_fingerprint(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -208,11 +225,20 @@ class LaunchAgentConfigTests(unittest.TestCase):
             with patch.object(
                 daemon,
                 "_launchctl",
-                side_effect=lambda _config, *arguments: subprocess.CompletedProcess(
-                    ["launchctl", *arguments],
-                    113 if arguments[0] == "bootout" or arguments[0] == "print" else 0,
-                    "",
-                    daemon._service_absent_message(config),
+                side_effect=lambda _config, *arguments: (
+                    subprocess.CompletedProcess(
+                        ["launchctl", *arguments],
+                        3,
+                        "",
+                        "Boot-out failed: 3: No such process",
+                    )
+                    if arguments[0] == "bootout"
+                    else subprocess.CompletedProcess(
+                        ["launchctl", *arguments],
+                        113 if arguments[0] == "print" else 0,
+                        "",
+                        daemon._service_absent_message(config),
+                    )
                 ),
             ):
                 result = daemon.uninstall(config)
