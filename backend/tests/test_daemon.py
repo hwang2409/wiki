@@ -61,6 +61,47 @@ class LaunchAgentConfigTests(unittest.TestCase):
         )
         self.assertFalse(daemon._service_absent(config, wrong_domain))
 
+    def test_status_rejects_stale_running_backend_fingerprint(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / "wiki-backend"
+            executable.write_bytes(b"installed backend")
+            executable.chmod(0o755)
+            config = daemon.DaemonConfig(
+                **{**self._config(root).__dict__, "executable": executable}
+            )
+            stale = {
+                "healthy": True,
+                "payload": {
+                    "status": "ok",
+                    "daemon_managed": True,
+                    "backend_fingerprint": "stale-backend",
+                },
+            }
+            with patch.object(daemon, "_service_loaded", return_value=True), patch.object(
+                daemon, "_health", return_value=stale
+            ):
+                result = daemon.status(config)
+            self.assertFalse(result["healthy"])
+            self.assertFalse(result["fingerprint_match"])
+            self.assertEqual(result["backend_fingerprint"], "stale-backend")
+            self.assertEqual(
+                result["expected_backend_fingerprint"],
+                frozen_runtime_fingerprint(executable),
+            )
+
+    def test_plist_exports_bundle_path_for_source_build_artifact(self) -> None:
+        config = self._config(Path("/tmp/LaunchAgents"))
+        executable = (
+            Path("/tmp/src-tauri/target/release/bundle/macos/Wiki.app")
+            / "Contents/Resources/wiki-backend-sidecar/wiki-backend"
+        )
+        config = daemon.DaemonConfig(**{**config.__dict__, "executable": executable})
+        self.assertEqual(
+            daemon.plist_payload(config)["EnvironmentVariables"]["WIKI_APP_PATH"],
+            "/tmp/src-tauri/target/release/bundle/macos/Wiki.app",
+        )
+
     def test_install_preserves_seeded_live_runs_and_archive(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -424,11 +465,17 @@ class DaemonArtifactTests(unittest.TestCase):
                     )
                 return subprocess.CompletedProcess(["launchctl", *arguments], 0, "", "")
 
-            with patch.object(daemon, "_launchctl", side_effect=fake_launchctl), patch.object(
+            with patch.object(daemon, "_launchctl", side_effect=fake_launchctl) as launchctl, patch.object(
                 daemon, "_health", return_value={"healthy": False}
             ), patch.object(daemon, "HEALTH_TIMEOUT_SECONDS", 0.0):
                 with self.assertRaisesRegex(daemon.DaemonError, "did not become healthy"):
                     daemon.install(config)
+            self.assertTrue(
+                any(
+                    call.args[1:] == ("bootout", config.target)
+                    for call in launchctl.call_args_list
+                )
+            )
 
 
 class DaemonHandshakeTests(unittest.TestCase):
@@ -475,7 +522,10 @@ class DaemonHandshakeTests(unittest.TestCase):
         ), patch.object(native_server.subprocess, "run", side_effect=fake_run), socket.socket() as peer:
             self.assertTrue(native_server.is_trusted_tauri_peer(peer))
 
-        self.assertEqual(calls[1][0:4], ["/usr/bin/codesign", "--verify", "--strict", "--requirements"])
+        self.assertEqual(
+            calls[1][0:4],
+            ["/usr/bin/codesign", "--verify", "--strict", "--test-requirement"],
+        )
         self.assertIn('anchor apple generic', calls[1][4])
         self.assertIn('certificate leaf[subject.OU] = "ABCDE12345"', calls[1][4])
 

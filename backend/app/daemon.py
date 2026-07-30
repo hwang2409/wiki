@@ -17,7 +17,24 @@ from urllib.request import Request, urlopen
 DEFAULT_LABEL = "com.hwang2409.wiki.backend"
 DEFAULT_PORT = 8213
 FINDER_SAFE_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-DEFAULT_WIKI_APP_PATH = Path("/Applications/Wiki.app")
+INSTALLED_WIKI_APP_PATH = Path("/Applications/Wiki.app")
+SOURCE_WIKI_APP_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "src-tauri"
+    / "target"
+    / "release"
+    / "bundle"
+    / "macos"
+    / "Wiki.app"
+)
+DEFAULT_WIKI_APP_PATH = Path(
+    os.environ.get("WIKI_APP_PATH")
+    or (
+        SOURCE_WIKI_APP_PATH
+        if SOURCE_WIKI_APP_PATH.is_dir()
+        else INSTALLED_WIKI_APP_PATH
+    )
+)
 HEALTH_TIMEOUT_SECONDS = 15.0
 HEALTH_POLL_SECONDS = 0.2
 
@@ -126,20 +143,31 @@ def config_from_env(*, overrides: dict[str, str | None] | None = None) -> Daemon
     )
 
 
+def _bundle_path_for_executable(executable: Path) -> Path | None:
+    for parent in executable.parents:
+        if parent.name == "Wiki.app":
+            return parent
+    return None
+
+
 def plist_payload(config: DaemonConfig) -> dict[str, object]:
     """Return a deterministic user LaunchAgent definition."""
 
+    environment = {
+        "PATH": FINDER_SAFE_PATH,
+        "WIKI_AGENT_RUNTIME_DIR": str(config.runtime_dir),
+        "WIKI_BACKEND_DAEMON": "launchd",
+        "WIKI_BACKEND_URL": config.backend_url,
+        "WIKI_SUPERVISOR_AUTOSTART": "on",
+    }
+    bundle_path = _bundle_path_for_executable(config.executable)
+    if bundle_path is not None:
+        environment["WIKI_APP_PATH"] = str(bundle_path)
     return {
         "Label": config.label,
         "ProgramArguments": config.program_arguments,
         "WorkingDirectory": str(config.repo_dir),
-        "EnvironmentVariables": {
-            "PATH": FINDER_SAFE_PATH,
-            "WIKI_AGENT_RUNTIME_DIR": str(config.runtime_dir),
-            "WIKI_BACKEND_DAEMON": "launchd",
-            "WIKI_BACKEND_URL": config.backend_url,
-            "WIKI_SUPERVISOR_AUTOSTART": "on",
-        },
+        "EnvironmentVariables": environment,
         "RunAtLoad": True,
         "KeepAlive": True,
         "ThrottleInterval": 5,
@@ -242,7 +270,13 @@ def install(config: DaemonConfig) -> dict[str, object]:
     loaded = _launchctl(config, "bootstrap", config.domain, str(config.plist_path))
     if loaded.returncode != 0:
         raise DaemonError(f"cannot load {config.plist_path}: {_describe_failure(loaded)}")
-    _wait_for_healthy(config)
+    try:
+        _wait_for_healthy(config)
+    except DaemonError:
+        # KeepAlive would relaunch a backend that cannot claim its port. Remove
+        # the loaded job so a failed install does not create a restart storm.
+        _unload_after_health_failure(config)
+        raise
     return {
         "label": config.label,
         "target": config.target,
@@ -315,16 +349,41 @@ def _wait_for_healthy(config: DaemonConfig) -> dict[str, object]:
     )
 
 
+def _unload_after_health_failure(config: DaemonConfig) -> None:
+    unloaded = _launchctl(config, "bootout", config.target)
+    if unloaded.returncode != 0 and not _service_absent(config, unloaded):
+        raise DaemonError(
+            "daemon health failed and launchd could not unload "
+            f"{config.target}: {_describe_failure(unloaded)}"
+        )
+
+
 def status(config: DaemonConfig) -> dict[str, object]:
     loaded = _service_loaded(config)
     health = _health(config)
+    payload = health.get("payload")
+    expected_fingerprint = (
+        _expected_backend_fingerprint(config) if config.executable.is_file() else None
+    )
+    running_fingerprint = (
+        payload.get("backend_fingerprint")
+        if isinstance(payload, dict)
+        else None
+    )
+    fingerprint_match = (
+        expected_fingerprint is not None
+        and running_fingerprint == expected_fingerprint
+    )
     return {
         "label": config.label,
         "target": config.target,
         "plist": str(config.plist_path),
         "installed": config.plist_path.is_file(),
         "loaded": loaded,
-        "healthy": health["healthy"],
+        "healthy": health["healthy"] and fingerprint_match,
         "url": config.backend_url,
-        "health": health.get("payload"),
+        "health": payload,
+        "backend_fingerprint": running_fingerprint,
+        "expected_backend_fingerprint": expected_fingerprint,
+        "fingerprint_match": fingerprint_match,
     }

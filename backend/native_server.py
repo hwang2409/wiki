@@ -23,7 +23,26 @@ import uvicorn
 DAEMON_AUTH_SOCKET_NAME = "wiki-app-secret.sock"
 DAEMON_AUTH_LOCK_NAME = "wiki-app-secret.lock"
 TAURI_BUNDLE_IDENTIFIER = "com.hwang2409.wiki"
-TAURI_BUNDLE_PATH = Path("/Applications/Wiki.app")
+DEFAULT_TAURI_BUNDLE_PATH = Path("/Applications/Wiki.app")
+SOURCE_TAURI_BUNDLE_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "src-tauri"
+    / "target"
+    / "release"
+    / "bundle"
+    / "macos"
+    / "Wiki.app"
+)
+# Tests and packaged deployments can override this after import. The source
+# bundle is the documented native-build output when no installed app exists.
+TAURI_BUNDLE_PATH = Path(
+    os.environ.get("WIKI_APP_PATH")
+    or (
+        SOURCE_TAURI_BUNDLE_PATH
+        if SOURCE_TAURI_BUNDLE_PATH.is_dir()
+        else DEFAULT_TAURI_BUNDLE_PATH
+    )
+)
 DAEMON_LOG_MAX_BYTES = 10 * 1024 * 1024
 DAEMON_LOG_BACKUPS = 5
 _LOG_REDIRECT_LOCK = threading.Lock()
@@ -317,7 +336,7 @@ def _verify_code_identity(executable: Path, team_identifier: str | None = None) 
                 "/usr/bin/codesign",
                 "--verify",
                 "--strict",
-                "--requirements",
+                "--test-requirement",
                 f"={requirement}",
                 str(executable),
             ],
@@ -331,7 +350,7 @@ def _verify_code_identity(executable: Path, team_identifier: str | None = None) 
 
 
 def is_trusted_tauri_peer(connection: socket.socket) -> bool:
-    """Accept only a developer-signed process matching the installed Wiki.app team."""
+    """Accept only a signed process matching the selected Wiki.app team."""
 
     pid = _peer_pid(connection)
     executable = _peer_executable(pid) if pid is not None else None

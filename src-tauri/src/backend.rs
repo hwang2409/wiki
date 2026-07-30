@@ -31,6 +31,8 @@ const FINDER_SAFE_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/
 const HEALTH_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(350);
+const DAEMON_PROBE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const DAEMON_PROBE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
 const MAIN_WINDOW_LABEL: &str = "main";
 const WINDOW_TITLE: &str = "Wiki";
@@ -421,26 +423,49 @@ fn probe_persistent_daemon() -> Option<String> {
         .timeout(DAEMON_PROBE_TIMEOUT)
         .build()
         .ok()?;
-    let response = client.get(&health_url).send().ok()?;
-    if !response.status().is_success() {
-        return None;
+    let ready = retry_until_ready(
+        || {
+            let response = client.get(&health_url).send().ok()?;
+            if !response.status().is_success() {
+                return None;
+            }
+            let payload = response.json::<serde_json::Value>().ok()?;
+            if payload
+                .get("daemon_managed")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            {
+                return None;
+            }
+            if payload
+                .get("backend_fingerprint")
+                .and_then(serde_json::Value::as_str)
+                != Some(EXPECTED_BACKEND_FINGERPRINT)
+            {
+                return None;
+            }
+            Some(())
+        },
+        DAEMON_PROBE_WAIT_TIMEOUT,
+        DAEMON_PROBE_POLL_INTERVAL,
+    );
+    ready.map(|_| launch_url)
+}
+
+fn retry_until_ready<T, F>(mut probe: F, timeout: Duration, interval: Duration) -> Option<T>
+where
+    F: FnMut() -> Option<T>,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(value) = probe() {
+            return Some(value);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(interval);
     }
-    let payload = response.json::<serde_json::Value>().ok()?;
-    if payload
-        .get("daemon_managed")
-        .and_then(serde_json::Value::as_bool)
-        != Some(true)
-    {
-        return None;
-    }
-    if payload
-        .get("backend_fingerprint")
-        .and_then(serde_json::Value::as_str)
-        != Some(EXPECTED_BACKEND_FINGERPRINT)
-    {
-        return None;
-    }
-    Some(launch_url)
 }
 
 fn set_app_secret(app: &AppHandle, secret: String) {
@@ -961,6 +986,21 @@ mod tests {
             )),
             Path::new("/Users/henry/me/fun/wiki")
         );
+    }
+
+    #[test]
+    fn persistent_daemon_probe_retries_until_ready() {
+        let mut attempts = 0;
+        let result = super::retry_until_ready(
+            || {
+                attempts += 1;
+                (attempts >= 3).then_some("ready")
+            },
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(1),
+        );
+        assert_eq!(result, Some("ready"));
+        assert_eq!(attempts, 3);
     }
 
     // WIKI-148 round 7: exercise the REAL Tauri IPC + ACL path for the
