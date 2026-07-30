@@ -5,6 +5,7 @@ import rehypeKatex from "rehype-katex";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
+import { ArtifactLightbox } from "./artifact-detail/lightbox";
 import { CopyPill } from "./copy-button";
 import { ShikiCode } from "./shiki";
 import {
@@ -684,23 +685,78 @@ function nodeProperties(node: unknown): Record<string, unknown> {
 function MarkdownImage({ alt, className, "data-obsidian-width": dataWidth, node, notePath, src }: MarkdownImageProps) {
   const candidates = src ? assetCandidates(src, notePath) : [];
   const [failed, setFailed] = useState(false);
-  useEffect(() => setFailed(false), [src, notePath]);
+  const [state, setState] = useState<"loading" | "ready" | "error">("loading");
+  const [aspectRatio, setAspectRatio] = useState<number | null>(null);
+  const [lightboxOpen, setLightboxOpen] = useState(false);
+  useEffect(() => {
+    setFailed(false);
+    setState("loading");
+    setAspectRatio(null);
+  }, [src, notePath]);
+
   const currentSrc = src && candidates.length > 0
     ? vaultAssetUrl(candidates[failed && candidates.length > 1 ? 1 : 0])
     : src;
   const widthValue = dataWidth ?? nodeProperties(node)["data-obsidian-width"];
   const width = typeof widthValue === "number" ? widthValue : undefined;
 
+  if (!currentSrc) return null;
+
+  const style: React.CSSProperties = {};
+  if (width) style.width = `${width}px`;
+  if (aspectRatio && !width) style.aspectRatio = String(aspectRatio);
+
+  const label = alt || src?.split(/[\\/]/).pop() || "Image";
+
   return (
-    <img
-      alt={alt ?? ""}
-      className={className}
-      src={currentSrc}
-      style={width ? { width: `${width}px` } : undefined}
-      onError={() => {
-        if (candidates.length > 1) setFailed(true);
-      }}
-    />
+    <>
+      <button
+        aria-label={`Open ${label} in fullscreen`}
+        className={`markdown-image-frame${state === "ready" ? " is-loaded" : ""}${state === "error" ? " is-error" : ""}`}
+        onClick={() => {
+          if (state === "ready") setLightboxOpen(true);
+        }}
+        style={style}
+        type="button"
+      >
+        {state === "loading" ? <span className="markdown-image-shimmer" aria-hidden="true" /> : null}
+        {state === "error" ? (
+          <span className="markdown-image-error" role="img" aria-label={`Image failed to load: ${label}`}>
+            image unavailable
+          </span>
+        ) : (
+          <img
+            alt={alt ?? ""}
+            className={className}
+            decoding="async"
+            loading="lazy"
+            src={currentSrc}
+            onError={() => {
+              if (candidates.length > 1 && !failed) {
+                setFailed(true);
+                return;
+              }
+              setState("error");
+            }}
+            onLoad={(event) => {
+              const img = event.currentTarget;
+              if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+                setAspectRatio(img.naturalWidth / img.naturalHeight);
+              }
+              setState("ready");
+            }}
+          />
+        )}
+      </button>
+      {lightboxOpen ? (
+        <ArtifactLightbox
+          index={0}
+          items={[{ src: currentSrc, alt: label, caption: alt || label }]}
+          onClose={() => setLightboxOpen(false)}
+          onIndexChange={() => undefined}
+        />
+      ) : null}
+    </>
   );
 }
 

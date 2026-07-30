@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 
 from . import knowledge
 from . import wiki_agent_tools
+from .image_scrub import ImageScrubError, scrub_image_bytes
 
 
 TEXT_LIMIT = 100_000
@@ -206,6 +207,13 @@ def _write_image(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
         data = base64.b64decode(encoded, validate=True)
     except (binascii.Error, ValueError) as exc:
         raise ArtifactValidationError("payload.data_base64 is not valid base64") from exc
+    if len(data) > IMAGE_LIMIT:
+        raise ArtifactValidationError("image payload exceeds the 5MB image limit")
+
+    try:
+        data = scrub_image_bytes(data, mime)
+    except ImageScrubError as exc:
+        raise ArtifactValidationError(f"image payload rejected: {exc}") from exc
     if len(data) > IMAGE_LIMIT:
         raise ArtifactValidationError("image payload exceeds the 5MB image limit")
 

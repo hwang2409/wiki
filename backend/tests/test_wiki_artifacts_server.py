@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import os
 import subprocess
@@ -10,6 +11,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from PIL import Image
+
 from backend.app import wiki_agent_tools, wiki_artifacts
 from backend.app.next_review_schema import NextReviewIn, mcp_input_schema
 
@@ -17,12 +20,21 @@ from backend.app.next_review_schema import NextReviewIn, mcp_input_schema
 RUN_ID = "00000000-0000-4000-8000-000000000085"
 
 
+def _fixture_png_bytes() -> bytes:
+    buffer = io.BytesIO()
+    Image.new("RGB", (2, 2), color=(255, 128, 0)).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+FIXTURE_PNG_BYTES = _fixture_png_bytes()
+
+
 def _payload(kind: str) -> dict:
     return {
         "mermaid": {"source": "graph TD; A-->B"},
         "svg": {"source": '<svg xmlns="http://www.w3.org/2000/svg"><rect width="1" height="1"/></svg>'},
         "image": {
-            "data_base64": base64.b64encode(b"fixture-png").decode(),
+            "data_base64": base64.b64encode(FIXTURE_PNG_BYTES).decode(),
             "mime": "image/png",
         },
         "table": {
@@ -118,7 +130,11 @@ class WikiArtifactsTests(unittest.TestCase):
                         / "artifacts"
                         / f"{event['id']}.png"
                     )
-                    self.assertEqual(image.read_bytes(), b"fixture-png")
+                    stored = image.read_bytes()
+                    self.assertTrue(stored.startswith(b"\x89PNG\r\n\x1a\n"))
+                    with Image.open(io.BytesIO(stored)) as reopened:
+                        reopened.load()
+                        self.assertEqual(reopened.size, (2, 2))
                     self.assertEqual(image.stat().st_mode & 0o777, 0o600)
                 else:
                     for key, value in _payload(kind).items():
@@ -418,7 +434,11 @@ class WikiArtifactsTests(unittest.TestCase):
             / "artifacts"
             / f"{event['id']}.png"
         )
-        self.assertEqual(target.read_bytes(), b"fixture-png")
+        stored_bytes = target.read_bytes()
+        self.assertTrue(stored_bytes.startswith(b"\x89PNG\r\n\x1a\n"))
+        with Image.open(io.BytesIO(stored_bytes)) as reopened:
+            reopened.load()
+            self.assertEqual(reopened.size, (2, 2))
 
     def test_storage_failure_returns_a_tool_error_without_crashing_server(self) -> None:
         with mock.patch.object(wiki_artifacts, "render_artifact", side_effect=OSError("disk full")):
