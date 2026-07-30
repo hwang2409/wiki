@@ -236,6 +236,8 @@ class ClaudeStreamAdapter(ProviderAdapter):
             "stdio",
             "--include-partial-messages",
             "--include-hook-events",
+            "--thinking-display",
+            "summarized",
             "--mcp-config",
             self.artifact_mcp_config,
             # Parity with the codex adapter's approvalPolicy "never" +
