@@ -2457,10 +2457,8 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-normal);
 }
 
-.tmux-status-index,
-.tmux-status-sep {
-  color: var(--text-faint);
-}
+/* WIKI-152: .tmux-status-index / .tmux-status-sep removed with the tmux
+   punctuation stripped from the status bar. */
 
 .tmux-status-label {
   max-width: 20ch;
@@ -5461,65 +5459,9 @@ body.is-resizing-panes .pane-cell {
   overflow-wrap: anywhere;
 }
 
-.session-provider-request-details {
-  margin-top: 8px;
-  color: var(--text-faint);
-  font-family: var(--font-monospace);
-  font-weight: var(--font-monospace-weight);
-  font-size: var(--font-ui-smaller);
-}
-
-.session-provider-request-details > summary {
-  display: inline-flex;
-  align-items: center;
-  padding: 1px 8px;
-  border: 1px dashed var(--background-modifier-border);
-  border-radius: var(--radius-xs);
-  color: var(--text-faint);
-  cursor: pointer;
-  list-style: none;
-  letter-spacing: 0.02em;
-}
-
-.session-provider-request-details > summary::-webkit-details-marker {
-  display: none;
-}
-
-.session-provider-request-details[open] > summary {
-  border-style: solid;
-  color: var(--text-muted);
-}
-
-.session-provider-request-meta {
-  display: grid;
-  grid-template-columns: max-content 1fr;
-  gap: 3px 12px;
-  margin: 8px 0;
-}
-
-.session-provider-request-meta dt {
-  color: var(--text-faint);
-  letter-spacing: 0.02em;
-  text-transform: uppercase;
-}
-
-.session-provider-request-meta dd {
-  margin: 0;
-  color: var(--text-muted);
-  overflow-wrap: anywhere;
-}
-
-.session-provider-request-details > pre {
-  max-height: 220px;
-  margin: 0;
-  padding: 8px 10px;
-  border-radius: var(--radius-xs);
-  background-color: var(--code-background);
-  color: var(--text-muted);
-  overflow: auto;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
+/* WIKI-152 R1-04: the per-card .session-provider-request-details mini
+   disclosure was removed. Kind / request id / raw payload now live in
+   Run details only, cross-referenced by raw_seq. */
 
 .session-provider-request-error {
   margin-top: 6px;
@@ -12827,11 +12769,6 @@ textarea.composer-command-input {
 .session-tab > .session-run-details > summary .session-run-details-label {
   color: var(--text-normal);
   font-weight: var(--fw-semibold);
-}
-
-.session-tab > .session-run-details > summary .session-run-details-summary {
-  margin-left: auto;
-  color: var(--text-muted);
 }
 
 .session-tab > .session-run-details .session-run-details-body {

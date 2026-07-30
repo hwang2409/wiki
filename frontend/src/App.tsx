@@ -4062,8 +4062,6 @@ export default function App() {
                     type="button"
                     onClick={() => activateWindowByIndex(index)}
                   >
-                    <span className="tmux-status-index">{index}</span>
-                    <span className="tmux-status-sep">:</span>
                     <span className="tmux-status-label">{windowLabel(window)}</span>
                   </button>
                 ))}

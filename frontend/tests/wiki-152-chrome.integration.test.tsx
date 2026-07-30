@@ -34,7 +34,7 @@ function pending(overrides: Partial<ProviderPendingRequest> = {}): ProviderPendi
 afterEach(() => cleanup());
 
 describe("WIKI-152 default chrome — no diagnostic noise", () => {
-  test("SessionRunDetails is collapsed by default and hides Provider stream label", () => {
+  test("SessionRunDetails collapsed summary shows label only and leaks no telemetry", () => {
     render(
       <SessionRunDetails
         inspector={inspector()}
@@ -46,14 +46,18 @@ describe("WIKI-152 default chrome — no diagnostic noise", () => {
     );
     const details = screen.getByTestId("session-run-details") as HTMLDetailsElement;
     expect(details.open).toBe(false);
-    // Summary shows compact label — not the ambient "Provider stream" chip.
+    // Summary label reads "Run details" — nothing more.
     expect(screen.getByText("Run details")).toBeTruthy();
-    expect(screen.queryByText("Provider stream")).toBeNull();
-    // Summary carries a compact provider · state · tokens hint that is not a raw count.
-    expect(screen.getByText(/codex · working · 3k tok/)).toBeTruthy();
-    // The summary itself does not leak the raw disposition string; that is body-only.
+    // R1-01: the collapsed summary must not surface provider, state, tokens,
+    // format, or disposition strings — a leak makes the disclosure the noise
+    // it was meant to hide.
     const summary = details.querySelector("summary");
-    expect(summary?.textContent ?? "").not.toContain("Unknown");
+    const summaryText = summary?.textContent ?? "";
+    for (const leak of ["Provider stream", "codex", "working", "tok", "msg/v1", "Unknown"]) {
+      expect(summaryText).not.toContain(leak);
+    }
+    // Screen-level: none of the demoted labels render outside the collapsed body.
+    expect(screen.queryByText("Provider stream")).toBeNull();
   });
 
   test("opening SessionRunDetails reveals raw→normalized and disposition counts", () => {

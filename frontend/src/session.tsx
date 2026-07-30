@@ -550,16 +550,9 @@ function ProviderPendingRequestCard({
                 : "Send response"}
         </button>
       </div>
-      <details className="session-provider-request-details">
-        <summary>Details</summary>
-        <dl className="session-provider-request-meta">
-          <dt>kind</dt>
-          <dd>{request.request_kind}</dd>
-          <dt>request id</dt>
-          <dd>{String(request.request_id)}</dd>
-        </dl>
-        <pre>{JSON.stringify(request.payload, null, 2)}</pre>
-      </details>
+      {/* R1-04: request kind, id, and raw payload no longer live in a
+          per-card mini disclosure. Run details is the single diagnostics
+          home — cross-reference by raw_seq #{request.raw_seq}. */}
       {error ? <div className="session-provider-request-error">{error}</div> : null}
     </div>
   );
@@ -982,17 +975,11 @@ export function SessionRunDetails({
     ? formatDispositionCounts(inspector.dispositions)
     : null;
   const tokensLabel = formatTokens(tokens);
-  const summaryPieces = [
-    inspector ? `${inspector.provider} · ${inspector.state}` : null,
-    tokensLabel,
-  ].filter(Boolean) as string[];
-  const summary = summaryPieces.length > 0 ? summaryPieces.join(" · ") : "diagnostics";
   return (
     <details className="session-run-details" data-testid="session-run-details">
       <summary>
         <ChevronRight size={12} className="session-run-details-chevron" />
         <span className="session-run-details-label">Run details</span>
-        <span className="session-run-details-summary tabular-nums">{summary}</span>
       </summary>
       <div className="session-run-details-body">
         <dl className="session-run-details-meta tabular-nums">
@@ -3751,7 +3738,8 @@ function MessageComposer({
           autoCorrect="off"
           className={vimMode === "normal" || vimMode === "visual" ? "is-vim-normal" : undefined}
           spellCheck={false}
-          placeholder={vimMode === "insert" ? "Enter sends now · Shift+Enter queues until idle · Esc = vim normal" : undefined}
+          placeholder={vimMode === "insert" ? "Message" : undefined}
+          title="Enter sends now · Shift+Enter queues until idle · Esc = vim normal"
           ref={inputRef}
           rows={2}
           value={text}
@@ -3907,15 +3895,15 @@ function MessageComposer({
             </button>
           ))}
         </div>
-        <span className={`session-vim-mode is-${vimMode}`}>
-          {vimMode === "insert"
-            ? "-- INSERT --"
-            : vimMode === "visual"
+        {vimMode !== "insert" ? (
+          <span className={`session-vim-mode is-${vimMode}`}>
+            {vimMode === "visual"
               ? "-- VISUAL --"
               : vimMode === "pane"
                 ? "-- PANE --"
                 : "-- NORMAL --"}
-        </span>
+          </span>
+        ) : null}
       </div>
     </div>
   );

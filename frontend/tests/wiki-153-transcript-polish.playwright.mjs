@@ -430,21 +430,20 @@ async function main() {
     await actionPanel.locator(".session-action-required-title", { hasText: "Action required" }).waitFor();
     const providerCard = actionPanel.locator(".session-provider-request").first();
     await providerCard.waitFor({ state: "visible" });
-    const kindDd = providerCard
-      .locator(".session-provider-request-meta dd", { hasText: "item/tool/requestUserInput" })
-      .first();
-    if (await kindDd.isVisible()) {
-      throw new Error("WIKI-152: request kind must still be hidden by default (inside Details disclosure)");
+    // R1-04: the per-request Details disclosure is gone. Run details is now
+    // the single diagnostics home; the pending card must not render kind,
+    // request id, or raw payload — those live in Run details' event log
+    // cross-referenced by raw_seq.
+    if ((await providerCard.locator(".session-provider-request-details").count()) !== 0) {
+      throw new Error("R1-04: per-card Details disclosure must be removed — Run details is the diagnostics home");
+    }
+    const cardText = await providerCard.innerText();
+    for (const forbidden of ["item/tool/requestUserInput", "kind", "request id"]) {
+      if (cardText.toLowerCase().includes(forbidden.toLowerCase())) {
+        throw new Error(`R1-04: pending card must not leak "${forbidden}" (got: ${cardText})`);
+      }
     }
     await providerCard.locator(".session-provider-question", { hasText: "Which scope" }).waitFor({ state: "visible" });
-    const detailsSummary = providerCard.locator(".session-provider-request-details > summary", { hasText: "Details" });
-    await detailsSummary.waitFor({ state: "visible" });
-    const preBeforeOpen = await providerCard.locator(".session-provider-request-details > pre").isVisible();
-    if (preBeforeOpen) throw new Error("raw payload should be hidden before Details expanded");
-    await detailsSummary.click();
-    await providerCard.locator(".session-provider-request-meta dd", { hasText: "item/tool/requestUserInput" }).waitFor({ state: "visible" });
-    await providerCard.locator(".session-provider-request-meta dd", { hasText: "42" }).waitFor({ state: "visible" });
-    await providerCard.locator(".session-provider-request-details > pre").waitFor({ state: "visible" });
 
     logStep("capturing screenshot");
     await page.screenshot({ path: path.join(OUT_DIR, "wiki-153-transcript-polish.png"), fullPage: true });
