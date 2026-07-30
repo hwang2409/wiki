@@ -1781,6 +1781,7 @@ export default function App() {
 
   useEffect(() => {
     const nextOpenTerminalIds = new Set<string>();
+    const disposedTerminalIds: string[] = [];
     for (const window of windowState.windows) {
       for (const pane of collectPaneInfos(window.layout)) {
         const terminalId = terminalIdFromPanePath(pane.path);
@@ -1791,9 +1792,22 @@ export default function App() {
       if (!nextOpenTerminalIds.has(terminalId)) {
         terminalControllersRef.current.delete(terminalId);
         disposeTerminalRuntime(terminalId);
+        disposedTerminalIds.push(terminalId);
       }
     }
     openTerminalIdsRef.current = nextOpenTerminalIds;
+    if (disposedTerminalIds.length > 0) {
+      setTerminalLaunchNonceById((current) => {
+        const next = { ...current };
+        for (const terminalId of disposedTerminalIds) delete next[terminalId];
+        return next;
+      });
+      setTerminalNames((current) => {
+        const next = { ...current };
+        for (const terminalId of disposedTerminalIds) delete next[terminalId];
+        return next;
+      });
+    }
   }, [windowState]);
 
   useEffect(() => {

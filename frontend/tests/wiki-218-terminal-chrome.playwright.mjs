@@ -168,6 +168,14 @@ try {
   await page.waitForFunction(
     () => document.querySelector(".terminal-pane")?.getBoundingClientRect().width <= 220
   );
+  await page.evaluate((id) => window.__wikiTerminals?.[id]?.terminal.focus(), terminalId);
+  await page.waitForFunction(
+    (id) =>
+      document.activeElement instanceof HTMLTextAreaElement &&
+      document.activeElement.dataset.terminalInput === "true" &&
+      document.activeElement.dataset.terminalId === id,
+    terminalId
+  );
   await page.keyboard.press("Control+f");
   await page.waitForSelector(".terminal-pane-find");
   result.findHeaderFits = await page.evaluate(() => {

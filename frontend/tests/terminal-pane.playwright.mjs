@@ -386,7 +386,8 @@ async function activeWindowIndex(page) {
 
 async function readMarkerNumber(page, terminalId, prefix) {
   const text = await terminalBufferText(page, terminalId);
-  const match = text.match(new RegExp(`${prefix}(\\d+)__`));
+  const matches = [...text.matchAll(new RegExp(`${prefix}(\\d+)__`, "g"))];
+  const match = matches.at(-1);
   return match ? Number(match[1]) : null;
 }
 
@@ -791,6 +792,9 @@ try {
   }
   if (!result.colsBefore || !result.colsAfter) {
     throw new Error(`Expected tput cols markers, saw ${result.colsBefore} -> ${result.colsAfter}`);
+  }
+  if (result.colsBefore === result.colsAfter) {
+    throw new Error(`PTY width did not change after pane resize: ${result.colsBefore} -> ${result.colsAfter}`);
   }
   if (!result.floodBuffer || result.floodBuffer.baseY < 1000) {
     throw new Error("Flood command did not produce enough terminal output to validate scrollback");
