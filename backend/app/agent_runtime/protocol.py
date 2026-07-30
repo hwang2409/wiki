@@ -20,6 +20,7 @@ class UnixSupervisorServer:
         self.supervisor = supervisor
         self.socket_path = socket_path
         self.server: asyncio.AbstractServer | None = None
+        self._bound_ino: int | None = None
 
     async def start(self) -> None:
         self.socket_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -48,6 +49,7 @@ class UnixSupervisorServer:
             limit=MAX_PROTOCOL_LINE_BYTES,
         )
         self.socket_path.chmod(0o600)
+        self._bound_ino = self.socket_path.lstat().st_ino
 
     async def _write(self, writer: asyncio.StreamWriter, payload: dict[str, Any]) -> None:
         writer.write(json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n")
@@ -127,7 +129,10 @@ class UnixSupervisorServer:
             await self.server.wait_closed()
             self.server = None
         try:
-            if self.socket_path.exists() and stat.S_ISSOCK(self.socket_path.lstat().st_mode):
+            # A successor daemon may have rebound this path; only remove the
+            # socket this server created (WIKI-217).
+            current = self.socket_path.lstat()
+            if stat.S_ISSOCK(current.st_mode) and current.st_ino == self._bound_ino:
                 self.socket_path.unlink()
         except OSError:
             pass

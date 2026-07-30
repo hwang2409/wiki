@@ -62,6 +62,8 @@ import type {
   ProviderPendingRequest,
   QueuedMessage,
   SessionEvent,
+  SessionInit,
+  SessionRateLimit,
   SessionPr,
   SkillInfo,
   SubagentInfo,
@@ -1156,7 +1158,7 @@ function ToolRow({
   );
 }
 
-type SessionUiState = {
+export type SessionUiState = {
   booleans: Map<string, boolean>;
 };
 
@@ -1358,6 +1360,126 @@ function TaskListRow({
           </ul>
         </div>
       </div>
+    </div>
+  );
+}
+
+function claudeValue(value: unknown): string {
+  if (value === null || value === undefined || value === "") return "—";
+  if (typeof value === "string") return value;
+  return JSON.stringify(value);
+}
+
+function claudePath(value: string | null | undefined): string {
+  if (!value) return "—";
+  return value.replace(/^\/Users\/[^/]+/, "~");
+}
+
+export function ClaudeInitRow({ event, stateKey, uiState }: { event: SessionEvent; stateKey: string; uiState: SessionUiState }) {
+  const [open, setOpen] = useStoredBooleanState(uiState, stateKey, false);
+  const init: SessionInit = event.claude_init ?? {};
+  const model = init.model || "claude";
+  const cwd = claudePath(init.cwd);
+  const details: Array<[string, unknown]> = [
+    ["claude code version", init.claude_code_version],
+    ["model", init.model],
+    ["output style", init.output_style],
+    ["cwd", cwd],
+    ["mcp servers", init.mcp_servers],
+    ["agents", init.agents],
+    ["memory paths", init.memory_paths],
+    ["fast mode state", init.fast_mode_state],
+  ];
+  return (
+    <div className={`session-claude-init${open ? " is-open" : ""}`}>
+      <button aria-expanded={open} className="session-claude-init-head" type="button" onClick={() => setOpen((value) => !value)}>
+        <ChevronRight className={`collapse-icon${open ? "" : " is-collapsed"}`} size={12} />
+        <span>session started: {model}{cwd !== "—" ? ` in ${cwd}` : ""}</span>
+      </button>
+      <div className={`session-collapsible session-claude-init-collapsible${open ? " is-open" : ""}`}>
+        <div className="session-collapsible-inner">
+          <dl className="session-claude-init-details">
+            {details.map(([label, value]) => (
+              <div key={label}>
+                <dt>{label}</dt>
+                <dd>{claudeValue(value)}</dd>
+              </div>
+            ))}
+          </dl>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ClaudeTaskRow({ event }: { event: SessionEvent }) {
+  const task = event.claude_task ?? {};
+  const id = task.task_id || task.tool_use_id || "unknown";
+  const status = task.status || "updated";
+  const summary = task.summary || "task update";
+  return (
+    <div className={`session-claude-task is-${status}`}>
+      <span className="session-claude-task-label">task {id}</span>
+      <span className="session-claude-task-status">— {status}:</span>
+      <span className="session-claude-task-summary">{summary}</span>
+      {task.output_file ? (
+        <a className="session-claude-task-output" href={task.output_file} {...externalLinkProps(task.output_file)}>
+          output file
+        </a>
+      ) : null}
+    </div>
+  );
+}
+
+export function ClaudeApiRetryRow({ event }: { event: SessionEvent }) {
+  const retry = event.claude_api_retry ?? {};
+  const attempt = retry.attempt ?? "?";
+  const max = retry.max_retries ?? "?";
+  const status = retry.error_status || "error";
+  const delay = typeof retry.retry_delay_ms === "number" ? retry.retry_delay_ms : 0;
+  return (
+    <div className="session-claude-retry" data-testid="claude-api-retry-chip">
+      <AlertTriangle size={12} />
+      <span className="tabular-nums">retry {attempt}/{max}</span>
+      <span>— {status} in {delay}ms</span>
+    </div>
+  );
+}
+
+function formatRateLimitReset(resetsAt: number | null | undefined): string | null {
+  if (typeof resetsAt !== "number") return null;
+  const hours = Math.max(0, (resetsAt * 1000 - Date.now()) / 3_600_000);
+  return `resets in ${hours < 1 ? `${Math.max(1, Math.round(hours * 60))}m` : `${Math.max(1, Math.round(hours))}h`}`;
+}
+
+export function ClaudeRateLimitChrome({ rate }: { rate: SessionRateLimit }) {
+  if (!rate.status || rate.status === "allowed") return null;
+  return (
+    <span className="session-state-rate-limit" data-testid="claude-rate-limit-session-pill">
+      <AlertTriangle size={12} />
+      <span>{rate.status}</span>
+      {rate.rateLimitType ? <span>{rate.rateLimitType}</span> : null}
+      {typeof rate.isUsingOverage === "boolean" ? (
+        <span>overage {rate.isUsingOverage ? "on" : "off"}</span>
+      ) : null}
+      {rate.overageStatus ? <span>overage status {rate.overageStatus}</span> : null}
+      {rate.overageDisabledReason ? <span>overage reason {rate.overageDisabledReason}</span> : null}
+      {formatRateLimitReset(rate.resetsAt) ? <span className="tabular-nums">{formatRateLimitReset(rate.resetsAt)}</span> : null}
+    </span>
+  );
+}
+
+function ClaudeRateLimitRow({ event }: { event: SessionEvent }) {
+  const rate = event.claude_rate_limit ?? {};
+  return (
+    <div className="session-claude-rate-limit is-prominent" data-testid="claude-rate-limit-row">
+      <AlertTriangle size={13} />
+      <span>{rate.status || "rate limit"}</span>
+      {rate.rateLimitType ? <span>{rate.rateLimitType}</span> : null}
+      {typeof rate.isUsingOverage === "boolean" ? <span>overage {rate.isUsingOverage ? "on" : "off"}</span> : null}
+      {rate.overageStatus ? <span>overage status {rate.overageStatus}</span> : null}
+      {rate.overageDisabledReason ? <span>overage reason {rate.overageDisabledReason}</span> : null}
+      {formatRateLimitReset(rate.resetsAt) ? <span className="tabular-nums">{formatRateLimitReset(rate.resetsAt)}</span> : null}
     </div>
   );
 }
@@ -1618,6 +1740,12 @@ const MessageBlock = memo(function MessageBlock({
   if (event.kind === "tasks") {
     return <TaskListRow event={event} stateKey={`tasks:${rowKey}`} uiState={uiState} />;
   }
+  if (event.kind === "claude_init") {
+    return <ClaudeInitRow event={event} stateKey={`claude-init:${rowKey}`} uiState={uiState} />;
+  }
+  if (event.kind === "claude_task") return <ClaudeTaskRow event={event} />;
+  if (event.kind === "claude_api_retry") return <ClaudeApiRetryRow event={event} />;
+  if (event.kind === "claude_rate_limit") return <ClaudeRateLimitRow event={event} />;
   if (event.kind === "question") {
     return <QuestionRow event={event} />;
   }
@@ -2531,11 +2659,13 @@ export function SessionTab({
   const tokens = formatTokens(session.tokens);
   const dispositionCounts = formatDispositionCounts(session.dispositions);
   const footerSegments = [session.format, tokens ?? "", dispositionCounts].filter(Boolean);
+  const rateLimit = session.sessionMeta.rate_limit;
+  const thinkingTokens = session.sessionMeta.thinking_tokens?.total;
 
   return (
     <QuestionUiContext.Provider value={questionUi}>
       <div className="session-tab" ref={containerRef}>
-      {(session.tasks.length > 0 || session.pr || session.sessionMeta.custom_title || session.sessionMeta.agent_name) ? (
+      {(session.tasks.length > 0 || session.pr || session.sessionMeta.custom_title || session.sessionMeta.agent_name || typeof thinkingTokens === "number" || (rateLimit?.status && rateLimit.status !== "allowed")) ? (
         <div className="session-state-strip">
           {session.sessionMeta.custom_title ? (
             <span className="session-state-meta">{session.sessionMeta.custom_title}</span>
@@ -2553,6 +2683,10 @@ export function SessionTab({
               </span>
             </span>
           ) : null}
+          {typeof thinkingTokens === "number" ? (
+            <span className="session-state-meta tabular-nums">thinking {thinkingTokens} tokens</span>
+          ) : null}
+          {rateLimit ? <ClaudeRateLimitChrome rate={rateLimit} /> : null}
           {session.pr ? (
             <a
               className="session-state-pr"

@@ -2,13 +2,19 @@
 type: log
 tags: [log, done]
 created: 2026-07-06
-updated: 2026-07-29
+updated: 2026-07-30
 ---
 
 # Done
 
+## 2026-07-30
+
+- **wiki** — WIKI-217 supervisor fingerprint-swap wedge fixed (dev-client swap guard + early lock release + socket inode guard), merged 5017f26
+
 ## 2026-07-29
 
+- **phoebe** — PHO-13647 account-health PostHog batch tool merged (#12623, 3 review rounds + conflict rebase re-verify)
+- WIKI-211 merged 1ed52f1 — Claude provider-stream renderers batch (thinking_tokens SUMMARIZED, system:init collapsible, task_notification+task_updated patch cards, api_retry warning chip in default chrome, rate_limit_event nested rate_limit_info parse + overage chrome + session-level hoist on rejected). Closes WIKI-211/212/213/214/215. 2 rounds.
 - WIKI-172 merged c604ad3 — merge-ready loop UI: ticket-level chrome (round N/8 subdued/warning/danger tiers, unrouted verdict badge {0,1}, plateau counter w/ first-line normalization + similarity, expandable history panel via canonical workgraph edges), backend loop_state.py derivation, cap chain graph→template→default (F4 rejection upheld, WIKI-164 doctrine). 3 rounds.
 - WIKI-171 merged c713e87 — next-review orchestrator primitive: single MCP tool + endpoint collapsing gate + worktree + spawn + prev-archive per merge-ready round (crash-safe journal-before-side-effect w/ archive reconciliation, status-file terminal-state derivation, short-SHA canonicalization, AGENT_STATUS_DIR + operations-journal test isolation, MCP schema shared w/ NextReviewIn, cc-optional effort). 4 rounds.
 - WIKI-170 merged 0f1493b — fleet-wide DAG rollup: /fleet/graph endpoint aggregating live workers + last N archived per orch via graph_health loader (bounded metadata-first slice, headless orch bucket seeding, endpoint classification via node_tickets for legacy N-* nodes), frontend fleet-graph.tsx w/ orch groups + client-side filter chips. 3 rounds.
@@ -62,6 +68,11 @@ updated: 2026-07-29
 - **wiki** — dropped provider auth ribbon badge (b21bc5c) — sidecar probe stuck unknown, chips pure noise; backend probe kept
 - **mitm-inspector** — MITMWEB-B4+F7 flow-summary enrichment, body search, conversation view merged (tooling PRs #2, #3, 2026-07-20) — restored after vault rollback
 - **mitm-inspector** — MITMWEB-F8 session-first UX merged (tooling PR #5, squash cd1430b) — session-list home, canonical-thread chat drill-in with manual picker, sanitized markdown; 12 sol review rounds + in-session fallback pass
+- **mitm-inspector** — MITMWEB-F9 readability polish merged (tooling PR #6, squash b117f92) — two-line session rows, centered 76ch conversation column, role-distinct turn cards; presentation-only
+- **mitm-inspector** — MITMWEB-F10 chat-UI overhaul merged (tooling PR #7, squash 7ed5ef6) — Henry kill-list applied (auxiliary-calls collapse, side-call tables, default-visible picker), breadcrumb drill-in header, 860px transcript column
+- **mitm-inspector** — MITMWEB-F11 chat render fidelity merged (tooling PR #8, squash dbe26bc) — remark-gfm tables/strikethrough/task-lists, untrusted-tag escape via mdast html→text nodes, wider clamp(960px,92vw,1320px) transcript
+- **mitm-inspector** — MITMWEB-B5 backend read-path perf merged (tooling PR #9, squash a5a6cb4) — flow-index detail reads, skip redundant re-validation; packet loads 11.6s/30s+ timeout → <100ms
+- **mitm-inspector** — MITMWEB-B6 websocket browse path removed merged (tooling PR #10, squash dac2808) — sqlite-backed GET /sessions + /sessions/<id>, SPA on HTTP reads, WS stream/fanout/cursor deleted
 - **wiki** — Moxy Static font bundled + added to mono font picker (5bbb71b, direct commit)
 
 ## 2026-07-20

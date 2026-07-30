@@ -57,6 +57,8 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[recommendation-subagents]] — recommendation-subagents campaign (June–July 2026): changes, eval numbers, overfit arc.
 - [[pr10475-parity-loop]] — PR-10475 parity iteration protocol: OFF frozen, no eval overfit, 6-step loop until ON hits OFF-vs-OFF noise floor
 - [[datasource-sync-auto-disable]] — axiscare sync auto-disable: self-heals via 10:10Z daily forced sync; retry logs blind to status on result-based retries
+- [[admin-agent-tool-discovery]] — native tool_search + defer_loading decision, shipping chain PHO-14285..88, go/no-go = 14286 eval, watch items
+- [[admin-redesign]] — full /admin/* redesign decision (2026-07-27): Ramp×Linear×wiki direction, scrap 14461 primitives, signal-tier IA per laws-of-ux, one mega-PR after in-flight admin set lands
 
 ## Phoebe/til
 
@@ -96,6 +98,10 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 ## Mitm-inspector/decisions
 
 - [[public-hook-adapter]] — Architecture: public mitmproxy hook addon and independent UI; private mitmweb API rejected
+
+## Wiki-app
+
+- [[supervisor-fingerprint-swap-wedge]] — dev-code clients kill the prod agent supervisor via fingerprint swap; shutdown wedges holding the lock
 
 ## Families (path patterns, not enumerated)
 
