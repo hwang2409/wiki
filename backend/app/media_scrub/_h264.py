@@ -24,6 +24,12 @@ from .base import MediaScrubError
 
 _H264_MAX_DIMENSION = 8192
 _H264_MAX_PIXELS = 16_777_216
+_H264_MAX_DPB_MBS = {
+    9: 396, 10: 396, 11: 900, 12: 2376, 13: 2376, 20: 2376,
+    21: 4752, 22: 8100, 30: 8100, 31: 18000, 32: 20480,
+    40: 32768, 41: 32768, 42: 34816, 50: 110400, 51: 184320,
+    52: 184320, 60: 696960, 61: 983040, 62: 2073600,
+}
 
 
 class _BitReader:
@@ -240,7 +246,9 @@ def _copy_hrd_parameters(reader: _BitReader, writer: _BitWriter) -> None:
     writer.write_bits(reader.read_bits(5), 5)  # time_offset_length
 
 
-def _copy_vui_parameters(reader: _BitReader, writer: _BitWriter) -> None:
+def _copy_vui_parameters(
+    reader: _BitReader, writer: _BitWriter, max_dpb_frames: int,
+) -> None:
     aspect_ratio_info_present_flag = reader.read_u1()
     writer.write_u1(aspect_ratio_info_present_flag)
     if aspect_ratio_info_present_flag:
@@ -303,8 +311,15 @@ def _copy_vui_parameters(reader: _BitReader, writer: _BitWriter) -> None:
         writer.write_ue(reader.read_ue())  # max_bits_per_mb_denom
         writer.write_ue(reader.read_ue())  # log2_max_mv_length_horizontal
         writer.write_ue(reader.read_ue())  # log2_max_mv_length_vertical
-        writer.write_ue(reader.read_ue())  # max_num_reorder_frames
-        writer.write_ue(reader.read_ue())  # max_dec_frame_buffering
+        max_num_reorder_frames = reader.read_ue()
+        max_dec_frame_buffering = reader.read_ue()
+        if (
+            max_num_reorder_frames > max_dec_frame_buffering
+            or max_dec_frame_buffering > max_dpb_frames
+        ):
+            raise MediaScrubError("h264 VUI decoded-picture-buffer limits are invalid")
+        writer.write_ue(max_num_reorder_frames)
+        writer.write_ue(max_dec_frame_buffering)
 
 
 def _parse_and_emit_sps_rbsp(rbsp: bytes) -> tuple[bytes, int, tuple[int, int]]:
@@ -371,7 +386,8 @@ def _parse_and_emit_sps_rbsp(rbsp: bytes) -> tuple[bytes, int, tuple[int, int]]:
         for _ in range(num_ref_in_cycle):
             writer.write_se(reader.read_se())
 
-    writer.write_ue(reader.read_ue())  # max_num_ref_frames
+    max_num_ref_frames = reader.read_ue()
+    writer.write_ue(max_num_ref_frames)
     writer.write_u1(reader.read_u1())  # gaps_in_frame_num_value_allowed_flag
     pic_width_in_mbs_minus1 = reader.read_ue()
     pic_height_in_map_units_minus1 = reader.read_ue()
@@ -390,6 +406,15 @@ def _parse_and_emit_sps_rbsp(rbsp: bytes) -> tuple[bytes, int, tuple[int, int]]:
         or coded_width * coded_height > _H264_MAX_PIXELS
     ):
         raise MediaScrubError("h264 SPS coded dimensions exceed scrubber limits")
+    max_dpb_mbs = _H264_MAX_DPB_MBS.get(level_idc)
+    if max_dpb_mbs is None:
+        raise MediaScrubError("h264 SPS level_idc has no DPB limit")
+    frame_mbs = ((pic_width_in_mbs_minus1 + 1)
+                 * (pic_height_in_map_units_minus1 + 1)
+                 * coded_height_multiplier)
+    max_dpb_frames = min(16, max_dpb_mbs // frame_mbs)
+    if max_dpb_frames < 1 or max_num_ref_frames > max_dpb_frames:
+        raise MediaScrubError("h264 SPS max_num_ref_frames exceeds level DPB limit")
     writer.write_u1(frame_mbs_only_flag)
     if not frame_mbs_only_flag:
         writer.write_u1(reader.read_u1())  # mb_adaptive_frame_field_flag
@@ -433,7 +458,7 @@ def _parse_and_emit_sps_rbsp(rbsp: bytes) -> tuple[bytes, int, tuple[int, int]]:
     vui_present = reader.read_u1()
     writer.write_u1(vui_present)
     if vui_present:
-        _copy_vui_parameters(reader, writer)
+        _copy_vui_parameters(reader, writer, max_dpb_frames)
 
     reader.read_rbsp_trailing_bits()
     writer.write_rbsp_trailing_bits()

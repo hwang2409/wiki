@@ -3291,5 +3291,163 @@ class Review20MediaProbeTests(unittest.TestCase):
         self.assertLess(elapsed, 8.0, f"scrub took {elapsed:.2f}s")
 
 
+class Review21MediaProbeTests(unittest.TestCase):
+    def test_aac_sample_marker_is_rejected_before_storage(self) -> None:
+        payload = bytearray(REAL_MIXED_MP4.read_bytes())
+        audio = next(
+            track for track in Review17MediaProbeTests._track_info(payload)
+            if track["handler"] == b"soun"
+        )
+        stsz_body = int(audio["stsz_body"])
+        stco_body = int(audio["stco_body"])
+        first_offset = struct.unpack(">I", payload[stco_body + 8:stco_body + 12])[0]
+        first_size = struct.unpack(">I", payload[stsz_body + 12:stsz_body + 16])[0]
+        marker = b"GPS-AAC-SAMPLE"
+        payload[first_offset:first_offset + first_size] = (
+            marker + b"X" * (first_size - len(marker))
+        )
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "AAC"):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+    def test_mvhd_and_tkhd_matrices_reject_marker_bytes(self) -> None:
+        for box_type, matrix_offset in ((b"mvhd", 36), (b"tkhd", 40)):
+            with self.subTest(box_type=box_type):
+                payload = bytearray(REAL_MP4.read_bytes())
+                type_pos = payload.find(box_type)
+                marker = b"GPS-MATRIX!!"
+                payload[type_pos + 4 + matrix_offset:type_pos + 4 + matrix_offset + len(marker)] = marker
+                with self.assertRaisesRegex(media_scrub.MediaScrubError, "matrix"):
+                    media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+    @staticmethod
+    def _sps_with_ref_count(max_num_ref_frames: int) -> bytes:
+        writer = h264_scrubber._BitWriter()
+        writer.write_bits(100, 8)
+        writer.write_bits(0, 8)
+        writer.write_bits(10, 8)
+        writer.write_ue(0)
+        writer.write_ue(1)
+        writer.write_ue(0)
+        writer.write_ue(0)
+        writer.write_u1(0)
+        writer.write_u1(0)
+        writer.write_ue(0)
+        writer.write_ue(0)
+        writer.write_ue(0)
+        writer.write_ue(max_num_ref_frames)
+        writer.write_u1(0)
+        writer.write_ue(9)
+        writer.write_ue(7)
+        writer.write_u1(1)
+        writer.write_u1(1)
+        writer.write_u1(1)
+        writer.write_ue(0)
+        writer.write_ue(0)
+        writer.write_ue(0)
+        writer.write_ue(4)
+        writer.write_u1(0)
+        writer.write_rbsp_trailing_bits()
+        return b"\x67" + h264_scrubber._rbsp_escape(writer.to_bytes())
+
+    def test_sps_reference_count_is_bounded_by_level_dpb(self) -> None:
+        payload = Review20MediaProbeTests._replace_sps(
+            REAL_MP4.read_bytes(), self._sps_with_ref_count(5),
+        )
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "DPB"):
+            media_scrub.scrub_video(payload, "video/mp4")
+
+    @staticmethod
+    def _near_limit_chunk_mdat_fixture() -> bytes:
+        real = REAL_MP4.read_bytes()
+        top = Review17MediaProbeTests._children(real, 0, len(real))
+        ftyp = next(child for child in top if child[0] == b"ftyp")
+        moov = next(child for child in top if child[0] == b"moov")
+        ftyp_bytes = real[ftyp[1]:ftyp[2]]
+        moov_bytes = real[moov[1]:moov[2]]
+        sample_count = 65_536
+        mdat_count = 4_094
+        samples_per_mdat = [16] * (mdat_count - 1) + [48]
+        sample = b"\x00\x00\x00\x02\x06\x80"
+        mdat_bodies = [sample * count for count in samples_per_mdat]
+
+        def box(box_type: bytes, body: bytes) -> bytes:
+            return struct.pack(">I", 8 + len(body)) + box_type + body
+
+        def rebuild_tree(raw: bytes, replacements: dict[bytes, bytes]) -> bytes:
+            box_type = raw[4:8]
+            if box_type in replacements:
+                return replacements[box_type]
+            if box_type not in {b"moov", b"trak", b"mdia", b"minf", b"stbl"}:
+                return raw
+            body = raw[8:]
+            children = []
+            offset = 0
+            while offset < len(body):
+                child_size = struct.unpack(">I", body[offset:offset + 4])[0]
+                children.append(rebuild_tree(body[offset:offset + child_size], replacements))
+                offset += child_size
+            if offset != len(body):
+                raise AssertionError("fixture container did not end on a child boundary")
+            return box(box_type, b"".join(children))
+
+        def replacement_map(stco: bytes) -> dict[bytes, bytes]:
+            replacements = {
+                b"stsc": box(
+                    b"stsc",
+                    b"\x00\x00\x00\x00" + struct.pack(">I", 1)
+                    + struct.pack(">III", 1, 1, 1),
+                ),
+                b"stsz": box(
+                    b"stsz",
+                    b"\x00\x00\x00\x00" + struct.pack(">II", len(sample), sample_count),
+                ),
+                b"stts": box(
+                    b"stts",
+                    b"\x00\x00\x00\x00" + struct.pack(">I", 1)
+                    + struct.pack(">II", sample_count, 1),
+                ),
+                b"stco": stco,
+            }
+            if b"ctts" in moov_bytes:
+                replacements[b"ctts"] = box(
+                    b"ctts",
+                    b"\x00\x00\x00\x00" + struct.pack(">I", 1)
+                    + struct.pack(">II", sample_count, 0),
+                )
+            return replacements
+
+        placeholder_stco = box(
+            b"stco",
+            b"\x00\x00\x00\x00" + struct.pack(">I", sample_count)
+            + b"\x00" * (sample_count * 4),
+        )
+        placeholder_moov = rebuild_tree(
+            moov_bytes, replacement_map(placeholder_stco),
+        )
+        mdat_start = len(ftyp_bytes) + len(placeholder_moov)
+        offsets: list[int] = []
+        cursor = mdat_start
+        for body in mdat_bodies:
+            body_start = cursor + 8
+            offsets.extend(body_start + index * len(sample) for index in range(len(body) // len(sample)))
+            cursor += 8 + len(body)
+        self_stco = box(
+            b"stco",
+            b"\x00\x00\x00\x00" + struct.pack(">I", sample_count)
+            + b"".join(struct.pack(">I", value) for value in offsets),
+        )
+        final_moov = rebuild_tree(moov_bytes, replacement_map(self_stco))
+        mdats = b"".join(box(b"mdat", body) for body in mdat_bodies)
+        return ftyp_bytes + final_moov + mdats
+
+    def test_near_limit_chunks_and_mdats_are_grouped(self) -> None:
+        payload = self._near_limit_chunk_mdat_fixture()
+        started = time.perf_counter()
+        result = media_scrub.scrub_video(payload, "video/mp4")
+        elapsed = time.perf_counter() - started
+        self.assertEqual(len(result.data), len(payload))
+        self.assertLess(elapsed, 8.0, f"scrub took {elapsed:.2f}s")
+
+
 if __name__ == "__main__":
     unittest.main()
