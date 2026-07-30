@@ -72,7 +72,7 @@ In Progress:
 - [P2] WIKI-157 utility-page refinement: activity/graph/health/token usage — title+loading+empty+error+retry everywhere, graph keyboard/noncanvas access, git/CLI terminology secondary, no false-zero token data
 - [P3] WIKI-168 daemon-ize wiki backend — open since graph-engineering D2; survive terminal close, launchd or equivalent
 - [P1] PHO-14864 land agent-bash-recs-proto on main behind feature flag (owner: phoebe orch)
-- [P2] WIKI-221 fleet-card screencast preview collapsible — agent output preview (ScreencastStrip) in each agent card is always visible and tall; hide behind a click-to-expand disclosure, default collapsed, per-ticket localStorage persistence (wiki-collapsed-folders pattern), reuse chevron collapse affordances; skip strip mount/poll while collapsed. Frontend ticket: cc fable-5 worker + /frontend-design + /make-interfaces-feel-better at spawn — cc:WIKI-221
+- [P2] WIKI-221 fleet-card screencast preview collapsible — agent output preview (ScreencastStrip) in each agent card is always visible and tall; hide behind a click-to-expand disclosure, default collapsed, per-ticket localStorage persistence (wiki-collapsed-folders pattern), reuse chevron collapse affordances; skip strip mount/poll while collapsed; working-diff panel (DiffRenderer, codex-stream-renderers.tsx:356) gets the same section-level disclosure (Henry 2026-07-30). Frontend ticket: cc fable-5 worker + /frontend-design + /make-interfaces-feel-better at spawn — cc:WIKI-221
 
 Backlog:
 
