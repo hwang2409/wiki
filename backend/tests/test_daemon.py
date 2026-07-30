@@ -432,6 +432,79 @@ class DaemonArtifactTests(unittest.TestCase):
 
 
 class DaemonHandshakeTests(unittest.TestCase):
+    def test_forged_adhoc_peer_with_same_identifier_is_rejected(self) -> None:
+        details = "\n".join(
+            [
+                "Identifier=com.hwang2409.wiki",
+                "Signature=adhoc",
+                "TeamIdentifier=not set",
+            ]
+        )
+        with patch.object(native_server, "_bundle_team_identifier", return_value="ABCDE12345"), patch.object(
+            native_server, "_peer_pid", return_value=123
+        ), patch.object(
+            native_server, "_peer_executable", return_value=Path("/tmp/forged-wiki")
+        ), patch.object(
+            native_server.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(
+                ["codesign"], 0, "", details
+            ),
+        ), socket.socket() as peer:
+            self.assertFalse(native_server.is_trusted_tauri_peer(peer))
+
+    def test_developer_signature_requires_team_and_designated_requirement(self) -> None:
+        details = "\n".join(
+            [
+                "Identifier=com.hwang2409.wiki",
+                "Signature=CMS",
+                "TeamIdentifier=ABCDE12345",
+                "Authority=Apple Development: Wiki",
+            ]
+        )
+        calls: list[list[str]] = []
+
+        def fake_run(arguments: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            calls.append(arguments)
+            return subprocess.CompletedProcess(arguments, 0, "", details)
+
+        with patch.object(native_server, "_bundle_team_identifier", return_value="ABCDE12345"), patch.object(
+            native_server, "_peer_pid", return_value=123
+        ), patch.object(
+            native_server, "_peer_executable", return_value=Path("/tmp/signed-wiki")
+        ), patch.object(native_server.subprocess, "run", side_effect=fake_run), socket.socket() as peer:
+            self.assertTrue(native_server.is_trusted_tauri_peer(peer))
+
+        self.assertEqual(calls[1][0:4], ["/usr/bin/codesign", "--verify", "--strict", "--requirements"])
+        self.assertIn('anchor apple generic', calls[1][4])
+        self.assertIn('certificate leaf[subject.OU] = "ABCDE12345"', calls[1][4])
+
+    def test_auth_thread_survives_client_disconnect_before_send(self) -> None:
+        with TemporaryDirectory() as tmp:
+            first_checked = threading.Event()
+            calls = 0
+
+            def peer_checker(connection: socket.socket) -> bool:
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    first_checked.set()
+                    connection.close()
+                return True
+
+            server = DaemonAuthSocket(
+                Path(tmp) / "runtime", "survives", peer_checker=peer_checker
+            )
+            server.start()
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as first:
+                first.connect(str(server.path))
+                self.assertTrue(first_checked.wait(timeout=1))
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as second:
+                second.settimeout(1)
+                second.connect(str(server.path))
+                self.assertEqual(second.recv(4096).decode().strip(), "survives")
+            server.close()
+
     def test_sidecar_pipe_secret_is_not_in_child_environment(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

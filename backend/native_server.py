@@ -6,6 +6,7 @@ from contextlib import nullcontext
 import fcntl
 import os
 import platform
+import re
 import secrets
 import signal
 import socket
@@ -22,6 +23,7 @@ import uvicorn
 DAEMON_AUTH_SOCKET_NAME = "wiki-app-secret.sock"
 DAEMON_AUTH_LOCK_NAME = "wiki-app-secret.lock"
 TAURI_BUNDLE_IDENTIFIER = "com.hwang2409.wiki"
+TAURI_BUNDLE_PATH = Path("/Applications/Wiki.app")
 DAEMON_LOG_MAX_BYTES = 10 * 1024 * 1024
 DAEMON_LOG_BACKUPS = 5
 _LOG_REDIRECT_LOCK = threading.Lock()
@@ -199,8 +201,13 @@ class DaemonAuthSocket:
             except OSError:
                 break
             with connection:
-                if not self.stop.is_set() and self.peer_checker(connection):
-                    connection.sendall(self.secret)
+                try:
+                    if not self.stop.is_set() and self.peer_checker(connection):
+                        connection.sendall(self.secret)
+                except Exception:
+                    # A client can disappear while peer verification or sendall
+                    # runs. Keep the listener alive for the next app handshake.
+                    continue
 
     def close(self) -> None:
         self.stop.set()
@@ -255,21 +262,83 @@ def _peer_executable(pid: int) -> Path | None:
     return Path(buffer.value.decode("utf-8"))
 
 
+def _codesign_details(executable: Path) -> list[str] | None:
+    try:
+        result = subprocess.run(
+            ["/usr/bin/codesign", "-dvvv", str(executable)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    return (result.stdout + result.stderr).splitlines()
+
+
+def _bundle_team_identifier(app_path: Path) -> str | None:
+    details = _codesign_details(app_path)
+    if not details or any(line == "Signature=adhoc" for line in details):
+        return None
+    team = next(
+        (line.removeprefix("TeamIdentifier=") for line in details if line.startswith("TeamIdentifier=")),
+        None,
+    )
+    if not team or team == "not set" or not any(line.startswith("Authority=") for line in details):
+        return None
+    return team
+
+
+def _verify_code_identity(executable: Path, team_identifier: str | None = None) -> bool:
+    """Verify a real Apple signature and its designated requirement."""
+
+    team = (team_identifier or "").strip()
+    if not team or not re.fullmatch(r"[A-Z0-9]{10}", team):
+        return False
+    details = _codesign_details(executable)
+    if not details:
+        return False
+    if any(line == "Signature=adhoc" for line in details):
+        return False
+    if f"Identifier={TAURI_BUNDLE_IDENTIFIER}" not in details:
+        return False
+    if f"TeamIdentifier={team}" not in details:
+        return False
+    if not any(line.startswith("Authority=") for line in details):
+        return False
+    requirement = (
+        f'anchor apple generic and identifier "{TAURI_BUNDLE_IDENTIFIER}" '
+        f'and certificate leaf[subject.OU] = "{team}"'
+    )
+    try:
+        result = subprocess.run(
+            [
+                "/usr/bin/codesign",
+                "--verify",
+                "--strict",
+                "--requirements",
+                f"={requirement}",
+                str(executable),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return False
+    return result.returncode == 0
+
+
 def is_trusted_tauri_peer(connection: socket.socket) -> bool:
-    """Accept only a process signed as the Wiki.app bundle."""
+    """Accept only a developer-signed process matching the installed Wiki.app team."""
 
     pid = _peer_pid(connection)
     executable = _peer_executable(pid) if pid is not None else None
-    if executable is None:
-        return False
-    result = subprocess.run(
-        ["/usr/bin/codesign", "-dvv", str(executable)],
-        check=False,
-        capture_output=True,
-        text=True,
+    trusted_team = _bundle_team_identifier(TAURI_BUNDLE_PATH)
+    return executable is not None and trusted_team is not None and _verify_code_identity(
+        executable, trusted_team
     )
-    identity = (result.stdout + result.stderr).splitlines()
-    return result.returncode == 0 and f"Identifier={TAURI_BUNDLE_IDENTIFIER}" in identity
 
 
 def read_sidecar_secret() -> str:

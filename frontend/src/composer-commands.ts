@@ -64,10 +64,7 @@ type WindowWithComposerSecret = Window & {
   __TAURI_INTERNALS__?: unknown;
 };
 
-let cachedWikiAppSecret: string | null = null;
-
 async function getWikiAppSecret(): Promise<string> {
-  if (cachedWikiAppSecret) return cachedWikiAppSecret;
   if (typeof window === "undefined") {
     throw new Error("Wiki.app origin secret unavailable outside a browser context");
   }
@@ -82,7 +79,6 @@ async function getWikiAppSecret(): Promise<string> {
   if (typeof value !== "string" || !value) {
     throw new Error("Wiki.app origin secret is empty");
   }
-  cachedWikiAppSecret = value;
   return value;
 }
 
