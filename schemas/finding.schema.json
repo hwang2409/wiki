@@ -19,11 +19,13 @@
     "title": {"type": "string", "maxLength": 140},
     "file": {"type": "string"},
     "line": {"type": "integer", "minimum": 1},
+    "line_end": {"type": "integer", "minimum": 1},
     "observed": {"type": "string"},
     "why_wrong": {"type": "string"},
     "do_instead": {"type": "string"},
     "constraint": {"type": "string"},
     "source_worker": {"type": "string", "description": "worker id, e.g. PHO-14060-REVIEW3"},
+    "source_lenses": {"type": "array", "items": {"type": "string"}, "minItems": 1, "uniqueItems": true},
     "source_kind": {"enum": ["review", "sim", "thermo", "audit", "canary", "eval", "human"]},
     "source_sha": {"type": "string", "pattern": "^[a-f0-9]{7,40}$"},
     "linked_findings": {
