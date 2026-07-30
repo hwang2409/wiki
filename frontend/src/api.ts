@@ -1034,9 +1034,17 @@ export type ReplayRunSummary = {
 export type ReplayTimeline = {
   run: ReplayRunSummary;
   events: ReplayTimelineEvent[];
-  next_after_seq: number | null;
+  next_cursor: string | null;
+  has_more: boolean;
   bookmarks: ReplayBookmark[];
+  bookmarks_truncated: boolean;
   warnings: string[];
+};
+
+export type ReplayRunsResponse = {
+  ticket: string;
+  runs: ReplayRunSummary[];
+  runs_truncated: boolean;
 };
 
 export type ReplayRawEvent = {
@@ -1046,7 +1054,7 @@ export type ReplayRawEvent = {
 };
 
 export function getAgentReplayRuns(ticket: string, signal?: AbortSignal) {
-  return request<{ ticket: string; runs: ReplayRunSummary[] }>(
+  return request<ReplayRunsResponse>(
     `/api/agents/${encodeURIComponent(ticket)}/replay/runs`,
     { signal }
   );
@@ -1054,9 +1062,10 @@ export function getAgentReplayRuns(ticket: string, signal?: AbortSignal) {
 
 export function getReplayTimeline(
   runId: string,
-  { afterSeq = 0, limit = 500, signal }: { afterSeq?: number; limit?: number; signal?: AbortSignal } = {},
+  { cursor, limit = 500, signal }: { cursor?: string | null; limit?: number; signal?: AbortSignal } = {},
 ) {
-  const params = new URLSearchParams({ after_seq: String(afterSeq), limit: String(limit) });
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (cursor) params.set("cursor", cursor);
   return request<ReplayTimeline>(
     `/api/agent-runs/${encodeURIComponent(runId)}/replay/timeline?${params.toString()}`,
     { signal }

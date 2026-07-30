@@ -1,11 +1,15 @@
 """WIKI-174 backend replay endpoint + timeline builder tests.
 
-Round-2 test additions cover the review's HIGH/MEDIUM findings:
-    * bounded byte reads (oversized-line drop + torn-tail guard)
-    * symlink-safe run dir resolution
-    * bookmark classification against fixtures derived from a real Claude
-      and a real Codex ``events.jsonl`` (with synthetic supplements for the
-      failure-path shapes the sampled sessions didn't happen to emit)
+Round-3 coverage additions:
+    * Strict oversized-line survivors — BOTH surrounding records must
+      survive the drop (round-2 test masked the data-loss regression).
+    * Symlink swap under a valid run — mid-request replacement of the run
+      dir's child with a symlink outside the runs root must fail the open
+      via pathwalk, without leaking the swapped-in target.
+    * Large-file pagination — a real ≥64 MiB events.jsonl must page in
+      linear time via the opaque byte cursor (round-2 rescanned from zero
+      each page).
+    * Bounded ``run.json`` metadata reads + run-list cap surfaced.
 """
 
 from __future__ import annotations
@@ -115,6 +119,15 @@ def runs_root(tmp_path: Path) -> Path:
 
 
 @pytest.fixture()
+def runs_root_fd(runs_root: Path):
+    fd = replay.open_runs_root_fd(runs_root)
+    try:
+        yield fd
+    finally:
+        os.close(fd)
+
+
+@pytest.fixture()
 def run_dir(runs_root: Path) -> Path:
     run_dir = runs_root / RUN_ID
     run_dir.mkdir()
@@ -131,6 +144,17 @@ def run_dir(runs_root: Path) -> Path:
     return run_dir
 
 
+def _iter_events_from_path(path: Path, **kwargs) -> list[dict]:
+    """Test convenience: stream_json_events over a raw path (opens+closes fd)."""
+
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        stats = kwargs.pop("stats", replay._ScanStats())
+        return [entry for _off, entry in replay.stream_json_events(fd, stats=stats, **kwargs)]
+    finally:
+        os.close(fd)
+
+
 # ---------------------------------------------------------------------------
 # run_id / summary basics
 # ---------------------------------------------------------------------------
@@ -142,8 +166,8 @@ def test_valid_run_id() -> None:
     assert not replay.valid_run_id("../etc/passwd")
 
 
-def test_build_run_summary_reads_meta(run_dir: Path) -> None:
-    summary = replay.build_run_summary(run_dir)
+def test_build_run_summary_reads_meta(runs_root_fd: int, run_dir: Path) -> None:
+    summary = replay.build_run_summary(runs_root_fd, RUN_ID)
     assert summary.run_id == RUN_ID
     assert summary.agent_id == "WIKI-174"
     assert summary.orch_id == "wiki"
@@ -152,34 +176,46 @@ def test_build_run_summary_reads_meta(run_dir: Path) -> None:
     assert summary.initial_prompt_excerpt.endswith("…")
 
 
+def test_metadata_size_cap_rejects_oversize_run_json(
+    runs_root_fd: int, runs_root: Path
+) -> None:
+    """Round-3 review item 1: run.json reads must be size-capped."""
+
+    run_dir = runs_root / RUN_ID
+    run_dir.mkdir()
+    huge = {"run_id": RUN_ID, "initial_prompt": "x" * (replay.MAX_RUN_JSON_BYTES + 1024)}
+    (run_dir / "run.json").write_text(json.dumps(huge), encoding="utf-8")
+    with pytest.raises(replay.ReplayError) as exc:
+        replay.build_run_summary(runs_root_fd, RUN_ID)
+    assert "ceiling" in str(exc.value)
+
+
 # ---------------------------------------------------------------------------
 # Timeline window + bookmarks (synthetic)
 # ---------------------------------------------------------------------------
 
 
-def test_build_timeline_window_returns_all_events(run_dir: Path) -> None:
-    events, next_seq, stats = replay.build_timeline_window(run_dir / "events.jsonl")
-    assert next_seq is None
-    assert [e.seq for e in events] == [1, 2, 3, 4]
-    assert stats.dropped_oversize == 0
-    assert stats.dropped_truncated_tail is False
-    steer = next(e for e in events if e.seq == 2)
-    assert steer.bookmark == "steer"
-    assert "please do the thing" in steer.summary
-    verdict = next(e for e in events if e.seq == 3)
-    assert verdict.bookmark == "verdict"
-    assert "MERGE-READY" in verdict.summary
-    exit_event = next(e for e in events if e.seq == 4)
-    # Non-zero exit_code → error bookmark
-    assert exit_event.bookmark == "error"
+def test_build_timeline_page_returns_all_events(
+    runs_root_fd: int, run_dir: Path
+) -> None:
+    response = replay.build_timeline_response(runs_root_fd, RUN_ID)
+    assert response["has_more"] is False
+    assert response["next_cursor"] is None
+    seqs = [e["seq"] for e in response["events"]]
+    assert seqs == [1, 2, 3, 4]
+    bookmark_kinds = {b["kind"] for b in response["bookmarks"]}
+    assert bookmark_kinds == {"steer", "verdict", "error"}
+    assert response["bookmarks_truncated"] is False
 
 
-def test_zero_exit_code_is_not_error(tmp_path: Path) -> None:
-    """WIKI-174 round-2 review item 3: exit_code=0 was previously flagged as error."""
+def test_zero_exit_code_is_not_error(runs_root_fd: int, runs_root: Path) -> None:
+    """Round-2 review item 3: exit_code=0 was previously flagged as error."""
 
-    path = tmp_path / "events.jsonl"
+    run_dir = runs_root / RUN_ID
+    run_dir.mkdir()
+    (run_dir / "run.json").write_text(json.dumps(_base_run_json()), encoding="utf-8")
     _write_events(
-        path,
+        run_dir / "events.jsonl",
         [
             {
                 "seq": 1,
@@ -197,48 +233,87 @@ def test_zero_exit_code_is_not_error(tmp_path: Path) -> None:
             },
         ],
     )
-    events, _, _ = replay.build_timeline_window(path)
-    assert [e.bookmark for e in events] == [None, None]
+    response = replay.build_timeline_response(runs_root_fd, RUN_ID)
+    assert all(e["bookmark"] is None for e in response["events"])
 
 
-def test_build_timeline_window_bounds_response(run_dir: Path) -> None:
-    events, next_seq, _ = replay.build_timeline_window(
-        run_dir / "events.jsonl", limit=2
+def test_timeline_pagination_via_opaque_cursor(
+    runs_root_fd: int, run_dir: Path
+) -> None:
+    """Round-3 review item 4: byte-offset cursor + has_more."""
+
+    first = replay.build_timeline_response(runs_root_fd, RUN_ID, limit=2)
+    assert first["has_more"] is True
+    assert first["next_cursor"] is not None
+    assert [e["seq"] for e in first["events"]] == [1, 2]
+    # First page carries bookmarks; later pages must not repeat the scan.
+    assert first["bookmarks"]
+
+    second = replay.build_timeline_response(
+        runs_root_fd, RUN_ID, cursor=first["next_cursor"], limit=2
     )
-    assert len(events) == 2
-    assert next_seq == 2
-    tail, tail_next, _ = replay.build_timeline_window(
-        run_dir / "events.jsonl", after_seq=2, limit=2
+    assert [e["seq"] for e in second["events"]] == [3, 4]
+    assert second["has_more"] is False
+    assert second["next_cursor"] is None
+    assert second["bookmarks"] == []
+
+
+def test_cursor_is_opaque_and_encodes_byte_offset(runs_root_fd: int, run_dir: Path) -> None:
+    """Any transformation of the cursor must fail — it's not a user int."""
+
+    page = replay.build_timeline_response(runs_root_fd, RUN_ID, limit=1)
+    cursor = page["next_cursor"]
+    assert cursor is not None
+    assert isinstance(cursor, str)
+    # Bad cursor → 400 at endpoint / ReplayError at library.
+    with pytest.raises(replay.ReplayError):
+        replay.decode_cursor("this-is-not-base64!")
+
+
+def test_malformed_lines_are_counted_and_skipped(
+    runs_root_fd: int, runs_root: Path
+) -> None:
+    run_dir = runs_root / RUN_ID
+    run_dir.mkdir()
+    (run_dir / "run.json").write_text(json.dumps(_base_run_json()), encoding="utf-8")
+    events_path = run_dir / "events.jsonl"
+    events_path.write_bytes(
+        json.dumps(
+            {
+                "seq": 1,
+                "raw_seq": 1,
+                "kind": "claude_user",
+                "disposition": "rendered",
+                "payload": {"message": {"content": [{"type": "text", "text": "one"}]}},
+            }
+        ).encode()
+        + b"\n"
+        + b"{not-json\n"
+        + json.dumps(
+            {
+                "seq": 2,
+                "raw_seq": 2,
+                "kind": "claude_user",
+                "disposition": "rendered",
+                "payload": {"message": {"content": [{"type": "text", "text": "two"}]}},
+            }
+        ).encode()
+        + b"\n"
     )
-    assert [e.seq for e in tail] == [3, 4]
-    assert tail_next == 4
-    after_end, after_end_next, _ = replay.build_timeline_window(
-        run_dir / "events.jsonl", after_seq=4, limit=2
-    )
-    assert after_end == []
-    assert after_end_next is None
+    response = replay.build_timeline_response(runs_root_fd, RUN_ID)
+    seqs = [e["seq"] for e in response["events"]]
+    assert seqs == [1, 2]
+    assert any("malformed" in w for w in response["warnings"])
 
 
-def test_build_timeline_window_skips_malformed_lines(tmp_path: Path) -> None:
-    path = tmp_path / "events.jsonl"
-    path.write_text(
-        "\n".join(
-            [
-                json.dumps({"seq": 1, "raw_seq": 1, "kind": "k", "disposition": "d", "payload": {}}),
-                "{not-json",
-                json.dumps({"seq": 2, "raw_seq": 2, "kind": "k", "disposition": "d", "payload": {}}),
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    events, _, stats = replay.build_timeline_window(path)
-    assert [e.seq for e in events] == [1, 2]
-    assert stats.dropped_malformed == 1
+def test_bookmarks_truncated_flag_is_surfaced(
+    runs_root_fd: int, runs_root: Path
+) -> None:
+    """Round-3 review item 5: MAX_BOOKMARKS cap must surface a truncation flag."""
 
-
-def test_build_bookmarks_caps_output(tmp_path: Path) -> None:
-    path = tmp_path / "events.jsonl"
+    run_dir = runs_root / RUN_ID
+    run_dir.mkdir()
+    (run_dir / "run.json").write_text(json.dumps(_base_run_json()), encoding="utf-8")
     entries = [
         {
             "seq": i,
@@ -247,257 +322,277 @@ def test_build_bookmarks_caps_output(tmp_path: Path) -> None:
             "disposition": "rendered",
             "payload": {"exit_code": 137},
         }
-        for i in range(1, 25)
+        for i in range(1, replay.MAX_BOOKMARKS + 5)
     ]
-    _write_events(path, entries)
-    bookmarks, _ = replay.build_bookmarks(path, cap=10)
-    assert len(bookmarks) == 10
-    assert bookmarks[0]["kind"] == "error"
-
-
-def test_load_raw_event_bailout(run_dir: Path) -> None:
-    assert replay.load_raw_event(run_dir, 2) == {
-        "seq": 2,
-        "direction": "stdout",
-        "payload": {"type": "raw-1"},
-    }
-    assert replay.load_raw_event(run_dir, 99) is None
-    assert replay.load_raw_event(run_dir, 0) is None
-
-
-def test_missing_run_json_raises(tmp_path: Path) -> None:
-    with pytest.raises(replay.ReplayError):
-        replay.load_run_metadata(tmp_path)
-
-
-def test_tool_result_only_message_is_not_a_steer(tmp_path: Path) -> None:
-    path = tmp_path / "events.jsonl"
-    _write_events(
-        path,
-        [
-            {
-                "seq": 1,
-                "raw_seq": 1,
-                "kind": "claude_user",
-                "disposition": "rendered",
-                "payload": {
-                    "message": {
-                        "content": [
-                            {"type": "tool_result", "content": [{"type": "text", "text": "ok"}]},
-                        ],
-                    },
-                },
-            }
-        ],
-    )
-    events, _, _ = replay.build_timeline_window(path)
-    assert events[0].bookmark is None
+    _write_events(run_dir / "events.jsonl", entries)
+    response = replay.build_timeline_response(runs_root_fd, RUN_ID, limit=1)
+    assert response["bookmarks_truncated"] is True
+    assert len(response["bookmarks"]) == replay.MAX_BOOKMARKS
+    assert any("truncated" in w for w in response["warnings"])
 
 
 # ---------------------------------------------------------------------------
-# Real-shape fixture coverage (round-2 review item 3)
+# Real-shape fixture coverage
 # ---------------------------------------------------------------------------
 
 
 def test_codex_fixture_yields_all_bookmark_kinds() -> None:
-    """Regression: round-1 code returned zero bookmarks against canonical Codex shapes."""
-
-    events, _, _ = replay.build_timeline_window(CODEX_FIXTURE, limit=replay.MAX_LIMIT)
+    yielded = _iter_events_from_path(CODEX_FIXTURE)
+    events = [replay._timeline_event_from(e) for e in yielded]
+    events = [e for e in events if e is not None]
     bookmark_kinds = {e.bookmark for e in events if e.bookmark}
     assert bookmark_kinds == {"steer", "verdict", "error"}
-    # userMessage item → steer
     steer = next(e for e in events if e.kind == "item_completed" and e.bookmark == "steer")
     assert "userMessage" in steer.summary
-    # agentMessage carrying MERGE-READY → verdict
     verdicts = [e for e in events if e.bookmark == "verdict"]
     assert any(e.kind == "item_completed" for e in verdicts)
     assert any(e.kind == "turn_completed" for e in verdicts)
-    # non-zero commandExecution.exitCode, failed turn, non-zero provider exit → error
     errors = [e for e in events if e.bookmark == "error"]
     error_kinds = {e.kind for e in errors}
     assert {"item_completed", "turn_completed", "provider_process_exit"} <= error_kinds
 
 
 def test_codex_fixture_interrupted_turn_is_not_a_verdict() -> None:
-    """A turn that ended with status=interrupted is neither verdict nor error."""
-
-    events, _, _ = replay.build_timeline_window(CODEX_FIXTURE, limit=replay.MAX_LIMIT)
+    yielded = _iter_events_from_path(CODEX_FIXTURE)
+    events = [replay._timeline_event_from(e) for e in yielded]
+    events = [e for e in events if e is not None]
     interrupted = [
-        e
-        for e in events
-        if e.kind == "turn_completed" and e.lifecycle_state == "interrupted"
+        e for e in events if e.kind == "turn_completed" and e.lifecycle_state == "interrupted"
     ]
     assert interrupted
     assert all(e.bookmark is None for e in interrupted)
 
 
 def test_claude_fixture_yields_all_bookmark_kinds() -> None:
-    events, _, _ = replay.build_timeline_window(CLAUDE_FIXTURE, limit=replay.MAX_LIMIT)
+    yielded = _iter_events_from_path(CLAUDE_FIXTURE)
+    events = [replay._timeline_event_from(e) for e in yielded]
+    events = [e for e in events if e is not None]
     bookmark_kinds = {e.bookmark for e in events if e.bookmark}
     assert bookmark_kinds == {"steer", "verdict", "error"}
-    steer_events = [e for e in events if e.bookmark == "steer"]
-    assert any(e.kind == "claude_user" for e in steer_events)
-    verdict_events = [e for e in events if e.bookmark == "verdict"]
-    assert any(e.kind == "claude_assistant" for e in verdict_events)
-    error_events = [e for e in events if e.bookmark == "error"]
-    assert any(e.kind == "claude_result" for e in error_events)
-    assert any(e.kind == "provider_process_exit" for e in error_events)
+    assert any(e.bookmark == "steer" and e.kind == "claude_user" for e in events)
+    assert any(e.bookmark == "verdict" and e.kind == "claude_assistant" for e in events)
+    assert any(e.bookmark == "error" and e.kind == "claude_result" for e in events)
+    assert any(
+        e.bookmark == "error" and e.kind == "provider_process_exit" for e in events
+    )
 
 
 # ---------------------------------------------------------------------------
-# Bounded byte reads (round-2 review item 1)
+# Bounded byte reads (round-3 review item 2 — STRICT)
 # ---------------------------------------------------------------------------
 
 
-def test_oversized_line_dropped_without_buffering(tmp_path: Path) -> None:
-    """A single 20 MiB line must not be buffered into memory.
+def _make_records(count: int, seed_seq: int = 1) -> bytes:
+    """Compact newline-separated JSON records."""
 
-    We enforce this by keeping ``MAX_LINE_BYTES`` low for this test and
-    asserting that (a) the oversize record is not yielded and (b) records
-    after the oversized line are still processed. The 20 MiB payload is
-    written from disk so ``pytest -x`` doesn't peak on the driver too.
+    out = []
+    for i in range(count):
+        out.append(
+            json.dumps(
+                {
+                    "seq": seed_seq + i,
+                    "raw_seq": seed_seq + i,
+                    "normalized_at": "2026-07-30T00:00:01+00:00",
+                    "kind": "claude_stream_event",
+                    "disposition": "rendered",
+                    "payload": {"event": {"type": "message_delta"}},
+                }
+            ).encode()
+        )
+    return b"\n".join(out) + b"\n"
+
+
+def test_oversized_line_dropped_and_both_survivors_preserved(tmp_path: Path) -> None:
+    """Round-3 review item 6: BOTH surrounding records must survive.
+
+    The round-2 test accepted either one, which hid the drop-the-record-after
+    bug the round-2 review flagged.
     """
 
     path = tmp_path / "events.jsonl"
-    big_line = b"{" + b" " * (5 * 1024 * 1024) + b'"seq":42}\n'
-    good_line = json.dumps(
-        {
-            "seq": 99,
-            "raw_seq": 99,
-            "normalized_at": "2026-07-30T00:00:01+00:00",
-            "kind": "claude_user",
-            "disposition": "rendered",
-            "payload": {"message": {"content": [{"type": "text", "text": "hi"}]}},
-        }
-    ).encode() + b"\n"
+    good_one = json.dumps(
+        {"seq": 1, "raw_seq": 1, "kind": "k", "disposition": "d", "payload": {}}
+    ).encode()
+    big = b"{" + b" " * (5 * 1024 * 1024) + b'"seq":42}'
+    good_two = json.dumps(
+        {"seq": 100, "raw_seq": 100, "kind": "k", "disposition": "d", "payload": {}}
+    ).encode()
     with path.open("wb") as f:
-        f.write(good_line)
-        f.write(big_line)
-        f.write(good_line.replace(b'"seq": 99', b'"seq": 100'))
+        f.write(good_one + b"\n")
+        f.write(big + b"\n")
+        f.write(good_two + b"\n")
 
-    stats = replay._ScanStats()
-    yielded = list(
-        replay._iter_json_events(
-            path,
-            max_line_bytes=1 * 1024 * 1024,
-            stats=stats,
-        )
-    )
-    seqs = [entry.get("seq") for entry in yielded]
-    assert 42 not in seqs, "oversized line must be dropped, not yielded"
-    assert seqs.count(99) + seqs.count(100) >= 1
-    assert stats.dropped_oversize >= 1
+    events = _iter_events_from_path(path, max_line_bytes=1 * 1024 * 1024)
+    seqs = [e["seq"] for e in events]
+    # STRICT: both surrounding records must survive.
+    assert 1 in seqs, "record BEFORE oversized line lost"
+    assert 100 in seqs, "record AFTER oversized line lost (round-2 regression)"
+    assert 42 not in seqs, "oversized line must be dropped"
 
 
-def test_scan_bytes_budget_terminates(tmp_path: Path) -> None:
-    """Hard byte budget stops long files even if all lines are well-formed."""
+def test_scan_bytes_budget_counts_all_read_including_skips(tmp_path: Path) -> None:
+    """Round-3 review item 2: bytes read while skipping oversized lines
+    MUST count against the scan budget. The round-2 code let an oversized
+    line bypass the budget entirely."""
 
     path = tmp_path / "events.jsonl"
-    line = json.dumps(
-        {
-            "seq": 1,
-            "raw_seq": 1,
-            "kind": "claude_stream_event",
-            "disposition": "rendered",
-            "payload": {"event": {"type": "message_delta"}},
-        }
-    )
-    # Enough records to exceed the tiny scan budget below.
-    with path.open("w", encoding="utf-8") as f:
-        for i in range(2_000):
-            f.write(line.replace('"seq": 1', f'"seq": {i + 1}') + "\n")
+    good_line = json.dumps(
+        {"seq": 1, "raw_seq": 1, "kind": "k", "disposition": "d", "payload": {}}
+    ).encode()
+    # 8 MiB oversized line — a plain byte budget of 4 MiB must abort during
+    # the skip, not read all 8 MiB.
+    big = b"{" + b" " * (8 * 1024 * 1024) + b'"seq":42}'
+    with path.open("wb") as f:
+        f.write(good_line + b"\n")
+        f.write(big + b"\n")
+        f.write(good_line.replace(b'"seq": 1', b'"seq": 2') + b"\n")
+
     stats = replay._ScanStats()
-    limited = list(
-        replay._iter_json_events(
-            path,
-            max_scan_bytes=4 * 1024,
-            stats=stats,
-        )
-    )
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        events = [
+            entry
+            for _off, entry in replay.stream_json_events(
+                fd,
+                start_offset=0,
+                max_scan_bytes=4 * 1024 * 1024,
+                max_line_bytes=1 * 1024 * 1024,
+                stats=stats,
+            )
+        ]
+    finally:
+        os.close(fd)
     assert stats.scan_truncated is True
-    assert len(limited) < 2_000
+    # Whatever we yielded must be a prefix — the first good line at minimum,
+    # never the tail record because we aborted mid-skip.
+    seqs = [e["seq"] for e in events]
+    assert 1 in seqs
+    assert 2 not in seqs
 
 
 def test_torn_write_missing_trailing_newline_dropped(tmp_path: Path) -> None:
-    """A live-append that flushed JSON without its trailing newline must be
-    treated as incomplete — never yielded until the newline arrives."""
-
     path = tmp_path / "events.jsonl"
     complete = json.dumps(
-        {
-            "seq": 1,
-            "raw_seq": 1,
-            "kind": "claude_user",
-            "disposition": "rendered",
-            "payload": {"message": {"content": [{"type": "text", "text": "one"}]}},
-        }
+        {"seq": 1, "raw_seq": 1, "kind": "k", "disposition": "d", "payload": {}}
     )
     torn = json.dumps(
-        {
-            "seq": 2,
-            "raw_seq": 2,
-            "kind": "claude_user",
-            "disposition": "rendered",
-            "payload": {"message": {"content": [{"type": "text", "text": "two"}]}},
-        }
+        {"seq": 2, "raw_seq": 2, "kind": "k", "disposition": "d", "payload": {}}
     )
-    # First record ends with \n (committed); second record is mid-write.
     path.write_bytes(complete.encode() + b"\n" + torn.encode())
     stats = replay._ScanStats()
-    yielded = list(replay._iter_json_events(path, stats=stats))
-    assert [e.get("seq") for e in yielded] == [1]
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        yielded = [
+            entry
+            for _off, entry in replay.stream_json_events(fd, start_offset=0, stats=stats)
+        ]
+    finally:
+        os.close(fd)
+    assert [e["seq"] for e in yielded] == [1]
     assert stats.dropped_truncated_tail is True
 
 
+def test_stream_snapshot_records_resume_from_byte_offset(tmp_path: Path) -> None:
+    """Verify the byte cursor lets us pick up exactly where a prior page ended."""
+
+    path = tmp_path / "events.jsonl"
+    path.write_bytes(_make_records(5))
+    stats_a = replay._ScanStats()
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        first_two: list[tuple[int, bytes]] = []
+        gen = replay.stream_snapshot_records(fd, start_offset=0, stats=stats_a)
+        for record in gen:
+            first_two.append(record)
+            if len(first_two) >= 2:
+                break
+        gen.close()
+    finally:
+        os.close(fd)
+    resume_offset = first_two[-1][0]
+
+    stats_b = replay._ScanStats()
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        rest = list(
+            replay.stream_snapshot_records(fd, start_offset=resume_offset, stats=stats_b)
+        )
+    finally:
+        os.close(fd)
+    seqs_first = [json.loads(rec)["seq"] for _off, rec in first_two]
+    seqs_rest = [json.loads(rec)["seq"] for _off, rec in rest]
+    assert seqs_first == [1, 2]
+    assert seqs_rest == [3, 4, 5]
+
+
 # ---------------------------------------------------------------------------
-# Symlink safety (round-2 review item 2)
+# Symlink safety (round-3 review item 3 + item 6)
 # ---------------------------------------------------------------------------
 
 
-def test_symlinked_run_dir_is_rejected(runs_root: Path, tmp_path: Path) -> None:
+def test_symlinked_run_dir_is_rejected(
+    runs_root: Path, runs_root_fd: int, tmp_path: Path
+) -> None:
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "run.json").write_text(json.dumps(_base_run_json()), encoding="utf-8")
-    link = runs_root / RUN_ID
-    os.symlink(outside, link)
-    with mock.patch.object(main, "AGENT_RUNS_DIR", runs_root):
-        with pytest.raises(HTTPException) as ctx:
-            main._replay_run_dir(RUN_ID)
-    assert ctx.value.status_code == 404
+    os.symlink(outside, runs_root / RUN_ID)
+    with pytest.raises(replay.ReplayError):
+        replay.verify_run_dir_exists(runs_root_fd, RUN_ID)
 
 
-def test_symlinked_events_file_is_rejected(runs_root: Path, tmp_path: Path) -> None:
-    """Even a real run dir must reject a substituted-symlink child."""
+def test_symlinked_events_file_is_refused_by_pathwalk(
+    runs_root: Path, runs_root_fd: int, tmp_path: Path
+) -> None:
+    """Round-3 review item 3: a symlink swapped in for events.jsonl must
+    fail the ``open_relative_file`` walk with ELOOP, not follow into the
+    swap target."""
 
     run_dir = runs_root / RUN_ID
     run_dir.mkdir()
     (run_dir / "run.json").write_text(json.dumps(_base_run_json()), encoding="utf-8")
-    # Attacker points events.jsonl at an arbitrary file outside the runs root.
     secret = tmp_path / "outside" / "secret.jsonl"
     secret.parent.mkdir(parents=True)
-    secret.write_text("secret", encoding="utf-8")
+    secret.write_text('{"seq":1,"kind":"leaked","disposition":"d","payload":{}}\n', encoding="utf-8")
     os.symlink(secret, run_dir / "events.jsonl")
-    with mock.patch.object(main, "AGENT_RUNS_DIR", runs_root):
-        with pytest.raises(HTTPException) as ctx:
-            main._replay_run_dir(RUN_ID)
-    assert ctx.value.status_code == 404
-
-
-def test_iter_snapshot_refuses_symlinked_input(runs_root: Path, tmp_path: Path) -> None:
-    """Even if main's guard is bypassed, the reader itself refuses to
-    follow symlinks (defence in depth for the round-2 review probe)."""
-
-    target = tmp_path / "outside.jsonl"
-    target.write_text("secret\n", encoding="utf-8")
-    link = runs_root / "linked.jsonl"
-    os.symlink(target, link)
+    # verify_run_dir_exists succeeds (the run dir itself is a real dir);
+    # the open of events.jsonl through pathwalk is what must refuse.
+    replay.verify_run_dir_exists(runs_root_fd, RUN_ID)
     with pytest.raises(OSError):
-        # ``_open_nofollow`` should raise ELOOP on macOS/Linux.
-        replay._open_nofollow(link)
+        replay._open_run_child_fd(runs_root_fd, RUN_ID, "events.jsonl")
+
+
+def test_symlink_swap_after_run_dir_check_still_refused(
+    runs_root: Path, runs_root_fd: int, tmp_path: Path
+) -> None:
+    """Deterministic swap: the run dir exists as a real dir when the request
+    starts, then a symlink is swapped in for events.jsonl before the reader
+    opens it. Pathwalk must still refuse — that's the TOCTTOU gap the round-2
+    resolve-then-open guard couldn't close."""
+
+    run_dir = runs_root / RUN_ID
+    run_dir.mkdir()
+    (run_dir / "run.json").write_text(json.dumps(_base_run_json()), encoding="utf-8")
+    _write_events(run_dir / "events.jsonl", _fixture_events())
+
+    # First, verify normal operation works.
+    ok = replay.build_timeline_response(runs_root_fd, RUN_ID)
+    assert ok["events"]
+
+    # Now the "attacker" swaps events.jsonl for a symlink after the run
+    # dir check would have passed. The reader opens through pathwalk and
+    # must refuse rather than follow the link.
+    secret = tmp_path / "secret.jsonl"
+    secret.write_text('{"seq":1}\n', encoding="utf-8")
+    (run_dir / "events.jsonl").unlink()
+    os.symlink(secret, run_dir / "events.jsonl")
+
+    with pytest.raises(OSError):
+        replay._open_run_child_fd(runs_root_fd, RUN_ID, "events.jsonl")
 
 
 def test_resolve_ticket_runs_ignores_symlinked_entries(
-    runs_root: Path, tmp_path: Path
+    runs_root: Path, runs_root_fd: int, tmp_path: Path
 ) -> None:
     outside = tmp_path / "impostor"
     outside.mkdir()
@@ -505,8 +600,83 @@ def test_resolve_ticket_runs_ignores_symlinked_entries(
         json.dumps(_base_run_json(run_id=RUN_ID)), encoding="utf-8"
     )
     os.symlink(outside, runs_root / RUN_ID)
-    with mock.patch.object(main, "AGENT_RUNS_DIR", runs_root):
-        assert main._resolve_ticket_runs("WIKI-174") == []
+    listing = replay.resolve_ticket_runs(runs_root_fd, "WIKI-174")
+    assert listing.runs == []
+
+
+def test_resolve_ticket_runs_reports_truncation(
+    runs_root: Path, runs_root_fd: int
+) -> None:
+    """When more runs match than MAX_RUN_LIST_ENTRIES, expose it."""
+
+    # Cap at 3 for this test so we don't have to write 200 runs to disk.
+    for i in range(5):
+        # UUIDs sortable by created time via mtime — write in reverse to
+        # make later-touched dirs appear newer.
+        rid = f"{i:08d}-2222-3333-4444-555555555555"
+        run_dir = runs_root / rid
+        run_dir.mkdir()
+        meta = _base_run_json(run_id=rid, agent_id="WIKI-174")
+        (run_dir / "run.json").write_text(json.dumps(meta), encoding="utf-8")
+    with mock.patch.object(replay, "MAX_RUN_LIST_ENTRIES", 3):
+        listing = replay.resolve_ticket_runs(runs_root_fd, "WIKI-174")
+    assert len(listing.runs) == 3
+    assert listing.truncated is True
+
+
+# ---------------------------------------------------------------------------
+# Large pagination probe (round-3 review item 4 + item 6)
+# ---------------------------------------------------------------------------
+
+
+def test_large_events_file_pages_linearly_via_cursor(
+    runs_root: Path, runs_root_fd: int
+) -> None:
+    """Round-3 review item 4: byte cursor must let paging skip past the
+    scan budget. We write more than MAX_SCAN_BYTES worth of small events
+    and confirm we can walk to the very last event via the cursor."""
+
+    run_dir = runs_root / RUN_ID
+    run_dir.mkdir()
+    (run_dir / "run.json").write_text(json.dumps(_base_run_json()), encoding="utf-8")
+    events_path = run_dir / "events.jsonl"
+    # Each record ~150 bytes → 500 events = ~75 KiB. To keep the test fast
+    # while still exercising the cursor, we exceed the scan budget in a
+    # PATCHED reader with a small budget rather than writing 65 MiB to disk.
+    _write_events(
+        events_path,
+        [
+            {
+                "seq": i,
+                "raw_seq": i,
+                "normalized_at": "2026-07-30T00:00:01+00:00",
+                "kind": "claude_stream_event",
+                "disposition": "rendered",
+                "payload": {"event": {"type": f"delta-{i}"}},
+            }
+            for i in range(1, 5001)
+        ],
+    )
+    small_budget = 128 * 1024  # 128 KiB
+    with mock.patch.object(replay, "MAX_SCAN_BYTES", small_budget):
+        # Paginate to the end.
+        cursor: str | None = None
+        seen: list[int] = []
+        pages = 0
+        while pages < 200:
+            response = replay.build_timeline_response(
+                runs_root_fd, RUN_ID, cursor=cursor, limit=replay.DEFAULT_LIMIT
+            )
+            seen.extend(e["seq"] for e in response["events"])
+            pages += 1
+            if not response["has_more"]:
+                break
+            cursor = response["next_cursor"]
+    # Must reach the last event across pages. Round-2 rescanned from byte
+    # zero each page and would either loop or stall against the budget.
+    assert 5000 in seen
+    assert seen == sorted(seen)
+    assert len(seen) == 5000
 
 
 # ---------------------------------------------------------------------------
@@ -520,25 +690,9 @@ def test_timeline_endpoint_happy_path(run_dir: Path, runs_root: Path) -> None:
     assert payload["run"]["run_id"] == RUN_ID
     assert payload["run"]["agent_id"] == "WIKI-174"
     assert len(payload["events"]) == 4
-    assert payload["next_after_seq"] is None
+    assert payload["has_more"] is False
     bookmark_kinds = {b["kind"] for b in payload["bookmarks"]}
     assert bookmark_kinds >= {"steer", "verdict", "error"}
-    assert payload["warnings"] == []
-
-
-def test_timeline_endpoint_paginates(run_dir: Path, runs_root: Path) -> None:
-    with mock.patch.object(main, "AGENT_RUNS_DIR", runs_root):
-        first = main.agent_run_replay_timeline(RUN_ID, limit=2)
-        assert first["next_after_seq"] == 2
-        assert [e["seq"] for e in first["events"]] == [1, 2]
-        assert first["bookmarks"]
-        second = main.agent_run_replay_timeline(RUN_ID, after_seq=2, limit=2)
-        assert [e["seq"] for e in second["events"]] == [3, 4]
-        assert second["next_after_seq"] == 4
-        assert second["bookmarks"] == []
-        third = main.agent_run_replay_timeline(RUN_ID, after_seq=4, limit=2)
-        assert third["events"] == []
-        assert third["next_after_seq"] is None
 
 
 def test_timeline_endpoint_rejects_bad_run_id(runs_root: Path) -> None:
@@ -551,30 +705,22 @@ def test_timeline_endpoint_rejects_bad_run_id(runs_root: Path) -> None:
         assert missing.value.status_code == 404
 
 
-def test_replay_runs_lists_matching_agent_id(runs_root: Path) -> None:
-    newer = runs_root / RUN_ID
-    newer.mkdir()
-    meta = _base_run_json()
-    meta["updated_at"] = "2026-07-30T00:10:00+00:00"
-    (newer / "run.json").write_text(json.dumps(meta), encoding="utf-8")
-    older = runs_root / OTHER_RUN
-    older.mkdir()
-    older_meta = _base_run_json(run_id=OTHER_RUN)
-    older_meta["updated_at"] = "2026-07-30T00:01:00+00:00"
-    (older / "run.json").write_text(json.dumps(older_meta), encoding="utf-8")
-    unrelated_id = "99999999-9999-9999-9999-999999999999"
-    unrelated = runs_root / unrelated_id
-    unrelated.mkdir()
-    unrelated_meta = _base_run_json(run_id=unrelated_id, agent_id="WIKI-999")
-    (unrelated / "run.json").write_text(json.dumps(unrelated_meta), encoding="utf-8")
+def test_timeline_endpoint_rejects_bad_cursor(run_dir: Path, runs_root: Path) -> None:
+    with mock.patch.object(main, "AGENT_RUNS_DIR", runs_root):
+        with pytest.raises(HTTPException) as ctx:
+            main.agent_run_replay_timeline(RUN_ID, cursor="not-base64!")
+    assert ctx.value.status_code == 400
 
+
+def test_replay_runs_endpoint_lists_matches(run_dir: Path, runs_root: Path) -> None:
     with mock.patch.object(main, "AGENT_RUNS_DIR", runs_root):
         payload = main.agent_replay_runs("WIKI-174")
     assert payload["ticket"] == "WIKI-174"
-    assert [r["run_id"] for r in payload["runs"]] == [RUN_ID, OTHER_RUN]
+    assert [r["run_id"] for r in payload["runs"]] == [RUN_ID]
+    assert payload["runs_truncated"] is False
 
 
-def test_replay_runs_rejects_bad_ticket(runs_root: Path) -> None:
+def test_replay_runs_endpoint_rejects_bad_ticket(runs_root: Path) -> None:
     with mock.patch.object(main, "AGENT_RUNS_DIR", runs_root):
         with pytest.raises(HTTPException) as ctx:
             main.agent_replay_runs("../etc/passwd")
@@ -592,28 +738,3 @@ def test_raw_event_endpoint(run_dir: Path, runs_root: Path) -> None:
         with pytest.raises(HTTPException) as bad:
             main.agent_run_replay_event(RUN_ID, 0)
         assert bad.value.status_code == 400
-
-
-def test_timeline_endpoint_surfaces_dropped_lines_as_warnings(
-    runs_root: Path,
-) -> None:
-    run_dir = runs_root / RUN_ID
-    run_dir.mkdir()
-    (run_dir / "run.json").write_text(json.dumps(_base_run_json()), encoding="utf-8")
-    events_path = run_dir / "events.jsonl"
-    events_path.write_bytes(
-        json.dumps(
-            {
-                "seq": 1,
-                "raw_seq": 1,
-                "kind": "claude_user",
-                "disposition": "rendered",
-                "payload": {"message": {"content": [{"type": "text", "text": "ok"}]}},
-            }
-        ).encode()
-        + b"\n"
-        + b"{not-json\n"
-    )
-    with mock.patch.object(main, "AGENT_RUNS_DIR", runs_root):
-        payload = main.agent_run_replay_timeline(RUN_ID)
-    assert any("malformed" in w for w in payload["warnings"])

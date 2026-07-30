@@ -12,11 +12,11 @@ import type {
 import { ReplayScrubberPanel } from "../src/replay-scrubber-panel";
 
 /**
- * WIKI-174 round-2 review item 6: the round-1 tests mocked the whole api
- * module, so deleting ``signal`` forwarding in ``getReplayRawEvent`` still
- * passed. Round 2 tests intercept ``global.fetch`` directly, so the panel's
- * abort behaviour is verified through the real ``request()`` → ``fetch``
- * signal-forwarding path.
+ * WIKI-174 round-2/round-3 tests intercept ``global.fetch`` directly so
+ * signal forwarding through ``request()`` is exercised end-to-end.
+ * Round-3 additions cover: opaque cursor + has_more consumption, empty
+ * final page that still carries a warning (must not be dropped), and
+ * ``bookmarks_truncated`` surfacing.
  */
 
 const RUN_ID = "11111111-2222-3333-4444-555555555555";
@@ -116,8 +116,10 @@ function timeline(): ReplayTimeline {
       }),
       event(4, { kind: "provider_process_exit", bookmark: "error" }),
     ],
-    next_after_seq: null,
+    next_cursor: null,
+    has_more: false,
     bookmarks: BASE_BOOKMARKS,
+    bookmarks_truncated: false,
     warnings: [],
   };
 }
@@ -127,6 +129,7 @@ function respond(url: string): Response {
     return jsonResponse({
       ticket: "WIKI-174",
       runs: [runSummary(), runSummary({ run_id: OLD_RUN })],
+      runs_truncated: false,
     });
   }
   if (url.startsWith("/api/agent-runs/") && url.includes("/replay/timeline")) {
@@ -152,8 +155,6 @@ describe("replay scrubber panel", () => {
     vi.spyOn(global, "fetch").mockImplementation(async (input, init) => {
       const url = typeof input === "string" ? input : input.toString();
       const call = record(url, init);
-      // Return synchronously (Promise.resolve) so scheduled tests can await
-      // and advance timers in a predictable order.
       return call.aborted ? new Response("aborted", { status: 499 }) : respond(url);
     });
   });
@@ -186,7 +187,6 @@ describe("replay scrubber panel", () => {
     await flushAsync();
     fireEvent.click(screen.getByRole("button", { name: "Play replay" }));
     await act(async () => {
-      // Real gap 1 → 2 = 1 second; at speed 1x = 1000ms.
       await vi.advanceTimersByTimeAsync(1000);
     });
     expect(screen.getByText("2 / 4")).toBeTruthy();
@@ -196,7 +196,6 @@ describe("replay scrubber panel", () => {
   test("rapid scrub cancels the in-flight raw event fetch via signal", async () => {
     render(<ReplayScrubberPanel ticket="WIKI-174" />);
     await flushAsync();
-    // Let the initial cursor's debounced raw fetch actually fire.
     await act(async () => {
       await vi.advanceTimersByTimeAsync(150);
     });
@@ -208,9 +207,6 @@ describe("replay scrubber panel", () => {
     const slider = screen.getByRole("slider", { name: "Event cursor" });
     fireEvent.change(slider, { target: { value: "3" } });
     await flushAsync();
-    // The scrub tore down the prior effect, which must have aborted the
-    // in-flight raw fetch's signal. If ``getReplayRawEvent`` stopped
-    // forwarding the signal this expectation would fail.
     expect(initialRawFetch!.aborted).toBe(true);
     expect(screen.getByRole("button", { name: "Play replay" })).toBeTruthy();
     expect(screen.getByText("4 / 4")).toBeTruthy();
@@ -244,30 +240,37 @@ describe("replay scrubber panel", () => {
     expect(screen.getByText("2 / 4")).toBeTruthy();
   });
 
-  test("paginates until server drains the cursor with no silent cap", async () => {
-    // Return two pages: first has next_after_seq=2, second is empty.
+  test("paginates via opaque cursor + has_more with no silent cap", async () => {
     const firstPage: ReplayTimeline = {
       run: runSummary({ total_events: 6 }),
       events: [event(1), event(2, { kind: "claude_user", bookmark: "steer" })],
-      next_after_seq: 2,
+      next_cursor: "b3B0aXF1ZQ==",
+      has_more: true,
       bookmarks: BASE_BOOKMARKS,
+      bookmarks_truncated: false,
       warnings: [],
     };
     const secondPage: ReplayTimeline = {
       run: runSummary({ total_events: 6 }),
       events: [event(3), event(4), event(5), event(6)],
-      next_after_seq: null,
+      next_cursor: null,
+      has_more: false,
       bookmarks: [],
+      bookmarks_truncated: false,
       warnings: ["dropped 2 malformed line(s)"],
     };
     (global.fetch as ReturnType<typeof vi.spyOn>).mockRestore();
-    vi.spyOn(global, "fetch").mockImplementation(async (input) => {
+    vi.spyOn(global, "fetch").mockImplementation(async (input, init) => {
       const url = typeof input === "string" ? input : input.toString();
+      record(url, init);
       if (url.includes("/replay/timeline")) {
-        return jsonResponse(url.includes("after_seq=2") ? secondPage : firstPage);
+        // Second-page request MUST forward the exact opaque cursor from
+        // page one; anything else (round-1/2 ``after_seq=N`` style) would
+        // return the first page indefinitely.
+        return jsonResponse(url.includes(`cursor=${encodeURIComponent("b3B0aXF1ZQ==")}`) ? secondPage : firstPage);
       }
       if (url.endsWith("/replay/runs")) {
-        return jsonResponse({ ticket: "WIKI-174", runs: [runSummary()] });
+        return jsonResponse({ ticket: "WIKI-174", runs: [runSummary()], runs_truncated: false });
       }
       if (url.includes("/replay/events/")) {
         return jsonResponse({ run_id: RUN_ID, seq: 1, raw: {} });
@@ -278,12 +281,67 @@ describe("replay scrubber panel", () => {
     render(<ReplayScrubberPanel ticket="WIKI-174" />);
     await flushAsync();
     await flushAsync();
-
     expect(screen.getByText("1 / 6")).toBeTruthy();
-    // Server-provided warning is surfaced in the UI.
     expect(screen.getByText(/dropped 2 malformed line/)).toBeTruthy();
-    // The slider can reach the last of the 6 events (no 5000-style silent cap).
     const slider = screen.getByRole("slider", { name: "Event cursor" }) as HTMLInputElement;
     expect(slider.max).toBe("5");
+
+    const timelineFetches = calls.filter((c) => c.url.includes("/replay/timeline"));
+    expect(timelineFetches).toHaveLength(2);
+    expect(timelineFetches[0].url).not.toContain("cursor=");
+    expect(timelineFetches[1].url).toContain("cursor=");
+  });
+
+  test("empty final page preserves prior warnings and terminates paging", async () => {
+    // Round-3 review item 4: the round-2 loop bailed out on empty final
+    // page and silently discarded server warnings that came with it.
+    const firstPage: ReplayTimeline = {
+      run: runSummary({ total_events: 2 }),
+      events: [event(1), event(2)],
+      next_cursor: "Y3Vyc29yLTE=",
+      has_more: true,
+      bookmarks: [],
+      bookmarks_truncated: false,
+      warnings: ["scan hit byte budget — later events not classified"],
+    };
+    const emptyFinalPage: ReplayTimeline = {
+      run: runSummary({ total_events: 2 }),
+      events: [],
+      next_cursor: null,
+      has_more: false,
+      bookmarks: [],
+      bookmarks_truncated: true,
+      warnings: ["bookmark list truncated"],
+    };
+    (global.fetch as ReturnType<typeof vi.spyOn>).mockRestore();
+    vi.spyOn(global, "fetch").mockImplementation(async (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      record(url, init);
+      if (url.includes("/replay/timeline")) {
+        return jsonResponse(url.includes("cursor=") ? emptyFinalPage : firstPage);
+      }
+      if (url.endsWith("/replay/runs")) {
+        return jsonResponse({ ticket: "WIKI-174", runs: [runSummary()], runs_truncated: false });
+      }
+      if (url.includes("/replay/events/")) {
+        return jsonResponse({ run_id: RUN_ID, seq: 1, raw: {} });
+      }
+      return new Response("not found", { status: 404 });
+    });
+
+    render(<ReplayScrubberPanel ticket="WIKI-174" />);
+    await flushAsync();
+    await flushAsync();
+    // Both the earlier scan-budget warning and the final-page truncation
+    // warning must show; neither should be swallowed.
+    expect(screen.getByText(/scan hit byte budget/)).toBeTruthy();
+    // The client-side flag AND the server's warning string both match a
+    // /bookmark list truncated/ regex — assert both are present via a
+    // multi-match query so we detect swallowed warnings AND dedup regressions.
+    const truncationLines = screen.getAllByText(/bookmark list truncated/);
+    expect(truncationLines.length).toBeGreaterThanOrEqual(1);
+    // Paging terminated after seeing has_more=false.
+    const timelineFetches = calls.filter((c) => c.url.includes("/replay/timeline"));
+    expect(timelineFetches).toHaveLength(2);
   });
 });

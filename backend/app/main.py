@@ -2789,169 +2789,81 @@ def agent_provider_events(
     return result
 
 
-def _reject_symlinked_children(run_dir: Path) -> None:
-    """Refuse a run dir whose members were substituted with symlinks.
-
-    A reviewer probe (WIKI-174 round 2) showed that even with a validated
-    ``run_id``, replacing ``events.jsonl`` with a symlink to a file outside
-    the runs root would let the replay stream leak that file's contents. We
-    ``lstat`` each expected child and refuse if any is a symlink.
-    """
-
-    for name in ("run.json", "events.jsonl", "raw.jsonl"):
-        child = run_dir / name
-        try:
-            info = os.lstat(child)
-        except FileNotFoundError:
-            continue
-        if stat.S_ISLNK(info.st_mode):
-            raise HTTPException(
-                status_code=404,
-                detail="Run not found",
-            )
+def _open_runs_root_fd_or_404() -> int:
+    try:
+        return replay.open_runs_root_fd(AGENT_RUNS_DIR)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Runs root missing") from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Runs root unreadable: {exc}") from exc
 
 
-def _resolved_runs_root() -> Path:
-    return AGENT_RUNS_DIR.resolve(strict=False)
-
-
-def _replay_run_dir(run_id: str) -> Path:
+def _validate_run_id_or_400(run_id: str) -> None:
     if not replay.valid_run_id(run_id):
         raise HTTPException(status_code=400, detail="Bad run id")
-    runs_root = _resolved_runs_root()
-    candidate = AGENT_RUNS_DIR / run_id
-    try:
-        info = os.lstat(candidate)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail="Run not found") from exc
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-        raise HTTPException(status_code=404, detail="Run not found")
-    # Even without a symlink on the run dir itself, ``resolve`` guards against
-    # a mount-point overlay or an ``AGENT_RUNS_DIR`` that itself was a symlink
-    # at process start — the run's real path must sit under the real root.
-    resolved = candidate.resolve(strict=False)
-    try:
-        resolved.relative_to(runs_root)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail="Run not found") from exc
-    run_path = candidate / "run.json"
-    try:
-        run_info = os.lstat(run_path)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail="Run not found") from exc
-    if stat.S_ISLNK(run_info.st_mode) or not stat.S_ISREG(run_info.st_mode):
-        raise HTTPException(status_code=404, detail="Run not found")
-    _reject_symlinked_children(candidate)
-    return candidate
-
-
-def _resolve_ticket_runs(ticket: str) -> list[Path]:
-    """Return every archived run.json directory whose ``agent_id`` matches ticket.
-
-    Ordered newest-first by ``updated_at`` when known, then by directory mtime
-    as a fallback. Refuses symlinked entries and any entry that resolves
-    outside the runs root.
-    """
-
-    matches: list[tuple[float, Path]] = []
-    try:
-        entries = list(AGENT_RUNS_DIR.iterdir())
-    except FileNotFoundError:
-        return []
-    runs_root = _resolved_runs_root()
-    for entry in entries:
-        if not replay.valid_run_id(entry.name):
-            continue
-        try:
-            info = os.lstat(entry)
-        except OSError:
-            continue
-        # Skip symlinks and non-dirs. An attacker who can plant a symlink in
-        # AGENT_RUNS_DIR must not be able to redirect run resolution into
-        # unrelated filesystem paths.
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-            continue
-        try:
-            entry.resolve(strict=False).relative_to(runs_root)
-        except ValueError:
-            continue
-        run_path = entry / "run.json"
-        try:
-            run_info = os.lstat(run_path)
-        except OSError:
-            continue
-        if stat.S_ISLNK(run_info.st_mode) or not stat.S_ISREG(run_info.st_mode):
-            continue
-        try:
-            payload = json.loads(run_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if not isinstance(payload, dict):
-            continue
-        agent_id = payload.get("agent_id")
-        if agent_id != ticket:
-            continue
-        updated_at = payload.get("updated_at")
-        ts = 0.0
-        if isinstance(updated_at, str):
-            try:
-                ts = datetime.fromisoformat(updated_at.replace("Z", "+00:00")).timestamp()
-            except ValueError:
-                ts = 0.0
-        if ts == 0.0:
-            try:
-                ts = run_path.stat().st_mtime
-            except OSError:
-                ts = 0.0
-        matches.append((ts, entry))
-    matches.sort(key=lambda item: item[0], reverse=True)
-    return [path for _, path in matches]
 
 
 @app.get("/api/agents/{ticket}/replay/runs")
 def agent_replay_runs(ticket: str) -> dict[str, object]:
     if not TICKET_PATTERN.fullmatch(ticket):
         raise HTTPException(status_code=400, detail="Bad ticket")
-    runs = _resolve_ticket_runs(ticket)
+    runs_root_fd = _open_runs_root_fd_or_404()
+    try:
+        listing = replay.resolve_ticket_runs(runs_root_fd, ticket)
+    finally:
+        os.close(runs_root_fd)
     return {
         "ticket": ticket,
-        "runs": [
-            replay.build_run_summary(run_dir).as_dict()
-            for run_dir in runs
-        ],
+        "runs": [run.as_dict() for run in listing.runs],
+        "runs_truncated": listing.truncated,
     }
 
 
 @app.get("/api/agent-runs/{run_id}/replay/timeline")
 def agent_run_replay_timeline(
     run_id: str,
-    after_seq: int = 0,
+    cursor: str | None = None,
     limit: int = replay.DEFAULT_LIMIT,
 ) -> dict[str, object]:
-    if after_seq < 0:
-        raise HTTPException(status_code=400, detail="after_seq must be non-negative")
+    _validate_run_id_or_400(run_id)
     if limit < 1 or limit > replay.MAX_LIMIT:
         raise HTTPException(
             status_code=400,
             detail=f"limit must be between 1 and {replay.MAX_LIMIT}",
         )
-    run_dir = _replay_run_dir(run_id)
+    runs_root_fd = _open_runs_root_fd_or_404()
     try:
+        replay.verify_run_dir_exists(runs_root_fd, run_id)
         return replay.build_timeline_response(
-            run_dir,
-            after_seq=after_seq,
+            runs_root_fd,
+            run_id,
+            cursor=cursor,
             limit=limit,
         )
     except replay.ReplayError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        message = str(exc)
+        if "not found" in message or "missing" in message:
+            raise HTTPException(status_code=404, detail="Run not found") from exc
+        if "invalid cursor" in message:
+            raise HTTPException(status_code=400, detail="Bad cursor") from exc
+        raise HTTPException(status_code=500, detail=message) from exc
+    finally:
+        os.close(runs_root_fd)
 
 
 @app.get("/api/agent-runs/{run_id}/replay/events/{seq}")
 def agent_run_replay_event(run_id: str, seq: int) -> dict[str, object]:
     if seq <= 0:
         raise HTTPException(status_code=400, detail="Seq must be positive")
-    run_dir = _replay_run_dir(run_id)
-    entry = replay.load_raw_event(run_dir, seq)
+    _validate_run_id_or_400(run_id)
+    runs_root_fd = _open_runs_root_fd_or_404()
+    try:
+        replay.verify_run_dir_exists(runs_root_fd, run_id)
+        entry = replay.load_raw_event(runs_root_fd, run_id, seq)
+    except replay.ReplayError as exc:
+        raise HTTPException(status_code=404, detail="Run not found") from exc
+    finally:
+        os.close(runs_root_fd)
     if entry is None:
         raise HTTPException(status_code=404, detail="Event not found")
     return {"run_id": run_id, "seq": seq, "raw": entry}

@@ -33,7 +33,7 @@ type SpeedChoice = (typeof SPEED_OPTIONS)[number] | typeof MAX_SPEED_LABEL;
 const MAX_ADVANCE_DELAY_MS = 10_000;
 const MIN_ADVANCE_DELAY_MS = 40;
 const DEFAULT_PAGE_SIZE = 500;
-// Runaway guard — a well-behaved server always terminates ``next_after_seq``,
+// Runaway guard — a well-behaved server always terminates ``has_more``,
 // but we cap pagination at 200 pages (100k events at DEFAULT_PAGE_SIZE) so a
 // corrupt cursor cycle can't loop forever. If we hit this, the UI shows an
 // explicit "more events beyond this window" notice.
@@ -106,11 +106,11 @@ async function loadFullTimeline(
   onProgress({
     timeline,
     pagesLoaded: pages,
-    done: timeline.next_after_seq === null,
+    done: !timeline.has_more,
     hitPageGuard: false,
   });
-  let cursor = timeline.next_after_seq;
-  while (cursor !== null && !signal.aborted) {
+  let cursor: string | null = timeline.next_cursor;
+  while (timeline.has_more && cursor && !signal.aborted) {
     if (pages >= MAX_TIMELINE_PAGES) {
       onProgress({
         timeline,
@@ -121,33 +121,32 @@ async function loadFullTimeline(
       return;
     }
     const page = await getReplayTimeline(runId, {
-      afterSeq: cursor,
+      cursor,
       limit: DEFAULT_PAGE_SIZE,
       signal,
     });
     pages += 1;
-    if (page.events.length === 0) {
-      onProgress({
-        timeline: { ...timeline, next_after_seq: null },
-        pagesLoaded: pages,
-        done: true,
-        hitPageGuard: false,
-      });
-      return;
-    }
+    // Merge warnings even on an empty final page — a truncated tail or
+    // scan cap warning can appear on the last read after we've stopped
+    // accumulating new events.
+    const mergedWarnings = [...timeline.warnings, ...page.warnings];
     timeline = {
       ...timeline,
       events: [...timeline.events, ...page.events],
-      next_after_seq: page.next_after_seq,
-      warnings: [...timeline.warnings, ...page.warnings],
+      next_cursor: page.next_cursor,
+      has_more: page.has_more,
+      bookmarks_truncated:
+        timeline.bookmarks_truncated || page.bookmarks_truncated,
+      warnings: mergedWarnings,
     };
-    cursor = page.next_after_seq;
+    cursor = page.next_cursor;
     onProgress({
       timeline,
       pagesLoaded: pages,
-      done: cursor === null,
+      done: !timeline.has_more,
       hitPageGuard: false,
     });
+    if (!page.has_more) return;
   }
 }
 
@@ -352,6 +351,7 @@ export function ReplayScrubberPanel({ ticket }: { ticket: string }) {
 
       {timeline ? (
         <ReplayLoadStatus
+          bookmarksTruncated={timeline.bookmarks_truncated}
           events={timeline.events.length}
           loading={timelineLoading}
           pageGuardHit={pageGuardHit}
@@ -387,6 +387,7 @@ export function ReplayScrubberPanel({ ticket }: { ticket: string }) {
 }
 
 function ReplayLoadStatus({
+  bookmarksTruncated,
   events,
   loading,
   pageGuardHit,
@@ -394,6 +395,7 @@ function ReplayLoadStatus({
   serverWarnings,
   totalHint,
 }: {
+  bookmarksTruncated: boolean;
   events: number;
   loading: boolean;
   pageGuardHit: boolean;
@@ -414,7 +416,11 @@ function ReplayLoadStatus({
       `stopped after ${pagesLoaded} pages; more events exist beyond this window.`
     );
   }
-  for (const warning of serverWarnings) {
+  if (bookmarksTruncated) {
+    messages.push("bookmark list truncated — more bookmarks exist beyond this view.");
+  }
+  const dedupedWarnings = Array.from(new Set(serverWarnings));
+  for (const warning of dedupedWarnings) {
     messages.push(warning);
   }
   if (messages.length === 0) return null;

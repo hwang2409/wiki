@@ -1,59 +1,74 @@
 """Session replay timeline builder for archived agent runs (WIKI-174).
 
-Pure helpers that transform ``events.jsonl`` (and, when needed, ``raw.jsonl``)
-into a compact, timestamped timeline the frontend scrubber consumes. All I/O
-here is read-only and strictly bounded so a corrupted or adversarial log can't
-blow out a handler's memory budget.
+Round-3 review feedback drove a fd-first rewrite:
 
-Read discipline (WIKI-174 round-2 review):
-    * Files are opened with ``O_NOFOLLOW`` so a symlinked ``events.jsonl``
-      pointing outside the runs root can't leak data.
-    * We snapshot the file size at open with ``os.fstat`` and read only up to
-      that byte count, so a live-append that lands the header of a new record
-      before its trailing newline can't feed us a torn half-line.
-    * Only ``\\n``-terminated records are yielded — the last partial line in
-      the snapshot window is dropped and reconsidered on the next read.
-    * Every line is capped by ``MAX_LINE_BYTES``: an oversize line is skipped
-      wholesale instead of being buffered into memory.
-    * Every scan is capped by a total byte budget so ``build_bookmarks`` on a
-      100 MiB events.jsonl still terminates in constant peak RSS.
+* Every file we read is opened through ``pathwalk.open_relative_file`` against
+  a pre-opened runs-root descriptor. A symlink swap at any path component
+  (leaf or intermediate) fails the open, closing the check-then-open TOCTTOU
+  gap that resolve-then-open guards can't cover.
+* Reads always happen through the fd; the reader NEVER re-derives a path
+  from a string mid-request. Once we hold the fd, we read from that inode
+  regardless of what happens on disk.
+* ``events.jsonl`` and ``raw.jsonl`` reads go through
+  ``stream_snapshot_records`` — a single-pass, inline skip-state machine
+  that counts EVERY byte read against a scan budget, keeps oversized
+  records from being buffered into RAM, and preserves records after a
+  skipped oversized line (round-2 lost them).
+* ``run.json`` metadata is size-capped before reading — the round-2 code
+  called ``Path.read_text`` with no ceiling.
+* Timeline pages resume from an opaque base64url cursor that encodes the
+  byte offset at which to resume ``os.lseek``. Callers no longer re-scan
+  from byte zero every page.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
 import stat
-from dataclasses import dataclass
-from io import BufferedReader
-from pathlib import Path
-from typing import Any, Iterable, Iterator
+from dataclasses import dataclass, field
+from typing import Any, Iterator
+
+from .pathwalk import open_relative_directory, open_relative_file
 
 RUN_ID_PATTERN = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
 
 # Bookmark rendering budget: keep the count small so a scrubber's tick track
-# stays legible on a 480px panel even for long runs.
+# stays legible on a 480px panel even for long runs. When we hit this we
+# surface ``bookmarks_truncated`` in the response so nothing is silently
+# hidden (round-3 review item 5).
 MAX_BOOKMARKS = 200
 DEFAULT_LIMIT = 500
 MAX_LIMIT = 2000
 
 # Per-line hard ceiling. Real supervisor events observed on disk are ~200 B –
-# 30 KiB (tool_use inputs, hook payloads). A well-formed event should never
-# approach 1 MiB; anything above that is corruption or an attack and we drop
-# it rather than allocate for it.
+# 30 KiB; anything above 1 MiB is corruption or an attack and the reader
+# discards it wholesale instead of buffering.
 MAX_LINE_BYTES = 1 * 1024 * 1024
 
-# Per-scan hard ceiling. The bookmark scan and raw event lookup traverse a
-# full events.jsonl / raw.jsonl. This bound guarantees a peak read of
-# ~64 MiB regardless of file size — with truncation surfaced to the caller so
-# nothing gets silently dropped from the UI.
+# Per-scan hard ceiling. Every byte physically read counts — including bytes
+# consumed while skipping an oversized record — so a 100 GiB file terminates
+# in constant peak RSS. Surfaced as ``scan_truncated`` in warnings.
 MAX_SCAN_BYTES = 64 * 1024 * 1024
 
+# Per-run.json read cap. The largest real ``run.json`` seen in the runtime
+# directory is ~14 KiB even with a very long ``initial_prompt``. 256 KiB
+# gives ample headroom without letting a corrupt or adversarial run.json
+# drive unbounded metadata reads (round-3 review item 1).
+MAX_RUN_JSON_BYTES = 256 * 1024
+
+# ``_resolve_ticket_runs`` outer caps: sort the whole runs dir by mtime, then
+# read at most this many run.json files to filter by ticket. Surfaced as
+# ``runs_truncated`` so the UI can note when older matches were skipped.
+MAX_RUN_LIST_SCAN = 500
+MAX_RUN_LIST_ENTRIES = 200
+
 # Chunked stream reads: 128 KiB balances syscall overhead against per-response
-# RSS. Never buffer more than one chunk beyond the current partial line.
+# RSS. We never buffer more than one chunk beyond the current partial record.
 _STREAM_CHUNK = 128 * 1024
 
 MERGE_READY_PATTERN = re.compile(r"\b(MERGE-READY|BLOCKED)\s*:", re.IGNORECASE)
@@ -119,8 +134,259 @@ class RunSummary:
         }
 
 
+@dataclass
+class _ScanStats:
+    dropped_oversize: int = 0
+    dropped_malformed: int = 0
+    dropped_truncated_tail: bool = False
+    scan_truncated: bool = False
+    bookmarks_truncated: bool = False
+
+
 def valid_run_id(run_id: str) -> bool:
     return bool(RUN_ID_PATTERN.fullmatch(run_id))
+
+
+# ---------------------------------------------------------------------------
+# Opaque byte cursor (round-3 review item 4)
+# ---------------------------------------------------------------------------
+
+
+def encode_cursor(byte_offset: int) -> str:
+    """Encode a byte offset into an opaque URL-safe token.
+
+    Client code MUST NOT parse this — the encoding may change. The point is
+    the round-1/round-2 ``after_seq`` cursor forced the server to rescan
+    from byte zero every page; a byte cursor lets us ``lseek`` straight to
+    the resume point.
+    """
+
+    payload = json.dumps({"o": int(byte_offset)}, separators=(",", ":")).encode("ascii")
+    return base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
+
+
+def decode_cursor(cursor: str | None) -> int:
+    if not cursor:
+        return 0
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        raw = base64.urlsafe_b64decode(padded.encode("ascii"))
+        value = json.loads(raw)
+    except (ValueError, TypeError) as exc:
+        raise ReplayError("invalid cursor") from exc
+    if not isinstance(value, dict):
+        raise ReplayError("invalid cursor")
+    offset = value.get("o")
+    if not isinstance(offset, int) or offset < 0:
+        raise ReplayError("invalid cursor")
+    return offset
+
+
+# ---------------------------------------------------------------------------
+# Bounded fd-based reader (round-3 review items 1 + 2 + 3)
+# ---------------------------------------------------------------------------
+
+
+def _open_run_child_fd(runs_root_fd: int, run_id: str, filename: str) -> int:
+    """Open ``<runs_root>/<run_id>/<filename>`` via the dir-fd walker.
+
+    ``open_relative_file`` refuses a symlink at ANY component so a swap in
+    the run dir (or in the child file) fails the open — closing the TOCTTOU
+    gap in the round-2 resolve-then-open guard.
+    """
+
+    return open_relative_file(runs_root_fd, (run_id, filename))
+
+
+def _fstat_regular_or_raise(fd: int) -> os.stat_result:
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode):
+        raise ReplayError("expected a regular file")
+    return info
+
+
+def stream_snapshot_records(
+    fd: int,
+    *,
+    start_offset: int = 0,
+    max_scan_bytes: int = MAX_SCAN_BYTES,
+    max_line_bytes: int = MAX_LINE_BYTES,
+    stats: _ScanStats,
+) -> Iterator[tuple[int, bytes]]:
+    """Yield ``(end_offset, record_bytes)`` for each newline-terminated record.
+
+    ``end_offset`` is the byte position immediately AFTER the record's
+    trailing newline. Callers pass it back as ``start_offset`` on the next
+    page to resume without a rescan.
+
+    Bounds enforced (round-3 review item 2):
+
+    * Every byte physically read from ``fd`` counts against
+      ``max_scan_bytes`` — including bytes consumed while walking past an
+      oversized record. An earlier version accounted only for bytes that
+      were yielded, which let an oversized-line attacker bypass the budget.
+    * Records over ``max_line_bytes`` are skipped by advancing through the
+      stream until the terminating newline; bytes are NEVER buffered past
+      the ceiling.
+    * Records after a skipped oversized record are preserved — the earlier
+      fast-skip loop's edge case could drop the record immediately after a
+      skipped line if the newline sat at the end of the read chunk.
+
+    The reader assumes a size snapshot: ``os.fstat`` at open time, read
+    exactly that many bytes, drop any un-newline-terminated tail. That is
+    the WIKI-174 round-2 torn-write guard, preserved here.
+    """
+
+    info = _fstat_regular_or_raise(fd)
+    snapshot_size = int(info.st_size)
+    if start_offset < 0:
+        start_offset = 0
+    if start_offset >= snapshot_size:
+        return
+    os.lseek(fd, start_offset, os.SEEK_SET)
+
+    chunk_start = start_offset
+    total_bytes_read = 0
+    buffer = bytearray()
+    accumulated_line_bytes = 0
+    skipping_oversize = False
+    remaining_in_snapshot = snapshot_size - start_offset
+
+    while remaining_in_snapshot > 0:
+        to_read = min(_STREAM_CHUNK, remaining_in_snapshot)
+        chunk = os.read(fd, to_read)
+        if not chunk:
+            break
+        remaining_in_snapshot -= len(chunk)
+        total_bytes_read += len(chunk)
+        if total_bytes_read > max_scan_bytes:
+            stats.scan_truncated = True
+            return
+        offset = 0
+        while offset < len(chunk):
+            nl = chunk.find(b"\n", offset)
+            if nl < 0:
+                slice_len = len(chunk) - offset
+                accumulated_line_bytes += slice_len
+                if not skipping_oversize and accumulated_line_bytes > max_line_bytes:
+                    # This partial record just crossed the ceiling.
+                    # Drop what we've buffered and flip into skip mode; the
+                    # terminating newline (which may be many chunks away)
+                    # will exit skip mode.
+                    stats.dropped_oversize += 1
+                    skipping_oversize = True
+                    buffer.clear()
+                if not skipping_oversize:
+                    buffer.extend(chunk[offset:])
+                offset = len(chunk)
+                continue
+
+            record_end_position = chunk_start + nl + 1
+            if skipping_oversize:
+                # This newline terminates the oversized record. Reset and
+                # keep processing the rest of the chunk — the very next
+                # record is the one round-2 lost.
+                skipping_oversize = False
+                accumulated_line_bytes = 0
+                offset = nl + 1
+                continue
+
+            slice_len = nl - offset
+            accumulated_line_bytes += slice_len
+            if accumulated_line_bytes > max_line_bytes:
+                # Whole record fit in one chunk but the accumulated span is
+                # over ceiling (edge case: partial from prior chunk + this
+                # slice > ceiling AND newline came within this slice).
+                stats.dropped_oversize += 1
+                buffer.clear()
+                accumulated_line_bytes = 0
+                offset = nl + 1
+                continue
+
+            if buffer:
+                buffer.extend(chunk[offset:nl])
+                record = bytes(buffer)
+                buffer.clear()
+            else:
+                record = bytes(chunk[offset:nl])
+            accumulated_line_bytes = 0
+            offset = nl + 1
+            yield record_end_position, record
+
+        chunk_start += len(chunk)
+
+    if buffer or skipping_oversize:
+        # Trailing bytes with no terminating newline: torn write or an
+        # oversized record whose \n sits outside the snapshot window.
+        stats.dropped_truncated_tail = True
+
+
+def stream_json_events(
+    fd: int,
+    *,
+    start_offset: int = 0,
+    max_scan_bytes: int = MAX_SCAN_BYTES,
+    max_line_bytes: int = MAX_LINE_BYTES,
+    stats: _ScanStats,
+) -> Iterator[tuple[int, dict[str, Any]]]:
+    for end_offset, record in stream_snapshot_records(
+        fd,
+        start_offset=start_offset,
+        max_scan_bytes=max_scan_bytes,
+        max_line_bytes=max_line_bytes,
+        stats=stats,
+    ):
+        if not record.strip():
+            continue
+        try:
+            value = json.loads(record)
+        except ValueError:
+            stats.dropped_malformed += 1
+            continue
+        if isinstance(value, dict):
+            yield end_offset, value
+
+
+# ---------------------------------------------------------------------------
+# run.json metadata (bounded)
+# ---------------------------------------------------------------------------
+
+
+def _read_bounded_metadata(runs_root_fd: int, run_id: str) -> dict[str, Any]:
+    try:
+        fd = _open_run_child_fd(runs_root_fd, run_id, "run.json")
+    except FileNotFoundError as exc:
+        raise ReplayError(f"run.json missing for {run_id}") from exc
+    except OSError as exc:
+        raise ReplayError(f"could not open run.json: {exc}") from exc
+    try:
+        info = _fstat_regular_or_raise(fd)
+        if info.st_size > MAX_RUN_JSON_BYTES:
+            raise ReplayError(
+                f"run.json exceeds {MAX_RUN_JSON_BYTES}-byte ceiling"
+            )
+        chunks: list[bytes] = []
+        remaining = MAX_RUN_JSON_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(_STREAM_CHUNK, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > MAX_RUN_JSON_BYTES:
+            raise ReplayError(
+                f"run.json exceeds {MAX_RUN_JSON_BYTES}-byte ceiling"
+            )
+    finally:
+        os.close(fd)
+    try:
+        value = json.loads(raw)
+    except ValueError as exc:
+        raise ReplayError(f"run.json is not valid JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ReplayError("run.json must contain an object")
+    return value
 
 
 def _excerpt(text: str, limit: int = 120) -> str:
@@ -156,25 +422,7 @@ def _first_text_block(content: Any) -> str | None:
     return None
 
 
-def load_run_metadata(run_dir: Path) -> dict[str, Any]:
-    run_path = run_dir / "run.json"
-    try:
-        raw = run_path.read_text(encoding="utf-8")
-    except FileNotFoundError as exc:
-        raise ReplayError(f"run.json missing for {run_dir.name}") from exc
-    except OSError as exc:
-        raise ReplayError(f"could not read run.json: {exc}") from exc
-    try:
-        value = json.loads(raw)
-    except ValueError as exc:
-        raise ReplayError(f"run.json is not valid JSON: {exc}") from exc
-    if not isinstance(value, dict):
-        raise ReplayError("run.json must contain an object")
-    return value
-
-
-def build_run_summary(run_dir: Path, meta: dict[str, Any] | None = None) -> RunSummary:
-    meta = meta if meta is not None else load_run_metadata(run_dir)
+def _run_summary_from_meta(meta: dict[str, Any], fallback_run_id: str) -> RunSummary:
     initial_prompt = meta.get("initial_prompt")
     initial_excerpt = (
         _excerpt(initial_prompt, 240)
@@ -185,7 +433,7 @@ def build_run_summary(run_dir: Path, meta: dict[str, Any] | None = None) -> RunS
     if not isinstance(total_events, int):
         total_events = meta.get("raw_event_count") or 0
     return RunSummary(
-        run_id=str(meta.get("run_id") or run_dir.name),
+        run_id=str(meta.get("run_id") or fallback_run_id),
         agent_id=meta.get("agent_id") if isinstance(meta.get("agent_id"), str) else None,
         orch_id=meta.get("orchestrator_id") if isinstance(meta.get("orchestrator_id"), str) else None,
         role=meta.get("role") if isinstance(meta.get("role"), str) else None,
@@ -200,158 +448,14 @@ def build_run_summary(run_dir: Path, meta: dict[str, Any] | None = None) -> RunS
     )
 
 
-@dataclass(frozen=True)
-class _RawLine:
-    raw: bytes
+def build_run_summary(runs_root_fd: int, run_id: str) -> RunSummary:
+    meta = _read_bounded_metadata(runs_root_fd, run_id)
+    return _run_summary_from_meta(meta, run_id)
 
 
-@dataclass
-class _ScanStats:
-    dropped_oversize: int = 0
-    dropped_malformed: int = 0
-    dropped_truncated_tail: bool = False
-    scan_truncated: bool = False
-
-
-def _open_nofollow(path: Path) -> int:
-    """Open a JSONL log for read, refusing symlinks and non-regular files.
-
-    A symlinked ``events.jsonl`` that points outside the runs root would let a
-    caller who can only forge the ``run_id`` still read anything the server
-    process can. ``O_NOFOLLOW`` on the final path component plus an
-    ``S_ISREG`` check on the resulting fd close that off.
-    """
-
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    fd = os.open(path, flags)
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            raise ReplayError(f"{path.name} is not a regular file")
-    except Exception:
-        os.close(fd)
-        raise
-    return fd
-
-
-def _iter_snapshot_lines(
-    path: Path,
-    *,
-    max_scan_bytes: int = MAX_SCAN_BYTES,
-    max_line_bytes: int = MAX_LINE_BYTES,
-    stats: _ScanStats | None = None,
-) -> Iterator[bytes]:
-    """Yield newline-terminated byte lines from a bounded snapshot window.
-
-    The producer of these files (``RunStore``) writes each event as
-    ``json.dumps(...) + '\\n'`` — but the write is not one atomic syscall in
-    every path. Reading past the snapshot size or accepting a line without a
-    trailing ``\\n`` risks a torn read where the reader sees ``json.dumps``
-    but not the newline. We snapshot ``st_size`` at open and only yield lines
-    that end with ``\\n`` inside that window; anything after the last newline
-    is left for the next read.
-    """
-
-    try:
-        fd = _open_nofollow(path)
-    except FileNotFoundError:
-        return
-    reader: BufferedReader | None = None
-    try:
-        info = os.fstat(fd)
-        snapshot_size = int(info.st_size)
-        reader = os.fdopen(fd, "rb", buffering=0)
-        # ``fd`` now owned by ``reader``; do not close it separately.
-        fd = -1
-        buffer = bytearray()
-        remaining = snapshot_size
-        total_yielded = 0
-        while remaining > 0:
-            to_read = min(_STREAM_CHUNK, remaining)
-            chunk = reader.read(to_read)
-            if not chunk:
-                break
-            remaining -= len(chunk)
-            buffer.extend(chunk)
-            while True:
-                newline = buffer.find(b"\n")
-                if newline < 0:
-                    break
-                line = bytes(buffer[:newline])
-                del buffer[: newline + 1]
-                total_yielded += newline + 1
-                if len(line) > max_line_bytes:
-                    if stats is not None:
-                        stats.dropped_oversize += 1
-                    continue
-                if total_yielded > max_scan_bytes:
-                    if stats is not None:
-                        stats.scan_truncated = True
-                    return
-                yield line
-            # Guard against a single record that is itself larger than
-            # ``max_line_bytes``: don't grow the buffer past that ceiling
-            # searching for the eventual newline.
-            if len(buffer) > max_line_bytes:
-                # Discard everything up to the next newline in the stream.
-                if stats is not None:
-                    stats.dropped_oversize += 1
-                buffer.clear()
-                skip_remaining = remaining
-                while skip_remaining > 0:
-                    skip_chunk = reader.read(min(_STREAM_CHUNK, skip_remaining))
-                    if not skip_chunk:
-                        break
-                    skip_remaining -= len(skip_chunk)
-                    hit = skip_chunk.find(b"\n")
-                    if hit >= 0:
-                        buffer.extend(skip_chunk[hit + 1 :])
-                        remaining = skip_remaining
-                        break
-                else:
-                    remaining = 0
-                if remaining == 0 and skip_remaining > 0:
-                    remaining = skip_remaining
-        # Any bytes still in the buffer come from an un-newline-terminated
-        # tail: leave them for the next call.
-        if buffer:
-            if stats is not None:
-                stats.dropped_truncated_tail = True
-    finally:
-        if reader is not None:
-            try:
-                reader.close()
-            except Exception:
-                pass
-        elif fd >= 0:
-            os.close(fd)
-
-
-def _iter_json_events(
-    path: Path,
-    *,
-    max_scan_bytes: int = MAX_SCAN_BYTES,
-    max_line_bytes: int = MAX_LINE_BYTES,
-    stats: _ScanStats | None = None,
-) -> Iterator[dict[str, Any]]:
-    for line in _iter_snapshot_lines(
-        path,
-        max_scan_bytes=max_scan_bytes,
-        max_line_bytes=max_line_bytes,
-        stats=stats,
-    ):
-        if not line.strip():
-            continue
-        try:
-            value = json.loads(line)
-        except ValueError:
-            if stats is not None:
-                stats.dropped_malformed += 1
-            continue
-        if isinstance(value, dict):
-            yield value
+# ---------------------------------------------------------------------------
+# Bookmark + summary derivation (unchanged logic, extracted from round-2)
+# ---------------------------------------------------------------------------
 
 
 def _codex_item(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -384,9 +488,6 @@ def _codex_item_text(item: dict[str, Any]) -> str | None:
 
 
 def _classify_bookmark(kind: str, payload: dict[str, Any], text: str | None) -> str | None:
-    # Codex ``item/completed`` covers user injections, agent replies, tool
-    # execs, and reasoning. userMessage = a real steer; agentMessage carrying
-    # a merge sentinel = a verdict.
     if kind == "item_completed":
         item = _codex_item(payload) or {}
         item_type = item.get("type")
@@ -416,9 +517,6 @@ def _classify_bookmark(kind: str, payload: dict[str, Any], text: str | None) -> 
     if kind in {"error", "codex_error", "provider_protocol_error"}:
         return "error"
     if kind == "provider_process_exit":
-        # Codex reports through ``params.returncode``; Claude uses
-        # top-level ``exit_code``. A clean 0 is normal termination, NOT an
-        # error — only mark non-zero exits so bookmarks stay useful.
         exit_code: Any = payload.get("exit_code")
         params = payload.get("params")
         if isinstance(params, dict):
@@ -452,12 +550,6 @@ def _classify_bookmark(kind: str, payload: dict[str, Any], text: str | None) -> 
 
 
 def _summarize_payload(kind: str, payload: dict[str, Any]) -> tuple[str, str | None]:
-    """Return ``(summary, text_hint)`` for a normalized event payload.
-
-    ``text_hint`` is only populated when a message-body excerpt was extracted;
-    the bookmark classifier reuses it so we don't scan the payload twice.
-    """
-
     if kind == "claude_assistant" or kind == "claude_user":
         message = payload.get("message")
         if isinstance(message, dict):
@@ -508,8 +600,6 @@ def _summarize_payload(kind: str, payload: dict[str, Any]) -> tuple[str, str | N
     if kind == "claude_rate_limit_event":
         return "rate_limit_event", None
     if kind == "provider_process_exit":
-        # Look in both shapes: Codex nests under ``params.returncode``, Claude
-        # exposes ``exit_code`` on the payload directly.
         code: Any = payload.get("exit_code")
         params = payload.get("params")
         if isinstance(params, dict):
@@ -561,9 +651,6 @@ def _summarize_payload(kind: str, payload: dict[str, Any]) -> tuple[str, str | N
         artifact = payload.get("artifact") or {}
         kind_hint = artifact.get("kind") if isinstance(artifact, dict) else None
         return f"artifact {kind_hint}" if kind_hint else "artifact", None
-    # Generic Codex method-derived kinds (``item_agentMessage_delta``,
-    # ``thread_tokenUsage_updated``, etc.) — just show the kind and let the
-    # payload viewer do the rest.
     return kind, None
 
 
@@ -595,60 +682,54 @@ def _timeline_event_from(entry: dict[str, Any]) -> TimelineEvent | None:
     )
 
 
-def _iter_timeline(source: Iterable[dict[str, Any]]) -> Iterator[TimelineEvent]:
-    for entry in source:
-        event = _timeline_event_from(entry)
-        if event is not None:
-            yield event
+# ---------------------------------------------------------------------------
+# Timeline + bookmark builders — fd-based
+# ---------------------------------------------------------------------------
 
 
-def build_timeline_window(
-    events_path: Path,
+@dataclass
+class TimelinePage:
+    events: list[TimelineEvent]
+    end_offset: int
+    has_more: bool
+
+
+def _build_timeline_page(
+    fd: int,
     *,
-    after_seq: int = 0,
-    limit: int = DEFAULT_LIMIT,
-) -> tuple[list[TimelineEvent], int | None, _ScanStats]:
-    """Return ``(events, next_after_seq, stats)`` for a bounded slice.
-
-    ``next_after_seq`` is the last-emitted seq when the window filled, letting
-    the client paginate forward without re-reading the file from byte zero.
-    ``stats`` surfaces drop counters + snapshot truncation so callers can show
-    when data was skipped.
-    """
-
-    stats = _ScanStats()
+    start_offset: int,
+    limit: int,
+    stats: _ScanStats,
+) -> TimelinePage:
     if limit <= 0:
-        return [], None, stats
+        return TimelinePage(events=[], end_offset=start_offset, has_more=False)
     limit = min(limit, MAX_LIMIT)
-    if after_seq < 0:
-        after_seq = 0
-    collected: list[TimelineEvent] = []
-    last_seq: int | None = None
-    for event in _iter_timeline(
-        _iter_json_events(events_path, stats=stats)
+    if start_offset < 0:
+        start_offset = 0
+    snapshot_size = int(_fstat_regular_or_raise(fd).st_size)
+    events: list[TimelineEvent] = []
+    end_offset = start_offset
+    for offset, entry in stream_json_events(
+        fd, start_offset=start_offset, stats=stats
     ):
-        if event.seq <= after_seq:
+        end_offset = offset
+        event = _timeline_event_from(entry)
+        if event is None:
             continue
-        collected.append(event)
-        last_seq = event.seq
-        if len(collected) >= limit:
-            return collected, last_seq, stats
-    return collected, None, stats
+        events.append(event)
+        if len(events) >= limit:
+            break
+    has_more = end_offset < snapshot_size and not stats.scan_truncated
+    return TimelinePage(events=events, end_offset=end_offset, has_more=has_more)
 
 
-def build_bookmarks(
-    events_path: Path,
-    *,
-    cap: int = MAX_BOOKMARKS,
-) -> tuple[list[dict[str, Any]], _ScanStats]:
-    """Whole-file bookmark scan, capped so a large run stays cheap on the wire."""
-
-    stats = _ScanStats()
+def _build_bookmarks(fd: int, *, cap: int, stats: _ScanStats) -> list[dict[str, Any]]:
     if cap <= 0:
-        return [], stats
+        return []
     bookmarks: list[dict[str, Any]] = []
-    for event in _iter_timeline(_iter_json_events(events_path, stats=stats)):
-        if event.bookmark is None:
+    for _offset, entry in stream_json_events(fd, start_offset=0, stats=stats):
+        event = _timeline_event_from(entry)
+        if event is None or event.bookmark is None:
             continue
         bookmarks.append(
             {
@@ -660,37 +741,9 @@ def build_bookmarks(
             }
         )
         if len(bookmarks) >= cap:
+            stats.bookmarks_truncated = True
             break
-    return bookmarks, stats
-
-
-def build_timeline_response(
-    run_dir: Path,
-    *,
-    after_seq: int = 0,
-    limit: int = DEFAULT_LIMIT,
-) -> dict[str, Any]:
-    """Full endpoint payload — meta + a window of events + bookmarks."""
-
-    meta = load_run_metadata(run_dir)
-    summary = build_run_summary(run_dir, meta)
-    events_path = run_dir / "events.jsonl"
-    events, next_seq, window_stats = build_timeline_window(
-        events_path, after_seq=after_seq, limit=limit
-    )
-    bookmarks: list[dict[str, Any]]
-    bookmark_stats: _ScanStats
-    if after_seq <= 0:
-        bookmarks, bookmark_stats = build_bookmarks(events_path)
-    else:
-        bookmarks, bookmark_stats = [], _ScanStats()
-    return {
-        "run": summary.as_dict(),
-        "events": [event.as_dict() for event in events],
-        "next_after_seq": next_seq,
-        "bookmarks": bookmarks,
-        "warnings": _warnings_from(window_stats, bookmark_stats),
-    }
+    return bookmarks
 
 
 def _warnings_from(*stats: _ScanStats) -> list[str]:
@@ -698,6 +751,7 @@ def _warnings_from(*stats: _ScanStats) -> list[str]:
     dropped_malformed = sum(s.dropped_malformed for s in stats)
     dropped_tail = any(s.dropped_truncated_tail for s in stats)
     scan_truncated = any(s.scan_truncated for s in stats)
+    bookmarks_truncated = any(s.bookmarks_truncated for s in stats)
     warnings: list[str] = []
     if dropped_oversize:
         warnings.append(f"dropped {dropped_oversize} oversized event line(s)")
@@ -707,21 +761,177 @@ def _warnings_from(*stats: _ScanStats) -> list[str]:
         warnings.append("trailing partial write ignored (torn-read guard)")
     if scan_truncated:
         warnings.append("scan hit byte budget — later events not classified")
+    if bookmarks_truncated:
+        warnings.append(f"bookmark list truncated at {MAX_BOOKMARKS}; more exist")
     return warnings
 
 
-def load_raw_event(run_dir: Path, seq: int) -> dict[str, Any] | None:
-    """Return the raw.jsonl entry for ``seq`` without slurping the whole file."""
+def build_timeline_response(
+    runs_root_fd: int,
+    run_id: str,
+    *,
+    cursor: str | None = None,
+    limit: int = DEFAULT_LIMIT,
+) -> dict[str, Any]:
+    """Full endpoint payload: meta + a window of events + bookmarks + cursor.
+
+    Every file read happens through an fd rooted at ``runs_root_fd`` via the
+    dir-fd walker, so a symlink swap anywhere along ``<run_id>/*`` fails the
+    open rather than following into an attacker-chosen path.
+    """
+
+    summary = build_run_summary(runs_root_fd, run_id)
+    start_offset = decode_cursor(cursor)
+    window_stats = _ScanStats()
+    bookmark_stats = _ScanStats()
+
+    events_fd = _open_run_child_fd(runs_root_fd, run_id, "events.jsonl")
+    try:
+        page = _build_timeline_page(
+            events_fd,
+            start_offset=start_offset,
+            limit=limit,
+            stats=window_stats,
+        )
+    finally:
+        os.close(events_fd)
+
+    # Bookmarks scan only on the first page — re-scanning per page would
+    # dominate the wire cost and give identical results.
+    bookmarks: list[dict[str, Any]]
+    if start_offset == 0:
+        events_fd = _open_run_child_fd(runs_root_fd, run_id, "events.jsonl")
+        try:
+            bookmarks = _build_bookmarks(
+                events_fd, cap=MAX_BOOKMARKS, stats=bookmark_stats
+            )
+        finally:
+            os.close(events_fd)
+    else:
+        bookmarks = []
+
+    next_cursor = encode_cursor(page.end_offset) if page.has_more else None
+    return {
+        "run": summary.as_dict(),
+        "events": [event.as_dict() for event in page.events],
+        "next_cursor": next_cursor,
+        "has_more": page.has_more,
+        "bookmarks": bookmarks,
+        "bookmarks_truncated": bookmark_stats.bookmarks_truncated,
+        "warnings": _warnings_from(window_stats, bookmark_stats),
+    }
+
+
+def load_raw_event(runs_root_fd: int, run_id: str, seq: int) -> dict[str, Any] | None:
+    """Return the raw.jsonl entry for ``seq`` — fd-based, byte-bounded."""
 
     if seq <= 0:
         return None
-    raw_path = run_dir / "raw.jsonl"
     stats = _ScanStats()
-    for entry in _iter_json_events(raw_path, stats=stats):
-        entry_seq = entry.get("seq")
-        if isinstance(entry_seq, int) and entry_seq == seq:
-            return entry
-        # raw.jsonl is monotonic in seq, so we can bail early once we pass it.
-        if isinstance(entry_seq, int) and entry_seq > seq:
-            return None
+    try:
+        raw_fd = _open_run_child_fd(runs_root_fd, run_id, "raw.jsonl")
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+    try:
+        for _offset, entry in stream_json_events(raw_fd, start_offset=0, stats=stats):
+            entry_seq = entry.get("seq")
+            if isinstance(entry_seq, int) and entry_seq == seq:
+                return entry
+            if isinstance(entry_seq, int) and entry_seq > seq:
+                return None
+    finally:
+        os.close(raw_fd)
     return None
+
+
+# ---------------------------------------------------------------------------
+# Ticket → runs discovery — bounded (round-3 review item 1 tail)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TicketRunsListing:
+    runs: list[RunSummary]
+    truncated: bool = False
+
+
+def _iter_root_entries(runs_root_fd: int) -> list[tuple[str, float]]:
+    """Return ``(name, mtime)`` for regular subdirs of the runs root, sorted newest first.
+
+    Symlinked entries are silently skipped: ``open_relative_directory`` will
+    refuse to follow them if we did try to open them, but skipping in the
+    listing keeps the per-request cost predictable.
+    """
+
+    entries: list[tuple[str, float]] = []
+    root_fd = os.dup(runs_root_fd)
+    try:
+        with os.scandir(root_fd) as scanner:
+            for entry in scanner:
+                if not valid_run_id(entry.name):
+                    continue
+                try:
+                    info = os.stat(entry.name, dir_fd=runs_root_fd, follow_symlinks=False)
+                except OSError:
+                    continue
+                if not stat.S_ISDIR(info.st_mode):
+                    continue
+                entries.append((entry.name, info.st_mtime))
+    finally:
+        os.close(root_fd)
+    entries.sort(key=lambda pair: pair[1], reverse=True)
+    return entries
+
+
+def resolve_ticket_runs(runs_root_fd: int, ticket: str) -> TicketRunsListing:
+    entries = _iter_root_entries(runs_root_fd)
+    matches: list[RunSummary] = []
+    truncated = False
+    scanned = 0
+    for name, _mtime in entries:
+        if scanned >= MAX_RUN_LIST_SCAN:
+            truncated = True
+            break
+        scanned += 1
+        try:
+            meta = _read_bounded_metadata(runs_root_fd, name)
+        except ReplayError:
+            continue
+        agent_id = meta.get("agent_id")
+        if agent_id != ticket:
+            continue
+        matches.append(_run_summary_from_meta(meta, name))
+        if len(matches) >= MAX_RUN_LIST_ENTRIES:
+            truncated = True
+            break
+    return TicketRunsListing(runs=matches, truncated=truncated)
+
+
+# ---------------------------------------------------------------------------
+# Runs root helper (for callers in main.py)
+# ---------------------------------------------------------------------------
+
+
+def open_runs_root_fd(runs_root_path: str | os.PathLike[str]) -> int:
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    return os.open(runs_root_path, os.O_RDONLY | no_follow | directory_flag)
+
+
+def verify_run_dir_exists(runs_root_fd: int, run_id: str) -> None:
+    """Cheap early-existence check that mirrors production behavior.
+
+    ``open_relative_directory`` opens the run dir under ``runs_root_fd``
+    with ``O_NOFOLLOW`` on every component. We close the fd immediately —
+    the useful signal is whether the open succeeded.
+    """
+
+    try:
+        fd = open_relative_directory(runs_root_fd, (run_id,))
+    except FileNotFoundError as exc:
+        raise ReplayError("run not found") from exc
+    except OSError as exc:
+        raise ReplayError(f"run not readable: {exc}") from exc
+    os.close(fd)
