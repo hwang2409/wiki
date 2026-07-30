@@ -72,6 +72,7 @@ def main_cli() -> None:
             "WIKI_CODEX_SESSIONS_DIR": str(args.codex_sessions_dir),
             "WIKI_CLAUDE_PROJECTS_DIR": str(claude_projects_dir),
             "WIKI_ACCOUNT_HOME_OVERRIDE": str(account_home),
+            "HOME": str(account_home),
             "WIKI_CODEX_AUTH_PATH": str(account_home / "codex" / "auth.json"),
             "WIKI_CODEX_ACCOUNTS_DIR": str(account_home / "codex-accounts"),
             "WIKI_ROTATION_LOG_PATH": str(account_home / "rotation.log"),

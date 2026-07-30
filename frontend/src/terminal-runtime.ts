@@ -11,8 +11,13 @@ export type TerminalRenderer = "webgl" | "dom";
 export type TerminalSearchResults = ISearchResultChangeEvent;
 
 type TerminalSnapshot = {
+  customName: string | null;
+  cwd: string | null;
   message: string;
+  oscTitle: string | null;
   renderer: TerminalRenderer;
+  shell: string | null;
+  size: { cols: number; rows: number } | null;
   status: TerminalStatus;
   theme: DerivedTerminalTheme;
 };
@@ -36,6 +41,45 @@ declare global {
 const DEFAULT_COLS = 80;
 const DEFAULT_ROWS = 24;
 const RESIZE_DEBOUNCE_MS = 48;
+
+function customNameStorageKey(terminalId: string) {
+  return `wiki-terminal-name:${terminalId}`;
+}
+
+function readStoredCustomName(terminalId: string) {
+  try {
+    const value = window.localStorage.getItem(customNameStorageKey(terminalId));
+    return value?.trim() ? value.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+function metaStorageKey(terminalId: string) {
+  return `wiki-terminal-meta:${terminalId}`;
+}
+
+function readStoredMeta(terminalId: string): { cwd: string | null; shell: string | null } {
+  try {
+    const raw = window.localStorage.getItem(metaStorageKey(terminalId));
+    if (!raw) return { cwd: null, shell: null };
+    const parsed = JSON.parse(raw) as { cwd?: unknown; shell?: unknown };
+    return {
+      cwd: typeof parsed.cwd === "string" && parsed.cwd ? parsed.cwd : null,
+      shell: typeof parsed.shell === "string" && parsed.shell ? parsed.shell : null,
+    };
+  } catch {
+    return { cwd: null, shell: null };
+  }
+}
+
+function writeStoredMeta(terminalId: string, meta: { cwd: string | null; shell: string | null }) {
+  try {
+    window.localStorage.setItem(metaStorageKey(terminalId), JSON.stringify(meta));
+  } catch {
+    // Storage may be unavailable; metadata just won't survive reloads.
+  }
+}
 
 function terminalWsUrl(terminalId: string, token: string, create: boolean) {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
@@ -91,6 +135,7 @@ class TerminalRuntime {
   private readonly searchListeners = new Set<(results: TerminalSearchResults) => void>();
   private readonly themeObserver: MutationObserver;
   private readonly dataDisposable: IDisposable;
+  private titleDisposable: IDisposable | null = null;
   private readonly searchResultsDisposable: IDisposable;
   private rendererDisposable: IDisposable | null = null;
   private webglAddon: WebglAddon | null = null;
@@ -105,14 +150,26 @@ class TerminalRuntime {
   private hasConnected = false;
   private disposed = false;
   private snapshot: TerminalSnapshot = {
+    customName: null,
+    cwd: null,
     message: "Connecting…",
+    oscTitle: null,
     renderer: "dom",
+    shell: null,
+    size: null,
     status: "connecting",
     theme: deriveTerminalTheme(),
   };
 
   constructor(terminalId: string) {
     this.terminalId = terminalId;
+    const storedMeta = readStoredMeta(terminalId);
+    this.snapshot = {
+      ...this.snapshot,
+      customName: readStoredCustomName(terminalId),
+      cwd: storedMeta.cwd,
+      shell: storedMeta.shell,
+    };
     this.shellRoot = document.createElement("div");
     this.shellRoot.className = "terminal-runtime-shell";
     this.shellRoot.style.height = "1px";
@@ -142,6 +199,10 @@ class TerminalRuntime {
     this.installRenderer();
     this.dataDisposable = this.terminal.onData((data) => {
       this.sendInput(data);
+    });
+    this.titleDisposable = this.terminal.onTitleChange((title) => {
+      const trimmed = title.trim();
+      this.setSnapshot({ oscTitle: trimmed ? trimmed : null });
     });
     this.searchResultsDisposable = this.searchAddon.onDidChangeResults((results) => {
       this.searchListeners.forEach((listener) => listener(results));
@@ -238,6 +299,20 @@ class TerminalRuntime {
     this.terminal.focus();
   }
 
+  setCustomName(name: string) {
+    const trimmed = name.trim();
+    try {
+      if (trimmed) {
+        window.localStorage.setItem(customNameStorageKey(this.terminalId), trimmed);
+      } else {
+        window.localStorage.removeItem(customNameStorageKey(this.terminalId));
+      }
+    } catch {
+      // Storage may be unavailable; the in-memory name still applies.
+    }
+    this.setSnapshot({ customName: trimmed ? trimmed : null });
+  }
+
   ensureConnection(launchNonce: number) {
     if (this.disposed) return;
     if (!this.hasConnected) {
@@ -285,7 +360,15 @@ class TerminalRuntime {
     this.socket = null;
     socket?.close();
     this.dataDisposable.dispose();
+    this.titleDisposable?.dispose();
+    this.titleDisposable = null;
     delete window.__wikiTerminals?.[this.terminalId];
+    try {
+      window.localStorage.removeItem(customNameStorageKey(this.terminalId));
+      window.localStorage.removeItem(metaStorageKey(this.terminalId));
+    } catch {
+      // Best-effort cleanup of per-terminal storage.
+    }
     this.terminal.dispose();
     this.shellRoot.remove();
   }
@@ -384,7 +467,9 @@ class TerminalRuntime {
             capabilities?: {
               binaryInput?: boolean;
             };
+            cwd?: string;
             message?: string;
+            shell?: string;
             type?: string;
           };
           try {
@@ -392,7 +477,9 @@ class TerminalRuntime {
               capabilities?: {
                 binaryInput?: boolean;
               };
+              cwd?: string;
               message?: string;
+              shell?: string;
               type?: string;
             };
           } catch {
@@ -401,6 +488,11 @@ class TerminalRuntime {
           }
           if (payload.type === "hello") {
             this.binaryInputSupported = payload.capabilities?.binaryInput === true;
+            const cwd = typeof payload.cwd === "string" && payload.cwd ? payload.cwd : this.snapshot.cwd;
+            const shell =
+              typeof payload.shell === "string" && payload.shell ? payload.shell : this.snapshot.shell;
+            this.setSnapshot({ cwd, shell });
+            writeStoredMeta(this.terminalId, { cwd, shell });
           } else if (payload.type === "missing" || payload.type === "exit") {
             this.setSnapshot({
               message: payload.message ?? "Session ended.",
@@ -467,6 +559,7 @@ class TerminalRuntime {
     const last = this.lastSize;
     const changed = !last || last.cols !== next.cols || last.rows !== next.rows;
     this.lastSize = next;
+    if (changed) this.setSnapshot({ size: next });
     if (!sendResize || !changed) return;
     const socket = this.socket;
     if (socket?.readyState === WebSocket.OPEN) {
