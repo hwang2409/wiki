@@ -1245,6 +1245,29 @@ class TodoCompleteTests(unittest.TestCase):
             lint = self._run(["lint"], env)
             self.assertEqual(lint.returncode, 0, msg=lint.stdout + lint.stderr)
 
+    def test_todo_add_if_missing_is_idempotent(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            vault = self._vault(tmp_path)
+            env = {
+                **os.environ,
+                "WIKI_VAULT_DIR": str(vault),
+                "WIKI_AGENT_RUNTIME_DIR": str(tmp_path / "runtime"),
+            }
+            text = "unknown provider event kind item/novel"
+            first = self._run(["todo", "add", text, "--if-missing"], env)
+            second = self._run(["todo", "add", text, "--if-missing"], env)
+
+            self.assertEqual(first.returncode, 0, msg=first.stderr)
+            self.assertEqual(second.returncode, 0, msg=second.stderr)
+            self.assertIn("already in Todo", second.stdout)
+            self.assertEqual(
+                (vault / "todo.md").read_text(encoding="utf-8").count(
+                    f"- {text}"
+                ),
+                1,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

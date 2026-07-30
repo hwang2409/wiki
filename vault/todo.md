@@ -12,7 +12,6 @@ Todo:
 - [P1] WIKI-175 PR conflict auto-rebase bot — detect DIRTY state after upstream merge; spawn dedicated worker that fetches origin/main, merges, resolves mechanical conflicts (imports, ordering, whitespace, lockfiles), pushes. Semantic conflicts escalate to orchestrator w/ diff summary. Cuts 2x rebase cycles seen in 07-29 five-feature arc
 - [P2] WIKI-176 live worker screencast strip — miniature terminal preview (last ~20 lines) inline in fleet view + per-ticket cards; refresh 2s from raw.jsonl tail. Skim 12 workers at glance w/o click-in
 - [P2] WIKI-177 blast radius view pre-spawn — before spawning ticket X, compute which in-flight branches touch same files (git diff main..branch per active branch); display collision-risk preview in spawn dialog. Prevents rebase pain
-- [P2] WIKI-179 vault semantic search — embed vault notes (once, incrementally on write), search by meaning. Grep already exists; add embedding-backed rank. Backend: embedding store + query endpoint. Frontend: search palette upgrade w/ semantic-vs-lexical toggle
 - [P2] WIKI-180 auto-context injector on spawn — LLM scans vault + related tickets + recent PRs touching same files + related workgraphs; prepends "context prelude" to kickoff prompt. Cuts prompt-writing time. Backend: prelude builder; hook into spawn_agent. Frontend: preview prelude before spawn
 - [P2] WIKI-181 reviewer diversity harness — spawn N reviewers w/ distinct lenses (correctness / security / perf / test-strength) in parallel; synthesize verdicts. Codified adversarial verify — one lens catches what another misses. Wire into next_review (WIKI-171) as opt-in mode
 - [P3] WIKI-182 verdict archaeology — search across all archived reviewer verdicts. "Show every finding about mutation-not-load-bearing." Training data for future reviewer prompts + doctrine mining. Backend: full-text over archived transcripts. Frontend: search page w/ severity + author + date filters
@@ -77,8 +76,8 @@ In Progress:
 - [P1] WIKI-189 image artifact polish — blur-up progressive load, lazy-load below fold, click-to-lightbox (fullscreen w/ pinch/scroll zoom + pan), copy-to-clipboard, drag-to-download, EXIF strip on receive, `srcset` for retina. Fixes current jank; makes single-image inline previews feel silky
 - [P2] WIKI-192 multi-image gallery + lightbox — when artifact payload = N images (e.g. R1/R3/R7 screenshots in WIKI-172), render as responsive grid w/ captions; click any → lightbox w/ arrow-key nav + pinch-zoom. Currently a file-list dump
 - [P2] WIKI-201 markdown inline-image polish — smooth rendering of `![](url)` in agent output: loading placeholder, sized-before-load (aspect-ratio hint or naturalWidth probe), click → lightbox, respect prefers-reduced-motion
-- [P2] WIKI-216 unknown-kind telemetry job — cron over `~/.wiki/agent-runtime/runs/` weekly, aggregates unknown-kind frequency, opens vault todo entry when a novel kind exceeds threshold (e.g. >100 events across the week). Kills the need for hand audits. Backend cron + vault write via `wiki todo add`
 - [P2] WIKI-178 cost dashboard — per-worker/ticket/orch/day USD, top spenders, prompt-size distribution, token velocity. Kill runaways before they burn tokens. Backend: cost aggregator over raw.jsonl. Frontend: dashboard page + per-ticket cost strip
+- [P2] WIKI-179 vault semantic search — embed vault notes (once, incrementally on write), search by meaning. Grep already exists; add embedding-backed rank. Backend: embedding store + query endpoint. Frontend: search palette upgrade w/ semantic-vs-lexical toggle
 
 Backlog:
 

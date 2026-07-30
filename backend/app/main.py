@@ -4,6 +4,7 @@ import asyncio
 import errno
 import fcntl
 import json
+import logging
 import os
 import re
 import secrets
@@ -59,6 +60,7 @@ from .agent_runtime import graph_health
 from .agent_runtime.loop_state import derive_loop_state
 from .agent_runtime.store import RuntimePaths
 from .agent_runtime.ticket import base_ticket
+from .agent_runtime.unknown_kind_telemetry import UnknownKindTelemetry
 from .frontend_static import mount_frontend_static
 from .next_review_schema import NextReviewIn
 from .rebase_schema import RebaseDirtyPrIn
@@ -94,6 +96,8 @@ IGNORED_FILE_PARTS = {
 VAULT_DIR.mkdir(parents=True, exist_ok=True)
 
 PROVIDER_HEALTH = provider_health.ProviderHealthTracker()
+UNKNOWN_KIND_TELEMETRY: UnknownKindTelemetry | None = None
+logger = logging.getLogger(__name__)
 
 
 _REBASE_RECORDING_NOTIFIER: Callable[[str, str], None] | None = None
@@ -134,10 +138,12 @@ def _rebase_bot_notification_sender(target: str, text: str) -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    global UNKNOWN_KIND_TELEMETRY
     runtime_paths = RuntimePaths.from_env()
     from .agent_runtime import rebase_bot
 
     rebase_bot.resume_pending_jobs(notify=_rebase_bot_notification_sender)
+    UNKNOWN_KIND_TELEMETRY = UnknownKindTelemetry(runtime_paths)
     configured_backend = os.environ.get("WIKI_BACKEND_URL")
     if configured_backend:
         backend_runtime.publish_backend_url(configured_backend)
@@ -183,26 +189,35 @@ async def lifespan(_app: FastAPI):
         provider_health.probe_loop(PROVIDER_HEALTH),
         name="wiki-provider-health-probe",
     )
+    unknown_kind_telemetry_stop = asyncio.Event()
+    unknown_kind_telemetry_task = asyncio.create_task(
+        UNKNOWN_KIND_TELEMETRY.periodic_loop(unknown_kind_telemetry_stop),
+        name="wiki-unknown-kind-telemetry",
+    )
     try:
         yield
     finally:
+        unknown_kind_telemetry_stop.set()
         dispatcher_task.cancel()
         watchdog_task.cancel()
         token_task.cancel()
         knowledge_task.cancel()
         provider_health_task.cancel()
+        unknown_kind_telemetry_task.cancel()
         await asyncio.gather(
             dispatcher_task,
             watchdog_task,
             token_task,
             knowledge_task,
             provider_health_task,
+            unknown_kind_telemetry_task,
             return_exceptions=True,
         )
         # Bounded drain: every accepted workgraph write is delivered or
         # logged as undelivered before the process exits.
         await asyncio.to_thread(workgraph_service.stop_outbox)
         await asyncio.to_thread(terminal.TERMINAL_MANAGER.close_all)
+        UNKNOWN_KIND_TELEMETRY = None
 
 
 # --- Wiki.app origin secret (WIKI-148 round 6 — Path B) ---------------------
@@ -765,6 +780,24 @@ def normalize_content(title: str, content: str) -> str:
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+def _unknown_kind_telemetry_service() -> UnknownKindTelemetry:
+    global UNKNOWN_KIND_TELEMETRY
+    if UNKNOWN_KIND_TELEMETRY is None:
+        UNKNOWN_KIND_TELEMETRY = UnknownKindTelemetry(RuntimePaths.from_env())
+    return UNKNOWN_KIND_TELEMETRY
+
+
+@app.post("/api/agent-runtime/unknown-kind-telemetry/run")
+async def run_unknown_kind_telemetry() -> dict[str, object]:
+    """Run the weekly unknown-provider-kind sweep now."""
+
+    try:
+        return await asyncio.to_thread(_unknown_kind_telemetry_service().run_once)
+    except Exception as exc:
+        logger.exception("manual unknown-kind telemetry sweep failed")
+        raise HTTPException(status_code=500, detail="telemetry sweep failed") from exc
 
 
 WIKILINK_PATTERN = re.compile(r"\[\[([^\][|\n]+?)(?:\|[^\][\n]*)?\]\]")
