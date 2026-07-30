@@ -57,6 +57,7 @@ def scrub_wav(data: bytes) -> MediaScrubResult:
     fmt_bits = 0
     fmt_block_align = 0
     fmt_format_code = _WAV_FORMAT_PCM
+    fmt_valid_bits = 0
 
     offset = 12
     end = len(data)
@@ -78,7 +79,7 @@ def scrub_wav(data: bytes) -> MediaScrubResult:
                 raise MediaScrubError("wav duplicate fmt chunk")
             (rebuilt_fmt, fmt_channels, fmt_sample_rate,
              fmt_byte_rate, fmt_bits, fmt_block_align,
-             fmt_format_code) = _wav_rebuild_fmt(payload)
+             fmt_format_code, fmt_valid_bits) = _wav_rebuild_fmt(payload)
         elif chunk_id == b"data":
             if data_payload is not None:
                 raise MediaScrubError("wav duplicate data chunk")
@@ -110,6 +111,8 @@ def scrub_wav(data: bytes) -> MediaScrubResult:
     # Use the frames-based formula (it survives a future refactor where we
     # drop the mandatory byte_rate emission).
     duration_ms = int(round(frames * 1000 / fmt_sample_rate)) if frames else 0
+    if fmt_format_code == _WAV_FORMAT_PCM and fmt_valid_bits < fmt_bits:
+        data_payload = _wav_zero_pcm_padding(data_payload, fmt_bits, fmt_valid_bits)
     peaks = _wav_stream_peaks(
         data_payload, 0, len(data_payload), fmt_channels, fmt_bits,
         fmt_format_code,
@@ -141,7 +144,7 @@ def _wav_emit_chunk(body: bytearray, chunk_id: bytes, payload: bytes) -> None:
         body.append(0)
 
 
-def _wav_rebuild_fmt(payload: bytes) -> tuple[bytes, int, int, int, int, int, int]:
+def _wav_rebuild_fmt(payload: bytes) -> tuple[bytes, int, int, int, int, int, int, int]:
     """Parse and rebuild fmt from validated fields only.
 
     Every byte in the returned fmt chunk is either a struct.pack of a
@@ -204,7 +207,9 @@ def _wav_rebuild_fmt(payload: bytes) -> tuple[bytes, int, int, int, int, int, in
             if subformat == _WAV_KSDATAFORMAT_IEEE_FLOAT
             else _WAV_FORMAT_PCM
         )
-        return rebuilt, channels, sample_rate, byte_rate, bits, block_align, effective_format
+        if effective_format == _WAV_FORMAT_IEEE_FLOAT and valid_bits != bits:
+            raise MediaScrubError("wav extensible float valid_bits must equal container bits")
+        return rebuilt, channels, sample_rate, byte_rate, bits, block_align, effective_format, valid_bits
 
     if format_code == _WAV_FORMAT_PCM:
         allowed_bits = _WAV_PCM_ALLOWED_BITS
@@ -224,7 +229,23 @@ def _wav_rebuild_fmt(payload: bytes) -> tuple[bytes, int, int, int, int, int, in
     rebuilt = struct.pack(
         "<HHIIHH", format_code, channels, sample_rate, byte_rate, block_align, bits,
     )
-    return rebuilt, channels, sample_rate, byte_rate, bits, block_align, format_code
+    return rebuilt, channels, sample_rate, byte_rate, bits, block_align, format_code, bits
+
+
+def _wav_zero_pcm_padding(
+    data: bytes, bits: int, valid_bits: int,
+) -> bytes:
+    if valid_bits >= bits:
+        return data
+    bytes_per_sample = bits // 8
+    mask = ((1 << valid_bits) - 1) << (bits - valid_bits)
+    output = bytearray(data)
+    for offset in range(0, len(output), bytes_per_sample):
+        sample = int.from_bytes(output[offset:offset + bytes_per_sample], "little")
+        output[offset:offset + bytes_per_sample] = (sample & mask).to_bytes(
+            bytes_per_sample, "little",
+        )
+    return bytes(output)
 
 
 def _wav_validate_bit_depth_and_alignment(

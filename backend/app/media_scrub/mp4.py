@@ -100,6 +100,7 @@ _MP4_SAMPLE_ENTRY_REQUIRED_CONFIG: Final = {
 }
 _MP4_MAX_SAMPLES: Final = 16_777_216
 _MP4_AVC_SAMPLE_NAL_TYPES: Final = {1, 5, 6}
+_MP4_MAX_BOXES_PER_CONTAINER: Final = 4096
 # Additional stbl children beyond stsd. Every allowed type below has a
 # field-level rebuild via struct.pack that emits exactly the parsed
 # entry_count worth of entries — trailing bytes cannot survive because
@@ -634,6 +635,10 @@ def _parse_container(data: bytes, offset: int, end: int) -> list[_Mp4Atom]:
     view = memoryview(data)
     atoms: list[_Mp4Atom] = []
     while offset < end:
+        if len(atoms) >= _MP4_MAX_BOXES_PER_CONTAINER:
+            raise MediaScrubError(
+                f"mp4 container has more than {_MP4_MAX_BOXES_PER_CONTAINER} child boxes"
+            )
         size, atom_type, header_len, atom_end = _read_header(view, offset, end)
         atoms.append(
             _Mp4Atom(

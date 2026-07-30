@@ -575,7 +575,7 @@ def _validate_audio_transcript(payload: dict[str, Any]) -> str | None:
         return None
     if not isinstance(transcript, str):
         raise ArtifactValidationError("payload.transcript must be a string")
-    if len(transcript) > TEXT_LIMIT:
+    if len(transcript.encode("utf-8")) > TEXT_LIMIT:
         raise ArtifactValidationError(
             f"audio transcript exceeds the {TEXT_LIMIT // 1000}KB text limit"
         )

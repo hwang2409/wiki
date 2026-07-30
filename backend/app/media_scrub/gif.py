@@ -7,8 +7,7 @@ scrub, and both are re-serialized from parsed fields:
     disposal + user_input + transparent flags, delay_time (uint16 LE),
     transparent_color_index (uint8). Rebuilt via struct.pack.
   * NETSCAPE2.0 looping Application Extension (0x21 0xFF, ident
-    "NETSCAPE2.0"): 3-byte sub-block carrying sub_block_index (0x01),
-    loop_count (uint16 LE). Rebuilt via struct.pack.
+    "NETSCAPE2.0"): emitted once for animated output with loop_count 0.
 
 Everything else — Comment (0xFE), Plain Text (0x01), XMP, Adobe, and every
 other Application Extension — is dropped. Image data (0x2C) is not an
@@ -48,6 +47,9 @@ _GIF_GCE_DISPOSAL_MAX: Final = 3  # spec defines 0..3; 4..7 reserved
 _GIF_IMAGE_DESCRIPTOR_RESERVED_MASK: Final = 0b0001_1000
 _GIF_IMAGE_DESCRIPTOR_ALLOWED_MASK: Final = 0b1110_0111
 _GIF_MAX_EXTENSION_SUB_BLOCKS: Final = 4096
+_GIF_CANONICAL_LOOP_EXTENSION: Final = (
+    b"\x21\xff\x0b" + _GIF_NETSCAPE_IDENT + b"\x03\x01\x00\x00\x00"
+)
 
 
 @dataclass(frozen=True)
@@ -144,6 +146,9 @@ def scrub_gif(data: bytes) -> MediaScrubResult:
         out.extend(data[13:lsd_end])
 
     image_seen = False
+    image_count = 0
+    loop_inserted = False
+    first_image_output_offset: int | None = None
     total_image_pixels = 0
     pending_gce: _PendingGCE | None = None
     offset = lsd_end
@@ -183,6 +188,8 @@ def scrub_gif(data: bytes) -> MediaScrubResult:
             offset = block_end
             continue
         if marker == _GIF_IMAGE_DESCRIPTOR:
+            if image_count == 0:
+                first_image_output_offset = len(out)
             block_end, image_pixels = _emit_image_descriptor(
                 data, offset, end, out,
                 pending_gce=pending_gce,
@@ -197,6 +204,13 @@ def scrub_gif(data: bytes) -> MediaScrubResult:
             pending_gce = None
             offset = block_end
             image_seen = True
+            image_count += 1
+            if image_count == 2 and not loop_inserted:
+                assert first_image_output_offset is not None
+                out[first_image_output_offset:first_image_output_offset] = (
+                    _GIF_CANONICAL_LOOP_EXTENSION
+                )
+                loop_inserted = True
             continue
         raise MediaScrubError(f"unexpected gif block marker: 0x{marker:02x}")
     if not image_seen:
@@ -253,21 +267,13 @@ def _rebuild_extension(label: int, sub_blocks: list[bytes]) -> bytes | None:
             return None  # unknown application extension → drop
         if sub_blocks[0] != _GIF_NETSCAPE_IDENT:
             return None  # anything except NETSCAPE2.0 (XMP, Adobe, …) → drop
-        # NETSCAPE2.0 looping extension: sub_block_index(1)=0x01,
-        # loop_count(2 LE). Rebuild from those parsed fields only.
         if len(sub_blocks) < 2 or len(sub_blocks[1]) != 3:
             raise MediaScrubError("gif NETSCAPE2.0 extension malformed")
-        sub_block_index = sub_blocks[1][0]
-        if sub_block_index != 0x01:
+        if sub_blocks[1][0] != 0x01:
             raise MediaScrubError("gif NETSCAPE2.0 sub-block index unexpected")
-        loop_count = struct.unpack("<H", sub_blocks[1][1:3])[0]
-        return (
-            bytes([_GIF_EXT_INTRO, _GIF_APP_EXT_LABEL, 0x0B])
-            + _GIF_NETSCAPE_IDENT
-            + bytes([0x03, 0x01])
-            + struct.pack("<H", loop_count)
-            + bytes([0x00])
-        )
+        # Drop every input loop extension. Animated output receives one
+        # canonical loop extension when the second image is observed.
+        return None
     # Comment (0xFE), Plain Text (0x01), and every other label → drop.
     return None
 

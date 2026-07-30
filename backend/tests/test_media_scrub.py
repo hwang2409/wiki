@@ -1494,27 +1494,36 @@ class GifRound7ExtensionProbes(unittest.TestCase):
         self.assertNotIn(marker, result.data)
         self.assertNotIn(ident, result.data)
 
-    def test_netscape_looping_extension_survives_via_rebuild(self) -> None:
-        # NETSCAPE2.0 looping extension SHOULD survive scrub — it's the
-        # only application extension we allowlist, and it's rebuilt from
-        # parsed sub-block fields.
-        loop_count = 3
+    def test_netscape_looping_extension_is_replaced_with_canonical_loop(self) -> None:
+        # An input loop extension is replaced by the canonical infinite loop.
         netscape = (
             b"\x21\xff\x0b"
             + b"NETSCAPE2.0"
             + b"\x03\x01"
-            + struct.pack("<H", loop_count)
+            + struct.pack("<H", 3)
             + b"\x00"
         )
-        payload = self._min_gif_prefix() + netscape + self._min_gif_image_data()
+        frame = self._min_gif_image_data()[:-1]
+        payload = self._min_gif_prefix() + netscape + frame + frame + b"\x3b"
         result = media_scrub.scrub_video(payload, "image/gif")
         self.assertIn(b"NETSCAPE2.0", result.data)
-        # The loop count survives (it's a parsed field).
         loop_pos = result.data.find(b"NETSCAPE2.0")
-        # After ident, expect: 0x03 0x01 <loop LE 2 bytes> 0x00
         self.assertEqual(result.data[loop_pos + 11], 0x03)
         self.assertEqual(result.data[loop_pos + 12], 0x01)
-        self.assertEqual(struct.unpack("<H", result.data[loop_pos + 13:loop_pos + 15])[0], loop_count)
+        self.assertEqual(
+            struct.unpack("<H", result.data[loop_pos + 13:loop_pos + 15])[0], 0,
+        )
+        self.assertEqual(result.data.count(b"NETSCAPE2.0"), 1)
+
+    def test_animated_gif_without_loop_extension_gets_infinite_loop(self) -> None:
+        frame = self._min_gif_image_data()[:-1]
+        payload = self._min_gif_prefix() + frame + frame + b"\x3b"
+        result = media_scrub.scrub_video(payload, "image/gif")
+        self.assertEqual(result.data.count(b"NETSCAPE2.0"), 1)
+        loop_pos = result.data.find(b"NETSCAPE2.0")
+        self.assertEqual(
+            struct.unpack("<H", result.data[loop_pos + 13:loop_pos + 15])[0], 0,
+        )
 
 
 class Mp4Round8SurvivorProbes(unittest.TestCase):
@@ -2648,6 +2657,59 @@ class Review15MediaProbeTests(unittest.TestCase):
         payload = GifRound7ExtensionProbes._min_gif_prefix() + comment
         with self.assertRaisesRegex(media_scrub.MediaScrubError, "too many sub-blocks"):
             media_scrub.scrub_video(payload, "image/gif")
+
+    def test_mp4_child_box_count_is_capped_with_bounded_memory(self) -> None:
+        real = REAL_MP4.read_bytes()
+        free_boxes = b"".join(
+            struct.pack(">I", 8) + b"free" for _ in range(100_000)
+        )
+        payload = real + free_boxes
+        tracemalloc.start()
+        try:
+            with self.assertRaisesRegex(
+                media_scrub.MediaScrubError, "more than 4096 child boxes"
+            ):
+                media_scrub.scrub_video(payload, "video/mp4")
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 8 * 1024 * 1024, f"peak allocation was {peak} bytes")
+
+    def test_extensible_pcm_padding_marker_is_zeroed_and_decodes(self) -> None:
+        samples = b"".join(
+            struct.pack("<H", (0x12 << 8) | marker)
+            for marker in (0xA5, 0x5A, 0xC3)
+        )
+        fmt_body = (
+            struct.pack("<HHIIHH", 0xFFFE, 1, 16_000, 32_000, 2, 16)
+            + struct.pack("<HHI", 22, 8, 0)
+            + media_scrub._WAV_KSDATAFORMAT_PCM
+        )
+        fmt_chunk = b"fmt " + struct.pack("<I", len(fmt_body)) + fmt_body
+        data_chunk = b"data" + struct.pack("<I", len(samples)) + samples
+        body = b"WAVE" + fmt_chunk + data_chunk
+        payload = b"RIFF" + struct.pack("<I", len(body)) + body
+        result = media_scrub.scrub_audio(payload, "audio/wav")
+        data_pos = result.data.find(b"data")
+        data_size = struct.unpack("<I", result.data[data_pos + 4:data_pos + 8])[0]
+        stored = result.data[data_pos + 8:data_pos + 8 + data_size]
+        self.assertEqual(stored, b"\x00\x12\x00\x12\x00\x12")
+        if FFMPEG is not None:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
+                handle.write(result.data)
+                stored_path = handle.name
+            try:
+                probe = subprocess.run(
+                    [FFMPEG, "-v", "error", "-i", stored_path, "-f", "null", "-"],
+                    capture_output=True,
+                    timeout=30,
+                )
+                self.assertEqual(
+                    probe.returncode, 0,
+                    msg=f"ffmpeg decode failed: {probe.stderr.decode(errors='replace')}",
+                )
+            finally:
+                Path(stored_path).unlink(missing_ok=True)
 
     def test_gif_cumulative_pixels_are_capped_before_decode(self) -> None:
         image = b"\x2c" + struct.pack("<HHHH", 0, 0, 4096, 4096) + b"\x00\x02\x01\x2c\x00"

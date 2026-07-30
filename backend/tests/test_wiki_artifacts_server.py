@@ -312,6 +312,17 @@ class WikiArtifactsTests(unittest.TestCase):
         ):
             wiki_artifacts.render_artifact({"kind": "audio", "payload": payload})
 
+    def test_audio_multibyte_transcript_length_is_capped_by_utf8_bytes(self) -> None:
+        payload = {
+            "data_base64": base64.b64encode(FIXTURE_WAV_BYTES).decode(),
+            "mime": "audio/wav",
+            "transcript": "𐍈" * (wiki_artifacts.TEXT_LIMIT // 4 + 1),
+        }
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError, "audio transcript exceeds"
+        ):
+            wiki_artifacts.render_artifact({"kind": "audio", "payload": payload})
+
     def test_audio_rejected_transcript_does_not_orphan_media_file(self) -> None:
         # Round-2 review flagged: an oversized transcript fires AFTER
         # _write_binary, leaving a scrubbed .wav resident on disk while
