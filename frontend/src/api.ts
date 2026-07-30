@@ -952,6 +952,7 @@ export type AutopilotAction = {
   action: string;
   at_ns: number;
   source: "autopilot";
+  findings?: Array<Record<string, unknown>>;
   [key: string]: unknown;
 };
 

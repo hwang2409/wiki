@@ -268,6 +268,8 @@ def record_steer(
     source: str | None,
     request_id: str | None,
     status_dir: Path | None = None,
+    findings: list[dict] | None = None,
+    constraint_bundle: str | None = None,
 ) -> None:
     actor = orch or DEFAULT_ACTOR
     # The supervisor's exact request id rides on the edge itself: replay
@@ -279,6 +281,8 @@ def record_steer(
         text,
         source_worker=source or DEFAULT_ACTOR,
         request_id=operation_id,
+        findings=findings,
+        constraint_bundle=constraint_bundle,
     )
     _record(
         base_ticket(agent_id),

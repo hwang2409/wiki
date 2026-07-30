@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -315,18 +316,16 @@ def approve_pr(ticket: str) -> dict[str, str]:
     return {"status": "approved"}
 
 
-def merge_pr(ticket: str, expected_sha: str) -> dict[str, str]:
-    """Squash-merge a resolved ticket PR through the existing gh wrapper."""
+def merge_pr(pr_url: str, expected_sha: str) -> dict[str, str]:
+    """Squash-merge the exact PR that passed the merge-ready gate."""
 
-    if not isinstance(expected_sha, str) or not expected_sha:
+    if _normalize_pr_url(pr_url) != pr_url:
+        raise HTTPException(status_code=400, detail="a canonical GitHub PR URL is required")
+    if not isinstance(expected_sha, str) or not re.fullmatch(r"[0-9a-fA-F]{7,64}", expected_sha):
         raise HTTPException(status_code=400, detail="expected PR head sha is required")
-    resolved = resolve_pr(ticket)
-    if not resolved:
-        raise HTTPException(status_code=404, detail="No PR found for this agent")
-    pr_url, _repo = resolved
     _run_gh(
         ["pr", "merge", pr_url, "--squash", f"--match-head-commit={expected_sha}"],
         timeout=60,
     )
-    _pr_cache.pop(ticket, None)
+    _pr_cache.clear()
     return {"status": "merged", "url": pr_url}

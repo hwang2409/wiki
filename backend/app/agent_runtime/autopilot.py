@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -31,9 +32,9 @@ from .ticket import base_ticket
 DEFAULT_ITERATION_CAP = 8
 DEFAULT_PLATEAU_GUARD = 3
 _HEADER = re.compile(
-    r"(?im)^\s*(?:verdict\s*:\s*)?"
+    r"(?im)^[ \t]*(?:verdict[ \t]*:[ \t]*)?"
     r"(MERGE-READY|NOT-MERGE-READY|NO-GO|NEEDS[- ](?:FIXES|WORK))"
-    r"\s*(?:[:;—-]\s*(?:(\d+)\s+findings?|[^\n]*))?\s*$"
+    r"[ \t]*(?:[:;—-][ \t]*(?:(\d+)[ \t]+findings?|[^\n]*))?[ \t]*$"
 )
 _FINDING = re.compile(
     r"(?im)^\s*(?:\d+[.)]|[-*])\s*(?:\*\*)?\[?"
@@ -63,6 +64,12 @@ class Finding:
     line: int | None
     problem: str
     fix: str
+    finding_id: str | None = None
+    title: str | None = None
+    observed: str | None = None
+    why_wrong: str | None = None
+    constraint: str | None = None
+    source_worker: str | None = None
     mutation_contract: str | None = None
     source_sha: str | None = None
 
@@ -74,11 +81,57 @@ class Finding:
             "problem": self.problem,
             "fix": self.fix,
         }
+        if self.finding_id:
+            result["id"] = self.finding_id
+        if self.title:
+            result["title"] = self.title
+        if self.observed:
+            result["observed"] = self.observed
+        if self.why_wrong:
+            result["why_wrong"] = self.why_wrong
+        if self.constraint:
+            result["constraint"] = self.constraint
+        if self.source_worker:
+            result["source_worker"] = self.source_worker
         if self.mutation_contract:
             result["mutation_contract"] = self.mutation_contract
         if self.source_sha:
             result["source_sha"] = self.source_sha
         return result
+
+    def to_steer_dict(
+        self,
+        *,
+        source_worker: str,
+        source_sha: str | None,
+        created_at: str,
+    ) -> dict[str, Any]:
+        canonical_sha = self.source_sha or source_sha or "0000000"
+        identity = self.finding_id or (
+            "F-"
+            + hashlib.sha256(
+                f"{canonical_sha}\0{self.path}\0{self.line}\0{self.problem}\0{self.fix}".encode()
+            ).hexdigest()[:6]
+        )
+        return {
+            "id": identity,
+            "severity": self.severity,
+            "title": (self.title or self.problem)[:140],
+            "file": self.path,
+            **({"line": self.line} if self.line is not None else {}),
+            "observed": self.observed or self.problem,
+            "why_wrong": self.why_wrong or self.problem,
+            "do_instead": self.fix,
+            **(
+                {"constraint": self.constraint or self.mutation_contract}
+                if self.constraint or self.mutation_contract
+                else {}
+            ),
+            "source_worker": self.source_worker or source_worker,
+            "source_kind": "review",
+            "source_sha": canonical_sha,
+            "created_at": created_at,
+        }
 
 
 @dataclass(frozen=True)
@@ -90,7 +143,7 @@ class Verdict:
 
     @property
     def clean(self) -> bool:
-        return self.state == "MERGE-READY"
+        return self.state == "MERGE-READY" and not self.findings
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -100,7 +153,9 @@ class Verdict:
         }
 
 
-def _finding_from_mapping(value: Mapping[str, Any], source_sha: str | None) -> Finding:
+def _finding_from_mapping(
+    value: Mapping[str, Any], source_sha: str | None, source_worker: str | None = None
+) -> Finding:
     line = value.get("line")
     if isinstance(line, str) and line.isdigit():
         line = int(line)
@@ -124,6 +179,11 @@ def _finding_from_mapping(value: Mapping[str, Any], source_sha: str | None) -> F
         or value.get("recommendation")
         or "address the finding"
     )
+    observed = str(value.get("observed") or problem)
+    why_wrong = str(value.get("why_wrong") or problem)
+    title = str(value.get("title") or problem)
+    finding_id = value.get("id")
+    finding_source_worker = value.get("source_worker") or value.get("worker") or source_worker
     contract = value.get("mutation_contract") or value.get("contract")
     return Finding(
         severity=str(value.get("severity") or "MEDIUM").upper(),
@@ -131,6 +191,14 @@ def _finding_from_mapping(value: Mapping[str, Any], source_sha: str | None) -> F
         line=line,
         problem=problem,
         fix=fix,
+        finding_id=str(finding_id) if finding_id else None,
+        title=title,
+        observed=observed,
+        why_wrong=why_wrong,
+        constraint=str(value.get("constraint")) if value.get("constraint") else None,
+        source_worker=(
+            str(finding_source_worker) if finding_source_worker else None
+        ),
         mutation_contract=str(contract) if contract else None,
         source_sha=str(value.get("source_sha") or source_sha)
         if (value.get("source_sha") or source_sha)
@@ -152,15 +220,30 @@ def parse_verdict(
 
     if not isinstance(text, str):
         return None
-    header = _HEADER.search(text)
-    if header is None:
+    headers = list(_HEADER.finditer(text))
+    if not headers:
         if fallback is not None:
             value = fallback(text)
             if isinstance(value, Mapping):
                 state = value.get("state")
                 if isinstance(state, str):
-                    return verdict_from_graph(value)
+                    parsed = verdict_from_graph(
+                        {**value, "source_sha": value.get("source_sha") or source_sha}
+                    )
+                    return None if parsed is not None and parsed.clean else parsed
         return None
+    states = {
+        (
+            "NOT-MERGE-READY"
+            if header.group(1).upper()
+            in {"NEEDS FIXES", "NEEDS-FIXES", "NEEDS WORK", "NEEDS-WORK"}
+            else header.group(1).upper()
+        )
+        for header in headers
+    }
+    if len(states) != 1:
+        return None
+    header = headers[-1]
     state = header.group(1).upper()
     if state in {"NEEDS FIXES", "NEEDS-FIXES", "NEEDS WORK", "NEEDS-WORK"}:
         state = "NOT-MERGE-READY"
@@ -219,12 +302,10 @@ def parse_verdict(
                 mutation_contract=finding.mutation_contract,
                 source_sha=finding.source_sha,
             )
-    if not findings and header.group(2) not in {None, "0"} and fallback is not None:
-        value = fallback(text)
-        if isinstance(value, Mapping):
-            parsed = verdict_from_graph(value)
-            if parsed is not None:
-                return parsed
+    if state == "MERGE-READY" and (
+        (matches and not findings) or header.group(2) not in {None, "0"}
+    ):
+        return None
     return Verdict(
         state=state, findings=tuple(findings), source_sha=verdict_sha, raw=text
     )
@@ -245,15 +326,16 @@ def verdict_from_graph(payload: Mapping[str, Any]) -> Verdict | None:
         or payload.get("pinned_sha")
     )
     source_sha = source_sha if isinstance(source_sha, str) else None
+    source_worker = payload.get("worker")
+    source_worker = source_worker if isinstance(source_worker, str) else None
     values = payload.get("findings")
-    findings = (
-        tuple(
-            _finding_from_mapping(value, source_sha)
-            for value in values
-            if isinstance(value, Mapping)
-        )
-        if isinstance(values, list)
-        else ()
+    if values is not None and not isinstance(values, list):
+        return None
+    if isinstance(values, list) and any(not isinstance(value, Mapping) for value in values):
+        return None
+    findings = tuple(
+        _finding_from_mapping(value, source_sha, source_worker)
+        for value in values or []
     )
     return Verdict(state=state.upper(), findings=findings, source_sha=source_sha)
 
@@ -282,7 +364,7 @@ def _anthropic_fallback(text: str) -> Mapping[str, Any] | None:
         )
         content = response.content[0].text if response.content else ""
         value = json.loads(content)
-    except (ImportError, OSError, ValueError, AttributeError):
+    except Exception:
         return None
     return value if isinstance(value, Mapping) else None
 
@@ -492,6 +574,7 @@ class AutopilotController:
         self.gate = gate or self._default_gate
         self.next_review = next_review or self._default_next_review
         self.steer = steer or self._default_steer
+        self._structured_steer = steer is None
         self.archive = archive or self._default_archive
         self.merge = merge or self._default_merge
         self.notify = notify or self._default_notify
@@ -537,7 +620,21 @@ class AutopilotController:
             status = self.status_reader(ticket)
             current.merge_ack_sha = self._current_sha(ticket, status, {})
             self.store.save(ticket, current)
-            return current.to_dict()
+        graph = self.graph_loader(ticket)
+        reviewer = self._current_reviewer(graph)
+        verdict = self._latest_verdict(graph, reviewer=reviewer) if reviewer else None
+        if verdict is None:
+            return self.status(ticket)
+
+        async def retry_merge() -> None:
+            with self.store.lock(ticket):
+                state = self.store.load(ticket)
+                if state.enabled and not state.halted:
+                    await self._maybe_merge(ticket, state, verdict)
+                self.store.save(ticket, state)
+
+        asyncio.run(retry_merge())
+        return self.status(ticket)
 
     def status(self, ticket: str | None = None) -> dict[str, Any]:
         values = self.store.list()
@@ -561,15 +658,15 @@ class AutopilotController:
             "actions_last_hour": actions,
         }
 
-    async def on_transition(self, event: Mapping[str, Any]) -> None:
+    async def on_transition(self, event: Mapping[str, Any]) -> bool:
         agent_id = event.get("agent_id")
         status_state = event.get("status_state")
         if not isinstance(agent_id, str) or not isinstance(status_state, str):
-            return
+            return True
         ticket = base_ticket(agent_id).upper()
         lock = self._locks.setdefault(ticket, asyncio.Lock())
         async with lock:
-            await self._handle_transition(ticket, agent_id, status_state, event)
+            return await self._handle_transition(ticket, agent_id, status_state, event)
 
     async def _handle_transition(
         self,
@@ -577,24 +674,32 @@ class AutopilotController:
         agent_id: str,
         status_state: str,
         event: Mapping[str, Any],
-    ) -> None:
+    ) -> bool:
         with self.store.lock(ticket):
             state = self.store.load(ticket)
             if not state.enabled or state.halted:
-                return
+                return True
             key = f"{agent_id}:{event.get('run_id')}:{status_state}:{event.get('status_mtime')}"
             if state.last_event_key == key:
-                return
-            state.last_event_key = key
+                return True
             try:
                 if status_state == "merge-ready" and re.search(
                     r"-REVIEW[1-9][0-9]*$", agent_id.upper()
                 ):
-                    await self._reviewer_ready(ticket, agent_id, event, state)
+                    success = await self._reviewer_ready(ticket, agent_id, event, state)
                 elif status_state == "merge-ready":
-                    await self._implementer_ready(ticket, event, state)
-            finally:
+                    success = await self._implementer_ready(ticket, event, state)
+                else:
+                    success = True
+            except Exception as exc:
+                self._log(state, "autopilot-action-failed", {"error": str(exc)})
+                success = False
+            if success:
+                state.last_event_key = key
                 self.store.save(ticket, state)
+            else:
+                self.store.save(ticket, state)
+            return success
 
     async def _reviewer_ready(
         self,
@@ -602,8 +707,10 @@ class AutopilotController:
         reviewer: str,
         event: Mapping[str, Any],
         state: AutopilotState,
-    ) -> None:
+    ) -> bool:
         graph = self.graph_loader(ticket)
+        if graph is None:
+            return False
         current_reviewer = self._current_reviewer(graph)
         if current_reviewer != reviewer:
             self._log(
@@ -611,16 +718,10 @@ class AutopilotController:
                 "reviewer-verdict-ignored-stale-reviewer",
                 {"reviewer": reviewer, "current_reviewer": current_reviewer},
             )
-            return
-        verdict = self._latest_verdict(graph, reviewer=reviewer) if graph else None
+            return True
+        verdict = self._latest_verdict(graph, reviewer=reviewer)
         if verdict is None:
-            verdict = self._read_verdict_file(reviewer)
-        if verdict is None:
-            verdict = parse_verdict(
-                str(event.get("step") or ""), fallback=_anthropic_fallback
-            )
-        if verdict is None:
-            return
+            return False
         status = self.status_reader(ticket)
         sha = self._current_sha(ticket, status, event)
         if not _sha_matches(verdict.source_sha, sha):
@@ -629,11 +730,11 @@ class AutopilotController:
                 "reviewer-verdict-blocked-sha-mismatch",
                 {"reviewer": reviewer, "verdict_sha": verdict.source_sha, "head_sha": sha},
             )
-            return
+            return True
         self._log(state, "parsed-verdict", {"reviewer": reviewer, **verdict.to_dict()})
         if not verdict.clean:
             message = build_steer_message(verdict, target_worker=ticket)
-            await self._invoke(self.steer, ticket, message)
+            await self._send_steer(ticket, reviewer, verdict, message)
             self._log(
                 state,
                 "steer-sent",
@@ -652,13 +753,15 @@ class AutopilotController:
                 self._halt(ticket, state, "plateau")
             elif loop and loop.round >= loop.cap:
                 self._halt(ticket, state, "iteration-cap")
-            return
-        await self._maybe_merge(ticket, state, verdict)
+            return True
+        return await self._maybe_merge(ticket, state, verdict)
 
     async def _implementer_ready(
         self, ticket: str, event: Mapping[str, Any], state: AutopilotState
-    ) -> None:
+    ) -> bool:
         graph = self.graph_loader(ticket)
+        if graph is None:
+            return False
         loop = derive_loop_state(dict(graph)) if graph else None
         current_reviewer = self._current_reviewer(graph)
         verdict = (
@@ -677,17 +780,16 @@ class AutopilotController:
             verdict = None
         if loop and loop.round >= loop.cap and (verdict is None or not verdict.clean):
             self._halt(ticket, state, "iteration-cap")
-            return
+            return True
         if (
             loop
             and loop.plateau_length >= state.plateau_guard
             and (verdict is None or not verdict.clean)
         ):
             self._halt(ticket, state, "plateau")
-            return
+            return True
         if verdict and verdict.clean:
-            await self._maybe_merge(ticket, state, verdict)
-            return
+            return await self._maybe_merge(ticket, state, verdict)
         pr = status.get("pr") if isinstance(status, Mapping) else None
         number = _pr_number(pr if isinstance(pr, str) else None)
         orch = self._orchestrator(ticket, graph)
@@ -695,7 +797,7 @@ class AutopilotController:
             self._log(
                 state, "halted-missing-context", {"pr": pr, "sha": sha, "orch": orch}
             )
-            return
+            return False
         result = await self._invoke(
             self.next_review,
             ticket=ticket,
@@ -712,29 +814,42 @@ class AutopilotController:
                 "pr": pr,
             },
         )
+        return isinstance(result, Mapping) and result.get("status") == "spawned"
 
     async def _maybe_merge(
         self, ticket: str, state: AutopilotState, verdict: Verdict
-    ) -> None:
+    ) -> bool:
         status = self.status_reader(ticket)
         pr = status.get("pr") if isinstance(status, Mapping) else None
-        number = _pr_number(pr if isinstance(pr, str) else None)
+        pr_url = pr if isinstance(pr, str) else None
         sha = self._current_sha(ticket, status, {})
-        if number is None or not isinstance(sha, str):
-            return
+        if pr_url is None or not isinstance(sha, str):
+            return False
         if not _sha_matches(verdict.source_sha, sha):
             self._log(
                 state,
                 "merge-blocked-verdict-sha",
                 {"verdict_sha": verdict.source_sha, "head_sha": sha},
             )
-            return
+            return True
         if state.henry_ack_required_for_merge and (
             state.merge_ack_at_ns is None or state.merge_ack_sha != sha
         ):
             self._log(state, "merge-awaiting-henry-ack", {"sha": sha})
-            return
-        gate = await self._invoke(self.gate, number, sha)
+            return True
+        gate = await self._invoke(self.gate, pr_url, sha)
+        gate_pr = (
+            gate.get("pr") or gate.get("url")
+            if isinstance(gate, Mapping)
+            else None
+        )
+        if gate_pr != pr_url:
+            self._log(
+                state,
+                "merge-blocked-gate-pr-mismatch",
+                {"expected_pr": pr_url, "gate_pr": gate_pr},
+            )
+            return True
         clean = (
             gate.get("verdict") == "pass" or gate.get("ready") is True
             if isinstance(gate, Mapping)
@@ -746,17 +861,34 @@ class AutopilotController:
                 "merge-blocked-gate",
                 {"gate": dict(gate) if isinstance(gate, Mapping) else gate},
             )
-            return
-        await self._invoke(self.merge, ticket, sha)
+            return False
+        await self._invoke(self.merge, pr_url, sha)
         self._log(
             state,
             "merged",
-            {"pr": pr, "source_sha": verdict.source_sha, "head_sha": sha},
+            {"pr": pr_url, "source_sha": verdict.source_sha, "head_sha": sha},
         )
+        return True
 
     @staticmethod
     async def _invoke(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         return await asyncio.to_thread(function, *args, **kwargs)
+
+    async def _send_steer(
+        self, ticket: str, source_worker: str, verdict: Verdict, message: str
+    ) -> Any:
+        if not self._structured_steer:
+            return await self._invoke(self.steer, ticket, message)
+        created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        findings = [
+            finding.to_steer_dict(
+                source_worker=source_worker,
+                source_sha=verdict.source_sha,
+                created_at=created_at,
+            )
+            for finding in verdict.findings
+        ]
+        return await self._invoke(self.steer, ticket, message, findings)
 
     def _current_reviewer(self, graph: Mapping[str, Any] | None) -> str | None:
         if not graph:
@@ -918,10 +1050,13 @@ class AutopilotController:
         return graph
 
     @staticmethod
-    def _default_gate(number: int, sha: str) -> Mapping[str, Any]:
+    def _default_gate(pr_url: str, sha: str) -> Mapping[str, Any]:
         from .. import main
 
-        return main.composer_gate(main.ComposerGateIn(pr=str(number), expect_sha=sha))
+        return {
+            "pr": pr_url,
+            **main.composer_gate(main.ComposerGateIn(pr=pr_url, expect_sha=sha)),
+        }
 
     @staticmethod
     def _default_next_review(**kwargs: Any) -> Mapping[str, Any]:
@@ -930,12 +1065,19 @@ class AutopilotController:
         return next_review(**kwargs)
 
     @staticmethod
-    def _default_steer(ticket: str, message: str) -> Any:
+    def _default_steer(
+        ticket: str, message: str, findings: list[dict[str, Any]] | None = None
+    ) -> Any:
         from .. import main
 
         return main.agent_message(
             ticket,
-            main.MessageIn(text=message, mode="now", source="autopilot"),
+            main.MessageIn(
+                text=message,
+                mode="now",
+                source="autopilot",
+                findings=findings,
+            ),
             main.BackgroundTasks(),
         )
 
@@ -946,10 +1088,10 @@ class AutopilotController:
         return main.archive_agent(reviewer, main.AgentArchiveIn(outcome="closed"))
 
     @staticmethod
-    def _default_merge(ticket: str, sha: str) -> Any:
+    def _default_merge(pr_url: str, sha: str) -> Any:
         from .. import github_pr
 
-        return github_pr.merge_pr(ticket, sha)
+        return github_pr.merge_pr(pr_url, sha)
 
     @staticmethod
     def _default_notify(orch: str, message: str) -> Any:

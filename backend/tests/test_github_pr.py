@@ -7,14 +7,9 @@ from backend.app import github_pr
 
 def test_merge_binds_gh_merge_to_reviewed_head_sha() -> None:
     with (
-        mock.patch.object(
-            github_pr,
-            "resolve_pr",
-            return_value=("https://github.com/hwang2409/wiki/pull/140", "hwang2409/wiki"),
-        ),
         mock.patch.object(github_pr, "_run_gh") as run_gh,
     ):
-        github_pr.merge_pr("WIKI-173", "0123456789abcdef")
+        github_pr.merge_pr("https://github.com/hwang2409/wiki/pull/140", "0123456789abcdef")
 
     args = run_gh.call_args.args[0]
     assert args == [

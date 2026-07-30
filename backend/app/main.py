@@ -3452,6 +3452,8 @@ class MessageIn(BaseModel):
         max_length=64,
         pattern=r"^[A-Za-z0-9_.:-]+$",
     )
+    findings: list[dict[str, Any]] | None = None
+    constraint_bundle: str | None = Field(default=None, max_length=4000)
 
 
 class AgentRespondIn(BaseModel):
@@ -4777,6 +4779,8 @@ def agent_message(ticket: str, body: MessageIn, background: BackgroundTasks) -> 
                 source=body.source,
                 request_id=body.request_id,
                 status_dir=AGENT_STATUS_DIR,
+                findings=body.findings,
+                constraint_bundle=body.constraint_bundle,
             )
         return dict(result)
     del background

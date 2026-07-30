@@ -77,9 +77,22 @@ const autopilot: AutopilotState = {
       at_ns: 1_754_000_000_000_000_000,
       source: "autopilot",
       state: "NOT-MERGE-READY",
-      finding_count: 3,
       reviewer: "WIKI-000-REVIEW2",
       source_sha: "0123456",
+      findings: [
+        {
+          id: "F-abc123",
+          severity: "HIGH",
+          title: "autopilot log hides context",
+          file: "frontend/src/loop-state-chrome.tsx",
+          line: 279,
+          observed: "the log hides context",
+          why_wrong: "the operator cannot assess the action",
+          do_instead: "render the action details",
+          source_worker: "WIKI-000-REVIEW2",
+          source_sha: "0123456",
+        },
+      ],
     },
     {
       action: "steer-sent",
@@ -188,6 +201,7 @@ describe("LoopStateChrome", () => {
     fireEvent.click(trigger);
 
     expect(await screen.findByText(/verdict NOT-MERGE-READY/)).toBeTruthy();
+    expect(screen.getByText(/verdict NOT-MERGE-READY · 1 findings/)).toBeTruthy();
     expect(screen.getByText(/steer: 1\. \[HIGH\]/)).toBeTruthy();
     expect(screen.getByText(/WIKI-000-REVIEW2.*sha 0123456/)).toBeTruthy();
     expect(screen.getByText("halted: plateau")).toBeTruthy();

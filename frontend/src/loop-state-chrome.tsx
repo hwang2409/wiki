@@ -60,7 +60,10 @@ function actionText(action: AutopilotState["actions"][number], key: string): str
 
 function ActionRow({ action }: { action: AutopilotState["actions"][number] }) {
   const state = actionText(action, "state");
-  const findingCount = action["finding_count"];
+  const findings = action["findings"];
+  const findingCount = Array.isArray(findings)
+    ? findings.length
+    : action["finding_count"];
   const preview = actionText(action, "preview");
   const halted = actionText(action, "halted");
   const sha =
