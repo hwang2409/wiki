@@ -142,7 +142,8 @@ export function PdfArtifactDetail({
   useEffect(() => {
     if (loadState.status !== "ready" || !canvasRef.current || !textLayerRef.current || !pageBaseSize) return;
     let cancelled = false;
-    let active: { cancel: () => void } | null = null;
+    let canvasRender: { cancel: () => void } | null = null;
+    let textLayerRender: { cancel: () => void } | null = null;
     const canvas = canvasRef.current;
     const textLayer = textLayerRef.current;
     (async () => {
@@ -151,16 +152,19 @@ export function PdfArtifactDetail({
         pdfPage = await loadState.pdf.doc.getPage(page);
         if (cancelled) return;
         const render = renderPageToCanvas(pdfPage, canvas, zoom, window.devicePixelRatio || 1);
-        active = render;
+        canvasRender = render;
         await render.promise;
         if (cancelled) return;
         textLayer.style.width = `${Math.floor(pageBaseSize.width * zoom)}px`;
         textLayer.style.height = `${Math.floor(pageBaseSize.height * zoom)}px`;
+        const layerTask = renderTextLayer(pdfPage, textLayer, zoom);
+        textLayerRender = layerTask;
         try {
-          await renderTextLayer(pdfPage, textLayer, zoom);
+          await layerTask.promise;
         } catch {
           textLayer.replaceChildren();
         }
+        if (cancelled) return;
         if (pendingFocal.current && viewportRef.current) {
           viewportRef.current.scrollLeft = pendingFocal.current.scrollLeft;
           viewportRef.current.scrollTop = pendingFocal.current.scrollTop;
@@ -176,7 +180,11 @@ export function PdfArtifactDetail({
     })();
     return () => {
       cancelled = true;
-      active?.cancel();
+      canvasRender?.cancel();
+      // Cancel the text-layer stream reader too so switching pages while a
+      // hostile-size text layer is streaming stops it immediately instead
+      // of decoding to the char budget in the background.
+      textLayerRender?.cancel();
     };
   }, [loadState, page, zoom, pageBaseSize]);
 

@@ -89,32 +89,147 @@ export function renderPageToCanvas(
   return { promise, cancel: () => task.cancel() };
 }
 
-export async function renderTextLayer(
-  page: PDFPageProxy,
+export type CancellableTextLayerRender = {
+  promise: Promise<void>;
+  cancel: () => void;
+};
+
+// Wrap streamTextContent so the TextLayer only ever sees chunks up to
+// `charLimit`. As soon as the cap is hit, we cancel the source reader
+// AND close our forwarded stream — pdf.js's TextLayer stops laying out
+// text and peak memory stays bounded regardless of the page's payload.
+export function boundedTextStream(
+  source: ReadableStream<{ items?: Array<{ str?: string }> }>,
+  charLimit: number,
+): { stream: ReadableStream<unknown>; cancel: () => Promise<void> } {
+  const reader = source.getReader();
+  let total = 0;
+  let done = false;
+  const cancelSource = async () => {
+    if (done) return;
+    done = true;
+    try {
+      await reader.cancel();
+    } catch {
+      // Reader may already be released/errored — nothing to do.
+    }
+  };
+  const stream = new ReadableStream({
+    async pull(controller) {
+      if (done) {
+        controller.close();
+        return;
+      }
+      try {
+        const { value, done: sourceDone } = await reader.read();
+        if (sourceDone) {
+          done = true;
+          controller.close();
+          return;
+        }
+        const items = (value as { items?: Array<{ str?: string }> })?.items;
+        if (items) {
+          const kept: Array<{ str?: string }> = [];
+          let itemMutated = false;
+          for (const item of items) {
+            const raw = item?.str;
+            if (typeof raw !== "string") {
+              kept.push(item);
+              continue;
+            }
+            const remaining = charLimit - total;
+            if (remaining <= 0) break;
+            if (raw.length > remaining) {
+              kept.push({ ...item, str: raw.slice(0, remaining) });
+              itemMutated = true;
+              total = charLimit;
+              break;
+            }
+            kept.push(item);
+            total += raw.length;
+          }
+          const forwarded = itemMutated || kept.length !== items.length
+            ? { ...(value as object), items: kept }
+            : value;
+          controller.enqueue(forwarded);
+        } else {
+          controller.enqueue(value);
+        }
+        if (total >= charLimit) {
+          await cancelSource();
+          controller.close();
+        }
+      } catch (err) {
+        controller.error(err);
+      }
+    },
+    cancel() {
+      return cancelSource();
+    },
+  });
+  return { stream, cancel: cancelSource };
+}
+
+export function renderTextLayer(
+  page: StreamablePage | PDFPageProxy,
   container: HTMLElement,
   scale: number,
-): Promise<void> {
-  const module = await loadPdfjs();
+  options: { charLimit?: number } = {},
+): CancellableTextLayerRender {
+  const charLimit = options.charLimit ?? PAGE_TEXT_CHAR_LIMIT;
   container.replaceChildren();
-  const viewport = page.getViewport({ scale });
-  const textContent = await page.getTextContent();
-  const TextLayerCtor = (module as unknown as { TextLayer?: new (options: unknown) => { render: () => Promise<void> } }).TextLayer;
-  if (TextLayerCtor) {
-    const layer = new TextLayerCtor({
-      textContentSource: textContent,
+  const viewport = (page as PDFPageProxy).getViewport({ scale });
+  const rawStream = (page as StreamablePage).streamTextContent();
+  const bounded = boundedTextStream(rawStream, charLimit);
+  let cancelled = false;
+  let layerCancel: (() => void) | null = null;
+  const cancel = () => {
+    if (cancelled) return;
+    cancelled = true;
+    try {
+      layerCancel?.();
+    } catch {
+      // TextLayer.cancel is a no-op after render completes.
+    }
+    void bounded.cancel();
+  };
+  const promise = (async () => {
+    const module = await loadPdfjs();
+    if (cancelled) return;
+    const TextLayerCtor = (module as unknown as {
+      TextLayer?: new (options: unknown) => {
+        render: () => Promise<void>;
+        cancel?: () => void;
+      };
+    }).TextLayer;
+    if (TextLayerCtor) {
+      const layer = new TextLayerCtor({
+        textContentSource: bounded.stream,
+        container,
+        viewport,
+      });
+      layerCancel = () => layer.cancel?.();
+      await layer.render();
+      return;
+    }
+    const legacy = (module as unknown as {
+      renderTextLayer?: (options: unknown) => {
+        promise: Promise<void>;
+        cancel?: () => void;
+      };
+    }).renderTextLayer;
+    if (!legacy) throw new Error("PDF.js text layer API unavailable");
+    const task = legacy({
+      textContentSource: bounded.stream,
       container,
       viewport,
     });
-    await layer.render();
-    return;
-  }
-  const legacy = (module as unknown as { renderTextLayer?: (options: unknown) => { promise: Promise<void> } }).renderTextLayer;
-  if (!legacy) throw new Error("PDF.js text layer API unavailable");
-  await legacy({
-    textContentSource: textContent,
-    container,
-    viewport,
-  }).promise;
+    layerCancel = () => task.cancel?.();
+    await task.promise;
+  })().catch((err) => {
+    if (!cancelled) throw err;
+  });
+  return { promise, cancel };
 }
 
 export type PageTextIndex = {

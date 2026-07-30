@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   FIND_MATCH_LIMIT,
+  boundedTextStream,
   extractPageText,
   findMatches,
   type PageTextIndex,
@@ -98,6 +99,65 @@ test("extractPageText stops pulling and cancels once the char budget is hit", as
   // Allow one pre-fetched pull past what we consumed (browser buffering);
   // if this jumps into the tens we've regressed to buffer-everything.
   assert.ok(pulled <= 3, `expected ≤3 pulls before cancel, got ${pulled}`);
+});
+
+test("boundedTextStream cancels the source once the character budget is exhausted", async () => {
+  // Renderer-level bound: the raw stream would emit far more text than the
+  // TextLayer should ever see. boundedTextStream must forward only what
+  // fits in `charLimit` and cancel the upstream reader so pdf.js stops
+  // decoding — this is the guarantee that the render path stays bounded
+  // regardless of hostile-size page text.
+  let pulled = 0;
+  let cancelled = false;
+  const source = new ReadableStream<{ items: Array<{ str: string }> }>({
+    pull(controller) {
+      pulled += 1;
+      if (pulled > 100) {
+        controller.close();
+        return;
+      }
+      controller.enqueue({ items: [{ str: "y".repeat(1000) }] });
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+  const bounded = boundedTextStream(source, 500);
+  const forwarded: Array<{ items?: Array<{ str?: string }> }> = [];
+  const reader = bounded.stream.getReader();
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      forwarded.push(value as { items?: Array<{ str?: string }> });
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const totalChars = forwarded
+    .flatMap((chunk) => chunk.items ?? [])
+    .reduce((sum, item) => sum + (item?.str?.length ?? 0), 0);
+  assert.equal(totalChars, 500, "forwarded exactly the char budget, no more");
+  assert.equal(cancelled, true, "upstream source was cancelled once the budget was hit");
+  assert.ok(pulled <= 3, `expected ≤3 upstream pulls before cancel, got ${pulled}`);
+});
+
+test("boundedTextStream cancel() propagates to the source (unmount path)", async () => {
+  // Simulates the render-effect cleanup calling `.cancel()` on the returned
+  // handle before render completes — the upstream reader must be released
+  // so a mid-flight text-layer stream stops decoding on page-switch.
+  let cancelled = false;
+  const source = new ReadableStream({
+    pull() {
+      // Never resolve — we cancel before the consumer ever pulls.
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+  const bounded = boundedTextStream(source, 500);
+  await bounded.cancel();
+  assert.equal(cancelled, true, "cancel() propagated to the upstream reader");
 });
 
 test("extractPageText concatenates all items when the page fits under the budget", async () => {
