@@ -391,6 +391,13 @@ async function readMarkerNumber(page, terminalId, prefix) {
   return match ? Number(match[1]) : null;
 }
 
+async function readMarkerValue(page, terminalId, prefix) {
+  const text = await terminalBufferText(page, terminalId);
+  const matches = [...text.matchAll(new RegExp(`${prefix}([\\s\\S]*?)__`, "g"))];
+  const match = matches.at(-1);
+  return match ? match[1].replace(/\s+/g, "") : null;
+}
+
 async function wsRejectsWithoutToken(page, terminalId) {
   return page.evaluate(
     (id) =>
@@ -426,6 +433,7 @@ const result = {
   darkScreenshot,
   echoInputWorked: false,
   fixturePaths: {
+    accountHome: path.join(fixtures.root, "account-home"),
     codexSessionsDir: fixtures.sessionsDir,
     queue: fixtures.queuePath,
     registry: fixtures.registryPath,
@@ -446,6 +454,7 @@ const result = {
   searchWorked: false,
   shellPid: null,
   shellPidGoneAfterClose: null,
+  shellHome: null,
   terminalId: null,
   themeAfter: null,
   themeBefore: null,
@@ -551,6 +560,27 @@ try {
   }
   if (echoLines.some((line) => line.includes("echo hihi") || /\bhihi\b/.test(line))) {
     throw new Error(`Echo output glued typed input into output: ${JSON.stringify(echoLines.slice(-6))}`);
+  }
+
+  const shellHomeOutput = await runCommand(
+    page,
+    terminalId,
+    "printf '__HOME__%s__\\n' \"$HOME\"",
+    "__HOME__"
+  );
+  result.shellHome = await readMarkerValue(page, terminalId, "__HOME__");
+  const accountHome = path.resolve(fixtures.root, "account-home");
+  const [accountHomeReal, shellHomeReal] = await Promise.all([
+    fs.realpath(accountHome),
+    result.shellHome ? fs.realpath(result.shellHome) : Promise.resolve(null),
+  ]);
+  if (shellHomeReal !== accountHomeReal) {
+    throw new Error(
+      `Shell HOME escaped the fixture: expected ${accountHomeReal}, saw ${JSON.stringify({
+        output: shellHomeOutput,
+        shellHome: result.shellHome,
+      })}`
+    );
   }
 
   const lsOutput = await runCommand(page, terminalId, "ls -1", "frontend");
