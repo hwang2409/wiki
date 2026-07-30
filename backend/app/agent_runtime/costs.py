@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import stat
@@ -11,42 +12,48 @@ import threading
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+from ..pathwalk import open_relative_directory, open_relative_file
 from .ticket import base_ticket
 
 
-# USD per one million tokens. Cache rates use the standard provider tiers:
-# OpenAI cache reads are 10% of input and writes are 125% of input. Anthropic
-# cache reads are 10% of input and 5-minute writes are 125% of input.
-# Sources: developers.openai.com/api/docs/models/compare and
+# USD per one million tokens. Sources:
+# developers.openai.com/api/docs/models/gpt-5.5,
+# developers.openai.com/api/docs/models/compare,
 # docs.anthropic.com/en/docs/about-claude/pricing.
 PRICING_USD_PER_MILLION: dict[str, dict[str, float]] = {
-    "gpt-5.6-sol": {"input": 5.0, "cache_read": 0.5, "cache_write": 6.25, "output": 30.0},
-    "gpt-5.6-terra": {"input": 2.5, "cache_read": 0.25, "cache_write": 3.125, "output": 15.0},
-    "gpt-5.6-luna": {"input": 1.0, "cache_read": 0.1, "cache_write": 1.25, "output": 6.0},
-    "gpt-5.5": {"input": 2.0, "cache_read": 0.2, "cache_write": 2.5, "output": 8.0},
-    "gpt-5.4": {"input": 2.5, "cache_read": 0.25, "cache_write": 3.125, "output": 15.0},
-    "gpt-5.4-mini": {"input": 0.75, "cache_read": 0.075, "cache_write": 0.9375, "output": 4.5},
-    "gpt-5.3-codex-spark": {"input": 1.5, "cache_read": 0.15, "cache_write": 1.875, "output": 6.0},
-    "claude-fable-5": {"input": 10.0, "cache_read": 1.0, "cache_write": 12.5, "output": 50.0},
-    "opus-4.7": {"input": 5.0, "cache_read": 0.5, "cache_write": 6.25, "output": 25.0},
-    "opus": {"input": 5.0, "cache_read": 0.5, "cache_write": 6.25, "output": 25.0},
-    "sonnet": {"input": 3.0, "cache_read": 0.3, "cache_write": 3.75, "output": 15.0},
-    "sonnet-4.6": {"input": 3.0, "cache_read": 0.3, "cache_write": 3.75, "output": 15.0},
-    "haiku": {"input": 0.8, "cache_read": 0.08, "cache_write": 1.0, "output": 4.0},
-    "haiku-4.5": {"input": 0.8, "cache_read": 0.08, "cache_write": 1.0, "output": 4.0},
+    "gpt-5.6-sol": {"input": 5.0, "cache_read": 0.5, "cache_write_5m": 6.25, "cache_write_1h": 6.25, "output": 30.0},
+    "gpt-5.6-terra": {"input": 2.5, "cache_read": 0.25, "cache_write_5m": 3.125, "cache_write_1h": 3.125, "output": 15.0},
+    "gpt-5.6-luna": {"input": 1.0, "cache_read": 0.1, "cache_write_5m": 1.25, "cache_write_1h": 1.25, "output": 6.0},
+    "gpt-5.5": {"input": 5.0, "cache_read": 0.5, "cache_write_5m": 6.25, "cache_write_1h": 6.25, "output": 30.0},
+    "gpt-5.4": {"input": 2.5, "cache_read": 0.25, "cache_write_5m": 3.125, "cache_write_1h": 3.125, "output": 15.0},
+    "gpt-5.4-mini": {"input": 0.75, "cache_read": 0.075, "cache_write_5m": 0.9375, "cache_write_1h": 0.9375, "output": 4.5},
+    "claude-fable-5": {"input": 10.0, "cache_read": 1.0, "cache_write_5m": 12.5, "cache_write_1h": 20.0, "output": 50.0},
+    "claude-opus-4-7": {"input": 5.0, "cache_read": 0.5, "cache_write_5m": 6.25, "cache_write_1h": 10.0, "output": 25.0},
+    "claude-sonnet-4-6": {"input": 3.0, "cache_read": 0.3, "cache_write_5m": 3.75, "cache_write_1h": 6.0, "output": 15.0},
+    "claude-haiku-4-5": {"input": 1.0, "cache_read": 0.1, "cache_write_5m": 1.25, "cache_write_1h": 2.0, "output": 5.0},
 }
 
-STATE_VERSION = 2
+MODEL_ID_ALIASES = {
+    "opus-4.7": "claude-opus-4-7",
+    "opus": "claude-opus-4-7",
+    "sonnet": "claude-sonnet-4-6",
+    "sonnet-4.6": "claude-sonnet-4-6",
+    "haiku": "claude-haiku-4-5",
+    "haiku-4.5": "claude-haiku-4-5",
+}
+
+STATE_VERSION = 3
 CHUNK_BYTES = 64 * 1024
 MAX_EVENT_LINE_BYTES = 4 * 1024 * 1024
 MAX_MESSAGE_DEDUPE_IDS = 4096
+CURSOR_TAIL_BYTES = 256
 REFRESH_INTERVAL_SECONDS = float(os.environ.get("WIKI_COST_REFRESH_INTERVAL_SECONDS", "5"))
 _REFRESH_LOCK = threading.Lock()
 
 
-USAGE_FIELDS = ("input", "cache_read", "cache_write", "output")
+ACCOUNTING_FIELDS = ("input", "cache_read", "cache_write_5m", "cache_write_1h", "output")
 
 
 def runtime_runs_dir() -> Path:
@@ -145,20 +152,39 @@ def _usage_values(value: object, *, input_includes_cache: bool) -> dict[str, int
         "cache_read_input_tokens",
         "cached_input_tokens",
     )
-    cache_write = _pick(
+    cache_write_legacy = _pick(
         value,
         "cacheWriteInputTokens",
         "cache_write_input_tokens",
         "cache_creation_input_tokens",
         "cacheCreationInputTokens",
     )
+    creation = value.get("cache_creation")
+    cache_write_5m = _pick(
+        value,
+        "cacheWrite5mInputTokens",
+        "cache_write_5m_input_tokens",
+        "cache_creation_5m_input_tokens",
+    )
+    cache_write_1h = _pick(
+        value,
+        "cacheWrite1hInputTokens",
+        "cache_write_1h_input_tokens",
+        "cache_creation_1h_input_tokens",
+    )
+    if isinstance(creation, dict):
+        cache_write_5m = cache_write_5m or _pick(creation, "ephemeral_5m_input_tokens", "5m_input_tokens")
+        cache_write_1h = cache_write_1h or _pick(creation, "ephemeral_1h_input_tokens", "1h_input_tokens")
+    if not cache_write_5m and not cache_write_1h:
+        cache_write_5m = cache_write_legacy
     input_tokens = _pick(value, "inputTokens", "input_tokens")
     if input_includes_cache:
-        input_tokens = max(0, input_tokens - cache_read - cache_write)
+        input_tokens = max(0, input_tokens - cache_read - cache_write_5m - cache_write_1h)
     result = {
         "input": input_tokens,
         "cache_read": cache_read,
-        "cache_write": cache_write,
+        "cache_write_5m": cache_write_5m,
+        "cache_write_1h": cache_write_1h,
         "output": _pick(value, "outputTokens", "output_tokens"),
     }
     return result if any(result.values()) else None
@@ -177,9 +203,9 @@ def _codex_usage(payload: dict[str, Any], run_state: dict[str, Any]) -> dict[str
     run_state["cumulative"] = current
     if not isinstance(previous, dict):
         return current
-    if any(current[key] < _number(previous.get(key)) for key in USAGE_FIELDS):
-        return {key: 0 for key in USAGE_FIELDS}
-    return {key: current[key] - _number(previous.get(key)) for key in USAGE_FIELDS}
+    if any(current[key] < _number(previous.get(key)) for key in ACCOUNTING_FIELDS):
+        return {key: 0 for key in ACCOUNTING_FIELDS}
+    return {key: current[key] - _number(previous.get(key)) for key in ACCOUNTING_FIELDS}
 
 
 def _claude_usage(payload: dict[str, Any], run_state: dict[str, Any]) -> dict[str, int] | None:
@@ -202,52 +228,41 @@ def _claude_usage(payload: dict[str, Any], run_state: dict[str, Any]) -> dict[st
     return _usage_values(message.get("usage"), input_includes_cache=False)
 
 
-def _root_path() -> Path:
-    return runtime_runs_dir().absolute().resolve(strict=False)
-
-
-def _inside_root(path: Path, root: Path) -> bool:
+def _open_root() -> int | None:
+    root = runtime_runs_dir().absolute().resolve(strict=False)
     try:
-        path.resolve(strict=False).relative_to(root)
-    except ValueError:
-        return False
-    return True
-
-
-def _safe_open(path: Path, root: Path, mode: int = os.O_RDONLY) -> int | None:
-    if not _inside_root(path, root):
-        return None
-    try:
-        return os.open(path, mode | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            os.close(fd)
+            return None
+        return fd
     except OSError:
         return None
 
 
-def _read_json(path: Path, root: Path) -> dict[str, Any]:
-    fd = _safe_open(path, root)
-    if fd is None:
-        return {}
+def _read_json_fd(fd: int) -> dict[str, Any]:
     try:
-        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+        with os.fdopen(os.dup(fd), "r", encoding="utf-8") as handle:
             value = json.load(handle)
     except (OSError, ValueError, UnicodeError):
         return {}
     return value if isinstance(value, dict) else {}
 
 
-def _iter_new_json_lines(path: Path, root: Path, offset: int) -> tuple[Iterator[tuple[int, dict[str, Any]]], list[int]]:
+def _iter_new_json_lines(
+    fd: int, offset: int, on_chunk: Callable[[], None] | None = None
+) -> tuple[Iterator[tuple[int, dict[str, Any]]], list[int]]:
     progress = [offset]
 
     def read() -> Iterator[tuple[int, dict[str, Any]]]:
-        fd = _safe_open(path, root)
-        if fd is None:
-            return
         try:
-            with os.fdopen(fd, "rb") as handle:
+            with os.fdopen(os.dup(fd), "rb") as handle:
                 handle.seek(offset)
                 carry = b""
                 base = offset
                 while chunk := handle.read(CHUNK_BYTES):
+                    if on_chunk is not None:
+                        on_chunk()
                     data = carry + chunk
                     start = 0
                     while True:
@@ -279,6 +294,18 @@ def _iter_new_json_lines(path: Path, root: Path, offset: int) -> tuple[Iterator[
     return read(), progress
 
 
+def _cursor_tail_fingerprint(fd: int, offset: int) -> str:
+    if offset <= 0:
+        return hashlib.sha256(b"").hexdigest()
+    try:
+        with os.fdopen(os.dup(fd), "rb") as handle:
+            start = max(0, offset - CURSOR_TAIL_BYTES)
+            handle.seek(start)
+            return hashlib.sha256(handle.read(offset - start)).hexdigest()
+    except OSError:
+        return ""
+
+
 def _record_key(day: str, metadata: dict[str, Any], model: str) -> str:
     worker = str(metadata.get("agent_id") or "unknown")
     ticket = base_ticket(worker)
@@ -295,7 +322,7 @@ def _new_record(key: str, metadata: dict[str, Any], model: str, day: str) -> dic
         "ticket": base_ticket(worker),
         "orchestrator": str(metadata.get("orchestrator_id") or ""),
         "model": model,
-        **{field: 0 for field in USAGE_FIELDS},
+        **{field: 0 for field in ACCOUNTING_FIELDS},
     }
 
 
@@ -310,8 +337,8 @@ def _add_contribution(
 ) -> None:
     records = state["records"]
     record = records.setdefault(key, _new_record(key, metadata, model, day))
-    local = run_state.setdefault("records", {}).setdefault(key, {field: 0 for field in USAGE_FIELDS})
-    for field in USAGE_FIELDS:
+    local = run_state.setdefault("records", {}).setdefault(key, {field: 0 for field in ACCOUNTING_FIELDS})
+    for field in ACCOUNTING_FIELDS:
         amount = int(usage[field])
         record[field] += amount
         local[field] += amount
@@ -322,38 +349,85 @@ def _remove_run_contributions(state: dict[str, Any], run_state: dict[str, Any]) 
         record = state["records"].get(key)
         if not isinstance(record, dict):
             continue
-        for field in USAGE_FIELDS:
+        for field in ACCOUNTING_FIELDS:
             record[field] -= _number(local.get(field))
-        if not any(record[field] for field in USAGE_FIELDS):
+        if not any(record[field] for field in ACCOUNTING_FIELDS):
             state["records"].pop(key, None)
 
 
-def _scan_run(state: dict[str, Any], run_dir: Path, root: Path) -> None:
-    run_id = run_dir.name
-    raw_path = run_dir / "raw.jsonl"
+def _discard_run(state: dict[str, Any], run_id: str) -> None:
+    old_run = state["runs"].pop(run_id, None)
+    if isinstance(old_run, dict):
+        _remove_run_contributions(state, old_run)
+
+
+def _scan_run(state: dict[str, Any], run_id: str, root_fd: int) -> None:
+    raw_fd: int | None = None
     try:
-        raw_stat = raw_path.stat(follow_symlinks=False)
+        run_fd = open_relative_directory(root_fd, (run_id,))
     except OSError:
-        old_run = state["runs"].pop(run_id, None)
-        if isinstance(old_run, dict):
-            _remove_run_contributions(state, old_run)
+        _discard_run(state, run_id)
         return
-    if not stat.S_ISREG(raw_stat.st_mode) or not _inside_root(raw_path, root):
-        old_run = state["runs"].pop(run_id, None)
-        if isinstance(old_run, dict):
-            _remove_run_contributions(state, old_run)
+    try:
+        if not stat.S_ISDIR(os.fstat(run_fd).st_mode):
+            _discard_run(state, run_id)
+            return
+        try:
+            raw_fd = open_relative_file(run_fd, ("raw.jsonl",), extra_final_flags=getattr(os, "O_NONBLOCK", 0))
+        except OSError:
+            _discard_run(state, run_id)
+            return
+        raw_stat = os.fstat(raw_fd)
+        if not stat.S_ISREG(raw_stat.st_mode):
+            os.close(raw_fd)
+            raw_fd = None
+            _discard_run(state, run_id)
+            return
+        try:
+            metadata_fd = open_relative_file(run_fd, ("run.json",), extra_final_flags=getattr(os, "O_NONBLOCK", 0))
+        except FileNotFoundError:
+            metadata = {}
+        except OSError:
+            os.close(raw_fd)
+            raw_fd = None
+            _discard_run(state, run_id)
+            return
+        else:
+            try:
+                if not stat.S_ISREG(os.fstat(metadata_fd).st_mode):
+                    os.close(raw_fd)
+                    raw_fd = None
+                    _discard_run(state, run_id)
+                    return
+                metadata = _read_json_fd(metadata_fd)
+            finally:
+                os.close(metadata_fd)
+    except OSError:
+        if raw_fd is not None:
+            os.close(raw_fd)
+        _discard_run(state, run_id)
         return
-    metadata = _read_json(run_dir / "run.json", root)
+    finally:
+        os.close(run_fd)
+
     metadata.setdefault("agent_id", run_id)
     run_state = state["runs"].get(run_id)
     if not isinstance(run_state, dict):
         run_state = {"offset": 0, "cumulative": None, "seen_message_ids": {}, "records": {}}
         state["runs"][run_id] = run_state
-    if raw_stat.st_size < _number(run_state.get("offset")) or raw_stat.st_ino != _number(run_state.get("inode")):
+    offset = _number(run_state.get("offset"))
+    tail_fingerprint = _cursor_tail_fingerprint(raw_fd, offset)
+    if (
+        raw_stat.st_size < offset
+        or raw_stat.st_ino != _number(run_state.get("inode"))
+        or (offset and run_state.get("cursor_tail_fingerprint") != tail_fingerprint)
+    ):
         _remove_run_contributions(state, run_state)
         run_state = {"offset": 0, "cumulative": None, "seen_message_ids": {}, "records": {}}
         state["runs"][run_id] = run_state
-    iterator, progress = _iter_new_json_lines(raw_path, root, _number(run_state.get("offset")))
+        offset = 0
+    read_chunks = [0]
+    iterator, progress = _iter_new_json_lines(raw_fd, offset, lambda: read_chunks.__setitem__(0, read_chunks[0] + 1))
     provider = str(metadata.get("provider") or "")
     model = str(metadata.get("model") or "unknown")
     for _line_start, envelope in iterator:
@@ -373,11 +447,14 @@ def _scan_run(state: dict[str, Any], run_dir: Path, root: Path) -> None:
         day = _event_day(timestamp)
         if day is not None and any(usage.values()):
             _add_contribution(state, run_state, _record_key(day, metadata, model), metadata, model, day, usage)
+    final_stat = os.fstat(raw_fd)
     run_state.update(
         {
             "offset": progress[0],
-            "size": raw_stat.st_size,
-            "inode": raw_stat.st_ino,
+            "size": final_stat.st_size,
+            "inode": final_stat.st_ino,
+            "cursor_tail_fingerprint": _cursor_tail_fingerprint(raw_fd, progress[0]),
+            "read_chunks": read_chunks[0],
             "prompt_chars": len(str(metadata.get("initial_prompt") or "")),
             "prompt_tokens_estimate": max(0, len(str(metadata.get("initial_prompt") or "")) // 4),
             "model": model,
@@ -387,25 +464,23 @@ def _scan_run(state: dict[str, Any], run_dir: Path, root: Path) -> None:
             "created_at": metadata.get("created_at"),
         }
     )
+    os.close(raw_fd)
 
 
 def refresh(state: dict[str, Any] | None = None) -> dict[str, Any]:
     if state is None:
         state = _load_state()
-    root = _root_path()
+    root_fd = _open_root()
     seen_runs: set[str] = set()
-    try:
-        entries = list(os.scandir(root))
-    except OSError:
-        entries = []
-    for entry in entries:
-        if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
-            continue
-        run_dir = Path(entry.path)
-        if not _inside_root(run_dir, root):
-            continue
-        seen_runs.add(entry.name)
-        _scan_run(state, run_dir, root)
+    if root_fd is not None:
+        try:
+            with os.scandir(os.dup(root_fd)) as entries:
+                run_ids = [entry.name for entry in entries if not entry.is_symlink() and entry.is_dir(follow_symlinks=False)]
+            for run_id in run_ids:
+                seen_runs.add(run_id)
+                _scan_run(state, run_id, root_fd)
+        finally:
+            os.close(root_fd)
     for run_id in list(state["runs"]):
         if run_id not in seen_runs:
             _remove_run_contributions(state, state["runs"][run_id])
@@ -439,11 +514,11 @@ def _state_stale(state: dict[str, Any]) -> bool:
 
 
 def _money_and_pricing(model: str, usage: dict[str, Any]) -> tuple[float | None, str, int]:
-    rates = PRICING_USD_PER_MILLION.get(model)
-    tokens = sum(_number(usage.get(field)) for field in USAGE_FIELDS)
+    rates = PRICING_USD_PER_MILLION.get(MODEL_ID_ALIASES.get(model, model))
+    tokens = sum(_number(usage.get(field)) for field in ACCOUNTING_FIELDS)
     if rates is None:
         return None, "unpriced", tokens
-    cost = sum(_number(usage.get(field)) * rates[field] / 1_000_000 for field in USAGE_FIELDS)
+    cost = sum(_number(usage.get(field)) * rates[field] / 1_000_000 for field in ACCOUNTING_FIELDS)
     return cost, "priced", 0
 
 
@@ -453,9 +528,9 @@ def _rollup(items: list[dict[str, Any]], label_key: str, label: str | None = Non
         name = label if label is not None else str(item.get(label_key) or "(none)")
         row = grouped.setdefault(
             name,
-            {"label": name, **{field: 0 for field in USAGE_FIELDS}, "cost_usd": 0.0, "unpriced_tokens": 0, "models": set(), "pricing_flags": set()},
+            {"label": name, **{field: 0 for field in ACCOUNTING_FIELDS}, "cost_usd": 0.0, "unpriced_tokens": 0, "models": set(), "pricing_flags": set()},
         )
-        for field in USAGE_FIELDS:
+        for field in ACCOUNTING_FIELDS:
             row[field] += _number(item.get(field))
         row["models"].add(item.get("model") or "unknown")
         cost, pricing, unpriced = _money_and_pricing(str(item.get("model") or "unknown"), item)
@@ -469,8 +544,9 @@ def _rollup(items: list[dict[str, Any]], label_key: str, label: str | None = Non
         has_unpriced = row["unpriced_tokens"] > 0
         row["pricing"] = "mixed" if has_priced and has_unpriced else "unpriced" if has_unpriced else "priced"
         row["cost_usd"] = round(row["cost_usd"], 8) if has_priced else None
+        row["cache_write"] = row.pop("cache_write_5m") + row.pop("cache_write_1h")
         row["cached"] = row["cache_read"] + row["cache_write"]
-        row["total_tokens"] = sum(row[field] for field in USAGE_FIELDS)
+        row["total_tokens"] = row["input"] + row["cached"] + row["output"]
         row["models"] = sorted(row["models"])
         row.pop("pricing_flags")
         output.append(row)
@@ -513,7 +589,7 @@ def _query_state(state: dict[str, Any], from_ts: str | None = None, to_ts: str |
         and _range_matches_day(str(record.get("day") or ""), from_dt, to_dt)
     ]
     totals = _rollup(records, "ticket", "all")
-    all_total = totals[0] if totals else {"label": "all", **{field: 0 for field in USAGE_FIELDS}, "cached": 0, "total_tokens": 0, "cost_usd": 0.0, "unpriced_tokens": 0, "pricing": "priced", "models": []}
+    all_total = totals[0] if totals else {"label": "all", "input": 0, "cache_read": 0, "cache_write": 0, "cached": 0, "output": 0, "total_tokens": 0, "cost_usd": 0.0, "unpriced_tokens": 0, "pricing": "priced", "models": []}
     runs = _matching_runs(state, records, ticket)
     if from_dt or to_dt:
         selected_days = [_parse_timestamp(f"{record['day']}T00:00:00Z") for record in records]

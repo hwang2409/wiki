@@ -323,7 +323,7 @@ function CostDashboard({ costs }: { costs: CostResponse }) {
             <div className="cost-prompt-bar" key={item.bucket}>
               <div
                 className="cost-prompt-bar-fill"
-                style={{ height: `${Math.min(40, Math.max(4, Math.round((item.runs / maxPromptRuns) * 40)))}px` }}
+                style={{ height: `${item.runs > 0 ? Math.min(40, Math.max(4, Math.round((item.runs / maxPromptRuns) * 40))) : 0}px` }}
               />
               <span>{item.bucket}</span>
               <strong>{item.runs}</strong>

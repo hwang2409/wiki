@@ -290,6 +290,9 @@ export function getCosts(
 
 export function getTicketCosts(ticket: string) {
   const now = Date.now();
+  for (const [key, value] of ticketCostCache) {
+    if (value.expiresAt <= now) ticketCostCache.delete(key);
+  }
   const cached = ticketCostCache.get(ticket);
   if (cached && cached.expiresAt > now) return Promise.resolve(cached.value);
   const existing = ticketCostInflight.get(ticket);
@@ -297,6 +300,11 @@ export function getTicketCosts(ticket: string) {
   // The shared request must not use one pane's abort signal. A pane can unmount
   // while another pane still needs the same in-flight request.
   const requestPromise = getCosts({ ticket }).then((value) => {
+    while (ticketCostCache.size >= MAX_TICKET_COST_CACHE_ENTRIES) {
+      const oldest = ticketCostCache.keys().next().value;
+      if (oldest === undefined) break;
+      ticketCostCache.delete(oldest);
+    }
     ticketCostCache.set(ticket, { value, expiresAt: Date.now() + 15_000 });
     ticketCostInflight.delete(ticket);
     return value;
@@ -310,6 +318,7 @@ export function getTicketCosts(ticket: string) {
 
 const ticketCostCache = new Map<string, { value: CostResponse; expiresAt: number }>();
 const ticketCostInflight = new Map<string, Promise<CostResponse>>();
+const MAX_TICKET_COST_CACHE_ENTRIES = 128;
 
 export type SpawnWorkerKind = "cdx" | "cc";
 export type SpawnWorkerRole = "plan" | "implement" | "review";

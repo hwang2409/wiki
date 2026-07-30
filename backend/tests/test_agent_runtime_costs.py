@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -118,26 +119,31 @@ class CostAggregatorTests(unittest.TestCase):
     def test_redacted_provider_fixtures_use_real_event_shapes(self) -> None:
         codex_raw = self._run("fixture-codex", model="gpt-5.6-sol", provider="codex")
         shutil.copyfile(FIXTURE_ROOT / "costs-codex.jsonl", codex_raw)
-        claude_raw = self._run("fixture-claude", model="opus-4.7", provider="claude")
+        claude_raw = self._run("fixture-claude", model="claude-opus-4-7", provider="claude")
         shutil.copyfile(FIXTURE_ROOT / "costs-claude.jsonl", claude_raw)
 
         result = costs.refresh()
         codex_rows = [record for record in result["records"].values() if record["model"] == "gpt-5.6-sol"]
-        claude_rows = [record for record in result["records"].values() if record["model"] == "opus-4.7"]
+        claude_rows = [record for record in result["records"].values() if record["model"] == "claude-opus-4-7"]
         self.assertEqual(sum(record["input"] for record in codex_rows), 1550)
-        self.assertEqual(sum(record["cache_write"] for record in codex_rows), 50)
+        self.assertEqual(sum(record["cache_write_5m"] for record in codex_rows), 50)
         self.assertEqual(sum(record["cache_read"] for record in codex_rows), 200)
         self.assertEqual(sum(record["output"] for record in codex_rows), 100)
-        self.assertEqual(claude_rows[0]["cache_write"], 10)
+        self.assertEqual(claude_rows[0]["cache_write_5m"], 10)
+        self.assertEqual(claude_rows[0]["cache_write_1h"], 30)
 
     def test_large_fixture_keeps_reads_bounded_and_advances_cursor(self) -> None:
         raw = self._run("run-large")
         event = json.dumps(_envelope("2026-07-30T10:00:00Z", _usage(1, 1)))
         raw.write_text((event + "\n") * 2_000, encoding="utf-8")
 
+        started = time.perf_counter()
         result = costs.refresh()
+        elapsed = time.perf_counter() - started
         run_state = result["runs"]["run-large"]
         self.assertEqual(run_state["offset"], raw.stat().st_size)
+        self.assertGreater(run_state["read_chunks"], 1)
+        self.assertLess(elapsed, 2.0)
         self.assertEqual(sum(record["output"] for record in result["records"].values()), 1)
 
     def test_claude_cache_read_and_creation_are_priced(self) -> None:
@@ -150,7 +156,10 @@ class CostAggregatorTests(unittest.TestCase):
                 "usage": {
                     "input_tokens": 100,
                     "cache_read_input_tokens": 20,
-                    "cache_creation_input_tokens": 30,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": 10,
+                        "ephemeral_1h_input_tokens": 20,
+                    },
                     "output_tokens": 10,
                 },
             },
@@ -159,27 +168,33 @@ class CostAggregatorTests(unittest.TestCase):
         result = costs._query_state(costs.refresh())
         row = result["totals"]
         self.assertEqual((row["input"], row["cache_read"], row["cache_write"], row["output"]), (100, 20, 30, 10))
-        self.assertAlmostEqual(row["cost_usd"], 0.0009475, places=8)
+        self.assertAlmostEqual(row["cost_usd"], 0.0010225, places=8)
 
         state = {"seen_message_ids": {f"old-{index}": True for index in range(costs.MAX_MESSAGE_DEDUPE_IDS)}}
         costs._claude_usage(payload, state)
         self.assertLessEqual(len(state["seen_message_ids"]), costs.MAX_MESSAGE_DEDUPE_IDS)
 
     def test_all_catalog_model_rates_are_distinct_and_explicit(self) -> None:
-        self.assertEqual(costs.PRICING_USD_PER_MILLION["gpt-5.6-sol"]["input"], 5.0)
-        self.assertEqual(costs.PRICING_USD_PER_MILLION["gpt-5.6-terra"]["input"], 2.5)
-        self.assertEqual(costs.PRICING_USD_PER_MILLION["gpt-5.6-luna"]["input"], 1.0)
-        self.assertEqual(costs.PRICING_USD_PER_MILLION["opus-4.7"]["output"], 25.0)
+        self.assertEqual(costs.PRICING_USD_PER_MILLION["gpt-5.5"]["input"], 5.0)
+        self.assertEqual(costs.PRICING_USD_PER_MILLION["gpt-5.5"]["output"], 30.0)
+        self.assertEqual(costs.PRICING_USD_PER_MILLION["claude-haiku-4-5"]["input"], 1.0)
+        self.assertEqual(costs.PRICING_USD_PER_MILLION["claude-haiku-4-5"]["output"], 5.0)
+        self.assertEqual(costs.PRICING_USD_PER_MILLION["claude-opus-4-7"]["cache_write_1h"], 10.0)
         self.assertEqual(costs.PRICING_USD_PER_MILLION["claude-fable-5"]["output"], 50.0)
+        self.assertNotIn("gpt-5.3-codex-spark", costs.PRICING_USD_PER_MILLION)
 
     def test_reset_replaces_per_run_contributions_and_prunes_deleted_runs(self) -> None:
         raw = self._run("run-reset")
         raw.write_text(json.dumps(_envelope("2026-07-30T10:00:00Z", _usage(220, 22))) + "\n", encoding="utf-8")
         costs.refresh()
-        raw.unlink()
         raw.write_text(json.dumps(_envelope("2026-07-30T10:00:00Z", _usage(330, 33))) + "\n", encoding="utf-8")
         refreshed = costs.refresh()
         self.assertEqual(refreshed["records"][next(iter(refreshed["records"]))]["input"], 330)
+        with raw.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(_envelope("2026-07-30T10:01:00Z", _usage(440, 44))) + "\n")
+        appended = costs.refresh()
+        self.assertEqual(sum(record["input"] for record in appended["records"].values()), 440)
+        raw.unlink()
         shutil.rmtree(raw.parent)
         pruned = costs.refresh()
         self.assertEqual(pruned["runs"], {})
@@ -223,6 +238,17 @@ class CostAggregatorTests(unittest.TestCase):
         local_raw.symlink_to(external_raw)
         result = costs.refresh()
         self.assertEqual(result["records"], {})
+
+    def test_non_regular_metadata_does_not_block_refresh(self) -> None:
+        raw = self._run("run-fifo")
+        raw.write_text(json.dumps(_envelope("2026-07-30T10:00:00Z", _usage(999, 99))) + "\n", encoding="utf-8")
+        metadata = raw.parent / "run.json"
+        metadata.unlink()
+        os.mkfifo(metadata)
+
+        result = costs.refresh()
+        self.assertEqual(result["records"], {})
+        self.assertEqual(result["runs"], {})
 
     def test_partial_line_is_retried_without_rescanning_complete_lines(self) -> None:
         raw = self._run("run-partial")

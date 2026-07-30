@@ -8,7 +8,7 @@ test("ticket cost requests share an in-flight fetch", async () => {
   let calls = 0;
   globalThis.fetch = (async (input) => {
     calls += 1;
-    assert.match(String(input), /\/api\/costs\?ticket=WIKI-178/);
+    if (calls === 1) assert.match(String(input), /\/api\/costs\?ticket=WIKI-178/);
     return {
       ok: true,
       json: async () => ({
@@ -42,6 +42,14 @@ test("ticket cost requests share an in-flight fetch", async () => {
     ]);
     assert.equal(calls, 1);
     assert.equal(first, second);
+    assert.equal(await getTicketCosts("WIKI-178"), first);
+    assert.equal(calls, 1);
+
+    for (let index = 0; index < 128; index += 1) {
+      await getTicketCosts(`WIKI-${index}`);
+    }
+    await getTicketCosts("WIKI-178");
+    assert.equal(calls, 130);
   } finally {
     globalThis.fetch = originalFetch;
   }
