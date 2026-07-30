@@ -19,6 +19,7 @@ fi
 stage_parent="${WIKI_NATIVE_STAGE_PARENT:-$ROOT/.native-build-staging}"
 mkdir -p "$stage_parent"
 shopt -s nullglob
+# native_swap_transaction.py writes this only after daemon health and handover.
 for completed_stage in "$stage_parent"/*/.swap-complete; do
   rm -rf "$(dirname "$completed_stage")"
 done

@@ -97,6 +97,40 @@ class ApprovalRecoveryStallAdapter(CodexFixtureAdapter):
     """Accept the continuation but never emit a replacement approval."""
 
 
+class ApprovalRecoveryAdapter(CodexFixtureAdapter):
+    def __init__(self, *args, resumed_sessions: list[str], **kwargs):
+        super().__init__(*args, **kwargs)
+        self.resumed_sessions = resumed_sessions
+
+    async def resume(self, session_id: str) -> AdapterStatus:
+        self.resumed_sessions.append(session_id)
+        return await super().resume(session_id)
+
+    async def send_now(self, message: str) -> AdapterStatus:
+        del message
+        status = self.snapshot()
+        self._status = AdapterStatus(  # noqa: SLF001 - approval recovery fixture
+            LifecycleState.WAITING_APPROVAL,
+            status.session_id,
+            status.pid,
+            generation=max(1, status.generation),
+        )
+        await self._events.put(  # noqa: SLF001 - approval recovery fixture
+            ProviderEvent(
+                ProviderKind.CODEX,
+                {
+                    "id": 8,
+                    "method": "item/tool/requestUserInput",
+                    "params": {
+                        "questions": [{"id": "surface", "question": "Which surface?"}]
+                    },
+                },
+                generation=self._status.generation,  # noqa: SLF001
+            )
+        )
+        return self._status
+
+
 def _paths(root: Path) -> RuntimePaths:
     return RuntimePaths(
         runtime_dir=root / "runtime",
@@ -1799,6 +1833,61 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await supervisor.close()
         self.supervisor = Supervisor(self.store, FixtureAdapterFactory(FIXTURES))
+
+    async def test_waiting_approval_orphan_retries_exact_session_recovery(self) -> None:
+        await self.supervisor.close()
+        record = RunRecord.new(
+            agent_id="WIKI-ORPHAN-APPROVAL",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            worktree=str(self.worktree),
+            prompt="fixture",
+        )
+        record.state = LifecycleState.WAITING_APPROVAL
+        record.provider_session_id = "session-exact-approval"
+        record.provider_pid = 424_243
+        record.pending_requests["str:old"] = {
+            "request_id": "old",
+            "request_kind": "item/tool/requestUserInput",
+            "payload": {
+                "method": "item/tool/requestUserInput",
+                "id": "old",
+                "params": {"questions": [{"question": "Which surface?"}]},
+            },
+        }
+        self.store.create(record)
+        alive = {"value": True}
+        resumed_sessions: list[str] = []
+
+        def factory(_record: RunRecord) -> ApprovalRecoveryAdapter:
+            return ApprovalRecoveryAdapter(
+                FIXTURES / "codex_app_server_success.jsonl",
+                FIXTURES / "codex_app_server_control.jsonl",
+                pid=os.getpid(),
+                resumed_sessions=resumed_sessions,
+            )
+
+        self.supervisor = Supervisor(
+            self.store,
+            factory,
+            pid_alive=lambda _pid: alive["value"],
+        )
+        first = await self.supervisor.recover_on_start()
+        self.assertEqual(first[0]["action"], "block")
+        blocked = self.store.get(record.run_id)
+        self.assertEqual(blocked.recovery_from_state, LifecycleState.WAITING_APPROVAL)
+        self.assertEqual(blocked.pending_requests["str:old"]["request_id"], "old")
+
+        alive["value"] = False
+        second = await self.supervisor.recover_on_start()
+        self.assertEqual(second[0]["action"], "resume")
+        resumed = self.store.get(record.run_id)
+        self.assertEqual(resumed.provider_session_id, "session-exact-approval")
+        self.assertEqual(resumed.state, LifecycleState.WAITING_APPROVAL)
+        self.assertEqual(resumed.pending_requests["int:8"]["request_id"], 8)
+        self.assertEqual(resumed_sessions, ["session-exact-approval"])
+        self.assertIn(record.run_id, self.supervisor.adapters)
 
     async def test_failed_automatic_resume_does_not_loop_and_manual_retry_works(
         self,

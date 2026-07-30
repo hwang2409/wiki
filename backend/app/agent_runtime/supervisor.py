@@ -1577,6 +1577,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     if (
                         current.state is LifecycleState.WAITING_APPROVAL
                         and current.pending_requests
+                        and current.pending_requests != old_pending_requests
                     ):
                         record = current
                         break

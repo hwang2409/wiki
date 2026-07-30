@@ -327,6 +327,113 @@ class NativeBuildGuardTests(TestCase):
             self.assertTrue((runtime / "app.lock").exists())
             self.assertEqual((live / "marker").read_text(encoding="utf-8"), "new")
 
+    def test_crash_after_exchange_keeps_rollback_bundle_without_completion_marker(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage_root = root / "stage"
+            live = root / "src-tauri/target/release/bundle/macos/Wiki.app"
+            staged = stage_root / "target/release/bundle/macos/Wiki.app"
+            runtime = root / "runtime"
+            stage_root.mkdir(parents=True)
+            live.mkdir(parents=True)
+            staged.mkdir(parents=True)
+            runtime.mkdir()
+            (runtime / "app.lock").touch()
+            (live / "marker").write_text("old", encoding="utf-8")
+            (staged / "marker").write_text("new", encoding="utf-8")
+
+            def crash_after_exchange(*_args: object) -> bool:
+                raise KeyboardInterrupt
+
+            with self.assertRaises(KeyboardInterrupt):
+                swap_native_app(stage_root, root, runtime, restart=crash_after_exchange)
+
+            self.assertEqual((live / "marker").read_text(encoding="utf-8"), "new")
+            self.assertEqual((staged / "marker").read_text(encoding="utf-8"), "old")
+            self.assertTrue((stage_root / ".swap-exchanged").exists())
+            self.assertFalse((stage_root / ".swap-complete").exists())
+
+    def test_retry_after_drain_crash_reloads_saved_runs_and_verifies_handover(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage_root = root / "stage"
+            live = root / "src-tauri/target/release/bundle/macos/Wiki.app"
+            staged = stage_root / "target/release/bundle/macos/Wiki.app"
+            runtime = root / "runtime"
+            stage_root.mkdir(parents=True)
+            live.mkdir(parents=True)
+            staged.mkdir(parents=True)
+            runtime.mkdir()
+            (runtime / "app.lock").touch()
+            (live / "marker").write_text("old", encoding="utf-8")
+            (staged / "marker").write_text("new", encoding="utf-8")
+            saved_runs = [
+                {
+                    "agent_id": "WIKI-CRASH-RECOVERY",
+                    "run_id": "run-crash-recovery",
+                    "provider_session_id": "session-crash-recovery",
+                }
+            ]
+            handover_client = Mock()
+            handover_client.prepare_for_handover.return_value = saved_runs
+            started: list[tuple[Path, Path, Path]] = []
+            verified: list[list[dict[str, object]]] = []
+
+            def start_supervisor(
+                bundle: Path, runtime_dir: Path, repo_root: Path
+            ) -> None:
+                started.append((bundle, runtime_dir, repo_root))
+
+            def wait_for_handover(
+                _runtime_dir: Path, runs: list[dict[str, object]]
+            ) -> None:
+                verified.append(runs)
+
+            with (
+                patch.object(
+                    native_swap_transaction,
+                    "_supervisor_lock_is_free",
+                    side_effect=[False, True],
+                ),
+                patch.object(
+                    native_swap_transaction,
+                    "_supervisor_identity",
+                    return_value=(handover_client, 1234, {"pid": 1234}),
+                ),
+                patch.object(
+                    native_swap_transaction,
+                    "_stop_supervisor",
+                    side_effect=[KeyboardInterrupt, None],
+                ),
+                patch.object(
+                    native_swap_transaction,
+                    "_wait_for_handover",
+                    side_effect=wait_for_handover,
+                ),
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    swap_native_app(stage_root, root, runtime)
+
+                journal = stage_root / ".handover-runs.json"
+                self.assertTrue(journal.exists())
+                swap_native_app(
+                    stage_root,
+                    root,
+                    runtime,
+                    restart=lambda *_args: True,
+                    start_supervisor=start_supervisor,
+                )
+
+            self.assertEqual((live / "marker").read_text(encoding="utf-8"), "new")
+            self.assertEqual(
+                started,
+                [(live.resolve(), runtime.resolve(), root.resolve())],
+            )
+            self.assertEqual(verified, [saved_runs])
+            self.assertFalse(stage_root.exists())
+
     def test_swap_rejects_stale_supervisor_pid_before_signal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             runtime = Path(tmp)

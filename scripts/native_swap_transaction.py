@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import json
 import os
 import signal
 import socket
@@ -208,6 +209,47 @@ def _bundle_backend_fingerprint(
     )
 
 
+def _write_handover_state(path: Path, runs: list[dict[str, object]]) -> None:
+    """Persist the exact runs before stopping the old supervisor."""
+    payload = {"version": 1, "runs": runs}
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def _read_handover_state(path: Path) -> list[dict[str, object]]:
+    """Load a handover journal left by a transaction that stopped mid-swap."""
+    try:
+        with path.open(encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"invalid supervisor handover journal: {path}") from exc
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        raise RuntimeError(f"invalid supervisor handover journal: {path}")
+    runs = payload.get("runs")
+    if not isinstance(runs, list):
+        raise RuntimeError(f"invalid supervisor handover journal: {path}")
+    result: list[dict[str, object]] = []
+    for run in runs:
+        if not isinstance(run, dict):
+            raise RuntimeError(f"invalid supervisor handover journal: {path}")
+        if not all(
+            isinstance(run.get(key), str) and bool(run.get(key))
+            for key in ("agent_id", "run_id")
+        ):
+            raise RuntimeError(f"invalid supervisor handover journal: {path}")
+        if not isinstance(run.get("provider_session_id"), str) or not run.get(
+            "provider_session_id"
+        ):
+            raise RuntimeError(f"invalid supervisor handover journal: {path}")
+        result.append(dict(run))
+    return result
+
+
 def _start_supervisor(live_bundle: Path, runtime_dir: Path, repo_root: Path) -> None:
     executable = _bundle_backend_executable(live_bundle)
     if not executable.is_file():
@@ -324,7 +366,9 @@ def swap_native_app(
     staged_bundle = stage_root / "target/release/bundle/macos/Wiki.app"
     live_bundle = repo_root / "src-tauri/target/release/bundle/macos/Wiki.app"
     swap_intent = stage_root / ".swap-intent"
+    exchange_sentinel = stage_root / ".swap-exchanged"
     success_sentinel = stage_root / ".swap-complete"
+    handover_state = stage_root / ".handover-runs.json"
 
     if not staged_bundle.is_dir() and not swap_intent.is_file():
         raise FileNotFoundError(f"missing staged Wiki.app at {staged_bundle}")
@@ -343,7 +387,11 @@ def swap_native_app(
         old_fingerprint = _bundle_backend_fingerprint(
             live_bundle, runtime_dir, repo_root
         )
-        saved_runs: list[dict[str, object]] = []
+        saved_runs = (
+            _read_handover_state(handover_state)
+            if handover_state.is_file()
+            else []
+        )
         if not _supervisor_lock_is_free(runtime_dir):
             handover_client, _pid, _health = _supervisor_identity(
                 runtime_dir,
@@ -351,6 +399,7 @@ def swap_native_app(
                 expected_fingerprint=old_fingerprint,
             )
             saved_runs = handover_client.prepare_for_handover()
+            _write_handover_state(handover_state, saved_runs)
         _stop_supervisor(
             runtime_dir,
             expected_executable=old_executable,
@@ -362,7 +411,7 @@ def swap_native_app(
                 atomic_replace(
                     staged_bundle,
                     live_bundle,
-                    success_sentinel,
+                    exchange_sentinel,
                     swap_intent,
                 )
                 try:
@@ -375,7 +424,7 @@ def swap_native_app(
                         rollback_replace(
                             staged_bundle,
                             live_bundle,
-                            success_sentinel,
+                            exchange_sentinel,
                             swap_intent,
                         )
                     except Exception as rollback_error:
@@ -421,7 +470,7 @@ def swap_native_app(
                         rollback_replace(
                             staged_bundle,
                             live_bundle,
-                            success_sentinel,
+                            exchange_sentinel,
                             swap_intent,
                         )
                         restart(live_bundle, runtime_dir, repo_root)
@@ -435,6 +484,7 @@ def swap_native_app(
                 raise RuntimeError(
                     "new supervisor did not restore saved runs"
                 ) from handover_error
+        success_sentinel.touch()
         shutil.rmtree(stage_root)
 
 
