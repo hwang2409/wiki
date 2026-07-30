@@ -212,15 +212,29 @@ def _bundle_backend_fingerprint(
 
 def _write_handover_state(path: Path, runs: list[dict[str, object]]) -> None:
     """Persist the exact runs before stopping the old supervisor."""
-    runs = _validate_handover_state(runs, path)
+    runs = _sanitize_handover_state(runs, path)
     payload = {"version": 1, "runs": runs}
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    with temporary.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, sort_keys=True)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, path)
+    file_descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o600,
+    )
+    try:
+        os.fchmod(file_descriptor, 0o600)
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as handle:
+            file_descriptor = -1
+            json.dump(payload, handle, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    except BaseException:
+        if file_descriptor >= 0:
+            os.close(file_descriptor)
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def _read_handover_state(path: Path) -> list[dict[str, object]]:
@@ -235,10 +249,10 @@ def _read_handover_state(path: Path) -> list[dict[str, object]]:
     runs = payload.get("runs")
     if not isinstance(runs, list):
         raise RuntimeError(f"invalid supervisor handover journal: {path}")
-    return _validate_handover_state(runs, path)
+    return _sanitize_handover_state(runs, path)
 
 
-def _validate_handover_state(
+def _sanitize_handover_state(
     runs: object,
     path: Path,
 ) -> list[dict[str, object]]:
@@ -255,7 +269,17 @@ def _validate_handover_state(
             raise RuntimeError(f"invalid supervisor handover journal: {path}")
         if run.get("state") not in _HANDOVER_STATES:
             raise RuntimeError(f"invalid supervisor handover journal: {path}")
-        result.append(dict(run))
+        result.append(
+            {
+                "agent_id": run["agent_id"],
+                "run_id": run["run_id"],
+                "provider_session_id": run["provider_session_id"],
+                "state": run["state"],
+                "pending_request": bool(
+                    run.get("pending_requests") or run.get("pending_request")
+                ),
+            }
+        )
     return result
 
 
@@ -321,7 +345,7 @@ def _wait_for_handover(
                     or status.get("provider_alive") is not True
                     or status.get("state") not in {"working", "waiting-approval", "idle"}
                     or (
-                        saved.get("pending_requests")
+                        saved.get("pending_request")
                         and (
                             status.get("state") != "waiting-approval"
                             or not status.get("pending_requests")
@@ -381,6 +405,7 @@ def swap_native_app(
 
     if not staged_bundle.is_dir() and not swap_intent.is_file():
         raise FileNotFoundError(f"missing staged Wiki.app at {staged_bundle}")
+    stage_root.chmod(0o700)
     app_lock_path = runtime_dir / "app.lock"
     if not allow_missing_app_lock and not app_lock_path.exists():
         raise NativeRuntimeLockError(

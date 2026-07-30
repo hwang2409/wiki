@@ -45,6 +45,7 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$stage_root"
+chmod 700 "$stage_root"
 frontend_dist="$stage_root/frontend-dist"
 pyinstaller_dist="$stage_root/dist"
 pyinstaller_work="$stage_root/build"

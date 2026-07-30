@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import signal
 import subprocess
@@ -376,6 +377,19 @@ class NativeBuildGuardTests(TestCase):
                     "run_id": "run-crash-recovery",
                     "provider_session_id": "session-crash-recovery",
                     "state": "idle",
+                    "initial_prompt": "private prompt",
+                    "pending_requests": [
+                        {"payload": "private approval payload"}
+                    ],
+                }
+            ]
+            safe_runs = [
+                {
+                    "agent_id": "WIKI-CRASH-RECOVERY",
+                    "run_id": "run-crash-recovery",
+                    "provider_session_id": "session-crash-recovery",
+                    "state": "idle",
+                    "pending_request": True,
                 }
             ]
             handover_client = Mock()
@@ -420,6 +434,21 @@ class NativeBuildGuardTests(TestCase):
 
                 journal = stage_root / ".handover-runs.json"
                 self.assertTrue(journal.exists())
+                self.assertEqual(stage_root.stat().st_mode & 0o777, 0o700)
+                self.assertEqual(journal.stat().st_mode & 0o777, 0o600)
+                journal_text = journal.read_text(encoding="utf-8")
+                self.assertNotIn("private prompt", journal_text)
+                self.assertNotIn("private approval payload", journal_text)
+                self.assertEqual(
+                    set(json.loads(journal_text)["runs"][0]),
+                    {
+                        "agent_id",
+                        "run_id",
+                        "provider_session_id",
+                        "state",
+                        "pending_request",
+                    },
+                )
                 swap_native_app(
                     stage_root,
                     root,
@@ -433,7 +462,7 @@ class NativeBuildGuardTests(TestCase):
                 started,
                 [(live.resolve(), runtime.resolve(), root.resolve())],
             )
-            self.assertEqual(verified, [saved_runs])
+            self.assertEqual(verified, [safe_runs])
             self.assertFalse(stage_root.exists())
 
     def test_starting_attached_run_aborts_before_drain_or_handover_journal(self) -> None:
@@ -450,14 +479,6 @@ class NativeBuildGuardTests(TestCase):
             (runtime / "app.lock").touch()
             (live / "marker").write_text("old", encoding="utf-8")
             (staged / "marker").write_text("new", encoding="utf-8")
-            starting = {
-                "agent_id": "WIKI-STARTING",
-                "run_id": "run-starting",
-                "state": "starting",
-                "provider_session_id": None,
-                "provider_pid": 424_244,
-                "control_attached": True,
-            }
             calls: list[str] = []
             handover_client = native_swap_transaction.SupervisorClient(
                 RuntimePaths.from_env({"WIKI_AGENT_RUNTIME_DIR": str(runtime)})
@@ -465,10 +486,10 @@ class NativeBuildGuardTests(TestCase):
 
             def request(method: str, _params: dict[str, object] | None = None) -> object:
                 calls.append(method)
-                if method == "run/list":
-                    return {"runs": [starting]}
-                if method == "run/status":
-                    return starting
+                if method == "supervisor/handover":
+                    raise native_swap_transaction.SupervisorUnavailable(
+                        "state starting is not resumable"
+                    )
                 raise AssertionError(f"unexpected request: {method}")
 
             with (
@@ -501,7 +522,7 @@ class NativeBuildGuardTests(TestCase):
                     )
 
             stop.assert_not_called()
-            self.assertEqual(calls, ["run/list", "run/status"])
+            self.assertEqual(calls, ["supervisor/handover"])
             self.assertFalse((stage_root / ".handover-runs.json").exists())
             self.assertFalse((stage_root / ".swap-intent").exists())
             self.assertEqual((live / "marker").read_text(encoding="utf-8"), "old")

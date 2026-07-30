@@ -277,6 +277,8 @@ class Supervisor:
         self.event_routes: dict[tuple[int, int], str] = {}
         self.queue_locks: dict[str, asyncio.Lock] = {}
         self.agent_locks: dict[str, asyncio.Lock] = {}
+        self.handover_admission_lock = asyncio.Lock()
+        self.handover_active = False
         self.codex_fleet_lock = asyncio.Lock()
         self.codex_rotation_task: asyncio.Task[dict[str, Any]] | None = None
         self.codex_rotation_operation_id: str | None = None
@@ -1471,8 +1473,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         prompt: str,
         migrate_legacy: bool = False,
     ) -> RunRecord:
-        self.store.create(record, migrate_legacy=migrate_legacy)
-        return await self._launch_record(record, prompt)
+        async with self.handover_admission_lock:
+            if self.handover_active:
+                raise StoreConflict("supervisor handover is in progress")
+            self.store.create(record, migrate_legacy=migrate_legacy)
+            return await self._launch_record(record, prompt)
 
     async def _launch_record(self, record: RunRecord, prompt: str) -> RunRecord:
         adapter = self.adapter_factory(record)
@@ -1515,6 +1520,20 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             return await self._resume_run(run_id, automatic=False)
 
     async def _resume_run(self, run_id: str, *, automatic: bool) -> RunRecord:
+        async with self.handover_admission_lock:
+            if self.handover_active:
+                raise StoreConflict("supervisor handover is in progress")
+            return await self._resume_run_without_handover(
+                run_id,
+                automatic=automatic,
+            )
+
+    async def _resume_run_without_handover(
+        self,
+        run_id: str,
+        *,
+        automatic: bool,
+    ) -> RunRecord:
         # Re-read immediately before resume so stale recovery snapshots cannot
         # revive a deregistered, terminal, or replaced run (PR #31 invariant).
         record = self.store.get(run_id)
@@ -2176,23 +2195,81 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 results.append(await self._recover_run(snapshot.run_id))
         return results
 
-    async def prepare_handover(self, run_ids: list[str]) -> dict[str, Any]:
-        """Drain provider transports while preserving durable run identity."""
+    def _handover_snapshot(self) -> list[dict[str, Any]]:
+        """Snapshot and validate every provider before any adapter is drained."""
 
-        drained: list[str] = []
-        for run_id in run_ids:
+        runs: list[dict[str, Any]] = []
+        for record in self.store.list_runs():
+            if (
+                record.state in TERMINAL_STATES
+                or record.replaced_by_run_id
+                or not self.store.is_current(record)
+            ):
+                continue
+            runtime = self._runtime_status(record)
+            provider_alive = bool(runtime["provider_alive"]) or self.pid_alive(
+                record.provider_pid
+            )
+            if not runtime["control_attached"] and not provider_alive:
+                continue
+            if runtime.get("state") not in {
+                LifecycleState.WORKING.value,
+                LifecycleState.WAITING_APPROVAL.value,
+                LifecycleState.IDLE.value,
+            }:
+                raise StoreConflict(
+                    f"cannot hand over {record.agent_id}: state "
+                    f"{runtime.get('state') or 'unknown'} is not resumable"
+                )
+            if not isinstance(runtime.get("provider_session_id"), str) or not runtime.get(
+                "provider_session_id"
+            ):
+                raise StoreConflict(
+                    f"cannot hand over {record.agent_id}: provider session id is missing"
+                )
+            runs.append(runtime)
+        return runs
+
+    async def prepare_handover(self, _run_ids: list[str] | None = None) -> dict[str, Any]:
+        """Block admission, snapshot all providers, then drain that exact set."""
+
+        async with self.handover_admission_lock:
+            if self.handover_active:
+                raise StoreConflict("supervisor handover is already in progress")
+            runs = self._handover_snapshot()
+            self.handover_active = True
             try:
-                record = self.store.get(run_id)
-            except RunNotFound:
-                continue
-            adapter = self.adapters.get(run_id)
-            if adapter is None:
-                continue
-            async with self._run_lock(run_id):
-                if self.adapters.get(run_id) is adapter:
-                    await self._quiesce_adapter_for_replacement(run_id, adapter)
-                    drained.append(record.run_id)
-        return {"drained_run_ids": drained}
+                drained: list[str] = []
+                for run in runs:
+                    run_id = str(run["run_id"])
+                    adapter = self.adapters.get(run_id)
+                    if adapter is None:
+                        raise StoreConflict(
+                            f"provider control detached during handover: {run_id}"
+                        )
+                    async with self._run_lock(run_id):
+                        if self.adapters.get(run_id) is not adapter:
+                            raise StoreConflict(
+                                f"provider control changed during handover: {run_id}"
+                            )
+                        await self._quiesce_adapter_for_replacement(run_id, adapter)
+                        state = LifecycleState(str(run["state"]))
+                        self.store.update_adapter_status(
+                            run_id,
+                            AdapterStatus(
+                                state=state,
+                                session_id=str(run["provider_session_id"]),
+                                pid=None,
+                                generation=int(run.get("provider_generation") or 0),
+                                active_turn_id=None,
+                                transcript_path=run.get("transcript_path"),
+                            ),
+                        )
+                        drained.append(run_id)
+                return {"drained_run_ids": drained, "runs": runs}
+            except BaseException:
+                self.handover_active = False
+                raise
 
     async def _recover_run(self, run_id: str) -> dict[str, str]:
         # Decision inputs are refreshed per run; no stale list snapshot can
@@ -2685,6 +2762,27 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         effort: str | None = None,
         backend_base_url: str | None = None,
     ) -> RunRecord:
+        async with self.handover_admission_lock:
+            if self.handover_active:
+                raise StoreConflict("supervisor handover is in progress")
+            return await self._replace_without_handover(
+                run_id,
+                prompt,
+                model,
+                provider,
+                effort,
+                backend_base_url,
+            )
+
+    async def _replace_without_handover(
+        self,
+        run_id: str,
+        prompt: str,
+        model: str | None = None,
+        provider: ProviderKind | None = None,
+        effort: str | None = None,
+        backend_base_url: str | None = None,
+    ) -> RunRecord:
         old = self.store.get(run_id)
         if not self.store.is_current(old):
             raise StoreConflict("replacement target is no longer current")
@@ -3113,8 +3211,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             return {"runs": await self.recover_on_start()}
         if method == "supervisor/handover":
             run_ids = params.get("run_ids")
-            if not isinstance(run_ids, list) or not all(
-                isinstance(run_id, str) and run_id for run_id in run_ids
+            if run_ids is not None and (
+                not isinstance(run_ids, list)
+                or not all(isinstance(run_id, str) and run_id for run_id in run_ids)
             ):
                 raise ValueError("run_ids must be a list of non-empty strings")
             return await self.prepare_handover(run_ids)

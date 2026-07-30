@@ -1789,6 +1789,60 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             await replacement.close()
         self.supervisor = Supervisor(self.store, FixtureAdapterFactory(FIXTURES))
 
+    async def test_handover_barrier_defers_start_until_after_snapshot(self) -> None:
+        existing = await self.supervisor.start_run(
+            agent_id="WIKI-HANDOVER-BARRIER-EXISTING",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="existing handover run",
+        )
+        snapshot_started = asyncio.Event()
+        release_snapshot = asyncio.Event()
+        original_quiesce = self.supervisor._quiesce_adapter_for_replacement
+
+        async def paused_quiesce(run_id: str, adapter: Any) -> None:
+            snapshot_started.set()
+            await release_snapshot.wait()
+            await original_quiesce(run_id, adapter)
+
+        with mock.patch.object(
+            self.supervisor,
+            "_quiesce_adapter_for_replacement",
+            new=paused_quiesce,
+        ):
+            handover_task = asyncio.create_task(self.supervisor.prepare_handover())
+            await asyncio.wait_for(snapshot_started.wait(), timeout=2)
+            start_task = asyncio.create_task(
+                self.supervisor.start_run(
+                    agent_id="WIKI-HANDOVER-BARRIER-NEW",
+                    provider=ProviderKind.CODEX,
+                    role="implement",
+                    model="fixture-codex",
+                    effort="high",
+                    worktree=str(self.worktree),
+                    prompt="must wait for handover",
+                )
+            )
+            await asyncio.sleep(0.05)
+            self.assertFalse(start_task.done())
+            release_snapshot.set()
+            result = await asyncio.wait_for(handover_task, timeout=2)
+            with self.assertRaisesRegex(StoreConflict, "handover is in progress"):
+                await start_task
+
+        self.assertEqual(
+            result["drained_run_ids"],
+            [existing.run_id],
+        )
+        self.assertEqual(
+            [run["run_id"] for run in result["runs"]],
+            [existing.run_id],
+        )
+        self.assertIsNone(self.store.current_run_id("WIKI-HANDOVER-BARRIER-NEW"))
+
     async def test_recovery_rechecks_live_orphan_then_resumes_exact_session(
         self,
     ) -> None:
@@ -3581,13 +3635,13 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(
                 client,
                 "request",
-                return_value={"status": "ok", "runs": []},
+                return_value={"status": "ok", "drained_run_ids": [], "runs": []},
             ) as request,
             mock.patch.object(client, "_spawn_detached") as spawn,
             mock.patch("backend.app.agent_runtime.client.os.kill") as kill,
         ):
             self.assertEqual(client.ensure_running(timeout=0.1), current)
-        request.assert_called_once_with("run/list")
+        request.assert_called_once_with("supervisor/handover", {})
         kill.assert_called_once_with(424_242, signal.SIGTERM)
         spawn.assert_called_once_with()
 
@@ -3625,15 +3679,12 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
         def request(method: str, params: dict[str, Any] | None = None) -> Any:
             values = dict(params or {})
             calls.append((method, values))
-            if method == "run/list":
-                return {"runs": [idle, working]}
-            if method == "run/status":
-                if values.get("agent_id") == "WIKI-IDLE":
-                    return idle
-                if values.get("agent_id") == "wiki":
-                    return working
-                return {**working, "state": "interrupted", "active_turn_id": None}
-            if method in {"run/interrupt", "run/stop", "run/replace"}:
+            if method == "supervisor/handover":
+                return {
+                    "drained_run_ids": ["idle-run", "working-run"],
+                    "runs": [idle, working],
+                }
+            if method == "run/replace":
                 return {"status": "ok"}
             raise AssertionError(method)
 
@@ -3662,11 +3713,11 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
         spawn.assert_called_once_with()
         self.assertEqual(
             [values["run_id"] for method, values in calls if method == "run/stop"],
-            ["idle-run", "working-run"],
+            [],
         )
         self.assertEqual(
             [values["run_id"] for method, values in calls if method == "run/interrupt"],
-            ["working-run"],
+            [],
         )
         replacements = [values for method, values in calls if method == "run/replace"]
         self.assertEqual(
