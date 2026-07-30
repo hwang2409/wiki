@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import plistlib
+import stat
 import subprocess
 import tempfile
 import time
@@ -183,24 +184,41 @@ def render_plist(config: DaemonConfig) -> str:
     ).decode("utf-8")
 
 
-def _write_plist(config: DaemonConfig) -> None:
-    config.launch_agents_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    config.launch_agents_dir.chmod(0o700)
+def _write_atomic(path: Path, content: bytes, mode: int) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.parent.chmod(0o700)
     fd, raw_tmp = tempfile.mkstemp(
-        prefix=f".{config.plist_path.name}.",
-        dir=config.launch_agents_dir,
-        text=True,
+        prefix=f".{path.name}.",
+        dir=path.parent,
     )
     tmp = Path(raw_tmp)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(render_plist(config))
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        tmp.chmod(0o600)
-        os.replace(tmp, config.plist_path)
+        tmp.chmod(mode)
+        os.replace(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)
+
+
+def _write_plist(config: DaemonConfig) -> None:
+    _write_atomic(config.plist_path, render_plist(config).encode("utf-8"), 0o600)
+
+
+def _capture_plist(path: Path) -> tuple[bytes, int] | None:
+    if not path.is_file():
+        return None
+    return path.read_bytes(), stat.S_IMODE(path.stat().st_mode)
+
+
+def _restore_plist(config: DaemonConfig, backup: tuple[bytes, int] | None) -> None:
+    if backup is None:
+        config.plist_path.unlink(missing_ok=True)
+        return
+    content, mode = backup
+    _write_atomic(config.plist_path, content, mode)
 
 
 def _launchctl(config: DaemonConfig, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -249,6 +267,52 @@ def _service_loaded(config: DaemonConfig) -> bool:
     )
 
 
+def _unload_and_verify_absent(config: DaemonConfig) -> None:
+    unloaded = _launchctl(config, "bootout", config.target)
+    if unloaded.returncode != 0 and not _service_absent(config, unloaded):
+        raise DaemonError(
+            f"cannot unload {config.target}: {_describe_failure(unloaded)}"
+        )
+    if unloaded.returncode == 0 and _service_loaded(config):
+        raise DaemonError(f"{config.target} is still loaded after bootout")
+
+
+def _restore_prior_service(config: DaemonConfig, was_loaded: bool) -> None:
+    if not was_loaded or _service_loaded(config):
+        return
+    restored = _launchctl(config, "bootstrap", config.domain, str(config.plist_path))
+    if restored.returncode != 0:
+        raise DaemonError(
+            f"cannot restore {config.target}: {_describe_failure(restored)}"
+        )
+    if not _service_loaded(config):
+        raise DaemonError(f"{config.target} was not loaded after rollback")
+
+
+def _rollback_install(
+    config: DaemonConfig,
+    backup: tuple[bytes, int] | None,
+    was_loaded: bool,
+    bootstrap_attempted: bool,
+) -> list[str]:
+    errors: list[str] = []
+    if bootstrap_attempted:
+        try:
+            _unload_and_verify_absent(config)
+        except DaemonError as error:
+            errors.append(f"cleanup failed: {error}")
+    try:
+        _restore_plist(config, backup)
+    except OSError as error:
+        errors.append(f"plist rollback failed: {error}")
+    if backup is not None and was_loaded:
+        try:
+            _restore_prior_service(config, was_loaded)
+        except DaemonError as error:
+            errors.append(f"service rollback failed: {error}")
+    return errors
+
+
 def install(config: DaemonConfig) -> dict[str, object]:
     """Install and load the LaunchAgent without touching run state."""
 
@@ -256,26 +320,29 @@ def install(config: DaemonConfig) -> dict[str, object]:
         raise DaemonError(
             f"backend executable is missing or not executable: {config.executable}"
         )
+    backup = _capture_plist(config.plist_path)
+    was_loaded = _service_loaded(config)
     config.log_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     config.log_path.parent.chmod(0o700)
-    _write_plist(config)
-    if _service_loaded(config):
-        previous = _launchctl(config, "bootout", config.target)
-        if previous.returncode != 0 and not _service_absent(config, previous):
-            raise DaemonError(
-                f"cannot unload {config.target}: {_describe_failure(previous)}"
-            )
-        if previous.returncode == 0 and _service_loaded(config):
-            raise DaemonError(f"{config.target} is still loaded after bootout")
-    loaded = _launchctl(config, "bootstrap", config.domain, str(config.plist_path))
-    if loaded.returncode != 0:
-        raise DaemonError(f"cannot load {config.plist_path}: {_describe_failure(loaded)}")
+    bootstrap_attempted = False
     try:
+        _write_plist(config)
+        if was_loaded:
+            _unload_and_verify_absent(config)
+        bootstrap_attempted = True
+        loaded = _launchctl(config, "bootstrap", config.domain, str(config.plist_path))
+        if loaded.returncode != 0:
+            raise DaemonError(
+                f"cannot load {config.plist_path}: {_describe_failure(loaded)}"
+            )
         _wait_for_healthy(config)
-    except DaemonError:
-        # KeepAlive would relaunch a backend that cannot claim its port. Remove
-        # the loaded job so a failed install does not create a restart storm.
-        _unload_after_health_failure(config)
+    except Exception as error:
+        rollback_errors = _rollback_install(
+            config, backup, was_loaded, bootstrap_attempted
+        )
+        if rollback_errors:
+            detail = "; ".join([f"install failed: {error}", *rollback_errors])
+            raise DaemonError(detail) from error
         raise
     return {
         "label": config.label,
@@ -290,13 +357,7 @@ def install(config: DaemonConfig) -> dict[str, object]:
 def uninstall(config: DaemonConfig) -> dict[str, object]:
     """Unload the LaunchAgent and remove only its generated plist."""
 
-    unloaded = _launchctl(config, "bootout", config.target)
-    if unloaded.returncode != 0 and not _service_absent(config, unloaded):
-        raise DaemonError(
-            f"cannot unload {config.target}: {_describe_failure(unloaded)}"
-        )
-    if unloaded.returncode == 0 and _service_loaded(config):
-        raise DaemonError(f"{config.target} is still loaded after bootout")
+    _unload_and_verify_absent(config)
     config.plist_path.unlink(missing_ok=True)
     return {
         "label": config.label,
@@ -347,15 +408,6 @@ def _wait_for_healthy(config: DaemonConfig) -> dict[str, object]:
     raise DaemonError(
         f"daemon did not become healthy at {config.backend_url}: {last_health}"
     )
-
-
-def _unload_after_health_failure(config: DaemonConfig) -> None:
-    unloaded = _launchctl(config, "bootout", config.target)
-    if unloaded.returncode != 0 and not _service_absent(config, unloaded):
-        raise DaemonError(
-            "daemon health failed and launchd could not unload "
-            f"{config.target}: {_describe_failure(unloaded)}"
-        )
 
 
 def status(config: DaemonConfig) -> dict[str, object]:

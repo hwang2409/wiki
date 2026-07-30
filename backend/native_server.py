@@ -6,6 +6,7 @@ from contextlib import nullcontext
 import fcntl
 import os
 import platform
+import plistlib
 import re
 import secrets
 import signal
@@ -309,16 +310,94 @@ def _bundle_team_identifier(app_path: Path) -> str | None:
     return team
 
 
-def _verify_code_identity(executable: Path, team_identifier: str | None = None) -> bool:
-    """Verify a real Apple signature and its designated requirement."""
+def _bundle_executable(app_path: Path) -> Path | None:
+    try:
+        with (app_path / "Contents" / "Info.plist").open("rb") as handle:
+            info = plistlib.load(handle)
+    except (OSError, plistlib.InvalidFileException, ValueError):
+        return None
+    name = info.get("CFBundleExecutable") if isinstance(info, dict) else None
+    if not isinstance(name, str) or not name or Path(name).name != name:
+        return None
+    return app_path / "Contents" / "MacOS" / name
 
-    team = (team_identifier or "").strip()
-    if not team or not re.fullmatch(r"[A-Z0-9]{10}", team):
+
+def _code_directory_identity(details: list[str]) -> str | None:
+    for prefix in ("CDHashFull=", "CDHash="):
+        value = next(
+            (line.removeprefix(prefix) for line in details if line.startswith(prefix)),
+            None,
+        )
+        if value:
+            return value
+    return None
+
+
+def _same_selected_executable(executable: Path, selected: Path) -> bool:
+    try:
+        return executable.resolve(strict=True) == selected.resolve(strict=True) and os.path.samefile(
+            executable, selected
+        )
+    except OSError:
         return False
+
+
+def _verify_signature(executable: Path, requirement: str | None = None) -> bool:
+    arguments = ["/usr/bin/codesign", "--verify", "--strict"]
+    if requirement is not None:
+        arguments.extend(["--test-requirement", f"={requirement}"])
+    arguments.append(str(executable))
+    try:
+        result = subprocess.run(
+            arguments,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return False
+    return result.returncode == 0
+
+
+def _verify_adhoc_identity(
+    executable: Path, details: list[str], selected_executable: Path
+) -> bool:
+    """Verify the selected source bundle's ad-hoc code directory and path."""
+
+    if "Signature=adhoc" not in details:
+        return False
+    if f"Identifier={TAURI_BUNDLE_IDENTIFIER}" not in details:
+        return False
+    if not _same_selected_executable(executable, selected_executable):
+        return False
+    selected_details = _codesign_details(selected_executable)
+    if not selected_details or "Signature=adhoc" not in selected_details:
+        return False
+    identity = _code_directory_identity(details)
+    if not identity or identity != _code_directory_identity(selected_details):
+        return False
+    return _verify_signature(executable)
+
+
+def _verify_code_identity(
+    executable: Path,
+    team_identifier: str | None = None,
+    *,
+    selected_executable: Path | None = None,
+) -> bool:
+    """Verify a signed identity or the selected ad-hoc source executable."""
+
     details = _codesign_details(executable)
     if not details:
         return False
     if any(line == "Signature=adhoc" for line in details):
+        return (
+            team_identifier is None
+            and selected_executable is not None
+            and _verify_adhoc_identity(executable, details, selected_executable)
+        )
+    team = (team_identifier or "").strip()
+    if not team or not re.fullmatch(r"[A-Z0-9]{10}", team):
         return False
     if f"Identifier={TAURI_BUNDLE_IDENTIFIER}" not in details:
         return False
@@ -330,23 +409,7 @@ def _verify_code_identity(executable: Path, team_identifier: str | None = None) 
         f'anchor apple generic and identifier "{TAURI_BUNDLE_IDENTIFIER}" '
         f'and certificate leaf[subject.OU] = "{team}"'
     )
-    try:
-        result = subprocess.run(
-            [
-                "/usr/bin/codesign",
-                "--verify",
-                "--strict",
-                "--test-requirement",
-                f"={requirement}",
-                str(executable),
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-    except OSError:
-        return False
-    return result.returncode == 0
+    return _verify_signature(executable, requirement)
 
 
 def is_trusted_tauri_peer(connection: socket.socket) -> bool:
@@ -355,8 +418,14 @@ def is_trusted_tauri_peer(connection: socket.socket) -> bool:
     pid = _peer_pid(connection)
     executable = _peer_executable(pid) if pid is not None else None
     trusted_team = _bundle_team_identifier(TAURI_BUNDLE_PATH)
-    return executable is not None and trusted_team is not None and _verify_code_identity(
-        executable, trusted_team
+    if executable is None:
+        return False
+    if trusted_team is not None:
+        return _verify_code_identity(executable, trusted_team)
+    selected_executable = _bundle_executable(TAURI_BUNDLE_PATH)
+    return selected_executable is not None and _verify_code_identity(
+        executable,
+        selected_executable=selected_executable,
     )
 
 

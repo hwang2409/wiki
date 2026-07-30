@@ -476,6 +476,92 @@ class DaemonArtifactTests(unittest.TestCase):
                     for call in launchctl.call_args_list
                 )
             )
+            self.assertFalse(config.plist_path.exists())
+
+    def test_failed_upgrade_restores_prior_plist_and_service(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / "Wiki.app/Contents/Resources/wiki-backend-sidecar/wiki-backend"
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"new backend")
+            executable.chmod(0o755)
+            config = daemon.config_from_env(
+                overrides={
+                    "WIKI_APP_PATH": str(root / "Wiki.app"),
+                    "WIKI_LAUNCH_AGENTS_DIR": str(root / "LaunchAgents"),
+                }
+            )
+            config.plist_path.parent.mkdir(parents=True)
+            prior_plist = b"prior working plist\n"
+            config.plist_path.write_bytes(prior_plist)
+            loaded = True
+
+            def fake_launchctl(
+                _config: daemon.DaemonConfig, *arguments: str
+            ) -> subprocess.CompletedProcess[str]:
+                nonlocal loaded
+                if arguments[0] == "print":
+                    if loaded:
+                        return subprocess.CompletedProcess(["launchctl", *arguments], 0, "", "")
+                    return subprocess.CompletedProcess(
+                        ["launchctl", *arguments],
+                        113,
+                        "",
+                        daemon._service_absent_message(config),
+                    )
+                if arguments[0] == "bootout":
+                    loaded = False
+                elif arguments[0] == "bootstrap":
+                    loaded = True
+                return subprocess.CompletedProcess(["launchctl", *arguments], 0, "", "")
+
+            with patch.object(daemon, "_launchctl", side_effect=fake_launchctl), patch.object(
+                daemon, "_health", return_value={"healthy": False}
+            ), patch.object(daemon, "HEALTH_TIMEOUT_SECONDS", 0.0):
+                with self.assertRaisesRegex(daemon.DaemonError, "did not become healthy"):
+                    daemon.install(config)
+
+            self.assertEqual(config.plist_path.read_bytes(), prior_plist)
+            self.assertTrue(loaded)
+
+    def test_failed_install_reports_health_and_cleanup_errors(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / "Wiki.app/Contents/Resources/wiki-backend-sidecar/wiki-backend"
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"new backend")
+            executable.chmod(0o755)
+            config = daemon.config_from_env(
+                overrides={
+                    "WIKI_APP_PATH": str(root / "Wiki.app"),
+                    "WIKI_LAUNCH_AGENTS_DIR": str(root / "LaunchAgents"),
+                }
+            )
+
+            def fake_launchctl(
+                _config: daemon.DaemonConfig, *arguments: str
+            ) -> subprocess.CompletedProcess[str]:
+                if arguments[0] == "print":
+                    return subprocess.CompletedProcess(
+                        ["launchctl", *arguments],
+                        113,
+                        "",
+                        daemon._service_absent_message(config),
+                    )
+                if arguments[0] == "bootout":
+                    return subprocess.CompletedProcess(
+                        ["launchctl", *arguments], 1, "", "cleanup failed"
+                    )
+                return subprocess.CompletedProcess(["launchctl", *arguments], 0, "", "")
+
+            with patch.object(daemon, "_launchctl", side_effect=fake_launchctl), patch.object(
+                daemon, "_health", return_value={"healthy": False}
+            ), patch.object(daemon, "HEALTH_TIMEOUT_SECONDS", 0.0):
+                with self.assertRaisesRegex(
+                    daemon.DaemonError, "did not become healthy.*cleanup failed"
+                ):
+                    daemon.install(config)
+            self.assertFalse(config.plist_path.exists())
 
 
 class DaemonHandshakeTests(unittest.TestCase):
@@ -499,6 +585,43 @@ class DaemonHandshakeTests(unittest.TestCase):
             ),
         ), socket.socket() as peer:
             self.assertFalse(native_server.is_trusted_tauri_peer(peer))
+
+    def test_selected_adhoc_bundle_identity_is_accepted(self) -> None:
+        with TemporaryDirectory() as tmp:
+            selected = Path(tmp) / "Wiki.app" / "Contents" / "MacOS" / "wiki-backend"
+            selected.parent.mkdir(parents=True)
+            selected.write_bytes(b"selected ad-hoc executable")
+            selected.chmod(0o755)
+            forged = Path(tmp) / "forged-wiki"
+            forged.write_bytes(b"forged ad-hoc executable")
+            forged.chmod(0o755)
+            details = "\n".join(
+                [
+                    "Identifier=com.hwang2409.wiki",
+                    "Signature=adhoc",
+                    "TeamIdentifier=not set",
+                    "CDHash=0123456789abcdef",
+                ]
+            )
+
+            def fake_run(arguments: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+                if len(arguments) > 1 and arguments[1] == "-dvvv":
+                    return subprocess.CompletedProcess(arguments, 0, "", details)
+                return subprocess.CompletedProcess(arguments, 0, "", "")
+
+            with patch.object(native_server, "_bundle_team_identifier", return_value=None), patch.object(
+                native_server, "_bundle_executable", return_value=selected
+            ), patch.object(native_server, "_peer_pid", return_value=123), patch.object(
+                native_server, "_peer_executable", return_value=selected
+            ), patch.object(native_server.subprocess, "run", side_effect=fake_run), socket.socket() as peer:
+                self.assertTrue(native_server.is_trusted_tauri_peer(peer))
+
+            with patch.object(native_server, "_bundle_team_identifier", return_value=None), patch.object(
+                native_server, "_bundle_executable", return_value=selected
+            ), patch.object(native_server, "_peer_pid", return_value=123), patch.object(
+                native_server, "_peer_executable", return_value=forged
+            ), patch.object(native_server.subprocess, "run", side_effect=fake_run), socket.socket() as peer:
+                self.assertFalse(native_server.is_trusted_tauri_peer(peer))
 
     def test_developer_signature_requires_team_and_designated_requirement(self) -> None:
         details = "\n".join(

@@ -9,6 +9,7 @@ use std::{
     os::fd::AsRawFd,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
+    process::Command,
     sync::Mutex,
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -31,13 +32,14 @@ const FINDER_SAFE_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/
 const HEALTH_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(350);
-const DAEMON_PROBE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const DAEMON_PROBE_WAIT_TIMEOUT: Duration = HEALTH_WAIT_TIMEOUT;
 const DAEMON_PROBE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
 const MAIN_WINDOW_LABEL: &str = "main";
 const WINDOW_TITLE: &str = "Wiki";
 const APP_LOCK_NAME: &str = "app.lock";
 const DEFAULT_DAEMON_URL: &str = "http://127.0.0.1:8213/";
+const DEFAULT_DAEMON_LABEL: &str = "com.hwang2409.wiki.backend";
 const EXPECTED_BACKEND_FINGERPRINT: &str = env!("WIKI_EXPECTED_BACKEND_FINGERPRINT");
 // Guard: WKWebView can defer this eval past the post-health navigate() when
 // the backend boots fast (onedir sidecar ~0.4s) — unguarded, the deferred
@@ -384,17 +386,16 @@ fn launch_backend_and_navigate(app: &AppHandle) {
     let launch_result = if let Ok(url) = env::var("WIKI_NATIVE_BACKEND_URL") {
         let launch_url = normalize_launch_url(&url);
         wait_for_health(app, &launch_url, None).map(|_| launch_url)
-    } else if let Some(launch_url) = probe_persistent_daemon() {
-        match daemon_handshake::read_secret(&runtime_dir()) {
-            Ok(secret) => {
+    } else {
+        match probe_persistent_daemon() {
+            Ok(Some((launch_url, secret))) => {
                 set_app_secret(app, secret);
                 set_daemon_managed(app, true);
                 Ok(launch_url)
             }
-            Err(_) => start_sidecar(app, 0),
+            Ok(None) => start_sidecar(app, 0),
+            Err(error) => Err(io::Error::other(error).into()),
         }
-    } else {
-        start_sidecar(app, 0)
     };
 
     match launch_result {
@@ -414,7 +415,10 @@ fn launch_backend_and_navigate(app: &AppHandle) {
     }
 }
 
-fn probe_persistent_daemon() -> Option<String> {
+fn probe_persistent_daemon() -> Result<Option<(String, String)>, String> {
+    if !daemon_may_be_starting() {
+        return Ok(None);
+    }
     let launch_url = normalize_launch_url(
         &env::var("WIKI_DAEMON_BACKEND_URL").unwrap_or_else(|_| DEFAULT_DAEMON_URL.to_string()),
     );
@@ -422,7 +426,7 @@ fn probe_persistent_daemon() -> Option<String> {
     let client = Client::builder()
         .timeout(DAEMON_PROBE_TIMEOUT)
         .build()
-        .ok()?;
+        .map_err(|error| format!("cannot create daemon health client: {error}"))?;
     let ready = retry_until_ready(
         || {
             let response = client.get(&health_url).send().ok()?;
@@ -444,12 +448,71 @@ fn probe_persistent_daemon() -> Option<String> {
             {
                 return None;
             }
-            Some(())
+            let secret = daemon_handshake::read_secret(&runtime_dir()).ok()?;
+            Some(secret)
         },
         DAEMON_PROBE_WAIT_TIMEOUT,
         DAEMON_PROBE_POLL_INTERVAL,
     );
-    ready.map(|_| launch_url)
+    ready
+        .map(|secret| Ok(Some((launch_url, secret))))
+        .unwrap_or_else(|| {
+            Err(format!(
+                "persistent daemon did not become ready at {health_url}"
+            ))
+        })
+}
+
+fn daemon_launchd_job_loaded() -> Option<bool> {
+    let target = format!("gui/{}/{}", unsafe { libc::getuid() }, DEFAULT_DAEMON_LABEL);
+    let output = Command::new("launchctl")
+        .args(["print", target.as_str()])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        return Some(true);
+    }
+    if output.status.code() == Some(113) {
+        return Some(false);
+    }
+    None
+}
+
+fn daemon_socket_is_live() -> bool {
+    let path = daemon_handshake::socket_path(&runtime_dir());
+    path.exists() && daemon_handshake::read_secret(&runtime_dir()).is_ok()
+}
+
+fn daemon_plist_exists() -> bool {
+    let launch_agents = env::var_os("WIKI_LAUNCH_AGENTS_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("HOME").map(|home| PathBuf::from(home).join("Library/LaunchAgents"))
+        });
+    launch_agents
+        .map(|directory| {
+            directory
+                .join(format!("{DEFAULT_DAEMON_LABEL}.plist"))
+                .is_file()
+        })
+        .unwrap_or(false)
+}
+
+fn daemon_probe_should_wait(
+    job_loaded: Option<bool>,
+    socket_live: bool,
+    plist_exists: bool,
+) -> bool {
+    job_loaded == Some(true) || socket_live || plist_exists
+}
+
+fn daemon_may_be_starting() -> bool {
+    let socket_live = daemon_socket_is_live();
+    daemon_probe_should_wait(
+        daemon_launchd_job_loaded(),
+        socket_live,
+        daemon_plist_exists(),
+    )
 }
 
 fn retry_until_ready<T, F>(mut probe: F, timeout: Duration, interval: Duration) -> Option<T>
@@ -469,9 +532,21 @@ where
 }
 
 fn set_app_secret(app: &AppHandle, secret: String) {
-    let app_state = app.state::<NativeAppState>();
-    let mut state = app_state.inner.lock().unwrap();
-    state.wiki_app_secret = Some(secret);
+    set_app_secret_state(&app.state::<NativeAppState>(), secret);
+}
+
+fn set_app_secret_state(state: &NativeAppState, secret: String) {
+    let mut guard = state.inner.lock().unwrap();
+    guard.wiki_app_secret = Some(secret);
+}
+
+fn refresh_daemon_secret(state: &NativeAppState) {
+    let daemon_managed = state.inner.lock().unwrap().daemon_managed;
+    if daemon_managed {
+        if let Ok(secret) = daemon_handshake::read_secret(&runtime_dir()) {
+            set_app_secret_state(state, secret);
+        }
+    }
 }
 
 fn set_daemon_managed(app: &AppHandle, daemon_managed: bool) {
@@ -784,16 +859,8 @@ fn app_origin(app: &AppHandle) -> Option<String> {
 /// Called by the webview via `invoke("get_wiki_app_secret")` to attach an
 /// `X-Wiki-App-Secret` header on composer requests. WIKI-148 round 6, Path B.
 #[tauri::command]
-pub fn get_wiki_app_secret(
-    app: AppHandle,
-    state: tauri::State<'_, NativeAppState>,
-) -> Result<String, String> {
-    let daemon_managed = state.inner.lock().unwrap().daemon_managed;
-    if daemon_managed {
-        if let Ok(secret) = daemon_handshake::read_secret(&runtime_dir()) {
-            set_app_secret(&app, secret);
-        }
-    }
+pub fn get_wiki_app_secret(state: tauri::State<'_, NativeAppState>) -> Result<String, String> {
+    refresh_daemon_secret(&state);
     let guard = state.inner.lock().unwrap();
     guard
         .wiki_app_secret
@@ -1001,6 +1068,15 @@ mod tests {
         );
         assert_eq!(result, Some("ready"));
         assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn persistent_daemon_probe_falls_back_when_not_loaded_and_socket_is_dead() {
+        assert!(!super::daemon_probe_should_wait(Some(false), false, false));
+        assert!(!super::daemon_probe_should_wait(None, false, false));
+        assert!(super::daemon_probe_should_wait(Some(true), false, false));
+        assert!(super::daemon_probe_should_wait(Some(false), true, false));
+        assert!(super::daemon_probe_should_wait(Some(false), false, true));
     }
 
     // WIKI-148 round 7: exercise the REAL Tauri IPC + ACL path for the
