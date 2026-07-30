@@ -55,6 +55,7 @@ export function PdfArtifactDetail({
   const [findValue, setFindValue] = useState("");
   const [textIndex, setTextIndex] = useState<PageTextIndex[]>([]);
   const [indexingState, setIndexingState] = useState<"idle" | "building" | "ready">("idle");
+  const indexingStartedRef = useRef(false);
   const [currentMatch, setCurrentMatch] = useState<number>(0);
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -69,6 +70,7 @@ export function PdfArtifactDetail({
     setTextIndex([]);
     setIndexingState("idle");
     setPageBaseSize(null);
+    indexingStartedRef.current = false;
   }, [url]);
 
   const handleReload = useCallback(() => {
@@ -150,7 +152,8 @@ export function PdfArtifactDetail({
   useEffect(() => {
     if (!findOpen) return;
     if (loadState.status !== "ready") return;
-    if (indexingState !== "idle") return;
+    if (indexingStartedRef.current) return;
+    indexingStartedRef.current = true;
     setIndexingState("building");
     let cancelled = false;
     (async () => {
@@ -176,7 +179,7 @@ export function PdfArtifactDetail({
     return () => {
       cancelled = true;
     };
-  }, [findOpen, indexingState, loadState]);
+  }, [findOpen, loadState]);
 
   const matches = useMemo<FindMatch[]>(
     () => (findValue && indexingState === "ready" ? findMatches(textIndex, findValue) : []),
