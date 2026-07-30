@@ -503,64 +503,76 @@ async function main() {
       }
     }
 
-    logStep("CLS: measure video frame reservation BEFORE and AFTER loadedmetadata");
-    // Reload and immediately (before metadata parses) capture the reserved
-    // frame rect. Then wait for `loadedmetadata` and capture again. The
-    // reserved aspect ratio is set inline on `.artifact-video-frame`, so
-    // both rects must match — this is the whole point of the aspect-ratio
-    // reservation. Round-3 review flagged that the previous CLS check ran
-    // both measurements AFTER metadata loaded, so it never actually
-    // confirmed the reservation prevented a shift.
-    await page.reload({ waitUntil: "domcontentloaded" });
-    await page.locator(".session-scroll").waitFor({ state: "visible" });
-    const clsMetric = await videoBlock
-      .locator(".artifact-video-frame")
-      .evaluate(async (node) => {
-        const video = node.querySelector("video");
-        // Capture the reserved rect BEFORE any metadata parse could
-        // possibly have completed. Snapshot straight away.
-        const before = node.getBoundingClientRect();
-        const preReadyState = video ? video.readyState : -1;
-        // Wait for loadedmetadata (or resolve immediately if it already fired).
-        await new Promise((resolve, reject) => {
+    logStep("CLS: measure video frame reservation BEFORE and AFTER loadedmetadata (route-delayed)");
+    // Round-4 review flagged that the previous CLS check ran the "pre-
+    // metadata" snapshot at preReadyState=4 — the fixture is 9 KB and
+    // Chromium had already parsed metadata by the time we measured.
+    // Intercept the video artifact request and DELAY the response so
+    // readyState provably stays at 0 when we snapshot. The test now
+    // asserts preReadyState < 1 to prove the measurement was pre-metadata.
+    const videoArtifactId = results[0].artifactId;
+    const videoRoutePattern = `${backend.baseUrl}/api/agents/${TICKET}/artifact/${videoArtifactId}`;
+    const CLS_DELAY_MS = 3500;
+    await page.route(videoRoutePattern, async (route) => {
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, CLS_DELAY_MS));
+      await route.continue();
+    });
+    try {
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await page.locator(".session-scroll").waitFor({ state: "visible" });
+      // Wait for the frame to mount but NOT for playback to be ready.
+      await videoBlock.locator(".artifact-video-frame").waitFor({ state: "visible" });
+      const clsMetric = await videoBlock
+        .locator(".artifact-video-frame")
+        .evaluate(async (node) => {
+          const video = node.querySelector("video");
           if (!video) {
-            reject(new Error("video element not found for CLS check"));
-            return;
+            throw new Error("video element not found for CLS check");
           }
-          if (video.readyState >= 1) {
-            resolve();
-            return;
-          }
-          const onLoaded = () => {
-            video.removeEventListener("loadedmetadata", onLoaded);
-            resolve();
+          // Snapshot IMMEDIATELY. The route delay keeps readyState low
+          // long enough for this snapshot to be genuinely pre-metadata.
+          const before = node.getBoundingClientRect();
+          const preReadyState = video.readyState;
+          // Wait for loadedmetadata; the route will release after the
+          // delay and metadata will parse then.
+          await new Promise((resolve, reject) => {
+            if (video.readyState >= 1) {
+              resolve();
+              return;
+            }
+            const onLoaded = () => {
+              video.removeEventListener("loadedmetadata", onLoaded);
+              resolve();
+            };
+            video.addEventListener("loadedmetadata", onLoaded, { once: true });
+            setTimeout(() => reject(new Error("CLS: loadedmetadata timeout")), 20000);
+          });
+          await new Promise((resolveRaf) => requestAnimationFrame(resolveRaf));
+          const after = node.getBoundingClientRect();
+          return {
+            preReadyState,
+            before: { top: before.top, left: before.left, width: before.width, height: before.height },
+            after: { top: after.top, left: after.left, width: after.width, height: after.height },
           };
-          video.addEventListener("loadedmetadata", onLoaded, { once: true });
-          try {
-            video.load();
-          } catch {
-            /* already loading */
-          }
-          setTimeout(() => reject(new Error("CLS: loadedmetadata timeout")), 15000);
         });
-        // Yield a paint before taking the AFTER rect.
-        await new Promise((resolve) => requestAnimationFrame(resolve));
-        const after = node.getBoundingClientRect();
-        return {
-          preReadyState,
-          before: { top: before.top, left: before.left, width: before.width, height: before.height },
-          after: { top: after.top, left: after.left, width: after.width, height: after.height },
-        };
-      });
-    const topDelta = Math.abs(clsMetric.after.top - clsMetric.before.top);
-    const heightDelta = Math.abs(clsMetric.after.height - clsMetric.before.height);
-    const widthDelta = Math.abs(clsMetric.after.width - clsMetric.before.width);
-    // 0.5px tolerance covers sub-pixel rounding; a genuine reserve failure
-    // shifts by dozens of pixels the moment videoWidth/Height land.
-    if (topDelta > 0.5 || heightDelta > 0.5 || widthDelta > 0.5) {
-      throw new Error(
-        `CLS: layout shifted between pre-metadata and post-metadata: dTop=${topDelta} dHeight=${heightDelta} dWidth=${widthDelta} (preReadyState=${clsMetric.preReadyState}, before=${JSON.stringify(clsMetric.before)}, after=${JSON.stringify(clsMetric.after)})`,
-      );
+      // Reviewer's ask: assert the pre-metadata snapshot ACTUALLY ran
+      // pre-metadata. HAVE_METADATA is 1 — anything < 1 (HAVE_NOTHING=0)
+      // proves the route delay held the fetch back.
+      if (!(clsMetric.preReadyState < 1)) {
+        throw new Error(
+          `CLS pre-measurement was not pre-metadata: preReadyState=${clsMetric.preReadyState} (expected < 1)`,
+        );
+      }
+      const topDelta = Math.abs(clsMetric.after.top - clsMetric.before.top);
+      const heightDelta = Math.abs(clsMetric.after.height - clsMetric.before.height);
+      const widthDelta = Math.abs(clsMetric.after.width - clsMetric.before.width);
+      if (topDelta > 0.5 || heightDelta > 0.5 || widthDelta > 0.5) {
+        throw new Error(
+          `CLS: layout shifted between pre-metadata and post-metadata: dTop=${topDelta} dHeight=${heightDelta} dWidth=${widthDelta} (preReadyState=${clsMetric.preReadyState}, before=${JSON.stringify(clsMetric.before)}, after=${JSON.stringify(clsMetric.after)})`,
+        );
+      }
+    } finally {
+      await page.unroute(videoRoutePattern);
     }
 
     logStep("in-page transcript-toggle churn must not leak media elements");

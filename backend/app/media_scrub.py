@@ -72,64 +72,157 @@ def scrub_audio(data: bytes, mime: str) -> MediaScrubResult:
 # MP4 / ISO Base Media File Format
 # ---------------------------------------------------------------------------
 #
-# ISOBMFF containers are a sequence of atoms:
-#     [4-byte big-endian size][4-byte type][payload...]
-# with size == 1 meaning a 64-bit size follows, size == 0 meaning run-to-EOF.
+# Round-5 review: in-place byte surgery on the raw MP4 kept spawning
+# boundary bugs (trailing bytes past declared entries, out-of-chain
+# atoms surviving, unknown-type atoms slipping through). Replaced with
+# structural reconstruction — the stored file is emitted from the parsed
+# atom tree, and ONLY atoms reached via the canonical ISOBMFF chain are
+# written back:
 #
-# The playback-critical tables inside `moov` (specifically stco/co64) point
-# at ABSOLUTE file offsets. Any strip that changes moov's size shifts every
-# subsequent atom and invalidates those offsets — fast-start MP4s (moov
-# ahead of mdat) then fail to decode. We therefore do NOT resize any atom:
-# for every metadata atom (top-level and nested), we overwrite the 4-byte
-# type with `free` and zero the payload. `free` atoms are officially padding
-# that every decoder skips — bytes stay in place, offsets stay valid.
+#     ftyp
+#     moov -> mvhd + trak+ (each trak -> tkhd + edts? + mdia
+#                             mdia  -> mdhd + hdlr + minf
+#                             minf  -> vmhd/smhd/nmhd/hmhd/dinf + stbl
+#                             stbl  -> stsd + (stts, stsc, stco, co64, stsz, …)
+#                             stsd  -> re-emitted from parsed sample entries)
+#     mdat, moof, sidx, styp, mfra    (played back as-is; carry no metadata)
+#     everything else at the top level -> replaced with a `free` box of
+#                                        the same length
 #
-# We validate structure at the same time: a real MP4 must have `ftyp` at
-# the head and `moov` containing at least one `mvhd` and one `trak`.
+# The last rule preserves the absolute byte offsets that stco/co64
+# entries inside stbl point at (mdat sample offsets must survive). To
+# keep the moov atom the same total size after we drop metadata
+# children, we also emit a `free` box inside moov whose length exactly
+# fills the shrinkage. Nothing else about the file layout changes.
+#
+# Unknown atoms, trailing bytes past declared entry counts, and boxes
+# stashed outside their canonical parent cannot survive because they
+# are never written by the emitter.
 
-_MP4_STRIP_TYPES: Final = {b"udta", b"meta", b"free", b"skip", b"uuid"}
+
+@dataclass(frozen=True)
+class _Mp4Atom:
+    start: int
+    size: int
+    header_len: int
+    type: bytes
+    body_start: int
+    body_end: int
+
+
+_MP4_TOPLEVEL_PLAYBACK: Final = {
+    b"moov", b"mdat", b"moof", b"sidx", b"styp", b"mfra", b"skip",
+}
+_MP4_MOOV_KEEP: Final = {b"mvhd", b"trak", b"mvex"}
+_MP4_TRAK_KEEP: Final = {b"tkhd", b"edts", b"mdia"}
+_MP4_MDIA_KEEP: Final = {b"mdhd", b"hdlr", b"minf"}
+_MP4_MINF_KEEP: Final = {b"vmhd", b"smhd", b"nmhd", b"hmhd", b"dinf", b"stbl"}
+_MP4_STBL_KEEP: Final = {
+    b"stsd", b"stts", b"ctts", b"cslg", b"stsc", b"stco", b"co64",
+    b"stsz", b"stz2", b"stss", b"stsh", b"sdtp", b"sbgp", b"sgpd",
+    b"subs", b"saiz", b"saio", b"padb",
+}
+_MP4_FREE_MIN_SIZE: Final = 8  # a `free` box header alone is 8 bytes
+
+
+def _mp4_parse_container(data: bytes, offset: int, end: int) -> list[_Mp4Atom]:
+    """Parse a container's direct children. Raises on any malformed size."""
+    view = memoryview(data)
+    atoms: list[_Mp4Atom] = []
+    while offset < end:
+        size, atom_type, header_len, atom_end = _mp4_read_header(view, offset, end)
+        atoms.append(
+            _Mp4Atom(
+                start=offset,
+                size=size,
+                header_len=header_len,
+                type=atom_type,
+                body_start=offset + header_len,
+                body_end=atom_end,
+            )
+        )
+        offset = atom_end
+    return atoms
+
+
+def _mp4_pack(atom_type: bytes, body: bytes) -> bytes:
+    """Emit a fresh 32-bit-sized atom. Callers must keep total < 2**32."""
+    total = 8 + len(body)
+    if total > 0xFFFFFFFF:  # pragma: no cover — enforced by upstream 40 MB cap
+        raise MediaScrubError("mp4 rebuilt atom size overflows 32 bits")
+    return struct.pack(">I", total) + atom_type + body
+
+
+def _mp4_free(total_size: int) -> bytes:
+    """Emit a `free` box that occupies exactly `total_size` bytes."""
+    if total_size < _MP4_FREE_MIN_SIZE:
+        raise MediaScrubError(
+            f"mp4 free padding requires ≥{_MP4_FREE_MIN_SIZE} bytes, got {total_size}"
+        )
+    return struct.pack(">I", total_size) + b"free" + b"\x00" * (total_size - _MP4_FREE_MIN_SIZE)
 
 
 def _scrub_mp4(data: bytes) -> MediaScrubResult:
     if len(data) < 16:
         raise MediaScrubError("mp4 payload too small")
-    if data[4:8] != b"ftyp":
+
+    top_atoms = _mp4_parse_container(data, 0, len(data))
+    if not top_atoms or top_atoms[0].type != b"ftyp":
         raise MediaScrubError("mp4 payload missing ftyp box at offset 0")
 
-    out = bytearray(data)
-    view = memoryview(out)
-    duration_ms: int | None = None
-    dims: tuple[int, int] | None = None
+    out_parts: list[bytes] = [data[top_atoms[0].start:top_atoms[0].body_end]]
     moov_seen = False
     trak_seen = False
     mvhd_seen = False
-    stsd_sample_entry_seen = False
+    stsd_ok = False
+    duration_ms: int | None = None
+    dims: tuple[int, int] | None = None
 
-    offset = 0
-    end = len(out)
-    while offset < end:
-        atom_size, atom_type, header_len, atom_end = _mp4_read_header(view, offset, end)
-        if atom_type in _MP4_STRIP_TYPES:
-            _mp4_nullify(view, offset + 4, header_len, atom_end)
-            offset = atom_end
-            continue
-        if atom_type == b"moov":
+    for atom in top_atoms[1:]:
+        if atom.type == b"ftyp":
+            raise MediaScrubError("mp4 duplicate ftyp box")
+        if atom.type == b"moov":
+            if moov_seen:
+                raise MediaScrubError("mp4 duplicate moov box")
             moov_seen = True
-            trak_in_moov, mvhd_in_moov, stsd_ok = _mp4_scrub_container(
-                view, offset + header_len, atom_end, parent=b"moov",
-            )
-            trak_seen = trak_seen or trak_in_moov
-            mvhd_seen = mvhd_seen or mvhd_in_moov
-            stsd_sample_entry_seen = stsd_sample_entry_seen or stsd_ok
-            if duration_ms is None:
-                duration_ms = _mp4_extract_moov_duration(
-                    bytes(view[offset + header_len:atom_end]),
-                )
-            if dims is None:
-                dims = _mp4_extract_moov_dims(
-                    bytes(view[offset + header_len:atom_end]),
-                )
-        offset = atom_end
+            moov_payload = data[atom.body_start:atom.body_end]
+            duration_ms = _mp4_extract_moov_duration(moov_payload)
+            dims = _mp4_extract_moov_dims(moov_payload)
+            rebuilt_body, tr, mv, st = _mp4_rewrite_moov(data, atom.body_start, atom.body_end)
+            trak_seen |= tr
+            mvhd_seen |= mv
+            stsd_ok |= st
+            rebuilt = _mp4_pack(b"moov", rebuilt_body)
+            delta = atom.size - len(rebuilt)
+            if delta < 0:
+                # Reconstruction should never grow moov (we only drop).
+                # Refusing here means a fixture went out of contract.
+                raise MediaScrubError("mp4 rebuilt moov exceeds original size")
+            if delta > 0:
+                # Pad the moov body with a `free` child of exactly `delta`
+                # bytes so the total moov size matches the original. This
+                # keeps every stco/co64 sample-offset inside stbl valid
+                # without having to rewrite offsets — the free box is a
+                # first-class ISOBMFF construct that decoders skip past.
+                padded_body = rebuilt_body + _mp4_free(delta)
+                rebuilt = _mp4_pack(b"moov", padded_body)
+            if len(rebuilt) != atom.size:
+                raise MediaScrubError("mp4 rebuilt moov size mismatch after padding")
+            out_parts.append(rebuilt)
+        elif atom.type == b"mdat":
+            # Sample data — passes through untouched; stco/co64 point here.
+            out_parts.append(data[atom.start:atom.body_end])
+        elif atom.type in _MP4_TOPLEVEL_PLAYBACK:
+            # Fragmented playback / auxiliary boxes; no metadata carried
+            # here in practice, and their internal offsets are relative.
+            out_parts.append(data[atom.start:atom.body_end])
+        else:
+            # Everything else — udta, meta, uuid, and any wholly unknown
+            # top-level atom — becomes a same-size `free` box. That
+            # destroys the payload bytes AND preserves file layout so
+            # any absolute-offset table pointing past this atom stays
+            # valid.
+            out_parts.append(_mp4_free(atom.size))
 
     if not moov_seen:
         raise MediaScrubError("mp4 payload missing moov box")
@@ -137,18 +230,14 @@ def _scrub_mp4(data: bytes) -> MediaScrubResult:
         raise MediaScrubError("mp4 moov missing mvhd box")
     if not trak_seen:
         raise MediaScrubError("mp4 moov missing trak box")
-    if not stsd_sample_entry_seen:
-        # A fake moov/mvhd/trak with no stbl/stsd/sample entry would let a
-        # tagged text blob masquerade as MP4. Reject unless the full ISOBMFF
-        # chain trak -> mdia -> minf -> stbl -> stsd is present AND every
-        # declared sample entry in stsd parses cleanly.
+    if not stsd_ok:
         raise MediaScrubError(
             "mp4 trak missing valid stbl/stsd sample entry (full chain required)"
         )
 
     width, height = dims if dims is not None else (None, None)
     return MediaScrubResult(
-        data=bytes(out),
+        data=b"".join(out_parts),
         mime="video/mp4",
         duration_ms=duration_ms,
         width=width,
@@ -181,105 +270,129 @@ def _mp4_read_header(
     return size, atom_type, header_len, atom_end
 
 
-def _mp4_nullify(view: memoryview, type_offset: int, header_len: int, atom_end: int) -> None:
-    """Overwrite atom type with `free` and zero the payload — no size change."""
-    view[type_offset:type_offset + 4] = b"free"
-    payload_start = type_offset + header_len - 4
-    for i in range(payload_start, atom_end):
-        view[i] = 0
-
-
-def _mp4_scrub_container(
-    view: memoryview,
-    payload_start: int,
-    container_end: int,
-    *,
-    parent: bytes = b"",
-) -> tuple[bool, bool, bool]:
-    """Recursively nullify metadata atoms in a container.
-
-    Returns (trak_seen, mvhd_seen, stsd_sample_entry_seen).
-
-    The `parent` context lets us enforce the mandated ISOBMFF chain
-    trak -> mdia -> minf -> stbl -> stsd for stsd hits: a stsd atom
-    stashed anywhere else is ignored so a hostile fixture cannot
-    manufacture a stream descriptor outside its structural home.
-    """
+def _mp4_rewrite_moov(
+    data: bytes, body_start: int, body_end: int,
+) -> tuple[bytes, bool, bool, bool]:
+    """Emit only mvhd, trak, and mvex children. Return (body, trak_seen, mvhd_seen, stsd_ok)."""
+    atoms = _mp4_parse_container(data, body_start, body_end)
+    parts: list[bytes] = []
     trak_seen = False
     mvhd_seen = False
     stsd_ok = False
-    offset = payload_start
-    while offset < container_end:
-        _size, atom_type, header_len, atom_end = _mp4_read_header(
-            view, offset, container_end,
-        )
-        if atom_type in _MP4_STRIP_TYPES:
-            _mp4_nullify(view, offset + 4, header_len, atom_end)
-            offset = atom_end
-            continue
-        if atom_type == b"trak" and parent == b"moov":
-            trak_seen = True
-        if atom_type == b"mvhd" and parent == b"moov":
+    for atom in atoms:
+        if atom.type == b"mvhd":
             mvhd_seen = True
-        if atom_type == b"stsd" and parent == b"stbl":
-            # Walk EVERY declared entry, not just entry_count > 0. A
-            # truncated stsd or an entry whose size runs past the atom
-            # end would let a bogus descriptor slip through.
-            if _mp4_stsd_has_valid_sample_entry(
-                view, offset + header_len, atom_end,
-            ):
+            parts.append(data[atom.start:atom.body_end])
+        elif atom.type == b"trak":
+            trak_body, stsd_in_trak = _mp4_rewrite_trak(data, atom.body_start, atom.body_end)
+            trak_seen = True
+            stsd_ok |= stsd_in_trak
+            parts.append(_mp4_pack(b"trak", trak_body))
+        elif atom.type == b"mvex":
+            parts.append(data[atom.start:atom.body_end])
+        # every other child (udta, meta, uuid, iods, hoisted anything) — drop
+    return b"".join(parts), trak_seen, mvhd_seen, stsd_ok
+
+
+def _mp4_rewrite_trak(
+    data: bytes, body_start: int, body_end: int,
+) -> tuple[bytes, bool]:
+    atoms = _mp4_parse_container(data, body_start, body_end)
+    parts: list[bytes] = []
+    stsd_ok = False
+    for atom in atoms:
+        if atom.type in (b"tkhd", b"edts"):
+            parts.append(data[atom.start:atom.body_end])
+        elif atom.type == b"mdia":
+            mdia_body, stsd_in_mdia = _mp4_rewrite_mdia(data, atom.body_start, atom.body_end)
+            parts.append(_mp4_pack(b"mdia", mdia_body))
+            stsd_ok |= stsd_in_mdia
+    return b"".join(parts), stsd_ok
+
+
+def _mp4_rewrite_mdia(
+    data: bytes, body_start: int, body_end: int,
+) -> tuple[bytes, bool]:
+    atoms = _mp4_parse_container(data, body_start, body_end)
+    parts: list[bytes] = []
+    stsd_ok = False
+    for atom in atoms:
+        if atom.type in (b"mdhd", b"hdlr"):
+            parts.append(data[atom.start:atom.body_end])
+        elif atom.type == b"minf":
+            minf_body, stsd_in_minf = _mp4_rewrite_minf(data, atom.body_start, atom.body_end)
+            parts.append(_mp4_pack(b"minf", minf_body))
+            stsd_ok |= stsd_in_minf
+    return b"".join(parts), stsd_ok
+
+
+def _mp4_rewrite_minf(
+    data: bytes, body_start: int, body_end: int,
+) -> tuple[bytes, bool]:
+    atoms = _mp4_parse_container(data, body_start, body_end)
+    parts: list[bytes] = []
+    stsd_ok = False
+    for atom in atoms:
+        if atom.type in (b"vmhd", b"smhd", b"nmhd", b"hmhd", b"dinf"):
+            parts.append(data[atom.start:atom.body_end])
+        elif atom.type == b"stbl":
+            stbl_body, stsd_in_stbl = _mp4_rewrite_stbl(data, atom.body_start, atom.body_end)
+            parts.append(_mp4_pack(b"stbl", stbl_body))
+            stsd_ok |= stsd_in_stbl
+    return b"".join(parts), stsd_ok
+
+
+def _mp4_rewrite_stbl(
+    data: bytes, body_start: int, body_end: int,
+) -> tuple[bytes, bool]:
+    atoms = _mp4_parse_container(data, body_start, body_end)
+    parts: list[bytes] = []
+    stsd_ok = False
+    for atom in atoms:
+        if atom.type == b"stsd":
+            stsd_body = _mp4_rewrite_stsd(data, atom.body_start, atom.body_end)
+            if stsd_body is not None:
+                parts.append(_mp4_pack(b"stsd", stsd_body))
                 stsd_ok = True
-        if atom_type in {b"moov", b"trak", b"mdia", b"minf", b"stbl"}:
-            child_trak, child_mvhd, child_stsd = _mp4_scrub_container(
-                view, offset + header_len, atom_end, parent=atom_type,
-            )
-            trak_seen = trak_seen or child_trak
-            mvhd_seen = mvhd_seen or child_mvhd
-            stsd_ok = stsd_ok or child_stsd
-        offset = atom_end
-    return trak_seen, mvhd_seen, stsd_ok
+        elif atom.type in _MP4_STBL_KEEP:
+            parts.append(data[atom.start:atom.body_end])
+    return b"".join(parts), stsd_ok
 
 
-def _mp4_stsd_has_valid_sample_entry(
-    view: memoryview, payload_start: int, atom_end: int,
-) -> bool:
-    """Return True iff stsd declares ≥1 entry and every entry parses cleanly.
+def _mp4_rewrite_stsd(
+    data: bytes, body_start: int, body_end: int,
+) -> bytes | None:
+    """Emit the version/flags header + entry count + fully-parsed entries.
 
-    stsd payload layout: 1 byte version, 3 flag bytes, uint32 entry_count,
-    then N sample-entry boxes each shaped like [uint32 size][4 type][body].
-    Every entry's size field is validated against the remaining stsd bytes
-    before we advance — a truncated or oversized entry causes rejection
-    (return False), which the caller escalates to a whole-file reject.
+    Any bytes past the last declared entry (attacker markers, misaligned
+    padding) are simply not written to the output — they cannot survive.
+    Returns None if the descriptor is unparseable; caller treats that as
+    "no valid stsd" and the whole-file check fails.
     """
-    if payload_start + 8 > atom_end:
-        return False
-    entry_count = struct.unpack(
-        ">I", bytes(view[payload_start + 4:payload_start + 8]),
-    )[0]
+    payload = data[body_start:body_end]
+    if len(payload) < 8:
+        return None
+    version_flags = payload[:4]
+    entry_count = struct.unpack(">I", payload[4:8])[0]
     if entry_count == 0:
-        return False
-    # Cap entry_count against remaining bytes: the smallest legal sample
-    # entry is 8 bytes (size + type), so more entries than that would fit
-    # is nonsense.
-    remaining = atom_end - (payload_start + 8)
+        return None
+    remaining = len(payload) - 8
     if entry_count > remaining // 8:
-        return False
-    offset = payload_start + 8
+        return None
+    entries: list[bytes] = []
+    offset = 8
     for _ in range(entry_count):
-        if offset + 8 > atom_end:
-            return False
-        entry_size = struct.unpack(">I", bytes(view[offset:offset + 4]))[0]
-        entry_type = bytes(view[offset + 4:offset + 8])
-        # Sample-entry types are 4 ASCII bytes (avc1, mp4a, hev1, …). A
-        # null or all-zero type is meaningless.
+        if offset + 8 > len(payload):
+            return None
+        entry_size = struct.unpack(">I", payload[offset:offset + 4])[0]
+        entry_type = payload[offset + 4:offset + 8]
         if entry_type == b"\x00\x00\x00\x00":
-            return False
-        # Reject 64-bit and run-to-EOF entry sizes inside stsd — the spec
-        # only permits fixed uint32 entry sizes here.
-        if entry_size < 8 or offset + entry_size > atom_end:
-            return False
+            return None
+        if entry_size < 8 or offset + entry_size > len(payload):
+            return None
+        entries.append(payload[offset:offset + entry_size])
         offset += entry_size
-    return offset <= atom_end
+    return version_flags + struct.pack(">I", len(entries)) + b"".join(entries)
 
 
 def _mp4_extract_moov_duration(moov_payload: bytes) -> int | None:
@@ -482,24 +595,19 @@ def _gif_walk_subblocks(
 # WAV (RIFF/WAVE)
 # ---------------------------------------------------------------------------
 #
-# WAV is a chunk-based container. Playback needs `fmt ` and `data` (and
-# optionally `fact`). Any other chunk may carry metadata — LIST/INFO,
-# bext (broadcast wave), iXML (production XML), _PMX (XMP), aXML, cue,
-# etc. Rather than maintain a strip list, we allowlist the playback-safe
-# chunks and drop everything else. Peaks are computed streaming from the
-# `data` chunk using memoryview slices — no per-sample allocation.
+# Round-5 review: in-place scrub silently accepted files whose RIFF size
+# undercounted trailing bytes and odd-sized chunks whose pad byte lived
+# past the RIFF boundary. Replaced with structural reconstruction: parse
+# every chunk under a validated RIFF size, keep only fmt/data/fact, then
+# emit the file from scratch with computed sizes and correct padding.
+# Nothing outside the parsed structure can survive because nothing else
+# is written.
 
 _WAV_KEEP_CHUNKS: Final = {b"fmt ", b"data", b"fact"}
-# Allow only decoder-reachable format codes: 1 = PCM, 3 = IEEE float,
-# 0xFFFE = WAVE_FORMAT_EXTENSIBLE (real codec identified by SubFormat GUID).
-# Format code 0 (WAVE_FORMAT_UNKNOWN) or anything else is refused — the
-# reviewer flagged that fmt_code == 0 currently slips through as unplayable.
 _WAV_FORMAT_PCM: Final = 1
 _WAV_FORMAT_IEEE_FLOAT: Final = 3
 _WAV_FORMAT_EXTENSIBLE: Final = 0xFFFE
 _WAV_ALLOWED_FORMATS: Final = {_WAV_FORMAT_PCM, _WAV_FORMAT_IEEE_FLOAT}
-# KSDATAFORMAT_SUBTYPE_PCM / _IEEE_FLOAT — the extensible SubFormat GUID
-# must resolve to one of these for us to trust the container.
 _WAV_KSDATAFORMAT_PCM: Final = (
     b"\x01\x00\x00\x00\x00\x00\x10\x00\x80\x00\x00\xaa\x00\x38\x9b\x71"
 )
@@ -514,116 +622,131 @@ def _scrub_wav(data: bytes) -> MediaScrubResult:
     if data[:4] != b"RIFF" or data[8:12] != b"WAVE":
         raise MediaScrubError("wav payload missing RIFF/WAVE header")
 
-    kept = bytearray(b"RIFF____WAVE")
-    duration_ms: int | None = None
-    peaks: list[int] | None = None
-    sample_rate = 0
-    byte_rate = 0
-    channels = 0
-    bits = 0
+    # RIFF size covers every byte after itself: 4 bytes for "WAVE" plus
+    # every chunk. Any mismatch — undercount (trailing attacker bytes past
+    # RIFF end) OR overcount (RIFF claims bytes we don't have) — is
+    # sufficient to reject the file. We refuse to guess where the "real"
+    # end lies.
+    declared_riff_size = struct.unpack("<I", data[4:8])[0]
+    if declared_riff_size + 8 != len(data):
+        raise MediaScrubError(
+            f"wav RIFF size {declared_riff_size} + 8 does not match payload length {len(data)}"
+        )
+
+    fmt_payload: bytes | None = None
+    data_payload: bytes | None = None
+    fact_payload: bytes | None = None
 
     offset = 12
     end = len(data)
-    fmt_seen = False
-    data_bytes = 0
-    while offset + 8 <= end:
+    while offset < end:
+        if offset + 8 > end:
+            raise MediaScrubError("wav chunk header truncated inside RIFF")
         chunk_id = data[offset:offset + 4]
         chunk_size = struct.unpack("<I", data[offset + 4:offset + 8])[0]
         payload_start = offset + 8
         payload_end = payload_start + chunk_size
         if payload_end > end:
-            raise MediaScrubError("wav chunk extends past payload")
+            raise MediaScrubError("wav chunk extends past RIFF end")
         pad = chunk_size & 1
-        if chunk_id not in _WAV_KEEP_CHUNKS:
-            offset = payload_end + pad
-            continue
+        if pad and payload_end + pad > end:
+            # Odd-sized chunk whose mandatory pad byte lives outside RIFF.
+            raise MediaScrubError("wav odd chunk missing pad byte inside RIFF")
+        payload = data[payload_start:payload_end]
         if chunk_id == b"fmt ":
-            if chunk_size < 16:
-                raise MediaScrubError("wav fmt chunk too short")
-            format_code = struct.unpack(
-                "<H", data[payload_start:payload_start + 2],
-            )[0]
-            channels = struct.unpack(
-                "<H", data[payload_start + 2:payload_start + 4],
-            )[0]
-            sample_rate = struct.unpack(
-                "<I", data[payload_start + 4:payload_start + 8],
-            )[0]
-            byte_rate = struct.unpack(
-                "<I", data[payload_start + 8:payload_start + 12],
-            )[0]
-            bits = struct.unpack(
-                "<H", data[payload_start + 14:payload_start + 16],
-            )[0]
-            if format_code == _WAV_FORMAT_EXTENSIBLE:
-                # WAVE_FORMAT_EXTENSIBLE layout after the shared 16 bytes:
-                # cbSize (2) tells the extension length; the extensible
-                # extension is exactly 22 bytes (valid_bits(2) + channel_mask(4)
-                # + SubFormat GUID(16)). We validate cbSize BEFORE reading
-                # the SubFormat so a PCM GUID pointer that runs past the
-                # chunk cannot pass — round-3 review flagged that cbSize
-                # was ignored entirely, letting an extension-shaped fmt
-                # with cbSize=0 slip through.
-                if chunk_size < 18:
-                    raise MediaScrubError(
-                        "wav extensible fmt chunk missing cbSize field"
-                    )
-                cb_size = struct.unpack(
-                    "<H", data[payload_start + 16:payload_start + 18],
-                )[0]
-                if cb_size < 22:
-                    raise MediaScrubError(
-                        f"wav extensible cbSize {cb_size} smaller than the 22-byte extension"
-                    )
-                extension_end = payload_start + 18 + cb_size
-                if extension_end > payload_end:
-                    raise MediaScrubError(
-                        "wav extensible extension extends past fmt chunk"
-                    )
-                if chunk_size < 40:
-                    raise MediaScrubError(
-                        "wav extensible fmt chunk too short for SubFormat"
-                    )
-                subformat = data[payload_start + 24:payload_start + 40]
-                if subformat not in (
-                    _WAV_KSDATAFORMAT_PCM, _WAV_KSDATAFORMAT_IEEE_FLOAT,
-                ):
-                    raise MediaScrubError(
-                        f"wav SubFormat GUID {subformat.hex()} is not PCM or float"
-                    )
-            elif format_code not in _WAV_ALLOWED_FORMATS:
-                raise MediaScrubError(
-                    f"wav format code {format_code} is not PCM (1), float (3), or extensible"
-                )
-            fmt_seen = True
+            if fmt_payload is not None:
+                raise MediaScrubError("wav duplicate fmt chunk")
+            _wav_validate_fmt(payload)
+            fmt_payload = payload
         elif chunk_id == b"data":
-            data_bytes = chunk_size
-            if fmt_seen:
-                peaks = _wav_stream_peaks(
-                    data, payload_start, payload_end, channels, bits,
-                )
-        kept.extend(data[offset:payload_end + pad])
+            if data_payload is not None:
+                raise MediaScrubError("wav duplicate data chunk")
+            data_payload = payload
+        elif chunk_id == b"fact":
+            if fact_payload is not None:
+                raise MediaScrubError("wav duplicate fact chunk")
+            fact_payload = payload
+        # All other chunks are dropped — never written to the output.
         offset = payload_end + pad
 
-    if not fmt_seen:
+    if fmt_payload is None:
         raise MediaScrubError("wav payload missing fmt chunk")
-    if data_bytes == 0:
+    if data_payload is None or len(data_payload) == 0:
         raise MediaScrubError("wav payload missing data chunk")
-    if byte_rate and data_bytes:
+
+    channels, sample_rate, byte_rate, bits = _wav_fmt_fields(fmt_payload)
+    data_bytes = len(data_payload)
+    if byte_rate:
         duration_ms = int(round(data_bytes * 1000 / byte_rate))
-    elif sample_rate and channels and bits and data_bytes:
+    elif sample_rate and channels and bits:
         frames = data_bytes // max(1, (channels * bits // 8))
-        duration_ms = int(round(frames * 1000 / sample_rate))
-    new_size = len(kept) - 8
-    kept[4:8] = struct.pack("<I", new_size)
+        duration_ms = int(round(frames * 1000 / sample_rate)) if frames else 0
+    else:
+        duration_ms = None
+    peaks = _wav_stream_peaks(data_payload, 0, len(data_payload), channels, bits)
+
+    # Emit chunks in canonical playback order (fmt, fact?, data). Every
+    # chunk carries its computed length + its own pad byte. Nothing outside
+    # this list can survive because nothing else is written.
+    body = bytearray(b"WAVE")
+    _wav_emit_chunk(body, b"fmt ", fmt_payload)
+    if fact_payload is not None:
+        _wav_emit_chunk(body, b"fact", fact_payload)
+    _wav_emit_chunk(body, b"data", data_payload)
+    riff = bytearray(b"RIFF")
+    riff += struct.pack("<I", len(body))
+    riff += body
     return MediaScrubResult(
-        data=bytes(kept),
+        data=bytes(riff),
         mime="audio/wav",
         duration_ms=duration_ms,
         width=None,
         height=None,
         peaks=peaks,
     )
+
+
+def _wav_emit_chunk(body: bytearray, chunk_id: bytes, payload: bytes) -> None:
+    body.extend(chunk_id)
+    body.extend(struct.pack("<I", len(payload)))
+    body.extend(payload)
+    if len(payload) & 1:
+        body.append(0)
+
+
+def _wav_fmt_fields(payload: bytes) -> tuple[int, int, int, int]:
+    channels = struct.unpack("<H", payload[2:4])[0]
+    sample_rate = struct.unpack("<I", payload[4:8])[0]
+    byte_rate = struct.unpack("<I", payload[8:12])[0]
+    bits = struct.unpack("<H", payload[14:16])[0]
+    return channels, sample_rate, byte_rate, bits
+
+
+def _wav_validate_fmt(payload: bytes) -> None:
+    if len(payload) < 16:
+        raise MediaScrubError("wav fmt chunk too short")
+    format_code = struct.unpack("<H", payload[:2])[0]
+    if format_code == _WAV_FORMAT_EXTENSIBLE:
+        if len(payload) < 18:
+            raise MediaScrubError("wav extensible fmt chunk missing cbSize field")
+        cb_size = struct.unpack("<H", payload[16:18])[0]
+        if cb_size < 22:
+            raise MediaScrubError(
+                f"wav extensible cbSize {cb_size} smaller than the 22-byte extension"
+            )
+        if 18 + cb_size > len(payload):
+            raise MediaScrubError("wav extensible extension extends past fmt chunk")
+        if len(payload) < 40:
+            raise MediaScrubError("wav extensible fmt chunk too short for SubFormat")
+        subformat = payload[24:40]
+        if subformat not in (_WAV_KSDATAFORMAT_PCM, _WAV_KSDATAFORMAT_IEEE_FLOAT):
+            raise MediaScrubError(
+                f"wav SubFormat GUID {subformat.hex()} is not PCM or float"
+            )
+    elif format_code not in _WAV_ALLOWED_FORMATS:
+        raise MediaScrubError(
+            f"wav format code {format_code} is not PCM (1), float (3), or extensible"
+        )
 
 
 def _wav_stream_peaks(

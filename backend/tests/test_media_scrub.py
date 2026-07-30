@@ -568,6 +568,26 @@ class Mp4Stbl_stsdStructuralTests(unittest.TestCase):
         with self.assertRaisesRegex(media_scrub.MediaScrubError, "stbl/stsd"):
             media_scrub.scrub_video(self._make_mp4_with_stsd(stsd_body), "video/mp4")
 
+    def test_trailing_bytes_after_last_stsd_entry_are_dropped_by_reconstruction(self) -> None:
+        # Round-5 reviewer's regression: an attacker marker placed AFTER
+        # the last declared stsd entry survived in-place scrub. Under
+        # reconstruction, we only emit what we parsed — trailing bytes
+        # cannot appear in the output.
+        marker = b"round5-reviewer-marker-must-not-survive"
+        # A valid 8-byte sample entry (size=8, type="avc1") + trailing bytes.
+        stsd_body = (
+            b"\x00\x00\x00\x00"                    # version+flags
+            + struct.pack(">I", 1)                 # entry_count = 1
+            + struct.pack(">I", 8) + b"avc1"       # the single sample entry
+            + marker                               # attacker trailer
+        )
+        payload = self._make_mp4_with_stsd(stsd_body)
+        # Sanity: marker WAS in the original bytes.
+        self.assertIn(marker, payload)
+        result = media_scrub.scrub_video(payload, "video/mp4")
+        # Reconstruction cannot smuggle it into the output.
+        self.assertNotIn(marker, result.data)
+
     def test_stsd_outside_stbl_chain_is_ignored(self) -> None:
         # stsd hoisted OUT of stbl and pasted directly under moov — a
         # hostile fixture that tried to trick the scanner in round-2.
@@ -601,6 +621,162 @@ class Mp4Stbl_stsdStructuralTests(unittest.TestCase):
         moov = self._wrap_atom(b"moov", mvhd + trak + stsd)
         with self.assertRaisesRegex(media_scrub.MediaScrubError, "stbl/stsd"):
             media_scrub.scrub_video(ftyp + moov, "video/mp4")
+
+
+class Mp4ReconstructionRegressionTests(unittest.TestCase):
+    """Round-5 directive: the stored MP4 is REBUILT from the parsed chain.
+    Trailing bytes, out-of-chain hoisted atoms, and top-level unknowns
+    cannot survive because they are never written to the output. These
+    tests exercise that surface directly.
+    """
+
+    @staticmethod
+    def _wrap(atom_type: bytes, body: bytes) -> bytes:
+        return struct.pack(">I", 8 + len(body)) + atom_type + body
+
+    def test_trailing_bytes_past_top_level_atoms_are_dropped(self) -> None:
+        # Append a hostile marker AFTER the last legal top-level atom.
+        # The reconstruction only emits parsed atoms, so a marker sitting
+        # beyond the last mdat is never copied through.
+        original = REAL_MP4.read_bytes()
+        marker = b"top-level-trailer-round5-marker"
+        # Reconstruction requires input to be a valid atom chain — any
+        # trailing junk fails structural parse. The scrub therefore
+        # rejects, but rejection is safer than silent survival.
+        with self.assertRaises(media_scrub.MediaScrubError):
+            media_scrub.scrub_video(original + marker, "video/mp4")
+
+    def test_hoisted_moov_pieces_do_not_leak_through(self) -> None:
+        # Attack: fake moov followed by a top-level `mvhd` sitting outside
+        # any moov (a hostile fixture that hopes the scanner picks it up).
+        # Under reconstruction the hoisted mvhd is not moov-parented, so
+        # it becomes a `free` box.
+        real = REAL_MP4.read_bytes()
+        hoisted_mvhd = self._wrap(b"mvhd", b"round5-hoisted-payload" + b"\x00" * 40)
+        payload = real + hoisted_mvhd
+        # The hoisted marker exists on input.
+        self.assertIn(b"round5-hoisted-payload", payload)
+        result = media_scrub.scrub_video(payload, "video/mp4")
+        # Reconstruction dropped it into a `free` box — bytes destroyed.
+        self.assertNotIn(b"round5-hoisted-payload", result.data)
+
+    def test_unknown_top_level_atom_is_replaced_with_free(self) -> None:
+        real = REAL_MP4.read_bytes()
+        marker = b"unknown-top-level-round5"
+        unknown = self._wrap(b"vend", marker + b"\x00" * 20)
+        payload = real + unknown
+        result = media_scrub.scrub_video(payload, "video/mp4")
+        self.assertNotIn(b"vend", result.data)
+        self.assertNotIn(marker, result.data)
+
+    def test_stco_offsets_still_point_at_mdat_after_reconstruction(self) -> None:
+        # The whole reason moov is padded with `free` — chunk offsets in
+        # stco/co64 must still resolve to mdat sample data. FFmpeg's
+        # decode of the scrubbed bytes is the final proof; we assert
+        # that here too so this stays wired up.
+        if not FFMPEG:
+            self.skipTest("ffmpeg not installed")
+        result = media_scrub.scrub_video(REAL_MP4.read_bytes(), "video/mp4")
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as handle:
+            handle.write(result.data)
+            path = handle.name
+        try:
+            probe = subprocess.run(
+                [FFMPEG, "-v", "error", "-i", path, "-f", "null", "-"],
+                capture_output=True, timeout=30,
+            )
+            self.assertEqual(probe.returncode, 0, probe.stderr.decode(errors="replace"))
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+
+class WavReconstructionRegressionTests(unittest.TestCase):
+    """Round-5 directive: WAV bytes are rebuilt from parsed fmt/data/fact
+    chunks with computed sizes and correct padding. RIFF size mismatches
+    → whole-file reject. Trailing attacker bytes cannot land in the
+    output because reconstruction never writes them.
+    """
+
+    def _real(self) -> bytes:
+        return REAL_WAV.read_bytes()
+
+    def test_riff_size_undercount_is_rejected(self) -> None:
+        # Splice attacker bytes past the RIFF-declared end. In-place scrub
+        # scanned to len(data) so the marker slipped through. Under
+        # reconstruction, the RIFF size must equal the payload size, so
+        # this simply fails validation.
+        real = bytearray(self._real())
+        marker = b"riff-tail-round5-marker"
+        # RIFF size stays the same; we append after it.
+        real_with_tail = bytes(real) + marker
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "RIFF size .* does not match"
+        ):
+            media_scrub.scrub_audio(real_with_tail, "audio/wav")
+
+    def test_riff_size_overcount_is_rejected(self) -> None:
+        real = bytearray(self._real())
+        real[4:8] = struct.pack("<I", len(real) + 128)
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "RIFF size .* does not match"
+        ):
+            media_scrub.scrub_audio(bytes(real), "audio/wav")
+
+    def test_reconstruction_emits_only_fmt_fact_data_in_canonical_order(self) -> None:
+        # Splice a LIST/INFO chunk (metadata) into the real WAV. After
+        # reconstruction, only fmt + data survive AND in the canonical
+        # order regardless of input ordering.
+        real = self._real()
+        list_body = b"INFO" + b"IART" + struct.pack("<I", 8) + b"round5\x00\x00"
+        list_chunk = b"LIST" + struct.pack("<I", len(list_body)) + list_body
+        head = real[:12]
+        tail = real[12:]
+        payload = bytearray(head) + list_chunk + tail
+        payload[4:8] = struct.pack("<I", len(payload) - 8)
+        self.assertIn(b"round5", bytes(payload))
+        result = media_scrub.scrub_audio(bytes(payload), "audio/wav")
+        # Marker gone.
+        self.assertNotIn(b"round5", result.data)
+        # Chunks walk: only fmt, (fact optional), data — in that order.
+        seen: list[bytes] = []
+        offset = 12
+        while offset + 8 <= len(result.data):
+            cid = result.data[offset:offset + 4]
+            size = struct.unpack("<I", result.data[offset + 4:offset + 8])[0]
+            seen.append(cid)
+            offset += 8 + size + (size & 1)
+        self.assertEqual(seen[0], b"fmt ")
+        self.assertEqual(seen[-1], b"data")
+        for cid in seen:
+            self.assertIn(cid, {b"fmt ", b"data", b"fact"})
+
+    def test_odd_data_chunk_gets_pad_byte_in_output(self) -> None:
+        # Build a WAV whose data chunk is odd-length; reconstruction must
+        # emit the pad byte to keep RIFF size even-aligned per the spec.
+        fmt_body = struct.pack("<HHIIHH", 1, 1, 8000, 16000, 2, 16)
+        fmt_chunk = b"fmt " + struct.pack("<I", len(fmt_body)) + fmt_body
+        # 3-byte data payload — odd length.
+        odd_data = b"\x00\x00\x00"
+        data_chunk = b"data" + struct.pack("<I", 3) + odd_data + b"\x00"  # includes pad
+        body = b"WAVE" + fmt_chunk + data_chunk
+        payload = b"RIFF" + struct.pack("<I", len(body)) + body
+        result = media_scrub.scrub_audio(payload, "audio/wav")
+        # RIFF size in output must be even (spec compliance).
+        out_riff_size = struct.unpack("<I", result.data[4:8])[0]
+        self.assertEqual(out_riff_size, len(result.data) - 8)
+        # data chunk size == 3, followed by a pad byte, then EOF.
+        self.assertEqual(len(result.data) & 1, 0)
+
+    def test_duplicate_fmt_chunk_is_rejected(self) -> None:
+        fmt_body = struct.pack("<HHIIHH", 1, 1, 8000, 16000, 2, 16)
+        fmt_chunk = b"fmt " + struct.pack("<I", len(fmt_body)) + fmt_body
+        data_chunk = b"data" + struct.pack("<I", 4) + b"\x00\x00\x00\x00"
+        body = b"WAVE" + fmt_chunk + fmt_chunk + data_chunk
+        payload = b"RIFF" + struct.pack("<I", len(body)) + body
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "duplicate fmt"
+        ):
+            media_scrub.scrub_audio(payload, "audio/wav")
 
 
 class WavFormatCodeAllowlistTests(unittest.TestCase):
