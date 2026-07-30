@@ -3,6 +3,7 @@ import {
   AlertTriangle,
   Archive,
   Bot,
+  ChevronDown,
   ExternalLink,
   GitPullRequest,
   Plus,
@@ -32,6 +33,7 @@ import type {
   SpawnWorkerKind,
   SpawnWorkerRole,
 } from "./api";
+import { DisclosureContent } from "./disclosure";
 import { externalLinkProps } from "./external-links";
 import { LoadingPlaceholder } from "./loading";
 import { ReplaceAgentModal, type ReplaceAgentTarget } from "./replace-agent-modal";
@@ -149,6 +151,20 @@ function archivedAge(iso: string): string {
   if (seconds < 3600) return `${Math.max(1, Math.floor(seconds / 60))}m ago`;
   if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
   return `${Math.floor(seconds / 86400)}d ago`;
+}
+
+const SCREENCAST_EXPANDED_KEY = "wiki-expanded-screencasts";
+
+function readStoredExpandedScreencasts(): Set<string> {
+  try {
+    const raw = localStorage.getItem(SCREENCAST_EXPANDED_KEY);
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    return new Set(
+      Array.isArray(parsed) ? parsed.filter((p): p is string => typeof p === "string") : []
+    );
+  } catch {
+    return new Set();
+  }
 }
 
 export function SpawnWorkerModal({
@@ -970,6 +986,22 @@ export function AgentsView({
     archived: ArchivedWorker[];
     error: string | null;
   } | null>(null);
+  const [expandedScreencasts, setExpandedScreencasts] = useState<Set<string>>(
+    readStoredExpandedScreencasts
+  );
+
+  useEffect(() => {
+    localStorage.setItem(SCREENCAST_EXPANDED_KEY, JSON.stringify([...expandedScreencasts]));
+  }, [expandedScreencasts]);
+
+  function toggleScreencast(ticket: string) {
+    setExpandedScreencasts((prev) => {
+      const next = new Set(prev);
+      if (next.has(ticket)) next.delete(ticket);
+      else next.add(ticket);
+      return next;
+    });
+  }
 
   useEffect(() => {
     if (data) return;
@@ -1231,6 +1263,7 @@ export function AgentsView({
     const flag = healthFlag(worker);
     const state = stateLabel(worker);
     const isOpen = openTicket === worker.ticket;
+    const previewOpen = expandedScreencasts.has(worker.ticket);
     return (
       <article className={`agent-card${isOpen ? " is-selected" : ""}`} key={worker.ticket}>
         <header className="agent-card-header">
@@ -1338,11 +1371,29 @@ export function AgentsView({
               <ScrollText size={13} />
               log
             </button>
+            {worker.run_id ? (
+              <button
+                aria-expanded={previewOpen}
+                className={`agent-log-toggle agent-screencast-toggle${previewOpen ? " is-active" : ""}`}
+                type="button"
+                onClick={() => toggleScreencast(worker.ticket)}
+              >
+                <ChevronDown
+                  className={`disclosure-chevron${previewOpen ? "" : " is-collapsed"}`}
+                  size={13}
+                />
+                output
+              </button>
+            ) : null}
           </span>
         </div>
 
         {worker.run_id ? (
-          <ScreencastStrip ticket={worker.ticket} runId={worker.run_id} />
+          <DisclosureContent open={previewOpen}>
+            <div className="agent-screencast">
+              <ScreencastStrip ticket={worker.ticket} runId={worker.run_id} />
+            </div>
+          </DisclosureContent>
         ) : null}
       </article>
     );

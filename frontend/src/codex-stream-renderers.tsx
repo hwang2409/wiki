@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
-import { AlertTriangle, ChevronRight, ListTodo, Terminal } from "lucide-react";
+import { AlertTriangle, ChevronDown, ChevronRight, ListTodo, Terminal } from "lucide-react";
+import { DisclosureContent } from "./disclosure";
 import type { ProviderStreamEvent } from "./api";
 import {
   fileKind,
@@ -361,6 +362,7 @@ function DiffRenderer({ source }: { source: string | null }) {
     [source],
   );
   const boundedFiles = useMemo(() => boundDiffFiles(snapshot.files), [snapshot]);
+  const [sectionOpen, setSectionOpen] = useState(false);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [expandedLarge, setExpandedLarge] = useState<Set<string>>(new Set());
   useEffect(() => {
@@ -369,11 +371,24 @@ function DiffRenderer({ source }: { source: string | null }) {
   }, [source]);
   if (!boundedFiles.size && !snapshot.omittedFiles) return null;
   return (
-    <div className="codex-stream-artifact codex-stream-diff" data-testid="codex-diff-renderer">
-      <div className="codex-stream-artifact-head">
+    <div
+      className={`codex-stream-artifact codex-stream-diff${sectionOpen ? "" : " is-collapsed"}`}
+      data-testid="codex-diff-renderer"
+    >
+      <button
+        aria-expanded={sectionOpen}
+        className="codex-stream-artifact-head codex-stream-diff-toggle"
+        type="button"
+        onClick={() => setSectionOpen((value) => !value)}
+      >
+        <ChevronDown
+          className={`disclosure-chevron${sectionOpen ? "" : " is-collapsed"}`}
+          size={12}
+        />
         <span>working diff</span>
         <span className="codex-stream-artifact-count tabular-nums">{boundedFiles.size} file{boundedFiles.size === 1 ? "" : "s"}</span>
-      </div>
+      </button>
+      <DisclosureContent open={sectionOpen}>
       {snapshot.omittedFiles ? (
         <div className="codex-stream-diff-omitted" data-testid="codex-diff-omitted" role="status">
           additional diff files omitted from preview
@@ -427,6 +442,7 @@ function DiffRenderer({ source }: { source: string | null }) {
           </div>
         );
       })}
+      </DisclosureContent>
     </div>
   );
 }

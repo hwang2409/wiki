@@ -1,5 +1,5 @@
-import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   commandExecutionCards,
   CodexStreamHighlights,
@@ -8,6 +8,12 @@ import {
   parseDiffSnapshot,
 } from "../src/codex-stream-renderers";
 import type { ProviderStreamEvent } from "../src/api";
+
+afterEach(cleanup);
+
+function expandDiffSection() {
+  fireEvent.click(screen.getByRole("button", { name: /working diff/ }));
+}
 
 function event(
   kind: string,
@@ -132,6 +138,7 @@ describe("codex stream renderers", () => {
     const first = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,1 +1,1 @@\n-old\n+new";
     const second = "diff --git a/b.txt b/b.txt\n--- a/b.txt\n+++ b/b.txt\n@@ -1,1 +1,1 @@\n-x\n+y";
     render(<CodexStreamHighlights events={[event("turn_diff_updated", 1, { diff: first }), event("turn_diff_updated", 2, { diff: second })]} />);
+    expandDiffSection();
     expect(screen.getByText("b.txt")).toBeTruthy();
     expect(screen.queryByText("a.txt")).toBeNull();
     expect(document.querySelector(".codex-stream-diff-body")?.textContent).toContain("+y");
@@ -147,6 +154,7 @@ describe("codex stream renderers", () => {
         currentTurnDiff={currentDiff}
       />,
     );
+    expandDiffSection();
     expect(view.getByText("current.txt")).toBeTruthy();
     expect(view.queryByText("old.txt")).toBeNull();
     view.unmount();
@@ -168,6 +176,7 @@ describe("codex stream renderers", () => {
       <CodexStreamHighlights events={[summarized]} currentTurnDiff={currentDiff} />,
     );
     expect(view.container.querySelector("[data-testid='codex-diff-renderer']")).toBeTruthy();
+    expandDiffSection();
     expect(view.container.textContent).toContain("current.txt");
   });
 
@@ -180,6 +189,7 @@ describe("codex stream renderers", () => {
     const lines = Array.from({ length: 200 }, (_, index) => `+${"x".repeat(1_000)}-${index}`).join("\n");
     const source = `diff --git a/large.txt b/large.txt\n--- a/large.txt\n+++ b/large.txt\n@@ -0,0 +1,200 @@\n${lines}`;
     const view = render(<CodexStreamHighlights events={[event("turn_diff_updated", 1, { diff: source })]} />);
+    expandDiffSection();
     expect(view.container.querySelector(".codex-stream-diff-body")).toBeNull();
     fireEvent.click(view.getByRole("button", { name: /large\.txt/ }));
     const renderedLines = view.container.querySelectorAll(".codex-stream-diff-line");
@@ -191,6 +201,7 @@ describe("codex stream renderers", () => {
     const hunks = Array.from({ length: 3_000 }, (_, index) => `@@ -${index + 1},0 +${index + 1},0 @@ ${"header".repeat(8)}`).join("\n");
     const source = `diff --git a/headers.txt b/headers.txt\n--- a/headers.txt\n+++ b/headers.txt\n${hunks}`;
     const view = render(<CodexStreamHighlights events={[event("turn_diff_updated", 1, { diff: source })]} />);
+    expandDiffSection();
     fireEvent.click(view.getByRole("button", { name: /headers\.txt/ }));
     const renderedHeaders = view.container.querySelectorAll(".codex-stream-diff-hunk-head");
     expect(renderedHeaders.length).toBeLessThan(3_000);
@@ -202,7 +213,21 @@ describe("codex stream renderers", () => {
       `diff --git a/file-${index}.txt b/file-${index}.txt\n--- a/file-${index}.txt\n+++ b/file-${index}.txt\n@@ -0,1 +0,1 @@\n+${"x".repeat(6_000)}`
     )).join("\n");
     const view = render(<CodexStreamHighlights events={[event("turn_diff_updated", 1, { diff: source })]} />);
+    expandDiffSection();
     expect(view.container.querySelectorAll(".codex-stream-diff-file").length).toBeLessThanOrEqual(100);
     expect(view.getByTestId("codex-diff-omitted")).toBeTruthy();
+  });
+
+  it("collapses the working diff section by default; toggle reveals the file list", () => {
+    const source = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,1 +1,1 @@\n-old\n+new";
+    const view = render(<CodexStreamHighlights events={[event("turn_diff_updated", 1, { diff: source })]} />);
+    const toggle = view.getByRole("button", { name: /working diff/ });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(view.queryByText("a.txt")).toBeNull();
+    expect(view.container.querySelector(".codex-stream-diff-file")).toBeNull();
+    expect(view.container.querySelector("[data-testid='codex-diff-omitted']")).toBeNull();
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    expect(view.getByText("a.txt")).toBeTruthy();
   });
 });
