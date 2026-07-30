@@ -116,7 +116,7 @@ def _scrub_mp4(data: bytes) -> MediaScrubResult:
         if atom_type == b"moov":
             moov_seen = True
             trak_in_moov, mvhd_in_moov, stsd_ok = _mp4_scrub_container(
-                view, offset + header_len, atom_end,
+                view, offset + header_len, atom_end, parent=b"moov",
             )
             trak_seen = trak_seen or trak_in_moov
             mvhd_seen = mvhd_seen or mvhd_in_moov
@@ -139,10 +139,12 @@ def _scrub_mp4(data: bytes) -> MediaScrubResult:
         raise MediaScrubError("mp4 moov missing trak box")
     if not stsd_sample_entry_seen:
         # A fake moov/mvhd/trak with no stbl/stsd/sample entry would let a
-        # tagged text blob masquerade as MP4. Reject it by requiring the
-        # decoder-reachable descriptor: trak -> mdia -> minf -> stbl -> stsd
-        # with at least one sample-entry child.
-        raise MediaScrubError("mp4 trak missing stbl/stsd sample entry")
+        # tagged text blob masquerade as MP4. Reject unless the full ISOBMFF
+        # chain trak -> mdia -> minf -> stbl -> stsd is present AND every
+        # declared sample entry in stsd parses cleanly.
+        raise MediaScrubError(
+            "mp4 trak missing valid stbl/stsd sample entry (full chain required)"
+        )
 
     width, height = dims if dims is not None else (None, None)
     return MediaScrubResult(
@@ -188,11 +190,20 @@ def _mp4_nullify(view: memoryview, type_offset: int, header_len: int, atom_end: 
 
 
 def _mp4_scrub_container(
-    view: memoryview, payload_start: int, container_end: int
+    view: memoryview,
+    payload_start: int,
+    container_end: int,
+    *,
+    parent: bytes = b"",
 ) -> tuple[bool, bool, bool]:
     """Recursively nullify metadata atoms in a container.
 
     Returns (trak_seen, mvhd_seen, stsd_sample_entry_seen).
+
+    The `parent` context lets us enforce the mandated ISOBMFF chain
+    trak -> mdia -> minf -> stbl -> stsd for stsd hits: a stsd atom
+    stashed anywhere else is ignored so a hostile fixture cannot
+    manufacture a stream descriptor outside its structural home.
     """
     trak_seen = False
     mvhd_seen = False
@@ -206,31 +217,69 @@ def _mp4_scrub_container(
             _mp4_nullify(view, offset + 4, header_len, atom_end)
             offset = atom_end
             continue
-        if atom_type == b"trak":
+        if atom_type == b"trak" and parent == b"moov":
             trak_seen = True
-        if atom_type == b"mvhd":
+        if atom_type == b"mvhd" and parent == b"moov":
             mvhd_seen = True
-        if atom_type == b"stsd":
-            # stsd payload = 4 flag-and-version bytes, then a big-endian
-            # entry_count uint32, then N sample-entry boxes. At least one
-            # entry is the proof the trak actually carries a decodable
-            # stream; a bogus text-only fixture has entry_count=0.
-            payload_at = offset + header_len
-            if payload_at + 8 <= atom_end:
-                entry_count = struct.unpack(
-                    ">I", bytes(view[payload_at + 4:payload_at + 8]),
-                )[0]
-                if entry_count > 0:
-                    stsd_ok = True
+        if atom_type == b"stsd" and parent == b"stbl":
+            # Walk EVERY declared entry, not just entry_count > 0. A
+            # truncated stsd or an entry whose size runs past the atom
+            # end would let a bogus descriptor slip through.
+            if _mp4_stsd_has_valid_sample_entry(
+                view, offset + header_len, atom_end,
+            ):
+                stsd_ok = True
         if atom_type in {b"moov", b"trak", b"mdia", b"minf", b"stbl"}:
             child_trak, child_mvhd, child_stsd = _mp4_scrub_container(
-                view, offset + header_len, atom_end,
+                view, offset + header_len, atom_end, parent=atom_type,
             )
             trak_seen = trak_seen or child_trak
             mvhd_seen = mvhd_seen or child_mvhd
             stsd_ok = stsd_ok or child_stsd
         offset = atom_end
     return trak_seen, mvhd_seen, stsd_ok
+
+
+def _mp4_stsd_has_valid_sample_entry(
+    view: memoryview, payload_start: int, atom_end: int,
+) -> bool:
+    """Return True iff stsd declares ≥1 entry and every entry parses cleanly.
+
+    stsd payload layout: 1 byte version, 3 flag bytes, uint32 entry_count,
+    then N sample-entry boxes each shaped like [uint32 size][4 type][body].
+    Every entry's size field is validated against the remaining stsd bytes
+    before we advance — a truncated or oversized entry causes rejection
+    (return False), which the caller escalates to a whole-file reject.
+    """
+    if payload_start + 8 > atom_end:
+        return False
+    entry_count = struct.unpack(
+        ">I", bytes(view[payload_start + 4:payload_start + 8]),
+    )[0]
+    if entry_count == 0:
+        return False
+    # Cap entry_count against remaining bytes: the smallest legal sample
+    # entry is 8 bytes (size + type), so more entries than that would fit
+    # is nonsense.
+    remaining = atom_end - (payload_start + 8)
+    if entry_count > remaining // 8:
+        return False
+    offset = payload_start + 8
+    for _ in range(entry_count):
+        if offset + 8 > atom_end:
+            return False
+        entry_size = struct.unpack(">I", bytes(view[offset:offset + 4]))[0]
+        entry_type = bytes(view[offset + 4:offset + 8])
+        # Sample-entry types are 4 ASCII bytes (avc1, mp4a, hev1, …). A
+        # null or all-zero type is meaningless.
+        if entry_type == b"\x00\x00\x00\x00":
+            return False
+        # Reject 64-bit and run-to-EOF entry sizes inside stsd — the spec
+        # only permits fixed uint32 entry sizes here.
+        if entry_size < 8 or offset + entry_size > atom_end:
+            return False
+        offset += entry_size
+    return offset <= atom_end
 
 
 def _mp4_extract_moov_duration(moov_payload: bytes) -> int | None:
@@ -507,8 +556,30 @@ def _scrub_wav(data: bytes) -> MediaScrubResult:
                 "<H", data[payload_start + 14:payload_start + 16],
             )[0]
             if format_code == _WAV_FORMAT_EXTENSIBLE:
-                # WAVE_FORMAT_EXTENSIBLE: chunk must be ≥40 bytes and end
-                # with a 16-byte SubFormat GUID resolving to PCM or float.
+                # WAVE_FORMAT_EXTENSIBLE layout after the shared 16 bytes:
+                # cbSize (2) tells the extension length; the extensible
+                # extension is exactly 22 bytes (valid_bits(2) + channel_mask(4)
+                # + SubFormat GUID(16)). We validate cbSize BEFORE reading
+                # the SubFormat so a PCM GUID pointer that runs past the
+                # chunk cannot pass — round-3 review flagged that cbSize
+                # was ignored entirely, letting an extension-shaped fmt
+                # with cbSize=0 slip through.
+                if chunk_size < 18:
+                    raise MediaScrubError(
+                        "wav extensible fmt chunk missing cbSize field"
+                    )
+                cb_size = struct.unpack(
+                    "<H", data[payload_start + 16:payload_start + 18],
+                )[0]
+                if cb_size < 22:
+                    raise MediaScrubError(
+                        f"wav extensible cbSize {cb_size} smaller than the 22-byte extension"
+                    )
+                extension_end = payload_start + 18 + cb_size
+                if extension_end > payload_end:
+                    raise MediaScrubError(
+                        "wav extensible extension extends past fmt chunk"
+                    )
                 if chunk_size < 40:
                     raise MediaScrubError(
                         "wav extensible fmt chunk too short for SubFormat"
@@ -632,9 +703,15 @@ _ID3V2_MAGIC: Final = b"ID3"
 _ID3V1_MAGIC: Final = b"TAG"
 _APE_MAGIC: Final = b"APETAGEX"
 _APE_HEADER_FOOTER_LEN: Final = 32
-# APEv2 flags (bit indices).
-_APE_FLAG_HAS_HEADER: Final = 1 << 31
-_APE_FLAG_IS_HEADER: Final = 1 << 29
+# APEv2 flag bit indices per the official spec.
+#   Bit 31 = "this preamble is a header" (0 = footer)
+#   Bit 30 = "the tag has no footer"
+#   Bit 29 = "the tag has a header preceding the items"
+# Round-3 review sweep caught these were swapped, letting a footer-shaped
+# preamble with IS_HEADER set slip through the "is-a-header" refusal.
+_APE_FLAG_IS_HEADER: Final = 1 << 31
+_APE_FLAG_NO_FOOTER: Final = 1 << 30
+_APE_FLAG_HAS_HEADER: Final = 1 << 29
 
 # Bitrate table for MPEG Version 1 Layer III (kbps). Values are per second;
 # a frame's byte length is derived from bitrate + sample rate.
@@ -685,24 +762,59 @@ def _scrub_mp3(data: bytes) -> MediaScrubResult:
     )
 
 
+# Cap item_count and tag_size at reasonable ceilings. Real APE tags never
+# get anywhere near these — a 4-billion-item claim (uint32 max) is either
+# a bug or a hostile fixture, and we refuse to trust it.
+_APE_ITEM_COUNT_MAX: Final = 0xFFFF
+_APE_TAG_SIZE_MAX: Final = 32 * 1024 * 1024  # 32 MB is already implausible
+
+
+def _mp3_read_ape_meta(data: bytes, preamble_at: int) -> tuple[int, int, int]:
+    """Read tag_size, item_count, flags from an APETAGEX preamble.
+
+    Enforces every derived bound before returning: preamble fits, size
+    fields fall inside plausible ceilings, integer arithmetic on tag_size
+    cannot overflow later. Any deviation → refuse to parse (the caller
+    turns that into a whole-file rejection — silent pass-through was the
+    round-1/2/3 recurrence and we do not repeat it).
+    """
+    if preamble_at < 0 or preamble_at + _APE_HEADER_FOOTER_LEN > len(data):
+        raise MediaScrubError("mp3 APEv2 preamble out of bounds")
+    tag_size, item_count, flags = struct.unpack(
+        "<III", data[preamble_at + 12:preamble_at + 24],
+    )
+    if tag_size < _APE_HEADER_FOOTER_LEN:
+        # Real APEv2 tag_size always includes at least the 32-byte footer
+        # even when the tag holds zero items. Values 0..31 are impossible
+        # for a valid tag and would leak metadata bytes if honored.
+        raise MediaScrubError(
+            f"mp3 APEv2 tag_size {tag_size} smaller than minimum 32"
+        )
+    if tag_size > _APE_TAG_SIZE_MAX:
+        raise MediaScrubError(
+            f"mp3 APEv2 tag_size {tag_size} exceeds implausible ceiling"
+        )
+    if item_count > _APE_ITEM_COUNT_MAX:
+        raise MediaScrubError(
+            f"mp3 APEv2 item count {item_count} exceeds implausible ceiling"
+        )
+    return tag_size, item_count, flags
+
+
 def _mp3_strip_ape_header(data: bytes, start: int, end: int) -> int:
     """If APEv2 sits at the front as a header, advance `start` past it."""
     if end - start < _APE_HEADER_FOOTER_LEN:
         return start
     if data[start:start + 8] != _APE_MAGIC:
         return start
-    tag_size, item_count, flags = struct.unpack(
-        "<III", data[start + 12:start + 24],
-    )
+    tag_size, _item_count, flags = _mp3_read_ape_meta(data, start)
     if flags & _APE_FLAG_IS_HEADER == 0:
         # A footer masquerading at position 0 — rare but possible; refuse.
         raise MediaScrubError("mp3 APEv2 marker at start is not a header")
-    if item_count > 0xFFFF:
-        raise MediaScrubError("mp3 APEv2 item count implausible")
-    # Header tag_size includes the footer bytes but NOT the header — advance
-    # past header + tag_size (which covers items + optional footer).
+    # Header tag_size includes the items + optional footer but NOT the
+    # 32-byte header we already sit on. Advance past both.
     advance = _APE_HEADER_FOOTER_LEN + tag_size
-    if start + advance > end:
+    if advance > end - start:
         raise MediaScrubError("mp3 APEv2 header size larger than payload")
     return start + advance
 
@@ -715,24 +827,18 @@ def _mp3_strip_ape_footer(data: bytes, start: int, end: int) -> int:
     footer_start = end - _APE_HEADER_FOOTER_LEN
     if data[footer_start:footer_start + 8] != _APE_MAGIC:
         return end
-    tag_size, item_count, flags = struct.unpack(
-        "<III", data[footer_start + 12:footer_start + 24],
-    )
+    tag_size, _item_count, flags = _mp3_read_ape_meta(data, footer_start)
     if flags & _APE_FLAG_IS_HEADER:
         # This is a header, not a footer — bail (would be corrupt at end).
         raise MediaScrubError("mp3 APEv2 marker at end is a header")
-    if item_count > 0xFFFF:
-        raise MediaScrubError("mp3 APEv2 item count implausible")
-    # Footer tag_size includes the footer itself; items sit tag_size-32
-    # bytes above the footer, plus a header (another 32) if the flag is set.
-    items_length = tag_size - _APE_HEADER_FOOTER_LEN
-    new_end = end - tag_size
+    # Footer tag_size includes the footer's own 32 bytes and every item.
+    # If a matching header is announced, subtract another 32 for that.
+    trim = tag_size
     if flags & _APE_FLAG_HAS_HEADER:
-        new_end -= _APE_HEADER_FOOTER_LEN
-    if new_end < start:
+        trim += _APE_HEADER_FOOTER_LEN
+    if trim > end - start:
         raise MediaScrubError("mp3 APEv2 footer size larger than payload")
-    del items_length  # silence lint — bound-check tag_size covers items too
-    return new_end
+    return end - trim
 
 
 def _mp3_require_frames(data: bytes, start: int, end: int, *, minimum: int) -> None:

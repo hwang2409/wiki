@@ -344,6 +344,123 @@ class ScrubMp3ApeV2FixtureTests(unittest.TestCase):
             Path(path).unlink(missing_ok=True)
 
 
+class ApeV2BoundaryTests(unittest.TestCase):
+    """The round-3 review flagged that malformed APEv2 footers with sizes
+    0, 16, or 31 slipped past scrub and retained metadata. Rule: any tag
+    field we cannot parse safely → reject the whole file. These tests
+    build minimal MP3 payloads with hostile APE footers and confirm every
+    boundary case now raises rather than passing through.
+    """
+
+    @staticmethod
+    def _build_mp3_with_ape_footer(
+        tag_size: int,
+        flags: int = 0,
+        item_count: int = 0,
+    ) -> bytes:
+        # Real mp3 frames (matches round-2 fixture pattern) plus an
+        # attacker-controlled APE footer. Use the real fixture's front so
+        # the frame walk succeeds; splice a hostile footer over the tail.
+        frames = REAL_MP3.read_bytes()
+        # Drop any existing APE/ID3v1 by taking a prefix that ends on a
+        # frame boundary — the real fixture has no APE, so the tail is
+        # already frame-only.
+        version = 2000
+        footer = (
+            b"APETAGEX"
+            + struct.pack("<III", version, tag_size, item_count)
+            + struct.pack("<I", flags)
+            + b"\x00" * 8
+        )
+        return frames + b"payload-bytes-that-encode-metadata" + footer
+
+    def test_ape_footer_size_zero_is_rejected(self) -> None:
+        payload = self._build_mp3_with_ape_footer(tag_size=0)
+        self.assertIn(b"payload-bytes-that-encode-metadata", payload)
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "APEv2 tag_size 0 smaller than minimum 32"
+        ):
+            media_scrub.scrub_audio(payload, "audio/mpeg")
+
+    def test_ape_footer_size_sixteen_is_rejected(self) -> None:
+        payload = self._build_mp3_with_ape_footer(tag_size=16)
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "APEv2 tag_size 16 smaller than minimum 32"
+        ):
+            media_scrub.scrub_audio(payload, "audio/mpeg")
+
+    def test_ape_footer_size_thirty_one_is_rejected(self) -> None:
+        payload = self._build_mp3_with_ape_footer(tag_size=31)
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "APEv2 tag_size 31 smaller than minimum 32"
+        ):
+            media_scrub.scrub_audio(payload, "audio/mpeg")
+
+    def test_ape_footer_size_larger_than_payload_is_rejected(self) -> None:
+        # tag_size 999999 — footer claims a tag bigger than the file. Rejected
+        # via the size-vs-remaining bounds check (either directly by the
+        # "larger than payload" guard or the implausible-ceiling guard,
+        # depending on order; both fail the file, which is the whole point).
+        payload = self._build_mp3_with_ape_footer(tag_size=999_999)
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "APEv2.*(larger than payload|exceeds implausible)"
+        ):
+            media_scrub.scrub_audio(payload, "audio/mpeg")
+
+    def test_ape_footer_absurd_item_count_is_rejected(self) -> None:
+        payload = self._build_mp3_with_ape_footer(
+            tag_size=32, item_count=10**7,
+        )
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "APEv2 item count"
+        ):
+            media_scrub.scrub_audio(payload, "audio/mpeg")
+
+    def test_ape_footer_with_is_header_flag_at_end_is_rejected(self) -> None:
+        # bit 31 = IS_HEADER; if that shows up in a tail-position preamble
+        # we refuse to interpret it — silent pass-through is banned.
+        payload = self._build_mp3_with_ape_footer(
+            tag_size=32, flags=1 << 31,
+        )
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "APEv2 marker at end is a header"
+        ):
+            media_scrub.scrub_audio(payload, "audio/mpeg")
+
+    def test_ape_header_at_start_with_size_larger_than_payload_is_rejected(self) -> None:
+        # Attack: valid frame stream but APE header at the front with a
+        # tag_size that overflows the remaining bytes. Rejected via one of
+        # the size guards (implausible-ceiling for very large; larger-than-
+        # payload for merely oversized). Either way — no pass-through.
+        frames = REAL_MP3.read_bytes()
+        # 1 MB tag_size — plausible ceiling, but larger than the payload.
+        header = (
+            b"APETAGEX"
+            + struct.pack("<III", 2000, 1 << 20, 0)
+            + struct.pack("<I", 1 << 31)  # IS_HEADER
+            + b"\x00" * 8
+        )
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "APEv2 header size larger than payload"
+        ):
+            media_scrub.scrub_audio(header + frames, "audio/mpeg")
+
+    def test_ape_header_at_start_with_absurd_size_hits_ceiling(self) -> None:
+        # Same attack but with a truly implausible tag_size; the ceiling
+        # guard is what fires here.
+        frames = REAL_MP3.read_bytes()
+        header = (
+            b"APETAGEX"
+            + struct.pack("<III", 2000, 10**8, 0)
+            + struct.pack("<I", 1 << 31)
+            + b"\x00" * 8
+        )
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "APEv2 tag_size .* exceeds implausible ceiling"
+        ):
+            media_scrub.scrub_audio(header + frames, "audio/mpeg")
+
+
 class Mp4Stbl_stsdStructuralTests(unittest.TestCase):
     """A fake moov/mvhd/trak with no stbl/stsd sample entry masqueraded as
     MP4 under round-2 rules. Now the sample-entry check rejects it.
@@ -380,6 +497,110 @@ class Mp4Stbl_stsdStructuralTests(unittest.TestCase):
         # Confirms the check does not false-reject the real fixture.
         result = media_scrub.scrub_video(REAL_MP4.read_bytes(), "video/mp4")
         self.assertEqual(result.mime, "video/mp4")
+
+    @staticmethod
+    def _wrap_atom(atom_type: bytes, body: bytes) -> bytes:
+        return struct.pack(">I", 8 + len(body)) + atom_type + body
+
+    def _make_mp4_with_stsd(self, stsd_body: bytes) -> bytes:
+        ftyp = struct.pack(">I", 24) + b"ftyp" + b"isom" + b"\x00\x00\x02\x00" + b"isommp41"
+        mvhd_body = (
+            b"\x00\x00\x00\x00"
+            + b"\x00" * 8
+            + struct.pack(">I", 1000)
+            + struct.pack(">I", 1000)
+            + b"\x00" * 80
+        )
+        mvhd = self._wrap_atom(b"mvhd", mvhd_body)
+        tkhd_body = (
+            b"\x00\x00\x00\x07"
+            + b"\x00" * 8
+            + b"\x00\x00\x00\x01"
+            + b"\x00" * 60
+            + struct.pack(">II", 320 << 16, 240 << 16)
+        )
+        tkhd = self._wrap_atom(b"tkhd", tkhd_body)
+        stsd = self._wrap_atom(b"stsd", stsd_body)
+        stbl = self._wrap_atom(b"stbl", stsd)
+        minf = self._wrap_atom(b"minf", stbl)
+        mdia = self._wrap_atom(b"mdia", minf)
+        trak = self._wrap_atom(b"trak", tkhd + mdia)
+        moov = self._wrap_atom(b"moov", mvhd + trak)
+        return ftyp + moov
+
+    def test_stsd_with_zero_declared_entries_is_rejected(self) -> None:
+        stsd_body = b"\x00\x00\x00\x00" + struct.pack(">I", 0)
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "stbl/stsd"):
+            media_scrub.scrub_video(self._make_mp4_with_stsd(stsd_body), "video/mp4")
+
+    def test_stsd_with_entry_size_smaller_than_header_is_rejected(self) -> None:
+        # Declared 1 entry, entry size 4 — smaller than the 8-byte minimum.
+        stsd_body = (
+            b"\x00\x00\x00\x00"
+            + struct.pack(">I", 1)
+            + struct.pack(">I", 4) + b"avc1"
+        )
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "stbl/stsd"):
+            media_scrub.scrub_video(self._make_mp4_with_stsd(stsd_body), "video/mp4")
+
+    def test_stsd_with_entry_size_past_atom_end_is_rejected(self) -> None:
+        # Entry size claims 4 kB, but the stsd atom only contains 16 bytes.
+        stsd_body = (
+            b"\x00\x00\x00\x00"
+            + struct.pack(">I", 1)
+            + struct.pack(">I", 4096) + b"avc1"
+        )
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "stbl/stsd"):
+            media_scrub.scrub_video(self._make_mp4_with_stsd(stsd_body), "video/mp4")
+
+    def test_stsd_with_null_entry_type_is_rejected(self) -> None:
+        stsd_body = (
+            b"\x00\x00\x00\x00"
+            + struct.pack(">I", 1)
+            + struct.pack(">I", 8) + b"\x00\x00\x00\x00"
+        )
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "stbl/stsd"):
+            media_scrub.scrub_video(self._make_mp4_with_stsd(stsd_body), "video/mp4")
+
+    def test_stsd_with_absurd_entry_count_is_rejected(self) -> None:
+        # 4 billion entries won't fit; the remaining-bytes check catches it.
+        stsd_body = b"\x00\x00\x00\x00" + struct.pack(">I", 0xFFFFFFFF)
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "stbl/stsd"):
+            media_scrub.scrub_video(self._make_mp4_with_stsd(stsd_body), "video/mp4")
+
+    def test_stsd_outside_stbl_chain_is_ignored(self) -> None:
+        # stsd hoisted OUT of stbl and pasted directly under moov — a
+        # hostile fixture that tried to trick the scanner in round-2.
+        # The chain-enforced check must NOT count this as a valid stream.
+        ftyp = struct.pack(">I", 24) + b"ftyp" + b"isom" + b"\x00\x00\x02\x00" + b"isommp41"
+        mvhd_body = (
+            b"\x00\x00\x00\x00"
+            + b"\x00" * 8
+            + struct.pack(">I", 1000)
+            + struct.pack(">I", 1000)
+            + b"\x00" * 80
+        )
+        mvhd = self._wrap_atom(b"mvhd", mvhd_body)
+        tkhd_body = (
+            b"\x00\x00\x00\x07"
+            + b"\x00" * 8
+            + b"\x00\x00\x00\x01"
+            + b"\x00" * 60
+            + struct.pack(">II", 320 << 16, 240 << 16)
+        )
+        tkhd = self._wrap_atom(b"tkhd", tkhd_body)
+        stsd_body = (
+            b"\x00\x00\x00\x00"
+            + struct.pack(">I", 1)
+            + struct.pack(">I", 8) + b"avc1"
+        )
+        stsd = self._wrap_atom(b"stsd", stsd_body)
+        trak = self._wrap_atom(b"trak", tkhd)
+        # Note: stsd is a sibling of trak, NOT nested inside a stbl inside
+        # a minf inside a mdia inside the trak.
+        moov = self._wrap_atom(b"moov", mvhd + trak + stsd)
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "stbl/stsd"):
+            media_scrub.scrub_video(ftyp + moov, "video/mp4")
 
 
 class WavFormatCodeAllowlistTests(unittest.TestCase):
@@ -431,6 +652,73 @@ class WavFormatCodeAllowlistTests(unittest.TestCase):
             media_scrub.scrub_audio(
                 self._wav_with_format(0xFFFE, alien), "audio/wav",
             )
+
+    @staticmethod
+    def _extensible_wav_with_cbsize(cb_size: int) -> bytes:
+        """Build an extensible WAV whose fmt chunk has the given cbSize.
+
+        The extension body (22 bytes: valid_bits + channel_mask + SubFormat)
+        is always emitted; only the cbSize field varies. This lets us prove
+        the cbSize check fires independently of the SubFormat check.
+        """
+        subformat = media_scrub._WAV_KSDATAFORMAT_PCM
+        # 16 base bytes + 2 cbSize + 22 extension = 40-byte fmt chunk.
+        fmt_body = (
+            struct.pack("<HHIIHH", 0xFFFE, 1, 16000, 32000, 2, 16)
+            + struct.pack("<H", cb_size)
+            + struct.pack("<HI", 16, 0)
+            + subformat
+        )
+        fmt_chunk = b"fmt " + struct.pack("<I", len(fmt_body)) + fmt_body
+        data_chunk = b"data" + struct.pack("<I", 4) + b"\x00\x00\x00\x00"
+        body = b"WAVE" + fmt_chunk + data_chunk
+        return b"RIFF" + struct.pack("<I", len(body)) + body
+
+    def test_extensible_cbsize_zero_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "cbSize 0 smaller than the 22-byte extension"
+        ):
+            media_scrub.scrub_audio(
+                self._extensible_wav_with_cbsize(0), "audio/wav",
+            )
+
+    def test_extensible_cbsize_below_twenty_two_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "cbSize 10 smaller than the 22-byte extension"
+        ):
+            media_scrub.scrub_audio(
+                self._extensible_wav_with_cbsize(10), "audio/wav",
+            )
+
+    def test_extensible_cbsize_past_chunk_end_is_rejected(self) -> None:
+        # cbSize far larger than the fmt chunk holds.
+        subformat = media_scrub._WAV_KSDATAFORMAT_PCM
+        fmt_body = (
+            struct.pack("<HHIIHH", 0xFFFE, 1, 16000, 32000, 2, 16)
+            + struct.pack("<H", 9999)
+            + struct.pack("<HI", 16, 0)
+            + subformat
+        )
+        fmt_chunk = b"fmt " + struct.pack("<I", len(fmt_body)) + fmt_body
+        data_chunk = b"data" + struct.pack("<I", 4) + b"\x00\x00\x00\x00"
+        body = b"WAVE" + fmt_chunk + data_chunk
+        payload = b"RIFF" + struct.pack("<I", len(body)) + body
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "extends past fmt chunk"
+        ):
+            media_scrub.scrub_audio(payload, "audio/wav")
+
+    def test_extensible_missing_cbsize_field_is_rejected(self) -> None:
+        # A fmt chunk of only 16 bytes (no cbSize) but claiming extensible.
+        fmt_body = struct.pack("<HHIIHH", 0xFFFE, 1, 16000, 32000, 2, 16)
+        fmt_chunk = b"fmt " + struct.pack("<I", len(fmt_body)) + fmt_body
+        data_chunk = b"data" + struct.pack("<I", 4) + b"\x00\x00\x00\x00"
+        body = b"WAVE" + fmt_chunk + data_chunk
+        payload = b"RIFF" + struct.pack("<I", len(body)) + body
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "cbSize field|SubFormat"
+        ):
+            media_scrub.scrub_audio(payload, "audio/wav")
 
 
 class WavStreamingPeaksBoundsTests(unittest.TestCase):

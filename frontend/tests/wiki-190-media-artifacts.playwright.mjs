@@ -481,62 +481,114 @@ async function main() {
       throw new Error(`video currentTime did not advance: ${playbackDelta}`);
     }
 
-    logStep("verifying frame position is stable across loadedmetadata (no CLS)");
-    // Reset video state, wait a paint, take the frame bounds, then wait
-    // for a second paint after metadata is present. The frame position and
-    // dimensions must be identical: the reservation-before-load contract
-    // is the whole point of the fallback aspect ratio + poster reservation.
-    const clsMetric = await videoBlock.locator(".artifact-video-frame").evaluate(
-      (node) =>
-        new Promise((resolve) => {
-          const first = node.getBoundingClientRect();
-          requestAnimationFrame(() =>
-            requestAnimationFrame(() => {
-              const second = node.getBoundingClientRect();
-              resolve({
-                topDelta: Math.abs(second.top - first.top),
-                heightDelta: Math.abs(second.height - first.height),
-              });
-            }),
-          );
-        }),
-    );
-    if (clsMetric.topDelta > 0.5 || clsMetric.heightDelta > 0.5) {
+    logStep("mount-stress: real page-reload remount cycles must not leak media elements");
+    // Round-3 review flagged that the previous mount-stress just toggled
+    // transcript text and never re-mounted the media element itself. Do
+    // the honest thing: reload the page a handful of times and confirm
+    // the resulting DOM comes back with exactly one <video> and one
+    // <audio>, and no orphaned ones piling up.
+    for (let cycle = 0; cycle < 5; cycle += 1) {
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await page.locator(".session-scroll").waitFor({ state: "visible" });
+      await videoBlock.waitFor({ state: "visible" });
+      await audioBlock.waitFor({ state: "visible" });
+      const counts = await page.evaluate(() => ({
+        video: document.querySelectorAll("video").length,
+        audio: document.querySelectorAll("audio").length,
+      }));
+      if (counts.video !== 1 || counts.audio !== 1) {
+        throw new Error(
+          `remount cycle ${cycle}: expected exactly one video+one audio, got video=${counts.video} audio=${counts.audio}`,
+        );
+      }
+    }
+
+    logStep("CLS: measure video frame reservation BEFORE and AFTER loadedmetadata");
+    // Reload and immediately (before metadata parses) capture the reserved
+    // frame rect. Then wait for `loadedmetadata` and capture again. The
+    // reserved aspect ratio is set inline on `.artifact-video-frame`, so
+    // both rects must match — this is the whole point of the aspect-ratio
+    // reservation. Round-3 review flagged that the previous CLS check ran
+    // both measurements AFTER metadata loaded, so it never actually
+    // confirmed the reservation prevented a shift.
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.locator(".session-scroll").waitFor({ state: "visible" });
+    const clsMetric = await videoBlock
+      .locator(".artifact-video-frame")
+      .evaluate(async (node) => {
+        const video = node.querySelector("video");
+        // Capture the reserved rect BEFORE any metadata parse could
+        // possibly have completed. Snapshot straight away.
+        const before = node.getBoundingClientRect();
+        const preReadyState = video ? video.readyState : -1;
+        // Wait for loadedmetadata (or resolve immediately if it already fired).
+        await new Promise((resolve, reject) => {
+          if (!video) {
+            reject(new Error("video element not found for CLS check"));
+            return;
+          }
+          if (video.readyState >= 1) {
+            resolve();
+            return;
+          }
+          const onLoaded = () => {
+            video.removeEventListener("loadedmetadata", onLoaded);
+            resolve();
+          };
+          video.addEventListener("loadedmetadata", onLoaded, { once: true });
+          try {
+            video.load();
+          } catch {
+            /* already loading */
+          }
+          setTimeout(() => reject(new Error("CLS: loadedmetadata timeout")), 15000);
+        });
+        // Yield a paint before taking the AFTER rect.
+        await new Promise((resolve) => requestAnimationFrame(resolve));
+        const after = node.getBoundingClientRect();
+        return {
+          preReadyState,
+          before: { top: before.top, left: before.left, width: before.width, height: before.height },
+          after: { top: after.top, left: after.left, width: after.width, height: after.height },
+        };
+      });
+    const topDelta = Math.abs(clsMetric.after.top - clsMetric.before.top);
+    const heightDelta = Math.abs(clsMetric.after.height - clsMetric.before.height);
+    const widthDelta = Math.abs(clsMetric.after.width - clsMetric.before.width);
+    // 0.5px tolerance covers sub-pixel rounding; a genuine reserve failure
+    // shifts by dozens of pixels the moment videoWidth/Height land.
+    if (topDelta > 0.5 || heightDelta > 0.5 || widthDelta > 0.5) {
       throw new Error(
-        `layout shifted after playback: dTop=${clsMetric.topDelta} dHeight=${clsMetric.heightDelta}`,
+        `CLS: layout shifted between pre-metadata and post-metadata: dTop=${topDelta} dHeight=${heightDelta} dWidth=${widthDelta} (preReadyState=${clsMetric.preReadyState}, before=${JSON.stringify(clsMetric.before)}, after=${JSON.stringify(clsMetric.after)})`,
       );
     }
 
-    logStep("mount-stress: 25 rapid mount/unmount cycles must not leak media elements");
-    // The reviewer's round-2 note said the cleanup + CLS probes were run by
-    // hand. Commit them: cycle the transcript panel closed→open→closed→…
-    // in a tight loop and confirm the DOM never accumulates <video>/<audio>
-    // elements above the expected single instance each.
-    const stressResult = await page.evaluate(async () => {
-      const START_VIDEO = document.querySelectorAll("video").length;
-      const START_AUDIO = document.querySelectorAll("audio").length;
-      const transcriptButton = document.querySelector(
-        ".artifact-audio-transcript-toggle",
-      );
+    logStep("in-page transcript-toggle churn must not leak media elements");
+    // Complementary to the reload-based mount stress: exercise the
+    // transcript toggle in a tight loop and confirm the DOM element
+    // counts stay put (guards against the earlier round-2 hazard where
+    // render churn triggered false unmount cycles).
+    const churnResult = await page.evaluate(async () => {
+      const startVideo = document.querySelectorAll("video").length;
+      const startAudio = document.querySelectorAll("audio").length;
+      const toggle = document.querySelector(".artifact-audio-transcript-toggle");
       for (let i = 0; i < 25; i += 1) {
-        transcriptButton?.click();
+        toggle?.click();
         await new Promise((resolve) => requestAnimationFrame(resolve));
       }
-      const END_VIDEO = document.querySelectorAll("video").length;
-      const END_AUDIO = document.querySelectorAll("audio").length;
       return {
-        startVideo: START_VIDEO,
-        endVideo: END_VIDEO,
-        startAudio: START_AUDIO,
-        endAudio: END_AUDIO,
+        startVideo,
+        endVideo: document.querySelectorAll("video").length,
+        startAudio,
+        endAudio: document.querySelectorAll("audio").length,
       };
     });
     if (
-      stressResult.startVideo !== stressResult.endVideo ||
-      stressResult.startAudio !== stressResult.endAudio
+      churnResult.startVideo !== churnResult.endVideo ||
+      churnResult.startAudio !== churnResult.endAudio
     ) {
       throw new Error(
-        `media element leak: video ${stressResult.startVideo}->${stressResult.endVideo}, audio ${stressResult.startAudio}->${stressResult.endAudio}`,
+        `transcript churn leak: video ${churnResult.startVideo}->${churnResult.endVideo}, audio ${churnResult.startAudio}->${churnResult.endAudio}`,
       );
     }
 
