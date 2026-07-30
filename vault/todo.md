@@ -10,11 +10,9 @@ Todo:
 
 - [P3] WIKI-168 daemon-ize wiki backend — open since graph-engineering D2; survive terminal close, launchd or equivalent
 - [P1] WIKI-173 orch autopilot — pair next_review (WIKI-171) w/ LLM-parses-verdict + auto-steer + auto-merge on clean. Orchestrator becomes observer, not driver. Backend: verdict-parser module (extract findings via regex + LLM fallback), auto-steer builder, gated auto-merge (requires clean gate + optional Henry ack per ticket). Frontend: autopilot toggle per ticket, live log of autopilot decisions
-- [P1] WIKI-174 session replay scrubber — variable-speed replay of any archived agent session from raw.jsonl. Backend: replay endpoint w/ speed control; timeline of tool calls + prompts + responses. Frontend: scrubber UI (like WIKI-169 timeline but for a single session), bookmarks for verdicts/steers/errors. Debug tool for "why did cdx worker do X"
 - [P1] WIKI-175 PR conflict auto-rebase bot — detect DIRTY state after upstream merge; spawn dedicated worker that fetches origin/main, merges, resolves mechanical conflicts (imports, ordering, whitespace, lockfiles), pushes. Semantic conflicts escalate to orchestrator w/ diff summary. Cuts 2x rebase cycles seen in 07-29 five-feature arc
 - [P2] WIKI-176 live worker screencast strip — miniature terminal preview (last ~20 lines) inline in fleet view + per-ticket cards; refresh 2s from raw.jsonl tail. Skim 12 workers at glance w/o click-in
 - [P2] WIKI-177 blast radius view pre-spawn — before spawning ticket X, compute which in-flight branches touch same files (git diff main..branch per active branch); display collision-risk preview in spawn dialog. Prevents rebase pain
-- [P2] WIKI-178 cost dashboard — per-worker/ticket/orch/day USD, top spenders, prompt-size distribution, token velocity. Kill runaways before they burn tokens. Backend: cost aggregator over raw.jsonl. Frontend: dashboard page + per-ticket cost strip
 - [P2] WIKI-179 vault semantic search — embed vault notes (once, incrementally on write), search by meaning. Grep already exists; add embedding-backed rank. Backend: embedding store + query endpoint. Frontend: search palette upgrade w/ semantic-vs-lexical toggle
 - [P2] WIKI-180 auto-context injector on spawn — LLM scans vault + related tickets + recent PRs touching same files + related workgraphs; prepends "context prelude" to kickoff prompt. Cuts prompt-writing time. Backend: prelude builder; hook into spawn_agent. Frontend: preview prelude before spawn
 - [P2] WIKI-181 reviewer diversity harness — spawn N reviewers w/ distinct lenses (correctness / security / perf / test-strength) in parallel; synthesize verdicts. Codified adversarial verify — one lens catches what another misses. Wire into next_review (WIKI-171) as opt-in mode
@@ -27,11 +25,8 @@ Todo:
 
 Silky-smooth artifact rendering arc (Henry 2026-07-29):
 
-- [P1] WIKI-188 first-class PDF artifact — new `kind: pdf` renderer w/ inline page nav, zoom/fit-width toggle, thumbnail sidebar, native text selection + copy, keyboard nav (arrows / page-up-down / cmd+f in-doc search). PDF.js under the hood. Extends artifact schema; backend accepts base64 or file-path payload
-- [P1] WIKI-189 image artifact polish — blur-up progressive load, lazy-load below fold, click-to-lightbox (fullscreen w/ pinch/scroll zoom + pan), copy-to-clipboard, drag-to-download, EXIF strip on receive, `srcset` for retina. Fixes current jank; makes single-image inline previews feel silky
 - [P1] WIKI-190 video/GIF artifact kind — new `kind: video` inline player (mp4/webm/gif). Controls: play/pause/scrubber/speed/mute; poster frame lazy-load; loop-by-default for GIFs. Useful for Playwright recordings, mitmproxy captures, animated diagrams
 - [P2] WIKI-191 audio artifact kind — new `kind: audio` inline w/ waveform preview + scrubber + speed control; transcript overlay if attached. For voice memos, TTS output, transcription evidence
-- [P2] WIKI-192 multi-image gallery + lightbox — when artifact payload = N images (e.g. R1/R3/R7 screenshots in WIKI-172), render as responsive grid w/ captions; click any → lightbox w/ arrow-key nav + pinch-zoom. Currently a file-list dump
 - [P2] WIKI-193 visual-diff artifact mode — before/after image pair w/ opacity slider (drag L↔R for overlay) + pixel-diff toggle (bright overlay of changed regions). Huge for UI regression review — replaces the current back-and-forth of two screenshots
 - [P2] WIKI-194 interactive plot upgrade — kind:plot currently static (likely); make it interactive: hover-tooltip, wheel-zoom, drag-to-pan, box-select range, save-as-png. Plotly.js or D3 depending on payload shape
 - [P1] WIKI-195 universal fullscreen inspector — cmd+enter opens ANY artifact fullscreen; escape dismisses; arrow keys nav siblings; consistent chrome (title, download, copy source, close). Kills the inconsistent per-kind inspect flows
@@ -40,24 +35,10 @@ Silky-smooth artifact rendering arc (Henry 2026-07-29):
 - [P2] WIKI-198 file-list peek + side-pane — hover on kind:file-list entry shows peek (first 20 lines or thumbnail); click → opens side-pane w/ full viewer instead of external app hop
 - [P2] WIKI-199 universal copy/share/download surface — every artifact has consistent header actions (copy raw, copy image/svg, download, share URL if backend exposes). Currently per-kind ad-hoc
 - [P1] WIKI-200 artifact rendering perf pass — blur-up placeholders for all image kinds, virtualized list for many-artifact scrolls (>20), thumbnail cache (indexeddb) w/ mtime invalidation, subtle scale-in / fade-out enter/exit animations (150ms cubic-bezier, tuned per make-interfaces-feel-better). Root cause the current jank
-- [P2] WIKI-201 markdown inline-image polish — smooth rendering of `![](url)` in agent output: loading placeholder, sized-before-load (aspect-ratio hint or naturalWidth probe), click → lightbox, respect prefers-reduced-motion
 - [P3] WIKI-202 image/PDF OCR + searchable — OCR pass on receive (tesseract or macOS Vision framework); text index searchable via vault + palette. Enables grep over screenshot/PDF content
 
 Unknown provider-stream renderer arc (Henry 2026-07-29 — audit of `disposition=unknown` events across last 50 runs; see backend/app/agent_runtime/normalizer.py classifier):
 
-- [P1] WIKI-204 Codex `item/reasoning/summaryPartAdded` classifier fix (6,902) — reasoning-summary delta miscategorized as unknown. Move to _CODEX_SUMMARIZED_METHODS alongside agentMessage/delta so it feeds the "thinking" affordance and doesn't leak into UI
-- [P2] WIKI-205 Codex `rawResponse/completed` classifier fix (6,332) — low-value telemetry envelope. Move to _CODEX_IGNORED_METHODS. Cuts unknown-count noise by ~1.5% per session
-- [P1] WIKI-206 Codex `item/commandExecution/terminalInteraction` renderer (1,328) — terminal stdin injection during interactive commands. Critical for visibility into what worker is typing at prompts. Render as stdin badge on the associated command execution card
-- [P2] WIKI-207 Codex `turn/moderationMetadata` classifier (343) — content moderation results. Move to _CODEX_IGNORED_METHODS by default; RENDER if flag != safe (surface via a small warning chip). Guards against silent content blocks
-- [P2] WIKI-208 Codex hook lifecycle `hook/started` + `hook/completed` (163 each) — pair into summarized "hook: <name> (Nms)" entries. Both go to _CODEX_SUMMARIZED_METHODS; UI collapses matched pairs w/ duration
-- [P1] WIKI-209 Codex `warning` renderer (71) — provider warnings currently INVISIBLE. Render as prominent warning chip w/ message body. Small volume + high signal — likely surfacing issues we're missing today
-- [P3] WIKI-210 Codex `skills/changed` + `turn/plan/updated` renderers (4 + 2) — low-volume but semantically important. Skills-changed = "skills updated" chip; plan-updated = mini plan artifact
-- [P1] WIKI-211 Claude `system:thinking_tokens` classifier fix (9,617) — reclassify to SUMMARIZED (`_CLAUDE_SUMMARIZED_SYSTEM_SUBTYPES`). Feeds the thinking-tokens affordance instead of leaking into unknown count. Highest-frequency Claude unknown
-- [P1] WIKI-212 Claude `system:init` renderer (2,504) — session-start event carrying agents list, MCP servers, cwd, model, output_style, memory paths. Render as collapsible "session started" chip w/ details on expand (matches WIKI-165 escalation-edge style)
-- [P2] WIKI-213 Claude `system:task_notification` + `system:task_updated` renderers (771 + 294) — background task completion + progress. Render as small task-progress cards w/ status badge + output-file link if present
-- [P1] WIKI-214 Claude `system:api_retry` renderer (278) — retry attempts w/ error + status + delay. Render as warning chip "retry N/M — 429 in 5s". Currently silent — Henry can't see when Anthropic is throttling
-- [P1] WIKI-215 Claude `rate_limit_event` renderer (192) — rate-limit status events (five_hour, isUsingOverage, resetsAt, overageStatus). Render as prominent status pill; hoist to session-level chrome when status != "allowed". Critical Henry visibility (out-of-credits recovery)
-- [P2] WIKI-216 unknown-kind telemetry job — cron over `~/.wiki/agent-runtime/runs/` weekly, aggregates unknown-kind frequency, opens vault todo entry when a novel kind exceeds threshold (e.g. >100 events across the week). Kills the need for hand audits. Backend cron + vault write via `wiki todo add`
 - [P2] PHO-13800 customer_churned_date timing unreliable (19/29 in one entry window; zero churns Jan-Apr) — backfill true dates or document entry-date semantic; related PHO-13735
 - [P2] PHO-13763 PARKED by Henry 2026-07-15: PR 11383 drafted at 909ef288ce, gate-passed (CI green, 0 threads, sol REVIEW4 merge-ready), worker archived — resume = un-draft, re-verify freshness vs main, merge
 - [P3] WIKI-126: surface rebrand — rename app-facing identity only (app display name, window title, README header); NAME NOT YET CHOSEN by Henry, blocked until he picks. Internal identifiers stay (repo, wiki CLI, WIKI-* tickets, MCP names, vault paths — codename doctrine, Henry 2026-07-15)
@@ -93,6 +74,12 @@ In Progress:
 - [P2] PHO-13826 ModalSandboxBackend + PHO-13827 sandbox ownership — workers live (Modal replaces exe.dev for v0; 13828 lifecycle + 13829 egress design queued)
 - mitmweb rebuild: scope and build a clearer live proxy-traffic inspector — owner (misc); merged through B6 (tooling PR #10, 2026-07-21); remaining: P1 packaging
 - WIKI-135 dashboard: implementation workers only (drop reviewers/one-shots) — owner cdx:WIKI-135 (luna)
+- [P1] WIKI-174 session replay scrubber — variable-speed replay of any archived agent session from raw.jsonl. Backend: replay endpoint w/ speed control; timeline of tool calls + prompts + responses. Frontend: scrubber UI (like WIKI-169 timeline but for a single session), bookmarks for verdicts/steers/errors. Debug tool for "why did cdx worker do X"
+- [P1] WIKI-189 image artifact polish — blur-up progressive load, lazy-load below fold, click-to-lightbox (fullscreen w/ pinch/scroll zoom + pan), copy-to-clipboard, drag-to-download, EXIF strip on receive, `srcset` for retina. Fixes current jank; makes single-image inline previews feel silky
+- [P2] WIKI-192 multi-image gallery + lightbox — when artifact payload = N images (e.g. R1/R3/R7 screenshots in WIKI-172), render as responsive grid w/ captions; click any → lightbox w/ arrow-key nav + pinch-zoom. Currently a file-list dump
+- [P2] WIKI-201 markdown inline-image polish — smooth rendering of `![](url)` in agent output: loading placeholder, sized-before-load (aspect-ratio hint or naturalWidth probe), click → lightbox, respect prefers-reduced-motion
+- [P2] WIKI-216 unknown-kind telemetry job — cron over `~/.wiki/agent-runtime/runs/` weekly, aggregates unknown-kind frequency, opens vault todo entry when a novel kind exceeds threshold (e.g. >100 events across the week). Kills the need for hand audits. Backend cron + vault write via `wiki todo add`
+- [P2] WIKI-178 cost dashboard — per-worker/ticket/orch/day USD, top spenders, prompt-size distribution, token velocity. Kill runaways before they burn tokens. Backend: cost aggregator over raw.jsonl. Frontend: dashboard page + per-ticket cost strip
 
 Backlog:
 

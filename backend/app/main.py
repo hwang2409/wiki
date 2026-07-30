@@ -429,40 +429,7 @@ def resolve_vault_asset_path(raw_path: str) -> tuple[Path, str, str]:
     return target, path.as_posix(), media_type
 
 
-def open_relative_file(root_fd: int, relative_parts: tuple[str, ...]) -> int:
-    no_follow = getattr(os, "O_NOFOLLOW", 0)
-    directory_flag = getattr(os, "O_DIRECTORY", 0)
-    current_fd = os.dup(root_fd)
-    try:
-        for index, component in enumerate(relative_parts):
-            is_final = index == len(relative_parts) - 1
-            flags = os.O_RDONLY | no_follow | (0 if is_final else directory_flag)
-            next_fd = os.open(component, flags, dir_fd=current_fd)
-            os.close(current_fd)
-            current_fd = next_fd
-        return current_fd
-    except BaseException:
-        os.close(current_fd)
-        raise
-
-
-def open_relative_directory(root_fd: int, relative_parts: tuple[str, ...]) -> int:
-    no_follow = getattr(os, "O_NOFOLLOW", 0)
-    directory_flag = getattr(os, "O_DIRECTORY", 0)
-    current_fd = os.dup(root_fd)
-    try:
-        for component in relative_parts:
-            next_fd = os.open(
-                component,
-                os.O_RDONLY | directory_flag | no_follow,
-                dir_fd=current_fd,
-            )
-            os.close(current_fd)
-            current_fd = next_fd
-        return current_fd
-    except BaseException:
-        os.close(current_fd)
-        raise
+from .pathwalk import open_relative_directory, open_relative_file  # noqa: E402
 
 
 def iter_repo_files(file_root: Path, root_fd: int | None = None) -> tuple[list[Path], bool]:
@@ -3463,6 +3430,7 @@ ARTIFACT_MEDIA_TYPES = {
     "png": "image/png",
     "jpg": "image/jpeg",
     "webp": "image/webp",
+    "pdf": "application/pdf",
 }
 
 
