@@ -3842,6 +3842,46 @@ body.is-resizing-panes .pane-cell {
   border-color: var(--text-faint);
 }
 
+.tokens-refresh-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 8px;
+  padding: 6px 12px;
+  border: 1px solid
+    color-mix(in srgb, var(--accent-warning, var(--text-muted)) 40%, var(--background-modifier-border));
+  border-radius: var(--radius-m);
+  background: color-mix(
+    in srgb,
+    var(--accent-warning, var(--text-muted)) 5%,
+    var(--background-primary-alt)
+  );
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
+.tokens-refresh-message {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.tokens-refresh-retry {
+  padding: 3px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  background: var(--background-primary);
+  color: var(--text-normal);
+  cursor: pointer;
+  font-size: var(--font-ui-smaller);
+  font-weight: var(--fw-medium);
+}
+
+.tokens-refresh-retry:hover {
+  background: var(--background-modifier-hover);
+  border-color: var(--text-faint);
+}
+
 .activity-day-heading {
   margin: 24px 0 8px;
   color: var(--text-muted);

@@ -12,9 +12,25 @@ function basename(path: string) {
   return path.split("/").pop()?.replace(/\.md$/, "") ?? path;
 }
 
+const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+export function parseNoteUpdated(raw: string): number {
+  // Vault frontmatter `updated: YYYY-MM-DD` is a CALENDAR date, not a
+  // UTC instant. Date.parse("2026-07-30") returns midnight UTC — which
+  // is the previous day in any negative-offset locale, so a note edited
+  // today shows as "1d" and the whole 7d/30d bucketing shifts early.
+  // Parse date-only values as local midnight instead. (Round-4 review
+  // MEDIUM: negative-offset viewers saw same-day notes as one day old.)
+  if (DATE_ONLY_RE.test(raw)) {
+    const [y, m, d] = raw.split("-").map(Number);
+    return new Date(y, m - 1, d).getTime();
+  }
+  return Date.parse(raw);
+}
+
 function ageDays(note: NoteSummary): number {
   const raw = note.meta_updated || note.updated_at;
-  const time = Date.parse(raw);
+  const time = parseNoteUpdated(raw);
   if (Number.isNaN(time)) return 0;
   return Math.max(0, Math.floor((Date.now() - time) / DAY_MS));
 }

@@ -126,8 +126,17 @@ export function TokensView() {
   const [includeCached, setIncludeCached] = useState(false);
   const [data, setData] = useState<TokensResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [refreshFailed, setRefreshFailed] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [retryTick, setRetryTick] = useState(0);
+  // Mirror `data` in a ref so the poll `.catch` (which closes over stale
+  // state) can decide whether to trip the full error state or keep the
+  // last-good view + banner. (Round-4 review MEDIUM: any failed poll
+  // wiped the chart, even when a valid snapshot was already on screen.)
+  const dataRef = useRef<TokensResponse | null>(null);
+  useEffect(() => {
+    dataRef.current = data;
+  }, [data]);
 
   function pickPreset(next: Preset) {
     const chosen = PRESETS.find((p) => p.key === next);
@@ -153,12 +162,20 @@ export function TokensView() {
           if (cancelled) return;
           setData(next);
           setError(null);
+          setRefreshFailed(null);
           if (next.refreshing) {
             retry = window.setTimeout(() => load(false), 1000);
           }
         })
         .catch((err: unknown) => {
-          if (!cancelled) setError(err instanceof Error ? err.message : "Could not load token usage");
+          if (cancelled) return;
+          const msg = err instanceof Error ? err.message : "Could not load token usage";
+          // Preserve last-good data on a poll failure — the tokens page
+          // background-polls while the aggregator warms; blowing the
+          // chart away every time the request drops (rate-limit, network
+          // blip) is worse than showing stale numbers with a banner.
+          if (dataRef.current) setRefreshFailed(msg);
+          else setError(msg);
         })
         .finally(() => {
           if (!cancelled && showSpinner) setLoading(false);
@@ -173,8 +190,11 @@ export function TokensView() {
   }, [range.from, range.to, bucketMode, retryTick]);
 
   const retry = useCallback(() => {
+    // Keep any last-good `data` so the chart stays on screen while the
+    // retry request is in flight — clearing it would collapse to the
+    // loading state again and defeat the stale-data banner.
     setError(null);
-    setData(null);
+    setRefreshFailed(null);
     setRetryTick((tick) => tick + 1);
   }, []);
 
@@ -274,6 +294,24 @@ export function TokensView() {
           </div>
         ) : (
         <>
+        {refreshFailed ? (
+          <div
+            className="tokens-refresh-banner"
+            role="status"
+            aria-live="polite"
+          >
+            <span className="tokens-refresh-message">
+              Showing the last loaded snapshot. Refresh failed: {refreshFailed}
+            </span>
+            <button
+              className="tokens-refresh-retry"
+              type="button"
+              onClick={retry}
+            >
+              Retry
+            </button>
+          </div>
+        ) : null}
         <div className="tokens-controls">
           <div className="tokens-bucket-group" role="group" aria-label="Bucket size">
             {(["hour", "day"] as BucketMode[]).map((mode) => (

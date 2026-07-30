@@ -15,12 +15,32 @@ function vaultNotePath(filePath: string): string | null {
   return filePath.slice("vault/".length);
 }
 
+function parseCommitDate(iso: string): Date | null {
+  // git %aI keeps the author's UTC offset, so raw slice(0,10)/slice(11,16)
+  // would bucket a commit under the author's calendar day/wall-clock, not
+  // the viewer's. Parse once and derive both parts from the same local
+  // Date. (Round-4 review LOW: offset-crossing commits landed under the
+  // wrong local day/time.)
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return null;
+  return new Date(t);
+}
+
 function dayOf(iso: string) {
-  return iso.slice(0, 10);
+  const d = parseCommitDate(iso);
+  if (!d) return iso.slice(0, 10);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
 }
 
 function timeOf(iso: string) {
-  return iso.slice(11, 16);
+  const d = parseCommitDate(iso);
+  if (!d) return iso.slice(11, 16);
+  const h = String(d.getHours()).padStart(2, "0");
+  const min = String(d.getMinutes()).padStart(2, "0");
+  return `${h}:${min}`;
 }
 
 const DAY_FORMATTER = new Intl.DateTimeFormat(undefined, {
@@ -137,8 +157,11 @@ export function ActivityFeed({
   }, [refreshTick, retryTick]);
 
   const retry = useCallback(() => {
+    // Keep the last-loaded entries visible while the refetch is in
+    // flight — clearing `commits` collapses the feed back to the empty /
+    // loading state and defeats the stale-data banner. (Round-4 review
+    // MEDIUM: retry destroyed the entries it was meant to preserve.)
     setError(null);
-    setCommits(null);
     setRetryTick((tick) => tick + 1);
   }, []);
 

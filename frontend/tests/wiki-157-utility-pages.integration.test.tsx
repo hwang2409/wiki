@@ -4,7 +4,7 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 
 import { ActivityFeed } from "../src/activity";
 import { GraphView } from "../src/graph";
-import { HealthView } from "../src/health";
+import { HealthView, parseNoteUpdated } from "../src/health";
 import { TokensView } from "../src/tokens";
 import type { NoteSummary } from "../src/types";
 
@@ -514,5 +514,233 @@ test("tokens page: error state exposes a retry", async () => {
     });
   } finally {
     restore();
+  }
+});
+
+test("activity page: retry click during refresh failure preserves commits", async () => {
+  let call = 0;
+  const restore = installFetch(async () => {
+    call += 1;
+    if (call === 1) {
+      return jsonResponse([
+        {
+          sha: "0f00d001",
+          date: "2026-07-30T09:00:00+00:00",
+          message: "retry-preserves-me",
+          files: [{ path: "vault/notes/keep.md", status: "A" }],
+        },
+      ]);
+    }
+    throw new Error("refresh boom");
+  });
+  try {
+    const { rerender } = render(<ActivityFeed onOpenNote={() => {}} refreshTick={0} />);
+    await waitFor(() => {
+      expect(screen.getByText("retry-preserves-me")).toBeTruthy();
+    });
+    rerender(<ActivityFeed onOpenNote={() => {}} refreshTick={1} />);
+    await waitFor(() => {
+      const banner = document.querySelector<HTMLElement>(".activity-refresh-banner");
+      expect(banner).toBeTruthy();
+      expect(banner!.textContent).toContain("refresh boom");
+    });
+    // Click the in-banner Retry — the round-4 bug cleared commits here,
+    // collapsing the body to the initial loading state and destroying the
+    // entry the banner was meant to keep visible.
+    const banner = document.querySelector<HTMLElement>(".activity-refresh-banner")!;
+    const retryBtn = banner.querySelector<HTMLButtonElement>(".activity-refresh-retry")!;
+    fireEvent.click(retryBtn);
+    // Commit entry must still be on screen after the click; the loading
+    // placeholder must not have replaced the feed body.
+    expect(screen.getByText("retry-preserves-me")).toBeTruthy();
+    expect(screen.queryByText(/Reading vault activity/i)).toBeNull();
+  } finally {
+    restore();
+  }
+});
+
+test("activity page: %aI author-offset formats to viewer's local day/time", () => {
+  // %aI keeps the author's UTC offset. Slicing the raw string bucketed
+  // commits under the author's calendar wall-clock, so a commit authored
+  // at 22:30 UTC-05:00 (= 03:30 UTC next day) appeared under 22:30 on the
+  // author's day regardless of the viewer's timezone.
+  const iso = "2026-07-30T22:30:00-05:00";
+  const d = new Date(iso);
+  const expectedTime = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  // Only a meaningful assertion when the viewer's local time differs from
+  // the naive slice — skip when the environment happens to be UTC-05:00.
+  if (expectedTime === "22:30") return;
+
+  const restore = installFetch(async () =>
+    jsonResponse([
+      {
+        sha: "aaaaaaa1234567",
+        date: iso,
+        message: "author-offset",
+        files: [{ path: "vault/notes/tz.md", status: "A" }],
+      },
+    ]),
+  );
+  try {
+    render(<ActivityFeed onOpenNote={() => {}} refreshTick={0} />);
+    return waitFor(() => {
+      const time = document.querySelector<HTMLElement>(".activity-time");
+      expect(time).toBeTruthy();
+      expect(time!.textContent).toBe(expectedTime);
+      // Regression guard: the raw slice would render "22:30".
+      expect(time!.textContent).not.toBe("22:30");
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("tokens page: poll failure after a good snapshot keeps the chart and shows a banner", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  let call = 0;
+  const restore = installFetch(async () => {
+    call += 1;
+    if (call === 1) {
+      // First good snapshot with `refreshing: true` triggers a poll.
+      return jsonResponse({
+        buckets: [
+          {
+            ts: "2026-07-30T10:00:00+00:00",
+            series: { "claude/opus-4-7": { input: 4200, output: 900, cached: 50 } },
+          },
+        ],
+        totals: { input: 4200, cached: 50, output: 900, reasoning: 0 },
+        models: ["opus-4-7"],
+        clis: ["claude"],
+        sessions_scanned: 7,
+        bucket: "hour",
+        refreshing: true,
+      });
+    }
+    throw new Error("poll boom");
+  });
+  try {
+    render(<TokensView />);
+    await waitFor(() => {
+      expect(screen.getByText("4,200")).toBeTruthy();
+    });
+    // Advance past the 1s poll delay so the second (failing) fetch fires.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1200);
+    });
+    await waitFor(() => {
+      const banner = document.querySelector<HTMLElement>(".tokens-refresh-banner");
+      expect(banner).toBeTruthy();
+      expect(banner!.textContent).toContain("poll boom");
+      // Chart totals from the initial snapshot must survive.
+      expect(screen.getByText("4,200")).toBeTruthy();
+    });
+    // Regression: the full-page error state must NOT have swapped in.
+    expect(screen.queryByText(/Token usage is unavailable/i)).toBeNull();
+  } finally {
+    restore();
+    vi.useRealTimers();
+  }
+});
+
+test("tokens page: clicking the banner retry preserves the current chart", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  let call = 0;
+  const restore = installFetch(async () => {
+    call += 1;
+    if (call === 1) {
+      return jsonResponse({
+        buckets: [
+          {
+            ts: "2026-07-30T10:00:00+00:00",
+            series: { "claude/opus-4-7": { input: 3300, output: 700 } },
+          },
+        ],
+        totals: { input: 3300, cached: 0, output: 700, reasoning: 0 },
+        models: ["opus-4-7"],
+        clis: ["claude"],
+        sessions_scanned: 4,
+        bucket: "hour",
+        refreshing: true,
+      });
+    }
+    if (call === 2) throw new Error("poll boom");
+    // Retry — hang so we can observe the pre-retry chart state persists.
+    return new Promise<Response>(() => {});
+  });
+  try {
+    render(<TokensView />);
+    await waitFor(() => {
+      expect(screen.getByText("3,300")).toBeTruthy();
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1200);
+    });
+    let banner: HTMLElement | null = null;
+    await waitFor(() => {
+      banner = document.querySelector<HTMLElement>(".tokens-refresh-banner");
+      expect(banner).toBeTruthy();
+    });
+    fireEvent.click(banner!.querySelector<HTMLButtonElement>(".tokens-refresh-retry")!);
+    // Chart totals stay visible during the in-flight retry.
+    expect(screen.getByText("3,300")).toBeTruthy();
+    // Loading placeholder must NOT reappear.
+    expect(screen.queryByText(/Reading token telemetry/i)).toBeNull();
+  } finally {
+    restore();
+    vi.useRealTimers();
+  }
+});
+
+test("health page: parseNoteUpdated interprets YYYY-MM-DD as local calendar midnight", () => {
+  // Round-4 review MEDIUM: date-only frontmatter parsed as UTC midnight
+  // showed same-day notes as one day old in negative offsets and shifted
+  // 7d / 30d buckets by one day. The fix parses date-only as local
+  // midnight — mutation-sensitive assertion below.
+  const ms = parseNoteUpdated("2026-07-30");
+  const d = new Date(2026, 6, 30);
+  expect(ms).toBe(d.getTime());
+  // Regression: Date.parse("2026-07-30") returns UTC midnight, which
+  // differs from local midnight for any non-UTC viewer.
+  if (d.getTimezoneOffset() !== 0) {
+    expect(ms).not.toBe(Date.parse("2026-07-30"));
+  }
+  // Timestamped values still parse via Date.parse.
+  const withTime = parseNoteUpdated("2026-07-30T15:00:00Z");
+  expect(withTime).toBe(Date.parse("2026-07-30T15:00:00Z"));
+});
+
+test("health page: negative-offset same-day note reads as today, not 1d", () => {
+  // Force a viewer wall-clock late in the day so a UTC-midnight parse
+  // would tip over into "1d" for any non-positive offset.
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  vi.setSystemTime(new Date(2026, 6, 30, 22, 0, 0));
+  const notes: NoteSummary[] = [
+    {
+      id: "n1",
+      path: "vault/notes/today.md",
+      title: "today",
+      note_type: "reference",
+      updated_at: "2026-07-30T00:00:00Z",
+      meta_updated: "2026-07-30",
+      tags: [],
+      aliases: [],
+    } as unknown as NoteSummary,
+  ];
+  try {
+    render(
+      <HealthView
+        error={null}
+        loading={false}
+        notes={notes}
+        notesLoaded
+        onOpenNote={() => {}}
+        onRetry={() => {}}
+      />,
+    );
+    const age = document.querySelector<HTMLElement>(".health-age");
+    expect(age?.textContent).toBe("today");
+  } finally {
+    vi.useRealTimers();
   }
 });

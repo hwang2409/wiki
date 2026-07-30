@@ -501,6 +501,98 @@ class GroupedResetTests(unittest.TestCase):
             self.assertEqual(totals["input"], 1000)
             self.assertEqual(totals["output"], 5)
 
+    def test_absent_metric_reappearance_after_reset_reanchors(self) -> None:
+        """Round-4 review HIGH: a grouped reset that omits a metric leaves the
+        prior-epoch cumulative in place. When that metric reappears later at a
+        fresh-epoch value, the naive diff either credits fake growth or trips
+        a second grouped_reset that drops sibling deltas. The fix marks
+        absent-after-reset metrics as pending re-anchor.
+
+        Truth for this fixture: input contributed 100 + 5 + 5 = 110; output
+        contributed 50 + 2 + 3 = 55; reasoning contributed 20 + 0 (anchor) +
+        5 = 25. Without the fix, the reappearance of reasoning as 25 triggers
+        `25 < 20`-style behaviour on the sibling reset and zeros input +
+        output deltas from the third event, giving under-count 105 / 52 / 25.
+        """
+        with _EnvOverride() as paths:
+            from backend.app import tokens
+
+            day = paths["codex"] / "2026/07/09"
+            rows = [
+                _codex_session_meta("2026-07-09T18:00:00Z", "gpt-5.4"),
+                # Epoch 1 — all three metrics reported.
+                _codex_token_row(
+                    "2026-07-09T18:00:10Z",
+                    {"input": 100, "output": 50, "reasoning": 20},
+                ),
+                # Reset — only input + output reported. reasoning must be
+                # marked pending re-anchor; its prev-epoch 20 is now stale.
+                _codex_token_row_partial(
+                    "2026-07-09T18:05:00Z",
+                    {"input": 5, "output": 2},
+                ),
+                # Reasoning reappears — value happens to be > prev (25 > 20)
+                # so a naive diff would fake-credit 5 tokens; the fix must
+                # anchor (delta 0) and preserve the input + output deltas.
+                _codex_token_row(
+                    "2026-07-09T18:10:00Z",
+                    {"input": 10, "output": 5, "reasoning": 25},
+                ),
+                # Fresh-epoch reasoning continues climbing; delta from anchor
+                # is the honest 5.
+                _codex_token_row(
+                    "2026-07-09T18:15:00Z",
+                    {"input": 12, "output": 6, "reasoning": 30},
+                ),
+            ]
+            _write_jsonl(day / "rollout-absent.jsonl", rows)
+            tokens.refresh()
+            totals = tokens.query()["totals"]
+            # input: 100 (epoch 1) + 0 (reset) + 5 (10 - 5) + 2 (12 - 10)
+            self.assertEqual(totals["input"], 107)
+            # output: 50 + 0 + 3 (5 - 2) + 1 (6 - 5)
+            self.assertEqual(totals["output"], 54)
+            # reasoning: 20 (epoch 1) + 0 (anchor on re-appearance) + 5 (30 - 25)
+            self.assertEqual(totals["reasoning"], 25)
+
+    def test_absent_metric_reappearance_below_prev_no_double_reset(self) -> None:
+        """Sibling scenario: reappearing metric's fresh-epoch value happens to
+        be BELOW its stale prev. Without pending re-anchor tracking, the
+        sibling drop trips a second grouped_reset — zeroing input + output
+        deltas that were valid. The fix must exempt pending metrics from the
+        reset check."""
+        with _EnvOverride() as paths:
+            from backend.app import tokens
+
+            day = paths["codex"] / "2026/07/09"
+            rows = [
+                _codex_session_meta("2026-07-09T18:00:00Z", "gpt-5.4"),
+                _codex_token_row(
+                    "2026-07-09T18:00:10Z",
+                    {"input": 100, "output": 50, "reasoning": 40},
+                ),
+                # Reset — reasoning omitted. Prev reasoning (40) is now stale.
+                _codex_token_row_partial(
+                    "2026-07-09T18:05:00Z",
+                    {"input": 5, "output": 2},
+                ),
+                # Reasoning reappears at 8 (< stale 40). Naive check would
+                # detect reset and drop the valid input/output growth deltas.
+                _codex_token_row(
+                    "2026-07-09T18:10:00Z",
+                    {"input": 15, "output": 8, "reasoning": 8},
+                ),
+            ]
+            _write_jsonl(day / "rollout-below.jsonl", rows)
+            tokens.refresh()
+            totals = tokens.query()["totals"]
+            # input growth 5 -> 15 is real (delta 10).
+            self.assertEqual(totals["input"], 110)
+            # output growth 2 -> 8 is real (delta 6).
+            self.assertEqual(totals["output"], 56)
+            # reasoning: 40 (epoch 1) + 0 (anchor at 8).
+            self.assertEqual(totals["reasoning"], 40)
+
 
 class MetricAvailabilityTests(unittest.TestCase):
     """WIKI-157: `reasoning` and `cached` must be OMITTED from the response

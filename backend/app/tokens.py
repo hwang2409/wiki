@@ -245,22 +245,44 @@ def _codex_apply(state: dict, file_state: dict, row: dict, index: dict) -> None:
         return
 
     prev: dict[str, int] = file_state.get("cum") or {}
+    # Metrics whose old-epoch cumulative in `prev` is stale after a prior
+    # grouped reset that did NOT re-report them. Their next appearance is a
+    # fresh baseline, not an increment — diffing would either credit fake
+    # growth or flag a spurious second reset that drops sibling deltas.
+    # (Round-4 review HIGH: absent-metric re-appearance wiped valid deltas.)
+    pending: set[str] = set(file_state.get("pending_reanchor") or [])
+
     # Codex ships the counters as a group. A resume/rotate resets ALL of them
     # to fresh baselines in the same event — a metric that appears to have
     # grown after another metric dropped is really a fresh count, not real
     # activity. Detect the reset once across cum_event, then zero every
     # reported metric together. (Round-3 review: per-metric re-anchor
-    # over-counted grouped resets.)
+    # over-counted grouped resets.) Skip pending re-anchors from the check —
+    # their prev value is from the pre-reset epoch and would flag a false
+    # reset when the new-epoch cumulative is (correctly) smaller.
     grouped_reset = any(
-        prev.get(k) is not None and v < prev[k] for k, v in cum_event.items()
+        k not in pending and prev.get(k) is not None and v < prev[k]
+        for k, v in cum_event.items()
     )
     delta: dict[str, int] = {}
     if grouped_reset:
         delta = {k: 0 for k in cum_event}
+        # Metrics that were tracked pre-reset but are absent from THIS reset
+        # event still hold their old-epoch cumulative in `prev`. Mark them
+        # so their next appearance re-anchors (delta = 0) instead of diffing.
+        absent = set(prev) - set(cum_event)
+        pending |= absent
+        # Present metrics ARE the new baseline — clear any prior pending flag.
+        pending -= set(cum_event)
     else:
         for k, v in cum_event.items():
-            p = prev.get(k)
-            delta[k] = v if p is None else v - p
+            if k in pending:
+                # Re-anchor: adopt v as the new epoch baseline, no delta.
+                delta[k] = 0
+                pending.discard(k)
+            else:
+                p = prev.get(k)
+                delta[k] = v if p is None else v - p
 
     # Availability is gated on a POSITIVE DELTA — not on the cumulative
     # total. A plain non-reasoning model that reads back the last reasoning
@@ -275,9 +297,15 @@ def _codex_apply(state: dict, file_state: dict, row: dict, index: dict) -> None:
 
     # Persist the new cumulative — absent fields retain their prior last
     # value so a later event that re-includes them still diffs correctly.
+    # (Absent-after-reset metrics carry a `pending_reanchor` flag that
+    # forces delta=0 on re-appearance regardless of the stale prev value.)
     merged = dict(prev)
     merged.update(cum_event)
     file_state["cum"] = merged
+    if pending:
+        file_state["pending_reanchor"] = sorted(pending)
+    elif "pending_reanchor" in file_state:
+        del file_state["pending_reanchor"]
 
     _add_delta(
         state,
