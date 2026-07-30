@@ -491,7 +491,15 @@ function paneLabel(path: string | null): string {
   const ticket = ticketFromPanePath(path);
   if (ticket) return ticket;
   const terminalId = terminalIdFromPanePath(path);
-  if (terminalId) return `term:${terminalId.slice(0, 8)}`;
+  if (terminalId) {
+    try {
+      const name = window.localStorage.getItem(`wiki-terminal-name:${terminalId}`)?.trim();
+      if (name) return name;
+    } catch {
+      // Fall through to the default label.
+    }
+    return `term:${terminalId.slice(0, 8)}`;
+  }
   const utility = utilityKindFromPanePath(path);
   if (utility) return utilityLabel(utility);
   return basename(path);

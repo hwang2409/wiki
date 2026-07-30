@@ -413,8 +413,14 @@ async function focusedTerminalId(page) {
   });
 }
 
+// WIKI-152 removed the numeric .tmux-status-index spans; derive the active
+// window index from the position of the active status item instead.
 async function activeWindowIndex(page) {
-  return page.locator(".tmux-status-item.is-active .tmux-status-index").textContent();
+  return page.evaluate(() => {
+    const items = [...document.querySelectorAll(".tmux-status-item")];
+    const active = items.findIndex((item) => item.classList.contains("is-active"));
+    return active === -1 ? null : String(active);
+  });
 }
 
 async function readMarkerNumber(page, terminalId, prefix) {
@@ -525,6 +531,10 @@ try {
     if (message.type() === "error") {
       const text = message.text();
       if (text.includes("/ws/terminal/unauthorized-terminal") && text.includes("Unexpected response code: 403")) {
+        return;
+      }
+      // The isolated fixture backend serves no workgraphs; the app's poll 404s.
+      if (text.includes("Failed to load resource") && message.location()?.url?.includes("/workgraph")) {
         return;
       }
       result.pageErrors.push(`console:${text}`);
@@ -703,9 +713,19 @@ try {
   const paneAfterL = await focusedPaneKind(page);
 
   await leader(page, "1");
-  await page.waitForFunction(() => document.querySelector(".tmux-status-item.is-active .tmux-status-index")?.textContent === "1");
+  await page.waitForFunction(
+    () =>
+      [...document.querySelectorAll(".tmux-status-item")].findIndex((item) =>
+        item.classList.contains("is-active")
+      ) === 1
+  );
   await leader(page, "0");
-  await page.waitForFunction(() => document.querySelector(".tmux-status-item.is-active .tmux-status-index")?.textContent === "0");
+  await page.waitForFunction(
+    () =>
+      [...document.querySelectorAll(".tmux-status-item")].findIndex((item) =>
+        item.classList.contains("is-active")
+      ) === 0
+  );
   result.activeWindowAfterTerminalSwitchBack = await activeWindowIndex(page);
   result.windowSwitchWorked =
     paneAfterH === "agent" && paneAfterL === "terminal" && result.activeWindowAfterTerminalSwitchBack === "0";
@@ -714,8 +734,9 @@ try {
   const visibleTerminalHosts = await page.locator(".terminal-pane-host").count();
   if (visibleTerminalHosts === 0) {
     const postSwitchSummary = await page.evaluate(() => ({
-      activeWindowIndex:
-        document.querySelector(".tmux-status-item.is-active .tmux-status-index")?.textContent ?? null,
+      activeWindowIndex: [...document.querySelectorAll(".tmux-status-item")].findIndex((item) =>
+        item.classList.contains("is-active")
+      ),
       locationHash: window.location.hash,
       storedLayout: localStorage.getItem("wiki-window-layout-v2"),
       paneLabels: [...document.querySelectorAll(".pane-frame")]

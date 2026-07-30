@@ -451,6 +451,8 @@ class TerminalWebSocketTests(unittest.TestCase):
                 self.control_frames.append(payload)
 
         session = terminal.TerminalSession.__new__(terminal.TerminalSession)
+        session.cwd = Path.home() / "projects" / "demo"
+        session.shell_path = "/bin/zsh"
         session._flow_gate = threading.Condition()
         session._pending_bytes = 0
         session._output_queue = queue.Queue()
@@ -465,6 +467,8 @@ class TerminalWebSocketTests(unittest.TestCase):
 
         self.assertEqual([frame["type"] for frame in websocket.control_frames], ["hello", "exit"])
         self.assertEqual(websocket.control_frames[0]["capabilities"], {"binaryInput": True})
+        self.assertEqual(websocket.control_frames[0]["shell"], "/bin/zsh")
+        self.assertEqual(websocket.control_frames[0]["cwd"], "~/projects/demo")
         self.assertLess(len(websocket.binary_frames), 20)
         self.assertEqual(sum(len(frame) for frame in websocket.binary_frames), 20 * 4096)
 
@@ -481,6 +485,8 @@ class TerminalWebSocketTests(unittest.TestCase):
                 self.control_frames.append(payload)
 
         session = terminal.TerminalSession.__new__(terminal.TerminalSession)
+        session.cwd = Path("/tmp")
+        session.shell_path = "/bin/zsh"
         session._flow_gate = threading.Condition()
         session._pending_bytes = 0
         session._output_queue = queue.Queue()

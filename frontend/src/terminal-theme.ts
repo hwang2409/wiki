@@ -89,7 +89,6 @@ export function deriveTerminalTheme(target: HTMLElement = document.documentEleme
   const backgroundAlt = readVar(styles, "--background-primary-alt");
   const surface = readVar(styles, "--background-secondary");
   const border = readVar(styles, "--background-modifier-border");
-  const hover = readVar(styles, "--background-modifier-hover");
   const foreground = readVar(styles, "--text-normal");
   const muted = readVar(styles, "--text-muted");
   const faint = readVar(styles, "--text-faint");
@@ -115,9 +114,10 @@ export function deriveTerminalTheme(target: HTMLElement = document.documentEleme
       "--terminal-muted": muted,
       "--terminal-faint": faint,
       "--terminal-accent": accent,
+      "--terminal-success": success,
       "--terminal-warning": warning,
       "--terminal-danger": danger,
-      "--terminal-overlay": withAlpha(hover, 0.96),
+      "--terminal-overlay": withAlpha(mix(background, surface, 0.45), 0.96),
     },
     renderer: {
       background,
