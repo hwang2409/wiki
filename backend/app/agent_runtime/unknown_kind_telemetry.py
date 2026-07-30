@@ -235,7 +235,10 @@ class UnknownKindTelemetry:
             cursor_path = cursor.get("path") if isinstance(cursor, dict) else None
             if not isinstance(cursor_path, str) or not Path(cursor_path).is_file():
                 if isinstance(cursor, dict):
-                    missing_sweeps = int(cursor.get("missing_sweeps", 0))
+                    try:
+                        missing_sweeps = int(cursor.get("missing_sweeps", 0))
+                    except (TypeError, ValueError):
+                        missing_sweeps = 0
                     if missing_sweeps < 1:
                         cursor["missing_sweeps"] = missing_sweeps + 1
                         continue
@@ -254,13 +257,40 @@ class UnknownKindTelemetry:
             )
             cursors.pop(oldest_name, None)
 
+    @staticmethod
+    def _archive_run_name(raw_path: Path, archive_dir: Path) -> str:
+        metadata_path = raw_path.parent / "run.json"
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            candidate = metadata.get("run_id")
+            if isinstance(candidate, str) and candidate:
+                return candidate
+        except (OSError, TypeError, ValueError):
+            pass
+        return f"archive:{raw_path.relative_to(archive_dir)}"
+
+    def _published_archive_keys(self) -> set[str]:
+        archive_dir = self.paths.archive_dir
+        if not archive_dir.is_dir():
+            return set()
+        return {
+            self._archive_run_name(marker.parent / "raw.jsonl", archive_dir)
+            for marker in archive_dir.rglob(ARCHIVE_COMPLETION_MARKER)
+        }
+
     def _iter_sources(self, state: dict[str, Any]):
         completed = set(state["completed_runs"])
+        published = self._published_archive_keys()
         runs_dir = self.paths.runs_dir
         if runs_dir.is_dir():
             for run_dir in runs_dir.iterdir():
                 raw_path = run_dir / "raw.jsonl"
-                if run_dir.is_dir() and raw_path.is_file():
+                if (
+                    run_dir.is_dir()
+                    and raw_path.is_file()
+                    and run_dir.name not in published
+                    and run_dir.name not in completed
+                ):
                     yield _ScanSource(run_dir.name, raw_path, False)
 
         archive_dir = self.paths.archive_dir
@@ -269,17 +299,7 @@ class UnknownKindTelemetry:
         for raw_path in archive_dir.rglob("raw.jsonl"):
             if not (raw_path.parent / ARCHIVE_COMPLETION_MARKER).is_file():
                 continue
-            run_name = None
-            metadata_path = raw_path.parent / "run.json"
-            try:
-                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-                candidate = metadata.get("run_id")
-                if isinstance(candidate, str) and candidate:
-                    run_name = candidate
-            except (OSError, TypeError, ValueError):
-                pass
-            if run_name is None:
-                run_name = f"archive:{raw_path.relative_to(archive_dir)}"
+            run_name = self._archive_run_name(raw_path, archive_dir)
             if run_name not in completed:
                 yield _ScanSource(run_name, raw_path, True)
 

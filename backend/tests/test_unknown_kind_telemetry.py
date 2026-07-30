@@ -295,6 +295,31 @@ class UnknownKindTelemetryTests(unittest.TestCase):
         self.assertEqual(first["filed_kinds"], [])
         self.assertEqual(second["filed_kinds"], [])
 
+    def test_published_archive_wins_over_lingering_live_remnant(self) -> None:
+        self._append(60)
+        archive_raw = self.paths.archive_dir / "WIKI-1" / "session" / "raw.jsonl"
+        archive_raw.parent.mkdir(parents=True)
+        shutil.copy2(self.raw, archive_raw)
+        (archive_raw.parent / "run.json").write_text(
+            json.dumps({"run_id": "run-1"}), encoding="utf-8"
+        )
+        (archive_raw.parent / telemetry_module.ARCHIVE_COMPLETION_MARKER).write_text(
+            json.dumps({"run_id": "run-1"}), encoding="utf-8"
+        )
+        service = self._service()
+
+        first = service.run_once()
+        second = service.run_once()
+        shutil.rmtree(self.raw.parent)
+        cleanup = service.run_once()
+
+        self.assertEqual(first["unknown_counts"], {"item/novel": 60})
+        self.assertEqual(second["unknown_counts"], {"item/novel": 60})
+        self.assertEqual(cleanup["unknown_counts"], {"item/novel": 60})
+        self.assertEqual(first["filed_kinds"], [])
+        self.assertEqual(second["filed_kinds"], [])
+        self.assertEqual(cleanup["filed_kinds"], [])
+
     def test_live_cursor_cap_does_not_evict_active_runs(self) -> None:
         self._append(1)
         self._write_run("run-2", 1)
