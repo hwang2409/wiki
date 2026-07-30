@@ -11,7 +11,9 @@ from backend.app.agent_runtime.next_review import (
     record_diverse_verdicts,
     synthesize_diverse_verdicts,
 )
-from backend.app import main
+from backend.app.agent_runtime.diversity_orchestration import collect_diversity_verdict, journal_path
+from backend.app.agent_runtime.ticket import base_ticket, parse_reviewer_id
+from backend.app import main, workgraph
 from backend.app.main import SpawnWorkerIn
 from wiki_cli import graph_lint
 
@@ -380,6 +382,7 @@ class NextReviewTests(unittest.TestCase):
         self.assertEqual({item["lens"] for item in worktrees}, {"correctness", "security"})
         self.assertTrue(all("aaaaaaaa" in request.prompt for request in spawned))
         self.assertTrue(all("lens mandate:" in request.prompt for request in spawned))
+        self.assertTrue(all("headRefOid" in request.prompt and "STALE-SHA" in request.prompt for request in spawned))
 
     def test_diversity_retry_only_respawns_unrecorded_lens(self) -> None:
         spawned: list[str] = []
@@ -415,6 +418,33 @@ class NextReviewTests(unittest.TestCase):
         self.assertEqual(spawned.count("WIKI-181-REVIEW1-correctness"), 1)
         self.assertEqual(spawned.count("WIKI-181-REVIEW1-security"), 2)
 
+    def test_diversity_round_two_uses_new_lens_names(self) -> None:
+        captured: list[str] = []
+        result = next_review_module.next_review(
+            "WIKI-181",
+            181,
+            "c" * 40,
+            orch="wiki",
+            diversity=2,
+            gate=lambda _pr, _sha: {"verdict": "pass"},
+            resolve_root=lambda _orch: Path("/repo"),
+            worktree=lambda **kwargs: Path(f"/repo/{kwargs['lens']}"),
+            spawn=lambda request: captured.append(request.ticket) or {"run_id": request.ticket},
+            archive=lambda _reviewer: {"outcome": "closed"},
+            archived=lambda: [],
+            registry=lambda: {
+                "WIKI-181-REVIEW1-correctness": {"current": {"state": "completed"}},
+                "WIKI-181-REVIEW1-security": {"current": {"state": "completed"}},
+            },
+            status_reader=lambda _reviewer: {"state": "completed"},
+            request_id="diversity-round-two",
+        )
+        self.assertEqual(result["round"], 2)
+        self.assertEqual(
+            set(captured),
+            {"WIKI-181-REVIEW2-correctness", "WIKI-181-REVIEW2-security"},
+        )
+
     def test_synthesis_dedupes_and_keeps_max_severity_and_lenses(self) -> None:
         result = synthesize_diverse_verdicts(
             "WIKI-181",
@@ -445,8 +475,8 @@ class NextReviewTests(unittest.TestCase):
             ticket="WIKI-181",
             expected_sha="d" * 40,
             verdicts={
-                "correctness": {"state": "MERGE-READY", "findings": []},
-                "security": {"state": "MERGE-READY", "findings": []},
+                "correctness": {"state": "MERGE-READY", "source_sha": "d" * 40, "findings": []},
+                "security": {"state": "MERGE-READY", "source_sha": "d" * 40, "findings": []},
             },
             orch="wiki",
             record_verdict=lambda **kwargs: calls.append(kwargs),
@@ -461,7 +491,7 @@ class NextReviewTests(unittest.TestCase):
             [
                 "WIKI-181-REVIEW2-correctness",
                 "WIKI-181-REVIEW2-security",
-                "WIKI-181-REVIEW-SYNTHESIS",
+                "WIKI-181-REVIEW2-synthesis",
             ],
         )
         for call in calls:
@@ -473,6 +503,156 @@ class NextReviewTests(unittest.TestCase):
                 "created_at": "2026-07-30T00:00:00+00:00",
             }
             self.assertEqual(graph_lint.validate_document(edge, "edge"), [])
+
+    def test_collector_waits_for_exact_set_and_records_only_combined_route(self) -> None:
+        next_review_module.next_review(
+            "WIKI-181",
+            181,
+            "e" * 40,
+            orch="wiki",
+            diversity=["correctness", "security"],
+            gate=lambda _pr, _sha: {"verdict": "pass"},
+            resolve_root=lambda _orch: Path("/repo"),
+            worktree=lambda **kwargs: Path(f"/repo/{kwargs['lens']}"),
+            spawn=lambda request: {"run_id": request.ticket},
+            archived=lambda: [],
+            registry=lambda: {},
+            request_id="collector-journal",
+        )
+        calls: list[dict] = []
+        clean = lambda reviewer: {
+            "worker": reviewer,
+            "state": "MERGE-READY",
+            "source_sha": "e" * 40,
+            "findings": [],
+        }
+        first = collect_diversity_verdict(
+            runtime_dir=Path(self.runtime_tmp.name),
+            ticket="WIKI-181",
+            reviewer="WIKI-181-REVIEW1-correctness",
+            verdict=clean("WIKI-181-REVIEW1-correctness"),
+            record_verdict=lambda **kwargs: calls.append(kwargs),
+        )
+        second = collect_diversity_verdict(
+            runtime_dir=Path(self.runtime_tmp.name),
+            ticket="WIKI-181",
+            reviewer="WIKI-181-REVIEW1-security",
+            verdict=clean("WIKI-181-REVIEW1-security"),
+            record_verdict=lambda **kwargs: calls.append(kwargs),
+        )
+
+        self.assertEqual(first["status"], "pending")
+        self.assertEqual(second["state"], "MERGE-READY")
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[-1]["payload"]["worker"], "WIKI-181-REVIEW1-synthesis")
+        self.assertEqual(parse_reviewer_id(calls[-1]["reviewer"]).round, 1)
+        self.assertEqual(base_ticket("WIKI-181-REVIEW1-security"), "WIKI-181")
+
+    def test_reviewer_parser_is_case_insensitive_and_round_scoped(self) -> None:
+        parsed = parse_reviewer_id("wiki-181-review2-SECURITY")
+        self.assertEqual(parsed.ticket, "WIKI-181")
+        self.assertEqual(parsed.round, 2)
+        self.assertEqual(parsed.lens, "security")
+        self.assertEqual(base_ticket("wiki-181-review2-SECURITY"), "WIKI-181")
+
+    def test_collector_restart_boundary_requires_disk_journal(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "journal is missing"):
+            collect_diversity_verdict(
+                runtime_dir=Path(self.runtime_tmp.name),
+                ticket="WIKI-181",
+                reviewer="WIKI-181-REVIEW1-security",
+                verdict={"state": "MERGE-READY", "source_sha": "e" * 40, "findings": []},
+                record_verdict=lambda **_kwargs: None,
+            )
+
+    def test_collector_keeps_stale_report_dirty_until_synthesis(self) -> None:
+        next_review_module.next_review(
+            "WIKI-181", 181, "3" * 40, orch="wiki", diversity=["correctness", "security"],
+            gate=lambda _pr, _sha: {"verdict": "pass"}, resolve_root=lambda _orch: Path("/repo"),
+            worktree=lambda **kwargs: Path(f"/repo/{kwargs['lens']}"),
+            spawn=lambda request: {"run_id": request.ticket}, archived=lambda: [], registry=lambda: {},
+            request_id="collector-stale",
+        )
+        calls: list[dict] = []
+        for lens, sha in (("correctness", "0" * 40), ("security", "3" * 40)):
+            report = collect_diversity_verdict(
+                runtime_dir=Path(self.runtime_tmp.name), ticket="WIKI-181",
+                reviewer=f"WIKI-181-REVIEW1-{lens}",
+                verdict={"state": "MERGE-READY", "source_sha": sha, "findings": []},
+                record_verdict=lambda **kwargs: calls.append(kwargs),
+            )
+        self.assertEqual(report["state"], "NOT-MERGE-READY")
+        self.assertEqual(calls[-1]["payload"]["state"], "NOT-MERGE-READY")
+
+    def test_synthesis_marks_missing_and_stale_lenses_dirty(self) -> None:
+        missing = synthesize_diverse_verdicts(
+            "WIKI-181",
+            "f" * 40,
+            {"correctness": {"state": "MERGE-READY", "source_sha": "f" * 40, "findings": []}},
+            expected_lenses=["correctness", "security"],
+        )
+        stale = synthesize_diverse_verdicts(
+            "WIKI-181",
+            "f" * 40,
+            {
+                "correctness": {"state": "MERGE-READY", "source_sha": "0" * 40, "findings": []},
+                "security": {"state": "MERGE-READY", "source_sha": "f" * 40, "findings": []},
+            },
+            expected_lenses=["correctness", "security"],
+        )
+        self.assertEqual(missing["state"], "NOT-MERGE-READY")
+        self.assertEqual(stale["state"], "NOT-MERGE-READY")
+
+    def test_synthesis_is_byte_stable_and_different_lines_do_not_dedupe(self) -> None:
+        verdicts = {
+            "correctness": {
+                "state": "NOT-MERGE-READY",
+                "source_sha": "1" * 40,
+                "findings": [{"severity": "HIGH", "file": "x.py", "line": 3, "problem": "unsafe input", "fix": "validate"}],
+            },
+            "security": {
+                "state": "NOT-MERGE-READY",
+                "source_sha": "1" * 40,
+                "findings": [{"severity": "MEDIUM", "file": "x.py", "line": 4, "problem": "unsafe input", "fix": "validate"}],
+            },
+        }
+        first = synthesize_diverse_verdicts("WIKI-181", "1" * 40, verdicts, expected_lenses=["correctness", "security"])
+        second = synthesize_diverse_verdicts("WIKI-181", "1" * 40, verdicts, expected_lenses=["security", "correctness"])
+        self.assertEqual(json.dumps(first, sort_keys=True), json.dumps(second, sort_keys=True))
+        self.assertEqual(len(first["findings"]), 2)
+
+    def test_generated_diversity_edges_form_a_valid_workgraph(self) -> None:
+        calls: list[dict] = []
+        record_diverse_verdicts(
+            ticket="WIKI-181",
+            expected_sha="2" * 40,
+            verdicts={
+                "correctness": {"state": "MERGE-READY", "source_sha": "2" * 40, "findings": []},
+                "security": {"state": "MERGE-READY", "source_sha": "2" * 40, "findings": []},
+            },
+            orch="wiki",
+            record_verdict=lambda **kwargs: calls.append(kwargs),
+            request_id="graph-generated",
+            round_number=1,
+            created_at="2026-07-30T00:00:00+00:00",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            status_dir = Path(directory) / "status"
+            snapshot_dir = Path(directory) / "snapshots"
+            workgraph.append_edge(
+                "WIKI-181", "spawn", "orch:wiki", "WIKI-181", {
+                    "ticket": "WIKI-181", "role": "implement", "model": "test",
+                    "worktree": "/repo", "request_id": "graph-spawn",
+                }, orch="wiki", status_dir=status_dir, snapshot_dir=snapshot_dir,
+            )
+            for call in calls:
+                workgraph.append_edge(
+                    "WIKI-181", "verdict", call["reviewer"], "orch:wiki", call["payload"],
+                    orch="wiki", status_dir=status_dir, snapshot_dir=snapshot_dir,
+                    request_id=call["request_id"],
+                )
+            graph = workgraph.load_workgraph("WIKI-181", status_dir)
+            self.assertEqual(graph_lint.validate_document(graph, "workgraph"), [])
 
 
 if __name__ == "__main__":

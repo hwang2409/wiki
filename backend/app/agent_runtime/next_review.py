@@ -10,7 +10,6 @@ from __future__ import annotations
 import re
 import threading
 import json
-import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
@@ -18,32 +17,19 @@ from pathlib import Path
 from typing import Any, Sequence
 from uuid import uuid4
 
-
-_REVIEWER_ID = re.compile(
-    r"^(?P<ticket>[A-Z0-9-]+)-REVIEW(?P<round>[1-9][0-9]*)(?:-(?P<lens>[a-z-]+))?$"
+from .ticket import parse_reviewer_id, reviewer_id as canonical_reviewer_id
+from .diversity_orchestration import create_journal
+from .reviewer_diversity import (
+    DEFAULT_DIVERSITY_LENSES,
+    LENS_PROMPTS,
+    normalize_diversity as _normalize_diversity,
+    record_diverse_verdicts,
+    synthesize_diverse_verdicts,
 )
-DEFAULT_DIVERSITY_LENSES = ("correctness", "security", "perf", "test-strength")
-LENS_PROMPTS = {
-    "correctness": (
-        "focus on functional correctness, invariants, edge cases, and behavior "
-        "that can make the implementation wrong"
-    ),
-    "security": (
-        "focus on trust boundaries, input validation, privilege changes, data "
-        "exposure, and abuse paths"
-    ),
-    "perf": (
-        "focus on latency, concurrency, resource use, unbounded work, and "
-        "failure behavior under load"
-    ),
-    "test-strength": (
-        "focus on missing tests, weak assertions, untested failure paths, and "
-        "tests that can pass while the feature is broken"
-    ),
-}
-_SEVERITY_RANK = {"INFO": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "BLOCKING": 4}
-_STOP_WORDS = frozenset(
-    "a an and are as at be by for from in is it of on or that the this to with".split()
+
+REVIEW_CONTRACT = (
+    "verify PR headRefOid and git rev-parse HEAD match the pinned sha; if either "
+    "check fails, stop with INSUFFICIENT-CONTEXT and STALE-SHA, and do not report MERGE-READY"
 )
 _TERMINAL_STATES = {
     "abandoned",
@@ -59,242 +45,6 @@ _REQUEST_LOCK = threading.RLock()
 _REQUEST_RESULTS: dict[str, dict[str, Any]] = {}
 _REQUEST_STAGES: dict[str, dict[str, Any]] = {}
 _REQUEST_STATE_LOADED = False
-
-
-def _normalize_diversity(value: int | Sequence[str] | None) -> tuple[str, ...]:
-    """Validate and normalize the opt-in reviewer lens selection."""
-
-    if value is None:
-        return ()
-    if isinstance(value, bool):
-        raise ValueError("diversity must be a lens list or a count")
-    if isinstance(value, int):
-        if not 1 <= value <= len(DEFAULT_DIVERSITY_LENSES):
-            raise ValueError(f"diversity count must be between 1 and {len(DEFAULT_DIVERSITY_LENSES)}")
-        return DEFAULT_DIVERSITY_LENSES[:value]
-    if isinstance(value, (str, bytes)):
-        raise ValueError("diversity must be a lens list or a count")
-    lenses = tuple(str(item).strip().lower() for item in value)
-    if not 1 <= len(lenses) <= len(DEFAULT_DIVERSITY_LENSES):
-        raise ValueError(f"diversity must contain between 1 and {len(DEFAULT_DIVERSITY_LENSES)} lenses")
-    if len(set(lenses)) != len(lenses):
-        raise ValueError("diversity lenses must be unique")
-    unknown = sorted(set(lenses) - set(LENS_PROMPTS))
-    if unknown:
-        raise ValueError(f"unknown diversity lens: {unknown[0]}")
-    return lenses
-
-
-def _finding_tokens(finding: Mapping[str, Any]) -> set[str]:
-    text = " ".join(
-        str(finding.get(key) or "")
-        for key in ("problem", "observed", "title", "why_wrong", "description")
-    ).lower()
-    return {
-        token
-        for token in re.findall(r"[a-z0-9]+", text)
-        if len(token) >= 3 and token not in _STOP_WORDS
-    }
-
-
-def _line_range(finding: Mapping[str, Any]) -> tuple[int, int] | None:
-    line = finding.get("line")
-    end = finding.get("line_end") or finding.get("end_line")
-    raw_range = finding.get("line_range")
-    if isinstance(raw_range, Sequence) and not isinstance(raw_range, (str, bytes)) and len(raw_range) == 2:
-        line, end = raw_range
-    try:
-        start_value = int(line)
-        end_value = int(end) if end is not None else start_value
-    except (TypeError, ValueError):
-        return None
-    if start_value < 1 or end_value < start_value:
-        return None
-    return start_value, end_value
-
-
-def _findings_collide(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
-    left_path = str(left.get("file") or left.get("path") or left.get("location") or "unknown")
-    right_path = str(right.get("file") or right.get("path") or right.get("location") or "unknown")
-    if left_path != right_path:
-        return False
-    left_lines = _line_range(left)
-    right_lines = _line_range(right)
-    if left_lines is None or right_lines is None:
-        return bool(_finding_tokens(left) & _finding_tokens(right))
-    overlaps = left_lines[0] <= right_lines[1] and right_lines[0] <= left_lines[1]
-    return overlaps and bool(_finding_tokens(left) & _finding_tokens(right))
-
-
-def _finding_id(finding: Mapping[str, Any], sha: str) -> str:
-    material = json.dumps(
-        {
-            "file": finding.get("file") or finding.get("path") or "unknown",
-            "line": _line_range(finding),
-            "description": sorted(_finding_tokens(finding)),
-            "sha": sha,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return "F-" + hashlib.sha256(material.encode()).hexdigest()[:6]
-
-
-def _schema_finding(
-    raw: Mapping[str, Any],
-    *,
-    lens: str,
-    reviewer: str,
-    expected_sha: str,
-    created_at: str,
-) -> dict[str, Any]:
-    severity = str(raw.get("severity") or "MEDIUM").upper()
-    if severity not in _SEVERITY_RANK:
-        severity = "MEDIUM"
-    path = str(raw.get("file") or raw.get("path") or raw.get("location") or "unknown")
-    problem = str(raw.get("problem") or raw.get("observed") or raw.get("title") or "review finding")
-    line = _line_range(raw)
-    raw_id = str(raw.get("id") or "")
-    result: dict[str, Any] = {
-        "id": raw_id if re.fullmatch(r"F-[a-z0-9]{6}", raw_id) else _finding_id(raw, expected_sha),
-        "severity": severity,
-        "title": str(raw.get("title") or problem)[:140],
-        "file": path,
-        "observed": str(raw.get("observed") or problem),
-        "why_wrong": str(raw.get("why_wrong") or problem),
-        "do_instead": str(raw.get("do_instead") or raw.get("fix") or "address the finding"),
-        "source_worker": str(raw.get("source_worker") or reviewer),
-        "source_lenses": [lens],
-        "source_kind": "review",
-        "source_sha": expected_sha,
-        "created_at": created_at,
-    }
-    if line is not None:
-        result["line"] = line[0]
-        if line[1] != line[0]:
-            result["line_end"] = line[1]
-    if raw.get("constraint"):
-        result["constraint"] = str(raw["constraint"])
-    return result
-
-
-def synthesize_diverse_verdicts(
-    ticket: str,
-    expected_sha: str,
-    verdicts: Mapping[str, Mapping[str, Any]],
-    *,
-    created_at: str | None = None,
-) -> dict[str, Any]:
-    """Deterministically merge lens verdicts into one schema-valid verdict."""
-
-    lenses = _normalize_diversity(tuple(verdicts))
-    expected_sha = expected_sha.lower()
-    timestamp = created_at or datetime.now(timezone.utc).isoformat(timespec="seconds")
-    merged: list[dict[str, Any]] = []
-    clean = True
-    for lens in lenses:
-        value = verdicts[lens]
-        state = str(value.get("state") or "").upper()
-        if state != "MERGE-READY" or list(value.get("findings") or []):
-            clean = False
-        reviewer = str(value.get("worker") or f"{ticket.upper()}-REVIEW-{lens.upper()}")
-        for raw in value.get("findings") or []:
-            if not isinstance(raw, Mapping):
-                clean = False
-                continue
-            candidate = _schema_finding(
-                raw,
-                lens=lens,
-                reviewer=reviewer,
-                expected_sha=expected_sha,
-                created_at=timestamp,
-            )
-            collision = next((item for item in merged if _findings_collide(item, candidate)), None)
-            if collision is None:
-                merged.append(candidate)
-                continue
-            if _SEVERITY_RANK[candidate["severity"]] > _SEVERITY_RANK[collision["severity"]]:
-                collision["severity"] = candidate["severity"]
-            collision["source_lenses"] = sorted(
-                set(collision.get("source_lenses") or []) | {lens}
-            )
-            collision["linked_findings"] = sorted(
-                set(collision.get("linked_findings") or []) | {candidate["id"]}
-            )
-    for finding in merged:
-        finding["id"] = _finding_id(finding, expected_sha)
-    state = "MERGE-READY" if clean and all(
-        str(verdicts[lens].get("state") or "").upper() == "MERGE-READY"
-        and not list(verdicts[lens].get("findings") or [])
-        for lens in lenses
-    ) else "NOT-MERGE-READY"
-    return {
-        "worker": f"{ticket.upper()}-REVIEW-SYNTHESIS",
-        "sha": expected_sha,
-        "state": state,
-        "findings": merged,
-        "summary": f"deterministic synthesis of {len(lenses)} reviewer lenses",
-        "created_at": timestamp,
-    }
-
-
-def record_diverse_verdicts(
-    *,
-    ticket: str,
-    expected_sha: str,
-    verdicts: Mapping[str, Mapping[str, Any]],
-    orch: str,
-    record_verdict: Callable[..., Any],
-    request_id: str,
-    status_dir: Path | None = None,
-    round_number: int | None = None,
-) -> dict[str, Any]:
-    """Write one verdict edge per lens, then the deterministic synthesis edge."""
-
-    lenses = _normalize_diversity(tuple(verdicts))
-    expected_sha = expected_sha.lower()
-    round_part = f"{round_number}" if round_number is not None else "1"
-    for lens in lenses:
-        raw = verdicts[lens]
-        reviewer = str(raw.get("worker") or f"{ticket.upper()}-REVIEW{round_part}-{lens}")
-        created_at = str(raw.get("created_at") or datetime.now(timezone.utc).isoformat(timespec="seconds"))
-        payload = {
-            "worker": reviewer,
-            "sha": expected_sha,
-            "state": str(raw.get("state") or "NOT-MERGE-READY").upper(),
-            "findings": [
-                _schema_finding(
-                    finding,
-                    lens=lens,
-                    reviewer=reviewer,
-                    expected_sha=expected_sha,
-                    created_at=created_at,
-                )
-                for finding in raw.get("findings") or []
-                if isinstance(finding, Mapping)
-            ],
-            "created_at": created_at,
-        }
-        if raw.get("summary"):
-            payload["summary"] = str(raw["summary"])[:500]
-        record_verdict(
-            ticket=ticket,
-            reviewer=reviewer,
-            orch=orch,
-            payload=payload,
-            request_id=f"{request_id}:verdict:{lens}",
-            status_dir=status_dir,
-        )
-    synthesis = synthesize_diverse_verdicts(ticket, expected_sha, verdicts)
-    record_verdict(
-        ticket=ticket,
-        reviewer=synthesis["worker"],
-        orch=orch,
-        payload=synthesis,
-        request_id=f"{request_id}:synthesis",
-        status_dir=status_dir,
-    )
-    return synthesis
 
 
 def _main() -> Any:
@@ -371,15 +121,15 @@ def _archived_reviewers(ticket: str, archived: list[Mapping[str, Any]]) -> dict[
         value = row.get("ticket")
         if not isinstance(value, str):
             continue
-        match = _REVIEWER_ID.fullmatch(value.upper())
-        if match and match.group("ticket") == ticket.upper():
-            result[value.upper()] = int(match.group("round"))
+        parsed = parse_reviewer_id(value)
+        if parsed is not None and parsed.ticket == ticket.upper():
+            result[value.upper()] = parsed.round
     return result
 
 
 def _reviewer_round(value: str) -> int | None:
-    match = _REVIEWER_ID.fullmatch(value.upper())
-    return int(match.group("round")) if match else None
+    parsed = parse_reviewer_id(value)
+    return parsed.round if parsed is not None else None
 
 
 def _next_round(
@@ -389,9 +139,9 @@ def _next_round(
 ) -> int:
     reviewers = _archived_reviewers(ticket, archived)
     for value in registry:
-        match = _REVIEWER_ID.fullmatch(str(value).upper())
-        if match and match.group("ticket") == ticket.upper():
-            reviewers[str(value).upper()] = int(match.group("round"))
+        parsed = parse_reviewer_id(str(value))
+        if parsed is not None and parsed.ticket == ticket.upper():
+            reviewers[str(value).upper()] = parsed.round
     return max(reviewers.values(), default=0) + 1
 
 
@@ -403,8 +153,8 @@ def _previous_terminal_reviewer(
 ) -> str | None:
     candidates: list[tuple[int, str, Mapping[str, Any]]] = []
     for value, entry in registry.items():
-        match = _REVIEWER_ID.fullmatch(str(value).upper())
-        if not match or match.group("ticket") != ticket.upper() or not isinstance(entry, Mapping):
+        parsed = parse_reviewer_id(str(value))
+        if parsed is None or parsed.ticket != ticket.upper() or not isinstance(entry, Mapping):
             continue
         current = entry.get("current")
         if not isinstance(current, Mapping):
@@ -420,7 +170,7 @@ def _previous_terminal_reviewer(
             status_state or current.get("state") or current.get("runtime_state") or ""
         ).lower()
         if state in _TERMINAL_STATES:
-            candidates.append((int(match.group("round")), candidate_reviewer, current))
+            candidates.append((parsed.round, candidate_reviewer, current))
     if not candidates:
         return None
     candidates.sort(reverse=True)
@@ -480,7 +230,9 @@ prior reviewer: {prior}
 inspect the pinned worktree, identify actionable correctness, security, reliability,
 and test issues, and report findings with file and line references. if the diff is
 clean, report that explicitly. follow the repository review protocol and do not
-modify the worktree. after the review, write the complete structured verdict to
+modify the worktree. first verify PR headRefOid and git rev-parse HEAD match the
+pinned sha. if either check fails, stop with INSUFFICIENT-CONTEXT and STALE-SHA;
+do not review or report MERGE-READY. after the review, write the complete structured verdict to
 /tmp/{reviewer_id}-verdict.json. use state, source_sha, and findings fields;
 each finding must include severity, path, line, problem, and fix.
 """
@@ -527,7 +279,9 @@ def _build_prompt(
         f"\n\nreview context: ticket={ticket}, pr=#{pr_number}, pinned_sha={expected_sha}, "
         f"round={round_number}, prior_reviewer={previous_reviewer or 'none'}, lens={lens or 'standard'}"
     )
-    return rendered + context + (f"\n\nlens mandate: {LENS_PROMPTS[lens]}." if lens else "")
+    return rendered + context + f"\n\nreview contract: {REVIEW_CONTRACT}." + (
+        f"\n\nlens mandate: {LENS_PROMPTS[lens]}." if lens else ""
+    )
 
 
 def _diverse_worktree(
@@ -620,7 +374,7 @@ def _next_review_diverse(
         repo_root = (resolve_root or _resolve_root)(orch)
         reviewers: dict[str, dict[str, Any]] = {}
         for lens in lenses:
-            reviewer_id = f"{ticket.upper()}-REVIEW{round_number}-{lens}"
+            reviewer_id = canonical_reviewer_id(ticket, round_number, lens)
             reviewers[lens] = {
                 "reviewer": reviewer_id,
                 "worktree": str(
@@ -656,6 +410,7 @@ def _next_review_diverse(
             "reviewer_kind": reviewer_kind,
             "reviewer_model": reviewer_model,
             "reviewer_effort": reviewer_effort,
+            "synthesis_created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
         _REQUEST_STAGES[request_id] = staged
         _persist_request_state()
@@ -726,6 +481,17 @@ def _next_review_diverse(
         )
         staged["archives"][reviewer] = {"result": dict(archive_result)}
         _persist_request_state()
+
+    create_journal(
+        main.AGENT_RUNTIME_DIR,
+        ticket=staged["ticket"],
+        round_number=int(staged["round"]),
+        expected_sha=staged["expected_sha"],
+        expected_lenses=staged["lenses"],
+        reviewers={lens: details["reviewer"] for lens, details in staged["reviewers"].items()},
+        orch=staged["orch"],
+        created_at=staged["synthesis_created_at"],
+    )
 
     result = _diverse_result(staged)
     _REQUEST_STAGES.pop(request_id, None)
@@ -887,7 +653,7 @@ def next_review(
             archived_rows = list(archived())
         registry_data = dict((registry or main._read_agent_registry)())  # noqa: SLF001
         round_number = _next_round(ticket, archived_rows, registry_data)
-        reviewer_id = f"{ticket.upper()}-REVIEW{round_number}"
+        reviewer_id = canonical_reviewer_id(ticket, round_number)
         previous_reviewer = _previous_terminal_reviewer(
             ticket, round_number, registry_data, status_reader
         )

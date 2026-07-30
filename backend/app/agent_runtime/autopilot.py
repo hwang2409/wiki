@@ -25,7 +25,7 @@ from urllib.parse import urlparse
 
 from .graph_health import load_validated_graph
 from .loop_state import derive_loop_state
-from .ticket import base_ticket
+from .ticket import base_ticket, parse_reviewer_id
 from .autopilot_actions import steer_action_id, verdict_edge_id
 from .autopilot_parser import (
     Finding,
@@ -226,6 +226,7 @@ class AutopilotController:
         archive: Callable[[str], Any] | None = None,
         merge: Callable[[str], Any] | None = None,
         notify: Callable[[str, str], Any] | None = None,
+        collect_diversity: Callable[..., Any] | None = None,
     ):
         self.store = store or AutopilotStore()
         self.status_reader = status_reader or self._default_status
@@ -238,6 +239,7 @@ class AutopilotController:
         self._structured_steer = steer is None
         self.archive = archive or self._default_archive
         self.merge = merge or self._default_merge
+        self.collect_diversity = collect_diversity or self._default_collect_diversity
         self.notifications: list[tuple[str, str]] = []
         self.notify = notify or self._record_notification
         self._locks: dict[str, asyncio.Lock] = {}
@@ -367,9 +369,7 @@ class AutopilotController:
             if state.last_event_key == key:
                 return True
             try:
-                if status_state == "merge-ready" and re.search(
-                    r"-REVIEW[1-9][0-9]*$", agent_id.upper()
-                ):
+                if status_state == "merge-ready" and parse_reviewer_id(agent_id) is not None:
                     success = await self._reviewer_ready(ticket, agent_id, event, state)
                 elif status_state == "merge-ready":
                     success = await self._implementer_ready(ticket, event, state)
@@ -395,8 +395,31 @@ class AutopilotController:
         graph = self.graph_loader(ticket)
         if graph is None:
             return False
+        identity = parse_reviewer_id(reviewer)
+        diversity_report = None
+        if identity is not None and identity.lens not in {None, "synthesis"}:
+            status = self.status_reader(ticket)
+            sha = self._current_sha(ticket, status, event)
+            source_verdict = self._latest_verdict(graph, reviewer=reviewer)
+            if source_verdict is None:
+                source_verdict = self._read_verdict_file(reviewer, event.get("verdict_path"))
+            if source_verdict is None:
+                return False
+            diversity_report = await self._invoke(
+                self.collect_diversity,
+                ticket=ticket,
+                reviewer=reviewer,
+                verdict=source_verdict,
+                expected_sha=sha,
+                status_dir=getattr(self, "status_dir", None),
+            )
+            if not isinstance(diversity_report, Mapping) or diversity_report.get("status") == "pending":
+                self._log(state, "diversity-verdict-pending", {"reviewer": reviewer, "report": diversity_report})
+                return True
+            reviewer = str(diversity_report.get("worker") or reviewer)
+            graph = self.graph_loader(ticket) or graph
         current_reviewer = self._current_reviewer(graph)
-        if current_reviewer != reviewer:
+        if diversity_report is None and current_reviewer != reviewer:
             self._log(
                 state,
                 "reviewer-verdict-ignored-stale-reviewer",
@@ -405,7 +428,7 @@ class AutopilotController:
             return True
         status = self.status_reader(ticket)
         sha = self._current_sha(ticket, status, event)
-        verdict = self._latest_verdict(graph, reviewer=reviewer)
+        verdict = diversity_report and verdict_from_graph(diversity_report) or self._latest_verdict(graph, reviewer=reviewer)
         parsed_from_artifact = verdict is None
         if verdict is None:
             verdict = self._read_verdict_file(
@@ -638,6 +661,13 @@ class AutopilotController:
     async def _invoke(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         return await asyncio.to_thread(function, *args, **kwargs)
 
+    @staticmethod
+    def _default_collect_diversity(**kwargs: Any) -> Any:
+        from .diversity_orchestration import collect_diversity_verdict
+        from .. import main
+
+        return collect_diversity_verdict(runtime_dir=main.AGENT_RUNTIME_DIR, **kwargs)
+
     async def _send_steer(
         self,
         ticket: str,
@@ -691,9 +721,7 @@ class AutopilotController:
                 or (payload.get("ticket") if isinstance(payload, Mapping) else None)
                 or (target.get("worker_id") if isinstance(target, Mapping) else None)
             )
-            if not isinstance(reviewer, str) or not re.search(
-                r"-REVIEW[1-9][0-9]*$", reviewer.upper()
-            ):
+            if not isinstance(reviewer, str) or parse_reviewer_id(reviewer) is None:
                 continue
             created = edge.get("created_at")
             try:
