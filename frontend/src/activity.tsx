@@ -1,9 +1,10 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { ChevronRight, FileText } from "lucide-react";
 import { getActivity, getActivityDiff } from "./api";
 import type { ActivityCommit } from "./api";
 import { LoadingPlaceholder } from "./loading";
 import { SplitDiffView } from "./split-diff";
+import { UtilityEmpty, UtilityError, UtilityLoading, UtilityPage } from "./utility-page";
 
 function basename(path: string) {
   return path.split("/").pop()?.replace(/\.md$/, "") ?? path;
@@ -40,7 +41,7 @@ function DiffView({ sha }: { sha: string }) {
     };
   }, [sha]);
 
-  if (error) return <div className="activity-diff-empty">Could not load diff.</div>;
+  if (error) return <div className="activity-diff-empty">Could not load changes.</div>;
   if (patch === null) {
     return (
       <div className="activity-diff-empty">
@@ -52,7 +53,7 @@ function DiffView({ sha }: { sha: string }) {
     <SplitDiffView
       className="activity-diff"
       emptyClassName="activity-diff-empty"
-      emptyMessage="No vault changes in this commit."
+      emptyMessage="No vault changes in this entry."
       patch={patch}
     />
   );
@@ -60,7 +61,7 @@ function DiffView({ sha }: { sha: string }) {
 
 export function ActivityFeed({
   onOpenNote,
-  refreshTick
+  refreshTick,
 }: {
   onOpenNote: (path: string) => void;
   refreshTick: number;
@@ -68,6 +69,7 @@ export function ActivityFeed({
   const [commits, setCommits] = useState<ActivityCommit[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [retryTick, setRetryTick] = useState(0);
 
   useEffect(() => {
     let ignore = false;
@@ -76,7 +78,7 @@ export function ActivityFeed({
       .then((next) => {
         if (ignore) return;
         setCommits((prev) =>
-          prev && prev.length === next.length && prev[0]?.sha === next[0]?.sha ? prev : next
+          prev && prev.length === next.length && prev[0]?.sha === next[0]?.sha ? prev : next,
         );
         setError(null);
       })
@@ -87,18 +89,64 @@ export function ActivityFeed({
     return () => {
       ignore = true;
     };
-  }, [refreshTick]);
+  }, [refreshTick, retryTick]);
 
-  if (error) return <div className="activity-empty">{error}</div>;
-  if (commits === null) {
-    return (
-      <div className="activity-empty">
-        <LoadingPlaceholder className="activity-loading" lines={[95, 86, 92, 78]} />
-      </div>
-    );
-  }
-  if (commits.length === 0) return <div className="activity-empty">No vault commits yet.</div>;
+  const retry = useCallback(() => {
+    setError(null);
+    setCommits(null);
+    setRetryTick((tick) => tick + 1);
+  }, []);
 
+  const toggle = useCallback((sha: string) => {
+    setExpanded((current) => {
+      const next = new Set(current);
+      if (next.has(sha)) next.delete(sha);
+      else next.add(sha);
+      return next;
+    });
+  }, []);
+
+  return (
+    <UtilityPage
+      title="Activity feed"
+      subtitle="Chronological vault changes — each entry groups the notes touched together."
+    >
+      {error ? (
+        <UtilityError
+          message={error}
+          onRetry={retry}
+          title="Activity is unavailable"
+        />
+      ) : commits === null ? (
+        <UtilityLoading label="Reading vault activity…" />
+      ) : commits.length === 0 ? (
+        <UtilityEmpty
+          title="No vault activity yet"
+          message="Vault changes will land here as notes are created, edited, or moved."
+        />
+      ) : (
+        <ActivityBody
+          commits={commits}
+          expanded={expanded}
+          onOpenNote={onOpenNote}
+          onToggle={toggle}
+        />
+      )}
+    </UtilityPage>
+  );
+}
+
+function ActivityBody({
+  commits,
+  expanded,
+  onOpenNote,
+  onToggle,
+}: {
+  commits: ActivityCommit[];
+  expanded: Set<string>;
+  onOpenNote: (path: string) => void;
+  onToggle: (sha: string) => void;
+}) {
   const byDay: Array<{ day: string; commits: ActivityCommit[] }> = [];
   for (const commit of commits) {
     const day = dayOf(commit.date);
@@ -110,18 +158,6 @@ export function ActivityFeed({
     }
   }
 
-  function toggle(sha: string) {
-    setExpanded((current) => {
-      const next = new Set(current);
-      if (next.has(sha)) {
-        next.delete(sha);
-      } else {
-        next.add(sha);
-      }
-      return next;
-    });
-  }
-
   return (
     <div className="activity-feed">
       {byDay.map(({ day, commits: dayCommits }) => (
@@ -129,12 +165,14 @@ export function ActivityFeed({
           <h2 className="activity-day-heading">{day}</h2>
           {dayCommits.map((commit) => {
             const isOpen = expanded.has(commit.sha);
+            const shortSha = commit.sha.slice(0, 7);
             return (
               <article className="activity-commit" key={commit.sha}>
                 <button
+                  aria-expanded={isOpen}
                   className="activity-commit-row"
                   type="button"
-                  onClick={() => toggle(commit.sha)}
+                  onClick={() => onToggle(commit.sha)}
                 >
                   <ChevronRight
                     className={`collapse-icon${isOpen ? "" : " is-collapsed"}`}
@@ -142,6 +180,12 @@ export function ActivityFeed({
                   />
                   <span className="activity-time tabular-nums">{timeOf(commit.date)}</span>
                   <span className="activity-message">{commit.message}</span>
+                  <span
+                    className="activity-sha tabular-nums"
+                    title={`revision ${commit.sha}`}
+                  >
+                    {shortSha}
+                  </span>
                 </button>
                 <div className="activity-files">
                   {commit.files.map((file) => {

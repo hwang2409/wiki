@@ -39,3 +39,21 @@ if (typeof window !== "undefined") {
 }
 installStorage(globalThis, "localStorage");
 installStorage(globalThis, "sessionStorage");
+
+// jsdom does not implement ResizeObserver; utility pages that render charts /
+// canvases rely on it. A no-op shim is enough for tests that only assert
+// against surrounding chrome and data.
+class NoopResizeObserver {
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+}
+
+if (typeof window !== "undefined" && typeof window.ResizeObserver === "undefined") {
+  (window as unknown as { ResizeObserver: typeof NoopResizeObserver }).ResizeObserver =
+    NoopResizeObserver;
+}
+if (typeof (globalThis as { ResizeObserver?: unknown }).ResizeObserver === "undefined") {
+  (globalThis as { ResizeObserver: typeof NoopResizeObserver }).ResizeObserver =
+    NoopResizeObserver;
+}

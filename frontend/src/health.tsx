@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { FileText } from "lucide-react";
 import type { NoteSummary } from "./types";
+import { UtilityEmpty, UtilityPage } from "./utility-page";
 
 const LIVING_TYPES = new Set(["reference", "campaign"]);
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -27,12 +28,12 @@ function bucketOf(days: number): Bucket {
 const BUCKET_LABEL: Record<Bucket, string> = {
   fresh: "fresh (<7d)",
   aging: "aging (7–30d)",
-  stale: "stale (>30d)"
+  stale: "stale (>30d)",
 };
 
 export function HealthView({
   notes,
-  onOpenNote
+  onOpenNote,
 }: {
   notes: NoteSummary[];
   onOpenNote: (path: string) => void;
@@ -53,14 +54,15 @@ export function HealthView({
   }, [rows]);
 
   return (
-    <div className="health-view">
-      <div className="health-summary">
-        {(Object.keys(counts) as Bucket[]).map((bucket) => (
-          <div className={`health-stat health-${bucket}`} key={bucket}>
-            <span className="health-stat-count tabular-nums">{counts[bucket]}</span>
-            <span className="health-stat-label">{BUCKET_LABEL[bucket]}</span>
-          </div>
-        ))}
+    <UtilityPage
+      title="Vault health"
+      subtitle={
+        <>
+          Living notes ({showAll ? "all types" : "reference + campaign"}) ranked stalest-first —
+          agent memory rots when these stop moving.
+        </>
+      }
+      actions={
         <label className="health-toggle">
           <input
             checked={showAll}
@@ -69,32 +71,60 @@ export function HealthView({
           />
           <span>all types</span>
         </label>
-      </div>
+      }
+    >
+      <div className="health-view">
+        <div className="health-summary" role="group" aria-label="Vault freshness summary">
+          {(Object.keys(counts) as Bucket[]).map((bucket) => (
+            <div className={`health-stat health-${bucket}`} key={bucket}>
+              <span className="health-stat-count tabular-nums">{counts[bucket]}</span>
+              <span className="health-stat-label">{BUCKET_LABEL[bucket]}</span>
+            </div>
+          ))}
+        </div>
 
-      <p className="health-hint">
-        Living notes ({showAll ? "all types" : "reference + campaign"}) ranked stalest-first —
-        agent memory rots when these stop moving. Structural drift: run <code>wiki lint</code>.
-      </p>
+        {rows.length === 0 ? (
+          <UtilityEmpty
+            title={
+              notes.length === 0
+                ? "No notes in the vault yet"
+                : showAll
+                  ? "No notes match this view"
+                  : "No living notes yet"
+            }
+            message={
+              notes.length === 0
+                ? "Create a note and it will appear here as it ages."
+                : showAll
+                  ? "Try creating a note or toggle types."
+                  : "Reference and campaign notes power agent memory — toggle all types to widen this list."
+            }
+          />
+        ) : (
+          <div className="health-list">
+            {rows.map(({ note, days }) => (
+              <button
+                className={`health-row is-${bucketOf(days)}`}
+                key={note.id}
+                type="button"
+                onClick={() => onOpenNote(note.path)}
+              >
+                <FileText size={13} />
+                <span className="health-name">{basename(note.path)}</span>
+                <span className="health-type">{note.note_type ?? "—"}</span>
+                <span className="health-path">{note.path}</span>
+                <span className="health-age tabular-nums">
+                  {days === 0 ? "today" : `${days}d`}
+                </span>
+              </button>
+            ))}
+          </div>
+        )}
 
-      <div className="health-list">
-        {rows.map(({ note, days }) => (
-          <button
-            className={`health-row is-${bucketOf(days)}`}
-            key={note.id}
-            type="button"
-            onClick={() => onOpenNote(note.path)}
-          >
-            <FileText size={13} />
-            <span className="health-name">{basename(note.path)}</span>
-            <span className="health-type">{note.note_type ?? "—"}</span>
-            <span className="health-path">{note.path}</span>
-            <span className="health-age tabular-nums">
-              {days === 0 ? "today" : `${days}d`}
-            </span>
-          </button>
-        ))}
-        {rows.length === 0 ? <div className="health-empty">No notes match.</div> : null}
+        <p className="health-secondary-hint">
+          Structural vault drift is tracked separately — the note surface stays clean regardless.
+        </p>
       </div>
-    </div>
+    </UtilityPage>
   );
 }

@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getTokens, type TokenBucket, type TokensResponse } from "./api";
+import { UtilityEmpty, UtilityError, UtilityLoading, UtilityPage } from "./utility-page";
 
 type Preset = "24h" | "7d" | "30d";
 type BucketMode = "hour" | "day";
@@ -10,6 +11,7 @@ type Hover = {
   y: number;
 };
 
+const UNAVAILABLE_LABEL = "unavailable";
 const METRICS_STACKED: Metric[] = ["input", "output", "reasoning"];
 const PRESETS: { key: Preset; label: string; bucket: BucketMode; hoursBack: number }[] = [
   { key: "24h", label: "24h", bucket: "hour", hoursBack: 24 },
@@ -90,6 +92,32 @@ function seriesTotal(bucket: TokenBucket, key: string, metrics: Metric[]): numbe
   return metrics.reduce((acc, m) => acc + (s[m] ?? 0), 0);
 }
 
+// The API can omit a metric key from a bucket's series entry when no data
+// source reported it (e.g. reasoning tokens for non-thinking models). Any
+// bucket that *does* define the key — even at 0 — marks the metric as
+// available. This drives the "unavailable" vs "0" distinction that WIKI-178
+// established for the cost dashboard.
+function metricAvailability(buckets: TokenBucket[]): Record<Metric, boolean> {
+  const seen: Record<Metric, boolean> = {
+    input: false,
+    output: false,
+    reasoning: false,
+    cached: false,
+  };
+  for (const bucket of buckets) {
+    for (const values of Object.values(bucket.series)) {
+      for (const metric of ["input", "output", "reasoning", "cached"] as Metric[]) {
+        if (values[metric] !== undefined) seen[metric] = true;
+      }
+    }
+  }
+  return seen;
+}
+
+function metricDisplay(total: number, available: boolean): string {
+  return available ? formatNumber(total) : UNAVAILABLE_LABEL;
+}
+
 export function TokensView() {
   const [preset, setPreset] = useState<Preset>("7d");
   const [bucketMode, setBucketMode] = useState<BucketMode>("hour");
@@ -98,7 +126,8 @@ export function TokensView() {
   const [includeCached, setIncludeCached] = useState(false);
   const [data, setData] = useState<TokensResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [retryTick, setRetryTick] = useState(0);
 
   function pickPreset(next: Preset) {
     const chosen = PRESETS.find((p) => p.key === next);
@@ -129,7 +158,7 @@ export function TokensView() {
           }
         })
         .catch((err: unknown) => {
-          if (!cancelled) setError(err instanceof Error ? err.message : "Failed");
+          if (!cancelled) setError(err instanceof Error ? err.message : "Could not load token usage");
         })
         .finally(() => {
           if (!cancelled && showSpinner) setLoading(false);
@@ -141,7 +170,13 @@ export function TokensView() {
       cancelled = true;
       if (retry) window.clearTimeout(retry);
     };
-  }, [range.from, range.to, bucketMode]);
+  }, [range.from, range.to, bucketMode, retryTick]);
+
+  const retry = useCallback(() => {
+    setError(null);
+    setData(null);
+    setRetryTick((tick) => tick + 1);
+  }, []);
 
   const activeMetrics: Metric[] = includeCached
     ? [...METRICS_STACKED, "cached"]
@@ -186,6 +221,8 @@ export function TokensView() {
     return acc;
   }, [filteredBuckets]);
 
+  const availability = useMemo(() => metricAvailability(filteredBuckets), [filteredBuckets]);
+
   const seriesColor = useMemo(() => {
     const colors: Record<string, string> = {};
     visibleSeriesKeys.forEach((key, i) => {
@@ -195,10 +232,24 @@ export function TokensView() {
     return colors;
   }, [visibleSeriesKeys]);
 
+  const hasAnyData = filteredBuckets.some((bucket) => Object.keys(bucket.series).length > 0);
+
+  const subtitle = data ? (
+    <>
+      {formatNumber(data.sessions_scanned)} sessions scanned
+      {data.refreshing ? <span className="tokens-refreshing-inline"> · refreshing</span> : null}
+    </>
+  ) : (
+    "Aggregated token spend across recent agent sessions."
+  );
+
   return (
-    <div className="tokens-view">
-      <div className="tokens-controls">
-        <div className="tokens-preset-group">
+    <UtilityPage
+      title="Token usage"
+      subtitle={subtitle}
+      scroll={false}
+      actions={
+        <div className="tokens-preset-group" role="group" aria-label="Time range">
           {PRESETS.map((p) => (
             <button
               key={p.key}
@@ -210,130 +261,179 @@ export function TokensView() {
             </button>
           ))}
         </div>
-        <div className="tokens-bucket-group">
-          {(["hour", "day"] as BucketMode[]).map((mode) => (
-            <button
-              key={mode}
-              className={`tokens-chip${bucketMode === mode ? " is-active" : ""}`}
-              type="button"
-              onClick={() => setBucketMode(mode)}
-            >
-              {mode}
-            </button>
+      }
+    >
+      <div className="tokens-view">
+        {error ? (
+          <UtilityError
+            title="Token usage is unavailable"
+            message={error}
+            onRetry={retry}
+          />
+        ) : null}
+
+        <div className="tokens-controls">
+          <div className="tokens-bucket-group" role="group" aria-label="Bucket size">
+            {(["hour", "day"] as BucketMode[]).map((mode) => (
+              <button
+                key={mode}
+                className={`tokens-chip${bucketMode === mode ? " is-active" : ""}`}
+                type="button"
+                onClick={() => setBucketMode(mode)}
+              >
+                {mode}
+              </button>
+            ))}
+          </div>
+          <label className="tokens-cached-toggle">
+            <input
+              type="checkbox"
+              checked={includeCached}
+              onChange={(e) => setIncludeCached(e.target.checked)}
+            />
+            <span>include cached</span>
+          </label>
+        </div>
+
+        {data && (data.clis.length > 0 || data.models.length > 0) ? (
+          <div className="tokens-controls tokens-filter-row">
+            {data.clis.length > 0 ? (
+              <div className="tokens-filter-group" aria-label="Agent filter">
+                <span className="tokens-filter-label">agent</span>
+                {data.clis.map((cli) => {
+                  const active = cliFilter.has(cli);
+                  return (
+                    <button
+                      key={cli}
+                      className={`tokens-chip${active ? " is-active" : ""}`}
+                      type="button"
+                      onClick={() =>
+                        setCliFilter((current) => {
+                          const next = new Set(current);
+                          if (active) next.delete(cli);
+                          else next.add(cli);
+                          return next;
+                        })
+                      }
+                    >
+                      {cli}
+                    </button>
+                  );
+                })}
+              </div>
+            ) : null}
+            {data.models.length > 0 ? (
+              <div className="tokens-filter-group" aria-label="Model filter">
+                <span className="tokens-filter-label">model</span>
+                {data.models.map((model) => {
+                  const active = modelFilter.has(model);
+                  return (
+                    <button
+                      key={model}
+                      className={`tokens-chip${active ? " is-active" : ""}`}
+                      type="button"
+                      onClick={() =>
+                        setModelFilter((current) => {
+                          const next = new Set(current);
+                          if (active) next.delete(model);
+                          else next.add(model);
+                          return next;
+                        })
+                      }
+                    >
+                      {model}
+                    </button>
+                  );
+                })}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+
+        <div className="tokens-totals" role="group" aria-label="Token totals">
+          <TotalCell label="input" total={totals.input} available={availability.input} />
+          <TotalCell label="output" total={totals.output} available={availability.output} />
+          <TotalCell
+            label="reasoning"
+            total={totals.reasoning}
+            available={availability.reasoning}
+          />
+          <TotalCell
+            label="cached"
+            total={totals.cached}
+            available={availability.cached}
+            secondary
+          />
+          <div className="tokens-total tokens-total-secondary">
+            <span className="tokens-total-label">sessions</span>
+            <span className="tokens-total-value tabular-nums">
+              {data ? formatNumber(data.sessions_scanned) : "—"}
+            </span>
+          </div>
+        </div>
+
+        {loading && !data ? (
+          <div className="tokens-chart tokens-chart-state">
+            <UtilityLoading label="Reading token telemetry…" lines={[70, 90, 60, 84]} />
+          </div>
+        ) : !hasAnyData ? (
+          <div className="tokens-chart tokens-chart-state">
+            <UtilityEmpty
+              title={
+                cliFilter.size > 0 || modelFilter.size > 0
+                  ? "No usage matches these filters"
+                  : "No token usage in this range"
+              }
+              message={
+                cliFilter.size > 0 || modelFilter.size > 0
+                  ? "Clear the filters or widen the time range."
+                  : "Widen the time range or run an agent session to populate this view."
+              }
+            />
+          </div>
+        ) : (
+          <TokensChart
+            buckets={filteredBuckets}
+            bucketMode={bucketMode}
+            seriesKeys={visibleSeriesKeys}
+            seriesColor={seriesColor}
+            activeMetrics={activeMetrics}
+          />
+        )}
+
+        <div className="tokens-legend">
+          {visibleSeriesKeys.map((key) => (
+            <span key={key} className="tokens-legend-item">
+              <span className="tokens-legend-swatch" style={{ background: seriesColor[key] }} />
+              <span className="tokens-legend-name">{key}</span>
+            </span>
           ))}
         </div>
-        <label className="tokens-cached-toggle">
-          <input
-            type="checkbox"
-            checked={includeCached}
-            onChange={(e) => setIncludeCached(e.target.checked)}
-          />
-          <span>include cached</span>
-        </label>
-        {data?.refreshing ? <span className="tokens-refreshing">refreshing...</span> : null}
       </div>
+    </UtilityPage>
+  );
+}
 
-      {data ? (
-        <div className="tokens-controls tokens-filter-row">
-          {data.clis.length > 0 ? (
-            <div className="tokens-filter-group" aria-label="CLI filter">
-              <span className="tokens-filter-label">cli</span>
-              {data.clis.map((cli) => {
-                const active = cliFilter.has(cli);
-                return (
-                  <button
-                    key={cli}
-                    className={`tokens-chip${active ? " is-active" : ""}`}
-                    type="button"
-                    onClick={() =>
-                      setCliFilter((current) => {
-                        const next = new Set(current);
-                        if (active) next.delete(cli);
-                        else next.add(cli);
-                        return next;
-                      })
-                    }
-                  >
-                    {cli}
-                  </button>
-                );
-              })}
-            </div>
-          ) : null}
-          {data.models.length > 0 ? (
-            <div className="tokens-filter-group" aria-label="Model filter">
-              <span className="tokens-filter-label">model</span>
-              {data.models.map((model) => {
-                const active = modelFilter.has(model);
-                return (
-                  <button
-                    key={model}
-                    className={`tokens-chip${active ? " is-active" : ""}`}
-                    type="button"
-                    onClick={() =>
-                      setModelFilter((current) => {
-                        const next = new Set(current);
-                        if (active) next.delete(model);
-                        else next.add(model);
-                        return next;
-                      })
-                    }
-                  >
-                    {model}
-                  </button>
-                );
-              })}
-            </div>
-          ) : null}
-        </div>
-      ) : null}
-
-      <div className="tokens-totals">
-        <div className="tokens-total">
-          <span className="tokens-total-label">input</span>
-          <span className="tokens-total-value tabular-nums">{formatNumber(totals.input)}</span>
-        </div>
-        <div className="tokens-total">
-          <span className="tokens-total-label">output</span>
-          <span className="tokens-total-value tabular-nums">{formatNumber(totals.output)}</span>
-        </div>
-        <div className="tokens-total">
-          <span className="tokens-total-label">reasoning</span>
-          <span className="tokens-total-value tabular-nums">{formatNumber(totals.reasoning)}</span>
-        </div>
-        <div className="tokens-total tokens-total-secondary">
-          <span className="tokens-total-label">cached</span>
-          <span className="tokens-total-value tabular-nums">{formatNumber(totals.cached)}</span>
-        </div>
-        <div className="tokens-total tokens-total-secondary">
-          <span className="tokens-total-label">sessions</span>
-          <span className="tokens-total-value tabular-nums">
-            {formatNumber(data?.sessions_scanned ?? 0)}
-          </span>
-        </div>
-      </div>
-
-      <TokensChart
-        buckets={filteredBuckets}
-        bucketMode={bucketMode}
-        seriesKeys={visibleSeriesKeys}
-        seriesColor={seriesColor}
-        activeMetrics={activeMetrics}
-      />
-
-      <div className="tokens-legend">
-        {visibleSeriesKeys.map((key) => (
-          <span key={key} className="tokens-legend-item">
-            <span className="tokens-legend-swatch" style={{ background: seriesColor[key] }} />
-            <span className="tokens-legend-name">{key}</span>
-          </span>
-        ))}
-        {visibleSeriesKeys.length === 0 && !loading ? (
-          <span className="tokens-legend-empty">No data in this range.</span>
-        ) : null}
-      </div>
-
-      {error ? <div className="tokens-error">{error}</div> : null}
+function TotalCell({
+  label,
+  total,
+  available,
+  secondary = false,
+}: {
+  label: string;
+  total: number;
+  available: boolean;
+  secondary?: boolean;
+}) {
+  return (
+    <div className={`tokens-total${secondary ? " tokens-total-secondary" : ""}`}>
+      <span className="tokens-total-label">{label}</span>
+      <span
+        className={`tokens-total-value tabular-nums${available ? "" : " is-unavailable"}`}
+        title={available ? undefined : "This metric was not reported for the current selection."}
+      >
+        {metricDisplay(total, available)}
+      </span>
     </div>
   );
 }
@@ -510,14 +610,30 @@ function TokensChart({
             );
           })}
           <div className="tokens-tooltip-sep" />
-          {(["input", "output", "reasoning", "cached"] as Metric[]).map((metric) => (
-            <div key={metric} className="tokens-tooltip-row is-secondary">
-              <span className="tokens-tooltip-name">{metric}</span>
-              <span className="tokens-tooltip-value tabular-nums">
-                {formatNumber(sumSeries(hoveredBucket, metric, () => true))}
-              </span>
-            </div>
-          ))}
+          {(["input", "output", "reasoning", "cached"] as Metric[]).map((metric) => {
+            const bucketAvail = ["input", "output", "reasoning", "cached"].reduce(
+              (acc, m) => {
+                acc[m as Metric] = Object.values(hoveredBucket.series).some(
+                  (v) => v[m as Metric] !== undefined,
+                );
+                return acc;
+              },
+              {} as Record<Metric, boolean>,
+            );
+            const total = sumSeries(hoveredBucket, metric, () => true);
+            return (
+              <div key={metric} className="tokens-tooltip-row is-secondary">
+                <span className="tokens-tooltip-name">{metric}</span>
+                <span
+                  className={`tokens-tooltip-value tabular-nums${
+                    bucketAvail[metric] ? "" : " is-unavailable"
+                  }`}
+                >
+                  {metricDisplay(total, bucketAvail[metric])}
+                </span>
+              </div>
+            );
+          })}
         </div>
       ) : null}
     </div>
