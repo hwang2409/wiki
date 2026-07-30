@@ -6,7 +6,7 @@ import threading
 from concurrent.futures import Future
 from typing import Callable
 
-from .blast_radius_types import ChangedFiles, MAX_CACHE_ENTRIES, SourceAttestation
+from .blast_radius_types import Attested, ChangedFiles, MAX_CACHE_ENTRIES
 
 
 class DiffCache:
@@ -14,20 +14,19 @@ class DiffCache:
 
     def __init__(self, max_entries: int = MAX_CACHE_ENTRIES) -> None:
         self.max_entries = max(1, max_entries)
-        self._values: dict[tuple[str, str, str], ChangedFiles] = {}
-        self._inflight: dict[tuple[str, str, str], Future[ChangedFiles]] = {}
+        self._values: dict[tuple[str, str, str], Attested[ChangedFiles]] = {}
+        self._inflight: dict[tuple[str, str, str], Future[Attested[ChangedFiles]]] = {}
         self._lock = threading.Lock()
 
     def get_or_compute(
         self,
         branch: str,
         head_sha: str,
-        compute: Callable[[], tuple[str, ...]],
+        compute: Callable[[], tuple[str, ...] | ChangedFiles | Attested[ChangedFiles]],
         *,
         candidate_head_sha: str = "",
         main_head_sha: str = "",
-    ) -> ChangedFiles:
-        del branch
+    ) -> Attested[ChangedFiles]:
         key = (candidate_head_sha, head_sha, main_head_sha)
         with self._lock:
             cached = self._values.get(key)
@@ -44,9 +43,22 @@ class DiffCache:
 
         try:
             computed = compute()
-            value = computed if isinstance(computed, ChangedFiles) else ChangedFiles(computed)
-            if not value.cache_attestation.valid:
-                raise RuntimeError(value.cache_attestation.reason or "cache entry is unattested")
+            if isinstance(computed, ChangedFiles):
+                value = computed
+            elif isinstance(computed, Attested) and isinstance(computed.value, ChangedFiles):
+                value = computed.value
+            else:
+                value = ChangedFiles(computed)
+            cached_value = Attested(
+                value,
+                "cache-entry",
+                value.valid,
+                value.shape_valid,
+                value.fresh,
+                value.reason,
+            )
+            if not cached_value.valid:
+                raise RuntimeError(cached_value.reason or "cache entry is unattested")
         except BaseException as exc:
             with self._lock:
                 self._inflight.pop(key, None)
@@ -58,15 +70,8 @@ class DiffCache:
             if cached is None:
                 while len(self._values) >= self.max_entries:
                     self._values.pop(next(iter(self._values)))
-                value = ChangedFiles(
-                    value,
-                    truncated=value.truncated,
-                    dropped_count=value.dropped_count,
-                    attestation=value.attestation,
-                    cache_attestation=SourceAttestation("cache-entry", True, True, True),
-                )
-                self._values[key] = value
-                cached = value
+                self._values[key] = cached_value
+                cached = cached_value
             self._inflight.pop(key, None)
             future.set_result(cached)
         return cached

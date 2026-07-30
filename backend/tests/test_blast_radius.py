@@ -566,6 +566,25 @@ class BlastRadiusTests(unittest.TestCase):
             )
             assert_unknown(blast_radius.analyze(self.fixture.root, {}, cache=blast_radius.DiffCache(), pr_snapshot=snapshot))
 
+        with self.subTest("snapshot attestation flags are authoritative"):
+            snapshot = blast_radius.OpenPRSnapshotState(
+                (),
+                True,
+                time.time(),
+                attestation=blast_radius.SourceAttestation("open-pr-snapshot", False, True, False, "provider is stale"),
+            )
+            assert_unknown(blast_radius.analyze(self.fixture.root, {}, cache=blast_radius.DiffCache(), pr_snapshot=snapshot))
+
+        with self.subTest("corrupt registry stays shape-invalid"):
+            assert_unknown(
+                blast_radius.analyze(
+                    self.fixture.root,
+                    [],
+                    cache=blast_radius.DiffCache(),
+                    pr_snapshot=valid_snapshot,
+                )
+            )
+
         with self.subTest("registry row without locator"):
             assert_unknown(
                 blast_radius.analyze(
@@ -609,6 +628,21 @@ class BlastRadiusTests(unittest.TestCase):
                     )
 
             assert_unknown(blast_radius.analyze(self.fixture.root, {}, cache=UnattestedCache(), pr_snapshot=self.snapshot("one")))
+
+        with self.subTest("cache attestation dropped"):
+            class DroppedCacheAttestation:
+                def get_or_compute(self, *args: object, **kwargs: object) -> blast_radius.ChangedFiles:
+                    del args, kwargs
+                    return blast_radius.ChangedFiles(("styles.css",))
+
+            assert_unknown(
+                blast_radius.analyze(
+                    self.fixture.root,
+                    {},
+                    cache=DroppedCacheAttestation(),
+                    pr_snapshot=self.snapshot("one"),
+                )
+            )
 
         with self.subTest("missing candidate"):
             assert_unknown(blast_radius.analyze(self.fixture.root, {}, "deleted", cache=blast_radius.DiffCache(), pr_snapshot=self.snapshot("one")))

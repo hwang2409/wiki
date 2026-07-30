@@ -3963,12 +3963,12 @@ def _write_queue(queue: dict[str, list[dict]]) -> None:
     tmp.rename(MSG_QUEUE_PATH)
 
 
-def _read_agent_registry(*, strict: bool = False) -> dict:
+def _read_agent_registry(*, strict: bool = False) -> object:
     try:
         data = json.loads(AGENT_REGISTRY_PATH.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            raise ValueError("agent registry must be an object")
-        return data
+        if strict:
+            return data
+        return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         if strict:
             raise

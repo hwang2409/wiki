@@ -10,6 +10,7 @@ from typing import Any, Iterable, Sequence
 
 from .blast_radius_cache import DIFF_CACHE, DiffCache
 from .blast_radius_discovery import (
+    attest_registry,
     branch_hint as _branch_hint,
     discover_active_branch_result,
     discover_active_branches,
@@ -19,35 +20,27 @@ from .blast_radius_discovery import (
     select_ref as _select_ref,
     ticket_for_branch as _ticket_for_branch,
 )
-from .blast_radius_git import (
-    GitAnalysisError,
-    _run_git,
-    parse_refs_output as _parse_refs_output,
-    resolve_main_ref as _resolve_main_ref,
-)
-from .blast_radius_provider import (
-    OPEN_PR_SNAPSHOT,
-    OpenPRSnapshot,
-    _default_open_pr_provider,
-    parse_open_pr_snapshot,
-)
+from .blast_radius_git import GitAnalysisError, _run_git, parse_refs_output as _parse_refs_output, resolve_main_ref as _resolve_main_ref
+from .blast_radius_provider import OPEN_PR_SNAPSHOT, OpenPRSnapshot, _default_open_pr_provider
 from .blast_radius_types import (
     ANALYSIS_TIMEOUT_SECONDS,
+    ActiveBranch,
+    AttestationLedger,
+    Attested,
     BranchFiles,
+    BranchRef,
     ChangedFiles,
     GIT_TIMEOUT_SECONDS,
+    MAX_ACTIVE_BRANCHES,
     MAX_CHANGED_FILES,
     OPEN_PR_MAX_AGE_SECONDS,
-    MAX_ACTIVE_BRANCHES,
-    ActiveBranch,
-    BranchRef,
     OpenPRBranch,
     OpenPRSnapshotState,
     SourceAttestation,
 )
 
 
-def _refs(repo_root: Path, *, timeout: float) -> dict[str, BranchRef]:
+def _refs(repo_root: Path, *, timeout: float) -> Attested[dict[str, BranchRef]]:
     """Keep ref reads patchable while parsing stays in the Git module."""
 
     output = _run_git(
@@ -61,7 +54,8 @@ def _refs(repo_root: Path, *, timeout: float) -> dict[str, BranchRef]:
         ],
         timeout=timeout,
     )
-    return _parse_refs_output(output)
+    refs = _parse_refs_output(output)
+    return Attested(refs, "git-refs", True, True, True)
 
 
 def changed_files(
@@ -72,7 +66,8 @@ def changed_files(
     timeout: float = GIT_TIMEOUT_SECONDS,
 ) -> ChangedFiles:
     if main_ref is None:
-        main_ref = _resolve_main_ref(_refs(repo_root, timeout=timeout))
+        refs = _refs(repo_root, timeout=timeout)
+        main_ref = _resolve_main_ref(refs.value or {})
     if main_ref is None:
         raise GitAnalysisError("main ref is not present in fetched refs")
     output = _run_git(
@@ -141,7 +136,7 @@ def _candidate_matches(candidate: str, branch: ActiveBranch) -> bool:
 def _candidate_ref(candidate: str, refs: dict[str, BranchRef], active: Sequence[ActiveBranch], registry: dict[str, Any]) -> BranchRef | None:
     found = next((branch for branch in active if _candidate_matches(candidate, branch)), None)
     if found is not None:
-        return BranchRef(found.name, found.ref, found.head_sha)
+        return BranchRef(found.name, found.ref, found.head)
     normalized = candidate.strip().lower()
     if not normalized or normalized == "all":
         return None
@@ -157,9 +152,8 @@ def _candidate_ref(candidate: str, refs: dict[str, BranchRef], active: Sequence[
     return None
 
 
-def _attestation_complete(attestations: Iterable[SourceAttestation]) -> bool:
-    sources = tuple(attestations)
-    return bool(sources) and all(source.valid for source in sources)
+def _invalid(source: str, reason: str, *, shape_valid: bool = True, fresh: bool = False) -> Attested[Any]:
+    return Attested(None, source, False, shape_valid, fresh, reason)
 
 
 def _response(
@@ -169,7 +163,8 @@ def _response(
     branches: list[dict[str, Any]],
     collisions: list[dict[str, Any]],
     failed_branches: list[dict[str, str]],
-    attestations: Iterable[SourceAttestation],
+    inputs: Iterable[Attested[Any]],
+    expected_input_count: int,
     refreshed_at: float | None = None,
     error: str | None = None,
 ) -> dict[str, Any]:
@@ -180,22 +175,18 @@ def _response(
         if key not in seen:
             seen.add(key)
             deduped_failures.append(failure)
-    source_attestations = tuple(attestations)
-    complete = not deduped_failures and _attestation_complete(source_attestations) and error is None
+    ledger = AttestationLedger(tuple(inputs), expected_input_count)
     payload: dict[str, Any] = {
         "candidate": candidate,
         "candidate_found": candidate_found,
-        "complete": complete,
+        "complete": ledger.complete,
         "failed_branches": deduped_failures,
         "branches": branches,
         "collisions": collisions,
-        "risk": _risk_summary(collisions) if complete else None,
+        "risk": _risk_summary(collisions) if ledger.complete else None,
         "refreshed_at": refreshed_at,
         "snapshot_max_age_seconds": OPEN_PR_MAX_AGE_SECONDS,
-        "attestation": {
-            "complete": _attestation_complete(source_attestations),
-            "sources": [source.as_dict() for source in source_attestations],
-        },
+        "attestation": ledger.as_dict(),
     }
     if error:
         payload["error"] = error
@@ -204,7 +195,7 @@ def _response(
 
 def analyze(
     repo_root: Path,
-    registry: dict[str, Any],
+    registry: object,
     candidate: str = "all",
     *,
     cache: DiffCache = DIFF_CACHE,
@@ -213,74 +204,102 @@ def analyze(
 ) -> dict[str, Any]:
     deadline = time.monotonic() + ANALYSIS_TIMEOUT_SECONDS
     snapshot_state = pr_snapshot.read() if isinstance(pr_snapshot, OpenPRSnapshot) else pr_snapshot or OPEN_PR_SNAPSHOT.read()
+    snapshot = snapshot_state.snapshot
     snapshot_age = None if snapshot_state.refreshed_at is None else max(0.0, time.time() - snapshot_state.refreshed_at)
     snapshot_fresh = snapshot_age is not None and snapshot_age <= OPEN_PR_MAX_AGE_SECONDS
-    snapshot_attestation = SourceAttestation(
-        "open-pr-snapshot",
-        snapshot_state.complete,
-        snapshot_state.attestation.shape_valid,
-        snapshot_fresh,
-        snapshot_state.error or ("stale" if not snapshot_fresh else None),
+    snapshot_input = Attested(
+        snapshot.value,
+        snapshot.source,
+        snapshot.ok,
+        snapshot.shape_valid,
+        snapshot.fresh and snapshot_fresh,
+        snapshot.reason or ("stale" if not snapshot_fresh else None),
     )
-    attestations: list[SourceAttestation] = [SourceAttestation("analysis", True, True, True), snapshot_attestation]
-    attestations.extend(
-        SourceAttestation(
-            branch.attestation.source,
-            branch.attestation.ok and bool(re.fullmatch(r"[0-9a-fA-F]{40,64}", branch.head_sha or "")),
-            branch.attestation.shape_valid,
-            branch.attestation.fresh,
-            branch.attestation.reason or ("missing head SHA" if not branch.head_sha else None),
-        )
-        for branch in snapshot_state.branches
-    )
+    registry_input = registry if isinstance(registry, Attested) else attest_registry(registry)
     if registry_error:
-        failures = [_failed("agent registry", registry_error)]
-        attestations.append(SourceAttestation("registry", False, True, True, registry_error))
-    else:
-        failures = []
-    if not isinstance(registry, dict):
-        registry = {}
-    attestations.append(SourceAttestation("registry-container", True, True, True))
+        registry_input = _invalid("registry-input", registry_error, shape_valid=True)
+    registry_value = registry_input.value if registry_input.valid and isinstance(registry_input.value, dict) else {}
+    inputs: list[Attested[Any]] = [snapshot_input, registry_input]
+    failures: list[dict[str, str]] = []
+    if registry_error:
+        failures.append(_failed("agent registry", registry_error))
+    expected_input_count = len(inputs)
+    inputs.extend(branch.head for branch in snapshot_state.branches)
+    expected_input_count += len(snapshot_state.branches)
 
     try:
-        refs = _refs(repo_root, timeout=GIT_TIMEOUT_SECONDS)
-        attestations.append(SourceAttestation("git-refs", True, True, True))
+        refs_input = _refs(repo_root, timeout=GIT_TIMEOUT_SECONDS)
+        refs = refs_input.value or {}
+        inputs.append(refs_input)
+        expected_input_count += 1
     except GitAnalysisError as exc:
         reason = str(exc)
-        return _response(candidate=candidate, candidate_found=None if candidate.strip().lower() in {"", "all"} else False, branches=[], collisions=[], failed_branches=[_failed("git refs", reason)], attestations=[*attestations, SourceAttestation("git-refs", False, False, False, reason)], error="branch refs are unavailable")
+        inputs.append(_invalid("git-refs", reason, shape_valid=False))
+        expected_input_count += 1
+        return _response(
+            candidate=candidate,
+            candidate_found=None if candidate.strip().lower() in {"", "all"} else False,
+            branches=[],
+            collisions=[],
+            failed_branches=[_failed("git refs", reason)],
+            inputs=inputs,
+            expected_input_count=expected_input_count,
+            error="branch refs are unavailable",
+        )
+
     main_ref = _resolve_main_ref(refs)
     if main_ref is None:
         reason = "main ref is not present in fetched refs"
-        return _response(candidate=candidate, candidate_found=None if candidate.strip().lower() in {"", "all"} else False, branches=[], collisions=[], failed_branches=[_failed("main", reason)], attestations=[*attestations, SourceAttestation("main-ref", False, True, True, reason)], error="main ref is unavailable")
-    attestations.append(SourceAttestation("main-ref", True, True, True))
+        inputs.append(_invalid("main-ref", reason))
+        expected_input_count += 1
+        return _response(
+            candidate=candidate,
+            candidate_found=None if candidate.strip().lower() in {"", "all"} else False,
+            branches=[],
+            collisions=[],
+            failed_branches=[_failed("main", reason)],
+            inputs=inputs,
+            expected_input_count=expected_input_count,
+            error="main ref is unavailable",
+        )
+    inputs.append(Attested(main_ref, "main-ref", True, True, True))
+    inputs.append(main_ref.head)
+    expected_input_count += 2
 
     discovery = discover_active_branch_result(
         repo_root,
-        registry,
+        registry_value,
         refs=refs,
         pr_snapshot=snapshot_state,
         deadline=deadline,
         max_active_branches=MAX_ACTIVE_BRANCHES,
     )
-    failures.extend([*(_registry_shape_failures(registry)), *discovery.failed_branches])
-    attestations.extend(discovery.attestations)
-    if not snapshot_attestation.valid:
-        failures.append(_failed("open PR snapshot", snapshot_state.error or snapshot_attestation.reason or "snapshot is incomplete"))
+    failures.extend([*(_registry_shape_failures(registry_value)), *discovery.failed_branches])
+    inputs.extend(discovery.inputs)
+    expected_input_count += discovery.expected_input_count
+    inputs.append(discovery.branches)
+    expected_input_count += 1
+    if not snapshot_input.valid:
+        failures.append(_failed("open PR snapshot", snapshot_state.error or snapshot_input.reason or "snapshot is incomplete"))
 
     candidate_found: bool | None = None
     candidate_branch: ActiveBranch | None = None
     if candidate.strip().lower() not in {"", "all"}:
-        candidate_ref = _candidate_ref(candidate, refs, discovery.branches, registry)
+        candidate_ref = _candidate_ref(candidate, refs, discovery.branches.value or (), registry_value)
         if candidate_ref is None:
             candidate_found = False
-            failures.append(_failed(candidate, "candidate branch was not found in fetched refs"))
-            attestations.append(SourceAttestation("candidate", False, True, True, "candidate branch was not found"))
+            reason = "candidate branch was not found in fetched refs"
+            failures.append(_failed(candidate, reason))
+            inputs.append(_invalid("candidate", reason))
+            expected_input_count += 1
         else:
             candidate_found = True
-            candidate_branch = ActiveBranch(candidate_ref.name, candidate_ref.ref, candidate_ref.head_sha, "candidate", _ticket_for_branch(candidate_ref.name, registry))
-            attestations.append(SourceAttestation("candidate", True, True, True))
+            candidate_branch = ActiveBranch(candidate_ref.name, candidate_ref.ref, candidate_ref.head, "candidate", _ticket_for_branch(candidate_ref.name, registry_value))
+            inputs.append(Attested(candidate_branch, "candidate", True, True, True))
+            inputs.append(candidate_branch.head)
+            expected_input_count += 2
 
-    selected = list(discovery.branches)
+    selected = list(discovery.branches.value or ())
     if candidate_branch is not None:
         selected = [candidate_branch, *[branch for branch in selected if branch.name != candidate_branch.name]]
     candidate_head = candidate_branch.head_sha if candidate_branch else ""
@@ -288,28 +307,52 @@ def analyze(
     branch_payload: list[dict[str, Any]] = []
     for index, branch in enumerate(selected):
         if time.monotonic() >= deadline:
-            failures.extend(_failed(remaining.name, "analysis deadline exceeded") for remaining in selected[index:])
-            attestations.append(SourceAttestation("analysis-deadline", False, True, False, "analysis deadline exceeded"))
+            remaining = selected[index:]
+            for missing in remaining:
+                inputs.extend((_invalid(f"cache-entry:{missing.name}", "analysis deadline exceeded"), _invalid(f"git-diff:{missing.name}", "analysis deadline exceeded")))
+            expected_input_count += 2 * len(remaining)
+            failures.extend(_failed(remaining_branch.name, "analysis deadline exceeded") for remaining_branch in remaining)
             break
+        expected_input_count += 2
         try:
-            files = cache.get_or_compute(
+            raw_cached = cache.get_or_compute(
                 branch.name,
                 branch.head_sha,
                 lambda branch=branch: changed_files(repo_root, branch, main_ref=main_ref, timeout=min(GIT_TIMEOUT_SECONDS, max(0.05, deadline - time.monotonic()))),
                 candidate_head_sha=candidate_head,
                 main_head_sha=main_ref.head_sha,
             )
-            attestations.extend((files.attestation, files.cache_attestation))
-            if not files.attestation.valid or not files.cache_attestation.valid:
-                failures.append(_failed(branch.name, files.attestation.reason or "diff or cache entry is unattested"))
+            expected_cache_source = f"cache-entry:{branch.name}"
+            if isinstance(raw_cached, Attested) and isinstance(raw_cached.value, ChangedFiles):
+                cache_input = Attested(raw_cached.value, expected_cache_source, raw_cached.ok, raw_cached.shape_valid, raw_cached.fresh, raw_cached.reason)
+                diff_input = raw_cached.value
+            elif isinstance(raw_cached, ChangedFiles):
+                cache_input = _invalid(expected_cache_source, "cache entry attestation was dropped")
+                diff_input = raw_cached
+            else:
+                cache_input = _invalid(expected_cache_source, "cache entry is not attested")
+                diff_input = _invalid(f"git-diff:{branch.name}", "diff value is not attested")
+            inputs.extend((cache_input, diff_input))
+            if not cache_input.valid or not diff_input.valid:
+                failures.append(_failed(branch.name, cache_input.reason or diff_input.reason or "diff or cache entry is unattested"))
+                continue
+            rows.append(BranchFiles(branch.name, branch.head_sha, diff_input.value or ()))
+            branch_payload.append({"branch": branch.name, "ticket": branch.ticket, "source": branch.source, "head_sha": branch.head_sha, "files": list(diff_input.value or ()), "file_count": len(diff_input.value or ())})
         except BaseException as exc:
-            failures.append(_failed(branch.name, str(exc)))
-            attestations.append(SourceAttestation(f"git-diff:{branch.name}", False, False, False, str(exc)))
-            continue
-        rows.append(BranchFiles(branch.name, branch.head_sha, files))
-        branch_payload.append({"branch": branch.name, "ticket": branch.ticket, "source": branch.source, "head_sha": branch.head_sha, "files": list(files), "file_count": len(files)})
+            reason = str(exc)
+            inputs.extend((_invalid(f"cache-entry:{branch.name}", reason), _invalid(f"git-diff:{branch.name}", reason, shape_valid=False)))
+            failures.append(_failed(branch.name, reason))
 
     collisions = collision_pairs(rows)
     if candidate_branch:
         collisions = [collision for collision in collisions if candidate_branch.name in {collision["left"], collision["right"]}]
-    return _response(candidate=candidate, candidate_found=candidate_found, branches=branch_payload, collisions=collisions, failed_branches=failures, attestations=attestations, refreshed_at=snapshot_state.refreshed_at)
+    return _response(
+        candidate=candidate,
+        candidate_found=candidate_found,
+        branches=branch_payload,
+        collisions=collisions,
+        failed_branches=failures,
+        inputs=inputs,
+        expected_input_count=expected_input_count,
+        refreshed_at=snapshot_state.refreshed_at,
+    )

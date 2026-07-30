@@ -17,6 +17,7 @@ from .blast_radius_git import (
 from .blast_radius_provider import _logical_branch_name
 from .blast_radius_types import (
     ActiveBranch,
+    Attested,
     ANALYSIS_TIMEOUT_SECONDS,
     BranchRef,
     DiscoveryResult,
@@ -29,6 +30,12 @@ from .blast_radius_types import (
 
 def failed(branch: str, reason: str) -> dict[str, str]:
     return {"branch": branch, "reason": reason[:200]}
+
+
+def attest_registry(registry: object) -> Attested[dict[str, Any]]:
+    if not isinstance(registry, dict):
+        return Attested(None, "registry-input", False, False, True, "registry must be an object")
+    return Attested(registry, "registry-input", True, True, True)
 
 
 def registry_rows(registry: dict[str, Any]) -> Iterable[tuple[str, dict[str, Any]]]:
@@ -146,6 +153,7 @@ def reconcile_heads(repo_root: Path, candidates: dict[str, list[ActiveBranch]], 
             elif workers:
                 selected[name] = workers[0]
                 attestations.append(SourceAttestation(f"heads:{name}", True, True, True))
+                attestations.append(Attested(workers[0].head.value, f"resolved-head:{name}", workers[0].head.ok, workers[0].head.shape_valid, workers[0].head.fresh, workers[0].head.reason))
             continue
         winner = pr
         for worker in workers:
@@ -173,6 +181,7 @@ def reconcile_heads(repo_root: Path, candidates: dict[str, list[ActiveBranch]], 
         if winner is not None:
             selected[name] = winner
             attestations.append(SourceAttestation(f"heads:{name}", True, True, True))
+            attestations.append(Attested(winner.head.value, f"resolved-head:{name}", winner.head.ok, winner.head.shape_valid, winner.head.fresh, winner.head.reason))
     return selected, failures, attestations
 
 
@@ -189,8 +198,6 @@ def discover_active_branch_result(
     attestations = registry_attestations(registry)
     candidates: dict[str, list[ActiveBranch]] = {}
     if pr_snapshot.complete:
-        for branch in pr_snapshot.branches:
-            attestations.append(branch.attestation)
         for pr_branch in pr_snapshot.branches[:max_active_branches]:
             ref, reason = select_ref(refs, pr_branch.name, pr_branch.head_sha)
             if ref is None:
@@ -286,13 +293,15 @@ def discover_active_branch_result(
         reason = f"active branch list truncated; dropped {count} branches"
         failures.append(failed("active branches", reason))
         attestations.append(SourceAttestation("active-branch-limit", False, True, True, reason))
+    selected_branches = tuple(all_branches[:max_active_branches])
     return DiscoveryResult(
-        tuple(all_branches[:max_active_branches]),
+        Attested(selected_branches, "active-branches", True, True, True),
         tuple(failures),
-        pr_snapshot.complete,
         tuple(attestations),
+        len(attestations),
     )
 
 
 def discover_active_branches(repo_root: Path, registry: dict[str, Any], *, refs: dict[str, BranchRef] | None = None, deadline: float | None = None, pr_snapshot: OpenPRSnapshotState | None = None) -> list[ActiveBranch]:
-    return list(discover_active_branch_result(repo_root, registry, refs=refs or git_refs(repo_root, timeout=GIT_TIMEOUT_SECONDS), pr_snapshot=pr_snapshot or OpenPRSnapshotState((), False), deadline=deadline or time.monotonic() + ANALYSIS_TIMEOUT_SECONDS).branches)
+    result = discover_active_branch_result(repo_root, registry, refs=refs or git_refs(repo_root, timeout=GIT_TIMEOUT_SECONDS), pr_snapshot=pr_snapshot or OpenPRSnapshotState((), False), deadline=deadline or time.monotonic() + ANALYSIS_TIMEOUT_SECONDS)
+    return list(result.branches.value or ())
