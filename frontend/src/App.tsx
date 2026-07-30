@@ -482,22 +482,37 @@ function terminalIdFromPanePath(path: string | null): string | null {
   return path?.startsWith("terminal://") ? path.slice("terminal://".length) : null;
 }
 
+type TerminalNames = Readonly<Record<string, string>>;
+
+function readStoredTerminalNames(state: WindowWorkspaceState): Record<string, string> {
+  const names: Record<string, string> = {};
+  for (const window of state.windows) {
+    for (const pane of collectPaneInfos(window.layout)) {
+      const terminalId = terminalIdFromPanePath(pane.path);
+      if (!terminalId) continue;
+      try {
+        const name = localStorage.getItem(`wiki-terminal-name:${terminalId}`)?.trim();
+        if (name) names[terminalId] = name;
+      } catch {
+        // Storage may be unavailable; the runtime supplies the fallback label.
+      }
+    }
+  }
+  return names;
+}
+
 function cwdBasename(path: string | null): string {
   return path ? path.split("/").slice(-1)[0] : "no cwd";
 }
 
-function paneLabel(path: string | null): string {
+function paneLabel(path: string | null, terminalNames: TerminalNames): string {
   if (path === null) return "new pane";
   const ticket = ticketFromPanePath(path);
   if (ticket) return ticket;
   const terminalId = terminalIdFromPanePath(path);
   if (terminalId) {
-    try {
-      const name = window.localStorage.getItem(`wiki-terminal-name:${terminalId}`)?.trim();
-      if (name) return name;
-    } catch {
-      // Fall through to the default label.
-    }
+    const name = terminalNames[terminalId];
+    if (name) return name;
     return `term:${terminalId.slice(0, 8)}`;
   }
   const utility = utilityKindFromPanePath(path);
@@ -505,11 +520,13 @@ function paneLabel(path: string | null): string {
   return basename(path);
 }
 
-function windowLabel(window: WorkspaceWindow): string {
+function windowLabel(window: WorkspaceWindow, terminalNames: TerminalNames): string {
   const panes = collectPaneInfos(window.layout);
   if (panes.length === 0) return "empty";
   const [first, ...rest] = panes;
-  return rest.length > 0 ? `${paneLabel(first.path)}+${rest.length}` : paneLabel(first.path);
+  return rest.length > 0
+    ? `${paneLabel(first.path, terminalNames)}+${rest.length}`
+    : paneLabel(first.path, terminalNames);
 }
 
 function normalizeWindow(
@@ -1329,6 +1346,9 @@ export default function App() {
   );
   const [draggingNotePath, setDraggingNotePath] = useState<string | null>(null);
   const [windowState, setWindowState] = useState<WindowWorkspaceState>(readStoredWindowWorkspaceState);
+  const [terminalNames, setTerminalNames] = useState<Record<string, string>>(() =>
+    readStoredTerminalNames(windowState)
+  );
   const [zoomedPaneId, setZoomedPaneId] = useState<string | null>(null);
   const [terminalLaunchNonceById, setTerminalLaunchNonceById] = useState<Record<string, number>>({});
   const [links, setLinks] = useState<Record<string, NoteLinks>>({});
@@ -1936,7 +1956,7 @@ export default function App() {
           value: worker.ticket,
           icon: <span className="fleet-switcher-glyph">{agentStateGlyph(worker.state, worker.live)}</span>,
           label: worker.ticket,
-          meta: `${sourceWindow ? windowLabel(sourceWindow) : "not open"}${
+          meta: `${sourceWindow ? windowLabel(sourceWindow, terminalNames) : "not open"}${
             worker.detail ? ` · ${worker.detail}` : ""
           }`,
           indent: 1,
@@ -1971,7 +1991,7 @@ export default function App() {
           value: pane.path,
           icon: <BookOpen size={14} />,
           label: basename(pane.path),
-          meta: `${index}:${windowLabel(window)} · ${pane.path}`,
+          meta: `${index}:${windowLabel(window, terminalNames)} · ${pane.path}`,
           indent: 1,
           active: activeWindow?.id === window.id && focusedPaneId === pane.key,
           chooserKind: "note",
@@ -1982,7 +2002,7 @@ export default function App() {
       }
     }
     return items;
-  }, [activeWindow, fleetGroups, focusedPaneId, focusedPaneTicket, windowState.windows]);
+  }, [activeWindow, fleetGroups, focusedPaneId, focusedPaneTicket, terminalNames, windowState.windows]);
 
   useEffect(() => {
     if (!focusedPaneId || !paneInfos.some((pane) => pane.key === focusedPaneId)) {
@@ -2519,6 +2539,17 @@ export default function App() {
   ) {
     if (controller) terminalControllersRef.current.set(terminalId, controller);
     else terminalControllersRef.current.delete(terminalId);
+  }
+
+  function updateTerminalName(terminalId: string, name: string | null) {
+    setTerminalNames((current) => {
+      if (name && current[terminalId] === name) return current;
+      if (!name && !(terminalId in current)) return current;
+      const next = { ...current };
+      if (name) next[terminalId] = name;
+      else delete next[terminalId];
+      return next;
+    });
   }
 
   function registerPaneRef(key: string, node: HTMLDivElement | null) {
@@ -3583,6 +3614,7 @@ export default function App() {
               onClose={() => closeFocusedPane(node.id)}
               onOpenNote={openNote}
               onRegisterTerminalController={registerTerminalController}
+              onTerminalNameChange={updateTerminalName}
               onRestartTerminal={restartTerminalPane}
               overlayContent={overlayContent}
               paneStateKey={node.id}
@@ -3590,6 +3622,7 @@ export default function App() {
               resourceKind={node.resourceKind}
               refreshTick={refreshTick}
               scrollRef={scrollRef}
+              terminalName={terminalNames[terminalIdFromPanePath(node.path) ?? ""] ?? null}
               terminalLaunchNonce={
                 terminalIdFromPanePath(node.path)
                   ? terminalLaunchNonceById[terminalIdFromPanePath(node.path) ?? ""] ?? 0
@@ -4106,7 +4139,7 @@ export default function App() {
                     type="button"
                     onClick={() => activateWindowByIndex(index)}
                   >
-                    <span className="tmux-status-label">{windowLabel(window)}</span>
+                    <span className="tmux-status-label">{windowLabel(window, terminalNames)}</span>
                   </button>
                 ))}
               </div>

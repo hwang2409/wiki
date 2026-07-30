@@ -1170,6 +1170,7 @@ body.is-resizing-panes .pane-cell {
 }
 
 .terminal-pane-header {
+  position: relative;
   align-items: center;
   gap: 8px;
   min-height: 36px;
@@ -1181,8 +1182,10 @@ body.is-resizing-panes .pane-cell {
 
 .terminal-pane-title-group {
   display: flex;
+  flex: 1 1 auto;
   align-items: center;
   gap: 8px;
+  min-width: 0;
   min-height: 28px;
 }
 
@@ -1349,15 +1352,20 @@ body.is-resizing-panes .pane-cell {
 
 .terminal-pane-find {
   display: inline-flex;
-  flex: 0 1 300px;
+  position: absolute;
+  top: 50%;
+  right: 8px;
+  z-index: 2;
+  width: min(300px, calc(100% - 16px));
   align-items: center;
   gap: 4px;
-  min-width: 180px;
+  min-width: 0;
   min-height: 26px;
   padding: 0 4px 0 8px;
   border: 1px solid var(--terminal-border);
   border-radius: var(--radius-full);
   background: var(--terminal-surface);
+  transform: translateY(-50%);
 }
 
 .terminal-pane-find input {

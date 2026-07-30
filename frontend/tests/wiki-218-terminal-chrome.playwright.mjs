@@ -22,6 +22,11 @@ function logStep(message) {
   console.error(`[wiki-218] ${message}`);
 }
 
+async function leader(page, key) {
+  await page.keyboard.press("Control+a");
+  await page.keyboard.press(key);
+}
+
 function writeJsonl(filePath, rows) {
   writeFileSync(filePath, rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
 }
@@ -62,6 +67,8 @@ const result = {
   pageErrors: [],
   renamePersisted: null,
   renamedTitle: null,
+  statusLabel: null,
+  findHeaderFits: null,
   sizeFlashSeen: null,
   title: null,
   viewportBackground: null,
@@ -152,6 +159,29 @@ try {
     terminalId
   );
 
+  logStep("checking the find overlay at narrow pane width");
+  await page.evaluate(() => {
+    const split = document.querySelector(".pane-split.row");
+    if (!(split instanceof HTMLElement)) throw new Error("Pane split not found");
+    split.style.setProperty("--split-ratio", "0.88");
+  });
+  await page.waitForFunction(
+    () => document.querySelector(".terminal-pane")?.getBoundingClientRect().width <= 220
+  );
+  await page.keyboard.press("Control+f");
+  await page.waitForSelector(".terminal-pane-find");
+  result.findHeaderFits = await page.evaluate(() => {
+    const header = document.querySelector(".terminal-pane-header");
+    const find = document.querySelector(".terminal-pane-find");
+    return Boolean(
+      header &&
+        find &&
+        header.scrollWidth <= header.clientWidth &&
+        find.getBoundingClientRect().right <= header.getBoundingClientRect().right
+    );
+  });
+  await page.getByRole("button", { name: "Close find" }).click();
+
   logStep("checking split-drag reflow and the transient size flash");
   result.colsBeforeResize = await page.evaluate(
     (id) => window.__wikiTerminals?.[id]?.terminal.cols ?? null,
@@ -173,6 +203,17 @@ try {
     terminalId
   );
   await page.waitForFunction(() => !document.querySelector(".terminal-pane-size-flash"));
+
+  logStep("checking the reactive status label");
+  await leader(page, "k");
+  await page.waitForFunction(() => document.querySelector(".pane-frame.is-focused .agent-session-surface") !== null);
+  await leader(page, "x");
+  await page.waitForFunction(() => document.querySelectorAll(".terminal-pane").length === 1);
+  result.statusLabel = await page.evaluate(
+    () => [...document.querySelectorAll(".tmux-status-label")]
+      .map((node) => node.textContent?.trim() ?? "")
+      .find((label) => label === "deploy shell") ?? null
+  );
 
   logStep("checking the ended state keeps the friendly title");
   await page.reload({ waitUntil: "domcontentloaded" });
@@ -206,6 +247,12 @@ try {
     throw new Error(
       `Rename did not stick: title=${result.renamedTitle} stored=${result.renamePersisted}`
     );
+  }
+  if (!result.findHeaderFits) {
+    throw new Error("Find overlay overflowed the narrow terminal header");
+  }
+  if (result.statusLabel?.trim() !== "deploy shell") {
+    throw new Error(`Status label did not follow rename: ${result.statusLabel}`);
   }
   if (!result.sizeFlashSeen) {
     throw new Error("Size flash did not appear during split resize");

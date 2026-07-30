@@ -93,6 +93,7 @@ export function WorkspacePane({
   onClose,
   onOpenNote,
   onRegisterTerminalController,
+  onTerminalNameChange,
   onRestartTerminal,
   overlayContent,
   paneStateKey,
@@ -100,6 +101,7 @@ export function WorkspacePane({
   resourceKind,
   refreshTick,
   scrollRef,
+  terminalName,
   terminalLaunchNonce,
 }: {
   agentPanel: AgentRoutePanel;
@@ -111,6 +113,7 @@ export function WorkspacePane({
   onClose: () => void;
   onOpenNote: (path: string) => void;
   onRegisterTerminalController?: (terminalId: string, controller: TerminalPaneController | null) => void;
+  onTerminalNameChange?: (terminalId: string, name: string | null) => void;
   onRestartTerminal?: (terminalId: string) => void;
   overlayContent?: ReactNode;
   paneStateKey: string;
@@ -118,6 +121,7 @@ export function WorkspacePane({
   resourceKind?: "note" | "file";
   refreshTick: number;
   scrollRef?: RefObject<HTMLDivElement | null>;
+  terminalName?: string | null;
   terminalLaunchNonce?: number;
 }) {
   let content: ReactNode;
@@ -142,7 +146,9 @@ export function WorkspacePane({
         focused={focused}
         launchNonce={terminalLaunchNonce ?? 0}
         onRegisterController={onRegisterTerminalController}
+        onNameChange={onTerminalNameChange}
         onRestart={() => onRestartTerminal?.(terminalId)}
+        customName={terminalName}
         terminalId={terminalId}
       />
     );

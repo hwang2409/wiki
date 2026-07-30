@@ -61,14 +61,18 @@ export function terminalDisplayTitle(snapshot: {
 }
 
 export function TerminalPane({
+  customName,
   focused,
   launchNonce,
+  onNameChange,
   onRegisterController,
   onRestart,
   terminalId,
 }: {
+  customName?: string | null;
   focused: boolean;
   launchNonce: number;
+  onNameChange?: (terminalId: string, name: string | null) => void;
   onRegisterController?: (terminalId: string, controller: TerminalPaneController | null) => void;
   onRestart: () => void;
   terminalId: string;
@@ -193,12 +197,14 @@ export function TerminalPane({
 
   function beginRename() {
     setDetailsOpen(false);
-    setRenameDraft(snapshot.customName ?? "");
+    setRenameDraft(customName ?? snapshot.customName ?? "");
     setRenaming(true);
   }
 
   function commitRename() {
+    const nextName = renameDraft.trim() || null;
     runtime.setCustomName(renameDraft);
+    onNameChange?.(terminalId, nextName);
     setRenaming(false);
     window.requestAnimationFrame(() => runtime.focus());
   }
@@ -261,7 +267,7 @@ export function TerminalPane({
     [snapshot.theme.chromeVars]
   );
 
-  const title = terminalDisplayTitle(snapshot);
+  const title = terminalDisplayTitle({ ...snapshot, customName: customName ?? snapshot.customName });
   const statusLabel = STATUS_LABELS[snapshot.status];
 
   return (
