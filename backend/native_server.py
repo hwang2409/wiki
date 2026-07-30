@@ -342,8 +342,15 @@ def _same_selected_executable(executable: Path, selected: Path) -> bool:
         return False
 
 
-def _verify_signature(executable: Path, requirement: str | None = None) -> bool:
+def _verify_signature(
+    executable: Path,
+    requirement: str | None = None,
+    *,
+    ignore_resources: bool = False,
+) -> bool:
     arguments = ["/usr/bin/codesign", "--verify", "--strict"]
+    if ignore_resources:
+        arguments.append("--ignore-resources")
     if requirement is not None:
         arguments.extend(["--test-requirement", f"={requirement}"])
     arguments.append(str(executable))
@@ -361,7 +368,7 @@ def _verify_signature(executable: Path, requirement: str | None = None) -> bool:
 
 def _verify_adhoc_identity(
     executable: Path,
-    details: list[str] | None,
+    details: list[str],
     selected_executable: Path,
     selected_bundle: Path,
 ) -> bool:
@@ -377,17 +384,15 @@ def _verify_adhoc_identity(
     selected_identity = _code_directory_identity(selected_details)
     if not selected_identity:
         return False
-    if details is not None:
-        if "Signature=adhoc" not in details:
-            return False
-        if f"Identifier={TAURI_BUNDLE_IDENTIFIER}" not in details:
-            return False
-        if _code_directory_identity(details) != selected_identity:
-            return False
-    # Tauri's ad-hoc bundle can contain an unsigned launcher executable. The
-    # bundle signature is still verified, while path and identity checks bind
-    # the peer to the selected app's launcher.
-    return _verify_signature(selected_bundle)
+    if "Signature=adhoc" not in details:
+        return False
+    if f"Identifier={TAURI_BUNDLE_IDENTIFIER}" not in details:
+        return False
+    if _code_directory_identity(details) != selected_identity:
+        return False
+    # Tauri's ad-hoc bundle can contain an unsigned nested launcher. Verify
+    # only the exact signed main executable and ignore unrelated resources.
+    return _verify_signature(selected_executable, ignore_resources=True)
 
 
 def _verify_code_identity(
@@ -400,9 +405,9 @@ def _verify_code_identity(
     """Verify a signed identity or the selected ad-hoc source executable."""
 
     details = _codesign_details(executable)
-    if not details and (team_identifier is not None or selected_bundle is None):
+    if not details:
         return False
-    if details is None or any(line == "Signature=adhoc" for line in details):
+    if any(line == "Signature=adhoc" for line in details):
         return (
             team_identifier is None
             and selected_executable is not None

@@ -6,6 +6,7 @@ import json
 import http.server
 import os
 import plistlib
+import shutil
 import socket
 import subprocess
 import sys
@@ -665,7 +666,7 @@ class DaemonHandshakeTests(unittest.TestCase):
 
             def fake_run(arguments: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
                 if len(arguments) > 1 and arguments[1] == "-dvvv":
-                    if Path(arguments[-1]) == app:
+                    if Path(arguments[-1]) in {app, selected}:
                         return subprocess.CompletedProcess(arguments, 0, "", details)
                     return subprocess.CompletedProcess(arguments, 1, "", "unsigned launcher")
                 return subprocess.CompletedProcess(arguments, 0, "", "")
@@ -682,6 +683,46 @@ class DaemonHandshakeTests(unittest.TestCase):
             ), patch.object(native_server, "_peer_executable", return_value=forged), patch.object(
                 native_server.subprocess, "run", side_effect=fake_run
             ), socket.socket() as peer:
+                self.assertFalse(native_server.is_trusted_tauri_peer(peer))
+
+    def test_real_adhoc_bundle_ignores_unsigned_nested_launcher(self) -> None:
+        source = (
+            Path(__file__).resolve().parents[2]
+            / "src-tauri"
+            / "target"
+            / "release"
+            / "bundle"
+            / "macos"
+            / "Wiki.app"
+        )
+        if not source.is_dir() or not Path("/usr/bin/codesign").is_file():
+            self.skipTest("requires a locally built macOS Wiki.app")
+
+        with TemporaryDirectory() as tmp:
+            app = Path(tmp) / "Wiki.app"
+            (app / "Contents").mkdir(parents=True)
+            shutil.copy2(source / "Contents" / "Info.plist", app / "Contents" / "Info.plist")
+            shutil.copytree(
+                source / "Contents" / "MacOS",
+                app / "Contents" / "MacOS",
+            )
+            code_signature = source / "Contents" / "_CodeSignature"
+            if code_signature.is_dir():
+                shutil.copytree(code_signature, app / "Contents" / "_CodeSignature")
+            launcher = app / "Contents" / "MacOS" / "wiki-backend"
+            main = app / "Contents" / "MacOS" / "wiki-native"
+            subprocess.run(["/usr/bin/codesign", "--remove-signature", str(launcher)], check=True)
+            forged = Path(tmp) / "forged-wiki-native"
+            shutil.copy2(main, forged)
+
+            with patch.object(native_server, "TAURI_BUNDLE_PATH", app), patch.object(
+                native_server, "_peer_pid", return_value=123
+            ), patch.object(native_server, "_peer_executable", return_value=main), socket.socket() as peer:
+                self.assertTrue(native_server.is_trusted_tauri_peer(peer))
+
+            with patch.object(native_server, "TAURI_BUNDLE_PATH", app), patch.object(
+                native_server, "_peer_pid", return_value=123
+            ), patch.object(native_server, "_peer_executable", return_value=forged), socket.socket() as peer:
                 self.assertFalse(native_server.is_trusted_tauri_peer(peer))
 
     def test_developer_signature_requires_team_and_designated_requirement(self) -> None:
