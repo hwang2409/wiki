@@ -68,7 +68,6 @@ In Progress:
 - WIKI-135 dashboard: implementation workers only (drop reviewers/one-shots) — owner cdx:WIKI-135 (luna)
 - [P1] WIKI-190 video/GIF artifact kind — new `kind: video` inline player (mp4/webm/gif). Controls: play/pause/scrubber/speed/mute; poster frame lazy-load; loop-by-default for GIFs. Useful for Playwright recordings, mitmproxy captures, animated diagrams
 - [P2] WIKI-191 audio artifact kind — new `kind: audio` inline w/ waveform preview + scrubber + speed control; transcript overlay if attached. For voice memos, TTS output, transcription evidence
-- [P2] WIKI-181 reviewer diversity harness — spawn N reviewers w/ distinct lenses (correctness / security / perf / test-strength) in parallel; synthesize verdicts. Codified adversarial verify — one lens catches what another misses. Wire into next_review (WIKI-171) as opt-in mode
 - [P1] WIKI-152 agent-session chrome: header, provider inspector, action-required card, composer help, footer/status rail — kill 'Provider stream', raw/normalized counts, request IDs, Unknown 0, format/token telemetry, tmux punctuation from default chrome; diagnostics in Run details (depends WIKI-148)
 
 Backlog:
