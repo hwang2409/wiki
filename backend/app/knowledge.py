@@ -36,12 +36,12 @@ from .knowledge_schema import (
     is_corruption_error as _corruption_error,
     reset_schema,
 )
-from .semantic_index import SemanticIndex, SemanticNote
+from .semantic_index import SEMANTIC_SCORE_FLOOR, SemanticIndex, SemanticNote
+from .semantic_search import EmbeddingProvider
 
 
 LOGGER = logging.getLogger(__name__)
 MAX_SEARCH_LIMIT = 100
-SEMANTIC_SCORE_FLOOR = 0.15
 FTS_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 _PATH_LOCKS: dict[str, threading.RLock] = {}
 _PATH_LOCKS_GUARD = threading.Lock()
@@ -927,44 +927,17 @@ class KnowledgeIndex:
             raise KnowledgeQueryError(f"limit must be between 1 and {MAX_SEARCH_LIMIT}")
         if ticket is not None and not ticket.strip():
             raise KnowledgeQueryError("ticket must not be empty")
-        try:
-            payload = self.semantic_index.search(
+        return self.semantic_index.search_with_fallback(
+            query,
+            ticket=ticket,
+            limit=limit,
+            score_floor=score_floor,
+            lexical_fallback=lambda: self.search(
                 query,
-                ticket=ticket,
+                kind="note",
                 limit=limit,
-                score_floor=score_floor,
-            )
-        except Exception as exc:
-            LOGGER.warning("semantic query unavailable; using lexical fallback: %s", exc)
-            payload = {
-                "results": [],
-                "semantic": {
-                    "available": False,
-                    "active": False,
-                    "indexing": False,
-                    "model": None,
-                    "reason": f"semantic search unavailable: {exc}",
-                },
-                "rebuilding": True,
-                "stale": True,
-            }
-        if payload["semantic"]["available"]:
-            return {"query": query, **payload}
-        try:
-            fallback = self.search(query, kind="note", limit=limit)
-            fallback_results = fallback["results"]
-        except KnowledgeError:
-            fallback_results = []
-        return {
-            "query": query,
-            "results": fallback_results,
-            "lexical_results": fallback_results,
-            "semantic_results": payload["results"],
-            "fallback": "lexical",
-            "semantic": payload["semantic"],
-            "rebuilding": payload.get("rebuilding", False),
-            "stale": payload.get("stale", False),
-        }
+            )["results"],
+        )
 
     def _note_paths(self, connection: sqlite3.Connection) -> list[str]:
         return [str(row[0]) for row in connection.execute("SELECT path FROM notes ORDER BY path")]

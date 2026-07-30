@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any, Mapping, Sequence
 
 from .semantic_search import (
@@ -238,11 +239,27 @@ class SemanticIndex:
                 "model": provider_model(self.embedding_provider),
                 "reason": f"semantic search unavailable: {self._semantic_error}",
             }
-        active = self.active_marker.exists()
+        connection = self._prepare()
+        try:
+            row = connection.execute(
+                "SELECT enabled, built_at FROM meta LIMIT 1"
+            ).fetchone()
+            active = self.active_marker.exists() or bool(row and int(row["enabled"]))
+            built = bool(row and row["built_at"])
+        finally:
+            connection.close()
+        if active and not built:
+            return {
+                "available": False,
+                "active": True,
+                "indexing": True,
+                "model": provider_model(self.embedding_provider),
+                "reason": "semantic index is indexing; using lexical search until the first refresh completes",
+            }
         return {
             "available": active,
             "active": active,
-            "indexing": active and not self.db_path.exists(),
+            "indexing": False,
             "model": provider_model(self.embedding_provider),
             "reason": None if active else "semantic search is disabled until enabled by an explicit action",
         }
@@ -477,3 +494,50 @@ class SemanticIndex:
             raise
         finally:
             connection.close()
+
+    def search_with_fallback(
+        self,
+        query: str,
+        *,
+        lexical_fallback: Callable[[], list[dict[str, Any]]],
+        ticket: str | None = None,
+        limit: int = 20,
+        score_floor: float = SEMANTIC_SCORE_FLOOR,
+    ) -> dict[str, Any]:
+        try:
+            payload = self.search(
+                query,
+                ticket=ticket,
+                limit=limit,
+                score_floor=score_floor,
+            )
+        except Exception as exc:
+            LOGGER.warning("semantic query unavailable; using lexical fallback: %s", exc)
+            payload = {
+                "results": [],
+                "semantic": {
+                    "available": False,
+                    "active": False,
+                    "indexing": False,
+                    "model": None,
+                    "reason": f"semantic search unavailable: {exc}",
+                },
+                "rebuilding": True,
+                "stale": True,
+            }
+        if payload["semantic"]["available"]:
+            return {"query": query, **payload}
+        try:
+            fallback_results = lexical_fallback()
+        except Exception:
+            fallback_results = []
+        return {
+            "query": query,
+            "results": fallback_results,
+            "lexical_results": fallback_results,
+            "semantic_results": payload["results"],
+            "fallback": "lexical",
+            "semantic": payload["semantic"],
+            "rebuilding": payload.get("rebuilding", False),
+            "stale": payload.get("stale", False),
+        }

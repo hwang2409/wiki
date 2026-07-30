@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import io
 import os
+import runpy
 import sqlite3
 import tempfile
+import threading
 import unittest
-from contextlib import closing
+from contextlib import closing, redirect_stdout
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
 from backend.app import knowledge, main
+from backend.app import semantic_index as semantic_index_module
 
 
 class FakeEmbeddingProvider:
@@ -23,6 +28,10 @@ class FakeEmbeddingProvider:
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         self.calls.append(list(texts))
+        return self._vectors(texts)
+
+    @staticmethod
+    def _vectors(texts: list[str]) -> list[list[float]]:
         vectors = []
         for text in texts:
             lowered = text.lower()
@@ -33,6 +42,24 @@ class FakeEmbeddingProvider:
                 ]
             )
         return vectors
+
+
+class BlockingEmbeddingProvider(FakeEmbeddingProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.first_started = threading.Event()
+        self.second_started = threading.Event()
+        self.release = threading.Event()
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        self.calls.append(list(texts))
+        if len(self.calls) == 1:
+            self.first_started.set()
+        else:
+            self.second_started.set()
+        if not self.release.wait(timeout=2):
+            raise RuntimeError("fixture provider was not released")
+        return self._vectors(texts)
 
 
 class RejectingEmbeddingProvider(FakeEmbeddingProvider):
@@ -143,7 +170,8 @@ class SemanticIndexTests(unittest.TestCase):
 
         partial = self.index.search_semantic("database")
         self.assertTrue(partial["rebuilding"])
-        self.assertEqual(partial["results"], [])
+        self.assertEqual(partial["fallback"], "lexical")
+        self.assertEqual(partial["results"][0]["path"], "db.md")
         self.index.refresh_all()
         self.assertEqual(
             self.index.search_semantic("database")["results"][0]["path"],
@@ -167,6 +195,24 @@ class SemanticIndexTests(unittest.TestCase):
         self.assertTrue(index.activate_semantic())
         index.refresh_all()
         self.assertEqual(len(provider.calls), 1)
+
+    def test_activation_reports_indexing_and_uses_lexical_until_built(self) -> None:
+        write_note(self.vault / "db.md", "sqlite database notes")
+        self.assertTrue(self.index.activate_semantic())
+        status = self.index.semantic_status()
+        self.assertTrue(status["active"])
+        self.assertTrue(status["indexing"])
+        self.assertFalse(status["available"])
+
+        result = self.index.search_semantic("database")
+        self.assertEqual(result["fallback"], "lexical")
+        self.assertEqual(result["results"], [])
+        self.assertEqual(self.provider.calls, [])
+
+        self.index.refresh_all()
+        status = self.index.semantic_status()
+        self.assertTrue(status["available"])
+        self.assertFalse(status["indexing"])
 
     def test_generic_openai_key_is_not_an_embedding_consent_signal(self) -> None:
         with mock.patch.dict(
@@ -214,7 +260,7 @@ class SemanticIndexTests(unittest.TestCase):
 
     def test_refresh_is_single_flight_for_overlapping_callers(self) -> None:
         write_note(self.vault / "db.md", "sqlite database notes")
-        provider = FakeEmbeddingProvider()
+        provider = BlockingEmbeddingProvider()
         first = knowledge.KnowledgeIndex(
             knowledge.KnowledgePaths(self.db, self.vault, self.archive, self.runtime),
             provider,
@@ -225,7 +271,12 @@ class SemanticIndexTests(unittest.TestCase):
             provider,
         )
         with ThreadPoolExecutor(max_workers=2) as executor:
-            results = list(executor.map(lambda index: index.refresh_all(), (first, second)))
+            first_future = executor.submit(first.refresh_all)
+            self.assertTrue(provider.first_started.wait(timeout=2))
+            second_future = executor.submit(second.refresh_all)
+            self.assertFalse(provider.second_started.wait(timeout=0.2))
+            provider.release.set()
+            results = [first_future.result(timeout=2), second_future.result(timeout=2)]
         self.assertEqual(len(provider.calls), 1)
         self.assertEqual(sum(result.embeddings_indexed for result in results), 1)
 
@@ -241,7 +292,27 @@ class SemanticIndexTests(unittest.TestCase):
                 connection.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0],
                 500,
             )
-        result = self.index.search_semantic("database", limit=5)
+        real_connect = sqlite3.connect
+
+        class NoFetchAllCursor(sqlite3.Cursor):
+            def fetchall(self):
+                raise AssertionError("semantic query fetched all rows")
+
+        class NoFetchAllConnection(sqlite3.Connection):
+            def execute(self, sql, parameters=()):
+                return super().cursor(factory=NoFetchAllCursor).execute(sql, parameters)
+
+        def guarded_connect(*args, **kwargs):
+            kwargs["factory"] = NoFetchAllConnection
+            return real_connect(*args, **kwargs)
+
+        with mock.patch.object(
+            semantic_index_module.sqlite3,
+            "connect",
+            side_effect=guarded_connect,
+        ):
+            result = self.index.search_semantic("database", limit=5)
+        self.assertTrue(result["semantic"]["available"])
         self.assertEqual(len(result["results"]), 5)
         self.assertEqual(
             [row["path"] for row in result["results"]],
@@ -258,12 +329,45 @@ class SemanticIndexTests(unittest.TestCase):
         }
         with mock.patch.dict(os.environ, env, clear=False):
             knowledge.KnowledgeIndex.from_env().rebuild()
-            result = asyncio.run(
-                main.knowledge_search(q="endpointneedle", mode="semantic")
-            )
+            with mock.patch.object(knowledge.KnowledgeIndex, "refresh_all") as refresh:
+                result = asyncio.run(
+                    main.knowledge_search(q="endpointneedle", mode="semantic")
+                )
+        refresh.assert_not_called()
         self.assertFalse(result["semantic"]["available"])
         self.assertEqual(result["fallback"], "lexical")
         self.assertEqual(result["results"][0]["path"], "endpoint.md")
+
+    def test_cli_semantic_search_does_not_index_an_unindexed_vault(self) -> None:
+        write_note(self.vault / "db.md", "sqlite database notes")
+        provider = FakeEmbeddingProvider()
+        index = knowledge.KnowledgeIndex(
+            knowledge.KnowledgePaths(self.db, self.vault, self.archive, self.runtime),
+            provider,
+        )
+        cli = runpy.run_path(
+            str(Path(__file__).resolve().parents[2] / "wiki"),
+            run_name="wiki_test",
+        )
+        cli["cmd_search"].__globals__["_knowledge_index"] = lambda: index
+        args = argparse.Namespace(
+            mode="semantic",
+            query="database",
+            ticket=None,
+            limit=20,
+            json=True,
+            kind="note",
+            event_type=None,
+            since=None,
+        )
+        with redirect_stdout(io.StringIO()):
+            cli["cmd_search"](args)
+        self.assertEqual(provider.calls, [])
+
+    def test_knowledge_index_annotations_resolve(self) -> None:
+        from typing import get_type_hints
+
+        get_type_hints(knowledge.KnowledgeIndex.__init__)
 
 
 if __name__ == "__main__":
