@@ -76,7 +76,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "spawn_agent",
         "description": (
             "Spawn one supervisor-owned worker. Always pass this orchestrator's id in "
-            "orch. request_id is generated when omitted; reuse an explicit value on retry."
+            "orch. request_id is generated when omitted; reuse an explicit value on retry. "
+            "Set context_prelude=true to prepend bounded local context."
         ),
         "inputSchema": {
             "type": "object",
@@ -92,6 +93,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "prompt": {"type": "string", "minLength": 1},
                 "orch": {"type": "string", "minLength": 1},
                 "request_id": {"type": "string", "minLength": 1, "maxLength": 200},
+                "title": {"type": "string", "maxLength": 500},
+                "context_prelude": {"type": "boolean", "default": False},
+                "include_context": {"type": "boolean", "default": False},
+                "context_prelude_override": {"type": "string", "maxLength": 5000},
             },
         },
     },
@@ -318,7 +323,14 @@ def spawn_agent(arguments: Any) -> dict[str, Any]:
     values = _arguments(
         arguments,
         required={"ticket", "kind", "role", "model", "workdir", "prompt", "orch"},
-        optional={"effort", "request_id"},
+        optional={
+            "effort",
+            "request_id",
+            "title",
+            "context_prelude",
+            "include_context",
+            "context_prelude_override",
+        },
     )
     values.setdefault("effort", None)
     values.setdefault("request_id", str(uuid4()))

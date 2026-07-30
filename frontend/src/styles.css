@@ -2087,6 +2087,12 @@ body.is-resizing-panes .pane-cell {
   line-height: 1.5;
 }
 
+.agent-context-prelude {
+  min-height: 180px;
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+}
+
 .agent-spawn-hint,
 .agent-spawn-error {
   color: var(--text-faint);

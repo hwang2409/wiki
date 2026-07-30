@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 from . import (
     accounts,
     backend_runtime,
+    context_prelude,
     dashboard,
     github_pr,
     github_preview,
@@ -3848,6 +3849,10 @@ class SpawnWorkerIn(BaseModel):
     workdir: str = Field(..., min_length=1, max_length=4096)
     orch: str | None = Field(default=None, max_length=100)
     prompt: str = Field(..., min_length=1, max_length=100_000)
+    title: str = Field(default="", max_length=500)
+    context_prelude: bool = False
+    include_context: bool = False
+    context_prelude_override: str | None = Field(default=None, max_length=5_000)
     request_id: str | None = Field(default=None, min_length=1, max_length=200)
 
     @model_validator(mode="after")
@@ -3859,6 +3864,13 @@ class SpawnWorkerIn(BaseModel):
         if kind == "cc" and effort is not None:
             raise ValueError("Claude workers do not accept reasoning effort")
         return self
+
+
+class ContextPreludeIn(BaseModel):
+    ticket: str = Field(..., min_length=1, max_length=80)
+    title: str = Field(default="", max_length=500)
+    prompt: str = Field(default="", max_length=100_000)
+    workdir: str = Field(..., min_length=1, max_length=4096)
 
 
 class SpawnOrchestratorIn(BaseModel):
@@ -4343,6 +4355,81 @@ def cancel_agent_model(ticket: str) -> dict[str, object]:
     return {"status": result.get("status", "canceled"), "desired_model": None}
 
 
+def _build_context_prelude(
+    *,
+    ticket: str,
+    title: str,
+    prompt: str,
+    repo_root: Path,
+) -> context_prelude.PreludeResult:
+    builder = context_prelude.ContextPreludeBuilder(
+        repo_root=repo_root,
+        vault_dir=VAULT_DIR,
+        status_dir=AGENT_STATUS_DIR,
+        runtime_dir=AGENT_RUNTIME_DIR,
+        archive_dir=AGENT_ARCHIVE_DIR,
+    )
+    return builder.build(ticket=ticket, title=title, prompt=prompt)
+
+
+def _contextual_prompt(
+    body: SpawnWorkerIn,
+    *,
+    repo_root: Path,
+) -> str:
+    if not (body.context_prelude or body.include_context):
+        return body.prompt
+    if body.context_prelude_override is not None:
+        prelude = context_prelude.bound_override(body.context_prelude_override)
+    else:
+        try:
+            prelude = _build_context_prelude(
+                ticket=body.ticket,
+                title=body.title,
+                prompt=body.prompt,
+                repo_root=repo_root,
+            ).text
+        except Exception as exc:
+            # Context is an optional enhancement. A broken source or path can
+            # never prevent the underlying worker spawn.
+            logger.warning("context prelude unavailable for %s: %s", body.ticket, exc)
+            return body.prompt
+    return context_prelude.prepend(prelude, body.prompt)
+
+
+@app.post("/api/agents/context-prelude")
+def context_prelude_route(body: ContextPreludeIn) -> dict[str, object]:
+    ticket = body.ticket.strip().upper()
+    if not SPAWN_TICKET_PATTERN.fullmatch(ticket):
+        raise HTTPException(
+            status_code=400,
+            detail="Ticket must be uppercase letters, numbers, or dashes",
+        )
+    workdir_path = resolve_existing_dir(body.workdir, field_name="Working directory")
+    try:
+        result = _build_context_prelude(
+            ticket=ticket,
+            title=body.title,
+            prompt=body.prompt,
+            repo_root=workdir_path,
+        )
+    except context_prelude.PreludeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.warning("context prelude preview failed for %s: %s", ticket, exc)
+        return {
+            "prelude": "# context prelude\n[context retrieval unavailable; continue with the kickoff prompt]",
+            "truncated": False,
+            "sources": {},
+        }
+    return {
+        "prelude": result.text,
+        "truncated": result.truncated,
+        "sources": result.sources,
+        "char_budget": context_prelude.MAX_PRELUDE_CHARS,
+    }
+
+
 def spawn_agent(
     body: dict[str, Any] | SpawnWorkerIn,
     *,
@@ -4372,6 +4459,12 @@ def spawn_agent(
         raise HTTPException(status_code=400, detail="Kickoff prompt must be smaller than 100KB")
 
     workdir_path = resolve_existing_dir(body.workdir, field_name="Working directory")
+    try:
+        prompt = _contextual_prompt(body, repo_root=workdir_path)
+    except context_prelude.PreludeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if len(prompt.encode("utf-8")) >= MAX_SPAWN_PROMPT_BYTES:
+        raise HTTPException(status_code=400, detail="Kickoff prompt must be smaller than 100KB")
 
     registry = _read_agent_registry()
     orch = (body.orch or "").strip()

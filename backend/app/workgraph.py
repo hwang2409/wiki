@@ -50,6 +50,8 @@ import fcntl
 import itertools
 import json
 import os
+import re
+import stat
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -57,6 +59,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from wiki_cli import graph_lint
+
+from .pathwalk import open_relative_file
 
 STATUS_DIR = Path(os.environ.get("WIKI_AGENT_STATUS_DIR") or "/tmp/agent-status")
 SNAPSHOT_DIR = Path(
@@ -77,6 +81,7 @@ EDGE_KINDS = (
 SNAPSHOT_EDGE_KINDS = {"spawn", "verdict", "archive", "escalation"}
 STALL_ALARM_SECONDS = 1800
 DEFAULT_ITERATION_CAP = 8
+WORKGRAPH_TICKET_RE = re.compile(r"^[A-Z][A-Z0-9]+-[0-9]+(?:-[A-Z0-9]+)*$")
 
 # One injected clock for every stall/health computation so the renderer, the
 # health endpoint, and the CLI agree on "now" (and tests can freeze it).
@@ -118,6 +123,12 @@ def now_iso() -> str:
     return _stamp(CLOCK())
 
 
+def _validate_ticket(ticket: str) -> str:
+    if not isinstance(ticket, str) or not WORKGRAPH_TICKET_RE.fullmatch(ticket):
+        raise WorkgraphError("unsafe workgraph ticket")
+    return ticket
+
+
 def _parse_ts(value: object) -> float | None:
     if not isinstance(value, str):
         return None
@@ -128,6 +139,7 @@ def _parse_ts(value: object) -> float | None:
 
 
 def hot_path(ticket: str, status_dir: Path | None = None) -> Path:
+    _validate_ticket(ticket)
     return (status_dir or STATUS_DIR) / f"{ticket}.workgraph.json"
 
 
@@ -138,6 +150,7 @@ def _ticket_lock(ticket: str, status_dir: Path | None = None):
     Backend requests and ``wiki graph append`` share the same lockfile, so a
     read-modify-write can never interleave with another writer's commit.
     """
+    ticket = _validate_ticket(ticket)
     directory = status_dir or STATUS_DIR
     try:
         directory.mkdir(parents=True, exist_ok=True)
@@ -161,16 +174,42 @@ def load_workgraph(ticket: str, status_dir: Path | None = None) -> dict[str, Any
     never mistake a damaged graph for a missing one and overwrite its edge
     history.
     """
-    path = hot_path(ticket, status_dir)
+    ticket = _validate_ticket(ticket)
+    directory = status_dir or STATUS_DIR
+    path = hot_path(ticket, directory)
     recovery_hint = f"inspect it or run `wiki graph recover {ticket}` to restore the newest snapshot"
+    root_fd: int | None = None
+    file_fd: int | None = None
     try:
-        text = path.read_text(encoding="utf-8")
+        root_fd = os.open(
+            directory,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        file_fd = open_relative_file(
+            root_fd,
+            (path.name,),
+            extra_final_flags=getattr(os, "O_NONBLOCK", 0),
+        )
+        if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+            raise OSError("hot workgraph is not a regular file")
+        with os.fdopen(file_fd, "r", encoding="utf-8") as handle:
+            file_fd = None
+            text = handle.read()
     except FileNotFoundError:
         return None
     except OSError as exc:
         raise WorkgraphCorruptError(
             f"hot workgraph {path} exists but cannot be read ({exc}); {recovery_hint}"
         ) from exc
+    finally:
+        if file_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(file_fd)
+        if root_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(root_fd)
     try:
         data = json.loads(text)
     except ValueError as exc:
@@ -230,6 +269,7 @@ def _latest_snapshot_revision(ticket: str, directory: Path) -> int:
 
 
 def newest_snapshot_path(ticket: str, snapshot_dir: Path | None = None) -> Path | None:
+    ticket = _validate_ticket(ticket)
     directory = snapshot_dir or SNAPSHOT_DIR
     best: tuple[tuple[int, int, int], Path] | None = None
     if not directory.is_dir():
