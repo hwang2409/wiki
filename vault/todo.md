@@ -8,7 +8,6 @@ updated: 2026-07-30
 
 Todo:
 
-- [P3] WIKI-168 daemon-ize wiki backend — open since graph-engineering D2; survive terminal close, launchd or equivalent
 - [P3] WIKI-182 verdict archaeology — search across all archived reviewer verdicts. "Show every finding about mutation-not-load-bearing." Training data for future reviewer prompts + doctrine mining. Backend: full-text over archived transcripts. Frontend: search page w/ severity + author + date filters
 - [P3] WIKI-183 cross-project search — grep across all orch vaults + PRs + commits + verdicts. Wiki + phoebe + tooling + misc in one query. Backend: multi-repo indexer (respect .gitignore); frontend: unified palette
 - [P4] WIKI-184 voice steer — Henry says "restart WIKI-165" or "route WIKI-172 R1 to implementer"; app parses via speech-to-text + LLM intent extraction + routes. Overkill but cool. Depends on macOS speech API + safety confirm on destructive ops
@@ -44,7 +43,6 @@ Unknown provider-stream renderer arc (Henry 2026-07-29 — audit of `disposition
 - [P2] WIKI-149 code-block copy button + diff artifact kind: hover copy on ``` blocks; new artifact renderer syntax-colors +/- with hunk headers; register kind:diff in artifact router
 - [P1] WIKI-154 runs management productization: Agents page/cards/banners/actions/session preview/spawn+replace dialogs — Active/History hierarchy, decision-relevant fields only, IDs/tmux/log-paths in Technical details, provider/auth notices state user impact + next action
 - [P1] WIKI-155 session + dashboard state completeness: explicit zero-event/working/error variants with recovery, dashboard table skeleton, both empty variants contextual, last-good content survives refresh failure
-- [P2] WIKI-157 utility-page refinement: activity/graph/health/token usage — title+loading+empty+error+retry everywhere, graph keyboard/noncanvas access, git/CLI terminology secondary, no false-zero token data
 - [P1] WIKI-158 global resilience + lifecycle states: first run, backend down, provider auth, update available, notices — coherent first-run path, backend outage != empty vault, persistent sign-in state, all states announce success recovery
 - [P2] WIKI-159 keyboard + dialog accessibility: kanban/dashboard filters/destructive dialog/context menu — keyboard equivalents for drag/double-click, listbox+menu+dialog semantics complete, focus trap+restore, destructive copy describes outcome+recovery
 - [P2] WIKI-160 design-token convergence + shared controls: spacing/radii/motion/icons/shadows, settings+status components — one spacing/radius/motion vocabulary, no dup radius aliases, theme-token shadows, weights cap 600, primitives everywhere (rebase after WIKI-144)
@@ -69,6 +67,8 @@ In Progress:
 - [P1] WIKI-190 video/GIF artifact kind — new `kind: video` inline player (mp4/webm/gif). Controls: play/pause/scrubber/speed/mute; poster frame lazy-load; loop-by-default for GIFs. Useful for Playwright recordings, mitmproxy captures, animated diagrams
 - [P2] WIKI-191 audio artifact kind — new `kind: audio` inline w/ waveform preview + scrubber + speed control; transcript overlay if attached. For voice memos, TTS output, transcription evidence
 - [P1] WIKI-152 agent-session chrome: header, provider inspector, action-required card, composer help, footer/status rail — kill 'Provider stream', raw/normalized counts, request IDs, Unknown 0, format/token telemetry, tmux punctuation from default chrome; diagnostics in Run details (depends WIKI-148)
+- [P2] WIKI-157 utility-page refinement: activity/graph/health/token usage — title+loading+empty+error+retry everywhere, graph keyboard/noncanvas access, git/CLI terminology secondary, no false-zero token data
+- [P3] WIKI-168 daemon-ize wiki backend — open since graph-engineering D2; survive terminal close, launchd or equivalent
 
 Backlog:
 
