@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import {
   commandExecutionCards,
@@ -66,6 +66,22 @@ describe("codex stream renderers", () => {
     expect(screen.getByText("hook: userPromptSubmit")).toBeTruthy();
   });
 
+  it("pairs hooks by run id without a turn id and renders completion-only hooks", () => {
+    const paired = deriveHookChips([
+      event("hook_started", 1, { run: { eventName: "sessionStart", id: "hook-1" } }),
+      event("hook_completed", 2, { run: { eventName: "sessionStart", id: "hook-1", durationMs: 18 } }),
+    ]);
+    expect(paired[0]?.name).toBe("sessionStart");
+    expect(paired[0]?.durationMs).toBe(18);
+
+    const completionOnly = deriveHookChips([
+      event("hook_completed", 3, { run: { eventName: "sessionEnd", durationMs: 24 } }),
+    ]);
+    expect(completionOnly).toEqual([
+      { key: "name:sessionEnd\u00003", name: "sessionEnd", durationMs: 24, seq: 3 },
+    ]);
+  });
+
   it("attaches terminal interaction to one command card and keeps empty stdin visible", () => {
     const orphan = event("item_commandExecution_terminalInteraction", 1, {
       itemId: "exec-1",
@@ -122,8 +138,41 @@ describe("codex stream renderers", () => {
     expect(document.querySelector(".codex-stream-diff-body")?.textContent).not.toContain("+new");
   });
 
-  it("memoizes parsed diff snapshots by content", () => {
+  it("uses the backend-pinned current-turn diff and honors a reset", () => {
+    const oldDiff = "diff --git a/old.txt b/old.txt\n--- a/old.txt\n+++ b/old.txt\n@@ -1,1 +1,1 @@\n-old\n+old";
+    const currentDiff = "diff --git a/current.txt b/current.txt\n--- a/current.txt\n+++ b/current.txt\n@@ -1,1 +1,1 @@\n-old\n+current";
+    const view = render(
+      <CodexStreamHighlights
+        events={[event("turn_diff_updated", 1, { diff: oldDiff })]}
+        currentTurnDiff={currentDiff}
+      />,
+    );
+    expect(view.getByText("current.txt")).toBeTruthy();
+    expect(view.queryByText("old.txt")).toBeNull();
+    view.unmount();
+
+    const reset = render(
+      <CodexStreamHighlights
+        events={[event("turn_diff_updated", 1, { diff: oldDiff })]}
+        currentTurnDiff={null}
+      />,
+    );
+    expect(reset.container.querySelector("[data-testid='codex-diff-renderer']")).toBeNull();
+  });
+
+  it("parses a diff snapshot into files", () => {
     const source = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,1 +1,1 @@\n-old\n+new";
-    expect(parseDiffSnapshot(source)).toBe(parseDiffSnapshot(source));
+    expect(parseDiffSnapshot(source)).toStrictEqual(parseDiffSnapshot(source));
+  });
+
+  it("collapses large files and limits the expanded preview", () => {
+    const lines = Array.from({ length: 200 }, (_, index) => `+${"x".repeat(1_000)}-${index}`).join("\n");
+    const source = `diff --git a/large.txt b/large.txt\n--- a/large.txt\n+++ b/large.txt\n@@ -0,0 +1,200 @@\n${lines}`;
+    const view = render(<CodexStreamHighlights events={[event("turn_diff_updated", 1, { diff: source })]} />);
+    expect(view.container.querySelector(".codex-stream-diff-body")).toBeNull();
+    fireEvent.click(view.getByRole("button", { name: /large\.txt/ }));
+    const renderedLines = view.container.querySelectorAll(".codex-stream-diff-line");
+    expect(renderedLines.length).toBeGreaterThan(0);
+    expect(renderedLines.length).toBeLessThan(200);
   });
 });

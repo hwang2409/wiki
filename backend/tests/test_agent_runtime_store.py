@@ -571,6 +571,54 @@ class RunStoreTests(unittest.TestCase):
             reloaded = store.get(record.run_id)
             self.assertEqual(reloaded.disposition_counts["rendered"], 1)
 
+    def test_current_turn_diff_survives_event_window_and_resets_on_new_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            record = store.create(_record(root))
+
+            def append(method: str, params: dict[str, Any], kind: str) -> None:
+                payload = {"method": method, "params": params}
+                raw = store.append_raw(
+                    record.run_id,
+                    provider="codex",
+                    direction="server",
+                    payload=payload,
+                )
+                store.append_normalized(
+                    record.run_id,
+                    raw_seq=raw["seq"],
+                    disposition=EventDisposition.RENDERED,
+                    kind=kind,
+                    payload=payload,
+                )
+
+            append("turn/started", {"turn": {"id": "turn-1"}}, "turn_started")
+            append("turn/diff/updated", {"diff": "diff one"}, "turn_diff_updated")
+            for index in range(51):
+                append("warning", {"message": f"event {index}"}, "warning")
+
+            window = store.read_normalized_events(record.run_id, limit=50)
+            self.assertFalse(any(event["kind"] == "turn_diff_updated" for event in window))
+            self.assertEqual(
+                store.current_turn_diff(record.run_id),
+                {"turn_id": "turn-1", "seq": 2, "diff": "diff one"},
+            )
+
+            append("turn/started", {"turn": {"id": "turn-2"}}, "turn_started")
+            self.assertIsNone(store.current_turn_diff(record.run_id))
+            append("turn/diff/updated", {"diff": "diff two"}, "turn_diff_updated")
+            self.assertEqual(
+                store.current_turn_diff(record.run_id),
+                {"turn_id": "turn-2", "seq": 55, "diff": "diff two"},
+            )
+            restarted = RunStore(paths)
+            self.assertEqual(
+                restarted.current_turn_diff(record.run_id),
+                {"turn_id": "turn-2", "seq": 55, "diff": "diff two"},
+            )
+
     def test_pending_user_message_matching_is_durable_and_fifo_safe(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

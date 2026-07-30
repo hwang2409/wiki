@@ -969,7 +969,16 @@ function ProviderStreamInspector({
           {inspector.provider} · {inspector.state}
         </span>
       </button>
-      {inspector.provider === "codex" ? <CodexStreamHighlights events={inspector.events} /> : null}
+      {inspector.provider === "codex" ? (
+        <CodexStreamHighlights
+          events={inspector.events}
+          currentTurnDiff={
+            inspector.current_turn_diff === undefined
+              ? undefined
+              : inspector.current_turn_diff?.diff ?? null
+          }
+        />
+      ) : null}
       {open ? (
         <div className="session-provider-inspector-body">
           {pendingRequests.map((request) => (

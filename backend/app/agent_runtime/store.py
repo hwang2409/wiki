@@ -17,6 +17,7 @@ from .provider import AdapterStatus
 from .types import (
     EventDisposition,
     LifecycleState,
+    ProviderKind,
     RunRecord,
     MAX_MESSAGE_DEDUPE_KEYS,
     TERMINAL_STATES,
@@ -90,6 +91,44 @@ def _provider_request_id(kind: str, payload: dict[str, Any]) -> str | int | None
     if isinstance(value, bool) or not isinstance(value, (str, int)):
         return None
     return value
+
+
+def _codex_turn_id(payload: dict[str, Any]) -> str | None:
+    params = payload.get("params")
+    if not isinstance(params, dict):
+        return None
+    direct = params.get("turnId")
+    if isinstance(direct, str) and direct:
+        return direct
+    turn = params.get("turn")
+    if isinstance(turn, dict):
+        value = turn.get("id")
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _apply_current_turn_diff(record: RunRecord, envelope: dict[str, Any]) -> None:
+    if record.provider is not ProviderKind.CODEX:
+        return
+    payload = envelope.get("payload")
+    if not isinstance(payload, dict):
+        return
+    method = payload.get("method")
+    seq = int(envelope.get("seq", 0))
+    if method == "turn/started":
+        record.current_turn_diff_turn_id = _codex_turn_id(payload)
+        record.current_turn_diff_started_seq = seq
+        record.current_turn_diff_seq = 0
+        record.current_turn_diff = None
+        return
+    if method != "turn/diff/updated" or record.current_turn_diff_started_seq <= 0:
+        return
+    params = payload.get("params")
+    diff = params.get("diff") if isinstance(params, dict) else None
+    if isinstance(diff, str):
+        record.current_turn_diff_seq = seq
+        record.current_turn_diff = diff
 
 
 def _apply_pending_request_event(
@@ -639,7 +678,17 @@ class RunStore:
                 }
                 previous_pending_user_messages = list(record.pending_user_messages)
                 previous_composer_messages = list(record.composer_messages)
+                previous_current_turn_diff = (
+                    record.current_turn_diff_turn_id,
+                    record.current_turn_diff_started_seq,
+                    record.current_turn_diff_seq,
+                    record.current_turn_diff,
+                )
                 record.pending_requests = {}
+                record.current_turn_diff_turn_id = None
+                record.current_turn_diff_started_seq = 0
+                record.current_turn_diff_seq = 0
+                record.current_turn_diff = None
                 lifecycle_checkpoint = record.last_lifecycle_event_seq
                 rebuilt_unread_seq = 0
                 for event in normalized_events:
@@ -664,6 +713,7 @@ class RunStore:
                             seq=seq,
                             normalized_at=str(event.get("normalized_at") or utc_now()),
                         )
+                    _apply_current_turn_diff(record, event)
                     # Rebuild the WIKI-161 unread-worthy counter alongside
                     # normalized_event_count so a crash between JSONL fsync
                     # and run.json replace cannot leave a stale value on disk.
@@ -710,6 +760,13 @@ class RunStore:
                     or previous_composer_messages != record.composer_messages
                     or record.last_lifecycle_event_seq != lifecycle_checkpoint
                     or record.unread_event_seq != rebuilt_unread_seq
+                    or previous_current_turn_diff
+                    != (
+                        record.current_turn_diff_turn_id,
+                        record.current_turn_diff_started_seq,
+                        record.current_turn_diff_seq,
+                        record.current_turn_diff,
+                    )
                 ):
                     record.raw_event_count = raw_count
                     record.normalized_event_count = normalized_count
@@ -1310,6 +1367,7 @@ class RunStore:
                 "lifecycle_state": lifecycle_state.value if lifecycle_state else None,
             }
             _append_json_line(self.normalized_events_path(run_id), envelope)
+            _apply_current_turn_diff(record, envelope)
             record.normalized_event_count = int(envelope["seq"])
             # Unread advances only on genuinely worker-authored surface events
             # (see _is_unread_worthy). Synthetic supervisor wakes, outbound
@@ -1353,6 +1411,17 @@ class RunStore:
             record.last_lifecycle_event_seq = int(envelope["seq"])
             self._write_record(record)
             return envelope
+
+    def current_turn_diff(self, run_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            record = self.get(run_id)
+            if record.provider is not ProviderKind.CODEX or record.current_turn_diff is None:
+                return None
+            return {
+                "turn_id": record.current_turn_diff_turn_id,
+                "seq": record.current_turn_diff_seq,
+                "diff": record.current_turn_diff,
+            }
 
     def clear_pending_request(
         self,
