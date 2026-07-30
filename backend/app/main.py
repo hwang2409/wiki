@@ -36,6 +36,7 @@ from . import (
     knowledge,
     palette,
     provider_health,
+    replay,
     terminal,
     tokens,
     transcripts,
@@ -2969,6 +2970,81 @@ def agent_provider_events(
             detail="Provider event inspection is available after headless migration",
         )
     return result
+
+
+def _open_runs_root_fd_or_404() -> int:
+    try:
+        return replay.open_runs_root_fd(AGENT_RUNS_DIR)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Runs root missing") from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Runs root unreadable: {exc}") from exc
+
+
+def _validate_run_id_or_400(run_id: str) -> None:
+    if not replay.valid_run_id(run_id):
+        raise HTTPException(status_code=400, detail="Bad run id")
+
+
+@app.get("/api/agents/{ticket}/replay/runs")
+def agent_replay_runs(ticket: str) -> dict[str, object]:
+    if not TICKET_PATTERN.fullmatch(ticket):
+        raise HTTPException(status_code=400, detail="Bad ticket")
+    runs_root_fd = _open_runs_root_fd_or_404()
+    try:
+        listing = replay.resolve_ticket_runs(runs_root_fd, ticket)
+    finally:
+        os.close(runs_root_fd)
+    return {
+        "ticket": ticket,
+        "runs": [run.as_dict() for run in listing.runs],
+        "runs_truncated": listing.truncated,
+    }
+
+
+@app.get("/api/agent-runs/{run_id}/replay/timeline")
+def agent_run_replay_timeline(
+    run_id: str,
+    cursor: str | None = None,
+    limit: int = replay.DEFAULT_LIMIT,
+) -> dict[str, object]:
+    _validate_run_id_or_400(run_id)
+    if limit < 1 or limit > replay.MAX_LIMIT:
+        raise HTTPException(
+            status_code=400,
+            detail=f"limit must be between 1 and {replay.MAX_LIMIT}",
+        )
+    runs_root_fd = _open_runs_root_fd_or_404()
+    try:
+        replay.verify_run_dir_exists(runs_root_fd, run_id)
+        return replay.build_timeline_response(
+            runs_root_fd,
+            run_id,
+            cursor=cursor,
+            limit=limit,
+        )
+    except replay.ReplayError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    finally:
+        os.close(runs_root_fd)
+
+
+@app.get("/api/agent-runs/{run_id}/replay/events/{seq}")
+def agent_run_replay_event(run_id: str, seq: int) -> dict[str, object]:
+    if seq <= 0:
+        raise HTTPException(status_code=400, detail="Seq must be positive")
+    _validate_run_id_or_400(run_id)
+    runs_root_fd = _open_runs_root_fd_or_404()
+    try:
+        replay.verify_run_dir_exists(runs_root_fd, run_id)
+        entry = replay.load_raw_event(runs_root_fd, run_id, seq)
+    except replay.ReplayError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    finally:
+        os.close(runs_root_fd)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Event not found")
+    return {"run_id": run_id, "seq": seq, "raw": entry}
 
 
 def _session_delta_payload(
