@@ -11006,10 +11006,15 @@ textarea.composer-command-input {
   cursor: pointer;
   transition: border-color 150ms cubic-bezier(0.2, 0, 0, 1),
     background 150ms cubic-bezier(0.2, 0, 0, 1);
-  /* Skip offscreen layout+paint so a many-page sidebar stays cheap even
-     when the button count is large. */
-  content-visibility: auto;
-  contain-intrinsic-size: 128px 148px;
+  /* Fixed slot geometry: the sidebar's DOM windowing math (see
+     THUMB_SLOT_HEIGHT in pdf.tsx) picks the visible range from
+     scrollTop / height, so every button MUST occupy exactly the
+     same vertical space, populated or not. Don't add content-visibility
+     here — it collapses offscreen buttons to their intrinsic size and
+     the windowed slice ends up computing wrong indices. */
+  flex: 0 0 148px;
+  height: 148px;
+  box-sizing: border-box;
 }
 
 .artifact-pdf-thumbnail:hover {

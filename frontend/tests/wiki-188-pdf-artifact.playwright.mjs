@@ -426,9 +426,42 @@ async function main() {
     if (!/^1\/1$/.test(matchCountLarge.trim())) {
       throw new Error(`large-pdf match count unexpected: ${JSON.stringify(matchCountLarge)}`);
     }
-    // Now switch back to B one more time and re-run its find — the B side
-    // of the ref must also survive multiple bounces.
+
+    logStep("last-page thumbnail mounts and renders after selecting page 40");
+    // Regression: the windowed sidebar picks its visible range from
+    // scrollTop / THUMB_SLOT_HEIGHT. If the slot height ever collapses
+    // (e.g. content-visibility replacing the button box), page 40's
+    // thumbnail never enters the window even after navigation. This test
+    // proves the slot geometry is fixed and the last-page button both
+    // mounts and renders its canvas.
     await panel.getByRole("button", { name: /Close find/i }).click();
+    // Reset back to page 1 first — the earlier find left us on page 40, so
+    // the Last-page button would be disabled and the navigation wouldn't
+    // exercise the sidebar re-window.
+    await panel.locator("[data-pdf-first]").click();
+    await page.waitForFunction(() => {
+      const label = document.querySelector(".artifact-pdf-page-indicator");
+      return label?.textContent?.startsWith("page 1 of");
+    });
+    await panel.locator("[data-pdf-last]").click();
+    await page.waitForFunction((total) => {
+      const label = document.querySelector(".artifact-pdf-page-indicator");
+      return label?.textContent?.includes(`page ${total} of`);
+    }, LARGE_FIRST_PDF_PAGES);
+    const lastThumb = panel.locator(
+      `.artifact-pdf-thumbnail[data-pdf-thumb-page="${LARGE_FIRST_PDF_PAGES}"]`,
+    );
+    await lastThumb.waitFor({ state: "visible", timeout: 5000 });
+    await page.waitForFunction((total) => {
+      const button = document.querySelector(
+        `.artifact-pdf-thumbnail[data-pdf-thumb-page="${total}"]`,
+      );
+      const canvas = button?.querySelector(".artifact-pdf-thumbnail-canvas");
+      return canvas instanceof HTMLCanvasElement && canvas.width > 0;
+    }, LARGE_FIRST_PDF_PAGES);
+    // Now switch back to B one more time and re-run its find — the B side
+    // of the ref must also survive multiple bounces. Find is already closed
+    // from the last-page test above.
     await secondaryBlock.getByRole("button", { name: /Open in panel/ }).click();
     await page.waitForFunction(
       (needle) => document.querySelector(".artifact-pdf-page-textlayer")?.textContent?.includes(needle) ?? false,

@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { FIND_MATCH_LIMIT, findMatches, type PageTextIndex } from "../src/pdfjs-runtime.ts";
+import {
+  FIND_MATCH_LIMIT,
+  extractPageText,
+  findMatches,
+  type PageTextIndex,
+  type StreamablePage,
+} from "../src/pdfjs-runtime.ts";
 
 const INDEX: PageTextIndex[] = [
   { page: 1, text: "silky pdf artifact preview" },
@@ -52,7 +58,57 @@ test("findMatches truncates and reports when a query exceeds the match limit", (
   assert.equal(matches.length, 100);
 });
 
+test("findMatches does not report truncation when hit count equals the cap exactly", () => {
+  // Exactly `limit` matches must return truncated=false so the UI badge
+  // reads "100/100" instead of a misleading "100/100+".
+  const spam = "a".repeat(100);
+  const { matches, truncated } = findMatches([{ page: 1, text: spam }], "a", 100);
+  assert.equal(matches.length, 100);
+  assert.equal(truncated, false);
+});
+
 test("FIND_MATCH_LIMIT is a small enough ceiling to stay in memory", () => {
   // Guardrail so a future bump doesn't quietly land at, say, 10M matches.
   assert.ok(FIND_MATCH_LIMIT <= 10_000, `FIND_MATCH_LIMIT is ${FIND_MATCH_LIMIT}`);
+});
+
+test("extractPageText stops pulling and cancels once the char budget is hit", async () => {
+  // Peak memory bound: even when the underlying page would emit far more
+  // text, the extractor MUST cancel the reader so pdf.js doesn't buffer
+  // additional chunks in the worker or main thread heap.
+  let pulled = 0;
+  let cancelled = false;
+  const stream = new ReadableStream<{ items: Array<{ str: string }> }>({
+    pull(controller) {
+      pulled += 1;
+      if (pulled > 40) {
+        controller.close();
+        return;
+      }
+      controller.enqueue({ items: [{ str: "x".repeat(1000) }] });
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+  const page: StreamablePage = { streamTextContent: () => stream };
+  const text = await extractPageText(page, { charLimit: 500 });
+  assert.equal(text.length, 500, "text is capped to the char budget");
+  assert.equal(cancelled, true, "reader.cancel() was invoked once the cap was hit");
+  // Allow one pre-fetched pull past what we consumed (browser buffering);
+  // if this jumps into the tens we've regressed to buffer-everything.
+  assert.ok(pulled <= 3, `expected ≤3 pulls before cancel, got ${pulled}`);
+});
+
+test("extractPageText concatenates all items when the page fits under the budget", async () => {
+  const stream = new ReadableStream<{ items: Array<{ str: string }> }>({
+    start(controller) {
+      controller.enqueue({ items: [{ str: "hello" }, { str: "world" }] });
+      controller.enqueue({ items: [{ str: "again" }] });
+      controller.close();
+    },
+  });
+  const page: StreamablePage = { streamTextContent: () => stream };
+  const text = await extractPageText(page, { charLimit: 500 });
+  assert.equal(text, "hello world again");
 });

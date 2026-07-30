@@ -127,22 +127,64 @@ export type PageTextIndex = {
 // expand sharply so we cannot trust page count alone.
 export const PAGE_TEXT_CHAR_LIMIT = 200_000;
 
-export async function extractPageText(page: PDFPageProxy): Promise<string> {
-  const content = await page.getTextContent();
-  let total = 0;
+// A minimal shape that lets us feed real pdf.js pages OR unit-test fakes
+// into extractPageText: all we need is a streamTextContent() → ReadableStream
+// whose chunks contain an `items` array.
+export type StreamablePage = {
+  streamTextContent: (params?: unknown) => ReadableStream<{
+    items?: Array<{ str?: string }>;
+  }>;
+};
+
+export async function extractPageText(
+  page: StreamablePage | PDFPageProxy,
+  options: { charLimit?: number } = {},
+): Promise<string> {
+  const charLimit = options.charLimit ?? PAGE_TEXT_CHAR_LIMIT;
+  // streamTextContent() emits chunks incrementally — we read only what fits
+  // in the budget and cancel the reader as soon as the cap is hit. This
+  // keeps peak memory bounded regardless of the underlying page's text
+  // size: a hostile page cannot force us to buffer megabytes just so we
+  // can then truncate the result.
+  const stream = (page as StreamablePage).streamTextContent();
+  const reader = stream.getReader();
   const parts: string[] = [];
-  for (const item of content.items) {
-    const raw = (item as { str?: string }).str;
-    if (typeof raw !== "string") continue;
-    const remaining = PAGE_TEXT_CHAR_LIMIT - total;
-    if (remaining <= 0) break;
-    if (raw.length + 1 > remaining) {
-      parts.push(raw.slice(0, remaining));
-      total = PAGE_TEXT_CHAR_LIMIT;
-      break;
+  let total = 0;
+  let cancelled = false;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const items = (value as { items?: Array<{ str?: string }> })?.items;
+      if (items) {
+        for (const item of items) {
+          const raw = item?.str;
+          if (typeof raw !== "string") continue;
+          const remaining = charLimit - total;
+          if (remaining <= 0) break;
+          if (raw.length + 1 > remaining) {
+            parts.push(raw.slice(0, remaining));
+            total = charLimit;
+            break;
+          }
+          parts.push(raw);
+          total += raw.length + 1; // account for the join(" ") separator
+        }
+      }
+      if (total >= charLimit) {
+        cancelled = true;
+        await reader.cancel();
+        break;
+      }
     }
-    parts.push(raw);
-    total += raw.length + 1; // account for the join(" ") separator
+  } finally {
+    if (!cancelled) {
+      try {
+        reader.releaseLock();
+      } catch {
+        // Lock is already released once the reader has finished or cancelled.
+      }
+    }
   }
   return parts.join(" ");
 }
@@ -178,10 +220,14 @@ export function findMatches(
     while (cursor <= haystack.length) {
       const at = haystack.indexOf(lower, cursor);
       if (at < 0) break;
-      matches.push({ page: entry.page, matchIndex: count });
+      // Detect truncation by probing for one match beyond the cap before
+      // pushing. Exactly `limit` matches must NOT be reported truncated
+      // (that would surface a spurious "+" in the UI); only a genuine
+      // (limit + 1)th match returns truncated=true.
       if (matches.length >= limit) {
         return { matches, truncated: true };
       }
+      matches.push({ page: entry.page, matchIndex: count });
       cursor = at + lower.length;
       count += 1;
     }

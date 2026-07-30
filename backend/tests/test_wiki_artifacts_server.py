@@ -556,10 +556,12 @@ class WikiArtifactsTests(unittest.TestCase):
             os.close(fd)
 
     def test_pdf_path_refuses_intermediate_directory_symlink(self) -> None:
-        # Prime a legitimate path under the runtime root, then swap an
-        # intermediate directory for a symlink pointing outside the root.
-        # The dir_fd + O_NOFOLLOW walker must fail; plain O_NOFOLLOW on
-        # the leaf would happily follow the intermediate hop.
+        # Race-real TOCTOU: prime a legitimate path, then swap an
+        # intermediate directory for a symlink pointing outside the root
+        # AFTER validation (resolve + allow-root check) has already
+        # accepted the path but BEFORE the walker opens it. The walker's
+        # dir_fd + O_NOFOLLOW per-component open MUST refuse; a single
+        # O_NOFOLLOW on the leaf would happily follow the intermediate hop.
         pdf_bytes = b"%PDF-1.4\nallowed\n"
         outside_bytes = b"%PDF-1.4\nSECRET-OUTSIDE\n"
         runtime = self.root / "runtime"
@@ -571,17 +573,34 @@ class WikiArtifactsTests(unittest.TestCase):
         # Sanity: happy path still reads through the walker.
         self.assertEqual(wiki_artifacts._read_pdf_path(str(legit_file)), pdf_bytes)
 
-        # Now build the swap target OUTSIDE the runtime root and replace
-        # the intermediate directory with a symlink to it.
         outside_root = self.root.parent / "outside-tree-intermediate"
         outside_root.mkdir(exist_ok=True)
         outside_file = outside_root / "doc.pdf"
         outside_file.write_bytes(outside_bytes)
-        try:
+
+        # Intercept _open_root_fd so the swap happens AFTER validation but
+        # BEFORE the walker opens any component under the root. This is the
+        # real race window the walker must close — without patching a
+        # barrier here the swap would land before resolve() and be caught
+        # by symlink-check on the parent, never exercising the walker.
+        real_open_root = wiki_artifacts._open_root_fd
+
+        def swap_then_open_root(root):
             os.rename(legit_parent, runtime / "reports.tmp")
-            os.symlink(outside_root, legit_parent)
-            with self.assertRaises(wiki_artifacts.ArtifactValidationError):
-                wiki_artifacts._read_pdf_path(str(legit_file))
+            try:
+                os.symlink(outside_root, legit_parent)
+            except OSError:
+                # If symlink creation fails, undo the rename and skip.
+                os.rename(runtime / "reports.tmp", legit_parent)
+                raise
+            return real_open_root(root)
+
+        try:
+            with mock.patch.object(
+                wiki_artifacts, "_open_root_fd", side_effect=swap_then_open_root
+            ):
+                with self.assertRaises(wiki_artifacts.ArtifactValidationError):
+                    wiki_artifacts._read_pdf_path(str(legit_file))
         finally:
             try:
                 legit_parent.unlink()
