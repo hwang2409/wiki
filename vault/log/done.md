@@ -9,6 +9,7 @@ updated: 2026-07-30
 
 ## 2026-07-30
 
+- **wiki-app** — WIKI-188 first-class PDF artifact merged — PR #141, 5 review rounds; PDF.js renderer w/ per-component dir_fd+O_NOFOLLOW path walk, bounded streaming text extraction on search AND render paths, windowed thumbnails, race-real TOCTOU test (https://github.com/hwang2409/wiki/pull/141)
 - **wiki-app** — WIKI-215 folded into PR #138 (Claude provider stream events batch, merged)
 - **wiki-app** — WIKI-214 folded into PR #138 (Claude provider stream events batch, merged)
 - **wiki-app** — WIKI-213 folded into PR #138 (Claude provider stream events batch, merged)
