@@ -1156,6 +1156,31 @@ export function getFleetGraph(limit = 10) {
   return request<FleetGraphData>(`/api/fleet/graph?limit=${limit}`);
 }
 
+export type ScreencastFrameKind = "assistant" | "user" | "tool" | "marker";
+
+export type ScreencastFrame = {
+  kind: ScreencastFrameKind;
+  text: string;
+  ts: string | null;
+};
+
+export type ScreencastWorker = {
+  ticket: string;
+  run_id: string | null;
+  frames: ScreencastFrame[];
+};
+
+export type FleetScreencastData = {
+  workers: ScreencastWorker[];
+  updated_at_ns: number;
+};
+
+export function getFleetScreencast(tickets: string[], signal?: AbortSignal) {
+  const params = new URLSearchParams();
+  for (const ticket of tickets) params.append("ticket", ticket);
+  return request<FleetScreencastData>(`/api/fleet/screencast?${params}`, { signal });
+}
+
 export type WorkgraphRevision = {
   revision: number;
   created_at_ns: number;

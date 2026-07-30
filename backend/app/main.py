@@ -38,6 +38,7 @@ from . import (
     palette,
     provider_health,
     replay,
+    screencast,
     terminal,
     tokens,
     transcripts,
@@ -512,7 +513,7 @@ def resolve_vault_asset_path(raw_path: str) -> tuple[Path, str, str]:
     return target, path.as_posix(), media_type
 
 
-from .pathwalk import open_relative_directory, open_relative_file  # noqa: E402
+from .pathwalk import open_relative_directory, open_relative_file, open_root_directory  # noqa: E402
 
 
 def iter_repo_files(file_root: Path, root_fd: int | None = None) -> tuple[list[Path], bool]:
@@ -2611,6 +2612,139 @@ def fleet_graph(limit: int = Query(default=10, ge=0, le=50)) -> dict[str, object
     """Return one bounded, normalized DAG view across the worker fleet."""
 
     return _fleet_graph_payload(limit)
+
+
+MAX_SCREENCAST_TICKETS = 32
+
+
+def _screencast_etag(workers: list[dict[str, object]]) -> str:
+    """Stable ETag over (ticket, run_id, frame texts) — no timestamp churn.
+
+    Excluding ``updated_at_ns`` from the hash is the point: if the tail
+    of every worker's raw.jsonl is unchanged since the last poll, the
+    ETag must match so we can return 304 and skip the JSON body. Frames
+    are already sanitized / clipped, so hashing their dicts is
+    deterministic. Digest is truncated to 16 hex chars — plenty for
+    cache-key uniqueness across the worker fleet.
+    """
+
+    import hashlib
+
+    hasher = hashlib.blake2b(digest_size=8)
+    for worker in workers:
+        hasher.update(str(worker.get("ticket") or "").encode("utf-8"))
+        hasher.update(b"\x00")
+        hasher.update(str(worker.get("run_id") or "").encode("utf-8"))
+        hasher.update(b"\x00")
+        for frame in worker.get("frames") or []:
+            if not isinstance(frame, dict):
+                continue
+            hasher.update(str(frame.get("kind") or "").encode("utf-8"))
+            hasher.update(b"\x1e")
+            hasher.update(str(frame.get("text") or "").encode("utf-8"))
+            hasher.update(b"\x1f")
+        hasher.update(b"\n")
+    return f'W/"{hasher.hexdigest()}"'
+
+
+def _run_id_for_ticket(registry: dict, ticket: str) -> str | None:
+    """Resolve the run id currently registered for ``ticket``.
+
+    Screencasts are always live-only: they read the currently-running
+    worker's raw.jsonl. Archived runs are intentionally excluded — the strip
+    is a "what is happening now" pane, not a history browser.
+    """
+
+    if not TICKET_PATTERN.fullmatch(ticket):
+        return None
+    entry = registry.get(ticket)
+    if not isinstance(entry, dict):
+        return None
+    current = entry.get("current")
+    if not isinstance(current, dict):
+        return None
+    run_id = current.get("run_id")
+    if not isinstance(run_id, str) or not RUN_ID_PATTERN.fullmatch(run_id):
+        return None
+    return run_id
+
+
+def _screencast_payload(tickets: list[str]) -> dict[str, object]:
+    """Batched tail read → per-ticket frame lists in one call.
+
+    The fleet view must not poll per worker; it sends the set of visible
+    tickets and gets one bounded, ETag-friendly response. Unknown or
+    archived tickets return an empty frames list — the caller keeps its
+    existing empty-state UI.
+    """
+
+    registry = _read_agent_registry()
+    runs_root = SUPERVISOR_CLIENT.paths.runs_dir
+    workers: list[dict[str, object]] = []
+    seen: set[str] = set()
+    root_fd: int | None = None
+    try:
+        root_fd = open_root_directory(runs_root)
+    except OSError:
+        root_fd = None
+    try:
+        for ticket in tickets:
+            if ticket in seen or len(workers) >= MAX_SCREENCAST_TICKETS:
+                continue
+            seen.add(ticket)
+            run_id = _run_id_for_ticket(registry, ticket)
+            frames: list[screencast.ScreencastFrame] = []
+            if run_id is not None and root_fd is not None:
+                try:
+                    frames = screencast.tail_frames(root_fd, run_id)
+                except OSError:
+                    frames = []
+            workers.append(
+                {
+                    "ticket": ticket,
+                    "run_id": run_id,
+                    "frames": [screencast.frame_to_dict(frame) for frame in frames],
+                }
+            )
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
+    return {"workers": workers, "updated_at_ns": time.time_ns()}
+
+
+@app.get("/api/fleet/screencast", response_model=None)
+@app.get("/fleet/screencast", include_in_schema=False, response_model=None)
+def fleet_screencast(
+    request: Request,
+    response: Response,
+    ticket: list[str] = Query(default_factory=list),
+) -> Response | dict[str, object]:
+    """Return short tail-of-raw.jsonl frames for the requested worker tickets.
+
+    Single call for all visible workers on the fleet view. Each worker's
+    frame list is a bounded read of the last window of its raw.jsonl —
+    never a full-file scan — parsed into short lines suitable for the
+    monospace strip.
+
+    Supports conditional GET: the ETag is derived from the stable
+    (ticket, run_id, frame text) tuples only — never from wall-clock
+    timestamps — so an unchanged fleet returns 304 with no body. The
+    ~2 s poll only pays the JSON cost when a worker actually made
+    progress.
+    """
+
+    payload = _screencast_payload(ticket)
+    etag = _screencast_etag(payload["workers"])  # type: ignore[arg-type]
+    inm = request.headers.get("if-none-match")
+    if inm and etag in {value.strip() for value in inm.split(",")}:
+        headers = {
+            "ETag": etag,
+            "Cache-Control": "no-cache, max-age=1",
+        }
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
+    response.headers["ETag"] = etag
+    response.headers["Cache-Control"] = "no-cache, max-age=1"
+    return payload
 
 
 @app.get("/api/agents/{ticket}/workgraph")

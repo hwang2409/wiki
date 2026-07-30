@@ -11,7 +11,64 @@ responsible for opening the root directory once and passing its fd in.
 """
 from __future__ import annotations
 
+import errno
 import os
+import stat
+from pathlib import Path
+
+
+def _validate_component(name: str) -> None:
+    """Reject path components that would escape the anchor.
+
+    ``os.open("..", dir_fd=<root_fd>)`` opens the parent of the anchor
+    despite O_NOFOLLOW — the "no follow" only applies when the *named*
+    entry is itself a symlink. ``..`` is a real directory entry, not a
+    link, so the walk needs an explicit refusal. Same for ``.`` (no-op,
+    but a caller passing it is almost certainly confused about the API)
+    and any embedded separator or NUL byte that would collapse two
+    component slots into one traversal.
+
+    Kept in this shared helper so ``open_relative_file`` and
+    ``open_relative_directory`` share one policy — callers that want to
+    accept ``..`` (nobody yet) would opt in explicitly.
+    """
+
+    if not isinstance(name, str) or not name or name in {".", ".."}:
+        raise OSError(errno.EINVAL, f"unsafe path component: {name!r}")
+    if "/" in name or "\x00" in name or "\\" in name:
+        raise OSError(errno.EINVAL, f"unsafe path component: {name!r}")
+
+
+def open_root_directory(path: Path | str) -> int:
+    """Open an anchor directory with O_NOFOLLOW so a symlinked root fails.
+
+    ``open_relative_file``/``open_relative_directory`` apply O_NOFOLLOW to
+    every component under the anchor, but the anchor itself is trusted.
+    That is not always safe: a symlink swapped in for ``runs_dir`` would
+    silently redirect every subsequent open. Callers of that pattern
+    should open the anchor through this helper.
+
+    It canonicalizes the PARENT chain only (so macOS ``/tmp`` and other
+    benign parent symlinks still work) and keeps the leaf unresolved,
+    then opens it with O_NOFOLLOW | O_DIRECTORY. If the anchor itself
+    is a symlink, ``os.open`` raises with ELOOP; if it is not a
+    directory, this helper raises ``OSError`` after inspecting the
+    ``fstat`` mode. Callers handle either failure.
+    """
+
+    absolute = Path(path).absolute()
+    resolved = absolute.parent.resolve(strict=False) / absolute.name
+    fd = os.open(
+        resolved,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(f"root is not a directory: {resolved}")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
 def open_relative_file(
@@ -30,6 +87,8 @@ def open_relative_file(
     """
     no_follow = getattr(os, "O_NOFOLLOW", 0)
     directory_flag = getattr(os, "O_DIRECTORY", 0)
+    for component in relative_parts:
+        _validate_component(component)
     current_fd = os.dup(root_fd)
     try:
         for index, component in enumerate(relative_parts):
@@ -52,6 +111,8 @@ def open_relative_directory(root_fd: int, relative_parts: tuple[str, ...]) -> in
     """Open a directory nested under ``root_fd`` with O_NOFOLLOW per component."""
     no_follow = getattr(os, "O_NOFOLLOW", 0)
     directory_flag = getattr(os, "O_DIRECTORY", 0)
+    for component in relative_parts:
+        _validate_component(component)
     current_fd = os.dup(root_fd)
     try:
         for component in relative_parts:
