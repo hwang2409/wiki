@@ -222,6 +222,9 @@ class UnknownKindTelemetryTests(unittest.TestCase):
         (archive_raw.parent / "run.json").write_text(
             json.dumps({"run_id": "run-1"}), encoding="utf-8"
         )
+        (archive_raw.parent / telemetry_module.ARCHIVE_COMPLETION_MARKER).write_text(
+            json.dumps({"run_id": "run-1"}), encoding="utf-8"
+        )
         shutil.rmtree(self.raw.parent)
 
         result = service.run_once()
@@ -230,6 +233,67 @@ class UnknownKindTelemetryTests(unittest.TestCase):
         self.assertEqual(result["unknown_counts"], {"item/novel": 101})
         self.assertEqual(result["filed_kinds"], ["item/novel"])
         self.assertEqual(later["scanned_runs"], 0)
+
+    def test_partial_archive_is_ignored_until_completion_marker(self) -> None:
+        archive_dir = self.paths.archive_dir / "WIKI-1" / "session"
+        archive_dir.mkdir(parents=True)
+        archive_raw = archive_dir / "raw.jsonl"
+        with archive_raw.open("w", encoding="utf-8") as handle:
+            self._write_events(handle, 170)
+        (archive_dir / "run.json").write_text(
+            json.dumps({"run_id": "archived-1"}), encoding="utf-8"
+        )
+        service = self._service()
+
+        during_copy = service.run_once()
+        state = json.loads(service.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(during_copy["scanned_events"], 0)
+        self.assertNotIn("archived-1", state["completed_runs"])
+
+        with archive_raw.open("a", encoding="utf-8") as handle:
+            self._write_events(handle, 31)
+        (archive_dir / telemetry_module.ARCHIVE_COMPLETION_MARKER).write_text(
+            json.dumps({"run_id": "archived-1"}), encoding="utf-8"
+        )
+
+        published = service.run_once()
+
+        self.assertEqual(published["unknown_counts"], {"item/novel": 201})
+        self.assertEqual(published["filed_kinds"], ["item/novel"])
+        self.assertIn(
+            "archived-1", json.loads(service.state_path.read_text())["completed_runs"]
+        )
+
+    def test_archive_landing_after_enumeration_keeps_live_cursor(self) -> None:
+        self._append(60)
+        service = self._service()
+        original_scan = service._scan_run
+
+        def scan_then_archive(state, source, **kwargs):
+            scanned = original_scan(state, source, **kwargs)
+            if source.key == "run-1" and not source.terminal:
+                archive_raw = (
+                    self.paths.archive_dir / "WIKI-1" / "session" / "raw.jsonl"
+                )
+                archive_raw.parent.mkdir(parents=True)
+                shutil.copy2(self.raw, archive_raw)
+                (archive_raw.parent / "run.json").write_text(
+                    json.dumps({"run_id": "run-1"}), encoding="utf-8"
+                )
+                (
+                    archive_raw.parent / telemetry_module.ARCHIVE_COMPLETION_MARKER
+                ).write_text(json.dumps({"run_id": "run-1"}), encoding="utf-8")
+                shutil.rmtree(self.raw.parent)
+            return scanned
+
+        with mock.patch.object(service, "_scan_run", side_effect=scan_then_archive):
+            first = service.run_once()
+        second = service.run_once()
+
+        self.assertEqual(first["unknown_counts"], {"item/novel": 60})
+        self.assertEqual(second["unknown_counts"], {"item/novel": 60})
+        self.assertEqual(first["filed_kinds"], [])
+        self.assertEqual(second["filed_kinds"], [])
 
     def test_live_cursor_cap_does_not_evict_active_runs(self) -> None:
         self._append(1)

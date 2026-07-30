@@ -30,6 +30,7 @@ MAX_EVENT_LINE_BYTES = 1024 * 1024
 CHECKPOINT_EVENT_COUNT = 256
 MAX_CURSOR_ENTRIES = 4096
 STATE_VERSION = 2
+ARCHIVE_COMPLETION_MARKER = "archive-complete.json"
 
 
 @dataclass(frozen=True)
@@ -224,6 +225,7 @@ class UnknownKindTelemetry:
         cursor["source_type"] = source_type
         cursor["path"] = str(path)
         cursor["last_seen_at"] = timestamp
+        cursor["missing_sweeps"] = 0
         return cursor
 
     def _prune_cursors(self, state: dict[str, Any]) -> None:
@@ -232,6 +234,11 @@ class UnknownKindTelemetry:
             cursor = cursors[run_name]
             cursor_path = cursor.get("path") if isinstance(cursor, dict) else None
             if not isinstance(cursor_path, str) or not Path(cursor_path).is_file():
+                if isinstance(cursor, dict):
+                    missing_sweeps = int(cursor.get("missing_sweeps", 0))
+                    if missing_sweeps < 1:
+                        cursor["missing_sweeps"] = missing_sweeps + 1
+                        continue
                 cursors.pop(run_name, None)
         # A cursor is never evicted while its file can be scanned again.
         # Completed archive cursors are safe to remove because their source is
@@ -260,6 +267,8 @@ class UnknownKindTelemetry:
         if not archive_dir.is_dir():
             return
         for raw_path in archive_dir.rglob("raw.jsonl"):
+            if not (raw_path.parent / ARCHIVE_COMPLETION_MARKER).is_file():
+                continue
             run_name = None
             metadata_path = raw_path.parent / "run.json"
             try:

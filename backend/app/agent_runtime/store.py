@@ -1059,6 +1059,14 @@ class RunStore:
                     symlinks=True,
                 )
 
+            # Publish the archive only after every file is complete. Telemetry
+            # scans sessions with this marker and never observes a copy in
+            # progress.
+            _atomic_write_json(
+                session_dir / "archive-complete.json",
+                {"run_id": run_id, "completed_at": ended_at},
+            )
+
             shutil.rmtree(self.run_dir(run_id))
             registry.pop(record.agent_id, None)
             self._write_registry(registry)
