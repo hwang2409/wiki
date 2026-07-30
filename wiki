@@ -3,7 +3,7 @@
 
 Hot-path writes with validation, so conventions hold mechanically:
 
-  wiki todo add "text" [--priority P1] [--section Todo]
+  wiki todo add "text" [--priority P1] [--section Todo] [--if-missing]
   wiki todo move "substring" --to "In Progress"
   wiki todo complete "substring" [--done-line "terse completion"]
   wiki agent spawn <ticket> --kind cdx --role implement --model gpt-5.4 --effort high --prompt-file prompt.md --workdir /path
@@ -183,6 +183,9 @@ def cmd_todo_add(args: argparse.Namespace) -> None:
             fail("--priority must look like P0/P1/P2")
         text = f"[{priority}] {text}"
     lines = read_lines(TODO)
+    if getattr(args, "if_missing", False) and f"- {text}" in lines:
+        print(f"already in {args.section}: - {text}")
+        return
     lines = insert_todo_line(lines, args.section, text)
     bump_updated(lines)
     write_lines(TODO, lines)
@@ -1705,6 +1708,11 @@ def main() -> None:
     add.add_argument("text")
     add.add_argument("--priority", help="P0/P1/P2 — prepended as [Pn]")
     add.add_argument("--section", default="Todo", help='default "Todo"')
+    add.add_argument(
+        "--if-missing",
+        action="store_true",
+        help="succeed without adding a duplicate exact todo item",
+    )
     add.set_defaults(func=cmd_todo_add, refresh_knowledge=True)
 
     move = todo_sub.add_parser("move", help="move an item between sections")
