@@ -10,6 +10,7 @@ export type ArtifactRendererProps = {
   artifact: SessionArtifact;
   compact?: boolean;
   event: SessionEvent;
+  onExpand?: () => void;
   onImageLoad?: (image: HTMLImageElement) => void;
   onOpenFile?: (entry: ArtifactFileEntry) => void;
   onRenderError?: (failure: ArtifactRenderFailure) => void;

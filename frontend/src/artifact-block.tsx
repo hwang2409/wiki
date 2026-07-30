@@ -9,6 +9,7 @@ import {
   GitBranch,
   Image as ImageIcon,
   Info,
+  Maximize2,
   Music,
   PanelRightOpen,
   Shapes,
@@ -24,6 +25,7 @@ import type {
   SessionEvent,
 } from "./api";
 import { classifyArtifact } from "./artifact-kind";
+import { downloadArtifact, imageBase64, textPayload } from "./artifact-payload";
 import { ArtifactError } from "./artifact-state";
 import {
   ArtifactRenderer,
@@ -31,7 +33,6 @@ import {
   TableCopyMenu,
   artifactUrl,
   svgBounds,
-  tableText,
   type ArtifactRenderFailure,
 } from "./artifact-renderers";
 import {
@@ -41,7 +42,7 @@ import {
 } from "./transcript-store";
 
 
-const KIND_ICONS: Record<ArtifactKind, LucideIcon> = {
+export const KIND_ICONS: Record<ArtifactKind, LucideIcon> = {
   mermaid: GitBranch,
   svg: Shapes,
   image: ImageIcon,
@@ -55,76 +56,6 @@ const KIND_ICONS: Record<ArtifactKind, LucideIcon> = {
   video: Video,
   audio: Music,
 };
-
-
-function textPayload(artifact: SessionArtifact): string {
-  switch (artifact.kind) {
-    case "mermaid":
-    case "svg":
-    case "code":
-    case "diff":
-      return artifact.source ?? "";
-    case "table":
-      return tableText(artifact, "tsv");
-    case "plot":
-      return JSON.stringify(artifact.spec_vega_lite ?? {}, null, 2);
-    case "image":
-      return artifact.data_base64 ?? artifact.ref ?? "";
-    case "file-list":
-      return (artifact.files ?? []).map((entry) => entry.path).join("\n");
-    case "json":
-      return typeof artifact.json_data === "string"
-        ? artifact.json_data
-        : JSON.stringify(artifact.json_data ?? {}, null, 2);
-    case "pdf":
-    case "video":
-    case "audio":
-      return artifact.ref ?? "";
-  }
-}
-
-async function imageBase64(url: string): Promise<string> {
-  const response = await fetch(url);
-  if (!response.ok) throw new Error(`Image download failed (${response.status})`);
-  const bytes = new Uint8Array(await response.arrayBuffer());
-  let binary = "";
-  const chunkSize = 0x8000;
-  for (let index = 0; index < bytes.length; index += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
-  }
-  return btoa(binary);
-}
-
-function downloadName(event: SessionEvent): string {
-  const artifact = event.artifact!;
-  const effectiveKind = classifyArtifact(artifact);
-  const base = (event.title || `artifact-${event.artifact_id?.slice(0, 8) || effectiveKind}`)
-    .replace(/[^a-zA-Z0-9._-]+/g, "-")
-    .replace(/^-+|-+$/g, "") || "artifact";
-  if (effectiveKind === "code" && artifact.filename) {
-    return artifact.filename.split(/[\\/]/).pop() || `${base}.txt`;
-  }
-  const videoExtension = artifact.mime === "image/gif" ? "gif" : "mp4";
-  const audioExtension = artifact.mime === "audio/mpeg" ? "mp3" : "wav";
-  const extension = {
-    mermaid: "mmd",
-    svg: "svg",
-    image: artifact.mime === "image/jpeg" ? "jpg" : artifact.mime?.split("/")[1] || "png",
-    table: "csv",
-    plot: "json",
-    code: artifact.language?.replace(/[^a-zA-Z0-9]/g, "") || "txt",
-    diff: "diff",
-    "file-list": "txt",
-    json: "json",
-    pdf: "pdf",
-    video: videoExtension,
-    audio: audioExtension,
-  }[effectiveKind];
-  return `${base}.${extension}`;
-}
-
-
-
 
 
 function mermaidNodeCount(source: string): number {
@@ -196,11 +127,13 @@ function useInlineExpanded(sessionKey: string, artifactId: string | undefined): 
 
 export function ArtifactBlock({
   event,
+  onInspect,
   onOpen,
   sessionKey,
   ticket,
 }: {
   event: SessionEvent;
+  onInspect?: (event: SessionEvent) => void;
   onOpen?: (event: SessionEvent) => void;
   sessionKey?: string;
   ticket: string;
@@ -298,40 +231,7 @@ export function ArtifactBlock({
   }
 
   async function download() {
-    const binaryKinds = new Set(["pdf", "video", "audio"]);
-    let blob: Blob;
-    if (binaryKinds.has(resolvedArtifact.kind)) {
-      if (resolvedArtifact.data_base64) {
-        const response = await fetch(
-          `data:${resolvedArtifact.mime};base64,${resolvedArtifact.data_base64}`,
-        );
-        blob = await response.blob();
-      } else {
-        const response = await fetch(artifactUrl(ticket, event));
-        if (!response.ok) {
-          throw new Error(
-            `${resolvedArtifact.kind} download failed (${response.status})`,
-          );
-        }
-        blob = await response.blob();
-      }
-    } else if (resolvedArtifact.kind === "image" && !resolvedArtifact.data_base64) {
-      const response = await fetch(artifactUrl(ticket, event));
-      if (!response.ok) throw new Error(`Image download failed (${response.status})`);
-      blob = await response.blob();
-    } else if (resolvedArtifact.kind === "image" && resolvedArtifact.data_base64) {
-      const response = await fetch(`data:${resolvedArtifact.mime};base64,${resolvedArtifact.data_base64}`);
-      blob = await response.blob();
-    } else {
-      const text = resolvedArtifact.kind === "table" ? tableText(resolvedArtifact, "csv") : textPayload(resolvedArtifact);
-      blob = new Blob([text], { type: resolvedArtifact.kind === "svg" ? "image/svg+xml" : "text/plain;charset=utf-8" });
-    }
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = downloadName(event);
-    anchor.click();
-    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+    await downloadArtifact(ticket, event);
   }
 
   return (
@@ -343,6 +243,7 @@ export function ArtifactBlock({
         data-artifact-id={event.artifact_id}
         data-artifact-kind={resolvedArtifact.kind}
         data-artifact-render-status={renderFailure ? "failed" : undefined}
+        tabIndex={onInspect ? 0 : undefined}
       >
         <header className="artifact-header">
           <div className="artifact-heading">
@@ -388,6 +289,17 @@ export function ArtifactBlock({
               <Download aria-hidden="true" size={12} />
               <span className="artifact-action-label">Download</span>
             </button>
+            {onInspect ? (
+              <button
+                className="artifact-action artifact-action-fullscreen"
+                title="Fullscreen (⌘↩)"
+                type="button"
+                onClick={() => onInspect(event)}
+              >
+                <Maximize2 aria-hidden="true" size={12} />
+                <span className="artifact-action-label">Fullscreen</span>
+              </button>
+            ) : null}
             <button
               aria-expanded={inspect}
               className={`artifact-action${inspect ? " is-active" : ""}`}
@@ -410,6 +322,7 @@ export function ArtifactBlock({
               artifact={resolvedArtifact}
               event={event}
               ticket={ticket}
+              onExpand={onInspect ? () => onInspect(event) : undefined}
               onRenderError={reportRenderFailure}
               onImageLoad={(image) => setImageBounds({ width: image.naturalWidth, height: image.naturalHeight })}
             />

@@ -12,32 +12,14 @@ import { PdfArtifactDetail } from "./artifact-detail/pdf";
 import { PlotArtifactDetail } from "./artifact-detail/plot";
 import { SvgArtifactDetail } from "./artifact-detail/svg";
 import { TableArtifactDetail } from "./artifact-detail/table";
-import { classifyArtifact } from "./artifact-kind";
+import { classifyArtifact, humanizeArtifactKind } from "./artifact-kind";
 import { ArtifactFallback } from "./artifact-state";
 import type { ArtifactViewState, PanelState } from "./transcript-store";
-
-const KIND_LABELS: Record<string, string> = {
-  mermaid: "Diagram",
-  svg: "Image",
-  image: "Image",
-  table: "Table",
-  plot: "Plot",
-  code: "Code",
-  diff: "Diff",
-  "file-list": "File list",
-  json: "JSON",
-  pdf: "PDF",
-};
-
-function humanizeKind(kind: string | undefined): string {
-  if (!kind) return "Artifact";
-  return KIND_LABELS[kind] ?? kind.charAt(0).toUpperCase() + kind.slice(1);
-}
 
 function titleFor(event: SessionEvent | undefined, _id: string): string {
   return event?.title
     || event?.artifact?.filename
-    || humanizeKind(event?.artifact?.kind);
+    || humanizeArtifactKind(event?.artifact?.kind);
 }
 
 
