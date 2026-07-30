@@ -1249,7 +1249,11 @@ class RunStore:
         with self._lock:
             record = self.get(run_id)
             recovery_state = record.recovery_from_state or record.state
-            if recovery_state not in {LifecycleState.WORKING, LifecycleState.IDLE}:
+            if recovery_state not in {
+                LifecycleState.WORKING,
+                LifecycleState.WAITING_APPROVAL,
+                LifecycleState.IDLE,
+            }:
                 raise StoreConflict(
                     f"state {recovery_state.value} is not eligible for recovery polling"
                 )
@@ -1284,7 +1288,11 @@ class RunStore:
 
         with self._lock:
             record = self.get(run_id)
-            if recovery_state not in {LifecycleState.WORKING, LifecycleState.IDLE}:
+            if recovery_state not in {
+                LifecycleState.WORKING,
+                LifecycleState.WAITING_APPROVAL,
+                LifecycleState.IDLE,
+            }:
                 raise StoreConflict(
                     f"state {recovery_state.value} has no resumable recovery intent"
                 )
@@ -1473,6 +1481,14 @@ class RunStore:
             self._write_record(record)
             return record
 
+    def clear_pending_request_key(self, run_id: str, key: str) -> RunRecord:
+        """Clear one durable request by its canonical storage key."""
+        with self._lock:
+            record = self.get(run_id)
+            record.pending_requests.pop(key, None)
+            self._write_record(record)
+            return record
+
     def clear_pending_request_by_tool_use_id(
         self,
         run_id: str,
@@ -1501,6 +1517,21 @@ class RunStore:
             if not record.pending_requests:
                 return record
             record.pending_requests.clear()
+            self._write_record(record)
+            return record
+
+    def restore_pending_requests(
+        self,
+        run_id: str,
+        pending_requests: dict[str, dict[str, Any]],
+    ) -> RunRecord:
+        """Restore approval requests after a failed replacement transport."""
+
+        with self._lock:
+            record = self.get(run_id)
+            record.pending_requests = {
+                str(key): dict(request) for key, request in pending_requests.items()
+            }
             self._write_record(record)
             return record
 

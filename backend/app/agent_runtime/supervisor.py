@@ -44,7 +44,7 @@ DEFAULT_ADAPTER_DETACH_GRACE_SECONDS = 1.0
 DEFAULT_IDEMPOTENCY_CACHE_SIZE = 256
 DEFAULT_WORKER_SOFT_CAP = 5
 _IDEMPOTENT_METHODS = frozenset({"run/start", "run/send_now", "run/send_on_idle"})
-APPROVAL_RECOVERY_WAIT_SECONDS = 5.0
+DEFAULT_APPROVAL_RECOVERY_TIMEOUT_SECONDS = 30.0
 
 
 def _approval_recovery_prompt(record: RunRecord) -> str | None:
@@ -219,6 +219,7 @@ class Supervisor:
         *,
         pid_alive: Callable[[int | None], bool] = provider_pid_is_alive,
         recovery_stability_seconds: float = 30.0,
+        approval_recovery_timeout_seconds: float | None = None,
         reaper_interval_seconds: float | None = None,
         reaper_grace_seconds: float | None = None,
         adapter_detach_grace_seconds: float = DEFAULT_ADAPTER_DETACH_GRACE_SECONDS,
@@ -232,6 +233,17 @@ class Supervisor:
         self.adapter_factory = adapter_factory
         self.pid_alive = pid_alive
         self.recovery_stability_seconds = recovery_stability_seconds
+        self.approval_recovery_timeout_seconds = _validated_seconds(
+            "approval_recovery_timeout_seconds",
+            (
+                approval_recovery_timeout_seconds
+                if approval_recovery_timeout_seconds is not None
+                else _env_seconds(
+                    "WIKI_APPROVAL_RECOVERY_TIMEOUT_SECONDS",
+                    DEFAULT_APPROVAL_RECOVERY_TIMEOUT_SECONDS,
+                )
+            ),
+        )
         self.reaper_interval_seconds = _validated_seconds(
             "WIKI_REAPER_INTERVAL_SECONDS",
             (
@@ -1541,45 +1553,55 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             if recovery_state is LifecycleState.WAITING_APPROVAL
             else None
         )
-        if approval_prompt is not None:
-            record = self.store.clear_pending_requests(run_id)
+        old_pending_requests = deepcopy(record.pending_requests)
 
         adapter = self.adapter_factory(record)
         self._attach_adapter(record.run_id, adapter)
         try:
             status = await adapter.resume(session_id)
-        except asyncio.CancelledError:
-            await self._cleanup_cancelled_launch(record, adapter)
-            raise
-        except Exception:
-            await self._close_and_drain_adapter(record.run_id, adapter)
-            raise
-        record = self.store.update_adapter_status(
-            run_id,
-            status,
-            guard_automatic_resume=automatic,
-        )
-        if approval_prompt is not None:
-            status = await adapter.send_now(approval_prompt)
             record = self.store.update_adapter_status(
                 run_id,
                 status,
                 guard_automatic_resume=automatic,
             )
-            deadline = time.monotonic() + APPROVAL_RECOVERY_WAIT_SECONDS
-            while time.monotonic() < deadline:
-                current = self.store.get(run_id)
-                if (
-                    current.state is LifecycleState.WAITING_APPROVAL
-                    and current.pending_requests
-                ):
-                    record = current
-                    break
-                await asyncio.sleep(0.01)
-            else:
-                raise StoreConflict(
-                    "provider did not re-emit the pending approval after transport recovery"
+            if approval_prompt is not None:
+                status = await adapter.send_now(approval_prompt)
+                record = self.store.update_adapter_status(
+                    run_id,
+                    status,
+                    guard_automatic_resume=automatic,
                 )
+                deadline = time.monotonic() + self.approval_recovery_timeout_seconds
+                while time.monotonic() < deadline:
+                    current = self.store.get(run_id)
+                    if (
+                        current.state is LifecycleState.WAITING_APPROVAL
+                        and current.pending_requests
+                    ):
+                        record = current
+                        break
+                    await asyncio.sleep(0.01)
+                else:
+                    raise StoreConflict(
+                        "provider did not re-emit the pending approval after transport recovery"
+                    )
+                for key, pending in old_pending_requests.items():
+                    if (
+                        record.pending_requests.get(key) == pending
+                    ):
+                        record = self.store.clear_pending_request_key(run_id, key)
+        except asyncio.CancelledError:
+            if approval_prompt is not None:
+                await self._close_and_drain_adapter(record.run_id, adapter)
+                self.store.restore_pending_requests(run_id, old_pending_requests)
+            else:
+                await self._cleanup_cancelled_launch(record, adapter)
+            raise
+        except Exception:
+            await self._close_and_drain_adapter(record.run_id, adapter)
+            if approval_prompt is not None:
+                self.store.restore_pending_requests(run_id, old_pending_requests)
+            raise
         if quiesce_operation_id is not None:
             record = self.store.clear_quiesce_marker(
                 run_id,

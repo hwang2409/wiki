@@ -93,6 +93,10 @@ class ResumeFailureAdapter(CodexFixtureAdapter):
         raise RuntimeError("fixture resume failure")
 
 
+class ApprovalRecoveryStallAdapter(CodexFixtureAdapter):
+    """Accept the continuation but never emit a replacement approval."""
+
+
 def _paths(root: Path) -> RuntimePaths:
     return RuntimePaths(
         runtime_dir=root / "runtime",
@@ -956,6 +960,64 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 current = self.store.get(record.run_id)
                 self.assertFalse(current.pending_requests)
                 self.assertNotEqual(current.state, LifecycleState.WAITING_APPROVAL)
+
+    async def test_failed_approval_recovery_drains_and_preserves_request(self) -> None:
+        await self.supervisor.close()
+
+        def factory(_record: RunRecord) -> ApprovalRecoveryStallAdapter:
+            return ApprovalRecoveryStallAdapter(
+                FIXTURES / "codex_app_server_success.jsonl",
+                FIXTURES / "codex_app_server_control.jsonl",
+                pid=os.getpid(),
+            )
+
+        self.supervisor = Supervisor(
+            self.store,
+            factory,
+            pid_alive=lambda _pid: False,
+            approval_recovery_timeout_seconds=0.05,
+        )
+        record = RunRecord.new(
+            agent_id="WIKI-APPROVAL-RECOVERY-STALL",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-model",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="handover approval",
+        )
+        record.state = LifecycleState.WAITING_APPROVAL
+        record.provider_session_id = "thread-recovery-stall"
+        record.provider_pid = 999_001
+        record.provider_generation = 1
+        record.pending_requests["int:7"] = {
+            "request_id": 7,
+            "request_kind": "item/tool/requestUserInput",
+            "payload": {
+                "method": "item/tool/requestUserInput",
+                "id": 7,
+                "params": {"questions": [{"question": "Which surface?"}]},
+            },
+        }
+        original_pending = dict(record.pending_requests)
+        self.store.create(record)
+
+        recovery = await self.supervisor.recover_on_start()
+        result = next(item for item in recovery if item["run_id"] == record.run_id)
+        self.assertEqual(result["action"], "block")
+        current = self.store.get(record.run_id)
+        self.assertEqual(current.state, LifecycleState.BLOCKED)
+        self.assertEqual(current.recovery_from_state, LifecycleState.WAITING_APPROVAL)
+        self.assertTrue(current.automatic_resume_suppressed)
+        self.assertEqual(current.pending_requests, original_pending)
+        self.assertNotIn(record.run_id, self.supervisor.adapters)
+
+        self.store.clear_automatic_resume_suppression(record.run_id)
+        with self.assertRaises(StoreConflict):
+            await self.supervisor.resume_run(record.run_id)
+        current = self.store.get(record.run_id)
+        self.assertEqual(current.pending_requests, original_pending)
+        self.assertNotIn(record.run_id, self.supervisor.adapters)
 
     async def test_background_codex_turn_rejection_is_durably_blocked(self) -> None:
         await self.supervisor.close()
