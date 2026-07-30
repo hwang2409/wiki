@@ -9,6 +9,7 @@ updated: 2026-07-30
 
 ## 2026-07-30
 
+- **wiki-app** — WIKI-179 vault semantic search merged — PR #146, 4 review rounds; embedding index w/ strict privacy invariant (uploads only via explicit wiki index rebuild, verified zero provider calls from all search paths incl. background drain), incremental hash-keyed re-embedding, lexical fallback w/ indexing state (https://github.com/hwang2409/wiki/pull/146)
 - **wiki-app** — WIKI-178 cost dashboard merged — PR #145, 5 review rounds; per-worker/ticket/orch/day USD w/ verified provider rates incl. 5-min/1-hour cache-write tiers, cached snapshot endpoint, descriptor-pinned scans, truncation-safe cursors (https://github.com/hwang2409/wiki/pull/145)
 - **wiki-app** — WIKI-216 unknown-kind telemetry job merged — PR #142, 5 review rounds; weekly incremental sweep w/ atomic archive publication, crash-safe cursors, durable CLI retry+dedupe, auto-files vault todos for novel unknown kinds (https://github.com/hwang2409/wiki/pull/142)
 - **wiki-app** — WIKI-173 orch autopilot merged — PR #140, 8 review rounds; verdict parser w/ alias normalization + SHA-bound merge authority, canonical-graph persistence before action, per-repo merge policy, notifier test isolation w/ live-send trap, strict no-check gate w/ rollup validation (https://github.com/hwang2409/wiki/pull/140)
