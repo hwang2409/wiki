@@ -16,18 +16,17 @@ export function DisclosureContent({
 }) {
   const [closing, setClosing] = useState(false);
   const wasOpen = useRef(open);
-  useEffect(() => {
-    const was = wasOpen.current;
+  if (open !== wasOpen.current) {
     wasOpen.current = open;
-    if (open) {
-      setClosing(false);
-      return;
-    }
-    if (!was) return;
-    setClosing(true);
+    // Render-phase update: `closing` must be true in the very first closed
+    // render, or children unmount for one commit and lose their state.
+    setClosing(!open);
+  }
+  useEffect(() => {
+    if (!closing) return;
     const timer = window.setTimeout(() => setClosing(false), COLLAPSE_EXIT_MS);
     return () => window.clearTimeout(timer);
-  }, [open]);
+  }, [closing]);
   return (
     <div
       className={`disclosure-wrap${open ? " is-open" : ""}${className ? ` ${className}` : ""}`}

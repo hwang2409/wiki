@@ -1,9 +1,11 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
+import { useEffect } from "react";
 
 import { AgentsView } from "../src/agents";
 import type { AgentWorker } from "../src/api";
+import { DisclosureContent } from "../src/disclosure";
 
 vi.mock("../src/api", async () => {
   const actual = await vi.importActual<typeof import("../src/api")>("../src/api");
@@ -121,6 +123,87 @@ test("collapsing again unmounts the strip after the exit transition", async () =
   expect(
     JSON.parse(localStorage.getItem("wiki-expanded-screencasts") ?? "[]")
   ).not.toContain("WIKI-1");
+});
+
+test("disclosure children stay mounted through the whole exit transition", () => {
+  vi.useFakeTimers();
+  try {
+    const lifecycle: string[] = [];
+    function Probe() {
+      useEffect(() => {
+        lifecycle.push("mount");
+        return () => lifecycle.push("cleanup");
+      }, []);
+      return <div data-testid="probe" />;
+    }
+    const view = render(
+      <DisclosureContent open>
+        <Probe />
+      </DisclosureContent>
+    );
+    expect(lifecycle).toEqual(["mount"]);
+    view.rerender(
+      <DisclosureContent open={false}>
+        <Probe />
+      </DisclosureContent>
+    );
+    // No cleanup in the close commit itself...
+    expect(lifecycle).toEqual(["mount"]);
+    expect(view.getByTestId("probe")).toBeTruthy();
+    // ...nor while the 160ms grid transition runs...
+    act(() => {
+      vi.advanceTimersByTime(160);
+    });
+    expect(lifecycle).toEqual(["mount"]);
+    expect(view.getByTestId("probe")).toBeTruthy();
+    // ...only after the 200ms exit deadline.
+    act(() => {
+      vi.advanceTimersByTime(40);
+    });
+    expect(lifecycle).toEqual(["mount", "cleanup"]);
+    expect(view.queryByTestId("probe")).toBeNull();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("reopening during the exit keeps children mounted and cancels the unmount", () => {
+  vi.useFakeTimers();
+  try {
+    const lifecycle: string[] = [];
+    function Probe() {
+      useEffect(() => {
+        lifecycle.push("mount");
+        return () => lifecycle.push("cleanup");
+      }, []);
+      return <div data-testid="probe" />;
+    }
+    const view = render(
+      <DisclosureContent open>
+        <Probe />
+      </DisclosureContent>
+    );
+    view.rerender(
+      <DisclosureContent open={false}>
+        <Probe />
+      </DisclosureContent>
+    );
+    act(() => {
+      vi.advanceTimersByTime(100);
+    });
+    view.rerender(
+      <DisclosureContent open>
+        <Probe />
+      </DisclosureContent>
+    );
+    act(() => {
+      vi.advanceTimersByTime(500);
+    });
+    expect(lifecycle).toEqual(["mount"]);
+    expect(view.getByTestId("probe")).toBeTruthy();
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 test("stored expanded state survives a reload (fresh mount)", () => {
