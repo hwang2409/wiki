@@ -229,14 +229,30 @@ def _delivery_id(job: _RebaseJob, result: Mapping[str, Any]) -> str:
 
 
 def _prune_durable_jobs(clear_job_slot: Callable[[int, str], None] | None = None) -> None:
-    cutoff = time.time() - _JOB_RETENTION_SECONDS
-    for key, record in list(_DURABLE_JOBS.items()):
-        completed_at = record.get("completed_at")
-        if (
-            record.get("status") in {"completed", "failed"}
-            and isinstance(completed_at, (int, float))
-            and completed_at < cutoff
-        ):
+    """Delete expired completed/failed jobs from ``state.json`` atomically.
+
+    Pruning MUST go through ``_state_lock`` and ``_persist_durable_state``
+    for the same reason completions do: without the persist step, the
+    next reload happily reads the expired records back off disk and the
+    retention rule silently never runs.  This function reloads under the
+    lock, removes anything past ``_JOB_RETENTION_SECONDS``, and writes a
+    single atomic snapshot.
+    """
+
+    with _state_lock():
+        cutoff = time.time() - _JOB_RETENTION_SECONDS
+        expired: list[str] = []
+        for key, record in _DURABLE_JOBS.items():
+            completed_at = record.get("completed_at")
+            if (
+                record.get("status") in {"completed", "failed"}
+                and isinstance(completed_at, (int, float))
+                and completed_at < cutoff
+            ):
+                expired.append(key)
+        if not expired and clear_job_slot is None:
+            return
+        for key in expired:
             _DURABLE_JOBS.pop(key, None)
             if clear_job_slot is not None:
                 try:
@@ -244,6 +260,8 @@ def _prune_durable_jobs(clear_job_slot: Callable[[int, str], None] | None = None
                     clear_job_slot(int(pr_number), expected_sha)
                 except (ValueError, TypeError):
                     pass
+        if expired:
+            _persist_durable_state()
 
 
 def _result_message(worker_id: str, result: Mapping[str, Any]) -> str | None:
