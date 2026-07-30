@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import resource
+import random
 import shutil
 import struct
 import subprocess
@@ -10,6 +11,8 @@ import unittest
 from pathlib import Path
 
 from backend.app import media_scrub
+from backend.app.media_scrub import gif as gif_scrubber
+from backend.app.media_scrub import mp4 as mp4_scrubber
 
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "media"
@@ -2767,6 +2770,165 @@ class Review15MediaProbeTests(unittest.TestCase):
     def test_float_wav_rejects_non_finite_samples(self) -> None:
         with self.assertRaisesRegex(media_scrub.MediaScrubError, "not finite"):
             media_scrub.scrub_audio(self._float_wav(float("nan")), "audio/wav")
+
+
+class Review17MediaProbeTests(unittest.TestCase):
+    @staticmethod
+    def _children(data: bytes | bytearray, start: int, end: int) -> list[tuple[bytes, int, int, int, int]]:
+        children: list[tuple[bytes, int, int, int, int]] = []
+        offset = start
+        while offset < end:
+            size = struct.unpack(">I", data[offset:offset + 4])[0]
+            if size < 8 or offset + size > end:
+                raise AssertionError("fixture box is malformed")
+            children.append((
+                bytes(data[offset + 4:offset + 8]),
+                offset,
+                offset + size,
+                offset + 8,
+                offset + size,
+            ))
+            offset += size
+        return children
+
+    @classmethod
+    def _track_info(cls, payload: bytes | bytearray) -> list[dict[str, int | bytes]]:
+        moov = next(child for child in cls._children(payload, 0, len(payload)) if child[0] == b"moov")
+        tracks: list[dict[str, int | bytes]] = []
+        for trak in cls._children(payload, moov[3], moov[4]):
+            if trak[0] != b"trak":
+                continue
+            mdia = next(child for child in cls._children(payload, trak[3], trak[4]) if child[0] == b"mdia")
+            mdia_children = cls._children(payload, mdia[3], mdia[4])
+            hdlr = next(child for child in mdia_children if child[0] == b"hdlr")
+            minf = next(child for child in mdia_children if child[0] == b"minf")
+            stbl = next(child for child in cls._children(payload, minf[3], minf[4]) if child[0] == b"stbl")
+            stbl_children = cls._children(payload, stbl[3], stbl[4])
+            stsd = next(child for child in stbl_children if child[0] == b"stsd")
+            stco = next(child for child in stbl_children if child[0] == b"stco")
+            stsz = next(child for child in stbl_children if child[0] == b"stsz")
+            tracks.append({
+                "handler": bytes(payload[hdlr[3] + 8:hdlr[3] + 12]),
+                "trak_start": trak[1],
+                "trak_end": trak[2],
+                "stsd_body": stsd[3],
+                "stco_body": stco[3],
+                "stsz_body": stsz[3],
+            })
+        return tracks
+
+    @classmethod
+    def _overlap_fixture(cls, *, exact: bool, swapped: bool) -> bytes:
+        payload = bytearray(REAL_MIXED_MP4.read_bytes())
+        tracks = cls._track_info(payload)
+        video = next(track for track in tracks if track["handler"] == b"vide")
+        audio = next(track for track in tracks if track["handler"] == b"soun")
+        video_offset = struct.unpack(">I", payload[int(video["stco_body"]) + 8:int(video["stco_body"]) + 12])[0]
+        audio_stco = int(audio["stco_body"])
+        payload[audio_stco + 8:audio_stco + 12] = struct.pack(">I", video_offset)
+        if exact:
+            video_stsz = int(video["stsz_body"])
+            audio_stsz = int(audio["stsz_body"])
+            video_sample_size = struct.unpack(">I", payload[video_stsz + 12:video_stsz + 16])[0]
+            payload[audio_stsz + 12:audio_stsz + 16] = struct.pack(">I", video_sample_size)
+        if not swapped:
+            return bytes(payload)
+        tracks = cls._track_info(payload)
+        moov = next(child for child in cls._children(payload, 0, len(payload)) if child[0] == b"moov")
+        first, second = sorted(
+            (track for track in tracks), key=lambda track: int(track["trak_start"]),
+        )
+        moov_body = bytes(payload[moov[3]:moov[4]])
+        first_start = int(first["trak_start"]) - moov[3]
+        first_end = int(first["trak_end"]) - moov[3]
+        second_start = int(second["trak_start"]) - moov[3]
+        second_end = int(second["trak_end"]) - moov[3]
+        swapped_body = (
+            moov_body[:first_start]
+            + moov_body[second_start:second_end]
+            + moov_body[first_end:second_start]
+            + moov_body[first_start:first_end]
+            + moov_body[second_end:]
+        )
+        payload[moov[3]:moov[4]] = swapped_body
+        return bytes(payload)
+
+    def test_cross_track_partial_overlap_is_rejected_in_both_orders(self) -> None:
+        for swapped in (False, True):
+            with self.subTest(swapped=swapped):
+                with self.assertRaisesRegex(media_scrub.MediaScrubError, "sample ranges overlap"):
+                    media_scrub.scrub_video(
+                        self._overlap_fixture(exact=False, swapped=swapped),
+                        "video/mp4",
+                    )
+
+    def test_cross_track_exact_overlap_is_rejected_in_both_orders(self) -> None:
+        for swapped in (False, True):
+            with self.subTest(swapped=swapped):
+                with self.assertRaisesRegex(media_scrub.MediaScrubError, "sample ranges overlap"):
+                    media_scrub.scrub_video(
+                        self._overlap_fixture(exact=True, swapped=swapped),
+                        "video/mp4",
+                    )
+
+    def test_video_track_cannot_use_mp4a_sample_entry(self) -> None:
+        payload = bytearray(REAL_MIXED_MP4.read_bytes())
+        video = next(track for track in self._track_info(payload) if track["handler"] == b"vide")
+        stsd_entry_type = int(video["stsd_body"]) + 12
+        payload[stsd_entry_type:stsd_entry_type + 4] = b"mp4a"
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "vide track cannot use"):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+    def test_audio_track_cannot_use_avc1_sample_entry(self) -> None:
+        payload = bytearray(REAL_MIXED_MP4.read_bytes())
+        audio = next(track for track in self._track_info(payload) if track["handler"] == b"soun")
+        stsd_entry_type = int(audio["stsd_body"]) + 12
+        payload[stsd_entry_type:stsd_entry_type + 4] = b"avc1"
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "soun track cannot use"):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+    def test_sample_entry_child_iterator_is_bounded(self) -> None:
+        btrt = struct.pack(">I", 20) + b"btrt" + b"\x00" * 12
+        entry = b"\x00" * 36 + btrt * 100_000
+        tracemalloc.start()
+        try:
+            iterator = mp4_scrubber._iter_sample_entry_inner_boxes(entry, 36)
+            with self.assertRaisesRegex(media_scrub.MediaScrubError, "more than 4096 child boxes"):
+                for _box_type, _body in iterator:
+                    pass
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 8 * 1024 * 1024, f"peak allocation was {peak} bytes")
+
+    def test_gif_high_entropy_rebuild_has_bounded_peak_memory(self) -> None:
+        pixel_count = 4_000_000
+        pixels = random.Random(190).randbytes(pixel_count)
+        compressed = gif_scrubber._encode_gif_lzw(pixels, 8)
+        blocks = b"".join(
+            bytes([min(255, len(compressed) - offset)])
+            + compressed[offset:offset + 255]
+            for offset in range(0, len(compressed), 255)
+        )
+        payload = (
+            b"GIF89a"
+            + struct.pack("<HH", 2000, 2000)
+            + b"\xf7\x00\x00"
+            + bytes(range(256)) * 3
+            + b"\x2c"
+            + struct.pack("<HHHH", 0, 0, 2000, 2000)
+            + b"\x00\x08"
+            + blocks
+            + b"\x00\x3b"
+        )
+        tracemalloc.start()
+        try:
+            result = media_scrub.scrub_video(payload, "image/gif")
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual((result.width, result.height), (2000, 2000))
+        self.assertLess(peak, 30 * 1024 * 1024, f"peak allocation was {peak} bytes")
 
 
 if __name__ == "__main__":

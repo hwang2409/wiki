@@ -142,7 +142,7 @@ def scrub_mp4(data: bytes) -> MediaScrubResult:
         (atom.body_start, atom.body_end)
         for atom in top_atoms if atom.type == b"mdat"
     ]
-    _validate_sample_ranges(
+    sample_plan = _validate_sample_ranges(
         data, _collect_sample_ranges(data, top_atoms, mdat_ranges), mdat_ranges,
     )
 
@@ -189,7 +189,7 @@ def scrub_mp4(data: bytes) -> MediaScrubResult:
                 raise MediaScrubError("mp4 mdat body is empty")
             mdat_non_empty = True
             scrubbed_body = bytearray(body_len)
-            for sample_range in _collect_sample_ranges(data, top_atoms, mdat_ranges):
+            for sample_range in sample_plan:
                 sample_start = sample_range.start
                 sample_end = sample_range.end
                 if sample_start < atom.body_start or sample_end > atom.body_end:
@@ -279,13 +279,19 @@ def _collect_sample_ranges(
             for mdia in _parse_container(data, trak.body_start, trak.body_end):
                 if mdia.type != b"mdia":
                     continue
-                for minf in _parse_container(data, mdia.body_start, mdia.body_end):
+                mdia_atoms = _parse_container(data, mdia.body_start, mdia.body_end)
+                hdlr_atoms = [atom for atom in mdia_atoms if atom.type == b"hdlr"]
+                if len(hdlr_atoms) != 1:
+                    raise MediaScrubError("mp4 mdia requires exactly one hdlr child")
+                handler_type = _handler_type(data, hdlr_atoms[0])
+                for minf in mdia_atoms:
                     if minf.type != b"minf":
                         continue
                     for stbl in _parse_container(data, minf.body_start, minf.body_end):
                         if stbl.type == b"stbl":
                             yield from _collect_sample_ranges_from_stbl(
                                 data, stbl.body_start, stbl.body_end, mdat_ranges,
+                                handler_type,
                             )
 
 
@@ -294,6 +300,7 @@ def _collect_sample_ranges_from_stbl(
     body_start: int,
     body_end: int,
     mdat_ranges: list[tuple[int, int]],
+    handler_type: bytes,
 ) -> Iterator[_Mp4SampleRange]:
     tables = {
         atom.type: atom
@@ -310,7 +317,9 @@ def _collect_sample_ranges_from_stbl(
     if offset_atom is None:
         raise MediaScrubError("mp4 sample tables missing stco or co64")
 
-    sample_descriptions = _sample_description_configs(data, body_start, body_end)
+    sample_descriptions = _sample_description_configs(
+        data, body_start, body_end, handler_type,
+    )
     if not sample_descriptions:
         raise MediaScrubError("mp4 stbl/stsd has no sample descriptions")
 
@@ -446,7 +455,7 @@ def _collect_sample_ranges_from_stbl(
 
 
 def _sample_description_configs(
-    data: bytes, body_start: int, body_end: int,
+    data: bytes, body_start: int, body_end: int, handler_type: bytes,
 ) -> list[tuple[int, set[int], bool] | None]:
     """Return one codec configuration per stsd sample-description index."""
     stsd_atoms = [
@@ -471,15 +480,18 @@ def _sample_description_configs(
         if entry_size < 8 or offset + entry_size > len(body):
             raise MediaScrubError("mp4 stsd entry size out of bounds")
         entry = body[offset:offset + entry_size]
+        expected_entry_type = b"avc1" if handler_type == b"vide" else b"mp4a"
+        if entry_type != expected_entry_type:
+            raise MediaScrubError(
+                f"mp4 {handler_type.decode('ascii')} track cannot use "
+                f"{entry_type.decode('ascii', 'replace')} sample entry; "
+                "outside scrubber scope"
+            )
         if entry_type == b"avc1":
             entries.append(_parse_avc_sample_config_from_entry(entry))
-        elif entry_type == b"mp4a":
+        else:
             _rebuild_sample_entry(entry_type, entry)
             entries.append(None)
-        else:
-            raise MediaScrubError(
-                f"mp4 sample entry type {entry_type!r} is outside scrubber scope"
-            )
         offset += entry_size
     return entries
 
@@ -487,21 +499,16 @@ def _sample_description_configs(
 def _parse_avc_sample_config_from_entry(
     entry: bytes,
 ) -> tuple[int, set[int], bool]:
-    inner_start = 16 + 70
-    inner_offset = inner_start
     avcc_body: bytes | None = None
-    while inner_offset < len(entry):
-        if inner_offset + 8 > len(entry):
-            raise MediaScrubError("mp4 avc sample inner header truncated")
-        box_size = struct.unpack(">I", entry[inner_offset:inner_offset + 4])[0]
-        box_type = entry[inner_offset + 4:inner_offset + 8]
-        if box_size < 8 or inner_offset + box_size > len(entry):
-            raise MediaScrubError("mp4 avc sample inner box out of bounds")
+    seen: set[bytes] = set()
+    for box_type, box_body in _iter_sample_entry_inner_boxes(entry, 16 + 70):
+        if box_type in seen:
+            raise MediaScrubError(
+                f"mp4 avc1 sample entry has duplicate {box_type.decode('ascii', 'replace')}"
+            )
+        seen.add(box_type)
         if box_type == b"avcC":
-            if avcc_body is not None:
-                raise MediaScrubError("mp4 avc1 sample entry has duplicate avcC")
-            avcc_body = entry[inner_offset + 8:inner_offset + box_size]
-        inner_offset += box_size
+            avcc_body = box_body
     if avcc_body is None:
         raise MediaScrubError("mp4 avc1 sample entry requires exactly one avcC")
     return _parse_avc_sample_config(avcc_body, True)
@@ -597,8 +604,11 @@ def _canonicalise_avc_sample(
 def _validate_sample_ranges(
     data: bytes, sample_ranges: Iterator[_Mp4SampleRange],
     mdat_ranges: list[tuple[int, int]],
-) -> None:
-    for sample_range in sample_ranges:
+) -> list[_Mp4SampleRange]:
+    plan = list(sample_ranges)
+    plan.sort(key=lambda sample_range: (sample_range.start, sample_range.end))
+    previous: _Mp4SampleRange | None = None
+    for sample_range in plan:
         start = sample_range.start
         end = sample_range.end
         if (
@@ -608,10 +618,16 @@ def _validate_sample_ranges(
             raise MediaScrubError(
                 "mp4 sample range is not contained by one mdat box"
             )
+        if previous is not None and start < previous.end:
+            raise MediaScrubError(
+                "mp4 sample ranges overlap across or within tracks"
+            )
         if sample_range.avc_config is not None:
             _canonicalise_avc_sample(
                 data[start:end], *sample_range.avc_config,
             )
+        previous = sample_range
+    return plan
 
 
 # ---------------------------------------------------------------------------
@@ -1159,6 +1175,7 @@ def _rebuild_minf(
     dinf = _rebuild_dinf(data, dinf_atoms[0].body_start, dinf_atoms[0].body_end)
     stbl_body, stsd_ok = _rebuild_stbl(
         data, stbl_atoms[0].body_start, stbl_atoms[0].body_end,
+        handler_type,
     )
     return media_header + dinf + _pack(b"stbl", stbl_body), stsd_ok
 
@@ -1290,6 +1307,7 @@ def _rebuild_dinf(data: bytes, body_start: int, body_end: int) -> bytes:
 
 def _rebuild_stbl(
     data: bytes, body_start: int, body_end: int,
+    handler_type: bytes,
 ) -> tuple[bytes, bool]:
     atoms = _parse_container(data, body_start, body_end)
     parts: list[bytes] = []
@@ -1306,7 +1324,9 @@ def _rebuild_stbl(
             )
         seen.add(atom.type)
         if atom.type == b"stsd":
-            stsd_body = _rebuild_stsd(data, atom.body_start, atom.body_end)
+            stsd_body = _rebuild_stsd(
+                data, atom.body_start, atom.body_end, handler_type,
+            )
             if stsd_body is not None:
                 parts.append(_pack(b"stsd", stsd_body))
                 stsd_ok = True
@@ -1511,7 +1531,7 @@ def _rebuild_stbl_table(box_type: bytes, data: bytes, atom: _Mp4Atom) -> bytes:
 
 
 def _rebuild_stsd(
-    data: bytes, body_start: int, body_end: int,
+    data: bytes, body_start: int, body_end: int, handler_type: bytes,
 ) -> bytes | None:
     payload = data[body_start:body_end]
     if len(payload) < 8:
@@ -1537,6 +1557,13 @@ def _rebuild_stsd(
         if entry_size < 8 or offset + entry_size > len(payload):
             return None
         entry_bytes = payload[offset:offset + entry_size]
+        expected_entry_type = b"avc1" if handler_type == b"vide" else b"mp4a"
+        if entry_type != expected_entry_type:
+            raise MediaScrubError(
+                f"mp4 {handler_type.decode('ascii')} track cannot use "
+                f"{entry_type.decode('ascii', 'replace')} sample entry; "
+                "outside scrubber scope"
+            )
         rebuilt = _rebuild_sample_entry(entry_type, entry_bytes)
         entries.append(rebuilt)
         offset += entry_size
@@ -1575,14 +1602,13 @@ def _rebuild_sample_entry(entry_type: bytes, entry_bytes: bytes) -> bytes:
             f"mp4 sample entry type {entry_type!r} outside allowlist"
         )
 
-    inner_boxes = _walk_sample_entry_inner_boxes(
+    inner_payload, inner_types = _walk_sample_entry_inner_boxes(
         entry_bytes,
         inner_start,
         entry_type=entry_type,
     )
     required_config = _MP4_SAMPLE_ENTRY_REQUIRED_CONFIG[entry_type]
-    inner_types = [box[4:8] for box in inner_boxes]
-    if inner_types.count(required_config) != 1:
+    if required_config not in inner_types:
         raise MediaScrubError(
             f"mp4 {entry_type.decode('ascii')} sample entry requires exactly one "
             f"{required_config.decode('ascii')} configuration box"
@@ -1591,7 +1617,7 @@ def _rebuild_sample_entry(entry_type: bytes, entry_bytes: bytes) -> bytes:
         b"\x00" * 6
         + struct.pack(">H", data_ref_index)
         + fixed
-        + b"".join(inner_boxes)
+        + inner_payload
     )
     return _pack(entry_type, body)
 
@@ -1855,17 +1881,55 @@ def _walk_sample_entry_inner_boxes(
     inner_start: int,
     *,
     entry_type: bytes,
-) -> list[bytes]:
+) -> tuple[bytes, set[bytes]]:
     """Rebuild each inner box from parsed fields. No opaque body copy
     path remains: every allowlisted type dispatches to a struct.pack
     rebuild that reads specific fields; anything not in the allowlist
     (hvcC/vpcC/av1C/sinf/schm/schi/tenc/anything unknown) rejects
     the whole file — strict-subset acceptance.
     """
-    out: list[bytes] = []
+    out = bytearray()
+    seen: set[bytes] = set()
+    for box_type, body in _iter_sample_entry_inner_boxes(entry_bytes, inner_start):
+        if box_type in seen:
+            raise MediaScrubError(
+                f"mp4 {entry_type.decode('ascii')} sample entry has duplicate "
+                f"{box_type.decode('ascii', 'replace')}"
+            )
+        seen.add(box_type)
+        if box_type == b"avcC":
+            out.extend(
+                _rebuild_inner_avcC(
+                    body, require_parameter_sets=entry_type == b"avc1",
+                )
+            )
+        elif box_type == b"btrt":
+            out.extend(_rebuild_inner_btrt(body))
+        elif box_type == b"pasp":
+            out.extend(_rebuild_inner_pasp(body))
+        elif box_type == b"colr":
+            out.extend(_rebuild_inner_colr(body))
+        elif box_type == b"esds":
+            out.extend(_rebuild_inner_esds(body))
+        else:  # pragma: no cover — allowlist above already gated
+            raise MediaScrubError(
+                f"mp4 sample entry inner box {box_type!r} missing rebuilder"
+            )
+    return bytes(out), seen
+
+
+def _iter_sample_entry_inner_boxes(
+    entry_bytes: bytes, inner_start: int,
+) -> Iterator[tuple[bytes, bytes]]:
     offset = inner_start
     end = len(entry_bytes)
+    box_count = 0
     while offset < end:
+        box_count += 1
+        if box_count > _MP4_MAX_BOXES_PER_CONTAINER:
+            raise MediaScrubError(
+                f"mp4 sample entry has more than {_MP4_MAX_BOXES_PER_CONTAINER} child boxes"
+            )
         if offset + 8 > end:
             raise MediaScrubError("mp4 sample entry inner box header truncated")
         box_size = struct.unpack(">I", entry_bytes[offset:offset + 4])[0]
@@ -1876,28 +1940,8 @@ def _walk_sample_entry_inner_boxes(
             raise MediaScrubError(
                 f"mp4 sample entry inner box {box_type!r} outside allowlist"
             )
-        body = entry_bytes[offset + 8:offset + box_size]
-        if box_type == b"avcC":
-            out.append(
-                _rebuild_inner_avcC(
-                    body,
-                    require_parameter_sets=entry_type == b"avc1",
-                )
-            )
-        elif box_type == b"btrt":
-            out.append(_rebuild_inner_btrt(body))
-        elif box_type == b"pasp":
-            out.append(_rebuild_inner_pasp(body))
-        elif box_type == b"colr":
-            out.append(_rebuild_inner_colr(body))
-        elif box_type == b"esds":
-            out.append(_rebuild_inner_esds(body))
-        else:  # pragma: no cover — allowlist above already gated
-            raise MediaScrubError(
-                f"mp4 sample entry inner box {box_type!r} missing rebuilder"
-            )
+        yield box_type, entry_bytes[offset + 8:offset + box_size]
         offset += box_size
-    return out
 
 
 def _rebuild_inner_avcC(

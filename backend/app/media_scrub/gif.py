@@ -347,7 +347,18 @@ def _encode_gif_lzw(pixels: bytes, min_code_size: int) -> bytes:
     code_size = min_code_size + 1
     next_code = clear_code + 2
     grow_pending = False
-    coded: list[tuple[int, int]] = [(clear_code, code_size)]
+    output = bytearray()
+    bit_offset = 0
+
+    def emit_code(code: int, width: int) -> None:
+        nonlocal bit_offset
+        for shift in range(width):
+            if bit_offset % 8 == 0:
+                output.append(0)
+            output[-1] |= ((code >> shift) & 1) << (bit_offset % 8)
+            bit_offset += 1
+
+    emit_code(clear_code, code_size)
     if pixels:
         current = bytes([pixels[0]])
         for pixel in pixels[1:]:
@@ -355,7 +366,7 @@ def _encode_gif_lzw(pixels: bytes, min_code_size: int) -> bytes:
             if candidate in dictionary:
                 current = candidate
                 continue
-            coded.append((dictionary[current], code_size))
+            emit_code(dictionary[current], code_size)
             if grow_pending:
                 code_size += 1
                 grow_pending = False
@@ -365,23 +376,14 @@ def _encode_gif_lzw(pixels: bytes, min_code_size: int) -> bytes:
                 if next_code == (1 << code_size) and code_size < 12:
                     grow_pending = True
             else:
-                coded.append((clear_code, code_size))
+                emit_code(clear_code, code_size)
                 dictionary = {bytes([index]): index for index in range(clear_code)}
                 code_size = min_code_size + 1
                 next_code = clear_code + 2
                 grow_pending = False
             current = bytes([pixel])
-        coded.append((dictionary[current], code_size))
-    coded.append((eoi_code, code_size))
-
-    output = bytearray()
-    bit_offset = 0
-    for code, width in coded:
-        for shift in range(width):
-            if bit_offset % 8 == 0:
-                output.append(0)
-            output[-1] |= ((code >> shift) & 1) << (bit_offset % 8)
-            bit_offset += 1
+        emit_code(dictionary[current], code_size)
+    emit_code(eoi_code, code_size)
     return bytes(output)
 
 
