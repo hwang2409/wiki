@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
 from backend.app.agent_runtime.store import RuntimePaths
-from backend.app.agent_runtime.unknown_kind_telemetry import UnknownKindTelemetry
+from backend.app.agent_runtime import unknown_kind_telemetry as telemetry_module
+from backend.app.agent_runtime.unknown_kind_telemetry import (
+    MAX_EVENT_LINE_BYTES,
+    MAX_SCHEDULE_DELAY_SECONDS,
+    UnknownKindTelemetry,
+    _todo_runner,
+)
 
 
 class UnknownKindTelemetryTests(unittest.TestCase):
@@ -50,6 +58,28 @@ class UnknownKindTelemetryTests(unittest.TestCase):
         path.parent.mkdir(parents=True)
         with path.open("w", encoding="utf-8") as handle:
             self._write_events(handle, count)
+
+    def _write_timestamped_run(
+        self, run_name: str, count: int, received_at: str
+    ) -> None:
+        path = self.paths.runs_dir / run_name / "raw.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as handle:
+            for _ in range(count):
+                handle.write(
+                    json.dumps(
+                        {
+                            "received_at": received_at,
+                            "provider": "codex",
+                            "direction": "provider",
+                            "payload": {
+                                "method": "item/novel",
+                                "params": {},
+                            },
+                        }
+                    )
+                    + "\n"
+                )
 
     def _service(self) -> UnknownKindTelemetry:
         return UnknownKindTelemetry(
@@ -121,6 +151,123 @@ class UnknownKindTelemetryTests(unittest.TestCase):
         self.assertEqual(result["unknown_counts"], {"claude_attachment": 101})
         self.assertEqual(result["filed_kinds"], [])
         self.assertEqual(len(self.calls), 0)
+
+    def test_cli_failure_retries_pending_todo_after_restart(self) -> None:
+        self._append(101)
+        attempts = 0
+
+        def flaky_runner(text: str) -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("vault unavailable")
+            self.calls.append(text)
+
+        first = UnknownKindTelemetry(
+            self.paths,
+            threshold=100,
+            todo_runner=flaky_runner,
+            clock=lambda: 1_759_000_000,
+        )
+        with mock.patch.object(telemetry_module.logger, "exception"):
+            first.run_once()
+        failed_state = json.loads(first.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(failed_state["filed_kinds"], [])
+        self.assertIn("item/novel", failed_state["pending_kinds"])
+
+        second = UnknownKindTelemetry(
+            self.paths,
+            threshold=100,
+            todo_runner=flaky_runner,
+            clock=lambda: 1_759_000_000,
+        )
+        result = second.run_once()
+
+        self.assertEqual(attempts, 2)
+        self.assertEqual(result["filed_kinds"], ["item/novel"])
+        self.assertEqual(len(self.calls), 1)
+
+    def test_counts_use_event_received_week(self) -> None:
+        self._write_timestamped_run("run-1", 60, "2026-07-20T01:00:00Z")
+        self._write_timestamped_run("run-2", 60, "2026-07-27T01:00:00Z")
+        service = UnknownKindTelemetry(
+            self.paths,
+            threshold=100,
+            todo_runner=self.calls.append,
+            clock=lambda: datetime(2026, 7, 28, tzinfo=timezone.utc).timestamp(),
+        )
+
+        result = service.run_once()
+
+        self.assertEqual(
+            result["unknown_counts_by_week"],
+            {
+                "2026-07-20": {"item/novel": 60},
+                "2026-07-27": {"item/novel": 60},
+            },
+        )
+        self.assertEqual(self.calls, [])
+
+    def test_clock_skew_does_not_reset_week_or_extend_scheduler_delay(self) -> None:
+        service = self._service()
+        future = datetime(2026, 8, 3, tzinfo=timezone.utc).timestamp()
+        earlier = datetime(2026, 7, 20, tzinfo=timezone.utc).timestamp()
+        service.run_once(timestamp=future)
+        backward = service.run_once(timestamp=earlier)
+
+        self.assertEqual(backward["week_start"], "2026-08-03")
+        self.assertLessEqual(
+            service.seconds_until_due(timestamp=future - 1),
+            MAX_SCHEDULE_DELAY_SECONDS,
+        )
+
+    def test_oversized_line_is_discarded_with_durable_state(self) -> None:
+        oversized = self.raw
+        oversized.write_bytes(b"x" * (MAX_EVENT_LINE_BYTES + 1))
+        service = self._service()
+        service.run_once()
+        state = json.loads(service.state_path.read_text(encoding="utf-8"))
+        self.assertTrue(state["cursors"]["run-1"]["discarding_oversized_line"])
+
+        with oversized.open("ab") as handle:
+            handle.write(b"\n")
+        self._append(101)
+        result = service.run_once()
+
+        self.assertEqual(result["unknown_counts"], {"item/novel": 101})
+        self.assertEqual(len(self.calls), 1)
+
+    def test_frozen_native_runner_uses_repo_cli_not_python_executable(self) -> None:
+        repo = Path(self.tmp.name) / "repo"
+        repo.mkdir()
+        expected_cli = repo / "wiki"
+        with (
+            mock.patch.dict(os.environ, {"WIKI_REPO_DIR": str(repo)}),
+            mock.patch(
+                "sys.executable", "/Applications/Wiki.app/Contents/MacOS/wiki-backend"
+            ),
+            mock.patch.object(telemetry_module.subprocess, "run") as run,
+        ):
+            _todo_runner("unknown provider event kind test")
+
+        self.assertEqual(run.call_args.args[0][0], str(expected_cli))
+        self.assertIn("--if-missing", run.call_args.args[0])
+
+    def test_torn_state_write_keeps_previous_state(self) -> None:
+        service = self._service()
+        service.run_once()
+        before = service.state_path.read_bytes()
+        replacement = {"version": 2, "week_start": "2099-01-01"}
+
+        with (
+            mock.patch.object(
+                telemetry_module.os, "replace", side_effect=OSError("torn write")
+            ),
+            self.assertRaises(OSError),
+        ):
+            service._save_state(replacement)
+
+        self.assertEqual(service.state_path.read_bytes(), before)
 
     def test_raw_stream_is_not_read_with_read_text(self) -> None:
         self._append(101)

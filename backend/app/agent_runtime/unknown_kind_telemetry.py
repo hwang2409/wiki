@@ -6,7 +6,6 @@ import json
 import logging
 import os
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -24,7 +23,12 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_INTERVAL_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_UNKNOWN_KIND_THRESHOLD = 100
-STATE_VERSION = 1
+MAX_SCHEDULE_DELAY_SECONDS = DEFAULT_INTERVAL_SECONDS
+SCAN_CHUNK_BYTES = 64 * 1024
+MAX_EVENT_LINE_BYTES = 1024 * 1024
+CHECKPOINT_EVENT_COUNT = 256
+MAX_CURSOR_ENTRIES = 4096
+STATE_VERSION = 2
 
 
 def _atomic_write_json(path: Path, value: dict[str, Any]) -> None:
@@ -66,6 +70,7 @@ def _default_state(timestamp: float) -> dict[str, Any]:
         "cursors": {},
         "unknown_counts": {},
         "covered_kinds": [],
+        "pending_kinds": {},
         "filed_kinds": [],
     }
 
@@ -73,9 +78,12 @@ def _default_state(timestamp: float) -> dict[str, Any]:
 def _todo_runner(text: str) -> None:
     """File one todo item through the repository's CLI."""
 
-    cli = Path(__file__).resolve().parents[3] / "wiki"
+    repo_dir = Path(
+        os.environ.get("WIKI_REPO_DIR") or Path(__file__).resolve().parents[3]
+    )
+    cli = repo_dir / "wiki"
     subprocess.run(
-        [sys.executable, str(cli), "todo", "add", text, "--section", "Todo"],
+        [str(cli), "todo", "add", text, "--section", "Todo", "--if-missing"],
         check=True,
         capture_output=True,
         text=True,
@@ -112,16 +120,44 @@ class UnknownKindTelemetry:
             state = json.loads(self.state_path.read_text(encoding="utf-8"))
         except (FileNotFoundError, OSError, ValueError):
             return _default_state(timestamp)
-        if not isinstance(state, dict) or state.get("version") != STATE_VERSION:
+        if not isinstance(state, dict) or state.get("version") not in {
+            1,
+            STATE_VERSION,
+        }:
             return _default_state(timestamp)
         result = _default_state(timestamp)
         result.update(state)
+        if state.get("version") == 1:
+            old_week = str(state.get("week_start") or _week_start(timestamp))
+            old_counts = state.get("unknown_counts")
+            result["unknown_counts"] = {
+                old_week: old_counts if isinstance(old_counts, dict) else {}
+            }
+            result["version"] = STATE_VERSION
         for key in ("cursors", "unknown_counts"):
             if not isinstance(result[key], dict):
                 result[key] = {}
+        result["cursors"] = {
+            str(run_name): cursor
+            for run_name, cursor in result["cursors"].items()
+            if isinstance(run_name, str) and isinstance(cursor, dict)
+        }
+        result["unknown_counts"] = {
+            str(week): counts
+            for week, counts in result["unknown_counts"].items()
+            if isinstance(counts, dict)
+        }
+        if not isinstance(result["pending_kinds"], dict):
+            result["pending_kinds"] = {}
         for key in ("covered_kinds", "filed_kinds"):
             if not isinstance(result[key], list):
                 result[key] = []
+        result["covered_kinds"] = [
+            kind for kind in result["covered_kinds"] if isinstance(kind, str)
+        ]
+        result["filed_kinds"] = [
+            kind for kind in result["filed_kinds"] if isinstance(kind, str)
+        ]
         return result
 
     def _save_state(self, state: dict[str, Any]) -> None:
@@ -129,13 +165,17 @@ class UnknownKindTelemetry:
 
     def _start_week(self, state: dict[str, Any], timestamp: float) -> None:
         current_week = _week_start(timestamp)
-        if state.get("week_start") == current_week:
-            return
-        state["week_start"] = current_week
-        state["unknown_counts"] = {}
+        stored_week = state.get("week_start")
+        if not isinstance(stored_week, str) or current_week > stored_week:
+            state["week_start"] = current_week
 
     @staticmethod
-    def _cursor_for(state: dict[str, Any], run_name: str, path: Path) -> dict[str, Any]:
+    def _cursor_for(
+        state: dict[str, Any],
+        run_name: str,
+        path: Path,
+        timestamp: float,
+    ) -> dict[str, Any]:
         cursors = state["cursors"]
         cursor = cursors.get(run_name)
         if not isinstance(cursor, dict):
@@ -145,64 +185,169 @@ class UnknownKindTelemetry:
             stat = path.stat()
         except OSError:
             return cursor
+        try:
+            cursor_offset = int(cursor.get("offset", 0))
+        except (TypeError, ValueError):
+            cursor_offset = 0
         if (
             cursor.get("device") != stat.st_dev
             or cursor.get("inode") != stat.st_ino
-            or int(cursor.get("offset", 0)) > stat.st_size
+            or cursor_offset > stat.st_size
         ):
             cursor.clear()
             cursor.update({"offset": 0, "device": stat.st_dev, "inode": stat.st_ino})
+        cursor["last_seen_at"] = timestamp
         return cursor
 
-    def _scan_run(self, state: dict[str, Any], run_dir: Path) -> int:
+    def _prune_cursors(self, state: dict[str, Any]) -> None:
+        cursors = state["cursors"]
+        for run_name in list(cursors):
+            if (
+                Path(run_name).name != run_name
+                or not (self.paths.runs_dir / run_name / "raw.jsonl").is_file()
+            ):
+                cursors.pop(run_name, None)
+        while len(cursors) > MAX_CURSOR_ENTRIES:
+            oldest_name = min(
+                cursors,
+                key=lambda name: float(cursors[name].get("last_seen_at", 0)),
+            )
+            cursors.pop(oldest_name, None)
+
+    @staticmethod
+    def _event_week(envelope: dict[str, Any], fallback_week: str) -> str:
+        received_at = envelope.get("received_at")
+        if not isinstance(received_at, str):
+            return fallback_week
+        try:
+            parsed = datetime.fromisoformat(received_at.replace("Z", "+00:00"))
+        except ValueError:
+            return fallback_week
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return _week_start(parsed.astimezone(timezone.utc).timestamp())
+
+    def _process_line(
+        self,
+        state: dict[str, Any],
+        line: bytes,
+        *,
+        fallback_week: str,
+    ) -> None:
+        try:
+            envelope = json.loads(line.decode("utf-8"))
+            provider = ProviderKind(str(envelope["provider"]))
+            payload = envelope["payload"]
+            direction = str(envelope.get("direction", "provider"))
+            if not isinstance(payload, dict):
+                raise ValueError("payload is not an object")
+        except (UnicodeDecodeError, KeyError, TypeError, ValueError):
+            return
+        try:
+            normalized = normalize_provider_event(
+                provider, payload, direction=direction
+            )
+        except Exception as exc:
+            normalized = NormalizedProviderEvent(
+                EventDisposition.UNKNOWN,
+                "normalization_error",
+                {"error": str(exc), "raw_payload": payload},
+            )
+        kind = normalized.kind
+        if normalized.disposition is EventDisposition.UNKNOWN:
+            week = self._event_week(envelope, fallback_week)
+            week_counts = state["unknown_counts"].setdefault(week, {})
+            week_counts[kind] = int(week_counts.get(kind, 0)) + 1
+        else:
+            covered = set(state["covered_kinds"])
+            covered.add(kind)
+            state["covered_kinds"] = sorted(covered)
+
+    def _scan_run(
+        self,
+        state: dict[str, Any],
+        run_dir: Path,
+        *,
+        fallback_week: str,
+        timestamp: float,
+    ) -> int:
         path = run_dir / "raw.jsonl"
         if not path.is_file():
             return 0
-        cursor = self._cursor_for(state, run_dir.name, path)
-        offset = int(cursor.get("offset", 0))
+        cursor = self._cursor_for(state, run_dir.name, path, timestamp)
+        try:
+            offset = max(0, int(cursor.get("offset", 0)))
+        except (TypeError, ValueError):
+            offset = 0
         scanned = 0
+        line_start = offset
+        stream_offset = offset
+        line_buffer = bytearray()
+        discarding = bool(cursor.get("discarding_oversized_line", False))
+        checkpoint_events = 0
         try:
             with path.open("rb") as handle:
                 handle.seek(offset)
-                while True:
-                    line = handle.readline()
-                    if not line:
-                        break
-                    if not line.endswith(b"\n"):
-                        break
-                    cursor["offset"] = handle.tell()
-                    scanned += 1
-                    try:
-                        envelope = json.loads(line.decode("utf-8"))
-                        provider = ProviderKind(str(envelope["provider"]))
-                        payload = envelope["payload"]
-                        direction = str(envelope.get("direction", "provider"))
-                        if not isinstance(payload, dict):
-                            raise ValueError("payload is not an object")
-                    except (UnicodeDecodeError, KeyError, TypeError, ValueError):
-                        self._save_state(state)
-                        continue
-                    try:
-                        normalized = normalize_provider_event(
-                            provider, payload, direction=direction
-                        )
-                    except Exception as exc:
-                        normalized = NormalizedProviderEvent(
-                            EventDisposition.UNKNOWN,
-                            "normalization_error",
-                            {"error": str(exc), "raw_payload": payload},
-                        )
-                    kind = normalized.kind
-                    if normalized.disposition is EventDisposition.UNKNOWN:
-                        counts = state["unknown_counts"]
-                        counts[kind] = int(counts.get(kind, 0)) + 1
-                    else:
-                        covered = set(state["covered_kinds"])
-                        covered.add(kind)
-                        state["covered_kinds"] = sorted(covered)
-                    # Persist every complete line. A crash can therefore lose
-                    # at most the incomplete final line, never a multi-GB scan.
-                    self._save_state(state)
+                while chunk := handle.read(SCAN_CHUNK_BYTES):
+                    chunk_start = 0
+                    while chunk_start < len(chunk):
+                        newline = chunk.find(b"\n", chunk_start)
+                        if newline == -1:
+                            segment = chunk[chunk_start:]
+                            stream_offset += len(segment)
+                            if not discarding:
+                                if (
+                                    len(line_buffer) + len(segment)
+                                    > MAX_EVENT_LINE_BYTES
+                                ):
+                                    line_buffer.clear()
+                                    discarding = True
+                                    cursor["offset"] = line_start
+                                    cursor["discarding_oversized_line"] = True
+                                    self._save_state(state)
+                                else:
+                                    line_buffer.extend(segment)
+                            break
+
+                        segment = chunk[chunk_start : newline + 1]
+                        stream_offset += len(segment)
+                        if discarding:
+                            line_buffer.clear()
+                            discarding = False
+                            cursor["offset"] = stream_offset
+                            cursor["discarding_oversized_line"] = False
+                            line_start = stream_offset
+                            self._save_state(state)
+                        elif len(line_buffer) + len(segment) > MAX_EVENT_LINE_BYTES:
+                            line_buffer.clear()
+                            discarding = False
+                            cursor["offset"] = stream_offset
+                            cursor["discarding_oversized_line"] = False
+                            line_start = stream_offset
+                            self._save_state(state)
+                        else:
+                            line_buffer.extend(segment)
+                            cursor["offset"] = stream_offset
+                            cursor["discarding_oversized_line"] = False
+                            self._process_line(
+                                state,
+                                bytes(line_buffer),
+                                fallback_week=fallback_week,
+                            )
+                            line_buffer.clear()
+                            line_start = stream_offset
+                            scanned += 1
+                            checkpoint_events += 1
+                            if checkpoint_events >= CHECKPOINT_EVENT_COUNT:
+                                self._save_state(state)
+                                checkpoint_events = 0
+                        chunk_start = newline + 1
+            # Persist the final batch, and retain the line-start offset while
+            # an oversized or unterminated line waits for more input.
+            if discarding:
+                cursor["offset"] = line_start
+                cursor["discarding_oversized_line"] = True
+            self._save_state(state)
         except OSError:
             logger.exception("unknown-kind telemetry could not scan %s", path)
         return scanned
@@ -210,25 +355,56 @@ class UnknownKindTelemetry:
     def _file_todos(self, state: dict[str, Any]) -> list[str]:
         covered = set(state["covered_kinds"])
         filed = set(state["filed_kinds"])
+        pending = state["pending_kinds"]
         filed_now: list[str] = []
-        for kind, count in sorted(state["unknown_counts"].items()):
-            if int(count) <= self.threshold or kind in covered or kind in filed:
+
+        for kind in list(pending):
+            if kind in covered or kind in filed:
+                pending.pop(kind, None)
                 continue
-            text = (
-                f'unknown provider event kind "{kind}" exceeded '
-                f"{self.threshold} events in the week of {state['week_start']}"
-            )
-            # Record before the subprocess. This gives the external, non-
-            # transactional CLI an at-most-once durable invocation contract.
-            filed.add(kind)
-            state["filed_kinds"] = sorted(filed)
-            self._save_state(state)
+            item = pending[kind]
+            text = item.get("text") if isinstance(item, dict) else None
+            if not isinstance(text, str):
+                pending.pop(kind, None)
+                continue
             try:
                 self.todo_runner(text)
             except Exception:
                 logger.exception("unknown-kind telemetry todo add failed for %s", kind)
             else:
+                pending.pop(kind, None)
+                filed.add(kind)
+                state["filed_kinds"] = sorted(filed)
+                self._save_state(state)
                 filed_now.append(kind)
+
+        for week, week_counts in sorted(state["unknown_counts"].items()):
+            for kind, count in sorted(week_counts.items()):
+                if (
+                    int(count) <= self.threshold
+                    or kind in covered
+                    or kind in filed
+                    or kind in pending
+                ):
+                    continue
+                text = (
+                    f'unknown provider event kind "{kind}" exceeded '
+                    f"{self.threshold} events in the week of {week}"
+                )
+                pending[kind] = {"text": text, "week": week}
+                self._save_state(state)
+                try:
+                    self.todo_runner(text)
+                except Exception:
+                    logger.exception(
+                        "unknown-kind telemetry todo add failed for %s", kind
+                    )
+                else:
+                    pending.pop(kind, None)
+                    filed.add(kind)
+                    state["filed_kinds"] = sorted(filed)
+                    self._save_state(state)
+                    filed_now.append(kind)
         return filed_now
 
     def run_once(self, *, timestamp: float | None = None) -> dict[str, Any]:
@@ -238,24 +414,36 @@ class UnknownKindTelemetry:
             current = self.clock() if timestamp is None else timestamp
             state = self._load_state(current)
             self._start_week(state, current)
+            self._prune_cursors(state)
             self._save_state(state)
             scanned_runs = 0
             scanned_events = 0
             runs_dir = self.paths.runs_dir
             if runs_dir.is_dir():
-                for run_dir in sorted(runs_dir.iterdir(), key=lambda item: item.name):
+                for run_dir in runs_dir.iterdir():
                     if not run_dir.is_dir():
                         continue
                     scanned_runs += 1
-                    scanned_events += self._scan_run(state, run_dir)
+                    scanned_events += self._scan_run(
+                        state,
+                        run_dir,
+                        fallback_week=state["week_start"],
+                        timestamp=current,
+                    )
+            self._prune_cursors(state)
             filed_now = self._file_todos(state)
             state["last_run_at"] = current
             self._save_state(state)
+            current_counts = state["unknown_counts"].get(state["week_start"], {})
             return {
                 "week_start": state["week_start"],
                 "scanned_runs": scanned_runs,
                 "scanned_events": scanned_events,
-                "unknown_counts": dict(state["unknown_counts"]),
+                "unknown_counts": dict(current_counts),
+                "unknown_counts_by_week": {
+                    week: dict(counts)
+                    for week, counts in state["unknown_counts"].items()
+                },
                 "filed_kinds": filed_now,
                 "last_run_at": current,
             }
@@ -266,7 +454,8 @@ class UnknownKindTelemetry:
         last_run = state.get("last_run_at")
         if not isinstance(last_run, (int, float)):
             return 0
-        return max(0.0, self.interval - (current - float(last_run)))
+        delay = max(0.0, self.interval - (current - float(last_run)))
+        return min(MAX_SCHEDULE_DELAY_SECONDS, delay)
 
     async def periodic_loop(self, stop) -> None:
         """Run weekly while the backend lifespan is active."""
