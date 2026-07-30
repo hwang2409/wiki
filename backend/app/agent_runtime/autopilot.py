@@ -9,6 +9,9 @@ supervisor or GitHub credentials.
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
+from datetime import datetime
+import fcntl
 import json
 import os
 import re
@@ -28,19 +31,24 @@ from .ticket import base_ticket
 DEFAULT_ITERATION_CAP = 8
 DEFAULT_PLATEAU_GUARD = 3
 _HEADER = re.compile(
-    r"(?im)^\s*(MERGE-READY|NOT-MERGE-READY|NO-GO)\s*(?::\s*(?:(\d+)\s+findings?|[^\n]*))?\s*$"
+    r"(?im)^\s*(?:verdict\s*:\s*)?"
+    r"(MERGE-READY|NOT-MERGE-READY|NO-GO|NEEDS[- ](?:FIXES|WORK))"
+    r"\s*(?:[:;—-]\s*(?:(\d+)\s+findings?|[^\n]*))?\s*$"
 )
 _FINDING = re.compile(
     r"(?im)^\s*(?:\d+[.)]|[-*])\s*(?:\*\*)?\[?"
-    r"(?P<severity>BLOCKING|HIGH|MEDIUM|LOW)\]?\*?\*?\s*"
-    r"(?:(?::|[-—])\s*)?(?P<location>`[^`\n]+`|[^:\n]+?)(?::(?P<line>\d+))?\s*[-—:]\s*"
-    r"(?P<problem>[^\n]+)"
+    r"(?P<severity>BLOCKING|CRITICAL|HIGH|MAJOR|MEDIUM|MINOR|LOW)\]?\*?\*?\s*"
+    r"(?::|[-—])?\s*(?P<rest>[^\n]+)"
 )
 _FIELD = re.compile(
     r"(?im)^\s*(?:[-*]\s*)?(?:fix|do instead|recommendation)\s*:\s*(?P<fix>[^\n]+)"
 )
 _CONTRACT = re.compile(
     r"(?im)^\s*(?:[-*]\s*)?(?:mutation contract|contract)\s*:\s*(?P<contract>[^\n]+)"
+)
+_LOCATION = re.compile(
+    r"^\s*(?P<location>`[^`\n]+`|\*\*[^*\n]+\*\*|[^\s—-]+?)"
+    r"(?::(?P<line>\d+))?\s*(?:[-—:]\s+)(?P<problem>.+?)\s*$"
 )
 _SHA = re.compile(
     r"(?i)\b(?:source[_ -]?sha|pinned[_ -]?sha|sha)\s*[:=]\s*([0-9a-f]{7,64})\b"
@@ -98,14 +106,24 @@ def _finding_from_mapping(value: Mapping[str, Any], source_sha: str | None) -> F
         line = int(line)
     if not isinstance(line, int) or isinstance(line, bool):
         line = None
-    path = str(value.get("path") or value.get("file") or "unknown")
+    path = str(
+        value.get("path")
+        or value.get("file")
+        or value.get("location")
+        or "unknown"
+    )
     problem = str(
         value.get("problem")
         or value.get("observed")
         or value.get("title")
         or "review finding"
     )
-    fix = str(value.get("fix") or value.get("do_instead") or "address the finding")
+    fix = str(
+        value.get("fix")
+        or value.get("do_instead")
+        or value.get("recommendation")
+        or "address the finding"
+    )
     contract = value.get("mutation_contract") or value.get("contract")
     return Finding(
         severity=str(value.get("severity") or "MEDIUM").upper(),
@@ -144,6 +162,8 @@ def parse_verdict(
                     return verdict_from_graph(value)
         return None
     state = header.group(1).upper()
+    if state in {"NEEDS FIXES", "NEEDS-FIXES", "NEEDS WORK", "NEEDS-WORK"}:
+        state = "NOT-MERGE-READY"
     sha_match = _SHA.search(text)
     verdict_sha = source_sha or (sha_match.group(1) if sha_match else None)
     findings: list[Finding] = []
@@ -154,19 +174,31 @@ def parse_verdict(
         entry = body[match.start() : end]
         fix_match = _FIELD.search(entry)
         contract_match = _CONTRACT.search(entry)
-        path = match.group("location").strip().strip("`")
-        line = int(match.group("line")) if match.group("line") else None
+        rest = match.group("rest").strip()
+        location_match = _LOCATION.match(rest)
+        if location_match is None:
+            continue
+        path = location_match.group("location").strip().strip("`*")
+        line = int(location_match.group("line")) if location_match.group("line") else None
         if line is None:
-            location_match = re.fullmatch(r"(.+):(\d+)", path)
-            if location_match:
-                path = location_match.group(1).strip()
-                line = int(location_match.group(2))
+            embedded_line = re.fullmatch(r"(.+):(\d+)", path)
+            if embedded_line:
+                path = embedded_line.group(1).strip()
+                line = int(embedded_line.group(2))
+        problem = location_match.group("problem").strip()
+        inline_fix = re.search(
+            r"\s+(?:fix|do instead|recommendation)\s*:\s*(?P<fix>.+)$",
+            problem,
+            re.IGNORECASE,
+        )
+        if inline_fix:
+            problem = problem[: inline_fix.start()].rstrip(" .")
         findings.append(
             Finding(
                 severity=match.group("severity").upper(),
                 path=path,
                 line=line,
-                problem=match.group("problem").strip(),
+                problem=problem,
                 fix=(
                     fix_match.group("fix") if fix_match else "address the finding"
                 ).strip(),
@@ -176,6 +208,17 @@ def parse_verdict(
                 source_sha=verdict_sha,
             )
         )
+        if inline_fix and not fix_match:
+            finding = findings[-1]
+            findings[-1] = Finding(
+                severity=finding.severity,
+                path=finding.path,
+                line=finding.line,
+                problem=finding.problem,
+                fix=inline_fix.group("fix").strip(),
+                mutation_contract=finding.mutation_contract,
+                source_sha=finding.source_sha,
+            )
     if not findings and header.group(2) not in {None, "0"} and fallback is not None:
         value = fallback(text)
         if isinstance(value, Mapping):
@@ -195,7 +238,12 @@ def verdict_from_graph(payload: Mapping[str, Any]) -> Verdict | None:
         "NO-GO",
     }:
         return None
-    source_sha = payload.get("sha")
+    source_sha = (
+        payload.get("sha")
+        or payload.get("source_sha")
+        or payload.get("head_sha")
+        or payload.get("pinned_sha")
+    )
     source_sha = source_sha if isinstance(source_sha, str) else None
     values = payload.get("findings")
     findings = (
@@ -346,6 +394,25 @@ class AutopilotStore:
             raise ValueError("invalid ticket")
         return self.root / f"{ticket}.json"
 
+    def lock_path(self, ticket: str) -> Path:
+        if not re.fullmatch(r"[A-Z0-9-]+", ticket):
+            raise ValueError("invalid ticket")
+        return self.root / f"{ticket}.lock"
+
+    @contextmanager
+    def lock(self, ticket: str):
+        """Serialize ticket state mutations across controller processes."""
+
+        with self._lock:
+            self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            handle = self.lock_path(ticket).open("a+")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
+
     def load(self, ticket: str) -> AutopilotState:
         try:
             value = json.loads(self.path(ticket).read_text(encoding="utf-8"))
@@ -361,7 +428,7 @@ class AutopilotStore:
         with self._lock:
             self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
             target = self.path(ticket)
-            temporary = target.with_name(f".{target.name}.tmp")
+            temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
             temporary.write_text(
                 json.dumps(state.to_dict(), ensure_ascii=False, separators=(",", ":")),
                 encoding="utf-8",
@@ -391,6 +458,14 @@ def _pr_number(value: str | None) -> int | None:
     if parsed.path.isdigit():
         return int(parsed.path)
     return int(value) if value.isdigit() else None
+
+
+def _sha_matches(verdict_sha: str | None, head_sha: str | None) -> bool:
+    if not verdict_sha or not head_sha:
+        return False
+    verdict = verdict_sha.lower()
+    head = head_sha.lower()
+    return verdict == head or head.startswith(verdict) or verdict.startswith(head)
 
 
 class AutopilotController:
@@ -426,39 +501,43 @@ class AutopilotController:
         self, ticket: str, *, henry_ack_required_for_merge: bool = False
     ) -> dict[str, Any]:
         ticket = ticket.upper()
-        current = self.store.load(ticket)
-        if current.halted and current.enabled:
-            # A hard halt cannot be restarted by a second enable call. The
-            # operator must disable and re-enable, making the reset explicit.
+        with self.store.lock(ticket):
+            current = self.store.load(ticket)
+            if current.halted and current.enabled:
+                # A hard halt cannot be restarted by a second enable call. The
+                # operator must disable and re-enable, making the reset explicit.
+                self.store.save(ticket, current)
+                return current.to_dict()
+            if current.halted:
+                current.halted = None
+            current.enabled = True
+            current.henry_ack_required_for_merge = henry_ack_required_for_merge
+            current.last_action_at_ns = time.time_ns()
             self.store.save(ticket, current)
             return current.to_dict()
-        if current.halted:
-            current.halted = None
-        current.enabled = True
-        current.henry_ack_required_for_merge = henry_ack_required_for_merge
-        current.last_action_at_ns = time.time_ns()
-        self.store.save(ticket, current)
-        return current.to_dict()
 
     def disable(self, ticket: str) -> dict[str, Any]:
         ticket = ticket.upper()
-        current = self.store.load(ticket)
-        current.enabled = False
-        current.merge_ack_at_ns = None
-        current.merge_ack_sha = None
-        current.last_action_at_ns = time.time_ns()
-        self.store.save(ticket, current)
-        return current.to_dict()
+        with self.store.lock(ticket):
+            current = self.store.load(ticket)
+            current.enabled = False
+            current.merge_ack_at_ns = None
+            current.merge_ack_sha = None
+            self._log(current, "manual-disable", {"halted": "manual-disable"})
+            current.last_action_at_ns = time.time_ns()
+            self.store.save(ticket, current)
+            return current.to_dict()
 
     def ack_merge(self, ticket: str) -> dict[str, Any]:
         ticket = ticket.upper()
-        current = self.store.load(ticket)
-        current.merge_ack_at_ns = time.time_ns()
-        current.last_action_at_ns = current.merge_ack_at_ns
-        status = self.status_reader(ticket)
-        current.merge_ack_sha = self._current_sha(ticket, status, {})
-        self.store.save(ticket, current)
-        return current.to_dict()
+        with self.store.lock(ticket):
+            current = self.store.load(ticket)
+            current.merge_ack_at_ns = time.time_ns()
+            current.last_action_at_ns = current.merge_ack_at_ns
+            status = self.status_reader(ticket)
+            current.merge_ack_sha = self._current_sha(ticket, status, {})
+            self.store.save(ticket, current)
+            return current.to_dict()
 
     def status(self, ticket: str | None = None) -> dict[str, Any]:
         values = self.store.list()
@@ -499,22 +578,23 @@ class AutopilotController:
         status_state: str,
         event: Mapping[str, Any],
     ) -> None:
-        state = self.store.load(ticket)
-        if not state.enabled or state.halted:
-            return
-        key = f"{agent_id}:{event.get('run_id')}:{status_state}:{event.get('status_mtime')}"
-        if state.last_event_key == key:
-            return
-        state.last_event_key = key
-        try:
-            if status_state == "merge-ready" and re.search(
-                r"-REVIEW[1-9][0-9]*$", agent_id.upper()
-            ):
-                await self._reviewer_ready(ticket, agent_id, event, state)
-            elif status_state == "merge-ready":
-                await self._implementer_ready(ticket, event, state)
-        finally:
-            self.store.save(ticket, state)
+        with self.store.lock(ticket):
+            state = self.store.load(ticket)
+            if not state.enabled or state.halted:
+                return
+            key = f"{agent_id}:{event.get('run_id')}:{status_state}:{event.get('status_mtime')}"
+            if state.last_event_key == key:
+                return
+            state.last_event_key = key
+            try:
+                if status_state == "merge-ready" and re.search(
+                    r"-REVIEW[1-9][0-9]*$", agent_id.upper()
+                ):
+                    await self._reviewer_ready(ticket, agent_id, event, state)
+                elif status_state == "merge-ready":
+                    await self._implementer_ready(ticket, event, state)
+            finally:
+                self.store.save(ticket, state)
 
     async def _reviewer_ready(
         self,
@@ -524,7 +604,15 @@ class AutopilotController:
         state: AutopilotState,
     ) -> None:
         graph = self.graph_loader(ticket)
-        verdict = self._latest_verdict(graph) if graph else None
+        current_reviewer = self._current_reviewer(graph)
+        if current_reviewer != reviewer:
+            self._log(
+                state,
+                "reviewer-verdict-ignored-stale-reviewer",
+                {"reviewer": reviewer, "current_reviewer": current_reviewer},
+            )
+            return
+        verdict = self._latest_verdict(graph, reviewer=reviewer) if graph else None
         if verdict is None:
             verdict = self._read_verdict_file(reviewer)
         if verdict is None:
@@ -532,6 +620,15 @@ class AutopilotController:
                 str(event.get("step") or ""), fallback=_anthropic_fallback
             )
         if verdict is None:
+            return
+        status = self.status_reader(ticket)
+        sha = self._current_sha(ticket, status, event)
+        if not _sha_matches(verdict.source_sha, sha):
+            self._log(
+                state,
+                "reviewer-verdict-blocked-sha-mismatch",
+                {"reviewer": reviewer, "verdict_sha": verdict.source_sha, "head_sha": sha},
+            )
             return
         self._log(state, "parsed-verdict", {"reviewer": reviewer, **verdict.to_dict()})
         if not verdict.clean:
@@ -544,6 +641,8 @@ class AutopilotController:
                     "reviewer": reviewer,
                     "target": ticket,
                     "source_sha": verdict.source_sha,
+                    "preview": message[:500],
+                    "finding_count": len(verdict.findings),
                 },
             )
             await self._invoke(self.archive, reviewer)
@@ -561,7 +660,21 @@ class AutopilotController:
     ) -> None:
         graph = self.graph_loader(ticket)
         loop = derive_loop_state(dict(graph)) if graph else None
-        verdict = self._latest_verdict(graph) if graph else None
+        current_reviewer = self._current_reviewer(graph)
+        verdict = (
+            self._latest_verdict(graph, reviewer=current_reviewer)
+            if graph and current_reviewer
+            else None
+        )
+        status = self.status_reader(ticket)
+        sha = self._current_sha(ticket, status, event)
+        if verdict is not None and not _sha_matches(verdict.source_sha, sha):
+            self._log(
+                state,
+                "implementer-verdict-blocked-sha-mismatch",
+                {"reviewer": current_reviewer, "verdict_sha": verdict.source_sha, "head_sha": sha},
+            )
+            verdict = None
         if loop and loop.round >= loop.cap and (verdict is None or not verdict.clean):
             self._halt(ticket, state, "iteration-cap")
             return
@@ -575,10 +688,8 @@ class AutopilotController:
         if verdict and verdict.clean:
             await self._maybe_merge(ticket, state, verdict)
             return
-        status = self.status_reader(ticket)
         pr = status.get("pr") if isinstance(status, Mapping) else None
         number = _pr_number(pr if isinstance(pr, str) else None)
-        sha = self._current_sha(ticket, status, event)
         orch = self._orchestrator(ticket, graph)
         if number is None or sha is None or orch is None:
             self._log(
@@ -595,7 +706,11 @@ class AutopilotController:
         self._log(
             state,
             "reviewer-spawned",
-            dict(result) if isinstance(result, Mapping) else {},
+            {
+                **(dict(result) if isinstance(result, Mapping) else {}),
+                "head_sha": sha,
+                "pr": pr,
+            },
         )
 
     async def _maybe_merge(
@@ -606,6 +721,13 @@ class AutopilotController:
         number = _pr_number(pr if isinstance(pr, str) else None)
         sha = self._current_sha(ticket, status, {})
         if number is None or not isinstance(sha, str):
+            return
+        if not _sha_matches(verdict.source_sha, sha):
+            self._log(
+                state,
+                "merge-blocked-verdict-sha",
+                {"verdict_sha": verdict.source_sha, "head_sha": sha},
+            )
             return
         if state.henry_ack_required_for_merge and (
             state.merge_ack_at_ns is None or state.merge_ack_sha != sha
@@ -625,14 +747,62 @@ class AutopilotController:
                 {"gate": dict(gate) if isinstance(gate, Mapping) else gate},
             )
             return
-        await self._invoke(self.merge, ticket)
-        self._log(state, "merged", {"pr": pr, "source_sha": verdict.source_sha})
+        await self._invoke(self.merge, ticket, sha)
+        self._log(
+            state,
+            "merged",
+            {"pr": pr, "source_sha": verdict.source_sha, "head_sha": sha},
+        )
 
     @staticmethod
     async def _invoke(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         return await asyncio.to_thread(function, *args, **kwargs)
 
-    def _latest_verdict(self, graph: Mapping[str, Any] | None) -> Verdict | None:
+    def _current_reviewer(self, graph: Mapping[str, Any] | None) -> str | None:
+        if not graph:
+            return None
+        nodes = {
+            str(node.get("id")): node
+            for node in graph.get("nodes", [])
+            if isinstance(node, Mapping) and isinstance(node.get("id"), str)
+        }
+        candidates: list[tuple[float, int, str]] = []
+        for index, edge in enumerate(graph.get("edges", [])):
+            if not isinstance(edge, Mapping) or edge.get("kind") != "spawn":
+                continue
+            payload = edge.get("payload")
+            target = nodes.get(str(edge.get("to")))
+            is_review = isinstance(payload, Mapping) and payload.get("role") == "review"
+            is_review = is_review or (
+                isinstance(target, Mapping) and target.get("kind") == "review"
+            )
+            if not is_review:
+                continue
+            reviewer = (
+                edge.get("to")
+                or (payload.get("ticket") if isinstance(payload, Mapping) else None)
+                or (target.get("worker_id") if isinstance(target, Mapping) else None)
+            )
+            if not isinstance(reviewer, str) or not re.search(
+                r"-REVIEW[1-9][0-9]*$", reviewer.upper()
+            ):
+                continue
+            created = edge.get("created_at")
+            try:
+                timestamp = datetime.fromisoformat(
+                    str(created).replace("Z", "+00:00")
+                ).timestamp()
+            except (TypeError, ValueError, OverflowError):
+                timestamp = float(index)
+            candidates.append((timestamp, index, reviewer))
+        return max(candidates)[2] if candidates else None
+
+    def _latest_verdict(
+        self,
+        graph: Mapping[str, Any] | None,
+        *,
+        reviewer: str | None = None,
+    ) -> Verdict | None:
         if not graph:
             return None
         for edge in reversed(graph.get("edges", [])):
@@ -640,6 +810,12 @@ class AutopilotController:
                 isinstance(edge, Mapping)
                 and edge.get("kind") == "verdict"
                 and isinstance(edge.get("payload"), Mapping)
+                and (
+                    reviewer is None
+                    or edge.get("from") == reviewer
+                    or edge["payload"].get("worker") == reviewer
+                    or edge["payload"].get("reviewer") == reviewer
+                )
             ):
                 return verdict_from_graph(edge["payload"])
         return None
@@ -706,12 +882,12 @@ class AutopilotController:
         now = time.time_ns()
         state.last_action_at_ns = now
         state.actions.append(
-            {"action": action, "at_ns": now, "source": "autopilot", **dict(details)}
+            {"action": action, "at_ns": now, **dict(details), "source": "autopilot"}
         )
 
     def _halt(self, ticket: str, state: AutopilotState, reason: str) -> None:
         state.halted = reason
-        self._log(state, f"halted-at-{reason}", {"ticket": ticket})
+        self._log(state, f"halted-at-{reason}", {"ticket": ticket, "halted": reason})
         orch = self._orchestrator(ticket, None)
         if orch:
             try:
@@ -770,10 +946,10 @@ class AutopilotController:
         return main.archive_agent(reviewer, main.AgentArchiveIn(outcome="closed"))
 
     @staticmethod
-    def _default_merge(ticket: str) -> Any:
+    def _default_merge(ticket: str, sha: str) -> Any:
         from .. import github_pr
 
-        return github_pr.merge_pr(ticket)
+        return github_pr.merge_pr(ticket, sha)
 
     @staticmethod
     def _default_notify(orch: str, message: str) -> Any:

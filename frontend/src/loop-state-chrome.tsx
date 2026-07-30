@@ -44,6 +44,60 @@ function verdictLabel(state: string | null | undefined): string {
   return state.toLowerCase();
 }
 
+function actionTime(atNs: number): string {
+  if (!Number.isFinite(atNs)) return "";
+  return new Date(atNs / 1_000_000).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function actionText(action: AutopilotState["actions"][number], key: string): string | null {
+  const value = action[key];
+  return typeof value === "string" || typeof value === "number" ? String(value) : null;
+}
+
+function ActionRow({ action }: { action: AutopilotState["actions"][number] }) {
+  const state = actionText(action, "state");
+  const findingCount = action["finding_count"];
+  const preview = actionText(action, "preview");
+  const halted = actionText(action, "halted");
+  const sha =
+    actionText(action, "head_sha") ??
+    actionText(action, "source_sha") ??
+    actionText(action, "expected_sha");
+  const detailParts = [
+    actionText(action, "reviewer"),
+    actionText(action, "target"),
+    actionText(action, "pr"),
+    sha ? `sha ${sha}` : null,
+  ].filter((value): value is string => Boolean(value));
+  return (
+    <div className="loop-autopilot-log-row">
+      <div className="loop-autopilot-log-main">
+        <div className="loop-autopilot-log-head">
+          <span>{action.action}</span>
+          <span className="loop-autopilot-log-time tabular-nums">{actionTime(action.at_ns)}</span>
+        </div>
+        {state ? (
+          <div className="loop-autopilot-log-summary">
+            verdict {state}
+            {typeof findingCount === "number" ? ` · ${findingCount} findings` : ""}
+          </div>
+        ) : null}
+        {preview ? <div className="loop-autopilot-log-preview">steer: {preview}</div> : null}
+        {detailParts.length > 0 ? (
+          <div className="loop-autopilot-log-details">{detailParts.join(" · ")}</div>
+        ) : null}
+        {halted ? (
+          <div className="loop-autopilot-log-halted">halted: {halted}</div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 function HistoryRow({ entry }: { entry: LoopStateHistoryEntry }) {
   const routedDelta = relativeMinutes(entry.verdict_at, entry.routed_at);
   const archivedDelta = relativeMinutes(entry.spawned_at, entry.archived_at);
@@ -204,11 +258,13 @@ export function LoopStateChrome({ ticket, tick }: Props) {
 
   const hasLoopHistory =
     state && (state.round > 0 || state.unrouted_verdict_count > 0);
+  const hasAutopilotLog = Boolean(autopilot?.actions?.length);
+  const hasDetails = Boolean(hasLoopHistory || hasAutopilotLog);
 
   return (
     <div className="loop-chrome" data-danger={state?.danger ?? "normal"}>
       <div className="loop-chrome-controls">
-        {state && hasLoopHistory ? (
+        {hasDetails ? (
           <button
             aria-expanded={open}
             aria-label={
@@ -219,7 +275,7 @@ export function LoopStateChrome({ ticket, tick }: Props) {
             type="button"
             onClick={() => setOpen((current) => !current)}
           >
-            {chips}
+            {state ? chips : <span className="loop-chrome-label">autopilot log</span>}
             <ChevronDown
               aria-hidden
               className={`loop-chrome-caret${open ? " is-open" : ""}`}
@@ -243,21 +299,23 @@ export function LoopStateChrome({ ticket, tick }: Props) {
           </button>
         ) : null}
       </div>
-      {open && state ? (
+      {open && (state || hasAutopilotLog) ? (
         <div className="loop-chrome-detail" ref={detailRef} role="dialog">
           <header className="loop-chrome-detail-head">
             <span className="loop-chrome-detail-title">merge-ready loop</span>
-            <span className="loop-chrome-detail-sub tabular-nums">
-              {state.round}/{state.cap} rounds
-              {state.plateau_length >= 2
-                ? ` · plateau ${state.plateau_length}`
-                : ""}
-              {state.unrouted_verdict_count > 0
-                ? ` · ${state.unrouted_verdict_count} unrouted`
-                : ""}
-            </span>
+            {state ? (
+              <span className="loop-chrome-detail-sub tabular-nums">
+                {state.round}/{state.cap} rounds
+                {state.plateau_length >= 2
+                  ? ` · plateau ${state.plateau_length}`
+                  : ""}
+                {state.unrouted_verdict_count > 0
+                  ? ` · ${state.unrouted_verdict_count} unrouted`
+                  : ""}
+              </span>
+            ) : null}
           </header>
-          {state.latest_verdict_finding ?? state.latest_verdict?.top_finding?.title ? (
+          {state && (state.latest_verdict_finding ?? state.latest_verdict?.top_finding?.title) ? (
             <div className="loop-chrome-latest">
               <span className="loop-chrome-latest-label">latest finding</span>
               <span className="loop-chrome-latest-title">
@@ -267,15 +325,15 @@ export function LoopStateChrome({ ticket, tick }: Props) {
               </span>
             </div>
           ) : null}
-          {state.history.length > 0 ? (
+          {state && state.history.length > 0 ? (
             <ol className="loop-history">
               {state.history.map((entry) => (
                 <HistoryRow entry={entry} key={`${entry.round}-${entry.reviewer ?? ""}`} />
               ))}
             </ol>
-          ) : (
+          ) : state ? (
             <div className="loop-chrome-empty">no rounds recorded yet</div>
-          )}
+          ) : null}
           {autopilot?.actions?.length ? (
             <div className="loop-autopilot-log">
               <div className="loop-chrome-latest-label">autopilot log</div>
@@ -283,13 +341,7 @@ export function LoopStateChrome({ ticket, tick }: Props) {
                 .slice(-5)
                 .reverse()
                 .map((action) => (
-                  <div
-                    className="loop-autopilot-log-row"
-                    key={`${action.at_ns}-${action.action}`}
-                  >
-                    <span>{action.action}</span>
-                    {action.halted ? <span>{String(action.halted)}</span> : null}
-                  </div>
+                  <ActionRow action={action} key={`${action.at_ns}-${action.action}`} />
                 ))}
             </div>
           ) : null}

@@ -10516,11 +10516,48 @@ textarea.composer-command-input {
 }
 
 .loop-autopilot-log-row {
+  display: block;
+  border-bottom: 1px solid color-mix(in srgb, var(--background-modifier-border) 60%, transparent);
+  padding: 6px 0;
+  color: var(--text-faint);
+  font-size: var(--fs-2xs);
+}
+
+.loop-autopilot-log-row:last-child {
+  border-bottom: 0;
+}
+
+.loop-autopilot-log-head,
+.loop-autopilot-log-details {
   display: flex;
   justify-content: space-between;
   gap: 8px;
+}
+
+.loop-autopilot-log-time,
+.loop-autopilot-log-details {
   color: var(--text-faint);
-  font-size: var(--fs-2xs);
+}
+
+.loop-autopilot-log-summary,
+.loop-autopilot-log-preview,
+.loop-autopilot-log-halted {
+  margin-top: 3px;
+  overflow-wrap: anywhere;
+}
+
+.loop-autopilot-log-summary {
+  color: var(--text-normal);
+}
+
+.loop-autopilot-log-preview {
+  max-height: 3.2em;
+  overflow: hidden;
+  color: var(--text-muted);
+}
+
+.loop-autopilot-log-halted {
+  color: var(--text-error);
 }
 
 .dashboard-autopilot-card {
