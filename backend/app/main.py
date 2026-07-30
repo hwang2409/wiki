@@ -2033,7 +2033,10 @@ async def palette_search(
     request: Request,
     q: str = "",
     limit: int = palette.DEFAULT_LIMIT,
+    mode: str = "lexical",
 ) -> dict[str, object]:
+    if mode not in {"lexical", "semantic"}:
+        raise HTTPException(status_code=422, detail="mode must be lexical or semantic")
     agents_payload = agents()
 
     # Palette walk (session index + vault stat + artifact scan) runs in the
@@ -2074,7 +2077,95 @@ async def palette_search(
             await watcher
         except asyncio.CancelledError:
             pass
-    return {"results": results}
+    if mode == "lexical":
+        return {"mode": mode, "results": results}
+
+    def _semantic() -> dict[str, object]:
+        index = knowledge.KnowledgeIndex.from_env(
+            runtime_dir=RuntimePaths.from_env().runtime_dir,
+            archive_dir=AGENT_ARCHIVE_DIR,
+            vault_dir=VAULT_DIR,
+        )
+        try:
+            payload = index.search_semantic(q, limit=limit)
+        except knowledge.KnowledgeQueryError:
+            return {
+                "results": [],
+                "semantic": index.semantic_status(),
+                "rebuilding": index.rebuilding,
+                "stale": True,
+            }
+        except knowledge.KnowledgeError as exc:
+            logger.warning("semantic palette search unavailable: %s", exc)
+            return {
+                "results": [],
+                "semantic": {
+                    "available": False,
+                    "model": None,
+                    "reason": f"semantic search unavailable: {exc}",
+                },
+                "rebuilding": True,
+                "stale": True,
+            }
+        return payload
+
+    semantic = await asyncio.to_thread(_semantic)
+    semantic_status = semantic.get("semantic")
+    semantic_is_available = bool(
+        isinstance(semantic_status, dict) and semantic_status.get("available")
+    )
+    semantic_results = [
+        {
+            "kind": "note",
+            "id": f"semantic:{row['path']}",
+            "title": row.get("title") or row["path"],
+            "subtitle": row.get("snippet") or row["path"],
+            "url": f"#/note/{row['path']}",
+            "updated_at": None,
+            "score": row.get("score", 0),
+        }
+        for row in semantic.get("semantic_results", semantic.get("results", []))
+        if isinstance(row, dict) and isinstance(row.get("path"), str)
+    ] if semantic_is_available else []
+    return {
+        "mode": mode,
+        "results": results,
+        "lexical_results": results,
+        "semantic_results": semantic_results,
+        "semantic_available": semantic_is_available,
+        "semantic_unavailable_reason": (
+            semantic_status.get("reason")
+            if isinstance(semantic_status, dict)
+            else "semantic search unavailable"
+        ),
+        "rebuilding": semantic.get("rebuilding", False),
+        "stale": semantic.get("stale", False),
+    }
+
+
+@app.get("/api/knowledge/search")
+async def knowledge_search(
+    q: str,
+    mode: str = "lexical",
+    ticket: str | None = None,
+    kind: str | None = None,
+    limit: int = 20,
+) -> dict[str, object]:
+    if mode not in {"lexical", "semantic"}:
+        raise HTTPException(status_code=422, detail="mode must be lexical or semantic")
+
+    def _run() -> dict[str, object]:
+        index = knowledge.KnowledgeIndex.from_env()
+        if mode == "semantic":
+            return index.search_semantic(q, ticket=ticket, limit=limit)
+        return index.search(q, ticket=ticket, kind=kind, limit=limit)
+
+    try:
+        return await asyncio.to_thread(_run)
+    except knowledge.KnowledgeQueryError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except knowledge.KnowledgeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @app.get("/api/agents/{ticket}/pr")

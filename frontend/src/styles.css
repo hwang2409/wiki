@@ -2262,6 +2262,43 @@ body.is-resizing-panes .pane-cell {
   font-size: var(--font-text-size);
 }
 
+.command-palette-mode {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 12px 0;
+  color: var(--text-faint);
+  font-size: var(--font-ui-smaller);
+}
+
+.command-palette-mode-label {
+  margin-right: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.command-palette-mode-button {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  padding: 3px 8px;
+  color: var(--text-faint);
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+}
+
+.command-palette-mode-button:hover,
+.command-palette-mode-button.is-selected {
+  border-color: var(--interactive-accent);
+  color: var(--text-normal);
+}
+
+.command-palette-status {
+  padding: 6px 12px;
+  color: var(--text-warning, var(--text-faint));
+  font-size: var(--font-ui-smaller);
+}
+
 .command-palette-result {
   display: grid;
   grid-template-columns: 16px minmax(0, auto) minmax(0, 1fr) auto;

@@ -36,6 +36,8 @@ from .knowledge_schema import (
     is_corruption_error as _corruption_error,
     reset_schema,
 )
+from .semantic_index import SemanticIndex, SemanticNote
+from .semantic_search import EmbeddingProvider
 
 
 LOGGER = logging.getLogger(__name__)
@@ -43,6 +45,9 @@ MAX_SEARCH_LIMIT = 100
 FTS_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 _PATH_LOCKS: dict[str, threading.RLock] = {}
 _PATH_LOCKS_GUARD = threading.Lock()
+_REFRESH_GATES: dict[str, threading.Lock] = {}
+_REFRESH_GATES_GUARD = threading.Lock()
+_DEFAULT_PROVIDER = object()
 
 
 class KnowledgeError(RuntimeError):
@@ -77,6 +82,9 @@ class IngestStats:
     base64_blob_lines_skipped: int = 0
     ansi_heavy_lines_skipped: int = 0
     legacy_runs_skipped: int = 0
+    embeddings_indexed: int = 0
+    embeddings_skipped: int = 0
+    semantic_unavailable: int = 0
     elapsed_seconds: float = 0.0
 
     def merge(self, other: IngestStats) -> None:
@@ -95,6 +103,9 @@ class IngestStats:
             "base64_blob_lines_skipped",
             "ansi_heavy_lines_skipped",
             "legacy_runs_skipped",
+            "embeddings_indexed",
+            "embeddings_skipped",
+            "semantic_unavailable",
         ):
             setattr(self, field, getattr(self, field) + getattr(other, field))
 
@@ -177,10 +188,44 @@ def _path_lock(path: Path) -> threading.RLock:
         return _PATH_LOCKS.setdefault(key, threading.RLock())
 
 
+def _refresh_gate(path: Path) -> threading.Lock:
+    key = str(path.absolute())
+    with _REFRESH_GATES_GUARD:
+        return _REFRESH_GATES.setdefault(key, threading.Lock())
+
+
 class KnowledgeIndex:
-    def __init__(self, paths: KnowledgePaths):
+    def __init__(
+        self,
+        paths: KnowledgePaths,
+        embedding_provider: EmbeddingProvider | None | object = _DEFAULT_PROVIDER,
+        *,
+        provider_env: Mapping[str, str] | None = None,
+    ):
         self.paths = paths
         self._lock = _path_lock(paths.db_path)
+        lexical_fallback = lambda query, ticket, limit: self.search(
+            query,
+            ticket=ticket,
+            kind="note",
+            limit=limit,
+        )["results"]
+        if embedding_provider is _DEFAULT_PROVIDER:
+            self.semantic_index = SemanticIndex(
+                paths.db_path,
+                env=provider_env,
+                lexical_fallback=lexical_fallback,
+                query_error=KnowledgeQueryError,
+            )
+        else:
+            self.semantic_index = SemanticIndex(
+                paths.db_path,
+                embedding_provider=embedding_provider,
+                lexical_fallback=lexical_fallback,
+                query_error=KnowledgeQueryError,
+            )
+        self.semantic_status = self.semantic_index.status
+        self.search_semantic = self.semantic_index.search_with_fallback
 
     @classmethod
     def from_env(
@@ -188,7 +233,11 @@ class KnowledgeIndex:
         env: Mapping[str, str] | None = None,
         **overrides: Path | str | None,
     ) -> KnowledgeIndex:
-        return cls(KnowledgePaths.from_env(env, **overrides))
+        values = os.environ if env is None else env
+        return cls(
+            KnowledgePaths.from_env(values, **overrides),
+            provider_env=values,
+        )
 
     @property
     def rebuild_marker(self) -> Path:
@@ -502,6 +551,22 @@ class KnowledgeIndex:
                             ),
                         )
                         stats.links_indexed += 1
+            semantic_stats = self.semantic_index.refresh(
+                [
+                    SemanticNote(
+                        path=rel,
+                            content_hash=details[rel][1],
+                            title=extract_title(contents[rel], rel),
+                            text=contents[rel][:120_000],
+                            snippet=contents[rel][:500],
+                        ticket=ticket_for_note(rel, contents[rel]),
+                    )
+                    for rel in sorted(contents)
+                ]
+            )
+            stats.embeddings_indexed += semantic_stats.embeddings_indexed
+            stats.embeddings_skipped += semantic_stats.embeddings_skipped
+            stats.semantic_unavailable += semantic_stats.semantic_unavailable
             return stats
         except (OSError, sqlite3.Error) as exc:
             if isinstance(exc, sqlite3.Error) and _corruption_error(exc):
@@ -654,7 +719,12 @@ class KnowledgeIndex:
         stats.elapsed_seconds = time.perf_counter() - started
         return stats
 
-    def rebuild(self, *, include_legacy_archives: bool | None = None) -> IngestStats:
+    def rebuild(
+        self,
+        *,
+        include_legacy_archives: bool | None = None,
+        explicit: bool = True,
+    ) -> IngestStats:
         """Drop derived data and deterministically restore it from source files."""
 
         started = time.perf_counter()
@@ -666,6 +736,8 @@ class KnowledgeIndex:
                 reset_schema(connection)
             finally:
                 connection.close()
+        if explicit:
+            self.semantic_index.reset_for_explicit_rebuild()
         stats = IngestStats()
         try:
             stats.merge(self.scan_vault())
@@ -683,11 +755,17 @@ class KnowledgeIndex:
     def refresh_all(self) -> IngestStats:
         """Run a startup/requested delta refresh, rebuilding on schema reset."""
 
+        with _refresh_gate(self.paths.db_path):
+            return self._refresh_all()
+
+    def _refresh_all(self) -> IngestStats:
+        """Run one serialized refresh pass."""
+
         refresh_mtime = self._refresh_request_mtime()
         connection, needs_rebuild = self._prepare()
         connection.close()
         if needs_rebuild or self.rebuilding:
-            return self.rebuild()
+            return self.rebuild(explicit=False)
         started = time.perf_counter()
         stats = IngestStats()
         stats.merge(self.scan_vault())
@@ -930,7 +1008,14 @@ class KnowledgeIndex:
         try:
             return {
                 table: int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
-                for table in ("notes", "chunks", "chunks_fts", "links", "runs", "events")
+                for table in (
+                    "notes",
+                    "chunks",
+                    "chunks_fts",
+                    "links",
+                    "runs",
+                    "events",
+                )
             }
         finally:
             connection.close()

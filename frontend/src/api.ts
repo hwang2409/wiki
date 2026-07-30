@@ -58,9 +58,25 @@ export type PaletteResult = {
   ticket?: string;
 };
 
-export function searchPalette(query: string, limit = 30, signal?: AbortSignal) {
-  const params = new URLSearchParams({ q: query, limit: String(limit) });
-  return request<{ results: PaletteResult[] }>(`/api/palette/search?${params}`, {
+export type PaletteSearchMode = "lexical" | "semantic";
+
+export type PaletteSearchResponse = {
+  mode?: PaletteSearchMode;
+  results: PaletteResult[];
+  lexical_results?: PaletteResult[];
+  semantic_results?: PaletteResult[];
+  semantic_available?: boolean;
+  semantic_unavailable_reason?: string | null;
+};
+
+export function searchPalette(
+  query: string,
+  limit = 30,
+  signal?: AbortSignal,
+  mode: PaletteSearchMode = "lexical",
+) {
+  const params = new URLSearchParams({ q: query, limit: String(limit), mode });
+  return request<PaletteSearchResponse>(`/api/palette/search?${params}`, {
     signal,
   });
 }
