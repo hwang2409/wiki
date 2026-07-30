@@ -1,6 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowDown, ArrowUp, ChevronDown, X } from "lucide-react";
-import { getDashboardTickets, type DashboardTicket } from "./api";
+import {
+  getAutopilotFleetStatus,
+  getDashboardTickets,
+  type AutopilotFleetStatus,
+  type DashboardTicket,
+} from "./api";
 import {
   collectProjects,
   collectStates,
@@ -19,6 +24,28 @@ import { formatRelative } from "./timestamp-format";
 
 const REFRESH_INTERVAL_MS = 15_000;
 const FILTERS_STORAGE_KEY = "wiki-dashboard-filters";
+
+function AutopilotDashboardCard() {
+  const [status, setStatus] = useState<AutopilotFleetStatus | null>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    getAutopilotFleetStatus(controller.signal)
+      .then(setStatus)
+      .catch(() => undefined);
+    return () => controller.abort();
+  }, []);
+
+  if (!status || typeof status.enabled !== "number") return null;
+  return (
+    <div className="dashboard-autopilot-card" data-testid="autopilot-dashboard-card">
+      <span className="dashboard-autopilot-title">autopilot</span>
+      <span>{status.enabled} on</span>
+      <span>{status.actions_last_hour} actions / 1h</span>
+      <span>{status.halted} halted</span>
+    </div>
+  );
+}
 
 const STATUS_STATE: Record<string, string> = {
   implementing: "working",
@@ -167,6 +194,7 @@ export function DashboardView({
           />
         ) : null}
       </div>
+      <AutopilotDashboardCard />
       {error ? <div className="dashboard-error">{error}</div> : null}
       {tickets && tickets.length === 0 ? (
         <div className="dashboard-empty">No tickets with workers or PRs yet.</div>

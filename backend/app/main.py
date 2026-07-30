@@ -3420,6 +3420,8 @@ class MessageIn(BaseModel):
         max_length=64,
         pattern=r"^[A-Za-z0-9_.:-]+$",
     )
+    findings: list[dict[str, Any]] | None = None
+    constraint_bundle: str | None = Field(default=None, max_length=4000)
 
 
 class AgentRespondIn(BaseModel):
@@ -3483,6 +3485,10 @@ class SpawnOrchestratorIn(BaseModel):
 
 class AgentArchiveIn(BaseModel):
     outcome: str = Field(pattern="^(merged|closed|abandoned)$")
+
+
+class AutopilotEnableIn(BaseModel):
+    henry_ack_required_for_merge: bool = False
 
 
 def _allowed_model_message(kind: str, model: str, *, target: str) -> str:
@@ -4091,6 +4097,56 @@ def next_review_route(body: NextReviewIn) -> dict[str, Any]:
     )
 
 
+@app.post("/api/autopilot/{ticket}/enable")
+def autopilot_enable_route(ticket: str, body: AutopilotEnableIn | None = None) -> dict[str, Any]:
+    from .agent_runtime.autopilot import AutopilotController
+
+    try:
+        return AutopilotController(notify=AutopilotController.live_notify).enable(
+            ticket,
+            henry_ack_required_for_merge=(body.henry_ack_required_for_merge if body else False),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/autopilot/{ticket}/disable")
+def autopilot_disable_route(ticket: str) -> dict[str, Any]:
+    from .agent_runtime.autopilot import AutopilotController
+
+    try:
+        return AutopilotController(notify=AutopilotController.live_notify).disable(ticket)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/autopilot/{ticket}/ack-merge")
+def autopilot_ack_merge_route(ticket: str) -> dict[str, Any]:
+    from .agent_runtime.autopilot import AutopilotController
+
+    try:
+        return AutopilotController(notify=AutopilotController.live_notify).ack_merge(ticket)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/autopilot")
+def autopilot_status_route() -> dict[str, Any]:
+    from .agent_runtime.autopilot import AutopilotController
+
+    return AutopilotController(notify=AutopilotController.live_notify).status()
+
+
+@app.get("/api/autopilot/{ticket}")
+def autopilot_ticket_status_route(ticket: str) -> dict[str, Any]:
+    from .agent_runtime.autopilot import AutopilotController
+
+    try:
+        return AutopilotController(notify=AutopilotController.live_notify).status(ticket)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 def spawn_orchestrator(
     body: dict[str, Any] | SpawnOrchestratorIn,
     *,
@@ -4691,6 +4747,8 @@ def agent_message(ticket: str, body: MessageIn, background: BackgroundTasks) -> 
                 source=body.source,
                 request_id=body.request_id,
                 status_dir=AGENT_STATUS_DIR,
+                findings=body.findings,
+                constraint_bundle=body.constraint_bundle,
             )
         return dict(result)
     del background

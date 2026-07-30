@@ -28,7 +28,10 @@ from .types import LifecycleState, RunRecord, TERMINAL_STATES
 
 
 SendNow = Callable[[str, str, str | None, str | None], Awaitable[Any]]
+TransitionHook = Callable[[dict[str, Any]], Awaitable[Any]]
 FLEET_MONITOR_SOURCE = "fleet-monitor"
+
+__all__ = ["FleetMonitor", "Notification", "base_ticket"]
 
 
 DEFAULT_INTERVAL_SECONDS = 15.0
@@ -85,6 +88,7 @@ class _WorkerView:
     step: str | None
     blocker: str | None
     status_mtime: float | None
+    verdict_path: str | None = None
 
 
 def _read_status_file(path) -> tuple[dict[str, Any] | None, float | None]:
@@ -154,6 +158,7 @@ class FleetMonitor:
         send_timeout: float = DEFAULT_SEND_TIMEOUT_SECONDS,
         max_concurrent_sends: int = DEFAULT_MAX_CONCURRENT_SENDS,
         ownership_lock: Callable[[str], asyncio.Lock] | None = None,
+        on_transition: TransitionHook | None = None,
     ):
         self.store = store
         self.send_now = send_now
@@ -181,6 +186,7 @@ class FleetMonitor:
         self.send_timeout = send_timeout
         self.max_concurrent_sends = max_concurrent_sends
         self.ownership_lock = ownership_lock
+        self.on_transition = on_transition
         self._instance_id = uuid4().hex[:12]
         self._snapshots: dict[str, _WorkerSnapshot] = {}
         self._graph_health = GraphHealthMonitor(
@@ -292,6 +298,7 @@ class FleetMonitor:
                         pr=None,
                         step=None,
                         blocker=None,
+                        verdict_path=None,
                         status_mtime=mtime,
                     )
                 )
@@ -303,6 +310,9 @@ class FleetMonitor:
                     pr=_string_or_none(status_data.get("pr")),
                     step=_string_or_none(status_data.get("step")),
                     blocker=_string_or_none(status_data.get("blocker")),
+                    verdict_path=_string_or_none(
+                        status_data.get("verdict_path") or status_data.get("artifact_path")
+                    ),
                     status_mtime=mtime,
                 )
             )
@@ -353,7 +363,35 @@ class FleetMonitor:
                 )
                 if notif is not None:
                     results.append(notif)
-                if notif is not None or self._dedupe_was_sent(view, dedupe_key):
+                observer_succeeded = notif is not None or self._dedupe_was_sent(
+                    view, dedupe_key
+                )
+                # Autopilot is a control path, not observer telemetry. Run it
+                # even when delivery to the orchestrator fails.
+                hook_succeeded = True
+                if self.on_transition is not None:
+                    try:
+                        hook_result = await self.on_transition(
+                            {
+                                "agent_id": record.agent_id,
+                                "run_id": record.run_id,
+                                "status_state": view.status_state,
+                                "previous_status_state": snapshot.status_state,
+                                "status_mtime": view.status_mtime,
+                                "step": view.step,
+                                "pr": view.pr,
+                                "verdict_path": view.verdict_path,
+                                "orch": record.orchestrator_id,
+                            }
+                        )
+                        hook_succeeded = hook_result is not False
+                    except Exception:
+                        hook_succeeded = False
+                        logger.exception(
+                            "fleet_monitor: transition hook failed for %s",
+                            record.agent_id,
+                        )
+                if observer_succeeded and hook_succeeded:
                     snapshot.status_state = current_status_state[0]
                     snapshot.pending_status_state = None
                     snapshot.pending_status_dedupe_key = None

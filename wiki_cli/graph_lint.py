@@ -223,6 +223,8 @@ def compose_steer_document(
     source_worker: str = "supervisor-steer",
     request_id: str = "",
     created_at: str | None = None,
+    findings: list[dict[str, Any]] | None = None,
+    constraint_bundle: str | None = None,
 ) -> dict[str, Any]:
     """Represent a legacy free-form steer as a schema-valid Steer document.
 
@@ -231,10 +233,10 @@ def compose_steer_document(
     """
     timestamp = created_at or datetime.now(timezone.utc).isoformat(timespec="seconds")
     digest = hashlib.sha256(f"{request_id}\0{message}".encode()).hexdigest()
-    return {
+    document = {
         "target_worker": target_worker,
         "mode": mode,
-        "findings": [
+        "findings": findings or [
             {
                 "id": f"F-{digest[:6]}",
                 "severity": "INFO",
@@ -251,6 +253,9 @@ def compose_steer_document(
         "preamble": message.splitlines()[0][:140],
         "created_at": timestamp,
     }
+    if constraint_bundle:
+        document["constraint_bundle"] = constraint_bundle
+    return document
 
 
 def validate_document(document: Any, schema_name: str) -> list[tuple[str, str]]:

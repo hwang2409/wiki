@@ -1,6 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, ChevronDown, Repeat } from "lucide-react";
-import { getAgentWorkgraph, type LoopState, type LoopStateHistoryEntry } from "./api";
+import { AlertTriangle, ChevronDown, Power, Repeat } from "lucide-react";
+import {
+  getAgentWorkgraph,
+  getAutopilotStatus,
+  setAutopilotEnabled,
+  type AutopilotState,
+  type LoopState,
+  type LoopStateHistoryEntry,
+} from "./api";
 
 type Props = {
   ticket: string;
@@ -35,6 +42,63 @@ function verdictClass(state: string | null | undefined): string {
 function verdictLabel(state: string | null | undefined): string {
   if (!state) return "—";
   return state.toLowerCase();
+}
+
+function actionTime(atNs: number): string {
+  if (!Number.isFinite(atNs)) return "";
+  return new Date(atNs / 1_000_000).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function actionText(action: AutopilotState["actions"][number], key: string): string | null {
+  const value = action[key];
+  return typeof value === "string" || typeof value === "number" ? String(value) : null;
+}
+
+function ActionRow({ action }: { action: AutopilotState["actions"][number] }) {
+  const state = actionText(action, "state");
+  const findings = action["findings"];
+  const findingCount = Array.isArray(findings)
+    ? findings.length
+    : action["finding_count"];
+  const preview = actionText(action, "preview");
+  const halted = actionText(action, "halted");
+  const sha =
+    actionText(action, "head_sha") ??
+    actionText(action, "source_sha") ??
+    actionText(action, "expected_sha");
+  const detailParts = [
+    actionText(action, "reviewer"),
+    actionText(action, "target"),
+    actionText(action, "pr"),
+    sha ? `sha ${sha}` : null,
+  ].filter((value): value is string => Boolean(value));
+  return (
+    <div className="loop-autopilot-log-row">
+      <div className="loop-autopilot-log-main">
+        <div className="loop-autopilot-log-head">
+          <span>{action.action}</span>
+          <span className="loop-autopilot-log-time tabular-nums">{actionTime(action.at_ns)}</span>
+        </div>
+        {state ? (
+          <div className="loop-autopilot-log-summary">
+            verdict {state}
+            {typeof findingCount === "number" ? ` · ${findingCount} findings` : ""}
+          </div>
+        ) : null}
+        {preview ? <div className="loop-autopilot-log-preview">steer: {preview}</div> : null}
+        {detailParts.length > 0 ? (
+          <div className="loop-autopilot-log-details">{detailParts.join(" · ")}</div>
+        ) : null}
+        {halted ? (
+          <div className="loop-autopilot-log-halted">halted: {halted}</div>
+        ) : null}
+      </div>
+    </div>
+  );
 }
 
 function HistoryRow({ entry }: { entry: LoopStateHistoryEntry }) {
@@ -84,6 +148,7 @@ function HistoryRow({ entry }: { entry: LoopStateHistoryEntry }) {
 
 export function LoopStateChrome({ ticket, tick }: Props) {
   const [state, setState] = useState<LoopState | null>(null);
+  const [autopilot, setAutopilot] = useState<AutopilotState | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [open, setOpen] = useState(false);
   const detailRef = useRef<HTMLDivElement | null>(null);
@@ -91,6 +156,7 @@ export function LoopStateChrome({ ticket, tick }: Props) {
 
   useEffect(() => {
     setState(null);
+    setAutopilot(null);
     setLoaded(false);
     setOpen(false);
   }, [ticket]);
@@ -106,8 +172,15 @@ export function LoopStateChrome({ ticket, tick }: Props) {
       .catch(() => {
         if (cancelled) return;
         setState(null);
+        setAutopilot(null);
         setLoaded(true);
       });
+    getAutopilotStatus(ticket)
+      .then((data) => {
+        if (cancelled) return;
+        setAutopilot(typeof data.enabled === "boolean" ? data : null);
+      })
+      .catch(() => undefined);
     return () => {
       cancelled = true;
     };
@@ -182,44 +255,70 @@ export function LoopStateChrome({ ticket, tick }: Props) {
   }, [state]);
 
   if (!loaded) return null;
-  if (!state || (state.round === 0 && state.unrouted_verdict_count === 0)) {
+  if (!state && !autopilot) {
     return null;
   }
 
+  const hasLoopHistory =
+    state && (state.round > 0 || state.unrouted_verdict_count > 0);
+  const hasAutopilotLog = Boolean(autopilot?.actions?.length);
+  const hasDetails = Boolean(hasLoopHistory || hasAutopilotLog);
+
   return (
-    <div className="loop-chrome" data-danger={state.danger}>
-      <button
-        aria-expanded={open}
-        aria-label={
-          open ? "Hide merge-ready loop history" : "Show merge-ready loop history"
-        }
-        className={`loop-chrome-trigger${open ? " is-open" : ""}`}
-        ref={triggerRef}
-        type="button"
-        onClick={() => setOpen((current) => !current)}
-      >
-        {chips}
-        <ChevronDown
-          aria-hidden
-          className={`loop-chrome-caret${open ? " is-open" : ""}`}
-          size={12}
-        />
-      </button>
-      {open ? (
+    <div className="loop-chrome" data-danger={state?.danger ?? "normal"}>
+      <div className="loop-chrome-controls">
+        {hasDetails ? (
+          <button
+            aria-expanded={open}
+            aria-label={
+              open ? "Hide merge-ready loop history" : "Show merge-ready loop history"
+            }
+            className={`loop-chrome-trigger${open ? " is-open" : ""}`}
+            ref={triggerRef}
+            type="button"
+            onClick={() => setOpen((current) => !current)}
+          >
+            {state ? chips : <span className="loop-chrome-label">autopilot log</span>}
+            <ChevronDown
+              aria-hidden
+              className={`loop-chrome-caret${open ? " is-open" : ""}`}
+              size={12}
+            />
+          </button>
+        ) : null}
+        {autopilot ? (
+          <button
+            aria-pressed={autopilot.enabled}
+            className={`loop-autopilot-toggle${autopilot.enabled ? " is-on" : ""}`}
+            type="button"
+            onClick={() => {
+              void setAutopilotEnabled(ticket, !autopilot.enabled)
+                .then(setAutopilot)
+                .catch(() => undefined);
+            }}
+          >
+            <Power aria-hidden size={12} />
+            autopilot {autopilot.enabled ? "on" : "off"}
+          </button>
+        ) : null}
+      </div>
+      {open && (state || hasAutopilotLog) ? (
         <div className="loop-chrome-detail" ref={detailRef} role="dialog">
           <header className="loop-chrome-detail-head">
             <span className="loop-chrome-detail-title">merge-ready loop</span>
-            <span className="loop-chrome-detail-sub tabular-nums">
-              {state.round}/{state.cap} rounds
-              {state.plateau_length >= 2
-                ? ` · plateau ${state.plateau_length}`
-                : ""}
-              {state.unrouted_verdict_count > 0
-                ? ` · ${state.unrouted_verdict_count} unrouted`
-                : ""}
-            </span>
+            {state ? (
+              <span className="loop-chrome-detail-sub tabular-nums">
+                {state.round}/{state.cap} rounds
+                {state.plateau_length >= 2
+                  ? ` · plateau ${state.plateau_length}`
+                  : ""}
+                {state.unrouted_verdict_count > 0
+                  ? ` · ${state.unrouted_verdict_count} unrouted`
+                  : ""}
+              </span>
+            ) : null}
           </header>
-          {state.latest_verdict_finding ?? state.latest_verdict?.top_finding?.title ? (
+          {state && (state.latest_verdict_finding ?? state.latest_verdict?.top_finding?.title) ? (
             <div className="loop-chrome-latest">
               <span className="loop-chrome-latest-label">latest finding</span>
               <span className="loop-chrome-latest-title">
@@ -229,15 +328,26 @@ export function LoopStateChrome({ ticket, tick }: Props) {
               </span>
             </div>
           ) : null}
-          {state.history.length > 0 ? (
+          {state && state.history.length > 0 ? (
             <ol className="loop-history">
               {state.history.map((entry) => (
                 <HistoryRow entry={entry} key={`${entry.round}-${entry.reviewer ?? ""}`} />
               ))}
             </ol>
-          ) : (
+          ) : state ? (
             <div className="loop-chrome-empty">no rounds recorded yet</div>
-          )}
+          ) : null}
+          {autopilot?.actions?.length ? (
+            <div className="loop-autopilot-log">
+              <div className="loop-chrome-latest-label">autopilot log</div>
+              {autopilot.actions
+                .slice(-5)
+                .reverse()
+                .map((action) => (
+                  <ActionRow action={action} key={`${action.at_ns}-${action.action}`} />
+                ))}
+            </div>
+          ) : null}
         </div>
       ) : null}
     </div>
