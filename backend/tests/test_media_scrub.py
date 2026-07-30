@@ -1615,6 +1615,289 @@ class Mp4Round8SurvivorProbes(unittest.TestCase):
             media_scrub.scrub_video(bytes(payload), "video/mp4")
 
 
+class Mp4Round9SurvivorProbes(unittest.TestCase):
+    """Round-9 review found four byte-smuggling / DoS paths:
+      1. SPS/PPS NAL bodies inside avcC were copied verbatim after
+         length checks. R9 canonicalises each NAL via a full RBSP
+         parse+re-encode; a marker byte inside a declared NAL either
+         fails parsing (rejected) or is clobbered by canonical emission.
+      2. stbl table fullbox flags (3 bytes each) were captured then
+         re-emitted verbatim, so attacker bytes rode through per table.
+         R9 requires canonical zero flags and rejects anything else.
+      3. stbl accepted duplicate singleton tables (multiple stss/stco/
+         ...), stacking many empty tables each smuggling flag bytes.
+         R9 tracks seen types and rejects duplicates.
+      4. Large stsz tables materialised millions of Python ints. R9
+         validates the declared length and splices the entry payload
+         verbatim (fixed-size big-endian, no room for non-canonical
+         variation), keeping RSS bounded to the input size."""
+
+    @staticmethod
+    def _grow_ancestors(payload: bytearray, child_pos: int,
+                        parents: tuple[bytes, ...], added: int) -> None:
+        for parent in parents:
+            pos = payload.rfind(parent, 0, child_pos)
+            existing = struct.unpack(">I", bytes(payload[pos - 4:pos]))[0]
+            payload[pos - 4:pos] = struct.pack(">I", existing + added)
+
+    @staticmethod
+    def _sps_slice(mp4: bytes) -> tuple[int, int]:
+        """Return (sps_body_start, sps_body_end) for the first SPS in the
+        real fixture's avcC. avcC body layout: version(1) profile(1)
+        compat(1) level(1) lsm(1) num_sps(1) then per-SPS length(u16)+
+        NAL bytes."""
+        avcc_pos = mp4.find(b"avcC")
+        assert avcc_pos > 0
+        # avcC body starts after 4-byte size + 4-byte type header.
+        body_start = avcc_pos + 4
+        sps_len = struct.unpack(">H", mp4[body_start + 6:body_start + 8])[0]
+        sps_start = body_start + 8
+        return sps_start, sps_start + sps_len
+
+    @staticmethod
+    def _pps_slice(mp4: bytes) -> tuple[int, int]:
+        avcc_pos = mp4.find(b"avcC")
+        assert avcc_pos > 0
+        body_start = avcc_pos + 4
+        sps_len = struct.unpack(">H", mp4[body_start + 6:body_start + 8])[0]
+        after_sps = body_start + 8 + sps_len
+        # after_sps points to num_pps byte
+        pps_len = struct.unpack(">H", mp4[after_sps + 1:after_sps + 3])[0]
+        pps_start = after_sps + 3
+        return pps_start, pps_start + pps_len
+
+    def test_sps_body_byte_mutation_does_not_survive_verbatim(self) -> None:
+        # Splice a distinctive 4-byte marker deep inside the SPS body.
+        # Under the R8 code path, avcC copied SPS bytes verbatim so this
+        # marker would appear at the same relative avcC offset in the
+        # sanitized output. Under R9 canonicalise_nal, the SPS RBSP is
+        # decoded field-by-field and re-emitted from parsed values --
+        # either the mutation breaks RBSP syntax (raises MediaScrubError)
+        # or the re-encoded bits differ so the specific marker sequence
+        # cannot appear verbatim.
+        real = REAL_MP4.read_bytes()
+        sps_start, sps_end = self._sps_slice(real)
+        marker = b"\xde\xad\xbe\xef"
+        # Sanity-check: marker is not already in the fixture.
+        self.assertNotIn(marker, real)
+        # Splice near the tail of the SPS (past the fixed header) so it
+        # lands inside VUI / trailing bits rather than the profile byte.
+        splice_at = sps_end - 4
+        payload = bytearray(real)
+        payload[splice_at:splice_at + 4] = marker
+        try:
+            result = media_scrub.scrub_video(bytes(payload), "video/mp4")
+        except media_scrub.MediaScrubError:
+            return  # rejected: marker cannot survive
+        self.assertNotIn(marker, result.data)
+
+    def test_pps_body_byte_mutation_does_not_survive_verbatim(self) -> None:
+        real = REAL_MP4.read_bytes()
+        pps_start, pps_end = self._pps_slice(real)
+        marker = b"\xca\xfe\xba\xbe"
+        self.assertNotIn(marker, real)
+        splice_at = pps_end - min(4, pps_end - pps_start)
+        payload = bytearray(real)
+        payload[splice_at:splice_at + 4] = marker
+        try:
+            result = media_scrub.scrub_video(bytes(payload), "video/mp4")
+        except media_scrub.MediaScrubError:
+            return
+        self.assertNotIn(marker, result.data)
+
+    def test_stbl_table_flags_mutation_is_rejected(self) -> None:
+        # Set the 3 flag bytes of stts to non-zero. R9 requires canonical
+        # zeros. Revert the check and this test passes-through, meaning
+        # attacker bytes smuggled into fullbox flags survive to storage.
+        real = REAL_MP4.read_bytes()
+        stts_pos = real.find(b"stts")
+        assert stts_pos > 0
+        body_flags_start = stts_pos + 4 + 1  # after size(4) type(4) version(1)
+        payload = bytearray(real)
+        marker = b"\xa1\xb2\xc3"
+        payload[body_flags_start:body_flags_start + 3] = marker
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "fullbox flags non-zero"
+        ):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+    def test_stbl_duplicate_stss_table_is_rejected(self) -> None:
+        # Splice a duplicate stss box just before the existing stss. Under
+        # R8 both got emitted, providing two independent 3-byte flag slots.
+        real = REAL_MP4.read_bytes()
+        stss_pos = real.find(b"stss")
+        if stss_pos < 0:
+            self.skipTest("fixture has no stss table; probe not applicable")
+        stss_size = struct.unpack(">I", real[stss_pos - 4:stss_pos])[0]
+        original_stss = real[stss_pos - 4:stss_pos - 4 + stss_size]
+        payload = bytearray(real)
+        insert_at = stss_pos - 4
+        added = len(original_stss)
+        self._grow_ancestors(
+            payload, insert_at,
+            (b"stbl", b"minf", b"mdia", b"trak", b"moov"), added,
+        )
+        payload[insert_at:insert_at] = original_stss
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "duplicate .* table"
+        ):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+    def test_avcc_sps_ext_arrays_are_rejected(self) -> None:
+        # Flip a High profile byte, then extend the fixture avcC to carry
+        # a bogus SPS-ext trailer. R9 rejects any avcC declaring SPS-ext
+        # NALs because canonicalising the auxiliary-picture RBSP is out of
+        # scope. Verifies the strict-subset rejection path.
+        real = REAL_MP4.read_bytes()
+        avcc_pos = real.find(b"avcC")
+        assert avcc_pos > 0
+        # We construct a full replacement avcC body that declares 1 SPS
+        # copied from the fixture, 1 PPS copied from the fixture, then a
+        # High-profile extended trailer with num_sps_ext=1 and a 1-byte
+        # dummy SPS-ext NAL. The exact SPS/PPS bytes don't matter because
+        # rejection fires before we would try to canonicalise the SPS-ext.
+        # Reject fires on num_sps_ext != 0.
+        avcc_size = struct.unpack(">I", real[avcc_pos - 4:avcc_pos])[0]
+        avcc_body = real[avcc_pos + 4:avcc_pos + avcc_size]
+        # Flip profile to High (100) and enable extended trailer.
+        # Layout: version(1) profile(1) compat(1) level(1) lsm(1) numSPS(1)
+        new_body = bytearray(avcc_body)
+        new_body[1] = 100  # profile_idc = High
+        # Locate PPS end within avcc_body.
+        sps_len = struct.unpack(">H", bytes(new_body[6:8]))[0]
+        after_sps = 8 + sps_len
+        num_pps = new_body[after_sps]
+        pos = after_sps + 1
+        for _ in range(num_pps):
+            pps_len = struct.unpack(">H", bytes(new_body[pos:pos + 2]))[0]
+            pos += 2 + pps_len
+        # Truncate and append extended trailer: chroma(1) bd_luma(1)
+        # bd_chroma(1) num_sps_ext(1)=1 + one 1-byte dummy SPS-ext NAL.
+        new_body = bytes(new_body[:pos])
+        new_body += bytes([0xFC | 1, 0xF8, 0xF8, 1])  # chroma=1, depth=0
+        new_body += struct.pack(">H", 1) + b"\x00"
+        new_avcc = struct.pack(">I", 8 + len(new_body)) + b"avcC" + new_body
+        payload = bytearray(real)
+        payload[avcc_pos - 4:avcc_pos - 4 + avcc_size] = new_avcc
+        # Fix parent atom sizes for the delta.
+        delta = len(new_avcc) - avcc_size
+        if delta != 0:
+            for parent in (b"avc1", b"stsd", b"stbl", b"minf", b"mdia",
+                           b"trak", b"moov"):
+                pos = payload.rfind(parent, 0, avcc_pos)
+                existing = struct.unpack(">I", bytes(payload[pos - 4:pos]))[0]
+                payload[pos - 4:pos] = struct.pack(">I", existing + delta)
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "SPS-ext arrays"
+        ):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+    def test_ctts_version_1_signed_offsets_round_trip(self) -> None:
+        # ctts version 1 carries signed int32 sample_offset. R8 rejected
+        # any non-zero version. R9 accepts version in {0, 1} and preserves
+        # the version, so signed offsets survive. This probe replaces the
+        # fixture's ctts body with a valid v1 table (one entry with a
+        # negative offset) and asserts the scrubbed output preserves the
+        # version byte AND the exact signed offset bytes.
+        real = REAL_MP4.read_bytes()
+        ctts_pos = real.find(b"ctts")
+        if ctts_pos < 0:
+            # Splice a synthetic ctts before stco: same treatment.
+            stco_pos = real.find(b"stco")
+            if stco_pos < 0:
+                self.skipTest("fixture has neither ctts nor stco")
+            insert_before = stco_pos - 4
+        else:
+            ctts_size = struct.unpack(">I", real[ctts_pos - 4:ctts_pos])[0]
+            insert_before = ctts_pos - 4
+        # v1 header: 0x01 version, zero flags, entry_count=1
+        # entry: sample_count=1 (u32), sample_offset=-42 (i32)
+        v1_body = (
+            bytes([1, 0, 0, 0])
+            + struct.pack(">I", 1)
+            + struct.pack(">I", 1)
+            + struct.pack(">i", -42)
+        )
+        new_ctts = struct.pack(">I", 8 + len(v1_body)) + b"ctts" + v1_body
+        payload = bytearray(real)
+        if ctts_pos >= 0:
+            payload[insert_before:insert_before + ctts_size] = new_ctts
+            delta = len(new_ctts) - ctts_size
+        else:
+            payload[insert_before:insert_before] = new_ctts
+            delta = len(new_ctts)
+        for parent in (b"stbl", b"minf", b"mdia", b"trak", b"moov"):
+            pos = payload.rfind(parent, 0, insert_before)
+            existing = struct.unpack(">I", bytes(payload[pos - 4:pos]))[0]
+            payload[pos - 4:pos] = struct.pack(">I", existing + delta)
+        result = media_scrub.scrub_video(bytes(payload), "video/mp4")
+        # v1 ctts appears in output with its version byte and negative
+        # offset preserved.
+        expected_ctts = (
+            b"ctts"
+            + bytes([1, 0, 0, 0])
+            + struct.pack(">I", 1)
+            + struct.pack(">I", 1)
+            + struct.pack(">i", -42)
+        )
+        self.assertIn(expected_ctts, result.data)
+
+    def test_stsz_large_table_rss_stays_bounded(self) -> None:
+        # Build a synthetic stsz table with 5M entries (20MB body + 12 byte
+        # header). Under the R8 rebuild, per-entry decode-and-repack
+        # allocated a Python int list plus a bytes list of the same size,
+        # so RSS ballooned to hundreds of MB. Under R9 the entries are
+        # spliced verbatim, so peak allocation stays close to input size.
+        real = REAL_MP4.read_bytes()
+        stsz_pos = real.find(b"stsz")
+        assert stsz_pos > 0
+        stsz_size = struct.unpack(">I", real[stsz_pos - 4:stsz_pos])[0]
+
+        sample_count = 5_000_000
+        new_body = (
+            bytes([0, 0, 0, 0])
+            + struct.pack(">II", 0, sample_count)
+            + b"\x00\x00\x00\x01" * sample_count
+        )
+        new_stsz = struct.pack(">I", 8 + len(new_body)) + b"stsz" + new_body
+        added = len(new_stsz) - stsz_size
+
+        payload = bytearray(real)
+        payload[stsz_pos - 4:stsz_pos - 4 + stsz_size] = new_stsz
+        for parent in (b"stbl", b"minf", b"mdia", b"trak", b"moov"):
+            pos = payload.rfind(parent, 0, stsz_pos)
+            existing = struct.unpack(">I", bytes(payload[pos - 4:pos]))[0]
+            payload[pos - 4:pos] = struct.pack(">I", existing + added)
+
+        raw = bytes(payload)
+        del payload
+
+        tracemalloc.start()
+        try:
+            try:
+                media_scrub.scrub_video(raw, "video/mp4")
+            except media_scrub.MediaScrubError:
+                # cross-table inconsistencies may cause rejection late;
+                # measuring peak alloc up to that point is still valid.
+                pass
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        # Pre-R9 (per-entry decode+repack) peaked at ~660MB for this
+        # 20MB stsz body -- millions of Python ints plus a per-entry
+        # bytes list. Post-R9 splices the entry payload verbatim, so peak
+        # is dominated by intermediate concat copies of the input size
+        # (~95MB observed). Ceiling set at 150MB catches any regression
+        # to per-entry Python object allocation while allowing headroom
+        # for the concat pipeline.
+        self.assertLess(
+            peak, 150 * 1024 * 1024,
+            f"tracemalloc peak {peak/1024/1024:.1f}MB exceeded 150MB ceiling; "
+            "table rebuild is allocating per-entry Python objects again",
+        )
+
+
 class UnsupportedMimeTests(unittest.TestCase):
     def test_scrub_video_rejects_audio_mime(self) -> None:
         with self.assertRaises(media_scrub.MediaScrubError):

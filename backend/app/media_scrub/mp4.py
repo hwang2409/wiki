@@ -50,6 +50,7 @@ from dataclasses import dataclass
 from typing import Final
 
 from .base import MediaScrubError, MediaScrubResult
+from ._h264 import canonicalise_nal
 
 
 @dataclass(frozen=True)
@@ -833,7 +834,17 @@ def _rebuild_stbl(
     atoms = _parse_container(data, body_start, body_end)
     parts: list[bytes] = []
     stsd_ok = False
+    # Round-9 review: stbl singleton tables must not repeat. Pre-R9 the
+    # walker accepted arbitrary duplicates so an attacker could stack
+    # many empty stss/ctts/... boxes with independent 3-byte flags
+    # smuggled through each header. Track seen types and reject dupes.
+    seen: set[bytes] = set()
     for atom in atoms:
+        if atom.type in seen:
+            raise MediaScrubError(
+                f"mp4 stbl carries duplicate {atom.type!r} table"
+            )
+        seen.add(atom.type)
         if atom.type == b"stsd":
             stsd_body = _rebuild_stsd(data, atom.body_start, atom.body_end)
             if stsd_body is not None:
@@ -852,147 +863,101 @@ def _rebuild_stbl(
     return b"".join(parts), stsd_ok
 
 
+_CANONICAL_FULLBOX_FLAGS = b"\x00\x00\x00"
+
+
 def _rebuild_stbl_table(box_type: bytes, data: bytes, atom: _Mp4Atom) -> bytes:
     """Rebuild an stbl child table from parsed entry_count entries.
 
     Every table box in stbl (stts/ctts/stsc/stsz/stco/co64/stss) is a
     fullbox with a 4-byte entry_count followed by exactly N fixed-size
-    entries. Round-8 review flagged that trailing bytes rode through
-    the pre-R8 opaque-body path; here we compute the expected body size
-    from entry_count and reject anything else.
+    entries. Round-9 review found two issues in the R8 rebuild:
+      1. version+flags bytes were captured then re-emitted verbatim, so
+         an attacker could smuggle 3 bytes through each table header.
+         Fix: require flags == 0, emit canonical zeros; require
+         version == 0 (or version in {0,1} for ctts) and preserve the
+         version so signed sample offsets remain valid.
+      2. The rebuild decoded each entry to a Python int and re-packed
+         it, so a valid multi-million-entry stsz cost hundreds of MB
+         RSS. Fix: after validating the declared entry_count against the
+         body length, splice the entry payload verbatim as bytes -- the
+         encoding is fixed-size big-endian, and there is no room for
+         non-canonical variation.
     """
-    body = data[atom.body_start:atom.body_end]
+    body = memoryview(data)[atom.body_start:atom.body_end]
     if len(body) < 8:
         raise MediaScrubError(f"mp4 {box_type!r} body too short for header")
     version = body[0]
-    flags = body[1:4]
+    if bytes(body[1:4]) != _CANONICAL_FULLBOX_FLAGS:
+        raise MediaScrubError(f"mp4 {box_type!r} fullbox flags non-zero")
+
+    def _canonical_header(v: int, entry_count: int) -> bytes:
+        return bytes([v]) + _CANONICAL_FULLBOX_FLAGS + struct.pack(">I", entry_count)
+
     if box_type == b"stsz":
-        # Special: after v+flags, `sample_size` (uint32) then sample_count.
-        # If sample_size == 0, N per-sample uint32 sizes follow.
         if len(body) < 12:
             raise MediaScrubError("mp4 stsz body too short")
         if version != 0:
             raise MediaScrubError(f"mp4 stsz unknown version {version}")
-        sample_size = struct.unpack(">I", body[4:8])[0]
-        sample_count = struct.unpack(">I", body[8:12])[0]
+        sample_size = struct.unpack(">I", bytes(body[4:8]))[0]
+        sample_count = struct.unpack(">I", bytes(body[8:12]))[0]
         if sample_size != 0:
-            expected = 12
-            if len(body) != expected:
+            if len(body) != 12:
                 raise MediaScrubError(
-                    f"mp4 stsz uniform-size body length {len(body)} "
-                    f"differs from expected {expected}"
+                    f"mp4 stsz uniform-size body length {len(body)} differs from expected 12"
                 )
-            return _pack(b"stsz", bytes([0]) + flags + struct.pack(">II", sample_size, sample_count))
+            return _pack(
+                b"stsz",
+                bytes([0]) + _CANONICAL_FULLBOX_FLAGS
+                + struct.pack(">II", sample_size, sample_count),
+            )
         expected = 12 + sample_count * 4
         if len(body) != expected:
             raise MediaScrubError(
                 f"mp4 stsz body length {len(body)} differs from expected {expected} "
                 f"(sample_count={sample_count})"
             )
-        entries = [struct.unpack(">I", body[12 + i * 4:12 + i * 4 + 4])[0]
-                   for i in range(sample_count)]
-        rebuilt = (
-            bytes([0]) + flags
+        return _pack(
+            b"stsz",
+            bytes([0]) + _CANONICAL_FULLBOX_FLAGS
             + struct.pack(">II", 0, sample_count)
-            + b"".join(struct.pack(">I", size) for size in entries)
+            + bytes(body[12:]),
         )
-        return _pack(b"stsz", rebuilt)
 
-    if version != 0:
-        raise MediaScrubError(f"mp4 {box_type!r} unknown version {version}")
-    entry_count = struct.unpack(">I", body[4:8])[0]
-    if box_type == b"stts":
-        # 8 bytes per entry: sample_count(4) + sample_delta(4)
-        entry_size = 8
-        expected = 8 + entry_count * entry_size
-        if len(body) != expected:
-            raise MediaScrubError(
-                f"mp4 stts body length {len(body)} differs from expected {expected}"
-            )
-        chunks: list[bytes] = []
-        for i in range(entry_count):
-            off = 8 + i * entry_size
-            sc = struct.unpack(">I", body[off:off + 4])[0]
-            sd = struct.unpack(">I", body[off + 4:off + 8])[0]
-            chunks.append(struct.pack(">II", sc, sd))
-        return _pack(b"stts", bytes([0]) + flags + struct.pack(">I", entry_count) + b"".join(chunks))
     if box_type == b"ctts":
-        # 8 bytes per entry: sample_count(4) + sample_offset(4 signed for v1)
-        entry_size = 8
-        expected = 8 + entry_count * entry_size
+        # ctts version 0: unsigned uint32 sample_offset. version 1: signed
+        # int32 sample_offset. Both are 8 bytes per entry and canonical
+        # in big-endian; splice verbatim, preserve the version.
+        if version not in (0, 1):
+            raise MediaScrubError(f"mp4 ctts unknown version {version}")
+        entry_count = struct.unpack(">I", bytes(body[4:8]))[0]
+        expected = 8 + entry_count * 8
         if len(body) != expected:
             raise MediaScrubError(
                 f"mp4 ctts body length {len(body)} differs from expected {expected}"
             )
-        chunks = []
-        for i in range(entry_count):
-            off = 8 + i * entry_size
-            sc = struct.unpack(">I", body[off:off + 4])[0]
-            so = struct.unpack(">I", body[off + 4:off + 8])[0]
-            chunks.append(struct.pack(">II", sc, so))
-        return _pack(b"ctts", bytes([0]) + flags + struct.pack(">I", entry_count) + b"".join(chunks))
-    if box_type == b"stsc":
-        # 12 bytes per entry: first_chunk(4) + samples_per_chunk(4) + sample_desc_index(4)
-        entry_size = 12
-        expected = 8 + entry_count * entry_size
-        if len(body) != expected:
-            raise MediaScrubError(
-                f"mp4 stsc body length {len(body)} differs from expected {expected}"
-            )
-        chunks = []
-        for i in range(entry_count):
-            off = 8 + i * entry_size
-            fc = struct.unpack(">I", body[off:off + 4])[0]
-            spc = struct.unpack(">I", body[off + 4:off + 8])[0]
-            sdi = struct.unpack(">I", body[off + 8:off + 12])[0]
-            chunks.append(struct.pack(">III", fc, spc, sdi))
-        return _pack(b"stsc", bytes([0]) + flags + struct.pack(">I", entry_count) + b"".join(chunks))
-    if box_type == b"stco":
-        # 4 bytes per entry: chunk_offset (uint32)
-        entry_size = 4
-        expected = 8 + entry_count * entry_size
-        if len(body) != expected:
-            raise MediaScrubError(
-                f"mp4 stco body length {len(body)} differs from expected {expected}"
-            )
-        entries_data = [struct.unpack(">I", body[8 + i * 4:8 + i * 4 + 4])[0]
-                        for i in range(entry_count)]
-        return _pack(
-            b"stco",
-            bytes([0]) + flags + struct.pack(">I", entry_count)
-            + b"".join(struct.pack(">I", off) for off in entries_data),
+        return _pack(b"ctts", _canonical_header(version, entry_count) + bytes(body[8:]))
+
+    if version != 0:
+        raise MediaScrubError(f"mp4 {box_type!r} unknown version {version}")
+    entry_count = struct.unpack(">I", bytes(body[4:8]))[0]
+    entry_size_by_type = {
+        b"stts": 8,
+        b"stsc": 12,
+        b"stco": 4,
+        b"co64": 8,
+        b"stss": 4,
+    }
+    entry_size = entry_size_by_type.get(box_type)
+    if entry_size is None:
+        raise MediaScrubError(f"mp4 stbl table dispatch missing case for {box_type!r}")
+    expected = 8 + entry_count * entry_size
+    if len(body) != expected:
+        raise MediaScrubError(
+            f"mp4 {box_type.decode('ascii', 'replace')} body length {len(body)} "
+            f"differs from expected {expected}"
         )
-    if box_type == b"co64":
-        # 8 bytes per entry: chunk_offset (uint64)
-        entry_size = 8
-        expected = 8 + entry_count * entry_size
-        if len(body) != expected:
-            raise MediaScrubError(
-                f"mp4 co64 body length {len(body)} differs from expected {expected}"
-            )
-        entries_data = [struct.unpack(">Q", body[8 + i * 8:8 + i * 8 + 8])[0]
-                        for i in range(entry_count)]
-        return _pack(
-            b"co64",
-            bytes([0]) + flags + struct.pack(">I", entry_count)
-            + b"".join(struct.pack(">Q", off) for off in entries_data),
-        )
-    if box_type == b"stss":
-        # 4 bytes per entry: sample_number (uint32)
-        entry_size = 4
-        expected = 8 + entry_count * entry_size
-        if len(body) != expected:
-            raise MediaScrubError(
-                f"mp4 stss body length {len(body)} differs from expected {expected}"
-            )
-        entries_data = [struct.unpack(">I", body[8 + i * 4:8 + i * 4 + 4])[0]
-                        for i in range(entry_count)]
-        return _pack(
-            b"stss",
-            bytes([0]) + flags + struct.pack(">I", entry_count)
-            + b"".join(struct.pack(">I", n) for n in entries_data),
-        )
-    raise MediaScrubError(f"mp4 stbl table dispatch missing case for {box_type!r}")
+    return _pack(box_type, _canonical_header(0, entry_count) + bytes(body[8:]))
 
 
 def _rebuild_stsd(
@@ -1299,7 +1264,10 @@ def _rebuild_inner_avcC(body: bytes) -> bytes:
         offset += 2
         if offset + sps_len > len(body):
             raise MediaScrubError("mp4 avcC SPS body extends past avcC")
-        sps_list.append(body[offset:offset + sps_len])
+        canonical = canonicalise_nal(body[offset:offset + sps_len], expected_nal_type=7)
+        if len(canonical) > 0xFFFF:
+            raise MediaScrubError("mp4 avcC canonical SPS exceeds uint16 length")
+        sps_list.append(canonical)
         offset += sps_len
     if offset >= len(body):
         raise MediaScrubError("mp4 avcC missing numOfPictureParameterSets byte")
@@ -1313,7 +1281,10 @@ def _rebuild_inner_avcC(body: bytes) -> bytes:
         offset += 2
         if offset + pps_len > len(body):
             raise MediaScrubError("mp4 avcC PPS body extends past avcC")
-        pps_list.append(body[offset:offset + pps_len])
+        canonical = canonicalise_nal(body[offset:offset + pps_len], expected_nal_type=8)
+        if len(canonical) > 0xFFFF:
+            raise MediaScrubError("mp4 avcC canonical PPS exceeds uint16 length")
+        pps_list.append(canonical)
         offset += pps_len
 
     rebuilt_body = (
@@ -1344,20 +1315,16 @@ def _rebuild_inner_avcC(body: bytes) -> bytes:
         if depth_chroma_byte & 0xF8 != 0xF8:
             raise MediaScrubError("mp4 avcC extended chroma-depth reserved bits wrong")
         offset += 4
-        sps_ext_list: list[bytes] = []
-        for _ in range(num_sps_ext):
-            if offset + 2 > len(body):
-                raise MediaScrubError("mp4 avcC SPS-ext length field truncated")
-            ext_len = struct.unpack(">H", body[offset:offset + 2])[0]
-            offset += 2
-            if offset + ext_len > len(body):
-                raise MediaScrubError("mp4 avcC SPS-ext body extends past avcC")
-            sps_ext_list.append(body[offset:offset + ext_len])
-            offset += ext_len
-        rebuilt_body += bytes([chroma_byte, depth_luma_byte, depth_chroma_byte, num_sps_ext])
-        rebuilt_body += b"".join(
-            struct.pack(">H", len(ext)) + ext for ext in sps_ext_list
-        )
+        # Round-9 review: SPS extension NALs (auxiliary picture streams) are
+        # rejected outright. They're vanishingly rare on artifact uploads,
+        # and canonicalising the SPS-ext NAL RBSP would require another full
+        # H.264 auxiliary parser. Strict-subset rejection keeps the surface
+        # tight without the parser bloat.
+        if num_sps_ext != 0:
+            raise MediaScrubError(
+                "mp4 avcC declares SPS-ext arrays; auxiliary picture streams not accepted"
+            )
+        rebuilt_body += bytes([chroma_byte, depth_luma_byte, depth_chroma_byte, 0])
 
     if offset != len(body):
         raise MediaScrubError(

@@ -1,0 +1,505 @@
+"""H.264 SPS/PPS RBSP parse + canonical re-encode.
+
+Round 9 review closed the last byte-smuggling path in avcC: previously the
+SPS/PPS NAL bodies were copied through opaquely once the outer length fields
+validated. This module decodes each SPS/PPS RBSP down to its syntax
+elements, validates the field values against the H.264 spec, and emits fresh
+canonical bits from the decoded values. Any bit not consumed by the parser
+causes rejection, and any mutation inside a declared NAL either changes a
+parsed value (so the re-encoded output differs) or fails parsing.
+
+Scope choices:
+- Baseline through High/High10/High422/High444 profiles are decoded field-
+  by-field, including scaling matrices, VUI parameters, and HRD parameters.
+- SPS extension NALs (nal_unit_type 13) are rejected — they are used only
+  for auxiliary picture streams (alpha layer), never seen on artifact
+  uploads, so refusing them is safer than adding a partial parser.
+- Reserved bit constraints from the spec are enforced (any nonconforming
+  reserved bit rejects the file).
+"""
+from __future__ import annotations
+
+from typing import Callable
+
+from .base import MediaScrubError
+
+
+class _BitReader:
+    __slots__ = ("_data", "_bit_pos", "_total_bits")
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+        self._bit_pos = 0
+        self._total_bits = len(data) * 8
+
+    def remaining(self) -> int:
+        return self._total_bits - self._bit_pos
+
+    def read_bits(self, n: int) -> int:
+        if n < 0 or n > 32:
+            raise MediaScrubError("h264 bit read width out of range")
+        if self._bit_pos + n > self._total_bits:
+            raise MediaScrubError("h264 bit read past end of RBSP")
+        value = 0
+        for _ in range(n):
+            byte = self._data[self._bit_pos >> 3]
+            bit = (byte >> (7 - (self._bit_pos & 7))) & 1
+            value = (value << 1) | bit
+            self._bit_pos += 1
+        return value
+
+    def read_u1(self) -> int:
+        return self.read_bits(1)
+
+    def read_ue(self) -> int:
+        zeros = 0
+        while zeros < 32:
+            if self._bit_pos >= self._total_bits:
+                raise MediaScrubError("h264 ue leading-zero run past end of RBSP")
+            byte = self._data[self._bit_pos >> 3]
+            bit = (byte >> (7 - (self._bit_pos & 7))) & 1
+            self._bit_pos += 1
+            if bit == 1:
+                break
+            zeros += 1
+        else:
+            raise MediaScrubError("h264 ue leading zeros exceed 32")
+        if zeros == 0:
+            return 0
+        tail = self.read_bits(zeros)
+        return (1 << zeros) - 1 + tail
+
+    def read_se(self) -> int:
+        code = self.read_ue()
+        if code == 0:
+            return 0
+        if code & 1:
+            return (code + 1) >> 1
+        return -(code >> 1)
+
+    def more_rbsp_data(self) -> bool:
+        # Per H.264 7.2: more_rbsp_data() is false when only the stop bit
+        # (single 1 followed by zeros to byte boundary) remains.
+        if self._bit_pos >= self._total_bits:
+            return False
+        remaining = self._total_bits - self._bit_pos
+        # Look ahead: find the last 1-bit in the buffer.
+        # If the current bit is the stop bit followed by zeros to end, return False.
+        # Scan from current position to end.
+        found_one = False
+        for i in range(self._bit_pos, self._total_bits):
+            byte = self._data[i >> 3]
+            bit = (byte >> (7 - (i & 7))) & 1
+            if bit == 1:
+                if found_one:
+                    return True
+                found_one = True
+        return not found_one and remaining > 0
+
+    def read_rbsp_trailing_bits(self) -> None:
+        stop = self.read_bits(1)
+        if stop != 1:
+            raise MediaScrubError("h264 rbsp trailing bits missing stop-one bit")
+        # Zero-pad to byte boundary.
+        while self._bit_pos & 7:
+            if self.read_bits(1) != 0:
+                raise MediaScrubError("h264 rbsp trailing bits non-zero pad")
+        if self._bit_pos != self._total_bits:
+            raise MediaScrubError("h264 rbsp has bits past trailing byte boundary")
+
+
+class _BitWriter:
+    __slots__ = ("_out", "_bit_pos")
+
+    def __init__(self) -> None:
+        self._out = bytearray()
+        self._bit_pos = 0
+
+    def write_bits(self, value: int, n: int) -> None:
+        if n < 0 or n > 32:
+            raise MediaScrubError("h264 bit write width out of range")
+        if value < 0 or value >= (1 << n):
+            raise MediaScrubError("h264 bit write value out of range")
+        for i in range(n - 1, -1, -1):
+            bit = (value >> i) & 1
+            if self._bit_pos & 7 == 0:
+                self._out.append(0)
+            byte_idx = self._bit_pos >> 3
+            self._out[byte_idx] |= bit << (7 - (self._bit_pos & 7))
+            self._bit_pos += 1
+
+    def write_u1(self, value: int) -> None:
+        self.write_bits(value & 1, 1)
+
+    def write_ue(self, value: int) -> None:
+        if value < 0:
+            raise MediaScrubError("h264 ue write negative value")
+        m = value + 1
+        n = m.bit_length() - 1
+        if n > 32:
+            raise MediaScrubError("h264 ue write value too large")
+        # n leading zeros, then the (n+1)-bit binary of m.
+        self.write_bits(0, n)
+        self.write_bits(m, n + 1)
+
+    def write_se(self, value: int) -> None:
+        if value <= 0:
+            code = -2 * value
+        else:
+            code = 2 * value - 1
+        self.write_ue(code)
+
+    def write_rbsp_trailing_bits(self) -> None:
+        self.write_bits(1, 1)
+        while self._bit_pos & 7:
+            self.write_bits(0, 1)
+
+    def to_bytes(self) -> bytes:
+        return bytes(self._out)
+
+
+def _rbsp_unescape(nal_body: bytes) -> bytes:
+    """Remove emulation prevention bytes (0x00 0x00 0x03) inside a NAL body."""
+    out = bytearray()
+    zeros = 0
+    i = 0
+    n = len(nal_body)
+    while i < n:
+        b = nal_body[i]
+        if zeros >= 2 and b == 0x03:
+            # Emulation prevention byte. The next byte must be <= 0x03
+            # per H.264 7.4.1.1; otherwise this was not a real 03 escape.
+            if i + 1 >= n:
+                raise MediaScrubError("h264 emulation-prevention 03 at end of NAL")
+            follower = nal_body[i + 1]
+            if follower > 0x03:
+                raise MediaScrubError("h264 emulation-prevention 03 followed by illegal byte")
+            zeros = 0
+            i += 1
+            continue
+        out.append(b)
+        if b == 0:
+            zeros += 1
+        else:
+            zeros = 0
+        i += 1
+    return bytes(out)
+
+
+def _rbsp_escape(rbsp: bytes) -> bytes:
+    """Insert emulation prevention bytes to convert RBSP to NAL byte stream."""
+    out = bytearray()
+    zeros = 0
+    for b in rbsp:
+        if zeros >= 2 and b <= 0x03:
+            out.append(0x03)
+            zeros = 0
+        out.append(b)
+        if b == 0:
+            zeros += 1
+        else:
+            zeros = 0
+    # H.264 7.4.1.1 requires trailing zero bytes get an escape too, but a
+    # valid trailing_bits stop-one guarantees the last RBSP byte is nonzero.
+    return bytes(out)
+
+
+_HIGH_PROFILES = frozenset({
+    44, 83, 86, 100, 110, 118, 122, 128, 134, 135, 138, 139, 144, 244,
+})
+
+
+def _copy_scaling_list(reader: _BitReader, writer: _BitWriter, size: int) -> None:
+    last_scale = 8
+    next_scale = 8
+    for _ in range(size):
+        if next_scale != 0:
+            delta_scale = reader.read_se()
+            writer.write_se(delta_scale)
+            next_scale = (last_scale + delta_scale + 256) % 256
+        if next_scale != 0:
+            last_scale = next_scale
+
+
+def _copy_hrd_parameters(reader: _BitReader, writer: _BitWriter) -> None:
+    cpb_cnt_minus1 = reader.read_ue()
+    if cpb_cnt_minus1 > 31:
+        raise MediaScrubError("h264 hrd cpb_cnt_minus1 out of range")
+    writer.write_ue(cpb_cnt_minus1)
+    writer.write_bits(reader.read_bits(4), 4)  # bit_rate_scale
+    writer.write_bits(reader.read_bits(4), 4)  # cpb_size_scale
+    for _ in range(cpb_cnt_minus1 + 1):
+        writer.write_ue(reader.read_ue())      # bit_rate_value_minus1
+        writer.write_ue(reader.read_ue())      # cpb_size_value_minus1
+        writer.write_u1(reader.read_u1())      # cbr_flag
+    writer.write_bits(reader.read_bits(5), 5)  # initial_cpb_removal_delay_length_minus1
+    writer.write_bits(reader.read_bits(5), 5)  # cpb_removal_delay_length_minus1
+    writer.write_bits(reader.read_bits(5), 5)  # dpb_output_delay_length_minus1
+    writer.write_bits(reader.read_bits(5), 5)  # time_offset_length
+
+
+def _copy_vui_parameters(reader: _BitReader, writer: _BitWriter) -> None:
+    aspect_ratio_info_present_flag = reader.read_u1()
+    writer.write_u1(aspect_ratio_info_present_flag)
+    if aspect_ratio_info_present_flag:
+        aspect_ratio_idc = reader.read_bits(8)
+        writer.write_bits(aspect_ratio_idc, 8)
+        if aspect_ratio_idc == 255:  # Extended_SAR
+            writer.write_bits(reader.read_bits(16), 16)  # sar_width
+            writer.write_bits(reader.read_bits(16), 16)  # sar_height
+
+    overscan_info_present_flag = reader.read_u1()
+    writer.write_u1(overscan_info_present_flag)
+    if overscan_info_present_flag:
+        writer.write_u1(reader.read_u1())  # overscan_appropriate_flag
+
+    video_signal_type_present_flag = reader.read_u1()
+    writer.write_u1(video_signal_type_present_flag)
+    if video_signal_type_present_flag:
+        writer.write_bits(reader.read_bits(3), 3)  # video_format
+        writer.write_u1(reader.read_u1())          # video_full_range_flag
+        colour_description_present_flag = reader.read_u1()
+        writer.write_u1(colour_description_present_flag)
+        if colour_description_present_flag:
+            writer.write_bits(reader.read_bits(8), 8)  # colour_primaries
+            writer.write_bits(reader.read_bits(8), 8)  # transfer_characteristics
+            writer.write_bits(reader.read_bits(8), 8)  # matrix_coefficients
+
+    chroma_loc_info_present_flag = reader.read_u1()
+    writer.write_u1(chroma_loc_info_present_flag)
+    if chroma_loc_info_present_flag:
+        writer.write_ue(reader.read_ue())  # chroma_sample_loc_type_top_field
+        writer.write_ue(reader.read_ue())  # chroma_sample_loc_type_bottom_field
+
+    timing_info_present_flag = reader.read_u1()
+    writer.write_u1(timing_info_present_flag)
+    if timing_info_present_flag:
+        writer.write_bits(reader.read_bits(32), 32)  # num_units_in_tick
+        writer.write_bits(reader.read_bits(32), 32)  # time_scale
+        writer.write_u1(reader.read_u1())            # fixed_frame_rate_flag
+
+    nal_hrd_present = reader.read_u1()
+    writer.write_u1(nal_hrd_present)
+    if nal_hrd_present:
+        _copy_hrd_parameters(reader, writer)
+
+    vcl_hrd_present = reader.read_u1()
+    writer.write_u1(vcl_hrd_present)
+    if vcl_hrd_present:
+        _copy_hrd_parameters(reader, writer)
+
+    if nal_hrd_present or vcl_hrd_present:
+        writer.write_u1(reader.read_u1())  # low_delay_hrd_flag
+
+    writer.write_u1(reader.read_u1())  # pic_struct_present_flag
+
+    bitstream_restriction_flag = reader.read_u1()
+    writer.write_u1(bitstream_restriction_flag)
+    if bitstream_restriction_flag:
+        writer.write_u1(reader.read_u1())  # motion_vectors_over_pic_boundaries_flag
+        writer.write_ue(reader.read_ue())  # max_bytes_per_pic_denom
+        writer.write_ue(reader.read_ue())  # max_bits_per_mb_denom
+        writer.write_ue(reader.read_ue())  # log2_max_mv_length_horizontal
+        writer.write_ue(reader.read_ue())  # log2_max_mv_length_vertical
+        writer.write_ue(reader.read_ue())  # max_num_reorder_frames
+        writer.write_ue(reader.read_ue())  # max_dec_frame_buffering
+
+
+def _parse_and_emit_sps_rbsp(rbsp: bytes) -> bytes:
+    reader = _BitReader(rbsp)
+    writer = _BitWriter()
+
+    profile_idc = reader.read_bits(8)
+    writer.write_bits(profile_idc, 8)
+    # 6 constraint_setN_flag bits then 2 reserved_zero bits
+    constraint_bits = reader.read_bits(8)
+    if constraint_bits & 0x03 != 0:
+        raise MediaScrubError("h264 sps reserved_zero_2bits nonzero")
+    writer.write_bits(constraint_bits, 8)
+    level_idc = reader.read_bits(8)
+    writer.write_bits(level_idc, 8)
+
+    sps_id = reader.read_ue()
+    if sps_id > 31:
+        raise MediaScrubError("h264 sps seq_parameter_set_id out of range")
+    writer.write_ue(sps_id)
+
+    if profile_idc in _HIGH_PROFILES:
+        chroma_format_idc = reader.read_ue()
+        if chroma_format_idc > 3:
+            raise MediaScrubError("h264 sps chroma_format_idc out of range")
+        writer.write_ue(chroma_format_idc)
+        if chroma_format_idc == 3:
+            writer.write_u1(reader.read_u1())  # separate_colour_plane_flag
+        bd_luma = reader.read_ue()
+        bd_chroma = reader.read_ue()
+        if bd_luma > 6 or bd_chroma > 6:
+            raise MediaScrubError("h264 sps bit_depth out of range")
+        writer.write_ue(bd_luma)
+        writer.write_ue(bd_chroma)
+        writer.write_u1(reader.read_u1())  # qpprime_y_zero_transform_bypass_flag
+        seq_scaling_matrix_present = reader.read_u1()
+        writer.write_u1(seq_scaling_matrix_present)
+        if seq_scaling_matrix_present:
+            count = 8 if chroma_format_idc != 3 else 12
+            for i in range(count):
+                seq_scaling_list_present = reader.read_u1()
+                writer.write_u1(seq_scaling_list_present)
+                if seq_scaling_list_present:
+                    size = 16 if i < 6 else 64
+                    _copy_scaling_list(reader, writer, size)
+
+    writer.write_ue(reader.read_ue())  # log2_max_frame_num_minus4
+
+    pic_order_cnt_type = reader.read_ue()
+    if pic_order_cnt_type > 2:
+        raise MediaScrubError("h264 sps pic_order_cnt_type out of range")
+    writer.write_ue(pic_order_cnt_type)
+    if pic_order_cnt_type == 0:
+        writer.write_ue(reader.read_ue())  # log2_max_pic_order_cnt_lsb_minus4
+    elif pic_order_cnt_type == 1:
+        writer.write_u1(reader.read_u1())  # delta_pic_order_always_zero_flag
+        writer.write_se(reader.read_se())  # offset_for_non_ref_pic
+        writer.write_se(reader.read_se())  # offset_for_top_to_bottom_field
+        num_ref_in_cycle = reader.read_ue()
+        if num_ref_in_cycle > 255:
+            raise MediaScrubError("h264 sps num_ref_frames_in_pic_order_cnt_cycle too large")
+        writer.write_ue(num_ref_in_cycle)
+        for _ in range(num_ref_in_cycle):
+            writer.write_se(reader.read_se())
+
+    writer.write_ue(reader.read_ue())  # max_num_ref_frames
+    writer.write_u1(reader.read_u1())  # gaps_in_frame_num_value_allowed_flag
+    writer.write_ue(reader.read_ue())  # pic_width_in_mbs_minus1
+    writer.write_ue(reader.read_ue())  # pic_height_in_map_units_minus1
+    frame_mbs_only_flag = reader.read_u1()
+    writer.write_u1(frame_mbs_only_flag)
+    if not frame_mbs_only_flag:
+        writer.write_u1(reader.read_u1())  # mb_adaptive_frame_field_flag
+    writer.write_u1(reader.read_u1())  # direct_8x8_inference_flag
+    frame_cropping_flag = reader.read_u1()
+    writer.write_u1(frame_cropping_flag)
+    if frame_cropping_flag:
+        writer.write_ue(reader.read_ue())  # frame_crop_left_offset
+        writer.write_ue(reader.read_ue())  # frame_crop_right_offset
+        writer.write_ue(reader.read_ue())  # frame_crop_top_offset
+        writer.write_ue(reader.read_ue())  # frame_crop_bottom_offset
+
+    vui_present = reader.read_u1()
+    writer.write_u1(vui_present)
+    if vui_present:
+        _copy_vui_parameters(reader, writer)
+
+    reader.read_rbsp_trailing_bits()
+    writer.write_rbsp_trailing_bits()
+    return writer.to_bytes()
+
+
+def _parse_and_emit_pps_rbsp(rbsp: bytes) -> bytes:
+    reader = _BitReader(rbsp)
+    writer = _BitWriter()
+
+    pps_id = reader.read_ue()
+    sps_id = reader.read_ue()
+    if pps_id > 255 or sps_id > 31:
+        raise MediaScrubError("h264 pps parameter_set_id out of range")
+    writer.write_ue(pps_id)
+    writer.write_ue(sps_id)
+
+    entropy_coding_mode_flag = reader.read_u1()
+    writer.write_u1(entropy_coding_mode_flag)
+    writer.write_u1(reader.read_u1())  # bottom_field_pic_order_in_frame_present_flag
+
+    num_slice_groups_minus1 = reader.read_ue()
+    if num_slice_groups_minus1 > 7:
+        raise MediaScrubError("h264 pps num_slice_groups_minus1 out of range")
+    writer.write_ue(num_slice_groups_minus1)
+    if num_slice_groups_minus1 > 0:
+        slice_group_map_type = reader.read_ue()
+        if slice_group_map_type > 6:
+            raise MediaScrubError("h264 pps slice_group_map_type out of range")
+        writer.write_ue(slice_group_map_type)
+        if slice_group_map_type == 0:
+            for _ in range(num_slice_groups_minus1 + 1):
+                writer.write_ue(reader.read_ue())  # run_length_minus1
+        elif slice_group_map_type == 2:
+            for _ in range(num_slice_groups_minus1):
+                writer.write_ue(reader.read_ue())  # top_left
+                writer.write_ue(reader.read_ue())  # bottom_right
+        elif slice_group_map_type in (3, 4, 5):
+            writer.write_u1(reader.read_u1())  # slice_group_change_direction_flag
+            writer.write_ue(reader.read_ue())  # slice_group_change_rate_minus1
+        elif slice_group_map_type == 6:
+            pic_size_in_map_units_minus1 = reader.read_ue()
+            if pic_size_in_map_units_minus1 > 65535:
+                raise MediaScrubError("h264 pps pic_size_in_map_units_minus1 too large")
+            writer.write_ue(pic_size_in_map_units_minus1)
+            # ceil(log2(num_slice_groups_minus1 + 1)) bits per unit
+            n = num_slice_groups_minus1 + 1
+            bit_width = max(1, (n - 1).bit_length())
+            for _ in range(pic_size_in_map_units_minus1 + 1):
+                writer.write_bits(reader.read_bits(bit_width), bit_width)
+
+    writer.write_ue(reader.read_ue())  # num_ref_idx_l0_default_active_minus1
+    writer.write_ue(reader.read_ue())  # num_ref_idx_l1_default_active_minus1
+    writer.write_u1(reader.read_u1())  # weighted_pred_flag
+    writer.write_bits(reader.read_bits(2), 2)  # weighted_bipred_idc
+    writer.write_se(reader.read_se())  # pic_init_qp_minus26
+    writer.write_se(reader.read_se())  # pic_init_qs_minus26
+    writer.write_se(reader.read_se())  # chroma_qp_index_offset
+    writer.write_u1(reader.read_u1())  # deblocking_filter_control_present_flag
+    writer.write_u1(reader.read_u1())  # constrained_intra_pred_flag
+    writer.write_u1(reader.read_u1())  # redundant_pic_cnt_present_flag
+
+    if reader.more_rbsp_data():
+        writer.write_u1(reader.read_u1())  # transform_8x8_mode_flag
+        pic_scaling_matrix_present_flag = reader.read_u1()
+        writer.write_u1(pic_scaling_matrix_present_flag)
+        if pic_scaling_matrix_present_flag:
+            # The list count depends on the SPS chroma_format_idc and the
+            # PPS transform_8x8_mode_flag. Standard: for i < 6 + (chroma!=3 ? 2 : 6) * transform_8x8.
+            # Without the SPS context here we accept up to 12 lists and stop
+            # once more_rbsp_data() is false — but the spec fixes the count.
+            # We conservatively reject scaling matrices without SPS context:
+            # every real encoder that emits one also carries seq_scaling_matrix.
+            raise MediaScrubError(
+                "h264 pps carries scaling matrix without SPS context; rejected"
+            )
+        writer.write_se(reader.read_se())  # second_chroma_qp_index_offset
+
+    reader.read_rbsp_trailing_bits()
+    writer.write_rbsp_trailing_bits()
+    return writer.to_bytes()
+
+
+def canonicalise_nal(nal_bytes: bytes, expected_nal_type: int) -> bytes:
+    """Parse a NAL, validate its type, decode + re-encode the RBSP, return
+    the canonical NAL byte stream (header byte + escaped RBSP).
+    """
+    if len(nal_bytes) < 1:
+        raise MediaScrubError("h264 NAL too short for header")
+    header = nal_bytes[0]
+    forbidden_zero_bit = (header >> 7) & 1
+    nal_ref_idc = (header >> 5) & 0x3
+    nal_type = header & 0x1F
+    if forbidden_zero_bit != 0:
+        raise MediaScrubError("h264 NAL forbidden_zero_bit set")
+    if nal_type != expected_nal_type:
+        raise MediaScrubError(
+            f"h264 NAL type {nal_type} does not match expected {expected_nal_type}"
+        )
+    rbsp = _rbsp_unescape(nal_bytes[1:])
+    if not rbsp:
+        raise MediaScrubError("h264 RBSP is empty after unescape")
+
+    emit: Callable[[bytes], bytes]
+    if expected_nal_type == 7:      # SPS
+        emit = _parse_and_emit_sps_rbsp
+    elif expected_nal_type == 8:    # PPS
+        emit = _parse_and_emit_pps_rbsp
+    else:
+        raise MediaScrubError(f"h264 canonicalise: unsupported NAL type {expected_nal_type}")
+
+    new_rbsp = emit(rbsp)
+    canonical_header = bytes([(nal_ref_idc << 5) | nal_type])
+    return canonical_header + _rbsp_escape(new_rbsp)
