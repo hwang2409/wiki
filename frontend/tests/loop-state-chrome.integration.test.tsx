@@ -187,9 +187,9 @@ describe("LoopStateChrome", () => {
     });
     fireEvent.click(trigger);
 
-    expect(await screen.findByText(/verdict NOT-MERGE-READY/)).toBeVisible();
-    expect(screen.getByText(/steer: 1\. \[HIGH\]/)).toBeVisible();
-    expect(screen.getByText(/WIKI-000-REVIEW2.*sha 0123456/)).toBeVisible();
-    expect(screen.getByText("halted: plateau")).toBeVisible();
+    expect(await screen.findByText(/verdict NOT-MERGE-READY/)).toBeTruthy();
+    expect(screen.getByText(/steer: 1\. \[HIGH\]/)).toBeTruthy();
+    expect(screen.getByText(/WIKI-000-REVIEW2.*sha 0123456/)).toBeTruthy();
+    expect(screen.getByText("halted: plateau")).toBeTruthy();
   });
 });

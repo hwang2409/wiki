@@ -242,6 +242,7 @@ class AutopilotTests(unittest.TestCase):
             ]
             controller = AutopilotController(
                 store=AutopilotStore(Path(directory)),
+                status_reader=lambda _ticket: {"sha": "0123456"},
                 graph_loader=lambda _ticket: _graph(verdicts),
                 steer=lambda _ticket, _message: None,
                 archive=lambda _reviewer: None,
