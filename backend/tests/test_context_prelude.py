@@ -78,6 +78,16 @@ class ContextPreludeTests(unittest.TestCase):
         self.assertIn("## related workgraph", result.text)
         self.assertEqual(result.sources["vault notes"]["status"], "ok")
 
+    def test_recent_pr_scan_ignores_unmerged_branch(self) -> None:
+        git(self.root, "switch", "-c", "unmerged")
+        (self.root / "shared.py").write_text("unmerged\n", encoding="utf-8")
+        git(self.root, "commit", "-am", "Merge pull request #99 from unmerged/shared")
+        git(self.root, "switch", "feature")
+
+        result = context_prelude._recent_pr_source(self.root)
+
+        self.assertNotIn("#99", result.body)
+
     def test_vault_scan_does_not_create_index_state(self) -> None:
         before = sorted(path.relative_to(self.root).as_posix() for path in self.root.rglob("*"))
         self.builder().build(ticket="WIKI-180", title="context prelude")
@@ -108,6 +118,14 @@ class ContextPreludeTests(unittest.TestCase):
         self.assertTrue(result.truncated)
         self.assertIn("truncated:", result.text)
         self.assertIn("omitted", result.text)
+
+    def test_fit_omitted_count_matches_removed_characters(self) -> None:
+        source = "x" * 2_000
+        fitted, truncated = context_prelude._fit(source, 100, "probe")
+        self.assertTrue(truncated)
+        self.assertLessEqual(len(fitted), 100)
+        omitted = int(fitted.rsplit("omitted ", 1)[1].split(" chars", 1)[0])
+        self.assertEqual(omitted, len(source) - fitted.index("\n["))
 
     def test_giant_note_and_graph_report_omitted_content(self) -> None:
         (self.vault / "giant.md").write_text("WIKI-180 " + "x" * 20_000, encoding="utf-8")

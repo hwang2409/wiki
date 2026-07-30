@@ -150,7 +150,7 @@ function archivedAge(iso: string): string {
   return `${Math.floor(seconds / 86400)}d ago`;
 }
 
-function SpawnWorkerModal({
+export function SpawnWorkerModal({
   models,
   orchestrators,
   onClose,

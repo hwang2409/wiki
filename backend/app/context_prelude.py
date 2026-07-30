@@ -80,11 +80,19 @@ def _optional_root(value: Path | str | None) -> Path | None:
 def _fit(text: str, budget: int, marker: str) -> tuple[str, bool]:
     if len(text) <= budget:
         return text, False
-    omitted = max(0, len(text) - budget)
-    marker = f"\n[{marker}; omitted {omitted} chars]"
-    if len(marker) >= budget:
-        return marker[:budget], True
-    return text[: budget - len(marker)].rstrip() + marker, True
+    omitted = len(text) - budget
+    for _ in range(8):
+        truncation_marker = f"\n[{marker}; omitted {omitted} chars]"
+        if len(truncation_marker) >= budget:
+            return truncation_marker[:budget], True
+        prefix_length = budget - len(truncation_marker)
+        exact_omitted = len(text) - prefix_length
+        if exact_omitted == omitted:
+            return text[:prefix_length] + truncation_marker, True
+        omitted = exact_omitted
+    truncation_marker = f"\n[{marker}; omitted {omitted} chars]"
+    prefix_length = max(0, budget - len(truncation_marker))
+    return text[:prefix_length] + truncation_marker[: budget - prefix_length], True
 
 
 def _clean(value: object, limit: int = 360) -> str:
