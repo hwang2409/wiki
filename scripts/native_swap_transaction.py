@@ -26,7 +26,7 @@ from scripts.native_daemon_restart import restart_daemon_in_process
 
 RestartDaemon = Callable[[Path, Path, Path], bool]
 UninstallDaemon = Callable[[Path, Path, Path], None]
-StartSupervisor = Callable[[Path, Path], None]
+StartSupervisor = Callable[[Path, Path, Path], None]
 
 
 def _uninstall_daemon(live_bundle: Path, runtime_dir: Path, repo_root: Path) -> None:
@@ -61,7 +61,9 @@ def _supervisor_peer_pid(socket_path: Path) -> int:
             raw = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
             return int.from_bytes(raw[:4], byteorder=sys.byteorder, signed=True)
     except OSError as exc:
-        raise RuntimeError(f"cannot authenticate supervisor socket: {exc}") from exc
+        raise SupervisorUnavailable(
+            f"supervisor socket is not ready: {exc}"
+        ) from exc
     finally:
         connection.close()
     raise RuntimeError("cannot authenticate supervisor socket on this platform")
@@ -72,35 +74,48 @@ def _supervisor_identity(
     *,
     expected_executable: Path | None = None,
     expected_fingerprint: str | None = None,
+    timeout: float = 5.0,
 ) -> tuple[SupervisorClient, int, dict[str, object]]:
     pid = _supervisor_pid(runtime_dir)
     if pid is None:
         raise RuntimeError("supervisor lock is held but supervisor.pid is missing")
     paths = RuntimePaths.from_env({"WIKI_AGENT_RUNTIME_DIR": str(runtime_dir)})
-    peer_pid = _supervisor_peer_pid(paths.socket_path)
-    if peer_pid != pid:
-        raise RuntimeError(
-            f"supervisor PID mismatch: pid file has {pid}, socket peer is {peer_pid}"
-        )
     client = SupervisorClient(paths, timeout=2.0)
-    try:
-        health = client.ping()
-    except SupervisorUnavailable as exc:
-        raise RuntimeError(f"cannot authenticate supervisor RPC: {exc}") from exc
-    if health.get("pid") != pid:
-        raise RuntimeError("supervisor RPC PID does not match its authenticated socket")
-    if (
-        expected_fingerprint is not None
-        and health.get("runtime_fingerprint") != expected_fingerprint
-    ):
-        raise RuntimeError("supervisor runtime fingerprint does not match the live bundle")
-    if expected_executable is not None and expected_executable.is_file():
-        executable = backend_daemon._process_executable(pid)  # noqa: SLF001
-        if executable is None or not backend_daemon._same_executable(  # noqa: SLF001
-            executable, expected_executable
-        ):
-            raise RuntimeError("supervisor executable does not match the live bundle")
-    return client, pid, health
+    deadline = time.monotonic() + timeout
+    while True:
+        if _supervisor_pid(runtime_dir) != pid or _supervisor_lock_is_free(runtime_dir):
+            raise RuntimeError("supervisor identity changed while waiting for readiness")
+        try:
+            peer_pid = _supervisor_peer_pid(paths.socket_path)
+            if peer_pid != pid:
+                raise RuntimeError(
+                    f"supervisor PID mismatch: pid file has {pid}, socket peer is {peer_pid}"
+                )
+            health = client.ping()
+            if health.get("pid") != pid:
+                raise RuntimeError(
+                    "supervisor RPC PID does not match its authenticated socket"
+                )
+            if (
+                expected_fingerprint is not None
+                and health.get("runtime_fingerprint") != expected_fingerprint
+            ):
+                raise RuntimeError(
+                    "supervisor runtime fingerprint does not match the live bundle"
+                )
+            if expected_executable is not None and expected_executable.is_file():
+                executable = backend_daemon._process_executable(pid)  # noqa: SLF001
+                if executable is None or not backend_daemon._same_executable(  # noqa: SLF001
+                    executable, expected_executable
+                ):
+                    raise RuntimeError("supervisor executable does not match the live bundle")
+            return client, pid, health
+        except SupervisorUnavailable as exc:
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"supervisor socket did not become ready before deadline: {exc}"
+                ) from exc
+            time.sleep(0.05)
 
 
 def _supervisor_lock_is_free(runtime_dir: Path) -> bool:
@@ -232,12 +247,14 @@ def _wait_for_handover(
     paths = RuntimePaths.from_env({"WIKI_AGENT_RUNTIME_DIR": str(runtime_dir)})
     client = SupervisorClient(paths, timeout=2.0)
     deadline = time.monotonic() + timeout
+    last_observation: tuple[tuple[object, ...], ...] | None = None
+    stable_observations = 0
     while time.monotonic() < deadline:
         try:
             health = client.ping()
             if not isinstance(health, dict):
                 raise SupervisorUnavailable("invalid supervisor health")
-            stable = True
+            observations: list[tuple[object, ...]] = []
             for saved in runs:
                 status = client.request("run/status", {"agent_id": saved["agent_id"]})
                 if (
@@ -245,13 +262,35 @@ def _wait_for_handover(
                     or status.get("run_id") != saved["run_id"]
                     or status.get("provider_session_id")
                     != saved.get("provider_session_id")
+                    or status.get("control_attached") is not True
+                    or status.get("provider_alive") is not True
+                    or status.get("state") not in {"working", "waiting-approval", "idle"}
                 ):
-                    stable = False
+                    observations = []
                     break
-            if stable:
+                observations.append(
+                    (
+                        status["run_id"],
+                        status["provider_session_id"],
+                        status["control_attached"],
+                        status["provider_alive"],
+                        status["state"],
+                    )
+                )
+            current_observation = tuple(observations)
+            if current_observation and current_observation == last_observation:
+                stable_observations += 1
+            elif current_observation:
+                last_observation = current_observation
+                stable_observations = 1
+            else:
+                last_observation = None
+                stable_observations = 0
+            if stable_observations >= 2:
                 return
         except (SupervisorUnavailable, OSError, ValueError):
-            pass
+            last_observation = None
+            stable_observations = 0
         time.sleep(0.05)
     raise RuntimeError("new supervisor did not restore every saved run and session")
 
@@ -312,7 +351,7 @@ def swap_native_app(
                 try:
                     restart(live_bundle, runtime_dir, repo_root)
                     if saved_runs:
-                        start_supervisor(live_bundle, runtime_dir)
+                        start_supervisor(live_bundle, runtime_dir, repo_root)
                         handover_started = True
                 except Exception as new_error:
                     try:
@@ -330,7 +369,7 @@ def swap_native_app(
                     try:
                         restart(live_bundle, runtime_dir, repo_root)
                         if saved_runs:
-                            start_supervisor(live_bundle, runtime_dir)
+                            start_supervisor(live_bundle, runtime_dir, repo_root)
                             handover_started = True
                     except Exception as old_error:
                         try:
@@ -369,7 +408,7 @@ def swap_native_app(
                             swap_intent,
                         )
                         restart(live_bundle, runtime_dir, repo_root)
-                        start_supervisor(live_bundle, runtime_dir)
+                        start_supervisor(live_bundle, runtime_dir, repo_root)
                 try:
                     _wait_for_handover(runtime_dir, saved_runs)
                 except Exception as rollback_error:

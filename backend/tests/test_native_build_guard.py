@@ -9,7 +9,7 @@ import tempfile
 import time
 from pathlib import Path
 from unittest import TestCase
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from backend.app.native_lifecycle import hold_app_lock, hold_runtime_locks
 import scripts.atomic_swap as atomic_swap_module
@@ -332,6 +332,233 @@ class NativeBuildGuardTests(TestCase):
                     with self.assertRaisesRegex(RuntimeError, "RPC PID"):
                         native_swap_transaction._stop_supervisor(runtime)
                     fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    def test_supervisor_identity_retries_until_delayed_socket_is_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Path(tmp)
+            (runtime / "supervisor.lock").touch()
+            (runtime / "supervisor.pid").write_text("1234\n", encoding="utf-8")
+            with (
+                (runtime / "supervisor.lock").open("a+b") as lock,
+                patch.object(
+                    native_swap_transaction,
+                    "_supervisor_peer_pid",
+                    side_effect=[
+                        native_swap_transaction.SupervisorUnavailable(
+                            "socket is still starting"
+                        ),
+                        1234,
+                    ],
+                ) as peer_pid,
+                patch.object(
+                    native_swap_transaction.SupervisorClient,
+                    "ping",
+                    return_value={"status": "ok", "pid": 1234},
+                ),
+            ):
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                native_swap_transaction._supervisor_identity(runtime, timeout=1.0)
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+            self.assertEqual(peer_pid.call_count, 2)
+
+    def test_handover_requires_live_attached_provider_and_stable_state(self) -> None:
+        saved = [
+            {
+                "agent_id": "WIKI-HANDOVER",
+                "run_id": "run-before-swap",
+                "provider_session_id": "provider-before-swap",
+            }
+        ]
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            native_swap_transaction, "SupervisorClient"
+        ) as client_type:
+            client = client_type.return_value
+            client.ping.return_value = {"status": "ok", "pid": 1234}
+            client.request.return_value = {
+                "agent_id": "WIKI-HANDOVER",
+                "run_id": "run-before-swap",
+                "provider_session_id": "provider-before-swap",
+                "control_attached": False,
+                "provider_alive": False,
+                "state": "idle",
+            }
+            with self.assertRaisesRegex(RuntimeError, "did not restore"):
+                native_swap_transaction._wait_for_handover(
+                    Path(tmp), saved, timeout=0.11
+                )
+
+            client.request.side_effect = [
+                {
+                    "agent_id": "WIKI-HANDOVER",
+                    "run_id": "run-before-swap",
+                    "provider_session_id": "provider-before-swap",
+                    "control_attached": True,
+                    "provider_alive": True,
+                    "state": "idle",
+                },
+                {
+                    "agent_id": "WIKI-HANDOVER",
+                    "run_id": "run-before-swap",
+                    "provider_session_id": "provider-before-swap",
+                    "control_attached": True,
+                    "provider_alive": True,
+                    "state": "idle",
+                },
+            ]
+            native_swap_transaction._wait_for_handover(
+                Path(tmp), saved, timeout=1.0
+            )
+
+    def test_swap_uses_three_argument_default_starter_for_saved_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage_root = root / "stage"
+            live = root / "src-tauri" / "target" / "release" / "bundle" / "macos" / "Wiki.app"
+            staged = stage_root / "target" / "release" / "bundle" / "macos" / "Wiki.app"
+            runtime = root / "runtime"
+            sidecar = staged / "Contents/Resources/wiki-backend-sidecar/wiki-backend"
+            stage_root.mkdir(parents=True)
+            sidecar.parent.mkdir(parents=True)
+            staged.mkdir(parents=True, exist_ok=True)
+            live.mkdir(parents=True)
+            runtime.mkdir()
+            (runtime / "app.lock").touch()
+            (live / "marker").write_text("old", encoding="utf-8")
+            (staged / "marker").write_text("new", encoding="utf-8")
+            sidecar.write_text("#!/bin/sh\n", encoding="utf-8")
+            sidecar.chmod(0o755)
+            saved_runs = [
+                {
+                    "agent_id": "WIKI-SAVED",
+                    "run_id": "run-saved",
+                    "provider_session_id": "session-saved",
+                }
+            ]
+            started: list[tuple[Path, Path, Path]] = []
+            handover_client = Mock()
+            handover_client.prepare_for_handover.return_value = saved_runs
+
+            def start_supervisor(
+                bundle: Path, runtime_dir: Path, repo_root: Path
+            ) -> None:
+                started.append((bundle, runtime_dir, repo_root))
+                native_swap_transaction._start_supervisor(bundle, runtime_dir, repo_root)
+
+            with (
+                patch.object(
+                    native_swap_transaction,
+                    "_supervisor_lock_is_free",
+                    return_value=False,
+                ),
+                patch.object(
+                    native_swap_transaction,
+                    "_supervisor_identity",
+                    return_value=(
+                        handover_client,
+                        1234,
+                        {"status": "ok", "pid": 1234},
+                    ),
+                ) as identity,
+                patch.object(native_swap_transaction, "_stop_supervisor"),
+                patch.object(native_swap_transaction, "_wait_for_handover"),
+                patch.object(
+                    native_swap_transaction.subprocess,
+                    "Popen",
+                ) as popen,
+            ):
+                native_swap_transaction.swap_native_app(
+                    stage_root,
+                    root,
+                    runtime,
+                    restart=lambda *_args: True,
+                    start_supervisor=start_supervisor,
+                )
+
+            self.assertEqual(identity.call_count, 1)
+            self.assertEqual(
+                started,
+                [(live.resolve(), runtime.resolve(), root.resolve())],
+            )
+            popen.assert_called_once()
+            self.assertEqual(popen.call_args.args[0][-1], "--supervisor")
+            self.assertEqual((live / "marker").read_text(encoding="utf-8"), "new")
+
+    def test_failed_handover_rolls_back_bundle_and_recovers_saved_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage_root = root / "stage"
+            live = root / "src-tauri" / "target" / "release" / "bundle" / "macos" / "Wiki.app"
+            staged = stage_root / "target" / "release" / "bundle" / "macos" / "Wiki.app"
+            runtime = root / "runtime"
+            stage_root.mkdir(parents=True)
+            live.mkdir(parents=True)
+            staged.mkdir(parents=True)
+            runtime.mkdir()
+            (runtime / "app.lock").touch()
+            (live / "marker").write_text("old", encoding="utf-8")
+            (staged / "marker").write_text("new", encoding="utf-8")
+            saved_runs = [
+                {
+                    "agent_id": "WIKI-SAVED",
+                    "run_id": "run-saved",
+                    "provider_session_id": "session-saved",
+                }
+            ]
+            started: list[tuple[Path, Path, Path]] = []
+            restarts: list[str] = []
+            handover_client = Mock()
+            handover_client.prepare_for_handover.return_value = saved_runs
+
+            def restart(bundle: Path, _runtime: Path, _repo: Path) -> bool:
+                restarts.append((bundle / "marker").read_text(encoding="utf-8"))
+                return True
+
+            def start_supervisor(
+                bundle: Path, runtime_dir: Path, repo_root: Path
+            ) -> None:
+                started.append((bundle, runtime_dir, repo_root))
+
+            with (
+                patch.object(
+                    native_swap_transaction,
+                    "_supervisor_lock_is_free",
+                    return_value=False,
+                ),
+                patch.object(
+                    native_swap_transaction,
+                    "_supervisor_identity",
+                    return_value=(
+                        handover_client,
+                        1234,
+                        {"status": "ok", "pid": 1234},
+                    ),
+                ),
+                patch.object(native_swap_transaction, "_stop_supervisor"),
+                patch.object(
+                    native_swap_transaction,
+                    "_wait_for_handover",
+                    side_effect=[RuntimeError("provider resume is pending"), None],
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "did not restore saved runs"):
+                    native_swap_transaction.swap_native_app(
+                        stage_root,
+                        root,
+                        runtime,
+                        restart=restart,
+                        start_supervisor=start_supervisor,
+                    )
+
+            self.assertEqual(restarts, ["new", "old"])
+            self.assertEqual((live / "marker").read_text(encoding="utf-8"), "old")
+            self.assertEqual(
+                started,
+                [
+                    (live.resolve(), runtime.resolve(), root.resolve()),
+                    (live.resolve(), runtime.resolve(), root.resolve()),
+                ],
+            )
 
     def test_swap_keeps_competing_process_out_during_restart_and_rollback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
