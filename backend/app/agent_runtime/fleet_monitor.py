@@ -363,35 +363,39 @@ class FleetMonitor:
                 )
                 if notif is not None:
                     results.append(notif)
-                if notif is not None or self._dedupe_was_sent(view, dedupe_key):
-                    hook_succeeded = True
-                    if self.on_transition is not None:
-                        try:
-                            hook_result = await self.on_transition(
-                                {
-                                    "agent_id": record.agent_id,
-                                    "run_id": record.run_id,
-                                    "status_state": view.status_state,
-                                    "previous_status_state": snapshot.status_state,
-                                    "status_mtime": view.status_mtime,
-                                    "step": view.step,
-                                    "pr": view.pr,
-                                    "verdict_path": view.verdict_path,
-                                    "orch": record.orchestrator_id,
-                                }
-                            )
-                            hook_succeeded = hook_result is not False
-                        except Exception:
-                            hook_succeeded = False
-                            logger.exception(
-                                "fleet_monitor: transition hook failed for %s",
-                                record.agent_id,
-                            )
-                    if hook_succeeded:
-                        snapshot.status_state = current_status_state[0]
-                        snapshot.pending_status_state = None
-                        snapshot.pending_status_dedupe_key = None
-                        self._clear_dedupe_key(view, dedupe_key)
+                observer_succeeded = notif is not None or self._dedupe_was_sent(
+                    view, dedupe_key
+                )
+                # Autopilot is a control path, not observer telemetry. Run it
+                # even when delivery to the orchestrator fails.
+                hook_succeeded = True
+                if self.on_transition is not None:
+                    try:
+                        hook_result = await self.on_transition(
+                            {
+                                "agent_id": record.agent_id,
+                                "run_id": record.run_id,
+                                "status_state": view.status_state,
+                                "previous_status_state": snapshot.status_state,
+                                "status_mtime": view.status_mtime,
+                                "step": view.step,
+                                "pr": view.pr,
+                                "verdict_path": view.verdict_path,
+                                "orch": record.orchestrator_id,
+                            }
+                        )
+                        hook_succeeded = hook_result is not False
+                    except Exception:
+                        hook_succeeded = False
+                        logger.exception(
+                            "fleet_monitor: transition hook failed for %s",
+                            record.agent_id,
+                        )
+                if observer_succeeded and hook_succeeded:
+                    snapshot.status_state = current_status_state[0]
+                    snapshot.pending_status_state = None
+                    snapshot.pending_status_dedupe_key = None
+                    self._clear_dedupe_key(view, dedupe_key)
 
         if record.state != snapshot.runtime_state:
             if record.state not in self.ACTIONABLE_RUNTIME_STATES:

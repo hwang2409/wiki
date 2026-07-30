@@ -296,6 +296,32 @@ def record_steer(
     )
 
 
+def record_verdict(
+    *,
+    ticket: str,
+    reviewer: str,
+    orch: str | None,
+    payload: dict,
+    request_id: str,
+    status_dir: Path | None = None,
+    wait_for_delivery: bool = False,
+) -> Future[None] | None:
+    """Persist a parsed reviewer verdict before autopilot acts on it."""
+
+    actor = orch or DEFAULT_ACTOR
+    return _record(
+        base_ticket(ticket),
+        "verdict",
+        reviewer,
+        orch_node_id(actor),
+        payload,
+        actor,
+        status_dir,
+        request_id=request_id,
+        wait_for_delivery=wait_for_delivery,
+    )
+
+
 def record_archive(
     *,
     agent_id: str,

@@ -530,6 +530,8 @@ MERGE-READY
             artifact.write_text(
                 """NOT-MERGE-READY: 1 finding
 
+source sha: 0123456
+
 1. [BLOCKING] backend/app/main.py:1 - unsafe merge
    fix: stop the merge
 """,
@@ -541,10 +543,28 @@ MERGE-READY
             ]
             steers: list[str] = []
             archived: list[str] = []
+            persisted: list[tuple[str, str]] = []
+
+            def record_verdict(_ticket, reviewer, verdict, _request_id):
+                persisted.append((reviewer, verdict.source_sha or ""))
+                graph["edges"].append(
+                    {
+                        "kind": "verdict",
+                        "from": reviewer,
+                        "payload": {
+                            "worker": reviewer,
+                            "state": verdict.state,
+                            "sha": verdict.source_sha,
+                            "findings": [finding.to_dict() for finding in verdict.findings],
+                        },
+                    }
+                )
+                return True
             controller = AutopilotController(
                 store=AutopilotStore(Path(directory) / "state"),
                 status_reader=lambda _ticket: {"pr": PR_URL, "sha": "0123456"},
                 graph_loader=lambda _ticket: graph,
+                record_verdict=record_verdict,
                 steer=lambda _ticket, message: steers.append(message),
                 archive=lambda reviewer: archived.append(reviewer),
             )
@@ -557,9 +577,47 @@ MERGE-READY
                 "verdict_path": str(artifact),
             }
             self.assertTrue(asyncio.run(controller.on_transition(event)))
+            self.assertEqual(persisted, [("WIKI-173-REVIEW1", "0123456")])
             self.assertEqual(len(steers), 1)
             self.assertEqual(archived, ["WIKI-173-REVIEW1"])
             self.assertIsNotNone(controller.status("WIKI-173")["last_event_key"])
+
+    def test_artifact_without_sha_is_invalid_and_cannot_merge_or_persist(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "reviewer-output.json"
+            artifact.write_text(
+                '{"state":"MERGE-READY","findings":[]}',
+                encoding="utf-8",
+            )
+            graph = _graph([])
+            graph["edges"] = [
+                {"kind": "spawn", "to": "WIKI-173-REVIEW1", "payload": {"role": "review"}}
+            ]
+            persisted: list[str] = []
+            merged: list[str] = []
+            controller = AutopilotController(
+                store=AutopilotStore(Path(directory) / "state"),
+                status_reader=lambda _ticket: {"pr": PR_URL, "sha": "0123456"},
+                graph_loader=lambda _ticket: graph,
+                record_verdict=lambda *_args: persisted.append("persisted"),
+                gate=lambda pr, _sha: {"verdict": "pass", "pr": pr},
+                merge=lambda pr, _sha: merged.append(pr),
+            )
+            controller.enable("WIKI-173")
+            result = asyncio.run(
+                controller.on_transition(
+                    {
+                        "agent_id": "WIKI-173-REVIEW1",
+                        "run_id": "r1",
+                        "status_state": "merge-ready",
+                        "status_mtime": 1,
+                        "verdict_path": str(artifact),
+                    }
+                )
+            )
+            self.assertTrue(result)
+            self.assertEqual(persisted, [])
+            self.assertEqual(merged, [])
 
     def test_steer_and_archive_stages_resume_without_duplicate_steer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -626,6 +684,44 @@ MERGE-READY
             )
             controller.enable("WIKI-173")
             self.assertEqual(merged, [PR_URL])
+
+    def test_enable_reconcile_routes_dirty_state_to_next_review(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            spawned: list[dict] = []
+            steers: list[str] = []
+            graph = _graph(
+                [
+                    {
+                        "state": "NOT-MERGE-READY",
+                        "sha": "0123456",
+                        "findings": [
+                            {
+                                "id": "F-abc123",
+                                "severity": "HIGH",
+                                "title": "stale finding",
+                                "observed": "bad",
+                                "why_wrong": "wrong",
+                                "do_instead": "fix",
+                            }
+                        ],
+                    }
+                ]
+            )
+            controller = AutopilotController(
+                store=AutopilotStore(Path(directory)),
+                status_reader=lambda _ticket: {
+                    "state": "merge-ready",
+                    "pr": PR_URL,
+                    "sha": "0123456",
+                },
+                graph_loader=lambda _ticket: graph,
+                next_review=lambda **kwargs: spawned.append(kwargs) or {"status": "spawned"},
+                steer=lambda _ticket, message: steers.append(message),
+                registry_reader=lambda: {"WIKI-173": {"current": {"orch": "wiki"}}},
+            )
+            controller.enable("WIKI-173")
+            self.assertEqual(len(spawned), 1)
+            self.assertEqual(steers, [])
 
     def test_transient_gate_failure_retries_same_transition(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

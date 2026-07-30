@@ -26,7 +26,7 @@ from urllib.parse import urlparse
 from .graph_health import load_validated_graph
 from .loop_state import derive_loop_state
 from .ticket import base_ticket
-from .autopilot_actions import steer_action_id
+from .autopilot_actions import steer_action_id, verdict_edge_id
 from .autopilot_parser import (
     Finding,
     Verdict,
@@ -200,6 +200,10 @@ def _pr_number(value: str | None) -> int | None:
 def _sha_matches(verdict_sha: str | None, head_sha: str | None) -> bool:
     if not verdict_sha or not head_sha:
         return False
+    if not re.fullmatch(r"[0-9a-fA-F]{7,64}", verdict_sha):
+        return False
+    if not re.fullmatch(r"[0-9a-fA-F]{7,64}", head_sha):
+        return False
     verdict = verdict_sha.lower()
     head = head_sha.lower()
     return verdict == head or head.startswith(verdict) or verdict.startswith(head)
@@ -217,6 +221,7 @@ class AutopilotController:
         graph_loader: Callable[[str], Mapping[str, Any] | None] | None = None,
         gate: Callable[[int, str], Mapping[str, Any]] | None = None,
         next_review: Callable[..., Mapping[str, Any]] | None = None,
+        record_verdict: Callable[[str, str, Verdict, str], Any] | None = None,
         steer: Callable[[str, str], Any] | None = None,
         archive: Callable[[str], Any] | None = None,
         merge: Callable[[str], Any] | None = None,
@@ -228,6 +233,7 @@ class AutopilotController:
         self.graph_loader = graph_loader or self._default_graph
         self.gate = gate or self._default_gate
         self.next_review = next_review or self._default_next_review
+        self.record_verdict = record_verdict or self._default_record_verdict
         self.steer = steer or self._default_steer
         self._structured_steer = steer is None
         self.archive = archive or self._default_archive
@@ -256,11 +262,8 @@ class AutopilotController:
             enabled_state = current
         status = self.status_reader(ticket)
         if isinstance(status, Mapping) and status.get("state") == "merge-ready":
-            graph = self.graph_loader(ticket)
-            reviewer = self._current_reviewer(graph)
-            agent_id = reviewer or ticket
             event = {
-                "agent_id": agent_id,
+                "agent_id": ticket,
                 "run_id": status.get("run_id") or "autopilot-enable",
                 "status_state": "merge-ready",
                 "status_mtime": time.time_ns(),
@@ -268,7 +271,14 @@ class AutopilotController:
                 "pr": status.get("pr"),
                 "verdict_path": status.get("verdict_path") or status.get("artifact_path"),
             }
-            asyncio.run(self.on_transition(event))
+            async def reconcile() -> None:
+                with self.store.lock(ticket):
+                    state = self.store.load(ticket)
+                    if state.enabled and not state.halted:
+                        await self._implementer_ready(ticket, event, state)
+                    self.store.save(ticket, state)
+
+            asyncio.run(reconcile())
             enabled_state = self.store.load(ticket)
         return enabled_state.to_dict()
 
@@ -395,14 +405,21 @@ class AutopilotController:
         status = self.status_reader(ticket)
         sha = self._current_sha(ticket, status, event)
         verdict = self._latest_verdict(graph, reviewer=reviewer)
+        parsed_from_artifact = verdict is None
         if verdict is None:
             verdict = self._read_verdict_file(
                 reviewer,
                 event.get("verdict_path"),
-                source_sha=sha,
             )
         if verdict is None:
             return False
+        if not verdict.source_sha:
+            self._log(
+                state,
+                "reviewer-verdict-invalid-missing-sha",
+                {"reviewer": reviewer},
+            )
+            return True
         if not _sha_matches(verdict.source_sha, sha):
             self._log(
                 state,
@@ -410,6 +427,16 @@ class AutopilotController:
                 {"reviewer": reviewer, "verdict_sha": verdict.source_sha, "head_sha": sha},
             )
             return True
+        if parsed_from_artifact:
+            request_id = verdict_edge_id(ticket, reviewer, verdict)
+            persisted = await self._persist_verdict(
+                ticket, reviewer, verdict, request_id=request_id
+            )
+            if not persisted:
+                return False
+            refreshed = self.graph_loader(ticket)
+            if refreshed is not None:
+                graph = refreshed
         self._log(state, "parsed-verdict", {"reviewer": reviewer, **verdict.to_dict()})
         if not verdict.clean:
             message = build_steer_message(verdict, target_worker=ticket)
@@ -459,6 +486,23 @@ class AutopilotController:
                 self._halt(ticket, state, "iteration-cap")
             return True
         return await self._maybe_merge(ticket, state, verdict)
+
+    async def _persist_verdict(
+        self,
+        ticket: str,
+        reviewer: str,
+        verdict: Verdict,
+        *,
+        request_id: str,
+    ) -> bool:
+        result = await self._invoke(
+            self.record_verdict,
+            ticket,
+            reviewer,
+            verdict,
+            request_id,
+        )
+        return result is not False
 
     async def _implementer_ready(
         self, ticket: str, event: Mapping[str, Any], state: AutopilotState
@@ -738,13 +782,13 @@ class AutopilotController:
         try:
             value = json.loads(raw)
         except ValueError:
-            return parse_verdict(raw, source_sha=source_sha)
+            return parse_verdict(raw)
         if not isinstance(value, Mapping):
             return None
         text = value.get("text") or value.get("content")
         if isinstance(text, str):
-            return parse_verdict(text, source_sha=source_sha or value.get("source_sha"))
-        return verdict_from_graph({**value, "source_sha": value.get("source_sha") or source_sha})
+            return parse_verdict(text)
+        return verdict_from_graph(value)
 
     def _orchestrator(self, ticket: str, graph: Mapping[str, Any] | None) -> str | None:
         if graph and isinstance(graph.get("orch"), str):
@@ -812,6 +856,48 @@ class AutopilotController:
         from .next_review import next_review
 
         return next_review(**kwargs)
+
+    def _default_record_verdict(
+        self,
+        ticket: str,
+        reviewer: str,
+        verdict: Verdict,
+        request_id: str,
+    ) -> Any:
+        from .. import main, workgraph_service
+
+        graph = self.graph_loader(ticket)
+        orch = graph.get("orch") if isinstance(graph, Mapping) else None
+        if not isinstance(orch, str) or not orch:
+            return False
+        created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        findings = [
+            finding.to_steer_dict(
+                source_worker=reviewer,
+                source_sha=verdict.source_sha,
+                created_at=created_at,
+            )
+            for finding in verdict.findings
+        ]
+        payload = {
+            "worker": reviewer,
+            "sha": verdict.source_sha,
+            "state": verdict.state,
+            "findings": findings,
+            "created_at": created_at,
+        }
+        delivered = workgraph_service.record_verdict(
+            ticket=ticket,
+            reviewer=reviewer,
+            orch=orch,
+            payload=payload,
+            request_id=request_id,
+            status_dir=main.AGENT_STATUS_DIR,
+            wait_for_delivery=True,
+        )
+        if delivered is not None:
+            delivered.result(timeout=10)
+        return True
 
     @staticmethod
     def _default_steer(
