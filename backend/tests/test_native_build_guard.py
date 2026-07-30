@@ -15,6 +15,7 @@ import scripts.atomic_swap as atomic_swap_module
 from scripts.atomic_swap import atomic_replace, rollback_replace
 from scripts.native_build_guard import inspect_runtime
 from scripts.native_daemon_restart import restart_daemon_if_installed
+from scripts.native_swap_transaction import swap_native_app
 
 
 class NativeBuildGuardTests(TestCase):
@@ -208,3 +209,50 @@ class NativeBuildGuardTests(TestCase):
             self.assertEqual((live / "marker").read_text(encoding="utf-8"), "old")
             self.assertEqual((staged / "marker").read_text(encoding="utf-8"), "new")
             self.assertFalse(sentinel.exists())
+
+    def test_swap_keeps_competing_process_out_during_restart_and_rollback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage_root = root / "stage"
+            live = root / "src-tauri" / "target" / "release" / "bundle" / "macos" / "Wiki.app"
+            staged = stage_root / "target" / "release" / "bundle" / "macos" / "Wiki.app"
+            runtime = root / "runtime"
+            stage_root.mkdir(parents=True)
+            live.mkdir(parents=True)
+            staged.mkdir(parents=True)
+            runtime.mkdir()
+            (runtime / "app.lock").touch()
+            (runtime / "supervisor.lock").touch()
+            (live / "marker").write_text("old", encoding="utf-8")
+            (staged / "marker").write_text("new", encoding="utf-8")
+            restart_markers: list[str] = []
+
+            def restart(live_bundle: Path, runtime_dir: Path, _repo_root: Path) -> bool:
+                competing = subprocess.run(
+                    [
+                        sys.executable,
+                        str(Path(__file__).parents[2] / "scripts" / "native_build_guard.py"),
+                        "--runtime-dir",
+                        str(runtime_dir),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertNotEqual(competing.returncode, 0)
+                restart_markers.append((live_bundle / "marker").read_text(encoding="utf-8"))
+                if len(restart_markers) == 1:
+                    raise RuntimeError("new daemon fingerprint mismatch")
+                return True
+
+            with self.assertRaisesRegex(RuntimeError, "new daemon failed"):
+                swap_native_app(
+                    stage_root,
+                    root,
+                    runtime,
+                    restart=restart,
+                )
+
+            self.assertEqual(restart_markers, ["new", "old"])
+            self.assertEqual((live / "marker").read_text(encoding="utf-8"), "old")
+            self.assertFalse(inspect_runtime(runtime).running)

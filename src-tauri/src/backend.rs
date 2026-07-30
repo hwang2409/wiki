@@ -377,7 +377,9 @@ fn sidecar_environment_without_secret() -> Vec<(OsString, OsString)> {
 }
 
 fn launch_backend_and_navigate(app: &AppHandle) {
-    let launch_result = if let Ok(url) = env::var("WIKI_NATIVE_BACKEND_URL") {
+    let launch_result = if native_dev_mode() {
+        start_sidecar(app, 0)
+    } else if let Ok(url) = env::var("WIKI_NATIVE_BACKEND_URL") {
         let launch_url = normalize_launch_url(&url);
         wait_for_health(app, &launch_url, None).map(|_| launch_url)
     } else {
@@ -407,6 +409,14 @@ fn launch_backend_and_navigate(app: &AppHandle) {
             show_error_dialog(app, "Wiki backend failed to start", &format!("{err}"));
         }
     }
+}
+
+fn native_dev_mode() -> bool {
+    native_dev_flag(env::var("WIKI_NATIVE_DEV").ok().as_deref())
+}
+
+fn native_dev_flag(value: Option<&str>) -> bool {
+    matches!(value, Some("1" | "true" | "yes" | "on"))
 }
 
 fn set_app_secret(app: &AppHandle, secret: String) {
@@ -901,6 +911,13 @@ mod tests {
         assert!(super::sidecar_environment_without_secret()
             .iter()
             .all(|(key, _)| key != "WIKI_APP_SECRET"));
+    }
+
+    #[test]
+    fn native_dev_bypasses_installed_daemon_probe() {
+        assert!(super::native_dev_flag(Some("1")));
+        assert!(!super::native_dev_flag(Some("0")));
+        assert!(!super::native_dev_flag(None));
     }
 
     #[test]
