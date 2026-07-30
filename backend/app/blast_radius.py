@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import threading
 import time
@@ -132,9 +133,9 @@ def parse_open_pr_snapshot(payload: object) -> tuple[OpenPRBranch, ...]:
             head_sha = row.get("headRefOid") or row.get("head_sha")
             ticket = row.get("ticket")
         else:
-            continue
+            raise ValueError("open PR snapshot contains a malformed row")
         if not _valid_snapshot_branch(raw_name):
-            continue
+            raise ValueError("open PR snapshot contains an invalid branch row")
         name = _logical_branch_name(str(raw_name).strip())
         normalized_sha = str(head_sha).strip() if head_sha else None
         normalized_ticket = str(ticket).strip() if ticket else None
@@ -146,12 +147,16 @@ def _validate_open_pr_payload(payload: object) -> None:
     rows = payload
     reported_total: int | None = None
     if isinstance(payload, dict):
-        rows = payload.get("branches") or payload.get("pullRequests") or []
+        if "branches" not in payload and "pullRequests" not in payload:
+            raise ValueError("open PR snapshot has no branch rows")
+        rows = payload.get("branches") if "branches" in payload else payload.get("pullRequests")
         for key in ("totalCount", "total_count", "total"):
             value = payload.get(key)
             if isinstance(value, int) and not isinstance(value, bool):
                 reported_total = value
                 break
+    if not isinstance(rows, list | tuple):
+        raise ValueError("open PR snapshot rows must be a list")
     if reported_total is not None and reported_total > MAX_ACTIVE_BRANCHES:
         raise RuntimeError(
             f"open PR snapshot truncated; reported more than {MAX_ACTIVE_BRANCHES} branches"
@@ -164,13 +169,14 @@ def _validate_open_pr_payload(payload: object) -> None:
         raise RuntimeError("open PR snapshot truncated; fetched fewer than the reported branch total")
 
 
-def _default_open_pr_provider() -> object:
+def _default_open_pr_provider(repo_root: Path | None = None) -> object:
     """Read open PR heads outside the request path.
 
     The snapshot is refreshed by a background thread. A request only reads
     the last successful snapshot and never invokes GitHub or ``gh``.
     """
 
+    bound_repo = (repo_root or Path(__file__).resolve().parents[2]).resolve()
     try:
         result = subprocess.run(
             [
@@ -188,6 +194,7 @@ def _default_open_pr_provider() -> object:
             text=True,
             timeout=10,
             check=False,
+            cwd=str(bound_repo),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise RuntimeError(str(exc)) from exc
@@ -211,6 +218,8 @@ class OpenPRSnapshot:
         refresh_seconds: float = OPEN_PR_REFRESH_SECONDS,
     ) -> None:
         self.provider = provider or _default_open_pr_provider
+        self.repo_root: Path | None = None
+        self._custom_provider = provider
         self.refresh_seconds = max(1.0, refresh_seconds)
         self._state = OpenPRSnapshotState((), False, None, "open PR snapshot has not refreshed")
         self._lock = threading.Lock()
@@ -221,9 +230,16 @@ class OpenPRSnapshot:
         with self._lock:
             return self._state
 
+    def set_repo_root(self, repo_root: Path) -> None:
+        self.repo_root = repo_root.resolve()
+
     def refresh(self) -> OpenPRSnapshotState:
         try:
-            payload = self.provider()
+            payload = (
+                self._custom_provider()
+                if self._custom_provider is not None
+                else _default_open_pr_provider(self.repo_root)
+            )
             _validate_open_pr_payload(payload)
             branches = parse_open_pr_snapshot(payload)
             if len(branches) > MAX_ACTIVE_BRANCHES:
@@ -355,12 +371,18 @@ def _refs(repo_root: Path, *, timeout: float) -> dict[str, BranchRef]:
     )
     refs: dict[str, BranchRef] = {}
     for line in output.splitlines():
+        if not line:
+            continue
         parts = line.split("\x00")
         if len(parts) != 3:
-            continue
+            raise GitAnalysisError("git refs output is malformed")
         short, ref, sha = parts
         if not short or not ref or not sha or short.endswith("/HEAD"):
-            continue
+            if short.endswith("/HEAD"):
+                continue
+            raise GitAnalysisError("git refs output contains an invalid ref")
+        if not re.fullmatch(r"[0-9a-fA-F]{40,64}", sha):
+            raise GitAnalysisError("git refs output contains an invalid object id")
         refs.setdefault(short, BranchRef(name=short, ref=ref, head_sha=sha))
     return refs
 
@@ -418,6 +440,24 @@ def _registry_rows(registry: dict[str, Any]) -> Iterable[tuple[str, dict[str, An
             yield ticket, current
 
 
+def _registry_shape_failures(registry: object) -> list[dict[str, str]]:
+    if not isinstance(registry, dict):
+        return [_failed("agent registry", "registry must be an object")]
+    failures: list[dict[str, str]] = []
+    for ticket, entry in registry.items():
+        if isinstance(ticket, str) and ticket.startswith("_"):
+            if ticket == "_orchestrators" and entry is not None and not isinstance(entry, dict):
+                failures.append(_failed(ticket, "registry entry must be an object"))
+            continue
+        if not isinstance(ticket, str) or not isinstance(entry, dict):
+            failures.append(_failed(str(ticket), "registry entry is malformed"))
+            continue
+        current = entry.get("current")
+        if current is not None and not isinstance(current, dict):
+            failures.append(_failed(ticket, "registry current entry is malformed"))
+    return failures
+
+
 def _branch_hint(current: dict[str, Any]) -> str | None:
     for key in ("branch", "branch_name", "pr_branch", "head_ref_name"):
         value = current.get(key)
@@ -469,10 +509,95 @@ def _failed(branch: str, reason: str) -> dict[str, str]:
     return {"branch": branch, "reason": reason[:200]}
 
 
-def _add_selected(selected: dict[str, ActiveBranch], branch: ActiveBranch) -> None:
-    existing = selected.get(branch.name)
-    if existing is None or (branch.source == "worker" and existing.source != "worker"):
-        selected[branch.name] = branch
+def _add_selected(selected: dict[str, list[ActiveBranch]], branch: ActiveBranch) -> None:
+    candidates = selected.setdefault(branch.name, [])
+    if branch not in candidates:
+        candidates.append(branch)
+
+
+def _is_ancestor(repo_root: Path, ancestor: str, descendant: str, *, timeout: float) -> bool:
+    if not re.fullmatch(r"[0-9a-fA-F]{40,64}", ancestor) or not re.fullmatch(
+        r"[0-9a-fA-F]{40,64}", descendant
+    ):
+        raise GitAnalysisError("branch head is not a valid Git object id")
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "merge-base",
+                "--is-ancestor",
+                ancestor,
+                descendant,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=max(0.05, timeout),
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise GitAnalysisError(str(exc)) from exc
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    raise GitAnalysisError((result.stderr or result.stdout or "cannot compare branch heads").strip()[:200])
+
+
+def _reconcile_selected_heads(
+    repo_root: Path,
+    candidates: dict[str, list[ActiveBranch]],
+    *,
+    deadline: float,
+) -> tuple[dict[str, ActiveBranch], list[dict[str, str]]]:
+    selected: dict[str, ActiveBranch] = {}
+    failures: list[dict[str, str]] = []
+    for name, branches in candidates.items():
+        pr = next((branch for branch in branches if branch.source == "pr"), None)
+        workers = [branch for branch in branches if branch.source == "worker"]
+        if pr is None:
+            unique_heads = {branch.head_sha for branch in workers}
+            if len(unique_heads) > 1:
+                failures.append(_failed(name, "worker branch heads do not agree"))
+                continue
+            if workers:
+                selected[name] = workers[0]
+            continue
+
+        winner = pr
+        undecidable = False
+        for worker in workers:
+            if worker.head_sha == winner.head_sha:
+                continue
+            try:
+                worker_descendant = _is_ancestor(
+                    repo_root,
+                    winner.head_sha,
+                    worker.head_sha,
+                    timeout=min(GIT_TIMEOUT_SECONDS, max(0.05, deadline - time.monotonic())),
+                )
+                winner_descendant = _is_ancestor(
+                    repo_root,
+                    worker.head_sha,
+                    winner.head_sha,
+                    timeout=min(GIT_TIMEOUT_SECONDS, max(0.05, deadline - time.monotonic())),
+                )
+            except GitAnalysisError as exc:
+                failures.append(_failed(name, f"cannot compare PR and worker branch heads: {exc}"))
+                undecidable = True
+                break
+            if worker_descendant and not winner_descendant:
+                winner = worker
+            elif winner_descendant and not worker_descendant:
+                continue
+            else:
+                failures.append(_failed(name, "PR and worker branch heads are mismatched or unrelated"))
+                undecidable = True
+                break
+        if not undecidable:
+            selected[name] = winner
+    return selected, failures
 
 
 def discover_active_branch_result(
@@ -484,7 +609,7 @@ def discover_active_branch_result(
     deadline: float,
 ) -> DiscoveryResult:
     failures: list[dict[str, str]] = []
-    selected: dict[str, ActiveBranch] = {}
+    selected: dict[str, list[ActiveBranch]] = {}
 
     if pr_snapshot.complete:
         if len(pr_snapshot.branches) > MAX_ACTIVE_BRANCHES:
@@ -609,12 +734,14 @@ def discover_active_branch_result(
             ),
         )
 
+    reconciled, head_failures = _reconcile_selected_heads(repo_root, selected, deadline=deadline)
+    failures.extend(head_failures)
     workers = sorted(
-        (branch for branch in selected.values() if branch.source == "worker"),
+        (branch for branch in reconciled.values() if branch.source == "worker"),
         key=lambda branch: branch.name,
     )
     other_branches = sorted(
-        (branch for branch in selected.values() if branch.source != "worker"),
+        (branch for branch in reconciled.values() if branch.source != "worker"),
         key=lambda branch: branch.name,
     )
     all_branches = [*workers, *other_branches]
@@ -802,6 +929,7 @@ def analyze(
     *,
     cache: DiffCache = DIFF_CACHE,
     pr_snapshot: OpenPRSnapshot | OpenPRSnapshotState | None = None,
+    registry_error: str | None = None,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + ANALYSIS_TIMEOUT_SECONDS
     snapshot_state = (
@@ -822,6 +950,11 @@ def analyze(
             snapshot_state.refreshed_at,
             snapshot_state.error or "open PR snapshot is stale",
         )
+    registry_failures = _registry_shape_failures(registry)
+    if registry_error:
+        registry_failures.insert(0, _failed("agent registry", registry_error))
+    if not isinstance(registry, dict):
+        registry = {}
     try:
         refs = _refs(repo_root, timeout=GIT_TIMEOUT_SECONDS)
     except GitAnalysisError as exc:
@@ -830,7 +963,7 @@ def analyze(
             candidate_found=None if candidate.strip().lower() in {"", "all"} else False,
             branches=[],
             collisions=[],
-            failed_branches=[_failed("git refs", str(exc))],
+            failed_branches=[*registry_failures, _failed("git refs", str(exc))],
             refreshed_at=snapshot_state.refreshed_at,
             error="branch refs are unavailable",
         )
@@ -842,7 +975,7 @@ def analyze(
             candidate_found=None if candidate.strip().lower() in {"", "all"} else False,
             branches=[],
             collisions=[],
-            failed_branches=[_failed("main", "main ref is not present in fetched refs")],
+            failed_branches=[*registry_failures, _failed("main", "main ref is not present in fetched refs")],
             refreshed_at=snapshot_state.refreshed_at,
             error="main ref is unavailable",
         )
@@ -854,7 +987,7 @@ def analyze(
         pr_snapshot=snapshot_state,
         deadline=deadline,
     )
-    failures = list(discovery.failed_branches)
+    failures = [*registry_failures, *discovery.failed_branches]
     if not snapshot_state.complete:
         reason = snapshot_state.error or "snapshot is incomplete"
         if snapshot_stale and "stale" not in reason:

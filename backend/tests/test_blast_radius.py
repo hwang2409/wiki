@@ -191,6 +191,43 @@ class BlastRadiusTests(unittest.TestCase):
         self.assertIsNone(payload["risk"])
         self.assertTrue(any("no merge base" in failure["reason"] for failure in payload["failed_branches"]))
 
+    def test_worker_and_pr_heads_use_the_newer_descendant(self) -> None:
+        old_one = self.refs()["one"].head_sha
+        git(self.fixture.root, "switch", "two")
+        (self.fixture.root / "collision.md").write_text("two\n", encoding="utf-8")
+        git(self.fixture.root, "add", "--", "collision.md")
+        git(self.fixture.root, "commit", "-m", "two collision")
+        git(self.fixture.root, "switch", "one")
+        (self.fixture.root / "collision.md").write_text("one\n", encoding="utf-8")
+        git(self.fixture.root, "add", "--", "collision.md")
+        git(self.fixture.root, "commit", "-m", "one collision")
+        new_one = git(self.fixture.root, "rev-parse", "HEAD")
+        git(self.fixture.root, "switch", "main")
+        git(self.fixture.root, "update-ref", "refs/heads/one", old_one)
+        git(self.fixture.root, "update-ref", "refs/remotes/origin/one", new_one)
+        refs = self.refs()
+        snapshot = blast_radius.OpenPRSnapshotState(
+            (
+                blast_radius.OpenPRBranch("one", new_one),
+                blast_radius.OpenPRBranch("two", refs["two"].head_sha),
+            ),
+            True,
+            time.time(),
+        )
+        payload = blast_radius.analyze(
+            self.fixture.root,
+            {"ONE": {"current": {"role": "implement", "branch": "one"}}},
+            cache=blast_radius.DiffCache(),
+            pr_snapshot=snapshot,
+        )
+        self.assertTrue(payload["complete"])
+        self.assertTrue(
+            any(
+                "collision.md" in collision["overlap"]
+                for collision in payload["collisions"]
+            )
+        )
+
     def test_timeout_is_reported_and_never_becomes_no_overlap(self) -> None:
         with mock.patch.object(
             blast_radius,
@@ -389,6 +426,14 @@ class BlastRadiusTests(unittest.TestCase):
         self.assertIsNone(analyzed["risk"])
         self.assertTrue(any(failure["branch"] == "open PR snapshot" for failure in analyzed["failed_branches"]))
 
+    def test_malformed_provider_row_is_incomplete(self) -> None:
+        snapshot = blast_radius.OpenPRSnapshot(
+            lambda: [{"headRefName": "one"}, {"headRefName": "bad branch"}]
+        )
+        state = snapshot.refresh()
+        self.assertFalse(state.complete)
+        self.assertIn("invalid branch row", state.error or "")
+
     def test_provider_truncation_is_incomplete(self) -> None:
         snapshot = blast_radius.OpenPRSnapshot(
             lambda: [{"headRefName": f"branch-{index}"} for index in range(blast_radius.MAX_ACTIVE_BRANCHES + 1)]
@@ -396,6 +441,19 @@ class BlastRadiusTests(unittest.TestCase):
         state = snapshot.refresh()
         self.assertFalse(state.complete)
         self.assertIn("truncated", state.error or "")
+
+    def test_default_provider_binds_gh_to_the_repository(self) -> None:
+        completed = subprocess.CompletedProcess(
+            ["gh"],
+            0,
+            stdout="[]",
+            stderr="",
+        )
+        with mock.patch.object(blast_radius.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(blast_radius._default_open_pr_provider(self.fixture.root), [])
+        command = run.call_args.args[0]
+        self.assertEqual(command[:3], ["gh", "pr", "list"])
+        self.assertEqual(run.call_args.kwargs["cwd"], str(self.fixture.root.resolve()))
 
     def test_malformed_registry_and_branch_input_do_not_escape_git(self) -> None:
         payload = blast_radius.analyze(
@@ -406,6 +464,29 @@ class BlastRadiusTests(unittest.TestCase):
         )
         self.assertFalse(payload["candidate_found"])
         self.assertEqual(payload["branches"], [])
+
+    def test_malformed_registry_entry_is_incomplete(self) -> None:
+        payload = blast_radius.analyze(
+            self.fixture.root,
+            {"BAD": "not an entry"},
+            cache=blast_radius.DiffCache(),
+            pr_snapshot=blast_radius.OpenPRSnapshotState((), True, time.time()),
+        )
+        self.assertFalse(payload["complete"])
+        self.assertIsNone(payload["risk"])
+        self.assertTrue(any(failure["branch"] == "BAD" for failure in payload["failed_branches"]))
+
+    def test_malformed_git_refs_output_is_incomplete(self) -> None:
+        with mock.patch.object(blast_radius, "_run_git", return_value="malformed refs output"):
+            payload = blast_radius.analyze(
+                self.fixture.root,
+                {},
+                cache=blast_radius.DiffCache(),
+                pr_snapshot=blast_radius.OpenPRSnapshotState((), True, time.time()),
+            )
+        self.assertFalse(payload["complete"])
+        self.assertIsNone(payload["risk"])
+        self.assertIn("git refs", {failure["branch"] for failure in payload["failed_branches"]})
 
 
 class RouteTests(unittest.TestCase):
@@ -419,6 +500,19 @@ class RouteTests(unittest.TestCase):
         ):
             payload = main.blast_radius_view(candidate="all", branch=None, ticket=None)
         self.assertIn("risk", payload)
+
+    def test_route_carries_registry_read_failure_into_incomplete_result(self) -> None:
+        from backend.app import main
+
+        fixture = FixtureRepo()
+        self.addCleanup(fixture.close)
+        with mock.patch.object(main, "ROOT_DIR", fixture.root), mock.patch.object(
+            main, "_read_agent_registry", side_effect=OSError("registry unreadable")
+        ):
+            payload = main.blast_radius_view(candidate="all", branch=None, ticket=None)
+        self.assertFalse(payload["complete"])
+        self.assertIsNone(payload["risk"])
+        self.assertTrue(any(failure["branch"] == "agent registry" for failure in payload["failed_branches"]))
 
 
 if __name__ == "__main__":

@@ -68,6 +68,7 @@ from .next_review_schema import NextReviewIn
 
 
 ROOT_DIR = Path(os.environ.get("WIKI_REPO_DIR", Path(__file__).resolve().parents[2])).resolve()
+blast_radius.OPEN_PR_SNAPSHOT.set_repo_root(ROOT_DIR)
 VAULT_DIR = Path(os.environ.get("WIKI_VAULT_DIR", ROOT_DIR / "vault")).resolve()
 # File API paths are relative to the repository root. Note paths remain
 # vault-relative because the note API is rooted at VAULT_DIR.
@@ -2354,7 +2355,16 @@ def blast_radius_view(
     """Return bounded branch overlap data from the primary repository refs."""
 
     selected = branch or ticket or candidate
-    return blast_radius.analyze(ROOT_DIR, _read_agent_registry(), selected)
+    try:
+        registry = _read_agent_registry(strict=True)
+    except (OSError, ValueError) as exc:
+        return blast_radius.analyze(
+            ROOT_DIR,
+            {},
+            selected,
+            registry_error=f"agent registry is unavailable: {exc}",
+        )
+    return blast_radius.analyze(ROOT_DIR, registry, selected)
 
 
 @app.get("/api/agents/{ticket}/workgraph")
@@ -3594,11 +3604,15 @@ def _write_queue(queue: dict[str, list[dict]]) -> None:
     tmp.rename(MSG_QUEUE_PATH)
 
 
-def _read_agent_registry() -> dict:
+def _read_agent_registry(*, strict: bool = False) -> dict:
     try:
         data = json.loads(AGENT_REGISTRY_PATH.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            raise ValueError("agent registry must be an object")
+        return data
     except (OSError, ValueError):
+        if strict:
+            raise
         return {}
 
 
