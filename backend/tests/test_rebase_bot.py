@@ -308,12 +308,35 @@ class RebaseBotTests(unittest.TestCase):
             with self.assertRaisesRegex(RebaseError, "pytest cannot open the live"):
                 rebase_durable._durable_state_path()
 
-    def test_rebase_test_does_not_touch_live_durable_store(self) -> None:
-        live_state = Path.home() / ".wiki" / "agent-runtime" / "rebase-bot" / "state.json"
-        before = live_state.read_bytes() if live_state.exists() else None
+    def test_rebase_test_uses_session_runtime_only(self) -> None:
+        session_runtime = Path(os.environ["WIKI_AGENT_RUNTIME_DIR"]).resolve()
+        live_root = (Path.home() / ".wiki" / "agent-runtime").absolute()
+
+        def reject_live_path(path: Path) -> None:
+            candidate = path.absolute()
+            if candidate == live_root or live_root in candidate.parents:
+                raise AssertionError(f"test touched live runtime: {candidate}")
+
+        original_open = Path.open
+        original_replace = Path.replace
+        original_write_text = Path.write_text
+
+        def guarded_open(path: Path, *args: object, **kwargs: object):
+            reject_live_path(path)
+            return original_open(path, *args, **kwargs)
+
+        def guarded_replace(path: Path, target: Path):
+            reject_live_path(path)
+            reject_live_path(target)
+            return original_replace(path, target)
+
+        def guarded_write_text(path: Path, *args: object, **kwargs: object):
+            reject_live_path(path)
+            return original_write_text(path, *args, **kwargs)
+
         with tempfile.TemporaryDirectory() as raw:
             fake_main = SimpleNamespace(
-                AGENT_RUNTIME_DIR=raw,
+                AGENT_RUNTIME_DIR=session_runtime,
                 _registry_agent=lambda _registry, _worker: (
                     "WIKI-175-IMPL",
                     {},
@@ -325,6 +348,9 @@ class RebaseBotTests(unittest.TestCase):
                 mock.patch.object(rebase_bot, "_main", return_value=fake_main),
                 mock.patch.object(rebase_bot, "_validate_pr_binding"),
                 mock.patch.object(rebase_bot, "_start_rebase_thread"),
+                mock.patch.object(Path, "open", guarded_open),
+                mock.patch.object(Path, "replace", guarded_replace),
+                mock.patch.object(Path, "write_text", guarded_write_text),
             ):
                 result = rebase_bot.rebase_dirty_pr(
                     175,
@@ -339,9 +365,9 @@ class RebaseBotTests(unittest.TestCase):
                         }
                     },
                 )
-        after = live_state.read_bytes() if live_state.exists() else None
         self.assertEqual(result["status"], "started")
-        self.assertEqual(before, after)
+        durable_path = rebase_durable._durable_state_path().resolve()
+        self.assertTrue(durable_path.is_relative_to(session_runtime), durable_path)
 
     def test_rebase_worker_thread_stays_in_isolated_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

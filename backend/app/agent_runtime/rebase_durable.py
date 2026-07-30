@@ -43,6 +43,7 @@ _OUTBOX_BACKOFF_BASE_SECONDS = 2.0
 _OUTBOX_BACKOFF_CAP_SECONDS = 300.0
 _TEMP_COUNTER = 0
 _TEMP_COUNTER_LOCK = threading.Lock()
+_TEST_RUNTIME_GUARD = bool(os.environ.get("WIKI_REBASE_TEST_MODE"))
 
 
 @dataclass
@@ -97,8 +98,10 @@ def _durable_state_path() -> Path:
         else Path(tempfile.gettempdir()) / "wiki-agent-runtime"
     )
     state_path = root / "rebase-bot" / "state.json"
-    if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get(
-        "WIKI_REBASE_TEST_MODE"
+    if (
+        _TEST_RUNTIME_GUARD
+        or os.environ.get("PYTEST_CURRENT_TEST")
+        or os.environ.get("WIKI_REBASE_TEST_MODE")
     ):
         live_root = Path.home() / ".wiki" / "agent-runtime"
         try:

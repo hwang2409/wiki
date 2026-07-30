@@ -30,8 +30,23 @@ def purge(runtime_dir: Path) -> int:
             if record.get("status") == "completed"
             and str(record.get("expected_sha") or "").startswith("retry-test-")
         ]
+        delivery_ids: set[str] = set()
+        for key in keys:
+            record = rebase_durable._DURABLE_JOBS[key]
+            result = record.get("result")
+            if not isinstance(result, dict):
+                continue
+            delivery_parts = (
+                str(record.get("pr_number") or ""),
+                str(record.get("expected_sha") or ""),
+                str(result.get("status") or ""),
+                str(result.get("head_sha") or ""),
+            )
+            if all(delivery_parts):
+                delivery_ids.add(":".join(delivery_parts))
         for key in keys:
             del rebase_durable._DURABLE_JOBS[key]
+        rebase_durable._DELIVERED_EVENTS.difference_update(delivery_ids)
         if keys:
             rebase_durable._persist_durable_state()
         return len(keys)
