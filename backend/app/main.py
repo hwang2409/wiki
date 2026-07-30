@@ -2822,21 +2822,68 @@ def agent_provider_events(
     return result
 
 
+def _reject_symlinked_children(run_dir: Path) -> None:
+    """Refuse a run dir whose members were substituted with symlinks.
+
+    A reviewer probe (WIKI-174 round 2) showed that even with a validated
+    ``run_id``, replacing ``events.jsonl`` with a symlink to a file outside
+    the runs root would let the replay stream leak that file's contents. We
+    ``lstat`` each expected child and refuse if any is a symlink.
+    """
+
+    for name in ("run.json", "events.jsonl", "raw.jsonl"):
+        child = run_dir / name
+        try:
+            info = os.lstat(child)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(info.st_mode):
+            raise HTTPException(
+                status_code=404,
+                detail="Run not found",
+            )
+
+
+def _resolved_runs_root() -> Path:
+    return AGENT_RUNS_DIR.resolve(strict=False)
+
+
 def _replay_run_dir(run_id: str) -> Path:
     if not replay.valid_run_id(run_id):
         raise HTTPException(status_code=400, detail="Bad run id")
-    run_dir = AGENT_RUNS_DIR / run_id
-    if not run_dir.is_dir() or not (run_dir / "run.json").is_file():
+    runs_root = _resolved_runs_root()
+    candidate = AGENT_RUNS_DIR / run_id
+    try:
+        info = os.lstat(candidate)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Run not found") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
         raise HTTPException(status_code=404, detail="Run not found")
-    return run_dir
+    # Even without a symlink on the run dir itself, ``resolve`` guards against
+    # a mount-point overlay or an ``AGENT_RUNS_DIR`` that itself was a symlink
+    # at process start — the run's real path must sit under the real root.
+    resolved = candidate.resolve(strict=False)
+    try:
+        resolved.relative_to(runs_root)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Run not found") from exc
+    run_path = candidate / "run.json"
+    try:
+        run_info = os.lstat(run_path)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Run not found") from exc
+    if stat.S_ISLNK(run_info.st_mode) or not stat.S_ISREG(run_info.st_mode):
+        raise HTTPException(status_code=404, detail="Run not found")
+    _reject_symlinked_children(candidate)
+    return candidate
 
 
 def _resolve_ticket_runs(ticket: str) -> list[Path]:
     """Return every archived run.json directory whose ``agent_id`` matches ticket.
 
     Ordered newest-first by ``updated_at`` when known, then by directory mtime
-    as a fallback. Never enumerates a run without a parsed run.json so path
-    injection through symlinked run dirs is impossible.
+    as a fallback. Refuses symlinked entries and any entry that resolves
+    outside the runs root.
     """
 
     matches: list[tuple[float, Path]] = []
@@ -2844,10 +2891,30 @@ def _resolve_ticket_runs(ticket: str) -> list[Path]:
         entries = list(AGENT_RUNS_DIR.iterdir())
     except FileNotFoundError:
         return []
+    runs_root = _resolved_runs_root()
     for entry in entries:
-        if not entry.is_dir() or not replay.valid_run_id(entry.name):
+        if not replay.valid_run_id(entry.name):
+            continue
+        try:
+            info = os.lstat(entry)
+        except OSError:
+            continue
+        # Skip symlinks and non-dirs. An attacker who can plant a symlink in
+        # AGENT_RUNS_DIR must not be able to redirect run resolution into
+        # unrelated filesystem paths.
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            continue
+        try:
+            entry.resolve(strict=False).relative_to(runs_root)
+        except ValueError:
             continue
         run_path = entry / "run.json"
+        try:
+            run_info = os.lstat(run_path)
+        except OSError:
+            continue
+        if stat.S_ISLNK(run_info.st_mode) or not stat.S_ISREG(run_info.st_mode):
+            continue
         try:
             payload = json.loads(run_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):

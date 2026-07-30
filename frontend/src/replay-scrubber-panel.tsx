@@ -32,8 +32,12 @@ type SpeedChoice = (typeof SPEED_OPTIONS)[number] | typeof MAX_SPEED_LABEL;
 
 const MAX_ADVANCE_DELAY_MS = 10_000;
 const MIN_ADVANCE_DELAY_MS = 40;
-const MAX_TIMELINE_EVENTS = 5_000;
 const DEFAULT_PAGE_SIZE = 500;
+// Runaway guard — a well-behaved server always terminates ``next_after_seq``,
+// but we cap pagination at 200 pages (100k events at DEFAULT_PAGE_SIZE) so a
+// corrupt cursor cycle can't loop forever. If we hit this, the UI shows an
+// explicit "more events beyond this window" notice.
+const MAX_TIMELINE_PAGES = 200;
 
 function formatClockTime(iso: string | null): string {
   if (!iso) return "--:--:--";
@@ -73,34 +77,78 @@ function bookmarkTitle(bookmark: ReplayBookmark): string {
   return `${bookmark.kind} @ ${clock} · ${bookmark.summary}`;
 }
 
+type TimelineLoadUpdate = {
+  timeline: ReplayTimeline;
+  pagesLoaded: number;
+  done: boolean;
+  hitPageGuard: boolean;
+};
+
+/**
+ * Page through every server window until the cursor drains. Reports each
+ * intermediate state through ``onProgress`` so a long run shows a growing
+ * event count instead of a spinner that hides the fact loading is still
+ * happening. The MAX_TIMELINE_PAGES guard exists only as a runaway backstop;
+ * if we ever hit it the caller flips a "more events beyond this window"
+ * banner — the round-1 code silently truncated at 5000 events which is what
+ * the review flagged.
+ */
 async function loadFullTimeline(
   runId: string,
   signal: AbortSignal,
-): Promise<ReplayTimeline> {
+  onProgress: (update: TimelineLoadUpdate) => void,
+): Promise<void> {
   let timeline = await getReplayTimeline(runId, {
     limit: DEFAULT_PAGE_SIZE,
     signal,
   });
+  let pages = 1;
+  onProgress({
+    timeline,
+    pagesLoaded: pages,
+    done: timeline.next_after_seq === null,
+    hitPageGuard: false,
+  });
   let cursor = timeline.next_after_seq;
-  while (
-    cursor !== null &&
-    timeline.events.length < MAX_TIMELINE_EVENTS &&
-    !signal.aborted
-  ) {
+  while (cursor !== null && !signal.aborted) {
+    if (pages >= MAX_TIMELINE_PAGES) {
+      onProgress({
+        timeline,
+        pagesLoaded: pages,
+        done: false,
+        hitPageGuard: true,
+      });
+      return;
+    }
     const page = await getReplayTimeline(runId, {
       afterSeq: cursor,
       limit: DEFAULT_PAGE_SIZE,
       signal,
     });
-    if (page.events.length === 0) break;
+    pages += 1;
+    if (page.events.length === 0) {
+      onProgress({
+        timeline: { ...timeline, next_after_seq: null },
+        pagesLoaded: pages,
+        done: true,
+        hitPageGuard: false,
+      });
+      return;
+    }
     timeline = {
       ...timeline,
       events: [...timeline.events, ...page.events],
       next_after_seq: page.next_after_seq,
+      warnings: [...timeline.warnings, ...page.warnings],
     };
     cursor = page.next_after_seq;
+    onProgress({
+      timeline,
+      pagesLoaded: pages,
+      done: cursor === null,
+      hitPageGuard: false,
+    });
   }
-  return timeline;
 }
 
 export function ReplayScrubberPanel({ ticket }: { ticket: string }) {
@@ -110,6 +158,8 @@ export function ReplayScrubberPanel({ ticket }: { ticket: string }) {
   const [timeline, setTimeline] = useState<ReplayTimeline | null>(null);
   const [timelineLoading, setTimelineLoading] = useState(false);
   const [timelineError, setTimelineError] = useState<string | null>(null);
+  const [pagesLoaded, setPagesLoaded] = useState(0);
+  const [pageGuardHit, setPageGuardHit] = useState(false);
   const [cursor, setCursor] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState<SpeedChoice>(1);
@@ -145,14 +195,19 @@ export function ReplayScrubberPanel({ ticket }: { ticket: string }) {
     setTimeline(null);
     setTimelineError(null);
     setTimelineLoading(true);
+    setPagesLoaded(0);
+    setPageGuardHit(false);
     setCursor(0);
     setPlaying(false);
-    loadFullTimeline(selectedRunId, controller.signal)
-      .then((result) => {
-        if (ignore || controller.signal.aborted) return;
-        setTimeline(result);
+    loadFullTimeline(selectedRunId, controller.signal, (update) => {
+      if (ignore || controller.signal.aborted) return;
+      setTimeline(update.timeline);
+      setPagesLoaded(update.pagesLoaded);
+      setPageGuardHit(update.hitPageGuard);
+      if (update.done || update.hitPageGuard) {
         setTimelineLoading(false);
-      })
+      }
+    })
       .catch((err) => {
         if (ignore || controller.signal.aborted) return;
         setTimeline(null);
@@ -295,6 +350,17 @@ export function ReplayScrubberPanel({ ticket }: { ticket: string }) {
         <div className="replay-empty">loading timeline…</div>
       ) : null}
 
+      {timeline ? (
+        <ReplayLoadStatus
+          events={timeline.events.length}
+          loading={timelineLoading}
+          pageGuardHit={pageGuardHit}
+          pagesLoaded={pagesLoaded}
+          serverWarnings={timeline.warnings}
+          totalHint={timeline.run.total_events}
+        />
+      ) : null}
+
       {timeline && timeline.events.length > 0 ? (
         <ReplayScrubberBody
           bookmarks={bookmarkPositions}
@@ -316,6 +382,51 @@ export function ReplayScrubberPanel({ ticket }: { ticket: string }) {
           timeline={timeline}
         />
       ) : null}
+    </div>
+  );
+}
+
+function ReplayLoadStatus({
+  events,
+  loading,
+  pageGuardHit,
+  pagesLoaded,
+  serverWarnings,
+  totalHint,
+}: {
+  events: number;
+  loading: boolean;
+  pageGuardHit: boolean;
+  pagesLoaded: number;
+  serverWarnings: string[];
+  totalHint: number;
+}) {
+  const messages: string[] = [];
+  if (loading) {
+    if (totalHint > 0) {
+      messages.push(`loaded ${events} of ~${totalHint} events (page ${pagesLoaded})…`);
+    } else {
+      messages.push(`loaded ${events} events (page ${pagesLoaded})…`);
+    }
+  }
+  if (pageGuardHit) {
+    messages.push(
+      `stopped after ${pagesLoaded} pages; more events exist beyond this window.`
+    );
+  }
+  for (const warning of serverWarnings) {
+    messages.push(warning);
+  }
+  if (messages.length === 0) return null;
+  return (
+    <div
+      aria-live="polite"
+      className={`replay-status${pageGuardHit ? " is-truncated" : ""}`}
+      role="status"
+    >
+      {messages.map((message, i) => (
+        <p key={i}>{message}</p>
+      ))}
     </div>
   );
 }

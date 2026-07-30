@@ -11187,6 +11187,28 @@ textarea.composer-command-input {
   text-align: center;
 }
 
+.replay-status {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  background-color: var(--background-primary);
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+}
+
+.replay-status.is-truncated {
+  color: var(--text-normal);
+  border-color: #b3261e;
+}
+
+.replay-status p {
+  margin: 0;
+}
+
 .replay-scrubber {
   display: flex;
   flex-direction: column;

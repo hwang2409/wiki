@@ -2,16 +2,31 @@
 
 Pure helpers that transform ``events.jsonl`` (and, when needed, ``raw.jsonl``)
 into a compact, timestamped timeline the frontend scrubber consumes. All I/O
-here is read-only and bounded so a 100k-event ``raw.jsonl`` never blows out a
-handler's memory budget: we stream JSON lines, skip anything below the caller's
-cursor, and cap the response window with ``limit``.
+here is read-only and strictly bounded so a corrupted or adversarial log can't
+blow out a handler's memory budget.
+
+Read discipline (WIKI-174 round-2 review):
+    * Files are opened with ``O_NOFOLLOW`` so a symlinked ``events.jsonl``
+      pointing outside the runs root can't leak data.
+    * We snapshot the file size at open with ``os.fstat`` and read only up to
+      that byte count, so a live-append that lands the header of a new record
+      before its trailing newline can't feed us a torn half-line.
+    * Only ``\\n``-terminated records are yielded — the last partial line in
+      the snapshot window is dropped and reconsidered on the next read.
+    * Every line is capped by ``MAX_LINE_BYTES``: an oversize line is skipped
+      wholesale instead of being buffered into memory.
+    * Every scan is capped by a total byte budget so ``build_bookmarks`` on a
+      100 MiB events.jsonl still terminates in constant peak RSS.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
+import stat
 from dataclasses import dataclass
+from io import BufferedReader
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
@@ -24,6 +39,22 @@ RUN_ID_PATTERN = re.compile(
 MAX_BOOKMARKS = 200
 DEFAULT_LIMIT = 500
 MAX_LIMIT = 2000
+
+# Per-line hard ceiling. Real supervisor events observed on disk are ~200 B –
+# 30 KiB (tool_use inputs, hook payloads). A well-formed event should never
+# approach 1 MiB; anything above that is corruption or an attack and we drop
+# it rather than allocate for it.
+MAX_LINE_BYTES = 1 * 1024 * 1024
+
+# Per-scan hard ceiling. The bookmark scan and raw event lookup traverse a
+# full events.jsonl / raw.jsonl. This bound guarantees a peak read of
+# ~64 MiB regardless of file size — with truncation surfaced to the caller so
+# nothing gets silently dropped from the UI.
+MAX_SCAN_BYTES = 64 * 1024 * 1024
+
+# Chunked stream reads: 128 KiB balances syscall overhead against per-response
+# RSS. Never buffer more than one chunk beyond the current partial line.
+_STREAM_CHUNK = 128 * 1024
 
 MERGE_READY_PATTERN = re.compile(r"\b(MERGE-READY|BLOCKED)\s*:", re.IGNORECASE)
 
@@ -169,51 +200,242 @@ def build_run_summary(run_dir: Path, meta: dict[str, Any] | None = None) -> RunS
     )
 
 
-def _iter_json_lines(path: Path) -> Iterator[dict[str, Any]]:
-    """Stream JSON objects from a JSONL file, skipping malformed trailing lines.
+@dataclass(frozen=True)
+class _RawLine:
+    raw: bytes
 
-    The supervisor's crash-repair pass truncates the last partial line on the
-    next restart, so we mirror that leniency here: if a mid-stream line fails to
-    parse we skip it rather than raising — the caller is showing history, not
-    building the durable ledger.
+
+@dataclass
+class _ScanStats:
+    dropped_oversize: int = 0
+    dropped_malformed: int = 0
+    dropped_truncated_tail: bool = False
+    scan_truncated: bool = False
+
+
+def _open_nofollow(path: Path) -> int:
+    """Open a JSONL log for read, refusing symlinks and non-regular files.
+
+    A symlinked ``events.jsonl`` that points outside the runs root would let a
+    caller who can only forge the ``run_id`` still read anything the server
+    process can. ``O_NOFOLLOW`` on the final path component plus an
+    ``S_ISREG`` check on the resulting fd close that off.
+    """
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    fd = os.open(path, flags)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ReplayError(f"{path.name} is not a regular file")
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _iter_snapshot_lines(
+    path: Path,
+    *,
+    max_scan_bytes: int = MAX_SCAN_BYTES,
+    max_line_bytes: int = MAX_LINE_BYTES,
+    stats: _ScanStats | None = None,
+) -> Iterator[bytes]:
+    """Yield newline-terminated byte lines from a bounded snapshot window.
+
+    The producer of these files (``RunStore``) writes each event as
+    ``json.dumps(...) + '\\n'`` — but the write is not one atomic syscall in
+    every path. Reading past the snapshot size or accepting a line without a
+    trailing ``\\n`` risks a torn read where the reader sees ``json.dumps``
+    but not the newline. We snapshot ``st_size`` at open and only yield lines
+    that end with ``\\n`` inside that window; anything after the last newline
+    is left for the next read.
     """
 
     try:
-        handle = path.open("r", encoding="utf-8")
+        fd = _open_nofollow(path)
     except FileNotFoundError:
         return
-    with handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
+    reader: BufferedReader | None = None
+    try:
+        info = os.fstat(fd)
+        snapshot_size = int(info.st_size)
+        reader = os.fdopen(fd, "rb", buffering=0)
+        # ``fd`` now owned by ``reader``; do not close it separately.
+        fd = -1
+        buffer = bytearray()
+        remaining = snapshot_size
+        total_yielded = 0
+        while remaining > 0:
+            to_read = min(_STREAM_CHUNK, remaining)
+            chunk = reader.read(to_read)
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            buffer.extend(chunk)
+            while True:
+                newline = buffer.find(b"\n")
+                if newline < 0:
+                    break
+                line = bytes(buffer[:newline])
+                del buffer[: newline + 1]
+                total_yielded += newline + 1
+                if len(line) > max_line_bytes:
+                    if stats is not None:
+                        stats.dropped_oversize += 1
+                    continue
+                if total_yielded > max_scan_bytes:
+                    if stats is not None:
+                        stats.scan_truncated = True
+                    return
+                yield line
+            # Guard against a single record that is itself larger than
+            # ``max_line_bytes``: don't grow the buffer past that ceiling
+            # searching for the eventual newline.
+            if len(buffer) > max_line_bytes:
+                # Discard everything up to the next newline in the stream.
+                if stats is not None:
+                    stats.dropped_oversize += 1
+                buffer.clear()
+                skip_remaining = remaining
+                while skip_remaining > 0:
+                    skip_chunk = reader.read(min(_STREAM_CHUNK, skip_remaining))
+                    if not skip_chunk:
+                        break
+                    skip_remaining -= len(skip_chunk)
+                    hit = skip_chunk.find(b"\n")
+                    if hit >= 0:
+                        buffer.extend(skip_chunk[hit + 1 :])
+                        remaining = skip_remaining
+                        break
+                else:
+                    remaining = 0
+                if remaining == 0 and skip_remaining > 0:
+                    remaining = skip_remaining
+        # Any bytes still in the buffer come from an un-newline-terminated
+        # tail: leave them for the next call.
+        if buffer:
+            if stats is not None:
+                stats.dropped_truncated_tail = True
+    finally:
+        if reader is not None:
             try:
-                value = json.loads(line)
-            except ValueError:
+                reader.close()
+            except Exception:
+                pass
+        elif fd >= 0:
+            os.close(fd)
+
+
+def _iter_json_events(
+    path: Path,
+    *,
+    max_scan_bytes: int = MAX_SCAN_BYTES,
+    max_line_bytes: int = MAX_LINE_BYTES,
+    stats: _ScanStats | None = None,
+) -> Iterator[dict[str, Any]]:
+    for line in _iter_snapshot_lines(
+        path,
+        max_scan_bytes=max_scan_bytes,
+        max_line_bytes=max_line_bytes,
+        stats=stats,
+    ):
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+        except ValueError:
+            if stats is not None:
+                stats.dropped_malformed += 1
+            continue
+        if isinstance(value, dict):
+            yield value
+
+
+def _codex_item(payload: dict[str, Any]) -> dict[str, Any] | None:
+    params = payload.get("params")
+    if not isinstance(params, dict):
+        return None
+    item = params.get("item")
+    return item if isinstance(item, dict) else None
+
+
+def _codex_item_text(item: dict[str, Any]) -> str | None:
+    content = item.get("content")
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
                 continue
-            if isinstance(value, dict):
-                yield value
+            text = block.get("text")
+            if isinstance(text, str) and text.strip():
+                return text
+    summary = item.get("summary")
+    if isinstance(summary, list):
+        for entry in summary:
+            if isinstance(entry, dict):
+                text = entry.get("text") or entry.get("summary")
+                if isinstance(text, str) and text.strip():
+                    return text
+            elif isinstance(entry, str) and entry.strip():
+                return entry
+    return None
 
 
 def _classify_bookmark(kind: str, payload: dict[str, Any], text: str | None) -> str | None:
-    if kind == "provider_process_exit":
+    # Codex ``item/completed`` covers user injections, agent replies, tool
+    # execs, and reasoning. userMessage = a real steer; agentMessage carrying
+    # a merge sentinel = a verdict.
+    if kind == "item_completed":
+        item = _codex_item(payload) or {}
+        item_type = item.get("type")
+        if item_type == "userMessage":
+            item_text = _codex_item_text(item)
+            if item_text and item_text.strip():
+                return "steer"
+        elif item_type == "agentMessage":
+            item_text = _codex_item_text(item) or text
+            if item_text and MERGE_READY_PATTERN.search(item_text):
+                return "verdict"
+        elif item_type == "commandExecution":
+            exit_code = item.get("exitCode")
+            if isinstance(exit_code, int) and exit_code != 0:
+                return "error"
+    if kind == "turn_completed":
+        params = payload.get("params") or {}
+        turn = params.get("turn") if isinstance(params, dict) else None
+        if isinstance(turn, dict):
+            status = turn.get("status")
+            error_obj = turn.get("error")
+            if status == "failed" or error_obj is not None:
+                return "error"
+            if status == "completed":
+                return "verdict"
+        return None
+    if kind in {"error", "codex_error", "provider_protocol_error"}:
         return "error"
+    if kind == "provider_process_exit":
+        # Codex reports through ``params.returncode``; Claude uses
+        # top-level ``exit_code``. A clean 0 is normal termination, NOT an
+        # error — only mark non-zero exits so bookmarks stay useful.
+        exit_code: Any = payload.get("exit_code")
+        params = payload.get("params")
+        if isinstance(params, dict):
+            exit_code = params.get("returncode", exit_code)
+        if isinstance(exit_code, int) and exit_code != 0:
+            return "error"
+        return None
     if kind == "claude_result":
         if payload.get("is_error"):
             return "error"
-        # A completed result is the natural verdict frame.
         return "verdict"
     if payload.get("is_error") is True:
-        return "error"
-    if kind.endswith("_error") or kind.endswith("_stderr"):
         return "error"
     if kind == "claude_user":
         message = payload.get("message")
         if isinstance(message, dict):
             content = message.get("content")
-            # Anything that ISN'T only a tool_result block is user-injected
-            # steering (composer message, orchestrator user echo, etc.). Pure
-            # tool_result deliveries are just protocol chatter.
             has_user_input = False
             if isinstance(content, str) and content.strip():
                 has_user_input = True
@@ -286,26 +508,62 @@ def _summarize_payload(kind: str, payload: dict[str, Any]) -> tuple[str, str | N
     if kind == "claude_rate_limit_event":
         return "rate_limit_event", None
     if kind == "provider_process_exit":
-        code = payload.get("exit_code")
-        return f"provider_process_exit code={code}" if code is not None else "provider_process_exit", None
-    if kind == "provider_stderr":
+        # Look in both shapes: Codex nests under ``params.returncode``, Claude
+        # exposes ``exit_code`` on the payload directly.
+        code: Any = payload.get("exit_code")
+        params = payload.get("params")
+        if isinstance(params, dict):
+            code = params.get("returncode", code)
+        return (
+            f"provider_process_exit code={code}"
+            if code is not None
+            else "provider_process_exit",
+            None,
+        )
+    if kind == "provider_stderr" or kind == "codex_stderr":
         text = payload.get("text") or payload.get("stderr") or ""
-        return _excerpt(text) if isinstance(text, str) else "provider_stderr", None
-    if kind.startswith("codex_") or kind == "codex_client_message":
-        method = payload.get("method")
-        if isinstance(method, str):
-            return f"codex {method}", None
-        return kind, None
-    if kind == "approval" or kind == "approval_cancelled":
-        subtype = None
+        return _excerpt(text) if isinstance(text, str) else kind, None
+    if kind == "item_started" or kind == "item_completed":
+        item = _codex_item(payload) or {}
+        item_type = item.get("type") or "item"
+        text = _codex_item_text(item)
+        stem = f"codex {kind.replace('_', '/')}: {item_type}"
+        if text:
+            return f"{stem} — {_excerpt(text, 100)}", text
+        return stem, None
+    if kind == "turn_started" or kind == "turn_completed":
+        params = payload.get("params") or {}
+        turn = params.get("turn") if isinstance(params, dict) else {}
+        if isinstance(turn, dict):
+            status = turn.get("status")
+            duration = turn.get("durationMs")
+            bits = [f"codex turn/{kind.split('_', 1)[1]}"]
+            if status:
+                bits.append(str(status))
+            if duration:
+                bits.append(f"{int(duration)}ms")
+            return " ".join(bits), None
+        return f"codex turn/{kind.split('_', 1)[1]}", None
+    if kind == "warning":
+        params = payload.get("params") or {}
+        message = params.get("message") if isinstance(params, dict) else None
+        if isinstance(message, str) and message.strip():
+            return f"warning: {_excerpt(message, 120)}", None
+        return "warning", None
+    if kind == "codex_client_message" or kind == "rpc_response":
+        method = payload.get("method") or "response"
+        return f"codex {method}", None
+    if kind == "approval" or kind == "approval_cancelled" or kind == "approval_resolved":
         request = payload.get("request")
-        if isinstance(request, dict):
-            subtype = request.get("subtype")
+        subtype = request.get("subtype") if isinstance(request, dict) else None
         return f"{kind}{': ' + subtype if subtype else ''}", None
     if kind == "artifact":
         artifact = payload.get("artifact") or {}
         kind_hint = artifact.get("kind") if isinstance(artifact, dict) else None
         return f"artifact {kind_hint}" if kind_hint else "artifact", None
+    # Generic Codex method-derived kinds (``item_agentMessage_delta``,
+    # ``thread_tokenUsage_updated``, etc.) — just show the kind and let the
+    # payload viewer do the rest.
     return kind, None
 
 
@@ -349,38 +607,47 @@ def build_timeline_window(
     *,
     after_seq: int = 0,
     limit: int = DEFAULT_LIMIT,
-) -> tuple[list[TimelineEvent], int | None]:
-    """Return ``(events, next_after_seq)`` for a bounded slice of the timeline.
+) -> tuple[list[TimelineEvent], int | None, _ScanStats]:
+    """Return ``(events, next_after_seq, stats)`` for a bounded slice.
 
     ``next_after_seq`` is the last-emitted seq when the window filled, letting
-    the client paginate forward without re-reading the file from byte zero. It
-    is ``None`` when the stream ended within the window.
+    the client paginate forward without re-reading the file from byte zero.
+    ``stats`` surfaces drop counters + snapshot truncation so callers can show
+    when data was skipped.
     """
 
+    stats = _ScanStats()
     if limit <= 0:
-        return [], None
+        return [], None, stats
     limit = min(limit, MAX_LIMIT)
     if after_seq < 0:
         after_seq = 0
     collected: list[TimelineEvent] = []
     last_seq: int | None = None
-    for event in _iter_timeline(_iter_json_lines(events_path)):
+    for event in _iter_timeline(
+        _iter_json_events(events_path, stats=stats)
+    ):
         if event.seq <= after_seq:
             continue
         collected.append(event)
         last_seq = event.seq
         if len(collected) >= limit:
-            return collected, last_seq
-    return collected, None
+            return collected, last_seq, stats
+    return collected, None, stats
 
 
-def build_bookmarks(events_path: Path, *, cap: int = MAX_BOOKMARKS) -> list[dict[str, Any]]:
-    """Whole-file bookmark scan, capped so a 100k-event run stays cheap on the wire."""
+def build_bookmarks(
+    events_path: Path,
+    *,
+    cap: int = MAX_BOOKMARKS,
+) -> tuple[list[dict[str, Any]], _ScanStats]:
+    """Whole-file bookmark scan, capped so a large run stays cheap on the wire."""
 
+    stats = _ScanStats()
     if cap <= 0:
-        return []
+        return [], stats
     bookmarks: list[dict[str, Any]] = []
-    for event in _iter_timeline(_iter_json_lines(events_path)):
+    for event in _iter_timeline(_iter_json_events(events_path, stats=stats)):
         if event.bookmark is None:
             continue
         bookmarks.append(
@@ -394,7 +661,7 @@ def build_bookmarks(events_path: Path, *, cap: int = MAX_BOOKMARKS) -> list[dict
         )
         if len(bookmarks) >= cap:
             break
-    return bookmarks
+    return bookmarks, stats
 
 
 def build_timeline_response(
@@ -408,16 +675,39 @@ def build_timeline_response(
     meta = load_run_metadata(run_dir)
     summary = build_run_summary(run_dir, meta)
     events_path = run_dir / "events.jsonl"
-    events, next_seq = build_timeline_window(
+    events, next_seq, window_stats = build_timeline_window(
         events_path, after_seq=after_seq, limit=limit
     )
-    bookmarks = build_bookmarks(events_path) if after_seq <= 0 else []
+    bookmarks: list[dict[str, Any]]
+    bookmark_stats: _ScanStats
+    if after_seq <= 0:
+        bookmarks, bookmark_stats = build_bookmarks(events_path)
+    else:
+        bookmarks, bookmark_stats = [], _ScanStats()
     return {
         "run": summary.as_dict(),
         "events": [event.as_dict() for event in events],
         "next_after_seq": next_seq,
         "bookmarks": bookmarks,
+        "warnings": _warnings_from(window_stats, bookmark_stats),
     }
+
+
+def _warnings_from(*stats: _ScanStats) -> list[str]:
+    dropped_oversize = sum(s.dropped_oversize for s in stats)
+    dropped_malformed = sum(s.dropped_malformed for s in stats)
+    dropped_tail = any(s.dropped_truncated_tail for s in stats)
+    scan_truncated = any(s.scan_truncated for s in stats)
+    warnings: list[str] = []
+    if dropped_oversize:
+        warnings.append(f"dropped {dropped_oversize} oversized event line(s)")
+    if dropped_malformed:
+        warnings.append(f"skipped {dropped_malformed} malformed line(s)")
+    if dropped_tail:
+        warnings.append("trailing partial write ignored (torn-read guard)")
+    if scan_truncated:
+        warnings.append("scan hit byte budget — later events not classified")
+    return warnings
 
 
 def load_raw_event(run_dir: Path, seq: int) -> dict[str, Any] | None:
@@ -426,7 +716,8 @@ def load_raw_event(run_dir: Path, seq: int) -> dict[str, Any] | None:
     if seq <= 0:
         return None
     raw_path = run_dir / "raw.jsonl"
-    for entry in _iter_json_lines(raw_path):
+    stats = _ScanStats()
+    for entry in _iter_json_events(raw_path, stats=stats):
         entry_seq = entry.get("seq")
         if isinstance(entry_seq, int) and entry_seq == seq:
             return entry

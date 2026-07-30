@@ -1035,6 +1035,7 @@ export type ReplayTimeline = {
   events: ReplayTimelineEvent[];
   next_after_seq: number | null;
   bookmarks: ReplayBookmark[];
+  warnings: string[];
 };
 
 export type ReplayRawEvent = {
