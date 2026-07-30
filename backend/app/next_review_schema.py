@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
 
 ReviewerKind = Literal["cc", "cdx"]
 ReviewerEffort = Literal["minimal", "low", "medium", "high", "xhigh"]
+DiversityLens = Literal["correctness", "security", "perf", "test-strength"]
+DiversityCount = Annotated[int, Field(ge=1, le=4)]
 
 
 class NextReviewIn(BaseModel):
@@ -23,6 +25,18 @@ class NextReviewIn(BaseModel):
     reviewer_effort: ReviewerEffort | None = None
     prompt_template: str | None = Field(default=None, max_length=100_000)
     request_id: str | None = Field(default=None, min_length=1, max_length=200)
+    diversity: list[DiversityLens] | DiversityCount | None = None
+
+    @model_validator(mode="after")
+    def validate_diversity(self) -> NextReviewIn:
+        if isinstance(self.diversity, list):
+            if not self.diversity:
+                raise ValueError("diversity must contain at least one lens")
+            if len(set(self.diversity)) != len(self.diversity):
+                raise ValueError("diversity lenses must be unique")
+            if len(self.diversity) > 4:
+                raise ValueError("diversity supports at most four lenses")
+        return self
 
     @model_validator(mode="after")
     def validate_provider_effort(self) -> NextReviewIn:

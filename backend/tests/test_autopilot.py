@@ -98,6 +98,58 @@ ARCHIVED_VERDICTS = (
 
 
 class AutopilotTests(unittest.TestCase):
+    def test_diversity_controller_waits_for_lenses_and_handles_combined_verdict(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            graph = {
+                "ticket": "WIKI-173",
+                "orch": "wiki",
+                "iteration_cap": 8,
+                "nodes": [],
+                "edges": [
+                    {"kind": "spawn", "to": "WIKI-173", "payload": {"role": "implement"}},
+                    {"kind": "spawn", "to": "WIKI-173-REVIEW1-correctness", "payload": {"role": "review"}},
+                    {"kind": "spawn", "to": "WIKI-173-REVIEW1-security", "payload": {"role": "review"}},
+                    {"kind": "verdict", "from": "WIKI-173-REVIEW1-correctness", "payload": {"worker": "WIKI-173-REVIEW1-correctness", "sha": "0" * 40, "state": "MERGE-READY", "findings": []}},
+                    {"kind": "verdict", "from": "WIKI-173-REVIEW1-security", "payload": {"worker": "WIKI-173-REVIEW1-security", "sha": "0" * 40, "state": "MERGE-READY", "findings": []}},
+                ],
+            }
+            calls: list[str] = []
+
+            def collect_diversity(**kwargs):
+                calls.append(kwargs["reviewer"])
+                if len(calls) == 1:
+                    return {"status": "pending", "received": calls}
+                return {
+                    "worker": "WIKI-173-REVIEW1-synthesis",
+                    "sha": "0" * 40,
+                    "state": "MERGE-READY",
+                    "findings": [],
+                    "created_at": "2026-07-30T00:00:00+00:00",
+                }
+
+            controller = AutopilotController(
+                store=AutopilotStore(Path(directory)),
+                status_reader=lambda _ticket: {"pr": PR_URL, "sha": "0" * 40},
+                graph_loader=lambda _ticket: graph,
+                collect_diversity=collect_diversity,
+                gate=lambda pr, _sha: {"verdict": "pass", "pr": pr},
+                merge=lambda _pr, _sha: None,
+            )
+            controller.enable("WIKI-173")
+            first = asyncio.run(
+                controller.on_transition(
+                    {"agent_id": "WIKI-173-REVIEW1-correctness", "run_id": "r1", "status_state": "merge-ready"}
+                )
+            )
+            second = asyncio.run(
+                controller.on_transition(
+                    {"agent_id": "WIKI-173-REVIEW1-security", "run_id": "r2", "status_state": "merge-ready"}
+                )
+            )
+            self.assertTrue(first)
+            self.assertTrue(second)
+            self.assertEqual(calls, ["WIKI-173-REVIEW1-correctness", "WIKI-173-REVIEW1-security"])
+
     def test_parser_and_steer_golden_shape(self) -> None:
         verdict = parse_verdict(
             """NOT-MERGE-READY: 1 findings
@@ -939,12 +991,15 @@ source sha: 0123456
                         "title": "title",
                         "file": "backend/app/main.py",
                         "line": 42,
+                        "line_end": 45,
                         "observed": "observed",
                         "why_wrong": "why wrong",
                         "do_instead": "do this",
                         "constraint": "keep the gate pinned",
                         "source_worker": "WIKI-173-REVIEW1",
                         "source_sha": "0123456",
+                        "source_lenses": ["correctness", "security"],
+                        "linked_findings": ["F-linked1"],
                     }
                 ],
             }
@@ -959,8 +1014,11 @@ source sha: 0123456
         self.assertEqual(steer_finding["why_wrong"], "why wrong")
         self.assertEqual(steer_finding["constraint"], "keep the gate pinned")
         self.assertEqual(steer_finding["source_worker"], "WIKI-173-REVIEW1")
+        self.assertEqual(steer_finding["line_end"], 45)
+        self.assertEqual(steer_finding["source_lenses"], ["correctness", "security"])
+        self.assertEqual(steer_finding["linked_findings"], ["F-linked1"])
         message = build_steer_message(verdict, target_worker="WIKI-173")
-        for field in ("why wrong", "constraint", "source worker", "finding id"):
+        for field in ("why wrong", "constraint", "source worker", "finding id", "source lenses", "linked findings"):
             self.assertIn(field, message)
 
     def test_current_reviewer_falls_back_to_review_node_kind(self) -> None:

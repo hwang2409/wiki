@@ -12,11 +12,23 @@ import threading
 import json
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 from uuid import uuid4
 
+from .ticket import parse_reviewer_id, reviewer_id as canonical_reviewer_id
+from .diversity_orchestration import create_journal, run_diverse_review
+from .reviewer_diversity import (
+    DEFAULT_DIVERSITY_LENSES,
+    LENS_PROMPTS,
+    normalize_diversity as _normalize_diversity,
+    record_diverse_verdicts,
+    synthesize_diverse_verdicts,
+)
 
-_REVIEWER_ID = re.compile(r"^(?P<ticket>[A-Z0-9-]+)-REVIEW(?P<round>[1-9][0-9]*)$")
+REVIEW_CONTRACT = (
+    "verify PR headRefOid and git rev-parse HEAD match the pinned sha; if either "
+    "check fails, stop with INSUFFICIENT-CONTEXT and STALE-SHA, and do not report MERGE-READY"
+)
 _TERMINAL_STATES = {
     "abandoned",
     "closed",
@@ -107,10 +119,15 @@ def _archived_reviewers(ticket: str, archived: list[Mapping[str, Any]]) -> dict[
         value = row.get("ticket")
         if not isinstance(value, str):
             continue
-        match = _REVIEWER_ID.fullmatch(value.upper())
-        if match and match.group("ticket") == ticket.upper():
-            result[value.upper()] = int(match.group("round"))
+        parsed = parse_reviewer_id(value)
+        if parsed is not None and parsed.ticket == ticket.upper():
+            result[value.upper()] = parsed.round
     return result
+
+
+def _reviewer_round(value: str) -> int | None:
+    parsed = parse_reviewer_id(value)
+    return parsed.round if parsed is not None else None
 
 
 def _next_round(
@@ -120,9 +137,9 @@ def _next_round(
 ) -> int:
     reviewers = _archived_reviewers(ticket, archived)
     for value in registry:
-        match = _REVIEWER_ID.fullmatch(str(value).upper())
-        if match and match.group("ticket") == ticket.upper():
-            reviewers[str(value).upper()] = int(match.group("round"))
+        parsed = parse_reviewer_id(str(value))
+        if parsed is not None and parsed.ticket == ticket.upper():
+            reviewers[str(value).upper()] = parsed.round
     return max(reviewers.values(), default=0) + 1
 
 
@@ -134,8 +151,8 @@ def _previous_terminal_reviewer(
 ) -> str | None:
     candidates: list[tuple[int, str, Mapping[str, Any]]] = []
     for value, entry in registry.items():
-        match = _REVIEWER_ID.fullmatch(str(value).upper())
-        if not match or match.group("ticket") != ticket.upper() or not isinstance(entry, Mapping):
+        parsed = parse_reviewer_id(str(value))
+        if parsed is None or parsed.ticket != ticket.upper() or not isinstance(entry, Mapping):
             continue
         current = entry.get("current")
         if not isinstance(current, Mapping):
@@ -151,12 +168,42 @@ def _previous_terminal_reviewer(
             status_state or current.get("state") or current.get("runtime_state") or ""
         ).lower()
         if state in _TERMINAL_STATES:
-            candidates.append((int(match.group("round")), candidate_reviewer, current))
+            candidates.append((parsed.round, candidate_reviewer, current))
     if not candidates:
         return None
     candidates.sort(reverse=True)
     previous_round, reviewer_id, _ = candidates[0]
     return reviewer_id if previous_round < round_number else None
+
+
+def _previous_terminal_reviewers(
+    ticket: str,
+    round_number: int,
+    registry: Mapping[str, Any],
+    status_reader: Callable[[str], Mapping[str, Any] | None] | None = None,
+) -> list[str]:
+    """Return all terminal reviewers from the latest completed prior round."""
+
+    candidates: list[tuple[int, str]] = []
+    for value, entry in registry.items():
+        reviewer = str(value).upper()
+        parsed_round = _reviewer_round(reviewer)
+        if parsed_round is None or not reviewer.startswith(ticket.upper() + "-REVIEW"):
+            continue
+        if parsed_round >= round_number or not isinstance(entry, Mapping):
+            continue
+        current = entry.get("current")
+        if not isinstance(current, Mapping):
+            continue
+        status = status_reader(reviewer) if status_reader is not None else _main().read_agent_status(reviewer)
+        status_state = status.get("state") if isinstance(status, Mapping) else None
+        state = str(status_state or current.get("state") or current.get("runtime_state") or "").lower()
+        if state in _TERMINAL_STATES:
+            candidates.append((parsed_round, reviewer))
+    if not candidates:
+        return []
+    latest_round = max(item[0] for item in candidates)
+    return [reviewer for parsed_round, reviewer in sorted(candidates) if parsed_round == latest_round]
 
 
 def _default_prompt(
@@ -167,9 +214,11 @@ def _default_prompt(
     expected_sha: str,
     round_number: int,
     previous_reviewer: str | None,
+    lens: str | None = None,
 ) -> str:
     prior = previous_reviewer or "none (first review round)"
-    return f"""review PR #{pr_number} for {ticket}.
+    if lens is None:
+        return f"""review PR #{pr_number} for {ticket}.
 
 reviewer: {reviewer_id}
 round: {round_number}
@@ -183,6 +232,22 @@ modify the worktree. after the review, write the complete structured verdict to
 /tmp/{reviewer_id}-verdict.json. use state, source_sha, and findings fields;
 each finding must include severity, path, line, problem, and fix.
 """
+    prompt = f"""review PR #{pr_number} for {ticket}.
+
+reviewer: {reviewer_id}
+lens: {lens}
+round: {round_number}
+pinned sha: {expected_sha}
+prior reviewer: {prior}
+
+inspect the pinned worktree, identify actionable correctness, security, reliability,
+and test issues, and report findings with file and line references. if the diff is
+clean, report that explicitly. follow the repository review protocol and do not
+modify the worktree. after the review, write the complete structured verdict to
+/tmp/{reviewer_id}-verdict.json. use state, source_sha, and findings fields;
+each finding must include severity, path, line, problem, and fix.
+"""
+    return prompt + f"\n\nreview contract: {REVIEW_CONTRACT}.\n\nlens mandate: {LENS_PROMPTS[lens]}.\n"
 
 
 def _build_prompt(
@@ -194,6 +259,7 @@ def _build_prompt(
     expected_sha: str,
     round_number: int,
     previous_reviewer: str | None,
+    lens: str | None = None,
 ) -> str:
     if not template:
         return _default_prompt(
@@ -203,6 +269,7 @@ def _build_prompt(
             expected_sha=expected_sha,
             round_number=round_number,
             previous_reviewer=previous_reviewer,
+            lens=lens,
         )
     values = {
         "ticket": ticket,
@@ -211,6 +278,7 @@ def _build_prompt(
         "expected_sha": expected_sha,
         "round": round_number,
         "prior_reviewer": previous_reviewer or "none",
+        "lens": lens or "standard",
     }
     try:
         rendered = template.format_map(values)
@@ -218,9 +286,59 @@ def _build_prompt(
         raise ValueError(f"invalid prompt_template: {exc}") from exc
     context = (
         f"\n\nreview context: ticket={ticket}, pr=#{pr_number}, pinned_sha={expected_sha}, "
-        f"round={round_number}, prior_reviewer={previous_reviewer or 'none'}"
+        f"round={round_number}, prior_reviewer={previous_reviewer or 'none'}, lens={lens or 'standard'}"
     )
-    return rendered + context
+    return rendered + context + f"\n\nreview contract: {REVIEW_CONTRACT}." + (
+        f"\n\nlens mandate: {LENS_PROMPTS[lens]}." if lens else ""
+    )
+
+
+def _diverse_worktree(
+    *,
+    repo_root: Path,
+    ticket: str,
+    round_number: int,
+    lens: str,
+    expected_sha: str,
+    worktree: Callable[..., Path] | None,
+) -> Path:
+    if worktree is not None:
+        return worktree(
+            repo_root=repo_root,
+            ticket=ticket,
+            round_number=round_number,
+            lens=lens,
+            expected_sha=expected_sha,
+        )
+    path = (repo_root / ".codex" / "worktrees" / f"{ticket.lower()}-review{round_number}-{lens}").resolve()
+    return _main().provision_pinned_worktree(repo_root, path, expected_sha)
+
+
+def _diverse_result(staged: Mapping[str, Any]) -> dict[str, Any]:
+    reviewers = [
+        {
+            "lens": lens,
+            "reviewer": details["reviewer"],
+            "run_id": details.get("run_id"),
+            "worktree": details["worktree"],
+            "expected_sha": staged["expected_sha"],
+        }
+        for lens, details in staged["reviewers"].items()
+    ]
+    return {
+        "status": "spawned",
+        "ticket": staged["ticket"],
+        "round": staged["round"],
+        "reviewers": reviewers,
+        "diversity": list(staged["lenses"]),
+        "expected_sha": staged["expected_sha"],
+        "orch": staged["orch"],
+        "request_id": staged["request_id"],
+        "synthesis": {
+            "status": "pending",
+            "reviewers": [item["reviewer"] for item in reviewers],
+        },
+    }
 
 
 def next_review(
@@ -243,6 +361,7 @@ def next_review(
     archived: Callable[[], list[Mapping[str, Any]]] | None = None,
     registry: Callable[[], Mapping[str, Any]] | None = None,
     status_reader: Callable[[str], Mapping[str, Any] | None] | None = None,
+    diversity: int | Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Gate and start the next pinned reviewer, replaying request ids."""
 
@@ -267,6 +386,7 @@ def next_review(
         "xhigh",
     }:
         raise ValueError("reviewer_effort is invalid")
+    diversity_lenses = _normalize_diversity(diversity)
     request_id = request_id or str(uuid4())
     with _REQUEST_LOCK:
         _load_request_state()
@@ -276,6 +396,30 @@ def next_review(
 
         main = _main()
         staged = _REQUEST_STAGES.get(request_id)
+        if diversity_lenses or (staged is not None and staged.get("diversity")):
+            return run_diverse_review(
+                runtime=__import__(__name__, fromlist=["run_diverse_review"]),
+                staged=staged if staged is not None and staged.get("diversity") else None,
+                lenses=tuple(staged.get("lenses", ())) if staged is not None and staged.get("diversity") else diversity_lenses,
+                ticket=ticket,
+                pr_number=pr_number,
+                expected_sha=expected_sha,
+                reviewer_kind=reviewer_kind,
+                reviewer_model=reviewer_model,
+                reviewer_effort=reviewer_effort,
+                prompt_template=prompt_template,
+                request_id=request_id,
+                orch=orch,
+                main=main,
+                gate=gate,
+                resolve_root=resolve_root,
+                worktree=worktree,
+                spawn=spawn,
+                archive=archive,
+                archived=archived,
+                registry=registry,
+                status_reader=status_reader,
+            )
         if staged is not None:
             if not staged.get("spawn_completed", False):
                 if not staged.get("worktree_provisioned", False):
@@ -351,7 +495,7 @@ def next_review(
             archived_rows = list(archived())
         registry_data = dict((registry or main._read_agent_registry)())  # noqa: SLF001
         round_number = _next_round(ticket, archived_rows, registry_data)
-        reviewer_id = f"{ticket.upper()}-REVIEW{round_number}"
+        reviewer_id = canonical_reviewer_id(ticket, round_number)
         previous_reviewer = _previous_terminal_reviewer(
             ticket, round_number, registry_data, status_reader
         )
@@ -477,4 +621,10 @@ def _staged_result(
     return result
 
 
-__all__ = ["next_review"]
+__all__ = [
+    "DEFAULT_DIVERSITY_LENSES",
+    "LENS_PROMPTS",
+    "next_review",
+    "record_diverse_verdicts",
+    "synthesize_diverse_verdicts",
+]

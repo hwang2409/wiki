@@ -4721,6 +4721,7 @@ def next_review_route(body: NextReviewIn) -> dict[str, Any]:
         reviewer_effort=body.reviewer_effort,
         prompt_template=body.prompt_template,
         request_id=body.request_id,
+        diversity=body.diversity,
     )
 
 

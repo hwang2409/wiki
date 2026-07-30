@@ -60,6 +60,9 @@ class Finding:
     source_worker: str | None = None
     mutation_contract: str | None = None
     source_sha: str | None = None
+    line_end: int | None = None
+    source_lenses: tuple[str, ...] = ()
+    linked_findings: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -85,6 +88,12 @@ class Finding:
             result["mutation_contract"] = self.mutation_contract
         if self.source_sha:
             result["source_sha"] = self.source_sha
+        if self.line_end is not None:
+            result["line_end"] = self.line_end
+        if self.source_lenses:
+            result["source_lenses"] = list(self.source_lenses)
+        if self.linked_findings:
+            result["linked_findings"] = list(self.linked_findings)
         return result
 
     def to_steer_dict(
@@ -107,6 +116,7 @@ class Finding:
             "title": (self.title or self.problem)[:140],
             "file": self.path,
             **({"line": self.line} if self.line is not None else {}),
+            **({"line_end": self.line_end} if self.line_end is not None else {}),
             "observed": self.observed or self.problem,
             "why_wrong": self.why_wrong or self.problem,
             "do_instead": self.fix,
@@ -119,6 +129,8 @@ class Finding:
             "source_kind": "review",
             "source_sha": canonical_sha,
             "created_at": created_at,
+            **({"source_lenses": list(self.source_lenses)} if self.source_lenses else {}),
+            **({"linked_findings": list(self.linked_findings)} if self.linked_findings else {}),
         }
 
 
@@ -149,6 +161,11 @@ def _finding_from_mapping(
         line = int(line)
     if not isinstance(line, int) or isinstance(line, bool):
         line = None
+    line_end = value.get("line_end") or value.get("end_line")
+    if isinstance(line_end, str) and line_end.isdigit():
+        line_end = int(line_end)
+    if not isinstance(line_end, int) or isinstance(line_end, bool) or (line is not None and line_end < line):
+        line_end = None
     path = str(value.get("path") or value.get("file") or value.get("location") or "unknown")
     problem = str(value.get("problem") or value.get("observed") or value.get("title") or "review finding")
     fix = str(value.get("fix") or value.get("do_instead") or value.get("recommendation") or "address the finding")
@@ -174,6 +191,13 @@ def _finding_from_mapping(
         source_sha=str(value.get("source_sha") or source_sha)
         if (value.get("source_sha") or source_sha)
         else None,
+        line_end=line_end,
+        source_lenses=tuple(
+            sorted(str(item) for item in value.get("source_lenses", []) if isinstance(item, str))
+        ) if isinstance(value.get("source_lenses"), list) else (),
+        linked_findings=tuple(
+            sorted(str(item) for item in value.get("linked_findings", []) if isinstance(item, str))
+        ) if isinstance(value.get("linked_findings"), list) else (),
     )
 
 
@@ -313,7 +337,11 @@ def build_steer_message(verdict: Verdict, *, target_worker: str | None = None) -
         return f"{heading}. reviewer verdict: {verdict.state}; no structured findings were supplied."
     lines = [heading + "."]
     for index, finding in enumerate(verdict.findings, start=1):
-        location = finding.path + (f":{finding.line}" if finding.line is not None else "")
+        location = finding.path
+        if finding.line is not None:
+            location += f":{finding.line}"
+            if finding.line_end is not None:
+                location += f"-{finding.line_end}"
         citation = finding.source_sha or verdict.source_sha or "unknown-sha"
         lines.extend([
             f"{index}. [{finding.severity}] {location} (source sha: {citation})",
@@ -332,6 +360,10 @@ def build_steer_message(verdict: Verdict, *, target_worker: str | None = None) -
             lines.append(f"   mutation contract: {finding.mutation_contract}")
         if finding.source_worker:
             lines.append(f"   source worker: {finding.source_worker}")
+        if finding.source_lenses:
+            lines.append(f"   source lenses: {', '.join(finding.source_lenses)}")
+        if finding.linked_findings:
+            lines.append(f"   linked findings: {', '.join(finding.linked_findings)}")
     lines.append("do not declare merge-ready until every item is fixed and verified.")
     return "\n".join(lines)
 
