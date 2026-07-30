@@ -283,6 +283,9 @@ class Supervisor:
         self.handover_pending = False
         self.handover_active = False
         self.handover_result: dict[str, Any] | None = None
+        self.handover_event_queue: dict[
+            str, list[tuple[ProviderAdapter, ProviderEvent]]
+        ] = {}
         self.codex_fleet_lock = asyncio.Lock()
         self.codex_rotation_task: asyncio.Task[dict[str, Any]] | None = None
         self.codex_rotation_operation_id: str | None = None
@@ -408,13 +411,21 @@ class Supervisor:
                 self.handover_condition.notify_all()
 
     @asynccontextmanager
-    async def _event_mutation_admission(self):
+    async def _event_mutation_admission(
+        self,
+        run_id: str,
+        adapter: ProviderAdapter,
+        event: ProviderEvent,
+    ):
         """Defer provider events while a handover owns the run set."""
 
         async with self.handover_condition:
             while self.handover_pending:
                 await self.handover_condition.wait()
             if self.handover_active:
+                self.handover_event_queue.setdefault(run_id, []).append(
+                    (adapter, event)
+                )
                 yield False
                 return
             self.active_run_mutations += 1
@@ -665,7 +676,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         adapter: ProviderAdapter,
         event: ProviderEvent,
     ) -> None:
-        async with self._event_mutation_admission() as admitted:
+        async with self._event_mutation_admission(run_id, adapter, event) as admitted:
             if not admitted:
                 return
             await self._handle_provider_event_without_admission(
@@ -679,6 +690,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         run_id: str,
         adapter: ProviderAdapter,
         event: ProviderEvent,
+        *,
+        update_adapter_snapshot: bool = True,
+        schedule_monitor_actions: bool = True,
     ) -> None:
         prior = self.store.get(run_id)
         raw = self.store.append_raw(
@@ -733,7 +747,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         )
 
         record = self.store.get(run_id)
-        if normalized.lifecycle_state is not None:
+        if normalized.lifecycle_state is not None and update_adapter_snapshot:
             try:
                 adapter_status = adapter.snapshot()
                 record = self.store.update_adapter_status(run_id, adapter_status)
@@ -789,15 +803,16 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             if credential_fingerprint is not None:
                 verified_event["credential_fingerprint"] = credential_fingerprint
             await self._publish(verified_event)
-        self._schedule_monitor_actions(
-            run_id,
-            adapter,
-            event,
-            prior_state=prior.state,
-            record=record,
-        )
+        if schedule_monitor_actions:
+            self._schedule_monitor_actions(
+                run_id,
+                adapter,
+                event,
+                prior_state=prior.state,
+                record=record,
+            )
 
-        if (
+        if schedule_monitor_actions and (
             record.state is LifecycleState.IDLE
             and id(adapter) not in self.expected_stream_ends
         ):
@@ -805,6 +820,23 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 self._deliver_next_queued(run_id, adapter),
                 name=f"agent-idle-boundary-{run_id}",
             )
+
+    async def _flush_handover_events(self, run_id: str) -> None:
+        """Persist events queued while the handover barrier owned admission."""
+
+        while True:
+            async with self.handover_condition:
+                events = self.handover_event_queue.pop(run_id, [])
+            if not events:
+                return
+            for adapter, event in events:
+                await self._handle_provider_event_without_admission(
+                    run_id,
+                    adapter,
+                    event,
+                    update_adapter_snapshot=False,
+                    schedule_monitor_actions=False,
+                )
 
     def _schedule_monitor_actions(
         self,
@@ -2349,6 +2381,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             runs: list[dict[str, Any]] = []
             for run_id in run_ids:
                 async with self._run_lock(run_id):
+                    await self._flush_handover_events(run_id)
                     record = self.store.get(run_id)
                     runtime = self._runtime_status(record)
                     if (
@@ -2378,8 +2411,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         raise StoreConflict(
                             f"provider control detached during handover: {run_id}"
                         )
-                    handover_run = dict(runtime)
                     await self._quiesce_adapter_for_replacement(run_id, adapter)
+                    await self._flush_handover_events(run_id)
                     current = self.store.get(run_id)
                     if (
                         current.state in TERMINAL_STATES
@@ -2407,6 +2440,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                             transcript_path=current.transcript_path,
                         ),
                     )
+                    handover_run = self._runtime_status(self.store.get(run_id))
                     handover_run.update(
                         {
                             "state": current.state.value,

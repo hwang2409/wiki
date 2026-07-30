@@ -408,7 +408,7 @@ class NativeBuildGuardTests(TestCase):
                 *,
                 timeout: float,
             ) -> None:
-                self.assertEqual(timeout, 45.0)
+                self.assertEqual(timeout, 75.0)
                 time.sleep(15.1)
                 verified.append(runs)
 
@@ -638,6 +638,12 @@ class NativeBuildGuardTests(TestCase):
         ]
         self.assertEqual(
             native_swap_transaction._handover_wait_timeout(runs),
+            135.0,
+        )
+        self.assertEqual(
+            native_swap_transaction._handover_wait_timeout(
+                [{"run_id": "run-1"}, {"run_id": "run-2"}]
+            ),
             75.0,
         )
 

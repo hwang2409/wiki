@@ -1907,6 +1907,95 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(current.state, LifecycleState.WAITING_APPROVAL)
         self.assertIsNone(current.provider_pid)
 
+    async def test_handover_queues_late_events_before_second_snapshot(self) -> None:
+        first = await self.supervisor.start_run(
+            agent_id="WIKI-HANDOVER-EVENT-FIRST",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="first handover event run",
+        )
+        second = await self.supervisor.start_run(
+            agent_id="WIKI-HANDOVER-EVENT-SECOND",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="second handover event run",
+        )
+        await asyncio.sleep(0.05)
+        second_adapter = self.supervisor.adapters[second.run_id]
+        before = self.store.get(second.run_id)
+        first_drain_started = asyncio.Event()
+        release_first_drain = asyncio.Event()
+        original_quiesce = self.supervisor._quiesce_adapter_for_replacement
+
+        async def paused_first_drain(run_id: str, adapter: Any) -> None:
+            if run_id == first.run_id:
+                first_drain_started.set()
+                await release_first_drain.wait()
+            await original_quiesce(run_id, adapter)
+
+        with mock.patch.object(
+            self.supervisor,
+            "_quiesce_adapter_for_replacement",
+            new=paused_first_drain,
+        ):
+            handover_task = asyncio.create_task(self.supervisor.prepare_handover())
+            await asyncio.wait_for(first_drain_started.wait(), timeout=2)
+
+            second_adapter._status = AdapterStatus(  # noqa: SLF001
+                LifecycleState.WAITING_APPROVAL,
+                second.provider_session_id,
+                os.getpid(),
+                generation=second_adapter.snapshot().generation,
+            )
+            await second_adapter._events.put(  # noqa: SLF001
+                ProviderEvent(
+                    ProviderKind.CODEX,
+                    {
+                        "method": "item/agentMessage/delta",
+                        "params": {"delta": "late output"},
+                    },
+                    generation=second_adapter.snapshot().generation,
+                )
+            )
+            await second_adapter._events.put(  # noqa: SLF001
+                ProviderEvent(
+                    ProviderKind.CODEX,
+                    {
+                        "id": 42,
+                        "method": "item/tool/requestUserInput",
+                        "params": {
+                            "questions": [
+                                {"id": "surface", "question": "Which surface?"}
+                            ]
+                        },
+                    },
+                    generation=second_adapter.snapshot().generation,
+                )
+            )
+            for _ in range(100):
+                if second.run_id in self.supervisor.handover_event_queue:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertIn(second.run_id, self.supervisor.handover_event_queue)
+
+            release_first_drain.set()
+            result = await asyncio.wait_for(handover_task, timeout=2)
+
+        current = self.store.get(second.run_id)
+        self.assertEqual(current.raw_event_count, before.raw_event_count + 2)
+        self.assertEqual(current.normalized_event_count, before.normalized_event_count + 2)
+        self.assertEqual(current.state, LifecycleState.WAITING_APPROVAL)
+        self.assertIn("int:42", current.pending_requests)
+        second_runs = [run for run in result["runs"] if run["run_id"] == second.run_id]
+        self.assertEqual(len(second_runs), 1)
+        self.assertTrue(second_runs[0]["pending_requests"])
+
     async def test_mutation_admission_does_not_deadlock_nested_resume_replace(self) -> None:
         record = await self.supervisor.start_run(
             agent_id="WIKI-HANDOVER-ADMISSION-RACE",

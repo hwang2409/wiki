@@ -41,6 +41,7 @@ _IDENTITY_RPC_TIMEOUT_SECONDS = 2.0
 _HANDOVER_RPC_TIMEOUT_SECONDS = 120.0
 _HANDOVER_RESULT_TIMEOUT_SECONDS = 30.0
 _SUPERVISOR_STARTUP_TIMEOUT_SECONDS = 15.0
+_RUN_RECOVERY_TIMEOUT_SECONDS = 30.0
 _DEFAULT_APPROVAL_RECOVERY_TIMEOUT_SECONDS = 30.0
 
 
@@ -209,15 +210,17 @@ def _approval_recovery_timeout_seconds() -> float:
 
 
 def _handover_wait_timeout(runs: list[dict[str, object]]) -> float:
-    """Allow sequential approval recovery for every saved approval run."""
+    """Budget sequential recovery for every run and approval re-emission."""
 
     approval_runs = sum(
         bool(run.get("pending_request"))
         or run.get("state") == "waiting-approval"
         for run in runs
     )
-    return _SUPERVISOR_STARTUP_TIMEOUT_SECONDS + (
-        approval_runs * _approval_recovery_timeout_seconds()
+    return (
+        _SUPERVISOR_STARTUP_TIMEOUT_SECONDS
+        + (len(runs) * _RUN_RECOVERY_TIMEOUT_SECONDS)
+        + (approval_runs * _approval_recovery_timeout_seconds())
     )
 
 
