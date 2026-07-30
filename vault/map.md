@@ -39,7 +39,6 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[harness-pi-coding-agent]] — Pi coding agent harness breakdown: runtime, tool surface
 - [[llm-rigorous-proving]] — LLMs on rigorous mathematical proving: current SOTA, failure modes, benchmarks
 - [[graph-engineering]] — graph engineering as next layer after loop engineering; org-graph + work-graph, nodes/edges/shared-state, maps onto orchestrator/worker stack
-- [[wiki-supervisor-wedge]] — wiki supervisor wedge pathology: socket vanishes, lock held, kill -TERM + auto-relaunch remediation
 
 ## Design
 

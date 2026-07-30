@@ -2,10 +2,14 @@
 type: log
 tags: [log, done]
 created: 2026-07-06
-updated: 2026-07-29
+updated: 2026-07-30
 ---
 
 # Done
+
+## 2026-07-30
+
+- **wiki** — WIKI-217 supervisor fingerprint-swap wedge fixed (dev-client swap guard + early lock release + socket inode guard), merged 5017f26
 
 ## 2026-07-29
 

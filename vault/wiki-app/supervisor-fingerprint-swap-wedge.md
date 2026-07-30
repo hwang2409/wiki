@@ -23,6 +23,19 @@ Outage ~20:12:45 local: backend 503 "Agent supervisor is unavailable: supervisor
 - Shutdown ordering: socket closed/unlinked BEFORE adapter drain, and lock held throughout -> half-dead daemon blocks replacement indefinitely; swap protocol assumes fast old-daemon exit.
 - Deadlock irony: shutdown waits for orchestrator children; the children were busy investigating the outage the shutdown caused.
 
+## Symptoms (cheat sheet)
+
+- Control ops 503: "supervisor did not become ready" with `[Errno 61]` (listener closed, socket file still present) or `[Errno 2]` (file already unlinked).
+- Reads like `list_agents` still serve stale snapshots; supervisor pid alive; `supervisor.lock` flock held; respawns crash-loop "wiki supervisor is already running".
+- Providers die around the wedge; main thread idles in kevent (not a C-level deadlock).
+- Spindump samples (phoebe, 07-29): `/tmp/wiki-backend_2026-07-29_202028_DiBe.sample.txt`, `/tmp/wiki-backend_2026-07-29_204045_bIWq.sample.txt`.
+
+## Remediation (proven 3x on 07-29)
+
+1. `kill -9 $(cat ~/.wiki/agent-runtime/supervisor.pid)` — TERM is a no-op mid-shutdown; the wedge IS a hung TERM.
+2. Any backend request (or UI poll) autostarts a fresh supervisor within seconds; verify `supervisor.sock` exists + ping.
+3. Orchestrators auto-resume; dead-but-registered workers return via replace; re-arm fleet monitors.
+
 ## Evidence
 
 - `~/.wiki/agent-runtime/supervisor.log` lines ~159080-160257 (dev worktree tracebacks), ~160956+ (PYI burst, pids 41848-43721).
@@ -34,5 +47,7 @@ Outage ~20:12:45 local: backend 503 "Agent supervisor is unavailable: supervisor
 - 20:33 kill -9 21618 -> fresh supervisor 51477, healthy.
 - Henry relaunched Wiki.app ~20:35 -> supervisor 52419 -> wedged again within minutes: NEW `wiki-173-orch-autopilot` dev tracebacks in supervisor.log (~line 163487). The WIKI-173 worker re-strikes every fresh supervisor when its turns run dev backend code.
 - 20:42 kill -9 52419 -> supervisor 60373 healthy. Stable only while the WIKI-173 worker stays idle.
+
+FIXED 2026-07-30, merged `5017f26` (WIKI-217): dev-client swap guard in `ensure_running`, early lock/pid release in daemon shutdown, socket unlink guarded by bound inode. Takes effect in the app after the next `make native-build` + relaunch. Worktrees created before the fix still carry the old swapping client until rebased — but with a rebuilt app, their strike now completes as a clean swap instead of a wedge.
 
 Ticket: WIKI-217 (vault todo, P1). Related: [[mitmweb-rebuild]] fleet ops; ticket WIKI-173.
