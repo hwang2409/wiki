@@ -97,7 +97,9 @@ def _durable_state_path() -> Path:
         else Path(tempfile.gettempdir()) / "wiki-agent-runtime"
     )
     state_path = root / "rebase-bot" / "state.json"
-    if os.environ.get("PYTEST_CURRENT_TEST"):
+    if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get(
+        "WIKI_REBASE_TEST_MODE"
+    ):
         live_root = Path.home() / ".wiki" / "agent-runtime"
         try:
             state_path.resolve().relative_to(live_root.resolve())

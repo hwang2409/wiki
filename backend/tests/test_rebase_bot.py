@@ -343,6 +343,45 @@ class RebaseBotTests(unittest.TestCase):
         self.assertEqual(result["status"], "started")
         self.assertEqual(before, after)
 
+    def test_rebase_worker_thread_stays_in_isolated_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            parent_runtime = Path(raw) / "parent-runtime"
+            isolated_runtime = Path(raw) / "isolated-runtime"
+            parent_state = parent_runtime / "rebase-bot" / "state.json"
+            fake_main = SimpleNamespace(AGENT_RUNTIME_DIR=isolated_runtime)
+            job = rebase_durable._RebaseJob(
+                job_id="thread-isolation",
+                worktree=Path(raw) / "worktree",
+                prompt="prompt",
+                done=threading.Event(),
+                pr_number=175,
+                expected_sha="retry-test-thread",
+                ticket="WIKI-220",
+                worker_id="WIKI-220-IMPL",
+                durable=True,
+            )
+            result = {
+                "status": "escalated",
+                "head_sha": "retry-test-thread",
+                "resolved_files": [],
+                "escalated_hunks": ["test"],
+            }
+            with (
+                mock.patch.object(rebase_bot, "_main", return_value=fake_main),
+                mock.patch.object(rebase_bot, "_validate_pr_binding"),
+                mock.patch.object(rebase_bot, "_preflight_worktree"),
+                mock.patch.object(
+                    rebase_bot, "_run_rebase_helper_checked", return_value=result
+                ),
+            ):
+                rebase_bot._start_rebase_thread(job)
+                self.assertTrue(job.done.wait(timeout=5))
+
+            self.assertFalse(parent_state.exists())
+            self.assertTrue(
+                (isolated_runtime / "rebase-bot" / "state.json").exists()
+            )
+
     def test_duplicate_logical_notification_is_sent_once(self) -> None:
         sent: list[tuple[str, str]] = []
         result = {

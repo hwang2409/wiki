@@ -1,18 +1,29 @@
 from __future__ import annotations
 
+import os
+import tempfile
 from pathlib import Path
 
 import pytest
 
 
-@pytest.fixture(autouse=True)
-def isolate_rebase_bot_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """Keep every backend test away from the operator runtime."""
+_ISOLATED_RUNTIME_DIR = Path(
+    tempfile.mkdtemp(prefix="wiki-agent-test-runtime-")
+)
 
-    runtime_dir = tmp_path / "agent-runtime"
-    monkeypatch.setenv("WIKI_AGENT_RUNTIME_DIR", str(runtime_dir))
+
+def pytest_configure() -> None:
+    """Set the test runtime before backend modules are imported."""
+
+    os.environ["WIKI_AGENT_RUNTIME_DIR"] = str(_ISOLATED_RUNTIME_DIR)
+    os.environ["WIKI_REBASE_TEST_MODE"] = "1"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def isolate_rebase_bot_runtime():
+    """Keep every backend test away from the operator runtime."""
 
     from backend.app import main
 
-    monkeypatch.setattr(main, "AGENT_RUNTIME_DIR", runtime_dir)
+    main.AGENT_RUNTIME_DIR = _ISOLATED_RUNTIME_DIR
     yield
