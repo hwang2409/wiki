@@ -1907,6 +1907,45 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(current.state, LifecycleState.WAITING_APPROVAL)
         self.assertIsNone(current.provider_pid)
 
+    async def test_mutation_admission_does_not_deadlock_nested_resume_replace(self) -> None:
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-HANDOVER-ADMISSION-RACE",
+            provider=ProviderKind.CLAUDE,
+            role="implement",
+            model="fixture-claude",
+            worktree=str(self.worktree),
+            prompt="admission race",
+        )
+        run_lock = self.supervisor._run_lock(record.run_id)
+        await run_lock.acquire()
+        try:
+            resume_task = asyncio.create_task(self.supervisor.resume_run(record.run_id))
+            replace_task = asyncio.create_task(
+                self.supervisor.replace(record.run_id, "replacement after admission race")
+            )
+            await asyncio.sleep(0.05)
+            self.assertFalse(resume_task.done())
+            self.assertFalse(replace_task.done())
+
+            handover_task = asyncio.create_task(self.supervisor.prepare_handover())
+            await asyncio.sleep(0.05)
+            run_lock.release()
+
+            results = await asyncio.wait_for(
+                asyncio.gather(
+                    resume_task,
+                    replace_task,
+                    handover_task,
+                    return_exceptions=True,
+                ),
+                timeout=2,
+            )
+        finally:
+            if run_lock.locked():
+                run_lock.release()
+
+        self.assertFalse(any(isinstance(result, asyncio.TimeoutError) for result in results))
+
     async def test_recovery_rechecks_live_orphan_then_resumes_exact_session(
         self,
     ) -> None:

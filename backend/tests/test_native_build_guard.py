@@ -741,10 +741,21 @@ class NativeBuildGuardTests(TestCase):
                     "state": "idle",
                 }
             ]
+            refreshed_runs = [
+                {
+                    "agent_id": "WIKI-SAVED",
+                    "run_id": "run-saved",
+                    "provider_session_id": "session-refreshed",
+                    "state": "working",
+                }
+            ]
             started: list[tuple[Path, Path, Path]] = []
             restarts: list[str] = []
             handover_client = Mock()
-            handover_client.prepare_for_handover.return_value = saved_runs
+            handover_client.prepare_for_handover.side_effect = [
+                saved_runs,
+                refreshed_runs,
+            ]
 
             def restart(bundle: Path, _runtime: Path, _repo: Path) -> bool:
                 restarts.append((bundle / "marker").read_text(encoding="utf-8"))
@@ -795,6 +806,50 @@ class NativeBuildGuardTests(TestCase):
                     (live.resolve(), runtime.resolve(), root.resolve()),
                 ],
             )
+
+            # The rollback leaves the old supervisor live. A retry must ask
+            # that supervisor for a fresh snapshot before stopping it.
+            with (
+                patch.object(
+                    native_swap_transaction,
+                    "_supervisor_lock_is_free",
+                    return_value=False,
+                ),
+                patch.object(
+                    native_swap_transaction,
+                    "_supervisor_identity",
+                    return_value=(
+                        handover_client,
+                        1234,
+                        {"status": "ok", "pid": 1234},
+                    ),
+                ),
+                patch.object(native_swap_transaction, "_stop_supervisor"),
+                patch.object(
+                    native_swap_transaction,
+                    "_wait_for_handover",
+                    return_value=None,
+                ),
+            ):
+                native_swap_transaction.swap_native_app(
+                    stage_root,
+                    root,
+                    runtime,
+                    restart=restart,
+                    start_supervisor=start_supervisor,
+                )
+
+            self.assertEqual(handover_client.prepare_for_handover.call_count, 2)
+            self.assertEqual(
+                started,
+                [
+                    (live.resolve(), runtime.resolve(), root.resolve()),
+                    (live.resolve(), runtime.resolve(), root.resolve()),
+                    (live.resolve(), runtime.resolve(), root.resolve()),
+                ],
+            )
+            self.assertEqual((live / "marker").read_text(encoding="utf-8"), "new")
+            self.assertFalse(stage_root.exists())
 
     def test_swap_keeps_competing_process_out_during_restart_and_rollback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

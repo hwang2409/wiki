@@ -985,7 +985,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         reason="quiesced for auth-dead recovery",
                     )
                     await self._publish_agent_change(detached.agent_id)
-                    await self._resume_run(run_id, automatic=False)
+                    await self._resume_run_without_admission(run_id, automatic=False)
                     revived.append(record.agent_id)
                 except Exception as exc:
                     try:
@@ -1071,7 +1071,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             old_model=old_model,
             new_model=desired_model,
         )
-        replacement = await self._replace(run_id, prompt, desired_model)
+        replacement = await self._replace_without_admission(
+            run_id,
+            prompt,
+            desired_model,
+        )
         if queued_messages:
             replacement = self.store.replace_queued_messages(
                 replacement.run_id,
@@ -1558,16 +1562,28 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 async with self.codex_fleet_lock:
                     self._assert_codex_fleet_available()
                     async with self._run_lock(run_id):
-                        return await self._resume_run(run_id, automatic=False)
+                        return await self._resume_run_without_admission(
+                            run_id,
+                            automatic=False,
+                        )
             async with self._run_lock(run_id):
-                return await self._resume_run(run_id, automatic=False)
+                return await self._resume_run_without_admission(
+                    run_id,
+                    automatic=False,
+                )
 
-    async def _resume_run(self, run_id: str, *, automatic: bool) -> RunRecord:
-        async with self._run_mutation_admission():
-            return await self._resume_run_without_handover(
-                run_id,
-                automatic=automatic,
-            )
+    async def _resume_run_without_admission(
+        self,
+        run_id: str,
+        *,
+        automatic: bool,
+    ) -> RunRecord:
+        """Resume a run after the caller has acquired mutation admission."""
+
+        return await self._resume_run_without_handover(
+            run_id,
+            automatic=automatic,
+        )
 
     async def _resume_run_without_handover(
         self,
@@ -2169,7 +2185,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     if self.pid_alive(record.provider_pid):
                         pending = True
                         continue
-                    await self._resume_run(run_id, automatic=False)
+                    await self._resume_run_without_admission(run_id, automatic=False)
                     row["resumed"] = True
                     row["failed_reason"] = None
                     revived.append(agent_id)
@@ -2481,7 +2497,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         if decision.action is RecoveryAction.RESUME:
             recovery_state = record.recovery_from_state or record.state
             try:
-                await self._resume_run(record.run_id, automatic=True)
+                await self._resume_run_without_admission(
+                    record.run_id,
+                    automatic=True,
+                )
             except Exception as exc:
                 try:
                     self.store.mark_automatic_resume_failed(
@@ -2861,7 +2880,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 async with self.codex_fleet_lock:
                     self._assert_codex_fleet_available()
                     async with self._run_lock(run_id):
-                        replacement = await self._replace(
+                        replacement = await self._replace_without_admission(
                             run_id,
                             prompt,
                             model,
@@ -2871,7 +2890,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         )
             else:
                 async with self._run_lock(run_id):
-                    replacement = await self._replace(
+                    replacement = await self._replace_without_admission(
                         run_id,
                         prompt,
                         model,
@@ -2905,7 +2924,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             )
         return replacement
 
-    async def _replace(
+    async def _replace_without_admission(
         self,
         run_id: str,
         prompt: str,
@@ -2914,15 +2933,16 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         effort: str | None = None,
         backend_base_url: str | None = None,
     ) -> RunRecord:
-        async with self._run_mutation_admission():
-            return await self._replace_without_handover(
-                run_id,
-                prompt,
-                model,
-                provider,
-                effort,
-                backend_base_url,
-            )
+        """Replace a run after the caller has acquired mutation admission."""
+
+        return await self._replace_without_handover(
+            run_id,
+            prompt,
+            model,
+            provider,
+            effort,
+            backend_base_url,
+        )
 
     async def _replace_without_handover(
         self,

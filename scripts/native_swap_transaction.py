@@ -432,9 +432,11 @@ def swap_native_app(
                 expected_executable=old_executable,
                 expected_fingerprint=old_fingerprint,
             )
-            if not handover_state.is_file():
-                saved_runs = handover_client.prepare_for_handover()
-                _write_handover_state(handover_state, saved_runs)
+            # A live supervisor owns the current run state. Always take a new
+            # snapshot before stopping it. A journal is only authoritative
+            # when no supervisor can provide a newer snapshot.
+            saved_runs = handover_client.prepare_for_handover()
+            _write_handover_state(handover_state, saved_runs)
         _stop_supervisor(
             runtime_dir,
             expected_executable=old_executable,
