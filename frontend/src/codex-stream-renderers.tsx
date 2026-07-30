@@ -181,26 +181,18 @@ export type ParsedDiffSnapshot = {
   omittedFiles: boolean;
 };
 
-function boundedDiffSource(source: string): { source: string; truncated: boolean; fileLimited: boolean } {
+function boundedDiffSource(source: string): { source: string; truncated: boolean } {
   const encoded = new TextEncoder().encode(source);
   const truncated = encoded.byteLength > MAX_DIFF_SOURCE_BYTES;
   const bounded = truncated
     ? new TextDecoder().decode(encoded.slice(0, MAX_DIFF_SOURCE_BYTES))
     : source;
-  const chunks = bounded.split(/(?=^diff --git )/m);
-  const firstFileChunk = chunks[0]?.startsWith("diff --git ") ? 0 : 1;
-  const fileCount = chunks.length - firstFileChunk;
-  if (fileCount <= MAX_DIFF_FILES) return { source: bounded, truncated, fileLimited: false };
-  return {
-    source: chunks.slice(0, firstFileChunk + MAX_DIFF_FILES).join(""),
-    truncated,
-    fileLimited: true,
-  };
+  return { source: bounded, truncated };
 }
 
 export function parseDiffSnapshot(source: string): ParsedDiffSnapshot {
   const bounded = boundedDiffSource(source);
-  const parsed = parseUnifiedDiff(bounded.source);
+  const parsed = parseUnifiedDiff(bounded.source, MAX_DIFF_FILES + 1);
   const files = new Map<string, DiffFilePatch>();
   for (const file of parsed) {
     if (files.size >= MAX_DIFF_FILES) break;
@@ -208,7 +200,7 @@ export function parseDiffSnapshot(source: string): ParsedDiffSnapshot {
   }
   return {
     files,
-    omittedFiles: bounded.truncated || bounded.fileLimited || parsed.length > MAX_DIFF_FILES,
+    omittedFiles: bounded.truncated || parsed.length > MAX_DIFF_FILES,
   };
 }
 
@@ -285,7 +277,8 @@ function diffFileStats(file: DiffFilePatch): { lineCount: number; byteCount: num
   let byteCount = 0;
   for (const header of file.extendedHeaders) byteCount += textBytes(header) + 1;
   for (const hunk of file.hunks) {
-    byteCount += textBytes(hunk.header);
+    lineCount += 1;
+    byteCount += textBytes(hunk.header) + 1;
     for (const line of hunk.lines) {
       lineCount += 1;
       byteCount += textBytes(line.text) + 1;
@@ -314,8 +307,14 @@ function boundDiffFile(
   }
   const hunks = [];
   for (const hunk of file.hunks) {
+    const headerBytes = textBytes(hunk.header) + 1;
+    if (lineCount >= maxLines || byteCount + headerBytes > maxBytes) {
+      truncated = true;
+      break;
+    }
     const lines = [];
-    byteCount += textBytes(hunk.header);
+    byteCount += headerBytes;
+    lineCount += 1;
     for (const line of hunk.lines) {
       const lineBytes = textBytes(line.text) + 1;
       if (lineCount >= maxLines || byteCount + lineBytes > maxBytes) {

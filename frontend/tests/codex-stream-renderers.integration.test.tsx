@@ -187,6 +187,16 @@ describe("codex stream renderers", () => {
     expect(renderedLines.length).toBeLessThan(200);
   });
 
+  it("counts hunk headers against diff row and byte limits", () => {
+    const hunks = Array.from({ length: 3_000 }, (_, index) => `@@ -${index + 1},0 +${index + 1},0 @@ ${"header".repeat(8)}`).join("\n");
+    const source = `diff --git a/headers.txt b/headers.txt\n--- a/headers.txt\n+++ b/headers.txt\n${hunks}`;
+    const view = render(<CodexStreamHighlights events={[event("turn_diff_updated", 1, { diff: source })]} />);
+    fireEvent.click(view.getByRole("button", { name: /headers\.txt/ }));
+    const renderedHeaders = view.container.querySelectorAll(".codex-stream-diff-hunk-head");
+    expect(renderedHeaders.length).toBeLessThan(3_000);
+    expect(renderedHeaders.length).toBeLessThanOrEqual(2_000);
+  });
+
   it("caps diff source bytes and file count before rendering", () => {
     const source = Array.from({ length: 120 }, (_, index) => (
       `diff --git a/file-${index}.txt b/file-${index}.txt\n--- a/file-${index}.txt\n+++ b/file-${index}.txt\n@@ -0,1 +0,1 @@\n+${"x".repeat(6_000)}`
