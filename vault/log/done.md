@@ -9,6 +9,7 @@ updated: 2026-07-30
 
 ## 2026-07-30
 
+- **wiki-app** — WIKI-216 unknown-kind telemetry job merged — PR #142, 5 review rounds; weekly incremental sweep w/ atomic archive publication, crash-safe cursors, durable CLI retry+dedupe, auto-files vault todos for novel unknown kinds (https://github.com/hwang2409/wiki/pull/142)
 - **wiki-app** — WIKI-173 orch autopilot merged — PR #140, 8 review rounds; verdict parser w/ alias normalization + SHA-bound merge authority, canonical-graph persistence before action, per-repo merge policy, notifier test isolation w/ live-send trap, strict no-check gate w/ rollup validation (https://github.com/hwang2409/wiki/pull/140)
 - **wiki-app** — WIKI-188 first-class PDF artifact merged — PR #141, 5 review rounds; PDF.js renderer w/ per-component dir_fd+O_NOFOLLOW path walk, bounded streaming text extraction on search AND render paths, windowed thumbnails, race-real TOCTOU test (https://github.com/hwang2409/wiki/pull/141)
 - **wiki-app** — WIKI-215 folded into PR #138 (Claude provider stream events batch, merged)
