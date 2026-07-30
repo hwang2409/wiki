@@ -13216,6 +13216,12 @@ textarea.composer-command-input {
    sheet (not a translucent lightbox) so themed detail renderers — code,
    tables, diffs — sit on their designed surfaces. */
 
+/* Layout-neutral wrapper that scopes a transcript's artifacts for the
+   fullscreen inspector's cmd+enter targeting. */
+.session-artifact-scope {
+  display: contents;
+}
+
 .artifact-inspector {
   position: fixed;
   inset: 0;

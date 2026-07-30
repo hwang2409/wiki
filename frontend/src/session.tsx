@@ -71,6 +71,7 @@ import type {
 } from "./api";
 import { renderAnsi } from "./ansi";
 import { ArtifactBlock } from "./artifact-block";
+import { useArtifactInspector } from "./artifact-inspector";
 import {
   filterCommands,
   initialValues,
@@ -3967,6 +3968,27 @@ function MessageComposer({
   );
 }
 
+// SessionTab plus a self-contained fullscreen-inspector scope: artifacts in
+// this transcript get the Fullscreen action and Cmd+Enter targeting, with
+// sibling navigation limited to this transcript.
+export function InspectableSessionTab(props: ComponentProps<typeof SessionTab>) {
+  const scopeRef = useRef<HTMLDivElement | null>(null);
+  const { handleArtifactsChange, inspector, openInspector } = useArtifactInspector({
+    scopeRef,
+    ticket: props.ticket,
+  });
+  return (
+    <div className="session-artifact-scope" ref={scopeRef}>
+      <SessionTab
+        {...props}
+        onArtifactsChange={handleArtifactsChange}
+        onInspectArtifact={openInspector}
+      />
+      {inspector}
+    </div>
+  );
+}
+
 const WIDTH_KEY = "wiki-session-sidebar-width";
 const MIN_WIDTH = 320;
 
@@ -4052,7 +4074,7 @@ export function SessionSidebar({
             <X size={14} />
           </button>
         </header>
-        <SessionTab showComposer={false} ticket={worker.ticket} />
+        <InspectableSessionTab showComposer={false} ticket={worker.ticket} />
       </div>
     </aside>
   );

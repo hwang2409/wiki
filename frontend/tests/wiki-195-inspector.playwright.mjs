@@ -65,7 +65,49 @@ function logStep(message) {
 
 const MERMAID_SOURCE = "flowchart LR\n  Plan --> Build\n  Build --> Ship";
 
-function artifactInputs() {
+const PNG_SIGNATURE = [137, 80, 78, 71, 13, 10, 26, 10];
+
+async function generateBrowserImageFixtures(page) {
+  return page.evaluate(() => {
+    const canvas = document.createElement("canvas");
+    canvas.width = 96;
+    canvas.height = 64;
+    const context = canvas.getContext("2d");
+    context.fillStyle = "#4f6756";
+    context.fillRect(0, 0, 96, 64);
+    context.fillStyle = "#e8e5df";
+    context.fillRect(16, 16, 64, 32);
+    const strip = (dataUrl) => dataUrl.slice(dataUrl.indexOf(",") + 1);
+    return {
+      jpeg: strip(canvas.toDataURL("image/jpeg", 0.9)),
+      webp: strip(canvas.toDataURL("image/webp", 0.9)),
+    };
+  });
+}
+
+async function assertClipboardHoldsPng(page, label) {
+  const signature = await page.evaluate(async () => {
+    const items = await navigator.clipboard.read();
+    const item = items[0];
+    if (!item.types.includes("image/png")) {
+      throw new Error(`clipboard types are ${item.types.join(", ")}`);
+    }
+    const blob = await item.getType("image/png");
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    return Array.from(bytes.slice(0, 8));
+  });
+  if (JSON.stringify(signature) !== JSON.stringify(PNG_SIGNATURE)) {
+    throw new Error(`${label}: clipboard payload is not a PNG (${signature.join(",")})`);
+  }
+}
+
+async function copyImageAndAssertPng(page, label) {
+  await page.locator(".artifact-inspector").getByTitle("Copy image").click();
+  await page.locator(".artifact-inspector").getByText("Copied", { exact: true }).waitFor({ state: "visible" });
+  await assertClipboardHoldsPng(page, label);
+}
+
+function artifactInputs(browserImages) {
   const rows = Array.from({ length: 8 }, (_, index) => [
     index + 1,
     `row-${String(index + 1).padStart(2, "0")}`,
@@ -144,6 +186,18 @@ function artifactInputs() {
         filename: "src/artifact.ts",
         source: "export const limit = 20;\nexport const enabled = true;\n",
       },
+    },
+    {
+      kind: "image",
+      title: "JPEG fixture",
+      caption: "Copy-image conversion source",
+      payload: { data_base64: browserImages.jpeg, mime: "image/jpeg" },
+    },
+    {
+      kind: "image",
+      title: "WebP fixture",
+      caption: "Copy-image conversion source",
+      payload: { data_base64: browserImages.webp, mime: "image/webp" },
     },
   ];
 }
@@ -253,24 +307,6 @@ async function expectClosed(page) {
 }
 
 async function main() {
-  logStep("creating isolated fixtures for six artifact kinds");
-  const fixtures = makeFixtureRoot("wiki-195-inspector-");
-  const inputs = artifactInputs();
-  const results = invokeFixtureWorker(fixtures, inputs);
-  const transcript = await writeTranscript(fixtures, inputs, results);
-  await writeRegistry(fixtures, transcript);
-  writeQueue(fixtures.queuePath, TICKET, []);
-
-  // The backend scrubs image bytes out of the event payload; serve them from
-  // the archived-run path like wiki-85 does.
-  const imageResult = results[inputs.findIndex((input) => input.kind === "image")];
-  const liveImage = path.join(fixtures.runtimeDir, "runs", RUN_ID, "artifacts", `${imageResult.artifactId}.png`);
-  const archiveArtifacts = path.join(fixtures.root, "archive", TICKET, "20260730-140000", "artifacts");
-  await fs.mkdir(archiveArtifacts, { recursive: true });
-  await fs.copyFile(liveImage, path.join(archiveArtifacts, `${imageResult.artifactId}.png`));
-
-  logStep("starting the isolated worktree backend");
-  const backend = await startBackend(fixtures);
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({
     viewport: { width: 1440, height: 1000 },
@@ -279,6 +315,29 @@ async function main() {
   });
   const page = await context.newPage();
   page.on("pageerror", (error) => logStep(`browser page error: ${error.message}`));
+
+  logStep("generating jpeg/webp fixture bytes in the browser");
+  const browserImages = await generateBrowserImageFixtures(page);
+
+  logStep("creating isolated fixtures for eight artifacts across six kinds");
+  const fixtures = makeFixtureRoot("wiki-195-inspector-");
+  const inputs = artifactInputs(browserImages);
+  const results = invokeFixtureWorker(fixtures, inputs);
+  const transcript = await writeTranscript(fixtures, inputs, results);
+  await writeRegistry(fixtures, transcript);
+  writeQueue(fixtures.queuePath, TICKET, []);
+
+  // The backend scrubs image bytes out of the event payload; serve every
+  // stored artifact from the archived-run path like wiki-85 does.
+  const runArtifacts = path.join(fixtures.runtimeDir, "runs", RUN_ID, "artifacts");
+  const archiveArtifacts = path.join(fixtures.root, "archive", TICKET, "20260730-140000", "artifacts");
+  await fs.mkdir(archiveArtifacts, { recursive: true });
+  for (const file of await fs.readdir(runArtifacts)) {
+    await fs.copyFile(path.join(runArtifacts, file), path.join(archiveArtifacts, file));
+  }
+
+  logStep("starting the isolated worktree backend");
+  const backend = await startBackend(fixtures);
 
   try {
     await page.addInitScript(({ layout }) => {
@@ -294,8 +353,8 @@ async function main() {
     logStep("cmd+enter with no focused/hovered artifact opens the most recent artifact");
     await page.locator(".session-scroll").click({ position: { x: 8, y: 8 } });
     await page.keyboard.press("ControlOrMeta+Enter");
-    await expectInspectorTitle(page, "Parser change");
-    await page.locator(".artifact-inspector .artifact-code-detail").waitFor({ state: "visible" });
+    await expectInspectorTitle(page, "WebP fixture");
+    await page.locator(".artifact-inspector img").first().waitFor({ state: "visible" });
 
     logStep("escape closes the inspector");
     await page.keyboard.press("Escape");
@@ -317,6 +376,8 @@ async function main() {
       ["Build inventory", ".artifact-inspector table", SCREENSHOTS.table],
       ["Weekly throughput", ".artifact-inspector .artifact-plot svg", SCREENSHOTS.plot],
       ["Parser change", ".artifact-inspector .artifact-code-detail", SCREENSHOTS.code],
+      ["JPEG fixture", ".artifact-inspector img", null],
+      ["WebP fixture", ".artifact-inspector img", null],
       ["Release path", ".artifact-inspector .artifact-mermaid svg", null],
     ];
     for (const [title, selector, screenshot] of arrowExpectations) {
@@ -326,7 +387,7 @@ async function main() {
       if (screenshot) await page.screenshot({ path: screenshot });
     }
     await page.keyboard.press("ArrowLeft");
-    await expectInspectorTitle(page, "Parser change");
+    await expectInspectorTitle(page, "WebP fixture");
 
     logStep("copy source copies the raw payload");
     await page.keyboard.press("ArrowRight");
@@ -343,6 +404,23 @@ async function main() {
     await page.keyboard.press("ArrowRight");
     await expectInspectorTitle(page, "Pixel fixture");
     await page.locator(".artifact-inspector").getByTitle("Copy image").waitFor({ state: "visible" });
+
+    logStep("copy image puts image/png bytes on the clipboard for a file-backed PNG");
+    await copyImageAndAssertPng(page, "PNG artifact");
+
+    logStep("copy image converts JPEG and WebP artifacts to image/png");
+    for (const title of ["Build inventory", "Weekly throughput", "Parser change", "JPEG fixture"]) {
+      await page.keyboard.press("ArrowRight");
+      await expectInspectorTitle(page, title);
+    }
+    await copyImageAndAssertPng(page, "JPEG artifact");
+    await page.keyboard.press("ArrowRight");
+    await expectInspectorTitle(page, "WebP fixture");
+    await copyImageAndAssertPng(page, "WebP artifact");
+    for (const title of ["JPEG fixture", "Parser change", "Weekly throughput", "Build inventory", "Pixel fixture"]) {
+      await page.keyboard.press("ArrowLeft");
+      await expectInspectorTitle(page, title);
+    }
 
     logStep("download works from the inspector chrome");
     const downloadPromise = page.waitForEvent("download");
@@ -373,7 +451,7 @@ async function main() {
     await expectClosed(page);
 
     logStep("image expand click routes to the inspector, not the legacy lightbox");
-    await page.locator('[data-artifact-kind="image"] .artifact-image-expand').click();
+    await page.locator('[data-artifact-kind="image"] .artifact-image-expand').first().click();
     await expectInspectorTitle(page, "Pixel fixture");
     if ((await page.locator(".artifact-lightbox").count()) !== 0) {
       throw new Error("Legacy lightbox opened for an artifact image");

@@ -11,13 +11,13 @@ import { AlertTriangle, Bot, GitBranch, GitPullRequest, History, RefreshCw, X } 
 import { AgentPrReviewPanel } from "./agent-pr-review";
 import { LoopStateChrome } from "./loop-state-chrome";
 import { WorkgraphPanel } from "./workgraph-panel";
-import { ArtifactInspector, isTextEntryTarget, resolveInspectTarget } from "./artifact-inspector";
+import { useArtifactInspector } from "./artifact-inspector";
 import { ArtifactPanel } from "./artifact-panel";
 import { ReplayScrubberPanel } from "./replay-scrubber-panel";
 import { deletePaneStateEntries } from "./pane-state-cache";
 import { ReplaceAgentModal } from "./replace-agent-modal";
 import { getTicketCosts, type CostRow, type SessionEvent, type SpawnWorkerEffort, type SpawnWorkerKind } from "./api";
-import { SessionTab, usePollTick } from "./session";
+import { InspectableSessionTab, SessionTab, usePollTick } from "./session";
 import { StatusBadge } from "./status-badge";
 import {
   readPanelState,
@@ -340,7 +340,7 @@ function SubagentSidePanel({
       title={`subagent ${subagent.slice(0, 8)}`}
       width={width}
     >
-      <SessionTab showComposer={false} stateKey={stateKey} subagent={subagent} ticket={ticket} />
+      <InspectableSessionTab showComposer={false} stateKey={stateKey} subagent={subagent} ticket={ticket} />
     </SessionSidePanel>
   );
 }
@@ -383,15 +383,11 @@ export function AgentSessionSurface({
   const panelStateRef = useRef(panelState);
   panelStateRef.current = panelState;
   const [artifactEvents, setArtifactEvents] = useState<SessionEvent[]>([]);
-  const artifactEventsRef = useRef(artifactEvents);
-  artifactEventsRef.current = artifactEvents;
   const artifacts = useMemo(
     () => new Map(artifactEvents.flatMap((event) => (event.artifact_id ? [[event.artifact_id, event] as const] : []))),
     [artifactEvents],
   );
-  const [inspectorIndex, setInspectorIndex] = useState<number | null>(null);
-  const inspectorIndexRef = useRef(inspectorIndex);
-  inspectorIndexRef.current = inspectorIndex;
+  const mainScopeRef = useRef<HTMLDivElement | null>(null);
   const [replaceOpen, setReplaceOpen] = useState(false);
   const commitPanelState = useCallback((update: (current: PanelState) => PanelState, syncUrl = true) => {
     const next = update(panelStateRef.current);
@@ -528,21 +524,8 @@ export function AgentSessionSurface({
       if (pane && !pane.classList.contains("is-focused")) return;
       if (event.defaultPrevented) return;
       // The fullscreen inspector traps and handles its own keys.
-      if (inspectorIndexRef.current !== null) return;
+      if (inspectorOpenRef.current) return;
       const command = event.metaKey || event.ctrlKey;
-      if (command && !event.shiftKey && !event.altKey && event.key === "Enter") {
-        if (isTextEntryTarget(event.target)) return;
-        const target = resolveInspectTarget(
-          rowRef.current,
-          artifactEventsRef.current,
-          panelStateRef.current.focusedTab,
-        );
-        if (target !== null) {
-          event.preventDefault();
-          setInspectorIndex(target);
-        }
-        return;
-      }
       if (event.key === "Escape" && panelState.open && panelState.focusedTab) {
         event.preventDefault();
         closeArtifactTab(panelState.focusedTab);
@@ -574,24 +557,24 @@ export function AgentSessionSurface({
     return () => window.removeEventListener("keydown", onShortcut);
   }, [closeArtifactTab, commitPanelState, panelState.focusedTab, panelState.open, panelState.tabs]);
 
+  const {
+    handleArtifactsChange: inspectorArtifactsChange,
+    inspector,
+    inspectorOpen,
+    openInspector,
+  } = useArtifactInspector({
+    getPanelFocusedTab: () => panelStateRef.current.focusedTab,
+    primary: true,
+    scopeRef: mainScopeRef,
+    ticket: worker.ticket,
+  });
+  const inspectorOpenRef = useRef(inspectorOpen);
+  inspectorOpenRef.current = inspectorOpen;
+
   const handleArtifactsChange = useCallback((events: SessionEvent[]) => {
     setArtifactEvents(events);
-  }, []);
-
-  const openInspector = useCallback((event: SessionEvent) => {
-    const index = artifactEventsRef.current.findIndex(
-      (candidate) => candidate.artifact_id === event.artifact_id,
-    );
-    if (index >= 0) setInspectorIndex(index);
-  }, []);
-
-  const closeInspector = useCallback(() => setInspectorIndex(null), []);
-
-  useEffect(() => {
-    if (inspectorIndex !== null && inspectorIndex >= artifactEvents.length) {
-      setInspectorIndex(artifactEvents.length > 0 ? artifactEvents.length - 1 : null);
-    }
-  }, [artifactEvents.length, inspectorIndex]);
+    inspectorArtifactsChange(events);
+  }, [inspectorArtifactsChange]);
 
   const resizePanel = (event: ReactPointerEvent<HTMLDivElement>) => {
     event.preventDefault();
@@ -729,7 +712,7 @@ export function AgentSessionSurface({
           </div>
         ) : null}
         <TicketCostStrip ticket={worker.ticket} refreshTick={tick} />
-        <div className="agent-session-surface-main">
+        <div className="agent-session-surface-main" ref={mainScopeRef}>
           <SessionTab
             onArtifactsChange={handleArtifactsChange}
             onInspect={inspectSubagent}
@@ -787,15 +770,7 @@ export function AgentSessionSurface({
           width={panelWidth}
         />
       ) : null}
-      {inspectorIndex !== null && artifactEvents.length > 0 ? (
-        <ArtifactInspector
-          events={artifactEvents}
-          index={Math.min(inspectorIndex, artifactEvents.length - 1)}
-          onClose={closeInspector}
-          onIndexChange={setInspectorIndex}
-          ticket={worker.ticket}
-        />
-      ) : null}
+      {inspector}
       {replaceOpen && worker.kind && worker.model ? (
         <ReplaceAgentModal
           target={{

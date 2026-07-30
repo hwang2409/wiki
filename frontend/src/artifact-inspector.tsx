@@ -1,6 +1,6 @@
 import { createPortal } from "react-dom";
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { KeyboardEvent as ReactKeyboardEvent } from "react";
+import type { KeyboardEvent as ReactKeyboardEvent, ReactNode, RefObject } from "react";
 import {
   ChevronLeft,
   ChevronRight,
@@ -55,56 +55,182 @@ export function isTextEntryTarget(target: EventTarget | null): boolean {
 export function inspectorTitle(event: SessionEvent): string {
   return event.title
     || event.artifact?.filename
-    || humanizeArtifactKind(event.artifact?.kind);
+    || humanizeArtifactKind(event.artifact ? classifyArtifact(event.artifact) : undefined);
+}
+
+type InspectorScopeEntry = {
+  element: () => HTMLElement | null;
+  events: () => SessionEvent[];
+  isOpen: () => boolean;
+  open: (index: number) => void;
+  panelFocusedTab: () => string | null;
+  primary: boolean;
+};
+
+const inspectorScopes = new Set<InspectorScopeEntry>();
+
+function paneAllows(element: HTMLElement | null): boolean {
+  const pane = element?.closest(".pane-frame");
+  return !pane || pane.classList.contains("is-focused");
 }
 
 /**
- * Resolve which artifact cmd+enter should open: the focused artifact wins,
- * then the hovered one, then the artifact panel's focused tab, then the most
- * recent artifact in the stream.
+ * One listener serves every registered transcript scope. Resolution order:
+ * a focused artifact wins, then a hovered one — each handled by the scope
+ * that owns it, so sibling navigation stays within that transcript. With no
+ * direct target, the primary scope (the main session transcript) falls back
+ * to its panel-focused tab, then its most recent artifact.
  */
-export function resolveInspectTarget(
-  scope: HTMLElement | Document | null,
-  events: SessionEvent[],
-  panelFocusedTab: string | null,
-): number | null {
-  if (events.length === 0) return null;
-  const indexOf = (artifactId: string | null | undefined): number =>
-    artifactId ? events.findIndex((event) => event.artifact_id === artifactId) : -1;
-  const focusedHost = document.activeElement?.closest?.("[data-artifact-id]");
-  const focusedIndex = indexOf(focusedHost?.getAttribute("data-artifact-id"));
-  if (focusedIndex >= 0) return focusedIndex;
-  if (scope) {
-    const hovered = Array.from(scope.querySelectorAll<HTMLElement>("[data-artifact-id]"))
+export function handleGlobalInspectKey(event: KeyboardEvent): void {
+  if (event.defaultPrevented) return;
+  const command = event.metaKey || event.ctrlKey;
+  if (!command || event.shiftKey || event.altKey || event.key !== "Enter") return;
+  if (isTextEntryTarget(event.target) || isTextEntryTarget(document.activeElement)) return;
+  for (const scope of inspectorScopes) if (scope.isOpen()) return;
+  const openIn = (scope: InspectorScopeEntry, index: number) => {
+    event.preventDefault();
+    scope.open(index);
+  };
+  const focusedHost = document.activeElement?.closest?.("[data-artifact-id]") ?? null;
+  const hoveredHost = focusedHost
+    ? null
+    : Array.from(document.querySelectorAll<HTMLElement>("[data-artifact-id]"))
       .filter((element) => element.matches(":hover"))
-      .at(-1);
-    const hoveredIndex = indexOf(hovered?.getAttribute("data-artifact-id"));
-    if (hoveredIndex >= 0) return hoveredIndex;
+      .at(-1) ?? null;
+  const host = focusedHost ?? hoveredHost;
+  if (host) {
+    const artifactId = host.getAttribute("data-artifact-id");
+    for (const scope of inspectorScopes) {
+      const root = scope.element();
+      if (!root || !root.contains(host) || !paneAllows(root)) continue;
+      const index = scope.events().findIndex((candidate) => candidate.artifact_id === artifactId);
+      if (index >= 0) {
+        openIn(scope, index);
+        return;
+      }
+    }
+    return;
   }
-  const panelIndex = indexOf(panelFocusedTab);
-  if (panelIndex >= 0) return panelIndex;
-  return events.length - 1;
+  for (const scope of inspectorScopes) {
+    if (!scope.primary || !paneAllows(scope.element())) continue;
+    const events = scope.events();
+    if (events.length === 0) continue;
+    const tab = scope.panelFocusedTab();
+    const tabIndex = tab ? events.findIndex((candidate) => candidate.artifact_id === tab) : -1;
+    openIn(scope, tabIndex >= 0 ? tabIndex : events.length - 1);
+    return;
+  }
 }
 
+function registerInspectorScope(entry: InspectorScopeEntry): () => void {
+  if (inspectorScopes.size === 0) {
+    window.addEventListener("keydown", handleGlobalInspectKey);
+  }
+  inspectorScopes.add(entry);
+  return () => {
+    inspectorScopes.delete(entry);
+    if (inspectorScopes.size === 0) {
+      window.removeEventListener("keydown", handleGlobalInspectKey);
+    }
+  };
+}
+
+export function useArtifactInspector({
+  getPanelFocusedTab,
+  primary = false,
+  scopeRef,
+  ticket,
+}: {
+  getPanelFocusedTab?: () => string | null;
+  primary?: boolean;
+  scopeRef: RefObject<HTMLElement | null>;
+  ticket: string;
+}): {
+  handleArtifactsChange: (events: SessionEvent[]) => void;
+  inspector: ReactNode;
+  inspectorOpen: boolean;
+  openInspector: (event: SessionEvent) => void;
+} {
+  const [artifactEvents, setArtifactEvents] = useState<SessionEvent[]>([]);
+  const [index, setIndex] = useState<number | null>(null);
+  const eventsRef = useRef(artifactEvents);
+  eventsRef.current = artifactEvents;
+  const indexRef = useRef(index);
+  indexRef.current = index;
+  const getPanelFocusedTabRef = useRef(getPanelFocusedTab);
+  getPanelFocusedTabRef.current = getPanelFocusedTab;
+
+  useEffect(() => {
+    if (index !== null && index >= artifactEvents.length) {
+      setIndex(artifactEvents.length > 0 ? artifactEvents.length - 1 : null);
+    }
+  }, [artifactEvents.length, index]);
+
+  useEffect(() => registerInspectorScope({
+    element: () => scopeRef.current,
+    events: () => eventsRef.current,
+    isOpen: () => indexRef.current !== null,
+    open: (next) => setIndex(next),
+    panelFocusedTab: () => getPanelFocusedTabRef.current?.() ?? null,
+    primary,
+  }), [primary, scopeRef]);
+
+  const handleArtifactsChange = useCallback((events: SessionEvent[]) => {
+    setArtifactEvents(events);
+  }, []);
+
+  const openInspector = useCallback((event: SessionEvent) => {
+    const next = eventsRef.current.findIndex(
+      (candidate) => candidate.artifact_id === event.artifact_id,
+    );
+    if (next >= 0) setIndex(next);
+  }, []);
+
+  const inspector = index !== null && artifactEvents.length > 0 ? (
+    <ArtifactInspector
+      events={artifactEvents}
+      index={Math.min(index, artifactEvents.length - 1)}
+      onClose={() => setIndex(null)}
+      onIndexChange={setIndex}
+      ticket={ticket}
+    />
+  ) : null;
+
+  return { handleArtifactsChange, inspector, inspectorOpen: index !== null, openInspector };
+}
+
+async function toPngBlob(blob: Blob): Promise<Blob> {
+  if (blob.type === "image/png") return blob;
+  const bitmap = await createImageBitmap(blob);
+  try {
+    const canvas = document.createElement("canvas");
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("2d canvas context unavailable");
+    context.drawImage(bitmap, 0, 0);
+    const png = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/png"));
+    if (!png) throw new Error("PNG encode failed");
+    return png;
+  } finally {
+    bitmap.close();
+  }
+}
+
+// Chromium/WebKit only accept image/png ClipboardItems, so every payload is
+// converted before the write. Failures surface as failures — never a silent
+// URL-as-text copy behind a "Copied" label.
 async function copyImagePayload(ticket: string, event: SessionEvent): Promise<boolean> {
   const artifact = event.artifact!;
   const source = artifact.data_base64
     ? `data:${artifact.mime ?? "image/png"};base64,${artifact.data_base64}`
     : artifactUrl(ticket, event);
+  if (typeof ClipboardItem === "undefined" || !navigator.clipboard?.write) return false;
   try {
-    if (typeof ClipboardItem !== "undefined" && navigator.clipboard?.write) {
-      const response = await fetch(source);
-      const blob = await response.blob();
-      await navigator.clipboard.write([
-        new ClipboardItem({ [blob.type || "image/png"]: blob }),
-      ]);
-      return true;
-    }
-  } catch {
-    // fall through to text copy
-  }
-  try {
-    await navigator.clipboard.writeText(source);
+    const response = await fetch(source);
+    if (!response.ok) throw new Error(`Image fetch failed (${response.status})`);
+    const png = await toPngBlob(await response.blob());
+    await navigator.clipboard.write([new ClipboardItem({ "image/png": png })]);
     return true;
   } catch {
     return false;
@@ -121,7 +247,8 @@ export function ArtifactInspector({
   const dialogRef = useRef<HTMLDivElement | null>(null);
   const previouslyFocused = useRef<HTMLElement | null>(null);
   const copyTimer = useRef<number | null>(null);
-  const [copied, setCopied] = useState<"source" | "image" | null>(null);
+  const previousArtifactId = useRef<string | null>(null);
+  const [copied, setCopied] = useState<"source" | "image" | "image-failed" | null>(null);
   const [viewStates, setViewStates] = useState<Record<string, ArtifactViewState>>({});
 
   const active = events[index] as SessionEvent | undefined;
@@ -136,6 +263,13 @@ export function ArtifactInspector({
       window.clearTimeout(copyTimer.current);
       copyTimer.current = null;
     }
+    // Navigation can unmount the focused action (e.g. Copy image when leaving
+    // an image artifact); reclaim focus so arrow keys keep working.
+    if (previousArtifactId.current !== null) {
+      const dialog = dialogRef.current;
+      if (dialog && !dialog.contains(document.activeElement)) dialog.focus();
+    }
+    previousArtifactId.current = artifactId;
   }, [artifactId]);
 
   useEffect(() => {
@@ -216,7 +350,7 @@ export function ArtifactInspector({
     [canPaginate, onClose, step],
   );
 
-  const showCopied = useCallback((which: "source" | "image") => {
+  const showCopied = useCallback((which: "source" | "image" | "image-failed") => {
     setCopied(which);
     if (copyTimer.current !== null) window.clearTimeout(copyTimer.current);
     copyTimer.current = window.setTimeout(() => {
@@ -238,7 +372,7 @@ export function ArtifactInspector({
 
   const copyImage = useCallback(async () => {
     if (!active) return;
-    if (await copyImagePayload(ticket, active)) showCopied("image");
+    showCopied((await copyImagePayload(ticket, active)) ? "image" : "image-failed");
   }, [active, showCopied, ticket]);
 
   const viewState = viewStates[artifactId] ?? {};
@@ -253,7 +387,7 @@ export function ArtifactInspector({
   if (typeof document === "undefined") return null;
 
   const kind = artifact ? classifyArtifact(artifact) : null;
-  const Icon = (artifact && KIND_ICONS[artifact.kind]) || FileJson;
+  const Icon = (kind && KIND_ICONS[kind]) || FileJson;
   const detail = active && artifact && kind ? (() => {
     switch (kind) {
       case "table": return <TableArtifactDetail artifact={artifact} onChange={onViewChange} state={viewState} />;
@@ -290,7 +424,7 @@ export function ArtifactInspector({
           {caption ? (
             <span className="artifact-inspector-caption" title={caption}>{caption}</span>
           ) : null}
-          <span className="artifact-inspector-kind">{humanizeArtifactKind(artifact?.kind)}</span>
+          <span className="artifact-inspector-kind">{humanizeArtifactKind(kind ?? undefined)}</span>
         </div>
         <div className="artifact-inspector-actions">
           {canPaginate ? (
@@ -339,7 +473,7 @@ export function ArtifactInspector({
             >
               <ImageIcon size={13} />
               <span className="artifact-inspector-action-label">
-                {copied === "image" ? "Copied" : "Copy image"}
+                {copied === "image" ? "Copied" : copied === "image-failed" ? "Copy failed" : "Copy image"}
               </span>
             </button>
           ) : null}

@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
+import { useEffect, useRef } from "react";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
 
 import type { SessionEvent } from "../src/api";
 import { ArtifactBlock } from "../src/artifact-block";
@@ -8,8 +9,20 @@ import {
   ArtifactInspector,
   inspectorTitle,
   isTextEntryTarget,
-  resolveInspectTarget,
+  useArtifactInspector,
 } from "../src/artifact-inspector";
+import { SessionSidebar, InspectableSessionTab } from "../src/session";
+
+class NoopObserver {
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+}
+
+beforeAll(() => {
+  (globalThis as { IntersectionObserver?: unknown }).IntersectionObserver ??= NoopObserver;
+  (globalThis as { ResizeObserver?: unknown }).ResizeObserver ??= NoopObserver;
+});
 
 function artifactEvent(overrides: Partial<SessionEvent> & { artifact_id: string }): SessionEvent {
   return {
@@ -41,6 +54,20 @@ const imageEvent = artifactEvent({
 });
 
 const events = [jsonEvent, codeEvent, imageEvent];
+
+function sessionPayload(sessionEvents: SessionEvent[], path: string) {
+  return {
+    version: 2,
+    format: "claude",
+    path,
+    tokens: null,
+    base: 0,
+    cursor: sessionEvents.length,
+    tail_from: 0,
+    events: sessionEvents,
+    patches: [],
+  };
+}
 
 beforeEach(() => {
   vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response("{}", {
@@ -74,6 +101,30 @@ describe("ArtifactInspector chrome", () => {
     expect(screen.getByTitle("Copy raw payload")).toBeTruthy();
     expect(screen.getByTitle("Download")).toBeTruthy();
     expect(screen.getByTitle("Close (Esc)")).toBeTruthy();
+  });
+
+  test("code artifact carrying a unified diff gets Diff chrome and the diff viewer", () => {
+    const diffInCode = artifactEvent({
+      artifact_id: "diff-1",
+      artifact: {
+        kind: "code",
+        language: "diff",
+        source: "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n",
+      },
+    });
+    render(
+      <ArtifactInspector
+        events={[diffInCode]}
+        index={0}
+        onClose={() => undefined}
+        onIndexChange={() => undefined}
+        ticket="WIKI-195"
+      />,
+    );
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.querySelector(".artifact-inspector-kind")?.textContent).toBe("Diff");
+    expect(dialog.getAttribute("aria-label")).toBe("Diff");
+    expect(dialog.querySelector(".artifact-detail-diff")).toBeTruthy();
   });
 
   test("copy image action appears only for image artifacts", () => {
@@ -118,6 +169,34 @@ describe("ArtifactInspector chrome", () => {
       fireEvent.click(screen.getByTitle("Copy raw payload"));
     });
     expect(writeText).toHaveBeenCalledWith("print('hi')");
+  });
+
+  test("copy image reports failure instead of silently copying text", async () => {
+    (globalThis as { ClipboardItem?: unknown }).ClipboardItem = class {
+      constructor(_types: Record<string, Blob>) {}
+    };
+    const write = vi.fn().mockResolvedValue(undefined);
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { write, writeText },
+    });
+    // jsdom has no createImageBitmap/canvas encode, so the PNG conversion
+    // throws — the button must surface the failure, not fall back to text.
+    render(
+      <ArtifactInspector
+        events={[imageEvent]}
+        index={0}
+        onClose={() => undefined}
+        onIndexChange={() => undefined}
+        ticket="WIKI-195"
+      />,
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByTitle("Copy image"));
+    });
+    expect(screen.getByText("Copy failed")).toBeTruthy();
+    expect(writeText).not.toHaveBeenCalled();
   });
 });
 
@@ -272,35 +351,158 @@ describe("ArtifactInspector focus behavior", () => {
   });
 });
 
-describe("resolveInspectTarget", () => {
-  test("focused artifact wins over everything", () => {
-    const host = document.createElement("section");
-    host.setAttribute("data-artifact-id", "code-1");
-    host.tabIndex = 0;
-    document.body.appendChild(host);
-    try {
-      host.focus();
-      expect(resolveInspectTarget(document.body, events, "image-1")).toBe(1);
-    } finally {
-      host.remove();
-    }
+function InspectorScopeHarness({
+  primary = false,
+  scopeEvents,
+  tag,
+}: {
+  primary?: boolean;
+  scopeEvents: SessionEvent[];
+  tag: string;
+}) {
+  const scopeRef = useRef<HTMLDivElement | null>(null);
+  const { handleArtifactsChange, inspector, openInspector } = useArtifactInspector({
+    primary,
+    scopeRef,
+    ticket: "WIKI-195",
+  });
+  useEffect(() => {
+    handleArtifactsChange(scopeEvents);
+  }, [handleArtifactsChange, scopeEvents]);
+  return (
+    <div data-scope={tag} ref={scopeRef}>
+      {scopeEvents.map((event) => (
+        <section data-artifact-id={event.artifact_id} key={event.artifact_id} tabIndex={0}>
+          <button onClick={() => openInspector(event)} type="button">open {event.artifact_id}</button>
+        </section>
+      ))}
+      {inspector}
+    </div>
+  );
+}
+
+describe("useArtifactInspector scopes", () => {
+  const mainEvents = [jsonEvent, codeEvent];
+  const sideEvents = [
+    artifactEvent({
+      artifact_id: "side-1",
+      title: "Side artifact",
+      artifact: { kind: "json", json_data: { side: true } },
+    }),
+  ];
+
+  test("cmd+enter opens the focused artifact in its owning scope with scoped siblings", () => {
+    const { container } = render(
+      <>
+        <InspectorScopeHarness primary scopeEvents={mainEvents} tag="main" />
+        <InspectorScopeHarness scopeEvents={sideEvents} tag="side" />
+      </>,
+    );
+    const sideBlock = container.querySelector("[data-artifact-id='side-1']") as HTMLElement;
+    sideBlock.focus();
+    fireEvent.keyDown(window, { key: "Enter", metaKey: true });
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.getAttribute("aria-label")).toBe("Side artifact");
+    // one sibling only — no counter, no pagination into the other transcript
+    expect(screen.queryByLabelText("Next artifact")).toBeNull();
   });
 
-  test("falls back to the panel's focused tab", () => {
-    expect(resolveInspectTarget(document.body, events, "image-1")).toBe(2);
+  test("cmd+enter with no focused/hovered artifact falls back to the primary scope's latest", () => {
+    render(
+      <>
+        <InspectorScopeHarness primary scopeEvents={mainEvents} tag="main" />
+        <InspectorScopeHarness scopeEvents={sideEvents} tag="side" />
+      </>,
+    );
+    (document.activeElement as HTMLElement | null)?.blur?.();
+    fireEvent.keyDown(window, { key: "Enter", metaKey: true });
+    expect(screen.getByRole("dialog").getAttribute("aria-label")).toBe("Snippet");
   });
 
-  test("falls back to the most recent artifact", () => {
-    expect(resolveInspectTarget(document.body, events, null)).toBe(2);
+  test("cmd+enter is inert while an inspector is already open", () => {
+    render(<InspectorScopeHarness primary scopeEvents={mainEvents} tag="main" />);
+    fireEvent.keyDown(window, { key: "Enter", metaKey: true });
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+    fireEvent.keyDown(window, { key: "Enter", metaKey: true });
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
   });
 
-  test("returns null when there are no artifacts", () => {
-    expect(resolveInspectTarget(document.body, [], null)).toBeNull();
+  test("cmd+enter never fires from a text-entry target", () => {
+    render(
+      <>
+        <InspectorScopeHarness primary scopeEvents={mainEvents} tag="main" />
+        <textarea aria-label="composer" />
+      </>,
+    );
+    const composer = screen.getByLabelText("composer");
+    composer.focus();
+    fireEvent.keyDown(composer, { key: "Enter", metaKey: true });
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+});
+
+describe("transcript surfaces", () => {
+  test("agents-page drawer artifacts open the fullscreen inspector", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes("/api/agents/WIKI-DRAWER/session")) {
+        return new Response(
+          JSON.stringify(sessionPayload([
+            artifactEvent({
+              artifact_id: "drawer-1",
+              title: "Drawer artifact",
+              artifact: { kind: "json", json_data: { drawer: true } },
+            }),
+          ], "drawer.jsonl")),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } });
+    });
+    render(
+      <SessionSidebar
+        worker={{ ticket: "WIKI-DRAWER", kind: "cc", role: "implement" }}
+        onClose={() => undefined}
+        onOpenAgent={() => undefined}
+      />,
+    );
+    const fullscreen = await screen.findByTitle("Fullscreen (⌘↩)");
+    fireEvent.click(fullscreen);
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.getAttribute("aria-label")).toBe("Drawer artifact");
+  });
+
+  test("subagent transcript artifacts open the fullscreen inspector via cmd+enter", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes("/subagents/sub-1/session")) {
+        return new Response(
+          JSON.stringify(sessionPayload([
+            artifactEvent({
+              artifact_id: "sub-artifact-1",
+              title: "Subagent artifact",
+              artifact: { kind: "json", json_data: { sub: true } },
+            }),
+          ], "subagent.jsonl")),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } });
+    });
+    const { container } = render(
+      <InspectableSessionTab showComposer={false} subagent="sub-1" ticket="WIKI-SUB" />,
+    );
+    await screen.findByTitle("Fullscreen (⌘↩)");
+    const block = container.querySelector("[data-artifact-id='sub-artifact-1']") as HTMLElement;
+    block.focus();
+    fireEvent.keyDown(window, { key: "Enter", metaKey: true });
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.getAttribute("aria-label")).toBe("Subagent artifact");
   });
 });
 
 describe("helpers", () => {
-  test("inspectorTitle prefers event title, then filename, then kind label", () => {
+  test("inspectorTitle prefers event title, then filename, then classified kind label", () => {
     expect(inspectorTitle(jsonEvent)).toBe("Run summary");
     expect(
       inspectorTitle(artifactEvent({
@@ -314,6 +516,12 @@ describe("helpers", () => {
         artifact: { kind: "mermaid", source: "graph TD" },
       })),
     ).toBe("Diagram");
+    expect(
+      inspectorTitle(artifactEvent({
+        artifact_id: "diff-2",
+        artifact: { kind: "code", source: "diff --git a/x b/x\n--- a/x\n+++ b/x\n" },
+      })),
+    ).toBe("Diff");
   });
 
   test("isTextEntryTarget detects inputs, textareas, and contenteditable", () => {
