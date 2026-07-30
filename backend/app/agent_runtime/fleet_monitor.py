@@ -88,6 +88,7 @@ class _WorkerView:
     step: str | None
     blocker: str | None
     status_mtime: float | None
+    verdict_path: str | None = None
 
 
 def _read_status_file(path) -> tuple[dict[str, Any] | None, float | None]:
@@ -297,6 +298,7 @@ class FleetMonitor:
                         pr=None,
                         step=None,
                         blocker=None,
+                        verdict_path=None,
                         status_mtime=mtime,
                     )
                 )
@@ -308,6 +310,9 @@ class FleetMonitor:
                     pr=_string_or_none(status_data.get("pr")),
                     step=_string_or_none(status_data.get("step")),
                     blocker=_string_or_none(status_data.get("blocker")),
+                    verdict_path=_string_or_none(
+                        status_data.get("verdict_path") or status_data.get("artifact_path")
+                    ),
                     status_mtime=mtime,
                 )
             )
@@ -371,6 +376,7 @@ class FleetMonitor:
                                     "status_mtime": view.status_mtime,
                                     "step": view.step,
                                     "pr": view.pr,
+                                    "verdict_path": view.verdict_path,
                                     "orch": record.orchestrator_id,
                                 }
                             )

@@ -1079,6 +1079,8 @@ class AgentWatchTests(unittest.TestCase):
                     raise SystemExit(8)
                 if scenario == "no-checks":
                     print("[]")
+                elif scenario == "empty-checks-failure":
+                    raise SystemExit(1)
                 else:
                     print(json.dumps([{ "name": "test", "state": "SUCCESS" }]))
             elif args[:2] == ["api", "graphql"]:
@@ -1104,6 +1106,7 @@ class GateTests(unittest.TestCase):
             "draft": (1, ["draft"]),
             "failing-checks": (1, ["checks-failing"]),
             "no-checks": (0, []),
+            "empty-checks-failure": (2, []),
             "unresolved": (1, ["unresolved-threads:2"]),
             "not-mergeable": (1, ["not-mergeable"]),
         }
@@ -1123,6 +1126,9 @@ class GateTests(unittest.TestCase):
                         },
                     )
                     self.assertEqual(proc.returncode, code, msg=proc.stderr)
+                    if code == 2:
+                        self.assertIn("gh pr checks failed", proc.stderr)
+                        continue
                     payload = json.loads(proc.stdout)
                     self.assertEqual(payload["ready"], code == 0)
                     self.assertEqual(payload["reasons"], reasons)

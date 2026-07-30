@@ -179,7 +179,9 @@ prior reviewer: {prior}
 inspect the pinned worktree, identify actionable correctness, security, reliability,
 and test issues, and report findings with file and line references. if the diff is
 clean, report that explicitly. follow the repository review protocol and do not
-modify the worktree.
+modify the worktree. after the review, write the complete structured verdict to
+/tmp/{reviewer_id}-verdict.json. use state, source_sha, and findings fields;
+each finding must include severity, path, line, problem, and fix.
 """
 
 

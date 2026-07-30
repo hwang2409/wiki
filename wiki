@@ -1208,7 +1208,11 @@ def _check_gate_checks(pr: str, repo: str) -> tuple[list[dict], bool]:
         allowed_returncodes={0, 1, 8},
     )
     raw = result.stdout.strip()
+    if result.returncode != 0 and not raw:
+        raise GateError("gh pr checks failed without a check result")
     if not raw or raw.lower().startswith("no checks reported"):
+        if result.returncode != 0:
+            raise GateError("gh pr checks did not complete successfully")
         return [], True
     try:
         checks = json.loads(raw)
@@ -1217,6 +1221,8 @@ def _check_gate_checks(pr: str, repo: str) -> tuple[list[dict], bool]:
     if not isinstance(checks, list):
         raise GateError("gh pr checks returned a non-list")
     normalized = [check for check in checks if isinstance(check, dict)]
+    if result.returncode != 0 and not normalized:
+        raise GateError("gh pr checks failed before reporting checks")
     return normalized, not normalized
 
 

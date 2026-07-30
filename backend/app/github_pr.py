@@ -17,6 +17,7 @@ AGENT_STATUS_DIR = Path(os.environ.get("WIKI_AGENT_STATUS_DIR") or "/tmp/agent-s
 PR_CACHE_TTL_SECONDS = 20
 PR_URL_HOSTS = {"github.com", "www.github.com"}
 DEFAULT_GITHUB_REPO = "hwang2409/wiki"
+AUTO_MERGE_REPOSITORIES = frozenset({DEFAULT_GITHUB_REPO})
 REVIEW_THREADS_QUERY = """
 query ReviewThreads($url: URI!, $endCursor: String) {
   resource(url: $url) {
@@ -321,6 +322,9 @@ def merge_pr(pr_url: str, expected_sha: str) -> dict[str, str]:
 
     if _normalize_pr_url(pr_url) != pr_url:
         raise HTTPException(status_code=400, detail="a canonical GitHub PR URL is required")
+    repository = _github_repo_from_url(pr_url)
+    if repository not in AUTO_MERGE_REPOSITORIES:
+        raise HTTPException(status_code=403, detail="repository is not authorized for autopilot merge")
     if not isinstance(expected_sha, str) or not re.fullmatch(r"[0-9a-fA-F]{7,64}", expected_sha):
         raise HTTPException(status_code=400, detail="expected PR head sha is required")
     _run_gh(

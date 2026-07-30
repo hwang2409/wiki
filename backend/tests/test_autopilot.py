@@ -10,6 +10,8 @@ from pathlib import Path
 from backend.app.agent_runtime.autopilot import (
     AutopilotController,
     AutopilotStore,
+    Finding,
+    Verdict,
     build_steer_message,
     parse_verdict,
     verdict_from_graph,
@@ -121,6 +123,69 @@ VERDICT: NOT-MERGE-READY: 1 finding
         self.assertIsNotNone(verdict)
         assert verdict is not None
         self.assertFalse(verdict.clean)
+
+    def test_parser_rejects_duplicate_same_state_header_with_hidden_finding(self) -> None:
+        self.assertIsNone(
+            parse_verdict(
+                """MERGE-READY
+
+quoted answer:
+MERGE-READY
+- [HIGH] backend/app/main.py:1 - hidden finding
+  fix: expose the finding
+""",
+                source_sha="0123456",
+            )
+        )
+
+    def test_maybe_merge_blocks_nonclean_verdict_inside_merge_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            gate_calls: list[str] = []
+            merged: list[str] = []
+            controller = AutopilotController(
+                store=AutopilotStore(Path(directory)),
+                status_reader=lambda _ticket: {"pr": PR_URL, "sha": "0123456"},
+                gate=lambda pr, _sha: gate_calls.append(pr) or {"verdict": "pass", "pr": pr},
+                merge=lambda pr, _sha: merged.append(pr),
+            )
+            controller.enable("WIKI-173")
+            state = controller.store.load("WIKI-173")
+            verdict = Verdict(
+                state="MERGE-READY",
+                source_sha="0123456",
+                findings=(
+                    Finding(
+                        severity="BLOCKING",
+                        path="backend/app/main.py",
+                        line=1,
+                        problem="unsafe merge",
+                        fix="stop the merge",
+                    ),
+                ),
+            )
+            self.assertTrue(asyncio.run(controller._maybe_merge("WIKI-173", state, verdict)))
+            self.assertEqual(gate_calls, [])
+            self.assertEqual(merged, [])
+
+    def test_unknown_repository_is_blocked_by_autopilot_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            gate_calls: list[str] = []
+            merged: list[str] = []
+            controller = AutopilotController(
+                store=AutopilotStore(Path(directory)),
+                status_reader=lambda _ticket: {
+                    "pr": "https://github.com/example/other/pull/173",
+                    "sha": "0123456",
+                },
+                gate=lambda pr, _sha: gate_calls.append(pr) or {"verdict": "pass", "pr": pr},
+                merge=lambda pr, _sha: merged.append(pr),
+            )
+            controller.enable("WIKI-173")
+            state = controller.store.load("WIKI-173")
+            verdict = Verdict(state="MERGE-READY", source_sha="0123456")
+            self.assertTrue(asyncio.run(controller._maybe_merge("WIKI-173", state, verdict)))
+            self.assertEqual(gate_calls, [])
+            self.assertEqual(merged, [])
 
     def test_gate_clean_and_verdict_clean_merges(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -459,6 +524,109 @@ VERDICT: NOT-MERGE-READY: 1 finding
             self.assertEqual(len(steers), 1)
             self.assertIsNotNone(controller.status("WIKI-173")["last_event_key"])
 
+    def test_reviewer_artifact_flows_through_parser_and_controller(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "reviewer-output.txt"
+            artifact.write_text(
+                """NOT-MERGE-READY: 1 finding
+
+1. [BLOCKING] backend/app/main.py:1 - unsafe merge
+   fix: stop the merge
+""",
+                encoding="utf-8",
+            )
+            graph = _graph([])
+            graph["edges"] = [
+                {"kind": "spawn", "to": "WIKI-173-REVIEW1", "payload": {"role": "review"}}
+            ]
+            steers: list[str] = []
+            archived: list[str] = []
+            controller = AutopilotController(
+                store=AutopilotStore(Path(directory) / "state"),
+                status_reader=lambda _ticket: {"pr": PR_URL, "sha": "0123456"},
+                graph_loader=lambda _ticket: graph,
+                steer=lambda _ticket, message: steers.append(message),
+                archive=lambda reviewer: archived.append(reviewer),
+            )
+            controller.enable("WIKI-173")
+            event = {
+                "agent_id": "WIKI-173-REVIEW1",
+                "run_id": "r1",
+                "status_state": "merge-ready",
+                "status_mtime": 1,
+                "verdict_path": str(artifact),
+            }
+            self.assertTrue(asyncio.run(controller.on_transition(event)))
+            self.assertEqual(len(steers), 1)
+            self.assertEqual(archived, ["WIKI-173-REVIEW1"])
+            self.assertIsNotNone(controller.status("WIKI-173")["last_event_key"])
+
+    def test_steer_and_archive_stages_resume_without_duplicate_steer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            graph = _graph(
+                [
+                    {
+                        "state": "NOT-MERGE-READY",
+                        "sha": "0123456",
+                        "findings": [
+                            {
+                                "id": "F-retry1",
+                                "severity": "HIGH",
+                                "path": "backend/app/main.py",
+                                "line": 1,
+                                "problem": "bad",
+                                "fix": "fix",
+                            }
+                        ],
+                    }
+                ]
+            )
+            steers: list[str] = []
+            archives: list[str] = []
+
+            def archive(reviewer: str) -> None:
+                archives.append(reviewer)
+                if len(archives) == 1:
+                    raise RuntimeError("archive unavailable")
+
+            controller = AutopilotController(
+                store=AutopilotStore(Path(directory)),
+                status_reader=lambda _ticket: {"pr": PR_URL, "sha": "0123456"},
+                graph_loader=lambda _ticket: graph,
+                steer=lambda _ticket, message: steers.append(message),
+                archive=archive,
+            )
+            controller.enable("WIKI-173")
+            event = {
+                "agent_id": "WIKI-173-REVIEW1",
+                "run_id": "r1",
+                "status_state": "merge-ready",
+                "status_mtime": 1,
+            }
+            self.assertFalse(asyncio.run(controller.on_transition(event)))
+            self.assertTrue(asyncio.run(controller.on_transition(event)))
+            self.assertEqual(len(steers), 1)
+            self.assertEqual(archives, ["WIKI-173-REVIEW1", "WIKI-173-REVIEW1"])
+
+    def test_enable_reconciles_existing_merge_ready_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            merged: list[str] = []
+            controller = AutopilotController(
+                store=AutopilotStore(Path(directory)),
+                status_reader=lambda _ticket: {
+                    "state": "merge-ready",
+                    "pr": PR_URL,
+                    "sha": "0123456",
+                },
+                graph_loader=lambda _ticket: _graph(
+                    [{"state": "MERGE-READY", "sha": "0123456", "findings": []}]
+                ),
+                gate=lambda pr, _sha: {"verdict": "pass", "pr": pr},
+                merge=lambda pr, _sha: merged.append(pr),
+            )
+            controller.enable("WIKI-173")
+            self.assertEqual(merged, [PR_URL])
+
     def test_transient_gate_failure_retries_same_transition(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             gate_results = iter(
@@ -516,6 +684,9 @@ VERDICT: NOT-MERGE-READY: 1 finding
         self.assertEqual(steer_finding["why_wrong"], "why wrong")
         self.assertEqual(steer_finding["constraint"], "keep the gate pinned")
         self.assertEqual(steer_finding["source_worker"], "WIKI-173-REVIEW1")
+        message = build_steer_message(verdict, target_worker="WIKI-173")
+        for field in ("why wrong", "constraint", "source worker", "finding id"):
+            self.assertIn(field, message)
 
     def test_current_reviewer_falls_back_to_review_node_kind(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
