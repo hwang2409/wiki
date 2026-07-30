@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from backend.app.native_lifecycle import hold_app_lock, hold_runtime_locks
 import scripts.atomic_swap as atomic_swap_module
-from scripts.atomic_swap import atomic_replace
+from scripts.atomic_swap import atomic_replace, rollback_replace
 from scripts.native_build_guard import inspect_runtime
 from scripts.native_daemon_restart import restart_daemon_if_installed
 
@@ -189,3 +189,22 @@ class NativeBuildGuardTests(TestCase):
             self.assertEqual(command_args[-3:], ["daemon", "install", "--json"])
             self.assertEqual(command_env["WIKI_APP_PATH"], str(live_bundle))
             self.assertEqual(command_env["WIKI_AGENT_RUNTIME_DIR"], str(runtime_dir))
+
+    def test_failed_swap_restores_old_bundle_before_retrying_daemon(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            live = root / "live" / "Wiki.app"
+            staged = root / "stage" / "Wiki.app"
+            live.mkdir(parents=True)
+            staged.mkdir(parents=True)
+            (live / "marker").write_text("old", encoding="utf-8")
+            (staged / "marker").write_text("new", encoding="utf-8")
+            sentinel = root / "stage" / ".swap-complete"
+            intent = root / "stage" / ".swap-intent"
+
+            self.assertTrue(atomic_replace(staged, live, sentinel, intent))
+            self.assertEqual((live / "marker").read_text(encoding="utf-8"), "new")
+            self.assertTrue(rollback_replace(staged, live, sentinel, intent))
+            self.assertEqual((live / "marker").read_text(encoding="utf-8"), "old")
+            self.assertEqual((staged / "marker").read_text(encoding="utf-8"), "new")
+            self.assertFalse(sentinel.exists())

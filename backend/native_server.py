@@ -282,6 +282,147 @@ def _peer_executable(pid: int) -> Path | None:
     return Path(buffer.value.decode("utf-8"))
 
 
+def _security_code_identity(
+    pid: int,
+) -> tuple[str, str | None, frozenset[str]] | None:
+    """Read and validate the live process identity from Security.framework."""
+
+    if platform.system() != "Darwin":
+        return None
+    try:
+        security = ctypes.CDLL(
+            "/System/Library/Frameworks/Security.framework/Security"
+        )
+        core_foundation = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+        )
+        copy_guest_with_attributes = security.SecCodeCopyGuestWithAttributes
+        copy_guest_with_attributes.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        copy_guest_with_attributes.restype = ctypes.c_int
+        check_validity = security.SecCodeCheckValidity
+        check_validity.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        check_validity.restype = ctypes.c_int
+        copy_signing_information = security.SecCodeCopySigningInformation
+        copy_signing_information.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        copy_signing_information.restype = ctypes.c_int
+        dictionary_get_value = core_foundation.CFDictionaryGetValue
+        dictionary_get_value.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        dictionary_get_value.restype = ctypes.c_void_p
+        string_get_cstring = core_foundation.CFStringGetCString
+        string_get_cstring.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_char_p,
+            ctypes.c_long,
+            ctypes.c_uint32,
+        ]
+        string_get_cstring.restype = ctypes.c_bool
+        data_get_length = core_foundation.CFDataGetLength
+        data_get_length.argtypes = [ctypes.c_void_p]
+        data_get_length.restype = ctypes.c_long
+        data_get_byte_ptr = core_foundation.CFDataGetBytePtr
+        data_get_byte_ptr.argtypes = [ctypes.c_void_p]
+        data_get_byte_ptr.restype = ctypes.POINTER(ctypes.c_ubyte)
+        number_create = core_foundation.CFNumberCreate
+        number_create.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+        number_create.restype = ctypes.c_void_p
+        dictionary_create = core_foundation.CFDictionaryCreate
+        dictionary_create.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_long,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        dictionary_create.restype = ctypes.c_void_p
+        release = core_foundation.CFRelease
+        release.argtypes = [ctypes.c_void_p]
+    except (AttributeError, OSError):
+        return None
+
+    pid_number = ctypes.c_int(pid)
+    pid_value = number_create(None, 3, ctypes.byref(pid_number))
+    if not pid_value:
+        return None
+    key = ctypes.c_void_p.in_dll(security, "kSecGuestAttributePid")
+    keys = (ctypes.c_void_p * 1)(key)
+    values = (ctypes.c_void_p * 1)(pid_value)
+    attributes = dictionary_create(None, keys, values, 1, None, None)
+    if not attributes:
+        release(pid_value)
+        return None
+    code = ctypes.c_void_p()
+    try:
+        if (
+            copy_guest_with_attributes(None, attributes, 0, ctypes.byref(code)) != 0
+            or not code
+            or check_validity(code, 0, None) != 0
+        ):
+            return None
+        signing_information = ctypes.c_void_p()
+        # kSecCSSigningInformation | kSecCSDynamicInformation.
+        if (
+            copy_signing_information(code, 0x02 | 0x08, ctypes.byref(signing_information))
+            != 0
+            or not signing_information
+        ):
+            return None
+        try:
+            def value_for(name: str) -> ctypes.c_void_p | None:
+                try:
+                    key = ctypes.c_void_p.in_dll(security, name)
+                except ValueError:
+                    return None
+                value = dictionary_get_value(signing_information, key)
+                return value or None
+
+            def string_value(value: ctypes.c_void_p | None) -> str | None:
+                if not value:
+                    return None
+                buffer = ctypes.create_string_buffer(512)
+                if not string_get_cstring(value, buffer, 512, 0x08000100):
+                    return None
+                return buffer.value.decode("utf-8")
+
+            def data_value(value: ctypes.c_void_p | None) -> str | None:
+                if not value:
+                    return None
+                length = data_get_length(value)
+                pointer = data_get_byte_ptr(value)
+                if length <= 0 or not pointer:
+                    return None
+                return bytes(pointer[:length]).hex()
+
+            identifier = string_value(value_for("kSecCodeInfoIdentifier"))
+            if not identifier:
+                return None
+            team = string_value(value_for("kSecCodeInfoTeamIdentifier"))
+            unique = data_value(value_for("kSecCodeInfoUnique"))
+            if not unique:
+                return None
+            return identifier, team, frozenset({unique})
+        finally:
+            release(signing_information)
+    finally:
+        if code:
+            release(code)
+        release(attributes)
+        release(pid_value)
+
+
 def _codesign_details(executable: Path) -> list[str] | None:
     try:
         result = subprocess.run(
@@ -333,6 +474,16 @@ def _code_directory_identity(details: list[str]) -> str | None:
     return None
 
 
+def _code_directory_identities(details: list[str]) -> frozenset[str]:
+    identities = {
+        line.removeprefix(prefix)
+        for prefix in ("CDHashFull=", "CDHash=")
+        for line in details
+        if line.startswith(prefix)
+    }
+    return frozenset(identities)
+
+
 def _same_selected_executable(executable: Path, selected: Path) -> bool:
     try:
         return executable.resolve(strict=True) == selected.resolve(strict=True) and os.path.samefile(
@@ -371,6 +522,7 @@ def _verify_adhoc_identity(
     details: list[str],
     selected_executable: Path,
     selected_bundle: Path,
+    live_identity: tuple[str, str | None, frozenset[str]],
 ) -> bool:
     """Verify the selected ad-hoc bundle, including unsigned launchers."""
 
@@ -381,14 +533,19 @@ def _verify_adhoc_identity(
         return False
     if f"Identifier={TAURI_BUNDLE_IDENTIFIER}" not in selected_details:
         return False
-    selected_identity = _code_directory_identity(selected_details)
-    if not selected_identity:
+    selected_identities = _code_directory_identities(selected_details)
+    if not selected_identities:
         return False
     if "Signature=adhoc" not in details:
         return False
     if f"Identifier={TAURI_BUNDLE_IDENTIFIER}" not in details:
         return False
-    if _code_directory_identity(details) != selected_identity:
+    if not _code_directory_identities(details) & selected_identities:
+        return False
+    live_identifier, live_team, live_identities = live_identity
+    if live_identifier != TAURI_BUNDLE_IDENTIFIER or live_team is not None:
+        return False
+    if not live_identities & selected_identities:
         return False
     # Tauri's ad-hoc bundle can contain an unsigned nested launcher. Verify
     # only the exact signed main executable and ignore unrelated resources.
@@ -401,6 +558,7 @@ def _verify_code_identity(
     *,
     selected_executable: Path | None = None,
     selected_bundle: Path | None = None,
+    live_identity: tuple[str, str | None, frozenset[str]] | None = None,
 ) -> bool:
     """Verify a signed identity or the selected ad-hoc source executable."""
 
@@ -412,8 +570,13 @@ def _verify_code_identity(
             team_identifier is None
             and selected_executable is not None
             and selected_bundle is not None
+            and live_identity is not None
             and _verify_adhoc_identity(
-                executable, details, selected_executable, selected_bundle
+                executable,
+                details,
+                selected_executable,
+                selected_bundle,
+                live_identity,
             )
         )
     team = (team_identifier or "").strip()
@@ -424,6 +587,15 @@ def _verify_code_identity(
     if f"TeamIdentifier={team}" not in details:
         return False
     if not any(line.startswith("Authority=") for line in details):
+        return False
+    if live_identity is None:
+        return False
+    live_identifier, live_team, live_identities = live_identity
+    if (
+        live_identifier != TAURI_BUNDLE_IDENTIFIER
+        or live_team != team
+        or not live_identities & _code_directory_identities(details)
+    ):
         return False
     requirement = (
         f'anchor apple generic and identifier "{TAURI_BUNDLE_IDENTIFIER}" '
@@ -437,16 +609,22 @@ def is_trusted_tauri_peer(connection: socket.socket) -> bool:
 
     pid = _peer_pid(connection)
     executable = _peer_executable(pid) if pid is not None else None
+    live_identity = _security_code_identity(pid) if pid is not None else None
     trusted_team = _bundle_team_identifier(TAURI_BUNDLE_PATH)
-    if executable is None:
+    if executable is None or live_identity is None:
         return False
     if trusted_team is not None:
-        return _verify_code_identity(executable, trusted_team)
+        return _verify_code_identity(
+            executable,
+            trusted_team,
+            live_identity=live_identity,
+        )
     selected_executable = _bundle_executable(TAURI_BUNDLE_PATH)
     return selected_executable is not None and _verify_code_identity(
         executable,
         selected_executable=selected_executable,
         selected_bundle=TAURI_BUNDLE_PATH,
+        live_identity=live_identity,
     )
 
 

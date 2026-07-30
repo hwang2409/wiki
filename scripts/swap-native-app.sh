@@ -30,10 +30,34 @@ python3 "$ROOT/scripts/atomic_swap.py" \
   --swap-intent "$swap_intent" \
   "${allow_missing_args[@]}"
 
-python3 "$ROOT/scripts/native_daemon_restart.py" \
+if ! python3 "$ROOT/scripts/native_daemon_restart.py" \
   "$live_bundle" \
   --runtime-dir "$runtime_dir" \
-  --repo-root "$ROOT"
+  --repo-root "$ROOT"; then
+  echo "new daemon failed health or fingerprint verification; restoring old bundle" >&2
+  if ! python3 "$ROOT/scripts/atomic_swap.py" \
+    "$staged_bundle" \
+    "$live_bundle" \
+    --runtime-dir "$runtime_dir" \
+    --success-sentinel "$stage_root/.swap-complete" \
+    --swap-intent "$swap_intent" \
+    --rollback \
+    "${allow_missing_args[@]}"; then
+    echo "cannot restore the old native bundle" >&2
+    exit 1
+  fi
+  if ! python3 "$ROOT/scripts/native_daemon_restart.py" \
+    "$live_bundle" \
+    --runtime-dir "$runtime_dir" \
+    --repo-root "$ROOT"; then
+    echo "old daemon did not become healthy after bundle rollback; unloading it" >&2
+    WIKI_APP_PATH="$live_bundle" WIKI_AGENT_RUNTIME_DIR="$runtime_dir" \
+      python3 "$ROOT/wiki" daemon uninstall --json || true
+    exit 1
+  fi
+  echo "restored old bundle and verified old daemon health" >&2
+  exit 1
+fi
 
 rm -rf "$stage_root"
 

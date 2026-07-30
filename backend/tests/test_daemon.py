@@ -643,6 +643,20 @@ class DaemonArtifactTests(unittest.TestCase):
 
 
 class DaemonHandshakeTests(unittest.TestCase):
+    def test_security_framework_reads_live_pid_identity(self) -> None:
+        if sys.platform != "darwin" or not Path("/usr/bin/osascript").is_file():
+            self.skipTest("requires macOS Security.framework")
+        process = subprocess.Popen(["/usr/bin/osascript", "-e", "delay 2"])
+        try:
+            identity = native_server._security_code_identity(process.pid)
+        finally:
+            process.terminate()
+            process.wait(timeout=2)
+        self.assertIsNotNone(identity)
+        self.assertEqual(identity[0], "com.apple.osascript")
+        self.assertIsNone(identity[1])
+        self.assertTrue(identity[2])
+
     def test_forged_adhoc_peer_with_same_identifier_is_rejected(self) -> None:
         details = "\n".join(
             [
@@ -655,6 +669,10 @@ class DaemonHandshakeTests(unittest.TestCase):
             native_server, "_peer_pid", return_value=123
         ), patch.object(
             native_server, "_peer_executable", return_value=Path("/tmp/forged-wiki")
+        ), patch.object(
+            native_server,
+            "_security_code_identity",
+            return_value=("com.hwang2409.wiki", None, frozenset({"forged"})),
         ), patch.object(
             native_server.subprocess,
             "run",
@@ -700,14 +718,36 @@ class DaemonHandshakeTests(unittest.TestCase):
             with patch.object(native_server, "TAURI_BUNDLE_PATH", app), patch.object(
                 native_server, "_peer_pid", return_value=123
             ), patch.object(native_server, "_peer_executable", return_value=selected), patch.object(
-                native_server.subprocess, "run", side_effect=fake_run
+                native_server, "_security_code_identity", return_value=(
+                    native_server.TAURI_BUNDLE_IDENTIFIER,
+                    None,
+                    frozenset({"0123456789abcdef"}),
+                )
+            ), patch.object(native_server.subprocess, "run", side_effect=fake_run
             ), socket.socket() as peer:
                 self.assertTrue(native_server.is_trusted_tauri_peer(peer))
 
             with patch.object(native_server, "TAURI_BUNDLE_PATH", app), patch.object(
                 native_server, "_peer_pid", return_value=123
             ), patch.object(native_server, "_peer_executable", return_value=forged), patch.object(
-                native_server.subprocess, "run", side_effect=fake_run
+                native_server, "_security_code_identity", return_value=(
+                    native_server.TAURI_BUNDLE_IDENTIFIER,
+                    None,
+                    frozenset({"0123456789abcdef"}),
+                )
+            ), patch.object(native_server.subprocess, "run", side_effect=fake_run
+            ), socket.socket() as peer:
+                self.assertFalse(native_server.is_trusted_tauri_peer(peer))
+
+            with patch.object(native_server, "TAURI_BUNDLE_PATH", app), patch.object(
+                native_server, "_peer_pid", return_value=123
+            ), patch.object(native_server, "_peer_executable", return_value=selected), patch.object(
+                native_server, "_security_code_identity", return_value=(
+                    native_server.TAURI_BUNDLE_IDENTIFIER,
+                    None,
+                    frozenset({"old-process-identity"}),
+                )
+            ), patch.object(native_server.subprocess, "run", side_effect=fake_run
             ), socket.socket() as peer:
                 self.assertFalse(native_server.is_trusted_tauri_peer(peer))
 
@@ -743,12 +783,32 @@ class DaemonHandshakeTests(unittest.TestCase):
 
             with patch.object(native_server, "TAURI_BUNDLE_PATH", app), patch.object(
                 native_server, "_peer_pid", return_value=123
-            ), patch.object(native_server, "_peer_executable", return_value=main), socket.socket() as peer:
+            ), patch.object(native_server, "_peer_executable", return_value=main), patch.object(
+                native_server,
+                "_security_code_identity",
+                return_value=(
+                    native_server.TAURI_BUNDLE_IDENTIFIER,
+                    None,
+                    native_server._code_directory_identities(
+                        native_server._codesign_details(main) or []
+                    ),
+                ),
+            ), socket.socket() as peer:
                 self.assertTrue(native_server.is_trusted_tauri_peer(peer))
 
             with patch.object(native_server, "TAURI_BUNDLE_PATH", app), patch.object(
                 native_server, "_peer_pid", return_value=123
-            ), patch.object(native_server, "_peer_executable", return_value=forged), socket.socket() as peer:
+            ), patch.object(native_server, "_peer_executable", return_value=forged), patch.object(
+                native_server,
+                "_security_code_identity",
+                return_value=(
+                    native_server.TAURI_BUNDLE_IDENTIFIER,
+                    None,
+                    native_server._code_directory_identities(
+                        native_server._codesign_details(main) or []
+                    ),
+                ),
+            ), socket.socket() as peer:
                 self.assertFalse(native_server.is_trusted_tauri_peer(peer))
 
     def test_developer_signature_requires_team_and_designated_requirement(self) -> None:
@@ -758,6 +818,7 @@ class DaemonHandshakeTests(unittest.TestCase):
                 "Signature=CMS",
                 "TeamIdentifier=ABCDE12345",
                 "Authority=Apple Development: Wiki",
+                "CDHash=0123456789abcdef",
             ]
         )
         calls: list[list[str]] = []
@@ -770,6 +831,14 @@ class DaemonHandshakeTests(unittest.TestCase):
             native_server, "_peer_pid", return_value=123
         ), patch.object(
             native_server, "_peer_executable", return_value=Path("/tmp/signed-wiki")
+        ), patch.object(
+            native_server,
+            "_security_code_identity",
+            return_value=(
+                native_server.TAURI_BUNDLE_IDENTIFIER,
+                "ABCDE12345",
+                frozenset({"0123456789abcdef"}),
+            ),
         ), patch.object(native_server.subprocess, "run", side_effect=fake_run), socket.socket() as peer:
             self.assertTrue(native_server.is_trusted_tauri_peer(peer))
 
