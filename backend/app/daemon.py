@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import ctypes
+import fcntl
 import json
 import os
+import platform
 import plistlib
+import re
 import stat
 import subprocess
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.error import URLError
@@ -38,6 +43,7 @@ DEFAULT_WIKI_APP_PATH = Path(
 )
 HEALTH_TIMEOUT_SECONDS = 15.0
 HEALTH_POLL_SECONDS = 0.2
+DAEMON_TRANSACTION_LOCK_NAME = "daemon.transaction.lock"
 
 
 class DaemonError(RuntimeError):
@@ -93,6 +99,33 @@ class DaemonConfig:
             ]
         )
         return command
+
+
+@dataclass(frozen=True)
+class PriorDaemon:
+    config: DaemonConfig
+    fingerprint: str
+
+
+@contextmanager
+def hold_daemon_transaction_lock(runtime_dir: Path | str):
+    """Serialize plist and LaunchAgent mutations for one runtime."""
+
+    runtime = Path(runtime_dir).expanduser()
+    runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
+    runtime.chmod(0o700)
+    path = runtime / DAEMON_TRANSACTION_LOCK_NAME
+    handle = path.open("a+b")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError) as exc:
+        handle.close()
+        raise DaemonError(f"daemon transaction is already active: {path}") from exc
+    try:
+        yield
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
 
 
 def _repo_dir() -> Path:
@@ -243,6 +276,63 @@ def _describe_failure(result: subprocess.CompletedProcess[str]) -> str:
     return detail
 
 
+def _service_pid(config: DaemonConfig) -> int | None:
+    result = _launchctl(config, "print", config.target)
+    if result.returncode != 0:
+        if _service_absent(config, result):
+            return None
+        raise DaemonError(
+            f"cannot inspect {config.target}: {_describe_failure(result)}"
+        )
+    match = re.search(r"(?m)^\s*pid\s*=\s*(\d+)\s*$", _describe_failure(result))
+    return int(match.group(1)) if match else None
+
+
+def _process_executable(pid: int) -> Path | None:
+    try:
+        if platform.system() == "Darwin":
+            libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+            libproc.proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+            libproc.proc_pidpath.restype = ctypes.c_int
+            buffer = ctypes.create_string_buffer(4096)
+            size = libproc.proc_pidpath(pid, buffer, ctypes.sizeof(buffer))
+            if size <= 0:
+                return None
+            return Path(buffer.value.decode("utf-8"))
+        return Path(f"/proc/{pid}/exe").resolve(strict=True)
+    except (OSError, UnicodeDecodeError, AttributeError):
+        return None
+
+
+def _same_executable(first: Path, second: Path) -> bool:
+    try:
+        return first.resolve(strict=True) == second.resolve(strict=True) and os.path.samefile(
+            first, second
+        )
+    except OSError:
+        return False
+
+
+def _health_process_matches(
+    config: DaemonConfig,
+    payload: dict[str, object],
+    expected_fingerprint: str | None = None,
+) -> bool:
+    raw_pid = payload.get("process_id")
+    if isinstance(raw_pid, bool) or not isinstance(raw_pid, int) or raw_pid <= 0:
+        return False
+    service_pid = _service_pid(config)
+    if service_pid != raw_pid:
+        return False
+    executable = _process_executable(raw_pid)
+    if executable is None or not _same_executable(executable, config.executable):
+        return False
+    from .agent_runtime.version import frozen_runtime_fingerprint
+
+    expected = expected_fingerprint or _expected_backend_fingerprint(config)
+    return frozen_runtime_fingerprint(executable) == expected
+
+
 def _service_absent_message(config: DaemonConfig) -> str:
     return (
         "Bad request.\n"
@@ -291,16 +381,47 @@ def _unload_and_verify_absent(config: DaemonConfig) -> None:
         raise DaemonError(f"{config.target} is still loaded after bootout")
 
 
-def _restore_prior_service(config: DaemonConfig, was_loaded: bool) -> None:
-    if not was_loaded or _service_loaded(config):
-        return
-    restored = _launchctl(config, "bootstrap", config.domain, str(config.plist_path))
-    if restored.returncode != 0:
-        raise DaemonError(
-            f"cannot restore {config.target}: {_describe_failure(restored)}"
+def _prior_config(
+    config: DaemonConfig,
+    backup: tuple[bytes, int] | None,
+) -> PriorDaemon | None:
+    if backup is None:
+        return None
+    try:
+        document = plistlib.loads(backup[0])
+        arguments = document.get("ProgramArguments")
+        executable = arguments[0] if isinstance(arguments, list) and arguments else None
+        if not isinstance(executable, str) or not executable:
+            return None
+        prior_config = DaemonConfig(**{**config.__dict__, "executable": Path(executable)})
+        if not prior_config.executable.is_file():
+            return None
+        return PriorDaemon(
+            config=prior_config,
+            fingerprint=_expected_backend_fingerprint(prior_config),
         )
+    except (OSError, TypeError, ValueError, plistlib.InvalidFileException):
+        return None
+
+
+def _restore_prior_service(
+    config: DaemonConfig,
+    was_loaded: bool,
+    prior: PriorDaemon | None,
+) -> None:
+    if not was_loaded:
+        return
+    if prior is None:
+        raise DaemonError("cannot verify the prior daemon executable during rollback")
     if not _service_loaded(config):
-        raise DaemonError(f"{config.target} was not loaded after rollback")
+        restored = _launchctl(config, "bootstrap", config.domain, str(config.plist_path))
+        if restored.returncode != 0:
+            raise DaemonError(
+                f"cannot restore {config.target}: {_describe_failure(restored)}"
+            )
+        if not _service_loaded(config):
+            raise DaemonError(f"{config.target} was not loaded after rollback")
+    _wait_for_healthy(prior.config, expected_fingerprint=prior.fingerprint)
 
 
 def _rollback_install(
@@ -308,6 +429,7 @@ def _rollback_install(
     backup: tuple[bytes, int] | None,
     was_loaded: bool,
     bootstrap_attempted: bool,
+    prior: PriorDaemon | None,
 ) -> list[str]:
     errors: list[str] = []
     if bootstrap_attempted:
@@ -321,15 +443,15 @@ def _rollback_install(
         plist_restored = True
     except Exception as error:
         errors.append(f"plist rollback failed: {error}")
-    if plist_restored and backup is not None and was_loaded:
+    if plist_restored and was_loaded:
         try:
-            _restore_prior_service(config, was_loaded)
+            _restore_prior_service(config, was_loaded, prior)
         except DaemonError as error:
             errors.append(f"service rollback failed: {error}")
     return errors
 
 
-def install(config: DaemonConfig) -> dict[str, object]:
+def _install_unlocked(config: DaemonConfig) -> dict[str, object]:
     """Install and load the LaunchAgent without touching run state."""
 
     if not config.executable.is_file() or not os.access(config.executable, os.X_OK):
@@ -338,6 +460,7 @@ def install(config: DaemonConfig) -> dict[str, object]:
         )
     backup = _capture_plist(config.plist_path)
     was_loaded = _service_loaded(config)
+    prior = _prior_config(config, backup)
     config.log_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     config.log_path.parent.chmod(0o700)
     bootstrap_attempted = False
@@ -354,7 +477,7 @@ def install(config: DaemonConfig) -> dict[str, object]:
         _wait_for_healthy(config)
     except Exception as error:
         rollback_errors = _rollback_install(
-            config, backup, was_loaded, bootstrap_attempted
+            config, backup, was_loaded, bootstrap_attempted, prior
         )
         if rollback_errors:
             detail = "; ".join([f"install failed: {error}", *rollback_errors])
@@ -370,11 +493,39 @@ def install(config: DaemonConfig) -> dict[str, object]:
     }
 
 
-def uninstall(config: DaemonConfig) -> dict[str, object]:
+def install(
+    config: DaemonConfig,
+    *,
+    transaction_lock_held: bool = False,
+) -> dict[str, object]:
+    if transaction_lock_held:
+        return _install_unlocked(config)
+    with hold_daemon_transaction_lock(config.runtime_dir):
+        return _install_unlocked(config)
+
+
+def _uninstall_unlocked(config: DaemonConfig) -> dict[str, object]:
     """Unload the LaunchAgent and remove only its generated plist."""
 
-    _unload_and_verify_absent(config)
-    config.plist_path.unlink(missing_ok=True)
+    backup_path = config.plist_path.with_name(
+        f".{config.plist_path.name}.uninstall.{os.getpid()}.bak"
+    )
+    if backup_path.exists():
+        raise DaemonError(f"stale uninstall backup exists: {backup_path}")
+    if config.plist_path.exists():
+        os.replace(config.plist_path, backup_path)
+    try:
+        _unload_and_verify_absent(config)
+    except Exception:
+        if backup_path.exists():
+            os.replace(backup_path, config.plist_path)
+        raise
+    try:
+        backup_path.unlink(missing_ok=True)
+    except OSError as exc:
+        raise DaemonError(
+            f"service unloaded but uninstall backup cleanup failed: {exc}"
+        ) from exc
     return {
         "label": config.label,
         "target": config.target,
@@ -383,7 +534,22 @@ def uninstall(config: DaemonConfig) -> dict[str, object]:
     }
 
 
-def _health(config: DaemonConfig) -> dict[str, object]:
+def uninstall(
+    config: DaemonConfig,
+    *,
+    transaction_lock_held: bool = False,
+) -> dict[str, object]:
+    if transaction_lock_held:
+        return _uninstall_unlocked(config)
+    with hold_daemon_transaction_lock(config.runtime_dir):
+        return _uninstall_unlocked(config)
+
+
+def _health(
+    config: DaemonConfig,
+    *,
+    expected_fingerprint: str | None = None,
+) -> dict[str, object]:
     request = Request(f"{config.backend_url}/health", method="GET")
     try:
         with urlopen(request, timeout=0.75) as response:  # noqa: S310 - loopback URL
@@ -394,9 +560,12 @@ def _health(config: DaemonConfig) -> dict[str, object]:
         return {"healthy": False}
     if not isinstance(payload, dict):
         return {"healthy": False}
+    identity_matches = _health_process_matches(config, payload, expected_fingerprint)
     return {
         "healthy": payload.get("status") == "ok"
-        and payload.get("daemon_managed") is True,
+        and payload.get("daemon_managed") is True
+        and identity_matches,
+        "identity_matches": identity_matches,
         "payload": payload,
     }
 
@@ -407,18 +576,28 @@ def _expected_backend_fingerprint(config: DaemonConfig) -> str:
     return frozen_runtime_fingerprint(config.executable)
 
 
-def _wait_for_healthy(config: DaemonConfig) -> dict[str, object]:
+def _wait_for_healthy(
+    config: DaemonConfig,
+    *,
+    expected_fingerprint: str | None = None,
+) -> dict[str, object]:
     deadline = time.monotonic() + HEALTH_TIMEOUT_SECONDS
-    expected = _expected_backend_fingerprint(config)
+    expected = expected_fingerprint or _expected_backend_fingerprint(config)
     last_health: dict[str, object] = {"healthy": False}
     while time.monotonic() < deadline:
-        last_health = _health(config)
+        if expected_fingerprint is None:
+            last_health = _health(config)
+        else:
+            last_health = _health(config, expected_fingerprint=expected_fingerprint)
         payload = last_health.get("payload")
-        if last_health.get("healthy") and isinstance(payload, dict):
+        if (
+            last_health.get("healthy")
+            and last_health.get("identity_matches", True) is True
+            and isinstance(payload, dict)
+        ):
             if payload.get("backend_fingerprint") != expected:
-                raise DaemonError(
-                    "daemon health fingerprint does not match the installed backend"
-                )
+                time.sleep(HEALTH_POLL_SECONDS)
+                continue
             return last_health
         time.sleep(HEALTH_POLL_SECONDS)
     raise DaemonError(

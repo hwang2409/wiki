@@ -6,6 +6,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from unittest import TestCase
 from unittest.mock import patch
@@ -209,6 +210,78 @@ class NativeBuildGuardTests(TestCase):
             self.assertEqual((live / "marker").read_text(encoding="utf-8"), "old")
             self.assertEqual((staged / "marker").read_text(encoding="utf-8"), "new")
             self.assertFalse(sentinel.exists())
+
+    def test_fallback_exchange_preserves_old_bundle_at_staged_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            live = root / "live" / "Wiki.app"
+            staged = root / "stage" / "Wiki.app"
+            live.mkdir(parents=True)
+            staged.mkdir(parents=True)
+            (live / "marker").write_text("old", encoding="utf-8")
+            (staged / "marker").write_text("new", encoding="utf-8")
+            sentinel = root / "stage" / ".swap-complete"
+            intent = root / "stage" / ".swap-intent"
+
+            with patch.object(atomic_swap_module, "_rename_swap", return_value=False):
+                atomic_replace(staged, live, sentinel, intent)
+                self.assertEqual((live / "marker").read_text(encoding="utf-8"), "new")
+                self.assertEqual((staged / "marker").read_text(encoding="utf-8"), "old")
+                rollback_replace(staged, live, sentinel, intent)
+            self.assertEqual((live / "marker").read_text(encoding="utf-8"), "old")
+
+    def test_transaction_stops_live_supervisor_before_taking_its_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage_root = root / "stage"
+            live = root / "src-tauri/target/release/bundle/macos/Wiki.app"
+            staged = stage_root / "target/release/bundle/macos/Wiki.app"
+            runtime = root / "runtime"
+            stage_root.mkdir(parents=True)
+            live.mkdir(parents=True)
+            staged.mkdir(parents=True)
+            runtime.mkdir()
+            (runtime / "app.lock").touch()
+            (live / "marker").write_text("old", encoding="utf-8")
+            (staged / "marker").write_text("new", encoding="utf-8")
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "backend.app.agent_runtime.daemon",
+                    "--runtime-dir",
+                    str(runtime),
+                    "--socket",
+                    str(runtime / "supervisor.sock"),
+                    "--registry",
+                    str(runtime / "registry.json"),
+                ],
+                cwd=Path(__file__).parents[2],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                deadline = time.monotonic() + 5
+                while not (runtime / "supervisor.pid").exists():
+                    if process.poll() is not None:
+                        self.fail(process.stderr.read() if process.stderr else "supervisor exited")
+                    if time.monotonic() >= deadline:
+                        self.fail("supervisor did not publish its PID")
+                    time.sleep(0.05)
+
+                def restart(_live: Path, _runtime: Path, _repo: Path) -> bool:
+                    self.assertFalse((runtime / "supervisor.pid").exists())
+                    return True
+
+                swap_native_app(stage_root, root, runtime, restart=restart)
+                self.assertEqual((live / "marker").read_text(encoding="utf-8"), "new")
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=5)
+                if process.stderr:
+                    process.stderr.close()
 
     def test_swap_keeps_competing_process_out_during_restart_and_rollback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

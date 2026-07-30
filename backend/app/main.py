@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import errno
 import fcntl
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -916,12 +918,20 @@ def normalize_content(title: str, content: str) -> str:
 
 
 @app.get("/health")
-def health() -> dict[str, object]:
+def health(request: Request = None) -> dict[str, object]:  # type: ignore[assignment]
+    request_nonce = request.headers.get("X-Wiki-Daemon-Nonce") if request else None
     payload: dict[str, object] = {
         "status": "ok",
         "daemon_managed": os.environ.get("WIKI_BACKEND_DAEMON") == "launchd",
         "backend_fingerprint": RUNTIME_FINGERPRINT,
+        "process_id": os.getpid(),
     }
+    if request_nonce is not None:
+        payload["daemon_proof"] = hmac.new(
+            wiki_app_secret().encode("utf-8"),
+            request_nonce.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
     return payload
 
 

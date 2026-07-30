@@ -6,7 +6,6 @@ import ctypes
 import json
 import os
 import signal
-import shutil
 import sys
 from contextlib import contextmanager
 from pathlib import Path
@@ -123,7 +122,7 @@ def _exchange_paths(first: Path, second: Path) -> None:
     except Exception:
         os.rename(backup, second)
         raise
-    shutil.rmtree(backup)
+    os.rename(backup, first)
 
 
 def atomic_replace(

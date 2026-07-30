@@ -109,6 +109,83 @@ class LaunchAgentConfigTests(unittest.TestCase):
                 frozen_runtime_fingerprint(executable),
             )
 
+    def test_health_rejects_unrelated_server_with_matching_fingerprint(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / "Wiki.app/Contents/Resources/wiki-backend-sidecar/wiki-backend"
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"installed backend")
+            executable.chmod(0o755)
+            config = daemon.DaemonConfig(
+                **{**self._config(root).__dict__, "executable": executable}
+            )
+
+            class HealthHandler(http.server.BaseHTTPRequestHandler):
+                def do_GET(self) -> None:
+                    body = json.dumps(
+                        {
+                            "status": "ok",
+                            "daemon_managed": True,
+                            "backend_fingerprint": frozen_runtime_fingerprint(executable),
+                            "process_id": os.getpid(),
+                        }
+                    ).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                def log_message(self, _format: str, *_args: object) -> None:
+                    pass
+
+            server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), HealthHandler)
+            config = daemon.DaemonConfig(
+                **{**config.__dict__, "port": server.server_port}
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with patch.object(daemon, "_service_pid", return_value=os.getpid()):
+                    health = daemon._health(config)
+            finally:
+                server.shutdown()
+                thread.join(timeout=2)
+                server.server_close()
+            self.assertFalse(health["healthy"])
+            self.assertFalse(health["identity_matches"])
+
+    def test_wait_for_healthy_retries_a_retiring_fingerprint(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / "wiki-backend"
+            executable.write_bytes(b"new backend")
+            executable.chmod(0o755)
+            config = daemon.DaemonConfig(
+                **{**self._config(root).__dict__, "executable": executable}
+            )
+            expected = daemon._expected_backend_fingerprint(config)
+            health = iter(
+                [
+                    {
+                        "healthy": True,
+                        "identity_matches": True,
+                        "payload": {
+                            "backend_fingerprint": "old backend",
+                        },
+                    },
+                    {
+                        "healthy": True,
+                        "identity_matches": True,
+                        "payload": {"backend_fingerprint": expected},
+                    },
+                ]
+            )
+            with patch.object(daemon, "_health", side_effect=lambda _config: next(health)), patch.object(
+                daemon, "HEALTH_POLL_SECONDS", 0.0
+            ):
+                result = daemon._wait_for_healthy(config)
+            self.assertEqual(result["payload"]["backend_fingerprint"], expected)
+
     def test_plist_exports_bundle_path_for_source_build_artifact(self) -> None:
         config = self._config(Path("/tmp/LaunchAgents"))
         executable = (
@@ -135,6 +212,7 @@ class LaunchAgentConfigTests(unittest.TestCase):
                 }
             )
             config.runtime_dir.mkdir(parents=True)
+            (config.runtime_dir / daemon.DAEMON_TRANSACTION_LOCK_NAME).touch()
             run_dir = config.runtime_dir / "runs" / "run-live-1"
             run_dir.mkdir(parents=True)
             (run_dir / "run.json").write_text(
@@ -520,10 +598,16 @@ class DaemonArtifactTests(unittest.TestCase):
                 }
             )
             config.plist_path.parent.mkdir(parents=True)
-            prior_plist = b"prior working plist\n"
+            prior_executable = root / "prior" / "wiki-backend"
+            prior_executable.parent.mkdir(parents=True)
+            prior_executable.write_bytes(b"prior backend")
+            prior_executable.chmod(0o755)
+            prior_config = daemon.DaemonConfig(
+                **{**config.__dict__, "executable": prior_executable}
+            )
+            prior_plist = daemon.render_plist(prior_config).encode("utf-8")
             config.plist_path.write_bytes(prior_plist)
             loaded = True
-
             def fake_launchctl(
                 _config: daemon.DaemonConfig, *arguments: str
             ) -> subprocess.CompletedProcess[str]:
@@ -543,9 +627,28 @@ class DaemonArtifactTests(unittest.TestCase):
                     loaded = True
                 return subprocess.CompletedProcess(["launchctl", *arguments], 0, "", "")
 
+            def fake_wait(
+                current: daemon.DaemonConfig,
+                **_kwargs: object,
+            ) -> dict[str, object]:
+                if current.executable == config.executable:
+                    raise daemon.DaemonError("did not become healthy")
+                self.assertEqual(current.executable, prior_executable)
+                return {
+                    "healthy": True,
+                    "identity_matches": True,
+                    "payload": {
+                        "status": "ok",
+                        "daemon_managed": True,
+                        "backend_fingerprint": daemon._expected_backend_fingerprint(
+                            prior_config
+                        ),
+                    },
+                }
+
             with patch.object(daemon, "_launchctl", side_effect=fake_launchctl), patch.object(
-                daemon, "_health", return_value={"healthy": False}
-            ), patch.object(daemon, "HEALTH_TIMEOUT_SECONDS", 0.0):
+                daemon, "_wait_for_healthy", side_effect=fake_wait
+            ):
                 with self.assertRaisesRegex(daemon.DaemonError, "did not become healthy"):
                     daemon.install(config)
 
@@ -991,6 +1094,7 @@ class DaemonCliTests(unittest.TestCase):
                 printf '%s\\n' "$*" >> "{log_path}"
                 if [ "$1" = "print" ]; then
                     if [ -f "{root / 'loaded'}" ]; then
+                        printf 'pid = %s\\n' "$(cat \"{root / 'server.pid'}\")"
                         exit 0
                     fi
                     printf 'Bad request.\\nCould not find service "{daemon.DEFAULT_LABEL}" in domain for user gui: %s\\n' "$(id -u)" >&2
@@ -1016,17 +1120,7 @@ class DaemonCliTests(unittest.TestCase):
         wiki_cli = repo_root / "wiki"
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            executable = (
-                root
-                / "Wiki.app"
-                / "Contents"
-                / "Resources"
-                / "wiki-backend-sidecar"
-                / "wiki-backend"
-            )
-            executable.parent.mkdir(parents=True)
-            executable.write_bytes(b"stable bundled backend")
-            executable.chmod(0o755)
+            executable = Path(sys.executable).resolve()
             fingerprint = frozen_runtime_fingerprint(executable)
 
             class HealthHandler(http.server.BaseHTTPRequestHandler):
@@ -1040,6 +1134,7 @@ class DaemonCliTests(unittest.TestCase):
                             "status": "ok",
                             "daemon_managed": True,
                             "backend_fingerprint": fingerprint,
+                            "process_id": os.getpid(),
                         }
                     ).encode("utf-8")
                     self.send_response(200)
@@ -1058,6 +1153,7 @@ class DaemonCliTests(unittest.TestCase):
                 target=health_server.serve_forever, daemon=True
             )
             health_thread.start()
+            (root / "server.pid").write_text(f"{os.getpid()}\n", encoding="utf-8")
             bin_dir, launchctl_log = self._write_launchctl_stub(root)
             env = {
                 **os.environ,
@@ -1068,6 +1164,7 @@ class DaemonCliTests(unittest.TestCase):
                 "WIKI_REPO_DIR": str(root / "repo"),
                 "WIKI_VAULT_DIR": str(root / "vault"),
                 "WIKI_APP_PATH": str(root / "Wiki.app"),
+                "WIKI_BACKEND_EXECUTABLE": str(executable),
                 "WIKI_BACKEND_PORT": str(health_server.server_port),
             }
             commands = [
@@ -1095,7 +1192,15 @@ class DaemonCliTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, msg=result.stderr)
             self.assertEqual(
                 [line.split(" ", 1)[0] for line in launchctl_log.read_text().splitlines()],
-                ["print", "bootstrap", "print", "bootout", "print"],
+                [
+                    "print",
+                    "bootstrap",
+                    "print",
+                    "print",
+                    "print",
+                    "bootout",
+                    "print",
+                ],
             )
             self.assertFalse((root / "LaunchAgents" / f"{daemon.DEFAULT_LABEL}.plist").exists())
 

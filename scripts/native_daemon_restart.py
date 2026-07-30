@@ -9,6 +9,9 @@ import sys
 from pathlib import Path
 from typing import Callable
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from backend.app import daemon as backend_daemon
 
 DEFAULT_LABEL = "com.hwang2409.wiki.backend"
 
@@ -70,6 +73,26 @@ def restart_daemon_if_installed(
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "daemon restart failed").strip()
         raise RuntimeError(detail)
+    return True
+
+
+def restart_daemon_in_process(
+    live_bundle: Path,
+    runtime_dir: Path,
+    repo_root: Path,
+) -> bool:
+    """Restart the daemon while the caller owns the daemon transaction lock."""
+
+    if not _daemon_is_installed(runtime_dir):
+        return False
+    config = backend_daemon.config_from_env(
+        overrides={
+            "WIKI_APP_PATH": str(live_bundle),
+            "WIKI_AGENT_RUNTIME_DIR": str(runtime_dir),
+            "WIKI_REPO_DIR": str(repo_root),
+        }
+    )
+    backend_daemon.install(config, transaction_lock_held=True)
     return True
 
 

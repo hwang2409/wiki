@@ -1,5 +1,7 @@
 use std::{
     env,
+    fs::File,
+    io::Read,
     path::{Path, PathBuf},
     process::Command,
     thread,
@@ -33,7 +35,19 @@ pub(crate) fn probe(
         .map_err(|error| format!("cannot create daemon health client: {error}"))?;
     let ready = retry_until_ready(
         || {
-            let response = client.get(&health_url).send().ok()?;
+            let expected_executable = expected_backend_executable()?;
+            let authenticated = daemon_handshake::read_authenticated_secret(
+                runtime_dir,
+                &expected_executable,
+                expected_fingerprint,
+            )
+            .ok()?;
+            let nonce = health_nonce().ok()?;
+            let response = client
+                .get(&health_url)
+                .header("X-Wiki-Daemon-Nonce", &nonce)
+                .send()
+                .ok()?;
             if !response.status().is_success() {
                 return None;
             }
@@ -52,7 +66,13 @@ pub(crate) fn probe(
             {
                 return None;
             }
-            daemon_handshake::read_secret(runtime_dir).ok()
+            if !health_matches_authenticated_peer(&payload, authenticated.pid, expected_fingerprint)
+                || !health_proof_matches(&payload, &authenticated.secret, &nonce)
+                || daemon_launchd_pid() != Some(authenticated.pid)
+            {
+                return None;
+            }
+            Some(authenticated.secret)
         },
         DAEMON_PROBE_WAIT_TIMEOUT,
         DAEMON_PROBE_POLL_INTERVAL,
@@ -66,10 +86,80 @@ pub(crate) fn probe(
         })
 }
 
-pub(crate) fn refresh_secret(runtime_dir: &Path, daemon_managed: bool) -> Option<String> {
-    daemon_managed
-        .then(|| daemon_handshake::read_secret(runtime_dir).ok())
-        .flatten()
+pub(crate) fn refresh_secret(
+    runtime_dir: &Path,
+    daemon_managed: bool,
+    expected_fingerprint: &str,
+) -> Option<String> {
+    if !daemon_managed {
+        return None;
+    }
+    let expected_executable = expected_backend_executable()?;
+    let authenticated = daemon_handshake::read_authenticated_secret(
+        runtime_dir,
+        &expected_executable,
+        expected_fingerprint,
+    )
+    .ok()?;
+    (daemon_launchd_pid() == Some(authenticated.pid)).then_some(authenticated.secret)
+}
+
+fn expected_backend_executable() -> Option<PathBuf> {
+    if let Some(path) = env::var_os("WIKI_BACKEND_EXECUTABLE") {
+        return Some(PathBuf::from(path));
+    }
+    if let Some(app_path) = env::var_os("WIKI_APP_PATH") {
+        return Some(
+            PathBuf::from(app_path).join("Contents/Resources/wiki-backend-sidecar/wiki-backend"),
+        );
+    }
+    let current = env::current_exe().ok()?;
+    current
+        .ancestors()
+        .find(|path| path.file_name().is_some_and(|name| name == "Wiki.app"))
+        .map(|app| app.join("Contents/Resources/wiki-backend-sidecar/wiki-backend"))
+        .filter(|path| path.is_file())
+}
+
+fn health_matches_authenticated_peer(
+    payload: &serde_json::Value,
+    peer_pid: u32,
+    expected_fingerprint: &str,
+) -> bool {
+    payload.get("process_id").and_then(|value| value.as_u64()) == Some(peer_pid as u64)
+        && payload
+            .get("backend_fingerprint")
+            .and_then(|value| value.as_str())
+            == Some(expected_fingerprint)
+}
+
+fn health_proof_matches(payload: &serde_json::Value, secret: &str, nonce: &str) -> bool {
+    let Some(proof) = payload.get("daemon_proof").and_then(|value| value.as_str()) else {
+        return false;
+    };
+    constant_time_equal(
+        proof.as_bytes(),
+        daemon_handshake::hmac_sha256_hex(secret, nonce).as_bytes(),
+    )
+}
+
+fn constant_time_equal(first: &[u8], second: &[u8]) -> bool {
+    if first.len() != second.len() {
+        return false;
+    }
+    first
+        .iter()
+        .zip(second)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
+}
+
+fn health_nonce() -> std::io::Result<String> {
+    let mut bytes = [0_u8; 32];
+    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 fn daemon_may_be_starting(runtime_dir: &Path) -> bool {
@@ -93,6 +183,20 @@ fn daemon_launchd_job_loaded() -> Option<bool> {
         return Some(false);
     }
     None
+}
+
+fn daemon_launchd_pid() -> Option<u32> {
+    let target = format!("gui/{}/{}", unsafe { libc::getuid() }, DEFAULT_DAEMON_LABEL);
+    let output = Command::new("launchctl")
+        .args(["print", target.as_str()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("pid = ")?.parse().ok())
 }
 
 fn daemon_socket_is_live(runtime_dir: &Path) -> bool {
@@ -171,7 +275,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{daemon_probe_should_wait, retry_until_ready};
+    use super::{
+        daemon_probe_should_wait, health_matches_authenticated_peer, health_proof_matches,
+        retry_until_ready,
+    };
 
     #[test]
     fn retries_until_ready() {
@@ -195,5 +302,29 @@ mod tests {
         assert!(daemon_probe_should_wait(Some(true), false, false));
         assert!(daemon_probe_should_wait(Some(false), true, false));
         assert!(daemon_probe_should_wait(Some(false), false, true));
+    }
+
+    #[test]
+    fn forged_health_fails_before_the_real_peer_passes() {
+        let forged = serde_json::json!({
+            "process_id": 100,
+            "backend_fingerprint": "expected",
+        });
+        let real = serde_json::json!({
+            "process_id": 200,
+            "backend_fingerprint": "expected",
+        });
+        assert!(!health_matches_authenticated_peer(&forged, 200, "expected"));
+        assert!(health_matches_authenticated_peer(&real, 200, "expected"));
+        assert!(!health_proof_matches(&forged, "daemon-secret", "nonce"));
+        let mut authenticated = real;
+        authenticated["daemon_proof"] = serde_json::Value::String(
+            super::daemon_handshake::hmac_sha256_hex("daemon-secret", "nonce"),
+        );
+        assert!(health_proof_matches(
+            &authenticated,
+            "daemon-secret",
+            "nonce"
+        ));
     }
 }

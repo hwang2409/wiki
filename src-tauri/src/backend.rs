@@ -430,7 +430,11 @@ fn set_app_secret_state(state: &NativeAppState, secret: String) {
 
 fn refresh_daemon_secret(state: &NativeAppState) {
     let daemon_managed = state.inner.lock().unwrap().daemon_managed;
-    if let Some(secret) = persistent_daemon::refresh_secret(&runtime_dir(), daemon_managed) {
+    if let Some(secret) = persistent_daemon::refresh_secret(
+        &runtime_dir(),
+        daemon_managed,
+        EXPECTED_BACKEND_FINGERPRINT,
+    ) {
         set_app_secret_state(state, secret);
     }
 }
