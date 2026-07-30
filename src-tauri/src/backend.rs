@@ -4,7 +4,7 @@ use std::{
     error::Error,
     ffi::OsStr,
     fs::{self, File, OpenOptions},
-    io::{self, Write},
+    io::{self, Read, Write},
     net::TcpListener,
     os::fd::AsRawFd,
     os::unix::fs::PermissionsExt,
@@ -30,12 +30,12 @@ const FINDER_SAFE_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/
 const HEALTH_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(350);
-const DAEMON_PROBE_WAIT: Duration = Duration::from_secs(1);
 const SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
 const MAIN_WINDOW_LABEL: &str = "main";
 const WINDOW_TITLE: &str = "Wiki";
 const APP_LOCK_NAME: &str = "app.lock";
 const DEFAULT_DAEMON_URL: &str = "http://127.0.0.1:8213/";
+const EXPECTED_BACKEND_FINGERPRINT: &str = env!("WIKI_EXPECTED_BACKEND_FINGERPRINT");
 // Guard: WKWebView can defer this eval past the post-health navigate() when
 // the backend boots fast (onedir sidecar ~0.4s) — unguarded, the deferred
 // write CLOBBERS the already-loaded app with the static loading card.
@@ -137,12 +137,9 @@ pub struct NativeAppState {
 struct LifecycleState {
     app_origin: Option<String>,
     sidecar: Option<SidecarState>,
-    // Wiki.app origin secret captured from the backend sidecar's stdout on
-    // startup (marker line `[[WIKI_APP_SECRET_BOOT]]=<hex>`). Held in Rust
-    // process memory only — the webview reads it via the
-    // `get_wiki_app_secret` invoke command. Worker CLI processes have no
-    // invoke bridge and cannot pull the value, so `/api/composer/*` calls
-    // from workers fail with 403. WIKI-148 round 6, Path B.
+    // Wiki.app origin secret received through the sidecar environment or the
+    // daemon's owner-only runtime file. Held in Rust process memory only.
+    // WIKI-148 round 6, Path B.
     wiki_app_secret: Option<String>,
     // Loopback origins for which a remote-scoped ACL capability granting
     // `allow-get-wiki-app-secret` has already been registered via
@@ -151,8 +148,6 @@ struct LifecycleState {
     // registration for the same origin. WIKI-148 round 7.
     ipc_authorized_origins: HashSet<String>,
 }
-
-const WIKI_APP_SECRET_MARKER: &str = "[[WIKI_APP_SECRET_BOOT]]=";
 
 struct SidecarState {
     child: Option<CommandChild>,
@@ -279,6 +274,7 @@ pub fn handle_run_event(app: &AppHandle, event: RunEvent) {
 
 fn start_sidecar(app: &AppHandle, restart_count: u8) -> Result<String, Box<dyn Error>> {
     let port = pick_loopback_port()?;
+    let app_secret = new_app_secret()?;
     let launch_url = format!("http://127.0.0.1:{port}/");
     let repo_dir = resolve_repo_dir();
     let vault_dir = resolve_vault_dir(&repo_dir);
@@ -303,6 +299,7 @@ fn start_sidecar(app: &AppHandle, restart_count: u8) -> Result<String, Box<dyn E
         .env("PATH", FINDER_SAFE_PATH)
         .env("WIKI_REPO_DIR", &repo_dir)
         .env("WIKI_VAULT_DIR", &vault_dir)
+        .env("WIKI_APP_SECRET", &app_secret)
         .args([
             "--host",
             "127.0.0.1",
@@ -321,6 +318,7 @@ fn start_sidecar(app: &AppHandle, restart_count: u8) -> Result<String, Box<dyn E
     {
         let app_state = app.state::<NativeAppState>();
         let mut state = app_state.inner.lock().unwrap();
+        state.wiki_app_secret = Some(app_secret.clone());
         state.sidecar = Some(SidecarState {
             child: Some(child),
             pid,
@@ -357,12 +355,24 @@ fn start_sidecar(app: &AppHandle, restart_count: u8) -> Result<String, Box<dyn E
     Ok(launch_url)
 }
 
+fn new_app_secret() -> io::Result<String> {
+    let mut bytes = [0_u8; 32];
+    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 fn launch_backend_and_navigate(app: &AppHandle) {
     let launch_result = if let Ok(url) = env::var("WIKI_NATIVE_BACKEND_URL") {
         let launch_url = normalize_launch_url(&url);
         wait_for_health(app, &launch_url, None).map(|_| launch_url)
-    } else if let Some(launch_url) = probe_persistent_daemon() {
-        Ok(launch_url)
+    } else if let Some((launch_url, secret_path)) = probe_persistent_daemon() {
+        match read_daemon_app_secret(&secret_path) {
+            Ok(secret) => {
+                set_app_secret(app, secret);
+                Ok(launch_url)
+            }
+            Err(_) => start_sidecar(app, 0),
+        }
     } else {
         start_sidecar(app, 0)
     };
@@ -384,7 +394,7 @@ fn launch_backend_and_navigate(app: &AppHandle) {
     }
 }
 
-fn probe_persistent_daemon() -> Option<String> {
+fn probe_persistent_daemon() -> Option<(String, PathBuf)> {
     let launch_url = normalize_launch_url(
         &env::var("WIKI_DAEMON_BACKEND_URL").unwrap_or_else(|_| DEFAULT_DAEMON_URL.to_string()),
     );
@@ -393,25 +403,57 @@ fn probe_persistent_daemon() -> Option<String> {
         .timeout(DAEMON_PROBE_TIMEOUT)
         .build()
         .ok()?;
-    let deadline = Instant::now() + DAEMON_PROBE_WAIT;
-    while Instant::now() < deadline {
-        let response = client.get(&health_url).send();
-        if let Ok(response) = response {
-            if response.status().is_success() {
-                if let Ok(payload) = response.json::<serde_json::Value>() {
-                    if payload
-                        .get("daemon_managed")
-                        .and_then(serde_json::Value::as_bool)
-                        == Some(true)
-                    {
-                        return Some(launch_url);
-                    }
-                }
-            }
-        }
-        thread::sleep(HEALTH_POLL_INTERVAL.min(DAEMON_PROBE_TIMEOUT));
+    let response = client.get(&health_url).send().ok()?;
+    if !response.status().is_success() {
+        return None;
     }
-    None
+    let payload = response.json::<serde_json::Value>().ok()?;
+    if payload
+        .get("daemon_managed")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return None;
+    }
+    if payload
+        .get("backend_fingerprint")
+        .and_then(serde_json::Value::as_str)
+        != Some(EXPECTED_BACKEND_FINGERPRINT)
+    {
+        return None;
+    }
+    let secret_path = payload
+        .get("app_secret_path")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)?;
+    if !secret_path.is_absolute() {
+        return None;
+    }
+    Some((launch_url, secret_path))
+}
+
+fn read_daemon_app_secret(path: &Path) -> io::Result<String> {
+    let permissions = fs::metadata(path)?.permissions().mode();
+    if permissions & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "daemon app secret file is not owner-only",
+        ));
+    }
+    let secret = fs::read_to_string(path)?.trim().to_string();
+    if secret.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "daemon app secret file is empty",
+        ));
+    }
+    Ok(secret)
+}
+
+fn set_app_secret(app: &AppHandle, secret: String) {
+    let app_state = app.state::<NativeAppState>();
+    let mut state = app_state.inner.lock().unwrap();
+    state.wiki_app_secret = Some(secret);
 }
 
 fn spawn_sidecar_logger(
@@ -425,22 +467,7 @@ fn spawn_sidecar_logger(
             match event {
                 CommandEvent::Stdout(line) => {
                     let decoded = decode_line(&line);
-                    if let Some(secret) = decoded.strip_prefix(WIKI_APP_SECRET_MARKER) {
-                        // Capture the Wiki.app origin secret out of the
-                        // stdout stream BEFORE it ever hits the log. Worker
-                        // sessions can read the log file (same user), so the
-                        // marker line must never be persisted anywhere on
-                        // disk. WIKI-148 round 6, Path B.
-                        let app_state = app.state::<NativeAppState>();
-                        let mut state = app_state.inner.lock().unwrap();
-                        state.wiki_app_secret = Some(secret.trim().to_string());
-                        let _ = append_log(
-                            &log_path,
-                            "stdout <wiki-app-secret captured; line redacted>",
-                        );
-                    } else {
-                        let _ = append_log(&log_path, &format!("stdout {decoded}"));
-                    }
+                    let _ = append_log(&log_path, &format!("stdout {decoded}"));
                 }
                 CommandEvent::Stderr(line) => {
                     let _ = append_log(&log_path, &format!("stderr {}", decode_line(&line)));

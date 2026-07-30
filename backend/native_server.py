@@ -139,17 +139,12 @@ def main() -> None:
     if args.daemon and args.log_path:
         configure_daemon_log(Path(args.log_path).expanduser().absolute())
 
-    from backend.app.main import app, wiki_app_secret_boot_line
+    from backend.app.main import app, write_wiki_app_secret_file
 
-    # Emit the Wiki.app origin secret to stdout BEFORE uvicorn starts
-    # serving. The Tauri Rust host captures this line via its sidecar rx
-    # channel, strips it from the log stream, and stores the secret in
-    # process memory to hand to the webview via a `get_wiki_app_secret`
-    # invoke command. Worker CLI processes run outside Tauri's IPC bridge
-    # and never receive it — this is what gates /api/composer/* against
-    # non-Wiki.app callers (WIKI-148 round 6, Path B).
-    sys.stdout.write(wiki_app_secret_boot_line() + "\n")
-    sys.stdout.flush()
+    if args.daemon:
+        # The native app reads this owner-only file after the private daemon
+        # health probe. The secret never enters launchd stdout or stderr.
+        write_wiki_app_secret_file()
 
     config = uvicorn.Config(
         app,

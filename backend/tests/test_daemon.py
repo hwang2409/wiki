@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import json
+import stat
 import subprocess
 import sys
 import textwrap
@@ -37,17 +39,68 @@ class LaunchAgentConfigTests(unittest.TestCase):
             ).read_text(encoding="utf-8")
             self.assertEqual(daemon.render_plist(config), expected)
 
-    def test_install_does_not_touch_runtime_or_run_archive(self) -> None:
+    def test_install_preserves_seeded_live_runs_and_archive(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             config = self._config(root)
+            config = daemon.DaemonConfig(
+                **{
+                    **config.__dict__,
+                    "repo_dir": root / "repo",
+                    "vault_dir": root / "vault",
+                    "runtime_dir": root / "runtime",
+                    "log_path": root / "logs" / "backend.log",
+                }
+            )
+            config.runtime_dir.mkdir(parents=True)
+            run_dir = config.runtime_dir / "runs" / "run-live-1"
+            run_dir.mkdir(parents=True)
+            (run_dir / "run.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": "run-live-1",
+                        "agent_id": "WIKI-168",
+                        "session_id": "session-live-1",
+                        "history": [{"state": "working"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            archive_dir = root / "agent-archive" / "WIKI-168" / "session-live-1"
+            archive_dir.mkdir(parents=True)
+            (archive_dir / "meta.json").write_text(
+                '{"run_id":"run-archived-1","session_id":"session-old-1"}\n',
+                encoding="utf-8",
+            )
+            registry = root / "agent-registry.json"
+            registry.write_text(
+                json.dumps(
+                    {
+                        "WIKI-168": {
+                            "current": {
+                                "run_id": "run-live-1",
+                                "session_id": "session-live-1",
+                            },
+                            "history": [{"run_id": "run-archived-1"}],
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            tracked = [config.runtime_dir, archive_dir, registry]
+            before = {
+                path.relative_to(root).as_posix(): path.read_bytes()
+                for base in tracked
+                for path in ([base] if base.is_file() else base.rglob("*"))
+                if path.is_file()
+            }
             calls: list[tuple[str, ...]] = []
 
             def fake_launchctl(
                 _config: daemon.DaemonConfig, *arguments: str
             ) -> subprocess.CompletedProcess[str]:
                 calls.append(arguments)
-                if arguments[0] == "bootout":
+                if arguments[0] == "print":
                     return subprocess.CompletedProcess(
                         ["launchctl", *arguments],
                         1,
@@ -62,10 +115,15 @@ class LaunchAgentConfigTests(unittest.TestCase):
                 result = daemon.install(config)
 
             self.assertEqual(result["action"], "installed")
-            self.assertEqual([call[0] for call in calls], ["bootout", "bootstrap"])
+            self.assertEqual([call[0] for call in calls], ["print", "bootstrap"])
             self.assertTrue(config.plist_path.is_file())
-            self.assertFalse(config.runtime_dir.exists())
-            self.assertFalse((root / "agent-archive").exists())
+            after = {
+                path.relative_to(root).as_posix(): path.read_bytes()
+                for base in tracked
+                for path in ([base] if base.is_file() else base.rglob("*"))
+                if path.is_file()
+            }
+            self.assertEqual(after, before)
 
     def test_uninstall_is_idempotent(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -75,16 +133,86 @@ class LaunchAgentConfigTests(unittest.TestCase):
             with patch.object(
                 daemon,
                 "_launchctl",
-                return_value=subprocess.CompletedProcess(
-                    ["launchctl"], 1, "", "Could not find service"
+                side_effect=lambda _config, *arguments: subprocess.CompletedProcess(
+                    ["launchctl", *arguments],
+                    1 if arguments[0] == "bootout" or arguments[0] == "print" else 0,
+                    "",
+                    "Could not find service",
                 ),
             ):
                 result = daemon.uninstall(config)
             self.assertEqual(result["action"], "uninstalled")
             self.assertFalse(config.plist_path.exists())
 
+    def test_uninstall_keeps_plist_when_launchctl_error_is_not_absence(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp))
+            config.launch_agents_dir.mkdir()
+            config.plist_path.write_text("plist", encoding="utf-8")
+            with patch.object(
+                daemon,
+                "_launchctl",
+                return_value=subprocess.CompletedProcess(
+                    ["launchctl"], 1, "", "Input/output error"
+                ),
+            ):
+                with self.assertRaises(daemon.DaemonError):
+                    daemon.uninstall(config)
+            self.assertTrue(config.plist_path.exists())
+
 
 class DaemonLogTests(unittest.TestCase):
+    def test_daemon_secret_is_absent_from_every_log_file(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log_path = root / "logs" / "backend.log"
+            secret_path = root / "secret.txt"
+            driver = root / "driver.py"
+            driver.write_text(
+                textwrap.dedent(
+                    f"""
+                    import os
+                    import sys
+                    from pathlib import Path
+                    from backend import native_server
+
+                    class FakeServer:
+                        def __init__(self, _config):
+                            pass
+
+                        def run(self):
+                            pass
+
+                    native_server.uvicorn.Config = lambda *args, **kwargs: object()
+                    native_server.uvicorn.Server = FakeServer
+                    sys.argv = [
+                        "wiki-backend", "--port", "18213", "--daemon",
+                        "--log-path", {str(log_path)!r},
+                    ]
+                    os.environ["WIKI_APP_SECRET"] = "daemon-secret-never-logged"
+                    os.environ["WIKI_AGENT_RUNTIME_DIR"] = {str(root / 'runtime')!r}
+                    os.environ["WIKI_APP_SECRET_FILE"] = {str(secret_path)!r}
+                    native_server.main()
+                    Path({str(secret_path)!r}).write_text(
+                        os.environ["WIKI_APP_SECRET"], encoding="utf-8"
+                    )
+                    """
+                ),
+                encoding="utf-8",
+            )
+            env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[2])}
+            subprocess.run(
+                [sys.executable, str(driver)],
+                check=True,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            secret = secret_path.read_text(encoding="utf-8")
+            self.assertEqual(stat.S_IMODE(secret_path.stat().st_mode), 0o600)
+            logs = list(root.rglob("*.log"))
+            self.assertTrue(logs)
+            self.assertTrue(all(secret not in path.read_text() for path in logs))
     def test_log_rotates_with_bounded_backups(self) -> None:
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "wiki-backend-daemon.log"
@@ -114,9 +242,19 @@ class DaemonCliTests(unittest.TestCase):
                 f"""\
                 #!/bin/sh
                 printf '%s\\n' "$*" >> "{log_path}"
-                if [ "$1" = "bootout" ]; then
+                if [ "$1" = "print" ]; then
+                    if [ -f "{root / 'loaded'}" ]; then
+                        exit 0
+                    fi
                     echo "Could not find service" >&2
                     exit 1
+                fi
+                if [ "$1" = "bootout" ]; then
+                    rm -f "{root / 'loaded'}"
+                    exit 0
+                fi
+                if [ "$1" = "bootstrap" ]; then
+                    touch "{root / 'loaded'}"
                 fi
                 exit 0
                 """
@@ -161,7 +299,7 @@ class DaemonCliTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, msg=result.stderr)
             self.assertEqual(
                 [line.split(" ", 1)[0] for line in launchctl_log.read_text().splitlines()],
-                ["bootout", "bootstrap", "print", "bootout"],
+                ["print", "bootstrap", "print", "bootout", "print"],
             )
             self.assertFalse((root / "LaunchAgents" / f"{daemon.DEFAULT_LABEL}.plist").exists())
 

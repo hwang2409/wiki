@@ -16,6 +16,7 @@ from urllib.request import Request, urlopen
 
 DEFAULT_LABEL = "com.hwang2409.wiki.backend"
 DEFAULT_PORT = 8213
+FINDER_SAFE_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 
 class DaemonError(RuntimeError):
@@ -128,7 +129,9 @@ def plist_payload(config: DaemonConfig) -> dict[str, object]:
         "ProgramArguments": config.program_arguments,
         "WorkingDirectory": str(config.repo_dir),
         "EnvironmentVariables": {
+            "PATH": FINDER_SAFE_PATH,
             "WIKI_AGENT_RUNTIME_DIR": str(config.runtime_dir),
+            "WIKI_APP_SECRET_FILE": str(config.runtime_dir / "wiki-app-secret"),
             "WIKI_BACKEND_DAEMON": "launchd",
             "WIKI_BACKEND_URL": config.backend_url,
             "WIKI_SUPERVISOR_AUTOSTART": "on",
@@ -193,18 +196,37 @@ def _not_loaded(result: subprocess.CompletedProcess[str]) -> bool:
             "could not find service",
             "no such process",
             "not found",
-            "input/output error",
         )
+    )
+
+
+def _service_loaded(config: DaemonConfig) -> bool:
+    """Return service state, rejecting launchctl errors we cannot classify."""
+
+    result = _launchctl(config, "print", config.target)
+    if result.returncode == 0:
+        return True
+    if _not_loaded(result):
+        return False
+    raise DaemonError(
+        f"cannot inspect {config.target}: {_describe_failure(result)}"
     )
 
 
 def install(config: DaemonConfig) -> dict[str, object]:
     """Install and load the LaunchAgent without touching run state."""
 
+    config.log_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    config.log_path.parent.chmod(0o700)
     _write_plist(config)
-    previous = _launchctl(config, "bootout", config.target)
-    if previous.returncode != 0 and not _not_loaded(previous):
-        raise DaemonError(f"cannot replace {config.target}: {_describe_failure(previous)}")
+    if _service_loaded(config):
+        previous = _launchctl(config, "bootout", config.target)
+        if previous.returncode != 0 and _service_loaded(config):
+            raise DaemonError(
+                f"cannot unload {config.target}: {_describe_failure(previous)}"
+            )
+        if _service_loaded(config):
+            raise DaemonError(f"{config.target} is still loaded after bootout")
     loaded = _launchctl(config, "bootstrap", config.domain, str(config.plist_path))
     if loaded.returncode != 0:
         raise DaemonError(f"cannot load {config.plist_path}: {_describe_failure(loaded)}")
@@ -221,8 +243,12 @@ def uninstall(config: DaemonConfig) -> dict[str, object]:
     """Unload the LaunchAgent and remove only its generated plist."""
 
     unloaded = _launchctl(config, "bootout", config.target)
-    if unloaded.returncode != 0 and not _not_loaded(unloaded):
-        raise DaemonError(f"cannot unload {config.target}: {_describe_failure(unloaded)}")
+    if unloaded.returncode != 0 and _service_loaded(config):
+        raise DaemonError(
+            f"cannot unload {config.target}: {_describe_failure(unloaded)}"
+        )
+    if _service_loaded(config):
+        raise DaemonError(f"{config.target} is still loaded after bootout")
     config.plist_path.unlink(missing_ok=True)
     return {
         "label": config.label,
@@ -251,14 +277,14 @@ def _health(config: DaemonConfig) -> dict[str, object]:
 
 
 def status(config: DaemonConfig) -> dict[str, object]:
-    printed = _launchctl(config, "print", config.target)
+    loaded = _service_loaded(config)
     health = _health(config)
     return {
         "label": config.label,
         "target": config.target,
         "plist": str(config.plist_path),
         "installed": config.plist_path.is_file(),
-        "loaded": printed.returncode == 0,
+        "loaded": loaded,
         "healthy": health["healthy"],
         "url": config.backend_url,
         "health": health.get("payload"),
