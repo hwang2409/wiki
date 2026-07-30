@@ -249,6 +249,8 @@ export function getDashboardTickets(signal?: AbortSignal) {
 export type CostRow = {
   label: string;
   input: number;
+  cache_read: number;
+  cache_write: number;
   cached: number;
   output: number;
   reasoning: number;
@@ -286,9 +288,28 @@ export function getCosts(
   return request<CostResponse>(`/api/costs${query ? `?${query}` : ""}`, signal ? { signal } : undefined);
 }
 
-export function getTicketCosts(ticket: string, signal?: AbortSignal) {
-  return getCosts({ ticket }, signal);
+export function getTicketCosts(ticket: string) {
+  const now = Date.now();
+  const cached = ticketCostCache.get(ticket);
+  if (cached && cached.expiresAt > now) return Promise.resolve(cached.value);
+  const existing = ticketCostInflight.get(ticket);
+  if (existing) return existing;
+  // The shared request must not use one pane's abort signal. A pane can unmount
+  // while another pane still needs the same in-flight request.
+  const requestPromise = getCosts({ ticket }).then((value) => {
+    ticketCostCache.set(ticket, { value, expiresAt: Date.now() + 15_000 });
+    ticketCostInflight.delete(ticket);
+    return value;
+  }).catch((error) => {
+    ticketCostInflight.delete(ticket);
+    throw error;
+  });
+  ticketCostInflight.set(ticket, requestPromise);
+  return requestPromise;
 }
+
+const ticketCostCache = new Map<string, { value: CostResponse; expiresAt: number }>();
+const ticketCostInflight = new Map<string, Promise<CostResponse>>();
 
 export type SpawnWorkerKind = "cdx" | "cc";
 export type SpawnWorkerRole = "plan" | "implement" | "review";

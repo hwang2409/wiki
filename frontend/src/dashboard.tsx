@@ -265,6 +265,7 @@ function CostTable({ title, rows }: { title: string; rows: CostResponse["top"]["
 
 function CostDashboard({ costs }: { costs: CostResponse }) {
   const total = costs.totals;
+  const maxPromptRuns = Math.max(1, ...costs.prompt_size_distribution.map((item) => item.runs));
   return (
     <section className="cost-dashboard" aria-label="Agent costs">
       <div className="cost-dashboard-header">
@@ -290,7 +291,10 @@ function CostDashboard({ costs }: { costs: CostResponse }) {
         <div className="cost-prompt-bars">
           {costs.prompt_size_distribution.map((item) => (
             <div className="cost-prompt-bar" key={item.bucket}>
-              <div className="cost-prompt-bar-fill" style={{ height: `${Math.max(4, item.runs * 12)}px` }} />
+              <div
+                className="cost-prompt-bar-fill"
+                style={{ height: `${Math.min(40, Math.max(4, Math.round((item.runs / maxPromptRuns) * 40)))}px` }}
+              />
               <span>{item.bucket}</span>
               <strong>{item.runs}</strong>
             </div>

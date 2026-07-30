@@ -97,13 +97,17 @@ function formatTicketCost(row: CostRow): string {
 function TicketCostStrip({ ticket, refreshTick }: { ticket: string; refreshTick: number }) {
   const [summary, setSummary] = useState<CostRow | null>(null);
   useEffect(() => {
-    const controller = new AbortController();
-    getTicketCosts(ticket, controller.signal)
-      .then((data) => setSummary(data.totals))
+    let active = true;
+    getTicketCosts(ticket)
+      .then((data) => {
+        if (active) setSummary(data.totals);
+      })
       .catch(() => {
-        if (!controller.signal.aborted) setSummary(null);
+        if (active) setSummary(null);
       });
-    return () => controller.abort();
+    return () => {
+      active = false;
+    };
   }, [ticket, refreshTick]);
   if (!summary || summary.total_tokens === 0) return null;
   return (

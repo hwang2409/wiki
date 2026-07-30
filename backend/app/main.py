@@ -130,6 +130,7 @@ async def lifespan(_app: FastAPI):
     # drained on shutdown instead of dying with a daemon thread.
     workgraph_service.start_outbox()
     dispatcher_task, watchdog_task, token_task = await _start_dispatcher()
+    cost_task = asyncio.create_task(costs.background_loop(), name="wiki-cost-aggregator")
     knowledge_task = asyncio.create_task(
         knowledge.background_index_loop(
             knowledge.KnowledgePaths.from_env(
@@ -150,12 +151,14 @@ async def lifespan(_app: FastAPI):
         dispatcher_task.cancel()
         watchdog_task.cancel()
         token_task.cancel()
+        cost_task.cancel()
         knowledge_task.cancel()
         provider_health_task.cancel()
         await asyncio.gather(
             dispatcher_task,
             watchdog_task,
             token_task,
+            cost_task,
             knowledge_task,
             provider_health_task,
             return_exceptions=True,
