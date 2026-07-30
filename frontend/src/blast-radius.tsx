@@ -20,6 +20,7 @@ export function BlastRadiusPanel({
 }: BlastRadiusPanelProps) {
   const [payload, setPayload] = useState<BlastRadiusPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [stale, setStale] = useState(false);
   const normalizedCandidate = candidate.trim() || "all";
 
   useEffect(() => {
@@ -34,17 +35,20 @@ export function BlastRadiusPanel({
           if (cancelled) return;
           setPayload(next);
           setError(null);
+          setStale(false);
           timer = setTimeout(load, refreshMs);
         })
         .catch((reason: unknown) => {
           if (cancelled || (reason instanceof DOMException && reason.name === "AbortError")) return;
           setError(reason instanceof Error ? reason.message : "could not load collision risk");
+          setStale(true);
           timer = setTimeout(load, refreshMs);
         });
     };
 
     setPayload(null);
     setError(null);
+    setStale(false);
     load();
     return () => {
       cancelled = true;
@@ -62,6 +66,7 @@ export function BlastRadiusPanel({
       ),
     [payload],
   );
+  const usable = Boolean(payload?.complete && !stale && payload.risk);
 
   return (
     <section className="blast-radius-panel" aria-label="Collision risk" data-testid="blast-radius-panel">
@@ -72,21 +77,21 @@ export function BlastRadiusPanel({
             {normalizedCandidate === "all" ? "active branches" : `candidate ${normalizedCandidate}`}
           </div>
         </div>
-        {payload ? (
+        {usable && payload?.risk ? (
           <span className={`blast-radius-risk is-${payload.risk.level}`}>
             {payload.risk.count} collision{payload.risk.count === 1 ? "" : "s"}
           </span>
         ) : null}
       </div>
 
-      {error ? <div className="blast-radius-error">{error}</div> : null}
+      {error ? <div className="blast-radius-error">{stale ? "results stale: " : ""}{error}</div> : null}
       {!payload && !error ? <div className="blast-radius-muted">checking branch refs...</div> : null}
       {payload?.error ? <div className="blast-radius-muted">{payload.error}</div> : null}
 
-      {payload && !payload.complete ? (
+      {payload && (!payload.complete || stale) ? (
         <div className="blast-radius-incomplete" data-testid="blast-radius-incomplete">
           <strong>analysis incomplete</strong>
-          <span>collision results are not safe to clear.</span>
+          <span>{stale ? "the latest refresh failed; collision results are stale." : "collision results are not safe to clear."}</span>
           {payload.failed_branches.length > 0 ? (
             <ul>
               {payload.failed_branches.map((failure) => (
@@ -99,14 +104,14 @@ export function BlastRadiusPanel({
         </div>
       ) : null}
 
-      {payload?.complete && collisions.length === 0 ? (
+      {usable && collisions.length === 0 ? (
         <div className="blast-radius-empty" data-testid="blast-radius-no-overlap">
           <strong>no overlap</strong>
           <span>No active branch shares changed files with this view.</span>
         </div>
       ) : null}
 
-      {collisions.length > 0 ? (
+      {usable && collisions.length > 0 ? (
         <div className="blast-radius-collisions">
           {collisions.map((collision) => (
             <div
@@ -130,7 +135,7 @@ export function BlastRadiusPanel({
         </div>
       ) : null}
 
-      {payload && payload.risk.hot_files.length > 0 ? (
+      {usable && payload?.risk && payload.risk.hot_files.length > 0 ? (
         <div className="blast-radius-hot-files">
           <span>hot files</span>
           {payload.risk.hot_files.map((path) => (

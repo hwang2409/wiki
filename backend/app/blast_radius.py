@@ -18,6 +18,7 @@ MAX_CACHE_ENTRIES = 256
 GIT_TIMEOUT_SECONDS = 2.0
 ANALYSIS_TIMEOUT_SECONDS = 5.0
 OPEN_PR_REFRESH_SECONDS = 30.0
+OPEN_PR_MAX_AGE_SECONDS = 90.0
 
 
 @dataclass(frozen=True)
@@ -54,7 +55,14 @@ class OpenPRBranch:
 class OpenPRSnapshotState:
     branches: tuple[OpenPRBranch, ...]
     complete: bool
+    refreshed_at: float | None = None
     error: str | None = None
+
+    def __post_init__(self) -> None:
+        # Keep older injected states with a positional error usable.
+        if isinstance(self.refreshed_at, str) and self.error is None:
+            object.__setattr__(self, "error", self.refreshed_at)
+            object.__setattr__(self, "refreshed_at", None)
 
 
 @dataclass(frozen=True)
@@ -62,6 +70,25 @@ class DiscoveryResult:
     branches: tuple[ActiveBranch, ...]
     failed_branches: tuple[dict[str, str], ...]
     open_pr_snapshot_complete: bool
+
+
+class ChangedFiles(tuple[str, ...]):
+    """Immutable changed files with explicit truncation metadata."""
+
+    truncated: bool
+    dropped_count: int
+
+    def __new__(
+        cls,
+        files: Iterable[str] = (),
+        *,
+        truncated: bool = False,
+        dropped_count: int = 0,
+    ) -> "ChangedFiles":
+        value = super().__new__(cls, files)
+        value.truncated = truncated
+        value.dropped_count = dropped_count
+        return value
 
 
 def _logical_branch_name(value: str) -> str:
@@ -161,7 +188,7 @@ class OpenPRSnapshot:
     ) -> None:
         self.provider = provider or _default_open_pr_provider
         self.refresh_seconds = max(1.0, refresh_seconds)
-        self._state = OpenPRSnapshotState((), False, "open PR snapshot has not refreshed")
+        self._state = OpenPRSnapshotState((), False, None, "open PR snapshot has not refreshed")
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -172,9 +199,20 @@ class OpenPRSnapshot:
 
     def refresh(self) -> OpenPRSnapshotState:
         try:
-            state = OpenPRSnapshotState(parse_open_pr_snapshot(self.provider()), True)
+            state = OpenPRSnapshotState(
+                parse_open_pr_snapshot(self.provider()),
+                True,
+                time.time(),
+            )
         except Exception as exc:  # provider failure must not break the request path
-            state = OpenPRSnapshotState((), False, str(exc)[:200])
+            with self._lock:
+                previous = self._state
+            state = OpenPRSnapshotState(
+                previous.branches,
+                False,
+                previous.refreshed_at,
+                str(exc)[:200],
+            )
         with self._lock:
             self._state = state
         return state
@@ -233,7 +271,7 @@ class DiffCache:
             return future.result()
 
         try:
-            value = tuple(compute())
+            value = compute()
         except BaseException as exc:
             with self._lock:
                 self._inflight.pop(key, None)
@@ -321,6 +359,25 @@ def _worktree_branches(repo_root: Path, *, timeout: float) -> dict[str, str]:
     return result
 
 
+def _git_common_dir(worktree: Path, *, timeout: float) -> Path:
+    del timeout
+    git_path = worktree / ".git"
+    try:
+        if git_path.is_dir():
+            return git_path.resolve()
+        if git_path.is_file():
+            marker = git_path.read_text(encoding="utf-8").strip()
+            if not marker.startswith("gitdir:"):
+                raise GitAnalysisError("git common directory marker is invalid")
+            gitdir = Path(marker[len("gitdir:") :].strip())
+            if not gitdir.is_absolute():
+                gitdir = git_path.parent / gitdir
+            return gitdir.resolve().parent.parent
+    except (OSError, RuntimeError, UnicodeError) as exc:
+        raise GitAnalysisError(str(exc)) from exc
+    raise GitAnalysisError("git common directory is unavailable")
+
+
 def _registry_rows(registry: dict[str, Any]) -> Iterable[tuple[str, dict[str, Any]]]:
     for ticket, entry in registry.items():
         if not isinstance(ticket, str) or ticket.startswith("_") or not isinstance(entry, dict):
@@ -399,6 +456,13 @@ def discover_active_branch_result(
     selected: dict[str, ActiveBranch] = {}
 
     if pr_snapshot.complete:
+        if len(pr_snapshot.branches) > MAX_ACTIVE_BRANCHES:
+            failures.append(
+                _failed(
+                    "open PR branches",
+                    f"open PR branch list truncated; dropped {len(pr_snapshot.branches) - MAX_ACTIVE_BRANCHES} branches",
+                )
+            )
         for pr_branch in pr_snapshot.branches[:MAX_ACTIVE_BRANCHES]:
             ref, reason = _select_ref(refs, pr_branch.name, pr_branch.head_sha)
             if ref is None:
@@ -424,18 +488,46 @@ def discover_active_branch_result(
         worktrees = {}
         failures.append(_failed("registered worker worktrees", str(exc)))
 
-    registered_paths: dict[str, str] = {}
+    try:
+        primary_common_dir = _git_common_dir(
+            repo_root,
+            timeout=min(GIT_TIMEOUT_SECONDS, max(0.05, deadline - time.monotonic())),
+        )
+    except GitAnalysisError as exc:
+        primary_common_dir = None
+        failures.append(_failed("git common directory", str(exc)))
+
+    registered_paths: dict[str, tuple[str, str | None]] = {}
     for ticket, current in _registry_rows(registry):
         if current.get("role") == "orchestrator":
             continue
+        eligible_for_hint = True
         raw_worktree = current.get("worktree") or current.get("cwd")
         if isinstance(raw_worktree, str) and raw_worktree.strip():
             try:
-                registered_paths[str(Path(raw_worktree).expanduser().resolve())] = ticket
+                path = Path(raw_worktree).expanduser().resolve()
             except (OSError, RuntimeError, TypeError, ValueError):
-                failures.append(_failed(ticket, "registered worktree path is invalid"))
+                eligible_for_hint = False
+                continue
+            if primary_common_dir is None:
+                eligible_for_hint = False
+                continue
+            try:
+                worker_common_dir = _git_common_dir(
+                    path,
+                    timeout=min(GIT_TIMEOUT_SECONDS, max(0.05, deadline - time.monotonic())),
+                )
+            except GitAnalysisError:
+                eligible_for_hint = False
+                continue
+            if worker_common_dir != primary_common_dir:
+                eligible_for_hint = False
+                continue
+            registered_paths[str(path)] = (ticket, current.get("role"))
+            if current.get("role") == "review" and str(path) not in worktrees:
+                eligible_for_hint = False
         hint = _branch_hint(current)
-        if hint:
+        if hint and eligible_for_hint:
             ref, reason = _select_ref(refs, hint)
             if ref is None:
                 failures.append(_failed(hint, reason or "registered branch ref unavailable"))
@@ -451,9 +543,11 @@ def discover_active_branch_result(
                     ),
                 )
 
-    for path, ticket in registered_paths.items():
+    for path, (ticket, role) in registered_paths.items():
         branch_name = worktrees.get(path)
         if not branch_name:
+            if role == "review":
+                continue
             failures.append(_failed(ticket, "registered worker branch is not available"))
             continue
         ref, reason = _select_ref(refs, branch_name)
@@ -479,8 +573,17 @@ def discover_active_branch_result(
         (branch for branch in selected.values() if branch.source != "worker"),
         key=lambda branch: branch.name,
     )
+    all_branches = [*workers, *other_branches]
+    dropped_count = max(0, len(all_branches) - MAX_ACTIVE_BRANCHES)
+    if dropped_count:
+        failures.append(
+            _failed(
+                "active branches",
+                f"active branch list truncated; dropped {dropped_count} branches",
+            )
+        )
     return DiscoveryResult(
-        tuple([*workers, *other_branches][:MAX_ACTIVE_BRANCHES]),
+        tuple(all_branches[:MAX_ACTIVE_BRANCHES]),
         tuple(failures),
         pr_snapshot.complete,
     )
@@ -516,7 +619,7 @@ def changed_files(
     *,
     main_ref: BranchRef | None = None,
     timeout: float = GIT_TIMEOUT_SECONDS,
-) -> tuple[str, ...]:
+) -> ChangedFiles:
     """Return the immutable changed-file set for ``main...branch``."""
 
     if main_ref is None:
@@ -529,7 +632,12 @@ def changed_files(
         timeout=timeout,
     )
     files = tuple(dict.fromkeys(line for line in output.splitlines() if line))
-    return files[:MAX_CHANGED_FILES]
+    dropped_count = max(0, len(files) - MAX_CHANGED_FILES)
+    return ChangedFiles(
+        files[:MAX_CHANGED_FILES],
+        truncated=bool(dropped_count),
+        dropped_count=dropped_count,
+    )
 
 
 def collision_pairs(branches: Iterable[BranchFiles]) -> list[dict[str, Any]]:
@@ -614,6 +722,8 @@ def _response(
     branches: list[dict[str, Any]],
     collisions: list[dict[str, Any]],
     failed_branches: list[dict[str, str]],
+    refreshed_at: float | None = None,
+    snapshot_max_age_seconds: float = OPEN_PR_MAX_AGE_SECONDS,
     error: str | None = None,
 ) -> dict[str, Any]:
     deduped_failures: list[dict[str, str]] = []
@@ -632,7 +742,9 @@ def _response(
         "failed_branches": deduped_failures,
         "branches": branches,
         "collisions": collisions,
-        "risk": _risk_summary(collisions),
+        "risk": _risk_summary(collisions) if complete else None,
+        "refreshed_at": refreshed_at,
+        "snapshot_max_age_seconds": snapshot_max_age_seconds,
     }
     if error:
         payload["error"] = error
@@ -653,6 +765,19 @@ def analyze(
         if isinstance(pr_snapshot, OpenPRSnapshot)
         else pr_snapshot or OPEN_PR_SNAPSHOT.read()
     )
+    snapshot_age = (
+        None
+        if snapshot_state.refreshed_at is None
+        else max(0.0, time.time() - snapshot_state.refreshed_at)
+    )
+    snapshot_stale = snapshot_age is None or snapshot_age > OPEN_PR_MAX_AGE_SECONDS
+    if snapshot_stale and snapshot_state.complete:
+        snapshot_state = OpenPRSnapshotState(
+            snapshot_state.branches,
+            False,
+            snapshot_state.refreshed_at,
+            snapshot_state.error or "open PR snapshot is stale",
+        )
     try:
         refs = _refs(repo_root, timeout=GIT_TIMEOUT_SECONDS)
     except GitAnalysisError as exc:
@@ -662,6 +787,7 @@ def analyze(
             branches=[],
             collisions=[],
             failed_branches=[_failed("git refs", str(exc))],
+            refreshed_at=snapshot_state.refreshed_at,
             error="branch refs are unavailable",
         )
 
@@ -673,6 +799,7 @@ def analyze(
             branches=[],
             collisions=[],
             failed_branches=[_failed("main", "main ref is not present in fetched refs")],
+            refreshed_at=snapshot_state.refreshed_at,
             error="main ref is unavailable",
         )
 
@@ -685,7 +812,10 @@ def analyze(
     )
     failures = list(discovery.failed_branches)
     if not snapshot_state.complete:
-        failures.append(_failed("open PR snapshot", snapshot_state.error or "snapshot is incomplete"))
+        reason = snapshot_state.error or "snapshot is incomplete"
+        if snapshot_stale and "stale" not in reason:
+            reason = f"{reason}; snapshot is stale"
+        failures.append(_failed("open PR snapshot", reason))
 
     candidate_found: bool | None = None
     candidate_branch: ActiveBranch | None = None
@@ -728,6 +858,13 @@ def analyze(
         except BaseException as exc:
             failures.append(_failed(branch.name, str(exc)))
             continue
+        if getattr(files, "truncated", False):
+            failures.append(
+                _failed(
+                    branch.name,
+                    f"changed file list truncated; dropped {getattr(files, 'dropped_count', 0)} files",
+                )
+            )
         rows.append(BranchFiles(branch=branch.name, head_sha=branch.head_sha, files=files))
         branch_payload.append(
             {
@@ -753,4 +890,5 @@ def analyze(
         branches=branch_payload,
         collisions=collisions,
         failed_branches=failures,
+        refreshed_at=snapshot_state.refreshed_at,
     )

@@ -65,6 +65,7 @@ class BlastRadiusTests(unittest.TestCase):
                 for name in names
             ),
             True,
+            time.time(),
         )
 
     def test_changed_files_use_main_three_dot_diff(self) -> None:
@@ -168,7 +169,7 @@ class BlastRadiusTests(unittest.TestCase):
             ),
         )
         self.assertFalse(payload["complete"])
-        self.assertEqual(payload["risk"]["count"], 0)
+        self.assertIsNone(payload["risk"])
         self.assertTrue(payload["failed_branches"])
 
     def test_timeout_is_reported_and_never_becomes_no_overlap(self) -> None:
@@ -188,7 +189,7 @@ class BlastRadiusTests(unittest.TestCase):
                 pr_snapshot=self.snapshot("one", "two"),
             )
         self.assertFalse(payload["complete"])
-        self.assertEqual(payload["risk"]["count"], 0)
+        self.assertIsNone(payload["risk"])
         self.assertIn("two", {failure["branch"] for failure in payload["failed_branches"]})
 
     def test_registered_worktree_branch_is_discovered_from_primary_repo(self) -> None:
@@ -209,6 +210,68 @@ class BlastRadiusTests(unittest.TestCase):
         )
         branches = {row["branch"] for row in payload["branches"]}
         self.assertIn("one", branches)
+
+    def test_foreign_and_detached_review_worktrees_are_ignored(self) -> None:
+        foreign = FixtureRepo()
+        self.addCleanup(foreign.close)
+        detached = self.fixture.root.parent / "detached-review"
+        git(self.fixture.root, "worktree", "add", "--detach", "--", str(detached), "main")
+        self.addCleanup(lambda: git(self.fixture.root, "worktree", "remove", "--force", "--", str(detached)))
+        payload = blast_radius.analyze(
+            self.fixture.root,
+            {
+                "FOREIGN": {
+                    "current": {"role": "implement", "worktree": str(foreign.root), "branch": "one"}
+                },
+                "REVIEW": {
+                    "current": {"role": "review", "worktree": str(detached), "branch": "one"}
+                },
+            },
+            cache=blast_radius.DiffCache(),
+            pr_snapshot=blast_radius.OpenPRSnapshotState((), True, time.time()),
+        )
+        self.assertTrue(payload["complete"])
+        self.assertEqual(payload["failed_branches"], [])
+        self.assertEqual(payload["branches"], [])
+
+    def test_stale_snapshot_is_incomplete_and_has_unknown_risk(self) -> None:
+        payload = blast_radius.analyze(
+            self.fixture.root,
+            {},
+            cache=blast_radius.DiffCache(),
+            pr_snapshot=blast_radius.OpenPRSnapshotState(
+                (),
+                True,
+                time.time() - blast_radius.OPEN_PR_MAX_AGE_SECONDS - 1,
+            ),
+        )
+        self.assertFalse(payload["complete"])
+        self.assertIsNone(payload["risk"])
+        self.assertTrue(any("stale" in failure["reason"] for failure in payload["failed_branches"]))
+
+    def test_branch_count_truncation_is_reported_as_incomplete(self) -> None:
+        with mock.patch.object(blast_radius, "MAX_ACTIVE_BRANCHES", 1):
+            payload = blast_radius.analyze(
+                self.fixture.root,
+                {},
+                cache=blast_radius.DiffCache(),
+                pr_snapshot=self.snapshot("one", "two"),
+            )
+        self.assertFalse(payload["complete"])
+        self.assertIsNone(payload["risk"])
+        self.assertTrue(any("dropped 1 branches" in failure["reason"] for failure in payload["failed_branches"]))
+
+    def test_file_count_truncation_is_reported_as_incomplete(self) -> None:
+        with mock.patch.object(blast_radius, "MAX_CHANGED_FILES", 1):
+            payload = blast_radius.analyze(
+                self.fixture.root,
+                {},
+                cache=blast_radius.DiffCache(),
+                pr_snapshot=self.snapshot("one"),
+            )
+        self.assertFalse(payload["complete"])
+        self.assertIsNone(payload["risk"])
+        self.assertTrue(any("dropped 1 files" in failure["reason"] for failure in payload["failed_branches"]))
 
     def test_candidate_can_be_a_ref_or_ticket_and_missing_is_clean(self) -> None:
         by_ref = blast_radius.analyze(
@@ -241,10 +304,12 @@ class BlastRadiusTests(unittest.TestCase):
             pr_snapshot=blast_radius.OpenPRSnapshotState(
                 (blast_radius.OpenPRBranch("deleted", "1" * 40),),
                 True,
+                time.time(),
             ),
         )
         self.assertFalse(payload["candidate_found"])
         self.assertFalse(payload["complete"])
+        self.assertIsNone(payload["risk"])
         self.assertIn("deleted", {failure["branch"] for failure in payload["failed_branches"]})
 
     def test_origin_main_is_a_valid_full_main_ref(self) -> None:
@@ -255,7 +320,7 @@ class BlastRadiusTests(unittest.TestCase):
             self.fixture.root,
             {},
             cache=blast_radius.DiffCache(),
-            pr_snapshot=blast_radius.OpenPRSnapshotState((), True),
+            pr_snapshot=blast_radius.OpenPRSnapshotState((), True, time.time()),
         )
         self.assertTrue(payload["complete"])
 
@@ -265,10 +330,10 @@ class BlastRadiusTests(unittest.TestCase):
             self.fixture.root,
             {},
             cache=blast_radius.DiffCache(),
-            pr_snapshot=blast_radius.OpenPRSnapshotState((), True),
+            pr_snapshot=blast_radius.OpenPRSnapshotState((), True, time.time()),
         )
         self.assertFalse(payload["complete"])
-        self.assertEqual(payload["risk"]["count"], 0)
+        self.assertIsNone(payload["risk"])
         self.assertIn("main", {failure["branch"] for failure in payload["failed_branches"]})
 
     def test_snapshot_provider_refreshes_and_reports_provider_errors(self) -> None:

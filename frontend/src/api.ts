@@ -234,7 +234,9 @@ export type BlastRadiusPayload = {
     count: number;
     level: "none" | "low" | "medium" | "high" | string;
     hot_files: string[];
-  };
+  } | null;
+  refreshed_at: number | null;
+  snapshot_max_age_seconds: number;
   error?: string;
 };
 
