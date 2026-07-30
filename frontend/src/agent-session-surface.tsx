@@ -1,6 +1,7 @@
 import {
   useEffect,
   useCallback,
+  useMemo,
   useRef,
   useState,
   type PointerEvent as ReactPointerEvent,
@@ -10,6 +11,7 @@ import { AlertTriangle, Bot, GitBranch, GitPullRequest, History, RefreshCw, X } 
 import { AgentPrReviewPanel } from "./agent-pr-review";
 import { LoopStateChrome } from "./loop-state-chrome";
 import { WorkgraphPanel } from "./workgraph-panel";
+import { ArtifactInspector, isTextEntryTarget, resolveInspectTarget } from "./artifact-inspector";
 import { ArtifactPanel } from "./artifact-panel";
 import { ReplayScrubberPanel } from "./replay-scrubber-panel";
 import { deletePaneStateEntries } from "./pane-state-cache";
@@ -380,7 +382,16 @@ export function AgentSessionSurface({
   );
   const panelStateRef = useRef(panelState);
   panelStateRef.current = panelState;
-  const [artifacts, setArtifacts] = useState<Map<string, SessionEvent>>(new Map());
+  const [artifactEvents, setArtifactEvents] = useState<SessionEvent[]>([]);
+  const artifactEventsRef = useRef(artifactEvents);
+  artifactEventsRef.current = artifactEvents;
+  const artifacts = useMemo(
+    () => new Map(artifactEvents.flatMap((event) => (event.artifact_id ? [[event.artifact_id, event] as const] : []))),
+    [artifactEvents],
+  );
+  const [inspectorIndex, setInspectorIndex] = useState<number | null>(null);
+  const inspectorIndexRef = useRef(inspectorIndex);
+  inspectorIndexRef.current = inspectorIndex;
   const [replaceOpen, setReplaceOpen] = useState(false);
   const commitPanelState = useCallback((update: (current: PanelState) => PanelState, syncUrl = true) => {
     const next = update(panelStateRef.current);
@@ -406,7 +417,9 @@ export function AgentSessionSurface({
       const containerWidth = rowRef.current?.getBoundingClientRect().width ?? window.innerWidth;
       setArtifactWidth(clampPanelWidth(Math.round(containerWidth * 0.45), containerWidth));
     }
-    setArtifacts((current) => new Map(current).set(artifactId, event));
+    setArtifactEvents((current) =>
+      current.some((candidate) => candidate.artifact_id === artifactId) ? current : [...current, event]
+    );
     commitPanelState((current) => {
       const tabs = current.tabs.includes(artifactId) ? current.tabs : [...current.tabs, artifactId];
       return {
@@ -513,12 +526,28 @@ export function AgentSessionSurface({
     const onShortcut = (event: KeyboardEvent) => {
       const pane = rowRef.current?.closest(".pane-frame");
       if (pane && !pane.classList.contains("is-focused")) return;
+      if (event.defaultPrevented) return;
+      // The fullscreen inspector traps and handles its own keys.
+      if (inspectorIndexRef.current !== null) return;
+      const command = event.metaKey || event.ctrlKey;
+      if (command && !event.shiftKey && !event.altKey && event.key === "Enter") {
+        if (isTextEntryTarget(event.target)) return;
+        const target = resolveInspectTarget(
+          rowRef.current,
+          artifactEventsRef.current,
+          panelStateRef.current.focusedTab,
+        );
+        if (target !== null) {
+          event.preventDefault();
+          setInspectorIndex(target);
+        }
+        return;
+      }
       if (event.key === "Escape" && panelState.open && panelState.focusedTab) {
         event.preventDefault();
         closeArtifactTab(panelState.focusedTab);
         return;
       }
-      const command = event.metaKey || event.ctrlKey;
       if (!command || !event.shiftKey) return;
       if (event.key.toLocaleLowerCase() === "a") {
         if (panelState.tabs.length === 0) return;
@@ -546,10 +575,23 @@ export function AgentSessionSurface({
   }, [closeArtifactTab, commitPanelState, panelState.focusedTab, panelState.open, panelState.tabs]);
 
   const handleArtifactsChange = useCallback((events: SessionEvent[]) => {
-    setArtifacts(
-      new Map(events.flatMap((event) => (event.artifact_id ? [[event.artifact_id, event] as const] : [])))
-    );
+    setArtifactEvents(events);
   }, []);
+
+  const openInspector = useCallback((event: SessionEvent) => {
+    const index = artifactEventsRef.current.findIndex(
+      (candidate) => candidate.artifact_id === event.artifact_id,
+    );
+    if (index >= 0) setInspectorIndex(index);
+  }, []);
+
+  const closeInspector = useCallback(() => setInspectorIndex(null), []);
+
+  useEffect(() => {
+    if (inspectorIndex !== null && inspectorIndex >= artifactEvents.length) {
+      setInspectorIndex(artifactEvents.length > 0 ? artifactEvents.length - 1 : null);
+    }
+  }, [artifactEvents.length, inspectorIndex]);
 
   const resizePanel = (event: ReactPointerEvent<HTMLDivElement>) => {
     event.preventDefault();
@@ -691,6 +733,7 @@ export function AgentSessionSurface({
           <SessionTab
             onArtifactsChange={handleArtifactsChange}
             onInspect={inspectSubagent}
+            onInspectArtifact={openInspector}
             onOpenArtifact={openArtifact}
             stateKey={`${surfaceStateKey}:main`}
             ticket={worker.ticket}
@@ -742,6 +785,15 @@ export function AgentSessionSurface({
           subagent={panel.subagent}
           ticket={worker.ticket}
           width={panelWidth}
+        />
+      ) : null}
+      {inspectorIndex !== null && artifactEvents.length > 0 ? (
+        <ArtifactInspector
+          events={artifactEvents}
+          index={Math.min(inspectorIndex, artifactEvents.length - 1)}
+          onClose={closeInspector}
+          onIndexChange={setInspectorIndex}
+          ticket={worker.ticket}
         />
       ) : null}
       {replaceOpen && worker.kind && worker.model ? (

@@ -13,7 +13,10 @@ export function SvgArtifactDetail({
 }) {
   return (
     <PanZoomCanvas label="SVG pan and zoom canvas" onChange={onChange} state={state}>
-      <SvgRenderer source={source} />
+      {/* compact forces explicit width/height from the viewBox — a viewBox-only
+          SVG otherwise resolves to a zero-sized box inside the pan-zoom canvas
+          (width: max-content parent × max-width: 100% child). */}
+      <SvgRenderer compact source={source} />
     </PanZoomCanvas>
   );
 }

@@ -47,6 +47,7 @@ export type ArtifactRendererProps = {
   artifact: SessionArtifact;
   compact?: boolean;
   event: SessionEvent;
+  onExpand?: () => void;
   onImageLoad?: (image: HTMLImageElement) => void;
   onOpenFile?: (entry: ArtifactFileEntry) => void;
   onRenderError?: (failure: ArtifactRenderFailure) => void;
@@ -240,6 +241,7 @@ export function SharedImageRenderer({
   eager,
   height,
   imgClassName,
+  onExpand,
   onImageLoad,
   openInLightbox = false,
   previewBase64,
@@ -254,6 +256,7 @@ export function SharedImageRenderer({
   eager?: boolean;
   height?: number;
   imgClassName?: string;
+  onExpand?: () => void;
   onImageLoad?: (image: HTMLImageElement) => void;
   openInLightbox?: boolean;
   previewBase64?: string | null;
@@ -346,11 +349,11 @@ export function SharedImageRenderer({
           />
         ) : null
       ) : null}
-      {openInLightbox ? (
+      {openInLightbox || onExpand ? (
         <button
           aria-label={`Open ${alt} in fullscreen`}
           className="artifact-image-expand"
-          onClick={() => setLightboxOpen(true)}
+          onClick={() => (onExpand ? onExpand() : setLightboxOpen(true))}
           type="button"
         >
           {image}
@@ -373,7 +376,7 @@ export function SharedImageRenderer({
   );
 }
 
-export function ImageRenderer({ artifact, event, onImageLoad, ticket }: ArtifactRendererProps) {
+export function ImageRenderer({ artifact, event, onExpand, onImageLoad, ticket }: ArtifactRendererProps) {
   const source = artifact.data_base64
     ? `data:${artifact.mime ?? "image/png"};base64,${artifact.data_base64}`
     : artifactUrl(ticket, event);
@@ -383,6 +386,7 @@ export function ImageRenderer({ artifact, event, onImageLoad, ticket }: Artifact
       caption={event.caption || event.title || null}
       height={artifact.height}
       imgClassName="artifact-image"
+      onExpand={onExpand}
       onImageLoad={onImageLoad}
       openInLightbox
       previewBase64={artifact.preview_base64 ?? null}

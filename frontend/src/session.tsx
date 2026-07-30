@@ -1751,6 +1751,7 @@ function QuestionRow({ event }: { event: SessionEvent }) {
 const MessageBlock = memo(function MessageBlock({
   event,
   imageNums,
+  onInspectArtifact,
   onOpenArtifact,
   rowKey,
   sessionKey,
@@ -1759,6 +1760,7 @@ const MessageBlock = memo(function MessageBlock({
 }: {
   event: SessionEvent;
   imageNums?: number[];
+  onInspectArtifact?: (event: SessionEvent) => void;
   onOpenArtifact?: (event: SessionEvent) => void;
   rowKey: number;
   sessionKey: string;
@@ -1766,7 +1768,7 @@ const MessageBlock = memo(function MessageBlock({
   uiState: SessionUiState;
 }) {
   if (event.kind === "artifact") {
-    return <ArtifactBlock event={event} onOpen={onOpenArtifact} sessionKey={sessionKey} ticket={ticket} />;
+    return <ArtifactBlock event={event} onInspect={onInspectArtifact} onOpen={onOpenArtifact} sessionKey={sessionKey} ticket={ticket} />;
   }
   if (event.kind === "user") {
     if (event.source) {
@@ -1842,6 +1844,7 @@ const MessageBlock = memo(function MessageBlock({
 }, (prev, next) =>
   prev.event === next.event &&
   prev.rowKey === next.rowKey &&
+  prev.onInspectArtifact === next.onInspectArtifact &&
   prev.onOpenArtifact === next.onOpenArtifact &&
   prev.ticket === next.ticket &&
   prev.uiState === next.uiState &&
@@ -1971,6 +1974,7 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
   imageNums,
   onHeightChange,
   onInspect,
+  onInspectArtifact,
   onOpenArtifact,
   sessionKey,
   showTimestamp,
@@ -1982,6 +1986,7 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
   imageNums?: number[];
   onHeightChange: (group: EventGroup, height: number) => void;
   onInspect?: (agentId: string) => void;
+  onInspectArtifact?: (event: SessionEvent) => void;
   onOpenArtifact?: (event: SessionEvent) => void;
   sessionKey: string;
   showTimestamp: boolean;
@@ -2007,6 +2012,7 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
         <MessageBlock
           event={group.event}
           imageNums={imageNums}
+          onInspectArtifact={onInspectArtifact}
           onOpenArtifact={onOpenArtifact}
           rowKey={group.key}
           sessionKey={sessionKey}
@@ -2022,6 +2028,7 @@ const VirtualSessionRow = memo(function VirtualSessionRow({
     prev.top !== next.top ||
     prev.onHeightChange !== next.onHeightChange ||
     prev.onInspect !== next.onInspect ||
+    prev.onInspectArtifact !== next.onInspectArtifact ||
     prev.onOpenArtifact !== next.onOpenArtifact ||
     prev.showTimestamp !== next.showTimestamp ||
     prev.ticket !== next.ticket ||
@@ -2133,6 +2140,7 @@ export function SessionTab({
   showComposer = true,
   onInspect,
   onArtifactsChange,
+  onInspectArtifact,
   onOpenArtifact,
   stateKey,
 }: {
@@ -2141,6 +2149,7 @@ export function SessionTab({
   showComposer?: boolean;
   onInspect?: (agentId: string) => void;
   onArtifactsChange?: (events: SessionEvent[]) => void;
+  onInspectArtifact?: (event: SessionEvent) => void;
   onOpenArtifact?: (event: SessionEvent) => void;
   stateKey?: string;
 }) {
@@ -2802,6 +2811,7 @@ export function SessionTab({
                 key={group.key}
                 onHeightChange={reportRowHeight}
                 onInspect={onInspect}
+                onInspectArtifact={onInspectArtifact}
                 onOpenArtifact={onOpenArtifact}
                 sessionKey={inlineArtifactKey}
                 showTimestamp={timestampKeys.has(group.key)}
