@@ -268,6 +268,8 @@ def record_steer(
     source: str | None,
     request_id: str | None,
     status_dir: Path | None = None,
+    findings: list[dict] | None = None,
+    constraint_bundle: str | None = None,
 ) -> None:
     actor = orch or DEFAULT_ACTOR
     # The supervisor's exact request id rides on the edge itself: replay
@@ -279,6 +281,8 @@ def record_steer(
         text,
         source_worker=source or DEFAULT_ACTOR,
         request_id=operation_id,
+        findings=findings,
+        constraint_bundle=constraint_bundle,
     )
     _record(
         base_ticket(agent_id),
@@ -289,6 +293,32 @@ def record_steer(
         actor,
         status_dir,
         request_id=operation_id,
+    )
+
+
+def record_verdict(
+    *,
+    ticket: str,
+    reviewer: str,
+    orch: str | None,
+    payload: dict,
+    request_id: str,
+    status_dir: Path | None = None,
+    wait_for_delivery: bool = False,
+) -> Future[None] | None:
+    """Persist a parsed reviewer verdict before autopilot acts on it."""
+
+    actor = orch or DEFAULT_ACTOR
+    return _record(
+        base_ticket(ticket),
+        "verdict",
+        reviewer,
+        orch_node_id(actor),
+        payload,
+        actor,
+        status_dir,
+        request_id=request_id,
+        wait_for_delivery=wait_for_delivery,
     )
 
 

@@ -175,6 +175,48 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             **rebase_input_schema(),
         },
     },
+    {
+        "name": "autopilot_enable",
+        "description": "Enable the opt-in autonomous merge-ready loop for one ticket.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["ticket"],
+            "properties": {
+                "ticket": {"type": "string", "minLength": 1},
+                "henry_ack_required_for_merge": {"type": "boolean", "default": False},
+            },
+        },
+    },
+    {
+        "name": "autopilot_disable",
+        "description": "Disable autonomous actions for one ticket.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["ticket"],
+            "properties": {"ticket": {"type": "string", "minLength": 1}},
+        },
+    },
+    {
+        "name": "autopilot_status",
+        "description": "Read one ticket's autopilot state or the fleet-wide summary.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"ticket": {"type": ["string", "null"], "minLength": 1}},
+        },
+    },
+    {
+        "name": "autopilot_ack_merge",
+        "description": "Record Henry's explicit merge acknowledgement for one ticket.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["ticket"],
+            "properties": {"ticket": {"type": "string", "minLength": 1}},
+        },
+    },
 ]
 
 
@@ -384,6 +426,40 @@ def rebase_dirty_pr(arguments: Any) -> dict[str, Any]:
     return _backend_api("POST", "/api/agents/rebase-dirty-pr", values)
 
 
+def autopilot_enable(arguments: Any) -> dict[str, Any]:
+    values = _arguments(
+        arguments,
+        required={"ticket"},
+        optional={"henry_ack_required_for_merge"},
+    )
+    return _backend_api(
+        "POST",
+        f"/api/autopilot/{quote(_string(values.pop('ticket'), 'ticket'), safe='')}/enable",
+        values,
+    )
+
+
+def autopilot_disable(arguments: Any) -> dict[str, Any]:
+    values = _arguments(arguments, required={"ticket"})
+    ticket = _string(values["ticket"], "ticket")
+    return _backend_api("POST", f"/api/autopilot/{quote(ticket, safe='')}/disable")
+
+
+def autopilot_status(arguments: Any) -> dict[str, Any]:
+    values = _arguments(arguments, required=set(), optional={"ticket"})
+    ticket = values.get("ticket")
+    if ticket is not None:
+        ticket = _string(ticket, "ticket")
+        return _backend_api("GET", f"/api/autopilot/{quote(ticket, safe='')}")
+    return _backend_api("GET", "/api/autopilot")
+
+
+def autopilot_ack_merge(arguments: Any) -> dict[str, Any]:
+    values = _arguments(arguments, required={"ticket"})
+    ticket = _string(values["ticket"], "ticket")
+    return _backend_api("POST", f"/api/autopilot/{quote(ticket, safe='')}/ack-merge")
+
+
 TOOL_HANDLERS = {
     "list_agents": list_agents,
     "read_agent": read_agent,
@@ -395,6 +471,10 @@ TOOL_HANDLERS = {
     "archive_agent": archive_agent,
     "next_review": next_review,
     "rebase_dirty_pr": rebase_dirty_pr,
+    "autopilot_enable": autopilot_enable,
+    "autopilot_disable": autopilot_disable,
+    "autopilot_status": autopilot_status,
+    "autopilot_ack_merge": autopilot_ack_merge,
 }
 
 

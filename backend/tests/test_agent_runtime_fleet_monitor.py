@@ -1754,6 +1754,13 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         await self.monitor.tick()  # seed
         self.send.calls.clear()
         self.send.fail_with = RuntimeError("adapter gone")
+        hook_events: list[dict] = []
+
+        async def on_transition(event: dict) -> bool:
+            hook_events.append(event)
+            return True
+
+        self.monitor.on_transition = on_transition
 
         _write_status(
             self.store,
@@ -1764,6 +1771,8 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         # No successful notification produced; but send_now was called.
         self.assertEqual(notes, [])
         self.assertEqual(len(self.send.calls), 1)
+        self.assertEqual(len(hook_events), 1)
+        self.assertEqual(hook_events[0]["status_state"], "merge-ready")
 
     async def test_missing_orch_run_swallowed(self) -> None:
         # Worker references an orchestrator agent_id that doesn't exist.

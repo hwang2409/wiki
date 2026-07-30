@@ -2,7 +2,7 @@
 type: til
 tags: [wiki-app]
 created: 2026-07-29
-updated: 2026-07-29
+updated: 2026-07-30
 ---
 
 # Supervisor fingerprint-swap wedge (2026-07-29 outage RCA)
@@ -49,5 +49,27 @@ Outage ~20:12:45 local: backend 503 "Agent supervisor is unavailable: supervisor
 - 20:42 kill -9 52419 -> supervisor 60373 healthy. Stable only while the WIKI-173 worker stays idle.
 
 FIXED 2026-07-30, merged `5017f26` (WIKI-217): dev-client swap guard in `ensure_running`, early lock/pid release in daemon shutdown, socket unlink guarded by bound inode. Takes effect in the app after the next `make native-build` + relaunch. Worktrees created before the fix still carry the old swapping client until rebased — but with a rebuilt app, their strike now completes as a clean swap instead of a wedge.
+
+## Wedge #4 AFTER the fix (2026-07-30 00:39 EDT)
+
+Supervisor 45859 (started 00:32, running the REBUILT release binary with `5017f26`) wedged at ~00:39: socket unlinked, `supervisor.lock` still flock-held, respawn crash-storm ("wiki supervisor is already running", BlockingIOError 35), all children on both orchestrators killed. Trigger consistent with the pre-fix WIKI-173 worktree client striking again (its worktree predates the fix). Conclusion: the daemon-side early-lock-release in `5017f26` did NOT prevent the wedge — the fix is incomplete or the lock is held by a different path. kill -9 45859 -> fresh supervisor 53892, healthy. WIKI-217 needs a follow-up: reproduce with a pre-fix client striking a post-fix daemon; verify lock/pid release ordering actually runs before adapter drain.
+
+## Wedges #5-#6 and the auto-resume strike loop (2026-07-30 00:41-00:47 EDT)
+
+Two more strikes after #4 (supervisors 53892, 57341). Loop mechanics: supervisor dies -> wiki orch auto-resumes -> replaces WIKI-173 -> the worker's FIRST recovery turn runs pre-fix backend code and strikes -> everyone dies -> repeat. The wiki orch knew (it queued an urgent merge-main steer to WIKI-173 at 00:46) but a queued steer can never win: the strike fires in the recovery turn before queued messages are consumed. Loop broken by phoebe orch at 00:48: archived WIKI-173 (outcome=closed) so it cannot be blindly replaced; the correct respawn is a FRESH spawn whose prompt front-loads "merge origin/main before any backend test run". Worktree state intact on disk.
+
+## Strike loop broken (2026-07-30 00:48-00:50 EDT)
+
+Wiki orch removed the hazard deterministically while workers were dead, instead of racing steers against recovery turns:
+
+- Committed WIKI-173's uncommitted in-flight work as WIP `ff656f4`, then merged origin/main into both implementer branches: `8b4cf03` (wiki-173), `eb125b8` (wiki-188). Both worktrees now carry the fix; backend test runs from them are safe.
+- Reviewer worktrees stay pinned at pre-fix PR SHAs by design — reviewers get a STATIC-ONLY constraint (no backend tests, services, or dev servers from the pinned checkout). Steer, not rebase: the pin is the point.
+- WIKI-173 respawned FRESH (it was archived during the loop) with the safe-worktree state front-loaded in the kickoff prompt; others revived via replace. Fleet stable as of 00:50.
+
+Recovery gotcha (new): do NOT `rm supervisor.pid` while recovering. The backend's own respawn can land between your kill and your rm — the rm then deletes the FRESH instance's pid file and the supervisor reports "degraded: supervisor PID is absent" while actually running. If it happens: `echo <live pid> > supervisor.pid` (find via `ps aux | grep 'wiki-backend --supervisor'`). kill -9 the old pid + one backend agent-operation is the whole remedy; leave the pid file alone.
+
+## Related: backend restart archives the fleet (2026-07-30)
+
+Separate pathology, same evening: Wiki.app quit ~20:45 EDT (backend 8213 down ~3.7h, machine also slept). Workers kept running under the surviving supervisor (60373) the whole outage — worktree state advanced normally. On app relaunch 00:33 EDT the fresh backend archived every registered run and released all provider processes, including live mid-task workers. Recovery: worktree/git state is durable; respawn each ticket from on-disk state (archived tickets need spawn; a ticket with a dead-but-registered run needs replace). Keep respawn prompts on disk (`/tmp/phoebe-respawn/`) — they made this a 5-minute recovery.
 
 Ticket: WIKI-217 (vault todo, P1). Related: [[mitmweb-rebuild]] fleet ops; ticket WIKI-173.

@@ -23,6 +23,11 @@ _CODEX_RENDERED_METHODS = {
     "item/completed",
     "item/fileChange/outputDelta",
     "item/commandExecution/outputDelta",
+    "turn/diff/updated",
+    "item/commandExecution/terminalInteraction",
+    "warning",
+    "skills/changed",
+    "turn/plan/updated",
     "error",
     "account/rateLimits/updated",
     "context/compacted",
@@ -34,15 +39,20 @@ _CODEX_RENDERED_METHODS = {
 _CODEX_SUMMARIZED_METHODS = {
     "item/agentMessage/delta",
     "item/reasoning/summaryTextDelta",
+    "item/reasoning/summaryPartAdded",
+    "hook/started",
+    "hook/completed",
     "thread/tokenUsage/updated",
     "thread/status/changed",
 }
 _CODEX_IGNORED_METHODS = {
     "rawResponseItem/completed",
+    "rawResponse/completed",
     "mcpServer/startupStatus/updated",
     "remoteControl/status/changed",
     "thread/settings/updated",
     "thread/goal/cleared",
+    "turn/moderationMetadata",
 }
 _CODEX_APPROVAL_METHODS = {
     "item/commandExecution/requestApproval",
@@ -89,6 +99,46 @@ def _codex_state(payload: dict[str, Any]) -> LifecycleState | None:
     return None
 
 
+def _codex_moderation_flags(params: object) -> list[str]:
+    """Extract active flags from Codex's nested moderation metadata payloads."""
+
+    if not isinstance(params, dict):
+        return []
+    flags: list[str] = []
+
+    def walk(value: object, *, in_flag_map: bool = False) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key == "is_blocked" and child is True:
+                    flags.append("blocked")
+                    continue
+                is_flag_map = in_flag_map or key in {"flag", "flags", "category_flags", "labels"}
+                if is_flag_map and isinstance(child, bool):
+                    if child and key.lower() != "safe":
+                        flags.append(key)
+                elif is_flag_map and isinstance(child, str) and child.lower() != "safe":
+                    flags.append(child)
+                elif isinstance(child, (dict, list)):
+                    walk(child, in_flag_map=is_flag_map)
+            return
+        if isinstance(value, list):
+            for child in value:
+                if isinstance(child, dict):
+                    name = child.get("flag") or child.get("name") or child.get("type")
+                    if isinstance(name, str) and name and name.lower() != "safe":
+                        flags.append(name)
+                    walk(child, in_flag_map=in_flag_map)
+                elif isinstance(child, str) and child.lower() != "safe":
+                    flags.append(child)
+
+    walk(params)
+    return list(dict.fromkeys(flags))
+
+
+def _codex_moderation_is_warning(params: object) -> bool:
+    return bool(_codex_moderation_flags(params))
+
+
 def _normalize_codex(payload: dict[str, Any]) -> NormalizedProviderEvent:
     method = payload.get("method")
     lifecycle = _codex_state(payload)
@@ -107,6 +157,9 @@ def _normalize_codex(payload: dict[str, Any]) -> NormalizedProviderEvent:
     elif method == "serverRequest/resolved":
         disposition = EventDisposition.RENDERED
         kind = "approval_resolved"
+    elif method == "turn/moderationMetadata" and _codex_moderation_is_warning(params):
+        disposition = EventDisposition.RENDERED
+        kind = "turn_moderationMetadata_warning"
     elif method in _CODEX_RENDERED_METHODS:
         disposition = EventDisposition.RENDERED
         kind = str(method).replace("/", "_")

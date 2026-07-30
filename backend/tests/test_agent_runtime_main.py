@@ -44,6 +44,7 @@ class FakeSupervisorClient:
         self.messages: list[dict[str, str]] = []
         self.normalized_events: list[dict[str, Any]] = []
         self.raw_events: list[dict[str, Any]] = []
+        self.current_turn_diff: dict[str, Any] | None = None
         self.pending_requests: list[dict[str, Any]] = []
         self.fail_unavailable = False
         self.rotation_error: SupervisorRemoteError | None = None
@@ -263,6 +264,7 @@ class FakeSupervisorClient:
                     "unknown": 0,
                 },
                 "pending_requests": list(self.pending_requests),
+                "current_turn_diff": self.current_turn_diff,
                 "events": normalized,
                 "raw": raw if values.get("include_raw") else None,
             }
@@ -853,6 +855,11 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
                 "payload": normalized_event["payload"],
             }
         ]
+        self.client.current_turn_diff = {
+            "turn_id": "turn-1",
+            "seq": 1,
+            "diff": "diff --git a/current.txt b/current.txt",
+        }
 
         payload = main.agent_session("WIKI-42")
         inspector = cast(dict[str, Any], payload["provider_inspector"])
@@ -864,6 +871,7 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(inspector["normalized_count"], 1)
         self.assertEqual(inspector["dispositions"]["rendered"], 1)
         self.assertEqual(inspector["events"][0]["kind"], "approval")
+        self.assertEqual(inspector["current_turn_diff"]["turn_id"], "turn-1")
         self.assertEqual(inspector["pending_requests"][0]["request_id"], 0)
 
         raw = main.agent_provider_events(

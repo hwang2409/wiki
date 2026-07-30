@@ -69,6 +69,9 @@ def _payload(kind: str) -> dict:
                 "flags": [True, False, True],
             },
         },
+        "pdf": {
+            "data_base64": base64.b64encode(b"%PDF-1.4\n%fixture bytes\n").decode(),
+        },
     }[kind]
 
 
@@ -120,6 +123,20 @@ class WikiArtifactsTests(unittest.TestCase):
                     )
                     self.assertEqual(image.read_bytes(), b"fixture-png")
                     self.assertEqual(image.stat().st_mode & 0o777, 0o600)
+                elif kind == "pdf":
+                    self.assertNotIn("data_base64", event["artifact"])
+                    self.assertNotIn("path", event["artifact"])
+                    self.assertEqual(event["artifact"]["mime"], wiki_artifacts.PDF_MIME)
+                    pdf = (
+                        self.root
+                        / "runtime"
+                        / "runs"
+                        / RUN_ID
+                        / "artifacts"
+                        / f"{event['id']}.pdf"
+                    )
+                    self.assertTrue(pdf.read_bytes().startswith(b"%PDF-"))
+                    self.assertEqual(pdf.stat().st_mode & 0o777, 0o600)
                 else:
                     for key, value in _payload(kind).items():
                         self.assertEqual(event["artifact"][key], value)
@@ -138,6 +155,7 @@ class WikiArtifactsTests(unittest.TestCase):
             "diff": {},
             "file-list": {"files": [{"label": "missing path"}]},
             "json": {},
+            "pdf": {"data_base64": base64.b64encode(b"not a pdf").decode()},
         }
         for kind, payload in malformed.items():
             with self.subTest(kind=kind), self.assertRaises(
@@ -419,6 +437,223 @@ class WikiArtifactsTests(unittest.TestCase):
             / f"{event['id']}.png"
         )
         self.assertEqual(target.read_bytes(), b"fixture-png")
+
+    def test_pdf_accepts_base64_and_path_payload_variants(self) -> None:
+        pdf_bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n"
+
+        base_event = wiki_artifacts.render_artifact(
+            {
+                "kind": "pdf",
+                "title": "Base64 PDF",
+                "payload": {"data_base64": base64.b64encode(pdf_bytes).decode()},
+            }
+        )
+        self.assertEqual(base_event["artifact"]["mime"], wiki_artifacts.PDF_MIME)
+        self.assertEqual(base_event["artifact"]["byte_size"], len(pdf_bytes))
+
+        # Path variant: source must live under an allowed root (runtime dir here).
+        (self.root / "runtime").mkdir(exist_ok=True)
+        source = self.root / "runtime" / "source.pdf"
+        source.write_bytes(pdf_bytes)
+        path_event = wiki_artifacts.render_artifact(
+            {"kind": "pdf", "payload": {"path": str(source)}}
+        )
+        stored = (
+            self.root
+            / "runtime"
+            / "runs"
+            / RUN_ID
+            / "artifacts"
+            / f"{path_event['id']}.pdf"
+        )
+        self.assertEqual(stored.read_bytes(), pdf_bytes)
+
+    def test_pdf_path_outside_allowed_roots_is_rejected(self) -> None:
+        pdf_bytes = b"%PDF-1.4\ncontent\n"
+        outside_root = self.root.parent / "outside-tree"
+        outside_root.mkdir(exist_ok=True)
+        outside = outside_root / "leaked.pdf"
+        outside.write_bytes(pdf_bytes)
+        try:
+            with self.assertRaisesRegex(
+                wiki_artifacts.ArtifactValidationError, "outside the allowed roots"
+            ):
+                wiki_artifacts.render_artifact(
+                    {"kind": "pdf", "payload": {"path": str(outside)}}
+                )
+        finally:
+            outside.unlink(missing_ok=True)
+            try:
+                outside_root.rmdir()
+            except OSError:
+                pass
+
+    def test_pdf_path_refused_when_no_allowed_roots_configured(self) -> None:
+        pdf_bytes = b"%PDF-1.4\nsource\n"
+        source = self.root / "runtime" / "keep.pdf"
+        source.parent.mkdir(exist_ok=True)
+        source.write_bytes(pdf_bytes)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "WIKI_VAULT_DIR": "",
+                "WIKI_AGENT_RUNTIME_DIR": "",
+                "WIKI_AGENT_ARCHIVE_DIR": "",
+                "WIKI_RUN_ID": RUN_ID,
+            },
+            clear=False,
+        ):
+            os.environ.pop("WIKI_VAULT_DIR", None)
+            os.environ.pop("WIKI_AGENT_RUNTIME_DIR", None)
+            os.environ.pop("WIKI_AGENT_ARCHIVE_DIR", None)
+            with self.assertRaisesRegex(
+                wiki_artifacts.ArtifactValidationError, "no allowed roots configured"
+            ):
+                wiki_artifacts._read_pdf_path(str(source))
+
+    def test_pdf_rejects_ambiguous_and_unsafe_payloads(self) -> None:
+        pdf_bytes = b"%PDF-1.4\nx\n"
+        with self.assertRaises(wiki_artifacts.ArtifactValidationError):
+            wiki_artifacts.render_artifact(
+                {
+                    "kind": "pdf",
+                    "payload": {
+                        "data_base64": base64.b64encode(pdf_bytes).decode(),
+                        "path": "/etc/passwd",
+                    },
+                }
+            )
+        with self.assertRaises(wiki_artifacts.ArtifactValidationError):
+            wiki_artifacts.render_artifact({"kind": "pdf", "payload": {}})
+        with self.assertRaises(wiki_artifacts.ArtifactValidationError):
+            wiki_artifacts.render_artifact(
+                {"kind": "pdf", "payload": {"path": "relative/path.pdf"}}
+            )
+        symlink_target = self.root / "symlinked.pdf"
+        real = self.root / "real.pdf"
+        real.write_bytes(pdf_bytes)
+        try:
+            symlink_target.symlink_to(real)
+        except OSError:  # symlinks unsupported in this environment
+            return
+        with self.assertRaises(wiki_artifacts.ArtifactValidationError):
+            wiki_artifacts.render_artifact(
+                {"kind": "pdf", "payload": {"path": str(symlink_target)}}
+            )
+
+    def test_read_fd_bounded_rejects_files_that_exceed_the_cap(self) -> None:
+        payload = b"%PDF-1.4\n" + b"z" * (wiki_artifacts.PDF_LIMIT + 1)
+        source = self.root / "runtime" / "grown.pdf"
+        source.parent.mkdir(exist_ok=True)
+        source.write_bytes(payload)
+        fd = os.open(source, os.O_RDONLY)
+        try:
+            with self.assertRaisesRegex(
+                wiki_artifacts.ArtifactValidationError, "MB pdf limit"
+            ):
+                wiki_artifacts._read_fd_bounded(fd, wiki_artifacts.PDF_LIMIT)
+        finally:
+            os.close(fd)
+
+    def test_pdf_path_refuses_intermediate_directory_symlink(self) -> None:
+        # Race-real TOCTOU: prime a legitimate path, then swap an
+        # intermediate directory for a symlink pointing outside the root
+        # AFTER validation (resolve + allow-root check) has already
+        # accepted the path but BEFORE the walker opens it. The walker's
+        # dir_fd + O_NOFOLLOW per-component open MUST refuse; a single
+        # O_NOFOLLOW on the leaf would happily follow the intermediate hop.
+        pdf_bytes = b"%PDF-1.4\nallowed\n"
+        outside_bytes = b"%PDF-1.4\nSECRET-OUTSIDE\n"
+        runtime = self.root / "runtime"
+        runtime.mkdir(exist_ok=True)
+        legit_parent = runtime / "reports"
+        legit_parent.mkdir(exist_ok=True)
+        legit_file = legit_parent / "doc.pdf"
+        legit_file.write_bytes(pdf_bytes)
+        # Sanity: happy path still reads through the walker.
+        self.assertEqual(wiki_artifacts._read_pdf_path(str(legit_file)), pdf_bytes)
+
+        outside_root = self.root.parent / "outside-tree-intermediate"
+        outside_root.mkdir(exist_ok=True)
+        outside_file = outside_root / "doc.pdf"
+        outside_file.write_bytes(outside_bytes)
+
+        # Intercept _open_root_fd so the swap happens AFTER validation but
+        # BEFORE the walker opens any component under the root. This is the
+        # real race window the walker must close — without patching a
+        # barrier here the swap would land before resolve() and be caught
+        # by symlink-check on the parent, never exercising the walker.
+        real_open_root = wiki_artifacts._open_root_fd
+
+        def swap_then_open_root(root):
+            os.rename(legit_parent, runtime / "reports.tmp")
+            try:
+                os.symlink(outside_root, legit_parent)
+            except OSError:
+                # If symlink creation fails, undo the rename and skip.
+                os.rename(runtime / "reports.tmp", legit_parent)
+                raise
+            return real_open_root(root)
+
+        try:
+            with mock.patch.object(
+                wiki_artifacts, "_open_root_fd", side_effect=swap_then_open_root
+            ):
+                with self.assertRaises(wiki_artifacts.ArtifactValidationError):
+                    wiki_artifacts._read_pdf_path(str(legit_file))
+        finally:
+            try:
+                legit_parent.unlink()
+            except OSError:
+                pass
+            try:
+                os.rename(runtime / "reports.tmp", legit_parent)
+            except OSError:
+                pass
+            outside_file.unlink(missing_ok=True)
+            try:
+                outside_root.rmdir()
+            except OSError:
+                pass
+
+    def test_pdf_path_rejects_non_regular_files(self) -> None:
+        fifo = self.root / "runtime" / "pipe.pdf"
+        fifo.parent.mkdir(exist_ok=True)
+        try:
+            os.mkfifo(fifo)
+        except (AttributeError, OSError):  # not all filesystems support fifos
+            return
+        try:
+            with self.assertRaisesRegex(
+                wiki_artifacts.ArtifactValidationError, "regular file"
+            ):
+                wiki_artifacts._read_pdf_path(str(fifo))
+        finally:
+            fifo.unlink(missing_ok=True)
+
+    def test_stdio_server_rejects_oversized_transport_line(self) -> None:
+        # Craft a line larger than MAX_REQUEST_BYTES, followed by a well-formed
+        # request. The server should drain the giant line, respond with a
+        # transport error, and still process the trailing request.
+        garbage = b"x" * (wiki_artifacts.MAX_REQUEST_BYTES + 4096)
+        good = json.dumps(
+            {"jsonrpc": "2.0", "id": 99, "method": "tools/list", "params": {}}
+        ).encode() + b"\n"
+        env = os.environ.copy()
+        process = subprocess.run(
+            [sys.executable, "-m", "backend.app.wiki_artifacts"],
+            input=garbage + b"\n" + good,
+            capture_output=True,
+            env=env,
+            timeout=10,
+            check=True,
+        )
+        responses = [json.loads(line) for line in process.stdout.splitlines()]
+        self.assertEqual(len(responses), 2)
+        self.assertEqual(responses[0]["id"], None)
+        self.assertIn("transport limit", responses[0]["error"]["message"])
+        self.assertEqual(responses[1]["id"], 99)
+        self.assertIn("tools", responses[1]["result"])
 
     def test_storage_failure_returns_a_tool_error_without_crashing_server(self) -> None:
         with mock.patch.object(wiki_artifacts, "render_artifact", side_effect=OSError("disk full")):

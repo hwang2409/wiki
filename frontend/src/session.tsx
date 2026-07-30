@@ -95,6 +95,7 @@ import { createStateKeyWriteBarrier, deletePaneStateEntries } from "./pane-state
 import { Timestamp } from "./timestamp";
 import { StatusBadge } from "./status-badge";
 import { BoundedPreview } from "./transcript-preview";
+import { CodexStreamHighlights } from "./codex-stream-renderers";
 import { markerRule } from "./hook-message-registry";
 import type { MarkerSeverity } from "./hook-message-registry";
 import {
@@ -968,6 +969,16 @@ function ProviderStreamInspector({
           {inspector.provider} · {inspector.state}
         </span>
       </button>
+      {inspector.provider === "codex" ? (
+        <CodexStreamHighlights
+          events={inspector.events}
+          currentTurnDiff={
+            inspector.current_turn_diff === undefined
+              ? undefined
+              : inspector.current_turn_diff?.diff ?? null
+          }
+        />
+      ) : null}
       {open ? (
         <div className="session-provider-inspector-body">
           {pendingRequests.map((request) => (

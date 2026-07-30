@@ -3004,6 +3004,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 "composer_messages": [
                     dict(message) for message in record.composer_messages
                 ],
+                "current_turn_diff": self.store.current_turn_diff(run_id),
                 "events": self.store.read_normalized_events(
                     run_id,
                     after_seq=after_seq,

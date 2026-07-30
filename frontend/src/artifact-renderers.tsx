@@ -10,6 +10,11 @@ import type {
 import { classifyArtifact } from "./artifact-kind";
 import { ArtifactError, ArtifactPlaceholder } from "./artifact-state";
 import { DiffPatchView } from "./diff-view";
+import {
+  loadPdfFromUrl,
+  renderPageToCanvas,
+  type LoadedPdf,
+} from "./pdfjs-runtime";
 import { ShikiCode, useCurrentTheme } from "./shiki";
 import { StatusBadge, statusToTone } from "./status-badge";
 
@@ -630,6 +635,133 @@ export function TableCopyMenu({ artifact, onCopied }: { artifact: SessionArtifac
   );
 }
 
+const PDF_INLINE_WIDTH = 320;
+
+type PdfLoadState =
+  | { status: "loading" }
+  | { status: "ready"; pdf: LoadedPdf; aspect: number }
+  | { status: "error"; message: string };
+
+export function usePdfDocument(url: string): {
+  state: PdfLoadState;
+  reload: () => void;
+} {
+  const [state, setState] = useState<PdfLoadState>({ status: "loading" });
+  const [nonce, setNonce] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    let current: LoadedPdf | null = null;
+    setState({ status: "loading" });
+    (async () => {
+      try {
+        const pdf = await loadPdfFromUrl(url);
+        if (cancelled) {
+          await pdf.destroy();
+          return;
+        }
+        current = pdf;
+        const first = await pdf.doc.getPage(1);
+        let aspect: number;
+        try {
+          const viewport = first.getViewport({ scale: 1 });
+          aspect = viewport.height / viewport.width;
+        } finally {
+          first.cleanup?.();
+        }
+        if (cancelled) return;
+        setState({ status: "ready", pdf, aspect });
+      } catch (error) {
+        if (cancelled) return;
+        setState({
+          status: "error",
+          message: error instanceof Error ? error.message : "Failed to load PDF.",
+        });
+      }
+    })();
+    return () => {
+      cancelled = true;
+      current?.destroy().catch(() => {});
+    };
+  }, [nonce, url]);
+  return { state, reload: () => setNonce((value) => value + 1) };
+}
+
+export function PdfCompactRenderer({
+  event,
+  ticket,
+}: {
+  event: SessionEvent;
+  ticket: string;
+}) {
+  const url = artifactUrl(ticket, event);
+  const { state, reload } = usePdfDocument(url);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  useEffect(() => {
+    if (state.status !== "ready") return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    let cancelled = false;
+    let active: { cancel: () => void } | null = null;
+    (async () => {
+      let page: import("pdfjs-dist").PDFPageProxy | null = null;
+      try {
+        page = await state.pdf.doc.getPage(1);
+        const baseViewport = page.getViewport({ scale: 1 });
+        const scale = PDF_INLINE_WIDTH / baseViewport.width;
+        if (cancelled) return;
+        const render = renderPageToCanvas(page, canvas, scale, window.devicePixelRatio || 1);
+        active = render;
+        await render.promise;
+      } catch {
+        // Retry surfaces the error via reload button.
+      } finally {
+        // Release the compact-preview page proxy in every exit path so
+        // pdf.js doesn't retain a page-1 handle per compact renderer.
+        page?.cleanup?.();
+      }
+    })();
+    return () => {
+      cancelled = true;
+      active?.cancel();
+    };
+  }, [state]);
+
+  if (state.status === "error") {
+    return (
+      <ArtifactError
+        detail={state.message}
+        onRetry={reload}
+        title="PDF failed to load."
+      />
+    );
+  }
+  const aspect = state.status === "ready" ? state.aspect : 1.294; // ~US Letter default
+  const height = Math.round(PDF_INLINE_WIDTH * aspect);
+  return (
+    <div className="artifact-pdf-compact" style={{ width: PDF_INLINE_WIDTH }}>
+      <div
+        className="artifact-pdf-compact-frame"
+        style={{ width: PDF_INLINE_WIDTH, height }}
+      >
+        {state.status === "loading" ? (
+          <ArtifactPlaceholder label="Loading PDF…" shape="image" />
+        ) : (
+          <canvas
+            aria-label={event.title || event.caption || "PDF first page thumbnail"}
+            className="artifact-pdf-compact-canvas"
+            ref={canvasRef}
+          />
+        )}
+      </div>
+      {state.status === "ready" ? (
+        <div className="artifact-pdf-compact-meta tabular-nums">
+          page 1 of {state.pdf.numPages}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 export function ArtifactRenderer(props: ArtifactRendererProps): ReactNode {
   const { artifact } = props;
   const effectiveKind = classifyArtifact(artifact);
@@ -652,6 +784,8 @@ export function ArtifactRenderer(props: ArtifactRendererProps): ReactNode {
       return <JsonRenderer artifact={artifact} />;
     case "code":
       return <CodeRenderer artifact={artifact} />;
+    case "pdf":
+      return <PdfCompactRenderer event={props.event} ticket={props.ticket} />;
   }
 }
 
@@ -712,6 +846,9 @@ export function CompactPreview({ artifact, event, onRenderError, ticket }: Artif
         <span className="artifact-compact-diagram-hint">Diagram continues · Click to inspect</span>
       </div>
     );
+  }
+  if (effectiveKind === "pdf") {
+    return <PdfCompactRenderer event={event} ticket={ticket} />;
   }
   return <ArtifactRenderer artifact={artifact} event={event} ticket={ticket} />;
 }

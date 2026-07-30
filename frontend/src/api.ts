@@ -510,6 +510,11 @@ export type ProviderEventInspector = {
   normalized_count: number;
   dispositions: SessionDispositionCounts;
   pending_requests: ProviderPendingRequest[];
+  current_turn_diff?: {
+    turn_id: string | null;
+    seq: number;
+    diff: string;
+  } | null;
   events: ProviderStreamEvent[];
   raw?: ProviderRawEvent[] | null;
 };
@@ -523,7 +528,8 @@ export type ArtifactKind =
   | "code"
   | "diff"
   | "file-list"
-  | "json";
+  | "json"
+  | "pdf";
 
 export type ArtifactFileEntry = {
   path: string;
@@ -946,6 +952,64 @@ export type AgentWorkgraphData = {
 
 export function getAgentWorkgraph(ticket: string) {
   return request<AgentWorkgraphData>(`/api/agents/${encodeURIComponent(ticket)}/workgraph`);
+}
+
+export type AutopilotAction = {
+  action: string;
+  at_ns: number;
+  source: "autopilot";
+  findings?: Array<Record<string, unknown>>;
+  [key: string]: unknown;
+};
+
+export type AutopilotState = {
+  ticket?: string;
+  enabled: boolean;
+  iteration_cap: number;
+  plateau_guard: number;
+  henry_ack_required_for_merge: boolean;
+  last_action_at_ns: number;
+  halted: string | null;
+  merge_ack_at_ns: number | null;
+  merge_ack_sha?: string | null;
+  actions: AutopilotAction[];
+};
+
+export type AutopilotFleetStatus = {
+  tickets: Record<string, AutopilotState>;
+  enabled: number;
+  halted: number;
+  actions_last_hour: number;
+};
+
+export function getAutopilotStatus(ticket: string) {
+  return request<AutopilotState>(`/api/autopilot/${encodeURIComponent(ticket)}`);
+}
+
+export function getAutopilotFleetStatus(signal?: AbortSignal) {
+  return request<AutopilotFleetStatus>(
+    "/api/autopilot",
+    signal ? { signal } : undefined,
+  );
+}
+
+export function setAutopilotEnabled(ticket: string, enabled: boolean, henryAckRequired = false) {
+  return request<AutopilotState>(
+    `/api/autopilot/${encodeURIComponent(ticket)}/${enabled ? "enable" : "disable"}`,
+    enabled
+      ? {
+          method: "POST",
+          body: JSON.stringify({ henry_ack_required_for_merge: henryAckRequired }),
+        }
+      : { method: "POST" },
+  );
+}
+
+export function ackAutopilotMerge(ticket: string) {
+  return request<AutopilotState>(
+    `/api/autopilot/${encodeURIComponent(ticket)}/ack-merge`,
+    { method: "POST" },
+  );
 }
 
 export type FleetGraphTicket = {
