@@ -33,6 +33,20 @@ def _fixture_png_bytes() -> bytes:
 FIXTURE_PNG_BYTES = _fixture_png_bytes()
 
 
+def _fixture_mp4_bytes() -> bytes:
+    from backend.tests.test_media_scrub import _minimal_mp4  # local fixture
+    return _minimal_mp4(with_gps=False)
+
+
+def _fixture_wav_bytes() -> bytes:
+    from backend.tests.test_media_scrub import _wav_bytes
+    return _wav_bytes()
+
+
+FIXTURE_MP4_BYTES = _fixture_mp4_bytes()
+FIXTURE_WAV_BYTES = _fixture_wav_bytes()
+
+
 def _payload(kind: str) -> dict:
     return {
         "mermaid": {"source": "graph TD; A-->B"},
@@ -87,6 +101,14 @@ def _payload(kind: str) -> dict:
         },
         "pdf": {
             "data_base64": base64.b64encode(b"%PDF-1.4\n%fixture bytes\n").decode(),
+        },
+        "video": {
+            "data_base64": base64.b64encode(FIXTURE_MP4_BYTES).decode(),
+            "mime": "video/mp4",
+        },
+        "audio": {
+            "data_base64": base64.b64encode(FIXTURE_WAV_BYTES).decode(),
+            "mime": "audio/wav",
         },
     }[kind]
 
@@ -157,6 +179,35 @@ class WikiArtifactsTests(unittest.TestCase):
                     )
                     self.assertTrue(pdf.read_bytes().startswith(b"%PDF-"))
                     self.assertEqual(pdf.stat().st_mode & 0o777, 0o600)
+                elif kind == "video":
+                    self.assertNotIn("data_base64", event["artifact"])
+                    self.assertEqual(event["artifact"]["mime"], "video/mp4")
+                    self.assertEqual(event["artifact"]["duration_ms"], 2500)
+                    self.assertEqual(event["artifact"]["width"], 320)
+                    self.assertEqual(event["artifact"]["height"], 240)
+                    video = (
+                        self.root
+                        / "runtime"
+                        / "runs"
+                        / RUN_ID
+                        / "artifacts"
+                        / f"{event['id']}.mp4"
+                    )
+                    self.assertTrue(video.read_bytes()[4:8] == b"ftyp")
+                    self.assertEqual(video.stat().st_mode & 0o777, 0o600)
+                elif kind == "audio":
+                    self.assertNotIn("data_base64", event["artifact"])
+                    self.assertEqual(event["artifact"]["mime"], "audio/wav")
+                    audio = (
+                        self.root
+                        / "runtime"
+                        / "runs"
+                        / RUN_ID
+                        / "artifacts"
+                        / f"{event['id']}.wav"
+                    )
+                    self.assertTrue(audio.read_bytes().startswith(b"RIFF"))
+                    self.assertEqual(audio.stat().st_mode & 0o777, 0o600)
                 else:
                     for key, value in _payload(kind).items():
                         self.assertEqual(event["artifact"][key], value)
@@ -176,6 +227,14 @@ class WikiArtifactsTests(unittest.TestCase):
             "file-list": {"files": [{"label": "missing path"}]},
             "json": {},
             "pdf": {"data_base64": base64.b64encode(b"not a pdf").decode()},
+            "video": {
+                "data_base64": base64.b64encode(b"not a video").decode(),
+                "mime": "video/mp4",
+            },
+            "audio": {
+                "data_base64": base64.b64encode(b"not audio").decode(),
+                "mime": "audio/wav",
+            },
         }
         for kind, payload in malformed.items():
             with self.subTest(kind=kind), self.assertRaises(
@@ -216,6 +275,60 @@ class WikiArtifactsTests(unittest.TestCase):
                     "payload": {"data_base64": image, "mime": "image/png"},
                 }
             )
+
+        video = base64.b64encode(b"x" * (wiki_artifacts.VIDEO_LIMIT + 1)).decode()
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError, "40MB video limit"
+        ):
+            wiki_artifacts.render_artifact(
+                {
+                    "kind": "video",
+                    "payload": {"data_base64": video, "mime": "video/mp4"},
+                }
+            )
+
+        audio = base64.b64encode(b"x" * (wiki_artifacts.AUDIO_LIMIT + 1)).decode()
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError, "20MB audio limit"
+        ):
+            wiki_artifacts.render_artifact(
+                {
+                    "kind": "audio",
+                    "payload": {"data_base64": audio, "mime": "audio/wav"},
+                }
+            )
+
+    def test_video_rejects_wrong_mime(self) -> None:
+        payload = {
+            "data_base64": base64.b64encode(FIXTURE_MP4_BYTES).decode(),
+            "mime": "application/octet-stream",
+        }
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError, "payload.mime must be one of"
+        ):
+            wiki_artifacts.render_artifact({"kind": "video", "payload": payload})
+
+    def test_audio_transcript_length_is_capped(self) -> None:
+        payload = {
+            "data_base64": base64.b64encode(FIXTURE_WAV_BYTES).decode(),
+            "mime": "audio/wav",
+            "transcript": "x" * (wiki_artifacts.TEXT_LIMIT + 1),
+        }
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError, "audio transcript exceeds"
+        ):
+            wiki_artifacts.render_artifact({"kind": "audio", "payload": payload})
+
+    def test_audio_transcript_flows_through(self) -> None:
+        payload = {
+            "data_base64": base64.b64encode(FIXTURE_WAV_BYTES).decode(),
+            "mime": "audio/wav",
+            "transcript": "hello from the fixture",
+        }
+        event = wiki_artifacts.render_artifact(
+            {"kind": "audio", "payload": payload}
+        )
+        self.assertEqual(event["artifact"]["transcript"], "hello from the fixture")
 
     def test_sentinel_parser_revalidates_text_payload_caps(self) -> None:
         event = {

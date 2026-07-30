@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
-import { ChevronDown, Copy, FileJson, Maximize2 } from "lucide-react";
+import { ChevronDown, Copy, FileJson, Maximize2, Play } from "lucide-react";
 import type {
   ArtifactColumn,
   ArtifactFileEntry,
@@ -869,6 +869,278 @@ export function PdfCompactRenderer({
   );
 }
 
+function usePrefersReducedMotion(): boolean {
+  const [reduced, setReduced] = useState(() => {
+    if (typeof window === "undefined" || !window.matchMedia) return false;
+    return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  });
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.matchMedia) return;
+    const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const handler = () => setReduced(mq.matches);
+    if (typeof mq.addEventListener === "function") {
+      mq.addEventListener("change", handler);
+      return () => mq.removeEventListener("change", handler);
+    }
+    mq.addListener(handler);
+    return () => mq.removeListener(handler);
+  }, []);
+  return reduced;
+}
+
+function formatMediaDuration(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return "";
+  const total = Math.round(seconds);
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const secs = total % 60;
+  const mm = String(minutes).padStart(hours ? 2 : 1, "0");
+  const ss = String(secs).padStart(2, "0");
+  return hours ? `${hours}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+
+const MEDIA_SPEED_OPTIONS: readonly number[] = [0.75, 1, 1.25, 1.5, 2];
+
+function GifRenderer({
+  source,
+  width,
+  height,
+  label,
+}: {
+  source: string;
+  width?: number;
+  height?: number;
+  label: string;
+}) {
+  const reducedMotion = usePrefersReducedMotion();
+  const [playing, setPlaying] = useState(!reducedMotion);
+  useEffect(() => {
+    setPlaying(!reducedMotion);
+  }, [reducedMotion]);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const imgRef = useRef<HTMLImageElement>(null);
+  useEffect(() => {
+    if (playing) return;
+    const img = imgRef.current;
+    const canvas = canvasRef.current;
+    if (!img || !canvas) return;
+    let cancelled = false;
+    const draw = () => {
+      if (cancelled) return;
+      const naturalWidth = img.naturalWidth || width || 0;
+      const naturalHeight = img.naturalHeight || height || 0;
+      if (!naturalWidth || !naturalHeight) return;
+      canvas.width = naturalWidth;
+      canvas.height = naturalHeight;
+      const ctx = canvas.getContext("2d");
+      if (ctx) ctx.drawImage(img, 0, 0);
+    };
+    if (img.complete && img.naturalWidth > 0) {
+      draw();
+    } else {
+      img.addEventListener("load", draw, { once: true });
+    }
+    return () => {
+      cancelled = true;
+      img.removeEventListener("load", draw);
+    };
+  }, [playing, source, width, height]);
+  const ratioStyle: CSSProperties | undefined =
+    width && height ? { aspectRatio: `${width} / ${height}` } : undefined;
+  return (
+    <div className="artifact-video-wrap artifact-gif-wrap" style={ratioStyle}>
+      <img
+        ref={imgRef}
+        src={source}
+        alt={label}
+        className={`artifact-video${playing ? "" : " is-frozen-source"}`}
+        aria-hidden={playing ? undefined : true}
+        decoding="async"
+        loading="lazy"
+        width={width}
+        height={height}
+      />
+      {playing ? null : (
+        <>
+          <canvas
+            ref={canvasRef}
+            className="artifact-video artifact-gif-frozen"
+            aria-label={`${label} (paused)`}
+            role="img"
+          />
+          <button
+            className="artifact-gif-play"
+            onClick={() => setPlaying(true)}
+            type="button"
+            aria-label={`Play ${label}`}
+          >
+            <Play size={16} aria-hidden="true" />
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
+export function VideoRenderer({ artifact, event, ticket }: ArtifactRendererProps) {
+  const source = artifact.data_base64
+    ? `data:${artifact.mime ?? "video/mp4"};base64,${artifact.data_base64}`
+    : artifactUrl(ticket, event);
+  const label = event.title || event.caption || "Video artifact";
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const [speed, setSpeed] = useState(1);
+  useEffect(() => {
+    const node = videoRef.current;
+    if (node) node.playbackRate = speed;
+  }, [speed]);
+  useEffect(() => {
+    return () => {
+      const node = videoRef.current;
+      if (!node) return;
+      node.pause();
+      node.removeAttribute("src");
+      node.load();
+    };
+  }, []);
+  if (artifact.mime === "image/gif") {
+    return (
+      <GifRenderer
+        source={source}
+        width={artifact.width}
+        height={artifact.height}
+        label={label}
+      />
+    );
+  }
+  const ratioStyle: CSSProperties | undefined =
+    artifact.width && artifact.height
+      ? { aspectRatio: `${artifact.width} / ${artifact.height}` }
+      : undefined;
+  const durationSeconds = artifact.duration_ms
+    ? artifact.duration_ms / 1000
+    : undefined;
+  return (
+    <div className="artifact-video-wrap">
+      <div className="artifact-video-frame" style={ratioStyle}>
+        <video
+          ref={videoRef}
+          className="artifact-video"
+          controls
+          controlsList="nodownload"
+          preload="metadata"
+          playsInline
+          aria-label={label}
+          width={artifact.width}
+          height={artifact.height}
+        >
+          <source src={source} type={artifact.mime ?? "video/mp4"} />
+        </video>
+      </div>
+      <div className="artifact-video-controls tabular-nums">
+        {durationSeconds !== undefined ? (
+          <span className="artifact-video-duration">
+            {formatMediaDuration(durationSeconds)}
+          </span>
+        ) : null}
+        <label className="artifact-video-speed">
+          <span>Speed</span>
+          <select
+            aria-label="Playback speed"
+            onChange={(mediaEvent) => setSpeed(Number(mediaEvent.target.value))}
+            value={speed}
+          >
+            {MEDIA_SPEED_OPTIONS.map((option) => (
+              <option key={option} value={option}>
+                {option}x
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+    </div>
+  );
+}
+
+export function AudioRenderer({ artifact, event, ticket }: ArtifactRendererProps) {
+  const source = artifact.data_base64
+    ? `data:${artifact.mime ?? "audio/wav"};base64,${artifact.data_base64}`
+    : artifactUrl(ticket, event);
+  const label = event.title || event.caption || "Audio artifact";
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const [speed, setSpeed] = useState(1);
+  const [showTranscript, setShowTranscript] = useState(false);
+  useEffect(() => {
+    const node = audioRef.current;
+    if (node) node.playbackRate = speed;
+  }, [speed]);
+  useEffect(() => {
+    return () => {
+      const node = audioRef.current;
+      if (!node) return;
+      node.pause();
+      node.removeAttribute("src");
+      node.load();
+    };
+  }, []);
+  const durationSeconds = artifact.duration_ms
+    ? artifact.duration_ms / 1000
+    : undefined;
+  return (
+    <div className="artifact-audio-wrap">
+      <audio
+        ref={audioRef}
+        className="artifact-audio"
+        controls
+        controlsList="nodownload"
+        preload="metadata"
+        aria-label={label}
+      >
+        <source src={source} type={artifact.mime ?? "audio/wav"} />
+      </audio>
+      <div className="artifact-audio-controls tabular-nums">
+        {durationSeconds !== undefined ? (
+          <span className="artifact-audio-duration">
+            {formatMediaDuration(durationSeconds)}
+          </span>
+        ) : null}
+        <label className="artifact-audio-speed">
+          <span>Speed</span>
+          <select
+            aria-label="Playback speed"
+            onChange={(mediaEvent) => setSpeed(Number(mediaEvent.target.value))}
+            value={speed}
+          >
+            {MEDIA_SPEED_OPTIONS.map((option) => (
+              <option key={option} value={option}>
+                {option}x
+              </option>
+            ))}
+          </select>
+        </label>
+        {artifact.transcript ? (
+          <button
+            aria-expanded={showTranscript}
+            className="artifact-audio-transcript-toggle"
+            onClick={() => setShowTranscript((value) => !value)}
+            type="button"
+          >
+            {showTranscript ? "Hide transcript" : "Show transcript"}
+          </button>
+        ) : null}
+      </div>
+      {showTranscript && artifact.transcript ? (
+        <div
+          aria-label="Transcript"
+          className="artifact-audio-transcript"
+          role="region"
+        >
+          {artifact.transcript}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 export function ArtifactRenderer(props: ArtifactRendererProps): ReactNode {
   const { artifact } = props;
   const effectiveKind = classifyArtifact(artifact);
@@ -893,6 +1165,10 @@ export function ArtifactRenderer(props: ArtifactRendererProps): ReactNode {
       return <CodeRenderer artifact={artifact} />;
     case "pdf":
       return <PdfCompactRenderer event={props.event} ticket={props.ticket} />;
+    case "video":
+      return <VideoRenderer {...props} />;
+    case "audio":
+      return <AudioRenderer {...props} />;
   }
 }
 

@@ -15,20 +15,43 @@ from uuid import UUID, uuid4
 from . import knowledge
 from . import wiki_agent_tools
 from .image_scrub import ImageScrubError, scrub_image
+from .media_scrub import (
+    AUDIO_MIMES,
+    MediaScrubError,
+    VIDEO_MIMES,
+    scrub_audio,
+    scrub_video,
+)
 from .pathwalk import open_relative_file
 
 
 TEXT_LIMIT = 100_000
 IMAGE_LIMIT = 5 * 1024 * 1024
 PDF_LIMIT = 25 * 1024 * 1024
+VIDEO_LIMIT = 40 * 1024 * 1024
+AUDIO_LIMIT = 20 * 1024 * 1024
 PDF_MAGIC = b"%PDF-"
 # Transport-level cap on a single MCP request line. Sized to fit the largest
-# base64-encoded PDF payload (4/3 inflation) plus JSON envelope headroom, so
+# base64-encoded video payload (4/3 inflation) plus JSON envelope headroom, so
 # json.loads never sees an unbounded buffer even when a caller sends garbage.
-MAX_REQUEST_BYTES = ((PDF_LIMIT + 2) // 3) * 4 + 64 * 1024
+MEDIA_TRANSPORT_MAX = max(PDF_LIMIT, VIDEO_LIMIT, AUDIO_LIMIT, IMAGE_LIMIT)
+MAX_REQUEST_BYTES = ((MEDIA_TRANSPORT_MAX + 2) // 3) * 4 + 64 * 1024
 SENTINEL_START = "<<wiki-artifact:v1>>"
 SENTINEL_END = "<<end>>"
-ARTIFACT_KINDS = {"mermaid", "svg", "image", "table", "plot", "code", "diff", "file-list", "json", "pdf"}
+ARTIFACT_KINDS = {
+    "mermaid",
+    "svg",
+    "image",
+    "table",
+    "plot",
+    "code",
+    "diff",
+    "file-list",
+    "json",
+    "pdf",
+    "video",
+    "audio",
+}
 IMAGE_TYPES = {
     "image/png": "png",
     "image/jpeg": "jpg",
@@ -429,6 +452,107 @@ def _write_image(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
     return normalized
 
 
+def _decode_media_payload(
+    payload: dict[str, Any],
+    *,
+    kind: str,
+    allowed_mimes: dict[str, str],
+    byte_limit: int,
+    limit_label: str,
+    optional_keys: set[str] = frozenset(),
+) -> tuple[bytes, str]:
+    _require_keys(
+        payload, required={"data_base64", "mime"}, optional=optional_keys
+    )
+    encoded = _require_string(payload["data_base64"], "payload.data_base64")
+    mime = payload["mime"]
+    if mime not in allowed_mimes:
+        raise ArtifactValidationError(
+            f"payload.mime must be one of {sorted(allowed_mimes)!s} for {kind}"
+        )
+    if len(encoded) > ((byte_limit + 2) // 3) * 4 + 4:
+        raise ArtifactValidationError(f"{kind} payload exceeds the {limit_label}")
+    try:
+        data = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ArtifactValidationError("payload.data_base64 is not valid base64") from exc
+    if len(data) > byte_limit:
+        raise ArtifactValidationError(f"{kind} payload exceeds the {limit_label}")
+    return data, mime
+
+
+def _write_video(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
+    data, mime = _decode_media_payload(
+        payload,
+        kind="video",
+        allowed_mimes=VIDEO_MIMES,
+        byte_limit=VIDEO_LIMIT,
+        limit_label=f"{VIDEO_LIMIT // (1024 * 1024)}MB video limit",
+    )
+    try:
+        result = scrub_video(data, mime)
+    except MediaScrubError as exc:
+        raise ArtifactValidationError(f"video payload rejected: {exc}") from exc
+    if len(result.data) > VIDEO_LIMIT:
+        raise ArtifactValidationError(
+            f"video payload exceeds the {VIDEO_LIMIT // (1024 * 1024)}MB video limit"
+        )
+
+    artifact_dir = _artifact_run_dir()
+    _write_binary(artifact_dir, artifact_id, VIDEO_MIMES[mime], result.data)
+    normalized: dict[str, Any] = {
+        "ref": f"artifact://{artifact_id}",
+        "mime": result.mime,
+        "byte_size": len(result.data),
+    }
+    if result.duration_ms is not None:
+        normalized["duration_ms"] = result.duration_ms
+    if result.width is not None:
+        normalized["width"] = result.width
+    if result.height is not None:
+        normalized["height"] = result.height
+    return normalized
+
+
+def _write_audio(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
+    data, mime = _decode_media_payload(
+        payload,
+        kind="audio",
+        allowed_mimes=AUDIO_MIMES,
+        byte_limit=AUDIO_LIMIT,
+        limit_label=f"{AUDIO_LIMIT // (1024 * 1024)}MB audio limit",
+        optional_keys={"transcript"},
+    )
+    try:
+        result = scrub_audio(data, mime)
+    except MediaScrubError as exc:
+        raise ArtifactValidationError(f"audio payload rejected: {exc}") from exc
+    if len(result.data) > AUDIO_LIMIT:
+        raise ArtifactValidationError(
+            f"audio payload exceeds the {AUDIO_LIMIT // (1024 * 1024)}MB audio limit"
+        )
+
+    artifact_dir = _artifact_run_dir()
+    _write_binary(artifact_dir, artifact_id, AUDIO_MIMES[mime], result.data)
+    normalized: dict[str, Any] = {
+        "ref": f"artifact://{artifact_id}",
+        "mime": result.mime,
+        "byte_size": len(result.data),
+    }
+    if result.duration_ms is not None:
+        normalized["duration_ms"] = result.duration_ms
+    transcript = payload.get("transcript")
+    if transcript is not None:
+        if not isinstance(transcript, str):
+            raise ArtifactValidationError("payload.transcript must be a string")
+        if len(transcript) > TEXT_LIMIT:
+            raise ArtifactValidationError(
+                f"audio transcript exceeds the {TEXT_LIMIT // 1000}KB text limit"
+            )
+        normalized["transcript"] = transcript
+    return normalized
+
+
 def render_artifact(arguments: Any) -> dict[str, Any]:
     if not isinstance(arguments, dict):
         raise ArtifactValidationError("tool input must be an object")
@@ -455,6 +579,10 @@ def render_artifact(arguments: Any) -> dict[str, Any]:
         artifact.update(_write_image(payload, artifact_id))
     elif kind == "pdf":
         artifact.update(_write_pdf(payload, artifact_id))
+    elif kind == "video":
+        artifact.update(_write_video(payload, artifact_id))
+    elif kind == "audio":
+        artifact.update(_write_audio(payload, artifact_id))
     else:
         artifact.update(_validate_text_payload(kind, payload))
     event: dict[str, Any] = {
@@ -502,7 +630,7 @@ def artifact_from_text(value: Any) -> dict[str, Any] | None:
         ):
             return None
     kind = artifact["kind"]
-    if kind not in {"image", "pdf"}:
+    if kind not in {"image", "pdf", "video", "audio"}:
         payload = {key: item for key, item in artifact.items() if key != "kind"}
         try:
             _validate_text_payload(kind, payload)

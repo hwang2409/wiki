@@ -648,7 +648,9 @@ export type ArtifactKind =
   | "diff"
   | "file-list"
   | "json"
-  | "pdf";
+  | "pdf"
+  | "video"
+  | "audio";
 
 export type ArtifactFileEntry = {
   path: string;
@@ -667,12 +669,24 @@ export type SessionArtifact = {
   kind: ArtifactKind;
   source?: string;
   ref?: string;
-  mime?: "image/png" | "image/jpeg" | "image/webp";
+  mime?:
+    | "image/png"
+    | "image/jpeg"
+    | "image/webp"
+    | "image/gif"
+    | "video/mp4"
+    | "video/webm"
+    | "audio/wav"
+    | "audio/mpeg"
+    | "audio/webm"
+    | "audio/ogg";
   byte_size?: number;
   data_base64?: string;
   width?: number;
   height?: number;
   preview_base64?: string;
+  duration_ms?: number;
+  transcript?: string;
   columns?: ArtifactColumn[];
   rows?: (string | number | boolean | null)[][];
   spec_vega_lite?: Record<string, unknown>;

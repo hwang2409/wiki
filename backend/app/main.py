@@ -3781,6 +3781,13 @@ ARTIFACT_MEDIA_TYPES = {
     "jpg": "image/jpeg",
     "webp": "image/webp",
     "pdf": "application/pdf",
+    "mp4": "video/mp4",
+    "webm": "video/webm",
+    "gif": "image/gif",
+    "wav": "audio/wav",
+    "mp3": "audio/mpeg",
+    "weba": "audio/webm",
+    "ogg": "audio/ogg",
 }
 
 

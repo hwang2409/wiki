@@ -9,9 +9,11 @@ import {
   GitBranch,
   Image as ImageIcon,
   Info,
+  Music,
   PanelRightOpen,
   Shapes,
   Table2,
+  Video,
   X,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
@@ -50,6 +52,8 @@ const KIND_ICONS: Record<ArtifactKind, LucideIcon> = {
   "file-list": FileJson,
   json: FileJson,
   pdf: FileText,
+  video: Video,
+  audio: Music,
 };
 
 
@@ -73,6 +77,8 @@ function textPayload(artifact: SessionArtifact): string {
         ? artifact.json_data
         : JSON.stringify(artifact.json_data ?? {}, null, 2);
     case "pdf":
+    case "video":
+    case "audio":
       return artifact.ref ?? "";
   }
 }
@@ -98,6 +104,20 @@ function downloadName(event: SessionEvent): string {
   if (effectiveKind === "code" && artifact.filename) {
     return artifact.filename.split(/[\\/]/).pop() || `${base}.txt`;
   }
+  const videoExtension =
+    artifact.mime === "image/gif"
+      ? "gif"
+      : artifact.mime === "video/webm"
+        ? "webm"
+        : "mp4";
+  const audioExtension =
+    artifact.mime === "audio/mpeg"
+      ? "mp3"
+      : artifact.mime === "audio/webm"
+        ? "weba"
+        : artifact.mime === "audio/ogg"
+          ? "ogg"
+          : "wav";
   const extension = {
     mermaid: "mmd",
     svg: "svg",
@@ -109,6 +129,8 @@ function downloadName(event: SessionEvent): string {
     "file-list": "txt",
     json: "json",
     pdf: "pdf",
+    video: videoExtension,
+    audio: audioExtension,
   }[effectiveKind];
   return `${base}.${extension}`;
 }
@@ -161,6 +183,8 @@ export function artifactExceedsInlineThreshold(
       return text.length > 4000;
     }
     case "pdf": return true;
+    case "video": return false;
+    case "audio": return false;
   }
 }
 
