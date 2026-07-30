@@ -16,6 +16,7 @@ from backend.app.native_lifecycle import (
     hold_app_lock,
     hold_runtime_locks,
 )
+from backend.app.agent_runtime.store import RuntimePaths
 import scripts.atomic_swap as atomic_swap_module
 import scripts.native_swap_transaction as native_swap_transaction
 from scripts.atomic_swap import atomic_replace, rollback_replace
@@ -374,6 +375,7 @@ class NativeBuildGuardTests(TestCase):
                     "agent_id": "WIKI-CRASH-RECOVERY",
                     "run_id": "run-crash-recovery",
                     "provider_session_id": "session-crash-recovery",
+                    "state": "idle",
                 }
             ]
             handover_client = Mock()
@@ -433,6 +435,77 @@ class NativeBuildGuardTests(TestCase):
             )
             self.assertEqual(verified, [saved_runs])
             self.assertFalse(stage_root.exists())
+
+    def test_starting_attached_run_aborts_before_drain_or_handover_journal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage_root = root / "stage"
+            live = root / "src-tauri/target/release/bundle/macos/Wiki.app"
+            staged = stage_root / "target/release/bundle/macos/Wiki.app"
+            runtime = root / "runtime"
+            stage_root.mkdir(parents=True)
+            live.mkdir(parents=True)
+            staged.mkdir(parents=True)
+            runtime.mkdir()
+            (runtime / "app.lock").touch()
+            (live / "marker").write_text("old", encoding="utf-8")
+            (staged / "marker").write_text("new", encoding="utf-8")
+            starting = {
+                "agent_id": "WIKI-STARTING",
+                "run_id": "run-starting",
+                "state": "starting",
+                "provider_session_id": None,
+                "provider_pid": 424_244,
+                "control_attached": True,
+            }
+            calls: list[str] = []
+            handover_client = native_swap_transaction.SupervisorClient(
+                RuntimePaths.from_env({"WIKI_AGENT_RUNTIME_DIR": str(runtime)})
+            )
+
+            def request(method: str, _params: dict[str, object] | None = None) -> object:
+                calls.append(method)
+                if method == "run/list":
+                    return {"runs": [starting]}
+                if method == "run/status":
+                    return starting
+                raise AssertionError(f"unexpected request: {method}")
+
+            with (
+                patch.object(
+                    handover_client,
+                    "request",
+                    side_effect=request,
+                ),
+                patch.object(
+                    native_swap_transaction,
+                    "_supervisor_lock_is_free",
+                    return_value=False,
+                ),
+                patch.object(
+                    native_swap_transaction,
+                    "_supervisor_identity",
+                    return_value=(handover_client, 1234, {"pid": 1234}),
+                ),
+                patch.object(native_swap_transaction, "_stop_supervisor") as stop,
+            ):
+                with self.assertRaisesRegex(
+                    native_swap_transaction.SupervisorUnavailable,
+                    "state starting is not resumable",
+                ):
+                    swap_native_app(
+                        stage_root,
+                        root,
+                        runtime,
+                        restart=Mock(),
+                    )
+
+            stop.assert_not_called()
+            self.assertEqual(calls, ["run/list", "run/status"])
+            self.assertFalse((stage_root / ".handover-runs.json").exists())
+            self.assertFalse((stage_root / ".swap-intent").exists())
+            self.assertEqual((live / "marker").read_text(encoding="utf-8"), "old")
+            self.assertEqual((staged / "marker").read_text(encoding="utf-8"), "new")
 
     def test_swap_rejects_stale_supervisor_pid_before_signal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -573,6 +646,7 @@ class NativeBuildGuardTests(TestCase):
                     "agent_id": "WIKI-SAVED",
                     "run_id": "run-saved",
                     "provider_session_id": "session-saved",
+                    "state": "idle",
                 }
             ]
             started: list[tuple[Path, Path, Path]] = []
@@ -643,6 +717,7 @@ class NativeBuildGuardTests(TestCase):
                     "agent_id": "WIKI-SAVED",
                     "run_id": "run-saved",
                     "provider_session_id": "session-saved",
+                    "state": "idle",
                 }
             ]
             started: list[tuple[Path, Path, Path]] = []

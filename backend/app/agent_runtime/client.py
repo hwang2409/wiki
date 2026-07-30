@@ -21,6 +21,7 @@ from .version import RUNTIME_FINGERPRINT, RUNTIME_FROZEN
 DEFAULT_SWAP_DRAIN_SECONDS = 10.0
 DEFAULT_FAST_READ_TIMEOUT = 1.0
 DEFAULT_SLOW_OPERATION_TIMEOUT = 30.0
+_HANDOVER_STATES = frozenset({"working", "waiting-approval", "idle"})
 
 _FAST_READ_METHODS = frozenset(
     {
@@ -332,6 +333,17 @@ class SupervisorClient:
             if current.get("control_attached") or _pid_alive(
                 current.get("provider_pid")
             ):
+                if current.get("state") not in _HANDOVER_STATES:
+                    raise SupervisorUnavailable(
+                        f"cannot hand over {agent_id}: state "
+                        f"{current.get('state') or 'unknown'} is not resumable"
+                    )
+                if not isinstance(current.get("provider_session_id"), str) or not current.get(
+                    "provider_session_id"
+                ):
+                    raise SupervisorUnavailable(
+                        f"cannot hand over {agent_id}: provider session id is missing"
+                    )
                 active.append(dict(current))
         return active
 

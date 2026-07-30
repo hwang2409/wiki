@@ -32,6 +32,7 @@ from scripts.native_daemon_restart import restart_daemon_in_process
 RestartDaemon = Callable[[Path, Path, Path], bool]
 UninstallDaemon = Callable[[Path, Path, Path], None]
 StartSupervisor = Callable[[Path, Path, Path], None]
+_HANDOVER_STATES = frozenset({"working", "waiting-approval", "idle"})
 
 
 def _uninstall_daemon(live_bundle: Path, runtime_dir: Path, repo_root: Path) -> None:
@@ -211,6 +212,7 @@ def _bundle_backend_fingerprint(
 
 def _write_handover_state(path: Path, runs: list[dict[str, object]]) -> None:
     """Persist the exact runs before stopping the old supervisor."""
+    runs = _validate_handover_state(runs, path)
     payload = {"version": 1, "runs": runs}
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     with temporary.open("w", encoding="utf-8") as handle:
@@ -233,18 +235,25 @@ def _read_handover_state(path: Path) -> list[dict[str, object]]:
     runs = payload.get("runs")
     if not isinstance(runs, list):
         raise RuntimeError(f"invalid supervisor handover journal: {path}")
+    return _validate_handover_state(runs, path)
+
+
+def _validate_handover_state(
+    runs: object,
+    path: Path,
+) -> list[dict[str, object]]:
+    if not isinstance(runs, list):
+        raise RuntimeError(f"invalid supervisor handover journal: {path}")
     result: list[dict[str, object]] = []
     for run in runs:
         if not isinstance(run, dict):
             raise RuntimeError(f"invalid supervisor handover journal: {path}")
         if not all(
             isinstance(run.get(key), str) and bool(run.get(key))
-            for key in ("agent_id", "run_id")
+            for key in ("agent_id", "run_id", "provider_session_id")
         ):
             raise RuntimeError(f"invalid supervisor handover journal: {path}")
-        if not isinstance(run.get("provider_session_id"), str) or not run.get(
-            "provider_session_id"
-        ):
+        if run.get("state") not in _HANDOVER_STATES:
             raise RuntimeError(f"invalid supervisor handover journal: {path}")
         result.append(dict(run))
     return result
