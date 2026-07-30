@@ -1425,6 +1425,40 @@ class GifRound7ExtensionProbes(unittest.TestCase):
         result = media_scrub.scrub_video(payload, "image/gif")
         self.assertNotIn(marker, result.data)
 
+    def test_plain_text_consumes_pending_gce(self) -> None:
+        gce = b"\x21\xf9\x04\x00\x00\x00\x00\x00"
+        plain_text = b"\x21\x01\x0c" + b"\x00" * 12 + b"\x00"
+        payload = self._min_gif_prefix() + gce + plain_text + self._min_gif_image_data()
+        result = media_scrub.scrub_video(payload, "image/gif")
+        self.assertNotIn(b"\x21\xf9\x04", result.data)
+
+    def test_comments_and_app_extensions_do_not_consume_pending_gce(self) -> None:
+        gce = b"\x21\xf9\x04\x00\x00\x00\x00\x00"
+        comment = b"\x21\xfe\x03abc\x00"
+        app = b"\x21\xff\x0bADOBE1.0abc\x03xyz\x00"
+        payload = self._min_gif_prefix() + gce + comment + app + self._min_gif_image_data()
+        result = media_scrub.scrub_video(payload, "image/gif")
+        self.assertIn(b"\x21\xf9\x04", result.data)
+
+    def test_image_descriptor_reserved_bits_are_rejected(self) -> None:
+        payload = bytearray(self._min_gif_prefix() + self._min_gif_image_data())
+        image_descriptor = len(self._min_gif_prefix())
+        payload[image_descriptor + 9] = 0x18
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "image descriptor packed byte.*reserved bits"
+        ):
+            media_scrub.scrub_video(bytes(payload), "image/gif")
+
+    def test_image_descriptor_flags_and_lzw_data_are_preserved(self) -> None:
+        image_descriptor = b"\x2c" + struct.pack("<HHHH", 0, 0, 4, 2) + b"\x60"
+        lzw = b"\x02\x02\x44\x01\x00"
+        payload = self._min_gif_prefix() + image_descriptor + lzw + b"\x3b"
+        result = media_scrub.scrub_video(payload, "image/gif")
+        output_descriptor = result.data.find(b"\x2c")
+        self.assertGreater(output_descriptor, 0)
+        self.assertEqual(result.data[output_descriptor + 9], 0x60)
+        self.assertTrue(result.data.endswith(image_descriptor + lzw + b"\x3b"))
+
     def test_unknown_application_extension_is_dropped(self) -> None:
         marker = b"round7-adobe-marker"
         # Application extension with "ADOBE1.00abc" identifier + marker body.
@@ -1975,6 +2009,34 @@ class Mp4Round10FullBoxFlagProbes(unittest.TestCase):
         payload[flag_offset:flag_offset + 3] = b"\x00\x00\x03"  # bit 1 set
         with self.assertRaisesRegex(
             media_scrub.MediaScrubError, "fullbox flags .* has reserved bits set"
+        ):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+    def test_vmhd_zero_flags_are_rejected(self) -> None:
+        real = REAL_MP4.read_bytes()
+        flag_offset = self._flag_offset_after(real, b"vmhd")
+        payload = bytearray(real)
+        payload[flag_offset:flag_offset + 3] = b"\x00\x00\x00"
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "vmhd fullbox flags must be exactly 0x000001"
+        ):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+    def test_avc1_without_avcc_is_rejected(self) -> None:
+        real = REAL_MP4.read_bytes()
+        avcc_pos = real.find(b"avcC")
+        assert avcc_pos > 0
+        avcc_size = struct.unpack(">I", real[avcc_pos - 4:avcc_pos])[0]
+        remove_start = avcc_pos - 4
+        remove_end = remove_start + avcc_size
+        payload = bytearray(real)
+        del payload[remove_start:remove_end]
+        for parent in (b"avc1", b"stsd", b"stbl", b"minf", b"mdia", b"trak", b"moov"):
+            pos = payload.rfind(parent, 0, remove_start)
+            existing = struct.unpack(">I", bytes(payload[pos - 4:pos]))[0]
+            payload[pos - 4:pos] = struct.pack(">I", existing - avcc_size)
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "avc1 sample entry requires exactly one avcC"
         ):
             media_scrub.scrub_video(bytes(payload), "video/mp4")
 

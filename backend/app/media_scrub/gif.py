@@ -46,6 +46,8 @@ _GIF_GCE_DISPOSAL_SHIFT: Final = 2
 _GIF_GCE_USER_INPUT_MASK: Final = 0b0000_0010
 _GIF_GCE_TRANSPARENT_MASK: Final = 0b0000_0001
 _GIF_GCE_DISPOSAL_MAX: Final = 3  # spec defines 0..3; 4..7 reserved
+_GIF_IMAGE_DESCRIPTOR_RESERVED_MASK: Final = 0b0001_1000
+_GIF_IMAGE_DESCRIPTOR_ALLOWED_MASK: Final = 0b1110_0111
 
 
 @dataclass(frozen=True)
@@ -166,6 +168,11 @@ def scrub_gif(data: bytes) -> MediaScrubResult:
                     pass
                 pending_gce = _parse_gce_body(sub_blocks[0])
             else:
+                if label == _GIF_PLAIN_TEXT_LABEL:
+                    # Plain Text is a Graphic Rendering Block. A pending GCE
+                    # applies to it, so it must not reach the next image after
+                    # this extension is dropped.
+                    pending_gce = None
                 rebuilt = _rebuild_extension(label, sub_blocks)
                 if rebuilt is not None:
                     out.extend(rebuilt)
@@ -278,6 +285,11 @@ def _emit_image_descriptor(
     img_w = struct.unpack("<H", data[offset + 5:offset + 7])[0]
     img_h = struct.unpack("<H", data[offset + 7:offset + 9])[0]
     local_packed = data[offset + 9]
+    if local_packed & _GIF_IMAGE_DESCRIPTOR_RESERVED_MASK:
+        raise MediaScrubError(
+            "gif image descriptor packed byte has reserved bits set"
+        )
+    local_packed_canonical = local_packed & _GIF_IMAGE_DESCRIPTOR_ALLOWED_MASK
     local_ct_entries = (
         1 << ((local_packed & 0x07) + 1)
         if local_packed & 0x80
@@ -307,7 +319,7 @@ def _emit_image_descriptor(
     out.append(_GIF_IMAGE_DESCRIPTOR)
     out.extend(struct.pack("<HH", left, top))
     out.extend(struct.pack("<HH", img_w, img_h))
-    out.append(local_packed)
+    out.append(local_packed_canonical)
     if local_ct_size:
         out.extend(data[lct_start:lct_start + local_ct_size])
     out.append(lzw_min_code_size)

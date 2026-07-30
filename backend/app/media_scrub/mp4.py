@@ -725,6 +725,10 @@ def _rebuild_vmhd(data: bytes, atom: _Mp4Atom) -> bytes:
     if body[0] != 0:
         raise MediaScrubError(f"mp4 vmhd unknown version {body[0]}")
     flags = _validate_fullbox_flags(b"vmhd", body[1:4])
+    if flags != b"\x00\x00\x01":
+        raise MediaScrubError(
+            "mp4 vmhd fullbox flags must be exactly 0x000001"
+        )
     graphics_mode = struct.unpack(">H", body[4:6])[0]
     opcolor = struct.unpack(">HHH", body[6:12])
     rebuilt = (
@@ -1078,6 +1082,20 @@ def _rebuild_sample_entry(entry_type: bytes, entry_bytes: bytes) -> bytes:
         )
 
     inner_boxes = _walk_sample_entry_inner_boxes(entry_bytes, inner_start)
+    required_config = {
+        b"avc1": b"avcC",
+        b"avc3": b"avcC",
+        b"hev1": b"hvcC",
+        b"hvc1": b"hvcC",
+        b"mp4v": b"esds",
+        b"mp4a": b"esds",
+    }[entry_type]
+    inner_types = [box[4:8] for box in inner_boxes]
+    if inner_types.count(required_config) != 1:
+        raise MediaScrubError(
+            f"mp4 {entry_type.decode('ascii')} sample entry requires exactly one "
+            f"{required_config.decode('ascii')} configuration box"
+        )
     body = (
         b"\x00" * 6
         + struct.pack(">H", data_ref_index)
