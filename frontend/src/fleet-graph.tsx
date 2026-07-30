@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { getFleetGraph, type FleetGraphGroup, type FleetGraphTicket, type WorkgraphEdge, type WorkgraphNode } from "./api";
+import { FleetScreencastPanel } from "./screencast-strip";
 import { WorkgraphDag } from "./workgraph-panel";
 
 type FilterKind = "orch" | "state" | "role";
@@ -99,6 +100,24 @@ function FilterChips({
 
 function FleetGroup({ group }: { group: FleetGraphGroup }) {
   const edges = useMemo(() => dedupeEdges(group.tickets), [group.tickets]);
+  const liveTickets = useMemo(
+    () =>
+      group.tickets
+        .filter((ticket) => ticket.state !== "archived")
+        .map((ticket) => ticket.ticket),
+    [group.tickets]
+  );
+  const screencastMeta = useMemo(
+    () =>
+      group.tickets
+        .filter((ticket) => ticket.state !== "archived")
+        .map((ticket) => ({
+          ticket: ticket.ticket,
+          state: ticket.state,
+          role: ticket.role,
+        })),
+    [group.tickets]
+  );
   return (
     <section className="fleet-graph-group" data-orch={group.orch}>
       <div className="fleet-graph-group-head">
@@ -117,6 +136,9 @@ function FleetGroup({ group }: { group: FleetGraphGroup }) {
           />
         )}
       </div>
+      {liveTickets.length > 0 ? (
+        <FleetScreencastPanel tickets={liveTickets} tickets_meta={screencastMeta} />
+      ) : null}
     </section>
   );
 }

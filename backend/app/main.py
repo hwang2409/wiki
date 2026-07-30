@@ -36,6 +36,7 @@ from . import (
     knowledge,
     palette,
     provider_health,
+    screencast,
     terminal,
     tokens,
     transcripts,
@@ -2484,6 +2485,98 @@ def fleet_graph(limit: int = Query(default=10, ge=0, le=50)) -> dict[str, object
     """Return one bounded, normalized DAG view across the worker fleet."""
 
     return _fleet_graph_payload(limit)
+
+
+MAX_SCREENCAST_TICKETS = 32
+
+
+def _run_id_for_ticket(registry: dict, ticket: str) -> str | None:
+    """Resolve the run id currently registered for ``ticket``.
+
+    Screencasts are always live-only: they read the currently-running
+    worker's raw.jsonl. Archived runs are intentionally excluded — the strip
+    is a "what is happening now" pane, not a history browser.
+    """
+
+    if not TICKET_PATTERN.fullmatch(ticket):
+        return None
+    entry = registry.get(ticket)
+    if not isinstance(entry, dict):
+        return None
+    current = entry.get("current")
+    if not isinstance(current, dict):
+        return None
+    run_id = current.get("run_id")
+    if not isinstance(run_id, str) or not RUN_ID_PATTERN.fullmatch(run_id):
+        return None
+    return run_id
+
+
+def _screencast_payload(tickets: list[str]) -> dict[str, object]:
+    """Batched tail read → per-ticket frame lists in one call.
+
+    The fleet view must not poll per worker; it sends the set of visible
+    tickets and gets one bounded, ETag-friendly response. Unknown or
+    archived tickets return an empty frames list — the caller keeps its
+    existing empty-state UI.
+    """
+
+    registry = _read_agent_registry()
+    runs_root = SUPERVISOR_CLIENT.paths.runs_dir
+    workers: list[dict[str, object]] = []
+    seen: set[str] = set()
+    root_fd: int | None = None
+    try:
+        root_fd = os.open(
+            str(runs_root),
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+    except OSError:
+        root_fd = None
+    try:
+        for ticket in tickets:
+            if ticket in seen or len(workers) >= MAX_SCREENCAST_TICKETS:
+                continue
+            seen.add(ticket)
+            run_id = _run_id_for_ticket(registry, ticket)
+            frames: list[screencast.ScreencastFrame] = []
+            if run_id is not None and root_fd is not None:
+                try:
+                    frames = screencast.tail_frames(root_fd, run_id)
+                except OSError:
+                    frames = []
+            workers.append(
+                {
+                    "ticket": ticket,
+                    "run_id": run_id,
+                    "frames": [screencast.frame_to_dict(frame) for frame in frames],
+                }
+            )
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
+    return {"workers": workers, "updated_at_ns": time.time_ns()}
+
+
+@app.get("/api/fleet/screencast")
+@app.get("/fleet/screencast", include_in_schema=False)
+def fleet_screencast(
+    response: Response,
+    ticket: list[str] = Query(default_factory=list),
+) -> dict[str, object]:
+    """Return short tail-of-raw.jsonl frames for the requested worker tickets.
+
+    Single call for all visible workers on the fleet view. Each worker's
+    frame list is a bounded read of the last window of its raw.jsonl —
+    never a full-file scan — parsed into short lines suitable for the
+    monospace strip. Response is cache-friendly (``Cache-Control:
+    max-age=1``) so the ~2s poll costs almost nothing when the fleet is
+    quiet.
+    """
+
+    payload = _screencast_payload(ticket)
+    response.headers["Cache-Control"] = "no-cache, max-age=1"
+    return payload
 
 
 @app.get("/api/agents/{ticket}/workgraph")
