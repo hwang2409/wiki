@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from backend.app import blast_radius
+from backend.app import blast_radius_discovery
 
 
 def git(repo: Path, *args: str) -> str:
@@ -61,11 +62,16 @@ class BlastRadiusTests(unittest.TestCase):
         refs = self.refs()
         return blast_radius.OpenPRSnapshotState(
             tuple(
-                blast_radius.OpenPRBranch(name, refs[name].head_sha)
+                blast_radius.OpenPRBranch(
+                    name,
+                    refs[name].head_sha,
+                    attestation=blast_radius.SourceAttestation(f"open-pr-row:{name}", True, True, True),
+                )
                 for name in names
             ),
             True,
             time.time(),
+            attestation=blast_radius.SourceAttestation("open-pr-snapshot", True, True, True),
         )
 
     def test_changed_files_use_main_three_dot_diff(self) -> None:
@@ -99,6 +105,20 @@ class BlastRadiusTests(unittest.TestCase):
         self.assertEqual(cache.get_or_compute("one", "a", compute), ("styles.css",))
         self.assertEqual(cache.get_or_compute("one", "a", compute), ("styles.css",))
         self.assertEqual(cache.get_or_compute("one", "b", compute), ("styles.css",))
+        self.assertEqual(calls, 2)
+
+    def test_cache_recomputes_when_main_head_moves(self) -> None:
+        cache = blast_radius.DiffCache()
+        calls = 0
+
+        def compute() -> tuple[str, ...]:
+            nonlocal calls
+            calls += 1
+            return ("styles.css",)
+
+        cache.get_or_compute("one", "branch-head", compute, candidate_head_sha="candidate", main_head_sha="main-a")
+        cache.get_or_compute("one", "branch-head", compute, candidate_head_sha="candidate", main_head_sha="main-a")
+        cache.get_or_compute("one", "branch-head", compute, candidate_head_sha="candidate", main_head_sha="main-b")
         self.assertEqual(calls, 2)
 
     def test_cache_single_flight_runs_one_same_key_computation(self) -> None:
@@ -208,11 +228,20 @@ class BlastRadiusTests(unittest.TestCase):
         refs = self.refs()
         snapshot = blast_radius.OpenPRSnapshotState(
             (
-                blast_radius.OpenPRBranch("one", new_one),
-                blast_radius.OpenPRBranch("two", refs["two"].head_sha),
+                blast_radius.OpenPRBranch(
+                    "one",
+                    new_one,
+                    attestation=blast_radius.SourceAttestation("open-pr-row:one", True, True, True),
+                ),
+                blast_radius.OpenPRBranch(
+                    "two",
+                    refs["two"].head_sha,
+                    attestation=blast_radius.SourceAttestation("open-pr-row:two", True, True, True),
+                ),
             ),
             True,
             time.time(),
+            attestation=blast_radius.SourceAttestation("open-pr-snapshot", True, True, True),
         )
         payload = blast_radius.analyze(
             self.fixture.root,
@@ -277,7 +306,12 @@ class BlastRadiusTests(unittest.TestCase):
                 }
             },
             cache=blast_radius.DiffCache(),
-            pr_snapshot=blast_radius.OpenPRSnapshotState((), True, time.time()),
+            pr_snapshot=blast_radius.OpenPRSnapshotState(
+                (),
+                True,
+                time.time(),
+                attestation=blast_radius.SourceAttestation("open-pr-snapshot", True, True, True),
+            ),
         )
         self.assertFalse(payload["complete"])
         self.assertIsNone(payload["risk"])
@@ -300,7 +334,12 @@ class BlastRadiusTests(unittest.TestCase):
                 },
             },
             cache=blast_radius.DiffCache(),
-            pr_snapshot=blast_radius.OpenPRSnapshotState((), True, time.time()),
+            pr_snapshot=blast_radius.OpenPRSnapshotState(
+                (),
+                True,
+                time.time(),
+                attestation=blast_radius.SourceAttestation("open-pr-snapshot", True, True, True),
+            ),
         )
         self.assertTrue(payload["complete"])
         self.assertEqual(payload["failed_branches"], [])
@@ -392,7 +431,12 @@ class BlastRadiusTests(unittest.TestCase):
             self.fixture.root,
             {},
             cache=blast_radius.DiffCache(),
-            pr_snapshot=blast_radius.OpenPRSnapshotState((), True, time.time()),
+            pr_snapshot=blast_radius.OpenPRSnapshotState(
+                (),
+                True,
+                time.time(),
+                attestation=blast_radius.SourceAttestation("open-pr-snapshot", True, True, True),
+            ),
         )
         self.assertTrue(payload["complete"])
 
@@ -409,7 +453,7 @@ class BlastRadiusTests(unittest.TestCase):
         self.assertIn("main", {failure["branch"] for failure in payload["failed_branches"]})
 
     def test_snapshot_provider_refreshes_and_reports_provider_errors(self) -> None:
-        snapshot = blast_radius.OpenPRSnapshot(lambda: [{"headRefName": "one"}])
+        snapshot = blast_radius.OpenPRSnapshot(lambda: [{"headRefName": "one", "headRefOid": "0" * 40}])
         state = snapshot.refresh()
         self.assertTrue(state.complete)
         self.assertEqual([branch.name for branch in state.branches], ["one"])
@@ -428,7 +472,10 @@ class BlastRadiusTests(unittest.TestCase):
 
     def test_malformed_provider_row_is_incomplete(self) -> None:
         snapshot = blast_radius.OpenPRSnapshot(
-            lambda: [{"headRefName": "one"}, {"headRefName": "bad branch"}]
+            lambda: [
+                {"headRefName": "one", "headRefOid": "0" * 40},
+                {"headRefName": "bad branch", "headRefOid": "1" * 40},
+            ]
         )
         state = snapshot.refresh()
         self.assertFalse(state.complete)
@@ -436,7 +483,10 @@ class BlastRadiusTests(unittest.TestCase):
 
     def test_provider_truncation_is_incomplete(self) -> None:
         snapshot = blast_radius.OpenPRSnapshot(
-            lambda: [{"headRefName": f"branch-{index}"} for index in range(blast_radius.MAX_ACTIVE_BRANCHES + 1)]
+            lambda: [
+                {"headRefName": f"branch-{index}", "headRefOid": f"{index + 1:040x}"}
+                for index in range(blast_radius.MAX_ACTIVE_BRANCHES + 1)
+            ]
         )
         state = snapshot.refresh()
         self.assertFalse(state.complete)
@@ -487,6 +537,81 @@ class BlastRadiusTests(unittest.TestCase):
         self.assertFalse(payload["complete"])
         self.assertIsNone(payload["risk"])
         self.assertIn("git refs", {failure["branch"] for failure in payload["failed_branches"]})
+
+    def test_every_unattested_source_produces_unknown_risk(self) -> None:
+        valid_snapshot = self.snapshot("one")
+
+        def assert_unknown(payload: dict[str, object]) -> None:
+            self.assertFalse(payload["complete"])
+            self.assertIsNone(payload["risk"])
+            self.assertFalse(payload["attestation"]["complete"])
+
+        with self.subTest("provider failure"):
+            broken = blast_radius.OpenPRSnapshot(lambda: (_ for _ in ()).throw(RuntimeError("provider offline")))
+            assert_unknown(blast_radius.analyze(self.fixture.root, {}, cache=blast_radius.DiffCache(), pr_snapshot=broken))
+
+        with self.subTest("provider row missing head"):
+            snapshot = blast_radius.OpenPRSnapshotState(
+                (blast_radius.OpenPRBranch("one", None),),
+                True,
+                time.time(),
+            )
+            assert_unknown(blast_radius.analyze(self.fixture.root, {}, cache=blast_radius.DiffCache(), pr_snapshot=snapshot))
+
+        with self.subTest("stale provider snapshot"):
+            snapshot = blast_radius.OpenPRSnapshotState(
+                (),
+                True,
+                time.time() - blast_radius.OPEN_PR_MAX_AGE_SECONDS - 1,
+            )
+            assert_unknown(blast_radius.analyze(self.fixture.root, {}, cache=blast_radius.DiffCache(), pr_snapshot=snapshot))
+
+        with self.subTest("registry row without locator"):
+            assert_unknown(
+                blast_radius.analyze(
+                    self.fixture.root,
+                    {"BAD": {"current": {"role": "implement"}}},
+                    cache=blast_radius.DiffCache(),
+                    pr_snapshot=self.snapshot("one"),
+                )
+            )
+
+        with self.subTest("registry read failure"):
+            assert_unknown(
+                blast_radius.analyze(
+                    self.fixture.root,
+                    {},
+                    cache=blast_radius.DiffCache(),
+                    pr_snapshot=self.snapshot("one"),
+                    registry_error="registry unavailable",
+                )
+            )
+
+        with self.subTest("git refs corruption"):
+            with mock.patch.object(blast_radius, "_run_git", return_value="malformed refs output"):
+                assert_unknown(blast_radius.analyze(self.fixture.root, {}, cache=blast_radius.DiffCache(), pr_snapshot=valid_snapshot))
+
+        with self.subTest("worktree discovery failure"):
+            with mock.patch.object(blast_radius_discovery, "worktree_branches", side_effect=blast_radius.GitAnalysisError("worktree list failed")):
+                assert_unknown(blast_radius.analyze(self.fixture.root, {}, cache=blast_radius.DiffCache(), pr_snapshot=self.snapshot("one")))
+
+        with self.subTest("git diff failure"):
+            with mock.patch.object(blast_radius, "changed_files", side_effect=blast_radius.GitAnalysisError("diff failed")):
+                assert_unknown(blast_radius.analyze(self.fixture.root, {}, cache=blast_radius.DiffCache(), pr_snapshot=self.snapshot("one")))
+
+        with self.subTest("cache entry stale"):
+            class UnattestedCache:
+                def get_or_compute(self, *args: object, **kwargs: object) -> blast_radius.ChangedFiles:
+                    del args, kwargs
+                    return blast_radius.ChangedFiles(
+                        ("styles.css",),
+                        cache_attestation=blast_radius.SourceAttestation("cache-entry", False, True, False, "stale"),
+                    )
+
+            assert_unknown(blast_radius.analyze(self.fixture.root, {}, cache=UnattestedCache(), pr_snapshot=self.snapshot("one")))
+
+        with self.subTest("missing candidate"):
+            assert_unknown(blast_radius.analyze(self.fixture.root, {}, "deleted", cache=blast_radius.DiffCache(), pr_snapshot=self.snapshot("one")))
 
 
 class RouteTests(unittest.TestCase):
