@@ -63,6 +63,18 @@ test("plain diff -u multi-file (no diff --git) splits into separate files", () =
   assert.equal(files[1].hunks.length, 1);
 });
 
+test("file limit stops parsing plain unified diffs", () => {
+  const source = Array.from({ length: 120 }, (_, index) => [
+    `--- a/file-${index}.txt`,
+    `+++ b/file-${index}.txt`,
+    "@@ -0,0 +0,1 @@",
+    `+line-${index}`,
+  ].join("\n")).join("\n");
+  const files = parseUnifiedDiff(source, 101);
+  assert.equal(files.length, 101);
+  assert.equal(files[100]?.newPath, "file-100.txt");
+});
+
 test("hunk content lines beginning with -- and ++ are not misclassified as file headers", () => {
   const source = [
     "diff --git a/notes.txt b/notes.txt",

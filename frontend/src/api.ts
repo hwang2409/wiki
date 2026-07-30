@@ -510,6 +510,11 @@ export type ProviderEventInspector = {
   normalized_count: number;
   dispositions: SessionDispositionCounts;
   pending_requests: ProviderPendingRequest[];
+  current_turn_diff?: {
+    turn_id: string | null;
+    seq: number;
+    diff: string;
+  } | null;
   events: ProviderStreamEvent[];
   raw?: ProviderRawEvent[] | null;
 };

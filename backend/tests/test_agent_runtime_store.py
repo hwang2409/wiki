@@ -206,6 +206,119 @@ class ProtocolFixtureTests(unittest.TestCase):
         self.assertEqual(response.kind, "approval_response")
         self.assertEqual(response.disposition, EventDisposition.IGNORED)
 
+    def test_codex_stream_renderer_methods_have_explicit_dispositions(self) -> None:
+        rendered_methods = (
+            "turn/diff/updated",
+            "item/commandExecution/terminalInteraction",
+            "warning",
+            "skills/changed",
+            "turn/plan/updated",
+        )
+        summarized_methods = (
+            "item/reasoning/summaryPartAdded",
+            "hook/started",
+            "hook/completed",
+        )
+        ignored_methods = ("rawResponse/completed",)
+        for method in rendered_methods:
+            with self.subTest(method=method):
+                normalized = normalize_provider_event(
+                    ProviderKind.CODEX,
+                    {"method": method, "params": {}},
+                )
+                self.assertEqual(normalized.disposition, EventDisposition.RENDERED)
+                self.assertEqual(normalized.kind, method.replace("/", "_"))
+        for method in summarized_methods:
+            with self.subTest(method=method):
+                normalized = normalize_provider_event(
+                    ProviderKind.CODEX,
+                    {"method": method, "params": {}},
+                )
+                self.assertEqual(normalized.disposition, EventDisposition.SUMMARIZED)
+                self.assertEqual(normalized.kind, method.replace("/", "_"))
+        for method in ignored_methods:
+            with self.subTest(method=method):
+                normalized = normalize_provider_event(
+                    ProviderKind.CODEX,
+                    {"method": method, "params": {}},
+                )
+                self.assertEqual(normalized.disposition, EventDisposition.IGNORED)
+                self.assertEqual(normalized.kind, method.replace("/", "_"))
+
+    def test_codex_moderation_metadata_warns_only_for_non_safe_flags(self) -> None:
+        safe = normalize_provider_event(
+            ProviderKind.CODEX,
+            {
+                "method": "turn/moderationMetadata",
+                "params": {
+                    "metadata": {
+                        "prompt": {
+                            "omnimod": {
+                                "outputs": [
+                                    {
+                                        "results": [
+                                            {"category_flags": {"sexual": False, "violence": False}}
+                                        ]
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                },
+            },
+        )
+        warning = normalize_provider_event(
+            ProviderKind.CODEX,
+            {
+                "method": "turn/moderationMetadata",
+                "params": {
+                    "metadata": {
+                        "prompt": {
+                            "omnimod": {
+                                "outputs": [
+                                    {
+                                        "results": [
+                                            {"category_flags": {"sexual": False, "violence": True}}
+                                        ]
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                },
+            },
+        )
+        self.assertEqual(safe.disposition, EventDisposition.IGNORED)
+        self.assertEqual(safe.kind, "turn_moderationMetadata")
+        self.assertEqual(warning.disposition, EventDisposition.RENDERED)
+        self.assertEqual(warning.kind, "turn_moderationMetadata_warning")
+
+    def test_codex_moderation_metadata_warns_for_blocked_payload_shapes(self) -> None:
+        payloads = (
+            {
+                "metadata": {
+                    "prompt": {
+                        "omnimod": {"outputs": [{"is_blocked": True}]}
+                    }
+                }
+            },
+            {
+                "metadata": {
+                    "prompt": {
+                        "omnimod": {"outputs": [{"results": [{"labels": ["violence"]}]}]}
+                    }
+                }
+            },
+        )
+        for params in payloads:
+            with self.subTest(params=params):
+                normalized = normalize_provider_event(
+                    ProviderKind.CODEX,
+                    {"method": "turn/moderationMetadata", "params": params},
+                )
+                self.assertEqual(normalized.disposition, EventDisposition.RENDERED)
+                self.assertEqual(normalized.kind, "turn_moderationMetadata_warning")
+
     def test_codex_render_artifact_completion_normalizes_as_artifact(self) -> None:
         row = json.loads(
             (FIXTURES / "codex_render_artifact_completed.jsonl").read_text(
@@ -457,6 +570,92 @@ class RunStoreTests(unittest.TestCase):
             self.assertEqual(normalized["raw_seq"], 1)
             reloaded = store.get(record.run_id)
             self.assertEqual(reloaded.disposition_counts["rendered"], 1)
+
+    def test_current_turn_diff_survives_event_window_and_resets_on_new_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            record = store.create(_record(root))
+
+            def append(method: str, params: dict[str, Any], kind: str) -> None:
+                payload = {"method": method, "params": params}
+                raw = store.append_raw(
+                    record.run_id,
+                    provider="codex",
+                    direction="server",
+                    payload=payload,
+                )
+                store.append_normalized(
+                    record.run_id,
+                    raw_seq=raw["seq"],
+                    disposition=EventDisposition.RENDERED,
+                    kind=kind,
+                    payload=payload,
+                )
+
+            append("turn/started", {"turn": {"id": "turn-1"}}, "turn_started")
+            append("turn/diff/updated", {"diff": "diff one"}, "turn_diff_updated")
+            self.assertNotIn("diff one", store.run_path(record.run_id).read_text())
+            self.assertEqual(
+                json.loads(store.current_turn_diff_path(record.run_id).read_text()),
+                {"diff": "diff one"},
+            )
+            for index in range(51):
+                append("warning", {"message": f"event {index}"}, "warning")
+
+            window = store.read_normalized_events(record.run_id, limit=50)
+            self.assertFalse(any(event["kind"] == "turn_diff_updated" for event in window))
+            self.assertEqual(
+                store.current_turn_diff(record.run_id),
+                {"turn_id": "turn-1", "seq": 2, "diff": "diff one"},
+            )
+
+            append("turn/started", {"turn": {"id": "turn-2"}}, "turn_started")
+            self.assertIsNone(store.current_turn_diff(record.run_id))
+            append("turn/diff/updated", {"diff": "diff two"}, "turn_diff_updated")
+            self.assertEqual(
+                store.current_turn_diff(record.run_id),
+                {"turn_id": "turn-2", "seq": 55, "diff": "diff two"},
+            )
+            restarted = RunStore(paths)
+            self.assertEqual(
+                restarted.current_turn_diff(record.run_id),
+                {"turn_id": "turn-2", "seq": 55, "diff": "diff two"},
+            )
+
+    def test_current_turn_diff_sidecar_is_not_rewritten_for_unrelated_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunStore(_paths(root))
+            record = store.create(_record(root))
+
+            def append(method: str, params: dict[str, Any], kind: str) -> None:
+                payload = {"method": method, "params": params}
+                raw = store.append_raw(
+                    record.run_id,
+                    provider="codex",
+                    direction="server",
+                    payload=payload,
+                )
+                store.append_normalized(
+                    record.run_id,
+                    raw_seq=raw["seq"],
+                    disposition=EventDisposition.RENDERED,
+                    kind=kind,
+                    payload=payload,
+                )
+
+            with mock.patch.object(
+                store,
+                "_write_current_turn_diff_snapshot",
+                wraps=store._write_current_turn_diff_snapshot,
+            ) as write_snapshot:
+                append("turn/started", {"turn": {"id": "turn-1"}}, "turn_started")
+                append("turn/diff/updated", {"diff": "large diff"}, "turn_diff_updated")
+                for index in range(200):
+                    append("warning", {"message": str(index)}, "warning")
+            self.assertEqual(write_snapshot.call_count, 2)
 
     def test_pending_user_message_matching_is_durable_and_fifo_safe(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

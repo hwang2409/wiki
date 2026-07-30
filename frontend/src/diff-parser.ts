@@ -70,7 +70,7 @@ function isExtendedHeaderLine(line: string): boolean {
   return EXTENDED_HEADER_PREFIXES.some((prefix) => line.startsWith(prefix));
 }
 
-export function parseUnifiedDiff(source: string): DiffFilePatch[] {
+export function parseUnifiedDiff(source: string, maxFiles = Number.POSITIVE_INFINITY): DiffFilePatch[] {
   if (!source) return [];
   const lines = source.split("\n");
   if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
@@ -115,6 +115,7 @@ export function parseUnifiedDiff(source: string): DiffFilePatch[] {
 
     if (line.startsWith(DIFF_GIT_MARKER)) {
       commitCurrent();
+      if (files.length >= maxFiles) break;
       current = { oldPath: null, newPath: null, hunks: [], extendedHeaders: [line] };
       continue;
     }
@@ -170,6 +171,7 @@ export function parseUnifiedDiff(source: string): DiffFilePatch[] {
       if (current && (current.hunks.length > 0 || current.oldPath !== null || current.newPath !== null)) {
         commitCurrent();
       }
+      if (files.length >= maxFiles) break;
       const file = ensureFile();
       file.oldPath = stripPathPrefix(line.slice(FILE_MARKER_OLD.length));
       continue;
