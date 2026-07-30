@@ -16,6 +16,7 @@ import {
   getAgents,
   getAgentModels,
   markRunViewed,
+  previewAgentContextPrelude,
   spawnAgentOrchestrator,
   spawnAgentWorker,
 } from "./api";
@@ -167,7 +168,11 @@ function SpawnWorkerModal({
   const [effort, setEffort] = useState<SpawnWorkerEffort>("high");
   const [workdir, setWorkdir] = useState(DEFAULT_WORKDIR);
   const [orch, setOrch] = useState(orchestrators[0]?.id ?? "");
+  const [title, setTitle] = useState("");
   const [prompt, setPrompt] = useState("");
+  const [prelude, setPrelude] = useState("");
+  const [preludeLoading, setPreludeLoading] = useState(false);
+  const [preludeError, setPreludeError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -224,6 +229,45 @@ function SpawnWorkerModal({
     !promptTooLarge &&
     !submitting;
 
+  useEffect(() => {
+    if (!ticketValid || !workdirValid) {
+      setPrelude("");
+      setPreludeLoading(false);
+      setPreludeError(null);
+      return;
+    }
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => {
+      setPreludeLoading(true);
+      setPreludeError(null);
+      previewAgentContextPrelude(
+        {
+          ticket: normalizedTicket,
+          title,
+          prompt,
+          workdir: workdir.trim(),
+        },
+        controller.signal,
+      )
+        .then((result) => {
+          if (controller.signal.aborted) return;
+          setPrelude(result.prelude);
+          setPreludeLoading(false);
+        })
+        .catch((reason: unknown) => {
+          if (controller.signal.aborted) return;
+          setPreludeLoading(false);
+          setPreludeError(
+            reason instanceof Error ? reason.message : "context preview unavailable",
+          );
+        });
+    }, 250);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [normalizedTicket, ticketValid, title, prompt, workdir, workdirValid]);
+
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!canSubmit) return;
@@ -244,6 +288,9 @@ function SpawnWorkerModal({
         workdir: workdir.trim(),
         orch: orch || null,
         prompt,
+        title: title.trim(),
+        context_prelude: true,
+        context_prelude_override: prelude.trim() || null,
       });
       onSpawn({
         kind: "worker",
@@ -393,6 +440,19 @@ function SpawnWorkerModal({
           </label>
 
           <label className="agent-spawn-field">
+            <span className="agent-spawn-label">Ticket title</span>
+            <input
+              className="dialog-input"
+              placeholder="Optional title or short description"
+              value={title}
+              onChange={(event) => {
+                resetConfirmation();
+                setTitle(event.target.value);
+              }}
+            />
+          </label>
+
+          <label className="agent-spawn-field">
             <span className="agent-spawn-label">Orchestrator id</span>
             <select
               className="agent-spawn-select"
@@ -427,12 +487,32 @@ function SpawnWorkerModal({
               {promptTooLarge ? "Prompt must stay under 100KB." : `${promptBytes} bytes`}
             </span>
           </label>
+
+          <label className="agent-spawn-field">
+            <span className="agent-spawn-label">Context prelude</span>
+            <textarea
+              aria-label="Context prelude"
+              className="dialog-input agent-spawn-textarea agent-context-prelude"
+              placeholder="Enter a ticket and working dir to preview local context."
+              value={prelude}
+              onChange={(event) => {
+                resetConfirmation();
+                setPrelude(event.target.value);
+              }}
+            />
+            <span className="agent-spawn-hint">
+              {preludeLoading
+                ? "Building deterministic local context…"
+                : preludeError || `${prelude.length} / 4096 characters · editable before send`}
+            </span>
+          </label>
         </div>
 
         {!ticketValid && normalizedTicket ? (
           <div className="agent-spawn-error">Ticket ids must stay uppercase and match the worker pattern.</div>
         ) : null}
         {!workdirValid ? <div className="agent-spawn-error">Working dir is required.</div> : null}
+        {preludeError ? <div className="agent-spawn-error">{preludeError}</div> : null}
         {error ? <div className="agent-spawn-error">{error}</div> : null}
 
         <div className="dialog-actions">

@@ -349,6 +349,10 @@ export type SpawnWorkerInput = {
   workdir: string;
   orch: string | null;
   prompt: string;
+  title?: string;
+  context_prelude?: boolean;
+  include_context?: boolean;
+  context_prelude_override?: string | null;
 };
 
 export type SpawnWorkerResult = {
@@ -362,6 +366,31 @@ export function spawnAgentWorker(body: SpawnWorkerInput) {
   return request<SpawnWorkerResult>("/api/agents/spawn", {
     method: "POST",
     body: JSON.stringify(body),
+  });
+}
+
+export type ContextPreludeInput = {
+  ticket: string;
+  title: string;
+  prompt: string;
+  workdir: string;
+};
+
+export type ContextPreludeResult = {
+  prelude: string;
+  truncated: boolean;
+  sources: Record<string, { status: string; items: number; warning: string | null }>;
+  char_budget?: number;
+};
+
+export function previewAgentContextPrelude(
+  body: ContextPreludeInput,
+  signal?: AbortSignal,
+) {
+  return request<ContextPreludeResult>("/api/agents/context-prelude", {
+    method: "POST",
+    body: JSON.stringify(body),
+    signal,
   });
 }
 
