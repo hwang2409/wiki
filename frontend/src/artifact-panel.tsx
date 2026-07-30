@@ -8,6 +8,7 @@ import { FileListArtifactDetail } from "./artifact-detail/file-list";
 import { ImageArtifactDetail } from "./artifact-detail/image";
 import { JsonArtifactDetail } from "./artifact-detail/json";
 import { MermaidArtifactDetail } from "./artifact-detail/mermaid";
+import { PdfArtifactDetail } from "./artifact-detail/pdf";
 import { PlotArtifactDetail } from "./artifact-detail/plot";
 import { SvgArtifactDetail } from "./artifact-detail/svg";
 import { TableArtifactDetail } from "./artifact-detail/table";
@@ -25,6 +26,7 @@ const KIND_LABELS: Record<string, string> = {
   diff: "Diff",
   "file-list": "File list",
   json: "JSON",
+  pdf: "PDF",
 };
 
 function humanizeKind(kind: string | undefined): string {
@@ -86,12 +88,12 @@ export function ArtifactPanel({
       if (focusedId) onCloseTab(focusedId);
       return;
     }
-    if (command && event.key === "0" && ["image", "svg", "mermaid"].includes(artifact?.kind ?? "")) {
+    if (command && event.key === "0" && ["image", "svg", "mermaid", "pdf"].includes(artifact?.kind ?? "")) {
       event.preventDefault();
       event.currentTarget.querySelector<HTMLButtonElement>("[data-panel-reset-zoom]")?.click();
       return;
     }
-    if (command && event.key.toLocaleLowerCase() === "f" && artifact?.kind === "code") {
+    if (command && event.key.toLocaleLowerCase() === "f" && (artifact?.kind === "code" || artifact?.kind === "pdf")) {
       event.preventDefault();
       event.currentTarget.querySelector<HTMLButtonElement>("[data-code-find]")?.click();
     }
@@ -110,6 +112,7 @@ export function ArtifactPanel({
       case "file-list": return <FileListArtifactDetail artifact={artifact} />;
       case "json": return <JsonArtifactDetail artifact={artifact} />;
       case "code": return <CodeArtifactDetail artifact={artifact} onChange={onChange} state={viewState} />;
+      case "pdf": return <PdfArtifactDetail artifact={artifact} event={focusedEvent} onChange={onChange} state={viewState} ticket={ticket} />;
     }
   })() : null;
 

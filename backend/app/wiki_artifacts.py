@@ -15,18 +15,26 @@ from uuid import UUID, uuid4
 from . import knowledge
 from . import wiki_agent_tools
 from .image_scrub import ImageScrubError, scrub_image_bytes
+from .pathwalk import open_relative_file
 
 
 TEXT_LIMIT = 100_000
 IMAGE_LIMIT = 5 * 1024 * 1024
+PDF_LIMIT = 25 * 1024 * 1024
+PDF_MAGIC = b"%PDF-"
+# Transport-level cap on a single MCP request line. Sized to fit the largest
+# base64-encoded PDF payload (4/3 inflation) plus JSON envelope headroom, so
+# json.loads never sees an unbounded buffer even when a caller sends garbage.
+MAX_REQUEST_BYTES = ((PDF_LIMIT + 2) // 3) * 4 + 64 * 1024
 SENTINEL_START = "<<wiki-artifact:v1>>"
 SENTINEL_END = "<<end>>"
-ARTIFACT_KINDS = {"mermaid", "svg", "image", "table", "plot", "code", "diff", "file-list", "json"}
+ARTIFACT_KINDS = {"mermaid", "svg", "image", "table", "plot", "code", "diff", "file-list", "json", "pdf"}
 IMAGE_TYPES = {
     "image/png": "png",
     "image/jpeg": "jpg",
     "image/webp": "webp",
 }
+PDF_MIME = "application/pdf"
 TABLE_COLUMN_TYPES = {"string", "number", "date", "link"}
 
 
@@ -195,6 +203,196 @@ def _validated_run_id(raw: str) -> str:
     return raw
 
 
+def _artifact_run_dir() -> Path:
+    runtime_value = os.environ.get("WIKI_AGENT_RUNTIME_DIR")
+    if not runtime_value:
+        raise ArtifactValidationError("WIKI_AGENT_RUNTIME_DIR is required")
+    runtime_dir = Path(runtime_value).expanduser()
+    run_id = _validated_run_id(os.environ.get("WIKI_RUN_ID") or "")
+    artifact_dir = runtime_dir / "runs" / run_id / "artifacts"
+    artifact_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if artifact_dir.is_symlink():
+        raise ArtifactValidationError("refusing symlink artifact directory")
+    artifact_dir.chmod(0o700)
+    return artifact_dir
+
+
+def _write_binary(artifact_dir: Path, artifact_id: str, extension: str, data: bytes) -> Path:
+    target = artifact_dir / f"{artifact_id}.{extension}"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(target, flags, 0o600)
+    try:
+        os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+    return target
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        return path.is_relative_to(root)
+    except AttributeError:  # pragma: no cover - Python <3.9 fallback
+        try:
+            path.relative_to(root)
+            return True
+        except ValueError:
+            return False
+
+
+def _pdf_path_allowed_roots() -> list[Path]:
+    roots: list[Path] = []
+    for var in ("WIKI_VAULT_DIR", "WIKI_AGENT_RUNTIME_DIR", "WIKI_AGENT_ARCHIVE_DIR"):
+        value = os.environ.get(var)
+        if not value:
+            continue
+        try:
+            roots.append(Path(value).expanduser().resolve(strict=False))
+        except (OSError, RuntimeError):
+            continue
+    return roots
+
+
+def _read_fd_bounded(fd: int, limit: int) -> bytes:
+    """Read up to `limit` bytes from `fd`. Reject if the source has more."""
+    chunks: list[bytes] = []
+    remaining = limit + 1  # +1 lets us detect overflow without buffering it
+    while remaining > 0:
+        chunk = os.read(fd, min(65536, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    data = b"".join(chunks)
+    if len(data) > limit:
+        raise ArtifactValidationError(
+            f"pdf payload exceeds the {limit // (1024 * 1024)}MB pdf limit"
+        )
+    return data
+
+
+def _open_root_fd(root: Path) -> int:
+    """Open ``root`` as an O_NOFOLLOW directory fd, or raise ArtifactValidationError."""
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    return os.open(root, flags)
+
+
+def _read_pdf_path(raw: str) -> bytes:
+    if not raw or not isinstance(raw, str):
+        raise ArtifactValidationError("payload.path must be a non-empty string")
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        raise ArtifactValidationError("payload.path must be an absolute filesystem path")
+    if candidate.is_symlink():
+        raise ArtifactValidationError("refusing symlink pdf source")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ArtifactValidationError(f"payload.path could not be resolved: {exc}") from exc
+    roots = _pdf_path_allowed_roots()
+    if not roots:
+        raise ArtifactValidationError(
+            "payload.path rejected: no allowed roots configured (set WIKI_VAULT_DIR or WIKI_AGENT_RUNTIME_DIR)"
+        )
+    # Find the containing root AND the relative path segments — the walker
+    # opens each component with O_NOFOLLOW so a symlink at ANY level
+    # (intermediate directory or leaf) fails. Plain O_NOFOLLOW on a
+    # single os.open() only protects the leaf.
+    containing_root: Path | None = None
+    relative_parts: tuple[str, ...] = ()
+    for root in roots:
+        if _is_relative_to(resolved, root):
+            containing_root = root
+            relative_parts = resolved.relative_to(root).parts
+            break
+    if containing_root is None:
+        raise ArtifactValidationError(
+            "payload.path is outside the allowed roots (vault, runtime, or archive)"
+        )
+    if not relative_parts:
+        raise ArtifactValidationError("payload.path must reference a file inside the root")
+    try:
+        root_fd = _open_root_fd(containing_root)
+    except OSError as exc:
+        raise ArtifactValidationError(f"allowed root could not be opened: {exc}") from exc
+    # NONBLOCK on the leaf keeps FIFOs/devices swapped in at the last step
+    # from blocking the open — fstat below still rejects them.
+    final_flags = getattr(os, "O_NONBLOCK", 0)
+    try:
+        try:
+            fd = open_relative_file(
+                root_fd, relative_parts, extra_final_flags=final_flags
+            )
+        except OSError as exc:
+            raise ArtifactValidationError(
+                f"payload.path could not be opened: {exc}"
+            ) from exc
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise ArtifactValidationError(
+                    "payload.path must reference a regular file"
+                )
+            if info.st_size > PDF_LIMIT:
+                raise ArtifactValidationError(
+                    f"pdf payload exceeds the {PDF_LIMIT // (1024 * 1024)}MB pdf limit"
+                )
+            return _read_fd_bounded(fd, PDF_LIMIT)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(root_fd)
+
+
+def _write_pdf(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
+    extra = payload.keys() - {"data_base64", "path"}
+    if extra:
+        raise ArtifactValidationError(f"unknown field: {sorted(extra)[0]}")
+    has_base64 = "data_base64" in payload
+    has_path = "path" in payload
+    if has_base64 == has_path:
+        raise ArtifactValidationError(
+            "pdf payload must include exactly one of data_base64 or path"
+        )
+    if has_base64:
+        encoded = _require_string(payload["data_base64"], "payload.data_base64")
+        if len(encoded) > ((PDF_LIMIT + 2) // 3) * 4 + 4:
+            raise ArtifactValidationError(
+                f"pdf payload exceeds the {PDF_LIMIT // (1024 * 1024)}MB pdf limit"
+            )
+        try:
+            data = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ArtifactValidationError("payload.data_base64 is not valid base64") from exc
+    else:
+        data = _read_pdf_path(str(payload["path"]))
+    if len(data) > PDF_LIMIT:
+        raise ArtifactValidationError(
+            f"pdf payload exceeds the {PDF_LIMIT // (1024 * 1024)}MB pdf limit"
+        )
+    if not data.startswith(PDF_MAGIC):
+        raise ArtifactValidationError("pdf payload is not a valid PDF (missing %PDF- header)")
+    artifact_dir = _artifact_run_dir()
+    _write_binary(artifact_dir, artifact_id, "pdf", data)
+    return {
+        "ref": f"artifact://{artifact_id}",
+        "mime": PDF_MIME,
+        "byte_size": len(data),
+    }
+
+
 def _write_image(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
     _require_keys(payload, required={"data_base64", "mime"})
     encoded = _require_string(payload["data_base64"], "payload.data_base64")
@@ -217,30 +415,8 @@ def _write_image(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
     if len(data) > IMAGE_LIMIT:
         raise ArtifactValidationError("image payload exceeds the 5MB image limit")
 
-    runtime_value = os.environ.get("WIKI_AGENT_RUNTIME_DIR")
-    if not runtime_value:
-        raise ArtifactValidationError("WIKI_AGENT_RUNTIME_DIR is required")
-    runtime_dir = Path(runtime_value).expanduser()
-    run_id = _validated_run_id(os.environ.get("WIKI_RUN_ID") or "")
-    artifact_dir = runtime_dir / "runs" / run_id / "artifacts"
-    artifact_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if artifact_dir.is_symlink():
-        raise ArtifactValidationError("refusing symlink artifact directory")
-    artifact_dir.chmod(0o700)
-    target = artifact_dir / f"{artifact_id}.{IMAGE_TYPES[mime]}"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = os.open(target, flags, 0o600)
-    try:
-        os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-    except Exception:
-        target.unlink(missing_ok=True)
-        raise
+    artifact_dir = _artifact_run_dir()
+    _write_binary(artifact_dir, artifact_id, IMAGE_TYPES[mime], data)
     return {
         "ref": f"artifact://{artifact_id}",
         "mime": mime,
@@ -272,6 +448,8 @@ def render_artifact(arguments: Any) -> dict[str, Any]:
     artifact = {"kind": kind}
     if kind == "image":
         artifact.update(_write_image(payload, artifact_id))
+    elif kind == "pdf":
+        artifact.update(_write_pdf(payload, artifact_id))
     else:
         artifact.update(_validate_text_payload(kind, payload))
     event: dict[str, Any] = {
@@ -319,7 +497,7 @@ def artifact_from_text(value: Any) -> dict[str, Any] | None:
         ):
             return None
     kind = artifact["kind"]
-    if kind != "image":
+    if kind not in {"image", "pdf"}:
         payload = {key: item for key, item in artifact.items() if key != "kind"}
         try:
             _validate_text_payload(kind, payload)
@@ -506,8 +684,41 @@ def _response(message: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def _drain_oversized_line(stream) -> None:
+    """Discard the rest of an oversized line in bounded chunks."""
+    while True:
+        chunk = stream.readline(65536)
+        if not chunk or chunk.endswith(b"\n"):
+            return
+
+
+def _emit(response: dict[str, Any]) -> None:
+    sys.stdout.write(json.dumps(response, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
 def main() -> None:
-    for raw_line in sys.stdin.buffer:
+    stream = sys.stdin.buffer
+    while True:
+        # readline(size) reads up to `size` bytes OR until a newline — this
+        # caps the buffered request before json.loads sees it, so an oversized
+        # base64 payload cannot exhaust memory before the pre-parse check.
+        raw_line = stream.readline(MAX_REQUEST_BYTES)
+        if not raw_line:
+            return
+        if not raw_line.endswith(b"\n"):
+            _drain_oversized_line(stream)
+            _emit({
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": {
+                    "code": -32700,
+                    "message": (
+                        f"request exceeds {MAX_REQUEST_BYTES}-byte transport limit"
+                    ),
+                },
+            })
+            continue
         try:
             message = json.loads(raw_line)
             if not isinstance(message, dict):
@@ -520,8 +731,7 @@ def main() -> None:
                 "error": {"code": -32700, "message": f"parse error: {exc}"},
             }
         if response is not None:
-            sys.stdout.write(json.dumps(response, separators=(",", ":")) + "\n")
-            sys.stdout.flush()
+            _emit(response)
 
 
 if __name__ == "__main__":
