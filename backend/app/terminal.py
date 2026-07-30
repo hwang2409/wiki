@@ -437,11 +437,22 @@ class TerminalSession:
                 with contextlib.suppress(Exception):
                     await websocket.close()
 
+    def display_cwd(self) -> str:
+        cwd = str(self.cwd)
+        home = str(Path.home())
+        if cwd == home:
+            return "~"
+        if cwd.startswith(home + os.sep):
+            return "~" + cwd[len(home):]
+        return cwd
+
     async def _send_loop(self, websocket: WebSocket) -> None:
         await websocket.send_json(
             {
                 "type": "hello",
                 "capabilities": {"binaryInput": True},
+                "cwd": self.display_cwd(),
+                "shell": self.shell_path,
             }
         )
         while True:
