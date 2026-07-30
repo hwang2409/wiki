@@ -6,6 +6,28 @@ import type { DashboardTicketsPayload } from "../src/dashboard";
 import { DashboardView } from "../src/dashboard";
 
 const EMPTY_PAYLOAD: DashboardTicketsPayload = { tickets: [], repo_allowlist: [] };
+const EMPTY_COSTS = {
+  updated_at: null,
+  totals: {
+    label: "all",
+    input: 0,
+    cache_read: 0,
+    cache_write: 0,
+    cached: 0,
+    output: 0,
+    reasoning: 0,
+    total_tokens: 0,
+    cost_usd: 0,
+    unpriced_tokens: 0,
+    pricing: "priced" as const,
+    models: [],
+  },
+  top: { worker: [], ticket: [], orchestrator: [], day: [] },
+  prompt_size_distribution: [],
+  velocity: { tokens_per_minute: 0, window_seconds: 60, tokens: 0 },
+  runs_scanned: 0,
+  refreshing: false,
+};
 
 function ticket(overrides: Partial<DashboardTicketsPayload["tickets"][number]> = {}) {
   return {
@@ -52,6 +74,38 @@ test("polling does not overlap: next fetch waits for prior completion", async ()
   await vi.advanceTimersByTimeAsync(60_000);
   expect(peak).toBe(1);
   expect(fetchFn.mock.calls.length).toBeGreaterThan(0);
+});
+
+test("successful cost polling makes one request per interval tick", async () => {
+  vi.useFakeTimers();
+  const originalFetch = globalThis.fetch;
+  const costRequests = vi.fn();
+  const transport = vi.fn(async (input: RequestInfo | URL) => {
+    if (String(input) === "/api/costs") costRequests();
+    return { ok: true, json: async () => EMPTY_COSTS } as Response;
+  });
+  globalThis.fetch = transport as typeof fetch;
+  try {
+    render(<DashboardView fetchTickets={async () => EMPTY_PAYLOAD} pollMs={5_000} />);
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(costRequests).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_000);
+    });
+    expect(costRequests).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_000);
+    });
+    expect(costRequests).toHaveBeenCalledTimes(3);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("unmount aborts inflight fetch", async () => {
