@@ -3,7 +3,7 @@ type: reference
 view: kanban
 tags: [todo]
 created: 2026-07-06
-updated: 2026-07-27
+updated: 2026-07-29
 ---
 
 Todo:
@@ -24,6 +24,7 @@ Todo:
 - [P3] WIKI-185 auto-plan mode — given Linear-style problem statement, LLM decomposes into subtasks; each renders as workgraph node; orch can edit/reorder before spawning. Backend: planner endpoint. Frontend: plan editor
 - [P3] WIKI-186 steer macros — reusable snippets in composer (reviewer prompt, mutation-verify contract, canonical-writer regression, iteration-cap check); one-click apply w/ ticket-name substitution. Cuts recurring prompt drafting
 - [P3] WIKI-187 hot.md dedicated editor UI — arc-boundary rewrite surface: split-pane w/ live preview, section templates (Active threads / Recent facts / Watchouts), word-count budget indicator (≤500 target). Currently hand-edited via Read/Edit tools
+- [P1] WIKI-217 supervisor fingerprint-swap wedge — dev-code clients (wiki-173 worktree, struck 2x 07-29) SIGTERM the prod supervisor via ensure_running swap; shutdown unlinks socket + holds flock while draining long-lived providers -> deadlock + backend 503 storm. Fix: guard swap for non-frozen fingerprints (WIKI_SUPERVISOR_AUTOSTART=off default for dev clients or isolated runtime dir), fix shutdown ordering (release lock / drain timeout). RCA: [[supervisor-fingerprint-swap-wedge]]
 
 Silky-smooth artifact rendering arc (Henry 2026-07-29):
 
