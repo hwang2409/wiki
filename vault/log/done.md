@@ -9,6 +9,8 @@ updated: 2026-07-30
 
 ## 2026-07-30
 
+- phoebe — PHO-14851 Phoebe Home Care admin_agent_tool_search enable merged (#12855 squash @01d77efe58, 3 review rounds)
+- phoebe — PHO-14843 admin scratchpad hardening merged (#12857 squash @1dd94824d2, 2 review rounds)
 - **wiki-app** — WIKI-152 agent-session chrome merged — PR #152, 3 review rounds; default chrome shows decision-relevant state only, all diagnostics consolidated in Run details disclosure, absence tests guard against noise creep, composer a11y fixed, screenshots on PR (https://github.com/hwang2409/wiki/pull/152)
 - **wiki-app** — WIKI-181 reviewer diversity harness merged — PR #151, 4 review rounds; opt-in N-lens parallel review on next_review w/ deterministic synthesis (exact-set + exact-SHA strictness, absence=dirty), canonical-handler e2e both paths, lens workers archived correctly (https://github.com/hwang2409/wiki/pull/151)
 - **wiki-app** — WIKI-176 live worker screencast strip merged — PR #149, 3 review rounds; bounded EOF-window tails via pathwalk, single batched poller w/ ETag/304, 20-row strips on fleet + ticket cards, ANSI/control stripping (https://github.com/hwang2409/wiki/pull/149)
