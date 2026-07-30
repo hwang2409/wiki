@@ -1263,7 +1263,7 @@ def _gate_result(args: argparse.Namespace) -> dict:
             "--repo",
             repo,
             "--json",
-            "state,isDraft,mergeable,mergeStateStatus,headRefOid,url,statusCheckRollup",
+            "state,isDraft,mergeable,mergeStateStatus,headRefName,headRefOid,url,statusCheckRollup",
         ]
     )
     pr_url = view.get("url")
@@ -1304,6 +1304,7 @@ def _gate_result(args: argparse.Namespace) -> dict:
         "is_draft": bool(view.get("isDraft")),
         "mergeable": view.get("mergeable"),
         "merge_state_status": view.get("mergeStateStatus"),
+        "head_ref_name": view.get("headRefName"),
         "head_sha": head_sha,
         "checks": checks,
         "unresolved_threads": unresolved,

@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from . import backend_runtime
 from .next_review_schema import mcp_input_schema
+from .rebase_schema import mcp_input_schema as rebase_input_schema
 
 
 class AgentToolError(RuntimeError):
@@ -161,6 +162,17 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         ),
         "inputSchema": {
             **mcp_input_schema(),
+        },
+    },
+    {
+        "name": "rebase_dirty_pr",
+        "description": (
+            "If a PR gate reports CONFLICTING, start a scoped low-effort Codex "
+            "helper in the existing worker worktree to resolve mechanical "
+            "conflicts and escalate semantic conflicts."
+        ),
+        "inputSchema": {
+            **rebase_input_schema(),
         },
     },
     {
@@ -407,6 +419,13 @@ def next_review(arguments: Any) -> dict[str, Any]:
     return _backend_api("POST", "/api/agents/next-review", values)
 
 
+def rebase_dirty_pr(arguments: Any) -> dict[str, Any]:
+    values = _arguments(arguments, required={"pr_number", "ticket", "worker_id"})
+    if not isinstance(values["pr_number"], int) or isinstance(values["pr_number"], bool):
+        raise AgentToolError("pr_number must be an integer")
+    return _backend_api("POST", "/api/agents/rebase-dirty-pr", values)
+
+
 def autopilot_enable(arguments: Any) -> dict[str, Any]:
     values = _arguments(
         arguments,
@@ -451,6 +470,7 @@ TOOL_HANDLERS = {
     "replace_agent": replace_agent,
     "archive_agent": archive_agent,
     "next_review": next_review,
+    "rebase_dirty_pr": rebase_dirty_pr,
     "autopilot_enable": autopilot_enable,
     "autopilot_disable": autopilot_disable,
     "autopilot_status": autopilot_status,

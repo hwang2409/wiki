@@ -13,7 +13,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -64,6 +64,7 @@ from .agent_runtime.ticket import base_ticket
 from .agent_runtime.unknown_kind_telemetry import UnknownKindTelemetry
 from .frontend_static import mount_frontend_static
 from .next_review_schema import NextReviewIn
+from .rebase_schema import RebaseDirtyPrIn
 
 
 ROOT_DIR = Path(os.environ.get("WIKI_REPO_DIR", Path(__file__).resolve().parents[2])).resolve()
@@ -100,10 +101,64 @@ UNKNOWN_KIND_TELEMETRY: UnknownKindTelemetry | None = None
 logger = logging.getLogger(__name__)
 
 
+_REBASE_RECORDING_NOTIFIER: Callable[[str, str, str], None] | None = None
+
+
+def install_rebase_recording_notifier(
+    sender: Callable[[str, str, str], None] | None,
+) -> None:
+    """Route rebase-bot notifications to a recorder instead of the live channel.
+
+    Tests install a recorder before invoking rebase flows so they can assert
+    deliveries; passing ``None`` restores the default live path.  The recorder
+    takes priority over the pytest safety guard, so a test that installs a
+    recorder gets real observations of every delivery.  The recorder
+    receives the stable ``delivery_id`` as its third argument so tests can
+    verify the id propagates all the way through.
+    """
+
+    global _REBASE_RECORDING_NOTIFIER
+    _REBASE_RECORDING_NOTIFIER = sender
+
+
+def _rebase_bot_notification_sender(
+    target: str, text: str, delivery_id: str = ""
+) -> None:
+    """Send one rebase result through the configured agent message path.
+
+    ``delivery_id`` becomes ``MessageIn.dedupe_key`` so the receiving
+    orchestrator inbox drops duplicates from the outbox's bounded retry
+    loop.  Without this key threaded through, a transient sender failure
+    would silently stack N copies of the same rebase result.
+    """
+
+    recorder = _REBASE_RECORDING_NOTIFIER
+    if recorder is not None:
+        recorder(target, text, delivery_id)
+        return
+    # Fallback safety: if no recorder is installed and pytest is running,
+    # drop the message rather than paging live operators from a test.
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return
+    agent_message(
+        target,
+        MessageIn(
+            text=text,
+            mode="now",
+            source="rebase-bot",
+            dedupe_key=delivery_id or None,
+        ),
+        BackgroundTasks(),
+    )
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     global UNKNOWN_KIND_TELEMETRY
     runtime_paths = RuntimePaths.from_env()
+    from .agent_runtime import rebase_bot
+
+    rebase_bot.resume_pending_jobs(notify=_rebase_bot_notification_sender)
     UNKNOWN_KIND_TELEMETRY = UnknownKindTelemetry(runtime_paths)
     configured_backend = os.environ.get("WIKI_BACKEND_URL")
     if configured_backend:
@@ -4238,6 +4293,20 @@ def next_review_route(body: NextReviewIn) -> dict[str, Any]:
         reviewer_effort=body.reviewer_effort,
         prompt_template=body.prompt_template,
         request_id=body.request_id,
+    )
+
+
+@app.post("/api/agents/rebase-dirty-pr")
+def rebase_dirty_pr_route(body: RebaseDirtyPrIn) -> dict[str, Any]:
+    """Start the scoped conflict helper only when the PR is DIRTY."""
+
+    from .agent_runtime.rebase_bot import rebase_dirty_pr
+
+    return rebase_dirty_pr(
+        pr_number=body.pr_number,
+        ticket=body.ticket,
+        worker_id=body.worker_id,
+        notify=_rebase_bot_notification_sender,
     )
 
 
