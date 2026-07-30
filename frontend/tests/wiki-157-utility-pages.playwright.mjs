@@ -112,7 +112,7 @@ async function main() {
     for (const [hash, label, name, extra] of [
       ["#/activity", "Activity feed", "activity"],
       ["#/graph", "Graph view", "graph"],
-      ["#/health", "Vault health", "health"],
+      ["#/health", "Note freshness", "health"],
       ["#/tokens", "Token usage", "tokens"],
     ]) {
       await page.goto(`${backend.baseUrl}/${hash}`, { waitUntil: "domcontentloaded" });

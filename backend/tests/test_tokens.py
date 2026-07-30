@@ -468,6 +468,40 @@ class IncrementalScanTests(unittest.TestCase):
             self.assertEqual(tokens.query()["totals"]["input"], 500)
 
 
+class GroupedResetTests(unittest.TestCase):
+    """Round-3 review HIGH: codex ships counters as a group. When ANY
+    counter drops (resume / rotate) the others' apparent growth is really
+    a fresh count against a new baseline, not real activity. Re-anchoring
+    per-metric independently overcounts — probe returned 1000/20 where
+    truth is 1000/5."""
+
+    def test_grouped_reset_zeros_every_reported_metric(self) -> None:
+        with _EnvOverride() as paths:
+            from backend.app import tokens
+
+            day = paths["codex"] / "2026/07/08"
+            rows = [
+                _codex_session_meta("2026-07-08T18:00:00Z", "gpt-5.4"),
+                _codex_token_row(
+                    "2026-07-08T18:00:10Z",
+                    {"input": 1000, "output": 5},
+                ),
+                # A resume/rotate: input drops (real reset), output's fresh
+                # count LOOKS like growth relative to the pre-reset value.
+                # Per-metric would credit that fake growth; grouped-reset
+                # must ignore both.
+                _codex_token_row(
+                    "2026-07-08T18:05:00Z",
+                    {"input": 500, "output": 20},
+                ),
+            ]
+            _write_jsonl(day / "rollout-reset.jsonl", rows)
+            tokens.refresh()
+            totals = tokens.query()["totals"]
+            self.assertEqual(totals["input"], 1000)
+            self.assertEqual(totals["output"], 5)
+
+
 class MetricAvailabilityTests(unittest.TestCase):
     """WIKI-157: `reasoning` and `cached` must be OMITTED from the response
     when no source contributed them (claude never reports reasoning), so the
@@ -562,6 +596,46 @@ class MetricAvailabilityTests(unittest.TestCase):
                     per_series_reasoning.setdefault(key, set()).add("reasoning" in values)
             self.assertEqual(per_series_reasoning["codex/gpt-5.4"], {False})
             self.assertEqual(per_series_reasoning["codex/o1"], {True})
+
+    def test_repeated_cumulative_on_plain_model_does_not_advertise_reasoning(self) -> None:
+        """Round-3 review: a plain non-reasoning model that reads back a
+        stale cumulative reasoning total (persisted across a mid-session
+        model switch) must not fake-report reasoning as available. The
+        `provided` flag lives on the DELTA, not the cumulative."""
+        with _EnvOverride() as paths:
+            from backend.app import tokens
+
+            day = paths["codex"] / "2026/07/08"
+            rows = [
+                _codex_session_meta("2026-07-08T18:00:00Z", "o1"),
+                _codex_token_row(
+                    "2026-07-08T18:00:10Z",
+                    {"input": 100, "output": 20, "reasoning": 5},
+                ),
+                _codex_turn_context("2026-07-08T18:05:00Z", "gpt-5.4"),
+                # Plain model reads back the last reasoning cumulative
+                # unchanged — no new reasoning tokens, but the raw field
+                # is still present. Delta = 0 → NOT available.
+                _codex_token_row(
+                    "2026-07-08T18:10:00Z",
+                    {"input": 200, "output": 40, "reasoning": 5},
+                ),
+                _codex_token_row(
+                    "2026-07-08T18:15:00Z",
+                    {"input": 300, "output": 60, "reasoning": 5},
+                ),
+            ]
+            _write_jsonl(day / "rollout-repeat.jsonl", rows)
+            tokens.refresh()
+            per_series_reasoning = {}
+            for bucket in tokens.query()["buckets"]:
+                for key, values in bucket["series"].items():
+                    per_series_reasoning.setdefault(key, set()).add(
+                        "reasoning" in values
+                    )
+            # The reasoning model gets reasoning; the plain model does NOT.
+            self.assertEqual(per_series_reasoning["codex/o1"], {True})
+            self.assertEqual(per_series_reasoning["codex/gpt-5.4"], {False})
 
     def test_plain_non_reasoning_model_never_marks_reasoning_available(self) -> None:
         with _EnvOverride() as paths:

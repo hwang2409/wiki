@@ -65,11 +65,11 @@ export function HealthView({
 
   return (
     <UtilityPage
-      title="Vault health"
+      title="Note freshness"
       subtitle={
         <>
-          Living notes ({showAll ? "all types" : "reference + campaign"}) ranked stalest-first —
-          agent memory rots when these stop moving.
+          {showAll ? "All notes" : "Reference and campaign notes"} ranked oldest-first, so
+          long-lived notes stay easy to spot and revisit.
         </>
       }
       actions={
@@ -87,7 +87,7 @@ export function HealthView({
     >
       {error ? (
         <UtilityError
-          title="Vault health is unavailable"
+          title="Note freshness is unavailable"
           message={error}
           onRetry={onRetry}
         />
@@ -95,7 +95,7 @@ export function HealthView({
         <UtilityLoading label="Reading vault notes…" />
       ) : (
         <div className="health-view">
-          <div className="health-summary" role="group" aria-label="Vault freshness summary">
+          <div className="health-summary" role="group" aria-label="Note freshness summary">
             {(Object.keys(counts) as Bucket[]).map((bucket) => (
               <div className={`health-stat health-${bucket}`} key={bucket}>
                 <span className="health-stat-count tabular-nums">{counts[bucket]}</span>
@@ -111,14 +111,14 @@ export function HealthView({
                   ? "No notes in the vault yet"
                   : showAll
                     ? "No notes match this view"
-                    : "No living notes yet"
+                    : "No reference or campaign notes yet"
               }
               message={
                 notes.length === 0
                   ? "Create a note and it will appear here as it ages."
                   : showAll
                     ? "Try creating a note or toggle types."
-                    : "Reference and campaign notes power agent memory — toggle all types to widen this list."
+                    : "Toggle all types to include shorter-lived notes in this list."
               }
             />
           ) : (
@@ -143,7 +143,8 @@ export function HealthView({
           )}
 
           <p className="health-secondary-hint">
-            Structural vault drift is tracked separately — the note surface stays clean regardless.
+            Structural checks live elsewhere — this view only tracks how recently each note was
+            edited.
           </p>
         </div>
       )}

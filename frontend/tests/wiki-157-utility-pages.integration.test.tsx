@@ -93,6 +93,46 @@ test("activity page: empty state renders when there are no commits", async () =>
   }
 });
 
+test("activity page: refresh failure preserves stale entries with a retry banner", async () => {
+  let call = 0;
+  const restore = installFetch(async () => {
+    call += 1;
+    if (call === 1) {
+      return jsonResponse([
+        {
+          sha: "aaa1111",
+          date: "2026-07-30T09:00:00+00:00",
+          message: "seed message",
+          files: [{ path: "vault/notes/one.md", status: "A" }],
+        },
+      ]);
+    }
+    throw new Error("refresh boom");
+  });
+  try {
+    const { rerender } = render(<ActivityFeed onOpenNote={() => {}} refreshTick={0} />);
+    await waitFor(() => {
+      expect(screen.getByText("seed message")).toBeTruthy();
+    });
+    rerender(<ActivityFeed onOpenNote={() => {}} refreshTick={1} />);
+    await waitFor(() => {
+      // Loaded entry survives the refresh failure.
+      expect(screen.getByText("seed message")).toBeTruthy();
+      // Non-blocking banner is present with a retry affordance.
+      const banner = document.querySelector<HTMLElement>(".activity-refresh-banner");
+      expect(banner).toBeTruthy();
+      expect(banner!.textContent).toContain("refresh boom");
+      expect(
+        banner!.querySelector<HTMLButtonElement>(".activity-refresh-retry"),
+      ).toBeTruthy();
+    });
+    // Regression: refresh failure must NOT swap the body out for the error state.
+    expect(screen.queryByText(/Activity is unavailable/i)).toBeNull();
+  } finally {
+    restore();
+  }
+});
+
 test("activity page: day heading is friendly, status codes are labels", async () => {
   const today = new Date();
   const iso = new Date(
@@ -147,10 +187,12 @@ test("health page: loading state does NOT read as empty vault", () => {
       onRetry={() => {}}
     />,
   );
-  expect(screen.getByText("Vault health")).toBeTruthy();
+  expect(screen.getByText("Note freshness")).toBeTruthy();
   expect(screen.getByRole("status").textContent ?? "").toContain("Reading vault notes");
   // BLOCKING guard: booting must NOT surface the vault-empty state.
   expect(screen.queryByText(/No notes in the vault yet/i)).toBeNull();
+  // Round-3 review: rename dropped the "agent memory rots" loaded language.
+  expect(document.body.textContent ?? "").not.toMatch(/agent memory rots/i);
 });
 
 test("health page: boot failure surfaces retry, calls onRetry", () => {
@@ -165,7 +207,7 @@ test("health page: boot failure surfaces retry, calls onRetry", () => {
       onRetry={onRetry}
     />,
   );
-  expect(screen.getByRole("alert").textContent).toContain("Vault health is unavailable");
+  expect(screen.getByRole("alert").textContent).toContain("Note freshness is unavailable");
   fireEvent.click(screen.getByRole("button", { name: /Retry/i }));
   expect(onRetry).toHaveBeenCalledTimes(1);
 });

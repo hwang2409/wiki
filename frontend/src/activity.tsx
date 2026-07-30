@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { ChevronRight, FileText } from "lucide-react";
+import { AlertTriangle, ChevronRight, FileText, RefreshCw } from "lucide-react";
 import { getActivity, getActivityDiff } from "./api";
 import type { ActivityCommit } from "./api";
 import { LoadingPlaceholder } from "./loading";
@@ -151,12 +151,14 @@ export function ActivityFeed({
     });
   }, []);
 
+  const hasCommits = commits !== null && commits.length > 0;
+
   return (
     <UtilityPage
       title="Activity feed"
       subtitle="Chronological vault changes — each entry groups the notes touched together."
     >
-      {error ? (
+      {error && !hasCommits ? (
         <UtilityError
           message={error}
           onRetry={retry}
@@ -170,12 +172,34 @@ export function ActivityFeed({
           message="Vault changes will land here as notes are created, edited, or moved."
         />
       ) : (
-        <ActivityBody
-          commits={commits}
-          expanded={expanded}
-          onOpenNote={onOpenNote}
-          onToggle={toggle}
-        />
+        <>
+          {error ? (
+            <div
+              className="activity-refresh-banner"
+              role="status"
+              aria-live="polite"
+            >
+              <AlertTriangle aria-hidden="true" size={13} />
+              <span className="activity-refresh-message">
+                Showing the last loaded entries. Refresh failed: {error}
+              </span>
+              <button
+                className="activity-refresh-retry"
+                type="button"
+                onClick={retry}
+              >
+                <RefreshCw aria-hidden="true" size={12} />
+                <span>Retry</span>
+              </button>
+            </div>
+          ) : null}
+          <ActivityBody
+            commits={commits}
+            expanded={expanded}
+            onOpenNote={onOpenNote}
+            onToggle={toggle}
+          />
+        </>
       )}
     </UtilityPage>
   );

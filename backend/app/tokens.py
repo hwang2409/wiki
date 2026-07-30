@@ -245,26 +245,32 @@ def _codex_apply(state: dict, file_state: dict, row: dict, index: dict) -> None:
         return
 
     prev: dict[str, int] = file_state.get("cum") or {}
+    # Codex ships the counters as a group. A resume/rotate resets ALL of them
+    # to fresh baselines in the same event — a metric that appears to have
+    # grown after another metric dropped is really a fresh count, not real
+    # activity. Detect the reset once across cum_event, then zero every
+    # reported metric together. (Round-3 review: per-metric re-anchor
+    # over-counted grouped resets.)
+    grouped_reset = any(
+        prev.get(k) is not None and v < prev[k] for k, v in cum_event.items()
+    )
     delta: dict[str, int] = {}
-    for k, v in cum_event.items():
-        p = prev.get(k)
-        if p is None:
-            # First appearance of this metric on this file — cumulative IS
-            # the delta.
-            delta[k] = v
-        elif v < p:
-            # Per-metric re-anchor (resume/rotate). Zero this metric only —
-            # co-reported metrics that continued to advance still contribute.
-            delta[k] = 0
-        else:
-            delta[k] = v - p
+    if grouped_reset:
+        delta = {k: 0 for k in cum_event}
+    else:
+        for k, v in cum_event.items():
+            p = prev.get(k)
+            delta[k] = v if p is None else v - p
 
-    # Availability semantics per model (round-3 review): a plain
-    # non-reasoning model that ships reasoning_output_tokens: 0 is *not*
-    # actually reasoning — don't advertise the metric. Only mark reasoning
-    # available once the model has actually accrued reasoning tokens.
+    # Availability is gated on a POSITIVE DELTA — not on the cumulative
+    # total. A plain non-reasoning model that reads back the last reasoning
+    # cumulative (persisted across a mid-session model switch) would
+    # otherwise fake-report reasoning as available. Round-3 review.
+    # input / cached / output are structurally reported by codex, so their
+    # presence in cum_event is enough — reasoning is the metric with
+    # per-model variance and must earn its slot with real activity.
     provided = {"input", "cached", "output"} & set(cum_event)
-    if cum_event.get("reasoning", 0) > 0:
+    if delta.get("reasoning", 0) > 0:
         provided.add("reasoning")
 
     # Persist the new cumulative — absent fields retain their prior last

@@ -3793,6 +3793,55 @@ body.is-resizing-panes .pane-cell {
   font-size: var(--font-ui-smaller);
 }
 
+.activity-refresh-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: var(--readable-col);
+  margin: 8px auto 4px;
+  padding: 6px 12px;
+  border: 1px solid
+    color-mix(in srgb, var(--accent-warning, var(--text-muted)) 40%, var(--background-modifier-border));
+  border-radius: var(--radius-m);
+  background: color-mix(
+    in srgb,
+    var(--accent-warning, var(--text-muted)) 5%,
+    var(--background-primary-alt)
+  );
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
+.activity-refresh-banner svg {
+  color: var(--accent-warning, var(--text-muted));
+  flex-shrink: 0;
+}
+
+.activity-refresh-message {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.activity-refresh-retry {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  background: var(--background-primary);
+  color: var(--text-normal);
+  cursor: pointer;
+  font-size: var(--font-ui-smaller);
+  font-weight: var(--fw-medium);
+}
+
+.activity-refresh-retry:hover {
+  background: var(--background-modifier-hover);
+  border-color: var(--text-faint);
+}
+
 .activity-day-heading {
   margin: 24px 0 8px;
   color: var(--text-muted);
@@ -4468,7 +4517,7 @@ body.is-resizing-panes .pane-cell {
   text-align: center;
 }
 
-/* Vault health */
+/* Note freshness */
 
 .health-view {
   max-width: var(--readable-col);
