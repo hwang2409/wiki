@@ -572,20 +572,37 @@ class Mp4Stbl_stsdStructuralTests(unittest.TestCase):
         # Round-5 reviewer's regression: an attacker marker placed AFTER
         # the last declared stsd entry survived in-place scrub. Under
         # reconstruction, we only emit what we parsed — trailing bytes
-        # cannot appear in the output.
+        # cannot appear in the output. We splice a marker into the real
+        # fixture's stsd (past the last declared entry) and verify it
+        # never reaches the stored output.
         marker = b"round5-reviewer-marker-must-not-survive"
-        # A valid 8-byte sample entry (size=8, type="avc1") + trailing bytes.
-        stsd_body = (
-            b"\x00\x00\x00\x00"                    # version+flags
-            + struct.pack(">I", 1)                 # entry_count = 1
-            + struct.pack(">I", 8) + b"avc1"       # the single sample entry
-            + marker                               # attacker trailer
-        )
-        payload = self._make_mp4_with_stsd(stsd_body)
-        # Sanity: marker WAS in the original bytes.
-        self.assertIn(marker, payload)
-        result = media_scrub.scrub_video(payload, "video/mp4")
-        # Reconstruction cannot smuggle it into the output.
+        original = REAL_MP4.read_bytes()
+        stsd_pos = original.find(b"stsd")
+        assert stsd_pos > 0
+        stsd_size = struct.unpack(">I", original[stsd_pos - 4:stsd_pos])[0]
+        stsd_end = stsd_pos - 4 + stsd_size
+        # Insert marker AFTER the last declared sample entry (which fills
+        # the whole stsd body in the fixture — the marker is trailing).
+        # The whole file must be extended so the size fields around it
+        # remain consistent; we grow moov + trak + mdia + minf + stbl +
+        # stsd sizes by len(marker).
+        # Simpler: leave file structurally consistent by growing stsd's
+        # size claim to include the marker. Then verify marker survives
+        # in the ORIGINAL input but not the output.
+        grown_stsd_size = stsd_size + len(marker)
+        assembled = bytearray(original)
+        assembled[stsd_pos - 4:stsd_pos] = struct.pack(">I", grown_stsd_size)
+        # Grow all enclosing containers' sizes too so the file parses.
+        # trak/mdia/minf/stbl each carry stsd. Walk parents by find().
+        for parent in (b"stbl", b"minf", b"mdia", b"trak", b"moov"):
+            pos = assembled.find(parent)
+            assert pos > 0
+            existing = struct.unpack(">I", bytes(assembled[pos - 4:pos]))[0]
+            assembled[pos - 4:pos] = struct.pack(">I", existing + len(marker))
+        # Insert the marker at the end of stsd.
+        assembled[stsd_end:stsd_end] = marker
+        self.assertIn(marker, bytes(assembled))
+        result = media_scrub.scrub_video(bytes(assembled), "video/mp4")
         self.assertNotIn(marker, result.data)
 
     def test_stsd_outside_stbl_chain_is_ignored(self) -> None:
@@ -621,6 +638,172 @@ class Mp4Stbl_stsdStructuralTests(unittest.TestCase):
         moov = self._wrap_atom(b"moov", mvhd + trak + stsd)
         with self.assertRaisesRegex(media_scrub.MediaScrubError, "stbl/stsd"):
             media_scrub.scrub_video(ftyp + moov, "video/mp4")
+
+
+class Mp4Round6SurvivorProbes(unittest.TestCase):
+    """Round-6 review named five reviewer-confirmed byte survivors. Each
+    is exercised here as a stored-bytes probe: build a hostile input,
+    scrub, and assert the marker never appears in the output (or that
+    the file is rejected outright, per strict-subset acceptance)."""
+
+    @staticmethod
+    def _wrap(atom_type: bytes, body: bytes) -> bytes:
+        return struct.pack(">I", 8 + len(body)) + atom_type + body
+
+    def test_top_level_skip_content_is_zeroed(self) -> None:
+        # Round-6 survivor: `skip` at top level. Pre-R6 the atom was
+        # emitted through, keeping its body bytes. Under strict rebuild,
+        # `skip` becomes a same-size `free` box with zeroed body.
+        real = REAL_MP4.read_bytes()
+        marker = b"round6-skip-content-must-not-survive"
+        skip_box = self._wrap(b"skip", marker + b"\x00" * 40)
+        payload = real + skip_box
+        result = media_scrub.scrub_video(payload, "video/mp4")
+        # The marker bytes are gone…
+        self.assertNotIn(marker, result.data)
+        # …and no top-level `skip` box exists in the output. (Walk the
+        # atoms so we don't false-match on "skip" substrings inside
+        # mdat — x264's SEI legitimately embeds `fast_pskip=…`.)
+        offset = 0
+        while offset + 8 <= len(result.data):
+            size = struct.unpack(">I", result.data[offset:offset + 4])[0]
+            atom_type = result.data[offset + 4:offset + 8]
+            self.assertNotEqual(atom_type, b"skip")
+            if size == 0:
+                break
+            offset += size
+
+    def test_empty_mdat_is_rejected(self) -> None:
+        # Round-6 MAJOR #2: a zero-body mdat passes reconstruction shape
+        # but fails ffmpeg decode. Reject at validation.
+        real = REAL_MP4.read_bytes()
+        # Locate the actual mdat and empty its body.
+        mdat_pos = real.find(b"mdat")
+        assert mdat_pos > 0
+        mdat_size = struct.unpack(">I", real[mdat_pos - 4:mdat_pos])[0]
+        mdat_end = mdat_pos - 4 + mdat_size
+        payload = bytearray(real)
+        # Replace mdat body with nothing: shrink mdat to just its 8-byte header
+        payload[mdat_pos - 4:mdat_end] = struct.pack(">I", 8) + b"mdat"
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "mdat body is empty"
+        ):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+    def test_unknown_child_inside_dinf_is_rejected(self) -> None:
+        # Round-6 survivor: dinf contained an unknown child that survived
+        # opaque copy. Canonical rebuild rejects anything that isn't the
+        # self-referencing dref/url shape.
+        # Splice a foreign child into dinf and confirm reject.
+        real = REAL_MP4.read_bytes()
+        dinf_pos = real.find(b"dinf")
+        assert dinf_pos > 0
+        dinf_size = struct.unpack(">I", real[dinf_pos - 4:dinf_pos])[0]
+        dinf_end = dinf_pos - 4 + dinf_size
+        foreign = self._wrap(b"junk", b"round6-dinf-unknown-marker")
+        payload = bytearray(real)
+        # Grow dinf and all ancestors by the added child size.
+        added = len(foreign)
+        payload[dinf_pos - 4:dinf_pos] = struct.pack(">I", dinf_size + added)
+        for parent in (b"minf", b"mdia", b"trak", b"moov"):
+            pos = payload.find(parent)
+            existing = struct.unpack(">I", bytes(payload[pos - 4:pos]))[0]
+            payload[pos - 4:pos] = struct.pack(">I", existing + added)
+        payload[dinf_end:dinf_end] = foreign
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "dinf must contain exactly one dref"
+        ):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+    def test_unknown_inner_box_inside_stsd_sample_entry_is_rejected(self) -> None:
+        # Round-6 survivor: an unknown inner box inside e.g. avc1
+        # (something like `junk`) was copied through opaquely. Under
+        # rebuild the inner-box allowlist rejects it.
+        real = REAL_MP4.read_bytes()
+        # Find stsd/avc1 entry, splice a foreign inner box before avcC.
+        stsd_pos = real.find(b"stsd")
+        stsd_size = struct.unpack(">I", real[stsd_pos - 4:stsd_pos])[0]
+        # avc1 sits right after stsd's 8-byte v+f+count header.
+        entry_pos = stsd_pos - 4 + 8 + 8  # stsd header(8) + v+f+count(8)
+        entry_size = struct.unpack(">I", real[entry_pos:entry_pos + 4])[0]
+        entry_end = entry_pos + entry_size
+        # Insert a foreign box AT THE END of the entry (after all inner boxes).
+        foreign = self._wrap(b"junk", b"round6-stsd-inner-marker")
+        added = len(foreign)
+        payload = bytearray(real)
+        # Grow the sample entry size, stsd size, and every ancestor.
+        payload[entry_pos:entry_pos + 4] = struct.pack(">I", entry_size + added)
+        payload[stsd_pos - 4:stsd_pos] = struct.pack(">I", stsd_size + added)
+        for parent in (b"stbl", b"minf", b"mdia", b"trak", b"moov"):
+            pos = payload.find(parent)
+            existing = struct.unpack(">I", bytes(payload[pos - 4:pos]))[0]
+            payload[pos - 4:pos] = struct.pack(">I", existing + added)
+        payload[entry_end:entry_end] = foreign
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "sample entry inner box .* outside allowlist"
+        ):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+    def test_compressor_name_is_zeroed_in_visual_sample_entry(self) -> None:
+        # ffmpeg embeds its encoder identity ("Lavc62.28.101 libx264") in
+        # the compressor_name field of avc1. That's metadata leakage.
+        # Round-6 rebuild zeros the 32-byte compressor_name field.
+        original = REAL_MP4.read_bytes()
+        self.assertIn(b"libx264", original)
+        self.assertIn(b"Lavc", original)
+        result = media_scrub.scrub_video(original, "video/mp4")
+        self.assertNotIn(b"libx264", result.data)
+        self.assertNotIn(b"Lavc", result.data)
+
+
+class WavRound6SurvivorProbes(unittest.TestCase):
+    def test_fact_chunk_content_beyond_sample_length_is_zeroed(self) -> None:
+        # Round-6 survivor: WAV `fact` content copied through opaquely.
+        # A malicious fact of, say, 32 bytes could hide metadata. Under
+        # rebuild fact is emitted as exactly 4 bytes = sample_length.
+        # Build a fresh WAV whose fact chunk holds a marker past its
+        # 4-byte sample_length field.
+        marker = b"round6-wav-fact-content-marker"
+        fmt_body = struct.pack("<HHIIHH", 1, 1, 16000, 32000, 2, 16)
+        fmt_chunk = b"fmt " + struct.pack("<I", len(fmt_body)) + fmt_body
+        fact_payload = struct.pack("<I", 12345) + marker
+        pad = 1 if len(fact_payload) & 1 else 0
+        fact_chunk = (
+            b"fact"
+            + struct.pack("<I", len(fact_payload))
+            + fact_payload
+            + (b"\x00" * pad)
+        )
+        data_chunk = b"data" + struct.pack("<I", 8) + b"\x00\x01" * 4
+        body = b"WAVE" + fmt_chunk + fact_chunk + data_chunk
+        payload = b"RIFF" + struct.pack("<I", len(body)) + body
+        self.assertIn(marker, payload)
+        result = media_scrub.scrub_audio(payload, "audio/wav")
+        self.assertNotIn(marker, result.data)
+        # fact chunk in output must be exactly 4 bytes body.
+        fact_out = result.data.find(b"fact")
+        self.assertGreater(fact_out, 0)
+        fact_size = struct.unpack("<I", result.data[fact_out + 4:fact_out + 8])[0]
+        self.assertEqual(fact_size, 4)
+
+    def test_trailing_bytes_inside_pcm_fmt_chunk_are_dropped(self) -> None:
+        # Round-6 survivor: PCM fmt chunks larger than 16 bytes had their
+        # tail copied through. Under rebuild PCM emits exactly 16 bytes;
+        # extensible emits exactly 40. Anything past that is dropped.
+        marker = b"round6-pcm-fmt-trailer-marker"
+        fmt_body = struct.pack("<HHIIHH", 1, 1, 16000, 32000, 2, 16) + marker
+        fmt_chunk = b"fmt " + struct.pack("<I", len(fmt_body)) + fmt_body + (b"\x00" if len(fmt_body) & 1 else b"")
+        data_chunk = b"data" + struct.pack("<I", 4) + b"\x00\x00\x00\x00"
+        body = b"WAVE" + fmt_chunk + data_chunk
+        payload = b"RIFF" + struct.pack("<I", len(body)) + body
+        self.assertIn(marker, payload)
+        result = media_scrub.scrub_audio(payload, "audio/wav")
+        self.assertNotIn(marker, result.data)
+        # fmt chunk in output must be exactly 16 bytes body.
+        fmt_out = result.data.find(b"fmt ")
+        self.assertEqual(fmt_out, 12)  # right after RIFF+size+WAVE
+        fmt_size = struct.unpack("<I", result.data[fmt_out + 4:fmt_out + 8])[0]
+        self.assertEqual(fmt_size, 16)
 
 
 class Mp4ReconstructionRegressionTests(unittest.TestCase):
