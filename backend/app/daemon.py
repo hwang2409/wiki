@@ -6,7 +6,6 @@ import json
 import os
 import plistlib
 import subprocess
-import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -90,10 +89,10 @@ def config_from_env(*, overrides: dict[str, str | None] | None = None) -> Daemon
         values.get("WIKI_AGENT_RUNTIME_DIR") or Path.home() / ".wiki" / "agent-runtime"
     ).expanduser().absolute()
     executable_raw = values.get("WIKI_BACKEND_EXECUTABLE")
-    executable = Path(executable_raw or sys.executable).expanduser().absolute()
-    python_module = "" if executable_raw else values.get(
-        "WIKI_DAEMON_PYTHON_MODULE", "backend.native_server"
-    )
+    executable = Path(
+        executable_raw or repo_dir / "dist" / "wiki-backend-sidecar" / "wiki-backend"
+    ).expanduser().absolute()
+    python_module = ""
     log_path = Path(
         values.get("WIKI_DAEMON_LOG_PATH")
         or Path.home() / "Library" / "Logs" / "Wiki" / "wiki-backend-daemon.log"
@@ -187,11 +186,20 @@ def _describe_failure(result: subprocess.CompletedProcess[str]) -> str:
     return detail
 
 
+def _service_absent_message(config: DaemonConfig) -> str:
+    return (
+        "Bad request.\n"
+        f'Could not find service "{config.label}" in domain for user gui: {os.getuid()}'
+    )
+
+
 def _service_absent(
     config: DaemonConfig, result: subprocess.CompletedProcess[str]
 ) -> bool:
-    canonical = f'Could not find service "{config.target}" in domain for system'
-    return result.returncode != 0 and _describe_failure(result) == canonical
+    return (
+        result.returncode == 113
+        and _describe_failure(result) == _service_absent_message(config)
+    )
 
 
 def _service_loaded(config: DaemonConfig) -> bool:

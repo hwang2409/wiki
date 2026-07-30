@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-import stat
+import socket
 import subprocess
 import sys
 import textwrap
@@ -13,9 +13,10 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from backend import native_server
 from backend.app import daemon
 from backend.app.agent_runtime.version import frozen_runtime_fingerprint
-from backend.native_server import rotate_log_file
+from backend.native_server import DaemonAuthSocket, rotate_log_file
 
 
 class LaunchAgentConfigTests(unittest.TestCase):
@@ -39,6 +40,24 @@ class LaunchAgentConfigTests(unittest.TestCase):
                 Path(__file__).parent / "fixtures" / "wiki-backend.launchd.plist"
             ).read_text(encoding="utf-8")
             self.assertEqual(daemon.render_plist(config), expected)
+
+    def test_service_absence_matches_captured_macos_output(self) -> None:
+        config = self._config(Path("/tmp/LaunchAgents"))
+        captured = subprocess.CompletedProcess(
+            ["launchctl", "print", config.target],
+            113,
+            "",
+            daemon._service_absent_message(config) + "\n",
+        )
+        self.assertTrue(daemon._service_absent(config, captured))
+        wrong_domain = subprocess.CompletedProcess(
+            captured.args,
+            113,
+            "",
+            "Bad request.\n"
+            f'Could not find service "{config.target}" in domain for system',
+        )
+        self.assertFalse(daemon._service_absent(config, wrong_domain))
 
     def test_install_preserves_seeded_live_runs_and_archive(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -104,9 +123,9 @@ class LaunchAgentConfigTests(unittest.TestCase):
                 if arguments[0] == "print":
                     return subprocess.CompletedProcess(
                         ["launchctl", *arguments],
-                        1,
+                        113,
                         "",
-                        f'Could not find service "{config.target}" in domain for system',
+                        daemon._service_absent_message(config),
                     )
                 return subprocess.CompletedProcess(
                     ["launchctl", *arguments], 0, "", ""
@@ -136,9 +155,9 @@ class LaunchAgentConfigTests(unittest.TestCase):
                 "_launchctl",
                 side_effect=lambda _config, *arguments: subprocess.CompletedProcess(
                     ["launchctl", *arguments],
-                    1 if arguments[0] == "bootout" or arguments[0] == "print" else 0,
+                    113 if arguments[0] == "bootout" or arguments[0] == "print" else 0,
                     "",
-                    f'Could not find service "{config.target}" in domain for system',
+                    daemon._service_absent_message(config),
                 ),
             ):
                 result = daemon.uninstall(config)
@@ -179,9 +198,9 @@ class LaunchAgentConfigTests(unittest.TestCase):
                     )
                 return subprocess.CompletedProcess(
                     ["launchctl", *arguments],
-                    1,
+                    113,
                     "",
-                    f'Could not find service "{config.target}" in domain for system',
+                    daemon._service_absent_message(config),
                 )
 
             with patch.object(daemon, "_launchctl", side_effect=fake_launchctl):
@@ -195,7 +214,7 @@ class DaemonLogTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             log_path = root / "logs" / "backend.log"
-            secret_path = root / "runtime" / "wiki-app-secret"
+            socket_path = root / "runtime" / "wiki-app-secret.sock"
             secret_copy = root / "secret-copy.txt"
             mode_copy = root / "secret-mode.txt"
             driver = root / "driver.py"
@@ -203,6 +222,8 @@ class DaemonLogTests(unittest.TestCase):
                 textwrap.dedent(
                     f"""
                     import os
+                    import socket
+                    import signal
                     import sys
                     from pathlib import Path
                     from backend import native_server
@@ -212,7 +233,13 @@ class DaemonLogTests(unittest.TestCase):
                             pass
 
                         def run(self):
-                            pass
+                            path = Path({str(socket_path)!r})
+                            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                                client.connect(str(path))
+                                secret = client.recv(4096).decode().strip()
+                            Path({str(secret_copy)!r}).write_text(secret, encoding="utf-8")
+                            Path({str(mode_copy)!r}).write_text(str(path.stat().st_mode), encoding="utf-8")
+                            os.kill(os.getpid(), signal.SIGTERM)
 
                     native_server.uvicorn.Config = lambda *args, **kwargs: object()
                     native_server.uvicorn.Server = FakeServer
@@ -223,9 +250,6 @@ class DaemonLogTests(unittest.TestCase):
                     os.environ["WIKI_APP_SECRET"] = "daemon-secret-never-logged"
                     os.environ["WIKI_AGENT_RUNTIME_DIR"] = {str(root / 'runtime')!r}
                     native_server.main()
-                    actual = Path({str(secret_path)!r})
-                    Path({str(secret_copy)!r}).write_text(actual.read_text(), encoding="utf-8")
-                    Path({str(mode_copy)!r}).write_text(str(actual.stat().st_mode), encoding="utf-8")
                     """
                 ),
                 encoding="utf-8",
@@ -239,8 +263,12 @@ class DaemonLogTests(unittest.TestCase):
                 text=True,
             )
             secret = secret_copy.read_text(encoding="utf-8")
-            self.assertEqual(stat.S_IMODE(int(mode_copy.read_text(encoding="utf-8"))), 0o600)
-            self.assertFalse(secret_path.exists())
+            self.assertEqual(
+                int(mode_copy.read_text(encoding="utf-8"), 10) & 0o777,
+                0o600,
+            )
+            self.assertFalse(socket_path.exists())
+            self.assertFalse((root / "runtime" / "wiki-app-secret").exists())
             logs = list(root.rglob("*.log"))
             self.assertTrue(logs)
             self.assertTrue(all(secret not in path.read_text() for path in logs))
@@ -288,6 +316,73 @@ class DaemonLogTests(unittest.TestCase):
                 "one",
             )
 
+    def test_runtime_log_rotator_reopens_after_size_limit(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "wiki-backend-daemon.log"
+            path.write_text("current", encoding="utf-8")
+            self.assertTrue(
+                native_server.rotate_daemon_log(
+                    path, max_bytes=1, backups=1, reopen=False
+                )
+            )
+            self.assertEqual(
+                path.with_name(path.name + ".1").read_text(encoding="utf-8"),
+                "current",
+            )
+
+
+class DaemonArtifactTests(unittest.TestCase):
+    def test_default_install_uses_frozen_bundle_executable(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / "dist" / "wiki-backend-sidecar" / "wiki-backend"
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"frozen backend")
+            config = daemon.config_from_env(
+                overrides={
+                    "WIKI_REPO_DIR": str(root),
+                    "WIKI_VAULT_DIR": str(root / "vault"),
+                    "WIKI_AGENT_RUNTIME_DIR": str(root / "runtime"),
+                    "WIKI_LAUNCH_AGENTS_DIR": str(root / "LaunchAgents"),
+                }
+            )
+            self.assertEqual(config.executable, executable)
+            self.assertEqual(config.python_module, "")
+            self.assertEqual(
+                daemon.plist_payload(config)["ProgramArguments"][0], str(executable)
+            )
+            self.assertEqual(
+                frozen_runtime_fingerprint(executable),
+                frozen_runtime_fingerprint(config.executable),
+            )
+
+
+class DaemonHandshakeTests(unittest.TestCase):
+    def test_handshake_reissues_secret_after_daemon_restart(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runtime_dir = Path(tmp) / "runtime"
+
+            first = DaemonAuthSocket(runtime_dir, "secret-before-restart")
+            first.start()
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.connect(str(first.path))
+                self.assertEqual(
+                    client.recv(4096).decode().strip(), "secret-before-restart"
+                )
+            first.close()
+
+            second = DaemonAuthSocket(runtime_dir, "secret-after-restart")
+            second.start()
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.connect(str(second.path))
+                self.assertEqual(
+                    client.recv(4096).decode().strip(), "secret-after-restart"
+                )
+            second.close()
+
+            self.assertFalse(first.path.exists())
+            self.assertEqual(list(runtime_dir.iterdir()), [])
+
 
 class DaemonCliTests(unittest.TestCase):
     def _write_launchctl_stub(self, root: Path) -> tuple[Path, Path]:
@@ -304,8 +399,8 @@ class DaemonCliTests(unittest.TestCase):
                     if [ -f "{root / 'loaded'}" ]; then
                         exit 0
                     fi
-                    printf 'Could not find service "gui/%s/{daemon.DEFAULT_LABEL}" in domain for system\\n' "$(id -u)" >&2
-                    exit 1
+                    printf 'Bad request.\\nCould not find service "{daemon.DEFAULT_LABEL}" in domain for user gui: %s\\n' "$(id -u)" >&2
+                    exit 113
                 fi
                 if [ "$1" = "bootout" ]; then
                     rm -f "{root / 'loaded'}"

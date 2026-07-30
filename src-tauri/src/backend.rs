@@ -7,13 +7,14 @@ use std::{
     io::{self, Read, Write},
     net::TcpListener,
     os::fd::AsRawFd,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::Mutex,
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use crate::daemon_handshake;
 use reqwest::{blocking::Client, Url};
 use tauri::{
     ipc::CapabilityBuilder, webview::NewWindowResponse, App, AppHandle, Manager, RunEvent,
@@ -138,7 +139,7 @@ struct LifecycleState {
     app_origin: Option<String>,
     sidecar: Option<SidecarState>,
     // Wiki.app origin secret received through the sidecar environment or the
-    // daemon's owner-only runtime file. Held in Rust process memory only.
+    // daemon's owner-only runtime socket. Held in Rust process memory only.
     // WIKI-148 round 6, Path B.
     wiki_app_secret: Option<String>,
     // Loopback origins for which a remote-scoped ACL capability granting
@@ -147,6 +148,7 @@ struct LifecycleState {
     // therefore need a fresh capability; tracking prevents duplicate
     // registration for the same origin. WIKI-148 round 7.
     ipc_authorized_origins: HashSet<String>,
+    daemon_managed: bool,
 }
 
 struct SidecarState {
@@ -319,6 +321,7 @@ fn start_sidecar(app: &AppHandle, restart_count: u8) -> Result<String, Box<dyn E
         let app_state = app.state::<NativeAppState>();
         let mut state = app_state.inner.lock().unwrap();
         state.wiki_app_secret = Some(app_secret.clone());
+        state.daemon_managed = false;
         state.sidecar = Some(SidecarState {
             child: Some(child),
             pid,
@@ -366,9 +369,10 @@ fn launch_backend_and_navigate(app: &AppHandle) {
         let launch_url = normalize_launch_url(&url);
         wait_for_health(app, &launch_url, None).map(|_| launch_url)
     } else if let Some(launch_url) = probe_persistent_daemon() {
-        match read_daemon_app_secret() {
+        match daemon_handshake::read_secret(&runtime_dir()) {
             Ok(secret) => {
                 set_app_secret(app, secret);
+                set_daemon_managed(app, true);
                 Ok(launch_url)
             }
             Err(_) => start_sidecar(app, 0),
@@ -425,42 +429,16 @@ fn probe_persistent_daemon() -> Option<String> {
     Some(launch_url)
 }
 
-fn read_daemon_app_secret() -> io::Result<String> {
-    let path = runtime_dir().join("wiki-app-secret");
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&path)?;
-    let mut metadata = unsafe { std::mem::zeroed::<libc::stat>() };
-    if unsafe { libc::fstat(file.as_raw_fd(), &mut metadata) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if metadata.st_uid != unsafe { libc::getuid() }
-        || metadata.st_mode & libc::S_IFMT != libc::S_IFREG
-        || metadata.st_mode & 0o077 != 0
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "daemon app secret file is not owner-only",
-        ));
-    }
-    let mut contents = String::new();
-    (&file).read_to_string(&mut contents)?;
-    let secret = contents.trim().to_string();
-    if secret.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "daemon app secret file is empty",
-        ));
-    }
-    fs::remove_file(&path)?;
-    Ok(secret)
-}
-
 fn set_app_secret(app: &AppHandle, secret: String) {
     let app_state = app.state::<NativeAppState>();
     let mut state = app_state.inner.lock().unwrap();
     state.wiki_app_secret = Some(secret);
+}
+
+fn set_daemon_managed(app: &AppHandle, daemon_managed: bool) {
+    let app_state = app.state::<NativeAppState>();
+    let mut state = app_state.inner.lock().unwrap();
+    state.daemon_managed = daemon_managed;
 }
 
 fn spawn_sidecar_logger(
@@ -707,9 +685,7 @@ fn set_app_origin(app: &AppHandle, launch_url: &str) {
         state.app_origin = origin.clone();
     }
     if let Err(err) = register_wiki_app_secret_capability(app, launch_url) {
-        eprintln!(
-            "failed to register get_wiki_app_secret capability for {launch_url}: {err}"
-        );
+        eprintln!("failed to register get_wiki_app_secret capability for {launch_url}: {err}");
     }
 }
 
@@ -728,8 +704,8 @@ fn register_wiki_app_secret_capability<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     launch_url: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let parsed = Url::parse(launch_url)
-        .map_err(|err| format!("invalid launch url {launch_url}: {err}"))?;
+    let parsed =
+        Url::parse(launch_url).map_err(|err| format!("invalid launch url {launch_url}: {err}"))?;
     let origin = parsed.origin().ascii_serialization();
     // urlpattern-style: origin + wildcard pathname keeps this scoped to
     // the exact scheme/host/port while allowing the SPA to navigate
@@ -770,8 +746,15 @@ fn app_origin(app: &AppHandle) -> Option<String> {
 /// `X-Wiki-App-Secret` header on composer requests. WIKI-148 round 6, Path B.
 #[tauri::command]
 pub fn get_wiki_app_secret(
+    app: AppHandle,
     state: tauri::State<'_, NativeAppState>,
 ) -> Result<String, String> {
+    let daemon_managed = state.inner.lock().unwrap().daemon_managed;
+    if daemon_managed {
+        if let Ok(secret) = daemon_handshake::read_secret(&runtime_dir()) {
+            set_app_secret(&app, secret);
+        }
+    }
     let guard = state.inner.lock().unwrap();
     guard
         .wiki_app_secret
@@ -782,8 +765,9 @@ pub fn get_wiki_app_secret(
 fn allow_in_webview(app: &AppHandle, url: &Url) -> bool {
     match url.scheme() {
         "tauri" | "asset" | "about" => true,
-        "http" | "https" => app_origin(app)
-            .is_some_and(|origin| origin == url.origin().ascii_serialization()),
+        "http" | "https" => {
+            app_origin(app).is_some_and(|origin| origin == url.origin().ascii_serialization())
+        }
         _ => false,
     }
 }
@@ -1061,7 +1045,10 @@ mod tests {
             register_wiki_app_secret_capability(&handle, LOOPBACK_URL).unwrap();
             let state = app.state::<NativeAppState>();
             let guard = state.inner.lock().unwrap();
-            let origin = Url::parse(LOOPBACK_URL).unwrap().origin().ascii_serialization();
+            let origin = Url::parse(LOOPBACK_URL)
+                .unwrap()
+                .origin()
+                .ascii_serialization();
             assert!(guard.ipc_authorized_origins.contains(&origin));
             assert_eq!(guard.ipc_authorized_origins.len(), 1);
         }

@@ -246,8 +246,8 @@ async def lifespan(_app: FastAPI):
 # --- Wiki.app origin secret (WIKI-148 round 6 — Path B) ---------------------
 # Per-startup random secret proving a request came from the Wiki.app main
 # process. Sidecars receive it through their private process environment.
-# Launchd backends persist it in a 0600 runtime file for the Tauri process.
-# It never travels through stdout or a daemon log.
+# Launchd backends serve it through a private runtime socket for the Tauri
+# process. It never travels through stdout or a daemon log.
 _WIKI_APP_SECRET_HOLDER: dict[str, str] = {
     "value": os.environ.get("WIKI_APP_SECRET") or secrets.token_urlsafe(32)
 }
@@ -268,36 +268,6 @@ def wiki_app_secret_boot_line() -> str:
     """Return the legacy marker for compatibility with older test callers."""
 
     return f"{_WIKI_APP_SECRET_MARKER}{wiki_app_secret()}"
-
-
-def wiki_app_secret_file_path() -> Path:
-    return RuntimePaths.from_env().runtime_dir / "wiki-app-secret"
-
-
-def write_wiki_app_secret_file(path: Path | None = None) -> Path:
-    """Atomically persist the daemon secret with owner-only permissions."""
-
-    target = path or wiki_app_secret_file_path()
-    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    target.parent.chmod(0o700)
-    descriptor, raw_temporary = tempfile.mkstemp(
-        prefix=f".{target.name}.", dir=target.parent
-    )
-    temporary = Path(raw_temporary)
-    try:
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            descriptor = -1
-            handle.write(wiki_app_secret())
-            handle.flush()
-            os.fsync(handle.fileno())
-        temporary.chmod(0o600)
-        os.replace(temporary, target)
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        temporary.unlink(missing_ok=True)
-    return target
 
 
 def require_wiki_app_origin(
