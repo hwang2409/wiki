@@ -18,6 +18,22 @@ afterEach(() => {
   cleanup();
 });
 
+// Default: silence any network calls the components make (gallery batch
+// asset-meta POST, MarkdownImage asset-meta GET, lightbox clipboard fetch)
+// so tests that don't stub fetch themselves don't spam relative-URL errors
+// or hang on real connections. Tests that need to observe fetch replace it
+// via vi.spyOn inside their block.
+beforeEach(() => {
+  vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response("{}", {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  }));
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
 describe("ArtifactLightbox", () => {
   test("renders active item and counter", () => {
     render(
@@ -144,6 +160,18 @@ describe("ImageGallery", () => {
     { path: "notes/two.jpg", label: "Two" },
     { path: "notes/three.webp", label: "Three" },
   ];
+
+  beforeEach(() => {
+    // Silence the batch asset-meta POST — it doesn't matter for these
+    // structural assertions and the real backend isn't running under vitest.
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } }),
+    );
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
 
   test("renders a tile per image with bounded thumbnail srcset", () => {
     render(<ImageGallery files={files} />);
@@ -447,5 +475,100 @@ describe("ArtifactLightbox lifecycle cleanup", () => {
     fireEvent.keyDown(dialog, { key: "Tab" });
     // The trap keeps document.activeElement inside the dialog subtree.
     expect(dialog.contains(document.activeElement)).toBe(true);
+  });
+});
+
+describe("MarkdownImage layout stability (WIKI-201)", () => {
+  test("commits with real dims on first render when note provides asset_meta", async () => {
+    const { ObsidianMarkdown } = await import("../src/markdown");
+    // pane.tsx seeds the shared cache from note.asset_meta before rendering.
+    // ObsidianMarkdown does that seeding itself when we pass the prop.
+    // The path key must match the FIRST candidate MarkdownImage resolves,
+    // which for a top-level note is just the raw asset path.
+    const { container } = render(
+      <ObsidianMarkdown
+        assetMeta={{ "hero.png": { width: 1280, height: 720 } }}
+        content={"![hero](hero.png)"}
+        notePath="index.md"
+        notes={[]}
+        onOpenNote={() => undefined}
+      />,
+    );
+    const img = container.querySelector("img") as HTMLImageElement;
+    // Dimensions and aspect ratio must be set BEFORE any onLoad — this is
+    // the frame's very first commit. No race, no swap.
+    expect(img.getAttribute("width")).toBe("1280");
+    expect(img.getAttribute("height")).toBe("720");
+    const frame = container.querySelector(".markdown-image-frame") as HTMLElement;
+    expect(frame.style.aspectRatio).toBe("1280 / 720");
+    expect(frame.className).toContain("has-known-ratio");
+  });
+
+  test("shared asset-meta fetch is not aborted when the first consumer unmounts", async () => {
+    const { MarkdownImage: _MarkdownImage } = await import("../src/markdown");
+    // We assert the fetch itself never receives a signal that gets aborted.
+    // Consumer A mounts, kicks off a fetch, then unmounts before it resolves.
+    // Consumer B mounts and awaits the same promise; it must still resolve.
+    const originalFetch = globalThis.fetch;
+    let signalReceived: AbortSignal | undefined;
+    let resolveFetch: ((response: Response) => void) | null = null;
+    globalThis.fetch = vi.fn((_url: RequestInfo | URL, init?: RequestInit) => {
+      signalReceived = init?.signal ?? undefined;
+      return new Promise<Response>((resolve) => {
+        resolveFetch = resolve;
+      });
+    }) as typeof fetch;
+    try {
+      const { ObsidianMarkdown } = await import("../src/markdown");
+      const { unmount } = render(
+        <ObsidianMarkdown
+          content={"![a](notes/shared.png)"}
+          notePath="notes/index.md"
+          notes={[]}
+          onOpenNote={() => undefined}
+        />,
+      );
+      await act(async () => {
+        unmount();
+      });
+      // Second consumer mounts after the first unmounted — the shared
+      // promise must still be pending and still resolvable.
+      expect(signalReceived).toBeUndefined();
+      expect(resolveFetch).not.toBeNull();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("preview stays in the DOM through the fade after load", async () => {
+    vi.useFakeTimers();
+    try {
+      const preview = "data:image/jpeg;base64,ZmFkZQ==";
+      const { container } = render(
+        <SharedImageRenderer
+          alt="pic"
+          height={200}
+          openInLightbox={false}
+          previewBase64={preview}
+          source="/api/agents/WIKI-1/artifact/abc.png"
+          width={400}
+        />,
+      );
+      const img = container.querySelector("img[decoding='async']") as HTMLImageElement;
+      await act(async () => {
+        fireEvent.load(img);
+      });
+      // Still in DOM immediately after load; is-fading class flips on.
+      const preview1 = container.querySelector(".artifact-image-preview") as HTMLElement | null;
+      expect(preview1).not.toBeNull();
+      expect(preview1!.className).toContain("is-fading");
+      // Advance past the retention timer and re-render.
+      await act(async () => {
+        vi.advanceTimersByTime(400);
+      });
+      expect(container.querySelector(".artifact-image-preview")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -264,8 +264,19 @@ export function SharedImageRenderer({
 }) {
   const [state, setState] = useState<"loading" | "ready" | "error">("loading");
   const [nonce, setNonce] = useState(0);
+  const [previewMounted, setPreviewMounted] = useState(true);
   const [lightboxOpen, setLightboxOpen] = useState(false);
-  useEffect(() => setState("loading"), [source, nonce]);
+  useEffect(() => {
+    setState("loading");
+    setPreviewMounted(true);
+  }, [source, nonce]);
+  useEffect(() => {
+    if (state !== "ready") return;
+    // Retain the preview through the opacity transition (matches the CSS
+    // duration in styles.css) so the fade actually plays out.
+    const timer = window.setTimeout(() => setPreviewMounted(false), 380);
+    return () => window.clearTimeout(timer);
+  }, [state]);
   if (state === "error") {
     return (
       <div className={`artifact-image-wrap${wrapClassName ? ` ${wrapClassName}` : ""}`}>
@@ -313,27 +324,27 @@ export function SharedImageRenderer({
     : {};
   return (
     <div
-      className={`artifact-image-wrap${wrapClassName ? ` ${wrapClassName}` : ""}${knownRatio ? " has-known-ratio" : ""}`}
+      className={`artifact-image-wrap${wrapClassName ? ` ${wrapClassName}` : ""}${knownRatio ? " has-known-ratio" : ""}${state === "ready" ? " is-loaded" : ""}`}
       style={knownRatio ? { aspectRatio: `${width} / ${height}` } : undefined}
     >
-      {state === "loading" ? (
+      {previewMounted ? (
         previewBase64 ? (
           <img
             aria-hidden="true"
             alt=""
-            className="artifact-image-preview"
+            className={`artifact-image-preview${state === "ready" ? " is-fading" : ""}`}
             decoding="sync"
             src={previewBase64}
             style={placeholderStyle}
           />
-        ) : (
+        ) : state === "loading" ? (
           <div
             className="artifact-image-blur"
             aria-hidden="true"
             data-shape="image"
             style={placeholderStyle}
           />
-        )
+        ) : null
       ) : null}
       {openInLightbox ? (
         <button

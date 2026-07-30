@@ -252,8 +252,16 @@ class NoteSummary(BaseModel):
     meta_updated: str | None = None
 
 
+class AssetMeta(BaseModel):
+    width: int
+    height: int
+    media_type: str
+    preview_base64: str | None = None
+
+
 class Note(NoteSummary):
     content: str
+    asset_meta: dict[str, AssetMeta] = Field(default_factory=dict)
 
 
 class NoteCreate(BaseModel):
@@ -687,9 +695,87 @@ def to_summary(path: Path) -> NoteSummary:
     )
 
 
+_IMAGE_EXTENSION_RE = re.compile(r"\.(png|jpe?g|gif|webp|svg)(?:[?#]|$)", re.IGNORECASE)
+_MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(<?([^)\s>]+)>?\)")
+_OBSIDIAN_EMBED_RE = re.compile(r"!\[\[([^\][|]+?)(?:\|[^\][]*)?\]\]")
+
+
+def _extract_note_image_paths(content: str, note_path: str) -> list[str]:
+    """Return de-duplicated vault-relative paths for every image the note
+    references. Skips external URLs and anything without an image extension."""
+    if not content:
+        return []
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def push(candidate: str) -> None:
+        if candidate in seen:
+            return
+        seen.add(candidate)
+        candidates.append(candidate)
+
+    def note_relative(target: str) -> list[str]:
+        stripped = target.split("?", 1)[0].split("#", 1)[0].strip()
+        if not stripped or stripped.startswith("/"):
+            return []
+        if re.match(r"^[a-z][a-z0-9+.-]*:", stripped, re.IGNORECASE):
+            return []
+        if stripped.startswith("//"):
+            return []
+        if not _IMAGE_EXTENSION_RE.search(stripped):
+            return []
+        cleaned = stripped.replace("\\", "/")
+        parts = [segment for segment in cleaned.split("/") if segment not in ("", ".")]
+        note_dir = note_path.rsplit("/", 1)[0] if "/" in note_path else ""
+        base_parts = [segment for segment in note_dir.split("/") if segment]
+        results: list[str] = []
+        for base in ([base_parts] if base_parts else []) + [[]]:
+            stack = list(base)
+            good = True
+            for part in parts:
+                if part == "..":
+                    if not stack:
+                        good = False
+                        break
+                    stack.pop()
+                else:
+                    stack.append(part)
+            if good and stack:
+                results.append("/".join(stack))
+        return results
+
+    for match in _MARKDOWN_IMAGE_RE.finditer(content):
+        for candidate in note_relative(match.group(1)):
+            push(candidate)
+    for match in _OBSIDIAN_EMBED_RE.finditer(content):
+        for candidate in note_relative(match.group(1)):
+            push(candidate)
+    return candidates
+
+
+def _collect_note_asset_meta(content: str, note_path: str) -> dict[str, AssetMeta]:
+    """Resolve each image reference in the note to `AssetMeta`, silently
+    dropping anything that resolves outside the vault or fails to decode."""
+    result: dict[str, AssetMeta] = {}
+    for candidate in _extract_note_image_paths(content, note_path):
+        try:
+            raw, media_type = _read_vault_asset_bytes(candidate)
+        except HTTPException:
+            continue
+        if media_type not in _VAULT_ASSET_RESIZE_MIMES:
+            continue
+        payload = _asset_meta_for(raw, media_type)
+        if payload is None:
+            continue
+        result[candidate] = AssetMeta(**payload)
+    return result
+
+
 def to_note(path: Path) -> Note:
     summary = to_summary(path)
-    return Note(**summary.model_dump(), content=read_note(path))
+    content = read_note(path)
+    asset_meta = _collect_note_asset_meta(content, summary.path)
+    return Note(**summary.model_dump(), content=content, asset_meta=asset_meta)
 
 
 def iter_note_files() -> list[Path]:
@@ -5080,7 +5166,6 @@ def get_file_content(
 
 
 _VAULT_ASSET_RESIZE_MIMES = {"image/png", "image/jpeg", "image/webp"}
-_VAULT_ASSET_RESIZE_WIDTHS = (160, 320, 640, 1280)
 
 
 def _read_vault_asset_bytes(asset_path: str) -> tuple[bytes, str]:
@@ -5112,48 +5197,25 @@ def _read_vault_asset_bytes(asset_path: str) -> tuple[bytes, str]:
     return raw, media_type
 
 
-def _resize_asset_bytes(raw: bytes, media_type: str, width: int) -> tuple[bytes, str]:
-    from io import BytesIO
-
-    from PIL import Image
-
-    with Image.open(BytesIO(raw)) as source:
-        source.load()
-        source_width, source_height = source.size
-        if width >= source_width:
-            return raw, media_type
-        target_height = max(1, round(source_height * (width / source_width)))
-        oriented = source.convert("RGBA" if source.mode in {"RGBA", "LA", "PA"} else "RGB")
-        oriented = oriented.resize((width, target_height), Image.Resampling.LANCZOS)
-        buffer = BytesIO()
-        if media_type == "image/png":
-            oriented.save(buffer, format="PNG", optimize=True)
-            out_mime = "image/png"
-        elif media_type == "image/webp":
-            oriented.save(buffer, format="WEBP", quality=88, method=4)
-            out_mime = "image/webp"
-        else:
-            if oriented.mode != "RGB":
-                oriented = oriented.convert("RGB")
-            oriented.save(buffer, format="JPEG", quality=88, optimize=True, progressive=True)
-            out_mime = "image/jpeg"
-    return buffer.getvalue(), out_mime
-
-
 @app.get("/api/vault/assets/{asset_path:path}")
 def get_vault_asset(asset_path: str, w: int | None = None) -> Response:
     raw, media_type = _read_vault_asset_bytes(asset_path)
     if w is not None and media_type in _VAULT_ASSET_RESIZE_MIMES:
+        from .image_scrub import ALLOWED_RESIZE_WIDTHS, ImageScrubError, resize_image_bytes
+
         try:
             width = int(w)
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail="w must be an integer") from exc
-        if width not in _VAULT_ASSET_RESIZE_WIDTHS:
+        if width not in ALLOWED_RESIZE_WIDTHS:
             raise HTTPException(status_code=400, detail="unsupported w value")
         try:
-            raw, media_type = _resize_asset_bytes(raw, media_type, width)
-        except Exception as exc:  # noqa: BLE001 — Pillow raises many exceptions
-            raise HTTPException(status_code=422, detail=f"resize failed: {exc}") from exc
+            raw, media_type = resize_image_bytes(raw, media_type, width)
+        except ImageScrubError as exc:
+            # The bounded resize enforces the same pre-decode side + pixel
+            # caps as ingress so decompression bombs cannot slip in through
+            # the thumbnail path.
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
     headers = {
         "Cache-Control": "private, max-age=3600",
         "X-Content-Type-Options": "nosniff",
@@ -5163,29 +5225,67 @@ def get_vault_asset(asset_path: str, w: int | None = None) -> Response:
     return Response(content=raw, media_type=media_type, headers=headers)
 
 
+def _asset_meta_for(raw: bytes, media_type: str) -> dict[str, object] | None:
+    """Return canonical (orientation-normalised) dimensions + preview for an
+    image asset, or None if it cannot be scrubbed. Uses scrub_image so the
+    reported width/height match what the browser will actually render — a
+    portrait photo tagged with EXIF orientation 6 comes out with its axes
+    already swapped, matching the pixels the vault-asset endpoint serves."""
+    from .image_scrub import ImageScrubError, scrub_image
+
+    try:
+        result = scrub_image(raw, media_type)
+    except ImageScrubError:
+        return None
+    payload: dict[str, object] = {
+        "width": result.width,
+        "height": result.height,
+        "media_type": media_type,
+    }
+    if result.preview_base64:
+        payload["preview_base64"] = result.preview_base64
+    return payload
+
+
 @app.get("/api/vault/asset-meta/{asset_path:path}")
 def get_vault_asset_meta(asset_path: str) -> dict[str, object]:
     raw, media_type = _read_vault_asset_bytes(asset_path)
     if media_type not in _VAULT_ASSET_RESIZE_MIMES:
         raise HTTPException(status_code=415, detail="asset is not an image")
-    from .image_scrub import ImageScrubError, probe_dimensions, scrub_image
+    meta = _asset_meta_for(raw, media_type)
+    if meta is None:
+        raise HTTPException(status_code=422, detail="asset could not be scrubbed")
+    return meta
 
-    try:
-        width, height = probe_dimensions(raw, media_type)
-    except ImageScrubError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    preview: str | None = None
-    try:
-        preview = scrub_image(raw, media_type).preview_base64
-    except ImageScrubError:
-        preview = None
-    result: dict[str, object] = {
-        "width": width,
-        "height": height,
-        "media_type": media_type,
-    }
-    if preview:
-        result["preview_base64"] = preview
+
+class AssetMetaBatchRequest(BaseModel):
+    paths: list[str] = Field(default_factory=list, max_length=64)
+
+
+@app.post("/api/vault/asset-meta")
+def post_vault_asset_meta_batch(payload: AssetMetaBatchRequest) -> dict[str, dict[str, object]]:
+    """Return `{path: {width, height, preview_base64}}` for every readable
+    image path in the request. Silently drops entries that resolve outside
+    the vault, aren't images, or fail to decode so the frontend can render
+    the surviving ones in one round-trip without any per-image race."""
+    seen: set[str] = set()
+    result: dict[str, dict[str, object]] = {}
+    for raw_path in payload.paths:
+        if not isinstance(raw_path, str):
+            continue
+        candidate = raw_path.strip()
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            content, media_type = _read_vault_asset_bytes(candidate)
+        except HTTPException:
+            continue
+        if media_type not in _VAULT_ASSET_RESIZE_MIMES:
+            continue
+        meta = _asset_meta_for(content, media_type)
+        if meta is not None:
+            result[candidate] = meta
     return result
 
 

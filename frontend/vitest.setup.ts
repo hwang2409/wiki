@@ -39,3 +39,4 @@ if (typeof window !== "undefined") {
 }
 installStorage(globalThis, "localStorage");
 installStorage(globalThis, "sessionStorage");
+

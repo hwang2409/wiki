@@ -11425,7 +11425,13 @@ textarea.composer-command-input {
   object-fit: cover;
   filter: blur(20px) saturate(1.05);
   transform: scale(1.08);
+  opacity: 1;
+  transition: opacity 360ms cubic-bezier(0.2, 0, 0, 1);
   pointer-events: none;
+}
+
+.artifact-image-preview.is-fading {
+  opacity: 0;
 }
 
 .artifact-image-wrap.has-known-ratio {
@@ -11445,8 +11451,14 @@ textarea.composer-command-input {
   object-fit: cover;
   filter: blur(16px) saturate(1.05);
   transform: scale(1.08);
+  opacity: 1;
+  transition: opacity 360ms cubic-bezier(0.2, 0, 0, 1);
   pointer-events: none;
   z-index: 0;
+}
+
+.artifact-gallery-preview.is-fading {
+  opacity: 0;
 }
 
 .artifact-gallery-image {
@@ -11657,11 +11669,11 @@ textarea.composer-command-input {
   filter: blur(18px) saturate(1.05);
   transform: scale(1.08);
   opacity: 1;
+  transition: opacity 360ms cubic-bezier(0.2, 0, 0, 1);
 }
 
-.markdown-image-frame.is-loaded .markdown-image-preview {
+.markdown-image-preview.is-fading {
   opacity: 0;
-  transition: opacity 300ms cubic-bezier(0.2, 0, 0, 1);
 }
 
 .markdown-image-frame:focus-visible {

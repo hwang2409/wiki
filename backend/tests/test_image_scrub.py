@@ -176,6 +176,136 @@ class ImageScrubTests(unittest.TestCase):
         # No metadata was present, so the strip should return the exact bytes.
         self.assertEqual(scrubbed, original)
 
+    def test_extended_xmp_and_gpano_app1_dropped(self) -> None:
+        # Extended-XMP APP1 uses http://ns.adobe.com/xmp/extension/ as its
+        # signature — the round-2 strip only dropped the plain XMP signature
+        # and let this survive. Any APP1 flavour must go.
+        buffer = io.BytesIO()
+        Image.new("RGB", (16, 16), color=(30, 30, 30)).save(buffer, format="JPEG", quality=90)
+        base_jpeg = buffer.getvalue()
+        # Insert a fake APP1 segment right after the SOI marker.
+        signature = b"http://ns.adobe.com/xmp/extension/\x00"
+        marker_payload = signature + b"<xmp><gps>SECRET-GPS-COORDS</gps></xmp>"
+        length = (len(marker_payload) + 2).to_bytes(2, "big")
+        smuggled = base_jpeg[:2] + b"\xff\xe1" + length + marker_payload + base_jpeg[2:]
+        self.assertIn(b"SECRET-GPS-COORDS", smuggled)
+        scrubbed = scrub_image_bytes(smuggled, "image/jpeg")
+        self.assertNotIn(b"SECRET-GPS-COORDS", scrubbed)
+        self.assertNotIn(b"ns.adobe.com/xmp/extension", scrubbed)
+
+    def test_png_orientation_baked_into_pixels(self) -> None:
+        from zlib import crc32
+
+        from PIL.ExifTags import Base as ExifBase
+
+        image = Image.new("RGB", (16, 24), color=(255, 255, 255))
+        for x in range(4):
+            for y in range(4):
+                image.putpixel((x, y), (0, 0, 0))
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        data = buffer.getvalue()
+        # Pillow doesn't expose an API for arbitrary PNG chunks, so splice
+        # an eXIf chunk in by hand right after the IHDR.
+        exif = image.getexif()
+        exif[ExifBase.Orientation.value] = 6
+        tiff = exif.tobytes(offset=0)
+        crc = crc32(b"eXIf" + tiff).to_bytes(4, "big")
+        exif_chunk = len(tiff).to_bytes(4, "big") + b"eXIf" + tiff + crc
+        # Splice the chunk after IHDR (bytes 8..33 hold IHDR).
+        ihdr_end = 8 + 4 + 4 + 13 + 4  # length + type + payload + crc
+        data_with_exif = data[:ihdr_end] + exif_chunk + data[ihdr_end:]
+        scrubbed = scrub_image_bytes(data_with_exif, "image/png")
+        with Image.open(io.BytesIO(scrubbed)) as reopened:
+            reopened.load()
+            self.assertEqual(reopened.size, (24, 16))  # axes swapped
+            top_right = reopened.getpixel((reopened.width - 1, 0))
+            top_left = reopened.getpixel((0, 0))
+            self.assertLess(sum(top_right[:3]), 60)
+            self.assertGreater(sum(top_left[:3]), 600)
+        # Any lingering eXIf chunk in the output must be gone.
+        self.assertNotIn(b"eXIf", scrubbed)
+
+    def test_webp_orientation_baked_into_pixels(self) -> None:
+        from PIL.ExifTags import Base as ExifBase
+
+        image = Image.new("RGB", (32, 48), color=(255, 255, 255))
+        for x in range(6):
+            for y in range(6):
+                image.putpixel((x, y), (0, 0, 0))
+        exif = image.getexif()
+        exif[ExifBase.Orientation.value] = 6
+        buffer = io.BytesIO()
+        image.save(buffer, format="WEBP", quality=95, exif=exif.tobytes(offset=0))
+        scrubbed = scrub_image_bytes(buffer.getvalue(), "image/webp")
+        with Image.open(io.BytesIO(scrubbed)) as reopened:
+            reopened.load()
+            self.assertEqual(reopened.size, (48, 32))
+            top_right = reopened.getpixel((reopened.width - 2, 1))
+            top_left = reopened.getpixel((1, 1))
+            self.assertLess(sum(top_right[:3]), 90)
+            self.assertGreater(sum(top_left[:3]), 600)
+        # Every EXIF chunk in the output must be gone.
+        self.assertNotIn(b"EXIF", scrubbed)
+
+    def test_resize_rejects_pixel_bomb_before_decode(self) -> None:
+        from zlib import crc32
+
+        from backend.app.image_scrub import ImageScrubError, resize_image_bytes
+
+        def chunk(kind: bytes, payload: bytes) -> bytes:
+            return (
+                len(payload).to_bytes(4, "big")
+                + kind
+                + payload
+                + crc32(kind + payload).to_bytes(4, "big")
+            )
+
+        header = (
+            (60_000).to_bytes(4, "big")
+            + (60_000).to_bytes(4, "big")
+            + b"\x08\x02\x00\x00\x00"
+        )
+        bomb = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IEND", b"")
+        with self.assertRaisesRegex(ImageScrubError, "pixel limit|side limit"):
+            resize_image_bytes(bomb, "image/png", 320)
+
+    def test_resize_smaller_than_source_shrinks(self) -> None:
+        from backend.app.image_scrub import resize_image_bytes
+
+        buffer = io.BytesIO()
+        Image.new("RGB", (800, 600), color=(10, 200, 50)).save(buffer, format="PNG")
+        resized, out_mime = resize_image_bytes(buffer.getvalue(), "image/png", 320)
+        self.assertEqual(out_mime, "image/png")
+        with Image.open(io.BytesIO(resized)) as reopened:
+            reopened.load()
+            self.assertEqual(reopened.size, (320, 240))
+
+    def test_resize_leaves_undersized_source_untouched(self) -> None:
+        from backend.app.image_scrub import resize_image_bytes
+
+        buffer = io.BytesIO()
+        Image.new("RGB", (100, 100), color=(10, 200, 50)).save(buffer, format="PNG")
+        original = buffer.getvalue()
+        resized, out_mime = resize_image_bytes(original, "image/png", 320)
+        self.assertEqual(resized, original)
+        self.assertEqual(out_mime, "image/png")
+
+    def test_scrub_returns_scrubbed_dimensions_after_orientation_swap(self) -> None:
+        from backend.app.image_scrub import scrub_image
+
+        # Portrait source with orientation=6 should report the upright
+        # dimensions, not the raw pre-rotation ones.
+        image = Image.new("RGB", (24, 40), color=(10, 200, 50))
+        exif = image.getexif()
+        from PIL.ExifTags import Base as ExifBase
+
+        exif[ExifBase.Orientation.value] = 6
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=90, exif=exif.tobytes())
+        result = scrub_image(buffer.getvalue(), "image/jpeg")
+        self.assertEqual((result.width, result.height), (40, 24))
+
 
 if __name__ == "__main__":
     unittest.main()

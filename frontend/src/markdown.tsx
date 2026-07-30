@@ -688,16 +688,21 @@ type AssetMeta = {
   previewBase64: string | null;
 };
 
+// Shared cache: results are cached forever, in-flight fetches are shared, and
+// the underlying fetch is NEVER aborted from a consumer's cleanup — each
+// consumer manages its own cancellation via a cancelled flag. This avoids
+// the round-2 bug where the first consumer's unmount cancelled the request
+// for every other consumer waiting on the same asset.
 const assetMetaCache = new Map<string, AssetMeta | null>();
 const assetMetaPending = new Map<string, Promise<AssetMeta | null>>();
 
-function fetchAssetMeta(path: string, signal: AbortSignal): Promise<AssetMeta | null> {
+function fetchAssetMeta(path: string): Promise<AssetMeta | null> {
   const cached = assetMetaCache.get(path);
   if (cached !== undefined) return Promise.resolve(cached);
   const pending = assetMetaPending.get(path);
   if (pending) return pending;
   const encoded = path.split("/").map(encodeURIComponent).join("/");
-  const request = fetch(`/api/vault/asset-meta/${encoded}`, { signal })
+  const request = fetch(`/api/vault/asset-meta/${encoded}`)
     .then(async (response) => {
       if (!response.ok) return null;
       const body = await response.json();
@@ -713,9 +718,8 @@ function fetchAssetMeta(path: string, signal: AbortSignal): Promise<AssetMeta | 
       assetMetaPending.delete(path);
       return meta;
     })
-    .catch((error) => {
+    .catch(() => {
       assetMetaPending.delete(path);
-      if ((error as { name?: string }).name === "AbortError") return null;
       assetMetaCache.set(path, null);
       return null;
     });
@@ -723,33 +727,72 @@ function fetchAssetMeta(path: string, signal: AbortSignal): Promise<AssetMeta | 
   return request;
 }
 
+export function seedAssetMetaCache(entries: Record<string, {
+  width: number;
+  height: number;
+  preview_base64?: string | null;
+}> | undefined | null): void {
+  if (!entries) return;
+  for (const [path, entry] of Object.entries(entries)) {
+    if (!entry || typeof entry !== "object") continue;
+    assetMetaCache.set(path, {
+      width: Number(entry.width) || 0,
+      height: Number(entry.height) || 0,
+      previewBase64: typeof entry.preview_base64 === "string" ? entry.preview_base64 : null,
+    });
+  }
+}
+
+export function assetMetaFromCache(path: string): AssetMeta | null | undefined {
+  return assetMetaCache.get(path);
+}
+
 function MarkdownImage({ alt, className, "data-obsidian-width": dataWidth, node, notePath, src }: MarkdownImageProps) {
   const candidates = src ? assetCandidates(src, notePath) : [];
   const [failed, setFailed] = useState(false);
-  const [state, setState] = useState<"loading" | "ready" | "error">("loading");
-  const [meta, setMeta] = useState<AssetMeta | null>(null);
-  const [lightboxOpen, setLightboxOpen] = useState(false);
   const activeCandidate = candidates.length > 0
     ? candidates[failed && candidates.length > 1 ? 1 : 0]
     : null;
+  // Consult the cache SYNCHRONOUSLY during the first render so any dimensions
+  // that arrived with the note payload (or a prior render) are on the frame
+  // before React commits. Falls back to an async probe only if the cache is
+  // empty for this asset — the async fetch is shared across every consumer
+  // and never aborted by an individual consumer's cleanup.
+  const cachedMeta = activeCandidate ? assetMetaFromCache(activeCandidate) : undefined;
+  const [state, setState] = useState<"loading" | "ready" | "error">("loading");
+  const [meta, setMeta] = useState<AssetMeta | null>(cachedMeta ?? null);
+  const [previewMounted, setPreviewMounted] = useState(true);
+  const [lightboxOpen, setLightboxOpen] = useState(false);
 
   useEffect(() => {
     setFailed(false);
     setState("loading");
-    setMeta(null);
+    setPreviewMounted(true);
+    // Prime meta from cache on src/notePath change; not on activeCandidate
+    // change so a fallback retry (candidates[0] -> candidates[1]) doesn't
+    // undo itself in an infinite loop.
+    const first = candidates.length > 0 ? candidates[0] : null;
+    const preloaded = first ? assetMetaFromCache(first) : undefined;
+    setMeta(preloaded ?? null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [src, notePath]);
 
   useEffect(() => {
+    if (state !== "ready") return;
+    const timer = window.setTimeout(() => setPreviewMounted(false), 380);
+    return () => window.clearTimeout(timer);
+  }, [state]);
+
+  useEffect(() => {
     if (!activeCandidate) return;
-    const controller = new AbortController();
+    if (assetMetaFromCache(activeCandidate) !== undefined) return;
     let cancelled = false;
-    fetchAssetMeta(activeCandidate, controller.signal).then((info) => {
+    fetchAssetMeta(activeCandidate).then((info) => {
       if (cancelled) return;
       setMeta(info);
     });
     return () => {
       cancelled = true;
-      controller.abort();
     };
   }, [activeCandidate]);
 
@@ -780,11 +823,11 @@ function MarkdownImage({ alt, className, "data-obsidian-width": dataWidth, node,
         style={frameStyle}
         type="button"
       >
-        {state === "loading" && meta?.previewBase64 ? (
+        {previewMounted && meta?.previewBase64 ? (
           <img
             aria-hidden="true"
             alt=""
-            className="markdown-image-preview"
+            className={`markdown-image-preview${state === "ready" ? " is-fading" : ""}`}
             decoding="sync"
             src={meta.previewBase64}
           />
@@ -911,18 +954,26 @@ function createComponents(
 }
 
 export function ObsidianMarkdown({
+  assetMeta,
   content,
   notes,
   notePath,
   onOpenNote,
   onCreateNote
 }: {
+  assetMeta?: Record<string, { width: number; height: number; preview_base64?: string | null }>;
   content: string;
   notes: NoteSummary[];
   notePath?: string;
   onOpenNote: (path: string) => void;
   onCreateNote?: (target: string) => void;
 }) {
+  // Seed the shared cache SYNCHRONOUSLY before ReactMarkdown renders, so
+  // every MarkdownImage frame commits with correct width/height/preview on
+  // its first render (no metadata race, no layout shift).
+  if (assetMeta) {
+    seedAssetMetaCache(assetMeta);
+  }
   const prepared = useMemo(() => prepareMarkdown(content), [content]);
   const components = useMemo(
     () =>

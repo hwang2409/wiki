@@ -158,7 +158,59 @@ def _jpeg_exif_orientation(data: bytes) -> int:
     return 1
 
 
+def _png_exif_orientation(data: bytes) -> int:
+    """Return EXIF Orientation for a PNG (eXIf chunk), defaulting to 1."""
+    if data[:8] != _PNG_SIGNATURE:
+        return 1
+    offset = 8
+    end = len(data)
+    while offset + 12 <= end:
+        length = struct.unpack(">I", data[offset:offset + 4])[0]
+        chunk_type = data[offset + 4:offset + 8]
+        payload_end = offset + 8 + length
+        if payload_end > end:
+            return 1
+        if chunk_type == b"eXIf":
+            payload = data[offset + 8:payload_end]
+            return _read_orientation_from_exif(payload)
+        offset = payload_end + 4
+        if chunk_type == b"IEND":
+            break
+    return 1
+
+
+def _webp_exif_orientation(data: bytes) -> int:
+    """Return EXIF Orientation for a WebP (EXIF chunk), defaulting to 1."""
+    if data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+        return 1
+    offset = 12
+    end = len(data)
+    while offset + 8 <= end:
+        chunk_id = data[offset:offset + 4]
+        length = struct.unpack("<I", data[offset + 4:offset + 8])[0]
+        padded = length + (length & 1)
+        payload_start = offset + 8
+        payload_end = payload_start + length
+        if payload_end > end:
+            return 1
+        if chunk_id == b"EXIF":
+            return _read_orientation_from_exif(data[payload_start:payload_end])
+        offset = payload_start + padded
+    return 1
+
+
+_ORIENTATION_PROBES: Final = {
+    "image/jpeg": _jpeg_exif_orientation,
+    "image/png": _png_exif_orientation,
+    "image/webp": _webp_exif_orientation,
+}
+
+
 def _read_orientation_from_exif(tiff: bytes) -> int:
+    # Tolerate PNG/WebP payloads that begin with the JPEG "Exif\x00\x00"
+    # prefix — some tools emit it, most do not.
+    if tiff.startswith(b"Exif\x00\x00"):
+        tiff = tiff[6:]
     if len(tiff) < 12:
         return 1
     if tiff[:2] == b"II":
@@ -263,7 +315,13 @@ def _strip_jpeg_metadata(data: bytes) -> bytes:
         payload = data[offset + 2:offset + length]
         segment_end = offset + length
         drop = False
-        if marker == 0xE1 and (payload.startswith(b"Exif\x00\x00") or payload.startswith(b"http://ns.adobe.com/xap/")):
+        # Every APP1 flavour carries metadata — EXIF (Exif\0\0), Adobe XMP
+        # (http://ns.adobe.com/xap/), Extended XMP
+        # (http://ns.adobe.com/xmp/extension/), GPano, and vendor-private
+        # markers. None of them are needed to *render* the image. Drop them
+        # unconditionally so exotic XMP-GPS or extended-XMP variants can't
+        # smuggle metadata past us.
+        if marker == 0xE1:
             drop = True
         elif marker == 0xE2 and not payload.startswith(b"ICC_PROFILE\x00"):
             drop = True
@@ -307,7 +365,30 @@ _METADATA_STRIPPERS = {
 }
 
 
-def _rotate_and_reencode(data: bytes, mime: str) -> bytes:
+_ORIENTATION_TRANSPOSE: Final = {
+    2: Image.Transpose.FLIP_LEFT_RIGHT,
+    3: Image.Transpose.ROTATE_180,
+    4: Image.Transpose.FLIP_TOP_BOTTOM,
+    5: Image.Transpose.TRANSPOSE,
+    6: Image.Transpose.ROTATE_270,
+    7: Image.Transpose.TRANSVERSE,
+    8: Image.Transpose.ROTATE_90,
+}
+
+
+def _apply_orientation(image: "Image.Image", orientation: int) -> "Image.Image":
+    """Bake an EXIF Orientation value into the pixel data.
+
+    Pillow's ImageOps.exif_transpose only looks at Image.getexif(), which is
+    empty for PNG and WebP payloads we parsed the tag out of manually — so we
+    walk the mapping ourselves for every format."""
+    transpose = _ORIENTATION_TRANSPOSE.get(orientation)
+    if transpose is None:
+        return image
+    return image.transpose(transpose)
+
+
+def _rotate_and_reencode(data: bytes, mime: str, orientation: int) -> bytes:
     """Fallback path: decode, apply orientation, drop metadata, re-encode."""
     expected = _PIL_FORMAT_BY_MIME[mime]
     with Image.open(io.BytesIO(data)) as source:
@@ -317,7 +398,15 @@ def _rotate_and_reencode(data: bytes, mime: str) -> bytes:
                 f"payload declares {mime} but decodes as {source.format}"
             )
         icc = source.info.get("icc_profile")
-        oriented = ImageOps.exif_transpose(source) or source
+        # Prefer the format-specific tag we parsed by hand — Pillow's
+        # ImageOps.exif_transpose only handles JPEG-embedded EXIF, so PNG /
+        # WebP with orientation tags in their container chunks fall through
+        # it silently and would render sideways.
+        oriented = _apply_orientation(source, orientation)
+        # Also give ImageOps a chance in case Pillow itself pulled an
+        # in-band orientation (e.g. JPEG EXIF) that our probe missed.
+        if orientation == 1:
+            oriented = ImageOps.exif_transpose(oriented) or oriented
         if oriented.mode not in {"1", "L", "LA", "P", "PA", "RGB", "RGBA", "CMYK", "I;16"}:
             oriented = oriented.convert("RGBA" if "A" in oriented.mode else "RGB")
         buffer = io.BytesIO()
@@ -383,15 +472,16 @@ def scrub_image(data: bytes, mime: str) -> ScrubResult:
         )
 
     orientation = 1
-    if mime == "image/jpeg":
+    probe = _ORIENTATION_PROBES.get(mime)
+    if probe is not None:
         try:
-            orientation = _jpeg_exif_orientation(data)
+            orientation = probe(data)
         except (struct.error, ValueError, IndexError):
             orientation = 1
 
     try:
         if orientation != 1:
-            scrubbed = _rotate_and_reencode(data, mime)
+            scrubbed = _rotate_and_reencode(data, mime, orientation)
             width, height = probe_dimensions(scrubbed, mime)
         else:
             scrubbed = _METADATA_STRIPPERS[mime](data)
@@ -413,3 +503,57 @@ def scrub_image(data: bytes, mime: str) -> ScrubResult:
 def scrub_image_bytes(data: bytes, mime: str) -> bytes:
     """Backwards-compatible wrapper returning just the scrubbed bytes."""
     return scrub_image(data, mime).data
+
+
+ALLOWED_RESIZE_WIDTHS: Final = (160, 320, 640, 1280)
+
+
+def resize_image_bytes(data: bytes, mime: str, target_width: int) -> tuple[bytes, str]:
+    """Return (resized_bytes, mime) for a vault-asset thumbnail.
+
+    Enforces the same pre-decode side + pixel caps as scrub_image so the
+    resize path can never be used to smuggle a decompression bomb past the
+    normal ingress guard. Returns the original bytes untouched when the
+    source is already narrower than the target width."""
+    if _PIL_FORMAT_BY_MIME.get(mime) is None:
+        raise ImageScrubError(f"unsupported mime: {mime}")
+    if target_width not in ALLOWED_RESIZE_WIDTHS:
+        raise ImageScrubError(f"unsupported target width: {target_width}")
+    width, height = probe_dimensions(data, mime)
+    if width <= 0 or height <= 0:
+        raise ImageScrubError("image reports non-positive dimensions")
+    if width > MAX_SIDE or height > MAX_SIDE:
+        raise ImageScrubError(
+            f"image exceeds {MAX_SIDE}px side limit ({width}x{height})"
+        )
+    if width * height > MAX_PIXELS:
+        raise ImageScrubError(
+            f"image exceeds {MAX_PIXELS // 1_000_000}MP pixel limit ({width}x{height})"
+        )
+    if target_width >= width:
+        return data, mime
+    target_height = max(1, round(height * (target_width / width)))
+    try:
+        with Image.open(io.BytesIO(data)) as source:
+            source.load()
+            oriented = ImageOps.exif_transpose(source) or source
+            if oriented.mode not in {"RGB", "RGBA", "L", "LA", "P", "PA"}:
+                oriented = oriented.convert("RGBA" if "A" in oriented.mode else "RGB")
+            resized = oriented.resize((target_width, target_height), Image.Resampling.LANCZOS)
+            buffer = io.BytesIO()
+            if mime == "image/png":
+                resized.save(buffer, format="PNG", optimize=True)
+                out_mime = "image/png"
+            elif mime == "image/webp":
+                resized.save(buffer, format="WEBP", quality=88, method=4)
+                out_mime = "image/webp"
+            else:
+                if resized.mode != "RGB":
+                    resized = resized.convert("RGB")
+                resized.save(buffer, format="JPEG", quality=88, optimize=True, progressive=True)
+                out_mime = "image/jpeg"
+    except ImageScrubError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise ImageScrubError(f"resize failed: {exc}") from exc
+    return buffer.getvalue(), out_mime

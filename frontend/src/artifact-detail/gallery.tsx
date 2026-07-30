@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ArtifactFileEntry } from "../api";
 import { ArtifactLightbox, type LightboxItem } from "./lightbox";
 
 const THUMBNAIL_WIDTHS = [320, 640] as const;
+const PREVIEW_FADE_MS = 380;
 
 type AssetMeta = {
   width: number;
@@ -21,9 +22,28 @@ function vaultAssetUrl(path: string, params?: Record<string, string | number>): 
   return `/api/vault/assets/${encoded}${query}`;
 }
 
-function vaultAssetMetaUrl(path: string): string {
-  const cleaned = path.replace(/^\/+/, "").replace(/\\/g, "/");
-  return `/api/vault/asset-meta/${cleaned.split("/").map(encodeURIComponent).join("/")}`;
+async function fetchAssetMetaBatch(paths: string[]): Promise<Record<string, AssetMeta>> {
+  if (paths.length === 0) return {};
+  const response = await fetch("/api/vault/asset-meta", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ paths }),
+  });
+  if (!response.ok) return {};
+  const body = (await response.json()) as Record<string, {
+    width: number;
+    height: number;
+    preview_base64?: string | null;
+  }>;
+  const out: Record<string, AssetMeta> = {};
+  for (const [path, entry] of Object.entries(body)) {
+    out[path] = {
+      width: Number(entry.width) || 0,
+      height: Number(entry.height) || 0,
+      previewBase64: typeof entry.preview_base64 === "string" ? entry.preview_base64 : null,
+    };
+  }
+  return out;
 }
 
 function friendlyName(entry: ArtifactFileEntry): string {
@@ -36,40 +56,60 @@ function isResizable(entry: ArtifactFileEntry): boolean {
   return /\.(png|jpe?g|webp)$/i.test(entry.path);
 }
 
+type TileLoadState = "loading" | "ready" | "error";
+
 export function ImageGallery({ files }: { files: ArtifactFileEntry[] }) {
   const [openIndex, setOpenIndex] = useState<number | null>(null);
   const [meta, setMeta] = useState<Record<string, AssetMeta | null>>({});
+  const [tileState, setTileState] = useState<Record<number, TileLoadState>>({});
+  const [previewMounted, setPreviewMounted] = useState<Record<number, boolean>>(() => {
+    const initial: Record<number, boolean> = {};
+    files.forEach((_, index) => {
+      initial[index] = true;
+    });
+    return initial;
+  });
+  const fadeTimers = useRef<Map<number, number>>(new Map());
+
+  // Single batch fetch on mount (or when file list changes). One request
+  // per gallery, not one per tile — no per-image race.
+  useEffect(() => {
+    const paths = Array.from(new Set(files.map((entry) => entry.path)));
+    if (paths.length === 0) return;
+    let cancelled = false;
+    fetchAssetMetaBatch(paths).then((batch) => {
+      if (cancelled) return;
+      setMeta((prev) => {
+        const next: Record<string, AssetMeta | null> = { ...prev };
+        for (const path of paths) {
+          next[path] = batch[path] ?? null;
+        }
+        return next;
+      });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [files]);
 
   useEffect(() => {
-    const controller = new AbortController();
-    for (const entry of files) {
-      if (meta[entry.path] !== undefined) continue;
-      // eslint-disable-next-line @typescript-eslint/no-floating-promises
-      fetch(vaultAssetMetaUrl(entry.path), { signal: controller.signal })
-        .then((response) => (response.ok ? response.json() : null))
-        .then((body) => {
-          if (!body) {
-            setMeta((prev) => ({ ...prev, [entry.path]: null }));
-            return;
-          }
-          setMeta((prev) => ({
-            ...prev,
-            [entry.path]: {
-              width: Number(body.width) || 0,
-              height: Number(body.height) || 0,
-              previewBase64:
-                typeof body.preview_base64 === "string" ? body.preview_base64 : null,
-            },
-          }));
-        })
-        .catch(() => {
-          setMeta((prev) => ({ ...prev, [entry.path]: null }));
-        });
-    }
-    return () => controller.abort();
-    // meta is intentionally omitted — we only want to fetch once per file
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [files]);
+    const timers = fadeTimers.current;
+    return () => {
+      for (const id of timers.values()) window.clearTimeout(id);
+      timers.clear();
+    };
+  }, []);
+
+  const markLoaded = (index: number) => {
+    setTileState((prev) => ({ ...prev, [index]: "ready" }));
+    const existing = fadeTimers.current.get(index);
+    if (existing) window.clearTimeout(existing);
+    const timer = window.setTimeout(() => {
+      setPreviewMounted((prev) => ({ ...prev, [index]: false }));
+      fadeTimers.current.delete(index);
+    }, PREVIEW_FADE_MS);
+    fadeTimers.current.set(index, timer);
+  };
 
   const items: LightboxItem[] = useMemo(
     () =>
@@ -104,20 +144,22 @@ export function ImageGallery({ files }: { files: ArtifactFileEntry[] }) {
             : undefined;
           const knownRatio = info?.width && info?.height ? info.width / info.height : null;
           const tileStyle = knownRatio ? { aspectRatio: `${info!.width} / ${info!.height}` } : undefined;
+          const loaded = tileState[index] === "ready";
+          const showPreview = previewMounted[index] !== false;
           return (
             <li className="artifact-gallery-cell" key={`${item.src}-${index}`}>
               <button
                 aria-label={`Open ${item.alt} in fullscreen`}
-                className="artifact-gallery-tile"
+                className={`artifact-gallery-tile${loaded ? " is-loaded" : ""}`}
                 onClick={() => setOpenIndex(index)}
                 style={tileStyle}
                 type="button"
               >
-                {info?.previewBase64 ? (
+                {showPreview && info?.previewBase64 ? (
                   <img
                     aria-hidden="true"
                     alt=""
-                    className="artifact-gallery-preview"
+                    className={`artifact-gallery-preview${loaded ? " is-fading" : ""}`}
                     decoding="sync"
                     src={info.previewBase64}
                   />
@@ -132,6 +174,10 @@ export function ImageGallery({ files }: { files: ArtifactFileEntry[] }) {
                   src={thumbnailSrc}
                   srcSet={srcSet}
                   width={info?.width}
+                  onLoad={() => markLoaded(index)}
+                  onError={() =>
+                    setTileState((prev) => ({ ...prev, [index]: "error" }))
+                  }
                 />
               </button>
               <span className="artifact-gallery-caption" title={item.caption ?? undefined}>
