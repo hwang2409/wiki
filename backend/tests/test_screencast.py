@@ -9,6 +9,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from fastapi.testclient import TestClient
+
 from backend.app import main, screencast
 
 
@@ -166,6 +168,48 @@ class TailExtractorTests(unittest.TestCase):
         self.assertLessEqual(len(frames[0].text), screencast.MAX_FRAME_TEXT)
         self.assertTrue(frames[0].text.endswith("…"))
 
+    def test_default_max_frames_is_twenty(self) -> None:
+        """Spec: strip shows ~20 lines. Not 6, not 500 — twenty."""
+        self.assertEqual(screencast.DEFAULT_MAX_FRAMES, 20)
+
+
+class SanitizeTextTests(unittest.TestCase):
+    def test_strips_ansi_colour_and_cursor_escapes(self) -> None:
+        payload = "\x1b[31mred\x1b[0m\x1b[2Kclear-line\x1b]0;title\x07after"
+        frames = screencast.frames_from_lines(
+            [json.dumps(_claude_assistant(payload)).encode("utf-8")]
+        )
+        self.assertEqual(frames[0].text, "redclear-lineafter")
+
+    def test_strips_bidi_overrides_that_could_spoof_tool_labels(self) -> None:
+        """LRO/RLO/PDI/BOM must never survive to the client — they would
+        let a worker rewrite the visual reading order of the strip."""
+
+        # A tool name that pretends to be "→ ls" but reverses to "→ sl" in RTL
+        payload = "‮rm -rf /‬ legit-looking"
+        frames = screencast.frames_from_lines(
+            [json.dumps(_claude_assistant(payload)).encode("utf-8")]
+        )
+        for ch in ("‮", "‬", "‭", "⁦", "⁩"):
+            self.assertNotIn(ch, frames[0].text)
+
+    def test_strips_nul_and_c0_c1_controls(self) -> None:
+        payload = "hello\x00\x07\x1b\x9bworld"
+        frames = screencast.frames_from_lines(
+            [json.dumps(_claude_assistant(payload)).encode("utf-8")]
+        )
+        for ch in ("\x00", "\x07", "\x1b", "\x9b"):
+            self.assertNotIn(ch, frames[0].text)
+        self.assertIn("hello", frames[0].text)
+        self.assertIn("world", frames[0].text)
+
+    def test_strips_zero_width_and_soft_hyphen(self) -> None:
+        payload = "safe​word‌‍﻿­"
+        frames = screencast.frames_from_lines(
+            [json.dumps(_claude_assistant(payload)).encode("utf-8")]
+        )
+        self.assertEqual(frames[0].text, "safeword")
+
 
 class TornLineTests(unittest.TestCase):
     def test_iter_drops_torn_head_when_seeked(self) -> None:
@@ -193,15 +237,17 @@ class TornLineTests(unittest.TestCase):
 
 
 class BoundedTailFileTests(unittest.TestCase):
-    def test_tail_reads_only_end_window_of_large_file(self) -> None:
-        """Prove the tail read is bounded: pad the head with megabytes of
-        garbage and assert the extractor still returns the true tail frame.
+    def test_tail_reads_only_end_window_of_multi_gib_sparse_file(self) -> None:
+        """Prove the tail read is bounded: a sparse 4 GiB file with data only
+        at the tail. If the extractor scanned the whole file, the test would
+        allocate multi-gigabyte buffers and either OOM or take minutes. Also
+        instrument ``os.pread`` — the exact (fd, size, offset) call — and
+        assert we read exactly one window ending at EOF, from a stable
+        offset equal to ``file_size - window_bytes``.
 
-        Files in production reach multi-GB. The tail read MUST NOT scan
-        the head. This test proves that by making the head so large that
-        parsing it would either fail (invalid JSON garbage) or wildly
-        exceed the max-frames cap — either way, if the reader read past
-        the window, the output would not equal the expected tail.
+        This is the assertion R1 finding #6 asked for: pread SIZE **and**
+        OFFSET, not just the extracted output — a whole-file implementation
+        would call read()/pread(fd, size, 0) and this test would fail.
         """
 
         with tempfile.TemporaryDirectory() as raw_dir:
@@ -210,21 +256,76 @@ class BoundedTailFileTests(unittest.TestCase):
             run_dir.mkdir()
             raw_path = run_dir / "raw.jsonl"
 
-            garbage_line = b"x" * (screencast.DEFAULT_WINDOW_BYTES * 4) + b"\n"
-            tail_env = _claude_assistant("tail-marker")
+            # Sparse-hole up to 4 GiB, then append the tail records at EOF.
+            tail_records = (
+                json.dumps(_claude_assistant("first")).encode("utf-8")
+                + b"\n"
+                + json.dumps(_claude_assistant("tail-marker")).encode("utf-8")
+                + b"\n"
+            )
+            sparse_size = 4 * 1024**3
             with raw_path.open("wb") as fp:
-                fp.write(garbage_line)
-                fp.write(garbage_line)
-                fp.write(json.dumps(tail_env).encode("utf-8") + b"\n")
+                fp.truncate(sparse_size)
+                fp.seek(sparse_size)
+                fp.write(tail_records)
+
+            expected_size = sparse_size + len(tail_records)
+            expected_offset = expected_size - screencast.DEFAULT_WINDOW_BYTES
+            observed: list[tuple[int, int]] = []
+
+            real_pread = os.pread
+
+            def spy_pread(fd: int, size: int, offset: int) -> bytes:
+                observed.append((size, offset))
+                return real_pread(fd, size, offset)
 
             root_fd = os.open(str(root), os.O_RDONLY | os.O_DIRECTORY)
             try:
-                frames = screencast.tail_frames(root_fd, "abc")
+                with mock.patch.object(screencast.os, "pread", spy_pread):
+                    frames = screencast.tail_frames(root_fd, "abc")
             finally:
                 os.close(root_fd)
 
-        self.assertEqual(len(frames), 1)
-        self.assertEqual(frames[0].text, "tail-marker")
+        # Exactly one pread — a whole-file implementation would call read()
+        # or pread(..., 0), or make many chunked calls. Neither is allowed.
+        self.assertEqual(len(observed), 1, f"expected 1 pread, got {observed}")
+        observed_size, observed_offset = observed[0]
+        self.assertEqual(observed_size, screencast.DEFAULT_WINDOW_BYTES)
+        self.assertEqual(observed_offset, expected_offset)
+
+        # And the tail must have been extracted correctly.
+        texts = [frame.text for frame in frames]
+        self.assertIn("tail-marker", texts)
+
+    def test_rapid_append_yields_the_newer_tail(self) -> None:
+        """Two successive tail reads must reflect newly-appended records.
+
+        This proves the reader always seeks to the current EOF instead of
+        caching a stale ``st_size``. A worker appending in a hot loop must
+        be visible to the strip within one poll.
+        """
+
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            run_dir = root / "run"
+            run_dir.mkdir()
+            raw_path = run_dir / "raw.jsonl"
+
+            _write_raw(raw_path, [_claude_assistant("first")])
+            root_fd = os.open(str(root), os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                first = screencast.tail_frames(root_fd, "run")
+                with raw_path.open("ab") as fp:
+                    fp.write(
+                        json.dumps(_claude_assistant("second")).encode("utf-8")
+                        + b"\n"
+                    )
+                second = screencast.tail_frames(root_fd, "run")
+            finally:
+                os.close(root_fd)
+
+        self.assertEqual([f.text for f in first], ["first"])
+        self.assertEqual([f.text for f in second], ["first", "second"])
 
     def test_tail_skips_torn_last_line(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
@@ -265,12 +366,10 @@ class BoundedTailFileTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as raw_dir:
             root = Path(raw_dir)
-            # Create the real run outside the runs-root anchor.
             outside = root / "outside"
             outside.mkdir()
             raw_path = outside / "raw.jsonl"
             _write_raw(raw_path, [_claude_assistant("secret")])
-            # Symlink pretends to be a legitimate run dir under the anchor.
             link = root / "fake-run"
             link.symlink_to(outside)
 
@@ -282,15 +381,100 @@ class BoundedTailFileTests(unittest.TestCase):
 
         self.assertEqual(frames, [])
 
+    def test_tail_rejects_symlink_raw_file(self) -> None:
+        """Final-component symlink for raw.jsonl itself must be refused."""
+
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            run_dir = root / "run"
+            run_dir.mkdir()
+            outside = root / "outside.jsonl"
+            _write_raw(outside, [_claude_assistant("secret")])
+            (run_dir / "raw.jsonl").symlink_to(outside)
+
+            root_fd = os.open(str(root), os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                frames = screencast.tail_frames(root_fd, "run")
+            finally:
+                os.close(root_fd)
+
+        self.assertEqual(frames, [])
+
+    def test_tail_rejects_traversal_run_id(self) -> None:
+        """A run_id containing ``..`` would escape the anchor via
+        os.open(dir_fd=...) despite O_NOFOLLOW. tail_frames must not
+        follow the traversal."""
+
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            sibling = root.parent / "sibling"
+            sibling.mkdir(exist_ok=True)
+            (sibling / "raw.jsonl").write_text("nope\n", encoding="utf-8")
+            try:
+                root_fd = os.open(str(root), os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    frames = screencast.tail_frames(root_fd, "../sibling")
+                finally:
+                    os.close(root_fd)
+            finally:
+                (sibling / "raw.jsonl").unlink(missing_ok=True)
+                try:
+                    sibling.rmdir()
+                except OSError:
+                    pass
+
+        self.assertEqual(frames, [])
+
+
+class OpenRootDirectoryTests(unittest.TestCase):
+    def test_refuses_symlinked_root(self) -> None:
+        """R1 finding #4: runs ROOT itself must not follow a symlink."""
+
+        from backend.app.pathwalk import open_root_directory
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            real = root / "real-runs"
+            real.mkdir()
+            link = root / "runs-link"
+            link.symlink_to(real)
+
+            with self.assertRaises(OSError):
+                open_root_directory(link)
+
+    def test_opens_real_directory(self) -> None:
+        from backend.app.pathwalk import open_root_directory
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fd = open_root_directory(tmp)
+            try:
+                self.assertIsInstance(fd, int)
+            finally:
+                os.close(fd)
+
+    def test_refuses_regular_file(self) -> None:
+        from backend.app.pathwalk import open_root_directory
+
+        with tempfile.TemporaryDirectory() as tmp:
+            regular = Path(tmp) / "not-a-dir"
+            regular.write_text("hi", encoding="utf-8")
+            with self.assertRaises(OSError):
+                open_root_directory(regular)
+
 
 class FleetScreencastEndpointTests(unittest.TestCase):
+    def _patch_runs_root(self, root: Path):
+        return mock.patch.object(
+            main.SUPERVISOR_CLIENT.paths.__class__,
+            "runs_dir",
+            new=property(lambda self: root),
+        )
+
     def test_returns_empty_frames_for_ticket_without_registry_entry(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
-            with mock.patch.object(
-                main.SUPERVISOR_CLIENT.paths.__class__,
-                "runs_dir",
-                new=property(lambda self: Path(raw_dir)),
-            ), mock.patch.object(main, "_read_agent_registry", return_value={}):
+            with self._patch_runs_root(Path(raw_dir)), mock.patch.object(
+                main, "_read_agent_registry", return_value={}
+            ):
                 payload = main._screencast_payload(["WIKI-176"])
 
         self.assertEqual(payload["workers"][0]["ticket"], "WIKI-176")
@@ -308,11 +492,9 @@ class FleetScreencastEndpointTests(unittest.TestCase):
                 "WIKI-1": {"current": {"run_id": run_id}},
                 "WIKI-2": {"current": {"run_id": None}},
             }
-            with mock.patch.object(
-                main.SUPERVISOR_CLIENT.paths.__class__,
-                "runs_dir",
-                new=property(lambda self: root),
-            ), mock.patch.object(main, "_read_agent_registry", return_value=registry):
+            with self._patch_runs_root(root), mock.patch.object(
+                main, "_read_agent_registry", return_value=registry
+            ):
                 payload = main._screencast_payload(["WIKI-1", "WIKI-1", "WIKI-2"])
 
         tickets_seen = [worker["ticket"] for worker in payload["workers"]]
@@ -323,24 +505,72 @@ class FleetScreencastEndpointTests(unittest.TestCase):
 
     def test_rejects_invalid_ticket_ids_without_reading_disk(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
-            with mock.patch.object(
-                main.SUPERVISOR_CLIENT.paths.__class__,
-                "runs_dir",
-                new=property(lambda self: Path(raw_dir)),
-            ), mock.patch.object(main, "_read_agent_registry", return_value={}):
+            with self._patch_runs_root(Path(raw_dir)), mock.patch.object(
+                main, "_read_agent_registry", return_value={}
+            ):
                 payload = main._screencast_payload(["../etc/passwd"])
         self.assertIsNone(payload["workers"][0]["run_id"])
 
     def test_caps_batch_at_max_tickets(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            with self._patch_runs_root(Path(raw_dir)), mock.patch.object(
+                main, "_read_agent_registry", return_value={}
+            ):
+                many = [f"WIKI-{n}" for n in range(main.MAX_SCREENCAST_TICKETS + 10)]
+                payload = main._screencast_payload(many)
+        self.assertEqual(len(payload["workers"]), main.MAX_SCREENCAST_TICKETS)
+
+
+class ScreencastEtagTests(unittest.TestCase):
+    def test_etag_excludes_updated_at_ns(self) -> None:
+        """R1 finding #3: ETag must not churn — same tails → same ETag."""
+
+        workers = [
+            {
+                "ticket": "WIKI-1",
+                "run_id": "abc",
+                "frames": [{"kind": "assistant", "text": "hello", "ts": None}],
+            }
+        ]
+        first = main._screencast_etag(workers)
+        second = main._screencast_etag(workers)
+        self.assertEqual(first, second)
+
+    def test_etag_changes_when_frames_change(self) -> None:
+        workers = [
+            {
+                "ticket": "WIKI-1",
+                "run_id": "abc",
+                "frames": [{"kind": "assistant", "text": "hello", "ts": None}],
+            }
+        ]
+        first = main._screencast_etag(workers)
+        workers[0]["frames"].append({"kind": "assistant", "text": "world", "ts": None})
+        self.assertNotEqual(first, main._screencast_etag(workers))
+
+    def test_endpoint_returns_304_on_matching_if_none_match(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
             with mock.patch.object(
                 main.SUPERVISOR_CLIENT.paths.__class__,
                 "runs_dir",
                 new=property(lambda self: Path(raw_dir)),
             ), mock.patch.object(main, "_read_agent_registry", return_value={}):
-                many = [f"WIKI-{n}" for n in range(main.MAX_SCREENCAST_TICKETS + 10)]
-                payload = main._screencast_payload(many)
-        self.assertEqual(len(payload["workers"]), main.MAX_SCREENCAST_TICKETS)
+                client = TestClient(main.app, base_url="http://127.0.0.1")
+                first = client.get(
+                    "/api/fleet/screencast",
+                    params=[("ticket", "WIKI-176")],
+                )
+                self.assertEqual(first.status_code, 200)
+                etag = first.headers.get("etag")
+                self.assertIsNotNone(etag)
+
+                second = client.get(
+                    "/api/fleet/screencast",
+                    params=[("ticket", "WIKI-176")],
+                    headers={"If-None-Match": etag},
+                )
+                self.assertEqual(second.status_code, 304)
+                self.assertEqual(second.content, b"")
 
 
 if __name__ == "__main__":

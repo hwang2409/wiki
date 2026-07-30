@@ -34,6 +34,7 @@ import type {
 import { externalLinkProps } from "./external-links";
 import { LoadingPlaceholder } from "./loading";
 import { ReplaceAgentModal, type ReplaceAgentTarget } from "./replace-agent-modal";
+import { ScreencastProvider, ScreencastStrip } from "./screencast-strip";
 import { SessionSidebar } from "./session";
 import type { SidebarTarget } from "./session";
 import { BranchPill } from "./branch-pill";
@@ -1205,6 +1206,10 @@ export function AgentsView({
             </button>
           </span>
         </div>
+
+        {worker.run_id ? (
+          <ScreencastStrip ticket={worker.ticket} runId={worker.run_id} compact />
+        ) : null}
       </article>
     );
   }
@@ -1365,6 +1370,7 @@ export function AgentsView({
   }
 
   return (
+    <ScreencastProvider>
     <div className={`agents-layout${openWorker ? " has-sidebar" : ""}`}>
       <div className="agents-view">
         <div className="agents-toolbar">
@@ -1497,6 +1503,7 @@ export function AgentsView({
         />
       ) : null}
     </div>
+    </ScreencastProvider>
   );
 }
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 from dataclasses import dataclass
 from typing import Iterable
@@ -31,6 +32,56 @@ DEFAULT_MAX_FRAMES = 20
 MAX_FRAME_TEXT = 200
 _ELLIPSIS = "…"
 
+# Matches CSI, OSC, and bare ESC-form escape sequences. Kept in sync with
+# ``main.ANSI_PATTERN`` but duplicated here so this module has no import
+# cycle with the FastAPI app.
+_ANSI_PATTERN = re.compile(
+    r"\x1b\[[0-9;?]*[ -/]*[@-~]"  # CSI incl. space-intermediate forms
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC
+    r"|\x1b[@-_]"  # bare two-char escapes
+)
+
+# Any character that could redraw the terminal, hide bytes, or spoof the
+# rendered text: C0/C1 controls (except \t/\n/\r), unicode line-break
+# controls (LS/PS), bidi overrides (LRO/RLO/PDF/LRI/RLI/FSI/PDI), invisible
+# marks (soft hyphen, zero-width chars, BOM, WORD JOINER), and interlinear
+# annotation controls. Kept intentionally strict — the strip is only ever
+# meant to render literal text.
+_UNSAFE_CONTROL_PATTERN = re.compile(
+    "["
+    "\x00-\x08"  # C0 controls (skip \t=0x09, \n=0x0a, \r=0x0d)
+    "\x0b\x0c"
+    "\x0e-\x1f"
+    "\x7f"
+    "\x80-\x9f"  # C1 controls
+    "  "  # LS, PS
+    "‪-‮"  # bidi overrides
+    "⁦-⁩"  # bidi isolates
+    "​-‏"  # zero-width + directional marks
+    "⁠"  # WORD JOINER
+    "­"  # SOFT HYPHEN
+    "﻿"  # BOM / ZWNBSP
+    "￹-￻"  # interlinear annotation anchors
+    "]"
+)
+
+
+def _sanitize_text(text: str) -> str:
+    """Strip ANSI escapes and unsafe control characters from ``text``.
+
+    Raw command output routinely embeds ANSI colour codes and cursor
+    escapes; without stripping, the strip would render as garbled bytes
+    or (worse) let a worker rewrite characters outside its cell via
+    cursor-move sequences. Bidi overrides and zero-width marks can spoof
+    the visible identity of a tool call ("→ Bash" vs "→ Rᴍ -Rf /"), so
+    they are dropped too. Tabs become one space; other whitespace is
+    collapsed downstream by ``_clip``.
+    """
+
+    text = _ANSI_PATTERN.sub("", text)
+    text = _UNSAFE_CONTROL_PATTERN.sub("", text)
+    return text.replace("\t", " ")
+
 
 @dataclass(frozen=True)
 class ScreencastFrame:
@@ -42,7 +93,7 @@ class ScreencastFrame:
 
 
 def _clip(text: str, limit: int = MAX_FRAME_TEXT) -> str:
-    text = text.strip()
+    text = _sanitize_text(text).strip()
     text = " ".join(text.split())
     if len(text) <= limit:
         return text

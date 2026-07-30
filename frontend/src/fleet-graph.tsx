@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { getFleetGraph, type FleetGraphGroup, type FleetGraphTicket, type WorkgraphEdge, type WorkgraphNode } from "./api";
-import { FleetScreencastPanel } from "./screencast-strip";
+import { ScreencastProvider, ScreencastStrip } from "./screencast-strip";
 import { WorkgraphDag } from "./workgraph-panel";
 
 type FilterKind = "orch" | "state" | "role";
@@ -101,21 +101,7 @@ function FilterChips({
 function FleetGroup({ group }: { group: FleetGraphGroup }) {
   const edges = useMemo(() => dedupeEdges(group.tickets), [group.tickets]);
   const liveTickets = useMemo(
-    () =>
-      group.tickets
-        .filter((ticket) => ticket.state !== "archived")
-        .map((ticket) => ticket.ticket),
-    [group.tickets]
-  );
-  const screencastMeta = useMemo(
-    () =>
-      group.tickets
-        .filter((ticket) => ticket.state !== "archived")
-        .map((ticket) => ({
-          ticket: ticket.ticket,
-          state: ticket.state,
-          role: ticket.role,
-        })),
+    () => group.tickets.filter((ticket) => ticket.state !== "archived"),
     [group.tickets]
   );
   return (
@@ -137,7 +123,23 @@ function FleetGroup({ group }: { group: FleetGraphGroup }) {
         )}
       </div>
       {liveTickets.length > 0 ? (
-        <FleetScreencastPanel tickets={liveTickets} tickets_meta={screencastMeta} />
+        <div className="fleet-screencast-panel">
+          {liveTickets.map((ticket) => (
+            <article
+              className="fleet-screencast-card"
+              data-state={ticket.state}
+              key={ticket.ticket}
+            >
+              <header className="fleet-screencast-card-head">
+                <span className="fleet-screencast-ticket">{ticket.ticket}</span>
+                <span className="fleet-screencast-meta">
+                  {ticket.role} · {ticket.state}
+                </span>
+              </header>
+              <ScreencastStrip ticket={ticket.ticket} />
+            </article>
+          ))}
+        </div>
       ) : null}
     </section>
   );
@@ -184,6 +186,7 @@ export function FleetGraphView({ refreshTick }: { refreshTick: number }) {
   }, [filters, groups]);
 
   return (
+    <ScreencastProvider>
     <main className="fleet-graph-view" data-testid="fleet-graph-view">
       <div className="fleet-graph-header">
         <div>
@@ -224,5 +227,6 @@ export function FleetGraphView({ refreshTick }: { refreshTick: number }) {
         {filteredGroups.map((group) => <FleetGroup group={group} key={group.orch} />)}
       </div>
     </main>
+    </ScreencastProvider>
   );
 }

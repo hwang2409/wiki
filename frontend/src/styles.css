@@ -3950,12 +3950,14 @@ body.is-resizing-panes .pane-cell {
 }
 
 .fleet-screencast-tape {
-  --fleet-screencast-lines: 6;
+  --fleet-screencast-lines: 20;
   --fleet-screencast-line-height: 1.35;
   display: flex;
   flex-direction: column;
   justify-content: flex-end;
   height: calc(var(--fleet-screencast-lines) * var(--font-ui-smaller) * var(--fleet-screencast-line-height) + 12px);
+  min-height: calc(var(--fleet-screencast-lines) * var(--font-ui-smaller) * var(--fleet-screencast-line-height) + 12px);
+  max-height: calc(var(--fleet-screencast-lines) * var(--font-ui-smaller) * var(--fleet-screencast-line-height) + 12px);
   padding: 6px 8px;
   overflow: hidden;
   background-color: var(--background-primary);
@@ -3964,7 +3966,7 @@ body.is-resizing-panes .pane-cell {
   font-size: var(--font-ui-smaller);
   line-height: var(--fleet-screencast-line-height);
   white-space: nowrap;
-  contain: layout paint;
+  contain: layout paint size;
 }
 
 .fleet-screencast-line {

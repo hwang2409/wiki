@@ -512,7 +512,7 @@ def resolve_vault_asset_path(raw_path: str) -> tuple[Path, str, str]:
     return target, path.as_posix(), media_type
 
 
-from .pathwalk import open_relative_directory, open_relative_file  # noqa: E402
+from .pathwalk import open_relative_directory, open_relative_file, open_root_directory  # noqa: E402
 
 
 def iter_repo_files(file_root: Path, root_fd: int | None = None) -> tuple[list[Path], bool]:
@@ -2616,6 +2616,36 @@ def fleet_graph(limit: int = Query(default=10, ge=0, le=50)) -> dict[str, object
 MAX_SCREENCAST_TICKETS = 32
 
 
+def _screencast_etag(workers: list[dict[str, object]]) -> str:
+    """Stable ETag over (ticket, run_id, frame texts) — no timestamp churn.
+
+    Excluding ``updated_at_ns`` from the hash is the point: if the tail
+    of every worker's raw.jsonl is unchanged since the last poll, the
+    ETag must match so we can return 304 and skip the JSON body. Frames
+    are already sanitized / clipped, so hashing their dicts is
+    deterministic. Digest is truncated to 16 hex chars — plenty for
+    cache-key uniqueness across the worker fleet.
+    """
+
+    import hashlib
+
+    hasher = hashlib.blake2b(digest_size=8)
+    for worker in workers:
+        hasher.update(str(worker.get("ticket") or "").encode("utf-8"))
+        hasher.update(b"\x00")
+        hasher.update(str(worker.get("run_id") or "").encode("utf-8"))
+        hasher.update(b"\x00")
+        for frame in worker.get("frames") or []:
+            if not isinstance(frame, dict):
+                continue
+            hasher.update(str(frame.get("kind") or "").encode("utf-8"))
+            hasher.update(b"\x1e")
+            hasher.update(str(frame.get("text") or "").encode("utf-8"))
+            hasher.update(b"\x1f")
+        hasher.update(b"\n")
+    return f'W/"{hasher.hexdigest()}"'
+
+
 def _run_id_for_ticket(registry: dict, ticket: str) -> str | None:
     """Resolve the run id currently registered for ``ticket``.
 
@@ -2653,10 +2683,7 @@ def _screencast_payload(tickets: list[str]) -> dict[str, object]:
     seen: set[str] = set()
     root_fd: int | None = None
     try:
-        root_fd = os.open(
-            str(runs_root),
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-        )
+        root_fd = open_root_directory(runs_root)
     except OSError:
         root_fd = None
     try:
@@ -2684,23 +2711,37 @@ def _screencast_payload(tickets: list[str]) -> dict[str, object]:
     return {"workers": workers, "updated_at_ns": time.time_ns()}
 
 
-@app.get("/api/fleet/screencast")
-@app.get("/fleet/screencast", include_in_schema=False)
+@app.get("/api/fleet/screencast", response_model=None)
+@app.get("/fleet/screencast", include_in_schema=False, response_model=None)
 def fleet_screencast(
+    request: Request,
     response: Response,
     ticket: list[str] = Query(default_factory=list),
-) -> dict[str, object]:
+) -> Response | dict[str, object]:
     """Return short tail-of-raw.jsonl frames for the requested worker tickets.
 
     Single call for all visible workers on the fleet view. Each worker's
     frame list is a bounded read of the last window of its raw.jsonl —
     never a full-file scan — parsed into short lines suitable for the
-    monospace strip. Response is cache-friendly (``Cache-Control:
-    max-age=1``) so the ~2s poll costs almost nothing when the fleet is
-    quiet.
+    monospace strip.
+
+    Supports conditional GET: the ETag is derived from the stable
+    (ticket, run_id, frame text) tuples only — never from wall-clock
+    timestamps — so an unchanged fleet returns 304 with no body. The
+    ~2 s poll only pays the JSON cost when a worker actually made
+    progress.
     """
 
     payload = _screencast_payload(ticket)
+    etag = _screencast_etag(payload["workers"])  # type: ignore[arg-type]
+    inm = request.headers.get("if-none-match")
+    if inm and etag in {value.strip() for value in inm.split(",")}:
+        headers = {
+            "ETag": etag,
+            "Cache-Control": "no-cache, max-age=1",
+        }
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
+    response.headers["ETag"] = etag
     response.headers["Cache-Control"] = "no-cache, max-age=1"
     return payload
 
