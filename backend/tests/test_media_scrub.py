@@ -1190,6 +1190,254 @@ class WavStreamingPeaksBoundsTests(unittest.TestCase):
         )
 
 
+class Mp4Round7SurvivorProbes(unittest.TestCase):
+    """Round-7 review found allowlisted box bodies were still copied
+    unchanged: sidx, btrt inside sample entries, and oversized mdhd slack
+    all leaked bytes through. Each is exercised here as a stored-bytes
+    probe."""
+
+    @staticmethod
+    def _wrap(atom_type: bytes, body: bytes) -> bytes:
+        return struct.pack(">I", 8 + len(body)) + atom_type + body
+
+    def test_sidx_trailing_bytes_are_rejected(self) -> None:
+        # A single-reference sidx has a well-defined length. Splice attacker
+        # marker bytes past its declared reference table and reconstruction
+        # must reject rather than copy.
+        marker = b"round7-sidx-trailer-must-not-survive"
+        # v0 fixed = 4+4+4+4+4+2+2 = 24, + 1 reference (12 bytes) = 36
+        sidx_body = (
+            b"\x00\x00\x00\x00"          # version+flags
+            + struct.pack(">I", 1)        # reference_ID
+            + struct.pack(">I", 90000)    # timescale
+            + struct.pack(">I", 0)        # earliest_presentation_time
+            + struct.pack(">I", 0)        # first_offset
+            + struct.pack(">HH", 0, 1)    # reserved + reference_count
+            + struct.pack(">III", 0x80000100, 90000, 0x00000000)
+            + marker
+        )
+        sidx_atom = self._wrap(b"sidx", sidx_body)
+        real = REAL_MP4.read_bytes()
+        payload = real + sidx_atom
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "sidx body has .* trailing bytes"
+        ):
+            media_scrub.scrub_video(payload, "video/mp4")
+
+    def test_sidx_rebuilt_from_valid_input(self) -> None:
+        # A well-formed sidx passes reconstruction; the output body is
+        # produced by struct.pack, so it must not contain arbitrary bytes.
+        real = REAL_MP4.read_bytes()
+        sidx_body = (
+            b"\x00\x00\x00\x00"
+            + struct.pack(">I", 1)
+            + struct.pack(">I", 90000)
+            + struct.pack(">I", 0)
+            + struct.pack(">I", 0)
+            + struct.pack(">HH", 0, 1)
+            + struct.pack(">III", 0x80000100, 90000, 0x00000000)
+        )
+        sidx_atom = self._wrap(b"sidx", sidx_body)
+        payload = real + sidx_atom
+        result = media_scrub.scrub_video(payload, "video/mp4")
+        # sidx bytes appear (rebuilt from fields).
+        self.assertIn(b"sidx", result.data)
+
+    def test_btrt_slack_inside_sample_entry_is_rejected(self) -> None:
+        # Splice trailing bytes AFTER the 12-byte btrt body inside the
+        # avc1 sample entry. Round-7 rebuild rejects. Use rfind for names
+        # that ALSO appear in ftyp's compatible_brands token stream (avc1)
+        # so we grow the enclosing sample-entry box, not the brand string.
+        marker = b"round7-btrt-slack-marker"
+        real = REAL_MP4.read_bytes()
+        btrt_pos = real.find(b"btrt")
+        assert btrt_pos > 0
+        btrt_size = struct.unpack(">I", real[btrt_pos - 4:btrt_pos])[0]
+        btrt_end = btrt_pos - 4 + btrt_size
+        added = len(marker)
+        payload = bytearray(real)
+        payload[btrt_pos - 4:btrt_pos] = struct.pack(">I", btrt_size + added)
+        for parent in (b"avc1", b"stsd", b"stbl", b"minf", b"mdia", b"trak", b"moov"):
+            pos = payload.rfind(parent, 0, btrt_pos)
+            existing = struct.unpack(">I", bytes(payload[pos - 4:pos]))[0]
+            payload[pos - 4:pos] = struct.pack(">I", existing + added)
+        payload[btrt_end:btrt_end] = marker
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "btrt body length .* not the 12-byte"
+        ):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+    def test_mdhd_slack_is_rejected(self) -> None:
+        # mdhd v0 spec size is 24 bytes. Splice extra bytes into the fixture's
+        # mdhd and expect reconstruction to reject.
+        marker = b"round7-mdhd-slack-marker"
+        real = REAL_MP4.read_bytes()
+        mdhd_pos = real.find(b"mdhd")
+        assert mdhd_pos > 0
+        mdhd_size = struct.unpack(">I", real[mdhd_pos - 4:mdhd_pos])[0]
+        mdhd_end = mdhd_pos - 4 + mdhd_size
+        added = len(marker)
+        payload = bytearray(real)
+        payload[mdhd_pos - 4:mdhd_pos] = struct.pack(">I", mdhd_size + added)
+        for parent in (b"mdia", b"trak", b"moov"):
+            pos = payload.find(parent)
+            existing = struct.unpack(">I", bytes(payload[pos - 4:pos]))[0]
+            payload[pos - 4:pos] = struct.pack(">I", existing + added)
+        payload[mdhd_end:mdhd_end] = marker
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "mdhd v0 body length"
+        ):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+    def test_hdlr_name_string_is_zeroed(self) -> None:
+        # ffmpeg embeds "VideoHandler" (or the caller's chosen name) in the
+        # hdlr name field. Round-7 rebuild emits an empty name.
+        real = REAL_MP4.read_bytes()
+        self.assertIn(b"VideoHandler", real)
+        result = media_scrub.scrub_video(real, "video/mp4")
+        self.assertNotIn(b"VideoHandler", result.data)
+
+
+class Mp3Round7FixpointProbes(unittest.TestCase):
+    """Round-7 review: an ID3v1 placed BEFORE an APEv2 footer survived
+    scrub because the tag stripper only handled tags in a fixed order.
+    And the full frame stream past the third frame was never validated."""
+
+    def test_id3v1_before_apev2_footer_is_stripped(self) -> None:
+        # Layout: [ID3v2][frames][ID3v1 128 bytes][APEv2 footer 32 bytes]
+        base = REAL_MP3.read_bytes()
+        id3v1_marker = b"round7-id3v1-marker".ljust(125, b" ")
+        id3v1 = b"TAG" + id3v1_marker
+        assert len(id3v1) == 128
+        # APEv2 footer with tag_size >= 32 minimum, item_count 0, flags 0.
+        ape_footer = (
+            b"APETAGEX"
+            + struct.pack("<III", 2000, 32, 0)
+            + struct.pack("<I", 0)
+            + b"\x00" * 8
+        )
+        payload = base + id3v1 + ape_footer
+        self.assertIn(b"round7-id3v1-marker", payload)
+        result = media_scrub.scrub_audio(payload, "audio/mpeg")
+        self.assertNotIn(b"round7-id3v1-marker", result.data)
+        self.assertNotIn(b"TAG", result.data[-128:])
+        self.assertNotIn(b"APETAGEX", result.data)
+
+    def test_apev2_before_id3v1_footer_is_stripped(self) -> None:
+        # Reverse ordering: [ID3v2][frames][APEv2 footer][ID3v1]
+        base = REAL_MP3.read_bytes()
+        marker = b"round7-marker-apeitem"
+        ape_footer = (
+            b"APETAGEX"
+            + struct.pack("<III", 2000, 32, 0)
+            + struct.pack("<I", 0)
+            + b"\x00" * 8
+        )
+        id3v1 = b"TAG" + marker.ljust(125, b" ")
+        assert len(id3v1) == 128
+        payload = base + ape_footer + id3v1
+        result = media_scrub.scrub_audio(payload, "audio/mpeg")
+        self.assertNotIn(marker, result.data)
+        self.assertNotIn(b"TAG", result.data[-128:])
+        self.assertNotIn(b"APETAGEX", result.data)
+
+    def test_lyrics3v2_tag_is_stripped(self) -> None:
+        # Layout: [ID3v2][frames]LYRICSBEGIN<items>LYRICS200<6-digit size>
+        base = REAL_MP3.read_bytes()
+        items = b"round7-lyrics3v2-marker-items"
+        size_field = f"{len(items):06d}".encode("ascii")
+        lyrics_tag = b"LYRICSBEGIN" + items + b"LYRICS200" + size_field
+        payload = base + lyrics_tag
+        self.assertIn(b"round7-lyrics3v2-marker-items", payload)
+        result = media_scrub.scrub_audio(payload, "audio/mpeg")
+        self.assertNotIn(b"LYRICS200", result.data)
+        self.assertNotIn(b"LYRICSBEGIN", result.data)
+        self.assertNotIn(b"round7-lyrics3v2-marker-items", result.data)
+
+    def test_hostile_bytes_past_third_frame_reject_full_stream(self) -> None:
+        # The pre-R7 walker only checked the first three frames — a
+        # hostile append of unstructured bytes past the third frame
+        # survived. Under full-stream validation, any un-parseable byte
+        # in the frame region rejects.
+        base = REAL_MP3.read_bytes()
+        # Splice hostile bytes right before the ID3v1 tail (if any) —
+        # here the fixture has no ID3v1, so we can just append.
+        hostile = b"\xff\xff\xff\xff" * 8  # not a valid MPEG sync sequence
+        payload = base + hostile
+        with self.assertRaises(media_scrub.MediaScrubError):
+            media_scrub.scrub_audio(payload, "audio/mpeg")
+
+
+class GifRound7ExtensionProbes(unittest.TestCase):
+    """Round-7 review: non-XMP extension blocks (comment, plain-text,
+    non-NETSCAPE application extensions) were byte-copied through the
+    scrubber. Allowlist rebuild kills them all."""
+
+    @staticmethod
+    def _min_gif_prefix() -> bytes:
+        header = b"GIF89a"
+        # 4x2 canvas, no global color table
+        lsd = struct.pack("<HH", 4, 2) + b"\x00\x00\x00"
+        return header + lsd
+
+    @staticmethod
+    def _min_gif_image_data() -> bytes:
+        # image descriptor + LZW sub-block + terminator + trailer
+        image_desc = b"\x2c" + struct.pack("<HHHH", 0, 0, 4, 2) + b"\x00"
+        # LZW min code size + one 4-byte data block + terminator
+        lzw = b"\x02\x02\x44\x01\x00"
+        return image_desc + lzw + b"\x3b"
+
+    def test_comment_extension_is_dropped(self) -> None:
+        marker = b"round7-comment-extension-marker"
+        # Comment extension: 0x21 0xFE, sub-blocks, terminator
+        comment = b"\x21\xfe" + bytes([len(marker)]) + marker + b"\x00"
+        payload = self._min_gif_prefix() + comment + self._min_gif_image_data()
+        self.assertIn(marker, payload)
+        result = media_scrub.scrub_video(payload, "image/gif")
+        self.assertNotIn(marker, result.data)
+
+    def test_plain_text_extension_is_dropped(self) -> None:
+        marker = b"round7-plain-text-extension-marker"
+        plain_text = b"\x21\x01" + b"\x0c" + b"\x00" * 12 + bytes([len(marker)]) + marker + b"\x00"
+        payload = self._min_gif_prefix() + plain_text + self._min_gif_image_data()
+        result = media_scrub.scrub_video(payload, "image/gif")
+        self.assertNotIn(marker, result.data)
+
+    def test_unknown_application_extension_is_dropped(self) -> None:
+        marker = b"round7-adobe-marker"
+        # Application extension with "ADOBE1.00abc" identifier + marker body.
+        ident = b"ADOBE1.0abc"
+        assert len(ident) == 11
+        payload_ext = b"\x21\xff\x0b" + ident + bytes([len(marker)]) + marker + b"\x00"
+        payload = self._min_gif_prefix() + payload_ext + self._min_gif_image_data()
+        result = media_scrub.scrub_video(payload, "image/gif")
+        self.assertNotIn(marker, result.data)
+        self.assertNotIn(ident, result.data)
+
+    def test_netscape_looping_extension_survives_via_rebuild(self) -> None:
+        # NETSCAPE2.0 looping extension SHOULD survive scrub — it's the
+        # only application extension we allowlist, and it's rebuilt from
+        # parsed sub-block fields.
+        loop_count = 3
+        netscape = (
+            b"\x21\xff\x0b"
+            + b"NETSCAPE2.0"
+            + b"\x03\x01"
+            + struct.pack("<H", loop_count)
+            + b"\x00"
+        )
+        payload = self._min_gif_prefix() + netscape + self._min_gif_image_data()
+        result = media_scrub.scrub_video(payload, "image/gif")
+        self.assertIn(b"NETSCAPE2.0", result.data)
+        # The loop count survives (it's a parsed field).
+        loop_pos = result.data.find(b"NETSCAPE2.0")
+        # After ident, expect: 0x03 0x01 <loop LE 2 bytes> 0x00
+        self.assertEqual(result.data[loop_pos + 11], 0x03)
+        self.assertEqual(result.data[loop_pos + 12], 0x01)
+        self.assertEqual(struct.unpack("<H", result.data[loop_pos + 13:loop_pos + 15])[0], loop_count)
+
+
 class UnsupportedMimeTests(unittest.TestCase):
     def test_scrub_video_rejects_audio_mime(self) -> None:
         with self.assertRaises(media_scrub.MediaScrubError):

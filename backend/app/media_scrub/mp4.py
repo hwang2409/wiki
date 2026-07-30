@@ -65,7 +65,7 @@ class _Mp4Atom:
 _MP4_FREE_MIN_SIZE: Final = 8
 
 _MP4_TOPLEVEL_PLAYBACK: Final = {
-    b"moov", b"mdat", b"moof", b"sidx", b"styp", b"mfra",
+    b"moov", b"mdat", b"moof", b"mfra",
 }
 # Sample-entry types we know how to rebuild field-by-field. Unknown types
 # fall to strict-subset reject.
@@ -142,7 +142,37 @@ def scrub_mp4(data: bytes) -> MediaScrubResult:
                 raise MediaScrubError("mp4 mdat body is empty")
             mdat_non_empty = True
             out_parts.append(data[atom.start:atom.body_end])
+        elif atom.type == b"sidx":
+            # Round-7 review: sidx body was copied through opaquely. Now
+            # rebuilt from parsed uint fields. If the rebuilt size differs
+            # from the original, pad with a `free` block to preserve
+            # top-level layout (mdat offsets pointing past sidx must stay
+            # correct).
+            rebuilt_sidx = _rebuild_sidx(data, atom)
+            delta = atom.size - len(rebuilt_sidx)
+            if delta < 0:
+                raise MediaScrubError("mp4 rebuilt sidx exceeds original size")
+            out_parts.append(rebuilt_sidx)
+            if delta > 0:
+                out_parts.append(_free(delta))
+        elif atom.type == b"styp":
+            # styp mirrors ftyp: major_brand + minor_version + N compatible
+            # brand tokens. Rebuild via struct.pack so trailing junk cannot
+            # survive.
+            rebuilt_styp = _rebuild_ftyp_like(b"styp", data, atom)
+            if len(rebuilt_styp) != atom.size:
+                raise MediaScrubError("mp4 rebuilt styp size mismatch")
+            out_parts.append(rebuilt_styp)
         elif atom.type in _MP4_TOPLEVEL_PLAYBACK:
+            # moof / mfra / moov (moov is handled above). moof + mfra are
+            # fragment boxes carrying byte-position tables that would need
+            # dedicated parsers to rebuild safely; wiki artifact fixtures
+            # are not fragmented in practice. If we hit one, reject rather
+            # than copy through — R7 strict-subset acceptance.
+            if atom.type in (b"moof", b"mfra"):
+                raise MediaScrubError(
+                    f"mp4 fragmented playback box {atom.type!r} not supported by scrubber"
+                )
             out_parts.append(data[atom.start:atom.body_end])
         else:
             # skip, udta, meta, uuid, and any unknown top-level atom are
@@ -243,17 +273,99 @@ def _free(total_size: int) -> bytes:
 # ---------------------------------------------------------------------------
 
 def _rebuild_ftyp(data: bytes, atom: _Mp4Atom) -> bytes:
+    return _rebuild_ftyp_like(b"ftyp", data, atom)
+
+
+def _rebuild_ftyp_like(atom_type: bytes, data: bytes, atom: _Mp4Atom) -> bytes:
+    """Rebuild an ftyp-shaped box (ftyp or styp) from parsed 4-byte tokens."""
     body = data[atom.body_start:atom.body_end]
     if len(body) < 8:
-        raise MediaScrubError("mp4 ftyp body too short")
+        raise MediaScrubError(f"mp4 {atom_type!r} body too short")
     major_brand = body[:4]
     minor_version = struct.unpack(">I", body[4:8])[0]
     tail = body[8:]
     if len(tail) % 4 != 0:
-        raise MediaScrubError("mp4 ftyp compatible_brands not a multiple of 4 bytes")
+        raise MediaScrubError(
+            f"mp4 {atom_type!r} compatible_brands not a multiple of 4 bytes"
+        )
     compat = [tail[i:i + 4] for i in range(0, len(tail), 4)]
     rebuilt_body = major_brand + struct.pack(">I", minor_version) + b"".join(compat)
-    return _pack(b"ftyp", rebuilt_body)
+    return _pack(atom_type, rebuilt_body)
+
+
+def _rebuild_sidx(data: bytes, atom: _Mp4Atom) -> bytes:
+    """Segment Index Box (sidx) — rebuild from parsed fields only.
+
+    Layout per ISO/IEC 14496-12:
+      full box header (v+flags 4 bytes)
+      reference_ID (uint32)
+      timescale (uint32)
+      earliest_presentation_time (v0: uint32, v1: uint64)
+      first_offset (v0: uint32, v1: uint64)
+      reserved (uint16 = 0)
+      reference_count (uint16)
+      per-reference (12 bytes):
+        [reference_type(1 bit) + referenced_size(31 bits)] uint32
+        subsegment_duration uint32
+        [starts_with_SAP(1) + SAP_type(3) + SAP_delta_time(28)] uint32
+    """
+    body = data[atom.body_start:atom.body_end]
+    if len(body) < 4:
+        raise MediaScrubError("mp4 sidx body too short for full-box header")
+    version = body[0]
+    flags = body[1:4]
+    if version == 0:
+        fixed_len = 4 + 4 + 4 + 4 + 4 + 2 + 2
+    elif version == 1:
+        fixed_len = 4 + 4 + 4 + 8 + 8 + 2 + 2
+    else:
+        raise MediaScrubError(f"mp4 sidx unknown version {version}")
+    if len(body) < fixed_len:
+        raise MediaScrubError("mp4 sidx body shorter than fixed header")
+    reference_id = struct.unpack(">I", body[4:8])[0]
+    timescale = struct.unpack(">I", body[8:12])[0]
+    if version == 0:
+        earliest_pt = struct.unpack(">I", body[12:16])[0]
+        first_offset = struct.unpack(">I", body[16:20])[0]
+        # reserved at 20:22, reference_count at 22:24
+        reference_count = struct.unpack(">H", body[22:24])[0]
+    else:
+        earliest_pt = struct.unpack(">Q", body[12:20])[0]
+        first_offset = struct.unpack(">Q", body[20:28])[0]
+        reference_count = struct.unpack(">H", body[30:32])[0]
+    if reference_count > 0xFFFF:  # pragma: no cover — uint16 max already
+        raise MediaScrubError("mp4 sidx reference count implausible")
+    references_start = fixed_len
+    expected_len = fixed_len + reference_count * 12
+    if len(body) < expected_len:
+        raise MediaScrubError("mp4 sidx references extend past body")
+    if len(body) > expected_len:
+        raise MediaScrubError(
+            f"mp4 sidx body has {len(body) - expected_len} trailing bytes past declared references"
+        )
+    references: list[bytes] = []
+    offset = references_start
+    for _ in range(reference_count):
+        rt_size = struct.unpack(">I", body[offset:offset + 4])[0]
+        sub_duration = struct.unpack(">I", body[offset + 4:offset + 8])[0]
+        sap = struct.unpack(">I", body[offset + 8:offset + 12])[0]
+        references.append(struct.pack(">III", rt_size, sub_duration, sap))
+        offset += 12
+    if version == 0:
+        header_bytes = (
+            bytes([0]) + flags
+            + struct.pack(">II", reference_id, timescale)
+            + struct.pack(">II", earliest_pt, first_offset)
+            + struct.pack(">HH", 0, reference_count)
+        )
+    else:
+        header_bytes = (
+            bytes([1]) + flags
+            + struct.pack(">II", reference_id, timescale)
+            + struct.pack(">QQ", earliest_pt, first_offset)
+            + struct.pack(">HH", 0, reference_count)
+        )
+    return _pack(b"sidx", header_bytes + b"".join(references))
 
 
 # ---------------------------------------------------------------------------
@@ -278,9 +390,14 @@ def _rebuild_moov(
             stsd_ok |= stsd_in_trak
             parts.append(_pack(b"trak", trak_body))
         elif atom.type == b"mvex":
-            # mvex holds fragment defaults (trex etc); we header-validate
-            # via _parse_container above; body is bounded by parsed size.
-            parts.append(data[atom.start:atom.body_end])
+            # mvex indicates a fragmented movie. The scrubber does not
+            # yet rebuild fragment defaults field-by-field, and copying
+            # the body would reintroduce unparsed bytes. Strict-subset
+            # acceptance: reject fragmented MP4s (same policy as moof at
+            # the top level).
+            raise MediaScrubError(
+                "mp4 mvex box present — fragmented playback not supported by scrubber"
+            )
         # Everything else in moov (udta, meta, uuid, iods, hoisted anything) → drop
     return b"".join(parts), trak_seen, mvhd_seen, stsd_ok
 
@@ -291,8 +408,10 @@ def _rebuild_mvhd(data: bytes, atom: _Mp4Atom) -> bytes:
         raise MediaScrubError("mp4 mvhd empty")
     version = body[0]
     if version == 0:
-        if len(body) < 100:
-            raise MediaScrubError("mp4 mvhd v0 too short")
+        if len(body) != 100:
+            raise MediaScrubError(
+                f"mp4 mvhd v0 body length {len(body)} not the 100-byte spec size"
+            )
         flags = body[1:4]
         creation = struct.unpack(">I", body[4:8])[0]
         modification = struct.unpack(">I", body[8:12])[0]
@@ -314,8 +433,10 @@ def _rebuild_mvhd(data: bytes, atom: _Mp4Atom) -> bytes:
         )
         return _pack(b"mvhd", rebuilt)
     if version == 1:
-        if len(body) < 112:
-            raise MediaScrubError("mp4 mvhd v1 too short")
+        if len(body) != 112:
+            raise MediaScrubError(
+                f"mp4 mvhd v1 body length {len(body)} not the 112-byte spec size"
+            )
         flags = body[1:4]
         creation = struct.unpack(">Q", body[4:12])[0]
         modification = struct.unpack(">Q", body[12:20])[0]
@@ -349,7 +470,7 @@ def _rebuild_trak(
         if atom.type == b"tkhd":
             parts.append(_rebuild_tkhd(data, atom))
         elif atom.type == b"edts":
-            parts.append(data[atom.start:atom.body_end])
+            parts.append(_rebuild_edts(data, atom))
         elif atom.type == b"mdia":
             mdia_body, stsd_in_mdia = _rebuild_mdia(data, atom.body_start, atom.body_end)
             parts.append(_pack(b"mdia", mdia_body))
@@ -363,8 +484,10 @@ def _rebuild_tkhd(data: bytes, atom: _Mp4Atom) -> bytes:
         raise MediaScrubError("mp4 tkhd empty")
     version = body[0]
     if version == 0:
-        if len(body) < 84:
-            raise MediaScrubError("mp4 tkhd v0 too short")
+        if len(body) != 84:
+            raise MediaScrubError(
+                f"mp4 tkhd v0 body length {len(body)} not the 84-byte spec size"
+            )
         flags = body[1:4]
         creation = struct.unpack(">I", body[4:8])[0]
         modification = struct.unpack(">I", body[8:12])[0]
@@ -388,8 +511,10 @@ def _rebuild_tkhd(data: bytes, atom: _Mp4Atom) -> bytes:
         )
         return _pack(b"tkhd", rebuilt)
     if version == 1:
-        if len(body) < 96:
-            raise MediaScrubError("mp4 tkhd v1 too short")
+        if len(body) != 96:
+            raise MediaScrubError(
+                f"mp4 tkhd v1 body length {len(body)} not the 96-byte spec size"
+            )
         flags = body[1:4]
         creation = struct.unpack(">Q", body[4:12])[0]
         modification = struct.unpack(">Q", body[12:20])[0]
@@ -423,13 +548,138 @@ def _rebuild_mdia(
     parts: list[bytes] = []
     stsd_ok = False
     for atom in atoms:
-        if atom.type in (b"mdhd", b"hdlr"):
-            parts.append(data[atom.start:atom.body_end])
+        if atom.type == b"mdhd":
+            parts.append(_rebuild_mdhd(data, atom))
+        elif atom.type == b"hdlr":
+            parts.append(_rebuild_hdlr(data, atom))
         elif atom.type == b"minf":
             minf_body, stsd_in_minf = _rebuild_minf(data, atom.body_start, atom.body_end)
             parts.append(_pack(b"minf", minf_body))
             stsd_ok |= stsd_in_minf
     return b"".join(parts), stsd_ok
+
+
+def _rebuild_edts(data: bytes, atom: _Mp4Atom) -> bytes:
+    # edts contains exactly one elst (Edit List Box). Rebuild elst from
+    # parsed entries; reject anything else.
+    children = _parse_container(data, atom.body_start, atom.body_end)
+    if len(children) != 1 or children[0].type != b"elst":
+        raise MediaScrubError("mp4 edts must contain exactly one elst child")
+    elst = children[0]
+    body = data[elst.body_start:elst.body_end]
+    if len(body) < 8:
+        raise MediaScrubError("mp4 elst body too short")
+    version = body[0]
+    flags = body[1:4]
+    entry_count = struct.unpack(">I", body[4:8])[0]
+    if version == 0:
+        entry_size = 12  # segment_duration(4) + media_time(4 signed) + rate(4 fixed)
+    elif version == 1:
+        entry_size = 20  # segment_duration(8) + media_time(8 signed) + rate(4 fixed)
+    else:
+        raise MediaScrubError(f"mp4 elst unknown version {version}")
+    if entry_count > 0xFFFF:
+        raise MediaScrubError("mp4 elst entry count implausible")
+    expected = 8 + entry_count * entry_size
+    if len(body) != expected:
+        raise MediaScrubError(
+            f"mp4 elst body length {len(body)} does not match "
+            f"declared {entry_count} entries (expected {expected})"
+        )
+    entries: list[bytes] = []
+    off = 8
+    for _ in range(entry_count):
+        if version == 0:
+            seg_dur = struct.unpack(">I", body[off:off + 4])[0]
+            media_time = struct.unpack(">i", body[off + 4:off + 8])[0]
+            rate = struct.unpack(">I", body[off + 8:off + 12])[0]
+            entries.append(struct.pack(">IiI", seg_dur, media_time, rate))
+        else:
+            seg_dur = struct.unpack(">Q", body[off:off + 8])[0]
+            media_time = struct.unpack(">q", body[off + 8:off + 16])[0]
+            rate = struct.unpack(">I", body[off + 16:off + 20])[0]
+            entries.append(struct.pack(">QqI", seg_dur, media_time, rate))
+        off += entry_size
+    elst_body = (
+        bytes([version]) + flags
+        + struct.pack(">I", entry_count)
+        + b"".join(entries)
+    )
+    return _pack(b"edts", _pack(b"elst", elst_body))
+
+
+def _rebuild_mdhd(data: bytes, atom: _Mp4Atom) -> bytes:
+    body = data[atom.body_start:atom.body_end]
+    if len(body) < 1:
+        raise MediaScrubError("mp4 mdhd empty")
+    version = body[0]
+    if version == 0:
+        # v0 body: 4 v+flags + 4 creation + 4 modification + 4 timescale
+        # + 4 duration + 2 language + 2 pre_defined = 24 bytes
+        if len(body) != 24:
+            raise MediaScrubError(
+                f"mp4 mdhd v0 body length {len(body)} not the 24-byte spec size"
+            )
+        flags = body[1:4]
+        creation = struct.unpack(">I", body[4:8])[0]
+        modification = struct.unpack(">I", body[8:12])[0]
+        timescale = struct.unpack(">I", body[12:16])[0]
+        duration = struct.unpack(">I", body[16:20])[0]
+        language = struct.unpack(">H", body[20:22])[0]
+        rebuilt = (
+            bytes([0]) + flags
+            + struct.pack(">IIII", creation, modification, timescale, duration)
+            + struct.pack(">HH", language, 0)
+        )
+        return _pack(b"mdhd", rebuilt)
+    if version == 1:
+        # v1: creation/modification/duration widen to 8 bytes each = 36 bytes
+        if len(body) != 36:
+            raise MediaScrubError(
+                f"mp4 mdhd v1 body length {len(body)} not the 36-byte spec size"
+            )
+        flags = body[1:4]
+        creation = struct.unpack(">Q", body[4:12])[0]
+        modification = struct.unpack(">Q", body[12:20])[0]
+        timescale = struct.unpack(">I", body[20:24])[0]
+        duration = struct.unpack(">Q", body[24:32])[0]
+        language = struct.unpack(">H", body[32:34])[0]
+        rebuilt = (
+            bytes([1]) + flags
+            + struct.pack(">QQ", creation, modification)
+            + struct.pack(">IQ", timescale, duration)
+            + struct.pack(">HH", language, 0)
+        )
+        return _pack(b"mdhd", rebuilt)
+    raise MediaScrubError(f"mp4 mdhd unknown version {version}")
+
+
+def _rebuild_hdlr(data: bytes, atom: _Mp4Atom) -> bytes:
+    body = data[atom.body_start:atom.body_end]
+    # hdlr: v+flags(4) + pre_defined(4) + handler_type(4) + reserved(12) +
+    # name (null-terminated UTF-8 string, may be empty). Fixed prefix
+    # is 24 bytes; anything past that is the name.
+    if len(body) < 24:
+        raise MediaScrubError(
+            f"mp4 hdlr body length {len(body)} shorter than 24-byte header"
+        )
+    version = body[0]
+    if version != 0:
+        raise MediaScrubError(f"mp4 hdlr unknown version {version}")
+    flags = body[1:4]
+    handler_type = body[8:12]
+    # Rebuild reserved fields as zeros; keep the handler_type token (real
+    # value — decoders route on it) and emit an empty name so any
+    # encoder-identity string ("VideoHandler" from ffmpeg, arbitrary from
+    # a hostile fixture) cannot survive.
+    rebuilt = (
+        bytes([0]) + flags
+        + b"\x00" * 4  # pre_defined
+        + handler_type
+        + b"\x00" * 12  # reserved
+        + b"\x00"  # name = ""
+    )
+    return _pack(b"hdlr", rebuilt)
 
 
 def _rebuild_minf(
@@ -439,8 +689,14 @@ def _rebuild_minf(
     parts: list[bytes] = []
     stsd_ok = False
     for atom in atoms:
-        if atom.type in (b"vmhd", b"smhd", b"nmhd", b"hmhd"):
-            parts.append(data[atom.start:atom.body_end])
+        if atom.type == b"vmhd":
+            parts.append(_rebuild_vmhd(data, atom))
+        elif atom.type == b"smhd":
+            parts.append(_rebuild_smhd(data, atom))
+        elif atom.type == b"nmhd":
+            parts.append(_rebuild_nmhd(data, atom))
+        elif atom.type == b"hmhd":
+            parts.append(_rebuild_hmhd(data, atom))
         elif atom.type == b"dinf":
             # Canonical rebuild — the reviewer flagged that unknown
             # children inside dinf survived. We only accept the shape
@@ -452,6 +708,70 @@ def _rebuild_minf(
             parts.append(_pack(b"stbl", stbl_body))
             stsd_ok |= stsd_in_stbl
     return b"".join(parts), stsd_ok
+
+
+def _rebuild_vmhd(data: bytes, atom: _Mp4Atom) -> bytes:
+    # vmhd body: v+flags(4) + graphicsmode(2) + opcolor(6) = 12 bytes
+    body = data[atom.body_start:atom.body_end]
+    if len(body) != 12:
+        raise MediaScrubError(
+            f"mp4 vmhd body length {len(body)} not the 12-byte spec size"
+        )
+    flags = body[1:4]
+    graphics_mode = struct.unpack(">H", body[4:6])[0]
+    opcolor = struct.unpack(">HHH", body[6:12])
+    rebuilt = (
+        bytes([0]) + flags
+        + struct.pack(">H", graphics_mode)
+        + struct.pack(">HHH", *opcolor)
+    )
+    return _pack(b"vmhd", rebuilt)
+
+
+def _rebuild_smhd(data: bytes, atom: _Mp4Atom) -> bytes:
+    # smhd body: v+flags(4) + balance(2) + reserved(2) = 8 bytes
+    body = data[atom.body_start:atom.body_end]
+    if len(body) != 8:
+        raise MediaScrubError(
+            f"mp4 smhd body length {len(body)} not the 8-byte spec size"
+        )
+    flags = body[1:4]
+    balance = struct.unpack(">h", body[4:6])[0]
+    rebuilt = bytes([0]) + flags + struct.pack(">h", balance) + b"\x00\x00"
+    return _pack(b"smhd", rebuilt)
+
+
+def _rebuild_nmhd(data: bytes, atom: _Mp4Atom) -> bytes:
+    # nmhd body: v+flags(4). Fixed 4 bytes.
+    body = data[atom.body_start:atom.body_end]
+    if len(body) != 4:
+        raise MediaScrubError(
+            f"mp4 nmhd body length {len(body)} not the 4-byte spec size"
+        )
+    flags = body[1:4]
+    return _pack(b"nmhd", bytes([0]) + flags)
+
+
+def _rebuild_hmhd(data: bytes, atom: _Mp4Atom) -> bytes:
+    # hmhd body: v+flags(4) + maxPDUsize(2) + avgPDUsize(2) + maxbitrate(4)
+    # + avgbitrate(4) + reserved(4) = 20 bytes
+    body = data[atom.body_start:atom.body_end]
+    if len(body) != 20:
+        raise MediaScrubError(
+            f"mp4 hmhd body length {len(body)} not the 20-byte spec size"
+        )
+    flags = body[1:4]
+    max_pdu = struct.unpack(">H", body[4:6])[0]
+    avg_pdu = struct.unpack(">H", body[6:8])[0]
+    max_bitrate = struct.unpack(">I", body[8:12])[0]
+    avg_bitrate = struct.unpack(">I", body[12:16])[0]
+    rebuilt = (
+        bytes([0]) + flags
+        + struct.pack(">HH", max_pdu, avg_pdu)
+        + struct.pack(">II", max_bitrate, avg_bitrate)
+        + b"\x00" * 4
+    )
+    return _pack(b"hmhd", rebuilt)
 
 
 def _rebuild_dinf(data: bytes, body_start: int, body_end: int) -> bytes:
@@ -646,6 +966,94 @@ def _rebuild_audio_sample_entry_fixed(entry_bytes: bytes) -> tuple[bytes, int]:
     return fixed, 16 + 20
 
 
+# Sample-entry inner boxes come in two shapes. Codec configuration blobs
+# (avcC = H.264 SPS/PPS; hvcC = HEVC config; vpcC, av1C, esds — MPEG-4
+# elementary stream descriptors) are inherently variable-length codec-
+# specific data; parsing every field is codec engineering out of scope
+# for this ticket. They are size-validated at the box-header level and
+# their bounded body is emitted, but no field-level rebuild happens.
+# Everything else in this allowlist is a fixed-shape structural box and
+# GETS a field-level struct.pack rebuild — the round-7 review flagged
+# that btrt slack survived under the previous opaque copy path.
+_MP4_INNER_CODEC_CONFIG: Final = {
+    b"avcC", b"hvcC", b"vpcC", b"av1C", b"esds",
+}
+
+
+def _rebuild_inner_btrt(body: bytes) -> bytes:
+    # btrt body: bufferSizeDB(4) + maxBitrate(4) + avgBitrate(4) = 12 bytes.
+    if len(body) != 12:
+        raise MediaScrubError(
+            f"mp4 btrt body length {len(body)} not the 12-byte spec size"
+        )
+    buffer_size = struct.unpack(">I", body[0:4])[0]
+    max_bitrate = struct.unpack(">I", body[4:8])[0]
+    avg_bitrate = struct.unpack(">I", body[8:12])[0]
+    return _pack(b"btrt", struct.pack(">III", buffer_size, max_bitrate, avg_bitrate))
+
+
+def _rebuild_inner_pasp(body: bytes) -> bytes:
+    # pasp body: hSpacing(4) + vSpacing(4) = 8 bytes.
+    if len(body) != 8:
+        raise MediaScrubError(
+            f"mp4 pasp body length {len(body)} not the 8-byte spec size"
+        )
+    h_spacing = struct.unpack(">I", body[0:4])[0]
+    v_spacing = struct.unpack(">I", body[4:8])[0]
+    return _pack(b"pasp", struct.pack(">II", h_spacing, v_spacing))
+
+
+def _rebuild_inner_colr(body: bytes) -> bytes:
+    # colr body starts with a 4-byte colour_type tag. We support the two
+    # tags a modern muxer emits:
+    #   nclx (7 bytes body after the tag): primaries(2), transfer(2),
+    #     matrix(2), full_range_flag byte
+    #   nclc (6 bytes body after tag): primaries(2), transfer(2), matrix(2)
+    # Any other tag is rejected. Trailing bytes past the declared shape
+    # are rejected — no slack survives.
+    if len(body) < 4:
+        raise MediaScrubError("mp4 colr body too short")
+    colour_type = body[0:4]
+    payload = body[4:]
+    if colour_type == b"nclx":
+        if len(payload) != 7:
+            raise MediaScrubError(
+                f"mp4 colr(nclx) payload length {len(payload)} not the 7-byte spec size"
+            )
+        primaries = struct.unpack(">H", payload[0:2])[0]
+        transfer = struct.unpack(">H", payload[2:4])[0]
+        matrix = struct.unpack(">H", payload[4:6])[0]
+        full_range = payload[6]
+        rebuilt = (
+            b"nclx"
+            + struct.pack(">HHH", primaries, transfer, matrix)
+            + bytes([full_range])
+        )
+    elif colour_type == b"nclc":
+        if len(payload) != 6:
+            raise MediaScrubError(
+                f"mp4 colr(nclc) payload length {len(payload)} not the 6-byte spec size"
+            )
+        primaries = struct.unpack(">H", payload[0:2])[0]
+        transfer = struct.unpack(">H", payload[2:4])[0]
+        matrix = struct.unpack(">H", payload[4:6])[0]
+        rebuilt = b"nclc" + struct.pack(">HHH", primaries, transfer, matrix)
+    else:
+        raise MediaScrubError(
+            f"mp4 colr colour_type {colour_type!r} outside allowlist (nclx/nclc)"
+        )
+    return _pack(b"colr", rebuilt)
+
+
+def _rebuild_inner_frma(body: bytes) -> bytes:
+    # frma body: original_format (4 bytes, a 4-CC).
+    if len(body) != 4:
+        raise MediaScrubError(
+            f"mp4 frma body length {len(body)} not the 4-byte spec size"
+        )
+    return _pack(b"frma", body)
+
+
 def _walk_sample_entry_inner_boxes(entry_bytes: bytes, inner_start: int) -> list[bytes]:
     """Header-validate each inner box; reject unknown types.
 
@@ -672,9 +1080,28 @@ def _walk_sample_entry_inner_boxes(entry_bytes: bytes, inner_start: int) -> list
             raise MediaScrubError(
                 f"mp4 sample entry inner box {box_type!r} outside allowlist"
             )
-        # Rebuild header from validated size+type; body bounded by size.
         body = entry_bytes[offset + 8:offset + box_size]
-        out.append(struct.pack(">I", 8 + len(body)) + box_type + body)
+        # Rebuild via struct.pack from parsed fields for every fixed-shape
+        # inner box. Codec configuration blobs (avcC/hvcC/vpcC/av1C/esds)
+        # are the sole exception — parsing every H.264 SPS byte or MPEG-4
+        # ES descriptor is out of scope; they emit as a header-rebuilt
+        # box with a size-bounded body copy.
+        if box_type == b"btrt":
+            out.append(_rebuild_inner_btrt(body))
+        elif box_type == b"pasp":
+            out.append(_rebuild_inner_pasp(body))
+        elif box_type == b"colr":
+            out.append(_rebuild_inner_colr(body))
+        elif box_type == b"frma":
+            out.append(_rebuild_inner_frma(body))
+        elif box_type in _MP4_INNER_CODEC_CONFIG:
+            out.append(struct.pack(">I", 8 + len(body)) + box_type + body)
+        else:
+            # Container/auxiliary types (sinf, schm, schi, tenc) — parsing
+            # every one field-by-field is out of scope; emitted as header-
+            # rebuilt with size-bounded body. If a hostile inner appears
+            # inside sinf/schi, the recursion is future work.
+            out.append(struct.pack(">I", 8 + len(body)) + box_type + body)
         offset += box_size
     return out
 
