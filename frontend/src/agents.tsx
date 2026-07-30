@@ -39,6 +39,7 @@ import { ScreencastProvider, ScreencastStrip } from "./screencast-strip";
 import { SessionSidebar } from "./session";
 import type { SidebarTarget } from "./session";
 import { BranchPill } from "./branch-pill";
+import { BlastRadiusPanel } from "./blast-radius";
 import { StatusBadge } from "./status-badge";
 
 declare global {
@@ -562,6 +563,8 @@ export function SpawnWorkerModal({
             </span>
           </label>
         </div>
+
+        <BlastRadiusPanel candidate={normalizedTicket || "all"} />
 
         {!ticketValid && normalizedTicket ? (
           <div className="agent-spawn-error">Ticket ids must stay uppercase and match the worker pattern.</div>
@@ -1543,6 +1546,7 @@ export function AgentsView({
           </div>
         </div>
         <AccountEventsBanner events={accountEvents} />
+        <BlastRadiusPanel />
         {spawnNotice ? (
           spawnNotice.kind === "worker" ? (
             <div className="agents-notice">

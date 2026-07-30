@@ -223,6 +223,44 @@ export function getAgents() {
   }>("/api/agents");
 }
 
+export type BlastRadiusBranch = {
+  branch: string;
+  ticket: string | null;
+  source: "pr" | "worker" | "candidate" | string;
+  head_sha: string;
+  files: string[];
+  file_count: number;
+};
+
+export type BlastRadiusCollision = {
+  left: string;
+  right: string;
+  overlap: string[];
+  overlap_count: number;
+};
+
+export type BlastRadiusPayload = {
+  candidate: string;
+  candidate_found: boolean | null;
+  complete: boolean;
+  failed_branches: Array<{ branch: string; reason: string }>;
+  branches: BlastRadiusBranch[];
+  collisions: BlastRadiusCollision[];
+  risk: {
+    count: number;
+    level: "none" | "low" | "medium" | "high" | string;
+    hot_files: string[];
+  } | null;
+  refreshed_at: number | null;
+  snapshot_max_age_seconds: number;
+  error?: string;
+};
+
+export function getBlastRadius(candidate = "all", signal?: AbortSignal) {
+  const params = new URLSearchParams({ candidate });
+  return request<BlastRadiusPayload>(`/api/blast-radius?${params}`, signal ? { signal } : undefined);
+}
+
 export type MarkViewedResult = {
   run_id: string;
   last_viewed_at: string;

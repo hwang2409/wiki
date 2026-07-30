@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 from . import (
     accounts,
     backend_runtime,
+    blast_radius,
     context_prelude,
     dashboard,
     github_pr,
@@ -71,6 +72,7 @@ from .rebase_schema import RebaseDirtyPrIn
 
 
 ROOT_DIR = Path(os.environ.get("WIKI_REPO_DIR", Path(__file__).resolve().parents[2])).resolve()
+blast_radius.OPEN_PR_SNAPSHOT.set_repo_root(ROOT_DIR)
 VAULT_DIR = Path(os.environ.get("WIKI_VAULT_DIR", ROOT_DIR / "vault")).resolve()
 # File API paths are relative to the repository root. Note paths remain
 # vault-relative because the note API is rooted at VAULT_DIR.
@@ -158,6 +160,7 @@ def _rebase_bot_notification_sender(
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     global UNKNOWN_KIND_TELEMETRY
+    blast_radius.OPEN_PR_SNAPSHOT.start()
     runtime_paths = RuntimePaths.from_env()
     from .agent_runtime import rebase_bot
 
@@ -217,6 +220,7 @@ async def lifespan(_app: FastAPI):
     try:
         yield
     finally:
+        blast_radius.OPEN_PR_SNAPSHOT.stop()
         unknown_kind_telemetry_stop.set()
         dispatcher_task.cancel()
         watchdog_task.cancel()
@@ -2614,6 +2618,29 @@ def fleet_graph(limit: int = Query(default=10, ge=0, le=50)) -> dict[str, object
     return _fleet_graph_payload(limit)
 
 
+@app.get("/api/blast-radius")
+@app.get("/api/fleet/blast-radius")
+@app.get("/api/agents/blast-radius")
+def blast_radius_view(
+    candidate: str = Query(default="all", max_length=200),
+    branch: str | None = Query(default=None, max_length=200),
+    ticket: str | None = Query(default=None, max_length=80),
+) -> dict[str, Any]:
+    """Return bounded branch overlap data from the primary repository refs."""
+
+    selected = branch or ticket or candidate
+    try:
+        registry = _read_agent_registry(strict=True)
+    except (OSError, ValueError) as exc:
+        return blast_radius.analyze(
+            ROOT_DIR,
+            {},
+            selected,
+            registry_error=f"agent registry is unavailable: {exc}",
+        )
+    return blast_radius.analyze(ROOT_DIR, registry, selected)
+
+
 MAX_SCREENCAST_TICKETS = 32
 
 
@@ -4070,11 +4097,15 @@ def _write_queue(queue: dict[str, list[dict]]) -> None:
     tmp.rename(MSG_QUEUE_PATH)
 
 
-def _read_agent_registry() -> dict:
+def _read_agent_registry(*, strict: bool = False) -> object:
     try:
         data = json.loads(AGENT_REGISTRY_PATH.read_text(encoding="utf-8"))
+        if strict:
+            return data
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
+        if strict:
+            raise
         return {}
 
 
