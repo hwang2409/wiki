@@ -2841,12 +2841,7 @@ def agent_run_replay_timeline(
             limit=limit,
         )
     except replay.ReplayError as exc:
-        message = str(exc)
-        if "not found" in message or "missing" in message:
-            raise HTTPException(status_code=404, detail="Run not found") from exc
-        if "invalid cursor" in message:
-            raise HTTPException(status_code=400, detail="Bad cursor") from exc
-        raise HTTPException(status_code=500, detail=message) from exc
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
     finally:
         os.close(runs_root_fd)
 
@@ -2861,7 +2856,7 @@ def agent_run_replay_event(run_id: str, seq: int) -> dict[str, object]:
         replay.verify_run_dir_exists(runs_root_fd, run_id)
         entry = replay.load_raw_event(runs_root_fd, run_id, seq)
     except replay.ReplayError as exc:
-        raise HTTPException(status_code=404, detail="Run not found") from exc
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
     finally:
         os.close(runs_root_fd)
     if entry is None:

@@ -32,12 +32,19 @@ type SpeedChoice = (typeof SPEED_OPTIONS)[number] | typeof MAX_SPEED_LABEL;
 
 const MAX_ADVANCE_DELAY_MS = 10_000;
 const MIN_ADVANCE_DELAY_MS = 40;
-const DEFAULT_PAGE_SIZE = 500;
-// Runaway guard — a well-behaved server always terminates ``has_more``,
-// but we cap pagination at 200 pages (100k events at DEFAULT_PAGE_SIZE) so a
-// corrupt cursor cycle can't loop forever. If we hit this, the UI shows an
-// explicit "more events beyond this window" notice.
-const MAX_TIMELINE_PAGES = 200;
+
+// Bounded event window (round-4 review item 2): the panel keeps at most
+// ``windowSize`` events in memory at any moment. When a new page arrives
+// and puts us over the cap, the OLDEST events evict from the front.
+// Playback and scrubbing prefetch the next page only as we approach the
+// window's forward edge, so a 100k-event run does not accumulate 100k JS
+// objects. Exported as a MUTABLE object so tests can force eviction with
+// a small window without inflating the fixture size.
+export const REPLAY_TUNABLES = {
+  windowSize: 5_000,
+  prefetchMargin: 128,
+  pageSize: 500,
+};
 
 function formatClockTime(iso: string | null): string {
   if (!iso) return "--:--:--";
@@ -77,94 +84,89 @@ function bookmarkTitle(bookmark: ReplayBookmark): string {
   return `${bookmark.kind} @ ${clock} · ${bookmark.summary}`;
 }
 
-type TimelineLoadUpdate = {
-  timeline: ReplayTimeline;
-  pagesLoaded: number;
-  done: boolean;
-  hitPageGuard: boolean;
+/**
+ * Rolling window over a paginated event stream.
+ *
+ * ``droppedFromFront`` is the count of events evicted since we started
+ * loading the first page. It converts between the panel's "absolute index"
+ * (0-based over the run's full sequence) and the position inside the
+ * currently-held ``events`` array. When the user scrubs backward past the
+ * evicted edge, the loader resets and re-pages forward — the round-3
+ * code accumulated every event ever fetched into a single array and hit
+ * memory pressure on long runs.
+ */
+type TimelineWindow = {
+  run: ReplayRunSummary;
+  events: ReplayTimelineEvent[];
+  droppedFromFront: number;
+  hasMore: boolean;
+  nextCursor: string | null;
+  bookmarks: ReplayBookmark[];
+  bookmarksTruncated: boolean;
+  warnings: string[];
 };
 
-/**
- * Page through every server window until the cursor drains. Reports each
- * intermediate state through ``onProgress`` so a long run shows a growing
- * event count instead of a spinner that hides the fact loading is still
- * happening. The MAX_TIMELINE_PAGES guard exists only as a runaway backstop;
- * if we ever hit it the caller flips a "more events beyond this window"
- * banner — the round-1 code silently truncated at 5000 events which is what
- * the review flagged.
- */
-async function loadFullTimeline(
+function initialWindow(run: ReplayRunSummary): TimelineWindow {
+  return {
+    run,
+    events: [],
+    droppedFromFront: 0,
+    hasMore: true,
+    nextCursor: null,
+    bookmarks: [],
+    bookmarksTruncated: false,
+    warnings: [],
+  };
+}
+
+function mergePage(window: TimelineWindow, page: ReplayTimeline): TimelineWindow {
+  let events = [...window.events, ...page.events];
+  let droppedFromFront = window.droppedFromFront;
+  if (events.length > REPLAY_TUNABLES.windowSize) {
+    const overflow = events.length - REPLAY_TUNABLES.windowSize;
+    events = events.slice(overflow);
+    droppedFromFront += overflow;
+  }
+  return {
+    ...window,
+    events,
+    droppedFromFront,
+    hasMore: page.has_more,
+    nextCursor: page.next_cursor,
+    bookmarks: window.bookmarks.length ? window.bookmarks : page.bookmarks,
+    bookmarksTruncated: window.bookmarksTruncated || page.bookmarks_truncated,
+    warnings: Array.from(new Set([...window.warnings, ...page.warnings])),
+  };
+}
+
+async function fetchNextPage(
   runId: string,
+  window: TimelineWindow,
   signal: AbortSignal,
-  onProgress: (update: TimelineLoadUpdate) => void,
-): Promise<void> {
-  let timeline = await getReplayTimeline(runId, {
-    limit: DEFAULT_PAGE_SIZE,
+): Promise<ReplayTimeline> {
+  return getReplayTimeline(runId, {
+    cursor: window.nextCursor ?? undefined,
+    limit: REPLAY_TUNABLES.pageSize,
     signal,
   });
-  let pages = 1;
-  onProgress({
-    timeline,
-    pagesLoaded: pages,
-    done: !timeline.has_more,
-    hitPageGuard: false,
-  });
-  let cursor: string | null = timeline.next_cursor;
-  while (timeline.has_more && cursor && !signal.aborted) {
-    if (pages >= MAX_TIMELINE_PAGES) {
-      onProgress({
-        timeline,
-        pagesLoaded: pages,
-        done: false,
-        hitPageGuard: true,
-      });
-      return;
-    }
-    const page = await getReplayTimeline(runId, {
-      cursor,
-      limit: DEFAULT_PAGE_SIZE,
-      signal,
-    });
-    pages += 1;
-    // Merge warnings even on an empty final page — a truncated tail or
-    // scan cap warning can appear on the last read after we've stopped
-    // accumulating new events.
-    const mergedWarnings = [...timeline.warnings, ...page.warnings];
-    timeline = {
-      ...timeline,
-      events: [...timeline.events, ...page.events],
-      next_cursor: page.next_cursor,
-      has_more: page.has_more,
-      bookmarks_truncated:
-        timeline.bookmarks_truncated || page.bookmarks_truncated,
-      warnings: mergedWarnings,
-    };
-    cursor = page.next_cursor;
-    onProgress({
-      timeline,
-      pagesLoaded: pages,
-      done: !timeline.has_more,
-      hitPageGuard: false,
-    });
-    if (!page.has_more) return;
-  }
 }
 
 export function ReplayScrubberPanel({ ticket }: { ticket: string }) {
   const [runs, setRuns] = useState<ReplayRunSummary[] | null>(null);
   const [runsError, setRunsError] = useState<string | null>(null);
+  const [runsTruncated, setRunsTruncated] = useState(false);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
-  const [timeline, setTimeline] = useState<ReplayTimeline | null>(null);
-  const [timelineLoading, setTimelineLoading] = useState(false);
+  const [timeline, setTimeline] = useState<TimelineWindow | null>(null);
   const [timelineError, setTimelineError] = useState<string | null>(null);
-  const [pagesLoaded, setPagesLoaded] = useState(0);
-  const [pageGuardHit, setPageGuardHit] = useState(false);
-  const [cursor, setCursor] = useState(0);
+  const [initialLoading, setInitialLoading] = useState(false);
+  const [pageLoading, setPageLoading] = useState(false);
+  const [absoluteIndex, setAbsoluteIndex] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState<SpeedChoice>(1);
   const [rawEvent, setRawEvent] = useState<ReplayRawEvent | null>(null);
   const [rawLoading, setRawLoading] = useState(false);
   const [rawError, setRawError] = useState<string | null>(null);
+  const loadingRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     let ignore = false;
@@ -174,6 +176,7 @@ export function ReplayScrubberPanel({ ticket }: { ticket: string }) {
       .then((body) => {
         if (ignore) return;
         setRuns(body.runs);
+        setRunsTruncated(body.runs_truncated);
         setSelectedRunId((current) => current ?? body.runs[0]?.run_id ?? null);
       })
       .catch((err) => {
@@ -187,33 +190,43 @@ export function ReplayScrubberPanel({ ticket }: { ticket: string }) {
     };
   }, [ticket]);
 
+  // Initial page load whenever the selected run changes.
   useEffect(() => {
     if (!selectedRunId) return;
     let ignore = false;
     const controller = new AbortController();
+    loadingRef.current?.abort();
+    loadingRef.current = controller;
     setTimeline(null);
     setTimelineError(null);
-    setTimelineLoading(true);
-    setPagesLoaded(0);
-    setPageGuardHit(false);
-    setCursor(0);
+    setInitialLoading(true);
+    setAbsoluteIndex(0);
     setPlaying(false);
-    loadFullTimeline(selectedRunId, controller.signal, (update) => {
-      if (ignore || controller.signal.aborted) return;
-      setTimeline(update.timeline);
-      setPagesLoaded(update.pagesLoaded);
-      setPageGuardHit(update.hitPageGuard);
-      if (update.done || update.hitPageGuard) {
-        setTimelineLoading(false);
-      }
+    getReplayTimeline(selectedRunId, {
+      limit: REPLAY_TUNABLES.pageSize,
+      signal: controller.signal,
     })
+      .then((page) => {
+        if (ignore || controller.signal.aborted) return;
+        const window: TimelineWindow = {
+          run: page.run,
+          events: page.events,
+          droppedFromFront: 0,
+          hasMore: page.has_more,
+          nextCursor: page.next_cursor,
+          bookmarks: page.bookmarks,
+          bookmarksTruncated: page.bookmarks_truncated,
+          warnings: Array.from(new Set(page.warnings)),
+        };
+        setTimeline(window);
+        setInitialLoading(false);
+      })
       .catch((err) => {
         if (ignore || controller.signal.aborted) return;
-        setTimeline(null);
         setTimelineError(
-          err instanceof Error ? err.message : "Could not load timeline"
+          err instanceof Error ? err.message : "Could not load timeline",
         );
-        setTimelineLoading(false);
+        setInitialLoading(false);
       });
     return () => {
       ignore = true;
@@ -221,18 +234,125 @@ export function ReplayScrubberPanel({ ticket }: { ticket: string }) {
     };
   }, [selectedRunId]);
 
+  // Demand-driven prefetch: when the cursor is close to the trailing edge
+  // of the loaded window AND the server has more, request the next page.
+  // Deliberately NOT gated on ``pageLoading`` — if the cursor moves during
+  // an in-flight prefetch, the cleanup aborts it and this effect
+  // re-fires. Round-3's ``pageLoading`` gate caused the chain to stall
+  // after a scrub if the prior abort branch hadn't cleared the flag.
+  useEffect(() => {
+    if (!timeline || !selectedRunId) return;
+    if (!timeline.hasMore || !timeline.nextCursor) return;
+    const trailingEdgeAbsolute = timeline.droppedFromFront + timeline.events.length - 1;
+    if (absoluteIndex + REPLAY_TUNABLES.prefetchMargin < trailingEdgeAbsolute) return;
+    let ignore = false;
+    const controller = new AbortController();
+    setPageLoading(true);
+    fetchNextPage(selectedRunId, timeline, controller.signal)
+      .then((page) => {
+        if (ignore || controller.signal.aborted) return;
+        setTimeline((current) => (current ? mergePage(current, page) : current));
+        setPageLoading(false);
+      })
+      .catch((err) => {
+        if (ignore || controller.signal.aborted) return;
+        setTimelineError(
+          err instanceof Error ? err.message : "Could not load next page",
+        );
+        setPageLoading(false);
+      });
+    return () => {
+      ignore = true;
+      controller.abort();
+    };
+  }, [absoluteIndex, selectedRunId, timeline]);
+
+  // Backward-scrub reset: if the cursor moves before the evicted-edge, we
+  // restart pagination from the beginning and page forward until the
+  // target is loaded again.
+  const rewindTo = useCallback(
+    (targetAbsolute: number) => {
+      if (!selectedRunId) return;
+      const controller = new AbortController();
+      loadingRef.current?.abort();
+      loadingRef.current = controller;
+      setInitialLoading(true);
+      setTimeline((current) =>
+        current
+          ? { ...current, events: [], droppedFromFront: 0, hasMore: true, nextCursor: null }
+          : current,
+      );
+      setPlaying(false);
+      (async () => {
+        let cursor: string | null = null;
+        let events: ReplayTimelineEvent[] = [];
+        let bookmarks: ReplayBookmark[] = [];
+        let bookmarksTruncated = false;
+        let warnings: string[] = [];
+        let run: ReplayRunSummary | null = null;
+        let hasMore = true;
+        while (hasMore && !controller.signal.aborted) {
+          const page = await getReplayTimeline(selectedRunId, {
+            cursor: cursor ?? undefined,
+            limit: REPLAY_TUNABLES.pageSize,
+            signal: controller.signal,
+          });
+          if (!run) run = page.run;
+          events = [...events, ...page.events];
+          if (bookmarks.length === 0) bookmarks = page.bookmarks;
+          bookmarksTruncated = bookmarksTruncated || page.bookmarks_truncated;
+          warnings = Array.from(new Set([...warnings, ...page.warnings]));
+          hasMore = page.has_more;
+          cursor = page.next_cursor;
+          if (events.length > targetAbsolute + REPLAY_TUNABLES.prefetchMargin) break;
+        }
+        if (controller.signal.aborted) return;
+        let dropped = 0;
+        if (events.length > REPLAY_TUNABLES.windowSize) {
+          const overflow = events.length - REPLAY_TUNABLES.windowSize;
+          events = events.slice(overflow);
+          dropped = overflow;
+        }
+        setTimeline({
+          run: run!,
+          events,
+          droppedFromFront: dropped,
+          hasMore,
+          nextCursor: cursor,
+          bookmarks,
+          bookmarksTruncated,
+          warnings,
+        });
+        setAbsoluteIndex(targetAbsolute);
+        setInitialLoading(false);
+      })().catch((err) => {
+        if (controller.signal.aborted) return;
+        setTimelineError(err instanceof Error ? err.message : "Could not rewind");
+        setInitialLoading(false);
+      });
+    },
+    [selectedRunId],
+  );
+
+  // Playback advances one event per real-time gap (scaled by speed).
   useEffect(() => {
     if (!playing || !timeline || timeline.events.length === 0) return;
-    if (cursor >= timeline.events.length - 1) {
-      setPlaying(false);
+    const localIndex = absoluteIndex - timeline.droppedFromFront;
+    if (localIndex < 0 || localIndex >= timeline.events.length - 1) {
+      if (!timeline.hasMore) setPlaying(false);
       return;
     }
-    const delay = eventDelay(timeline.events, cursor, speed);
-    const timer = window.setTimeout(() => setCursor((v) => v + 1), delay);
+    const delay = eventDelay(timeline.events, localIndex, speed);
+    const timer = window.setTimeout(() => setAbsoluteIndex((v) => v + 1), delay);
     return () => window.clearTimeout(timer);
-  }, [cursor, playing, speed, timeline]);
+  }, [absoluteIndex, playing, speed, timeline]);
 
-  const currentEvent = timeline?.events[cursor] ?? null;
+  const currentEvent = useMemo(() => {
+    if (!timeline) return null;
+    const localIndex = absoluteIndex - timeline.droppedFromFront;
+    if (localIndex < 0 || localIndex >= timeline.events.length) return null;
+    return timeline.events[localIndex];
+  }, [absoluteIndex, timeline]);
 
   useEffect(() => {
     if (!selectedRunId || !currentEvent) {
@@ -266,42 +386,58 @@ export function ReplayScrubberPanel({ ticket }: { ticket: string }) {
     };
   }, [currentEvent, selectedRunId]);
 
+  const totalKnown = timeline
+    ? Math.max(
+        timeline.droppedFromFront + timeline.events.length,
+        timeline.run.total_events,
+      )
+    : 0;
+
   const bookmarkPositions = useMemo(() => {
-    if (!timeline || timeline.events.length === 0) return [];
-    const total = timeline.events.length;
-    const seqToIndex = new Map<number, number>();
-    timeline.events.forEach((event, index) => {
-      seqToIndex.set(event.seq, index);
-    });
-    return timeline.bookmarks
-      .map((bookmark) => {
-        const index = seqToIndex.get(bookmark.seq);
-        if (index === undefined) return null;
-        const pct = total <= 1 ? 0 : (index / (total - 1)) * 100;
-        return { bookmark, index, pct };
-      })
-      .filter((value): value is { bookmark: ReplayBookmark; index: number; pct: number } =>
-        value !== null,
-      );
-  }, [timeline]);
+    if (!timeline || totalKnown <= 0) return [];
+    // Map seq → absolute index via a linear walk over the current window.
+    // For bookmarks whose seq isn't in the window we approximate the
+    // position by treating seq-1 as the absolute index (seqs are
+    // monotonic starting at 1 in supervisor output).
+    const positions: {
+      bookmark: ReplayBookmark;
+      absoluteIndex: number;
+      pct: number;
+    }[] = [];
+    const denom = Math.max(totalKnown - 1, 1);
+    for (const bookmark of timeline.bookmarks) {
+      const absoluteIndexEstimate = Math.max(0, bookmark.seq - 1);
+      const pct = (absoluteIndexEstimate / denom) * 100;
+      positions.push({ bookmark, absoluteIndex: absoluteIndexEstimate, pct });
+    }
+    return positions;
+  }, [timeline, totalKnown]);
 
   const stepBy = useCallback(
     (delta: number) => {
       if (!timeline) return;
       setPlaying(false);
-      setCursor((v) =>
-        Math.max(0, Math.min(timeline.events.length - 1, v + delta))
-      );
+      const target = Math.max(0, Math.min(totalKnown - 1, absoluteIndex + delta));
+      if (target < timeline.droppedFromFront) {
+        rewindTo(target);
+        return;
+      }
+      setAbsoluteIndex(target);
     },
-    [timeline]
+    [absoluteIndex, rewindTo, timeline, totalKnown],
   );
 
-  const jumpToBookmark = useCallback(
-    (index: number) => {
+  const jumpToAbsolute = useCallback(
+    (target: number) => {
+      if (!timeline) return;
       setPlaying(false);
-      setCursor(index);
+      if (target < timeline.droppedFromFront) {
+        rewindTo(target);
+        return;
+      }
+      setAbsoluteIndex(target);
     },
-    []
+    [rewindTo, timeline],
   );
 
   const runOptions = runs ?? [];
@@ -340,37 +476,37 @@ export function ReplayScrubberPanel({ ticket }: { ticket: string }) {
       {runsEmpty ? (
         <div className="replay-empty">no archived runs for {ticket}</div>
       ) : null}
+      {runsTruncated ? (
+        <div className="replay-status">older runs beyond this list; truncation cap hit.</div>
+      ) : null}
 
       {timelineError ? (
         <div className="replay-empty">{timelineError}</div>
       ) : null}
 
-      {timelineLoading && !timeline ? (
+      {initialLoading && !timeline ? (
         <div className="replay-empty">loading timeline…</div>
       ) : null}
 
       {timeline ? (
         <ReplayLoadStatus
-          bookmarksTruncated={timeline.bookmarks_truncated}
-          events={timeline.events.length}
-          loading={timelineLoading}
-          pageGuardHit={pageGuardHit}
-          pagesLoaded={pagesLoaded}
+          absoluteIndex={absoluteIndex}
+          bookmarksTruncated={timeline.bookmarksTruncated}
+          droppedFromFront={timeline.droppedFromFront}
+          eventsInWindow={timeline.events.length}
+          hasMore={timeline.hasMore}
+          pageLoading={pageLoading}
           serverWarnings={timeline.warnings}
-          totalHint={timeline.run.total_events}
+          totalKnown={totalKnown}
         />
       ) : null}
 
       {timeline && timeline.events.length > 0 ? (
         <ReplayScrubberBody
+          absoluteIndex={absoluteIndex}
           bookmarks={bookmarkPositions}
-          cursor={cursor}
           currentEvent={currentEvent}
-          onCursorChange={(value) => {
-            setPlaying(false);
-            setCursor(value);
-          }}
-          onJumpToBookmark={jumpToBookmark}
+          onJump={jumpToAbsolute}
           onPlayToggle={() => setPlaying((value) => !value)}
           onSpeedChange={setSpeed}
           onStepBy={stepBy}
@@ -379,7 +515,8 @@ export function ReplayScrubberPanel({ ticket }: { ticket: string }) {
           rawEvent={rawEvent}
           rawLoading={rawLoading}
           speed={speed}
-          timeline={timeline}
+          totalKnown={totalKnown}
+          window={timeline}
         />
       ) : null}
     </div>
@@ -387,33 +524,31 @@ export function ReplayScrubberPanel({ ticket }: { ticket: string }) {
 }
 
 function ReplayLoadStatus({
+  absoluteIndex,
   bookmarksTruncated,
-  events,
-  loading,
-  pageGuardHit,
-  pagesLoaded,
+  droppedFromFront,
+  eventsInWindow,
+  hasMore,
+  pageLoading,
   serverWarnings,
-  totalHint,
+  totalKnown,
 }: {
+  absoluteIndex: number;
   bookmarksTruncated: boolean;
-  events: number;
-  loading: boolean;
-  pageGuardHit: boolean;
-  pagesLoaded: number;
+  droppedFromFront: number;
+  eventsInWindow: number;
+  hasMore: boolean;
+  pageLoading: boolean;
   serverWarnings: string[];
-  totalHint: number;
+  totalKnown: number;
 }) {
   const messages: string[] = [];
-  if (loading) {
-    if (totalHint > 0) {
-      messages.push(`loaded ${events} of ~${totalHint} events (page ${pagesLoaded})…`);
-    } else {
-      messages.push(`loaded ${events} events (page ${pagesLoaded})…`);
-    }
+  if (pageLoading) {
+    messages.push(`loading next page…`);
   }
-  if (pageGuardHit) {
+  if (droppedFromFront > 0) {
     messages.push(
-      `stopped after ${pagesLoaded} pages; more events exist beyond this window.`
+      `sliding window: showing events ${droppedFromFront + 1}–${droppedFromFront + eventsInWindow} (of ~${totalKnown}). Earlier events evicted; scrub back to reload.`,
     );
   }
   if (bookmarksTruncated) {
@@ -425,11 +560,7 @@ function ReplayLoadStatus({
   }
   if (messages.length === 0) return null;
   return (
-    <div
-      aria-live="polite"
-      className={`replay-status${pageGuardHit ? " is-truncated" : ""}`}
-      role="status"
-    >
+    <div aria-live="polite" className="replay-status" role="status">
       {messages.map((message, i) => (
         <p key={i}>{message}</p>
       ))}
@@ -438,11 +569,10 @@ function ReplayLoadStatus({
 }
 
 function ReplayScrubberBody({
+  absoluteIndex,
   bookmarks,
-  cursor,
   currentEvent,
-  onCursorChange,
-  onJumpToBookmark,
+  onJump,
   onPlayToggle,
   onSpeedChange,
   onStepBy,
@@ -451,13 +581,13 @@ function ReplayScrubberBody({
   rawEvent,
   rawLoading,
   speed,
-  timeline,
+  totalKnown,
+  window: replayWindow,
 }: {
-  bookmarks: { bookmark: ReplayBookmark; index: number; pct: number }[];
-  cursor: number;
+  absoluteIndex: number;
+  bookmarks: { bookmark: ReplayBookmark; absoluteIndex: number; pct: number }[];
   currentEvent: ReplayTimelineEvent | null;
-  onCursorChange: (value: number) => void;
-  onJumpToBookmark: (index: number) => void;
+  onJump: (absoluteIndex: number) => void;
   onPlayToggle: () => void;
   onSpeedChange: (speed: SpeedChoice) => void;
   onStepBy: (delta: number) => void;
@@ -466,9 +596,9 @@ function ReplayScrubberBody({
   rawEvent: ReplayRawEvent | null;
   rawLoading: boolean;
   speed: SpeedChoice;
-  timeline: ReplayTimeline;
+  totalKnown: number;
+  window: TimelineWindow;
 }) {
-  const total = timeline.events.length;
   const rawRef = useRef<HTMLPreElement | null>(null);
 
   useEffect(() => {
@@ -486,7 +616,9 @@ function ReplayScrubberBody({
     }
   }, [rawError, rawEvent, rawLoading]);
 
-  const timePct = total <= 1 ? 0 : (cursor / (total - 1)) * 100;
+  const sliderMax = Math.max(totalKnown - 1, 0);
+  const timePct = sliderMax === 0 ? 0 : (absoluteIndex / sliderMax) * 100;
+  const beyondWindow = currentEvent === null;
 
   return (
     <>
@@ -495,7 +627,7 @@ function ReplayScrubberBody({
           <button
             aria-label="Previous event"
             className="replay-step"
-            disabled={cursor <= 0}
+            disabled={absoluteIndex <= 0}
             type="button"
             onClick={() => onStepBy(-1)}
           >
@@ -514,37 +646,33 @@ function ReplayScrubberBody({
           <button
             aria-label="Next event"
             className="replay-step"
-            disabled={cursor >= total - 1}
+            disabled={absoluteIndex >= sliderMax}
             type="button"
             onClick={() => onStepBy(1)}
           >
             <SkipForward size={13} />
           </button>
-          <div
-            aria-label="Replay progress"
-            className="replay-track"
-            role="group"
-          >
+          <div aria-label="Replay progress" className="replay-track" role="group">
             <input
               aria-label="Event cursor"
               className="replay-slider"
-              max={total - 1}
+              max={sliderMax}
               min={0}
               type="range"
-              value={cursor}
-              onChange={(event) => onCursorChange(Number(event.target.value))}
+              value={absoluteIndex}
+              onChange={(event) => onJump(Number(event.target.value))}
             />
             <div aria-hidden className="replay-track-progress" style={{ width: `${timePct}%` }} />
-            {bookmarks.map(({ bookmark, index, pct }) => (
+            {bookmarks.map(({ bookmark, absoluteIndex: bookmarkAbs, pct }) => (
               <button
                 key={`${bookmark.seq}-${bookmark.kind}`}
                 aria-label={`Jump to ${bookmark.kind} at seq ${bookmark.seq}`}
                 className={`replay-bookmark is-${bookmark.kind}`}
-                data-active={index === cursor}
+                data-active={bookmarkAbs === absoluteIndex}
                 style={{ left: `${pct}%` }}
                 title={bookmarkTitle(bookmark)}
                 type="button"
-                onClick={() => onJumpToBookmark(index)}
+                onClick={() => onJump(bookmarkAbs)}
               >
                 {bookmarkIcon(bookmark.kind)}
               </button>
@@ -558,7 +686,7 @@ function ReplayScrubberBody({
               onChange={(event) => {
                 const raw = event.target.value;
                 onSpeedChange(
-                  raw === MAX_SPEED_LABEL ? MAX_SPEED_LABEL : (Number(raw) as SpeedChoice)
+                  raw === MAX_SPEED_LABEL ? MAX_SPEED_LABEL : (Number(raw) as SpeedChoice),
                 );
               }}
             >
@@ -573,11 +701,16 @@ function ReplayScrubberBody({
         </div>
         <div className="replay-frame-info">
           <span>
-            {cursor + 1} / {total}
+            {absoluteIndex + 1} / {Math.max(totalKnown, absoluteIndex + 1)}
           </span>
-          <span className="replay-frame-clock">{formatClockTime(currentEvent?.ts ?? null)}</span>
+          <span className="replay-frame-clock">
+            {formatClockTime(currentEvent?.ts ?? null)}
+          </span>
           {currentEvent ? (
             <span className="replay-frame-kind">{currentEvent.kind}</span>
+          ) : null}
+          {beyondWindow && replayWindow.hasMore ? (
+            <span className="replay-frame-kind">loading window…</span>
           ) : null}
         </div>
       </div>
@@ -605,6 +738,11 @@ function ReplayScrubberBody({
             {rawJson}
           </pre>
         </article>
+      ) : beyondWindow ? (
+        <div className="replay-empty">
+          event {absoluteIndex + 1} is outside the loaded window
+          {replayWindow.hasMore ? " — loading more…" : ""}
+        </div>
       ) : null}
     </>
   );
