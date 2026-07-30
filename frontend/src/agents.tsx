@@ -52,7 +52,7 @@ declare global {
 
 const STALE_SECONDS = 5 * 60;
 
-const SPAWN_TICKET_PATTERN = /^[A-Z0-9-]+$/;
+const SPAWN_TICKET_PATTERN = /^[A-Z][A-Z0-9]+-[0-9]+(?:-[A-Z0-9]+)*$/;
 const ORCH_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 const DEFAULT_WORKDIR = "/Users/henry/me/fun/wiki";
 const REASONING_EFFORTS: SpawnWorkerEffort[] = ["minimal", "low", "medium", "high", "xhigh"];
@@ -170,7 +170,9 @@ function SpawnWorkerModal({
   const [orch, setOrch] = useState(orchestrators[0]?.id ?? "");
   const [title, setTitle] = useState("");
   const [prompt, setPrompt] = useState("");
+  const [contextEnabled, setContextEnabled] = useState(false);
   const [prelude, setPrelude] = useState("");
+  const [preludeReady, setPreludeReady] = useState(false);
   const [preludeLoading, setPreludeLoading] = useState(false);
   const [preludeError, setPreludeError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -185,6 +187,13 @@ function SpawnWorkerModal({
   function resetConfirmation() {
     setConfirming(false);
     setError(null);
+  }
+
+  function invalidatePrelude() {
+    if (!contextEnabled) return;
+    setPreludeReady(false);
+    setPreludeLoading(true);
+    setPreludeError(null);
   }
 
   useEffect(() => {
@@ -218,6 +227,7 @@ function SpawnWorkerModal({
   const allowedModels = modelsForKind(models, kind);
   const promptBytes = new TextEncoder().encode(prompt).length;
   const promptTooLarge = promptBytes >= 100_000;
+  const preludeTooLarge = prelude.length > 4096;
   const ticketValid = SPAWN_TICKET_PATTERN.test(normalizedTicket);
   const workdirValid = workdir.trim().length > 0;
   const confirmLabel = `spawn ${kind} · ${model} · ${role} in ${workdir.trim()}?`;
@@ -227,19 +237,30 @@ function SpawnWorkerModal({
     model.length > 0 &&
     prompt.trim().length > 0 &&
     !promptTooLarge &&
+    (!contextEnabled ||
+      (preludeReady && !preludeLoading && !preludeError && !preludeTooLarge)) &&
     !submitting;
 
   useEffect(() => {
-    if (!ticketValid || !workdirValid) {
+    if (!contextEnabled) {
       setPrelude("");
+      setPreludeReady(false);
       setPreludeLoading(false);
       setPreludeError(null);
       return;
     }
+    if (!ticketValid || !workdirValid) {
+      setPrelude("");
+      setPreludeReady(false);
+      setPreludeLoading(false);
+      setPreludeError(null);
+      return;
+    }
+    setPreludeReady(false);
+    setPreludeLoading(true);
+    setPreludeError(null);
     const controller = new AbortController();
     const timer = window.setTimeout(() => {
-      setPreludeLoading(true);
-      setPreludeError(null);
       previewAgentContextPrelude(
         {
           ticket: normalizedTicket,
@@ -252,6 +273,12 @@ function SpawnWorkerModal({
         .then((result) => {
           if (controller.signal.aborted) return;
           setPrelude(result.prelude);
+          if (result.prelude.length > 4096) {
+            setPreludeReady(false);
+            setPreludeError("context preview exceeded the 4096-character limit");
+          } else {
+            setPreludeReady(true);
+          }
           setPreludeLoading(false);
         })
         .catch((reason: unknown) => {
@@ -266,7 +293,7 @@ function SpawnWorkerModal({
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [normalizedTicket, ticketValid, title, prompt, workdir, workdirValid]);
+  }, [contextEnabled, normalizedTicket, ticketValid, title, prompt, workdir, workdirValid]);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -289,8 +316,8 @@ function SpawnWorkerModal({
         orch: orch || null,
         prompt,
         title: title.trim(),
-        context_prelude: true,
-        context_prelude_override: prelude.trim() || null,
+        context_prelude: contextEnabled,
+        context_prelude_override: contextEnabled ? prelude : null,
       });
       onSpawn({
         kind: "worker",
@@ -338,6 +365,7 @@ function SpawnWorkerModal({
               onChange={(event) => {
                 resetConfirmation();
                 setTicket(event.target.value.toUpperCase());
+                invalidatePrelude();
               }}
             />
             <span className="agent-spawn-hint">Uppercase letters, numbers, and dashes only.</span>
@@ -435,6 +463,7 @@ function SpawnWorkerModal({
               onChange={(event) => {
                 resetConfirmation();
                 setWorkdir(event.target.value);
+                invalidatePrelude();
               }}
             />
           </label>
@@ -448,6 +477,7 @@ function SpawnWorkerModal({
               onChange={(event) => {
                 resetConfirmation();
                 setTitle(event.target.value);
+                invalidatePrelude();
               }}
             />
           </label>
@@ -481,6 +511,7 @@ function SpawnWorkerModal({
               onChange={(event) => {
                 resetConfirmation();
                 setPrompt(event.target.value);
+                invalidatePrelude();
               }}
             />
             <span className="agent-spawn-hint">
@@ -489,21 +520,44 @@ function SpawnWorkerModal({
           </label>
 
           <label className="agent-spawn-field">
-            <span className="agent-spawn-label">Context prelude</span>
+            <span className="agent-spawn-label">
+              <input
+                type="checkbox"
+                checked={contextEnabled}
+                onChange={(event) => {
+                  const enabled = event.target.checked;
+                  resetConfirmation();
+                  setContextEnabled(enabled);
+                  setPreludeReady(false);
+                  setPreludeError(null);
+                  setPreludeLoading(enabled);
+                  if (!enabled) setPrelude("");
+                }}
+              />{" "}
+              Add context prelude
+            </span>
             <textarea
               aria-label="Context prelude"
               className="dialog-input agent-spawn-textarea agent-context-prelude"
               placeholder="Enter a ticket and working dir to preview local context."
               value={prelude}
+              disabled={!contextEnabled || preludeLoading}
               onChange={(event) => {
                 resetConfirmation();
                 setPrelude(event.target.value);
+                setPreludeError(null);
+                setPreludeReady(true);
               }}
             />
             <span className="agent-spawn-hint">
-              {preludeLoading
+              {!contextEnabled
+                ? "Optional. Enable to retrieve local context."
+                : preludeLoading
                 ? "Building deterministic local context…"
-                : preludeError || `${prelude.length} / 4096 characters · editable before send`}
+                : preludeError ||
+                  (preludeTooLarge
+                    ? "Context prelude must stay within 4096 characters."
+                    : `${prelude.length} / 4096 characters · editable before send`)}
             </span>
           </label>
         </div>

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
 import unittest
@@ -64,25 +65,11 @@ class ContextPreludeTests(unittest.TestCase):
         )
 
     def test_builds_from_fixture_sources_and_reports_overlap(self) -> None:
-        fake_index = mock.Mock()
-        fake_index.search.side_effect = lambda query, **_kwargs: {
-            "results": [
-                {
-                    "path": "wiki-180.md",
-                    "snippet": "shared.py and workgraph state",
-                }
-            ]
-        }
-        with mock.patch.object(
-            context_prelude.knowledge.KnowledgeIndex,
-            "from_env",
-            return_value=fake_index,
-        ):
-            result = self.builder().build(
-                ticket="WIKI-180",
-                title="context prelude",
-                prompt="implement the builder",
-            )
+        result = self.builder().build(
+            ticket="WIKI-180",
+            title="context prelude",
+            prompt="implement the builder",
+        )
 
         self.assertLessEqual(len(result.text), context_prelude.MAX_PRELUDE_CHARS)
         self.assertIn("## vault notes", result.text)
@@ -90,6 +77,14 @@ class ContextPreludeTests(unittest.TestCase):
         self.assertIn("shared.py", result.text)
         self.assertIn("## related workgraph", result.text)
         self.assertEqual(result.sources["vault notes"]["status"], "ok")
+
+    def test_vault_scan_does_not_create_index_state(self) -> None:
+        before = sorted(path.relative_to(self.root).as_posix() for path in self.root.rglob("*"))
+        self.builder().build(ticket="WIKI-180", title="context prelude")
+        after = sorted(path.relative_to(self.root).as_posix() for path in self.root.rglob("*"))
+        self.assertEqual(before, after)
+        self.assertNotIn("knowledge.db", "\n".join(after))
+        self.assertNotIn("knowledge.db.rebuilding", "\n".join(after))
 
     def test_each_source_failure_degrades_with_a_note(self) -> None:
         with (
@@ -112,16 +107,57 @@ class ContextPreludeTests(unittest.TestCase):
         self.assertLessEqual(len(result.text), context_prelude.MAX_PRELUDE_CHARS)
         self.assertTrue(result.truncated)
         self.assertIn("truncated:", result.text)
+        self.assertIn("omitted", result.text)
+
+    def test_giant_note_and_graph_report_omitted_content(self) -> None:
+        (self.vault / "giant.md").write_text("WIKI-180 " + "x" * 20_000, encoding="utf-8")
+        nodes = [{"id": f"WIKI-{index}", "kind": "worker"} for index in range(100)]
+        (self.status / "WIKI-180.workgraph.json").write_text(
+            json.dumps({"ticket": "WIKI-180", "nodes": nodes, "edges": []}),
+            encoding="utf-8",
+        )
+        result = self.builder().build(ticket="WIKI-180")
+        self.assertIn("truncated note content; omitted", result.text)
+        self.assertIn("nodes omitted: 88", result.text)
+        self.assertTrue(result.sources["related workgraph"]["truncated"])
+
+    def test_source_setup_failure_does_not_hide_other_sources(self) -> None:
+        original = context_prelude._safe_root
+
+        def fail_repository(value: Path | str, label: str) -> Path:
+            if label == "repository":
+                raise context_prelude.PreludeError("repository unavailable")
+            return original(value, label)
+
+        with mock.patch.object(context_prelude, "_safe_root", side_effect=fail_repository):
+            result = self.builder().build(ticket="WIKI-180")
+        self.assertIn("repository unavailable", result.text)
+        self.assertIn("shared.py", result.text)
 
     def test_injection_shaped_ticket_is_rejected_before_git(self) -> None:
-        with mock.patch.object(context_prelude.subprocess, "run") as run:
-            with self.assertRaises(context_prelude.PreludeError):
-                self.builder().build(ticket="WIKI-180; touch /tmp/pwned")
-        run.assert_not_called()
+        for shaped in ("--FOO", "../WIKI-180", "WIKI-180;touch"):
+            with self.subTest(ticket=shaped), mock.patch.object(
+                context_prelude.subprocess, "run"
+            ) as run:
+                with self.assertRaises(context_prelude.PreludeError):
+                    self.builder().build(ticket=shaped)
+                run.assert_not_called()
 
     def test_prepend_keeps_goal_after_context(self) -> None:
-        prompt = context_prelude.prepend("## context\n- note", "run tests")
-        self.assertEqual(prompt, "## context\n- note\n\n# kickoff prompt\nrun tests")
+        prelude = "## context\n```\n- note\n````"
+        goal = "run tests\n```\nkeep this exact"
+        prompt = context_prelude.prepend(prelude, goal)
+        envelope = prompt.splitlines()
+        self.assertEqual(envelope[0], "<<WIKI_CONTEXT_PRELUDE_V1>>")
+        payload = json.loads("\n".join(envelope[1:-1]))
+        self.assertEqual(payload, {"prelude": prelude, "kickoff_prompt": goal})
+        self.assertEqual(envelope[-1], "<<WIKI_CONTEXT_PRELUDE_END>>")
+
+    def test_bound_override_rejects_without_clipping(self) -> None:
+        exact = "  edited\n"
+        self.assertIs(context_prelude.bound_override(exact), exact)
+        with self.assertRaises(context_prelude.PreludeError):
+            context_prelude.bound_override("x" * (context_prelude.MAX_PRELUDE_CHARS + 1))
 
     def test_spawn_path_uses_opt_in_prelude_and_fails_soft(self) -> None:
         body = main.SpawnWorkerIn(
@@ -135,12 +171,33 @@ class ContextPreludeTests(unittest.TestCase):
         )
         generated = context_prelude.PreludeResult("## generated", False, {})
         with mock.patch.object(main, "_build_context_prelude", return_value=generated):
-            self.assertEqual(
-                main._contextual_prompt(body, repo_root=self.root),
-                "## generated\n\n# kickoff prompt\nrun tests",
-            )
+            sent = main._contextual_prompt(body, repo_root=self.root)
+        self.assertEqual(
+            json.loads(sent.splitlines()[1]),
+            {"prelude": "## generated", "kickoff_prompt": "run tests"},
+        )
         with mock.patch.object(main, "_build_context_prelude", side_effect=RuntimeError("broken")):
             self.assertEqual(main._contextual_prompt(body, repo_root=self.root), "run tests")
+
+    def test_spawn_path_is_opt_in_and_preserves_preview_bytes(self) -> None:
+        body = main.SpawnWorkerIn(
+            ticket="WIKI-180",
+            kind="cc",
+            role="implement",
+            model="sonnet",
+            workdir=str(self.root),
+            prompt="  run tests\n",
+        )
+        with mock.patch.object(main, "_build_context_prelude") as build:
+            self.assertEqual(main._contextual_prompt(body, repo_root=self.root), body.prompt)
+        build.assert_not_called()
+
+        exact = "  previewed\n"
+        body.context_prelude = True
+        body.context_prelude_override = exact
+        payload = json.loads(main._contextual_prompt(body, repo_root=self.root).splitlines()[1])
+        self.assertEqual(payload["prelude"], exact)
+        self.assertEqual(payload["kickoff_prompt"], body.prompt)
 
 
 if __name__ == "__main__":

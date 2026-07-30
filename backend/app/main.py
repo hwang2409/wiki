@@ -4178,9 +4178,8 @@ def _contextual_prompt(
 ) -> str:
     if not (body.context_prelude or body.include_context):
         return body.prompt
-    override = (body.context_prelude_override or "").strip()
-    if override:
-        prelude = context_prelude.bound_override(override)
+    if body.context_prelude_override is not None:
+        prelude = context_prelude.bound_override(body.context_prelude_override)
     else:
         try:
             prelude = _build_context_prelude(
@@ -4259,7 +4258,10 @@ def spawn_agent(
         raise HTTPException(status_code=400, detail="Kickoff prompt must be smaller than 100KB")
 
     workdir_path = resolve_existing_dir(body.workdir, field_name="Working directory")
-    prompt = _contextual_prompt(body, repo_root=workdir_path)
+    try:
+        prompt = _contextual_prompt(body, repo_root=workdir_path)
+    except context_prelude.PreludeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if len(prompt.encode("utf-8")) >= MAX_SPAWN_PROMPT_BYTES:
         raise HTTPException(status_code=400, detail="Kickoff prompt must be smaller than 100KB")
 
