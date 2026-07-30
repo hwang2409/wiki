@@ -1632,6 +1632,7 @@ def cmd_search(args: argparse.Namespace) -> None:
     try:
         index = _knowledge_index()
         if args.mode == "semantic":
+            index.activate_semantic()
             index.refresh_all()
             result = index.search_semantic(
                 args.query,

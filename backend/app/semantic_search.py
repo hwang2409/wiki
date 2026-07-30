@@ -106,20 +106,21 @@ def configured_provider(env: dict[str, str] | None = None) -> EmbeddingProvider 
     """Return the configured provider, or ``None`` for lexical-only mode."""
 
     values = os.environ if env is None else env
-    api_key = (values.get("WIKI_EMBEDDING_API_KEY") or values.get("OPENAI_API_KEY") or "").strip()
+    # A dedicated key is required. Never infer consent from a generic provider key.
+    api_key = (values.get("WIKI_EMBEDDINGS_API_KEY") or "").strip()
     if not api_key:
         return None
     try:
-        timeout = float(values.get("WIKI_EMBEDDING_TIMEOUT", "8"))
+        timeout = float(values.get("WIKI_EMBEDDINGS_TIMEOUT", "8"))
     except ValueError:
         timeout = 8.0
     return OpenAIEmbeddingProvider(
         api_key,
         endpoint=values.get(
-            "WIKI_EMBEDDING_BASE_URL",
+            "WIKI_EMBEDDINGS_BASE_URL",
             "https://api.openai.com/v1/embeddings",
         ),
-        model=values.get("WIKI_EMBEDDING_MODEL", "text-embedding-3-small"),
+        model=values.get("WIKI_EMBEDDINGS_MODEL", "text-embedding-3-small"),
         timeout_seconds=timeout,
     )
 

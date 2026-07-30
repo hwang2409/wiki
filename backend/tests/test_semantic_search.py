@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
 import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest import mock
 
-from backend.app import knowledge
+from backend.app import knowledge, main
 
 
 class FakeEmbeddingProvider:
@@ -29,6 +33,18 @@ class FakeEmbeddingProvider:
                 ]
             )
         return vectors
+
+
+class RejectingEmbeddingProvider(FakeEmbeddingProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.reject = True
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        if self.reject and any("reject-this-note" in text for text in texts):
+            self.calls.append(list(texts))
+            raise RuntimeError("fixture rejected one note")
+        return super().embed(texts)
 
 
 def write_note(path: Path, body: str) -> None:
@@ -82,9 +98,9 @@ class SemanticIndexTests(unittest.TestCase):
 
         stats = self.index.scan_vault()
         self.assertEqual(stats.notes_deleted, 1)
-        with closing(sqlite3.connect(self.db)) as connection:
+        with closing(sqlite3.connect(f"{self.db}.semantic")) as connection:
             self.assertEqual(
-                connection.execute("SELECT COUNT(*) FROM note_embeddings").fetchone()[0],
+                connection.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0],
                 0,
             )
 
@@ -120,7 +136,10 @@ class SemanticIndexTests(unittest.TestCase):
     def test_corrupt_embedding_database_is_rebuildable(self) -> None:
         write_note(self.vault / "db.md", "sqlite database notes")
         self.index.rebuild()
-        self.db.write_bytes(b"torn sqlite write")
+        semantic_db = Path(f"{self.db}.semantic")
+        semantic_db.write_bytes(b"torn sqlite write")
+        Path(f"{semantic_db}-wal").unlink(missing_ok=True)
+        Path(f"{semantic_db}-shm").unlink(missing_ok=True)
 
         partial = self.index.search_semantic("database")
         self.assertTrue(partial["rebuilding"])
@@ -130,6 +149,121 @@ class SemanticIndexTests(unittest.TestCase):
             self.index.search_semantic("database")["results"][0]["path"],
             "db.md",
         )
+
+    def test_startup_does_not_call_injected_provider_until_explicit_activation(self) -> None:
+        write_note(self.vault / "db.md", "sqlite database notes")
+        provider = FakeEmbeddingProvider()
+        index = knowledge.KnowledgeIndex(
+            knowledge.KnowledgePaths(
+                db_path=self.db,
+                vault_dir=self.vault,
+                archive_dir=self.archive,
+                runtime_dir=self.runtime,
+            ),
+            provider,
+        )
+        index.refresh_all()
+        self.assertEqual(provider.calls, [])
+        self.assertTrue(index.activate_semantic())
+        index.refresh_all()
+        self.assertEqual(len(provider.calls), 1)
+
+    def test_generic_openai_key_is_not_an_embedding_consent_signal(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"OPENAI_API_KEY": "generic-fixture-key"},
+            clear=True,
+        ):
+            index = knowledge.KnowledgeIndex.from_env(
+                vault_dir=self.vault,
+                archive_dir=self.archive,
+                runtime_dir=self.runtime,
+                env={
+                    "OPENAI_API_KEY": "generic-fixture-key",
+                    "WIKI_KNOWLEDGE_DB_PATH": str(self.db),
+                },
+            )
+        self.assertIsNone(index.semantic_index.embedding_provider)
+        self.assertFalse(index.semantic_status()["available"])
+
+    def test_rejected_note_does_not_discard_successful_notes_and_retries(self) -> None:
+        for number in range(33):
+            body = (
+                "sqlite database notes reject-this-note"
+                if number == 10
+                else "sqlite database notes"
+            )
+            write_note(self.vault / f"note-{number:02}.md", body)
+        provider = RejectingEmbeddingProvider()
+        index = knowledge.KnowledgeIndex(
+            knowledge.KnowledgePaths(self.db, self.vault, self.archive, self.runtime),
+            provider,
+        )
+        first = index.rebuild()
+        self.assertEqual(first.embeddings_indexed, 32)
+        self.assertEqual(first.embeddings_skipped, 1)
+        with closing(sqlite3.connect(f"{self.db}.semantic")) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0],
+                32,
+            )
+        provider.reject = False
+        second = index.scan_vault()
+        self.assertEqual(second.embeddings_indexed, 1)
+        self.assertEqual(second.embeddings_skipped, 0)
+
+    def test_refresh_is_single_flight_for_overlapping_callers(self) -> None:
+        write_note(self.vault / "db.md", "sqlite database notes")
+        provider = FakeEmbeddingProvider()
+        first = knowledge.KnowledgeIndex(
+            knowledge.KnowledgePaths(self.db, self.vault, self.archive, self.runtime),
+            provider,
+        )
+        self.assertTrue(first.activate_semantic())
+        second = knowledge.KnowledgeIndex(
+            knowledge.KnowledgePaths(self.db, self.vault, self.archive, self.runtime),
+            provider,
+        )
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(lambda index: index.refresh_all(), (first, second)))
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(sum(result.embeddings_indexed for result in results), 1)
+
+    def test_query_keeps_one_vector_per_note_and_returns_only_top_n(self) -> None:
+        for number in range(500):
+            write_note(
+                self.vault / f"note-{number:03}.md",
+                f"sqlite database notes row {number}",
+            )
+        self.index.rebuild()
+        with closing(sqlite3.connect(f"{self.db}.semantic")) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0],
+                500,
+            )
+        result = self.index.search_semantic("database", limit=5)
+        self.assertEqual(len(result["results"]), 5)
+        self.assertEqual(
+            [row["path"] for row in result["results"]],
+            [f"note-{number:03}.md" for number in range(5)],
+        )
+
+    def test_semantic_endpoint_falls_back_without_scanning_when_key_is_missing(self) -> None:
+        write_note(self.vault / "endpoint.md", "endpointneedle lexical context")
+        env = {
+            "WIKI_KNOWLEDGE_DB_PATH": str(self.db),
+            "WIKI_VAULT_DIR": str(self.vault),
+            "WIKI_AGENT_RUNTIME_DIR": str(self.runtime),
+            "WIKI_AGENT_ARCHIVE_DIR": str(self.archive),
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            knowledge.KnowledgeIndex.from_env().rebuild()
+            result = asyncio.run(
+                main.knowledge_search(q="endpointneedle", mode="semantic")
+            )
+        self.assertFalse(result["semantic"]["available"])
+        self.assertEqual(result["fallback"], "lexical")
+        self.assertEqual(result["results"][0]["path"], "endpoint.md")
 
 
 if __name__ == "__main__":

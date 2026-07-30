@@ -36,25 +36,17 @@ from .knowledge_schema import (
     is_corruption_error as _corruption_error,
     reset_schema,
 )
-from .semantic_search import (
-    EmbeddingProvider,
-    EmbeddingUnavailable,
-    configured_provider,
-    cosine_normalized,
-    normalise_vector,
-    pack_vector,
-    provider_model,
-    unpack_vector,
-)
+from .semantic_index import SemanticIndex, SemanticNote
 
 
 LOGGER = logging.getLogger(__name__)
 MAX_SEARCH_LIMIT = 100
 SEMANTIC_SCORE_FLOOR = 0.15
-EMBED_BATCH_SIZE = 32
 FTS_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 _PATH_LOCKS: dict[str, threading.RLock] = {}
 _PATH_LOCKS_GUARD = threading.Lock()
+_REFRESH_GATES: dict[str, threading.Lock] = {}
+_REFRESH_GATES_GUARD = threading.Lock()
 _DEFAULT_PROVIDER = object()
 
 
@@ -196,20 +188,29 @@ def _path_lock(path: Path) -> threading.RLock:
         return _PATH_LOCKS.setdefault(key, threading.RLock())
 
 
+def _refresh_gate(path: Path) -> threading.Lock:
+    key = str(path.absolute())
+    with _REFRESH_GATES_GUARD:
+        return _REFRESH_GATES.setdefault(key, threading.Lock())
+
+
 class KnowledgeIndex:
     def __init__(
         self,
         paths: KnowledgePaths,
         embedding_provider: EmbeddingProvider | None | object = _DEFAULT_PROVIDER,
+        *,
+        provider_env: Mapping[str, str] | None = None,
     ):
         self.paths = paths
         self._lock = _path_lock(paths.db_path)
-        self.embedding_provider = (
-            configured_provider()
-            if embedding_provider is _DEFAULT_PROVIDER
-            else embedding_provider
-        )
-        self._semantic_error: str | None = None
+        if embedding_provider is _DEFAULT_PROVIDER:
+            self.semantic_index = SemanticIndex(paths.db_path, env=provider_env)
+        else:
+            self.semantic_index = SemanticIndex(
+                paths.db_path,
+                embedding_provider=embedding_provider,
+            )
 
     @classmethod
     def from_env(
@@ -220,27 +221,17 @@ class KnowledgeIndex:
         values = os.environ if env is None else env
         return cls(
             KnowledgePaths.from_env(values, **overrides),
-            configured_provider(dict(values)),
+            provider_env=values,
         )
 
     def semantic_status(self) -> dict[str, Any]:
-        if self.embedding_provider is None:
-            return {
-                "available": False,
-                "model": None,
-                "reason": "semantic search unavailable: no embedding API key configured",
-            }
-        if self._semantic_error:
-            return {
-                "available": False,
-                "model": provider_model(self.embedding_provider),
-                "reason": f"semantic search unavailable: {self._semantic_error}",
-            }
-        return {
-            "available": True,
-            "model": provider_model(self.embedding_provider),
-            "reason": None,
-        }
+        return self.semantic_index.status()
+
+    def activate_semantic(self) -> bool:
+        activated = self.semantic_index.activate()
+        if activated:
+            self.request_refresh()
+        return activated
 
     @property
     def rebuild_marker(self) -> Path:
@@ -446,12 +437,6 @@ class KnowledgeIndex:
                     "SELECT path, mtime, content_hash FROM notes"
                 )
             }
-            existing_embeddings = {
-                str(row["path"]): row
-                for row in connection.execute(
-                    "SELECT path, content_hash, model FROM note_embeddings"
-                )
-            }
             contents: dict[str, str] = {}
             details: dict[str, tuple[int, str]] = {}
             for rel, path in self._note_files():
@@ -467,53 +452,6 @@ class KnowledgeIndex:
                 details[rel] = (mtime, digest)
                 stats.notes_scanned += 1
 
-            embedding_rows: dict[str, tuple[str, int, bytes]] = {}
-            provider = self.embedding_provider
-            provider_name = provider_model(provider) if provider is not None else None
-            embedding_inputs: list[tuple[str, str]] = []
-            if provider is not None:
-                for rel in sorted(contents):
-                    previous = existing.get(rel)
-                    previous_embedding = existing_embeddings.get(rel)
-                    if (
-                        previous is not None
-                        and str(previous["content_hash"]) == details[rel][1]
-                        and previous_embedding is not None
-                        and str(previous_embedding["content_hash"]) == details[rel][1]
-                        and str(previous_embedding["model"]) == provider_name
-                    ):
-                        continue
-                    embedding_inputs.append((rel, contents[rel]))
-                if embedding_inputs:
-                    try:
-                        vectors: list[list[float]] = []
-                        for start in range(0, len(embedding_inputs), EMBED_BATCH_SIZE):
-                            batch = embedding_inputs[start : start + EMBED_BATCH_SIZE]
-                            vectors.extend(
-                                provider.embed([text[:120_000] for _rel, text in batch])
-                            )
-                        if len(vectors) != len(embedding_inputs):
-                            raise EmbeddingUnavailable(
-                                "embedding provider returned the wrong number of vectors"
-                            )
-                        for (rel, _text), vector in zip(
-                            embedding_inputs, vectors, strict=True
-                        ):
-                            packed = pack_vector(vector)
-                            embedding_rows[rel] = (provider_name, len(packed) // 4, packed)
-                    except Exception as exc:
-                        embedding_rows.clear()
-                        self._semantic_error = str(exc)
-                        stats.semantic_unavailable = 1
-                        stats.embeddings_skipped = len(embedding_inputs)
-                        LOGGER.warning("semantic note indexing unavailable: %s", exc)
-                    else:
-                        self._semantic_error = None
-                        stats.embeddings_indexed = len(embedding_rows)
-            elif contents:
-                stats.semantic_unavailable = 1
-                stats.embeddings_skipped = len(contents)
-
             with connection:
                 removed = sorted(set(existing) - set(contents))
                 for rel in removed:
@@ -522,7 +460,6 @@ class KnowledgeIndex:
                         (rel,),
                     )
                     connection.execute("DELETE FROM notes WHERE path = ?", (rel,))
-                    connection.execute("DELETE FROM note_embeddings WHERE path = ?", (rel,))
                     stats.notes_deleted += 1
 
                 for rel in sorted(contents):
@@ -530,29 +467,6 @@ class KnowledgeIndex:
                     mtime, digest = details[rel]
                     previous = existing.get(rel)
                     if previous is not None and str(previous["content_hash"]) == digest:
-                        if rel in embedding_rows:
-                            model, dimension, vector = embedding_rows[rel]
-                            connection.execute(
-                                """
-                                INSERT INTO note_embeddings(
-                                    path, content_hash, model, dimension, vector, embedded_at
-                                ) VALUES (?, ?, ?, ?, ?, ?)
-                                ON CONFLICT(path) DO UPDATE SET
-                                    content_hash=excluded.content_hash,
-                                    model=excluded.model,
-                                    dimension=excluded.dimension,
-                                    vector=excluded.vector,
-                                    embedded_at=excluded.embedded_at
-                                """,
-                                (
-                                    rel,
-                                    digest,
-                                    model,
-                                    dimension,
-                                    vector,
-                                    datetime.now(timezone.utc).isoformat(),
-                                ),
-                            )
                         if int(previous["mtime"]) != mtime:
                             connection.execute(
                                 "UPDATE notes SET mtime = ? WHERE path = ?", (mtime, rel)
@@ -590,24 +504,6 @@ class KnowledgeIndex:
                         "DELETE FROM chunks WHERE source_kind = 'note' AND source_id = ?",
                         (rel,),
                     )
-                    connection.execute("DELETE FROM note_embeddings WHERE path = ?", (rel,))
-                    if rel in embedding_rows:
-                        model, dimension, vector = embedding_rows[rel]
-                        connection.execute(
-                            """
-                            INSERT INTO note_embeddings(
-                                path, content_hash, model, dimension, vector, embedded_at
-                            ) VALUES (?, ?, ?, ?, ?, ?)
-                            """,
-                            (
-                                rel,
-                                digest,
-                                model,
-                                dimension,
-                                vector,
-                                datetime.now(timezone.utc).isoformat(),
-                            ),
-                        )
                     ticket = ticket_for_note(rel, content)
                     chunks = chunk_markdown(content)
                     if not chunks:
@@ -649,6 +545,22 @@ class KnowledgeIndex:
                             ),
                         )
                         stats.links_indexed += 1
+            semantic_stats = self.semantic_index.refresh(
+                [
+                    SemanticNote(
+                        path=rel,
+                            content_hash=details[rel][1],
+                            title=extract_title(contents[rel], rel),
+                            text=contents[rel][:120_000],
+                            snippet=contents[rel][:500],
+                        ticket=ticket_for_note(rel, contents[rel]),
+                    )
+                    for rel in sorted(contents)
+                ]
+            )
+            stats.embeddings_indexed += semantic_stats.embeddings_indexed
+            stats.embeddings_skipped += semantic_stats.embeddings_skipped
+            stats.semantic_unavailable += semantic_stats.semantic_unavailable
             return stats
         except (OSError, sqlite3.Error) as exc:
             if isinstance(exc, sqlite3.Error) and _corruption_error(exc):
@@ -801,7 +713,12 @@ class KnowledgeIndex:
         stats.elapsed_seconds = time.perf_counter() - started
         return stats
 
-    def rebuild(self, *, include_legacy_archives: bool | None = None) -> IngestStats:
+    def rebuild(
+        self,
+        *,
+        include_legacy_archives: bool | None = None,
+        explicit: bool = True,
+    ) -> IngestStats:
         """Drop derived data and deterministically restore it from source files."""
 
         started = time.perf_counter()
@@ -813,6 +730,8 @@ class KnowledgeIndex:
                 reset_schema(connection)
             finally:
                 connection.close()
+        if explicit:
+            self.semantic_index.reset_for_explicit_rebuild()
         stats = IngestStats()
         try:
             stats.merge(self.scan_vault())
@@ -830,11 +749,17 @@ class KnowledgeIndex:
     def refresh_all(self) -> IngestStats:
         """Run a startup/requested delta refresh, rebuilding on schema reset."""
 
+        with _refresh_gate(self.paths.db_path):
+            return self._refresh_all()
+
+    def _refresh_all(self) -> IngestStats:
+        """Run one serialized refresh pass."""
+
         refresh_mtime = self._refresh_request_mtime()
         connection, needs_rebuild = self._prepare()
         connection.close()
         if needs_rebuild or self.rebuilding:
-            return self.rebuild()
+            return self.rebuild(explicit=False)
         started = time.perf_counter()
         stats = IngestStats()
         stats.merge(self.scan_vault())
@@ -995,12 +920,6 @@ class KnowledgeIndex:
         limit: int = 20,
         score_floor: float = SEMANTIC_SCORE_FLOOR,
     ) -> dict[str, Any]:
-        """Return note matches ranked by cosine similarity.
-
-        Semantic results stay separate from lexical results because their
-        scores have different meanings. The caller can safely show both.
-        """
-
         query = query.strip()
         if not query:
             raise KnowledgeQueryError("query must contain a searchable word")
@@ -1008,109 +927,44 @@ class KnowledgeIndex:
             raise KnowledgeQueryError(f"limit must be between 1 and {MAX_SEARCH_LIMIT}")
         if ticket is not None and not ticket.strip():
             raise KnowledgeQueryError("ticket must not be empty")
-
-        connection, needs_rebuild = self._prepare()
-        stale = needs_rebuild or self.rebuilding
-        status = self.semantic_status()
-
-        def unavailable_payload(current_status: dict[str, Any], *, stale_value: bool) -> dict[str, Any]:
-            try:
-                fallback = self.search(query, kind="note", limit=limit)
-                fallback_results = fallback["results"]
-            except KnowledgeError:
-                fallback_results = []
-            return {
-                "query": query,
-                "results": fallback_results,
-                "lexical_results": fallback_results,
-                "semantic_results": [],
-                "fallback": "lexical",
-                "semantic": current_status,
-                "rebuilding": self.rebuilding,
-                "stale": stale_value,
-            }
-
         try:
-            if self.embedding_provider is None:
-                return unavailable_payload(status, stale_value=stale)
-            try:
-                query_vectors = self.embedding_provider.embed([query])
-                if len(query_vectors) != 1:
-                    raise EmbeddingUnavailable(
-                        "embedding provider returned the wrong number of vectors"
-                    )
-                query_vector = normalise_vector(query_vectors[0])
-            except Exception as exc:
-                self._semantic_error = str(exc)
-                status = self.semantic_status()
-                return unavailable_payload(status, stale_value=True)
-
-            candidates: dict[str, tuple[float, sqlite3.Row]] = {}
-            rows = connection.execute(
-                """
-                SELECT
-                    e.path, e.dimension, e.vector,
-                    n.title,
-                    c.ticket, c.heading, c.text, c.pos
-                FROM note_embeddings e
-                JOIN notes n ON n.path = e.path
-                LEFT JOIN chunks c
-                    ON c.source_kind = 'note' AND c.source_id = e.path
-                ORDER BY e.path, c.pos
-                """
-            ).fetchall()
-            for row in rows:
-                if ticket and str(row["ticket"] or "").upper() != ticket.upper():
-                    continue
-                try:
-                    vector = unpack_vector(bytes(row["vector"]), int(row["dimension"]))
-                    score = cosine_normalized(query_vector, vector)
-                except (EmbeddingUnavailable, TypeError, ValueError):
-                    continue
-                score = max(-1.0, min(1.0, score))
-                if score < score_floor:
-                    continue
-                path = str(row["path"])
-                current = candidates.get(path)
-                if current is None or int(row["pos"] or 0) < int(current[1]["pos"] or 0):
-                    candidates[path] = (score, row)
-
-            ranked = sorted(
-                candidates.values(),
-                key=lambda item: (-item[0], str(item[1]["path"])),
-            )[:limit]
-            return {
-                "query": query,
-                "results": [
-                    {
-                        "kind": "note",
-                        "citation": str(row["path"]),
-                        "path": str(row["path"]),
-                        "title": str(row["title"] or ""),
-                        "heading": row["heading"],
-                        "snippet": str(row["text"] or "")[:500],
-                        "score": round(score, 8),
-                    }
-                    for score, row in ranked
-                ],
-                "semantic": self.semantic_status(),
-                "rebuilding": self.rebuilding,
-                "stale": stale,
+            payload = self.semantic_index.search(
+                query,
+                ticket=ticket,
+                limit=limit,
+                score_floor=score_floor,
+            )
+        except Exception as exc:
+            LOGGER.warning("semantic query unavailable; using lexical fallback: %s", exc)
+            payload = {
+                "results": [],
+                "semantic": {
+                    "available": False,
+                    "active": False,
+                    "indexing": False,
+                    "model": None,
+                    "reason": f"semantic search unavailable: {exc}",
+                },
+                "rebuilding": True,
+                "stale": True,
             }
-        except sqlite3.Error as exc:
-            if _corruption_error(exc):
-                connection.close()
-                self._recover_corruption(exc)
-                return {
-                    "query": query,
-                    "results": [],
-                    "semantic": self.semantic_status(),
-                    "rebuilding": True,
-                    "stale": True,
-                }
-            raise KnowledgeUnavailable(f"semantic query failed: {exc}") from exc
-        finally:
-            connection.close()
+        if payload["semantic"]["available"]:
+            return {"query": query, **payload}
+        try:
+            fallback = self.search(query, kind="note", limit=limit)
+            fallback_results = fallback["results"]
+        except KnowledgeError:
+            fallback_results = []
+        return {
+            "query": query,
+            "results": fallback_results,
+            "lexical_results": fallback_results,
+            "semantic_results": payload["results"],
+            "fallback": "lexical",
+            "semantic": payload["semantic"],
+            "rebuilding": payload.get("rebuilding", False),
+            "stale": payload.get("stale", False),
+        }
 
     def _note_paths(self, connection: sqlite3.Connection) -> list[str]:
         return [str(row[0]) for row in connection.execute("SELECT path FROM notes ORDER BY path")]
@@ -1204,7 +1058,6 @@ class KnowledgeIndex:
                 table: int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
                 for table in (
                     "notes",
-                    "note_embeddings",
                     "chunks",
                     "chunks_fts",
                     "links",

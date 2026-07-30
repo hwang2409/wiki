@@ -2083,7 +2083,7 @@ async def palette_search(
             vault_dir=VAULT_DIR,
         )
         try:
-            index.refresh_all()
+            index.activate_semantic()
             payload = index.search_semantic(q, limit=limit)
         except knowledge.KnowledgeQueryError:
             return {
@@ -2154,7 +2154,7 @@ async def knowledge_search(
     def _run() -> dict[str, object]:
         index = knowledge.KnowledgeIndex.from_env()
         if mode == "semantic":
-            index.refresh_all()
+            index.activate_semantic()
             return index.search_semantic(q, ticket=ticket, limit=limit)
         return index.search(q, ticket=ticket, kind=kind, limit=limit)
 
