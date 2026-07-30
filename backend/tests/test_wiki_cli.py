@@ -1079,6 +1079,9 @@ class AgentWatchTests(unittest.TestCase):
                     raise SystemExit(8)
                 if scenario == "no-checks":
                     print("[]")
+                elif scenario == "no-checks-stderr":
+                    sys.stderr.write("no checks reported on the 'example/wiki' branch\\n")
+                    raise SystemExit(1)
                 elif scenario == "empty-checks-failure":
                     raise SystemExit(1)
                 else:
@@ -1106,6 +1109,7 @@ class GateTests(unittest.TestCase):
             "draft": (1, ["draft"]),
             "failing-checks": (1, ["checks-failing"]),
             "no-checks": (0, []),
+            "no-checks-stderr": (0, []),
             "empty-checks-failure": (2, []),
             "unresolved": (1, ["unresolved-threads:2"]),
             "not-mergeable": (1, ["not-mergeable"]),
@@ -1133,6 +1137,8 @@ class GateTests(unittest.TestCase):
                     self.assertEqual(payload["ready"], code == 0)
                     self.assertEqual(payload["reasons"], reasons)
                     if scenario == "no-checks":
+                        self.assertEqual(payload["notes"], ["no-checks-reported"])
+                    if scenario == "no-checks-stderr":
                         self.assertEqual(payload["notes"], ["no-checks-reported"])
 
     def test_gate_reports_sha_mismatch_and_pr_not_found_as_usage_error(self) -> None:

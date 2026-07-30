@@ -1179,6 +1179,7 @@ query ReviewThreads($url: URI!, $endCursor: String) {
   }
 }
 """.strip()
+NO_CHECKS_STDERR = re.compile(r"^no checks reported on the '[^']+' branch$")
 
 
 def _unresolved_threads(pr_url: str) -> int:
@@ -1208,6 +1209,9 @@ def _check_gate_checks(pr: str, repo: str) -> tuple[list[dict], bool]:
         allowed_returncodes={0, 1, 8},
     )
     raw = result.stdout.strip()
+    stderr = result.stderr.strip()
+    if result.returncode == 1 and NO_CHECKS_STDERR.fullmatch(stderr):
+        return [], True
     if result.returncode != 0 and not raw:
         raise GateError("gh pr checks failed without a check result")
     if not raw or raw.lower().startswith("no checks reported"):
