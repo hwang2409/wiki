@@ -991,12 +991,15 @@ source sha: 0123456
                         "title": "title",
                         "file": "backend/app/main.py",
                         "line": 42,
+                        "line_end": 45,
                         "observed": "observed",
                         "why_wrong": "why wrong",
                         "do_instead": "do this",
                         "constraint": "keep the gate pinned",
                         "source_worker": "WIKI-173-REVIEW1",
                         "source_sha": "0123456",
+                        "source_lenses": ["correctness", "security"],
+                        "linked_findings": ["F-linked1"],
                     }
                 ],
             }
@@ -1011,8 +1014,11 @@ source sha: 0123456
         self.assertEqual(steer_finding["why_wrong"], "why wrong")
         self.assertEqual(steer_finding["constraint"], "keep the gate pinned")
         self.assertEqual(steer_finding["source_worker"], "WIKI-173-REVIEW1")
+        self.assertEqual(steer_finding["line_end"], 45)
+        self.assertEqual(steer_finding["source_lenses"], ["correctness", "security"])
+        self.assertEqual(steer_finding["linked_findings"], ["F-linked1"])
         message = build_steer_message(verdict, target_worker="WIKI-173")
-        for field in ("why wrong", "constraint", "source worker", "finding id"):
+        for field in ("why wrong", "constraint", "source worker", "finding id", "source lenses", "linked findings"):
             self.assertIn(field, message)
 
     def test_current_reviewer_falls_back_to_review_node_kind(self) -> None:

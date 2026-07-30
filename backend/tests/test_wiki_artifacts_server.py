@@ -444,6 +444,127 @@ class WikiArtifactsTests(unittest.TestCase):
         self.assertEqual(recorded[-1]["reviewer"], "WIKI-181-REVIEW1-synthesis")
         self.assertEqual(recorded[-1]["payload"]["state"], "MERGE-READY")
 
+    def test_next_review_canonical_handler_dirty_path_steers_and_archives_lenses(self) -> None:
+        runtime_dir = self.root / "runtime"
+        status_dir = self.root / "status"
+        status_dir.mkdir()
+        sha = "c" * 40
+        spawned: list[str] = []
+        steers: list[str] = []
+        archived: list[str] = []
+
+        def backend(method: str, path: str, payload: dict | None = None) -> dict:
+            self.assertEqual((method, path), ("POST", "/api/agents/next-review"))
+            assert payload is not None
+            return next_review_runtime.next_review(
+                **payload,
+                gate=lambda _pr, _sha: {"verdict": "pass"},
+                resolve_root=lambda _orch: Path("/repo"),
+                worktree=lambda **kwargs: Path(f"/repo/{kwargs['lens']}"),
+                spawn=lambda request: spawned.append(request.ticket) or {"run_id": request.ticket},
+                archived=lambda: [],
+                registry=lambda: {},
+            )
+
+        graph = {
+            "ticket": "WIKI-181",
+            "orch": "wiki",
+            "iteration_cap": 8,
+            "nodes": [],
+            "edges": [
+                {"kind": "spawn", "to": "WIKI-181", "payload": {"role": "implement"}},
+                *[
+                    {"kind": "spawn", "to": f"WIKI-181-REVIEW1-{lens}", "payload": {"role": "review"}}
+                    for lens in ("correctness", "security")
+                ],
+                {
+                    "kind": "verdict",
+                    "from": "WIKI-181-REVIEW1-correctness",
+                    "payload": {
+                        "worker": "WIKI-181-REVIEW1-correctness",
+                        "state": "NOT-MERGE-READY",
+                        "sha": sha,
+                        "findings": [{
+                            "id": "F-dirty1",
+                            "severity": "HIGH",
+                            "file": "backend/app/main.py",
+                            "line": 10,
+                            "line_end": 12,
+                            "problem": "unsafe input reaches the merge path",
+                            "fix": "validate input before merge",
+                        }],
+                    },
+                },
+                {
+                    "kind": "verdict",
+                    "from": "WIKI-181-REVIEW1-security",
+                    "payload": {
+                        "worker": "WIKI-181-REVIEW1-security",
+                        "state": "MERGE-READY",
+                        "sha": sha,
+                        "findings": [],
+                    },
+                },
+            ],
+        }
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"WIKI_AGENT_ROLE": "orchestrator", "WIKI_AGENT_ID": "wiki"},
+            ),
+            mock.patch.object(wiki_agent_tools, "_backend_api", side_effect=backend),
+            mock.patch.object(main, "AGENT_RUNTIME_DIR", runtime_dir),
+            mock.patch.object(main, "AGENT_STATUS_DIR", status_dir),
+        ):
+            result = wiki_agent_tools.next_review(
+                {
+                    "ticket": "WIKI-181",
+                    "pr_number": 181,
+                    "expected_sha": sha,
+                    "request_id": "canonical-diversity-dirty-e2e",
+                    "diversity": ["correctness", "security"],
+                }
+            )
+            self.assertEqual(result["status"], "spawned")
+            controller = AutopilotController(
+                store=AutopilotStore(self.root / "autopilot"),
+                status_reader=lambda _ticket: {"pr": "https://github.com/hwang2409/wiki/pull/181", "sha": sha},
+                registry_reader=lambda: {"WIKI-181": {"current": {"orch": "wiki"}}},
+                graph_loader=lambda _ticket: graph,
+                collect_diversity=lambda **kwargs: collect_diversity_verdict(
+                    runtime_dir=runtime_dir,
+                    record_verdict=lambda **_record: None,
+                    **kwargs,
+                ),
+                steer=lambda _ticket, message: steers.append(message),
+                archive=lambda reviewer: archived.append(reviewer),
+            )
+            controller.enable("WIKI-181")
+            first = asyncio.run(
+                controller.on_transition(
+                    {"agent_id": "WIKI-181-REVIEW1-correctness", "run_id": "r1", "status_state": "merge-ready"}
+                )
+            )
+            second = asyncio.run(
+                controller.on_transition(
+                    {"agent_id": "WIKI-181-REVIEW1-security", "run_id": "r2", "status_state": "merge-ready"}
+                )
+            )
+            retry = asyncio.run(
+                controller.on_transition(
+                    {"agent_id": "WIKI-181-REVIEW1-security", "run_id": "r3", "status_state": "merge-ready"}
+                )
+            )
+
+        self.assertTrue(first)
+        self.assertTrue(second)
+        self.assertTrue(retry)
+        self.assertEqual(set(spawned), {"WIKI-181-REVIEW1-correctness", "WIKI-181-REVIEW1-security"})
+        self.assertEqual(archived, ["WIKI-181-REVIEW1-correctness", "WIKI-181-REVIEW1-security"])
+        self.assertEqual(len(steers), 1)
+        self.assertIn("source lenses: correctness", steers[0])
+        self.assertIn("backend/app/main.py:10-12", steers[0])
+
     def test_next_review_mcp_constraints_match_endpoint_model(self) -> None:
         endpoint = NextReviewIn.model_json_schema()["properties"]
         mcp = mcp_input_schema()["properties"]

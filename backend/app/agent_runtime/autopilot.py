@@ -397,6 +397,7 @@ class AutopilotController:
             return False
         identity = parse_reviewer_id(reviewer)
         diversity_report = None
+        diversity_reviewers: list[str] = []
         if identity is not None and identity.lens not in {None, "synthesis"}:
             status = self.status_reader(ticket)
             sha = self._current_sha(ticket, status, event)
@@ -416,8 +417,8 @@ class AutopilotController:
             if not isinstance(diversity_report, Mapping) or diversity_report.get("status") == "pending":
                 self._log(state, "diversity-verdict-pending", {"reviewer": reviewer, "report": diversity_report})
                 return True
-            reviewer = str(diversity_report.get("worker") or reviewer)
             graph = self.graph_loader(ticket) or graph
+            diversity_reviewers = self._diversity_reviewers(graph, ticket, identity.round)
         current_reviewer = self._current_reviewer(graph)
         if diversity_report is None and current_reviewer != reviewer:
             self._log(
@@ -464,17 +465,25 @@ class AutopilotController:
         self._log(state, "parsed-verdict", {"reviewer": reviewer, **verdict.to_dict()})
         if not verdict.clean:
             message = build_steer_message(verdict, target_worker=ticket)
-            action_id = steer_action_id(ticket, reviewer, verdict)
+            routed_reviewer = str(diversity_report.get("worker") or reviewer) if diversity_report else reviewer
+            archive_reviewers = diversity_reviewers or [reviewer]
+            action_id = steer_action_id(ticket, routed_reviewer, verdict)
             stage = state.action_stages.setdefault(
                 action_id,
                 {
-                    "reviewer": reviewer,
+                    "reviewer": routed_reviewer,
                     "target": ticket,
                     "request_id": action_id,
                     "steer": "pending",
                     "archive": "pending",
+                    "archive_reviewers": archive_reviewers,
+                    "archive_status": {},
                 },
             )
+            stage["archive_reviewers"] = sorted(
+                set(stage.get("archive_reviewers") or []) | set(archive_reviewers)
+            )
+            stage.setdefault("archive_status", {})
             self.store.save(ticket, state)
             if stage.get("steer") != "done":
                 await self._send_steer(
@@ -495,12 +504,17 @@ class AutopilotController:
                 )
                 self.store.save(ticket, state)
             if stage.get("archive") != "done":
-                await self._invoke(self.archive, reviewer)
+                for archive_reviewer in stage["archive_reviewers"]:
+                    if stage["archive_status"].get(archive_reviewer) == "done":
+                        continue
+                    await self._invoke(self.archive, archive_reviewer)
+                    stage["archive_status"][archive_reviewer] = "done"
+                    self.store.save(ticket, state)
                 stage["archive"] = "done"
                 self._log(
                     state,
                     "reviewer-archived",
-                    {"reviewer": reviewer, "request_id": action_id},
+                    {"reviewers": stage["archive_reviewers"], "request_id": action_id},
                 )
                 self.store.save(ticket, state)
             loop = derive_loop_state(dict(graph)) if graph else None
@@ -732,6 +746,32 @@ class AutopilotController:
                 timestamp = float(index)
             candidates.append((timestamp, index, reviewer))
         return max(candidates)[2] if candidates else None
+
+    @staticmethod
+    def _diversity_reviewers(
+        graph: Mapping[str, Any] | None, ticket: str, round_number: int
+    ) -> list[str]:
+        reviewers: set[str] = set()
+        if not graph:
+            return []
+        for edge in graph.get("edges", []):
+            if not isinstance(edge, Mapping) or edge.get("kind") != "spawn":
+                continue
+            payload = edge.get("payload")
+            candidate = edge.get("to")
+            if not isinstance(candidate, str) and isinstance(payload, Mapping):
+                candidate = payload.get("ticket")
+            if not isinstance(candidate, str):
+                continue
+            identity = parse_reviewer_id(candidate)
+            if (
+                identity is not None
+                and identity.ticket == ticket.upper()
+                and identity.round == round_number
+                and identity.lens not in {None, "synthesis"}
+            ):
+                reviewers.add(candidate)
+        return sorted(reviewers)
 
     def _latest_verdict(
         self,
