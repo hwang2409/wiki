@@ -9677,7 +9677,6 @@ textarea.composer-command-input {
 
 .cost-prompt-bar-fill {
   align-self: end;
-  min-height: 4px;
   border-radius: var(--radius-xs) var(--radius-xs) 0 0;
   background: var(--accent-primary);
   opacity: 0.65;

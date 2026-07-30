@@ -82,9 +82,13 @@ export type DashboardViewProps = {
   pollMs?: number;
 };
 
+function fetchDefaultCosts(signal: AbortSignal): Promise<CostResponse> {
+  return getCosts({}, signal);
+}
+
 export function DashboardView({
   fetchTickets = getDashboardTickets,
-  fetchCosts = (signal) => getCosts({}, signal),
+  fetchCosts = fetchDefaultCosts,
   pollMs = REFRESH_INTERVAL_MS,
 }: DashboardViewProps = {}) {
   const [tickets, setTickets] = useState<DashboardTicket[] | null>(null);
