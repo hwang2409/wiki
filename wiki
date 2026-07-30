@@ -1630,14 +1630,23 @@ def _knowledge_index() -> knowledge.KnowledgeIndex:
 
 def cmd_search(args: argparse.Namespace) -> None:
     try:
-        result = _knowledge_index().search(
-            args.query,
-            ticket=args.ticket,
-            kind=args.kind,
-            event_type=args.event_type,
-            since=args.since,
-            limit=args.limit,
-        )
+        index = _knowledge_index()
+        if args.mode == "semantic":
+            index.refresh_all()
+            result = index.search_semantic(
+                args.query,
+                ticket=args.ticket,
+                limit=args.limit,
+            )
+        else:
+            result = index.search(
+                args.query,
+                ticket=args.ticket,
+                kind=args.kind,
+                event_type=args.event_type,
+                since=args.since,
+                limit=args.limit,
+            )
     except knowledge.KnowledgeQueryError as exc:
         fail(str(exc))
     except knowledge.KnowledgeUnavailable as exc:
@@ -1944,6 +1953,7 @@ def main() -> None:
     search.add_argument("--type", dest="event_type", help="normalized event type")
     search.add_argument("--since", help="YYYY-MM-DD")
     search.add_argument("--limit", type=int, default=20)
+    search.add_argument("--mode", choices=("lexical", "semantic"), default="lexical")
     search.add_argument("--json", action="store_true")
     search.set_defaults(func=cmd_search)
 
