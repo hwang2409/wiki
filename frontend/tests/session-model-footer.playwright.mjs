@@ -171,7 +171,11 @@ async function main() {
     }, { ticket: TICKET });
     await page.goto(`${backend.baseUrl}/#/agent/${TICKET}`, { waitUntil: "domcontentloaded" });
     await page.waitForSelector(".session-footer");
-    await page.getByText("model changed to gpt-5.5").waitFor();
+    // WIKI-152: Run details now serialises the raw provider payload into a
+    // hidden `<pre>` which contains the same substring, so `getByText` needs
+    // to be exact to avoid a strict-mode DOM match on both the visible chip
+    // and the diagnostics JSON dump.
+    await page.getByText("model changed to gpt-5.5", { exact: true }).waitFor();
 
     await page.getByRole("button", { name: "Change model" }).click();
     await page.getByRole("button", { name: /GPT 5\.5/ }).click();

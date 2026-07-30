@@ -61,6 +61,7 @@ import type {
   ProviderEventInspector,
   ProviderPendingRequest,
   QueuedMessage,
+  SessionDispositionCounts,
   SessionEvent,
   SessionInit,
   SessionRateLimit,
@@ -481,9 +482,6 @@ function ProviderPendingRequestCard({
 
   return (
     <div className="session-provider-request">
-      <div className="session-provider-request-head">
-        <span>Action required</span>
-      </div>
       {questions.length > 0 ? (
         <div className="session-provider-questions">
           {questions.map((question) => (
@@ -552,16 +550,9 @@ function ProviderPendingRequestCard({
                 : "Send response"}
         </button>
       </div>
-      <details className="session-provider-request-details">
-        <summary>Details</summary>
-        <dl className="session-provider-request-meta">
-          <dt>kind</dt>
-          <dd>{request.request_kind}</dd>
-          <dt>request id</dt>
-          <dd>{String(request.request_id)}</dd>
-        </dl>
-        <pre>{JSON.stringify(request.payload, null, 2)}</pre>
-      </details>
+      {/* R1-04: request kind, id, and raw payload no longer live in a
+          per-card mini disclosure. Run details is the single diagnostics
+          home — cross-reference by raw_seq #{request.raw_seq}. */}
       {error ? <div className="session-provider-request-error">{error}</div> : null}
     </div>
   );
@@ -933,7 +924,7 @@ function SessionModelFooter({
   );
 }
 
-function ProviderStreamInspector({
+export function ProviderActionRequired({
   inspector,
   ticket,
 }: {
@@ -941,53 +932,123 @@ function ProviderStreamInspector({
   ticket: string;
 }) {
   const pendingRequests = inspector.pending_requests ?? [];
-  const [open, setOpen] = useState(pendingRequests.length > 0);
-  useEffect(() => {
-    if (pendingRequests.length > 0) setOpen(true);
-  }, [pendingRequests.length]);
-  const counts = formatDispositionCounts(inspector.dispositions);
+  if (pendingRequests.length === 0) return null;
   return (
-    <div className={`session-provider-inspector${open ? " is-open" : ""}`}>
-      <button
-        aria-expanded={open}
-        className="session-provider-inspector-head"
-        type="button"
-        onClick={() => setOpen((current) => !current)}
-      >
-        <ChevronRight size={12} />
-        <span className="session-dispositions-label">Provider stream</span>
-        <span className="session-provider-inspector-route">
-          raw {inspector.raw_count} → normalized {inspector.normalized_count}
-        </span>
-        <span className="session-dispositions-value">{counts}</span>
-        {pendingRequests.length > 0 ? (
-          <span className="session-provider-pending">
-            {pendingRequests.length} pending
-          </span>
+    <div className="session-action-required" data-testid="session-action-required">
+      <div className="session-action-required-head">
+        <AlertTriangle size={13} />
+        <span className="session-action-required-title">Action required</span>
+        {pendingRequests.length > 1 ? (
+          <span className="session-action-required-count">{pendingRequests.length}</span>
         ) : null}
-        <span className={`session-provider-state is-${inspector.state}`}>
-          {inspector.provider} · {inspector.state}
-        </span>
-      </button>
-      {inspector.provider === "codex" ? (
-        <CodexStreamHighlights
-          events={inspector.events}
-          currentTurnDiff={
-            inspector.current_turn_diff === undefined
-              ? undefined
-              : inspector.current_turn_diff?.diff ?? null
-          }
-        />
-      ) : null}
-      {open ? (
-        <div className="session-provider-inspector-body">
-          {pendingRequests.map((request) => (
-            <ProviderPendingRequestCard
-              key={`${typeof request.request_id}:${request.request_id}`}
-              request={request}
-              ticket={ticket}
-            />
-          ))}
+      </div>
+      <div className="session-action-required-body">
+        {pendingRequests.map((request) => (
+          <ProviderPendingRequestCard
+            key={`${typeof request.request_id}:${request.request_id}`}
+            request={request}
+            ticket={ticket}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+export function SessionRunDetails({
+  inspector,
+  format,
+  tokens,
+  thinkingTokens,
+  dispositions,
+}: {
+  inspector: ProviderEventInspector | null;
+  format: string | null;
+  tokens: number | null;
+  thinkingTokens: number | null;
+  dispositions: SessionDispositionCounts | null;
+}) {
+  if (!inspector && !format && !tokens && !thinkingTokens && !dispositions) return null;
+  // R2-01: prefer inspector.dispositions — it is the source of truth for
+  // live provider events. Session-level dispositions come from the
+  // transcript fallback path which zeroes counts while real provider
+  // events are flowing (the exact "Unknown 0" artifact this ticket
+  // kills). Only fall back to session dispositions when there is no
+  // inspector at all.
+  const dispositionCounts = inspector
+    ? formatDispositionCounts(inspector.dispositions)
+    : dispositions
+    ? formatDispositionCounts(dispositions)
+    : null;
+  const pendingRequests = inspector?.pending_requests ?? [];
+  const tokensLabel = formatTokens(tokens);
+  return (
+    <details className="session-run-details" data-testid="session-run-details">
+      <summary>
+        <ChevronRight size={12} className="session-run-details-chevron" />
+        <span className="session-run-details-label">Run details</span>
+      </summary>
+      <div className="session-run-details-body">
+        <dl className="session-run-details-meta tabular-nums">
+          {inspector ? (
+            <>
+              <dt>provider</dt>
+              <dd>{inspector.provider}</dd>
+              <dt>state</dt>
+              <dd className={`session-provider-state is-${inspector.state}`}>{inspector.state}</dd>
+              <dt>events</dt>
+              <dd>raw {inspector.raw_count} → normalized {inspector.normalized_count}</dd>
+            </>
+          ) : null}
+          {dispositionCounts ? (
+            <>
+              <dt>dispositions</dt>
+              <dd className="session-dispositions-value">{dispositionCounts}</dd>
+            </>
+          ) : null}
+          {format ? (
+            <>
+              <dt>format</dt>
+              <dd>{format}</dd>
+            </>
+          ) : null}
+          {tokensLabel ? (
+            <>
+              <dt>tokens</dt>
+              <dd>{tokensLabel}</dd>
+            </>
+          ) : null}
+          {typeof thinkingTokens === "number" ? (
+            <>
+              <dt>thinking</dt>
+              <dd>{thinkingTokens} tokens</dd>
+            </>
+          ) : null}
+        </dl>
+        {/* R2-02: render pending requests as first-class diagnostics so a
+            pending request that has not yet produced an event (e.g. id 0
+            with an empty event log) is discoverable — the action-required
+            card intentionally hides kind/id/payload, so Run details is
+            their one home. */}
+        {pendingRequests.length > 0 ? (
+          <div className="session-provider-pending-list" data-testid="run-details-pending-requests">
+            {pendingRequests.map((request) => (
+              <details
+                className="session-provider-event is-pending"
+                key={`pending:${typeof request.request_id}:${request.request_id}`}
+              >
+                <summary>
+                  <span className="is-pending">pending</span>
+                  <span>id #{String(request.request_id)}</span>
+                  <span>{request.request_kind}</span>
+                  <span>raw #{request.raw_seq}</span>
+                </summary>
+                <pre>{JSON.stringify(request.payload, null, 2)}</pre>
+              </details>
+            ))}
+          </div>
+        ) : null}
+        {inspector ? (
           <div className="session-provider-events">
             {inspector.events.length > 0 ? (
               inspector.events
@@ -1005,13 +1066,13 @@ function ProviderStreamInspector({
                     <pre>{JSON.stringify(event.payload, null, 2)}</pre>
                   </details>
                 ))
-            ) : (
+            ) : pendingRequests.length === 0 ? (
               <div className="session-provider-empty">No normalized provider events yet.</div>
-            )}
+            ) : null}
           </div>
-        </div>
-      ) : null}
-    </div>
+        ) : null}
+      </div>
+    </details>
   );
 }
 
@@ -2665,16 +2726,14 @@ export function SessionTab({
     );
   }
 
-  const tokens = formatTokens(session.tokens);
-  const dispositionCounts = formatDispositionCounts(session.dispositions);
-  const footerSegments = [session.format, tokens ?? "", dispositionCounts].filter(Boolean);
   const rateLimit = session.sessionMeta.rate_limit;
-  const thinkingTokens = session.sessionMeta.thinking_tokens?.total;
+  const thinkingTokens = session.sessionMeta.thinking_tokens?.total ?? null;
+  const inspector = session.providerInspector;
 
   return (
     <QuestionUiContext.Provider value={questionUi}>
       <div className="session-tab" ref={containerRef}>
-      {(session.tasks.length > 0 || session.pr || session.sessionMeta.custom_title || session.sessionMeta.agent_name || typeof thinkingTokens === "number" || (rateLimit?.status && rateLimit.status !== "allowed")) ? (
+      {(session.tasks.length > 0 || session.pr || session.sessionMeta.custom_title || session.sessionMeta.agent_name || (rateLimit?.status && rateLimit.status !== "allowed")) ? (
         <div className="session-state-strip">
           {session.sessionMeta.custom_title ? (
             <span className="session-state-meta">{session.sessionMeta.custom_title}</span>
@@ -2692,9 +2751,6 @@ export function SessionTab({
               </span>
             </span>
           ) : null}
-          {typeof thinkingTokens === "number" ? (
-            <span className="session-state-meta tabular-nums">thinking {thinkingTokens} tokens</span>
-          ) : null}
           {rateLimit ? <ClaudeRateLimitChrome rate={rateLimit} /> : null}
           {session.pr ? (
             <a
@@ -2708,12 +2764,26 @@ export function SessionTab({
           ) : null}
         </div>
       ) : null}
-      <div className="session-dispositions">
-        <span className="session-dispositions-value">{dispositionCounts}</span>
-      </div>
-      {session.providerInspector ? (
-        <ProviderStreamInspector inspector={session.providerInspector} ticket={ticket} />
+      {inspector ? (
+        <ProviderActionRequired inspector={inspector} ticket={ticket} />
       ) : null}
+      {inspector && inspector.provider === "codex" ? (
+        <CodexStreamHighlights
+          events={inspector.events}
+          currentTurnDiff={
+            inspector.current_turn_diff === undefined
+              ? undefined
+              : inspector.current_turn_diff?.diff ?? null
+          }
+        />
+      ) : null}
+      <SessionRunDetails
+        inspector={inspector ?? null}
+        format={session.format ?? null}
+        tokens={session.tokens ?? null}
+        thinkingTokens={thinkingTokens}
+        dispositions={session.dispositions ?? null}
+      />
       <div className="session-scroll" ref={ref}>
         <div className="session-scroll-inner" ref={innerRef}>
           {session.hasOlder && !subagent ? (
@@ -2756,15 +2826,7 @@ export function SessionTab({
         />
       )}
       <div className="session-footer tabular-nums">
-        {footerSegments[0] ? <span>{footerSegments[0]}</span> : null}
-        <span className="session-footer-separator">·</span>
         <SessionModelFooter session={session} ticket={ticket} />
-        {footerSegments.slice(1).map((segment) => (
-          <span className="session-footer-segment" key={segment}>
-            <span className="session-footer-separator">·</span>
-            {segment}
-          </span>
-        ))}
       </div>
       </div>
     </QuestionUiContext.Provider>
@@ -2836,6 +2898,7 @@ function MessageComposer({
   const [text, setText] = useState(() => cachedComposer?.text ?? "");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [inputFocused, setInputFocused] = useState(false);
   const [vimMode, setVimMode] = useState<ComposerMode>(() => cachedComposer?.vimMode ?? "insert");
   const pendingKeyRef = useRef<string | null>(null);
   const registerRef = useRef<string>("");
@@ -3706,7 +3769,12 @@ function MessageComposer({
           autoCorrect="off"
           className={vimMode === "normal" || vimMode === "visual" ? "is-vim-normal" : undefined}
           spellCheck={false}
-          placeholder={vimMode === "insert" ? "Enter sends now · Shift+Enter queues until idle · Esc = vim normal" : undefined}
+          placeholder={vimMode === "insert" ? "Message" : undefined}
+          /* R2-03: aria-label carries the accessible name ("Message"); the
+             keyboard sheet lives in a real focus-revealed element below
+             wired via aria-describedby. `title` would clobber both. */
+          aria-label="Message"
+          aria-describedby="session-composer-help"
           ref={inputRef}
           rows={2}
           value={text}
@@ -3720,9 +3788,11 @@ function MessageComposer({
           }
           aria-autocomplete="list"
           onFocus={(event) => {
+            setInputFocused(true);
             if (vimMode !== "insert") enterInsert(event.currentTarget.selectionEnd ?? text.length);
             else captureSelection(event.currentTarget);
           }}
+          onBlur={() => setInputFocused(false)}
           onChange={(event) => {
             setText(event.target.value);
             setMenuDismissed(false);
@@ -3845,6 +3915,17 @@ function MessageComposer({
         </button>
       </div>
       )}
+      {/* R2-03: focus-revealed keyboard help. Always in the DOM (so
+          aria-describedby resolves for screen readers) but only visually
+          shown while the composer is focused, so the ambient chrome
+          stays quiet. */}
+      <div
+        id="session-composer-help"
+        className={`session-composer-help${inputFocused ? " is-visible" : ""}`}
+        aria-hidden={!inputFocused}
+      >
+        Enter sends now · Shift+Enter queues until idle · Esc = vim normal
+      </div>
       <div className="session-composer-status">
         {thinking ? <span className="session-thinking-indicator">thinking</span> : null}
         <div className="session-subagents">
@@ -3862,15 +3943,15 @@ function MessageComposer({
             </button>
           ))}
         </div>
-        <span className={`session-vim-mode is-${vimMode}`}>
-          {vimMode === "insert"
-            ? "-- INSERT --"
-            : vimMode === "visual"
+        {vimMode !== "insert" ? (
+          <span className={`session-vim-mode is-${vimMode}`}>
+            {vimMode === "visual"
               ? "-- VISUAL --"
               : vimMode === "pane"
                 ? "-- PANE --"
                 : "-- NORMAL --"}
-        </span>
+          </span>
+        ) : null}
       </div>
     </div>
   );

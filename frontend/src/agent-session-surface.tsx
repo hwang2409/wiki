@@ -6,7 +6,7 @@ import {
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
 } from "react";
-import { Bot, GitBranch, GitPullRequest, History, RefreshCw, X } from "lucide-react";
+import { AlertTriangle, Bot, GitBranch, GitPullRequest, History, RefreshCw, X } from "lucide-react";
 import { AgentPrReviewPanel } from "./agent-pr-review";
 import { LoopStateChrome } from "./loop-state-chrome";
 import { WorkgraphPanel } from "./workgraph-panel";
@@ -88,7 +88,42 @@ export type AgentSessionSurfaceWorker = {
   pr?: string | null;
   canReview?: boolean;
   canReplace?: boolean;
+  state?: string | null;
+  step?: string | null;
+  blocker?: string | null;
 };
+
+const WORKER_STATE_TONE: Record<string, "positive" | "negative" | "neutral" | "faint"> = {
+  "merge-ready": "positive",
+  merged: "positive",
+  approved: "positive",
+  working: "neutral",
+  running: "neutral",
+  blocked: "negative",
+  dead: "negative",
+  interrupted: "negative",
+  completed: "faint",
+  archived: "faint",
+};
+
+function workerStateTone(state: string | null | undefined): "positive" | "negative" | "neutral" | "faint" {
+  if (!state) return "faint";
+  return WORKER_STATE_TONE[state] ?? "neutral";
+}
+
+export function WorkerStatePill({ state }: { state: string | null | undefined }) {
+  if (!state) return null;
+  const tone = workerStateTone(state);
+  return (
+    <span
+      className={`session-state-pill is-${tone}`}
+      data-testid="session-state-pill"
+      data-state={state}
+    >
+      {state}
+    </span>
+  );
+}
 
 function formatTicketCost(row: CostRow): string {
   if (row.cost_usd === null) return `unpriced · ${row.unpriced_tokens.toLocaleString()} tokens`;
@@ -568,6 +603,9 @@ export function AgentSessionSurface({
     handle.addEventListener("pointerup", onUp);
   };
 
+  const step = worker.step?.trim() || null;
+  const blocker = worker.blocker?.trim() || null;
+  const state = worker.state ?? null;
   return (
     <div className={`agent-session-surface-row is-${context}`} ref={rowRef}>
       <section className={`agent-session-surface is-${context}`}>
@@ -576,6 +614,7 @@ export function AgentSessionSurface({
           {worker.kind ? <StatusBadge compact label={worker.kind} state="neutral" /> : null}
           {worker.role ? <StatusBadge compact label={worker.role} state="neutral" /> : null}
           {worker.model ? <StatusBadge compact label={worker.model} state="faint" /> : null}
+          <WorkerStatePill state={state} />
           <LoopStateChrome ticket={worker.ticket} tick={tick} />
           <div className="agent-surface-actions">
               {worker.canReplace && worker.kind && worker.model ? (
@@ -635,6 +674,18 @@ export function AgentSessionSurface({
               ) : null}
             </div>
         </header>
+        {blocker ? (
+          <div className="session-blocker-row" data-testid="session-blocker-row" role="alert">
+            <AlertTriangle size={13} />
+            <span className="session-blocker-label">blocked</span>
+            <span className="session-blocker-text">{blocker}</span>
+          </div>
+        ) : step ? (
+          <div className="session-step-row" data-testid="session-step-row">
+            <span className="session-step-label">step</span>
+            <span className="session-step-text">{step}</span>
+          </div>
+        ) : null}
         <TicketCostStrip ticket={worker.ticket} refreshTick={tick} />
         <div className="agent-session-surface-main">
           <SessionTab
