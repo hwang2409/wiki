@@ -9,7 +9,6 @@ updated: 2026-07-30
 Todo:
 
 - [P3] WIKI-168 daemon-ize wiki backend — open since graph-engineering D2; survive terminal close, launchd or equivalent
-- [P1] WIKI-173 orch autopilot — pair next_review (WIKI-171) w/ LLM-parses-verdict + auto-steer + auto-merge on clean. Orchestrator becomes observer, not driver. Backend: verdict-parser module (extract findings via regex + LLM fallback), auto-steer builder, gated auto-merge (requires clean gate + optional Henry ack per ticket). Frontend: autopilot toggle per ticket, live log of autopilot decisions
 - [P1] WIKI-175 PR conflict auto-rebase bot — detect DIRTY state after upstream merge; spawn dedicated worker that fetches origin/main, merges, resolves mechanical conflicts (imports, ordering, whitespace, lockfiles), pushes. Semantic conflicts escalate to orchestrator w/ diff summary. Cuts 2x rebase cycles seen in 07-29 five-feature arc
 - [P2] WIKI-176 live worker screencast strip — miniature terminal preview (last ~20 lines) inline in fleet view + per-ticket cards; refresh 2s from raw.jsonl tail. Skim 12 workers at glance w/o click-in
 - [P2] WIKI-177 blast radius view pre-spawn — before spawning ticket X, compute which in-flight branches touch same files (git diff main..branch per active branch); display collision-risk preview in spawn dialog. Prevents rebase pain
