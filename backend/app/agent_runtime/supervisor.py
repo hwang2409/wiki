@@ -275,6 +275,7 @@ class Supervisor:
         self.orphan_archive_grace_seconds = orphan_archive_grace_seconds
         self.adapters: dict[str, ProviderAdapter] = {}
         self.event_tasks: dict[str, asyncio.Task[None]] = {}
+        self.event_processing_locks: dict[str, asyncio.Lock] = {}
         self.event_routes: dict[tuple[int, int], str] = {}
         self.queue_locks: dict[str, asyncio.Lock] = {}
         self.agent_locks: dict[str, asyncio.Lock] = {}
@@ -588,7 +589,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     run_id,
                 )
                 try:
-                    await self._handle_provider_event(event_run_id, adapter, event)
+                    event_lock = self.event_processing_locks.setdefault(
+                        event_run_id, asyncio.Lock()
+                    )
+                    async with event_lock:
+                        await self._handle_provider_event(event_run_id, adapter, event)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -821,7 +826,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 name=f"agent-idle-boundary-{run_id}",
             )
 
-    async def _flush_handover_events(self, run_id: str) -> None:
+    async def _flush_handover_events(
+        self, run_id: str, *, schedule_monitor_actions: bool = False
+    ) -> None:
         """Persist events queued while the handover barrier owned admission."""
 
         while True:
@@ -829,14 +836,52 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 events = self.handover_event_queue.pop(run_id, [])
             if not events:
                 return
-            for adapter, event in events:
-                await self._handle_provider_event_without_admission(
-                    run_id,
-                    adapter,
-                    event,
-                    update_adapter_snapshot=False,
-                    schedule_monitor_actions=False,
-                )
+            for index, (adapter, event) in enumerate(events):
+                try:
+                    await self._handle_provider_event_without_admission(
+                        run_id,
+                        adapter,
+                        event,
+                        update_adapter_snapshot=False,
+                        schedule_monitor_actions=schedule_monitor_actions,
+                    )
+                except BaseException:
+                    async with self.handover_condition:
+                        self.handover_event_queue.setdefault(run_id, []).extend(
+                            events[index:]
+                        )
+                    raise
+
+    async def _flush_all_handover_events(self) -> None:
+        """Replay queued events before failed handover releases admission."""
+
+        while True:
+            async with self.handover_condition:
+                run_ids = list(self.handover_event_queue)
+            if not run_ids:
+                return
+            for run_id in run_ids:
+                async with self._run_lock(run_id):
+                    await self._flush_handover_events(
+                        run_id, schedule_monitor_actions=True
+                    )
+
+    async def _capture_live_handover_events(self) -> None:
+        """Move buffered events from live adapters into the handover queue."""
+
+        for run_id, adapter in list(self.adapters.items()):
+            event_lock = self.event_processing_locks.setdefault(
+                run_id, asyncio.Lock()
+            )
+            async with event_lock:
+                for event in await adapter.drain_events():
+                    event_run_id = self.event_routes.get(
+                        (id(adapter), event.generation), run_id
+                    )
+                    async with self.handover_condition:
+                        self.handover_event_queue.setdefault(
+                            event_run_id, []
+                        ).append((adapter, event))
 
     def _schedule_monitor_actions(
         self,
@@ -1380,12 +1425,32 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         stream_key = id(adapter)
         self.expected_stream_ends.add(stream_key)
         try:
-            # Stop the event pump before stopping the provider. The provider
-            # may emit terminal protocol events while it is quiescing; those
-            # events belong to the old run and must not race the ownership
-            # reset or make the old record terminal before the handoff.
-            await self._detach_adapter(run_id, preserve_event_routes=True)
             await adapter.stop()
+            event_lock = self.event_processing_locks.setdefault(
+                run_id, asyncio.Lock()
+            )
+            # Keep the pump attached through provider stop. The lock closes
+            # the race with an event already taken from the adapter queue.
+            async with event_lock:
+                for event in await adapter.drain_events():
+                    event_run_id = self.event_routes.get(
+                        (id(adapter), event.generation), run_id
+                    )
+                    async with self.handover_condition:
+                        handover_active = self.handover_active
+                        if handover_active:
+                            self.handover_event_queue.setdefault(
+                                event_run_id, []
+                            ).append((adapter, event))
+                    if not handover_active:
+                        await self._handle_provider_event_without_admission(
+                            event_run_id,
+                            adapter,
+                            event,
+                            update_adapter_snapshot=True,
+                            schedule_monitor_actions=True,
+                        )
+            await self._detach_adapter(run_id, preserve_event_routes=True)
         finally:
             self.expected_stream_ends.discard(stream_key)
 
@@ -2459,11 +2524,22 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 "runs": [dict(run) for run in runs],
             }
         except BaseException:
+            capture_error: BaseException | None = None
+            try:
+                await self._capture_live_handover_events()
+            except BaseException as exc:
+                capture_error = exc
             async with self.handover_condition:
                 self.handover_active = False
                 self.handover_pending = False
                 self.handover_result = None
                 self.handover_condition.notify_all()
+            try:
+                await self._flush_all_handover_events()
+            except BaseException:
+                raise
+            if capture_error is not None:
+                raise capture_error
             raise
 
     async def _recover_run(self, run_id: str) -> dict[str, str]:

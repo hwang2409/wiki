@@ -1996,6 +1996,129 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(second_runs), 1)
         self.assertTrue(second_runs[0]["pending_requests"])
 
+    async def test_handover_drains_adapter_queue_after_provider_stop(self) -> None:
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-HANDOVER-ADAPTER-QUEUE",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="adapter queue handover",
+        )
+        await _wait_for_events(self.store, record.run_id, 10)
+        before = self.store.get(record.run_id)
+        adapter = self.supervisor.adapters[record.run_id]
+        event = ProviderEvent(
+            ProviderKind.CODEX,
+            {
+                "id": 91,
+                "method": "item/tool/requestUserInput",
+                "params": {
+                    "questions": [{"id": "queue", "question": "Continue?"}]
+                },
+            },
+            generation=adapter.snapshot().generation,
+        )
+        original_drain = adapter.drain_events
+
+        async def inject_after_stop() -> list[ProviderEvent]:
+            await adapter._events.put(event)  # noqa: SLF001 - queue boundary probe
+            return await original_drain()
+
+        with mock.patch.object(adapter, "drain_events", new=inject_after_stop):
+            await self.supervisor.prepare_handover()
+
+        current = self.store.get(record.run_id)
+        self.assertEqual(current.raw_event_count, before.raw_event_count + 1)
+        self.assertEqual(current.normalized_event_count, before.normalized_event_count + 1)
+        self.assertIn("int:91", current.pending_requests)
+        self.assertFalse(self.supervisor.handover_event_queue)
+
+    async def test_failed_handover_preflight_replays_queued_events(self) -> None:
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-HANDOVER-PREFLIGHT-FAIL",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="preflight failure",
+        )
+        await _wait_for_events(self.store, record.run_id, 10)
+        before = self.store.get(record.run_id)
+        adapter = self.supervisor.adapters[record.run_id]
+
+        async def fail_preflight() -> list[str]:
+            await adapter._events.put(  # noqa: SLF001 - barrier failure probe
+                ProviderEvent(
+                    ProviderKind.CODEX,
+                    {
+                        "id": 92,
+                        "method": "item/tool/requestUserInput",
+                        "params": {
+                            "questions": [{"id": "preflight", "question": "Retry?"}]
+                        },
+                    },
+                    generation=adapter.snapshot().generation,
+                )
+            )
+            raise StoreConflict("fixture preflight failure")
+
+        with mock.patch.object(
+            self.supervisor, "_handover_preflight", new=fail_preflight
+        ):
+            with self.assertRaisesRegex(StoreConflict, "fixture preflight failure"):
+                await self.supervisor.prepare_handover()
+
+        current = self.store.get(record.run_id)
+        self.assertEqual(current.raw_event_count, before.raw_event_count + 1)
+        self.assertIn("int:92", current.pending_requests)
+        self.assertFalse(self.supervisor.handover_event_queue)
+
+    async def test_failed_handover_drain_replays_queued_events(self) -> None:
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-HANDOVER-DRAIN-FAIL",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="drain failure",
+        )
+        await _wait_for_events(self.store, record.run_id, 10)
+        before = self.store.get(record.run_id)
+        adapter = self.supervisor.adapters[record.run_id]
+
+        async def fail_drain(run_id: str, candidate: Any) -> None:
+            await adapter._events.put(  # noqa: SLF001 - barrier failure probe
+                ProviderEvent(
+                    ProviderKind.CODEX,
+                    {
+                        "id": 93,
+                        "method": "item/tool/requestUserInput",
+                        "params": {
+                            "questions": [{"id": "drain", "question": "Retry?"}]
+                        },
+                    },
+                    generation=adapter.snapshot().generation,
+                )
+            )
+            raise StoreConflict(f"fixture drain failure: {run_id}")
+
+        with mock.patch.object(
+            self.supervisor,
+            "_quiesce_adapter_for_replacement",
+            new=fail_drain,
+        ):
+            with self.assertRaisesRegex(StoreConflict, "fixture drain failure"):
+                await self.supervisor.prepare_handover()
+
+        current = self.store.get(record.run_id)
+        self.assertEqual(current.raw_event_count, before.raw_event_count + 1)
+        self.assertIn("int:93", current.pending_requests)
+        self.assertFalse(self.supervisor.handover_event_queue)
+
     async def test_mutation_admission_does_not_deadlock_nested_resume_replace(self) -> None:
         record = await self.supervisor.start_run(
             agent_id="WIKI-HANDOVER-ADMISSION-RACE",
