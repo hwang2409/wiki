@@ -74,6 +74,45 @@ class PurgeRebaseBotTestJobsTests(unittest.TestCase):
                 {"jobs": {}, "outbox": {}, "delivered": []},
             )
 
+    def test_purge_removes_orphaned_retry_delivery_ids_only(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            runtime_dir = Path(raw)
+            state_path = runtime_dir / "rebase-bot" / "state.json"
+            state_path.parent.mkdir(parents=True)
+            production_delivery_id = "177:production-sha:escalated:production-head"
+            orphaned_retry_delivery_id = "178:retry-test-pruned:escalated:retry-test-head"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "jobs": {},
+                        "outbox": {},
+                        "delivered": [
+                            production_delivery_id,
+                            orphaned_retry_delivery_id,
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "--runtime-dir", str(runtime_dir)],
+                capture_output=True,
+                text=True,
+                check=True,
+                env=os.environ.copy(),
+            )
+
+            self.assertIn("purged 0 retry-test job(s)", result.stdout)
+            self.assertEqual(
+                json.loads(state_path.read_text(encoding="utf-8")),
+                {
+                    "jobs": {},
+                    "outbox": {},
+                    "delivered": [production_delivery_id],
+                },
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

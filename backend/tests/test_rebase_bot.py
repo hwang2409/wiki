@@ -374,6 +374,8 @@ class RebaseBotTests(unittest.TestCase):
             parent_runtime = Path(raw) / "parent-runtime"
             isolated_runtime = Path(raw) / "isolated-runtime"
             parent_state = parent_runtime / "rebase-bot" / "state.json"
+            parent_state.parent.mkdir(parents=True)
+            parent_state.write_text("parent canary\n", encoding="utf-8")
             fake_main = SimpleNamespace(AGENT_RUNTIME_DIR=isolated_runtime)
             job = rebase_durable._RebaseJob(
                 job_id="thread-isolation",
@@ -393,6 +395,10 @@ class RebaseBotTests(unittest.TestCase):
                 "escalated_hunks": ["test"],
             }
             with (
+                mock.patch.dict(
+                    os.environ,
+                    {"WIKI_AGENT_RUNTIME_DIR": str(parent_runtime)},
+                ),
                 mock.patch.object(rebase_bot, "_main", return_value=fake_main),
                 mock.patch.object(rebase_bot, "_validate_pr_binding"),
                 mock.patch.object(rebase_bot, "_preflight_worktree"),
@@ -400,13 +406,32 @@ class RebaseBotTests(unittest.TestCase):
                     rebase_bot, "_run_rebase_helper_checked", return_value=result
                 ),
             ):
-                rebase_bot._start_rebase_thread(job)
+                thread = rebase_bot._start_rebase_thread(job)
                 self.assertTrue(job.done.wait(timeout=5))
+                thread.join(timeout=5)
+                self.assertFalse(thread.is_alive())
 
-            self.assertFalse(parent_state.exists())
+            self.assertEqual(parent_state.read_text(encoding="utf-8"), "parent canary\n")
             self.assertTrue(
                 (isolated_runtime / "rebase-bot" / "state.json").exists()
             )
+
+    def test_delivery_id_keeps_empty_head_field_for_retries(self) -> None:
+        job = rebase_durable._RebaseJob(
+            job_id="missing-head",
+            worktree=Path("."),
+            prompt="prompt",
+            done=threading.Event(),
+            pr_number=175,
+            expected_sha="retry-test-missing-head",
+        )
+
+        first = rebase_durable._delivery_id(job, {"status": "escalated"})
+        second = rebase_durable._delivery_id(job, {"status": "escalated"})
+
+        self.assertEqual(first, "175:retry-test-missing-head:escalated:")
+        self.assertTrue(first)
+        self.assertEqual(first, second)
 
     def test_duplicate_logical_notification_is_sent_once(self) -> None:
         sent: list[tuple[str, str]] = []

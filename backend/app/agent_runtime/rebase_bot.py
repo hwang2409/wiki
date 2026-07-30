@@ -832,8 +832,8 @@ def _start_rebase_thread(
     job: _RebaseJob,
     steer: Callable[[str, Mapping[str, Any]], None] | None = None,
     notify: NotificationSender | None = None,
-) -> None:
-    threading.Thread(
+) -> threading.Thread:
+    thread = threading.Thread(
         target=_finish_rebase_job,
         kwargs={
             "job": job,
@@ -844,7 +844,9 @@ def _start_rebase_thread(
         },
         name=f"rebase-bot-{job.job_id}",
         daemon=True,
-    ).start()
+    )
+    thread.start()
+    return thread
 
 
 def resume_pending_jobs(notify: NotificationSender | None = None) -> None:

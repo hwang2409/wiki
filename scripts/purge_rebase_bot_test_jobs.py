@@ -9,6 +9,11 @@ import sys
 from pathlib import Path
 
 
+def _is_retry_test_delivery_id(delivery_id: str) -> bool:
+    parts = delivery_id.split(":")
+    return len(parts) == 4 and parts[1].startswith("retry-test-")
+
+
 def purge(runtime_dir: Path) -> int:
     """Remove completed retry-test jobs with an empty outbox atomically."""
 
@@ -32,15 +37,20 @@ def purge(runtime_dir: Path) -> int:
         ]
         delivery_ids = {
             delivery_id
+            for delivery_id in rebase_durable._DELIVERED_EVENTS
+            if _is_retry_test_delivery_id(delivery_id)
+        }
+        delivery_ids.update(
+            delivery_id
             for key in keys
             if (delivery_id := rebase_durable._delivery_id_from_record(
                 rebase_durable._DURABLE_JOBS[key]
             ))
-        }
+        )
         for key in keys:
             del rebase_durable._DURABLE_JOBS[key]
         rebase_durable._DELIVERED_EVENTS.difference_update(delivery_ids)
-        if keys:
+        if keys or delivery_ids:
             rebase_durable._persist_durable_state()
         return len(keys)
 

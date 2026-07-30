@@ -257,7 +257,7 @@ def _delivery_id_from_parts(
     parts = tuple(
         str(part or "") for part in (pr_number, expected_sha, status, head_sha)
     )
-    return ":".join(parts) if all(parts) else ""
+    return ":".join(parts)
 
 
 def _delivery_id_from_record(record: Mapping[str, Any]) -> str:
