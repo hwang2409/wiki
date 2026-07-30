@@ -213,9 +213,21 @@ class F12ExactlyOnceDelivery(unittest.TestCase):
                 }
                 rebase_durable._persist_completion(job, result)
 
+                # After R12 the sender-side is at-least-once + retry, and
+                # the receiver-side dedupes on the ``delivery_id`` that
+                # threads through the notifier.  Simulate the receiver
+                # inbox by dropping messages whose id we have seen.
                 delivered: list[str] = []
+                seen_ids: set[str] = set()
 
-                def flaky_send(_target: str, message: str) -> None:
+                def flaky_receiver_dedupe(
+                    _target: str, message: str, delivery_id: str
+                ) -> None:
+                    if delivery_id in seen_ids:
+                        # Receiver drops the duplicate: exactly-once at
+                        # the observable layer.
+                        raise RuntimeError("duplicate suppressed")
+                    seen_ids.add(delivery_id)
                     delivered.append(message)
                     raise RuntimeError("delivered then raised")
 
@@ -226,8 +238,12 @@ class F12ExactlyOnceDelivery(unittest.TestCase):
                     return clock[0]
 
                 for _ in range(5):
-                    rebase_bot._flush_outbox(flaky_send, _now=advancing_clock)
+                    rebase_bot._flush_outbox(
+                        flaky_receiver_dedupe, _now=advancing_clock
+                    )
+        # Receiver observed exactly one unique event.
         self.assertEqual(len(delivered), 1)
+        self.assertEqual(len(seen_ids), 1)
 
 
 class F13UnusedWrappersRemoved(unittest.TestCase):

@@ -244,7 +244,7 @@ class RebaseBotTests(unittest.TestCase):
                         }
                     },
                     helper=lambda _worktree: results.pop(0),
-                    notify=lambda target, text: messages.append((target, text)),
+                    notify=lambda target, text, _id="": messages.append((target, text)),
                 )
                 self.assertEqual(result["status"], expected_status)
 
@@ -287,7 +287,7 @@ class RebaseBotTests(unittest.TestCase):
                     "resolved_files": [],
                     "escalated_hunks": [],
                 },
-                notify=lambda target, text: notifications.append((target, text)),
+                notify=lambda target, text, _id="": notifications.append((target, text)),
             )
         self.assertEqual(result["status"], "resolved")
         self.assertEqual(len(notifications), 1)
@@ -315,7 +315,7 @@ class RebaseBotTests(unittest.TestCase):
                     "WIKI-175-IMPL",
                     "wiki",
                     result,
-                    lambda target, text: sent.append((target, text)),
+                    lambda target, text, _id="": sent.append((target, text)),
                     "same-event",
                 )
         self.assertEqual(len(sent), 1)
@@ -524,18 +524,17 @@ class RebaseBotTests(unittest.TestCase):
         self.assertIn(["rm", "-f", "--", "frontend/package-lock.json"], calls)
         regenerate.assert_called_once_with(Path(raw).resolve(), "frontend/package-lock.json")
 
-    def test_result_outbox_is_at_most_once_on_sender_failure(self) -> None:
-        # After R11 the outbox records the delivery attempt BEFORE calling
-        # the sender: a raise (even one that already delivered the message)
-        # never triggers a retry, so downstream sees each event at most
-        # once.  A sender that raises before delivering loses that event,
-        # which is the trade-off the reviewer signed off on to eliminate
-        # the "delivered five copies" flood.
+    def test_result_outbox_retries_with_same_delivery_id_until_bound(self) -> None:
+        # After R12 the outbox retries a raising sender with the SAME
+        # ``delivery_id`` so the receiver (which forwards the id as
+        # ``MessageIn.dedupe_key``) can drop duplicates.  Retries stop at
+        # ``_OUTBOX_MAX_ATTEMPTS`` so a persistently broken orchestrator
+        # cannot hold the outbox forever.
         with tempfile.TemporaryDirectory() as raw:
-            calls: list[str] = []
+            seen: list[str] = []
 
-            def failing_sender(_target: str, message: str) -> None:
-                calls.append(message)
+            def failing_sender(_target: str, _message: str, delivery_id: str) -> None:
+                seen.append(delivery_id)
                 raise RuntimeError("orchestrator unavailable")
 
             fake_main = SimpleNamespace(AGENT_RUNTIME_DIR=raw)
@@ -553,6 +552,7 @@ class RebaseBotTests(unittest.TestCase):
             )
             result = {
                 "status": "escalated",
+                "head_sha": "sha-one",
                 "resolved_files": [],
                 "escalated_hunks": ["semantic"],
             }
@@ -561,18 +561,22 @@ class RebaseBotTests(unittest.TestCase):
                 rebase_durable._DURABLE_JOBS.clear()
                 rebase_durable._OUTBOX.clear()
                 rebase_durable._DELIVERED_EVENTS.clear()
-                rebase_durable._persist_job(job, result)
-                rebase_durable._enqueue_result(job, result)
-                for _ in range(5):
-                    rebase_bot._flush_outbox(
-                        failing_sender, _now=lambda: time.time() + 3600
-                    )
-        # Exactly one attempt to notify, no retry loop.
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(
-            calls[0], "rebase-bot escalated WIKI-175-IMPL: semantic"
-        )
-        # Outbox entry is gone after the attempt.
+                rebase_durable._persist_completion(job, result)
+
+                clock = [time.time()]
+
+                def advancing_clock() -> float:
+                    clock[0] += 3600.0
+                    return clock[0]
+
+                for _ in range(rebase_durable._OUTBOX_MAX_ATTEMPTS + 3):
+                    rebase_bot._flush_outbox(failing_sender, _now=advancing_clock)
+        # Bounded number of attempts; every attempt carries the same key.
+        self.assertGreater(len(seen), 1)
+        self.assertLessEqual(len(seen), rebase_durable._OUTBOX_MAX_ATTEMPTS)
+        self.assertTrue(all(sid == seen[0] for sid in seen))
+        self.assertEqual(seen[0], "137:sha-one:escalated:sha-one")
+        # After the bound the entry is dropped.
         self.assertNotIn("durable-test:result", rebase_durable._OUTBOX)
 
     def test_preflight_rejects_unstaged_worktree_changes(self) -> None:
@@ -639,7 +643,7 @@ class RebaseBotTests(unittest.TestCase):
                     "WIKI-175",
                     "WIKI-175-IMPL",
                     gate=gate,
-                    notify=lambda _target, _text: None,
+                    notify=lambda _target, _text, _id="": None,
                 )
                 self.assertEqual(first["status"], "started")
                 self.assertTrue(started.wait(timeout=2))
@@ -649,7 +653,7 @@ class RebaseBotTests(unittest.TestCase):
                     "WIKI-175",
                     "WIKI-175-IMPL",
                     gate=gate,
-                    notify=lambda _target, _text: None,
+                    notify=lambda _target, _text, _id="": None,
                 )
                 release.set()
                 self.assertTrue(finished.wait(timeout=2))

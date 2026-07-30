@@ -671,7 +671,7 @@ def _escalate_to_orchestrator(
         if event_id in _NOTIFIED_RESULTS:
             return
     try:
-        notify(orchestrator, message[:4000])
+        notify(orchestrator, message[:4000], event_id)
     except Exception:
         # The result remains in the API response; a transient steering failure
         # must not turn a safe, already-aborted rebase into a false success.

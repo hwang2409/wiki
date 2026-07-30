@@ -100,30 +100,40 @@ UNKNOWN_KIND_TELEMETRY: UnknownKindTelemetry | None = None
 logger = logging.getLogger(__name__)
 
 
-_REBASE_RECORDING_NOTIFIER: Callable[[str, str], None] | None = None
+_REBASE_RECORDING_NOTIFIER: Callable[[str, str, str], None] | None = None
 
 
 def install_rebase_recording_notifier(
-    sender: Callable[[str, str], None] | None,
+    sender: Callable[[str, str, str], None] | None,
 ) -> None:
     """Route rebase-bot notifications to a recorder instead of the live channel.
 
     Tests install a recorder before invoking rebase flows so they can assert
     deliveries; passing ``None`` restores the default live path.  The recorder
     takes priority over the pytest safety guard, so a test that installs a
-    recorder gets real observations of every delivery.
+    recorder gets real observations of every delivery.  The recorder
+    receives the stable ``delivery_id`` as its third argument so tests can
+    verify the id propagates all the way through.
     """
 
     global _REBASE_RECORDING_NOTIFIER
     _REBASE_RECORDING_NOTIFIER = sender
 
 
-def _rebase_bot_notification_sender(target: str, text: str) -> None:
-    """Send one rebase result through the configured agent message path."""
+def _rebase_bot_notification_sender(
+    target: str, text: str, delivery_id: str = ""
+) -> None:
+    """Send one rebase result through the configured agent message path.
+
+    ``delivery_id`` becomes ``MessageIn.dedupe_key`` so the receiving
+    orchestrator inbox drops duplicates from the outbox's bounded retry
+    loop.  Without this key threaded through, a transient sender failure
+    would silently stack N copies of the same rebase result.
+    """
 
     recorder = _REBASE_RECORDING_NOTIFIER
     if recorder is not None:
-        recorder(target, text)
+        recorder(target, text, delivery_id)
         return
     # Fallback safety: if no recorder is installed and pytest is running,
     # drop the message rather than paging live operators from a test.
@@ -131,7 +141,12 @@ def _rebase_bot_notification_sender(target: str, text: str) -> None:
         return
     agent_message(
         target,
-        MessageIn(text=text, mode="now", source="rebase-bot"),
+        MessageIn(
+            text=text,
+            mode="now",
+            source="rebase-bot",
+            dedupe_key=delivery_id or None,
+        ),
         BackgroundTasks(),
     )
 

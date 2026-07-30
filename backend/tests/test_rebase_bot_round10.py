@@ -423,10 +423,10 @@ class F8OutboxDedupeAndBounds(unittest.TestCase):
                 }
                 sent: list[str] = []
                 rebase_bot._persist_completion(job, result)
-                rebase_bot._flush_outbox(lambda _t, m: sent.append(m))
+                rebase_bot._flush_outbox(lambda _t, m, _id="": sent.append(m))
                 # Re-enqueue the same logical event: must NOT send again.
                 rebase_durable._enqueue_result(job, result)
-                rebase_bot._flush_outbox(lambda _t, m: sent.append(m))
+                rebase_bot._flush_outbox(lambda _t, m, _id="": sent.append(m))
         self.assertEqual(len(sent), 1)
 
     def test_outbox_retries_are_bounded(self) -> None:
@@ -454,7 +454,7 @@ class F8OutboxDedupeAndBounds(unittest.TestCase):
                 }
                 rebase_bot._persist_completion(job, result)
 
-                def failing_send(_target, _message):
+                def failing_send(_target, _message, _delivery_id=""):
                     raise RuntimeError("network down")
 
                 clock = [time.time()]
@@ -469,19 +469,19 @@ class F8OutboxDedupeAndBounds(unittest.TestCase):
                 self.assertNotIn("bounded-test:result", rebase_durable._OUTBOX)
 
     def test_recording_notifier_installs_over_pytest_default(self) -> None:
-        recorded: list[tuple[str, str]] = []
+        recorded: list[tuple[str, str, str]] = []
         with (
             mock.patch.dict(os.environ, {"PYTEST_CURRENT_TEST": "install-test"}),
             mock.patch.object(main, "agent_message") as send,
         ):
             main.install_rebase_recording_notifier(
-                lambda t, x: recorded.append((t, x))
+                lambda t, x, i: recorded.append((t, x, i))
             )
             try:
-                main._rebase_bot_notification_sender("wiki", "hello")
+                main._rebase_bot_notification_sender("wiki", "hello", "key-1")
             finally:
                 main.install_rebase_recording_notifier(None)
-        self.assertEqual(recorded, [("wiki", "hello")])
+        self.assertEqual(recorded, [("wiki", "hello", "key-1")])
         send.assert_not_called()
 
 

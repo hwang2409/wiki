@@ -10,16 +10,25 @@ state write so a crash between the two cannot lose a result notification.
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import threading
 import time
+import uuid
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 
-NotificationSender = Callable[[str, str], None]
+NotificationSender = Callable[[str, str, str], None]
+"""``notify(target, message, delivery_id)``.
+
+The stable ``delivery_id`` must reach ``MessageIn.dedupe_key`` on the
+receiving side so that bounded sender retries do not stack duplicate
+notifications in the orchestrator inbox.
+"""
 
 _DURABLE_STATE_LOADED = False
 _DURABLE_STATE_ROOT: Path | None = None
@@ -30,6 +39,8 @@ _JOB_RETENTION_SECONDS = 900
 _OUTBOX_MAX_ATTEMPTS = 5
 _OUTBOX_BACKOFF_BASE_SECONDS = 2.0
 _OUTBOX_BACKOFF_CAP_SECONDS = 300.0
+_TEMP_COUNTER = 0
+_TEMP_COUNTER_LOCK = threading.Lock()
 
 
 @dataclass
@@ -130,6 +141,7 @@ def _load_durable_state() -> None:
 
 
 def _persist_durable_state() -> None:
+    global _TEMP_COUNTER
     state_path = _durable_state_path()
     state_path.parent.mkdir(parents=True, exist_ok=True)
     snapshot = {
@@ -137,12 +149,63 @@ def _persist_durable_state() -> None:
         "outbox": _OUTBOX,
         "delivered": sorted(_DELIVERED_EVENTS),
     }
-    temporary = state_path.with_suffix(state_path.suffix + ".tmp")
+    with _TEMP_COUNTER_LOCK:
+        _TEMP_COUNTER += 1
+        seq = _TEMP_COUNTER
+    # Unique temp filename per writer: pid + monotonic counter + a random
+    # nonce keeps two concurrent processes from clobbering each other's
+    # temp file before ``os.replace`` promotes it to ``state.json``.
+    temporary = state_path.with_name(
+        f"{state_path.name}.{os.getpid()}.{seq}.{uuid.uuid4().hex}.tmp"
+    )
     temporary.write_text(
         json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")),
         encoding="utf-8",
     )
     temporary.replace(state_path)
+
+
+@contextmanager
+def _state_lock():
+    """Serialize the reload-mutate-publish cycle across processes.
+
+    Every mutating helper (``_persist_job``, ``_persist_completion``,
+    ``_enqueue_result``, ``_flush_outbox``) wraps its work in this
+    manager.  We take an exclusive ``fcntl.flock`` on a sibling lock
+    file, then FORCE a reload from disk so mutations start from the
+    latest snapshot — otherwise a stale in-memory dict would silently
+    overwrite another writer's just-published changes.
+    """
+
+    global _DURABLE_STATE_LOADED
+    state_path = _durable_state_path()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = state_path.with_name(state_path.name + ".lock")
+    handle = lock_path.open("a+")
+    try:
+        try:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            locked = True
+        except (ImportError, OSError):
+            locked = False
+        try:
+            # Whether or not the OS gave us a lock, refresh from disk so
+            # we merge with any concurrent writer's committed state.
+            _DURABLE_STATE_LOADED = False
+            _load_durable_state()
+            yield
+        finally:
+            if locked:
+                try:
+                    import fcntl as _fcntl
+
+                    _fcntl.flock(handle.fileno(), _fcntl.LOCK_UN)
+                except (ImportError, OSError):
+                    pass
+    finally:
+        handle.close()
 
 
 def _durable_key(pr_number: int, expected_sha: str) -> str:
@@ -211,11 +274,11 @@ def _job_record(job: _RebaseJob, result: Mapping[str, Any] | None) -> dict[str, 
 def _persist_job(job: _RebaseJob, result: Mapping[str, Any] | None = None) -> None:
     if not job.durable:
         return
-    _load_durable_state()
-    key = _durable_key(job.pr_number, job.expected_sha)
-    record = _DURABLE_JOBS.setdefault(key, {})
-    record.update(_job_record(job, result))
-    _persist_durable_state()
+    with _state_lock():
+        key = _durable_key(job.pr_number, job.expected_sha)
+        record = _DURABLE_JOBS.setdefault(key, {})
+        record.update(_job_record(job, result))
+        _persist_durable_state()
 
 
 def _outbox_entry(job: _RebaseJob, result: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -239,15 +302,15 @@ def _enqueue_result(job: _RebaseJob, result: Mapping[str, Any]) -> None:
 
     if not job.durable or not job.orchestrator:
         return
-    _load_durable_state()
-    delivery_id = _delivery_id(job, result)
-    if delivery_id in _DELIVERED_EVENTS:
-        return
-    entry = _outbox_entry(job, result)
-    if entry is None:
-        return
-    _OUTBOX.setdefault(entry["id"], entry)
-    _persist_durable_state()
+    with _state_lock():
+        delivery_id = _delivery_id(job, result)
+        if delivery_id in _DELIVERED_EVENTS:
+            return
+        entry = _outbox_entry(job, result)
+        if entry is None:
+            return
+        _OUTBOX.setdefault(entry["id"], entry)
+        _persist_durable_state()
 
 
 def _persist_completion(job: _RebaseJob, result: Mapping[str, Any]) -> None:
@@ -255,17 +318,17 @@ def _persist_completion(job: _RebaseJob, result: Mapping[str, Any]) -> None:
 
     if not job.durable:
         return
-    _load_durable_state()
-    key = _durable_key(job.pr_number, job.expected_sha)
-    record = _DURABLE_JOBS.setdefault(key, {})
-    record.update(_job_record(job, result))
-    if job.orchestrator:
-        delivery_id = _delivery_id(job, result)
-        if delivery_id not in _DELIVERED_EVENTS:
-            entry = _outbox_entry(job, result)
-            if entry is not None:
-                _OUTBOX.setdefault(entry["id"], entry)
-    _persist_durable_state()
+    with _state_lock():
+        key = _durable_key(job.pr_number, job.expected_sha)
+        record = _DURABLE_JOBS.setdefault(key, {})
+        record.update(_job_record(job, result))
+        if job.orchestrator:
+            delivery_id = _delivery_id(job, result)
+            if delivery_id not in _DELIVERED_EVENTS:
+                entry = _outbox_entry(job, result)
+                if entry is not None:
+                    _OUTBOX.setdefault(entry["id"], entry)
+        _persist_durable_state()
 
 
 def _flush_outbox(
@@ -273,60 +336,78 @@ def _flush_outbox(
     *,
     _now: Callable[[], float] = time.time,
 ) -> None:
-    """Drain the outbox with at-most-once semantics per ``delivery_id``.
+    """Drain the outbox with bounded retries keyed by ``delivery_id``.
 
-    The delivery attempt is recorded — ``_DELIVERED_EVENTS`` gets the id and
-    the entry is popped, then the state file is replaced — BEFORE the send
-    call.  If the sender delivered then raised, no retry re-sends the same
-    event; if the sender raised before delivery, the loss is bounded to one
-    event rather than an unbounded flood of duplicates.  The persisted
-    delivery id is a stable ``(pr, sha, status, head_sha)`` key so downstream
-    receivers (or a future receiver-side dedupe) can spot a duplicate that
-    escapes a torn write.
+    ``notify`` is called with ``(target, message, delivery_id)``.  The
+    delivery id is a stable ``(pr, sha, status, head_sha)`` string that
+    receiver code (``main._rebase_bot_notification_sender``) forwards as
+    ``MessageIn.dedupe_key`` — so a retry after a transient failure looks
+    like the same logical event to the receiver, and the inbox drops the
+    duplicate.  Retries are bounded by ``_OUTBOX_MAX_ATTEMPTS`` with
+    exponential backoff to keep a persistently broken sender from
+    holding the outbox forever.
     """
 
-    _load_durable_state()
     if notify is None:
         return
     now = _now()
-    dispatch: list[tuple[str, str, str]] = []
-    changed = False
-    for entry_id, entry in list(_OUTBOX.items()):
-        target = entry.get("target")
-        result = entry.get("result")
-        worker_id = entry.get("worker_id")
-        if not isinstance(target, str) or not isinstance(result, Mapping):
-            _OUTBOX.pop(entry_id, None)
-            changed = True
-            continue
-        delivery_id = str(entry.get("delivery_id") or "")
-        if delivery_id and delivery_id in _DELIVERED_EVENTS:
-            _OUTBOX.pop(entry_id, None)
-            changed = True
-            continue
-        next_attempt_at = float(entry.get("next_attempt_at") or 0.0)
-        if next_attempt_at > now:
-            continue
-        message = _result_message(str(worker_id or "worker"), result)
-        if message is None:
-            _OUTBOX.pop(entry_id, None)
-            changed = True
-            continue
-        # Record the attempt BEFORE the send so a delivered-then-raised
-        # sender cannot get five copies through the retry loop.  The entry
-        # leaves the outbox in the same state write.
-        if delivery_id:
-            _DELIVERED_EVENTS.add(delivery_id)
-        _OUTBOX.pop(entry_id, None)
-        changed = True
-        dispatch.append((target, message[:4000], delivery_id))
-    if changed:
-        _persist_durable_state()
-    for target, message, _delivery_id in dispatch:
+    # First pass: pick eligible entries and snapshot them under the state
+    # lock.  Actual ``notify`` calls happen OUTSIDE the lock so a slow or
+    # blocking sender does not stall other durable-state writers.
+    with _state_lock():
+        dispatch: list[tuple[str, str, str, str]] = []
+        changed = False
+        for entry_id, entry in list(_OUTBOX.items()):
+            target = entry.get("target")
+            result = entry.get("result")
+            worker_id = entry.get("worker_id")
+            if not isinstance(target, str) or not isinstance(result, Mapping):
+                _OUTBOX.pop(entry_id, None)
+                changed = True
+                continue
+            delivery_id = str(entry.get("delivery_id") or "")
+            if delivery_id and delivery_id in _DELIVERED_EVENTS:
+                _OUTBOX.pop(entry_id, None)
+                changed = True
+                continue
+            next_attempt_at = float(entry.get("next_attempt_at") or 0.0)
+            if next_attempt_at > now:
+                continue
+            message = _result_message(str(worker_id or "worker"), result)
+            if message is None:
+                _OUTBOX.pop(entry_id, None)
+                changed = True
+                continue
+            dispatch.append((entry_id, target, message[:4000], delivery_id))
+        if changed:
+            _persist_durable_state()
+
+    for entry_id, target, message, delivery_id in dispatch:
+        error: str | None = None
         try:
-            notify(target, message)
-        except Exception:
-            # The attempt is already durably recorded; retrying would risk
-            # a duplicate delivery, and this dispatch loop is the only path
-            # from the outbox to a receiver.
-            continue
+            notify(target, message, delivery_id)
+        except Exception as exc:
+            error = str(exc)[:600]
+
+        with _state_lock():
+            entry = _OUTBOX.get(entry_id)
+            if entry is None:
+                continue
+            if error is None:
+                if delivery_id:
+                    _DELIVERED_EVENTS.add(delivery_id)
+                _OUTBOX.pop(entry_id, None)
+                _persist_durable_state()
+                continue
+            attempts = int(entry.get("attempts") or 0) + 1
+            entry["attempts"] = attempts
+            entry["last_error"] = error
+            if attempts >= _OUTBOX_MAX_ATTEMPTS:
+                _OUTBOX.pop(entry_id, None)
+            else:
+                delay = min(
+                    _OUTBOX_BACKOFF_CAP_SECONDS,
+                    _OUTBOX_BACKOFF_BASE_SECONDS * (2 ** (attempts - 1)),
+                )
+                entry["next_attempt_at"] = _now() + delay
+            _persist_durable_state()
