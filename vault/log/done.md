@@ -9,6 +9,8 @@ updated: 2026-07-30
 
 ## 2026-07-30
 
+- **wiki-app** — WIKI-203 Codex turn/diff renderer merged — PR #139, 9 review rounds, live rolling diff artifact w/ pinned current-turn diff, bounded memory/bytes/files/hunk-headers, snapshot store split from run.json (https://github.com/hwang2409/wiki/pull/139)
+- **BASH-BRANCH-MERGE-MAIN** — agent-bash-recs-proto reconciled with main and pushed (0a1f5b8f93); worker archived
 - **wiki** — WIKI-217 supervisor fingerprint-swap wedge fixed (dev-client swap guard + early lock release + socket inode guard), merged 5017f26
 
 ## 2026-07-29

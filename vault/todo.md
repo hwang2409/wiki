@@ -45,7 +45,6 @@ Silky-smooth artifact rendering arc (Henry 2026-07-29):
 
 Unknown provider-stream renderer arc (Henry 2026-07-29 — audit of `disposition=unknown` events across last 50 runs; see backend/app/agent_runtime/normalizer.py classifier):
 
-- [P1] WIKI-203 Codex `turn/diff/updated` renderer (7,412 unknowns) — highest-frequency unknown. Live inline diff stream while Codex edits files. Render as compact rolling diff artifact w/ per-file grouping + collapse; update in place (don't re-render on each delta). backend/app/agent_runtime/normalizer.py:_normalize_codex — add to _CODEX_RENDERED_METHODS, wire into frontend event renderer
 - [P1] WIKI-204 Codex `item/reasoning/summaryPartAdded` classifier fix (6,902) — reasoning-summary delta miscategorized as unknown. Move to _CODEX_SUMMARIZED_METHODS alongside agentMessage/delta so it feeds the "thinking" affordance and doesn't leak into UI
 - [P2] WIKI-205 Codex `rawResponse/completed` classifier fix (6,332) — low-value telemetry envelope. Move to _CODEX_IGNORED_METHODS. Cuts unknown-count noise by ~1.5% per session
 - [P1] WIKI-206 Codex `item/commandExecution/terminalInteraction` renderer (1,328) — terminal stdin injection during interactive commands. Critical for visibility into what worker is typing at prompts. Render as stdin badge on the associated command execution card
