@@ -1497,7 +1497,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         if record.state in {LifecycleState.DEAD, LifecycleState.COMPLETED}:
             raise StoreConflict(f"{record.state.value} runs never resume")
         recovery_state = record.recovery_from_state or record.state
-        if recovery_state not in {LifecycleState.WORKING, LifecycleState.IDLE}:
+        if recovery_state not in {
+            LifecycleState.WORKING,
+            LifecycleState.WAITING_APPROVAL,
+            LifecycleState.IDLE,
+        }:
             raise StoreConflict(
                 f"state {recovery_state.value} is not eligible for exact-session resume"
             )
@@ -1513,7 +1517,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         # Request ids belong to the old transport generation. A resumed
         # provider must re-emit any still-actionable request before the UI can
         # answer it through the new adapter.
-        record = self.store.clear_pending_requests(run_id)
+        if recovery_state is not LifecycleState.WAITING_APPROVAL:
+            record = self.store.clear_pending_requests(run_id)
 
         adapter = self.adapter_factory(record)
         self._attach_adapter(record.run_id, adapter)
@@ -2102,6 +2107,24 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             async with self._agent_lock(snapshot.agent_id):
                 results.append(await self._recover_run(snapshot.run_id))
         return results
+
+    async def prepare_handover(self, run_ids: list[str]) -> dict[str, Any]:
+        """Drain provider transports while preserving durable run identity."""
+
+        drained: list[str] = []
+        for run_id in run_ids:
+            try:
+                record = self.store.get(run_id)
+            except RunNotFound:
+                continue
+            adapter = self.adapters.get(run_id)
+            if adapter is None:
+                continue
+            async with self._run_lock(run_id):
+                if self.adapters.get(run_id) is adapter:
+                    await self._quiesce_adapter_for_replacement(run_id, adapter)
+                    drained.append(record.run_id)
+        return {"drained_run_ids": drained}
 
     async def _recover_run(self, run_id: str) -> dict[str, str]:
         # Decision inputs are refreshed per run; no stale list snapshot can
@@ -3020,6 +3043,13 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             }
         if method == "supervisor/recover":
             return {"runs": await self.recover_on_start()}
+        if method == "supervisor/handover":
+            run_ids = params.get("run_ids")
+            if not isinstance(run_ids, list) or not all(
+                isinstance(run_id, str) and run_id for run_id in run_ids
+            ):
+                raise ValueError("run_ids must be a list of non-empty strings")
+            return await self.prepare_handover(run_ids)
         raise ValueError(f"unknown supervisor method: {method}")
 
     async def close(self) -> None:

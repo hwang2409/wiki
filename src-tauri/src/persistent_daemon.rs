@@ -12,8 +12,9 @@ use reqwest::blocking::Client;
 
 use crate::daemon_handshake;
 
-const DEFAULT_DAEMON_URL: &str = "http://127.0.0.1:8213/";
 const DEFAULT_DAEMON_LABEL: &str = "com.hwang2409.wiki.backend";
+const DEFAULT_DAEMON_PORT: u16 = 8213;
+const DAEMON_SETTINGS_NAME: &str = "daemon-settings.json";
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(350);
 const DAEMON_PROBE_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const DAEMON_PROBE_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -22,11 +23,13 @@ pub(crate) fn probe(
     runtime_dir: &Path,
     expected_fingerprint: &str,
 ) -> Result<Option<(String, String)>, String> {
-    if !daemon_may_be_starting(runtime_dir) {
+    let (label, port) = daemon_connection_settings(runtime_dir)?;
+    if !daemon_may_be_starting(runtime_dir, &label) {
         return Ok(None);
     }
     let launch_url = normalize_launch_url(
-        &env::var("WIKI_DAEMON_BACKEND_URL").unwrap_or_else(|_| DEFAULT_DAEMON_URL.to_string()),
+        &env::var("WIKI_DAEMON_BACKEND_URL")
+            .unwrap_or_else(|_| format!("http://127.0.0.1:{port}/")),
     );
     let health_url = health_url_for(&launch_url);
     let client = Client::builder()
@@ -68,7 +71,7 @@ pub(crate) fn probe(
             }
             if !health_matches_authenticated_peer(&payload, authenticated.pid, expected_fingerprint)
                 || !health_proof_matches(&payload, &authenticated.secret, &nonce)
-                || daemon_launchd_pid() != Some(authenticated.pid)
+                || daemon_launchd_pid(&label) != Some(authenticated.pid)
             {
                 return None;
             }
@@ -101,7 +104,34 @@ pub(crate) fn refresh_secret(
         expected_fingerprint,
     )
     .ok()?;
-    (daemon_launchd_pid() == Some(authenticated.pid)).then_some(authenticated.secret)
+    let (label, _) = daemon_connection_settings(runtime_dir).ok()?;
+    (daemon_launchd_pid(&label) == Some(authenticated.pid)).then_some(authenticated.secret)
+}
+
+fn daemon_connection_settings(runtime_dir: &Path) -> Result<(String, u16), String> {
+    let path = runtime_dir.join(DAEMON_SETTINGS_NAME);
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((DEFAULT_DAEMON_LABEL.to_string(), DEFAULT_DAEMON_PORT));
+        }
+        Err(error) => return Err(format!("cannot read daemon settings: {error}")),
+    };
+    let value: serde_json::Value = serde_json::from_str(&contents)
+        .map_err(|error| format!("invalid daemon settings: {error}"))?;
+    let label = value
+        .get("label")
+        .and_then(serde_json::Value::as_str)
+        .filter(|label| !label.is_empty())
+        .unwrap_or(DEFAULT_DAEMON_LABEL)
+        .to_string();
+    let port = value
+        .get("port")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|port| u16::try_from(port).ok())
+        .filter(|port| *port > 0)
+        .unwrap_or(DEFAULT_DAEMON_PORT);
+    Ok((label, port))
 }
 
 fn expected_backend_executable() -> Option<PathBuf> {
@@ -162,16 +192,16 @@ fn health_nonce() -> std::io::Result<String> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-fn daemon_may_be_starting(runtime_dir: &Path) -> bool {
+fn daemon_may_be_starting(runtime_dir: &Path, label: &str) -> bool {
     daemon_probe_should_wait(
-        daemon_launchd_job_loaded(),
+        daemon_launchd_job_loaded(label),
         daemon_socket_is_live(runtime_dir),
-        daemon_plist_exists(),
+        daemon_plist_exists(label),
     )
 }
 
-fn daemon_launchd_job_loaded() -> Option<bool> {
-    let target = format!("gui/{}/{}", unsafe { libc::getuid() }, DEFAULT_DAEMON_LABEL);
+fn daemon_launchd_job_loaded(label: &str) -> Option<bool> {
+    let target = format!("gui/{}/{}", unsafe { libc::getuid() }, label);
     let output = Command::new("launchctl")
         .args(["print", target.as_str()])
         .output()
@@ -185,8 +215,8 @@ fn daemon_launchd_job_loaded() -> Option<bool> {
     None
 }
 
-fn daemon_launchd_pid() -> Option<u32> {
-    let target = format!("gui/{}/{}", unsafe { libc::getuid() }, DEFAULT_DAEMON_LABEL);
+fn daemon_launchd_pid(label: &str) -> Option<u32> {
+    let target = format!("gui/{}/{}", unsafe { libc::getuid() }, label);
     let output = Command::new("launchctl")
         .args(["print", target.as_str()])
         .output()
@@ -204,18 +234,14 @@ fn daemon_socket_is_live(runtime_dir: &Path) -> bool {
     path.exists() && daemon_handshake::read_secret(runtime_dir).is_ok()
 }
 
-fn daemon_plist_exists() -> bool {
+fn daemon_plist_exists(label: &str) -> bool {
     let launch_agents = env::var_os("WIKI_LAUNCH_AGENTS_DIR")
         .map(PathBuf::from)
         .or_else(|| {
             env::var_os("HOME").map(|home| PathBuf::from(home).join("Library/LaunchAgents"))
         });
     launch_agents
-        .map(|directory| {
-            directory
-                .join(format!("{DEFAULT_DAEMON_LABEL}.plist"))
-                .is_file()
-        })
+        .map(|directory| directory.join(format!("{label}.plist")).is_file())
         .unwrap_or(false)
 }
 
@@ -276,8 +302,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        daemon_probe_should_wait, health_matches_authenticated_peer, health_proof_matches,
-        retry_until_ready,
+        daemon_connection_settings, daemon_probe_should_wait, health_matches_authenticated_peer,
+        health_proof_matches, retry_until_ready, DAEMON_SETTINGS_NAME,
     };
 
     #[test]
@@ -326,5 +352,24 @@ mod tests {
             "daemon-secret",
             "nonce"
         ));
+    }
+
+    #[test]
+    fn probe_uses_persisted_non_default_port_and_label() {
+        let runtime = std::env::temp_dir().join(format!(
+            "wiki-native-daemon-settings-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&runtime).unwrap();
+        std::fs::write(
+            runtime.join(DAEMON_SETTINGS_NAME),
+            r#"{"label":"com.example.wiki.test","port":9321}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            daemon_connection_settings(&runtime).unwrap(),
+            ("com.example.wiki.test".to_string(), 9321)
+        );
+        std::fs::remove_dir_all(runtime).unwrap();
     }
 }

@@ -280,6 +280,22 @@ class SupervisorClient:
                 time.sleep(0.05)
         raise SupervisorUnavailable(f"supervisor did not become ready: {last_error}")
 
+    def prepare_for_handover(self) -> list[dict[str, Any]]:
+        """Drain the current supervisor while preserving run and session ids."""
+
+        runs = self._active_runs_for_swap()
+        result = self.request(
+            "supervisor/handover",
+            {"run_ids": [str(run["run_id"]) for run in runs]},
+        )
+        drained = result.get("drained_run_ids") if isinstance(result, dict) else None
+        expected = {str(run["run_id"]) for run in runs}
+        if not isinstance(drained, list) or set(drained) != expected:
+            raise SupervisorUnavailable(
+                "supervisor handover did not drain every active provider"
+            )
+        return runs
+
     def _active_runs_for_swap(self) -> list[dict[str, Any]]:
         """Snapshot current runs whose provider transport must cross the swap."""
 

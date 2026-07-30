@@ -13,22 +13,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from backend.app import daemon as backend_daemon
 
-DEFAULT_LABEL = "com.hwang2409.wiki.backend"
-
-
-def _launch_agents_dir() -> Path:
-    return Path(
-        os.environ.get("WIKI_LAUNCH_AGENTS_DIR")
-        or Path.home() / "Library" / "LaunchAgents"
-    ).expanduser()
-
-
 def _daemon_is_installed(
     runtime_dir: Path,
     *,
     launchctl: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> bool:
-    target = f"gui/{os.getuid()}/{DEFAULT_LABEL}"
+    config = backend_daemon.config_from_env(
+        overrides={"WIKI_AGENT_RUNTIME_DIR": str(runtime_dir)}
+    )
+    target = config.target
     try:
         result = launchctl(
             ["launchctl", "print", target],
@@ -38,7 +31,7 @@ def _daemon_is_installed(
         )
     except OSError:
         result = None
-    plist = _launch_agents_dir() / f"{DEFAULT_LABEL}.plist"
+    plist = config.plist_path
     return (result is not None and result.returncode == 0) or plist.is_file()
 
 

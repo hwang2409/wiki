@@ -44,6 +44,7 @@ DEFAULT_WIKI_APP_PATH = Path(
 HEALTH_TIMEOUT_SECONDS = 15.0
 HEALTH_POLL_SECONDS = 0.2
 DAEMON_TRANSACTION_LOCK_NAME = "daemon.transaction.lock"
+DAEMON_SETTINGS_NAME = "daemon-settings.json"
 
 
 class DaemonError(RuntimeError):
@@ -128,6 +129,28 @@ def hold_daemon_transaction_lock(runtime_dir: Path | str):
         handle.close()
 
 
+def daemon_settings_path(runtime_dir: Path | str) -> Path:
+    return Path(runtime_dir).expanduser() / DAEMON_SETTINGS_NAME
+
+
+def _load_daemon_settings(runtime_dir: Path) -> dict[str, object]:
+    path = daemon_settings_path(runtime_dir)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _write_daemon_settings(config: DaemonConfig) -> None:
+    content = json.dumps(
+        {"label": config.label, "port": config.port},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8") + b"\n"
+    _write_atomic(daemon_settings_path(config.runtime_dir), content, 0o600)
+
+
 def _repo_dir() -> Path:
     return Path(__file__).resolve().parents[2]
 
@@ -143,6 +166,9 @@ def config_from_env(*, overrides: dict[str, str | None] | None = None) -> Daemon
     runtime_dir = Path(
         values.get("WIKI_AGENT_RUNTIME_DIR") or Path.home() / ".wiki" / "agent-runtime"
     ).expanduser().absolute()
+    settings = _load_daemon_settings(runtime_dir)
+    stored_label = settings.get("label")
+    stored_port = settings.get("port")
     executable_raw = values.get("WIKI_BACKEND_EXECUTABLE")
     app_path = Path(values.get("WIKI_APP_PATH") or DEFAULT_WIKI_APP_PATH)
     executable = Path(
@@ -165,8 +191,17 @@ def config_from_env(*, overrides: dict[str, str | None] | None = None) -> Daemon
     if not 1 <= port <= 65535:
         raise DaemonError("backend port must be between 1 and 65535")
     return DaemonConfig(
-        label=values.get("WIKI_DAEMON_LABEL") or DEFAULT_LABEL,
-        port=port,
+        label=values.get("WIKI_DAEMON_LABEL")
+        or (stored_label if isinstance(stored_label, str) else DEFAULT_LABEL),
+        port=(
+            port
+            if values.get("WIKI_BACKEND_PORT")
+            else (
+                stored_port
+                if isinstance(stored_port, int) and 1 <= stored_port <= 65535
+                else DEFAULT_PORT
+            )
+        ),
         repo_dir=repo_dir,
         vault_dir=vault_dir,
         runtime_dir=runtime_dir,
@@ -475,6 +510,7 @@ def _install_unlocked(config: DaemonConfig) -> dict[str, object]:
                 f"cannot load {config.plist_path}: {_describe_failure(loaded)}"
             )
         _wait_for_healthy(config)
+        _write_daemon_settings(config)
     except Exception as error:
         rollback_errors = _rollback_install(
             config, backup, was_loaded, bootstrap_attempted, prior
@@ -525,6 +561,12 @@ def _uninstall_unlocked(config: DaemonConfig) -> dict[str, object]:
     except OSError as exc:
         raise DaemonError(
             f"service unloaded but uninstall backup cleanup failed: {exc}"
+        ) from exc
+    try:
+        daemon_settings_path(config.runtime_dir).unlink(missing_ok=True)
+    except OSError as exc:
+        raise DaemonError(
+            f"service unloaded but daemon settings cleanup failed: {exc}"
         ) from exc
     return {
         "label": config.label,

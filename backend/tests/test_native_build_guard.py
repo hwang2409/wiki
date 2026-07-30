@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from backend.app.native_lifecycle import hold_app_lock, hold_runtime_locks
 import scripts.atomic_swap as atomic_swap_module
+import scripts.native_swap_transaction as native_swap_transaction
 from scripts.atomic_swap import atomic_replace, rollback_replace
 from scripts.native_build_guard import inspect_runtime
 from scripts.native_daemon_restart import restart_daemon_if_installed
@@ -154,7 +155,13 @@ class NativeBuildGuardTests(TestCase):
             runtime_dir = root / "runtime"
             launch_agents = root / "LaunchAgents"
             launch_agents.mkdir()
-            (launch_agents / "com.hwang2409.wiki.backend.plist").write_text(
+            runtime_dir.mkdir()
+            daemon_settings = runtime_dir / "daemon-settings.json"
+            daemon_settings.write_text(
+                '{"label":"com.example.wiki.custom","port":19321}\n',
+                encoding="utf-8",
+            )
+            (launch_agents / "com.example.wiki.custom.plist").write_text(
                 "old daemon plist", encoding="utf-8"
             )
             launchctl_calls: list[list[str]] = []
@@ -186,6 +193,10 @@ class NativeBuildGuardTests(TestCase):
                 )
 
             self.assertEqual(len(launchctl_calls), 1)
+            self.assertEqual(
+                launchctl_calls[0][-1],
+                f"gui/{os.getuid()}/com.example.wiki.custom",
+            )
             self.assertEqual(len(command_calls), 1)
             command_args, command_env = command_calls[0]
             self.assertEqual(command_args[-3:], ["daemon", "install", "--json"])
@@ -282,6 +293,45 @@ class NativeBuildGuardTests(TestCase):
                     process.wait(timeout=5)
                 if process.stderr:
                     process.stderr.close()
+
+    def test_swap_rejects_stale_supervisor_pid_before_signal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Path(tmp)
+            (runtime / "supervisor.lock").touch()
+            (runtime / "supervisor.pid").write_text("1234\n", encoding="utf-8")
+            with hold_app_lock(runtime), patch.object(
+                native_swap_transaction, "_supervisor_peer_pid", return_value=5678
+            ):
+                # Keep the lock held in a separate descriptor so the swap must
+                # inspect the PID instead of taking the lock itself.
+                with (runtime / "supervisor.lock").open("a+b") as lock:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                    with self.assertRaisesRegex(RuntimeError, "PID mismatch"):
+                        native_swap_transaction._stop_supervisor(runtime)
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    def test_swap_rejects_pid_reuse_from_authenticated_rpc(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Path(tmp)
+            (runtime / "supervisor.lock").touch()
+            (runtime / "supervisor.pid").write_text("1234\n", encoding="utf-8")
+            with (
+                patch.object(
+                    native_swap_transaction,
+                    "_supervisor_peer_pid",
+                    return_value=1234,
+                ),
+                patch.object(
+                    native_swap_transaction.SupervisorClient,
+                    "ping",
+                    return_value={"status": "ok", "pid": 5678},
+                ),
+            ):
+                with (runtime / "supervisor.lock").open("a+b") as lock:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                    with self.assertRaisesRegex(RuntimeError, "RPC PID"):
+                        native_swap_transaction._stop_supervisor(runtime)
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
     def test_swap_keeps_competing_process_out_during_restart_and_rollback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

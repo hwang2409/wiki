@@ -1400,7 +1400,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(current.desired_model)
         self.assertIn(record.run_id, self.supervisor.adapters)
 
-    async def test_recovery_resumes_only_current_working_and_idle_with_dead_pid(
+    async def test_recovery_resumes_current_sessions_with_dead_pid(
         self,
     ) -> None:
         await self.supervisor.close()
@@ -1445,7 +1445,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(by_id[records["idle"].run_id]["action"], "resume")
             self.assertEqual(by_id[records["starting"].run_id]["action"], "block")
             self.assertEqual(
-                by_id[records["waiting-approval"].run_id]["action"], "block"
+                by_id[records["waiting-approval"].run_id]["action"], "resume"
             )
             self.assertEqual(by_id[records["dead"].run_id]["action"], "skip")
             self.assertEqual(by_id[records["completed"].run_id]["action"], "skip")
@@ -1457,7 +1457,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(
                 store.get(records["waiting-approval"].run_id).state,
-                LifecycleState.BLOCKED,
+                LifecycleState.IDLE,
             )
             self.assertEqual(
                 store.get(records["starting"].run_id).state,
@@ -1466,6 +1466,61 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await supervisor.close()
         # Keep tearDown from closing the already-closed original twice.
+        self.supervisor = Supervisor(self.store, FixtureAdapterFactory(FIXTURES))
+
+    async def test_handover_preserves_working_idle_waiting_runs_and_sessions(self) -> None:
+        records: list[RunRecord] = []
+        for index, state in enumerate(
+            (
+                LifecycleState.WORKING,
+                LifecycleState.IDLE,
+                LifecycleState.WAITING_APPROVAL,
+            ),
+            start=1,
+        ):
+            record = await self.supervisor.start_run(
+                agent_id=f"WIKI-HANDOVER-{index}",
+                provider=ProviderKind.CLAUDE,
+                role="implement",
+                model="fixture-claude",
+                effort=None,
+                worktree=str(self.worktree),
+                prompt=f"handover-{index}",
+            )
+            session_id = f"handover-session-{index}"
+            adapter_status = AdapterStatus(state, session_id, os.getpid(), generation=1)
+            record = self.store.transition(
+                record.run_id,
+                state,
+                adapter_status=adapter_status,
+            )
+            records.append(record)
+
+        saved = [
+            {
+                "run_id": record.run_id,
+                "agent_id": record.agent_id,
+                "provider_session_id": record.provider_session_id,
+            }
+            for record in records
+        ]
+        result = await self.supervisor.prepare_handover([record.run_id for record in records])
+        self.assertEqual(set(result["drained_run_ids"]), {record.run_id for record in records})
+        await self.supervisor.close()
+        replacement = Supervisor(
+            RunStore(self.paths),
+            FixtureAdapterFactory(FIXTURES, pid=os.getpid()),
+            pid_alive=lambda _pid: False,
+        )
+        try:
+            await replacement.recover_on_start()
+            for expected in saved:
+                current = replacement.store.get(expected["run_id"])
+                self.assertEqual(current.run_id, expected["run_id"])
+                self.assertEqual(current.provider_session_id, expected["provider_session_id"])
+                self.assertEqual(current.agent_id, expected["agent_id"])
+        finally:
+            await replacement.close()
         self.supervisor = Supervisor(self.store, FixtureAdapterFactory(FIXTURES))
 
     async def test_recovery_rechecks_live_orphan_then_resumes_exact_session(

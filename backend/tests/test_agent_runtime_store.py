@@ -496,13 +496,13 @@ class ProtocolFixtureTests(unittest.TestCase):
 
 
 class LifecycleTests(unittest.TestCase):
-    def test_restart_recovery_table_is_closed_and_only_working_idle_resume(
+    def test_restart_recovery_table_is_closed_and_resumable_sessions(
         self,
     ) -> None:
         expected = {
             LifecycleState.STARTING: RecoveryAction.BLOCK,
             LifecycleState.WORKING: RecoveryAction.RESUME,
-            LifecycleState.WAITING_APPROVAL: RecoveryAction.BLOCK,
+            LifecycleState.WAITING_APPROVAL: RecoveryAction.RESUME,
             LifecycleState.IDLE: RecoveryAction.RESUME,
             LifecycleState.INTERRUPTED: RecoveryAction.SKIP,
             LifecycleState.DEAD: RecoveryAction.SKIP,

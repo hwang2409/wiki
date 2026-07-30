@@ -119,7 +119,10 @@ ALLOWED_STATE_TRANSITIONS: dict[LifecycleState, frozenset[LifecycleState]] = {
 RESTART_RECOVERY_TABLE: dict[LifecycleState, RecoveryAction] = {
     LifecycleState.STARTING: RecoveryAction.BLOCK,
     LifecycleState.WORKING: RecoveryAction.RESUME,
-    LifecycleState.WAITING_APPROVAL: RecoveryAction.BLOCK,
+    # A supervisor handover closes the provider transport without changing
+    # durable run state. The next supervisor can resume the exact session and
+    # let the provider re-emit its pending approval request.
+    LifecycleState.WAITING_APPROVAL: RecoveryAction.RESUME,
     LifecycleState.IDLE: RecoveryAction.RESUME,
     LifecycleState.INTERRUPTED: RecoveryAction.SKIP,
     LifecycleState.DEAD: RecoveryAction.SKIP,
@@ -428,7 +431,7 @@ def restart_recovery_decision(
         RecoveryAction.BLOCK: (
             "provider start did not finish"
             if recovery_state is LifecycleState.STARTING
-            else "pending approval cannot be reconstructed safely"
+            else "pending approval session will be resumed"
         ),
         RecoveryAction.SKIP: f"state {recovery_state.value} is not auto-resumable",
     }

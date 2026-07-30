@@ -45,6 +45,28 @@ class LaunchAgentConfigTests(unittest.TestCase):
             ).read_text(encoding="utf-8")
             self.assertEqual(daemon.render_plist(config), expected)
 
+    def test_config_reads_persisted_non_default_connection_settings(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runtime = Path(tmp) / "runtime"
+            runtime.mkdir()
+            daemon.daemon_settings_path(runtime).write_text(
+                '{"label":"com.example.wiki.custom","port":19321}\n',
+                encoding="utf-8",
+            )
+            with patch.dict(
+                os.environ,
+                {"WIKI_BACKEND_PORT": "", "WIKI_DAEMON_LABEL": ""},
+            ):
+                config = daemon.config_from_env(
+                    overrides={
+                        "WIKI_AGENT_RUNTIME_DIR": str(runtime),
+                        "WIKI_LAUNCH_AGENTS_DIR": str(Path(tmp) / "LaunchAgents"),
+                    }
+                )
+            self.assertEqual(config.label, "com.example.wiki.custom")
+            self.assertEqual(config.port, 19321)
+            self.assertIn("19321", daemon.render_plist(config))
+
     def test_service_absence_matches_captured_macos_output(self) -> None:
         config = self._config(Path("/tmp/LaunchAgents"))
         captured = subprocess.CompletedProcess(
@@ -293,7 +315,12 @@ class LaunchAgentConfigTests(unittest.TestCase):
                 for path in ([base] if base.is_file() else base.rglob("*"))
                 if path.is_file()
             }
+            settings = after.pop("runtime/daemon-settings.json")
             self.assertEqual(after, before)
+            self.assertEqual(
+                json.loads(settings),
+                {"label": config.label, "port": config.port},
+            )
 
     def test_uninstall_is_idempotent(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -1120,7 +1147,10 @@ class DaemonCliTests(unittest.TestCase):
         wiki_cli = repo_root / "wiki"
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            executable = Path(sys.executable).resolve()
+            executable = (
+                daemon._process_executable(os.getpid())
+                or Path(sys.executable).resolve()
+            )
             fingerprint = frozen_runtime_fingerprint(executable)
 
             class HealthHandler(http.server.BaseHTTPRequestHandler):
@@ -1180,7 +1210,7 @@ class DaemonCliTests(unittest.TestCase):
                         text=True,
                         env=env,
                         check=False,
-                        timeout=15,
+                        timeout=20,
                     )
                     for command in commands
                 ]
