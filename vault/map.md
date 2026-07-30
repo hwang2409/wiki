@@ -99,6 +99,10 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 
 - [[public-hook-adapter]] — Architecture: public mitmproxy hook addon and independent UI; private mitmweb API rejected
 
+## Wiki-app
+
+- [[supervisor-fingerprint-swap-wedge]] — dev-code clients kill the prod agent supervisor via fingerprint swap; shutdown wedges holding the lock
+
 ## Families (path patterns, not enumerated)
 
 - `log/YYYY-MM-DD.md` — daily end-of-day changelogs, cross-project.

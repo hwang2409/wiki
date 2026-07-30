@@ -15,7 +15,7 @@ from uuid import uuid4
 
 from .protocol import MAX_PROTOCOL_LINE_BYTES
 from .store import RuntimePaths
-from .version import RUNTIME_FINGERPRINT
+from .version import RUNTIME_FINGERPRINT, RUNTIME_FROZEN
 
 
 DEFAULT_SWAP_DRAIN_SECONDS = 10.0
@@ -87,6 +87,7 @@ class SupervisorClient:
         *,
         timeout: float | None = None,
         runtime_fingerprint: str = RUNTIME_FINGERPRINT,
+        runtime_frozen: bool = RUNTIME_FROZEN,
         swap_drain_seconds: float = DEFAULT_SWAP_DRAIN_SECONDS,
     ):
         if swap_drain_seconds < 0:
@@ -94,6 +95,7 @@ class SupervisorClient:
         self.paths = paths
         self.timeout = timeout
         self.runtime_fingerprint = runtime_fingerprint
+        self.runtime_frozen = runtime_frozen
         self.swap_drain_seconds = swap_drain_seconds
 
     def _timeout_for(self, method: str) -> float:
@@ -244,6 +246,11 @@ class SupervisorClient:
                 # Isolated test and externally managed supervisors predate the
                 # fingerprint field. With autostart disabled, use the server
                 # the caller deliberately supplied instead of replacing it.
+                return health
+            if not self.runtime_frozen:
+                # Only the bundled app upgrades the supervisor. Dev checkouts
+                # and worktrees always mismatch the frozen fingerprint and
+                # would swap-kill the live supervisor on every run (WIKI-217).
                 return health
             if not autostart_enabled:
                 raise SupervisorUnavailable(
