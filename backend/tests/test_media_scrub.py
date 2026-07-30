@@ -1450,14 +1450,32 @@ class GifRound7ExtensionProbes(unittest.TestCase):
             media_scrub.scrub_video(bytes(payload), "image/gif")
 
     def test_image_descriptor_flags_and_lzw_data_are_preserved(self) -> None:
-        image_descriptor = b"\x2c" + struct.pack("<HHHH", 0, 0, 4, 2) + b"\x60"
+        image_descriptor = b"\x2c" + struct.pack("<HHHH", 0, 0, 4, 2) + b"\xe1"
+        palette = bytes(range(12))
+        lzw = b"\x02\x02\x44\x01\x00"
+        payload = self._min_gif_prefix() + image_descriptor + palette + lzw + b"\x3b"
+        result = media_scrub.scrub_video(payload, "image/gif")
+        output_descriptor = result.data.find(b"\x2c")
+        self.assertGreater(output_descriptor, 0)
+        self.assertEqual(result.data[output_descriptor + 9], 0xe1)
+        self.assertTrue(result.data.endswith(image_descriptor + palette + lzw + b"\x3b"))
+
+    def test_false_global_table_fields_are_zeroed(self) -> None:
+        payload = bytearray(self._min_gif_prefix() + self._min_gif_image_data())
+        payload[10] = 0x78  # ignored color-resolution, sort, and size fields
+        payload[11] = 0x47  # ignored background index without a GCT
+        result = media_scrub.scrub_video(bytes(payload), "image/gif")
+        self.assertEqual(result.data[10:12], b"\x00\x00")
+        self.assertTrue(result.data.endswith(self._min_gif_image_data()))
+
+    def test_false_local_table_fields_are_zeroed_but_interlace_survives(self) -> None:
+        image_descriptor = b"\x2c" + struct.pack("<HHHH", 0, 0, 4, 2) + b"\x67"
         lzw = b"\x02\x02\x44\x01\x00"
         payload = self._min_gif_prefix() + image_descriptor + lzw + b"\x3b"
         result = media_scrub.scrub_video(payload, "image/gif")
         output_descriptor = result.data.find(b"\x2c")
-        self.assertGreater(output_descriptor, 0)
-        self.assertEqual(result.data[output_descriptor + 9], 0x60)
-        self.assertTrue(result.data.endswith(image_descriptor + lzw + b"\x3b"))
+        self.assertEqual(result.data[output_descriptor + 9], 0x40)
+        self.assertTrue(result.data.endswith(b"\x2c" + image_descriptor[1:9] + b"\x40" + lzw + b"\x3b"))
 
     def test_unknown_application_extension_is_dropped(self) -> None:
         marker = b"round7-adobe-marker"
@@ -2050,6 +2068,106 @@ class Mp4Round10FullBoxFlagProbes(unittest.TestCase):
         payload[flag_offset:flag_offset + 3] = self.FLAG_MARKER
         with self.assertRaisesRegex(
             media_scrub.MediaScrubError, "fullbox flags"
+        ):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+
+class Mp4Round11CorrectnessProbes(unittest.TestCase):
+    @staticmethod
+    def _replace_inner_box(
+        real: bytes, old_type: bytes, replacement: bytes,
+    ) -> bytes:
+        old_pos = real.find(old_type)
+        assert old_pos > 0
+        old_size = struct.unpack(">I", real[old_pos - 4:old_pos])[0]
+        old_atom_start = old_pos - 4
+        payload = bytearray(real)
+        payload[old_atom_start:old_atom_start + old_size] = replacement
+        delta = len(replacement) - old_size
+        for parent in (b"avc1", b"stsd", b"stbl", b"minf", b"mdia", b"trak", b"moov"):
+            pos = payload.rfind(parent, 0, old_atom_start)
+            existing = struct.unpack(">I", bytes(payload[pos - 4:pos]))[0]
+            payload[pos - 4:pos] = struct.pack(">I", existing + delta)
+        return bytes(payload)
+
+    def test_empty_avcc_is_rejected_for_avc1(self) -> None:
+        real = REAL_MP4.read_bytes()
+        avcc_pos = real.find(b"avcC")
+        assert avcc_pos > 0
+        old_size = struct.unpack(">I", real[avcc_pos - 4:avcc_pos])[0]
+        body = real[avcc_pos + 4:avcc_pos - 4 + old_size]
+        empty_body = bytes([1, body[1], body[2], body[3], body[4], 0xe0, 0])
+        replacement = struct.pack(">I", 8 + len(empty_body)) + b"avcC" + empty_body
+        payload = self._replace_inner_box(real, b"avcC", replacement)
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "avc1 avcC requires at least one SPS"
+        ):
+            media_scrub.scrub_video(payload, "video/mp4")
+
+    def test_avcc_header_mismatch_with_canonical_sps_is_rejected(self) -> None:
+        real = bytearray(REAL_MP4.read_bytes())
+        avcc_pos = real.find(b"avcC")
+        assert avcc_pos > 0
+        real[avcc_pos + 6] ^= 0x01  # compatibility byte, not the SPS
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError,
+            "header profile/compatibility/level mismatches canonical SPS",
+        ):
+            media_scrub.scrub_video(bytes(real), "video/mp4")
+
+    def test_multiple_matching_sps_records_are_supported(self) -> None:
+        real = REAL_MP4.read_bytes()
+        avcc_pos = real.find(b"avcC")
+        assert avcc_pos > 0
+        old_size = struct.unpack(">I", real[avcc_pos - 4:avcc_pos])[0]
+        body = real[avcc_pos + 4:avcc_pos - 4 + old_size]
+        offset = 6
+        sps: list[bytes] = []
+        for _ in range(body[5] & 0x1f):
+            sps_len = struct.unpack(">H", body[offset:offset + 2])[0]
+            offset += 2
+            sps.append(body[offset:offset + sps_len])
+            offset += sps_len
+        num_pps = body[offset]
+        pps_start = offset + 1
+        pps_bytes = body[pps_start:]
+        duplicate_body = (
+            body[:5]
+            + bytes([0xe0 | (len(sps) + 1)])
+            + b"".join(struct.pack(">H", len(item)) + item for item in sps)
+            + struct.pack(">H", len(sps[0]))
+            + sps[0]
+            + bytes([num_pps])
+            + pps_bytes
+        )
+        replacement = struct.pack(">I", 8 + len(duplicate_body)) + b"avcC" + duplicate_body
+        payload = self._replace_inner_box(real, b"avcC", replacement)
+        result = media_scrub.scrub_video(payload, "video/mp4")
+        self.assertIn(b"avcC", result.data)
+
+    def test_nclx_reserved_low_bits_are_rejected(self) -> None:
+        body = b"nclx" + struct.pack(">HHH", 1, 2, 3) + b"\x81"
+        replacement = struct.pack(">I", 8 + len(body)) + b"colr" + body
+        payload = self._replace_inner_box(REAL_MP4.read_bytes(), b"pasp", replacement)
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "full_range_flag has reserved low bits"
+        ):
+            media_scrub.scrub_video(payload, "video/mp4")
+
+    def test_nclx_full_range_flag_is_preserved(self) -> None:
+        body = b"nclx" + struct.pack(">HHH", 1, 2, 3) + b"\x80"
+        replacement = struct.pack(">I", 8 + len(body)) + b"colr" + body
+        payload = self._replace_inner_box(REAL_MP4.read_bytes(), b"pasp", replacement)
+        result = media_scrub.scrub_video(payload, "video/mp4")
+        self.assertIn(b"colr" + body, result.data)
+
+    def test_direct_frma_inside_avc1_is_rejected(self) -> None:
+        payload = bytearray(REAL_MP4.read_bytes())
+        frma_pos = bytes(payload).find(b"pasp")
+        assert frma_pos > 0
+        payload[frma_pos:frma_pos + 4] = b"frma"
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "sample entry inner box .* outside allowlist"
         ):
             media_scrub.scrub_video(bytes(payload), "video/mp4")
 

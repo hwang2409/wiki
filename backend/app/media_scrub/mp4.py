@@ -80,7 +80,15 @@ _MP4_AUDIO_ENTRIES: Final = {b"mp4a"}
 # and the encryption tree sinf/schm/schi/tenc) are OUT — files using
 # them are rejected under strict-subset acceptance.
 _MP4_SAMPLE_ENTRY_INNER_ALLOWED: Final = {
-    b"avcC", b"btrt", b"pasp", b"colr", b"frma",
+    b"avcC", b"btrt", b"pasp", b"colr",
+}
+_MP4_SAMPLE_ENTRY_REQUIRED_CONFIG: Final = {
+    b"avc1": b"avcC",
+    b"avc3": b"avcC",
+    b"hev1": b"hvcC",
+    b"hvc1": b"hvcC",
+    b"mp4v": b"esds",
+    b"mp4a": b"esds",
 }
 # Additional stbl children beyond stsd. Every allowed type below has a
 # field-level rebuild via struct.pack that emits exactly the parsed
@@ -1081,15 +1089,12 @@ def _rebuild_sample_entry(entry_type: bytes, entry_bytes: bytes) -> bytes:
             f"mp4 sample entry type {entry_type!r} outside allowlist"
         )
 
-    inner_boxes = _walk_sample_entry_inner_boxes(entry_bytes, inner_start)
-    required_config = {
-        b"avc1": b"avcC",
-        b"avc3": b"avcC",
-        b"hev1": b"hvcC",
-        b"hvc1": b"hvcC",
-        b"mp4v": b"esds",
-        b"mp4a": b"esds",
-    }[entry_type]
+    inner_boxes = _walk_sample_entry_inner_boxes(
+        entry_bytes,
+        inner_start,
+        entry_type=entry_type,
+    )
+    required_config = _MP4_SAMPLE_ENTRY_REQUIRED_CONFIG[entry_type]
     inner_types = [box[4:8] for box in inner_boxes]
     if inner_types.count(required_config) != 1:
         raise MediaScrubError(
@@ -1207,10 +1212,14 @@ def _rebuild_inner_colr(body: bytes) -> bytes:
         transfer = struct.unpack(">H", payload[2:4])[0]
         matrix = struct.unpack(">H", payload[4:6])[0]
         full_range = payload[6]
+        if full_range & 0x7F:
+            raise MediaScrubError(
+                "mp4 colr(nclx) full_range_flag has reserved low bits set"
+            )
         rebuilt = (
             b"nclx"
             + struct.pack(">HHH", primaries, transfer, matrix)
-            + bytes([full_range])
+            + bytes([full_range & 0x80])
         )
     elif colour_type == b"nclc":
         if len(payload) != 6:
@@ -1228,16 +1237,12 @@ def _rebuild_inner_colr(body: bytes) -> bytes:
     return _pack(b"colr", rebuilt)
 
 
-def _rebuild_inner_frma(body: bytes) -> bytes:
-    # frma body: original_format (4 bytes, a 4-CC).
-    if len(body) != 4:
-        raise MediaScrubError(
-            f"mp4 frma body length {len(body)} not the 4-byte spec size"
-        )
-    return _pack(b"frma", body)
-
-
-def _walk_sample_entry_inner_boxes(entry_bytes: bytes, inner_start: int) -> list[bytes]:
+def _walk_sample_entry_inner_boxes(
+    entry_bytes: bytes,
+    inner_start: int,
+    *,
+    entry_type: bytes,
+) -> list[bytes]:
     """Rebuild each inner box from parsed fields. No opaque body copy
     path remains: every allowlisted type dispatches to a struct.pack
     rebuild that reads specific fields; anything not in the allowlist
@@ -1260,15 +1265,18 @@ def _walk_sample_entry_inner_boxes(entry_bytes: bytes, inner_start: int) -> list
             )
         body = entry_bytes[offset + 8:offset + box_size]
         if box_type == b"avcC":
-            out.append(_rebuild_inner_avcC(body))
+            out.append(
+                _rebuild_inner_avcC(
+                    body,
+                    require_parameter_sets=entry_type == b"avc1",
+                )
+            )
         elif box_type == b"btrt":
             out.append(_rebuild_inner_btrt(body))
         elif box_type == b"pasp":
             out.append(_rebuild_inner_pasp(body))
         elif box_type == b"colr":
             out.append(_rebuild_inner_colr(body))
-        elif box_type == b"frma":
-            out.append(_rebuild_inner_frma(body))
         else:  # pragma: no cover — allowlist above already gated
             raise MediaScrubError(
                 f"mp4 sample entry inner box {box_type!r} missing rebuilder"
@@ -1277,7 +1285,11 @@ def _walk_sample_entry_inner_boxes(entry_bytes: bytes, inner_start: int) -> list
     return out
 
 
-def _rebuild_inner_avcC(body: bytes) -> bytes:
+def _rebuild_inner_avcC(
+    body: bytes,
+    *,
+    require_parameter_sets: bool = False,
+) -> bytes:
     """AVC decoder configuration record — ISO/IEC 14496-15.
 
     Layout:
@@ -1356,6 +1368,26 @@ def _rebuild_inner_avcC(body: bytes) -> bytes:
             raise MediaScrubError("mp4 avcC canonical PPS exceeds uint16 length")
         pps_list.append(canonical)
         offset += pps_len
+
+    if require_parameter_sets and not sps_list:
+        raise MediaScrubError("mp4 avc1 avcC requires at least one SPS")
+    if require_parameter_sets and not pps_list:
+        raise MediaScrubError("mp4 avc1 avcC requires at least one PPS")
+
+    if sps_list:
+        # Multiple-SPS rule: every canonical SPS must share the first SPS's
+        # profile/compatibility/level triple, and avcC must match it. avc3
+        # may have no SPS because its parameter sets can be in-band.
+        canonical_header = sps_list[0][1:4]
+        if any(sps[1:4] != canonical_header for sps in sps_list[1:]):
+            raise MediaScrubError(
+                "mp4 avcC SPS records disagree on profile/compatibility/level"
+            )
+        if bytes([profile, compat, level]) != canonical_header:
+            raise MediaScrubError(
+                "mp4 avcC header profile/compatibility/level mismatches canonical SPS"
+            )
+        profile, compat, level = canonical_header
 
     rebuilt_body = (
         bytes([1, profile, compat, level, lsm_byte, 0xE0 | num_sps])

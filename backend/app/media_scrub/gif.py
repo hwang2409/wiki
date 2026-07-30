@@ -123,6 +123,8 @@ def scrub_gif(data: bytes) -> MediaScrubResult:
     global_ct_flag = packed & 0x80
     global_ct_entries = 1 << ((packed & 0x07) + 1) if global_ct_flag else 0
     global_ct_size = 3 * global_ct_entries
+    canonical_packed = packed if global_ct_flag else 0
+    canonical_background_color_index = background_color_index if global_ct_flag else 0
 
     lsd_end = 13 + global_ct_size
     if lsd_end > len(data):
@@ -135,8 +137,8 @@ def scrub_gif(data: bytes) -> MediaScrubResult:
     # any byte would corrupt the pixels.
     out = bytearray(header)
     out.extend(struct.pack("<HH", width, height))
-    out.append(packed)
-    out.append(background_color_index)
+    out.append(canonical_packed)
+    out.append(canonical_background_color_index)
     out.append(pixel_aspect_ratio)
     if global_ct_flag:
         out.extend(data[13:lsd_end])
@@ -289,10 +291,15 @@ def _emit_image_descriptor(
         raise MediaScrubError(
             "gif image descriptor packed byte has reserved bits set"
         )
-    local_packed_canonical = local_packed & _GIF_IMAGE_DESCRIPTOR_ALLOWED_MASK
+    local_ct_flag = local_packed & 0x80
+    local_packed_canonical = (
+        local_packed & _GIF_IMAGE_DESCRIPTOR_ALLOWED_MASK
+        if local_ct_flag
+        else local_packed & 0x40  # interlace remains meaningful without an LCT
+    )
     local_ct_entries = (
         1 << ((local_packed & 0x07) + 1)
-        if local_packed & 0x80
+        if local_ct_flag
         else 0
     )
     local_ct_size = 3 * local_ct_entries
