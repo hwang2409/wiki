@@ -1338,6 +1338,24 @@ export default function App() {
   // nonce is only in the file-loading effect's dep list, so a retry is
   // strictly scoped to the file fetch.
   const [filesRetryNonce, setFilesRetryNonce] = useState(0);
+  // WIKI-157 (round-2 BLOCKING#1): drive HealthView's loading/error/retry
+  // from the same boot state so it never renders "empty vault" during boot
+  // or hides a boot failure behind an empty list.
+  //
+  // Round-3 BLOCKING#2: this error is DEDICATED to the notes boot — the
+  // shared `error` state gets cleared by every unrelated interaction (open
+  // note, save, rename, etc), which meant a failed boot silently turned
+  // into an endless loading state as soon as the user did anything. Keep
+  // notesError independent so failed boots render a real error surface.
+  const [notesRetryNonce, setNotesRetryNonce] = useState(0);
+  const [notesError, setNotesError] = useState<string | null>(null);
+  const retryNotes = () => {
+    setNotesLoaded(false);
+    setNotesError(null);
+    setNotes([]);
+    setError(null);
+    setNotesRetryNonce((nonce) => nonce + 1);
+  };
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [dialog, setDialog] = useState<DialogState | null>(null);
   const paneIdRef = useRef(0);
@@ -1592,15 +1610,19 @@ export default function App() {
     async function boot() {
       setIsLoading(true);
       setError(null);
+      setNotesError(null);
       try {
         const nextNotes = await listNotes();
         if (ignore) return;
         setNotes(nextNotes);
         setNotesLoaded(true);
+        setNotesError(null);
       } catch (err) {
         if (!ignore) {
+          const message = err instanceof Error ? err.message : "Could not load notes";
           setNotesLoaded(false);
-          setError(err instanceof Error ? err.message : "Could not load notes");
+          setNotesError(message);
+          setError(message);
         }
       } finally {
         if (!ignore) setIsLoading(false);
@@ -1611,7 +1633,7 @@ export default function App() {
     return () => {
       ignore = true;
     };
-  }, []);
+  }, [notesRetryNonce]);
 
   const activeWorkspaceInfo = workspaces.find((workspace) => workspace.id === activeWorkspace);
   const activeFileCacheKey = activeWorkspaceInfo ? workspaceCacheKey(activeWorkspaceInfo) : null;
@@ -3412,7 +3434,14 @@ export default function App() {
       return <GraphView onOpenNote={openNote} />;
     }
     if (mode === "health") {
-      return <HealthView notes={notes} onOpenNote={openNote} />;
+      return <HealthView
+                  error={notesError}
+                  loading={!notesLoaded && !notesError}
+                  notes={notes}
+                  notesLoaded={notesLoaded}
+                  onOpenNote={openNote}
+                  onRetry={retryNotes}
+                />;
     }
     if (mode === "tokens") {
       return <TokensView />;
@@ -3603,7 +3632,7 @@ export default function App() {
   }> = [
     { label: "Activity feed", icon: History, mode: "activity", view: "activity" },
     { label: "Graph view", icon: Waypoints, mode: "graph", view: "graph" },
-    { label: "Vault health", icon: HeartPulse, mode: "health", view: "health" },
+    { label: "Note freshness", icon: HeartPulse, mode: "health", view: "health" },
     { label: "Token usage", icon: TrendingUp, mode: "tokens", view: "tokens" },
     { label: "Ticket dashboard", icon: ClipboardList, mode: "dashboard", view: "dashboard" },
     { label: "Fleet graph", icon: Waypoints, mode: "fleet-graph", view: "fleet-graph" },
@@ -4010,7 +4039,14 @@ export default function App() {
               ) : mode === "graph" ? (
                 <GraphView onOpenNote={openNote} />
               ) : mode === "health" ? (
-                <HealthView notes={notes} onOpenNote={openNote} />
+                <HealthView
+                  error={notesError}
+                  loading={!notesLoaded && !notesError}
+                  notes={notes}
+                  notesLoaded={notesLoaded}
+                  onOpenNote={openNote}
+                  onRetry={retryNotes}
+                />
               ) : mode === "agent" && agentTicket ? (
                 <AgentSessionView
                   initialPanel={agentPanel}

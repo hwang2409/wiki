@@ -1339,11 +1339,14 @@ export function updateNote(path: string, content: string) {
   });
 }
 
+// WIKI-157: metrics are individually optional — the backend omits a key
+// entirely when no source contributed it, so the frontend can render
+// "unavailable" instead of a false 0.
 export type TokenSeries = {
-  input: number;
-  cached: number;
-  output: number;
-  reasoning: number;
+  input?: number;
+  cached?: number;
+  output?: number;
+  reasoning?: number;
 };
 
 export type TokenBucket = {

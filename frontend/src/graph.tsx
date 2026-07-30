@@ -1,7 +1,329 @@
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { CircleDot, LayoutGrid, ListTree } from "lucide-react";
 import { getLinks } from "./api";
+import type { NoteLinks } from "./api";
+import { UtilityEmpty, UtilityError, UtilityLoading, UtilityPage } from "./utility-page";
 
-type GraphNode = {
+type LinksMap = Record<string, NoteLinks>;
+type GraphMode = "canvas" | "list";
+
+type GraphNodeSummary = {
+  id: string;
+  label: string;
+  unresolved: boolean;
+  degree: number;
+  outgoing: string[];
+  incoming: string[];
+};
+
+function cssVar(name: string) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+function labelOf(id: string) {
+  return id.split("/").pop()?.replace(/\.md$/, "") ?? id;
+}
+
+function summariseLinks(links: LinksMap): GraphNodeSummary[] {
+  const summary = new Map<string, GraphNodeSummary>();
+
+  function ensure(id: string, unresolved: boolean) {
+    const existing = summary.get(id);
+    if (existing) {
+      // A previously-unresolved ghost becomes resolved if we later see it as a real note.
+      if (existing.unresolved && !unresolved) existing.unresolved = false;
+      return existing;
+    }
+    const created: GraphNodeSummary = {
+      id,
+      label: unresolved ? id.replace(/^unresolved:/, "") : labelOf(id),
+      unresolved,
+      degree: 0,
+      outgoing: [],
+      incoming: [],
+    };
+    summary.set(id, created);
+    return created;
+  }
+
+  for (const source of Object.keys(links)) ensure(source, false);
+  for (const [source, entry] of Object.entries(links)) {
+    const sourceNode = ensure(source, false);
+    for (const target of entry.outgoing) {
+      const targetNode = ensure(target, false);
+      sourceNode.outgoing.push(target);
+      sourceNode.degree += 1;
+      targetNode.incoming.push(source);
+      targetNode.degree += 1;
+    }
+    for (const ghost of entry.unresolved) {
+      const ghostId = `unresolved:${ghost}`;
+      const ghostNode = ensure(ghostId, true);
+      sourceNode.outgoing.push(ghostId);
+      sourceNode.degree += 1;
+      ghostNode.incoming.push(source);
+      ghostNode.degree += 1;
+    }
+  }
+
+  return Array.from(summary.values());
+}
+
+export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }) {
+  const [links, setLinks] = useState<LinksMap | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [retryTick, setRetryTick] = useState(0);
+  const [mode, setMode] = useState<GraphMode>("canvas");
+  const [focusedId, setFocusedId] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    getLinks()
+      .then((result) => {
+        if (!cancelled) {
+          setLinks(result);
+          setError(null);
+        }
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setError(err instanceof Error ? err.message : "Could not load link graph");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [retryTick]);
+
+  const retry = useCallback(() => {
+    setError(null);
+    setLinks(null);
+    setRetryTick((tick) => tick + 1);
+  }, []);
+
+  const summaries = useMemo(() => (links ? summariseLinks(links) : []), [links]);
+  // Notes and unresolved targets are separate counts — a wikilink to a note
+  // that does not exist yet is a *target*, not a note in the vault.
+  const noteCount = links ? Object.keys(links).length : 0;
+  const unresolvedCount = summaries.filter((node) => node.unresolved).length;
+
+  const subtitle =
+    links === null
+      ? "Note-to-note links across the vault."
+      : `${noteCount} ${noteCount === 1 ? "note" : "notes"} · ${unresolvedCount} unresolved ${
+          unresolvedCount === 1 ? "target" : "targets"
+        }.`;
+
+  const actions = (
+    <>
+      <div className="graph-focus-hint" aria-live="polite">
+        {focusedId ? (
+          <>
+            <CircleDot size={12} aria-hidden="true" />
+            <span title={focusedId}>{labelOf(focusedId.replace(/^unresolved:/, ""))}</span>
+          </>
+        ) : (
+          <span className="graph-focus-hint-idle">no node focused</span>
+        )}
+      </div>
+      <div className="graph-mode-group" role="group" aria-label="Graph view mode">
+        <button
+          type="button"
+          className={`tokens-chip graph-mode-chip${mode === "canvas" ? " is-active" : ""}`}
+          aria-pressed={mode === "canvas"}
+          onClick={() => setMode("canvas")}
+        >
+          <LayoutGrid size={12} aria-hidden="true" />
+          <span>Canvas</span>
+        </button>
+        <button
+          type="button"
+          className={`tokens-chip graph-mode-chip${mode === "list" ? " is-active" : ""}`}
+          aria-pressed={mode === "list"}
+          onClick={() => setMode("list")}
+        >
+          <ListTree size={12} aria-hidden="true" />
+          <span>List</span>
+        </button>
+      </div>
+    </>
+  );
+
+  return (
+    <UtilityPage
+      title="Graph view"
+      subtitle={subtitle}
+      actions={actions}
+      scroll={false}
+      bodyClassName="graph-page-body"
+    >
+      {error ? (
+        <UtilityError
+          title="Link graph is unavailable"
+          message={error}
+          onRetry={retry}
+        />
+      ) : links === null ? (
+        <UtilityLoading label="Building link graph…" />
+      ) : summaries.length === 0 ? (
+        <UtilityEmpty
+          title="No linked notes yet"
+          message="Add [[wikilinks]] between notes to see the graph populate."
+        />
+      ) : mode === "canvas" ? (
+        <GraphCanvas
+          links={links}
+          summaries={summaries}
+          focusedId={focusedId}
+          onFocus={setFocusedId}
+          onOpenNote={onOpenNote}
+        />
+      ) : (
+        <GraphList summaries={summaries} onFocus={setFocusedId} onOpenNote={onOpenNote} />
+      )}
+    </UtilityPage>
+  );
+}
+
+function GraphList({
+  summaries,
+  onFocus,
+  onOpenNote,
+}: {
+  summaries: GraphNodeSummary[];
+  onFocus: (id: string) => void;
+  onOpenNote: (path: string) => void;
+}) {
+  const sorted = useMemo(
+    () => [...summaries].sort((a, b) => b.degree - a.degree || a.label.localeCompare(b.label)),
+    [summaries],
+  );
+
+  const labelFor = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const node of summaries) map.set(node.id, node.label);
+    return (id: string) => map.get(id) ?? labelOf(id.replace(/^unresolved:/, ""));
+  }, [summaries]);
+
+  return (
+    <div className="graph-list-wrap">
+      <p className="graph-list-hint">
+        Non-visual fallback — every node in the graph plus its outgoing and incoming
+        wikilinks. Enter opens the note; unresolved targets have no note to open.
+      </p>
+      <ul className="graph-list" role="list">
+        {sorted.map((node) => {
+          const outgoing = node.outgoing;
+          const incoming = node.incoming;
+          return (
+            <li key={node.id}>
+              <details
+                className={`graph-list-item${node.unresolved ? " is-unresolved" : ""}`}
+                onToggle={(event) => {
+                  if ((event.target as HTMLDetailsElement).open) onFocus(node.id);
+                }}
+              >
+                <summary className="graph-list-row">
+                  <span className="graph-list-name">{node.label}</span>
+                  <span className="graph-list-meta">
+                    {node.unresolved
+                      ? "unresolved target"
+                      : `${node.degree} link${node.degree === 1 ? "" : "s"} · ${outgoing.length} out · ${incoming.length} in`}
+                  </span>
+                  {!node.unresolved ? (
+                    <span className="graph-list-path">{node.id}</span>
+                  ) : null}
+                </summary>
+                <div className="graph-list-body">
+                  {!node.unresolved ? (
+                    <div className="graph-list-actions">
+                      <button
+                        type="button"
+                        className="graph-list-open"
+                        onClick={() => onOpenNote(node.id)}
+                      >
+                        Open note
+                      </button>
+                    </div>
+                  ) : null}
+                  <EdgeList
+                    heading="Outgoing wikilinks"
+                    ids={outgoing}
+                    emptyLabel="No outgoing links from this note."
+                    labelFor={labelFor}
+                    onOpen={(id) => {
+                      if (!id.startsWith("unresolved:")) onOpenNote(id);
+                    }}
+                  />
+                  <EdgeList
+                    heading="Incoming wikilinks"
+                    ids={incoming}
+                    emptyLabel={
+                      node.unresolved
+                        ? "Nothing links to this unresolved target."
+                        : "No notes currently link to this one."
+                    }
+                    labelFor={labelFor}
+                    onOpen={(id) => {
+                      if (!id.startsWith("unresolved:")) onOpenNote(id);
+                    }}
+                  />
+                </div>
+              </details>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
+function EdgeList({
+  heading,
+  ids,
+  emptyLabel,
+  labelFor,
+  onOpen,
+}: {
+  heading: string;
+  ids: string[];
+  emptyLabel: string;
+  labelFor: (id: string) => string;
+  onOpen: (id: string) => void;
+}) {
+  return (
+    <div className="graph-edge-group" role="group" aria-label={heading}>
+      <div className="graph-edge-heading">{heading}</div>
+      {ids.length === 0 ? (
+        <div className="graph-edge-empty">{emptyLabel}</div>
+      ) : (
+        <ul className="graph-edge-list" role="list">
+          {ids.map((id) => {
+            const unresolved = id.startsWith("unresolved:");
+            return (
+              <li key={`${heading}-${id}`}>
+                <button
+                  type="button"
+                  className={`graph-edge${unresolved ? " is-unresolved" : ""}`}
+                  disabled={unresolved}
+                  onClick={() => onOpen(id)}
+                >
+                  <span className="graph-edge-name">{labelFor(id)}</span>
+                  {unresolved ? (
+                    <span className="graph-edge-flag">unresolved</span>
+                  ) : (
+                    <span className="graph-edge-path">{id}</span>
+                  )}
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+type PhysicsNode = {
   id: string;
   label: string;
   unresolved: boolean;
@@ -12,17 +334,96 @@ type GraphNode = {
   vy: number;
 };
 
-type GraphEdge = {
+type PhysicsEdge = {
   a: number;
   b: number;
 };
 
-function cssVar(name: string) {
-  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
-}
-
-export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }) {
+function GraphCanvas({
+  links,
+  summaries,
+  focusedId,
+  onFocus,
+  onOpenNote,
+}: {
+  links: LinksMap;
+  summaries: GraphNodeSummary[];
+  focusedId: string | null;
+  onFocus: (id: string | null) => void;
+  onOpenNote: (path: string) => void;
+}) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const focusedIdRef = useRef<string | null>(focusedId);
+  const openNoteRef = useRef(onOpenNote);
+  const focusHandleRef = useRef<((id: string | null) => void) | null>(null);
+  const canvasKeyboardRef = useRef<((key: string) => void) | null>(null);
+  const orderedIdsRef = useRef<string[]>([]);
+  const [instructionsShown, setInstructionsShown] = useState(false);
+
+  // Keyboard navigation is authoritative on `summaries` (not the physics
+  // node list) so it works even when the canvas 2d context is missing —
+  // jsdom / older embeddings never install one and the physics-scoped
+  // handler would otherwise never register.
+  const orderedIds = useMemo(
+    () =>
+      [...summaries]
+        .sort((a, b) => b.degree - a.degree || a.label.localeCompare(b.label))
+        .map((node) => node.id),
+    [summaries],
+  );
+
+  useEffect(() => {
+    orderedIdsRef.current = orderedIds;
+  }, [orderedIds]);
+
+  const unresolvedById = useMemo(() => {
+    const map = new Map<string, boolean>();
+    for (const node of summaries) map.set(node.id, node.unresolved);
+    return map;
+  }, [summaries]);
+
+  function handleKeyboardNav(key: string) {
+    if (orderedIds.length === 0) return;
+    const currentId = focusedId;
+    let index = currentId ? orderedIds.indexOf(currentId) : -1;
+    if (key === "ArrowRight" || key === "ArrowDown" || key === "j") {
+      index = index < 0 ? 0 : (index + 1) % orderedIds.length;
+      onFocus(orderedIds[index]);
+      canvasKeyboardRef.current?.(key);
+      return;
+    }
+    if (key === "ArrowLeft" || key === "ArrowUp" || key === "k") {
+      index = index <= 0 ? orderedIds.length - 1 : index - 1;
+      onFocus(orderedIds[index]);
+      canvasKeyboardRef.current?.(key);
+      return;
+    }
+    if (key === "Home") {
+      onFocus(orderedIds[0] ?? null);
+      canvasKeyboardRef.current?.(key);
+      return;
+    }
+    if (key === "End") {
+      onFocus(orderedIds[orderedIds.length - 1] ?? null);
+      canvasKeyboardRef.current?.(key);
+      return;
+    }
+    if (key === "Enter" || key === " ") {
+      const activeId = focusedId;
+      if (!activeId) return;
+      if (unresolvedById.get(activeId)) return;
+      onOpenNote(activeId);
+    }
+  }
+
+  useEffect(() => {
+    focusedIdRef.current = focusedId;
+  }, [focusedId]);
+
+  useEffect(() => {
+    openNoteRef.current = onOpenNote;
+  }, [onOpenNote]);
 
   useEffect(() => {
     const trackRaf = import.meta.env.DEV;
@@ -33,13 +434,13 @@ export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }
     const context = canvas.getContext("2d");
     if (!context) return;
 
-    let nodes: GraphNode[] = [];
-    let edges: GraphEdge[] = [];
+    let nodes: PhysicsNode[] = [];
+    let edges: PhysicsEdge[] = [];
     let raf = 0;
     let running = false;
     let alpha = 1;
-    let hovered: GraphNode | null = null;
-    let dragged: GraphNode | null = null;
+    let hovered: PhysicsNode | null = null;
+    let dragged: PhysicsNode | null = null;
     let dragOrigin = { x: 0, y: 0 };
     let dragTravel = 0;
     let disposed = false;
@@ -48,6 +449,12 @@ export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }
     let height = 0;
     const view = { scale: 1, ox: 0, oy: 0 };
     const settleAlpha = 0.003;
+    let focusedNode: PhysicsNode | null = null;
+
+    function findNode(id: string | null): PhysicsNode | null {
+      if (!id) return null;
+      return nodes.find((node) => node.id === id) ?? null;
+    }
 
     function toScreenX(x: number) {
       return x * view.scale + view.ox;
@@ -79,7 +486,7 @@ export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }
       const target = Math.min(
         (width - pad * 2) / spanX,
         (height - pad * 2) / spanY,
-        2.2
+        2.2,
       );
       const targetOx = (width - (minX + maxX) * target) / 2;
       const targetOy = (height - (minY + maxY) * target) / 2;
@@ -184,7 +591,7 @@ export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }
       alpha = Math.max(0.002, alpha * 0.985);
     }
 
-    function radius(node: GraphNode) {
+    function radius(node: PhysicsNode) {
       return node.unresolved ? 3 : 4 + Math.min(6, node.degree * 1.2);
     }
 
@@ -193,17 +600,20 @@ export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }
       const textMuted = cssVar("--text-muted") || "#6b6b6b";
       const textFaint = cssVar("--text-faint") || "#9b9b9b";
       const border = cssVar("--background-modifier-border") || "#dcdcdc";
+      const accentPrimary = cssVar("--accent-primary") || textNormal;
 
       const viewAnimating = fitView();
       context!.clearRect(0, 0, width, height);
 
+      focusedNode = findNode(focusedIdRef.current);
+      const spotlight = hovered ?? focusedNode;
       const neighborhood = new Set<number>();
-      if (hovered) {
-        const hoveredIndex = nodes.indexOf(hovered);
-        neighborhood.add(hoveredIndex);
+      if (spotlight) {
+        const spotlightIndex = nodes.indexOf(spotlight);
+        neighborhood.add(spotlightIndex);
         for (const edge of edges) {
-          if (edge.a === hoveredIndex) neighborhood.add(edge.b);
-          if (edge.b === hoveredIndex) neighborhood.add(edge.a);
+          if (edge.a === spotlightIndex) neighborhood.add(edge.b);
+          if (edge.b === spotlightIndex) neighborhood.add(edge.a);
         }
       }
 
@@ -211,9 +621,9 @@ export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }
         const a = nodes[edge.a];
         const b = nodes[edge.b];
         const active =
-          !hovered || (neighborhood.has(edge.a) && neighborhood.has(edge.b));
+          !spotlight || (neighborhood.has(edge.a) && neighborhood.has(edge.b));
         context!.strokeStyle = active ? textFaint : border;
-        context!.globalAlpha = hovered && !active ? 0.25 : 0.6;
+        context!.globalAlpha = spotlight && !active ? 0.25 : 0.6;
         context!.lineWidth = 1;
         context!.beginPath();
         context!.moveTo(toScreenX(a.x), toScreenY(a.y));
@@ -223,10 +633,20 @@ export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }
       context!.globalAlpha = 1;
 
       nodes.forEach((node, index) => {
-        const active = !hovered || neighborhood.has(index);
+        const active = !spotlight || neighborhood.has(index);
         const r = radius(node);
         const sx = toScreenX(node.x);
         const sy = toScreenY(node.y);
+
+        if (node === focusedNode) {
+          context!.beginPath();
+          context!.arc(sx, sy, r + 5, 0, Math.PI * 2);
+          context!.strokeStyle = accentPrimary;
+          context!.lineWidth = 1.5;
+          context!.globalAlpha = 0.9;
+          context!.stroke();
+        }
+
         context!.beginPath();
         context!.arc(sx, sy, r, 0, Math.PI * 2);
         if (node.unresolved) {
@@ -239,9 +659,9 @@ export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }
 
         context!.font =
           '10px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-        context!.fillStyle = node === hovered ? textNormal : textMuted;
+        context!.fillStyle = node === hovered || node === focusedNode ? textNormal : textMuted;
         context!.textAlign = "center";
-        context!.globalAlpha = active ? (node === hovered ? 1 : 0.85) : 0.25;
+        context!.globalAlpha = active ? (node === hovered || node === focusedNode ? 1 : 0.85) : 0.25;
         context!.fillText(node.label, sx, sy + r + 12);
         context!.globalAlpha = 1;
       });
@@ -279,7 +699,7 @@ export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }
       }
     }
 
-    function nodeAt(px: number, py: number): GraphNode | null {
+    function nodeAt(px: number, py: number): PhysicsNode | null {
       const { x, y } = toWorld(px, py);
       const slop = (4 + 4) / view.scale;
       for (let i = nodes.length - 1; i >= 0; i -= 1) {
@@ -324,6 +744,7 @@ export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }
         dragTravel = 0;
         canvas!.setPointerCapture(event.pointerId);
         alpha = Math.max(alpha, 0.25);
+        focusHandleRef.current?.(node.id);
         requestRender();
       }
     }
@@ -334,7 +755,7 @@ export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }
         dragged = null;
         alpha = Math.max(alpha, 0.2);
         if (!node.unresolved && dragTravel < 4) {
-          onOpenNote(node.id);
+          openNoteRef.current?.(node.id);
         }
       }
       requestRender();
@@ -357,64 +778,65 @@ export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }
       requestRender();
     }
 
+    // The container-level keyboard handler updates focusedId; here we only
+    // nudge the physics alpha so the selection ring redraws.
+    canvasKeyboardRef.current = () => {
+      alpha = Math.max(alpha, 0.15);
+      requestRender();
+    };
+    focusHandleRef.current = (id) => onFocus(id);
+
     resize();
 
-    getLinks()
-      .then((links) => {
-        if (disposed) return;
-        const ids = Object.keys(links);
-        const index = new Map<string, number>();
-        nodes = ids.map((id, i) => {
-          index.set(id, i);
-          const angle = (i / ids.length) * Math.PI * 2;
-          return {
-            id,
-            label: id.split("/").pop()?.replace(/\.md$/, "") ?? id,
-            unresolved: false,
+    const ids = Object.keys(links);
+    const index = new Map<string, number>();
+    nodes = ids.map((id, i) => {
+      index.set(id, i);
+      const angle = (i / ids.length) * Math.PI * 2;
+      return {
+        id,
+        label: id.split("/").pop()?.replace(/\.md$/, "") ?? id,
+        unresolved: false,
+        degree: 0,
+        x: width / 2 + Math.cos(angle) * 120,
+        y: height / 2 + Math.sin(angle) * 120,
+        vx: 0,
+        vy: 0,
+      };
+    });
+
+    for (const [source, entry] of Object.entries(links)) {
+      const a = index.get(source);
+      if (a === undefined) continue;
+      for (const target of entry.outgoing) {
+        const b = index.get(target);
+        if (b === undefined) continue;
+        edges.push({ a, b });
+        nodes[a].degree += 1;
+        nodes[b].degree += 1;
+      }
+      for (const ghost of entry.unresolved) {
+        let g = index.get(`unresolved:${ghost}`);
+        if (g === undefined) {
+          g = nodes.length;
+          index.set(`unresolved:${ghost}`, g);
+          nodes.push({
+            id: `unresolved:${ghost}`,
+            label: ghost,
+            unresolved: true,
             degree: 0,
-            x: width / 2 + Math.cos(angle) * 120,
-            y: height / 2 + Math.sin(angle) * 120,
+            x: width / 2 + (Math.sin(g * 5) || 0.3) * 200,
+            y: height / 2 + (Math.cos(g * 3) || 0.3) * 200,
             vx: 0,
-            vy: 0
-          };
-        });
-
-        for (const [source, entry] of Object.entries(links)) {
-          const a = index.get(source);
-          if (a === undefined) continue;
-          for (const target of entry.outgoing) {
-            const b = index.get(target);
-            if (b === undefined) continue;
-            edges.push({ a, b });
-            nodes[a].degree += 1;
-            nodes[b].degree += 1;
-          }
-          for (const ghost of entry.unresolved) {
-            let g = index.get(`unresolved:${ghost}`);
-            if (g === undefined) {
-              g = nodes.length;
-              index.set(`unresolved:${ghost}`, g);
-              nodes.push({
-                id: `unresolved:${ghost}`,
-                label: ghost,
-                unresolved: true,
-                degree: 0,
-                x: width / 2 + (Math.sin(g * 5) || 0.3) * 200,
-                y: height / 2 + (Math.cos(g * 3) || 0.3) * 200,
-                vx: 0,
-                vy: 0
-              });
-            }
-            edges.push({ a, b: g });
-          }
+            vy: 0,
+          });
         }
+        edges.push({ a, b: g });
+      }
+    }
 
-        alpha = 1;
-        requestRender();
-      })
-      .catch(() => {
-        requestRender();
-      });
+    alpha = 1;
+    requestRender();
 
     const observer = new ResizeObserver(resize);
     if (canvas.parentElement) observer.observe(canvas.parentElement);
@@ -434,12 +856,46 @@ export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }
       canvas.removeEventListener("pointerup", onPointerUp);
       canvas.removeEventListener("pointerleave", onPointerLeave);
       document.removeEventListener("visibilitychange", onVisibilityChange);
+      focusHandleRef.current = null;
+      canvasKeyboardRef.current = null;
     };
-  }, [onOpenNote]);
+  }, [links, onFocus]);
+
+  function onKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
+    const key = event.key;
+    if (
+      key === "ArrowLeft" ||
+      key === "ArrowRight" ||
+      key === "ArrowUp" ||
+      key === "ArrowDown" ||
+      key === "Home" ||
+      key === "End" ||
+      key === "Enter" ||
+      key === " " ||
+      key === "j" ||
+      key === "k"
+    ) {
+      event.preventDefault();
+      handleKeyboardNav(key);
+    }
+  }
 
   return (
-    <div className="graph-view">
-      <canvas ref={canvasRef} />
+    <div className="graph-view-shell">
+      <div
+        ref={containerRef}
+        className="graph-view"
+        role="application"
+        aria-label="Note link graph. Use arrow keys to move between nodes, Enter to open."
+        tabIndex={0}
+        onFocus={() => setInstructionsShown(true)}
+        onKeyDown={onKeyDown}
+      >
+        <canvas ref={canvasRef} aria-hidden="true" />
+        <div className={`graph-keyboard-hint${instructionsShown ? " is-visible" : ""}`}>
+          Arrows or J / K move · Enter opens · switch to List for a flat, keyboard-first view.
+        </div>
+      </div>
     </div>
   );
 }

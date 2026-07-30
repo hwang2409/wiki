@@ -73,7 +73,7 @@ async function waitForUtilityWindow(page, kind, expectedCount) {
 const OVERFLOW_LABELS = new Set([
   "Activity feed",
   "Graph view",
-  "Vault health",
+  "Note freshness",
   "Token usage",
   "Ticket dashboard",
 ]);
@@ -136,7 +136,7 @@ async function main() {
     await openSidebarPage(page, "Token usage", "tokens", 3);
     await openSidebarPage(page, "Activity feed", "activity", 4);
     await openSidebarPage(page, "Graph view", "graph", 5);
-    await openSidebarPage(page, "Vault health", "health", 6);
+    await openSidebarPage(page, "Note freshness", "health", 6);
 
     const allPages = await storedWorkspace(page);
     for (const kind of ["agents", "tokens", "activity", "graph", "health"]) {
