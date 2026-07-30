@@ -9,6 +9,7 @@ updated: 2026-07-30
 
 ## 2026-07-30
 
+- **wiki-app** — WIKI-180 auto-context injector merged — PR #148, 3 review rounds; deterministic opt-in spawn prelude (vault+PRs+workgraph), fence-proof envelope, strict read-only retrieval, explicit truncation counts (https://github.com/hwang2409/wiki/pull/148)
 - **wiki-app** — WIKI-201 merged via PR #144 (image cluster: polish + gallery + inline images, 6 review rounds; EXIF strip w/ bomb caps, shared lightbox w/ focus trap, dims-before-render CLS kill, blur-up fades, delimiter-safe resolvers both sides)
 - **wiki-app** — WIKI-192 merged via PR #144 (image cluster: polish + gallery + inline images, 6 review rounds; EXIF strip w/ bomb caps, shared lightbox w/ focus trap, dims-before-render CLS kill, blur-up fades, delimiter-safe resolvers both sides)
 - **wiki-app** — WIKI-189 merged via PR #144 (image cluster: polish + gallery + inline images, 6 review rounds; EXIF strip w/ bomb caps, shared lightbox w/ focus trap, dims-before-render CLS kill, blur-up fades, delimiter-safe resolvers both sides)
