@@ -175,9 +175,21 @@ export function VideoRenderer({ artifact, event, ticket }: ArtifactRendererProps
   const releaseRef = useReleaseMediaOnUnmount<HTMLVideoElement>();
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const [speed, setSpeed] = useState(1);
+  const speedRef = useRef(1);
   useEffect(() => {
+    speedRef.current = speed;
     if (videoRef.current) videoRef.current.playbackRate = speed;
   }, [speed]);
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    try {
+      video.load();
+    } catch {
+      /* jsdom / detached element */
+    }
+    video.playbackRate = speedRef.current;
+  }, [source]);
   const attachVideoRef = useCallback(
     (node: HTMLVideoElement | null) => {
       videoRef.current = node;
@@ -214,11 +226,10 @@ export function VideoRenderer({ artifact, event, ticket }: ArtifactRendererProps
           playsInline
           poster={artifact.poster_base64}
           aria-label={label}
+          src={source}
           width={artifact.width}
           height={artifact.height}
-        >
-          <source src={source} type={artifact.mime ?? "video/mp4"} />
-        </video>
+        />
       </div>
       <div className="artifact-video-controls tabular-nums">
         {durationSeconds !== undefined ? (
@@ -281,10 +292,22 @@ export function AudioRenderer({ artifact, event, ticket }: ArtifactRendererProps
   const releaseRef = useReleaseMediaOnUnmount<HTMLAudioElement>();
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const [speed, setSpeed] = useState(1);
+  const speedRef = useRef(1);
   const [showTranscript, setShowTranscript] = useState(false);
   useEffect(() => {
+    speedRef.current = speed;
     if (audioRef.current) audioRef.current.playbackRate = speed;
   }, [speed]);
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    try {
+      audio.load();
+    } catch {
+      /* jsdom / detached element */
+    }
+    audio.playbackRate = speedRef.current;
+  }, [source]);
   const attachAudioRef = useCallback(
     (node: HTMLAudioElement | null) => {
       audioRef.current = node;
@@ -307,9 +330,8 @@ export function AudioRenderer({ artifact, event, ticket }: ArtifactRendererProps
         controlsList="nodownload"
         preload="metadata"
         aria-label={label}
-      >
-        <source src={source} type={artifact.mime ?? "audio/wav"} />
-      </audio>
+        src={source}
+      />
       <div className="artifact-audio-controls tabular-nums">
         {durationSeconds !== undefined ? (
           <span className="artifact-audio-duration">

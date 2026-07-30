@@ -46,6 +46,7 @@ the exact delta. mdat sits at the same absolute offset as before.
 """
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections.abc import Iterator
 import struct
 from dataclasses import dataclass
@@ -71,6 +72,14 @@ class _Mp4SampleRange:
     end: int
     description_index: int
     avc_config: tuple[int, set[int], bool] | None
+
+
+@dataclass(frozen=True)
+class _Mp4TrackSamplePlan:
+    chunks: tuple[tuple[int, int, int, int, int, tuple[int, set[int], bool] | None], ...]
+    sample_size: int
+    sample_sizes: memoryview | None
+    sample_count: int
 
 
 _MP4_FREE_MIN_SIZE: Final = 8
@@ -101,6 +110,10 @@ _MP4_SAMPLE_ENTRY_REQUIRED_CONFIG: Final = {
 _MP4_MAX_SAMPLES: Final = 16_777_216
 _MP4_AVC_SAMPLE_NAL_TYPES: Final = {1, 5, 6}
 _MP4_MAX_BOXES_PER_CONTAINER: Final = 4096
+_MP4_MAX_CHUNKS: Final = 65_536
+# Tables that are rebuilt entry-by-entry are capped separately from sample
+# tables. This keeps their temporary Python object lists bounded.
+_MP4_MAX_TABLE_ENTRIES: Final = 4096
 _MP4_BRAND_ALLOWLIST: Final = frozenset({
     b"avc1", b"isom", b"iso2", b"iso5", b"iso6", b"mp41", b"mp42", b"mp4a",
 })
@@ -149,9 +162,7 @@ def scrub_mp4(data: bytes) -> MediaScrubResult:
         (atom.body_start, atom.body_end)
         for atom in top_atoms if atom.type == b"mdat"
     ]
-    _validate_sample_ranges(
-        data, _collect_sample_ranges(data, top_atoms, mdat_ranges), mdat_ranges,
-    )
+    sample_plan = _build_sample_plan(data, top_atoms, mdat_ranges)
 
     ftyp = _rebuild_ftyp(data, top_atoms[0])
     if len(ftyp) != top_atoms[0].size:
@@ -200,7 +211,7 @@ def scrub_mp4(data: bytes) -> MediaScrubResult:
                 raise MediaScrubError("mp4 mdat body is empty")
             mdat_non_empty = True
             scrubbed_body = bytearray(body_len)
-            for sample_range in _collect_sample_ranges(data, top_atoms, mdat_ranges):
+            for sample_range in _iter_sample_plan_ranges(sample_plan):
                 sample_start = sample_range.start
                 sample_end = sample_range.end
                 if sample_start < atom.body_start or sample_end > atom.body_end:
@@ -275,14 +286,15 @@ def scrub_mp4(data: bytes) -> MediaScrubResult:
     )
 
 
-def _collect_sample_ranges(
+def _build_sample_plan(
     data: bytes,
     top_atoms: list[_Mp4Atom],
     mdat_ranges: list[tuple[int, int]],
-) -> Iterator[_Mp4SampleRange]:
-    """Yield sample ranges after validating compact chunk ownership."""
-    sample_iterators: list[Iterator[_Mp4SampleRange]] = []
-    chunk_ranges: list[tuple[int, int]] = []
+) -> tuple[_Mp4TrackSamplePlan, ...]:
+    """Build one bounded chunk plan and validate ownership once."""
+    track_plans: list[_Mp4TrackSamplePlan] = []
+    ownership: list[tuple[int, int, int, int, int, tuple[int, set[int], bool] | None]] = []
+    mdat_starts = [start for start, _end in mdat_ranges]
     for moov in (atom for atom in top_atoms if atom.type == b"moov"):
         for trak in _parse_container(data, moov.body_start, moov.body_end):
             if trak.type != b"trak":
@@ -300,36 +312,42 @@ def _collect_sample_ranges(
                         continue
                     for stbl in _parse_container(data, minf.body_start, minf.body_end):
                         if stbl.type == b"stbl":
-                            sample_iterator, track_chunks = _collect_sample_ranges_from_stbl(
+                            track_plan = _build_sample_plan_from_stbl(
                                 data, stbl.body_start, stbl.body_end, mdat_ranges,
-                                handler_type,
+                                mdat_starts, handler_type,
                             )
-                            sample_iterators.append(sample_iterator)
-                            chunk_ranges.extend(track_chunks)
-    chunk_ranges.sort()
+                            if track_plan is not None:
+                                if len(ownership) + len(track_plan.chunks) > _MP4_MAX_CHUNKS:
+                                    raise MediaScrubError(
+                                        f"mp4 has more than {_MP4_MAX_CHUNKS} sample chunks"
+                                    )
+                                track_plans.append(track_plan)
+                                ownership.extend(track_plan.chunks)
+    ownership.sort(key=lambda item: item[0])
     previous: tuple[int, int] | None = None
-    for chunk_range in chunk_ranges:
+    for chunk in ownership:
+        chunk_range = (chunk[0], chunk[1])
         if previous is not None and chunk_range[0] < previous[1]:
             raise MediaScrubError("mp4 sample chunks overlap across or within tracks")
         previous = chunk_range
-    for sample_iterator in sample_iterators:
-        yield from sample_iterator
+    return tuple(track_plans)
 
 
-def _collect_sample_ranges_from_stbl(
+def _build_sample_plan_from_stbl(
     data: bytes,
     body_start: int,
     body_end: int,
     mdat_ranges: list[tuple[int, int]],
+    mdat_starts: list[int],
     handler_type: bytes,
-) -> tuple[Iterator[_Mp4SampleRange], list[tuple[int, int]]]:
+) -> _Mp4TrackSamplePlan | None:
     tables = {
         atom.type: atom
         for atom in _parse_container(data, body_start, body_end)
         if atom.type in {b"stsc", b"stsz", b"stco", b"co64"}
     }
     if not tables:
-        return iter(()), []
+        return None
     if b"stsc" not in tables or b"stsz" not in tables:
         raise MediaScrubError("mp4 sample tables missing stsc or stsz")
     if b"stco" in tables and b"co64" in tables:
@@ -354,6 +372,10 @@ def _collect_sample_ranges_from_stbl(
 
     stsc_body = fullbox_body(tables[b"stsc"], "stsc")
     stsc_count = struct.unpack(">I", stsc_body[4:8])[0]
+    if stsc_count > _MP4_MAX_TABLE_ENTRIES:
+        raise MediaScrubError(
+            f"mp4 stsc entry count exceeds {_MP4_MAX_TABLE_ENTRIES}"
+        )
     if len(stsc_body) != 8 + stsc_count * 12 or stsc_count == 0:
         raise MediaScrubError("mp4 stsc body length does not match entries")
     stsc_entries: list[tuple[int, int, int]] = []
@@ -380,6 +402,10 @@ def _collect_sample_ranges_from_stbl(
 
     offset_body = fullbox_body(offset_atom, offset_atom.type.decode("ascii"))
     chunk_count = struct.unpack(">I", offset_body[4:8])[0]
+    if chunk_count > _MP4_MAX_CHUNKS:
+        raise MediaScrubError(
+            f"mp4 chunk count {chunk_count} exceeds scrubber limit {_MP4_MAX_CHUNKS}"
+        )
     offset_width = 4 if offset_atom.type == b"stco" else 8
     if len(offset_body) != 8 + chunk_count * offset_width:
         raise MediaScrubError("mp4 chunk offset table length does not match entries")
@@ -427,7 +453,7 @@ def _collect_sample_ranges_from_stbl(
     # chunk ownership before any per-sample work.
     sample_index = 0
     stsc_cursor = 0
-    chunk_ranges: list[tuple[int, int]] = []
+    chunks: list[tuple[int, int, int, int, int, tuple[int, set[int], bool] | None]] = []
     for chunk_number in range(1, chunk_count + 1):
         stsc_cursor, samples_per_chunk, description_index, _ = stsc_for_chunk(
             chunk_number, stsc_cursor,
@@ -449,39 +475,45 @@ def _collect_sample_ranges_from_stbl(
             raise MediaScrubError(
                 "mp4 chunk extent exceeds input size; sample range is not contained"
             )
-        if not any(
-            chunk_start >= mdat_start and chunk_end <= mdat_end
-            for mdat_start, mdat_end in mdat_ranges
+        mdat_index = bisect_right(mdat_starts, chunk_start) - 1
+        if (
+            mdat_index < 0
+            or chunk_start < mdat_ranges[mdat_index][0]
+            or chunk_end > mdat_ranges[mdat_index][1]
         ):
             raise MediaScrubError("mp4 chunk extent is not contained by one mdat box")
-        chunk_ranges.append((chunk_start, chunk_end))
+        chunks.append((
+            chunk_start, chunk_end, sample_index, samples_per_chunk,
+            description_index, sample_descriptions[description_index - 1],
+        ))
         sample_index += samples_per_chunk
     if sample_index != sample_count:
         raise MediaScrubError("mp4 stsc does not describe every stsz sample")
 
-    def iter_sample_ranges() -> Iterator[_Mp4SampleRange]:
-        sample_index = 0
-        stsc_cursor = 0
-        for chunk_number in range(1, chunk_count + 1):
-            stsc_cursor, samples_per_chunk, description_index, _ = stsc_for_chunk(
-                chunk_number, stsc_cursor,
-            )
-            avc_config = sample_descriptions[description_index - 1]
-            chunk_start = int.from_bytes(
-                offset_body[8 + (chunk_number - 1) * offset_width:
-                            8 + chunk_number * offset_width],
-                "big",
-            )
+    return _Mp4TrackSamplePlan(tuple(chunks), sample_size, sample_sizes, sample_count)
+
+
+def _iter_sample_plan_ranges(
+    plan: tuple[_Mp4TrackSamplePlan, ...],
+) -> Iterator[_Mp4SampleRange]:
+    for track in plan:
+        for (
+            chunk_start, _chunk_end, sample_index, samples_per_chunk,
+            description_index, avc_config,
+        ) in track.chunks:
             sample_start = chunk_start
             for local_index in range(samples_per_chunk):
-                sample_end = sample_start + size_at(sample_index + local_index)
+                if track.sample_size:
+                    size = track.sample_size
+                else:
+                    assert track.sample_sizes is not None
+                    size_offset = 12 + (sample_index + local_index) * 4
+                    size = struct.unpack(">I", track.sample_sizes[size_offset:size_offset + 4])[0]
+                sample_end = sample_start + size
                 yield _Mp4SampleRange(
                     sample_start, sample_end, description_index, avc_config,
                 )
                 sample_start = sample_end
-            sample_index += samples_per_chunk
-
-    return iter_sample_ranges(), chunk_ranges
 
 
 def _sample_description_configs(
@@ -500,6 +532,10 @@ def _sample_description_configs(
     entry_count = struct.unpack(">I", body[4:8])[0]
     if entry_count == 0:
         return []
+    if entry_count > _MP4_MAX_TABLE_ENTRIES:
+        raise MediaScrubError(
+            f"mp4 stsd entry count exceeds {_MP4_MAX_TABLE_ENTRIES}"
+        )
     entries: list[tuple[int, set[int], bool] | None] = []
     offset = 8
     for _ in range(entry_count):
@@ -629,26 +665,6 @@ def _canonicalise_avc_sample(
     if nal_count == 0:
         raise MediaScrubError("mp4 AVC sample has no NAL units")
     return bytes(output)
-
-
-def _validate_sample_ranges(
-    data: bytes, sample_ranges: Iterator[_Mp4SampleRange],
-    mdat_ranges: list[tuple[int, int]],
-) -> None:
-    for sample_range in sample_ranges:
-        start = sample_range.start
-        end = sample_range.end
-        if (
-            start < 0 or end < start or end > len(data)
-            or not any(start >= mdat_start and end <= mdat_end for mdat_start, mdat_end in mdat_ranges)
-        ):
-            raise MediaScrubError(
-                "mp4 sample range is not contained by one mdat box"
-            )
-        if sample_range.avc_config is not None:
-            _canonicalise_avc_sample(
-                data[start:end], *sample_range.avc_config,
-            )
 
 
 # ---------------------------------------------------------------------------
@@ -816,6 +832,10 @@ def _rebuild_sidx(data: bytes, atom: _Mp4Atom) -> bytes:
         reference_count = struct.unpack(">H", body[30:32])[0]
     if reference_count > 0xFFFF:  # pragma: no cover — uint16 max already
         raise MediaScrubError("mp4 sidx reference count implausible")
+    if reference_count > _MP4_MAX_TABLE_ENTRIES:
+        raise MediaScrubError(
+            f"mp4 sidx reference count exceeds {_MP4_MAX_TABLE_ENTRIES}"
+        )
     references_start = fixed_len
     expected_len = fixed_len + reference_count * 12
     if len(body) < expected_len:
@@ -1107,6 +1127,10 @@ def _rebuild_edts(data: bytes, atom: _Mp4Atom) -> bytes:
         raise MediaScrubError(f"mp4 elst unknown version {version}")
     if entry_count > 0xFFFF:
         raise MediaScrubError("mp4 elst entry count implausible")
+    if entry_count > _MP4_MAX_TABLE_ENTRIES:
+        raise MediaScrubError(
+            f"mp4 elst entry count exceeds {_MP4_MAX_TABLE_ENTRIES}"
+        )
     expected = 8 + entry_count * entry_size
     if len(body) != expected:
         raise MediaScrubError(
@@ -1330,6 +1354,10 @@ def _rebuild_dinf(data: bytes, body_start: int, body_end: int) -> bytes:
         raise MediaScrubError("mp4 dref must declare at least one entry")
     if entry_count > 0xFFFF:
         raise MediaScrubError("mp4 dref entry count implausible")
+    if entry_count > _MP4_MAX_TABLE_ENTRIES:
+        raise MediaScrubError(
+            f"mp4 dref entry count exceeds {_MP4_MAX_TABLE_ENTRIES}"
+        )
     entries: list[bytes] = []
     offset = 8
     for _ in range(entry_count):
@@ -1519,6 +1547,10 @@ def _rebuild_stbl_table(box_type: bytes, data: bytes, atom: _Mp4Atom) -> bytes:
         if version not in (0, 1):
             raise MediaScrubError(f"mp4 ctts unknown version {version}")
         entry_count = struct.unpack(">I", bytes(body[4:8]))[0]
+        if entry_count > _MP4_MAX_TABLE_ENTRIES:
+            raise MediaScrubError(
+                f"mp4 ctts entry count exceeds {_MP4_MAX_TABLE_ENTRIES}"
+            )
         expected = 8 + entry_count * 8
         if len(body) != expected:
             raise MediaScrubError(
@@ -1532,6 +1564,10 @@ def _rebuild_stbl_table(box_type: bytes, data: bytes, atom: _Mp4Atom) -> bytes:
         grouping_type = bytes(body[4:8])
         default_length = struct.unpack(">I", bytes(body[8:12]))[0]
         entry_count = struct.unpack(">I", bytes(body[12:16]))[0]
+        if entry_count > _MP4_MAX_TABLE_ENTRIES:
+            raise MediaScrubError(
+                f"mp4 sgpd entry count exceeds {_MP4_MAX_TABLE_ENTRIES}"
+            )
         if grouping_type != b"roll" or default_length != 2:
             raise MediaScrubError("mp4 sgpd supports only roll entries of length 2")
         expected = 16 + entry_count * default_length
@@ -1552,6 +1588,10 @@ def _rebuild_stbl_table(box_type: bytes, data: bytes, atom: _Mp4Atom) -> bytes:
             raise MediaScrubError("mp4 sbgp requires version 0")
         grouping_type = bytes(body[4:8])
         entry_count = struct.unpack(">I", bytes(body[8:12]))[0]
+        if entry_count > _MP4_MAX_TABLE_ENTRIES:
+            raise MediaScrubError(
+                f"mp4 sbgp entry count exceeds {_MP4_MAX_TABLE_ENTRIES}"
+            )
         if grouping_type != b"roll":
             raise MediaScrubError("mp4 sbgp supports only roll entries")
         expected = 12 + entry_count * 8
@@ -1570,6 +1610,11 @@ def _rebuild_stbl_table(box_type: bytes, data: bytes, atom: _Mp4Atom) -> bytes:
     if version != 0:
         raise MediaScrubError(f"mp4 {box_type!r} unknown version {version}")
     entry_count = struct.unpack(">I", bytes(body[4:8]))[0]
+    if box_type not in (b"stco", b"co64") and entry_count > _MP4_MAX_TABLE_ENTRIES:
+        raise MediaScrubError(
+            f"mp4 {box_type.decode('ascii', 'replace')} entry count exceeds "
+            f"{_MP4_MAX_TABLE_ENTRIES}"
+        )
     entry_size_by_type = {
         b"stts": 8,
         b"stsc": 12,
@@ -1601,6 +1646,10 @@ def _rebuild_stsd(
     entry_count = struct.unpack(">I", payload[4:8])[0]
     if entry_count == 0:
         return None
+    if entry_count > _MP4_MAX_TABLE_ENTRIES:
+        raise MediaScrubError(
+            f"mp4 stsd entry count exceeds {_MP4_MAX_TABLE_ENTRIES}"
+        )
     remaining = len(payload) - 8
     if entry_count > remaining // 8:
         return None

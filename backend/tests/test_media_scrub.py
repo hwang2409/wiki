@@ -33,8 +33,9 @@ FFMPEG = shutil.which("ffmpeg")
 
 def _gif_bytes(*, with_xmp: bool = False) -> bytes:
     header = b"GIF89a"
-    lsd = struct.pack("<HH", 4, 2) + b"\x00\x00\x00"
+    lsd = struct.pack("<HH", 4, 2) + b"\x80\x00\x00"
     body = bytearray(header + lsd)
+    body += b"\x00\x00\x00\xff\xff\xff"
     if with_xmp:
         body += b"\x21\xff\x0b" + b"XMP DataXMP"
         body += b"\x04meta" + b"\x00"
@@ -1443,9 +1444,9 @@ class GifRound7ExtensionProbes(unittest.TestCase):
     @staticmethod
     def _min_gif_prefix() -> bytes:
         header = b"GIF89a"
-        # 4x2 canvas, no global color table
-        lsd = struct.pack("<HH", 4, 2) + b"\x00\x00\x00"
-        return header + lsd
+        # 4x2 canvas with a two-entry global color table.
+        lsd = struct.pack("<HH", 4, 2) + b"\x80\x00\x00"
+        return header + lsd + b"\x00\x00\x00\xff\xff\xff"
 
     @staticmethod
     def _min_gif_image_data() -> bytes:
@@ -1506,13 +1507,13 @@ class GifRound7ExtensionProbes(unittest.TestCase):
         self.assertEqual(result.data[output_descriptor + 9], 0xe1)
         self.assertTrue(result.data.endswith(image_descriptor + palette + lzw + b"\x3b"))
 
-    def test_false_global_table_fields_are_zeroed(self) -> None:
-        payload = bytearray(self._min_gif_prefix() + self._min_gif_image_data())
-        payload[10] = 0x78  # ignored color-resolution, sort, and size fields
-        payload[11] = 0x47  # ignored background index without a GCT
-        result = media_scrub.scrub_video(bytes(payload), "image/gif")
-        self.assertEqual(result.data[10:12], b"\x00\x00")
-        self.assertTrue(result.data.endswith(self._min_gif_image_data()))
+    def test_false_global_table_fields_are_rejected_without_a_palette(self) -> None:
+        payload = (
+            b"GIF89a" + struct.pack("<HH", 4, 2) + b"\x78\x47\x00"
+            + self._min_gif_image_data()
+        )
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "color table"):
+            media_scrub.scrub_video(payload, "image/gif")
 
     def test_false_local_table_fields_are_zeroed_but_interlace_survives(self) -> None:
         image_descriptor = b"\x2c" + struct.pack("<HHHH", 0, 0, 4, 2) + b"\x67"
@@ -2327,7 +2328,10 @@ class GifRound12LzwProbes(unittest.TestCase):
         # clear, one pixel, EOI; the next sub-block is not part of the
         # compressed stream and must not reach the stored artifact.
         lzw = b"\x02\x02\x44\x01" + bytes([len(marker)]) + marker + b"\x00"
-        payload = b"GIF89a" + struct.pack("<HH", 4, 2) + b"\x00\x00\x00" + image_desc + lzw + b"\x3b"
+        payload = (
+            b"GIF89a" + struct.pack("<HH", 4, 2) + b"\x80\x00\x00"
+            + b"\x00\x00\x00\xff\xff\xff" + image_desc + lzw + b"\x3b"
+        )
         result = media_scrub.scrub_video(payload, "image/gif")
         self.assertNotIn(marker, result.data)
 
@@ -2754,7 +2758,8 @@ class Review15MediaProbeTests(unittest.TestCase):
     def test_gif_cumulative_pixels_are_capped_before_decode(self) -> None:
         image = b"\x2c" + struct.pack("<HHHH", 0, 0, 4096, 4096) + b"\x00\x02\x01\x2c\x00"
         payload = (
-            b"GIF89a" + struct.pack("<HH", 4096, 4096) + b"\x00\x00\x00"
+            b"GIF89a" + struct.pack("<HH", 4096, 4096) + b"\x80\x00\x00"
+            + b"\x00\x00\x00\x00\x00\x00"
             + image + image + b"\x3b"
         )
         with self.assertRaisesRegex(media_scrub.MediaScrubError, "cumulative image pixels"):
@@ -2950,6 +2955,25 @@ class Review18MediaProbeTests(unittest.TestCase):
         with self.assertRaisesRegex(media_scrub.MediaScrubError, "logical screen|pixels"):
             media_scrub.scrub_video(payload, "image/gif")
 
+    def test_gif_image_requires_an_active_color_table(self) -> None:
+        payload = (
+            b"GIF89a" + struct.pack("<HH", 1, 1) + b"\x00\x00\x00"
+            + b"\x2c" + struct.pack("<HHHH", 0, 0, 1, 1) + b"\x00"
+            + b"\x02\x02\x44\x01\x00\x3b"
+        )
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "color table"):
+            media_scrub.scrub_video(payload, "image/gif")
+
+    def test_gif_pixel_index_must_fit_active_color_table(self) -> None:
+        payload = (
+            b"GIF89a" + struct.pack("<HH", 1, 1) + b"\x80\x00\x00"
+            + b"\x00\x00\x00\xff\xff\xff"
+            + b"\x2c" + struct.pack("<HHHH", 0, 0, 1, 1) + b"\x00"
+            + b"\x02\x02\x54\x01\x00\x3b"
+        )
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "pixel index"):
+            media_scrub.scrub_video(payload, "image/gif")
+
     def test_aac_only_mp4_is_rejected_without_video_track(self) -> None:
         with self.assertRaisesRegex(media_scrub.MediaScrubError, "vide/avc1"):
             media_scrub.scrub_video(REAL_AAC_ONLY_MP4.read_bytes(), "video/mp4")
@@ -3049,6 +3073,66 @@ class Review18MediaProbeTests(unittest.TestCase):
             peak, len(payload) * 16,
             f"peak allocation {peak} exceeded 16x input size {len(payload)}",
         )
+
+    @staticmethod
+    def _large_stco_fixture(chunk_count: int = 1_000_000) -> bytes:
+        payload = bytearray(REAL_MP4.read_bytes())
+        tracks = Review17MediaProbeTests._track_info(payload)
+        video = next(track for track in tracks if track["handler"] == b"vide")
+        moov = next(
+            child for child in Review17MediaProbeTests._children(payload, 0, len(payload))
+            if child[0] == b"moov"
+        )
+        trak = next(
+            child for child in Review17MediaProbeTests._children(payload, moov[3], moov[4])
+            if child[0] == b"trak" and child[1] == int(video["trak_start"])
+        )
+        mdia = next(
+            child for child in Review17MediaProbeTests._children(payload, trak[3], trak[4])
+            if child[0] == b"mdia"
+        )
+        minf = next(
+            child for child in Review17MediaProbeTests._children(payload, mdia[3], mdia[4])
+            if child[0] == b"minf"
+        )
+        stbl = next(
+            child for child in Review17MediaProbeTests._children(payload, minf[3], minf[4])
+            if child[0] == b"stbl"
+        )
+        stco_start = int(video["stco_body"]) - 8
+        old_size = struct.unpack(">I", payload[stco_start:stco_start + 4])[0]
+        replacement_body = (
+            b"\x00\x00\x00\x00" + struct.pack(">I", chunk_count)
+            + b"\x00\x00\x00\x00" * chunk_count
+        )
+        replacement = struct.pack(">I", 8 + len(replacement_body)) + b"stco" + replacement_body
+        delta = len(replacement) - old_size
+        payload[stco_start:stco_start + old_size] = replacement
+        for parent in (stbl, minf, mdia, trak, moov):
+            parent_start = parent[1]
+            parent_size = struct.unpack(">I", payload[parent_start:parent_start + 4])[0]
+            payload[parent_start:parent_start + 4] = struct.pack(">I", parent_size + delta)
+        return bytes(payload)
+
+    def test_mp4_millions_of_chunks_reject_before_materialization(self) -> None:
+        payload = self._large_stco_fixture()
+        tracemalloc.start()
+        try:
+            with self.assertRaisesRegex(media_scrub.MediaScrubError, "chunk count"):
+                media_scrub.scrub_video(payload, "video/mp4")
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 32 * 1024 * 1024, f"peak allocation was {peak} bytes")
+
+    def test_mp4_sample_plan_is_reused_for_multiple_mdat_boxes(self) -> None:
+        extra_body = b"second-mdat-marker"
+        payload = REAL_MP4.read_bytes() + (
+            struct.pack(">I", 8 + len(extra_body)) + b"mdat" + extra_body
+        )
+        result = media_scrub.scrub_video(payload, "video/mp4")
+        self.assertNotIn(extra_body, result.data)
+        self.assertEqual(result.data[-len(extra_body):], b"\x00" * len(extra_body))
 
 
 if __name__ == "__main__":

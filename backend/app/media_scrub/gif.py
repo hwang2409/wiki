@@ -301,6 +301,7 @@ def _decode_gif_lzw(
     compressed: bytes,
     min_code_size: int,
     expected_pixels: int,
+    palette_entries: int,
 ) -> bytes:
     if not 2 <= min_code_size <= 8:
         raise MediaScrubError("gif LZW minimum code size outside 2..8")
@@ -336,6 +337,8 @@ def _decode_gif_lzw(
             entry = previous + previous[:1]
         else:
             raise MediaScrubError("gif LZW stream references an undefined code")
+        if entry and max(entry) >= palette_entries:
+            raise MediaScrubError("gif LZW pixel index is outside the active color table")
         if len(pixels) + len(entry) > expected_pixels:
             raise MediaScrubError("gif LZW stream emits more pixels than the image size")
         pixels.extend(entry)
@@ -398,9 +401,12 @@ def _encode_gif_lzw(pixels: bytes, min_code_size: int) -> bytes:
 
 
 def _rebuild_gif_lzw(
-    blocks: list[bytes], min_code_size: int, expected_pixels: int,
+    compressed: bytes, min_code_size: int, expected_pixels: int,
+    palette_entries: int,
 ) -> bytes:
-    pixels = _decode_gif_lzw(b"".join(blocks), min_code_size, expected_pixels)
+    pixels = _decode_gif_lzw(
+        compressed, min_code_size, expected_pixels, palette_entries,
+    )
     compressed = _encode_gif_lzw(pixels, min_code_size)
     output = bytearray([min_code_size])
     for offset in range(0, len(compressed), 255):
@@ -472,9 +478,11 @@ def _emit_image_descriptor(
     if data_start + 1 > end:
         raise MediaScrubError("gif image data truncated")
     lzw_min_code_size = data[data_start]
+    active_ct_entries = local_ct_entries if local_ct_entries else global_ct_entries
+    if active_ct_entries == 0:
+        raise MediaScrubError("gif image has no active color table")
 
     if pending_gce is not None:
-        active_ct_entries = local_ct_entries if local_ct_entries else global_ct_entries
         if pending_gce.transparent_flag:
             if active_ct_entries == 0:
                 raise MediaScrubError(
@@ -495,21 +503,28 @@ def _emit_image_descriptor(
         out.extend(data[lct_start:lct_start + local_ct_size])
     # Decode the image stream through EOI, then emit one deterministic,
     # canonical stream. Bytes in sub-blocks after EOI are not pixel data.
-    lzw_blocks: list[bytes] = []
+    compressed = bytearray()
+    block_count = 0
     sub_offset = data_start + 1
     while sub_offset < end:
         length = data[sub_offset]
         sub_offset += 1
         if length == 0:
             out.extend(_rebuild_gif_lzw(
-                lzw_blocks,
+                bytes(compressed),
                 lzw_min_code_size,
                 expected_pixels,
+                active_ct_entries,
             ))
             return sub_offset, expected_pixels
         block_end = sub_offset + length
         if block_end > end:
             raise MediaScrubError("gif image sub-block extends past payload")
-        lzw_blocks.append(data[sub_offset:block_end])
+        block_count += 1
+        if block_count > max(expected_pixels, _GIF_MAX_EXTENSION_SUB_BLOCKS):
+            raise MediaScrubError("gif image has too many LZW sub-blocks")
+        if len(compressed) + length > expected_pixels * 2 + 64:
+            raise MediaScrubError("gif LZW input is too large for the image")
+        compressed.extend(data[sub_offset:block_end])
         sub_offset = block_end
     raise MediaScrubError("gif image sub-block chain missing terminator")

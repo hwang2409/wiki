@@ -196,14 +196,30 @@ async function main() {
   const inputs = [
     {
       kind: "video",
-      title: "Silky video fixture",
-      caption: "mp4 artifact for WIKI-190",
+      title: "Silky video fixture 1",
+      caption: "first mp4 artifact for WIKI-190",
+      payload: { data_base64: mp4Base64, mime: "video/mp4" },
+    },
+    {
+      kind: "video",
+      title: "Silky video fixture 2",
+      caption: "second mp4 artifact for WIKI-190",
       payload: { data_base64: mp4Base64, mime: "video/mp4" },
     },
     {
       kind: "audio",
-      title: "Silky audio fixture",
-      caption: "wav artifact for WIKI-191",
+      title: "Silky audio fixture 1",
+      caption: "first wav artifact for WIKI-191",
+      payload: {
+        data_base64: wavBase64,
+        mime: "audio/wav",
+        transcript: "hello from the wiki-190 fixture transcript",
+      },
+    },
+    {
+      kind: "audio",
+      title: "Silky audio fixture 2",
+      caption: "second wav artifact for WIKI-191",
       payload: {
         data_base64: wavBase64,
         mime: "audio/wav",
@@ -262,14 +278,12 @@ async function main() {
       controls: node.hasAttribute("controls"),
       preload: node.getAttribute("preload"),
       playsInline: node.hasAttribute("playsinline"),
-      sourceType: node.querySelector("source")?.getAttribute("type"),
-      sourceSrc: node.querySelector("source")?.getAttribute("src") || "",
+      sourceSrc: node.getAttribute("src") || "",
     }));
     if (videoAttrs.tag !== "VIDEO") throw new Error("video element missing");
     if (!videoAttrs.controls) throw new Error("video controls attribute missing");
     if (videoAttrs.preload !== "metadata") throw new Error(`video preload wrong: ${videoAttrs.preload}`);
     if (!videoAttrs.playsInline) throw new Error("video playsInline attribute missing");
-    if (videoAttrs.sourceType !== "video/mp4") throw new Error(`video source type wrong: ${videoAttrs.sourceType}`);
     if (!videoAttrs.sourceSrc.includes(`/api/agents/${TICKET}/artifact/`)) {
       throw new Error(`video source src does not point to artifact API: ${videoAttrs.sourceSrc}`);
     }
@@ -279,13 +293,11 @@ async function main() {
       tag: node.tagName,
       controls: node.hasAttribute("controls"),
       preload: node.getAttribute("preload"),
-      sourceType: node.querySelector("source")?.getAttribute("type"),
-      sourceSrc: node.querySelector("source")?.getAttribute("src") || "",
+      sourceSrc: node.getAttribute("src") || "",
     }));
     if (audioAttrs.tag !== "AUDIO") throw new Error("audio element missing");
     if (!audioAttrs.controls) throw new Error("audio controls attribute missing");
     if (audioAttrs.preload !== "metadata") throw new Error(`audio preload wrong: ${audioAttrs.preload}`);
-    if (audioAttrs.sourceType !== "audio/wav") throw new Error(`audio source type wrong: ${audioAttrs.sourceType}`);
     if (!audioAttrs.sourceSrc.includes(`/api/agents/${TICKET}/artifact/`)) {
       throw new Error(`audio source src does not point to artifact API: ${audioAttrs.sourceSrc}`);
     }
@@ -300,6 +312,13 @@ async function main() {
     if (await inspector.getByTitle("Copy raw payload").count() !== 0) {
       throw new Error("video fullscreen inspector exposed raw payload copy");
     }
+    const firstVideoSrc = await inspector.locator("video").evaluate((node) => node.currentSrc);
+    await inspector.getByTitle("Next artifact (→)").click();
+    await inspector.getByText("Silky video fixture 2").waitFor({ state: "visible" });
+    const secondVideoSrc = await inspector.locator("video").evaluate((node) => node.currentSrc);
+    if (!firstVideoSrc || firstVideoSrc === secondVideoSrc) {
+      throw new Error(`same-kind video navigation did not reload: ${firstVideoSrc} -> ${secondVideoSrc}`);
+    }
     await inspector.getByTitle("Close (Esc)").click();
     await inspector.waitFor({ state: "detached" });
 
@@ -310,6 +329,13 @@ async function main() {
     }
     if (await inspector.getByTitle("Copy raw payload").count() !== 0) {
       throw new Error("audio fullscreen inspector exposed raw payload copy");
+    }
+    const firstAudioSrc = await inspector.locator("audio").evaluate((node) => node.currentSrc);
+    await inspector.getByTitle("Next artifact (→)").click();
+    await inspector.getByText("Silky audio fixture 2").waitFor({ state: "visible" });
+    const secondAudioSrc = await inspector.locator("audio").evaluate((node) => node.currentSrc);
+    if (!firstAudioSrc || firstAudioSrc === secondAudioSrc) {
+      throw new Error(`same-kind audio navigation did not reload: ${firstAudioSrc} -> ${secondAudioSrc}`);
     }
     await inspector.getByTitle("Close (Esc)").click();
     await inspector.waitFor({ state: "detached" });
@@ -391,9 +417,7 @@ async function main() {
     // asserting the RIFF/WAVE marker + fmt+data chunk structure. This is
     // the playback readiness check the reviewer asked for: it fails on any
     // bytes ffmpeg produced but the browser cannot decode.
-    const audioSrc = await audioBlock
-      .locator("audio source")
-      .getAttribute("src");
+    const audioSrc = await audioBlock.locator("audio").getAttribute("src");
     if (!audioSrc) throw new Error("audio source src missing");
     const servedAudio = await page.request.get(`${backend.baseUrl}${audioSrc}`);
     if (servedAudio.status() !== 200) {
@@ -509,7 +533,7 @@ async function main() {
     // Round-3 review flagged that the previous mount-stress just toggled
     // transcript text and never re-mounted the media element itself. Do
     // the honest thing: reload the page a handful of times and confirm
-    // the resulting DOM comes back with exactly one <video> and one
+    // the resulting DOM comes back with exactly two <video> and two
     // <audio>, and no orphaned ones piling up.
     for (let cycle = 0; cycle < 5; cycle += 1) {
       await page.reload({ waitUntil: "domcontentloaded" });
@@ -520,9 +544,9 @@ async function main() {
         video: document.querySelectorAll("video").length,
         audio: document.querySelectorAll("audio").length,
       }));
-      if (counts.video !== 1 || counts.audio !== 1) {
+      if (counts.video !== 2 || counts.audio !== 2) {
         throw new Error(
-          `remount cycle ${cycle}: expected exactly one video+one audio, got video=${counts.video} audio=${counts.audio}`,
+          `remount cycle ${cycle}: expected exactly two video+two audio, got video=${counts.video} audio=${counts.audio}`,
         );
       }
     }

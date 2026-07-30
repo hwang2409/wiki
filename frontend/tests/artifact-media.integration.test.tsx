@@ -7,14 +7,14 @@ import { VideoRenderer, AudioRenderer } from "../src/artifact-renderers";
 
 const TICKET = "WIKI-190";
 
-function makeEvent(artifact: SessionArtifact): SessionEvent {
+function makeEvent(artifact: SessionArtifact, artifactId = "00000000-0000-4000-8000-000000000001"): SessionEvent {
   return {
     id: 1,
     kind: "artifact",
     ts: null,
     text: "",
     disposition: "kept",
-    artifact_id: "00000000-0000-4000-8000-000000000001",
+    artifact_id: artifactId,
     title: "Fixture media",
     caption: "test",
     artifact,
@@ -69,8 +69,7 @@ describe("VideoRenderer", () => {
     expect(video.hasAttribute("controls")).toBe(true);
     expect(video.getAttribute("preload")).toBe("metadata");
     expect(video.getAttribute("playsinline")).not.toBeNull();
-    const source = video.querySelector("source");
-    expect(source?.getAttribute("type")).toBe("video/mp4");
+    expect(video.getAttribute("src")).toContain("artifact");
     expect(screen.getByText("0:03")).toBeTruthy();
   });
 
@@ -132,15 +131,33 @@ describe("VideoRenderer", () => {
     expect(screen.queryByLabelText("Fixture media")).toBeNull();
   });
 
-  test("unmount cleanup clears the <source> child src (defensive decoder release)", () => {
+  test("same-kind navigation reloads the video and keeps playback rate", () => {
+    const first: SessionArtifact = { kind: "video", mime: "video/mp4", ref: "artifact://first" };
+    const second: SessionArtifact = { kind: "video", mime: "video/mp4", ref: "artifact://second" };
+    const loadSpy = vi.spyOn(HTMLMediaElement.prototype, "load");
+    const { rerender } = render(
+      <VideoRenderer artifact={first} event={makeEvent(first, "first")} ticket={TICKET} />,
+    );
+    const select = screen.getByLabelText("Playback speed") as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: "1.5" } });
+    const video = screen.getByLabelText("Fixture media") as HTMLVideoElement;
+    const firstSrc = video.getAttribute("src");
+    rerender(<VideoRenderer artifact={second} event={makeEvent(second, "second")} ticket={TICKET} />);
+    expect(video.getAttribute("src")).not.toBe(firstSrc);
+    expect(video.getAttribute("src")).toContain("/artifact/second");
+    expect(video.playbackRate).toBeCloseTo(1.5);
+    expect(loadSpy).toHaveBeenCalled();
+  });
+
+  test("unmount cleanup clears the media src (defensive decoder release)", () => {
     const pauseSpy = vi.spyOn(HTMLMediaElement.prototype, "pause");
     const loadSpy = vi.spyOn(HTMLMediaElement.prototype, "load");
     const artifact: SessionArtifact = { kind: "video", mime: "video/mp4", ref: "artifact://abc" };
     const { unmount, container } = render(
       <VideoRenderer artifact={artifact} event={makeEvent(artifact)} ticket={TICKET} />,
     );
-    const source = container.querySelector("source");
-    expect(source?.getAttribute("src")).toBeTruthy();
+    const video = container.querySelector("video")!;
+    expect(video.getAttribute("src")).toBeTruthy();
     unmount();
     // The captured-in-effect cleanup path (not a live ref) fires — proves the
     // review's #8 "cleared ref races the cleanup" hazard cannot surface here.
@@ -204,6 +221,24 @@ describe("AudioRenderer", () => {
     const audio = screen.getByLabelText("Fixture media") as HTMLAudioElement;
     fireEvent.change(select, { target: { value: "0.75" } });
     expect(audio.playbackRate).toBeCloseTo(0.75);
+  });
+
+  test("same-kind navigation reloads the audio and keeps playback rate", () => {
+    const first: SessionArtifact = { kind: "audio", mime: "audio/wav", ref: "artifact://first" };
+    const second: SessionArtifact = { kind: "audio", mime: "audio/wav", ref: "artifact://second" };
+    const loadSpy = vi.spyOn(HTMLMediaElement.prototype, "load");
+    const { rerender } = render(
+      <AudioRenderer artifact={first} event={makeEvent(first, "first")} ticket={TICKET} />,
+    );
+    const select = screen.getByLabelText("Playback speed") as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: "1.5" } });
+    const audio = screen.getByLabelText("Fixture media") as HTMLAudioElement;
+    const firstSrc = audio.getAttribute("src");
+    rerender(<AudioRenderer artifact={second} event={makeEvent(second, "second")} ticket={TICKET} />);
+    expect(audio.getAttribute("src")).not.toBe(firstSrc);
+    expect(audio.getAttribute("src")).toContain("/artifact/second");
+    expect(audio.playbackRate).toBeCloseTo(1.5);
+    expect(loadSpy).toHaveBeenCalled();
   });
 
   test("transcript toggle reveals and hides the transcript block", () => {
