@@ -428,7 +428,43 @@ def _prior_config(
         executable = arguments[0] if isinstance(arguments, list) and arguments else None
         if not isinstance(executable, str) or not executable:
             return None
-        prior_config = DaemonConfig(**{**config.__dict__, "executable": Path(executable)})
+        if not isinstance(arguments, list):
+            return None
+        if not all(isinstance(argument, str) for argument in arguments):
+            return None
+        parsed: dict[str, object] = {
+            "executable": Path(executable),
+        }
+        flags: dict[str, str] = {
+            "--port": "port",
+            "--repo-dir": "repo_dir",
+            "--vault-dir": "vault_dir",
+            "--log-path": "log_path",
+        }
+        for index, argument in enumerate(arguments[1:], start=1):
+            if argument == "--host":
+                if index + 1 >= len(arguments) or arguments[index + 1] != "127.0.0.1":
+                    return None
+                continue
+            if argument == "-m":
+                if index + 1 >= len(arguments) or not isinstance(arguments[index + 1], str):
+                    return None
+                parsed["python_module"] = arguments[index + 1]
+                continue
+            field = flags.get(argument)
+            if field is None:
+                continue
+            if index + 1 >= len(arguments):
+                return None
+            value = arguments[index + 1]
+            if field == "port":
+                try:
+                    parsed[field] = int(value)
+                except (TypeError, ValueError):
+                    return None
+            else:
+                parsed[field] = Path(value)
+        prior_config = DaemonConfig(**{**config.__dict__, **parsed})
         if not prior_config.executable.is_file():
             return None
         return PriorDaemon(

@@ -19,7 +19,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from backend.app import daemon as backend_daemon
 from backend.app.agent_runtime.client import SupervisorClient, SupervisorUnavailable
 from backend.app.agent_runtime.store import RuntimePaths
-from backend.app.native_lifecycle import hold_app_lock, hold_supervisor_lock
+from backend.app.native_lifecycle import (
+    NativeRuntimeLockError,
+    hold_app_lock,
+    hold_supervisor_lock,
+)
 from scripts.atomic_swap import atomic_replace, rollback_replace
 from scripts.native_daemon_restart import restart_daemon_in_process
 
@@ -265,6 +269,13 @@ def _wait_for_handover(
                     or status.get("control_attached") is not True
                     or status.get("provider_alive") is not True
                     or status.get("state") not in {"working", "waiting-approval", "idle"}
+                    or (
+                        saved.get("pending_requests")
+                        and (
+                            status.get("state") != "waiting-approval"
+                            or not status.get("pending_requests")
+                        )
+                    )
                 ):
                     observations = []
                     break
@@ -317,6 +328,12 @@ def swap_native_app(
 
     if not staged_bundle.is_dir() and not swap_intent.is_file():
         raise FileNotFoundError(f"missing staged Wiki.app at {staged_bundle}")
+    app_lock_path = runtime_dir / "app.lock"
+    if not allow_missing_app_lock and not app_lock_path.exists():
+        raise NativeRuntimeLockError(
+            f"app lock is missing: {app_lock_path}; the installed sidecar may be old. "
+            "Quit Wiki.app and pass ALLOW_MISSING_APP_LOCK=1 for the one-time upgrade."
+        )
 
     with hold_app_lock(
         runtime_dir,

@@ -27,6 +27,7 @@ from backend.app.agent_runtime.client import (
     SupervisorUnavailable,
 )
 from backend.app.agent_runtime import daemon as agent_daemon
+from backend.app.agent_runtime.claude import ClaudeStreamAdapter
 from backend.app.agent_runtime.codex import CodexAppServerAdapter
 from backend.app.agent_runtime.fake import CodexFixtureAdapter, FixtureAdapterFactory
 from backend.app.agent_runtime.process import (
@@ -786,6 +787,175 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 break
         self.assertIn("session", surfaces)
         self.supervisor.unsubscribe(events)
+
+    async def test_handover_reemits_and_answers_approval_through_real_adapters(self) -> None:
+        await self.supervisor.close()
+        env_root = self.root / "real-adapter-env"
+        env_root.mkdir()
+        codex_env = os.environ.copy()
+        codex_env.update(
+            {
+                "HOME": str(env_root / "codex-home"),
+                "CODEX_HOME": str(env_root / "codex"),
+                "FAKE_PROTOCOL_LOG": str(env_root / "codex-protocol.jsonl"),
+                "FAKE_CODEX_TRANSCRIPT_DIR": str(env_root / "codex-sessions"),
+                "FAKE_CODEX_APPROVAL": "1",
+            }
+        )
+        claude_env = os.environ.copy()
+        claude_env.update(
+            {
+                "HOME": str(env_root / "claude-home"),
+                "CLAUDE_CONFIG_DIR": str(env_root / "claude-config"),
+                "FAKE_PROTOCOL_LOG": str(env_root / "claude-protocol.jsonl"),
+            }
+        )
+
+        async def identity(
+            pid: int | None,
+            _provider: ProviderKind,
+            _session_id: str | None,
+            *,
+            reported_path: str | None = None,
+        ) -> ProviderProcessIdentity | None:
+            if pid is None or reported_path is None:
+                return None
+            return ProviderProcessIdentity(pid, reported_path)
+
+        async def no_identity(
+            _pid: int | None,
+            _provider: ProviderKind,
+            _session_id: str | None,
+            *,
+            reported_path: str | None = None,
+        ) -> ProviderProcessIdentity | None:
+            del reported_path
+            return None
+
+        def factory(record: RunRecord):
+            if record.provider is ProviderKind.CODEX:
+                return CodexAppServerAdapter(
+                    record,
+                    command=(
+                        sys.executable,
+                        "-u",
+                        str(FIXTURES / "fake_codex_app_server.py"),
+                    ),
+                    env=codex_env,
+                    request_timeout=1,
+                    identity_resolver=identity,
+                )
+            return ClaudeStreamAdapter(
+                record,
+                command=(
+                    sys.executable,
+                    "-u",
+                    str(FIXTURES / "fake_claude_stream.py"),
+                ),
+                env=claude_env,
+                request_timeout=1,
+                identity_resolver=no_identity,
+            )
+
+        self.supervisor = Supervisor(
+            self.store,
+            factory,
+            pid_alive=lambda _pid: False,
+        )
+        cases = (
+            (
+                ProviderKind.CODEX,
+                "WIKI-REAL-CODEX-APPROVAL",
+                "thread-recovery",
+                "int:old",
+                {
+                    "request_id": "old",
+                    "request_kind": "item/tool/requestUserInput",
+                    "payload": {
+                        "method": "item/tool/requestUserInput",
+                        "id": "old",
+                        "params": {"questions": [{"question": "Which surface?"}]},
+                    },
+                },
+                0,
+                {"answers": {"wiki_surface": {"answers": ["Agents page"]}}},
+            ),
+            (
+                ProviderKind.CLAUDE,
+                "WIKI-REAL-CLAUDE-APPROVAL",
+                "session-recovery",
+                "str:old",
+                {
+                    "request_id": "old",
+                    "request_kind": "can_use_tool",
+                    "payload": {
+                        "type": "control_request",
+                        "request_id": "old",
+                        "request": {"subtype": "can_use_tool"},
+                    },
+                },
+                "permission-1",
+                {
+                    "behavior": "deny",
+                    "message": "Denied by handover test",
+                    "interrupt": False,
+                    "toolUseID": "toolu_fixture",
+                },
+            ),
+        )
+        for (
+            provider,
+            agent_id,
+            session_id,
+            pending_key,
+            pending,
+            new_request_id,
+            response,
+        ) in cases:
+            with self.subTest(provider=provider.value):
+                record = RunRecord.new(
+                    agent_id=agent_id,
+                    provider=provider,
+                    role="implement",
+                    model="fixture-model",
+                    effort="high" if provider is ProviderKind.CODEX else None,
+                    worktree=str(self.worktree),
+                    prompt="handover approval",
+                )
+                record.state = LifecycleState.WAITING_APPROVAL
+                record.provider_session_id = session_id
+                record.provider_pid = 999_000 + len(cases)
+                record.provider_generation = 1
+                record.pending_requests[pending_key] = pending
+                self.store.create(record)
+
+                results = await self.supervisor.recover_on_start()
+                self.assertEqual(
+                    next(item for item in results if item["run_id"] == record.run_id)[
+                        "action"
+                    ],
+                    "resume",
+                )
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    current = self.store.get(record.run_id)
+                    if current.state is LifecycleState.WAITING_APPROVAL and current.pending_requests:
+                        break
+                    await asyncio.sleep(0.01)
+                current = self.store.get(record.run_id)
+                self.assertEqual(current.state, LifecycleState.WAITING_APPROVAL)
+                self.assertTrue(current.pending_requests)
+                await self.supervisor.respond(record.run_id, new_request_id, response)
+
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    current = self.store.get(record.run_id)
+                    if not current.pending_requests and current.state is not LifecycleState.WAITING_APPROVAL:
+                        break
+                    await asyncio.sleep(0.01)
+                current = self.store.get(record.run_id)
+                self.assertFalse(current.pending_requests)
+                self.assertNotEqual(current.state, LifecycleState.WAITING_APPROVAL)
 
     async def test_background_codex_turn_rejection_is_durably_blocked(self) -> None:
         await self.supervisor.close()

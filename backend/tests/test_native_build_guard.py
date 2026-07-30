@@ -11,7 +11,11 @@ from pathlib import Path
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
-from backend.app.native_lifecycle import hold_app_lock, hold_runtime_locks
+from backend.app.native_lifecycle import (
+    NativeRuntimeLockError,
+    hold_app_lock,
+    hold_runtime_locks,
+)
 import scripts.atomic_swap as atomic_swap_module
 import scripts.native_swap_transaction as native_swap_transaction
 from scripts.atomic_swap import atomic_replace, rollback_replace
@@ -293,6 +297,35 @@ class NativeBuildGuardTests(TestCase):
                     process.wait(timeout=5)
                 if process.stderr:
                     process.stderr.close()
+
+    def test_swap_requires_existing_app_lock_unless_explicitly_overridden(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage_root = root / "stage"
+            live = root / "src-tauri/target/release/bundle/macos/Wiki.app"
+            staged = stage_root / "target/release/bundle/macos/Wiki.app"
+            runtime = root / "runtime"
+            stage_root.mkdir(parents=True)
+            live.mkdir(parents=True)
+            staged.mkdir(parents=True)
+            runtime.mkdir()
+            (live / "marker").write_text("old", encoding="utf-8")
+            (staged / "marker").write_text("new", encoding="utf-8")
+
+            with self.assertRaisesRegex(NativeRuntimeLockError, "app lock is missing"):
+                swap_native_app(stage_root, root, runtime, restart=lambda *_args: True)
+            self.assertFalse((runtime / "app.lock").exists())
+            self.assertEqual((live / "marker").read_text(encoding="utf-8"), "old")
+
+            swap_native_app(
+                stage_root,
+                root,
+                runtime,
+                allow_missing_app_lock=True,
+                restart=lambda *_args: True,
+            )
+            self.assertTrue((runtime / "app.lock").exists())
+            self.assertEqual((live / "marker").read_text(encoding="utf-8"), "new")
 
     def test_swap_rejects_stale_supervisor_pid_before_signal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

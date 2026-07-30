@@ -682,6 +682,85 @@ class DaemonArtifactTests(unittest.TestCase):
             self.assertEqual(config.plist_path.read_bytes(), prior_plist)
             self.assertTrue(loaded)
 
+    def test_failed_upgrade_verifies_restored_prior_port(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / "Wiki.app/Contents/Resources/wiki-backend-sidecar/wiki-backend"
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"new backend")
+            executable.chmod(0o755)
+            config = daemon.config_from_env(
+                overrides={
+                    "WIKI_APP_PATH": str(root / "Wiki.app"),
+                    "WIKI_LAUNCH_AGENTS_DIR": str(root / "LaunchAgents"),
+                    "WIKI_BACKEND_PORT": "18213",
+                }
+            )
+            config.plist_path.parent.mkdir(parents=True)
+            prior_executable = root / "prior" / "wiki-backend"
+            prior_executable.parent.mkdir(parents=True)
+            prior_executable.write_bytes(b"prior backend")
+            prior_executable.chmod(0o755)
+            prior_config = daemon.DaemonConfig(
+                **{
+                    **config.__dict__,
+                    "executable": prior_executable,
+                    "port": 18214,
+                }
+            )
+            config.plist_path.write_bytes(daemon.render_plist(prior_config).encode())
+            loaded = True
+
+            def fake_launchctl(
+                _config: daemon.DaemonConfig, *arguments: str
+            ) -> subprocess.CompletedProcess[str]:
+                nonlocal loaded
+                if arguments[0] == "print":
+                    return subprocess.CompletedProcess(
+                        ["launchctl", *arguments],
+                        0 if loaded else 113,
+                        "" if loaded else daemon._service_absent_message(config),
+                        "",
+                    )
+                if arguments[0] == "bootout":
+                    loaded = False
+                elif arguments[0] == "bootstrap":
+                    loaded = True
+                return subprocess.CompletedProcess(["launchctl", *arguments], 0, "", "")
+
+            seen_ports: list[int] = []
+
+            def fake_wait(
+                current: daemon.DaemonConfig,
+                **_kwargs: object,
+            ) -> dict[str, object]:
+                seen_ports.append(current.port)
+                if current.executable == config.executable:
+                    raise daemon.DaemonError("new daemon did not become healthy")
+                self.assertEqual(current.port, 18214)
+                return {
+                    "healthy": True,
+                    "identity_matches": True,
+                    "payload": {
+                        "status": "ok",
+                        "daemon_managed": True,
+                        "backend_fingerprint": daemon._expected_backend_fingerprint(
+                            prior_config
+                        ),
+                    },
+                }
+
+            with patch.object(daemon, "_launchctl", side_effect=fake_launchctl), patch.object(
+                daemon, "_wait_for_healthy", side_effect=fake_wait
+            ):
+                with self.assertRaisesRegex(
+                    daemon.DaemonError, "new daemon did not become healthy"
+                ):
+                    daemon.install(config)
+
+            self.assertEqual(seen_ports, [18213, 18214])
+            self.assertTrue(loaded)
+
     def test_failed_upgrade_leaves_service_unloaded_when_plist_restore_fails(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

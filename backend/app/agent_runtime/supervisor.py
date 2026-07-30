@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import os
 import re
@@ -43,6 +44,24 @@ DEFAULT_ADAPTER_DETACH_GRACE_SECONDS = 1.0
 DEFAULT_IDEMPOTENCY_CACHE_SIZE = 256
 DEFAULT_WORKER_SOFT_CAP = 5
 _IDEMPOTENT_METHODS = frozenset({"run/start", "run/send_now", "run/send_on_idle"})
+APPROVAL_RECOVERY_WAIT_SECONDS = 5.0
+
+
+def _approval_recovery_prompt(record: RunRecord) -> str | None:
+    if not record.pending_requests:
+        return None
+    details: list[str] = []
+    for pending in record.pending_requests.values():
+        payload = pending.get("payload") if isinstance(pending, dict) else None
+        if isinstance(payload, dict):
+            details.append(json.dumps(payload, sort_keys=True))
+    request_details = "\n".join(details) or "the prior approval request"
+    return (
+        "The provider transport restarted while an approval was pending. "
+        "Recreate the exact approval question now and wait for the user's answer. "
+        "Do not continue without that answer. Prior request details:\n"
+        f"{request_details}"
+    )
 
 
 def _validated_pending_id(value: object) -> str | None:
@@ -1517,7 +1536,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         # Request ids belong to the old transport generation. A resumed
         # provider must re-emit any still-actionable request before the UI can
         # answer it through the new adapter.
-        if recovery_state is not LifecycleState.WAITING_APPROVAL:
+        approval_prompt = (
+            _approval_recovery_prompt(record)
+            if recovery_state is LifecycleState.WAITING_APPROVAL
+            else None
+        )
+        if approval_prompt is not None:
             record = self.store.clear_pending_requests(run_id)
 
         adapter = self.adapter_factory(record)
@@ -1535,6 +1559,27 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             status,
             guard_automatic_resume=automatic,
         )
+        if approval_prompt is not None:
+            status = await adapter.send_now(approval_prompt)
+            record = self.store.update_adapter_status(
+                run_id,
+                status,
+                guard_automatic_resume=automatic,
+            )
+            deadline = time.monotonic() + APPROVAL_RECOVERY_WAIT_SECONDS
+            while time.monotonic() < deadline:
+                current = self.store.get(run_id)
+                if (
+                    current.state is LifecycleState.WAITING_APPROVAL
+                    and current.pending_requests
+                ):
+                    record = current
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise StoreConflict(
+                    "provider did not re-emit the pending approval after transport recovery"
+                )
         if quiesce_operation_id is not None:
             record = self.store.clear_quiesce_marker(
                 run_id,
