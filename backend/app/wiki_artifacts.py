@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 
 from . import knowledge
 from . import wiki_agent_tools
+from .pathwalk import open_relative_file
 
 
 TEXT_LIMIT = 100_000
@@ -275,6 +276,18 @@ def _read_fd_bounded(fd: int, limit: int) -> bytes:
     return data
 
 
+def _open_root_fd(root: Path) -> int:
+    """Open ``root`` as an O_NOFOLLOW directory fd, or raise ArtifactValidationError."""
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    return os.open(root, flags)
+
+
 def _read_pdf_path(raw: str) -> bytes:
     if not raw or not isinstance(raw, str):
         raise ArtifactValidationError("payload.path must be a non-empty string")
@@ -292,39 +305,54 @@ def _read_pdf_path(raw: str) -> bytes:
         raise ArtifactValidationError(
             "payload.path rejected: no allowed roots configured (set WIKI_VAULT_DIR or WIKI_AGENT_RUNTIME_DIR)"
         )
-    if not any(_is_relative_to(resolved, root) for root in roots):
+    # Find the containing root AND the relative path segments — the walker
+    # opens each component with O_NOFOLLOW so a symlink at ANY level
+    # (intermediate directory or leaf) fails. Plain O_NOFOLLOW on a
+    # single os.open() only protects the leaf.
+    containing_root: Path | None = None
+    relative_parts: tuple[str, ...] = ()
+    for root in roots:
+        if _is_relative_to(resolved, root):
+            containing_root = root
+            relative_parts = resolved.relative_to(root).parts
+            break
+    if containing_root is None:
         raise ArtifactValidationError(
             "payload.path is outside the allowed roots (vault, runtime, or archive)"
         )
-    # Open + stat + read all through the same file descriptor to close the
-    # TOCTOU window between validation and reading. O_NOFOLLOW refuses if the
-    # leaf was swapped for a symlink after resolve(). fstat() reports the
-    # object referenced by this exact fd, and the bounded read caps memory
-    # even when a swapped-in file inflates past the pre-check size.
-    open_flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        open_flags |= os.O_NOFOLLOW
-    if hasattr(os, "O_CLOEXEC"):
-        open_flags |= os.O_CLOEXEC
-    if hasattr(os, "O_NONBLOCK"):
-        # NONBLOCK keeps os.open() from blocking on a FIFO/device swapped in
-        # after resolve(); the fstat check below rejects anything non-regular.
-        open_flags |= os.O_NONBLOCK
+    if not relative_parts:
+        raise ArtifactValidationError("payload.path must reference a file inside the root")
     try:
-        fd = os.open(resolved, open_flags)
+        root_fd = _open_root_fd(containing_root)
     except OSError as exc:
-        raise ArtifactValidationError(f"payload.path could not be opened: {exc}") from exc
+        raise ArtifactValidationError(f"allowed root could not be opened: {exc}") from exc
+    # NONBLOCK on the leaf keeps FIFOs/devices swapped in at the last step
+    # from blocking the open — fstat below still rejects them.
+    final_flags = getattr(os, "O_NONBLOCK", 0)
     try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            raise ArtifactValidationError("payload.path must reference a regular file")
-        if info.st_size > PDF_LIMIT:
-            raise ArtifactValidationError(
-                f"pdf payload exceeds the {PDF_LIMIT // (1024 * 1024)}MB pdf limit"
+        try:
+            fd = open_relative_file(
+                root_fd, relative_parts, extra_final_flags=final_flags
             )
-        return _read_fd_bounded(fd, PDF_LIMIT)
+        except OSError as exc:
+            raise ArtifactValidationError(
+                f"payload.path could not be opened: {exc}"
+            ) from exc
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise ArtifactValidationError(
+                    "payload.path must reference a regular file"
+                )
+            if info.st_size > PDF_LIMIT:
+                raise ArtifactValidationError(
+                    f"pdf payload exceeds the {PDF_LIMIT // (1024 * 1024)}MB pdf limit"
+                )
+            return _read_fd_bounded(fd, PDF_LIMIT)
+        finally:
+            os.close(fd)
     finally:
-        os.close(fd)
+        os.close(root_fd)
 
 
 def _write_pdf(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:

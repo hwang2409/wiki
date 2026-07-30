@@ -122,11 +122,29 @@ export type PageTextIndex = {
   text: string;
 };
 
+// Per-page extraction cap. A page that decodes to more than this many chars
+// gets truncated instead of ballooning heap; compressed text streams can
+// expand sharply so we cannot trust page count alone.
+export const PAGE_TEXT_CHAR_LIMIT = 200_000;
+
 export async function extractPageText(page: PDFPageProxy): Promise<string> {
   const content = await page.getTextContent();
-  return content.items
-    .map((item) => (typeof (item as { str?: string }).str === "string" ? (item as { str: string }).str : ""))
-    .join(" ");
+  let total = 0;
+  const parts: string[] = [];
+  for (const item of content.items) {
+    const raw = (item as { str?: string }).str;
+    if (typeof raw !== "string") continue;
+    const remaining = PAGE_TEXT_CHAR_LIMIT - total;
+    if (remaining <= 0) break;
+    if (raw.length + 1 > remaining) {
+      parts.push(raw.slice(0, remaining));
+      total = PAGE_TEXT_CHAR_LIMIT;
+      break;
+    }
+    parts.push(raw);
+    total += raw.length + 1; // account for the join(" ") separator
+  }
+  return parts.join(" ");
 }
 
 export type FindMatch = {
@@ -134,9 +152,23 @@ export type FindMatch = {
   matchIndex: number;
 };
 
-export function findMatches(index: PageTextIndex[], needle: string): FindMatch[] {
+export type FindResult = {
+  matches: FindMatch[];
+  truncated: boolean;
+};
+
+// Ceiling on returned matches. One object per occurrence — a query that
+// hits on every word can otherwise allocate megabytes of match records
+// and stall the UI when we render the badge / navigate matches.
+export const FIND_MATCH_LIMIT = 5000;
+
+export function findMatches(
+  index: PageTextIndex[],
+  needle: string,
+  limit: number = FIND_MATCH_LIMIT,
+): FindResult {
   const trimmed = needle.trim();
-  if (!trimmed) return [];
+  if (!trimmed) return { matches: [], truncated: false };
   const lower = trimmed.toLowerCase();
   const matches: FindMatch[] = [];
   for (const entry of index) {
@@ -147,9 +179,12 @@ export function findMatches(index: PageTextIndex[], needle: string): FindMatch[]
       const at = haystack.indexOf(lower, cursor);
       if (at < 0) break;
       matches.push({ page: entry.page, matchIndex: count });
+      if (matches.length >= limit) {
+        return { matches, truncated: true };
+      }
       cursor = at + lower.length;
       count += 1;
     }
   }
-  return matches;
+  return { matches, truncated: false };
 }

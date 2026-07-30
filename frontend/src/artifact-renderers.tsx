@@ -661,8 +661,13 @@ export function usePdfDocument(url: string): {
         }
         current = pdf;
         const first = await pdf.doc.getPage(1);
-        const viewport = first.getViewport({ scale: 1 });
-        const aspect = viewport.height / viewport.width;
+        let aspect: number;
+        try {
+          const viewport = first.getViewport({ scale: 1 });
+          aspect = viewport.height / viewport.width;
+        } finally {
+          first.cleanup?.();
+        }
         if (cancelled) return;
         setState({ status: "ready", pdf, aspect });
       } catch (error) {
@@ -698,8 +703,9 @@ export function PdfCompactRenderer({
     let cancelled = false;
     let active: { cancel: () => void } | null = null;
     (async () => {
+      let page: import("pdfjs-dist").PDFPageProxy | null = null;
       try {
-        const page = await state.pdf.doc.getPage(1);
+        page = await state.pdf.doc.getPage(1);
         const baseViewport = page.getViewport({ scale: 1 });
         const scale = PDF_INLINE_WIDTH / baseViewport.width;
         if (cancelled) return;
@@ -708,6 +714,10 @@ export function PdfCompactRenderer({
         await render.promise;
       } catch {
         // Retry surfaces the error via reload button.
+      } finally {
+        // Release the compact-preview page proxy in every exit path so
+        // pdf.js doesn't retain a page-1 handle per compact renderer.
+        page?.cleanup?.();
       }
     })();
     return () => {

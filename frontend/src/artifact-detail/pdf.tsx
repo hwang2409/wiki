@@ -37,6 +37,10 @@ const TEXT_INDEX_BATCH_MS = 40;
 // memory. Beyond this the find overlay reports the truncation and only
 // searches the first N pages.
 const TEXT_INDEX_PAGE_BUDGET = 500;
+// Cumulative extracted text ceiling. A page-only budget doesn't help when
+// compressed streams decode to megabytes each — cap total chars too so the
+// text index cannot grow beyond a few MB regardless of page density.
+const TEXT_INDEX_CHAR_BUDGET = 4_000_000;
 
 export function PdfArtifactDetail({
   artifact: _artifact,
@@ -97,10 +101,15 @@ export function PdfArtifactDetail({
     if (loadState.status !== "ready") return;
     let cancelled = false;
     (async () => {
-      const pdfPage = await loadState.pdf.doc.getPage(page);
-      if (cancelled) return;
-      const baseline = pageMetrics(pdfPage, 1);
-      setPageBaseSize(baseline);
+      let pdfPage: import("pdfjs-dist").PDFPageProxy | null = null;
+      try {
+        pdfPage = await loadState.pdf.doc.getPage(page);
+        if (cancelled) return;
+        const baseline = pageMetrics(pdfPage, 1);
+        setPageBaseSize(baseline);
+      } finally {
+        pdfPage?.cleanup?.();
+      }
     })();
     return () => {
       cancelled = true;
@@ -137,25 +146,33 @@ export function PdfArtifactDetail({
     const canvas = canvasRef.current;
     const textLayer = textLayerRef.current;
     (async () => {
-      const pdfPage = await loadState.pdf.doc.getPage(page);
-      if (cancelled) return;
-      const render = renderPageToCanvas(pdfPage, canvas, zoom, window.devicePixelRatio || 1);
-      active = render;
-      await render.promise;
-      if (cancelled) return;
-      textLayer.style.width = `${Math.floor(pageBaseSize.width * zoom)}px`;
-      textLayer.style.height = `${Math.floor(pageBaseSize.height * zoom)}px`;
+      let pdfPage: import("pdfjs-dist").PDFPageProxy | null = null;
       try {
-        await renderTextLayer(pdfPage, textLayer, zoom);
-      } catch {
-        textLayer.replaceChildren();
+        pdfPage = await loadState.pdf.doc.getPage(page);
+        if (cancelled) return;
+        const render = renderPageToCanvas(pdfPage, canvas, zoom, window.devicePixelRatio || 1);
+        active = render;
+        await render.promise;
+        if (cancelled) return;
+        textLayer.style.width = `${Math.floor(pageBaseSize.width * zoom)}px`;
+        textLayer.style.height = `${Math.floor(pageBaseSize.height * zoom)}px`;
+        try {
+          await renderTextLayer(pdfPage, textLayer, zoom);
+        } catch {
+          textLayer.replaceChildren();
+        }
+        if (pendingFocal.current && viewportRef.current) {
+          viewportRef.current.scrollLeft = pendingFocal.current.scrollLeft;
+          viewportRef.current.scrollTop = pendingFocal.current.scrollTop;
+          pendingFocal.current = null;
+        }
+        previousZoom.current = zoom;
+      } finally {
+        // Release the page proxy in every exit path, including cancellation
+        // and render-error, so pdf.js doesn't retain the previously-shown
+        // page across every re-render.
+        pdfPage?.cleanup?.();
       }
-      if (pendingFocal.current && viewportRef.current) {
-        viewportRef.current.scrollLeft = pendingFocal.current.scrollLeft;
-        viewportRef.current.scrollTop = pendingFocal.current.scrollTop;
-        pendingFocal.current = null;
-      }
-      previousZoom.current = zoom;
     })();
     return () => {
       cancelled = true;
@@ -177,13 +194,31 @@ export function PdfArtifactDetail({
     (async () => {
       const accumulator: PageTextIndex[] = [];
       const pageLimit = Math.min(doc.numPages, TEXT_INDEX_PAGE_BUDGET);
+      let totalChars = 0;
+      let indexedPages = 0;
       for (let index = 1; index <= pageLimit; index += 1) {
         if (cancelled) return;
-        const target = await doc.getPage(index);
-        const text = await extractPageText(target);
-        // Release the page early; keeping every page pinned costs memory.
-        target.cleanup?.();
+        let target: import("pdfjs-dist").PDFPageProxy | null = null;
+        let text = "";
+        try {
+          target = await doc.getPage(index);
+          text = await extractPageText(target);
+        } catch (err) {
+          // A single unreadable page mustn't kill the whole index — surface
+          // it as an empty entry so page numbering stays consistent.
+          console.warn(`[pdf] text extraction failed on page ${index}`, err);
+        } finally {
+          // Always release the page proxy, including on cancellation or
+          // extraction error, otherwise pdf.js retains every page it touched.
+          target?.cleanup?.();
+        }
+        if (cancelled) return;
         accumulator.push({ page: index, text });
+        indexedPages = index;
+        totalChars += text.length;
+        if (totalChars >= TEXT_INDEX_CHAR_BUDGET) {
+          break; // char budget wins over page budget for very dense docs
+        }
         // Yield to the event loop between batches so large PDFs stay
         // responsive; the find field remains editable while indexing runs.
         if (index % 8 === 0) {
@@ -192,7 +227,7 @@ export function PdfArtifactDetail({
       }
       if (cancelled) return;
       setTextIndex(accumulator);
-      setIndexedPageCount(pageLimit);
+      setIndexedPageCount(indexedPages);
       setIndexingState("ready");
       // Mark THIS doc as fully indexed only after completion. A cancelled
       // pass leaves the ref alone so a resume can re-enter this effect.
@@ -203,10 +238,15 @@ export function PdfArtifactDetail({
     };
   }, [findOpen, loadState]);
 
-  const matches = useMemo<FindMatch[]>(
-    () => (findValue && indexingState === "ready" ? findMatches(textIndex, findValue) : []),
+  const matchResult = useMemo(
+    () =>
+      findValue && indexingState === "ready"
+        ? findMatches(textIndex, findValue)
+        : { matches: [] as FindMatch[], truncated: false },
     [findValue, indexingState, textIndex],
   );
+  const matches = matchResult.matches;
+  const matchesTruncated = matchResult.truncated;
 
   useEffect(() => {
     if (!matches.length) {
@@ -366,7 +406,7 @@ export function PdfArtifactDetail({
                 {indexingState === "building" && !textIndex.length
                   ? "indexing…"
                   : totalMatches
-                    ? `${activeMatch}/${totalMatches}`
+                    ? `${activeMatch}/${totalMatches}${matchesTruncated ? "+" : ""}`
                     : "0 matches"}
               </span>
               {indexingState === "ready" && numPages > indexedPageCount ? (
@@ -428,6 +468,12 @@ export function PdfArtifactDetail({
   );
 }
 
+// Fixed thumbnail slot geometry — button (128×140) + 6px flex gap. Sidebar
+// virtualization uses this to derive the visible index range from scrollTop
+// without measuring each button.
+const THUMB_SLOT_HEIGHT = 154;
+const THUMB_WINDOW_BUFFER = 6;
+
 function PdfThumbnailSidebar({
   activePage,
   numPages,
@@ -440,138 +486,143 @@ function PdfThumbnailSidebar({
   pdf: import("pdfjs-dist").PDFDocumentProxy | null;
 }) {
   const sidebarRef = useRef<HTMLElement | null>(null);
-  const observerRef = useRef<IntersectionObserver | null>(null);
-  const visibility = useRef<Map<number, () => void>>(new Map());
-  const [visibleSet, setVisibleSet] = useState<ReadonlySet<number>>(() => new Set());
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewportHeight, setViewportHeight] = useState(0);
 
+  // Track scroll + resize so the windowed render slice keeps up. Both are
+  // O(1) per frame, so we don't need to throttle further than the browser
+  // already does.
   useEffect(() => {
-    if (!sidebarRef.current) return;
-    const map = visibility.current;
-    const observer = new IntersectionObserver(
-      (entries) => {
-        setVisibleSet((current) => {
-          const next = new Set(current);
-          let changed = false;
-          for (const entry of entries) {
-            const raw = (entry.target as HTMLElement).dataset.pdfThumbPage;
-            const pageNumber = raw ? Number(raw) : NaN;
-            if (Number.isNaN(pageNumber)) continue;
-            // Add on enter, remove on leave — otherwise the set grows without
-            // bound and every ever-visible canvas stays retained in memory.
-            if (entry.isIntersecting) {
-              if (!next.has(pageNumber)) {
-                next.add(pageNumber);
-                changed = true;
-              }
-            } else if (next.delete(pageNumber)) {
-              changed = true;
-            }
-          }
-          return changed ? next : current;
-        });
-      },
-      { root: sidebarRef.current, rootMargin: "200px" },
-    );
-    observerRef.current = observer;
+    const el = sidebarRef.current;
+    if (!el) return;
+    setViewportHeight(el.clientHeight);
+    setScrollTop(el.scrollTop);
+    const handleScroll = () => setScrollTop(el.scrollTop);
+    const observer = new ResizeObserver(() => setViewportHeight(el.clientHeight));
+    observer.observe(el);
+    el.addEventListener("scroll", handleScroll, { passive: true });
     return () => {
       observer.disconnect();
-      map.clear();
-      observerRef.current = null;
+      el.removeEventListener("scroll", handleScroll);
     };
-  }, []);
+  }, [pdf]);
 
-  const observeCallback = useCallback((element: HTMLElement | null, pageNumber: number) => {
-    if (!observerRef.current) return;
-    if (element) {
-      element.dataset.pdfThumbPage = String(pageNumber);
-      observerRef.current.observe(element);
+  // Auto-scroll the active thumbnail into view when the caller nudges page.
+  useEffect(() => {
+    const el = sidebarRef.current;
+    if (!el || !numPages) return;
+    const anchorTop = (activePage - 1) * THUMB_SLOT_HEIGHT;
+    if (anchorTop < el.scrollTop || anchorTop + THUMB_SLOT_HEIGHT > el.scrollTop + el.clientHeight) {
+      el.scrollTo({ top: Math.max(0, anchorTop - el.clientHeight / 2), behavior: "smooth" });
     }
-  }, []);
+  }, [activePage, numPages]);
 
   if (!pdf || !numPages) {
     return <aside className="artifact-pdf-thumbnails" aria-label="PDF thumbnails" ref={sidebarRef} />;
   }
+
+  // Windowed render: only DOM-mount thumbnails within a small band around
+  // the current scroll position. `content-visibility: auto` alone still
+  // pays one DOM node per page; windowing keeps DOM cost O(viewport pages).
+  const firstVisible = Math.max(0, Math.floor(scrollTop / THUMB_SLOT_HEIGHT) - THUMB_WINDOW_BUFFER);
+  const lastVisibleExclusive = Math.min(
+    numPages,
+    Math.ceil((scrollTop + viewportHeight) / THUMB_SLOT_HEIGHT) + THUMB_WINDOW_BUFFER,
+  );
+  const topSpacer = firstVisible * THUMB_SLOT_HEIGHT;
+  const bottomSpacer = Math.max(0, (numPages - lastVisibleExclusive) * THUMB_SLOT_HEIGHT);
+  const windowed: number[] = [];
+  for (let index = firstVisible; index < lastVisibleExclusive; index += 1) {
+    windowed.push(index + 1);
+  }
+
   return (
-    <aside className="artifact-pdf-thumbnails" aria-label="PDF thumbnails" ref={sidebarRef}>
-      {Array.from({ length: numPages }, (_, index) => index + 1).map((pageNumber) => (
+    <aside
+      className="artifact-pdf-thumbnails"
+      aria-label="PDF thumbnails"
+      data-pdf-thumbnails
+      data-pdf-thumb-window-size={windowed.length}
+      ref={sidebarRef}
+    >
+      {topSpacer ? <div style={{ height: topSpacer, flex: "0 0 auto" }} aria-hidden /> : null}
+      {windowed.map((pageNumber) => (
         <PdfThumbnail
           active={pageNumber === activePage}
           key={pageNumber}
-          onObserve={observeCallback}
           onSelect={onSelect}
           page={pageNumber}
           pdf={pdf}
-          visible={visibleSet.has(pageNumber)}
         />
       ))}
+      {bottomSpacer ? <div style={{ height: bottomSpacer, flex: "0 0 auto" }} aria-hidden /> : null}
     </aside>
   );
 }
 
 function PdfThumbnail({
   active,
-  onObserve,
   onSelect,
   page,
   pdf,
-  visible,
 }: {
   active: boolean;
-  onObserve: (element: HTMLElement | null, page: number) => void;
   onSelect: (page: number) => void;
   page: number;
   pdf: import("pdfjs-dist").PDFDocumentProxy;
-  visible: boolean;
 }) {
-  const wrapperRef = useRef<HTMLButtonElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
   useEffect(() => {
-    onObserve(wrapperRef.current, page);
-  }, [onObserve, page]);
-
-  useEffect(() => {
     const canvas = canvasRef.current;
-    if (!visible || !canvas) return;
+    if (!canvas) return;
     let cancelled = false;
-    let active: { cancel: () => void } | null = null;
+    let renderTask: { cancel: () => void } | null = null;
     (async () => {
-      const target = await pdf.getPage(page);
-      if (cancelled || !canvasRef.current) return;
-      const viewport = target.getViewport({ scale: 1 });
-      const scale = 96 / viewport.width;
-      const render = renderPageToCanvas(target, canvasRef.current, scale, window.devicePixelRatio || 1);
-      active = render;
-      await render.promise;
-      target.cleanup?.();
+      let target: import("pdfjs-dist").PDFPageProxy | null = null;
+      try {
+        target = await pdf.getPage(page);
+        if (cancelled || !canvasRef.current) return;
+        const viewport = target.getViewport({ scale: 1 });
+        const scale = 96 / viewport.width;
+        const render = renderPageToCanvas(
+          target,
+          canvasRef.current,
+          scale,
+          window.devicePixelRatio || 1,
+        );
+        renderTask = render;
+        await render.promise;
+      } catch (err) {
+        // Rendering a single thumbnail can fail (page corruption, worker
+        // shutdown mid-cancel) — swallow so it doesn't bubble to React's
+        // uncaught-error boundary and blank the sidebar.
+        if (!cancelled) console.warn(`[pdf] thumbnail render failed on page ${page}`, err);
+      } finally {
+        // Always release the page proxy so pdf.js doesn't retain a proxy
+        // for every thumbnail that ever mounted, including cancelled ones.
+        target?.cleanup?.();
+      }
     })();
     return () => {
       cancelled = true;
-      active?.cancel();
-      // Release the canvas backing store when the thumbnail scrolls out of
-      // view or the doc changes — browsers free the pixel buffer once width
-      // is set to zero. Without this, sidebar canvases retain memory
-      // proportional to numPages for the life of the document.
+      renderTask?.cancel();
+      // Free the canvas backing store when the thumbnail unmounts (windowing
+      // rolls it off DOM) or the doc changes. Zeroing width is the standard
+      // way to force browsers to drop the pixel buffer.
       if (canvas.width) {
         canvas.width = 0;
         canvas.height = 0;
       }
     };
-  }, [page, pdf, visible]);
-
-  useEffect(() => {
-    if (active && wrapperRef.current) {
-      wrapperRef.current.scrollIntoView({ block: "nearest", behavior: "smooth" });
-    }
-  }, [active]);
+  }, [page, pdf]);
 
   return (
     <button
       aria-current={active ? "true" : undefined}
       aria-label={`Go to page ${page}`}
       className={`artifact-pdf-thumbnail${active ? " is-active" : ""}`}
+      data-pdf-thumb-page={page}
       onClick={() => onSelect(page)}
-      ref={wrapperRef}
       type="button"
     >
       <canvas className="artifact-pdf-thumbnail-canvas" ref={canvasRef} />

@@ -43,6 +43,18 @@ const PAGE_TEXTS_B = [
 ];
 const UNIQUE_WORD_B = "aardvark";
 
+// A large first PDF so indexing takes long enough for the mid-indexing tab
+// switch (A → B → A) to observably interleave. The unique marker on the
+// last page requires the full index to be built before find can locate it.
+const LARGE_FIRST_PDF_PAGES = 40;
+const LARGE_MARKER = "rhinoceros";
+const PAGE_TEXTS_LARGE = Array.from({ length: LARGE_FIRST_PDF_PAGES }, (_, index) => {
+  if (index === LARGE_FIRST_PDF_PAGES - 1) {
+    return `Final large page holds a unique marker: ${LARGE_MARKER}`;
+  }
+  return `Large-doc filler page ${index + 1} with padding text to slow indexing`;
+});
+
 function logStep(message) {
   console.error(`[wiki-188-pdf-playwright] ${message}`);
 }
@@ -177,16 +189,19 @@ async function main() {
   logStep("building pdf fixture bytes");
   const pdfBytes = buildFixturePdf(PAGE_TEXTS);
   const pdfBytesB = buildFixturePdf(PAGE_TEXTS_B);
+  const pdfBytesLarge = buildFixturePdf(PAGE_TEXTS_LARGE);
   logStep("creating isolated backend fixtures");
   const fixtures = makeFixtureRoot("wiki-188-pdf-");
   const artifacts = invokeFixtureWorker(fixtures, [
     { title: "Silky pdf fixture", caption: "Multi-page pdf artifact for WIKI-188", bytes: pdfBytes },
     { title: "Second silky pdf", caption: "Tab-switch target for WIKI-188", bytes: pdfBytesB },
+    { title: "Large silky pdf", caption: "40-page fixture for rapid tab-switch race", bytes: pdfBytesLarge },
   ]);
-  const [primary, secondary] = artifacts;
+  const [primary, secondary, large] = artifacts;
   const transcript = await writeTranscript(fixtures, [
     { ...primary, title: "Silky pdf fixture", caption: "Multi-page pdf artifact for WIKI-188" },
     { ...secondary, title: "Second silky pdf", caption: "Tab-switch target for WIKI-188" },
+    { ...large, title: "Large silky pdf", caption: "40-page fixture for rapid tab-switch race" },
   ]);
   await writeRegistry(fixtures, transcript);
   writeQueue(fixtures.queuePath, TICKET, []);
@@ -352,6 +367,83 @@ async function main() {
     if (!/^1\/1$/.test(matchCountB.trim())) {
       throw new Error(`second-pdf match count unexpected: ${JSON.stringify(matchCountB)}`);
     }
+
+    logStep("rapid A→B→A tab-switch during indexing on the 40-page fixture");
+    await panel.getByRole("button", { name: /Close find/i }).click();
+    const largeBlock = page.locator(`[data-artifact-kind="pdf"][data-artifact-id="${large.artifactId}"]`);
+    await largeBlock.waitFor({ state: "visible" });
+    await largeBlock.getByRole("button", { name: "Show all" }).click();
+    await largeBlock.getByRole("button", { name: /Open in panel/ }).click();
+    await page.waitForFunction(
+      (needle) => document.querySelector(".artifact-pdf-page-textlayer")?.textContent?.includes(needle) ?? false,
+      "Large-doc filler page 1",
+    );
+    // Kick off indexing on the LARGE PDF, then immediately switch to B (a
+    // tiny doc) before A can finish. This is the race the reviewer flagged:
+    // ref stayed set / restart got dropped when the switch landed while an
+    // indexing pass was still in flight.
+    await panel.locator(".artifact-pdf-viewport").focus();
+    await page.keyboard.press("Meta+f");
+    const findInputLarge = panel.locator('input[aria-label="Find in PDF"]');
+    await findInputLarge.waitFor({ state: "visible" });
+    await findInputLarge.fill(LARGE_MARKER);
+    // Don't wait for indexing to finish — switch immediately.
+    await page.waitForFunction(() => {
+      return document.querySelector("[data-pdf-find-status]")?.textContent === "indexing…";
+    }, { timeout: 3000 }).catch(() => {
+      // Small chance indexing finished before we got here on very fast
+      // machines; still exercise the switch as a general regression.
+    });
+    await panel.getByRole("button", { name: /Close find/i }).click();
+    // Switch mid-flight to B, then straight back to the large doc.
+    await secondaryBlock.getByRole("button", { name: /Open in panel/ }).click();
+    await page.waitForFunction(
+      (needle) => document.querySelector(".artifact-pdf-page-textlayer")?.textContent?.includes(needle) ?? false,
+      "Second pdf cover",
+    );
+    await largeBlock.getByRole("button", { name: /Open in panel/ }).click();
+    await page.waitForFunction(
+      (needle) => document.querySelector(".artifact-pdf-page-textlayer")?.textContent?.includes(needle) ?? false,
+      "Large-doc filler page 1",
+    );
+    // Reopen find and confirm the large doc's indexing completes cleanly
+    // this time and can locate the marker on the last page.
+    await panel.locator(".artifact-pdf-viewport").focus();
+    await page.keyboard.press("Meta+f");
+    const findInputLarge2 = panel.locator('input[aria-label="Find in PDF"]');
+    await findInputLarge2.waitFor({ state: "visible" });
+    await findInputLarge2.fill(LARGE_MARKER);
+    await findInputLarge2.press("Enter");
+    await page.waitForFunction(
+      (expected) => {
+        const label = document.querySelector(".artifact-pdf-page-indicator");
+        return label?.textContent?.includes(`page ${expected} of`);
+      },
+      LARGE_FIRST_PDF_PAGES,
+      { timeout: 15000 },
+    );
+    const matchCountLarge = await panel.locator(".artifact-pdf-find span.tabular-nums").innerText();
+    if (!/^1\/1$/.test(matchCountLarge.trim())) {
+      throw new Error(`large-pdf match count unexpected: ${JSON.stringify(matchCountLarge)}`);
+    }
+    // Now switch back to B one more time and re-run its find — the B side
+    // of the ref must also survive multiple bounces.
+    await panel.getByRole("button", { name: /Close find/i }).click();
+    await secondaryBlock.getByRole("button", { name: /Open in panel/ }).click();
+    await page.waitForFunction(
+      (needle) => document.querySelector(".artifact-pdf-page-textlayer")?.textContent?.includes(needle) ?? false,
+      "Second pdf cover",
+    );
+    await panel.locator(".artifact-pdf-viewport").focus();
+    await page.keyboard.press("Meta+f");
+    const findInputBAgain = panel.locator('input[aria-label="Find in PDF"]');
+    await findInputBAgain.waitFor({ state: "visible" });
+    await findInputBAgain.fill(UNIQUE_WORD_B);
+    await findInputBAgain.press("Enter");
+    await page.waitForFunction(() => {
+      const label = document.querySelector(".artifact-pdf-page-indicator");
+      return label?.textContent?.includes("page 2 of");
+    });
 
     const summary = {
       root: fixtures.root,

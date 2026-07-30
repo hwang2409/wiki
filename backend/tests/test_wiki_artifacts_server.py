@@ -555,6 +555,48 @@ class WikiArtifactsTests(unittest.TestCase):
         finally:
             os.close(fd)
 
+    def test_pdf_path_refuses_intermediate_directory_symlink(self) -> None:
+        # Prime a legitimate path under the runtime root, then swap an
+        # intermediate directory for a symlink pointing outside the root.
+        # The dir_fd + O_NOFOLLOW walker must fail; plain O_NOFOLLOW on
+        # the leaf would happily follow the intermediate hop.
+        pdf_bytes = b"%PDF-1.4\nallowed\n"
+        outside_bytes = b"%PDF-1.4\nSECRET-OUTSIDE\n"
+        runtime = self.root / "runtime"
+        runtime.mkdir(exist_ok=True)
+        legit_parent = runtime / "reports"
+        legit_parent.mkdir(exist_ok=True)
+        legit_file = legit_parent / "doc.pdf"
+        legit_file.write_bytes(pdf_bytes)
+        # Sanity: happy path still reads through the walker.
+        self.assertEqual(wiki_artifacts._read_pdf_path(str(legit_file)), pdf_bytes)
+
+        # Now build the swap target OUTSIDE the runtime root and replace
+        # the intermediate directory with a symlink to it.
+        outside_root = self.root.parent / "outside-tree-intermediate"
+        outside_root.mkdir(exist_ok=True)
+        outside_file = outside_root / "doc.pdf"
+        outside_file.write_bytes(outside_bytes)
+        try:
+            os.rename(legit_parent, runtime / "reports.tmp")
+            os.symlink(outside_root, legit_parent)
+            with self.assertRaises(wiki_artifacts.ArtifactValidationError):
+                wiki_artifacts._read_pdf_path(str(legit_file))
+        finally:
+            try:
+                legit_parent.unlink()
+            except OSError:
+                pass
+            try:
+                os.rename(runtime / "reports.tmp", legit_parent)
+            except OSError:
+                pass
+            outside_file.unlink(missing_ok=True)
+            try:
+                outside_root.rmdir()
+            except OSError:
+                pass
+
     def test_pdf_path_rejects_non_regular_files(self) -> None:
         fifo = self.root / "runtime" / "pipe.pdf"
         fifo.parent.mkdir(exist_ok=True)
