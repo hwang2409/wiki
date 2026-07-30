@@ -36,7 +36,7 @@ from .knowledge_schema import (
     is_corruption_error as _corruption_error,
     reset_schema,
 )
-from .semantic_index import SEMANTIC_SCORE_FLOOR, SemanticIndex, SemanticNote
+from .semantic_index import SemanticIndex, SemanticNote
 from .semantic_search import EmbeddingProvider
 
 
@@ -204,13 +204,28 @@ class KnowledgeIndex:
     ):
         self.paths = paths
         self._lock = _path_lock(paths.db_path)
+        lexical_fallback = lambda query, ticket, limit: self.search(
+            query,
+            ticket=ticket,
+            kind="note",
+            limit=limit,
+        )["results"]
         if embedding_provider is _DEFAULT_PROVIDER:
-            self.semantic_index = SemanticIndex(paths.db_path, env=provider_env)
+            self.semantic_index = SemanticIndex(
+                paths.db_path,
+                env=provider_env,
+                lexical_fallback=lexical_fallback,
+                query_error=KnowledgeQueryError,
+            )
         else:
             self.semantic_index = SemanticIndex(
                 paths.db_path,
                 embedding_provider=embedding_provider,
+                lexical_fallback=lexical_fallback,
+                query_error=KnowledgeQueryError,
             )
+        self.semantic_status = self.semantic_index.status
+        self.search_semantic = self.semantic_index.search_with_fallback
 
     @classmethod
     def from_env(
@@ -223,15 +238,6 @@ class KnowledgeIndex:
             KnowledgePaths.from_env(values, **overrides),
             provider_env=values,
         )
-
-    def semantic_status(self) -> dict[str, Any]:
-        return self.semantic_index.status()
-
-    def activate_semantic(self) -> bool:
-        activated = self.semantic_index.activate()
-        if activated:
-            self.request_refresh()
-        return activated
 
     @property
     def rebuild_marker(self) -> Path:
@@ -911,33 +917,6 @@ class KnowledgeIndex:
             raise KnowledgeUnavailable(f"knowledge query failed: {exc}") from exc
         finally:
             connection.close()
-
-    def search_semantic(
-        self,
-        query: str,
-        *,
-        ticket: str | None = None,
-        limit: int = 20,
-        score_floor: float = SEMANTIC_SCORE_FLOOR,
-    ) -> dict[str, Any]:
-        query = query.strip()
-        if not query:
-            raise KnowledgeQueryError("query must contain a searchable word")
-        if not 1 <= limit <= MAX_SEARCH_LIMIT:
-            raise KnowledgeQueryError(f"limit must be between 1 and {MAX_SEARCH_LIMIT}")
-        if ticket is not None and not ticket.strip():
-            raise KnowledgeQueryError("ticket must not be empty")
-        return self.semantic_index.search_with_fallback(
-            query,
-            ticket=ticket,
-            limit=limit,
-            score_floor=score_floor,
-            lexical_fallback=lambda: self.search(
-                query,
-                kind="note",
-                limit=limit,
-            )["results"],
-        )
 
     def _note_paths(self, connection: sqlite3.Connection) -> list[str]:
         return [str(row[0]) for row in connection.execute("SELECT path FROM notes ORDER BY path")]

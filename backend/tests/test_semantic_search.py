@@ -11,7 +11,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
-from contextlib import closing, redirect_stdout
+from contextlib import closing, redirect_stdout, suppress
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
@@ -192,13 +192,13 @@ class SemanticIndexTests(unittest.TestCase):
         )
         index.refresh_all()
         self.assertEqual(provider.calls, [])
-        self.assertTrue(index.activate_semantic())
+        self.assertTrue(index.semantic_index.reset_for_explicit_rebuild())
         index.refresh_all()
         self.assertEqual(len(provider.calls), 1)
 
-    def test_activation_reports_indexing_and_uses_lexical_until_built(self) -> None:
+    def test_explicit_rebuild_reports_indexing_and_uses_lexical_until_built(self) -> None:
         write_note(self.vault / "db.md", "sqlite database notes")
-        self.assertTrue(self.index.activate_semantic())
+        self.assertTrue(self.index.semantic_index.reset_for_explicit_rebuild())
         status = self.index.semantic_status()
         self.assertTrue(status["active"])
         self.assertTrue(status["indexing"])
@@ -265,7 +265,7 @@ class SemanticIndexTests(unittest.TestCase):
             knowledge.KnowledgePaths(self.db, self.vault, self.archive, self.runtime),
             provider,
         )
-        self.assertTrue(first.activate_semantic())
+        self.assertTrue(first.semantic_index.reset_for_explicit_rebuild())
         second = knowledge.KnowledgeIndex(
             knowledge.KnowledgePaths(self.db, self.vault, self.archive, self.runtime),
             provider,
@@ -362,6 +362,62 @@ class SemanticIndexTests(unittest.TestCase):
         )
         with redirect_stdout(io.StringIO()):
             cli["cmd_search"](args)
+        self.assertEqual(provider.calls, [])
+
+    def test_all_search_entry_points_are_read_only_even_after_background_drain(self) -> None:
+        write_note(self.vault / "db.md", "sqlite database private note")
+        provider = FakeEmbeddingProvider()
+        index = knowledge.KnowledgeIndex(
+            knowledge.KnowledgePaths(self.db, self.vault, self.archive, self.runtime),
+            provider,
+        )
+
+        cli = runpy.run_path(
+            str(Path(__file__).resolve().parents[2] / "wiki"),
+            run_name="wiki_read_only_test",
+        )
+        cli["cmd_search"].__globals__["_knowledge_index"] = lambda: index
+        cli_args = argparse.Namespace(
+            mode="semantic",
+            query="database",
+            ticket=None,
+            limit=20,
+            json=True,
+            kind="note",
+            event_type=None,
+            since=None,
+        )
+        with redirect_stdout(io.StringIO()):
+            cli["cmd_search"](cli_args)
+
+        class Request:
+            async def is_disconnected(self) -> bool:
+                return False
+
+        async def exercise_http_entry_points() -> None:
+            with (
+                mock.patch.object(knowledge.KnowledgeIndex, "from_env", return_value=index),
+                mock.patch.object(main, "agents", return_value=[]),
+                mock.patch.object(main.palette, "search", return_value=[]),
+            ):
+                await main.palette_search(Request(), q="database", mode="semantic")
+                await main.knowledge_search(q="database", mode="semantic")
+
+        asyncio.run(exercise_http_entry_points())
+        self.assertFalse(index.refresh_marker.exists())
+        self.assertEqual(provider.calls, [])
+
+        async def drain_background_once() -> None:
+            with mock.patch.object(knowledge, "KnowledgeIndex", return_value=index):
+                task = asyncio.create_task(
+                    knowledge.background_index_loop(index.paths, poll_seconds=0.01)
+                )
+                await asyncio.sleep(0.05)
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+
+        asyncio.run(drain_background_once())
         self.assertEqual(provider.calls, [])
 
     def test_knowledge_index_annotations_resolve(self) -> None:

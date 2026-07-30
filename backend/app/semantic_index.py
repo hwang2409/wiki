@@ -7,10 +7,10 @@ import logging
 import os
 import sqlite3
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from collections.abc import Callable
 from typing import Any, Mapping, Sequence
 
 from .semantic_search import (
@@ -30,6 +30,7 @@ SCHEMA_VERSION = 1
 MAX_EMBED_BATCH_SIZE = 32
 MAX_EMBED_TEXT_CHARS = 120_000
 SEMANTIC_SCORE_FLOOR = 0.15
+MAX_SEARCH_LIMIT = 100
 _DEFAULT_PROVIDER = object()
 
 
@@ -69,6 +70,8 @@ class SemanticIndex:
         embedding_provider: EmbeddingProvider | None | object = _DEFAULT_PROVIDER,
         *,
         env: Mapping[str, str] | None = None,
+        lexical_fallback: Callable[[str, str | None, int], list[dict[str, Any]]] | None = None,
+        query_error: Callable[[str], Exception] | None = None,
     ) -> None:
         self.db_path = Path(f"{knowledge_db_path}.semantic").absolute()
         self.embedding_provider = (
@@ -76,6 +79,8 @@ class SemanticIndex:
             if embedding_provider is _DEFAULT_PROVIDER
             else embedding_provider
         )
+        self.lexical_fallback = lexical_fallback
+        self.query_error = query_error
         self._semantic_error: str | None = None
         self._recovered_corruption = False
 
@@ -197,31 +202,6 @@ class SemanticIndex:
         row = connection.execute("SELECT enabled FROM meta LIMIT 1").fetchone()
         return bool(row and int(row[0]))
 
-    def activate(self) -> bool:
-        """Enable semantic refreshes after an explicit user action."""
-
-        if self.embedding_provider is None:
-            return False
-        connection = self._prepare()
-        try:
-            connection.execute("UPDATE meta SET enabled = 1")
-            connection.commit()
-            self.active_marker.touch(exist_ok=True)
-            return True
-        finally:
-            connection.close()
-
-    def active(self) -> bool:
-        if self.embedding_provider is None:
-            return False
-        if self.active_marker.exists():
-            return True
-        connection = self._prepare()
-        try:
-            return self._enabled(connection)
-        finally:
-            connection.close()
-
     def status(self) -> dict[str, Any]:
         if self.embedding_provider is None:
             return {
@@ -265,13 +245,14 @@ class SemanticIndex:
         }
 
     def reset_for_explicit_rebuild(self) -> bool:
-        if not self.activate():
+        if self.embedding_provider is None:
             return False
         connection = self._prepare()
         try:
             connection.execute("DELETE FROM embeddings")
             connection.execute("UPDATE meta SET built_at = NULL, enabled = 1")
             connection.commit()
+            self.active_marker.touch(exist_ok=True)
         finally:
             connection.close()
         return True
@@ -499,11 +480,20 @@ class SemanticIndex:
         self,
         query: str,
         *,
-        lexical_fallback: Callable[[], list[dict[str, Any]]],
         ticket: str | None = None,
         limit: int = 20,
         score_floor: float = SEMANTIC_SCORE_FLOOR,
     ) -> dict[str, Any]:
+        query = query.strip()
+        if not query:
+            error = "query must contain a searchable word"
+            raise self.query_error(error) if self.query_error else ValueError(error)
+        if not 1 <= limit <= MAX_SEARCH_LIMIT:
+            error = f"limit must be between 1 and {MAX_SEARCH_LIMIT}"
+            raise self.query_error(error) if self.query_error else ValueError(error)
+        if ticket is not None and not ticket.strip():
+            error = "ticket must not be empty"
+            raise self.query_error(error) if self.query_error else ValueError(error)
         try:
             payload = self.search(
                 query,
@@ -528,7 +518,11 @@ class SemanticIndex:
         if payload["semantic"]["available"]:
             return {"query": query, **payload}
         try:
-            fallback_results = lexical_fallback()
+            fallback_results = (
+                self.lexical_fallback(query, ticket, limit)
+                if self.lexical_fallback is not None
+                else []
+            )
         except Exception:
             fallback_results = []
         return {
