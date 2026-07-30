@@ -9,8 +9,6 @@ updated: 2026-07-30
 Todo:
 
 - [P3] WIKI-168 daemon-ize wiki backend — open since graph-engineering D2; survive terminal close, launchd or equivalent
-- [P2] WIKI-176 live worker screencast strip — miniature terminal preview (last ~20 lines) inline in fleet view + per-ticket cards; refresh 2s from raw.jsonl tail. Skim 12 workers at glance w/o click-in
-- [P2] WIKI-180 auto-context injector on spawn — LLM scans vault + related tickets + recent PRs touching same files + related workgraphs; prepends "context prelude" to kickoff prompt. Cuts prompt-writing time. Backend: prelude builder; hook into spawn_agent. Frontend: preview prelude before spawn
 - [P2] WIKI-181 reviewer diversity harness — spawn N reviewers w/ distinct lenses (correctness / security / perf / test-strength) in parallel; synthesize verdicts. Codified adversarial verify — one lens catches what another misses. Wire into next_review (WIKI-171) as opt-in mode
 - [P3] WIKI-182 verdict archaeology — search across all archived reviewer verdicts. "Show every finding about mutation-not-load-bearing." Training data for future reviewer prompts + doctrine mining. Backend: full-text over archived transcripts. Frontend: search page w/ severity + author + date filters
 - [P3] WIKI-183 cross-project search — grep across all orch vaults + PRs + commits + verdicts. Wiki + phoebe + tooling + misc in one query. Backend: multi-repo indexer (respect .gitignore); frontend: unified palette
@@ -75,6 +73,8 @@ In Progress:
 - [P2] WIKI-192 multi-image gallery + lightbox — when artifact payload = N images (e.g. R1/R3/R7 screenshots in WIKI-172), render as responsive grid w/ captions; click any → lightbox w/ arrow-key nav + pinch-zoom. Currently a file-list dump
 - [P2] WIKI-201 markdown inline-image polish — smooth rendering of `![](url)` in agent output: loading placeholder, sized-before-load (aspect-ratio hint or naturalWidth probe), click → lightbox, respect prefers-reduced-motion
 - [P2] WIKI-177 blast radius view pre-spawn — before spawning ticket X, compute which in-flight branches touch same files (git diff main..branch per active branch); display collision-risk preview in spawn dialog. Prevents rebase pain
+- [P2] WIKI-176 live worker screencast strip — miniature terminal preview (last ~20 lines) inline in fleet view + per-ticket cards; refresh 2s from raw.jsonl tail. Skim 12 workers at glance w/o click-in
+- [P2] WIKI-180 auto-context injector on spawn — LLM scans vault + related tickets + recent PRs touching same files + related workgraphs; prepends "context prelude" to kickoff prompt. Cuts prompt-writing time. Backend: prelude builder; hook into spawn_agent. Frontend: preview prelude before spawn
 
 Backlog:
 
