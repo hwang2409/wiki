@@ -43,6 +43,7 @@ _OUTBOX_BACKOFF_BASE_SECONDS = 2.0
 _OUTBOX_BACKOFF_CAP_SECONDS = 300.0
 _TEMP_COUNTER = 0
 _TEMP_COUNTER_LOCK = threading.Lock()
+_TEST_RUNTIME_GUARD = bool(os.environ.get("WIKI_REBASE_TEST_MODE"))
 
 
 @dataclass
@@ -96,7 +97,23 @@ def _durable_state_path() -> Path:
         if isinstance(runtime_dir, (str, Path))
         else Path(tempfile.gettempdir()) / "wiki-agent-runtime"
     )
-    return root / "rebase-bot" / "state.json"
+    state_path = root / "rebase-bot" / "state.json"
+    if (
+        _TEST_RUNTIME_GUARD
+        or os.environ.get("PYTEST_CURRENT_TEST")
+        or os.environ.get("WIKI_REBASE_TEST_MODE")
+    ):
+        live_root = Path.home() / ".wiki" / "agent-runtime"
+        try:
+            state_path.resolve().relative_to(live_root.resolve())
+        except ValueError:
+            pass
+        else:
+            raise RebaseError(
+                "pytest cannot open the live rebase-bot durable store; "
+                "use an isolated AGENT_RUNTIME_DIR"
+            )
+    return state_path
 
 
 def _load_durable_state() -> None:
@@ -223,9 +240,36 @@ def _durable_key(pr_number: int, expected_sha: str) -> str:
 
 def _delivery_id(job: _RebaseJob, result: Mapping[str, Any]) -> str:
     # Stable across process restarts so a delivered event never re-enqueues.
-    status = str(result.get("status") or "")
-    head_sha = str(result.get("head_sha") or "")
-    return f"{job.pr_number}:{job.expected_sha}:{status}:{head_sha}"
+    return _delivery_id_from_parts(
+        job.pr_number,
+        job.expected_sha,
+        result.get("status"),
+        result.get("head_sha"),
+    )
+
+
+def _delivery_id_from_parts(
+    pr_number: Any,
+    expected_sha: Any,
+    status: Any,
+    head_sha: Any,
+) -> str:
+    parts = tuple(
+        str(part or "") for part in (pr_number, expected_sha, status, head_sha)
+    )
+    return ":".join(parts)
+
+
+def _delivery_id_from_record(record: Mapping[str, Any]) -> str:
+    result = record.get("result")
+    if not isinstance(result, Mapping):
+        return ""
+    return _delivery_id_from_parts(
+        record.get("pr_number"),
+        record.get("expected_sha"),
+        result.get("status"),
+        result.get("head_sha"),
+    )
 
 
 def _prune_durable_jobs(clear_job_slot: Callable[[int, str], None] | None = None) -> None:

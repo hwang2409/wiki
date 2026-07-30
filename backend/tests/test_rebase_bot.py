@@ -301,6 +301,138 @@ class RebaseBotTests(unittest.TestCase):
             main._rebase_bot_notification_sender("wiki", "test notification")
         send.assert_not_called()
 
+    def test_pytest_guard_rejects_live_durable_store(self) -> None:
+        live_runtime = Path.home() / ".wiki" / "agent-runtime"
+        fake_main = SimpleNamespace(AGENT_RUNTIME_DIR=live_runtime)
+        with mock.patch.object(rebase_bot, "_main", return_value=fake_main):
+            with self.assertRaisesRegex(RebaseError, "pytest cannot open the live"):
+                rebase_durable._durable_state_path()
+
+    def test_rebase_test_uses_session_runtime_only(self) -> None:
+        session_runtime = Path(os.environ["WIKI_AGENT_RUNTIME_DIR"]).resolve()
+        live_root = (Path.home() / ".wiki" / "agent-runtime").absolute()
+
+        def reject_live_path(path: Path) -> None:
+            candidate = path.absolute()
+            if candidate == live_root or live_root in candidate.parents:
+                raise AssertionError(f"test touched live runtime: {candidate}")
+
+        original_open = Path.open
+        original_replace = Path.replace
+        original_write_text = Path.write_text
+
+        def guarded_open(path: Path, *args: object, **kwargs: object):
+            reject_live_path(path)
+            return original_open(path, *args, **kwargs)
+
+        def guarded_replace(path: Path, target: Path):
+            reject_live_path(path)
+            reject_live_path(target)
+            return original_replace(path, target)
+
+        def guarded_write_text(path: Path, *args: object, **kwargs: object):
+            reject_live_path(path)
+            return original_write_text(path, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as raw:
+            fake_main = SimpleNamespace(
+                AGENT_RUNTIME_DIR=session_runtime,
+                _registry_agent=lambda _registry, _worker: (
+                    "WIKI-175-IMPL",
+                    {},
+                    {"worktree": raw, "orch": "wiki"},
+                ),
+                _read_agent_registry=lambda: {},
+            )
+            with (
+                mock.patch.object(rebase_bot, "_main", return_value=fake_main),
+                mock.patch.object(rebase_bot, "_validate_pr_binding"),
+                mock.patch.object(rebase_bot, "_start_rebase_thread"),
+                mock.patch.object(Path, "open", guarded_open),
+                mock.patch.object(Path, "replace", guarded_replace),
+                mock.patch.object(Path, "write_text", guarded_write_text),
+            ):
+                result = rebase_bot.rebase_dirty_pr(
+                    175,
+                    "WIKI-175",
+                    "WIKI-175-IMPL",
+                    gate=lambda _pr: {
+                        "raw": {
+                            "mergeable": "CONFLICTING",
+                            "repo": "hwang2409/wiki",
+                            "head_ref_name": "feature",
+                            "head_sha": "isolated-test",
+                        }
+                    },
+                )
+        self.assertEqual(result["status"], "started")
+        durable_path = rebase_durable._durable_state_path().resolve()
+        self.assertTrue(durable_path.is_relative_to(session_runtime), durable_path)
+
+    def test_rebase_worker_thread_stays_in_isolated_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            parent_runtime = Path(raw) / "parent-runtime"
+            isolated_runtime = Path(raw) / "isolated-runtime"
+            parent_state = parent_runtime / "rebase-bot" / "state.json"
+            parent_state.parent.mkdir(parents=True)
+            parent_state.write_text("parent canary\n", encoding="utf-8")
+            fake_main = SimpleNamespace(AGENT_RUNTIME_DIR=isolated_runtime)
+            job = rebase_durable._RebaseJob(
+                job_id="thread-isolation",
+                worktree=Path(raw) / "worktree",
+                prompt="prompt",
+                done=threading.Event(),
+                pr_number=175,
+                expected_sha="retry-test-thread",
+                ticket="WIKI-220",
+                worker_id="WIKI-220-IMPL",
+                durable=True,
+            )
+            result = {
+                "status": "escalated",
+                "head_sha": "retry-test-thread",
+                "resolved_files": [],
+                "escalated_hunks": ["test"],
+            }
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"WIKI_AGENT_RUNTIME_DIR": str(parent_runtime)},
+                ),
+                mock.patch.object(rebase_bot, "_main", return_value=fake_main),
+                mock.patch.object(rebase_bot, "_validate_pr_binding"),
+                mock.patch.object(rebase_bot, "_preflight_worktree"),
+                mock.patch.object(
+                    rebase_bot, "_run_rebase_helper_checked", return_value=result
+                ),
+            ):
+                thread = rebase_bot._start_rebase_thread(job)
+                self.assertTrue(job.done.wait(timeout=5))
+                thread.join(timeout=5)
+                self.assertFalse(thread.is_alive())
+
+            self.assertEqual(parent_state.read_text(encoding="utf-8"), "parent canary\n")
+            self.assertTrue(
+                (isolated_runtime / "rebase-bot" / "state.json").exists()
+            )
+
+    def test_delivery_id_keeps_empty_head_field_for_retries(self) -> None:
+        job = rebase_durable._RebaseJob(
+            job_id="missing-head",
+            worktree=Path("."),
+            prompt="prompt",
+            done=threading.Event(),
+            pr_number=175,
+            expected_sha="retry-test-missing-head",
+        )
+
+        first = rebase_durable._delivery_id(job, {"status": "escalated"})
+        second = rebase_durable._delivery_id(job, {"status": "escalated"})
+
+        self.assertEqual(first, "175:retry-test-missing-head:escalated:")
+        self.assertTrue(first)
+        self.assertEqual(first, second)
+
     def test_duplicate_logical_notification_is_sent_once(self) -> None:
         sent: list[tuple[str, str]] = []
         result = {
