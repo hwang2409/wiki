@@ -290,6 +290,30 @@ async function main() {
       throw new Error(`audio source src does not point to artifact API: ${audioAttrs.sourceSrc}`);
     }
 
+    logStep("opening video and audio fullscreen inspectors");
+    await videoBlock.getByTitle("Fullscreen (⌘↩)").click();
+    const inspector = page.locator(".artifact-inspector");
+    await inspector.waitFor({ state: "visible" });
+    if (await inspector.locator("video").count() !== 1) {
+      throw new Error("video fullscreen inspector did not render a video");
+    }
+    if (await inspector.getByTitle("Copy raw payload").count() !== 0) {
+      throw new Error("video fullscreen inspector exposed raw payload copy");
+    }
+    await inspector.getByTitle("Close (Esc)").click();
+    await inspector.waitFor({ state: "detached" });
+
+    await audioBlock.getByTitle("Fullscreen (⌘↩)").click();
+    await inspector.waitFor({ state: "visible" });
+    if (await inspector.locator("audio").count() !== 1) {
+      throw new Error("audio fullscreen inspector did not render audio");
+    }
+    if (await inspector.getByTitle("Copy raw payload").count() !== 0) {
+      throw new Error("audio fullscreen inspector exposed raw payload copy");
+    }
+    await inspector.getByTitle("Close (Esc)").click();
+    await inspector.waitFor({ state: "detached" });
+
     logStep("verifying transcript reveal toggle");
     const transcriptToggle = audioBlock.getByRole("button", { name: /Show transcript/i });
     await transcriptToggle.click();

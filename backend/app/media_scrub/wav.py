@@ -8,6 +8,7 @@ a PCM fmt chunk cannot appear in the output because we only pack the
 """
 from __future__ import annotations
 
+import math
 import struct
 from typing import Final
 
@@ -55,6 +56,7 @@ def scrub_wav(data: bytes) -> MediaScrubResult:
     fmt_byte_rate = 0
     fmt_bits = 0
     fmt_block_align = 0
+    fmt_format_code = _WAV_FORMAT_PCM
 
     offset = 12
     end = len(data)
@@ -75,7 +77,8 @@ def scrub_wav(data: bytes) -> MediaScrubResult:
             if rebuilt_fmt is not None:
                 raise MediaScrubError("wav duplicate fmt chunk")
             (rebuilt_fmt, fmt_channels, fmt_sample_rate,
-             fmt_byte_rate, fmt_bits, fmt_block_align) = _wav_rebuild_fmt(payload)
+             fmt_byte_rate, fmt_bits, fmt_block_align,
+             fmt_format_code) = _wav_rebuild_fmt(payload)
         elif chunk_id == b"data":
             if data_payload is not None:
                 raise MediaScrubError("wav duplicate data chunk")
@@ -109,6 +112,7 @@ def scrub_wav(data: bytes) -> MediaScrubResult:
     duration_ms = int(round(frames * 1000 / fmt_sample_rate)) if frames else 0
     peaks = _wav_stream_peaks(
         data_payload, 0, len(data_payload), fmt_channels, fmt_bits,
+        fmt_format_code,
     )
 
     body = bytearray(b"WAVE")
@@ -137,7 +141,7 @@ def _wav_emit_chunk(body: bytearray, chunk_id: bytes, payload: bytes) -> None:
         body.append(0)
 
 
-def _wav_rebuild_fmt(payload: bytes) -> tuple[bytes, int, int, int, int]:
+def _wav_rebuild_fmt(payload: bytes) -> tuple[bytes, int, int, int, int, int, int]:
     """Parse and rebuild fmt from validated fields only.
 
     Every byte in the returned fmt chunk is either a struct.pack of a
@@ -195,7 +199,12 @@ def _wav_rebuild_fmt(payload: bytes) -> tuple[bytes, int, int, int, int]:
             + struct.pack("<HHI", 22, valid_bits, channel_mask)
             + subformat
         )
-        return rebuilt, channels, sample_rate, byte_rate, bits, block_align
+        effective_format = (
+            _WAV_FORMAT_IEEE_FLOAT
+            if subformat == _WAV_KSDATAFORMAT_IEEE_FLOAT
+            else _WAV_FORMAT_PCM
+        )
+        return rebuilt, channels, sample_rate, byte_rate, bits, block_align, effective_format
 
     if format_code == _WAV_FORMAT_PCM:
         allowed_bits = _WAV_PCM_ALLOWED_BITS
@@ -215,7 +224,7 @@ def _wav_rebuild_fmt(payload: bytes) -> tuple[bytes, int, int, int, int]:
     rebuilt = struct.pack(
         "<HHIIHH", format_code, channels, sample_rate, byte_rate, block_align, bits,
     )
-    return rebuilt, channels, sample_rate, byte_rate, bits, block_align
+    return rebuilt, channels, sample_rate, byte_rate, bits, block_align, format_code
 
 
 def _wav_validate_bit_depth_and_alignment(
@@ -261,8 +270,14 @@ def _wav_stream_peaks(
     payload_end: int,
     channels: int,
     bits: int,
+    format_code: int = _WAV_FORMAT_PCM,
 ) -> list[int] | None:
-    if channels <= 0 or bits not in (8, 16, 24, 32):
+    if channels <= 0:
+        return None
+    if format_code == _WAV_FORMAT_IEEE_FLOAT:
+        if bits not in _WAV_FLOAT_ALLOWED_BITS:
+            return None
+    elif bits not in (8, 16, 24, 32):
         return None
     bytes_per_sample = bits // 8
     frame_stride = bytes_per_sample * channels
@@ -275,30 +290,32 @@ def _wav_stream_peaks(
     bucket_frames = max(1, (total_frames + WAVEFORM_MAX_PEAKS - 1) // WAVEFORM_MAX_PEAKS)
     peaks: list[int] = []
     view = memoryview(data)[payload_start:payload_end]
-    max_amplitude = (1 << (bits - 1)) if bits > 8 else 128
+    max_amplitude = 1.0 if format_code == _WAV_FORMAT_IEEE_FLOAT else ((1 << (bits - 1)) if bits > 8 else 128)
     frame_index = 0
     while frame_index < total_frames:
         bucket_end = min(frame_index + bucket_frames, total_frames)
         peak = 0
         f = frame_index
         while f < bucket_end:
-            sample_start = f * frame_stride
-            if bits == 8:
-                value = abs(view[sample_start] - 128)
-            elif bits == 16:
-                value = abs(
-                    int.from_bytes(view[sample_start:sample_start + 2], "little", signed=True)
-                )
-            elif bits == 24:
-                value = abs(
-                    int.from_bytes(view[sample_start:sample_start + 3], "little", signed=True)
-                )
-            else:  # 32
-                value = abs(
-                    int.from_bytes(view[sample_start:sample_start + 4], "little", signed=True)
-                )
-            if value > peak:
-                peak = value
+            frame_start = f * frame_stride
+            for channel in range(channels):
+                sample_start = frame_start + channel * bytes_per_sample
+                if format_code == _WAV_FORMAT_IEEE_FLOAT:
+                    unpack_format = "<f" if bits == 32 else "<d"
+                    value = struct.unpack_from(unpack_format, view, sample_start)[0]
+                    if not math.isfinite(value):
+                        raise MediaScrubError("wav float sample is not finite")
+                    value = abs(value)
+                elif bits == 8:
+                    value = abs(view[sample_start] - 128)
+                elif bits == 16:
+                    value = abs(int.from_bytes(view[sample_start:sample_start + 2], "little", signed=True))
+                elif bits == 24:
+                    value = abs(int.from_bytes(view[sample_start:sample_start + 3], "little", signed=True))
+                else:  # 32-bit PCM
+                    value = abs(int.from_bytes(view[sample_start:sample_start + 4], "little", signed=True))
+                if value > peak:
+                    peak = value
             f += 1
         normalized = min(255, int(peak * 255 / max_amplitude))
         peaks.append(normalized)

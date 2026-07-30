@@ -279,7 +279,7 @@ export function ArtifactBlock({
             ) : null}
             {resolvedArtifact.kind === "table" ? (
               <TableCopyMenu artifact={resolvedArtifact} onCopied={showCopied} />
-            ) : (
+            ) : resolvedArtifact.kind === "video" || resolvedArtifact.kind === "audio" ? null : (
               <button className="artifact-action" type="button" onClick={() => void copy()}>
                 <Copy aria-hidden="true" size={12} />
                 <span className="artifact-action-label">{copied ? "Copied" : "Copy"}</span>

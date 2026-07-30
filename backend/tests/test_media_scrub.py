@@ -2547,5 +2547,129 @@ class UnsupportedMimeTests(unittest.TestCase):
             media_scrub.scrub_audio(b"\x00" * 32, "video/mp4")
 
 
+class Review15MediaProbeTests(unittest.TestCase):
+    def test_unknown_avc_nal_with_marker_is_rejected(self) -> None:
+        payload = bytearray(REAL_MP4.read_bytes())
+        mdat_type = payload.find(b"mdat")
+        self.assertGreater(mdat_type, 0)
+        nal_length = struct.unpack(">I", payload[mdat_type + 4:mdat_type + 8])[0]
+        nal_start = mdat_type + 8
+        self.assertGreater(nal_length, 24)
+        marker = b"review15-unknown-nal-marker"
+        payload[nal_start] = (payload[nal_start] & 0xE0) | 30
+        payload[nal_start + 1:nal_start + 1 + len(marker)] = marker
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "unsupported NAL type 30"
+        ):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+    def test_in_band_parameter_set_nal_with_marker_is_rejected(self) -> None:
+        payload = bytearray(REAL_MP4.read_bytes())
+        mdat_type = payload.find(b"mdat")
+        nal_start = mdat_type + 8
+        marker = b"review15-in-band-parameter-marker"
+        payload[nal_start] = (payload[nal_start] & 0xE0) | 7
+        payload[nal_start + 1:nal_start + 1 + len(marker)] = marker
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "in-band parameter-set"
+        ):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+    def test_huge_uniform_sample_count_rejects_before_range_expansion(self) -> None:
+        payload = bytearray(REAL_MP4.read_bytes())
+        stsc_type = payload.find(b"stsc")
+        stsz_type = payload.find(b"stsz")
+        self.assertGreater(stsc_type, 0)
+        self.assertGreater(stsz_type, 0)
+        payload[stsc_type + 16:stsc_type + 20] = struct.pack(">I", 200_000)
+        old_size = struct.unpack(">I", payload[stsz_type - 4:stsz_type])[0]
+        new_body = b"\x00\x00\x00\x00" + struct.pack(">II", 1, 200_000)
+        new_box = struct.pack(">I", 8 + len(new_body)) + b"stsz" + new_body
+        old_start = stsz_type - 4
+        payload[old_start:old_start + old_size] = new_box
+        delta = len(new_box) - old_size
+        for parent_type in (b"stbl", b"minf", b"mdia", b"trak", b"moov"):
+            parent_type_pos = payload.find(parent_type, 0, old_start)
+            parent_size = struct.unpack(">I", payload[parent_type_pos - 4:parent_type_pos])[0]
+            payload[parent_type_pos - 4:parent_type_pos] = struct.pack(">I", parent_size + delta)
+        raw = bytes(payload)
+        tracemalloc.start()
+        try:
+            with self.assertRaisesRegex(
+                media_scrub.MediaScrubError, "chunk extent|sample_count"
+            ):
+                media_scrub.scrub_video(raw, "video/mp4")
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 5 * 1024 * 1024, f"peak allocation was {peak} bytes")
+
+    def test_mp4_clock_fields_and_language_are_normalized(self) -> None:
+        payload = bytearray(REAL_MP4.read_bytes())
+        for box_type in (b"mvhd", b"tkhd", b"mdhd"):
+            type_pos = payload.find(box_type)
+            body_pos = type_pos + 4
+            payload[body_pos + 4:body_pos + 8] = b"GPS!"
+            payload[body_pos + 8:body_pos + 12] = b"TIME"
+        result = media_scrub.scrub_video(bytes(payload), "video/mp4")
+        for box_type in (b"mvhd", b"tkhd", b"mdhd"):
+            type_pos = result.data.find(box_type)
+            body_pos = type_pos + 4
+            self.assertEqual(result.data[body_pos + 4:body_pos + 12], b"\x00" * 8)
+        mdhd_pos = result.data.find(b"mdhd")
+        self.assertEqual(result.data[mdhd_pos + 24:mdhd_pos + 26], b"\x00\x00")
+
+    def test_required_mp4_children_cannot_be_renamed(self) -> None:
+        for box_type in (b"tkhd", b"mdhd", b"hdlr", b"vmhd", b"dinf"):
+            with self.subTest(box_type=box_type):
+                payload = bytearray(REAL_MP4.read_bytes())
+                type_pos = payload.find(box_type)
+                payload[type_pos:type_pos + 4] = b"bad!"
+                with self.assertRaisesRegex(
+                    media_scrub.MediaScrubError, box_type.decode("ascii")
+                ):
+                    media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+    def test_gif_dropped_extension_blocks_are_not_retained(self) -> None:
+        blocks = b"\xff" + (b"x" * 255)
+        comment = b"\x21\xfe" + blocks * 1882 + b"\x00"
+        payload = GifRound7ExtensionProbes._min_gif_prefix() + comment + GifRound7ExtensionProbes._min_gif_image_data()
+        tracemalloc.start()
+        try:
+            result = media_scrub.scrub_video(payload, "image/gif")
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertNotIn(b"x" * 32, result.data)
+        self.assertLess(peak, 3 * 1024 * 1024, f"peak allocation was {peak} bytes")
+
+    def test_gif_extension_sub_block_count_is_capped(self) -> None:
+        comment = b"\x21\xfe" + (b"\x01x" * 4097) + b"\x00"
+        payload = GifRound7ExtensionProbes._min_gif_prefix() + comment
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "too many sub-blocks"):
+            media_scrub.scrub_video(payload, "image/gif")
+
+    def test_gif_cumulative_pixels_are_capped_before_decode(self) -> None:
+        image = b"\x2c" + struct.pack("<HHHH", 0, 0, 4096, 4096) + b"\x00\x02\x01\x2c\x00"
+        payload = GifRound7ExtensionProbes._min_gif_prefix() + image + image + b"\x3b"
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "cumulative image pixels"):
+            media_scrub.scrub_video(payload, "image/gif")
+
+    @staticmethod
+    def _float_wav(value: float) -> bytes:
+        fmt = struct.pack("<HHIIHH", 3, 1, 16_000, 64_000, 4, 32)
+        data = struct.pack("<f", value)
+        body = b"WAVE" + b"fmt " + struct.pack("<I", len(fmt)) + fmt + b"data" + struct.pack("<I", len(data)) + data
+        return b"RIFF" + struct.pack("<I", len(body)) + body
+
+    def test_float_wav_peaks_unpack_ieee_samples(self) -> None:
+        result = media_scrub.scrub_audio(self._float_wav(0.5), "audio/wav")
+        self.assertEqual(result.peaks, [127])
+
+    def test_float_wav_rejects_non_finite_samples(self) -> None:
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "not finite"):
+            media_scrub.scrub_audio(self._float_wav(float("nan")), "audio/wav")
+
+
 if __name__ == "__main__":
     unittest.main()

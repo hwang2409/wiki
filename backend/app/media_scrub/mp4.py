@@ -45,6 +45,7 @@ the exact delta. mdat sits at the same absolute offset as before.
 """
 from __future__ import annotations
 
+from collections.abc import Iterator
 import struct
 from dataclasses import dataclass
 from typing import Final
@@ -98,6 +99,7 @@ _MP4_SAMPLE_ENTRY_REQUIRED_CONFIG: Final = {
     b"avc1": b"avcC",
 }
 _MP4_MAX_SAMPLES: Final = 16_777_216
+_MP4_AVC_SAMPLE_NAL_TYPES: Final = {1, 5, 6}
 # Additional stbl children beyond stsd. Every allowed type below has a
 # field-level rebuild via struct.pack that emits exactly the parsed
 # entry_count worth of entries — trailing bytes cannot survive because
@@ -135,12 +137,13 @@ def scrub_mp4(data: bytes) -> MediaScrubResult:
         if atom.type == b"mdat" and atom.body_start == atom.body_end:
             raise MediaScrubError("mp4 mdat body is empty")
 
-    sample_ranges = _collect_sample_ranges(data, top_atoms)
     mdat_ranges = [
         (atom.body_start, atom.body_end)
         for atom in top_atoms if atom.type == b"mdat"
     ]
-    _validate_sample_ranges(data, sample_ranges, mdat_ranges)
+    _validate_sample_ranges(
+        data, _collect_sample_ranges(data, top_atoms, mdat_ranges), mdat_ranges,
+    )
 
     ftyp = _rebuild_ftyp(data, top_atoms[0])
     if len(ftyp) != top_atoms[0].size:
@@ -185,7 +188,7 @@ def scrub_mp4(data: bytes) -> MediaScrubResult:
                 raise MediaScrubError("mp4 mdat body is empty")
             mdat_non_empty = True
             scrubbed_body = bytearray(body_len)
-            for sample_range in sample_ranges:
+            for sample_range in _collect_sample_ranges(data, top_atoms, mdat_ranges):
                 sample_start = sample_range.start
                 sample_end = sample_range.end
                 if sample_start < atom.body_start or sample_end > atom.body_end:
@@ -263,10 +266,11 @@ def scrub_mp4(data: bytes) -> MediaScrubResult:
 
 
 def _collect_sample_ranges(
-    data: bytes, top_atoms: list[_Mp4Atom],
-) -> list[_Mp4SampleRange]:
-    """Return absolute byte ranges owned by all non-fragmented samples."""
-    ranges: list[_Mp4SampleRange] = []
+    data: bytes,
+    top_atoms: list[_Mp4Atom],
+    mdat_ranges: list[tuple[int, int]],
+) -> Iterator[_Mp4SampleRange]:
+    """Yield absolute sample ranges after validating all chunk extents."""
     for moov in (atom for atom in top_atoms if atom.type == b"moov"):
         for trak in _parse_container(data, moov.body_start, moov.body_end):
             if trak.type != b"trak":
@@ -279,24 +283,24 @@ def _collect_sample_ranges(
                         continue
                     for stbl in _parse_container(data, minf.body_start, minf.body_end):
                         if stbl.type == b"stbl":
-                            ranges.extend(
-                                _collect_sample_ranges_from_stbl(
-                                    data, stbl.body_start, stbl.body_end,
-                                )
+                            yield from _collect_sample_ranges_from_stbl(
+                                data, stbl.body_start, stbl.body_end, mdat_ranges,
                             )
-    return ranges
 
 
 def _collect_sample_ranges_from_stbl(
-    data: bytes, body_start: int, body_end: int,
-) -> list[_Mp4SampleRange]:
+    data: bytes,
+    body_start: int,
+    body_end: int,
+    mdat_ranges: list[tuple[int, int]],
+) -> Iterator[_Mp4SampleRange]:
     tables = {
         atom.type: atom
         for atom in _parse_container(data, body_start, body_end)
         if atom.type in {b"stsc", b"stsz", b"stco", b"co64"}
     }
     if not tables:
-        return []
+        return
     if b"stsc" not in tables or b"stsz" not in tables:
         raise MediaScrubError("mp4 sample tables missing stsc or stsz")
     if b"stco" in tables and b"co64" in tables:
@@ -348,14 +352,6 @@ def _collect_sample_ranges_from_stbl(
     offset_width = 4 if offset_atom.type == b"stco" else 8
     if len(offset_body) != 8 + chunk_count * offset_width:
         raise MediaScrubError("mp4 chunk offset table length does not match entries")
-    chunk_offsets = [
-        int.from_bytes(
-            offset_body[8 + index * offset_width:8 + (index + 1) * offset_width],
-            "big",
-        )
-        for index in range(chunk_count)
-    ]
-
     stsz_body = fullbox_body(tables[b"stsz"], "stsz")
     if len(stsz_body) < 12:
         raise MediaScrubError("mp4 stsz body too short")
@@ -364,49 +360,88 @@ def _collect_sample_ranges_from_stbl(
         raise MediaScrubError(
             f"mp4 stsz sample_count {sample_count} exceeds scrubber limit"
         )
+    if sample_count > len(data):
+        raise MediaScrubError(
+            f"mp4 stsz sample_count {sample_count} exceeds input-size bound {len(data)}"
+        )
     if sample_size:
         if len(stsz_body) != 12:
             raise MediaScrubError("mp4 uniform stsz body has trailing bytes")
-        sample_sizes: list[int] | None = None
+        sample_sizes: memoryview | None = None
     else:
         if len(stsz_body) != 12 + sample_count * 4:
             raise MediaScrubError("mp4 stsz sample-size table length does not match entries")
-        sample_sizes = None
+        sample_sizes = memoryview(stsz_body)
 
-    ranges: list[_Mp4SampleRange] = []
-    sample_index = 0
-    for chunk_number, chunk_start in enumerate(chunk_offsets, start=1):
-        matching = [
-            entry for entry in stsc_entries if entry[0] <= chunk_number
-        ]
-        if not matching:
+    def stsc_for_chunk(chunk_number: int, cursor: int) -> tuple[int, int, int, int]:
+        while (
+            cursor + 1 < len(stsc_entries)
+            and stsc_entries[cursor + 1][0] <= chunk_number
+        ):
+            cursor += 1
+        first_chunk, samples_per_chunk, description_index = stsc_entries[cursor]
+        if first_chunk > chunk_number:
             raise MediaScrubError("mp4 stsc does not describe every chunk")
-        _first_chunk, samples_per_chunk, description_index = matching[-1]
-        avc_config = sample_descriptions[description_index - 1]
+        return cursor, samples_per_chunk, description_index, first_chunk
+
+    def size_at(sample_index: int) -> int:
+        if sample_size:
+            return sample_size
+        assert sample_sizes is not None
+        size_offset = 12 + sample_index * 4
+        return struct.unpack(">I", sample_sizes[size_offset:size_offset + 4])[0]
+
+    # Validate every complete chunk before yielding one sample object. This
+    # rejects forged sample counts before range expansion can consume memory.
+    sample_index = 0
+    stsc_cursor = 0
+    for chunk_number in range(1, chunk_count + 1):
+        stsc_cursor, samples_per_chunk, description_index, _ = stsc_for_chunk(
+            chunk_number, stsc_cursor,
+        )
         if sample_index + samples_per_chunk > sample_count:
             raise MediaScrubError("mp4 stsc describes more samples than stsz")
-        sample_start = chunk_start
-        for local_index in range(samples_per_chunk):
-            if sample_size:
-                sample_size_value = sample_size
-            else:
-                size_offset = 12 + (sample_index + local_index) * 4
-                sample_size_value = struct.unpack(
-                    ">I", stsz_body[size_offset:size_offset + 4],
-                )[0]
-            sample_end = sample_start + sample_size_value
-            if sample_end < sample_start:
-                raise MediaScrubError("mp4 sample range arithmetic overflow")
-            ranges.append(
-                _Mp4SampleRange(
-                    sample_start, sample_end, description_index, avc_config,
-                )
+        chunk_start = int.from_bytes(
+            offset_body[8 + (chunk_number - 1) * offset_width:
+                        8 + chunk_number * offset_width],
+            "big",
+        )
+        chunk_end = chunk_start
+        for index in range(samples_per_chunk):
+            chunk_end += size_at(sample_index + index)
+        if chunk_start < 0 or chunk_end < chunk_start or chunk_end > len(data):
+            raise MediaScrubError(
+                "mp4 chunk extent exceeds input size; sample range is not contained"
             )
-            sample_start = sample_end
+        if not any(
+            chunk_start >= mdat_start and chunk_end <= mdat_end
+            for mdat_start, mdat_end in mdat_ranges
+        ):
+            raise MediaScrubError("mp4 chunk extent is not contained by one mdat box")
         sample_index += samples_per_chunk
     if sample_index != sample_count:
         raise MediaScrubError("mp4 stsc does not describe every stsz sample")
-    return ranges
+
+    sample_index = 0
+    stsc_cursor = 0
+    for chunk_number in range(1, chunk_count + 1):
+        stsc_cursor, samples_per_chunk, description_index, _ = stsc_for_chunk(
+            chunk_number, stsc_cursor,
+        )
+        avc_config = sample_descriptions[description_index - 1]
+        chunk_start = int.from_bytes(
+            offset_body[8 + (chunk_number - 1) * offset_width:
+                        8 + chunk_number * offset_width],
+            "big",
+        )
+        sample_start = chunk_start
+        for local_index in range(samples_per_chunk):
+            sample_end = sample_start + size_at(sample_index + local_index)
+            yield _Mp4SampleRange(
+                sample_start, sample_end, description_index, avc_config,
+            )
+            sample_start = sample_end
+        sample_index += samples_per_chunk
 
 
 def _sample_description_configs(
@@ -523,6 +558,14 @@ def _canonicalise_avc_sample(
             raise MediaScrubError("mp4 AVC sample NAL length is out of bounds")
         nal = sample[offset:offset + nal_size]
         nal_type = nal[0] & 0x1F
+        if nal_type not in _MP4_AVC_SAMPLE_NAL_TYPES:
+            if nal_type in (7, 8):
+                raise MediaScrubError(
+                    "mp4 avc1 sample contains an in-band parameter-set NAL"
+                )
+            raise MediaScrubError(
+                f"mp4 avc1 sample contains unsupported NAL type {nal_type}"
+            )
         if nal_type in (1, 5):
             pps_id = parse_slice_pps_id(nal)
             if require_pps and pps_id not in pps_ids:
@@ -541,7 +584,7 @@ def _canonicalise_avc_sample(
 
 
 def _validate_sample_ranges(
-    data: bytes, sample_ranges: list[_Mp4SampleRange],
+    data: bytes, sample_ranges: Iterator[_Mp4SampleRange],
     mdat_ranges: list[tuple[int, int]],
 ) -> None:
     for sample_range in sample_ranges:
@@ -731,6 +774,12 @@ def _rebuild_moov(
     data: bytes, body_start: int, body_end: int,
 ) -> tuple[bytes, bool, bool, bool]:
     atoms = _parse_container(data, body_start, body_end)
+    mvhd_atoms = [atom for atom in atoms if atom.type == b"mvhd"]
+    trak_atoms = [atom for atom in atoms if atom.type == b"trak"]
+    if len(mvhd_atoms) != 1:
+        raise MediaScrubError("mp4 moov requires exactly one mvhd child")
+    if not trak_atoms:
+        raise MediaScrubError("mp4 moov missing trak")
     parts: list[bytes] = []
     trak_seen = False
     mvhd_seen = False
@@ -778,7 +827,7 @@ def _rebuild_mvhd(data: bytes, atom: _Mp4Atom) -> bytes:
         next_track_id = struct.unpack(">I", body[96:100])[0]
         rebuilt = (
             bytes([0]) + flags
-            + struct.pack(">II", creation, modification)
+            + struct.pack(">II", 0, 0)
             + struct.pack(">II", timescale, duration)
             + struct.pack(">IH", rate, volume)
             + b"\x00" * 10
@@ -803,7 +852,7 @@ def _rebuild_mvhd(data: bytes, atom: _Mp4Atom) -> bytes:
         next_track_id = struct.unpack(">I", body[108:112])[0]
         rebuilt = (
             bytes([1]) + flags
-            + struct.pack(">QQ", creation, modification)
+            + struct.pack(">QQ", 0, 0)
             + struct.pack(">IQ", timescale, duration)
             + struct.pack(">IH", rate, volume)
             + b"\x00" * 10
@@ -819,17 +868,26 @@ def _rebuild_trak(
     data: bytes, body_start: int, body_end: int,
 ) -> tuple[bytes, bool]:
     atoms = _parse_container(data, body_start, body_end)
-    parts: list[bytes] = []
-    stsd_ok = False
-    for atom in atoms:
-        if atom.type == b"tkhd":
-            parts.append(_rebuild_tkhd(data, atom))
-        elif atom.type == b"edts":
-            parts.append(_rebuild_edts(data, atom))
-        elif atom.type == b"mdia":
-            mdia_body, stsd_in_mdia = _rebuild_mdia(data, atom.body_start, atom.body_end)
-            parts.append(_pack(b"mdia", mdia_body))
-            stsd_ok |= stsd_in_mdia
+    tkhd_atoms = [atom for atom in atoms if atom.type == b"tkhd"]
+    mdia_atoms = [atom for atom in atoms if atom.type == b"mdia"]
+    edts_atoms = [atom for atom in atoms if atom.type == b"edts"]
+    if len(tkhd_atoms) != 1:
+        raise MediaScrubError(
+            "mp4 trak requires exactly one tkhd child; stbl/stsd chain incomplete"
+        )
+    if len(mdia_atoms) != 1:
+        raise MediaScrubError(
+            "mp4 trak requires exactly one mdia child; stbl/stsd chain incomplete"
+        )
+    if len(edts_atoms) > 1:
+        raise MediaScrubError("mp4 trak has duplicate edts children")
+    parts = [_rebuild_tkhd(data, tkhd_atoms[0])]
+    if edts_atoms:
+        parts.append(_rebuild_edts(data, edts_atoms[0]))
+    mdia_body, stsd_ok = _rebuild_mdia(
+        data, mdia_atoms[0].body_start, mdia_atoms[0].body_end,
+    )
+    parts.append(_pack(b"mdia", mdia_body))
     return b"".join(parts), stsd_ok
 
 
@@ -856,7 +914,7 @@ def _rebuild_tkhd(data: bytes, atom: _Mp4Atom) -> bytes:
         height = struct.unpack(">I", body[80:84])[0]
         rebuilt = (
             bytes([0]) + flags
-            + struct.pack(">III", creation, modification, track_id)
+            + struct.pack(">III", 0, 0, track_id)
             + b"\x00" * 4
             + struct.pack(">I", duration)
             + b"\x00" * 8
@@ -883,7 +941,7 @@ def _rebuild_tkhd(data: bytes, atom: _Mp4Atom) -> bytes:
         height = struct.unpack(">I", body[92:96])[0]
         rebuilt = (
             bytes([1]) + flags
-            + struct.pack(">QQ", creation, modification)
+            + struct.pack(">QQ", 0, 0)
             + struct.pack(">I", track_id)
             + b"\x00" * 4
             + struct.pack(">Q", duration)
@@ -900,18 +958,44 @@ def _rebuild_mdia(
     data: bytes, body_start: int, body_end: int,
 ) -> tuple[bytes, bool]:
     atoms = _parse_container(data, body_start, body_end)
-    parts: list[bytes] = []
-    stsd_ok = False
-    for atom in atoms:
-        if atom.type == b"mdhd":
-            parts.append(_rebuild_mdhd(data, atom))
-        elif atom.type == b"hdlr":
-            parts.append(_rebuild_hdlr(data, atom))
-        elif atom.type == b"minf":
-            minf_body, stsd_in_minf = _rebuild_minf(data, atom.body_start, atom.body_end)
-            parts.append(_pack(b"minf", minf_body))
-            stsd_ok |= stsd_in_minf
-    return b"".join(parts), stsd_ok
+    mdhd_atoms = [atom for atom in atoms if atom.type == b"mdhd"]
+    hdlr_atoms = [atom for atom in atoms if atom.type == b"hdlr"]
+    minf_atoms = [atom for atom in atoms if atom.type == b"minf"]
+    if len(mdhd_atoms) != 1:
+        raise MediaScrubError(
+            "mp4 mdia requires exactly one mdhd child; stbl/stsd chain incomplete"
+        )
+    if len(hdlr_atoms) != 1:
+        raise MediaScrubError(
+            "mp4 mdia requires exactly one hdlr child; stbl/stsd chain incomplete"
+        )
+    if len(minf_atoms) != 1:
+        raise MediaScrubError(
+            "mp4 mdia requires exactly one minf child; stbl/stsd chain incomplete"
+        )
+    handler_type = _handler_type(data, hdlr_atoms[0])
+    minf_body, stsd_ok = _rebuild_minf(
+        data, minf_atoms[0].body_start, minf_atoms[0].body_end, handler_type,
+    )
+    return (
+        _rebuild_mdhd(data, mdhd_atoms[0])
+        + _rebuild_hdlr(data, hdlr_atoms[0])
+        + _pack(b"minf", minf_body),
+        stsd_ok,
+    )
+
+
+def _handler_type(data: bytes, atom: _Mp4Atom) -> bytes:
+    body = data[atom.body_start:atom.body_end]
+    if len(body) < 24 or body[0] != 0:
+        raise MediaScrubError("mp4 hdlr header is invalid")
+    _validate_fullbox_flags(b"hdlr", body[1:4])
+    handler_type = body[8:12]
+    if handler_type not in (b"vide", b"soun"):
+        raise MediaScrubError(
+            f"mp4 hdlr track type {handler_type!r} is outside scrubber scope"
+        )
+    return handler_type
 
 
 def _rebuild_edts(data: bytes, atom: _Mp4Atom) -> bytes:
@@ -983,8 +1067,8 @@ def _rebuild_mdhd(data: bytes, atom: _Mp4Atom) -> bytes:
         language = struct.unpack(">H", body[20:22])[0]
         rebuilt = (
             bytes([0]) + flags
-            + struct.pack(">IIII", creation, modification, timescale, duration)
-            + struct.pack(">HH", language, 0)
+            + struct.pack(">IIII", 0, 0, timescale, duration)
+            + struct.pack(">HH", 0, 0)
         )
         return _pack(b"mdhd", rebuilt)
     if version == 1:
@@ -1001,9 +1085,9 @@ def _rebuild_mdhd(data: bytes, atom: _Mp4Atom) -> bytes:
         language = struct.unpack(">H", body[32:34])[0]
         rebuilt = (
             bytes([1]) + flags
-            + struct.pack(">QQ", creation, modification)
+            + struct.pack(">QQ", 0, 0)
             + struct.pack(">IQ", timescale, duration)
-            + struct.pack(">HH", language, 0)
+            + struct.pack(">HH", 0, 0)
         )
         return _pack(b"mdhd", rebuilt)
     raise MediaScrubError(f"mp4 mdhd unknown version {version}")
@@ -1038,31 +1122,30 @@ def _rebuild_hdlr(data: bytes, atom: _Mp4Atom) -> bytes:
 
 
 def _rebuild_minf(
-    data: bytes, body_start: int, body_end: int,
+    data: bytes, body_start: int, body_end: int, handler_type: bytes,
 ) -> tuple[bytes, bool]:
     atoms = _parse_container(data, body_start, body_end)
-    parts: list[bytes] = []
-    stsd_ok = False
-    for atom in atoms:
-        if atom.type == b"vmhd":
-            parts.append(_rebuild_vmhd(data, atom))
-        elif atom.type == b"smhd":
-            parts.append(_rebuild_smhd(data, atom))
-        elif atom.type == b"nmhd":
-            parts.append(_rebuild_nmhd(data, atom))
-        elif atom.type == b"hmhd":
-            parts.append(_rebuild_hmhd(data, atom))
-        elif atom.type == b"dinf":
-            # Canonical rebuild — the reviewer flagged that unknown
-            # children inside dinf survived. We only accept the shape
-            # ffmpeg + every mainstream muxer emits (dref containing a
-            # single self-referencing url).
-            parts.append(_rebuild_dinf(data, atom.body_start, atom.body_end))
-        elif atom.type == b"stbl":
-            stbl_body, stsd_in_stbl = _rebuild_stbl(data, atom.body_start, atom.body_end)
-            parts.append(_pack(b"stbl", stbl_body))
-            stsd_ok |= stsd_in_stbl
-    return b"".join(parts), stsd_ok
+    required_header = b"vmhd" if handler_type == b"vide" else b"smhd"
+    header_atoms = [atom for atom in atoms if atom.type == required_header]
+    if len(header_atoms) != 1:
+        raise MediaScrubError(
+            f"mp4 minf requires exactly one {required_header.decode()} child"
+        )
+    dinf_atoms = [atom for atom in atoms if atom.type == b"dinf"]
+    stbl_atoms = [atom for atom in atoms if atom.type == b"stbl"]
+    if len(dinf_atoms) != 1:
+        raise MediaScrubError("mp4 minf requires exactly one dinf child")
+    if len(stbl_atoms) != 1:
+        raise MediaScrubError("mp4 minf requires exactly one stbl child")
+    if handler_type == b"vide":
+        media_header = _rebuild_vmhd(data, header_atoms[0])
+    else:
+        media_header = _rebuild_smhd(data, header_atoms[0])
+    dinf = _rebuild_dinf(data, dinf_atoms[0].body_start, dinf_atoms[0].body_end)
+    stbl_body, stsd_ok = _rebuild_stbl(
+        data, stbl_atoms[0].body_start, stbl_atoms[0].body_end,
+    )
+    return media_header + dinf + _pack(b"stbl", stbl_body), stsd_ok
 
 
 def _rebuild_vmhd(data: bytes, atom: _Mp4Atom) -> bytes:

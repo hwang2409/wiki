@@ -47,6 +47,7 @@ _GIF_GCE_TRANSPARENT_MASK: Final = 0b0000_0001
 _GIF_GCE_DISPOSAL_MAX: Final = 3  # spec defines 0..3; 4..7 reserved
 _GIF_IMAGE_DESCRIPTOR_RESERVED_MASK: Final = 0b0001_1000
 _GIF_IMAGE_DESCRIPTOR_ALLOWED_MASK: Final = 0b1110_0111
+_GIF_MAX_EXTENSION_SUB_BLOCKS: Final = 4096
 
 
 @dataclass(frozen=True)
@@ -143,6 +144,7 @@ def scrub_gif(data: bytes) -> MediaScrubResult:
         out.extend(data[13:lsd_end])
 
     image_seen = False
+    total_image_pixels = 0
     pending_gce: _PendingGCE | None = None
     offset = lsd_end
     end = len(data)
@@ -156,8 +158,9 @@ def scrub_gif(data: bytes) -> MediaScrubResult:
                 raise MediaScrubError("gif extension truncated")
             label = data[offset + 1]
             sub_start = offset + 2
+            collect_blocks = label in (_GIF_GRAPHIC_CONTROL_LABEL, _GIF_APP_EXT_LABEL)
             block_end, sub_blocks = _gif_walk_extension_subblocks(
-                data, sub_start, end,
+                data, sub_start, end, collect=collect_blocks,
             )
             if label == _GIF_GRAPHIC_CONTROL_LABEL:
                 if len(sub_blocks) != 1:
@@ -180,11 +183,17 @@ def scrub_gif(data: bytes) -> MediaScrubResult:
             offset = block_end
             continue
         if marker == _GIF_IMAGE_DESCRIPTOR:
-            block_end = _emit_image_descriptor(
+            block_end, image_pixels = _emit_image_descriptor(
                 data, offset, end, out,
                 pending_gce=pending_gce,
                 global_ct_entries=global_ct_entries,
+                pixel_budget=GIF_MAX_PIXELS - total_image_pixels,
             )
+            total_image_pixels += image_pixels
+            if total_image_pixels > GIF_MAX_PIXELS:
+                raise MediaScrubError(
+                    f"gif cumulative image pixels exceed the {GIF_MAX_PIXELS} pixel limit"
+                )
             pending_gce = None
             offset = block_end
             image_seen = True
@@ -207,20 +216,25 @@ def scrub_gif(data: bytes) -> MediaScrubResult:
 
 
 def _gif_walk_extension_subblocks(
-    data: bytes, start: int, end: int,
+    data: bytes, start: int, end: int, *, collect: bool,
 ) -> tuple[int, list[bytes]]:
-    """Walk an extension's sub-block chain. Return (offset_past_terminator, blocks)."""
+    """Walk an extension, optionally retaining its small parsed blocks."""
     offset = start
     blocks: list[bytes] = []
+    block_count = 0
     while offset < end:
         length = data[offset]
         offset += 1
         if length == 0:
             return offset, blocks
+        block_count += 1
+        if block_count > _GIF_MAX_EXTENSION_SUB_BLOCKS:
+            raise MediaScrubError("gif extension has too many sub-blocks")
         block_end = offset + length
         if block_end > end:
             raise MediaScrubError("gif sub-block extends past payload")
-        blocks.append(data[offset:block_end])
+        if collect:
+            blocks.append(data[offset:block_end])
         offset = block_end
     raise MediaScrubError("gif sub-block chain missing terminator")
 
@@ -384,7 +398,8 @@ def _emit_image_descriptor(
     *,
     pending_gce: _PendingGCE | None,
     global_ct_entries: int,
-) -> int:
+    pixel_budget: int,
+) -> tuple[int, int]:
     """Emit the image descriptor + local color table + LZW image data.
 
     Every field is parsed from validated positions. The LZW stream is
@@ -406,6 +421,10 @@ def _emit_image_descriptor(
     if expected_pixels > GIF_MAX_PIXELS:
         raise MediaScrubError(
             f"gif image has {expected_pixels} pixels, above the {GIF_MAX_PIXELS} pixel limit"
+        )
+    if expected_pixels > pixel_budget:
+        raise MediaScrubError(
+            "gif cumulative image pixels exceed the pixel limit"
         )
     local_packed = data[offset + 9]
     if local_packed & _GIF_IMAGE_DESCRIPTOR_RESERVED_MASK:
@@ -463,7 +482,7 @@ def _emit_image_descriptor(
                 lzw_min_code_size,
                 expected_pixels,
             ))
-            return sub_offset
+            return sub_offset, expected_pixels
         block_end = sub_offset + length
         if block_end > end:
             raise MediaScrubError("gif image sub-block extends past payload")
