@@ -271,9 +271,6 @@ def wiki_app_secret_boot_line() -> str:
 
 
 def wiki_app_secret_file_path() -> Path:
-    configured = os.environ.get("WIKI_APP_SECRET_FILE")
-    if configured:
-        return Path(configured).expanduser().absolute()
     return RuntimePaths.from_env().runtime_dir / "wiki-app-secret"
 
 
@@ -955,8 +952,6 @@ def health() -> dict[str, object]:
         "daemon_managed": os.environ.get("WIKI_BACKEND_DAEMON") == "launchd",
         "backend_fingerprint": RUNTIME_FINGERPRINT,
     }
-    if payload["daemon_managed"]:
-        payload["app_secret_path"] = str(wiki_app_secret_file_path())
     return payload
 
 

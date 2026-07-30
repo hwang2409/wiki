@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import os
 import json
+import os
 import stat
 import subprocess
 import sys
@@ -14,6 +14,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from backend.app import daemon
+from backend.app.agent_runtime.version import frozen_runtime_fingerprint
 from backend.native_server import rotate_log_file
 
 
@@ -105,7 +106,7 @@ class LaunchAgentConfigTests(unittest.TestCase):
                         ["launchctl", *arguments],
                         1,
                         "",
-                        "Could not find service",
+                        f'Could not find service "{config.target}" in domain for system',
                     )
                 return subprocess.CompletedProcess(
                     ["launchctl", *arguments], 0, "", ""
@@ -137,7 +138,7 @@ class LaunchAgentConfigTests(unittest.TestCase):
                     ["launchctl", *arguments],
                     1 if arguments[0] == "bootout" or arguments[0] == "print" else 0,
                     "",
-                    "Could not find service",
+                    f'Could not find service "{config.target}" in domain for system',
                 ),
             ):
                 result = daemon.uninstall(config)
@@ -153,9 +154,37 @@ class LaunchAgentConfigTests(unittest.TestCase):
                 daemon,
                 "_launchctl",
                 return_value=subprocess.CompletedProcess(
-                    ["launchctl"], 1, "", "Input/output error"
+                    ["launchctl"], 1, "", "Input/output error: service database not found"
                 ),
             ):
+                with self.assertRaises(daemon.DaemonError):
+                    daemon.uninstall(config)
+            self.assertTrue(config.plist_path.exists())
+
+    def test_uninstall_keeps_plist_when_bootout_fails_even_if_probe_is_absent(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp))
+            config.launch_agents_dir.mkdir()
+            config.plist_path.write_text("plist", encoding="utf-8")
+
+            def fake_launchctl(
+                _config: daemon.DaemonConfig, *arguments: str
+            ) -> subprocess.CompletedProcess[str]:
+                if arguments[0] == "bootout":
+                    return subprocess.CompletedProcess(
+                        ["launchctl", *arguments],
+                        1,
+                        "",
+                        "Input/output error",
+                    )
+                return subprocess.CompletedProcess(
+                    ["launchctl", *arguments],
+                    1,
+                    "",
+                    f'Could not find service "{config.target}" in domain for system',
+                )
+
+            with patch.object(daemon, "_launchctl", side_effect=fake_launchctl):
                 with self.assertRaises(daemon.DaemonError):
                     daemon.uninstall(config)
             self.assertTrue(config.plist_path.exists())
@@ -166,7 +195,9 @@ class DaemonLogTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             log_path = root / "logs" / "backend.log"
-            secret_path = root / "secret.txt"
+            secret_path = root / "runtime" / "wiki-app-secret"
+            secret_copy = root / "secret-copy.txt"
+            mode_copy = root / "secret-mode.txt"
             driver = root / "driver.py"
             driver.write_text(
                 textwrap.dedent(
@@ -191,11 +222,10 @@ class DaemonLogTests(unittest.TestCase):
                     ]
                     os.environ["WIKI_APP_SECRET"] = "daemon-secret-never-logged"
                     os.environ["WIKI_AGENT_RUNTIME_DIR"] = {str(root / 'runtime')!r}
-                    os.environ["WIKI_APP_SECRET_FILE"] = {str(secret_path)!r}
                     native_server.main()
-                    Path({str(secret_path)!r}).write_text(
-                        os.environ["WIKI_APP_SECRET"], encoding="utf-8"
-                    )
+                    actual = Path({str(secret_path)!r})
+                    Path({str(secret_copy)!r}).write_text(actual.read_text(), encoding="utf-8")
+                    Path({str(mode_copy)!r}).write_text(str(actual.stat().st_mode), encoding="utf-8")
                     """
                 ),
                 encoding="utf-8",
@@ -208,11 +238,39 @@ class DaemonLogTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
             )
-            secret = secret_path.read_text(encoding="utf-8")
-            self.assertEqual(stat.S_IMODE(secret_path.stat().st_mode), 0o600)
+            secret = secret_copy.read_text(encoding="utf-8")
+            self.assertEqual(stat.S_IMODE(int(mode_copy.read_text(encoding="utf-8"))), 0o600)
+            self.assertFalse(secret_path.exists())
             logs = list(root.rglob("*.log"))
             self.assertTrue(logs)
             self.assertTrue(all(secret not in path.read_text() for path in logs))
+
+    def test_build_fingerprint_matches_frozen_bundle_executable(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bundle = root / "dist" / "wiki-backend-sidecar"
+            bundle.mkdir(parents=True)
+            executable = bundle / "wiki-backend"
+            launcher = root / "dist" / "wiki-backend"
+            executable.write_bytes(b"frozen backend executable")
+            launcher.write_bytes(b"shell launcher")
+            script = Path(__file__).resolve().parents[2] / "scripts" / "native_backend_fingerprint.py"
+            result = subprocess.run(
+                [sys.executable, str(script), str(executable)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.stdout.strip(), frozen_runtime_fingerprint(executable))
+            self.assertNotEqual(
+                result.stdout.strip(), frozen_runtime_fingerprint(launcher)
+            )
+            build_script = script.parent / "build-native-app.sh"
+            self.assertIn(
+                'backend_binary="$pyinstaller_dist/wiki-backend-sidecar/wiki-backend"',
+                build_script.read_text(encoding="utf-8"),
+            )
+
     def test_log_rotates_with_bounded_backups(self) -> None:
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "wiki-backend-daemon.log"
@@ -246,7 +304,7 @@ class DaemonCliTests(unittest.TestCase):
                     if [ -f "{root / 'loaded'}" ]; then
                         exit 0
                     fi
-                    echo "Could not find service" >&2
+                    printf 'Could not find service "gui/%s/{daemon.DEFAULT_LABEL}" in domain for system\\n' "$(id -u)" >&2
                     exit 1
                 fi
                 if [ "$1" = "bootout" ]; then

@@ -7,7 +7,7 @@ use std::{
     io::{self, Read, Write},
     net::TcpListener,
     os::fd::AsRawFd,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::Mutex,
     thread,
@@ -365,8 +365,8 @@ fn launch_backend_and_navigate(app: &AppHandle) {
     let launch_result = if let Ok(url) = env::var("WIKI_NATIVE_BACKEND_URL") {
         let launch_url = normalize_launch_url(&url);
         wait_for_health(app, &launch_url, None).map(|_| launch_url)
-    } else if let Some((launch_url, secret_path)) = probe_persistent_daemon() {
-        match read_daemon_app_secret(&secret_path) {
+    } else if let Some(launch_url) = probe_persistent_daemon() {
+        match read_daemon_app_secret() {
             Ok(secret) => {
                 set_app_secret(app, secret);
                 Ok(launch_url)
@@ -394,7 +394,7 @@ fn launch_backend_and_navigate(app: &AppHandle) {
     }
 }
 
-fn probe_persistent_daemon() -> Option<(String, PathBuf)> {
+fn probe_persistent_daemon() -> Option<String> {
     let launch_url = normalize_launch_url(
         &env::var("WIKI_DAEMON_BACKEND_URL").unwrap_or_else(|_| DEFAULT_DAEMON_URL.to_string()),
     );
@@ -422,31 +422,38 @@ fn probe_persistent_daemon() -> Option<(String, PathBuf)> {
     {
         return None;
     }
-    let secret_path = payload
-        .get("app_secret_path")
-        .and_then(serde_json::Value::as_str)
-        .map(PathBuf::from)?;
-    if !secret_path.is_absolute() {
-        return None;
-    }
-    Some((launch_url, secret_path))
+    Some(launch_url)
 }
 
-fn read_daemon_app_secret(path: &Path) -> io::Result<String> {
-    let permissions = fs::metadata(path)?.permissions().mode();
-    if permissions & 0o077 != 0 {
+fn read_daemon_app_secret() -> io::Result<String> {
+    let path = runtime_dir().join("wiki-app-secret");
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)?;
+    let mut metadata = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe { libc::fstat(file.as_raw_fd(), &mut metadata) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if metadata.st_uid != unsafe { libc::getuid() }
+        || metadata.st_mode & libc::S_IFMT != libc::S_IFREG
+        || metadata.st_mode & 0o077 != 0
+    {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "daemon app secret file is not owner-only",
         ));
     }
-    let secret = fs::read_to_string(path)?.trim().to_string();
+    let mut contents = String::new();
+    (&file).read_to_string(&mut contents)?;
+    let secret = contents.trim().to_string();
     if secret.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "daemon app secret file is empty",
         ));
     }
+    fs::remove_file(&path)?;
     Ok(secret)
 }
 
@@ -758,11 +765,9 @@ fn app_origin(app: &AppHandle) -> Option<String> {
     state.app_origin.clone()
 }
 
-/// Return the Wiki.app origin secret captured from the backend sidecar's
-/// startup stdout. Called by the webview via `invoke("get_wiki_app_secret")`
-/// to attach an `X-Wiki-App-Secret` header on composer requests. Fails while
-/// the sidecar is still coming up (secret not yet observed) — the webview
-/// retries once the composer form is dispatched. WIKI-148 round 6, Path B.
+/// Return the Wiki.app origin secret captured during backend startup.
+/// Called by the webview via `invoke("get_wiki_app_secret")` to attach an
+/// `X-Wiki-App-Secret` header on composer requests. WIKI-148 round 6, Path B.
 #[tauri::command]
 pub fn get_wiki_app_secret(
     state: tauri::State<'_, NativeAppState>,

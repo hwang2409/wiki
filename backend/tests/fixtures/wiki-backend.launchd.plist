@@ -29,8 +29,6 @@
 		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
 		<key>WIKI_AGENT_RUNTIME_DIR</key>
 		<string>/tmp/wiki-runtime</string>
-		<key>WIKI_APP_SECRET_FILE</key>
-		<string>/tmp/wiki-runtime/wiki-app-secret</string>
 		<key>WIKI_BACKEND_DAEMON</key>
 		<string>launchd</string>
 		<key>WIKI_BACKEND_URL</key>

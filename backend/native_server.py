@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import os
 import sys
 import threading
@@ -76,6 +77,10 @@ def configure_daemon_log(path: Path) -> None:
             os.close(descriptor)
 
 
+def cleanup_daemon_secret(path: Path) -> None:
+    path.unlink(missing_ok=True)
+
+
 def parent_is_alive(parent_pid: int) -> bool:
     if parent_pid <= 1:
         return False
@@ -144,7 +149,8 @@ def main() -> None:
     if args.daemon:
         # The native app reads this owner-only file after the private daemon
         # health probe. The secret never enters launchd stdout or stderr.
-        write_wiki_app_secret_file()
+        secret_path = write_wiki_app_secret_file()
+        atexit.register(cleanup_daemon_secret, secret_path)
 
     config = uvicorn.Config(
         app,

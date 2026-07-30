@@ -131,7 +131,6 @@ def plist_payload(config: DaemonConfig) -> dict[str, object]:
         "EnvironmentVariables": {
             "PATH": FINDER_SAFE_PATH,
             "WIKI_AGENT_RUNTIME_DIR": str(config.runtime_dir),
-            "WIKI_APP_SECRET_FILE": str(config.runtime_dir / "wiki-app-secret"),
             "WIKI_BACKEND_DAEMON": "launchd",
             "WIKI_BACKEND_URL": config.backend_url,
             "WIKI_SUPERVISOR_AUTOSTART": "on",
@@ -188,16 +187,11 @@ def _describe_failure(result: subprocess.CompletedProcess[str]) -> str:
     return detail
 
 
-def _not_loaded(result: subprocess.CompletedProcess[str]) -> bool:
-    detail = _describe_failure(result).lower()
-    return result.returncode != 0 and any(
-        marker in detail
-        for marker in (
-            "could not find service",
-            "no such process",
-            "not found",
-        )
-    )
+def _service_absent(
+    config: DaemonConfig, result: subprocess.CompletedProcess[str]
+) -> bool:
+    canonical = f'Could not find service "{config.target}" in domain for system'
+    return result.returncode != 0 and _describe_failure(result) == canonical
 
 
 def _service_loaded(config: DaemonConfig) -> bool:
@@ -206,7 +200,7 @@ def _service_loaded(config: DaemonConfig) -> bool:
     result = _launchctl(config, "print", config.target)
     if result.returncode == 0:
         return True
-    if _not_loaded(result):
+    if _service_absent(config, result):
         return False
     raise DaemonError(
         f"cannot inspect {config.target}: {_describe_failure(result)}"
@@ -221,11 +215,11 @@ def install(config: DaemonConfig) -> dict[str, object]:
     _write_plist(config)
     if _service_loaded(config):
         previous = _launchctl(config, "bootout", config.target)
-        if previous.returncode != 0 and _service_loaded(config):
+        if previous.returncode != 0 and not _service_absent(config, previous):
             raise DaemonError(
                 f"cannot unload {config.target}: {_describe_failure(previous)}"
             )
-        if _service_loaded(config):
+        if previous.returncode == 0 and _service_loaded(config):
             raise DaemonError(f"{config.target} is still loaded after bootout")
     loaded = _launchctl(config, "bootstrap", config.domain, str(config.plist_path))
     if loaded.returncode != 0:
@@ -243,11 +237,11 @@ def uninstall(config: DaemonConfig) -> dict[str, object]:
     """Unload the LaunchAgent and remove only its generated plist."""
 
     unloaded = _launchctl(config, "bootout", config.target)
-    if unloaded.returncode != 0 and _service_loaded(config):
+    if unloaded.returncode != 0 and not _service_absent(config, unloaded):
         raise DaemonError(
             f"cannot unload {config.target}: {_describe_failure(unloaded)}"
         )
-    if _service_loaded(config):
+    if unloaded.returncode == 0 and _service_loaded(config):
         raise DaemonError(f"{config.target} is still loaded after bootout")
     config.plist_path.unlink(missing_ok=True)
     return {

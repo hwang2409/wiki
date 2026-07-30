@@ -2,7 +2,6 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-target_triple="$(rustc --print host-tuple 2>/dev/null || rustc -Vv | awk '/host:/ {print $2}')"
 runtime_dir="${WIKI_AGENT_RUNTIME_DIR:-${HOME}/.wiki/agent-runtime}"
 force_stage_only="${FORCE_STAGE_ONLY:-0}"
 guard_args=()
@@ -74,15 +73,8 @@ fi
 mkdir -p "$stage_root/src-tauri/binaries"
 cp "$backend_output_dir"/* "$stage_root/src-tauri/binaries/"
 
-backend_binary="$backend_output_dir/wiki-backend-${target_triple}"
-backend_fingerprint="$(BACKEND_BINARY="$backend_binary" python3 - <<'PY'
-import hashlib
-import os
-from pathlib import Path
-
-print(hashlib.sha256(Path(os.environ["BACKEND_BINARY"]).read_bytes()).hexdigest())
-PY
-)"
+backend_binary="$pyinstaller_dist/wiki-backend-sidecar/wiki-backend"
+backend_fingerprint="$(python3 "$ROOT/scripts/native_backend_fingerprint.py" "$backend_binary")"
 
 python3 - "$stage_root/src-tauri/tauri.conf.json" <<'PY'
 import json
