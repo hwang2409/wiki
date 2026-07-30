@@ -150,25 +150,33 @@ def _mp3_strip_trailing_tags_to_fixpoint(data: bytes, start: int, end: int) -> i
         if stripped != end:
             end = stripped
             continue
-        # Lyrics3v2: final 15 bytes are "LYRICS200" + 6 ASCII digits
-        # giving the tag size (of items only — the 15-byte footer itself
-        # AND the preceding LYRICSBEGIN sit outside it). The parser
-        # accepts only self-consistent sizes; anything malformed rejects.
-        if end - start >= 15 and data[end - 15:end - 6] == _LYRICS3V2_MAGIC:
-            size_field = data[end - 6:end]
+        # Lyrics3v2 spec layout (bottom-up): the LAST 9 bytes are the
+        # ASCII marker "LYRICS200"; the 6 bytes immediately before it are
+        # a decimal size counting all bytes between (and including) the
+        # leading "LYRICSBEGIN" and the size digits themselves. The
+        # round-7 parser had the marker and size positions swapped, so
+        # spec-conformant tags were rejected. Fixed here.
+        if (
+            end - start >= 15
+            and data[end - len(_LYRICS3V2_MAGIC):end] == _LYRICS3V2_MAGIC
+        ):
+            size_start = end - len(_LYRICS3V2_MAGIC) - _LYRICS3V2_SIZE_LEN
+            size_field = data[size_start:size_start + _LYRICS3V2_SIZE_LEN]
             try:
-                items_size = int(size_field.decode("ascii"))
+                tag_span = int(size_field.decode("ascii"))
             except ValueError as exc:
                 raise MediaScrubError("mp3 Lyrics3v2 size not ASCII digits") from exc
-            if items_size < 0:
-                raise MediaScrubError("mp3 Lyrics3v2 size negative")
-            tag_start = end - 15 - items_size
-            begin_at = tag_start - len(_LYRICS3_BEGIN)
+            if tag_span <= 0:
+                raise MediaScrubError("mp3 Lyrics3v2 size not positive")
+            # tag_span covers LYRICSBEGIN + items + the 6-digit size
+            # field (but NOT the LYRICS200 marker). LYRICSBEGIN sits
+            # `tag_span` bytes before the size field's end.
+            begin_at = size_start + _LYRICS3V2_SIZE_LEN - tag_span
             if begin_at < start:
                 raise MediaScrubError("mp3 Lyrics3v2 tag size larger than payload")
             if data[begin_at:begin_at + len(_LYRICS3_BEGIN)] != _LYRICS3_BEGIN:
                 raise MediaScrubError(
-                    "mp3 Lyrics3v2 LYRICSBEGIN marker missing before tag body"
+                    "mp3 Lyrics3v2 LYRICSBEGIN marker missing at declared tag start"
                 )
             end = begin_at
             continue

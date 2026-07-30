@@ -1342,17 +1342,24 @@ class Mp3Round7FixpointProbes(unittest.TestCase):
         self.assertNotIn(b"APETAGEX", result.data)
 
     def test_lyrics3v2_tag_is_stripped(self) -> None:
-        # Layout: [ID3v2][frames]LYRICSBEGIN<items>LYRICS200<6-digit size>
+        # Spec layout (bottom-up): the last 9 bytes are "LYRICS200"; the
+        # 6 bytes before that are an ASCII decimal size covering all bytes
+        # from the leading LYRICSBEGIN through the end of the size field
+        # itself. Round-8 review flagged that the previous test used the
+        # wrong order (marker before size); real Lyrics3v2 tags never
+        # matched under that layout.
         base = REAL_MP3.read_bytes()
-        items = b"round7-lyrics3v2-marker-items"
-        size_field = f"{len(items):06d}".encode("ascii")
-        lyrics_tag = b"LYRICSBEGIN" + items + b"LYRICS200" + size_field
+        items = b"round8-lyrics3v2-marker-items"
+        # tag span = LYRICSBEGIN + items + 6-digit size = 11 + N + 6
+        tag_span = len(b"LYRICSBEGIN") + len(items) + 6
+        size_field = f"{tag_span:06d}".encode("ascii")
+        lyrics_tag = b"LYRICSBEGIN" + items + size_field + b"LYRICS200"
         payload = base + lyrics_tag
-        self.assertIn(b"round7-lyrics3v2-marker-items", payload)
+        self.assertIn(b"round8-lyrics3v2-marker-items", payload)
         result = media_scrub.scrub_audio(payload, "audio/mpeg")
         self.assertNotIn(b"LYRICS200", result.data)
         self.assertNotIn(b"LYRICSBEGIN", result.data)
-        self.assertNotIn(b"round7-lyrics3v2-marker-items", result.data)
+        self.assertNotIn(b"round8-lyrics3v2-marker-items", result.data)
 
     def test_hostile_bytes_past_third_frame_reject_full_stream(self) -> None:
         # The pre-R7 walker only checked the first three frames — a
@@ -1436,6 +1443,176 @@ class GifRound7ExtensionProbes(unittest.TestCase):
         self.assertEqual(result.data[loop_pos + 11], 0x03)
         self.assertEqual(result.data[loop_pos + 12], 0x01)
         self.assertEqual(struct.unpack("<H", result.data[loop_pos + 13:loop_pos + 15])[0], loop_count)
+
+
+class Mp4Round8SurvivorProbes(unittest.TestCase):
+    """Round-8 review found byte-smuggling gaps: avcC/sinf/schi bodies
+    were copied opaquely, and stbl table children (stts/stsc/stsz/stco)
+    bypassed entry-count validation so trailing bytes rode through.
+    Each probe here mutates the real fixture (or builds a hostile one)
+    and asserts the marker cannot land in the sanitized output."""
+
+    @staticmethod
+    def _wrap(atom_type: bytes, body: bytes) -> bytes:
+        return struct.pack(">I", 8 + len(body)) + atom_type + body
+
+    def test_avcC_trailing_bytes_past_pps_arrays_are_rejected(self) -> None:
+        # Splice attacker bytes after the last declared PPS. Under R8
+        # rebuild, avcC counts SPS/PPS entries from parsed fields and
+        # rejects any trailing bytes past the last declared entry.
+        real = REAL_MP4.read_bytes()
+        marker = b"round8-avcC-trailer-must-not-survive"
+        avcc_pos = real.find(b"avcC")
+        assert avcc_pos > 0
+        avcc_size = struct.unpack(">I", real[avcc_pos - 4:avcc_pos])[0]
+        avcc_end = avcc_pos - 4 + avcc_size
+        added = len(marker)
+        payload = bytearray(real)
+        # Grow avcC + every ancestor size (avc1 uses rfind to skip the
+        # ftyp compatible-brands token).
+        payload[avcc_pos - 4:avcc_pos] = struct.pack(">I", avcc_size + added)
+        for parent in (b"avc1", b"stsd", b"stbl", b"minf", b"mdia", b"trak", b"moov"):
+            pos = payload.rfind(parent, 0, avcc_pos)
+            existing = struct.unpack(">I", bytes(payload[pos - 4:pos]))[0]
+            payload[pos - 4:pos] = struct.pack(">I", existing + added)
+        payload[avcc_end:avcc_end] = marker
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "avcC has .* trailing bytes"
+        ):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+    def test_hvcC_sample_entry_inner_box_is_rejected(self) -> None:
+        # Round-8 tightened the sample-entry inner allowlist: hvcC / vpcC
+        # / av1C / esds / sinf / schm / schi / tenc are all gone. A file
+        # that carries any of them is rejected outright.
+        real = REAL_MP4.read_bytes()
+        # Replace avcC's box type with hvcC in-place (contents nonsense
+        # for HEVC, but reject fires on the type check before any parse).
+        avcc_pos = real.find(b"avcC")
+        assert avcc_pos > 0
+        payload = bytearray(real)
+        payload[avcc_pos:avcc_pos + 4] = b"hvcC"
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "sample entry inner box .* outside allowlist"
+        ):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+    def test_sinf_encryption_container_is_rejected(self) -> None:
+        real = REAL_MP4.read_bytes()
+        avcc_pos = real.find(b"avcC")
+        payload = bytearray(real)
+        payload[avcc_pos:avcc_pos + 4] = b"sinf"
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "sample entry inner box .* outside allowlist"
+        ):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+    def test_stts_table_trailing_bytes_are_rejected(self) -> None:
+        # Splice marker bytes past stts's declared entry table. The
+        # rebuilder computes the expected body length from entry_count
+        # and rejects any mismatch.
+        real = REAL_MP4.read_bytes()
+        marker = b"round8-stts-slack-marker"
+        stts_pos = real.find(b"stts")
+        assert stts_pos > 0
+        stts_size = struct.unpack(">I", real[stts_pos - 4:stts_pos])[0]
+        stts_end = stts_pos - 4 + stts_size
+        added = len(marker)
+        payload = bytearray(real)
+        payload[stts_pos - 4:stts_pos] = struct.pack(">I", stts_size + added)
+        for parent in (b"stbl", b"minf", b"mdia", b"trak", b"moov"):
+            pos = payload.rfind(parent, 0, stts_pos)
+            existing = struct.unpack(">I", bytes(payload[pos - 4:pos]))[0]
+            payload[pos - 4:pos] = struct.pack(">I", existing + added)
+        payload[stts_end:stts_end] = marker
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "stts body length .* differs from expected"
+        ):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+    def test_stco_table_trailing_bytes_are_rejected(self) -> None:
+        real = REAL_MP4.read_bytes()
+        marker = b"round8-stco-slack-marker"
+        stco_pos = real.find(b"stco")
+        assert stco_pos > 0
+        stco_size = struct.unpack(">I", real[stco_pos - 4:stco_pos])[0]
+        stco_end = stco_pos - 4 + stco_size
+        added = len(marker)
+        payload = bytearray(real)
+        payload[stco_pos - 4:stco_pos] = struct.pack(">I", stco_size + added)
+        for parent in (b"stbl", b"minf", b"mdia", b"trak", b"moov"):
+            pos = payload.rfind(parent, 0, stco_pos)
+            existing = struct.unpack(">I", bytes(payload[pos - 4:pos]))[0]
+            payload[pos - 4:pos] = struct.pack(">I", existing + added)
+        payload[stco_end:stco_end] = marker
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "stco body length .* differs from expected"
+        ):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+    def test_stsz_table_trailing_bytes_are_rejected(self) -> None:
+        real = REAL_MP4.read_bytes()
+        marker = b"round8-stsz-slack-marker"
+        stsz_pos = real.find(b"stsz")
+        assert stsz_pos > 0
+        stsz_size = struct.unpack(">I", real[stsz_pos - 4:stsz_pos])[0]
+        stsz_end = stsz_pos - 4 + stsz_size
+        added = len(marker)
+        payload = bytearray(real)
+        payload[stsz_pos - 4:stsz_pos] = struct.pack(">I", stsz_size + added)
+        for parent in (b"stbl", b"minf", b"mdia", b"trak", b"moov"):
+            pos = payload.rfind(parent, 0, stsz_pos)
+            existing = struct.unpack(">I", bytes(payload[pos - 4:pos]))[0]
+            payload[pos - 4:pos] = struct.pack(">I", existing + added)
+        payload[stsz_end:stsz_end] = marker
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "stsz body length .* differs from expected"
+        ):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+    def test_stsc_table_trailing_bytes_are_rejected(self) -> None:
+        real = REAL_MP4.read_bytes()
+        marker = b"round8-stsc-slack-marker"
+        stsc_pos = real.find(b"stsc")
+        assert stsc_pos > 0
+        stsc_size = struct.unpack(">I", real[stsc_pos - 4:stsc_pos])[0]
+        stsc_end = stsc_pos - 4 + stsc_size
+        added = len(marker)
+        payload = bytearray(real)
+        payload[stsc_pos - 4:stsc_pos] = struct.pack(">I", stsc_size + added)
+        for parent in (b"stbl", b"minf", b"mdia", b"trak", b"moov"):
+            pos = payload.rfind(parent, 0, stsc_pos)
+            existing = struct.unpack(">I", bytes(payload[pos - 4:pos]))[0]
+            payload[pos - 4:pos] = struct.pack(">I", existing + added)
+        payload[stsc_end:stsc_end] = marker
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "stsc body length .* differs from expected"
+        ):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+    def test_rare_stbl_child_types_are_rejected(self) -> None:
+        # Round-8 removed rare stbl types (sdtp/sbgp/sgpd/etc) from the
+        # allowlist. A file that carries one is rejected. Splice a hostile
+        # sdtp box into the fixture's stbl and verify.
+        real = REAL_MP4.read_bytes()
+        stsc_pos = real.find(b"stsc")
+        assert stsc_pos > 0
+        # Insert an sdtp box just before stsc.
+        sdtp_body = b"round8-sdtp-body"
+        sdtp = struct.pack(">I", 8 + len(sdtp_body)) + b"sdtp" + sdtp_body
+        added = len(sdtp)
+        payload = bytearray(real)
+        insert_at = stsc_pos - 4
+        # Grow stbl and every ancestor.
+        for parent in (b"stbl", b"minf", b"mdia", b"trak", b"moov"):
+            pos = payload.rfind(parent, 0, insert_at)
+            existing = struct.unpack(">I", bytes(payload[pos - 4:pos]))[0]
+            payload[pos - 4:pos] = struct.pack(">I", existing + added)
+        payload[insert_at:insert_at] = sdtp
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "stbl child .* not supported"
+        ):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
 
 
 class UnsupportedMimeTests(unittest.TestCase):

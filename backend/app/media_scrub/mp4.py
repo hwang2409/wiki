@@ -72,20 +72,24 @@ _MP4_TOPLEVEL_PLAYBACK: Final = {
 _MP4_VISUAL_ENTRIES: Final = {b"avc1", b"avc3", b"hev1", b"hvc1", b"mp4v"}
 _MP4_AUDIO_ENTRIES: Final = {b"mp4a"}
 # Inner boxes inside a sample entry that we accept. Each one gets its
-# 8-byte header rebuilt from validated size + type; its body is bounded
-# by the validated size but not further parsed (codec configs like avcC
-# would need dedicated H.264 knowledge to walk field-by-field). Any
-# inner box type NOT in this allowlist rejects the file.
+# Every sample-entry inner box in this allowlist has a field-level
+# rebuild via struct.pack — no raw body copy path remains for anything
+# the scrubber claims to support (round-8 review). Codec configurations
+# for containers we do not fully field-decode yet (hvcC/vpcC/av1C/esds
+# and the encryption tree sinf/schm/schi/tenc) are OUT — files using
+# them are rejected under strict-subset acceptance.
 _MP4_SAMPLE_ENTRY_INNER_ALLOWED: Final = {
-    b"avcC", b"hvcC", b"vpcC", b"av1C", b"esds", b"btrt", b"pasp",
-    b"colr", b"sinf", b"frma", b"schm", b"schi", b"tenc",
+    b"avcC", b"btrt", b"pasp", b"colr", b"frma",
 }
-# Additional stbl children beyond stsd. Header-validated; body bounded
-# by parsed size. Anything else → drop (not written to output).
-_MP4_STBL_KEEP: Final = {
-    b"stts", b"ctts", b"cslg", b"stsc", b"stco", b"co64",
-    b"stsz", b"stz2", b"stss", b"stsh", b"sdtp", b"sbgp",
-    b"sgpd", b"subs", b"saiz", b"saio", b"padb",
+# Additional stbl children beyond stsd. Every allowed type below has a
+# field-level rebuild via struct.pack that emits exactly the parsed
+# entry_count worth of entries — trailing bytes cannot survive because
+# they are not written. Rare stbl types (stsh, sdtp, sbgp, sgpd, subs,
+# saiz, saio, padb, stz2, cslg) are not in the allowlist; a file that
+# uses one of those gets rejected by the walker at the stbl level via
+# strict-subset acceptance.
+_MP4_STBL_TABLE_TYPES: Final = {
+    b"stts", b"ctts", b"stsc", b"stsz", b"stco", b"co64", b"stss",
 }
 
 
@@ -835,9 +839,160 @@ def _rebuild_stbl(
             if stsd_body is not None:
                 parts.append(_pack(b"stsd", stsd_body))
                 stsd_ok = True
-        elif atom.type in _MP4_STBL_KEEP:
-            parts.append(data[atom.start:atom.body_end])
+        elif atom.type in _MP4_STBL_TABLE_TYPES:
+            parts.append(_rebuild_stbl_table(atom.type, data, atom))
+        else:
+            # Round-8 review: pre-R8 stbl copied any allowlisted child
+            # opaquely, so table slack rode through. Now every allowed
+            # type has a struct.pack rebuild; anything else rejects the
+            # file (strict-subset acceptance).
+            raise MediaScrubError(
+                f"mp4 stbl child {atom.type!r} not supported by scrubber"
+            )
     return b"".join(parts), stsd_ok
+
+
+def _rebuild_stbl_table(box_type: bytes, data: bytes, atom: _Mp4Atom) -> bytes:
+    """Rebuild an stbl child table from parsed entry_count entries.
+
+    Every table box in stbl (stts/ctts/stsc/stsz/stco/co64/stss) is a
+    fullbox with a 4-byte entry_count followed by exactly N fixed-size
+    entries. Round-8 review flagged that trailing bytes rode through
+    the pre-R8 opaque-body path; here we compute the expected body size
+    from entry_count and reject anything else.
+    """
+    body = data[atom.body_start:atom.body_end]
+    if len(body) < 8:
+        raise MediaScrubError(f"mp4 {box_type!r} body too short for header")
+    version = body[0]
+    flags = body[1:4]
+    if box_type == b"stsz":
+        # Special: after v+flags, `sample_size` (uint32) then sample_count.
+        # If sample_size == 0, N per-sample uint32 sizes follow.
+        if len(body) < 12:
+            raise MediaScrubError("mp4 stsz body too short")
+        if version != 0:
+            raise MediaScrubError(f"mp4 stsz unknown version {version}")
+        sample_size = struct.unpack(">I", body[4:8])[0]
+        sample_count = struct.unpack(">I", body[8:12])[0]
+        if sample_size != 0:
+            expected = 12
+            if len(body) != expected:
+                raise MediaScrubError(
+                    f"mp4 stsz uniform-size body length {len(body)} "
+                    f"differs from expected {expected}"
+                )
+            return _pack(b"stsz", bytes([0]) + flags + struct.pack(">II", sample_size, sample_count))
+        expected = 12 + sample_count * 4
+        if len(body) != expected:
+            raise MediaScrubError(
+                f"mp4 stsz body length {len(body)} differs from expected {expected} "
+                f"(sample_count={sample_count})"
+            )
+        entries = [struct.unpack(">I", body[12 + i * 4:12 + i * 4 + 4])[0]
+                   for i in range(sample_count)]
+        rebuilt = (
+            bytes([0]) + flags
+            + struct.pack(">II", 0, sample_count)
+            + b"".join(struct.pack(">I", size) for size in entries)
+        )
+        return _pack(b"stsz", rebuilt)
+
+    if version != 0:
+        raise MediaScrubError(f"mp4 {box_type!r} unknown version {version}")
+    entry_count = struct.unpack(">I", body[4:8])[0]
+    if box_type == b"stts":
+        # 8 bytes per entry: sample_count(4) + sample_delta(4)
+        entry_size = 8
+        expected = 8 + entry_count * entry_size
+        if len(body) != expected:
+            raise MediaScrubError(
+                f"mp4 stts body length {len(body)} differs from expected {expected}"
+            )
+        chunks: list[bytes] = []
+        for i in range(entry_count):
+            off = 8 + i * entry_size
+            sc = struct.unpack(">I", body[off:off + 4])[0]
+            sd = struct.unpack(">I", body[off + 4:off + 8])[0]
+            chunks.append(struct.pack(">II", sc, sd))
+        return _pack(b"stts", bytes([0]) + flags + struct.pack(">I", entry_count) + b"".join(chunks))
+    if box_type == b"ctts":
+        # 8 bytes per entry: sample_count(4) + sample_offset(4 signed for v1)
+        entry_size = 8
+        expected = 8 + entry_count * entry_size
+        if len(body) != expected:
+            raise MediaScrubError(
+                f"mp4 ctts body length {len(body)} differs from expected {expected}"
+            )
+        chunks = []
+        for i in range(entry_count):
+            off = 8 + i * entry_size
+            sc = struct.unpack(">I", body[off:off + 4])[0]
+            so = struct.unpack(">I", body[off + 4:off + 8])[0]
+            chunks.append(struct.pack(">II", sc, so))
+        return _pack(b"ctts", bytes([0]) + flags + struct.pack(">I", entry_count) + b"".join(chunks))
+    if box_type == b"stsc":
+        # 12 bytes per entry: first_chunk(4) + samples_per_chunk(4) + sample_desc_index(4)
+        entry_size = 12
+        expected = 8 + entry_count * entry_size
+        if len(body) != expected:
+            raise MediaScrubError(
+                f"mp4 stsc body length {len(body)} differs from expected {expected}"
+            )
+        chunks = []
+        for i in range(entry_count):
+            off = 8 + i * entry_size
+            fc = struct.unpack(">I", body[off:off + 4])[0]
+            spc = struct.unpack(">I", body[off + 4:off + 8])[0]
+            sdi = struct.unpack(">I", body[off + 8:off + 12])[0]
+            chunks.append(struct.pack(">III", fc, spc, sdi))
+        return _pack(b"stsc", bytes([0]) + flags + struct.pack(">I", entry_count) + b"".join(chunks))
+    if box_type == b"stco":
+        # 4 bytes per entry: chunk_offset (uint32)
+        entry_size = 4
+        expected = 8 + entry_count * entry_size
+        if len(body) != expected:
+            raise MediaScrubError(
+                f"mp4 stco body length {len(body)} differs from expected {expected}"
+            )
+        entries_data = [struct.unpack(">I", body[8 + i * 4:8 + i * 4 + 4])[0]
+                        for i in range(entry_count)]
+        return _pack(
+            b"stco",
+            bytes([0]) + flags + struct.pack(">I", entry_count)
+            + b"".join(struct.pack(">I", off) for off in entries_data),
+        )
+    if box_type == b"co64":
+        # 8 bytes per entry: chunk_offset (uint64)
+        entry_size = 8
+        expected = 8 + entry_count * entry_size
+        if len(body) != expected:
+            raise MediaScrubError(
+                f"mp4 co64 body length {len(body)} differs from expected {expected}"
+            )
+        entries_data = [struct.unpack(">Q", body[8 + i * 8:8 + i * 8 + 8])[0]
+                        for i in range(entry_count)]
+        return _pack(
+            b"co64",
+            bytes([0]) + flags + struct.pack(">I", entry_count)
+            + b"".join(struct.pack(">Q", off) for off in entries_data),
+        )
+    if box_type == b"stss":
+        # 4 bytes per entry: sample_number (uint32)
+        entry_size = 4
+        expected = 8 + entry_count * entry_size
+        if len(body) != expected:
+            raise MediaScrubError(
+                f"mp4 stss body length {len(body)} differs from expected {expected}"
+            )
+        entries_data = [struct.unpack(">I", body[8 + i * 4:8 + i * 4 + 4])[0]
+                        for i in range(entry_count)]
+        return _pack(
+            b"stss",
+            bytes([0]) + flags + struct.pack(">I", entry_count)
+            + b"".join(struct.pack(">I", n) for n in entries_data),
+        )
+    raise MediaScrubError(f"mp4 stbl table dispatch missing case for {box_type!r}")
 
 
 def _rebuild_stsd(
@@ -966,18 +1121,11 @@ def _rebuild_audio_sample_entry_fixed(entry_bytes: bytes) -> tuple[bytes, int]:
     return fixed, 16 + 20
 
 
-# Sample-entry inner boxes come in two shapes. Codec configuration blobs
-# (avcC = H.264 SPS/PPS; hvcC = HEVC config; vpcC, av1C, esds — MPEG-4
-# elementary stream descriptors) are inherently variable-length codec-
-# specific data; parsing every field is codec engineering out of scope
-# for this ticket. They are size-validated at the box-header level and
-# their bounded body is emitted, but no field-level rebuild happens.
-# Everything else in this allowlist is a fixed-shape structural box and
-# GETS a field-level struct.pack rebuild — the round-7 review flagged
-# that btrt slack survived under the previous opaque copy path.
-_MP4_INNER_CODEC_CONFIG: Final = {
-    b"avcC", b"hvcC", b"vpcC", b"av1C", b"esds",
-}
+# All sample-entry inner boxes now get a field-level rebuild — see the
+# individual _rebuild_inner_* helpers below plus _rebuild_inner_avcC in
+# the walker section. Codec-config formats we do NOT field-decode yet
+# (hvcC/vpcC/av1C/esds) are absent from _MP4_SAMPLE_ENTRY_INNER_ALLOWED,
+# so files that use them are rejected under strict-subset acceptance.
 
 
 def _rebuild_inner_btrt(body: bytes) -> bytes:
@@ -1055,16 +1203,11 @@ def _rebuild_inner_frma(body: bytes) -> bytes:
 
 
 def _walk_sample_entry_inner_boxes(entry_bytes: bytes, inner_start: int) -> list[bytes]:
-    """Header-validate each inner box; reject unknown types.
-
-    Bodies are bounded by the box's declared size (an already validated
-    field); rebuilding the size+type header from those parsed uint32/4-byte
-    values yields the emit. Full field-level parsing of every codec
-    config (avcC = H.264 SPS/PPS blob, esds = MPEG-4 elementary stream
-    descriptors, hvcC = HEVC config) is out of scope for one round; the
-    strict-subset fallback is to reject sample entries that contain any
-    unknown box type. Every codec that actually decodes appears in
-    _MP4_SAMPLE_ENTRY_INNER_ALLOWED.
+    """Rebuild each inner box from parsed fields. No opaque body copy
+    path remains: every allowlisted type dispatches to a struct.pack
+    rebuild that reads specific fields; anything not in the allowlist
+    (hvcC/vpcC/av1C/esds/sinf/schm/schi/tenc/anything unknown) rejects
+    the whole file — strict-subset acceptance.
     """
     out: list[bytes] = []
     offset = inner_start
@@ -1081,12 +1224,9 @@ def _walk_sample_entry_inner_boxes(entry_bytes: bytes, inner_start: int) -> list
                 f"mp4 sample entry inner box {box_type!r} outside allowlist"
             )
         body = entry_bytes[offset + 8:offset + box_size]
-        # Rebuild via struct.pack from parsed fields for every fixed-shape
-        # inner box. Codec configuration blobs (avcC/hvcC/vpcC/av1C/esds)
-        # are the sole exception — parsing every H.264 SPS byte or MPEG-4
-        # ES descriptor is out of scope; they emit as a header-rebuilt
-        # box with a size-bounded body copy.
-        if box_type == b"btrt":
+        if box_type == b"avcC":
+            out.append(_rebuild_inner_avcC(body))
+        elif box_type == b"btrt":
             out.append(_rebuild_inner_btrt(body))
         elif box_type == b"pasp":
             out.append(_rebuild_inner_pasp(body))
@@ -1094,16 +1234,136 @@ def _walk_sample_entry_inner_boxes(entry_bytes: bytes, inner_start: int) -> list
             out.append(_rebuild_inner_colr(body))
         elif box_type == b"frma":
             out.append(_rebuild_inner_frma(body))
-        elif box_type in _MP4_INNER_CODEC_CONFIG:
-            out.append(struct.pack(">I", 8 + len(body)) + box_type + body)
-        else:
-            # Container/auxiliary types (sinf, schm, schi, tenc) — parsing
-            # every one field-by-field is out of scope; emitted as header-
-            # rebuilt with size-bounded body. If a hostile inner appears
-            # inside sinf/schi, the recursion is future work.
-            out.append(struct.pack(">I", 8 + len(body)) + box_type + body)
+        else:  # pragma: no cover — allowlist above already gated
+            raise MediaScrubError(
+                f"mp4 sample entry inner box {box_type!r} missing rebuilder"
+            )
         offset += box_size
     return out
+
+
+def _rebuild_inner_avcC(body: bytes) -> bytes:
+    """AVC decoder configuration record — ISO/IEC 14496-15.
+
+    Layout:
+        configurationVersion (1) — must be 1
+        AVCProfileIndication (1)
+        profile_compatibility (1)
+        AVCLevelIndication (1)
+        reserved(6) | lengthSizeMinusOne(2)  (1)
+        reserved(3) | numOfSequenceParameterSets(5)  (1)
+        for each SPS:
+            sequenceParameterSetLength (uint16 BE)
+            sequenceParameterSetNALUnit (that many bytes)
+        numOfPictureParameterSets (1)
+        for each PPS:
+            pictureParameterSetLength (uint16 BE)
+            pictureParameterSetNALUnit (that many bytes)
+        # Extended for high profiles (100/110/122/144):
+        reserved(6) | chroma_format(2) (1)
+        reserved(5) | bit_depth_luma_minus8(3) (1)
+        reserved(5) | bit_depth_chroma_minus8(3) (1)
+        numOfSequenceParameterSetExt (1)
+        for each SPS ext:
+            sequenceParameterSetExtLength (uint16 BE)
+            sequenceParameterSetExtNALUnit
+
+    Every counted array is walked and rebuilt via struct.pack + a
+    validated-length body slice; trailing bytes past the last declared
+    NAL cause a reject. SPS/PPS/SPSExt bodies are the actual video
+    codec data — they're bounded by their own length prefix (a parsed
+    field), which is the honest bound available. This is the same
+    treatment we apply to mdat sample bytes.
+    """
+    if len(body) < 7:
+        raise MediaScrubError("mp4 avcC body too short for fixed header")
+    version = body[0]
+    if version != 1:
+        raise MediaScrubError(f"mp4 avcC configurationVersion {version} != 1")
+    profile = body[1]
+    compat = body[2]
+    level = body[3]
+    lsm_byte = body[4]
+    if lsm_byte & 0xFC != 0xFC:
+        raise MediaScrubError("mp4 avcC reserved bits above lengthSizeMinusOne non-set")
+    num_sps_byte = body[5]
+    if num_sps_byte & 0xE0 != 0xE0:
+        raise MediaScrubError("mp4 avcC reserved bits above numOfSequenceParameterSets non-set")
+    num_sps = num_sps_byte & 0x1F
+    offset = 6
+    sps_list: list[bytes] = []
+    for _ in range(num_sps):
+        if offset + 2 > len(body):
+            raise MediaScrubError("mp4 avcC SPS length field truncated")
+        sps_len = struct.unpack(">H", body[offset:offset + 2])[0]
+        offset += 2
+        if offset + sps_len > len(body):
+            raise MediaScrubError("mp4 avcC SPS body extends past avcC")
+        sps_list.append(body[offset:offset + sps_len])
+        offset += sps_len
+    if offset >= len(body):
+        raise MediaScrubError("mp4 avcC missing numOfPictureParameterSets byte")
+    num_pps = body[offset]
+    offset += 1
+    pps_list: list[bytes] = []
+    for _ in range(num_pps):
+        if offset + 2 > len(body):
+            raise MediaScrubError("mp4 avcC PPS length field truncated")
+        pps_len = struct.unpack(">H", body[offset:offset + 2])[0]
+        offset += 2
+        if offset + pps_len > len(body):
+            raise MediaScrubError("mp4 avcC PPS body extends past avcC")
+        pps_list.append(body[offset:offset + pps_len])
+        offset += pps_len
+
+    rebuilt_body = (
+        bytes([1, profile, compat, level, lsm_byte, 0xE0 | num_sps])
+        + b"".join(struct.pack(">H", len(sps)) + sps for sps in sps_list)
+        + bytes([num_pps])
+        + b"".join(struct.pack(">H", len(pps)) + pps for pps in pps_list)
+    )
+
+    # High profiles: extended trailer. Not all encoders emit it; if
+    # bytes remain we require the profile to be a high one AND the
+    # extended fields to be well-formed.
+    if offset < len(body):
+        if profile not in (100, 110, 122, 144, 44, 83, 86, 118, 128, 138, 139, 134, 135):
+            raise MediaScrubError(
+                f"mp4 avcC has extended tail but profile {profile} is not a high profile"
+            )
+        if len(body) - offset < 4:
+            raise MediaScrubError("mp4 avcC extended tail too short")
+        chroma_byte = body[offset]
+        depth_luma_byte = body[offset + 1]
+        depth_chroma_byte = body[offset + 2]
+        num_sps_ext = body[offset + 3]
+        if chroma_byte & 0xFC != 0xFC:
+            raise MediaScrubError("mp4 avcC extended chroma reserved bits wrong")
+        if depth_luma_byte & 0xF8 != 0xF8:
+            raise MediaScrubError("mp4 avcC extended luma-depth reserved bits wrong")
+        if depth_chroma_byte & 0xF8 != 0xF8:
+            raise MediaScrubError("mp4 avcC extended chroma-depth reserved bits wrong")
+        offset += 4
+        sps_ext_list: list[bytes] = []
+        for _ in range(num_sps_ext):
+            if offset + 2 > len(body):
+                raise MediaScrubError("mp4 avcC SPS-ext length field truncated")
+            ext_len = struct.unpack(">H", body[offset:offset + 2])[0]
+            offset += 2
+            if offset + ext_len > len(body):
+                raise MediaScrubError("mp4 avcC SPS-ext body extends past avcC")
+            sps_ext_list.append(body[offset:offset + ext_len])
+            offset += ext_len
+        rebuilt_body += bytes([chroma_byte, depth_luma_byte, depth_chroma_byte, num_sps_ext])
+        rebuilt_body += b"".join(
+            struct.pack(">H", len(ext)) + ext for ext in sps_ext_list
+        )
+
+    if offset != len(body):
+        raise MediaScrubError(
+            f"mp4 avcC has {len(body) - offset} trailing bytes past declared arrays"
+        )
+    return _pack(b"avcC", rebuilt_body)
 
 
 # ---------------------------------------------------------------------------
