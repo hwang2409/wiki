@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import sys
@@ -525,19 +524,21 @@ class RebaseBotTests(unittest.TestCase):
         self.assertIn(["rm", "-f", "--", "frontend/package-lock.json"], calls)
         regenerate.assert_called_once_with(Path(raw).resolve(), "frontend/package-lock.json")
 
-    def test_result_outbox_persists_failed_delivery_and_retries(self) -> None:
+    def test_result_outbox_is_at_most_once_on_sender_failure(self) -> None:
+        # After R11 the outbox records the delivery attempt BEFORE calling
+        # the sender: a raise (even one that already delivered the message)
+        # never triggers a retry, so downstream sees each event at most
+        # once.  A sender that raises before delivering loses that event,
+        # which is the trade-off the reviewer signed off on to eliminate
+        # the "delivered five copies" flood.
         with tempfile.TemporaryDirectory() as raw:
-            delivered: list[str] = []
-            should_fail = True
+            calls: list[str] = []
 
-            def send(_target: str, message: str) -> None:
-                if should_fail:
-                    raise RuntimeError("orchestrator unavailable")
-                delivered.append(message)
+            def failing_sender(_target: str, message: str) -> None:
+                calls.append(message)
+                raise RuntimeError("orchestrator unavailable")
 
-            fake_main = SimpleNamespace(
-                AGENT_RUNTIME_DIR=raw,
-            )
+            fake_main = SimpleNamespace(AGENT_RUNTIME_DIR=raw)
             job = rebase_bot._RebaseJob(
                 job_id="durable-test",
                 worktree=Path(raw),
@@ -562,18 +563,17 @@ class RebaseBotTests(unittest.TestCase):
                 rebase_durable._DELIVERED_EVENTS.clear()
                 rebase_durable._persist_job(job, result)
                 rebase_durable._enqueue_result(job, result)
-                rebase_bot._flush_outbox(send)
-                pending = json.loads(
-                    (Path(raw) / "rebase-bot" / "outbox.json").read_text(
-                        encoding="utf-8"
+                for _ in range(5):
+                    rebase_bot._flush_outbox(
+                        failing_sender, _now=lambda: time.time() + 3600
                     )
-                )
-                should_fail = False
-                # Bounded retry policy adds backoff after a failure.  Jump the
-                # clock past the backoff window so the retry actually fires.
-                rebase_bot._flush_outbox(send, _now=lambda: time.time() + 3600)
-        self.assertEqual(pending["durable-test:result"]["attempts"], 1)
-        self.assertEqual(delivered, ["rebase-bot escalated WIKI-175-IMPL: semantic"])
+        # Exactly one attempt to notify, no retry loop.
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            calls[0], "rebase-bot escalated WIKI-175-IMPL: semantic"
+        )
+        # Outbox entry is gone after the attempt.
+        self.assertNotIn("durable-test:result", rebase_durable._OUTBOX)
 
     def test_preflight_rejects_unstaged_worktree_changes(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

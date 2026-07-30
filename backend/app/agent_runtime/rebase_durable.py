@@ -65,7 +65,15 @@ def _main() -> Any:
     return rebase_bot._main()
 
 
-def _durable_paths() -> tuple[Path, Path, Path]:
+def _durable_state_path() -> Path:
+    """Single-file snapshot path.
+
+    Consolidating jobs, outbox, and delivery dedupe into one JSON blob is
+    what makes ``_persist_durable_state`` genuinely atomic — a torn write
+    between three sibling files used to leave a completed job with no
+    outbox entry, permanently losing the notification.
+    """
+
     try:
         runtime_dir = getattr(_main(), "AGENT_RUNTIME_DIR", None)
     except Exception:
@@ -75,18 +83,13 @@ def _durable_paths() -> tuple[Path, Path, Path]:
         if isinstance(runtime_dir, (str, Path))
         else Path(tempfile.gettempdir()) / "wiki-agent-runtime"
     )
-    state_dir = root / "rebase-bot"
-    return (
-        state_dir / "jobs.json",
-        state_dir / "outbox.json",
-        state_dir / "delivered.json",
-    )
+    return root / "rebase-bot" / "state.json"
 
 
 def _load_durable_state() -> None:
     global _DURABLE_STATE_LOADED, _DURABLE_STATE_ROOT
-    jobs_path, outbox_path, delivered_path = _durable_paths()
-    state_root = jobs_path.parent
+    state_path = _durable_state_path()
+    state_root = state_path.parent
     if _DURABLE_STATE_LOADED and _DURABLE_STATE_ROOT == state_root:
         return
     if _DURABLE_STATE_ROOT != state_root:
@@ -95,44 +98,51 @@ def _load_durable_state() -> None:
         _DELIVERED_EVENTS.clear()
     _DURABLE_STATE_ROOT = state_root
     _DURABLE_STATE_LOADED = True
-    for path, target in ((jobs_path, _DURABLE_JOBS), (outbox_path, _OUTBOX)):
-        try:
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if isinstance(value, Mapping):
-            target.update(
-                {
-                    str(key): dict(item)
-                    for key, item in value.items()
-                    if isinstance(key, str) and isinstance(item, Mapping)
-                }
-            )
     try:
-        raw = json.loads(delivered_path.read_text(encoding="utf-8"))
+        snapshot = json.loads(state_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        raw = None
-    if isinstance(raw, list):
-        for entry in raw:
+        return
+    if not isinstance(snapshot, Mapping):
+        return
+    jobs_section = snapshot.get("jobs")
+    if isinstance(jobs_section, Mapping):
+        _DURABLE_JOBS.update(
+            {
+                str(key): dict(item)
+                for key, item in jobs_section.items()
+                if isinstance(key, str) and isinstance(item, Mapping)
+            }
+        )
+    outbox_section = snapshot.get("outbox")
+    if isinstance(outbox_section, Mapping):
+        _OUTBOX.update(
+            {
+                str(key): dict(item)
+                for key, item in outbox_section.items()
+                if isinstance(key, str) and isinstance(item, Mapping)
+            }
+        )
+    delivered_section = snapshot.get("delivered")
+    if isinstance(delivered_section, list):
+        for entry in delivered_section:
             if isinstance(entry, str):
                 _DELIVERED_EVENTS.add(entry)
 
 
 def _persist_durable_state() -> None:
-    jobs_path, outbox_path, delivered_path = _durable_paths()
-    jobs_path.parent.mkdir(parents=True, exist_ok=True)
-    writes: tuple[tuple[Path, Any], ...] = (
-        (jobs_path, _DURABLE_JOBS),
-        (outbox_path, _OUTBOX),
-        (delivered_path, sorted(_DELIVERED_EVENTS)),
+    state_path = _durable_state_path()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot = {
+        "jobs": _DURABLE_JOBS,
+        "outbox": _OUTBOX,
+        "delivered": sorted(_DELIVERED_EVENTS),
+    }
+    temporary = state_path.with_suffix(state_path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
     )
-    for path, value in writes:
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_text(
-            json.dumps(value, ensure_ascii=False, separators=(",", ":")),
-            encoding="utf-8",
-        )
-        temporary.replace(path)
+    temporary.replace(state_path)
 
 
 def _durable_key(pr_number: int, expected_sha: str) -> str:
@@ -263,10 +273,23 @@ def _flush_outbox(
     *,
     _now: Callable[[], float] = time.time,
 ) -> None:
+    """Drain the outbox with at-most-once semantics per ``delivery_id``.
+
+    The delivery attempt is recorded — ``_DELIVERED_EVENTS`` gets the id and
+    the entry is popped, then the state file is replaced — BEFORE the send
+    call.  If the sender delivered then raised, no retry re-sends the same
+    event; if the sender raised before delivery, the loss is bounded to one
+    event rather than an unbounded flood of duplicates.  The persisted
+    delivery id is a stable ``(pr, sha, status, head_sha)`` key so downstream
+    receivers (or a future receiver-side dedupe) can spot a duplicate that
+    escapes a torn write.
+    """
+
     _load_durable_state()
     if notify is None:
         return
     now = _now()
+    dispatch: list[tuple[str, str, str]] = []
     changed = False
     for entry_id, entry in list(_OUTBOX.items()):
         target = entry.get("target")
@@ -289,25 +312,21 @@ def _flush_outbox(
             _OUTBOX.pop(entry_id, None)
             changed = True
             continue
-        try:
-            notify(target, message[:4000])
-        except Exception as exc:
-            entry["attempts"] = int(entry.get("attempts") or 0) + 1
-            entry["last_error"] = str(exc)[:600]
-            attempts = int(entry["attempts"])
-            if attempts >= _OUTBOX_MAX_ATTEMPTS:
-                _OUTBOX.pop(entry_id, None)
-            else:
-                delay = min(
-                    _OUTBOX_BACKOFF_CAP_SECONDS,
-                    _OUTBOX_BACKOFF_BASE_SECONDS * (2 ** (attempts - 1)),
-                )
-                entry["next_attempt_at"] = now + delay
-            changed = True
-            continue
+        # Record the attempt BEFORE the send so a delivered-then-raised
+        # sender cannot get five copies through the retry loop.  The entry
+        # leaves the outbox in the same state write.
         if delivery_id:
             _DELIVERED_EVENTS.add(delivery_id)
         _OUTBOX.pop(entry_id, None)
         changed = True
+        dispatch.append((target, message[:4000], delivery_id))
     if changed:
         _persist_durable_state()
+    for target, message, _delivery_id in dispatch:
+        try:
+            notify(target, message)
+        except Exception:
+            # The attempt is already durably recorded; retrying would risk
+            # a duplicate delivery, and this dispatch loop is the only path
+            # from the outbox to a receiver.
+            continue

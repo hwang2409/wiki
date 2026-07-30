@@ -112,20 +112,6 @@ def _parse_segments(text: str) -> list[Any]:
     return segments
 
 
-def _parse_conflicts(
-    text: str,
-) -> tuple[list[tuple[list[str], list[str] | None, list[str]]], bool]:
-    """Compat wrapper: return ``(hunks, found)`` from the segment parser."""
-
-    segments = _parse_segments(text)
-    hunks: list[tuple[list[str], list[str] | None, list[str]]] = []
-    for segment in segments:
-        if segment[0] == "hunk":
-            _kind, ours, base, theirs = segment
-            hunks.append((ours, base, theirs))
-    return hunks, bool(hunks)
-
-
 def resolve_conflict_file(path: Path) -> tuple[bool, str | None]:
     """Resolve only conflicts whose sides differ in line endings.
 

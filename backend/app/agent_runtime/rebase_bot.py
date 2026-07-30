@@ -48,13 +48,21 @@ from .rebase_parsing import (
 )
 
 
-_GITHUB_URL_PREFIXES = (
-    "https://github.com/",
-    "http://github.com/",
-    "git@github.com:",
-    "ssh://git@github.com/",
-)
 _REPO_SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
+_GITHUB_URL_PATTERNS = (
+    re.compile(
+        r"^https://github\.com/"
+        r"([A-Za-z0-9][A-Za-z0-9._-]*)/([A-Za-z0-9][A-Za-z0-9._-]*)$"
+    ),
+    re.compile(
+        r"^git@github\.com:"
+        r"([A-Za-z0-9][A-Za-z0-9._-]*)/([A-Za-z0-9][A-Za-z0-9._-]*)$"
+    ),
+    re.compile(
+        r"^ssh://git@github\.com/"
+        r"([A-Za-z0-9][A-Za-z0-9._-]*)/([A-Za-z0-9][A-Za-z0-9._-]*)$"
+    ),
+)
 
 
 _JOB_LOCK = threading.RLock()
@@ -152,36 +160,25 @@ def _git_value(worktree: Path, args: Sequence[str]) -> str | None:
 def _repo_name(value: str | None) -> str | None:
     """Return ``org/repo`` for a supported GitHub URL or bare slug, else ``None``.
 
-    URL-shaped inputs must start with one of ``_GITHUB_URL_PREFIXES`` (a bare
-    suffix match would let ``https://evil.com/hwang2409/wiki`` slip through
-    as ``hwang2409/wiki``).  Local paths and non-slug strings are rejected.
-    Bare ``owner/name`` slugs from the GitHub gate response stay allowed.
+    Each URL form matches an anchored regex so ``http://`` cannot pretend to
+    be ``https://``, extra path segments cannot smuggle through, and only
+    the exact host ``github.com`` (not ``github.com.evil``) is accepted.
+    Bare ``owner/name`` slugs from the GitHub gate JSON stay allowed.
     """
 
     if not value:
         return None
-    raw = value.strip().removesuffix(".git")
+    raw = value.strip()
     if not raw:
         return None
-    looks_like_url = "://" in raw or raw.startswith("git@")
-    if looks_like_url:
-        matched = False
-        for prefix in _GITHUB_URL_PREFIXES:
-            if raw.startswith(prefix):
-                raw = raw.removeprefix(prefix)
-                matched = True
-                break
-        if not matched:
-            return None
-        parts = [part for part in raw.strip("/").split("/") if part]
-        if len(parts) < 2:
-            return None
-        slug = f"{parts[0]}/{parts[1]}"
-    else:
-        slug = raw.strip("/")
-    if not _REPO_SLUG.fullmatch(slug):
-        return None
-    return slug
+    stripped = raw.removesuffix(".git")
+    for pattern in _GITHUB_URL_PATTERNS:
+        match = pattern.fullmatch(stripped)
+        if match:
+            return f"{match.group(1)}/{match.group(2)}"
+    if _REPO_SLUG.fullmatch(stripped):
+        return stripped
+    return None
 
 
 def _validate_pr_binding(worktree: Path, verdict: Mapping[str, Any]) -> None:

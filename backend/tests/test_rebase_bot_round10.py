@@ -378,14 +378,16 @@ class F7CompletionAtomic(unittest.TestCase):
                     side_effect=counting_persist,
                 ):
                     rebase_bot._persist_completion(job, result)
-                jobs_path = Path(raw) / "rebase-bot" / "jobs.json"
-                outbox_path = Path(raw) / "rebase-bot" / "outbox.json"
-                self.assertTrue(jobs_path.exists())
-                self.assertTrue(outbox_path.exists())
-                jobs = json.loads(jobs_path.read_text(encoding="utf-8"))
-                outbox = json.loads(outbox_path.read_text(encoding="utf-8"))
-                self.assertIn("137:sha-atomic", jobs)
-                self.assertTrue(any("atomic-test" in k for k in outbox))
+                # Single atomic snapshot file — no torn write between
+                # sibling jobs.json/outbox.json/delivered.json can lose a
+                # completion any more.
+                state_path = Path(raw) / "rebase-bot" / "state.json"
+                self.assertTrue(state_path.exists())
+                snapshot = json.loads(state_path.read_text(encoding="utf-8"))
+                self.assertIn("137:sha-atomic", snapshot.get("jobs", {}))
+                self.assertTrue(
+                    any("atomic-test" in k for k in snapshot.get("outbox", {}))
+                )
         self.assertEqual(call_count[0], 1)
 
 

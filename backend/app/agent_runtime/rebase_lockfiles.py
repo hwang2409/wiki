@@ -39,13 +39,6 @@ def _lockfile_commands(worktree: Path, filename: str) -> list[list[str]] | None:
     return None
 
 
-def _lockfile_command(worktree: Path, filename: str) -> list[str] | None:
-    """Compat shim: the first step of the requested lockfile's regen pipeline."""
-
-    commands = _lockfile_commands(worktree, filename)
-    return commands[0] if commands else None
-
-
 def _regenerate_lockfile(worktree: Path, filename: str) -> str | None:
     commands = _lockfile_commands(worktree, filename)
     if commands is None:
