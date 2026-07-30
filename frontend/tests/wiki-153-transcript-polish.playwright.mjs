@@ -422,18 +422,19 @@ async function main() {
     await errorSection.locator(".ansi-fg-1").first().waitFor({ state: "visible" });
 
     logStep("action-required card: question visible, kind hidden");
-    const inspectorToggle = page.locator(".session-provider-inspector-head").first();
-    await inspectorToggle.waitFor({ state: "visible" });
-    const inspectorClass = await page.locator(".session-provider-inspector").first().getAttribute("class");
-    if (!inspectorClass || !inspectorClass.includes("is-open")) {
-      await inspectorToggle.click();
-    }
-    const providerCard = page.locator(".session-provider-request").first();
+    // WIKI-152: Action required is promoted to the top-level chrome; there is
+    // no inspector toggle to open first, and the "Action required" label
+    // lives on the wrapping panel head, not the individual request card.
+    const actionPanel = page.locator('[data-testid="session-action-required"]').first();
+    await actionPanel.waitFor({ state: "visible" });
+    await actionPanel.locator(".session-action-required-title", { hasText: "Action required" }).waitFor();
+    const providerCard = actionPanel.locator(".session-provider-request").first();
     await providerCard.waitFor({ state: "visible" });
-    await providerCard.locator(".session-provider-request-head", { hasText: "Action required" }).waitFor();
-    const kindVisibleDefault = await providerCard.locator(":scope > .session-provider-request-head", { hasText: "item/tool/requestUserInput" }).count();
-    if (kindVisibleDefault !== 0) {
-      throw new Error("request kind should be hidden by default");
+    const kindDd = providerCard
+      .locator(".session-provider-request-meta dd", { hasText: "item/tool/requestUserInput" })
+      .first();
+    if (await kindDd.isVisible()) {
+      throw new Error("WIKI-152: request kind must still be hidden by default (inside Details disclosure)");
     }
     await providerCard.locator(".session-provider-question", { hasText: "Which scope" }).waitFor({ state: "visible" });
     const detailsSummary = providerCard.locator(".session-provider-request-details > summary", { hasText: "Details" });

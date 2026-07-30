@@ -61,6 +61,7 @@ import type {
   ProviderEventInspector,
   ProviderPendingRequest,
   QueuedMessage,
+  SessionDispositionCounts,
   SessionEvent,
   SessionInit,
   SessionRateLimit,
@@ -481,9 +482,6 @@ function ProviderPendingRequestCard({
 
   return (
     <div className="session-provider-request">
-      <div className="session-provider-request-head">
-        <span>Action required</span>
-      </div>
       {questions.length > 0 ? (
         <div className="session-provider-questions">
           {questions.map((question) => (
@@ -933,7 +931,7 @@ function SessionModelFooter({
   );
 }
 
-function ProviderStreamInspector({
+export function ProviderActionRequired({
   inspector,
   ticket,
 }: {
@@ -941,53 +939,99 @@ function ProviderStreamInspector({
   ticket: string;
 }) {
   const pendingRequests = inspector.pending_requests ?? [];
-  const [open, setOpen] = useState(pendingRequests.length > 0);
-  useEffect(() => {
-    if (pendingRequests.length > 0) setOpen(true);
-  }, [pendingRequests.length]);
-  const counts = formatDispositionCounts(inspector.dispositions);
+  if (pendingRequests.length === 0) return null;
   return (
-    <div className={`session-provider-inspector${open ? " is-open" : ""}`}>
-      <button
-        aria-expanded={open}
-        className="session-provider-inspector-head"
-        type="button"
-        onClick={() => setOpen((current) => !current)}
-      >
-        <ChevronRight size={12} />
-        <span className="session-dispositions-label">Provider stream</span>
-        <span className="session-provider-inspector-route">
-          raw {inspector.raw_count} → normalized {inspector.normalized_count}
-        </span>
-        <span className="session-dispositions-value">{counts}</span>
-        {pendingRequests.length > 0 ? (
-          <span className="session-provider-pending">
-            {pendingRequests.length} pending
-          </span>
+    <div className="session-action-required" data-testid="session-action-required">
+      <div className="session-action-required-head">
+        <AlertTriangle size={13} />
+        <span className="session-action-required-title">Action required</span>
+        {pendingRequests.length > 1 ? (
+          <span className="session-action-required-count">{pendingRequests.length}</span>
         ) : null}
-        <span className={`session-provider-state is-${inspector.state}`}>
-          {inspector.provider} · {inspector.state}
-        </span>
-      </button>
-      {inspector.provider === "codex" ? (
-        <CodexStreamHighlights
-          events={inspector.events}
-          currentTurnDiff={
-            inspector.current_turn_diff === undefined
-              ? undefined
-              : inspector.current_turn_diff?.diff ?? null
-          }
-        />
-      ) : null}
-      {open ? (
-        <div className="session-provider-inspector-body">
-          {pendingRequests.map((request) => (
-            <ProviderPendingRequestCard
-              key={`${typeof request.request_id}:${request.request_id}`}
-              request={request}
-              ticket={ticket}
-            />
-          ))}
+      </div>
+      <div className="session-action-required-body">
+        {pendingRequests.map((request) => (
+          <ProviderPendingRequestCard
+            key={`${typeof request.request_id}:${request.request_id}`}
+            request={request}
+            ticket={ticket}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+export function SessionRunDetails({
+  inspector,
+  format,
+  tokens,
+  thinkingTokens,
+  dispositions,
+}: {
+  inspector: ProviderEventInspector | null;
+  format: string | null;
+  tokens: number | null;
+  thinkingTokens: number | null;
+  dispositions: SessionDispositionCounts | null;
+}) {
+  if (!inspector && !format && !tokens && !thinkingTokens && !dispositions) return null;
+  const dispositionCounts = dispositions
+    ? formatDispositionCounts(dispositions)
+    : inspector
+    ? formatDispositionCounts(inspector.dispositions)
+    : null;
+  const tokensLabel = formatTokens(tokens);
+  const summaryPieces = [
+    inspector ? `${inspector.provider} · ${inspector.state}` : null,
+    tokensLabel,
+  ].filter(Boolean) as string[];
+  const summary = summaryPieces.length > 0 ? summaryPieces.join(" · ") : "diagnostics";
+  return (
+    <details className="session-run-details" data-testid="session-run-details">
+      <summary>
+        <ChevronRight size={12} className="session-run-details-chevron" />
+        <span className="session-run-details-label">Run details</span>
+        <span className="session-run-details-summary tabular-nums">{summary}</span>
+      </summary>
+      <div className="session-run-details-body">
+        <dl className="session-run-details-meta tabular-nums">
+          {inspector ? (
+            <>
+              <dt>provider</dt>
+              <dd>{inspector.provider}</dd>
+              <dt>state</dt>
+              <dd className={`session-provider-state is-${inspector.state}`}>{inspector.state}</dd>
+              <dt>events</dt>
+              <dd>raw {inspector.raw_count} → normalized {inspector.normalized_count}</dd>
+            </>
+          ) : null}
+          {dispositionCounts ? (
+            <>
+              <dt>dispositions</dt>
+              <dd className="session-dispositions-value">{dispositionCounts}</dd>
+            </>
+          ) : null}
+          {format ? (
+            <>
+              <dt>format</dt>
+              <dd>{format}</dd>
+            </>
+          ) : null}
+          {tokensLabel ? (
+            <>
+              <dt>tokens</dt>
+              <dd>{tokensLabel}</dd>
+            </>
+          ) : null}
+          {typeof thinkingTokens === "number" ? (
+            <>
+              <dt>thinking</dt>
+              <dd>{thinkingTokens} tokens</dd>
+            </>
+          ) : null}
+        </dl>
+        {inspector ? (
           <div className="session-provider-events">
             {inspector.events.length > 0 ? (
               inspector.events
@@ -1009,9 +1053,9 @@ function ProviderStreamInspector({
               <div className="session-provider-empty">No normalized provider events yet.</div>
             )}
           </div>
-        </div>
-      ) : null}
-    </div>
+        ) : null}
+      </div>
+    </details>
   );
 }
 
@@ -2665,16 +2709,14 @@ export function SessionTab({
     );
   }
 
-  const tokens = formatTokens(session.tokens);
-  const dispositionCounts = formatDispositionCounts(session.dispositions);
-  const footerSegments = [session.format, tokens ?? "", dispositionCounts].filter(Boolean);
   const rateLimit = session.sessionMeta.rate_limit;
-  const thinkingTokens = session.sessionMeta.thinking_tokens?.total;
+  const thinkingTokens = session.sessionMeta.thinking_tokens?.total ?? null;
+  const inspector = session.providerInspector;
 
   return (
     <QuestionUiContext.Provider value={questionUi}>
       <div className="session-tab" ref={containerRef}>
-      {(session.tasks.length > 0 || session.pr || session.sessionMeta.custom_title || session.sessionMeta.agent_name || typeof thinkingTokens === "number" || (rateLimit?.status && rateLimit.status !== "allowed")) ? (
+      {(session.tasks.length > 0 || session.pr || session.sessionMeta.custom_title || session.sessionMeta.agent_name || (rateLimit?.status && rateLimit.status !== "allowed")) ? (
         <div className="session-state-strip">
           {session.sessionMeta.custom_title ? (
             <span className="session-state-meta">{session.sessionMeta.custom_title}</span>
@@ -2692,9 +2734,6 @@ export function SessionTab({
               </span>
             </span>
           ) : null}
-          {typeof thinkingTokens === "number" ? (
-            <span className="session-state-meta tabular-nums">thinking {thinkingTokens} tokens</span>
-          ) : null}
           {rateLimit ? <ClaudeRateLimitChrome rate={rateLimit} /> : null}
           {session.pr ? (
             <a
@@ -2708,12 +2747,26 @@ export function SessionTab({
           ) : null}
         </div>
       ) : null}
-      <div className="session-dispositions">
-        <span className="session-dispositions-value">{dispositionCounts}</span>
-      </div>
-      {session.providerInspector ? (
-        <ProviderStreamInspector inspector={session.providerInspector} ticket={ticket} />
+      {inspector ? (
+        <ProviderActionRequired inspector={inspector} ticket={ticket} />
       ) : null}
+      {inspector && inspector.provider === "codex" ? (
+        <CodexStreamHighlights
+          events={inspector.events}
+          currentTurnDiff={
+            inspector.current_turn_diff === undefined
+              ? undefined
+              : inspector.current_turn_diff?.diff ?? null
+          }
+        />
+      ) : null}
+      <SessionRunDetails
+        inspector={inspector ?? null}
+        format={session.format ?? null}
+        tokens={session.tokens ?? null}
+        thinkingTokens={thinkingTokens}
+        dispositions={session.dispositions ?? null}
+      />
       <div className="session-scroll" ref={ref}>
         <div className="session-scroll-inner" ref={innerRef}>
           {session.hasOlder && !subagent ? (
@@ -2756,15 +2809,7 @@ export function SessionTab({
         />
       )}
       <div className="session-footer tabular-nums">
-        {footerSegments[0] ? <span>{footerSegments[0]}</span> : null}
-        <span className="session-footer-separator">·</span>
         <SessionModelFooter session={session} ticket={ticket} />
-        {footerSegments.slice(1).map((segment) => (
-          <span className="session-footer-segment" key={segment}>
-            <span className="session-footer-separator">·</span>
-            {segment}
-          </span>
-        ))}
       </div>
       </div>
     </QuestionUiContext.Provider>
