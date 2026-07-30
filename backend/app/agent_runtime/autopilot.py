@@ -238,7 +238,8 @@ class AutopilotController:
         self._structured_steer = steer is None
         self.archive = archive or self._default_archive
         self.merge = merge or self._default_merge
-        self.notify = notify or self._default_notify
+        self.notifications: list[tuple[str, str]] = []
+        self.notify = notify or self._record_notification
         self._locks: dict[str, asyncio.Lock] = {}
 
     def enable(
@@ -934,8 +935,11 @@ class AutopilotController:
 
         return github_pr.merge_pr(pr_url, sha)
 
+    def _record_notification(self, orch: str, message: str) -> None:
+        self.notifications.append((orch, message))
+
     @staticmethod
-    def _default_notify(orch: str, message: str) -> Any:
+    def live_notify(orch: str, message: str) -> Any:
         from .. import main
 
         return main.agent_message(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import tempfile
 import unittest
@@ -8,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from backend.app.agent_runtime.autopilot import (
-    AutopilotController,
+    AutopilotController as RealAutopilotController,
     AutopilotStore,
     Finding,
     Verdict,
@@ -19,6 +20,21 @@ from backend.app.agent_runtime.autopilot import (
 
 
 PR_URL = "https://github.com/hwang2409/wiki/pull/173"
+
+
+class HarnessAutopilotController(RealAutopilotController):
+    """Keep controller notifications inside the test harness."""
+
+    def __init__(self, *args, **kwargs):
+        self.notifications: list[tuple[str, str]] = []
+        kwargs.setdefault(
+            "notify",
+            lambda orch, message: self.notifications.append((orch, message)),
+        )
+        super().__init__(*args, **kwargs)
+
+
+AutopilotController = HarnessAutopilotController
 
 
 def _graph(verdicts: list[dict]) -> dict:
@@ -99,6 +115,160 @@ class AutopilotTests(unittest.TestCase):
             fallback=lambda _text: {"state": "MERGE-READY", "findings": []},
         )
         self.assertIsNone(verdict)
+
+    def test_json_severity_aliases_persist_before_actions(self) -> None:
+        for alias, canonical in {
+            "CRITICAL": "BLOCKING",
+            "MAJOR": "HIGH",
+            "MINOR": "MEDIUM",
+        }.items():
+            with self.subTest(alias=alias), tempfile.TemporaryDirectory() as directory:
+                artifact = Path(directory) / "reviewer-output.json"
+                artifact.write_text(
+                    json.dumps(
+                        {
+                            "state": "NOT-MERGE-READY",
+                            "sha": "0123456",
+                            "findings": [
+                                {
+                                    "severity": alias,
+                                    "file": "backend/app/main.py",
+                                    "line": 1,
+                                    "observed": "unsafe",
+                                    "do_instead": "fix it",
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                graph = _graph([])
+                graph["edges"] = [
+                    {
+                        "kind": "spawn",
+                        "to": "WIKI-173-REVIEW1",
+                        "payload": {"role": "review"},
+                    }
+                ]
+                actions: list[object] = []
+
+                def record_verdict(_ticket, reviewer, verdict, _request_id):
+                    actions.append(("persist", verdict.findings[0].severity))
+                    graph["edges"].append(
+                        {
+                            "kind": "verdict",
+                            "from": reviewer,
+                            "payload": {
+                                "worker": reviewer,
+                                "state": verdict.state,
+                                "sha": verdict.source_sha,
+                                "findings": [
+                                    finding.to_dict() for finding in verdict.findings
+                                ],
+                            },
+                        }
+                    )
+                    return True
+
+                controller = AutopilotController(
+                    store=AutopilotStore(Path(directory) / "state"),
+                    status_reader=lambda _ticket: {"pr": PR_URL, "sha": "0123456"},
+                    graph_loader=lambda _ticket: graph,
+                    record_verdict=record_verdict,
+                    steer=lambda _ticket, _message: actions.append("steer"),
+                    archive=lambda _reviewer: actions.append("archive"),
+                )
+                controller.enable("WIKI-173")
+                self.assertTrue(
+                    asyncio.run(
+                        controller.on_transition(
+                            {
+                                "agent_id": "WIKI-173-REVIEW1",
+                                "run_id": "json-alias",
+                                "status_state": "merge-ready",
+                                "status_mtime": 1,
+                                "verdict_path": str(artifact),
+                            }
+                        )
+                    )
+                )
+                self.assertEqual(
+                    actions,
+                    [("persist", canonical), "steer", "archive"],
+                )
+
+    def test_text_severity_aliases_persist_before_actions(self) -> None:
+        for alias, canonical in {
+            "CRITICAL": "BLOCKING",
+            "MAJOR": "HIGH",
+            "MINOR": "MEDIUM",
+        }.items():
+            with self.subTest(alias=alias), tempfile.TemporaryDirectory() as directory:
+                artifact = Path(directory) / "reviewer-output.txt"
+                artifact.write_text(
+                    f"""NOT-MERGE-READY: 1 finding
+
+source sha: 0123456
+
+1. [{alias}] backend/app/main.py:1 - unsafe
+   fix: fix it
+""",
+                    encoding="utf-8",
+                )
+                graph = _graph([])
+                graph["edges"] = [
+                    {
+                        "kind": "spawn",
+                        "to": "WIKI-173-REVIEW1",
+                        "payload": {"role": "review"},
+                    }
+                ]
+                actions: list[object] = []
+
+                def record_verdict(_ticket, reviewer, verdict, _request_id):
+                    actions.append(("persist", verdict.findings[0].severity))
+                    graph["edges"].append(
+                        {
+                            "kind": "verdict",
+                            "from": reviewer,
+                            "payload": {
+                                "worker": reviewer,
+                                "state": verdict.state,
+                                "sha": verdict.source_sha,
+                                "findings": [
+                                    finding.to_dict() for finding in verdict.findings
+                                ],
+                            },
+                        }
+                    )
+                    return True
+
+                controller = AutopilotController(
+                    store=AutopilotStore(Path(directory) / "state"),
+                    status_reader=lambda _ticket: {"pr": PR_URL, "sha": "0123456"},
+                    graph_loader=lambda _ticket: graph,
+                    record_verdict=record_verdict,
+                    steer=lambda _ticket, _message: actions.append("steer"),
+                    archive=lambda _reviewer: actions.append("archive"),
+                )
+                controller.enable("WIKI-173")
+                self.assertTrue(
+                    asyncio.run(
+                        controller.on_transition(
+                            {
+                                "agent_id": "WIKI-173-REVIEW1",
+                                "run_id": "text-alias",
+                                "status_state": "merge-ready",
+                                "status_mtime": 1,
+                                "verdict_path": str(artifact),
+                            }
+                        )
+                    )
+                )
+                self.assertEqual(
+                    actions,
+                    [("persist", canonical), "steer", "archive"],
+                )
 
     def test_parser_rejects_echoed_conflicting_verdict_and_findings_on_clean(self) -> None:
         self.assertIsNone(
@@ -341,6 +511,8 @@ MERGE-READY
             )
             self.assertEqual(spawned, [])
             self.assertEqual(controller.status("WIKI-173")["halted"], "iteration-cap")
+            self.assertEqual(len(controller.notifications), 1)
+            self.assertIn("autopilot halted WIKI-173: iteration-cap", controller.notifications[0][1])
 
     def test_plateau_halts_after_three_overlapping_findings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -128,7 +128,9 @@ async def run_daemon(args: argparse.Namespace) -> None:
                 run_id, message, dedupe_key=dedupe_key, source=source
             ),
             ownership_lock=supervisor._agent_lock,  # noqa: SLF001
-            on_transition=AutopilotController().on_transition,
+            on_transition=AutopilotController(
+                notify=AutopilotController.live_notify,
+            ).on_transition,
         )
         fleet_task = asyncio.create_task(
             fleet_monitor.run(stop),

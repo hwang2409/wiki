@@ -33,6 +33,16 @@ _LOCATION = re.compile(
 _SHA = re.compile(
     r"(?i)\b(?:source[_ -]?sha|pinned[_ -]?sha|sha)\s*[:=]\s*([0-9a-f]{7,64})\b"
 )
+_SEVERITY_ALIASES = {
+    "CRITICAL": "BLOCKING",
+    "MAJOR": "HIGH",
+    "MINOR": "MEDIUM",
+}
+
+
+def _normalize_severity(value: Any) -> str:
+    severity = str(value or "MEDIUM").upper()
+    return _SEVERITY_ALIASES.get(severity, severity)
 
 
 @dataclass(frozen=True)
@@ -149,7 +159,7 @@ def _finding_from_mapping(
     finding_source_worker = value.get("source_worker") or value.get("worker") or source_worker
     contract = value.get("mutation_contract") or value.get("contract")
     return Finding(
-        severity=str(value.get("severity") or "MEDIUM").upper(),
+        severity=_normalize_severity(value.get("severity")),
         path=path,
         line=line,
         problem=problem,
@@ -268,7 +278,7 @@ def parse_verdict(
             problem = problem[: inline_fix.start()].rstrip(" .")
         findings.append(
             Finding(
-                severity=match.group("severity").upper(),
+                severity=_normalize_severity(match.group("severity")),
                 path=path,
                 line=line,
                 problem=problem,

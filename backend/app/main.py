@@ -4134,7 +4134,7 @@ def autopilot_enable_route(ticket: str, body: AutopilotEnableIn | None = None) -
     from .agent_runtime.autopilot import AutopilotController
 
     try:
-        return AutopilotController().enable(
+        return AutopilotController(notify=AutopilotController.live_notify).enable(
             ticket,
             henry_ack_required_for_merge=(body.henry_ack_required_for_merge if body else False),
         )
@@ -4147,7 +4147,7 @@ def autopilot_disable_route(ticket: str) -> dict[str, Any]:
     from .agent_runtime.autopilot import AutopilotController
 
     try:
-        return AutopilotController().disable(ticket)
+        return AutopilotController(notify=AutopilotController.live_notify).disable(ticket)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -4157,7 +4157,7 @@ def autopilot_ack_merge_route(ticket: str) -> dict[str, Any]:
     from .agent_runtime.autopilot import AutopilotController
 
     try:
-        return AutopilotController().ack_merge(ticket)
+        return AutopilotController(notify=AutopilotController.live_notify).ack_merge(ticket)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -4166,7 +4166,7 @@ def autopilot_ack_merge_route(ticket: str) -> dict[str, Any]:
 def autopilot_status_route() -> dict[str, Any]:
     from .agent_runtime.autopilot import AutopilotController
 
-    return AutopilotController().status()
+    return AutopilotController(notify=AutopilotController.live_notify).status()
 
 
 @app.get("/api/autopilot/{ticket}")
@@ -4174,7 +4174,7 @@ def autopilot_ticket_status_route(ticket: str) -> dict[str, Any]:
     from .agent_runtime.autopilot import AutopilotController
 
     try:
-        return AutopilotController().status(ticket)
+        return AutopilotController(notify=AutopilotController.live_notify).status(ticket)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
