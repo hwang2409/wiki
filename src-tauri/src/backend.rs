@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     env,
     error::Error,
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     net::TcpListener,
@@ -138,8 +138,9 @@ pub struct NativeAppState {
 struct LifecycleState {
     app_origin: Option<String>,
     sidecar: Option<SidecarState>,
-    // Wiki.app origin secret received through the sidecar environment or the
-    // daemon's owner-only runtime socket. Held in Rust process memory only.
+    // Wiki.app origin secret received through the sidecar stdin pipe or the
+    // daemon's code-identity-authenticated runtime channel. Held in Rust
+    // process memory only.
     // WIKI-148 round 6, Path B.
     wiki_app_secret: Option<String>,
     // Loopback origins for which a remote-scoped ACL capability granting
@@ -294,14 +295,16 @@ fn start_sidecar(app: &AppHandle, restart_count: u8) -> Result<String, Box<dyn E
         ),
     )?;
 
-    let (rx, child) = app
+    let inherited_env = sidecar_environment_without_secret();
+    let (rx, mut child) = app
         .shell()
         .sidecar("wiki-backend")?
         .current_dir(&repo_dir)
+        .env_clear()
+        .envs(inherited_env)
         .env("PATH", FINDER_SAFE_PATH)
         .env("WIKI_REPO_DIR", &repo_dir)
         .env("WIKI_VAULT_DIR", &vault_dir)
-        .env("WIKI_APP_SECRET", &app_secret)
         .args([
             "--host",
             "127.0.0.1",
@@ -315,6 +318,11 @@ fn start_sidecar(app: &AppHandle, restart_count: u8) -> Result<String, Box<dyn E
             &parent_pid,
         ])
         .spawn()?;
+
+    if let Err(error) = child.write(format!("{app_secret}\n").as_bytes()) {
+        let _ = child.kill();
+        return Err(io::Error::other(format!("cannot send sidecar auth pipe: {error}")).into());
+    }
 
     let pid = child.pid();
     {
@@ -362,6 +370,12 @@ fn new_app_secret() -> io::Result<String> {
     let mut bytes = [0_u8; 32];
     File::open("/dev/urandom")?.read_exact(&mut bytes)?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn sidecar_environment_without_secret() -> Vec<(OsString, OsString)> {
+    env::vars_os()
+        .filter(|(key, _)| key != OsStr::new("WIKI_APP_SECRET"))
+        .collect()
 }
 
 fn launch_backend_and_navigate(app: &AppHandle) {
@@ -913,6 +927,13 @@ fn request_graceful_shutdown(_pid: u32) {}
 mod tests {
     use super::repo_dir_from_manifest_dir;
     use std::path::Path;
+
+    #[test]
+    fn sidecar_environment_excludes_origin_secret() {
+        assert!(super::sidecar_environment_without_secret()
+            .iter()
+            .all(|(key, _)| key != "WIKI_APP_SECRET"));
+    }
 
     #[test]
     fn repo_dir_defaults_to_manifest_parent() {

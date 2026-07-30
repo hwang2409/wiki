@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import http.server
 import os
 import socket
 import subprocess
 import sys
 import textwrap
+import threading
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -131,7 +133,17 @@ class LaunchAgentConfigTests(unittest.TestCase):
                     ["launchctl", *arguments], 0, "", ""
                 )
 
-            with patch.object(daemon, "_launchctl", side_effect=fake_launchctl):
+            health = {
+                "healthy": True,
+                "payload": {
+                    "status": "ok",
+                    "daemon_managed": True,
+                    "backend_fingerprint": daemon._expected_backend_fingerprint(config),
+                },
+            }
+            with patch.object(daemon, "_launchctl", side_effect=fake_launchctl), patch.object(
+                daemon, "_health", return_value=health
+            ):
                 result = daemon.install(config)
 
             self.assertEqual(result["action"], "installed")
@@ -243,6 +255,7 @@ class DaemonLogTests(unittest.TestCase):
 
                     native_server.uvicorn.Config = lambda *args, **kwargs: object()
                     native_server.uvicorn.Server = FakeServer
+                    native_server.is_trusted_tauri_peer = lambda _connection: True
                     sys.argv = [
                         "wiki-backend", "--port", "18213", "--daemon",
                         "--log-path", {str(log_path)!r},
@@ -332,15 +345,37 @@ class DaemonLogTests(unittest.TestCase):
 
 
 class DaemonArtifactTests(unittest.TestCase):
+    def test_install_fails_before_bootstrap_when_bundle_is_missing(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = daemon.config_from_env(
+                overrides={
+                    "WIKI_APP_PATH": str(root / "Wiki.app"),
+                    "WIKI_LAUNCH_AGENTS_DIR": str(root / "LaunchAgents"),
+                }
+            )
+            with patch.object(daemon, "_launchctl") as launchctl:
+                with self.assertRaisesRegex(daemon.DaemonError, "missing or not executable"):
+                    daemon.install(config)
+            launchctl.assert_not_called()
+
     def test_default_install_uses_frozen_bundle_executable(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            executable = root / "dist" / "wiki-backend-sidecar" / "wiki-backend"
+            executable = (
+                root
+                / "Wiki.app"
+                / "Contents"
+                / "Resources"
+                / "wiki-backend-sidecar"
+                / "wiki-backend"
+            )
             executable.parent.mkdir(parents=True)
             executable.write_bytes(b"frozen backend")
+            executable.chmod(0o755)
             config = daemon.config_from_env(
                 overrides={
-                    "WIKI_REPO_DIR": str(root),
+                    "WIKI_APP_PATH": str(root / "Wiki.app"),
                     "WIKI_VAULT_DIR": str(root / "vault"),
                     "WIKI_AGENT_RUNTIME_DIR": str(root / "runtime"),
                     "WIKI_LAUNCH_AGENTS_DIR": str(root / "LaunchAgents"),
@@ -356,13 +391,127 @@ class DaemonArtifactTests(unittest.TestCase):
                 frozen_runtime_fingerprint(config.executable),
             )
 
+    def test_install_fails_if_bootstrapped_backend_is_unhealthy(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = (
+                root
+                / "Wiki.app"
+                / "Contents"
+                / "Resources"
+                / "wiki-backend-sidecar"
+                / "wiki-backend"
+            )
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"stable bundled backend")
+            executable.chmod(0o755)
+            config = daemon.config_from_env(
+                overrides={
+                    "WIKI_APP_PATH": str(root / "Wiki.app"),
+                    "WIKI_LAUNCH_AGENTS_DIR": str(root / "LaunchAgents"),
+                }
+            )
+
+            def fake_launchctl(
+                _config: daemon.DaemonConfig, *arguments: str
+            ) -> subprocess.CompletedProcess[str]:
+                if arguments[0] == "print":
+                    return subprocess.CompletedProcess(
+                        ["launchctl", *arguments],
+                        113,
+                        "",
+                        daemon._service_absent_message(config),
+                    )
+                return subprocess.CompletedProcess(["launchctl", *arguments], 0, "", "")
+
+            with patch.object(daemon, "_launchctl", side_effect=fake_launchctl), patch.object(
+                daemon, "_health", return_value={"healthy": False}
+            ), patch.object(daemon, "HEALTH_TIMEOUT_SECONDS", 0.0):
+                with self.assertRaisesRegex(daemon.DaemonError, "did not become healthy"):
+                    daemon.install(config)
+
 
 class DaemonHandshakeTests(unittest.TestCase):
+    def test_sidecar_pipe_secret_is_not_in_child_environment(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            driver = root / "sidecar_pipe.py"
+            child_env_copy = root / "child-env.txt"
+            driver.write_text(
+                textwrap.dedent(
+                    f"""
+                    import os
+                    import subprocess
+                    import sys
+                    from pathlib import Path
+                    from backend.native_server import read_sidecar_secret
+
+                    os.environ["WIKI_APP_SECRET"] = "pipe-secret"
+                    secret = read_sidecar_secret()
+                    Path({str(root / 'secret.txt')!r}).write_text(secret, encoding="utf-8")
+                    child = subprocess.run(
+                        [sys.executable, "-c", "import os; print(os.environ.get('WIKI_APP_SECRET', '<absent>'))"],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+                    Path({str(child_env_copy)!r}).write_text(child.stdout, encoding="utf-8")
+                    """
+                ),
+                encoding="utf-8",
+            )
+            env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[2])}
+            subprocess.run(
+                [sys.executable, str(driver)],
+                input="pipe-secret\n",
+                check=True,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            self.assertEqual((root / "secret.txt").read_text(encoding="utf-8"), "pipe-secret")
+            self.assertEqual(child_env_copy.read_text(encoding="utf-8").strip(), "<absent>")
+
+    def test_untrusted_sibling_is_rejected(self) -> None:
+        with TemporaryDirectory() as tmp:
+            server = DaemonAuthSocket(Path(tmp) / "runtime", "not-for-siblings")
+            server.start()
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import socket, sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); print(s.recv(4096).decode())",
+                    str(server.path),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            server.close()
+            self.assertEqual(result.stdout.strip(), "")
+
+    def test_overlapping_starts_and_reversed_shutdown_keep_socket_identity(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runtime_dir = Path(tmp) / "runtime"
+            first = DaemonAuthSocket(runtime_dir, "first")
+            first.start()
+            second = DaemonAuthSocket(runtime_dir, "second")
+            with self.assertRaises(RuntimeError):
+                second.start()
+
+            first.close()
+            second.start()
+            first.close()
+            self.assertTrue(second.path.exists())
+            second.close()
+
     def test_handshake_reissues_secret_after_daemon_restart(self) -> None:
         with TemporaryDirectory() as tmp:
             runtime_dir = Path(tmp) / "runtime"
 
-            first = DaemonAuthSocket(runtime_dir, "secret-before-restart")
+            first = DaemonAuthSocket(
+                runtime_dir, "secret-before-restart", peer_checker=lambda _socket: True
+            )
             first.start()
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                 client.connect(str(first.path))
@@ -371,7 +520,9 @@ class DaemonHandshakeTests(unittest.TestCase):
                 )
             first.close()
 
-            second = DaemonAuthSocket(runtime_dir, "secret-after-restart")
+            second = DaemonAuthSocket(
+                runtime_dir, "secret-after-restart", peer_checker=lambda _socket: True
+            )
             second.start()
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                 client.connect(str(second.path))
@@ -381,7 +532,7 @@ class DaemonHandshakeTests(unittest.TestCase):
             second.close()
 
             self.assertFalse(first.path.exists())
-            self.assertEqual(list(runtime_dir.iterdir()), [])
+            self.assertTrue((runtime_dir / "wiki-app-secret.lock").exists())
 
 
 class DaemonCliTests(unittest.TestCase):
@@ -422,6 +573,48 @@ class DaemonCliTests(unittest.TestCase):
         wiki_cli = repo_root / "wiki"
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
+            executable = (
+                root
+                / "Wiki.app"
+                / "Contents"
+                / "Resources"
+                / "wiki-backend-sidecar"
+                / "wiki-backend"
+            )
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"stable bundled backend")
+            executable.chmod(0o755)
+            fingerprint = frozen_runtime_fingerprint(executable)
+
+            class HealthHandler(http.server.BaseHTTPRequestHandler):
+                def do_GET(self) -> None:
+                    if self.path != "/health":
+                        self.send_response(404)
+                        self.end_headers()
+                        return
+                    body = json.dumps(
+                        {
+                            "status": "ok",
+                            "daemon_managed": True,
+                            "backend_fingerprint": fingerprint,
+                        }
+                    ).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                def log_message(self, _format: str, *_args: object) -> None:
+                    pass
+
+            health_server = http.server.ThreadingHTTPServer(
+                ("127.0.0.1", 0), HealthHandler
+            )
+            health_thread = threading.Thread(
+                target=health_server.serve_forever, daemon=True
+            )
+            health_thread.start()
             bin_dir, launchctl_log = self._write_launchctl_stub(root)
             env = {
                 **os.environ,
@@ -431,23 +624,30 @@ class DaemonCliTests(unittest.TestCase):
                 "WIKI_AGENT_RUNTIME_DIR": str(root / "runtime"),
                 "WIKI_REPO_DIR": str(root / "repo"),
                 "WIKI_VAULT_DIR": str(root / "vault"),
+                "WIKI_APP_PATH": str(root / "Wiki.app"),
+                "WIKI_BACKEND_PORT": str(health_server.server_port),
             }
             commands = [
                 ["daemon", "install", "--json"],
                 ["daemon", "status", "--json"],
                 ["daemon", "uninstall", "--json"],
             ]
-            results = [
-                subprocess.run(
-                    [sys.executable, str(wiki_cli), *command],
-                    capture_output=True,
-                    text=True,
-                    env=env,
-                    check=False,
-                    timeout=15,
-                )
-                for command in commands
-            ]
+            try:
+                results = [
+                    subprocess.run(
+                        [sys.executable, str(wiki_cli), *command],
+                        capture_output=True,
+                        text=True,
+                        env=env,
+                        check=False,
+                        timeout=15,
+                    )
+                    for command in commands
+                ]
+            finally:
+                health_server.shutdown()
+                health_thread.join(timeout=2)
+                health_server.server_close()
             for result in results:
                 self.assertEqual(result.returncode, 0, msg=result.stderr)
             self.assertEqual(

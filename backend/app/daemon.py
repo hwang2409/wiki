@@ -7,6 +7,7 @@ import os
 import plistlib
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.error import URLError
@@ -16,6 +17,9 @@ from urllib.request import Request, urlopen
 DEFAULT_LABEL = "com.hwang2409.wiki.backend"
 DEFAULT_PORT = 8213
 FINDER_SAFE_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+DEFAULT_WIKI_APP_PATH = Path("/Applications/Wiki.app")
+HEALTH_TIMEOUT_SECONDS = 15.0
+HEALTH_POLL_SECONDS = 0.2
 
 
 class DaemonError(RuntimeError):
@@ -89,8 +93,10 @@ def config_from_env(*, overrides: dict[str, str | None] | None = None) -> Daemon
         values.get("WIKI_AGENT_RUNTIME_DIR") or Path.home() / ".wiki" / "agent-runtime"
     ).expanduser().absolute()
     executable_raw = values.get("WIKI_BACKEND_EXECUTABLE")
+    app_path = Path(values.get("WIKI_APP_PATH") or DEFAULT_WIKI_APP_PATH)
     executable = Path(
-        executable_raw or repo_dir / "dist" / "wiki-backend-sidecar" / "wiki-backend"
+        executable_raw
+        or app_path / "Contents" / "Resources" / "wiki-backend-sidecar" / "wiki-backend"
     ).expanduser().absolute()
     python_module = ""
     log_path = Path(
@@ -218,6 +224,10 @@ def _service_loaded(config: DaemonConfig) -> bool:
 def install(config: DaemonConfig) -> dict[str, object]:
     """Install and load the LaunchAgent without touching run state."""
 
+    if not config.executable.is_file() or not os.access(config.executable, os.X_OK):
+        raise DaemonError(
+            f"backend executable is missing or not executable: {config.executable}"
+        )
     config.log_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     config.log_path.parent.chmod(0o700)
     _write_plist(config)
@@ -232,11 +242,13 @@ def install(config: DaemonConfig) -> dict[str, object]:
     loaded = _launchctl(config, "bootstrap", config.domain, str(config.plist_path))
     if loaded.returncode != 0:
         raise DaemonError(f"cannot load {config.plist_path}: {_describe_failure(loaded)}")
+    _wait_for_healthy(config)
     return {
         "label": config.label,
         "target": config.target,
         "plist": str(config.plist_path),
         "url": config.backend_url,
+        "backend_fingerprint": _expected_backend_fingerprint(config),
         "action": "installed",
     }
 
@@ -276,6 +288,31 @@ def _health(config: DaemonConfig) -> dict[str, object]:
         and payload.get("daemon_managed") is True,
         "payload": payload,
     }
+
+
+def _expected_backend_fingerprint(config: DaemonConfig) -> str:
+    from .agent_runtime.version import frozen_runtime_fingerprint
+
+    return frozen_runtime_fingerprint(config.executable)
+
+
+def _wait_for_healthy(config: DaemonConfig) -> dict[str, object]:
+    deadline = time.monotonic() + HEALTH_TIMEOUT_SECONDS
+    expected = _expected_backend_fingerprint(config)
+    last_health: dict[str, object] = {"healthy": False}
+    while time.monotonic() < deadline:
+        last_health = _health(config)
+        payload = last_health.get("payload")
+        if last_health.get("healthy") and isinstance(payload, dict):
+            if payload.get("backend_fingerprint") != expected:
+                raise DaemonError(
+                    "daemon health fingerprint does not match the installed backend"
+                )
+            return last_health
+        time.sleep(HEALTH_POLL_SECONDS)
+    raise DaemonError(
+        f"daemon did not become healthy at {config.backend_url}: {last_health}"
+    )
 
 
 def status(config: DaemonConfig) -> dict[str, object]:
