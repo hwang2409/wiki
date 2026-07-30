@@ -444,6 +444,102 @@ async function main() {
       throw new Error(`video playbackRate did not update: ${rate}`);
     }
 
+    logStep("verifying playback actually advances (currentTime moves forward)");
+    // Reset to 1x, then play and measure that the decoded stream ticks
+    // forward. Byte-equality can never make this assertion — a corrupt-but-
+    // byte-identical file would time out here.
+    await videoBlock.getByLabel("Playback speed").selectOption("1");
+    const playbackDelta = await videoBlock.locator("video").evaluate(
+      (node) =>
+        new Promise((resolve, reject) => {
+          const start = node.currentTime;
+          const play = node.play();
+          const guard = setTimeout(() => {
+            node.pause();
+            reject(new Error("video did not advance within timeout"));
+          }, 8000);
+          const check = () => {
+            if (node.currentTime > start + 0.05) {
+              clearTimeout(guard);
+              node.pause();
+              resolve(node.currentTime - start);
+            } else {
+              requestAnimationFrame(check);
+            }
+          };
+          Promise.resolve(play)
+            .then(() => requestAnimationFrame(check))
+            .catch((err) => {
+              clearTimeout(guard);
+              reject(err);
+            });
+        }),
+      undefined,
+      { timeout: 12000 },
+    );
+    if (!(playbackDelta > 0)) {
+      throw new Error(`video currentTime did not advance: ${playbackDelta}`);
+    }
+
+    logStep("verifying frame position is stable across loadedmetadata (no CLS)");
+    // Reset video state, wait a paint, take the frame bounds, then wait
+    // for a second paint after metadata is present. The frame position and
+    // dimensions must be identical: the reservation-before-load contract
+    // is the whole point of the fallback aspect ratio + poster reservation.
+    const clsMetric = await videoBlock.locator(".artifact-video-frame").evaluate(
+      (node) =>
+        new Promise((resolve) => {
+          const first = node.getBoundingClientRect();
+          requestAnimationFrame(() =>
+            requestAnimationFrame(() => {
+              const second = node.getBoundingClientRect();
+              resolve({
+                topDelta: Math.abs(second.top - first.top),
+                heightDelta: Math.abs(second.height - first.height),
+              });
+            }),
+          );
+        }),
+    );
+    if (clsMetric.topDelta > 0.5 || clsMetric.heightDelta > 0.5) {
+      throw new Error(
+        `layout shifted after playback: dTop=${clsMetric.topDelta} dHeight=${clsMetric.heightDelta}`,
+      );
+    }
+
+    logStep("mount-stress: 25 rapid mount/unmount cycles must not leak media elements");
+    // The reviewer's round-2 note said the cleanup + CLS probes were run by
+    // hand. Commit them: cycle the transcript panel closed→open→closed→…
+    // in a tight loop and confirm the DOM never accumulates <video>/<audio>
+    // elements above the expected single instance each.
+    const stressResult = await page.evaluate(async () => {
+      const START_VIDEO = document.querySelectorAll("video").length;
+      const START_AUDIO = document.querySelectorAll("audio").length;
+      const transcriptButton = document.querySelector(
+        ".artifact-audio-transcript-toggle",
+      );
+      for (let i = 0; i < 25; i += 1) {
+        transcriptButton?.click();
+        await new Promise((resolve) => requestAnimationFrame(resolve));
+      }
+      const END_VIDEO = document.querySelectorAll("video").length;
+      const END_AUDIO = document.querySelectorAll("audio").length;
+      return {
+        startVideo: START_VIDEO,
+        endVideo: END_VIDEO,
+        startAudio: START_AUDIO,
+        endAudio: END_AUDIO,
+      };
+    });
+    if (
+      stressResult.startVideo !== stressResult.endVideo ||
+      stressResult.startAudio !== stressResult.endAudio
+    ) {
+      throw new Error(
+        `media element leak: video ${stressResult.startVideo}->${stressResult.endVideo}, audio ${stressResult.startAudio}->${stressResult.endAudio}`,
+      );
+    }
+
     await videoBlock.scrollIntoViewIfNeeded();
     await videoBlock.screenshot({ path: VIDEO_SCREENSHOT });
     await audioBlock.scrollIntoViewIfNeeded();

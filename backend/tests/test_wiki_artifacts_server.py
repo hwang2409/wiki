@@ -312,6 +312,39 @@ class WikiArtifactsTests(unittest.TestCase):
         ):
             wiki_artifacts.render_artifact({"kind": "audio", "payload": payload})
 
+    def test_audio_rejected_transcript_does_not_orphan_media_file(self) -> None:
+        # Round-2 review flagged: an oversized transcript fires AFTER
+        # _write_binary, leaving a scrubbed .wav resident on disk while
+        # the caller sees a failure. Validation must run before the write.
+        payload = {
+            "data_base64": base64.b64encode(FIXTURE_WAV_BYTES).decode(),
+            "mime": "audio/wav",
+            "transcript": "x" * (wiki_artifacts.TEXT_LIMIT + 1),
+        }
+        artifact_dir = self.root / "runtime" / "runs" / RUN_ID / "artifacts"
+        with self.assertRaises(wiki_artifacts.ArtifactValidationError):
+            wiki_artifacts.render_artifact({"kind": "audio", "payload": payload})
+        # No .wav should exist in the artifact dir.
+        if artifact_dir.exists():
+            leftover = list(artifact_dir.glob("*.wav"))
+            self.assertEqual(
+                leftover, [], msg=f"orphaned media files: {leftover}",
+            )
+
+    def test_audio_non_string_transcript_does_not_orphan_media_file(self) -> None:
+        payload = {
+            "data_base64": base64.b64encode(FIXTURE_WAV_BYTES).decode(),
+            "mime": "audio/wav",
+            "transcript": ["not", "a", "string"],
+        }
+        artifact_dir = self.root / "runtime" / "runs" / RUN_ID / "artifacts"
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError, "transcript must be a string"
+        ):
+            wiki_artifacts.render_artifact({"kind": "audio", "payload": payload})
+        if artifact_dir.exists():
+            self.assertEqual(list(artifact_dir.glob("*.wav")), [])
+
     def test_video_accepts_path_payload_alongside_data_base64(self) -> None:
         # Reject "both" and "neither".
         with self.assertRaisesRegex(

@@ -569,6 +569,19 @@ def _write_video(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
     return normalized
 
 
+def _validate_audio_transcript(payload: dict[str, Any]) -> str | None:
+    transcript = payload.get("transcript")
+    if transcript is None:
+        return None
+    if not isinstance(transcript, str):
+        raise ArtifactValidationError("payload.transcript must be a string")
+    if len(transcript) > TEXT_LIMIT:
+        raise ArtifactValidationError(
+            f"audio transcript exceeds the {TEXT_LIMIT // 1000}KB text limit"
+        )
+    return transcript
+
+
 def _write_audio(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
     data, mime = _decode_media_payload(
         payload,
@@ -578,6 +591,12 @@ def _write_audio(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
         limit_label=f"{AUDIO_LIMIT // (1024 * 1024)}MB audio limit",
         optional_keys={"transcript"},
     )
+    # Validate EVERY field before touching the filesystem. A rejected
+    # transcript (or any other optional field) that fires after
+    # _write_binary would leave an orphaned .wav/.mp3 in the artifact
+    # directory — the write is atomic, so the caller can retry with a
+    # different id but the earlier bytes stay resident until the run's
+    # cleanup path runs.
     try:
         result = scrub_audio(data, mime)
     except MediaScrubError as exc:
@@ -586,6 +605,7 @@ def _write_audio(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
         raise ArtifactValidationError(
             f"audio payload exceeds the {AUDIO_LIMIT // (1024 * 1024)}MB audio limit"
         )
+    transcript = _validate_audio_transcript(payload)
 
     artifact_dir = _artifact_run_dir()
     _write_binary(artifact_dir, artifact_id, AUDIO_MIMES[mime], result.data)
@@ -598,14 +618,7 @@ def _write_audio(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
         normalized["duration_ms"] = result.duration_ms
     if result.peaks is not None:
         normalized["peaks"] = result.peaks
-    transcript = payload.get("transcript")
     if transcript is not None:
-        if not isinstance(transcript, str):
-            raise ArtifactValidationError("payload.transcript must be a string")
-        if len(transcript) > TEXT_LIMIT:
-            raise ArtifactValidationError(
-                f"audio transcript exceeds the {TEXT_LIMIT // 1000}KB text limit"
-            )
         normalized["transcript"] = transcript
     return normalized
 

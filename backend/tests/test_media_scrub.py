@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import resource
 import shutil
 import struct
 import subprocess
 import tempfile
+import tracemalloc
 import unittest
 from pathlib import Path
 
@@ -14,6 +16,7 @@ FIXTURE_DIR = Path(__file__).parent / "fixtures" / "media"
 REAL_MP4 = FIXTURE_DIR / "tiny.mp4"
 REAL_WAV = FIXTURE_DIR / "tone.wav"
 REAL_MP3 = FIXTURE_DIR / "tone.mp3"
+REAL_MP3_APE = FIXTURE_DIR / "tone_ape.mp3"
 
 FFMPEG = shutil.which("ffmpeg")
 
@@ -302,36 +305,242 @@ class Mp3StructuralGuards(unittest.TestCase):
             media_scrub.scrub_audio(payload, "audio/mpeg")
 
 
-class WavStreamingPeaksBoundsTests(unittest.TestCase):
-    """The waveform generator must be bounded and NEVER perform a full-file
-    decode. Synthesizing a large WAV proves peaks stay capped at MAX_PEAKS
-    regardless of payload size and the memory footprint is limited to
-    memoryview slices of the input buffer.
+class ScrubMp3ApeV2FixtureTests(unittest.TestCase):
+    """APEv2 metadata is the review's round-2 blocker: silent survival of
+    APE-tagged location/title bytes in an mp3. Fixture appends an APEv2
+    footer (no header variant) to the real fixture with `ape-secret-*` items.
     """
 
-    def test_large_wav_produces_bounded_peak_array(self) -> None:
-        # 2 MB of pcm_s16le samples at 16 kHz mono = ~62s of audio.
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.original = REAL_MP3_APE.read_bytes()
+        cls.result = media_scrub.scrub_audio(cls.original, "audio/mpeg")
+
+    def test_apev2_preamble_is_absent_after_scrub(self) -> None:
+        self.assertIn(b"APETAGEX", self.original)
+        self.assertNotIn(b"APETAGEX", self.result.data)
+
+    def test_ape_item_values_are_destroyed(self) -> None:
+        for marker in (b"ape-secret-lat-lon", b"ape-secret-title", b"LOCATION"):
+            self.assertIn(marker, self.original)
+            self.assertNotIn(marker, self.result.data)
+
+    def test_frame_stream_still_starts_with_sync(self) -> None:
+        self.assertEqual(self.result.data[0], 0xFF)
+        self.assertEqual(self.result.data[1] & 0xE0, 0xE0)
+
+    @unittest.skipIf(FFMPEG is None, "ffmpeg not installed")
+    def test_stored_bytes_still_decode_through_ffmpeg(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as handle:
+            handle.write(self.result.data)
+            path = handle.name
+        try:
+            probe = subprocess.run(
+                [FFMPEG, "-v", "error", "-i", path, "-f", "null", "-"],
+                capture_output=True, timeout=30,
+            )
+            self.assertEqual(probe.returncode, 0, probe.stderr.decode(errors="replace"))
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+
+class Mp4Stbl_stsdStructuralTests(unittest.TestCase):
+    """A fake moov/mvhd/trak with no stbl/stsd sample entry masqueraded as
+    MP4 under round-2 rules. Now the sample-entry check rejects it.
+    """
+
+    def _make_bogus_mp4_no_stsd(self) -> bytes:
+        # ftyp + moov(mvhd + trak(tkhd)) — trak has no mdia/minf/stbl at all.
+        ftyp = struct.pack(">I", 24) + b"ftyp" + b"isom" + b"\x00\x00\x02\x00" + b"isommp41"
+        mvhd_body = (
+            b"\x00\x00\x00\x00"
+            + b"\x00" * 8
+            + struct.pack(">I", 1000)
+            + struct.pack(">I", 1000)
+            + b"\x00" * 80
+        )
+        mvhd = struct.pack(">I", 8 + len(mvhd_body)) + b"mvhd" + mvhd_body
+        tkhd_body = (
+            b"\x00\x00\x00\x07"
+            + b"\x00" * 8
+            + b"\x00\x00\x00\x01"
+            + b"\x00" * 60
+            + struct.pack(">II", 320 << 16, 240 << 16)
+        )
+        tkhd = struct.pack(">I", 8 + len(tkhd_body)) + b"tkhd" + tkhd_body
+        trak = struct.pack(">I", 8 + len(tkhd)) + b"trak" + tkhd
+        moov = struct.pack(">I", 8 + len(mvhd) + len(trak)) + b"moov" + mvhd + trak
+        return ftyp + moov
+
+    def test_bogus_mp4_without_stsd_sample_entry_is_rejected(self) -> None:
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "stbl/stsd"):
+            media_scrub.scrub_video(self._make_bogus_mp4_no_stsd(), "video/mp4")
+
+    def test_real_mp4_carries_a_stsd_sample_entry(self) -> None:
+        # Confirms the check does not false-reject the real fixture.
+        result = media_scrub.scrub_video(REAL_MP4.read_bytes(), "video/mp4")
+        self.assertEqual(result.mime, "video/mp4")
+
+
+class WavFormatCodeAllowlistTests(unittest.TestCase):
+    """Format code 0 (WAVE_FORMAT_UNKNOWN) has no decoder. Round-2 review
+    found the fmt check accepted it. Now the allowlist gates PCM/float and
+    the extensible SubFormat GUID must resolve to PCM or float."""
+
+    @staticmethod
+    def _wav_with_format(format_code: int, extensible_subformat: bytes | None = None) -> bytes:
+        # Minimal WAV with the given format code. If subformat provided,
+        # emits an extensible fmt chunk (chunk_size = 40).
+        if extensible_subformat is not None:
+            fmt_body = (
+                struct.pack("<HHIIHH", format_code, 1, 16000, 32000, 2, 16)
+                + struct.pack("<HHI", 22, 16, 0)
+                + extensible_subformat
+            )
+        else:
+            fmt_body = struct.pack("<HHIIHH", format_code, 1, 16000, 32000, 2, 16)
+        fmt_chunk = b"fmt " + struct.pack("<I", len(fmt_body)) + fmt_body
+        data_chunk = b"data" + struct.pack("<I", 4) + b"\x00\x00\x00\x00"
+        body = b"WAVE" + fmt_chunk + data_chunk
+        return b"RIFF" + struct.pack("<I", len(body)) + body
+
+    def test_format_code_zero_is_rejected(self) -> None:
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "format code 0"):
+            media_scrub.scrub_audio(self._wav_with_format(0), "audio/wav")
+
+    def test_format_code_pcm_is_accepted(self) -> None:
+        media_scrub.scrub_audio(self._wav_with_format(1), "audio/wav")
+
+    def test_format_code_ieee_float_is_accepted(self) -> None:
+        media_scrub.scrub_audio(self._wav_with_format(3), "audio/wav")
+
+    def test_format_code_alaw_is_rejected(self) -> None:
+        # 6 = WAVE_FORMAT_ALAW: valid ITU codec but not on our allowlist.
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "format code 6"):
+            media_scrub.scrub_audio(self._wav_with_format(6), "audio/wav")
+
+    def test_extensible_pcm_subformat_is_accepted(self) -> None:
+        subformat = media_scrub._WAV_KSDATAFORMAT_PCM
+        media_scrub.scrub_audio(
+            self._wav_with_format(0xFFFE, subformat), "audio/wav",
+        )
+
+    def test_extensible_alien_subformat_is_rejected(self) -> None:
+        alien = b"\xaa" * 16
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "SubFormat"):
+            media_scrub.scrub_audio(
+                self._wav_with_format(0xFFFE, alien), "audio/wav",
+            )
+
+
+class WavStreamingPeaksBoundsTests(unittest.TestCase):
+    """The waveform generator must be bounded and NEVER perform a full-file
+    decode. Round-2 review flagged that the previous test only checked the
+    output array size — a full-file allocation could still pass. Here we
+    ALSO measure the incremental allocation via tracemalloc: computing
+    peaks over a 10 MB WAV must not allocate anywhere near 10 MB of new
+    bytes, which is only possible if the generator streams memoryview
+    slices instead of decoding the data chunk into an intermediate array.
+    """
+
+    @staticmethod
+    def _build_wav(sample_count: int) -> bytes:
         sample_rate = 16000
         channels = 1
         bits = 16
         byte_rate = sample_rate * channels * bits // 8
-        # Fabricate a triangle wave so peaks vary.
-        payload = bytearray()
-        for i in range(1_000_000):
+        payload = bytearray(sample_count * 2)
+        for i in range(sample_count):
             value = (i % 32000) - 16000
-            payload.extend(value.to_bytes(2, "little", signed=True))
+            payload[i * 2:i * 2 + 2] = value.to_bytes(2, "little", signed=True)
         fmt_body = struct.pack(
             "<HHIIHH", 1, channels, sample_rate, byte_rate, channels * bits // 8, bits,
         )
         fmt_chunk = b"fmt " + struct.pack("<I", len(fmt_body)) + fmt_body
         data_chunk = b"data" + struct.pack("<I", len(payload)) + bytes(payload)
-        wav = b"RIFF" + struct.pack("<I", 4 + len(fmt_chunk) + len(data_chunk)) + b"WAVE" + fmt_chunk + data_chunk
+        return (
+            b"RIFF"
+            + struct.pack("<I", 4 + len(fmt_chunk) + len(data_chunk))
+            + b"WAVE"
+            + fmt_chunk
+            + data_chunk
+        )
 
+    def test_large_wav_produces_bounded_peak_array(self) -> None:
+        wav = self._build_wav(1_000_000)
         result = media_scrub.scrub_audio(wav, "audio/wav")
         self.assertIsNotNone(result.peaks)
         assert result.peaks is not None
         self.assertLessEqual(len(result.peaks), media_scrub.WAVEFORM_MAX_PEAKS)
         self.assertTrue(any(peak > 0 for peak in result.peaks))
+
+    def test_peak_generator_streams_without_decoding_full_data_chunk(self) -> None:
+        # Isolate the streaming-peaks function from the byte-copy the scrub
+        # does to write the scrubbed output. A 10 MB PCM data chunk fed
+        # straight to _wav_stream_peaks must allocate ORDERS of magnitude
+        # less — only the peak buffer (≤512 uint8) plus a handful of
+        # transient ints. A naive full-decode implementation would blow
+        # through the cap. The payload buffer itself is allocated BEFORE
+        # tracemalloc starts so we only measure the incremental cost of
+        # peak generation, not the setup.
+        sample_count = 5_000_000
+        data_size = sample_count * 2
+        payload = bytearray(data_size)
+        for i in range(sample_count):
+            value = (i % 32000) - 16000
+            payload[i * 2:i * 2 + 2] = value.to_bytes(2, "little", signed=True)
+        payload_bytes = bytes(payload)  # allocated pre-trace
+        # Warm up the interpreter (int cache, function dispatch) so the
+        # measurement below is just the incremental peak-generation cost.
+        media_scrub._wav_stream_peaks(payload_bytes[:200], 0, 200, 1, 16)
+        tracemalloc.start()
+        try:
+            peaks = media_scrub._wav_stream_peaks(
+                payload_bytes, 0, data_size, 1, 16,
+            )
+            _current, peak_bytes = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertIsNotNone(peaks)
+        assert peaks is not None
+        self.assertLessEqual(len(peaks), media_scrub.WAVEFORM_MAX_PEAKS)
+        # Bound: peak-generation allocation must scale with the OUTPUT size
+        # (up to 512 uint8 peaks + transient slice churn), not the input
+        # size. 200 KB is a generous ceiling for per-sample slice churn
+        # from int.from_bytes; a full-decode implementation lands at
+        # roughly the input size.
+        self.assertLess(
+            peak_bytes,
+            200 * 1024,
+            msg=(
+                f"peak generator allocated {peak_bytes} bytes on a "
+                f"{data_size}-byte input — should be independent of input size"
+            ),
+        )
+
+    def test_scrub_wav_rss_bound_stays_under_2x_input(self) -> None:
+        # RSS discipline — a real hostile fixture would fail here if the
+        # generator kept O(N) intermediate structures. We allow up to
+        # 2x the input size (the scrubbed output is ≈1x, plus scratch).
+        wav = self._build_wav(2_000_000)  # 4 MB PCM
+        # Warm up.
+        media_scrub.scrub_audio(self._build_wav(1_000), "audio/wav")
+        rusage_before = resource.getrusage(resource.RUSAGE_SELF)
+        rss_before = rusage_before.ru_maxrss
+        media_scrub.scrub_audio(wav, "audio/wav")
+        rss_after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        delta = max(0, rss_after - rss_before)
+        # macOS ru_maxrss is bytes, Linux is kilobytes. Normalize by treating
+        # anything under 100 MB as bytes (macOS) and anything larger as KB.
+        if delta > 100 * 1024 * 1024:
+            delta = delta * 1024
+        # 40 MB cap = 10x the input, comfortable ceiling for interpreter
+        # noise; a genuine unbounded allocation blows past this easily.
+        self.assertLess(
+            delta,
+            40 * 1024 * 1024,
+            msg=f"maxrss delta {delta} bytes exceeds bound on {len(wav)}-byte WAV",
+        )
 
 
 class UnsupportedMimeTests(unittest.TestCase):

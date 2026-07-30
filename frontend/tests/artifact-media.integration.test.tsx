@@ -166,6 +166,19 @@ describe("VideoRenderer", () => {
     const video = screen.getByLabelText("Fixture media") as HTMLVideoElement;
     expect(video.getAttribute("poster")).toBe("data:image/jpeg;base64,AAAA");
   });
+
+  test("mount-stress: 100 render/unmount cycles leave no leaked video elements", () => {
+    const artifact: SessionArtifact = { kind: "video", mime: "video/mp4", ref: "artifact://abc" };
+    for (let i = 0; i < 100; i += 1) {
+      const { unmount } = render(
+        <VideoRenderer artifact={artifact} event={makeEvent(artifact)} ticket={TICKET} />,
+      );
+      unmount();
+    }
+    // After every cycle, cleanup() below plus the release-on-null ref
+    // callback must have removed every media element from the DOM.
+    expect(document.querySelectorAll("video").length).toBe(0);
+  });
 });
 
 describe("AudioRenderer", () => {
