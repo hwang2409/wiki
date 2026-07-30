@@ -23,8 +23,12 @@ export function ImageArtifactDetail({
     <PanZoomCanvas label="Image pan and zoom canvas" onChange={onChange} state={state}>
       <SharedImageRenderer
         alt={event.title || event.caption || "Agent artifact"}
+        eager
+        height={artifact.height}
         imgClassName="artifact-detail-image"
+        previewBase64={artifact.preview_base64 ?? null}
         source={source}
+        width={artifact.width}
         wrapClassName="artifact-image-detail-wrap"
       />
     </PanZoomCanvas>

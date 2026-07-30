@@ -1,6 +1,12 @@
 import { FileJson } from "lucide-react";
 import type { ArtifactFileEntry, SessionArtifact } from "../api";
+import { isImagePath } from "../artifact-renderers";
 import { StatusBadge, statusToTone } from "../status-badge";
+import { ImageGallery } from "./gallery";
+
+function isImageOnly(files: ArtifactFileEntry[]) {
+  return files.length > 0 && files.every((entry) => isImagePath(entry.path));
+}
 
 export function FileListArtifactDetail({
   artifact,
@@ -14,6 +20,13 @@ export function FileListArtifactDetail({
     return (
       <div className="artifact-detail-file-list">
         <div className="artifact-file-list-empty">No files.</div>
+      </div>
+    );
+  }
+  if (isImageOnly(files)) {
+    return (
+      <div className="artifact-detail-file-list is-gallery">
+        <ImageGallery files={files} />
       </div>
     );
   }

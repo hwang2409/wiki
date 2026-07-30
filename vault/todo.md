@@ -9,8 +9,6 @@ updated: 2026-07-30
 Todo:
 
 - [P3] WIKI-168 daemon-ize wiki backend — open since graph-engineering D2; survive terminal close, launchd or equivalent
-- [P2] WIKI-176 live worker screencast strip — miniature terminal preview (last ~20 lines) inline in fleet view + per-ticket cards; refresh 2s from raw.jsonl tail. Skim 12 workers at glance w/o click-in
-- [P2] WIKI-180 auto-context injector on spawn — LLM scans vault + related tickets + recent PRs touching same files + related workgraphs; prepends "context prelude" to kickoff prompt. Cuts prompt-writing time. Backend: prelude builder; hook into spawn_agent. Frontend: preview prelude before spawn
 - [P2] WIKI-181 reviewer diversity harness — spawn N reviewers w/ distinct lenses (correctness / security / perf / test-strength) in parallel; synthesize verdicts. Codified adversarial verify — one lens catches what another misses. Wire into next_review (WIKI-171) as opt-in mode
 - [P3] WIKI-182 verdict archaeology — search across all archived reviewer verdicts. "Show every finding about mutation-not-load-bearing." Training data for future reviewer prompts + doctrine mining. Backend: full-text over archived transcripts. Frontend: search page w/ severity + author + date filters
 - [P3] WIKI-183 cross-project search — grep across all orch vaults + PRs + commits + verdicts. Wiki + phoebe + tooling + misc in one query. Backend: multi-repo indexer (respect .gitignore); frontend: unified palette
@@ -21,8 +19,6 @@ Todo:
 
 Silky-smooth artifact rendering arc (Henry 2026-07-29):
 
-- [P1] WIKI-190 video/GIF artifact kind — new `kind: video` inline player (mp4/webm/gif). Controls: play/pause/scrubber/speed/mute; poster frame lazy-load; loop-by-default for GIFs. Useful for Playwright recordings, mitmproxy captures, animated diagrams
-- [P2] WIKI-191 audio artifact kind — new `kind: audio` inline w/ waveform preview + scrubber + speed control; transcript overlay if attached. For voice memos, TTS output, transcription evidence
 - [P2] WIKI-193 visual-diff artifact mode — before/after image pair w/ opacity slider (drag L↔R for overlay) + pixel-diff toggle (bright overlay of changed regions). Huge for UI regression review — replaces the current back-and-forth of two screenshots
 - [P2] WIKI-194 interactive plot upgrade — kind:plot currently static (likely); make it interactive: hover-tooltip, wheel-zoom, drag-to-pan, box-select range, save-as-png. Plotly.js or D3 depending on payload shape
 - [P1] WIKI-195 universal fullscreen inspector — cmd+enter opens ANY artifact fullscreen; escape dismisses; arrow keys nav siblings; consistent chrome (title, download, copy source, close). Kills the inconsistent per-kind inspect flows
@@ -70,11 +66,11 @@ In Progress:
 - [P2] PHO-13826 ModalSandboxBackend + PHO-13827 sandbox ownership — workers live (Modal replaces exe.dev for v0; 13828 lifecycle + 13829 egress design queued)
 - mitmweb rebuild: scope and build a clearer live proxy-traffic inspector — owner (misc); merged through B6 (tooling PR #10, 2026-07-21); remaining: P1 packaging
 - WIKI-135 dashboard: implementation workers only (drop reviewers/one-shots) — owner cdx:WIKI-135 (luna)
-- [P1] WIKI-174 session replay scrubber — variable-speed replay of any archived agent session from raw.jsonl. Backend: replay endpoint w/ speed control; timeline of tool calls + prompts + responses. Frontend: scrubber UI (like WIKI-169 timeline but for a single session), bookmarks for verdicts/steers/errors. Debug tool for "why did cdx worker do X"
-- [P1] WIKI-189 image artifact polish — blur-up progressive load, lazy-load below fold, click-to-lightbox (fullscreen w/ pinch/scroll zoom + pan), copy-to-clipboard, drag-to-download, EXIF strip on receive, `srcset` for retina. Fixes current jank; makes single-image inline previews feel silky
-- [P2] WIKI-192 multi-image gallery + lightbox — when artifact payload = N images (e.g. R1/R3/R7 screenshots in WIKI-172), render as responsive grid w/ captions; click any → lightbox w/ arrow-key nav + pinch-zoom. Currently a file-list dump
-- [P2] WIKI-201 markdown inline-image polish — smooth rendering of `![](url)` in agent output: loading placeholder, sized-before-load (aspect-ratio hint or naturalWidth probe), click → lightbox, respect prefers-reduced-motion
 - [P2] WIKI-177 blast radius view pre-spawn — before spawning ticket X, compute which in-flight branches touch same files (git diff main..branch per active branch); display collision-risk preview in spawn dialog. Prevents rebase pain
+- [P2] WIKI-176 live worker screencast strip — miniature terminal preview (last ~20 lines) inline in fleet view + per-ticket cards; refresh 2s from raw.jsonl tail. Skim 12 workers at glance w/o click-in
+- [P2] WIKI-180 auto-context injector on spawn — LLM scans vault + related tickets + recent PRs touching same files + related workgraphs; prepends "context prelude" to kickoff prompt. Cuts prompt-writing time. Backend: prelude builder; hook into spawn_agent. Frontend: preview prelude before spawn
+- [P1] WIKI-190 video/GIF artifact kind — new `kind: video` inline player (mp4/webm/gif). Controls: play/pause/scrubber/speed/mute; poster frame lazy-load; loop-by-default for GIFs. Useful for Playwright recordings, mitmproxy captures, animated diagrams
+- [P2] WIKI-191 audio artifact kind — new `kind: audio` inline w/ waveform preview + scrubber + speed control; transcript overlay if attached. For voice memos, TTS output, transcription evidence
 
 Backlog:
 

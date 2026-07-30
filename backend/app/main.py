@@ -36,6 +36,7 @@ from . import (
     knowledge,
     palette,
     provider_health,
+    replay,
     screencast,
     terminal,
     tokens,
@@ -327,8 +328,16 @@ class NoteSummary(BaseModel):
     meta_updated: str | None = None
 
 
+class AssetMeta(BaseModel):
+    width: int
+    height: int
+    media_type: str
+    preview_base64: str | None = None
+
+
 class Note(NoteSummary):
     content: str
+    asset_meta: dict[str, AssetMeta] = Field(default_factory=dict)
 
 
 class NoteCreate(BaseModel):
@@ -762,9 +771,126 @@ def to_summary(path: Path) -> NoteSummary:
     )
 
 
+_IMAGE_EXTENSION_RE = re.compile(r"\.(png|jpe?g|gif|webp|svg)(?:[?#]|$)", re.IGNORECASE)
+# CommonMark image link: `![alt](destination[ "title"])`. The destination
+# may be wrapped in `<>` (allowing spaces) or a bare token that runs until
+# whitespace or the closing paren. Any following title is stripped.
+_MARKDOWN_IMAGE_RE = re.compile(
+    r"""
+    !\[[^\]]*\]                # ![alt]
+    \(                         # opening paren
+    \s*                        # optional leading whitespace
+    (?:
+        <(?P<angle>[^>\n]*)>   # angle-bracketed path (may contain spaces)
+        |
+        (?P<bare>[^\s()]+)     # bare path — no whitespace, no parens
+    )
+    (?:\s+
+        (?:"[^"]*"             # "title"
+         | '[^']*'             # 'title'
+         | \([^)]*\)           # (title)
+        )
+    )?
+    \s*
+    \)
+    """,
+    re.VERBOSE,
+)
+_OBSIDIAN_EMBED_RE = re.compile(r"!\[\[([^\][|]+?)(?:\|[^\][]*)?\]\]")
+
+
+def _extract_note_image_paths(content: str, note_path: str) -> list[str]:
+    """Return de-duplicated vault-relative paths for every image the note
+    references. Skips external URLs and anything without an image extension.
+
+    Handles CommonMark features the previous regex missed: link titles
+    (`![](path "title")`), angle-bracketed paths with spaces
+    (`![](<my image.png>)`), and percent-encoded characters (`%20`).
+    """
+    if not content:
+        return []
+    from urllib.parse import unquote
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def push(candidate: str) -> None:
+        if candidate in seen:
+            return
+        seen.add(candidate)
+        candidates.append(candidate)
+
+    def note_relative(target: str) -> list[str]:
+        # Split on the LITERAL query / fragment delimiters first — decoding
+        # before splitting would treat `hero%23draft.png` or
+        # `hero%3Fdraft.png` as if they carried a real `#` or `?`, silently
+        # dropping the actual filename tail.
+        without_query = target.split("?", 1)[0].split("#", 1)[0]
+        try:
+            stripped = unquote(without_query).strip()
+        except (UnicodeDecodeError, ValueError):
+            stripped = without_query.strip()
+        if not stripped or stripped.startswith("/"):
+            return []
+        if re.match(r"^[a-z][a-z0-9+.-]*:", stripped, re.IGNORECASE):
+            return []
+        if stripped.startswith("//"):
+            return []
+        if not _IMAGE_EXTENSION_RE.search(stripped):
+            return []
+        cleaned = stripped.replace("\\", "/")
+        parts = [segment for segment in cleaned.split("/") if segment not in ("", ".")]
+        note_dir = note_path.rsplit("/", 1)[0] if "/" in note_path else ""
+        base_parts = [segment for segment in note_dir.split("/") if segment]
+        results: list[str] = []
+        for base in ([base_parts] if base_parts else []) + [[]]:
+            stack = list(base)
+            good = True
+            for part in parts:
+                if part == "..":
+                    if not stack:
+                        good = False
+                        break
+                    stack.pop()
+                else:
+                    stack.append(part)
+            if good and stack:
+                results.append("/".join(stack))
+        return results
+
+    for match in _MARKDOWN_IMAGE_RE.finditer(content):
+        raw = match.group("angle") or match.group("bare") or ""
+        for candidate in note_relative(raw):
+            push(candidate)
+    for match in _OBSIDIAN_EMBED_RE.finditer(content):
+        for candidate in note_relative(match.group(1)):
+            push(candidate)
+    return candidates
+
+
+def _collect_note_asset_meta(content: str, note_path: str) -> dict[str, AssetMeta]:
+    """Resolve each image reference in the note to `AssetMeta`, silently
+    dropping anything that resolves outside the vault or fails to decode."""
+    result: dict[str, AssetMeta] = {}
+    for candidate in _extract_note_image_paths(content, note_path):
+        try:
+            raw, media_type = _read_vault_asset_bytes(candidate)
+        except HTTPException:
+            continue
+        if media_type not in _VAULT_ASSET_RESIZE_MIMES:
+            continue
+        payload = _asset_meta_for(raw, media_type)
+        if payload is None:
+            continue
+        result[candidate] = AssetMeta(**payload)
+    return result
+
+
 def to_note(path: Path) -> Note:
     summary = to_summary(path)
-    return Note(**summary.model_dump(), content=read_note(path))
+    content = read_note(path)
+    asset_meta = _collect_note_asset_meta(content, summary.path)
+    return Note(**summary.model_dump(), content=content, asset_meta=asset_meta)
 
 
 def iter_note_files() -> list[Path]:
@@ -3062,6 +3188,81 @@ def agent_provider_events(
             detail="Provider event inspection is available after headless migration",
         )
     return result
+
+
+def _open_runs_root_fd_or_404() -> int:
+    try:
+        return replay.open_runs_root_fd(AGENT_RUNS_DIR)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Runs root missing") from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Runs root unreadable: {exc}") from exc
+
+
+def _validate_run_id_or_400(run_id: str) -> None:
+    if not replay.valid_run_id(run_id):
+        raise HTTPException(status_code=400, detail="Bad run id")
+
+
+@app.get("/api/agents/{ticket}/replay/runs")
+def agent_replay_runs(ticket: str) -> dict[str, object]:
+    if not TICKET_PATTERN.fullmatch(ticket):
+        raise HTTPException(status_code=400, detail="Bad ticket")
+    runs_root_fd = _open_runs_root_fd_or_404()
+    try:
+        listing = replay.resolve_ticket_runs(runs_root_fd, ticket)
+    finally:
+        os.close(runs_root_fd)
+    return {
+        "ticket": ticket,
+        "runs": [run.as_dict() for run in listing.runs],
+        "runs_truncated": listing.truncated,
+    }
+
+
+@app.get("/api/agent-runs/{run_id}/replay/timeline")
+def agent_run_replay_timeline(
+    run_id: str,
+    cursor: str | None = None,
+    limit: int = replay.DEFAULT_LIMIT,
+) -> dict[str, object]:
+    _validate_run_id_or_400(run_id)
+    if limit < 1 or limit > replay.MAX_LIMIT:
+        raise HTTPException(
+            status_code=400,
+            detail=f"limit must be between 1 and {replay.MAX_LIMIT}",
+        )
+    runs_root_fd = _open_runs_root_fd_or_404()
+    try:
+        replay.verify_run_dir_exists(runs_root_fd, run_id)
+        return replay.build_timeline_response(
+            runs_root_fd,
+            run_id,
+            cursor=cursor,
+            limit=limit,
+        )
+    except replay.ReplayError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    finally:
+        os.close(runs_root_fd)
+
+
+@app.get("/api/agent-runs/{run_id}/replay/events/{seq}")
+def agent_run_replay_event(run_id: str, seq: int) -> dict[str, object]:
+    if seq <= 0:
+        raise HTTPException(status_code=400, detail="Seq must be positive")
+    _validate_run_id_or_400(run_id)
+    runs_root_fd = _open_runs_root_fd_or_404()
+    try:
+        replay.verify_run_dir_exists(runs_root_fd, run_id)
+        entry = replay.load_raw_event(runs_root_fd, run_id, seq)
+    except replay.ReplayError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    finally:
+        os.close(runs_root_fd)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Event not found")
+    return {"run_id": run_id, "seq": seq, "raw": entry}
 
 
 def _session_delta_payload(
@@ -5443,15 +5644,16 @@ def get_file_content(
     return FileContent(path=relative_path, size=size, content=content)
 
 
-@app.get("/api/vault/assets/{asset_path:path}")
-def get_vault_asset(asset_path: str) -> Response:
+_VAULT_ASSET_RESIZE_MIMES = {"image/png", "image/jpeg", "image/webp"}
+
+
+def _read_vault_asset_bytes(asset_path: str) -> tuple[bytes, str]:
     target, _relative_path, media_type = resolve_vault_asset_path(asset_path)
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(target, flags)
     except OSError as exc:
         raise HTTPException(status_code=404, detail="File not found") from exc
-
     try:
         if not opened_file_is_safe(fd, target, VAULT_DIR.resolve()):
             file_not_found()
@@ -5471,7 +5673,28 @@ def get_vault_asset(asset_path: str) -> Response:
         raise HTTPException(status_code=404, detail="File not found")
     finally:
         os.close(fd)
+    return raw, media_type
 
+
+@app.get("/api/vault/assets/{asset_path:path}")
+def get_vault_asset(asset_path: str, w: int | None = None) -> Response:
+    raw, media_type = _read_vault_asset_bytes(asset_path)
+    if w is not None and media_type in _VAULT_ASSET_RESIZE_MIMES:
+        from .image_scrub import ALLOWED_RESIZE_WIDTHS, ImageScrubError, resize_image_bytes
+
+        try:
+            width = int(w)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="w must be an integer") from exc
+        if width not in ALLOWED_RESIZE_WIDTHS:
+            raise HTTPException(status_code=400, detail="unsupported w value")
+        try:
+            raw, media_type = resize_image_bytes(raw, media_type, width)
+        except ImageScrubError as exc:
+            # The bounded resize enforces the same pre-decode side + pixel
+            # caps as ingress so decompression bombs cannot slip in through
+            # the thumbnail path.
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
     headers = {
         "Cache-Control": "private, max-age=3600",
         "X-Content-Type-Options": "nosniff",
@@ -5479,6 +5702,70 @@ def get_vault_asset(asset_path: str) -> Response:
     if media_type == "image/svg+xml":
         headers["Content-Security-Policy"] = "default-src 'none'; style-src 'unsafe-inline'"
     return Response(content=raw, media_type=media_type, headers=headers)
+
+
+def _asset_meta_for(raw: bytes, media_type: str) -> dict[str, object] | None:
+    """Return canonical (orientation-normalised) dimensions + preview for an
+    image asset, or None if it cannot be scrubbed. Uses scrub_image so the
+    reported width/height match what the browser will actually render — a
+    portrait photo tagged with EXIF orientation 6 comes out with its axes
+    already swapped, matching the pixels the vault-asset endpoint serves."""
+    from .image_scrub import ImageScrubError, scrub_image
+
+    try:
+        result = scrub_image(raw, media_type)
+    except ImageScrubError:
+        return None
+    payload: dict[str, object] = {
+        "width": result.width,
+        "height": result.height,
+        "media_type": media_type,
+    }
+    if result.preview_base64:
+        payload["preview_base64"] = result.preview_base64
+    return payload
+
+
+@app.get("/api/vault/asset-meta/{asset_path:path}")
+def get_vault_asset_meta(asset_path: str) -> dict[str, object]:
+    raw, media_type = _read_vault_asset_bytes(asset_path)
+    if media_type not in _VAULT_ASSET_RESIZE_MIMES:
+        raise HTTPException(status_code=415, detail="asset is not an image")
+    meta = _asset_meta_for(raw, media_type)
+    if meta is None:
+        raise HTTPException(status_code=422, detail="asset could not be scrubbed")
+    return meta
+
+
+class AssetMetaBatchRequest(BaseModel):
+    paths: list[str] = Field(default_factory=list, max_length=64)
+
+
+@app.post("/api/vault/asset-meta")
+def post_vault_asset_meta_batch(payload: AssetMetaBatchRequest) -> dict[str, dict[str, object]]:
+    """Return `{path: {width, height, preview_base64}}` for every readable
+    image path in the request. Silently drops entries that resolve outside
+    the vault, aren't images, or fail to decode so the frontend can render
+    the surviving ones in one round-trip without any per-image race."""
+    seen: set[str] = set()
+    result: dict[str, dict[str, object]] = {}
+    for raw_path in payload.paths:
+        if not isinstance(raw_path, str):
+            continue
+        candidate = raw_path.strip()
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            content, media_type = _read_vault_asset_bytes(candidate)
+        except HTTPException:
+            continue
+        if media_type not in _VAULT_ASSET_RESIZE_MIMES:
+            continue
+        meta = _asset_meta_for(content, media_type)
+        if meta is not None:
+            result[candidate] = meta
+    return result
 
 
 @app.get("/api/notes/{note_path:path}", response_model=Note)

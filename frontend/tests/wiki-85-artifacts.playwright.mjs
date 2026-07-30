@@ -62,6 +62,20 @@ function fixturePngBase64() {
 
 const PNG_BASE64 = fixturePngBase64();
 
+function assertValidPngWithDimensions(buffer, { width, height, label }) {
+  const signature = Buffer.from("89504e470d0a1a0a", "hex");
+  if (buffer.length < 24 || !buffer.subarray(0, 8).equals(signature)) {
+    throw new Error(`${label} image is not a valid PNG (missing signature)`);
+  }
+  const ihdrWidth = buffer.readUInt32BE(16);
+  const ihdrHeight = buffer.readUInt32BE(20);
+  if (ihdrWidth !== width || ihdrHeight !== height) {
+    throw new Error(
+      `${label} image dimensions changed: got ${ihdrWidth}x${ihdrHeight}, expected ${width}x${height}`,
+    );
+  }
+}
+
 function logStep(message) {
   console.error(`[wiki-85-playwright] ${message}`);
 }
@@ -406,9 +420,16 @@ async function main() {
     if (!liveResponse.ok() || liveResponse.headers()["content-type"] !== "image/png") {
       throw new Error(`Live image resolution failed: ${liveResponse.status()}`);
     }
-    if (!Buffer.from(await liveResponse.body()).equals(Buffer.from(PNG_BASE64, "base64"))) {
-      throw new Error("Live image bytes changed");
+    const storedLiveBytes = await fs.readFile(liveImage);
+    if (!Buffer.from(await liveResponse.body()).equals(storedLiveBytes)) {
+      throw new Error("Live image response does not match stored scrubbed bytes");
     }
+    // The fixture PNG carries no metadata chunks so the scrubber's
+    // metadata-only strip should produce byte-identical output.
+    if (!storedLiveBytes.equals(Buffer.from(PNG_BASE64, "base64"))) {
+      throw new Error("Scrubbed fixture bytes drifted from the original PNG");
+    }
+    assertValidPngWithDimensions(storedLiveBytes, { width: 360, height: 120, label: "Live" });
     await fs.unlink(liveImage);
     const archivedResponse = await page.request.get(
       `${backend.baseUrl}/api/agents/${TICKET}/artifact/${imageResult.artifactId}?archived=1`
@@ -416,9 +437,11 @@ async function main() {
     if (!archivedResponse.ok() || archivedResponse.headers()["content-type"] !== "image/png") {
       throw new Error(`Archived image fallback failed: ${archivedResponse.status()}`);
     }
-    if (!Buffer.from(await archivedResponse.body()).equals(Buffer.from(PNG_BASE64, "base64"))) {
-      throw new Error("Archived image bytes changed");
+    const storedArchivedBytes = await fs.readFile(archivedImage);
+    if (!Buffer.from(await archivedResponse.body()).equals(storedArchivedBytes)) {
+      throw new Error("Archived image response does not match stored scrubbed bytes");
     }
+    assertValidPngWithDimensions(storedArchivedBytes, { width: 360, height: 120, label: "Archived" });
     if (dialogs !== 0) throw new Error(`XSS regression opened ${dialogs} dialogs`);
 
     const fixtureSummary = {

@@ -387,6 +387,7 @@ function NotePane({
               ) : (
                 <div className="markdown-preview-view">
                   <ObsidianMarkdown
+                    assetMeta={currentNote.asset_meta}
                     content={stripLeadingTitle(parsed.body, currentNote.title)}
                     notePath={currentNote.path}
                     notes={notes}
