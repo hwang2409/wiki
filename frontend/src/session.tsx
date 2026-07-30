@@ -969,11 +969,18 @@ export function SessionRunDetails({
   dispositions: SessionDispositionCounts | null;
 }) {
   if (!inspector && !format && !tokens && !thinkingTokens && !dispositions) return null;
-  const dispositionCounts = dispositions
-    ? formatDispositionCounts(dispositions)
-    : inspector
+  // R2-01: prefer inspector.dispositions — it is the source of truth for
+  // live provider events. Session-level dispositions come from the
+  // transcript fallback path which zeroes counts while real provider
+  // events are flowing (the exact "Unknown 0" artifact this ticket
+  // kills). Only fall back to session dispositions when there is no
+  // inspector at all.
+  const dispositionCounts = inspector
     ? formatDispositionCounts(inspector.dispositions)
+    : dispositions
+    ? formatDispositionCounts(dispositions)
     : null;
+  const pendingRequests = inspector?.pending_requests ?? [];
   const tokensLabel = formatTokens(tokens);
   return (
     <details className="session-run-details" data-testid="session-run-details">
@@ -1018,6 +1025,29 @@ export function SessionRunDetails({
             </>
           ) : null}
         </dl>
+        {/* R2-02: render pending requests as first-class diagnostics so a
+            pending request that has not yet produced an event (e.g. id 0
+            with an empty event log) is discoverable — the action-required
+            card intentionally hides kind/id/payload, so Run details is
+            their one home. */}
+        {pendingRequests.length > 0 ? (
+          <div className="session-provider-pending-list" data-testid="run-details-pending-requests">
+            {pendingRequests.map((request) => (
+              <details
+                className="session-provider-event is-pending"
+                key={`pending:${typeof request.request_id}:${request.request_id}`}
+              >
+                <summary>
+                  <span className="is-pending">pending</span>
+                  <span>id #{String(request.request_id)}</span>
+                  <span>{request.request_kind}</span>
+                  <span>raw #{request.raw_seq}</span>
+                </summary>
+                <pre>{JSON.stringify(request.payload, null, 2)}</pre>
+              </details>
+            ))}
+          </div>
+        ) : null}
         {inspector ? (
           <div className="session-provider-events">
             {inspector.events.length > 0 ? (
@@ -1036,9 +1066,9 @@ export function SessionRunDetails({
                     <pre>{JSON.stringify(event.payload, null, 2)}</pre>
                   </details>
                 ))
-            ) : (
+            ) : pendingRequests.length === 0 ? (
               <div className="session-provider-empty">No normalized provider events yet.</div>
-            )}
+            ) : null}
           </div>
         ) : null}
       </div>
@@ -2868,6 +2898,7 @@ function MessageComposer({
   const [text, setText] = useState(() => cachedComposer?.text ?? "");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [inputFocused, setInputFocused] = useState(false);
   const [vimMode, setVimMode] = useState<ComposerMode>(() => cachedComposer?.vimMode ?? "insert");
   const pendingKeyRef = useRef<string | null>(null);
   const registerRef = useRef<string>("");
@@ -3739,7 +3770,11 @@ function MessageComposer({
           className={vimMode === "normal" || vimMode === "visual" ? "is-vim-normal" : undefined}
           spellCheck={false}
           placeholder={vimMode === "insert" ? "Message" : undefined}
-          title="Enter sends now · Shift+Enter queues until idle · Esc = vim normal"
+          /* R2-03: aria-label carries the accessible name ("Message"); the
+             keyboard sheet lives in a real focus-revealed element below
+             wired via aria-describedby. `title` would clobber both. */
+          aria-label="Message"
+          aria-describedby="session-composer-help"
           ref={inputRef}
           rows={2}
           value={text}
@@ -3753,9 +3788,11 @@ function MessageComposer({
           }
           aria-autocomplete="list"
           onFocus={(event) => {
+            setInputFocused(true);
             if (vimMode !== "insert") enterInsert(event.currentTarget.selectionEnd ?? text.length);
             else captureSelection(event.currentTarget);
           }}
+          onBlur={() => setInputFocused(false)}
           onChange={(event) => {
             setText(event.target.value);
             setMenuDismissed(false);
@@ -3878,6 +3915,17 @@ function MessageComposer({
         </button>
       </div>
       )}
+      {/* R2-03: focus-revealed keyboard help. Always in the DOM (so
+          aria-describedby resolves for screen readers) but only visually
+          shown while the composer is focused, so the ambient chrome
+          stays quiet. */}
+      <div
+        id="session-composer-help"
+        className={`session-composer-help${inputFocused ? " is-visible" : ""}`}
+        aria-hidden={!inputFocused}
+      >
+        Enter sends now · Shift+Enter queues until idle · Esc = vim normal
+      </div>
       <div className="session-composer-status">
         {thinking ? <span className="session-thinking-indicator">thinking</span> : null}
         <div className="session-subagents">

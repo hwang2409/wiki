@@ -72,6 +72,63 @@ describe("WIKI-152 default chrome — no diagnostic noise", () => {
     expect(meta?.textContent ?? "").toContain("codex");
   });
 
+  test("R2-01: prefers inspector dispositions over session-level fallback", () => {
+    // Divergent counts: inspector saw real events, session-level fallback
+    // is zeroed (the headless-fallback case that used to resurrect
+    // "Unknown 0" in real live provider streams).
+    render(
+      <SessionRunDetails
+        inspector={inspector({
+          dispositions: { rendered: 5, summarized: 1, ignored: 0, unknown: 3 },
+        })}
+        format={null}
+        tokens={null}
+        thinkingTokens={null}
+        dispositions={{ rendered: 0, summarized: 0, ignored: 0, unknown: 0 }}
+      />,
+    );
+    const details = screen.getByTestId("session-run-details") as HTMLDetailsElement;
+    details.setAttribute("open", "");
+    const meta = details.querySelector(".session-run-details-meta");
+    expect(meta?.textContent ?? "").toContain("Unknown 3");
+    expect(meta?.textContent ?? "").not.toContain("Unknown 0");
+  });
+
+  test("R2-02: pending requests render inside Run details even with an empty event log", () => {
+    render(
+      <SessionRunDetails
+        inspector={inspector({
+          events: [],
+          pending_requests: [
+            {
+              request_id: 0,
+              request_kind: "item/tool/requestUserInput",
+              received_at: "2026-07-30T00:00:00Z",
+              raw_seq: 1,
+              payload: { method: "item/tool/requestUserInput", params: {} },
+            },
+          ],
+        })}
+        format={null}
+        tokens={null}
+        thinkingTokens={null}
+        dispositions={null}
+      />,
+    );
+    const details = screen.getByTestId("session-run-details") as HTMLDetailsElement;
+    details.setAttribute("open", "");
+    const pending = screen.getByTestId("run-details-pending-requests");
+    expect(pending.textContent).toContain("pending");
+    // request_id 0 must be visible — the falsy check that used to swallow
+    // it in the action-required card cannot leave it invisible everywhere.
+    expect(pending.textContent).toContain("id #0");
+    expect(pending.textContent).toContain("item/tool/requestUserInput");
+    // The "no normalized provider events yet" empty-state should be
+    // suppressed when a pending request is showing (otherwise it reads
+    // as broken).
+    expect(details.querySelector(".session-provider-empty")).toBeNull();
+  });
+
   test("SessionRunDetails returns null when there is nothing to show", () => {
     const { container } = render(
       <SessionRunDetails inspector={null} format={null} tokens={null} thinkingTokens={null} dispositions={null} />,

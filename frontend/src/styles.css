@@ -5499,6 +5499,22 @@ body.is-resizing-panes .pane-cell {
   color: var(--accent-warning);
 }
 
+.session-provider-event.is-pending {
+  border-left: 2px solid var(--accent-warning);
+  background-color: color-mix(in srgb, var(--accent-warning) 6%, transparent);
+}
+
+.session-provider-event.is-pending summary .is-pending {
+  color: var(--accent-warning);
+  font-weight: var(--fw-semibold);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.session-provider-pending-list + .session-provider-events {
+  border-top: 1px solid var(--background-modifier-border);
+}
+
 .session-provider-event pre {
   max-height: 220px;
   margin: 0;
@@ -12587,6 +12603,39 @@ textarea.composer-command-input {
     animation: none !important;
     transition: none !important;
   }
+}
+
+/* WIKI-152 R2-03: composer keyboard-help hint. Always in the DOM so
+   aria-describedby resolves for assistive tech; visually hidden until
+   the composer receives focus, then surfaced as a muted one-liner. */
+
+.session-composer-help {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.session-composer-help.is-visible {
+  position: static;
+  width: auto;
+  height: auto;
+  margin: 4px 12px 0;
+  padding: 3px 8px;
+  overflow: visible;
+  clip: auto;
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--font-ui-smaller);
+  letter-spacing: 0.01em;
+  border-radius: var(--radius-xs);
+  background-color: color-mix(in srgb, var(--background-secondary) 60%, transparent);
 }
 
 /* WIKI-152: agent-session chrome. Header state pill, step, blocker,
