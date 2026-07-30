@@ -663,6 +663,9 @@ function readStoredWindowWorkspaceState(): WindowWorkspaceState {
 function buildAgentSessionWorker(
   worker: Pick<AgentWorker, "ticket" | "kind" | "role" | "model" | "effort" | "pr"> & {
     run_id?: string | null;
+    state?: string | null;
+    step?: string | null;
+    blocker?: string | null;
   }
 ): AgentSessionSurfaceWorker {
   return {
@@ -674,6 +677,9 @@ function buildAgentSessionWorker(
     pr: worker.pr,
     canReview: Boolean(worker.pr),
     canReplace: Boolean(worker.run_id),
+    state: worker.state ?? null,
+    step: worker.step ?? null,
+    blocker: worker.blocker ?? null,
   };
 }
 
@@ -4080,8 +4086,6 @@ export default function App() {
                     type="button"
                     onClick={() => activateWindowByIndex(index)}
                   >
-                    <span className="tmux-status-index">{index}</span>
-                    <span className="tmux-status-sep">:</span>
                     <span className="tmux-status-label">{windowLabel(window)}</span>
                   </button>
                 ))}

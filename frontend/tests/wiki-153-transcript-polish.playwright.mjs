@@ -422,28 +422,28 @@ async function main() {
     await errorSection.locator(".ansi-fg-1").first().waitFor({ state: "visible" });
 
     logStep("action-required card: question visible, kind hidden");
-    const inspectorToggle = page.locator(".session-provider-inspector-head").first();
-    await inspectorToggle.waitFor({ state: "visible" });
-    const inspectorClass = await page.locator(".session-provider-inspector").first().getAttribute("class");
-    if (!inspectorClass || !inspectorClass.includes("is-open")) {
-      await inspectorToggle.click();
-    }
-    const providerCard = page.locator(".session-provider-request").first();
+    // WIKI-152: Action required is promoted to the top-level chrome; there is
+    // no inspector toggle to open first, and the "Action required" label
+    // lives on the wrapping panel head, not the individual request card.
+    const actionPanel = page.locator('[data-testid="session-action-required"]').first();
+    await actionPanel.waitFor({ state: "visible" });
+    await actionPanel.locator(".session-action-required-title", { hasText: "Action required" }).waitFor();
+    const providerCard = actionPanel.locator(".session-provider-request").first();
     await providerCard.waitFor({ state: "visible" });
-    await providerCard.locator(".session-provider-request-head", { hasText: "Action required" }).waitFor();
-    const kindVisibleDefault = await providerCard.locator(":scope > .session-provider-request-head", { hasText: "item/tool/requestUserInput" }).count();
-    if (kindVisibleDefault !== 0) {
-      throw new Error("request kind should be hidden by default");
+    // R1-04: the per-request Details disclosure is gone. Run details is now
+    // the single diagnostics home; the pending card must not render kind,
+    // request id, or raw payload — those live in Run details' event log
+    // cross-referenced by raw_seq.
+    if ((await providerCard.locator(".session-provider-request-details").count()) !== 0) {
+      throw new Error("R1-04: per-card Details disclosure must be removed — Run details is the diagnostics home");
+    }
+    const cardText = await providerCard.innerText();
+    for (const forbidden of ["item/tool/requestUserInput", "kind", "request id"]) {
+      if (cardText.toLowerCase().includes(forbidden.toLowerCase())) {
+        throw new Error(`R1-04: pending card must not leak "${forbidden}" (got: ${cardText})`);
+      }
     }
     await providerCard.locator(".session-provider-question", { hasText: "Which scope" }).waitFor({ state: "visible" });
-    const detailsSummary = providerCard.locator(".session-provider-request-details > summary", { hasText: "Details" });
-    await detailsSummary.waitFor({ state: "visible" });
-    const preBeforeOpen = await providerCard.locator(".session-provider-request-details > pre").isVisible();
-    if (preBeforeOpen) throw new Error("raw payload should be hidden before Details expanded");
-    await detailsSummary.click();
-    await providerCard.locator(".session-provider-request-meta dd", { hasText: "item/tool/requestUserInput" }).waitFor({ state: "visible" });
-    await providerCard.locator(".session-provider-request-meta dd", { hasText: "42" }).waitFor({ state: "visible" });
-    await providerCard.locator(".session-provider-request-details > pre").waitFor({ state: "visible" });
 
     logStep("capturing screenshot");
     await page.screenshot({ path: path.join(OUT_DIR, "wiki-153-transcript-polish.png"), fullPage: true });

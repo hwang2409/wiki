@@ -260,9 +260,16 @@ async function main() {
 
     logStep("opening provider stream inspector");
     await page.goto(`${backend.baseUrl}/#/agent/${TICKET}`, { waitUntil: "domcontentloaded" });
-    await page.getByText("Provider stream", { exact: true }).waitFor();
-    await page.getByText("raw 4 → normalized 4", { exact: true }).waitFor();
+    // WIKI-152: "Action required" surfaces at the top of the chrome outside
+    // any disclosure, so it is available for approval without extra clicks.
     await page.getByText("Action required", { exact: true }).waitFor();
+    // WIKI-152: diagnostic fields (Provider stream / raw→normalized / provider
+    // event kinds) moved into a collapsed Run details disclosure. Open it to
+    // verify they still surface for debugging.
+    const runDetails = page.locator('[data-testid="session-run-details"]').first();
+    await runDetails.waitFor({ state: "attached" });
+    await runDetails.locator("summary").click();
+    await page.getByText("raw 4 → normalized 4", { exact: true }).waitFor();
     await page.getByText("approval", { exact: true }).waitFor();
     await page.getByText("context_compacted", { exact: true }).waitFor();
     await page.screenshot({ path: path.join(OUT_DIR, "session-provider-inspector.png"), fullPage: true });

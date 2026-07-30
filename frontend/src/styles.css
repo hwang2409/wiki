@@ -2457,10 +2457,8 @@ body.is-resizing-panes .pane-cell {
   color: var(--text-normal);
 }
 
-.tmux-status-index,
-.tmux-status-sep {
-  color: var(--text-faint);
-}
+/* WIKI-152: .tmux-status-index / .tmux-status-sep removed with the tmux
+   punctuation stripped from the status bar. */
 
 .tmux-status-label {
   max-width: 20ch;
@@ -5546,41 +5544,8 @@ body.is-resizing-panes .pane-cell {
   white-space: pre-wrap;
 }
 
-.session-dispositions {
-  position: absolute;
-  right: 12px;
-  bottom: 8px;
-  z-index: 2;
-  padding: 3px 8px;
-  color: var(--text-faint);
-  font-family: var(--font-monospace);
-  font-weight: var(--font-monospace-weight);
-  font-size: var(--font-ui-smaller);
-  background: var(--background-primary);
-  border: 1px solid var(--background-modifier-border);
-  border-radius: var(--radius-xs);
-  pointer-events: none;
-}
-
-.session-provider-inspector {
-  margin: 5px 12px 0;
-  border: 1px solid var(--background-modifier-border);
-  border-radius: var(--radius-xs);
-  background-color: color-mix(in srgb, var(--background-secondary) 72%, transparent);
-  color: var(--text-faint);
-  font-family: var(--font-monospace);
-  font-weight: var(--font-monospace-weight);
-  font-size: var(--font-ui-smaller);
-}
-
-.session-provider-inspector-head {
-  display: flex;
-  align-items: center;
-  width: 100%;
-  gap: 8px;
-  padding: 5px 8px;
-  text-align: left;
-}
+/* WIKI-152: ambient .session-dispositions block removed. Diagnostic counts
+   now live only inside .session-run-details. */
 
 /* WIKI-203: compact Codex provider-stream renderers stay in the default chrome. */
 
@@ -5841,21 +5806,7 @@ body.is-resizing-panes .pane-cell {
   color: var(--accent-primary);
 }
 
-.session-provider-inspector-head svg {
-  flex-shrink: 0;
-  transition: transform 100ms ease-out;
-}
-
-.session-provider-inspector.is-open .session-provider-inspector-head svg {
-  transform: rotate(90deg);
-}
-
-.session-provider-inspector-route {
-  color: var(--text-muted);
-}
-
 .session-provider-state {
-  margin-left: auto;
   color: var(--text-muted);
 }
 
@@ -5868,34 +5819,19 @@ body.is-resizing-panes .pane-cell {
   color: var(--accent-warning);
 }
 
-.session-provider-pending {
-  padding: 1px 5px;
-  border: 1px solid color-mix(in srgb, var(--accent-warning) 45%, var(--background-modifier-border));
-  border-radius: var(--radius-full);
-  color: var(--accent-warning);
-}
-
 .session-provider-request {
-  padding: 9px;
-  border-top: 1px solid color-mix(in srgb, var(--accent-warning) 45%, var(--background-modifier-border));
-  background-color: color-mix(in srgb, var(--accent-warning) 5%, transparent);
+  padding: 10px 12px;
+  color: var(--text-normal);
 }
 
-.session-provider-request-head,
+.session-provider-request + .session-provider-request {
+  border-top: 1px solid color-mix(in srgb, var(--accent-warning) 30%, var(--background-modifier-border));
+}
+
 .session-provider-request-actions {
   display: flex;
   align-items: center;
   gap: 8px;
-}
-
-.session-provider-request-head span:first-child {
-  color: var(--accent-warning);
-  font-weight: var(--fw-semibold);
-  text-transform: uppercase;
-}
-
-.session-provider-request-head span:last-child {
-  margin-left: auto;
 }
 
 .session-provider-questions {
@@ -5969,65 +5905,9 @@ body.is-resizing-panes .pane-cell {
   overflow-wrap: anywhere;
 }
 
-.session-provider-request-details {
-  margin-top: 8px;
-  color: var(--text-faint);
-  font-family: var(--font-monospace);
-  font-weight: var(--font-monospace-weight);
-  font-size: var(--font-ui-smaller);
-}
-
-.session-provider-request-details > summary {
-  display: inline-flex;
-  align-items: center;
-  padding: 1px 8px;
-  border: 1px dashed var(--background-modifier-border);
-  border-radius: var(--radius-xs);
-  color: var(--text-faint);
-  cursor: pointer;
-  list-style: none;
-  letter-spacing: 0.02em;
-}
-
-.session-provider-request-details > summary::-webkit-details-marker {
-  display: none;
-}
-
-.session-provider-request-details[open] > summary {
-  border-style: solid;
-  color: var(--text-muted);
-}
-
-.session-provider-request-meta {
-  display: grid;
-  grid-template-columns: max-content 1fr;
-  gap: 3px 12px;
-  margin: 8px 0;
-}
-
-.session-provider-request-meta dt {
-  color: var(--text-faint);
-  letter-spacing: 0.02em;
-  text-transform: uppercase;
-}
-
-.session-provider-request-meta dd {
-  margin: 0;
-  color: var(--text-muted);
-  overflow-wrap: anywhere;
-}
-
-.session-provider-request-details > pre {
-  max-height: 220px;
-  margin: 0;
-  padding: 8px 10px;
-  border-radius: var(--radius-xs);
-  background-color: var(--code-background);
-  color: var(--text-muted);
-  overflow: auto;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
+/* WIKI-152 R1-04: the per-card .session-provider-request-details mini
+   disclosure was removed. Kind / request id / raw payload now live in
+   Run details only, cross-referenced by raw_seq. */
 
 .session-provider-request-error {
   margin-top: 6px;
@@ -6063,6 +5943,22 @@ body.is-resizing-panes .pane-cell {
 
 .session-provider-event summary .is-unknown {
   color: var(--accent-warning);
+}
+
+.session-provider-event.is-pending {
+  border-left: 2px solid var(--accent-warning);
+  background-color: color-mix(in srgb, var(--accent-warning) 6%, transparent);
+}
+
+.session-provider-event.is-pending summary .is-pending {
+  color: var(--accent-warning);
+  font-weight: var(--fw-semibold);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.session-provider-pending-list + .session-provider-events {
+  border-top: 1px solid var(--background-modifier-border);
 }
 
 .session-provider-event pre {
@@ -13188,4 +13084,246 @@ textarea.composer-command-input {
     animation: none !important;
     transition: none !important;
   }
+}
+
+/* WIKI-152 R2-03: composer keyboard-help hint. Always in the DOM so
+   aria-describedby resolves for assistive tech; visually hidden until
+   the composer receives focus, then surfaced as a muted one-liner. */
+
+.session-composer-help {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.session-composer-help.is-visible {
+  position: static;
+  width: auto;
+  height: auto;
+  margin: 4px 12px 0;
+  padding: 3px 8px;
+  overflow: visible;
+  clip: auto;
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--font-ui-smaller);
+  letter-spacing: 0.01em;
+  border-radius: var(--radius-xs);
+  background-color: color-mix(in srgb, var(--background-secondary) 60%, transparent);
+}
+
+/* WIKI-152: agent-session chrome. Header state pill, step, blocker,
+   action-required panel, run-details disclosure. Scoped so it does
+   not affect other headers or `<details>` disclosures elsewhere. */
+
+.agent-session-surface-head .session-state-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 9px;
+  border-radius: var(--radius-full);
+  border: 1px solid transparent;
+  background-color: var(--background-secondary);
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-weight: var(--fw-semibold);
+  font-size: var(--font-ui-smaller);
+  text-transform: lowercase;
+  letter-spacing: 0.03em;
+}
+
+/* Themes intentionally collapse accent-* to a single mono color (see
+   themes.css). Rely on shape and adjacent chrome (step row / blocker row)
+   to carry state semantics, then let the accent colors — when the active
+   theme distinguishes them — layer on top. */
+
+.agent-session-surface-head .session-state-pill.is-positive {
+  background-color: var(--accent-success);
+  border-color: var(--accent-success);
+  color: var(--background-primary);
+}
+
+.agent-session-surface-head .session-state-pill.is-negative {
+  background-color: var(--accent-danger);
+  border-color: var(--accent-danger);
+  color: var(--background-primary);
+  box-shadow: inset 0 0 0 1px var(--background-primary);
+}
+
+.agent-session-surface-head .session-state-pill.is-neutral {
+  background-color: var(--accent-primary);
+  border-color: var(--accent-primary);
+  color: var(--background-primary);
+}
+
+.agent-session-surface-head .session-state-pill.is-faint {
+  color: var(--text-faint);
+}
+
+.agent-session-surface .session-step-row,
+.agent-session-surface .session-blocker-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 14px;
+  border-top: 1px solid var(--background-modifier-border);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  min-width: 0;
+}
+
+.agent-session-surface .session-step-row {
+  background-color: color-mix(in srgb, var(--background-secondary) 60%, transparent);
+}
+
+.agent-session-surface .session-step-label {
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 10px;
+}
+
+.agent-session-surface .session-step-text {
+  color: var(--text-normal);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-session-surface .session-blocker-row {
+  border-left: 3px solid var(--accent-danger);
+  background-color: color-mix(in srgb, var(--accent-danger) 10%, var(--background-primary));
+  color: var(--text-normal);
+}
+
+.agent-session-surface .session-blocker-row svg {
+  color: var(--accent-danger);
+  flex-shrink: 0;
+}
+
+.agent-session-surface .session-blocker-label {
+  color: var(--accent-danger);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-weight: var(--fw-semibold);
+  font-size: 10px;
+}
+
+.agent-session-surface .session-blocker-text {
+  color: var(--text-normal);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.session-tab > .session-action-required {
+  margin: 6px 12px 0;
+  border: 1px solid color-mix(in srgb, var(--accent-warning) 55%, var(--background-modifier-border));
+  border-radius: var(--radius-xs);
+  background-color: color-mix(in srgb, var(--accent-warning) 8%, var(--background-primary));
+  overflow: hidden;
+}
+
+.session-tab > .session-action-required .session-action-required-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--accent-warning) 40%, var(--background-modifier-border));
+  background-color: color-mix(in srgb, var(--accent-warning) 14%, var(--background-primary));
+  color: var(--accent-warning);
+  font-family: var(--font-monospace);
+  font-weight: var(--fw-semibold);
+  font-size: var(--font-ui-smaller);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.session-tab > .session-action-required .session-action-required-count {
+  margin-left: auto;
+  padding: 1px 6px;
+  border: 1px solid color-mix(in srgb, var(--accent-warning) 55%, var(--background-modifier-border));
+  border-radius: var(--radius-full);
+  background-color: var(--background-primary);
+  color: var(--accent-warning);
+  font-size: 10px;
+}
+
+.session-tab > .session-run-details {
+  margin: 6px 12px 0;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-xs);
+  background-color: color-mix(in srgb, var(--background-secondary) 72%, transparent);
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--font-ui-smaller);
+}
+
+.session-tab > .session-run-details > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  color: var(--text-muted);
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.session-tab > .session-run-details > summary::-webkit-details-marker {
+  display: none;
+}
+
+.session-tab > .session-run-details > summary::marker {
+  content: "";
+}
+
+.session-tab > .session-run-details > summary .session-run-details-chevron {
+  flex-shrink: 0;
+  transition: transform 100ms ease-out;
+}
+
+.session-tab > .session-run-details[open] > summary .session-run-details-chevron {
+  transform: rotate(90deg);
+}
+
+.session-tab > .session-run-details > summary .session-run-details-label {
+  color: var(--text-normal);
+  font-weight: var(--fw-semibold);
+}
+
+.session-tab > .session-run-details .session-run-details-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 6px 8px 8px;
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+.session-tab > .session-run-details .session-run-details-meta {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 3px 12px;
+  margin: 0;
+}
+
+.session-tab > .session-run-details .session-run-details-meta dt {
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 10px;
+}
+
+.session-tab > .session-run-details .session-run-details-meta dd {
+  margin: 0;
+  color: var(--text-muted);
 }
