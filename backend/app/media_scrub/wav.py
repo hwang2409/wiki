@@ -1,10 +1,9 @@
 """WAV (RIFF/WAVE) scrubbing — full structural reconstruction.
 
 Round 6 completes the rebuild-not-copy principle: fmt is emitted with a
-struct.pack'd layout containing exactly the parsed fields (nothing else),
-and fact is emitted from its single parsed uint32. Trailing bytes inside
-a PCM fmt chunk cannot appear in the output because we only pack the
-16 bytes the PCM spec allows. Same for extensible: exactly 40 bytes.
+struct.pack'd layout containing exactly the parsed fields (nothing else).
+PCM fact chunks are dropped. Float fact chunks are regenerated from the
+validated frame count. Trailing bytes inside fmt cannot appear in output.
 """
 from __future__ import annotations
 
@@ -50,7 +49,8 @@ def scrub_wav(data: bytes) -> MediaScrubResult:
 
     rebuilt_fmt: bytes | None = None
     data_payload: bytes | None = None
-    rebuilt_fact: bytes | None = None
+    fact_sample_length: int | None = None
+    fact_seen = False
     fmt_channels = 0
     fmt_sample_rate = 0
     fmt_byte_rate = 0
@@ -85,9 +85,10 @@ def scrub_wav(data: bytes) -> MediaScrubResult:
                 raise MediaScrubError("wav duplicate data chunk")
             data_payload = payload
         elif chunk_id == b"fact":
-            if rebuilt_fact is not None:
+            if fact_seen:
                 raise MediaScrubError("wav duplicate fact chunk")
-            rebuilt_fact = _wav_rebuild_fact(payload)
+            fact_seen = True
+            fact_sample_length = _wav_rebuild_fact(payload)
         # All other chunks are dropped.
         offset = payload_end + pad
 
@@ -106,6 +107,15 @@ def scrub_wav(data: bytes) -> MediaScrubResult:
             f"block_align {fmt_block_align}"
         )
     frames = data_bytes // fmt_block_align
+    if fmt_format_code == _WAV_FORMAT_PCM:
+        rebuilt_fact: bytes | None = None
+    else:
+        if fact_seen and fact_sample_length != frames:
+            raise MediaScrubError(
+                f"wav fact sample length {fact_sample_length} does not match "
+                f"validated frame count {frames}"
+            )
+        rebuilt_fact = struct.pack("<I", frames)
     # After R10 fmt cross-field validation, byte_rate == sample_rate *
     # block_align exactly, so both duration formulas below are equivalent.
     # Use the frames-based formula (it survives a future refactor where we
@@ -271,18 +281,12 @@ def _wav_validate_bit_depth_and_alignment(
         )
 
 
-def _wav_rebuild_fact(payload: bytes) -> bytes:
-    """fact chunk is exactly 4 bytes: dwSampleLength (uint32).
-
-    Anything else that fmt chunks bundled in the input's fact chunk was
-    never spec-legal; rebuilt output emits exactly the validated 4-byte
-    sample length. Trailing bytes cannot survive because they are not
-    written.
-    """
+def _wav_rebuild_fact(payload: bytes) -> int:
+    """Read the fact sample count. The caller validates it against data."""
     if len(payload) < 4:
         raise MediaScrubError("wav fact chunk too short")
     sample_length = struct.unpack("<I", payload[:4])[0]
-    return struct.pack("<I", sample_length)
+    return sample_length
 
 
 def _wav_stream_peaks(

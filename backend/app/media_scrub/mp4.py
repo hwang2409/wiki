@@ -86,10 +86,10 @@ class _Mp4AacConfig:
 
 @dataclass(frozen=True)
 class _Mp4TrackSamplePlan:
-    chunks_by_mdat: tuple[
+    chunks_by_mdat: dict[
+        int,
         tuple[tuple[int, int, int, int, int, tuple[int, set[int], bool]
                     | _Mp4AacConfig | None, int], ...],
-        ...,
     ]
     sample_size: int
     sample_sizes: memoryview | None
@@ -125,6 +125,8 @@ _MP4_MAX_SAMPLES: Final = 16_777_216
 _MP4_AVC_SAMPLE_NAL_TYPES: Final = {1, 5, 6}
 _MP4_MAX_BOXES_PER_CONTAINER: Final = 4096
 _MP4_MAX_CHUNKS: Final = 65_536
+_MP4_MAX_TRACK_MDAT_GROUPS: Final = 65_536
+_MP4_AAC_METADATA_TAIL_BYTES: Final = 4096
 # Tables that are rebuilt entry-by-entry are capped separately from sample
 # tables. This keeps their temporary Python object lists bounded.
 _MP4_MAX_TABLE_ENTRIES: Final = 4096
@@ -177,6 +179,8 @@ def scrub_mp4(data: bytes) -> MediaScrubResult:
         raise MediaScrubError("mp4 payload missing ftyp box at offset 0")
     if top_atoms[0].size < 16:
         raise MediaScrubError("mp4 ftyp too small")
+    if sum(atom.type == b"moov" for atom in top_atoms) > 1:
+        raise MediaScrubError("mp4 duplicate moov box")
 
     # Run the structural rebuild first. This preserves the parser's precise
     # errors for malformed moov children before sample ownership checks.
@@ -336,6 +340,7 @@ def _build_sample_plan(
 ) -> tuple[_Mp4TrackSamplePlan, ...]:
     """Build one bounded chunk plan and validate ownership once."""
     track_plans: list[_Mp4TrackSamplePlan] = []
+    track_mdat_groups = 0
     ownership: list[
         tuple[int, int, int, int, int,
               tuple[int, set[int], bool] | _Mp4AacConfig | None, int]
@@ -363,9 +368,14 @@ def _build_sample_plan(
                                 mdat_starts, handler_type,
                             )
                             if track_plan is not None:
+                                track_mdat_groups += len(track_plan.chunks_by_mdat)
+                                if track_mdat_groups > _MP4_MAX_TRACK_MDAT_GROUPS:
+                                    raise MediaScrubError(
+                                        "mp4 track/mdat group count exceeds scrubber limit"
+                                    )
                                 track_chunks = tuple(
                                     chunk
-                                    for group in track_plan.chunks_by_mdat
+                                    for group in track_plan.chunks_by_mdat.values()
                                     for chunk in group
                                 )
                                 if len(ownership) + len(track_chunks) > _MP4_MAX_CHUNKS:
@@ -504,14 +514,10 @@ def _build_sample_plan_from_stbl(
     # chunk ownership before any per-sample work.
     sample_index = 0
     stsc_cursor = 0
-    chunks: list[
-        tuple[int, int, int, int, int,
-              tuple[int, set[int], bool] | _Mp4AacConfig | None, int]
-    ] = []
-    chunks_by_mdat: list[list[tuple[
+    chunks_by_mdat: dict[int, list[tuple[
         int, int, int, int, int,
         tuple[int, set[int], bool] | _Mp4AacConfig | None, int,
-    ]]] = [[] for _ in mdat_ranges]
+    ]]] = {}
     for chunk_number in range(1, chunk_count + 1):
         stsc_cursor, samples_per_chunk, description_index, _ = stsc_for_chunk(
             chunk_number, stsc_cursor,
@@ -547,14 +553,13 @@ def _build_sample_plan_from_stbl(
             chunk_start, chunk_end, sample_index, samples_per_chunk,
             description_index, sample_descriptions[description_index - 1], mdat_index,
         )
-        chunks.append(chunk)
-        chunks_by_mdat[mdat_index].append(chunk)
+        chunks_by_mdat.setdefault(mdat_index, []).append(chunk)
         sample_index += samples_per_chunk
     if sample_index != sample_count:
         raise MediaScrubError("mp4 stsc does not describe every stsz sample")
 
     return _Mp4TrackSamplePlan(
-        tuple(tuple(group) for group in chunks_by_mdat),
+        {index: tuple(group) for index, group in chunks_by_mdat.items()},
         sample_size,
         sample_sizes,
         sample_count,
@@ -566,12 +571,11 @@ def _iter_sample_plan_ranges(
     mdat_index: int,
 ) -> Iterator[_Mp4SampleRange]:
     for track in plan:
-        if mdat_index >= len(track.chunks_by_mdat):
-            continue
+        chunks = track.chunks_by_mdat.get(mdat_index, ())
         for (
             chunk_start, _chunk_end, sample_index, samples_per_chunk,
             description_index, codec_config, _chunk_mdat_index,
-        ) in track.chunks_by_mdat[mdat_index]:
+        ) in chunks:
             sample_start = chunk_start
             for local_index in range(samples_per_chunk):
                 if track.sample_size:
@@ -869,6 +873,89 @@ def _aac_parse_ics_header(reader: _AacBitReader) -> tuple[int, int, int]:
     return window_sequence, max_sfb, groups
 
 
+def _aac_bits(data: bytes, bit_pos: int, width: int) -> int:
+    reader = _AacBitReader(data)
+    reader.bit_pos = bit_pos
+    return reader.read(width)
+
+
+def _aac_zero_padding_after(data: bytes, bit_pos: int) -> bool:
+    return all(_aac_bits(data, pos, 1) == 0 for pos in range(bit_pos, len(data) * 8))
+
+
+def _aac_is_id_end(data: bytes, bit_pos: int) -> bool:
+    return (
+        bit_pos + 3 <= len(data) * 8
+        and _aac_bits(data, bit_pos, 3) == 7
+        and len(data) * 8 - bit_pos - 3 <= 7
+        and _aac_zero_padding_after(data, bit_pos + 3)
+    )
+
+
+def _aac_skip_metadata_element(data: bytes, bit_pos: int) -> int | None:
+    if bit_pos + 7 > len(data) * 8:
+        return None
+    element_type = _aac_bits(data, bit_pos, 3)
+    if element_type not in (4, 6):
+        return None
+    bit_pos += 7
+    if element_type == 4:  # DSE
+        if bit_pos + 1 > len(data) * 8:
+            return None
+        byte_align = _aac_bits(data, bit_pos, 1)
+        bit_pos += 1
+        if byte_align != 1:
+            return None
+        if byte_align:
+            bit_pos = (bit_pos + 7) & ~7
+        if bit_pos + 8 > len(data) * 8:
+            return None
+        count = _aac_bits(data, bit_pos, 8)
+        bit_pos += 8
+        if count == 255:
+            if bit_pos + 8 > len(data) * 8:
+                return None
+            count += _aac_bits(data, bit_pos, 8)
+            bit_pos += 8
+        if count == 0 or count > 64:
+            return None
+        bit_pos += count * 8
+    else:  # FIL
+        count = _aac_bits(data, bit_pos - 4, 4)
+        if count == 15:
+            if bit_pos + 8 > len(data) * 8:
+                return None
+            count += _aac_bits(data, bit_pos, 8) - 1
+            bit_pos += 8
+        if count <= 0:
+            return None
+        if bit_pos + 4 > len(data) * 8 or _aac_bits(data, bit_pos, 4) != 0:
+            return None
+        bit_pos += count * 8
+    if bit_pos > len(data) * 8:
+        return None
+    return bit_pos
+
+
+def _aac_reject_late_metadata(data: bytes, channel_end: int) -> None:
+    """Reject a DSE/FIL element that terminates before raw_data_block end.
+
+    The supported subset has one channel element. A complete DSE/FIL parser
+    is used only for the tail, where its declared byte count must lead to the
+    canonical ID_END marker. This avoids treating spectral bits as metadata.
+    """
+    end_bits = len(data) * 8
+    scan_start = max(channel_end, end_bits - _MP4_AAC_METADATA_TAIL_BYTES * 8)
+    for bit_pos in range(scan_start, end_bits - 7):
+        next_pos = _aac_skip_metadata_element(data, bit_pos)
+        if next_pos is None:
+            continue
+        if _aac_is_id_end(data, next_pos):
+            raise MediaScrubError(
+                "mp4 AAC raw_data_block contains unsupported DSE/FIL metadata"
+            )
+
+
 def _canonicalise_aac_sample(sample: bytes, config: _Mp4AacConfig) -> bytes:
     """Drop supported AAC fill metadata and validate the channel header.
 
@@ -922,6 +1009,7 @@ def _canonicalise_aac_sample(sample: bytes, config: _Mp4AacConfig) -> bytes:
                 _aac_parse_ics_header(reader)
         else:
             _aac_parse_ics_header(reader)
+        _aac_reject_late_metadata(sample, reader.bit_pos)
         _aac_copy_bits(writer, sample, element_start, len(sample) * 8)
         break
     while writer.bit_pos < len(sample) * 8:

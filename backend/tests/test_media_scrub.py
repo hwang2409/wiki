@@ -14,6 +14,7 @@ from pathlib import Path
 from backend.app import media_scrub
 from backend.app.media_scrub import gif as gif_scrubber
 from backend.app.media_scrub import _h264 as h264_scrubber
+from backend.app.media_scrub import mp3 as mp3_scrubber
 from backend.app.media_scrub import mp4 as mp4_scrubber
 
 
@@ -829,11 +830,9 @@ class WavRound6SurvivorProbes(unittest.TestCase):
         self.assertIn(marker, payload)
         result = media_scrub.scrub_audio(payload, "audio/wav")
         self.assertNotIn(marker, result.data)
-        # fact chunk in output must be exactly 4 bytes body.
-        fact_out = result.data.find(b"fact")
-        self.assertGreater(fact_out, 0)
-        fact_size = struct.unpack("<I", result.data[fact_out + 4:fact_out + 8])[0]
-        self.assertEqual(fact_size, 4)
+        # PCM has no need for a fact sample count. Drop it instead of
+        # preserving an attacker-controlled count.
+        self.assertNotIn(b"fact", result.data)
 
     def test_trailing_bytes_inside_pcm_fmt_chunk_are_dropped(self) -> None:
         # Round-6 survivor: PCM fmt chunks larger than 16 bytes had their
@@ -2770,10 +2769,26 @@ class Review15MediaProbeTests(unittest.TestCase):
             media_scrub.scrub_video(payload, "image/gif")
 
     @staticmethod
-    def _float_wav(value: float) -> bytes:
-        fmt = struct.pack("<HHIIHH", 3, 1, 16_000, 64_000, 4, 32)
+    def _float_wav(
+        value: float, *, fact_sample_length: int | None = None,
+        extensible: bool = False,
+    ) -> bytes:
+        if extensible:
+            fmt = (
+                struct.pack("<HHIIHH", 0xFFFE, 1, 16_000, 64_000, 4, 32)
+                + struct.pack("<HHI", 22, 32, 0)
+                + media_scrub._WAV_KSDATAFORMAT_IEEE_FLOAT
+            )
+        else:
+            fmt = struct.pack("<HHIIHH", 3, 1, 16_000, 64_000, 4, 32)
         data = struct.pack("<f", value)
-        body = b"WAVE" + b"fmt " + struct.pack("<I", len(fmt)) + fmt + b"data" + struct.pack("<I", len(data)) + data
+        fact = b""
+        if fact_sample_length is not None:
+            fact = b"fact" + struct.pack("<I", 4) + struct.pack("<I", fact_sample_length)
+        body = (
+            b"WAVE" + b"fmt " + struct.pack("<I", len(fmt)) + fmt
+            + fact + b"data" + struct.pack("<I", len(data)) + data
+        )
         return b"RIFF" + struct.pack("<I", len(body)) + body
 
     def test_float_wav_peaks_unpack_ieee_samples(self) -> None:
@@ -2783,6 +2798,25 @@ class Review15MediaProbeTests(unittest.TestCase):
     def test_float_wav_rejects_non_finite_samples(self) -> None:
         with self.assertRaisesRegex(media_scrub.MediaScrubError, "not finite"):
             media_scrub.scrub_audio(self._float_wav(float("nan")), "audio/wav")
+
+    def test_float_fact_must_match_frame_count(self) -> None:
+        for extensible in (False, True):
+            with self.subTest(extensible=extensible):
+                with self.assertRaisesRegex(media_scrub.MediaScrubError, "fact sample length"):
+                    media_scrub.scrub_audio(
+                        self._float_wav(
+                            0.5, fact_sample_length=12345, extensible=extensible,
+                        ),
+                        "audio/wav",
+                    )
+
+    def test_pcm_fact_is_dropped(self) -> None:
+        fmt = struct.pack("<HHIIHH", 1, 1, 16_000, 32_000, 2, 16)
+        fact = b"fact" + struct.pack("<I", 4) + struct.pack("<I", 12345)
+        data = b"data" + struct.pack("<I", 2) + b"\x00\x00"
+        body = b"WAVE" + b"fmt " + struct.pack("<I", len(fmt)) + fmt + fact + data
+        result = media_scrub.scrub_audio(b"RIFF" + struct.pack("<I", len(body)) + body, "audio/wav")
+        self.assertNotIn(b"fact", result.data)
 
 
 class Review17MediaProbeTests(unittest.TestCase):
@@ -3292,6 +3326,40 @@ class Review20MediaProbeTests(unittest.TestCase):
 
 
 class Review21MediaProbeTests(unittest.TestCase):
+    def test_later_mp3_frame_ancillary_marker_is_removed_and_decodes(self) -> None:
+        payload = bytearray(REAL_MP3.read_bytes())
+        start = 110
+        offset = start
+        for frame_number in range(8):
+            frame_length = mp3_scrubber._mp3_frame_length(
+                payload, offset, len(payload),
+            )
+            self.assertIsNotNone(frame_length)
+            assert frame_length is not None
+            if frame_number == 7:
+                frame = bytes(payload[offset:offset + frame_length])
+                ancillary = mp3_scrubber._mp3_layer3_main_data_end(frame, frame[:4])
+                marker = b"GPS123456"
+                self.assertGreaterEqual(frame_length - ancillary, len(marker))
+                payload[offset + ancillary:offset + ancillary + len(marker)] = marker
+                break
+            offset += frame_length
+        result = media_scrub.scrub_audio(bytes(payload), "audio/mpeg")
+        self.assertNotIn(b"GPS123456", result.data)
+        if FFMPEG is not None:
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as handle:
+                handle.write(result.data)
+                stored_path = handle.name
+            try:
+                probe = subprocess.run(
+                    [FFMPEG, "-v", "error", "-i", stored_path, "-f", "null", "-"],
+                    capture_output=True,
+                    timeout=30,
+                )
+                self.assertEqual(probe.returncode, 0, probe.stderr.decode(errors="replace"))
+            finally:
+                Path(stored_path).unlink(missing_ok=True)
+
     def test_aac_sample_marker_is_rejected_before_storage(self) -> None:
         payload = bytearray(REAL_MIXED_MP4.read_bytes())
         audio = next(
@@ -3308,6 +3376,55 @@ class Review21MediaProbeTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(media_scrub.MediaScrubError, "AAC"):
             media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+    def test_aac_post_channel_dse_is_rejected(self) -> None:
+        payload = REAL_MIXED_MP4.read_bytes()
+        audio = next(
+            track
+            for track in Review17MediaProbeTests._track_info(payload)
+            if track["handler"] == b"soun"
+        )
+        stco_body = int(audio["stco_body"])
+        stsz_body = int(audio["stsz_body"])
+        offset = struct.unpack(">I", payload[stco_body + 8:stco_body + 12])[0]
+        size = struct.unpack(">I", payload[stsz_body + 12:stsz_body + 16])[0]
+        sample = payload[offset:offset + size]
+        end = next(
+            pos for pos in range(0, len(sample) * 8 - 2)
+            if mp4_scrubber._aac_is_id_end(sample, pos)
+        )
+        reader = mp4_scrubber._AacBitReader(sample)
+        while reader.remaining() >= 7:
+            pos = reader.bit_pos
+            if mp4_scrubber._aac_bits(sample, pos, 3) == 6:
+                tag = mp4_scrubber._aac_bits(sample, pos + 3, 4)
+                if tag == 15:
+                    count = 15 + mp4_scrubber._aac_bits(sample, pos + 7, 8) - 1
+                    reader.bit_pos = pos + 15 + count * 8
+                else:
+                    count = tag
+                    reader.bit_pos = pos + 7 + count * 8
+                if reader.bit_pos <= end:
+                    continue
+            break
+        channel_start = reader.bit_pos
+        writer = mp4_scrubber._AacBitWriter()
+        mp4_scrubber._aac_copy_bits(writer, sample, channel_start, end)
+        writer.write(4, 3)
+        writer.write(0, 4)
+        writer.write(1, 1)
+        while writer.bit_pos % 8:
+            writer.write(0, 1)
+        writer.write(4, 8)
+        writer.write(int.from_bytes(b"GPS!", "big"), 32)
+        writer.write(7, 3)
+        while writer.bit_pos % 8:
+            writer.write(0, 1)
+        mutated = writer.to_bytes()
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "DSE/FIL"):
+            mp4_scrubber._canonicalise_aac_sample(
+                mutated, mp4_scrubber._Mp4AacConfig(4, 1),
+            )
 
     def test_mvhd_and_tkhd_matrices_reject_marker_bytes(self) -> None:
         for box_type, matrix_offset in ((b"mvhd", 36), (b"tkhd", 40)):

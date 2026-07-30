@@ -230,6 +230,16 @@ def _mp3_validate_full_frame_stream(data: bytes, start: int, end: int) -> bytes:
                 rebuilt[frame_offset + side_info_start:frame_offset + metadata_end] = (
                     b"\x00" * (metadata_end - side_info_start)
                 )
+            else:
+                ancillary_start = _mp3_layer3_main_data_end(frame, header)
+                rebuilt[frame_offset + ancillary_start:frame_offset + frame_len] = (
+                    b"\x00" * (frame_len - ancillary_start)
+                )
+        else:
+            ancillary_start = _mp3_layer3_main_data_end(frame, frame[:4])
+            rebuilt[frame_offset + ancillary_start:frame_offset + frame_len] = (
+                b"\x00" * (frame_len - ancillary_start)
+            )
         offset += frame_len
         frames_seen += 1
     if offset != end:
@@ -239,6 +249,78 @@ def _mp3_validate_full_frame_stream(data: bytes, start: int, end: int) -> bytes:
     if frames_seen < 1:
         raise MediaScrubError("mp3 frame stream contains zero frames")
     return bytes(rebuilt)
+
+
+class _Mp3BitReader:
+    __slots__ = ("data", "bit_pos")
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+        self.bit_pos = 0
+
+    def read(self, width: int) -> int:
+        if self.bit_pos + width > len(self.data) * 8:
+            raise MediaScrubError("mp3 Layer III side information is truncated")
+        value = 0
+        for _ in range(width):
+            value = (value << 1) | (
+                self.data[self.bit_pos // 8] >> (7 - self.bit_pos % 8) & 1
+            )
+            self.bit_pos += 1
+        return value
+
+
+def _mp3_layer3_main_data_end(frame: bytes, header: bytes) -> int:
+    """Return the byte after this frame's Layer III main data.
+
+    The side-information lengths describe the exact number of coded main-data
+    bits. Bytes after that boundary are ancillary data and are zeroed.
+    """
+    side_start = 4 + (0 if header[1] & 1 else 2)
+    side_length = _mp3_side_info_length(header)
+    side_end = side_start + side_length
+    if side_end > len(frame):
+        raise MediaScrubError("mp3 Layer III side information is truncated")
+    reader = _Mp3BitReader(frame[side_start:side_end])
+    version_bits = (header[1] >> 3) & 0x03
+    channel_mode = (header[3] >> 6) & 0x03
+    channels = 1 if channel_mode == 3 else 2
+    mpeg1 = version_bits == 3
+    reader.read(9 if mpeg1 else 8)  # main_data_begin
+    reader.read(5 if mpeg1 and channels == 1 else 3 if mpeg1 else 1 if channels == 1 else 3)
+    if mpeg1:
+        for _ in range(channels):
+            reader.read(4)  # scfsi
+    main_data_bits = 0
+    for _ in range(2 if mpeg1 else 1):
+        for _ in range(channels):
+            main_data_bits += reader.read(12)  # part2_3_length
+            reader.read(9)  # big_values
+            reader.read(8)  # global_gain
+            reader.read(4 if mpeg1 else 9)  # scalefac_compress
+            switched = reader.read(1)
+            if switched:
+                block_type = reader.read(2)
+                if block_type == 0:
+                    raise MediaScrubError("mp3 Layer III reserved block type")
+                reader.read(1)  # mixed_block_flag
+                reader.read(5 * 2)  # table_select
+                reader.read(3 * 3)  # subblock_gain
+            else:
+                reader.read(5 * 3)  # table_select
+                reader.read(4)  # region0_count
+                reader.read(3)  # region1_count
+            if mpeg1:
+                reader.read(1)  # preflag
+            reader.read(1)  # scalefac_scale
+            reader.read(1)  # count1table_select
+    main_data_bytes = (main_data_bits + 7) // 8
+    main_data_start = side_end
+    # main_data_begin may point into the bit reservoir. In that case the
+    # current frame contributes only part of the declared main data, and
+    # every byte through the frame end is coded audio. No ancillary region
+    # exists in this frame.
+    return min(len(frame), main_data_start + main_data_bytes)
 
 
 def _mp3_side_info_length(header: bytes) -> int:
