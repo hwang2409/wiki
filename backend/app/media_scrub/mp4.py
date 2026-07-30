@@ -22,8 +22,8 @@ Chain:
             dinf                    canonical rebuild (dref/url,
                                     self-referencing). Any non-canonical
                                     shape → file rejected.
-            stbl -> stsd + boxes    stsd rebuilt from parsed sample
-                                    entries (avc1/hev1/mp4a); other stbl
+                                    stbl -> stsd + boxes    stsd rebuilt from parsed sample
+                                    entries (avc1/hev1); other stbl
                                     boxes header-validated but their
                                     bodies are BOUNDED by the parsed
                                     size (fully parsing every codec
@@ -50,7 +50,7 @@ from dataclasses import dataclass
 from typing import Final
 
 from .base import MediaScrubError, MediaScrubResult
-from ._h264 import canonicalise_nal_with_ids
+from ._h264 import canonicalise_nal_with_ids, parse_slice_pps_id
 
 
 @dataclass(frozen=True)
@@ -71,7 +71,9 @@ _MP4_TOPLEVEL_PLAYBACK: Final = {
 # Sample-entry types we know how to rebuild field-by-field. Unknown types
 # fall to strict-subset reject.
 _MP4_VISUAL_ENTRIES: Final = {b"avc1", b"avc3", b"hev1", b"hvc1", b"mp4v"}
-_MP4_AUDIO_ENTRIES: Final = {b"mp4a"}
+# AAC `mp4a` entries require an `esds` parser, which is outside this strict
+# reconstruction scope. Reject them instead of accepting an opaque config.
+_MP4_AUDIO_ENTRIES: Final = set()
 # Inner boxes inside a sample entry that we accept. Each one gets its
 # Every sample-entry inner box in this allowlist has a field-level
 # rebuild via struct.pack — no raw body copy path remains for anything
@@ -88,8 +90,8 @@ _MP4_SAMPLE_ENTRY_REQUIRED_CONFIG: Final = {
     b"hev1": b"hvcC",
     b"hvc1": b"hvcC",
     b"mp4v": b"esds",
-    b"mp4a": b"esds",
 }
+_MP4_MAX_SAMPLES: Final = 16_777_216
 # Additional stbl children beyond stsd. Every allowed type below has a
 # field-level rebuild via struct.pack that emits exactly the parsed
 # entry_count worth of entries — trailing bytes cannot survive because
@@ -112,12 +114,33 @@ def scrub_mp4(data: bytes) -> MediaScrubResult:
     if top_atoms[0].size < 16:
         raise MediaScrubError("mp4 ftyp too small")
 
-    try:
-        sample_ranges = _collect_sample_ranges(data, top_atoms)
-    except MediaScrubError:
-        # Let the normal moov rebuild report malformed table fields in its
-        # existing order. A malformed offset is not an owned mdat range.
-        sample_ranges = []
+    # Run the structural rebuild first. This preserves the parser's precise
+    # errors for malformed moov children before sample ownership checks.
+    for atom in top_atoms:
+        if atom.type == b"moov":
+            _rebuilt, _trak, _mvhd, stsd_ok = _rebuild_moov(
+                data, atom.body_start, atom.body_end,
+            )
+            if not _trak:
+                raise MediaScrubError("mp4 moov missing trak")
+            if not stsd_ok:
+                raise MediaScrubError("mp4 stbl/stsd has no valid sample entry")
+    for atom in top_atoms:
+        if atom.type == b"mdat" and atom.body_start == atom.body_end:
+            raise MediaScrubError("mp4 mdat body is empty")
+
+    sample_ranges = _collect_sample_ranges(data, top_atoms)
+    avc_configs = _collect_avc_configs(data, top_atoms)
+    mdat_ranges = [
+        (atom.body_start, atom.body_end)
+        for atom in top_atoms if atom.type == b"mdat"
+    ]
+    # Metadata reconstruction can move an mdat without updating legacy
+    # offsets in a malformed input. Treat that table as owning no bytes.
+    owned_sample_ranges = sample_ranges
+    if mdat_ranges and sample_ranges and sample_ranges[0][0] != mdat_ranges[0][0]:
+        owned_sample_ranges = []
+    _validate_avc_samples(data, owned_sample_ranges, avc_configs, mdat_ranges)
 
     ftyp = _rebuild_ftyp(data, top_atoms[0])
     if len(ftyp) != top_atoms[0].size:
@@ -162,12 +185,18 @@ def scrub_mp4(data: bytes) -> MediaScrubResult:
                 raise MediaScrubError("mp4 mdat body is empty")
             mdat_non_empty = True
             scrubbed_body = bytearray(body_len)
-            for sample_start, sample_end in sample_ranges:
+            for sample_start, sample_end in owned_sample_ranges:
                 if sample_start < atom.body_start or sample_end > atom.body_end:
+                    # The table does not own bytes in this mdat. Leave the
+                    # destination zeroed instead of copying an unbounded or
+                    # cross-box range.
                     continue
                 start = sample_start - atom.body_start
                 end = sample_end - atom.body_start
-                scrubbed_body[start:end] = data[sample_start:sample_end]
+                sample = data[sample_start:sample_end]
+                if avc_configs:
+                    sample = _canonicalise_avc_sample(sample, *avc_configs[0])
+                scrubbed_body[start:end] = sample
             out_parts.append(data[atom.start:atom.body_start] + scrubbed_body)
         elif atom.type == b"sidx":
             # Round-7 review: sidx body was copied through opaquely. Now
@@ -278,7 +307,9 @@ def _collect_sample_ranges_from_stbl(
     def fullbox_body(atom: _Mp4Atom, label: str) -> bytes:
         body = data[atom.body_start:atom.body_end]
         if len(body) < 8 or body[0] != 0 or body[1:4] != _CANONICAL_FULLBOX_FLAGS:
-            raise MediaScrubError(f"mp4 {label} has non-canonical fullbox header")
+            raise MediaScrubError(
+                f"mp4 {label} fullbox flags or header are non-canonical"
+            )
         return body
 
     stsc_body = fullbox_body(tables[b"stsc"], "stsc")
@@ -320,17 +351,18 @@ def _collect_sample_ranges_from_stbl(
     if len(stsz_body) < 12:
         raise MediaScrubError("mp4 stsz body too short")
     sample_size, sample_count = struct.unpack(">II", stsz_body[4:12])
+    if sample_count > _MP4_MAX_SAMPLES:
+        raise MediaScrubError(
+            f"mp4 stsz sample_count {sample_count} exceeds scrubber limit"
+        )
     if sample_size:
         if len(stsz_body) != 12:
             raise MediaScrubError("mp4 uniform stsz body has trailing bytes")
-        sample_sizes = [sample_size] * sample_count
+        sample_sizes: list[int] | None = None
     else:
         if len(stsz_body) != 12 + sample_count * 4:
             raise MediaScrubError("mp4 stsz sample-size table length does not match entries")
-        sample_sizes = [
-            struct.unpack(">I", stsz_body[12 + index * 4:16 + index * 4])[0]
-            for index in range(sample_count)
-        ]
+        sample_sizes = None
 
     ranges = []
     sample_index = 0
@@ -344,14 +376,182 @@ def _collect_sample_ranges_from_stbl(
         if sample_index + samples_per_chunk > sample_count:
             raise MediaScrubError("mp4 stsc describes more samples than stsz")
         sample_start = chunk_start
-        for sample_size_value in sample_sizes[sample_index:sample_index + samples_per_chunk]:
+        for local_index in range(samples_per_chunk):
+            if sample_size:
+                sample_size_value = sample_size
+            else:
+                size_offset = 12 + (sample_index + local_index) * 4
+                sample_size_value = struct.unpack(
+                    ">I", stsz_body[size_offset:size_offset + 4],
+                )[0]
             sample_end = sample_start + sample_size_value
+            if sample_end < sample_start:
+                raise MediaScrubError("mp4 sample range arithmetic overflow")
             ranges.append((sample_start, sample_end))
             sample_start = sample_end
         sample_index += samples_per_chunk
     if sample_index != sample_count:
         raise MediaScrubError("mp4 stsc does not describe every stsz sample")
     return ranges
+
+
+def _collect_avc_configs(
+    data: bytes, top_atoms: list[_Mp4Atom],
+) -> list[tuple[int, set[int], bool]]:
+    """Collect parsed AVC sample-entry framing and PPS identifiers."""
+    configs: list[tuple[int, set[int], bool]] = []
+    for moov in (atom for atom in top_atoms if atom.type == b"moov"):
+        for trak in _parse_container(data, moov.body_start, moov.body_end):
+            if trak.type != b"trak":
+                continue
+            for mdia in _parse_container(data, trak.body_start, trak.body_end):
+                if mdia.type != b"mdia":
+                    continue
+                for minf in _parse_container(data, mdia.body_start, mdia.body_end):
+                    if minf.type != b"minf":
+                        continue
+                    for stbl in _parse_container(data, minf.body_start, minf.body_end):
+                        if stbl.type != b"stbl":
+                            continue
+                        for stsd in _parse_container(data, stbl.body_start, stbl.body_end):
+                            if stsd.type != b"stsd":
+                                continue
+                            body = data[stsd.body_start:stsd.body_end]
+                            if (
+                                len(body) < 8
+                                or body[0] != 0
+                                or body[1:4] != _CANONICAL_FULLBOX_FLAGS
+                            ):
+                                raise MediaScrubError("mp4 stsd has non-canonical fullbox header")
+                            entry_count = struct.unpack(">I", body[4:8])[0]
+                            offset = 8
+                            for _ in range(entry_count):
+                                if offset + 8 > len(body):
+                                    raise MediaScrubError("mp4 stsd entry header truncated")
+                                entry_size = struct.unpack(">I", body[offset:offset + 4])[0]
+                                entry_type = body[offset + 4:offset + 8]
+                                if entry_size < 8 or offset + entry_size > len(body):
+                                    raise MediaScrubError("mp4 stsd entry size out of bounds")
+                                if entry_type in (b"avc1", b"avc3"):
+                                    entry = body[offset:offset + entry_size]
+                                    inner_start = 16 + 70
+                                    inner_offset = inner_start
+                                    while inner_offset < len(entry):
+                                        if inner_offset + 8 > len(entry):
+                                            raise MediaScrubError("mp4 avc sample inner header truncated")
+                                        box_size = struct.unpack(">I", entry[inner_offset:inner_offset + 4])[0]
+                                        box_type = entry[inner_offset + 4:inner_offset + 8]
+                                        if box_size < 8 or inner_offset + box_size > len(entry):
+                                            raise MediaScrubError("mp4 avc sample inner box out of bounds")
+                                        if box_type == b"avcC":
+                                            configs.append(
+                                                _parse_avc_sample_config(
+                                                    entry[inner_offset + 8:inner_offset + box_size],
+                                                    entry_type == b"avc1",
+                                                )
+                                            )
+                                        inner_offset += box_size
+                                offset += entry_size
+    return configs
+
+
+def _parse_avc_sample_config(
+    body: bytes, require_parameter_sets: bool,
+) -> tuple[int, set[int], bool]:
+    if len(body) < 7 or body[0] != 1:
+        raise MediaScrubError("mp4 avcC sample configuration header is invalid")
+    length_size_minus_one = body[4] & 0x03
+    if length_size_minus_one not in (0, 1, 3):
+        raise MediaScrubError("mp4 avcC lengthSizeMinusOne must be 0, 1, or 3")
+    num_sps = body[5] & 0x1F
+    offset = 6
+    sps_ids: set[int] = set()
+    for _ in range(num_sps):
+        if offset + 2 > len(body):
+            raise MediaScrubError("mp4 avcC SPS length field truncated")
+        size = struct.unpack(">H", body[offset:offset + 2])[0]
+        offset += 2
+        if offset + size > len(body):
+            raise MediaScrubError("mp4 avcC SPS extends past body")
+        _canonical, sps_id, _ = canonicalise_nal_with_ids(body[offset:offset + size], expected_nal_type=7)
+        sps_ids.add(sps_id)
+        offset += size
+    if offset >= len(body):
+        raise MediaScrubError("mp4 avcC missing PPS count")
+    num_pps = body[offset]
+    offset += 1
+    pps_ids: set[int] = set()
+    for _ in range(num_pps):
+        if offset + 2 > len(body):
+            raise MediaScrubError("mp4 avcC PPS length field truncated")
+        size = struct.unpack(">H", body[offset:offset + 2])[0]
+        offset += 2
+        if offset + size > len(body):
+            raise MediaScrubError("mp4 avcC PPS extends past body")
+        _canonical, pps_id, pps_sps_id = canonicalise_nal_with_ids(
+            body[offset:offset + size], expected_nal_type=8,
+        )
+        if pps_sps_id not in sps_ids:
+            raise MediaScrubError("mp4 avcC PPS references an SPS identifier absent from avcC")
+        pps_ids.add(pps_id)
+        offset += size
+    if require_parameter_sets and (not sps_ids or not pps_ids):
+        raise MediaScrubError("mp4 avc1 avcC requires SPS and PPS records")
+    return (length_size_minus_one + 1, pps_ids, require_parameter_sets)
+
+
+def _canonicalise_avc_sample(
+    sample: bytes, length_size: int, pps_ids: set[int], require_pps: bool,
+) -> bytes:
+    if not sample:
+        return b""
+    output = bytearray()
+    offset = 0
+    nal_count = 0
+    while offset < len(sample):
+        if offset + length_size > len(sample):
+            raise MediaScrubError("mp4 AVC sample NAL length is truncated")
+        nal_size = int.from_bytes(sample[offset:offset + length_size], "big")
+        offset += length_size
+        if nal_size == 0 or offset + nal_size > len(sample):
+            raise MediaScrubError("mp4 AVC sample NAL length is out of bounds")
+        nal = sample[offset:offset + nal_size]
+        nal_type = nal[0] & 0x1F
+        if nal_type in (1, 5):
+            pps_id = parse_slice_pps_id(nal)
+            if require_pps and pps_id not in pps_ids:
+                raise MediaScrubError("mp4 AVC slice references an unknown PPS identifier")
+        if nal_type == 6:
+            # Keep the declared NAL length and replace the SEI RBSP with an
+            # empty, canonical payload. This removes user-data metadata.
+            nal = nal[:1] + (b"\x80" + b"\x00" * (len(nal) - 2) if len(nal) >= 2 else b"")
+        output.extend(nal_size.to_bytes(length_size, "big"))
+        output.extend(nal)
+        offset += nal_size
+        nal_count += 1
+    if nal_count == 0:
+        raise MediaScrubError("mp4 AVC sample has no NAL units")
+    return bytes(output)
+
+
+def _validate_avc_samples(
+    data: bytes, sample_ranges: list[tuple[int, int]],
+    configs: list[tuple[int, set[int], bool]],
+    mdat_ranges: list[tuple[int, int]],
+) -> None:
+    if not configs:
+        return
+    length_size, pps_ids, require_pps = configs[0]
+    for start, end in sample_ranges:
+        if (
+            start < 0 or end < start or end > len(data)
+            or not any(start >= mdat_start and end <= mdat_end for mdat_start, mdat_end in mdat_ranges)
+        ):
+            # A stale table offset cannot make bytes owned. The mdat writer
+            # leaves such ranges zeroed, and only contained ranges reach the
+            # codec framing validator.
+            continue
+        _canonicalise_avc_sample(data[start:end], length_size, pps_ids, require_pps)
 
 
 # ---------------------------------------------------------------------------
@@ -1101,6 +1301,10 @@ def _rebuild_stbl_table(box_type: bytes, data: bytes, atom: _Mp4Atom) -> bytes:
             raise MediaScrubError(f"mp4 stsz unknown version {version}")
         sample_size = struct.unpack(">I", bytes(body[4:8]))[0]
         sample_count = struct.unpack(">I", bytes(body[8:12]))[0]
+        if sample_count > _MP4_MAX_SAMPLES:
+            raise MediaScrubError(
+                f"mp4 stsz sample_count {sample_count} exceeds scrubber limit"
+            )
         if sample_size != 0:
             if len(body) != 12:
                 raise MediaScrubError(

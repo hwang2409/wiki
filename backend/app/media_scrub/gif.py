@@ -21,7 +21,7 @@ import struct
 from dataclasses import dataclass
 from typing import Final
 
-from .base import MediaScrubError, MediaScrubResult
+from .base import GIF_MAX_PIXELS, MediaScrubError, MediaScrubResult
 
 _GIF_HEADER87: Final = b"GIF87a"
 _GIF_HEADER89: Final = b"GIF89a"
@@ -271,7 +271,7 @@ def _decode_gif_lzw(
     compressed: bytes,
     min_code_size: int,
     expected_pixels: int,
-) -> list[int]:
+) -> bytes:
     if not 2 <= min_code_size <= 8:
         raise MediaScrubError("gif LZW minimum code size outside 2..8")
     clear_code = 1 << min_code_size
@@ -280,7 +280,7 @@ def _decode_gif_lzw(
     next_code = clear_code + 2
     dictionary = {index: bytes([index]) for index in range(clear_code)}
     bit_offset = 0
-    pixels: list[int] = []
+    pixels = bytearray()
     previous: bytes | None = None
     saw_clear = False
     while True:
@@ -306,9 +306,9 @@ def _decode_gif_lzw(
             entry = previous + previous[:1]
         else:
             raise MediaScrubError("gif LZW stream references an undefined code")
-        pixels.extend(entry)
-        if len(pixels) > expected_pixels:
+        if len(pixels) + len(entry) > expected_pixels:
             raise MediaScrubError("gif LZW stream emits more pixels than the image size")
+        pixels.extend(entry)
         if previous is not None and next_code < 4096:
             dictionary[next_code] = previous + entry[:1]
             next_code += 1
@@ -317,10 +317,10 @@ def _decode_gif_lzw(
         previous = entry
     # Some legacy GIFs end after a short final row. Preserve those accepted
     # streams while still rejecting data that would write past the image.
-    return pixels
+    return bytes(pixels)
 
 
-def _encode_gif_lzw(pixels: list[int], min_code_size: int) -> bytes:
+def _encode_gif_lzw(pixels: bytes, min_code_size: int) -> bytes:
     clear_code = 1 << min_code_size
     eoi_code = clear_code + 1
     dictionary = {bytes([index]): index for index in range(clear_code)}
@@ -402,6 +402,11 @@ def _emit_image_descriptor(
     top = struct.unpack("<H", data[offset + 3:offset + 5])[0]
     img_w = struct.unpack("<H", data[offset + 5:offset + 7])[0]
     img_h = struct.unpack("<H", data[offset + 7:offset + 9])[0]
+    expected_pixels = img_w * img_h
+    if expected_pixels > GIF_MAX_PIXELS:
+        raise MediaScrubError(
+            f"gif image has {expected_pixels} pixels, above the {GIF_MAX_PIXELS} pixel limit"
+        )
     local_packed = data[offset + 9]
     if local_packed & _GIF_IMAGE_DESCRIPTOR_RESERVED_MASK:
         raise MediaScrubError(
@@ -456,7 +461,7 @@ def _emit_image_descriptor(
             out.extend(_rebuild_gif_lzw(
                 lzw_blocks,
                 lzw_min_code_size,
-                img_w * img_h,
+                expected_pixels,
             ))
             return sub_offset
         block_end = sub_offset + length

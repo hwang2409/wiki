@@ -9,10 +9,15 @@ VIDEO_MIMES: Final = {
     "video/mp4": "mp4",
     "image/gif": "gif",
 }
+# WebM and Ogg are outside this strict parser scope and are rejected.
 AUDIO_MIMES: Final = {
     "audio/wav": "wav",
     "audio/mpeg": "mp3",
 }
+
+# Keep LZW output bounded before allocating pixel storage. This limit also
+# rejects dimensions that cannot be represented safely by the scrubber.
+GIF_MAX_PIXELS: Final = 16_777_216
 
 # Streaming waveform cap. Peaks are stored as unsigned 8-bit values.
 WAVEFORM_MAX_PEAKS: Final = 512

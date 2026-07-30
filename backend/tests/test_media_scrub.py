@@ -2263,6 +2263,16 @@ class GifRound12LzwProbes(unittest.TestCase):
         result = media_scrub.scrub_video(payload, "image/gif")
         self.assertNotIn(marker, result.data)
 
+    def test_pixel_count_limit_rejects_huge_descriptor(self) -> None:
+        image_desc = b"\x2c" + struct.pack("<HHHH", 0, 0, 65535, 65535) + b"\x00"
+        lzw = b"\x02\x02\x44\x01\x00"
+        payload = (
+            b"GIF89a" + struct.pack("<HH", 1, 1) + b"\x00\x00\x00"
+            + image_desc + lzw + b"\x3b"
+        )
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "pixel limit"):
+            media_scrub.scrub_video(payload, "image/gif")
+
 
 class Mp4Round12OwnershipAndH264Probes(unittest.TestCase):
     @staticmethod
@@ -2318,6 +2328,38 @@ class Mp4Round12OwnershipAndH264Probes(unittest.TestCase):
         result = media_scrub.scrub_video(bytes(payload), "video/mp4")
         marker_start = mdat_start + mdat_size
         self.assertEqual(result.data[marker_start:marker_start + len(marker)], b"\x00" * len(marker))
+
+    def test_codec_metadata_is_removed_from_mp4_and_mp3(self) -> None:
+        mp4_result = media_scrub.scrub_video(REAL_MP4.read_bytes(), "video/mp4")
+        self.assertNotIn(b"x264 - core", mp4_result.data)
+        self.assertNotIn(b"Lavc62.28", mp4_result.data)
+        mp3_result = media_scrub.scrub_audio(REAL_MP3.read_bytes(), "audio/mpeg")
+        self.assertNotIn(b"Info", mp3_result.data)
+        self.assertNotIn(b"Lavc62.28", mp3_result.data)
+
+    def test_stsc_zero_first_chunk_is_rejected(self) -> None:
+        payload = bytearray(REAL_MP4.read_bytes())
+        stsc_pos = payload.find(b"stsc")
+        assert stsc_pos > 0
+        payload[stsc_pos + 12:stsc_pos + 16] = b"\x00\x00\x00\x00"
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "stsc entries are invalid"):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+    def test_uniform_sample_count_limit_is_rejected(self) -> None:
+        payload = bytearray(REAL_MP4.read_bytes())
+        stsz_pos = payload.find(b"stsz")
+        assert stsz_pos > 0
+        payload[stsz_pos + 12:stsz_pos + 16] = struct.pack(">I", 0xFFFFFFFF)
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "sample_count .* exceeds"):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+    def test_avc_sample_length_framing_is_rejected(self) -> None:
+        payload = bytearray(REAL_MP4.read_bytes())
+        mdat_pos = payload.find(b"mdat")
+        assert mdat_pos > 0
+        payload[mdat_pos + 4:mdat_pos + 8] = b"\x00\x00\x00\x00"
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "NAL length"):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
 
     def test_avcc_length_size_minus_one_two_is_rejected(self) -> None:
         real = bytearray(REAL_MP4.read_bytes())

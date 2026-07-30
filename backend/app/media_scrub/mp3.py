@@ -26,6 +26,9 @@ _MP3_BITRATE_V2_L3: Final = (
 _MP3_SAMPLE_RATE_V1: Final = (44100, 48000, 32000, 0)
 _MP3_SAMPLE_RATE_V2: Final = (22050, 24000, 16000, 0)
 _MP3_SAMPLE_RATE_V25: Final = (11025, 12000, 8000, 0)
+_MP3_CODEC_METADATA_MARKERS: Final = (
+    b"Info", b"Xing", b"LAME", b"Lavf", b"Lavc", b"x264 - core",
+)
 
 
 def scrub_mp3(data: bytes) -> MediaScrubResult:
@@ -64,9 +67,9 @@ def scrub_mp3(data: bytes) -> MediaScrubResult:
     # validation now walks EVERY frame and requires the final walk step
     # to land exactly on `end` — no untracked bytes may exist in the
     # frame stream at all.
-    _mp3_validate_full_frame_stream(data, start, end)
+    rebuilt_frames = _mp3_validate_full_frame_stream(data, start, end)
     return MediaScrubResult(
-        data=bytes(data[start:end]),
+        data=rebuilt_frames,
         mime="audio/mpeg",
         duration_ms=None,
         width=None,
@@ -195,7 +198,7 @@ def _mp3_strip_trailing_tags_to_fixpoint(data: bytes, start: int, end: int) -> i
             return end
 
 
-def _mp3_validate_full_frame_stream(data: bytes, start: int, end: int) -> None:
+def _mp3_validate_full_frame_stream(data: bytes, start: int, end: int) -> bytes:
     """Walk every MPEG frame between `start` and `end`. The walk must land
     exactly on `end` — any unaccounted-for byte in the payload rejects the
     file. This is the round-7 fix for the pre-R7 validator that only
@@ -203,6 +206,7 @@ def _mp3_validate_full_frame_stream(data: bytes, start: int, end: int) -> None:
     """
     offset = start
     frames_seen = 0
+    rebuilt = bytearray(data[start:end])
     while offset < end:
         frame_len = _mp3_frame_length(data, offset, end)
         if frame_len is None:
@@ -210,6 +214,30 @@ def _mp3_validate_full_frame_stream(data: bytes, start: int, end: int) -> None:
                 f"mp3 frame stream broken at offset {offset - start} "
                 f"({frames_seen} frames validated)"
             )
+        frame_offset = offset - start
+        frame = data[offset:offset + frame_len]
+        header = frame[:4]
+        side_info_start = 4 + _mp3_side_info_length(header)
+        has_ancillary_metadata = any(
+            marker in frame[side_info_start:]
+            for marker in _MP3_CODEC_METADATA_MARKERS
+        )
+        if frames_seen == 0 and has_ancillary_metadata:
+            # The first MPEG frame's ancillary region carries Xing/Info/LAME
+            # and encoder strings. It has no decoded audio for these files.
+            rebuilt[frame_offset + side_info_start:frame_offset + frame_len] = (
+                b"\x00" * (frame_len - side_info_start)
+            )
+        for marker in _MP3_CODEC_METADATA_MARKERS:
+            marker_offset = 0
+            while True:
+                marker_offset = frame.find(marker, marker_offset)
+                if marker_offset < 0:
+                    break
+                rebuilt[frame_offset + marker_offset:frame_offset + marker_offset + len(marker)] = (
+                    b"\x00" * len(marker)
+                )
+                marker_offset += len(marker)
         offset += frame_len
         frames_seen += 1
     if offset != end:
@@ -218,6 +246,16 @@ def _mp3_validate_full_frame_stream(data: bytes, start: int, end: int) -> None:
         )
     if frames_seen < 1:
         raise MediaScrubError("mp3 frame stream contains zero frames")
+    return bytes(rebuilt)
+
+
+def _mp3_side_info_length(header: bytes) -> int:
+    version_bits = (header[1] >> 3) & 0x03
+    channel_mode = (header[3] >> 6) & 0x03
+    mono = channel_mode == 3
+    if version_bits == 3:
+        return 17 if mono else 32
+    return 9 if mono else 17
 
 
 def _mp3_frame_length(data: bytes, offset: int, end: int) -> int | None:

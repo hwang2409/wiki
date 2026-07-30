@@ -515,3 +515,17 @@ def canonicalise_nal(nal_bytes: bytes, expected_nal_type: int) -> bytes:
         nal_bytes, expected_nal_type,
     )
     return canonical
+
+
+def parse_slice_pps_id(nal_bytes: bytes) -> int:
+    """Read the PPS identifier from a coded-slice NAL header and RBSP."""
+    if not nal_bytes:
+        raise MediaScrubError("h264 slice NAL is empty")
+    nal_type = nal_bytes[0] & 0x1F
+    if nal_type not in (1, 5):
+        raise MediaScrubError("h264 NAL is not a coded slice")
+    rbsp = _rbsp_unescape(nal_bytes[1:])
+    reader = _BitReader(rbsp)
+    reader.read_ue()  # first_mb_in_slice
+    reader.read_ue()  # slice_type
+    return reader.read_ue()  # pic_parameter_set_id
