@@ -31,3 +31,7 @@ def _runtime_fingerprint() -> str:
 # Capture this at import time. A detached frozen daemon can keep executing an
 # old inode after Wiki.app replaces the bundle at the same filesystem path.
 RUNTIME_FINGERPRINT = _runtime_fingerprint()
+
+# Frozen (bundled Wiki.app) processes own the supervisor upgrade path; dev
+# checkouts and worktrees must never swap-kill a live supervisor (WIKI-217).
+RUNTIME_FROZEN = bool(getattr(sys, "frozen", False))
