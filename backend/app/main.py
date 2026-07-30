@@ -35,6 +35,7 @@ from . import (
     knowledge,
     palette,
     provider_health,
+    replay,
     terminal,
     tokens,
     transcripts,
@@ -2819,6 +2820,107 @@ def agent_provider_events(
             detail="Provider event inspection is available after headless migration",
         )
     return result
+
+
+def _replay_run_dir(run_id: str) -> Path:
+    if not replay.valid_run_id(run_id):
+        raise HTTPException(status_code=400, detail="Bad run id")
+    run_dir = AGENT_RUNS_DIR / run_id
+    if not run_dir.is_dir() or not (run_dir / "run.json").is_file():
+        raise HTTPException(status_code=404, detail="Run not found")
+    return run_dir
+
+
+def _resolve_ticket_runs(ticket: str) -> list[Path]:
+    """Return every archived run.json directory whose ``agent_id`` matches ticket.
+
+    Ordered newest-first by ``updated_at`` when known, then by directory mtime
+    as a fallback. Never enumerates a run without a parsed run.json so path
+    injection through symlinked run dirs is impossible.
+    """
+
+    matches: list[tuple[float, Path]] = []
+    try:
+        entries = list(AGENT_RUNS_DIR.iterdir())
+    except FileNotFoundError:
+        return []
+    for entry in entries:
+        if not entry.is_dir() or not replay.valid_run_id(entry.name):
+            continue
+        run_path = entry / "run.json"
+        try:
+            payload = json.loads(run_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        agent_id = payload.get("agent_id")
+        if agent_id != ticket:
+            continue
+        updated_at = payload.get("updated_at")
+        ts = 0.0
+        if isinstance(updated_at, str):
+            try:
+                ts = datetime.fromisoformat(updated_at.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                ts = 0.0
+        if ts == 0.0:
+            try:
+                ts = run_path.stat().st_mtime
+            except OSError:
+                ts = 0.0
+        matches.append((ts, entry))
+    matches.sort(key=lambda item: item[0], reverse=True)
+    return [path for _, path in matches]
+
+
+@app.get("/api/agents/{ticket}/replay/runs")
+def agent_replay_runs(ticket: str) -> dict[str, object]:
+    if not TICKET_PATTERN.fullmatch(ticket):
+        raise HTTPException(status_code=400, detail="Bad ticket")
+    runs = _resolve_ticket_runs(ticket)
+    return {
+        "ticket": ticket,
+        "runs": [
+            replay.build_run_summary(run_dir).as_dict()
+            for run_dir in runs
+        ],
+    }
+
+
+@app.get("/api/agent-runs/{run_id}/replay/timeline")
+def agent_run_replay_timeline(
+    run_id: str,
+    after_seq: int = 0,
+    limit: int = replay.DEFAULT_LIMIT,
+) -> dict[str, object]:
+    if after_seq < 0:
+        raise HTTPException(status_code=400, detail="after_seq must be non-negative")
+    if limit < 1 or limit > replay.MAX_LIMIT:
+        raise HTTPException(
+            status_code=400,
+            detail=f"limit must be between 1 and {replay.MAX_LIMIT}",
+        )
+    run_dir = _replay_run_dir(run_id)
+    try:
+        return replay.build_timeline_response(
+            run_dir,
+            after_seq=after_seq,
+            limit=limit,
+        )
+    except replay.ReplayError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/agent-runs/{run_id}/replay/events/{seq}")
+def agent_run_replay_event(run_id: str, seq: int) -> dict[str, object]:
+    if seq <= 0:
+        raise HTTPException(status_code=400, detail="Seq must be positive")
+    run_dir = _replay_run_dir(run_id)
+    entry = replay.load_raw_event(run_dir, seq)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Event not found")
+    return {"run_id": run_id, "seq": seq, "raw": entry}
 
 
 def _session_delta_payload(

@@ -994,6 +994,80 @@ export function getAgentWorkgraphRevision(ticket: string, revision: number, sign
   );
 }
 
+export type ReplayBookmarkKind = "steer" | "verdict" | "error";
+
+export type ReplayTimelineEvent = {
+  seq: number;
+  raw_seq: number;
+  ts: string | null;
+  kind: string;
+  disposition: string;
+  lifecycle_state: string | null;
+  summary: string;
+  bookmark: ReplayBookmarkKind | null;
+};
+
+export type ReplayBookmark = {
+  seq: number;
+  kind: ReplayBookmarkKind;
+  ts: string | null;
+  summary: string;
+  event_kind: string;
+};
+
+export type ReplayRunSummary = {
+  run_id: string;
+  agent_id: string | null;
+  orch_id: string | null;
+  role: string | null;
+  provider: string | null;
+  model: string | null;
+  outcome: string | null;
+  state: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+  total_events: number;
+  initial_prompt_excerpt: string | null;
+};
+
+export type ReplayTimeline = {
+  run: ReplayRunSummary;
+  events: ReplayTimelineEvent[];
+  next_after_seq: number | null;
+  bookmarks: ReplayBookmark[];
+};
+
+export type ReplayRawEvent = {
+  run_id: string;
+  seq: number;
+  raw: Record<string, unknown>;
+};
+
+export function getAgentReplayRuns(ticket: string, signal?: AbortSignal) {
+  return request<{ ticket: string; runs: ReplayRunSummary[] }>(
+    `/api/agents/${encodeURIComponent(ticket)}/replay/runs`,
+    { signal }
+  );
+}
+
+export function getReplayTimeline(
+  runId: string,
+  { afterSeq = 0, limit = 500, signal }: { afterSeq?: number; limit?: number; signal?: AbortSignal } = {},
+) {
+  const params = new URLSearchParams({ after_seq: String(afterSeq), limit: String(limit) });
+  return request<ReplayTimeline>(
+    `/api/agent-runs/${encodeURIComponent(runId)}/replay/timeline?${params.toString()}`,
+    { signal }
+  );
+}
+
+export function getReplayRawEvent(runId: string, seq: number, signal?: AbortSignal) {
+  return request<ReplayRawEvent>(
+    `/api/agent-runs/${encodeURIComponent(runId)}/replay/events/${seq}`,
+    { signal }
+  );
+}
+
 export type ActivityFile = {
   path: string;
   status: string;
