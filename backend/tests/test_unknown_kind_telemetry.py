@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -26,6 +27,7 @@ class UnknownKindTelemetryTests(unittest.TestCase):
             runtime_dir=root / "runtime",
             socket_path=root / "runtime" / "supervisor.sock",
             registry_path=root / "registry.json",
+            archive_dir=root / "archive",
         )
         self.raw = self.paths.runs_dir / "run-1" / "raw.jsonl"
         self.raw.parent.mkdir(parents=True)
@@ -208,6 +210,51 @@ class UnknownKindTelemetryTests(unittest.TestCase):
         )
         self.assertEqual(self.calls, [])
 
+    def test_archived_run_tail_counts_after_live_directory_is_removed(self) -> None:
+        self._append(60)
+        service = self._service()
+        service.run_once()
+
+        self._append(41)
+        archive_raw = self.paths.archive_dir / "WIKI-1" / "session" / "raw.jsonl"
+        archive_raw.parent.mkdir(parents=True)
+        shutil.copy2(self.raw, archive_raw)
+        (archive_raw.parent / "run.json").write_text(
+            json.dumps({"run_id": "run-1"}), encoding="utf-8"
+        )
+        shutil.rmtree(self.raw.parent)
+
+        result = service.run_once()
+        later = service.run_once()
+
+        self.assertEqual(result["unknown_counts"], {"item/novel": 101})
+        self.assertEqual(result["filed_kinds"], ["item/novel"])
+        self.assertEqual(later["scanned_runs"], 0)
+
+    def test_live_cursor_cap_does_not_evict_active_runs(self) -> None:
+        self._append(1)
+        self._write_run("run-2", 1)
+        self._write_run("run-3", 1)
+        service = UnknownKindTelemetry(
+            self.paths,
+            threshold=1000,
+            todo_runner=self.calls.append,
+            clock=lambda: 1_759_000_000,
+        )
+
+        with mock.patch.object(telemetry_module, "MAX_CURSOR_ENTRIES", 2):
+            first = service.run_once()
+            second = service.run_once()
+
+        self.assertEqual(first["unknown_counts"], {"item/novel": 3})
+        self.assertEqual(second["scanned_events"], 0)
+        self.assertEqual(
+            json.loads(service.state_path.read_text(encoding="utf-8"))[
+                "cursors"
+            ].keys(),
+            {"run-1", "run-2", "run-3"},
+        )
+
     def test_clock_skew_does_not_reset_week_or_extend_scheduler_delay(self) -> None:
         service = self._service()
         future = datetime(2026, 8, 3, tzinfo=timezone.utc).timestamp()
@@ -228,13 +275,16 @@ class UnknownKindTelemetryTests(unittest.TestCase):
         service.run_once()
         state = json.loads(service.state_path.read_text(encoding="utf-8"))
         self.assertTrue(state["cursors"]["run-1"]["discarding_oversized_line"])
+        self.assertEqual(state["cursors"]["run-1"]["offset"], oversized.stat().st_size)
 
         with oversized.open("ab") as handle:
             handle.write(b"\n")
         self._append(101)
         result = service.run_once()
+        state = json.loads(service.state_path.read_text(encoding="utf-8"))
 
         self.assertEqual(result["unknown_counts"], {"item/novel": 101})
+        self.assertEqual(state["cursors"]["run-1"]["offset"], oversized.stat().st_size)
         self.assertEqual(len(self.calls), 1)
 
     def test_frozen_native_runner_uses_repo_cli_not_python_executable(self) -> None:

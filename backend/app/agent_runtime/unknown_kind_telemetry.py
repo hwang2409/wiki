@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,13 @@ MAX_EVENT_LINE_BYTES = 1024 * 1024
 CHECKPOINT_EVENT_COUNT = 256
 MAX_CURSOR_ENTRIES = 4096
 STATE_VERSION = 2
+
+
+@dataclass(frozen=True)
+class _ScanSource:
+    key: str
+    raw_path: Path
+    terminal: bool
 
 
 def _atomic_write_json(path: Path, value: dict[str, Any]) -> None:
@@ -72,6 +80,7 @@ def _default_state(timestamp: float) -> dict[str, Any]:
         "covered_kinds": [],
         "pending_kinds": {},
         "filed_kinds": [],
+        "completed_runs": [],
     }
 
 
@@ -158,6 +167,13 @@ class UnknownKindTelemetry:
         result["filed_kinds"] = [
             kind for kind in result["filed_kinds"] if isinstance(kind, str)
         ]
+        if not isinstance(result["completed_runs"], list):
+            result["completed_runs"] = []
+        result["completed_runs"] = [
+            run_name
+            for run_name in result["completed_runs"]
+            if isinstance(run_name, str)
+        ]
         return result
 
     def _save_state(self, state: dict[str, Any]) -> None:
@@ -175,6 +191,8 @@ class UnknownKindTelemetry:
         run_name: str,
         path: Path,
         timestamp: float,
+        *,
+        terminal: bool,
     ) -> dict[str, Any]:
         cursors = state["cursors"]
         cursor = cursors.get(run_name)
@@ -189,30 +207,72 @@ class UnknownKindTelemetry:
             cursor_offset = int(cursor.get("offset", 0))
         except (TypeError, ValueError):
             cursor_offset = 0
+        source_type = "archive" if terminal else "live"
+        source_changed_to_archive = (
+            cursor.get("source_type") == "live" and source_type == "archive"
+        )
         if (
             cursor.get("device") != stat.st_dev
             or cursor.get("inode") != stat.st_ino
             or cursor_offset > stat.st_size
-        ):
+        ) and (not source_changed_to_archive or cursor_offset > stat.st_size):
             cursor.clear()
             cursor.update({"offset": 0, "device": stat.st_dev, "inode": stat.st_ino})
+        elif source_changed_to_archive:
+            cursor["device"] = stat.st_dev
+            cursor["inode"] = stat.st_ino
+        cursor["source_type"] = source_type
+        cursor["path"] = str(path)
         cursor["last_seen_at"] = timestamp
         return cursor
 
     def _prune_cursors(self, state: dict[str, Any]) -> None:
         cursors = state["cursors"]
         for run_name in list(cursors):
-            if (
-                Path(run_name).name != run_name
-                or not (self.paths.runs_dir / run_name / "raw.jsonl").is_file()
-            ):
+            cursor = cursors[run_name]
+            cursor_path = cursor.get("path") if isinstance(cursor, dict) else None
+            if not isinstance(cursor_path, str) or not Path(cursor_path).is_file():
                 cursors.pop(run_name, None)
+        # A cursor is never evicted while its file can be scanned again.
+        # Completed archive cursors are safe to remove because their source is
+        # skipped permanently by ``_iter_sources``.
+        completed = set(state["completed_runs"])
         while len(cursors) > MAX_CURSOR_ENTRIES:
+            terminal_names = [name for name in cursors if name in completed]
+            if not terminal_names:
+                break
             oldest_name = min(
-                cursors,
+                terminal_names,
                 key=lambda name: float(cursors[name].get("last_seen_at", 0)),
             )
             cursors.pop(oldest_name, None)
+
+    def _iter_sources(self, state: dict[str, Any]):
+        completed = set(state["completed_runs"])
+        runs_dir = self.paths.runs_dir
+        if runs_dir.is_dir():
+            for run_dir in runs_dir.iterdir():
+                raw_path = run_dir / "raw.jsonl"
+                if run_dir.is_dir() and raw_path.is_file():
+                    yield _ScanSource(run_dir.name, raw_path, False)
+
+        archive_dir = self.paths.archive_dir
+        if not archive_dir.is_dir():
+            return
+        for raw_path in archive_dir.rglob("raw.jsonl"):
+            run_name = None
+            metadata_path = raw_path.parent / "run.json"
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                candidate = metadata.get("run_id")
+                if isinstance(candidate, str) and candidate:
+                    run_name = candidate
+            except (OSError, TypeError, ValueError):
+                pass
+            if run_name is None:
+                run_name = f"archive:{raw_path.relative_to(archive_dir)}"
+            if run_name not in completed:
+                yield _ScanSource(run_name, raw_path, True)
 
     @staticmethod
     def _event_week(envelope: dict[str, Any], fallback_week: str) -> str:
@@ -266,27 +326,32 @@ class UnknownKindTelemetry:
     def _scan_run(
         self,
         state: dict[str, Any],
-        run_dir: Path,
+        source: _ScanSource,
         *,
         fallback_week: str,
         timestamp: float,
     ) -> int:
-        path = run_dir / "raw.jsonl"
-        if not path.is_file():
+        if not source.raw_path.is_file():
             return 0
-        cursor = self._cursor_for(state, run_dir.name, path, timestamp)
+        cursor = self._cursor_for(
+            state,
+            source.key,
+            source.raw_path,
+            timestamp,
+            terminal=source.terminal,
+        )
         try:
             offset = max(0, int(cursor.get("offset", 0)))
         except (TypeError, ValueError):
             offset = 0
         scanned = 0
-        line_start = offset
         stream_offset = offset
         line_buffer = bytearray()
         discarding = bool(cursor.get("discarding_oversized_line", False))
         checkpoint_events = 0
+        discard_checkpoint_offset = stream_offset
         try:
-            with path.open("rb") as handle:
+            with source.raw_path.open("rb") as handle:
                 handle.seek(offset)
                 while chunk := handle.read(SCAN_CHUNK_BYTES):
                     chunk_start = 0
@@ -302,11 +367,19 @@ class UnknownKindTelemetry:
                                 ):
                                     line_buffer.clear()
                                     discarding = True
-                                    cursor["offset"] = line_start
+                                    cursor["offset"] = stream_offset
                                     cursor["discarding_oversized_line"] = True
                                     self._save_state(state)
+                                    discard_checkpoint_offset = stream_offset
                                 else:
                                     line_buffer.extend(segment)
+                            elif (
+                                stream_offset - discard_checkpoint_offset
+                                >= SCAN_CHUNK_BYTES * 16
+                            ):
+                                cursor["offset"] = stream_offset
+                                self._save_state(state)
+                                discard_checkpoint_offset = stream_offset
                             break
 
                         segment = chunk[chunk_start : newline + 1]
@@ -316,14 +389,12 @@ class UnknownKindTelemetry:
                             discarding = False
                             cursor["offset"] = stream_offset
                             cursor["discarding_oversized_line"] = False
-                            line_start = stream_offset
                             self._save_state(state)
                         elif len(line_buffer) + len(segment) > MAX_EVENT_LINE_BYTES:
                             line_buffer.clear()
                             discarding = False
                             cursor["offset"] = stream_offset
                             cursor["discarding_oversized_line"] = False
-                            line_start = stream_offset
                             self._save_state(state)
                         else:
                             line_buffer.extend(segment)
@@ -335,21 +406,22 @@ class UnknownKindTelemetry:
                                 fallback_week=fallback_week,
                             )
                             line_buffer.clear()
-                            line_start = stream_offset
                             scanned += 1
                             checkpoint_events += 1
                             if checkpoint_events >= CHECKPOINT_EVENT_COUNT:
                                 self._save_state(state)
                                 checkpoint_events = 0
                         chunk_start = newline + 1
-            # Persist the final batch, and retain the line-start offset while
-            # an oversized or unterminated line waits for more input.
+            # Persist the final batch. Normal incomplete lines retain their
+            # last complete-line offset; discard mode advances as consumed.
             if discarding:
-                cursor["offset"] = line_start
+                cursor["offset"] = stream_offset
                 cursor["discarding_oversized_line"] = True
             self._save_state(state)
         except OSError:
-            logger.exception("unknown-kind telemetry could not scan %s", path)
+            logger.exception(
+                "unknown-kind telemetry could not scan %s", source.raw_path
+            )
         return scanned
 
     def _file_todos(self, state: dict[str, Any]) -> list[str]:
@@ -414,22 +486,30 @@ class UnknownKindTelemetry:
             current = self.clock() if timestamp is None else timestamp
             state = self._load_state(current)
             self._start_week(state, current)
-            self._prune_cursors(state)
             self._save_state(state)
             scanned_runs = 0
             scanned_events = 0
-            runs_dir = self.paths.runs_dir
-            if runs_dir.is_dir():
-                for run_dir in runs_dir.iterdir():
-                    if not run_dir.is_dir():
-                        continue
-                    scanned_runs += 1
-                    scanned_events += self._scan_run(
-                        state,
-                        run_dir,
-                        fallback_week=state["week_start"],
-                        timestamp=current,
-                    )
+            for source in self._iter_sources(state):
+                scanned_runs += 1
+                scanned_events += self._scan_run(
+                    state,
+                    source,
+                    fallback_week=state["week_start"],
+                    timestamp=current,
+                )
+                if source.terminal:
+                    cursor = state["cursors"].get(source.key)
+                    try:
+                        complete = (
+                            isinstance(cursor, dict)
+                            and not cursor.get("discarding_oversized_line", False)
+                            and int(cursor.get("offset", 0))
+                            >= source.raw_path.stat().st_size
+                        )
+                    except (OSError, TypeError, ValueError):
+                        complete = False
+                    if complete and source.key not in state["completed_runs"]:
+                        state["completed_runs"].append(source.key)
             self._prune_cursors(state)
             filed_now = self._file_todos(state)
             state["last_run_at"] = current
