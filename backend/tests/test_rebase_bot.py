@@ -6,13 +6,14 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 from backend.app import main
-from backend.app.agent_runtime import rebase_bot
+from backend.app.agent_runtime import rebase_bot, rebase_durable
 from backend.app.agent_runtime.rebase_bot import RebaseError
 from backend.app.rebase_schema import RebaseDirtyPrIn, mcp_input_schema
 
@@ -479,10 +480,15 @@ class RebaseBotTests(unittest.TestCase):
             worktree = Path(raw)
             lockfile = worktree / "frontend" / "package-lock.json"
             lockfile.parent.mkdir()
+
+            def creating(cmd, cwd=None, **_kwargs):
+                (Path(cwd) / "package-lock.json").write_text(
+                    "{}", encoding="utf-8"
+                )
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
             with mock.patch.object(
-                rebase_bot.subprocess,
-                "run",
-                return_value=subprocess.CompletedProcess([], 0, "", ""),
+                rebase_bot.subprocess, "run", side_effect=creating
             ) as run:
                 self.assertIsNone(
                     rebase_bot._regenerate_lockfile(
@@ -550,11 +556,12 @@ class RebaseBotTests(unittest.TestCase):
                 "escalated_hunks": ["semantic"],
             }
             with mock.patch.object(rebase_bot, "_main", return_value=fake_main):
-                rebase_bot._DURABLE_STATE_LOADED = False
-                rebase_bot._DURABLE_JOBS.clear()
-                rebase_bot._OUTBOX.clear()
-                rebase_bot._persist_job(job, result)
-                rebase_bot._enqueue_result(job, result)
+                rebase_durable._DURABLE_STATE_LOADED = False
+                rebase_durable._DURABLE_JOBS.clear()
+                rebase_durable._OUTBOX.clear()
+                rebase_durable._DELIVERED_EVENTS.clear()
+                rebase_durable._persist_job(job, result)
+                rebase_durable._enqueue_result(job, result)
                 rebase_bot._flush_outbox(send)
                 pending = json.loads(
                     (Path(raw) / "rebase-bot" / "outbox.json").read_text(
@@ -562,7 +569,9 @@ class RebaseBotTests(unittest.TestCase):
                     )
                 )
                 should_fail = False
-                rebase_bot._flush_outbox(send)
+                # Bounded retry policy adds backoff after a failure.  Jump the
+                # clock past the backoff window so the retry actually fires.
+                rebase_bot._flush_outbox(send, _now=lambda: time.time() + 3600)
         self.assertEqual(pending["durable-test:result"]["attempts"], 1)
         self.assertEqual(delivered, ["rebase-bot escalated WIKI-175-IMPL: semantic"])
 

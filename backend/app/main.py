@@ -12,7 +12,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -96,11 +96,33 @@ VAULT_DIR.mkdir(parents=True, exist_ok=True)
 PROVIDER_HEALTH = provider_health.ProviderHealthTracker()
 
 
+_REBASE_RECORDING_NOTIFIER: Callable[[str, str], None] | None = None
+
+
+def install_rebase_recording_notifier(
+    sender: Callable[[str, str], None] | None,
+) -> None:
+    """Route rebase-bot notifications to a recorder instead of the live channel.
+
+    Tests install a recorder before invoking rebase flows so they can assert
+    deliveries; passing ``None`` restores the default live path.  The recorder
+    takes priority over the pytest safety guard, so a test that installs a
+    recorder gets real observations of every delivery.
+    """
+
+    global _REBASE_RECORDING_NOTIFIER
+    _REBASE_RECORDING_NOTIFIER = sender
+
+
 def _rebase_bot_notification_sender(target: str, text: str) -> None:
     """Send one rebase result through the configured agent message path."""
 
-    # Local test processes must inject a recorder.  They must not use the
-    # operator channel by default.
+    recorder = _REBASE_RECORDING_NOTIFIER
+    if recorder is not None:
+        recorder(target, text)
+        return
+    # Fallback safety: if no recorder is installed and pytest is running,
+    # drop the message rather than paging live operators from a test.
     if os.environ.get("PYTEST_CURRENT_TEST"):
         return
     agent_message(

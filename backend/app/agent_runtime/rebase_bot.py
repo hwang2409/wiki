@@ -4,11 +4,16 @@ The public operation only starts a short-lived helper when GitHub says that a
 PR is conflicting.  The helper prompt is deliberately narrow; the
 ``run_rebase_helper`` function is also kept deterministic so it can be used by
 the helper worker and by fixture tests without involving a model.
+
+Focused submodules keep this file to the orchestration layer:
+
+* ``rebase_parsing`` — conflict-marker parsing and safe line-ending resolution
+* ``rebase_lockfiles`` — per-lockfile regeneration pipeline
+* ``rebase_durable`` — durable job/outbox state and delivery-dedupe
 """
 
 from __future__ import annotations
 
-import json
 import hashlib
 import re
 import subprocess
@@ -18,131 +23,52 @@ import threading
 import time
 from contextlib import contextmanager
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .rebase_durable import (
+    NotificationSender,
+    _DURABLE_JOBS,
+    _RebaseJob,
+    _durable_key,
+    _flush_outbox,
+    _load_durable_state,
+    _persist_completion,
+    _persist_job,
+    _prune_durable_jobs as _prune_durable_jobs_impl,
+    _result_message,
+)
+from .rebase_lockfiles import (
+    LOCKFILES,
+    _regenerate_lockfile,
+)
+from .rebase_parsing import (
+    RebaseError,
+    resolve_conflict_file,
+)
 
-LOCKFILES = {
-    "pnpm-lock.yaml",
-    "package-lock.json",
-    "npm-shrinkwrap.json",
-    "yarn.lock",
-    "uv.lock",
-    "Cargo.lock",
-}
-_CONFLICT_START = re.compile(r"^<<<<<<<(?:\s.*)?$")
-_CONFLICT_MID = re.compile(r"^=======$")
-_CONFLICT_BASE = re.compile(r"^\|{7}(?:\s.*)?$")
-_CONFLICT_END = re.compile(r"^>>>>>>>(?:\s.*)?$")
-_CONFLICT_LIKE = re.compile(r"^(?:<{7,}|={7,}|>{7,}|\|{7,})(?:\s.*)?$")
 
-
-class RebaseError(RuntimeError):
-    """A rebase operation could not be completed safely."""
-
-
-@dataclass
-class _RebaseJob:
-    job_id: str
-    worktree: Path
-    prompt: str
-    done: threading.Event
-    helper: Callable[[Path], Mapping[str, Any]] | None = None
-    result: dict[str, Any] | None = None
-    pr_number: int = 0
-    expected_sha: str = ""
-    ticket: str = ""
-    worker_id: str = ""
-    orchestrator: str | None = None
-    verdict: dict[str, Any] | None = None
-    durable: bool = False
-    completed_at: float | None = None
+_GITHUB_URL_PREFIXES = (
+    "https://github.com/",
+    "http://github.com/",
+    "git@github.com:",
+    "ssh://git@github.com/",
+)
+_REPO_SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 _JOB_LOCK = threading.RLock()
 _JOBS: dict[tuple[Any, ...], _RebaseJob] = {}
 _WORKTREE_LOCKS: dict[str, threading.RLock] = {}
-_DURABLE_STATE_LOADED = False
-_DURABLE_STATE_ROOT: Path | None = None
-_DURABLE_JOBS: dict[str, dict[str, Any]] = {}
-_OUTBOX: dict[str, dict[str, Any]] = {}
 _NOTIFIED_RESULTS: set[str] = set()
-_JOB_RETENTION_SECONDS = 900
-NotificationSender = Callable[[str, str], None]
-
-
-def _durable_paths() -> tuple[Path, Path]:
-    try:
-        runtime_dir = getattr(_main(), "AGENT_RUNTIME_DIR", None)
-    except Exception:
-        runtime_dir = None
-    root = (
-        Path(runtime_dir)
-        if isinstance(runtime_dir, (str, Path))
-        else Path(tempfile.gettempdir()) / "wiki-agent-runtime"
-    )
-    state_dir = root / "rebase-bot"
-    return state_dir / "jobs.json", state_dir / "outbox.json"
-
-
-def _load_durable_state() -> None:
-    global _DURABLE_STATE_LOADED, _DURABLE_STATE_ROOT
-    jobs_path, outbox_path = _durable_paths()
-    state_root = jobs_path.parent
-    if _DURABLE_STATE_LOADED and _DURABLE_STATE_ROOT == state_root:
-        return
-    if _DURABLE_STATE_ROOT != state_root:
-        _DURABLE_JOBS.clear()
-        _OUTBOX.clear()
-    _DURABLE_STATE_ROOT = state_root
-    _DURABLE_STATE_LOADED = True
-    for path, target in ((jobs_path, _DURABLE_JOBS), (outbox_path, _OUTBOX)):
-        try:
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if isinstance(value, Mapping):
-            target.update(
-                {
-                    str(key): dict(item)
-                    for key, item in value.items()
-                    if isinstance(key, str) and isinstance(item, Mapping)
-                }
-            )
-
-
-def _persist_durable_state() -> None:
-    jobs_path, outbox_path = _durable_paths()
-    jobs_path.parent.mkdir(parents=True, exist_ok=True)
-    for path, value in ((jobs_path, _DURABLE_JOBS), (outbox_path, _OUTBOX)):
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_text(
-            json.dumps(value, ensure_ascii=False, separators=(",", ":")),
-            encoding="utf-8",
-        )
-        temporary.replace(path)
-
-
-def _durable_key(pr_number: int, expected_sha: str) -> str:
-    return f"{pr_number}:{expected_sha}"
+_ACTIVE_SHA: dict[int, str] = {}
 
 
 def _prune_durable_jobs() -> None:
-    cutoff = time.time() - _JOB_RETENTION_SECONDS
-    for key, record in list(_DURABLE_JOBS.items()):
-        completed_at = record.get("completed_at")
-        if (
-            record.get("status") in {"completed", "failed"}
-            and isinstance(completed_at, (int, float))
-            and completed_at < cutoff
-        ):
-            _DURABLE_JOBS.pop(key, None)
-            try:
-                pr_number, expected_sha = key.split(":", 1)
-                _JOBS.pop((int(pr_number), expected_sha, "production"), None)
-            except (ValueError, TypeError):
-                pass
+    def clear(pr_number: int, expected_sha: str) -> None:
+        _JOBS.pop((pr_number, expected_sha, "production"), None)
+
+    _prune_durable_jobs_impl(clear)
 
 
 def _job_key(
@@ -224,20 +150,38 @@ def _git_value(worktree: Path, args: Sequence[str]) -> str | None:
 
 
 def _repo_name(value: str | None) -> str | None:
+    """Return ``org/repo`` for a supported GitHub URL or bare slug, else ``None``.
+
+    URL-shaped inputs must start with one of ``_GITHUB_URL_PREFIXES`` (a bare
+    suffix match would let ``https://evil.com/hwang2409/wiki`` slip through
+    as ``hwang2409/wiki``).  Local paths and non-slug strings are rejected.
+    Bare ``owner/name`` slugs from the GitHub gate response stay allowed.
+    """
+
     if not value:
         return None
     raw = value.strip().removesuffix(".git")
-    for prefix in (
-        "https://github.com/",
-        "http://github.com/",
-        "git@github.com:",
-        "ssh://git@github.com/",
-    ):
-        if raw.startswith(prefix):
-            raw = raw.removeprefix(prefix)
-            break
-    parts = [part for part in raw.strip("/").split("/") if part]
-    return "/".join(parts[-2:]) if len(parts) >= 2 else None
+    if not raw:
+        return None
+    looks_like_url = "://" in raw or raw.startswith("git@")
+    if looks_like_url:
+        matched = False
+        for prefix in _GITHUB_URL_PREFIXES:
+            if raw.startswith(prefix):
+                raw = raw.removeprefix(prefix)
+                matched = True
+                break
+        if not matched:
+            return None
+        parts = [part for part in raw.strip("/").split("/") if part]
+        if len(parts) < 2:
+            return None
+        slug = f"{parts[0]}/{parts[1]}"
+    else:
+        slug = raw.strip("/")
+    if not _REPO_SLUG.fullmatch(slug):
+        return None
+    return slug
 
 
 def _validate_pr_binding(worktree: Path, verdict: Mapping[str, Any]) -> None:
@@ -282,183 +226,9 @@ def _validate_pr_binding(worktree: Path, verdict: Mapping[str, Any]) -> None:
         raise RebaseError("PR/worktree binding mismatch: " + "; ".join(mismatches))
 
 
-def _line_ending_only(line: str) -> str:
-    return line.replace("\r\n", "\n").replace("\r", "\n")
-
-
-def _parse_conflicts(
-    text: str,
-) -> tuple[list[tuple[list[str], list[str] | None, list[str]]], bool]:
-    """Parse only Git's exact seven-character conflict markers.
-
-    Marker-like lines with a different marker size are rejected.  They must
-    not turn malformed conflict data into a false clean result.
-    """
-
-    def marker(line: str) -> str | None:
-        if _CONFLICT_START.fullmatch(line):
-            return "start"
-        if _CONFLICT_BASE.fullmatch(line):
-            return "base"
-        if _CONFLICT_MID.fullmatch(line):
-            return "middle"
-        if _CONFLICT_END.fullmatch(line):
-            return "end"
-        if _CONFLICT_LIKE.fullmatch(line):
-            raise RebaseError("malformed conflict marker")
-        return None
-
-    lines = text.splitlines(keepends=True)
-    hunks: list[tuple[list[str], list[str] | None, list[str]]] = []
-    index = 0
-    found = False
-    while index < len(lines):
-        kind = marker(lines[index].rstrip("\r\n"))
-        if kind is None:
-            index += 1
-            continue
-        if kind != "start":
-            raise RebaseError("unexpected conflict marker")
-        found = True
-        index += 1
-        ours: list[str] = []
-        while index < len(lines):
-            kind = marker(lines[index].rstrip("\r\n"))
-            if kind in {"middle", "base"}:
-                break
-            if kind is not None:
-                raise RebaseError("nested or misplaced conflict marker")
-            ours.append(lines[index])
-            index += 1
-        if index >= len(lines):
-            raise RebaseError("incomplete conflict hunk")
-        base: list[str] | None = None
-        if marker(lines[index].rstrip("\r\n")) == "base":
-            index += 1
-            base = []
-            while index < len(lines):
-                kind = marker(lines[index].rstrip("\r\n"))
-                if kind == "middle":
-                    break
-                if kind is not None:
-                    raise RebaseError("nested or misplaced conflict marker")
-                base.append(lines[index])
-                index += 1
-            if index >= len(lines):
-                raise RebaseError("incomplete diff3 conflict hunk")
-        index += 1
-        theirs: list[str] = []
-        while index < len(lines):
-            kind = marker(lines[index].rstrip("\r\n"))
-            if kind == "end":
-                break
-            if kind is not None:
-                raise RebaseError("nested or misplaced conflict marker")
-            theirs.append(lines[index])
-            index += 1
-        if index >= len(lines):
-            raise RebaseError("incomplete conflict hunk")
-        index += 1
-        hunks.append((ours, base, theirs))
-    return hunks, found
-
-
-def resolve_conflict_file(path: Path) -> tuple[bool, str | None]:
-    """Resolve only conflicts whose sides differ in line endings.
-
-    Returns ``(resolved, summary)``.  A false result never writes the file.
-    """
-
-    raw = path.read_text(encoding="utf-8", errors="surrogateescape")
-    try:
-        hunks, found = _parse_conflicts(raw)
-    except RebaseError as exc:
-        return False, str(exc)
-    if not found:
-        return True, None
-
-    for ours, _base, theirs in hunks:
-        if [_line_ending_only(line) for line in ours] != [
-            _line_ending_only(line) for line in theirs
-        ]:
-            excerpt = "".join(
-                ["<<<<<<< ours\n", *ours, "=======\n", *theirs, ">>>>>>> theirs\n"]
-            )
-            return False, excerpt.strip()[:1200]
-
-    lines = raw.splitlines(keepends=True)
-    output: list[str] = []
-    index = 0
-    while index < len(lines):
-        if not _CONFLICT_START.fullmatch(lines[index].rstrip("\r\n")):
-            output.append(lines[index])
-            index += 1
-            continue
-        index += 1
-        ours_start = index
-        while index < len(lines) and not _CONFLICT_MID.fullmatch(
-            lines[index].rstrip("\r\n")
-        ):
-            index += 1
-        ours = lines[ours_start:index]
-        if index < len(lines) and _CONFLICT_BASE.fullmatch(
-            lines[index].rstrip("\r\n")
-        ):
-            index += 1
-            while index < len(lines) and not _CONFLICT_MID.fullmatch(
-                lines[index].rstrip("\r\n")
-            ):
-                index += 1
-        index += 1
-        while index < len(lines) and not _CONFLICT_END.fullmatch(
-            lines[index].rstrip("\r\n")
-        ):
-            index += 1
-        index += 1
-        output.extend(_line_ending_only(line) for line in ours)
-    normalized = "".join(output).replace("\r\n", "\n").replace("\r", "\n")
-    path.write_text(normalized, encoding="utf-8", errors="surrogateescape", newline="")
-    return True, None
-
-
-def _lockfile_command(worktree: Path, filename: str) -> list[str] | None:
-    basename = Path(filename).name
-    if basename == "package-lock.json" or basename == "npm-shrinkwrap.json":
-        return ["npm", "install", "--package-lock-only", "--ignore-scripts"]
-    if basename == "pnpm-lock.yaml":
-        return ["pnpm", "install", "--lockfile-only", "--ignore-scripts"]
-    if basename == "yarn.lock":
-        return ["yarn", "install", "--mode=skip-builds"]
-    if basename == "uv.lock":
-        return ["uv", "lock"]
-    if basename == "Cargo.lock":
-        return ["cargo", "generate-lockfile"]
-    return None
-
-
-def _regenerate_lockfile(worktree: Path, filename: str) -> str | None:
-    command = _lockfile_command(worktree, filename)
-    if command is None:
-        return f"no lockfile generator configured for {filename}"
-    try:
-        lockfile_dir = (worktree / filename).parent
-        result = subprocess.run(
-            command,
-            cwd=str(lockfile_dir),
-            capture_output=True,
-            text=True,
-            timeout=180,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return f"{filename} regeneration failed: {exc}"
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "generator failed").strip()
-        return f"{filename} regeneration failed: {detail[:600]}"
-    return None
-
-
 def _default_smoke_commands(worktree: Path) -> list[tuple[list[str], Path]]:
+    import json as _json
+
     commands: list[tuple[list[str], Path]] = []
     if (worktree / "backend" / "tests").is_dir():
         commands.append(
@@ -467,7 +237,7 @@ def _default_smoke_commands(worktree: Path) -> list[tuple[list[str], Path]]:
     package = worktree / "frontend" / "package.json"
     if package.is_file():
         try:
-            data = json.loads(package.read_text(encoding="utf-8"))
+            data = _json.loads(package.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             data = {}
         scripts = data.get("scripts") if isinstance(data, dict) else None
@@ -483,6 +253,40 @@ def _conflict_files(worktree: Path) -> list[str]:
             (result.stderr or result.stdout or "could not list conflicts").strip()
         )
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def _unmerged_stages(worktree: Path, filename: str) -> set[int]:
+    """Return the set of index stages Git recorded for a conflicting file."""
+
+    result = _git(worktree, ["ls-files", "--unmerged", "--", filename], timeout=15)
+    if result.returncode != 0:
+        return set()
+    stages: set[int] = set()
+    for line in result.stdout.splitlines():
+        # Format: <mode> <sha> <stage>\t<file>
+        parts = line.split("\t", 1)
+        if not parts:
+            continue
+        head = parts[0].split()
+        if len(head) >= 3:
+            try:
+                stages.add(int(head[2]))
+            except ValueError:
+                continue
+    return stages
+
+
+def _file_is_binary(worktree: Path, filename: str) -> bool:
+    """Detect a binary conflict via the .gitattributes attr and NUL bytes."""
+
+    attr = _git(worktree, ["check-attr", "binary", "--", filename], timeout=15)
+    if attr.returncode == 0 and attr.stdout.strip().endswith(": binary: set"):
+        return True
+    try:
+        chunk = (worktree / filename).read_bytes()[:8192]
+    except OSError:
+        return False
+    return b"\x00" in chunk
 
 
 def _preflight_worktree(worktree: Path, expected_sha: str | None = None) -> None:
@@ -522,11 +326,25 @@ def _push_destination_error(worktree: Path) -> str | None:
     return None
 
 
+def _mark_active(pr_number: int, expected_sha: str) -> None:
+    with _JOB_LOCK:
+        _ACTIVE_SHA[pr_number] = expected_sha
+
+
+def _is_superseded(pr_number: int, expected_sha: str) -> bool:
+    """True if a newer generation for this PR has been claimed elsewhere."""
+
+    with _JOB_LOCK:
+        current = _ACTIVE_SHA.get(pr_number)
+    return current is not None and current != expected_sha
+
+
 def _run_rebase_helper_unlocked(
     worktree: str | Path,
     *,
     smoke_commands: Sequence[tuple[Sequence[str], Path]] | None = None,
     push: bool = True,
+    supersede_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Fetch, merge narrow conflict classes, smoke-test, and push.
 
@@ -552,6 +370,13 @@ def _run_rebase_helper_unlocked(
         lockfiles: list[str] = []
         for filename in files:
             path = root / filename
+            stages = _unmerged_stages(root, filename)
+            if stages and stages != {1, 2, 3} and stages != {2, 3} and stages != {1, 2} and stages != {1, 3}:
+                escalated.append(f"{filename}: unexpected index stages {sorted(stages)}")
+                continue
+            if _file_is_binary(root, filename):
+                escalated.append(f"{filename}: binary conflict")
+                continue
             if path.name in LOCKFILES:
                 lockfiles.append(filename)
                 continue
@@ -635,6 +460,12 @@ def _run_rebase_helper_unlocked(
             )
 
     if push:
+        if supersede_check is not None and supersede_check():
+            return _escalated_result(
+                initial_sha,
+                resolved_files,
+                ["superseded by newer HEAD generation for this PR"],
+            )
         push_error = _push_destination_error(root)
         if push_error:
             return _escalated_result(initial_sha, resolved_files, [push_error])
@@ -679,7 +510,7 @@ def _cleanup_failed_rebase(root: Path, initial_sha: str | None) -> list[str]:
         errors.append(f"could not inspect HEAD during cleanup: {exc}")
     if initial_sha and current_sha != initial_sha:
         try:
-            restored = _git(root, ["reset", "--merge", initial_sha], timeout=60)
+            restored = _git(root, ["reset", "--hard", initial_sha], timeout=60)
             if restored.returncode != 0:
                 errors.append(
                     f"reset failed: {(restored.stderr or restored.stdout).strip()[:600]}"
@@ -711,6 +542,7 @@ def _run_rebase_helper_checked(
     *,
     smoke_commands: Sequence[tuple[Sequence[str], Path]] | None = None,
     push: bool = True,
+    supersede_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Run the merge and clean up every failed or raised operation."""
 
@@ -723,6 +555,7 @@ def _run_rebase_helper_checked(
             root,
             smoke_commands=smoke_commands,
             push=push,
+            supersede_check=supersede_check,
         )
     except Exception as exc:
         result = _escalated_result(
@@ -750,6 +583,7 @@ def run_rebase_helper(
     smoke_commands: Sequence[tuple[Sequence[str], Path]] | None = None,
     push: bool = True,
     expected_sha: str | None = None,
+    supersede_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Run one serialized rebase operation in the target worktree."""
 
@@ -760,6 +594,7 @@ def run_rebase_helper(
             root,
             smoke_commands=smoke_commands,
             push=push,
+            supersede_check=supersede_check,
         )
 
 
@@ -823,95 +658,6 @@ def _clean_result(verdict: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _result_message(worker_id: str, result: Mapping[str, Any]) -> str | None:
-    status = result.get("status")
-    if status == "resolved":
-        resolved_files = ", ".join(
-            str(item) for item in result.get("resolved_files", [])
-        )
-        return f"rebase-bot resolved {worker_id}: " + (
-            resolved_files or "rebase completed"
-        )
-    if status == "escalated":
-        return f"rebase-bot escalated {worker_id}: " + "; ".join(
-            str(item) for item in result.get("escalated_hunks", [])
-        )
-    return None
-
-
-def _persist_job(job: _RebaseJob, result: Mapping[str, Any] | None = None) -> None:
-    if not job.durable:
-        return
-    _load_durable_state()
-    key = _durable_key(job.pr_number, job.expected_sha)
-    record = _DURABLE_JOBS.setdefault(key, {})
-    record.update(
-        {
-            "job_id": job.job_id,
-            "pr_number": job.pr_number,
-            "expected_sha": job.expected_sha,
-            "ticket": job.ticket,
-            "worker_id": job.worker_id,
-            "worktree": str(job.worktree),
-            "orchestrator": job.orchestrator,
-            "prompt": job.prompt,
-            "verdict": job.verdict or {},
-            "status": "completed" if result is not None else "running",
-            "result": dict(result) if result is not None else None,
-            "updated_at": time.time(),
-            "completed_at": time.time() if result is not None else None,
-        }
-    )
-    _persist_durable_state()
-
-
-def _enqueue_result(job: _RebaseJob, result: Mapping[str, Any]) -> None:
-    if not job.durable or not job.orchestrator:
-        return
-    message = _result_message(job.worker_id, result)
-    if message is None:
-        return
-    _load_durable_state()
-    entry_id = f"{job.job_id}:result"
-    _OUTBOX.setdefault(
-        entry_id,
-        {
-            "id": entry_id,
-            "target": job.orchestrator,
-            "worker_id": job.worker_id,
-            "result": dict(result),
-            "attempts": 0,
-            "last_error": None,
-        },
-    )
-    _persist_durable_state()
-
-
-def _flush_outbox(notify: NotificationSender | None = None) -> None:
-    _load_durable_state()
-    if notify is None:
-        return
-    for entry_id, entry in list(_OUTBOX.items()):
-        target = entry.get("target")
-        result = entry.get("result")
-        worker_id = entry.get("worker_id")
-        if not isinstance(target, str) or not isinstance(result, Mapping):
-            _OUTBOX.pop(entry_id, None)
-            continue
-        message = _result_message(str(worker_id or "worker"), result)
-        if message is None:
-            _OUTBOX.pop(entry_id, None)
-            continue
-        try:
-            notify(target, message[:4000])
-        except Exception as exc:
-            entry["attempts"] = int(entry.get("attempts") or 0) + 1
-            entry["last_error"] = str(exc)[:600]
-            continue
-        _OUTBOX.pop(entry_id, None)
-    _persist_durable_state()
-
-
 def _escalate_to_orchestrator(
     worker_id: str,
     orchestrator: str | None,
@@ -955,7 +701,14 @@ def _finish_rebase_job(
                     raise RebaseError("durable rebase job has no gate verdict")
                 _validate_pr_binding(job.worktree, job.verdict)
                 _preflight_worktree(job.worktree, job.expected_sha)
-                result = dict(_run_rebase_helper_checked(job.worktree))
+                result = dict(
+                    _run_rebase_helper_checked(
+                        job.worktree,
+                        supersede_check=lambda: _is_superseded(
+                            job.pr_number, job.expected_sha
+                        ),
+                    )
+                )
     except Exception as exc:
         try:
             head_sha = _head_sha(job.worktree)
@@ -967,12 +720,14 @@ def _finish_rebase_job(
             [f"rebase worker failed: {exc}"],
         )
         if job.helper is None:
+            # Restore to the SHA the gate claimed we started from, not the
+            # sha we currently sit on: if the crash moved HEAD, using the
+            # current sha would leave the worktree at the moved position.
             try:
-                cleanup_sha = _head_sha(job.worktree)
-                if cleanup_sha:
-                    result["escalated_hunks"].extend(
-                        _cleanup_failed_rebase(job.worktree, cleanup_sha)
-                    )
+                cleanup_errors = _cleanup_failed_rebase(
+                    job.worktree, job.expected_sha or None
+                )
+                result["escalated_hunks"].extend(cleanup_errors)
             except Exception as cleanup_exc:
                 result["escalated_hunks"].append(
                     f"rebase cleanup failed: {cleanup_exc}"
@@ -981,9 +736,8 @@ def _finish_rebase_job(
     job.result = result
     job.completed_at = time.time()
     try:
-        _persist_job(job, result)
+        _persist_completion(job, result)
         if job.durable:
-            _enqueue_result(job, result)
             _flush_outbox(notify)
     except Exception as exc:
         result.setdefault("escalated_hunks", []).append(
@@ -1054,6 +808,7 @@ def _existing_or_new_job(
                     _JOBS[key] = job
                     return job, False, False
                 _JOBS[key] = job
+                _mark_active(pr_number, expected_sha)
                 return job, True, True
         job = _RebaseJob(
             job_id=hashlib.sha256(f"{key}:{id(prompt)}".encode()).hexdigest()[:16],
@@ -1071,6 +826,8 @@ def _existing_or_new_job(
         )
         _JOBS[key] = job
         _persist_job(job)
+        if job.durable:
+            _mark_active(pr_number, expected_sha)
         return job, True, False
 
 
@@ -1134,6 +891,7 @@ def resume_pending_jobs(notify: NotificationSender | None = None) -> None:
                 durable=True,
             )
             _JOBS[key] = job
+            _mark_active(pr_number, expected_sha)
             pending.append(job)
     _flush_outbox(notify)
     for job in pending:
