@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,8 +33,8 @@ def _conflicting_repo(
         theirs = 'def value():\n    return "theirs"\n'
     elif whitespace:
         base = "value = 1\n"
-        ours = "value = 1  # same  \n"
-        theirs = "value=1 # same\n"
+        ours = "value = 1  \n"
+        theirs = "value = 1\t\n"
     else:
         base = "import base\n"
         ours = "import ours\n"
@@ -264,6 +265,31 @@ class RebaseBotTests(unittest.TestCase):
                 },
             )
 
+    def test_binding_preserves_branch_names_with_slashes(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            worktree = _conflicting_repo(Path(raw))
+            _run(worktree, "git", "branch", "-m", "codex/foo")
+            _run(worktree, "git", "push", "-u", "origin", "codex/foo")
+            _run(
+                worktree,
+                "git",
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/hwang2409/wiki.git",
+            )
+            head_sha = _run(worktree, "git", "rev-parse", "HEAD").stdout.strip()
+            rebase_bot._validate_pr_binding(
+                worktree,
+                {
+                    "raw": {
+                        "repo": "hwang2409/wiki",
+                        "head_ref_name": "codex/foo",
+                        "head_sha": head_sha,
+                    }
+                },
+            )
+
     def test_production_code_has_no_verification_bypass(self) -> None:
         source = Path(rebase_bot.__file__).read_text(encoding="utf-8")
         self.assertNotIn("--no-verify", source)
@@ -279,6 +305,111 @@ class RebaseBotTests(unittest.TestCase):
         self.assertEqual(result["status"], "escalated")
         self.assertEqual(before, after)
         self.assertTrue(result["escalated_hunks"])
+
+    def test_assignment_additions_with_same_name_are_semantic(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "fixture.py"
+            original = (
+                "<<<<<<< ours\nMODE = 'ours'\n||||||| base\n=======\n"
+                "MODE = 'theirs'\n>>>>>>> theirs\n"
+            )
+            path.write_text(original, encoding="utf-8")
+            resolved, detail = rebase_bot.resolve_conflict_file(path)
+            self.assertFalse(resolved)
+            self.assertIn("MODE = 'ours'", detail or "")
+            self.assertEqual(path.read_text(encoding="utf-8"), original)
+
+    def test_whitespace_comparison_keeps_string_contents(self) -> None:
+        self.assertTrue(
+            rebase_bot._is_whitespace_only(
+                ['value = "a b"  \n'], ['value = "a b"\t\r\n']
+            )
+        )
+        self.assertFalse(
+            rebase_bot._is_whitespace_only(['value = "a b"\n'], ['value = "ab"\n'])
+        )
+
+    def test_formatter_exception_restores_original_clean_state(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            worktree = _conflicting_repo(Path(raw), whitespace=True)
+            before = _run(worktree, "git", "rev-parse", "HEAD").stdout.strip()
+
+            def formatter(_worktree: Path, _files: list[str]) -> None:
+                raise RuntimeError("formatter crashed")
+
+            result = rebase_bot.run_rebase_helper(
+                worktree, smoke_commands=[], formatter=formatter, push=False
+            )
+            after = _run(worktree, "git", "rev-parse", "HEAD").stdout.strip()
+            status = _run(worktree, "git", "status", "--porcelain").stdout
+        self.assertEqual(result["status"], "escalated")
+        self.assertIn("formatter crashed", result["escalated_hunks"][0])
+        self.assertEqual(before, after)
+        self.assertEqual(status, "")
+
+    def test_retry_joins_running_job_without_second_merge(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        calls: list[Path] = []
+        fake_main = SimpleNamespace(
+            _registry_agent=lambda _registry, _worker: (
+                "WIKI-175-IMPL",
+                {},
+                {"worktree": tempfile.gettempdir(), "orch": "wiki"},
+            ),
+            _read_agent_registry=lambda: {},
+        )
+
+        def slow_run(worktree: Path) -> dict:
+            calls.append(worktree)
+            started.set()
+            release.wait(timeout=5)
+            finished.set()
+            return {
+                "status": "resolved",
+                "head_sha": "abc",
+                "resolved_files": [],
+                "escalated_hunks": [],
+            }
+
+        with (
+            tempfile.TemporaryDirectory() as raw,
+            mock.patch.object(rebase_bot, "_main", return_value=fake_main),
+            mock.patch.object(rebase_bot, "_validate_pr_binding"),
+        ):
+            fake_main._registry_agent = lambda _registry, _worker: (
+                "WIKI-175-IMPL",
+                {},
+                {"worktree": raw, "orch": "wiki"},
+            )
+
+            def gate(_pr: int) -> dict:
+                return {
+                    "raw": {
+                        "mergeable": "CONFLICTING",
+                        "repo": "hwang2409/wiki",
+                        "head_ref_name": "feature",
+                        "head_sha": "abc",
+                    }
+                }
+
+            with mock.patch.object(
+                rebase_bot, "run_rebase_helper", side_effect=slow_run
+            ):
+                first = rebase_bot.rebase_dirty_pr(
+                    175, "WIKI-175", "WIKI-175-IMPL", gate=gate
+                )
+                self.assertEqual(first["status"], "started")
+                self.assertTrue(started.wait(timeout=2))
+                # The retry returns immediately and cannot start another merge.
+                second = rebase_bot.rebase_dirty_pr(
+                    175, "WIKI-175", "WIKI-175-IMPL", gate=gate
+                )
+                release.set()
+                self.assertTrue(finished.wait(timeout=2))
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(second.get("no_op"))
 
     def test_smoke_failure_escalates_and_restores_head(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

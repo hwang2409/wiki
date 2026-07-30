@@ -9,11 +9,16 @@ the helper worker and by fixture tests without involving a model.
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import threading
+from contextlib import contextmanager
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +44,58 @@ _SEMANTIC = re.compile(
 
 class RebaseError(RuntimeError):
     """A rebase operation could not be completed safely."""
+
+
+@dataclass
+class _RebaseJob:
+    job_id: str
+    worktree: Path
+    prompt: str
+    done: threading.Event
+    helper: Callable[[Path], Mapping[str, Any]] | None = None
+    result: dict[str, Any] | None = None
+
+
+_JOB_LOCK = threading.RLock()
+_JOBS: dict[tuple[str, str], _RebaseJob] = {}
+_WORKTREE_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _job_key(
+    worktree: Path, helper: Callable[[Path], Mapping[str, Any]] | None
+) -> tuple[str, str]:
+    # Injected helpers are test and embedding hooks.  Separate their jobs so
+    # one fixture cannot consume another fixture's completed result.
+    return (str(worktree), str(id(helper)) if helper is not None else "production")
+
+
+def _thread_lock(worktree: Path) -> threading.Lock:
+    key = str(worktree)
+    with _JOB_LOCK:
+        return _WORKTREE_LOCKS.setdefault(key, threading.Lock())
+
+
+@contextmanager
+def _worktree_lock(worktree: Path):
+    """Serialize rebase jobs in this process and across backend processes."""
+
+    process_lock = _thread_lock(worktree)
+    lock_name = hashlib.sha256(str(worktree).encode("utf-8")).hexdigest()
+    lock_path = Path(tempfile.gettempdir()) / f"wiki-rebase-{lock_name}.lock"
+    with process_lock, lock_path.open("a+") as handle:
+        try:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        except (ImportError, OSError) as exc:
+            raise RebaseError(f"could not lock rebase worktree: {exc}") from exc
+        try:
+            yield
+        finally:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except (ImportError, OSError):
+                pass
 
 
 def _main() -> Any:
@@ -112,7 +169,7 @@ def _validate_pr_binding(worktree: Path, verdict: Mapping[str, Any]) -> None:
         mismatches.append(
             f"repo gate={gate_repo or 'unknown'} worktree={remote or 'unknown'}"
         )
-    tracking_ref = tracking.rsplit("/", 1)[-1] if tracking else None
+    tracking_ref = tracking.removeprefix("origin/") if tracking else None
     if (
         not isinstance(gate_ref, str)
         or not branch
@@ -146,12 +203,42 @@ def _is_import_block(ours: Sequence[str], theirs: Sequence[str]) -> bool:
 
 def _is_whitespace_only(ours: Sequence[str], theirs: Sequence[str]) -> bool:
     def normalize(line: str) -> str:
-        return "".join(line.split())
+        # Keep spaces inside literals and between tokens.  Only line endings
+        # and whitespace at the end of each line are formatting noise.
+        line = line.replace("\r\n", "\n").replace("\r", "\n")
+        return line.rstrip(" \t\n")
 
     return [normalize(line) for line in ours] == [normalize(line) for line in theirs]
 
 
-def _is_unrelated_additions(ours: Sequence[str], theirs: Sequence[str]) -> bool:
+def _declaration_key(line: str) -> str:
+    assignment = re.match(
+        r"^(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=|^([A-Za-z_][A-Za-z0-9_]*)\s*=",
+        line,
+    )
+    if assignment:
+        return next(group for group in assignment.groups() if group is not None)
+    return line
+
+
+def _added_lines(lines: Sequence[str], base: Sequence[str]) -> list[str]:
+    remaining = list(_normal_lines(base))
+    added: list[str] = []
+    for line in _normal_lines(lines):
+        if line in remaining:
+            remaining.remove(line)
+        else:
+            added.append(line)
+    return added
+
+
+def _is_unrelated_additions(
+    ours: Sequence[str], theirs: Sequence[str], base: Sequence[str] | None = None
+) -> bool:
+    # A two-way conflict cannot prove that two declarations are independent.
+    # The diff3 base stage is required for this resolution.
+    if base is None:
+        return False
     significant = _normal_lines([*ours, *theirs])
     if not significant or any(_SEMANTIC.match(line) for line in significant):
         return False
@@ -166,16 +253,26 @@ def _is_unrelated_additions(ours: Sequence[str], theirs: Sequence[str]) -> bool:
     # Comments, imports, and simple declarations are safe to retain together
     # when both sides added distinct lines to the same conflict region.  The
     # semantic keyword guard above intentionally rejects function-body edits.
-    return all(
+    if not all(
         line.startswith(("#", "//", "/*", "*", "const ", "let ", "var "))
         or bool(re.match(r"^[A-Za-z_][A-Za-z0-9_ .-]*\s*=", line))
         for line in significant
+    ):
+        return False
+    ours_added = _added_lines(ours, base)
+    theirs_added = _added_lines(theirs, base)
+    if not ours_added or not theirs_added:
+        return False
+    return set(map(_declaration_key, ours_added)).isdisjoint(
+        map(_declaration_key, theirs_added)
     )
 
 
-def _parse_conflicts(text: str) -> tuple[list[tuple[list[str], list[str]]], bool]:
+def _parse_conflicts(
+    text: str,
+) -> tuple[list[tuple[list[str], list[str] | None, list[str]]], bool]:
     lines = text.splitlines(keepends=True)
-    hunks: list[tuple[list[str], list[str]]] = []
+    hunks: list[tuple[list[str], list[str] | None, list[str]]] = []
     output: list[str] = []
     index = 0
     found = False
@@ -187,8 +284,10 @@ def _parse_conflicts(text: str) -> tuple[list[tuple[list[str], list[str]]], bool
         found = True
         index += 1
         ours: list[str] = []
-        while index < len(lines) and not _CONFLICT_MID.match(
-            lines[index].rstrip("\r\n")
+        while (
+            index < len(lines)
+            and not _CONFLICT_MID.match(lines[index].rstrip("\r\n"))
+            and not lines[index].startswith("|||||||")
         ):
             if _CONFLICT_START.match(lines[index].rstrip("\r\n")):
                 raise RebaseError("nested conflict marker")
@@ -196,6 +295,17 @@ def _parse_conflicts(text: str) -> tuple[list[tuple[list[str], list[str]]], bool
             index += 1
         if index >= len(lines):
             raise RebaseError("incomplete conflict hunk")
+        base: list[str] | None = None
+        if lines[index].startswith("|||||||"):
+            index += 1
+            base = []
+            while index < len(lines) and not _CONFLICT_MID.match(
+                lines[index].rstrip("\r\n")
+            ):
+                base.append(lines[index])
+                index += 1
+            if index >= len(lines):
+                raise RebaseError("incomplete diff3 conflict hunk")
         index += 1
         theirs: list[str] = []
         while index < len(lines) and not _CONFLICT_END.match(
@@ -206,13 +316,13 @@ def _parse_conflicts(text: str) -> tuple[list[tuple[list[str], list[str]]], bool
         if index >= len(lines):
             raise RebaseError("incomplete conflict hunk")
         index += 1
-        hunks.append((ours, theirs))
+        hunks.append((ours, base, theirs))
         output.append("\n")
     return hunks, found
 
 
 def _mechanical_resolution(
-    ours: Sequence[str], theirs: Sequence[str]
+    ours: Sequence[str], theirs: Sequence[str], base: Sequence[str] | None = None
 ) -> list[str] | None:
     def clean(line: str) -> str:
         return line.rstrip(" \t\r\n") + "\n"
@@ -222,7 +332,7 @@ def _mechanical_resolution(
     if _is_import_block(ours, theirs):
         unique = {line.strip(): line for line in [*ours, *theirs]}
         return [clean(unique[key]) for key in sorted(unique)]
-    if _is_unrelated_additions(ours, theirs):
+    if _is_unrelated_additions(ours, theirs, base):
         unique: dict[str, str] = {}
         for line in [*ours, *theirs]:
             unique.setdefault(line.strip(), line)
@@ -242,8 +352,8 @@ def resolve_conflict_file(path: Path) -> tuple[bool, str | None]:
         return True, None
 
     resolved_hunks: list[list[str]] = []
-    for ours, theirs in hunks:
-        resolution = _mechanical_resolution(ours, theirs)
+    for ours, base, theirs in hunks:
+        resolution = _mechanical_resolution(ours, theirs, base)
         if resolution is None:
             excerpt = "".join(
                 ["<<<<<<< ours\n", *ours, "=======\n", *theirs, ">>>>>>> theirs\n"]
@@ -377,7 +487,7 @@ def _restore_head(worktree: Path, initial_sha: str | None) -> None:
         _git(worktree, ["reset", "--merge", initial_sha], timeout=60)
 
 
-def run_rebase_helper(
+def _run_rebase_helper_unlocked(
     worktree: str | Path,
     *,
     smoke_commands: Sequence[tuple[Sequence[str], Path]] | None = None,
@@ -410,6 +520,14 @@ def run_rebase_helper(
             path = root / filename
             if path.name in LOCKFILES:
                 lockfiles.append(filename)
+                continue
+            diff3 = _git(
+                root, ["checkout", "--conflict=diff3", "--", filename], timeout=30
+            )
+            if diff3.returncode != 0:
+                escalated.append(
+                    f"{filename}: could not read merge-base stage for conflict proof"
+                )
                 continue
             ok, detail = resolve_conflict_file(path)
             if ok:
@@ -521,6 +639,117 @@ def run_rebase_helper(
     }
 
 
+def _cleanup_failed_rebase(root: Path, initial_sha: str | None) -> list[str]:
+    """Abort, restore, and verify a failed merge before reporting it."""
+
+    errors: list[str] = []
+    try:
+        active = _git(root, ["rev-parse", "--verify", "MERGE_HEAD"], timeout=15)
+    except RebaseError as exc:
+        errors.append(f"could not inspect merge state: {exc}")
+        active = None
+    if active is not None and active.returncode == 0:
+        try:
+            aborted = _git(root, ["merge", "--abort"], timeout=30)
+            if aborted.returncode != 0:
+                errors.append(
+                    f"merge abort failed: {(aborted.stderr or aborted.stdout).strip()[:600]}"
+                )
+        except RebaseError as exc:
+            errors.append(f"merge abort failed: {exc}")
+    try:
+        current_sha = _head_sha(root)
+    except RebaseError as exc:
+        current_sha = None
+        errors.append(f"could not inspect HEAD during cleanup: {exc}")
+    if initial_sha and current_sha != initial_sha:
+        try:
+            restored = _git(root, ["reset", "--merge", initial_sha], timeout=60)
+            if restored.returncode != 0:
+                errors.append(
+                    f"reset failed: {(restored.stderr or restored.stdout).strip()[:600]}"
+                )
+        except RebaseError as exc:
+            errors.append(f"reset failed: {exc}")
+    try:
+        final_sha = _head_sha(root)
+        if initial_sha and final_sha != initial_sha:
+            errors.append(
+                f"cleanup left HEAD at {final_sha or 'unknown'} instead of {initial_sha}"
+            )
+        status = _git(
+            root, ["status", "--porcelain", "--untracked-files=all"], timeout=15
+        )
+        if status.returncode != 0:
+            errors.append(
+                f"could not verify clean state: {status.stderr.strip()[:600]}"
+            )
+        elif status.stdout.strip():
+            errors.append(f"cleanup left worktree dirty: {status.stdout.strip()[:600]}")
+    except RebaseError as exc:
+        errors.append(f"could not verify clean state: {exc}")
+    return errors
+
+
+def _run_rebase_helper_checked(
+    worktree: str | Path,
+    *,
+    smoke_commands: Sequence[tuple[Sequence[str], Path]] | None = None,
+    push: bool = True,
+    formatter: Callable[[Path, Sequence[str]], str | None] | None = None,
+) -> dict[str, Any]:
+    """Run the merge and clean up every failed or raised operation."""
+
+    root = Path(worktree).resolve()
+    initial_sha: str | None = None
+    result: dict[str, Any] | None = None
+    try:
+        initial_sha = _head_sha(root)
+        result = _run_rebase_helper_unlocked(
+            root,
+            smoke_commands=smoke_commands,
+            push=push,
+            formatter=formatter,
+        )
+    except Exception as exc:
+        result = _escalated_result(
+            initial_sha,
+            [],
+            [f"rebase helper failed: {exc}"],
+        )
+    finally:
+        if result is None:
+            result = _escalated_result(
+                initial_sha,
+                [],
+                ["rebase helper failed without a result"],
+            )
+        if result.get("status") != "resolved":
+            cleanup_errors = _cleanup_failed_rebase(root, initial_sha)
+            if cleanup_errors:
+                result.setdefault("escalated_hunks", []).extend(cleanup_errors)
+    return result
+
+
+def run_rebase_helper(
+    worktree: str | Path,
+    *,
+    smoke_commands: Sequence[tuple[Sequence[str], Path]] | None = None,
+    push: bool = True,
+    formatter: Callable[[Path, Sequence[str]], str | None] | None = None,
+) -> dict[str, Any]:
+    """Run one serialized rebase operation in the target worktree."""
+
+    root = Path(worktree).resolve()
+    with _worktree_lock(root):
+        return _run_rebase_helper_checked(
+            root,
+            smoke_commands=smoke_commands,
+            push=push,
+            formatter=formatter,
+        )
+
+
 def _escalated_result(
     head_sha: str | None, resolved_files: Sequence[str], hunks: Sequence[str]
 ) -> dict[str, Any]:
@@ -614,6 +843,62 @@ def _escalate_to_orchestrator(
         return
 
 
+def _finish_rebase_job(
+    job: _RebaseJob,
+    *,
+    worker_id: str,
+    orchestrator: str | None,
+    steer: Callable[[str, Mapping[str, Any]], None] | None,
+) -> dict[str, Any]:
+    try:
+        if job.helper is not None:
+            with _worktree_lock(job.worktree):
+                result = dict(job.helper(job.worktree))
+        else:
+            result = dict(run_rebase_helper(job.worktree))
+    except Exception as exc:
+        try:
+            head_sha = _head_sha(job.worktree)
+        except Exception:
+            head_sha = None
+        result = _escalated_result(
+            head_sha,
+            [],
+            [f"rebase worker failed: {exc}"],
+        )
+    result["job_id"] = job.job_id
+    with _JOB_LOCK:
+        job.result = result
+        job.done.set()
+    if result.get("status") in {"resolved", "escalated"}:
+        if steer is not None:
+            steer(orchestrator or worker_id, result)
+        else:
+            _escalate_to_orchestrator(worker_id, orchestrator, result)
+    return result
+
+
+def _existing_or_new_job(
+    worktree: Path,
+    prompt: str,
+    helper: Callable[[Path], Mapping[str, Any]] | None,
+) -> tuple[_RebaseJob, bool]:
+    key = _job_key(worktree, helper)
+    with _JOB_LOCK:
+        existing = _JOBS.get(key)
+        if existing is not None:
+            return existing, False
+        job = _RebaseJob(
+            job_id=hashlib.sha256(f"{key}:{id(prompt)}".encode()).hexdigest()[:16],
+            worktree=worktree,
+            prompt=prompt,
+            done=threading.Event(),
+            helper=helper,
+        )
+        _JOBS[key] = job
+        return job, True
+
+
 def rebase_dirty_pr(
     pr_number: int,
     ticket: str,
@@ -648,13 +933,46 @@ def rebase_dirty_pr(
     worktree = Path(raw_worktree).resolve()
     _validate_pr_binding(worktree, verdict)
     orchestrator = current.get("orch") if isinstance(current.get("orch"), str) else None
-    result = dict((helper or run_rebase_helper)(worktree))
-    if result.get("status") in {"resolved", "escalated"}:
-        if steer is not None:
-            steer(orchestrator or worker_id, result)
-        else:
-            _escalate_to_orchestrator(worker_id, orchestrator, result)
-    return result
+    prompt = helper_prompt(ticket=ticket, pr_number=pr_number, worker_id=worker_id)
+    job, owner = _existing_or_new_job(worktree, prompt, helper)
+    if not owner:
+        if not job.done.wait(timeout=0 if job.result is not None else 0):
+            return {
+                "status": "running",
+                "source": "rebase-bot",
+                "job_id": job.job_id,
+                "no_op": True,
+                "joined": True,
+            }
+        return {**(job.result or {}), "no_op": True, "joined": True}
+    if helper is not None:
+        # Synchronous hooks keep deterministic callers useful.  Production
+        # requests use the worker thread below and return before the 15-second
+        # client timeout.
+        return _finish_rebase_job(
+            job,
+            worker_id=worker_id,
+            orchestrator=orchestrator,
+            steer=steer,
+        )
+    thread = threading.Thread(
+        target=_finish_rebase_job,
+        kwargs={
+            "job": job,
+            "worker_id": worker_id,
+            "orchestrator": orchestrator,
+            "steer": steer,
+        },
+        name=f"rebase-bot-{job.job_id}",
+        daemon=True,
+    )
+    thread.start()
+    return {
+        "status": "started",
+        "source": "rebase-bot",
+        "job_id": job.job_id,
+        "prompt": prompt,
+    }
 
 
 __all__ = [
