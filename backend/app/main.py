@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 from . import (
     accounts,
     backend_runtime,
+    blast_radius,
     dashboard,
     github_pr,
     github_preview,
@@ -2338,6 +2339,20 @@ def fleet_graph(limit: int = Query(default=10, ge=0, le=50)) -> dict[str, object
     """Return one bounded, normalized DAG view across the worker fleet."""
 
     return _fleet_graph_payload(limit)
+
+
+@app.get("/api/blast-radius")
+@app.get("/api/fleet/blast-radius")
+@app.get("/api/agents/blast-radius")
+def blast_radius_view(
+    candidate: str = Query(default="all", max_length=200),
+    branch: str | None = Query(default=None, max_length=200),
+    ticket: str | None = Query(default=None, max_length=80),
+) -> dict[str, Any]:
+    """Return bounded branch overlap data from the primary repository refs."""
+
+    selected = branch or ticket or candidate
+    return blast_radius.analyze(ROOT_DIR, _read_agent_registry(), selected)
 
 
 @app.get("/api/agents/{ticket}/workgraph")

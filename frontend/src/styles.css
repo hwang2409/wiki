@@ -4101,6 +4101,136 @@ body.is-resizing-panes .pane-cell {
   color: var(--accent-danger);
 }
 
+.blast-radius-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+  max-width: var(--readable-col);
+  align-self: center;
+  padding: 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  background-color: var(--background-primary-alt);
+}
+
+.agent-spawn-modal .blast-radius-panel {
+  margin-top: 16px;
+}
+
+.blast-radius-header,
+.blast-radius-collision-head,
+.blast-radius-hot-files {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.blast-radius-header {
+  justify-content: space-between;
+}
+
+.blast-radius-title {
+  color: var(--text-normal);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-small);
+  font-weight: var(--fw-semibold);
+}
+
+.blast-radius-subtitle,
+.blast-radius-muted,
+.blast-radius-error,
+.blast-radius-empty span,
+.blast-radius-hot-files > span {
+  color: var(--text-faint);
+  font-size: var(--font-ui-smaller);
+}
+
+.blast-radius-risk,
+.blast-radius-count {
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  font-variant-numeric: tabular-nums;
+}
+
+.blast-radius-risk.is-high {
+  color: var(--accent-danger);
+}
+
+.blast-radius-risk.is-medium {
+  color: var(--text-normal);
+}
+
+.blast-radius-error {
+  color: var(--accent-danger);
+}
+
+.blast-radius-empty {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 10px;
+  border: 1px dashed var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  background-color: var(--background-secondary);
+}
+
+.blast-radius-empty strong {
+  color: var(--text-normal);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-small);
+  font-weight: var(--fw-semibold);
+}
+
+.blast-radius-collisions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.blast-radius-collision {
+  padding: 8px 10px;
+  border-left: 2px solid var(--text-normal);
+  background-color: var(--background-secondary);
+}
+
+.blast-radius-collision-head {
+  color: var(--text-normal);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  overflow-wrap: anywhere;
+}
+
+.blast-radius-arrow {
+  color: var(--text-faint);
+}
+
+.blast-radius-count {
+  margin-left: auto;
+  color: var(--text-faint);
+}
+
+.blast-radius-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  margin-top: 5px;
+}
+
+.blast-radius-files code,
+.blast-radius-hot-files code {
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  overflow-wrap: anywhere;
+}
+
+.blast-radius-hot-files {
+  flex-wrap: wrap;
+  padding-top: 2px;
+}
+
 .agents-account-banner {
   display: flex;
   flex-direction: column;
