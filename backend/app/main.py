@@ -55,6 +55,7 @@ from .agent_runtime.client import (
     SupervisorUnavailable,
     replacement_prompt,
 )
+from .agent_runtime import costs
 from .agent_runtime import graph_health
 from .agent_runtime.loop_state import derive_loop_state
 from .agent_runtime.store import RuntimePaths
@@ -3428,6 +3429,22 @@ async def get_tokens(
         bucket=bucket,
         cli=cli,
         model=model,
+    )
+
+
+@app.get("/api/costs")
+async def get_costs(
+    from_ts: str | None = Query(default=None, alias="from"),
+    to_ts: str | None = Query(default=None, alias="to"),
+    ticket: str | None = None,
+) -> dict[str, object]:
+    """Incremental USD cost data from headless runtime raw event logs."""
+
+    return await asyncio.to_thread(
+        costs.query,
+        from_ts=from_ts,
+        to_ts=to_ts,
+        ticket=ticket,
     )
 
 

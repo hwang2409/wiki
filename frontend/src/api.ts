@@ -246,6 +246,50 @@ export function getDashboardTickets(signal?: AbortSignal) {
   );
 }
 
+export type CostRow = {
+  label: string;
+  input: number;
+  cached: number;
+  output: number;
+  reasoning: number;
+  total_tokens: number;
+  cost_usd: number | null;
+  unpriced_tokens: number;
+  pricing: "priced" | "unpriced" | "mixed";
+  models: string[];
+};
+
+export type CostResponse = {
+  updated_at: string | null;
+  totals: CostRow;
+  top: {
+    worker: CostRow[];
+    ticket: CostRow[];
+    orchestrator: CostRow[];
+    day: CostRow[];
+  };
+  prompt_size_distribution: { bucket: string; runs: number }[];
+  velocity: { tokens_per_minute: number; window_seconds: number; tokens: number };
+  runs_scanned: number;
+  refreshing: boolean;
+};
+
+export function getCosts(
+  params: { from?: string; to?: string; ticket?: string } = {},
+  signal?: AbortSignal,
+) {
+  const search = new URLSearchParams();
+  if (params.from) search.set("from", params.from);
+  if (params.to) search.set("to", params.to);
+  if (params.ticket) search.set("ticket", params.ticket);
+  const query = search.toString();
+  return request<CostResponse>(`/api/costs${query ? `?${query}` : ""}`, signal ? { signal } : undefined);
+}
+
+export function getTicketCosts(ticket: string, signal?: AbortSignal) {
+  return getCosts({ ticket }, signal);
+}
+
 export type SpawnWorkerKind = "cdx" | "cc";
 export type SpawnWorkerRole = "plan" | "implement" | "review";
 export type SpawnWorkerEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
