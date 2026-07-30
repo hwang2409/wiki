@@ -1068,8 +1068,6 @@ class AgentWatchTests(unittest.TestCase):
                 rollup = []
                 if scenario == "rollup-mismatch":
                     rollup = [{"__typename": "CheckRun", "name": "required", "status": "COMPLETED", "conclusion": "FAILURE"}]
-                elif scenario == "realistic-failure":
-                    rollup = [{"__typename": "CheckRun", "name": "test", "status": "COMPLETED", "conclusion": "FAILURE", "detailsUrl": "https://example.test/check"}]
                 print(json.dumps({
                     "state": state,
                     "isDraft": scenario == "draft",
@@ -1093,7 +1091,8 @@ class AgentWatchTests(unittest.TestCase):
                     raise SystemExit(1)
                 elif scenario == "realistic-failure":
                     print(json.dumps([{ "name": "test", "state": "FAILURE" }]))
-                    raise SystemExit(8)
+                    sys.stderr.write("no checks reported on the 'example/wiki' branch\\n")
+                    raise SystemExit(1)
                 elif scenario == "empty-checks-failure":
                     raise SystemExit(1)
                 else:
