@@ -76,7 +76,6 @@ In Progress:
 - [P1] WIKI-189 image artifact polish — blur-up progressive load, lazy-load below fold, click-to-lightbox (fullscreen w/ pinch/scroll zoom + pan), copy-to-clipboard, drag-to-download, EXIF strip on receive, `srcset` for retina. Fixes current jank; makes single-image inline previews feel silky
 - [P2] WIKI-192 multi-image gallery + lightbox — when artifact payload = N images (e.g. R1/R3/R7 screenshots in WIKI-172), render as responsive grid w/ captions; click any → lightbox w/ arrow-key nav + pinch-zoom. Currently a file-list dump
 - [P2] WIKI-201 markdown inline-image polish — smooth rendering of `![](url)` in agent output: loading placeholder, sized-before-load (aspect-ratio hint or naturalWidth probe), click → lightbox, respect prefers-reduced-motion
-- [P2] WIKI-178 cost dashboard — per-worker/ticket/orch/day USD, top spenders, prompt-size distribution, token velocity. Kill runaways before they burn tokens. Backend: cost aggregator over raw.jsonl. Frontend: dashboard page + per-ticket cost strip
 - [P2] WIKI-179 vault semantic search — embed vault notes (once, incrementally on write), search by meaning. Grep already exists; add embedding-backed rank. Backend: embedding store + query endpoint. Frontend: search palette upgrade w/ semantic-vs-lexical toggle
 
 Backlog:
