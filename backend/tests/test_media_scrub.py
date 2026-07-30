@@ -601,6 +601,12 @@ class Mp4Stbl_stsdStructuralTests(unittest.TestCase):
             assembled[pos - 4:pos] = struct.pack(">I", existing + len(marker))
         # Insert the marker at the end of stsd.
         assembled[stsd_end:stsd_end] = marker
+        stco_pos = assembled.find(b"stco")
+        count = struct.unpack(">I", bytes(assembled[stco_pos + 8:stco_pos + 12]))[0]
+        for index in range(count):
+            value_pos = stco_pos + 12 + index * 4
+            value = struct.unpack(">I", bytes(assembled[value_pos:value_pos + 4]))[0]
+            assembled[value_pos:value_pos + 4] = struct.pack(">I", value + len(marker))
         self.assertIn(marker, bytes(assembled))
         result = media_scrub.scrub_video(bytes(assembled), "video/mp4")
         self.assertNotIn(marker, result.data)
@@ -1896,6 +1902,12 @@ class Mp4Round9SurvivorProbes(unittest.TestCase):
             pos = payload.rfind(parent, 0, insert_before)
             existing = struct.unpack(">I", bytes(payload[pos - 4:pos]))[0]
             payload[pos - 4:pos] = struct.pack(">I", existing + delta)
+        stco_pos = payload.find(b"stco")
+        count = struct.unpack(">I", bytes(payload[stco_pos + 8:stco_pos + 12]))[0]
+        for index in range(count):
+            value_pos = stco_pos + 12 + index * 4
+            value = struct.unpack(">I", bytes(payload[value_pos:value_pos + 4]))[0]
+            payload[value_pos:value_pos + 4] = struct.pack(">I", value + delta)
         result = media_scrub.scrub_video(bytes(payload), "video/mp4")
         # v1 ctts appears in output with its version byte and negative
         # offset preserved.
@@ -2088,6 +2100,13 @@ class Mp4Round11CorrectnessProbes(unittest.TestCase):
             pos = payload.rfind(parent, 0, old_atom_start)
             existing = struct.unpack(">I", bytes(payload[pos - 4:pos]))[0]
             payload[pos - 4:pos] = struct.pack(">I", existing + delta)
+        if delta:
+            stco_pos = payload.find(b"stco")
+            count = struct.unpack(">I", bytes(payload[stco_pos + 8:stco_pos + 12]))[0]
+            for index in range(count):
+                value_pos = stco_pos + 12 + index * 4
+                value = struct.unpack(">I", bytes(payload[value_pos:value_pos + 4]))[0]
+                payload[value_pos:value_pos + 4] = struct.pack(">I", value + delta)
         return bytes(payload)
 
     def test_empty_avcc_is_rejected_for_avc1(self) -> None:
@@ -2289,6 +2308,13 @@ class Mp4Round12OwnershipAndH264Probes(unittest.TestCase):
             pos = payload.rfind(parent, 0, old_atom_start)
             existing = struct.unpack(">I", bytes(payload[pos - 4:pos]))[0]
             payload[pos - 4:pos] = struct.pack(">I", existing + delta)
+        if delta:
+            stco_pos = payload.find(b"stco")
+            count = struct.unpack(">I", bytes(payload[stco_pos + 8:stco_pos + 12]))[0]
+            for index in range(count):
+                value_pos = stco_pos + 12 + index * 4
+                value = struct.unpack(">I", bytes(payload[value_pos:value_pos + 4]))[0]
+                payload[value_pos:value_pos + 4] = struct.pack(">I", value + delta)
         return bytes(payload)
 
     @staticmethod
@@ -2359,6 +2385,32 @@ class Mp4Round12OwnershipAndH264Probes(unittest.TestCase):
         assert mdat_pos > 0
         payload[mdat_pos + 4:mdat_pos + 8] = b"\x00\x00\x00\x00"
         with self.assertRaisesRegex(media_scrub.MediaScrubError, "NAL length"):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+    def test_sample_range_past_mdat_is_rejected(self) -> None:
+        payload = bytearray(REAL_MP4.read_bytes())
+        stco_pos = payload.find(b"stco")
+        assert stco_pos > 0
+        value_pos = stco_pos + 12
+        payload[value_pos:value_pos + 4] = struct.pack(">I", len(payload) + 1)
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "not contained"):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+    def test_stsc_description_index_outside_stsd_is_rejected(self) -> None:
+        payload = bytearray(REAL_MP4.read_bytes())
+        stsc_pos = payload.find(b"stsc")
+        assert stsc_pos > 0
+        payload[stsc_pos + 20:stsc_pos + 24] = struct.pack(">I", 2)
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "description_index"):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+    def test_avc3_sample_entry_is_rejected_as_out_of_scope(self) -> None:
+        payload = bytearray(REAL_MP4.read_bytes())
+        stsd_pos = payload.find(b"stsd")
+        avc1_pos = payload.find(b"avc1", stsd_pos)
+        assert avc1_pos > stsd_pos
+        payload[avc1_pos:avc1_pos + 4] = b"avc3"
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "outside allowlist|outside scrubber scope"):
             media_scrub.scrub_video(bytes(payload), "video/mp4")
 
     def test_avcc_length_size_minus_one_two_is_rejected(self) -> None:

@@ -26,9 +26,7 @@ _MP3_BITRATE_V2_L3: Final = (
 _MP3_SAMPLE_RATE_V1: Final = (44100, 48000, 32000, 0)
 _MP3_SAMPLE_RATE_V2: Final = (22050, 24000, 16000, 0)
 _MP3_SAMPLE_RATE_V25: Final = (11025, 12000, 8000, 0)
-_MP3_CODEC_METADATA_MARKERS: Final = (
-    b"Info", b"Xing", b"LAME", b"Lavf", b"Lavc", b"x264 - core",
-)
+_MP3_XING_MAGICS: Final = (b"Info", b"Xing")
 
 
 def scrub_mp3(data: bytes) -> MediaScrubResult:
@@ -216,28 +214,14 @@ def _mp3_validate_full_frame_stream(data: bytes, start: int, end: int) -> bytes:
             )
         frame_offset = offset - start
         frame = data[offset:offset + frame_len]
-        header = frame[:4]
-        side_info_start = 4 + _mp3_side_info_length(header)
-        has_ancillary_metadata = any(
-            marker in frame[side_info_start:]
-            for marker in _MP3_CODEC_METADATA_MARKERS
-        )
-        if frames_seen == 0 and has_ancillary_metadata:
-            # The first MPEG frame's ancillary region carries Xing/Info/LAME
-            # and encoder strings. It has no decoded audio for these files.
-            rebuilt[frame_offset + side_info_start:frame_offset + frame_len] = (
-                b"\x00" * (frame_len - side_info_start)
-            )
-        for marker in _MP3_CODEC_METADATA_MARKERS:
-            marker_offset = 0
-            while True:
-                marker_offset = frame.find(marker, marker_offset)
-                if marker_offset < 0:
-                    break
-                rebuilt[frame_offset + marker_offset:frame_offset + marker_offset + len(marker)] = (
-                    b"\x00" * len(marker)
+        if frames_seen == 0:
+            header = frame[:4]
+            side_info_start = _mp3_side_info_start(header)
+            metadata_end = _mp3_xing_metadata_end(frame, side_info_start)
+            if metadata_end is not None:
+                rebuilt[frame_offset + side_info_start:frame_offset + metadata_end] = (
+                    b"\x00" * (metadata_end - side_info_start)
                 )
-                marker_offset += len(marker)
         offset += frame_len
         frames_seen += 1
     if offset != end:
@@ -256,6 +240,39 @@ def _mp3_side_info_length(header: bytes) -> int:
     if version_bits == 3:
         return 17 if mono else 32
     return 9 if mono else 17
+
+
+def _mp3_side_info_start(header: bytes) -> int:
+    crc_length = 0 if header[1] & 0x01 else 2
+    return 4 + crc_length + _mp3_side_info_length(header)
+
+
+def _mp3_xing_metadata_end(frame: bytes, start: int) -> int | None:
+    if start + 8 > len(frame):
+        return None
+    magic = frame[start:start + 4]
+    if magic == b"VBRI":
+        raise MediaScrubError("mp3 VBRI metadata is outside scrubber scope")
+    if magic not in _MP3_XING_MAGICS:
+        return None
+    flags = struct.unpack(">I", frame[start + 4:start + 8])[0]
+    offset = start + 8
+    if flags & 0x01:
+        offset += 4
+    if flags & 0x02:
+        offset += 4
+    if flags & 0x04:
+        offset += 100
+    if flags & 0x08:
+        offset += 4
+    if offset > len(frame):
+        raise MediaScrubError("mp3 Xing/Info metadata is truncated")
+    # LAME and FFmpeg write a nine-byte encoder field after the Xing
+    # records. Accept only printable ASCII or an empty padded field.
+    encoder = frame[offset:offset + 9]
+    if len(encoder) == 9 and (all(byte == 0 for byte in encoder) or all(32 <= byte < 127 for byte in encoder)):
+        return offset + 9
+    return offset
 
 
 def _mp3_frame_length(data: bytes, offset: int, end: int) -> int | None:
