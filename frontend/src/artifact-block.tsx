@@ -5,6 +5,7 @@ import {
   Copy,
   Download,
   FileJson,
+  FileText,
   GitBranch,
   Image as ImageIcon,
   Info,
@@ -48,6 +49,7 @@ const KIND_ICONS: Record<ArtifactKind, LucideIcon> = {
   diff: GitBranch,
   "file-list": FileJson,
   json: FileJson,
+  pdf: FileText,
 };
 
 
@@ -70,6 +72,8 @@ function textPayload(artifact: SessionArtifact): string {
       return typeof artifact.json_data === "string"
         ? artifact.json_data
         : JSON.stringify(artifact.json_data ?? {}, null, 2);
+    case "pdf":
+      return artifact.ref ?? "";
   }
 }
 
@@ -104,6 +108,7 @@ function downloadName(event: SessionEvent): string {
     diff: "diff",
     "file-list": "txt",
     json: "json",
+    pdf: "pdf",
   }[effectiveKind];
   return `${base}.${extension}`;
 }
@@ -155,6 +160,7 @@ export function artifactExceedsInlineThreshold(
         : JSON.stringify(artifact.json_data ?? "");
       return text.length > 4000;
     }
+    case "pdf": return true;
   }
 }
 
@@ -269,17 +275,23 @@ export function ArtifactBlock({
   }
 
   async function copy() {
-    const value =
-      resolvedArtifact.kind === "image" && !resolvedArtifact.data_base64
-        ? await imageBase64(artifactUrl(ticket, event))
-        : textPayload(resolvedArtifact);
+    const needsBinaryFetch =
+      (resolvedArtifact.kind === "image" && !resolvedArtifact.data_base64) ||
+      resolvedArtifact.kind === "pdf";
+    const value = needsBinaryFetch
+      ? await imageBase64(artifactUrl(ticket, event))
+      : textPayload(resolvedArtifact);
     await navigator.clipboard.writeText(value);
     showCopied();
   }
 
   async function download() {
     let blob: Blob;
-    if (resolvedArtifact.kind === "image" && !resolvedArtifact.data_base64) {
+    if (resolvedArtifact.kind === "pdf") {
+      const response = await fetch(artifactUrl(ticket, event));
+      if (!response.ok) throw new Error(`PDF download failed (${response.status})`);
+      blob = await response.blob();
+    } else if (resolvedArtifact.kind === "image" && !resolvedArtifact.data_base64) {
       const response = await fetch(artifactUrl(ticket, event));
       if (!response.ok) throw new Error(`Image download failed (${response.status})`);
       blob = await response.blob();
