@@ -78,29 +78,34 @@ test("polling does not overlap: next fetch waits for prior completion", async ()
 
 test("successful cost polling makes one request per interval tick", async () => {
   vi.useFakeTimers();
-  const fetchCosts = vi.fn(async () => EMPTY_COSTS);
-  render(
-    <DashboardView
-      fetchTickets={async () => EMPTY_PAYLOAD}
-      fetchCosts={fetchCosts}
-      pollMs={5_000}
-    />
-  );
-
-  await act(async () => {
-    await Promise.resolve();
+  const originalFetch = globalThis.fetch;
+  const costRequests = vi.fn();
+  const transport = vi.fn(async (input: RequestInfo | URL) => {
+    if (String(input) === "/api/costs") costRequests();
+    return { ok: true, json: async () => EMPTY_COSTS } as Response;
   });
-  expect(fetchCosts).toHaveBeenCalledTimes(1);
+  globalThis.fetch = transport as typeof fetch;
+  try {
+    render(<DashboardView fetchTickets={async () => EMPTY_PAYLOAD} pollMs={5_000} />);
 
-  await act(async () => {
-    await vi.advanceTimersByTimeAsync(5_000);
-  });
-  expect(fetchCosts).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(costRequests).toHaveBeenCalledTimes(1);
 
-  await act(async () => {
-    await vi.advanceTimersByTimeAsync(5_000);
-  });
-  expect(fetchCosts).toHaveBeenCalledTimes(3);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_000);
+    });
+    expect(costRequests).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_000);
+    });
+    expect(costRequests).toHaveBeenCalledTimes(3);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("unmount aborts inflight fetch", async () => {
