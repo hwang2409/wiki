@@ -50,7 +50,7 @@ from dataclasses import dataclass
 from typing import Final
 
 from .base import MediaScrubError, MediaScrubResult
-from ._h264 import canonicalise_nal
+from ._h264 import canonicalise_nal_with_ids
 
 
 @dataclass(frozen=True)
@@ -112,6 +112,13 @@ def scrub_mp4(data: bytes) -> MediaScrubResult:
     if top_atoms[0].size < 16:
         raise MediaScrubError("mp4 ftyp too small")
 
+    try:
+        sample_ranges = _collect_sample_ranges(data, top_atoms)
+    except MediaScrubError:
+        # Let the normal moov rebuild report malformed table fields in its
+        # existing order. A malformed offset is not an owned mdat range.
+        sample_ranges = []
+
     ftyp = _rebuild_ftyp(data, top_atoms[0])
     if len(ftyp) != top_atoms[0].size:
         raise MediaScrubError("mp4 ftyp rebuild size mismatch")
@@ -154,7 +161,14 @@ def scrub_mp4(data: bytes) -> MediaScrubResult:
             if body_len == 0:
                 raise MediaScrubError("mp4 mdat body is empty")
             mdat_non_empty = True
-            out_parts.append(data[atom.start:atom.body_end])
+            scrubbed_body = bytearray(body_len)
+            for sample_start, sample_end in sample_ranges:
+                if sample_start < atom.body_start or sample_end > atom.body_end:
+                    continue
+                start = sample_start - atom.body_start
+                end = sample_end - atom.body_start
+                scrubbed_body[start:end] = data[sample_start:sample_end]
+            out_parts.append(data[atom.start:atom.body_start] + scrubbed_body)
         elif atom.type == b"sidx":
             # Round-7 review: sidx body was copied through opaquely. Now
             # rebuilt from parsed uint fields. If the rebuilt size differs
@@ -216,6 +230,128 @@ def scrub_mp4(data: bytes) -> MediaScrubResult:
         width=width,
         height=height,
     )
+
+
+def _collect_sample_ranges(
+    data: bytes, top_atoms: list[_Mp4Atom],
+) -> list[tuple[int, int]]:
+    """Return absolute byte ranges owned by all non-fragmented samples."""
+    ranges: list[tuple[int, int]] = []
+    for moov in (atom for atom in top_atoms if atom.type == b"moov"):
+        for trak in _parse_container(data, moov.body_start, moov.body_end):
+            if trak.type != b"trak":
+                continue
+            for mdia in _parse_container(data, trak.body_start, trak.body_end):
+                if mdia.type != b"mdia":
+                    continue
+                for minf in _parse_container(data, mdia.body_start, mdia.body_end):
+                    if minf.type != b"minf":
+                        continue
+                    for stbl in _parse_container(data, minf.body_start, minf.body_end):
+                        if stbl.type == b"stbl":
+                            ranges.extend(
+                                _collect_sample_ranges_from_stbl(
+                                    data, stbl.body_start, stbl.body_end,
+                                )
+                            )
+    return ranges
+
+
+def _collect_sample_ranges_from_stbl(
+    data: bytes, body_start: int, body_end: int,
+) -> list[tuple[int, int]]:
+    tables = {
+        atom.type: atom
+        for atom in _parse_container(data, body_start, body_end)
+        if atom.type in {b"stsc", b"stsz", b"stco", b"co64"}
+    }
+    if not tables:
+        return []
+    if b"stsc" not in tables or b"stsz" not in tables:
+        raise MediaScrubError("mp4 sample tables missing stsc or stsz")
+    if b"stco" in tables and b"co64" in tables:
+        raise MediaScrubError("mp4 sample tables carry both stco and co64")
+    offset_atom = tables.get(b"stco") or tables.get(b"co64")
+    if offset_atom is None:
+        raise MediaScrubError("mp4 sample tables missing stco or co64")
+
+    def fullbox_body(atom: _Mp4Atom, label: str) -> bytes:
+        body = data[atom.body_start:atom.body_end]
+        if len(body) < 8 or body[0] != 0 or body[1:4] != _CANONICAL_FULLBOX_FLAGS:
+            raise MediaScrubError(f"mp4 {label} has non-canonical fullbox header")
+        return body
+
+    stsc_body = fullbox_body(tables[b"stsc"], "stsc")
+    stsc_count = struct.unpack(">I", stsc_body[4:8])[0]
+    if len(stsc_body) != 8 + stsc_count * 12 or stsc_count == 0:
+        raise MediaScrubError("mp4 stsc body length does not match entries")
+    stsc_entries: list[tuple[int, int]] = []
+    offset = 8
+    previous_first_chunk = 0
+    for _ in range(stsc_count):
+        first_chunk, samples_per_chunk, description_index = struct.unpack(
+            ">III", stsc_body[offset:offset + 12]
+        )
+        if (
+            first_chunk == 0
+            or first_chunk <= previous_first_chunk
+            or samples_per_chunk == 0
+            or description_index == 0
+        ):
+            raise MediaScrubError("mp4 stsc entries are invalid")
+        stsc_entries.append((first_chunk, samples_per_chunk))
+        previous_first_chunk = first_chunk
+        offset += 12
+
+    offset_body = fullbox_body(offset_atom, offset_atom.type.decode("ascii"))
+    chunk_count = struct.unpack(">I", offset_body[4:8])[0]
+    offset_width = 4 if offset_atom.type == b"stco" else 8
+    if len(offset_body) != 8 + chunk_count * offset_width:
+        raise MediaScrubError("mp4 chunk offset table length does not match entries")
+    chunk_offsets = [
+        int.from_bytes(
+            offset_body[8 + index * offset_width:8 + (index + 1) * offset_width],
+            "big",
+        )
+        for index in range(chunk_count)
+    ]
+
+    stsz_body = fullbox_body(tables[b"stsz"], "stsz")
+    if len(stsz_body) < 12:
+        raise MediaScrubError("mp4 stsz body too short")
+    sample_size, sample_count = struct.unpack(">II", stsz_body[4:12])
+    if sample_size:
+        if len(stsz_body) != 12:
+            raise MediaScrubError("mp4 uniform stsz body has trailing bytes")
+        sample_sizes = [sample_size] * sample_count
+    else:
+        if len(stsz_body) != 12 + sample_count * 4:
+            raise MediaScrubError("mp4 stsz sample-size table length does not match entries")
+        sample_sizes = [
+            struct.unpack(">I", stsz_body[12 + index * 4:16 + index * 4])[0]
+            for index in range(sample_count)
+        ]
+
+    ranges = []
+    sample_index = 0
+    for chunk_number, chunk_start in enumerate(chunk_offsets, start=1):
+        matching = [
+            entry for entry in stsc_entries if entry[0] <= chunk_number
+        ]
+        if not matching:
+            raise MediaScrubError("mp4 stsc does not describe every chunk")
+        samples_per_chunk = matching[-1][1]
+        if sample_index + samples_per_chunk > sample_count:
+            raise MediaScrubError("mp4 stsc describes more samples than stsz")
+        sample_start = chunk_start
+        for sample_size_value in sample_sizes[sample_index:sample_index + samples_per_chunk]:
+            sample_end = sample_start + sample_size_value
+            ranges.append((sample_start, sample_end))
+            sample_start = sample_end
+        sample_index += samples_per_chunk
+    if sample_index != sample_count:
+        raise MediaScrubError("mp4 stsc does not describe every stsz sample")
+    return ranges
 
 
 # ---------------------------------------------------------------------------
@@ -1333,12 +1469,17 @@ def _rebuild_inner_avcC(
     lsm_byte = body[4]
     if lsm_byte & 0xFC != 0xFC:
         raise MediaScrubError("mp4 avcC reserved bits above lengthSizeMinusOne non-set")
+    if (lsm_byte & 0x03) not in (0, 1, 3):
+        raise MediaScrubError(
+            "mp4 avcC lengthSizeMinusOne must be 0, 1, or 3"
+        )
     num_sps_byte = body[5]
     if num_sps_byte & 0xE0 != 0xE0:
         raise MediaScrubError("mp4 avcC reserved bits above numOfSequenceParameterSets non-set")
     num_sps = num_sps_byte & 0x1F
     offset = 6
     sps_list: list[bytes] = []
+    sps_ids: set[int] = set()
     for _ in range(num_sps):
         if offset + 2 > len(body):
             raise MediaScrubError("mp4 avcC SPS length field truncated")
@@ -1346,16 +1487,20 @@ def _rebuild_inner_avcC(
         offset += 2
         if offset + sps_len > len(body):
             raise MediaScrubError("mp4 avcC SPS body extends past avcC")
-        canonical = canonicalise_nal(body[offset:offset + sps_len], expected_nal_type=7)
+        canonical, sps_id, _ = canonicalise_nal_with_ids(
+            body[offset:offset + sps_len], expected_nal_type=7,
+        )
         if len(canonical) > 0xFFFF:
             raise MediaScrubError("mp4 avcC canonical SPS exceeds uint16 length")
         sps_list.append(canonical)
+        sps_ids.add(sps_id)
         offset += sps_len
     if offset >= len(body):
         raise MediaScrubError("mp4 avcC missing numOfPictureParameterSets byte")
     num_pps = body[offset]
     offset += 1
     pps_list: list[bytes] = []
+    pps_sps_ids: list[int] = []
     for _ in range(num_pps):
         if offset + 2 > len(body):
             raise MediaScrubError("mp4 avcC PPS length field truncated")
@@ -1363,16 +1508,25 @@ def _rebuild_inner_avcC(
         offset += 2
         if offset + pps_len > len(body):
             raise MediaScrubError("mp4 avcC PPS body extends past avcC")
-        canonical = canonicalise_nal(body[offset:offset + pps_len], expected_nal_type=8)
+        canonical, _pps_id, pps_sps_id = canonicalise_nal_with_ids(
+            body[offset:offset + pps_len], expected_nal_type=8,
+        )
         if len(canonical) > 0xFFFF:
             raise MediaScrubError("mp4 avcC canonical PPS exceeds uint16 length")
         pps_list.append(canonical)
+        if pps_sps_id is None:
+            raise MediaScrubError("mp4 PPS did not return an SPS identifier")
+        pps_sps_ids.append(pps_sps_id)
         offset += pps_len
 
     if require_parameter_sets and not sps_list:
         raise MediaScrubError("mp4 avc1 avcC requires at least one SPS")
     if require_parameter_sets and not pps_list:
         raise MediaScrubError("mp4 avc1 avcC requires at least one PPS")
+    if require_parameter_sets and any(sps_id not in sps_ids for sps_id in pps_sps_ids):
+        raise MediaScrubError(
+            "mp4 avc1 PPS references an SPS identifier absent from avcC"
+        )
 
     if sps_list:
         # Multiple-SPS rule: every canonical SPS must share the first SPS's

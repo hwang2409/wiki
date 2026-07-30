@@ -12,9 +12,8 @@ scrub, and both are re-serialized from parsed fields:
 
 Everything else — Comment (0xFE), Plain Text (0x01), XMP, Adobe, and every
 other Application Extension — is dropped. Image data (0x2C) is not an
-extension and passes through with its sub-block chain validated but its
-LZW-compressed data untouched (that IS the pixel stream we exist to
-preserve).
+extension and is decoded through EOI, then re-encoded from its validated
+pixel indices.
 """
 from __future__ import annotations
 
@@ -259,6 +258,127 @@ def _rebuild_extension(label: int, sub_blocks: list[bytes]) -> bytes | None:
     return None
 
 
+def _read_gif_lzw_code(data: bytes, bit_offset: int, width: int) -> tuple[int, int]:
+    if bit_offset + width > len(data) * 8:
+        raise MediaScrubError("gif LZW stream ends before EOI")
+    value = 0
+    for shift in range(width):
+        value |= ((data[(bit_offset + shift) // 8] >> ((bit_offset + shift) % 8)) & 1) << shift
+    return value, bit_offset + width
+
+
+def _decode_gif_lzw(
+    compressed: bytes,
+    min_code_size: int,
+    expected_pixels: int,
+) -> list[int]:
+    if not 2 <= min_code_size <= 8:
+        raise MediaScrubError("gif LZW minimum code size outside 2..8")
+    clear_code = 1 << min_code_size
+    eoi_code = clear_code + 1
+    code_size = min_code_size + 1
+    next_code = clear_code + 2
+    dictionary = {index: bytes([index]) for index in range(clear_code)}
+    bit_offset = 0
+    pixels: list[int] = []
+    previous: bytes | None = None
+    saw_clear = False
+    while True:
+        code, bit_offset = _read_gif_lzw_code(compressed, bit_offset, code_size)
+        if code == clear_code:
+            dictionary = {index: bytes([index]) for index in range(clear_code)}
+            code_size = min_code_size + 1
+            next_code = clear_code + 2
+            previous = None
+            saw_clear = True
+            continue
+        if code == eoi_code:
+            if not saw_clear:
+                raise MediaScrubError("gif LZW stream has no clear code")
+            break
+        if not saw_clear or previous is None and code >= clear_code:
+            raise MediaScrubError("gif LZW stream has invalid first data code")
+        if code < clear_code:
+            entry = bytes([code])
+        elif code in dictionary:
+            entry = dictionary[code]
+        elif code == next_code and previous is not None:
+            entry = previous + previous[:1]
+        else:
+            raise MediaScrubError("gif LZW stream references an undefined code")
+        pixels.extend(entry)
+        if len(pixels) > expected_pixels:
+            raise MediaScrubError("gif LZW stream emits more pixels than the image size")
+        if previous is not None and next_code < 4096:
+            dictionary[next_code] = previous + entry[:1]
+            next_code += 1
+            if next_code == (1 << code_size) and code_size < 12:
+                code_size += 1
+        previous = entry
+    # Some legacy GIFs end after a short final row. Preserve those accepted
+    # streams while still rejecting data that would write past the image.
+    return pixels
+
+
+def _encode_gif_lzw(pixels: list[int], min_code_size: int) -> bytes:
+    clear_code = 1 << min_code_size
+    eoi_code = clear_code + 1
+    dictionary = {bytes([index]): index for index in range(clear_code)}
+    code_size = min_code_size + 1
+    next_code = clear_code + 2
+    grow_pending = False
+    coded: list[tuple[int, int]] = [(clear_code, code_size)]
+    if pixels:
+        current = bytes([pixels[0]])
+        for pixel in pixels[1:]:
+            candidate = current + bytes([pixel])
+            if candidate in dictionary:
+                current = candidate
+                continue
+            coded.append((dictionary[current], code_size))
+            if grow_pending:
+                code_size += 1
+                grow_pending = False
+            if next_code < 4096:
+                dictionary[candidate] = next_code
+                next_code += 1
+                if next_code == (1 << code_size) and code_size < 12:
+                    grow_pending = True
+            else:
+                coded.append((clear_code, code_size))
+                dictionary = {bytes([index]): index for index in range(clear_code)}
+                code_size = min_code_size + 1
+                next_code = clear_code + 2
+                grow_pending = False
+            current = bytes([pixel])
+        coded.append((dictionary[current], code_size))
+    coded.append((eoi_code, code_size))
+
+    output = bytearray()
+    bit_offset = 0
+    for code, width in coded:
+        for shift in range(width):
+            if bit_offset % 8 == 0:
+                output.append(0)
+            output[-1] |= ((code >> shift) & 1) << (bit_offset % 8)
+            bit_offset += 1
+    return bytes(output)
+
+
+def _rebuild_gif_lzw(
+    blocks: list[bytes], min_code_size: int, expected_pixels: int,
+) -> bytes:
+    pixels = _decode_gif_lzw(b"".join(blocks), min_code_size, expected_pixels)
+    compressed = _encode_gif_lzw(pixels, min_code_size)
+    output = bytearray([min_code_size])
+    for offset in range(0, len(compressed), 255):
+        block = compressed[offset:offset + 255]
+        output.append(len(block))
+        output.extend(block)
+    output.append(0)
+    return bytes(output)
+
+
 def _emit_image_descriptor(
     data: bytes, offset: int, end: int, out: bytearray,
     *,
@@ -267,12 +387,8 @@ def _emit_image_descriptor(
 ) -> int:
     """Emit the image descriptor + local color table + LZW image data.
 
-    Every field is parsed from validated positions; the LZW-compressed
-    image data is bounded by its sub-block chain (validated in the walk)
-    and IS the pixel stream we exist to preserve. Sub-block terminators
-    and boundaries are re-emitted from the parsed structure; the pixel
-    bytes themselves must remain byte-identical because they encode the
-    image the caller asked us to store.
+    Every field is parsed from validated positions. The LZW stream is
+    decoded through EOI and rebuilt from the validated pixel indices.
 
     Round-10 review: any preceding Graphic Control Extension is validated
     against this image's active color table (LCT if present, else GCT)
@@ -329,20 +445,23 @@ def _emit_image_descriptor(
     out.append(local_packed_canonical)
     if local_ct_size:
         out.extend(data[lct_start:lct_start + local_ct_size])
-    out.append(lzw_min_code_size)
-    # LZW sub-block chain: emit each parsed sub-block header + body, then
-    # terminator. Bodies are pixel data (indexed colours) that must survive
-    # byte-identical to preserve the image.
+    # Decode the image stream through EOI, then emit one deterministic,
+    # canonical stream. Bytes in sub-blocks after EOI are not pixel data.
+    lzw_blocks: list[bytes] = []
     sub_offset = data_start + 1
     while sub_offset < end:
         length = data[sub_offset]
         sub_offset += 1
-        out.append(length)
         if length == 0:
+            out.extend(_rebuild_gif_lzw(
+                lzw_blocks,
+                lzw_min_code_size,
+                img_w * img_h,
+            ))
             return sub_offset
         block_end = sub_offset + length
         if block_end > end:
             raise MediaScrubError("gif image sub-block extends past payload")
-        out.extend(data[sub_offset:block_end])
+        lzw_blocks.append(data[sub_offset:block_end])
         sub_offset = block_end
     raise MediaScrubError("gif image sub-block chain missing terminator")

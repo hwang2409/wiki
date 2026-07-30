@@ -19,8 +19,6 @@ Scope choices:
 """
 from __future__ import annotations
 
-from typing import Callable
-
 from .base import MediaScrubError
 
 
@@ -305,7 +303,7 @@ def _copy_vui_parameters(reader: _BitReader, writer: _BitWriter) -> None:
         writer.write_ue(reader.read_ue())  # max_dec_frame_buffering
 
 
-def _parse_and_emit_sps_rbsp(rbsp: bytes) -> bytes:
+def _parse_and_emit_sps_rbsp(rbsp: bytes) -> tuple[bytes, int]:
     reader = _BitReader(rbsp)
     writer = _BitWriter()
 
@@ -392,10 +390,10 @@ def _parse_and_emit_sps_rbsp(rbsp: bytes) -> bytes:
 
     reader.read_rbsp_trailing_bits()
     writer.write_rbsp_trailing_bits()
-    return writer.to_bytes()
+    return writer.to_bytes(), sps_id
 
 
-def _parse_and_emit_pps_rbsp(rbsp: bytes) -> bytes:
+def _parse_and_emit_pps_rbsp(rbsp: bytes) -> tuple[bytes, int, int]:
     reader = _BitReader(rbsp)
     writer = _BitWriter()
 
@@ -469,13 +467,13 @@ def _parse_and_emit_pps_rbsp(rbsp: bytes) -> bytes:
 
     reader.read_rbsp_trailing_bits()
     writer.write_rbsp_trailing_bits()
-    return writer.to_bytes()
+    return writer.to_bytes(), pps_id, sps_id
 
 
-def canonicalise_nal(nal_bytes: bytes, expected_nal_type: int) -> bytes:
-    """Parse a NAL, validate its type, decode + re-encode the RBSP, return
-    the canonical NAL byte stream (header byte + escaped RBSP).
-    """
+def canonicalise_nal_with_ids(
+    nal_bytes: bytes, expected_nal_type: int,
+) -> tuple[bytes, int, int | None]:
+    """Canonicalise an SPS or PPS and return its parameter-set identifiers."""
     if len(nal_bytes) < 1:
         raise MediaScrubError("h264 NAL too short for header")
     header = nal_bytes[0]
@@ -492,14 +490,28 @@ def canonicalise_nal(nal_bytes: bytes, expected_nal_type: int) -> bytes:
     if not rbsp:
         raise MediaScrubError("h264 RBSP is empty after unescape")
 
-    emit: Callable[[bytes], bytes]
-    if expected_nal_type == 7:      # SPS
-        emit = _parse_and_emit_sps_rbsp
-    elif expected_nal_type == 8:    # PPS
-        emit = _parse_and_emit_pps_rbsp
-    else:
-        raise MediaScrubError(f"h264 canonicalise: unsupported NAL type {expected_nal_type}")
+    if expected_nal_type == 7:
+        new_rbsp, sps_id = _parse_and_emit_sps_rbsp(rbsp)
+        return (
+            bytes([(nal_ref_idc << 5) | nal_type]) + _rbsp_escape(new_rbsp),
+            sps_id,
+            None,
+        )
+    if expected_nal_type == 8:
+        new_rbsp, pps_id, sps_id = _parse_and_emit_pps_rbsp(rbsp)
+        return (
+            bytes([(nal_ref_idc << 5) | nal_type]) + _rbsp_escape(new_rbsp),
+            pps_id,
+            sps_id,
+        )
+    raise MediaScrubError(f"h264 canonicalise: unsupported NAL type {expected_nal_type}")
 
-    new_rbsp = emit(rbsp)
-    canonical_header = bytes([(nal_ref_idc << 5) | nal_type])
-    return canonical_header + _rbsp_escape(new_rbsp)
+
+def canonicalise_nal(nal_bytes: bytes, expected_nal_type: int) -> bytes:
+    """Parse a NAL, validate its type, decode + re-encode the RBSP, return
+    the canonical NAL byte stream (header byte + escaped RBSP).
+    """
+    canonical, _first_id, _second_id = canonicalise_nal_with_ids(
+        nal_bytes, expected_nal_type,
+    )
+    return canonical

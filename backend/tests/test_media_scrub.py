@@ -2252,6 +2252,104 @@ class GifRound10GCEProbes(unittest.TestCase):
         self.assertEqual(result.data[gce_pos + 6], 1)
 
 
+class GifRound12LzwProbes(unittest.TestCase):
+    def test_lzw_sub_blocks_after_eoi_are_dropped(self) -> None:
+        marker = b"round12-gif-lzw-after-eoi-secret"
+        image_desc = b"\x2c" + struct.pack("<HHHH", 0, 0, 4, 2) + b"\x00"
+        # clear, one pixel, EOI; the next sub-block is not part of the
+        # compressed stream and must not reach the stored artifact.
+        lzw = b"\x02\x02\x44\x01" + bytes([len(marker)]) + marker + b"\x00"
+        payload = b"GIF89a" + struct.pack("<HH", 4, 2) + b"\x00\x00\x00" + image_desc + lzw + b"\x3b"
+        result = media_scrub.scrub_video(payload, "image/gif")
+        self.assertNotIn(marker, result.data)
+
+
+class Mp4Round12OwnershipAndH264Probes(unittest.TestCase):
+    @staticmethod
+    def _replace_avcc(real: bytes, body: bytes) -> bytes:
+        avcc_pos = real.find(b"avcC")
+        assert avcc_pos > 0
+        old_size = struct.unpack(">I", real[avcc_pos - 4:avcc_pos])[0]
+        replacement = struct.pack(">I", 8 + len(body)) + b"avcC" + body
+        old_atom_start = avcc_pos - 4
+        payload = bytearray(real)
+        payload[old_atom_start:old_atom_start + old_size] = replacement
+        delta = len(replacement) - old_size
+        for parent in (b"avc1", b"stsd", b"stbl", b"minf", b"mdia", b"trak", b"moov"):
+            pos = payload.rfind(parent, 0, old_atom_start)
+            existing = struct.unpack(">I", bytes(payload[pos - 4:pos]))[0]
+            payload[pos - 4:pos] = struct.pack(">I", existing + delta)
+        return bytes(payload)
+
+    @staticmethod
+    def _set_pps_sps_id(nal: bytes, sps_id: int) -> bytes:
+        bits = "".join(f"{byte:08b}" for byte in nal[1:])
+
+        def read_ue(position: int) -> tuple[str, int]:
+            start = position
+            zeros = 0
+            while bits[position] == "0":
+                zeros += 1
+                position += 1
+            position += 1 + zeros
+            return bits[start:position], position
+
+        first_code, position = read_ue(0)
+        _second_code, position = read_ue(position)
+        code_number = sps_id + 1
+        code_width = code_number.bit_length()
+        replacement = first_code + ("0" * (code_width - 1) + f"{code_number:0{code_width}b}") + bits[position:]
+        replacement = replacement[:len(bits)]
+        return nal[:1] + bytes(
+            int(replacement[index:index + 8], 2)
+            for index in range(0, len(replacement), 8)
+        )
+
+    def test_mdat_unreferenced_bytes_are_zeroed(self) -> None:
+        real = REAL_MP4.read_bytes()
+        marker = b"round12-mdat-unreferenced-secret"
+        mdat_pos = real.find(b"mdat")
+        assert mdat_pos > 0
+        mdat_start = mdat_pos - 4
+        mdat_size = struct.unpack(">I", real[mdat_start:mdat_pos])[0]
+        payload = bytearray(real)
+        payload[mdat_start:mdat_pos] = struct.pack(">I", mdat_size + len(marker))
+        payload[mdat_start + mdat_size:mdat_start + mdat_size] = marker
+        result = media_scrub.scrub_video(bytes(payload), "video/mp4")
+        marker_start = mdat_start + mdat_size
+        self.assertEqual(result.data[marker_start:marker_start + len(marker)], b"\x00" * len(marker))
+
+    def test_avcc_length_size_minus_one_two_is_rejected(self) -> None:
+        real = bytearray(REAL_MP4.read_bytes())
+        avcc_pos = real.find(b"avcC")
+        assert avcc_pos > 0
+        real[avcc_pos + 8] = (real[avcc_pos + 8] & 0xFC) | 0x02
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "lengthSizeMinusOne must be 0, 1, or 3"
+        ):
+            media_scrub.scrub_video(bytes(real), "video/mp4")
+
+    def test_avc1_pps_reference_to_missing_sps_is_rejected(self) -> None:
+        real = REAL_MP4.read_bytes()
+        avcc_pos = real.find(b"avcC")
+        assert avcc_pos > 0
+        old_size = struct.unpack(">I", real[avcc_pos - 4:avcc_pos])[0]
+        body = real[avcc_pos + 4:avcc_pos - 4 + old_size]
+        offset = 6
+        for _ in range(body[5] & 0x1F):
+            sps_len = struct.unpack(">H", body[offset:offset + 2])[0]
+            offset += 2 + sps_len
+        pps_len = struct.unpack(">H", body[offset + 1:offset + 3])[0]
+        pps_start = offset + 3
+        pps = body[pps_start:pps_start + pps_len]
+        bad_pps = self._set_pps_sps_id(pps, 1)
+        bad_body = body[:pps_start] + bad_pps + body[pps_start + pps_len:]
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "PPS references an SPS identifier absent"
+        ):
+            media_scrub.scrub_video(self._replace_avcc(real, bad_body), "video/mp4")
+
+
 _GCE_TRANSPARENT_FLAG = 0x01
 
 
