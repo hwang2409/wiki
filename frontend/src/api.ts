@@ -675,11 +675,8 @@ export type SessionArtifact = {
     | "image/webp"
     | "image/gif"
     | "video/mp4"
-    | "video/webm"
     | "audio/wav"
-    | "audio/mpeg"
-    | "audio/webm"
-    | "audio/ogg";
+    | "audio/mpeg";
   byte_size?: number;
   data_base64?: string;
   width?: number;
@@ -687,6 +684,8 @@ export type SessionArtifact = {
   preview_base64?: string;
   duration_ms?: number;
   transcript?: string;
+  poster_base64?: string;
+  peaks?: number[];
   columns?: ArtifactColumn[];
   rows?: (string | number | boolean | null)[][];
   spec_vega_lite?: Record<string, unknown>;

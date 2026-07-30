@@ -33,18 +33,10 @@ def _fixture_png_bytes() -> bytes:
 FIXTURE_PNG_BYTES = _fixture_png_bytes()
 
 
-def _fixture_mp4_bytes() -> bytes:
-    from backend.tests.test_media_scrub import _minimal_mp4  # local fixture
-    return _minimal_mp4(with_gps=False)
+from backend.tests.test_media_scrub import REAL_MP4, REAL_WAV
 
-
-def _fixture_wav_bytes() -> bytes:
-    from backend.tests.test_media_scrub import _wav_bytes
-    return _wav_bytes()
-
-
-FIXTURE_MP4_BYTES = _fixture_mp4_bytes()
-FIXTURE_WAV_BYTES = _fixture_wav_bytes()
+FIXTURE_MP4_BYTES = REAL_MP4.read_bytes()
+FIXTURE_WAV_BYTES = REAL_WAV.read_bytes()
 
 
 def _payload(kind: str) -> dict:
@@ -182,9 +174,10 @@ class WikiArtifactsTests(unittest.TestCase):
                 elif kind == "video":
                     self.assertNotIn("data_base64", event["artifact"])
                     self.assertEqual(event["artifact"]["mime"], "video/mp4")
-                    self.assertEqual(event["artifact"]["duration_ms"], 2500)
-                    self.assertEqual(event["artifact"]["width"], 320)
-                    self.assertEqual(event["artifact"]["height"], 240)
+                    # Real fixture: 160x120, ~0.5s runtime.
+                    self.assertEqual(event["artifact"]["width"], 160)
+                    self.assertEqual(event["artifact"]["height"], 120)
+                    self.assertGreater(event["artifact"]["duration_ms"], 0)
                     video = (
                         self.root
                         / "runtime"
@@ -318,6 +311,78 @@ class WikiArtifactsTests(unittest.TestCase):
             wiki_artifacts.ArtifactValidationError, "audio transcript exceeds"
         ):
             wiki_artifacts.render_artifact({"kind": "audio", "payload": payload})
+
+    def test_video_accepts_path_payload_alongside_data_base64(self) -> None:
+        # Reject "both" and "neither".
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError, "exactly one"
+        ):
+            wiki_artifacts.render_artifact(
+                {"kind": "video", "payload": {"mime": "video/mp4"}}
+            )
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError, "exactly one"
+        ):
+            wiki_artifacts.render_artifact(
+                {
+                    "kind": "video",
+                    "payload": {
+                        "mime": "video/mp4",
+                        "data_base64": base64.b64encode(FIXTURE_MP4_BYTES).decode(),
+                        "path": str(self.root),
+                    },
+                }
+            )
+        # Accept a path inside the allowed roots.
+        runtime_root = self.root / "runtime"
+        runtime_root.mkdir(exist_ok=True)
+        mp4_path = runtime_root / "path-fixture.mp4"
+        mp4_path.write_bytes(FIXTURE_MP4_BYTES)
+        event = wiki_artifacts.render_artifact(
+            {
+                "kind": "video",
+                "payload": {"mime": "video/mp4", "path": str(mp4_path)},
+            }
+        )
+        self.assertEqual(event["artifact"]["mime"], "video/mp4")
+
+    def test_audio_normalizes_bounded_peaks_array(self) -> None:
+        payload = {
+            "data_base64": base64.b64encode(FIXTURE_WAV_BYTES).decode(),
+            "mime": "audio/wav",
+        }
+        event = wiki_artifacts.render_artifact({"kind": "audio", "payload": payload})
+        peaks = event["artifact"].get("peaks")
+        self.assertIsInstance(peaks, list)
+        self.assertLessEqual(len(peaks), 512)
+        self.assertTrue(any(peak > 0 for peak in peaks))
+
+    def test_video_accepts_scrubbed_poster_frame(self) -> None:
+        import io as pil_io
+        buffer = pil_io.BytesIO()
+        Image.new("RGB", (160, 120), color=(10, 20, 30)).save(buffer, format="PNG")
+        poster_bytes = buffer.getvalue()
+        payload = {
+            "data_base64": base64.b64encode(FIXTURE_MP4_BYTES).decode(),
+            "mime": "video/mp4",
+            "poster_base64": base64.b64encode(poster_bytes).decode(),
+            "poster_mime": "image/png",
+        }
+        event = wiki_artifacts.render_artifact({"kind": "video", "payload": payload})
+        self.assertIn("poster_base64", event["artifact"])
+        # Poster is the scrubbed image preview (data URL fragment).
+        self.assertTrue(event["artifact"]["poster_base64"].startswith("data:image/"))
+
+    def test_video_rejects_ogg_and_webm(self) -> None:
+        for mime in ("video/webm", "audio/ogg", "audio/webm"):
+            with self.subTest(mime=mime):
+                payload = {
+                    "data_base64": base64.b64encode(b"\x00" * 32).decode(),
+                    "mime": mime,
+                }
+                kind = "audio" if mime.startswith("audio/") else "video"
+                with self.assertRaises(wiki_artifacts.ArtifactValidationError):
+                    wiki_artifacts.render_artifact({"kind": kind, "payload": payload})
 
     def test_audio_transcript_flows_through(self) -> None:
         payload = {
@@ -948,7 +1013,10 @@ class WikiArtifactsTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 wiki_artifacts.ArtifactValidationError, "MB pdf limit"
             ):
-                wiki_artifacts._read_fd_bounded(fd, wiki_artifacts.PDF_LIMIT)
+                wiki_artifacts._read_fd_bounded(
+                    fd, wiki_artifacts.PDF_LIMIT, "pdf",
+                    f"{wiki_artifacts.PDF_LIMIT // (1024 * 1024)}MB pdf limit",
+                )
         finally:
             os.close(fd)
 

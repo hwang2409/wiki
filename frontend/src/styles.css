@@ -12974,6 +12974,14 @@ textarea.composer-command-input {
   display: block;
 }
 
+.artifact-audio-waveform {
+  width: 100%;
+  height: 40px;
+  color: var(--text-muted);
+  fill: currentColor;
+  display: block;
+}
+
 .artifact-audio-transcript-toggle {
   padding: 2px 8px;
   border-radius: 4px;

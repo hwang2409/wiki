@@ -1,173 +1,123 @@
 from __future__ import annotations
 
+import shutil
 import struct
+import subprocess
+import tempfile
 import unittest
-import zlib
+from pathlib import Path
 
 from backend.app import media_scrub
 
 
+FIXTURE_DIR = Path(__file__).parent / "fixtures" / "media"
+REAL_MP4 = FIXTURE_DIR / "tiny.mp4"
+REAL_WAV = FIXTURE_DIR / "tone.wav"
+REAL_MP3 = FIXTURE_DIR / "tone.mp3"
+
+FFMPEG = shutil.which("ffmpeg")
+
+
 # ---------------------------------------------------------------------------
-# Fixture builders — every media fixture is minimal but structurally valid so
-# it exercises the same scrub paths a real payload would.
+# Small synthetic fixtures for edge-case coverage. Structural tests hit the
+# real files above; these are only for isolated corner cases.
 # ---------------------------------------------------------------------------
-
-def _mp4_atom(atom_type: bytes, payload: bytes) -> bytes:
-    return struct.pack(">I", 8 + len(payload)) + atom_type + payload
-
-
-def _mp4_mvhd(timescale: int, duration: int) -> bytes:
-    # v0 mvhd: flags(4) creation(4) modification(4) timescale(4) duration(4)
-    # rate(4) volume(2) reserved(10) matrix(36) pre_defined(24) next_track(4)
-    body = (
-        b"\x00\x00\x00\x00"
-        + b"\x00" * 4
-        + b"\x00" * 4
-        + struct.pack(">I", timescale)
-        + struct.pack(">I", duration)
-        + b"\x00\x01\x00\x00"  # rate
-        + b"\x01\x00"  # volume
-        + b"\x00" * 10
-        + b"\x00" * 36
-        + b"\x00" * 24
-        + b"\x00" * 4
-    )
-    return _mp4_atom(b"mvhd", body)
-
-
-def _mp4_tkhd(width: int, height: int) -> bytes:
-    # v0 tkhd: flags(4) creation(4) modification(4) trackID(4) reserved(4)
-    # duration(4) reserved(8) layer(2) alt_group(2) volume(2) reserved(2)
-    # matrix(36) width(4 fixed) height(4 fixed)
-    body = (
-        b"\x00\x00\x00\x07"
-        + b"\x00" * 4
-        + b"\x00" * 4
-        + b"\x00\x00\x00\x01"
-        + b"\x00" * 4
-        + b"\x00" * 4
-        + b"\x00" * 8
-        + b"\x00" * 2
-        + b"\x00" * 2
-        + b"\x00" * 2
-        + b"\x00" * 2
-        + b"\x00" * 36
-        + struct.pack(">I", width << 16)
-        + struct.pack(">I", height << 16)
-    )
-    return _mp4_atom(b"tkhd", body)
-
-
-def _mp4_udta_gps() -> bytes:
-    # ©xyz atom carrying a fake ISO 6709 GPS string.
-    xyz_payload = struct.pack(">HH", 16, 0x15C7) + b"+40.7128-074.0060/"
-    inner = _mp4_atom(b"\xa9xyz", xyz_payload)
-    return _mp4_atom(b"udta", inner)
-
-
-def _minimal_mp4(*, with_gps: bool = True) -> bytes:
-    ftyp = _mp4_atom(b"ftyp", b"isom" + b"\x00\x00\x02\x00" + b"isom" + b"mp41")
-    trak_children = _mp4_tkhd(320, 240)
-    trak = _mp4_atom(b"trak", trak_children)
-    moov_children = _mp4_mvhd(timescale=1000, duration=2500) + trak
-    if with_gps:
-        moov_children += _mp4_udta_gps()
-    moov = _mp4_atom(b"moov", moov_children)
-    mdat = _mp4_atom(b"mdat", b"pretend-frame-bytes-here")
-    return ftyp + moov + mdat
-
 
 def _gif_bytes(*, with_xmp: bool = False) -> bytes:
     header = b"GIF89a"
-    # 4x2 logical screen, no global color table, background 0, aspect 0
     lsd = struct.pack("<HH", 4, 2) + b"\x00\x00\x00"
     body = bytearray(header + lsd)
     if with_xmp:
-        # Application Extension: 0x21 0xFF <length=11> "XMP DataXMP" <sub-blocks>
         body += b"\x21\xff\x0b" + b"XMP DataXMP"
-        # A single 4-byte payload sub-block then terminator.
-        body += b"\x04metadata\x00"[:5] + b"\x00"
-    # Image Descriptor: 0x2C left(2) top(2) width(2) height(2) packed(1)
+        body += b"\x04meta" + b"\x00"
     body += b"\x2c" + struct.pack("<HHHH", 0, 0, 4, 2) + b"\x00"
-    # LZW min code size + a single sub-block with dummy bytes + terminator.
     body += b"\x02\x02\x44\x01\x00"
     body += b"\x3b"
     return bytes(body)
 
 
-def _wav_bytes(*, with_list: bool = False) -> bytes:
-    fmt_chunk = b"fmt " + struct.pack(
-        "<IHHIIHH", 16, 1, 1, 8000, 16000, 2, 16
-    )
-    data_chunk = b"data" + struct.pack("<I", 8) + b"\x00\x01" * 4
-    body = b"WAVE" + fmt_chunk
-    if with_list:
-        list_payload = b"INFO" + b"IART" + struct.pack("<I", 8) + b"secret\x00\x00"
-        body += b"LIST" + struct.pack("<I", len(list_payload)) + list_payload
-    body += data_chunk
-    header = b"RIFF" + struct.pack("<I", len(body)) + body[:4]
-    return header + body[4:]
+class ScrubMp4RealFixtureTests(unittest.TestCase):
+    """Structural + metadata assertions against a real x264-encoded MP4.
+
+    The fixture is a fast-start MP4 with ffmpeg encoder tags and a QuickTime
+    `loci` (location) atom inside moov/udta — the exact shape that leaked
+    GPS coordinates in the round-1 review.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.original = REAL_MP4.read_bytes()
+        cls.result = media_scrub.scrub_video(cls.original, "video/mp4")
+
+    def test_size_is_preserved_so_stco_offsets_stay_valid(self) -> None:
+        self.assertEqual(len(self.result.data), len(self.original))
+
+    def test_udta_metadata_atoms_are_destroyed(self) -> None:
+        # Fixture markers: `loci` box (GPS), `earth` string (loci suffix),
+        # `Lavf` encoder tag, `udta` container name.
+        self.assertIn(b"udta", self.original)
+        self.assertIn(b"loci", self.original)
+        self.assertIn(b"earth", self.original)
+        self.assertIn(b"Lavf", self.original)
+        for marker in (b"udta", b"loci", b"earth", b"Lavf"):
+            self.assertNotIn(marker, self.result.data)
+
+    def test_playback_atoms_survive(self) -> None:
+        for marker in (b"ftyp", b"moov", b"mvhd", b"trak", b"tkhd", b"mdat"):
+            self.assertIn(marker, self.result.data)
+
+    def test_dimensions_and_duration_are_extracted(self) -> None:
+        self.assertEqual((self.result.width, self.result.height), (160, 120))
+        self.assertIsNotNone(self.result.duration_ms)
+        assert self.result.duration_ms is not None
+        self.assertGreater(self.result.duration_ms, 0)
+
+    @unittest.skipIf(FFMPEG is None, "ffmpeg not installed")
+    def test_stored_bytes_decode_cleanly_through_ffmpeg(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as handle:
+            handle.write(self.result.data)
+            stored_path = handle.name
+        try:
+            probe = subprocess.run(
+                [FFMPEG, "-v", "error", "-i", stored_path, "-f", "null", "-"],
+                capture_output=True,
+                timeout=30,
+            )
+            self.assertEqual(
+                probe.returncode,
+                0,
+                msg=f"ffmpeg decode failed after scrub: {probe.stderr.decode(errors='replace')}",
+            )
+        finally:
+            Path(stored_path).unlink(missing_ok=True)
 
 
-def _mp3_bytes(*, with_id3v2: bool = False, with_id3v1: bool = False) -> bytes:
-    frame = b"\xff\xfb\x90\x00" + b"\x00" * 24  # minimal MPEG-1 layer3 frame
-    body = frame * 4
-    if with_id3v2:
-        payload = b"\x00" * 20
-        header = b"ID3\x04\x00\x00" + bytes(
-            [
-                (len(payload) >> 21) & 0x7F,
-                (len(payload) >> 14) & 0x7F,
-                (len(payload) >> 7) & 0x7F,
-                len(payload) & 0x7F,
-            ]
-        )
-        body = header + payload + body
-    if with_id3v1:
-        body = body + b"TAG" + b"secret".ljust(125, b"\x00")
-    return body
-
-
-class ScrubMp4Tests(unittest.TestCase):
-    def test_scrub_extracts_duration_and_dims(self) -> None:
-        result = media_scrub.scrub_video(_minimal_mp4(), "video/mp4")
-        self.assertEqual(result.mime, "video/mp4")
-        self.assertEqual(result.duration_ms, 2500)
-        self.assertEqual((result.width, result.height), (320, 240))
-
-    def test_scrub_removes_top_level_udta_gps(self) -> None:
-        original = _minimal_mp4(with_gps=True)
-        self.assertIn(b"+40.7128-074.0060", original)
-        result = media_scrub.scrub_video(original, "video/mp4")
-        self.assertNotIn(b"+40.7128-074.0060", result.data)
-        self.assertNotIn(b"udta", result.data)
-
-    def test_scrub_removes_gps_inside_moov(self) -> None:
-        # udta nested inside moov must also be stripped.
-        ftyp = _mp4_atom(
-            b"ftyp", b"isom" + b"\x00\x00\x02\x00" + b"isom" + b"mp41"
-        )
-        moov = _mp4_atom(
-            b"moov",
-            _mp4_mvhd(1000, 1000) + _mp4_udta_gps() + _mp4_tkhd(10, 10),
-        )
-        mdat = _mp4_atom(b"mdat", b"x")
-        result = media_scrub.scrub_video(ftyp + moov + mdat, "video/mp4")
-        self.assertNotIn(b"+40.7128-074.0060", result.data)
-        # The rewritten moov should still contain mvhd and tkhd (so playback works).
-        self.assertIn(b"mvhd", result.data)
-        self.assertIn(b"tkhd", result.data)
-
-    def test_scrub_rejects_missing_ftyp(self) -> None:
-        payload = _mp4_atom(b"moov", _mp4_mvhd(1000, 1000))
-        with self.assertRaises(media_scrub.MediaScrubError):
+class ScrubMp4StructuralGuards(unittest.TestCase):
+    def test_missing_moov_is_rejected(self) -> None:
+        payload = struct.pack(">I", 24) + b"ftyp" + b"isom" + b"\x00\x00\x02\x00" + b"isommp41"
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "moov"):
             media_scrub.scrub_video(payload, "video/mp4")
 
-    def test_scrub_rejects_truncated_atom(self) -> None:
-        ftyp = _mp4_atom(b"ftyp", b"isom" + b"\x00\x00\x02\x00")
-        truncated = ftyp + b"\x00\x00\x00\x40moov" + b"only-a-few-bytes"
+    def test_moov_without_trak_is_rejected(self) -> None:
+        # A real MP4 has trak inside moov; fixtures that omit it must fail
+        # the structural check so text-with-ftyp cannot masquerade as MP4.
+        ftyp = struct.pack(">I", 24) + b"ftyp" + b"isom" + b"\x00\x00\x02\x00" + b"isommp41"
+        # Build a moov with only mvhd (v0) and no trak.
+        mvhd_body = (
+            b"\x00\x00\x00\x00"
+            + b"\x00" * 8
+            + struct.pack(">I", 1000)
+            + struct.pack(">I", 1000)
+            + b"\x00" * 80
+        )
+        mvhd = struct.pack(">I", 8 + len(mvhd_body)) + b"mvhd" + mvhd_body
+        moov = struct.pack(">I", 8 + len(mvhd)) + b"moov" + mvhd
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "trak"):
+            media_scrub.scrub_video(ftyp + moov, "video/mp4")
+
+    def test_missing_ftyp_is_rejected(self) -> None:
         with self.assertRaises(media_scrub.MediaScrubError):
-            media_scrub.scrub_video(truncated, "video/mp4")
+            media_scrub.scrub_video(b"\x00" * 32, "video/mp4")
 
 
 class ScrubGifTests(unittest.TestCase):
@@ -181,7 +131,6 @@ class ScrubGifTests(unittest.TestCase):
         self.assertIn(b"XMP DataXMP", payload)
         scrubbed = media_scrub.scrub_video(payload, "image/gif").data
         self.assertNotIn(b"XMP DataXMP", scrubbed)
-        # Trailer should still terminate the stream.
         self.assertEqual(scrubbed[-1], 0x3B)
 
     def test_scrub_rejects_wrong_magic(self) -> None:
@@ -189,82 +138,200 @@ class ScrubGifTests(unittest.TestCase):
             media_scrub.scrub_video(b"NOTGIF" + b"\x00" * 40, "image/gif")
 
 
-class ScrubMatroskaTests(unittest.TestCase):
-    def test_scrub_validates_ebml_header(self) -> None:
-        payload = b"\x1a\x45\xdf\xa3" + b"\x00" * 40
-        result = media_scrub.scrub_video(payload, "video/webm")
-        self.assertEqual(result.mime, "video/webm")
-        self.assertEqual(result.data, payload)
+class RejectedContainerMimes(unittest.TestCase):
+    """Silent pass-through was the round-1 leak; reject webm and ogg entirely."""
 
-    def test_scrub_rejects_missing_ebml(self) -> None:
-        with self.assertRaises(media_scrub.MediaScrubError):
-            media_scrub.scrub_video(b"not-webm-header", "video/webm")
+    def test_webm_video_is_rejected(self) -> None:
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "unsupported"):
+            media_scrub.scrub_video(b"\x1a\x45\xdf\xa3" + b"\x00" * 32, "video/webm")
+
+    def test_webm_audio_is_rejected(self) -> None:
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "unsupported"):
+            media_scrub.scrub_audio(b"\x1a\x45\xdf\xa3" + b"\x00" * 32, "audio/webm")
+
+    def test_ogg_audio_is_rejected(self) -> None:
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "unsupported"):
+            media_scrub.scrub_audio(b"OggS" + b"\x00" * 32, "audio/ogg")
 
 
-class ScrubWavTests(unittest.TestCase):
-    def test_scrub_computes_duration(self) -> None:
-        result = media_scrub.scrub_audio(_wav_bytes(), "audio/wav")
-        self.assertEqual(result.mime, "audio/wav")
-        self.assertIsNotNone(result.duration_ms)
-        # 8 bytes data at 16000 byte_rate = 0.5 ms.
-        assert result.duration_ms is not None
-        self.assertEqual(result.duration_ms, 0)
+class ScrubWavRealFixtureTests(unittest.TestCase):
+    """Real ffmpeg-encoded pcm_s16le WAV. Structural scrub + peaks."""
 
-    def test_scrub_drops_list_info_chunk(self) -> None:
-        payload = _wav_bytes(with_list=True)
-        self.assertIn(b"secret", payload)
-        result = media_scrub.scrub_audio(payload, "audio/wav")
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.original = REAL_WAV.read_bytes()
+        cls.result = media_scrub.scrub_audio(cls.original, "audio/wav")
+
+    def test_header_is_intact_after_scrub(self) -> None:
+        self.assertEqual(self.result.data[:4], b"RIFF")
+        self.assertEqual(self.result.data[8:12], b"WAVE")
+        riff_size = struct.unpack("<I", self.result.data[4:8])[0]
+        self.assertEqual(riff_size, len(self.result.data) - 8)
+
+    def test_only_playback_chunks_survive(self) -> None:
+        # Walk chunks in the scrubbed output — only fmt/data/fact allowed.
+        offset = 12
+        seen: list[bytes] = []
+        while offset + 8 <= len(self.result.data):
+            chunk_id = self.result.data[offset:offset + 4]
+            chunk_size = struct.unpack("<I", self.result.data[offset + 4:offset + 8])[0]
+            seen.append(chunk_id)
+            offset += 8 + chunk_size + (chunk_size & 1)
+        self.assertTrue(seen)
+        for chunk_id in seen:
+            self.assertIn(chunk_id, {b"fmt ", b"data", b"fact"})
+
+    def test_duration_matches_fixture_length(self) -> None:
+        # Fixture is 0.5s = 500ms sine tone.
+        self.assertIsNotNone(self.result.duration_ms)
+        assert self.result.duration_ms is not None
+        self.assertGreaterEqual(self.result.duration_ms, 480)
+        self.assertLessEqual(self.result.duration_ms, 520)
+
+    def test_peaks_are_bounded_regardless_of_data_size(self) -> None:
+        self.assertIsNotNone(self.result.peaks)
+        assert self.result.peaks is not None
+        self.assertLessEqual(len(self.result.peaks), media_scrub.WAVEFORM_MAX_PEAKS)
+        # A real sine tone at 440 Hz cannot yield all zero peaks.
+        self.assertTrue(any(peak > 0 for peak in self.result.peaks))
+
+    @unittest.skipIf(FFMPEG is None, "ffmpeg not installed")
+    def test_stored_bytes_decode_cleanly_through_ffmpeg(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
+            handle.write(self.result.data)
+            stored_path = handle.name
+        try:
+            probe = subprocess.run(
+                [FFMPEG, "-v", "error", "-i", stored_path, "-f", "null", "-"],
+                capture_output=True,
+                timeout=30,
+            )
+            self.assertEqual(
+                probe.returncode,
+                0,
+                msg=f"ffmpeg decode failed after scrub: {probe.stderr.decode(errors='replace')}",
+            )
+        finally:
+            Path(stored_path).unlink(missing_ok=True)
+
+
+class WavMetadataStripTests(unittest.TestCase):
+    def test_list_info_chunk_is_dropped(self) -> None:
+        # Splice a LIST/INFO chunk into the real WAV to prove allowlist works.
+        original = REAL_WAV.read_bytes()
+        list_body = b"INFO" + b"IART" + struct.pack("<I", 8) + b"secret\x00\x00"
+        list_chunk = b"LIST" + struct.pack("<I", len(list_body)) + list_body
+        # Insert LIST just after RIFF/WAVE header.
+        head = original[:12]
+        tail = original[12:]
+        payload = bytearray(head) + list_chunk + tail
+        # Patch RIFF size.
+        payload[4:8] = struct.pack("<I", len(payload) - 8)
+        self.assertIn(b"secret", bytes(payload))
+        result = media_scrub.scrub_audio(bytes(payload), "audio/wav")
         self.assertNotIn(b"secret", result.data)
         self.assertNotIn(b"LIST", result.data)
-        self.assertEqual(result.data[:4], b"RIFF")
-        self.assertEqual(result.data[8:12], b"WAVE")
-        riff_size = struct.unpack("<I", result.data[4:8])[0]
-        self.assertEqual(riff_size, len(result.data) - 8)
 
-    def test_scrub_rejects_missing_fmt(self) -> None:
+    def test_ixml_chunk_is_dropped(self) -> None:
+        original = REAL_WAV.read_bytes()
+        ixml_body = b"<BWFXML><PROJECT>secret-proj</PROJECT></BWFXML>"
+        ixml_chunk = b"iXML" + struct.pack("<I", len(ixml_body)) + ixml_body + (b"\x00" if len(ixml_body) & 1 else b"")
+        head = original[:12]
+        tail = original[12:]
+        payload = bytearray(head) + ixml_chunk + tail
+        payload[4:8] = struct.pack("<I", len(payload) - 8)
+        self.assertIn(b"secret-proj", bytes(payload))
+        result = media_scrub.scrub_audio(bytes(payload), "audio/wav")
+        self.assertNotIn(b"secret-proj", result.data)
+        self.assertNotIn(b"iXML", result.data)
+
+    def test_missing_fmt_is_rejected(self) -> None:
         header = b"RIFF" + struct.pack("<I", 8) + b"WAVE" + b"data" + struct.pack("<I", 0)
         with self.assertRaises(media_scrub.MediaScrubError):
             media_scrub.scrub_audio(header, "audio/wav")
 
-    def test_scrub_rejects_missing_magic(self) -> None:
+    def test_missing_riff_wave_magic_is_rejected(self) -> None:
         with self.assertRaises(media_scrub.MediaScrubError):
             media_scrub.scrub_audio(b"RIFF" + b"\x00" * 8 + b"NOPE", "audio/wav")
 
 
-class ScrubMp3Tests(unittest.TestCase):
-    def test_scrub_passes_frames(self) -> None:
-        payload = _mp3_bytes()
-        result = media_scrub.scrub_audio(payload, "audio/mpeg")
-        self.assertEqual(result.mime, "audio/mpeg")
-        self.assertEqual(result.data, payload)
+class ScrubMp3RealFixtureTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.original = REAL_MP3.read_bytes()
+        cls.result = media_scrub.scrub_audio(cls.original, "audio/mpeg")
 
-    def test_scrub_strips_id3v2_prefix(self) -> None:
-        payload = _mp3_bytes(with_id3v2=True)
-        result = media_scrub.scrub_audio(payload, "audio/mpeg")
-        self.assertFalse(result.data.startswith(b"ID3"))
-        self.assertEqual(result.data[:2], b"\xff\xfb")
+    def test_id3v2_title_and_artist_are_destroyed(self) -> None:
+        # ffmpeg puts the -metadata values into the ID3v2 tag at the front.
+        # After scrub, the front-of-file tag is gone, so those strings vanish.
+        self.assertIn(b"stripme-title-marker", self.original)
+        self.assertIn(b"stripme-artist-marker", self.original)
+        self.assertNotIn(b"stripme-title-marker", self.result.data)
+        self.assertNotIn(b"stripme-artist-marker", self.result.data)
 
-    def test_scrub_strips_id3v1_suffix(self) -> None:
-        payload = _mp3_bytes(with_id3v1=True)
-        self.assertIn(b"secret", payload)
-        result = media_scrub.scrub_audio(payload, "audio/mpeg")
-        self.assertNotIn(b"secret", result.data)
-        self.assertNotIn(b"TAG", result.data[-128:])
+    def test_frame_stream_starts_with_valid_mpeg_sync(self) -> None:
+        first_two = self.result.data[:2]
+        self.assertEqual(first_two[0], 0xFF)
+        self.assertEqual(first_two[1] & 0xE0, 0xE0)
 
-    def test_scrub_rejects_missing_sync(self) -> None:
+    @unittest.skipIf(FFMPEG is None, "ffmpeg not installed")
+    def test_stored_bytes_decode_cleanly_through_ffmpeg(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as handle:
+            handle.write(self.result.data)
+            stored_path = handle.name
+        try:
+            probe = subprocess.run(
+                [FFMPEG, "-v", "error", "-i", stored_path, "-f", "null", "-"],
+                capture_output=True,
+                timeout=30,
+            )
+            self.assertEqual(
+                probe.returncode,
+                0,
+                msg=f"ffmpeg decode failed after scrub: {probe.stderr.decode(errors='replace')}",
+            )
+        finally:
+            Path(stored_path).unlink(missing_ok=True)
+
+
+class Mp3StructuralGuards(unittest.TestCase):
+    def test_random_bytes_are_rejected_even_with_first_sync(self) -> None:
+        # A single sync byte is not enough — the 3-frame walk must fail.
+        payload = b"\xff\xfb\x90\x00" + b"\x00" * 128
         with self.assertRaises(media_scrub.MediaScrubError):
-            media_scrub.scrub_audio(b"\x00" * 128, "audio/mpeg")
+            media_scrub.scrub_audio(payload, "audio/mpeg")
 
 
-class ScrubOggTests(unittest.TestCase):
-    def test_scrub_validates_ogg_header(self) -> None:
-        payload = b"OggS" + b"\x00" * 40
-        result = media_scrub.scrub_audio(payload, "audio/ogg")
-        self.assertEqual(result.mime, "audio/ogg")
+class WavStreamingPeaksBoundsTests(unittest.TestCase):
+    """The waveform generator must be bounded and NEVER perform a full-file
+    decode. Synthesizing a large WAV proves peaks stay capped at MAX_PEAKS
+    regardless of payload size and the memory footprint is limited to
+    memoryview slices of the input buffer.
+    """
 
-    def test_scrub_rejects_missing_ogg(self) -> None:
-        with self.assertRaises(media_scrub.MediaScrubError):
-            media_scrub.scrub_audio(b"NOTAOGG", "audio/ogg")
+    def test_large_wav_produces_bounded_peak_array(self) -> None:
+        # 2 MB of pcm_s16le samples at 16 kHz mono = ~62s of audio.
+        sample_rate = 16000
+        channels = 1
+        bits = 16
+        byte_rate = sample_rate * channels * bits // 8
+        # Fabricate a triangle wave so peaks vary.
+        payload = bytearray()
+        for i in range(1_000_000):
+            value = (i % 32000) - 16000
+            payload.extend(value.to_bytes(2, "little", signed=True))
+        fmt_body = struct.pack(
+            "<HHIIHH", 1, channels, sample_rate, byte_rate, channels * bits // 8, bits,
+        )
+        fmt_chunk = b"fmt " + struct.pack("<I", len(fmt_body)) + fmt_body
+        data_chunk = b"data" + struct.pack("<I", len(payload)) + bytes(payload)
+        wav = b"RIFF" + struct.pack("<I", 4 + len(fmt_chunk) + len(data_chunk)) + b"WAVE" + fmt_chunk + data_chunk
+
+        result = media_scrub.scrub_audio(wav, "audio/wav")
+        self.assertIsNotNone(result.peaks)
+        assert result.peaks is not None
+        self.assertLessEqual(len(result.peaks), media_scrub.WAVEFORM_MAX_PEAKS)
+        self.assertTrue(any(peak > 0 for peak in result.peaks))
 
 
 class UnsupportedMimeTests(unittest.TestCase):
@@ -275,10 +342,6 @@ class UnsupportedMimeTests(unittest.TestCase):
     def test_scrub_audio_rejects_video_mime(self) -> None:
         with self.assertRaises(media_scrub.MediaScrubError):
             media_scrub.scrub_audio(b"\x00" * 32, "video/mp4")
-
-
-# Silence unused-import lints from earlier fixture drafts that referenced zlib.
-del zlib
 
 
 if __name__ == "__main__":

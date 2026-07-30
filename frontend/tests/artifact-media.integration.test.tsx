@@ -131,6 +131,41 @@ describe("VideoRenderer", () => {
     unmount();
     expect(screen.queryByLabelText("Fixture media")).toBeNull();
   });
+
+  test("unmount cleanup clears the <source> child src (defensive decoder release)", () => {
+    const pauseSpy = vi.spyOn(HTMLMediaElement.prototype, "pause");
+    const loadSpy = vi.spyOn(HTMLMediaElement.prototype, "load");
+    const artifact: SessionArtifact = { kind: "video", mime: "video/mp4", ref: "artifact://abc" };
+    const { unmount, container } = render(
+      <VideoRenderer artifact={artifact} event={makeEvent(artifact)} ticket={TICKET} />,
+    );
+    const source = container.querySelector("source");
+    expect(source?.getAttribute("src")).toBeTruthy();
+    unmount();
+    // The captured-in-effect cleanup path (not a live ref) fires — proves the
+    // review's #8 "cleared ref races the cleanup" hazard cannot surface here.
+    expect(pauseSpy).toHaveBeenCalled();
+    expect(loadSpy).toHaveBeenCalled();
+  });
+
+  test("video uses fallback aspect ratio when dims are unknown", () => {
+    const artifact: SessionArtifact = { kind: "video", mime: "video/mp4", ref: "artifact://abc" };
+    render(<VideoRenderer artifact={artifact} event={makeEvent(artifact)} ticket={TICKET} />);
+    const frame = document.querySelector(".artifact-video-frame") as HTMLDivElement;
+    expect(frame.style.aspectRatio.replace(/\s+/g, "")).toBe("16/9");
+  });
+
+  test("video renders poster when payload includes poster_base64", () => {
+    const artifact: SessionArtifact = {
+      kind: "video",
+      mime: "video/mp4",
+      ref: "artifact://abc",
+      poster_base64: "data:image/jpeg;base64,AAAA",
+    };
+    render(<VideoRenderer artifact={artifact} event={makeEvent(artifact)} ticket={TICKET} />);
+    const video = screen.getByLabelText("Fixture media") as HTMLVideoElement;
+    expect(video.getAttribute("poster")).toBe("data:image/jpeg;base64,AAAA");
+  });
 });
 
 describe("AudioRenderer", () => {
@@ -179,6 +214,26 @@ describe("AudioRenderer", () => {
     const artifact: SessionArtifact = { kind: "audio", mime: "audio/wav", ref: "artifact://a" };
     render(<AudioRenderer artifact={artifact} event={makeEvent(artifact)} ticket={TICKET} />);
     expect(screen.queryByRole("button", { name: /transcript/i })).toBeNull();
+  });
+
+  test("audio renders waveform bars when peaks are supplied", () => {
+    const peaks = Array.from({ length: 32 }, (_, index) => (index * 8) % 256);
+    const artifact: SessionArtifact = {
+      kind: "audio",
+      mime: "audio/wav",
+      ref: "artifact://a",
+      peaks,
+    };
+    render(<AudioRenderer artifact={artifact} event={makeEvent(artifact)} ticket={TICKET} />);
+    const waveform = document.querySelector(".artifact-audio-waveform");
+    expect(waveform).not.toBeNull();
+    expect(waveform!.querySelectorAll("rect").length).toBe(peaks.length);
+  });
+
+  test("audio omits waveform when peaks are absent", () => {
+    const artifact: SessionArtifact = { kind: "audio", mime: "audio/wav", ref: "artifact://a" };
+    render(<AudioRenderer artifact={artifact} event={makeEvent(artifact)} ticket={TICKET} />);
+    expect(document.querySelector(".artifact-audio-waveform")).toBeNull();
   });
 
   test("unmount removes the audio element from the DOM", () => {

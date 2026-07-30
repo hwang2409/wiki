@@ -282,7 +282,7 @@ def _pdf_path_allowed_roots() -> list[Path]:
     return roots
 
 
-def _read_fd_bounded(fd: int, limit: int) -> bytes:
+def _read_fd_bounded(fd: int, limit: int, kind: str, limit_label: str) -> bytes:
     """Read up to `limit` bytes from `fd`. Reject if the source has more."""
     chunks: list[bytes] = []
     remaining = limit + 1  # +1 lets us detect overflow without buffering it
@@ -294,9 +294,7 @@ def _read_fd_bounded(fd: int, limit: int) -> bytes:
         remaining -= len(chunk)
     data = b"".join(chunks)
     if len(data) > limit:
-        raise ArtifactValidationError(
-            f"pdf payload exceeds the {limit // (1024 * 1024)}MB pdf limit"
-        )
+        raise ArtifactValidationError(f"{kind} payload exceeds the {limit_label}")
     return data
 
 
@@ -312,14 +310,15 @@ def _open_root_fd(root: Path) -> int:
     return os.open(root, flags)
 
 
-def _read_pdf_path(raw: str) -> bytes:
+def _read_media_path(raw: str, *, kind: str, byte_limit: int, limit_label: str) -> bytes:
+    """Bounded, dir-fd-walking read of a payload path inside an allowed root."""
     if not raw or not isinstance(raw, str):
         raise ArtifactValidationError("payload.path must be a non-empty string")
     candidate = Path(raw).expanduser()
     if not candidate.is_absolute():
         raise ArtifactValidationError("payload.path must be an absolute filesystem path")
     if candidate.is_symlink():
-        raise ArtifactValidationError("refusing symlink pdf source")
+        raise ArtifactValidationError(f"refusing symlink {kind} source")
     try:
         resolved = candidate.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
@@ -368,15 +367,22 @@ def _read_pdf_path(raw: str) -> bytes:
                 raise ArtifactValidationError(
                     "payload.path must reference a regular file"
                 )
-            if info.st_size > PDF_LIMIT:
-                raise ArtifactValidationError(
-                    f"pdf payload exceeds the {PDF_LIMIT // (1024 * 1024)}MB pdf limit"
-                )
-            return _read_fd_bounded(fd, PDF_LIMIT)
+            if info.st_size > byte_limit:
+                raise ArtifactValidationError(f"{kind} payload exceeds the {limit_label}")
+            return _read_fd_bounded(fd, byte_limit, kind, limit_label)
         finally:
             os.close(fd)
     finally:
         os.close(root_fd)
+
+
+def _read_pdf_path(raw: str) -> bytes:
+    return _read_media_path(
+        raw,
+        kind="pdf",
+        byte_limit=PDF_LIMIT,
+        limit_label=f"{PDF_LIMIT // (1024 * 1024)}MB pdf limit",
+    )
 
 
 def _write_pdf(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
@@ -461,24 +467,63 @@ def _decode_media_payload(
     limit_label: str,
     optional_keys: set[str] = frozenset(),
 ) -> tuple[bytes, str]:
-    _require_keys(
-        payload, required={"data_base64", "mime"}, optional=optional_keys
-    )
-    encoded = _require_string(payload["data_base64"], "payload.data_base64")
+    required = {"mime"}
+    optional = optional_keys | {"data_base64", "path"}
+    _require_keys(payload, required=required, optional=optional)
     mime = payload["mime"]
     if mime not in allowed_mimes:
         raise ArtifactValidationError(
             f"payload.mime must be one of {sorted(allowed_mimes)!s} for {kind}"
         )
-    if len(encoded) > ((byte_limit + 2) // 3) * 4 + 4:
-        raise ArtifactValidationError(f"{kind} payload exceeds the {limit_label}")
-    try:
-        data = base64.b64decode(encoded, validate=True)
-    except (binascii.Error, ValueError) as exc:
-        raise ArtifactValidationError("payload.data_base64 is not valid base64") from exc
+    has_base64 = "data_base64" in payload
+    has_path = "path" in payload
+    if has_base64 == has_path:
+        raise ArtifactValidationError(
+            f"{kind} payload must include exactly one of data_base64 or path"
+        )
+    if has_base64:
+        encoded = _require_string(payload["data_base64"], "payload.data_base64")
+        if len(encoded) > ((byte_limit + 2) // 3) * 4 + 4:
+            raise ArtifactValidationError(f"{kind} payload exceeds the {limit_label}")
+        try:
+            data = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ArtifactValidationError("payload.data_base64 is not valid base64") from exc
+    else:
+        data = _read_media_path(
+            str(payload["path"]), kind=kind, byte_limit=byte_limit, limit_label=limit_label,
+        )
     if len(data) > byte_limit:
         raise ArtifactValidationError(f"{kind} payload exceeds the {limit_label}")
     return data, mime
+
+
+def _scrub_optional_poster(payload: dict[str, Any]) -> tuple[str, int, int] | None:
+    """Route a caller-provided poster through image_scrub. Return preview_base64 + dims."""
+    poster = payload.get("poster_base64")
+    if poster is None:
+        return None
+    if not isinstance(poster, str) or not poster:
+        raise ArtifactValidationError("payload.poster_base64 must be a non-empty string")
+    if len(poster) > ((IMAGE_LIMIT + 2) // 3) * 4 + 4:
+        raise ArtifactValidationError("payload.poster_base64 exceeds the 5MB image limit")
+    try:
+        poster_bytes = base64.b64decode(poster, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ArtifactValidationError("payload.poster_base64 is not valid base64") from exc
+    poster_mime = payload.get("poster_mime", "image/png")
+    if poster_mime not in IMAGE_TYPES:
+        raise ArtifactValidationError(
+            "payload.poster_mime must be image/png, image/jpeg, or image/webp"
+        )
+    try:
+        result = scrub_image(poster_bytes, poster_mime)
+    except ImageScrubError as exc:
+        raise ArtifactValidationError(f"video poster rejected: {exc}") from exc
+    if not result.preview_base64:
+        # scrub_image always emits a preview for the bounded-side downsample.
+        return None
+    return result.preview_base64, result.width, result.height
 
 
 def _write_video(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
@@ -488,6 +533,7 @@ def _write_video(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
         allowed_mimes=VIDEO_MIMES,
         byte_limit=VIDEO_LIMIT,
         limit_label=f"{VIDEO_LIMIT // (1024 * 1024)}MB video limit",
+        optional_keys={"poster_base64", "poster_mime"},
     )
     try:
         result = scrub_video(data, mime)
@@ -497,6 +543,7 @@ def _write_video(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
         raise ArtifactValidationError(
             f"video payload exceeds the {VIDEO_LIMIT // (1024 * 1024)}MB video limit"
         )
+    poster = _scrub_optional_poster(payload)
 
     artifact_dir = _artifact_run_dir()
     _write_binary(artifact_dir, artifact_id, VIDEO_MIMES[mime], result.data)
@@ -511,6 +558,14 @@ def _write_video(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
         normalized["width"] = result.width
     if result.height is not None:
         normalized["height"] = result.height
+    if poster is not None:
+        preview_b64, poster_w, poster_h = poster
+        normalized["poster_base64"] = preview_b64
+        # Poster dims can be a stable fallback when the container omits its own dims.
+        if result.width is None and poster_w:
+            normalized["width"] = poster_w
+        if result.height is None and poster_h:
+            normalized["height"] = poster_h
     return normalized
 
 
@@ -541,6 +596,8 @@ def _write_audio(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
     }
     if result.duration_ms is not None:
         normalized["duration_ms"] = result.duration_ms
+    if result.peaks is not None:
+        normalized["peaks"] = result.peaks
     transcript = payload.get("transcript")
     if transcript is not None:
         if not isinstance(transcript, str):

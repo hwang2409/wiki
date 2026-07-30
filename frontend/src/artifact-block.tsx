@@ -104,20 +104,8 @@ function downloadName(event: SessionEvent): string {
   if (effectiveKind === "code" && artifact.filename) {
     return artifact.filename.split(/[\\/]/).pop() || `${base}.txt`;
   }
-  const videoExtension =
-    artifact.mime === "image/gif"
-      ? "gif"
-      : artifact.mime === "video/webm"
-        ? "webm"
-        : "mp4";
-  const audioExtension =
-    artifact.mime === "audio/mpeg"
-      ? "mp3"
-      : artifact.mime === "audio/webm"
-        ? "weba"
-        : artifact.mime === "audio/ogg"
-          ? "ogg"
-          : "wav";
+  const videoExtension = artifact.mime === "image/gif" ? "gif" : "mp4";
+  const audioExtension = artifact.mime === "audio/mpeg" ? "mp3" : "wav";
   const extension = {
     mermaid: "mmd",
     svg: "svg",
@@ -310,11 +298,23 @@ export function ArtifactBlock({
   }
 
   async function download() {
+    const binaryKinds = new Set(["pdf", "video", "audio"]);
     let blob: Blob;
-    if (resolvedArtifact.kind === "pdf") {
-      const response = await fetch(artifactUrl(ticket, event));
-      if (!response.ok) throw new Error(`PDF download failed (${response.status})`);
-      blob = await response.blob();
+    if (binaryKinds.has(resolvedArtifact.kind)) {
+      if (resolvedArtifact.data_base64) {
+        const response = await fetch(
+          `data:${resolvedArtifact.mime};base64,${resolvedArtifact.data_base64}`,
+        );
+        blob = await response.blob();
+      } else {
+        const response = await fetch(artifactUrl(ticket, event));
+        if (!response.ok) {
+          throw new Error(
+            `${resolvedArtifact.kind} download failed (${response.status})`,
+          );
+        }
+        blob = await response.blob();
+      }
     } else if (resolvedArtifact.kind === "image" && !resolvedArtifact.data_base64) {
       const response = await fetch(artifactUrl(ticket, event));
       if (!response.ok) throw new Error(`Image download failed (${response.status})`);
