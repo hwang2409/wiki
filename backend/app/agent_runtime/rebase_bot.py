@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from contextlib import contextmanager
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -54,25 +55,117 @@ class _RebaseJob:
     done: threading.Event
     helper: Callable[[Path], Mapping[str, Any]] | None = None
     result: dict[str, Any] | None = None
+    pr_number: int = 0
+    expected_sha: str = ""
+    ticket: str = ""
+    worker_id: str = ""
+    orchestrator: str | None = None
+    verdict: dict[str, Any] | None = None
+    durable: bool = False
+    completed_at: float | None = None
 
 
 _JOB_LOCK = threading.RLock()
-_JOBS: dict[tuple[str, str], _RebaseJob] = {}
-_WORKTREE_LOCKS: dict[str, threading.Lock] = {}
+_JOBS: dict[tuple[Any, ...], _RebaseJob] = {}
+_WORKTREE_LOCKS: dict[str, threading.RLock] = {}
+_DURABLE_STATE_LOADED = False
+_DURABLE_STATE_ROOT: Path | None = None
+_DURABLE_JOBS: dict[str, dict[str, Any]] = {}
+_OUTBOX: dict[str, dict[str, Any]] = {}
+_JOB_RETENTION_SECONDS = 900
+
+
+def _durable_paths() -> tuple[Path, Path]:
+    try:
+        runtime_dir = getattr(_main(), "AGENT_RUNTIME_DIR", None)
+    except Exception:
+        runtime_dir = None
+    root = (
+        Path(runtime_dir)
+        if isinstance(runtime_dir, (str, Path))
+        else Path(tempfile.gettempdir()) / "wiki-agent-runtime"
+    )
+    state_dir = root / "rebase-bot"
+    return state_dir / "jobs.json", state_dir / "outbox.json"
+
+
+def _load_durable_state() -> None:
+    global _DURABLE_STATE_LOADED, _DURABLE_STATE_ROOT
+    jobs_path, outbox_path = _durable_paths()
+    state_root = jobs_path.parent
+    if _DURABLE_STATE_LOADED and _DURABLE_STATE_ROOT == state_root:
+        return
+    if _DURABLE_STATE_ROOT != state_root:
+        _DURABLE_JOBS.clear()
+        _OUTBOX.clear()
+    _DURABLE_STATE_ROOT = state_root
+    _DURABLE_STATE_LOADED = True
+    for path, target in ((jobs_path, _DURABLE_JOBS), (outbox_path, _OUTBOX)):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(value, Mapping):
+            target.update(
+                {
+                    str(key): dict(item)
+                    for key, item in value.items()
+                    if isinstance(key, str) and isinstance(item, Mapping)
+                }
+            )
+
+
+def _persist_durable_state() -> None:
+    jobs_path, outbox_path = _durable_paths()
+    jobs_path.parent.mkdir(parents=True, exist_ok=True)
+    for path, value in ((jobs_path, _DURABLE_JOBS), (outbox_path, _OUTBOX)):
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(
+            json.dumps(value, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+
+
+def _durable_key(pr_number: int, expected_sha: str) -> str:
+    return f"{pr_number}:{expected_sha}"
+
+
+def _prune_durable_jobs() -> None:
+    cutoff = time.time() - _JOB_RETENTION_SECONDS
+    for key, record in list(_DURABLE_JOBS.items()):
+        completed_at = record.get("completed_at")
+        if (
+            record.get("status") in {"completed", "failed"}
+            and isinstance(completed_at, (int, float))
+            and completed_at < cutoff
+        ):
+            _DURABLE_JOBS.pop(key, None)
+            try:
+                pr_number, expected_sha = key.split(":", 1)
+                _JOBS.pop((int(pr_number), expected_sha, "production"), None)
+            except (ValueError, TypeError):
+                pass
 
 
 def _job_key(
-    worktree: Path, helper: Callable[[Path], Mapping[str, Any]] | None
-) -> tuple[str, str]:
+    pr_number: int,
+    expected_sha: str,
+    helper: Callable[[Path], Mapping[str, Any]] | None,
+) -> tuple[Any, ...]:
     # Injected helpers are test and embedding hooks.  Separate their jobs so
     # one fixture cannot consume another fixture's completed result.
-    return (str(worktree), str(id(helper)) if helper is not None else "production")
+    return (
+        pr_number,
+        expected_sha,
+        str(id(helper)) if helper is not None else "production",
+    )
 
 
-def _thread_lock(worktree: Path) -> threading.Lock:
+def _thread_lock(worktree: Path) -> threading.RLock:
     key = str(worktree)
     with _JOB_LOCK:
-        return _WORKTREE_LOCKS.setdefault(key, threading.Lock())
+        return _WORKTREE_LOCKS.setdefault(key, threading.RLock())
 
 
 @contextmanager
@@ -196,19 +289,69 @@ def _normal_lines(lines: Sequence[str]) -> list[str]:
     return [line.strip() for line in lines if line.strip()]
 
 
-def _is_import_block(ours: Sequence[str], theirs: Sequence[str]) -> bool:
+def _line_ending_only(line: str) -> str:
+    return line.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _is_subsequence(needles: Sequence[str], haystack: Sequence[str]) -> bool:
+    position = 0
+    for needle in needles:
+        try:
+            position = haystack.index(needle, position) + 1
+        except ValueError:
+            return False
+    return True
+
+
+def _sequence_additions(side: Sequence[str], base: Sequence[str]) -> list[str] | None:
+    normalized_side = [_line_ending_only(line) for line in side]
+    normalized_base = [_line_ending_only(line) for line in base]
+    if not _is_subsequence(normalized_base, normalized_side):
+        return None
+    remaining = list(normalized_base)
+    additions: list[str] = []
+    for line in normalized_side:
+        if line in remaining:
+            remaining.remove(line)
+        else:
+            additions.append(line)
+    return additions
+
+
+def _is_import_block(
+    ours: Sequence[str], theirs: Sequence[str], base: Sequence[str] | None = None
+) -> bool:
+    if base is None:
+        return False
     significant = _normal_lines([*ours, *theirs])
-    return bool(significant) and all(_IMPORT.match(line) for line in significant)
+    if not significant or not all(_IMPORT.match(line) for line in significant):
+        return False
+    ours_added = _sequence_additions(ours, base)
+    theirs_added = _sequence_additions(theirs, base)
+    if ours_added is None or theirs_added is None:
+        return False
+    if len(set(ours_added)) != len(ours_added) or len(set(theirs_added)) != len(
+        theirs_added
+    ):
+        return False
+    common = set(ours_added) & set(theirs_added)
+    ours_order = {line: index for index, line in enumerate(ours_added)}
+    theirs_order = {line: index for index, line in enumerate(theirs_added)}
+    return all(
+        (ours_order[left] < ours_order[right])
+        == (theirs_order[left] < theirs_order[right])
+        for left in common
+        for right in common
+        if left != right
+    )
 
 
 def _is_whitespace_only(ours: Sequence[str], theirs: Sequence[str]) -> bool:
-    def normalize(line: str) -> str:
-        # Keep spaces inside literals and between tokens.  Only line endings
-        # and whitespace at the end of each line are formatting noise.
-        line = line.replace("\r\n", "\n").replace("\r", "\n")
-        return line.rstrip(" \t\n")
-
-    return [normalize(line) for line in ours] == [normalize(line) for line in theirs]
+    # Whitespace can be data in multiline strings.  Only line endings are
+    # formatting noise, so every other character must match exactly.
+    return [_line_ending_only(line) for line in ours] == [
+        _line_ending_only(line) for line in theirs
+    ]
 
 
 def _declaration_key(line: str) -> str:
@@ -325,13 +468,18 @@ def _mechanical_resolution(
     ours: Sequence[str], theirs: Sequence[str], base: Sequence[str] | None = None
 ) -> list[str] | None:
     def clean(line: str) -> str:
-        return line.rstrip(" \t\r\n") + "\n"
+        normalized = _line_ending_only(line)
+        return normalized if normalized.endswith("\n") else normalized + "\n"
 
     if _is_whitespace_only(ours, theirs):
         return [clean(line) for line in ours]
-    if _is_import_block(ours, theirs):
-        unique = {line.strip(): line for line in [*ours, *theirs]}
-        return [clean(unique[key]) for key in sorted(unique)]
+    if _is_import_block(ours, theirs, base):
+        theirs_added = _sequence_additions(theirs, base or []) or []
+        merged = [_line_ending_only(line) for line in ours]
+        for line in theirs_added:
+            if line not in merged:
+                merged.append(line)
+        return [clean(line) for line in merged]
     if _is_unrelated_additions(ours, theirs, base):
         unique: dict[str, str] = {}
         for line in [*ours, *theirs]:
@@ -389,15 +537,16 @@ def resolve_conflict_file(path: Path) -> tuple[bool, str | None]:
 
 
 def _lockfile_command(worktree: Path, filename: str) -> list[str] | None:
-    if filename == "package-lock.json" or filename == "npm-shrinkwrap.json":
+    basename = Path(filename).name
+    if basename == "package-lock.json" or basename == "npm-shrinkwrap.json":
         return ["npm", "install", "--package-lock-only", "--ignore-scripts"]
-    if filename == "pnpm-lock.yaml":
+    if basename == "pnpm-lock.yaml":
         return ["pnpm", "install", "--lockfile-only", "--ignore-scripts"]
-    if filename == "yarn.lock":
+    if basename == "yarn.lock":
         return ["yarn", "install", "--mode=skip-builds"]
-    if filename == "uv.lock":
+    if basename == "uv.lock":
         return ["uv", "lock"]
-    if filename == "Cargo.lock":
+    if basename == "Cargo.lock":
         return ["cargo", "generate-lockfile"]
     return None
 
@@ -407,9 +556,10 @@ def _regenerate_lockfile(worktree: Path, filename: str) -> str | None:
     if command is None:
         return f"no lockfile generator configured for {filename}"
     try:
+        lockfile_dir = (worktree / filename).parent
         result = subprocess.run(
             command,
-            cwd=str(worktree),
+            cwd=str(lockfile_dir),
             capture_output=True,
             text=True,
             timeout=180,
@@ -473,6 +623,26 @@ def _conflict_files(worktree: Path) -> list[str]:
             (result.stderr or result.stdout or "could not list conflicts").strip()
         )
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def _preflight_worktree(worktree: Path, expected_sha: str | None = None) -> None:
+    head_sha = _head_sha(worktree)
+    if expected_sha and (not head_sha or not head_sha.startswith(expected_sha)):
+        raise RebaseError(
+            f"worktree head changed before rebase: expected {expected_sha}, "
+            f"found {head_sha or 'unknown'}"
+        )
+    status = _git(
+        worktree, ["status", "--porcelain", "--untracked-files=all"], timeout=15
+    )
+    if status.returncode != 0:
+        raise RebaseError(
+            (status.stderr or status.stdout or "could not inspect worktree").strip()
+        )
+    if status.stdout.strip():
+        raise RebaseError(
+            f"worktree is not clean before rebase: {status.stdout.strip()[:600]}"
+        )
 
 
 def _abort_merge(worktree: Path) -> None:
@@ -737,11 +907,13 @@ def run_rebase_helper(
     smoke_commands: Sequence[tuple[Sequence[str], Path]] | None = None,
     push: bool = True,
     formatter: Callable[[Path, Sequence[str]], str | None] | None = None,
+    expected_sha: str | None = None,
 ) -> dict[str, Any]:
     """Run one serialized rebase operation in the target worktree."""
 
     root = Path(worktree).resolve()
     with _worktree_lock(root):
+        _preflight_worktree(root, expected_sha)
         return _run_rebase_helper_checked(
             root,
             smoke_commands=smoke_commands,
@@ -811,27 +983,108 @@ def _clean_result(verdict: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _escalate_to_orchestrator(
-    worker_id: str, orchestrator: str | None, result: Mapping[str, Any]
-) -> None:
-    if not orchestrator:
-        return
-    main = _main()
+def _result_message(worker_id: str, result: Mapping[str, Any]) -> str | None:
     status = result.get("status")
     if status == "resolved":
         resolved_files = ", ".join(
             str(item) for item in result.get("resolved_files", [])
         )
-        message = f"rebase-bot resolved {worker_id}: " + (
+        return f"rebase-bot resolved {worker_id}: " + (
             resolved_files or "rebase completed"
         )
-    elif status == "escalated":
-        message = f"rebase-bot escalated {worker_id}: " + "; ".join(
+    if status == "escalated":
+        return f"rebase-bot escalated {worker_id}: " + "; ".join(
             str(item) for item in result.get("escalated_hunks", [])
         )
-    else:
+    return None
+
+
+def _persist_job(job: _RebaseJob, result: Mapping[str, Any] | None = None) -> None:
+    if not job.durable:
+        return
+    _load_durable_state()
+    key = _durable_key(job.pr_number, job.expected_sha)
+    record = _DURABLE_JOBS.setdefault(key, {})
+    record.update(
+        {
+            "job_id": job.job_id,
+            "pr_number": job.pr_number,
+            "expected_sha": job.expected_sha,
+            "ticket": job.ticket,
+            "worker_id": job.worker_id,
+            "worktree": str(job.worktree),
+            "orchestrator": job.orchestrator,
+            "prompt": job.prompt,
+            "verdict": job.verdict or {},
+            "status": "completed" if result is not None else "running",
+            "result": dict(result) if result is not None else None,
+            "updated_at": time.time(),
+            "completed_at": time.time() if result is not None else None,
+        }
+    )
+    _persist_durable_state()
+
+
+def _enqueue_result(job: _RebaseJob, result: Mapping[str, Any]) -> None:
+    if not job.durable or not job.orchestrator:
+        return
+    message = _result_message(job.worker_id, result)
+    if message is None:
+        return
+    _load_durable_state()
+    entry_id = f"{job.job_id}:result"
+    _OUTBOX.setdefault(
+        entry_id,
+        {
+            "id": entry_id,
+            "target": job.orchestrator,
+            "worker_id": job.worker_id,
+            "result": dict(result),
+            "attempts": 0,
+            "last_error": None,
+        },
+    )
+    _persist_durable_state()
+
+
+def _flush_outbox() -> None:
+    _load_durable_state()
+    for entry_id, entry in list(_OUTBOX.items()):
+        target = entry.get("target")
+        result = entry.get("result")
+        worker_id = entry.get("worker_id")
+        if not isinstance(target, str) or not isinstance(result, Mapping):
+            _OUTBOX.pop(entry_id, None)
+            continue
+        message = _result_message(str(worker_id or "worker"), result)
+        if message is None:
+            _OUTBOX.pop(entry_id, None)
+            continue
+        try:
+            main = _main()
+            main.agent_message(
+                target,
+                main.MessageIn(text=message[:4000], mode="now", source="rebase-bot"),
+                main.BackgroundTasks(),
+            )
+        except Exception as exc:
+            entry["attempts"] = int(entry.get("attempts") or 0) + 1
+            entry["last_error"] = str(exc)[:600]
+            continue
+        _OUTBOX.pop(entry_id, None)
+    _persist_durable_state()
+
+
+def _escalate_to_orchestrator(
+    worker_id: str, orchestrator: str | None, result: Mapping[str, Any]
+) -> None:
+    if not orchestrator:
+        return
+    message = _result_message(worker_id, result)
+    if message is None:
         return
     try:
+        main = _main()
         main.agent_message(
             orchestrator,
             main.MessageIn(text=message[:4000], mode="now", source="rebase-bot"),
@@ -855,7 +1108,12 @@ def _finish_rebase_job(
             with _worktree_lock(job.worktree):
                 result = dict(job.helper(job.worktree))
         else:
-            result = dict(run_rebase_helper(job.worktree))
+            with _worktree_lock(job.worktree):
+                if job.verdict is None:
+                    raise RebaseError("durable rebase job has no gate verdict")
+                _validate_pr_binding(job.worktree, job.verdict)
+                _preflight_worktree(job.worktree, job.expected_sha)
+                result = dict(_run_rebase_helper_checked(job.worktree))
     except Exception as exc:
         try:
             head_sha = _head_sha(job.worktree)
@@ -866,37 +1124,170 @@ def _finish_rebase_job(
             [],
             [f"rebase worker failed: {exc}"],
         )
+        if job.helper is None:
+            try:
+                cleanup_sha = _head_sha(job.worktree)
+                if cleanup_sha:
+                    result["escalated_hunks"].extend(
+                        _cleanup_failed_rebase(job.worktree, cleanup_sha)
+                    )
+            except Exception as cleanup_exc:
+                result["escalated_hunks"].append(
+                    f"rebase cleanup failed: {cleanup_exc}"
+                )
     result["job_id"] = job.job_id
+    job.result = result
+    job.completed_at = time.time()
+    try:
+        _persist_job(job, result)
+        if job.durable:
+            _enqueue_result(job, result)
+            _flush_outbox()
+    except Exception as exc:
+        result.setdefault("escalated_hunks", []).append(
+            f"durable rebase status update failed: {exc}"
+        )
     with _JOB_LOCK:
-        job.result = result
         job.done.set()
     if result.get("status") in {"resolved", "escalated"}:
         if steer is not None:
             steer(orchestrator or worker_id, result)
-        else:
+        elif not job.durable:
             _escalate_to_orchestrator(worker_id, orchestrator, result)
     return result
 
 
 def _existing_or_new_job(
+    pr_number: int,
+    expected_sha: str,
+    ticket: str,
+    worker_id: str,
     worktree: Path,
     prompt: str,
+    verdict: Mapping[str, Any],
+    orchestrator: str | None,
     helper: Callable[[Path], Mapping[str, Any]] | None,
-) -> tuple[_RebaseJob, bool]:
-    key = _job_key(worktree, helper)
+) -> tuple[_RebaseJob, bool, bool]:
+    key = _job_key(pr_number, expected_sha, helper)
     with _JOB_LOCK:
         existing = _JOBS.get(key)
         if existing is not None:
-            return existing, False
+            return existing, False, False
+        if helper is None:
+            _load_durable_state()
+            _prune_durable_jobs()
+            record = _DURABLE_JOBS.get(_durable_key(pr_number, expected_sha))
+            if isinstance(record, Mapping):
+                job = _RebaseJob(
+                    job_id=str(record.get("job_id") or "rebase-unknown"),
+                    worktree=Path(str(record.get("worktree") or worktree)).resolve(),
+                    prompt=str(record.get("prompt") or prompt),
+                    done=threading.Event(),
+                    pr_number=pr_number,
+                    expected_sha=expected_sha,
+                    ticket=str(record.get("ticket") or ticket),
+                    worker_id=str(record.get("worker_id") or worker_id),
+                    orchestrator=(
+                        str(record["orchestrator"])
+                        if isinstance(record.get("orchestrator"), str)
+                        else orchestrator
+                    ),
+                    verdict=(
+                        dict(record["verdict"])
+                        if isinstance(record.get("verdict"), Mapping)
+                        else dict(verdict)
+                    ),
+                    durable=True,
+                )
+                if isinstance(record.get("result"), Mapping):
+                    job.result = dict(record["result"])
+                    job.completed_at = float(record.get("completed_at") or time.time())
+                    job.done.set()
+                    _JOBS[key] = job
+                    return job, False, False
+                _JOBS[key] = job
+                return job, True, True
         job = _RebaseJob(
             job_id=hashlib.sha256(f"{key}:{id(prompt)}".encode()).hexdigest()[:16],
             worktree=worktree,
             prompt=prompt,
             done=threading.Event(),
             helper=helper,
+            pr_number=pr_number,
+            expected_sha=expected_sha,
+            ticket=ticket,
+            worker_id=worker_id,
+            orchestrator=orchestrator,
+            verdict=dict(verdict),
+            durable=helper is None,
         )
         _JOBS[key] = job
-        return job, True
+        _persist_job(job)
+        return job, True, False
+
+
+def _start_rebase_thread(
+    job: _RebaseJob,
+    steer: Callable[[str, Mapping[str, Any]], None] | None = None,
+) -> None:
+    threading.Thread(
+        target=_finish_rebase_job,
+        kwargs={
+            "job": job,
+            "worker_id": job.worker_id,
+            "orchestrator": job.orchestrator,
+            "steer": steer,
+        },
+        name=f"rebase-bot-{job.job_id}",
+        daemon=True,
+    ).start()
+
+
+def resume_pending_jobs() -> None:
+    """Resume durable rebase workers and retry their result outbox."""
+
+    with _JOB_LOCK:
+        _load_durable_state()
+        _prune_durable_jobs()
+        pending: list[_RebaseJob] = []
+        for record in _DURABLE_JOBS.values():
+            if record.get("status") not in {"running", "pending"}:
+                continue
+            try:
+                pr_number = int(record["pr_number"])
+                expected_sha = str(record["expected_sha"])
+                worktree = Path(str(record["worktree"])).resolve()
+            except (KeyError, TypeError, ValueError):
+                continue
+            key = _job_key(pr_number, expected_sha, None)
+            if key in _JOBS:
+                continue
+            job = _RebaseJob(
+                job_id=str(record.get("job_id") or "rebase-unknown"),
+                worktree=worktree,
+                prompt=str(record.get("prompt") or ""),
+                done=threading.Event(),
+                pr_number=pr_number,
+                expected_sha=expected_sha,
+                ticket=str(record.get("ticket") or ""),
+                worker_id=str(record.get("worker_id") or ""),
+                orchestrator=(
+                    str(record["orchestrator"])
+                    if isinstance(record.get("orchestrator"), str)
+                    else None
+                ),
+                verdict=(
+                    dict(record["verdict"])
+                    if isinstance(record.get("verdict"), Mapping)
+                    else None
+                ),
+                durable=True,
+            )
+            _JOBS[key] = job
+            pending.append(job)
+    _flush_outbox()
+    for job in pending:
+        _start_rebase_thread(job)
 
 
 def rebase_dirty_pr(
@@ -911,6 +1302,9 @@ def rebase_dirty_pr(
     """Start or execute the safe rebase helper for one conflicting PR."""
 
     main = _main()
+    if helper is None:
+        _load_durable_state()
+        _flush_outbox()
     verdict = (
         gate(pr_number)
         if gate is not None
@@ -923,6 +1317,12 @@ def rebase_dirty_pr(
     if not _gate_is_dirty(verdict):
         raise RebaseError("gate did not report a stable MERGEABLE or CONFLICTING state")
 
+    raw = verdict.get("raw")
+    source = raw if isinstance(raw, Mapping) else verdict
+    expected_sha = source.get("head_sha")
+    if not isinstance(expected_sha, str) or not expected_sha:
+        raise RebaseError("gate did not provide the expected head sha")
+
     resolved = main._registry_agent(main._read_agent_registry(), worker_id)  # noqa: SLF001
     if resolved is None:
         raise RebaseError(f"worker {worker_id!r} is not registered")
@@ -934,7 +1334,17 @@ def rebase_dirty_pr(
     _validate_pr_binding(worktree, verdict)
     orchestrator = current.get("orch") if isinstance(current.get("orch"), str) else None
     prompt = helper_prompt(ticket=ticket, pr_number=pr_number, worker_id=worker_id)
-    job, owner = _existing_or_new_job(worktree, prompt, helper)
+    job, owner, resumed = _existing_or_new_job(
+        pr_number,
+        expected_sha,
+        ticket,
+        worker_id,
+        worktree,
+        prompt,
+        verdict,
+        orchestrator,
+        helper,
+    )
     if not owner:
         if not job.done.wait(timeout=0 if job.result is not None else 0):
             return {
@@ -955,20 +1365,9 @@ def rebase_dirty_pr(
             orchestrator=orchestrator,
             steer=steer,
         )
-    thread = threading.Thread(
-        target=_finish_rebase_job,
-        kwargs={
-            "job": job,
-            "worker_id": worker_id,
-            "orchestrator": orchestrator,
-            "steer": steer,
-        },
-        name=f"rebase-bot-{job.job_id}",
-        daemon=True,
-    )
-    thread.start()
+    _start_rebase_thread(job, steer)
     return {
-        "status": "started",
+        "status": "running" if resumed else "started",
         "source": "rebase-bot",
         "job_id": job.job_id,
         "prompt": prompt,
@@ -980,5 +1379,6 @@ __all__ = [
     "helper_prompt",
     "rebase_dirty_pr",
     "resolve_conflict_file",
+    "resume_pending_jobs",
     "run_rebase_helper",
 ]

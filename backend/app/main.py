@@ -99,6 +99,9 @@ PROVIDER_HEALTH = provider_health.ProviderHealthTracker()
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     runtime_paths = RuntimePaths.from_env()
+    from .agent_runtime import rebase_bot
+
+    rebase_bot.resume_pending_jobs()
     configured_backend = os.environ.get("WIKI_BACKEND_URL")
     if configured_backend:
         backend_runtime.publish_backend_url(configured_backend)
