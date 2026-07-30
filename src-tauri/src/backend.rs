@@ -29,10 +29,13 @@ use tauri_plugin_shell::{
 const FINDER_SAFE_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 const HEALTH_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(200);
+const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(350);
+const DAEMON_PROBE_WAIT: Duration = Duration::from_secs(1);
 const SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
 const MAIN_WINDOW_LABEL: &str = "main";
 const WINDOW_TITLE: &str = "Wiki";
 const APP_LOCK_NAME: &str = "app.lock";
+const DEFAULT_DAEMON_URL: &str = "http://127.0.0.1:8213/";
 // Guard: WKWebView can defer this eval past the post-health navigate() when
 // the backend boots fast (onedir sidecar ~0.4s) — unguarded, the deferred
 // write CLOBBERS the already-loaded app with the static loading card.
@@ -358,6 +361,8 @@ fn launch_backend_and_navigate(app: &AppHandle) {
     let launch_result = if let Ok(url) = env::var("WIKI_NATIVE_BACKEND_URL") {
         let launch_url = normalize_launch_url(&url);
         wait_for_health(app, &launch_url, None).map(|_| launch_url)
+    } else if let Some(launch_url) = probe_persistent_daemon() {
+        Ok(launch_url)
     } else {
         start_sidecar(app, 0)
     };
@@ -377,6 +382,36 @@ fn launch_backend_and_navigate(app: &AppHandle) {
             show_error_dialog(app, "Wiki backend failed to start", &format!("{err}"));
         }
     }
+}
+
+fn probe_persistent_daemon() -> Option<String> {
+    let launch_url = normalize_launch_url(
+        &env::var("WIKI_DAEMON_BACKEND_URL").unwrap_or_else(|_| DEFAULT_DAEMON_URL.to_string()),
+    );
+    let health_url = health_url_for(&launch_url);
+    let client = Client::builder()
+        .timeout(DAEMON_PROBE_TIMEOUT)
+        .build()
+        .ok()?;
+    let deadline = Instant::now() + DAEMON_PROBE_WAIT;
+    while Instant::now() < deadline {
+        let response = client.get(&health_url).send();
+        if let Ok(response) = response {
+            if response.status().is_success() {
+                if let Ok(payload) = response.json::<serde_json::Value>() {
+                    if payload
+                        .get("daemon_managed")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                    {
+                        return Some(launch_url);
+                    }
+                }
+            }
+        }
+        thread::sleep(HEALTH_POLL_INTERVAL.min(DAEMON_PROBE_TIMEOUT));
+    }
+    None
 }
 
 fn spawn_sidecar_logger(

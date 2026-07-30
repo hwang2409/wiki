@@ -18,6 +18,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vault-dir")
     parser.add_argument("--frontend-dist")
     parser.add_argument("--parent-pid", type=int)
+    parser.add_argument("--daemon", action="store_true")
+    parser.add_argument("--log-path")
     return parser.parse_args()
 
 
@@ -37,6 +39,8 @@ def configure_environment(args: argparse.Namespace) -> None:
         os.environ["WIKI_REPO_DIR"] = args.repo_dir
     if args.vault_dir:
         os.environ["WIKI_VAULT_DIR"] = args.vault_dir
+    if args.daemon:
+        os.environ["WIKI_BACKEND_DAEMON"] = "launchd"
 
     frontend_dist = args.frontend_dist or os.environ.get("WIKI_FRONTEND_DIST")
     if frontend_dist:
@@ -46,6 +50,30 @@ def configure_environment(args: argparse.Namespace) -> None:
     bundled = bundled_frontend_dist()
     if bundled is not None:
         os.environ["WIKI_FRONTEND_DIST"] = str(bundled)
+
+
+def rotate_log_file(path: Path, *, max_bytes: int = 10 * 1024 * 1024, backups: int = 5) -> None:
+    """Rotate the daemon log before launchd reconnects its standard streams."""
+
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not path.exists() or path.stat().st_size < max_bytes:
+        return
+    for index in range(backups, 0, -1):
+        source = path.with_name(f"{path.name}.{index - 1}" if index > 1 else path.name)
+        destination = path.with_name(f"{path.name}.{index}")
+        if source.exists():
+            source.replace(destination)
+
+
+def configure_daemon_log(path: Path) -> None:
+    rotate_log_file(path)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.dup2(descriptor, sys.stdout.fileno())
+        os.dup2(descriptor, sys.stderr.fileno())
+    finally:
+        if descriptor > 2:
+            os.close(descriptor)
 
 
 def parent_is_alive(parent_pid: int) -> bool:
@@ -108,6 +136,8 @@ def main() -> None:
 
     args = parse_args()
     configure_environment(args)
+    if args.daemon and args.log_path:
+        configure_daemon_log(Path(args.log_path).expanduser().absolute())
 
     from backend.app.main import app, wiki_app_secret_boot_line
 

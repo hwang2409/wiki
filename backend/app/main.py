@@ -65,6 +65,7 @@ from .agent_runtime.loop_state import derive_loop_state
 from .agent_runtime.store import RuntimePaths
 from .agent_runtime.ticket import base_ticket
 from .agent_runtime.unknown_kind_telemetry import UnknownKindTelemetry
+from .agent_runtime.version import RUNTIME_FINGERPRINT
 from .frontend_static import mount_frontend_static
 from .next_review_schema import NextReviewIn
 from .rebase_schema import RebaseDirtyPrIn
@@ -925,8 +926,12 @@ def normalize_content(title: str, content: str) -> str:
 
 
 @app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+def health() -> dict[str, object]:
+    return {
+        "status": "ok",
+        "daemon_managed": os.environ.get("WIKI_BACKEND_DAEMON") == "launchd",
+        "backend_fingerprint": RUNTIME_FINGERPRINT,
+    }
 
 
 def _unknown_kind_telemetry_service() -> UnknownKindTelemetry:
