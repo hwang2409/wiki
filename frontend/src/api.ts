@@ -226,6 +226,8 @@ export type BlastRadiusCollision = {
 export type BlastRadiusPayload = {
   candidate: string;
   candidate_found: boolean | null;
+  complete: boolean;
+  failed_branches: Array<{ branch: string; reason: string }>;
   branches: BlastRadiusBranch[];
   collisions: BlastRadiusCollision[];
   risk: {

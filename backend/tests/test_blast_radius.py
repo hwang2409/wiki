@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -54,6 +57,16 @@ class BlastRadiusTests(unittest.TestCase):
     def refs(self) -> dict[str, blast_radius.BranchRef]:
         return blast_radius._refs(self.fixture.root, timeout=2)
 
+    def snapshot(self, *names: str) -> blast_radius.OpenPRSnapshotState:
+        refs = self.refs()
+        return blast_radius.OpenPRSnapshotState(
+            tuple(
+                blast_radius.OpenPRBranch(name, refs[name].head_sha)
+                for name in names
+            ),
+            True,
+        )
+
     def test_changed_files_use_main_three_dot_diff(self) -> None:
         refs = self.refs()
         self.assertEqual(
@@ -87,6 +100,34 @@ class BlastRadiusTests(unittest.TestCase):
         self.assertEqual(cache.get_or_compute("one", "b", compute), ("styles.css",))
         self.assertEqual(calls, 2)
 
+    def test_cache_single_flight_runs_one_same_key_computation(self) -> None:
+        cache = blast_radius.DiffCache()
+        calls = 0
+        calls_lock = threading.Lock()
+        barrier = threading.Barrier(8)
+
+        def compute() -> tuple[str, ...]:
+            nonlocal calls
+            with calls_lock:
+                calls += 1
+            time.sleep(0.05)
+            return ("styles.css",)
+
+        def load() -> tuple[str, ...]:
+            barrier.wait()
+            return cache.get_or_compute("one", "same-head", compute)
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            values = list(pool.map(lambda _index: load(), range(8)))
+        self.assertEqual(values, [("styles.css",)] * 8)
+        self.assertEqual(calls, 1)
+
+    def test_cache_single_flight_clears_inflight_after_error(self) -> None:
+        cache = blast_radius.DiffCache()
+        with self.assertRaisesRegex(RuntimeError, "failed"):
+            cache.get_or_compute("one", "bad-head", lambda: (_ for _ in ()).throw(RuntimeError("failed")))
+        self.assertEqual(cache.get_or_compute("one", "bad-head", lambda: ("styles.css",)), ("styles.css",))
+
     def test_analyze_all_reports_collision_and_hot_file(self) -> None:
         refs = self.refs()
         payload = blast_radius.analyze(
@@ -96,11 +137,59 @@ class BlastRadiusTests(unittest.TestCase):
                 "TWO": {"current": {"role": "implement", "branch": "two"}},
             },
             cache=blast_radius.DiffCache(),
+            pr_snapshot=self.snapshot("one", "two"),
         )
         self.assertIsNotNone(refs)
         self.assertEqual(payload["risk"]["count"], 1)
         self.assertEqual(payload["risk"]["hot_files"], ["styles.css"])
         self.assertEqual(payload["collisions"][0]["overlap"], ["styles.css"])
+
+    def test_open_pr_snapshot_filters_closed_refs_and_deduplicates_local_remote(self) -> None:
+        refs = self.refs()
+        git(self.fixture.root, "update-ref", "refs/remotes/origin/one", refs["one"].head_sha)
+        git(self.fixture.root, "update-ref", "refs/remotes/origin/closed", refs["two"].head_sha)
+        payload = blast_radius.analyze(
+            self.fixture.root,
+            {},
+            cache=blast_radius.DiffCache(),
+            pr_snapshot=self.snapshot("one"),
+        )
+        self.assertTrue(payload["complete"])
+        self.assertEqual([row["branch"] for row in payload["branches"]], ["one"])
+
+    def test_stale_open_pr_head_is_an_incomplete_failure(self) -> None:
+        payload = blast_radius.analyze(
+            self.fixture.root,
+            {},
+            cache=blast_radius.DiffCache(),
+            pr_snapshot=blast_radius.OpenPRSnapshotState(
+                (blast_radius.OpenPRBranch("one", "0" * 40),),
+                True,
+            ),
+        )
+        self.assertFalse(payload["complete"])
+        self.assertEqual(payload["risk"]["count"], 0)
+        self.assertTrue(payload["failed_branches"])
+
+    def test_timeout_is_reported_and_never_becomes_no_overlap(self) -> None:
+        with mock.patch.object(
+            blast_radius,
+            "changed_files",
+            side_effect=lambda _repo, branch, **_kwargs: (
+                (_ for _ in ()).throw(blast_radius.GitAnalysisError(f"timeout {branch.name}"))
+                if branch.name == "two"
+                else ("styles.css",),
+            ),
+        ):
+            payload = blast_radius.analyze(
+                self.fixture.root,
+                {},
+                cache=blast_radius.DiffCache(),
+                pr_snapshot=self.snapshot("one", "two"),
+            )
+        self.assertFalse(payload["complete"])
+        self.assertEqual(payload["risk"]["count"], 0)
+        self.assertIn("two", {failure["branch"] for failure in payload["failed_branches"]})
 
     def test_registered_worktree_branch_is_discovered_from_primary_repo(self) -> None:
         worktree = self.fixture.root.parent / "worker-one"
@@ -122,9 +211,15 @@ class BlastRadiusTests(unittest.TestCase):
         self.assertIn("one", branches)
 
     def test_candidate_can_be_a_ref_or_ticket_and_missing_is_clean(self) -> None:
-        by_ref = blast_radius.analyze(self.fixture.root, {}, "one", cache=blast_radius.DiffCache())
+        by_ref = blast_radius.analyze(
+            self.fixture.root,
+            {},
+            "one",
+            cache=blast_radius.DiffCache(),
+            pr_snapshot=self.snapshot("one"),
+        )
         self.assertTrue(by_ref["candidate_found"])
-        self.assertEqual(by_ref["collisions"], [])
+        self.assertTrue(by_ref["complete"])
 
         missing = blast_radius.analyze(
             self.fixture.root,
@@ -133,8 +228,56 @@ class BlastRadiusTests(unittest.TestCase):
             cache=blast_radius.DiffCache(),
         )
         self.assertFalse(missing["candidate_found"])
+        self.assertFalse(missing["complete"])
         self.assertEqual(missing["collisions"], [])
-        self.assertIn("not found", missing["error"])
+        self.assertIn("not-a-real-branch", {failure["branch"] for failure in missing["failed_branches"]})
+
+    def test_deleted_open_pr_candidate_is_not_found(self) -> None:
+        payload = blast_radius.analyze(
+            self.fixture.root,
+            {},
+            "deleted",
+            cache=blast_radius.DiffCache(),
+            pr_snapshot=blast_radius.OpenPRSnapshotState(
+                (blast_radius.OpenPRBranch("deleted", "1" * 40),),
+                True,
+            ),
+        )
+        self.assertFalse(payload["candidate_found"])
+        self.assertFalse(payload["complete"])
+        self.assertIn("deleted", {failure["branch"] for failure in payload["failed_branches"]})
+
+    def test_origin_main_is_a_valid_full_main_ref(self) -> None:
+        base = git(self.fixture.root, "rev-parse", "main")
+        git(self.fixture.root, "branch", "-m", "main", "local-main")
+        git(self.fixture.root, "update-ref", "refs/remotes/origin/main", base)
+        payload = blast_radius.analyze(
+            self.fixture.root,
+            {},
+            cache=blast_radius.DiffCache(),
+            pr_snapshot=blast_radius.OpenPRSnapshotState((), True),
+        )
+        self.assertTrue(payload["complete"])
+
+    def test_missing_main_ref_is_an_error_not_a_success(self) -> None:
+        git(self.fixture.root, "branch", "-m", "main", "local-main")
+        payload = blast_radius.analyze(
+            self.fixture.root,
+            {},
+            cache=blast_radius.DiffCache(),
+            pr_snapshot=blast_radius.OpenPRSnapshotState((), True),
+        )
+        self.assertFalse(payload["complete"])
+        self.assertEqual(payload["risk"]["count"], 0)
+        self.assertIn("main", {failure["branch"] for failure in payload["failed_branches"]})
+
+    def test_snapshot_provider_refreshes_and_reports_provider_errors(self) -> None:
+        snapshot = blast_radius.OpenPRSnapshot(lambda: [{"headRefName": "one"}])
+        state = snapshot.refresh()
+        self.assertTrue(state.complete)
+        self.assertEqual([branch.name for branch in state.branches], ["one"])
+        broken = blast_radius.OpenPRSnapshot(lambda: (_ for _ in ()).throw(RuntimeError("offline")))
+        self.assertFalse(broken.refresh().complete)
 
     def test_malformed_registry_and_branch_input_do_not_escape_git(self) -> None:
         payload = blast_radius.analyze(

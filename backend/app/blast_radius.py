@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import threading
 import time
+from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Sequence
 
 
 MAX_ACTIVE_BRANCHES = 100
@@ -15,6 +17,7 @@ MAX_CHANGED_FILES = 5_000
 MAX_CACHE_ENTRIES = 256
 GIT_TIMEOUT_SECONDS = 2.0
 ANALYSIS_TIMEOUT_SECONDS = 5.0
+OPEN_PR_REFRESH_SECONDS = 30.0
 
 
 @dataclass(frozen=True)
@@ -40,12 +43,173 @@ class BranchFiles:
     files: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class OpenPRBranch:
+    name: str
+    head_sha: str | None = None
+    ticket: str | None = None
+
+
+@dataclass(frozen=True)
+class OpenPRSnapshotState:
+    branches: tuple[OpenPRBranch, ...]
+    complete: bool
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class DiscoveryResult:
+    branches: tuple[ActiveBranch, ...]
+    failed_branches: tuple[dict[str, str], ...]
+    open_pr_snapshot_complete: bool
+
+
+def _logical_branch_name(value: str) -> str:
+    for prefix in ("refs/heads/", "refs/remotes/origin/", "origin/"):
+        if value.startswith(prefix):
+            return value[len(prefix) :]
+    return value
+
+
+def _valid_snapshot_branch(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    branch = _logical_branch_name(value.strip())
+    return bool(
+        branch
+        and not branch.startswith("-")
+        and "\x00" not in branch
+        and ".." not in branch
+        and "@{" not in branch
+        and not any(char.isspace() or ord(char) < 32 for char in branch)
+    )
+
+
+def parse_open_pr_snapshot(payload: object) -> tuple[OpenPRBranch, ...]:
+    """Parse provider output without trusting it as a git ref."""
+
+    rows = payload
+    if isinstance(payload, dict):
+        rows = payload.get("branches") or payload.get("pullRequests") or []
+    if not isinstance(rows, list | tuple):
+        raise ValueError("open PR snapshot must be a list")
+
+    branches: dict[str, OpenPRBranch] = {}
+    for row in rows:
+        if isinstance(row, str):
+            raw_name = row
+            head_sha = None
+            ticket = None
+        elif isinstance(row, dict):
+            raw_name = row.get("headRefName") or row.get("branch") or row.get("name")
+            head_sha = row.get("headRefOid") or row.get("head_sha")
+            ticket = row.get("ticket")
+        else:
+            continue
+        if not _valid_snapshot_branch(raw_name):
+            continue
+        name = _logical_branch_name(str(raw_name).strip())
+        normalized_sha = str(head_sha).strip() if head_sha else None
+        normalized_ticket = str(ticket).strip() if ticket else None
+        branches.setdefault(name, OpenPRBranch(name, normalized_sha, normalized_ticket))
+    return tuple(sorted(branches.values(), key=lambda branch: branch.name))
+
+
+def _default_open_pr_provider() -> object:
+    """Read open PR heads outside the request path.
+
+    The snapshot is refreshed by a background thread. A request only reads
+    the last successful snapshot and never invokes GitHub or ``gh``.
+    """
+
+    try:
+        result = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "list",
+                "--state",
+                "open",
+                "--limit",
+                str(MAX_ACTIVE_BRANCHES),
+                "--json",
+                "headRefName,headRefOid,number",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(str(exc)) from exc
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or "gh pr list failed").strip()[:200])
+    try:
+        return json.loads(result.stdout)
+    except ValueError as exc:
+        raise RuntimeError("gh returned invalid open PR JSON") from exc
+
+
+class OpenPRSnapshot:
+    """Injected, background-refreshed source of open PR branch names."""
+
+    def __init__(
+        self,
+        provider: Callable[[], object] | None = None,
+        *,
+        refresh_seconds: float = OPEN_PR_REFRESH_SECONDS,
+    ) -> None:
+        self.provider = provider or _default_open_pr_provider
+        self.refresh_seconds = max(1.0, refresh_seconds)
+        self._state = OpenPRSnapshotState((), False, "open PR snapshot has not refreshed")
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def read(self) -> OpenPRSnapshotState:
+        with self._lock:
+            return self._state
+
+    def refresh(self) -> OpenPRSnapshotState:
+        try:
+            state = OpenPRSnapshotState(parse_open_pr_snapshot(self.provider()), True)
+        except Exception as exc:  # provider failure must not break the request path
+            state = OpenPRSnapshotState((), False, str(exc)[:200])
+        with self._lock:
+            self._state = state
+        return state
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self.refresh()
+            self._stop.wait(self.refresh_seconds)
+
+    def start(self) -> None:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop.clear()
+            self._thread = threading.Thread(target=self._run, name="wiki-open-pr-snapshot", daemon=True)
+            self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1)
+        self._thread = None
+
+
+OPEN_PR_SNAPSHOT = OpenPRSnapshot()
+
+
 class DiffCache:
-    """Small process-local cache keyed by branch and its current head SHA."""
+    """Bounded cache with same-key single-flight computation."""
 
     def __init__(self, max_entries: int = MAX_CACHE_ENTRIES) -> None:
         self.max_entries = max(1, max_entries)
         self._values: dict[tuple[str, str], tuple[str, ...]] = {}
+        self._inflight: dict[tuple[str, str], Future[tuple[str, ...]]] = {}
         self._lock = threading.Lock()
 
     def get_or_compute(
@@ -59,16 +223,33 @@ class DiffCache:
             cached = self._values.get(key)
             if cached is not None:
                 return cached
+            future = self._inflight.get(key)
+            owner = future is None
+            if owner:
+                future = Future()
+                self._inflight[key] = future
 
-        value = tuple(compute())
+        if not owner:
+            return future.result()
+
+        try:
+            value = tuple(compute())
+        except BaseException as exc:
+            with self._lock:
+                self._inflight.pop(key, None)
+                future.set_exception(exc)
+            raise
+
         with self._lock:
             cached = self._values.get(key)
-            if cached is not None:
-                return cached
-            while len(self._values) >= self.max_entries:
-                self._values.pop(next(iter(self._values)))
-            self._values[key] = value
-        return value
+            if cached is None:
+                while len(self._values) >= self.max_entries:
+                    self._values.pop(next(iter(self._values)))
+                self._values[key] = value
+                cached = value
+            self._inflight.pop(key, None)
+            future.set_result(cached)
+        return cached
 
 
 DIFF_CACHE = DiffCache()
@@ -113,12 +294,17 @@ def _refs(repo_root: Path, *, timeout: float) -> dict[str, BranchRef]:
         if len(parts) != 3:
             continue
         short, ref, sha = parts
-        if not short or not ref or not sha:
-            continue
-        if short == "origin/HEAD" or short.endswith("/HEAD"):
+        if not short or not ref or not sha or short.endswith("/HEAD"):
             continue
         refs.setdefault(short, BranchRef(name=short, ref=ref, head_sha=sha))
     return refs
+
+
+def _resolve_main_ref(refs: dict[str, BranchRef]) -> BranchRef | None:
+    for name in ("main", "origin/main"):
+        if name in refs:
+            return refs[name]
+    return next((refs[name] for name in sorted(refs) if name.endswith("/main")), None)
 
 
 def _worktree_branches(repo_root: Path, *, timeout: float) -> dict[str, str]:
@@ -129,7 +315,7 @@ def _worktree_branches(repo_root: Path, *, timeout: float) -> dict[str, str]:
         if line.startswith("worktree "):
             current_path = str(Path(line[9:]).resolve())
         elif line.startswith("branch refs/") and current_path:
-            result[current_path] = line[len("branch refs/heads/") :]
+            result[current_path] = _logical_branch_name(line[len("branch ") :])
         elif not line.strip():
             current_path = None
     return result
@@ -148,12 +334,12 @@ def _branch_hint(current: dict[str, Any]) -> str | None:
     for key in ("branch", "branch_name", "pr_branch", "head_ref_name"):
         value = current.get(key)
         if isinstance(value, str) and value.strip():
-            return value.strip()
+            return _logical_branch_name(value.strip())
     return None
 
 
 def _ticket_for_branch(branch: str, registry: dict[str, Any]) -> str | None:
-    lowered = branch.lower()
+    lowered = _logical_branch_name(branch).lower()
     for ticket, current in _registry_rows(registry):
         hint = _branch_hint(current)
         if hint and hint.lower() == lowered:
@@ -163,44 +349,80 @@ def _ticket_for_branch(branch: str, registry: dict[str, Any]) -> str | None:
     return None
 
 
-def discover_active_branches(
+def _ref_candidates(refs: dict[str, BranchRef], branch: str) -> list[BranchRef]:
+    logical = _logical_branch_name(branch)
+    preferred = [logical, f"origin/{logical}"]
+    ordered: list[BranchRef] = []
+    for name in preferred:
+        ref = refs.get(name)
+        if ref is not None:
+            ordered.append(ref)
+    ordered.extend(ref for name, ref in refs.items() if _logical_branch_name(name) == logical and ref not in ordered)
+    return ordered
+
+
+def _select_ref(
+    refs: dict[str, BranchRef],
+    branch: str,
+    expected_sha: str | None = None,
+) -> tuple[BranchRef | None, str | None]:
+    candidates = [ref for ref in _ref_candidates(refs, branch) if _logical_branch_name(ref.name) != "main"]
+    if not candidates:
+        return None, "branch ref is not present in fetched refs"
+    if expected_sha:
+        matching = [ref for ref in candidates if ref.head_sha == expected_sha]
+        if not matching:
+            return None, "fetched branch head does not match the open PR head"
+        return matching[0], None
+    return candidates[0], None
+
+
+def _failed(branch: str, reason: str) -> dict[str, str]:
+    return {"branch": branch, "reason": reason[:200]}
+
+
+def _add_selected(selected: dict[str, ActiveBranch], branch: ActiveBranch) -> None:
+    existing = selected.get(branch.name)
+    if existing is None or (branch.source == "worker" and existing.source != "worker"):
+        selected[branch.name] = branch
+
+
+def discover_active_branch_result(
     repo_root: Path,
     registry: dict[str, Any],
     *,
-    refs: dict[str, BranchRef] | None = None,
-    deadline: float | None = None,
-) -> list[ActiveBranch]:
-    """Find branch refs without inspecting any worker worktree.
+    refs: dict[str, BranchRef],
+    pr_snapshot: OpenPRSnapshotState,
+    deadline: float,
+) -> DiscoveryResult:
+    failures: list[dict[str, str]] = []
+    selected: dict[str, ActiveBranch] = {}
 
-    Remote-tracking refs are the only local record of fetched PR heads. They
-    are included as PR candidates. Registered worker worktrees add their exact
-    branch, even when the branch is local-only.
-    """
-
-    deadline = deadline or time.monotonic() + ANALYSIS_TIMEOUT_SECONDS
-
-    def remaining() -> float:
-        return max(0.05, min(GIT_TIMEOUT_SECONDS, deadline - time.monotonic()))
+    if pr_snapshot.complete:
+        for pr_branch in pr_snapshot.branches[:MAX_ACTIVE_BRANCHES]:
+            ref, reason = _select_ref(refs, pr_branch.name, pr_branch.head_sha)
+            if ref is None:
+                failures.append(_failed(pr_branch.name, reason or "branch ref unavailable"))
+                continue
+            _add_selected(
+                selected,
+                ActiveBranch(
+                    name=_logical_branch_name(ref.name),
+                    ref=ref.ref,
+                    head_sha=ref.head_sha,
+                    source="pr",
+                    ticket=pr_branch.ticket or _ticket_for_branch(pr_branch.name, registry),
+                ),
+            )
 
     try:
-        refs = refs if refs is not None else _refs(repo_root, timeout=remaining())
-        worktrees = _worktree_branches(repo_root, timeout=remaining())
-    except GitAnalysisError:
-        return []
-
-    selected: dict[str, ActiveBranch] = {}
-    main = refs.get("main")
-    for name, ref in refs.items():
-        if name == "main" or name.endswith("/main") or (main and ref.ref == main.ref):
-            continue
-        if name.startswith("origin/"):
-            selected[name] = ActiveBranch(
-                name=name,
-                ref=ref.ref,
-                head_sha=ref.head_sha,
-                source="pr",
-                ticket=_ticket_for_branch(name, registry),
-            )
+        worktrees = _worktree_branches(
+            repo_root,
+            timeout=min(GIT_TIMEOUT_SECONDS, max(0.05, deadline - time.monotonic())),
+        )
+    except GitAnalysisError as exc:
+        worktrees = {}
+        failures.append(_failed("registered worker worktrees", str(exc)))
 
     registered_paths: dict[str, str] = {}
     for ticket, current in _registry_rows(registry):
@@ -211,32 +433,42 @@ def discover_active_branches(
             try:
                 registered_paths[str(Path(raw_worktree).expanduser().resolve())] = ticket
             except (OSError, RuntimeError, TypeError, ValueError):
-                pass
+                failures.append(_failed(ticket, "registered worktree path is invalid"))
         hint = _branch_hint(current)
         if hint:
-            candidate = refs.get(hint) or refs.get(hint.removeprefix("refs/heads/"))
-            if candidate and candidate.name not in {"main"}:
-                selected[candidate.name] = ActiveBranch(
-                    name=candidate.name,
-                    ref=candidate.ref,
-                    head_sha=candidate.head_sha,
-                    source="worker",
-                    ticket=ticket,
+            ref, reason = _select_ref(refs, hint)
+            if ref is None:
+                failures.append(_failed(hint, reason or "registered branch ref unavailable"))
+            else:
+                _add_selected(
+                    selected,
+                    ActiveBranch(
+                        name=_logical_branch_name(ref.name),
+                        ref=ref.ref,
+                        head_sha=ref.head_sha,
+                        source="worker",
+                        ticket=ticket,
+                    ),
                 )
 
     for path, ticket in registered_paths.items():
         branch_name = worktrees.get(path)
         if not branch_name:
+            failures.append(_failed(ticket, "registered worker branch is not available"))
             continue
-        candidate = refs.get(branch_name) or refs.get(branch_name.removeprefix("refs/heads/"))
-        if candidate is None or candidate.name == "main" or candidate.name.endswith("/main"):
+        ref, reason = _select_ref(refs, branch_name)
+        if ref is None:
+            failures.append(_failed(branch_name, reason or "registered branch ref unavailable"))
             continue
-        selected[candidate.name] = ActiveBranch(
-            name=candidate.name,
-            ref=candidate.ref,
-            head_sha=candidate.head_sha,
-            source="worker",
-            ticket=ticket,
+        _add_selected(
+            selected,
+            ActiveBranch(
+                name=_logical_branch_name(ref.name),
+                ref=ref.ref,
+                head_sha=ref.head_sha,
+                source="worker",
+                ticket=ticket,
+            ),
         )
 
     workers = sorted(
@@ -247,20 +479,53 @@ def discover_active_branches(
         (branch for branch in selected.values() if branch.source != "worker"),
         key=lambda branch: branch.name,
     )
-    return [*workers, *other_branches][:MAX_ACTIVE_BRANCHES]
+    return DiscoveryResult(
+        tuple([*workers, *other_branches][:MAX_ACTIVE_BRANCHES]),
+        tuple(failures),
+        pr_snapshot.complete,
+    )
+
+
+def discover_active_branches(
+    repo_root: Path,
+    registry: dict[str, Any],
+    *,
+    refs: dict[str, BranchRef] | None = None,
+    deadline: float | None = None,
+    pr_snapshot: OpenPRSnapshotState | None = None,
+) -> list[ActiveBranch]:
+    """Compatibility wrapper returning only validated active branches."""
+
+    deadline = deadline or time.monotonic() + ANALYSIS_TIMEOUT_SECONDS
+    refs = refs or _refs(repo_root, timeout=GIT_TIMEOUT_SECONDS)
+    snapshot = pr_snapshot or OPEN_PR_SNAPSHOT.read()
+    return list(
+        discover_active_branch_result(
+            repo_root,
+            registry,
+            refs=refs,
+            pr_snapshot=snapshot,
+            deadline=deadline,
+        ).branches
+    )
 
 
 def changed_files(
     repo_root: Path,
     branch: BranchRef | ActiveBranch,
     *,
+    main_ref: BranchRef | None = None,
     timeout: float = GIT_TIMEOUT_SECONDS,
 ) -> tuple[str, ...]:
     """Return the immutable changed-file set for ``main...branch``."""
 
+    if main_ref is None:
+        main_ref = _resolve_main_ref(_refs(repo_root, timeout=timeout))
+    if main_ref is None:
+        raise GitAnalysisError("main ref is not present in fetched refs")
     output = _run_git(
         repo_root,
-        ["diff", "--name-only", "--no-renames", f"main...{branch.ref}", "--"],
+        ["diff", "--name-only", "--no-renames", f"{main_ref.ref}...{branch.ref}", "--"],
         timeout=timeout,
     )
     files = tuple(dict.fromkeys(line for line in output.splitlines() if line))
@@ -297,21 +562,81 @@ def _risk_summary(collisions: list[dict[str, Any]]) -> dict[str, Any]:
     for collision in collisions:
         for path in collision["overlap"]:
             counts[path] = counts.get(path, 0) + 1
-    hot_files = [path for path, _count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:10]]
+    hot_files = [
+        path for path, _count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:10]
+    ]
     count = len(collisions)
     level = "none" if count == 0 else "low" if count == 1 else "medium" if count < 4 else "high"
     return {"count": count, "level": level, "hot_files": hot_files}
 
 
 def _candidate_matches(candidate: str, branch: ActiveBranch) -> bool:
-    normalized = candidate.strip().lower()
+    normalized = _logical_branch_name(candidate.strip()).lower()
+    return bool(
+        normalized
+        and (
+            branch.name.lower() == normalized
+            or branch.ref.lower() == candidate.strip().lower()
+            or (branch.ticket and branch.ticket.lower() == normalized)
+        )
+    )
+
+
+def _candidate_ref(
+    candidate: str,
+    refs: dict[str, BranchRef],
+    active: Sequence[ActiveBranch],
+    registry: dict[str, Any],
+) -> BranchRef | None:
+    found = next((branch for branch in active if _candidate_matches(candidate, branch)), None)
+    if found is not None:
+        return BranchRef(found.name, found.ref, found.head_sha)
+    normalized = _logical_branch_name(candidate.strip()).lower()
     if not normalized or normalized == "all":
-        return False
-    if branch.name.lower() == normalized or branch.ref.lower() == normalized:
-        return True
-    if branch.ticket and branch.ticket.lower() == normalized:
-        return True
-    return False
+        return None
+    ref, _reason = _select_ref(refs, normalized)
+    if ref is not None:
+        return ref
+    for ticket, current in _registry_rows(registry):
+        if ticket.lower() != normalized:
+            continue
+        hint = _branch_hint(current)
+        if hint:
+            ref, _reason = _select_ref(refs, hint)
+            return ref
+    return None
+
+
+def _response(
+    *,
+    candidate: str,
+    candidate_found: bool | None,
+    branches: list[dict[str, Any]],
+    collisions: list[dict[str, Any]],
+    failed_branches: list[dict[str, str]],
+    error: str | None = None,
+) -> dict[str, Any]:
+    deduped_failures: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for failure in failed_branches:
+        key = (failure.get("branch", ""), failure.get("reason", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped_failures.append(failure)
+    complete = not deduped_failures and error is None
+    payload: dict[str, Any] = {
+        "candidate": candidate,
+        "candidate_found": candidate_found,
+        "complete": complete,
+        "failed_branches": deduped_failures,
+        "branches": branches,
+        "collisions": collisions,
+        "risk": _risk_summary(collisions),
+    }
+    if error:
+        payload["error"] = error
+    return payload
 
 
 def analyze(
@@ -320,72 +645,74 @@ def analyze(
     candidate: str = "all",
     *,
     cache: DiffCache = DIFF_CACHE,
+    pr_snapshot: OpenPRSnapshot | OpenPRSnapshotState | None = None,
 ) -> dict[str, Any]:
-    started = time.monotonic()
-    deadline = started + ANALYSIS_TIMEOUT_SECONDS
+    deadline = time.monotonic() + ANALYSIS_TIMEOUT_SECONDS
+    snapshot_state = (
+        pr_snapshot.read()
+        if isinstance(pr_snapshot, OpenPRSnapshot)
+        else pr_snapshot or OPEN_PR_SNAPSHOT.read()
+    )
     try:
         refs = _refs(repo_root, timeout=GIT_TIMEOUT_SECONDS)
-        active = discover_active_branches(repo_root, registry, refs=refs, deadline=deadline)
-    except GitAnalysisError:
-        return {
-            "candidate": candidate,
-            "branches": [],
-            "collisions": [],
-            "risk": _risk_summary([]),
-            "error": "branch refs are unavailable",
-        }
+    except GitAnalysisError as exc:
+        return _response(
+            candidate=candidate,
+            candidate_found=None if candidate.strip().lower() in {"", "all"} else False,
+            branches=[],
+            collisions=[],
+            failed_branches=[_failed("git refs", str(exc))],
+            error="branch refs are unavailable",
+        )
 
+    main_ref = _resolve_main_ref(refs)
+    if main_ref is None:
+        return _response(
+            candidate=candidate,
+            candidate_found=None if candidate.strip().lower() in {"", "all"} else False,
+            branches=[],
+            collisions=[],
+            failed_branches=[_failed("main", "main ref is not present in fetched refs")],
+            error="main ref is unavailable",
+        )
+
+    discovery = discover_active_branch_result(
+        repo_root,
+        registry,
+        refs=refs,
+        pr_snapshot=snapshot_state,
+        deadline=deadline,
+    )
+    failures = list(discovery.failed_branches)
+    if not snapshot_state.complete:
+        failures.append(_failed("open PR snapshot", snapshot_state.error or "snapshot is incomplete"))
+
+    candidate_found: bool | None = None
     candidate_branch: ActiveBranch | None = None
     if candidate.strip().lower() not in {"", "all"}:
-        candidate_branch = next(
-            (branch for branch in active if _candidate_matches(candidate, branch)),
-            None,
-        )
-        if candidate_branch is None:
-            normalized = candidate.strip().lower()
-            candidate_ref = next(
-                (
-                    ref
-                    for ref in refs.values()
-                    if ref.name.lower() == normalized
-                    or ref.ref.lower() == normalized
-                    or ref.name.lower() == normalized.removeprefix("refs/heads/")
-                ),
-                None,
+        candidate_ref = _candidate_ref(candidate, refs, discovery.branches, registry)
+        if candidate_ref is None:
+            candidate_found = False
+            failures.append(_failed(candidate, "candidate branch was not found in fetched refs"))
+        else:
+            candidate_found = True
+            candidate_branch = ActiveBranch(
+                name=_logical_branch_name(candidate_ref.name),
+                ref=candidate_ref.ref,
+                head_sha=candidate_ref.head_sha,
+                source="candidate",
+                ticket=_ticket_for_branch(candidate_ref.name, registry),
             )
-            if candidate_ref is None:
-                for ticket_name, current in _registry_rows(registry):
-                    hint = _branch_hint(current)
-                    if ticket_name.lower() == normalized or (hint and hint.lower() == normalized):
-                        candidate_ref = refs.get(hint or "")
-                        if candidate_ref is not None:
-                            break
-            if candidate_ref is not None and candidate_ref.name != "main" and not candidate_ref.name.endswith("/main"):
-                candidate_branch = ActiveBranch(
-                    name=candidate_ref.name,
-                    ref=candidate_ref.ref,
-                    head_sha=candidate_ref.head_sha,
-                    source="candidate",
-                    ticket=_ticket_for_branch(candidate_ref.name, registry),
-                )
-        if candidate_branch is None:
-            return {
-                "candidate": candidate,
-                "candidate_found": False,
-                "branches": [],
-                "collisions": [],
-                "risk": _risk_summary([]),
-                "error": "candidate branch was not found in fetched refs",
-            }
+
+    selected: list[ActiveBranch] = list(discovery.branches)
+    if candidate_branch is not None:
+        selected = [candidate_branch, *[branch for branch in selected if branch.name != candidate_branch.name]]
 
     rows: list[BranchFiles] = []
     branch_payload: list[dict[str, Any]] = []
-    selected = [candidate_branch] if candidate_branch else active
-    if candidate_branch:
-        selected = [candidate_branch, *[branch for branch in active if branch.name != candidate_branch.name]]
-
-    for branch in selected:
+    for index, branch in enumerate(selected):
         if time.monotonic() >= deadline:
+            failures.extend(_failed(remaining.name, "analysis deadline exceeded") for remaining in selected[index:])
             break
         try:
             files = cache.get_or_compute(
@@ -394,10 +721,12 @@ def analyze(
                 lambda branch=branch: changed_files(
                     repo_root,
                     branch,
+                    main_ref=main_ref,
                     timeout=min(GIT_TIMEOUT_SECONDS, max(0.05, deadline - time.monotonic())),
                 ),
             )
-        except GitAnalysisError:
+        except BaseException as exc:
+            failures.append(_failed(branch.name, str(exc)))
             continue
         rows.append(BranchFiles(branch=branch.name, head_sha=branch.head_sha, files=files))
         branch_payload.append(
@@ -418,10 +747,10 @@ def analyze(
             for collision in collisions
             if candidate_branch.name in {collision["left"], collision["right"]}
         ]
-    return {
-        "candidate": candidate,
-        "candidate_found": candidate_branch is not None if candidate.strip().lower() not in {"", "all"} else None,
-        "branches": branch_payload,
-        "collisions": collisions,
-        "risk": _risk_summary(collisions),
-    }
+    return _response(
+        candidate=candidate,
+        candidate_found=candidate_found,
+        branches=branch_payload,
+        collisions=collisions,
+        failed_branches=failures,
+    )

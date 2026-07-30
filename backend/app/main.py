@@ -104,6 +104,7 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     global UNKNOWN_KIND_TELEMETRY
+    blast_radius.OPEN_PR_SNAPSHOT.start()
     runtime_paths = RuntimePaths.from_env()
     UNKNOWN_KIND_TELEMETRY = UnknownKindTelemetry(runtime_paths)
     configured_backend = os.environ.get("WIKI_BACKEND_URL")
@@ -160,6 +161,7 @@ async def lifespan(_app: FastAPI):
     try:
         yield
     finally:
+        blast_radius.OPEN_PR_SNAPSHOT.stop()
         unknown_kind_telemetry_stop.set()
         dispatcher_task.cancel()
         watchdog_task.cancel()

@@ -83,7 +83,23 @@ export function BlastRadiusPanel({
       {!payload && !error ? <div className="blast-radius-muted">checking branch refs...</div> : null}
       {payload?.error ? <div className="blast-radius-muted">{payload.error}</div> : null}
 
-      {payload && collisions.length === 0 ? (
+      {payload && !payload.complete ? (
+        <div className="blast-radius-incomplete" data-testid="blast-radius-incomplete">
+          <strong>analysis incomplete</strong>
+          <span>collision results are not safe to clear.</span>
+          {payload.failed_branches.length > 0 ? (
+            <ul>
+              {payload.failed_branches.map((failure) => (
+                <li key={`${failure.branch}:${failure.reason}`}>
+                  <code>{failure.branch}</code>: {failure.reason}
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </div>
+      ) : null}
+
+      {payload?.complete && collisions.length === 0 ? (
         <div className="blast-radius-empty" data-testid="blast-radius-no-overlap">
           <strong>no overlap</strong>
           <span>No active branch shares changed files with this view.</span>
