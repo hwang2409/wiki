@@ -1,5 +1,6 @@
 import {
   createContext,
+  useCallback,
   useContext,
   useEffect,
   useMemo,
@@ -17,12 +18,14 @@ export const SCREENCAST_MAX_TICKETS = 32;
 
 type ScreencastRegistry = {
   subscribe: (ticket: string) => () => void;
+  registerStrip: (ticket: string, node: HTMLElement | null) => void;
   get: (ticket: string) => ScreencastWorker | null;
   loading: boolean;
 };
 
 const EmptyRegistry: ScreencastRegistry = {
   subscribe: () => () => undefined,
+  registerStrip: () => undefined,
   get: () => null,
   loading: false,
 };
@@ -78,51 +81,65 @@ function useAnyNodeVisible(nodes: Iterable<HTMLElement>): boolean {
  * Single fleet-wide poller. Views that show worker cards wrap their tree
  * in this and drop <ScreencastStrip> anywhere inside; each strip
  * self-registers and the provider polls the union of registered tickets
- * exactly once per interval. One request per view, not one per group /
- * one per card.
+ * exactly once per interval. One request per view, not one per card.
  *
  * The poller pauses when the tab is hidden AND when every mounted strip
  * is off-screen, and honours the previous ETag so an unchanged fleet
  * costs a 304 response, not a full JSON payload.
+ *
+ * Consumer contract: the context value re-identifies whenever ``workers``
+ * or ``loading`` changes so a poll response actually re-renders the
+ * strips. It is a bug (R2 finding #1) to memoize on anything narrower
+ * than ``[workers, loading, ...stable callbacks]``.
  */
 export function ScreencastProvider({ children }: { children: ReactNode }) {
   const [subscribers, setSubscribers] = useState<Map<string, number>>(new Map());
   const [strips, setStrips] = useState<Map<string, HTMLElement>>(new Map());
   const [workers, setWorkers] = useState<Map<string, ScreencastWorker>>(new Map());
   const [loading, setLoading] = useState(true);
-  const workersRef = useRef(workers);
-  workersRef.current = workers;
   const etagRef = useRef<string | null>(null);
 
-  const registry = useMemo<ScreencastRegistry>(
-    () => ({
-      subscribe: (ticket) => {
-        setSubscribers((prev) => {
-          const next = new Map(prev);
-          next.set(ticket, (next.get(ticket) ?? 0) + 1);
-          return next;
-        });
-        return () => {
-          setSubscribers((prev) => {
-            const next = new Map(prev);
-            const current = next.get(ticket) ?? 0;
-            if (current <= 1) next.delete(ticket);
-            else next.set(ticket, current - 1);
-            return next;
-          });
-        };
-      },
-      get: (ticket) => workersRef.current.get(ticket) ?? null,
-      loading,
-    }),
-    [loading]
+  const subscribe = useCallback((ticket: string) => {
+    setSubscribers((prev) => {
+      const next = new Map(prev);
+      next.set(ticket, (next.get(ticket) ?? 0) + 1);
+      return next;
+    });
+    return () => {
+      setSubscribers((prev) => {
+        const next = new Map(prev);
+        const current = next.get(ticket) ?? 0;
+        if (current <= 1) next.delete(ticket);
+        else next.set(ticket, current - 1);
+        return next;
+      });
+    };
+  }, []);
+
+  const registerStrip = useCallback(
+    (ticket: string, node: HTMLElement | null) => {
+      setStrips((prev) => {
+        const next = new Map(prev);
+        if (node) next.set(ticket, node);
+        else next.delete(ticket);
+        return next;
+      });
+    },
+    []
   );
 
   const tickets = useMemo(() => {
-    const arr = [...subscribers.keys()].sort();
-    return arr.slice(0, SCREENCAST_MAX_TICKETS);
+    return [...subscribers.keys()].sort().slice(0, SCREENCAST_MAX_TICKETS);
   }, [subscribers]);
   const ticketsKey = useMemo(() => tickets.join("|"), [tickets]);
+
+  // Ticket-set changes invalidate the cached ETag — the server hashes
+  // the full worker set, so an ETag computed for a superset would 304
+  // even when a newly-joined ticket has fresh frames the client has
+  // never seen.
+  useEffect(() => {
+    etagRef.current = null;
+  }, [ticketsKey]);
 
   const stripNodes = useMemo(() => [...strips.values()], [strips]);
   const documentVisible = useDocumentVisible();
@@ -178,43 +195,20 @@ export function ScreencastProvider({ children }: { children: ReactNode }) {
 
   const contextValue = useMemo<ScreencastRegistry>(
     () => ({
-      ...registry,
-      subscribe: (ticket) => {
-        const cleanup = registry.subscribe(ticket);
-        return cleanup;
-      },
+      subscribe,
+      registerStrip,
+      get: (ticket) => workers.get(ticket) ?? null,
+      loading,
     }),
-    [registry]
-  );
-
-  const attach = useMemo(
-    () => ({
-      registerStrip: (ticket: string, node: HTMLElement | null) => {
-        setStrips((prev) => {
-          const next = new Map(prev);
-          if (node) next.set(ticket, node);
-          else next.delete(ticket);
-          return next;
-        });
-      },
-    }),
-    []
+    [workers, loading, subscribe, registerStrip]
   );
 
   return (
     <ScreencastContext.Provider value={contextValue}>
-      <StripDomContext.Provider value={attach}>{children}</StripDomContext.Provider>
+      {children}
     </ScreencastContext.Provider>
   );
 }
-
-type StripDomHandle = {
-  registerStrip: (ticket: string, node: HTMLElement | null) => void;
-};
-
-const StripDomContext = createContext<StripDomHandle>({
-  registerStrip: () => undefined,
-});
 
 // ------------------------------------------------------------ strip UI
 
@@ -236,22 +230,19 @@ function frameGlyph(kind: ScreencastFrame["kind"]): string {
 export function ScreencastStrip({
   ticket,
   runId,
-  compact,
 }: {
   ticket: string;
   runId?: string | null;
-  compact?: boolean;
 }) {
   const registry = useContext(ScreencastContext);
-  const dom = useContext(StripDomContext);
   const [rootNode, setRootNode] = useState<HTMLElement | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => registry.subscribe(ticket), [registry, ticket]);
   useEffect(() => {
-    dom.registerStrip(ticket, rootNode);
-    return () => dom.registerStrip(ticket, null);
-  }, [dom, ticket, rootNode]);
+    registry.registerStrip(ticket, rootNode);
+    return () => registry.registerStrip(ticket, null);
+  }, [registry, ticket, rootNode]);
 
   const worker = registry.get(ticket);
   const frames = worker?.frames ?? [];
@@ -264,7 +255,6 @@ export function ScreencastStrip({
   }, [frames]);
 
   const empty = frames.length === 0;
-  const lines = compact ? Math.min(SCREENCAST_VISIBLE_LINES, 8) : SCREENCAST_VISIBLE_LINES;
   return (
     <div
       className="fleet-screencast"
@@ -275,7 +265,6 @@ export function ScreencastStrip({
       <div
         className="fleet-screencast-tape"
         ref={scrollRef}
-        style={{ ["--fleet-screencast-lines" as string]: lines }}
         aria-live="polite"
         aria-label={`recent output for ${ticket}`}
       >
@@ -314,5 +303,4 @@ export function buildScreencastUrl(tickets: string[]): string {
   return `/api/fleet/screencast?${params}`;
 }
 
-/** Direct fetch shim retained for legacy import paths / ad-hoc use. */
 export { getFleetScreencast };

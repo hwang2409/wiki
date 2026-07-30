@@ -1208,7 +1208,7 @@ export function AgentsView({
         </div>
 
         {worker.run_id ? (
-          <ScreencastStrip ticket={worker.ticket} runId={worker.run_id} compact />
+          <ScreencastStrip ticket={worker.ticket} runId={worker.run_id} />
         ) : null}
       </article>
     );

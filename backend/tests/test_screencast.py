@@ -402,28 +402,62 @@ class BoundedTailFileTests(unittest.TestCase):
 
     def test_tail_rejects_traversal_run_id(self) -> None:
         """A run_id containing ``..`` would escape the anchor via
-        os.open(dir_fd=...) despite O_NOFOLLOW. tail_frames must not
-        follow the traversal."""
+        os.open(dir_fd=...) despite O_NOFOLLOW. Both the helper and
+        tail_frames must refuse — the reviewer flagged the previous
+        version as a false positive because only the endpoint-level UUID
+        check was holding the line."""
 
-        with tempfile.TemporaryDirectory() as raw_dir:
-            root = Path(raw_dir)
-            sibling = root.parent / "sibling"
-            sibling.mkdir(exist_ok=True)
-            (sibling / "raw.jsonl").write_text("nope\n", encoding="utf-8")
+        with tempfile.TemporaryDirectory() as parent_dir:
+            parent = Path(parent_dir)
+            root = parent / "root"
+            root.mkdir()
+            outside = parent / "outside"
+            outside.mkdir()
+            secret = _claude_assistant("outside-secret")
+            _write_raw(outside / "raw.jsonl", [secret])
+
+            root_fd = os.open(str(root), os.O_RDONLY | os.O_DIRECTORY)
             try:
-                root_fd = os.open(str(root), os.O_RDONLY | os.O_DIRECTORY)
-                try:
-                    frames = screencast.tail_frames(root_fd, "../sibling")
-                finally:
-                    os.close(root_fd)
+                frames = screencast.tail_frames(root_fd, "..")
             finally:
-                (sibling / "raw.jsonl").unlink(missing_ok=True)
-                try:
-                    sibling.rmdir()
-                except OSError:
-                    pass
+                os.close(root_fd)
 
+        # No frame from the outside file may leak in.
         self.assertEqual(frames, [])
+
+    def test_pathwalk_helper_refuses_traversal_component(self) -> None:
+        """Assert refusal at the helper level, not at the endpoint. If
+        the helper accepts ``..``, the fixture file at ``../outside``
+        gets returned — that was the R2 false-positive scenario."""
+
+        from backend.app.pathwalk import open_relative_file
+
+        with tempfile.TemporaryDirectory() as parent_dir:
+            parent = Path(parent_dir)
+            root = parent / "root"
+            root.mkdir()
+            outside = parent / "outside"
+            outside.mkdir()
+            outside_file = outside / "raw.jsonl"
+            outside_file.write_text("nope\n", encoding="utf-8")
+
+            root_fd = os.open(str(root), os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with self.assertRaises(OSError) as ctx:
+                    open_relative_file(root_fd, ("..", "outside", "raw.jsonl"))
+                # Must be a validation refusal (EINVAL), not "file not
+                # found" — otherwise a real ``..outside`` file could
+                # succeed and the helper is still unsafe.
+                import errno as errno_mod
+
+                self.assertEqual(ctx.exception.errno, errno_mod.EINVAL)
+
+                # Single-component ``..`` and ``.`` both refused.
+                for bad in ("..", ".", "", "a/b", "a\x00b", "a\\b"):
+                    with self.assertRaises(OSError):
+                        open_relative_file(root_fd, (bad,))
+            finally:
+                os.close(root_fd)
 
 
 class OpenRootDirectoryTests(unittest.TestCase):

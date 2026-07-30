@@ -1,4 +1,8 @@
 // @vitest-environment jsdom
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, resolve } from "node:path";
+
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
@@ -8,18 +12,25 @@ import {
   SCREENCAST_VISIBLE_LINES,
 } from "../src/screencast-strip";
 
+const CSS_SOURCE = readFileSync(
+  resolve(dirname(fileURLToPath(import.meta.url)), "..", "src", "styles.css"),
+  "utf-8"
+);
+
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
   vi.useRealTimers();
 });
 
-/** Deferred fetch response used by tests below to poke the poller. */
+// --------------------------------------------------------- fetch helpers
+
 type Deferred = {
   resolve: (r: Response) => void;
   promise: Promise<Response>;
   url: string;
   headers: Record<string, string>;
+  signal: AbortSignal | undefined;
 };
 
 function stubFetchQueue(): {
@@ -41,7 +52,7 @@ function stubFetchQueue(): {
       const promise = new Promise<Response>((r) => {
         resolve = r;
       });
-      calls.push({ resolve, promise, url, headers });
+      calls.push({ resolve, promise, url, headers, signal: init?.signal ?? undefined });
       return promise;
     }
   );
@@ -58,15 +69,31 @@ function stubFetchQueue(): {
   return { calls, push };
 }
 
-beforeEach(() => {
-  // JSDOM has no IntersectionObserver; provide a "always visible" stub.
+// -------------------------------------------------- IntersectionObserver
+
+type IoUpdate = (targets: Element[], isIntersecting: boolean) => void;
+
+function installIntersectionObserver(): { setIntersecting: IoUpdate } {
+  const callbacks: Array<{
+    cb: IntersectionObserverCallback;
+    observed: Set<Element>;
+    instance: IntersectionObserver;
+  }> = [];
+
   class FakeIO {
-    private cb: IntersectionObserverCallback;
-    constructor(cb: IntersectionObserverCallback) {
-      this.cb = cb;
+    private observed = new Set<Element>();
+    constructor(private cb: IntersectionObserverCallback) {
+      callbacks.push({
+        cb,
+        observed: this.observed,
+        instance: this as unknown as IntersectionObserver,
+      });
     }
     observe(target: Element) {
-      queueMicrotask(() =>
+      this.observed.add(target);
+      // Default: newly-observed nodes report intersecting so the poll can
+      // start. Tests toggle later via setIntersecting.
+      queueMicrotask(() => {
         this.cb(
           [
             {
@@ -80,31 +107,82 @@ beforeEach(() => {
             } as IntersectionObserverEntry,
           ],
           this as unknown as IntersectionObserver
-        )
-      );
+        );
+      });
     }
-    unobserve() {}
-    disconnect() {}
-    takeRecords(): IntersectionObserverEntry[] {
-      return [];
+    unobserve(target: Element) {
+      this.observed.delete(target);
+    }
+    disconnect() {
+      this.observed.clear();
+    }
+    takeRecords() {
+      return [] as IntersectionObserverEntry[];
     }
     root = null;
     rootMargin = "";
     thresholds = [] as number[];
   }
   vi.stubGlobal("IntersectionObserver", FakeIO);
+
+  const setIntersecting: IoUpdate = (targets, isIntersecting) => {
+    for (const { cb, observed, instance } of callbacks) {
+      const entries: IntersectionObserverEntry[] = [];
+      for (const target of targets) {
+        if (!observed.has(target)) continue;
+        entries.push({
+          target,
+          isIntersecting,
+          intersectionRatio: isIntersecting ? 1 : 0,
+          boundingClientRect: {} as DOMRectReadOnly,
+          intersectionRect: {} as DOMRectReadOnly,
+          rootBounds: null,
+          time: 0,
+        } as IntersectionObserverEntry);
+      }
+      if (entries.length > 0) cb(entries, instance);
+    }
+  };
+  return { setIntersecting };
+}
+
+let ioHandle: { setIntersecting: IoUpdate } = { setIntersecting: () => undefined };
+
+beforeEach(() => {
+  ioHandle = installIntersectionObserver();
   Object.defineProperty(document, "visibilityState", {
     configurable: true,
     get: () => "visible",
   });
 });
 
-describe("ScreencastStrip", () => {
-  test("shows the spec-required 20 lines (not 6)", () => {
+// -------------------------------------------------- tests
+
+describe("ScreencastStrip spec", () => {
+  test("spec: 20 visible lines", () => {
     expect(SCREENCAST_VISIBLE_LINES).toBe(20);
   });
 
-  test("fixed-height tape is inline-styled with 20 visible lines", async () => {
+  test("fixed layout: styles.css pins the tape at the 20-line height on all axes", () => {
+    // jsdom does not compute CSS calc(), and styles.css is not injected
+    // into the test document. Read the source instead — this is the
+    // load-bearing check: if someone removes min/max-height or the size
+    // containment, the strip could reflow as frames arrive and this
+    // assertion breaks.
+    const ruleMatch = CSS_SOURCE.match(
+      /(?:^|\})\s*\.fleet-screencast-tape\s*\{([\s\S]*?)\}/
+    );
+    expect(ruleMatch).not.toBeNull();
+    const rule = ruleMatch![1];
+    expect(rule).toContain("--fleet-screencast-lines: 20");
+    expect(rule).toMatch(/\bheight:\s*calc\(var\(--fleet-screencast-lines\)/);
+    expect(rule).toMatch(/\bmin-height:\s*calc\(var\(--fleet-screencast-lines\)/);
+    expect(rule).toMatch(/\bmax-height:\s*calc\(var\(--fleet-screencast-lines\)/);
+    expect(rule).toMatch(/\boverflow:\s*hidden/);
+    expect(rule).toMatch(/\bcontain:\s*layout paint size/);
+  });
+
+  test("rendered strip has a bounded tape element with no inline size override", async () => {
     const q = stubFetchQueue();
     render(
       <ScreencastProvider>
@@ -113,26 +191,135 @@ describe("ScreencastStrip", () => {
     );
     const tape = document.querySelector<HTMLDivElement>(".fleet-screencast-tape");
     expect(tape).not.toBeNull();
-    expect(tape!.style.getPropertyValue("--fleet-screencast-lines")).toBe("20");
-    // Kick the first poll so the deferred fetch resolves and the test
-    // teardown doesn't leak a pending promise.
+    // No component-level style override should sneak in — the CSS class
+    // is the single source of truth for size.
+    expect(tape!.getAttribute("style")).toBeNull();
     await act(async () => {
-      q.calls[0]?.resolve(q.push({ workers: [] }, { etag: 'W/"abc"' }));
+      q.calls[0]?.resolve(q.push({ workers: [] }, { etag: 'W/"e0"' }));
     });
   });
+});
 
-  test("compact variant caps at 8 lines for agent cards", async () => {
+describe("ScreencastProvider context re-renders (R2 finding #1)", () => {
+  test("second changed response renders the new frames", async () => {
     const q = stubFetchQueue();
     render(
       <ScreencastProvider>
-        <ScreencastStrip ticket="WIKI-1" compact />
+        <ScreencastStrip ticket="WIKI-1" />
       </ScreencastProvider>
     );
-    const tape = document.querySelector<HTMLDivElement>(".fleet-screencast-tape");
-    expect(tape!.style.getPropertyValue("--fleet-screencast-lines")).toBe("8");
+    await waitFor(() => expect(q.calls.length).toBeGreaterThan(0));
+
+    // First response.
     await act(async () => {
-      q.calls[0]?.resolve(q.push({ workers: [] }, { etag: 'W/"abc"' }));
+      q.calls[0]!.resolve(
+        q.push(
+          {
+            workers: [
+              {
+                ticket: "WIKI-1",
+                run_id: "abc",
+                frames: [{ kind: "assistant", text: "first-text", ts: null }],
+              },
+            ],
+          },
+          { etag: 'W/"1"' }
+        )
+      );
     });
+    await waitFor(() => expect(screen.getByText("first-text")).toBeTruthy());
+
+    // Second response with changed frames — MUST re-render the strip.
+    // (Bug the reviewer flagged: memo on [loading] dropped the update.)
+    await waitFor(() => expect(q.calls.length).toBeGreaterThanOrEqual(2), {
+      timeout: 4000,
+    });
+    await act(async () => {
+      q.calls[1]!.resolve(
+        q.push(
+          {
+            workers: [
+              {
+                ticket: "WIKI-1",
+                run_id: "abc",
+                frames: [
+                  { kind: "assistant", text: "first-text", ts: null },
+                  { kind: "assistant", text: "second-text", ts: null },
+                ],
+              },
+            ],
+          },
+          { etag: 'W/"2"' }
+        )
+      );
+    });
+    await waitFor(() => expect(screen.getByText("second-text")).toBeTruthy());
+  });
+
+  test("newly-joined worker: mounting a strip mid-run renders its frames", async () => {
+    const q = stubFetchQueue();
+    const { rerender } = render(
+      <ScreencastProvider>
+        <ScreencastStrip ticket="WIKI-1" />
+      </ScreencastProvider>
+    );
+    await waitFor(() => expect(q.calls.length).toBeGreaterThan(0));
+    await act(async () => {
+      q.calls[0]!.resolve(
+        q.push(
+          {
+            workers: [
+              {
+                ticket: "WIKI-1",
+                run_id: "abc",
+                frames: [{ kind: "assistant", text: "one-text", ts: null }],
+              },
+            ],
+          },
+          { etag: 'W/"1"' }
+        )
+      );
+    });
+    await waitFor(() => expect(screen.getByText("one-text")).toBeTruthy());
+
+    // Add a second strip — provider must poll with the union of tickets
+    // and the new card must render its frames from the fresh response.
+    rerender(
+      <ScreencastProvider>
+        <ScreencastStrip ticket="WIKI-1" />
+        <ScreencastStrip ticket="WIKI-2" />
+      </ScreencastProvider>
+    );
+    await waitFor(() => expect(q.calls.length).toBeGreaterThanOrEqual(2), {
+      timeout: 4000,
+    });
+    // The re-poll should include both tickets in the URL.
+    const lastCall = q.calls[q.calls.length - 1]!;
+    expect(lastCall.url).toContain("ticket=WIKI-1");
+    expect(lastCall.url).toContain("ticket=WIKI-2");
+
+    await act(async () => {
+      lastCall.resolve(
+        q.push(
+          {
+            workers: [
+              {
+                ticket: "WIKI-1",
+                run_id: "abc",
+                frames: [{ kind: "assistant", text: "one-text", ts: null }],
+              },
+              {
+                ticket: "WIKI-2",
+                run_id: "def",
+                frames: [{ kind: "assistant", text: "two-text", ts: null }],
+              },
+            ],
+          },
+          { etag: 'W/"3"' }
+        )
+      );
+    });
+    await waitFor(() => expect(screen.getByText("two-text")).toBeTruthy());
   });
 });
 
@@ -148,7 +335,6 @@ describe("ScreencastProvider polling", () => {
     );
     await waitFor(() => expect(q.calls.length).toBeGreaterThan(0));
     const url = q.calls[0]!.url;
-    // One request with three ticket params, not three requests.
     expect(q.calls.length).toBe(1);
     for (const ticket of ["WIKI-1", "WIKI-2", "WIKI-3"]) {
       expect(url).toContain(`ticket=${ticket}`);
@@ -158,7 +344,7 @@ describe("ScreencastProvider polling", () => {
     });
   });
 
-  test("sends If-None-Match after first response, then handles 304", async () => {
+  test("If-None-Match: sent on second poll; 304 keeps previous frames", async () => {
     const q = stubFetchQueue();
     render(
       <ScreencastProvider>
@@ -166,11 +352,8 @@ describe("ScreencastProvider polling", () => {
       </ScreencastProvider>
     );
     await waitFor(() => expect(q.calls.length).toBeGreaterThanOrEqual(1));
-
-    // No If-None-Match on the very first request.
     expect(q.calls[0]!.headers["If-None-Match"]).toBeUndefined();
 
-    // First response includes ETag and one frame.
     await act(async () => {
       q.calls[0]!.resolve(
         q.push(
@@ -179,7 +362,7 @@ describe("ScreencastProvider polling", () => {
               {
                 ticket: "WIKI-1",
                 run_id: "abc",
-                frames: [{ kind: "assistant", text: "hello", ts: null }],
+                frames: [{ kind: "assistant", text: "keep-me", ts: null }],
               },
             ],
           },
@@ -187,26 +370,23 @@ describe("ScreencastProvider polling", () => {
         )
       );
     });
-    await waitFor(() => expect(screen.getByText(/hello/)).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("keep-me")).toBeTruthy());
 
-    // Second poll fires ~2 s later (real timers).
     await waitFor(() => expect(q.calls.length).toBeGreaterThanOrEqual(2), {
       timeout: 4000,
     });
     expect(q.calls[1]!.headers["If-None-Match"]).toBe('W/"first"');
 
-    // Server replies 304 → frames must persist unchanged.
     await act(async () => {
       q.calls[1]!.resolve(q.push(null, { status: 304, etag: 'W/"first"' }));
     });
-    // Give React a beat, then confirm the text is still there.
     await act(async () => {
       await new Promise((r) => setTimeout(r, 0));
     });
-    expect(screen.getByText(/hello/)).toBeTruthy();
+    expect(screen.getByText("keep-me")).toBeTruthy();
   });
 
-  test("visibility-pause: no poll while document is hidden", async () => {
+  test("visibility-pause: hidden tab from mount time → no poll fires", async () => {
     Object.defineProperty(document, "visibilityState", {
       configurable: true,
       get: () => "hidden",
@@ -217,14 +397,47 @@ describe("ScreencastProvider polling", () => {
         <ScreencastStrip ticket="WIKI-1" />
       </ScreencastProvider>
     );
-    // Give the microtask + React render queue a chance to schedule a fetch.
     await act(async () => {
-      await new Promise((r) => setTimeout(r, 50));
+      await new Promise((r) => setTimeout(r, 100));
     });
     expect(q.calls.length).toBe(0);
   });
 
-  test("cleanup: aborts in-flight request when the strip unmounts", async () => {
+  test("off-screen pause: IntersectionObserver → not intersecting → poll stops, then resumes", async () => {
+    const q = stubFetchQueue();
+    render(
+      <ScreencastProvider>
+        <ScreencastStrip ticket="WIKI-1" />
+      </ScreencastProvider>
+    );
+    await waitFor(() => expect(q.calls.length).toBeGreaterThanOrEqual(1));
+    await act(async () => {
+      q.calls[0]!.resolve(q.push({ workers: [] }, { etag: 'W/"e"' }));
+    });
+
+    // Force every observed strip off-screen. The next scheduled poll
+    // MUST NOT fire until the strip comes back on-screen.
+    const strip = document.querySelector<HTMLElement>(".fleet-screencast")!;
+    await act(async () => {
+      ioHandle.setIntersecting([strip], false);
+    });
+    const callsAtHide = q.calls.length;
+    // Wait longer than the poll interval — no new call should appear.
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 2400));
+    });
+    expect(q.calls.length).toBe(callsAtHide);
+
+    // Bring the strip back on-screen; a fresh poll must fire.
+    await act(async () => {
+      ioHandle.setIntersecting([strip], true);
+    });
+    await waitFor(() => expect(q.calls.length).toBeGreaterThan(callsAtHide), {
+      timeout: 4000,
+    });
+  });
+
+  test("cleanup: unmount aborts the in-flight fetch (signal.aborted === true)", async () => {
     const q = stubFetchQueue();
     const { unmount } = render(
       <ScreencastProvider>
@@ -232,19 +445,14 @@ describe("ScreencastProvider polling", () => {
       </ScreencastProvider>
     );
     await waitFor(() => expect(q.calls.length).toBeGreaterThanOrEqual(1));
-    // Track the abort signal via the fetch spy — re-stub to observe.
-    const aborted: boolean[] = [];
-    const origFetch = globalThis.fetch;
-    vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) => {
-      const signal = init?.signal;
-      signal?.addEventListener("abort", () => aborted.push(true));
-      return origFetch(input, init);
-    });
+    const pendingSignal = q.calls[0]!.signal;
+    expect(pendingSignal).toBeDefined();
+    expect(pendingSignal!.aborted).toBe(false);
+
     unmount();
-    // Reasonable expectation: unmounting the provider caused it to cancel
-    // its outstanding fetch. Either the pre-mount fetch (never resolved)
-    // was aborted, or the observer-triggered second one — we just assert
-    // the DOM is torn down cleanly with no strip left.
-    expect(document.querySelector(".fleet-screencast")).toBeNull();
+
+    // The provider's effect cleanup runs controller.abort() → the fetch
+    // signal is now aborted. This is the load-bearing assertion.
+    expect(pendingSignal!.aborted).toBe(true);
   });
 });
