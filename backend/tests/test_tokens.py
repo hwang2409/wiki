@@ -443,6 +443,92 @@ class IncrementalScanTests(unittest.TestCase):
             self.assertEqual(tokens.query()["totals"]["input"], 500)
 
 
+class MetricAvailabilityTests(unittest.TestCase):
+    """WIKI-157: `reasoning` and `cached` must be OMITTED from the response
+    when no source contributed them (claude never reports reasoning), so the
+    frontend can render "unavailable" instead of a misleading 0."""
+
+    def test_claude_only_omits_reasoning(self) -> None:
+        with _EnvOverride() as paths:
+            from backend.app import tokens
+
+            _write_jsonl(
+                paths["claude"] / "p/s.jsonl",
+                [
+                    _claude_assistant_row(
+                        "2026-07-08T18:00:00Z",
+                        "m1",
+                        "sonnet",
+                        {
+                            "input_tokens": 100,
+                            "output_tokens": 40,
+                            "cache_read_input_tokens": 25,
+                        },
+                    )
+                ],
+            )
+            tokens.refresh()
+            response = tokens.query()
+            series = response["buckets"][0]["series"]["claude/sonnet"]
+            self.assertEqual(series["input"], 100)
+            self.assertEqual(series["cached"], 25)
+            self.assertEqual(series["output"], 40)
+            self.assertNotIn("reasoning", series)
+            self.assertNotIn("reasoning", response["totals"])
+
+    def test_codex_with_reasoning_keeps_the_field(self) -> None:
+        with _EnvOverride() as paths:
+            from backend.app import tokens
+
+            day = paths["codex"] / "2026/07/08"
+            _write_jsonl(
+                day / "rollout-r.jsonl",
+                [
+                    _codex_session_meta("2026-07-08T18:00:00Z", "gpt-5.4"),
+                    _codex_token_row(
+                        "2026-07-08T18:00:10Z",
+                        {"input": 100, "output": 40, "reasoning": 12},
+                    ),
+                ],
+            )
+            tokens.refresh()
+            series = tokens.query()["buckets"][0]["series"]["codex/gpt-5.4"]
+            self.assertEqual(series["reasoning"], 12)
+
+    def test_mixed_sources_take_union_of_availability(self) -> None:
+        with _EnvOverride() as paths:
+            from backend.app import tokens
+
+            day = paths["codex"] / "2026/07/08"
+            _write_jsonl(
+                day / "rollout-r.jsonl",
+                [
+                    _codex_session_meta("2026-07-08T18:00:00Z", "gpt-5.4"),
+                    _codex_token_row(
+                        "2026-07-08T18:00:10Z",
+                        {"input": 100, "reasoning": 5},
+                    ),
+                ],
+            )
+            _write_jsonl(
+                paths["claude"] / "p/s.jsonl",
+                [
+                    _claude_assistant_row(
+                        "2026-07-08T18:10:00Z",
+                        "m1",
+                        "sonnet",
+                        {"input_tokens": 50, "output_tokens": 5},
+                    ),
+                ],
+            )
+            tokens.refresh()
+            response = tokens.query()
+            # totals include reasoning because codex reported it — even
+            # though claude does not.
+            self.assertIn("reasoning", response["totals"])
+            self.assertEqual(response["totals"]["reasoning"], 5)
+
+
 class NonBlockingQueryTests(unittest.TestCase):
     def test_cold_cache_returns_empty_snapshot_and_refreshing(self) -> None:
         with _EnvOverride():
@@ -453,7 +539,10 @@ class NonBlockingQueryTests(unittest.TestCase):
 
             self.assertTrue(response["refreshing"])
             self.assertEqual(response["buckets"], [])
-            self.assertEqual(response["totals"]["input"], 0)
+            # WIKI-157: totals emit a metric only when some source reported it.
+            # A cold cache reports nothing, so the map is empty — the frontend
+            # then renders "unavailable" instead of a misleading 0.
+            self.assertEqual(response["totals"], {})
             start_refresh.assert_called_once()
 
     def test_stale_cache_serves_snapshot_while_refresh_runs(self) -> None:

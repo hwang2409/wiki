@@ -4075,29 +4075,135 @@ body.is-resizing-panes .pane-cell {
   gap: 2px;
 }
 
+.graph-list-item {
+  border-radius: var(--radius-s);
+}
+
+.graph-list-item[open] {
+  background: var(--background-primary-alt);
+}
+
 .graph-list-row {
   display: grid;
   grid-template-columns: minmax(140px, 1fr) auto minmax(0, 2fr);
   align-items: baseline;
   gap: 12px;
-  width: 100%;
   padding: 6px 10px;
   border-radius: var(--radius-s);
   color: var(--text-normal);
+  cursor: pointer;
   font-size: var(--font-ui-small);
-  text-align: left;
+  list-style: none;
   transition: background-color 100ms ease-out;
 }
 
-.graph-list-row:not(:disabled):hover,
-.graph-list-row:not(:disabled):focus-visible {
+.graph-list-row::-webkit-details-marker {
+  display: none;
+}
+
+.graph-list-row:hover,
+.graph-list-row:focus-visible {
   background: var(--background-modifier-hover);
   outline: none;
 }
 
-.graph-list-row.is-unresolved {
+.graph-list-item.is-unresolved > .graph-list-row {
+  color: var(--text-faint);
+}
+
+.graph-list-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 6px 10px 12px 24px;
+}
+
+.graph-list-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.graph-list-open {
+  padding: 3px 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  background: var(--background-primary);
+  color: var(--text-normal);
+  cursor: pointer;
+  font-size: var(--font-ui-smaller);
+  font-weight: var(--fw-medium);
+}
+
+.graph-list-open:hover {
+  background: var(--background-modifier-hover);
+}
+
+.graph-edge-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.graph-edge-heading {
+  color: var(--text-muted);
+  font-size: var(--fs-2xs);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.graph-edge-empty {
+  color: var(--text-faint);
+  font-size: var(--font-ui-smaller);
+}
+
+.graph-edge-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.graph-edge {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) minmax(0, 2fr);
+  gap: 12px;
+  padding: 3px 8px;
+  border-radius: var(--radius-s);
+  color: var(--text-normal);
+  cursor: pointer;
+  font-size: var(--font-ui-smaller);
+  text-align: left;
+}
+
+.graph-edge:not(:disabled):hover,
+.graph-edge:not(:disabled):focus-visible {
+  background: var(--background-modifier-hover);
+  outline: none;
+}
+
+.graph-edge.is-unresolved {
   color: var(--text-faint);
   cursor: default;
+}
+
+.graph-edge-name {
+  font-weight: var(--fw-medium);
+}
+
+.graph-edge-path {
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.graph-edge-flag {
+  color: var(--text-faint);
+  font-style: italic;
 }
 
 .graph-list-name {
@@ -8365,6 +8471,14 @@ textarea.composer-command-input {
   display: flex;
   align-items: center;
   justify-content: center;
+  padding: 20px;
+}
+
+.tokens-error-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
   padding: 20px;
 }
 

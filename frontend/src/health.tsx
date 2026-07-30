@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { FileText } from "lucide-react";
 import type { NoteSummary } from "./types";
-import { UtilityEmpty, UtilityPage } from "./utility-page";
+import { UtilityEmpty, UtilityError, UtilityLoading, UtilityPage } from "./utility-page";
 
 const LIVING_TYPES = new Set(["reference", "campaign"]);
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -33,10 +33,18 @@ const BUCKET_LABEL: Record<Bucket, string> = {
 
 export function HealthView({
   notes,
+  notesLoaded,
+  loading,
+  error,
   onOpenNote,
+  onRetry,
 }: {
   notes: NoteSummary[];
+  notesLoaded: boolean;
+  loading: boolean;
+  error: string | null;
   onOpenNote: (path: string) => void;
+  onRetry: () => void;
 }) {
   const [showAll, setShowAll] = useState(false);
 
@@ -53,6 +61,8 @@ export function HealthView({
     return result;
   }, [rows]);
 
+  const showToggle = notesLoaded && !error;
+
   return (
     <UtilityPage
       title="Vault health"
@@ -63,68 +73,80 @@ export function HealthView({
         </>
       }
       actions={
-        <label className="health-toggle">
-          <input
-            checked={showAll}
-            type="checkbox"
-            onChange={(event) => setShowAll(event.target.checked)}
-          />
-          <span>all types</span>
-        </label>
+        showToggle ? (
+          <label className="health-toggle">
+            <input
+              checked={showAll}
+              type="checkbox"
+              onChange={(event) => setShowAll(event.target.checked)}
+            />
+            <span>all types</span>
+          </label>
+        ) : null
       }
     >
-      <div className="health-view">
-        <div className="health-summary" role="group" aria-label="Vault freshness summary">
-          {(Object.keys(counts) as Bucket[]).map((bucket) => (
-            <div className={`health-stat health-${bucket}`} key={bucket}>
-              <span className="health-stat-count tabular-nums">{counts[bucket]}</span>
-              <span className="health-stat-label">{BUCKET_LABEL[bucket]}</span>
-            </div>
-          ))}
-        </div>
-
-        {rows.length === 0 ? (
-          <UtilityEmpty
-            title={
-              notes.length === 0
-                ? "No notes in the vault yet"
-                : showAll
-                  ? "No notes match this view"
-                  : "No living notes yet"
-            }
-            message={
-              notes.length === 0
-                ? "Create a note and it will appear here as it ages."
-                : showAll
-                  ? "Try creating a note or toggle types."
-                  : "Reference and campaign notes power agent memory — toggle all types to widen this list."
-            }
-          />
-        ) : (
-          <div className="health-list">
-            {rows.map(({ note, days }) => (
-              <button
-                className={`health-row is-${bucketOf(days)}`}
-                key={note.id}
-                type="button"
-                onClick={() => onOpenNote(note.path)}
-              >
-                <FileText size={13} />
-                <span className="health-name">{basename(note.path)}</span>
-                <span className="health-type">{note.note_type ?? "—"}</span>
-                <span className="health-path">{note.path}</span>
-                <span className="health-age tabular-nums">
-                  {days === 0 ? "today" : `${days}d`}
-                </span>
-              </button>
+      {error ? (
+        <UtilityError
+          title="Vault health is unavailable"
+          message={error}
+          onRetry={onRetry}
+        />
+      ) : loading ? (
+        <UtilityLoading label="Reading vault notes…" />
+      ) : (
+        <div className="health-view">
+          <div className="health-summary" role="group" aria-label="Vault freshness summary">
+            {(Object.keys(counts) as Bucket[]).map((bucket) => (
+              <div className={`health-stat health-${bucket}`} key={bucket}>
+                <span className="health-stat-count tabular-nums">{counts[bucket]}</span>
+                <span className="health-stat-label">{BUCKET_LABEL[bucket]}</span>
+              </div>
             ))}
           </div>
-        )}
 
-        <p className="health-secondary-hint">
-          Structural vault drift is tracked separately — the note surface stays clean regardless.
-        </p>
-      </div>
+          {rows.length === 0 ? (
+            <UtilityEmpty
+              title={
+                notes.length === 0
+                  ? "No notes in the vault yet"
+                  : showAll
+                    ? "No notes match this view"
+                    : "No living notes yet"
+              }
+              message={
+                notes.length === 0
+                  ? "Create a note and it will appear here as it ages."
+                  : showAll
+                    ? "Try creating a note or toggle types."
+                    : "Reference and campaign notes power agent memory — toggle all types to widen this list."
+              }
+            />
+          ) : (
+            <div className="health-list">
+              {rows.map(({ note, days }) => (
+                <button
+                  className={`health-row is-${bucketOf(days)}`}
+                  key={note.id}
+                  type="button"
+                  onClick={() => onOpenNote(note.path)}
+                >
+                  <FileText size={13} />
+                  <span className="health-name">{basename(note.path)}</span>
+                  <span className="health-type">{note.note_type ?? "—"}</span>
+                  <span className="health-path">{note.path}</span>
+                  <span className="health-age tabular-nums">
+                    {days === 0 ? "today" : `${days}d`}
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
+
+          <p className="health-secondary-hint">
+            Structural vault drift is tracked separately — the note surface stays clean regardless.
+          </p>
+        </div>
+      )}
     </UtilityPage>
   );
 }

@@ -1332,6 +1332,16 @@ export default function App() {
   // nonce is only in the file-loading effect's dep list, so a retry is
   // strictly scoped to the file fetch.
   const [filesRetryNonce, setFilesRetryNonce] = useState(0);
+  // WIKI-157 (round-2 BLOCKING#1): drive HealthView's loading/error/retry
+  // from the same boot state so it never renders "empty vault" during boot
+  // or hides a boot failure behind an empty list.
+  const [notesRetryNonce, setNotesRetryNonce] = useState(0);
+  const retryNotes = () => {
+    setNotesLoaded(false);
+    setNotes([]);
+    setError(null);
+    setNotesRetryNonce((nonce) => nonce + 1);
+  };
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [dialog, setDialog] = useState<DialogState | null>(null);
   const paneIdRef = useRef(0);
@@ -1605,7 +1615,7 @@ export default function App() {
     return () => {
       ignore = true;
     };
-  }, []);
+  }, [notesRetryNonce]);
 
   const activeWorkspaceInfo = workspaces.find((workspace) => workspace.id === activeWorkspace);
   const activeFileCacheKey = activeWorkspaceInfo ? workspaceCacheKey(activeWorkspaceInfo) : null;
@@ -3406,7 +3416,14 @@ export default function App() {
       return <GraphView onOpenNote={openNote} />;
     }
     if (mode === "health") {
-      return <HealthView notes={notes} onOpenNote={openNote} />;
+      return <HealthView
+                  error={notesLoaded ? null : error}
+                  loading={!notesLoaded && !error}
+                  notes={notes}
+                  notesLoaded={notesLoaded}
+                  onOpenNote={openNote}
+                  onRetry={retryNotes}
+                />;
     }
     if (mode === "tokens") {
       return <TokensView />;
@@ -4004,7 +4021,14 @@ export default function App() {
               ) : mode === "graph" ? (
                 <GraphView onOpenNote={openNote} />
               ) : mode === "health" ? (
-                <HealthView notes={notes} onOpenNote={openNote} />
+                <HealthView
+                  error={notesLoaded ? null : error}
+                  loading={!notesLoaded && !error}
+                  notes={notes}
+                  notesLoaded={notesLoaded}
+                  onOpenNote={openNote}
+                  onRetry={retryNotes}
+                />
               ) : mode === "agent" && agentTicket ? (
                 <AgentSessionView
                   initialPanel={agentPanel}

@@ -9,7 +9,8 @@ import {
   writeRegistry,
 } from "../scripts/wiki32-harness.mjs";
 
-const OUT_DIR = process.env.WIKI_PLAYWRIGHT_OUT_DIR || "/tmp/wiki-157-utility-pages";
+const REPO_SHOTS = new URL("../../docs/screenshots/wiki-157/", import.meta.url).pathname;
+const OUT_DIR = process.env.WIKI_PLAYWRIGHT_OUT_DIR || REPO_SHOTS;
 const TICKET = "WIKI-157";
 
 function payloadActivity() {

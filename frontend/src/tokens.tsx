@@ -265,13 +265,15 @@ export function TokensView() {
     >
       <div className="tokens-view">
         {error ? (
-          <UtilityError
-            title="Token usage is unavailable"
-            message={error}
-            onRetry={retry}
-          />
-        ) : null}
-
+          <div className="tokens-error-state">
+            <UtilityError
+              title="Token usage is unavailable"
+              message={error}
+              onRetry={retry}
+            />
+          </div>
+        ) : (
+        <>
         <div className="tokens-controls">
           <div className="tokens-bucket-group" role="group" aria-label="Bucket size">
             {(["hour", "day"] as BucketMode[]).map((mode) => (
@@ -409,6 +411,8 @@ export function TokensView() {
             </span>
           ))}
         </div>
+        </>
+        )}
       </div>
     </UtilityPage>
   );

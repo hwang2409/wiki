@@ -93,16 +93,66 @@ test("activity page: empty state renders when there are no commits", async () =>
   }
 });
 
-test("health page: chrome + empty state, no primary CLI reference", () => {
-  render(<HealthView notes={[]} onOpenNote={() => {}} />);
+test("health page: loading state does NOT read as empty vault", () => {
+  render(
+    <HealthView
+      error={null}
+      loading
+      notes={[]}
+      notesLoaded={false}
+      onOpenNote={() => {}}
+      onRetry={() => {}}
+    />,
+  );
   expect(screen.getByText("Vault health")).toBeTruthy();
+  expect(screen.getByRole("status").textContent ?? "").toContain("Reading vault notes");
+  // BLOCKING guard: booting must NOT surface the vault-empty state.
+  expect(screen.queryByText(/No notes in the vault yet/i)).toBeNull();
+});
+
+test("health page: boot failure surfaces retry, calls onRetry", () => {
+  const onRetry = vi.fn();
+  render(
+    <HealthView
+      error="notes endpoint 500"
+      loading={false}
+      notes={[]}
+      notesLoaded={false}
+      onOpenNote={() => {}}
+      onRetry={onRetry}
+    />,
+  );
+  expect(screen.getByRole("alert").textContent).toContain("Vault health is unavailable");
+  fireEvent.click(screen.getByRole("button", { name: /Retry/i }));
+  expect(onRetry).toHaveBeenCalledTimes(1);
+});
+
+test("health page: empty state renders only when notes really are empty", () => {
+  render(
+    <HealthView
+      error={null}
+      loading={false}
+      notes={[]}
+      notesLoaded
+      onOpenNote={() => {}}
+      onRetry={() => {}}
+    />,
+  );
   expect(screen.getByText(/No notes in the vault yet/i)).toBeTruthy();
-  // Regression guard: WIKI-157 demoted the primary "wiki lint" call-to-action.
   expect(screen.queryByText(/wiki lint/)).toBeNull();
 });
 
 test("health page: renders living notes when provided", () => {
-  render(<HealthView notes={NOTES_FIXTURE} onOpenNote={() => {}} />);
+  render(
+    <HealthView
+      error={null}
+      loading={false}
+      notes={NOTES_FIXTURE}
+      notesLoaded
+      onOpenNote={() => {}}
+      onRetry={() => {}}
+    />,
+  );
   expect(screen.getByText("hot")).toBeTruthy();
 });
 
@@ -126,28 +176,144 @@ test("graph page: loading -> data -> canvas/list toggle exists", async () => {
     fireEvent.click(screen.getByRole("button", { name: /^List$/i }));
 
     await waitFor(() => {
-      expect(screen.getByText("a")).toBeTruthy();
-      expect(screen.getByText("b")).toBeTruthy();
-      expect(screen.getByText("ghost.md")).toBeTruthy();
+      const rows = document.querySelectorAll(".graph-list-row .graph-list-name");
+      const labels = Array.from(rows).map((row) => row.textContent);
+      expect(labels).toContain("a");
+      expect(labels).toContain("b");
+      expect(labels).toContain("ghost.md");
     });
-    // Unresolved rows carry the disabled affordance.
-    const ghostRow = screen.getByText("ghost.md").closest("button");
-    expect(ghostRow?.hasAttribute("disabled")).toBe(true);
+    // Ghost row is marked unresolved at the item level.
+    const unresolvedItems = Array.from(
+      document.querySelectorAll(".graph-list-item.is-unresolved"),
+    );
+    const ghostLabels = unresolvedItems
+      .map((item) => item.querySelector(".graph-list-name")?.textContent)
+      .filter(Boolean);
+    expect(ghostLabels).toContain("ghost.md");
   } finally {
     restore();
   }
 });
 
-test("graph page: error state exposes a retry button", async () => {
-  const restore = installFetch(async () => {
-    throw new Error("api down");
+test("graph page: retry re-fetches and recovers data", async () => {
+  const fetchSpy = vi.fn(async (input: RequestInfo | URL) => {
+    if (String(input).includes("/api/links")) {
+      if (fetchSpy.mock.calls.length === 1) throw new Error("api down");
+      return jsonResponse({
+        "notes/root.md": { outgoing: ["notes/branch.md"], incoming: [], unresolved: [] },
+        "notes/branch.md": { outgoing: [], incoming: ["notes/root.md"], unresolved: [] },
+      });
+    }
+    return jsonResponse({});
   });
+  const original = globalThis.fetch;
+  globalThis.fetch = fetchSpy as typeof fetch;
   try {
     render(<GraphView onOpenNote={() => {}} />);
     await waitFor(() => {
       expect(screen.getByRole("alert").textContent).toContain("Link graph is unavailable");
     });
-    expect(screen.getByRole("button", { name: /Retry/i })).toBeTruthy();
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: /Retry/i }));
+
+    // Second fetch must actually happen, and recovered data must render.
+    await waitFor(() => {
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
+      expect(screen.queryByRole("alert")).toBeNull();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /^List$/i }));
+    await waitFor(() => {
+      const rows = document.querySelectorAll(".graph-list-row .graph-list-name");
+      const labels = Array.from(rows).map((r) => r.textContent);
+      expect(labels).toContain("root");
+      expect(labels).toContain("branch");
+    });
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test("graph page: list mode exposes outgoing + incoming edges per node", async () => {
+  const restore = installFetch(async () =>
+    jsonResponse({
+      "notes/root.md": { outgoing: ["notes/leaf.md"], incoming: [], unresolved: ["future.md"] },
+      "notes/leaf.md": { outgoing: [], incoming: ["notes/root.md"], unresolved: [] },
+    }),
+  );
+  try {
+    render(<GraphView onOpenNote={() => {}} />);
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /^List$/i })).toBeTruthy();
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^List$/i }));
+    await waitFor(() => {
+      expect(document.querySelector(".graph-list-item")).toBeTruthy();
+    });
+
+    // Expand the root disclosure and check both edge groups render.
+    const rootRow = Array.from(document.querySelectorAll(".graph-list-row")).find(
+      (row) => row.querySelector(".graph-list-name")?.textContent === "root",
+    ) as HTMLElement | undefined;
+    if (!rootRow) throw new Error("root row not found");
+    fireEvent.click(rootRow);
+
+    const rootDetails = rootRow.closest("details");
+    if (!rootDetails) throw new Error("root details not found");
+
+    await waitFor(() => {
+      expect(rootDetails.hasAttribute("open")).toBe(true);
+    });
+    const outgoingGroup = rootDetails.querySelector<HTMLElement>(
+      '[aria-label="Outgoing wikilinks"]',
+    );
+    const incomingGroup = rootDetails.querySelector<HTMLElement>(
+      '[aria-label="Incoming wikilinks"]',
+    );
+    expect(outgoingGroup).toBeTruthy();
+    expect(incomingGroup).toBeTruthy();
+    // Outgoing should surface both the resolved leaf and the unresolved ghost.
+    expect(outgoingGroup!.textContent).toContain("leaf");
+    expect(outgoingGroup!.textContent).toContain("future.md");
+    expect(outgoingGroup!.textContent).toContain("unresolved");
+  } finally {
+    restore();
+  }
+});
+
+test("graph page: keyboard focus advances with arrow keys and opens with Enter", async () => {
+  const onOpen = vi.fn();
+  const restore = installFetch(async () =>
+    jsonResponse({
+      "notes/alpha.md": {
+        outgoing: ["notes/beta.md", "notes/gamma.md"],
+        incoming: [],
+        unresolved: [],
+      },
+      "notes/beta.md": { outgoing: [], incoming: ["notes/alpha.md"], unresolved: [] },
+      "notes/gamma.md": { outgoing: [], incoming: ["notes/alpha.md"], unresolved: [] },
+    }),
+  );
+  try {
+    render(<GraphView onOpenNote={onOpen} />);
+    await waitFor(() => {
+      expect(screen.getByRole("application")).toBeTruthy();
+    });
+    const application = screen.getByRole("application");
+    application.focus();
+
+    fireEvent.keyDown(application, { key: "ArrowRight" });
+    await waitFor(() => {
+      // Focus badge in the header updates to show a real node label.
+      const badge = document.querySelector<HTMLElement>(".graph-focus-hint");
+      expect(badge?.textContent ?? "").toMatch(/alpha|beta|gamma/);
+    });
+
+    fireEvent.keyDown(application, { key: "Enter" });
+    expect(onOpen).toHaveBeenCalled();
+    // The opened id must match one of the fixture notes.
+    expect(onOpen.mock.calls[0][0]).toMatch(/notes\/(alpha|beta|gamma)\.md/);
   } finally {
     restore();
   }

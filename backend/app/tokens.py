@@ -34,8 +34,11 @@ from typing import Iterable
 # incident 2026-07-08). Losers of the race serve the last persisted snapshot.
 _REFRESH_LOCK = threading.Lock()
 
-CACHE_VERSION = 2  # v1 caches had a byte-offset desync on non-ASCII tail reads
-                    # + per-file (not global) msg-id dedupe; both wipe on load.
+CACHE_VERSION = 3  # v2 accumulated every metric to 0 regardless of whether the
+                    # source reported it — hid claude's absent "reasoning" as a
+                    # false zero. v3 records per-bucket `provided` so the API
+                    # can distinguish "reported 0" from "not reported".
+METRIC_KEYS: tuple[str, ...] = ("input", "cached", "output", "reasoning")
 SYNC_REFRESH_MAX_AGE_SECONDS = int(os.environ.get("WIKI_TOKEN_SYNC_MAX_AGE_SECONDS", "15"))
 
 BUCKET_HOUR = "hour"
@@ -145,13 +148,16 @@ def _add_delta(
     cli: str,
     model: str | None,
     delta: dict[str, int],
+    *,
+    provided: Iterable[str],
     index: dict[tuple[str, str, str], int] | None = None,
 ) -> None:
     ts_hour = _floor_hour(ts)
     if ts_hour is None:
         return
     model = model or "unknown"
-    if not any(delta.get(k) for k in ("input", "cached", "output", "reasoning")):
+    provided_set = {k for k in provided if k in METRIC_KEYS}
+    if not any(delta.get(k) for k in METRIC_KEYS):
         return
     key = (ts_hour, cli, model)
     if index is None:
@@ -167,6 +173,7 @@ def _add_delta(
                 "cached": int(delta.get("cached", 0)),
                 "output": int(delta.get("output", 0)),
                 "reasoning": int(delta.get("reasoning", 0)),
+                "provided": sorted(provided_set),
             }
         )
         index[key] = len(state["buckets"]) - 1
@@ -176,6 +183,8 @@ def _add_delta(
         b["cached"] += int(delta.get("cached", 0))
         b["output"] += int(delta.get("output", 0))
         b["reasoning"] += int(delta.get("reasoning", 0))
+        existing = set(b.get("provided") or [])
+        b["provided"] = sorted(existing | provided_set)
 
 
 # --------------------------------------------------------------------- codex
@@ -219,6 +228,15 @@ def _codex_apply(state: dict, file_state: dict, row: dict, index: dict) -> None:
         "output": int(total.get("output_tokens") or 0),
         "reasoning": int(total.get("reasoning_output_tokens") or 0),
     }
+    # Track which metrics the source actually reported (present-and-not-None)
+    # this event; a missing key means the model does not emit that metric.
+    provided_this = {"input", "cached", "output"}
+    if total.get("reasoning_output_tokens") is not None:
+        provided_this.add("reasoning")
+    existing_provided = set(file_state.get("provided") or [])
+    existing_provided |= provided_this
+    file_state["provided"] = sorted(existing_provided)
+
     prev = file_state.get("cum")
     if prev is None:
         delta = cum
@@ -242,6 +260,7 @@ def _codex_apply(state: dict, file_state: dict, row: dict, index: dict) -> None:
         "codex",
         file_state.get("model"),
         delta,
+        provided=existing_provided,
         index=index,
     )
 
@@ -273,7 +292,17 @@ def _claude_apply(state: dict, file_state: dict, row: dict, index: dict) -> None
         "output": int(usage.get("output_tokens") or 0),
         "reasoning": 0,
     }
-    _add_delta(state, row.get("timestamp"), "claude", model, delta, index=index)
+    # Anthropic's usage payload never carries a reasoning-token field, so
+    # the metric is genuinely unavailable for claude sessions.
+    _add_delta(
+        state,
+        row.get("timestamp"),
+        "claude",
+        model,
+        delta,
+        provided={"input", "cached", "output"},
+        index=index,
+    )
 
 
 # --------------------------------------------------------------------- scan
@@ -472,8 +501,10 @@ def _query_from_state(
     kept: list[dict] = []
     models_seen: set[str] = set()
     cli_seen: set[str] = set()
-    totals = {"input": 0, "cached": 0, "output": 0, "reasoning": 0}
+    totals_sum = {k: 0 for k in METRIC_KEYS}
+    totals_provided: set[str] = set()
     grouped: dict[str, dict[str, dict[str, int]]] = {}
+    provided_per_series: dict[tuple[str, str], set[str]] = {}
 
     for b in state["buckets"]:
         dt = _bucket_dt(b["ts"])
@@ -499,19 +530,35 @@ def _query_from_state(
         ts_key = dt.isoformat().replace("+00:00", "Z")
         series_key = f"{b['cli']}/{b['model']}"
         series = grouped.setdefault(ts_key, {}).setdefault(
-            series_key, {"input": 0, "cached": 0, "output": 0, "reasoning": 0}
+            series_key, {k: 0 for k in METRIC_KEYS}
         )
-        for k in ("input", "cached", "output", "reasoning"):
+        # Legacy (pre-v3) buckets without a `provided` list are assumed to
+        # cover the full metric set — preserves old-shape output on reads
+        # that pre-date the schema bump.
+        raw_provided = b.get("provided")
+        bucket_provided = (
+            set(raw_provided) if isinstance(raw_provided, list) else set(METRIC_KEYS)
+        )
+        provided_per_series.setdefault((ts_key, series_key), set()).update(bucket_provided)
+        totals_provided.update(bucket_provided)
+        for k in METRIC_KEYS:
             series[k] += int(b.get(k, 0))
-            totals[k] += int(b.get(k, 0))
+            totals_sum[k] += int(b.get(k, 0))
 
-    buckets_out = [
-        {"ts": ts, "series": series}
-        for ts, series in sorted(grouped.items())
-    ]
+    buckets_out = []
+    for ts, series_map in sorted(grouped.items()):
+        series_out = {}
+        for series_key, sums in series_map.items():
+            provided = provided_per_series.get((ts, series_key), set(METRIC_KEYS))
+            # Only emit metrics some source actually reported for this series
+            # — the frontend's "unavailable" convention relies on the key
+            # being absent (not present-with-zero).
+            series_out[series_key] = {k: sums[k] for k in METRIC_KEYS if k in provided}
+        buckets_out.append({"ts": ts, "series": series_out})
+    totals_out = {k: totals_sum[k] for k in METRIC_KEYS if k in totals_provided}
     return {
         "buckets": buckets_out,
-        "totals": totals,
+        "totals": totals_out,
         "models": sorted(models_seen),
         "clis": sorted(cli_seen),
         "sessions_scanned": len(state["files"]),

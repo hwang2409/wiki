@@ -194,35 +194,127 @@ function GraphList({
     [summaries],
   );
 
+  const labelFor = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const node of summaries) map.set(node.id, node.label);
+    return (id: string) => map.get(id) ?? labelOf(id.replace(/^unresolved:/, ""));
+  }, [summaries]);
+
   return (
     <div className="graph-list-wrap">
       <p className="graph-list-hint">
-        Non-visual fallback — every node in the graph, ranked by connection count. Enter opens the
-        note; unresolved links have no target.
+        Non-visual fallback — every node in the graph plus its outgoing and incoming
+        wikilinks. Enter opens the note; unresolved targets have no note to open.
       </p>
       <ul className="graph-list" role="list">
-        {sorted.map((node) => (
-          <li key={node.id}>
-            <button
-              type="button"
-              className={`graph-list-row${node.unresolved ? " is-unresolved" : ""}`}
-              disabled={node.unresolved}
-              onFocus={() => onFocus(node.id)}
-              onClick={() => {
-                if (!node.unresolved) onOpenNote(node.id);
-              }}
-            >
-              <span className="graph-list-name">{node.label}</span>
-              <span className="graph-list-meta">
-                {node.unresolved ? "unresolved" : `${node.degree} link${node.degree === 1 ? "" : "s"}`}
-              </span>
-              {!node.unresolved ? (
-                <span className="graph-list-path">{node.id}</span>
-              ) : null}
-            </button>
-          </li>
-        ))}
+        {sorted.map((node) => {
+          const outgoing = node.outgoing;
+          const incoming = node.incoming;
+          return (
+            <li key={node.id}>
+              <details
+                className={`graph-list-item${node.unresolved ? " is-unresolved" : ""}`}
+                onToggle={(event) => {
+                  if ((event.target as HTMLDetailsElement).open) onFocus(node.id);
+                }}
+              >
+                <summary className="graph-list-row">
+                  <span className="graph-list-name">{node.label}</span>
+                  <span className="graph-list-meta">
+                    {node.unresolved
+                      ? "unresolved target"
+                      : `${node.degree} link${node.degree === 1 ? "" : "s"} · ${outgoing.length} out · ${incoming.length} in`}
+                  </span>
+                  {!node.unresolved ? (
+                    <span className="graph-list-path">{node.id}</span>
+                  ) : null}
+                </summary>
+                <div className="graph-list-body">
+                  {!node.unresolved ? (
+                    <div className="graph-list-actions">
+                      <button
+                        type="button"
+                        className="graph-list-open"
+                        onClick={() => onOpenNote(node.id)}
+                      >
+                        Open note
+                      </button>
+                    </div>
+                  ) : null}
+                  <EdgeList
+                    heading="Outgoing wikilinks"
+                    ids={outgoing}
+                    emptyLabel="No outgoing links from this note."
+                    labelFor={labelFor}
+                    onOpen={(id) => {
+                      if (!id.startsWith("unresolved:")) onOpenNote(id);
+                    }}
+                  />
+                  <EdgeList
+                    heading="Incoming wikilinks"
+                    ids={incoming}
+                    emptyLabel={
+                      node.unresolved
+                        ? "Nothing links to this unresolved target."
+                        : "No notes currently link to this one."
+                    }
+                    labelFor={labelFor}
+                    onOpen={(id) => {
+                      if (!id.startsWith("unresolved:")) onOpenNote(id);
+                    }}
+                  />
+                </div>
+              </details>
+            </li>
+          );
+        })}
       </ul>
+    </div>
+  );
+}
+
+function EdgeList({
+  heading,
+  ids,
+  emptyLabel,
+  labelFor,
+  onOpen,
+}: {
+  heading: string;
+  ids: string[];
+  emptyLabel: string;
+  labelFor: (id: string) => string;
+  onOpen: (id: string) => void;
+}) {
+  return (
+    <div className="graph-edge-group" role="group" aria-label={heading}>
+      <div className="graph-edge-heading">{heading}</div>
+      {ids.length === 0 ? (
+        <div className="graph-edge-empty">{emptyLabel}</div>
+      ) : (
+        <ul className="graph-edge-list" role="list">
+          {ids.map((id) => {
+            const unresolved = id.startsWith("unresolved:");
+            return (
+              <li key={`${heading}-${id}`}>
+                <button
+                  type="button"
+                  className={`graph-edge${unresolved ? " is-unresolved" : ""}`}
+                  disabled={unresolved}
+                  onClick={() => onOpen(id)}
+                >
+                  <span className="graph-edge-name">{labelFor(id)}</span>
+                  {unresolved ? (
+                    <span className="graph-edge-flag">unresolved</span>
+                  ) : (
+                    <span className="graph-edge-path">{id}</span>
+                  )}
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      )}
     </div>
   );
 }
@@ -261,9 +353,65 @@ function GraphCanvas({
   const focusedIdRef = useRef<string | null>(focusedId);
   const openNoteRef = useRef(onOpenNote);
   const focusHandleRef = useRef<((id: string | null) => void) | null>(null);
-  const keyboardHandleRef = useRef<((key: string) => void) | null>(null);
+  const canvasKeyboardRef = useRef<((key: string) => void) | null>(null);
   const orderedIdsRef = useRef<string[]>([]);
   const [instructionsShown, setInstructionsShown] = useState(false);
+
+  // Keyboard navigation is authoritative on `summaries` (not the physics
+  // node list) so it works even when the canvas 2d context is missing —
+  // jsdom / older embeddings never install one and the physics-scoped
+  // handler would otherwise never register.
+  const orderedIds = useMemo(
+    () =>
+      [...summaries]
+        .sort((a, b) => b.degree - a.degree || a.label.localeCompare(b.label))
+        .map((node) => node.id),
+    [summaries],
+  );
+
+  useEffect(() => {
+    orderedIdsRef.current = orderedIds;
+  }, [orderedIds]);
+
+  const unresolvedById = useMemo(() => {
+    const map = new Map<string, boolean>();
+    for (const node of summaries) map.set(node.id, node.unresolved);
+    return map;
+  }, [summaries]);
+
+  function handleKeyboardNav(key: string) {
+    if (orderedIds.length === 0) return;
+    const currentId = focusedId;
+    let index = currentId ? orderedIds.indexOf(currentId) : -1;
+    if (key === "ArrowRight" || key === "ArrowDown" || key === "j") {
+      index = index < 0 ? 0 : (index + 1) % orderedIds.length;
+      onFocus(orderedIds[index]);
+      canvasKeyboardRef.current?.(key);
+      return;
+    }
+    if (key === "ArrowLeft" || key === "ArrowUp" || key === "k") {
+      index = index <= 0 ? orderedIds.length - 1 : index - 1;
+      onFocus(orderedIds[index]);
+      canvasKeyboardRef.current?.(key);
+      return;
+    }
+    if (key === "Home") {
+      onFocus(orderedIds[0] ?? null);
+      canvasKeyboardRef.current?.(key);
+      return;
+    }
+    if (key === "End") {
+      onFocus(orderedIds[orderedIds.length - 1] ?? null);
+      canvasKeyboardRef.current?.(key);
+      return;
+    }
+    if (key === "Enter" || key === " ") {
+      const activeId = focusedId;
+      if (!activeId) return;
+      if (unresolvedById.get(activeId)) return;
+      onOpenNote(activeId);
+    }
+  }
 
   useEffect(() => {
     focusedIdRef.current = focusedId;
@@ -272,12 +420,6 @@ function GraphCanvas({
   useEffect(() => {
     openNoteRef.current = onOpenNote;
   }, [onOpenNote]);
-
-  useEffect(() => {
-    orderedIdsRef.current = [...summaries]
-      .sort((a, b) => b.degree - a.degree || a.label.localeCompare(b.label))
-      .map((node) => node.id);
-  }, [summaries]);
 
   useEffect(() => {
     const trackRaf = import.meta.env.DEV;
@@ -632,54 +774,13 @@ function GraphCanvas({
       requestRender();
     }
 
-    function handleKeyboard(key: string) {
-      if (nodes.length === 0) return;
-      const ids = orderedIdsRef.current;
-      const currentId = focusedIdRef.current;
-      let index = currentId ? ids.indexOf(currentId) : -1;
-
-      if (key === "ArrowRight" || key === "ArrowDown" || key === "j") {
-        index = index < 0 ? 0 : (index + 1) % ids.length;
-        const nextId = ids[index];
-        focusHandleRef.current?.(nextId);
-        const target = findNode(nextId);
-        if (target) {
-          alpha = Math.max(alpha, 0.15);
-          requestRender();
-        }
-        return;
-      }
-      if (key === "ArrowLeft" || key === "ArrowUp" || key === "k") {
-        index = index <= 0 ? ids.length - 1 : index - 1;
-        const nextId = ids[index];
-        focusHandleRef.current?.(nextId);
-        const target = findNode(nextId);
-        if (target) {
-          alpha = Math.max(alpha, 0.15);
-          requestRender();
-        }
-        return;
-      }
-      if (key === "Home") {
-        const nextId = ids[0];
-        if (nextId) focusHandleRef.current?.(nextId);
-        requestRender();
-        return;
-      }
-      if (key === "End") {
-        const nextId = ids[ids.length - 1];
-        if (nextId) focusHandleRef.current?.(nextId);
-        requestRender();
-        return;
-      }
-      if (key === "Enter" || key === " ") {
-        const node = findNode(focusedIdRef.current);
-        if (node && !node.unresolved) openNoteRef.current?.(node.id);
-      }
-    }
-
+    // The container-level keyboard handler updates focusedId; here we only
+    // nudge the physics alpha so the selection ring redraws.
+    canvasKeyboardRef.current = () => {
+      alpha = Math.max(alpha, 0.15);
+      requestRender();
+    };
     focusHandleRef.current = (id) => onFocus(id);
-    keyboardHandleRef.current = handleKeyboard;
 
     resize();
 
@@ -752,13 +853,11 @@ function GraphCanvas({
       canvas.removeEventListener("pointerleave", onPointerLeave);
       document.removeEventListener("visibilitychange", onVisibilityChange);
       focusHandleRef.current = null;
-      keyboardHandleRef.current = null;
+      canvasKeyboardRef.current = null;
     };
   }, [links, onFocus]);
 
   function onKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
-    const handler = keyboardHandleRef.current;
-    if (!handler) return;
     const key = event.key;
     if (
       key === "ArrowLeft" ||
@@ -773,7 +872,7 @@ function GraphCanvas({
       key === "k"
     ) {
       event.preventDefault();
-      handler(key);
+      handleKeyboardNav(key);
     }
   }
 
