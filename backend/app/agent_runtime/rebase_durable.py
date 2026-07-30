@@ -96,7 +96,19 @@ def _durable_state_path() -> Path:
         if isinstance(runtime_dir, (str, Path))
         else Path(tempfile.gettempdir()) / "wiki-agent-runtime"
     )
-    return root / "rebase-bot" / "state.json"
+    state_path = root / "rebase-bot" / "state.json"
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        live_root = Path.home() / ".wiki" / "agent-runtime"
+        try:
+            state_path.resolve().relative_to(live_root.resolve())
+        except ValueError:
+            pass
+        else:
+            raise RebaseError(
+                "pytest cannot open the live rebase-bot durable store; "
+                "use an isolated AGENT_RUNTIME_DIR"
+            )
+    return state_path
 
 
 def _load_durable_state() -> None:

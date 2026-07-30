@@ -301,6 +301,48 @@ class RebaseBotTests(unittest.TestCase):
             main._rebase_bot_notification_sender("wiki", "test notification")
         send.assert_not_called()
 
+    def test_pytest_guard_rejects_live_durable_store(self) -> None:
+        live_runtime = Path.home() / ".wiki" / "agent-runtime"
+        fake_main = SimpleNamespace(AGENT_RUNTIME_DIR=live_runtime)
+        with mock.patch.object(rebase_bot, "_main", return_value=fake_main):
+            with self.assertRaisesRegex(RebaseError, "pytest cannot open the live"):
+                rebase_durable._durable_state_path()
+
+    def test_rebase_test_does_not_touch_live_durable_store(self) -> None:
+        live_state = Path.home() / ".wiki" / "agent-runtime" / "rebase-bot" / "state.json"
+        before = live_state.read_bytes() if live_state.exists() else None
+        with tempfile.TemporaryDirectory() as raw:
+            fake_main = SimpleNamespace(
+                AGENT_RUNTIME_DIR=raw,
+                _registry_agent=lambda _registry, _worker: (
+                    "WIKI-175-IMPL",
+                    {},
+                    {"worktree": raw, "orch": "wiki"},
+                ),
+                _read_agent_registry=lambda: {},
+            )
+            with (
+                mock.patch.object(rebase_bot, "_main", return_value=fake_main),
+                mock.patch.object(rebase_bot, "_validate_pr_binding"),
+                mock.patch.object(rebase_bot, "_start_rebase_thread"),
+            ):
+                result = rebase_bot.rebase_dirty_pr(
+                    175,
+                    "WIKI-175",
+                    "WIKI-175-IMPL",
+                    gate=lambda _pr: {
+                        "raw": {
+                            "mergeable": "CONFLICTING",
+                            "repo": "hwang2409/wiki",
+                            "head_ref_name": "feature",
+                            "head_sha": "isolated-test",
+                        }
+                    },
+                )
+        after = live_state.read_bytes() if live_state.exists() else None
+        self.assertEqual(result["status"], "started")
+        self.assertEqual(before, after)
+
     def test_duplicate_logical_notification_is_sent_once(self) -> None:
         sent: list[tuple[str, str]] = []
         result = {
