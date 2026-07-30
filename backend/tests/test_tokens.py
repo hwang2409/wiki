@@ -88,6 +88,31 @@ def _codex_token_row(ts: str, cum: dict[str, int]) -> dict:
     }
 
 
+def _codex_token_row_partial(ts: str, cum: dict[str, int]) -> dict:
+    """Like `_codex_token_row` but emits ONLY the keys present in `cum`.
+
+    Simulates a codex event that ships an incomplete `total_token_usage` —
+    e.g. a plain non-reasoning model whose event drops the reasoning field
+    entirely on a mid-session model switch.
+    """
+    field_by_metric = {
+        "input": "input_tokens",
+        "cached": "cached_input_tokens",
+        "output": "output_tokens",
+        "reasoning": "reasoning_output_tokens",
+    }
+    total = {field_by_metric[k]: v for k, v in cum.items() if k in field_by_metric}
+    total["total_tokens"] = sum(cum.values())
+    return {
+        "timestamp": ts,
+        "type": "event_msg",
+        "payload": {
+            "type": "token_count",
+            "info": {"total_token_usage": total},
+        },
+    }
+
+
 def _codex_turn_context(ts: str, model: str) -> dict:
     return {"timestamp": ts, "type": "turn_context", "payload": {"model": model}}
 
@@ -443,6 +468,328 @@ class IncrementalScanTests(unittest.TestCase):
             self.assertEqual(tokens.query()["totals"]["input"], 500)
 
 
+class GroupedResetTests(unittest.TestCase):
+    """Round-3 review HIGH: codex ships counters as a group. When ANY
+    counter drops (resume / rotate) the others' apparent growth is really
+    a fresh count against a new baseline, not real activity. Re-anchoring
+    per-metric independently overcounts — probe returned 1000/20 where
+    truth is 1000/5."""
+
+    def test_grouped_reset_zeros_every_reported_metric(self) -> None:
+        with _EnvOverride() as paths:
+            from backend.app import tokens
+
+            day = paths["codex"] / "2026/07/08"
+            rows = [
+                _codex_session_meta("2026-07-08T18:00:00Z", "gpt-5.4"),
+                _codex_token_row(
+                    "2026-07-08T18:00:10Z",
+                    {"input": 1000, "output": 5},
+                ),
+                # A resume/rotate: input drops (real reset), output's fresh
+                # count LOOKS like growth relative to the pre-reset value.
+                # Per-metric would credit that fake growth; grouped-reset
+                # must ignore both.
+                _codex_token_row(
+                    "2026-07-08T18:05:00Z",
+                    {"input": 500, "output": 20},
+                ),
+            ]
+            _write_jsonl(day / "rollout-reset.jsonl", rows)
+            tokens.refresh()
+            totals = tokens.query()["totals"]
+            self.assertEqual(totals["input"], 1000)
+            self.assertEqual(totals["output"], 5)
+
+    def test_absent_metric_reappearance_after_reset_reanchors(self) -> None:
+        """Round-4 review HIGH: a grouped reset that omits a metric leaves the
+        prior-epoch cumulative in place. When that metric reappears later at a
+        fresh-epoch value, the naive diff either credits fake growth or trips
+        a second grouped_reset that drops sibling deltas. The fix marks
+        absent-after-reset metrics as pending re-anchor.
+
+        Truth for this fixture: input contributed 100 + 5 + 5 = 110; output
+        contributed 50 + 2 + 3 = 55; reasoning contributed 20 + 0 (anchor) +
+        5 = 25. Without the fix, the reappearance of reasoning as 25 triggers
+        `25 < 20`-style behaviour on the sibling reset and zeros input +
+        output deltas from the third event, giving under-count 105 / 52 / 25.
+        """
+        with _EnvOverride() as paths:
+            from backend.app import tokens
+
+            day = paths["codex"] / "2026/07/09"
+            rows = [
+                _codex_session_meta("2026-07-09T18:00:00Z", "gpt-5.4"),
+                # Epoch 1 — all three metrics reported.
+                _codex_token_row(
+                    "2026-07-09T18:00:10Z",
+                    {"input": 100, "output": 50, "reasoning": 20},
+                ),
+                # Reset — only input + output reported. reasoning must be
+                # marked pending re-anchor; its prev-epoch 20 is now stale.
+                _codex_token_row_partial(
+                    "2026-07-09T18:05:00Z",
+                    {"input": 5, "output": 2},
+                ),
+                # Reasoning reappears — value happens to be > prev (25 > 20)
+                # so a naive diff would fake-credit 5 tokens; the fix must
+                # anchor (delta 0) and preserve the input + output deltas.
+                _codex_token_row(
+                    "2026-07-09T18:10:00Z",
+                    {"input": 10, "output": 5, "reasoning": 25},
+                ),
+                # Fresh-epoch reasoning continues climbing; delta from anchor
+                # is the honest 5.
+                _codex_token_row(
+                    "2026-07-09T18:15:00Z",
+                    {"input": 12, "output": 6, "reasoning": 30},
+                ),
+            ]
+            _write_jsonl(day / "rollout-absent.jsonl", rows)
+            tokens.refresh()
+            totals = tokens.query()["totals"]
+            # input: 100 (epoch 1) + 0 (reset) + 5 (10 - 5) + 2 (12 - 10)
+            self.assertEqual(totals["input"], 107)
+            # output: 50 + 0 + 3 (5 - 2) + 1 (6 - 5)
+            self.assertEqual(totals["output"], 54)
+            # reasoning: 20 (epoch 1) + 0 (anchor on re-appearance) + 5 (30 - 25)
+            self.assertEqual(totals["reasoning"], 25)
+
+    def test_absent_metric_reappearance_below_prev_no_double_reset(self) -> None:
+        """Sibling scenario: reappearing metric's fresh-epoch value happens to
+        be BELOW its stale prev. Without pending re-anchor tracking, the
+        sibling drop trips a second grouped_reset — zeroing input + output
+        deltas that were valid. The fix must exempt pending metrics from the
+        reset check."""
+        with _EnvOverride() as paths:
+            from backend.app import tokens
+
+            day = paths["codex"] / "2026/07/09"
+            rows = [
+                _codex_session_meta("2026-07-09T18:00:00Z", "gpt-5.4"),
+                _codex_token_row(
+                    "2026-07-09T18:00:10Z",
+                    {"input": 100, "output": 50, "reasoning": 40},
+                ),
+                # Reset — reasoning omitted. Prev reasoning (40) is now stale.
+                _codex_token_row_partial(
+                    "2026-07-09T18:05:00Z",
+                    {"input": 5, "output": 2},
+                ),
+                # Reasoning reappears at 8 (< stale 40). Naive check would
+                # detect reset and drop the valid input/output growth deltas.
+                _codex_token_row(
+                    "2026-07-09T18:10:00Z",
+                    {"input": 15, "output": 8, "reasoning": 8},
+                ),
+            ]
+            _write_jsonl(day / "rollout-below.jsonl", rows)
+            tokens.refresh()
+            totals = tokens.query()["totals"]
+            # input growth 5 -> 15 is real (delta 10).
+            self.assertEqual(totals["input"], 110)
+            # output growth 2 -> 8 is real (delta 6).
+            self.assertEqual(totals["output"], 56)
+            # reasoning: 40 (epoch 1) + 0 (anchor at 8).
+            self.assertEqual(totals["reasoning"], 40)
+
+
+class MetricAvailabilityTests(unittest.TestCase):
+    """WIKI-157: `reasoning` and `cached` must be OMITTED from the response
+    when no source contributed them (claude never reports reasoning), so the
+    frontend can render "unavailable" instead of a misleading 0."""
+
+    def test_claude_only_omits_reasoning(self) -> None:
+        with _EnvOverride() as paths:
+            from backend.app import tokens
+
+            _write_jsonl(
+                paths["claude"] / "p/s.jsonl",
+                [
+                    _claude_assistant_row(
+                        "2026-07-08T18:00:00Z",
+                        "m1",
+                        "sonnet",
+                        {
+                            "input_tokens": 100,
+                            "output_tokens": 40,
+                            "cache_read_input_tokens": 25,
+                        },
+                    )
+                ],
+            )
+            tokens.refresh()
+            response = tokens.query()
+            series = response["buckets"][0]["series"]["claude/sonnet"]
+            self.assertEqual(series["input"], 100)
+            self.assertEqual(series["cached"], 25)
+            self.assertEqual(series["output"], 40)
+            self.assertNotIn("reasoning", series)
+            self.assertNotIn("reasoning", response["totals"])
+
+    def test_codex_with_reasoning_keeps_the_field(self) -> None:
+        with _EnvOverride() as paths:
+            from backend.app import tokens
+
+            day = paths["codex"] / "2026/07/08"
+            _write_jsonl(
+                day / "rollout-r.jsonl",
+                [
+                    _codex_session_meta("2026-07-08T18:00:00Z", "gpt-5.4"),
+                    _codex_token_row(
+                        "2026-07-08T18:00:10Z",
+                        {"input": 100, "output": 40, "reasoning": 12},
+                    ),
+                ],
+            )
+            tokens.refresh()
+            series = tokens.query()["buckets"][0]["series"]["codex/gpt-5.4"]
+            self.assertEqual(series["reasoning"], 12)
+
+    def test_model_switch_preserves_input_output_when_reasoning_disappears(self) -> None:
+        """Round-3 regression: a mid-session model switch drops the reasoning
+        field from `total_token_usage`; the old code zero-filled it, tripped
+        the group drop-clamp, and lost the co-reported input / output delta.
+        """
+        with _EnvOverride() as paths:
+            from backend.app import tokens
+
+            day = paths["codex"] / "2026/07/08"
+            rows = [
+                _codex_session_meta("2026-07-08T18:00:00Z", "o1"),
+                _codex_token_row(
+                    "2026-07-08T18:00:10Z",
+                    {"input": 100, "output": 20, "reasoning": 5},
+                ),
+                _codex_turn_context("2026-07-08T18:05:00Z", "gpt-5.4"),
+                # Non-reasoning model omits the reasoning field entirely;
+                # cumulative counters keep advancing on the fields it does
+                # emit — this delta must still land, not vanish.
+                _codex_token_row_partial(
+                    "2026-07-08T18:10:00Z",
+                    {"input": 200, "output": 40},
+                ),
+            ]
+            _write_jsonl(day / "rollout-switch.jsonl", rows)
+            tokens.refresh()
+            response = tokens.query()
+            totals = response["totals"]
+            # Reasoning delta from the first event survives; input / output
+            # get the full run:  first (100/20) + switch (100/20) = 200 / 40.
+            self.assertEqual(totals["input"], 200)
+            self.assertEqual(totals["output"], 40)
+            self.assertEqual(totals["reasoning"], 5)
+
+            # The non-reasoning model does NOT advertise reasoning in its
+            # own bucket, even though the file's earlier model did.
+            per_series_reasoning = {}
+            for bucket in response["buckets"]:
+                for key, values in bucket["series"].items():
+                    per_series_reasoning.setdefault(key, set()).add("reasoning" in values)
+            self.assertEqual(per_series_reasoning["codex/gpt-5.4"], {False})
+            self.assertEqual(per_series_reasoning["codex/o1"], {True})
+
+    def test_repeated_cumulative_on_plain_model_does_not_advertise_reasoning(self) -> None:
+        """Round-3 review: a plain non-reasoning model that reads back a
+        stale cumulative reasoning total (persisted across a mid-session
+        model switch) must not fake-report reasoning as available. The
+        `provided` flag lives on the DELTA, not the cumulative."""
+        with _EnvOverride() as paths:
+            from backend.app import tokens
+
+            day = paths["codex"] / "2026/07/08"
+            rows = [
+                _codex_session_meta("2026-07-08T18:00:00Z", "o1"),
+                _codex_token_row(
+                    "2026-07-08T18:00:10Z",
+                    {"input": 100, "output": 20, "reasoning": 5},
+                ),
+                _codex_turn_context("2026-07-08T18:05:00Z", "gpt-5.4"),
+                # Plain model reads back the last reasoning cumulative
+                # unchanged — no new reasoning tokens, but the raw field
+                # is still present. Delta = 0 → NOT available.
+                _codex_token_row(
+                    "2026-07-08T18:10:00Z",
+                    {"input": 200, "output": 40, "reasoning": 5},
+                ),
+                _codex_token_row(
+                    "2026-07-08T18:15:00Z",
+                    {"input": 300, "output": 60, "reasoning": 5},
+                ),
+            ]
+            _write_jsonl(day / "rollout-repeat.jsonl", rows)
+            tokens.refresh()
+            per_series_reasoning = {}
+            for bucket in tokens.query()["buckets"]:
+                for key, values in bucket["series"].items():
+                    per_series_reasoning.setdefault(key, set()).add(
+                        "reasoning" in values
+                    )
+            # The reasoning model gets reasoning; the plain model does NOT.
+            self.assertEqual(per_series_reasoning["codex/o1"], {True})
+            self.assertEqual(per_series_reasoning["codex/gpt-5.4"], {False})
+
+    def test_plain_non_reasoning_model_never_marks_reasoning_available(self) -> None:
+        with _EnvOverride() as paths:
+            from backend.app import tokens
+
+            day = paths["codex"] / "2026/07/08"
+            # A plain model that ships reasoning_output_tokens: 0 across the
+            # whole session — must NOT be treated as a reasoning model.
+            _write_jsonl(
+                day / "rollout-plain.jsonl",
+                [
+                    _codex_session_meta("2026-07-08T18:00:00Z", "gpt-5.4"),
+                    _codex_token_row(
+                        "2026-07-08T18:00:10Z",
+                        {"input": 100, "output": 20, "reasoning": 0},
+                    ),
+                    _codex_token_row(
+                        "2026-07-08T18:05:00Z",
+                        {"input": 300, "output": 60, "reasoning": 0},
+                    ),
+                ],
+            )
+            tokens.refresh()
+            response = tokens.query()
+            series = response["buckets"][0]["series"]["codex/gpt-5.4"]
+            self.assertNotIn("reasoning", series)
+            self.assertNotIn("reasoning", response["totals"])
+
+    def test_mixed_sources_take_union_of_availability(self) -> None:
+        with _EnvOverride() as paths:
+            from backend.app import tokens
+
+            day = paths["codex"] / "2026/07/08"
+            _write_jsonl(
+                day / "rollout-r.jsonl",
+                [
+                    _codex_session_meta("2026-07-08T18:00:00Z", "gpt-5.4"),
+                    _codex_token_row(
+                        "2026-07-08T18:00:10Z",
+                        {"input": 100, "reasoning": 5},
+                    ),
+                ],
+            )
+            _write_jsonl(
+                paths["claude"] / "p/s.jsonl",
+                [
+                    _claude_assistant_row(
+                        "2026-07-08T18:10:00Z",
+                        "m1",
+                        "sonnet",
+                        {"input_tokens": 50, "output_tokens": 5},
+                    ),
+                ],
+            )
+            tokens.refresh()
+            response = tokens.query()
+            # totals include reasoning because codex reported it — even
+            # though claude does not.
+            self.assertIn("reasoning", response["totals"])
+            self.assertEqual(response["totals"]["reasoning"], 5)
+
+
 class NonBlockingQueryTests(unittest.TestCase):
     def test_cold_cache_returns_empty_snapshot_and_refreshing(self) -> None:
         with _EnvOverride():
@@ -453,7 +800,10 @@ class NonBlockingQueryTests(unittest.TestCase):
 
             self.assertTrue(response["refreshing"])
             self.assertEqual(response["buckets"], [])
-            self.assertEqual(response["totals"]["input"], 0)
+            # WIKI-157: totals emit a metric only when some source reported it.
+            # A cold cache reports nothing, so the map is empty — the frontend
+            # then renders "unavailable" instead of a misleading 0.
+            self.assertEqual(response["totals"], {})
             start_refresh.assert_called_once()
 
     def test_stale_cache_serves_snapshot_while_refresh_runs(self) -> None:

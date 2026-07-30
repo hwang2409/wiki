@@ -34,8 +34,14 @@ from typing import Iterable
 # incident 2026-07-08). Losers of the race serve the last persisted snapshot.
 _REFRESH_LOCK = threading.Lock()
 
-CACHE_VERSION = 2  # v1 caches had a byte-offset desync on non-ASCII tail reads
-                    # + per-file (not global) msg-id dedupe; both wipe on load.
+CACHE_VERSION = 4  # v3 zero-filled the cumulative-token path and unioned
+                    # `provided` file-wide, so a mid-session model switch lost
+                    # tokens (input/output nulled to 0 alongside a disappeared
+                    # reasoning field) and plain non-reasoning models still
+                    # advertised reasoning as available. v4 keeps cumulative
+                    # fields optional end-to-end and scopes reasoning
+                    # availability per-model at event time.
+METRIC_KEYS: tuple[str, ...] = ("input", "cached", "output", "reasoning")
 SYNC_REFRESH_MAX_AGE_SECONDS = int(os.environ.get("WIKI_TOKEN_SYNC_MAX_AGE_SECONDS", "15"))
 
 BUCKET_HOUR = "hour"
@@ -145,13 +151,16 @@ def _add_delta(
     cli: str,
     model: str | None,
     delta: dict[str, int],
+    *,
+    provided: Iterable[str],
     index: dict[tuple[str, str, str], int] | None = None,
 ) -> None:
     ts_hour = _floor_hour(ts)
     if ts_hour is None:
         return
     model = model or "unknown"
-    if not any(delta.get(k) for k in ("input", "cached", "output", "reasoning")):
+    provided_set = {k for k in provided if k in METRIC_KEYS}
+    if not any(delta.get(k) for k in METRIC_KEYS):
         return
     key = (ts_hour, cli, model)
     if index is None:
@@ -167,6 +176,7 @@ def _add_delta(
                 "cached": int(delta.get("cached", 0)),
                 "output": int(delta.get("output", 0)),
                 "reasoning": int(delta.get("reasoning", 0)),
+                "provided": sorted(provided_set),
             }
         )
         index[key] = len(state["buckets"]) - 1
@@ -176,6 +186,8 @@ def _add_delta(
         b["cached"] += int(delta.get("cached", 0))
         b["output"] += int(delta.get("output", 0))
         b["reasoning"] += int(delta.get("reasoning", 0))
+        existing = set(b.get("provided") or [])
+        b["provided"] = sorted(existing | provided_set)
 
 
 # --------------------------------------------------------------------- codex
@@ -213,28 +225,87 @@ def _codex_apply(state: dict, file_state: dict, row: dict, index: dict) -> None:
     if not isinstance(total, dict):
         return
 
-    cum = {
-        "input": int(total.get("input_tokens") or 0),
-        "cached": int(total.get("cached_input_tokens") or 0),
-        "output": int(total.get("output_tokens") or 0),
-        "reasoning": int(total.get("reasoning_output_tokens") or 0),
-    }
-    prev = file_state.get("cum")
-    if prev is None:
-        delta = cum
+    # Only pick up numeric cumulative fields — never fabricate 0 for a
+    # missing / null entry. WIKI-157 round-3: on a mid-session model switch,
+    # codex frequently drops the reasoning field entirely; the old
+    # `int(... or 0)` path both fake-reported reasoning: 0 AND tripped the
+    # group drop-clamp, zeroing the delta across every co-reported metric
+    # and losing real input / output activity.
+    cum_event: dict[str, int] = {}
+    for src, dst in (
+        ("input_tokens", "input"),
+        ("cached_input_tokens", "cached"),
+        ("output_tokens", "output"),
+        ("reasoning_output_tokens", "reasoning"),
+    ):
+        raw = total.get(src)
+        if isinstance(raw, (int, float)):
+            cum_event[dst] = int(raw)
+    if not cum_event:
+        return
+
+    prev: dict[str, int] = file_state.get("cum") or {}
+    # Metrics whose old-epoch cumulative in `prev` is stale after a prior
+    # grouped reset that did NOT re-report them. Their next appearance is a
+    # fresh baseline, not an increment — diffing would either credit fake
+    # growth or flag a spurious second reset that drops sibling deltas.
+    # (Round-4 review HIGH: absent-metric re-appearance wiped valid deltas.)
+    pending: set[str] = set(file_state.get("pending_reanchor") or [])
+
+    # Codex ships the counters as a group. A resume/rotate resets ALL of them
+    # to fresh baselines in the same event — a metric that appears to have
+    # grown after another metric dropped is really a fresh count, not real
+    # activity. Detect the reset once across cum_event, then zero every
+    # reported metric together. (Round-3 review: per-metric re-anchor
+    # over-counted grouped resets.) Skip pending re-anchors from the check —
+    # their prev value is from the pre-reset epoch and would flag a false
+    # reset when the new-epoch cumulative is (correctly) smaller.
+    grouped_reset = any(
+        k not in pending and prev.get(k) is not None and v < prev[k]
+        for k, v in cum_event.items()
+    )
+    delta: dict[str, int] = {}
+    if grouped_reset:
+        delta = {k: 0 for k in cum_event}
+        # Metrics that were tracked pre-reset but are absent from THIS reset
+        # event still hold their old-epoch cumulative in `prev`. Mark them
+        # so their next appearance re-anchors (delta = 0) instead of diffing.
+        absent = set(prev) - set(cum_event)
+        pending |= absent
+        # Present metrics ARE the new baseline — clear any prior pending flag.
+        pending -= set(cum_event)
     else:
-        # A resumed session's counters restart from 0. If ANY counter went
-        # down, treat as a re-anchor: emit zero delta this event across all
-        # fields, adopt the new cumulative as the baseline. (Counters that
-        # didn't move backwards are still zeroed for the reset event — codex
-        # ships them as a group and mixing pre/post-resume deltas
-        # over-attributes.)
-        drops = any(cum[k] < prev.get(k, 0) for k in cum)
-        if drops:
-            delta = {k: 0 for k in cum}
-        else:
-            delta = {k: cum[k] - prev.get(k, 0) for k in cum}
-    file_state["cum"] = cum
+        for k, v in cum_event.items():
+            if k in pending:
+                # Re-anchor: adopt v as the new epoch baseline, no delta.
+                delta[k] = 0
+                pending.discard(k)
+            else:
+                p = prev.get(k)
+                delta[k] = v if p is None else v - p
+
+    # Availability is gated on a POSITIVE DELTA — not on the cumulative
+    # total. A plain non-reasoning model that reads back the last reasoning
+    # cumulative (persisted across a mid-session model switch) would
+    # otherwise fake-report reasoning as available. Round-3 review.
+    # input / cached / output are structurally reported by codex, so their
+    # presence in cum_event is enough — reasoning is the metric with
+    # per-model variance and must earn its slot with real activity.
+    provided = {"input", "cached", "output"} & set(cum_event)
+    if delta.get("reasoning", 0) > 0:
+        provided.add("reasoning")
+
+    # Persist the new cumulative — absent fields retain their prior last
+    # value so a later event that re-includes them still diffs correctly.
+    # (Absent-after-reset metrics carry a `pending_reanchor` flag that
+    # forces delta=0 on re-appearance regardless of the stale prev value.)
+    merged = dict(prev)
+    merged.update(cum_event)
+    file_state["cum"] = merged
+    if pending:
+        file_state["pending_reanchor"] = sorted(pending)
+    elif "pending_reanchor" in file_state:
+        del file_state["pending_reanchor"]
 
     _add_delta(
         state,
@@ -242,6 +313,7 @@ def _codex_apply(state: dict, file_state: dict, row: dict, index: dict) -> None:
         "codex",
         file_state.get("model"),
         delta,
+        provided=provided,
         index=index,
     )
 
@@ -273,7 +345,17 @@ def _claude_apply(state: dict, file_state: dict, row: dict, index: dict) -> None
         "output": int(usage.get("output_tokens") or 0),
         "reasoning": 0,
     }
-    _add_delta(state, row.get("timestamp"), "claude", model, delta, index=index)
+    # Anthropic's usage payload never carries a reasoning-token field, so
+    # the metric is genuinely unavailable for claude sessions.
+    _add_delta(
+        state,
+        row.get("timestamp"),
+        "claude",
+        model,
+        delta,
+        provided={"input", "cached", "output"},
+        index=index,
+    )
 
 
 # --------------------------------------------------------------------- scan
@@ -472,8 +554,10 @@ def _query_from_state(
     kept: list[dict] = []
     models_seen: set[str] = set()
     cli_seen: set[str] = set()
-    totals = {"input": 0, "cached": 0, "output": 0, "reasoning": 0}
+    totals_sum = {k: 0 for k in METRIC_KEYS}
+    totals_provided: set[str] = set()
     grouped: dict[str, dict[str, dict[str, int]]] = {}
+    provided_per_series: dict[tuple[str, str], set[str]] = {}
 
     for b in state["buckets"]:
         dt = _bucket_dt(b["ts"])
@@ -499,19 +583,35 @@ def _query_from_state(
         ts_key = dt.isoformat().replace("+00:00", "Z")
         series_key = f"{b['cli']}/{b['model']}"
         series = grouped.setdefault(ts_key, {}).setdefault(
-            series_key, {"input": 0, "cached": 0, "output": 0, "reasoning": 0}
+            series_key, {k: 0 for k in METRIC_KEYS}
         )
-        for k in ("input", "cached", "output", "reasoning"):
+        # Legacy (pre-v3) buckets without a `provided` list are assumed to
+        # cover the full metric set — preserves old-shape output on reads
+        # that pre-date the schema bump.
+        raw_provided = b.get("provided")
+        bucket_provided = (
+            set(raw_provided) if isinstance(raw_provided, list) else set(METRIC_KEYS)
+        )
+        provided_per_series.setdefault((ts_key, series_key), set()).update(bucket_provided)
+        totals_provided.update(bucket_provided)
+        for k in METRIC_KEYS:
             series[k] += int(b.get(k, 0))
-            totals[k] += int(b.get(k, 0))
+            totals_sum[k] += int(b.get(k, 0))
 
-    buckets_out = [
-        {"ts": ts, "series": series}
-        for ts, series in sorted(grouped.items())
-    ]
+    buckets_out = []
+    for ts, series_map in sorted(grouped.items()):
+        series_out = {}
+        for series_key, sums in series_map.items():
+            provided = provided_per_series.get((ts, series_key), set(METRIC_KEYS))
+            # Only emit metrics some source actually reported for this series
+            # — the frontend's "unavailable" convention relies on the key
+            # being absent (not present-with-zero).
+            series_out[series_key] = {k: sums[k] for k in METRIC_KEYS if k in provided}
+        buckets_out.append({"ts": ts, "series": series_out})
+    totals_out = {k: totals_sum[k] for k in METRIC_KEYS if k in totals_provided}
     return {
         "buckets": buckets_out,
-        "totals": totals,
+        "totals": totals_out,
         "models": sorted(models_seen),
         "clis": sorted(cli_seen),
         "sessions_scanned": len(state["files"]),
