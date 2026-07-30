@@ -1182,6 +1182,23 @@ query ReviewThreads($url: URI!, $endCursor: String) {
 NO_CHECKS_STDERR = re.compile(r"^no checks reported on the '[^']+' branch$")
 
 
+def _status_rollup_checks(value: object) -> list[dict]:
+    if not isinstance(value, list):
+        raise GateError("gh pr view returned an invalid statusCheckRollup")
+    checks: list[dict] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise GateError("gh pr view returned an invalid statusCheckRollup item")
+        name = item.get("name") or item.get("context") or item.get("workflowName")
+        if not isinstance(name, str) or not name:
+            raise GateError("gh pr view statusCheckRollup item omitted name")
+        raw_state = item.get("conclusion") or item.get("state") or "PENDING"
+        if not isinstance(raw_state, str) or not raw_state:
+            raw_state = "PENDING"
+        checks.append({"name": name, "state": raw_state.upper()})
+    return checks
+
+
 def _unresolved_threads(pr_url: str) -> int:
     count = 0
     cursor: str | None = None
@@ -1210,7 +1227,10 @@ def _check_gate_checks(pr: str, repo: str) -> tuple[list[dict], bool]:
     )
     raw = result.stdout.strip()
     stderr = result.stderr.strip()
-    if result.returncode == 1 and NO_CHECKS_STDERR.fullmatch(stderr):
+    stdout_is_no_checks = (
+        not raw or raw == "[]" or raw.lower().startswith("no checks reported")
+    )
+    if result.returncode == 1 and NO_CHECKS_STDERR.fullmatch(stderr) and stdout_is_no_checks:
         return [], True
     if result.returncode != 0 and not raw:
         raise GateError("gh pr checks failed without a check result")
@@ -1240,13 +1260,17 @@ def _gate_result(args: argparse.Namespace) -> dict:
             "--repo",
             repo,
             "--json",
-            "state,isDraft,mergeable,mergeStateStatus,headRefOid,url",
+            "state,isDraft,mergeable,mergeStateStatus,headRefOid,url,statusCheckRollup",
         ]
     )
     pr_url = view.get("url")
     if not isinstance(pr_url, str) or not pr_url:
         raise GateError("gh pr view response omitted URL")
     checks, no_checks = _check_gate_checks(args.pr, repo)
+    rollup_checks = _status_rollup_checks(view.get("statusCheckRollup"))
+    if rollup_checks:
+        checks = rollup_checks
+        no_checks = False
     unresolved = _unresolved_threads(pr_url)
 
     check_states = {str(check.get("state") or "").upper() for check in checks}

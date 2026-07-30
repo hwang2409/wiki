@@ -1065,6 +1065,11 @@ class AgentWatchTests(unittest.TestCase):
                     raise SystemExit(1)
                 state_file = os.environ.get("FAKE_GH_STATE_FILE")
                 state = open(state_file).read().strip() if state_file else ("MERGED" if scenario == "merged" else "OPEN")
+                rollup = []
+                if scenario == "rollup-mismatch":
+                    rollup = [{"__typename": "CheckRun", "name": "required", "status": "COMPLETED", "conclusion": "FAILURE"}]
+                elif scenario == "realistic-failure":
+                    rollup = [{"__typename": "CheckRun", "name": "test", "status": "COMPLETED", "conclusion": "FAILURE", "detailsUrl": "https://example.test/check"}]
                 print(json.dumps({
                     "state": state,
                     "isDraft": scenario == "draft",
@@ -1072,6 +1077,7 @@ class AgentWatchTests(unittest.TestCase):
                     "mergeStateStatus": "CLEAN",
                     "headRefOid": "abcdef0123456789",
                     "url": "https://github.com/example/wiki/pull/103",
+                    "statusCheckRollup": rollup,
                 }))
             elif args[:2] == ["pr", "checks"]:
                 if scenario == "failing-checks":
@@ -1082,6 +1088,12 @@ class AgentWatchTests(unittest.TestCase):
                 elif scenario == "no-checks-stderr":
                     sys.stderr.write("no checks reported on the 'example/wiki' branch\\n")
                     raise SystemExit(1)
+                elif scenario == "rollup-mismatch":
+                    sys.stderr.write("no checks reported on the 'example/wiki' branch\\n")
+                    raise SystemExit(1)
+                elif scenario == "realistic-failure":
+                    print(json.dumps([{ "name": "test", "state": "FAILURE" }]))
+                    raise SystemExit(8)
                 elif scenario == "empty-checks-failure":
                     raise SystemExit(1)
                 else:
@@ -1110,6 +1122,8 @@ class GateTests(unittest.TestCase):
             "failing-checks": (1, ["checks-failing"]),
             "no-checks": (0, []),
             "no-checks-stderr": (0, []),
+            "rollup-mismatch": (1, ["checks-failing"]),
+            "realistic-failure": (1, ["checks-failing"]),
             "empty-checks-failure": (2, []),
             "unresolved": (1, ["unresolved-threads:2"]),
             "not-mergeable": (1, ["not-mergeable"]),
