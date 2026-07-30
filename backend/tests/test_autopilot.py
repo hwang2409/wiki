@@ -31,6 +31,13 @@ class HarnessAutopilotController(RealAutopilotController):
             "notify",
             lambda orch, message: self.notifications.append((orch, message)),
         )
+        # Stub the registry too: without this, _orchestrator() falls back to the
+        # LIVE agent registry, so halt-notification tests silently depend on
+        # whether the ticket happens to be registered on the host machine.
+        kwargs.setdefault(
+            "registry_reader",
+            lambda: {"WIKI-173": {"current": {"orch": "wiki"}}},
+        )
         super().__init__(*args, **kwargs)
 
 
