@@ -88,6 +88,25 @@ class ExtractNoteImagePathsTests(unittest.TestCase):
         content = "![](hero.png?v=2)\n![](hero.png#fragment)\n"
         self.assertEqual(_extract_note_image_paths(content, "index.md"), ["hero.png"])
 
+    def test_percent_encoded_hash_in_filename_survives_decode(self) -> None:
+        # `%23` is a literal `#` in the filename, not a fragment delimiter.
+        # A naive decode-before-split would treat `hero%23draft.png` as
+        # `hero` and drop the extension, silently returning no metadata.
+        content = "![](hero%23draft.png)\n"
+        self.assertEqual(
+            _extract_note_image_paths(content, "index.md"),
+            ["hero#draft.png"],
+        )
+
+    def test_percent_encoded_question_mark_in_filename_survives_decode(self) -> None:
+        # Same story for `%3F` — literal `?` in the filename must not be
+        # mistaken for a query string opener.
+        content = "![](hero%3Fdraft.png)\n"
+        self.assertEqual(
+            _extract_note_image_paths(content, "index.md"),
+            ["hero?draft.png"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

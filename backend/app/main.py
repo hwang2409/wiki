@@ -764,12 +764,15 @@ def _extract_note_image_paths(content: str, note_path: str) -> list[str]:
         candidates.append(candidate)
 
     def note_relative(target: str) -> list[str]:
-        # URL-decode first so `%20` and friends round-trip correctly.
+        # Split on the LITERAL query / fragment delimiters first — decoding
+        # before splitting would treat `hero%23draft.png` or
+        # `hero%3Fdraft.png` as if they carried a real `#` or `?`, silently
+        # dropping the actual filename tail.
+        without_query = target.split("?", 1)[0].split("#", 1)[0]
         try:
-            decoded = unquote(target)
+            stripped = unquote(without_query).strip()
         except (UnicodeDecodeError, ValueError):
-            decoded = target
-        stripped = decoded.split("?", 1)[0].split("#", 1)[0].strip()
+            stripped = without_query.strip()
         if not stripped or stripped.startswith("/"):
             return []
         if re.match(r"^[a-z][a-z0-9+.-]*:", stripped, re.IGNORECASE):
