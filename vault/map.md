@@ -39,6 +39,7 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[harness-pi-coding-agent]] — Pi coding agent harness breakdown: runtime, tool surface
 - [[llm-rigorous-proving]] — LLMs on rigorous mathematical proving: current SOTA, failure modes, benchmarks
 - [[graph-engineering]] — graph engineering as next layer after loop engineering; org-graph + work-graph, nodes/edges/shared-state, maps onto orchestrator/worker stack
+- [[t3code]] — prior art for the wiki agent-control surface: theo/ping's open-source multi-provider harness controller
 
 ## Design
 
