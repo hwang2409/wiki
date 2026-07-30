@@ -4,6 +4,7 @@ import asyncio
 import errno
 import fcntl
 import json
+import logging
 import os
 import re
 import secrets
@@ -55,10 +56,12 @@ from .agent_runtime.client import (
     SupervisorUnavailable,
     replacement_prompt,
 )
+from .agent_runtime import costs
 from .agent_runtime import graph_health
 from .agent_runtime.loop_state import derive_loop_state
 from .agent_runtime.store import RuntimePaths
 from .agent_runtime.ticket import base_ticket
+from .agent_runtime.unknown_kind_telemetry import UnknownKindTelemetry
 from .frontend_static import mount_frontend_static
 from .next_review_schema import NextReviewIn
 
@@ -93,11 +96,15 @@ IGNORED_FILE_PARTS = {
 VAULT_DIR.mkdir(parents=True, exist_ok=True)
 
 PROVIDER_HEALTH = provider_health.ProviderHealthTracker()
+UNKNOWN_KIND_TELEMETRY: UnknownKindTelemetry | None = None
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    global UNKNOWN_KIND_TELEMETRY
     runtime_paths = RuntimePaths.from_env()
+    UNKNOWN_KIND_TELEMETRY = UnknownKindTelemetry(runtime_paths)
     configured_backend = os.environ.get("WIKI_BACKEND_URL")
     if configured_backend:
         backend_runtime.publish_backend_url(configured_backend)
@@ -129,6 +136,7 @@ async def lifespan(_app: FastAPI):
     # drained on shutdown instead of dying with a daemon thread.
     workgraph_service.start_outbox()
     dispatcher_task, watchdog_task, token_task = await _start_dispatcher()
+    cost_task = asyncio.create_task(costs.background_loop(), name="wiki-cost-aggregator")
     knowledge_task = asyncio.create_task(
         knowledge.background_index_loop(
             knowledge.KnowledgePaths.from_env(
@@ -143,26 +151,37 @@ async def lifespan(_app: FastAPI):
         provider_health.probe_loop(PROVIDER_HEALTH),
         name="wiki-provider-health-probe",
     )
+    unknown_kind_telemetry_stop = asyncio.Event()
+    unknown_kind_telemetry_task = asyncio.create_task(
+        UNKNOWN_KIND_TELEMETRY.periodic_loop(unknown_kind_telemetry_stop),
+        name="wiki-unknown-kind-telemetry",
+    )
     try:
         yield
     finally:
+        unknown_kind_telemetry_stop.set()
         dispatcher_task.cancel()
         watchdog_task.cancel()
         token_task.cancel()
+        cost_task.cancel()
         knowledge_task.cancel()
         provider_health_task.cancel()
+        unknown_kind_telemetry_task.cancel()
         await asyncio.gather(
             dispatcher_task,
             watchdog_task,
             token_task,
+            cost_task,
             knowledge_task,
             provider_health_task,
+            unknown_kind_telemetry_task,
             return_exceptions=True,
         )
         # Bounded drain: every accepted workgraph write is delivered or
         # logged as undelivered before the process exits.
         await asyncio.to_thread(workgraph_service.stop_outbox)
         await asyncio.to_thread(terminal.TERMINAL_MANAGER.close_all)
+        UNKNOWN_KIND_TELEMETRY = None
 
 
 # --- Wiki.app origin secret (WIKI-148 round 6 — Path B) ---------------------
@@ -847,6 +866,24 @@ def normalize_content(title: str, content: str) -> str:
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+def _unknown_kind_telemetry_service() -> UnknownKindTelemetry:
+    global UNKNOWN_KIND_TELEMETRY
+    if UNKNOWN_KIND_TELEMETRY is None:
+        UNKNOWN_KIND_TELEMETRY = UnknownKindTelemetry(RuntimePaths.from_env())
+    return UNKNOWN_KIND_TELEMETRY
+
+
+@app.post("/api/agent-runtime/unknown-kind-telemetry/run")
+async def run_unknown_kind_telemetry() -> dict[str, object]:
+    """Run the weekly unknown-provider-kind sweep now."""
+
+    try:
+        return await asyncio.to_thread(_unknown_kind_telemetry_service().run_once)
+    except Exception as exc:
+        logger.exception("manual unknown-kind telemetry sweep failed")
+        raise HTTPException(status_code=500, detail="telemetry sweep failed") from exc
 
 
 WIKILINK_PATTERN = re.compile(r"\[\[([^\][|\n]+?)(?:\|[^\][\n]*)?\]\]")
@@ -3521,6 +3558,22 @@ async def get_tokens(
     )
 
 
+@app.get("/api/costs")
+async def get_costs(
+    from_ts: str | None = Query(default=None, alias="from"),
+    to_ts: str | None = Query(default=None, alias="to"),
+    ticket: str | None = None,
+) -> dict[str, object]:
+    """Incremental USD cost data from headless runtime raw event logs."""
+
+    return await asyncio.to_thread(
+        costs.query,
+        from_ts=from_ts,
+        to_ts=to_ts,
+        ticket=ticket,
+    )
+
+
 MSG_QUEUE_PATH = Path(os.environ.get("WIKI_MSG_QUEUE_PATH") or "/tmp/wiki-msg-queue.json")
 # codex: "• Working (26m 28s • esc to interrupt)" · claude: "✽ Leavening… (4m 26s · ↓ 6.0k tokens)"
 SPINNER_PATTERN = re.compile(r"esc to interrupt|\(\d+m\s\d+s\b|\(\d+s\b")
@@ -3542,6 +3595,8 @@ class MessageIn(BaseModel):
         max_length=64,
         pattern=r"^[A-Za-z0-9_.:-]+$",
     )
+    findings: list[dict[str, Any]] | None = None
+    constraint_bundle: str | None = Field(default=None, max_length=4000)
 
 
 class AgentRespondIn(BaseModel):
@@ -3605,6 +3660,10 @@ class SpawnOrchestratorIn(BaseModel):
 
 class AgentArchiveIn(BaseModel):
     outcome: str = Field(pattern="^(merged|closed|abandoned)$")
+
+
+class AutopilotEnableIn(BaseModel):
+    henry_ack_required_for_merge: bool = False
 
 
 def _allowed_model_message(kind: str, model: str, *, target: str) -> str:
@@ -4213,6 +4272,56 @@ def next_review_route(body: NextReviewIn) -> dict[str, Any]:
     )
 
 
+@app.post("/api/autopilot/{ticket}/enable")
+def autopilot_enable_route(ticket: str, body: AutopilotEnableIn | None = None) -> dict[str, Any]:
+    from .agent_runtime.autopilot import AutopilotController
+
+    try:
+        return AutopilotController(notify=AutopilotController.live_notify).enable(
+            ticket,
+            henry_ack_required_for_merge=(body.henry_ack_required_for_merge if body else False),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/autopilot/{ticket}/disable")
+def autopilot_disable_route(ticket: str) -> dict[str, Any]:
+    from .agent_runtime.autopilot import AutopilotController
+
+    try:
+        return AutopilotController(notify=AutopilotController.live_notify).disable(ticket)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/autopilot/{ticket}/ack-merge")
+def autopilot_ack_merge_route(ticket: str) -> dict[str, Any]:
+    from .agent_runtime.autopilot import AutopilotController
+
+    try:
+        return AutopilotController(notify=AutopilotController.live_notify).ack_merge(ticket)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/autopilot")
+def autopilot_status_route() -> dict[str, Any]:
+    from .agent_runtime.autopilot import AutopilotController
+
+    return AutopilotController(notify=AutopilotController.live_notify).status()
+
+
+@app.get("/api/autopilot/{ticket}")
+def autopilot_ticket_status_route(ticket: str) -> dict[str, Any]:
+    from .agent_runtime.autopilot import AutopilotController
+
+    try:
+        return AutopilotController(notify=AutopilotController.live_notify).status(ticket)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 def spawn_orchestrator(
     body: dict[str, Any] | SpawnOrchestratorIn,
     *,
@@ -4813,6 +4922,8 @@ def agent_message(ticket: str, body: MessageIn, background: BackgroundTasks) -> 
                 source=body.source,
                 request_id=body.request_id,
                 status_dir=AGENT_STATUS_DIR,
+                findings=body.findings,
+                constraint_bundle=body.constraint_bundle,
             )
         return dict(result)
     del background

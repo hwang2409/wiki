@@ -2,7 +2,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
-import type { AgentWorkgraphData, LoopState } from "../src/api";
+import type { AgentWorkgraphData, AutopilotState, LoopState } from "../src/api";
 import { LoopStateChrome } from "../src/loop-state-chrome";
 
 const loopState: LoopState = {
@@ -63,11 +63,65 @@ const payload: AgentWorkgraphData = {
   loop_state: loopState,
 };
 
+const autopilot: AutopilotState = {
+  enabled: true,
+  iteration_cap: 8,
+  plateau_guard: 3,
+  henry_ack_required_for_merge: false,
+  last_action_at_ns: 1_754_000_000_000_000_000,
+  halted: "plateau",
+  merge_ack_at_ns: null,
+  actions: [
+    {
+      action: "parsed-verdict",
+      at_ns: 1_754_000_000_000_000_000,
+      source: "autopilot",
+      state: "NOT-MERGE-READY",
+      reviewer: "WIKI-000-REVIEW2",
+      source_sha: "0123456",
+      findings: [
+        {
+          id: "F-abc123",
+          severity: "HIGH",
+          title: "autopilot log hides context",
+          file: "frontend/src/loop-state-chrome.tsx",
+          line: 279,
+          observed: "the log hides context",
+          why_wrong: "the operator cannot assess the action",
+          do_instead: "render the action details",
+          source_worker: "WIKI-000-REVIEW2",
+          source_sha: "0123456",
+        },
+      ],
+    },
+    {
+      action: "steer-sent",
+      at_ns: 1_754_000_001_000_000_000,
+      source: "autopilot",
+      preview: "1. [HIGH] frontend/src/loop-state-chrome.tsx:279",
+      target: "WIKI-000",
+      source_sha: "0123456",
+    },
+    {
+      action: "halted-at-plateau",
+      at_ns: 1_754_000_002_000_000_000,
+      source: "autopilot",
+      halted: "plateau",
+      ticket: "WIKI-000",
+    },
+  ],
+};
+
 describe("LoopStateChrome", () => {
   beforeEach(() => {
     vi.stubGlobal(
       "fetch",
-      vi.fn(async () => new Response(JSON.stringify(payload), { status: 200 }))
+      vi.fn(async (input: RequestInfo | URL) =>
+        new Response(
+          JSON.stringify(String(input).includes("/autopilot/") ? autopilot : payload),
+          { status: 200 },
+        )
+      )
     );
   });
 
@@ -137,5 +191,19 @@ describe("LoopStateChrome", () => {
     await waitFor(() => {
       expect(trigger.getAttribute("aria-expanded")).toBe("false");
     });
+  });
+
+  test("renders verdict, steer, action, and halt details from autopilot events", async () => {
+    render(<LoopStateChrome ticket="WIKI-000" tick={0} />);
+    const trigger = await screen.findByRole("button", {
+      name: /show merge-ready loop history/i,
+    });
+    fireEvent.click(trigger);
+
+    expect(await screen.findByText(/verdict NOT-MERGE-READY/)).toBeTruthy();
+    expect(screen.getByText(/verdict NOT-MERGE-READY · 1 findings/)).toBeTruthy();
+    expect(screen.getByText(/steer: 1\. \[HIGH\]/)).toBeTruthy();
+    expect(screen.getByText(/WIKI-000-REVIEW2.*sha 0123456/)).toBeTruthy();
+    expect(screen.getByText("halted: plateau")).toBeTruthy();
   });
 });

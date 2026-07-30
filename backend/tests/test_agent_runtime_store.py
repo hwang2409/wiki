@@ -4,11 +4,14 @@ import json
 import tempfile
 import unittest
 from copy import deepcopy
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from unittest import mock
 from uuid import uuid4
 
 from backend.app import transcripts
+from backend.app.agent_runtime import store as store_module
 from backend.app.agent_runtime.fake import WireFixture
 from backend.app.agent_runtime.normalizer import normalize_provider_event
 from backend.app.agent_runtime.provider import AdapterStatus
@@ -29,6 +32,7 @@ from backend.app.agent_runtime.types import (
     restart_recovery_decision,
     validate_transition,
 )
+from backend.app.agent_runtime.unknown_kind_telemetry import UnknownKindTelemetry
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "agent_runtime"
@@ -129,23 +133,40 @@ class ProtocolFixtureTests(unittest.TestCase):
             for marker in forbidden:
                 self.assertNotIn(marker, text, f"{marker!r} leaked in {path.name}")
 
-    def test_provider_normalizer_covers_wiki41_native_surface_dispositions(self) -> None:
+    def test_provider_normalizer_covers_wiki41_native_surface_dispositions(
+        self,
+    ) -> None:
         claude_cases = [
-            ({"type": "progress", "data": {"type": "planning"}}, EventDisposition.RENDERED),
+            (
+                {"type": "progress", "data": {"type": "planning"}},
+                EventDisposition.RENDERED,
+            ),
             (
                 {"type": "permission-mode", "permissionMode": "bypassPermissions"},
                 EventDisposition.RENDERED,
             ),
             (
-                {"type": "system", "subtype": "api_error", "error": {"formatted": "529"}},
+                {
+                    "type": "system",
+                    "subtype": "api_error",
+                    "error": {"formatted": "529"},
+                },
                 EventDisposition.RENDERED,
             ),
             (
-                {"type": "system", "subtype": "thinking_tokens", "estimated_tokens": 42, "estimated_tokens_delta": 4},
+                {
+                    "type": "system",
+                    "subtype": "thinking_tokens",
+                    "estimated_tokens": 42,
+                    "estimated_tokens_delta": 4,
+                },
                 EventDisposition.SUMMARIZED,
             ),
             ({"type": "system", "subtype": "init"}, EventDisposition.RENDERED),
-            ({"type": "system", "subtype": "task_notification"}, EventDisposition.RENDERED),
+            (
+                {"type": "system", "subtype": "task_notification"},
+                EventDisposition.RENDERED,
+            ),
             ({"type": "system", "subtype": "task_updated"}, EventDisposition.RENDERED),
             ({"type": "system", "subtype": "api_retry"}, EventDisposition.RENDERED),
             (
@@ -166,9 +187,18 @@ class ProtocolFixtureTests(unittest.TestCase):
                 {"type": "attachment", "attachment": {"type": "task_reminder"}},
                 EventDisposition.RENDERED,
             ),
-            ({"type": "custom-title", "customTitle": "Fixture"}, EventDisposition.SUMMARIZED),
-            ({"type": "agent-name", "agentName": "worker"}, EventDisposition.SUMMARIZED),
-            ({"type": "file-history-snapshot", "snapshot": {}}, EventDisposition.IGNORED),
+            (
+                {"type": "custom-title", "customTitle": "Fixture"},
+                EventDisposition.SUMMARIZED,
+            ),
+            (
+                {"type": "agent-name", "agentName": "worker"},
+                EventDisposition.SUMMARIZED,
+            ),
+            (
+                {"type": "file-history-snapshot", "snapshot": {}},
+                EventDisposition.IGNORED,
+            ),
             ({"type": "unknown-fixture"}, EventDisposition.UNKNOWN),
         ]
         for payload, disposition in claude_cases:
@@ -183,7 +213,9 @@ class ProtocolFixtureTests(unittest.TestCase):
                     self.assertEqual(normalized.payload["rateLimitType"], "five_hour")
                     self.assertFalse(normalized.payload["isUsingOverage"])
                     self.assertEqual(normalized.payload["overageStatus"], "rejected")
-                    self.assertEqual(normalized.payload["overageDisabledReason"], "out_of_credits")
+                    self.assertEqual(
+                        normalized.payload["overageDisabledReason"], "out_of_credits"
+                    )
                     self.assertEqual(normalized.payload["resetsAt"], 1784910600)
 
         auth = normalize_provider_event(
@@ -257,7 +289,12 @@ class ProtocolFixtureTests(unittest.TestCase):
                                 "outputs": [
                                     {
                                         "results": [
-                                            {"category_flags": {"sexual": False, "violence": False}}
+                                            {
+                                                "category_flags": {
+                                                    "sexual": False,
+                                                    "violence": False,
+                                                }
+                                            }
                                         ]
                                     }
                                 ]
@@ -278,7 +315,12 @@ class ProtocolFixtureTests(unittest.TestCase):
                                 "outputs": [
                                     {
                                         "results": [
-                                            {"category_flags": {"sexual": False, "violence": True}}
+                                            {
+                                                "category_flags": {
+                                                    "sexual": False,
+                                                    "violence": True,
+                                                }
+                                            }
                                         ]
                                     }
                                 ]
@@ -295,17 +337,13 @@ class ProtocolFixtureTests(unittest.TestCase):
 
     def test_codex_moderation_metadata_warns_for_blocked_payload_shapes(self) -> None:
         payloads = (
+            {"metadata": {"prompt": {"omnimod": {"outputs": [{"is_blocked": True}]}}}},
             {
                 "metadata": {
                     "prompt": {
-                        "omnimod": {"outputs": [{"is_blocked": True}]}
-                    }
-                }
-            },
-            {
-                "metadata": {
-                    "prompt": {
-                        "omnimod": {"outputs": [{"results": [{"labels": ["violence"]}]}]}
+                        "omnimod": {
+                            "outputs": [{"results": [{"labels": ["violence"]}]}]
+                        }
                     }
                 }
             },
@@ -329,7 +367,9 @@ class ProtocolFixtureTests(unittest.TestCase):
 
         self.assertEqual(normalized.disposition, EventDisposition.RENDERED)
         self.assertEqual(normalized.kind, "artifact")
-        self.assertEqual(normalized.payload["id"], "6d0e7d00-2edf-4054-b0dc-fe17cd382c2a")
+        self.assertEqual(
+            normalized.payload["id"], "6d0e7d00-2edf-4054-b0dc-fe17cd382c2a"
+        )
         self.assertEqual(normalized.payload["title"], "Wiki.app architecture")
         self.assertEqual(
             normalized.payload["caption"],
@@ -414,9 +454,11 @@ class ProtocolFixtureTests(unittest.TestCase):
                 )
             )
 
-            stored_lines = store.normalized_events_path(record.run_id).read_text(
-                encoding="utf-8"
-            ).splitlines()
+            stored_lines = (
+                store.normalized_events_path(record.run_id)
+                .read_text(encoding="utf-8")
+                .splitlines()
+            )
             self.assertEqual([json.loads(line) for line in stored_lines], persisted)
             self.assertEqual(
                 [event["payload"]["params"]["item"]["status"] for event in persisted],
@@ -571,7 +613,9 @@ class RunStoreTests(unittest.TestCase):
             reloaded = store.get(record.run_id)
             self.assertEqual(reloaded.disposition_counts["rendered"], 1)
 
-    def test_current_turn_diff_survives_event_window_and_resets_on_new_turn(self) -> None:
+    def test_current_turn_diff_survives_event_window_and_resets_on_new_turn(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             paths = _paths(root)
@@ -605,7 +649,9 @@ class RunStoreTests(unittest.TestCase):
                 append("warning", {"message": f"event {index}"}, "warning")
 
             window = store.read_normalized_events(record.run_id, limit=50)
-            self.assertFalse(any(event["kind"] == "turn_diff_updated" for event in window))
+            self.assertFalse(
+                any(event["kind"] == "turn_diff_updated" for event in window)
+            )
             self.assertEqual(
                 store.current_turn_diff(record.run_id),
                 {"turn_id": "turn-1", "seq": 2, "diff": "diff one"},
@@ -624,7 +670,9 @@ class RunStoreTests(unittest.TestCase):
                 {"turn_id": "turn-2", "seq": 55, "diff": "diff two"},
             )
 
-    def test_current_turn_diff_sidecar_is_not_rewritten_for_unrelated_events(self) -> None:
+    def test_current_turn_diff_sidecar_is_not_rewritten_for_unrelated_events(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             store = RunStore(_paths(root))
@@ -727,7 +775,10 @@ class RunStoreTests(unittest.TestCase):
                 )
 
             self.assertEqual(
-                [event["seq"] for event in store.read_raw_events(record.run_id, limit=2)],
+                [
+                    event["seq"]
+                    for event in store.read_raw_events(record.run_id, limit=2)
+                ],
                 [2, 3],
             )
             self.assertEqual(
@@ -750,7 +801,10 @@ class RunStoreTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual(
-                [event["seq"] for event in store.read_raw_events(record.run_id, limit=2)],
+                [
+                    event["seq"]
+                    for event in store.read_raw_events(record.run_id, limit=2)
+                ],
                 [79, 80],
             )
 
@@ -853,7 +907,9 @@ class RunStoreTests(unittest.TestCase):
                 payload=approval,
                 lifecycle_state=LifecycleState.WAITING_APPROVAL,
             )
-            metadata = json.loads(store.run_path(record.run_id).read_text(encoding="utf-8"))
+            metadata = json.loads(
+                store.run_path(record.run_id).read_text(encoding="utf-8")
+            )
             metadata["pending_requests"] = {}
             store.run_path(record.run_id).write_text(
                 json.dumps(metadata),
@@ -1280,7 +1336,9 @@ class RunStoreTests(unittest.TestCase):
                 )
             self.assertEqual(store.current_run_id("WIKI-42"), replacement.run_id)
 
-    def test_quiesce_intent_can_capture_prior_working_state_from_blocked_run(self) -> None:
+    def test_quiesce_intent_can_capture_prior_working_state_from_blocked_run(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             store = RunStore(_paths(root))
@@ -1497,7 +1555,13 @@ class RunStoreTests(unittest.TestCase):
             paths.status_dir.mkdir(parents=True, exist_ok=True)
             status_path = paths.status_dir / "WIKI-42.json"
             status_path.write_text(
-                json.dumps({"state": "merge-ready", "step": "done", "pr": "https://example/pr/42"}),
+                json.dumps(
+                    {
+                        "state": "merge-ready",
+                        "step": "done",
+                        "pr": "https://example/pr/42",
+                    }
+                ),
                 encoding="utf-8",
             )
             artifact_dir = store.run_dir(record.run_id) / "artifacts"
@@ -1526,7 +1590,9 @@ class RunStoreTests(unittest.TestCase):
             archived_artifact = session_dir / "artifacts" / artifact_path.name
             self.assertEqual(archived_artifact.read_bytes(), b"artifact-png")
             self.assertEqual(archived_artifact.stat().st_mode & 0o777, 0o600)
-            self.assertTrue((session_dir / "artifacts" / linked_artifact.name).is_symlink())
+            self.assertTrue(
+                (session_dir / "artifacts" / linked_artifact.name).is_symlink()
+            )
             self.assertEqual(
                 (session_dir / "cdx-WIKI-42-prompt.md").read_text(encoding="utf-8"),
                 "Work on ticket WIKI-42",
@@ -1538,6 +1604,52 @@ class RunStoreTests(unittest.TestCase):
                 (session_dir / "final-status.json").read_text(encoding="utf-8")
             )
             self.assertEqual(final_status["state"], "merge-ready")
+
+    def test_archive_marker_wins_when_cleanup_fails_and_retry_removes_remnant(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            record = store.create(_record(root))
+            for _ in range(60):
+                store.append_raw(
+                    record.run_id,
+                    provider="codex",
+                    direction="provider",
+                    payload={"method": "item/novel", "params": {}},
+                )
+            store.transition(record.run_id, LifecycleState.COMPLETED)
+
+            with (
+                mock.patch.object(
+                    store_module.shutil,
+                    "rmtree",
+                    side_effect=OSError("cleanup interrupted"),
+                ),
+                self.assertRaises(OSError),
+            ):
+                store.archive_current(record.run_id, outcome="merged")
+
+            calls: list[str] = []
+            telemetry = UnknownKindTelemetry(
+                paths,
+                threshold=100,
+                todo_runner=calls.append,
+                clock=lambda: datetime.now(timezone.utc).timestamp(),
+            )
+            first = telemetry.run_once()
+            second = telemetry.run_once()
+
+            self.assertEqual(first["unknown_counts"], {"item/novel": 60})
+            self.assertEqual(second["unknown_counts"], {"item/novel": 60})
+            self.assertEqual(calls, [])
+            self.assertTrue(store.run_dir(record.run_id).exists())
+
+            store.archive_current(record.run_id, outcome="merged")
+
+            self.assertFalse(store.run_dir(record.run_id).exists())
 
     def test_reconcile_prunes_headless_registry_rows_missing_run_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

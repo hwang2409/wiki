@@ -1065,6 +1065,9 @@ class AgentWatchTests(unittest.TestCase):
                     raise SystemExit(1)
                 state_file = os.environ.get("FAKE_GH_STATE_FILE")
                 state = open(state_file).read().strip() if state_file else ("MERGED" if scenario == "merged" else "OPEN")
+                rollup = []
+                if scenario == "rollup-mismatch":
+                    rollup = [{"__typename": "CheckRun", "name": "required", "status": "COMPLETED", "conclusion": "FAILURE"}]
                 print(json.dumps({
                     "state": state,
                     "isDraft": scenario == "draft",
@@ -1072,6 +1075,7 @@ class AgentWatchTests(unittest.TestCase):
                     "mergeStateStatus": "CLEAN",
                     "headRefOid": "abcdef0123456789",
                     "url": "https://github.com/example/wiki/pull/103",
+                    "statusCheckRollup": rollup,
                 }))
             elif args[:2] == ["pr", "checks"]:
                 if scenario == "failing-checks":
@@ -1079,6 +1083,18 @@ class AgentWatchTests(unittest.TestCase):
                     raise SystemExit(8)
                 if scenario == "no-checks":
                     print("[]")
+                elif scenario == "no-checks-stderr":
+                    sys.stderr.write("no checks reported on the 'example/wiki' branch\\n")
+                    raise SystemExit(1)
+                elif scenario == "rollup-mismatch":
+                    sys.stderr.write("no checks reported on the 'example/wiki' branch\\n")
+                    raise SystemExit(1)
+                elif scenario == "realistic-failure":
+                    print(json.dumps([{ "name": "test", "state": "FAILURE" }]))
+                    sys.stderr.write("no checks reported on the 'example/wiki' branch\\n")
+                    raise SystemExit(1)
+                elif scenario == "empty-checks-failure":
+                    raise SystemExit(1)
                 else:
                     print(json.dumps([{ "name": "test", "state": "SUCCESS" }]))
             elif args[:2] == ["api", "graphql"]:
@@ -1104,6 +1120,10 @@ class GateTests(unittest.TestCase):
             "draft": (1, ["draft"]),
             "failing-checks": (1, ["checks-failing"]),
             "no-checks": (0, []),
+            "no-checks-stderr": (0, []),
+            "rollup-mismatch": (1, ["checks-failing"]),
+            "realistic-failure": (1, ["checks-failing"]),
+            "empty-checks-failure": (2, []),
             "unresolved": (1, ["unresolved-threads:2"]),
             "not-mergeable": (1, ["not-mergeable"]),
         }
@@ -1123,10 +1143,15 @@ class GateTests(unittest.TestCase):
                         },
                     )
                     self.assertEqual(proc.returncode, code, msg=proc.stderr)
+                    if code == 2:
+                        self.assertIn("gh pr checks failed", proc.stderr)
+                        continue
                     payload = json.loads(proc.stdout)
                     self.assertEqual(payload["ready"], code == 0)
                     self.assertEqual(payload["reasons"], reasons)
                     if scenario == "no-checks":
+                        self.assertEqual(payload["notes"], ["no-checks-reported"])
+                    if scenario == "no-checks-stderr":
                         self.assertEqual(payload["notes"], ["no-checks-reported"])
 
     def test_gate_reports_sha_mismatch_and_pr_not_found_as_usage_error(self) -> None:
@@ -1219,6 +1244,29 @@ class TodoCompleteTests(unittest.TestCase):
             self.assertEqual(done.count("- **wiki** — terse completion"), 1)
             lint = self._run(["lint"], env)
             self.assertEqual(lint.returncode, 0, msg=lint.stdout + lint.stderr)
+
+    def test_todo_add_if_missing_is_idempotent(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            vault = self._vault(tmp_path)
+            env = {
+                **os.environ,
+                "WIKI_VAULT_DIR": str(vault),
+                "WIKI_AGENT_RUNTIME_DIR": str(tmp_path / "runtime"),
+            }
+            text = "unknown provider event kind item/novel"
+            first = self._run(["todo", "add", text, "--if-missing"], env)
+            second = self._run(["todo", "add", text, "--if-missing"], env)
+
+            self.assertEqual(first.returncode, 0, msg=first.stderr)
+            self.assertEqual(second.returncode, 0, msg=second.stderr)
+            self.assertIn("already in Todo", second.stdout)
+            self.assertEqual(
+                (vault / "todo.md").read_text(encoding="utf-8").count(
+                    f"- {text}"
+                ),
+                1,
+            )
 
 
 if __name__ == "__main__":

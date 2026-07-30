@@ -1,0 +1,1 @@
+{"seq":73,"received_at":"2026-07-30T10:02:00Z","provider":"claude","direction":"server","payload":{"type":"assistant","message":{"id":"msg-redacted-1","model":"claude-opus-4-7","usage":{"input_tokens":120,"cache_read_input_tokens":40,"cache_creation":{"ephemeral_5m_input_tokens":10,"ephemeral_1h_input_tokens":30},"output_tokens":30}}}}

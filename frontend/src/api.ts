@@ -246,6 +246,80 @@ export function getDashboardTickets(signal?: AbortSignal) {
   );
 }
 
+export type CostRow = {
+  label: string;
+  input: number;
+  cache_read: number;
+  cache_write: number;
+  cached: number;
+  output: number;
+  reasoning: number;
+  total_tokens: number;
+  cost_usd: number | null;
+  unpriced_tokens: number;
+  pricing: "priced" | "unpriced" | "mixed";
+  models: string[];
+};
+
+export type CostResponse = {
+  updated_at: string | null;
+  totals: CostRow;
+  top: {
+    worker: CostRow[];
+    ticket: CostRow[];
+    orchestrator: CostRow[];
+    day: CostRow[];
+  };
+  prompt_size_distribution: { bucket: string; runs: number }[];
+  velocity: { tokens_per_minute: number; window_seconds: number; tokens: number };
+  runs_scanned: number;
+  refreshing: boolean;
+};
+
+export function getCosts(
+  params: { from?: string; to?: string; ticket?: string } = {},
+  signal?: AbortSignal,
+) {
+  const search = new URLSearchParams();
+  if (params.from) search.set("from", params.from);
+  if (params.to) search.set("to", params.to);
+  if (params.ticket) search.set("ticket", params.ticket);
+  const query = search.toString();
+  return request<CostResponse>(`/api/costs${query ? `?${query}` : ""}`, signal ? { signal } : undefined);
+}
+
+export function getTicketCosts(ticket: string) {
+  const now = Date.now();
+  for (const [key, value] of ticketCostCache) {
+    if (value.expiresAt <= now) ticketCostCache.delete(key);
+  }
+  const cached = ticketCostCache.get(ticket);
+  if (cached && cached.expiresAt > now) return Promise.resolve(cached.value);
+  const existing = ticketCostInflight.get(ticket);
+  if (existing) return existing;
+  // The shared request must not use one pane's abort signal. A pane can unmount
+  // while another pane still needs the same in-flight request.
+  const requestPromise = getCosts({ ticket }).then((value) => {
+    while (ticketCostCache.size >= MAX_TICKET_COST_CACHE_ENTRIES) {
+      const oldest = ticketCostCache.keys().next().value;
+      if (oldest === undefined) break;
+      ticketCostCache.delete(oldest);
+    }
+    ticketCostCache.set(ticket, { value, expiresAt: Date.now() + 15_000 });
+    ticketCostInflight.delete(ticket);
+    return value;
+  }).catch((error) => {
+    ticketCostInflight.delete(ticket);
+    throw error;
+  });
+  ticketCostInflight.set(ticket, requestPromise);
+  return requestPromise;
+}
+
+const ticketCostCache = new Map<string, { value: CostResponse; expiresAt: number }>();
+const ticketCostInflight = new Map<string, Promise<CostResponse>>();
+const MAX_TICKET_COST_CACHE_ENTRIES = 128;
+
 export type SpawnWorkerKind = "cdx" | "cc";
 export type SpawnWorkerRole = "plan" | "implement" | "review";
 export type SpawnWorkerEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -955,6 +1029,64 @@ export type AgentWorkgraphData = {
 
 export function getAgentWorkgraph(ticket: string) {
   return request<AgentWorkgraphData>(`/api/agents/${encodeURIComponent(ticket)}/workgraph`);
+}
+
+export type AutopilotAction = {
+  action: string;
+  at_ns: number;
+  source: "autopilot";
+  findings?: Array<Record<string, unknown>>;
+  [key: string]: unknown;
+};
+
+export type AutopilotState = {
+  ticket?: string;
+  enabled: boolean;
+  iteration_cap: number;
+  plateau_guard: number;
+  henry_ack_required_for_merge: boolean;
+  last_action_at_ns: number;
+  halted: string | null;
+  merge_ack_at_ns: number | null;
+  merge_ack_sha?: string | null;
+  actions: AutopilotAction[];
+};
+
+export type AutopilotFleetStatus = {
+  tickets: Record<string, AutopilotState>;
+  enabled: number;
+  halted: number;
+  actions_last_hour: number;
+};
+
+export function getAutopilotStatus(ticket: string) {
+  return request<AutopilotState>(`/api/autopilot/${encodeURIComponent(ticket)}`);
+}
+
+export function getAutopilotFleetStatus(signal?: AbortSignal) {
+  return request<AutopilotFleetStatus>(
+    "/api/autopilot",
+    signal ? { signal } : undefined,
+  );
+}
+
+export function setAutopilotEnabled(ticket: string, enabled: boolean, henryAckRequired = false) {
+  return request<AutopilotState>(
+    `/api/autopilot/${encodeURIComponent(ticket)}/${enabled ? "enable" : "disable"}`,
+    enabled
+      ? {
+          method: "POST",
+          body: JSON.stringify({ henry_ack_required_for_merge: henryAckRequired }),
+        }
+      : { method: "POST" },
+  );
+}
+
+export function ackAutopilotMerge(ticket: string) {
+  return request<AutopilotState>(
+    `/api/autopilot/${encodeURIComponent(ticket)}/ack-merge`,
+    { method: "POST" },
+  );
 }
 
 export type FleetGraphTicket = {

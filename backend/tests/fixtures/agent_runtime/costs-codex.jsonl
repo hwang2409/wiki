@@ -1,0 +1,2 @@
+{"seq":41,"received_at":"2026-07-30T10:00:00Z","provider":"codex","direction":"server","payload":{"method":"thread/tokenUsage/updated","params":{"tokenUsage":{"total":{"inputTokens":1000,"cacheReadInputTokens":100,"cacheWriteInputTokens":25,"outputTokens":50,"reasoningOutputTokens":0}}}}}
+{"seq":42,"received_at":"2026-07-30T10:01:00Z","provider":"codex","direction":"server","payload":{"method":"thread/tokenUsage/updated","params":{"tokenUsage":{"total":{"inputTokens":1800,"cacheReadInputTokens":200,"cacheWriteInputTokens":50,"outputTokens":100,"reasoningOutputTokens":0}}}}}
