@@ -276,6 +276,8 @@ class Supervisor:
         self.adapters: dict[str, ProviderAdapter] = {}
         self.event_tasks: dict[str, asyncio.Task[None]] = {}
         self.event_processing_locks: dict[str, asyncio.Lock] = {}
+        self.event_inflight_counts: dict[str, int] = {}
+        self.event_drain_condition = asyncio.Condition()
         self.event_routes: dict[tuple[int, int], str] = {}
         self.queue_locks: dict[str, asyncio.Lock] = {}
         self.agent_locks: dict[str, asyncio.Lock] = {}
@@ -584,11 +586,19 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         stream_key = id(adapter)
         try:
             async for event in adapter.events():
-                event_run_id = self.event_routes.get(
-                    (id(adapter), event.generation),
-                    run_id,
+                # Mark the local slot before the first await. The detach
+                # barrier cannot observe an event between queue removal and
+                # this increment.
+                self.event_inflight_counts[run_id] = (
+                    self.event_inflight_counts.get(run_id, 0) + 1
                 )
                 try:
+                    async with self.event_drain_condition:
+                        self.event_drain_condition.notify_all()
+                    event_run_id = self.event_routes.get(
+                        (id(adapter), event.generation),
+                        run_id,
+                    )
                     event_lock = self.event_processing_locks.setdefault(
                         event_run_id, asyncio.Lock()
                     )
@@ -603,6 +613,14 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         f"provider event persistence failed: {exc}",
                     )
                     return
+                finally:
+                    remaining = self.event_inflight_counts.get(run_id, 1) - 1
+                    if remaining:
+                        self.event_inflight_counts[run_id] = remaining
+                    else:
+                        self.event_inflight_counts.pop(run_id, None)
+                    async with self.event_drain_condition:
+                        self.event_drain_condition.notify_all()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -882,6 +900,39 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         self.handover_event_queue.setdefault(
                             event_run_id, []
                         ).append((adapter, event))
+
+    async def _drain_stopped_adapter(
+        self, run_id: str, adapter: ProviderAdapter
+    ) -> None:
+        """Drain the adapter and every event already taken by its pump."""
+
+        event_lock = self.event_processing_locks.setdefault(
+            run_id, asyncio.Lock()
+        )
+        while True:
+            async with event_lock:
+                for event in await adapter.drain_events():
+                    event_run_id = self.event_routes.get(
+                        (id(adapter), event.generation), run_id
+                    )
+                    async with self.handover_condition:
+                        handover_active = self.handover_active
+                        if handover_active:
+                            self.handover_event_queue.setdefault(
+                                event_run_id, []
+                            ).append((adapter, event))
+                    if not handover_active:
+                        await self._handle_provider_event_without_admission(
+                            event_run_id,
+                            adapter,
+                            event,
+                            update_adapter_snapshot=True,
+                            schedule_monitor_actions=True,
+                        )
+            async with self.event_drain_condition:
+                if not self.event_inflight_counts.get(run_id):
+                    return
+                await self.event_drain_condition.wait()
 
     def _schedule_monitor_actions(
         self,
@@ -1426,30 +1477,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         self.expected_stream_ends.add(stream_key)
         try:
             await adapter.stop()
-            event_lock = self.event_processing_locks.setdefault(
-                run_id, asyncio.Lock()
-            )
-            # Keep the pump attached through provider stop. The lock closes
-            # the race with an event already taken from the adapter queue.
-            async with event_lock:
-                for event in await adapter.drain_events():
-                    event_run_id = self.event_routes.get(
-                        (id(adapter), event.generation), run_id
-                    )
-                    async with self.handover_condition:
-                        handover_active = self.handover_active
-                        if handover_active:
-                            self.handover_event_queue.setdefault(
-                                event_run_id, []
-                            ).append((adapter, event))
-                    if not handover_active:
-                        await self._handle_provider_event_without_admission(
-                            event_run_id,
-                            adapter,
-                            event,
-                            update_adapter_snapshot=True,
-                            schedule_monitor_actions=True,
-                        )
+            # Keep the pump attached through provider stop. This barrier
+            # covers both its local event and the adapter's buffered queue.
+            await self._drain_stopped_adapter(run_id, adapter)
             await self._detach_adapter(run_id, preserve_event_routes=True)
         finally:
             self.expected_stream_ends.discard(stream_key)
@@ -3534,6 +3564,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             await asyncio.gather(*self.monitor_tasks, return_exceptions=True)
         self.monitor_tasks.clear()
         self.event_routes.clear()
+        self.event_processing_locks.clear()
+        self.event_inflight_counts.clear()
         self.queue_locks.clear()
         self.agent_locks.clear()
         self.pipeline_failures.clear()

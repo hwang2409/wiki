@@ -2035,6 +2035,58 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("int:91", current.pending_requests)
         self.assertFalse(self.supervisor.handover_event_queue)
 
+    async def test_handover_waits_for_pump_event_in_flight_during_drain(self) -> None:
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-HANDOVER-PUMP-INFLIGHT",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="pump in-flight handover",
+        )
+        await _wait_for_events(self.store, record.run_id, 10)
+        before = self.store.get(record.run_id)
+        adapter = self.supervisor.adapters[record.run_id]
+        event = ProviderEvent(
+            ProviderKind.CODEX,
+            {
+                "id": 94,
+                "method": "item/tool/requestUserInput",
+                "params": {
+                    "questions": [{"id": "inflight", "question": "Continue?"}]
+                },
+            },
+            generation=adapter.snapshot().generation,
+        )
+        drain_started = asyncio.Event()
+        release_drain = asyncio.Event()
+        original_drain = adapter.drain_events
+
+        async def blocked_drain() -> list[ProviderEvent]:
+            drain_started.set()
+            await release_drain.wait()
+            return await original_drain()
+
+        with mock.patch.object(adapter, "drain_events", new=blocked_drain):
+            handover_task = asyncio.create_task(self.supervisor.prepare_handover())
+            await asyncio.wait_for(drain_started.wait(), timeout=2)
+            await adapter._events.put(event)  # noqa: SLF001 - in-flight probe
+
+            async def pump_has_taken_event() -> None:
+                while not self.supervisor.event_inflight_counts.get(record.run_id):
+                    await asyncio.sleep(0)
+
+            await asyncio.wait_for(pump_has_taken_event(), timeout=2)
+            release_drain.set()
+            await asyncio.wait_for(handover_task, timeout=2)
+
+        current = self.store.get(record.run_id)
+        self.assertEqual(current.raw_event_count, before.raw_event_count + 1)
+        self.assertEqual(current.normalized_event_count, before.normalized_event_count + 1)
+        self.assertIn("int:94", current.pending_requests)
+        self.assertFalse(self.supervisor.handover_event_queue)
+
     async def test_failed_handover_preflight_replays_queued_events(self) -> None:
         record = await self.supervisor.start_run(
             agent_id="WIKI-HANDOVER-PREFLIGHT-FAIL",
