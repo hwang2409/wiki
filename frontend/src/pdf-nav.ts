@@ -45,9 +45,10 @@ export type KeyNavInput = {
   targetIsEditable?: boolean;
 };
 
-// Bare Arrow = prev/next single step; cmd/ctrl+Arrow = jump to first/last.
-// cmd/ctrl+f opens the find overlay. Editable-target inputs are ignored so
-// typing in the find field doesn't page-flip the viewport.
+// Bare Arrow / PageUp / PageDown = prev/next single step; cmd/ctrl+Arrow +
+// cmd/ctrl+Home/End = jump to first/last. cmd/ctrl+f opens the find overlay.
+// Editable-target inputs are ignored so typing in the find field doesn't
+// page-flip the viewport.
 export function resolveKeyNav(input: KeyNavInput): KeyNavIntent | null {
   if (input.targetIsEditable) return null;
   const command = Boolean(input.metaKey || input.ctrlKey);
@@ -55,6 +56,8 @@ export function resolveKeyNav(input: KeyNavInput): KeyNavIntent | null {
   if (command && input.key.toLowerCase() === "f") return { kind: "open-find" };
   if (input.key === "ArrowLeft") return command ? { kind: "first" } : { kind: "prev" };
   if (input.key === "ArrowRight") return command ? { kind: "last" } : { kind: "next" };
+  if (input.key === "PageUp") return { kind: "prev" };
+  if (input.key === "PageDown") return { kind: "next" };
   if (input.key === "Home" && command) return { kind: "first" };
   if (input.key === "End" && command) return { kind: "last" };
   return null;

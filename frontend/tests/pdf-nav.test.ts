@@ -63,6 +63,14 @@ test("resolveKeyNav returns open-find for cmd+f", () => {
   assert.deepEqual(resolveKeyNav({ key: "F", ctrlKey: true }), { kind: "open-find" });
 });
 
+test("resolveKeyNav treats PageUp/PageDown as prev/next single-page steps", () => {
+  assert.deepEqual(resolveKeyNav({ key: "PageUp" }), { kind: "prev" });
+  assert.deepEqual(resolveKeyNav({ key: "PageDown" }), { kind: "next" });
+  // Editable inputs still swallow the event so typing in the find field
+  // doesn't page-flip.
+  assert.equal(resolveKeyNav({ key: "PageDown", targetIsEditable: true }), null);
+});
+
 test("applyKeyNav clamps to first and last pages", () => {
   assert.equal(applyKeyNav({ kind: "prev" }, 1, 10), 1);
   assert.equal(applyKeyNav({ kind: "next" }, 10, 10), 10);

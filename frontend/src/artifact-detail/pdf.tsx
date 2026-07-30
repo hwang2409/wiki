@@ -9,6 +9,7 @@ import {
   Search,
   X,
 } from "lucide-react";
+import type { PDFDocumentProxy } from "pdfjs-dist";
 import type { SessionArtifact, SessionEvent } from "../api";
 import type { ArtifactViewState } from "../transcript-store";
 import { ArtifactError, ArtifactPlaceholder } from "../artifact-state";
@@ -32,6 +33,10 @@ import {
 } from "../pdf-nav";
 
 const TEXT_INDEX_BATCH_MS = 40;
+// Cap indexing so a huge PDF can't stall the worker or balloon retained
+// memory. Beyond this the find overlay reports the truncation and only
+// searches the first N pages.
+const TEXT_INDEX_PAGE_BUDGET = 500;
 
 export function PdfArtifactDetail({
   artifact: _artifact,
@@ -55,7 +60,12 @@ export function PdfArtifactDetail({
   const [findValue, setFindValue] = useState("");
   const [textIndex, setTextIndex] = useState<PageTextIndex[]>([]);
   const [indexingState, setIndexingState] = useState<"idle" | "building" | "ready">("idle");
-  const indexingStartedRef = useRef(false);
+  const [indexedPageCount, setIndexedPageCount] = useState(0);
+  // Track the doc handle we've *completed* indexing for. Setting only on
+  // completion means a cancelled indexing pass leaves the ref unchanged, so
+  // a rapid tab-switch back to the same doc restarts cleanly instead of
+  // getting stuck.
+  const indexedDocRef = useRef<PDFDocumentProxy | null>(null);
   const [currentMatch, setCurrentMatch] = useState<number>(0);
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -69,8 +79,12 @@ export function PdfArtifactDetail({
     setPage(1);
     setTextIndex([]);
     setIndexingState("idle");
+    setIndexedPageCount(0);
     setPageBaseSize(null);
-    indexingStartedRef.current = false;
+    // Deliberately do NOT reset indexedDocRef here. The ref is keyed by
+    // document handle, so a stale value is either replaced when the new doc
+    // loads (mismatch → restart) or ignored on the same doc. Clearing it
+    // here would race with a pending loadState update carrying the old doc.
   }, [url]);
 
   const handleReload = useCallback(() => {
@@ -152,14 +166,18 @@ export function PdfArtifactDetail({
   useEffect(() => {
     if (!findOpen) return;
     if (loadState.status !== "ready") return;
-    if (indexingStartedRef.current) return;
-    indexingStartedRef.current = true;
-    setIndexingState("building");
+    const doc = loadState.pdf.doc;
+    // Same doc + already indexed → nothing to do. A tab-switch to a different
+    // PDF gives a different doc handle, so this check will miss and restart.
+    if (indexedDocRef.current === doc) return;
     let cancelled = false;
+    setTextIndex([]);
+    setIndexingState("building");
+    setIndexedPageCount(0);
     (async () => {
       const accumulator: PageTextIndex[] = [];
-      const doc = loadState.pdf.doc;
-      for (let index = 1; index <= doc.numPages; index += 1) {
+      const pageLimit = Math.min(doc.numPages, TEXT_INDEX_PAGE_BUDGET);
+      for (let index = 1; index <= pageLimit; index += 1) {
         if (cancelled) return;
         const target = await doc.getPage(index);
         const text = await extractPageText(target);
@@ -174,7 +192,11 @@ export function PdfArtifactDetail({
       }
       if (cancelled) return;
       setTextIndex(accumulator);
+      setIndexedPageCount(pageLimit);
       setIndexingState("ready");
+      // Mark THIS doc as fully indexed only after completion. A cancelled
+      // pass leaves the ref alone so a resume can re-enter this effect.
+      indexedDocRef.current = doc;
     })();
     return () => {
       cancelled = true;
@@ -347,6 +369,15 @@ export function PdfArtifactDetail({
                     ? `${activeMatch}/${totalMatches}`
                     : "0 matches"}
               </span>
+              {indexingState === "ready" && numPages > indexedPageCount ? (
+                <span
+                  className="artifact-pdf-find-truncated"
+                  data-pdf-find-truncated="true"
+                  title={`Search indexed the first ${indexedPageCount} of ${numPages} pages.`}
+                >
+                  first {indexedPageCount} pages
+                </span>
+              ) : null}
               <button
                 aria-label="Close find"
                 type="button"
@@ -420,13 +451,23 @@ function PdfThumbnailSidebar({
       (entries) => {
         setVisibleSet((current) => {
           const next = new Set(current);
+          let changed = false;
           for (const entry of entries) {
             const raw = (entry.target as HTMLElement).dataset.pdfThumbPage;
             const pageNumber = raw ? Number(raw) : NaN;
             if (Number.isNaN(pageNumber)) continue;
-            if (entry.isIntersecting) next.add(pageNumber);
+            // Add on enter, remove on leave — otherwise the set grows without
+            // bound and every ever-visible canvas stays retained in memory.
+            if (entry.isIntersecting) {
+              if (!next.has(pageNumber)) {
+                next.add(pageNumber);
+                changed = true;
+              }
+            } else if (next.delete(pageNumber)) {
+              changed = true;
+            }
           }
-          return next;
+          return changed ? next : current;
         });
       },
       { root: sidebarRef.current, rootMargin: "200px" },
@@ -490,7 +531,8 @@ function PdfThumbnail({
   }, [onObserve, page]);
 
   useEffect(() => {
-    if (!visible || !canvasRef.current) return;
+    const canvas = canvasRef.current;
+    if (!visible || !canvas) return;
     let cancelled = false;
     let active: { cancel: () => void } | null = null;
     (async () => {
@@ -506,6 +548,14 @@ function PdfThumbnail({
     return () => {
       cancelled = true;
       active?.cancel();
+      // Release the canvas backing store when the thumbnail scrolls out of
+      // view or the doc changes — browsers free the pixel buffer once width
+      // is set to zero. Without this, sidebar canvases retain memory
+      // proportional to numPages for the life of the document.
+      if (canvas.width) {
+        canvas.width = 0;
+        canvas.height = 0;
+      }
     };
   }, [page, pdf, visible]);
 

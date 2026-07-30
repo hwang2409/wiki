@@ -36,12 +36,18 @@ const PAGE_TEXTS = [
   "Fourth summary page for zoom check",
 ];
 const UNIQUE_WORD = "terrarium";
+const PAGE_TEXTS_B = [
+  "Second pdf cover page",
+  "Detail switch target unique marker: aardvark",
+  "Trailing page for the switch fixture",
+];
+const UNIQUE_WORD_B = "aardvark";
 
 function logStep(message) {
   console.error(`[wiki-188-pdf-playwright] ${message}`);
 }
 
-function invokeFixtureWorker(fixtures, pdfBytes) {
+function invokeFixtureWorker(fixtures, pdfPayloads) {
   const requests = [
     {
       jsonrpc: "2.0",
@@ -53,20 +59,20 @@ function invokeFixtureWorker(fixtures, pdfBytes) {
         clientInfo: { name: "wiki-188-fixture", version: "1" },
       },
     },
-    {
+    ...pdfPayloads.map((payload, index) => ({
       jsonrpc: "2.0",
-      id: 10,
+      id: 10 + index,
       method: "tools/call",
       params: {
         name: "render_artifact",
         arguments: {
           kind: "pdf",
-          title: "Silky pdf fixture",
-          caption: "Multi-page pdf artifact for WIKI-188",
-          payload: { data_base64: pdfBytes.toString("base64") },
+          title: payload.title,
+          caption: payload.caption,
+          payload: { data_base64: payload.bytes.toString("base64") },
         },
       },
-    },
+    })),
   ];
   const result = spawnSync(PYTHON, ["-m", "backend.app.wiki_artifacts"], {
     cwd: ROOT,
@@ -82,47 +88,52 @@ function invokeFixtureWorker(fixtures, pdfBytes) {
     throw new Error(`artifact fixture worker failed: ${result.stderr || result.stdout}`);
   }
   const responses = result.stdout.trim().split("\n").map((line) => JSON.parse(line));
-  const response = responses[1];
-  if (response.result?.isError) throw new Error(response.result.content?.[0]?.text || "pdf artifact rejected");
-  const sentinel = response.result.content[0].text;
-  const event = JSON.parse(sentinel.slice("<<wiki-artifact:v1>>".length, -"<<end>>".length));
-  return { artifactId: event.id, sentinel };
+  return pdfPayloads.map((payload, index) => {
+    const response = responses[index + 1];
+    if (response.result?.isError) {
+      throw new Error(response.result.content?.[0]?.text || "pdf artifact rejected");
+    }
+    const sentinel = response.result.content[0].text;
+    const event = JSON.parse(sentinel.slice("<<wiki-artifact:v1>>".length, -"<<end>>".length));
+    return { artifactId: event.id, sentinel };
+  });
 }
 
-async function writeTranscript(fixtures, sentinel) {
-  const rows = [
-    { type: "mode", mode: "normal", sessionId: "wiki-188-pdf" },
-    {
+async function writeTranscript(fixtures, artifacts) {
+  const rows = [{ type: "mode", mode: "normal", sessionId: "wiki-188-pdf" }];
+  artifacts.forEach((artifact, index) => {
+    const toolId = `toolu_pdf_artifact_${index + 1}`;
+    const stamp = `2026-07-29T14:00:${String(index * 2).padStart(2, "0")}Z`;
+    const nextStamp = `2026-07-29T14:00:${String(index * 2 + 1).padStart(2, "0")}Z`;
+    rows.push({
       type: "assistant",
-      timestamp: "2026-07-29T14:00:00Z",
+      timestamp: stamp,
       message: {
         role: "assistant",
         content: [
           {
             type: "tool_use",
-            id: "toolu_pdf_artifact",
+            id: toolId,
             name: "mcp__wiki-artifacts__render_artifact",
             input: {
               kind: "pdf",
-              title: "Silky pdf fixture",
-              caption: "Multi-page pdf artifact for WIKI-188",
-              payload: {
-                data_base64: "<omitted-from-transcript>",
-              },
+              title: artifact.title,
+              caption: artifact.caption,
+              payload: { data_base64: "<omitted-from-transcript>" },
             },
           },
         ],
       },
-    },
-    {
+    });
+    rows.push({
       type: "user",
-      timestamp: "2026-07-29T14:00:01Z",
+      timestamp: nextStamp,
       message: {
         role: "user",
-        content: [{ type: "tool_result", tool_use_id: "toolu_pdf_artifact", content: sentinel }],
+        content: [{ type: "tool_result", tool_use_id: toolId, content: artifact.sentinel }],
       },
-    },
-  ];
+    });
+  });
   const target = path.join(fixtures.root, "wiki-188-pdf.jsonl");
   await fs.writeFile(target, rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
   return target;
@@ -165,20 +176,21 @@ function sessionLayout() {
 async function main() {
   logStep("building pdf fixture bytes");
   const pdfBytes = buildFixturePdf(PAGE_TEXTS);
+  const pdfBytesB = buildFixturePdf(PAGE_TEXTS_B);
   logStep("creating isolated backend fixtures");
   const fixtures = makeFixtureRoot("wiki-188-pdf-");
-  const { artifactId, sentinel } = invokeFixtureWorker(fixtures, pdfBytes);
-  const transcript = await writeTranscript(fixtures, sentinel);
+  const artifacts = invokeFixtureWorker(fixtures, [
+    { title: "Silky pdf fixture", caption: "Multi-page pdf artifact for WIKI-188", bytes: pdfBytes },
+    { title: "Second silky pdf", caption: "Tab-switch target for WIKI-188", bytes: pdfBytesB },
+  ]);
+  const [primary, secondary] = artifacts;
+  const transcript = await writeTranscript(fixtures, [
+    { ...primary, title: "Silky pdf fixture", caption: "Multi-page pdf artifact for WIKI-188" },
+    { ...secondary, title: "Second silky pdf", caption: "Tab-switch target for WIKI-188" },
+  ]);
   await writeRegistry(fixtures, transcript);
   writeQueue(fixtures.queuePath, TICKET, []);
 
-  const livePdf = path.join(
-    fixtures.runtimeDir,
-    "runs",
-    RUN_ID,
-    "artifacts",
-    `${artifactId}.pdf`,
-  );
   const archiveArtifacts = path.join(
     fixtures.root,
     "archive",
@@ -187,7 +199,17 @@ async function main() {
     "artifacts",
   );
   await fs.mkdir(archiveArtifacts, { recursive: true });
-  await fs.copyFile(livePdf, path.join(archiveArtifacts, `${artifactId}.pdf`));
+  for (const artifact of artifacts) {
+    const livePdf = path.join(
+      fixtures.runtimeDir,
+      "runs",
+      RUN_ID,
+      "artifacts",
+      `${artifact.artifactId}.pdf`,
+    );
+    await fs.copyFile(livePdf, path.join(archiveArtifacts, `${artifact.artifactId}.pdf`));
+  }
+  const artifactId = primary.artifactId;
 
   logStep("starting the isolated worktree backend");
   const backend = await startBackend(fixtures);
@@ -213,28 +235,32 @@ async function main() {
     await page.locator(".session-scroll").waitFor({ state: "visible" });
 
     const openStart = Date.now();
-    const block = page.locator('[data-artifact-kind="pdf"]');
-    await block.waitFor({ state: "visible" });
+    const primaryBlock = page.locator(`[data-artifact-kind="pdf"][data-artifact-id="${primary.artifactId}"]`);
+    const secondaryBlock = page.locator(`[data-artifact-kind="pdf"][data-artifact-id="${secondary.artifactId}"]`);
+    await primaryBlock.waitFor({ state: "visible" });
+    await secondaryBlock.waitFor({ state: "visible" });
 
-    const compactCanvas = block.locator(".artifact-pdf-compact-canvas");
+    const compactCanvas = primaryBlock.locator(".artifact-pdf-compact-canvas");
     await compactCanvas.waitFor({ state: "visible" });
-    await page.waitForFunction(() => {
-      const canvas = document.querySelector('[data-artifact-kind="pdf"] .artifact-pdf-compact-canvas');
+    await page.waitForFunction((id) => {
+      const canvas = document.querySelector(
+        `[data-artifact-kind="pdf"][data-artifact-id="${id}"] .artifact-pdf-compact-canvas`,
+      );
       return canvas instanceof HTMLCanvasElement && canvas.width > 0 && canvas.height > 0;
-    });
+    }, primary.artifactId);
     const compactOpenMs = Date.now() - openStart;
     logStep(`compact preview rendered in ${compactOpenMs}ms`);
     if (compactOpenMs > 4000) throw new Error(`compact preview took ${compactOpenMs}ms — over 4s budget`);
 
-    const compactMeta = await block.locator(".artifact-pdf-compact-meta").innerText();
+    const compactMeta = await primaryBlock.locator(".artifact-pdf-compact-meta").innerText();
     if (!compactMeta.includes(`page 1 of ${PAGE_TEXTS.length}`)) {
       throw new Error(`compact meta unexpected: ${JSON.stringify(compactMeta)}`);
     }
-    await block.screenshot({ path: COMPACT_SCREENSHOT });
+    await primaryBlock.screenshot({ path: COMPACT_SCREENSHOT });
 
     logStep("opening detail panel via Show all");
-    await block.getByRole("button", { name: "Show all" }).click();
-    await block.getByRole("button", { name: /Open in panel/ }).click();
+    await primaryBlock.getByRole("button", { name: "Show all" }).click();
+    await primaryBlock.getByRole("button", { name: /Open in panel/ }).click();
     const panel = page.locator(".artifact-pdf-detail");
     await panel.waitFor({ state: "visible" });
     await panel.locator(".artifact-pdf-page-canvas").waitFor({ state: "visible" });
@@ -248,22 +274,39 @@ async function main() {
       throw new Error(`initial page indicator wrong: ${initialIndicator}`);
     }
 
-    logStep("verifying text layer contains selectable text");
+    logStep("verifying text layer contains real selectable text (window.getSelection)");
     await page.waitForFunction(
       (needle) => document.querySelector(".artifact-pdf-page-textlayer")?.textContent?.includes(needle) ?? false,
       "silky",
     );
+    const selection = await panel.evaluate(() => {
+      const layer = document.querySelector(".artifact-pdf-page-textlayer");
+      if (!layer) return null;
+      const range = document.createRange();
+      range.selectNodeContents(layer);
+      const active = window.getSelection();
+      if (!active) return null;
+      active.removeAllRanges();
+      active.addRange(range);
+      return active.toString();
+    });
+    if (!selection || !selection.includes("silky")) {
+      throw new Error(`window.getSelection did not return page-1 text: ${JSON.stringify(selection)}`);
+    }
 
-    logStep("advancing to next page and checking indicator");
-    await panel.locator("[data-pdf-next]").click();
+    logStep("stepping to next page via PageDown keyboard");
+    await panel.locator(".artifact-pdf-viewport").focus();
+    await page.keyboard.press("PageDown");
     await page.waitForFunction(() => {
       const label = document.querySelector(".artifact-pdf-page-indicator");
       return label?.textContent?.includes("page 2 of");
     });
 
-    logStep("using cmd+f + find field to locate unique marker");
-    await panel.getByRole("button", { name: /find/i }).click();
+    logStep("opening find via cmd+f (real keyboard shortcut)");
+    await panel.locator(".artifact-pdf-viewport").focus();
+    await page.keyboard.press("Meta+f");
     const findInput = panel.locator('input[aria-label="Find in PDF"]');
+    await findInput.waitFor({ state: "visible" });
     await findInput.fill(UNIQUE_WORD);
     await findInput.press("Enter");
     await page.waitForFunction(() => {
@@ -284,6 +327,31 @@ async function main() {
     }, zoomBefore);
 
     await panel.screenshot({ path: DETAIL_SCREENSHOT });
+
+    logStep("tab-switching to the second PDF and re-running find");
+    // Close find first — otherwise the second doc's find state inherits the
+    // still-open overlay and it's ambiguous whether the switch worked.
+    await panel.getByRole("button", { name: /Close find/i }).click();
+    await secondaryBlock.getByRole("button", { name: "Show all" }).click();
+    await secondaryBlock.getByRole("button", { name: /Open in panel/ }).click();
+    await page.waitForFunction(
+      (needle) => document.querySelector(".artifact-pdf-page-textlayer")?.textContent?.includes(needle) ?? false,
+      "Second pdf cover",
+    );
+    await panel.locator(".artifact-pdf-viewport").focus();
+    await page.keyboard.press("Meta+f");
+    const findInputB = panel.locator('input[aria-label="Find in PDF"]');
+    await findInputB.waitFor({ state: "visible" });
+    await findInputB.fill(UNIQUE_WORD_B);
+    await findInputB.press("Enter");
+    await page.waitForFunction(() => {
+      const label = document.querySelector(".artifact-pdf-page-indicator");
+      return label?.textContent?.includes("page 2 of");
+    });
+    const matchCountB = await panel.locator(".artifact-pdf-find span.tabular-nums").innerText();
+    if (!/^1\/1$/.test(matchCountB.trim())) {
+      throw new Error(`second-pdf match count unexpected: ${JSON.stringify(matchCountB)}`);
+    }
 
     const summary = {
       root: fixtures.root,

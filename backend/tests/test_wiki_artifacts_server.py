@@ -541,6 +541,59 @@ class WikiArtifactsTests(unittest.TestCase):
                 {"kind": "pdf", "payload": {"path": str(symlink_target)}}
             )
 
+    def test_read_fd_bounded_rejects_files_that_exceed_the_cap(self) -> None:
+        payload = b"%PDF-1.4\n" + b"z" * (wiki_artifacts.PDF_LIMIT + 1)
+        source = self.root / "runtime" / "grown.pdf"
+        source.parent.mkdir(exist_ok=True)
+        source.write_bytes(payload)
+        fd = os.open(source, os.O_RDONLY)
+        try:
+            with self.assertRaisesRegex(
+                wiki_artifacts.ArtifactValidationError, "MB pdf limit"
+            ):
+                wiki_artifacts._read_fd_bounded(fd, wiki_artifacts.PDF_LIMIT)
+        finally:
+            os.close(fd)
+
+    def test_pdf_path_rejects_non_regular_files(self) -> None:
+        fifo = self.root / "runtime" / "pipe.pdf"
+        fifo.parent.mkdir(exist_ok=True)
+        try:
+            os.mkfifo(fifo)
+        except (AttributeError, OSError):  # not all filesystems support fifos
+            return
+        try:
+            with self.assertRaisesRegex(
+                wiki_artifacts.ArtifactValidationError, "regular file"
+            ):
+                wiki_artifacts._read_pdf_path(str(fifo))
+        finally:
+            fifo.unlink(missing_ok=True)
+
+    def test_stdio_server_rejects_oversized_transport_line(self) -> None:
+        # Craft a line larger than MAX_REQUEST_BYTES, followed by a well-formed
+        # request. The server should drain the giant line, respond with a
+        # transport error, and still process the trailing request.
+        garbage = b"x" * (wiki_artifacts.MAX_REQUEST_BYTES + 4096)
+        good = json.dumps(
+            {"jsonrpc": "2.0", "id": 99, "method": "tools/list", "params": {}}
+        ).encode() + b"\n"
+        env = os.environ.copy()
+        process = subprocess.run(
+            [sys.executable, "-m", "backend.app.wiki_artifacts"],
+            input=garbage + b"\n" + good,
+            capture_output=True,
+            env=env,
+            timeout=10,
+            check=True,
+        )
+        responses = [json.loads(line) for line in process.stdout.splitlines()]
+        self.assertEqual(len(responses), 2)
+        self.assertEqual(responses[0]["id"], None)
+        self.assertIn("transport limit", responses[0]["error"]["message"])
+        self.assertEqual(responses[1]["id"], 99)
+        self.assertIn("tools", responses[1]["result"])
+
     def test_storage_failure_returns_a_tool_error_without_crashing_server(self) -> None:
         with mock.patch.object(wiki_artifacts, "render_artifact", side_effect=OSError("disk full")):
             response = wiki_artifacts._tool_result(7, {"kind": "image", "payload": {}})

@@ -20,6 +20,10 @@ TEXT_LIMIT = 100_000
 IMAGE_LIMIT = 5 * 1024 * 1024
 PDF_LIMIT = 25 * 1024 * 1024
 PDF_MAGIC = b"%PDF-"
+# Transport-level cap on a single MCP request line. Sized to fit the largest
+# base64-encoded PDF payload (4/3 inflation) plus JSON envelope headroom, so
+# json.loads never sees an unbounded buffer even when a caller sends garbage.
+MAX_REQUEST_BYTES = ((PDF_LIMIT + 2) // 3) * 4 + 64 * 1024
 SENTINEL_START = "<<wiki-artifact:v1>>"
 SENTINEL_END = "<<end>>"
 ARTIFACT_KINDS = {"mermaid", "svg", "image", "table", "plot", "code", "diff", "file-list", "json", "pdf"}
@@ -253,6 +257,24 @@ def _pdf_path_allowed_roots() -> list[Path]:
     return roots
 
 
+def _read_fd_bounded(fd: int, limit: int) -> bytes:
+    """Read up to `limit` bytes from `fd`. Reject if the source has more."""
+    chunks: list[bytes] = []
+    remaining = limit + 1  # +1 lets us detect overflow without buffering it
+    while remaining > 0:
+        chunk = os.read(fd, min(65536, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    data = b"".join(chunks)
+    if len(data) > limit:
+        raise ArtifactValidationError(
+            f"pdf payload exceeds the {limit // (1024 * 1024)}MB pdf limit"
+        )
+    return data
+
+
 def _read_pdf_path(raw: str) -> bytes:
     if not raw or not isinstance(raw, str):
         raise ArtifactValidationError("payload.path must be a non-empty string")
@@ -274,20 +296,35 @@ def _read_pdf_path(raw: str) -> bytes:
         raise ArtifactValidationError(
             "payload.path is outside the allowed roots (vault, runtime, or archive)"
         )
+    # Open + stat + read all through the same file descriptor to close the
+    # TOCTOU window between validation and reading. O_NOFOLLOW refuses if the
+    # leaf was swapped for a symlink after resolve(). fstat() reports the
+    # object referenced by this exact fd, and the bounded read caps memory
+    # even when a swapped-in file inflates past the pre-check size.
+    open_flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        open_flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        open_flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NONBLOCK"):
+        # NONBLOCK keeps os.open() from blocking on a FIFO/device swapped in
+        # after resolve(); the fstat check below rejects anything non-regular.
+        open_flags |= os.O_NONBLOCK
     try:
-        info = resolved.stat()
+        fd = os.open(resolved, open_flags)
     except OSError as exc:
-        raise ArtifactValidationError(f"payload.path is not readable: {exc}") from exc
-    if not stat.S_ISREG(info.st_mode):
-        raise ArtifactValidationError("payload.path must reference a regular file")
-    if info.st_size > PDF_LIMIT:
-        raise ArtifactValidationError(
-            f"pdf payload exceeds the {PDF_LIMIT // (1024 * 1024)}MB pdf limit"
-        )
+        raise ArtifactValidationError(f"payload.path could not be opened: {exc}") from exc
     try:
-        return resolved.read_bytes()
-    except OSError as exc:
-        raise ArtifactValidationError(f"payload.path could not be read: {exc}") from exc
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ArtifactValidationError("payload.path must reference a regular file")
+        if info.st_size > PDF_LIMIT:
+            raise ArtifactValidationError(
+                f"pdf payload exceeds the {PDF_LIMIT // (1024 * 1024)}MB pdf limit"
+            )
+        return _read_fd_bounded(fd, PDF_LIMIT)
+    finally:
+        os.close(fd)
 
 
 def _write_pdf(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
@@ -610,8 +647,41 @@ def _response(message: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def _drain_oversized_line(stream) -> None:
+    """Discard the rest of an oversized line in bounded chunks."""
+    while True:
+        chunk = stream.readline(65536)
+        if not chunk or chunk.endswith(b"\n"):
+            return
+
+
+def _emit(response: dict[str, Any]) -> None:
+    sys.stdout.write(json.dumps(response, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
 def main() -> None:
-    for raw_line in sys.stdin.buffer:
+    stream = sys.stdin.buffer
+    while True:
+        # readline(size) reads up to `size` bytes OR until a newline — this
+        # caps the buffered request before json.loads sees it, so an oversized
+        # base64 payload cannot exhaust memory before the pre-parse check.
+        raw_line = stream.readline(MAX_REQUEST_BYTES)
+        if not raw_line:
+            return
+        if not raw_line.endswith(b"\n"):
+            _drain_oversized_line(stream)
+            _emit({
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": {
+                    "code": -32700,
+                    "message": (
+                        f"request exceeds {MAX_REQUEST_BYTES}-byte transport limit"
+                    ),
+                },
+            })
+            continue
         try:
             message = json.loads(raw_line)
             if not isinstance(message, dict):
@@ -624,8 +694,7 @@ def main() -> None:
                 "error": {"code": -32700, "message": f"parse error: {exc}"},
             }
         if response is not None:
-            sys.stdout.write(json.dumps(response, separators=(",", ":")) + "\n")
-            sys.stdout.flush()
+            _emit(response)
 
 
 if __name__ == "__main__":
