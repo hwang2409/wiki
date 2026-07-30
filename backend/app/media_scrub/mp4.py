@@ -23,7 +23,7 @@ Chain:
                                     self-referencing). Any non-canonical
                                     shape → file rejected.
                                     stbl -> stsd + boxes    stsd rebuilt from parsed sample
-                                    entries (avc1/hev1); other stbl
+                                    entries (avc1/mp4a); other stbl
                                     boxes header-validated but their
                                     bodies are BOUNDED by the parsed
                                     size (fully parsing every codec
@@ -79,24 +79,23 @@ _MP4_TOPLEVEL_PLAYBACK: Final = {
 }
 # Sample-entry types we know how to rebuild field-by-field. Unknown types
 # fall to strict-subset reject.
-# Only avc1 has a complete field-level codec and sample scrubber. avc3 has
-# in-band parameter sets, and the other codecs need separate parsers.
+# avc1 and AAC-LC mp4a have complete field-level codec and sample scrubbers.
+# avc3 has in-band parameter sets, and other codecs need separate parsers.
 _MP4_VISUAL_ENTRIES: Final = {b"avc1"}
-# AAC `mp4a` entries require an `esds` parser, which is outside this strict
-# reconstruction scope. Reject them instead of accepting an opaque config.
-_MP4_AUDIO_ENTRIES: Final = set()
+_MP4_AUDIO_ENTRIES: Final = {b"mp4a"}
 # Inner boxes inside a sample entry that we accept. Each one gets its
 # Every sample-entry inner box in this allowlist has a field-level
 # rebuild via struct.pack — no raw body copy path remains for anything
 # the scrubber claims to support (round-8 review). Codec configurations
-# for containers we do not fully field-decode yet (hvcC/vpcC/av1C/esds
+# for containers we do not fully field-decode yet (hvcC/vpcC/av1C
 # and the encryption tree sinf/schm/schi/tenc) are OUT — files using
 # them are rejected under strict-subset acceptance.
 _MP4_SAMPLE_ENTRY_INNER_ALLOWED: Final = {
-    b"avcC", b"btrt", b"pasp", b"colr",
+    b"avcC", b"btrt", b"pasp", b"colr", b"esds",
 }
 _MP4_SAMPLE_ENTRY_REQUIRED_CONFIG: Final = {
     b"avc1": b"avcC",
+    b"mp4a": b"esds",
 }
 _MP4_MAX_SAMPLES: Final = 16_777_216
 _MP4_AVC_SAMPLE_NAL_TYPES: Final = {1, 5, 6}
@@ -110,6 +109,7 @@ _MP4_MAX_BOXES_PER_CONTAINER: Final = 4096
 # strict-subset acceptance.
 _MP4_STBL_TABLE_TYPES: Final = {
     b"stts", b"ctts", b"stsc", b"stsz", b"stco", b"co64", b"stss",
+    b"sgpd", b"sbgp",
 }
 
 
@@ -470,31 +470,41 @@ def _sample_description_configs(
         entry_type = body[offset + 4:offset + 8]
         if entry_size < 8 or offset + entry_size > len(body):
             raise MediaScrubError("mp4 stsd entry size out of bounds")
-        if entry_type != b"avc1":
+        entry = body[offset:offset + entry_size]
+        if entry_type == b"avc1":
+            entries.append(_parse_avc_sample_config_from_entry(entry))
+        elif entry_type == b"mp4a":
+            _rebuild_sample_entry(entry_type, entry)
+            entries.append(None)
+        else:
             raise MediaScrubError(
                 f"mp4 sample entry type {entry_type!r} is outside scrubber scope"
             )
-        entry = body[offset:offset + entry_size]
-        inner_start = 16 + 70
-        inner_offset = inner_start
-        avcc_body: bytes | None = None
-        while inner_offset < len(entry):
-            if inner_offset + 8 > len(entry):
-                raise MediaScrubError("mp4 avc sample inner header truncated")
-            box_size = struct.unpack(">I", entry[inner_offset:inner_offset + 4])[0]
-            box_type = entry[inner_offset + 4:inner_offset + 8]
-            if box_size < 8 or inner_offset + box_size > len(entry):
-                raise MediaScrubError("mp4 avc sample inner box out of bounds")
-            if box_type == b"avcC":
-                if avcc_body is not None:
-                    raise MediaScrubError("mp4 avc1 sample entry has duplicate avcC")
-                avcc_body = entry[inner_offset + 8:inner_offset + box_size]
-            inner_offset += box_size
-        if avcc_body is None:
-            raise MediaScrubError("mp4 avc1 sample entry requires exactly one avcC")
-        entries.append(_parse_avc_sample_config(avcc_body, True))
         offset += entry_size
     return entries
+
+
+def _parse_avc_sample_config_from_entry(
+    entry: bytes,
+) -> tuple[int, set[int], bool]:
+    inner_start = 16 + 70
+    inner_offset = inner_start
+    avcc_body: bytes | None = None
+    while inner_offset < len(entry):
+        if inner_offset + 8 > len(entry):
+            raise MediaScrubError("mp4 avc sample inner header truncated")
+        box_size = struct.unpack(">I", entry[inner_offset:inner_offset + 4])[0]
+        box_type = entry[inner_offset + 4:inner_offset + 8]
+        if box_size < 8 or inner_offset + box_size > len(entry):
+            raise MediaScrubError("mp4 avc sample inner box out of bounds")
+        if box_type == b"avcC":
+            if avcc_body is not None:
+                raise MediaScrubError("mp4 avc1 sample entry has duplicate avcC")
+            avcc_body = entry[inner_offset + 8:inner_offset + box_size]
+        inner_offset += box_size
+    if avcc_body is None:
+        raise MediaScrubError("mp4 avc1 sample entry requires exactly one avcC")
+    return _parse_avc_sample_config(avcc_body, True)
 
 
 def _parse_avc_sample_config(
@@ -1325,6 +1335,7 @@ _CANONICAL_FULLBOX_FLAGS = b"\x00\x00\x00"
 # For boxes with mask == 0, the return value is always three zero bytes.
 _MP4_FULLBOX_ALLOWED_FLAG_MASK: Final = {
     b"sidx": 0,
+    b"esds": 0,
     b"mvhd": 0,
     b"elst": 0,
     b"tkhd": 0x00000F,  # track_enabled(1) + in_movie(2) + in_preview(4) + size_is_aspect_ratio(8)
@@ -1435,6 +1446,47 @@ def _rebuild_stbl_table(box_type: bytes, data: bytes, atom: _Mp4Atom) -> bytes:
                 f"mp4 ctts body length {len(body)} differs from expected {expected}"
             )
         return _pack(b"ctts", _canonical_header(version, entry_count) + bytes(body[8:]))
+
+    if box_type == b"sgpd":
+        if version != 1 or len(body) < 16:
+            raise MediaScrubError("mp4 sgpd requires version 1")
+        grouping_type = bytes(body[4:8])
+        default_length = struct.unpack(">I", bytes(body[8:12]))[0]
+        entry_count = struct.unpack(">I", bytes(body[12:16]))[0]
+        if grouping_type != b"roll" or default_length != 2:
+            raise MediaScrubError("mp4 sgpd supports only roll entries of length 2")
+        expected = 16 + entry_count * default_length
+        if len(body) != expected:
+            raise MediaScrubError(
+                f"mp4 sgpd body length {len(body)} differs from expected {expected}"
+            )
+        return _pack(
+            b"sgpd",
+            bytes([1]) + _CANONICAL_FULLBOX_FLAGS
+            + grouping_type
+            + struct.pack(">II", default_length, entry_count)
+            + bytes(body[16:]),
+        )
+
+    if box_type == b"sbgp":
+        if version != 0 or len(body) < 12:
+            raise MediaScrubError("mp4 sbgp requires version 0")
+        grouping_type = bytes(body[4:8])
+        entry_count = struct.unpack(">I", bytes(body[8:12]))[0]
+        if grouping_type != b"roll":
+            raise MediaScrubError("mp4 sbgp supports only roll entries")
+        expected = 12 + entry_count * 8
+        if len(body) != expected:
+            raise MediaScrubError(
+                f"mp4 sbgp body length {len(body)} differs from expected {expected}"
+            )
+        return _pack(
+            b"sbgp",
+            bytes([0]) + _CANONICAL_FULLBOX_FLAGS
+            + grouping_type
+            + struct.pack(">I", entry_count)
+            + bytes(body[8:]),
+        )
 
     if version != 0:
         raise MediaScrubError(f"mp4 {box_type!r} unknown version {version}")
@@ -1598,8 +1650,8 @@ def _rebuild_audio_sample_entry_fixed(entry_bytes: bytes) -> tuple[bytes, int]:
 # All sample-entry inner boxes now get a field-level rebuild — see the
 # individual _rebuild_inner_* helpers below plus _rebuild_inner_avcC in
 # the walker section. Codec-config formats we do NOT field-decode yet
-# (hvcC/vpcC/av1C/esds) are absent from _MP4_SAMPLE_ENTRY_INNER_ALLOWED,
-# so files that use them are rejected under strict-subset acceptance.
+# (hvcC/vpcC/av1C) are absent from _MP4_SAMPLE_ENTRY_INNER_ALLOWED, so files
+# that use them are rejected under strict-subset acceptance.
 
 
 def _rebuild_inner_btrt(body: bytes) -> bytes:
@@ -1671,6 +1723,133 @@ def _rebuild_inner_colr(body: bytes) -> bytes:
     return _pack(b"colr", rebuilt)
 
 
+def _read_mp4_descriptor(
+    data: bytes, offset: int, end: int,
+) -> tuple[int, bytes, int]:
+    if offset >= end:
+        raise MediaScrubError("mp4 esds descriptor tag is truncated")
+    tag = data[offset]
+    offset += 1
+    length = 0
+    for index in range(4):
+        if offset >= end:
+            raise MediaScrubError("mp4 esds descriptor length is truncated")
+        value = data[offset]
+        offset += 1
+        length = (length << 7) | (value & 0x7F)
+        if not value & 0x80:
+            break
+    else:
+        raise MediaScrubError("mp4 esds descriptor length uses more than 4 bytes")
+    descriptor_end = offset + length
+    if descriptor_end > end:
+        raise MediaScrubError("mp4 esds descriptor extends past body")
+    return tag, data[offset:descriptor_end], descriptor_end
+
+
+def _pack_mp4_descriptor(tag: int, body: bytes) -> bytes:
+    if not 0 <= tag <= 0xFF:
+        raise MediaScrubError("mp4 esds descriptor tag is outside one byte")
+    groups = [len(body) & 0x7F]
+    remaining = len(body) >> 7
+    while remaining:
+        groups.append(remaining & 0x7F)
+        remaining >>= 7
+    length = bytes(
+        value | (0x80 if index < len(groups) - 1 else 0)
+        for index, value in enumerate(reversed(groups))
+    )
+    return bytes([tag]) + length + body
+
+
+def _canonical_aac_lc_config(config: bytes) -> bytes:
+    """Validate AAC-LC AudioSpecificConfig and emit its canonical core.
+
+    The optional extension and padding bits are not needed for AAC-LC.
+    Dropping them prevents opaque descriptor slack from reaching output.
+    """
+    if not 2 <= len(config) <= 64:
+        raise MediaScrubError("mp4 mp4a AudioSpecificConfig length is outside 2..64")
+    value = int.from_bytes(config, "big")
+    bit_count = len(config) * 8
+    cursor = bit_count
+
+    def read(width: int) -> int:
+        nonlocal cursor
+        if cursor < width:
+            raise MediaScrubError("mp4 mp4a AudioSpecificConfig is truncated")
+        cursor -= width
+        return (value >> cursor) & ((1 << width) - 1)
+
+    audio_object_type = read(5)
+    if audio_object_type == 31:
+        raise MediaScrubError("mp4 mp4a extended AudioObjectType is unsupported")
+    frequency_index = read(4)
+    if frequency_index == 15:
+        raise MediaScrubError("mp4 mp4a explicit AudioSpecificConfig frequency is unsupported")
+    channel_configuration = read(4)
+    if audio_object_type != 2:
+        raise MediaScrubError(
+            f"mp4 mp4a AudioObjectType {audio_object_type} is not AAC-LC"
+        )
+    if frequency_index > 12 or channel_configuration == 0 or channel_configuration > 6:
+        raise MediaScrubError("mp4 mp4a AudioSpecificConfig fields are unsupported")
+    if read(1) != 0 or read(1) != 0 or read(1) != 0:
+        raise MediaScrubError("mp4 mp4a AAC-LC GASpecificConfig flags are unsupported")
+    canonical = (audio_object_type << 11) | (frequency_index << 7) | (channel_configuration << 3)
+    return struct.pack(">H", canonical)
+
+
+def _rebuild_inner_esds(body: bytes) -> bytes:
+    if len(body) < 4:
+        raise MediaScrubError("mp4 esds body too short")
+    flags = _validate_fullbox_flags(b"esds", body[1:4])
+    tag, es_body, offset = _read_mp4_descriptor(body, 4, len(body))
+    if tag != 0x03 or offset != len(body):
+        raise MediaScrubError("mp4 esds requires exactly one ES descriptor")
+    if len(es_body) < 3:
+        raise MediaScrubError("mp4 esds ES descriptor body too short")
+    es_id = struct.unpack(">H", es_body[:2])[0]
+    es_flags = es_body[2]
+    if es_flags != 0:
+        raise MediaScrubError("mp4 esds optional ES descriptor fields are unsupported")
+    offset = 3
+    decoder_tag, decoder_body, offset = _read_mp4_descriptor(
+        es_body, offset, len(es_body),
+    )
+    sl_tag, sl_body, offset = _read_mp4_descriptor(es_body, offset, len(es_body))
+    if offset != len(es_body) or decoder_tag != 0x04 or sl_tag != 0x06:
+        raise MediaScrubError("mp4 esds requires decoder and SL descriptors")
+    if sl_body != b"\x02":
+        raise MediaScrubError("mp4 esds SLConfigDescriptor is not canonical")
+    if len(decoder_body) < 13:
+        raise MediaScrubError("mp4 esds decoder descriptor body too short")
+    object_type = decoder_body[0]
+    stream_flags = decoder_body[1]
+    if object_type != 0x40 or stream_flags != 0x15:
+        raise MediaScrubError("mp4 esds decoder descriptor is not AAC audio")
+    buffer_size = decoder_body[2:5]
+    max_bitrate = struct.unpack(">I", decoder_body[5:9])[0]
+    avg_bitrate = struct.unpack(">I", decoder_body[9:13])[0]
+    config_tag, config_body, config_end = _read_mp4_descriptor(
+        decoder_body, 13, len(decoder_body),
+    )
+    if config_tag != 0x05 or config_end != len(decoder_body):
+        raise MediaScrubError("mp4 esds requires exactly one DecoderSpecificInfo")
+    canonical_config = _canonical_aac_lc_config(config_body)
+    canonical_decoder = (
+        b"\x40\x15" + buffer_size
+        + struct.pack(">II", max_bitrate, avg_bitrate)
+        + _pack_mp4_descriptor(0x05, canonical_config)
+    )
+    canonical_es = (
+        struct.pack(">HB", es_id, 0)
+        + _pack_mp4_descriptor(0x04, canonical_decoder)
+        + _pack_mp4_descriptor(0x06, b"\x02")
+    )
+    return _pack(b"esds", flags + _pack_mp4_descriptor(0x03, canonical_es))
+
+
 def _walk_sample_entry_inner_boxes(
     entry_bytes: bytes,
     inner_start: int,
@@ -1680,7 +1859,7 @@ def _walk_sample_entry_inner_boxes(
     """Rebuild each inner box from parsed fields. No opaque body copy
     path remains: every allowlisted type dispatches to a struct.pack
     rebuild that reads specific fields; anything not in the allowlist
-    (hvcC/vpcC/av1C/esds/sinf/schm/schi/tenc/anything unknown) rejects
+    (hvcC/vpcC/av1C/sinf/schm/schi/tenc/anything unknown) rejects
     the whole file — strict-subset acceptance.
     """
     out: list[bytes] = []
@@ -1711,6 +1890,8 @@ def _walk_sample_entry_inner_boxes(
             out.append(_rebuild_inner_pasp(body))
         elif box_type == b"colr":
             out.append(_rebuild_inner_colr(body))
+        elif box_type == b"esds":
+            out.append(_rebuild_inner_esds(body))
         else:  # pragma: no cover — allowlist above already gated
             raise MediaScrubError(
                 f"mp4 sample entry inner box {box_type!r} missing rebuilder"

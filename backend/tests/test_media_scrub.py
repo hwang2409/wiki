@@ -14,6 +14,7 @@ from backend.app import media_scrub
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "media"
 REAL_MP4 = FIXTURE_DIR / "tiny.mp4"
+REAL_MIXED_MP4 = FIXTURE_DIR / "tiny_avc1_aac.mp4"
 REAL_WAV = FIXTURE_DIR / "tone.wav"
 REAL_MP3 = FIXTURE_DIR / "tone.mp3"
 REAL_MP3_APE = FIXTURE_DIR / "tone_ape.mp3"
@@ -90,6 +91,41 @@ class ScrubMp4RealFixtureTests(unittest.TestCase):
                 probe.returncode,
                 0,
                 msg=f"ffmpeg decode failed after scrub: {probe.stderr.decode(errors='replace')}",
+            )
+        finally:
+            Path(stored_path).unlink(missing_ok=True)
+
+
+class ScrubMp4MixedAacFixtureTests(unittest.TestCase):
+    """A real mixed avc1+AAC MP4 exercises both supported track types."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.original = REAL_MIXED_MP4.read_bytes()
+        cls.result = media_scrub.scrub_video(cls.original, "video/mp4")
+
+    def test_avc1_and_mp4a_tracks_survive_rebuild(self) -> None:
+        self.assertIn(b"avc1", self.result.data)
+        self.assertIn(b"mp4a", self.result.data)
+        self.assertIn(b"esds", self.result.data)
+        self.assertEqual(len(self.result.data), len(self.original))
+
+    def test_mixed_stored_bytes_decode_cleanly_through_ffmpeg(self) -> None:
+        if FFMPEG is None:
+            self.skipTest("ffmpeg not installed")
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as handle:
+            handle.write(self.result.data)
+            stored_path = handle.name
+        try:
+            probe = subprocess.run(
+                [FFMPEG, "-v", "error", "-i", stored_path, "-f", "null", "-"],
+                capture_output=True,
+                timeout=30,
+            )
+            self.assertEqual(
+                probe.returncode,
+                0,
+                msg=f"ffmpeg mixed decode failed: {probe.stderr.decode(errors='replace')}",
             )
         finally:
             Path(stored_path).unlink(missing_ok=True)
