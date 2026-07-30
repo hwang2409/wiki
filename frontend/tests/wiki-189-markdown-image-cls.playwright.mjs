@@ -42,26 +42,110 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
-async function main() {
-  const fixtures = makeFixtureRoot("wiki-189-cls-");
-  const vault = path.join(fixtures.root, "vault");
-  await fs.mkdir(vault, { recursive: true });
-  await fs.writeFile(path.join(vault, "hero.png"), greyPng(320, 200));
-  await fs.writeFile(
-    path.join(vault, "note.md"),
-    ["# CLS fixture", "", "![hero](hero.png)", ""].join("\n"),
-    "utf-8",
-  );
-  writeRegistry(fixtures.registryPath, []);
-  writeQueue(fixtures.queuePath, "WIKI-189", []);
-
-  const backend = await startBackend(fixtures);
-  const browser = await chromium.launch({ headless: true });
+async function openNote(browser, backend, targetPath) {
   const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+  await page.addInitScript((notePath) => {
+    localStorage.setItem(
+      "wiki-window-layout-v2",
+      JSON.stringify({
+        version: 2,
+        activeWindowId: "window-0",
+        windows: [
+          {
+            id: "window-0",
+            focusedPaneId: "pane-1",
+            layout: { kind: "pane", id: "pane-1", path: notePath },
+          },
+        ],
+      }),
+    );
+  }, targetPath);
+  await page.goto(`${backend.baseUrl}/#/note/${targetPath}`, { waitUntil: "domcontentloaded" });
+  await page.waitForSelector(".markdown-preview-view");
+  return page;
+}
+
+async function measureFadeOverTime(page, selector, samples) {
+  return page.evaluate(
+    async ({ selector, samples }) => {
+      const opacities = [];
+      for (let index = 0; index < samples; index += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        const node = document.querySelector(selector);
+        opacities.push(node ? Number(getComputedStyle(node).opacity) : null);
+      }
+      return opacities;
+    },
+    { selector, samples },
+  );
+}
+
+async function scenarioPreloadedMeta(browser, backend) {
+  const page = await openNote(browser, backend, "note.md");
   try {
-    // Throttle the raw asset response so we can observe the loading state.
+    // Delay the sharp image so we get a visible loading window during which
+    // the preview must sit at opacity 1 above the frame.
     await page.route(/\/api\/vault\/assets\/hero\.png($|\?)/, async (route) => {
       await new Promise((resolve) => setTimeout(resolve, 350));
+      return route.continue();
+    });
+    const frame = page.locator(".markdown-image-frame").first();
+    await frame.waitFor({ state: "visible", timeout: 5000 });
+
+    const before = await frame.evaluate((node) => {
+      const rect = node.getBoundingClientRect();
+      return {
+        height: rect.height,
+        aspectRatio: getComputedStyle(node).aspectRatio,
+      };
+    });
+    assert(before.height >= 20, `preloaded frame reserved no height (got ${before.height})`);
+    assert(
+      before.aspectRatio.replace(/\s+/g, "") === "320/200" || before.aspectRatio === "1.6",
+      `preloaded frame aspect ratio must lock before load, got '${before.aspectRatio}'`,
+    );
+
+    const image = frame.locator("img[decoding='async']");
+    await image.evaluate((img) => new Promise((resolve) => {
+      if (img.complete && img.naturalWidth > 0) return resolve();
+      img.addEventListener("load", () => resolve(), { once: true });
+      img.addEventListener("error", () => resolve(), { once: true });
+    }));
+
+    const after = await frame.evaluate((node) => ({ height: node.getBoundingClientRect().height }));
+    const heightDrift = Math.abs(after.height - before.height);
+    assert(
+      heightDrift < 1,
+      `preloaded frame height shifted after image load: ${before.height} -> ${after.height}`,
+    );
+    console.error("[wiki-189-cls] preloaded scenario: frame height locked");
+  } finally {
+    await page.close();
+  }
+}
+
+async function scenarioMetadataAfterImage(browser, backend) {
+  const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+  try {
+    // Strip asset_meta from the note payload so the frontend has to fetch
+    // metadata on its own. Route MUST be installed before the note fetch.
+    await page.route(/\/api\/notes\/note\.md/, async (route) => {
+      const response = await route.fetch();
+      const body = await response.json();
+      body.asset_meta = {};
+      return route.fulfill({
+        status: response.status(),
+        headers: response.headers(),
+        body: JSON.stringify(body),
+      });
+    });
+    // Delay the asset-meta probe long enough that the sharp image lands
+    // FIRST — this is the round-3 race condition the review demanded a
+    // fixture for.
+    let metaFetchedAt = null;
+    await page.route(/\/api\/vault\/asset-meta\//, async (route) => {
+      await new Promise((resolve) => setTimeout(resolve, 900));
+      metaFetchedAt = Date.now();
       return route.continue();
     });
     await page.addInitScript(() => {
@@ -85,43 +169,134 @@ async function main() {
 
     const frame = page.locator(".markdown-image-frame").first();
     await frame.waitFor({ state: "visible", timeout: 5000 });
-
-    const before = await frame.evaluate((node) => {
-      const rect = node.getBoundingClientRect();
-      return {
-        top: rect.top,
-        height: rect.height,
-        aspectRatio: getComputedStyle(node).aspectRatio,
-      };
-    });
-    assert(before.height >= 20, `frame reserved no height while loading (got ${before.height})`);
-    assert(
-      before.aspectRatio.replace(/\s+/g, "") === "320/200" || before.aspectRatio === "1.6",
-      `frame aspect ratio must lock before load, got '${before.aspectRatio}'`,
-    );
-
     const image = frame.locator("img[decoding='async']");
     await image.evaluate((img) => new Promise((resolve) => {
       if (img.complete && img.naturalWidth > 0) return resolve();
       img.addEventListener("load", () => resolve(), { once: true });
       img.addEventListener("error", () => resolve(), { once: true });
     }));
-
-    const after = await frame.evaluate((node) => {
-      const rect = node.getBoundingClientRect();
-      return { top: rect.top, height: rect.height };
-    });
-    // The frame's own layout must not jump — height stays locked from the
-    // aspect ratio committed on first render. (Unrelated ancestor async
-    // content may shift the whole preview up/down; that's not our race.)
-    const heightDrift = Math.abs(after.height - before.height);
+    // Ratio must be locked from naturalWidth/Height NOW, before meta arrives.
+    const atLoad = await frame.evaluate((node) => ({
+      height: node.getBoundingClientRect().height,
+      aspectRatio: getComputedStyle(node).aspectRatio,
+    }));
+    assert(atLoad.height >= 20, `frame reserved no height on image load (got ${atLoad.height})`);
+    // Give the delayed asset-meta probe time to arrive.
+    await page.waitForTimeout(1200);
+    const afterMeta = await frame.evaluate((node) => ({
+      height: node.getBoundingClientRect().height,
+    }));
+    const heightDrift = Math.abs(afterMeta.height - atLoad.height);
     assert(
       heightDrift < 1,
-      `frame height shifted after image load: ${before.height} -> ${after.height}`,
+      `race scenario: metadata arrival shifted frame height ${atLoad.height} -> ${afterMeta.height}`,
     );
-    console.error("[wiki-189-cls] frame height locked before and after image load");
+    if (metaFetchedAt === null) {
+      console.error("[wiki-189-cls] race scenario: (asset-meta was served from note payload)");
+    }
+    console.error("[wiki-189-cls] race scenario: metadata-after-image did NOT shift layout");
   } finally {
     await page.close();
+  }
+}
+
+async function scenarioPreviewFadeOpacity(browser, backend) {
+  // Fresh context so browser cache/previous routes don't taint the timing.
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  const page = await context.newPage();
+  try {
+    // A large image with a long delay guarantees an observable "loading"
+    // window during which the preview must sit at opacity 1 above the
+    // sharp image.
+    await page.route(/\/api\/vault\/assets\/big\.png($|\?)/, async (route) => {
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      return route.continue();
+    });
+    await page.addInitScript(() => {
+      localStorage.setItem(
+        "wiki-window-layout-v2",
+        JSON.stringify({
+          version: 2,
+          activeWindowId: "window-0",
+          windows: [
+            {
+              id: "window-0",
+              focusedPaneId: "pane-1",
+              layout: { kind: "pane", id: "pane-1", path: "note-big.md" },
+            },
+          ],
+        }),
+      );
+    });
+    await page.goto(`${backend.baseUrl}/#/note/note-big.md`, { waitUntil: "domcontentloaded" });
+    await page.waitForSelector(".markdown-preview-view");
+
+    const preview = page.locator(".markdown-image-preview").first();
+    await preview.waitFor({ state: "attached", timeout: 5000 });
+    // Sample opacity immediately: while the sharp image is still loading
+    // (~1.5s available), the preview must be at opacity ~1.
+    const opacityLoading = await preview.evaluate((node) => Number(getComputedStyle(node).opacity));
+    assert(opacityLoading > 0.9, `preview should start at ~1.0 opacity, got ${opacityLoading}`);
+    // Let the sharp image finish loading + the fade transition run, then
+    // sample every 40ms and confirm we crossed a mid-fade opacity value.
+    const opacities = await page.evaluate(async () => {
+      const samples = [];
+      // Wait for the preview to be told to fade (is-fading class flips on
+      // when the image loads).
+      for (let i = 0; i < 60; i += 1) {
+        const node = document.querySelector(".markdown-image-preview");
+        if (node && node.className.includes("is-fading")) break;
+        await new Promise((resolve) => setTimeout(resolve, 40));
+      }
+      for (let i = 0; i < 18; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        const node = document.querySelector(".markdown-image-preview");
+        samples.push(node ? Number(getComputedStyle(node).opacity) : null);
+      }
+      return samples;
+    });
+    const nonNull = opacities.filter((value) => value !== null);
+    assert(nonNull.length > 0, `preview vanished before fade could be measured: ${JSON.stringify(opacities)}`);
+    const sawIntermediate = nonNull.some((value) => value > 0.05 && value < 0.95);
+    assert(
+      sawIntermediate,
+      `preview never showed a mid-fade opacity: ${JSON.stringify(nonNull)}`,
+    );
+    console.error(`[wiki-189-cls] fade scenario: opacity trajectory ${JSON.stringify(nonNull)}`);
+  } finally {
+    await page.close();
+    await context.close();
+  }
+}
+
+async function main() {
+  const fixtures = makeFixtureRoot("wiki-189-cls-");
+  const vault = path.join(fixtures.root, "vault");
+  await fs.mkdir(vault, { recursive: true });
+  await fs.writeFile(path.join(vault, "hero.png"), greyPng(320, 200));
+  // Big enough that the backend's preview generator emits a base64 preview
+  // (>24px long side) so the fade path actually renders.
+  await fs.writeFile(path.join(vault, "big.png"), greyPng(640, 400));
+  await fs.writeFile(
+    path.join(vault, "note.md"),
+    ["# CLS fixture", "", "![hero](hero.png)", ""].join("\n"),
+    "utf-8",
+  );
+  await fs.writeFile(
+    path.join(vault, "note-big.md"),
+    ["# Fade fixture", "", "![big](big.png)", ""].join("\n"),
+    "utf-8",
+  );
+  writeRegistry(fixtures.registryPath, []);
+  writeQueue(fixtures.queuePath, "WIKI-189", []);
+
+  const backend = await startBackend(fixtures);
+  const browser = await chromium.launch({ headless: true });
+  try {
+    await scenarioPreloadedMeta(browser, backend);
+    await scenarioMetadataAfterImage(browser, backend);
+    await scenarioPreviewFadeOpacity(browser, backend);
+  } finally {
     await browser.close();
     await backend.stop();
   }

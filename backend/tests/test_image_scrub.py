@@ -291,6 +291,43 @@ class ImageScrubTests(unittest.TestCase):
         self.assertEqual(resized, original)
         self.assertEqual(out_mime, "image/png")
 
+    def test_resize_bakes_orientation_before_computing_target_height(self) -> None:
+        # Source: 400x240 tagged Orientation=6 — canonical upright is 240x400.
+        # A 160-wide thumbnail must be 160x266 (240:400 aspect), NOT 160x96
+        # (400:240 aspect) which would look distorted.
+        from PIL.ExifTags import Base as ExifBase
+
+        from backend.app.image_scrub import resize_image_bytes
+
+        image = Image.new("RGB", (400, 240), color=(10, 200, 50))
+        exif = image.getexif()
+        exif[ExifBase.Orientation.value] = 6
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=90, exif=exif.tobytes())
+        resized, out_mime = resize_image_bytes(buffer.getvalue(), "image/jpeg", 160)
+        self.assertEqual(out_mime, "image/jpeg")
+        with Image.open(io.BytesIO(resized)) as reopened:
+            reopened.load()
+            self.assertEqual(reopened.size, (160, 267))
+
+    def test_resize_passthrough_still_bakes_orientation(self) -> None:
+        # If the source is already narrow enough that no rescale is needed,
+        # we must STILL rotate the pixels so served bytes match the metadata
+        # dimensions the frontend was told about.
+        from PIL.ExifTags import Base as ExifBase
+
+        from backend.app.image_scrub import resize_image_bytes
+
+        image = Image.new("RGB", (80, 60), color=(10, 200, 50))
+        exif = image.getexif()
+        exif[ExifBase.Orientation.value] = 6
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=90, exif=exif.tobytes())
+        resized, _ = resize_image_bytes(buffer.getvalue(), "image/jpeg", 320)
+        with Image.open(io.BytesIO(resized)) as reopened:
+            reopened.load()
+            self.assertEqual(reopened.size, (60, 80))
+
     def test_scrub_returns_scrubbed_dimensions_after_orientation_swap(self) -> None:
         from backend.app.image_scrub import scrub_image
 

@@ -572,3 +572,28 @@ describe("MarkdownImage layout stability (WIKI-201)", () => {
     }
   });
 });
+
+describe("gallery tile ratio lock (WIKI-192)", () => {
+  test("tile ratio does not swap when metadata arrives after mount", async () => {
+    // Give the batch endpoint a 60ms round-trip delay so the tile lives in
+    // the "no metadata yet" state briefly. Whatever meta arrives later must
+    // not swap the tile's aspect ratio.
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      return new Response(
+        JSON.stringify({ "notes/one.png": { width: 1200, height: 800, media_type: "image/png" } }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    });
+    const { container } = render(
+      <ImageGallery files={[{ path: "notes/one.png", label: "One" }]} />,
+    );
+    const tile = container.querySelector(".artifact-gallery-tile") as HTMLElement;
+    // The tile MUST NOT carry an inline aspect-ratio — the CSS locks it to
+    // 4/3 and the batch response must not override that inline.
+    expect(tile.getAttribute("style") || "").not.toContain("aspect-ratio");
+    // Even after the batch resolves, the tile stays free of inline ratio.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(tile.getAttribute("style") || "").not.toContain("aspect-ratio");
+  });
+});

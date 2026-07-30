@@ -513,30 +513,57 @@ def resize_image_bytes(data: bytes, mime: str, target_width: int) -> tuple[bytes
 
     Enforces the same pre-decode side + pixel caps as scrub_image so the
     resize path can never be used to smuggle a decompression bomb past the
-    normal ingress guard. Returns the original bytes untouched when the
-    source is already narrower than the target width."""
+    normal ingress guard. Orientation is applied to the pixel data BEFORE
+    computing the target height so a 1200x800 photo tagged Orientation=6
+    resizes to 320x480 (canonical 2:3 upright) instead of 320x213 (raw
+    3:2 landscape). Returns the original bytes untouched when the source
+    is already narrower than the target width."""
     if _PIL_FORMAT_BY_MIME.get(mime) is None:
         raise ImageScrubError(f"unsupported mime: {mime}")
     if target_width not in ALLOWED_RESIZE_WIDTHS:
         raise ImageScrubError(f"unsupported target width: {target_width}")
-    width, height = probe_dimensions(data, mime)
-    if width <= 0 or height <= 0:
+    raw_width, raw_height = probe_dimensions(data, mime)
+    if raw_width <= 0 or raw_height <= 0:
         raise ImageScrubError("image reports non-positive dimensions")
-    if width > MAX_SIDE or height > MAX_SIDE:
+    if raw_width > MAX_SIDE or raw_height > MAX_SIDE:
         raise ImageScrubError(
-            f"image exceeds {MAX_SIDE}px side limit ({width}x{height})"
+            f"image exceeds {MAX_SIDE}px side limit ({raw_width}x{raw_height})"
         )
-    if width * height > MAX_PIXELS:
+    if raw_width * raw_height > MAX_PIXELS:
         raise ImageScrubError(
-            f"image exceeds {MAX_PIXELS // 1_000_000}MP pixel limit ({width}x{height})"
+            f"image exceeds {MAX_PIXELS // 1_000_000}MP pixel limit ({raw_width}x{raw_height})"
         )
-    if target_width >= width:
-        return data, mime
-    target_height = max(1, round(height * (target_width / width)))
+
+    orientation = 1
+    probe = _ORIENTATION_PROBES.get(mime)
+    if probe is not None:
+        try:
+            orientation = probe(data)
+        except (struct.error, ValueError, IndexError):
+            orientation = 1
+    # EXIF orientations 5..8 swap the axes. Use the CANONICAL post-rotation
+    # dimensions for every decision that follows so short-circuit and target
+    # sizing both match the pixels we will actually emit.
+    upright_width, upright_height = (raw_height, raw_width) if orientation >= 5 else (raw_width, raw_height)
+    if target_width >= upright_width:
+        # The scrub-then-passthrough path still needs to bake orientation in
+        # to match the served pixels, if orientation != 1.
+        if orientation == 1:
+            return data, mime
+        try:
+            oriented_bytes = _rotate_and_reencode(data, mime, orientation)
+        except ImageScrubError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise ImageScrubError(f"resize failed: {exc}") from exc
+        return oriented_bytes, mime
+    target_height = max(1, round(upright_height * (target_width / upright_width)))
     try:
         with Image.open(io.BytesIO(data)) as source:
             source.load()
-            oriented = ImageOps.exif_transpose(source) or source
+            oriented = _apply_orientation(source, orientation)
+            if orientation == 1:
+                oriented = ImageOps.exif_transpose(oriented) or oriented
             if oriented.mode not in {"RGB", "RGBA", "L", "LA", "P", "PA"}:
                 oriented = oriented.convert("RGBA" if "A" in oriented.mode else "RGB")
             resized = oriented.resize((target_width, target_height), Image.Resampling.LANCZOS)

@@ -761,6 +761,15 @@ function MarkdownImage({ alt, className, "data-obsidian-width": dataWidth, node,
   const cachedMeta = activeCandidate ? assetMetaFromCache(activeCandidate) : undefined;
   const [state, setState] = useState<"loading" | "ready" | "error">("loading");
   const [meta, setMeta] = useState<AssetMeta | null>(cachedMeta ?? null);
+  // Ratio is LOCKED once — either from meta arriving before image load, or
+  // from the image's own naturalWidth/Height on load if meta hasn't shown
+  // up yet. Late-arriving meta is used for the lightbox but never rewrites
+  // the frame's aspect ratio, so a metadata race can't cause CLS.
+  const [frameRatio, setFrameRatio] = useState<{ w: number; h: number } | null>(() =>
+    cachedMeta && cachedMeta.width > 0 && cachedMeta.height > 0
+      ? { w: cachedMeta.width, h: cachedMeta.height }
+      : null,
+  );
   const [previewMounted, setPreviewMounted] = useState(true);
   const [lightboxOpen, setLightboxOpen] = useState(false);
 
@@ -774,6 +783,11 @@ function MarkdownImage({ alt, className, "data-obsidian-width": dataWidth, node,
     const first = candidates.length > 0 ? candidates[0] : null;
     const preloaded = first ? assetMetaFromCache(first) : undefined;
     setMeta(preloaded ?? null);
+    setFrameRatio(
+      preloaded && preloaded.width > 0 && preloaded.height > 0
+        ? { w: preloaded.width, h: preloaded.height }
+        : null,
+    );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [src, notePath]);
 
@@ -790,6 +804,13 @@ function MarkdownImage({ alt, className, "data-obsidian-width": dataWidth, node,
     fetchAssetMeta(activeCandidate).then((info) => {
       if (cancelled) return;
       setMeta(info);
+      // Only lock the ratio from meta if we don't have one yet — otherwise
+      // the ratio was captured from the image's naturalWidth/Height at load
+      // time and we must NOT change it (that would be the CLS the race test
+      // hunts for).
+      if (info && info.width > 0 && info.height > 0) {
+        setFrameRatio((prev) => prev ?? { w: info.width, h: info.height });
+      }
     });
     return () => {
       cancelled = true;
@@ -802,13 +823,11 @@ function MarkdownImage({ alt, className, "data-obsidian-width": dataWidth, node,
 
   if (!currentSrc) return null;
 
-  const knownRatio = meta && meta.width > 0 && meta.height > 0
-    ? meta.width / meta.height
-    : null;
+  const knownRatio = frameRatio ? frameRatio.w / frameRatio.h : null;
 
   const frameStyle: React.CSSProperties = {};
   if (explicitWidth) frameStyle.width = `${explicitWidth}px`;
-  if (knownRatio) frameStyle.aspectRatio = `${meta!.width} / ${meta!.height}`;
+  if (frameRatio) frameStyle.aspectRatio = `${frameRatio.w} / ${frameRatio.h}`;
 
   const label = alt || src?.split(/[\\/]/).pop() || "Image";
 
@@ -853,7 +872,16 @@ function MarkdownImage({ alt, className, "data-obsidian-width": dataWidth, node,
             // them and let the browser render the native broken-image icon.
             if (candidates.length > 0) setState("error");
           }}
-          onLoad={() => setState("ready")}
+          onLoad={(event) => {
+            const img = event.currentTarget;
+            // Fallback ratio lock: if metadata hasn't shown up yet, use the
+            // image's own naturalWidth/Height so the frame stays put when
+            // meta arrives later.
+            if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+              setFrameRatio((prev) => prev ?? { w: img.naturalWidth, h: img.naturalHeight });
+            }
+            setState("ready");
+          }}
         />
         {state === "error" ? (
           <span className="markdown-image-error" role="img" aria-label={`Image failed to load: ${label}`}>

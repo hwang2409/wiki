@@ -142,8 +142,11 @@ export function ImageGallery({ files }: { files: ArtifactFileEntry[] }) {
                 (width) => `${vaultAssetUrl(entry.path, { w: width })} ${width}w`,
               ).join(", ")
             : undefined;
-          const knownRatio = info?.width && info?.height ? info.width / info.height : null;
-          const tileStyle = knownRatio ? { aspectRatio: `${info!.width} / ${info!.height}` } : undefined;
+          // Tiles use a fixed 4/3 ratio locked by CSS — the metadata race is
+          // deliberately not allowed to swap the tile's aspect ratio. The
+          // sharp source is `object-fit: cover` cropped inside that box so
+          // the ratio doesn't matter visually. Real dimensions still flow
+          // through to the lightbox via items[index].width/height.
           const loaded = tileState[index] === "ready";
           const showPreview = previewMounted[index] !== false;
           return (
@@ -152,7 +155,6 @@ export function ImageGallery({ files }: { files: ArtifactFileEntry[] }) {
                 aria-label={`Open ${item.alt} in fullscreen`}
                 className={`artifact-gallery-tile${loaded ? " is-loaded" : ""}`}
                 onClick={() => setOpenIndex(index)}
-                style={tileStyle}
                 type="button"
               >
                 {showPreview && info?.previewBase64 ? (

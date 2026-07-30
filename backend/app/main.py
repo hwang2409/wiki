@@ -696,15 +696,45 @@ def to_summary(path: Path) -> NoteSummary:
 
 
 _IMAGE_EXTENSION_RE = re.compile(r"\.(png|jpe?g|gif|webp|svg)(?:[?#]|$)", re.IGNORECASE)
-_MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(<?([^)\s>]+)>?\)")
+# CommonMark image link: `![alt](destination[ "title"])`. The destination
+# may be wrapped in `<>` (allowing spaces) or a bare token that runs until
+# whitespace or the closing paren. Any following title is stripped.
+_MARKDOWN_IMAGE_RE = re.compile(
+    r"""
+    !\[[^\]]*\]                # ![alt]
+    \(                         # opening paren
+    \s*                        # optional leading whitespace
+    (?:
+        <(?P<angle>[^>\n]*)>   # angle-bracketed path (may contain spaces)
+        |
+        (?P<bare>[^\s()]+)     # bare path — no whitespace, no parens
+    )
+    (?:\s+
+        (?:"[^"]*"             # "title"
+         | '[^']*'             # 'title'
+         | \([^)]*\)           # (title)
+        )
+    )?
+    \s*
+    \)
+    """,
+    re.VERBOSE,
+)
 _OBSIDIAN_EMBED_RE = re.compile(r"!\[\[([^\][|]+?)(?:\|[^\][]*)?\]\]")
 
 
 def _extract_note_image_paths(content: str, note_path: str) -> list[str]:
     """Return de-duplicated vault-relative paths for every image the note
-    references. Skips external URLs and anything without an image extension."""
+    references. Skips external URLs and anything without an image extension.
+
+    Handles CommonMark features the previous regex missed: link titles
+    (`![](path "title")`), angle-bracketed paths with spaces
+    (`![](<my image.png>)`), and percent-encoded characters (`%20`).
+    """
     if not content:
         return []
+    from urllib.parse import unquote
+
     candidates: list[str] = []
     seen: set[str] = set()
 
@@ -715,7 +745,12 @@ def _extract_note_image_paths(content: str, note_path: str) -> list[str]:
         candidates.append(candidate)
 
     def note_relative(target: str) -> list[str]:
-        stripped = target.split("?", 1)[0].split("#", 1)[0].strip()
+        # URL-decode first so `%20` and friends round-trip correctly.
+        try:
+            decoded = unquote(target)
+        except (UnicodeDecodeError, ValueError):
+            decoded = target
+        stripped = decoded.split("?", 1)[0].split("#", 1)[0].strip()
         if not stripped or stripped.startswith("/"):
             return []
         if re.match(r"^[a-z][a-z0-9+.-]*:", stripped, re.IGNORECASE):
@@ -745,7 +780,8 @@ def _extract_note_image_paths(content: str, note_path: str) -> list[str]:
         return results
 
     for match in _MARKDOWN_IMAGE_RE.finditer(content):
-        for candidate in note_relative(match.group(1)):
+        raw = match.group("angle") or match.group("bare") or ""
+        for candidate in note_relative(raw):
             push(candidate)
     for match in _OBSIDIAN_EMBED_RE.finditer(content):
         for candidate in note_relative(match.group(1)):
