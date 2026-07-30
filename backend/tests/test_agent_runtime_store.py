@@ -141,6 +141,28 @@ class ProtocolFixtureTests(unittest.TestCase):
                 EventDisposition.RENDERED,
             ),
             (
+                {"type": "system", "subtype": "thinking_tokens", "estimated_tokens": 42, "estimated_tokens_delta": 4},
+                EventDisposition.SUMMARIZED,
+            ),
+            ({"type": "system", "subtype": "init"}, EventDisposition.RENDERED),
+            ({"type": "system", "subtype": "task_notification"}, EventDisposition.RENDERED),
+            ({"type": "system", "subtype": "task_updated"}, EventDisposition.RENDERED),
+            ({"type": "system", "subtype": "api_retry"}, EventDisposition.RENDERED),
+            (
+                {
+                    "type": "rate_limit_event",
+                    "rate_limit_info": {
+                        "status": "rejected",
+                        "rateLimitType": "five_hour",
+                        "isUsingOverage": False,
+                        "overageStatus": "rejected",
+                        "overageDisabledReason": "out_of_credits",
+                        "resetsAt": 1784910600,
+                    },
+                },
+                EventDisposition.RENDERED,
+            ),
+            (
                 {"type": "attachment", "attachment": {"type": "task_reminder"}},
                 EventDisposition.RENDERED,
             ),
@@ -153,6 +175,16 @@ class ProtocolFixtureTests(unittest.TestCase):
             with self.subTest(payload=payload):
                 normalized = normalize_provider_event(ProviderKind.CLAUDE, payload)
                 self.assertEqual(normalized.disposition, disposition)
+                if payload.get("type") == "system":
+                    self.assertEqual(normalized.kind, f"claude_{payload['subtype']}")
+                elif payload.get("type") == "rate_limit_event":
+                    self.assertEqual(normalized.kind, "claude_rate_limit_event")
+                    self.assertEqual(normalized.payload["status"], "rejected")
+                    self.assertEqual(normalized.payload["rateLimitType"], "five_hour")
+                    self.assertFalse(normalized.payload["isUsingOverage"])
+                    self.assertEqual(normalized.payload["overageStatus"], "rejected")
+                    self.assertEqual(normalized.payload["overageDisabledReason"], "out_of_credits")
+                    self.assertEqual(normalized.payload["resetsAt"], 1784910600)
 
         auth = normalize_provider_event(
             ProviderKind.CODEX,

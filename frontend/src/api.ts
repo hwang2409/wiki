@@ -431,6 +431,48 @@ export type SessionDispositionCounts = {
 export type SessionMeta = {
   custom_title?: string;
   agent_name?: string;
+  thinking_tokens?: {
+    total?: number;
+    estimated_tokens?: number | null;
+    estimated_tokens_delta?: number | null;
+  };
+  rate_limit?: SessionRateLimit;
+};
+
+export type SessionInit = {
+  claude_code_version?: string | null;
+  model?: string | null;
+  output_style?: string | null;
+  cwd?: string | null;
+  mcp_servers?: unknown[];
+  agents?: unknown[];
+  memory_paths?: unknown[];
+  fast_mode_state?: string | null;
+};
+
+export type SessionTaskNotification = {
+  status?: string | null;
+  summary?: string | null;
+  output_file?: string | null;
+  task_id?: string | null;
+  tool_use_id?: string | null;
+};
+
+export type SessionApiRetry = {
+  attempt?: number | null;
+  max_retries?: number | null;
+  error?: unknown;
+  error_status?: string | null;
+  retry_delay_ms?: number | null;
+};
+
+export type SessionRateLimit = {
+  status?: string | null;
+  rateLimitType?: string | null;
+  isUsingOverage?: boolean | null;
+  overageStatus?: string | null;
+  overageDisabledReason?: string | null;
+  resetsAt?: number | null;
 };
 
 export type ProviderStreamEvent = {
@@ -530,7 +572,11 @@ export type SessionEvent = {
     | "pr"
     | "marker"
     | "question"
-    | "artifact";
+    | "artifact"
+    | "claude_init"
+    | "claude_task"
+    | "claude_api_retry"
+    | "claude_rate_limit";
   ts: string | null;
   text: string;
   disposition: SessionDisposition;
@@ -547,6 +593,10 @@ export type SessionEvent = {
   artifact?: SessionArtifact;
   source?: string | null;
   pending_id?: string | null;
+  claude_init?: SessionInit;
+  claude_task?: SessionTaskNotification;
+  claude_api_retry?: SessionApiRetry;
+  claude_rate_limit?: SessionRateLimit;
 };
 
 export type SubagentInfo = {

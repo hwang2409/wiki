@@ -68,6 +68,31 @@ async def _recovery_loop(supervisor: Supervisor, stop: asyncio.Event) -> None:
                 traceback.print_exc()
 
 
+async def _shutdown(
+    server: UnixSupervisorServer,
+    supervisor: Supervisor,
+    tasks: list[asyncio.Task[None] | None],
+    lock: BinaryIO,
+    paths: RuntimePaths,
+) -> None:
+    for task in tasks:
+        if task is not None:
+            task.cancel()
+    pending = [task for task in tasks if task is not None]
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    await server.close()
+    # Release the single-instance lock before the provider drain: the drain
+    # waits on long-lived provider turns, and holding the lock through it
+    # blocks every replacement daemon from binding (WIKI-217).
+    paths.pid_path.unlink(missing_ok=True)
+    try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    finally:
+        lock.close()
+    await supervisor.close()
+
+
 async def run_daemon(args: argparse.Namespace) -> None:
     paths = _paths_from_args(args)
     lock = _acquire_single_instance(paths)
@@ -111,16 +136,7 @@ async def run_daemon(args: argparse.Namespace) -> None:
         )
         await stop.wait()
     finally:
-        for task in (recovery_task, fleet_task):
-            if task is not None:
-                task.cancel()
-        pending = [task for task in (recovery_task, fleet_task) if task is not None]
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-        await server.close()
-        await supervisor.close()
-        paths.pid_path.unlink(missing_ok=True)
-        lock.close()
+        await _shutdown(server, supervisor, [recovery_task, fleet_task], lock, paths)
 
 
 def main() -> None:

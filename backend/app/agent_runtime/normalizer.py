@@ -149,9 +149,13 @@ _CLAUDE_IGNORED_TYPES = {
 }
 _CLAUDE_RENDERED_SYSTEM_SUBTYPES = {
     "api_error",
+    "api_retry",
     "compact_boundary",
+    "init",
     "scheduled_task_fire",
     "stop_hook_summary",
+    "task_notification",
+    "task_updated",
     "turn_duration",
     "informational",
     "local_command",
@@ -164,6 +168,15 @@ _CLAUDE_SUMMARIZED_SYSTEM_SUBTYPES = {
     "hook_response",
     "task_started",
     "task_progress",
+    "thinking_tokens",
+}
+_CLAUDE_RATE_LIMIT_FIELDS = {
+    "status",
+    "rateLimitType",
+    "isUsingOverage",
+    "overageStatus",
+    "overageDisabledReason",
+    "resetsAt",
 }
 
 
@@ -251,6 +264,19 @@ def _normalize_claude(payload: dict[str, Any]) -> NormalizedProviderEvent:
             disposition,
             "claude_attachment",
             payload,
+            state,
+        )
+    if event_type == "rate_limit_event":
+        rate_limit_info = payload.get("rate_limit_info")
+        rate_limit_info = rate_limit_info if isinstance(rate_limit_info, dict) else {}
+        normalized_payload = dict(payload)
+        for field in _CLAUDE_RATE_LIMIT_FIELDS:
+            if field in rate_limit_info:
+                normalized_payload[field] = rate_limit_info[field]
+        return NormalizedProviderEvent(
+            EventDisposition.RENDERED,
+            "claude_rate_limit_event",
+            normalized_payload,
             state,
         )
     if event_type in _CLAUDE_RENDERED_TYPES:
