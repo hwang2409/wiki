@@ -39,43 +39,14 @@ pub(crate) fn probe(
     let ready = retry_until_ready(
         || {
             let expected_executable = expected_backend_executable()?;
-            let authenticated = daemon_handshake::read_authenticated_secret(
+            authenticated_health_secret(
+                &client,
                 runtime_dir,
                 &expected_executable,
                 expected_fingerprint,
+                &label,
+                &health_url,
             )
-            .ok()?;
-            let nonce = health_nonce().ok()?;
-            let response = client
-                .get(&health_url)
-                .header("X-Wiki-Daemon-Nonce", &nonce)
-                .send()
-                .ok()?;
-            if !response.status().is_success() {
-                return None;
-            }
-            let payload = response.json::<serde_json::Value>().ok()?;
-            if payload
-                .get("daemon_managed")
-                .and_then(serde_json::Value::as_bool)
-                != Some(true)
-            {
-                return None;
-            }
-            if payload
-                .get("backend_fingerprint")
-                .and_then(serde_json::Value::as_str)
-                != Some(expected_fingerprint)
-            {
-                return None;
-            }
-            if !health_matches_authenticated_peer(&payload, authenticated.pid, expected_fingerprint)
-                || !health_proof_matches(&payload, &authenticated.secret, &nonce)
-                || daemon_launchd_pid(&label) != Some(authenticated.pid)
-            {
-                return None;
-            }
-            Some(authenticated.secret)
         },
         DAEMON_PROBE_WAIT_TIMEOUT,
         DAEMON_PROBE_POLL_INTERVAL,
@@ -93,19 +64,71 @@ pub(crate) fn refresh_secret(
     runtime_dir: &Path,
     daemon_managed: bool,
     expected_fingerprint: &str,
+    current_origin: &str,
 ) -> Option<String> {
     if !daemon_managed {
         return None;
     }
+    let (label, port) = daemon_connection_settings(runtime_dir).ok()?;
+    if !refresh_origin_matches_saved_port(current_origin, port) {
+        return None;
+    }
+    let launch_url = normalize_launch_url(current_origin);
+    let health_url = health_url_for(&launch_url);
+    let client = Client::builder()
+        .timeout(DAEMON_PROBE_TIMEOUT)
+        .build()
+        .ok()?;
     let expected_executable = expected_backend_executable()?;
-    let authenticated = daemon_handshake::read_authenticated_secret(
+    authenticated_health_secret(
+        &client,
         runtime_dir,
         &expected_executable,
         expected_fingerprint,
+        &label,
+        &health_url,
+    )
+}
+
+fn authenticated_health_secret(
+    client: &Client,
+    runtime_dir: &Path,
+    expected_executable: &Path,
+    expected_fingerprint: &str,
+    label: &str,
+    health_url: &str,
+) -> Option<String> {
+    let authenticated = daemon_handshake::read_authenticated_secret(
+        runtime_dir,
+        expected_executable,
+        expected_fingerprint,
     )
     .ok()?;
-    let (label, _) = daemon_connection_settings(runtime_dir).ok()?;
-    (daemon_launchd_pid(&label) == Some(authenticated.pid)).then_some(authenticated.secret)
+    let nonce = health_nonce().ok()?;
+    let response = client
+        .get(health_url)
+        .header("X-Wiki-Daemon-Nonce", &nonce)
+        .send()
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let payload = response.json::<serde_json::Value>().ok()?;
+    if payload
+        .get("daemon_managed")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+        || payload
+            .get("backend_fingerprint")
+            .and_then(serde_json::Value::as_str)
+            != Some(expected_fingerprint)
+        || !health_matches_authenticated_peer(&payload, authenticated.pid, expected_fingerprint)
+        || !health_proof_matches(&payload, &authenticated.secret, &nonce)
+        || daemon_launchd_pid(label) != Some(authenticated.pid)
+    {
+        return None;
+    }
+    Some(authenticated.secret)
 }
 
 fn daemon_connection_settings(runtime_dir: &Path) -> Result<(String, u16), String> {
@@ -132,6 +155,14 @@ fn daemon_connection_settings(runtime_dir: &Path) -> Result<(String, u16), Strin
         .filter(|port| *port > 0)
         .unwrap_or(DEFAULT_DAEMON_PORT);
     Ok((label, port))
+}
+
+fn origin_port(origin: &str) -> Option<u16> {
+    reqwest::Url::parse(origin).ok()?.port_or_known_default()
+}
+
+fn refresh_origin_matches_saved_port(origin: &str, saved_port: u16) -> bool {
+    origin_port(origin) == Some(saved_port)
 }
 
 fn expected_backend_executable() -> Option<PathBuf> {
@@ -303,7 +334,8 @@ where
 mod tests {
     use super::{
         daemon_connection_settings, daemon_probe_should_wait, health_matches_authenticated_peer,
-        health_proof_matches, retry_until_ready, DAEMON_SETTINGS_NAME,
+        health_proof_matches, refresh_origin_matches_saved_port, retry_until_ready,
+        DAEMON_SETTINGS_NAME,
     };
 
     #[test]
@@ -371,5 +403,17 @@ mod tests {
             ("com.example.wiki.test".to_string(), 9321)
         );
         std::fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn refresh_rejects_new_secret_for_an_old_origin() {
+        assert!(!refresh_origin_matches_saved_port(
+            "http://127.0.0.1:8213/",
+            9321
+        ));
+        assert!(refresh_origin_matches_saved_port(
+            "http://127.0.0.1:9321/",
+            9321
+        ));
     }
 }

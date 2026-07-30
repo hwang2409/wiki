@@ -1772,6 +1772,8 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         ]
         result = await self.supervisor.prepare_handover([record.run_id for record in records])
         self.assertEqual(set(result["drained_run_ids"]), {record.run_id for record in records})
+        retry = await self.supervisor.prepare_handover()
+        self.assertEqual(retry, result)
         await self.supervisor.close()
         replacement = Supervisor(
             RunStore(self.paths),
@@ -1827,7 +1829,6 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             await asyncio.sleep(0.05)
-            self.assertFalse(start_task.done())
             release_snapshot.set()
             result = await asyncio.wait_for(handover_task, timeout=2)
             with self.assertRaisesRegex(StoreConflict, "handover is in progress"):
@@ -1842,6 +1843,69 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             [existing.run_id],
         )
         self.assertIsNone(self.store.current_run_id("WIKI-HANDOVER-BARRIER-NEW"))
+
+    async def test_handover_barrier_defers_send_and_respond_without_stale_writes(
+        self,
+    ) -> None:
+        send_run = await self.supervisor.start_run(
+            agent_id="WIKI-HANDOVER-SEND-RACE",
+            provider=ProviderKind.CLAUDE,
+            role="implement",
+            model="fixture-claude",
+            worktree=str(self.worktree),
+            prompt="send race",
+        )
+        respond_run = await self.supervisor.start_run(
+            agent_id="WIKI-HANDOVER-RESPOND-RACE",
+            provider=ProviderKind.CLAUDE,
+            role="implement",
+            model="fixture-claude",
+            worktree=str(self.worktree),
+            prompt="respond race",
+        )
+        self.store.transition(
+            respond_run.run_id,
+            LifecycleState.WAITING_APPROVAL,
+            adapter_status=AdapterStatus(
+                LifecycleState.WAITING_APPROVAL,
+                "respond-session",
+                os.getpid(),
+                generation=1,
+            ),
+        )
+        snapshot_started = asyncio.Event()
+        release_snapshot = asyncio.Event()
+        original_quiesce = self.supervisor._quiesce_adapter_for_replacement
+
+        async def paused_quiesce(run_id: str, adapter: Any) -> None:
+            snapshot_started.set()
+            await release_snapshot.wait()
+            await original_quiesce(run_id, adapter)
+
+        with mock.patch.object(
+            self.supervisor,
+            "_quiesce_adapter_for_replacement",
+            new=paused_quiesce,
+        ):
+            handover_task = asyncio.create_task(self.supervisor.prepare_handover())
+            await asyncio.wait_for(snapshot_started.wait(), timeout=2)
+            send_task = asyncio.create_task(
+                self.supervisor.send_now(send_run.run_id, "must wait")
+            )
+            respond_task = asyncio.create_task(
+                self.supervisor.respond(respond_run.run_id, "old", {})
+            )
+            await asyncio.sleep(0.05)
+            release_snapshot.set()
+            await asyncio.wait_for(handover_task, timeout=2)
+            with self.assertRaisesRegex(StoreConflict, "handover is in progress"):
+                await send_task
+            with self.assertRaisesRegex(StoreConflict, "handover is in progress"):
+                await respond_task
+
+        current = self.store.get(respond_run.run_id)
+        self.assertEqual(current.state, LifecycleState.WAITING_APPROVAL)
+        self.assertIsNone(current.provider_pid)
 
     async def test_recovery_rechecks_live_orphan_then_resumes_exact_session(
         self,

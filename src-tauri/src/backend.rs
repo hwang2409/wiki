@@ -428,14 +428,27 @@ fn set_app_secret_state(state: &NativeAppState, secret: String) {
     guard.wiki_app_secret = Some(secret);
 }
 
-fn refresh_daemon_secret(state: &NativeAppState) {
-    let daemon_managed = state.inner.lock().unwrap().daemon_managed;
+fn refresh_daemon_secret(state: &NativeAppState) -> bool {
+    let (daemon_managed, current_origin) = {
+        let guard = state.inner.lock().unwrap();
+        (guard.daemon_managed, guard.app_origin.clone())
+    };
+    if !daemon_managed {
+        return true;
+    }
+    let Some(current_origin) = current_origin else {
+        return false;
+    };
     if let Some(secret) = persistent_daemon::refresh_secret(
         &runtime_dir(),
         daemon_managed,
         EXPECTED_BACKEND_FINGERPRINT,
+        &current_origin,
     ) {
         set_app_secret_state(state, secret);
+        true
+    } else {
+        false
     }
 }
 
@@ -750,7 +763,11 @@ fn app_origin(app: &AppHandle) -> Option<String> {
 /// `X-Wiki-App-Secret` header on composer requests. WIKI-148 round 6, Path B.
 #[tauri::command]
 pub fn get_wiki_app_secret(state: tauri::State<'_, NativeAppState>) -> Result<String, String> {
-    refresh_daemon_secret(&state);
+    if !refresh_daemon_secret(&state) {
+        return Err(
+            "daemon origin changed; reload Wiki.app before requesting its secret".to_string(),
+        );
+    }
     let guard = state.inner.lock().unwrap();
     guard
         .wiki_app_secret

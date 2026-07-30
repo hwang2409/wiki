@@ -432,8 +432,9 @@ def swap_native_app(
                 expected_executable=old_executable,
                 expected_fingerprint=old_fingerprint,
             )
-            saved_runs = handover_client.prepare_for_handover()
-            _write_handover_state(handover_state, saved_runs)
+            if not handover_state.is_file():
+                saved_runs = handover_client.prepare_for_handover()
+                _write_handover_state(handover_state, saved_runs)
         _stop_supervisor(
             runtime_dir,
             expected_executable=old_executable,
