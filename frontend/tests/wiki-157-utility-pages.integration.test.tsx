@@ -93,6 +93,49 @@ test("activity page: empty state renders when there are no commits", async () =>
   }
 });
 
+test("activity page: day heading is friendly, status codes are labels", async () => {
+  const today = new Date();
+  const iso = new Date(
+    today.getFullYear(),
+    today.getMonth(),
+    today.getDate(),
+    10,
+    15,
+  ).toISOString();
+  const restore = installFetch(async () =>
+    jsonResponse([
+      {
+        sha: "abcdef1234567890",
+        date: iso,
+        message: "seed",
+        files: [
+          { path: "vault/notes/seed.md", status: "A" },
+          { path: "vault/notes/plan.md", status: "M" },
+          { path: "vault/notes/old.md", status: "D" },
+        ],
+      },
+    ]),
+  );
+  try {
+    render(<ActivityFeed onOpenNote={() => {}} refreshTick={0} />);
+    await waitFor(() => {
+      expect(document.querySelector(".activity-message")).toBeTruthy();
+    });
+    // Day heading is friendly, not raw YYYY-MM-DD.
+    const heading = document.querySelector<HTMLElement>(".activity-day-heading");
+    expect(heading?.textContent ?? "").toMatch(/Today/i);
+    // Status codes A / M / D render as full labels, not single letters.
+    const statuses = Array.from(
+      document.querySelectorAll<HTMLElement>(".activity-file-status"),
+    ).map((el) => el.textContent);
+    expect(statuses).toContain("added");
+    expect(statuses).toContain("modified");
+    expect(statuses).toContain("deleted");
+  } finally {
+    restore();
+  }
+});
+
 test("health page: loading state does NOT read as empty vault", () => {
   render(
     <HealthView
@@ -190,6 +233,28 @@ test("graph page: loading -> data -> canvas/list toggle exists", async () => {
       .map((item) => item.querySelector(".graph-list-name")?.textContent)
       .filter(Boolean);
     expect(ghostLabels).toContain("ghost.md");
+  } finally {
+    restore();
+  }
+});
+
+test("graph page: subtitle counts notes and unresolved targets separately", async () => {
+  const restore = installFetch(async () =>
+    jsonResponse({
+      "notes/a.md": { outgoing: ["notes/b.md"], incoming: [], unresolved: ["future.md"] },
+      "notes/b.md": { outgoing: [], incoming: ["notes/a.md"], unresolved: [] },
+    }),
+  );
+  try {
+    render(<GraphView onOpenNote={() => {}} />);
+    await waitFor(() => {
+      const subtitle = document.querySelector<HTMLElement>(".utility-page-subtitle");
+      expect(subtitle).toBeTruthy();
+      expect(subtitle!.textContent).toContain("2 notes");
+      expect(subtitle!.textContent).toContain("1 unresolved target");
+      // Regression: unresolved must not roll into the note count.
+      expect(subtitle!.textContent).not.toContain("3 notes");
+    });
   } finally {
     restore();
   }

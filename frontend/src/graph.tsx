@@ -101,13 +101,17 @@ export function GraphView({ onOpenNote }: { onOpenNote: (path: string) => void }
   }, []);
 
   const summaries = useMemo(() => (links ? summariseLinks(links) : []), [links]);
-  const nodeCount = summaries.length;
+  // Notes and unresolved targets are separate counts — a wikilink to a note
+  // that does not exist yet is a *target*, not a note in the vault.
+  const noteCount = links ? Object.keys(links).length : 0;
   const unresolvedCount = summaries.filter((node) => node.unresolved).length;
 
   const subtitle =
     links === null
       ? "Note-to-note links across the vault."
-      : `${nodeCount} notes, ${unresolvedCount} unresolved links.`;
+      : `${noteCount} ${noteCount === 1 ? "note" : "notes"} · ${unresolvedCount} unresolved ${
+          unresolvedCount === 1 ? "target" : "targets"
+        }.`;
 
   const actions = (
     <>

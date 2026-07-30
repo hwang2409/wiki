@@ -34,10 +34,13 @@ from typing import Iterable
 # incident 2026-07-08). Losers of the race serve the last persisted snapshot.
 _REFRESH_LOCK = threading.Lock()
 
-CACHE_VERSION = 3  # v2 accumulated every metric to 0 regardless of whether the
-                    # source reported it — hid claude's absent "reasoning" as a
-                    # false zero. v3 records per-bucket `provided` so the API
-                    # can distinguish "reported 0" from "not reported".
+CACHE_VERSION = 4  # v3 zero-filled the cumulative-token path and unioned
+                    # `provided` file-wide, so a mid-session model switch lost
+                    # tokens (input/output nulled to 0 alongside a disappeared
+                    # reasoning field) and plain non-reasoning models still
+                    # advertised reasoning as available. v4 keeps cumulative
+                    # fields optional end-to-end and scopes reasoning
+                    # availability per-model at event time.
 METRIC_KEYS: tuple[str, ...] = ("input", "cached", "output", "reasoning")
 SYNC_REFRESH_MAX_AGE_SECONDS = int(os.environ.get("WIKI_TOKEN_SYNC_MAX_AGE_SECONDS", "15"))
 
@@ -222,37 +225,53 @@ def _codex_apply(state: dict, file_state: dict, row: dict, index: dict) -> None:
     if not isinstance(total, dict):
         return
 
-    cum = {
-        "input": int(total.get("input_tokens") or 0),
-        "cached": int(total.get("cached_input_tokens") or 0),
-        "output": int(total.get("output_tokens") or 0),
-        "reasoning": int(total.get("reasoning_output_tokens") or 0),
-    }
-    # Track which metrics the source actually reported (present-and-not-None)
-    # this event; a missing key means the model does not emit that metric.
-    provided_this = {"input", "cached", "output"}
-    if total.get("reasoning_output_tokens") is not None:
-        provided_this.add("reasoning")
-    existing_provided = set(file_state.get("provided") or [])
-    existing_provided |= provided_this
-    file_state["provided"] = sorted(existing_provided)
+    # Only pick up numeric cumulative fields — never fabricate 0 for a
+    # missing / null entry. WIKI-157 round-3: on a mid-session model switch,
+    # codex frequently drops the reasoning field entirely; the old
+    # `int(... or 0)` path both fake-reported reasoning: 0 AND tripped the
+    # group drop-clamp, zeroing the delta across every co-reported metric
+    # and losing real input / output activity.
+    cum_event: dict[str, int] = {}
+    for src, dst in (
+        ("input_tokens", "input"),
+        ("cached_input_tokens", "cached"),
+        ("output_tokens", "output"),
+        ("reasoning_output_tokens", "reasoning"),
+    ):
+        raw = total.get(src)
+        if isinstance(raw, (int, float)):
+            cum_event[dst] = int(raw)
+    if not cum_event:
+        return
 
-    prev = file_state.get("cum")
-    if prev is None:
-        delta = cum
-    else:
-        # A resumed session's counters restart from 0. If ANY counter went
-        # down, treat as a re-anchor: emit zero delta this event across all
-        # fields, adopt the new cumulative as the baseline. (Counters that
-        # didn't move backwards are still zeroed for the reset event — codex
-        # ships them as a group and mixing pre/post-resume deltas
-        # over-attributes.)
-        drops = any(cum[k] < prev.get(k, 0) for k in cum)
-        if drops:
-            delta = {k: 0 for k in cum}
+    prev: dict[str, int] = file_state.get("cum") or {}
+    delta: dict[str, int] = {}
+    for k, v in cum_event.items():
+        p = prev.get(k)
+        if p is None:
+            # First appearance of this metric on this file — cumulative IS
+            # the delta.
+            delta[k] = v
+        elif v < p:
+            # Per-metric re-anchor (resume/rotate). Zero this metric only —
+            # co-reported metrics that continued to advance still contribute.
+            delta[k] = 0
         else:
-            delta = {k: cum[k] - prev.get(k, 0) for k in cum}
-    file_state["cum"] = cum
+            delta[k] = v - p
+
+    # Availability semantics per model (round-3 review): a plain
+    # non-reasoning model that ships reasoning_output_tokens: 0 is *not*
+    # actually reasoning — don't advertise the metric. Only mark reasoning
+    # available once the model has actually accrued reasoning tokens.
+    provided = {"input", "cached", "output"} & set(cum_event)
+    if cum_event.get("reasoning", 0) > 0:
+        provided.add("reasoning")
+
+    # Persist the new cumulative — absent fields retain their prior last
+    # value so a later event that re-includes them still diffs correctly.
+    merged = dict(prev)
+    merged.update(cum_event)
+    file_state["cum"] = merged
 
     _add_delta(
         state,
@@ -260,7 +279,7 @@ def _codex_apply(state: dict, file_state: dict, row: dict, index: dict) -> None:
         "codex",
         file_state.get("model"),
         delta,
-        provided=existing_provided,
+        provided=provided,
         index=index,
     )
 

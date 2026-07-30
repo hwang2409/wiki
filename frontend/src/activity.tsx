@@ -23,6 +23,51 @@ function timeOf(iso: string) {
   return iso.slice(11, 16);
 }
 
+const DAY_FORMATTER = new Intl.DateTimeFormat(undefined, {
+  weekday: "long",
+  month: "long",
+  day: "numeric",
+});
+
+const DAY_FORMATTER_WITH_YEAR = new Intl.DateTimeFormat(undefined, {
+  weekday: "long",
+  month: "long",
+  day: "numeric",
+  year: "numeric",
+});
+
+function formatDayLabel(day: string, now: Date): string {
+  // `day` is the YYYY-MM-DD prefix of the commit timestamp; the commits
+  // come pre-sorted by ISO date, so parsing the naive date at midnight
+  // local time is enough for the Today / Yesterday buckets.
+  const parts = day.split("-").map(Number);
+  if (parts.length !== 3 || parts.some(Number.isNaN)) return day;
+  const bucket = new Date(parts[0], parts[1] - 1, parts[2]);
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const diffMs = today.getTime() - bucket.getTime();
+  const diffDays = Math.round(diffMs / (24 * 60 * 60 * 1000));
+  if (diffDays === 0) return `Today · ${DAY_FORMATTER.format(bucket)}`;
+  if (diffDays === 1) return `Yesterday · ${DAY_FORMATTER.format(bucket)}`;
+  const formatter =
+    bucket.getFullYear() === today.getFullYear() ? DAY_FORMATTER : DAY_FORMATTER_WITH_YEAR;
+  return formatter.format(bucket);
+}
+
+const STATUS_LABELS: Record<string, string> = {
+  A: "added",
+  M: "modified",
+  D: "deleted",
+  R: "renamed",
+  C: "copied",
+  T: "type-changed",
+  U: "unmerged",
+};
+
+function formatStatus(status: string): string {
+  const key = (status ?? "").trim().slice(0, 1).toUpperCase();
+  return STATUS_LABELS[key] ?? status ?? "changed";
+}
+
 function DiffView({ sha }: { sha: string }) {
   const [patch, setPatch] = useState<string | null>(null);
   const [error, setError] = useState(false);
@@ -157,12 +202,13 @@ function ActivityBody({
       byDay.push({ day, commits: [commit] });
     }
   }
+  const now = new Date();
 
   return (
     <div className="activity-feed">
       {byDay.map(({ day, commits: dayCommits }) => (
         <section className="activity-day" key={day}>
-          <h2 className="activity-day-heading">{day}</h2>
+          <h2 className="activity-day-heading">{formatDayLabel(day, now)}</h2>
           {dayCommits.map((commit) => {
             const isOpen = expanded.has(commit.sha);
             const shortSha = commit.sha.slice(0, 7);
@@ -203,7 +249,12 @@ function ActivityBody({
                       >
                         <FileText size={11} />
                         <span>{basename(file.path)}</span>
-                        <span className="activity-file-status">{file.status}</span>
+                        <span
+                          className="activity-file-status"
+                          title={`status: ${file.status}`}
+                        >
+                          {formatStatus(file.status)}
+                        </span>
                       </button>
                     );
                   })}

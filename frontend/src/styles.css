@@ -3871,9 +3871,9 @@ body.is-resizing-panes .pane-cell {
 
 .activity-file-status {
   color: var(--text-faint);
-  font-family: var(--font-monospace);
-  font-weight: var(--font-monospace-weight);
   font-size: 0.9em;
+  font-variant: small-caps;
+  letter-spacing: 0.02em;
 }
 
 .activity-diff-empty {

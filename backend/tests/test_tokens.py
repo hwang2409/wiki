@@ -88,6 +88,31 @@ def _codex_token_row(ts: str, cum: dict[str, int]) -> dict:
     }
 
 
+def _codex_token_row_partial(ts: str, cum: dict[str, int]) -> dict:
+    """Like `_codex_token_row` but emits ONLY the keys present in `cum`.
+
+    Simulates a codex event that ships an incomplete `total_token_usage` —
+    e.g. a plain non-reasoning model whose event drops the reasoning field
+    entirely on a mid-session model switch.
+    """
+    field_by_metric = {
+        "input": "input_tokens",
+        "cached": "cached_input_tokens",
+        "output": "output_tokens",
+        "reasoning": "reasoning_output_tokens",
+    }
+    total = {field_by_metric[k]: v for k, v in cum.items() if k in field_by_metric}
+    total["total_tokens"] = sum(cum.values())
+    return {
+        "timestamp": ts,
+        "type": "event_msg",
+        "payload": {
+            "type": "token_count",
+            "info": {"total_token_usage": total},
+        },
+    }
+
+
 def _codex_turn_context(ts: str, model: str) -> dict:
     return {"timestamp": ts, "type": "turn_context", "payload": {"model": model}}
 
@@ -494,6 +519,76 @@ class MetricAvailabilityTests(unittest.TestCase):
             tokens.refresh()
             series = tokens.query()["buckets"][0]["series"]["codex/gpt-5.4"]
             self.assertEqual(series["reasoning"], 12)
+
+    def test_model_switch_preserves_input_output_when_reasoning_disappears(self) -> None:
+        """Round-3 regression: a mid-session model switch drops the reasoning
+        field from `total_token_usage`; the old code zero-filled it, tripped
+        the group drop-clamp, and lost the co-reported input / output delta.
+        """
+        with _EnvOverride() as paths:
+            from backend.app import tokens
+
+            day = paths["codex"] / "2026/07/08"
+            rows = [
+                _codex_session_meta("2026-07-08T18:00:00Z", "o1"),
+                _codex_token_row(
+                    "2026-07-08T18:00:10Z",
+                    {"input": 100, "output": 20, "reasoning": 5},
+                ),
+                _codex_turn_context("2026-07-08T18:05:00Z", "gpt-5.4"),
+                # Non-reasoning model omits the reasoning field entirely;
+                # cumulative counters keep advancing on the fields it does
+                # emit — this delta must still land, not vanish.
+                _codex_token_row_partial(
+                    "2026-07-08T18:10:00Z",
+                    {"input": 200, "output": 40},
+                ),
+            ]
+            _write_jsonl(day / "rollout-switch.jsonl", rows)
+            tokens.refresh()
+            response = tokens.query()
+            totals = response["totals"]
+            # Reasoning delta from the first event survives; input / output
+            # get the full run:  first (100/20) + switch (100/20) = 200 / 40.
+            self.assertEqual(totals["input"], 200)
+            self.assertEqual(totals["output"], 40)
+            self.assertEqual(totals["reasoning"], 5)
+
+            # The non-reasoning model does NOT advertise reasoning in its
+            # own bucket, even though the file's earlier model did.
+            per_series_reasoning = {}
+            for bucket in response["buckets"]:
+                for key, values in bucket["series"].items():
+                    per_series_reasoning.setdefault(key, set()).add("reasoning" in values)
+            self.assertEqual(per_series_reasoning["codex/gpt-5.4"], {False})
+            self.assertEqual(per_series_reasoning["codex/o1"], {True})
+
+    def test_plain_non_reasoning_model_never_marks_reasoning_available(self) -> None:
+        with _EnvOverride() as paths:
+            from backend.app import tokens
+
+            day = paths["codex"] / "2026/07/08"
+            # A plain model that ships reasoning_output_tokens: 0 across the
+            # whole session — must NOT be treated as a reasoning model.
+            _write_jsonl(
+                day / "rollout-plain.jsonl",
+                [
+                    _codex_session_meta("2026-07-08T18:00:00Z", "gpt-5.4"),
+                    _codex_token_row(
+                        "2026-07-08T18:00:10Z",
+                        {"input": 100, "output": 20, "reasoning": 0},
+                    ),
+                    _codex_token_row(
+                        "2026-07-08T18:05:00Z",
+                        {"input": 300, "output": 60, "reasoning": 0},
+                    ),
+                ],
+            )
+            tokens.refresh()
+            response = tokens.query()
+            series = response["buckets"][0]["series"]["codex/gpt-5.4"]
+            self.assertNotIn("reasoning", series)
+            self.assertNotIn("reasoning", response["totals"])
 
     def test_mixed_sources_take_union_of_availability(self) -> None:
         with _EnvOverride() as paths:
