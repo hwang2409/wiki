@@ -96,12 +96,26 @@ VAULT_DIR.mkdir(parents=True, exist_ok=True)
 PROVIDER_HEALTH = provider_health.ProviderHealthTracker()
 
 
+def _rebase_bot_notification_sender(target: str, text: str) -> None:
+    """Send one rebase result through the configured agent message path."""
+
+    # Local test processes must inject a recorder.  They must not use the
+    # operator channel by default.
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return
+    agent_message(
+        target,
+        MessageIn(text=text, mode="now", source="rebase-bot"),
+        BackgroundTasks(),
+    )
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     runtime_paths = RuntimePaths.from_env()
     from .agent_runtime import rebase_bot
 
-    rebase_bot.resume_pending_jobs()
+    rebase_bot.resume_pending_jobs(notify=_rebase_bot_notification_sender)
     configured_backend = os.environ.get("WIKI_BACKEND_URL")
     if configured_backend:
         backend_runtime.publish_backend_url(configured_backend)
@@ -4137,6 +4151,7 @@ def rebase_dirty_pr_route(body: RebaseDirtyPrIn) -> dict[str, Any]:
         pr_number=body.pr_number,
         ticket=body.ticket,
         worker_id=body.worker_id,
+        notify=_rebase_bot_notification_sender,
     )
 
 

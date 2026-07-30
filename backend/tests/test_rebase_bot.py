@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -10,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from backend.app import main
 from backend.app.agent_runtime import rebase_bot
 from backend.app.agent_runtime.rebase_bot import RebaseError
 from backend.app.rebase_schema import RebaseDirtyPrIn, mcp_input_schema
@@ -147,14 +149,17 @@ class RebaseBotTests(unittest.TestCase):
                 )
         helper.assert_not_called()
 
-    def test_mechanical_import_conflict_resolves(self) -> None:
+    def test_import_conflict_escalates_without_push(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             worktree = _conflicting_repo(Path(raw))
+            before = _run(worktree, "git", "rev-parse", "HEAD").stdout.strip()
             result = rebase_bot.run_rebase_helper(
                 worktree, smoke_commands=[], push=False
             )
-        self.assertEqual(result["status"], "resolved")
-        self.assertEqual(result["resolved_files"], ["fixture.py"])
+            after = _run(worktree, "git", "rev-parse", "HEAD").stdout.strip()
+        self.assertEqual(result["status"], "escalated")
+        self.assertEqual(before, after)
+        self.assertEqual(result["resolved_files"], [])
 
     def test_import_replacements_and_reorders_escalate(self) -> None:
         replacement = (
@@ -173,7 +178,7 @@ class RebaseBotTests(unittest.TestCase):
             self.assertFalse(rebase_bot.resolve_conflict_file(replacement_path)[0])
             self.assertFalse(rebase_bot.resolve_conflict_file(reordered_path)[0])
 
-    def test_import_additions_use_the_merge_base(self) -> None:
+    def test_import_additions_escalate_even_with_a_merge_base(self) -> None:
         conflict = (
             "<<<<<<< ours\nimport base\nimport ours\n||||||| base\n"
             "import base\n=======\nimport base\nimport theirs\n>>>>>>> theirs\n"
@@ -183,22 +188,16 @@ class RebaseBotTests(unittest.TestCase):
             path.write_text(conflict, encoding="utf-8")
             resolved, _detail = rebase_bot.resolve_conflict_file(path)
             content = path.read_text(encoding="utf-8")
-        self.assertTrue(resolved)
-        self.assertEqual(content, "import base\nimport ours\nimport theirs\n")
+        self.assertFalse(resolved)
+        self.assertEqual(content, conflict)
 
-    def test_whitespace_changes_escalate_without_formatter(self) -> None:
-        formatter_calls: list[tuple[Path, list[str]]] = []
-
-        def formatter(worktree: Path, files: list[str]) -> None:
-            formatter_calls.append((worktree, list(files)))
-
+    def test_trailing_whitespace_changes_escalate(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             worktree = _conflicting_repo(Path(raw), whitespace=True)
             result = rebase_bot.run_rebase_helper(
-                worktree, smoke_commands=[], formatter=formatter, push=False
+                worktree, smoke_commands=[], push=False
             )
         self.assertEqual(result["status"], "escalated")
-        self.assertEqual(formatter_calls, [])
 
     def test_dirty_gate_routes_status_specific_messages_without_override(self) -> None:
         messages: list[tuple[str, str]] = []
@@ -225,11 +224,6 @@ class RebaseBotTests(unittest.TestCase):
                 {"worktree": tempfile.gettempdir(), "orch": "wiki"},
             ),
             _read_agent_registry=lambda: {},
-            MessageIn=lambda **kwargs: SimpleNamespace(**kwargs),
-            BackgroundTasks=lambda: object(),
-            agent_message=lambda target, message, _tasks: messages.append(
-                (target, message.text)
-            ),
         )
 
         with (
@@ -250,6 +244,7 @@ class RebaseBotTests(unittest.TestCase):
                         }
                     },
                     helper=lambda _worktree: results.pop(0),
+                    notify=lambda target, text: messages.append((target, text)),
                 )
                 self.assertEqual(result["status"], expected_status)
 
@@ -258,15 +253,72 @@ class RebaseBotTests(unittest.TestCase):
         self.assertNotIn("escalated", messages[0][1])
         self.assertIn("rebase-bot escalated", messages[1][1])
 
-    def test_missing_ruff_escalates_instead_of_silently_skipping_format(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
-            worktree = _conflicting_repo(Path(raw), whitespace=True)
-            with mock.patch.object(rebase_bot.shutil, "which", return_value=None):
-                result = rebase_bot.run_rebase_helper(
-                    worktree, smoke_commands=[], push=False
+    def test_injected_test_notifier_records_without_backend_send(self) -> None:
+        notifications: list[tuple[str, str]] = []
+        fake_main = SimpleNamespace(
+            _registry_agent=lambda _registry, _worker: (
+                "WIKI-175-IMPL",
+                {},
+                {"worktree": tempfile.gettempdir(), "orch": "wiki"},
+            ),
+            _read_agent_registry=lambda: {},
+            agent_message=mock.Mock(side_effect=AssertionError("live send")),
+        )
+
+        with (
+            mock.patch.object(rebase_bot, "_main", return_value=fake_main),
+            mock.patch.object(rebase_bot, "_validate_pr_binding"),
+        ):
+            result = rebase_bot.rebase_dirty_pr(
+                175,
+                "WIKI-175",
+                "WIKI-175-IMPL",
+                gate=lambda _pr: {
+                    "raw": {
+                        "mergeable": "CONFLICTING",
+                        "repo": "hwang2409/wiki",
+                        "head_ref_name": "feature",
+                        "head_sha": "notify-test",
+                    }
+                },
+                helper=lambda _worktree: {
+                    "status": "resolved",
+                    "head_sha": "notify-test",
+                    "resolved_files": [],
+                    "escalated_hunks": [],
+                },
+                notify=lambda target, text: notifications.append((target, text)),
+            )
+        self.assertEqual(result["status"], "resolved")
+        self.assertEqual(len(notifications), 1)
+        fake_main.agent_message.assert_not_called()
+
+    def test_pytest_default_sender_does_not_touch_live_channel(self) -> None:
+        with (
+            mock.patch.dict(os.environ, {"PYTEST_CURRENT_TEST": "rebase-test"}),
+            mock.patch.object(main, "agent_message") as send,
+        ):
+            main._rebase_bot_notification_sender("wiki", "test notification")
+        send.assert_not_called()
+
+    def test_duplicate_logical_notification_is_sent_once(self) -> None:
+        sent: list[tuple[str, str]] = []
+        result = {
+            "status": "resolved",
+            "head_sha": "same-sha",
+            "resolved_files": [],
+            "escalated_hunks": [],
+        }
+        with mock.patch.object(rebase_bot, "_NOTIFIED_RESULTS", set()):
+            for _ in range(5):
+                rebase_bot._escalate_to_orchestrator(
+                    "WIKI-175-IMPL",
+                    "wiki",
+                    result,
+                    lambda target, text: sent.append((target, text)),
+                    "same-event",
                 )
-        self.assertEqual(result["status"], "escalated")
-        self.assertIn("fixture.py", result["escalated_hunks"][0])
+        self.assertEqual(len(sent), 1)
 
     def test_binding_allows_worktree_without_upstream(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -320,6 +372,8 @@ class RebaseBotTests(unittest.TestCase):
     def test_production_code_has_no_verification_bypass(self) -> None:
         source = Path(rebase_bot.__file__).read_text(encoding="utf-8")
         self.assertNotIn("--no-verify", source)
+        self.assertNotIn("import ordering", source)
+        self.assertNotIn("_mechanical_resolution", source)
 
     def test_semantic_conflict_aborts_without_push(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -346,34 +400,77 @@ class RebaseBotTests(unittest.TestCase):
             self.assertIn("MODE = 'ours'", detail or "")
             self.assertEqual(path.read_text(encoding="utf-8"), original)
 
-    def test_whitespace_comparison_keeps_string_contents(self) -> None:
-        self.assertTrue(
-            rebase_bot._is_whitespace_only(['value = "a b"\n'], ['value = "a b"\r\n'])
+    def test_line_ending_only_resolution_preserves_string_contents(self) -> None:
+        conflict = (
+            '<<<<<<< ours\r\nvalue = "a b   "\r\n'
+            '=======\nvalue = "a b   "\n>>>>>>> theirs\r\n'
         )
-        self.assertFalse(
-            rebase_bot._is_whitespace_only(['value = "a b"\n'], ['value = "ab"\n'])
-        )
-        self.assertFalse(
-            rebase_bot._is_whitespace_only(
-                ['value = "text   "\n'], ['value = "text"\n']
-            )
-        )
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "fixture.py"
+            path.write_bytes(conflict.encode("utf-8"))
+            resolved, detail = rebase_bot.resolve_conflict_file(path)
+            content = path.read_text(encoding="utf-8")
+        self.assertTrue(resolved)
+        self.assertIsNone(detail)
+        self.assertEqual(content, 'value = "a b   "\n')
 
-    def test_formatter_exception_restores_original_clean_state(self) -> None:
+    def test_marker_size_bypass_escalates(self) -> None:
+        conflict = (
+            "<<<<<<<< ours\nvalue = 1\n=======\nvalue = 1\n"
+            ">>>>>>> theirs\n"
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "fixture.py"
+            path.write_text(conflict, encoding="utf-8")
+            resolved, detail = rebase_bot.resolve_conflict_file(path)
+            content = path.read_text(encoding="utf-8")
+        self.assertFalse(resolved)
+        self.assertIn("malformed conflict marker", detail or "")
+        self.assertEqual(content, conflict)
+
+    def test_filename_is_not_interpreted_as_a_lockfile_option(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            worktree = Path(raw)
+            with mock.patch.object(rebase_bot.subprocess, "run") as run:
+                detail = rebase_bot._regenerate_lockfile(
+                    worktree, "--exclude=evil.py"
+                )
+        self.assertIn("no lockfile generator", detail or "")
+        run.assert_not_called()
+
+    def test_pushurl_bypass_escalates_before_push(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            worktree = _conflicting_repo(Path(raw))
+            _run(
+                worktree,
+                "git",
+                "remote",
+                "set-url",
+                "--push",
+                "origin",
+                "https://attacker.invalid/repo.git",
+            )
+            self.assertIn(
+                "pushurl differs",
+                rebase_bot._push_destination_error(worktree) or "",
+            )
+
+    def test_parser_exception_restores_original_clean_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             worktree = _conflicting_repo(Path(raw))
             before = _run(worktree, "git", "rev-parse", "HEAD").stdout.strip()
-
-            def formatter(_worktree: Path, _files: list[str]) -> None:
-                raise RuntimeError("formatter crashed")
-
-            result = rebase_bot.run_rebase_helper(
-                worktree, smoke_commands=[], formatter=formatter, push=False
-            )
+            with mock.patch.object(
+                rebase_bot,
+                "resolve_conflict_file",
+                side_effect=RuntimeError("parser crashed"),
+            ):
+                result = rebase_bot.run_rebase_helper(
+                    worktree, smoke_commands=[], push=False
+                )
             after = _run(worktree, "git", "rev-parse", "HEAD").stdout.strip()
             status = _run(worktree, "git", "status", "--porcelain").stdout
         self.assertEqual(result["status"], "escalated")
-        self.assertIn("formatter crashed", result["escalated_hunks"][0])
+        self.assertIn("parser crashed", result["escalated_hunks"][0])
         self.assertEqual(before, after)
         self.assertEqual(status, "")
 
@@ -395,21 +492,45 @@ class RebaseBotTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["cwd"], str(lockfile.parent))
         self.assertEqual(run.call_args.args[0][0], "npm")
 
+    def test_conflicted_lockfile_is_deleted_before_regeneration(self) -> None:
+        calls: list[list[str]] = []
+        conflict_reads = 0
+
+        def git(_worktree: Path, args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            nonlocal conflict_reads
+            calls.append(args)
+            if args[:3] == ["diff", "--name-only", "--diff-filter=U"]:
+                conflict_reads += 1
+                output = "frontend/package-lock.json\n" if conflict_reads == 1 else ""
+                return subprocess.CompletedProcess([], 0, output, "")
+            if args[0] == "merge":
+                return subprocess.CompletedProcess([], 1, "", "conflict")
+            return subprocess.CompletedProcess([], 0, "sha\n" if args[:2] == ["rev-parse", "HEAD"] else "", "")
+
+        with tempfile.TemporaryDirectory() as raw:
+            with (
+                mock.patch.object(rebase_bot, "_git", side_effect=git),
+                mock.patch.object(rebase_bot, "_regenerate_lockfile", return_value=None) as regenerate,
+            ):
+                result = rebase_bot.run_rebase_helper(
+                    Path(raw), smoke_commands=[], push=False
+                )
+        self.assertEqual(result["status"], "resolved")
+        self.assertIn(["rm", "-f", "--", "frontend/package-lock.json"], calls)
+        regenerate.assert_called_once_with(Path(raw).resolve(), "frontend/package-lock.json")
+
     def test_result_outbox_persists_failed_delivery_and_retries(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             delivered: list[str] = []
             should_fail = True
 
-            def send(_target: str, message: object, _tasks: object) -> None:
+            def send(_target: str, message: str) -> None:
                 if should_fail:
                     raise RuntimeError("orchestrator unavailable")
-                delivered.append(message.text)
+                delivered.append(message)
 
             fake_main = SimpleNamespace(
                 AGENT_RUNTIME_DIR=raw,
-                MessageIn=lambda **kwargs: SimpleNamespace(**kwargs),
-                BackgroundTasks=lambda: object(),
-                agent_message=send,
             )
             job = rebase_bot._RebaseJob(
                 job_id="durable-test",
@@ -434,14 +555,14 @@ class RebaseBotTests(unittest.TestCase):
                 rebase_bot._OUTBOX.clear()
                 rebase_bot._persist_job(job, result)
                 rebase_bot._enqueue_result(job, result)
-                rebase_bot._flush_outbox()
+                rebase_bot._flush_outbox(send)
                 pending = json.loads(
                     (Path(raw) / "rebase-bot" / "outbox.json").read_text(
                         encoding="utf-8"
                     )
                 )
                 should_fail = False
-                rebase_bot._flush_outbox()
+                rebase_bot._flush_outbox(send)
         self.assertEqual(pending["durable-test:result"]["attempts"], 1)
         self.assertEqual(delivered, ["rebase-bot escalated WIKI-175-IMPL: semantic"])
 
@@ -505,13 +626,21 @@ class RebaseBotTests(unittest.TestCase):
                 rebase_bot, "_run_rebase_helper_checked", side_effect=slow_run
             ):
                 first = rebase_bot.rebase_dirty_pr(
-                    175, "WIKI-175", "WIKI-175-IMPL", gate=gate
+                    175,
+                    "WIKI-175",
+                    "WIKI-175-IMPL",
+                    gate=gate,
+                    notify=lambda _target, _text: None,
                 )
                 self.assertEqual(first["status"], "started")
                 self.assertTrue(started.wait(timeout=2))
                 # The retry returns immediately and cannot start another merge.
                 second = rebase_bot.rebase_dirty_pr(
-                    175, "WIKI-175", "WIKI-175-IMPL", gate=gate
+                    175,
+                    "WIKI-175",
+                    "WIKI-175-IMPL",
+                    gate=gate,
+                    notify=lambda _target, _text: None,
                 )
                 release.set()
                 self.assertTrue(finished.wait(timeout=2))
@@ -522,13 +651,18 @@ class RebaseBotTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             worktree = _conflicting_repo(Path(raw))
             before = _run(worktree, "git", "rev-parse", "HEAD").stdout.strip()
-            result = rebase_bot.run_rebase_helper(
-                worktree,
-                smoke_commands=[
-                    ([sys.executable, "-c", "raise SystemExit(3)"], worktree)
-                ],
-                push=True,
-            )
+            def resolve(path: Path) -> tuple[bool, str | None]:
+                path.write_text("import ours\n", encoding="utf-8")
+                return True, None
+
+            with mock.patch.object(rebase_bot, "resolve_conflict_file", side_effect=resolve):
+                result = rebase_bot.run_rebase_helper(
+                    worktree,
+                    smoke_commands=[
+                        ([sys.executable, "-c", "raise SystemExit(3)"], worktree)
+                    ],
+                    push=True,
+                )
             after = _run(worktree, "git", "rev-parse", "HEAD").stdout.strip()
         self.assertEqual(result["status"], "escalated")
         self.assertEqual(before, after)
