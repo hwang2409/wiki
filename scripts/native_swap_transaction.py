@@ -18,7 +18,11 @@ from typing import Callable
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from backend.app import daemon as backend_daemon
-from backend.app.agent_runtime.client import SupervisorClient, SupervisorUnavailable
+from backend.app.agent_runtime.client import (
+    SupervisorClient,
+    SupervisorRemoteError,
+    SupervisorUnavailable,
+)
 from backend.app.agent_runtime.store import RuntimePaths
 from backend.app.native_lifecycle import (
     NativeRuntimeLockError,
@@ -33,6 +37,11 @@ RestartDaemon = Callable[[Path, Path, Path], bool]
 UninstallDaemon = Callable[[Path, Path, Path], None]
 StartSupervisor = Callable[[Path, Path, Path], None]
 _HANDOVER_STATES = frozenset({"working", "waiting-approval", "idle"})
+_IDENTITY_RPC_TIMEOUT_SECONDS = 2.0
+_HANDOVER_RPC_TIMEOUT_SECONDS = 120.0
+_HANDOVER_RESULT_TIMEOUT_SECONDS = 30.0
+_SUPERVISOR_STARTUP_TIMEOUT_SECONDS = 15.0
+_DEFAULT_APPROVAL_RECOVERY_TIMEOUT_SECONDS = 30.0
 
 
 def _uninstall_daemon(live_bundle: Path, runtime_dir: Path, repo_root: Path) -> None:
@@ -86,7 +95,7 @@ def _supervisor_identity(
     if pid is None:
         raise RuntimeError("supervisor lock is held but supervisor.pid is missing")
     paths = RuntimePaths.from_env({"WIKI_AGENT_RUNTIME_DIR": str(runtime_dir)})
-    client = SupervisorClient(paths, timeout=2.0)
+    client = SupervisorClient(paths, timeout=_IDENTITY_RPC_TIMEOUT_SECONDS)
     deadline = time.monotonic() + timeout
     while True:
         if _supervisor_pid(runtime_dir) != pid or _supervisor_lock_is_free(runtime_dir):
@@ -115,7 +124,13 @@ def _supervisor_identity(
                     executable, expected_executable
                 ):
                     raise RuntimeError("supervisor executable does not match the live bundle")
-            return client, pid, health
+            # Identity checks stay short. Handover is a mutating RPC and can
+            # drain a full fleet, so callers use a separate long-lived client.
+            return (
+                SupervisorClient(paths, timeout=_HANDOVER_RPC_TIMEOUT_SECONDS),
+                pid,
+                health,
+            )
         except SupervisorUnavailable as exc:
             if time.monotonic() >= deadline:
                 raise RuntimeError(
@@ -139,6 +154,71 @@ def _supervisor_lock_is_free(runtime_dir: Path) -> bool:
             except OSError:
                 pass
     return True
+
+
+def _handover_is_ambiguous(error: Exception) -> bool:
+    if isinstance(error, SupervisorUnavailable):
+        return "timed out" in str(error).lower()
+    return (
+        isinstance(error, SupervisorRemoteError)
+        and error.error_type == "StoreConflict"
+        and "handover" in str(error).lower()
+    )
+
+
+def _prepare_handover(
+    client: SupervisorClient,
+    runtime_dir: Path,
+    pid: int,
+    *,
+    timeout: float = _HANDOVER_RESULT_TIMEOUT_SECONDS,
+) -> list[dict[str, object]]:
+    """Resolve an ambiguous handover without leaving the old supervisor drained."""
+
+    try:
+        return client.prepare_for_handover()
+    except (SupervisorRemoteError, SupervisorUnavailable) as error:
+        if not _handover_is_ambiguous(error):
+            raise
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _supervisor_pid(runtime_dir) != pid or _supervisor_lock_is_free(runtime_dir):
+            raise RuntimeError("supervisor identity changed during handover recovery")
+        try:
+            return client.prepare_for_handover()
+        except (SupervisorRemoteError, SupervisorUnavailable) as error:
+            if not _handover_is_ambiguous(error):
+                raise
+        time.sleep(0.05)
+    raise RuntimeError(
+        "supervisor handover result was not available before the recovery deadline"
+    )
+
+
+def _approval_recovery_timeout_seconds() -> float:
+    raw = os.environ.get("WIKI_APPROVAL_RECOVERY_TIMEOUT_SECONDS")
+    if raw is not None:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = _DEFAULT_APPROVAL_RECOVERY_TIMEOUT_SECONDS
+        if value >= 0:
+            return value
+    return _DEFAULT_APPROVAL_RECOVERY_TIMEOUT_SECONDS
+
+
+def _handover_wait_timeout(runs: list[dict[str, object]]) -> float:
+    """Allow sequential approval recovery for every saved approval run."""
+
+    approval_runs = sum(
+        bool(run.get("pending_request"))
+        or run.get("state") == "waiting-approval"
+        for run in runs
+    )
+    return _SUPERVISOR_STARTUP_TIMEOUT_SECONDS + (
+        approval_runs * _approval_recovery_timeout_seconds()
+    )
 
 
 def _stop_supervisor(
@@ -319,10 +399,12 @@ def _wait_for_handover(
     runtime_dir: Path,
     runs: list[dict[str, object]],
     *,
-    timeout: float = 15.0,
+    timeout: float | None = None,
 ) -> None:
     if not runs:
         return
+    if timeout is None:
+        timeout = _handover_wait_timeout(runs)
     paths = RuntimePaths.from_env({"WIKI_AGENT_RUNTIME_DIR": str(runtime_dir)})
     client = SupervisorClient(paths, timeout=2.0)
     deadline = time.monotonic() + timeout
@@ -427,7 +509,7 @@ def swap_native_app(
             else []
         )
         if not _supervisor_lock_is_free(runtime_dir):
-            handover_client, _pid, _health = _supervisor_identity(
+            handover_client, handover_pid, _health = _supervisor_identity(
                 runtime_dir,
                 expected_executable=old_executable,
                 expected_fingerprint=old_fingerprint,
@@ -435,7 +517,11 @@ def swap_native_app(
             # A live supervisor owns the current run state. Always take a new
             # snapshot before stopping it. A journal is only authoritative
             # when no supervisor can provide a newer snapshot.
-            saved_runs = handover_client.prepare_for_handover()
+            saved_runs = _prepare_handover(
+                handover_client,
+                runtime_dir,
+                handover_pid,
+            )
             _write_handover_state(handover_state, saved_runs)
         _stop_supervisor(
             runtime_dir,
@@ -491,7 +577,11 @@ def swap_native_app(
 
         if handover_started:
             try:
-                _wait_for_handover(runtime_dir, saved_runs)
+                _wait_for_handover(
+                    runtime_dir,
+                    saved_runs,
+                    timeout=_handover_wait_timeout(saved_runs),
+                )
             except Exception as handover_error:
                 new_executable = _bundle_backend_executable(live_bundle)
                 new_fingerprint = _bundle_backend_fingerprint(
@@ -513,7 +603,11 @@ def swap_native_app(
                         restart(live_bundle, runtime_dir, repo_root)
                         start_supervisor(live_bundle, runtime_dir, repo_root)
                 try:
-                    _wait_for_handover(runtime_dir, saved_runs)
+                    _wait_for_handover(
+                        runtime_dir,
+                        saved_runs,
+                        timeout=_handover_wait_timeout(saved_runs),
+                    )
                 except Exception as rollback_error:
                     raise RuntimeError(
                         "supervisor handover failed and old bundle recovery failed"

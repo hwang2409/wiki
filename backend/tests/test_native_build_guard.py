@@ -403,8 +403,13 @@ class NativeBuildGuardTests(TestCase):
                 started.append((bundle, runtime_dir, repo_root))
 
             def wait_for_handover(
-                _runtime_dir: Path, runs: list[dict[str, object]]
+                _runtime_dir: Path,
+                runs: list[dict[str, object]],
+                *,
+                timeout: float,
             ) -> None:
+                self.assertEqual(timeout, 45.0)
+                time.sleep(15.1)
                 verified.append(runs)
 
             with (
@@ -591,10 +596,50 @@ class NativeBuildGuardTests(TestCase):
                 ),
             ):
                 fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-                native_swap_transaction._supervisor_identity(runtime, timeout=1.0)
+                client, _pid, _health = native_swap_transaction._supervisor_identity(
+                    runtime,
+                    timeout=1.0,
+                )
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
             self.assertEqual(peer_pid.call_count, 2)
+            self.assertEqual(client.timeout, 120.0)
+
+    def test_ambiguous_handover_polls_until_cached_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Path(tmp)
+            (runtime / "supervisor.pid").write_text("1234\n", encoding="utf-8")
+            client = Mock()
+            client.prepare_for_handover.side_effect = [
+                native_swap_transaction.SupervisorUnavailable(
+                    "supervisor request supervisor/handover timed out"
+                ),
+                [{"run_id": "run", "agent_id": "agent"}],
+            ]
+            with patch.object(
+                native_swap_transaction,
+                "_supervisor_lock_is_free",
+                return_value=False,
+            ):
+                result = native_swap_transaction._prepare_handover(
+                    client,
+                    runtime,
+                    1234,
+                    timeout=1.0,
+                )
+
+            self.assertEqual(result, [{"run_id": "run", "agent_id": "agent"}])
+            self.assertEqual(client.prepare_for_handover.call_count, 2)
+
+    def test_handover_wait_budget_covers_sequential_approval_recovery(self) -> None:
+        runs = [
+            {"run_id": "run-1", "pending_request": True},
+            {"run_id": "run-2", "pending_request": True},
+        ]
+        self.assertEqual(
+            native_swap_transaction._handover_wait_timeout(runs),
+            75.0,
+        )
 
     def test_handover_requires_live_attached_provider_and_stable_state(self) -> None:
         saved = [
@@ -672,7 +717,14 @@ class NativeBuildGuardTests(TestCase):
             ]
             started: list[tuple[Path, Path, Path]] = []
             handover_client = Mock()
-            handover_client.prepare_for_handover.return_value = saved_runs
+            events: list[str] = []
+
+            def delayed_handover() -> list[dict[str, object]]:
+                events.append("handover")
+                time.sleep(2.1)
+                return saved_runs
+
+            handover_client.prepare_for_handover.side_effect = delayed_handover
 
             def start_supervisor(
                 bundle: Path, runtime_dir: Path, repo_root: Path
@@ -695,7 +747,11 @@ class NativeBuildGuardTests(TestCase):
                         {"status": "ok", "pid": 1234},
                     ),
                 ) as identity,
-                patch.object(native_swap_transaction, "_stop_supervisor"),
+                patch.object(
+                    native_swap_transaction,
+                    "_stop_supervisor",
+                    side_effect=lambda *_args, **_kwargs: events.append("stop"),
+                ),
                 patch.object(native_swap_transaction, "_wait_for_handover"),
                 patch.object(
                     native_swap_transaction.subprocess,
@@ -711,6 +767,7 @@ class NativeBuildGuardTests(TestCase):
                 )
 
             self.assertEqual(identity.call_count, 1)
+            self.assertEqual(events, ["handover", "stop"])
             self.assertEqual(
                 started,
                 [(live.resolve(), runtime.resolve(), root.resolve())],
