@@ -142,6 +142,28 @@ def parse_open_pr_snapshot(payload: object) -> tuple[OpenPRBranch, ...]:
     return tuple(sorted(branches.values(), key=lambda branch: branch.name))
 
 
+def _validate_open_pr_payload(payload: object) -> None:
+    rows = payload
+    reported_total: int | None = None
+    if isinstance(payload, dict):
+        rows = payload.get("branches") or payload.get("pullRequests") or []
+        for key in ("totalCount", "total_count", "total"):
+            value = payload.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                reported_total = value
+                break
+    if reported_total is not None and reported_total > MAX_ACTIVE_BRANCHES:
+        raise RuntimeError(
+            f"open PR snapshot truncated; reported more than {MAX_ACTIVE_BRANCHES} branches"
+        )
+    if isinstance(rows, list | tuple) and len(rows) > MAX_ACTIVE_BRANCHES:
+        raise RuntimeError(
+            f"open PR snapshot truncated; fetched more than {MAX_ACTIVE_BRANCHES} branches"
+        )
+    if isinstance(rows, list | tuple) and reported_total is not None and len(rows) < reported_total:
+        raise RuntimeError("open PR snapshot truncated; fetched fewer than the reported branch total")
+
+
 def _default_open_pr_provider() -> object:
     """Read open PR heads outside the request path.
 
@@ -158,7 +180,7 @@ def _default_open_pr_provider() -> object:
                 "--state",
                 "open",
                 "--limit",
-                str(MAX_ACTIVE_BRANCHES),
+                str(MAX_ACTIVE_BRANCHES + 1),
                 "--json",
                 "headRefName,headRefOid,number",
             ],
@@ -172,9 +194,11 @@ def _default_open_pr_provider() -> object:
     if result.returncode != 0:
         raise RuntimeError((result.stderr or result.stdout or "gh pr list failed").strip()[:200])
     try:
-        return json.loads(result.stdout)
+        payload = json.loads(result.stdout)
     except ValueError as exc:
         raise RuntimeError("gh returned invalid open PR JSON") from exc
+    _validate_open_pr_payload(payload)
+    return payload
 
 
 class OpenPRSnapshot:
@@ -199,11 +223,14 @@ class OpenPRSnapshot:
 
     def refresh(self) -> OpenPRSnapshotState:
         try:
-            state = OpenPRSnapshotState(
-                parse_open_pr_snapshot(self.provider()),
-                True,
-                time.time(),
-            )
+            payload = self.provider()
+            _validate_open_pr_payload(payload)
+            branches = parse_open_pr_snapshot(payload)
+            if len(branches) > MAX_ACTIVE_BRANCHES:
+                raise RuntimeError(
+                    f"open PR snapshot truncated; fetched more than {MAX_ACTIVE_BRANCHES} branches"
+                )
+            state = OpenPRSnapshotState(branches, True, time.time())
         except Exception as exc:  # provider failure must not break the request path
             with self._lock:
                 previous = self._state
@@ -378,6 +405,10 @@ def _git_common_dir(worktree: Path, *, timeout: float) -> Path:
     raise GitAnalysisError("git common directory is unavailable")
 
 
+def _path_is_within(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
 def _registry_rows(registry: dict[str, Any]) -> Iterable[tuple[str, dict[str, Any]]]:
     for ticket, entry in registry.items():
         if not isinstance(ticket, str) or ticket.startswith("_") or not isinstance(entry, dict):
@@ -489,11 +520,13 @@ def discover_active_branch_result(
         failures.append(_failed("registered worker worktrees", str(exc)))
 
     try:
+        primary_root = repo_root.resolve()
         primary_common_dir = _git_common_dir(
             repo_root,
             timeout=min(GIT_TIMEOUT_SECONDS, max(0.05, deadline - time.monotonic())),
         )
     except GitAnalysisError as exc:
+        primary_root = repo_root
         primary_common_dir = None
         failures.append(_failed("git common directory", str(exc)))
 
@@ -507,9 +540,14 @@ def discover_active_branch_result(
             try:
                 path = Path(raw_worktree).expanduser().resolve()
             except (OSError, RuntimeError, TypeError, ValueError):
+                if current.get("role") != "review":
+                    failures.append(_failed(ticket, f"registered worker worktree is unreadable: {raw_worktree}"))
                 eligible_for_hint = False
                 continue
+            local_path = _path_is_within(path, primary_root)
             if primary_common_dir is None:
+                if local_path and current.get("role") != "review":
+                    failures.append(_failed(ticket, f"registered worker worktree is unreadable: {path}"))
                 eligible_for_hint = False
                 continue
             try:
@@ -518,6 +556,8 @@ def discover_active_branch_result(
                     timeout=min(GIT_TIMEOUT_SECONDS, max(0.05, deadline - time.monotonic())),
                 )
             except GitAnalysisError:
+                if local_path and current.get("role") != "review":
+                    failures.append(_failed(ticket, f"registered worker worktree is unreadable: {path}"))
                 eligible_for_hint = False
                 continue
             if worker_common_dir != primary_common_dir:
@@ -526,6 +566,10 @@ def discover_active_branch_result(
             registered_paths[str(path)] = (ticket, current.get("role"))
             if current.get("role") == "review" and str(path) not in worktrees:
                 eligible_for_hint = False
+        elif raw_worktree is not None:
+            if current.get("role") != "review":
+                failures.append(_failed(ticket, f"registered worker worktree is unreadable: {raw_worktree}"))
+            eligible_for_hint = False
         hint = _branch_hint(current)
         if hint and eligible_for_hint:
             ref, reason = _select_ref(refs, hint)

@@ -172,6 +172,25 @@ class BlastRadiusTests(unittest.TestCase):
         self.assertIsNone(payload["risk"])
         self.assertTrue(payload["failed_branches"])
 
+    def test_merge_base_failure_is_incomplete(self) -> None:
+        original_run_git = blast_radius._run_git
+
+        def fail_diff(repo: Path, args: list[str], *, timeout: float) -> str:
+            if args and args[0] == "diff":
+                raise blast_radius.GitAnalysisError("no merge base")
+            return original_run_git(repo, args, timeout=timeout)
+
+        with mock.patch.object(blast_radius, "_run_git", side_effect=fail_diff):
+            payload = blast_radius.analyze(
+                self.fixture.root,
+                {},
+                cache=blast_radius.DiffCache(),
+                pr_snapshot=self.snapshot("one"),
+            )
+        self.assertFalse(payload["complete"])
+        self.assertIsNone(payload["risk"])
+        self.assertTrue(any("no merge base" in failure["reason"] for failure in payload["failed_branches"]))
+
     def test_timeout_is_reported_and_never_becomes_no_overlap(self) -> None:
         with mock.patch.object(
             blast_radius,
@@ -210,6 +229,22 @@ class BlastRadiusTests(unittest.TestCase):
         )
         branches = {row["branch"] for row in payload["branches"]}
         self.assertIn("one", branches)
+
+    def test_unreadable_local_implement_worktree_is_incomplete(self) -> None:
+        missing = self.fixture.root / ".codex" / "worktrees" / "missing-worker"
+        payload = blast_radius.analyze(
+            self.fixture.root,
+            {
+                "MISSING": {
+                    "current": {"role": "implement", "worktree": str(missing)}
+                }
+            },
+            cache=blast_radius.DiffCache(),
+            pr_snapshot=blast_radius.OpenPRSnapshotState((), True, time.time()),
+        )
+        self.assertFalse(payload["complete"])
+        self.assertIsNone(payload["risk"])
+        self.assertTrue(any(str(missing) in failure["reason"] for failure in payload["failed_branches"]))
 
     def test_foreign_and_detached_review_worktrees_are_ignored(self) -> None:
         foreign = FixtureRepo()
@@ -343,6 +378,24 @@ class BlastRadiusTests(unittest.TestCase):
         self.assertEqual([branch.name for branch in state.branches], ["one"])
         broken = blast_radius.OpenPRSnapshot(lambda: (_ for _ in ()).throw(RuntimeError("offline")))
         self.assertFalse(broken.refresh().complete)
+
+        analyzed = blast_radius.analyze(
+            self.fixture.root,
+            {},
+            cache=blast_radius.DiffCache(),
+            pr_snapshot=broken,
+        )
+        self.assertFalse(analyzed["complete"])
+        self.assertIsNone(analyzed["risk"])
+        self.assertTrue(any(failure["branch"] == "open PR snapshot" for failure in analyzed["failed_branches"]))
+
+    def test_provider_truncation_is_incomplete(self) -> None:
+        snapshot = blast_radius.OpenPRSnapshot(
+            lambda: [{"headRefName": f"branch-{index}"} for index in range(blast_radius.MAX_ACTIVE_BRANCHES + 1)]
+        )
+        state = snapshot.refresh()
+        self.assertFalse(state.complete)
+        self.assertIn("truncated", state.error or "")
 
     def test_malformed_registry_and_branch_input_do_not_escape_git(self) -> None:
         payload = blast_radius.analyze(
