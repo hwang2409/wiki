@@ -30,7 +30,8 @@ Chain:
                                     config table is out of scope; we
                                     strict-allowlist the box types).
     mdat                            sample data — required, non-empty
-    moof/sidx/styp/mfra             emitted as parsed (playback aux)
+    sidx                            rebuilt from parsed fields
+    styp/moof/mfra                  rejected (fragmented playback unsupported)
     skip / udta / meta / uuid /
     anything unknown at top level   → `free` box (bytes zeroed)
 
@@ -100,6 +101,10 @@ _MP4_SAMPLE_ENTRY_REQUIRED_CONFIG: Final = {
 _MP4_MAX_SAMPLES: Final = 16_777_216
 _MP4_AVC_SAMPLE_NAL_TYPES: Final = {1, 5, 6}
 _MP4_MAX_BOXES_PER_CONTAINER: Final = 4096
+_MP4_BRAND_ALLOWLIST: Final = frozenset({
+    b"avc1", b"isom", b"iso2", b"iso5", b"iso6", b"mp41", b"mp42", b"mp4a",
+})
+_MP4_MAX_COMPATIBLE_BRANDS: Final = 32
 # Additional stbl children beyond stsd. Every allowed type below has a
 # field-level rebuild via struct.pack that emits exactly the parsed
 # entry_count worth of entries — trailing bytes cannot survive because
@@ -127,13 +132,15 @@ def scrub_mp4(data: bytes) -> MediaScrubResult:
     # errors for malformed moov children before sample ownership checks.
     for atom in top_atoms:
         if atom.type == b"moov":
-            _rebuilt, _trak, _mvhd, stsd_ok = _rebuild_moov(
+            _rebuilt, _trak, _mvhd, stsd_ok, video_ok = _rebuild_moov(
                 data, atom.body_start, atom.body_end,
             )
             if not _trak:
                 raise MediaScrubError("mp4 moov missing trak")
             if not stsd_ok:
                 raise MediaScrubError("mp4 stbl/stsd has no valid sample entry")
+            if not video_ok:
+                raise MediaScrubError("mp4 payload requires a vide/avc1 track")
     for atom in top_atoms:
         if atom.type == b"mdat" and atom.body_start == atom.body_end:
             raise MediaScrubError("mp4 mdat body is empty")
@@ -142,7 +149,7 @@ def scrub_mp4(data: bytes) -> MediaScrubResult:
         (atom.body_start, atom.body_end)
         for atom in top_atoms if atom.type == b"mdat"
     ]
-    sample_plan = _validate_sample_ranges(
+    _validate_sample_ranges(
         data, _collect_sample_ranges(data, top_atoms, mdat_ranges), mdat_ranges,
     )
 
@@ -155,6 +162,7 @@ def scrub_mp4(data: bytes) -> MediaScrubResult:
     trak_seen = False
     mvhd_seen = False
     stsd_ok = False
+    video_ok = False
     mdat_non_empty = False
     duration_ms: int | None = None
     dims: tuple[int, int] | None = None
@@ -169,10 +177,13 @@ def scrub_mp4(data: bytes) -> MediaScrubResult:
             moov_body = data[atom.body_start:atom.body_end]
             duration_ms = _mvhd_duration(moov_body)
             dims = _tkhd_dims_from_moov(moov_body)
-            rebuilt_body, tr, mv, st = _rebuild_moov(data, atom.body_start, atom.body_end)
+            rebuilt_body, tr, mv, st, video = _rebuild_moov(
+                data, atom.body_start, atom.body_end,
+            )
             trak_seen |= tr
             mvhd_seen |= mv
             stsd_ok |= st
+            video_ok |= video
             rebuilt = _pack(b"moov", rebuilt_body)
             delta = atom.size - len(rebuilt)
             if delta < 0:
@@ -189,7 +200,7 @@ def scrub_mp4(data: bytes) -> MediaScrubResult:
                 raise MediaScrubError("mp4 mdat body is empty")
             mdat_non_empty = True
             scrubbed_body = bytearray(body_len)
-            for sample_range in sample_plan:
+            for sample_range in _collect_sample_ranges(data, top_atoms, mdat_ranges):
                 sample_start = sample_range.start
                 sample_end = sample_range.end
                 if sample_start < atom.body_start or sample_end > atom.body_end:
@@ -217,13 +228,9 @@ def scrub_mp4(data: bytes) -> MediaScrubResult:
             if delta > 0:
                 out_parts.append(_free(delta))
         elif atom.type == b"styp":
-            # styp mirrors ftyp: major_brand + minor_version + N compatible
-            # brand tokens. Rebuild via struct.pack so trailing junk cannot
-            # survive.
-            rebuilt_styp = _rebuild_ftyp_like(b"styp", data, atom)
-            if len(rebuilt_styp) != atom.size:
-                raise MediaScrubError("mp4 rebuilt styp size mismatch")
-            out_parts.append(rebuilt_styp)
+            raise MediaScrubError(
+                "mp4 styp box is not supported for non-fragmented scrubber"
+            )
         elif atom.type in _MP4_TOPLEVEL_PLAYBACK:
             # moof / mfra / moov (moov is handled above). moof + mfra are
             # fragment boxes carrying byte-position tables that would need
@@ -253,6 +260,8 @@ def scrub_mp4(data: bytes) -> MediaScrubResult:
         raise MediaScrubError(
             "mp4 trak missing valid stbl/stsd sample entry (full chain required)"
         )
+    if not video_ok:
+        raise MediaScrubError("mp4 payload requires a vide/avc1 track")
     if not mdat_non_empty:
         raise MediaScrubError("mp4 payload missing non-empty mdat box")
 
@@ -271,7 +280,9 @@ def _collect_sample_ranges(
     top_atoms: list[_Mp4Atom],
     mdat_ranges: list[tuple[int, int]],
 ) -> Iterator[_Mp4SampleRange]:
-    """Yield absolute sample ranges after validating all chunk extents."""
+    """Yield sample ranges after validating compact chunk ownership."""
+    sample_iterators: list[Iterator[_Mp4SampleRange]] = []
+    chunk_ranges: list[tuple[int, int]] = []
     for moov in (atom for atom in top_atoms if atom.type == b"moov"):
         for trak in _parse_container(data, moov.body_start, moov.body_end):
             if trak.type != b"trak":
@@ -289,10 +300,20 @@ def _collect_sample_ranges(
                         continue
                     for stbl in _parse_container(data, minf.body_start, minf.body_end):
                         if stbl.type == b"stbl":
-                            yield from _collect_sample_ranges_from_stbl(
+                            sample_iterator, track_chunks = _collect_sample_ranges_from_stbl(
                                 data, stbl.body_start, stbl.body_end, mdat_ranges,
                                 handler_type,
                             )
+                            sample_iterators.append(sample_iterator)
+                            chunk_ranges.extend(track_chunks)
+    chunk_ranges.sort()
+    previous: tuple[int, int] | None = None
+    for chunk_range in chunk_ranges:
+        if previous is not None and chunk_range[0] < previous[1]:
+            raise MediaScrubError("mp4 sample chunks overlap across or within tracks")
+        previous = chunk_range
+    for sample_iterator in sample_iterators:
+        yield from sample_iterator
 
 
 def _collect_sample_ranges_from_stbl(
@@ -301,14 +322,14 @@ def _collect_sample_ranges_from_stbl(
     body_end: int,
     mdat_ranges: list[tuple[int, int]],
     handler_type: bytes,
-) -> Iterator[_Mp4SampleRange]:
+) -> tuple[Iterator[_Mp4SampleRange], list[tuple[int, int]]]:
     tables = {
         atom.type: atom
         for atom in _parse_container(data, body_start, body_end)
         if atom.type in {b"stsc", b"stsz", b"stco", b"co64"}
     }
     if not tables:
-        return
+        return iter(()), []
     if b"stsc" not in tables or b"stsz" not in tables:
         raise MediaScrubError("mp4 sample tables missing stsc or stsz")
     if b"stco" in tables and b"co64" in tables:
@@ -401,10 +422,12 @@ def _collect_sample_ranges_from_stbl(
         size_offset = 12 + sample_index * 4
         return struct.unpack(">I", sample_sizes[size_offset:size_offset + 4])[0]
 
-    # Validate every complete chunk before yielding one sample object. This
-    # rejects forged sample counts before range expansion can consume memory.
+    # Validate every complete chunk before yielding one sample range. This
+    # rejects forged sample counts before range expansion and checks compact
+    # chunk ownership before any per-sample work.
     sample_index = 0
     stsc_cursor = 0
+    chunk_ranges: list[tuple[int, int]] = []
     for chunk_number in range(1, chunk_count + 1):
         stsc_cursor, samples_per_chunk, description_index, _ = stsc_for_chunk(
             chunk_number, stsc_cursor,
@@ -418,7 +441,10 @@ def _collect_sample_ranges_from_stbl(
         )
         chunk_end = chunk_start
         for index in range(samples_per_chunk):
-            chunk_end += size_at(sample_index + index)
+            sample_size_at = size_at(sample_index + index)
+            if sample_size_at == 0:
+                raise MediaScrubError("mp4 sample size must be positive")
+            chunk_end += sample_size_at
         if chunk_start < 0 or chunk_end < chunk_start or chunk_end > len(data):
             raise MediaScrubError(
                 "mp4 chunk extent exceeds input size; sample range is not contained"
@@ -428,30 +454,34 @@ def _collect_sample_ranges_from_stbl(
             for mdat_start, mdat_end in mdat_ranges
         ):
             raise MediaScrubError("mp4 chunk extent is not contained by one mdat box")
+        chunk_ranges.append((chunk_start, chunk_end))
         sample_index += samples_per_chunk
     if sample_index != sample_count:
         raise MediaScrubError("mp4 stsc does not describe every stsz sample")
 
-    sample_index = 0
-    stsc_cursor = 0
-    for chunk_number in range(1, chunk_count + 1):
-        stsc_cursor, samples_per_chunk, description_index, _ = stsc_for_chunk(
-            chunk_number, stsc_cursor,
-        )
-        avc_config = sample_descriptions[description_index - 1]
-        chunk_start = int.from_bytes(
-            offset_body[8 + (chunk_number - 1) * offset_width:
-                        8 + chunk_number * offset_width],
-            "big",
-        )
-        sample_start = chunk_start
-        for local_index in range(samples_per_chunk):
-            sample_end = sample_start + size_at(sample_index + local_index)
-            yield _Mp4SampleRange(
-                sample_start, sample_end, description_index, avc_config,
+    def iter_sample_ranges() -> Iterator[_Mp4SampleRange]:
+        sample_index = 0
+        stsc_cursor = 0
+        for chunk_number in range(1, chunk_count + 1):
+            stsc_cursor, samples_per_chunk, description_index, _ = stsc_for_chunk(
+                chunk_number, stsc_cursor,
             )
-            sample_start = sample_end
-        sample_index += samples_per_chunk
+            avc_config = sample_descriptions[description_index - 1]
+            chunk_start = int.from_bytes(
+                offset_body[8 + (chunk_number - 1) * offset_width:
+                            8 + chunk_number * offset_width],
+                "big",
+            )
+            sample_start = chunk_start
+            for local_index in range(samples_per_chunk):
+                sample_end = sample_start + size_at(sample_index + local_index)
+                yield _Mp4SampleRange(
+                    sample_start, sample_end, description_index, avc_config,
+                )
+                sample_start = sample_end
+            sample_index += samples_per_chunk
+
+    return iter_sample_ranges(), chunk_ranges
 
 
 def _sample_description_configs(
@@ -604,11 +634,8 @@ def _canonicalise_avc_sample(
 def _validate_sample_ranges(
     data: bytes, sample_ranges: Iterator[_Mp4SampleRange],
     mdat_ranges: list[tuple[int, int]],
-) -> list[_Mp4SampleRange]:
-    plan = list(sample_ranges)
-    plan.sort(key=lambda sample_range: (sample_range.start, sample_range.end))
-    previous: _Mp4SampleRange | None = None
-    for sample_range in plan:
+) -> None:
+    for sample_range in sample_ranges:
         start = sample_range.start
         end = sample_range.end
         if (
@@ -618,16 +645,10 @@ def _validate_sample_ranges(
             raise MediaScrubError(
                 "mp4 sample range is not contained by one mdat box"
             )
-        if previous is not None and start < previous.end:
-            raise MediaScrubError(
-                "mp4 sample ranges overlap across or within tracks"
-            )
         if sample_range.avc_config is not None:
             _canonicalise_avc_sample(
                 data[start:end], *sample_range.avc_config,
             )
-        previous = sample_range
-    return plan
 
 
 # ---------------------------------------------------------------------------
@@ -718,7 +739,38 @@ def _rebuild_ftyp_like(atom_type: bytes, data: bytes, atom: _Mp4Atom) -> bytes:
             f"mp4 {atom_type!r} compatible_brands not a multiple of 4 bytes"
         )
     compat = [tail[i:i + 4] for i in range(0, len(tail), 4)]
-    rebuilt_body = major_brand + struct.pack(">I", minor_version) + b"".join(compat)
+    if len(compat) > _MP4_MAX_COMPATIBLE_BRANDS:
+        raise MediaScrubError(
+            f"mp4 {atom_type!r} has too many compatible brands"
+        )
+    if major_brand not in _MP4_BRAND_ALLOWLIST and not any(
+        brand in _MP4_BRAND_ALLOWLIST for brand in compat
+    ):
+        raise MediaScrubError(
+            f"mp4 {atom_type!r} has no supported major or compatible brand"
+        )
+    canonical_compat: list[bytes] = []
+    seen: set[bytes] = set()
+    for brand in compat:
+        if brand not in _MP4_BRAND_ALLOWLIST:
+            raise MediaScrubError(
+                f"mp4 {atom_type!r} brand {brand!r} is outside the allowlist"
+            )
+        if brand not in seen:
+            seen.add(brand)
+            canonical_compat.append(brand)
+        else:
+            raise MediaScrubError(
+                f"mp4 {atom_type!r} compatible brands must be unique"
+            )
+    canonical_major = (
+        major_brand if major_brand in _MP4_BRAND_ALLOWLIST
+        else canonical_compat[0]
+    )
+    rebuilt_body = (
+        canonical_major + struct.pack(">I", minor_version)
+        + b"".join(canonical_compat)
+    )
     return _pack(atom_type, rebuilt_body)
 
 
@@ -803,7 +855,7 @@ def _rebuild_sidx(data: bytes, atom: _Mp4Atom) -> bytes:
 
 def _rebuild_moov(
     data: bytes, body_start: int, body_end: int,
-) -> tuple[bytes, bool, bool, bool]:
+) -> tuple[bytes, bool, bool, bool, bool]:
     atoms = _parse_container(data, body_start, body_end)
     mvhd_atoms = [atom for atom in atoms if atom.type == b"mvhd"]
     trak_atoms = [atom for atom in atoms if atom.type == b"trak"]
@@ -815,14 +867,18 @@ def _rebuild_moov(
     trak_seen = False
     mvhd_seen = False
     stsd_ok = False
+    video_ok = False
     for atom in atoms:
         if atom.type == b"mvhd":
             mvhd_seen = True
             parts.append(_rebuild_mvhd(data, atom))
         elif atom.type == b"trak":
-            trak_body, stsd_in_trak = _rebuild_trak(data, atom.body_start, atom.body_end)
+            trak_body, stsd_in_trak, video_in_trak = _rebuild_trak(
+                data, atom.body_start, atom.body_end,
+            )
             trak_seen = True
             stsd_ok |= stsd_in_trak
+            video_ok |= video_in_trak
             parts.append(_pack(b"trak", trak_body))
         elif atom.type == b"mvex":
             # mvex indicates a fragmented movie. The scrubber does not
@@ -834,7 +890,7 @@ def _rebuild_moov(
                 "mp4 mvex box present — fragmented playback not supported by scrubber"
             )
         # Everything else in moov (udta, meta, uuid, iods, hoisted anything) → drop
-    return b"".join(parts), trak_seen, mvhd_seen, stsd_ok
+    return b"".join(parts), trak_seen, mvhd_seen, stsd_ok, video_ok
 
 
 def _rebuild_mvhd(data: bytes, atom: _Mp4Atom) -> bytes:
@@ -897,7 +953,7 @@ def _rebuild_mvhd(data: bytes, atom: _Mp4Atom) -> bytes:
 
 def _rebuild_trak(
     data: bytes, body_start: int, body_end: int,
-) -> tuple[bytes, bool]:
+) -> tuple[bytes, bool, bool]:
     atoms = _parse_container(data, body_start, body_end)
     tkhd_atoms = [atom for atom in atoms if atom.type == b"tkhd"]
     mdia_atoms = [atom for atom in atoms if atom.type == b"mdia"]
@@ -915,11 +971,11 @@ def _rebuild_trak(
     parts = [_rebuild_tkhd(data, tkhd_atoms[0])]
     if edts_atoms:
         parts.append(_rebuild_edts(data, edts_atoms[0]))
-    mdia_body, stsd_ok = _rebuild_mdia(
+    mdia_body, stsd_ok, video_ok = _rebuild_mdia(
         data, mdia_atoms[0].body_start, mdia_atoms[0].body_end,
     )
     parts.append(_pack(b"mdia", mdia_body))
-    return b"".join(parts), stsd_ok
+    return b"".join(parts), stsd_ok, video_ok
 
 
 def _rebuild_tkhd(data: bytes, atom: _Mp4Atom) -> bytes:
@@ -987,7 +1043,7 @@ def _rebuild_tkhd(data: bytes, atom: _Mp4Atom) -> bytes:
 
 def _rebuild_mdia(
     data: bytes, body_start: int, body_end: int,
-) -> tuple[bytes, bool]:
+) -> tuple[bytes, bool, bool]:
     atoms = _parse_container(data, body_start, body_end)
     mdhd_atoms = [atom for atom in atoms if atom.type == b"mdhd"]
     hdlr_atoms = [atom for atom in atoms if atom.type == b"hdlr"]
@@ -1005,7 +1061,7 @@ def _rebuild_mdia(
             "mp4 mdia requires exactly one minf child; stbl/stsd chain incomplete"
         )
     handler_type = _handler_type(data, hdlr_atoms[0])
-    minf_body, stsd_ok = _rebuild_minf(
+    minf_body, stsd_ok, video_ok = _rebuild_minf(
         data, minf_atoms[0].body_start, minf_atoms[0].body_end, handler_type,
     )
     return (
@@ -1013,6 +1069,7 @@ def _rebuild_mdia(
         + _rebuild_hdlr(data, hdlr_atoms[0])
         + _pack(b"minf", minf_body),
         stsd_ok,
+        video_ok,
     )
 
 
@@ -1154,7 +1211,7 @@ def _rebuild_hdlr(data: bytes, atom: _Mp4Atom) -> bytes:
 
 def _rebuild_minf(
     data: bytes, body_start: int, body_end: int, handler_type: bytes,
-) -> tuple[bytes, bool]:
+) -> tuple[bytes, bool, bool]:
     atoms = _parse_container(data, body_start, body_end)
     required_header = b"vmhd" if handler_type == b"vide" else b"smhd"
     header_atoms = [atom for atom in atoms if atom.type == required_header]
@@ -1173,11 +1230,11 @@ def _rebuild_minf(
     else:
         media_header = _rebuild_smhd(data, header_atoms[0])
     dinf = _rebuild_dinf(data, dinf_atoms[0].body_start, dinf_atoms[0].body_end)
-    stbl_body, stsd_ok = _rebuild_stbl(
+    stbl_body, stsd_ok, video_ok = _rebuild_stbl(
         data, stbl_atoms[0].body_start, stbl_atoms[0].body_end,
         handler_type,
     )
-    return media_header + dinf + _pack(b"stbl", stbl_body), stsd_ok
+    return media_header + dinf + _pack(b"stbl", stbl_body), stsd_ok, video_ok
 
 
 def _rebuild_vmhd(data: bytes, atom: _Mp4Atom) -> bytes:
@@ -1308,10 +1365,11 @@ def _rebuild_dinf(data: bytes, body_start: int, body_end: int) -> bytes:
 def _rebuild_stbl(
     data: bytes, body_start: int, body_end: int,
     handler_type: bytes,
-) -> tuple[bytes, bool]:
+) -> tuple[bytes, bool, bool]:
     atoms = _parse_container(data, body_start, body_end)
     parts: list[bytes] = []
     stsd_ok = False
+    video_ok = False
     # Round-9 review: stbl singleton tables must not repeat. Pre-R9 the
     # walker accepted arbitrary duplicates so an attacker could stack
     # many empty stss/ctts/... boxes with independent 3-byte flags
@@ -1330,6 +1388,7 @@ def _rebuild_stbl(
             if stsd_body is not None:
                 parts.append(_pack(b"stsd", stsd_body))
                 stsd_ok = True
+                video_ok = handler_type == b"vide"
         elif atom.type in _MP4_STBL_TABLE_TYPES:
             parts.append(_rebuild_stbl_table(atom.type, data, atom))
         else:
@@ -1340,7 +1399,7 @@ def _rebuild_stbl(
             raise MediaScrubError(
                 f"mp4 stbl child {atom.type!r} not supported by scrubber"
             )
-    return b"".join(parts), stsd_ok
+    return b"".join(parts), stsd_ok, video_ok
 
 
 _CANONICAL_FULLBOX_FLAGS = b"\x00\x00\x00"

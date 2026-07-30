@@ -119,6 +119,14 @@ def scrub_gif(data: bytes) -> MediaScrubResult:
         raise MediaScrubError("gif payload missing GIF87a/GIF89a header")
 
     width, height = struct.unpack("<HH", data[6:10])
+    if width == 0 or height == 0:
+        raise MediaScrubError("gif logical screen dimensions must be non-zero")
+    logical_screen_pixels = width * height
+    if logical_screen_pixels > GIF_MAX_PIXELS:
+        raise MediaScrubError(
+            f"gif logical screen has {logical_screen_pixels} pixels, "
+            f"above the {GIF_MAX_PIXELS} pixel limit"
+        )
     packed = data[10]
     background_color_index = data[11]
     pixel_aspect_ratio = data[12]
@@ -194,6 +202,8 @@ def scrub_gif(data: bytes) -> MediaScrubResult:
                 data, offset, end, out,
                 pending_gce=pending_gce,
                 global_ct_entries=global_ct_entries,
+                screen_width=width,
+                screen_height=height,
                 pixel_budget=GIF_MAX_PIXELS - total_image_pixels,
             )
             total_image_pixels += image_pixels
@@ -406,6 +416,8 @@ def _emit_image_descriptor(
     *,
     pending_gce: _PendingGCE | None,
     global_ct_entries: int,
+    screen_width: int,
+    screen_height: int,
     pixel_budget: int,
 ) -> tuple[int, int]:
     """Emit the image descriptor + local color table + LZW image data.
@@ -425,11 +437,15 @@ def _emit_image_descriptor(
     top = struct.unpack("<H", data[offset + 3:offset + 5])[0]
     img_w = struct.unpack("<H", data[offset + 5:offset + 7])[0]
     img_h = struct.unpack("<H", data[offset + 7:offset + 9])[0]
+    if img_w == 0 or img_h == 0:
+        raise MediaScrubError("gif image dimensions must be non-zero")
     expected_pixels = img_w * img_h
     if expected_pixels > GIF_MAX_PIXELS:
         raise MediaScrubError(
             f"gif image has {expected_pixels} pixels, above the {GIF_MAX_PIXELS} pixel limit"
         )
+    if left > screen_width - img_w or top > screen_height - img_h:
+        raise MediaScrubError("gif image rectangle extends outside logical screen")
     if expected_pixels > pixel_budget:
         raise MediaScrubError(
             "gif cumulative image pixels exceed the pixel limit"

@@ -18,6 +18,7 @@ from backend.app.media_scrub import mp4 as mp4_scrubber
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "media"
 REAL_MP4 = FIXTURE_DIR / "tiny.mp4"
 REAL_MIXED_MP4 = FIXTURE_DIR / "tiny_avc1_aac.mp4"
+REAL_AAC_ONLY_MP4 = FIXTURE_DIR / "tiny_aac_only.mp4"
 REAL_WAV = FIXTURE_DIR / "tone.wav"
 REAL_MP3 = FIXTURE_DIR / "tone.mp3"
 REAL_MP3_APE = FIXTURE_DIR / "tone_ape.mp3"
@@ -2752,7 +2753,10 @@ class Review15MediaProbeTests(unittest.TestCase):
 
     def test_gif_cumulative_pixels_are_capped_before_decode(self) -> None:
         image = b"\x2c" + struct.pack("<HHHH", 0, 0, 4096, 4096) + b"\x00\x02\x01\x2c\x00"
-        payload = GifRound7ExtensionProbes._min_gif_prefix() + image + image + b"\x3b"
+        payload = (
+            b"GIF89a" + struct.pack("<HH", 4096, 4096) + b"\x00\x00\x00"
+            + image + image + b"\x3b"
+        )
         with self.assertRaisesRegex(media_scrub.MediaScrubError, "cumulative image pixels"):
             media_scrub.scrub_video(payload, "image/gif")
 
@@ -2856,7 +2860,7 @@ class Review17MediaProbeTests(unittest.TestCase):
     def test_cross_track_partial_overlap_is_rejected_in_both_orders(self) -> None:
         for swapped in (False, True):
             with self.subTest(swapped=swapped):
-                with self.assertRaisesRegex(media_scrub.MediaScrubError, "sample ranges overlap"):
+                with self.assertRaisesRegex(media_scrub.MediaScrubError, "sample (?:chunks|ranges) overlap"):
                     media_scrub.scrub_video(
                         self._overlap_fixture(exact=False, swapped=swapped),
                         "video/mp4",
@@ -2865,7 +2869,7 @@ class Review17MediaProbeTests(unittest.TestCase):
     def test_cross_track_exact_overlap_is_rejected_in_both_orders(self) -> None:
         for swapped in (False, True):
             with self.subTest(swapped=swapped):
-                with self.assertRaisesRegex(media_scrub.MediaScrubError, "sample ranges overlap"):
+                with self.assertRaisesRegex(media_scrub.MediaScrubError, "sample (?:chunks|ranges) overlap"):
                     media_scrub.scrub_video(
                         self._overlap_fixture(exact=True, swapped=swapped),
                         "video/mp4",
@@ -2929,6 +2933,122 @@ class Review17MediaProbeTests(unittest.TestCase):
             tracemalloc.stop()
         self.assertEqual((result.width, result.height), (2000, 2000))
         self.assertLess(peak, 30 * 1024 * 1024, f"peak allocation was {peak} bytes")
+
+
+class Review18MediaProbeTests(unittest.TestCase):
+    def test_gif_logical_screen_pixel_budget_is_enforced(self) -> None:
+        payload = (
+            b"GIF89a"
+            + struct.pack("<HH", 65535, 65535)
+            + b"\x00\x00\x00"
+            + b"\x2c"
+            + struct.pack("<HHHH", 0, 0, 1, 1)
+            + b"\x00"
+            + b"\x02\x02\x44\x01\x00"
+            + b"\x3b"
+        )
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "logical screen|pixels"):
+            media_scrub.scrub_video(payload, "image/gif")
+
+    def test_aac_only_mp4_is_rejected_without_video_track(self) -> None:
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "vide/avc1"):
+            media_scrub.scrub_video(REAL_AAC_ONLY_MP4.read_bytes(), "video/mp4")
+
+    def test_mp4_unknown_compatible_brand_is_rejected(self) -> None:
+        payload = bytearray(REAL_MP4.read_bytes())
+        marker_offset = payload.find(b"mp41", 8)
+        self.assertGreaterEqual(marker_offset, 0)
+        payload[marker_offset:marker_offset + 4] = b"GPS!"
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "brand.*allowlist"):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+    def test_mp4_unknown_major_brand_is_canonicalized(self) -> None:
+        payload = bytearray(REAL_MP4.read_bytes())
+        payload[8:12] = b"GPS!"
+        result = media_scrub.scrub_video(bytes(payload), "video/mp4")
+        self.assertNotIn(b"GPS!", result.data[:32])
+
+    def test_mp3_layer_i_header_with_trailing_marker_is_rejected(self) -> None:
+        payload = b"\xff\xff\x10\x00" + b"GEOLOCATION-MARKER"
+        with self.assertRaises(media_scrub.MediaScrubError):
+            media_scrub.scrub_audio(payload, "audio/mpeg")
+
+    def test_mp3_layer_ii_header_with_trailing_marker_is_rejected(self) -> None:
+        payload = b"\xff\xfd\x10\x00" + b"GEOLOCATION-MARKER"
+        with self.assertRaises(media_scrub.MediaScrubError):
+            media_scrub.scrub_audio(payload, "audio/mpeg")
+
+    @staticmethod
+    def _large_stsz_fixture(sample_count: int = 250_000) -> bytes:
+        payload = bytearray(REAL_MP4.read_bytes())
+        tracks = Review17MediaProbeTests._track_info(payload)
+        video = next(track for track in tracks if track["handler"] == b"vide")
+        moov = next(
+            child for child in Review17MediaProbeTests._children(payload, 0, len(payload))
+            if child[0] == b"moov"
+        )
+        trak = next(
+            child for child in Review17MediaProbeTests._children(
+                payload, moov[3], moov[4],
+            )
+            if child[0] == b"trak" and child[1] == int(video["trak_start"])
+        )
+        mdia = next(
+            child for child in Review17MediaProbeTests._children(
+                payload, trak[3], trak[4],
+            )
+            if child[0] == b"mdia"
+        )
+        minf = next(
+            child for child in Review17MediaProbeTests._children(
+                payload, mdia[3], mdia[4],
+            )
+            if child[0] == b"minf"
+        )
+        stbl = next(
+            child for child in Review17MediaProbeTests._children(
+                payload, minf[3], minf[4],
+            )
+            if child[0] == b"stbl"
+        )
+        stsz_start = int(video["stsz_body"]) - 8
+        stsz_end = stsz_start + struct.unpack(
+            ">I", payload[stsz_start:stsz_start + 4]
+        )[0]
+        replacement_body = (
+            b"\x00\x00\x00\x00"
+            + struct.pack(">II", 0, sample_count)
+            + b"\x00\x00\x00\x01" * sample_count
+        )
+        replacement = struct.pack(">I", 8 + len(replacement_body)) + b"stsz" + replacement_body
+        delta = len(replacement) - (stsz_end - stsz_start)
+        payload[stsz_start:stsz_end] = replacement
+        for parent in (stbl, minf, mdia, trak, moov):
+            parent_start = parent[1]
+            old_size = struct.unpack(">I", payload[parent_start:parent_start + 4])[0]
+            payload[parent_start:parent_start + 4] = struct.pack(">I", old_size + delta)
+        updated_video = next(
+            track for track in Review17MediaProbeTests._track_info(payload)
+            if track["handler"] == b"vide"
+        )
+        stco_body = int(updated_video["stco_body"])
+        first_offset = struct.unpack(">I", payload[stco_body + 8:stco_body + 12])[0]
+        payload[stco_body + 8:stco_body + 12] = struct.pack(">I", first_offset + delta)
+        return bytes(payload)
+
+    def test_mp4_large_stsz_full_scrub_has_bounded_peak(self) -> None:
+        payload = self._large_stsz_fixture()
+        tracemalloc.start()
+        try:
+            with self.assertRaises(media_scrub.MediaScrubError):
+                media_scrub.scrub_video(payload, "video/mp4")
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertLess(
+            peak, len(payload) * 16,
+            f"peak allocation {peak} exceeded 16x input size {len(payload)}",
+        )
 
 
 if __name__ == "__main__":

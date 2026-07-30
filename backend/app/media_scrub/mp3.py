@@ -204,6 +204,7 @@ def _mp3_validate_full_frame_stream(data: bytes, start: int, end: int) -> bytes:
     """
     offset = start
     frames_seen = 0
+    stream_signature: tuple[int, int] | None = None
     rebuilt = bytearray(data[start:end])
     while offset < end:
         frame_len = _mp3_frame_length(data, offset, end)
@@ -211,6 +212,13 @@ def _mp3_validate_full_frame_stream(data: bytes, start: int, end: int) -> bytes:
             raise MediaScrubError(
                 f"mp3 frame stream broken at offset {offset - start} "
                 f"({frames_seen} frames validated)"
+            )
+        signature = ((data[offset + 1] >> 3) & 0x03, (data[offset + 1] >> 1) & 0x03)
+        if stream_signature is None:
+            stream_signature = signature
+        elif signature != stream_signature:
+            raise MediaScrubError(
+                "mp3 frame stream changes MPEG version or layer"
             )
         frame_offset = offset - start
         frame = data[offset:offset + frame_len]
@@ -282,7 +290,10 @@ def _mp3_frame_length(data: bytes, offset: int, end: int) -> int | None:
         return None
     version_bits = (data[offset + 1] >> 3) & 0x03
     layer_bits = (data[offset + 1] >> 1) & 0x03
-    if version_bits == 1 or layer_bits == 0:
+    # The shipped scrubber supports MPEG Layer III only. The bitrate and
+    # frame-length tables below are Layer III tables, so accepting Layer I or
+    # II headers would mis-size the walk and expose trailing bytes as audio.
+    if version_bits == 1 or layer_bits != 1:
         return None
     bitrate_bits = (data[offset + 2] >> 4) & 0x0F
     sample_rate_bits = (data[offset + 2] >> 2) & 0x03
