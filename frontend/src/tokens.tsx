@@ -134,6 +134,13 @@ export function TokensView() {
   // last-good view + banner. (Round-4 review MEDIUM: any failed poll
   // wiped the chart, even when a valid snapshot was already on screen.)
   const dataRef = useRef<TokensResponse | null>(null);
+  // Query key each snapshot was fetched under. Preserving `data` on a
+  // failed request only makes sense for the SAME query — after a range
+  // or bucket switch, the last-good snapshot describes a different
+  // window than the active controls, and rendering it under the new
+  // label misrepresents current usage. (Round-5 review HIGH: 7d totals
+  // survived a failed 30d load and rendered under the 30d control.)
+  const dataQueryKeyRef = useRef<string | null>(null);
   useEffect(() => {
     dataRef.current = data;
   }, [data]);
@@ -154,6 +161,7 @@ export function TokensView() {
   useEffect(() => {
     let cancelled = false;
     let retry = 0;
+    const queryKey = `${range.from}|${range.to}|${bucketMode}`;
 
     const load = (showSpinner: boolean) => {
       if (showSpinner) setLoading(true);
@@ -161,6 +169,7 @@ export function TokensView() {
         .then((next) => {
           if (cancelled) return;
           setData(next);
+          dataQueryKeyRef.current = queryKey;
           setError(null);
           setRefreshFailed(null);
           if (next.refreshing) {
@@ -170,12 +179,20 @@ export function TokensView() {
         .catch((err: unknown) => {
           if (cancelled) return;
           const msg = err instanceof Error ? err.message : "Could not load token usage";
-          // Preserve last-good data on a poll failure — the tokens page
-          // background-polls while the aggregator warms; blowing the
-          // chart away every time the request drops (rate-limit, network
-          // blip) is worse than showing stale numbers with a banner.
-          if (dataRef.current) setRefreshFailed(msg);
-          else setError(msg);
+          // Preserve last-good data ONLY when the failing request was for
+          // the query currently bound to that snapshot — a retry or a
+          // background poll of the same range/bucket. After a preset or
+          // bucket switch, showing stale numbers under the new control
+          // misrepresents current usage; trip the full error state and
+          // drop the mismatched data instead.
+          if (dataRef.current && dataQueryKeyRef.current === queryKey) {
+            setRefreshFailed(msg);
+          } else {
+            setData(null);
+            dataQueryKeyRef.current = null;
+            setRefreshFailed(null);
+            setError(msg);
+          }
         })
         .finally(() => {
           if (!cancelled && showSpinner) setLoading(false);

@@ -28,9 +28,26 @@ export function parseNoteUpdated(raw: string): number {
   return Date.parse(raw);
 }
 
+// Calendar-day distance between two local Dates. Normalizing through
+// Date.UTC using each Date's local Y/M/D coordinates strips the
+// wall-clock time and any DST-induced hour skew: a spring-forward day
+// is 23 real hours and a fall-back day is 25, so dividing raw elapsed
+// ms by a fixed 24h drifts by ±1 day across the transition (round-5
+// review MEDIUM). Full timestamps still use elapsed ms because those
+// values are instants, not calendar dates.
+export function calendarDayDiff(from: Date, to: Date): number {
+  const utcFrom = Date.UTC(from.getFullYear(), from.getMonth(), from.getDate());
+  const utcTo = Date.UTC(to.getFullYear(), to.getMonth(), to.getDate());
+  return Math.floor((utcTo - utcFrom) / DAY_MS);
+}
+
 function ageDays(note: NoteSummary): number {
   const raw = note.meta_updated || note.updated_at;
-  const time = parseNoteUpdated(raw);
+  if (DATE_ONLY_RE.test(raw)) {
+    const [y, m, d] = raw.split("-").map(Number);
+    return Math.max(0, calendarDayDiff(new Date(y, m - 1, d), new Date()));
+  }
+  const time = Date.parse(raw);
   if (Number.isNaN(time)) return 0;
   return Math.max(0, Math.floor((Date.now() - time) / DAY_MS));
 }

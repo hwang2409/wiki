@@ -4,7 +4,7 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 
 import { ActivityFeed } from "../src/activity";
 import { GraphView } from "../src/graph";
-import { HealthView, parseNoteUpdated } from "../src/health";
+import { HealthView, calendarDayDiff, parseNoteUpdated } from "../src/health";
 import { TokensView } from "../src/tokens";
 import type { NoteSummary } from "../src/types";
 
@@ -740,6 +740,134 @@ test("health page: negative-offset same-day note reads as today, not 1d", () => 
     );
     const age = document.querySelector<HTMLElement>(".health-age");
     expect(age?.textContent).toBe("today");
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("tokens page: failed request after a preset switch does NOT keep old data under new controls", async () => {
+  let call = 0;
+  const seen: string[] = [];
+  const restore = installFetch(async (input: RequestInfo | URL) => {
+    call += 1;
+    const url = String(input);
+    seen.push(url);
+    if (call === 1) {
+      // 7d snapshot — anchor point for "old data".
+      return jsonResponse({
+        buckets: [
+          {
+            ts: "2026-07-30T10:00:00+00:00",
+            series: { "claude/opus-4-7": { input: 7777, output: 111 } },
+          },
+        ],
+        totals: { input: 7777, cached: 0, output: 111, reasoning: 0 },
+        models: ["opus-4-7"],
+        clis: ["claude"],
+        sessions_scanned: 2,
+        bucket: "hour",
+        refreshing: false,
+      });
+    }
+    // Second call fires when the preset flips to 30d — fail it.
+    throw new Error("30d boom");
+  });
+  try {
+    render(<TokensView />);
+    await waitFor(() => {
+      expect(screen.getByText("7,777")).toBeTruthy();
+    });
+    // Flip preset from 7d (default) to 30d — pickPreset() also swaps
+    // bucketMode to "day", so the second request has a distinct query key.
+    fireEvent.click(screen.getByRole("button", { name: /^30d$/ }));
+    await waitFor(() => {
+      // Full error state must render — stale 7d totals under the active
+      // 30d control would misrepresent the current selection.
+      expect(screen.getByRole("alert").textContent).toContain(
+        "Token usage is unavailable",
+      );
+    });
+    expect(screen.queryByText("7,777")).toBeNull();
+    // Regression guard: banner (which preserves data) must NOT appear
+    // when the failing request describes a different query than the
+    // last-good snapshot.
+    expect(document.querySelector(".tokens-refresh-banner")).toBeNull();
+  } finally {
+    restore();
+  }
+});
+
+test("health page: calendarDayDiff returns whole-calendar-day distance regardless of DST", () => {
+  // Two local Dates on consecutive calendar days should always be 1 day
+  // apart in calendar terms, even when the wall-clock gap is 23h
+  // (spring-forward) or 25h (fall-back) in a DST-observing timezone.
+  const from = new Date(2026, 2, 8);
+  const to = new Date(2026, 2, 9);
+  expect(calendarDayDiff(from, to)).toBe(1);
+
+  const fall = calendarDayDiff(new Date(2026, 10, 1), new Date(2026, 10, 2));
+  expect(fall).toBe(1);
+
+  // 7-day bucket boundary that straddles the spring transition (a naive
+  // ms/86_400_000 divisor would report 6 in a spring-DST env).
+  const weekAgo = new Date(2026, 2, 1);
+  const now = new Date(2026, 2, 8);
+  expect(calendarDayDiff(weekAgo, now)).toBe(7);
+
+  // If the env observes DST, prove the fix is mutation-sensitive by
+  // showing the naive elapsed-ms calculation would drift.
+  const naive = Math.floor(
+    (to.getTime() - from.getTime()) / (24 * 60 * 60 * 1000),
+  );
+  if (naive !== 1) {
+    // Env is spring-forward DST-aware — old logic reported 0 here.
+    expect(calendarDayDiff(from, to)).not.toBe(naive);
+  }
+});
+
+test("health page: parseNoteUpdated stays local-midnight anchored (no regression)", () => {
+  // Round-4 fix must still hold under round-5 rewrite of ageDays.
+  const ms = parseNoteUpdated("2026-07-30");
+  expect(ms).toBe(new Date(2026, 6, 30).getTime());
+});
+
+test("health page: date-only note keeps calendar-day age across a spring-DST bucket boundary", () => {
+  // Only meaningful when the runtime observes DST. When it does, this
+  // test pins wall-clock time to the moment right after spring-forward
+  // and asserts a note dated exactly 7 calendar days earlier reads as
+  // "7d" instead of the drifted "6d" that a fixed 24h divisor produces.
+  const beforeSpring = new Date(2026, 2, 1).getTimezoneOffset();
+  const afterSpring = new Date(2026, 2, 9).getTimezoneOffset();
+  if (beforeSpring === afterSpring) return; // non-DST env, skip.
+
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  // 08:00 local on the day after spring-forward (US: 2026-03-09 EDT).
+  vi.setSystemTime(new Date(2026, 2, 9, 8, 0, 0));
+  const notes: NoteSummary[] = [
+    {
+      id: "n2",
+      path: "vault/notes/week.md",
+      title: "week",
+      note_type: "reference",
+      updated_at: "2026-03-02T08:00:00Z",
+      meta_updated: "2026-03-02",
+      tags: [],
+      aliases: [],
+    } as unknown as NoteSummary,
+  ];
+  try {
+    render(
+      <HealthView
+        error={null}
+        loading={false}
+        notes={notes}
+        notesLoaded
+        onOpenNote={() => {}}
+        onRetry={() => {}}
+      />,
+    );
+    const age = document.querySelector<HTMLElement>(".health-age");
+    expect(age?.textContent).toBe("7d");
   } finally {
     vi.useRealTimers();
   }
