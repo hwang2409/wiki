@@ -1,11 +1,11 @@
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import {
-  applyDiffSnapshot,
   commandExecutionCards,
   CodexStreamHighlights,
   deriveHookChips,
   matchedTerminalInteractions,
+  parseDiffSnapshot,
 } from "../src/codex-stream-renderers";
 import type { ProviderStreamEvent } from "../src/api";
 
@@ -71,7 +71,14 @@ describe("codex stream renderers", () => {
       itemId: "exec-1",
       stdin: "",
     });
-    expect(matchedTerminalInteractions([orphan])).toEqual([]);
+    expect(matchedTerminalInteractions([orphan])).toHaveLength(1);
+    const fallbackCards = commandExecutionCards([orphan]);
+    expect(fallbackCards).toHaveLength(1);
+    expect(fallbackCards[0]?.command).toBeNull();
+    const fallbackRender = render(<CodexStreamHighlights events={[orphan]} />);
+    expect(fallbackRender.container.querySelectorAll(".codex-stream-command-card")).toHaveLength(1);
+    expect(fallbackRender.getByText("exec-1")).toBeTruthy();
+    fallbackRender.unmount();
     const command = event("item_started", 2, {
       item: { id: "exec-1", type: "commandExecution", command: "read prompt" },
     });
@@ -95,17 +102,28 @@ describe("codex stream renderers", () => {
     render(
       <CodexStreamHighlights
         events={[event("turn_moderationMetadata_warning", 1, {
-          metadata: { prompt: { omnimod: { outputs: [{ results: [{ category_flags: { violence: true } }] }] } } },
+          metadata: { prompt: { omnimod: { outputs: [{
+            is_blocked: true,
+            results: [{ labels: ["violence"] }],
+          }] } } },
         })]}
       />,
     );
-    expect(document.querySelector(".codex-stream-warning-flag")?.textContent).toBe("violence");
+    expect(document.querySelector(".codex-stream-warning-flag")?.textContent).toBe("blocked, violence");
   });
 
-  it("keeps rolling diff files keyed by path across snapshots", () => {
+  it("uses the newest complete diff snapshot and drops reverted files", () => {
     const first = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,1 +1,1 @@\n-old\n+new";
     const second = "diff --git a/b.txt b/b.txt\n--- a/b.txt\n+++ b/b.txt\n@@ -1,1 +1,1 @@\n-x\n+y";
-    const files = applyDiffSnapshot(applyDiffSnapshot(new Map(), first), second);
-    expect([...files.keys()]).toEqual(["a.txt", "b.txt"]);
+    render(<CodexStreamHighlights events={[event("turn_diff_updated", 1, { diff: first }), event("turn_diff_updated", 2, { diff: second })]} />);
+    expect(screen.getByText("b.txt")).toBeTruthy();
+    expect(screen.queryByText("a.txt")).toBeNull();
+    expect(document.querySelector(".codex-stream-diff-body")?.textContent).toContain("+y");
+    expect(document.querySelector(".codex-stream-diff-body")?.textContent).not.toContain("+new");
+  });
+
+  it("memoizes parsed diff snapshots by content", () => {
+    const source = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,1 +1,1 @@\n-old\n+new";
+    expect(parseDiffSnapshot(source)).toBe(parseDiffSnapshot(source));
   });
 });

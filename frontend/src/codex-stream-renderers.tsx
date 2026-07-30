@@ -83,20 +83,6 @@ function commandItemId(event: ProviderStreamEvent): string | null {
   return stringValue(params.itemId) ?? stringValue(item?.id);
 }
 
-function commandItemIds(events: ProviderStreamEvent[]): Set<string> {
-  const ids = new Set<string>();
-  for (const event of events) {
-    if (event.kind !== "item_started" && event.kind !== "item_completed") continue;
-    const item = recordValue(eventParams(event).item);
-    const type = stringValue(item?.type);
-    if (type === "commandExecution") {
-      const id = commandItemId(event);
-      if (id) ids.add(id);
-    }
-  }
-  return ids;
-}
-
 export type TerminalInteraction = {
   event: ProviderStreamEvent;
   itemId: string;
@@ -104,7 +90,6 @@ export type TerminalInteraction = {
 };
 
 export function matchedTerminalInteractions(events: ProviderStreamEvent[]): TerminalInteraction[] {
-  const ids = commandItemIds(events);
   return events
     .filter((event) => event.kind === "item_commandExecution_terminalInteraction")
     .map((event) => {
@@ -112,7 +97,7 @@ export function matchedTerminalInteractions(events: ProviderStreamEvent[]): Term
       const stdin = eventParams(event).stdin;
       return itemId && typeof stdin === "string" ? { event, itemId, stdin } : null;
     })
-    .filter((interaction): interaction is TerminalInteraction => Boolean(interaction && ids.has(interaction.itemId)));
+    .filter((interaction): interaction is TerminalInteraction => Boolean(interaction));
 }
 
 export type CommandExecutionCard = {
@@ -129,7 +114,13 @@ export function commandExecutionCards(events: ProviderStreamEvent[]): CommandExe
     current.push(interaction);
     byItem.set(interaction.itemId, current);
   }
-  const cards = new Map<string, CommandExecutionCard>();
+  const cards = new Map<string, CommandExecutionCard>(
+    [...byItem.entries()].map(([itemId, itemInteractions]) => [itemId, {
+      itemId,
+      command: null,
+      interactions: itemInteractions,
+    }]),
+  );
   for (const event of events) {
     if (event.kind !== "item_started" && event.kind !== "item_completed") continue;
     const params = eventParams(event);
@@ -151,23 +142,27 @@ function diffPath(file: DiffFilePatch): string {
   return fileTitle(file);
 }
 
-export function applyDiffSnapshot(
-  previous: ReadonlyMap<string, DiffFilePatch>,
-  source: string,
-): Map<string, DiffFilePatch> {
-  const next = new Map(previous);
-  for (const file of parseUnifiedDiff(source)) next.set(diffPath(file), file);
-  return next;
+const diffSnapshotCache = new Map<string, ReadonlyMap<string, DiffFilePatch>>();
+
+export function parseDiffSnapshot(source: string): ReadonlyMap<string, DiffFilePatch> {
+  const cached = diffSnapshotCache.get(source);
+  if (cached) return cached;
+  const files = new Map<string, DiffFilePatch>();
+  for (const file of parseUnifiedDiff(source)) files.set(diffPath(file), file);
+  diffSnapshotCache.set(source, files);
+  return files;
 }
 
 function diffSnapshots(events: ProviderStreamEvent[]): Map<string, DiffFilePatch> {
-  let files = new Map<string, DiffFilePatch>();
-  for (const event of events) {
-    if (event.kind !== "turn_diff_updated") continue;
-    const diff = stringValue(eventParams(event).diff);
-    if (diff) files = applyDiffSnapshot(files, diff);
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event?.kind !== "turn_diff_updated") continue;
+    const diff = eventParams(event).diff;
+    return typeof diff === "string"
+      ? new Map(parseDiffSnapshot(diff))
+      : new Map();
   }
-  return files;
+  return new Map();
 }
 
 function WarningRenderer({ event, moderation = false }: { event: ProviderStreamEvent; moderation?: boolean }) {
@@ -187,9 +182,14 @@ function WarningRenderer({ event, moderation = false }: { event: ProviderStreamE
       return;
     }
     for (const [key, child] of Object.entries(record)) {
-      const childIsFlagMap = inFlagMap || key === "flag" || key === "flags" || key === "category_flags";
+      const childIsFlagMap = inFlagMap
+        || key === "flag"
+        || key === "flags"
+        || key === "category_flags"
+        || key === "labels";
       if (childIsFlagMap && child === true) addFlag(key);
       else if (childIsFlagMap && typeof child === "string") addFlag(child);
+      else if (key === "is_blocked" && child === true) addFlag("blocked");
       else if (child && typeof child === "object") visitFlags(child, childIsFlagMap);
     }
   };

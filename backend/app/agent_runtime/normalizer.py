@@ -100,7 +100,7 @@ def _codex_state(payload: dict[str, Any]) -> LifecycleState | None:
 
 
 def _codex_moderation_flags(params: object) -> list[str]:
-    """Extract active flags from Codex's nested moderation metadata maps."""
+    """Extract active flags from Codex's nested moderation metadata payloads."""
 
     if not isinstance(params, dict):
         return []
@@ -109,10 +109,15 @@ def _codex_moderation_flags(params: object) -> list[str]:
     def walk(value: object, *, in_flag_map: bool = False) -> None:
         if isinstance(value, dict):
             for key, child in value.items():
-                is_flag_map = in_flag_map or key in {"flag", "flags", "category_flags"}
+                if key == "is_blocked" and child is True:
+                    flags.append("blocked")
+                    continue
+                is_flag_map = in_flag_map or key in {"flag", "flags", "category_flags", "labels"}
                 if is_flag_map and isinstance(child, bool):
                     if child and key.lower() != "safe":
                         flags.append(key)
+                elif is_flag_map and isinstance(child, str) and child.lower() != "safe":
+                    flags.append(child)
                 elif isinstance(child, (dict, list)):
                     walk(child, in_flag_map=is_flag_map)
             return

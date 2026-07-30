@@ -293,6 +293,32 @@ class ProtocolFixtureTests(unittest.TestCase):
         self.assertEqual(warning.disposition, EventDisposition.RENDERED)
         self.assertEqual(warning.kind, "turn_moderationMetadata_warning")
 
+    def test_codex_moderation_metadata_warns_for_blocked_payload_shapes(self) -> None:
+        payloads = (
+            {
+                "metadata": {
+                    "prompt": {
+                        "omnimod": {"outputs": [{"is_blocked": True}]}
+                    }
+                }
+            },
+            {
+                "metadata": {
+                    "prompt": {
+                        "omnimod": {"outputs": [{"results": [{"labels": ["violence"]}]}]}
+                    }
+                }
+            },
+        )
+        for params in payloads:
+            with self.subTest(params=params):
+                normalized = normalize_provider_event(
+                    ProviderKind.CODEX,
+                    {"method": "turn/moderationMetadata", "params": params},
+                )
+                self.assertEqual(normalized.disposition, EventDisposition.RENDERED)
+                self.assertEqual(normalized.kind, "turn_moderationMetadata_warning")
+
     def test_codex_render_artifact_completion_normalizes_as_artifact(self) -> None:
         row = json.loads(
             (FIXTURES / "codex_render_artifact_completed.jsonl").read_text(
