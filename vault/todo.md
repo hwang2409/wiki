@@ -15,6 +15,7 @@ Todo:
 - [P3] WIKI-185 auto-plan mode — given Linear-style problem statement, LLM decomposes into subtasks; each renders as workgraph node; orch can edit/reorder before spawning. Backend: planner endpoint. Frontend: plan editor
 - [P3] WIKI-186 steer macros — reusable snippets in composer (reviewer prompt, mutation-verify contract, canonical-writer regression, iteration-cap check); one-click apply w/ ticket-name substitution. Cuts recurring prompt drafting
 - [P3] WIKI-187 hot.md dedicated editor UI — arc-boundary rewrite surface: split-pane w/ live preview, section templates (Active threads / Recent facts / Watchouts), word-count budget indicator (≤500 target). Currently hand-edited via Read/Edit tools
+- [P2] WIKI-177 blast radius view pre-spawn — PARKED 2026-07-30 by overnight orch after 7 review rounds: PR #147 open at 53ecaf7 + round-7 attestation refactor pushed; two structural false-clear blockers remain (blast_radius_cache.py:44 raw-tuple bypass; blast_radius_types.py:300 count-vs-identity fold — dropping an attestation passes all tests). Worktree .codex/worktrees/wiki-177-blast-radius + branch preserved. Resume = fresh implementer on those two items + REVIEW8, or Henry descope/close call
 
 Silky-smooth artifact rendering arc (Henry 2026-07-29):
 
@@ -64,7 +65,6 @@ In Progress:
 - [P2] PHO-13826 ModalSandboxBackend + PHO-13827 sandbox ownership — workers live (Modal replaces exe.dev for v0; 13828 lifecycle + 13829 egress design queued)
 - mitmweb rebuild: scope and build a clearer live proxy-traffic inspector — owner (misc); merged through B6 (tooling PR #10, 2026-07-21); remaining: P1 packaging
 - WIKI-135 dashboard: implementation workers only (drop reviewers/one-shots) — owner cdx:WIKI-135 (luna)
-- [P2] WIKI-177 blast radius view pre-spawn — before spawning ticket X, compute which in-flight branches touch same files (git diff main..branch per active branch); display collision-risk preview in spawn dialog. Prevents rebase pain
 - [P1] WIKI-190 video/GIF artifact kind — new `kind: video` inline player (mp4/webm/gif). Controls: play/pause/scrubber/speed/mute; poster frame lazy-load; loop-by-default for GIFs. Useful for Playwright recordings, mitmproxy captures, animated diagrams
 - [P2] WIKI-191 audio artifact kind — new `kind: audio` inline w/ waveform preview + scrubber + speed control; transcript overlay if attached. For voice memos, TTS output, transcription evidence
 - [P2] WIKI-181 reviewer diversity harness — spawn N reviewers w/ distinct lenses (correctness / security / perf / test-strength) in parallel; synthesize verdicts. Codified adversarial verify — one lens catches what another misses. Wire into next_review (WIKI-171) as opt-in mode
