@@ -3,7 +3,12 @@ import type { KeyboardEvent } from "react";
 import { createPortal } from "react-dom";
 import { Bot, Ticket, Image as ImageIcon, FileText } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
-import { searchPalette, type PaletteResult, type PaletteResultKind } from "./api";
+import {
+  searchPalette,
+  type PaletteResult,
+  type PaletteResultKind,
+  type PaletteSearchMode,
+} from "./api";
 
 const KIND_ORDER: PaletteResultKind[] = ["session", "ticket", "artifact", "note"];
 
@@ -55,6 +60,11 @@ function relativeTime(iso: string | null): string {
 export function CommandPalette({ onClose, onOpen }: CommandPaletteProps) {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<PaletteResult[]>([]);
+  const [lexicalResults, setLexicalResults] = useState<PaletteResult[]>([]);
+  const [semanticResults, setSemanticResults] = useState<PaletteResult[]>([]);
+  const [semanticAvailable, setSemanticAvailable] = useState(true);
+  const [semanticUnavailableReason, setSemanticUnavailableReason] = useState<string | null>(null);
+  const [mode, setMode] = useState<PaletteSearchMode>("lexical");
   const [loading, setLoading] = useState(false);
   const [selected, setSelected] = useState(0);
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -94,12 +104,22 @@ export function CommandPalette({ onClose, onOpen }: CommandPaletteProps) {
     const timer = window.setTimeout(async () => {
       setLoading(true);
       try {
-        const payload = await searchPalette(query, 30, controller.signal);
+        const payload = await searchPalette(query, 30, controller.signal, mode);
         setResults(payload.results);
+        setLexicalResults(payload.lexical_results ?? payload.results);
+        setSemanticResults(payload.semantic_results ?? []);
+        setSemanticAvailable(payload.semantic_available ?? true);
+        setSemanticUnavailableReason(payload.semantic_unavailable_reason ?? null);
         setSelected(0);
       } catch (error) {
         if ((error as { name?: string }).name !== "AbortError") {
           setResults([]);
+          setLexicalResults([]);
+          setSemanticResults([]);
+          if (mode === "semantic") {
+            setSemanticAvailable(false);
+            setSemanticUnavailableReason("semantic search unavailable; showing lexical matches");
+          }
         }
       } finally {
         setLoading(false);
@@ -109,9 +129,15 @@ export function CommandPalette({ onClose, onOpen }: CommandPaletteProps) {
       controller.abort();
       window.clearTimeout(timer);
     };
-  }, [query]);
+  }, [mode, query]);
 
   const groups = useMemo(() => {
+    if (mode === "semantic") {
+      return [
+        { kind: "lexical", label: "Lexical matches", items: lexicalResults },
+        { kind: "semantic", label: "Semantic matches", items: semanticResults },
+      ].filter((group) => group.items.length > 0);
+    }
     const byKind = new Map<PaletteResultKind, PaletteResult[]>();
     for (const result of results) {
       const bucket = byKind.get(result.kind) ?? [];
@@ -120,9 +146,10 @@ export function CommandPalette({ onClose, onOpen }: CommandPaletteProps) {
     }
     return KIND_ORDER.filter((kind) => (byKind.get(kind) ?? []).length > 0).map((kind) => ({
       kind,
+      label: KIND_LABEL[kind],
       items: byKind.get(kind) ?? [],
     }));
-  }, [results]);
+  }, [lexicalResults, mode, results, semanticResults]);
 
   const flatResults = useMemo(() => groups.flatMap((group) => group.items), [groups]);
 
@@ -208,6 +235,23 @@ export function CommandPalette({ onClose, onOpen }: CommandPaletteProps) {
         onClick={(event) => event.stopPropagation()}
         onKeyDown={handleDialogKeyDown}
       >
+        <div className="command-palette-mode" role="group" aria-label="Search mode">
+          <span className="command-palette-mode-label">search</span>
+          {(["lexical", "semantic"] as PaletteSearchMode[]).map((option) => (
+            <button
+              aria-pressed={mode === option}
+              className={`command-palette-mode-button${mode === option ? " is-selected" : ""}`}
+              key={option}
+              type="button"
+              onClick={() => {
+                setMode(option);
+                setSelected(0);
+              }}
+            >
+              {option}
+            </button>
+          ))}
+        </div>
         <input
           ref={inputRef}
           aria-activedescendant={
@@ -222,6 +266,11 @@ export function CommandPalette({ onClose, onOpen }: CommandPaletteProps) {
           value={query}
           onChange={(event) => setQuery(event.target.value)}
         />
+        {mode === "semantic" && !semanticAvailable ? (
+          <div className="command-palette-status" role="status">
+            {semanticUnavailableReason ?? "semantic search is unavailable; showing lexical matches"}
+          </div>
+        ) : null}
         <div
           id="command-palette-results"
           className="quick-switcher-results command-palette-results"
@@ -230,10 +279,12 @@ export function CommandPalette({ onClose, onOpen }: CommandPaletteProps) {
         >
           {groups.length > 0 ? (
             groups.map((group) => {
-              const KindIcon = KIND_ICON[group.kind];
+              const KindIcon = group.kind === "semantic" || group.kind === "lexical"
+                ? FileText
+                : KIND_ICON[group.kind as PaletteResultKind];
               return (
                 <div className="quick-switcher-group command-palette-group" key={group.kind}>
-                  <div className="quick-switcher-group-label">{KIND_LABEL[group.kind]}</div>
+                  <div className="quick-switcher-group-label">{group.label}</div>
                   {group.items.map((item) => {
                     const index = flatResults.indexOf(item);
                     const active = index === selected;

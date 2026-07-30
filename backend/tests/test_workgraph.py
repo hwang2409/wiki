@@ -1271,6 +1271,17 @@ class CorruptHotFileTests(unittest.TestCase):
     def test_missing_file_loads_as_none(self) -> None:
         self.assertIsNone(workgraph.load_workgraph("TST-1", self.status_dir))
 
+    def test_shaped_ticket_is_rejected_before_path_access(self) -> None:
+        with self.assertRaises(workgraph.WorkgraphError):
+            workgraph.load_workgraph("--FOO", self.status_dir)
+
+    def test_symlink_hot_file_is_not_followed(self) -> None:
+        target = self.status_dir / "outside.json"
+        target.write_text("{}", encoding="utf-8")
+        self.hot().symlink_to(target)
+        with self.assertRaises(workgraph.WorkgraphCorruptError):
+            workgraph.load_workgraph("TST-1", self.status_dir)
+
     def test_malformed_json_fails_closed(self) -> None:
         self.hot().write_text("{not json", encoding="utf-8")
         with self.assertRaises(workgraph.WorkgraphCorruptError):

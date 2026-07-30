@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 
 
 def is_corruption_error(exc: BaseException) -> bool:
@@ -33,6 +33,7 @@ def reset_schema(connection: sqlite3.Connection) -> None:
         DROP TABLE IF EXISTS events;
         DROP TABLE IF EXISTS runs;
         DROP TABLE IF EXISTS notes;
+        DROP TABLE IF EXISTS note_embeddings;
         DROP TABLE IF EXISTS meta;
 
         CREATE TABLE meta (

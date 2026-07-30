@@ -6,11 +6,12 @@ import {
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
 } from "react";
-import { Bot, GitBranch, GitPullRequest, RefreshCw, X } from "lucide-react";
+import { Bot, GitBranch, GitPullRequest, History, RefreshCw, X } from "lucide-react";
 import { AgentPrReviewPanel } from "./agent-pr-review";
 import { LoopStateChrome } from "./loop-state-chrome";
 import { WorkgraphPanel } from "./workgraph-panel";
 import { ArtifactPanel } from "./artifact-panel";
+import { ReplayScrubberPanel } from "./replay-scrubber-panel";
 import { deletePaneStateEntries } from "./pane-state-cache";
 import { ReplaceAgentModal } from "./replace-agent-modal";
 import { getTicketCosts, type CostRow, type SessionEvent, type SpawnWorkerEffort, type SpawnWorkerKind } from "./api";
@@ -67,6 +68,7 @@ function writePanelUrl(ticket: string, state: PanelState, replace = false) {
 type SidePanelState =
   | { kind: "review" }
   | { kind: "graph" }
+  | { kind: "replay" }
   | { kind: "subagent"; subagent: string }
   | null;
 
@@ -246,6 +248,32 @@ function WorkgraphSidePanel({
       width={width}
     >
       <WorkgraphPanel ticket={ticket} tick={tick} />
+    </SessionSidePanel>
+  );
+}
+
+function ReplaySidePanel({
+  onClose,
+  onResizeStart,
+  ticket,
+  width,
+}: {
+  onClose: () => void;
+  onResizeStart: (event: ReactPointerEvent<HTMLDivElement>) => void;
+  ticket: string;
+  width: number;
+}) {
+  return (
+    <SessionSidePanel
+      badge="replay"
+      className="session-side-panel-replay"
+      icon={<History size={13} />}
+      onClose={onClose}
+      onResizeStart={onResizeStart}
+      title={ticket}
+      width={width}
+    >
+      <ReplayScrubberPanel ticket={ticket} />
     </SessionSidePanel>
   );
 }
@@ -584,6 +612,17 @@ export function AgentSessionSurface({
                 <GitBranch size={13} />
                 Graph
               </button>
+              <button
+                className={`agent-surface-action${panel?.kind === "replay" ? " is-active" : ""}`}
+                type="button"
+                onClick={() => {
+                  if (panelState.open) closeArtifactPanel();
+                  setPanel((current) => (current?.kind === "replay" ? null : { kind: "replay" }));
+                }}
+              >
+                <History size={13} />
+                Replay
+              </button>
               {onClose ? (
                 <button
                   aria-label="Close pane"
@@ -635,6 +674,13 @@ export function AgentSessionSurface({
           onResizeStart={resizePanel}
           ticket={worker.ticket}
           tick={tick}
+          width={panelWidth}
+        />
+      ) : panel?.kind === "replay" ? (
+        <ReplaySidePanel
+          onClose={() => setPanel(null)}
+          onResizeStart={resizePanel}
+          ticket={worker.ticket}
           width={panelWidth}
         />
       ) : panel?.kind === "subagent" ? (

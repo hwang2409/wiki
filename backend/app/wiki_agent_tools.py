@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from . import backend_runtime
 from .next_review_schema import mcp_input_schema
+from .rebase_schema import mcp_input_schema as rebase_input_schema
 
 
 class AgentToolError(RuntimeError):
@@ -75,7 +76,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "spawn_agent",
         "description": (
             "Spawn one supervisor-owned worker. Always pass this orchestrator's id in "
-            "orch. request_id is generated when omitted; reuse an explicit value on retry."
+            "orch. request_id is generated when omitted; reuse an explicit value on retry. "
+            "Set context_prelude=true to prepend bounded local context."
         ),
         "inputSchema": {
             "type": "object",
@@ -91,6 +93,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "prompt": {"type": "string", "minLength": 1},
                 "orch": {"type": "string", "minLength": 1},
                 "request_id": {"type": "string", "minLength": 1, "maxLength": 200},
+                "title": {"type": "string", "maxLength": 500},
+                "context_prelude": {"type": "boolean", "default": False},
+                "include_context": {"type": "boolean", "default": False},
+                "context_prelude_override": {"type": "string", "maxLength": 5000},
             },
         },
     },
@@ -161,6 +167,17 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         ),
         "inputSchema": {
             **mcp_input_schema(),
+        },
+    },
+    {
+        "name": "rebase_dirty_pr",
+        "description": (
+            "If a PR gate reports CONFLICTING, start a scoped low-effort Codex "
+            "helper in the existing worker worktree to resolve mechanical "
+            "conflicts and escalate semantic conflicts."
+        ),
+        "inputSchema": {
+            **rebase_input_schema(),
         },
     },
     {
@@ -306,7 +323,14 @@ def spawn_agent(arguments: Any) -> dict[str, Any]:
     values = _arguments(
         arguments,
         required={"ticket", "kind", "role", "model", "workdir", "prompt", "orch"},
-        optional={"effort", "request_id"},
+        optional={
+            "effort",
+            "request_id",
+            "title",
+            "context_prelude",
+            "include_context",
+            "context_prelude_override",
+        },
     )
     values.setdefault("effort", None)
     values.setdefault("request_id", str(uuid4()))
@@ -407,6 +431,13 @@ def next_review(arguments: Any) -> dict[str, Any]:
     return _backend_api("POST", "/api/agents/next-review", values)
 
 
+def rebase_dirty_pr(arguments: Any) -> dict[str, Any]:
+    values = _arguments(arguments, required={"pr_number", "ticket", "worker_id"})
+    if not isinstance(values["pr_number"], int) or isinstance(values["pr_number"], bool):
+        raise AgentToolError("pr_number must be an integer")
+    return _backend_api("POST", "/api/agents/rebase-dirty-pr", values)
+
+
 def autopilot_enable(arguments: Any) -> dict[str, Any]:
     values = _arguments(
         arguments,
@@ -451,6 +482,7 @@ TOOL_HANDLERS = {
     "replace_agent": replace_agent,
     "archive_agent": archive_agent,
     "next_review": next_review,
+    "rebase_dirty_pr": rebase_dirty_pr,
     "autopilot_enable": autopilot_enable,
     "autopilot_disable": autopilot_disable,
     "autopilot_status": autopilot_status,

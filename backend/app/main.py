@@ -13,7 +13,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -31,12 +31,14 @@ from . import (
     accounts,
     backend_runtime,
     blast_radius,
+    context_prelude,
     dashboard,
     github_pr,
     github_preview,
     knowledge,
     palette,
     provider_health,
+    replay,
     terminal,
     tokens,
     transcripts,
@@ -65,6 +67,7 @@ from .agent_runtime.ticket import base_ticket
 from .agent_runtime.unknown_kind_telemetry import UnknownKindTelemetry
 from .frontend_static import mount_frontend_static
 from .next_review_schema import NextReviewIn
+from .rebase_schema import RebaseDirtyPrIn
 
 
 ROOT_DIR = Path(os.environ.get("WIKI_REPO_DIR", Path(__file__).resolve().parents[2])).resolve()
@@ -102,11 +105,65 @@ UNKNOWN_KIND_TELEMETRY: UnknownKindTelemetry | None = None
 logger = logging.getLogger(__name__)
 
 
+_REBASE_RECORDING_NOTIFIER: Callable[[str, str, str], None] | None = None
+
+
+def install_rebase_recording_notifier(
+    sender: Callable[[str, str, str], None] | None,
+) -> None:
+    """Route rebase-bot notifications to a recorder instead of the live channel.
+
+    Tests install a recorder before invoking rebase flows so they can assert
+    deliveries; passing ``None`` restores the default live path.  The recorder
+    takes priority over the pytest safety guard, so a test that installs a
+    recorder gets real observations of every delivery.  The recorder
+    receives the stable ``delivery_id`` as its third argument so tests can
+    verify the id propagates all the way through.
+    """
+
+    global _REBASE_RECORDING_NOTIFIER
+    _REBASE_RECORDING_NOTIFIER = sender
+
+
+def _rebase_bot_notification_sender(
+    target: str, text: str, delivery_id: str = ""
+) -> None:
+    """Send one rebase result through the configured agent message path.
+
+    ``delivery_id`` becomes ``MessageIn.dedupe_key`` so the receiving
+    orchestrator inbox drops duplicates from the outbox's bounded retry
+    loop.  Without this key threaded through, a transient sender failure
+    would silently stack N copies of the same rebase result.
+    """
+
+    recorder = _REBASE_RECORDING_NOTIFIER
+    if recorder is not None:
+        recorder(target, text, delivery_id)
+        return
+    # Fallback safety: if no recorder is installed and pytest is running,
+    # drop the message rather than paging live operators from a test.
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return
+    agent_message(
+        target,
+        MessageIn(
+            text=text,
+            mode="now",
+            source="rebase-bot",
+            dedupe_key=delivery_id or None,
+        ),
+        BackgroundTasks(),
+    )
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     global UNKNOWN_KIND_TELEMETRY
     blast_radius.OPEN_PR_SNAPSHOT.start()
     runtime_paths = RuntimePaths.from_env()
+    from .agent_runtime import rebase_bot
+
+    rebase_bot.resume_pending_jobs(notify=_rebase_bot_notification_sender)
     UNKNOWN_KIND_TELEMETRY = UnknownKindTelemetry(runtime_paths)
     configured_backend = os.environ.get("WIKI_BACKEND_URL")
     if configured_backend:
@@ -275,8 +332,16 @@ class NoteSummary(BaseModel):
     meta_updated: str | None = None
 
 
+class AssetMeta(BaseModel):
+    width: int
+    height: int
+    media_type: str
+    preview_base64: str | None = None
+
+
 class Note(NoteSummary):
     content: str
+    asset_meta: dict[str, AssetMeta] = Field(default_factory=dict)
 
 
 class NoteCreate(BaseModel):
@@ -710,9 +775,126 @@ def to_summary(path: Path) -> NoteSummary:
     )
 
 
+_IMAGE_EXTENSION_RE = re.compile(r"\.(png|jpe?g|gif|webp|svg)(?:[?#]|$)", re.IGNORECASE)
+# CommonMark image link: `![alt](destination[ "title"])`. The destination
+# may be wrapped in `<>` (allowing spaces) or a bare token that runs until
+# whitespace or the closing paren. Any following title is stripped.
+_MARKDOWN_IMAGE_RE = re.compile(
+    r"""
+    !\[[^\]]*\]                # ![alt]
+    \(                         # opening paren
+    \s*                        # optional leading whitespace
+    (?:
+        <(?P<angle>[^>\n]*)>   # angle-bracketed path (may contain spaces)
+        |
+        (?P<bare>[^\s()]+)     # bare path — no whitespace, no parens
+    )
+    (?:\s+
+        (?:"[^"]*"             # "title"
+         | '[^']*'             # 'title'
+         | \([^)]*\)           # (title)
+        )
+    )?
+    \s*
+    \)
+    """,
+    re.VERBOSE,
+)
+_OBSIDIAN_EMBED_RE = re.compile(r"!\[\[([^\][|]+?)(?:\|[^\][]*)?\]\]")
+
+
+def _extract_note_image_paths(content: str, note_path: str) -> list[str]:
+    """Return de-duplicated vault-relative paths for every image the note
+    references. Skips external URLs and anything without an image extension.
+
+    Handles CommonMark features the previous regex missed: link titles
+    (`![](path "title")`), angle-bracketed paths with spaces
+    (`![](<my image.png>)`), and percent-encoded characters (`%20`).
+    """
+    if not content:
+        return []
+    from urllib.parse import unquote
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def push(candidate: str) -> None:
+        if candidate in seen:
+            return
+        seen.add(candidate)
+        candidates.append(candidate)
+
+    def note_relative(target: str) -> list[str]:
+        # Split on the LITERAL query / fragment delimiters first — decoding
+        # before splitting would treat `hero%23draft.png` or
+        # `hero%3Fdraft.png` as if they carried a real `#` or `?`, silently
+        # dropping the actual filename tail.
+        without_query = target.split("?", 1)[0].split("#", 1)[0]
+        try:
+            stripped = unquote(without_query).strip()
+        except (UnicodeDecodeError, ValueError):
+            stripped = without_query.strip()
+        if not stripped or stripped.startswith("/"):
+            return []
+        if re.match(r"^[a-z][a-z0-9+.-]*:", stripped, re.IGNORECASE):
+            return []
+        if stripped.startswith("//"):
+            return []
+        if not _IMAGE_EXTENSION_RE.search(stripped):
+            return []
+        cleaned = stripped.replace("\\", "/")
+        parts = [segment for segment in cleaned.split("/") if segment not in ("", ".")]
+        note_dir = note_path.rsplit("/", 1)[0] if "/" in note_path else ""
+        base_parts = [segment for segment in note_dir.split("/") if segment]
+        results: list[str] = []
+        for base in ([base_parts] if base_parts else []) + [[]]:
+            stack = list(base)
+            good = True
+            for part in parts:
+                if part == "..":
+                    if not stack:
+                        good = False
+                        break
+                    stack.pop()
+                else:
+                    stack.append(part)
+            if good and stack:
+                results.append("/".join(stack))
+        return results
+
+    for match in _MARKDOWN_IMAGE_RE.finditer(content):
+        raw = match.group("angle") or match.group("bare") or ""
+        for candidate in note_relative(raw):
+            push(candidate)
+    for match in _OBSIDIAN_EMBED_RE.finditer(content):
+        for candidate in note_relative(match.group(1)):
+            push(candidate)
+    return candidates
+
+
+def _collect_note_asset_meta(content: str, note_path: str) -> dict[str, AssetMeta]:
+    """Resolve each image reference in the note to `AssetMeta`, silently
+    dropping anything that resolves outside the vault or fails to decode."""
+    result: dict[str, AssetMeta] = {}
+    for candidate in _extract_note_image_paths(content, note_path):
+        try:
+            raw, media_type = _read_vault_asset_bytes(candidate)
+        except HTTPException:
+            continue
+        if media_type not in _VAULT_ASSET_RESIZE_MIMES:
+            continue
+        payload = _asset_meta_for(raw, media_type)
+        if payload is None:
+            continue
+        result[candidate] = AssetMeta(**payload)
+    return result
+
+
 def to_note(path: Path) -> Note:
     summary = to_summary(path)
-    return Note(**summary.model_dump(), content=read_note(path))
+    content = read_note(path)
+    asset_meta = _collect_note_asset_meta(content, summary.path)
+    return Note(**summary.model_dump(), content=content, asset_meta=asset_meta)
 
 
 def iter_note_files() -> list[Path]:
@@ -2037,7 +2219,10 @@ async def palette_search(
     request: Request,
     q: str = "",
     limit: int = palette.DEFAULT_LIMIT,
+    mode: str = "lexical",
 ) -> dict[str, object]:
+    if mode not in {"lexical", "semantic"}:
+        raise HTTPException(status_code=422, detail="mode must be lexical or semantic")
     agents_payload = agents()
 
     # Palette walk (session index + vault stat + artifact scan) runs in the
@@ -2078,7 +2263,95 @@ async def palette_search(
             await watcher
         except asyncio.CancelledError:
             pass
-    return {"results": results}
+    if mode == "lexical":
+        return {"mode": mode, "results": results}
+
+    def _semantic() -> dict[str, object]:
+        index = knowledge.KnowledgeIndex.from_env(
+            runtime_dir=RuntimePaths.from_env().runtime_dir,
+            archive_dir=AGENT_ARCHIVE_DIR,
+            vault_dir=VAULT_DIR,
+        )
+        try:
+            payload = index.search_semantic(q, limit=limit)
+        except knowledge.KnowledgeQueryError:
+            return {
+                "results": [],
+                "semantic": index.semantic_status(),
+                "rebuilding": index.rebuilding,
+                "stale": True,
+            }
+        except knowledge.KnowledgeError as exc:
+            logger.warning("semantic palette search unavailable: %s", exc)
+            return {
+                "results": [],
+                "semantic": {
+                    "available": False,
+                    "model": None,
+                    "reason": f"semantic search unavailable: {exc}",
+                },
+                "rebuilding": True,
+                "stale": True,
+            }
+        return payload
+
+    semantic = await asyncio.to_thread(_semantic)
+    semantic_status = semantic.get("semantic")
+    semantic_is_available = bool(
+        isinstance(semantic_status, dict) and semantic_status.get("available")
+    )
+    semantic_results = [
+        {
+            "kind": "note",
+            "id": f"semantic:{row['path']}",
+            "title": row.get("title") or row["path"],
+            "subtitle": row.get("snippet") or row["path"],
+            "url": f"#/note/{row['path']}",
+            "updated_at": None,
+            "score": row.get("score", 0),
+        }
+        for row in semantic.get("semantic_results", semantic.get("results", []))
+        if isinstance(row, dict) and isinstance(row.get("path"), str)
+    ] if semantic_is_available else []
+    return {
+        "mode": mode,
+        "results": results,
+        "lexical_results": results,
+        "semantic_results": semantic_results,
+        "semantic_available": semantic_is_available,
+        "semantic_unavailable_reason": (
+            semantic_status.get("reason")
+            if isinstance(semantic_status, dict)
+            else "semantic search unavailable"
+        ),
+        "rebuilding": semantic.get("rebuilding", False),
+        "stale": semantic.get("stale", False),
+    }
+
+
+@app.get("/api/knowledge/search")
+async def knowledge_search(
+    q: str,
+    mode: str = "lexical",
+    ticket: str | None = None,
+    kind: str | None = None,
+    limit: int = 20,
+) -> dict[str, object]:
+    if mode not in {"lexical", "semantic"}:
+        raise HTTPException(status_code=422, detail="mode must be lexical or semantic")
+
+    def _run() -> dict[str, object]:
+        index = knowledge.KnowledgeIndex.from_env()
+        if mode == "semantic":
+            return index.search_semantic(q, ticket=ticket, limit=limit)
+        return index.search(q, ticket=ticket, kind=kind, limit=limit)
+
+    try:
+        return await asyncio.to_thread(_run)
+    except knowledge.KnowledgeQueryError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except knowledge.KnowledgeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @app.get("/api/agents/{ticket}/pr")
@@ -2852,6 +3125,81 @@ def agent_provider_events(
     return result
 
 
+def _open_runs_root_fd_or_404() -> int:
+    try:
+        return replay.open_runs_root_fd(AGENT_RUNS_DIR)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Runs root missing") from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Runs root unreadable: {exc}") from exc
+
+
+def _validate_run_id_or_400(run_id: str) -> None:
+    if not replay.valid_run_id(run_id):
+        raise HTTPException(status_code=400, detail="Bad run id")
+
+
+@app.get("/api/agents/{ticket}/replay/runs")
+def agent_replay_runs(ticket: str) -> dict[str, object]:
+    if not TICKET_PATTERN.fullmatch(ticket):
+        raise HTTPException(status_code=400, detail="Bad ticket")
+    runs_root_fd = _open_runs_root_fd_or_404()
+    try:
+        listing = replay.resolve_ticket_runs(runs_root_fd, ticket)
+    finally:
+        os.close(runs_root_fd)
+    return {
+        "ticket": ticket,
+        "runs": [run.as_dict() for run in listing.runs],
+        "runs_truncated": listing.truncated,
+    }
+
+
+@app.get("/api/agent-runs/{run_id}/replay/timeline")
+def agent_run_replay_timeline(
+    run_id: str,
+    cursor: str | None = None,
+    limit: int = replay.DEFAULT_LIMIT,
+) -> dict[str, object]:
+    _validate_run_id_or_400(run_id)
+    if limit < 1 or limit > replay.MAX_LIMIT:
+        raise HTTPException(
+            status_code=400,
+            detail=f"limit must be between 1 and {replay.MAX_LIMIT}",
+        )
+    runs_root_fd = _open_runs_root_fd_or_404()
+    try:
+        replay.verify_run_dir_exists(runs_root_fd, run_id)
+        return replay.build_timeline_response(
+            runs_root_fd,
+            run_id,
+            cursor=cursor,
+            limit=limit,
+        )
+    except replay.ReplayError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    finally:
+        os.close(runs_root_fd)
+
+
+@app.get("/api/agent-runs/{run_id}/replay/events/{seq}")
+def agent_run_replay_event(run_id: str, seq: int) -> dict[str, object]:
+    if seq <= 0:
+        raise HTTPException(status_code=400, detail="Seq must be positive")
+    _validate_run_id_or_400(run_id)
+    runs_root_fd = _open_runs_root_fd_or_404()
+    try:
+        replay.verify_run_dir_exists(runs_root_fd, run_id)
+        entry = replay.load_raw_event(runs_root_fd, run_id, seq)
+    except replay.ReplayError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    finally:
+        os.close(runs_root_fd)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Event not found")
+    return {"run_id": run_id, "seq": seq, "raw": entry}
+
+
 def _session_delta_payload(
     fmt: str,
     path: Path,
@@ -3528,6 +3876,10 @@ class SpawnWorkerIn(BaseModel):
     workdir: str = Field(..., min_length=1, max_length=4096)
     orch: str | None = Field(default=None, max_length=100)
     prompt: str = Field(..., min_length=1, max_length=100_000)
+    title: str = Field(default="", max_length=500)
+    context_prelude: bool = False
+    include_context: bool = False
+    context_prelude_override: str | None = Field(default=None, max_length=5_000)
     request_id: str | None = Field(default=None, min_length=1, max_length=200)
 
     @model_validator(mode="after")
@@ -3539,6 +3891,13 @@ class SpawnWorkerIn(BaseModel):
         if kind == "cc" and effort is not None:
             raise ValueError("Claude workers do not accept reasoning effort")
         return self
+
+
+class ContextPreludeIn(BaseModel):
+    ticket: str = Field(..., min_length=1, max_length=80)
+    title: str = Field(default="", max_length=500)
+    prompt: str = Field(default="", max_length=100_000)
+    workdir: str = Field(..., min_length=1, max_length=4096)
 
 
 class SpawnOrchestratorIn(BaseModel):
@@ -4027,6 +4386,81 @@ def cancel_agent_model(ticket: str) -> dict[str, object]:
     return {"status": result.get("status", "canceled"), "desired_model": None}
 
 
+def _build_context_prelude(
+    *,
+    ticket: str,
+    title: str,
+    prompt: str,
+    repo_root: Path,
+) -> context_prelude.PreludeResult:
+    builder = context_prelude.ContextPreludeBuilder(
+        repo_root=repo_root,
+        vault_dir=VAULT_DIR,
+        status_dir=AGENT_STATUS_DIR,
+        runtime_dir=AGENT_RUNTIME_DIR,
+        archive_dir=AGENT_ARCHIVE_DIR,
+    )
+    return builder.build(ticket=ticket, title=title, prompt=prompt)
+
+
+def _contextual_prompt(
+    body: SpawnWorkerIn,
+    *,
+    repo_root: Path,
+) -> str:
+    if not (body.context_prelude or body.include_context):
+        return body.prompt
+    if body.context_prelude_override is not None:
+        prelude = context_prelude.bound_override(body.context_prelude_override)
+    else:
+        try:
+            prelude = _build_context_prelude(
+                ticket=body.ticket,
+                title=body.title,
+                prompt=body.prompt,
+                repo_root=repo_root,
+            ).text
+        except Exception as exc:
+            # Context is an optional enhancement. A broken source or path can
+            # never prevent the underlying worker spawn.
+            logger.warning("context prelude unavailable for %s: %s", body.ticket, exc)
+            return body.prompt
+    return context_prelude.prepend(prelude, body.prompt)
+
+
+@app.post("/api/agents/context-prelude")
+def context_prelude_route(body: ContextPreludeIn) -> dict[str, object]:
+    ticket = body.ticket.strip().upper()
+    if not SPAWN_TICKET_PATTERN.fullmatch(ticket):
+        raise HTTPException(
+            status_code=400,
+            detail="Ticket must be uppercase letters, numbers, or dashes",
+        )
+    workdir_path = resolve_existing_dir(body.workdir, field_name="Working directory")
+    try:
+        result = _build_context_prelude(
+            ticket=ticket,
+            title=body.title,
+            prompt=body.prompt,
+            repo_root=workdir_path,
+        )
+    except context_prelude.PreludeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.warning("context prelude preview failed for %s: %s", ticket, exc)
+        return {
+            "prelude": "# context prelude\n[context retrieval unavailable; continue with the kickoff prompt]",
+            "truncated": False,
+            "sources": {},
+        }
+    return {
+        "prelude": result.text,
+        "truncated": result.truncated,
+        "sources": result.sources,
+        "char_budget": context_prelude.MAX_PRELUDE_CHARS,
+    }
+
+
 def spawn_agent(
     body: dict[str, Any] | SpawnWorkerIn,
     *,
@@ -4056,6 +4490,12 @@ def spawn_agent(
         raise HTTPException(status_code=400, detail="Kickoff prompt must be smaller than 100KB")
 
     workdir_path = resolve_existing_dir(body.workdir, field_name="Working directory")
+    try:
+        prompt = _contextual_prompt(body, repo_root=workdir_path)
+    except context_prelude.PreludeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if len(prompt.encode("utf-8")) >= MAX_SPAWN_PROMPT_BYTES:
+        raise HTTPException(status_code=400, detail="Kickoff prompt must be smaller than 100KB")
 
     registry = _read_agent_registry()
     orch = (body.orch or "").strip()
@@ -4178,6 +4618,20 @@ def next_review_route(body: NextReviewIn) -> dict[str, Any]:
         reviewer_effort=body.reviewer_effort,
         prompt_template=body.prompt_template,
         request_id=body.request_id,
+    )
+
+
+@app.post("/api/agents/rebase-dirty-pr")
+def rebase_dirty_pr_route(body: RebaseDirtyPrIn) -> dict[str, Any]:
+    """Start the scoped conflict helper only when the PR is DIRTY."""
+
+    from .agent_runtime.rebase_bot import rebase_dirty_pr
+
+    return rebase_dirty_pr(
+        pr_number=body.pr_number,
+        ticket=body.ticket,
+        worker_id=body.worker_id,
+        notify=_rebase_bot_notification_sender,
     )
 
 
@@ -5221,15 +5675,16 @@ def get_file_content(
     return FileContent(path=relative_path, size=size, content=content)
 
 
-@app.get("/api/vault/assets/{asset_path:path}")
-def get_vault_asset(asset_path: str) -> Response:
+_VAULT_ASSET_RESIZE_MIMES = {"image/png", "image/jpeg", "image/webp"}
+
+
+def _read_vault_asset_bytes(asset_path: str) -> tuple[bytes, str]:
     target, _relative_path, media_type = resolve_vault_asset_path(asset_path)
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(target, flags)
     except OSError as exc:
         raise HTTPException(status_code=404, detail="File not found") from exc
-
     try:
         if not opened_file_is_safe(fd, target, VAULT_DIR.resolve()):
             file_not_found()
@@ -5249,7 +5704,28 @@ def get_vault_asset(asset_path: str) -> Response:
         raise HTTPException(status_code=404, detail="File not found")
     finally:
         os.close(fd)
+    return raw, media_type
 
+
+@app.get("/api/vault/assets/{asset_path:path}")
+def get_vault_asset(asset_path: str, w: int | None = None) -> Response:
+    raw, media_type = _read_vault_asset_bytes(asset_path)
+    if w is not None and media_type in _VAULT_ASSET_RESIZE_MIMES:
+        from .image_scrub import ALLOWED_RESIZE_WIDTHS, ImageScrubError, resize_image_bytes
+
+        try:
+            width = int(w)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="w must be an integer") from exc
+        if width not in ALLOWED_RESIZE_WIDTHS:
+            raise HTTPException(status_code=400, detail="unsupported w value")
+        try:
+            raw, media_type = resize_image_bytes(raw, media_type, width)
+        except ImageScrubError as exc:
+            # The bounded resize enforces the same pre-decode side + pixel
+            # caps as ingress so decompression bombs cannot slip in through
+            # the thumbnail path.
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
     headers = {
         "Cache-Control": "private, max-age=3600",
         "X-Content-Type-Options": "nosniff",
@@ -5257,6 +5733,70 @@ def get_vault_asset(asset_path: str) -> Response:
     if media_type == "image/svg+xml":
         headers["Content-Security-Policy"] = "default-src 'none'; style-src 'unsafe-inline'"
     return Response(content=raw, media_type=media_type, headers=headers)
+
+
+def _asset_meta_for(raw: bytes, media_type: str) -> dict[str, object] | None:
+    """Return canonical (orientation-normalised) dimensions + preview for an
+    image asset, or None if it cannot be scrubbed. Uses scrub_image so the
+    reported width/height match what the browser will actually render — a
+    portrait photo tagged with EXIF orientation 6 comes out with its axes
+    already swapped, matching the pixels the vault-asset endpoint serves."""
+    from .image_scrub import ImageScrubError, scrub_image
+
+    try:
+        result = scrub_image(raw, media_type)
+    except ImageScrubError:
+        return None
+    payload: dict[str, object] = {
+        "width": result.width,
+        "height": result.height,
+        "media_type": media_type,
+    }
+    if result.preview_base64:
+        payload["preview_base64"] = result.preview_base64
+    return payload
+
+
+@app.get("/api/vault/asset-meta/{asset_path:path}")
+def get_vault_asset_meta(asset_path: str) -> dict[str, object]:
+    raw, media_type = _read_vault_asset_bytes(asset_path)
+    if media_type not in _VAULT_ASSET_RESIZE_MIMES:
+        raise HTTPException(status_code=415, detail="asset is not an image")
+    meta = _asset_meta_for(raw, media_type)
+    if meta is None:
+        raise HTTPException(status_code=422, detail="asset could not be scrubbed")
+    return meta
+
+
+class AssetMetaBatchRequest(BaseModel):
+    paths: list[str] = Field(default_factory=list, max_length=64)
+
+
+@app.post("/api/vault/asset-meta")
+def post_vault_asset_meta_batch(payload: AssetMetaBatchRequest) -> dict[str, dict[str, object]]:
+    """Return `{path: {width, height, preview_base64}}` for every readable
+    image path in the request. Silently drops entries that resolve outside
+    the vault, aren't images, or fail to decode so the frontend can render
+    the surviving ones in one round-trip without any per-image race."""
+    seen: set[str] = set()
+    result: dict[str, dict[str, object]] = {}
+    for raw_path in payload.paths:
+        if not isinstance(raw_path, str):
+            continue
+        candidate = raw_path.strip()
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            content, media_type = _read_vault_asset_bytes(candidate)
+        except HTTPException:
+            continue
+        if media_type not in _VAULT_ASSET_RESIZE_MIMES:
+            continue
+        meta = _asset_meta_for(content, media_type)
+        if meta is not None:
+            result[candidate] = meta
+    return result
 
 
 @app.get("/api/notes/{note_path:path}", response_model=Note)

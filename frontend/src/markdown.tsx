@@ -1,4 +1,4 @@
-import { Children, isValidElement, lazy, Suspense, useEffect, useMemo, useState } from "react";
+import { Children, isValidElement, lazy, Suspense, useMemo, useState } from "react";
 import type { MouseEvent, ReactNode, TableHTMLAttributes } from "react";
 import ReactMarkdown from "react-markdown";
 import rehypeKatex from "rehype-katex";
@@ -6,6 +6,13 @@ import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { CopyPill } from "./copy-button";
+import {
+  MarkdownImage,
+  assetMetaFromCache,
+  isVaultImagePath,
+  seedAssetMetaCache,
+  type MarkdownImageProps,
+} from "./markdown-image";
 import { ShikiCode } from "./shiki";
 import {
   AlertTriangle,
@@ -333,12 +340,6 @@ export function stripLeadingTitle(content: string, title: string) {
 const inlinePattern =
   /%%[\s\S]*?%%|==([^=\n]+)==|(!?)\[\[([^\][\n|]+?)(?:\|([^\][\n]+?))?\]\]|(^|[\s(])#([A-Za-z][\w/-]*)|\[(P\d)\]/g;
 
-const vaultImagePattern = /\.(?:png|jpe?g|gif|webp|svg)$/i;
-
-function isVaultImagePath(value: string) {
-  return vaultImagePattern.test(value.split(/[?#]/, 1)[0]);
-}
-
 function splitInline(value: string): MdNode[] {
   const nodes: MdNode[] = [];
   let last = 0;
@@ -621,89 +622,6 @@ const LazyMermaidBlock = lazy(() =>
   import("./markdown-mermaid").then(({ MermaidBlock }) => ({ default: MermaidBlock }))
 );
 
-function decodeAssetPath(value: string) {
-  try {
-    return decodeURIComponent(value);
-  } catch {
-    return value;
-  }
-}
-
-function normalizeAssetPath(value: string, base: string[] = []) {
-  const parts = value.replaceAll("\\", "/").split("/");
-  const resolved = [...base];
-  for (const part of parts) {
-    if (!part || part === ".") continue;
-    if (part === "..") {
-      if (resolved.length > 0 && resolved[resolved.length - 1] !== "..") resolved.pop();
-      else resolved.push("..");
-    } else {
-      resolved.push(part);
-    }
-  }
-  return resolved.length > 0 ? resolved.join("/") : null;
-}
-
-function vaultAssetUrl(path: string) {
-  return `/api/vault/assets/${path.split("/").map(encodeURIComponent).join("/")}`;
-}
-
-function assetCandidates(src: string, notePath?: string) {
-  if (/^[a-z][a-z\d+.-]*:/i.test(src) || src.startsWith("//")) return [];
-  const decoded = decodeAssetPath(src.split(/[?#]/, 1)[0]);
-  if (decoded.includes("\0") || decoded.startsWith("/")) return [];
-  if (!isVaultImagePath(decoded)) return [];
-  const rootPath = normalizeAssetPath(decoded);
-  const notePathCandidate = notePath
-    ? normalizeAssetPath(decoded, notePath.split("/").slice(0, -1))
-    : null;
-  return [notePathCandidate, rootPath].filter(
-    (candidate, index, candidates): candidate is string =>
-      Boolean(candidate) && candidates.indexOf(candidate) === index,
-  );
-}
-
-type MarkdownImageProps = {
-  alt?: string;
-  className?: string;
-  "data-obsidian-width"?: number | string;
-  node?: unknown;
-  notePath?: string;
-  src?: string;
-};
-
-function nodeProperties(node: unknown): Record<string, unknown> {
-  if (!node || typeof node !== "object") return {};
-  const typedNode = node as {
-    data?: { hProperties?: Record<string, unknown> };
-    properties?: Record<string, unknown>;
-  };
-  return typedNode.data?.hProperties ?? typedNode.properties ?? {};
-}
-
-function MarkdownImage({ alt, className, "data-obsidian-width": dataWidth, node, notePath, src }: MarkdownImageProps) {
-  const candidates = src ? assetCandidates(src, notePath) : [];
-  const [failed, setFailed] = useState(false);
-  useEffect(() => setFailed(false), [src, notePath]);
-  const currentSrc = src && candidates.length > 0
-    ? vaultAssetUrl(candidates[failed && candidates.length > 1 ? 1 : 0])
-    : src;
-  const widthValue = dataWidth ?? nodeProperties(node)["data-obsidian-width"];
-  const width = typeof widthValue === "number" ? widthValue : undefined;
-
-  return (
-    <img
-      alt={alt ?? ""}
-      className={className}
-      src={currentSrc}
-      style={width ? { width: `${width}px` } : undefined}
-      onError={() => {
-        if (candidates.length > 1) setFailed(true);
-      }}
-    />
-  );
-}
-
 export function MarkdownTable({ children, ...props }: TableHTMLAttributes<HTMLTableElement>) {
   return (
     <div className="markdown-table-scroll">
@@ -779,18 +697,26 @@ function createComponents(
 }
 
 export function ObsidianMarkdown({
+  assetMeta,
   content,
   notes,
   notePath,
   onOpenNote,
   onCreateNote
 }: {
+  assetMeta?: Record<string, { width: number; height: number; preview_base64?: string | null }>;
   content: string;
   notes: NoteSummary[];
   notePath?: string;
   onOpenNote: (path: string) => void;
   onCreateNote?: (target: string) => void;
 }) {
+  // Seed the shared cache SYNCHRONOUSLY before ReactMarkdown renders, so
+  // every MarkdownImage frame commits with correct width/height/preview on
+  // its first render (no metadata race, no layout shift).
+  if (assetMeta) {
+    seedAssetMetaCache(assetMeta);
+  }
   const prepared = useMemo(() => prepareMarkdown(content), [content]);
   const components = useMemo(
     () =>

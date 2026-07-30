@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import os
 import subprocess
@@ -10,6 +11,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from PIL import Image
+
 from backend.app import wiki_agent_tools, wiki_artifacts
 from backend.app.next_review_schema import NextReviewIn, mcp_input_schema
 
@@ -17,12 +20,21 @@ from backend.app.next_review_schema import NextReviewIn, mcp_input_schema
 RUN_ID = "00000000-0000-4000-8000-000000000085"
 
 
+def _fixture_png_bytes() -> bytes:
+    buffer = io.BytesIO()
+    Image.new("RGB", (2, 2), color=(255, 128, 0)).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+FIXTURE_PNG_BYTES = _fixture_png_bytes()
+
+
 def _payload(kind: str) -> dict:
     return {
         "mermaid": {"source": "graph TD; A-->B"},
         "svg": {"source": '<svg xmlns="http://www.w3.org/2000/svg"><rect width="1" height="1"/></svg>'},
         "image": {
-            "data_base64": base64.b64encode(b"fixture-png").decode(),
+            "data_base64": base64.b64encode(FIXTURE_PNG_BYTES).decode(),
             "mime": "image/png",
         },
         "table": {
@@ -121,7 +133,11 @@ class WikiArtifactsTests(unittest.TestCase):
                         / "artifacts"
                         / f"{event['id']}.png"
                     )
-                    self.assertEqual(image.read_bytes(), b"fixture-png")
+                    stored = image.read_bytes()
+                    self.assertTrue(stored.startswith(b"\x89PNG\r\n\x1a\n"))
+                    with Image.open(io.BytesIO(stored)) as reopened:
+                        reopened.load()
+                        self.assertEqual(reopened.size, (2, 2))
                     self.assertEqual(image.stat().st_mode & 0o777, 0o600)
                 elif kind == "pdf":
                     self.assertNotIn("data_base64", event["artifact"])
@@ -423,6 +439,45 @@ class WikiArtifactsTests(unittest.TestCase):
             ],
         )
 
+    def test_image_scrub_strips_metadata_end_to_end(self) -> None:
+        # Mutation-proof: bytes that reach disk must not contain the GPS or
+        # camera-model strings the source payload embedded. If the scrub is
+        # ever disabled or bypassed this assertion trips.
+        from PIL import ExifTags, TiffImagePlugin
+
+        image = Image.new("RGB", (48, 32), color=(200, 50, 50))
+        exif = image.getexif()
+        exif[ExifTags.Base.Orientation.value] = 1
+        exif[ExifTags.Base.Make.value] = "GhostCam"
+        exif[ExifTags.Base.Model.value] = "SecretModel-42"
+        gps = exif.get_ifd(ExifTags.Base.GPSInfo.value)
+        gps[ExifTags.GPS.GPSLatitudeRef] = "N"
+        gps[ExifTags.GPS.GPSLatitude] = (
+            TiffImagePlugin.IFDRational(37, 1),
+            TiffImagePlugin.IFDRational(46, 1),
+            TiffImagePlugin.IFDRational(3060, 100),
+        )
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", exif=exif.tobytes(), quality=90)
+        payload = {"data_base64": base64.b64encode(buffer.getvalue()).decode(), "mime": "image/jpeg"}
+        event = wiki_artifacts.render_artifact({"kind": "image", "payload": payload})
+        target = (
+            self.root
+            / "runtime"
+            / "runs"
+            / RUN_ID
+            / "artifacts"
+            / f"{event['id']}.jpg"
+        )
+        stored = target.read_bytes()
+        self.assertNotIn(b"SecretModel-42", stored)
+        self.assertNotIn(b"GhostCam", stored)
+        self.assertNotIn(b"GPSLatitude", stored)
+        self.assertNotIn(b"Exif\x00\x00", stored)
+        # Metadata is stripped, but dimensions are preserved on the event.
+        self.assertEqual(event["artifact"]["width"], 48)
+        self.assertEqual(event["artifact"]["height"], 32)
+
     def test_orchestrator_render_artifact_uses_its_run_directory(self) -> None:
         with mock.patch.dict(os.environ, {"WIKI_AGENT_ROLE": "orchestrator"}):
             event = wiki_artifacts.render_artifact(
@@ -436,7 +491,11 @@ class WikiArtifactsTests(unittest.TestCase):
             / "artifacts"
             / f"{event['id']}.png"
         )
-        self.assertEqual(target.read_bytes(), b"fixture-png")
+        stored_bytes = target.read_bytes()
+        self.assertTrue(stored_bytes.startswith(b"\x89PNG\r\n\x1a\n"))
+        with Image.open(io.BytesIO(stored_bytes)) as reopened:
+            reopened.load()
+            self.assertEqual(reopened.size, (2, 2))
 
     def test_pdf_accepts_base64_and_path_payload_variants(self) -> None:
         pdf_bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n"

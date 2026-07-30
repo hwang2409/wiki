@@ -1,6 +1,6 @@
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
-import { ChevronDown, Copy, FileJson } from "lucide-react";
+import { ChevronDown, Copy, FileJson, Maximize2 } from "lucide-react";
 import type {
   ArtifactColumn,
   ArtifactFileEntry,
@@ -9,6 +9,8 @@ import type {
 } from "./api";
 import { classifyArtifact } from "./artifact-kind";
 import { ArtifactError, ArtifactPlaceholder } from "./artifact-state";
+import { ArtifactLightbox, type LightboxItem } from "./artifact-detail/lightbox";
+import { ImageGallery } from "./artifact-detail/gallery";
 import { DiffPatchView } from "./diff-view";
 import {
   loadPdfFromUrl,
@@ -17,6 +19,12 @@ import {
 } from "./pdfjs-runtime";
 import { ShikiCode, useCurrentTheme } from "./shiki";
 import { StatusBadge, statusToTone } from "./status-badge";
+
+const IMAGE_EXTENSION_PATTERN = /\.(png|jpe?g|gif|webp|svg)(\?.*)?$/i;
+
+export function isImagePath(path: string | undefined | null): boolean {
+  return typeof path === "string" && IMAGE_EXTENSION_PATTERN.test(path);
+}
 
 const TABLE_ROW_HEIGHT = 32;
 const TABLE_VIEWPORT_HEIGHT = 320;
@@ -227,22 +235,48 @@ export function SvgRenderer({
 
 export function SharedImageRenderer({
   alt,
+  caption,
+  downloadName,
+  eager,
+  height,
   imgClassName,
   onImageLoad,
+  openInLightbox = false,
+  previewBase64,
   source,
   style,
+  width,
   wrapClassName,
 }: {
   alt: string;
+  caption?: string | null;
+  downloadName?: string | null;
+  eager?: boolean;
+  height?: number;
   imgClassName?: string;
   onImageLoad?: (image: HTMLImageElement) => void;
+  openInLightbox?: boolean;
+  previewBase64?: string | null;
   source: string;
   style?: CSSProperties;
+  width?: number;
   wrapClassName?: string;
 }) {
   const [state, setState] = useState<"loading" | "ready" | "error">("loading");
   const [nonce, setNonce] = useState(0);
-  useEffect(() => setState("loading"), [source, nonce]);
+  const [previewMounted, setPreviewMounted] = useState(true);
+  const [lightboxOpen, setLightboxOpen] = useState(false);
+  useEffect(() => {
+    setState("loading");
+    setPreviewMounted(true);
+  }, [source, nonce]);
+  useEffect(() => {
+    if (state !== "ready") return;
+    // Retain the preview through the opacity transition (matches the CSS
+    // duration in styles.css) so the fade actually plays out.
+    const timer = window.setTimeout(() => setPreviewMounted(false), 380);
+    return () => window.clearTimeout(timer);
+  }, [state]);
   if (state === "error") {
     return (
       <div className={`artifact-image-wrap${wrapClassName ? ` ${wrapClassName}` : ""}`}>
@@ -254,22 +288,87 @@ export function SharedImageRenderer({
       </div>
     );
   }
+  const item: LightboxItem = {
+    src: source,
+    alt,
+    caption,
+    downloadName,
+    width,
+    height,
+  };
+  const knownRatio = width && height ? width / height : null;
+  const composedStyle: CSSProperties = {
+    ...(style ?? {}),
+    ...(knownRatio ? { aspectRatio: `${width} / ${height}` } : {}),
+  };
+  const image = (
+    <img
+      key={nonce}
+      alt={alt}
+      className={`${imgClassName ?? ""}${state === "ready" ? " is-loaded" : ""}`.trim()}
+      decoding="async"
+      height={height}
+      loading={eager ? "eager" : "lazy"}
+      src={source}
+      style={composedStyle}
+      width={width}
+      onError={() => setState("error")}
+      onLoad={(loadEvent) => {
+        setState("ready");
+        onImageLoad?.(loadEvent.currentTarget);
+      }}
+    />
+  );
+  const placeholderStyle: CSSProperties = knownRatio
+    ? { aspectRatio: `${width} / ${height}` }
+    : {};
   return (
-    <div className={`artifact-image-wrap${wrapClassName ? ` ${wrapClassName}` : ""}`}>
-      {state === "loading" ? <ArtifactPlaceholder label="Loading image…" shape="image" /> : null}
-      <img
-        key={nonce}
-        alt={alt}
-        className={imgClassName}
-        loading="lazy"
-        src={source}
-        style={state === "loading" ? { visibility: "hidden", position: "absolute", inset: 0, ...style } : style}
-        onError={() => setState("error")}
-        onLoad={(loadEvent) => {
-          setState("ready");
-          onImageLoad?.(loadEvent.currentTarget);
-        }}
-      />
+    <div
+      className={`artifact-image-wrap${wrapClassName ? ` ${wrapClassName}` : ""}${knownRatio ? " has-known-ratio" : ""}${state === "ready" ? " is-loaded" : ""}`}
+      style={knownRatio ? { aspectRatio: `${width} / ${height}` } : undefined}
+    >
+      {previewMounted ? (
+        previewBase64 ? (
+          <img
+            aria-hidden="true"
+            alt=""
+            className={`artifact-image-preview${state === "ready" ? " is-fading" : ""}`}
+            decoding="sync"
+            src={previewBase64}
+            style={placeholderStyle}
+          />
+        ) : state === "loading" ? (
+          <div
+            className="artifact-image-blur"
+            aria-hidden="true"
+            data-shape="image"
+            style={placeholderStyle}
+          />
+        ) : null
+      ) : null}
+      {openInLightbox ? (
+        <button
+          aria-label={`Open ${alt} in fullscreen`}
+          className="artifact-image-expand"
+          onClick={() => setLightboxOpen(true)}
+          type="button"
+        >
+          {image}
+          <span className="artifact-image-expand-badge" aria-hidden="true">
+            <Maximize2 size={12} />
+          </span>
+        </button>
+      ) : (
+        image
+      )}
+      {lightboxOpen ? (
+        <ArtifactLightbox
+          index={0}
+          items={[item]}
+          onClose={() => setLightboxOpen(false)}
+          onIndexChange={() => undefined}
+        />
+      ) : null}
     </div>
   );
 }
@@ -281,9 +380,14 @@ export function ImageRenderer({ artifact, event, onImageLoad, ticket }: Artifact
   return (
     <SharedImageRenderer
       alt={event.title || event.caption || "Agent artifact"}
+      caption={event.caption || event.title || null}
+      height={artifact.height}
       imgClassName="artifact-image"
       onImageLoad={onImageLoad}
+      openInLightbox
+      previewBase64={artifact.preview_base64 ?? null}
       source={source}
+      width={artifact.width}
     />
   );
 }
@@ -555,6 +659,9 @@ function FileListRenderer({
   const files = artifact.files ?? [];
   if (files.length === 0) {
     return <div className="artifact-file-list-empty">No files.</div>;
+  }
+  if (files.every((entry) => isImagePath(entry.path))) {
+    return <ImageGallery files={files} />;
   }
   return (
     <ul className="artifact-file-list">
@@ -833,8 +940,11 @@ export function CompactPreview({ artifact, event, onRenderError, ticket }: Artif
     return (
       <SharedImageRenderer
         alt={event.title || event.caption || "Agent artifact"}
+        height={artifact.height}
         imgClassName="artifact-image artifact-compact-image"
+        previewBase64={artifact.preview_base64 ?? null}
         source={source}
+        width={artifact.width}
         wrapClassName="artifact-image-compact-wrap"
       />
     );

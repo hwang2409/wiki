@@ -1263,7 +1263,7 @@ def _gate_result(args: argparse.Namespace) -> dict:
             "--repo",
             repo,
             "--json",
-            "state,isDraft,mergeable,mergeStateStatus,headRefOid,url,statusCheckRollup",
+            "state,isDraft,mergeable,mergeStateStatus,headRefName,headRefOid,url,statusCheckRollup",
         ]
     )
     pr_url = view.get("url")
@@ -1304,6 +1304,7 @@ def _gate_result(args: argparse.Namespace) -> dict:
         "is_draft": bool(view.get("isDraft")),
         "mergeable": view.get("mergeable"),
         "merge_state_status": view.get("mergeStateStatus"),
+        "head_ref_name": view.get("headRefName"),
         "head_sha": head_sha,
         "checks": checks,
         "unresolved_threads": unresolved,
@@ -1630,14 +1631,22 @@ def _knowledge_index() -> knowledge.KnowledgeIndex:
 
 def cmd_search(args: argparse.Namespace) -> None:
     try:
-        result = _knowledge_index().search(
-            args.query,
-            ticket=args.ticket,
-            kind=args.kind,
-            event_type=args.event_type,
-            since=args.since,
-            limit=args.limit,
-        )
+        index = _knowledge_index()
+        if args.mode == "semantic":
+            result = index.search_semantic(
+                args.query,
+                ticket=args.ticket,
+                limit=args.limit,
+            )
+        else:
+            result = index.search(
+                args.query,
+                ticket=args.ticket,
+                kind=args.kind,
+                event_type=args.event_type,
+                since=args.since,
+                limit=args.limit,
+            )
     except knowledge.KnowledgeQueryError as exc:
         fail(str(exc))
     except knowledge.KnowledgeUnavailable as exc:
@@ -1944,6 +1953,7 @@ def main() -> None:
     search.add_argument("--type", dest="event_type", help="normalized event type")
     search.add_argument("--since", help="YYYY-MM-DD")
     search.add_argument("--limit", type=int, default=20)
+    search.add_argument("--mode", choices=("lexical", "semantic"), default="lexical")
     search.add_argument("--json", action="store_true")
     search.set_defaults(func=cmd_search)
 

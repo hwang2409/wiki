@@ -58,9 +58,25 @@ export type PaletteResult = {
   ticket?: string;
 };
 
-export function searchPalette(query: string, limit = 30, signal?: AbortSignal) {
-  const params = new URLSearchParams({ q: query, limit: String(limit) });
-  return request<{ results: PaletteResult[] }>(`/api/palette/search?${params}`, {
+export type PaletteSearchMode = "lexical" | "semantic";
+
+export type PaletteSearchResponse = {
+  mode?: PaletteSearchMode;
+  results: PaletteResult[];
+  lexical_results?: PaletteResult[];
+  semantic_results?: PaletteResult[];
+  semantic_available?: boolean;
+  semantic_unavailable_reason?: string | null;
+};
+
+export function searchPalette(
+  query: string,
+  limit = 30,
+  signal?: AbortSignal,
+  mode: PaletteSearchMode = "lexical",
+) {
+  const params = new URLSearchParams({ q: query, limit: String(limit), mode });
+  return request<PaletteSearchResponse>(`/api/palette/search?${params}`, {
     signal,
   });
 }
@@ -371,6 +387,10 @@ export type SpawnWorkerInput = {
   workdir: string;
   orch: string | null;
   prompt: string;
+  title?: string;
+  context_prelude?: boolean;
+  include_context?: boolean;
+  context_prelude_override?: string | null;
 };
 
 export type SpawnWorkerResult = {
@@ -384,6 +404,31 @@ export function spawnAgentWorker(body: SpawnWorkerInput) {
   return request<SpawnWorkerResult>("/api/agents/spawn", {
     method: "POST",
     body: JSON.stringify(body),
+  });
+}
+
+export type ContextPreludeInput = {
+  ticket: string;
+  title: string;
+  prompt: string;
+  workdir: string;
+};
+
+export type ContextPreludeResult = {
+  prelude: string;
+  truncated: boolean;
+  sources: Record<string, { status: string; items: number; warning: string | null }>;
+  char_budget?: number;
+};
+
+export function previewAgentContextPrelude(
+  body: ContextPreludeInput,
+  signal?: AbortSignal,
+) {
+  return request<ContextPreludeResult>("/api/agents/context-prelude", {
+    method: "POST",
+    body: JSON.stringify(body),
+    signal,
   });
 }
 
@@ -663,6 +708,9 @@ export type SessionArtifact = {
   mime?: "image/png" | "image/jpeg" | "image/webp";
   byte_size?: number;
   data_base64?: string;
+  width?: number;
+  height?: number;
+  preview_base64?: string;
   columns?: ArtifactColumn[];
   rows?: (string | number | boolean | null)[][];
   spec_vega_lite?: Record<string, unknown>;
@@ -1161,6 +1209,90 @@ export function getAgentWorkgraphRevisions(ticket: string) {
 export function getAgentWorkgraphRevision(ticket: string, revision: number, signal?: AbortSignal) {
   return request<AgentWorkgraphData>(
     `/api/agents/${encodeURIComponent(ticket)}/workgraph?revision=${revision}`,
+    { signal }
+  );
+}
+
+export type ReplayBookmarkKind = "steer" | "verdict" | "error";
+
+export type ReplayTimelineEvent = {
+  seq: number;
+  raw_seq: number;
+  ts: string | null;
+  kind: string;
+  disposition: string;
+  lifecycle_state: string | null;
+  summary: string;
+  bookmark: ReplayBookmarkKind | null;
+};
+
+export type ReplayBookmark = {
+  seq: number;
+  kind: ReplayBookmarkKind;
+  ts: string | null;
+  summary: string;
+  event_kind: string;
+};
+
+export type ReplayRunSummary = {
+  run_id: string;
+  agent_id: string | null;
+  orch_id: string | null;
+  role: string | null;
+  provider: string | null;
+  model: string | null;
+  outcome: string | null;
+  state: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+  total_events: number;
+  initial_prompt_excerpt: string | null;
+};
+
+export type ReplayTimeline = {
+  run: ReplayRunSummary;
+  events: ReplayTimelineEvent[];
+  next_cursor: string | null;
+  has_more: boolean;
+  bookmarks: ReplayBookmark[];
+  bookmarks_truncated: boolean;
+  warnings: string[];
+};
+
+export type ReplayRunsResponse = {
+  ticket: string;
+  runs: ReplayRunSummary[];
+  runs_truncated: boolean;
+};
+
+export type ReplayRawEvent = {
+  run_id: string;
+  seq: number;
+  raw: Record<string, unknown>;
+};
+
+export function getAgentReplayRuns(ticket: string, signal?: AbortSignal) {
+  return request<ReplayRunsResponse>(
+    `/api/agents/${encodeURIComponent(ticket)}/replay/runs`,
+    { signal }
+  );
+}
+
+export function getReplayTimeline(
+  runId: string,
+  { cursor, limit = 500, signal }: { cursor?: string | null; limit?: number; signal?: AbortSignal } = {},
+) {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (cursor) params.set("cursor", cursor);
+  return request<ReplayTimeline>(
+    `/api/agent-runs/${encodeURIComponent(runId)}/replay/timeline?${params.toString()}`,
+    { signal }
+  );
+}
+
+export function getReplayRawEvent(runId: string, seq: number, signal?: AbortSignal) {
+  return request<ReplayRawEvent>(
+    `/api/agent-runs/${encodeURIComponent(runId)}/replay/events/${seq}`,
     { signal }
   );
 }
