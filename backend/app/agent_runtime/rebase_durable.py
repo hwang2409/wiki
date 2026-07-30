@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .rebase_parsing import RebaseError
+
 
 NotificationSender = Callable[[str, str, str], None]
 """``notify(target, message, delivery_id)``.
@@ -98,17 +100,28 @@ def _durable_state_path() -> Path:
 
 
 def _load_durable_state() -> None:
+    """Replace the in-memory collections with the disk snapshot.
+
+    In-memory dicts are a pure CACHE of ``state.json`` — never a merge
+    target.  A merge would let a stale writer resurrect an outbox entry
+    another process had already delivered and dropped (the reviewer's
+    "sixth send after the max-attempts bound" case).  This function
+    unconditionally CLEARS the three collections before repopulating
+    them from disk so a key that vanished on disk vanishes in memory
+    too.
+    """
+
     global _DURABLE_STATE_LOADED, _DURABLE_STATE_ROOT
     state_path = _durable_state_path()
     state_root = state_path.parent
     if _DURABLE_STATE_LOADED and _DURABLE_STATE_ROOT == state_root:
         return
-    if _DURABLE_STATE_ROOT != state_root:
-        _DURABLE_JOBS.clear()
-        _OUTBOX.clear()
-        _DELIVERED_EVENTS.clear()
     _DURABLE_STATE_ROOT = state_root
     _DURABLE_STATE_LOADED = True
+    # Replace, never merge — memory is a cache of disk.
+    _DURABLE_JOBS.clear()
+    _OUTBOX.clear()
+    _DELIVERED_EVENTS.clear()
     try:
         snapshot = json.loads(state_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -117,22 +130,14 @@ def _load_durable_state() -> None:
         return
     jobs_section = snapshot.get("jobs")
     if isinstance(jobs_section, Mapping):
-        _DURABLE_JOBS.update(
-            {
-                str(key): dict(item)
-                for key, item in jobs_section.items()
-                if isinstance(key, str) and isinstance(item, Mapping)
-            }
-        )
+        for key, item in jobs_section.items():
+            if isinstance(key, str) and isinstance(item, Mapping):
+                _DURABLE_JOBS[str(key)] = dict(item)
     outbox_section = snapshot.get("outbox")
     if isinstance(outbox_section, Mapping):
-        _OUTBOX.update(
-            {
-                str(key): dict(item)
-                for key, item in outbox_section.items()
-                if isinstance(key, str) and isinstance(item, Mapping)
-            }
-        )
+        for key, item in outbox_section.items():
+            if isinstance(key, str) and isinstance(item, Mapping):
+                _OUTBOX[str(key)] = dict(item)
     delivered_section = snapshot.get("delivered")
     if isinstance(delivered_section, list):
         for entry in delivered_section:
@@ -172,9 +177,11 @@ def _state_lock():
     Every mutating helper (``_persist_job``, ``_persist_completion``,
     ``_enqueue_result``, ``_flush_outbox``) wraps its work in this
     manager.  We take an exclusive ``fcntl.flock`` on a sibling lock
-    file, then FORCE a reload from disk so mutations start from the
-    latest snapshot — otherwise a stale in-memory dict would silently
-    overwrite another writer's just-published changes.
+    file, then FORCE a REPLACE-not-merge reload from disk so mutations
+    start from the latest snapshot.  We FAIL CLOSED (``RebaseError``)
+    if the OS refuses the lock — a quiet degrade to unlocked writes is
+    exactly the hole the round-11 code left, and it lets a concurrent
+    writer silently overwrite committed state.
     """
 
     global _DURABLE_STATE_LOADED
@@ -183,28 +190,30 @@ def _state_lock():
     lock_path = state_path.with_name(state_path.name + ".lock")
     handle = lock_path.open("a+")
     try:
-        try:
-            import fcntl
+        import fcntl
 
+        try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            locked = True
-        except (ImportError, OSError):
-            locked = False
-        try:
-            # Whether or not the OS gave us a lock, refresh from disk so
-            # we merge with any concurrent writer's committed state.
-            _DURABLE_STATE_LOADED = False
-            _load_durable_state()
-            yield
-        finally:
-            if locked:
-                try:
-                    import fcntl as _fcntl
-
-                    _fcntl.flock(handle.fileno(), _fcntl.LOCK_UN)
-                except (ImportError, OSError):
-                    pass
+        except OSError as exc:
+            handle.close()
+            raise RebaseError(
+                f"could not acquire durable-state lock {lock_path}: {exc}"
+            ) from exc
+    except ImportError as exc:
+        handle.close()
+        raise RebaseError(
+            f"fcntl not available; refusing to publish durable state without a lock: {exc}"
+        ) from exc
+    try:
+        # Under the lock, ALWAYS refresh from disk — memory is a cache.
+        _DURABLE_STATE_LOADED = False
+        _load_durable_state()
+        yield
     finally:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
         handle.close()
 
 
