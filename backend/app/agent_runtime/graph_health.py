@@ -350,7 +350,7 @@ class GraphHealthMonitor:
         threshold: float,
     ) -> bool:
         graph_module = _workgraph_module()
-        candidates: list[tuple[float, str]] = []
+        stalled_nodes: list[str] = []
         for node in graph_module._live_worker_nodes(graph):  # noqa: SLF001
             node_id = node.get("id") if isinstance(node, dict) else None
             if not isinstance(node_id, str):
@@ -365,24 +365,29 @@ class GraphHealthMonitor:
                 timestamp = graph_module._parse_ts(edge.get("created_at"))  # noqa: SLF001
                 if timestamp is not None and (latest is None or timestamp > latest):
                     latest = timestamp
-            if latest is not None:
-                candidates.append((latest, node_id))
-        if not candidates:
+            if latest is not None and now - latest > threshold:
+                stalled_nodes.append(node_id)
+        if not stalled_nodes:
             return False
-        stalled_node = min(candidates)[1]
-        matching_views = [
-            view for view in views if view.record.agent_id == stalled_node
-        ] or views
-        for view in matching_views:
-            activity = [view.status_mtime]
-            updated_at = graph_module._parse_ts(  # noqa: SLF001
-                getattr(view.record, "updated_at", None)
-            )
-            activity.append(updated_at)
-            activity.extend(cls._run_event_mtimes(view, store))
-            if any(cls._recent(timestamp, now, threshold) for timestamp in activity):
-                return True
-        return False
+        views_by_worker: dict[str, list[Any]] = {}
+        for view in views:
+            views_by_worker.setdefault(view.record.agent_id, []).append(view)
+        for node_id in stalled_nodes:
+            matching_views = views_by_worker.get(node_id)
+            # A graph node without a current run is not observable. Treat it
+            # as stale instead of borrowing activity from a sibling worker.
+            if not matching_views:
+                return False
+            for view in matching_views:
+                activity = [view.status_mtime]
+                activity.extend(cls._run_event_mtimes(view, store))
+                if any(
+                    cls._recent(timestamp, now, threshold) for timestamp in activity
+                ):
+                    break
+            else:
+                return False
+        return True
 
     async def _maybe_graph_unavailable(
         self, ticket: str, view: Any, views: list[Any], now: float
