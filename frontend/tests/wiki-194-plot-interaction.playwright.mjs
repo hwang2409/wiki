@@ -304,11 +304,12 @@ async function main() {
     const centerX = plotBox.x + plotBox.width / 2;
     const centerY = plotBox.y + plotBox.height / 2;
     await page.mouse.move(centerX, centerY);
+    const xBeforeWheel = await scaleDomain(page, inspectorSelector, "x");
     await page.mouse.wheel(0, -400);
     await page.waitForTimeout(120);
     const xAfterWheel = await scaleDomain(page, inspectorSelector, "x");
-    if (!domainsChanged(xBefore, xAfterWheel)) {
-      throw new Error(`wheel-zoom did not move x domain (still ${xAfterWheel})`);
+    if (!domainsChanged(xBeforeWheel, xAfterWheel)) {
+      throw new Error(`wheel-zoom did not move x domain (still ${xAfterWheel}, before ${xBeforeWheel})`);
     }
 
     // ─── real drag pans the scale ────────────────────────────────────────

@@ -55,8 +55,16 @@ export function PlotArtifactDetail({ spec, title }: { spec: Record<string, unkno
     if (view) setExportStatus(null);
   }, []);
   const onBrush = useCallback((next: PlotDomains) => {
-    setDomains(next);
-  }, []);
+    const merged: PlotDomains = { ...(domains ?? {}), ...next };
+    if (viewRef.current) {
+      for (const channel of interactivity.mode === "full" ? interactivity.channels : []) {
+        if (next[channel]) continue;
+        const live = scaleDomain(viewRef.current, channel);
+        if (live) merged[channel] = live;
+      }
+    }
+    setDomains(merged);
+  }, [domains, interactivity]);
   // Reset is always enabled in full mode: pan / wheel-zoom mutate Vega's
   // internal scales without touching React state, so `domains === null` is not
   // proof that the plot is at its default view. Bumping renderKey forces a
@@ -78,6 +86,9 @@ export function PlotArtifactDetail({ spec, title }: { spec: Record<string, unkno
     }
     if (Object.keys(next).length > 0) setDomains(next);
   }, [canInteract, domains, interactivity]);
+  const interactiveChannels = interactivity.mode === "full" ? interactivity.channels : [];
+  const hasXChannel = interactiveChannels.includes("x");
+  const hasYChannel = interactiveChannels.includes("y");
   const onSavePng = useCallback(async () => {
     const view = viewRef.current;
     if (!view) {
@@ -118,24 +129,32 @@ export function PlotArtifactDetail({ spec, title }: { spec: Record<string, unkno
             <button type="button" disabled={!viewReady} onClick={() => onKeyboardControl("zoom-out")} aria-label="Zoom out" title="Zoom out">
               <Minus size={12} /> Zoom out
             </button>
-            <button type="button" disabled={!viewReady} onClick={() => onKeyboardControl("pan-left")} aria-label="Pan left" title="Pan left">
-              <ArrowLeft size={12} /> Pan left
-            </button>
-            <button type="button" disabled={!viewReady} onClick={() => onKeyboardControl("pan-right")} aria-label="Pan right" title="Pan right">
-              <ArrowRight size={12} /> Pan right
-            </button>
-            <button type="button" disabled={!viewReady} onClick={() => onKeyboardControl("pan-up")} aria-label="Pan up" title="Pan up">
-              <ArrowUp size={12} /> Pan up
-            </button>
-            <button type="button" disabled={!viewReady} onClick={() => onKeyboardControl("pan-down")} aria-label="Pan down" title="Pan down">
-              <ArrowDown size={12} /> Pan down
-            </button>
+            {hasXChannel ? (
+              <>
+                <button type="button" disabled={!viewReady} onClick={() => onKeyboardControl("pan-left")} aria-label="Pan left" title="Pan left">
+                  <ArrowLeft size={12} /> Pan left
+                </button>
+                <button type="button" disabled={!viewReady} onClick={() => onKeyboardControl("pan-right")} aria-label="Pan right" title="Pan right">
+                  <ArrowRight size={12} /> Pan right
+                </button>
+              </>
+            ) : null}
+            {hasYChannel ? (
+              <>
+                <button type="button" disabled={!viewReady} onClick={() => onKeyboardControl("pan-up")} aria-label="Pan up" title="Pan up">
+                  <ArrowUp size={12} /> Pan up
+                </button>
+                <button type="button" disabled={!viewReady} onClick={() => onKeyboardControl("pan-down")} aria-label="Pan down" title="Pan down">
+                  <ArrowDown size={12} /> Pan down
+                </button>
+              </>
+            ) : null}
           </>
         ) : null}
         <button type="button" disabled={!viewReady} onClick={() => void onSavePng()} aria-label="Save as PNG">
           <Download size={12} /> Save PNG
         </button>
-        <span aria-live="polite" className="artifact-plot-status" role="status">{exportStatus}</span>
+        <span aria-live="polite" className="artifact-plot-status" data-testid="plot-export-status" role="status">{exportStatus}</span>
         <span className="artifact-plot-hint">{HINT_BY_MODE[interactivity.mode] ?? ""}</span>
       </div>
       <div
