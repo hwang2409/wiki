@@ -3534,6 +3534,63 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(published["failed"], [])
         self.supervisor.unsubscribe(queue)
 
+    async def test_auth_dead_cap_survives_exact_session_resumes(self) -> None:
+        queue = self.supervisor.subscribe()
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-AUTH-SAME-RUN-CAP",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="fixture",
+        )
+        session_id = record.provider_session_id
+        prior_adapter: ProviderAdapter | None = None
+
+        for attempt in range(accounts.AUTH_DEAD_MAX_ATTEMPTS):
+            adapter = self.supervisor.adapters[record.run_id]
+            self.assertIsNot(adapter, prior_adapter)
+            await self.supervisor._recover_codex_auth_dead(  # noqa: SLF001
+                record.run_id,
+                adapter,
+                prior_state=LifecycleState.WORKING,
+            )
+            published = await _wait_for_published(queue, "codex_auth_dead_revival")
+            self.assertEqual(published["revived"], [record.agent_id])
+            current = self.store.get(record.run_id)
+            self.assertEqual(current.provider_session_id, session_id)
+            self.assertEqual(
+                len(self.supervisor.auth_dead_attempts[record.run_id]), attempt + 1
+            )
+            prior_adapter = adapter
+            if attempt + 1 < accounts.AUTH_DEAD_MAX_ATTEMPTS:
+                self.supervisor.auth_dead_attempts[record.run_id][-1] -= (
+                    accounts.AUTH_DEAD_COOLDOWN_SECONDS + 1
+                )
+
+        adapter = self.supervisor.adapters[record.run_id]
+        await self.supervisor._recover_codex_auth_dead(  # noqa: SLF001
+            record.run_id,
+            adapter,
+            prior_state=LifecycleState.WORKING,
+        )
+        exhausted = await _wait_for_published(queue, "codex_auth_dead_exhausted")
+        self.assertEqual(exhausted["tickets"], [record.agent_id])
+        self.assertIs(self.supervisor.adapters[record.run_id], adapter)
+        self.assertFalse(cast(CodexFixtureAdapter, adapter).closed)
+
+        await self.supervisor._recover_codex_auth_dead(  # noqa: SLF001
+            record.run_id,
+            adapter,
+            prior_state=LifecycleState.WORKING,
+        )
+        with self.assertRaises(asyncio.TimeoutError):
+            await _wait_for_published(
+                queue, "codex_auth_dead_exhausted", timeout=0.05
+            )
+        self.supervisor.unsubscribe(queue)
+
     async def test_auth_dead_exhaustion_alerts_without_restarting_run(self) -> None:
         queue = self.supervisor.subscribe()
         record = await self.supervisor.start_run(

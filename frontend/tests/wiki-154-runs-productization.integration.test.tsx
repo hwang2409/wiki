@@ -529,6 +529,26 @@ test("merge-ready card shows Review as primary and does not duplicate it in the 
   expect(view.queryByRole("menuitem", { name: /Review PR/ })).toBeNull();
 });
 
+test("legacy merge-ready card keeps Review as the primary action", async () => {
+  const legacyMergeReady = {
+    ...worker,
+    run_id: null,
+    state: "merge-ready",
+    runtime_state: null,
+    pr: "https://github.com/hwang2409/wiki/pull/1",
+  };
+  const view = renderView({
+    data: { ...data, workers: [legacyMergeReady as unknown as AgentWorker] },
+  });
+  expect(view.getByRole("button", { name: /^Review$/ })).toBeTruthy();
+
+  fireEvent.click(view.getByRole("button", { name: /More actions for WIKI-1/ }));
+  await waitFor(() => {
+    expect(view.getByRole("menu")).toBeTruthy();
+  });
+  expect(view.queryByRole("menuitem", { name: /Review PR/ })).toBeNull();
+});
+
 test("orchestrator row default hides kind/model/cwd; details disclosure reveals them", async () => {
   const orch: Orchestrator = {
     id: "wiki-lead",

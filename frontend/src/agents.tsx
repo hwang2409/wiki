@@ -165,6 +165,7 @@ type PrimaryActionKind = "archive-dead" | "interrupt" | "resume" | "review" | nu
 
 function primaryActionForWorker(worker: AgentWorker, deadRun: boolean): PrimaryActionKind {
   if (deadRun) return "archive-dead";
+  if (worker.pr && worker.state === "merge-ready") return "review";
   if (!worker.run_id) return null;
   const runtime = worker.runtime_state;
   const controlAttached = Boolean(worker.control_attached);
@@ -174,7 +175,6 @@ function primaryActionForWorker(worker: AgentWorker, deadRun: boolean): PrimaryA
   if (!controlAttached && (runtime === "working" || runtime === "idle" || runtime === "blocked")) {
     return "resume";
   }
-  if (worker.pr && worker.state === "merge-ready") return "review";
   return null;
 }
 

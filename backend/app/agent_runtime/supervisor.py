@@ -1544,8 +1544,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         # run under the same ticket can emit its own limit notice inside
         # the hour (round-8 finding 5).
         self.last_limit_alert_at.pop(run_id, None)
-        self.auth_dead_attempts.pop(run_id, None)
-        self.auth_dead_alert_at.pop(run_id, None)
         adapter = self.adapters.pop(run_id, None)
         if adapter is not None:
             try:
@@ -1563,6 +1561,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 for key, target in self.event_routes.items()
                 if key[0] != adapter_key
             }
+
+    def _clear_auth_dead_recovery_state(self, run_id: str) -> None:
+        self.auth_dead_attempts.pop(run_id, None)
+        self.auth_dead_alert_at.pop(run_id, None)
 
     async def _close_and_drain_adapter(
         self,
@@ -1723,6 +1725,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     )
             except BaseException:
                 pass
+        self._clear_auth_dead_recovery_state(old.run_id)
+        self._clear_auth_dead_recovery_state(replacement.run_id)
         try:
             await self._publish_agent_change(old.agent_id)
         except BaseException:
@@ -1758,6 +1762,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     reason="provider launch cancelled",
                     adapter_status=terminal_status,
                 )
+            self._clear_auth_dead_recovery_state(record.run_id)
             await self._publish_agent_change(current.agent_id)
         except BaseException:
             pass
@@ -1831,6 +1836,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 LifecycleState.DEAD,
                 reason=f"provider start failed: {exc}",
             )
+            self._clear_auth_dead_recovery_state(record.run_id)
             await self._publish_agent_change(record.agent_id)
             raise
         await self._publish_agent_change(record.agent_id)
@@ -2320,6 +2326,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         LifecycleState.DEAD,
                         reason="stale provider closed for account rotation",
                     )
+                self._clear_auth_dead_recovery_state(run_id)
 
         for row in rows:
             run_id = row["run_id"]
@@ -2833,6 +2840,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 LifecycleState.COMPLETED,
             }:
                 await self._detach_adapter(record.run_id)
+                self._clear_auth_dead_recovery_state(record.run_id)
                 await adapter.close()
                 return {
                     "run_id": record.run_id,
@@ -3111,6 +3119,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 record = self.store.transition(
                     run_id, LifecycleState.DEAD, reason="stopped"
                 )
+            self._clear_auth_dead_recovery_state(run_id)
             return record
         try:
             status = await self._close_and_drain_adapter(
@@ -3129,6 +3138,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         if status is None:
             raise StoreConflict("provider stop returned no status")
         record = self.store.update_adapter_status(run_id, status)
+        self._clear_auth_dead_recovery_state(run_id)
         await self._publish_agent_change(record.agent_id)
         return record
 
@@ -3197,6 +3207,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 )
             archived, _ = self.store.archive_current(run_id, outcome=outcome)
             self._clear_adapter_loss(run_id)
+            self._clear_auth_dead_recovery_state(run_id)
             await self._publish_agent_change(archived.agent_id)
             return archived
         try:
@@ -3218,6 +3229,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         record = self.store.update_adapter_status(run_id, status)
         archived, _ = self.store.archive_current(run_id, outcome=outcome)
         self._clear_adapter_loss(run_id)
+        self._clear_auth_dead_recovery_state(run_id)
         await self._publish_agent_change(archived.agent_id)
         return archived
 
@@ -3240,6 +3252,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 or record.state is target
             ):
                 record = self.store.transition(run_id, target, reason=reason)
+            self._clear_auth_dead_recovery_state(run_id)
             await self._publish_agent_change(record.agent_id)
         except Exception:
             # Preserve the original provider/control error for the caller. A
@@ -3388,6 +3401,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 )
             self._reset_status_for_replacement(old.agent_id)
             self.store.replace(old.run_id, replacement, reset_status=False)
+            self._clear_auth_dead_recovery_state(old.run_id)
             return await self._launch_record(replacement, prompt)
 
         if target_provider is not old.provider:
@@ -3408,6 +3422,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 raise
             self._reset_status_for_replacement(old.agent_id)
             self.store.replace(old.run_id, replacement, reset_status=False)
+            self._clear_auth_dead_recovery_state(old.run_id)
             return await self._launch_record(replacement, prompt)
         published = False
         try:
@@ -3415,6 +3430,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             self._reset_status_for_replacement(old.agent_id)
             old_adapter.prepare_replacement(replacement)
             self.store.replace(old.run_id, replacement, reset_status=False)
+            self._clear_auth_dead_recovery_state(old.run_id)
             published = True
         except asyncio.CancelledError:
             await self._cleanup_cancelled_replacement(
@@ -3448,6 +3464,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 )
             except (ValueError, StoreConflict):
                 pass
+            self._clear_auth_dead_recovery_state(old.run_id)
             await self._publish_agent_change(old.agent_id)
             raise
 
@@ -3483,6 +3500,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 )
             except Exception:
                 pass
+            self._clear_auth_dead_recovery_state(old.run_id)
+            self._clear_auth_dead_recovery_state(replacement.run_id)
             await self._publish_agent_change(old.agent_id)
             raise
         replacement = self.store.update_adapter_status(replacement.run_id, status)
