@@ -1357,7 +1357,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             "unknown",
         )
 
-    async def test_start_failure_events_are_drained_before_run_is_marked_dead(
+    async def test_start_failure_rolls_back_the_registered_run(
         self,
     ) -> None:
         await self.supervisor.close()
@@ -1391,14 +1391,11 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(
             ("run/start", "failed-spawn-retry"), self.supervisor.idempotency_results
         )
-        run_id = self.store.current_run_id("WIKI-START-FAIL")
-        assert run_id is not None
-        failed = self.store.get(run_id)
-        self.assertEqual(failed.state, LifecycleState.DEAD)
-        self.assertTrue(
+        self.assertIsNone(self.store.current_run_id("WIKI-START-FAIL"))
+        self.assertFalse(
             any(
-                event["payload"].get("method") == "error"
-                for event in self.store.read_raw_events(run_id)
+                path.name == "run.json"
+                for path in self.paths.runs_dir.glob("*/run.json")
             )
         )
 

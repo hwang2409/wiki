@@ -10,13 +10,13 @@ from __future__ import annotations
 import re
 import threading
 import json
+import hashlib
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, Sequence
-from uuid import uuid4
 
 from .ticket import parse_reviewer_id, reviewer_id as canonical_reviewer_id
-from .diversity_orchestration import create_journal, run_diverse_review
+from .diversity_orchestration import run_diverse_review
 from .reviewer_diversity import (
     DEFAULT_DIVERSITY_LENSES,
     LENS_PROMPTS,
@@ -93,6 +93,33 @@ def _persist_request_state() -> None:
         encoding="utf-8",
     )
     temporary.replace(path)
+
+
+def _stable_request_id(
+    *,
+    ticket: str,
+    pr_number: int,
+    expected_sha: str,
+    orch: str,
+    reviewer_kind: str,
+    reviewer_model: str,
+    reviewer_effort: str | None,
+    prompt_template: str | None,
+    diversity: Sequence[str] | None,
+) -> str:
+    payload = {
+        "ticket": ticket.upper(),
+        "pr_number": pr_number,
+        "expected_sha": expected_sha.lower(),
+        "orch": orch,
+        "reviewer_kind": reviewer_kind,
+        "reviewer_model": reviewer_model,
+        "reviewer_effort": reviewer_effort,
+        "prompt_template": prompt_template,
+        "diversity": list(diversity or ()),
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return f"next-review-{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
 
 
 def _resolve_root(orch: str) -> Path:
@@ -362,6 +389,7 @@ def next_review(
     registry: Callable[[], Mapping[str, Any]] | None = None,
     status_reader: Callable[[str], Mapping[str, Any] | None] | None = None,
     diversity: int | Sequence[str] | None = None,
+    backend_base_url: str | None = None,
 ) -> dict[str, Any]:
     """Gate and start the next pinned reviewer, replaying request ids."""
 
@@ -387,7 +415,17 @@ def next_review(
     }:
         raise ValueError("reviewer_effort is invalid")
     diversity_lenses = _normalize_diversity(diversity)
-    request_id = request_id or str(uuid4())
+    request_id = request_id or _stable_request_id(
+        ticket=ticket,
+        pr_number=pr_number,
+        expected_sha=expected_sha,
+        orch=orch,
+        reviewer_kind=reviewer_kind,
+        reviewer_model=reviewer_model,
+        reviewer_effort=reviewer_effort,
+        prompt_template=prompt_template,
+        diversity=diversity_lenses,
+    )
     with _REQUEST_LOCK:
         _load_request_state()
         previous_result = _REQUEST_RESULTS.get(request_id)
@@ -443,7 +481,14 @@ def next_review(
                     orch=staged["orch"],
                     request_id=staged["request_id"],
                 )
-                spawn_result = spawn(spawn_args) if spawn is not None else main.spawn_agent(spawn_args)
+                spawn_result = (
+                    spawn(spawn_args)
+                    if spawn is not None
+                    else main.spawn_agent(
+                        spawn_args,
+                        backend_base_url=backend_base_url,
+                    )
+                )
                 staged["run_id"] = spawn_result.get("run_id")
                 staged["spawn_completed"] = True
                 _persist_request_state()
@@ -559,7 +604,14 @@ def next_review(
             orch=orch,
             request_id=request_id,
         )
-        spawn_result = spawn(spawn_args) if spawn is not None else main.spawn_agent(spawn_args)
+        spawn_result = (
+            spawn(spawn_args)
+            if spawn is not None
+            else main.spawn_agent(
+                spawn_args,
+                backend_base_url=backend_base_url,
+            )
+        )
         staged["run_id"] = spawn_result.get("run_id")
         staged["spawn_completed"] = True
         _persist_request_state()

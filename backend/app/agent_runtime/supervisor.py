@@ -26,7 +26,13 @@ from .process import (
     terminate_detached_provider_pid,
 )
 from .runtime_card import inject_runtime_card
-from .provider import AdapterStatus, ProviderAdapter, ProviderEvent, StartRequest
+from .provider import (
+    AdapterStatus,
+    ProviderAdapter,
+    ProviderEvent,
+    ProviderProcessError,
+    StartRequest,
+)
 from .store import RunNotFound, RunStore, StoreConflict
 from .types import (
     LifecycleState,
@@ -1763,12 +1769,18 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     self._assert_codex_fleet_available()
                     async with self._agent_lock(record.agent_id):
                         self.store.create(record, migrate_legacy=migrate_legacy)
-                        return await self._launch_record(record, prompt)
+                        return await self._launch_record(record, prompt, rollback_start=True)
             async with self._agent_lock(record.agent_id):
                 self.store.create(record, migrate_legacy=migrate_legacy)
-                return await self._launch_record(record, prompt)
+                return await self._launch_record(record, prompt, rollback_start=True)
 
-    async def _launch_record(self, record: RunRecord, prompt: str) -> RunRecord:
+    async def _launch_record(
+        self,
+        record: RunRecord,
+        prompt: str,
+        *,
+        rollback_start: bool = False,
+    ) -> RunRecord:
         adapter = self.adapter_factory(record)
         self._attach_adapter(record.run_id, adapter)
         request = StartRequest(
@@ -1788,13 +1800,19 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             raise
         except Exception as exc:
             await self._close_and_drain_adapter(record.run_id, adapter)
-            record = self.store.transition(
-                record.run_id,
-                LifecycleState.DEAD,
-                reason=f"provider start failed: {exc}",
-            )
-            await self._publish_agent_change(record.agent_id)
+            reason = f"provider start failed: {exc}"
+            if rollback_start:
+                self.store.abort_start(record.run_id, reason=reason)
+                raise ProviderProcessError(reason) from exc
+            else:
+                record = self.store.transition(
+                    record.run_id,
+                    LifecycleState.DEAD,
+                    reason=reason,
+                )
+                await self._publish_agent_change(record.agent_id)
             raise
+        self.store.commit_start(record.run_id)
         await self._publish_agent_change(record.agent_id)
         return record
 

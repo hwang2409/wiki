@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -13,7 +14,6 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from uuid import UUID
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -460,7 +460,9 @@ class _AgentControlApi:
                 payload = json.loads(self.rfile.read(length) or b"{}")
                 owner.requests.append(("POST", self.path, payload))
                 if self.path == "/api/agents/spawn":
-                    request_id = payload["request_id"]
+                    request_id = payload.get("request_id") or hashlib.sha256(
+                        json.dumps(payload, sort_keys=True).encode("utf-8")
+                    ).hexdigest()
                     result = owner.spawn_results.get(request_id)
                     if result is None:
                         owner.provider_starts += 1
@@ -478,7 +480,9 @@ class _AgentControlApi:
                     self._reply(200, result)
                     return
                 if self.path == "/api/agents/spawn-orchestrator":
-                    request_id = payload["request_id"]
+                    request_id = payload.get("request_id") or hashlib.sha256(
+                        json.dumps(payload, sort_keys=True).encode("utf-8")
+                    ).hexdigest()
                     result = owner.spawn_results.get(request_id)
                     if result is None:
                         owner.provider_starts += 1
@@ -686,7 +690,7 @@ class AgentControlCliTests(unittest.TestCase):
                 for method, path, payload in api.requests
                 if method == "POST" and path == "/api/agents/spawn"
             )
-            UUID(request["request_id"])
+            self.assertNotIn("request_id", request)
             self.assertTrue(
                 any(
                     method == "POST" and path == "/api/agents/spawn-orchestrator"

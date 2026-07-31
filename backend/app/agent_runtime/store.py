@@ -506,6 +506,7 @@ class RunStore:
         # Adapter ownership is process-local. A restarted supervisor must
         # project every retained PID as detached until it reattaches control.
         self._control_attached_run_ids: set[str] = set()
+        self._start_registry_snapshots: dict[str, dict[str, Any]] = {}
         _ensure_private_dir(paths.runtime_dir)
         _ensure_private_dir(paths.runs_dir)
         self._reconcile_existing_runs()
@@ -1108,6 +1109,9 @@ class RunStore:
             # orphan from a prior run before this record becomes current; the
             # supervisor calls create() while holding the per-agent lock.
             self.status_path(record.agent_id).unlink(missing_ok=True)
+            self._start_registry_snapshots[record.run_id] = json.loads(
+                json.dumps(registry)
+            )
             self._create_run_files(record)
             history = (
                 list((entry or {}).get("history") or [])
@@ -1150,6 +1154,30 @@ class RunStore:
             }
             self._write_registry(registry)
             return record
+
+    def commit_start(self, run_id: str) -> None:
+        """Forget the pre-start registry snapshot after provider launch succeeds."""
+
+        with self._lock:
+            self._start_registry_snapshots.pop(run_id, None)
+
+    def abort_start(self, run_id: str, *, reason: str) -> None:
+        """Remove a failed start and restore the registry before that start."""
+
+        del reason  # The failed run is rolled back instead of persisted.
+        with self._lock:
+            record = self.get(run_id)
+            registry = self._start_registry_snapshots.pop(run_id, None)
+            if registry is None:
+                registry = self._read_registry()
+                entry = registry.get(record.agent_id)
+                if isinstance(entry, dict) and (
+                    (entry.get("current") or {}).get("run_id") == run_id
+                ):
+                    registry.pop(record.agent_id, None)
+            self._control_attached_run_ids.discard(run_id)
+            shutil.rmtree(self.run_dir(run_id))
+            self._write_registry(registry)
 
     def get(self, run_id: str) -> RunRecord:
         with self._lock:

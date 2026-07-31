@@ -333,7 +333,6 @@ def spawn_agent(arguments: Any) -> dict[str, Any]:
         },
     )
     values.setdefault("effort", None)
-    values.setdefault("request_id", str(uuid4()))
     return _backend_api("POST", "/api/agents/spawn", values)
 
 
@@ -424,7 +423,6 @@ def next_review(arguments: Any) -> dict[str, Any]:
         values.setdefault("reviewer_effort", "high")
     else:
         values.pop("reviewer_effort", None)
-    values.setdefault("request_id", str(uuid4()))
     orch = os.environ.get("WIKI_AGENT_ID")
     if not orch:
         raise AgentToolError("WIKI_AGENT_ID is missing from the orchestrator runtime")

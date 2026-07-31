@@ -4179,6 +4179,11 @@ def request_backend_base_url(request: Request) -> str:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+def _stable_spawn_request_id(payload: dict[str, Any]) -> str:
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return f"spawn-{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
+
+
 def resolve_window(ticket: str) -> str | None:
     """Live tmux window for a worker ticket or orchestrator id."""
     registry = _read_agent_registry()
@@ -4606,6 +4611,19 @@ def spawn_agent(
     if len(prompt.encode("utf-8")) >= MAX_SPAWN_PROMPT_BYTES:
         raise HTTPException(status_code=400, detail="Kickoff prompt must be smaller than 100KB")
 
+    request_id = body.request_id or _stable_spawn_request_id(
+        {
+            "agent_id": ticket,
+            "provider": "codex" if kind == "cdx" else "claude",
+            "role": role,
+            "model": model,
+            "effort": effort,
+            "worktree": str(workdir_path),
+            "prompt": prompt,
+            "orchestrator_id": (body.orch or "").strip() or None,
+        }
+    )
+
     registry = _read_agent_registry()
     orch = (body.orch or "").strip()
     if orch:
@@ -4622,10 +4640,10 @@ def spawn_agent(
     current = (registry.get(ticket) or {}).get("current") or {}
     current_is_headless = isinstance(current, dict) and _is_headless(current)
     replaying = False
-    if current_is_headless and body.request_id is not None:
+    if current_is_headless:
         idempotency = _supervisor_request(
             "idempotency/status",
-            {"method": "run/start", "request_id": body.request_id},
+            {"method": "run/start", "request_id": request_id},
         )
         if not isinstance(idempotency, dict) or not isinstance(idempotency.get("known"), bool):
             raise HTTPException(
@@ -4662,7 +4680,7 @@ def spawn_agent(
             "prompt": prompt,
             "orchestrator_id": orch or None,
             "migrate_legacy": bool(current) and not current_is_headless,
-            "request_id": body.request_id,
+            "request_id": request_id,
             "backend_base_url": backend_base_url,
         },
     )
@@ -4678,7 +4696,7 @@ def spawn_agent(
         model=model,
         effort=effort,
         worktree=str(workdir_path),
-        request_id=body.request_id,
+        request_id=request_id,
         status_dir=AGENT_STATUS_DIR,
     )
     refreshed = _registry_agent(_read_agent_registry(), ticket)
@@ -4688,6 +4706,7 @@ def spawn_agent(
         "run_id": result.get("run_id"),
         "log": registration.get("log"),
         "prompt_path": None,
+        "request_id": request_id,
     }
     warnings = []
     if isinstance(result.get("warning"), str):
@@ -4712,7 +4731,7 @@ def spawn_agent_route(
 
 
 @app.post("/api/agents/next-review")
-def next_review_route(body: NextReviewIn) -> dict[str, Any]:
+def next_review_route(request: Request, body: NextReviewIn) -> dict[str, Any]:
     """Gate a PR and start its next pinned reviewer as one idempotent action."""
 
     from .agent_runtime.next_review import next_review
@@ -4728,6 +4747,7 @@ def next_review_route(body: NextReviewIn) -> dict[str, Any]:
         prompt_template=body.prompt_template,
         request_id=body.request_id,
         diversity=body.diversity,
+        backend_base_url=request_backend_base_url(request),
     )
 
 
@@ -4816,6 +4836,17 @@ def spawn_orchestrator(
         raise HTTPException(status_code=400, detail="Initial goal must stay under 20KB")
 
     workdir_path = resolve_existing_dir(body.workdir, field_name="Project directory")
+    request_id = body.request_id or _stable_spawn_request_id(
+        {
+            "agent_id": orch_id,
+            "provider": "codex" if kind == "cdx" else "claude",
+            "role": "orchestrator",
+            "model": model,
+            "effort": body.effort,
+            "worktree": str(workdir_path),
+            "goal": goal,
+        }
+    )
 
     registry = _read_agent_registry()
     normal_entry = registry.get(orch_id)
@@ -4824,10 +4855,10 @@ def spawn_orchestrator(
     )
     replaying = False
     if isinstance(normal_current, dict):
-        if _is_headless(normal_current) and body.request_id is not None:
+        if _is_headless(normal_current):
             idempotency = _supervisor_request(
                 "idempotency/status",
-                {"method": "run/start", "request_id": body.request_id},
+                {"method": "run/start", "request_id": request_id},
             )
             if not isinstance(idempotency, dict) or not isinstance(
                 idempotency.get("known"), bool
@@ -4887,7 +4918,7 @@ def spawn_orchestrator(
             "prompt": prompt,
             "orchestrator_id": None,
             "migrate_legacy": migrate_legacy,
-            "request_id": body.request_id,
+            "request_id": request_id,
             "backend_base_url": backend_base_url,
         },
     )
@@ -4901,6 +4932,7 @@ def spawn_orchestrator(
         "run_id": result.get("run_id"),
         "log": registration.get("log"),
         "prompt_path": None,
+        "request_id": request_id,
         "note": "orchestrator registered under the durable supervisor",
     }
     auth_hint = PROVIDER_HEALTH.spawn_hint(kind)

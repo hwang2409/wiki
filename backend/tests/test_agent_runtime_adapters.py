@@ -371,6 +371,30 @@ class CodexAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(first["tmux"])
         self.assertIsNone(first["tmux_pane"])
 
+    async def test_start_survives_slow_open_handle_verification(self) -> None:
+        record = _record(self.root, ProviderKind.CODEX, state=LifecycleState.STARTING)
+        adapter = self._adapter(record)
+        attempts = 0
+
+        async def delayed_identity(
+            wrapper_pid: int | None,
+            _provider: ProviderKind,
+            _session_id: str | None,
+            *,
+            reported_path: str | None = None,
+        ) -> ProviderProcessIdentity | None:
+            nonlocal attempts
+            attempts += 1
+            if attempts < 4 or wrapper_pid is None or reported_path is None:
+                return None
+            return ProviderProcessIdentity(wrapper_pid, reported_path)
+
+        adapter.identity_resolver = delayed_identity
+        started = await adapter.start(_start_request(record))
+
+        self.assertEqual(started.state, LifecycleState.WORKING)
+        self.assertEqual(attempts, 4)
+
     async def test_replacement_restarts_transport_with_new_run_mcp_identity(self) -> None:
         record = _record(self.root, ProviderKind.CODEX, state=LifecycleState.STARTING)
         adapter = self._adapter(record)
