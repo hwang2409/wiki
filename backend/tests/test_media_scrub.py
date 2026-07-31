@@ -6,6 +6,7 @@ import random
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 import tracemalloc
@@ -3512,6 +3513,122 @@ class Review24Mp3ReservoirProbeTests(unittest.TestCase):
         self.assertEqual(len(result.data), len(payload))
         self.assertLess(elapsed, 3.0, f"MP3 scrub took {elapsed:.2f}s")
         self.assertLess(peak, 8 * len(payload), f"peak allocation was {peak} bytes")
+
+    def test_near_limit_minimum_frames_keep_cpu_and_memory_bounded(self) -> None:
+        frame = b"\xff\xe3\x10\xc0" + b"\x00" * 48
+        frame_length = mp3_scrubber._mp3_frame_length(frame, 0, len(frame))
+        self.assertEqual(frame_length, len(frame))
+        frame_count = (20 * 1024 * 1024) // len(frame)
+        payload = frame * frame_count
+        rss_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        tracemalloc.start()
+        started = time.perf_counter()
+        cpu_started = time.process_time()
+        try:
+            result = media_scrub.scrub_audio(payload, "audio/mpeg")
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            cpu_elapsed = time.process_time() - cpu_started
+            tracemalloc.stop()
+        elapsed = time.perf_counter() - started
+        rss_after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        rss_delta = rss_after - rss_before
+        if sys.platform != "darwin":
+            rss_delta *= 1024
+        self.assertEqual(len(result.data), len(payload))
+        self.assertLess(cpu_elapsed, 20.0, f"MP3 CPU time was {cpu_elapsed:.2f}s")
+        self.assertLess(elapsed, 25.0, f"MP3 scrub took {elapsed:.2f}s")
+        self.assertLess(peak, 4 * len(payload), f"peak allocation was {peak} bytes")
+        self.assertLess(rss_delta, 4 * len(payload), f"RSS delta was {rss_delta} bytes")
+
+
+class Review26Mp4StructureProbeTests(unittest.TestCase):
+    def test_sbgp_one_entry_rebuild_has_one_count_word(self) -> None:
+        body = (
+            b"\x00\x00\x00\x00" + b"roll"
+            + struct.pack(">I", 1)
+            + struct.pack(">II", 1, 1)
+        )
+        data = struct.pack(">I", 8 + len(body)) + b"sbgp" + body
+        atom = mp4_scrubber._Mp4Atom(
+            start=0,
+            size=len(data),
+            header_len=8,
+            type=b"sbgp",
+            body_start=8,
+            body_end=len(data),
+        )
+        rebuilt = mp4_scrubber._rebuild_stbl_table(b"sbgp", data, atom)
+        self.assertEqual(rebuilt, data)
+        self.assertEqual(len(rebuilt), 28)
+
+    def test_real_roll_sample_groups_scrub_and_decode(self) -> None:
+        if FFMPEG is None:
+            self.skipTest("ffmpeg not installed")
+        real = REAL_MP4.read_bytes()
+        stsd_pos = real.find(b"stsd")
+        self.assertGreater(stsd_pos, 0)
+        sgpd_body = (
+            b"\x01\x00\x00\x00" + b"roll"
+            + struct.pack(">II", 2, 1) + struct.pack(">h", -1)
+        )
+        sbgp_body = (
+            b"\x00\x00\x00\x00" + b"roll"
+            + struct.pack(">I", 1) + struct.pack(">II", 1, 1)
+        )
+        groups = (
+            struct.pack(">I", 8 + len(sgpd_body)) + b"sgpd" + sgpd_body
+            + struct.pack(">I", 8 + len(sbgp_body)) + b"sbgp" + sbgp_body
+        )
+        payload = bytearray(real)
+        insert_at = stsd_pos - 4
+        for parent in (b"stbl", b"minf", b"mdia", b"trak", b"moov"):
+            pos = payload.rfind(parent, 0, insert_at)
+            existing = struct.unpack(">I", bytes(payload[pos - 4:pos]))[0]
+            payload[pos - 4:pos] = struct.pack(">I", existing + len(groups))
+        payload[insert_at:insert_at] = groups
+        stco_pos = payload.find(b"stco")
+        self.assertGreater(stco_pos, 0)
+        count = struct.unpack(">I", payload[stco_pos + 8:stco_pos + 12])[0]
+        for index in range(count):
+            value_pos = stco_pos + 12 + index * 4
+            value = struct.unpack(">I", payload[value_pos:value_pos + 4])[0]
+            payload[value_pos:value_pos + 4] = struct.pack(">I", value + len(groups))
+        result = media_scrub.scrub_video(bytes(payload), "video/mp4")
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as handle:
+            handle.write(result.data)
+            path = handle.name
+        try:
+            probe = subprocess.run(
+                [FFMPEG, "-v", "error", "-i", path, "-f", "null", "-"],
+                capture_output=True,
+                timeout=30,
+            )
+            self.assertEqual(probe.returncode, 0, probe.stderr.decode(errors="replace"))
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+    def test_forbidden_zero_bit_is_rejected_directly_for_slice_idr_and_sei(self) -> None:
+        for nal_type in (1, 5, 6):
+            with self.subTest(nal_type=nal_type):
+                sample = struct.pack(">I", 2) + bytes((0x80 | nal_type, 0x80))
+                with self.assertRaisesRegex(
+                    media_scrub.MediaScrubError, "forbidden_zero_bit",
+                ):
+                    mp4_scrubber._canonicalise_avc_sample(sample, 4, set(), False)
+
+    def test_forbidden_zero_bit_is_rejected_in_full_mp4_for_each_nal_kind(self) -> None:
+        for nal_type in (1, 5, 6):
+            with self.subTest(nal_type=nal_type):
+                payload = bytearray(REAL_MP4.read_bytes())
+                mdat_pos = payload.find(b"mdat")
+                self.assertGreater(mdat_pos, 0)
+                nal_start = mdat_pos + 8
+                payload[nal_start] = 0x80 | nal_type
+                with self.assertRaisesRegex(
+                    media_scrub.MediaScrubError, "forbidden_zero_bit",
+                ):
+                    media_scrub.scrub_video(bytes(payload), "video/mp4")
 
 
 class Review25Mp3CanonicalizationTests(unittest.TestCase):

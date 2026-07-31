@@ -206,9 +206,12 @@ def _mp3_validate_full_frame_stream(data: bytes, start: int, end: int) -> bytes:
     frames_seen = 0
     stream_signature: tuple[int, int] | None = None
     rebuilt = bytearray(data[start:end])
-    frame_specs: list[tuple[int, int, int]] = []
-    logical_segments: list[tuple[int, int, int]] = []
-    logical_ranges: list[tuple[int, int]] = []
+    # One byte per logical payload byte stores the exact bit mask that later
+    # Layer III frames own through the reservoir. This replaces four Python
+    # tuple graphs whose size grew with the frame count. A logical payload is
+    # always smaller than the complete input, so this bound is explicit.
+    ownership = bytearray(end - start)
+    has_ownership = False
     logical_payload_bytes = 0
     audio_floor_bytes: int | None = None
     while offset < end:
@@ -234,7 +237,12 @@ def _mp3_validate_full_frame_stream(data: bytes, start: int, end: int) -> bytes:
             )
         side_info_start = _mp3_side_info_start(header)
         canonical_header = _mp3_rebuild_header(header)
-        canonical_side_info = _mp3_rebuild_side_info(frame, header)
+        (
+            canonical_side_info,
+            main_data_begin,
+            main_data_bits,
+            _main_data_start,
+        ) = _mp3_rebuild_side_info_and_syntax(frame, header)
         rebuilt[frame_offset:frame_offset + 4] = canonical_header
         rebuilt[
             frame_offset + 4:frame_offset + side_info_start
@@ -243,13 +251,8 @@ def _mp3_validate_full_frame_stream(data: bytes, start: int, end: int) -> bytes:
             _mp3_xing_metadata_end(frame, side_info_start)
             if frames_seen == 0 else None
         )
-        frame_specs.append((frame_offset, frame_len, side_info_start))
         payload_length = frame_len - side_info_start
-        logical_segments.append((logical_payload_bytes, frame_offset + side_info_start, payload_length))
         if metadata_end is None:
-            main_data_begin, main_data_bits, _main_data_start = _mp3_layer3_syntax(
-                frame, header,
-            )
             if audio_floor_bytes is None:
                 audio_floor_bytes = logical_payload_bytes
             reservoir_start = logical_payload_bytes - main_data_begin
@@ -261,7 +264,13 @@ def _mp3_validate_full_frame_stream(data: bytes, start: int, end: int) -> bytes:
                 raise MediaScrubError(
                     "mp3 Layer III main data extends into a future frame"
                 )
-            logical_ranges.append((reservoir_start * 8, reservoir_start * 8 + main_data_bits))
+            if main_data_bits:
+                has_ownership = True
+            _mp3_mark_logical_range(
+                ownership,
+                reservoir_start * 8,
+                reservoir_start * 8 + main_data_bits,
+            )
         logical_payload_bytes += payload_length
         offset += frame_len
         frames_seen += 1
@@ -271,86 +280,60 @@ def _mp3_validate_full_frame_stream(data: bytes, start: int, end: int) -> bytes:
         )
     if frames_seen < 1:
         raise MediaScrubError("mp3 frame stream contains zero frames")
-    protected_ranges = _mp3_map_logical_ranges(logical_segments, logical_ranges)
-    _mp3_zero_unowned_main_data(rebuilt, frame_specs, protected_ranges)
+    _mp3_zero_unowned_main_data(
+        rebuilt, data, start, end, ownership, has_ownership,
+    )
     return bytes(rebuilt)
 
 
-def _mp3_map_logical_ranges(
-    segments: list[tuple[int, int, int]],
-    ranges: list[tuple[int, int]],
-) -> list[tuple[int, int]]:
-    """Map logical reservoir intervals to physical frame-payload intervals."""
-    merged_ranges: list[list[int]] = []
-    for start, end in sorted((start, end) for start, end in ranges if end > start):
-        if merged_ranges and start <= merged_ranges[-1][1]:
-            merged_ranges[-1][1] = max(merged_ranges[-1][1], end)
-        else:
-            merged_ranges.append([start, end])
-
-    physical: list[tuple[int, int]] = []
-    segment_index = 0
-    for range_start, range_end in merged_ranges:
-        while segment_index < len(segments):
-            logical_start, _physical_start, length = segments[segment_index]
-            if (logical_start + length) * 8 > range_start:
-                break
-            segment_index += 1
-        index = segment_index
-        while index < len(segments):
-            logical_start, physical_start, length = segments[index]
-            segment_end = logical_start + length
-            if logical_start * 8 >= range_end:
-                break
-            overlap_start = max(range_start, logical_start * 8)
-            overlap_end = min(range_end, segment_end * 8)
-            if overlap_start < overlap_end:
-                physical.append((
-                    physical_start * 8 + (overlap_start - logical_start * 8),
-                    physical_start * 8 + (overlap_end - logical_start * 8),
-                ))
-            if segment_end * 8 <= range_end:
-                index += 1
-            else:
-                break
-        segment_index = index
-    return physical
+def _mp3_mark_logical_range(ownership: bytearray, start: int, end: int) -> None:
+    """Mark an inclusive-exclusive logical bit range without per-range objects."""
+    if end <= start:
+        return
+    if start < 0 or end > len(ownership) * 8:
+        raise MediaScrubError("mp3 Layer III ownership range is out of bounds")
+    first_byte = start // 8
+    last_byte = (end - 1) // 8
+    first_offset = start % 8
+    last_offset = end % 8
+    if first_byte == last_byte:
+        ownership[first_byte] |= ((0xFF >> first_offset) & (0xFF << (8 - last_offset))) if last_offset else 0xFF >> first_offset
+        return
+    ownership[first_byte] |= 0xFF >> first_offset
+    if last_byte > first_byte + 1:
+        ownership[first_byte + 1:last_byte] = b"\xFF" * (last_byte - first_byte - 1)
+    if last_offset:
+        ownership[last_byte] |= (0xFF << (8 - last_offset)) & 0xFF
+    else:
+        ownership[last_byte] = 0xFF
 
 
 def _mp3_zero_unowned_main_data(
     rebuilt: bytearray,
-    frame_specs: list[tuple[int, int, int]],
-    protected_ranges: list[tuple[int, int]],
+    data: bytes,
+    start: int,
+    end: int,
+    ownership: bytearray,
+    has_ownership: bool,
 ) -> None:
-    """Clear payload bits not owned by any Layer III main-data range."""
-    protected_ranges.sort()
-    merged: list[list[int]] = []
-    for start, end in protected_ranges:
-        if end <= start:
-            continue
-        if merged and start <= merged[-1][1]:
-            merged[-1][1] = max(merged[-1][1], end)
+    """Rescan frame headers and clear payload bits with no ownership mark."""
+    offset = start
+    logical_payload_bytes = 0
+    while offset < end:
+        frame_len = _mp3_frame_length(data, offset, end)
+        if frame_len is None:
+            raise MediaScrubError("mp3 frame stream changed during rebuild")
+        header = data[offset:offset + 4]
+        side_info_start = _mp3_side_info_start(header)
+        payload_length = frame_len - side_info_start
+        physical_start = offset - start + side_info_start
+        if not has_ownership:
+            rebuilt[physical_start:physical_start + payload_length] = b"\x00" * payload_length
         else:
-            merged.append([start, end])
-    interval_index = 0
-    for frame_offset, frame_len, side_info_start in frame_specs:
-        for byte_offset in range(frame_offset + side_info_start, frame_offset + frame_len):
-            bit_start = byte_offset * 8
-            bit_end = bit_start + 8
-            while (
-                interval_index < len(merged)
-                and merged[interval_index][1] <= bit_start
-            ):
-                interval_index += 1
-            mask = 0
-            index = interval_index
-            while index < len(merged) and merged[index][0] < bit_end:
-                overlap_start = max(bit_start, merged[index][0])
-                overlap_end = min(bit_end, merged[index][1])
-                for bit in range(overlap_start, overlap_end):
-                    mask |= 1 << (7 - (bit - bit_start))
-                index += 1
-            rebuilt[byte_offset] &= mask
+            for index in range(payload_length):
+                rebuilt[physical_start + index] &= ownership[logical_payload_bytes + index]
+        logical_payload_bytes += payload_length
+        offset += frame_len
 
 
 class _Mp3BitReader:
@@ -405,14 +388,19 @@ def _mp3_rebuild_header(header: bytes) -> bytes:
     ))
 
 
-def _mp3_rebuild_side_info(frame: bytes, header: bytes) -> bytes:
-    """Re-emit side information while clearing its private field."""
+def _mp3_rebuild_side_info_and_syntax(
+    frame: bytes, header: bytes,
+) -> tuple[bytes, int, int, int]:
+    """Re-emit side information and return its reservoir syntax."""
     crc_length = 0 if header[1] & 0x01 else 2
     side_start = 4 + crc_length
     side_length = _mp3_side_info_length(header)
     side_end = side_start + side_length
     if side_end > len(frame):
         raise MediaScrubError("mp3 Layer III side information is truncated")
+    side_bytes = frame[side_start:side_end]
+    if not any(side_bytes):
+        return bytes(side_bytes), 0, 0, side_end
     reader = _Mp3BitReader(frame[side_start:side_end])
     writer = _Mp3BitWriter(side_length)
     version_bits = (header[1] >> 3) & 0x03
@@ -421,7 +409,8 @@ def _mp3_rebuild_side_info(frame: bytes, header: bytes) -> bytes:
     mpeg1 = version_bits == 3
 
     main_data_begin_width = 9 if mpeg1 else 8
-    writer.write(reader.read(main_data_begin_width), main_data_begin_width)
+    main_data_begin = reader.read(main_data_begin_width)
+    writer.write(main_data_begin, main_data_begin_width)
     private_width = (
         5 if mpeg1 and channels == 1
         else 3 if mpeg1
@@ -433,9 +422,12 @@ def _mp3_rebuild_side_info(frame: bytes, header: bytes) -> bytes:
     if mpeg1:
         for _ in range(channels):
             writer.write(reader.read(4), 4)
+    main_data_bits = 0
     for _ in range(2 if mpeg1 else 1):
         for _ in range(channels):
-            writer.write(reader.read(12), 12)
+            part2_3_length = reader.read(12)
+            main_data_bits += part2_3_length
+            writer.write(part2_3_length, 12)
             writer.write(reader.read(9), 9)
             writer.write(reader.read(8), 8)
             scalefac_width = 4 if mpeg1 else 9
@@ -463,7 +455,11 @@ def _mp3_rebuild_side_info(frame: bytes, header: bytes) -> bytes:
             writer.write(reader.read(1), 1)
     if reader.bit_pos > side_length * 8:
         raise MediaScrubError("mp3 Layer III side information is truncated")
-    return writer.finish()
+    return writer.finish(), main_data_begin, main_data_bits, side_end
+
+
+def _mp3_rebuild_side_info(frame: bytes, header: bytes) -> bytes:
+    return _mp3_rebuild_side_info_and_syntax(frame, header)[0]
 
 
 def _mp3_layer3_main_data_end(frame: bytes, header: bytes) -> int:
@@ -478,49 +474,9 @@ def _mp3_layer3_main_data_end(frame: bytes, header: bytes) -> int:
 
 def _mp3_layer3_syntax(frame: bytes, header: bytes) -> tuple[int, int, int]:
     """Parse side information and return reservoir, coded bits, and payload start."""
-    side_start = 4 + (0 if header[1] & 1 else 2)
-    side_length = _mp3_side_info_length(header)
-    side_end = side_start + side_length
-    if side_end > len(frame):
-        raise MediaScrubError("mp3 Layer III side information is truncated")
-    reader = _Mp3BitReader(frame[side_start:side_end])
-    version_bits = (header[1] >> 3) & 0x03
-    channel_mode = (header[3] >> 6) & 0x03
-    channels = 1 if channel_mode == 3 else 2
-    mpeg1 = version_bits == 3
-    main_data_begin = reader.read(9 if mpeg1 else 8)
-    reader.read(
-        5 if mpeg1 and channels == 1
-        else 3 if mpeg1
-        else 1 if channels == 1
-        else 2
+    _side_info, main_data_begin, main_data_bits, side_end = (
+        _mp3_rebuild_side_info_and_syntax(frame, header)
     )
-    if mpeg1:
-        for _ in range(channels):
-            reader.read(4)  # scfsi
-    main_data_bits = 0
-    for _ in range(2 if mpeg1 else 1):
-        for _ in range(channels):
-            main_data_bits += reader.read(12)  # part2_3_length
-            reader.read(9)  # big_values
-            reader.read(8)  # global_gain
-            reader.read(4 if mpeg1 else 9)  # scalefac_compress
-            switched = reader.read(1)
-            if switched:
-                block_type = reader.read(2)
-                if block_type == 0:
-                    raise MediaScrubError("mp3 Layer III reserved block type")
-                reader.read(1)  # mixed_block_flag
-                reader.read(5 * 2)  # table_select
-                reader.read(3 * 3)  # subblock_gain
-            else:
-                reader.read(5 * 3)  # table_select
-                reader.read(4)  # region0_count
-                reader.read(3)  # region1_count
-            if mpeg1:
-                reader.read(1)  # preflag
-            reader.read(1)  # scalefac_scale
-            reader.read(1)  # count1table_select
     return main_data_begin, main_data_bits, side_end
 
 

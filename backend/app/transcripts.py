@@ -31,7 +31,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 
 from .wiki_artifacts import (
+    AUDIO_MIMES,
     ArtifactValidationError,
+    IMAGE_TYPES,
+    PDF_MIME,
+    VIDEO_MIMES,
     _validate_text_payload,
     artifact_from_codex_mcp_tool_result,
     artifact_from_text,
@@ -59,6 +63,13 @@ EVENT_DISPOSITION_RENDERED = "rendered"
 EVENT_DISPOSITION_SUMMARIZED = "summarized"
 EVENT_DISPOSITION_IGNORED = "intentionally_ignored"
 EVENT_DISPOSITION_UNKNOWN = "unknown"
+
+_STRUCTURED_BINARY_MIMES = {
+    "image": frozenset(IMAGE_TYPES),
+    "pdf": frozenset({PDF_MIME}),
+    "video": frozenset(VIDEO_MIMES),
+    "audio": frozenset(AUDIO_MIMES),
+}
 
 
 def cache_image(media_type: str, b64_data: str) -> str | None:
@@ -668,11 +679,15 @@ def _artifact_from_structured_result(meta: dict, output: str) -> dict | None:
     payload = raw_input.get("payload")
     if not isinstance(kind, str) or not isinstance(payload, dict):
         return None
-    if kind == "image":
+    if kind in _STRUCTURED_BINARY_MIMES:
+        default_mime = PDF_MIME if kind == "pdf" else None
+        mime = payload.get("mime", default_mime)
+        if mime not in _STRUCTURED_BINARY_MIMES[kind]:
+            return None
         artifact = {
-            "kind": "image",
+            "kind": kind,
             "ref": f"artifact://{artifact_id}",
-            "mime": payload.get("mime"),
+            "mime": mime,
         }
     else:
         try:

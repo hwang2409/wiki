@@ -723,6 +723,10 @@ def _canonicalise_avc_sample(
         if nal_size == 0 or offset + nal_size > len(sample):
             raise MediaScrubError("mp4 AVC sample NAL length is out of bounds")
         nal = sample[offset:offset + nal_size]
+        if nal[0] & 0x80:
+            raise MediaScrubError(
+                "mp4 AVC sample NAL forbidden_zero_bit is set"
+            )
         nal_type = nal[0] & 0x1F
         if nal_type not in _MP4_AVC_SAMPLE_NAL_TYPES:
             if nal_type in (7, 8):
@@ -731,6 +735,15 @@ def _canonicalise_avc_sample(
                 )
             raise MediaScrubError(
                 f"mp4 avc1 sample contains unsupported NAL type {nal_type}"
+            )
+        nal_ref_idc = (nal[0] >> 5) & 0x03
+        if nal_type == 5 and nal_ref_idc == 0:
+            raise MediaScrubError(
+                "mp4 AVC IDR NAL has zero nal_ref_idc"
+            )
+        if nal_type == 6 and nal_ref_idc != 0:
+            raise MediaScrubError(
+                "mp4 AVC SEI NAL has non-zero nal_ref_idc"
             )
         if nal_type in (1, 5):
             pps_id = parse_slice_pps_id(nal)
@@ -1801,7 +1814,7 @@ def _rebuild_stbl_table(box_type: bytes, data: bytes, atom: _Mp4Atom) -> bytes:
             bytes([0]) + _CANONICAL_FULLBOX_FLAGS
             + grouping_type
             + struct.pack(">I", entry_count)
-            + bytes(body[8:]),
+            + bytes(body[12:]),
         )
 
     if version != 0:
