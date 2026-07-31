@@ -298,6 +298,21 @@ async function main() {
       throw new Error(`keyboard Zoom in did not move x domain (still ${xAfterKeyboard})`);
     }
 
+    // ─── keyboard Zoom out expands the live x scale ──────────────────────
+    logStep("keyboard activation of Zoom out expands the x scale");
+    const zoomedInSpan = Math.abs(xAfterKeyboard[1] - xAfterKeyboard[0]);
+    const zoomOutButton = page.getByRole("button", { name: "Zoom out" });
+    await zoomOutButton.focus();
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(220);
+    const xAfterKeyboardZoomOut = await scaleDomain(page, inspectorSelector, "x");
+    const zoomedOutSpan = Math.abs(xAfterKeyboardZoomOut[1] - xAfterKeyboardZoomOut[0]);
+    if (!(zoomedOutSpan > zoomedInSpan)) {
+      throw new Error(
+        `keyboard Zoom out did not expand x domain (span ${zoomedInSpan} → ${zoomedOutSpan})`,
+      );
+    }
+
     // ─── real wheel gesture zooms the x scale ────────────────────────────
     logStep("wheel over the inspector plot moves x scale (armed)");
     const plotBox = await inspectorPlot.boundingBox();

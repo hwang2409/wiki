@@ -1,6 +1,6 @@
 import { useCallback, useMemo, useRef, useState } from "react";
 import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Download, Minus, Plus, RotateCcw } from "lucide-react";
-import { plotInteractivity, plotPngFilename, type PlotDomains, type ZoomChannel } from "../plot-interaction";
+import { plotInteractivity, plotPngFilename, zoomParamName, type PlotDomains, type ZoomChannel } from "../plot-interaction";
 import { PlotRenderer, type PlotView } from "../artifact-renderers";
 
 const HINT_BY_MODE: Record<string, string> = {
@@ -9,7 +9,7 @@ const HINT_BY_MODE: Record<string, string> = {
   static: "Static plot",
 };
 
-type KeyboardAction = "zoom-in" | "zoom-out" | "pan-left" | "pan-right" | "pan-up" | "pan-down";
+export type KeyboardAction = "zoom-in" | "zoom-out" | "pan-left" | "pan-right" | "pan-up" | "pan-down";
 
 function scaleDomain(view: PlotView, channel: ZoomChannel): [number, number] | null {
   const values = view.scale?.(channel).domain() ?? [];
@@ -17,27 +17,63 @@ function scaleDomain(view: PlotView, channel: ZoomChannel): [number, number] | n
   const low = Number(values[0]);
   const high = Number(values[1]);
   if (!Number.isFinite(low) || !Number.isFinite(high) || low === high) return null;
-  return low < high ? [low, high] : [high, low];
+  return [low, high];
 }
 
-function adjustDomain(domain: [number, number], action: KeyboardAction, channel: ZoomChannel): [number, number] | null {
-  const [low, high] = domain;
-  const span = high - low;
-  const center = (low + high) / 2;
-  if (action === "zoom-in" || action === "zoom-out") {
-    const factor = action === "zoom-in" ? 0.4 : 0.625;
-    const nextSpan = span * factor;
-    return [center - nextSpan, center + nextSpan];
+function scaleAnchor(view: PlotView, channel: ZoomChannel, domain: [number, number]): number {
+  const scale = view.scale?.(channel);
+  const range = scale?.range?.() ?? [];
+  if (range.length === 2 && scale?.invert) {
+    const first = Number(range[0]);
+    const second = Number(range[1]);
+    const anchor = Number(scale.invert((first + second) / 2));
+    if (Number.isFinite(anchor)) return anchor;
   }
-  if (channel === "x" && (action === "pan-left" || action === "pan-right")) {
-    const delta = span * (action === "pan-left" ? -0.2 : 0.2);
-    return [low + delta, high + delta];
+  return (domain[0] + domain[1]) / 2;
+}
+
+export function applyKeyboardControl(
+  view: PlotView,
+  channels: readonly ZoomChannel[],
+  action: KeyboardAction,
+): boolean {
+  if (!view.signal || !view.run) return false;
+  const isZoom = action === "zoom-in" || action === "zoom-out";
+  let changed = false;
+  for (const channel of channels) {
+    const domain = scaleDomain(view, channel);
+    if (!domain) continue;
+    const param = zoomParamName(channel);
+    if (isZoom) {
+      const anchor = scaleAnchor(view, channel, domain);
+      const factor = action === "zoom-in" ? 0.8 : 1 / 0.8;
+      view.signal(`${param}_zoom_anchor`, { x: anchor, y: anchor });
+      view.signal(`${param}_zoom_delta`, factor);
+      changed = true;
+      continue;
+    }
+    const width = view.width?.() ?? 0;
+    const height = view.height?.() ?? 0;
+    const delta = { x: 0, y: 0 };
+    if (channel === "x" && width > 0 && (action === "pan-left" || action === "pan-right")) {
+      delta.x = width * (action === "pan-left" ? -0.2 : 0.2);
+    } else if (channel === "y" && height > 0 && (action === "pan-up" || action === "pan-down")) {
+      delta.y = height * (action === "pan-up" ? -0.2 : 0.2);
+    } else {
+      continue;
+    }
+    view.signal(`${param}_translate_anchor`, {
+      x: 0,
+      y: 0,
+      extent_x: domain,
+      extent_y: domain,
+    });
+    view.signal(`${param}_translate_delta`, delta);
+    changed = true;
   }
-  if (channel === "y" && (action === "pan-up" || action === "pan-down")) {
-    const delta = span * (action === "pan-up" ? 0.2 : -0.2);
-    return [low + delta, high + delta];
-  }
-  return null;
+  if (!changed) return false;
+  view.run();
+  return true;
 }
 
 export function PlotArtifactDetail({ spec, title }: { spec: Record<string, unknown>; title?: string | null }) {
@@ -76,16 +112,8 @@ export function PlotArtifactDetail({ spec, title }: { spec: Record<string, unkno
   const onKeyboardControl = useCallback((action: KeyboardAction) => {
     const view = viewRef.current;
     if (!view || !canInteract) return;
-    const next: PlotDomains = { ...(domains ?? {}) };
-    for (const channel of interactivity.channels) {
-      const current = scaleDomain(view, channel);
-      if (!current) continue;
-      const adjusted = adjustDomain(current, action, channel);
-      if (adjusted) next[channel] = adjusted;
-      else if (!next[channel]) next[channel] = current;
-    }
-    if (Object.keys(next).length > 0) setDomains(next);
-  }, [canInteract, domains, interactivity]);
+    applyKeyboardControl(view, interactivity.channels, action);
+  }, [canInteract, interactivity]);
   const interactiveChannels = interactivity.mode === "full" ? interactivity.channels : [];
   const hasXChannel = interactiveChannels.includes("x");
   const hasYChannel = interactiveChannels.includes("y");

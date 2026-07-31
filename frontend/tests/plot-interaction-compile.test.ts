@@ -184,6 +184,90 @@ test("runtime: wheel on wiki_zoom_x shrinks x domain independently of y", async 
   await view.finalize();
 });
 
+test("runtime: keyboard zoom and pan preserve log bounds", async () => {
+  const interactive = transform({
+    mark: "point",
+    width: 400,
+    height: 200,
+    data: { values: [{ x: 1, y: 1 }, { x: 10, y: 10 }] },
+    encoding: {
+      x: { field: "x", type: "quantitative", scale: { type: "log" } },
+      y: { field: "y", type: "quantitative" },
+    },
+  });
+  const compiled = compile(interactive as never).spec;
+  const xSignal = (compiled.signals ?? []).find(
+    (signal: Record<string, unknown>) => signal.name === `${zoomParamName("x")}_x`,
+  ) as Record<string, unknown>;
+  assert.match(JSON.stringify(xSignal.on ?? []), /panLog\(/);
+  assert.match(JSON.stringify(xSignal.on ?? []), /zoomLog\(/);
+
+  const view = await renderHeadless(interactive);
+  const scale = view.scale("x");
+  const range = scale.range();
+  const anchor = Number(scale.invert((Number(range[0]) + Number(range[1])) / 2));
+  view
+    .signal(`${zoomParamName("x")}_zoom_anchor`, { x: anchor, y: anchor })
+    .signal(`${zoomParamName("x")}_zoom_delta`, 0.8)
+    .run();
+  const zoomed = scale.domain() as [number, number];
+  assert.ok(zoomed.every((value) => Number.isFinite(value) && value > 0));
+
+  view
+    .signal(`${zoomParamName("x")}_translate_anchor`, {
+      x: 0,
+      y: 0,
+      extent_x: zoomed,
+      extent_y: zoomed,
+    })
+    .signal(`${zoomParamName("x")}_translate_delta`, { x: -80, y: 0 })
+    .run();
+  const panned = scale.domain() as [number, number];
+  assert.ok(panned.every((value) => Number.isFinite(value) && value > 0));
+  assert.ok(panned[0] < panned[1]);
+  await view.finalize();
+});
+
+test("runtime: keyboard zoom and pan preserve descending domain order", async () => {
+  const interactive = transform({
+    mark: "point",
+    width: 400,
+    height: 200,
+    data: { values: [{ x: 1, y: 1 }, { x: 10, y: 10 }] },
+    encoding: {
+      x: { field: "x", type: "quantitative", scale: { domain: [10, 1] } },
+      y: { field: "y", type: "quantitative" },
+    },
+  });
+  const view = await renderHeadless(interactive);
+  const scale = view.scale("x");
+  const initial = scale.domain() as [number, number];
+  assert.ok(initial[0] > initial[1]);
+  const range = scale.range();
+  const anchor = Number(scale.invert((Number(range[0]) + Number(range[1])) / 2));
+  view
+    .signal(`${zoomParamName("x")}_zoom_anchor`, { x: anchor, y: anchor })
+    .signal(`${zoomParamName("x")}_zoom_delta`, 0.8)
+    .run();
+  const zoomed = scale.domain() as [number, number];
+  assert.ok(zoomed.every(Number.isFinite));
+  assert.ok(zoomed[0] > zoomed[1]);
+
+  view
+    .signal(`${zoomParamName("x")}_translate_anchor`, {
+      x: 0,
+      y: 0,
+      extent_x: zoomed,
+      extent_y: zoomed,
+    })
+    .signal(`${zoomParamName("x")}_translate_delta`, { x: -80, y: 0 })
+    .run();
+  const panned = scale.domain() as [number, number];
+  assert.ok(panned.every(Number.isFinite));
+  assert.ok(panned[0] > panned[1]);
+  await view.finalize();
+});
+
 test("runtime: mixed domainRaw axis stays fixed while the other axis zooms", async () => {
   const spec = {
     ...CONTINUOUS,
