@@ -425,6 +425,7 @@ class Supervisor:
             self.store.command_log,
             self.store.command_state,
             self.store.command_state_for,
+            recovery_factory=self._recovery_executor,
         )
         self.worker_soft_cap = (
             worker_soft_cap
@@ -883,6 +884,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 echoed_text,
             )
             if pending_message is not None:
+                self.store.command_log.acknowledge_steer_for_pending(
+                    run_id, pending_message["pending_id"]
+                )
                 normalized_payload = {
                     **normalized.payload,
                     "pending_id": pending_message["pending_id"],
@@ -1423,6 +1427,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     {"type": "session", "ticket": record.agent_id, "surface": "queue"}
                 )
                 return
+            if pending_id is not None:
+                self.store.command_log.mark_steer_sent_for_pending(run_id, pending_id)
             self.store.pop_queued_message(run_id)
             record = self.store.update_adapter_status(run_id, status)
             record = self.store.clear_automatic_resume_suppression(run_id)
@@ -2053,6 +2059,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         async with self._run_mutation_admission():
             async with self.recovery_scan_lock:
                 results = await self._recover_once()
+                await self.command_queue.recover_pending()
                 if self._reaper_due():
                     by_run_id = {
                         item["run_id"]: index for index, item in enumerate(results)
@@ -2996,11 +3003,18 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         dedupe_key: str | None = None,
         source: str | None = None,
         effect_id: str | None = None,
+        command_hash: str | None = None,
     ) -> dict[str, Any]:
         async with self._run_mutation_admission():
             async with self._run_lock(run_id):
                 return await self._send_now(
-                    run_id, message, pending_id, dedupe_key, source, effect_id
+                    run_id,
+                    message,
+                    pending_id,
+                    dedupe_key,
+                    source,
+                    effect_id,
+                    command_hash,
                 )
 
     async def _send_now(
@@ -3011,10 +3025,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         dedupe_key: str | None = None,
         source: str | None = None,
         effect_id: str | None = None,
+        command_hash: str | None = None,
     ) -> dict[str, Any]:
         adapter = self.adapters.get(run_id)
         if adapter is None:
             raise StoreConflict("run has no attached provider adapter")
+        expose_pending_id = pending_id is not None or source is not None
         status = await adapter.status()
         if status.state is LifecycleState.IDLE:
             run_id, adapter, _ = await self._apply_desired_model_locked(
@@ -3024,15 +3040,40 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             )
             if adapter is None:
                 raise StoreConflict("run has no attached provider adapter")
+        if effect_id is not None and pending_id is None:
+            pending_id = str(uuid4())
+        steer_effect = None
+        if effect_id is not None:
+            steer_effect = self.store.command_log.steer_effect(
+                method="run/send_now",
+                request_id=effect_id,
+                agent_id=self.store.get(run_id).agent_id,
+                command_hash=command_hash or "",
+                run_id=run_id,
+                pending_id=pending_id,
+                message=message,
+                mode="now",
+            )
+            pending_id = str(steer_effect["pending_id"])
+            if steer_effect["status"] in {"sent", "acknowledged"}:
+                result = steer_effect.get("result")
+                if isinstance(result, dict):
+                    return result
+                return {"status": "sent", "pending_id": pending_id}
+            record = self.store.get(run_id)
+            if any(
+                item.get("pending_id") == pending_id
+                for item in record.composer_messages
+            ):
+                result = {"status": "sent", "pending_id": pending_id}
+                self.store.command_log.update_steer_effect(
+                    "run/send_now", effect_id, "acknowledged", result
+                )
+                return result
         if dedupe_key is not None:
             _, claimed = self.store.claim_message_dedupe_key(run_id, dedupe_key)
             if not claimed:
                 return {"status": "deduplicated", "dedupe_key": dedupe_key}
-        command_dedupe_key = f"command:{effect_id}" if effect_id else None
-        if command_dedupe_key is not None:
-            _, claimed = self.store.claim_message_dedupe_key(run_id, command_dedupe_key)
-            if not claimed:
-                return {"status": "deduplicated", "request_id": effect_id}
         if pending_id is None and source is not None:
             # Source metadata is only propagated through pending_user_messages,
             # so mint a durable id for synthetic sources without a composer id.
@@ -3043,6 +3084,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         # while releasing the dedupe key — a retry would then land a second
         # pending row for the same pending_id, and the stale first row could
         # consume the retry's provider echo.
+        accepted = False
         try:
             if pending_id is not None:
                 try:
@@ -3055,20 +3097,29 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     self.store.discard_pending_user_message(run_id, pending_id)
                     raise
             status = await adapter.send_now(message)
+            accepted = True
         except Exception:
-            if dedupe_key is not None:
+            if dedupe_key is not None and not accepted:
                 self.store.release_message_dedupe_key(run_id, dedupe_key)
-            if pending_id is not None:
+            if pending_id is not None and not accepted:
                 self.store.discard_pending_user_message(run_id, pending_id)
             raise
+        if effect_id is not None:
+            self.store.command_log.update_steer_effect(
+                "run/send_now", effect_id, "sent"
+            )
         record = self.store.update_adapter_status(run_id, status)
         record = self.store.clear_automatic_resume_suppression(run_id)
         await self._publish_agent_change(record.agent_id)
         response: dict[str, Any] = {"status": "sent"}
-        if pending_id is not None:
+        if pending_id is not None and expose_pending_id:
             response["pending_id"] = pending_id
         if dedupe_key is not None:
             response["dedupe_key"] = dedupe_key
+        if effect_id is not None:
+            self.store.command_log.update_steer_effect(
+                "run/send_now", effect_id, "sent", response
+            )
         return response
 
     async def send_on_idle(
@@ -3079,11 +3130,18 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         dedupe_key: str | None = None,
         source: str | None = None,
         effect_id: str | None = None,
+        command_hash: str | None = None,
     ) -> dict[str, Any]:
         async with self._run_mutation_admission():
             async with self._run_lock(run_id):
                 return await self._send_on_idle(
-                    run_id, message, pending_id, dedupe_key, source, effect_id
+                    run_id,
+                    message,
+                    pending_id,
+                    dedupe_key,
+                    source,
+                    effect_id,
+                    command_hash,
                 )
 
     async def _send_on_idle(
@@ -3094,10 +3152,32 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         dedupe_key: str | None = None,
         source: str | None = None,
         effect_id: str | None = None,
+        command_hash: str | None = None,
     ) -> dict[str, Any]:
         adapter = self.adapters.get(run_id)
         if adapter is None:
             raise StoreConflict("run has no attached provider adapter")
+        if effect_id is not None and pending_id is None:
+            pending_id = str(uuid4())
+        steer_effect = None
+        if effect_id is not None:
+            steer_effect = self.store.command_log.steer_effect(
+                method="run/send_on_idle",
+                request_id=effect_id,
+                agent_id=self.store.get(run_id).agent_id,
+                command_hash=command_hash or "",
+                run_id=run_id,
+                pending_id=pending_id,
+                message=message,
+                mode="on-idle",
+            )
+            pending_id = str(steer_effect["pending_id"])
+            if steer_effect["status"] in {"sent", "acknowledged"}:
+                self.store.remove_queued_message_by_pending_id(run_id, pending_id)
+                result = steer_effect.get("result")
+                if isinstance(result, dict):
+                    return result
+                return {"status": "sent", "pending_id": pending_id}
         if dedupe_key is not None:
             record, claimed = self.store.claim_message_dedupe_key(run_id, dedupe_key)
             if not claimed:
@@ -3106,17 +3186,22 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     "dedupe_key": dedupe_key,
                     "messages": list(record.queued_messages),
                 }
-        command_dedupe_key = f"command:{effect_id}" if effect_id else None
-        if command_dedupe_key is not None:
-            record, claimed = self.store.claim_message_dedupe_key(run_id, command_dedupe_key)
-            if not claimed:
-                return {"status": "deduplicated", "request_id": effect_id}
         if pending_id is None and source is not None:
             pending_id = str(uuid4())
         try:
-            record = self.store.queue_message(
-                run_id, message, pending_id, source=source
+            record = self.store.get(run_id)
+            existing = next(
+                (
+                    item
+                    for item in record.queued_messages
+                    if item.get("pending_id") == pending_id
+                ),
+                None,
             )
+            if existing is None:
+                record = self.store.queue_message(
+                    run_id, message, pending_id, source=source
+                )
         except Exception:
             if dedupe_key is not None:
                 self.store.release_message_dedupe_key(run_id, dedupe_key)
@@ -3143,6 +3228,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     "pending_id": pending_id,
                     **({"dedupe_key": dedupe_key} if dedupe_key is not None else {}),
                 }
+        if effect_id is not None:
+            self.store.command_log.update_steer_effect(
+                "run/send_on_idle", effect_id, "queued", response
+            )
         return response
 
     async def delete_queued(self, run_id: str, index: int) -> dict[str, Any]:
@@ -3283,7 +3372,13 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         "run/archive",
                         archived.agent_id,
                         effect_id,
-                        {"agent_id": archived.agent_id, "run_id": run_id, "outcome": outcome},
+                        {
+                            "agent_id": archived.agent_id,
+                            "run_id": run_id,
+                            "outcome": outcome,
+                            "request_id": effect_id,
+                            "method": "run/archive",
+                        },
                     ),
                     _public_run(archived),
                 )
@@ -3315,7 +3410,13 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     "run/archive",
                     archived.agent_id,
                     effect_id,
-                    {"agent_id": archived.agent_id, "run_id": run_id, "outcome": outcome},
+                    {
+                        "agent_id": archived.agent_id,
+                        "run_id": run_id,
+                        "outcome": outcome,
+                        "request_id": effect_id,
+                        "method": "run/archive",
+                    },
                 ),
                 _public_run(archived),
             )
@@ -3638,8 +3739,23 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         )
         return record
 
+    def _recovery_executor(self, command: AgentCommand) -> Callable[[], Any]:
+        command_params = dict(command.payload)
+        command_params["agent_id"] = command.agent_id
+        command_params["request_id"] = command.request_id
+
+        async def execute() -> Any:
+            return await self._dispatch(
+                command.method,
+                command_params,
+                command_hash=command.command_hash,
+            )
+
+        return execute
+
     async def dispatch(self, method: str, params: dict[str, Any]) -> Any:
         if method in _COMMAND_METHODS:
+            await self.command_queue.recover_pending()
             command_params = dict(params)
             request_id = _validated_idempotency_request_id(
                 command_params.get("request_id")
@@ -3707,11 +3823,18 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             if method in _IDEMPOTENT_METHODS:
                 async def execute() -> Any:
                     return await self._dispatch_idempotently(
-                        method, request_id, command_params
+                        method,
+                        request_id,
+                        command_params,
+                        command_hash=command.command_hash,
                     )
             else:
                 async def execute() -> Any:
-                    return await self._dispatch(method, command_params)
+                    return await self._dispatch(
+                        method,
+                        command_params,
+                        command_hash=command.command_hash,
+                    )
             return await self.command_queue.submit(command, execute)
         if method not in _IDEMPOTENT_METHODS:
             return await self._dispatch(method, params)
@@ -3772,6 +3895,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         method: str,
         request_id: str,
         params: dict[str, Any],
+        *,
+        command_hash: str | None = None,
     ) -> Any:
         key = (method, request_id)
         async with self.idempotency_lock:
@@ -3781,7 +3906,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             task = self.idempotency_tasks.get(key)
             if task is None:
                 task = asyncio.create_task(
-                    self._dispatch(method, params),
+                    self._dispatch(method, params, command_hash=command_hash),
                     name=f"agent-idempotency-{method}-{request_id}",
                 )
                 self.idempotency_tasks[key] = task
@@ -3790,7 +3915,13 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 )
         return deepcopy(await asyncio.shield(task))
 
-    async def _dispatch(self, method: str, params: dict[str, Any]) -> Any:
+    async def _dispatch(
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        command_hash: str | None = None,
+    ) -> Any:
         if method == "ping":
             return {
                 "status": "ok",
@@ -3821,6 +3952,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     "ok": receipt.ok,
                     "result": receipt.result,
                     "error_type": receipt.error_type,
+                    "agent_id": receipt.agent_id,
+                    "command_hash": receipt.command_hash,
                 }
             return response
         if method == "run/start":
@@ -3882,6 +4015,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 _validated_dedupe_key(params.get("dedupe_key")),
                 _validated_source(params.get("source")),
                 effect_id=params.get("request_id"),
+                command_hash=command_hash,
             )
         if method == "run/send_on_idle":
             return await self.send_on_idle(
@@ -3891,6 +4025,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 _validated_dedupe_key(params.get("dedupe_key")),
                 _validated_source(params.get("source")),
                 effect_id=params.get("request_id"),
+                command_hash=command_hash,
             )
         if method == "run/queue":
             run_id = self._resolve_run_id(params)

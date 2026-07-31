@@ -92,6 +92,178 @@ class CommandLogTests(unittest.TestCase):
             ["start:one", "end:one", "start:two", "end:two"],
         )
 
+    def test_queue_preserves_global_order_across_agents(self) -> None:
+        async def run() -> list[str]:
+            with tempfile.TemporaryDirectory() as tmp:
+                log = CommandLog(Path(tmp) / "command-log.sqlite3")
+                state = {
+                    "WIKI-A": {"current": {"run_id": "run-a"}},
+                    "WIKI-B": {"current": {"run_id": "run-b"}},
+                }
+                queue = CommandQueue(log, lambda: state)
+                order: list[str] = []
+
+                async def effect(name: str) -> dict[str, str]:
+                    order.append(f"start:{name}")
+                    await asyncio.sleep(0)
+                    order.append(f"end:{name}")
+                    return {"name": name}
+
+                first = AgentCommand.steer(
+                    agent_id="WIKI-A",
+                    request_id="steer-a",
+                    payload={"method": "run/send_now", "run_id": "run-a"},
+                )
+                second = AgentCommand.steer(
+                    agent_id="WIKI-B",
+                    request_id="steer-b",
+                    payload={"method": "run/send_now", "run_id": "run-b"},
+                )
+                await asyncio.gather(
+                    queue.submit(first, lambda: effect("a")),
+                    queue.submit(second, lambda: effect("b")),
+                )
+                await queue.close()
+                return order
+
+        self.assertEqual(
+            asyncio.run(run()),
+            ["start:a", "end:a", "start:b", "end:b"],
+        )
+
+    def test_inflight_conflict_checks_agent_and_payload(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                log = CommandLog(Path(tmp) / "command-log.sqlite3")
+                state = {
+                    "WIKI-A": {"current": {"run_id": "run-a"}},
+                    "WIKI-B": {"current": {"run_id": "run-b"}},
+                }
+                queue = CommandQueue(log, lambda: state)
+                started = asyncio.Event()
+                release = asyncio.Event()
+
+                async def effect() -> dict[str, str]:
+                    started.set()
+                    await release.wait()
+                    return {"status": "sent"}
+
+                first = AgentCommand.steer(
+                    agent_id="WIKI-A",
+                    request_id="same-request",
+                    payload={
+                        "method": "run/send_now",
+                        "run_id": "run-a",
+                        "text": "one",
+                    },
+                )
+                conflicting = AgentCommand.steer(
+                    agent_id="WIKI-B",
+                    request_id="same-request",
+                    payload={
+                        "method": "run/send_now",
+                        "run_id": "run-b",
+                        "text": "two",
+                    },
+                )
+                first_task = asyncio.create_task(queue.submit(first, effect))
+                await started.wait()
+                with self.assertRaises(CommandConflict):
+                    await queue.submit(conflicting, effect)
+                release.set()
+                await first_task
+                await queue.close()
+
+        asyncio.run(run())
+
+    def test_pending_intents_replay_in_durable_order(self) -> None:
+        async def run() -> list[str]:
+            with tempfile.TemporaryDirectory() as tmp:
+                log = CommandLog(Path(tmp) / "command-log.sqlite3")
+                first = AgentCommand.spawn(
+                    agent_id="WIKI-A",
+                    request_id="spawn-a",
+                    payload={"run_id": "run-a"},
+                )
+                second = AgentCommand.spawn(
+                    agent_id="WIKI-B",
+                    request_id="spawn-b",
+                    payload={"run_id": "run-b"},
+                )
+                log.append_intent(first, {})
+                log.append_intent(second, {})
+                queue_order: list[str] = []
+
+                def factory(command: AgentCommand):
+                    async def effect() -> dict[str, str]:
+                        queue_order.append(command.request_id)
+                        return {"run_id": str(command.payload["run_id"])}
+
+                    return effect
+
+                queue = CommandQueue(log, lambda: {}, recovery_factory=factory)
+                await queue.recover_pending()
+                await queue.close()
+                assert log.pending() == []
+                return queue_order
+
+        self.assertEqual(asyncio.run(run()), ["spawn-a", "spawn-b"])
+
+    def test_steer_outbox_reconciles_delivery_states(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log = CommandLog(Path(tmp) / "command-log.sqlite3")
+            row = log.steer_effect(
+                method="run/send_now",
+                request_id="steer-1",
+                agent_id="WIKI-A",
+                command_hash="hash-1",
+                run_id="run-a",
+                pending_id="pending-1",
+                message="hello",
+                mode="now",
+            )
+            self.assertEqual(row["status"], "queued")
+            log.update_steer_effect(
+                "run/send_now", "steer-1", "sent", {"status": "sent"}
+            )
+            replay = log.steer_effect(
+                method="run/send_now",
+                request_id="steer-1",
+                agent_id="WIKI-A",
+                command_hash="hash-1",
+                run_id="run-a",
+                pending_id="pending-1",
+                message="hello",
+                mode="now",
+            )
+            self.assertEqual(replay["status"], "sent")
+            self.assertEqual(replay["result"], {"status": "sent"})
+            log.acknowledge_steer_for_pending("run-a", "pending-1")
+            self.assertEqual(
+                log.steer_effect(
+                    method="run/send_now",
+                    request_id="steer-1",
+                    agent_id="WIKI-A",
+                    command_hash="hash-1",
+                    run_id="run-a",
+                    pending_id="pending-1",
+                    message="hello",
+                    mode="now",
+                )["status"],
+                "acknowledged",
+            )
+            with self.assertRaises(CommandConflict):
+                log.steer_effect(
+                    method="run/send_now",
+                    request_id="steer-1",
+                    agent_id="WIKI-B",
+                    command_hash="hash-1",
+                    run_id="run-b",
+                    pending_id="pending-2",
+                    message="other",
+                    mode="now",
+                )
+
     def test_restart_aborts_uncommitted_start_and_restores_preimage(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

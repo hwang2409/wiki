@@ -4381,6 +4381,39 @@ def replace_agent(
         TICKET_PATTERN.fullmatch(raw_id) or ORCH_ID_PATTERN.fullmatch(raw_id)
     ):
         raise HTTPException(status_code=400, detail="Bad agent id")
+    request_id = body.request_id if body is not None else None
+    if request_id is not None:
+        status = _supervisor_request(
+            "idempotency/status",
+            {"method": "run/replace", "request_id": request_id},
+        )
+        receipt = status.get("receipt") if isinstance(status, dict) else None
+        if isinstance(receipt, dict):
+            receipt_agent = receipt.get("agent_id")
+            if isinstance(receipt_agent, str) and receipt_agent.upper() != raw_id.upper():
+                raise HTTPException(
+                    status_code=409,
+                    detail="Replace request belongs to another agent",
+                )
+            prior_result = receipt.get("result")
+            if isinstance(prior_result, dict):
+                prior_agent = prior_result.get("agent_id")
+                if isinstance(prior_agent, str) and prior_agent.upper() != raw_id.upper():
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Replace receipt belongs to another agent",
+                    )
+                role = prior_result.get("role")
+                return {
+                    "id": prior_agent if isinstance(prior_agent, str) else raw_id,
+                    "type": "orchestrator" if role == "orchestrator" else "worker",
+                    "window": None,
+                    "run_id": prior_result.get("run_id"),
+                    "log": prior_result.get("log"),
+                    "prompt_path": None,
+                    "model": prior_result.get("model"),
+                    "registration": dict(prior_result),
+                }
     registry = _read_agent_registry()
     resolved = _registry_agent(registry, raw_id)
     if resolved is None:
@@ -4446,7 +4479,7 @@ def replace_agent(
             "model": model,
             "effort": effort,
             "backend_base_url": backend_base_url,
-            "request_id": body.request_id if body is not None else None,
+            "request_id": request_id,
         },
     )
     if not isinstance(result, dict):

@@ -153,6 +153,10 @@ class RunRecord:
     orchestrator_id: str | None = None
     provider_session_id: str | None = None
     provider_pid: int | None = None
+    provider_pid_started_at: float | None = None
+    provider_executable: str | None = None
+    provider_process_group_id: int | None = None
+    provider_process_group_members: list[dict[str, Any]] = field(default_factory=list)
     provider_generation: int = 0
     active_turn_id: str | None = None
     current_turn_diff_turn_id: str | None = None
@@ -254,6 +258,10 @@ class RunRecord:
             "automatic_resume_guarded_at": self.automatic_resume_guarded_at,
             "provider_session_id": self.provider_session_id,
             "provider_pid": self.provider_pid,
+            "provider_pid_started_at": self.provider_pid_started_at,
+            "provider_executable": self.provider_executable,
+            "provider_process_group_id": self.provider_process_group_id,
+            "provider_process_group_members": list(self.provider_process_group_members),
             "provider_generation": self.provider_generation,
             "active_turn_id": self.active_turn_id,
             "current_turn_diff_turn_id": self.current_turn_diff_turn_id,
@@ -319,6 +327,14 @@ class RunRecord:
             automatic_resume_guarded_at=value.get("automatic_resume_guarded_at"),
             provider_session_id=value.get("provider_session_id"),
             provider_pid=value.get("provider_pid"),
+            provider_pid_started_at=value.get("provider_pid_started_at"),
+            provider_executable=value.get("provider_executable"),
+            provider_process_group_id=value.get("provider_process_group_id"),
+            provider_process_group_members=[
+                dict(item)
+                for item in value.get("provider_process_group_members", [])
+                if isinstance(item, dict)
+            ],
             provider_generation=int(value.get("provider_generation", 0)),
             active_turn_id=value.get("active_turn_id"),
             current_turn_diff_turn_id=value.get("current_turn_diff_turn_id"),

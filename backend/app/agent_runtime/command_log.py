@@ -357,6 +357,23 @@ class CommandLog:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(method, request_id)
                 );
+                CREATE TABLE IF NOT EXISTS steer_effects (
+                    method TEXT NOT NULL,
+                    request_id TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    command_hash TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    pending_id TEXT,
+                    message TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    result_json TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(method, request_id)
+                );
+                CREATE INDEX IF NOT EXISTS steer_effects_pending_idx
+                    ON steer_effects(run_id, pending_id);
                 CREATE TABLE IF NOT EXISTS start_requests (
                     request_id TEXT PRIMARY KEY,
                     agent_id TEXT NOT NULL,
@@ -541,8 +558,172 @@ class CommandLog:
             return None
         return json.loads(row["result_json"]) if row["result_json"] is not None else None
 
+    def begin_effect(self, command: AgentCommand) -> None:
+        """Persist the reactor checkpoint before an external effect starts."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM command_effects WHERE method = ? AND request_id = ?",
+                (command.method, command.request_id),
+            ).fetchone()
+            if row is not None:
+                self._validate_binding(
+                    command,
+                    agent_id=row["agent_id"],
+                    command_hash=row["command_hash"],
+                )
+                if row["status"] == "completed":
+                    connection.commit()
+                    return
+            connection.execute(
+                """
+                INSERT INTO command_effects
+                (method, request_id, agent_id, command_hash, status, result_json, created_at)
+                VALUES (?, ?, ?, ?, 'started', NULL, ?)
+                ON CONFLICT(method, request_id) DO UPDATE SET
+                    status = CASE
+                        WHEN command_effects.status = 'completed'
+                        THEN command_effects.status
+                        ELSE 'started'
+                    END
+                """,
+                (
+                    command.method,
+                    command.request_id,
+                    command.agent_id,
+                    command.command_hash,
+                    _now(),
+                ),
+            )
+            connection.commit()
+
+    def steer_effect(
+        self,
+        *,
+        method: str,
+        request_id: str,
+        agent_id: str,
+        command_hash: str,
+        run_id: str,
+        pending_id: str,
+        message: str,
+        mode: str,
+    ) -> dict[str, Any]:
+        """Create or read one durable steer delivery record."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM steer_effects WHERE method = ? AND request_id = ?",
+                (method, request_id),
+            ).fetchone()
+            if row is None:
+                now = _now()
+                connection.execute(
+                    """
+                    INSERT INTO steer_effects
+                    (method, request_id, agent_id, command_hash, run_id, pending_id,
+                     message, mode, status, result_json, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', NULL, ?, ?)
+                    """,
+                    (
+                        method,
+                        request_id,
+                        agent_id,
+                        command_hash,
+                        run_id,
+                        pending_id,
+                        message,
+                        mode,
+                        now,
+                        now,
+                    ),
+                )
+                connection.commit()
+                row = connection.execute(
+                    "SELECT * FROM steer_effects WHERE method = ? AND request_id = ?",
+                    (method, request_id),
+                ).fetchone()
+            else:
+                if row["agent_id"] not in {None, "", agent_id}:
+                    raise CommandConflict(
+                        f"request_id {request_id} belongs to another agent"
+                    )
+                if command_hash and row["command_hash"] not in {"", command_hash}:
+                    raise CommandConflict(
+                        f"request_id {request_id} was used with a different payload"
+                    )
+                connection.commit()
+        assert row is not None
+        result = dict(row)
+        result["result"] = (
+            json.loads(result["result_json"])
+            if result.get("result_json") is not None
+            else None
+        )
+        return result
+
+    def update_steer_effect(
+        self,
+        method: str,
+        request_id: str,
+        status: str,
+        result: Any | None = None,
+    ) -> None:
+        if status not in {"queued", "sent", "acknowledged"}:
+            raise ValueError("invalid steer effect status")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE steer_effects
+                SET status = ?, result_json = COALESCE(?, result_json), updated_at = ?
+                WHERE method = ? AND request_id = ?
+                """,
+                (
+                    status,
+                    self._json(result) if result is not None else None,
+                    _now(),
+                    method,
+                    request_id,
+                ),
+            )
+            connection.commit()
+
+    def acknowledge_steer_for_pending(self, run_id: str, pending_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE steer_effects
+                SET status = 'acknowledged', updated_at = ?
+                WHERE run_id = ? AND pending_id = ? AND status IN ('queued', 'sent')
+                """,
+                (_now(), run_id, pending_id),
+            )
+            connection.commit()
+
+    def mark_steer_sent_for_pending(self, run_id: str, pending_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE steer_effects
+                SET status = 'sent', updated_at = ?
+                WHERE run_id = ? AND pending_id = ? AND status = 'queued'
+                """,
+                (_now(), run_id, pending_id),
+            )
+            connection.commit()
+
     def complete_effect(self, command: AgentCommand, result: Any) -> None:
         with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT * FROM command_effects WHERE method = ? AND request_id = ?",
+                (command.method, command.request_id),
+            ).fetchone()
+            if existing is not None:
+                self._validate_binding(
+                    command,
+                    agent_id=existing["agent_id"],
+                    command_hash=existing["command_hash"],
+                )
             connection.execute(
                 """
                 INSERT INTO command_effects
@@ -665,6 +846,10 @@ class CommandLog:
                     "DELETE FROM command_effects WHERE method = ? AND request_id = ?",
                     (row["method"], row["request_id"]),
                 )
+                connection.execute(
+                    "DELETE FROM steer_effects WHERE method = ? AND request_id = ?",
+                    (row["method"], row["request_id"]),
+                )
             connection.execute("DELETE FROM start_requests WHERE run_id = ?", (run_id,))
             connection.commit()
 
@@ -699,6 +884,10 @@ class CommandLog:
             )
             connection.execute(
                 "DELETE FROM command_effects WHERE method = ? AND request_id = ?",
+                (method, request_id),
+            )
+            connection.execute(
+                "DELETE FROM steer_effects WHERE method = ? AND request_id = ?",
                 (method, request_id),
             )
             connection.commit()
@@ -1021,39 +1210,110 @@ class CommandLog:
 
 CommandExecutor = Callable[[], Awaitable[Any]]
 AgentStateProvider = Callable[[str], Mapping[str, Any]]
+RecoveryExecutorFactory = Callable[[AgentCommand], CommandExecutor]
+
+
+@dataclass
+class _QueuedCommand:
+    command: AgentCommand
+    execute: CommandExecutor
+    future: asyncio.Future[Any]
 
 
 class CommandQueue:
-    """Commit intents globally while running one reactor per agent."""
+    """Run durable provider effects in one global FIFO reactor."""
 
     def __init__(
         self,
         log: CommandLog,
         state_provider: Callable[[], Mapping[str, Any]],
         agent_state_provider: AgentStateProvider | None = None,
+        recovery_factory: RecoveryExecutorFactory | None = None,
     ):
         self.log = log
         self.state_provider = state_provider
         self.agent_state_provider = agent_state_provider
-        self._queues: dict[str, asyncio.Queue[
-            tuple[AgentCommand, CommandExecutor, asyncio.Future[Any]]
-        ]] = {}
-        self._workers: dict[str, asyncio.Task[None]] = {}
+        self.recovery_factory = recovery_factory
+        self._queue: asyncio.Queue[_QueuedCommand] = asyncio.Queue()
+        self._worker: asyncio.Task[None] | None = None
         self._append_lock = asyncio.Lock()
         self._commit_lock = asyncio.Lock()
-        self._inflight: dict[tuple[str, str], asyncio.Future[Any]] = {}
+        self._recovery_lock = asyncio.Lock()
+        self._recovered = False
+        self._inflight: dict[
+            tuple[str, str], tuple[AgentCommand, asyncio.Future[Any]]
+        ] = {}
         self._closed = False
+
+    def _start_worker(self) -> None:
+        if self._worker is None or self._worker.done():
+            self._worker = asyncio.create_task(
+                self._run(),
+                name="global-command-reactor",
+            )
+
+    @staticmethod
+    def _same_binding(left: AgentCommand, right: AgentCommand) -> bool:
+        return (
+            left.agent_id == right.agent_id
+            and left.command_hash == right.command_hash
+        )
+
+    async def _ensure_recovered(self) -> list[asyncio.Future[Any]]:
+        if self._recovered:
+            return []
+        async with self._recovery_lock:
+            if self._recovered:
+                return []
+            pending = await asyncio.to_thread(self.log.pending)
+            if pending and self.recovery_factory is None:
+                raise CommandError("pending command intents need a recovery executor")
+            futures: list[asyncio.Future[Any]] = []
+            loop = asyncio.get_running_loop()
+            for command in pending:
+                key = (command.method, command.request_id)
+                existing = self._inflight.get(key)
+                if existing is not None:
+                    if not self._same_binding(command, existing[0]):
+                        raise CommandConflict(
+                            f"request_id {command.request_id} has a conflicting intent"
+                        )
+                    futures.append(existing[1])
+                    continue
+                future: asyncio.Future[Any] = loop.create_future()
+                self._inflight[key] = (command, future)
+                futures.append(future)
+                assert self.recovery_factory is not None
+                await self._queue.put(
+                    _QueuedCommand(command, self.recovery_factory(command), future)
+                )
+            self._recovered = True
+            if pending:
+                self._start_worker()
+            return futures
+
+    async def recover_pending(self) -> None:
+        """Replay all pending intents before startup accepts new mutations."""
+
+        futures = await self._ensure_recovered()
+        if futures:
+            await asyncio.gather(*(asyncio.shield(future) for future in futures))
 
     async def submit(self, command: AgentCommand, execute: CommandExecutor) -> Any:
         if self._closed:
             raise CommandError("command queue is closed")
+        await self._ensure_recovered()
         key = (command.method, command.request_id)
         existing = self._inflight.get(key)
         if existing is not None:
-            return await asyncio.shield(existing)
+            if not self._same_binding(command, existing[0]):
+                raise CommandConflict(
+                    f"request_id {command.request_id} has a conflicting command"
+                )
+            return await asyncio.shield(existing[1])
         loop = asyncio.get_running_loop()
         future: asyncio.Future[Any] = loop.create_future()
-        self._inflight[key] = future
+        self._inflight[key] = (command, future)
         try:
             async with self._append_lock:
                 state = (
@@ -1068,31 +1328,23 @@ class CommandQueue:
                 future.set_result(intent.result)
                 self._inflight.pop(key, None)
                 return await asyncio.shield(future)
-            queue = self._queues.setdefault(command.agent_id, asyncio.Queue())
-            worker = self._workers.get(command.agent_id)
-            if worker is None or worker.done():
-                worker = asyncio.create_task(
-                    self._run_agent(command.agent_id, queue),
-                    name=f"agent-command-reactor-{command.agent_id}",
-                )
-                self._workers[command.agent_id] = worker
-            await queue.put((command, execute, future))
+            self._start_worker()
+            await self._queue.put(_QueuedCommand(command, execute, future))
         except BaseException as exc:
-            self._inflight.pop(key, None)
+            if self._inflight.get(key, (None, None))[1] is future:
+                self._inflight.pop(key, None)
             if not future.done():
                 future.set_exception(exc)
 
         return await future
 
-    async def _run_agent(
-        self,
-        agent_id: str,
-        queue: asyncio.Queue[tuple[AgentCommand, CommandExecutor, asyncio.Future[Any]]],
-    ) -> None:
+    async def _run(self) -> None:
         while True:
-            command, execute, future = await queue.get()
+            item = await self._queue.get()
+            command, execute, future = item.command, item.execute, item.future
             try:
                 try:
+                    await asyncio.to_thread(self.log.begin_effect, command)
                     result = await execute()
                 except BaseException as exc:
                     async with self._commit_lock:
@@ -1122,17 +1374,15 @@ class CommandQueue:
                 if not future.done():
                     future.set_exception(exc)
             finally:
-                self._inflight.pop((command.method, command.request_id), None)
-                queue.task_done()
+                key = (command.method, command.request_id)
+                if self._inflight.get(key, (None, None))[1] is future:
+                    self._inflight.pop(key, None)
+                self._queue.task_done()
 
     async def close(self) -> None:
         self._closed = True
-        queues = list(self._queues.values())
-        if queues:
-            await asyncio.gather(*(queue.join() for queue in queues))
-        workers = list(self._workers.values())
-        for worker in workers:
-            worker.cancel()
-        await asyncio.gather(*workers, return_exceptions=True)
-        self._workers.clear()
-        self._queues.clear()
+        await self._queue.join()
+        if self._worker is not None:
+            self._worker.cancel()
+            await asyncio.gather(self._worker, return_exceptions=True)
+        self._worker = None

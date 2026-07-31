@@ -3,11 +3,9 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import signal
 import stat
 import tempfile
 import threading
-import time
 import base64
 from copy import deepcopy
 from dataclasses import dataclass
@@ -18,6 +16,11 @@ from uuid import UUID
 
 from .. import knowledge
 from .command_log import CommandLog
+from .process import (
+    provider_process_group_members_sync,
+    provider_process_status_sync,
+    terminate_verified_provider_group,
+)
 from .provider import AdapterStatus
 from .types import (
     EventDisposition,
@@ -785,7 +788,7 @@ class RunStore:
                 record = RunRecord.from_dict(value)
                 if not record.start_transaction:
                     continue
-                if not self._terminate_recorded_provider_pid(record.provider_pid):
+                if not self._terminate_recorded_provider_pid(record):
                     continue
                 self._restore_start_snapshot(record, record.start_transaction)
                 if record.start_request_id:
@@ -796,44 +799,25 @@ class RunStore:
                 continue
 
     @staticmethod
-    def _terminate_recorded_provider_pid(pid: int | None) -> bool:
+    def _terminate_recorded_provider_pid(record: RunRecord) -> bool:
         """Verify and stop a provider before deleting its uncommitted run."""
 
-        if pid is None or pid <= 1:
+        if record.provider_pid is None or record.provider_pid <= 1:
             return True
-
-        def alive() -> bool:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                return False
-            except PermissionError:
-                return True
-            return True
-
-        if not alive():
-            return True
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            return True
-        except PermissionError:
+        if (
+            record.provider_pid_started_at is None
+            or not record.provider_executable
+            or record.provider_process_group_id is None
+        ):
+            # A numeric PID without an identity is unsafe after a restart.
             return False
-        deadline = time.monotonic() + 0.5
-        while alive() and time.monotonic() < deadline:
-            time.sleep(0.02)
-        if not alive():
-            return True
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            return True
-        except PermissionError:
-            return False
-        deadline = time.monotonic() + 1.0
-        while alive() and time.monotonic() < deadline:
-            time.sleep(0.02)
-        return not alive()
+        return terminate_verified_provider_group(
+            pid=record.provider_pid,
+            created_at=record.provider_pid_started_at,
+            executable=record.provider_executable,
+            process_group_id=record.provider_process_group_id,
+            group_members=record.provider_process_group_members,
+        )
 
     def legacy_codex_agent_ids(self) -> list[str]:
         """Return tmux-era Codex currents, failing closed on corrupt entries."""
@@ -893,6 +877,10 @@ class RunStore:
             "session_id": record.provider_session_id,
             "provider_session_id": record.provider_session_id,
             "provider_pid": record.provider_pid,
+            "provider_pid_started_at": record.provider_pid_started_at,
+            "provider_executable": record.provider_executable,
+            "provider_process_group_id": record.provider_process_group_id,
+            "provider_process_group_members": list(record.provider_process_group_members),
             "control_attached": record.run_id in self._control_attached_run_ids,
             "provider_generation": record.provider_generation,
             "active_turn_id": record.active_turn_id,
@@ -1611,6 +1599,25 @@ class RunStore:
                 if adapter_status.session_id is not None:
                     record.provider_session_id = adapter_status.session_id
                 record.provider_pid = adapter_status.pid
+                if adapter_status.pid is None:
+                    record.provider_pid_started_at = None
+                    record.provider_executable = None
+                    record.provider_process_group_id = None
+                    record.provider_process_group_members = []
+                else:
+                    identity = provider_process_status_sync(adapter_status.pid)
+                    if identity is None or identity.executable is None:
+                        record.provider_pid_started_at = None
+                        record.provider_executable = None
+                        record.provider_process_group_id = None
+                        record.provider_process_group_members = []
+                    else:
+                        record.provider_pid_started_at = identity.created_at
+                        record.provider_executable = identity.executable
+                        record.provider_process_group_id = identity.process_group_id
+                        record.provider_process_group_members = (
+                            provider_process_group_members_sync(identity.process_group_id)
+                        )
                 record.provider_generation = adapter_status.generation
                 record.active_turn_id = adapter_status.active_turn_id
                 if adapter_status.transcript_path is not None:
@@ -2113,6 +2120,18 @@ class RunStore:
     ) -> RunRecord:
         with self._lock:
             record = self.get(run_id)
+            existing = next(
+                (
+                    message
+                    for message in record.pending_user_messages
+                    if message.get("pending_id") == pending_id
+                ),
+                None,
+            )
+            if existing is not None:
+                if existing.get("text") != text:
+                    raise StoreConflict("pending message id was reused with different text")
+                return record
             entry: dict[str, Any] = {
                 "pending_id": pending_id,
                 "text": text,
@@ -2238,6 +2257,21 @@ class RunStore:
             message = record.queued_messages.pop(0)
             self._write_record(record)
             return message
+
+    def remove_queued_message_by_pending_id(
+        self,
+        run_id: str,
+        pending_id: str,
+    ) -> RunRecord:
+        with self._lock:
+            record = self.get(run_id)
+            record.queued_messages = [
+                message
+                for message in record.queued_messages
+                if message.get("pending_id") != pending_id
+            ]
+            self._write_record(record)
+            return record
 
     def peek_queued_message(self, run_id: str) -> dict[str, str] | None:
         with self._lock:
