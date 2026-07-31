@@ -1751,8 +1751,13 @@ def _archive_hint(
 
     Without ``archived_at`` returns the newest archive (unchanged behavior).
     With ``archived_at`` returns the archive whose iso timestamp matches
-    exactly — this is what history rows pass through so an older row does
-    not open the newest archive's transcript.
+    exactly, or (None, None, None) for a stale identifier.
+
+    WIKI-229: this helper honors ``archived_at`` but the surrounding
+    session route currently consults it only in the no-live-run branch
+    (after the ticket-only ``_session_paths`` cache), so history-row
+    selection can be surfaced only once the route becomes discriminated.
+    The plumbing is retained here so WIKI-229 has less to add.
     """
 
     ticket_dir = AGENT_ARCHIVE_DIR / ticket

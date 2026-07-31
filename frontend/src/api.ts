@@ -911,9 +911,11 @@ export function getAgentSession(
 ) {
   const params = new URLSearchParams({ cursor: String(after) });
   if (path) params.set("path", path);
-  // History rows carry an explicit archived_at so the backend selects the
-  // right archive when a ticket has more than one. Without it the backend
-  // returns the newest archive, which is wrong for older history rows.
+  // WIKI-229: the ``archived_at`` param is honored by the backend
+  // ``_archive_hint`` helper but ignored by the session route unless the
+  // ticket has no live run and no cached transcript. Callers do not set
+  // it in this PR; WIKI-229 delivers the discriminated session route
+  // that will select the exact archive.
   if (archivedAt) params.set("archived_at", archivedAt);
   return request<AgentSessionData>(
     `/api/agents/${encodeURIComponent(ticket)}/session?${params.toString()}`

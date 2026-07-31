@@ -4017,9 +4017,11 @@ export type SidebarTarget = {
   model?: string | null;
   pr?: string | null;
   canReview?: boolean;
-  // Set when the target came from a specific history row. Threaded through
-  // getAgentSession so the right archived transcript is loaded when a
-  // ticket has more than one archive.
+  // WIKI-229: reserved for per-archive selection when a ticket has
+  // multiple archives. Threaded end-to-end (SidebarTarget → SessionTab →
+  // TranscriptTarget → getAgentSession → /session?archived_at=…) but not
+  // set in this PR — the backend route currently returns the newest
+  // archive regardless, and WIKI-229 delivers the discriminated route.
   archivedAt?: string;
 };
 

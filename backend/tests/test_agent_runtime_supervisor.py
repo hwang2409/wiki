@@ -3623,6 +3623,63 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             await _wait_for_published(queue, "claude_limit_hit", timeout=0.1)
         self.supervisor.unsubscribe(queue)
 
+    async def test_claude_limit_alerts_per_run_not_per_ticket(self) -> None:
+        # Round-8: throttling was previously keyed by ticket, so a
+        # replacement run under the same ticket would silently drop its
+        # own limit notice within the hour. Now keyed by run_id and
+        # pruned in _detach_adapter.
+        queue = self.supervisor.subscribe()
+        first_record = await self.supervisor.start_run(
+            agent_id="WIKI-CLAUDE-RETRY",
+            provider=ProviderKind.CLAUDE,
+            role="review",
+            model="fixture-claude",
+            effort=None,
+            worktree=str(self.worktree),
+            prompt="fixture",
+        )
+        first_adapter = self.supervisor.adapters[first_record.run_id]
+        payload = {
+            "type": "result",
+            "subtype": "error",
+            "is_error": True,
+            "result": "Claude usage limit reached. Try again at 4pm.",
+        }
+        await self.supervisor._handle_provider_event(  # noqa: SLF001
+            first_record.run_id,
+            first_adapter,
+            ProviderEvent(ProviderKind.CLAUDE, payload),
+        )
+        first = await _wait_for_published(queue, "claude_limit_hit")
+        self.assertEqual(first["run_id"], first_record.run_id)
+
+        # Terminate + archive the first run so the ticket becomes eligible
+        # for a replacement start_run. _detach_adapter (called from
+        # archive) must have pruned the per-run throttle timestamp.
+        self.assertIn(first_record.run_id, self.supervisor.last_limit_alert_at)
+        await self.supervisor.archive(first_record.run_id)
+        self.assertNotIn(first_record.run_id, self.supervisor.last_limit_alert_at)
+
+        second_record = await self.supervisor.start_run(
+            agent_id="WIKI-CLAUDE-RETRY",
+            provider=ProviderKind.CLAUDE,
+            role="review",
+            model="fixture-claude",
+            effort=None,
+            worktree=str(self.worktree),
+            prompt="fixture",
+        )
+        self.assertNotEqual(second_record.run_id, first_record.run_id)
+        second_adapter = self.supervisor.adapters[second_record.run_id]
+        await self.supervisor._handle_provider_event(  # noqa: SLF001
+            second_record.run_id,
+            second_adapter,
+            ProviderEvent(ProviderKind.CLAUDE, payload),
+        )
+        second = await _wait_for_published(queue, "claude_limit_hit")
+        self.assertEqual(second["run_id"], second_record.run_id)
+        self.supervisor.unsubscribe(queue)
+
     async def test_rotation_failure_restores_auth_and_resumes_quiesced_run(
         self,
     ) -> None:

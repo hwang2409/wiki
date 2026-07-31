@@ -400,6 +400,11 @@ class Supervisor:
         self.auth_dead_alert_at: dict[str, float] = {}
         self.auth_dead_recoveries: dict[str, asyncio.Task[None]] = {}
         self.codex_turn_fingerprints: dict[tuple[str, str], str | None] = {}
+        # Claude usage-limit alerts are throttled per RUN, not per ticket.
+        # Keying by ticket would suppress a fresh limit hit on a
+        # replacement run under the same ticket (the round-7 lifecycle
+        # cleared the old notice by run_id, so B's hit must not be
+        # silenced by A's alert timestamp). Pruned in _terminal_cleanup.
         self.last_limit_alert_at: dict[str, float] = {}
         self.last_no_eligible_alert: float = 0.0
         self.idempotency_cache_size = idempotency_cache_size
@@ -1107,9 +1112,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             and event.direction != "stdin"
             and accounts.detect_claude_limit_payload(event.payload)
         ):
-            if self._seconds_since(self.last_limit_alert_at.get(record.agent_id, 0.0)) < 3600:
+            # Throttle per run_id so a replacement run under the same
+            # ticket can emit its own limit notice within the hour. See
+            # last_limit_alert_at comment.
+            if self._seconds_since(self.last_limit_alert_at.get(record.run_id, 0.0)) < 3600:
                 return
-            self.last_limit_alert_at[record.agent_id] = time.monotonic()
+            self.last_limit_alert_at[record.run_id] = time.monotonic()
             self._spawn_monitor_task(
                 self._publish(
                     {
@@ -1532,6 +1540,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         self, run_id: str, *, preserve_event_routes: bool = False
     ) -> None:
         self._clear_adapter_loss(run_id)
+        # Prune the per-run Claude limit-alert timestamp so a replacement
+        # run under the same ticket can emit its own limit notice inside
+        # the hour (round-8 finding 5).
+        self.last_limit_alert_at.pop(run_id, None)
         adapter = self.adapters.pop(run_id, None)
         if adapter is not None:
             try:

@@ -61,29 +61,89 @@ _REVIVE_FAILED_KEYS = {
 }
 
 
-# Required shape check per notice type. AccountEventsBanner has an unchecked
-# switch on ``type``, so an unknown or malformed payload leaked from the
-# on-disk store would crash the Runs view. On load we drop anything that
-# doesn't match these shapes.
+# Complete per-type schema validation. AccountEventsBanner has an exhaustive
+# switch on ``type`` and reads specific fields on each branch, so a payload
+# with the right ``type`` but the wrong shape crashes the Runs view. Every
+# ticket, revived, and failed list item must be a non-empty string; reason
+# maps and per-ticket run_id maps must be string-to-string; every required
+# scalar (e.g. codex_rotation.to) must be present. Anything else is dropped
+# safely at load time.
+def _all_non_empty_strings(value: object) -> bool:
+    if not isinstance(value, list):
+        return False
+    return all(isinstance(item, str) and bool(item) for item in value)
+
+
+def _all_string_to_string(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return all(
+        isinstance(key, str) and bool(key) and isinstance(val, str)
+        for key, val in value.items()
+    )
+
+
+def _optional_string_map(value: object) -> bool:
+    return value is None or _all_string_to_string(value)
+
+
 def _valid_notice(kind: str, payload: dict) -> bool:
     if kind == "codex_limit_no_eligible":
-        return isinstance(payload.get("tickets"), list)
+        return (
+            _all_non_empty_strings(payload.get("tickets"))
+            or (
+                # tickets may be [] when the emitter had no live workers yet.
+                isinstance(payload.get("tickets"), list)
+                and len(payload["tickets"]) == 0
+            )
+        )
     if kind == "codex_rotation_failed":
-        return isinstance(payload.get("error"), str)
+        error = payload.get("error")
+        return isinstance(error, str) and bool(error)
     if kind == "codex_rotation":
-        return (
-            isinstance(payload.get("revived"), list)
-            and isinstance(payload.get("failed"), list)
-        )
+        revived = payload.get("revived")
+        failed = payload.get("failed")
+        to_value = payload.get("to")
+        if not isinstance(to_value, str) or not to_value:
+            return False
+        if not isinstance(revived, list) or not all(isinstance(t, str) and t for t in revived):
+            return False
+        if not isinstance(failed, list) or not all(isinstance(t, str) and t for t in failed):
+            return False
+        if not _optional_string_map(payload.get("failed_reasons")):
+            return False
+        if not _optional_string_map(payload.get("failed_run_ids")):
+            return False
+        return True
     if kind == "codex_auth_dead_revival":
-        return (
-            isinstance(payload.get("revived"), list)
-            and isinstance(payload.get("failed"), list)
-        )
+        revived = payload.get("revived")
+        failed = payload.get("failed")
+        if not isinstance(revived, list) or not all(isinstance(t, str) and t for t in revived):
+            return False
+        if not isinstance(failed, list) or not all(isinstance(t, str) and t for t in failed):
+            return False
+        if not _optional_string_map(payload.get("failed_reasons")):
+            return False
+        if not _optional_string_map(payload.get("failed_run_ids")):
+            return False
+        return True
     if kind == "codex_auth_dead_exhausted":
-        return isinstance(payload.get("tickets"), list)
+        if not _all_non_empty_strings(payload.get("tickets")):
+            return False
+        if not _optional_string_map(payload.get("run_ids")):
+            return False
+        return True
     if kind == "claude_limit_hit":
-        return isinstance(payload.get("ticket"), str) and bool(payload.get("ticket"))
+        ticket = payload.get("ticket")
+        if not isinstance(ticket, str) or not ticket:
+            return False
+        run_id = payload.get("run_id")
+        if run_id is not None and (not isinstance(run_id, str) or not run_id):
+            return False
+        provider = payload.get("provider")
+        if provider is not None and not isinstance(provider, str):
+            return False
+        return True
     return False
 
 

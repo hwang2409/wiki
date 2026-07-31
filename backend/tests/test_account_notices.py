@@ -357,6 +357,92 @@ def test_reconcile_falls_back_to_ticket_membership_for_legacy_claude_limit(
     assert store.snapshot() == []
 
 
+def test_loader_rejects_invalid_list_members_and_maps(tmp_path: Path) -> None:
+    # Every ticket/revived/failed item has to be a non-empty string. Objects,
+    # numbers, nulls, and empty strings are all rejected; reason maps and
+    # per-ticket run_id maps must be string-to-string.
+    path = tmp_path / "notices.json"
+    path.write_text(
+        json.dumps(
+            {
+                # rotation with a non-string list member. bannerDiagnostics
+                # would pass this object to React as a child and crash.
+                "codex:rotation-revive-failed:bad-item": {
+                    "type": "codex_rotation",
+                    "from": "acct-a",
+                    "to": "acct-b",
+                    "revived": [],
+                    "failed": [{"not": "a ticket"}],
+                    "ts": "t1",
+                },
+                # rotation missing the required "to" scalar.
+                "codex:rotation-revive-failed:missing-to": {
+                    "type": "codex_rotation",
+                    "from": "acct-a",
+                    "revived": [],
+                    "failed": ["WIKI-X"],
+                    "ts": "t2",
+                },
+                # rotation with a malformed reasons map (values must be strings).
+                "codex:rotation-revive-failed:bad-reasons": {
+                    "type": "codex_rotation",
+                    "from": "acct-a",
+                    "to": "acct-b",
+                    "revived": [],
+                    "failed": ["WIKI-Y"],
+                    "failed_reasons": {"WIKI-Y": 42},
+                    "ts": "t3",
+                },
+                # exhausted with a null ticket among the strings.
+                "codex:auth-exhausted:bad": {
+                    "type": "codex_auth_dead_exhausted",
+                    "tickets": ["WIKI-Z", None],
+                    "ts": "t4",
+                },
+                # exhausted with a malformed per-ticket run_ids map.
+                "codex:auth-exhausted:bad-run-ids": {
+                    "type": "codex_auth_dead_exhausted",
+                    "tickets": ["WIKI-W"],
+                    "run_ids": {"WIKI-W": {"nested": "object"}},
+                    "ts": "t5",
+                },
+                # claude_limit_hit with an empty ticket.
+                "claude:limit:empty": {
+                    "type": "claude_limit_hit",
+                    "ticket": "",
+                    "ts": "t6",
+                },
+                # claude_limit_hit with a malformed run_id (non-string).
+                "claude:limit:bad-run-id": {
+                    "type": "claude_limit_hit",
+                    "ticket": "WIKI-V",
+                    "run_id": 12345,
+                    "ts": "t7",
+                },
+                # revival with the wrong type for revived (dict, not list).
+                "codex:auth-revive-failed:bad-revived": {
+                    "type": "codex_auth_dead_revival",
+                    "revived": {"not": "a list"},
+                    "failed": ["WIKI-U"],
+                    "ts": "t8",
+                },
+                # ONE valid entry proves the loader kept working after the drops.
+                "claude:limit:WIKI-OK": {
+                    "type": "claude_limit_hit",
+                    "ticket": "WIKI-OK",
+                    "window": "@1",
+                    "ts": "t9",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    reloaded = AccountNoticeStore(path=path)
+    snapshot = reloaded.snapshot()
+    assert [entry["type"] for entry in snapshot] == ["claude_limit_hit"]
+    assert snapshot[0]["ticket"] == "WIKI-OK"
+
+
 def test_loader_drops_unknown_and_malformed_notice_payloads(tmp_path: Path) -> None:
     path = tmp_path / "notices.json"
     # Mix valid + invalid entries and reload.
