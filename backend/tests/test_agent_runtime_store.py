@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import signal
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -15,7 +19,11 @@ from backend.app import transcripts
 from backend.app.agent_runtime import store as store_module
 from backend.app.agent_runtime.fake import WireFixture
 from backend.app.agent_runtime.normalizer import normalize_provider_event
-from backend.app.agent_runtime.process import ProviderProcessStatus
+from backend.app.agent_runtime.process import (
+    ProviderProcessStatus,
+    provider_process_group_members_sync,
+    provider_process_status_sync,
+)
 from backend.app.agent_runtime.provider import AdapterStatus
 from backend.app.agent_runtime.store import (
     RunStore,
@@ -1737,6 +1745,198 @@ class RunStoreTests(unittest.TestCase):
             restarted = RunStore(paths)
 
             self.assertEqual(restarted.get(record.run_id).run_id, record.run_id)
+
+    def test_restart_kills_late_different_executable_group_member(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            run_id = str(uuid4())
+            agent_id = "WIKI-GROUP-IDENTITY"
+            child_code = (
+                "import os, subprocess, sys\n"
+                "print(f'leader:{os.getpid()}', flush=True)\n"
+                "if sys.stdin.readline().strip() != 'spawn':\n"
+                "    raise SystemExit('spawn command missing')\n"
+                "child = subprocess.Popen(['/bin/sleep', '30'], env=os.environ.copy())\n"
+                "print(f'child:{child.pid}', flush=True)\n"
+                "import time; time.sleep(60)\n"
+            )
+            daemon_code = (
+                "import json, os, subprocess, sys, time\n"
+                "from pathlib import Path\n"
+                "from backend.app.agent_runtime.store import RunStore, RuntimePaths\n"
+                "from backend.app.agent_runtime.types import ProviderKind, RunRecord\n"
+                "root = Path(sys.argv[1])\n"
+                "paths = RuntimePaths(\n"
+                "    runtime_dir=root / 'runtime',\n"
+                "    socket_path=root / 'runtime' / 'supervisor.sock',\n"
+                "    registry_path=root / 'registry' / 'agents.json',\n"
+                "    archive_dir=root / 'archive',\n"
+                "    status_dir=root / 'status',\n"
+                ")\n"
+                "store = RunStore(paths)\n"
+                "record = RunRecord.new(\n"
+                "    agent_id=sys.argv[2], provider=ProviderKind.CODEX,\n"
+                "    role='implement', model='fixture-codex', worktree=str(root),\n"
+                "    prompt='group identity crash fixture', run_id=sys.argv[3],\n"
+                ")\n"
+                "store.create(record, transactional_start=True)\n"
+                "env = os.environ.copy()\n"
+                "env['WIKI_RUN_ID'] = record.run_id\n"
+                "env['WIKI_AGENT_ID'] = record.agent_id\n"
+                "provider = subprocess.Popen(\n"
+                "    [sys.executable, '-c', sys.argv[4]],\n"
+                "    env=env, start_new_session=True, stdin=subprocess.PIPE,\n"
+                "    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,\n"
+                ")\n"
+                "leader = provider.stdout.readline().strip()\n"
+                "assert leader == f'leader:{provider.pid}', leader\n"
+                "store.record_provider_process_created(record.run_id, provider.pid)\n"
+                "provider.stdin.write('spawn\\n')\n"
+                "provider.stdin.flush()\n"
+                "child = provider.stdout.readline().strip()\n"
+                "print(json.dumps({'run_id': record.run_id, 'leader': provider.pid, 'child': int(child.split(':', 1)[1]), 'pgid': os.getpgid(provider.pid)}), flush=True)\n"
+                "time.sleep(60)\n"
+            )
+            env = os.environ.copy()
+            repo_root = str(Path(__file__).resolve().parents[2])
+            env["PYTHONPATH"] = repo_root
+            daemon = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    daemon_code,
+                    str(root),
+                    agent_id,
+                    run_id,
+                    child_code,
+                ],
+                cwd=repo_root,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            provider_info: dict[str, int | str] | None = None
+            try:
+                line = daemon.stdout.readline() if daemon.stdout is not None else ""
+                if not line:
+                    stderr = daemon.stderr.read() if daemon.stderr is not None else ""
+                    self.fail(f"daemon exited before barrier: {stderr}")
+                provider_info = json.loads(line)
+                leader_pid = int(provider_info["leader"])
+                child_pid = int(provider_info["child"])
+                process_group_id = int(provider_info["pgid"])
+                self.assertIsNotNone(provider_process_status_sync(leader_pid))
+                self.assertIsNotNone(provider_process_status_sync(child_pid))
+
+                os.kill(daemon.pid, signal.SIGKILL)
+                daemon.wait(timeout=5)
+
+                restarted = RunStore(paths)
+                self.assertEqual(restarted.list_runs(), [])
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    members = provider_process_group_members_sync(process_group_id)
+                    if not members:
+                        break
+                    time.sleep(0.05)
+                self.assertEqual(provider_process_group_members_sync(process_group_id), [])
+            finally:
+                if daemon.poll() is None:
+                    daemon.kill()
+                    daemon.wait(timeout=5)
+                if provider_info is not None:
+                    process_group_id = int(provider_info["pgid"])
+                    try:
+                        os.killpg(process_group_id, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+
+    def test_subprocess_kill_after_status_unlink_restores_exact_preimage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            agent_id = "WIKI-STATUS-PREIMAGE"
+            run_id = str(uuid4())
+            status_content = b'{"state":"working","step":"before start"}\n'
+            registry_content = {
+                agent_id: {
+                    "history": [{"run_id": "old-run", "state": "completed"}],
+                    "current": None,
+                }
+            }
+            paths.status_dir.mkdir(parents=True)
+            paths.status_dir.joinpath(f"{agent_id}.json").write_bytes(status_content)
+            paths.registry_path.parent.mkdir(parents=True)
+            paths.registry_path.write_text(
+                json.dumps(registry_content), encoding="utf-8"
+            )
+            daemon_code = (
+                "import os, sys, time\n"
+                "from pathlib import Path\n"
+                "from backend.app.agent_runtime.store import RunStore, RuntimePaths\n"
+                "from backend.app.agent_runtime.types import ProviderKind, RunRecord\n"
+                "root = Path(sys.argv[1])\n"
+                "paths = RuntimePaths(\n"
+                "    runtime_dir=root / 'runtime',\n"
+                "    socket_path=root / 'runtime' / 'supervisor.sock',\n"
+                "    registry_path=root / 'registry' / 'agents.json',\n"
+                "    archive_dir=root / 'archive',\n"
+                "    status_dir=root / 'status',\n"
+                ")\n"
+                "store = RunStore(paths)\n"
+                "print('ready', flush=True)\n"
+                "if sys.stdin.readline().strip() != 'create':\n"
+                "    raise SystemExit('create command missing')\n"
+                "record = RunRecord.new(\n"
+                "    agent_id=sys.argv[2], provider=ProviderKind.CODEX,\n"
+                "    role='implement', model='fixture-codex', worktree=str(root),\n"
+                "    prompt='status preimage crash fixture', run_id=sys.argv[3],\n"
+                ")\n"
+                "store.create(record, transactional_start=True)\n"
+                "time.sleep(60)\n"
+            )
+            env = os.environ.copy()
+            repo_root = str(Path(__file__).resolve().parents[2])
+            env["PYTHONPATH"] = repo_root
+            daemon = subprocess.Popen(
+                [sys.executable, "-c", daemon_code, str(root), agent_id, run_id],
+                cwd=repo_root,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.PIPE,
+                text=True,
+            )
+            status_path = paths.status_dir / f"{agent_id}.json"
+            run_path = paths.run_dir(run_id) / "run.json"
+            try:
+                line = daemon.stdout.readline() if daemon.stdout is not None else ""
+                self.assertEqual(line.strip(), "ready")
+                daemon.stdin.write("create\n")
+                daemon.stdin.flush()
+                deadline = time.monotonic() + 5
+                while status_path.exists() and time.monotonic() < deadline:
+                    time.sleep(0.0001)
+                self.assertFalse(status_path.exists())
+                self.assertTrue(run_path.exists())
+                marker = json.loads(run_path.read_text(encoding="utf-8"))
+                self.assertIsNotNone(marker.get("start_transaction"))
+                os.kill(daemon.pid, signal.SIGKILL)
+                daemon.wait(timeout=5)
+
+                restarted = RunStore(paths)
+                self.assertEqual(restarted.list_runs(), [])
+                self.assertEqual(status_path.read_bytes(), status_content)
+                self.assertEqual(
+                    json.loads(paths.registry_path.read_text(encoding="utf-8")),
+                    registry_content,
+                )
+            finally:
+                if daemon.poll() is None:
+                    daemon.kill()
+                    daemon.wait(timeout=5)
 
     def test_restart_discovers_unrecorded_provider_by_run_identity(self) -> None:
         for provider in (ProviderKind.CODEX, ProviderKind.CLAUDE):

@@ -180,7 +180,6 @@ class CommandQueue:
             raise CommandError("command queue is closed")
         await self._ensure_recovered()
         key = (command.method, command.request_id)
-        self._deferred.pop(key, None)
         existing = self._inflight.get(key)
         if existing is not None:
             if not self._same_binding(command, existing[0]):
@@ -200,6 +199,9 @@ class CommandQueue:
                 )
                 intent = await asyncio.to_thread(self.log.append_intent, command, state)
             if intent.replay:
+                # A receipt is terminal. It also closes any deferred retry
+                # left by an earlier provider-control outage.
+                self._deferred.pop(key, None)
                 future.set_result(intent.result)
                 self._inflight.pop(key, None)
                 return await asyncio.shield(future)
@@ -267,7 +269,12 @@ class CommandQueue:
                 key = (command.method, command.request_id)
                 if self._inflight.get(key, (None, None))[1] is future:
                     self._inflight.pop(key, None)
-                if not retryable:
+                if retryable:
+                    # A normal client retry can hit the same detached
+                    # provider as recovered work. Keep it eligible for the
+                    # next recovery poll without a daemon restart.
+                    self._deferred[key] = command
+                else:
                     self._deferred.pop(key, None)
                 self._queue.task_done()
 

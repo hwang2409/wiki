@@ -1820,6 +1820,62 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             "completed",
         )
 
+    async def test_start_replay_keeps_uncommitted_retained_run_pending_after_restart(
+        self,
+    ) -> None:
+        request_id = "start-retained-uncommitted"
+        record = RunRecord.new(
+            agent_id="WIKI-START-RETAINED",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            worktree=str(self.worktree),
+            prompt="retained uncommitted start",
+            run_id=str(uuid4()),
+            start_request_id=request_id,
+        )
+        command = AgentCommand.spawn(
+            agent_id=record.agent_id,
+            request_id=request_id,
+            payload={
+                "agent_id": record.agent_id,
+                "provider": record.provider.value,
+                "role": record.role,
+                "model": record.model,
+                "worktree": record.worktree,
+                "prompt": record.initial_prompt or "retained uncommitted start",
+                "run_id": record.run_id,
+            },
+        )
+        self.store.command_log.append_intent(command, {record.agent_id: None})
+        self.store.create(record, transactional_start=True)
+        record = self.store.get(record.run_id)
+        record.provider_pid = os.getpid()
+        self.store._write_record(record)  # noqa: SLF001 - uncertain live provider fixture
+        self.store.transition(
+            record.run_id,
+            LifecycleState.BLOCKED,
+            reason="provider identity is uncertain after restart",
+        )
+
+        restarted_store = RunStore(self.paths)
+        restarted = Supervisor(
+            restarted_store,
+            FixtureAdapterFactory(FIXTURES, pid=os.getpid()),
+        )
+        try:
+            await restarted.command_queue.recover_pending()
+            self.assertEqual(restarted_store.command_log.pending(), [command])
+            self.assertIsNone(
+                restarted_store.command_log.receipt("run/start", request_id)
+            )
+            retained = restarted_store.get(record.run_id)
+            self.assertEqual(retained.state, LifecycleState.BLOCKED)
+            self.assertIsNotNone(retained.start_transaction)
+            self.assertIsNone(restarted_store.find_start_request(request_id))
+        finally:
+            await restarted.close()
+
     async def test_replace_cancellation_during_quiesce_terminalizes_old_run(self) -> None:
         old = await self.supervisor.start_run(
             agent_id="WIKI-REPLACE-CANCEL-STOP",

@@ -838,7 +838,11 @@ class RunStore:
                 record = self.get(str(indexed["run_id"]))
             except RunNotFound:
                 return None
-            if record.agent_id == indexed["agent_id"] and self.is_current(record):
+            if (
+                record.agent_id == indexed["agent_id"]
+                and self.is_current(record)
+                and record.start_transaction is None
+            ):
                 return record
         return None
 
@@ -961,6 +965,8 @@ class RunStore:
             executable=record.provider_executable,
             process_group_id=record.provider_process_group_id,
             group_members=record.provider_process_group_members,
+            run_id=record.run_id,
+            agent_id=record.agent_id,
         )
 
     def legacy_codex_agent_ids(self) -> list[str]:
@@ -1547,13 +1553,12 @@ class RunStore:
                     "agent has a legacy orchestrator registration requiring "
                     f"explicit migration: {record.agent_id}"
                 )
-            # A status file belongs to the run that creates it. Clear any
-            # orphan from a prior run before this record becomes current; the
-            # supervisor calls create() while holding the per-agent lock.
+            # A status file belongs to the run that creates it. Capture the
+            # old status and registry before publishing any start side effect.
+            # The supervisor calls create() while holding the per-agent lock.
             status_path = self.status_path(record.agent_id)
             _ensure_parent_dir(status_path.parent)
             status_present, status_content = _read_start_status(status_path)
-            status_path.unlink(missing_ok=True)
             registry_before = deepcopy(registry)
             registry_was_present = self.paths.registry_path.exists()
             legacy_orchestrators = registry.get("_orchestrators")
@@ -1592,7 +1597,10 @@ class RunStore:
             }
             run_dir_was_absent = not self.run_dir(record.run_id).exists()
             try:
+                # The run record contains the preimage and transaction marker.
+                # It must reach disk before the previous status can disappear.
                 self._create_run_files(record)
+                status_path.unlink(missing_ok=True)
                 if record.start_request_id:
                     self.command_log.register_start_request(
                         record.start_request_id,

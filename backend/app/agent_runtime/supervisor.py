@@ -4173,7 +4173,15 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 raise ValueError("migrate_legacy must be a boolean")
             requested_run_id = params.get("run_id")
             current_run_id = self.store.current_run_id(str(params["agent_id"]))
-            if current_run_id == requested_run_id:
+            if requested_run_id is not None and current_run_id == requested_run_id:
+                current = self.store.get(current_run_id)
+                durable = self.store.find_start_request(
+                    str(params.get("request_id") or "")
+                )
+                if current.start_transaction is not None or durable is None:
+                    raise CommandRetryable(
+                        "matching run start is not durably committed"
+                    )
                 return _public_run(self.store.get(current_run_id))
             record = await self.start_run(
                 agent_id=str(params["agent_id"]),

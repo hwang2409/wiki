@@ -299,6 +299,8 @@ def terminate_verified_provider_group(
     executable: str,
     process_group_id: int,
     group_members: list[dict[str, int | float | str | None]] | None = None,
+    run_id: str | None = None,
+    agent_id: str | None = None,
     grace: float = 0.5,
     kill_timeout: float = 1.0,
 ) -> bool:
@@ -364,6 +366,42 @@ def terminate_verified_provider_group(
         current = provider_process_group_members_sync(process_group_id)
         if not current:
             return False
+        dedicated_session_group = process_group_id == pid
+
+        def is_later_owned_member(item: dict[str, int | float | str | None]) -> bool:
+            try:
+                member_pid = int(item["pid"])
+                member_created_at = float(item["created_at"])
+            except (
+                KeyError,
+                TypeError,
+                ValueError,
+            ):
+                return False
+            if member_created_at < created_at:
+                return False
+            if dedicated_session_group:
+                # The recorded PID is also the session leader. Its PGID is a
+                # dedicated ownership boundary for children started later.
+                return True
+            if run_id is None or agent_id is None:
+                return False
+            try:
+                environment = psutil.Process(member_pid).environ()
+            except (
+                ProcessLookupError,
+                PermissionError,
+                psutil.Error,
+                OSError,
+            ):
+                return False
+            # A child may use a different executable, but it must carry the
+            # exact run identity when no dedicated session boundary exists.
+            return (
+                environment.get("WIKI_RUN_ID") == run_id
+                and environment.get("WIKI_AGENT_ID") == agent_id
+            )
+
         return all(
             (
                 (
@@ -372,10 +410,7 @@ def terminate_verified_provider_group(
                     item.get("executable"),
                 )
                 in expected
-                or (
-                    item.get("executable") == executable
-                    and float(item["created_at"]) >= created_at
-                )
+                or is_later_owned_member(item)
             )
             for item in current
         )

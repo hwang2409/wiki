@@ -467,6 +467,58 @@ class CommandLogTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_repeat_retryable_submission_is_recovered_without_restart(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                log = CommandLog(Path(tmp) / "command-log.sqlite3")
+                command = AgentCommand.steer(
+                    agent_id="WIKI-A",
+                    request_id="steer-repeat-retryable",
+                    payload={
+                        "method": "run/send_now",
+                        "run_id": "run-a",
+                        "text": "deliver once",
+                    },
+                )
+                log.append_intent(
+                    command,
+                    {"WIKI-A": {"current": {"run_id": "run-a"}}},
+                )
+                available = False
+                deliveries = 0
+
+                def factory(_command: AgentCommand):
+                    async def effect() -> dict[str, str]:
+                        nonlocal deliveries
+                        if not available:
+                            raise CommandRetryable("provider control is detached")
+                        deliveries += 1
+                        return {"status": "sent"}
+
+                    return effect
+
+                queue = CommandQueue(
+                    log,
+                    lambda: {},
+                    recovery_factory=factory,
+                )
+                await queue.recover_pending()
+
+                with self.assertRaises(CommandRetryable):
+                    await queue.submit(command, factory(command))
+
+                available = True
+                await queue.recover_pending()
+
+                self.assertEqual(deliveries, 1)
+                self.assertEqual(log.pending(), [])
+                receipt = log.receipt(command.method, command.request_id)
+                self.assertIsNotNone(receipt)
+                self.assertEqual(receipt.result if receipt else None, {"status": "sent"})
+                await queue.close()
+
+        asyncio.run(run())
+
     def test_steer_outbox_reconciles_delivery_states(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log = CommandLog(Path(tmp) / "command-log.sqlite3")
