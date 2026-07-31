@@ -18,12 +18,11 @@ import {
   type LoadedPdf,
 } from "./pdfjs-runtime";
 import {
-  brushParamName,
+  BRUSH_TUPLE_SIGNAL,
   buildInteractiveSpec,
   makeBrushBuffer,
   plotInteractivity,
   type PlotDomains,
-  type ZoomChannel,
 } from "./plot-interaction";
 import { ShikiCode, useCurrentTheme } from "./shiki";
 import { StatusBadge, statusToTone } from "./status-badge";
@@ -495,19 +494,12 @@ export function PlotRenderer({
           const buffer = makeBrushBuffer(interactivity.channels, (domains) => {
             brushRef.current?.(domains);
           });
-          // Each zoomable channel has its own 1D brush param, whose top-level
-          // signal fires as `{ <compiledFieldName>: [low, high] }` on every
-          // brush update. Independent signals side-step Vega-Lite's dedup of
-          // same-field-both-axes selections and the escape-inconsistency of
-          // field-name keys in the shared user-facing signal.
-          for (const channel of interactivity.channels as ZoomChannel[]) {
-            const signalName = brushParamName(channel);
-            try {
-              result.view.addSignalListener(signalName, (_name, value) => {
-                buffer.onChannelSignal(channel, value);
-              });
-            } catch { /* Vega drops listeners if user spec stripped the param */ }
-          }
+          try {
+            // Listen to the compiled tuple signal (channel-tagged) so the
+            // reader is agnostic to nested field paths / escaped keys /
+            // same-field axes — metadata carries the channel, not the map key.
+            result.view.addSignalListener(BRUSH_TUPLE_SIGNAL, (_name, value) => buffer.onSignal(value));
+          } catch { /* Vega drops listeners if user spec stripped the param */ }
           window.addEventListener("pointerup", buffer.onPointerUp);
           window.addEventListener("pointercancel", buffer.onCancel);
           brushCleanup = () => {

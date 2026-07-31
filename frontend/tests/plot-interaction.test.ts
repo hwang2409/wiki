@@ -1,14 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  BRUSH_PARAM_PREFIX,
+  BRUSH_PARAM,
+  BRUSH_TUPLE_SIGNAL,
   ZOOM_PARAM_PREFIX,
-  brushParamName,
+  brushChannels,
   buildInteractiveSpec,
-  extentFromSignal,
   makeBrushBuffer,
   plotInteractivity,
   plotPngFilename,
+  tupleDomains,
   zoomParamName,
 } from "../src/plot-interaction.ts";
 
@@ -46,9 +47,7 @@ test("plotInteractivity: binned quantitative axis is not zoomable", () => {
   };
   const result = plotInteractivity(spec);
   assert.equal(result.mode, "full");
-  if (result.mode === "full") {
-    assert.deepEqual(result.channels, ["y"]);
-  }
+  if (result.mode === "full") assert.deepEqual(result.channels, ["y"]);
 });
 
 test("plotInteractivity: continuous x + temporal y → full both channels", () => {
@@ -61,9 +60,7 @@ test("plotInteractivity: continuous x + temporal y → full both channels", () =
   };
   const result = plotInteractivity(spec);
   assert.equal(result.mode, "full");
-  if (result.mode === "full") {
-    assert.deepEqual(result.channels.sort(), ["x", "y"]);
-  }
+  if (result.mode === "full") assert.deepEqual(result.channels.sort(), ["x", "y"]);
 });
 
 test("plotInteractivity: aggregate encodings downgrade the channel", () => {
@@ -87,9 +84,7 @@ test("plotInteractivity: aggregate on one channel leaves the other zoomable", ()
   };
   const result = plotInteractivity(spec);
   assert.equal(result.mode, "full");
-  if (result.mode === "full") {
-    assert.deepEqual(result.channels, ["x"]);
-  }
+  if (result.mode === "full") assert.deepEqual(result.channels, ["x"]);
 });
 
 test("plotInteractivity: scale:null encodings drop out of full mode", () => {
@@ -102,9 +97,7 @@ test("plotInteractivity: scale:null encodings drop out of full mode", () => {
   };
   const result = plotInteractivity(spec);
   assert.equal(result.mode, "full");
-  if (result.mode === "full") {
-    assert.deepEqual(result.channels, ["y"]);
-  }
+  if (result.mode === "full") assert.deepEqual(result.channels, ["y"]);
 });
 
 test("plotInteractivity: all-scale-null degrades to tooltip", () => {
@@ -133,7 +126,7 @@ test("plotInteractivity: exact wiki_zoom param collision downgrades", () => {
   const spec = {
     mark: "point",
     encoding: { x: { field: "x", type: "quantitative" } },
-    params: [{ name: ZOOM_PARAM_PREFIX, select: { type: "interval" } }],
+    params: [{ name: ZOOM_PARAM_PREFIX, value: 1 }],
   };
   assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
 });
@@ -141,29 +134,22 @@ test("plotInteractivity: exact wiki_zoom param collision downgrades", () => {
 test("plotInteractivity: derived-name collision on wiki_zoom_x downgrades", () => {
   const spec = {
     mark: "point",
-    encoding: {
-      x: { field: "x", type: "quantitative" },
-      y: { field: "y", type: "quantitative" },
-    },
+    encoding: { x: { field: "x", type: "quantitative" }, y: { field: "y", type: "quantitative" } },
     params: [{ name: `${ZOOM_PARAM_PREFIX}_x`, value: 42 }],
   };
   assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
 });
 
-test("plotInteractivity: derived-name collision on wiki_brush_x downgrades", () => {
+test("plotInteractivity: derived-name collision on wiki_brush_tuple downgrades", () => {
   const spec = {
     mark: "point",
     encoding: { x: { field: "x", type: "quantitative" } },
-    params: [{ name: `${BRUSH_PARAM_PREFIX}_x`, value: null }],
+    params: [{ name: BRUSH_TUPLE_SIGNAL, value: null }],
   };
   assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
 });
 
 test("plotInteractivity: top-level dataset named wiki_zoom_x_store downgrades", () => {
-  // Vega compiles `wiki_zoom_x_store` as the selection store for our
-  // injected wiki_zoom_x param. If a user top-level dataset already uses
-  // that name, the first selection update replaces its rows with the
-  // selection tuple — the chart source goes empty.
   const spec = {
     mark: "point",
     encoding: { x: { field: "x", type: "quantitative" } },
@@ -172,11 +158,11 @@ test("plotInteractivity: top-level dataset named wiki_zoom_x_store downgrades", 
   assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
 });
 
-test("plotInteractivity: top-level dataset named wiki_brush_x_store downgrades", () => {
+test("plotInteractivity: top-level dataset named wiki_brush_store downgrades", () => {
   const spec = {
     mark: "point",
     encoding: { x: { field: "x", type: "quantitative" } },
-    datasets: { "wiki_brush_x_store": [{ x: 1 }] },
+    datasets: { "wiki_brush_store": [{ x: 1 }] },
   };
   assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
 });
@@ -190,11 +176,50 @@ test("plotInteractivity: data.name matching reserved prefix downgrades", () => {
   assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
 });
 
+test("plotInteractivity: user-authored bind:scales interval downgrades", () => {
+  // R8F1: appended wiki_zoom_x would steal the single domainRaw binding from
+  // this user selection. Downgrade rather than silently break the user's
+  // interaction.
+  const spec = {
+    mark: "point",
+    encoding: {
+      x: { field: "x", type: "quantitative" },
+      y: { field: "y", type: "quantitative" },
+    },
+    params: [{ name: "user_pan", select: { type: "interval" }, bind: "scales" }],
+  };
+  assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
+});
+
+test("plotInteractivity: user-authored unbound brush (interval without bind) downgrades", () => {
+  const spec = {
+    mark: "point",
+    encoding: { x: { field: "x", type: "quantitative" } },
+    params: [{ name: "user_brush", select: { type: "interval" } }],
+  };
+  assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
+});
+
+test("plotInteractivity: user-authored point selection downgrades", () => {
+  const spec = {
+    mark: "point",
+    encoding: { x: { field: "x", type: "quantitative" } },
+    params: [{ name: "user_click", select: { type: "point" } }],
+  };
+  assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
+});
+
+test("plotInteractivity: user scalar params (no select) stay in full mode", () => {
+  const spec = {
+    mark: "point",
+    encoding: { x: { field: "x", type: "quantitative" } },
+    params: [{ name: "user_toggle", value: true }],
+  };
+  const result = plotInteractivity(spec);
+  assert.equal(result.mode, "full");
+});
+
 test("plotInteractivity: legacy top-level `selection` key downgrades", () => {
-  // Vega-Lite 6 still accepts the deprecated top-level `selection` block. If
-  // one exists, the compiler compiles those selections and DROPS every
-  // injected `params` entry — full mode would advertise pan/wheel/brush
-  // with no handlers.
   const spec = {
     mark: "point",
     encoding: { x: { field: "x", type: "quantitative" } },
@@ -206,10 +231,7 @@ test("plotInteractivity: legacy top-level `selection` key downgrades", () => {
 test("plotInteractivity: composite mark boxplot degrades to tooltip", () => {
   const spec = {
     mark: "boxplot",
-    encoding: {
-      x: { field: "x", type: "quantitative" },
-      y: { field: "y", type: "quantitative" },
-    },
+    encoding: { x: { field: "x", type: "quantitative" }, y: { field: "y", type: "quantitative" } },
   };
   assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
 });
@@ -217,10 +239,7 @@ test("plotInteractivity: composite mark boxplot degrades to tooltip", () => {
 test("plotInteractivity: composite mark errorbar degrades to tooltip", () => {
   const spec = {
     mark: { type: "errorbar", extent: "ci" },
-    encoding: {
-      x: { field: "x", type: "quantitative" },
-      y: { field: "y", type: "quantitative" },
-    },
+    encoding: { x: { field: "x", type: "quantitative" }, y: { field: "y", type: "quantitative" } },
   };
   assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
 });
@@ -228,15 +247,12 @@ test("plotInteractivity: composite mark errorbar degrades to tooltip", () => {
 test("plotInteractivity: composite mark errorband degrades to tooltip", () => {
   const spec = {
     mark: { type: "errorband" },
-    encoding: {
-      x: { field: "x", type: "quantitative" },
-      y: { field: "y", type: "quantitative" },
-    },
+    encoding: { x: { field: "x", type: "quantitative" }, y: { field: "y", type: "quantitative" } },
   };
   assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
 });
 
-test("plotInteractivity: same-field-both-axes stays in full mode (per-channel params handle it)", () => {
+test("plotInteractivity: same-field-both-axes stays in full mode", () => {
   const spec = {
     mark: "point",
     encoding: {
@@ -246,19 +262,29 @@ test("plotInteractivity: same-field-both-axes stays in full mode (per-channel pa
   };
   const result = plotInteractivity(spec);
   assert.equal(result.mode, "full");
-  if (result.mode === "full") {
-    assert.deepEqual(result.channels.sort(), ["x", "y"]);
-  }
+  if (result.mode === "full") assert.deepEqual(result.channels.sort(), ["x", "y"]);
 });
 
-test("plotInteractivity: unrelated params leave full mode intact", () => {
-  const spec = {
-    mark: "point",
-    encoding: { x: { field: "x", type: "quantitative" } },
-    params: [{ name: "userToggle", value: true }],
-  };
-  const result = plotInteractivity(spec);
-  assert.equal(result.mode, "full");
+test("brushChannels: distinct fields → both channels", () => {
+  assert.deepEqual(
+    brushChannels(["x", "y"], { x: { field: "a" }, y: { field: "b" } }),
+    ["x", "y"],
+  );
+});
+
+test("brushChannels: same field on both axes → drop y (visible band matches applied zoom)", () => {
+  // R8F2: if we projected y too, Vega-Lite would dedupe and render a
+  // full-height band whose visual bounds don't match what x-only zoom does.
+  // Dropping y makes the visible x-band match the x-only zoom on release.
+  assert.deepEqual(
+    brushChannels(["x", "y"], { x: { field: "v" }, y: { field: "v" } }),
+    ["x"],
+  );
+});
+
+test("brushChannels: single-channel full mode passes through", () => {
+  assert.deepEqual(brushChannels(["x"], { x: { field: "a" } }), ["x"]);
+  assert.deepEqual(brushChannels(["y"], { y: { field: "b" } }), ["y"]);
 });
 
 test("buildInteractiveSpec: static passes through unchanged", () => {
@@ -280,7 +306,7 @@ test("buildInteractiveSpec: preserves author-specified tooltip config", () => {
   assert.deepEqual((out.mark as Record<string, unknown>).tooltip, { content: "data" });
 });
 
-test("buildInteractiveSpec: full + armed injects one zoom and one brush per channel", () => {
+test("buildInteractiveSpec: full + armed injects per-channel zoom + single 2D brush", () => {
   const spec = {
     mark: "point",
     encoding: {
@@ -294,17 +320,37 @@ test("buildInteractiveSpec: full + armed injects one zoom and one brush per chan
     brushColor: "#abc",
   });
   const params = out.params as Array<Record<string, unknown>>;
-  assert.equal(params.length, 4, "four params: zoom_x, brush_x, zoom_y, brush_y");
+  assert.equal(params.length, 3, "wiki_zoom_x + wiki_zoom_y + wiki_brush");
   for (const channel of ["x", "y"] as const) {
     const zoom = params.find((p) => p.name === zoomParamName(channel))!;
-    assert.equal(zoom.bind, "scales", `${channel} zoom bind lives at param level`);
+    assert.equal(zoom.bind, "scales");
     assert.equal((zoom.select as Record<string, unknown>).bind, undefined);
     assert.deepEqual((zoom.select as Record<string, unknown>).encodings, [channel]);
-    const brush = params.find((p) => p.name === brushParamName(channel))!;
-    assert.equal((brush.select as Record<string, unknown>).translate, false);
-    assert.deepEqual((brush.select as Record<string, unknown>).encodings, [channel]);
-    assert.equal(((brush.select as Record<string, unknown>).mark as Record<string, unknown>).stroke, "#abc");
   }
+  const brush = params.find((p) => p.name === BRUSH_PARAM)!;
+  assert.deepEqual((brush.select as Record<string, unknown>).encodings, ["x", "y"]);
+  assert.equal((brush.select as Record<string, unknown>).translate, false);
+});
+
+test("buildInteractiveSpec: same-field brush projects x only (visible band matches zoom)", () => {
+  const spec = {
+    mark: "point",
+    encoding: {
+      x: { field: "v", type: "quantitative" },
+      y: { field: "v", type: "quantitative" },
+    },
+  };
+  const out = buildInteractiveSpec(spec, {
+    interactivity: { mode: "full", channels: ["x", "y"] },
+    armed: true,
+  });
+  const params = out.params as Array<Record<string, unknown>>;
+  const brush = params.find((p) => p.name === BRUSH_PARAM)!;
+  assert.deepEqual((brush.select as Record<string, unknown>).encodings, ["x"]);
+  // Zoom still per-channel — same-field zoom works via wheel on each axis
+  // independently.
+  assert.ok(params.find((p) => p.name === zoomParamName("x")));
+  assert.ok(params.find((p) => p.name === zoomParamName("y")));
 });
 
 test("buildInteractiveSpec: full but unarmed omits params (inline tooltip mode)", () => {
@@ -353,60 +399,73 @@ test("buildInteractiveSpec: does not mutate input", () => {
   assert.equal(JSON.stringify(spec), before);
 });
 
-test("buildInteractiveSpec: single-channel full mode injects only that channel's params", () => {
-  const spec = {
-    mark: "point",
-    encoding: { x: { field: "x", type: "quantitative" } },
-  };
-  const out = buildInteractiveSpec(spec, {
-    interactivity: { mode: "full", channels: ["x"] },
-    armed: true,
+test("tupleDomains: reads channel-tagged extents and sorts them", () => {
+  const domains = tupleDomains(
+    {
+      unit: "",
+      fields: [
+        { field: "price", channel: "x", type: "R" },
+        { field: "date", channel: "y", type: "R" },
+      ],
+      values: [[40, 12], [1_700_000_000_000, 1_710_000_000_000]],
+    },
+    ["x", "y"],
+  );
+  assert.deepEqual(domains, {
+    x: [12, 40],
+    y: [1_700_000_000_000, 1_710_000_000_000],
   });
-  const params = out.params as Array<Record<string, unknown>>;
-  assert.equal(params.length, 2);
-  assert.ok(params.every((p) => (p.name as string).endsWith("_x")));
 });
 
-test("extentFromSignal: reads the first array value regardless of key", () => {
-  assert.deepEqual(extentFromSignal({ "v": [2, 8] }), [2, 8]);
-  // Nested field path — the escaped key is opaque to us, but we don't need to
-  // read it because 1D signals only ever have one entry.
-  assert.deepEqual(extentFromSignal({ "a.b": [3, 7] }), [3, 7]);
-  assert.deepEqual(extentFromSignal({ "some\\.field": [-1, 4] }), [-1, 4]);
+test("tupleDomains: rejects zero-width extents and non-finite values", () => {
+  const empty = tupleDomains(
+    {
+      unit: "",
+      fields: [
+        { field: "x", channel: "x", type: "R" },
+        { field: "y", channel: "y", type: "R" },
+      ],
+      values: [[5, 5], [Number.NaN, 3]],
+    },
+    ["x", "y"],
+  );
+  assert.equal(empty, null);
 });
 
-test("extentFromSignal: reverses swapped low/high", () => {
-  assert.deepEqual(extentFromSignal({ "v": [8, 2] }), [2, 8]);
+test("tupleDomains: ignores channels outside the allowlist", () => {
+  const domains = tupleDomains(
+    {
+      unit: "",
+      fields: [
+        { field: "x", channel: "x", type: "R" },
+        { field: "z", channel: "color", type: "R" },
+      ],
+      values: [[0, 1], [0, 2]],
+    },
+    ["x"],
+  );
+  assert.deepEqual(domains, { x: [0, 1] });
 });
 
-test("extentFromSignal: empty and malformed → null", () => {
-  assert.equal(extentFromSignal({}), null);
-  assert.equal(extentFromSignal(null), null);
-  assert.equal(extentFromSignal({ "v": [] }), null);
-  assert.equal(extentFromSignal({ "v": [5, 5] }), null);
-  assert.equal(extentFromSignal({ "v": [Number.NaN, 3] }), null);
-  assert.equal(extentFromSignal([1, 2]), null);
+test("tupleDomains: returns null for malformed tuples", () => {
+  assert.equal(tupleDomains(null, ["x"]), null);
+  assert.equal(tupleDomains({ fields: [], values: [] }, ["x"]), null);
 });
 
-test("makeBrushBuffer: commits only on pointerup, always the latest per-channel extent", () => {
-  const commits: unknown[] = [];
-  const buffer = makeBrushBuffer(["x", "y"], (d) => commits.push(d));
-  buffer.onChannelSignal("x", { v: [0, 1] });
-  buffer.onChannelSignal("x", { v: [0, 5] });
-  buffer.onChannelSignal("y", { v: [1, 4] });
-  buffer.onChannelSignal("x", { v: [0, 12] });
-  assert.deepEqual(commits, []);
-  buffer.onPointerUp();
-  assert.deepEqual(commits, [{ x: [0, 12], y: [1, 4] }]);
-});
-
-test("makeBrushBuffer: rejects signals for channels outside the allowlist", () => {
+test("makeBrushBuffer: commits only on pointerup, always the latest value", () => {
   const commits: unknown[] = [];
   const buffer = makeBrushBuffer(["x"], (d) => commits.push(d));
-  buffer.onChannelSignal("x", { v: [0, 5] });
-  buffer.onChannelSignal("y" as never, { v: [0, 5] });
+  const wrap = (values: number[][]) => ({
+    unit: "",
+    fields: [{ field: "x", channel: "x", type: "R" }],
+    values,
+  });
+  buffer.onSignal(wrap([[0, 1]]));
+  buffer.onSignal(wrap([[0, 5]]));
+  buffer.onSignal(wrap([[0, 12]]));
+  assert.deepEqual(commits, []);
   buffer.onPointerUp();
-  assert.deepEqual(commits, [{ x: [0, 5] }]);
+  assert.deepEqual(commits, [{ x: [0, 12] }]);
 });
 
 test("makeBrushBuffer: pointerup with no signals is a no-op", () => {
@@ -417,46 +476,45 @@ test("makeBrushBuffer: pointerup with no signals is a no-op", () => {
   assert.deepEqual(commits, []);
 });
 
-test("makeBrushBuffer: multiple gestures each commit once", () => {
-  const commits: unknown[] = [];
-  const buffer = makeBrushBuffer(["x"], (d) => commits.push(d));
-  buffer.onChannelSignal("x", { v: [0, 1] });
-  buffer.onPointerUp();
-  buffer.onPointerUp();
-  buffer.onChannelSignal("x", { v: [4, 8] });
-  buffer.onPointerUp();
-  assert.deepEqual(commits, [{ x: [0, 1] }, { x: [4, 8] }]);
-});
-
 test("makeBrushBuffer: shape-less signal noise is ignored", () => {
   const commits: unknown[] = [];
   const buffer = makeBrushBuffer(["x"], (d) => commits.push(d));
-  buffer.onChannelSignal("x", { v: [2, 8] });
-  buffer.onChannelSignal("x", null);         // shape-less: keep pending
-  buffer.onChannelSignal("x", undefined);    // ditto
-  buffer.onChannelSignal("x", "garbage");    // ditto
+  const wrap = (extent: number[]) => ({
+    unit: "",
+    fields: [{ field: "x", channel: "x", type: "R" }],
+    values: [extent],
+  });
+  buffer.onSignal(wrap([2, 8]));
+  buffer.onSignal(null);
+  buffer.onSignal(undefined);
+  buffer.onSignal("garbage");
   buffer.onPointerUp();
   assert.deepEqual(commits, [{ x: [2, 8] }]);
 });
 
-test("makeBrushBuffer: shrink-to-empty clears that channel's pending", () => {
-  // Reviewer case: user drags x out, y stays selected, then drags x back to
-  // the anchor before releasing. Pointerup MUST commit y only, not the
-  // earlier intermediate x range.
+test("makeBrushBuffer: shrink-to-empty clears pending", () => {
   const commits: unknown[] = [];
-  const buffer = makeBrushBuffer(["x", "y"], (d) => commits.push(d));
-  buffer.onChannelSignal("x", { v: [2, 8] });
-  buffer.onChannelSignal("y", { v: [1, 4] });
-  buffer.onChannelSignal("x", { v: [5, 5] }); // shrunk on x only
+  const buffer = makeBrushBuffer(["x"], (d) => commits.push(d));
+  const tupleWith = (values: number[][]) => ({
+    unit: "",
+    fields: [{ field: "x", channel: "x", type: "R" }],
+    values,
+  });
+  buffer.onSignal(tupleWith([[2, 8]]));
+  buffer.onSignal(tupleWith([[2, 5]]));
+  buffer.onSignal(tupleWith([[5, 5]])); // shrunk back to a point
   buffer.onPointerUp();
-  assert.deepEqual(commits, [{ y: [1, 4] }]);
+  assert.deepEqual(commits, []);
 });
 
 test("makeBrushBuffer: onCancel clears pending across an aborted gesture", () => {
   const commits: unknown[] = [];
-  const buffer = makeBrushBuffer(["x", "y"], (d) => commits.push(d));
-  buffer.onChannelSignal("x", { v: [2, 8] });
-  buffer.onChannelSignal("y", { v: [1, 4] });
+  const buffer = makeBrushBuffer(["x"], (d) => commits.push(d));
+  buffer.onSignal({
+    unit: "",
+    fields: [{ field: "x", channel: "x", type: "R" }],
+    values: [[2, 8]],
+  });
   buffer.onCancel();
   buffer.onPointerUp();
   assert.deepEqual(commits, []);

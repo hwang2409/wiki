@@ -1,19 +1,19 @@
-// Compile-level and vega-runtime assertions for WIKI-194. These push the
-// transformed spec through the actual vega-lite compiler AND the vega runtime
-// so any wiring regression — bind:scales in wrong place, name collision,
-// same-field dedup, aggregate/timeUnit false-full, scale:null crash — fails
-// immediately, not silently in the browser.
+// Compile-level and vega-runtime assertions for WIKI-194. Push the
+// transformed spec through the actual vega-lite compiler AND the vega
+// runtime so any wiring regression — bind:scales in wrong place, name
+// collision, same-field dedup, user-selection binding theft, wrong brush
+// visual — fails immediately, not silently in the browser.
 import assert from "node:assert/strict";
 import test from "node:test";
 import { compile } from "vega-lite";
 import { View, parse } from "vega";
 import {
-  BRUSH_PARAM_PREFIX,
+  BRUSH_PARAM,
+  BRUSH_TUPLE_SIGNAL,
   ZOOM_PARAM_PREFIX,
-  brushParamName,
   buildInteractiveSpec,
-  extentFromSignal,
   plotInteractivity,
+  tupleDomains,
   zoomParamName,
 } from "../src/plot-interaction.ts";
 
@@ -43,7 +43,7 @@ const CONTINUOUS: Record<string, unknown> = {
   },
 };
 
-test("compile: each per-channel zoom param binds its own scale via domainRaw", () => {
+test("compile: per-channel zoom params bind their own scales via domainRaw", () => {
   const interactive = transform(CONTINUOUS);
   const output = compile(interactive as never);
   const scales = (output.spec.scales ?? []) as Array<Record<string, unknown>>;
@@ -51,9 +51,6 @@ test("compile: each per-channel zoom param binds its own scale via domainRaw", (
     const scale = scales.find((s) => s.name === channel)!;
     const domainRaw = scale.domainRaw as Record<string, unknown> | undefined;
     assert.ok(domainRaw, `${channel} scale must have domainRaw`);
-    // Each scale binds to its OWN wiki_zoom_<channel> selection (per-channel
-    // design), NOT a shared wiki_zoom. That's what lets same-field plots
-    // work: two parameters, two stores, nothing to dedupe.
     assert.equal(
       domainRaw.signal,
       `${zoomParamName(channel)}["${channel}"]`,
@@ -67,39 +64,71 @@ test("compile: per-channel zoom signals carry panLinear and zoomLinear updates",
   const output = compile(interactive as never);
   const signals = (output.spec.signals ?? []) as Array<Record<string, unknown>>;
   for (const channel of ["x", "y"] as const) {
-    const zoom = signals.find((s) => s.name === `${zoomParamName(channel)}_${channel}`);
-    assert.ok(zoom, `${channel} zoom signal must exist`);
+    const zoom = signals.find((s) => s.name === `${zoomParamName(channel)}_${channel}`)!;
     const zoomOn = JSON.stringify(zoom.on ?? []);
-    // panLinear + zoomLinear updates on the compiled signal prove the param
-    // is scale-bound; without bind:scales at the param level the signal
-    // exists but has no such handlers.
     assert.match(zoomOn, /panLinear\(/);
     assert.match(zoomOn, new RegExp(`zoomLinear\\(domain\\(\\\\?"${channel}\\\\?"\\)`));
   }
 });
 
-test("compile: per-channel brush params compile to independent signals + stores", () => {
+test("compile: single visible 2D brush for distinct-field x+y — mark spans BOTH bounds", () => {
+  // R8F2: two 1D brushes rendered a cross while the applied zoom was the
+  // intersection box. One 2D brush must both compile AND draw a rectangle
+  // whose bounds come from BOTH wiki_brush_x and wiki_brush_y signals.
   const interactive = transform(CONTINUOUS);
-  const output = compile(interactive as never);
-  const signals = (output.spec.signals ?? []) as Array<Record<string, unknown>>;
-  const data = (output.spec.data ?? []) as Array<Record<string, unknown>>;
-  for (const channel of ["x", "y"] as const) {
-    assert.ok(
-      signals.some((s) => s.name === brushParamName(channel)),
-      `${brushParamName(channel)} must compile`,
-    );
-    assert.ok(
-      data.some((d) => d.name === `${brushParamName(channel)}_store`),
-      `${brushParamName(channel)}_store selection store must exist`,
-    );
+  const compiled = compile(interactive as never).spec;
+  const brushMark = (compiled.marks ?? []).find(
+    (m: Record<string, unknown>) => m.name === `${BRUSH_PARAM}_brush_bg`,
+  ) as Record<string, unknown>;
+  const update = (brushMark.encode as Record<string, unknown>).update as Record<string, unknown>;
+  const bounds = ["x", "y", "x2", "y2"] as const;
+  for (const key of bounds) {
+    const entries = update[key] as Array<Record<string, unknown>>;
+    const activeEntry = entries[0];
+    // Both x/x2 must reference a wiki_brush_x* signal, both y/y2 must
+    // reference a wiki_brush_y* signal — proof that shift-drag paints a
+    // box, not a cross. Vega-Lite picks between wiki_brush_x (data-space)
+    // and wiki_brush_x_1 (pixel-space) depending on whether the brush is
+    // scale-bound; both are valid signal-driven bounds and either satisfies
+    // "box, not cross".
+    const signal = String((activeEntry as { signal?: string }).signal ?? "");
+    const prefix = key.startsWith("x") ? `${BRUSH_PARAM}_x` : `${BRUSH_PARAM}_y`;
+    assert.match(signal, new RegExp(`^${prefix}(_\\d+)?\\[[01]\\]$`),
+      `brush ${key} bound must come from a ${prefix}* signal (got ${signal || "no signal"})`);
   }
 });
 
-test("runtime: wheel zoom on wiki_zoom_x shrinks the x domain independently", async () => {
+test("compile: same-field brush projects x only — visible band matches applied x-zoom", () => {
+  // For same-field, the compiled brush mark spans full-height because y is
+  // dropped from the projection. The visible x-band then matches what
+  // actually happens on release (only x zooms).
+  const interactive = transform({
+    mark: "point",
+    data: { values: [{ v: 0 }, { v: 10 }] },
+    encoding: {
+      x: { field: "v", type: "quantitative" },
+      y: { field: "v", type: "quantitative" },
+    },
+  });
+  const compiled = compile(interactive as never).spec;
+  const brushMark = (compiled.marks ?? []).find(
+    (m: Record<string, unknown>) => m.name === `${BRUSH_PARAM}_brush_bg`,
+  ) as Record<string, unknown>;
+  const update = (brushMark.encode as Record<string, unknown>).update as Record<string, unknown>;
+  // x bound comes from wiki_brush_x (real x-selection)
+  const xEntry = (update.x as Array<Record<string, unknown>>)[0];
+  assert.equal(xEntry.signal, `${BRUSH_PARAM}_x[0]`);
+  // y bound is a static value or group height — NOT a signal — because we
+  // deliberately did not project y. That is what makes the visible band
+  // full-height, matching the "x-only zoom on release" outcome.
+  const y2Entry = (update.y2 as Array<Record<string, unknown>>)[0];
+  assert.notStrictEqual((y2Entry as { signal?: unknown }).signal, `${BRUSH_PARAM}_y[1]`);
+});
+
+test("runtime: wheel on wiki_zoom_x shrinks x domain independently of y", async () => {
   const interactive = transform({
     ...CONTINUOUS,
-    width: 400,
-    height: 200,
+    width: 400, height: 200,
     data: { values: [{ x: 0, y: 0 }, { x: 10, y: 10 }] },
   });
   const view = await renderHeadless(interactive);
@@ -111,16 +140,15 @@ test("runtime: wheel zoom on wiki_zoom_x shrinks the x domain independently", as
     .run();
   const afterX = view.scale("x").domain() as [number, number];
   const afterY = view.scale("y").domain() as [number, number];
-  assert.notDeepEqual(afterX, initialX, "wheel-zoom-x must move the x domain");
-  assert.deepEqual(afterY, initialY, "wheel-zoom-x must NOT touch the y domain");
+  assert.notDeepEqual(afterX, initialX);
+  assert.deepEqual(afterY, initialY, "wheel on x must NOT touch y");
   await view.finalize();
 });
 
-test("runtime: leftward drag on wiki_zoom_x shifts x domain toward lower values", async () => {
+test("runtime: leftward drag shifts x domain toward lower values", async () => {
   const interactive = transform({
     ...CONTINUOUS,
-    width: 400,
-    height: 200,
+    width: 400, height: 200,
     data: { values: [{ x: 0, y: 0 }, { x: 100, y: 100 }] },
   });
   const view = await renderHeadless(interactive);
@@ -130,89 +158,36 @@ test("runtime: leftward drag on wiki_zoom_x shifts x domain toward lower values"
     .signal(`${zoomParamName("x")}_translate_delta`, { x: -80, y: 0 })
     .run();
   const after = view.scale("x").domain() as [number, number];
-  assert.ok(after[0] < initial[0], "leftward drag shifts x domain toward lower values");
+  assert.ok(after[0] < initial[0]);
   await view.finalize();
 });
 
-test("runtime: per-channel brush signals fire {field: [low, high]} extents", async () => {
+test("runtime: single 2D brush yields channel-tagged extents for both axes", async () => {
   const interactive = transform({
     ...CONTINUOUS,
-    width: 400,
-    height: 200,
+    width: 400, height: 200,
     data: { values: [{ x: 0, y: 0 }, { x: 100, y: 100 }] },
   });
   const view = await renderHeadless(interactive);
-  const capturedX: unknown[] = [];
-  const capturedY: unknown[] = [];
-  view.addSignalListener(brushParamName("x"), (_n, v) => capturedX.push(v));
-  view.addSignalListener(brushParamName("y"), (_n, v) => capturedY.push(v));
-  view.signal(`${brushParamName("x")}_tuple`, {
+  const captured: unknown[] = [];
+  view.addSignalListener(BRUSH_TUPLE_SIGNAL, (_n, value) => captured.push(value));
+  view.signal(BRUSH_TUPLE_SIGNAL, {
     unit: "",
-    fields: [{ field: "x", channel: "x", type: "R" }],
-    values: [[20, 60]],
+    fields: [
+      { field: "x", channel: "x", type: "R" },
+      { field: "y", channel: "y", type: "R" },
+    ],
+    values: [[20, 60], [10, 40]],
   }).run();
-  view.signal(`${brushParamName("y")}_tuple`, {
-    unit: "",
-    fields: [{ field: "y", channel: "y", type: "R" }],
-    values: [[10, 40]],
-  }).run();
-  assert.deepEqual(extentFromSignal(capturedX.at(-1)), [20, 60]);
-  assert.deepEqual(extentFromSignal(capturedY.at(-1)), [10, 40]);
+  const domains = tupleDomains(captured.at(-1), ["x", "y"]);
+  assert.deepEqual(domains, { x: [20, 60], y: [10, 40] });
   await view.finalize();
 });
 
-test("runtime: same-field-both-axes — both scales bind, both brush signals fire distinctly", async () => {
-  // The original reason we added (and then removed) the alias transform:
-  // Vega-Lite dedupes same-field projections. Per-channel params make each
-  // param stand on its own, so both scales bind and each channel's brush
-  // signal is independent — no alias, no rewrite, no data transform.
+test("runtime: same-field a[0] path stays interactive (no data transform injected)", async () => {
   const interactive = transform({
     mark: "point",
-    width: 400,
-    height: 200,
-    data: { values: [{ v: 0 }, { v: 10 }] },
-    encoding: {
-      x: { field: "v", type: "quantitative" },
-      y: { field: "v", type: "quantitative" },
-    },
-  });
-  const compiled = compile(interactive as never).spec;
-  const scales = (compiled.scales ?? []) as Array<Record<string, unknown>>;
-  const xScale = scales.find((s) => s.name === "x");
-  const yScale = scales.find((s) => s.name === "y");
-  assert.ok((xScale as Record<string, unknown>)?.domainRaw, "x scale must have domainRaw");
-  assert.ok((yScale as Record<string, unknown>)?.domainRaw, "y scale must have domainRaw (per-channel fix)");
-
-  const view = new View(parse(compiled), { renderer: "none" as never });
-  await view.runAsync();
-  const capturedX: unknown[] = [];
-  const capturedY: unknown[] = [];
-  view.addSignalListener(brushParamName("x"), (_n, v) => capturedX.push(v));
-  view.addSignalListener(brushParamName("y"), (_n, v) => capturedY.push(v));
-  view.signal(`${brushParamName("x")}_tuple`, {
-    unit: "",
-    fields: [{ field: "v", channel: "x", type: "R" }],
-    values: [[2, 8]],
-  }).run();
-  view.signal(`${brushParamName("y")}_tuple`, {
-    unit: "",
-    fields: [{ field: "v", channel: "y", type: "R" }],
-    values: [[3, 7]],
-  }).run();
-  assert.deepEqual(extentFromSignal(capturedX.at(-1)), [2, 8]);
-  assert.deepEqual(extentFromSignal(capturedY.at(-1)), [3, 7]);
-  await view.finalize();
-});
-
-test("runtime: same-field a[0] path stays interactive with no calculate transform", async () => {
-  // Prior alias-based fix broke this at r5 because datum["a[0]"] is a literal
-  // key lookup, not an array-index path. Per-channel design side-steps: no
-  // calculate transform is injected, so the original data reaches Vega
-  // untouched and the compiled scales bind correctly.
-  const interactive = transform({
-    mark: "point",
-    width: 400,
-    height: 200,
+    width: 400, height: 200,
     data: { values: [{ a: [5, 6] }, { a: [7, 8] }, { a: [10, 3] }] },
     encoding: {
       x: { field: "a[0]", type: "quantitative" },
@@ -222,18 +197,16 @@ test("runtime: same-field a[0] path stays interactive with no calculate transfor
   const view = await renderHeadless(interactive);
   const xDomain = view.scale("x").domain() as [number, number];
   const yDomain = view.scale("y").domain() as [number, number];
-  assert.ok(Number.isFinite(xDomain[0]) && Number.isFinite(xDomain[1]), "x domain must be numeric");
-  assert.ok(Number.isFinite(yDomain[0]) && Number.isFinite(yDomain[1]), "y domain must be numeric");
-  // No alias transform was injected — verify that.
-  assert.equal(interactive.transform, undefined, "per-channel design must not add a data transform");
+  assert.ok(Number.isFinite(xDomain[0]) && Number.isFinite(xDomain[1]));
+  assert.ok(Number.isFinite(yDomain[0]) && Number.isFinite(yDomain[1]));
+  assert.equal(interactive.transform, undefined, "no data transform injected");
   await view.finalize();
 });
 
-test("runtime: escaped-dot field path (literal `a.b` key) stays interactive", async () => {
+test("runtime: escaped-dot field path stays interactive", async () => {
   const interactive = transform({
     mark: "point",
-    width: 400,
-    height: 200,
+    width: 400, height: 200,
     data: { values: [{ "a.b": 5 }, { "a.b": 8 }, { "a.b": 12 }] },
     encoding: {
       x: { field: "a\\.b", type: "quantitative" },
@@ -251,8 +224,7 @@ test("runtime: escaped-dot field path (literal `a.b` key) stays interactive", as
 test("runtime: nested `a.b` field path stays interactive", async () => {
   const interactive = transform({
     mark: "point",
-    width: 400,
-    height: 200,
+    width: 400, height: 200,
     data: { values: [{ a: { b: 5 } }, { a: { b: 8 } }, { a: { b: 12 } }] },
     encoding: {
       x: { field: "a.b", type: "quantitative" },
@@ -276,16 +248,12 @@ test("compile: scale:null encoding drops out and the surviving spec still compil
       y: { field: "y", type: "quantitative" },
     },
   };
-  const interactivity = plotInteractivity(spec);
-  assert.equal(interactivity.mode, "full");
-  if (interactivity.mode === "full") {
-    assert.deepEqual(interactivity.channels, ["y"]);
-  }
+  assert.equal(plotInteractivity(spec).mode, "full");
   const interactive = transform(spec);
   assert.doesNotThrow(() => compile(interactive as never));
 });
 
-test("compile: composite marks (boxplot/errorbar/errorband) never enter full mode", () => {
+test("compile: composite marks never enter full mode and inject no wiki_* signals", () => {
   for (const mark of ["boxplot", "errorbar", "errorband"] as const) {
     const spec = {
       mark,
@@ -301,8 +269,57 @@ test("compile: composite marks (boxplot/errorbar/errorband) never enter full mod
     const injected = (compiled.signals ?? []).filter(
       (s: Record<string, unknown>) => typeof s.name === "string" && (s.name as string).startsWith("wiki_"),
     );
-    assert.equal(injected.length, 0, `${mark} must not inject any wiki_* signals`);
+    assert.equal(injected.length, 0, `${mark} must not inject wiki_* signals`);
   }
+});
+
+test("runtime: existing user bind:scales interval — guard preserves the user's binding", async () => {
+  // R8F1 regression: without downgrade, our wiki_zoom_x binding replaces
+  // the user's `user_pan` binding on the x scale. Verify that when the guard
+  // downgrades (no wiki_* injection), the user's interval still binds the
+  // scale — i.e. we haven't broken their interaction.
+  const spec: Record<string, unknown> = {
+    mark: "point",
+    data: { values: [{ x: 0, y: 0 }, { x: 10, y: 10 }] },
+    width: 400, height: 200,
+    encoding: {
+      x: { field: "x", type: "quantitative" },
+      y: { field: "y", type: "quantitative" },
+    },
+    params: [{ name: "user_pan", select: { type: "interval" }, bind: "scales" }],
+  };
+  assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" }, "guard must downgrade");
+  const interactive = transform(spec);
+  const compiled = compile(interactive as never).spec;
+  const xScale = (compiled.scales ?? []).find((s: Record<string, unknown>) => s.name === "x") as Record<string, unknown>;
+  const domainRaw = xScale.domainRaw as Record<string, unknown>;
+  // The user's interval STILL binds the x scale — we didn't steal it because
+  // we didn't inject wiki_zoom_x.
+  assert.equal(domainRaw.signal, `user_pan["x"]`, "user_pan retains x scale binding");
+});
+
+test("compile: guard-bypass control — force full inject alongside user bind:scales STEALS x binding", () => {
+  // Sanity for R8F1: if buildInteractiveSpec is forced to inject alongside a
+  // user bind:scales interval, the compiled x scale binds wiki_zoom_x, not
+  // user_pan — this IS the silent break the guard prevents.
+  const spec: Record<string, unknown> = {
+    mark: "point",
+    data: { values: [{ x: 1, y: 1 }] },
+    encoding: {
+      x: { field: "x", type: "quantitative" },
+      y: { field: "y", type: "quantitative" },
+    },
+    params: [{ name: "user_pan", select: { type: "interval" }, bind: "scales" }],
+  };
+  const forced = buildInteractiveSpec(spec, {
+    interactivity: { mode: "full", channels: ["x", "y"] },
+    armed: true,
+  }) as Record<string, unknown>;
+  const compiled = compile(forced as never).spec;
+  const xScale = (compiled.scales ?? []).find((s: Record<string, unknown>) => s.name === "x") as Record<string, unknown>;
+  const domainRaw = xScale.domainRaw as Record<string, unknown>;
+  assert.equal(domainRaw.signal, `${zoomParamName("x")}["x"]`,
+    "without downgrade, wiki_zoom_x steals the binding from user_pan");
 });
 
 test("parse: exact wiki_zoom name collision degrades and parses clean", () => {
@@ -313,34 +330,14 @@ test("parse: exact wiki_zoom name collision degrades and parses clean", () => {
       x: { field: "x", type: "quantitative" },
       y: { field: "y", type: "quantitative" },
     },
-    params: [{ name: ZOOM_PARAM_PREFIX, select: { type: "interval" } }],
+    params: [{ name: ZOOM_PARAM_PREFIX, value: 1 }],
   };
   assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
   const interactive = transform(spec);
   assert.doesNotThrow(() => parse(compile(interactive as never).spec));
 });
 
-test("parse: user param wiki_zoom_x_x (would collide with derived signal) degrades", () => {
-  // Our per-channel wiki_zoom_x param compiles a derived signal wiki_zoom_x_x.
-  // A user param with that exact name would parse-error with "Duplicate
-  // signal name". The prefix guard catches this via the wiki_zoom_ prefix.
-  const spec: Record<string, unknown> = {
-    mark: "point",
-    data: { values: [{ x: 1, y: 1 }] },
-    encoding: {
-      x: { field: "x", type: "quantitative" },
-      y: { field: "y", type: "quantitative" },
-    },
-    params: [{ name: `${zoomParamName("x")}_x`, value: 5 }],
-  };
-  assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
-  const interactive = transform(spec);
-  assert.doesNotThrow(() => parse(compile(interactive as never).spec));
-});
-
-test("parse: guard-bypass control — forcing full inject with wiki_zoom_x user param throws Duplicate", () => {
-  // Sanity: this is the runtime failure the collision guard is preventing.
-  // If this ever stops throwing, the guard's justification has gone away.
+test("parse: derived wiki_zoom_x_x collision (bypass) throws Duplicate signal name", () => {
   const spec: Record<string, unknown> = {
     mark: "point",
     data: { values: [{ x: 1, y: 1 }] },
@@ -354,41 +351,27 @@ test("parse: guard-bypass control — forcing full inject with wiki_zoom_x user 
     interactivity: { mode: "full", channels: ["x", "y"] },
     armed: true,
   }) as Record<string, unknown>;
-  assert.throws(
-    () => parse(compile(forced as never).spec),
-    /Duplicate signal name/,
-  );
+  assert.throws(() => parse(compile(forced as never).spec), /Duplicate signal name/);
 });
 
-test("runtime: user dataset named wiki_zoom_x_store — guard prevents source replacement", async () => {
-  // Reviewer's regression: a user top-level dataset named wiki_zoom_x_store
-  // would collide with our injected selection store. If we didn't downgrade,
-  // the first zoom update would overwrite the user's dataset with the
-  // selection tuple and any chart sourced from it would go empty.
+test("runtime: user dataset named wiki_brush_store — guard prevents source replacement", async () => {
   const spec: Record<string, unknown> = {
     mark: "point",
-    data: { name: "wiki_zoom_x_store", values: [{ x: 0, y: 0 }, { x: 10, y: 10 }] },
+    data: { name: "wiki_brush_store", values: [{ x: 0, y: 0 }, { x: 10, y: 10 }] },
     encoding: {
       x: { field: "x", type: "quantitative" },
       y: { field: "y", type: "quantitative" },
     },
   };
-  // With the guard, we stay in tooltip mode (no injection, no collision).
   assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
   const interactive = transform(spec);
   const view = await renderHeadless(interactive);
-  // The user's dataset survives — chart still has rows because we injected
-  // nothing that would collide.
-  const rows = view.data("wiki_zoom_x_store") as unknown[];
+  const rows = view.data("wiki_brush_store") as unknown[];
   assert.equal(rows.length, 2, "user dataset must remain intact");
   await view.finalize();
 });
 
-test("compile: legacy top-level `selection` spec compiles the legacy signal, downgrade prevents dead inject", () => {
-  // Without downgrading, buildInteractiveSpec would inject wiki_zoom_x etc.,
-  // but Vega-Lite compiles ONLY the legacy `selection` block and drops every
-  // injected param — the inspector would advertise interactions with no
-  // handlers.
+test("compile: legacy top-level `selection` spec — guard prevents dead inject", () => {
   const spec: Record<string, unknown> = {
     mark: "point",
     data: { values: [{ x: 1, y: 1 }] },
@@ -404,30 +387,5 @@ test("compile: legacy top-level `selection` spec compiles the legacy signal, dow
   const wikiSignals = (compiled.signals ?? []).filter(
     (s: Record<string, unknown>) => typeof s.name === "string" && (s.name as string).startsWith("wiki_"),
   );
-  assert.equal(wikiSignals.length, 0, "no wiki_* signals should be injected in tooltip mode");
-});
-
-test("compile: guard-bypass control — full inject alongside legacy selection loses every wiki_* signal", () => {
-  // Sanity for the legacy-selection guard: if buildInteractiveSpec is forced
-  // to inject alongside a legacy top-level selection, Vega-Lite silently
-  // drops every injected param. This is precisely the "advertised interaction
-  // with no handlers" failure mode the guard prevents.
-  const spec: Record<string, unknown> = {
-    mark: "point",
-    data: { values: [{ x: 1, y: 1 }] },
-    encoding: {
-      x: { field: "x", type: "quantitative" },
-      y: { field: "y", type: "quantitative" },
-    },
-    selection: { legacy_pan: { type: "interval", bind: "scales" } },
-  };
-  const forced = buildInteractiveSpec(spec, {
-    interactivity: { mode: "full", channels: ["x", "y"] },
-    armed: true,
-  }) as Record<string, unknown>;
-  const compiled = compile(forced as never).spec;
-  const wikiSignals = (compiled.signals ?? []).filter(
-    (s: Record<string, unknown>) => typeof s.name === "string" && (s.name as string).startsWith("wiki_"),
-  );
-  assert.equal(wikiSignals.length, 0, "vega-lite drops every injected param when legacy selection is present");
+  assert.equal(wikiSignals.length, 0);
 });
