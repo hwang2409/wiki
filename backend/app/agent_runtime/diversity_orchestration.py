@@ -24,6 +24,13 @@ def write_journal(path: Path, payload: Mapping[str, Any]) -> None:
     temporary.replace(path)
 
 
+def _canonical_journal_reviewer(value: Any) -> Any:
+    identity = parse_reviewer_id(str(value))
+    if identity is None or identity.lens is None:
+        return value
+    return canonical_reviewer_id(identity.ticket, identity.round, identity.lens)
+
+
 def create_journal(
     runtime_dir: Path,
     *,
@@ -41,16 +48,36 @@ def create_journal(
             existing = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
             raise RuntimeError(f"diversity journal is unreadable: {path}") from exc
+        expected_reviewers = {
+            lens: _canonical_journal_reviewer(reviewer)
+            for lens, reviewer in reviewers.items()
+        }
+        existing_reviewers = existing.get("reviewers") if isinstance(existing, Mapping) else None
+        normalized_existing_reviewers = (
+            {
+                lens: _canonical_journal_reviewer(reviewer)
+                for lens, reviewer in existing_reviewers.items()
+            }
+            if isinstance(existing_reviewers, Mapping)
+            else existing_reviewers
+        )
         expected = {
             "ticket": ticket.upper(),
             "round": round_number,
             "expected_sha": expected_sha.lower(),
             "expected_lenses": sorted(expected_lenses),
-            "reviewers": dict(sorted(reviewers.items())),
+            "reviewers": dict(sorted(expected_reviewers.items())),
         }
-        if not isinstance(existing, Mapping) or any(existing.get(key) != value for key, value in expected.items()):
+        if not isinstance(existing, Mapping) or any(
+            (normalized_existing_reviewers if key == "reviewers" else existing.get(key)) != value
+            for key, value in expected.items()
+        ):
             raise RuntimeError(f"diversity journal intent changed: {path}")
         return path
+    canonical_reviewers = {
+        lens: _canonical_journal_reviewer(reviewer)
+        for lens, reviewer in reviewers.items()
+    }
     write_journal(
         path,
         {
@@ -58,7 +85,7 @@ def create_journal(
             "round": round_number,
             "expected_sha": expected_sha.lower(),
             "expected_lenses": sorted(expected_lenses),
-            "reviewers": dict(sorted(reviewers.items())),
+            "reviewers": dict(sorted(canonical_reviewers.items())),
             "orch": orch,
             "verdicts": {},
             "created_at": created_at or datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -106,6 +133,7 @@ def collect_diversity_verdict(
     identity = parse_reviewer_id(reviewer)
     if identity is None or identity.lens is None or identity.lens == "synthesis":
         return None
+    reviewer = canonical_reviewer_id(identity.ticket, identity.round, identity.lens)
     path = journal_path(runtime_dir, ticket, identity.round)
     if not path.is_file():
         raise RuntimeError(f"diversity journal is missing: {path}")
@@ -119,7 +147,9 @@ def collect_diversity_verdict(
     reviewers = journal.get("reviewers")
     if not isinstance(expected_lenses, list) or not isinstance(reviewers, Mapping):
         raise RuntimeError(f"diversity journal lacks its expected lens set: {path}")
-    if identity.lens not in expected_lenses or reviewers.get(identity.lens) != reviewer:
+    journal_reviewer = reviewers.get(identity.lens)
+    journal_reviewer = _canonical_journal_reviewer(journal_reviewer)
+    if identity.lens not in expected_lenses or journal_reviewer != reviewer:
         raise RuntimeError(f"reviewer is not in the diversity journal: {reviewer}")
     journal_sha = str(journal.get("expected_sha") or "").lower()
     caller_sha_mismatch = expected_sha is not None and str(expected_sha).lower() != journal_sha
@@ -218,6 +248,8 @@ def run_diverse_review(
     archived: Callable[[], list[Mapping[str, Any]]] | None,
     registry: Callable[[], Mapping[str, Any]] | None,
     status_reader: Callable[[str], Mapping[str, Any] | None] | None,
+    implicit_request_id: bool = False,
+    backend_base_url: str | None = None,
 ) -> dict[str, Any]:
     """Stage, provision, spawn, and archive one complete lens fan-out."""
 
@@ -321,9 +353,16 @@ def run_diverse_review(
             workdir=details["worktree"],
             prompt=details["prompt"],
             orch=staged["orch"],
-            request_id=f"{staged['request_id']}:{lens}",
+            request_id=runtime._child_spawn_request_id(  # noqa: SLF001
+                staged["request_id"], details["reviewer"]
+            ),
+            implicit_request_id=implicit_request_id,
         )
-        result = spawn(spawn_args) if spawn is not None else main.spawn_agent(spawn_args)
+        result = (
+            spawn(spawn_args)
+            if spawn is not None
+            else main.spawn_agent(spawn_args, backend_base_url=backend_base_url)
+        )
         return lens, result
 
     with ThreadPoolExecutor(max_workers=len(pending) or 1) as executor:

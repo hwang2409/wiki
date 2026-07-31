@@ -25,7 +25,12 @@ from urllib.parse import urlparse
 
 from .graph_health import load_validated_graph
 from .loop_state import derive_loop_state
-from .ticket import base_ticket, parse_reviewer_id
+from .ticket import (
+    base_ticket,
+    parse_reviewer_id,
+    reviewer_id as canonical_reviewer_id,
+    reviewer_id_candidates,
+)
 from .autopilot_actions import steer_action_id, verdict_edge_id
 from .autopilot_parser import (
     Finding,
@@ -420,7 +425,7 @@ class AutopilotController:
             graph = self.graph_loader(ticket) or graph
             diversity_reviewers = self._diversity_reviewers(graph, ticket, identity.round)
         current_reviewer = self._current_reviewer(graph)
-        if diversity_report is None and current_reviewer != reviewer:
+        if diversity_report is None and not self._same_reviewer(current_reviewer, reviewer):
             self._log(
                 state,
                 "reviewer-verdict-ignored-stale-reviewer",
@@ -748,6 +753,20 @@ class AutopilotController:
         return max(candidates)[2] if candidates else None
 
     @staticmethod
+    def _same_reviewer(left: str | None, right: str | None) -> bool:
+        if left is None or right is None:
+            return left == right
+        left_identity = parse_reviewer_id(left)
+        right_identity = parse_reviewer_id(right)
+        if left_identity is None or right_identity is None:
+            return left == right
+        return canonical_reviewer_id(
+            left_identity.ticket, left_identity.round, left_identity.lens
+        ) == canonical_reviewer_id(
+            right_identity.ticket, right_identity.round, right_identity.lens
+        )
+
+    @staticmethod
     def _diversity_reviewers(
         graph: Mapping[str, Any] | None, ticket: str, round_number: int
     ) -> list[str]:
@@ -770,7 +789,9 @@ class AutopilotController:
                 and identity.round == round_number
                 and identity.lens not in {None, "synthesis"}
             ):
-                reviewers.add(candidate)
+                reviewers.add(
+                    canonical_reviewer_id(identity.ticket, identity.round, identity.lens)
+                )
         return sorted(reviewers)
 
     def _latest_verdict(
@@ -781,16 +802,19 @@ class AutopilotController:
     ) -> Verdict | None:
         if not graph:
             return None
+        wanted_reviewer = reviewer.upper() if reviewer is not None else None
         for edge in reversed(graph.get("edges", [])):
             if (
                 isinstance(edge, Mapping)
                 and edge.get("kind") == "verdict"
                 and isinstance(edge.get("payload"), Mapping)
                 and (
-                    reviewer is None
-                    or edge.get("from") == reviewer
-                    or edge["payload"].get("worker") == reviewer
-                    or edge["payload"].get("reviewer") == reviewer
+                    wanted_reviewer is None
+                    or str(edge.get("from") or "").upper() == wanted_reviewer
+                    or str(edge["payload"].get("worker") or "").upper()
+                    == wanted_reviewer
+                    or str(edge["payload"].get("reviewer") or "").upper()
+                    == wanted_reviewer
                 )
             ):
                 return verdict_from_graph(edge["payload"])
@@ -839,25 +863,32 @@ class AutopilotController:
         *,
         source_sha: str | None = None,
     ) -> Verdict | None:
-        path = (
-            Path(artifact_path)
+        default_paths = [
+            Path("/tmp") / f"{candidate}-verdict.json"
+            for candidate in reviewer_id_candidates(reviewer)
+        ]
+        paths = (
+            [Path(artifact_path), *default_paths]
             if isinstance(artifact_path, str) and artifact_path
-            else Path("/tmp") / f"{reviewer}-verdict.json"
+            else default_paths
         )
-        try:
-            raw = path.read_text(encoding="utf-8")
-        except OSError:
-            return None
-        try:
-            value = json.loads(raw)
-        except ValueError:
-            return parse_verdict(raw)
-        if not isinstance(value, Mapping):
-            return None
-        text = value.get("text") or value.get("content")
-        if isinstance(text, str):
-            return parse_verdict(text)
-        return verdict_from_graph(value)
+        paths = list(dict.fromkeys(paths))
+        for path in paths:
+            try:
+                raw = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            try:
+                value = json.loads(raw)
+            except ValueError:
+                return parse_verdict(raw)
+            if not isinstance(value, Mapping):
+                continue
+            text = value.get("text") or value.get("content")
+            if isinstance(text, str):
+                return parse_verdict(text)
+            return verdict_from_graph(value)
+        return None
 
     def _orchestrator(self, ticket: str, graph: Mapping[str, Any] | None) -> str | None:
         if graph and isinstance(graph.get("orch"), str):
@@ -921,9 +952,24 @@ class AutopilotController:
         }
 
     @staticmethod
+    def _default_backend_base_url() -> str | None:
+        from .. import backend_runtime
+
+        configured = os.environ.get("WIKI_BACKEND_URL")
+        if configured:
+            try:
+                return backend_runtime.normalize_loopback_url(configured)
+            except ValueError:
+                pass
+        return backend_runtime.read_backend_url()
+
+    @staticmethod
     def _default_next_review(**kwargs: Any) -> Mapping[str, Any]:
         from .next_review import next_review
 
+        kwargs.setdefault(
+            "backend_base_url", AutopilotController._default_backend_base_url()
+        )
         return next_review(**kwargs)
 
     def _default_record_verdict(

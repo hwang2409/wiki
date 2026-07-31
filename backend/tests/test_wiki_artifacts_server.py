@@ -346,6 +346,61 @@ class WikiArtifactsTests(unittest.TestCase):
         self.assertEqual(calls[0][2]["request_id"], "mcp-next-review-1")
         self.assertEqual(calls[0][2]["diversity"], ["correctness", "security"])
 
+    def test_slow_agent_operations_use_extended_backend_timeout(self) -> None:
+        timeouts: list[float] = []
+
+        def request_json(
+            _base_url: str,
+            _method: str,
+            _path: str,
+            _payload: dict | None = None,
+            *,
+            timeout: float,
+        ) -> dict:
+            timeouts.append(timeout)
+            return {"status": "accepted", "run_id": "slow-start"}
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "WIKI_AGENT_ROLE": "orchestrator",
+                    "WIKI_AGENT_ID": "wiki",
+                    "WIKI_BACKEND_URL": "http://127.0.0.1:43112",
+                },
+            ),
+            mock.patch.object(
+                wiki_agent_tools.backend_runtime,
+                "request_json",
+                side_effect=request_json,
+            ),
+        ):
+            wiki_agent_tools.spawn_agent(
+                {
+                    "ticket": "WIKI-SLOW-SPAWN",
+                    "kind": "cdx",
+                    "role": "implement",
+                    "model": "gpt-5.4",
+                    "effort": "high",
+                    "workdir": "/tmp/worktree",
+                    "prompt": "start slowly",
+                    "orch": "wiki",
+                }
+            )
+            wiki_agent_tools.next_review(
+                {
+                    "ticket": "WIKI-SLOW-REVIEW",
+                    "pr_number": 226,
+                    "expected_sha": "a" * 40,
+                }
+            )
+
+        self.assertEqual(
+            timeouts,
+            [wiki_agent_tools.SLOW_AGENT_OPERATION_TIMEOUT_SECONDS] * 2,
+        )
+        self.assertGreater(timeouts[0], 15)
+
     def test_next_review_canonical_handler_routes_combined_verdict(self) -> None:
         runtime_dir = self.root / "runtime"
         status_dir = self.root / "status"

@@ -29,6 +29,7 @@ from .types import LifecycleState, ProviderKind, RunRecord
 
 
 IdentityResolver = Callable[..., Awaitable[ProviderProcessIdentity | None]]
+_IDENTITY_VERIFY_DELAYS_SECONDS = (0.1, 0.2, 0.4, 0.8, 1.0, 1.0, 1.0, 1.0, 1.0)
 
 
 @dataclass
@@ -605,7 +606,7 @@ class CodexAppServerAdapter(ProviderAdapter):
         wrapper_pid = (
             self._process.pid if self._process_is_alive() and self._process else None
         )
-        attempts = 10 if required else 1
+        attempts = len(_IDENTITY_VERIFY_DELAYS_SECONDS) + 1 if required else 1
         for attempt in range(attempts):
             identity = await self.identity_resolver(
                 wrapper_pid,
@@ -618,7 +619,7 @@ class CodexAppServerAdapter(ProviderAdapter):
                 self._transcript_path = identity.transcript_path
                 return
             if attempt + 1 < attempts:
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(_IDENTITY_VERIFY_DELAYS_SECONDS[attempt])
         if required:
             raise ProviderProcessError(
                 "Codex provider PID/transcript could not be verified from open handles"
