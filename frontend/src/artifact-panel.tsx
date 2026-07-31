@@ -70,7 +70,7 @@ export function ArtifactPanel({
       if (focusedId) onCloseTab(focusedId);
       return;
     }
-    if (command && event.key === "0" && ["image", "svg", "mermaid", "pdf"].includes(artifact?.kind ?? "")) {
+    if (command && event.key === "0" && ["image", "svg", "mermaid", "pdf", "plot"].includes(artifact?.kind ?? "")) {
       event.preventDefault();
       event.currentTarget.querySelector<HTMLButtonElement>("[data-panel-reset-zoom]")?.click();
       return;

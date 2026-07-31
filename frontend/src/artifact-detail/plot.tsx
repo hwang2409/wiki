@@ -54,6 +54,7 @@ export function PlotArtifactDetail({ spec, title }: { spec: Record<string, unkno
           onClick={onReset}
           disabled={!canInteract}
           aria-label="Reset zoom"
+          data-panel-reset-zoom
         >
           <RotateCcw size={12} /> Reset zoom
         </button>
