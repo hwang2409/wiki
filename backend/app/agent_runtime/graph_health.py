@@ -15,6 +15,9 @@ from .ticket import base_ticket
 logger = logging.getLogger(__name__)
 
 
+GRAPH_UNAVAILABLE_SPAWN_GRACE_SECONDS = 30.0
+
+
 def _workgraph_module():
     """Load graph support lazily so backend-only daemon bundles still boot."""
 
@@ -151,26 +154,39 @@ class GraphHealthMonitor:
         """Run the detector once for each normalized ticket represented by views."""
 
         by_ticket: dict[str, Any] = {}
+        views_by_ticket: dict[str, list[Any]] = {}
         for view in views:
             ticket = base_ticket(view.record.agent_id)
+            views_by_ticket.setdefault(ticket, []).append(view)
             prior = by_ticket.get(ticket)
             if prior is None or view.record.agent_id == ticket:
                 by_ticket[ticket] = view
 
         results: list[Any] = []
         for ticket, view in by_ticket.items():
+            ticket_views = views_by_ticket[ticket]
             graph = self.load_graph(ticket)
             if graph is None:
-                results.extend(await self._maybe_graph_unavailable(ticket, view, now))
+                results.extend(
+                    await self._maybe_graph_unavailable(
+                        ticket, view, ticket_views, now
+                    )
+                )
                 continue
             state = self.snapshots.setdefault(ticket, GraphHealthSnapshot())
             if ticket in self._degraded_tickets:
-                results.extend(await self._maybe_graph_unavailable(ticket, view, now))
+                results.extend(
+                    await self._maybe_graph_unavailable(
+                        ticket, view, ticket_views, now
+                    )
+                )
             else:
                 state.graph_unavailable_active = False
                 state.last_graph_unavailable_alarm_at = None
             try:
-                result = await self._maybe_graph_health(ticket, view, graph, now)
+                result = await self._maybe_graph_health(
+                    ticket, view, ticket_views, graph, now
+                )
             except Exception:
                 logger.exception("fleet_monitor: graph health scan failed for %s", ticket)
                 continue
@@ -292,8 +308,84 @@ class GraphHealthMonitor:
             marker = cls._latest_verdict_marker(graph) or "blocking-no-reviewer"
         return cls._episode_digest(f"{condition}:{marker}")
 
+    @staticmethod
+    def _recent(timestamp: float | None, now: float, threshold: float) -> bool:
+        if timestamp is None:
+            return False
+        age = now - timestamp
+        return 0 <= age < threshold
+
+    @classmethod
+    def _newest_spawn_age(cls, views: list[Any], now: float) -> float | None:
+        graph_module = _workgraph_module()
+        newest: float | None = None
+        for view in views:
+            timestamp = graph_module._parse_ts(  # noqa: SLF001
+                getattr(view.record, "created_at", None)
+            )
+            if timestamp is not None and (newest is None or timestamp > newest):
+                newest = timestamp
+        return now - newest if newest is not None else None
+
+    @staticmethod
+    def _run_event_mtimes(view: Any, store: Any) -> list[float]:
+        timestamps: list[float] = []
+        for method_name in ("raw_events_path", "normalized_events_path"):
+            path_factory = getattr(store, method_name, None)
+            if not callable(path_factory):
+                continue
+            try:
+                timestamps.append(path_factory(view.record.run_id).stat().st_mtime)
+            except (FileNotFoundError, OSError):
+                continue
+        return timestamps
+
+    @classmethod
+    def _stall_activity_is_fresh(
+        cls,
+        graph: dict[str, Any],
+        views: list[Any],
+        store: Any,
+        now: float,
+        threshold: float,
+    ) -> bool:
+        graph_module = _workgraph_module()
+        candidates: list[tuple[float, str]] = []
+        for node in graph_module._live_worker_nodes(graph):  # noqa: SLF001
+            node_id = node.get("id") if isinstance(node, dict) else None
+            if not isinstance(node_id, str):
+                continue
+            latest: float | None = None
+            for edge in graph.get("edges", []):
+                if not isinstance(edge, dict) or node_id not in (
+                    edge.get("from"),
+                    edge.get("to"),
+                ):
+                    continue
+                timestamp = graph_module._parse_ts(edge.get("created_at"))  # noqa: SLF001
+                if timestamp is not None and (latest is None or timestamp > latest):
+                    latest = timestamp
+            if latest is not None:
+                candidates.append((latest, node_id))
+        if not candidates:
+            return False
+        stalled_node = min(candidates)[1]
+        matching_views = [
+            view for view in views if view.record.agent_id == stalled_node
+        ] or views
+        for view in matching_views:
+            activity = [view.status_mtime]
+            updated_at = graph_module._parse_ts(  # noqa: SLF001
+                getattr(view.record, "updated_at", None)
+            )
+            activity.append(updated_at)
+            activity.extend(cls._run_event_mtimes(view, store))
+            if any(cls._recent(timestamp, now, threshold) for timestamp in activity):
+                return True
+        return False
+
     async def _maybe_graph_unavailable(
-        self, ticket: str, view: Any, now: float
+        self, ticket: str, view: Any, views: list[Any], now: float
     ) -> list[Any]:
         state = self.snapshots.setdefault(ticket, GraphHealthSnapshot())
         if state.last_clock is not None and now < state.last_clock:
@@ -304,6 +396,10 @@ class GraphHealthMonitor:
             state.graph_unavailable_active = True
             state.graph_unavailable_episode += 1
             state.last_graph_unavailable_alarm_at = None
+        spawn_age = self._newest_spawn_age(views, now)
+        if spawn_age is not None and 0 <= spawn_age < GRAPH_UNAVAILABLE_SPAWN_GRACE_SECONDS:
+            state.last_graph_unavailable_alarm_at = None
+            return []
         last = state.last_graph_unavailable_alarm_at
         if last is not None and now - last < self.graph_health_realarm:
             return []
@@ -325,7 +421,12 @@ class GraphHealthMonitor:
         return []
 
     async def _maybe_graph_health(
-        self, ticket: str, view: Any, graph: dict[str, Any], now: float
+        self,
+        ticket: str,
+        view: Any,
+        views: list[Any],
+        graph: dict[str, Any],
+        now: float,
     ) -> list[Any]:
         graph_module = _workgraph_module()
         state = self.snapshots.setdefault(ticket, GraphHealthSnapshot())
@@ -398,7 +499,14 @@ class GraphHealthMonitor:
                 state.stall_append_acknowledged = False
                 state.stall_notification_sent = False
             stall = health.get("slowest_node_stall_seconds", 0)
-            if not state.stall_append_acknowledged:
+            stall_activity_fresh = self._stall_activity_is_fresh(
+                graph,
+                views,
+                self.store,
+                now,
+                graph_module.STALL_ALARM_SECONDS,
+            )
+            if not stall_activity_fresh and not state.stall_append_acknowledged:
                 state.stall_append_acknowledged = await self._append_escalation(
                     ticket,
                     view,
@@ -409,7 +517,11 @@ class GraphHealthMonitor:
                     graph=graph,
                     now=now,
                 )
-            if state.stall_append_acknowledged and not state.stall_notification_sent:
+            if (
+                not stall_activity_fresh
+                and state.stall_append_acknowledged
+                and not state.stall_notification_sent
+            ):
                 notif = await self.emit(
                     view,
                     event_type="graph-health-stall",
