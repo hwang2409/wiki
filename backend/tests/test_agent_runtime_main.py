@@ -28,6 +28,7 @@ from backend.app.agent_runtime.fake import FixtureAdapterFactory
 from backend.app.agent_runtime.protocol import UnixSupervisorServer
 from backend.app.agent_runtime.store import RunStore, RuntimePaths
 from backend.app.agent_runtime.supervisor import Supervisor
+from backend.app.agent_runtime.types import LifecycleState
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "agent_runtime"
@@ -1432,6 +1433,7 @@ class BackendSupervisorEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.patchers = [
             mock.patch.object(main, "AGENT_REGISTRY_PATH", self.paths.registry_path),
             mock.patch.object(main, "AGENT_STATUS_DIR", self.root / "status"),
+            mock.patch.object(main, "AGENT_RUNTIME_DIR", self.paths.runtime_dir),
             mock.patch.object(main, "AGENT_ARCHIVE_DIR", self.root / "archive"),
             mock.patch.object(main, "AGENT_TMP_DIR", self.root / "tmp"),
             mock.patch.object(main, "MSG_QUEUE_PATH", self.root / "legacy-queue.json"),
@@ -1607,6 +1609,83 @@ class BackendSupervisorEndToEndTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(second, first)
         self.assertEqual(second["request_id"], first["request_id"])
+
+    async def test_implicit_next_review_round_uses_new_supervisor_child_id(self) -> None:
+        self.paths.registry_path.write_text(
+            json.dumps({"_orchestrators": {"wiki": {"kind": "cc"}}}),
+            encoding="utf-8",
+        )
+
+        def worktree(**values: object) -> Path:
+            path = self.root / f"review-{values['round_number']}"
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+
+        kwargs = {
+            "ticket": "WIKI-226-ROUND",
+            "pr_number": 226,
+            "expected_sha": "a" * 40,
+            "orch": "wiki",
+            "gate": lambda _pr, _sha: {"verdict": "pass"},
+            "resolve_root": lambda _orch: self.root,
+            "worktree": worktree,
+            "archived": lambda: [],
+            "registry": lambda: main._read_agent_registry(),  # noqa: SLF001
+            "status_reader": lambda _reviewer: None,
+        }
+        first = await asyncio.to_thread(next_review_module.next_review, **kwargs)
+        self.store.transition(first["run_id"], LifecycleState.COMPLETED)
+        second = await asyncio.to_thread(next_review_module.next_review, **kwargs)
+
+        self.assertEqual(first["reviewer"], "WIKI-226-ROUND-REVIEW1")
+        self.assertEqual(second["reviewer"], "WIKI-226-ROUND-REVIEW2")
+        self.assertNotEqual(second["run_id"], first["run_id"])
+        self.assertEqual(
+            self.store.current_run_id("WIKI-226-ROUND-REVIEW2"),
+            second["run_id"],
+        )
+
+    async def test_implicit_diversity_round_uses_new_supervisor_child_ids(self) -> None:
+        self.paths.registry_path.write_text(
+            json.dumps({"_orchestrators": {"wiki": {"kind": "cc"}}}),
+            encoding="utf-8",
+        )
+
+        def worktree(**values: object) -> Path:
+            path = self.root / f"{values['lens']}-{values['round_number']}"
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+
+        kwargs = {
+            "ticket": "WIKI-226-DIVERSE",
+            "pr_number": 226,
+            "expected_sha": "b" * 40,
+            "orch": "wiki",
+            "diversity": ["correctness", "security"],
+            "gate": lambda _pr, _sha: {"verdict": "pass"},
+            "resolve_root": lambda _orch: self.root,
+            "worktree": worktree,
+            "archived": lambda: [],
+            "registry": lambda: main._read_agent_registry(),  # noqa: SLF001
+            "status_reader": lambda _reviewer: None,
+        }
+        first = await asyncio.to_thread(next_review_module.next_review, **kwargs)
+        for reviewer in first["reviewers"]:
+            self.store.transition(reviewer["run_id"], LifecycleState.COMPLETED)
+        second = await asyncio.to_thread(next_review_module.next_review, **kwargs)
+
+        self.assertEqual(
+            {item["reviewer"] for item in second["reviewers"]},
+            {
+                "WIKI-226-DIVERSE-REVIEW2-correctness",
+                "WIKI-226-DIVERSE-REVIEW2-security",
+            },
+        )
+        for reviewer in second["reviewers"]:
+            self.assertEqual(
+                self.store.current_run_id(reviewer["reviewer"].upper()),
+                reviewer["run_id"],
+            )
 
 
 class DetachedHeadlessAcceptanceTests(unittest.TestCase):

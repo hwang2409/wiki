@@ -65,7 +65,7 @@ from .agent_runtime import costs
 from .agent_runtime import graph_health
 from .agent_runtime.loop_state import derive_loop_state
 from .agent_runtime.store import RuntimePaths
-from .agent_runtime.ticket import base_ticket
+from .agent_runtime.ticket import base_ticket, parse_reviewer_id
 from .agent_runtime.unknown_kind_telemetry import UnknownKindTelemetry
 from .agent_runtime.version import RUNTIME_FINGERPRINT
 from .frontend_static import mount_frontend_static
@@ -4584,8 +4584,12 @@ def spawn_agent(
 ) -> dict[str, object]:
     body = cast(SpawnWorkerIn, _coerce_request_model(body, SpawnWorkerIn))
     ticket = body.ticket.strip()
-    if not ticket or not SPAWN_TICKET_PATTERN.fullmatch(ticket):
+    if not ticket or (
+        not SPAWN_TICKET_PATTERN.fullmatch(ticket)
+        and parse_reviewer_id(ticket) is None
+    ):
         raise HTTPException(status_code=400, detail="Ticket must be uppercase letters, numbers, or dashes")
+    ticket = ticket.upper()
 
     kind = body.kind.strip()
     if kind not in {"cdx", "cc"}:

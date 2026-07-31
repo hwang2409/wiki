@@ -323,7 +323,9 @@ def run_diverse_review(
             workdir=details["worktree"],
             prompt=details["prompt"],
             orch=staged["orch"],
-            request_id=f"{staged['request_id']}:{lens}",
+            request_id=runtime._child_spawn_request_id(  # noqa: SLF001
+                staged["request_id"], details["reviewer"]
+            ),
             implicit_request_id=implicit_request_id,
         )
         result = (

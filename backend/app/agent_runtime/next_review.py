@@ -122,6 +122,15 @@ def _stable_request_id(
     return f"next-review-{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
 
 
+def _child_spawn_request_id(request_id: str, reviewer_id: str) -> str:
+    canonical = json.dumps(
+        {"operation_id": request_id, "reviewer": reviewer_id},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"next-review-spawn-{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
+
+
 def _resolve_root(orch: str) -> Path:
     return _main()._resolve_orchestrator_root(orch)  # noqa: SLF001
 
@@ -492,7 +501,9 @@ def next_review(
                     workdir=staged["worktree"],
                     prompt=staged["prompt"],
                     orch=staged["orch"],
-                    request_id=staged["request_id"],
+                    request_id=_child_spawn_request_id(
+                        staged["request_id"], staged["reviewer"]
+                    ),
                     implicit_request_id=implicit_request_id,
                 )
                 spawn_result = (
@@ -616,7 +627,7 @@ def next_review(
             workdir=str(worktree_path),
             prompt=prompt,
             orch=orch,
-            request_id=request_id,
+            request_id=_child_spawn_request_id(request_id, reviewer_id),
             implicit_request_id=implicit_request_id,
         )
         spawn_result = (
