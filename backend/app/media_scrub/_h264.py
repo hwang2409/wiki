@@ -407,14 +407,22 @@ def _parse_and_emit_sps_rbsp(
                     size = 16 if i < 6 else 64
                     _copy_scaling_list(reader, writer, size)
 
-    writer.write_ue(reader.read_ue())  # log2_max_frame_num_minus4
+    log2_max_frame_num_minus4 = reader.read_ue()
+    if log2_max_frame_num_minus4 > 12:
+        raise MediaScrubError("h264 sps log2_max_frame_num_minus4 out of range")
+    writer.write_ue(log2_max_frame_num_minus4)
 
     pic_order_cnt_type = reader.read_ue()
     if pic_order_cnt_type > 2:
         raise MediaScrubError("h264 sps pic_order_cnt_type out of range")
     writer.write_ue(pic_order_cnt_type)
     if pic_order_cnt_type == 0:
-        writer.write_ue(reader.read_ue())  # log2_max_pic_order_cnt_lsb_minus4
+        log2_max_pic_order_cnt_lsb_minus4 = reader.read_ue()
+        if log2_max_pic_order_cnt_lsb_minus4 > 12:
+            raise MediaScrubError(
+                "h264 sps log2_max_pic_order_cnt_lsb_minus4 out of range"
+            )
+        writer.write_ue(log2_max_pic_order_cnt_lsb_minus4)
     elif pic_order_cnt_type == 1:
         writer.write_u1(reader.read_u1())  # delta_pic_order_always_zero_flag
         writer.write_se(reader.read_se())  # offset_for_non_ref_pic
@@ -573,13 +581,32 @@ def _parse_and_emit_pps_rbsp(rbsp: bytes) -> tuple[bytes, int, int]:
             for _ in range(pic_size_in_map_units_minus1 + 1):
                 writer.write_bits(reader.read_bits(bit_width), bit_width)
 
-    writer.write_ue(reader.read_ue())  # num_ref_idx_l0_default_active_minus1
-    writer.write_ue(reader.read_ue())  # num_ref_idx_l1_default_active_minus1
+    num_ref_idx_l0_default_active_minus1 = reader.read_ue()
+    num_ref_idx_l1_default_active_minus1 = reader.read_ue()
+    if (
+        num_ref_idx_l0_default_active_minus1 > 31
+        or num_ref_idx_l1_default_active_minus1 > 31
+    ):
+        raise MediaScrubError("h264 pps default reference count out of range")
+    writer.write_ue(num_ref_idx_l0_default_active_minus1)
+    writer.write_ue(num_ref_idx_l1_default_active_minus1)
     writer.write_u1(reader.read_u1())  # weighted_pred_flag
-    writer.write_bits(reader.read_bits(2), 2)  # weighted_bipred_idc
-    writer.write_se(reader.read_se())  # pic_init_qp_minus26
-    writer.write_se(reader.read_se())  # pic_init_qs_minus26
-    writer.write_se(reader.read_se())  # chroma_qp_index_offset
+    weighted_bipred_idc = reader.read_bits(2)
+    if weighted_bipred_idc > 2:
+        raise MediaScrubError("h264 pps weighted_bipred_idc out of range")
+    writer.write_bits(weighted_bipred_idc, 2)
+    pic_init_qp_minus26 = reader.read_se()
+    pic_init_qs_minus26 = reader.read_se()
+    chroma_qp_index_offset = reader.read_se()
+    if not -26 <= pic_init_qp_minus26 <= 25:
+        raise MediaScrubError("h264 pps pic_init_qp_minus26 out of range")
+    if not -26 <= pic_init_qs_minus26 <= 25:
+        raise MediaScrubError("h264 pps pic_init_qs_minus26 out of range")
+    if not -12 <= chroma_qp_index_offset <= 12:
+        raise MediaScrubError("h264 pps chroma_qp_index_offset out of range")
+    writer.write_se(pic_init_qp_minus26)
+    writer.write_se(pic_init_qs_minus26)
+    writer.write_se(chroma_qp_index_offset)
     writer.write_u1(reader.read_u1())  # deblocking_filter_control_present_flag
     writer.write_u1(reader.read_u1())  # constrained_intra_pred_flag
     writer.write_u1(reader.read_u1())  # redundant_pic_cnt_present_flag
@@ -598,7 +625,12 @@ def _parse_and_emit_pps_rbsp(rbsp: bytes) -> tuple[bytes, int, int]:
             raise MediaScrubError(
                 "h264 pps carries scaling matrix without SPS context; rejected"
             )
-        writer.write_se(reader.read_se())  # second_chroma_qp_index_offset
+        second_chroma_qp_index_offset = reader.read_se()
+        if not -12 <= second_chroma_qp_index_offset <= 12:
+            raise MediaScrubError(
+                "h264 pps second_chroma_qp_index_offset out of range"
+            )
+        writer.write_se(second_chroma_qp_index_offset)
 
     reader.read_rbsp_trailing_bits()
     writer.write_rbsp_trailing_bits()

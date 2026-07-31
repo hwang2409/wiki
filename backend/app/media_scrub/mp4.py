@@ -2202,23 +2202,18 @@ def _rebuild_visual_sample_entry_fixed(entry_bytes: bytes) -> bytes:
     # 2 pre_defined + 2 reserved + 12 pre_defined = 16 bytes of zeros
     width = struct.unpack(">H", body[16:18])[0]
     height = struct.unpack(">H", body[18:20])[0]
-    horiz_res = struct.unpack(">I", body[20:24])[0]
-    vert_res = struct.unpack(">I", body[24:28])[0]
     # 4 bytes reserved
-    frame_count = struct.unpack(">H", body[32:34])[0]
     # compressor_name is a Pascal string (1 length byte + up to 31 chars,
     # zero padded to 32). This can carry the encoder identity ("Lavc..."),
     # so we drop it entirely — 32 bytes of zeros.
-    depth = struct.unpack(">H", body[66:68])[0]
-    pre_defined = struct.unpack(">h", body[68:70])[0]
     return (
         b"\x00" * 16
         + struct.pack(">HH", width, height)
-        + struct.pack(">II", horiz_res, vert_res)
+        + struct.pack(">II", 0x00480000, 0x00480000)
         + b"\x00" * 4
-        + struct.pack(">H", frame_count)
+        + struct.pack(">H", 1)
         + b"\x00" * 32
-        + struct.pack(">Hh", depth, pre_defined)
+        + struct.pack(">Hh", 0x0018, -1)
     )
 
 

@@ -564,7 +564,7 @@ class ApeV2ValidLayoutTests(unittest.TestCase):
         return struct.pack("<II", len(value), 0) + b"LOCATION\x00" + value
 
     @classmethod
-    def _payload(cls, *, footer: bool) -> bytes:
+    def _audio(cls) -> bytes:
         base = REAL_MP3.read_bytes()
         if base.startswith(b"ID3"):
             tag_size = sum(
@@ -572,6 +572,11 @@ class ApeV2ValidLayoutTests(unittest.TestCase):
                 for byte, shift in zip(base[6:10], (21, 14, 7, 0))
             )
             base = base[10 + tag_size :]
+        return base
+
+    @classmethod
+    def _payload(cls, *, footer: bool) -> bytes:
+        base = cls._audio()
         item = cls._item(b"ape-round35-marker")
         tag_size = 32 + len(item)
         parts = [
@@ -594,6 +599,53 @@ class ApeV2ValidLayoutTests(unittest.TestCase):
                 result = media_scrub.scrub_audio(payload, "audio/mpeg")
                 self.assertNotIn(b"APETAGEX", result.data)
                 self.assertNotIn(b"ape-round35-marker", result.data)
+                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as handle:
+                    handle.write(result.data)
+                    path = handle.name
+                try:
+                    probe = subprocess.run(
+                        [FFMPEG, "-v", "error", "-i", path, "-f", "null", "-"],
+                        capture_output=True,
+                        timeout=30,
+                    )
+                    self.assertEqual(
+                        probe.returncode, 0,
+                        probe.stderr.decode(errors="replace"),
+                    )
+                finally:
+                    Path(path).unlink(missing_ok=True)
+
+    @classmethod
+    def _trailing_payload(cls, *, header: bool) -> bytes:
+        item = cls._item(b"ape-round36-trailing-marker")
+        tag_size = 32 + len(item)
+        parts = [cls._audio()]
+        if header:
+            parts.append(
+                cls._preamble(
+                    flags=(1 << 29) | (1 << 31),
+                    tag_size=tag_size,
+                )
+            )
+        parts.extend(
+            (
+                item,
+                cls._preamble(
+                    flags=(1 << 31) if header else 0,
+                    tag_size=tag_size,
+                ),
+            )
+        )
+        return b"".join(parts)
+
+    @unittest.skipIf(FFMPEG is None, "ffmpeg not installed")
+    def test_trailing_footer_only_and_header_footer_are_removed(self) -> None:
+        for header in (False, True):
+            with self.subTest(header=header):
+                payload = self._trailing_payload(header=header)
+                result = media_scrub.scrub_audio(payload, "audio/mpeg")
+                self.assertNotIn(b"APETAGEX", result.data)
+                self.assertNotIn(b"ape-round36-trailing-marker", result.data)
                 with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as handle:
                     handle.write(result.data)
                     path = handle.name
@@ -3277,7 +3329,6 @@ class Review20MediaProbeTests(unittest.TestCase):
         body = bytearray(real[body_start:atom_start + old_size])
         body[6:8] = struct.pack(">H", len(sps))
         body[8:8 + old_sps_len] = sps
-        del body[8 + len(sps):8 + len(sps) + max(0, old_sps_len - len(sps))]
         replacement = struct.pack(">I", 8 + len(body)) + b"avcC" + body
         payload = bytearray(real)
         payload[atom_start:atom_start + old_size] = replacement
@@ -3500,7 +3551,12 @@ class Review21MediaProbeTests(unittest.TestCase):
                     media_scrub.scrub_video(bytes(payload), "video/mp4")
 
     @staticmethod
-    def _sps_with_ref_count(max_num_ref_frames: int) -> bytes:
+    def _sps_with_ref_count(
+        max_num_ref_frames: int,
+        *,
+        log2_max_frame_num_minus4: int = 0,
+        log2_max_pic_order_cnt_lsb_minus4: int = 0,
+    ) -> bytes:
         writer = h264_scrubber._BitWriter()
         writer.write_bits(100, 8)
         writer.write_bits(0, 8)
@@ -3511,9 +3567,9 @@ class Review21MediaProbeTests(unittest.TestCase):
         writer.write_ue(0)
         writer.write_u1(0)
         writer.write_u1(0)
+        writer.write_ue(log2_max_frame_num_minus4)
         writer.write_ue(0)
-        writer.write_ue(0)
-        writer.write_ue(0)
+        writer.write_ue(log2_max_pic_order_cnt_lsb_minus4)
         writer.write_ue(max_num_ref_frames)
         writer.write_u1(0)
         writer.write_ue(9)
@@ -3535,6 +3591,107 @@ class Review21MediaProbeTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(media_scrub.MediaScrubError, "DPB"):
             media_scrub.scrub_video(payload, "video/mp4")
+
+    @unittest.skipIf(FFMPEG is None, "ffmpeg not installed")
+    def test_sps_log2_bounds_accept_12_and_reject_13(self) -> None:
+        accepted = self._sps_with_ref_count(
+            0,
+            log2_max_frame_num_minus4=12,
+            log2_max_pic_order_cnt_lsb_minus4=12,
+        )
+        result = media_scrub.scrub_video(
+            Review20MediaProbeTests._replace_sps(REAL_MP4.read_bytes(), accepted),
+            "video/mp4",
+        )
+        self.assertTrue(result.data)
+        result = media_scrub.scrub_video(REAL_MP4.read_bytes(), "video/mp4")
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as handle:
+            handle.write(result.data)
+            path = handle.name
+        try:
+            probe = subprocess.run(
+                [FFMPEG, "-v", "error", "-i", path, "-f", "null", "-"],
+                capture_output=True,
+                timeout=30,
+            )
+            self.assertEqual(probe.returncode, 0, probe.stderr.decode(errors="replace"))
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+        rejected = self._sps_with_ref_count(
+            0,
+            log2_max_frame_num_minus4=13,
+            log2_max_pic_order_cnt_lsb_minus4=12,
+        )
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "log2_max_frame_num"):
+            media_scrub.scrub_video(
+                Review20MediaProbeTests._replace_sps(REAL_MP4.read_bytes(), rejected),
+                "video/mp4",
+            )
+
+    @staticmethod
+    def _pps_with_ref_counts(l0: int, l1: int) -> bytes:
+        writer = h264_scrubber._BitWriter()
+        writer.write_ue(0)
+        writer.write_ue(0)
+        writer.write_u1(0)
+        writer.write_u1(0)
+        writer.write_ue(0)
+        writer.write_ue(l0)
+        writer.write_ue(l1)
+        writer.write_u1(0)
+        writer.write_bits(0, 2)
+        writer.write_se(0)
+        writer.write_se(0)
+        writer.write_se(0)
+        writer.write_u1(1)
+        writer.write_u1(0)
+        writer.write_u1(0)
+        writer.write_rbsp_trailing_bits()
+        return b"\x68" + h264_scrubber._rbsp_escape(writer.to_bytes())
+
+    @staticmethod
+    def _replace_pps(real: bytes, pps: bytes) -> bytes:
+        avcc_pos = real.find(b"avcC")
+        assert avcc_pos > 0
+        old_size = struct.unpack(">I", real[avcc_pos - 4:avcc_pos])[0]
+        body_start = avcc_pos + 4
+        body = bytearray(real[body_start:avcc_pos - 4 + old_size])
+        sps_len = struct.unpack(">H", body[6:8])[0]
+        after_sps = 8 + sps_len
+        pps_len_pos = after_sps + 1
+        old_pps_len = struct.unpack(">H", body[pps_len_pos:pps_len_pos + 2])[0]
+        pps_start = pps_len_pos + 2
+        body[pps_len_pos:pps_len_pos + 2] = struct.pack(">H", len(pps))
+        body[pps_start:pps_start + old_pps_len] = pps
+        return Mp4Round12OwnershipAndH264Probes._replace_avcc(real, bytes(body))
+
+    @unittest.skipIf(FFMPEG is None, "ffmpeg not installed")
+    def test_pps_default_reference_bounds_accept_31_and_reject_32(self) -> None:
+        accepted = self._replace_pps(
+            REAL_MP4.read_bytes(), self._pps_with_ref_counts(31, 31),
+        )
+        result = media_scrub.scrub_video(accepted, "video/mp4")
+        self.assertTrue(result.data)
+        result = media_scrub.scrub_video(REAL_MP4.read_bytes(), "video/mp4")
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as handle:
+            handle.write(result.data)
+            path = handle.name
+        try:
+            probe = subprocess.run(
+                [FFMPEG, "-v", "error", "-i", path, "-f", "null", "-"],
+                capture_output=True,
+                timeout=30,
+            )
+            self.assertEqual(probe.returncode, 0, probe.stderr.decode(errors="replace"))
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+        rejected = self._replace_pps(
+            REAL_MP4.read_bytes(), self._pps_with_ref_counts(32, 31),
+        )
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "default reference count"):
+            media_scrub.scrub_video(rejected, "video/mp4")
 
 
     @staticmethod
@@ -4026,6 +4183,48 @@ class Review32CanonicalEncodingTests(unittest.TestCase):
         result = media_scrub.scrub_video(bytes(payload), "video/mp4")
         self.assertNotIn(noncanonical, result.data)
         self.assertIn(b"pasp" + struct.pack(">II", 1, 1), result.data)
+
+    @unittest.skipIf(FFMPEG is None, "ffmpeg not installed")
+    def test_visual_sample_entry_fixed_fields_are_canonical_and_decode(self) -> None:
+        fields = (
+            (32, 4, 0x12345678, 0x00480000),
+            (36, 4, 0x12345678, 0x00480000),
+            (44, 2, 0x1234, 1),
+            (78, 2, 0x1234, 0x0018),
+            (80, 2, 0x1234, 0xFFFF),
+        )
+        real = REAL_MP4.read_bytes()
+        avc1_pos = real.find(b"avc1", real.find(b"stsd"))
+        self.assertGreater(avc1_pos, 0)
+        for offset, size, mutation, canonical in fields:
+            with self.subTest(offset=offset):
+                payload = bytearray(REAL_MP4.read_bytes())
+                payload[avc1_pos + offset:avc1_pos + offset + size] = mutation.to_bytes(
+                    size, "big", signed=False,
+                )
+                result = media_scrub.scrub_video(bytes(payload), "video/mp4")
+                output_avc1_pos = result.data.find(
+                    b"avc1", result.data.find(b"stsd"),
+                )
+                self.assertEqual(
+                    result.data[output_avc1_pos + offset:output_avc1_pos + offset + size],
+                    canonical.to_bytes(size, "big", signed=False),
+                )
+                with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as handle:
+                    handle.write(result.data)
+                    path = handle.name
+                try:
+                    probe = subprocess.run(
+                        [FFMPEG, "-v", "error", "-i", path, "-f", "null", "-"],
+                        capture_output=True,
+                        timeout=30,
+                    )
+                    self.assertEqual(
+                        probe.returncode, 0,
+                        probe.stderr.decode(errors="replace"),
+                    )
+                finally:
+                    Path(path).unlink(missing_ok=True)
 
     def test_tkhd_v0_fractional_dimensions_are_rejected(self) -> None:
         payload = bytearray(REAL_MP4.read_bytes())

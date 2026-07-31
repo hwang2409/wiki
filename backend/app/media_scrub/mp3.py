@@ -127,6 +127,20 @@ def _mp3_strip_ape_footer(data: bytes, start: int, end: int) -> int:
     if flags & _APE_FLAG_IS_HEADER:
         raise MediaScrubError("mp3 APEv2 marker at end is a header")
     trim = tag_size
+    if flags & _APE_FLAG_HAS_HEADER:
+        trim += _APE_HEADER_FOOTER_LEN
+        header_start = end - trim
+        if header_start < start or data[header_start:header_start + 8] != _APE_MAGIC:
+            raise MediaScrubError(
+                "mp3 APEv2 footer declares a missing companion header"
+            )
+        header_tag_size, header_item_count, header_flags = _mp3_read_ape_meta(
+            data, header_start,
+        )
+        if not header_flags & _APE_FLAG_IS_HEADER or header_flags & _APE_FLAG_NO_FOOTER:
+            raise MediaScrubError("mp3 APEv2 companion header flags are invalid")
+        if header_tag_size != tag_size or header_item_count != _item_count:
+            raise MediaScrubError("mp3 APEv2 companion header does not match footer")
     if trim > end - start:
         raise MediaScrubError("mp3 APEv2 footer size larger than payload")
     return end - trim
