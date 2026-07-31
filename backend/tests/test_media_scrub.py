@@ -3651,6 +3651,30 @@ class Review21MediaProbeTests(unittest.TestCase):
         return b"\x68" + h264_scrubber._rbsp_escape(writer.to_bytes())
 
     @staticmethod
+    def _pps_with_map_type_6_slice_group_id(slice_group_id: int) -> bytes:
+        writer = h264_scrubber._BitWriter()
+        writer.write_ue(0)
+        writer.write_ue(0)
+        writer.write_u1(0)
+        writer.write_u1(0)
+        writer.write_ue(2)  # num_slice_groups_minus1
+        writer.write_ue(6)  # slice_group_map_type
+        writer.write_ue(0)  # pic_size_in_map_units_minus1
+        writer.write_bits(slice_group_id, 2)
+        writer.write_ue(0)
+        writer.write_ue(0)
+        writer.write_u1(0)
+        writer.write_bits(0, 2)
+        writer.write_se(0)
+        writer.write_se(0)
+        writer.write_se(0)
+        writer.write_u1(1)
+        writer.write_u1(0)
+        writer.write_u1(0)
+        writer.write_rbsp_trailing_bits()
+        return b"\x68" + h264_scrubber._rbsp_escape(writer.to_bytes())
+
+    @staticmethod
     def _replace_pps(real: bytes, pps: bytes) -> bytes:
         avcc_pos = real.find(b"avcC")
         assert avcc_pos > 0
@@ -3691,6 +3715,16 @@ class Review21MediaProbeTests(unittest.TestCase):
             REAL_MP4.read_bytes(), self._pps_with_ref_counts(32, 31),
         )
         with self.assertRaisesRegex(media_scrub.MediaScrubError, "default reference count"):
+            media_scrub.scrub_video(rejected, "video/mp4")
+
+    def test_pps_map_type_6_rejects_out_of_range_slice_group_id(self) -> None:
+        rejected = self._replace_pps(
+            REAL_MP4.read_bytes(),
+            self._pps_with_map_type_6_slice_group_id(3),
+        )
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "slice_group_id out of range"
+        ):
             media_scrub.scrub_video(rejected, "video/mp4")
 
 

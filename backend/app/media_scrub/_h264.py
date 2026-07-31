@@ -579,7 +579,12 @@ def _parse_and_emit_pps_rbsp(rbsp: bytes) -> tuple[bytes, int, int]:
             n = num_slice_groups_minus1 + 1
             bit_width = max(1, (n - 1).bit_length())
             for _ in range(pic_size_in_map_units_minus1 + 1):
-                writer.write_bits(reader.read_bits(bit_width), bit_width)
+                slice_group_id = reader.read_bits(bit_width)
+                if slice_group_id >= n:
+                    raise MediaScrubError(
+                        "h264 slice_group_id out of range for map type 6"
+                    )
+                writer.write_bits(slice_group_id, bit_width)
 
     num_ref_idx_l0_default_active_minus1 = reader.read_ue()
     num_ref_idx_l1_default_active_minus1 = reader.read_ue()
