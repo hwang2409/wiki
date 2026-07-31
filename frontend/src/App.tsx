@@ -82,7 +82,7 @@ import {
 } from "./file-workspaces";
 import { SettingsModal, applyStoredFonts } from "./settings";
 import { ActivityFeed } from "./activity";
-import { AgentsSidebar, AgentsView, DEFAULT_WORKDIR, type AccountEvent } from "./agents";
+import { AgentsSidebar, AgentsView, type AccountEvent } from "./agents";
 import { isAgentRefreshEvent } from "./agent-events";
 import {
   AgentSessionView,
@@ -1332,6 +1332,7 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [ribbonMoreOpen, setRibbonMoreOpen] = useState(false);
   const [workspaceDiscoveryError, setWorkspaceDiscoveryError] = useState<string | null>(null);
+  const [workspaceDiscoveryReady, setWorkspaceDiscoveryReady] = useState(false);
 
   useEffect(() => {
     applyStoredFonts();
@@ -1515,8 +1516,12 @@ export default function App() {
   }, [activeWorkspace]);
 
   useEffect(() => {
-    if (!shouldDiscoverWorkspaces(sidebarTab, switcherOpen, mode === "agents")) return;
+    if (!shouldDiscoverWorkspaces(sidebarTab, switcherOpen, mode === "agents")) {
+      setWorkspaceDiscoveryReady(false);
+      return;
+    }
     let ignore = false;
+    setWorkspaceDiscoveryReady(false);
     listWorkspaces()
       .then((result) => {
         if (ignore) return;
@@ -1524,6 +1529,7 @@ export default function App() {
         filesRequestTrackerRef.current.invalidate();
         setWorkspaces(result.workspaces);
         setWorkspaceDiscoveryError(null);
+        setWorkspaceDiscoveryReady(true);
         setActiveWorkspace((current) =>
           reconcileWorkspaceState(result.workspaces, current, {}).activeWorkspace
         );
@@ -1542,6 +1548,7 @@ export default function App() {
             ? error.message
             : "Could not reach workspace discovery.";
         setWorkspaceDiscoveryError(message);
+        setWorkspaceDiscoveryReady(false);
       });
     return () => {
       ignore = true;
@@ -1657,6 +1664,7 @@ export default function App() {
   const filesTruncated = activeFileState?.truncated ?? false;
   const filesError = activeFileState?.error ?? null;
   const workspaceUnavailable = !activeWorkspaceInfo || !activeWorkspaceInfo.live;
+  const spawnWorkspaceRoot = workspaceDiscoveryReady ? activeWorkspaceInfo?.root || null : null;
   const retryFiles = () => {
     if (!activeFileCacheKey) return;
     workspaceRefreshVersionRef.current += 1;
@@ -3494,7 +3502,8 @@ export default function App() {
       return (
         <AgentsView
           data={agentsState}
-          workspaceRoot={activeWorkspaceInfo?.root || DEFAULT_WORKDIR}
+          workspaceRoot={spawnWorkspaceRoot}
+          workspaceRootReady={workspaceDiscoveryReady}
           onOpenAgent={openAgent}
           onOpenTicket={setAgentsOpenTicket}
           openTicket={agentsOpenTicket}
@@ -4097,7 +4106,8 @@ export default function App() {
               ) : mode === "agents" ? (
                 <AgentsView
                   data={agentsState}
-                  workspaceRoot={activeWorkspaceInfo?.root || DEFAULT_WORKDIR}
+                  workspaceRoot={spawnWorkspaceRoot}
+                  workspaceRootReady={workspaceDiscoveryReady}
                   onOpenAgent={openAgent}
                   refreshTick={refreshTick}
                   openTicket={agentsOpenTicket}

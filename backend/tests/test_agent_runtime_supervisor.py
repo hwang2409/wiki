@@ -595,7 +595,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(
             provider_health, "credential_fingerprint", return_value="fp-old"
         ):
-            await self.supervisor.start_run(
+            record = await self.supervisor.start_run(
                 agent_id="WIKI-AUTH-FINGERPRINT",
                 provider=ProviderKind.CODEX,
                 role="implement",
@@ -606,6 +606,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             )
             verified = await _wait_for_published(queue, "codex_auth_verified")
         self.assertEqual(verified["credential_fingerprint"], "fp-old")
+        self.assertEqual(verified["run_id"], record.run_id)
         self.supervisor.unsubscribe(queue)
 
     async def test_artifact_failure_message_deduplicates_durably(self) -> None:

@@ -954,6 +954,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 # revive-failed rollups. A ticketless event proves nothing
                 # about any other worker still awaiting recovery.
                 "ticket": record.agent_id,
+                "run_id": run_id,
                 "ts": datetime.now(timezone.utc).isoformat(),
             }
             if credential_fingerprint is not None:

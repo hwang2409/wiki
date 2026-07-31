@@ -196,6 +196,7 @@ def test_verified_auth_clears_only_the_ticket_that_completed_a_turn(tmp_path: Pa
             "success": True,
             "credential_source": "current",
             "ticket": "WIKI-A",
+            "run_id": "run-a",
             "ts": "t3",
         }
     )
@@ -209,10 +210,96 @@ def test_verified_auth_clears_only_the_ticket_that_completed_a_turn(tmp_path: Pa
             "success": True,
             "credential_source": "current",
             "ticket": "WIKI-B",
+            "run_id": "run-b",
             "ts": "t4",
         }
     )
     assert store.snapshot() == []
+
+
+def test_stale_auth_verified_event_does_not_clear_replacement_failure(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.apply_event(
+        {
+            "type": "codex_auth_dead_exhausted",
+            "tickets": ["WIKI-A"],
+            "run_ids": {"WIKI-A": "run-old"},
+            "ts": "t1",
+        }
+    )
+    store.apply_event(
+        {
+            "type": "codex_auth_dead_exhausted",
+            "tickets": ["WIKI-A"],
+            "run_ids": {"WIKI-A": "run-new"},
+            "ts": "t2",
+        }
+    )
+
+    store.apply_event(
+        {
+            "type": "codex_auth_verified",
+            "success": True,
+            "credential_source": "current",
+            "ticket": "WIKI-A",
+            "run_id": "run-old",
+            "ts": "t3",
+        }
+    )
+
+    notice = _by_type(store, "codex_auth_dead_exhausted")
+    assert notice["tickets"] == ["WIKI-A"]
+    assert notice["run_ids"] == {"WIKI-A": "run-new"}
+
+
+def test_auth_verified_without_run_id_only_clears_legacy_notice(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.apply_event({"type": "codex_auth_dead_exhausted", "tickets": ["WIKI-A"], "ts": "t1"})
+    store.apply_event(
+        {
+            "type": "codex_auth_dead_exhausted",
+            "tickets": ["WIKI-B"],
+            "run_ids": {"WIKI-B": "run-b"},
+            "ts": "t2",
+        }
+    )
+    store.apply_event(
+        {
+            "type": "codex_auth_verified",
+            "success": True,
+            "credential_source": "current",
+            "ticket": "WIKI-A",
+            "ts": "t3",
+        }
+    )
+    notice = _by_type(store, "codex_auth_dead_exhausted")
+    assert notice["tickets"] == ["WIKI-B"]
+
+
+def test_stale_auth_verified_event_keeps_revival_failure(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.apply_event(
+        {
+            "type": "codex_auth_dead_revival",
+            "revived": [],
+            "failed": ["WIKI-A"],
+            "failed_run_ids": {"WIKI-A": "run-new"},
+            "ts": "t1",
+        }
+    )
+    store.apply_event(
+        {
+            "type": "codex_auth_verified",
+            "success": True,
+            "credential_source": "current",
+            "ticket": "WIKI-A",
+            "run_id": "run-old",
+            "ts": "t2",
+        }
+    )
+    notice = _by_type(store, "codex_auth_dead_revival")
+    assert notice["failed"] == ["WIKI-A"]
+    assert notice["failed_run_ids"] == {"WIKI-A": "run-new"}
 
 
 def test_verified_auth_without_ticket_does_not_clear_others(tmp_path: Path) -> None:

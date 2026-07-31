@@ -291,19 +291,38 @@ class AccountNoticeStore:
             payload["run_ids"] = run_ids
             set_notice(_EXHAUSTED_KEY, payload)
 
-        def remove_revived(revived: list[str]) -> None:
+        def remove_revived(
+            revived: list[str],
+            *,
+            recovery_run_id: str | None = None,
+            require_run_match: bool = False,
+        ) -> None:
             """A revived worker is proven running: drop it from every
-            worker-scoped failure notice; keep tickets not yet proven."""
+            worker-scoped failure notice; keep tickets not yet proven.
+
+            Auth verification is run-scoped. It clears legacy notices without
+            a stored run id, or notices whose stored run id matches the
+            verification event. A late event from an old run cannot clear a
+            replacement's failure.
+            """
 
             if not revived:
                 return
             revived_set = set(revived)
+
+            def can_clear(ticket: str, stored_run_ids: object) -> bool:
+                if not require_run_match:
+                    return True
+                stored_run_id = _reason_map(stored_run_ids).get(ticket)
+                return stored_run_id is None or stored_run_id == recovery_run_id
+
             existing = self._notices.get(_EXHAUSTED_KEY)
             if existing is not None:
                 remaining = [
                     ticket
                     for ticket in _ticket_list(existing.get("tickets"))
                     if ticket not in revived_set
+                    or not can_clear(ticket, existing.get("run_ids"))
                 ]
                 if remaining != _ticket_list(existing.get("tickets")):
                     if remaining:
@@ -325,6 +344,7 @@ class AccountNoticeStore:
                     ticket
                     for ticket in _ticket_list(notice.get("failed"))
                     if ticket not in revived_set
+                    or not can_clear(ticket, notice.get("failed_run_ids"))
                 ]
                 if remaining == _ticket_list(notice.get("failed")):
                     continue
@@ -391,7 +411,12 @@ class AccountNoticeStore:
             if event.get("success") is True and event.get("credential_source") == "current":
                 ticket = event.get("ticket")
                 if isinstance(ticket, str) and ticket:
-                    remove_revived([ticket])
+                    run_id = event.get("run_id")
+                    remove_revived(
+                        [ticket],
+                        recovery_run_id=run_id if isinstance(run_id, str) and run_id else None,
+                        require_run_match=True,
+                    )
         elif kind == "claude_limit_hit":
             ticket = event.get("ticket")
             if isinstance(ticket, str) and ticket:

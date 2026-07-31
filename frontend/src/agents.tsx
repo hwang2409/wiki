@@ -711,11 +711,13 @@ export function SpawnWorkerModal({
 export function SpawnOrchestratorModal({
   models,
   workspaceRoot,
+  workspaceRootReady = true,
   onClose,
   onSpawn,
 }: {
   models: AgentModelOption[];
   workspaceRoot?: string | null;
+  workspaceRootReady?: boolean;
   onClose: () => void;
   onSpawn: (notice: OrchestratorSpawnNotice) => void;
 }) {
@@ -729,9 +731,11 @@ export function SpawnOrchestratorModal({
   const [confirming, setConfirming] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(false);
-  const workspaceRootProvided = Boolean(workspaceRoot?.trim());
+  const projectDirTouched = useRef(false);
+  const workspaceRootProvided = workspaceRootReady && Boolean(workspaceRoot?.trim());
 
   useEffect(() => {
+    if (projectDirTouched.current) return;
     setProjectDir(workspaceRoot?.trim() ?? "");
   }, [workspaceRoot]);
 
@@ -777,6 +781,7 @@ export function SpawnOrchestratorModal({
         placeholder="/tmp/project"
         value={projectDir}
         onChange={(event) => {
+          projectDirTouched.current = true;
           resetConfirmation();
           setProjectDir(event.target.value);
         }}
@@ -1178,6 +1183,7 @@ function AccountEventsBanner({ events }: { events: AccountEvent[] }) {
 export function AgentsView({
   data,
   workspaceRoot,
+  workspaceRootReady = true,
   onOpenAgent,
   refreshTick,
   openTicket,
@@ -1191,6 +1197,7 @@ export function AgentsView({
     account_notices?: AccountEvent[];
   };
   workspaceRoot?: string | null;
+  workspaceRootReady?: boolean;
   onOpenAgent: (ticket: string, panel?: "review") => void;
   refreshTick: number;
   openTicket: string | null;
@@ -2366,6 +2373,7 @@ export function AgentsView({
         <SpawnOrchestratorModal
           models={availableModels}
           workspaceRoot={workspaceRoot}
+          workspaceRootReady={workspaceRootReady}
           onClose={() => setSpawnOrchestratorOpen(false)}
           onSpawn={(notice) => {
             setSpawnNotice(notice);
