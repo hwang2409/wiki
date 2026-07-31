@@ -202,10 +202,16 @@ pub fn setup(app: &mut App, app_lock: File) -> Result<(), Box<dyn Error>> {
 }
 
 fn runtime_dir() -> PathBuf {
-    env::var_os("WIKI_AGENT_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".wiki/agent-runtime")))
-        .unwrap_or_else(|| PathBuf::from(".wiki/agent-runtime"))
+    let default = env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".wiki/agent-runtime"))
+        .unwrap_or_else(|| PathBuf::from(".wiki/agent-runtime"));
+    if native_dev_mode() {
+        env::var_os("WIKI_AGENT_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or(default)
+    } else {
+        default
+    }
 }
 
 pub fn acquire_app_lock() -> io::Result<File> {
@@ -379,9 +385,6 @@ fn sidecar_environment_without_secret() -> Vec<(OsString, OsString)> {
 fn launch_backend_and_navigate(app: &AppHandle) {
     let launch_result = if native_dev_mode() {
         start_sidecar(app, 0)
-    } else if let Ok(url) = env::var("WIKI_NATIVE_BACKEND_URL") {
-        let launch_url = normalize_launch_url(&url);
-        wait_for_health(app, &launch_url, None).map(|_| launch_url)
     } else {
         match persistent_daemon::probe(&runtime_dir(), EXPECTED_BACKEND_FINGERPRINT) {
             Ok(Some((launch_url, secret))) => {
@@ -806,22 +809,6 @@ fn handle_new_window_request(app: &AppHandle, url: &Url) -> NewWindowResponse<ta
         return NewWindowResponse::Allow;
     }
     NewWindowResponse::Deny
-}
-
-fn normalize_launch_url(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if let Ok(mut url) = reqwest::Url::parse(trimmed) {
-        if url.path().is_empty() {
-            url.set_path("/");
-        }
-        return url.to_string();
-    }
-
-    if trimmed.ends_with('/') {
-        trimmed.to_string()
-    } else {
-        format!("{trimmed}/")
-    }
 }
 
 fn health_url_for(launch_url: &str) -> String {

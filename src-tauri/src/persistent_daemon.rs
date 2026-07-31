@@ -28,10 +28,7 @@ pub(crate) fn probe(
     if !daemon_may_be_starting(runtime_dir, &label) {
         return Ok(None);
     }
-    let launch_url = normalize_launch_url(
-        &env::var("WIKI_DAEMON_BACKEND_URL")
-            .unwrap_or_else(|_| format!("http://127.0.0.1:{port}/")),
-    );
+    let launch_url = daemon_url_for_port(port);
     let health_url = health_url_for(&launch_url);
     let client = Client::builder()
         .timeout(DAEMON_PROBE_TIMEOUT)
@@ -188,18 +185,21 @@ fn origin_port(origin: &str) -> Option<u16> {
 }
 
 fn refresh_origin_matches_saved_port(origin: &str, saved_port: u16) -> bool {
-    origin_port(origin) == Some(saved_port)
+    let Ok(url) = reqwest::Url::parse(origin) else {
+        return false;
+    };
+    url.scheme() == "http"
+        && url.host_str() == Some("127.0.0.1")
+        && url.username().is_empty()
+        && url.password().is_none()
+        && origin_port(origin) == Some(saved_port)
+}
+
+fn daemon_url_for_port(port: u16) -> String {
+    format!("http://127.0.0.1:{port}/")
 }
 
 fn expected_backend_executable() -> Option<PathBuf> {
-    if let Some(path) = env::var_os("WIKI_BACKEND_EXECUTABLE") {
-        return Some(PathBuf::from(path));
-    }
-    if let Some(app_path) = env::var_os("WIKI_APP_PATH") {
-        return Some(
-            PathBuf::from(app_path).join("Contents/Resources/wiki-backend-sidecar/wiki-backend"),
-        );
-    }
     let current = env::current_exe().ok()?;
     current
         .ancestors()
@@ -294,13 +294,13 @@ fn daemon_socket_is_live(runtime_dir: &Path) -> bool {
 }
 
 fn daemon_plist_exists(label: &str) -> bool {
-    let launch_agents = env::var_os("WIKI_LAUNCH_AGENTS_DIR")
-        .map(PathBuf::from)
-        .or_else(|| {
-            env::var_os("HOME").map(|home| PathBuf::from(home).join("Library/LaunchAgents"))
-        });
-    launch_agents
-        .map(|directory| directory.join(format!("{label}.plist")).is_file())
+    env::var_os("HOME")
+        .map(|home| {
+            PathBuf::from(home)
+                .join("Library/LaunchAgents")
+                .join(format!("{label}.plist"))
+                .is_file()
+        })
         .unwrap_or(false)
 }
 
@@ -460,6 +460,25 @@ mod tests {
             "http://127.0.0.1:8213/",
             9321
         ));
+        assert!(refresh_origin_matches_saved_port(
+            "http://127.0.0.1:9321/",
+            9321
+        ));
+    }
+
+    #[test]
+    fn refresh_rejects_proxy_origin_with_matching_port() {
+        for origin in [
+            "http://127.0.0.2:9321/",
+            "http://localhost:9321/",
+            "https://127.0.0.1:9321/",
+            "http://user@127.0.0.1:9321/",
+        ] {
+            assert!(
+                !refresh_origin_matches_saved_port(origin, 9321),
+                "proxy origin accepted: {origin}"
+            );
+        }
         assert!(refresh_origin_matches_saved_port(
             "http://127.0.0.1:9321/",
             9321

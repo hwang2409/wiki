@@ -2565,9 +2565,6 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             if normalized.kind in {"approval_response", "approval_resolved"}:
                 outcome = _HandoverDrainOutcome.USER_RESPONSE
                 continue
-            if event.payload.get("type") == "control_response":
-                outcome = _HandoverDrainOutcome.USER_RESPONSE
-                continue
             if event.payload.get("type") == "control_cancel_request":
                 outcome = _HandoverDrainOutcome.CONTROL_CANCEL_REQUEST
                 continue

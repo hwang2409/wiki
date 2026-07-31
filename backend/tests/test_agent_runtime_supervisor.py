@@ -272,6 +272,17 @@ class HandoverCancelClaudeAdapter(ClaudeFixtureAdapter):
                     generation=self.snapshot().generation,
                 )
             )
+            await self._events.put(  # noqa: SLF001 - end-session response fixture
+                ProviderEvent(
+                    ProviderKind.CLAUDE,
+                    {
+                        "type": "control_response",
+                        "response": {"request_id": "end-session"},
+                    },
+                    direction="stdout",
+                    generation=self.snapshot().generation,
+                )
+            )
         return await super().stop()
 
     async def send_now(self, message: str) -> AdapterStatus:
@@ -2501,12 +2512,19 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 await release_first_drain.wait()
             await original_quiesce(run_id, adapter)
 
+        async def ordered_preflight() -> list[str]:
+            return [first.run_id, second.run_id]
+
         handover_task: asyncio.Task[Any] | None = None
         try:
             with mock.patch.object(
                 self.supervisor,
                 "_quiesce_adapter_for_replacement",
                 new=paused_first_drain,
+            ), mock.patch.object(
+                self.supervisor,
+                "_handover_preflight",
+                new=ordered_preflight,
             ):
                 handover_task = asyncio.create_task(self.supervisor.prepare_handover())
                 await asyncio.wait_for(first_drain_started.wait(), timeout=5)
