@@ -39,6 +39,10 @@ function continuousField(encoding: Record<string, unknown>, channel: ZoomChannel
   // isn't the source field, so shift-brush would store no domain.
   if (def.aggregate) return null;
   if (def.timeUnit) return null;
+  // scale: null suppresses scale compilation for the channel; interval
+  // projection would then have no domainRaw to bind to and Vega-Lite throws
+  // "Cannot read properties of undefined (reading get)".
+  if ("scale" in def && def.scale === null) return null;
   return typeof def.field === "string" && def.field.length > 0 ? def.field : null;
 }
 
@@ -116,13 +120,17 @@ export function buildInteractiveSpec(
       ...params,
       {
         name: ZOOM_PARAM,
+        // `bind: "scales"` lives at the parameter level in Vega-Lite v5/v6.
+        // Nested inside `select` it is silently ignored — the compiled scales
+        // get no domainRaw signal, and drag draws a rectangle instead of
+        // panning, wheel resizes the rectangle instead of zooming.
         select: {
           type: "interval",
-          bind: "scales",
           encodings: interactivity.channels,
           translate: PAN_STREAM,
           zoom: "wheel!",
         },
+        bind: "scales",
       },
       {
         name: BRUSH_PARAM,

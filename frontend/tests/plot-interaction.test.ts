@@ -102,7 +102,11 @@ test("buildInteractiveSpec: full + armed adds zoom and brush params", () => {
   const params = out.params as Array<Record<string, unknown>>;
   assert.equal(params.length, 2);
   const zoom = params.find((p) => p.name === ZOOM_PARAM)!;
-  assert.equal((zoom.select as Record<string, unknown>).bind, "scales");
+  // bind:scales MUST sit on the parameter, not inside select — Vega-Lite v5/v6
+  // silently ignores nested bind so pan/wheel would degrade to drawing a
+  // selection rectangle instead of moving the domains.
+  assert.equal(zoom.bind, "scales");
+  assert.equal((zoom.select as Record<string, unknown>).bind, undefined);
   assert.equal((zoom.select as Record<string, unknown>).zoom, "wheel!");
   const brush = params.find((p) => p.name === BRUSH_PARAM)!;
   assert.equal((brush.select as Record<string, unknown>).translate, false);
@@ -203,6 +207,36 @@ test("plotInteractivity: aggregate on one channel leaves the other zoomable", ()
     assert.deepEqual(result.channels, ["x"]);
     assert.deepEqual(result.fields, { x: "price" });
   }
+});
+
+test("plotInteractivity: scale:null encodings drop out of full mode", () => {
+  // scale:null is a valid Vega-Lite encoding (used for raw pixel positioning,
+  // custom layers, etc). Injecting an interval projection on such a channel
+  // throws "Cannot read properties of undefined (reading get)" at compile.
+  const spec = {
+    mark: "point",
+    encoding: {
+      x: { field: "x", type: "quantitative", scale: null },
+      y: { field: "y", type: "quantitative" },
+    },
+  };
+  const result = plotInteractivity(spec);
+  assert.equal(result.mode, "full");
+  if (result.mode === "full") {
+    assert.deepEqual(result.channels, ["y"]);
+    assert.deepEqual(result.fields, { y: "y" });
+  }
+});
+
+test("plotInteractivity: all-scale-null degrades to tooltip", () => {
+  const spec = {
+    mark: "point",
+    encoding: {
+      x: { field: "x", type: "quantitative", scale: null },
+      y: { field: "y", type: "quantitative", scale: null },
+    },
+  };
+  assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
 });
 
 test("plotInteractivity: timeUnit encodings degrade to tooltip", () => {
