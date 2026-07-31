@@ -9,6 +9,14 @@ updated: 2026-07-31
 
 ## 2026-07-31
 
+- **wiki** — visual-diff artifact mode with image comparison controls ([#164](https://github.com/hwang2409/wiki/pull/164) merged 367a0f7)
+- wiki — WIKI-226 spawn-verification hardening merged via [#161](https://github.com/hwang2409/wiki/pull/161) (squash a65a469, 11 rounds — load-tolerant provider verification, scoped atomic rollback w/ status-file ownership, backend-URL propagation across all callers, canonical reviewer identity w/ legacy-key compat, server-side implicit ids w/ bounded dedupe; restart-durability descoped to WIKI-219)
+- **phoebe** — staging+prod app-env-vars backfilled with agent v3 Modal/sandbox keys (MODAL_ENVIRONMENT, MODAL_TOKEN_ID/SECRET, AGENT_SANDBOX_WORKSPACE_TOKEN_SECRET); prod already had Modal tokens, staging had none; workspace-token secrets freshly generated per env; picked up on next regular deploy
+- **phoebe** — PR #13002 merged (6d890b51d7) — PHO-14953
+- **phoebe** — PR #13011 merged (ba1be0f199) — staging deploy fix: agent v3 sandbox/Modal creds demoted from boot-required to use-time fail-fast; unblocks deploys broken since 05:04Z; ops follow-up: add secrets before agent_v3_enabled flips
+- wiki — WIKI-224 graph-health false-alarm fixes merged via [#159](https://github.com/hwang2409/wiki/pull/159) (squash 8e3da9d, 6 rounds — spawn-edge grace, per-worker stall evaluation w/ meaningful-activity filtering, stale-only episode identity, incremental bounded event cursors off the O(history) scan, recovery-reset episodes)
+- **website** — merged PR #1 — full ma5a-style redesign (tiny type, whitespace, dotted rules, pixel snowboarder mascot, AA contrast) + music/spotify page commit; 3 review rounds to clean pass
+- wiki — WIKI-222 nested-scroll-region kill merged via [#162](https://github.com/hwang2409/wiki/pull/162) (squash 3e8015d, 2 rounds — shared height threshold, ResizeObserver clamp for wrapped single-line payloads, full-height stream flow)
 - **phoebe** — PHO-14952 v3 file inspection tools merged via [#13000](https://github.com/phoebe-health/phoebe/pull/13000) (squash beed18398b, 3 rounds — budget-aware streaming reader, row-framing fix; v1 expansion complete)
 - wiki — WIKI-168 daemon-ize backend merged via [#153](https://github.com/hwang2409/wiki/pull/153) (squash 295ba9b, 42 review rounds — launchd daemon w/ authenticated secret handshake, handover finalization state matrix, unified install/runtime codesign trust gate; daemon activation on a real install needs Henry's developer signing identity, ad-hoc builds fall back to sidecar)
 - **phoebe** — PHO-14951 v3 get_shifts tool merged via [#13001](https://github.com/phoebe-health/phoebe/pull/13001) (squash c01e719bd3, 3 rounds — canonical progression-state semantics, v1 expansion tool 1 of 2)

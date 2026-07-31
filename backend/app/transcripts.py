@@ -21,6 +21,8 @@ Normalized event:
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import os
 import re
@@ -30,12 +32,14 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 
+from .image_scrub import ImageScrubError, probe_normalized_dimensions
 from .wiki_artifacts import (
     AUDIO_MIMES,
     ArtifactValidationError,
     IMAGE_TYPES,
     PDF_MIME,
     VIDEO_MIMES,
+    VISUAL_DIFF_VARIANTS,
     _validate_text_payload,
     artifact_from_codex_mcp_tool_result,
     artifact_from_text,
@@ -702,6 +706,11 @@ def _artifact_from_structured_result(meta: dict, output: str) -> dict | None:
                 "ref": f"artifact://{artifact_id}",
                 "mime": mime,
             }
+    elif kind == "visual-diff":
+        normalized = result.get("artifact")
+        if not isinstance(normalized, dict) or normalized.get("kind") != kind:
+            return None
+        artifact = dict(normalized)
     else:
         try:
             validated_payload = _validate_text_payload(kind, payload)

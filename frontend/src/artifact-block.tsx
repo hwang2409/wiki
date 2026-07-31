@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "
 import {
   BarChart3,
   Code2,
+  Columns2,
   Copy,
   Download,
   FileJson,
@@ -55,6 +56,7 @@ export const KIND_ICONS: Record<ArtifactKind, LucideIcon> = {
   pdf: FileText,
   video: Video,
   audio: Music,
+  "visual-diff": Columns2,
 };
 
 
@@ -104,6 +106,11 @@ export function artifactExceedsInlineThreshold(
     case "pdf": return true;
     case "video": return false;
     case "audio": return false;
+    case "visual-diff": {
+      const width = artifact.before?.width ?? artifact.after?.width ?? 0;
+      const height = artifact.before?.height ?? artifact.after?.height ?? 0;
+      return width > 400 || height > 400;
+    }
   }
 }
 

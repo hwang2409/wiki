@@ -12,6 +12,7 @@ import { PdfArtifactDetail } from "./artifact-detail/pdf";
 import { PlotArtifactDetail } from "./artifact-detail/plot";
 import { SvgArtifactDetail } from "./artifact-detail/svg";
 import { TableArtifactDetail } from "./artifact-detail/table";
+import { VisualDiffArtifactDetail } from "./artifact-detail/visual-diff";
 import { classifyArtifact, humanizeArtifactKind } from "./artifact-kind";
 import { ArtifactFallback } from "./artifact-state";
 import type { ArtifactViewState, PanelState } from "./transcript-store";
@@ -95,6 +96,7 @@ export function ArtifactPanel({
       case "json": return <JsonArtifactDetail artifact={artifact} />;
       case "code": return <CodeArtifactDetail artifact={artifact} onChange={onChange} state={viewState} />;
       case "pdf": return <PdfArtifactDetail artifact={artifact} event={focusedEvent} onChange={onChange} state={viewState} ticket={ticket} />;
+      case "visual-diff": return <VisualDiffArtifactDetail artifact={artifact} event={focusedEvent} ticket={ticket} />;
     }
   })() : null;
 

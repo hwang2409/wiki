@@ -62,6 +62,28 @@ def probe_dimensions(data: bytes, mime: str) -> tuple[int, int]:
     raise ImageScrubError(f"unsupported mime: {mime}")
 
 
+_ORIENTATION_SWAPS: Final = {5, 6, 7, 8}
+
+
+def probe_normalized_dimensions(data: bytes, mime: str) -> tuple[int, int]:
+    """Header-probed dimensions with EXIF orientation applied — the (width,
+    height) a viewer sees after scrub_image bakes rotation into the pixels.
+
+    Kept header-only so callers can query dimensions without allocating pixel
+    memory for a 40MP source."""
+    width, height = probe_dimensions(data, mime)
+    probe = _ORIENTATION_PROBES.get(mime)
+    orientation = 1
+    if probe is not None:
+        try:
+            orientation = probe(data)
+        except (struct.error, ValueError, IndexError):
+            orientation = 1
+    if orientation in _ORIENTATION_SWAPS:
+        return height, width
+    return width, height
+
+
 def _probe_png(data: bytes) -> tuple[int, int]:
     if len(data) < 24 or data[:8] != _PNG_SIGNATURE or data[12:16] != b"IHDR":
         raise ImageScrubError("PNG payload missing IHDR")
@@ -447,6 +469,34 @@ def _generate_preview(scrubbed: bytes, mime: str, width: int, height: int) -> st
     return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
+def _verify_container_integrity(data: bytes, expected_format: str) -> None:
+    """Confirm the payload really is a complete, well-formed container of the
+    declared format, decodable end-to-end. Header probing is O(bytes-of-header)
+    — fast, but accepts a PNG whose signature and IHDR are valid while a later
+    chunk CRC is corrupt, or a JPEG that is truncated inside its scan data.
+    verify() catches the PNG CRC case but does not decompress JPEG scan data,
+    so a JPEG missing its final EOI bytes slid through verify then died in
+    the preview-generation load() (whose exception is silently swallowed) —
+    the tool reported success while the browser got a broken image.
+
+    Cross-check the declared format, then force a full decode via load() so
+    every truncation / corruption class raises here with a canonical error
+    instead of surviving to fail on the client. Cost is one decode per
+    ingested variant (server-side, once per artifact) — acceptable for the
+    correctness guarantee."""
+    try:
+        with Image.open(io.BytesIO(data)) as source:
+            if source.format != expected_format:
+                raise ImageScrubError(
+                    f"payload does not decode as {expected_format} (got {source.format})"
+                )
+            source.load()
+    except ImageScrubError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — normalise Pillow's many exceptions
+        raise ImageScrubError(f"image container failed integrity check: {exc}") from exc
+
+
 def scrub_image(data: bytes, mime: str) -> ScrubResult:
     """Validate + strip metadata from image bytes. Rotates pixels if the source
     was tagged with a non-upright EXIF orientation, otherwise keeps the original
@@ -470,6 +520,8 @@ def scrub_image(data: bytes, mime: str) -> ScrubResult:
         raise ImageScrubError(
             f"image exceeds {MAX_PIXELS // 1_000_000}MP pixel limit ({width}x{height})"
         )
+
+    _verify_container_integrity(data, expected)
 
     orientation = 1
     probe = _ORIENTATION_PROBES.get(mime)

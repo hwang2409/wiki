@@ -103,6 +103,16 @@ def _payload(kind: str) -> dict:
             "data_base64": base64.b64encode(FIXTURE_WAV_BYTES).decode(),
             "mime": "audio/wav",
         },
+        "visual-diff": {
+            "before": {
+                "data_base64": base64.b64encode(FIXTURE_PNG_BYTES).decode(),
+                "mime": "image/png",
+            },
+            "after": {
+                "data_base64": base64.b64encode(FIXTURE_PNG_BYTES).decode(),
+                "mime": "image/png",
+            },
+        },
     }[kind]
 
 
@@ -202,6 +212,9 @@ class WikiArtifactsTests(unittest.TestCase):
                     )
                     self.assertTrue(audio.read_bytes().startswith(b"RIFF"))
                     self.assertEqual(audio.stat().st_mode & 0o777, 0o600)
+                elif kind == "visual-diff":
+                    self.assertEqual(event["artifact"]["before"]["width"], 2)
+                    self.assertEqual(event["artifact"]["after"]["height"], 2)
                 else:
                     for key, value in _payload(kind).items():
                         self.assertEqual(event["artifact"][key], value)

@@ -24,6 +24,7 @@ const KIND_LABELS: Record<string, string> = {
   "file-list": "File list",
   json: "JSON",
   pdf: "PDF",
+  "visual-diff": "Visual diff",
 };
 
 export function humanizeArtifactKind(kind: string | undefined): string {

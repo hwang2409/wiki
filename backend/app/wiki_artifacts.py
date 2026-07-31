@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import io
 import json
 import os
 import re
@@ -9,6 +10,8 @@ import stat
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+from PIL import Image
 from typing import Any, Mapping
 from uuid import UUID, uuid4
 
@@ -21,6 +24,11 @@ from .media_scrub import (
     VIDEO_MIMES,
     scrub_audio,
     scrub_video,
+)
+from .image_scrub import (
+    MAX_PIXELS as IMAGE_MAX_PIXELS,
+    MAX_SIDE as IMAGE_MAX_SIDE,
+    probe_dimensions,
 )
 from .pathwalk import open_relative_file
 
@@ -52,6 +60,8 @@ ARTIFACT_KINDS = {
     "video",
     "audio",
 }
+VISUAL_DIFF_VARIANTS = ("before", "after")
+ARTIFACT_KINDS.add("visual-diff")
 IMAGE_TYPES = {
     "image/png": "png",
     "image/jpeg": "jpg",
@@ -81,7 +91,32 @@ TOOL_DESCRIPTION = (
     "dumping /tmp file paths: the artifact is inspectable, downloadable, and lives "
     "with the transcript. Use table artifacts only for 20+ rows or data the user will "
     "want to sort, export, or inspect. For prose comparisons with at most 6 rows and "
-    "3 columns, use a plain markdown table instead."
+    "3 columns, use a plain markdown table instead. For visual-diff (paired before/after "
+    "screenshots), the payload is {before: {data_base64, mime}, after: {data_base64, mime}}; "
+    "each side accepts image/png, image/jpeg, or image/webp up to 5MB, and both sides must "
+    "have identical dimensions and be single-frame (no APNG/animated WebP)."
+)
+
+# The payload description is agent-facing — the enclosing schema keeps payload
+# as a generic object (validated in-process against the per-kind rules in
+# _validate_text_payload / _write_image / _write_pdf / _write_visual_diff),
+# but LLMs generating tool calls read this description to shape the payload.
+_PAYLOAD_DESCRIPTION = (
+    "Per-kind payload shape. "
+    "mermaid: {source}. "
+    "svg: {source} — must contain <svg> root. "
+    "image: {data_base64, mime} — mime in image/png|jpeg|webp, up to 5MB. "
+    "table: {columns:[{key,label,type}], rows:[[...]]} — type in string|number|date|link. "
+    "plot: {spec_vega_lite: object}. "
+    "code: {language, source, filename?, diff_from?}. "
+    "diff: {source} — unified diff text. "
+    "file-list: {files:[{path, label?, size?, status?}]}. "
+    "json: {json_data}. "
+    "pdf: {data_base64} or {path} — 25MB cap. "
+    "visual-diff: {before: {data_base64, mime}, after: {data_base64, mime}} — each side "
+    "image/png|jpeg|webp up to 5MB; before and after must share dimensions; multi-frame "
+    "sources (APNG, animated WebP) are rejected. "
+    "All text-kind payloads combined must fit in 100KB."
 )
 
 TOOL_SCHEMA: dict[str, Any] = {
@@ -92,7 +127,10 @@ TOOL_SCHEMA: dict[str, Any] = {
         "kind": {"enum": sorted(ARTIFACT_KINDS)},
         "title": {"type": "string", "maxLength": 200},
         "caption": {"type": "string", "maxLength": 500},
-        "payload": {"type": "object"},
+        "payload": {
+            "type": "object",
+            "description": _PAYLOAD_DESCRIPTION,
+        },
     },
 }
 
@@ -711,6 +749,120 @@ def _write_audio(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
     _write_binary(artifact_dir, artifact_id, AUDIO_MIMES[mime], result.data)
     return normalized
 
+def _decode_image_payload(payload: dict[str, Any], field: str) -> tuple[bytes, str]:
+    if not isinstance(payload, dict):
+        raise ArtifactValidationError(f"payload.{field} must be an object")
+    _require_keys(payload, required={"data_base64", "mime"})
+    encoded = _require_string(payload["data_base64"], f"payload.{field}.data_base64")
+    mime = payload["mime"]
+    if mime not in IMAGE_TYPES:
+        raise ArtifactValidationError(
+            f"payload.{field}.mime must be image/png, image/jpeg, or image/webp"
+        )
+    if len(encoded) > ((IMAGE_LIMIT + 2) // 3) * 4 + 4:
+        raise ArtifactValidationError(
+            f"payload.{field} exceeds the 5MB image limit"
+        )
+    try:
+        data = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ArtifactValidationError(
+            f"payload.{field}.data_base64 is not valid base64"
+        ) from exc
+    if len(data) > IMAGE_LIMIT:
+        raise ArtifactValidationError(
+            f"payload.{field} exceeds the 5MB image limit"
+        )
+    return data, mime
+
+
+def _reject_multi_frame(data: bytes, mime: str, variant: str) -> None:
+    """Reject APNG / animated WebP payloads for visual-diff.
+
+    An animated payload survives scrub_image (metadata strippers preserve
+    APNG fcTL/fdAT and WebP ANIM/ANMF chunks), and the two <img> tags each
+    animate on their own clock, so equal source frames would still report
+    phase-difference "changes" during compare. Fail loud at ingest.
+
+    Pillow's Image.open runs decompression-bomb detection on the *declared*
+    dimensions and raises DecompressionBombError (bare Exception, not
+    ValueError) — that used to escape this helper and terminate the whole
+    per-run MCP server on a malformed 10000x10000 declaration. So gate the
+    Pillow call behind header-side and pixel caps, and treat every other
+    probe failure as "defer to scrub_image for the canonical error."
+    """
+    try:
+        width, height = probe_dimensions(data, mime)
+    except ImageScrubError:
+        return
+    if (
+        width <= 0
+        or height <= 0
+        or width > IMAGE_MAX_SIDE
+        or height > IMAGE_MAX_SIDE
+        or width * height > IMAGE_MAX_PIXELS
+    ):
+        # Out-of-bounds sizes will surface via scrub_image with its
+        # canonical error message a moment later; do not open with Pillow.
+        return
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            if getattr(image, "n_frames", 1) > 1:
+                raise ArtifactValidationError(
+                    f"payload.{variant} rejected: multi-frame images are not"
+                    f" supported for visual-diff"
+                )
+    except ArtifactValidationError:
+        raise
+    except Exception:  # noqa: BLE001 — Pillow raises many types; canonical error comes from scrub_image
+        return
+
+
+def _write_visual_diff(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
+    _require_keys(payload, required={"before", "after"})
+    scrubbed: dict[str, Any] = {}
+    for variant in VISUAL_DIFF_VARIANTS:
+        data, mime = _decode_image_payload(payload[variant], variant)
+        _reject_multi_frame(data, mime, variant)
+        try:
+            result = scrub_image(data, mime)
+        except ImageScrubError as exc:
+            raise ArtifactValidationError(
+                f"payload.{variant} rejected: {exc}"
+            ) from exc
+        if len(result.data) > IMAGE_LIMIT:
+            raise ArtifactValidationError(
+                f"payload.{variant} exceeds the 5MB image limit"
+            )
+        scrubbed[variant] = result
+    if scrubbed["before"].width != scrubbed["after"].width or (
+        scrubbed["before"].height != scrubbed["after"].height
+    ):
+        raise ArtifactValidationError(
+            "visual-diff before and after images must have identical dimensions"
+        )
+    artifact_dir = _artifact_run_dir()
+    normalized: dict[str, Any] = {}
+    for variant in VISUAL_DIFF_VARIANTS:
+        result = scrubbed[variant]
+        _write_binary(
+            artifact_dir,
+            f"{artifact_id}.{variant}",
+            IMAGE_TYPES[result.mime],
+            result.data,
+        )
+        entry: dict[str, Any] = {
+            "ref": f"artifact://{artifact_id}/{variant}",
+            "mime": result.mime,
+            "byte_size": len(result.data),
+            "width": result.width,
+            "height": result.height,
+        }
+        if result.preview_base64:
+            entry["preview_base64"] = result.preview_base64
+        normalized[variant] = entry
+    return normalized
+
 
 def render_artifact(arguments: Any) -> dict[str, Any]:
     if not isinstance(arguments, dict):
@@ -742,6 +894,8 @@ def render_artifact(arguments: Any) -> dict[str, Any]:
         artifact.update(_write_video(payload, artifact_id))
     elif kind == "audio":
         artifact.update(_write_audio(payload, artifact_id))
+    elif kind == "visual-diff":
+        artifact.update(_write_visual_diff(payload, artifact_id))
     else:
         artifact.update(_validate_text_payload(kind, payload))
     event: dict[str, Any] = {
@@ -794,7 +948,7 @@ def artifact_from_text(value: Any) -> dict[str, Any] | None:
             _validate_binary_artifact(event, artifact)
         except ArtifactValidationError:
             return None
-    else:
+    elif kind != "visual-diff":
         payload = {key: item for key, item in artifact.items() if key != "kind"}
         try:
             _validate_text_payload(kind, payload)

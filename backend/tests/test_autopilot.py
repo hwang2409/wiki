@@ -17,6 +17,10 @@ from backend.app.agent_runtime.autopilot import (
     parse_verdict,
     verdict_from_graph,
 )
+from backend.app.agent_runtime.diversity_orchestration import (
+    collect_diversity_verdict,
+    create_journal,
+)
 
 
 PR_URL = "https://github.com/hwang2409/wiki/pull/173"
@@ -98,6 +102,88 @@ ARCHIVED_VERDICTS = (
 
 
 class AutopilotTests(unittest.TestCase):
+    def test_uppercase_fleet_identity_reads_canonical_diversity_verdicts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime_dir = Path(directory) / "runtime"
+            ticket = "WIKI-226-IDENTITY"
+            sha = "0" * 40
+            lenses = ["correctness", "security"]
+            reviewers = {
+                lens: f"{ticket}-REVIEW1-{lens}" for lens in lenses
+            }
+            create_journal(
+                runtime_dir,
+                ticket=ticket,
+                round_number=1,
+                expected_sha=sha,
+                expected_lenses=lenses,
+                reviewers=reviewers,
+                orch="wiki",
+            )
+            for lens in lenses:
+                path = Path("/tmp") / f"{ticket}-REVIEW1-{lens}-verdict.json"
+                path.write_text(
+                    json.dumps(
+                        {
+                            "worker": reviewers[lens],
+                            "state": "MERGE-READY",
+                            "source_sha": sha,
+                            "findings": [],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                self.addCleanup(path.unlink, missing_ok=True)
+
+            graph = {
+                "ticket": ticket,
+                "orch": "wiki",
+                "nodes": [],
+                "edges": [
+                    {"kind": "spawn", "to": ticket, "payload": {"role": "implement"}},
+                    *[
+                        {"kind": "spawn", "to": reviewer, "payload": {"role": "review"}}
+                        for reviewer in reviewers.values()
+                    ],
+                ],
+            }
+            recorded: list[dict] = []
+
+            def collect(**kwargs):
+                return collect_diversity_verdict(
+                    runtime_dir=runtime_dir,
+                    record_verdict=lambda **values: recorded.append(values),
+                    **kwargs,
+                )
+
+            controller = AutopilotController(
+                store=AutopilotStore(Path(directory) / "state"),
+                status_reader=lambda _ticket: {"pr": PR_URL, "sha": sha},
+                registry_reader=lambda: {ticket: {"current": {"orch": "wiki"}}},
+                graph_loader=lambda _ticket: graph,
+                collect_diversity=collect,
+                gate=lambda pr, _sha: {"verdict": "pass", "pr": pr},
+                merge=lambda _pr, _sha: None,
+                record_verdict=lambda *args, **kwargs: recorded.append(
+                    {"args": args, **kwargs}
+                ),
+            )
+            controller.enable(ticket)
+            for lens in lenses:
+                result = asyncio.run(
+                    controller.on_transition(
+                        {
+                            "agent_id": f"{ticket}-REVIEW1-{lens.upper()}",
+                            "run_id": f"run-{lens}",
+                            "status_state": "merge-ready",
+                            "sha": sha,
+                        }
+                    )
+                )
+                self.assertTrue(result, controller.status(ticket))
+
+            self.assertTrue(any(item.get("reviewer") == reviewers["security"] for item in recorded))
+
     def test_diversity_controller_waits_for_lenses_and_handles_combined_verdict(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             graph = {

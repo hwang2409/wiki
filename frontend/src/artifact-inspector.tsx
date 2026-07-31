@@ -22,6 +22,7 @@ import { PdfArtifactDetail } from "./artifact-detail/pdf";
 import { PlotArtifactDetail } from "./artifact-detail/plot";
 import { SvgArtifactDetail } from "./artifact-detail/svg";
 import { TableArtifactDetail } from "./artifact-detail/table";
+import { VisualDiffArtifactDetail } from "./artifact-detail/visual-diff";
 import { classifyArtifact, humanizeArtifactKind } from "./artifact-kind";
 import { AudioRenderer, VideoRenderer } from "./artifact-media-renderers";
 import { downloadArtifact, imageBase64, textPayload } from "./artifact-payload";
@@ -403,6 +404,7 @@ export function ArtifactInspector({
       case "pdf": return <PdfArtifactDetail artifact={artifact} event={active} onChange={onViewChange} state={viewState} ticket={ticket} />;
       case "video": return <VideoRenderer artifact={artifact} event={active} ticket={ticket} />;
       case "audio": return <AudioRenderer artifact={artifact} event={active} ticket={ticket} />;
+      case "visual-diff": return <VisualDiffArtifactDetail artifact={artifact} event={active} ticket={ticket} />;
     }
   })() : null;
 
