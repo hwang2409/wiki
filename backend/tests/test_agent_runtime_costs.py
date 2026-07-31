@@ -264,6 +264,15 @@ class CostAggregatorTests(unittest.TestCase):
         self.assertEqual(record["input"], 200)
         self.assertEqual(record["output"], 20)
 
+    def test_refresh_does_not_leak_file_descriptors(self) -> None:
+        raw = self._run("run-fd")
+        raw.write_text(json.dumps(_envelope("2026-07-30T10:00:00Z", _usage(10, 2))) + "\n", encoding="utf-8")
+        costs.refresh()
+        baseline = len(os.listdir("/dev/fd"))
+        for _ in range(5):
+            costs.refresh(costs._load_state())
+        self.assertEqual(len(os.listdir("/dev/fd")), baseline)
+
     def test_state_is_atomic_and_does_not_touch_live_paths(self) -> None:
         raw = self._run("run-atomic")
         raw.write_text(json.dumps(_envelope("2026-07-30T10:00:00Z", _usage(10, 2))) + "\n", encoding="utf-8")

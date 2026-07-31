@@ -119,7 +119,10 @@ ALLOWED_STATE_TRANSITIONS: dict[LifecycleState, frozenset[LifecycleState]] = {
 RESTART_RECOVERY_TABLE: dict[LifecycleState, RecoveryAction] = {
     LifecycleState.STARTING: RecoveryAction.BLOCK,
     LifecycleState.WORKING: RecoveryAction.RESUME,
-    LifecycleState.WAITING_APPROVAL: RecoveryAction.BLOCK,
+    # A supervisor handover closes the provider transport without changing
+    # durable run state. The next supervisor can resume the exact session and
+    # let the provider re-emit its pending approval request.
+    LifecycleState.WAITING_APPROVAL: RecoveryAction.RESUME,
     LifecycleState.IDLE: RecoveryAction.RESUME,
     LifecycleState.INTERRUPTED: RecoveryAction.SKIP,
     LifecycleState.DEAD: RecoveryAction.SKIP,
@@ -388,13 +391,15 @@ def restart_recovery_decision(
     its adapter control channel. A PID alone is not liveness: after supervisor
     restart it may be an orphan or reused PID, so the run is blocked rather
     than duplicated until an adapter can verify process identity. For a
-    working/idle run, that block preserves `recovery_from_state`; the daemon
-    rechecks the PID and resumes the exact session once it exits.
+    working, waiting-approval, or idle run, that block preserves
+    `recovery_from_state`; the daemon rechecks the PID and resumes the exact
+    session once it exits.
 
     The supervisor guards an automatic resume until its replacement control
     stream remains attached for the configured stability window. A failed or
     immediately dying resume is not retried every polling tick; its original
-    working/idle intent remains available for an explicit operator resume.
+    working, waiting-approval, or idle intent remains available for an
+    explicit operator resume.
     """
 
     if not is_current:
@@ -413,7 +418,12 @@ def restart_recovery_decision(
             RecoveryAction.BLOCK,
             "provider PID is live but its control channel is not attached",
             retryable=(
-                recovery_state in {LifecycleState.WORKING, LifecycleState.IDLE}
+                recovery_state
+                in {
+                    LifecycleState.WORKING,
+                    LifecycleState.WAITING_APPROVAL,
+                    LifecycleState.IDLE,
+                }
                 and bool(record.provider_session_id)
             ),
         )
@@ -428,7 +438,7 @@ def restart_recovery_decision(
         RecoveryAction.BLOCK: (
             "provider start did not finish"
             if recovery_state is LifecycleState.STARTING
-            else "pending approval cannot be reconstructed safely"
+            else "pending approval session will be resumed"
         ),
         RecoveryAction.SKIP: f"state {recovery_state.value} is not auto-resumable",
     }

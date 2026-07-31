@@ -22,14 +22,8 @@ if [[ ! -d "$staged_bundle" && ! -f "$swap_intent" ]]; then
   exit 1
 fi
 
-python3 "$ROOT/scripts/atomic_swap.py" \
-  "$staged_bundle" \
-  "$live_bundle" \
+python3 "$ROOT/scripts/native_swap_transaction.py" \
+  "$stage_root" \
   --runtime-dir "$runtime_dir" \
-  --success-sentinel "$stage_root/.swap-complete" \
-  --swap-intent "$swap_intent" \
+  --repo-root "$ROOT" \
   "${allow_missing_args[@]}"
-
-rm -rf "$stage_root"
-
-echo "swapped staged Wiki.app into $live_bundle"

@@ -2,9 +2,9 @@ use std::{
     collections::HashSet,
     env,
     error::Error,
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
-    io::{self, Write},
+    io::{self, Read, Write},
     net::TcpListener,
     os::fd::AsRawFd,
     os::unix::fs::PermissionsExt,
@@ -14,6 +14,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use crate::persistent_daemon;
 use reqwest::{blocking::Client, Url};
 use tauri::{
     ipc::CapabilityBuilder, webview::NewWindowResponse, App, AppHandle, Manager, RunEvent,
@@ -33,6 +34,7 @@ const SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
 const MAIN_WINDOW_LABEL: &str = "main";
 const WINDOW_TITLE: &str = "Wiki";
 const APP_LOCK_NAME: &str = "app.lock";
+const EXPECTED_BACKEND_FINGERPRINT: &str = env!("WIKI_EXPECTED_BACKEND_FINGERPRINT");
 // Guard: WKWebView can defer this eval past the post-health navigate() when
 // the backend boots fast (onedir sidecar ~0.4s) — unguarded, the deferred
 // write CLOBBERS the already-loaded app with the static loading card.
@@ -134,12 +136,10 @@ pub struct NativeAppState {
 struct LifecycleState {
     app_origin: Option<String>,
     sidecar: Option<SidecarState>,
-    // Wiki.app origin secret captured from the backend sidecar's stdout on
-    // startup (marker line `[[WIKI_APP_SECRET_BOOT]]=<hex>`). Held in Rust
-    // process memory only — the webview reads it via the
-    // `get_wiki_app_secret` invoke command. Worker CLI processes have no
-    // invoke bridge and cannot pull the value, so `/api/composer/*` calls
-    // from workers fail with 403. WIKI-148 round 6, Path B.
+    // Wiki.app origin secret received through the sidecar stdin pipe or the
+    // daemon's code-identity-authenticated runtime channel. Held in Rust
+    // process memory only.
+    // WIKI-148 round 6, Path B.
     wiki_app_secret: Option<String>,
     // Loopback origins for which a remote-scoped ACL capability granting
     // `allow-get-wiki-app-secret` has already been registered via
@@ -147,9 +147,8 @@ struct LifecycleState {
     // therefore need a fresh capability; tracking prevents duplicate
     // registration for the same origin. WIKI-148 round 7.
     ipc_authorized_origins: HashSet<String>,
+    daemon_managed: bool,
 }
-
-const WIKI_APP_SECRET_MARKER: &str = "[[WIKI_APP_SECRET_BOOT]]=";
 
 struct SidecarState {
     child: Option<CommandChild>,
@@ -203,10 +202,16 @@ pub fn setup(app: &mut App, app_lock: File) -> Result<(), Box<dyn Error>> {
 }
 
 fn runtime_dir() -> PathBuf {
-    env::var_os("WIKI_AGENT_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".wiki/agent-runtime")))
-        .unwrap_or_else(|| PathBuf::from(".wiki/agent-runtime"))
+    let default = env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".wiki/agent-runtime"))
+        .unwrap_or_else(|| PathBuf::from(".wiki/agent-runtime"));
+    if native_dev_mode() {
+        env::var_os("WIKI_AGENT_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or(default)
+    } else {
+        default
+    }
 }
 
 pub fn acquire_app_lock() -> io::Result<File> {
@@ -276,6 +281,7 @@ pub fn handle_run_event(app: &AppHandle, event: RunEvent) {
 
 fn start_sidecar(app: &AppHandle, restart_count: u8) -> Result<String, Box<dyn Error>> {
     let port = pick_loopback_port()?;
+    let app_secret = new_app_secret()?;
     let launch_url = format!("http://127.0.0.1:{port}/");
     let repo_dir = resolve_repo_dir();
     let vault_dir = resolve_vault_dir(&repo_dir);
@@ -293,10 +299,13 @@ fn start_sidecar(app: &AppHandle, restart_count: u8) -> Result<String, Box<dyn E
         ),
     )?;
 
-    let (rx, child) = app
+    let inherited_env = sidecar_environment_without_secret();
+    let (rx, mut child) = app
         .shell()
         .sidecar("wiki-backend")?
         .current_dir(&repo_dir)
+        .env_clear()
+        .envs(inherited_env)
         .env("PATH", FINDER_SAFE_PATH)
         .env("WIKI_REPO_DIR", &repo_dir)
         .env("WIKI_VAULT_DIR", &vault_dir)
@@ -314,10 +323,17 @@ fn start_sidecar(app: &AppHandle, restart_count: u8) -> Result<String, Box<dyn E
         ])
         .spawn()?;
 
+    if let Err(error) = child.write(format!("{app_secret}\n").as_bytes()) {
+        let _ = child.kill();
+        return Err(io::Error::other(format!("cannot send sidecar auth pipe: {error}")).into());
+    }
+
     let pid = child.pid();
     {
         let app_state = app.state::<NativeAppState>();
         let mut state = app_state.inner.lock().unwrap();
+        state.wiki_app_secret = Some(app_secret.clone());
+        state.daemon_managed = false;
         state.sidecar = Some(SidecarState {
             child: Some(child),
             pid,
@@ -354,13 +370,33 @@ fn start_sidecar(app: &AppHandle, restart_count: u8) -> Result<String, Box<dyn E
     Ok(launch_url)
 }
 
+fn new_app_secret() -> io::Result<String> {
+    let mut bytes = [0_u8; 32];
+    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn sidecar_environment_without_secret() -> Vec<(OsString, OsString)> {
+    env::vars_os()
+        .filter(|(key, _)| key != OsStr::new("WIKI_APP_SECRET"))
+        .collect()
+}
+
 fn launch_backend_and_navigate(app: &AppHandle) {
-    let launch_result = if let Ok(url) = env::var("WIKI_NATIVE_BACKEND_URL") {
-        let launch_url = normalize_launch_url(&url);
-        wait_for_health(app, &launch_url, None).map(|_| launch_url)
-    } else {
-        start_sidecar(app, 0)
-    };
+    let launch_result =
+        if should_use_sidecar(native_dev_mode(), persistent_daemon::self_is_adhoc_bundle()) {
+            start_sidecar(app, 0)
+        } else {
+            match persistent_daemon::probe(&runtime_dir(), EXPECTED_BACKEND_FINGERPRINT) {
+                Ok(Some((launch_url, secret))) => {
+                    set_app_secret(app, secret);
+                    set_daemon_managed(app, true);
+                    Ok(launch_url)
+                }
+                Ok(None) => start_sidecar(app, 0),
+                Err(error) => Err(io::Error::other(error).into()),
+            }
+        };
 
     match launch_result {
         Ok(launch_url) => {
@@ -379,6 +415,57 @@ fn launch_backend_and_navigate(app: &AppHandle) {
     }
 }
 
+fn should_use_sidecar(native_dev: bool, self_is_adhoc: bool) -> bool {
+    native_dev || self_is_adhoc
+}
+
+fn native_dev_mode() -> bool {
+    native_dev_flag(env::var("WIKI_NATIVE_DEV").ok().as_deref())
+}
+
+fn native_dev_flag(value: Option<&str>) -> bool {
+    matches!(value, Some("1" | "true" | "yes" | "on"))
+}
+
+fn set_app_secret(app: &AppHandle, secret: String) {
+    set_app_secret_state(&app.state::<NativeAppState>(), secret);
+}
+
+fn set_app_secret_state(state: &NativeAppState, secret: String) {
+    let mut guard = state.inner.lock().unwrap();
+    guard.wiki_app_secret = Some(secret);
+}
+
+fn refresh_daemon_secret(state: &NativeAppState) -> bool {
+    let (daemon_managed, current_origin) = {
+        let guard = state.inner.lock().unwrap();
+        (guard.daemon_managed, guard.app_origin.clone())
+    };
+    if !daemon_managed {
+        return true;
+    }
+    let Some(current_origin) = current_origin else {
+        return false;
+    };
+    if let Some(secret) = persistent_daemon::refresh_secret(
+        &runtime_dir(),
+        daemon_managed,
+        EXPECTED_BACKEND_FINGERPRINT,
+        &current_origin,
+    ) {
+        set_app_secret_state(state, secret);
+        true
+    } else {
+        false
+    }
+}
+
+fn set_daemon_managed(app: &AppHandle, daemon_managed: bool) {
+    let app_state = app.state::<NativeAppState>();
+    let mut state = app_state.inner.lock().unwrap();
+    state.daemon_managed = daemon_managed;
+}
+
 fn spawn_sidecar_logger(
     app: AppHandle,
     pid: u32,
@@ -390,22 +477,7 @@ fn spawn_sidecar_logger(
             match event {
                 CommandEvent::Stdout(line) => {
                     let decoded = decode_line(&line);
-                    if let Some(secret) = decoded.strip_prefix(WIKI_APP_SECRET_MARKER) {
-                        // Capture the Wiki.app origin secret out of the
-                        // stdout stream BEFORE it ever hits the log. Worker
-                        // sessions can read the log file (same user), so the
-                        // marker line must never be persisted anywhere on
-                        // disk. WIKI-148 round 6, Path B.
-                        let app_state = app.state::<NativeAppState>();
-                        let mut state = app_state.inner.lock().unwrap();
-                        state.wiki_app_secret = Some(secret.trim().to_string());
-                        let _ = append_log(
-                            &log_path,
-                            "stdout <wiki-app-secret captured; line redacted>",
-                        );
-                    } else {
-                        let _ = append_log(&log_path, &format!("stdout {decoded}"));
-                    }
+                    let _ = append_log(&log_path, &format!("stdout {decoded}"));
                 }
                 CommandEvent::Stderr(line) => {
                     let _ = append_log(&log_path, &format!("stderr {}", decode_line(&line)));
@@ -638,9 +710,7 @@ fn set_app_origin(app: &AppHandle, launch_url: &str) {
         state.app_origin = origin.clone();
     }
     if let Err(err) = register_wiki_app_secret_capability(app, launch_url) {
-        eprintln!(
-            "failed to register get_wiki_app_secret capability for {launch_url}: {err}"
-        );
+        eprintln!("failed to register get_wiki_app_secret capability for {launch_url}: {err}");
     }
 }
 
@@ -659,8 +729,8 @@ fn register_wiki_app_secret_capability<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     launch_url: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let parsed = Url::parse(launch_url)
-        .map_err(|err| format!("invalid launch url {launch_url}: {err}"))?;
+    let parsed =
+        Url::parse(launch_url).map_err(|err| format!("invalid launch url {launch_url}: {err}"))?;
     let origin = parsed.origin().ascii_serialization();
     // urlpattern-style: origin + wildcard pathname keeps this scoped to
     // the exact scheme/host/port while allowing the SPA to navigate
@@ -696,15 +766,16 @@ fn app_origin(app: &AppHandle) -> Option<String> {
     state.app_origin.clone()
 }
 
-/// Return the Wiki.app origin secret captured from the backend sidecar's
-/// startup stdout. Called by the webview via `invoke("get_wiki_app_secret")`
-/// to attach an `X-Wiki-App-Secret` header on composer requests. Fails while
-/// the sidecar is still coming up (secret not yet observed) — the webview
-/// retries once the composer form is dispatched. WIKI-148 round 6, Path B.
+/// Return the Wiki.app origin secret captured during backend startup.
+/// Called by the webview via `invoke("get_wiki_app_secret")` to attach an
+/// `X-Wiki-App-Secret` header on composer requests. WIKI-148 round 6, Path B.
 #[tauri::command]
-pub fn get_wiki_app_secret(
-    state: tauri::State<'_, NativeAppState>,
-) -> Result<String, String> {
+pub fn get_wiki_app_secret(state: tauri::State<'_, NativeAppState>) -> Result<String, String> {
+    if !refresh_daemon_secret(&state) {
+        return Err(
+            "daemon origin changed; reload Wiki.app before requesting its secret".to_string(),
+        );
+    }
     let guard = state.inner.lock().unwrap();
     guard
         .wiki_app_secret
@@ -715,8 +786,9 @@ pub fn get_wiki_app_secret(
 fn allow_in_webview(app: &AppHandle, url: &Url) -> bool {
     match url.scheme() {
         "tauri" | "asset" | "about" => true,
-        "http" | "https" => app_origin(app)
-            .is_some_and(|origin| origin == url.origin().ascii_serialization()),
+        "http" | "https" => {
+            app_origin(app).is_some_and(|origin| origin == url.origin().ascii_serialization())
+        }
         _ => false,
     }
 }
@@ -742,22 +814,6 @@ fn handle_new_window_request(app: &AppHandle, url: &Url) -> NewWindowResponse<ta
         return NewWindowResponse::Allow;
     }
     NewWindowResponse::Deny
-}
-
-fn normalize_launch_url(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if let Ok(mut url) = reqwest::Url::parse(trimmed) {
-        if url.path().is_empty() {
-            url.set_path("/");
-        }
-        return url.to_string();
-    }
-
-    if trimmed.ends_with('/') {
-        trimmed.to_string()
-    } else {
-        format!("{trimmed}/")
-    }
 }
 
 fn health_url_for(launch_url: &str) -> String {
@@ -862,6 +918,23 @@ fn request_graceful_shutdown(_pid: u32) {}
 mod tests {
     use super::repo_dir_from_manifest_dir;
     use std::path::Path;
+
+    #[test]
+    fn sidecar_environment_excludes_origin_secret() {
+        assert!(super::sidecar_environment_without_secret()
+            .iter()
+            .all(|(key, _)| key != "WIKI_APP_SECRET"));
+    }
+
+    #[test]
+    fn native_dev_bypasses_installed_daemon_probe() {
+        assert!(super::native_dev_flag(Some("1")));
+        assert!(!super::native_dev_flag(Some("0")));
+        assert!(!super::native_dev_flag(None));
+        assert!(super::should_use_sidecar(true, false));
+        assert!(super::should_use_sidecar(false, true));
+        assert!(!super::should_use_sidecar(false, false));
+    }
 
     #[test]
     fn repo_dir_defaults_to_manifest_parent() {
@@ -994,7 +1067,10 @@ mod tests {
             register_wiki_app_secret_capability(&handle, LOOPBACK_URL).unwrap();
             let state = app.state::<NativeAppState>();
             let guard = state.inner.lock().unwrap();
-            let origin = Url::parse(LOOPBACK_URL).unwrap().origin().ascii_serialization();
+            let origin = Url::parse(LOOPBACK_URL)
+                .unwrap()
+                .origin()
+                .ascii_serialization();
             assert!(guard.ipc_authorized_origins.contains(&origin));
             assert_eq!(guard.ipc_authorized_origins.len(), 1);
         }

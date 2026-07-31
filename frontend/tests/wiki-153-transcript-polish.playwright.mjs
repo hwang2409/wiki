@@ -15,8 +15,10 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", ".
 const OUT_DIR = process.env.WIKI_PLAYWRIGHT_OUT_DIR || "/tmp/wiki-153-playwright-evidence";
 const TICKET = "WIKI-153";
 
+// WIKI-222: long fixtures must exceed STREAM_CLAMP_LINES (40) so the clip +
+// expand affordance still engages under the generous shared threshold.
 const LONG_INPUT_LINES = 22;
-const LONG_OUTPUT_LINES = 30;
+const LONG_OUTPUT_LINES = 48;
 
 function logStep(message) {
   console.error(`[wiki-153] ${message}`);
@@ -50,7 +52,7 @@ const BASH_COMMAND_TEXT = [
   `  && cat /tmp/wiki-153-fixture/large.log | head -${LONG_OUTPUT_LINES}`,
 ].join("\n");
 
-const BASH_TOOL_INPUT_LINES = 34;
+const BASH_TOOL_INPUT_LINES = 48;
 const BASH_TOOL_INPUT = [
   `#!/usr/bin/env bash`,
   `set -euo pipefail`,

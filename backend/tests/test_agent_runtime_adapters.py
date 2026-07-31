@@ -1207,8 +1207,10 @@ class ClaudeAdapterTests(unittest.IsolatedAsyncioTestCase):
         adapter = self._adapter(working)
         resumed = await adapter.resume(working.provider_session_id)
         self.assertEqual(resumed.state, LifecycleState.WORKING)
-        rows = _protocol_rows(self.log)
-        user = next(row for row in rows if row.get("type") == "user")
+        user = await _wait_protocol_row(
+            self.log,
+            lambda row: row.get("type") == "user",
+        )
         self.assertIn(
             str(self.root / "status" / "WIKI-42.json"),
             user["message"]["content"][0]["text"],

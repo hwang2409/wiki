@@ -27,8 +27,14 @@ from backend.app.agent_runtime.client import (
     SupervisorUnavailable,
 )
 from backend.app.agent_runtime import daemon as agent_daemon
+from backend.app.agent_runtime import supervisor as supervisor_module
+from backend.app.agent_runtime.claude import ClaudeStreamAdapter
 from backend.app.agent_runtime.codex import CodexAppServerAdapter
-from backend.app.agent_runtime.fake import CodexFixtureAdapter, FixtureAdapterFactory
+from backend.app.agent_runtime.fake import (
+    ClaudeFixtureAdapter,
+    CodexFixtureAdapter,
+    FixtureAdapterFactory,
+)
 from backend.app.agent_runtime.process import (
     ProviderProcessIdentity,
     ProviderProcessStatus,
@@ -39,6 +45,7 @@ from backend.app.agent_runtime.process import (
 from backend.app.agent_runtime.protocol import UnixSupervisorServer
 from backend.app.agent_runtime.provider import (
     AdapterStatus,
+    ProviderAdapter,
     ProviderEvent,
     StartRequest,
 )
@@ -90,6 +97,228 @@ class ResumeFailureAdapter(CodexFixtureAdapter):
             )
         )
         raise RuntimeError("fixture resume failure")
+
+
+class ApprovalRecoveryStallAdapter(CodexFixtureAdapter):
+    """Accept the continuation but never emit a replacement approval."""
+
+
+class ApprovalRecoveryAdapter(CodexFixtureAdapter):
+    def __init__(self, *args, resumed_sessions: list[str], **kwargs):
+        super().__init__(*args, **kwargs)
+        self.resumed_sessions = resumed_sessions
+
+    async def resume(self, session_id: str) -> AdapterStatus:
+        self.resumed_sessions.append(session_id)
+        return await super().resume(session_id)
+
+    async def send_now(self, message: str) -> AdapterStatus:
+        del message
+        status = self.snapshot()
+        self._status = AdapterStatus(  # noqa: SLF001 - approval recovery fixture
+            LifecycleState.WAITING_APPROVAL,
+            status.session_id,
+            status.pid,
+            generation=max(1, status.generation),
+        )
+        await self._events.put(  # noqa: SLF001 - approval recovery fixture
+            ProviderEvent(
+                ProviderKind.CODEX,
+                {
+                    "id": 8,
+                    "method": "item/tool/requestUserInput",
+                    "params": {
+                        "questions": [{"id": "surface", "question": "Which surface?"}]
+                    },
+                },
+                generation=self._status.generation,  # noqa: SLF001
+            )
+        )
+        return self._status
+
+
+class HandoverStopEventCodexAdapter(CodexFixtureAdapter):
+    """Replay the Codex interrupt completion emitted while handover stops it."""
+
+    stop_result = "interrupted"
+
+    async def stop(self) -> AdapterStatus:
+        status = self.snapshot()
+        if status.state in {
+            LifecycleState.WORKING,
+            LifecycleState.WAITING_APPROVAL,
+        }:
+            if self.stop_result in {"approval", "approval_then_completed"}:
+                await self.emit_approval()
+                if self.stop_result == "approval_then_completed":
+                    await self._events.put(  # noqa: SLF001 - stop-event fixture
+                        ProviderEvent(
+                            ProviderKind.CODEX,
+                            {
+                                "method": "turn/completed",
+                                "params": {
+                                    "turn": {
+                                        "id": status.active_turn_id or "handover-turn",
+                                        "status": "completed",
+                                    }
+                                },
+                            },
+                            generation=status.generation,
+                        )
+                    )
+            else:
+                await self._events.put(  # noqa: SLF001 - stop-event fixture
+                    ProviderEvent(
+                        ProviderKind.CODEX,
+                        {
+                            "method": "turn/completed",
+                            "params": {
+                                "turn": {
+                                    "id": status.active_turn_id or "handover-turn",
+                                    "status": self.stop_result,
+                                }
+                            },
+                        },
+                        generation=status.generation,
+                    )
+                )
+        return await super().stop()
+
+    async def emit_approval(self) -> None:
+        status = self.snapshot()
+        self._status = AdapterStatus(  # noqa: SLF001 - handover fixture state
+            LifecycleState.WAITING_APPROVAL,
+            status.session_id,
+            status.pid,
+            generation=max(1, status.generation),
+            active_turn_id=status.active_turn_id or "approval-turn",
+        )
+        await self._events.put(  # noqa: SLF001 - approval handover fixture
+            ProviderEvent(
+                ProviderKind.CODEX,
+                {
+                    "id": "handover-approval",
+                    "method": "item/tool/requestUserInput",
+                    "params": {
+                        "questions": [
+                            {"id": "surface", "question": "Which surface?"}
+                        ]
+                    },
+                },
+                generation=self._status.generation,  # noqa: SLF001
+            )
+        )
+
+    async def send_now(self, message: str) -> AdapterStatus:
+        if "Recreate the exact approval question" in message:
+            await self.emit_approval()
+            return self.snapshot()
+        return await super().send_now(message)
+
+
+class HandoverCodexFactory(FixtureAdapterFactory):
+    def __init__(
+        self,
+        fixture_dir: Path,
+        *,
+        pid: int | None = None,
+        stop_result: str = "interrupted",
+    ):
+        super().__init__(fixture_dir, pid=pid)
+        self.stop_result = stop_result
+
+    def __call__(self, record: RunRecord) -> ProviderAdapter:
+        if record.provider is ProviderKind.CODEX:
+            adapter = HandoverStopEventCodexAdapter(
+                self.fixture_dir / "codex_app_server_success.jsonl",
+                self.fixture_dir / "codex_app_server_control.jsonl",
+                pid=self.pid,
+                generation=record.provider_generation,
+            )
+            adapter.stop_result = self.stop_result
+            return adapter
+        return super().__call__(record)
+
+
+class HandoverCancelClaudeAdapter(ClaudeFixtureAdapter):
+    recovery_prompt_count = 0
+
+    async def start(self, request: StartRequest) -> AdapterStatus:
+        self._request = request  # noqa: SLF001 - handover cancel fixture
+        self._status = AdapterStatus(
+            LifecycleState.IDLE,
+            str(uuid4()),
+            self.pid,
+            generation=max(1, self.snapshot().generation + 1),
+        )
+        return self.snapshot()
+
+    async def resume(self, session_id: str) -> AdapterStatus:
+        self._status = AdapterStatus(  # noqa: SLF001 - handover cancel fixture
+            LifecycleState.IDLE,
+            session_id,
+            self.pid,
+            generation=max(1, self.snapshot().generation + 1),
+        )
+        return self.snapshot()
+
+    async def stop(self) -> AdapterStatus:
+        if self.snapshot().state is LifecycleState.WAITING_APPROVAL:
+            await self._events.put(  # noqa: SLF001 - handover cancel fixture
+                ProviderEvent(
+                    ProviderKind.CLAUDE,
+                    {"type": "control_cancel_request", "request_id": "old"},
+                    direction="stdout",
+                    generation=self.snapshot().generation,
+                )
+            )
+            await self._events.put(  # noqa: SLF001 - end-session response fixture
+                ProviderEvent(
+                    ProviderKind.CLAUDE,
+                    {
+                        "type": "control_response",
+                        "response": {"request_id": "end-session"},
+                    },
+                    direction="stdout",
+                    generation=self.snapshot().generation,
+                )
+            )
+        return await super().stop()
+
+    async def send_now(self, message: str) -> AdapterStatus:
+        if "Recreate the exact approval question" in message:
+            self.recovery_prompt_count += 1
+            await self._events.put(  # noqa: SLF001 - approval recovery fixture
+                ProviderEvent(
+                    ProviderKind.CLAUDE,
+                    {
+                        "type": "control_request",
+                        "request_id": "old",
+                        "request": {"subtype": "can_use_tool"},
+                    },
+                    direction="stdout",
+                    generation=self.snapshot().generation,
+                )
+            )
+            self._status = AdapterStatus(
+                LifecycleState.WAITING_APPROVAL,
+                self.snapshot().session_id,
+                self.snapshot().pid,
+                generation=self.snapshot().generation,
+            )
+            return self.snapshot()
+        return await super().send_now(message)
+
+
+class HandoverCancelFactory(FixtureAdapterFactory):
+    def __call__(self, record: RunRecord) -> ProviderAdapter:
+        if record.provider is ProviderKind.CLAUDE:
+            return HandoverCancelClaudeAdapter(
+                self.fixture_dir / "claude_stream_native_surfaces.jsonl",
+                pid=self.pid,
+                generation=record.provider_generation,
+            )
+        return super().__call__(record)
 
 
 def _paths(root: Path) -> RuntimePaths:
@@ -787,6 +1016,233 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("session", surfaces)
         self.supervisor.unsubscribe(events)
 
+    async def test_handover_reemits_and_answers_approval_through_real_adapters(self) -> None:
+        await self.supervisor.close()
+        env_root = self.root / "real-adapter-env"
+        env_root.mkdir()
+        codex_env = os.environ.copy()
+        codex_env.update(
+            {
+                "HOME": str(env_root / "codex-home"),
+                "CODEX_HOME": str(env_root / "codex"),
+                "FAKE_PROTOCOL_LOG": str(env_root / "codex-protocol.jsonl"),
+                "FAKE_CODEX_TRANSCRIPT_DIR": str(env_root / "codex-sessions"),
+                "FAKE_CODEX_APPROVAL": "1",
+            }
+        )
+        claude_env = os.environ.copy()
+        claude_env.update(
+            {
+                "HOME": str(env_root / "claude-home"),
+                "CLAUDE_CONFIG_DIR": str(env_root / "claude-config"),
+                "FAKE_PROTOCOL_LOG": str(env_root / "claude-protocol.jsonl"),
+            }
+        )
+
+        async def identity(
+            pid: int | None,
+            _provider: ProviderKind,
+            _session_id: str | None,
+            *,
+            reported_path: str | None = None,
+        ) -> ProviderProcessIdentity | None:
+            if pid is None or reported_path is None:
+                return None
+            return ProviderProcessIdentity(pid, reported_path)
+
+        async def no_identity(
+            _pid: int | None,
+            _provider: ProviderKind,
+            _session_id: str | None,
+            *,
+            reported_path: str | None = None,
+        ) -> ProviderProcessIdentity | None:
+            del reported_path
+            return None
+
+        def factory(record: RunRecord):
+            if record.provider is ProviderKind.CODEX:
+                return CodexAppServerAdapter(
+                    record,
+                    command=(
+                        sys.executable,
+                        "-u",
+                        str(FIXTURES / "fake_codex_app_server.py"),
+                    ),
+                    env=codex_env,
+                    request_timeout=1,
+                    identity_resolver=identity,
+                )
+            return ClaudeStreamAdapter(
+                record,
+                command=(
+                    sys.executable,
+                    "-u",
+                    str(FIXTURES / "fake_claude_stream.py"),
+                ),
+                env=claude_env,
+                request_timeout=1,
+                identity_resolver=no_identity,
+            )
+
+        self.supervisor = Supervisor(
+            self.store,
+            factory,
+            pid_alive=lambda _pid: False,
+        )
+        cases = (
+            (
+                ProviderKind.CODEX,
+                "WIKI-REAL-CODEX-APPROVAL",
+                "thread-recovery",
+                "int:old",
+                {
+                    "request_id": "old",
+                    "request_kind": "item/tool/requestUserInput",
+                    "payload": {
+                        "method": "item/tool/requestUserInput",
+                        "id": "old",
+                        "params": {"questions": [{"question": "Which surface?"}]},
+                    },
+                },
+                0,
+                {"answers": {"wiki_surface": {"answers": ["Agents page"]}}},
+            ),
+            (
+                ProviderKind.CLAUDE,
+                "WIKI-REAL-CLAUDE-APPROVAL",
+                "session-recovery",
+                "str:old",
+                {
+                    "request_id": "old",
+                    "request_kind": "can_use_tool",
+                    "payload": {
+                        "type": "control_request",
+                        "request_id": "old",
+                        "request": {"subtype": "can_use_tool"},
+                    },
+                },
+                "permission-1",
+                {
+                    "behavior": "deny",
+                    "message": "Denied by handover test",
+                    "interrupt": False,
+                    "toolUseID": "toolu_fixture",
+                },
+            ),
+        )
+        for (
+            provider,
+            agent_id,
+            session_id,
+            pending_key,
+            pending,
+            new_request_id,
+            response,
+        ) in cases:
+            with self.subTest(provider=provider.value):
+                record = RunRecord.new(
+                    agent_id=agent_id,
+                    provider=provider,
+                    role="implement",
+                    model="fixture-model",
+                    effort="high" if provider is ProviderKind.CODEX else None,
+                    worktree=str(self.worktree),
+                    prompt="handover approval",
+                )
+                record.state = LifecycleState.WAITING_APPROVAL
+                record.provider_session_id = session_id
+                record.provider_pid = 999_000 + len(cases)
+                record.provider_generation = 1
+                record.pending_requests[pending_key] = pending
+                self.store.create(record)
+
+                results = await self.supervisor.recover_on_start()
+                self.assertEqual(
+                    next(item for item in results if item["run_id"] == record.run_id)[
+                        "action"
+                    ],
+                    "resume",
+                )
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    current = self.store.get(record.run_id)
+                    if current.state is LifecycleState.WAITING_APPROVAL and current.pending_requests:
+                        break
+                    await asyncio.sleep(0.01)
+                current = self.store.get(record.run_id)
+                self.assertEqual(current.state, LifecycleState.WAITING_APPROVAL)
+                self.assertTrue(current.pending_requests)
+                await self.supervisor.respond(record.run_id, new_request_id, response)
+
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    current = self.store.get(record.run_id)
+                    if not current.pending_requests and current.state is not LifecycleState.WAITING_APPROVAL:
+                        break
+                    await asyncio.sleep(0.01)
+                current = self.store.get(record.run_id)
+                self.assertFalse(current.pending_requests)
+                self.assertNotEqual(current.state, LifecycleState.WAITING_APPROVAL)
+
+    async def test_failed_approval_recovery_drains_and_preserves_request(self) -> None:
+        await self.supervisor.close()
+
+        def factory(_record: RunRecord) -> ApprovalRecoveryStallAdapter:
+            return ApprovalRecoveryStallAdapter(
+                FIXTURES / "codex_app_server_success.jsonl",
+                FIXTURES / "codex_app_server_control.jsonl",
+                pid=os.getpid(),
+            )
+
+        self.supervisor = Supervisor(
+            self.store,
+            factory,
+            pid_alive=lambda _pid: False,
+            approval_recovery_timeout_seconds=0.05,
+        )
+        record = RunRecord.new(
+            agent_id="WIKI-APPROVAL-RECOVERY-STALL",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-model",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="handover approval",
+        )
+        record.state = LifecycleState.WAITING_APPROVAL
+        record.provider_session_id = "thread-recovery-stall"
+        record.provider_pid = 999_001
+        record.provider_generation = 1
+        record.pending_requests["int:7"] = {
+            "request_id": 7,
+            "request_kind": "item/tool/requestUserInput",
+            "payload": {
+                "method": "item/tool/requestUserInput",
+                "id": 7,
+                "params": {"questions": [{"question": "Which surface?"}]},
+            },
+        }
+        original_pending = dict(record.pending_requests)
+        self.store.create(record)
+
+        recovery = await self.supervisor.recover_on_start()
+        result = next(item for item in recovery if item["run_id"] == record.run_id)
+        self.assertEqual(result["action"], "block")
+        current = self.store.get(record.run_id)
+        self.assertEqual(current.state, LifecycleState.BLOCKED)
+        self.assertEqual(current.recovery_from_state, LifecycleState.WAITING_APPROVAL)
+        self.assertTrue(current.automatic_resume_suppressed)
+        self.assertEqual(current.pending_requests, original_pending)
+        self.assertNotIn(record.run_id, self.supervisor.adapters)
+
+        self.store.clear_automatic_resume_suppression(record.run_id)
+        with self.assertRaises(StoreConflict):
+            await self.supervisor.resume_run(record.run_id)
+        current = self.store.get(record.run_id)
+        self.assertEqual(current.pending_requests, original_pending)
+        self.assertNotIn(record.run_id, self.supervisor.adapters)
+
     async def test_background_codex_turn_rejection_is_durably_blocked(self) -> None:
         await self.supervisor.close()
         env = os.environ.copy()
@@ -1400,7 +1856,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(current.desired_model)
         self.assertIn(record.run_id, self.supervisor.adapters)
 
-    async def test_recovery_resumes_only_current_working_and_idle_with_dead_pid(
+    async def test_recovery_resumes_current_sessions_with_dead_pid(
         self,
     ) -> None:
         await self.supervisor.close()
@@ -1445,7 +1901,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(by_id[records["idle"].run_id]["action"], "resume")
             self.assertEqual(by_id[records["starting"].run_id]["action"], "block")
             self.assertEqual(
-                by_id[records["waiting-approval"].run_id]["action"], "block"
+                by_id[records["waiting-approval"].run_id]["action"], "resume"
             )
             self.assertEqual(by_id[records["dead"].run_id]["action"], "skip")
             self.assertEqual(by_id[records["completed"].run_id]["action"], "skip")
@@ -1457,7 +1913,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(
                 store.get(records["waiting-approval"].run_id).state,
-                LifecycleState.BLOCKED,
+                LifecycleState.IDLE,
             )
             self.assertEqual(
                 store.get(records["starting"].run_id).state,
@@ -1467,6 +1923,1018 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             await supervisor.close()
         # Keep tearDown from closing the already-closed original twice.
         self.supervisor = Supervisor(self.store, FixtureAdapterFactory(FIXTURES))
+
+    async def test_idle_recovery_delivers_queued_message_once_after_handover(self) -> None:
+        await self.supervisor.close()
+        store = RunStore(self.paths)
+        worktree = self.root / "recovery-idle-queued"
+        worktree.mkdir()
+        record = RunRecord.new(
+            agent_id="WIKI-IDLE-QUEUED-RECOVERY",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            worktree=str(worktree),
+            prompt="idle queued recovery",
+        )
+        record.state = LifecycleState.IDLE
+        record.provider_session_id = "idle-queued-session"
+        record.provider_pid = 999_123
+        store.create(record)
+        store.queue_message(record.run_id, "deliver after recovery")
+        supervisor = Supervisor(
+            store,
+            FixtureAdapterFactory(FIXTURES, pid=os.getpid()),
+            pid_alive=lambda _pid: False,
+        )
+        try:
+            results = await supervisor.recover_on_start()
+            self.assertEqual(results[0]["action"], "resume")
+            adapter = supervisor.adapters[record.run_id]
+            self.assertIsInstance(adapter, CodexFixtureAdapter)
+            assert isinstance(adapter, CodexFixtureAdapter)
+            self.assertEqual(adapter.replayed_methods.count("turn/start"), 1)
+            self.assertEqual(store.queued_messages(record.run_id), [])
+        finally:
+            await supervisor.close()
+        self.supervisor = Supervisor(self.store, FixtureAdapterFactory(FIXTURES))
+
+    async def test_handover_preserves_working_idle_waiting_runs_and_sessions(self) -> None:
+        records: list[RunRecord] = []
+        for index, state in enumerate(
+            (
+                LifecycleState.WORKING,
+                LifecycleState.IDLE,
+                LifecycleState.WAITING_APPROVAL,
+            ),
+            start=1,
+        ):
+            record = await self.supervisor.start_run(
+                agent_id=f"WIKI-HANDOVER-{index}",
+                provider=ProviderKind.CLAUDE,
+                role="implement",
+                model="fixture-claude",
+                effort=None,
+                worktree=str(self.worktree),
+                prompt=f"handover-{index}",
+            )
+            session_id = f"handover-session-{index}"
+            adapter_status = AdapterStatus(state, session_id, os.getpid(), generation=1)
+            record = self.store.transition(
+                record.run_id,
+                state,
+                adapter_status=adapter_status,
+            )
+            records.append(record)
+
+        saved = [
+            {
+                "run_id": record.run_id,
+                "agent_id": record.agent_id,
+                "provider_session_id": record.provider_session_id,
+            }
+            for record in records
+        ]
+        result = await self.supervisor.prepare_handover([record.run_id for record in records])
+        self.assertEqual(set(result["drained_run_ids"]), {record.run_id for record in records})
+        retry = await self.supervisor.prepare_handover()
+        self.assertEqual(retry, result)
+        await self.supervisor.close()
+        replacement = Supervisor(
+            RunStore(self.paths),
+            FixtureAdapterFactory(FIXTURES, pid=os.getpid()),
+            pid_alive=lambda _pid: False,
+        )
+        try:
+            await replacement.recover_on_start()
+            for expected in saved:
+                current = replacement.store.get(expected["run_id"])
+                self.assertEqual(current.run_id, expected["run_id"])
+                self.assertEqual(current.provider_session_id, expected["provider_session_id"])
+                self.assertEqual(current.agent_id, expected["agent_id"])
+        finally:
+            await replacement.close()
+        self.supervisor = Supervisor(self.store, FixtureAdapterFactory(FIXTURES))
+
+    async def test_codex_handover_preserves_intent_through_stop_events(self) -> None:
+        for state in (LifecycleState.WORKING, LifecycleState.WAITING_APPROVAL):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                worktree = root / "worktree"
+                worktree.mkdir()
+                paths = _paths(root)
+                store = RunStore(paths)
+                factory = HandoverCodexFactory(FIXTURES, pid=os.getpid())
+                supervisor = Supervisor(
+                    store,
+                    factory,
+                    pid_alive=lambda _pid: False,
+                )
+                record = await supervisor.start_run(
+                    agent_id=f"WIKI-CODEX-HANDOVER-{state.value}",
+                    provider=ProviderKind.CODEX,
+                    role="implement",
+                    model="fixture-codex",
+                    effort="high",
+                    worktree=str(worktree),
+                    prompt="handover with stop event",
+                )
+                adapter = supervisor.adapters[record.run_id]
+                assert isinstance(adapter, HandoverStopEventCodexAdapter)
+                if state is LifecycleState.WORKING:
+                    status = await adapter.send_now("continue the active turn")
+                    store.update_adapter_status(record.run_id, status)
+                    expected_pending: dict[str, dict[str, Any]] = {}
+                else:
+                    await adapter.emit_approval()
+                    deadline = time.monotonic() + 2
+                    while time.monotonic() < deadline:
+                        current = store.get(record.run_id)
+                        if current.state is state and current.pending_requests:
+                            break
+                        await asyncio.sleep(0.01)
+                    expected_pending = dict(store.get(record.run_id).pending_requests)
+                    self.assertTrue(expected_pending)
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    if store.get(record.run_id).state is state:
+                        break
+                    await asyncio.sleep(0.01)
+                before = store.get(record.run_id)
+                self.assertEqual(before.state, state)
+                session_id = before.provider_session_id
+                self.assertIsNotNone(session_id)
+
+                result = await supervisor.prepare_handover()
+                self.assertEqual(result["drained_run_ids"], [record.run_id])
+                detached = store.get(record.run_id)
+                self.assertEqual(detached.state, state)
+                self.assertIsNone(detached.provider_pid)
+                self.assertEqual(detached.provider_session_id, session_id)
+                self.assertEqual(detached.pending_requests, expected_pending)
+                await supervisor.close()
+
+                replacement = Supervisor(
+                    RunStore(paths),
+                    HandoverCodexFactory(FIXTURES, pid=os.getpid()),
+                    pid_alive=lambda _pid: False,
+                )
+                try:
+                    recovered = await replacement.recover_on_start()
+                    self.assertEqual(recovered[0]["action"], "resume")
+                    deadline = time.monotonic() + 2
+                    while time.monotonic() < deadline:
+                        current = replacement.store.get(record.run_id)
+                        if state is LifecycleState.WORKING:
+                            if current.state is LifecycleState.IDLE:
+                                break
+                        elif current.state is state and current.pending_requests:
+                            break
+                        await asyncio.sleep(0.01)
+                    current = replacement.store.get(record.run_id)
+                    self.assertEqual(current.provider_session_id, session_id)
+                    if state is LifecycleState.WAITING_APPROVAL:
+                        self.assertEqual(current.state, state)
+                        self.assertTrue(current.pending_requests)
+                finally:
+                    await replacement.close()
+
+    async def test_codex_handover_classifies_natural_stop_results(self) -> None:
+        for stop_result, expected_state in (
+            ("completed", LifecycleState.IDLE),
+            ("approval", LifecycleState.WAITING_APPROVAL),
+            ("approval_then_completed", LifecycleState.IDLE),
+        ):
+            with self.subTest(stop_result=stop_result), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                worktree = root / "worktree"
+                worktree.mkdir()
+                paths = _paths(root)
+                store = RunStore(paths)
+                supervisor = Supervisor(
+                    store,
+                    HandoverCodexFactory(
+                        FIXTURES,
+                        pid=os.getpid(),
+                        stop_result=stop_result,
+                    ),
+                    pid_alive=lambda _pid: False,
+                )
+                record = await supervisor.start_run(
+                    agent_id=f"WIKI-CODEX-NATURAL-{stop_result}",
+                    provider=ProviderKind.CODEX,
+                    role="implement",
+                    model="fixture-codex",
+                    effort="high",
+                    worktree=str(worktree),
+                    prompt="natural handover result",
+                )
+                adapter = supervisor.adapters[record.run_id]
+                assert isinstance(adapter, HandoverStopEventCodexAdapter)
+                status = await adapter.send_now("start the active turn")
+                store.update_adapter_status(record.run_id, status)
+                before = store.get(record.run_id)
+                session_id = before.provider_session_id
+                self.assertIsNotNone(session_id)
+
+                await supervisor.prepare_handover()
+                detached = store.get(record.run_id)
+                self.assertEqual(detached.state, expected_state)
+                if expected_state is LifecycleState.WAITING_APPROVAL:
+                    self.assertTrue(detached.pending_requests)
+                else:
+                    self.assertFalse(detached.pending_requests)
+                await supervisor.close()
+
+                replacement_adapter_factory = HandoverCodexFactory(
+                    FIXTURES,
+                    pid=os.getpid(),
+                    stop_result="interrupted",
+                )
+                replacement = Supervisor(
+                    RunStore(paths),
+                    replacement_adapter_factory,
+                    pid_alive=lambda _pid: False,
+                )
+                try:
+                    recovered = await replacement.recover_on_start()
+                    self.assertEqual(recovered[0]["action"], "resume")
+                    current = replacement.store.get(record.run_id)
+                    self.assertEqual(current.provider_session_id, session_id)
+                    recovered_adapter = replacement.adapters[record.run_id]
+                    assert isinstance(
+                        recovered_adapter, HandoverStopEventCodexAdapter
+                    )
+                    self.assertNotIn("turn/start", recovered_adapter.replayed_methods)
+                    if expected_state is LifecycleState.WAITING_APPROVAL:
+                        self.assertEqual(current.state, expected_state)
+                        self.assertTrue(current.pending_requests)
+                        await replacement.respond(
+                            record.run_id,
+                            "handover-approval",
+                            {"answers": [{"id": "surface", "answer": "Wiki"}]},
+                        )
+                        self.assertFalse(
+                            replacement.store.get(record.run_id).pending_requests
+                        )
+                finally:
+                    await replacement.close()
+
+    def test_handover_finalization_matrix_covers_every_cell(self) -> None:
+        captured_pending = {"int:old": {"payload": {"question": "old"}}}
+        drained_pending = {"int:new": {"payload": {"question": "new"}}}
+        events_by_outcome = {
+            "supervisor-interrupted": [
+                ProviderEvent(
+                    ProviderKind.CODEX,
+                    {
+                        "method": "turn/completed",
+                        "params": {"turn": {"status": "interrupted"}},
+                    },
+                )
+            ],
+            "natural-completed": [
+                ProviderEvent(
+                    ProviderKind.CODEX,
+                    {
+                        "method": "turn/completed",
+                        "params": {"turn": {"status": "completed"}},
+                    },
+                )
+            ],
+            "new-approval": [
+                ProviderEvent(
+                    ProviderKind.CODEX,
+                    {
+                        "id": 1,
+                        "method": "item/tool/requestUserInput",
+                        "params": {"questions": [{"id": "new"}]},
+                    },
+                )
+            ],
+            "control-cancel-request": [
+                ProviderEvent(
+                    ProviderKind.CLAUDE,
+                    {"type": "control_cancel_request", "request_id": "old"},
+                )
+            ],
+            "user-response": [
+                ProviderEvent(
+                    ProviderKind.CODEX,
+                    {"id": 1, "result": {"ok": True}},
+                    direction="client",
+                )
+            ],
+            "none": [],
+        }
+        expected = {
+            LifecycleState.WORKING: {
+                "supervisor-interrupted": (LifecycleState.WORKING, captured_pending),
+                "natural-completed": (LifecycleState.IDLE, {}),
+                "new-approval": (
+                    LifecycleState.WAITING_APPROVAL,
+                    {**captured_pending, **drained_pending},
+                ),
+                "control-cancel-request": (LifecycleState.WORKING, captured_pending),
+                "user-response": (LifecycleState.WORKING, {}),
+                "none": (LifecycleState.WORKING, captured_pending),
+            },
+            LifecycleState.WAITING_APPROVAL: {
+                "supervisor-interrupted": (
+                    LifecycleState.WAITING_APPROVAL,
+                    captured_pending,
+                ),
+                "natural-completed": (LifecycleState.IDLE, {}),
+                "new-approval": (
+                    LifecycleState.WAITING_APPROVAL,
+                    {**captured_pending, **drained_pending},
+                ),
+                "control-cancel-request": (
+                    LifecycleState.WAITING_APPROVAL,
+                    captured_pending,
+                ),
+                "user-response": (LifecycleState.WORKING, {}),
+                "none": (LifecycleState.WAITING_APPROVAL, captured_pending),
+            },
+            LifecycleState.IDLE: {
+                "supervisor-interrupted": (LifecycleState.IDLE, captured_pending),
+                "natural-completed": (LifecycleState.IDLE, {}),
+                "new-approval": (
+                    LifecycleState.WAITING_APPROVAL,
+                    {**captured_pending, **drained_pending},
+                ),
+                "control-cancel-request": (LifecycleState.IDLE, {}),
+                "user-response": (LifecycleState.IDLE, {}),
+                "none": (LifecycleState.IDLE, captured_pending),
+            },
+        }
+        for captured_state, outcomes in expected.items():
+            for outcome, expected_result in outcomes.items():
+                with self.subTest(captured_state=captured_state, outcome=outcome):
+                    result = supervisor_module.Supervisor._classify_handover_finalization(
+                        captured_state,
+                        [
+                            (cast(ProviderAdapter, object()), event)
+                            for event in events_by_outcome[outcome]
+                        ],
+                        captured_pending,
+                        drained_pending,
+                    )
+                    self.assertEqual(result, expected_result)
+
+    async def test_handover_control_cancel_preserves_answerable_approval(self) -> None:
+        root = Path(tempfile.mkdtemp())
+        worktree = root / "worktree"
+        worktree.mkdir()
+        paths = _paths(root)
+        store = RunStore(paths)
+        supervisor = Supervisor(
+            store,
+            HandoverCancelFactory(FIXTURES, pid=os.getpid()),
+            pid_alive=lambda _pid: False,
+        )
+        record = await supervisor.start_run(
+            agent_id="WIKI-HANDOVER-CANCEL-APPROVAL",
+            provider=ProviderKind.CLAUDE,
+            role="implement",
+            model="fixture-claude",
+            worktree=str(worktree),
+            prompt="cancel during handover",
+        )
+        session_id = record.provider_session_id
+        self.assertIsNotNone(session_id)
+        adapter = supervisor.adapters[record.run_id]
+        adapter._status = AdapterStatus(  # noqa: SLF001 - handover cancel fixture
+            LifecycleState.WAITING_APPROVAL,
+            session_id,
+            os.getpid(),
+            generation=record.provider_generation,
+        )
+        await supervisor._handle_provider_event_without_admission(  # noqa: SLF001
+            record.run_id,
+            adapter,
+            ProviderEvent(
+                ProviderKind.CLAUDE,
+                {
+                    "type": "control_request",
+                    "request_id": "old",
+                    "request": {"subtype": "can_use_tool"},
+                },
+                direction="stdout",
+                generation=record.provider_generation,
+            ),
+        )
+        store.transition(
+            record.run_id,
+            LifecycleState.WAITING_APPROVAL,
+            adapter_status=AdapterStatus(
+                LifecycleState.WAITING_APPROVAL,
+                session_id,
+                os.getpid(),
+                generation=record.provider_generation,
+            ),
+        )
+        try:
+            await supervisor.prepare_handover()
+            detached = store.get(record.run_id)
+            self.assertEqual(detached.state, LifecycleState.WAITING_APPROVAL)
+            self.assertIn("str:old", detached.pending_requests)
+        finally:
+            await supervisor.close()
+
+        replacement = Supervisor(
+            store,
+            HandoverCancelFactory(FIXTURES, pid=os.getpid()),
+            pid_alive=lambda _pid: False,
+        )
+        try:
+            recovered = await replacement.recover_on_start()
+            self.assertEqual(recovered[0]["action"], "resume")
+            recovered_adapter = replacement.adapters[record.run_id]
+            self.assertEqual(recovered_adapter.recovery_prompt_count, 1)
+            for _ in range(100):
+                if replacement.store.get(record.run_id).pending_requests:
+                    break
+                await asyncio.sleep(0.01)
+            current = replacement.store.get(record.run_id)
+            self.assertEqual(current.state, LifecycleState.WAITING_APPROVAL)
+            await replacement.respond(record.run_id, "old", {"behavior": "allow"})
+            self.assertFalse(replacement.store.get(record.run_id).pending_requests)
+        finally:
+            await replacement.close()
+            shutil.rmtree(root, ignore_errors=True)
+
+    async def test_handover_barrier_defers_start_until_after_snapshot(self) -> None:
+        existing = await self.supervisor.start_run(
+            agent_id="WIKI-HANDOVER-BARRIER-EXISTING",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="existing handover run",
+        )
+        snapshot_started = asyncio.Event()
+        release_snapshot = asyncio.Event()
+        original_quiesce = self.supervisor._quiesce_adapter_for_replacement
+
+        async def paused_quiesce(run_id: str, adapter: Any) -> None:
+            snapshot_started.set()
+            await release_snapshot.wait()
+            await original_quiesce(run_id, adapter)
+
+        with mock.patch.object(
+            self.supervisor,
+            "_quiesce_adapter_for_replacement",
+            new=paused_quiesce,
+        ):
+            handover_task = asyncio.create_task(self.supervisor.prepare_handover())
+            await asyncio.wait_for(snapshot_started.wait(), timeout=2)
+            start_task = asyncio.create_task(
+                self.supervisor.start_run(
+                    agent_id="WIKI-HANDOVER-BARRIER-NEW",
+                    provider=ProviderKind.CODEX,
+                    role="implement",
+                    model="fixture-codex",
+                    effort="high",
+                    worktree=str(self.worktree),
+                    prompt="must wait for handover",
+                )
+            )
+            await asyncio.sleep(0.05)
+            release_snapshot.set()
+            result = await asyncio.wait_for(handover_task, timeout=2)
+            with self.assertRaisesRegex(StoreConflict, "handover is in progress"):
+                await start_task
+
+        self.assertEqual(
+            result["drained_run_ids"],
+            [existing.run_id],
+        )
+        self.assertEqual(
+            [run["run_id"] for run in result["runs"]],
+            [existing.run_id],
+        )
+        self.assertIsNone(self.store.current_run_id("WIKI-HANDOVER-BARRIER-NEW"))
+
+    async def test_handover_barrier_defers_send_and_respond_without_stale_writes(
+        self,
+    ) -> None:
+        send_run = await self.supervisor.start_run(
+            agent_id="WIKI-HANDOVER-SEND-RACE",
+            provider=ProviderKind.CLAUDE,
+            role="implement",
+            model="fixture-claude",
+            worktree=str(self.worktree),
+            prompt="send race",
+        )
+        respond_run = await self.supervisor.start_run(
+            agent_id="WIKI-HANDOVER-RESPOND-RACE",
+            provider=ProviderKind.CLAUDE,
+            role="implement",
+            model="fixture-claude",
+            worktree=str(self.worktree),
+            prompt="respond race",
+        )
+        self.store.transition(
+            respond_run.run_id,
+            LifecycleState.WAITING_APPROVAL,
+            adapter_status=AdapterStatus(
+                LifecycleState.WAITING_APPROVAL,
+                "respond-session",
+                os.getpid(),
+                generation=1,
+            ),
+        )
+        snapshot_started = asyncio.Event()
+        release_snapshot = asyncio.Event()
+        original_quiesce = self.supervisor._quiesce_adapter_for_replacement
+
+        async def paused_quiesce(run_id: str, adapter: Any) -> None:
+            snapshot_started.set()
+            await release_snapshot.wait()
+            await original_quiesce(run_id, adapter)
+
+        with mock.patch.object(
+            self.supervisor,
+            "_quiesce_adapter_for_replacement",
+            new=paused_quiesce,
+        ):
+            handover_task = asyncio.create_task(self.supervisor.prepare_handover())
+            await asyncio.wait_for(snapshot_started.wait(), timeout=2)
+            send_task = asyncio.create_task(
+                self.supervisor.send_now(send_run.run_id, "must wait")
+            )
+            respond_task = asyncio.create_task(
+                self.supervisor.respond(respond_run.run_id, "old", {})
+            )
+            await asyncio.sleep(0.05)
+            release_snapshot.set()
+            await asyncio.wait_for(handover_task, timeout=2)
+            with self.assertRaisesRegex(StoreConflict, "handover is in progress"):
+                await send_task
+            with self.assertRaisesRegex(StoreConflict, "handover is in progress"):
+                await respond_task
+
+        current = self.store.get(respond_run.run_id)
+        self.assertEqual(current.state, LifecycleState.WAITING_APPROVAL)
+        self.assertIsNone(current.provider_pid)
+
+    async def test_handover_queues_late_events_before_second_snapshot(self) -> None:
+        first = await self.supervisor.start_run(
+            agent_id="WIKI-HANDOVER-EVENT-FIRST",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="first handover event run",
+        )
+        second = await self.supervisor.start_run(
+            agent_id="WIKI-HANDOVER-EVENT-SECOND",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="second handover event run",
+        )
+        await asyncio.sleep(0.05)
+        second_adapter = self.supervisor.adapters[second.run_id]
+        before = self.store.get(second.run_id)
+        first_drain_started = asyncio.Event()
+        release_first_drain = asyncio.Event()
+        original_quiesce = self.supervisor._quiesce_adapter_for_replacement
+
+        async def paused_first_drain(run_id: str, adapter: Any) -> None:
+            if run_id == first.run_id:
+                first_drain_started.set()
+                await release_first_drain.wait()
+            await original_quiesce(run_id, adapter)
+
+        async def ordered_preflight() -> list[str]:
+            return [first.run_id, second.run_id]
+
+        handover_task: asyncio.Task[Any] | None = None
+        try:
+            with mock.patch.object(
+                self.supervisor,
+                "_quiesce_adapter_for_replacement",
+                new=paused_first_drain,
+            ), mock.patch.object(
+                self.supervisor,
+                "_handover_preflight",
+                new=ordered_preflight,
+            ):
+                handover_task = asyncio.create_task(self.supervisor.prepare_handover())
+                await asyncio.wait_for(first_drain_started.wait(), timeout=5)
+
+                second_adapter._status = AdapterStatus(  # noqa: SLF001
+                    LifecycleState.WAITING_APPROVAL,
+                    second.provider_session_id,
+                    os.getpid(),
+                    generation=second_adapter.snapshot().generation,
+                )
+                await second_adapter._events.put(  # noqa: SLF001
+                    ProviderEvent(
+                        ProviderKind.CODEX,
+                        {
+                            "method": "item/agentMessage/delta",
+                            "params": {"delta": "late output"},
+                        },
+                        generation=second_adapter.snapshot().generation,
+                    )
+                )
+                await second_adapter._events.put(  # noqa: SLF001
+                    ProviderEvent(
+                        ProviderKind.CODEX,
+                        {
+                            "id": 42,
+                            "method": "item/tool/requestUserInput",
+                            "params": {
+                                "questions": [
+                                    {"id": "surface", "question": "Which surface?"}
+                                ]
+                            },
+                        },
+                        generation=second_adapter.snapshot().generation,
+                    )
+                )
+
+                async def late_events_queued() -> None:
+                    while len(self.supervisor.handover_event_queue.get(second.run_id, [])) < 2:
+                        await asyncio.sleep(0.01)
+
+                await asyncio.wait_for(late_events_queued(), timeout=5)
+                release_first_drain.set()
+                result = await asyncio.wait_for(handover_task, timeout=5)
+        finally:
+            release_first_drain.set()
+            if handover_task is not None and not handover_task.done():
+                handover_task.cancel()
+            if handover_task is not None:
+                await asyncio.gather(handover_task, return_exceptions=True)
+
+        current = self.store.get(second.run_id)
+        self.assertEqual(current.raw_event_count, before.raw_event_count + 2)
+        self.assertEqual(current.normalized_event_count, before.normalized_event_count + 2)
+        self.assertEqual(current.state, LifecycleState.WAITING_APPROVAL)
+        self.assertIn("int:42", current.pending_requests)
+        second_runs = [run for run in result["runs"] if run["run_id"] == second.run_id]
+        self.assertEqual(len(second_runs), 1)
+        self.assertTrue(second_runs[0]["pending_requests"])
+
+    async def test_handover_drains_adapter_queue_after_provider_stop(self) -> None:
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-HANDOVER-ADAPTER-QUEUE",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="adapter queue handover",
+        )
+        await _wait_for_events(self.store, record.run_id, 10)
+        before = self.store.get(record.run_id)
+        adapter = self.supervisor.adapters[record.run_id]
+        event = ProviderEvent(
+            ProviderKind.CODEX,
+            {
+                "id": 91,
+                "method": "item/tool/requestUserInput",
+                "params": {
+                    "questions": [{"id": "queue", "question": "Continue?"}]
+                },
+            },
+            generation=adapter.snapshot().generation,
+        )
+        original_drain = adapter.drain_events
+
+        async def inject_after_stop() -> list[ProviderEvent]:
+            await adapter._events.put(event)  # noqa: SLF001 - queue boundary probe
+            return await original_drain()
+
+        with mock.patch.object(adapter, "drain_events", new=inject_after_stop):
+            await self.supervisor.prepare_handover()
+
+        current = self.store.get(record.run_id)
+        self.assertEqual(current.raw_event_count, before.raw_event_count + 1)
+        self.assertEqual(current.normalized_event_count, before.normalized_event_count + 1)
+        self.assertIn("int:91", current.pending_requests)
+        self.assertFalse(self.supervisor.handover_event_queue)
+
+    async def test_handover_waits_for_pump_event_in_flight_during_drain(self) -> None:
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-HANDOVER-PUMP-INFLIGHT",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="pump in-flight handover",
+        )
+        await _wait_for_events(self.store, record.run_id, 10)
+        before = self.store.get(record.run_id)
+        adapter = self.supervisor.adapters[record.run_id]
+        event = ProviderEvent(
+            ProviderKind.CODEX,
+            {
+                "id": 94,
+                "method": "item/tool/requestUserInput",
+                "params": {
+                    "questions": [{"id": "inflight", "question": "Continue?"}]
+                },
+            },
+            generation=adapter.snapshot().generation,
+        )
+        drain_started = asyncio.Event()
+        release_drain = asyncio.Event()
+        original_drain = adapter.drain_events
+
+        async def blocked_drain() -> list[ProviderEvent]:
+            drain_started.set()
+            await release_drain.wait()
+            return await original_drain()
+
+        with mock.patch.object(adapter, "drain_events", new=blocked_drain):
+            handover_task = asyncio.create_task(self.supervisor.prepare_handover())
+            await asyncio.wait_for(drain_started.wait(), timeout=2)
+            await adapter._events.put(event)  # noqa: SLF001 - in-flight probe
+
+            async def pump_has_taken_event() -> None:
+                while not self.supervisor.event_inflight_counts.get(record.run_id):
+                    await asyncio.sleep(0)
+
+            await asyncio.wait_for(pump_has_taken_event(), timeout=2)
+            release_drain.set()
+            await asyncio.wait_for(handover_task, timeout=2)
+
+        current = self.store.get(record.run_id)
+        self.assertEqual(current.raw_event_count, before.raw_event_count + 1)
+        self.assertEqual(current.normalized_event_count, before.normalized_event_count + 1)
+        self.assertIn("int:94", current.pending_requests)
+        self.assertFalse(self.supervisor.handover_event_queue)
+
+    async def test_handover_flushes_old_generation_route_after_replacement(self) -> None:
+        old = await self.supervisor.start_run(
+            agent_id="WIKI-HANDOVER-OLD-GENERATION",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="old generation handover",
+        )
+        await _wait_for_events(self.store, old.run_id, 10)
+        replacement = await self.supervisor.replace(
+            old.run_id, "replacement generation handover"
+        )
+        await _wait_for_events(self.store, replacement.run_id, 10)
+        old_before = self.store.get(old.run_id)
+        adapter = self.supervisor.adapters[replacement.run_id]
+        original_drain = adapter.drain_events
+        injected = False
+
+        async def inject_old_generation() -> list[ProviderEvent]:
+            nonlocal injected
+            if not injected:
+                injected = True
+                await adapter._events.put(  # noqa: SLF001 - generation route probe
+                    ProviderEvent(
+                        ProviderKind.CODEX,
+                        {
+                            "method": "item/agentMessage/delta",
+                            "params": {"delta": "late old generation output"},
+                        },
+                        generation=old.provider_generation,
+                    )
+                )
+            return await original_drain()
+
+        with mock.patch.object(
+            adapter, "drain_events", new=inject_old_generation
+        ):
+            await self.supervisor.prepare_handover()
+
+        old_after = self.store.get(old.run_id)
+        self.assertEqual(old_after.raw_event_count, old_before.raw_event_count + 1)
+        self.assertEqual(
+            old_after.normalized_event_count,
+            old_before.normalized_event_count + 1,
+        )
+        self.assertFalse(self.supervisor.handover_event_queue)
+
+    async def test_failed_handover_preflight_replays_queued_events(self) -> None:
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-HANDOVER-PREFLIGHT-FAIL",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="preflight failure",
+        )
+        await _wait_for_events(self.store, record.run_id, 10)
+        before = self.store.get(record.run_id)
+        adapter = self.supervisor.adapters[record.run_id]
+
+        async def fail_preflight() -> list[str]:
+            await adapter._events.put(  # noqa: SLF001 - barrier failure probe
+                ProviderEvent(
+                    ProviderKind.CODEX,
+                    {
+                        "id": 92,
+                        "method": "item/tool/requestUserInput",
+                        "params": {
+                            "questions": [{"id": "preflight", "question": "Retry?"}]
+                        },
+                    },
+                    generation=adapter.snapshot().generation,
+                )
+            )
+            raise StoreConflict("fixture preflight failure")
+
+        with mock.patch.object(
+            self.supervisor, "_handover_preflight", new=fail_preflight
+        ):
+            with self.assertRaisesRegex(StoreConflict, "fixture preflight failure"):
+                await self.supervisor.prepare_handover()
+
+        current = self.store.get(record.run_id)
+        self.assertEqual(current.raw_event_count, before.raw_event_count + 1)
+        self.assertIn("int:92", current.pending_requests)
+        self.assertFalse(self.supervisor.handover_event_queue)
+
+    async def test_handover_preflight_rejects_live_detached_control_before_drain(
+        self,
+    ) -> None:
+        healthy = await self.supervisor.start_run(
+            agent_id="WIKI-HANDOVER-ATTACHED",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="attached handover run",
+        )
+        detached = await self.supervisor.start_run(
+            agent_id="WIKI-HANDOVER-DETACHED",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="detached handover run",
+        )
+        await _wait_for_events(self.store, healthy.run_id, 10)
+        await _wait_for_events(self.store, detached.run_id, 10)
+        healthy_adapter = self.supervisor.adapters[healthy.run_id]
+        await self.supervisor._detach_adapter(  # noqa: SLF001 - live control probe
+            detached.run_id,
+            preserve_event_routes=True,
+        )
+        detached_record = self.store.get(detached.run_id)
+        self.assertFalse(self.supervisor._runtime_status(detached_record)["control_attached"])
+        self.assertTrue(self.supervisor.pid_alive(detached_record.provider_pid))
+
+        with mock.patch.object(
+            healthy_adapter, "stop", wraps=healthy_adapter.stop
+        ) as healthy_stop:
+            with self.assertRaisesRegex(StoreConflict, "live provider control is detached"):
+                await self.supervisor.prepare_handover()
+
+        healthy_stop.assert_not_awaited()
+        self.assertIs(self.supervisor.adapters.get(healthy.run_id), healthy_adapter)
+        self.assertTrue(self.supervisor._runtime_status(self.store.get(healthy.run_id))["control_attached"])
+
+    async def test_failed_handover_retries_queued_delivery_after_barrier(self) -> None:
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-HANDOVER-QUEUE-RETRY",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="queued delivery retry",
+        )
+        await _wait_for_events(self.store, record.run_id, 10)
+        adapter = self.supervisor.adapters[record.run_id]
+        idle = AdapterStatus(
+            LifecycleState.IDLE,
+            adapter.snapshot().session_id,
+            os.getpid(),
+            generation=adapter.snapshot().generation,
+        )
+        adapter._status = idle  # noqa: SLF001 - queue retry fixture
+        self.store.update_adapter_status(record.run_id, idle)
+        await self.supervisor.send_on_idle(record.run_id, "deliver after retry")
+
+        async def fail_preflight_with_delivery_task() -> list[str]:
+            self.supervisor._spawn_monitor_task(  # noqa: SLF001 - barrier race fixture
+                self.supervisor._deliver_next_queued(record.run_id, adapter),
+                name="handover-queued-delivery-retry",
+            )
+            await asyncio.sleep(0)
+            raise StoreConflict("fixture failed handover")
+
+        with mock.patch.object(
+            self.supervisor,
+            "_handover_preflight",
+            new=fail_preflight_with_delivery_task,
+        ):
+            with self.assertRaisesRegex(StoreConflict, "fixture failed handover"):
+                await self.supervisor.prepare_handover()
+
+        for _ in range(100):
+            if not self.store.get(record.run_id).queued_messages:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            self.fail("queued message was not delivered after handover failure")
+        self.assertEqual(adapter._queued, [])  # noqa: SLF001
+        self.assertEqual(adapter.snapshot().state, LifecycleState.WORKING)
+
+    async def test_failed_handover_drain_replays_queued_events(self) -> None:
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-HANDOVER-DRAIN-FAIL",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="drain failure",
+        )
+        await _wait_for_events(self.store, record.run_id, 10)
+        before = self.store.get(record.run_id)
+        adapter = self.supervisor.adapters[record.run_id]
+
+        async def fail_drain(run_id: str, candidate: Any) -> None:
+            await adapter._events.put(  # noqa: SLF001 - barrier failure probe
+                ProviderEvent(
+                    ProviderKind.CODEX,
+                    {
+                        "id": 93,
+                        "method": "item/tool/requestUserInput",
+                        "params": {
+                            "questions": [{"id": "drain", "question": "Retry?"}]
+                        },
+                    },
+                    generation=adapter.snapshot().generation,
+                )
+            )
+            raise StoreConflict(f"fixture drain failure: {run_id}")
+
+        with mock.patch.object(
+            self.supervisor,
+            "_quiesce_adapter_for_replacement",
+            new=fail_drain,
+        ):
+            with self.assertRaisesRegex(StoreConflict, "fixture drain failure"):
+                await self.supervisor.prepare_handover()
+
+        current = self.store.get(record.run_id)
+        self.assertEqual(current.raw_event_count, before.raw_event_count + 1)
+        self.assertIn("int:93", current.pending_requests)
+        self.assertFalse(self.supervisor.handover_event_queue)
+
+    async def test_mutation_admission_does_not_deadlock_nested_resume_replace(self) -> None:
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-HANDOVER-ADMISSION-RACE",
+            provider=ProviderKind.CLAUDE,
+            role="implement",
+            model="fixture-claude",
+            worktree=str(self.worktree),
+            prompt="admission race",
+        )
+        run_lock = self.supervisor._run_lock(record.run_id)
+        await run_lock.acquire()
+        try:
+            resume_task = asyncio.create_task(self.supervisor.resume_run(record.run_id))
+            replace_task = asyncio.create_task(
+                self.supervisor.replace(record.run_id, "replacement after admission race")
+            )
+            await asyncio.sleep(0.05)
+            self.assertFalse(resume_task.done())
+            self.assertFalse(replace_task.done())
+
+            handover_task = asyncio.create_task(self.supervisor.prepare_handover())
+            await asyncio.sleep(0.05)
+            run_lock.release()
+
+            results = await asyncio.wait_for(
+                asyncio.gather(
+                    resume_task,
+                    replace_task,
+                    handover_task,
+                    return_exceptions=True,
+                ),
+                timeout=2,
+            )
+        finally:
+            if run_lock.locked():
+                run_lock.release()
+
+        self.assertFalse(any(isinstance(result, asyncio.TimeoutError) for result in results))
 
     async def test_recovery_rechecks_live_orphan_then_resumes_exact_session(
         self,
@@ -1512,6 +2980,61 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await supervisor.close()
         self.supervisor = Supervisor(self.store, FixtureAdapterFactory(FIXTURES))
+
+    async def test_waiting_approval_orphan_retries_exact_session_recovery(self) -> None:
+        await self.supervisor.close()
+        record = RunRecord.new(
+            agent_id="WIKI-ORPHAN-APPROVAL",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            worktree=str(self.worktree),
+            prompt="fixture",
+        )
+        record.state = LifecycleState.WAITING_APPROVAL
+        record.provider_session_id = "session-exact-approval"
+        record.provider_pid = 424_243
+        record.pending_requests["str:old"] = {
+            "request_id": "old",
+            "request_kind": "item/tool/requestUserInput",
+            "payload": {
+                "method": "item/tool/requestUserInput",
+                "id": "old",
+                "params": {"questions": [{"question": "Which surface?"}]},
+            },
+        }
+        self.store.create(record)
+        alive = {"value": True}
+        resumed_sessions: list[str] = []
+
+        def factory(_record: RunRecord) -> ApprovalRecoveryAdapter:
+            return ApprovalRecoveryAdapter(
+                FIXTURES / "codex_app_server_success.jsonl",
+                FIXTURES / "codex_app_server_control.jsonl",
+                pid=os.getpid(),
+                resumed_sessions=resumed_sessions,
+            )
+
+        self.supervisor = Supervisor(
+            self.store,
+            factory,
+            pid_alive=lambda _pid: alive["value"],
+        )
+        first = await self.supervisor.recover_on_start()
+        self.assertEqual(first[0]["action"], "block")
+        blocked = self.store.get(record.run_id)
+        self.assertEqual(blocked.recovery_from_state, LifecycleState.WAITING_APPROVAL)
+        self.assertEqual(blocked.pending_requests["str:old"]["request_id"], "old")
+
+        alive["value"] = False
+        second = await self.supervisor.recover_on_start()
+        self.assertEqual(second[0]["action"], "resume")
+        resumed = self.store.get(record.run_id)
+        self.assertEqual(resumed.provider_session_id, "session-exact-approval")
+        self.assertEqual(resumed.state, LifecycleState.WAITING_APPROVAL)
+        self.assertEqual(resumed.pending_requests["int:8"]["request_id"], 8)
+        self.assertEqual(resumed_sessions, ["session-exact-approval"])
+        self.assertIn(record.run_id, self.supervisor.adapters)
 
     async def test_failed_automatic_resume_does_not_loop_and_manual_retry_works(
         self,
@@ -3205,13 +4728,13 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(
                 client,
                 "request",
-                return_value={"status": "ok", "runs": []},
+                return_value={"status": "ok", "drained_run_ids": [], "runs": []},
             ) as request,
             mock.patch.object(client, "_spawn_detached") as spawn,
             mock.patch("backend.app.agent_runtime.client.os.kill") as kill,
         ):
             self.assertEqual(client.ensure_running(timeout=0.1), current)
-        request.assert_called_once_with("run/list")
+        request.assert_called_once_with("supervisor/handover", {})
         kill.assert_called_once_with(424_242, signal.SIGTERM)
         spawn.assert_called_once_with()
 
@@ -3249,15 +4772,12 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
         def request(method: str, params: dict[str, Any] | None = None) -> Any:
             values = dict(params or {})
             calls.append((method, values))
-            if method == "run/list":
-                return {"runs": [idle, working]}
-            if method == "run/status":
-                if values.get("agent_id") == "WIKI-IDLE":
-                    return idle
-                if values.get("agent_id") == "wiki":
-                    return working
-                return {**working, "state": "interrupted", "active_turn_id": None}
-            if method in {"run/interrupt", "run/stop", "run/replace"}:
+            if method == "supervisor/handover":
+                return {
+                    "drained_run_ids": ["idle-run", "working-run"],
+                    "runs": [idle, working],
+                }
+            if method == "run/replace":
                 return {"status": "ok"}
             raise AssertionError(method)
 
@@ -3286,11 +4806,11 @@ class UnixClientTests(unittest.IsolatedAsyncioTestCase):
         spawn.assert_called_once_with()
         self.assertEqual(
             [values["run_id"] for method, values in calls if method == "run/stop"],
-            ["idle-run", "working-run"],
+            [],
         )
         self.assertEqual(
             [values["run_id"] for method, values in calls if method == "run/interrupt"],
-            ["working-run"],
+            [],
         )
         replacements = [values for method, values in calls if method == "run/replace"]
         self.assertEqual(

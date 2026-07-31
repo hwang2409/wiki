@@ -31,7 +31,7 @@ native-backend:
 	./scripts/build-native-backend.sh
 
 native-dev: native-backend
-	$(TAURI) dev --no-watch
+	WIKI_NATIVE_DEV=1 $(TAURI) dev --no-watch
 
 native-build:
 	FORCE_STAGE_ONLY="$(FORCE_STAGE_ONLY)" ALLOW_MISSING_APP_LOCK="$(ALLOW_MISSING_APP_LOCK)" ./scripts/build-native-app.sh

@@ -39,10 +39,12 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[harness-pi-coding-agent]] — Pi coding agent harness breakdown: runtime, tool surface
 - [[llm-rigorous-proving]] — LLMs on rigorous mathematical proving: current SOTA, failure modes, benchmarks
 - [[graph-engineering]] — graph engineering as next layer after loop engineering; org-graph + work-graph, nodes/edges/shared-state, maps onto orchestrator/worker stack
+- [[t3code]] — prior art for the wiki agent-control surface: theo/ping's open-source multi-provider harness controller
 
 ## Design
 
 - [[laws-of-ux]] — Laws of UX field notes: which laws bite where in Wiki/Phoebe UI decisions
+- [[default-quiet]] — default-quiet UI doctrine: previews/diagnostics are opt-in via disclosures, never visible by default
 
 ## Math
 
@@ -59,6 +61,7 @@ Topic → note index. **Agents: read this file first, before grepping.** Every n
 - [[datasource-sync-auto-disable]] — axiscare sync auto-disable: self-heals via 10:10Z daily forced sync; retry logs blind to status on result-based retries
 - [[admin-agent-tool-discovery]] — native tool_search + defer_loading decision, shipping chain PHO-14285..88, go/no-go = 14286 eval, watch items
 - [[admin-redesign]] — full /admin/* redesign decision (2026-07-27): Ramp×Linear×wiki direction, scrap 14461 primitives, signal-tier IA per laws-of-ux, one mega-PR after in-flight admin set lands
+- [[admin-agent-audit-2026-07-30]] — full admin-agent audit @main 7a3a01e1e2: 182 tools, 5H/11M/4L, remediation order
 
 ## Phoebe/til
 
