@@ -81,6 +81,10 @@ def configure_environment(args: argparse.Namespace) -> None:
     if args.daemon:
         os.environ["WIKI_BACKEND_DAEMON"] = "launchd"
 
+    if args.daemon and (args.frontend_dist or os.environ.get("WIKI_FRONTEND_DIST")):
+        raise RuntimeError(
+            "daemon mode does not accept external frontend overrides"
+        )
     frontend_dist = args.frontend_dist or os.environ.get("WIKI_FRONTEND_DIST")
     if frontend_dist:
         os.environ["WIKI_FRONTEND_DIST"] = frontend_dist

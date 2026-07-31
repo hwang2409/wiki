@@ -499,6 +499,7 @@ class DaemonLogTests(unittest.TestCase):
                 encoding="utf-8",
             )
             env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[2])}
+            env.pop("WIKI_FRONTEND_DIST", None)
             subprocess.run(
                 [sys.executable, str(driver)],
                 check=True,
@@ -818,7 +819,7 @@ class DaemonArtifactTests(unittest.TestCase):
             self.assertEqual(seen_ports, [18213, 18214])
             self.assertTrue(loaded)
 
-    def test_failed_upgrade_leaves_service_unloaded_when_plist_restore_fails(self) -> None:
+    def test_loaded_unparseable_prior_plist_aborts_without_mutation(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             executable = root / "Wiki.app/Contents/Resources/wiki-backend-sidecar/wiki-backend"
@@ -833,6 +834,7 @@ class DaemonArtifactTests(unittest.TestCase):
             )
             config.plist_path.parent.mkdir(parents=True)
             config.plist_path.write_bytes(b"prior working plist\n")
+            before = config.plist_path.read_bytes()
             loaded = True
 
             def fake_launchctl(
@@ -854,19 +856,21 @@ class DaemonArtifactTests(unittest.TestCase):
                     loaded = True
                 return subprocess.CompletedProcess(["launchctl", *arguments], 0, "", "")
 
-            with patch.object(daemon, "_launchctl", side_effect=fake_launchctl) as launchctl, patch.object(
-                daemon, "_restore_plist", side_effect=OSError("restore failed")
-            ), patch.object(daemon, "_health", return_value={"healthy": False}), patch.object(
-                daemon, "HEALTH_TIMEOUT_SECONDS", 0.0
-            ):
-                with self.assertRaisesRegex(daemon.DaemonError, "plist rollback failed: restore failed"):
+            with patch.object(daemon, "_launchctl", side_effect=fake_launchctl) as launchctl:
+                with self.assertRaisesRegex(daemon.DaemonError, "verify the loaded prior"):
                     daemon.install(config)
 
-            bootstrap_calls = [
-                call for call in launchctl.call_args_list if call.args[1:] == ("bootstrap", config.domain, str(config.plist_path))
+            mutation_calls = [
+                call
+                for call in launchctl.call_args_list
+                if call.args[1:] in {
+                    ("bootout", config.target),
+                    ("bootstrap", config.domain, str(config.plist_path)),
+                }
             ]
-            self.assertEqual(len(bootstrap_calls), 1)
-            self.assertFalse(loaded)
+            self.assertEqual(mutation_calls, [])
+            self.assertTrue(loaded)
+            self.assertEqual(config.plist_path.read_bytes(), before)
 
     def test_failed_install_reports_health_and_cleanup_errors(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -909,6 +913,40 @@ class DaemonArtifactTests(unittest.TestCase):
 
 
 class DaemonHandshakeTests(unittest.TestCase):
+    def test_daemon_rejects_external_frontend_override(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            driver = root / "driver.py"
+            driver.write_text(
+                "from backend import native_server\nnative_server.main()\n",
+                encoding="utf-8",
+            )
+            env = {
+                **os.environ,
+                "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+                "WIKI_FRONTEND_DIST": str(root / "replacement-frontend"),
+            }
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(driver),
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    "18213",
+                    "--daemon",
+                    "--frontend-dist",
+                    str(root / "replacement-frontend"),
+                ],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+                timeout=5,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("external frontend overrides", result.stderr)
+
     def test_security_framework_reads_live_pid_identity(self) -> None:
         if sys.platform != "darwin" or not Path("/usr/bin/osascript").is_file():
             self.skipTest("requires macOS Security.framework")

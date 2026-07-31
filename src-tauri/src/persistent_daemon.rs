@@ -143,19 +143,44 @@ fn daemon_connection_settings(runtime_dir: &Path) -> Result<(String, u16), Strin
     };
     let value: serde_json::Value = serde_json::from_str(&contents)
         .map_err(|error| format!("invalid daemon settings: {error}"))?;
-    let label = value
+    let object = value
+        .as_object()
+        .ok_or_else(|| "invalid daemon settings shape: expected object".to_string())?;
+    let label = object
         .get("label")
         .and_then(serde_json::Value::as_str)
-        .filter(|label| !label.is_empty())
-        .unwrap_or(DEFAULT_DAEMON_LABEL)
+        .filter(|label| valid_daemon_label(label))
+        .ok_or_else(|| "invalid daemon settings label".to_string())?
         .to_string();
-    let port = value
+    let port = object
         .get("port")
         .and_then(serde_json::Value::as_u64)
         .and_then(|port| u16::try_from(port).ok())
         .filter(|port| *port > 0)
-        .unwrap_or(DEFAULT_DAEMON_PORT);
+        .ok_or_else(|| "invalid daemon settings port".to_string())?;
     Ok((label, port))
+}
+
+fn valid_daemon_label(label: &str) -> bool {
+    if label.is_empty() || label.len() > 253 {
+        return false;
+    }
+    let components: Vec<&str> = label.split('.').collect();
+    components.len() >= 2
+        && components.iter().all(|component| {
+            !component.is_empty()
+                && component
+                    .bytes()
+                    .next()
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric())
+                && component
+                    .bytes()
+                    .last()
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric())
+                && component
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
 }
 
 fn origin_port(origin: &str) -> Option<u16> {
@@ -405,6 +430,27 @@ mod tests {
             daemon_connection_settings(&runtime).unwrap(),
             ("com.example.wiki.test".to_string(), 9321)
         );
+        std::fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn rejects_invalid_persisted_connection_settings() {
+        let runtime = std::env::temp_dir().join(format!(
+            "wiki-native-daemon-settings-invalid-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&runtime);
+        std::fs::create_dir_all(&runtime).unwrap();
+        for contents in [
+            r#"{}"#,
+            r#"[]"#,
+            r#"{"label":"../outside","port":9321}"#,
+            r#"{"label":"com.example.wiki.test","port":0}"#,
+            r#"{"label":"com.example.wiki.test","port":65536}"#,
+        ] {
+            std::fs::write(runtime.join(DAEMON_SETTINGS_NAME), contents).unwrap();
+            assert!(daemon_connection_settings(&runtime).is_err(), "{contents}");
+        }
         std::fs::remove_dir_all(runtime).unwrap();
     }
 

@@ -582,6 +582,10 @@ def _install_unlocked(config: DaemonConfig) -> dict[str, object]:
     backup = _capture_plist(config.plist_path)
     was_loaded = _service_loaded(config)
     prior = _prior_config(config, backup)
+    if was_loaded and prior is None:
+        raise DaemonError(
+            "cannot verify the loaded prior daemon before updating its plist"
+        )
     config.log_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     config.log_path.parent.chmod(0o700)
     bootstrap_attempted = False
