@@ -82,7 +82,7 @@ import {
 } from "./file-workspaces";
 import { SettingsModal, applyStoredFonts } from "./settings";
 import { ActivityFeed } from "./activity";
-import { AgentsSidebar, AgentsView, type AccountEvent } from "./agents";
+import { AgentsSidebar, AgentsView, DEFAULT_WORKDIR, type AccountEvent } from "./agents";
 import { isAgentRefreshEvent } from "./agent-events";
 import {
   AgentSessionView,
@@ -1515,7 +1515,7 @@ export default function App() {
   }, [activeWorkspace]);
 
   useEffect(() => {
-    if (!shouldDiscoverWorkspaces(sidebarTab, switcherOpen)) return;
+    if (!shouldDiscoverWorkspaces(sidebarTab, switcherOpen, mode === "agents")) return;
     let ignore = false;
     listWorkspaces()
       .then((result) => {
@@ -1546,7 +1546,7 @@ export default function App() {
     return () => {
       ignore = true;
     };
-  }, [refreshTick, sidebarTab, switcherOpen]);
+  }, [refreshTick, sidebarTab, switcherOpen, mode]);
 
   useEffect(() => {
     localStorage.setItem(
@@ -3494,7 +3494,7 @@ export default function App() {
       return (
         <AgentsView
           data={agentsState}
-          workspaceRoot={activeWorkspaceInfo?.root ?? ""}
+          workspaceRoot={activeWorkspaceInfo?.root || DEFAULT_WORKDIR}
           onOpenAgent={openAgent}
           onOpenTicket={setAgentsOpenTicket}
           openTicket={agentsOpenTicket}
@@ -4097,7 +4097,7 @@ export default function App() {
               ) : mode === "agents" ? (
                 <AgentsView
                   data={agentsState}
-                  workspaceRoot={activeWorkspaceInfo?.root ?? ""}
+                  workspaceRoot={activeWorkspaceInfo?.root || DEFAULT_WORKDIR}
                   onOpenAgent={openAgent}
                   refreshTick={refreshTick}
                   openTicket={agentsOpenTicket}

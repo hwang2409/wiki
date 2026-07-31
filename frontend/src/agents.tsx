@@ -60,7 +60,7 @@ const STALE_SECONDS = 5 * 60;
 
 const SPAWN_TICKET_PATTERN = /^[A-Z][A-Z0-9]+-[0-9]+(?:-[A-Z0-9]+)*$/;
 const ORCH_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
-const DEFAULT_WORKDIR = "/Users/henry/me/fun/wiki";
+export const DEFAULT_WORKDIR = "/Users/henry/me/fun/wiki";
 const REASONING_EFFORTS: SpawnWorkerEffort[] = ["minimal", "low", "medium", "high", "xhigh"];
 const DEAD_RUN_COPY = "adapter detached — archive to reset";
 

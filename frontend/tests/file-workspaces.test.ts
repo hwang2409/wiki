@@ -168,7 +168,8 @@ test("workspace reactivation replaces a stale in-flight request", () => {
 
 test("switcher opening bootstraps workspaces from persisted non-files tabs", () => {
   assert.equal(shouldDiscoverWorkspaces("search", false), false);
-  assert.equal(shouldDiscoverWorkspaces("agents", false), false);
+  assert.equal(shouldDiscoverWorkspaces("agents", false), true);
+  assert.equal(shouldDiscoverWorkspaces("search", false, true), true);
   assert.equal(shouldDiscoverWorkspaces("search", true), true);
   assert.equal(shouldDiscoverWorkspaces("agents", true), true);
   assert.equal(shouldDiscoverWorkspaces("files", false), true);

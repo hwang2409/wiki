@@ -1229,6 +1229,56 @@ class WatchdogLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(emitted), 1)
             self.assertEqual(emitted[0]["type"], "claude_limit_hit")
 
+    async def test_claude_limit_realerts_ticket_on_replacement_window(self) -> None:
+        old_worker = accounts.WorkerEntry(
+            ticket="WIKI-15",
+            window="@44",
+            worktree="/tmp/wt-15",
+            log="/tmp/cc-WIKI-15.log",
+            kind="cc",
+            role="implement",
+            orch=None,
+        )
+        new_worker = accounts.WorkerEntry(
+            ticket="WIKI-15",
+            window="@45",
+            worktree="/tmp/wt-15",
+            log="/tmp/cc-WIKI-15.log",
+            kind="cc",
+            role="implement",
+            orch=None,
+        )
+        workers = [old_worker]
+        live = {"@44"}
+        emitted: list[dict] = []
+
+        async def emit(evt: dict) -> None:
+            emitted.append(evt)
+
+        def iter_worker_kind(kind: str) -> list[accounts.WorkerEntry]:
+            return workers if kind == "cc" else []
+
+        with mock.patch.object(accounts, "tmux_live_windows", lambda: live), \
+             mock.patch.object(accounts, "iter_workers", iter_worker_kind), \
+             mock.patch.object(accounts, "tmux_capture", lambda w, lines=60: CLAUDE_LIMIT_STRING):
+            watch = accounts.WatchdogInternalState()
+            await accounts._check_once(watch, emit)
+
+            # The old window is archived and the ticket is reused by a new
+            # worker. Its identity must have a fresh alert budget.
+            workers[:] = [new_worker]
+            live.clear()
+            live.add("@45")
+            await accounts._check_once(watch, emit)
+
+        self.assertEqual(
+            [evt["type"] for evt in emitted],
+            ["claude_limit_hit", "claude_limit_hit"],
+        )
+        self.assertEqual([evt["window"] for evt in emitted], ["@44", "@45"])
+        self.assertNotIn(("WIKI-15", "@44"), watch.claude_limited)
+        self.assertNotIn(("WIKI-15", "@44"), watch.last_alert_at)
+
     async def test_claude_limit_cleared_emitted_when_banner_leaves_pane(self) -> None:
         with _EnvOverride() as paths:
             (paths["accounts"] / "alpha").mkdir()

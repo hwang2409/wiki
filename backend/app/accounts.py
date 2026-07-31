@@ -1474,7 +1474,7 @@ EventEmitter = Callable[[dict], Awaitable[None]]
 @dataclass
 class WatchdogInternalState:
     last_rotation_attempt: float = 0.0
-    last_alert_at: dict[str, float] = field(default_factory=dict)
+    last_alert_at: dict[tuple[str, str], float] = field(default_factory=dict)
     last_no_eligible_alert: float = 0.0
     # Per-ticket auth-dead revival timestamps (monotonic). Bounded loop:
     # after AUTH_DEAD_MAX_ATTEMPTS attempts inside AUTH_DEAD_WINDOW_SECONDS,
@@ -1486,7 +1486,7 @@ class WatchdogInternalState:
     # Tickets whose pane currently shows the Claude usage-limit banner. When
     # the banner leaves the pane on a later poll, the watchdog emits
     # claude_limit_cleared — the recovery proof that resolves the notice.
-    claude_limited: set[str] = field(default_factory=set)
+    claude_limited: set[tuple[str, str]] = field(default_factory=set)
 
 
 AUTH_DEAD_MAX_ATTEMPTS = 3
@@ -1569,27 +1569,37 @@ async def _check_once(
                 "ts": datetime.now(timezone.utc).isoformat(),
             })
 
+    live_claude_identities = {
+        (worker.ticket, worker.window)
+        for worker in claude_workers
+        if worker.window in live
+    }
+    watch.claude_limited.intersection_update(live_claude_identities)
+    for identity in set(watch.last_alert_at) - live_claude_identities:
+        watch.last_alert_at.pop(identity, None)
+
     for worker in claude_workers:
         if worker.window not in live:
             continue
+        identity = (worker.ticket, worker.window)
         pane = await asyncio.to_thread(tmux_capture, worker.window, 80)
         if detect_claude_limit(pane):
-            watch.claude_limited.add(worker.ticket)
-            # Alert once per hour per ticket.
-            if _seconds_since(watch.last_alert_at.get(worker.ticket, 0.0)) < 3600:
+            watch.claude_limited.add(identity)
+            # Alert once per hour per worker identity.
+            if _seconds_since(watch.last_alert_at.get(identity, 0.0)) < 3600:
                 continue
-            watch.last_alert_at[worker.ticket] = time.monotonic()
+            watch.last_alert_at[identity] = time.monotonic()
             await emit({
                 "type": "claude_limit_hit",
                 "ticket": worker.ticket,
                 "window": worker.window,
                 "ts": datetime.now(timezone.utc).isoformat(),
             })
-        elif worker.ticket in watch.claude_limited:
+        elif identity in watch.claude_limited:
             # The limit banner left the pane of a previously limited worker:
             # the only observable proof that this worker can make progress.
-            watch.claude_limited.discard(worker.ticket)
-            watch.last_alert_at.pop(worker.ticket, None)
+            watch.claude_limited.discard(identity)
+            watch.last_alert_at.pop(identity, None)
             await emit({
                 "type": "claude_limit_cleared",
                 "ticket": worker.ticket,
