@@ -1229,6 +1229,46 @@ class WatchdogLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(emitted), 1)
             self.assertEqual(emitted[0]["type"], "claude_limit_hit")
 
+    async def test_claude_limit_cleared_emitted_when_banner_leaves_pane(self) -> None:
+        with _EnvOverride() as paths:
+            (paths["accounts"] / "alpha").mkdir()
+            (paths["accounts"] / "alpha" / "auth.json").write_text("{}")
+            paths["auth"].write_text("{}")
+            registry = paths["registry"]
+            registry.write_text(json.dumps({
+                "WIKI-15": {
+                    "current": {
+                        "ticket": "WIKI-15",
+                        "window": "@44",
+                        "kind": "cc",
+                        "role": "implement",
+                        "worktree": str(paths["root"] / "wt-15"),
+                        "log": "/tmp/cc-WIKI-15.log",
+                    }
+                }
+            }))
+
+            emitted: list[dict] = []
+
+            async def emit(evt: dict) -> None:
+                emitted.append(evt)
+
+            watch = accounts.WatchdogInternalState()
+            pane_text = CLAUDE_LIMIT_STRING
+            with mock.patch.object(accounts, "tmux_live_windows", lambda: {"@44"}), \
+                 mock.patch.object(accounts, "tmux_capture", lambda w, lines=60: pane_text):
+                await accounts._check_once(watch, emit)
+                # Still limited on the next poll: no duplicate events.
+                await accounts._check_once(watch, emit)
+                pane_text = "> working on the next step"
+                await accounts._check_once(watch, emit)
+
+            self.assertEqual(
+                [evt["type"] for evt in emitted],
+                ["claude_limit_hit", "claude_limit_cleared"],
+            )
+            self.assertEqual(emitted[1]["ticket"], "WIKI-15")
+
 
 REAL_AUTH_DEAD_STRING = (
     "Your access token could not be refreshed because you have since logged "

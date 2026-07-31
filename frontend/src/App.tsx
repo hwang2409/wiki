@@ -83,6 +83,7 @@ import {
 import { SettingsModal, applyStoredFonts } from "./settings";
 import { ActivityFeed } from "./activity";
 import { AgentsSidebar, AgentsView, type AccountEvent } from "./agents";
+import { isAgentRefreshEvent } from "./agent-events";
 import {
   AgentSessionView,
   clearSurfacePaneState,
@@ -1471,20 +1472,11 @@ export default function App() {
           }
           return;
         }
-        if (
-          payload.type === "vault" ||
-          payload.type === "agents" ||
-          payload.type === "codex_rotation" ||
-          payload.type === "codex_limit_no_eligible" ||
-          payload.type === "codex_rotation_failed" ||
-          payload.type === "codex_auth_dead_revival" ||
-          payload.type === "codex_auth_dead_exhausted" ||
-          payload.type === "claude_limit_hit"
-        ) {
+        // Account events refresh /api/agents; the durable notice list rides
+        // in that payload, so no in-memory event accumulation here.
+        if (isAgentRefreshEvent(payload.type)) {
           setRefreshTick((tick) => tick + 1);
         }
-        // Account events refresh /api/agents (above); the durable notice list
-        // rides in that payload, so no in-memory event accumulation here.
       } catch {
         /* ignore malformed frames */
       }

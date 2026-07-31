@@ -1,8 +1,11 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
+import { useEffect, useState } from "react";
 
 import { AgentsView, SpawnWorkerModal } from "../src/agents";
+import { isAgentRefreshEvent } from "../src/agent-events";
+import { getAgents } from "../src/api";
 import type { AgentModelOption, AgentWorker, ArchivedWorker, Orchestrator } from "../src/api";
 import { presetWorkerModel } from "../src/role-pipeline";
 
@@ -11,6 +14,7 @@ vi.mock("../src/api", async () => {
   return {
     ...actual,
     getAgentModels: vi.fn().mockResolvedValue({ models: [] }),
+    getAgents: vi.fn().mockResolvedValue({ workers: [], orchestrators: [], archived: [] }),
   };
 });
 
@@ -254,6 +258,80 @@ test("role pipeline presets pick the vault-default models with API fallback", ()
   // preset model missing from the list -> fall back to default_worker flag
   const withoutLuna = models.filter((option) => option.id !== "gpt-5.6-luna");
   expect(presetWorkerModel(withoutLuna, "cdx", "implement")).toBe("gpt-5.4");
+});
+
+class FakeEventSource {
+  static instances: FakeEventSource[] = [];
+  onmessage: ((event: MessageEvent) => void) | null = null;
+  url: string;
+  constructor(url: string) {
+    this.url = url;
+    FakeEventSource.instances.push(this);
+  }
+  close() {
+    /* noop */
+  }
+  emit(payload: unknown) {
+    this.onmessage?.({ data: JSON.stringify(payload) } as MessageEvent);
+  }
+}
+
+// Mirrors App.tsx: the /api/events stream bumps refreshTick via
+// isAgentRefreshEvent, and AgentsView refetches /api/agents on each tick.
+function NoticeRefreshHarness() {
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    const source = new EventSource("/api/events") as unknown as FakeEventSource;
+    source.onmessage = (raw: MessageEvent) => {
+      const payload = JSON.parse(raw.data as string) as { type?: string };
+      if (typeof payload.type === "string" && isAgentRefreshEvent(payload.type)) {
+        setTick((current) => current + 1);
+      }
+    };
+    return () => source.close();
+  }, []);
+  return (
+    <AgentsView
+      onOpenAgent={() => undefined}
+      refreshTick={tick}
+      openTicket={null}
+      onOpenTicket={() => undefined}
+    />
+  );
+}
+
+test("codex_auth_verified refreshes the agents view and clears the exhausted banner", async () => {
+  FakeEventSource.instances = [];
+  vi.stubGlobal("EventSource", FakeEventSource);
+  const exhausted = {
+    type: "codex_auth_dead_exhausted",
+    tickets: ["WIKI-9"],
+    ts: "2026-07-31T00:00:00Z",
+  };
+  const base = { workers: [], orchestrators: [], archived: [] };
+  vi.mocked(getAgents)
+    .mockResolvedValueOnce({ ...base, account_notices: [exhausted] } as never)
+    .mockResolvedValue({ ...base, account_notices: [] } as never);
+
+  const view = render(<NoticeRefreshHarness />);
+  await waitFor(() => {
+    expect(view.getByText(/Sign in to Codex again/)).toBeTruthy();
+  });
+
+  act(() => {
+    FakeEventSource.instances[0].emit({
+      type: "codex_auth_verified",
+      provider: "codex",
+      credential_source: "current",
+      success: true,
+      ts: "2026-07-31T00:01:00Z",
+    });
+  });
+
+  await waitFor(() => {
+    expect(view.queryByText(/Sign in to Codex again/)).toBeNull();
+  });
+  expect(vi.mocked(getAgents).mock.calls.length).toBeGreaterThanOrEqual(2);
 });
 
 test("spawn dialog applies role presets and previews what will be created", () => {

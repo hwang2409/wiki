@@ -1477,6 +1477,10 @@ class WatchdogInternalState:
     # broken token loops kill+resume every poll cycle forever.
     auth_dead_attempts: dict[str, list[float]] = field(default_factory=dict)
     auth_dead_alert_at: dict[str, float] = field(default_factory=dict)
+    # Tickets whose pane currently shows the Claude usage-limit banner. When
+    # the banner leaves the pane on a later poll, the watchdog emits
+    # claude_limit_cleared — the recovery proof that resolves the notice.
+    claude_limited: set[str] = field(default_factory=set)
 
 
 AUTH_DEAD_MAX_ATTEMPTS = 3
@@ -1564,12 +1568,24 @@ async def _check_once(
             continue
         pane = await asyncio.to_thread(tmux_capture, worker.window, 80)
         if detect_claude_limit(pane):
+            watch.claude_limited.add(worker.ticket)
             # Alert once per hour per ticket.
             if _seconds_since(watch.last_alert_at.get(worker.ticket, 0.0)) < 3600:
                 continue
             watch.last_alert_at[worker.ticket] = time.monotonic()
             await emit({
                 "type": "claude_limit_hit",
+                "ticket": worker.ticket,
+                "window": worker.window,
+                "ts": datetime.now(timezone.utc).isoformat(),
+            })
+        elif worker.ticket in watch.claude_limited:
+            # The limit banner left the pane of a previously limited worker:
+            # the only observable proof that this worker can make progress.
+            watch.claude_limited.discard(worker.ticket)
+            watch.last_alert_at.pop(worker.ticket, None)
+            await emit({
+                "type": "claude_limit_cleared",
                 "ticket": worker.ticket,
                 "window": worker.window,
                 "ts": datetime.now(timezone.utc).isoformat(),
