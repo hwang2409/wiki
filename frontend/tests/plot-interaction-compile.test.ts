@@ -110,6 +110,24 @@ test("compile: all domainRaw axes inject no plot controls", () => {
   assert.equal(injected.length, 0);
 });
 
+test("compile: row and column facets stay out of full interaction mode", () => {
+  for (const facetChannel of ["row", "column"] as const) {
+    const spec = {
+      mark: "point",
+      data: { values: [{ x: 1, y: 1, facet: "a" }, { x: 2, y: 2, facet: "b" }] },
+      encoding: {
+        x: { field: "x", type: "quantitative" },
+        y: { field: "y", type: "quantitative" },
+        [facetChannel]: { field: "facet", type: "nominal" },
+      },
+    };
+    assert.deepEqual(plotInteractivity(spec), { mode: "static" });
+    const interactive = transform(spec);
+    assert.equal(interactive, spec);
+    assert.doesNotThrow(() => compile(interactive as never));
+  }
+});
+
 test("compile: single visible 2D brush for distinct-field x+y — mark spans BOTH bounds", () => {
   // R8F2: two 1D brushes rendered a cross while the applied zoom was the
   // intersection box. One 2D brush must both compile AND draw a rectangle
@@ -181,6 +199,39 @@ test("runtime: wheel on wiki_zoom_x shrinks x domain independently of y", async 
   const afterY = view.scale("y").domain() as [number, number];
   assert.notDeepEqual(afterX, initialX);
   assert.deepEqual(afterY, initialY, "wheel on x must NOT touch y");
+  await view.finalize();
+});
+
+test("runtime: repeated toolbar zoom updates move the domain every time", async () => {
+  const interactive = transform({
+    ...CONTINUOUS,
+    width: 400,
+    height: 200,
+    data: { values: [{ x: 0, y: 0 }, { x: 10, y: 10 }] },
+  });
+  const view = await renderHeadless(interactive);
+  const scale = view.scale("x");
+  const range = scale.range();
+  const zoom = (factor: number) => {
+    const domain = scale.domain() as [number, number];
+    const anchor = Number(scale.invert((Number(range[0]) + Number(range[1])) / 2));
+    view
+      .signal(`${zoomParamName("x")}_zoom_anchor`, { x: anchor, y: anchor })
+      .signal(`${zoomParamName("x")}_zoom_delta`, 1)
+      .run()
+      .signal(`${zoomParamName("x")}_zoom_delta`, factor)
+      .run();
+    return domain;
+  };
+  const initial = scale.domain() as [number, number];
+  const afterZoomIn = zoom(0.8);
+  const afterZoomInAgain = zoom(0.8);
+  const afterZoomOut = zoom(1 / 0.8);
+  const afterZoomOutAgain = zoom(1 / 0.8);
+  assert.deepEqual(afterZoomIn, initial);
+  assert.notDeepEqual(afterZoomInAgain, afterZoomIn);
+  assert.notDeepEqual(afterZoomOut, afterZoomInAgain);
+  assert.notDeepEqual(afterZoomOutAgain, afterZoomOut);
   await view.finalize();
 });
 

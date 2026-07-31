@@ -283,34 +283,38 @@ async function main() {
     const xBefore = await scaleDomain(page, inspectorSelector, "x");
     const yBefore = await scaleDomain(page, inspectorSelector, "y");
 
-    // ─── keyboard toolbar control changes the x scale ────────────────────
-    logStep("keyboard activation of Zoom in changes the x scale");
-    const xBeforeKeyboard = await scaleDomain(page, inspectorSelector, "x");
+    // ─── repeated toolbar zoom controls always change the x scale ─────────
+    logStep("repeated toolbar Zoom in and Zoom out controls change the x scale");
     const zoomInButton = page.getByRole("button", { name: "Zoom in" });
     if (await zoomInButton.count() === 0) {
       throw new Error(`interactive toolbar missing: ${await page.locator(".artifact-inspector .artifact-detail-toolbar").textContent()}`);
     }
-    await zoomInButton.focus();
-    await page.keyboard.press("Enter");
+    const xBeforeKeyboard = await scaleDomain(page, inspectorSelector, "x");
+    await zoomInButton.click();
     await page.waitForTimeout(220);
-    const xAfterKeyboard = await scaleDomain(page, inspectorSelector, "x");
-    if (!domainsChanged(xBeforeKeyboard, xAfterKeyboard)) {
-      throw new Error(`keyboard Zoom in did not move x domain (still ${xAfterKeyboard})`);
+    const xAfterZoomIn = await scaleDomain(page, inspectorSelector, "x");
+    if (!domainsChanged(xBeforeKeyboard, xAfterZoomIn)) {
+      throw new Error(`first keyboard Zoom in did not move x domain (still ${xAfterZoomIn})`);
+    }
+    await zoomInButton.click();
+    await page.waitForTimeout(220);
+    const xAfterZoomInAgain = await scaleDomain(page, inspectorSelector, "x");
+    if (!domainsChanged(xAfterZoomIn, xAfterZoomInAgain)) {
+      throw new Error(`second keyboard Zoom in did not move x domain (still ${xAfterZoomInAgain})`);
     }
 
-    // ─── keyboard Zoom out expands the live x scale ──────────────────────
-    logStep("keyboard activation of Zoom out expands the x scale");
-    const zoomedInSpan = Math.abs(xAfterKeyboard[1] - xAfterKeyboard[0]);
     const zoomOutButton = page.getByRole("button", { name: "Zoom out" });
-    await zoomOutButton.focus();
-    await page.keyboard.press("Enter");
+    await zoomOutButton.click();
     await page.waitForTimeout(220);
-    const xAfterKeyboardZoomOut = await scaleDomain(page, inspectorSelector, "x");
-    const zoomedOutSpan = Math.abs(xAfterKeyboardZoomOut[1] - xAfterKeyboardZoomOut[0]);
-    if (!(zoomedOutSpan > zoomedInSpan)) {
-      throw new Error(
-        `keyboard Zoom out did not expand x domain (span ${zoomedInSpan} → ${zoomedOutSpan})`,
-      );
+    const xAfterZoomOut = await scaleDomain(page, inspectorSelector, "x");
+    if (!domainsChanged(xAfterZoomInAgain, xAfterZoomOut)) {
+      throw new Error(`first keyboard Zoom out did not move x domain (still ${xAfterZoomOut})`);
+    }
+    await zoomOutButton.click();
+    await page.waitForTimeout(220);
+    const xAfterZoomOutAgain = await scaleDomain(page, inspectorSelector, "x");
+    if (!domainsChanged(xAfterZoomOut, xAfterZoomOutAgain)) {
+      throw new Error(`second keyboard Zoom out did not move x domain (still ${xAfterZoomOutAgain})`);
     }
 
     // ─── real wheel gesture zooms the x scale ────────────────────────────

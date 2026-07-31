@@ -40,6 +40,7 @@ export function applyKeyboardControl(
   if (!view.signal || !view.run) return false;
   const isZoom = action === "zoom-in" || action === "zoom-out";
   let changed = false;
+  const zoomRequests: Array<{ param: string; anchor: number; factor: number }> = [];
   for (const channel of channels) {
     const domain = scaleDomain(view, channel);
     if (!domain) continue;
@@ -47,8 +48,11 @@ export function applyKeyboardControl(
     if (isZoom) {
       const anchor = scaleAnchor(view, channel, domain);
       const factor = action === "zoom-in" ? 0.8 : 1 / 0.8;
+      zoomRequests.push({ param, anchor, factor });
+      // Vega suppresses equal primitive signal writes. Reset the delta in a
+      // separate run so repeated toolbar clicks always emit a zoom update.
       view.signal(`${param}_zoom_anchor`, { x: anchor, y: anchor });
-      view.signal(`${param}_zoom_delta`, factor);
+      view.signal(`${param}_zoom_delta`, 1);
       changed = true;
       continue;
     }
@@ -72,6 +76,13 @@ export function applyKeyboardControl(
     changed = true;
   }
   if (!changed) return false;
+  if (isZoom) {
+    view.run();
+    for (const { param, anchor, factor } of zoomRequests) {
+      view.signal(`${param}_zoom_anchor`, { x: anchor, y: anchor });
+      view.signal(`${param}_zoom_delta`, factor);
+    }
+  }
   view.run();
   return true;
 }

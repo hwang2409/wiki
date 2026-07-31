@@ -47,7 +47,7 @@ const RESERVED_PARAM_PREFIXES = [ZOOM_PARAM_PREFIX, BRUSH_PARAM] as const;
 // Reset button and hint drag/wheel/shift-drag with no live wiring.
 const COMPOSITE_MARKS = new Set(["boxplot", "errorbar", "errorband"]);
 
-const COMPOSITE_KEYS = ["layer", "facet", "concat", "hconcat", "vconcat", "repeat", "spec"];
+const COMPOSITE_KEYS = ["layer", "facet", "concat", "hconcat", "vconcat", "repeat", "spec", "row", "column"];
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -131,6 +131,7 @@ export function plotInteractivity(spec: unknown): PlotInteractivity {
   if (COMPOSITE_KEYS.some((key) => key in record)) return { mode: "static" };
   const encoding = asRecord(record.encoding);
   if (!encoding) return { mode: "static" };
+  if ("row" in encoding || "column" in encoding) return { mode: "static" };
   const channels: ZoomChannel[] = [];
   for (const channel of ["x", "y"] as const) {
     if (continuousChannel(encoding, channel)) channels.push(channel);
