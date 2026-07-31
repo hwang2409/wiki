@@ -493,15 +493,17 @@ class Supervisor:
         return time.monotonic() - ts if ts else float("inf")
 
     def _current_codex_tickets(self) -> list[str]:
-        tickets = {
-            record.agent_id
+        return sorted(self._current_codex_run_ids())
+
+    def _current_codex_run_ids(self) -> dict[str, str]:
+        return {
+            record.agent_id: record.run_id
             for record in self.store.list_runs()
             if record.provider is ProviderKind.CODEX
             and self.store.is_current(record)
             and not record.replaced_by_run_id
             and record.state not in TERMINAL_STATES
         }
-        return sorted(tickets)
 
     def _active_worker_count(self) -> int:
         return sum(
@@ -1163,10 +1165,13 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         except StoreConflict as exc:
             if "another Codex account rotation is active" in str(exc):
                 return
+            run_ids = self._current_codex_run_ids()
             await self._publish(
                 {
                     "type": "codex_rotation_failed",
                     "error": str(exc),
+                    "tickets": sorted(run_ids),
+                    "run_ids": run_ids,
                     "ts": datetime.now(timezone.utc).isoformat(),
                 }
             )
@@ -1174,25 +1179,32 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             if self._seconds_since(self.last_no_eligible_alert) < 3600:
                 return
             self.last_no_eligible_alert = time.monotonic()
-            tickets = self._current_codex_tickets()
+            run_ids = self._current_codex_run_ids()
+            tickets = sorted(run_ids)
             if not tickets:
                 try:
-                    tickets = [self.store.get(run_id).agent_id]
+                    record = self.store.get(run_id)
+                    tickets = [record.agent_id]
+                    run_ids = {record.agent_id: record.run_id}
                 except RunNotFound:
                     tickets = []
             await self._publish(
                 {
                     "type": "codex_limit_no_eligible",
                     "tickets": tickets,
+                    "run_ids": run_ids,
                     "reset_at": outgoing_reset_at,
                     "ts": datetime.now(timezone.utc).isoformat(),
                 }
             )
         except accounts.RotationError as exc:
+            run_ids = self._current_codex_run_ids()
             await self._publish(
                 {
                     "type": "codex_rotation_failed",
                     "error": str(exc),
+                    "tickets": sorted(run_ids),
+                    "run_ids": run_ids,
                     "ts": datetime.now(timezone.utc).isoformat(),
                 }
             )

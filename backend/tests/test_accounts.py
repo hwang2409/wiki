@@ -1128,6 +1128,7 @@ class WatchdogLoopTests(unittest.IsolatedAsyncioTestCase):
                         "window": "@42",
                         "kind": "cdx",
                         "role": "implement",
+                        "run_id": "run-wiki-15",
                         "worktree": str(paths["root"] / "wt-15"),
                         "log": "/tmp/cdx-WIKI-15.log",
                     }
@@ -1147,6 +1148,7 @@ class WatchdogLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(emitted), 1)
             self.assertEqual(emitted[0]["type"], "codex_limit_no_eligible")
             self.assertIn("WIKI-15", emitted[0]["tickets"])
+            self.assertEqual(emitted[0]["run_ids"], {"WIKI-15": "run-wiki-15"})
 
     async def test_limit_rotation_pins_fallback_reset_when_parse_missing(self) -> None:
         with _EnvOverride() as paths:

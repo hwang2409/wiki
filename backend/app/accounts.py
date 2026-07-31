@@ -629,6 +629,7 @@ class WorkerEntry:
     orch: str | None
     spawned_at: str | None = None
     session_id: str | None = None  # codex rollout session id (registry-tracked)
+    run_id: str | None = None  # headless supervisor run identity
 
 
 def read_registry() -> dict:
@@ -710,6 +711,7 @@ def _worker_from_registry_entry(
     orch_value = current.get("orch")
     spawned_at_value = current.get("spawned_at")
     session_id_value = current.get("session_id")
+    run_id_value = current.get("run_id")
     return WorkerEntry(
         ticket=ticket,
         window=window,
@@ -720,6 +722,7 @@ def _worker_from_registry_entry(
         orch=orch_value if isinstance(orch_value, str) else None,
         spawned_at=spawned_at_value if isinstance(spawned_at_value, str) else None,
         session_id=session_id_value if isinstance(session_id_value, str) else None,
+        run_id=run_id_value if isinstance(run_id_value, str) else None,
     ), None
 
 
@@ -1642,20 +1645,35 @@ async def _check_once(
     except RotationDebouncedError:
         return
     except NoEligibleAccountError:
+        affected_tickets = [worker.ticket for worker, _ in codex_hits]
+        affected_run_ids = {
+            worker.ticket: worker.run_id
+            for worker, _ in codex_hits
+            if worker.run_id
+        }
         if _seconds_since(watch.last_no_eligible_alert) >= 3600:
             watch.last_no_eligible_alert = time.monotonic()
             reset_hint = outgoing_reset or _earliest_pending_reset(state)
             await emit({
                 "type": "codex_limit_no_eligible",
-                "tickets": [w.ticket for w, _ in codex_hits],
+                "tickets": affected_tickets,
+                "run_ids": affected_run_ids,
                 "reset_at": reset_hint,
                 "ts": datetime.now(timezone.utc).isoformat(),
             })
         return
     except RotationError as exc:
+        affected_tickets = [worker.ticket for worker, _ in codex_hits]
+        affected_run_ids = {
+            worker.ticket: worker.run_id
+            for worker, _ in codex_hits
+            if worker.run_id
+        }
         await emit({
             "type": "codex_rotation_failed",
             "error": str(exc),
+            "tickets": affected_tickets,
+            "run_ids": affected_run_ids,
             "ts": datetime.now(timezone.utc).isoformat(),
         })
         return

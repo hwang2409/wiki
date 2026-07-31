@@ -692,10 +692,80 @@ def test_reconcile_bumps_revision_when_it_actually_changes_state(tmp_path: Path)
     assert store.revision == rev_before + 1
 
 
-def test_reconcile_leaves_fleet_wide_notices_alone(tmp_path: Path) -> None:
+def test_reconcile_clears_codex_limit_after_claude_replacement(tmp_path: Path) -> None:
     store = _store(tmp_path)
-    store.apply_event({"type": "codex_limit_no_eligible", "tickets": ["WIKI-I"], "reset_at": None, "ts": "t1"})
-    store.apply_event({"type": "codex_rotation_failed", "error": "boom", "ts": "t2"})
-    # No ticket is live; fleet-wide notices are not per-ticket and must remain.
-    assert store.reconcile_with_live({}) is False
-    assert sorted(_types(store)) == ["codex_limit_no_eligible", "codex_rotation_failed"]
+    store.apply_event(
+        {
+            "type": "codex_limit_no_eligible",
+            "tickets": ["WIKI-I"],
+            "run_ids": {"WIKI-I": "codex-old"},
+            "reset_at": None,
+            "ts": "t1",
+        }
+    )
+
+    assert store.reconcile_with_live(
+        {"WIKI-I": "claude-new"},
+        live_providers={"WIKI-I": "claude"},
+    ) is True
+    assert store.snapshot() == []
+
+
+def test_reconcile_clears_rotation_failure_after_claude_replacement(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.apply_event(
+        {
+            "type": "codex_rotation_failed",
+            "error": "boom",
+            "tickets": ["WIKI-I"],
+            "run_ids": {"WIKI-I": "codex-old"},
+            "ts": "t1",
+        }
+    )
+
+    assert store.reconcile_with_live(
+        {"WIKI-I": "claude-new"},
+        live_providers={"WIKI-I": "claude"},
+    ) is True
+    assert store.snapshot() == []
+
+
+def test_reconcile_clears_codex_fleet_notices_after_archive(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.apply_event(
+        {
+            "type": "codex_limit_no_eligible",
+            "tickets": ["WIKI-I"],
+            "run_ids": {"WIKI-I": "codex-old"},
+            "reset_at": None,
+            "ts": "t1",
+        }
+    )
+    store.apply_event(
+        {
+            "type": "codex_rotation_failed",
+            "error": "boom",
+            "tickets": ["WIKI-I"],
+            "run_ids": {"WIKI-I": "codex-old"},
+            "ts": "t2",
+        }
+    )
+
+    assert store.reconcile_with_live({}, live_providers={}) is True
+    assert store.snapshot() == []
+
+
+def test_reconcile_removes_empty_codex_fleet_notice(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.apply_event(
+        {
+            "type": "codex_limit_no_eligible",
+            "tickets": [],
+            "run_ids": {},
+            "reset_at": None,
+            "ts": "t1",
+        }
+    )
+
+    assert store.reconcile_with_live({}, live_providers={}) is True
+    assert store.snapshot() == []

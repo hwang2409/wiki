@@ -1044,8 +1044,8 @@ function accountBannerCopy(event: AccountEvent): { impact: string; action: strin
       return {
         impact: `Codex usage limit reached on every account — ${event.tickets.length > 0 ? `${event.tickets.join(", ")} are` : "Codex workers are"} paused.`,
         action: event.reset_at
-          ? `They resume when the limit resets at ${event.reset_at}. To keep moving now, replace them with Claude workers.`
-          : "To keep moving now, replace them with Claude workers.",
+          ? `When the limit resets at ${event.reset_at}, revive these workers. To keep moving now, replace them with Claude workers.`
+          : "Revive these workers after the limit resets, or replace them with Claude workers.",
       };
     case "codex_rotation_failed":
       return {

@@ -228,12 +228,15 @@ export type AccountEvent =
   | {
       type: "codex_limit_no_eligible";
       tickets: string[];
+      run_ids?: Record<string, string>;
       reset_at: string | null;
       ts: string;
     }
   | {
       type: "codex_rotation_failed";
       error: string;
+      tickets?: string[];
+      run_ids?: Record<string, string>;
       ts: string;
     }
   | {

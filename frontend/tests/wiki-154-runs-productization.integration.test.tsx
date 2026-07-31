@@ -166,6 +166,8 @@ test("account banners render persisted notices from the agents payload", () => {
   });
   expect(view.getByText(/Codex usage limit reached/)).toBeTruthy();
   expect(view.getByText(/replace them with Claude workers/)).toBeTruthy();
+  expect(view.getByText(/When the limit resets at 18:00, revive these workers/)).toBeTruthy();
+  expect(view.queryByText(/They resume when the limit resets/)).toBeNull();
 });
 
 test("codex_rotation_failed keeps the raw error behind the details disclosure", async () => {

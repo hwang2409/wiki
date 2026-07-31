@@ -8,8 +8,8 @@ clears a notice only when a matching recovery event proves resolution.
 Worker-scoped failures (dead-auth exhaustion, failed revivals) are tracked
 per ticket inside one aggregated notice per failure kind: new events merge
 their tickets in, and a recovery event removes only the tickets it proves
-revived. Fleet-wide conditions (usage-limit deadlock, rotation failure)
-stay single-keyed.
+revived. Codex fleet conditions use one notice key per condition, with the
+affected tickets and run identities tracked inside that notice.
 
 Two lifecycle gaps remain, both tracked as WIKI-228 (durable provider-health
 lifecycle in the supervisor): (a) the headless supervisor never emits
@@ -127,10 +127,23 @@ def _valid_notice(kind: str, payload: dict) -> bool:
                 isinstance(payload.get("tickets"), list)
                 and len(payload["tickets"]) == 0
             )
-        ) and ("reset_at" in payload and (payload["reset_at"] is None or _optional_non_empty_string(payload["reset_at"])))
+        ) and (
+            "reset_at" in payload
+            and (
+                payload["reset_at"] is None
+                or _optional_non_empty_string(payload["reset_at"])
+            )
+        ) and _optional_string_map(payload.get("run_ids"))
     if kind == "codex_rotation_failed":
         error = payload.get("error")
-        return _valid_common_fields(payload) and isinstance(error, str) and bool(error)
+        tickets = payload.get("tickets")
+        return (
+            _valid_common_fields(payload)
+            and isinstance(error, str)
+            and bool(error)
+            and ("tickets" not in payload or _all_non_empty_strings(tickets) or tickets == [])
+            and _optional_string_map(payload.get("run_ids"))
+        )
     if kind == "codex_rotation":
         revived = payload.get("revived")
         failed = payload.get("failed")
@@ -291,6 +304,27 @@ class AccountNoticeStore:
             payload["run_ids"] = run_ids
             set_notice(_EXHAUSTED_KEY, payload)
 
+        def merge_codex_fleet_notice(key: str) -> None:
+            existing = self._notices.get(key)
+            prior_tickets = _ticket_list(existing.get("tickets")) if existing else []
+            event_tickets = _ticket_list(event.get("tickets"))
+            has_tickets = (
+                (existing is not None and "tickets" in existing)
+                or "tickets" in event
+            )
+            merged_tickets = sorted(set(prior_tickets) | set(event_tickets))
+            prior_run_ids = _reason_map(existing.get("run_ids")) if existing else {}
+            merged_run_ids = {**prior_run_ids, **_reason_map(event.get("run_ids"))}
+            payload = dict(event)
+            if has_tickets:
+                payload["tickets"] = merged_tickets
+                payload["run_ids"] = {
+                    ticket: run_id
+                    for ticket, run_id in merged_run_ids.items()
+                    if ticket in set(merged_tickets)
+                }
+            set_notice(key, payload)
+
         def remove_revived(
             revived: list[str],
             *,
@@ -391,9 +425,9 @@ class AccountNoticeStore:
             set_notice(key, payload)
 
         if kind == "codex_limit_no_eligible":
-            set_notice("codex:limit", dict(event))
+            merge_codex_fleet_notice("codex:limit")
         elif kind == "codex_rotation_failed":
-            set_notice("codex:rotation-failed", dict(event))
+            merge_codex_fleet_notice("codex:rotation-failed")
         elif kind == "codex_auth_dead_exhausted":
             merge_exhausted(_ticket_list(event.get("tickets")))
         elif kind in ("codex_rotation", "codex_auth_dead_revival"):
@@ -435,9 +469,10 @@ class AccountNoticeStore:
         self,
         live_runs: dict[str, str | None],
         *,
+        live_providers: dict[str, str | None] | None = None,
         expected_revision: int | None = None,
     ) -> bool:
-        """Drop worker-scoped notice tickets that no longer match a live run.
+        """Drop notice tickets that no longer match a live run.
 
         ``expected_revision`` guards against a TOCTOU race between the
         registry snapshot and this call: publish_agent_event may apply a new
@@ -463,15 +498,23 @@ class AccountNoticeStore:
         events, and those events are (correctly) ignored by ``apply_event``.
         Without reconciliation the operator would follow the stated fix and
         the banner would remain forever. This runs on every ``/api/agents``
-        refresh so replaced or archived tickets clear promptly. Fleet-wide
-        notices (limit deadlock, rotation failure) are not per-ticket, so
-        they are untouched. See WIKI-228 for the durable event-driven
-        lifecycle that will supersede this reconciliation.
+        refresh so replaced or archived tickets clear promptly. Codex fleet
+        notices carry affected tickets and run ids, so provider identity also
+        clears a stale notice after a Claude replacement.
         """
 
-        def _ticket_matches_live(ticket: str, stored_run_id: str | None) -> bool:
+        def _ticket_matches_live(
+            ticket: str,
+            stored_run_id: str | None,
+            *,
+            expected_provider: str | None = None,
+        ) -> bool:
             if ticket not in live_runs:
                 return False
+            if expected_provider and live_providers is not None:
+                live_provider = live_providers.get(ticket)
+                if live_provider is not None and live_provider != expected_provider:
+                    return False
             live_run_id = live_runs[ticket]
             if stored_run_id and live_run_id and stored_run_id != live_run_id:
                 return False
@@ -484,6 +527,40 @@ class AccountNoticeStore:
                 # a paired revision.
                 return False
             changed = False
+            for key in ("codex:limit", "codex:rotation-failed"):
+                notice = self._notices.get(key)
+                if notice is None or "tickets" not in notice:
+                    continue
+                current_tickets = _ticket_list(notice.get("tickets"))
+                stored_run_ids = _reason_map(notice.get("run_ids"))
+                if not current_tickets:
+                    self._notices.pop(key, None)
+                    changed = True
+                    continue
+                remaining = [
+                    ticket
+                    for ticket in current_tickets
+                    if _ticket_matches_live(
+                        ticket,
+                        stored_run_ids.get(ticket),
+                        expected_provider="codex",
+                    )
+                ]
+                if remaining == current_tickets:
+                    continue
+                changed = True
+                if remaining:
+                    updated = dict(notice)
+                    updated["tickets"] = remaining
+                    updated["run_ids"] = {
+                        ticket: run_id
+                        for ticket, run_id in stored_run_ids.items()
+                        if ticket in remaining
+                    }
+                    self._notices[key] = updated
+                else:
+                    self._notices.pop(key, None)
+
             existing = self._notices.get(_EXHAUSTED_KEY)
             if existing is not None:
                 current_tickets = _ticket_list(existing.get("tickets"))
@@ -548,7 +625,7 @@ class AccountNoticeStore:
                 ticket = key.split(":", 2)[2]
                 notice = self._notices.get(key) or {}
                 stored_run_id = notice.get("run_id") if isinstance(notice.get("run_id"), str) else None
-                if _ticket_matches_live(ticket, stored_run_id):
+                if _ticket_matches_live(ticket, stored_run_id, expected_provider="claude"):
                     continue
                 self._notices.pop(key, None)
                 changed = True

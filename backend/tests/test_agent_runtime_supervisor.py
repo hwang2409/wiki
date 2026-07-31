@@ -3692,6 +3692,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(accounts.read_state().active, "alpha")
 
         self.assertEqual(published["tickets"], ["WIKI-NO-ELIGIBLE"])
+        self.assertEqual(published["run_ids"], {"WIKI-NO-ELIGIBLE": record.run_id})
         self.assertEqual(
             published["reset_at"],
             datetime.fromtimestamp(1_750_009_999, tz=timezone.utc).isoformat(),
