@@ -551,16 +551,20 @@ class ApeV2BoundaryTests(unittest.TestCase):
 
 class ApeV2ValidLayoutTests(unittest.TestCase):
     @staticmethod
-    def _preamble(flags: int) -> bytes:
+    def _preamble(*, flags: int, tag_size: int, item_count: int = 1) -> bytes:
         return (
             b"APETAGEX"
-            + struct.pack("<III", 2000, 32, 0)
+            + struct.pack("<III", 2000, tag_size, item_count)
             + struct.pack("<I", flags)
             + b"\x00" * 8
         )
 
+    @staticmethod
+    def _item(value: bytes) -> bytes:
+        return struct.pack("<II", len(value), 0) + b"LOCATION\x00" + value
+
     @classmethod
-    def _payload(cls, *, header: bool, footer: bool) -> bytes:
+    def _payload(cls, *, footer: bool) -> bytes:
         base = REAL_MP3.read_bytes()
         if base.startswith(b"ID3"):
             tag_size = sum(
@@ -568,22 +572,28 @@ class ApeV2ValidLayoutTests(unittest.TestCase):
                 for byte, shift in zip(base[6:10], (21, 14, 7, 0))
             )
             base = base[10 + tag_size :]
-        parts: list[bytes] = []
-        if header:
-            flags = (1 << 29) | ((1 << 31) if footer else (1 << 30))
-            parts.append(cls._preamble(flags))
-        parts.append(base)
+        item = cls._item(b"ape-round35-marker")
+        tag_size = 32 + len(item)
+        parts = [
+            cls._preamble(
+                flags=(1 << 29) | ((1 << 31) if footer else (1 << 30)),
+                tag_size=tag_size,
+            ),
+            item,
+        ]
         if footer:
-            parts.append(cls._preamble(1 << 31 if header else 0))
+            parts.append(cls._preamble(flags=1 << 31, tag_size=tag_size))
+        parts.append(base)
         return b"".join(parts)
 
     @unittest.skipIf(FFMPEG is None, "ffmpeg not installed")
-    def test_footer_header_and_header_without_footer_are_removed(self) -> None:
-        for header, footer in ((False, True), (True, True), (True, False)):
-            with self.subTest(header=header, footer=footer):
-                payload = self._payload(header=header, footer=footer)
+    def test_header_with_footer_and_header_without_footer_are_removed(self) -> None:
+        for footer in (True, False):
+            with self.subTest(footer=footer):
+                payload = self._payload(footer=footer)
                 result = media_scrub.scrub_audio(payload, "audio/mpeg")
                 self.assertNotIn(b"APETAGEX", result.data)
+                self.assertNotIn(b"ape-round35-marker", result.data)
                 with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as handle:
                     handle.write(result.data)
                     path = handle.name

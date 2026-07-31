@@ -105,10 +105,13 @@ def _mp3_strip_ape_header(data: bytes, start: int, end: int) -> int:
     tag_size, _item_count, flags = _mp3_read_ape_meta(data, start)
     if flags & _APE_FLAG_IS_HEADER == 0:
         raise MediaScrubError("mp3 APEv2 marker at start is not a header")
-    # With a footer, tag_size covers the front header plus tag payload and
-    # the footer. With NO_FOOTER, it covers the complete front tag. In both
-    # forms it is the number of bytes to advance past the front tag.
-    advance = tag_size
+    # With a footer, tag_size covers the footer and items, but excludes the
+    # front header. With NO_FOOTER, it covers the complete header-only tag.
+    advance = (
+        tag_size
+        if flags & _APE_FLAG_NO_FOOTER
+        else _APE_HEADER_FOOTER_LEN + tag_size
+    )
     if advance > end - start:
         raise MediaScrubError("mp3 APEv2 header size larger than payload")
     return start + advance
