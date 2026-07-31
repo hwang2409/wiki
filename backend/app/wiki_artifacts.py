@@ -869,7 +869,14 @@ def _tool_result(request_id: Any, arguments: Any) -> dict[str, Any]:
             "isError": True,
         }
     else:
-        result = {"content": [{"type": "text", "text": sentinel_text(event)}]}
+        result = {
+            "content": [{"type": "text", "text": sentinel_text(event)}],
+            "structuredContent": {
+                "artifact_id": event["id"],
+                "ok": True,
+                "artifact": event["artifact"],
+            },
+        }
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
 

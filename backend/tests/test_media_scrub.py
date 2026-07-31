@@ -29,6 +29,7 @@ REAL_MP3 = FIXTURE_DIR / "tone.mp3"
 REAL_MP3_APE = FIXTURE_DIR / "tone_ape.mp3"
 
 FFMPEG = shutil.which("ffmpeg")
+FFPROBE = shutil.which("ffprobe")
 
 
 # ---------------------------------------------------------------------------
@@ -3303,7 +3304,18 @@ class Review20MediaProbeTests(unittest.TestCase):
             struct.pack(">I", 9) + b"mdat" + b"\x00"
             for _ in range(extra_mdat_count)
         )
-        return bytes(payload) + extra
+        result = bytearray(payload + extra)
+        media_duration = sample_count * 1024
+        movie_duration = round(media_duration * 1000 / 15360)
+        mvhd_pos = result.find(b"mvhd")
+        tkhd_pos = result.find(b"tkhd")
+        mdhd_pos = result.find(b"mdhd")
+        elst_pos = result.find(b"elst")
+        result[mvhd_pos + 4 + 16:mvhd_pos + 4 + 20] = struct.pack(">I", movie_duration)
+        result[tkhd_pos + 4 + 20:tkhd_pos + 4 + 24] = struct.pack(">I", movie_duration)
+        result[mdhd_pos + 4 + 16:mdhd_pos + 4 + 20] = struct.pack(">I", media_duration)
+        result[elst_pos + 4 + 8:elst_pos + 4 + 12] = struct.pack(">I", movie_duration)
+        return bytes(result)
 
     def test_many_mdats_do_not_restart_large_sample_walk(self) -> None:
         payload = self._many_mdat_uniform_fixture()
@@ -3532,7 +3544,17 @@ class Review21MediaProbeTests(unittest.TestCase):
         )
         final_moov = rebuild_tree(moov_bytes, replacement_map(self_stco))
         mdats = b"".join(box(b"mdat", body) for body in mdat_bodies)
-        return ftyp_bytes + final_moov + mdats
+        result = bytearray(ftyp_bytes + final_moov + mdats)
+        movie_duration = round(sample_count * 1000 / 15360)
+        mvhd_pos = result.find(b"mvhd")
+        tkhd_pos = result.find(b"tkhd")
+        mdhd_pos = result.find(b"mdhd")
+        elst_pos = result.find(b"elst")
+        result[mvhd_pos + 4 + 16:mvhd_pos + 4 + 20] = struct.pack(">I", movie_duration)
+        result[tkhd_pos + 4 + 20:tkhd_pos + 4 + 24] = struct.pack(">I", movie_duration)
+        result[mdhd_pos + 4 + 16:mdhd_pos + 4 + 20] = struct.pack(">I", sample_count)
+        result[elst_pos + 4 + 8:elst_pos + 4 + 12] = struct.pack(">I", movie_duration)
+        return bytes(result)
 
     def test_near_limit_chunks_and_mdats_are_grouped(self) -> None:
         payload = self._near_limit_chunk_mdat_fixture()
@@ -3608,6 +3630,120 @@ class Review24Mp3ReservoirProbeTests(unittest.TestCase):
         self.assertLess(elapsed, 25.0, f"MP3 scrub took {elapsed:.2f}s")
         self.assertLess(peak, 4 * len(payload), f"peak allocation was {peak} bytes")
         self.assertLess(rss_delta, 4 * len(payload), f"RSS delta was {rss_delta} bytes")
+
+
+class Review31Mp3HeaderModeTests(unittest.TestCase):
+    @staticmethod
+    def _frame_start(data: bytes) -> int:
+        offset = 0
+        while offset + 4 <= len(data):
+            if data[offset] == 0xFF and data[offset + 1] & 0xE0 == 0xE0:
+                return offset
+            offset += 1
+        raise AssertionError("fixture has no MPEG frame")
+
+    def test_mode_extension_bits_are_canonical_by_channel_mode(self) -> None:
+        fixtures = (
+            ("mono", REAL_MP3, 3, False),
+            ("stereo", FIXTURE_DIR / "tone_mpeg2_stereo.mp3", 0, False),
+            ("joint", FIXTURE_DIR / "tone_mpeg2_stereo.mp3", 1, True),
+            ("dual", FIXTURE_DIR / "tone_mpeg2_stereo.mp3", 2, False),
+        )
+        for name, fixture, channel_mode, preserve_extension in fixtures:
+            with self.subTest(mode=name):
+                original = fixture.read_bytes()
+                source = original[self._frame_start(original):]
+                payload = bytearray(source)
+                offset = 0
+                values: list[int] = []
+                while offset < len(payload):
+                    frame_length = mp3_scrubber._mp3_frame_length(
+                        payload, offset, len(payload),
+                    )
+                    self.assertIsNotNone(frame_length)
+                    assert frame_length is not None
+                    value = len(values) & 0x03
+                    values.append(value)
+                    payload[offset + 3] = (
+                        (payload[offset + 3] & 0x0F)
+                        | (channel_mode << 6)
+                        | (value << 4)
+                    )
+                    offset += frame_length
+
+                result = media_scrub.scrub_audio(bytes(payload), "audio/mpeg")
+                offset = 0
+                for value in values:
+                    frame_length = mp3_scrubber._mp3_frame_length(
+                        result.data, offset, len(result.data),
+                    )
+                    self.assertIsNotNone(frame_length)
+                    assert frame_length is not None
+                    header = result.data[offset:offset + 4]
+                    extension = (header[3] >> 4) & 0x03
+                    self.assertEqual(extension, value if preserve_extension else 0)
+                    offset += frame_length
+                self.assertEqual(offset, len(result.data))
+
+                if FFMPEG is not None:
+                    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as handle:
+                        handle.write(result.data)
+                        path = handle.name
+                    try:
+                        probe = subprocess.run(
+                            [FFMPEG, "-v", "error", "-i", path, "-f", "null", "-"],
+                            capture_output=True,
+                            timeout=30,
+                        )
+                        self.assertEqual(
+                            probe.returncode, 0,
+                            probe.stderr.decode(errors="replace"),
+                        )
+                    finally:
+                        Path(path).unlink(missing_ok=True)
+
+
+class Review31Mp4TimingTests(unittest.TestCase):
+    def test_duration_is_derived_from_validated_timing(self) -> None:
+        original = REAL_MP4.read_bytes()
+        result = media_scrub.scrub_video(original, "video/mp4")
+        self.assertEqual(result.duration_ms, 533)
+        if FFPROBE is not None:
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as handle:
+                handle.write(result.data)
+                path = handle.name
+            try:
+                probe = subprocess.run(
+                    [
+                        FFPROBE, "-v", "error", "-show_entries",
+                        "format=duration", "-of", "default=nw=1:nk=1", path,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                self.assertEqual(probe.returncode, 0, probe.stderr)
+                self.assertAlmostEqual(result.duration_ms / 1000, float(probe.stdout), places=2)
+            finally:
+                Path(path).unlink(missing_ok=True)
+
+    def test_forged_duration_and_zero_timescales_are_rejected(self) -> None:
+        original = REAL_MP4.read_bytes()
+        mvhd = original.find(b"mvhd")
+        mdhd = original.find(b"mdhd")
+        self.assertGreater(mvhd, 0)
+        self.assertGreater(mdhd, 0)
+        cases = {
+            "forged mvhd duration": (mvhd + 4 + 16, (1_000_000).to_bytes(4, "big")),
+            "zero mvhd timescale": (mvhd + 4 + 12, b"\x00" * 4),
+            "zero mdhd timescale": (mdhd + 4 + 12, b"\x00" * 4),
+        }
+        for name, (offset, replacement) in cases.items():
+            with self.subTest(case=name):
+                payload = bytearray(original)
+                payload[offset:offset + 4] = replacement
+                with self.assertRaisesRegex(media_scrub.MediaScrubError, "duration|timescale"):
+                    media_scrub.scrub_video(bytes(payload), "video/mp4")
 
 
 class Review26Mp4StructureProbeTests(unittest.TestCase):

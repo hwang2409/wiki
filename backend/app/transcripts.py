@@ -683,15 +683,25 @@ def _artifact_from_structured_result(meta: dict, output: str) -> dict | None:
     if not isinstance(kind, str) or not isinstance(payload, dict):
         return None
     if kind in _STRUCTURED_BINARY_MIMES:
-        default_mime = PDF_MIME if kind == "pdf" else None
-        mime = payload.get("mime", default_mime)
-        if mime not in _STRUCTURED_BINARY_MIMES[kind]:
-            return None
-        artifact = {
-            "kind": kind,
-            "ref": f"artifact://{artifact_id}",
-            "mime": mime,
-        }
+        normalized = result.get("artifact")
+        if isinstance(normalized, dict):
+            artifact = dict(normalized)
+            if artifact.get("kind") != kind:
+                return None
+        else:
+            # Older providers only returned an id for image and PDF results.
+            # These kinds have no media metadata that the renderer needs.
+            if kind not in {"image", "pdf"}:
+                return None
+            default_mime = PDF_MIME if kind == "pdf" else None
+            mime = payload.get("mime", default_mime)
+            if mime not in _STRUCTURED_BINARY_MIMES[kind]:
+                return None
+            artifact = {
+                "kind": kind,
+                "ref": f"artifact://{artifact_id}",
+                "mime": mime,
+            }
     else:
         try:
             validated_payload = _validate_text_payload(kind, payload)

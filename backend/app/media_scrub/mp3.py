@@ -445,11 +445,13 @@ def _mp3_rebuild_header(header: bytes) -> bytes:
     """Keep decoder fields and clear MPEG header metadata bits."""
     if len(header) != 4:
         raise MediaScrubError("mp3 frame header is truncated")
+    channel_mode = (header[3] >> 6) & 0x03
+    mode_extension = header[3] & 0x30 if channel_mode == 1 else 0
     return bytes((
         header[0],
         header[1],
         header[2] & 0xFE,
-        header[3] & 0xF0,
+        (header[3] & 0xC0) | mode_extension,
     ))
 
 

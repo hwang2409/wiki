@@ -178,7 +178,7 @@ class WikiArtifactsTests(unittest.TestCase):
                     # Real fixture: 160x120, ~0.5s runtime.
                     self.assertEqual(event["artifact"]["width"], 160)
                     self.assertEqual(event["artifact"]["height"], 120)
-                    self.assertGreater(event["artifact"]["duration_ms"], 0)
+                    self.assertEqual(event["artifact"]["duration_ms"], 533)
                     video = (
                         self.root
                         / "runtime"
@@ -365,7 +365,8 @@ class WikiArtifactsTests(unittest.TestCase):
         payload[mvhd_pos + 20:mvhd_pos + 24] = struct.pack(">I", 0xFFFFFFFF)
         artifact_dir = self.root / "runtime" / "runs" / RUN_ID / "artifacts"
         with self.assertRaisesRegex(
-            wiki_artifacts.ArtifactValidationError, "duration_ms is out of bounds"
+            wiki_artifacts.ArtifactValidationError,
+            "duration_ms is out of bounds|mvhd and tkhd durations differ",
         ):
             wiki_artifacts.render_artifact(
                 {
@@ -590,9 +591,13 @@ class WikiArtifactsTests(unittest.TestCase):
         responses = [json.loads(line) for line in process.stdout.splitlines()]
         self.assertEqual(responses[1]["result"]["tools"][0]["name"], "render_artifact")
         result = responses[2]["result"]
-        self.assertNotIn("structuredContent", result)
         event = wiki_artifacts.artifact_from_text(result["content"][0]["text"])
         self.assertIsNotNone(event)
+        self.assertEqual(result["structuredContent"]["ok"], True)
+        self.assertEqual(
+            result["structuredContent"]["artifact"],
+            event["artifact"],
+        )
         self.assertEqual(event["artifact"]["kind"], "mermaid")
 
     def test_orchestrator_lists_native_ops_but_worker_does_not(self) -> None:

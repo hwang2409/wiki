@@ -184,6 +184,7 @@ def scrub_mp4(data: bytes) -> MediaScrubResult:
             _rebuilt, _trak, _mvhd, stsd_ok, video_ok = _rebuild_moov(
                 data, atom.body_start, atom.body_end,
             )
+            duration_ms = _validated_movie_duration(data, atom)
             if not _trak:
                 raise MediaScrubError("mp4 moov missing trak")
             if not stsd_ok:
@@ -212,7 +213,6 @@ def scrub_mp4(data: bytes) -> MediaScrubResult:
     video_ok = False
     mdat_non_empty = False
     mdat_index = 0
-    duration_ms: int | None = None
     dims: tuple[int, int] | None = None
 
     for atom in top_atoms[1:]:
@@ -223,7 +223,6 @@ def scrub_mp4(data: bytes) -> MediaScrubResult:
                 raise MediaScrubError("mp4 duplicate moov box")
             moov_seen = True
             moov_body = data[atom.body_start:atom.body_end]
-            duration_ms = _mvhd_duration(moov_body)
             dims = _tkhd_dims_from_moov(moov_body)
             rebuilt_body, tr, mv, st, video = _rebuild_moov(
                 data, atom.body_start, atom.body_end,
@@ -1029,6 +1028,8 @@ def _rebuild_mvhd(data: bytes, atom: _Mp4Atom) -> bytes:
         flags = _validate_fullbox_flags(b"mvhd", body[1:4])
         timescale = struct.unpack(">I", body[12:16])[0]
         duration = struct.unpack(">I", body[16:20])[0]
+        if timescale == 0:
+            raise MediaScrubError("mp4 mvhd timescale must be positive")
         rate = struct.unpack(">I", body[20:24])[0]
         volume = struct.unpack(">H", body[24:26])[0]
         matrix = _canonical_matrix(b"mvhd", body[36:72])
@@ -1052,6 +1053,8 @@ def _rebuild_mvhd(data: bytes, atom: _Mp4Atom) -> bytes:
         flags = _validate_fullbox_flags(b"mvhd", body[1:4])
         timescale = struct.unpack(">I", body[20:24])[0]
         duration = struct.unpack(">Q", body[24:32])[0]
+        if timescale == 0:
+            raise MediaScrubError("mp4 mvhd timescale must be positive")
         rate = struct.unpack(">I", body[32:36])[0]
         volume = struct.unpack(">H", body[36:38])[0]
         matrix = _canonical_matrix(b"mvhd", body[48:84])
@@ -1299,6 +1302,8 @@ def _rebuild_mdhd(data: bytes, atom: _Mp4Atom) -> bytes:
         modification = struct.unpack(">I", body[8:12])[0]
         timescale = struct.unpack(">I", body[12:16])[0]
         duration = struct.unpack(">I", body[16:20])[0]
+        if timescale == 0:
+            raise MediaScrubError("mp4 mdhd timescale must be positive")
         language = struct.unpack(">H", body[20:22])[0]
         rebuilt = (
             bytes([0]) + flags
@@ -1317,6 +1322,8 @@ def _rebuild_mdhd(data: bytes, atom: _Mp4Atom) -> bytes:
         modification = struct.unpack(">Q", body[12:20])[0]
         timescale = struct.unpack(">I", body[20:24])[0]
         duration = struct.unpack(">Q", body[24:32])[0]
+        if timescale == 0:
+            raise MediaScrubError("mp4 mdhd timescale must be positive")
         language = struct.unpack(">H", body[32:34])[0]
         rebuilt = (
             bytes([1]) + flags
@@ -2479,43 +2486,180 @@ def _rebuild_inner_avcC(
 # duration + dims extraction (from parsed moov payload)
 # ---------------------------------------------------------------------------
 
-def _mvhd_duration(moov_payload: bytes) -> int | None:
-    view = memoryview(moov_payload)
-    offset = 0
-    end = len(moov_payload)
-    while offset < end:
-        try:
-            _size, atom_type, header_len, atom_end = _read_header(view, offset, end)
-        except MediaScrubError:
-            return None
-        if atom_type != b"mvhd":
-            offset = atom_end
-            continue
-        payload_start = offset + header_len
-        if payload_start + 1 > atom_end:
-            return None
-        version = moov_payload[payload_start]
-        if version == 0:
-            body_start = payload_start + 4 + 8
-            if body_start + 8 > atom_end:
-                return None
-            timescale, duration = struct.unpack(
-                ">II", moov_payload[body_start:body_start + 8],
-            )
-        elif version == 1:
-            body_start = payload_start + 4 + 16
-            if body_start + 12 > atom_end:
-                return None
-            timescale = struct.unpack(">I", moov_payload[body_start:body_start + 4])[0]
-            duration = struct.unpack(
-                ">Q", moov_payload[body_start + 4:body_start + 12],
-            )[0]
+def _timing_atom_body(
+    data: bytes, atom: _Mp4Atom, label: bytes,
+    versions: tuple[int, ...] = (0,),
+) -> bytes:
+    body = data[atom.body_start:atom.body_end]
+    if len(body) < 4 or body[0] not in versions:
+        raise MediaScrubError(f"mp4 {label.decode()} version is unsupported")
+    if body[1:4] != _CANONICAL_FULLBOX_FLAGS:
+        raise MediaScrubError(f"mp4 {label.decode()} fullbox flags are non-canonical")
+    return body
+
+
+def _parse_mvhd_timing(data: bytes, atom: _Mp4Atom) -> tuple[int, int]:
+    body = data[atom.body_start:atom.body_end]
+    if len(body) == 100 and body[0] == 0:
+        _timing_atom_body(data, atom, b"mvhd")
+        timescale, duration = struct.unpack(">II", body[12:20])
+    elif len(body) == 112 and body[0] == 1:
+        _timing_atom_body(data, atom, b"mvhd", versions=(1,))
+        timescale = struct.unpack(">I", body[20:24])[0]
+        duration = struct.unpack(">Q", body[24:32])[0]
+    else:
+        raise MediaScrubError("mp4 mvhd body length or version is invalid")
+    if timescale == 0:
+        raise MediaScrubError("mp4 mvhd timescale must be positive")
+    if duration == 0:
+        raise MediaScrubError("mp4 mvhd duration must be positive")
+    return timescale, duration
+
+
+def _parse_mdhd_timing(data: bytes, atom: _Mp4Atom) -> tuple[int, int]:
+    body = data[atom.body_start:atom.body_end]
+    if len(body) == 24 and body[0] == 0:
+        _timing_atom_body(data, atom, b"mdhd")
+        timescale, duration = struct.unpack(">II", body[12:20])
+    elif len(body) == 36 and body[0] == 1:
+        _timing_atom_body(data, atom, b"mdhd", versions=(1,))
+        timescale = struct.unpack(">I", body[20:24])[0]
+        duration = struct.unpack(">Q", body[24:32])[0]
+    else:
+        raise MediaScrubError("mp4 mdhd body length or version is invalid")
+    if timescale == 0:
+        raise MediaScrubError("mp4 mdhd timescale must be positive")
+    if duration == 0:
+        raise MediaScrubError("mp4 mdhd duration must be positive")
+    return timescale, duration
+
+
+def _parse_tkhd_duration(data: bytes, atom: _Mp4Atom) -> int:
+    body = data[atom.body_start:atom.body_end]
+    if len(body) == 84 and body[0] == 0:
+        _validate_fullbox_flags(b"tkhd", body[1:4])
+        duration = struct.unpack(">I", body[20:24])[0]
+    elif len(body) == 96 and body[0] == 1:
+        _validate_fullbox_flags(b"tkhd", body[1:4])
+        duration = struct.unpack(">Q", body[28:36])[0]
+    else:
+        raise MediaScrubError("mp4 tkhd body length or version is invalid")
+    if duration == 0:
+        raise MediaScrubError("mp4 tkhd duration must be positive")
+    return duration
+
+
+def _parse_stts_timing(data: bytes, stbl_atoms: list[_Mp4Atom]) -> tuple[int, int, int]:
+    stts_atoms = [atom for atom in stbl_atoms if atom.type == b"stts"]
+    if len(stts_atoms) != 1:
+        raise MediaScrubError("mp4 stbl requires exactly one stts table")
+    body = data[stts_atoms[0].body_start:stts_atoms[0].body_end]
+    _timing_atom_body(data, stts_atoms[0], b"stts")
+    if len(body) < 8:
+        raise MediaScrubError("mp4 stts body too short")
+    entry_count = struct.unpack(">I", body[4:8])[0]
+    if entry_count > _MP4_MAX_TABLE_ENTRIES or len(body) != 8 + entry_count * 8:
+        raise MediaScrubError("mp4 stts body length is invalid")
+    sample_count = 0
+    duration = 0
+    max_delta = 0
+    for offset in range(8, len(body), 8):
+        run_count, delta = struct.unpack(">II", body[offset:offset + 8])
+        if run_count == 0 or delta == 0:
+            raise MediaScrubError("mp4 stts contains a zero-valued run")
+        sample_count += run_count
+        duration += run_count * delta
+        max_delta = max(max_delta, delta)
+    if sample_count == 0 or duration == 0:
+        raise MediaScrubError("mp4 stts has no positive media duration")
+    return sample_count, duration, max_delta
+
+
+def _parse_edit_duration(
+    data: bytes, edts_atoms: list[_Mp4Atom], mdhd_duration: int,
+) -> int | None:
+    if not edts_atoms:
+        return None
+    if len(edts_atoms) != 1:
+        raise MediaScrubError("mp4 trak carries duplicate edts boxes")
+    children = _parse_container(data, edts_atoms[0].body_start, edts_atoms[0].body_end)
+    if len(children) != 1 or children[0].type != b"elst":
+        raise MediaScrubError("mp4 edts must contain exactly one elst child")
+    atom = children[0]
+    body = data[atom.body_start:atom.body_end]
+    if len(body) < 8 or body[0] not in (0, 1):
+        raise MediaScrubError("mp4 elst timing header is invalid")
+    _validate_fullbox_flags(b"elst", body[1:4])
+    count = struct.unpack(">I", body[4:8])[0]
+    entry_size = 12 if body[0] == 0 else 20
+    if count == 0 or count > _MP4_MAX_TABLE_ENTRIES or len(body) != 8 + count * entry_size:
+        raise MediaScrubError("mp4 elst timing entries are invalid")
+    duration = 0
+    for offset in range(8, len(body), entry_size):
+        if body[0] == 0:
+            segment_duration, media_time, rate = struct.unpack(">IiI", body[offset:offset + 12])
         else:
-            return None
-        if timescale == 0:
-            return None
-        return int(round(duration * 1000 / timescale))
-    return None
+            segment_duration, media_time, rate = struct.unpack(">QqI", body[offset:offset + 20])
+        if segment_duration == 0 or rate != 0x00010000:
+            raise MediaScrubError("mp4 elst contains unsupported timing")
+        if media_time < -1 or (media_time >= mdhd_duration and media_time != -1):
+            raise MediaScrubError("mp4 elst media_time is outside mdhd duration")
+        duration += segment_duration
+    return duration
+
+
+def _validated_movie_duration(data: bytes, moov: _Mp4Atom) -> int:
+    """Validate movie timing and return duration derived from track samples."""
+    children = _parse_container(data, moov.body_start, moov.body_end)
+    mvhd_atoms = [atom for atom in children if atom.type == b"mvhd"]
+    if len(mvhd_atoms) != 1:
+        raise MediaScrubError("mp4 moov requires exactly one mvhd child")
+    movie_timescale, movie_duration = _parse_mvhd_timing(data, mvhd_atoms[0])
+    validated_duration: int | None = None
+    for trak in (atom for atom in children if atom.type == b"trak"):
+        trak_children = _parse_container(data, trak.body_start, trak.body_end)
+        tkhd_atoms = [atom for atom in trak_children if atom.type == b"tkhd"]
+        mdia_atoms = [atom for atom in trak_children if atom.type == b"mdia"]
+        if len(tkhd_atoms) != 1 or len(mdia_atoms) != 1:
+            raise MediaScrubError("mp4 trak timing chain is incomplete")
+        mdia_children = _parse_container(data, mdia_atoms[0].body_start, mdia_atoms[0].body_end)
+        mdhd_atoms = [atom for atom in mdia_children if atom.type == b"mdhd"]
+        hdlr_atoms = [atom for atom in mdia_children if atom.type == b"hdlr"]
+        minf_atoms = [atom for atom in mdia_children if atom.type == b"minf"]
+        if len(mdhd_atoms) != 1 or len(hdlr_atoms) != 1 or len(minf_atoms) != 1:
+            raise MediaScrubError("mp4 mdia timing chain is incomplete")
+        if _handler_type(data, hdlr_atoms[0]) != b"vide":
+            continue
+        mdhd_timescale, mdhd_duration = _parse_mdhd_timing(data, mdhd_atoms[0])
+        minf_children = _parse_container(data, minf_atoms[0].body_start, minf_atoms[0].body_end)
+        stbl_atoms = [atom for atom in minf_children if atom.type == b"stbl"]
+        if len(stbl_atoms) != 1:
+            raise MediaScrubError("mp4 minf timing chain is incomplete")
+        stbl_children = _parse_container(data, stbl_atoms[0].body_start, stbl_atoms[0].body_end)
+        _sample_count, stts_duration, max_delta = _parse_stts_timing(data, stbl_children)
+        if mdhd_duration < stts_duration or mdhd_duration - stts_duration > max_delta:
+            raise MediaScrubError("mp4 mdhd duration does not match stts timing")
+        edit_duration = _parse_edit_duration(
+            data,
+            [atom for atom in trak_children if atom.type == b"edts"],
+            mdhd_duration,
+        )
+        if edit_duration is None:
+            expected_movie_duration = round(stts_duration * movie_timescale / mdhd_timescale)
+        else:
+            expected_movie_duration = edit_duration
+        tkhd_duration = _parse_tkhd_duration(data, tkhd_atoms[0])
+        if tkhd_duration != movie_duration:
+            raise MediaScrubError("mp4 mvhd and tkhd durations differ")
+        if abs(tkhd_duration - expected_movie_duration) > 1:
+            raise MediaScrubError("mp4 track duration does not match stts and edits")
+        expected_ms = round(expected_movie_duration * 1000 / movie_timescale)
+        if validated_duration is not None and abs(validated_duration - expected_ms) > 1:
+            raise MediaScrubError("mp4 video tracks have inconsistent durations")
+        validated_duration = expected_ms
+    if validated_duration is None:
+        raise MediaScrubError("mp4 moov has no vide track timing")
+    return validated_duration
 
 
 def _tkhd_dims_from_moov(moov_payload: bytes) -> tuple[int, int] | None:

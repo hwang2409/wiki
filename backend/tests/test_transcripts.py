@@ -425,19 +425,44 @@ class ArtifactTranscriptTests(unittest.TestCase):
                     "poster_base64": "UNSCRUBBED-POSTER",
                     "transcript": "input transcript",
                 }
-                event = transcripts._artifact_from_structured_result(
-                    {"input": {"kind": kind, "payload": payload}},
-                    json.dumps({"artifact_id": artifact_id, "ok": True}),
-                )
-                self.assertIsNotNone(event)
-                self.assertEqual(
-                    event["artifact"],
-                    {
-                        "kind": kind,
+                result = {"artifact_id": artifact_id, "ok": True}
+                if kind == "video":
+                    result["artifact"] = {
+                        "kind": "video",
                         "ref": f"artifact://{artifact_id}",
                         "mime": mime,
-                    },
+                        "byte_size": 1234,
+                        "width": 160,
+                        "height": 120,
+                        "duration_ms": 533,
+                        "poster_base64": "data:image/png;base64,AA==",
+                    }
+                elif kind == "audio":
+                    result["artifact"] = {
+                        "kind": "audio",
+                        "ref": f"artifact://{artifact_id}",
+                        "mime": mime,
+                        "byte_size": 1234,
+                        "duration_ms": 500,
+                        "peaks": [0, 128, 255],
+                        "transcript": "validated transcript",
+                    }
+                event = transcripts._artifact_from_structured_result(
+                    {"input": {"kind": kind, "payload": payload}},
+                    json.dumps(result),
                 )
+                self.assertIsNotNone(event)
+                if kind in {"video", "audio"}:
+                    self.assertEqual(event["artifact"], result["artifact"])
+                else:
+                    self.assertEqual(
+                        event["artifact"],
+                        {
+                            "kind": kind,
+                            "ref": f"artifact://{artifact_id}",
+                            "mime": mime,
+                        },
+                    )
                 self.assertNotIn("UNSCRUBBED-INPUT-BYTES", json.dumps(event))
                 self.assertNotIn("UNSCRUBBED-POSTER", json.dumps(event))
 
