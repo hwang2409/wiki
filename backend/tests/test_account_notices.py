@@ -51,6 +51,38 @@ def test_rotation_success_resolves_limit_and_rotation_failure(tmp_path: Path) ->
     assert store.snapshot() == []
 
 
+def test_rotation_with_null_source_survives_apply_and_reload(tmp_path: Path) -> None:
+    path = tmp_path / "notices.json"
+    event = {
+        "type": "codex_rotation",
+        "from": None,
+        "to": "account-b",
+        "revived": [],
+        "failed": ["WIKI-NULL-SOURCE"],
+        "failed_reasons": {"WIKI-NULL-SOURCE": "first rotation failed"},
+        "ts": "t-null-source",
+    }
+    first = AccountNoticeStore(path=path)
+    assert first.apply_event(event)
+    assert _by_type(first, "codex_rotation")["from"] is None
+
+    reloaded = AccountNoticeStore(path=path)
+    assert _by_type(reloaded, "codex_rotation")["from"] is None
+
+
+def test_apply_event_rejects_malformed_known_notice(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    assert not store.apply_event(
+        {
+            "type": "codex_limit_no_eligible",
+            "tickets": None,
+            "reset_at": None,
+            "ts": "t-malformed",
+        }
+    )
+    assert store.snapshot() == []
+
+
 def test_exhaustion_tracks_tickets_and_clears_only_proven_revivals(tmp_path: Path) -> None:
     store = _store(tmp_path)
     store.apply_event({"type": "codex_auth_dead_exhausted", "tickets": ["WIKI-1"], "ts": "t1"})

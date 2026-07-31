@@ -59,6 +59,16 @@ _REVIVE_FAILED_KEYS = {
     "codex_rotation": "codex:rotation-revive-failed",
     "codex_auth_dead_revival": "codex:auth-revive-failed",
 }
+_MUTATING_NOTICE_TYPES = frozenset(
+    {
+        "codex_limit_no_eligible",
+        "codex_rotation_failed",
+        "codex_rotation",
+        "codex_auth_dead_revival",
+        "codex_auth_dead_exhausted",
+        "claude_limit_hit",
+    }
+)
 
 
 # Complete per-type schema validation. AccountEventsBanner has an exhaustive
@@ -127,7 +137,11 @@ def _valid_notice(kind: str, payload: dict) -> bool:
         to_value = payload.get("to")
         if not _valid_common_fields(payload, optional_fields=("provider", "failure", "credential_source")):
             return False
-        if not isinstance(payload.get("from"), str) or not payload["from"]:
+        if "from" not in payload:
+            return False
+        if payload["from"] is not None and (
+            not isinstance(payload["from"], str) or not payload["from"]
+        ):
             return False
         if not isinstance(to_value, str) or not to_value:
             return False
@@ -237,6 +251,9 @@ class AccountNoticeStore:
         """Set or resolve notices from one SSE event. True when state changed."""
 
         if not isinstance(event, dict) or not isinstance(event.get("type"), str):
+            return False
+        kind = event["type"]
+        if kind in _MUTATING_NOTICE_TYPES and not _valid_notice(kind, event):
             return False
         with self._lock:
             changed = self._apply_locked(event)

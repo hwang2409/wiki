@@ -3547,7 +3547,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         )
         adapter = self.supervisor.adapters[record.run_id]
         now = time.monotonic()
-        self.supervisor.auth_dead_attempts[record.agent_id] = [
+        self.supervisor.auth_dead_attempts[record.run_id] = [
             now - 400,
             now - 500,
             now - 600,
@@ -3579,6 +3579,37 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         codex_adapter = cast(CodexFixtureAdapter, adapter)
         self.assertIs(self.supervisor.adapters[record.run_id], adapter)
         self.assertFalse(codex_adapter.closed)
+        self.supervisor.unsubscribe(queue)
+
+    async def test_auth_dead_recovery_state_is_fresh_after_replacement(self) -> None:
+        queue = self.supervisor.subscribe()
+        old = await self.supervisor.start_run(
+            agent_id="WIKI-AUTH-REPLACE",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="fixture",
+        )
+        now = time.monotonic()
+        self.supervisor.auth_dead_attempts[old.run_id] = [now - 10, now - 20, now - 30]
+        self.supervisor.auth_dead_alert_at[old.run_id] = now
+
+        replacement = await self.supervisor.replace(old.run_id, "replacement prompt")
+
+        self.assertNotIn(old.run_id, self.supervisor.auth_dead_attempts)
+        self.assertNotIn(old.run_id, self.supervisor.auth_dead_alert_at)
+        self.assertNotIn(replacement.run_id, self.supervisor.auth_dead_attempts)
+        self.assertNotIn(replacement.run_id, self.supervisor.auth_dead_alert_at)
+
+        await self.supervisor._recover_codex_auth_dead(  # noqa: SLF001
+            replacement.run_id,
+            self.supervisor.adapters[replacement.run_id],
+            prior_state=LifecycleState.WORKING,
+        )
+        published = await _wait_for_published(queue, "codex_auth_dead_revival")
+        self.assertEqual(published["revived"], ["WIKI-AUTH-REPLACE"])
         self.supervisor.unsubscribe(queue)
 
     async def test_claude_limit_event_alerts_once_per_hour(self) -> None:

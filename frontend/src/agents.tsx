@@ -165,6 +165,7 @@ type PrimaryActionKind = "archive-dead" | "interrupt" | "resume" | "review" | nu
 
 function primaryActionForWorker(worker: AgentWorker, deadRun: boolean): PrimaryActionKind {
   if (deadRun) return "archive-dead";
+  if (!worker.run_id) return null;
   const runtime = worker.runtime_state;
   const controlAttached = Boolean(worker.control_attached);
   if (controlAttached && (runtime === "starting" || runtime === "working" || runtime === "waiting-approval")) {
@@ -399,12 +400,13 @@ export function SpawnWorkerModal({
       <div className="settings-backdrop" onClick={requestClose} />
       <form
         aria-modal
+        aria-labelledby="spawn-worker-dialog-title"
         className="dialog agent-spawn-modal"
         role="dialog"
         onSubmit={submit}
       >
         <div className="settings-header">
-          <div className="dialog-title">Spawn worker</div>
+          <div className="dialog-title" id="spawn-worker-dialog-title">Spawn worker</div>
           <button
             aria-label="Close spawn dialog"
             className="session-close"
@@ -708,15 +710,17 @@ export function SpawnWorkerModal({
 
 export function SpawnOrchestratorModal({
   models,
+  workspaceRoot,
   onClose,
   onSpawn,
 }: {
   models: AgentModelOption[];
+  workspaceRoot?: string | null;
   onClose: () => void;
   onSpawn: (notice: OrchestratorSpawnNotice) => void;
 }) {
   const [id, setId] = useState("");
-  const [projectDir, setProjectDir] = useState(DEFAULT_WORKDIR);
+  const [projectDir, setProjectDir] = useState(workspaceRoot?.trim() ?? "");
   const [kind, setKind] = useState<SpawnWorkerKind>("cc");
   const [model, setModel] = useState("");
   const [effort, setEffort] = useState<SpawnWorkerEffort>("high");
@@ -725,6 +729,11 @@ export function SpawnOrchestratorModal({
   const [confirming, setConfirming] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const workspaceRootProvided = Boolean(workspaceRoot?.trim());
+
+  useEffect(() => {
+    setProjectDir(workspaceRoot?.trim() ?? "");
+  }, [workspaceRoot]);
 
   function requestClose() {
     if (submitting) return;
@@ -758,6 +767,25 @@ export function SpawnOrchestratorModal({
   const idValid = ORCH_ID_PATTERN.test(normalizedId);
   const projectDirValid = projectDir.trim().length > 0;
   const canSubmit = idValid && projectDirValid && model.length > 0 && !goalTooLarge && !submitting;
+
+  const projectDirField = (
+    <label className="agent-spawn-field">
+      <span className="agent-spawn-label">Project directory</span>
+      <input
+        required
+        className="dialog-input"
+        placeholder="/tmp/project"
+        value={projectDir}
+        onChange={(event) => {
+          resetConfirmation();
+          setProjectDir(event.target.value);
+        }}
+      />
+      {!workspaceRootProvided ? (
+        <span className="agent-spawn-hint">Choose the active workspace root before launching.</span>
+      ) : null}
+    </label>
+  );
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -798,12 +826,13 @@ export function SpawnOrchestratorModal({
       <div className="settings-backdrop" onClick={requestClose} />
       <form
         aria-modal
+        aria-labelledby="spawn-orchestrator-dialog-title"
         className="dialog agent-spawn-modal"
         role="dialog"
         onSubmit={submit}
       >
         <div className="settings-header">
-          <div className="dialog-title">Spawn orchestrator</div>
+          <div className="dialog-title" id="spawn-orchestrator-dialog-title">Spawn orchestrator</div>
           <button
             aria-label="Close orchestrator dialog"
             className="session-close"
@@ -855,6 +884,8 @@ export function SpawnOrchestratorModal({
             </span>
           </label>
 
+          {!workspaceRootProvided ? projectDirField : null}
+
           <div className="agent-spawn-advanced">
             <button
               aria-controls="spawn-orch-advanced-body"
@@ -875,19 +906,7 @@ export function SpawnOrchestratorModal({
             </button>
             <DisclosureContent open={advancedOpen}>
               <div className="agent-spawn-advanced-body" id="spawn-orch-advanced-body">
-                <label className="agent-spawn-field">
-                  <span className="agent-spawn-label">Project directory</span>
-                  <input
-                    required
-                    className="dialog-input"
-                    placeholder="/tmp/project"
-                    value={projectDir}
-                    onChange={(event) => {
-                      resetConfirmation();
-                      setProjectDir(event.target.value);
-                    }}
-                  />
-                </label>
+                {workspaceRootProvided ? projectDirField : null}
 
                 <label className="agent-spawn-field">
                   <span className="agent-spawn-label">Provider</span>
@@ -1158,6 +1177,7 @@ function AccountEventsBanner({ events }: { events: AccountEvent[] }) {
 
 export function AgentsView({
   data,
+  workspaceRoot,
   onOpenAgent,
   refreshTick,
   openTicket,
@@ -1170,6 +1190,7 @@ export function AgentsView({
     error: string | null;
     account_notices?: AccountEvent[];
   };
+  workspaceRoot?: string | null;
   onOpenAgent: (ticket: string, panel?: "review") => void;
   refreshTick: number;
   openTicket: string | null;
@@ -1605,19 +1626,23 @@ export function AgentsView({
     // overflow menu for Replace/lifecycle secondary actions. Raw kind /
     // model / cwd all live under Technical details.
     const deadRun = isDeadRun(orch);
+    const headlessRun = Boolean(orch.run_id);
     const menuOpen = openMenuTicket === orch.id;
     const detailsOpen = expandedDetails.has(orch.id);
     const runtime = orch.runtime_state;
     const controlAttached = Boolean(orch.control_attached);
     const canInterrupt =
+      headlessRun &&
       controlAttached &&
       (runtime === "starting" || runtime === "working" || runtime === "waiting-approval");
     const canResume =
+      headlessRun &&
       !controlAttached &&
       (runtime === "working" || runtime === "idle" || runtime === "blocked");
-    const canComplete = controlAttached && (runtime === "idle" || runtime === "interrupted");
+    const canComplete =
+      headlessRun && controlAttached && (runtime === "idle" || runtime === "interrupted");
     const terminal = runtime === "dead" || runtime === "completed";
-    const replaceDisabled = !orch.run_id && (!orch.window || !orch.window_alive);
+    const replaceDisabled = !headlessRun;
     const replaceTarget: ReplaceAgentTarget = {
       id: orch.id,
       kind: orch.kind === "cdx" ? "cdx" : "cc",
@@ -1668,14 +1693,25 @@ export function AgentsView({
       menuItems.push({
         key: "stop",
         label: confirming ? "Confirm stop" : "Stop",
-        run: () => void requestControl(orch.id, "stop", true),
+        disabled: !headlessRun,
+        title: !headlessRun
+          ? "Legacy tmux runs must be migrated before Stop is available"
+          : undefined,
+        run: () => {
+          if (!headlessRun) return;
+          void requestControl(orch.id, "stop", true);
+        },
       });
     }
     menuItems.push({
       key: "replace",
       label: "Replace",
       disabled: replaceDisabled,
-      title: replaceDisabled ? "Registered runtime is not live" : "Stop this run and spawn a replacement",
+      title: replaceDisabled
+        ? headlessRun
+          ? "Registered runtime is not live"
+          : "Legacy tmux runs must be migrated before Replace is available"
+        : "Stop this run and spawn a replacement",
       run: () => {
         if (replaceDisabled) return;
         setReplaceNotice(null);
@@ -1761,22 +1797,34 @@ export function AgentsView({
                 </button>
                 {menuOpen ? (
                   <div className="agent-card-menu-popover" role="menu">
-                    {menuItems.map((item) => (
-                      <button
-                        className="agent-card-menu-item"
-                        disabled={item.disabled}
-                        key={item.key}
-                        role="menuitem"
-                        title={item.title}
-                        type="button"
-                        onClick={() => {
-                          setOpenMenuTicket(null);
-                          item.run();
-                        }}
-                      >
-                        {item.label}
-                      </button>
-                    ))}
+                    {menuItems.map((item) => {
+                      const reasonId = item.disabled ? `agent-menu-${orch.id}-${item.key}-reason` : undefined;
+                      return (
+                        <span key={item.key}>
+                          {item.disabled && item.title ? (
+                            <span className="sr-only" id={reasonId}>
+                              {item.title}
+                            </span>
+                          ) : null}
+                          <button
+                            aria-describedby={reasonId}
+                            aria-disabled={item.disabled ? "true" : undefined}
+                            className="agent-card-menu-item"
+                            key={item.key}
+                            role="menuitem"
+                            title={item.title}
+                            type="button"
+                            onClick={() => {
+                              if (item.disabled) return;
+                              setOpenMenuTicket(null);
+                              item.run();
+                            }}
+                          >
+                            {item.label}
+                          </button>
+                        </span>
+                      );
+                    })}
                   </div>
                 ) : null}
               </span>
@@ -1829,7 +1877,8 @@ export function AgentsView({
       effort: worker.effort,
       role: worker.role,
     };
-    const replaceDisabled = !worker.run_id && (!worker.window || !worker.window_alive);
+    const headlessRun = Boolean(worker.run_id);
+    const replaceDisabled = !headlessRun;
     // Same runtime_state vs state split as primaryActionForWorker: transport
     // controls key off runtime_state; every other menu entry (Complete /
     // Stop / Replace / Review) keys off whichever field is semantically
@@ -1838,14 +1887,17 @@ export function AgentsView({
     const controlAttached = Boolean(worker.control_attached);
     const primary = primaryActionForWorker(worker, deadRun);
     const canInterrupt =
+      headlessRun &&
       controlAttached &&
       (runtime === "starting" ||
         runtime === "working" ||
         runtime === "waiting-approval");
     const canResume =
+      headlessRun &&
       !controlAttached &&
       (runtime === "working" || runtime === "idle" || runtime === "blocked");
-    const canComplete = controlAttached && (runtime === "idle" || runtime === "interrupted");
+    const canComplete =
+      headlessRun && controlAttached && (runtime === "idle" || runtime === "interrupted");
     const terminal = runtime === "dead" || runtime === "completed";
     // Menu items = every applicable lifecycle action MINUS whichever action is
     // already surfaced as the card's primary button. Destructive actions
@@ -1886,14 +1938,25 @@ export function AgentsView({
       menuItems.push({
         key: "stop",
         label: confirming ? "Confirm stop" : "Stop",
-        run: () => void requestControl(worker.ticket, "stop", true),
+        disabled: !headlessRun,
+        title: !headlessRun
+          ? "Legacy tmux runs must be migrated before Stop is available"
+          : undefined,
+        run: () => {
+          if (!headlessRun) return;
+          void requestControl(worker.ticket, "stop", true);
+        },
       });
     }
     menuItems.push({
       key: "replace",
       label: "Replace",
       disabled: replaceDisabled,
-      title: replaceDisabled ? "Registered runtime is not live" : "Stop this run and spawn a replacement",
+      title: replaceDisabled
+        ? headlessRun
+          ? "Registered runtime is not live"
+          : "Legacy tmux runs must be migrated before Replace is available"
+        : "Stop this run and spawn a replacement",
       run: () => {
         if (replaceDisabled) return;
         setReplaceNotice(null);
@@ -2056,22 +2119,34 @@ export function AgentsView({
                 </button>
                 {menuOpen ? (
                   <div className="agent-card-menu-popover" role="menu">
-                    {menuItems.map((item) => (
-                      <button
-                        className="agent-card-menu-item"
-                        disabled={item.disabled}
-                        key={item.key}
-                        role="menuitem"
-                        title={item.title}
-                        type="button"
-                        onClick={() => {
-                          setOpenMenuTicket(null);
-                          item.run();
-                        }}
-                      >
-                        {item.label}
-                      </button>
-                    ))}
+                    {menuItems.map((item) => {
+                      const reasonId = item.disabled ? `agent-menu-${worker.ticket}-${item.key}-reason` : undefined;
+                      return (
+                        <span key={item.key}>
+                          {item.disabled && item.title ? (
+                            <span className="sr-only" id={reasonId}>
+                              {item.title}
+                            </span>
+                          ) : null}
+                          <button
+                            aria-describedby={reasonId}
+                            aria-disabled={item.disabled ? "true" : undefined}
+                            className="agent-card-menu-item"
+                            key={item.key}
+                            role="menuitem"
+                            title={item.title}
+                            type="button"
+                            onClick={() => {
+                              if (item.disabled) return;
+                              setOpenMenuTicket(null);
+                              item.run();
+                            }}
+                          >
+                            {item.label}
+                          </button>
+                        </span>
+                      );
+                    })}
                   </div>
                 ) : null}
               </span>
@@ -2290,6 +2365,7 @@ export function AgentsView({
       {spawnOrchestratorOpen ? (
         <SpawnOrchestratorModal
           models={availableModels}
+          workspaceRoot={workspaceRoot}
           onClose={() => setSpawnOrchestratorOpen(false)}
           onSpawn={(notice) => {
             setSpawnNotice(notice);

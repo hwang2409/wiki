@@ -3494,6 +3494,7 @@ export default function App() {
       return (
         <AgentsView
           data={agentsState}
+          workspaceRoot={activeWorkspaceInfo?.root ?? ""}
           onOpenAgent={openAgent}
           onOpenTicket={setAgentsOpenTicket}
           openTicket={agentsOpenTicket}
@@ -4096,6 +4097,7 @@ export default function App() {
               ) : mode === "agents" ? (
                 <AgentsView
                   data={agentsState}
+                  workspaceRoot={activeWorkspaceInfo?.root ?? ""}
                   onOpenAgent={openAgent}
                   refreshTick={refreshTick}
                   openTicket={agentsOpenTicket}

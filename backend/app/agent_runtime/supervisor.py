@@ -1201,7 +1201,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         except RunNotFound:
             return
         now_mono = time.monotonic()
-        history = self.auth_dead_attempts.setdefault(initial.agent_id, [])
+        history = self.auth_dead_attempts.setdefault(initial.run_id, [])
         history[:] = [
             ts
             for ts in history
@@ -1296,11 +1296,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         now_mono: float,
     ) -> None:
         if (
-            now_mono - self.auth_dead_alert_at.get(agent_id, 0.0)
+            now_mono - self.auth_dead_alert_at.get(run_id, 0.0)
             < accounts.AUTH_DEAD_ALERT_INTERVAL_SECONDS
         ):
             return
-        self.auth_dead_alert_at[agent_id] = now_mono
+        self.auth_dead_alert_at[run_id] = now_mono
         await self._publish(
             {
                 "type": "codex_auth_dead_exhausted",
@@ -1544,6 +1544,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         # run under the same ticket can emit its own limit notice inside
         # the hour (round-8 finding 5).
         self.last_limit_alert_at.pop(run_id, None)
+        self.auth_dead_attempts.pop(run_id, None)
+        self.auth_dead_alert_at.pop(run_id, None)
         adapter = self.adapters.pop(run_id, None)
         if adapter is not None:
             try:

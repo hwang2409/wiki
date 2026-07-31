@@ -6,7 +6,7 @@ import { useEffect, useState } from "react";
 import { AgentsView, SpawnOrchestratorModal, SpawnWorkerModal } from "../src/agents";
 import { ReplaceAgentModal } from "../src/replace-agent-modal";
 import { isAgentRefreshEvent } from "../src/agent-events";
-import { getAgents } from "../src/api";
+import { getAgents, spawnAgentOrchestrator } from "../src/api";
 import type { AgentModelOption, AgentWorker, ArchivedWorker, Orchestrator } from "../src/api";
 import { presetWorkerModel } from "../src/role-pipeline";
 
@@ -16,6 +16,7 @@ vi.mock("../src/api", async () => {
     ...actual,
     getAgentModels: vi.fn().mockResolvedValue({ models: [] }),
     getAgents: vi.fn().mockResolvedValue({ workers: [], orchestrators: [], archived: [] }),
+    spawnAgentOrchestrator: vi.fn(),
   };
 });
 
@@ -213,6 +214,25 @@ test("codex_rotation failures keep failed_reasons behind the details disclosure"
   });
 });
 
+test("codex rotation with a null source renders and survives the frontend contract", () => {
+  const view = renderView({
+    data: {
+      ...data,
+      account_notices: [
+        {
+          type: "codex_rotation",
+          from: null,
+          to: "account-b",
+          revived: [],
+          failed: [],
+          ts: "2026-07-31T00:00:00Z",
+        },
+      ],
+    },
+  });
+  expect(view.getByText(/Codex account switched \(unset\) → account-b/)).toBeTruthy();
+});
+
 test("codex_auth_dead_revival failures keep failed_reasons behind the details disclosure", async () => {
   const view = renderView({
     data: {
@@ -357,6 +377,7 @@ test("spawn dialog leads with ticket and prompt; role/model/effort live under Ad
       onSpawn={() => undefined}
     />
   );
+  expect(view.getByRole("dialog", { name: "Spawn worker" })).toBeTruthy();
   // Default view: ticket + title + prompt. Role/provider/model/effort are hidden.
   expect(view.queryByLabelText("Role")).toBeNull();
   expect(view.queryByLabelText("Provider")).toBeNull();
@@ -464,9 +485,19 @@ test("Replace stays disabled with a reason when a worker has no live runtime", a
   fireEvent.click(view.getByRole("button", { name: /More actions for WIKI-1/ }));
   await waitFor(() => {
     const replace = view.getByRole("menuitem", { name: /^Replace$/ }) as HTMLButtonElement;
-    expect(replace.disabled).toBe(true);
-    expect(replace.title).toBe("Registered runtime is not live");
+    const stop = view.getByRole("menuitem", { name: /^Stop$/ }) as HTMLButtonElement;
+    expect(replace.disabled).toBe(false);
+    expect(replace.getAttribute("aria-disabled")).toBe("true");
+    expect(replace.tabIndex).toBe(0);
+    expect(replace.getAttribute("aria-describedby")).toBeTruthy();
+    expect(replace.title).toBe("Legacy tmux runs must be migrated before Replace is available");
+    expect(stop.getAttribute("aria-disabled")).toBe("true");
+    expect(stop.title).toBe("Legacy tmux runs must be migrated before Stop is available");
+    expect(view.getByText("Legacy tmux runs must be migrated before Replace is available")).toBeTruthy();
   });
+  fireEvent.click(view.getByRole("menuitem", { name: /^Stop$/ }));
+  fireEvent.click(view.getByRole("menuitem", { name: /^Replace$/ }));
+  expect(vi.mocked(globalThis.fetch)).not.toHaveBeenCalled();
 });
 
 test("primary action tracks runtime_state, not the manual worker state", () => {
@@ -520,6 +551,7 @@ test("orchestrator row default hides kind/model/cwd; details disclosure reveals 
       error: null,
     },
   });
+  expect(view.queryByRole("dialog", { name: "Spawn orchestrator" })).toBeNull();
   // Default surface must not surface raw kind/model/cwd on the orch row.
   const orchHead = view.container.querySelector(".agents-orch-head")!;
   expect(orchHead).toBeTruthy();
@@ -555,9 +587,16 @@ test("orchestrator Replace stays disabled with a reason without a live runtime",
   fireEvent.click(view.getByRole("button", { name: /More actions for wiki-legacy/ }));
   await waitFor(() => {
     const replace = view.getByRole("menuitem", { name: /^Replace$/ }) as HTMLButtonElement;
-    expect(replace.disabled).toBe(true);
-    expect(replace.title).toBe("Registered runtime is not live");
+    const stop = view.getByRole("menuitem", { name: /^Stop$/ }) as HTMLButtonElement;
+    expect(replace.disabled).toBe(false);
+    expect(replace.getAttribute("aria-disabled")).toBe("true");
+    expect(replace.title).toBe("Legacy tmux runs must be migrated before Replace is available");
+    expect(stop.getAttribute("aria-disabled")).toBe("true");
+    expect(stop.title).toBe("Legacy tmux runs must be migrated before Stop is available");
   });
+  fireEvent.click(view.getByRole("menuitem", { name: /^Stop$/ }));
+  fireEvent.click(view.getByRole("menuitem", { name: /^Replace$/ }));
+  expect(vi.mocked(globalThis.fetch)).not.toHaveBeenCalled();
 });
 
 // Per-archive selection for a ticket with multiple archives is descoped
@@ -595,6 +634,7 @@ test("spawn orchestrator dialog leads with name and goal; provider/model live un
   const view = render(
     <SpawnOrchestratorModal
       models={models}
+      workspaceRoot="/workspace/active"
       onClose={() => undefined}
       onSpawn={() => undefined}
     />,
@@ -623,6 +663,13 @@ test("spawn orchestrator dialog leads with name and goal; provider/model live un
 
 test("spawn orchestrator default flow reaches confirmation without opening Advanced", async () => {
   const onSpawn = vi.fn();
+  vi.mocked(spawnAgentOrchestrator).mockResolvedValue({
+    window: null,
+    run_id: "run-orch-test",
+    log: null,
+    prompt_path: null,
+    note: "spawned",
+  });
   const view = render(
     <SpawnOrchestratorModal
       models={[
@@ -637,6 +684,7 @@ test("spawn orchestrator default flow reaches confirmation without opening Advan
           default_orchestrator: true,
         },
       ]}
+      workspaceRoot="/workspace/active"
       onClose={() => undefined}
       onSpawn={onSpawn}
     />,
@@ -645,15 +693,20 @@ test("spawn orchestrator default flow reaches confirmation without opening Advan
   fireEvent.change(view.getByPlaceholderText(/Optional\. Leave empty/), {
     target: { value: "start the fleet" },
   });
-  expect(view.queryByText("Project directory is required.")).toBeNull();
   fireEvent.click(view.getByRole("button", { name: /^Launch$/ }));
   await waitFor(() => {
     expect(view.getByRole("button", { name: /Confirm launch/ })).toBeTruthy();
   });
-  expect(onSpawn).not.toHaveBeenCalled();
+  fireEvent.click(view.getByRole("button", { name: /Confirm launch/ }));
+  await waitFor(() => {
+    expect(spawnAgentOrchestrator).toHaveBeenCalledWith(
+      expect.objectContaining({ workdir: "/workspace/active" }),
+    );
+    expect(onSpawn).toHaveBeenCalled();
+  });
 });
 
-test("spawn orchestrator dialog hides goal byte count until it nears 20KB", () => {
+test("spawn orchestrator keeps project directory visible when no workspace root is available", () => {
   const view = render(
     <SpawnOrchestratorModal
       models={models}
@@ -661,6 +714,20 @@ test("spawn orchestrator dialog hides goal byte count until it nears 20KB", () =
       onSpawn={() => undefined}
     />,
   );
+  expect(view.getByPlaceholderText("/tmp/project")).toBeTruthy();
+  expect(view.getByText("Project directory is required.")).toBeTruthy();
+});
+
+test("spawn orchestrator dialog hides goal byte count until it nears 20KB", () => {
+  const view = render(
+    <SpawnOrchestratorModal
+      models={models}
+      workspaceRoot="/workspace/active"
+      onClose={() => undefined}
+      onSpawn={() => undefined}
+    />,
+  );
+  expect(view.getByRole("dialog", { name: "Spawn orchestrator" })).toBeTruthy();
   const goalField = view.container.querySelector(
     "textarea.agent-spawn-textarea",
   ) as HTMLTextAreaElement;

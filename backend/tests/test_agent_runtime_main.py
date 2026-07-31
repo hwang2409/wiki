@@ -753,6 +753,22 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(exhausted), 1)
         self.assertEqual(exhausted[0]["tickets"], ["WIKI-42"])
 
+    async def test_publish_agent_event_rejects_malformed_known_notice(self) -> None:
+        notices = self._isolate_account_notices()
+
+        await main.publish_agent_event(
+            {
+                "type": "codex_limit_no_eligible",
+                "tickets": None,
+                "reset_at": None,
+                "ts": "t-malformed",
+            }
+        )
+
+        self.assertEqual(notices.snapshot(), [])
+        surfaced = cast(list[dict[str, Any]], main.agents()["account_notices"])
+        self.assertEqual(surfaced, [])
+
     async def test_agents_reconciles_replaced_ticket_notices_by_run_id(self) -> None:
         # A worker was replaced under the same ticket. The notice recorded
         # the old run_id; the live registry now shows a new run_id. The
