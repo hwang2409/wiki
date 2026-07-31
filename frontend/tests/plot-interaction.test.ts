@@ -4,6 +4,7 @@ import {
   BRUSH_PARAM,
   ZOOM_PARAM,
   buildInteractiveSpec,
+  makeBrushBuffer,
   plotInteractivity,
   plotPngFilename,
   selectionDomains,
@@ -174,6 +175,124 @@ test("selectionDomains: rejects zero-width extents and non-finite values", () =>
 test("selectionDomains: returns null when nothing matches known fields", () => {
   assert.equal(selectionDomains({ other: [1, 2] }, { x: "price" }), null);
   assert.equal(selectionDomains(null, { x: "price" }), null);
+});
+
+test("plotInteractivity: aggregate encodings downgrade the channel", () => {
+  const spec = {
+    mark: "bar",
+    encoding: {
+      x: { field: "category", type: "nominal" },
+      y: { field: "revenue", type: "quantitative", aggregate: "sum" },
+    },
+  };
+  // Both channels reject full-mode projection (nominal x, aggregate y) → tooltip.
+  assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
+});
+
+test("plotInteractivity: aggregate on one channel leaves the other zoomable", () => {
+  const spec = {
+    mark: "point",
+    encoding: {
+      x: { field: "price", type: "quantitative" },
+      y: { field: "revenue", type: "quantitative", aggregate: "mean" },
+    },
+  };
+  const result = plotInteractivity(spec);
+  assert.equal(result.mode, "full");
+  if (result.mode === "full") {
+    assert.deepEqual(result.channels, ["x"]);
+    assert.deepEqual(result.fields, { x: "price" });
+  }
+});
+
+test("plotInteractivity: timeUnit encodings degrade to tooltip", () => {
+  // A timeUnit encoding compiles the selection signal against the derived
+  // field name (yearmonth_ts) — mapping back to source `ts` would silently
+  // miss the extent, so drop it out of full mode entirely.
+  const spec = {
+    mark: "line",
+    encoding: {
+      x: { field: "ts", type: "temporal", timeUnit: "yearmonth" },
+      y: { field: "count", type: "quantitative", aggregate: "count" },
+    },
+  };
+  assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
+});
+
+test("plotInteractivity: existing wiki_zoom param collision downgrades to tooltip", () => {
+  const spec = {
+    mark: "point",
+    encoding: {
+      x: { field: "x", type: "quantitative" },
+      y: { field: "y", type: "quantitative" },
+    },
+    params: [{ name: ZOOM_PARAM, select: { type: "interval" } }],
+  };
+  // Would have been full — but injecting our params would throw Vega's
+  // duplicate-signal check, so we render tooltip-only instead.
+  assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
+});
+
+test("plotInteractivity: existing wiki_brush param collision downgrades to tooltip", () => {
+  const spec = {
+    mark: "point",
+    encoding: {
+      x: { field: "x", type: "quantitative" },
+    },
+    params: [{ name: BRUSH_PARAM, select: { type: "interval" } }],
+  };
+  assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
+});
+
+test("plotInteractivity: unrelated params leave full mode intact", () => {
+  const spec = {
+    mark: "point",
+    encoding: {
+      x: { field: "x", type: "quantitative" },
+    },
+    params: [{ name: "userToggle", value: true }],
+  };
+  const result = plotInteractivity(spec);
+  assert.equal(result.mode, "full");
+});
+
+test("makeBrushBuffer: commits only on pointerup, always the latest value", () => {
+  const commits: unknown[] = [];
+  const buffer = makeBrushBuffer({ x: "x" }, (d) => commits.push(d));
+  buffer.onSignal({ x: [0, 1] });
+  buffer.onSignal({ x: [0, 5] });
+  buffer.onSignal({ x: [0, 12] });
+  assert.deepEqual(commits, []);
+  buffer.onPointerUp();
+  assert.deepEqual(commits, [{ x: [0, 12] }]);
+});
+
+test("makeBrushBuffer: pointerup with no signals is a no-op", () => {
+  const commits: unknown[] = [];
+  const buffer = makeBrushBuffer({ x: "x" }, (d) => commits.push(d));
+  buffer.onPointerUp();
+  buffer.onPointerUp();
+  assert.deepEqual(commits, []);
+});
+
+test("makeBrushBuffer: multiple gestures each commit once", () => {
+  const commits: unknown[] = [];
+  const buffer = makeBrushBuffer({ x: "x" }, (d) => commits.push(d));
+  buffer.onSignal({ x: [0, 1] });
+  buffer.onPointerUp();
+  buffer.onPointerUp(); // second pointerup with no new signal — do nothing
+  buffer.onSignal({ x: [4, 8] });
+  buffer.onPointerUp();
+  assert.deepEqual(commits, [{ x: [0, 1] }, { x: [4, 8] }]);
+});
+
+test("makeBrushBuffer: signals that don't parse to a domain are ignored", () => {
+  const commits: unknown[] = [];
+  const buffer = makeBrushBuffer({ x: "x" }, (d) => commits.push(d));
+  buffer.onSignal({ x: [5, 5] }); // zero-width — rejected
+  buffer.onSignal(null);
+  buffer.onPointerUp();
+  assert.deepEqual(commits, []);
 });
 
 test("plotPngFilename: sanitizes and defaults", () => {

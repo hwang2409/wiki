@@ -394,7 +394,7 @@ export function ArtifactInspector({
       case "image": return <ImageArtifactDetail artifact={artifact} event={active} onChange={onViewChange} state={viewState} ticket={ticket} />;
       case "mermaid": return <MermaidArtifactDetail onChange={onViewChange} source={artifact.source ?? ""} state={viewState} />;
       case "svg": return <SvgArtifactDetail onChange={onViewChange} source={artifact.source ?? ""} state={viewState} />;
-      case "plot": return <PlotArtifactDetail spec={artifact.spec_vega_lite ?? {}} title={active.title ?? artifact.filename ?? null} />;
+      case "plot": return <PlotArtifactDetail key={active.artifact_id ?? undefined} spec={artifact.spec_vega_lite ?? {}} title={active.title ?? artifact.filename ?? null} />;
       case "diff": return <DiffArtifactDetail artifact={artifact} onChange={onViewChange} state={viewState} />;
       case "file-list": return <FileListArtifactDetail artifact={artifact} />;
       case "json": return <JsonArtifactDetail artifact={artifact} />;

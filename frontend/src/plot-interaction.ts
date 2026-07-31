@@ -3,8 +3,10 @@
 // Payloads are arbitrary Vega-Lite specs. Interactivity is injected only into
 // single-view specs (a top-level `mark` + `encoding`); composite or malformed
 // specs render exactly as before (static fallback). Pan/zoom binds only to
-// continuous positional channels (quantitative/temporal, un-binned) — ordinal
-// axes cannot zoom continuously.
+// continuous positional channels that are directly projectable — quantitative
+// or temporal, not binned, not aggregated, not timeUnit-transformed (the
+// compiled signal keys off the derived field name in those cases, so the
+// React-side mapping would silently miss the extent).
 
 export type VegaLiteSpec = Record<string, unknown>;
 export type ZoomChannel = "x" | "y";
@@ -19,6 +21,7 @@ export const ZOOM_PARAM = "wiki_zoom";
 export const BRUSH_PARAM = "wiki_brush";
 
 const COMPOSITE_KEYS = ["layer", "facet", "concat", "hconcat", "vconcat", "repeat", "spec"];
+const RESERVED_PARAM_NAMES = new Set([ZOOM_PARAM, BRUSH_PARAM]);
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -31,7 +34,20 @@ function continuousField(encoding: Record<string, unknown>, channel: ZoomChannel
   if (!def) return null;
   if (def.type !== "quantitative" && def.type !== "temporal") return null;
   if (def.bin) return null;
+  // Aggregate encodings can't be interval-projected in Vega-Lite; timeUnit
+  // encodings key the selection off a compiled name (e.g. yearmonth_ts) that
+  // isn't the source field, so shift-brush would store no domain.
+  if (def.aggregate) return null;
+  if (def.timeUnit) return null;
   return typeof def.field === "string" && def.field.length > 0 ? def.field : null;
+}
+
+function paramNameCollision(spec: Record<string, unknown>): boolean {
+  const params = Array.isArray(spec.params) ? spec.params : [];
+  return params.some((param) => {
+    const record = asRecord(param);
+    return typeof record?.name === "string" && RESERVED_PARAM_NAMES.has(record.name);
+  });
 }
 
 export function plotInteractivity(spec: unknown): PlotInteractivity {
@@ -50,6 +66,10 @@ export function plotInteractivity(spec: unknown): PlotInteractivity {
     }
   }
   if (channels.length === 0) return { mode: "tooltip" };
+  // A spec that already reserves wiki_zoom or wiki_brush would trip Vega's
+  // duplicate-signal check on inject. Degrade to tooltip so the plot still
+  // renders — WIKI-194 must not regress previously-working payloads.
+  if (paramNameCollision(record)) return { mode: "tooltip" };
   return { mode: "full", channels, fields };
 }
 
@@ -146,6 +166,32 @@ export function selectionDomains(
     domains[channel] = low < high ? [low, high] : [high, low];
   }
   return Object.keys(domains).length > 0 ? domains : null;
+}
+
+// Buffers Vega's brush signal (which fires on every pointermove during a
+// shift-drag) and only commits the final extent to React once the gesture
+// ends. Without this, the domains state update would re-run the embed effect
+// mid-drag and abort the gesture before the user releases.
+export function makeBrushBuffer(
+  fields: Partial<Record<ZoomChannel, string>>,
+  commit: (domains: PlotDomains) => void,
+): {
+  onSignal: (value: unknown) => void;
+  onPointerUp: () => void;
+} {
+  let pending: PlotDomains | null = null;
+  return {
+    onSignal(value: unknown) {
+      const next = selectionDomains(value, fields);
+      if (next) pending = next;
+    },
+    onPointerUp() {
+      if (pending === null) return;
+      const domains = pending;
+      pending = null;
+      commit(domains);
+    },
+  };
 }
 
 export function plotPngFilename(title: string | null | undefined): string {

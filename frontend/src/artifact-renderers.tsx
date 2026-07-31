@@ -20,8 +20,8 @@ import {
 import {
   BRUSH_PARAM,
   buildInteractiveSpec,
+  makeBrushBuffer,
   plotInteractivity,
-  selectionDomains,
   type PlotDomains,
 } from "./plot-interaction";
 import { ShikiCode, useCurrentTheme } from "./shiki";
@@ -439,6 +439,7 @@ export function PlotRenderer({
     if (!target) return;
     let finalized = false;
     let finalize: (() => void) | undefined;
+    let brushCleanup: (() => void) | undefined;
     const styles = getComputedStyle(document.documentElement);
     const text = styles.getPropertyValue("--text-normal").trim();
     const muted = styles.getPropertyValue("--text-muted").trim();
@@ -490,12 +491,14 @@ export function PlotRenderer({
         setReady(true);
         viewRef.current?.(result.view as PlotView);
         if (interactive && interactivity.mode === "full") {
+          const buffer = makeBrushBuffer(interactivity.fields, (domains) => {
+            brushRef.current?.(domains);
+          });
           try {
-            result.view.addSignalListener(BRUSH_PARAM, (_name, value) => {
-              const next = selectionDomains(value, interactivity.fields);
-              if (next) brushRef.current?.(next);
-            });
+            result.view.addSignalListener(BRUSH_PARAM, (_name, value) => buffer.onSignal(value));
           } catch { /* Vega drops listeners if the param is stripped by user spec */ }
+          brushCleanup = () => window.removeEventListener("pointerup", buffer.onPointerUp);
+          window.addEventListener("pointerup", buffer.onPointerUp);
         }
       } catch (reason) {
         reportPlotFailure(reason);
@@ -504,6 +507,7 @@ export function PlotRenderer({
     return () => {
       finalized = true;
       viewRef.current?.(null);
+      brushCleanup?.();
       finalize?.();
       target.replaceChildren();
     };

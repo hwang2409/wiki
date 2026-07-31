@@ -15,7 +15,6 @@ export function PlotArtifactDetail({ spec, title }: { spec: Record<string, unkno
   const viewRef = useRef<PlotView | null>(null);
   const interactivity = useMemo(() => plotInteractivity(spec), [spec]);
   const canInteract = interactivity.mode === "full";
-  const hasZoom = domains !== null;
 
   const onView = useCallback((view: PlotView | null) => {
     viewRef.current = view;
@@ -23,6 +22,10 @@ export function PlotArtifactDetail({ spec, title }: { spec: Record<string, unkno
   const onBrush = useCallback((next: PlotDomains) => {
     setDomains(next);
   }, []);
+  // Reset is always enabled in full mode: pan / wheel-zoom mutate Vega's
+  // internal scales without touching React state, so `domains === null` is not
+  // proof that the plot is at its default view. Bumping renderKey forces a
+  // re-embed which resets Vega too.
   const onReset = useCallback(() => {
     setDomains(null);
     setRenderKey((key) => key + 1);
@@ -49,7 +52,7 @@ export function PlotArtifactDetail({ spec, title }: { spec: Record<string, unkno
         <button
           type="button"
           onClick={onReset}
-          disabled={!canInteract || !hasZoom}
+          disabled={!canInteract}
           aria-label="Reset zoom"
         >
           <RotateCcw size={12} /> Reset zoom
@@ -62,7 +65,7 @@ export function PlotArtifactDetail({ spec, title }: { spec: Record<string, unkno
       <div
         className="artifact-plot-detail-canvas"
         data-interactive={canInteract ? "true" : undefined}
-        onDoubleClick={hasZoom ? onReset : undefined}
+        onDoubleClick={canInteract ? onReset : undefined}
       >
         <PlotRenderer
           key={renderKey}
