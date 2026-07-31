@@ -125,6 +125,14 @@ class ScrubMp4RealFixtureTests(unittest.TestCase):
             self.assertIn(b"pasp", original)
             result = media_scrub.scrub_video(original, "video/mp4")
 
+            mutated = bytearray(original)
+            tkhd_pos = mutated.find(b"tkhd")
+            self.assertGreater(tkhd_pos, 0)
+            mutated[tkhd_pos + 80:tkhd_pos + 84] = struct.pack(">I", 1234 << 16)
+            mutated[tkhd_pos + 84:tkhd_pos + 88] = struct.pack(">I", 17 << 16)
+            with self.assertRaisesRegex(media_scrub.MediaScrubError, "display dimensions"):
+                media_scrub.scrub_video(bytes(mutated), "video/mp4")
+
             stored = Path(directory) / "scrubbed.mp4"
             stored.write_bytes(result.data)
             probe = subprocess.run(

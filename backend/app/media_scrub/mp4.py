@@ -147,6 +147,11 @@ _MP4_ROTATION_MATRICES: Final = frozenset({
     (-0x00010000, 0, 0, 0, -0x00010000, 0, 0, 0, 0x40000000),
     (0, -0x00010000, 0, 0x00010000, 0, 0, 0, 0, 0x40000000),
 })
+_MP4_ROTATION_SWAP_MATRICES: Final = frozenset({
+    (0, 0x00010000, 0, -0x00010000, 0, 0, 0, 0, 0x40000000),
+    (0, -0x00010000, 0, 0x00010000, 0, 0, 0, 0, 0x40000000),
+})
+_Mp4TrackDimensions = tuple[int, int, bool]
 
 
 def _canonical_matrix(box_type: bytes, matrix: bytes) -> bytes:
@@ -1155,15 +1160,17 @@ def _rebuild_tkhd(data: bytes, atom: _Mp4Atom) -> bytes:
 
 def _tkhd_dimensions_from_atom(
     data: bytes, atom: _Mp4Atom,
-) -> tuple[int, int] | None:
-    """Read positive 16.16 video dimensions from one validated tkhd."""
+) -> _Mp4TrackDimensions | None:
+    """Read positive 16.16 video dimensions and rotation from one tkhd."""
     body = data[atom.body_start:atom.body_end]
     if not body:
         return None
     version = body[0]
     if version == 0 and len(body) == 84:
+        matrix = body[40:76]
         width_fixed, height_fixed = struct.unpack(">II", body[76:84])
     elif version == 1 and len(body) == 96:
+        matrix = body[52:88]
         width_fixed, height_fixed = struct.unpack(">II", body[88:96])
     else:
         raise MediaScrubError("mp4 tkhd dimensions cannot be read")
@@ -1171,12 +1178,13 @@ def _tkhd_dimensions_from_atom(
     height = height_fixed >> 16
     if width == 0 or height == 0:
         return None
-    return width, height
+    values = struct.unpack(">9i", matrix)
+    return width, height, values in _MP4_ROTATION_SWAP_MATRICES
 
 
 def _rebuild_mdia(
     data: bytes, body_start: int, body_end: int,
-    track_dimensions: tuple[int, int] | None,
+    track_dimensions: _Mp4TrackDimensions | None,
 ) -> tuple[bytes, bool, bool]:
     atoms = _parse_container(data, body_start, body_end)
     mdhd_atoms = [atom for atom in atoms if atom.type == b"mdhd"]
@@ -1350,7 +1358,7 @@ def _rebuild_hdlr(data: bytes, atom: _Mp4Atom) -> bytes:
 
 def _rebuild_minf(
     data: bytes, body_start: int, body_end: int, handler_type: bytes,
-    track_dimensions: tuple[int, int] | None,
+    track_dimensions: _Mp4TrackDimensions | None,
 ) -> tuple[bytes, bool, bool]:
     atoms = _parse_container(data, body_start, body_end)
     required_header = b"vmhd" if handler_type == b"vide" else b"smhd"
@@ -1510,7 +1518,7 @@ def _rebuild_dinf(data: bytes, body_start: int, body_end: int) -> bytes:
 
 def _rebuild_stbl(
     data: bytes, body_start: int, body_end: int,
-    handler_type: bytes, track_dimensions: tuple[int, int] | None,
+    handler_type: bytes, track_dimensions: _Mp4TrackDimensions | None,
 ) -> tuple[bytes, bool, bool]:
     atoms = _parse_container(data, body_start, body_end)
     parts: list[bytes] = []
@@ -1976,7 +1984,7 @@ def _rebuild_stbl_table(box_type: bytes, data: bytes, atom: _Mp4Atom) -> bytes:
 
 def _rebuild_stsd(
     data: bytes, body_start: int, body_end: int, handler_type: bytes,
-    track_dimensions: tuple[int, int] | None,
+    track_dimensions: _Mp4TrackDimensions | None,
 ) -> bytes | None:
     payload = data[body_start:body_end]
     if len(payload) < 8:
@@ -2037,7 +2045,7 @@ def _rebuild_stsd(
 def _rebuild_sample_entry(
     entry_type: bytes,
     entry_bytes: bytes,
-    track_dimensions: tuple[int, int] | None = None,
+    track_dimensions: _Mp4TrackDimensions | None = None,
 ) -> bytes:
     if len(entry_bytes) < 16:
         raise MediaScrubError("mp4 sample entry too short for base header")
@@ -2070,15 +2078,27 @@ def _rebuild_sample_entry(
             raise MediaScrubError(
                 "mp4 avc1 sample entry dimensions do not match SPS dimensions"
             )
-        if (
-            track_dimensions is None
-            or (
-                (pasp_ratio is None or pasp_ratio == (1, 1))
-                and sps_dimensions != track_dimensions
-            )
-        ):
+        if track_dimensions is None:
             raise MediaScrubError(
                 "mp4 avc1 SPS dimensions do not match tkhd track dimensions"
+            )
+        tkhd_width, tkhd_height, rotated = track_dimensions
+        h_spacing, v_spacing = pasp_ratio or (1, 1)
+        expected_width = sps_dimensions[1] if rotated else sps_dimensions[0]
+        expected_height = sps_dimensions[0] if rotated else sps_dimensions[1]
+        if rotated:
+            display_width_valid = tkhd_width == expected_width
+            display_height_valid = (
+                tkhd_height * v_spacing == expected_height * h_spacing
+            )
+        else:
+            display_width_valid = (
+                tkhd_width * v_spacing == expected_width * h_spacing
+            )
+            display_height_valid = tkhd_height == expected_height
+        if not (display_width_valid and display_height_valid):
+            raise MediaScrubError(
+                "mp4 avc1 display dimensions do not match tkhd after pasp/rotation"
             )
 
     inner_payload, inner_types = _walk_sample_entry_inner_boxes(
