@@ -208,6 +208,46 @@ each finding must include severity, path, line, problem, and fix.
         self.assertEqual(second["reviewer"], "WIKI-171-REVIEW2")
         self.assertEqual(spawned, ["WIKI-171-REVIEW1", "WIKI-171-REVIEW2"])
 
+    def test_implicit_diversity_result_stays_current_while_one_lens_runs(self) -> None:
+        registry: dict[str, dict[str, dict[str, str]]] = {}
+        spawned: list[str] = []
+
+        def spawn(request: SpawnWorkerIn) -> dict[str, str]:
+            run_id = f"run-{len(spawned) + 1}"
+            spawned.append(request.ticket)
+            registry[request.ticket] = {
+                "current": {"run_id": run_id, "state": "working"}
+            }
+            return {"run_id": run_id}
+
+        kwargs = dict(
+            ticket="WIKI-171",
+            pr_number=171,
+            expected_sha="d" * 40,
+            orch="wiki",
+            diversity=["correctness", "security"],
+            gate=lambda _pr, _sha: {"verdict": "pass"},
+            resolve_root=lambda _orch: Path("/repo"),
+            worktree=lambda **kwargs: Path(f"/repo/{kwargs['lens']}"),
+            spawn=spawn,
+            archived=lambda: [],
+            registry=lambda: registry,
+            status_reader=lambda _reviewer: None,
+        )
+        first = next_review_module.next_review(**kwargs)
+        correctness = "WIKI-171-REVIEW1-correctness"
+        registry[correctness]["current"]["state"] = "completed"
+        second = next_review_module.next_review(**kwargs)
+
+        self.assertEqual(second, first)
+        self.assertEqual(
+            spawned,
+            [
+                "WIKI-171-REVIEW1-correctness",
+                "WIKI-171-REVIEW1-security",
+            ],
+        )
+
     def test_merge_ready_previous_reviewer_is_archived(self) -> None:
         archived: list[str] = []
         (self.status_dir / "WIKI-171-REVIEW2.json").write_text(

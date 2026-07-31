@@ -1134,6 +1134,7 @@ class RunStore:
             # orphan from a prior run before this record becomes current; the
             # supervisor calls create() while holding the per-agent lock.
             status_path = self.status_path(record.agent_id)
+            _ensure_parent_dir(status_path.parent)
             status_present = status_path.is_file()
             status_content = status_path.read_bytes() if status_present else None
             status_path.unlink(missing_ok=True)

@@ -1498,6 +1498,62 @@ class BackendSupervisorEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(supervisor["status"], "snapshot")
         self.assertEqual(supervisor["liveness"], "snapshot")
 
+    async def test_failed_legacy_migration_restores_registry_and_status(self) -> None:
+        ticket = "WIKI-LEGACY-MIGRATE"
+        legacy = {
+            "history": [],
+            "current": {
+                "ticket": ticket,
+                "kind": "cc",
+                "role": "implement",
+                "model": "sonnet",
+                "worktree": str(self.worktree),
+                "state": "working",
+                "window": None,
+            },
+        }
+        self.paths.registry_path.write_text(
+            json.dumps({ticket: legacy}),
+            encoding="utf-8",
+        )
+        status_path = self.paths.status_dir / f"{ticket}.json"
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        status_content = '{"state":"working","step":"legacy work"}\n'
+        status_path.write_text(status_content, encoding="utf-8")
+        original_factory = self.supervisor.adapter_factory
+
+        def failing_factory(record):
+            adapter = original_factory(record)
+
+            async def fail_start(request):
+                del request
+                raise RuntimeError("legacy migration fixture failure")
+
+            adapter.start = fail_start  # type: ignore[method-assign]
+            return adapter
+
+        self.supervisor.adapter_factory = failing_factory
+        with self.assertRaises(HTTPException) as failed:
+            await asyncio.to_thread(
+                main.spawn_agent,
+                main.SpawnWorkerIn(
+                    ticket=ticket,
+                    kind="cdx",
+                    role="implement",
+                    model="gpt-5.4",
+                    effort="high",
+                    workdir=str(self.worktree),
+                    prompt="migrate this legacy worker",
+                ),
+            )
+
+        self.assertEqual(failed.exception.status_code, 409)
+        self.assertEqual(
+            json.loads(self.paths.registry_path.read_text()),
+            {ticket: legacy},
+        )
+        self.assertEqual(status_path.read_text(encoding="utf-8"), status_content)
+
     async def test_spawn_replay_preserves_status_and_returns_original_run(self) -> None:
         request = main.SpawnWorkerIn(
             ticket="WIKI-RETRY",

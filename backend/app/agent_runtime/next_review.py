@@ -692,22 +692,19 @@ def _implicit_result_is_current(
         ]
     if not reviewers:
         return False
-    if any(
-        _is_archived(reviewer_id, archived=archived, main=main)
-        for reviewer_id, _run_id in reviewers
-    ):
-        return False
     registry_data = dict((registry or main._read_agent_registry)())  # noqa: SLF001
     for reviewer_id, expected_run_id in reviewers:
+        if _is_archived(reviewer_id, archived=archived, main=main):
+            continue
         entry = registry_data.get(reviewer_id)
         current = entry.get("current") if isinstance(entry, Mapping) else None
         if not isinstance(current, Mapping) or current.get("run_id") != expected_run_id:
-            return False
+            continue
         state = str(
             current.get("state") or current.get("runtime_state") or ""
         ).lower()
         if state in _TERMINAL_STATES:
-            return False
+            continue
         status = (
             status_reader(reviewer_id)
             if status_reader is not None
@@ -715,8 +712,9 @@ def _implicit_result_is_current(
         )
         status_state = status.get("state") if isinstance(status, Mapping) else None
         if str(status_state or "").lower() in _TERMINAL_STATES:
-            return False
-    return True
+            continue
+        return True
+    return False
 
 
 def _staged_result(

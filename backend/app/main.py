@@ -4663,14 +4663,6 @@ def spawn_agent(
     if isinstance(live_window, str) and live_window in tmux_live_windows():
         raise HTTPException(status_code=409, detail=f"{ticket} already has a live worker window")
 
-    if not replaying:
-        status_path = AGENT_STATUS_DIR / f"{ticket}.json"
-        AGENT_STATUS_DIR.mkdir(parents=True, exist_ok=True)
-        try:
-            status_path.unlink(missing_ok=True)
-        except OSError as exc:
-            raise HTTPException(status_code=500, detail="Could not reset worker status") from exc
-
     result = _supervisor_request(
         "run/start",
         {
