@@ -1154,13 +1154,75 @@ class RunStoreTests(unittest.TestCase):
 
             restarted = RunStore(paths)
             registry = json.loads(paths.registry_path.read_text(encoding="utf-8"))
-            self.assertEqual(restarted.current_run_id("wiki-dev"), record.run_id)
-            self.assertNotIn("_orchestrators", registry)
-            self.assertEqual(registry["wiki-dev"]["history"][0]["window"], "@9999")
+            self.assertIsNone(restarted.current_run_id("wiki-dev"))
             self.assertEqual(
-                registry["wiki-dev"]["history"][0]["migration"],
-                "headless-supervisor",
+                registry,
+                {
+                    "_orchestrators": {
+                        "wiki-dev": {
+                            "window": "@9999",
+                            "cwd": str(root / "legacy-worktree"),
+                            "model": "opus",
+                        }
+                    }
+                },
             )
+            self.assertFalse(paths.runs_dir.joinpath(record.run_id).exists())
+
+    def test_create_failure_restores_status_registry_and_run_files(self) -> None:
+        for failure_point in ("_create_run_files", "_write_registry"):
+            with self.subTest(failure_point=failure_point), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                paths = _paths(root)
+                paths.registry_path.parent.mkdir(parents=True, exist_ok=True)
+                original_registry = {
+                    "_orchestrators": {
+                        "wiki-dev": {
+                            "window": "@9999",
+                            "cwd": str(root / "legacy-worktree"),
+                            "model": "opus",
+                        }
+                    }
+                }
+                paths.registry_path.write_text(
+                    json.dumps(original_registry), encoding="utf-8"
+                )
+                store = RunStore(paths)
+                record = _record(root, "wiki-dev")
+                record.provider = ProviderKind.CLAUDE
+                record.role = "orchestrator"
+                record.model = "opus"
+                record.orchestrator_id = None
+                status = store.status_path(record.agent_id)
+                status.parent.mkdir(parents=True, exist_ok=True)
+                status_content = '{"state":"working","step":"legacy"}\n'
+                status.write_text(status_content, encoding="utf-8")
+
+                if failure_point == "_create_run_files":
+                    def fail_create(value: RunRecord) -> None:
+                        value_dir = store.run_dir(value.run_id)
+                        value_dir.mkdir(mode=0o700, parents=False)
+                        raise OSError("simulated run-file failure")
+
+                    failure = mock.patch.object(
+                        store, failure_point, side_effect=fail_create
+                    )
+                else:
+                    failure = mock.patch.object(
+                        store,
+                        failure_point,
+                        side_effect=OSError("simulated registry failure"),
+                    )
+                with failure, self.assertRaisesRegex(OSError, "simulated"):
+                    store.create(record, migrate_legacy=True)
+
+                self.assertEqual(
+                    json.loads(paths.registry_path.read_text(encoding="utf-8")),
+                    original_registry,
+                )
+                self.assertEqual(status.read_text(encoding="utf-8"), status_content)
+                self.assertFalse(store.run_dir(record.run_id).exists())
+                self.assertEqual(store._start_registry_snapshots, {})  # noqa: SLF001
 
     def test_restart_repairs_crash_stale_counts_and_truncated_tail(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

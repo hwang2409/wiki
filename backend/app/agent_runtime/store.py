@@ -1181,6 +1181,8 @@ class RunStore:
             _ensure_parent_dir(status_path.parent)
             status_present, status_content = _read_start_status(status_path)
             status_path.unlink(missing_ok=True)
+            registry_before = deepcopy(registry)
+            registry_was_present = self.paths.registry_path.exists()
             legacy_orchestrators = registry.get("_orchestrators")
             legacy_entry = (
                 legacy_orchestrators.get(record.agent_id)
@@ -1196,47 +1198,62 @@ class RunStore:
                 "status_present": status_present,
                 "status_content": status_content,
             }
-            self._create_run_files(record)
-            history = (
-                list((entry or {}).get("history") or [])
-                if isinstance(entry, dict)
-                else []
-            )
-            if isinstance(current, dict) and current:
-                # Mixed-fleet migration: the backend refuses a still-live
-                # legacy window before calling create(). A stale tmux-era
-                # current row is archived once, then the supervisor becomes
-                # the sole registry writer for this agent.
-                history.append(
-                    {
-                        **current,
-                        "outcome": current.get("outcome") or "handoff",
-                        "ended_at": current.get("ended_at") or utc_now(),
-                        "migration": "headless-supervisor",
-                    }
+            run_dir_was_absent = not self.run_dir(record.run_id).exists()
+            try:
+                self._create_run_files(record)
+                history = (
+                    list((entry or {}).get("history") or [])
+                    if isinstance(entry, dict)
+                    else []
                 )
-            if isinstance(legacy_orchestrator, dict):
-                history.append(
-                    {
-                        **legacy_orchestrator,
-                        "ticket": record.agent_id,
-                        "kind": legacy_orchestrator.get("kind") or "cc",
-                        "role": legacy_orchestrator.get("role") or "orchestrator",
-                        "worktree": legacy_orchestrator.get("worktree")
-                        or legacy_orchestrator.get("cwd"),
-                        "outcome": legacy_orchestrator.get("outcome") or "handoff",
-                        "ended_at": legacy_orchestrator.get("ended_at") or utc_now(),
-                        "migration": "headless-supervisor",
-                    }
-                )
-                legacy_orchestrators.pop(record.agent_id)
-                if not legacy_orchestrators:
-                    registry.pop("_orchestrators", None)
-            registry[record.agent_id] = {
-                "history": history,
-                "current": self._registry_current(record),
-            }
-            self._write_registry(registry)
+                if isinstance(current, dict) and current:
+                    # Mixed-fleet migration: the backend refuses a still-live
+                    # legacy window before calling create(). A stale tmux-era
+                    # current row is archived once, then the supervisor becomes
+                    # the sole registry writer for this agent.
+                    history.append(
+                        {
+                            **current,
+                            "outcome": current.get("outcome") or "handoff",
+                            "ended_at": current.get("ended_at") or utc_now(),
+                            "migration": "headless-supervisor",
+                        }
+                    )
+                if isinstance(legacy_orchestrator, dict):
+                    history.append(
+                        {
+                            **legacy_orchestrator,
+                            "ticket": record.agent_id,
+                            "kind": legacy_orchestrator.get("kind") or "cc",
+                            "role": legacy_orchestrator.get("role") or "orchestrator",
+                            "worktree": legacy_orchestrator.get("worktree")
+                            or legacy_orchestrator.get("cwd"),
+                            "outcome": legacy_orchestrator.get("outcome") or "handoff",
+                            "ended_at": legacy_orchestrator.get("ended_at") or utc_now(),
+                            "migration": "headless-supervisor",
+                        }
+                    )
+                    legacy_orchestrators.pop(record.agent_id)
+                    if not legacy_orchestrators:
+                        registry.pop("_orchestrators", None)
+                registry[record.agent_id] = {
+                    "history": history,
+                    "current": self._registry_current(record),
+                }
+                self._write_registry(registry)
+            except BaseException:
+                self._start_registry_snapshots.pop(record.run_id, None)
+                if run_dir_was_absent:
+                    shutil.rmtree(self.run_dir(record.run_id), ignore_errors=True)
+                if status_present:
+                    _atomic_write_bytes(status_path, status_content)
+                else:
+                    status_path.unlink(missing_ok=True)
+                if registry_was_present:
+                    _atomic_write_json(self.paths.registry_path, registry_before)
+                else:
+                    self.paths.registry_path.unlink(missing_ok=True)
+                raise
             return record
 
     def commit_start(self, run_id: str) -> None:

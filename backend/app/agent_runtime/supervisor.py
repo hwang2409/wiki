@@ -1747,6 +1747,31 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         except BaseException:
             pass
 
+    async def _cleanup_precommit_adapter(
+        self,
+        run_id: str,
+        adapter: ProviderAdapter,
+    ) -> None:
+        """Close an adapter whose fresh start never committed attachment."""
+
+        try:
+            await adapter.close()
+        except BaseException:
+            pass
+        self._clear_adapter_loss(run_id)
+        task = self.event_tasks.pop(run_id, None)
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        if self.adapters.get(run_id) is adapter:
+            self.adapters.pop(run_id, None)
+        adapter_key = id(adapter)
+        self.event_routes = {
+            key: target
+            for key, target in self.event_routes.items()
+            if key[0] != adapter_key
+        }
+
     async def start_run(
         self,
         *,
@@ -1798,8 +1823,29 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         *,
         rollback_start: bool = False,
     ) -> RunRecord:
-        adapter = self.adapter_factory(record)
-        self._attach_adapter(record.run_id, adapter)
+        adapter: ProviderAdapter | None = None
+        try:
+            adapter = self.adapter_factory(record)
+            self._attach_adapter(record.run_id, adapter)
+        except asyncio.CancelledError:
+            if adapter is not None:
+                await self._cleanup_precommit_adapter(record.run_id, adapter)
+            if rollback_start:
+                self.store.abort_start(
+                    record.run_id,
+                    reason="provider launch cancelled before attachment",
+                )
+                await self._publish_agent_change(record.agent_id)
+            raise
+        except Exception as exc:
+            if adapter is not None:
+                await self._cleanup_precommit_adapter(record.run_id, adapter)
+            if rollback_start:
+                reason = f"provider attachment failed: {exc}"
+                self.store.abort_start(record.run_id, reason=reason)
+                raise ProviderProcessError(reason) from exc
+            raise
+        assert adapter is not None
         request = StartRequest(
             prompt=prompt,
             model=record.model,

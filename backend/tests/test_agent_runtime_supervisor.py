@@ -758,6 +758,64 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attempts, 2)
         self.assertEqual(second["agent_id"], "WIKI-IMPLICIT-FAILURE")
 
+    async def test_factory_failure_rolls_back_fresh_start(self) -> None:
+        def failing_factory(_record: RunRecord) -> ProviderAdapter:
+            raise RuntimeError("factory failure")
+
+        await self.supervisor.close()
+        self.supervisor = Supervisor(self.store, failing_factory)
+        with self.assertRaisesRegex(ProviderProcessError, "factory failure"):
+            await self.supervisor.start_run(
+                agent_id="WIKI-FACTORY-FAILURE",
+                provider=ProviderKind.CODEX,
+                role="implement",
+                model="fixture-codex",
+                effort="high",
+                worktree=str(self.worktree),
+                prompt="factory failure must roll back",
+            )
+
+        self.assertIsNone(self.store.current_run_id("WIKI-FACTORY-FAILURE"))
+        self.assertEqual(self.store.list_runs(), [])
+        self.assertFalse(
+            self.store.status_path("WIKI-FACTORY-FAILURE").exists()
+        )
+
+    async def test_attachment_persistence_failure_closes_adapter_and_rolls_back(
+        self,
+    ) -> None:
+        adapter: CodexFixtureAdapter | None = None
+        original_factory = self.supervisor.adapter_factory
+
+        def factory(record: RunRecord) -> ProviderAdapter:
+            nonlocal adapter
+            adapter = cast(CodexFixtureAdapter, original_factory(record))
+            return adapter
+
+        self.supervisor.adapter_factory = factory
+        with mock.patch.object(
+            self.store,
+            "set_control_attached",
+            side_effect=OSError("control-state persistence failure"),
+        ):
+            with self.assertRaisesRegex(
+                ProviderProcessError, "control-state persistence failure"
+            ):
+                await self.supervisor.start_run(
+                    agent_id="WIKI-ATTACH-FAILURE",
+                    provider=ProviderKind.CODEX,
+                    role="implement",
+                    model="fixture-codex",
+                    effort="high",
+                    worktree=str(self.worktree),
+                    prompt="attachment failure must roll back",
+                )
+
+        assert adapter is not None
+        self.assertTrue(adapter.closed)
+        self.assertIsNone(self.store.current_run_id("WIKI-ATTACH-FAILURE"))
+        self.assertEqual(self.store.list_runs(), [])
+
     async def test_aborted_start_preserves_interleaved_committed_registry_entry(self) -> None:
         first_started = asyncio.Event()
         second_started = asyncio.Event()
