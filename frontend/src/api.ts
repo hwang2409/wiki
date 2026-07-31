@@ -648,7 +648,17 @@ export type ArtifactKind =
   | "diff"
   | "file-list"
   | "json"
-  | "pdf";
+  | "pdf"
+  | "visual-diff";
+
+export type ArtifactImageVariant = {
+  ref?: string;
+  mime: "image/png" | "image/jpeg" | "image/webp";
+  byte_size?: number;
+  width?: number;
+  height?: number;
+  preview_base64?: string;
+};
 
 export type ArtifactFileEntry = {
   path: string;
@@ -681,6 +691,8 @@ export type SessionArtifact = {
   diff_from?: string;
   files?: ArtifactFileEntry[];
   json_data?: unknown;
+  before?: ArtifactImageVariant;
+  after?: ArtifactImageVariant;
 };
 
 export type SessionEvent = {

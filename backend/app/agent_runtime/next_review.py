@@ -10,13 +10,17 @@ from __future__ import annotations
 import re
 import threading
 import json
+import hashlib
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, Sequence
-from uuid import uuid4
 
-from .ticket import parse_reviewer_id, reviewer_id as canonical_reviewer_id
-from .diversity_orchestration import create_journal, run_diverse_review
+from .ticket import (
+    parse_reviewer_id,
+    reviewer_id as canonical_reviewer_id,
+    reviewer_id_candidates,
+)
+from .diversity_orchestration import run_diverse_review
 from .reviewer_diversity import (
     DEFAULT_DIVERSITY_LENSES,
     LENS_PROMPTS,
@@ -95,6 +99,42 @@ def _persist_request_state() -> None:
     temporary.replace(path)
 
 
+def _stable_request_id(
+    *,
+    ticket: str,
+    pr_number: int,
+    expected_sha: str,
+    orch: str,
+    reviewer_kind: str,
+    reviewer_model: str,
+    reviewer_effort: str | None,
+    prompt_template: str | None,
+    diversity: Sequence[str] | None,
+) -> str:
+    payload = {
+        "ticket": ticket.upper(),
+        "pr_number": pr_number,
+        "expected_sha": expected_sha.lower(),
+        "orch": orch,
+        "reviewer_kind": reviewer_kind,
+        "reviewer_model": reviewer_model,
+        "reviewer_effort": reviewer_effort,
+        "prompt_template": prompt_template,
+        "diversity": list(diversity or ()),
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return f"next-review-{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
+
+
+def _child_spawn_request_id(request_id: str, reviewer_id: str) -> str:
+    canonical = json.dumps(
+        {"operation_id": request_id, "reviewer": reviewer_id},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"next-review-spawn-{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
+
+
 def _resolve_root(orch: str) -> Path:
     return _main()._resolve_orchestrator_root(orch)  # noqa: SLF001
 
@@ -121,13 +161,26 @@ def _archived_reviewers(ticket: str, archived: list[Mapping[str, Any]]) -> dict[
             continue
         parsed = parse_reviewer_id(value)
         if parsed is not None and parsed.ticket == ticket.upper():
-            result[value.upper()] = parsed.round
+            result[canonical_reviewer_id(parsed.ticket, parsed.round, parsed.lens)] = parsed.round
     return result
 
 
 def _reviewer_round(value: str) -> int | None:
     parsed = parse_reviewer_id(value)
     return parsed.round if parsed is not None else None
+
+
+def _reviewer_status(
+    reviewer: str,
+    status_reader: Callable[[str], Mapping[str, Any] | None],
+) -> Mapping[str, Any] | None:
+    """Read status by exact key, then canonical and legacy keys."""
+
+    for candidate in reviewer_id_candidates(reviewer):
+        status = status_reader(candidate)
+        if isinstance(status, Mapping):
+            return status
+    return None
 
 
 def _next_round(
@@ -139,7 +192,7 @@ def _next_round(
     for value in registry:
         parsed = parse_reviewer_id(str(value))
         if parsed is not None and parsed.ticket == ticket.upper():
-            reviewers[str(value).upper()] = parsed.round
+            reviewers[canonical_reviewer_id(parsed.ticket, parsed.round, parsed.lens)] = parsed.round
     return max(reviewers.values(), default=0) + 1
 
 
@@ -157,11 +210,12 @@ def _previous_terminal_reviewer(
         current = entry.get("current")
         if not isinstance(current, Mapping):
             continue
-        candidate_reviewer = str(value).upper()
-        status = (
-            status_reader(candidate_reviewer)
-            if status_reader is not None
-            else _main().read_agent_status(candidate_reviewer)
+        candidate_reviewer = canonical_reviewer_id(
+            parsed.ticket, parsed.round, parsed.lens
+        )
+        status = _reviewer_status(
+            str(value),
+            status_reader or _main().read_agent_status,
         )
         status_state = status.get("state") if isinstance(status, Mapping) else None
         state = str(
@@ -186,16 +240,20 @@ def _previous_terminal_reviewers(
 
     candidates: list[tuple[int, str]] = []
     for value, entry in registry.items():
-        reviewer = str(value).upper()
-        parsed_round = _reviewer_round(reviewer)
-        if parsed_round is None or not reviewer.startswith(ticket.upper() + "-REVIEW"):
+        parsed = parse_reviewer_id(str(value))
+        if parsed is None or parsed.ticket != ticket.upper():
             continue
+        reviewer = canonical_reviewer_id(parsed.ticket, parsed.round, parsed.lens)
+        parsed_round = parsed.round
         if parsed_round >= round_number or not isinstance(entry, Mapping):
             continue
         current = entry.get("current")
         if not isinstance(current, Mapping):
             continue
-        status = status_reader(reviewer) if status_reader is not None else _main().read_agent_status(reviewer)
+        status = _reviewer_status(
+            str(value),
+            status_reader or _main().read_agent_status,
+        )
         status_state = status.get("state") if isinstance(status, Mapping) else None
         state = str(status_state or current.get("state") or current.get("runtime_state") or "").lower()
         if state in _TERMINAL_STATES:
@@ -362,6 +420,7 @@ def next_review(
     registry: Callable[[], Mapping[str, Any]] | None = None,
     status_reader: Callable[[str], Mapping[str, Any] | None] | None = None,
     diversity: int | Sequence[str] | None = None,
+    backend_base_url: str | None = None,
 ) -> dict[str, Any]:
     """Gate and start the next pinned reviewer, replaying request ids."""
 
@@ -387,12 +446,33 @@ def next_review(
     }:
         raise ValueError("reviewer_effort is invalid")
     diversity_lenses = _normalize_diversity(diversity)
-    request_id = request_id or str(uuid4())
+    implicit_request_id = request_id is None
+    request_id = request_id or _stable_request_id(
+        ticket=ticket,
+        pr_number=pr_number,
+        expected_sha=expected_sha,
+        orch=orch,
+        reviewer_kind=reviewer_kind,
+        reviewer_model=reviewer_model,
+        reviewer_effort=reviewer_effort,
+        prompt_template=prompt_template,
+        diversity=diversity_lenses,
+    )
     with _REQUEST_LOCK:
         _load_request_state()
         previous_result = _REQUEST_RESULTS.get(request_id)
         if previous_result is not None:
-            return dict(previous_result)
+            if not implicit_request_id or _implicit_result_is_current(
+                previous_result,
+                archived=archived,
+                registry=registry,
+                status_reader=status_reader,
+                main=_main(),
+            ):
+                return dict(previous_result)
+            _REQUEST_RESULTS.pop(request_id, None)
+            _REQUEST_STAGES.pop(request_id, None)
+            _persist_request_state()
 
         main = _main()
         staged = _REQUEST_STAGES.get(request_id)
@@ -409,7 +489,9 @@ def next_review(
                 reviewer_effort=reviewer_effort,
                 prompt_template=prompt_template,
                 request_id=request_id,
+                implicit_request_id=implicit_request_id,
                 orch=orch,
+                backend_base_url=backend_base_url,
                 main=main,
                 gate=gate,
                 resolve_root=resolve_root,
@@ -441,9 +523,19 @@ def next_review(
                     workdir=staged["worktree"],
                     prompt=staged["prompt"],
                     orch=staged["orch"],
-                    request_id=staged["request_id"],
+                    request_id=_child_spawn_request_id(
+                        staged["request_id"], staged["reviewer"]
+                    ),
+                    implicit_request_id=implicit_request_id,
                 )
-                spawn_result = spawn(spawn_args) if spawn is not None else main.spawn_agent(spawn_args)
+                spawn_result = (
+                    spawn(spawn_args)
+                    if spawn is not None
+                    else main.spawn_agent(
+                        spawn_args,
+                        backend_base_url=backend_base_url,
+                    )
+                )
                 staged["run_id"] = spawn_result.get("run_id")
                 staged["spawn_completed"] = True
                 _persist_request_state()
@@ -557,9 +649,17 @@ def next_review(
             workdir=str(worktree_path),
             prompt=prompt,
             orch=orch,
-            request_id=request_id,
+            request_id=_child_spawn_request_id(request_id, reviewer_id),
+            implicit_request_id=implicit_request_id,
         )
-        spawn_result = spawn(spawn_args) if spawn is not None else main.spawn_agent(spawn_args)
+        spawn_result = (
+            spawn(spawn_args)
+            if spawn is not None
+            else main.spawn_agent(
+                spawn_args,
+                backend_base_url=backend_base_url,
+            )
+        )
         staged["run_id"] = spawn_result.get("run_id")
         staged["spawn_completed"] = True
         _persist_request_state()
@@ -599,6 +699,74 @@ def _is_archived(
         for row in rows
         if isinstance(row, Mapping)
     )
+
+
+def _registry_reviewer_entry(
+    registry: Mapping[str, Any], reviewer_id: str
+) -> tuple[str, Mapping[str, Any]] | None:
+    """Resolve reviewer rows across legacy and canonical case forms."""
+
+    for candidate in reviewer_id_candidates(reviewer_id):
+        entry = registry.get(candidate)
+        if isinstance(entry, Mapping):
+            return candidate, entry
+    canonical = reviewer_id.upper()
+    for candidate, entry in registry.items():
+        if str(candidate).upper() == canonical and isinstance(entry, Mapping):
+            return str(candidate), entry
+    return None
+
+
+def _implicit_result_is_current(
+    result: Mapping[str, Any],
+    *,
+    archived: Callable[[], list[Mapping[str, Any]]] | None,
+    registry: Callable[[], Mapping[str, Any]] | None,
+    status_reader: Callable[[str], Mapping[str, Any] | None] | None,
+    main: Any,
+) -> bool:
+    reviewers: list[tuple[str, str]] = []
+    reviewer = result.get("reviewer")
+    run_id = result.get("run_id")
+    if isinstance(reviewer, str) and isinstance(run_id, str):
+        reviewers.append((reviewer, run_id))
+    diversity_reviewers = result.get("reviewers")
+    if isinstance(diversity_reviewers, list):
+        reviewers = [
+            (item["reviewer"], item["run_id"])
+            for item in diversity_reviewers
+            if isinstance(item, Mapping)
+            and isinstance(item.get("reviewer"), str)
+            and isinstance(item.get("run_id"), str)
+        ]
+    if not reviewers:
+        return False
+    registry_data = dict((registry or main._read_agent_registry)())  # noqa: SLF001
+    for reviewer_id, expected_run_id in reviewers:
+        if _is_archived(reviewer_id, archived=archived, main=main):
+            continue
+        resolved = _registry_reviewer_entry(registry_data, reviewer_id)
+        registry_id, entry = (
+            resolved if resolved is not None else (reviewer_id.upper(), None)
+        )
+        current = entry.get("current") if isinstance(entry, Mapping) else None
+        if not isinstance(current, Mapping) or current.get("run_id") != expected_run_id:
+            continue
+        state = str(
+            current.get("state") or current.get("runtime_state") or ""
+        ).lower()
+        if state in _TERMINAL_STATES:
+            continue
+        status = (
+            status_reader(registry_id)
+            if status_reader is not None
+            else main.read_agent_status(registry_id)
+        )
+        status_state = status.get("state") if isinstance(status, Mapping) else None
+        if str(status_state or "").lower() in _TERMINAL_STATES:
+            continue
+        return True
+    return False
 
 
 def _staged_result(

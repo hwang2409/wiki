@@ -401,6 +401,133 @@ class ArtifactTranscriptTests(unittest.TestCase):
         )
         self.assertNotIn("data_base64", event["artifact"])
 
+    def test_structured_visual_diff_result_strips_payload_and_keeps_metadata(self) -> None:
+        import base64 as _base64
+        import io as _io
+        from PIL import Image as _Image
+
+        def _png(size: tuple[int, int]) -> bytes:
+            buffer = _io.BytesIO()
+            _Image.new("RGB", size, color=(0, 0, 0)).save(buffer, format="PNG")
+            return buffer.getvalue()
+
+        before_bytes = _png((640, 480))
+        after_bytes = _png((640, 480))
+        artifact_id = "33b1c159-9d1e-4804-9b14-3d880ac2e3c7"
+
+        event = transcripts._artifact_from_structured_result(
+            {
+                "input": {
+                    "kind": "visual-diff",
+                    "payload": {
+                        "before": {
+                            "data_base64": _base64.b64encode(before_bytes).decode(),
+                            "mime": "image/png",
+                        },
+                        "after": {
+                            "data_base64": _base64.b64encode(after_bytes).decode(),
+                            "mime": "image/png",
+                        },
+                    },
+                }
+            },
+            json.dumps({"artifact_id": artifact_id, "ok": True}),
+        )
+
+        self.assertIsNotNone(event)
+        artifact = event["artifact"]
+        self.assertEqual(artifact["kind"], "visual-diff")
+        for variant in ("before", "after"):
+            self.assertNotIn("data_base64", artifact[variant])
+            self.assertEqual(artifact[variant]["ref"], f"artifact://{artifact_id}/{variant}")
+            self.assertEqual(artifact[variant]["mime"], "image/png")
+            self.assertEqual(artifact[variant]["width"], 640)
+            self.assertEqual(artifact[variant]["height"], 480)
+            self.assertGreater(artifact[variant]["byte_size"], 0)
+
+    def test_structured_visual_diff_swaps_dimensions_for_exif_orientation(self) -> None:
+        import base64 as _base64
+        import io as _io
+        from PIL import Image as _Image
+        from PIL.ExifTags import Base as _ExifBase
+
+        def _upright_png(size: tuple[int, int]) -> bytes:
+            buffer = _io.BytesIO()
+            _Image.new("RGB", size, color=(0, 0, 0)).save(buffer, format="PNG")
+            return buffer.getvalue()
+
+        def _orientation6_jpeg(size: tuple[int, int]) -> bytes:
+            image = _Image.new("RGB", size, color=(255, 255, 255))
+            exif = image.getexif()
+            exif[_ExifBase.Orientation.value] = 6
+            buffer = _io.BytesIO()
+            image.save(buffer, format="JPEG", exif=exif.tobytes(), quality=95)
+            return buffer.getvalue()
+
+        artifact_id = "33b1c159-9d1e-4804-9b14-3d880ac2e3c7"
+        # Raw JPEG header = 120x80; Orientation=6 rotates 90° so the stored
+        # image after scrub is 80x120. The upright peer is written directly as
+        # 80x120. Both must match so the compare stage stays in aspect.
+        before_bytes = _orientation6_jpeg((120, 80))
+        after_bytes = _upright_png((80, 120))
+
+        event = transcripts._artifact_from_structured_result(
+            {
+                "input": {
+                    "kind": "visual-diff",
+                    "payload": {
+                        "before": {
+                            "data_base64": _base64.b64encode(before_bytes).decode(),
+                            "mime": "image/jpeg",
+                        },
+                        "after": {
+                            "data_base64": _base64.b64encode(after_bytes).decode(),
+                            "mime": "image/png",
+                        },
+                    },
+                }
+            },
+            json.dumps({"artifact_id": artifact_id, "ok": True}),
+        )
+
+        self.assertIsNotNone(event)
+        artifact = event["artifact"]
+        # scrub_image would emit 80x120 for the rotated JPEG; the fallback must
+        # report the same, not the raw 120x80 header.
+        self.assertEqual(artifact["before"]["width"], 80)
+        self.assertEqual(artifact["before"]["height"], 120)
+        self.assertEqual(artifact["after"]["width"], 80)
+        self.assertEqual(artifact["after"]["height"], 120)
+
+    def test_structured_visual_diff_rejects_malformed_variants(self) -> None:
+        artifact_id = "33b1c159-9d1e-4804-9b14-3d880ac2e3c7"
+        cases = [
+            # missing after
+            {"before": {"data_base64": "aGk=", "mime": "image/png"}},
+            # unsupported mime
+            {
+                "before": {"data_base64": "aGk=", "mime": "image/gif"},
+                "after": {"data_base64": "aGk=", "mime": "image/gif"},
+            },
+            # invalid base64
+            {
+                "before": {"data_base64": "!!!", "mime": "image/png"},
+                "after": {"data_base64": "aGk=", "mime": "image/png"},
+            },
+            # not a PNG (probe fails)
+            {
+                "before": {"data_base64": "aGVsbG8=", "mime": "image/png"},
+                "after": {"data_base64": "aGVsbG8=", "mime": "image/png"},
+            },
+        ]
+        for index, payload in enumerate(cases):
+            with self.subTest(index=index):
+                event = transcripts._artifact_from_structured_result(
+                    {"input": {"kind": "visual-diff", "payload": payload}},
+                    json.dumps({"artifact_id": artifact_id, "ok": True}),
+                )
+                self.assertIsNone(event)
+
     def test_structured_artifact_fallback_rejects_errors_and_invalid_metadata(self) -> None:
         valid_input = {
             "kind": "mermaid",

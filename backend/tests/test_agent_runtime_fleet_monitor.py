@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest import mock
 
 from backend.app import workgraph, workgraph_service
+from backend.app.agent_runtime import graph_health
 from backend.app.agent_runtime.fake import FixtureAdapterFactory
 from backend.app.agent_runtime.fleet_monitor import FleetMonitor, Notification, _WorkerView
 from backend.app.agent_runtime.store import RunStore, RuntimePaths
@@ -104,6 +105,65 @@ def _set_created_at(store: RunStore, record, timestamp: float) -> None:
         timestamp, tz=timezone.utc
     ).isoformat()
     store._write_record(record)
+
+
+def _set_updated_at(store: RunStore, record, timestamp: float) -> None:
+    path = store.run_path(record.run_id)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["updated_at"] = datetime.fromtimestamp(
+        timestamp, tz=timezone.utc
+    ).isoformat()
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _append_event_rows(
+    store: RunStore,
+    record,
+    *,
+    direction: str,
+    disposition: str,
+    kind: str,
+    timestamp: float,
+) -> None:
+    stamp = datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+    raw_path = store.raw_events_path(record.run_id)
+    normalized_path = store.normalized_events_path(record.run_id)
+    raw_rows = [json.loads(line) for line in raw_path.read_text().splitlines() if line]
+    normalized_rows = [
+        json.loads(line) for line in normalized_path.read_text().splitlines() if line
+    ]
+    raw_seq = len(raw_rows) + 1
+    raw_path.write_text(
+        raw_path.read_text()
+        + json.dumps(
+            {
+                "seq": raw_seq,
+                "received_at": stamp,
+                "provider": record.provider.value,
+                "direction": direction,
+                "generation": 1,
+                "payload": {},
+            }
+        )
+        + "\n"
+    )
+    normalized_path.write_text(
+        normalized_path.read_text()
+        + json.dumps(
+            {
+                "seq": len(normalized_rows) + 1,
+                "raw_seq": raw_seq,
+                "normalized_at": stamp,
+                "disposition": disposition,
+                "kind": kind,
+                "payload": {},
+                "lifecycle_state": None,
+            }
+        )
+        + "\n"
+    )
+    os.utime(raw_path, (timestamp, timestamp))
+    os.utime(normalized_path, (timestamp, timestamp))
 
 
 class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
@@ -324,6 +384,507 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
             "node stall exceeded 1800s (1801s)",
             "iteration count exceeded cap 8 (9)",
         })
+
+    async def test_graph_health_stall_suppresses_fresh_status_activity(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        worker = await self._spawn("WIKI-920", role="implement", orch="WIKI-ORCH")
+        stale_edge = self.clock.now - 1801
+        _set_created_at(self.store, worker, stale_edge - 1)
+        _write_status(
+            self.store,
+            "WIKI-920",
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+            mtime=self.clock.now - 10,
+        )
+        graph = self._graph(
+            "WIKI-920",
+            edges=[self._graph_edge("spawn", stale_edge, to="WIKI-920")],
+        )
+        record_escalation = mock.Mock()
+        with self._patch_graph(graph), mock.patch(
+            "backend.app.workgraph_service.record_escalation",
+            side_effect=record_escalation,
+        ):
+            notes = await self.monitor.tick()
+
+        self.assertNotIn("graph-health-stall", {note.event_type for note in notes})
+        record_escalation.assert_not_called()
+
+    async def test_graph_health_stall_suppresses_recent_run_events(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        worker = await self._spawn("WIKI-921", role="implement", orch="WIKI-ORCH")
+        stale_edge = self.clock.now - 1801
+        _set_created_at(self.store, worker, stale_edge - 1)
+        _write_status(
+            self.store,
+            "WIKI-921",
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+            mtime=self.clock.now - 2000,
+        )
+        graph = self._graph(
+            "WIKI-921",
+            edges=[self._graph_edge("spawn", stale_edge, to="WIKI-921")],
+        )
+        record_escalation = mock.Mock()
+        with (
+            self._patch_graph(graph),
+            mock.patch(
+                "backend.app.agent_runtime.graph_health.GraphHealthMonitor._meaningful_event_timestamp",
+                return_value=self.clock.now - 10,
+            ),
+            mock.patch(
+                "backend.app.workgraph_service.record_escalation",
+                side_effect=record_escalation,
+            ),
+        ):
+            notes = await self.monitor.tick()
+
+        self.assertNotIn("graph-health-stall", {note.event_type for note in notes})
+        record_escalation.assert_not_called()
+
+    async def test_graph_health_stall_escalates_with_stale_activity(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        worker = await self._spawn("WIKI-922", role="implement", orch="WIKI-ORCH")
+        stale_edge = self.clock.now - 1801
+        _set_created_at(self.store, worker, stale_edge - 1)
+        _write_status(
+            self.store,
+            "WIKI-922",
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+            mtime=self.clock.now - 2000,
+        )
+        os.utime(
+            self.store.raw_events_path(worker.run_id),
+            (self.clock.now - 2000, self.clock.now - 2000),
+        )
+        graph = self._graph(
+            "WIKI-922",
+            edges=[self._graph_edge("spawn", stale_edge, to="WIKI-922")],
+        )
+        ack = Future()
+        ack.set_result(None)
+        with self._patch_graph(graph), mock.patch(
+            "backend.app.workgraph_service.record_escalation",
+            return_value=ack,
+        ):
+            notes = await self.monitor.tick()
+
+        self.assertIn("graph-health-stall", {note.event_type for note in notes})
+
+    async def test_graph_health_stall_escalates_when_any_worker_is_stale(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        implementer = await self._spawn(
+            "WIKI-923", role="implement", orch="WIKI-ORCH"
+        )
+        reviewer = await self._spawn(
+            "WIKI-923-REVIEW1", role="review", orch="WIKI-ORCH"
+        )
+        _write_status(
+            self.store,
+            implementer.agent_id,
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+            mtime=self.clock.now - 10,
+        )
+        _write_status(
+            self.store,
+            reviewer.agent_id,
+            {"state": "working", "pr": None, "step": "reviewing", "blocker": None},
+            mtime=self.clock.now - 2000,
+        )
+        graph = self._graph(
+            "WIKI-923",
+            nodes=[
+                {"id": implementer.agent_id, "kind": "implement", "label": "impl"},
+                {"id": reviewer.agent_id, "kind": "review", "label": "review"},
+            ],
+            edges=[
+                self._graph_edge(
+                    "spawn", self.clock.now - 2000, to=implementer.agent_id
+                ),
+                self._graph_edge(
+                    "spawn", self.clock.now - 1900, to=reviewer.agent_id
+                ),
+            ],
+        )
+        ack = Future()
+        ack.set_result(None)
+        record_escalation = mock.Mock(return_value=ack)
+        with self._patch_graph(graph), mock.patch(
+            "backend.app.workgraph_service.record_escalation",
+            side_effect=record_escalation,
+        ):
+            notes = await self.monitor.tick()
+            for index in range(3):
+                _write_status(
+                    self.store,
+                    implementer.agent_id,
+                    {
+                        "state": "working",
+                        "pr": None,
+                        "step": f"coding-{index}",
+                        "blocker": None,
+                    },
+                    mtime=self.clock.now - 10 + index,
+                )
+                notes.extend(await self.monitor.tick())
+
+        stall_notes = [note for note in notes if note.event_type == "graph-health-stall"]
+        self.assertEqual(len(stall_notes), 1)
+        self.assertEqual(record_escalation.call_count, 1)
+
+    async def test_graph_health_stall_does_not_borrow_sibling_activity_for_orphan(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        worker = await self._spawn("WIKI-924", role="implement", orch="WIKI-ORCH")
+        _write_status(
+            self.store,
+            worker.agent_id,
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+            mtime=self.clock.now - 10,
+        )
+        orphan = "WIKI-924-ORPHAN"
+        graph = self._graph(
+            "WIKI-924",
+            nodes=[
+                {"id": worker.agent_id, "kind": "implement", "label": "impl"},
+                {"id": orphan, "kind": "review", "label": "orphan"},
+            ],
+            edges=[
+                self._graph_edge("spawn", self.clock.now - 1900, to=worker.agent_id),
+                self._graph_edge("spawn", self.clock.now - 2000, to=orphan),
+            ],
+        )
+        ack = Future()
+        ack.set_result(None)
+        with self._patch_graph(graph), mock.patch(
+            "backend.app.workgraph_service.record_escalation",
+            return_value=ack,
+        ):
+            notes = await self.monitor.tick()
+
+        self.assertIn("graph-health-stall", {note.event_type for note in notes})
+
+    async def test_graph_health_stall_ignores_fresh_run_metadata(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        worker = await self._spawn("WIKI-925", role="implement", orch="WIKI-ORCH")
+        stale_activity = self.clock.now - 2000
+        _set_created_at(self.store, worker, stale_activity - 1)
+        _set_updated_at(self.store, worker, self.clock.now - 10)
+        _write_status(
+            self.store,
+            worker.agent_id,
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+            mtime=stale_activity,
+        )
+        for path_factory in (self.store.raw_events_path, self.store.normalized_events_path):
+            path = path_factory(worker.run_id)
+            os.utime(path, (stale_activity, stale_activity))
+        graph = self._graph(
+            "WIKI-925",
+            edges=[self._graph_edge("spawn", self.clock.now - 1801, to=worker.agent_id)],
+        )
+        ack = Future()
+        ack.set_result(None)
+        with self._patch_graph(graph), mock.patch(
+            "backend.app.workgraph_service.record_escalation",
+            return_value=ack,
+        ):
+            notes = await self.monitor.tick()
+
+        self.assertIn("graph-health-stall", {note.event_type for note in notes})
+
+    async def test_graph_health_stall_filters_noise_and_accepts_worker_output(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        worker = await self._spawn("WIKI-926", role="implement", orch="WIKI-ORCH")
+        stale_activity = self.clock.now - 2000
+        _set_created_at(self.store, worker, stale_activity - 1)
+        _write_status(
+            self.store,
+            worker.agent_id,
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+            mtime=stale_activity,
+        )
+        _append_event_rows(
+            self.store,
+            worker,
+            direction="client",
+            disposition="ignored",
+            kind="codex_client_message",
+            timestamp=self.clock.now - 10,
+        )
+        graph = self._graph(
+            "WIKI-926",
+            edges=[self._graph_edge("spawn", self.clock.now - 1801, to=worker.agent_id)],
+        )
+        ack = Future()
+        ack.set_result(None)
+        with self._patch_graph(graph), mock.patch(
+            "backend.app.workgraph_service.record_escalation",
+            return_value=ack,
+        ):
+            noise_notes = await self.monitor.tick()
+            _append_event_rows(
+                self.store,
+                worker,
+                direction="server",
+                disposition="rendered",
+                kind="item_completed",
+                timestamp=self.clock.now - 10,
+            )
+            output_notes = await self.monitor.tick()
+
+        self.assertIn("graph-health-stall", {note.event_type for note in noise_notes})
+        self.assertNotIn(
+            "graph-health-stall", {note.event_type for note in output_notes}
+        )
+
+    async def test_graph_health_stall_reopens_after_fresh_recovery(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        worker = await self._spawn("WIKI-927", role="implement", orch="WIKI-ORCH")
+        stale_activity = self.clock.now - 2000
+        _set_created_at(self.store, worker, stale_activity - 1)
+        _write_status(
+            self.store,
+            worker.agent_id,
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+            mtime=stale_activity,
+        )
+        graph = self._graph(
+            "WIKI-927",
+            edges=[self._graph_edge("spawn", self.clock.now - 1801, to=worker.agent_id)],
+        )
+        escalations: list[dict] = []
+
+        def record_escalation(**payload):
+            escalations.append(payload)
+            ack = Future()
+            ack.set_result(None)
+            return ack
+
+        with self._patch_graph(graph), mock.patch(
+            "backend.app.workgraph_service.record_escalation",
+            side_effect=record_escalation,
+        ):
+            first = await self.monitor.tick()
+            _write_status(
+                self.store,
+                worker.agent_id,
+                {"state": "working", "pr": None, "step": "coding", "blocker": None},
+                mtime=self.clock.now - 10,
+            )
+            recovered = await self.monitor.tick()
+            self.clock.advance(1801)
+            second = await self.monitor.tick()
+
+        first_stalls = [n for n in first if n.event_type == "graph-health-stall"]
+        recovered_stalls = [
+            n for n in recovered if n.event_type == "graph-health-stall"
+        ]
+        second_stalls = [n for n in second if n.event_type == "graph-health-stall"]
+        self.assertEqual(len(first_stalls), 1)
+        self.assertEqual(recovered_stalls, [])
+        self.assertEqual(len(second_stalls), 1)
+        self.assertEqual(len(escalations), 2)
+        self.assertNotEqual(
+            escalations[0]["request_id"], escalations[1]["request_id"]
+        )
+        self.assertNotEqual(first_stalls[0].dedupe_key, second_stalls[0].dedupe_key)
+
+    async def test_graph_health_stall_ignores_api_failures_but_accepts_progress(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        worker = await self._spawn("WIKI-928", role="implement", orch="WIKI-ORCH")
+        stale_activity = self.clock.now - 2000
+        _set_created_at(self.store, worker, stale_activity - 1)
+        _write_status(
+            self.store,
+            worker.agent_id,
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+            mtime=stale_activity,
+        )
+        for kind in ("claude_api_retry", "claude_api_error"):
+            _append_event_rows(
+                self.store,
+                worker,
+                direction="stdout",
+                disposition="rendered",
+                kind=kind,
+                timestamp=self.clock.now - 10,
+            )
+        graph = self._graph(
+            "WIKI-928",
+            edges=[self._graph_edge("spawn", self.clock.now - 1801, to=worker.agent_id)],
+        )
+        ack = Future()
+        ack.set_result(None)
+        record_escalation = mock.Mock(return_value=ack)
+        with self._patch_graph(graph), mock.patch(
+            "backend.app.workgraph_service.record_escalation",
+            side_effect=record_escalation,
+        ):
+            failure_notes = await self.monitor.tick()
+            _append_event_rows(
+                self.store,
+                worker,
+                direction="stdout",
+                disposition="summarized",
+                kind="claude_assistant",
+                timestamp=self.clock.now - 10,
+            )
+            progress_notes = await self.monitor.tick()
+
+        self.assertIn("graph-health-stall", {note.event_type for note in failure_notes})
+        self.assertNotIn(
+            "graph-health-stall", {note.event_type for note in progress_notes}
+        )
+        self.assertEqual(record_escalation.call_count, 1)
+
+    async def test_graph_health_stall_event_cursor_is_bounded_for_large_history(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        worker = await self._spawn("WIKI-929", role="implement", orch="WIKI-ORCH")
+        raw_path = self.store.raw_events_path(worker.run_id)
+        normalized_path = self.store.normalized_events_path(worker.run_id)
+        history_bytes = graph_health.MAX_EVENT_READ_BYTES * 8
+        for path in (raw_path, normalized_path):
+            with path.open("wb") as handle:
+                handle.truncate(history_bytes)
+        view = next(
+            view
+            for view in self.monitor._collect_views()  # noqa: SLF001
+            if view.record.run_id == worker.run_id
+        )
+        cursor = graph_health.EventActivityCursor()
+        with mock.patch.object(Path, "read_text", side_effect=AssertionError):
+            self.monitor._graph_health._meaningful_event_timestamp(  # noqa: SLF001
+                view, self.store, cursor
+            )
+
+        self.assertEqual(cursor.raw.offset, history_bytes)
+        self.assertEqual(cursor.normalized.offset, history_bytes)
+        self.assertLessEqual(
+            max(len(cursor.raw.pending), len(cursor.normalized.pending)),
+            graph_health.MAX_EVENT_ROW_BYTES,
+        )
+
+    async def test_graph_health_event_cursor_retries_normalized_row_after_raw_race(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        worker = await self._spawn("WIKI-930-RACE", role="implement", orch="WIKI-ORCH")
+        raw_path = self.store.raw_events_path(worker.run_id)
+        normalized_path = self.store.normalized_events_path(worker.run_id)
+        for path in (raw_path, normalized_path):
+            path.write_text("")
+        view = next(
+            view
+            for view in self.monitor._collect_views()  # noqa: SLF001
+            if view.record.run_id == worker.run_id
+        )
+        cursor = graph_health.EventActivityCursor()
+        event_timestamp = time.time() + 5
+        original_reader = graph_health.GraphHealthMonitor._read_incremental_event_rows
+        injected = False
+
+        def read_with_race(path, file_cursor, **kwargs):
+            nonlocal injected
+            if path == normalized_path and not injected:
+                _append_event_rows(
+                    self.store,
+                    worker,
+                    direction="server",
+                    disposition="rendered",
+                    kind="item_completed",
+                    timestamp=event_timestamp,
+                )
+                injected = True
+            return original_reader(path, file_cursor, **kwargs)
+
+        with mock.patch.object(
+            graph_health.GraphHealthMonitor,
+            "_read_incremental_event_rows",
+            side_effect=read_with_race,
+        ):
+            first = self.monitor._graph_health._meaningful_event_timestamp(  # noqa: SLF001
+                view, self.store, cursor
+            )
+            second = self.monitor._graph_health._meaningful_event_timestamp(  # noqa: SLF001
+                view, self.store, cursor
+            )
+
+        self.assertTrue(injected)
+        self.assertNotAlmostEqual(first or 0, event_timestamp, places=5)
+        self.assertAlmostEqual(second or 0, event_timestamp, places=5)
+
+    async def test_graph_health_stall_fast_forwards_event_cursor_after_edge_clear(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        worker = await self._spawn("WIKI-930", role="implement", orch="WIKI-ORCH")
+        self.clock.now = time.time()
+        stale_edge = self.clock.now - 1801
+        _set_created_at(self.store, worker, stale_edge - 1)
+        _write_status(
+            self.store,
+            worker.agent_id,
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+            mtime=self.clock.now - 10,
+        )
+        for path in (
+            self.store.raw_events_path(worker.run_id),
+            self.store.normalized_events_path(worker.run_id),
+        ):
+            path.write_text("")
+        graph = self._graph(
+            "WIKI-930",
+            edges=[self._graph_edge("spawn", stale_edge, to=worker.agent_id)],
+        )
+        escalations: list[dict] = []
+
+        def record_escalation(**payload):
+            escalations.append(payload)
+            ack = Future()
+            ack.set_result(None)
+            return ack
+
+        with self._patch_graph(graph), mock.patch(
+            "backend.app.workgraph_service.record_escalation",
+            side_effect=record_escalation,
+        ):
+            first = await self.monitor.tick()
+            graph["edges"] = [
+                self._graph_edge("steer", self.clock.now, to=worker.agent_id)
+            ]
+            _write_status(
+                self.store,
+                worker.agent_id,
+                {"state": "working", "pr": None, "step": "coding", "blocker": None},
+                mtime=self.clock.now - 2000,
+            )
+            cleared = await self.monitor.tick()
+            self.clock.advance(1801)
+            padding = b"{}\n" * (graph_health.MAX_EVENT_READ_BYTES * 5 // 3)
+            for path in (
+                self.store.raw_events_path(worker.run_id),
+                self.store.normalized_events_path(worker.run_id),
+            ):
+                with path.open("ab") as handle:
+                    handle.write(padding)
+            _append_event_rows(
+                self.store,
+                worker,
+                direction="server",
+                disposition="rendered",
+                kind="item_completed",
+                timestamp=self.clock.now - 10,
+            )
+            final = await self.monitor.tick()
+            self.assertAlmostEqual(
+                self.monitor._graph_health._event_activity[worker.run_id]  # noqa: SLF001
+                .latest_meaningful_activity,
+                self.clock.now - 10,
+                places=5,
+            )
+
+        first_stalls = [note for note in first if note.event_type == "graph-health-stall"]
+        self.assertEqual(first_stalls, [])
+        self.assertNotIn("graph-health-stall", {note.event_type for note in cleared})
+        self.assertNotIn("graph-health-stall", {note.event_type for note in final})
+        self.assertEqual(len(escalations), 0)
+
 
     async def test_escalation_append_failure_retries_before_notification(self) -> None:
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
@@ -546,6 +1107,23 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(hot.call_count, 3)
         self.assertEqual(durable.call_count, 3)
+
+    async def test_graph_unavailable_suppresses_young_spawn_edge(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        worker = await self._spawn("WIKI-910", role="implement", orch="WIKI-ORCH")
+        _set_created_at(self.store, worker, self.clock.now - 10)
+
+        with mock.patch.object(
+            workgraph, "load_workgraph", return_value=None
+        ), mock.patch.object(workgraph, "load_snapshot", return_value=None):
+            first = await self.monitor.tick()
+            self.assertNotIn(
+                "graph-unavailable", {note.event_type for note in first}
+            )
+            self.clock.advance(21)
+            second = await self.monitor.tick()
+
+        self.assertIn("graph-unavailable", {note.event_type for note in second})
 
     async def test_invalid_hot_and_snapshot_graph_alarm_without_phantom_health(self) -> None:
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
