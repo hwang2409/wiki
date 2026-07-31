@@ -228,7 +228,17 @@ def _mp3_validate_full_frame_stream(data: bytes, start: int, end: int) -> bytes:
         frame_offset = offset - start
         frame = data[offset:offset + frame_len]
         header = frame[:4]
+        if header[1] & 0x01 == 0:
+            raise MediaScrubError(
+                "mp3 CRC-protected frames are not supported"
+            )
         side_info_start = _mp3_side_info_start(header)
+        canonical_header = _mp3_rebuild_header(header)
+        canonical_side_info = _mp3_rebuild_side_info(frame, header)
+        rebuilt[frame_offset:frame_offset + 4] = canonical_header
+        rebuilt[
+            frame_offset + 4:frame_offset + side_info_start
+        ] = canonical_side_info
         metadata_end = (
             _mp3_xing_metadata_end(frame, side_info_start)
             if frames_seen == 0 else None
@@ -362,6 +372,100 @@ class _Mp3BitReader:
         return value
 
 
+class _Mp3BitWriter:
+    __slots__ = ("data", "bit_pos")
+
+    def __init__(self, length: int) -> None:
+        self.data = bytearray(length)
+        self.bit_pos = 0
+
+    def write(self, value: int, width: int) -> None:
+        if width < 0 or value < 0 or value >= 1 << width:
+            raise MediaScrubError("mp3 Layer III side information field is invalid")
+        if self.bit_pos + width > len(self.data) * 8:
+            raise MediaScrubError("mp3 Layer III side information is truncated")
+        for shift in range(width - 1, -1, -1):
+            if value & (1 << shift):
+                self.data[self.bit_pos // 8] |= 1 << (7 - self.bit_pos % 8)
+            self.bit_pos += 1
+
+    def finish(self) -> bytes:
+        return bytes(self.data)
+
+
+def _mp3_rebuild_header(header: bytes) -> bytes:
+    """Keep decoder fields and clear MPEG header metadata bits."""
+    if len(header) != 4:
+        raise MediaScrubError("mp3 frame header is truncated")
+    return bytes((
+        header[0],
+        header[1],
+        header[2] & 0xFE,
+        header[3] & 0xF0,
+    ))
+
+
+def _mp3_rebuild_side_info(frame: bytes, header: bytes) -> bytes:
+    """Re-emit side information while clearing its private field."""
+    crc_length = 0 if header[1] & 0x01 else 2
+    side_start = 4 + crc_length
+    side_length = _mp3_side_info_length(header)
+    side_end = side_start + side_length
+    if side_end > len(frame):
+        raise MediaScrubError("mp3 Layer III side information is truncated")
+    reader = _Mp3BitReader(frame[side_start:side_end])
+    writer = _Mp3BitWriter(side_length)
+    version_bits = (header[1] >> 3) & 0x03
+    channel_mode = (header[3] >> 6) & 0x03
+    channels = 1 if channel_mode == 3 else 2
+    mpeg1 = version_bits == 3
+
+    main_data_begin_width = 9 if mpeg1 else 8
+    writer.write(reader.read(main_data_begin_width), main_data_begin_width)
+    private_width = (
+        5 if mpeg1 and channels == 1
+        else 3 if mpeg1
+        else 1 if channels == 1
+        else 2
+    )
+    reader.read(private_width)
+    writer.write(0, private_width)
+    if mpeg1:
+        for _ in range(channels):
+            writer.write(reader.read(4), 4)
+    for _ in range(2 if mpeg1 else 1):
+        for _ in range(channels):
+            writer.write(reader.read(12), 12)
+            writer.write(reader.read(9), 9)
+            writer.write(reader.read(8), 8)
+            scalefac_width = 4 if mpeg1 else 9
+            writer.write(reader.read(scalefac_width), scalefac_width)
+            switched = reader.read(1)
+            writer.write(switched, 1)
+            if switched:
+                block_type = reader.read(2)
+                if block_type == 0:
+                    raise MediaScrubError("mp3 Layer III reserved block type")
+                writer.write(block_type, 2)
+                writer.write(reader.read(1), 1)
+                for _ in range(2):
+                    writer.write(reader.read(5), 5)
+                for _ in range(3):
+                    writer.write(reader.read(3), 3)
+            else:
+                for _ in range(3):
+                    writer.write(reader.read(5), 5)
+                writer.write(reader.read(4), 4)
+                writer.write(reader.read(3), 3)
+            if mpeg1:
+                writer.write(reader.read(1), 1)
+            writer.write(reader.read(1), 1)
+            writer.write(reader.read(1), 1)
+    if reader.bit_pos > side_length * 8:
+        raise MediaScrubError("mp3 Layer III side information is truncated")
+    return writer.finish()
+
+
 def _mp3_layer3_main_data_end(frame: bytes, header: bytes) -> int:
     """Return the byte after this frame's Layer III main data.
 
@@ -385,7 +489,12 @@ def _mp3_layer3_syntax(frame: bytes, header: bytes) -> tuple[int, int, int]:
     channels = 1 if channel_mode == 3 else 2
     mpeg1 = version_bits == 3
     main_data_begin = reader.read(9 if mpeg1 else 8)
-    reader.read(5 if mpeg1 and channels == 1 else 3 if mpeg1 else 1 if channels == 1 else 3)
+    reader.read(
+        5 if mpeg1 and channels == 1
+        else 3 if mpeg1
+        else 1 if channels == 1
+        else 2
+    )
     if mpeg1:
         for _ in range(channels):
             reader.read(4)  # scfsi

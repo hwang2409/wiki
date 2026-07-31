@@ -3304,6 +3304,17 @@ class Review21MediaProbeTests(unittest.TestCase):
         baseline[start + side_info_start:start + metadata_end] = b"\x00" * (
             metadata_end - side_info_start
         )
+        offset = start
+        while offset < len(baseline):
+            frame_length = mp3_scrubber._mp3_frame_length(
+                baseline, offset, len(baseline),
+            )
+            if frame_length is None:
+                break
+            baseline[offset:offset + 4] = mp3_scrubber._mp3_rebuild_header(
+                bytes(baseline[offset:offset + 4]),
+            )
+            offset += frame_length
 
         def pcm_md5(payload: bytes) -> tuple[str, int]:
             with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as handle:
@@ -3501,6 +3512,97 @@ class Review24Mp3ReservoirProbeTests(unittest.TestCase):
         self.assertEqual(len(result.data), len(payload))
         self.assertLess(elapsed, 3.0, f"MP3 scrub took {elapsed:.2f}s")
         self.assertLess(peak, 8 * len(payload), f"peak allocation was {peak} bytes")
+
+
+class Review25Mp3CanonicalizationTests(unittest.TestCase):
+    def test_crc_words_are_rejected_before_storage(self) -> None:
+        payload = bytearray(REAL_MP3.read_bytes())
+        frame_start = 110
+        frame_length = mp3_scrubber._mp3_frame_length(
+            payload, frame_start, len(payload),
+        )
+        self.assertIsNotNone(frame_length)
+        assert frame_length is not None
+        payload[frame_start + 1] &= 0xFE
+        payload[frame_start + 4:frame_start + 6] = b"CR"
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "CRC-protected",
+        ):
+            media_scrub.scrub_audio(bytes(payload), "audio/mpeg")
+
+    def test_header_and_side_info_metadata_bits_are_canonicalized(self) -> None:
+        payload = bytearray(REAL_MP3.read_bytes())
+        first_start = 110
+        first_length = mp3_scrubber._mp3_frame_length(
+            payload, first_start, len(payload),
+        )
+        self.assertIsNotNone(first_length)
+        assert first_length is not None
+        frame_start = first_start + first_length
+        payload[frame_start + 2] |= 0x01
+        payload[frame_start + 3] |= 0x0F
+        header = bytes(payload[frame_start:frame_start + 4])
+        side_start = mp3_scrubber._mp3_side_info_start(header)
+        # This fixture is MPEG-1 mono. Its five side-info private bits start
+        # after the nine-bit main_data_begin field.
+        payload[frame_start + 4 + 1] |= 0x7C
+
+        result = media_scrub.scrub_audio(bytes(payload), "audio/mpeg").data
+        output_frame_start = first_length
+        self.assertEqual(
+            result[output_frame_start:output_frame_start + 4],
+            mp3_scrubber._mp3_rebuild_header(header),
+        )
+        self.assertEqual(result[output_frame_start + 2] & 0x01, 0)
+        self.assertEqual(result[output_frame_start + 3] & 0x0F, 0)
+        self.assertEqual(result[output_frame_start + 5] & 0x7C, 0)
+        self.assertEqual(
+            result[output_frame_start + 4:output_frame_start + side_start],
+            mp3_scrubber._mp3_rebuild_side_info(
+                bytes(payload[frame_start:frame_start + first_length]),
+                header,
+            ),
+        )
+
+    def test_mpeg2_and_mpeg25_stereo_fixtures_scrub_and_decode(self) -> None:
+        fixtures = (
+            FIXTURE_DIR / "tone_mpeg2_stereo.mp3",
+            FIXTURE_DIR / "tone_mpeg25_stereo.mp3",
+        )
+        for fixture in fixtures:
+            with self.subTest(fixture=fixture.name):
+                original = fixture.read_bytes()
+                frame_length = mp3_scrubber._mp3_frame_length(
+                    original, 0, len(original),
+                )
+                self.assertIsNotNone(frame_length)
+                assert frame_length is not None
+                frame = original[:frame_length]
+                self.assertEqual(mp3_scrubber._mp3_side_info_length(frame[:4]), 17)
+                _begin, _bits, side_end = mp3_scrubber._mp3_layer3_syntax(
+                    frame, frame[:4],
+                )
+                self.assertEqual(side_end, 21)
+                result = media_scrub.scrub_audio(original, "audio/mpeg")
+                self.assertEqual(len(result.data), len(original))
+                if FFMPEG is not None:
+                    with tempfile.NamedTemporaryFile(
+                        suffix=".mp3", delete=False,
+                    ) as handle:
+                        handle.write(result.data)
+                        path = handle.name
+                    try:
+                        probe = subprocess.run(
+                            [FFMPEG, "-v", "error", "-i", path, "-f", "null", "-"],
+                            capture_output=True,
+                            timeout=30,
+                        )
+                        self.assertEqual(
+                            probe.returncode, 0,
+                            probe.stderr.decode(errors="replace"),
+                        )
+                    finally:
+                        Path(path).unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
