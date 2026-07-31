@@ -20,10 +20,12 @@ from typing import Callable
 
 import uvicorn
 
+from backend.app import native_trust
+
 
 DAEMON_AUTH_SOCKET_NAME = "wiki-app-secret.sock"
 DAEMON_AUTH_LOCK_NAME = "wiki-app-secret.lock"
-TAURI_BUNDLE_IDENTIFIER = "com.hwang2409.wiki"
+TAURI_BUNDLE_IDENTIFIER = native_trust.TAURI_BUNDLE_IDENTIFIER
 DEFAULT_TAURI_BUNDLE_PATH = Path("/Applications/Wiki.app")
 SOURCE_TAURI_BUNDLE_PATH = (
     Path(__file__).resolve().parents[1]
@@ -601,11 +603,7 @@ def _verify_code_identity(
         or not live_identities & _code_directory_identities(details)
     ):
         return False
-    requirement = (
-        f'anchor apple generic and identifier "{TAURI_BUNDLE_IDENTIFIER}" '
-        f'and certificate leaf[subject.OU] = "{team}"'
-    )
-    return _verify_signature(executable, requirement)
+    return native_trust.verify_designated_requirement(executable, team)
 
 
 def is_trusted_tauri_peer(connection: socket.socket) -> bool:

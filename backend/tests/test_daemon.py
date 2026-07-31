@@ -18,7 +18,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from backend import native_server
-from backend.app import daemon
+from backend.app import daemon, native_trust
 from backend.app.agent_runtime.version import frozen_runtime_fingerprint
 from backend.native_server import DaemonAuthSocket, rotate_log_file
 
@@ -689,6 +689,100 @@ class DaemonArtifactTests(unittest.TestCase):
                 ):
                     daemon.install(config)
             launchctl.assert_not_called()
+
+    def test_install_rejects_bundle_when_apple_anchor_requirement_fails(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = (
+                root
+                / "Wiki.app"
+                / "Contents"
+                / "Resources"
+                / "wiki-backend-sidecar"
+                / "wiki-backend"
+            )
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"self-signed backend")
+            executable.chmod(0o755)
+            (root / "Wiki.app" / "Contents" / "Info.plist").write_bytes(b"plist")
+            config = daemon.config_from_env(
+                overrides={
+                    "WIKI_APP_PATH": str(root / "Wiki.app"),
+                    "WIKI_AGENT_RUNTIME_DIR": str(root / "runtime"),
+                    "WIKI_LAUNCH_AGENTS_DIR": str(root / "LaunchAgents"),
+                }
+            )
+            with patch.object(
+                daemon, "_bundle_team_identifier", return_value="ABCDE12345"
+            ), patch.object(
+                daemon, "_verify_bundle_signature", return_value=True
+            ), patch.object(
+                native_trust, "verify_designated_requirement", return_value=False
+            ), patch.object(daemon, "_launchctl") as launchctl:
+                with self.assertRaisesRegex(
+                    daemon.DaemonError, "Apple developer signing requirement failed"
+                ):
+                    daemon.install(config)
+            launchctl.assert_not_called()
+
+    def test_install_and_runtime_use_the_shared_designated_requirement(self) -> None:
+        self.assertIs(daemon.native_trust, native_server.native_trust)
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = (
+                root
+                / "Wiki.app"
+                / "Contents"
+                / "Resources"
+                / "wiki-backend-sidecar"
+                / "wiki-backend"
+            )
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"shared requirement backend")
+            executable.chmod(0o755)
+            (root / "Wiki.app" / "Contents" / "Info.plist").write_bytes(b"plist")
+            config = daemon.config_from_env(
+                overrides={
+                    "WIKI_APP_PATH": str(root / "Wiki.app"),
+                    "WIKI_AGENT_RUNTIME_DIR": str(root / "runtime"),
+                    "WIKI_LAUNCH_AGENTS_DIR": str(root / "LaunchAgents"),
+                }
+            )
+            details = [
+                "Identifier=com.hwang2409.wiki",
+                "Signature=CMS",
+                "TeamIdentifier=ABCDE12345",
+                "Authority=Apple Development: Wiki",
+                "CDHash=0123456789abcdef",
+            ]
+            with patch.object(
+                daemon, "_bundle_team_identifier", return_value="ABCDE12345"
+            ), patch.object(
+                daemon, "_verify_bundle_signature", return_value=True
+            ), patch.object(
+                native_server, "_codesign_details", return_value=details
+            ), patch.object(
+                native_trust, "verify_designated_requirement", return_value=True
+            ) as shared_requirement:
+                daemon._validate_daemon_artifact(config)
+                self.assertTrue(
+                    native_server._verify_code_identity(
+                        executable,
+                        "ABCDE12345",
+                        live_identity=(
+                            "com.hwang2409.wiki",
+                            "ABCDE12345",
+                            frozenset({"0123456789abcdef"}),
+                        ),
+                    )
+                )
+            self.assertEqual(shared_requirement.call_count, 2)
+            self.assertEqual(
+                shared_requirement.call_args_list[0].args[1],
+                shared_requirement.call_args_list[1].args[1],
+            )
+            self.assertTrue(shared_requirement.call_args_list[0].kwargs["deep"])
+            self.assertNotIn("deep", shared_requirement.call_args_list[1].kwargs)
 
     def test_signed_built_artifact_install_gate(self) -> None:
         if sys.platform != "darwin":

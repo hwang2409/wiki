@@ -19,6 +19,8 @@ from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
+from . import native_trust
+
 
 DEFAULT_LABEL = "com.hwang2409.wiki.backend"
 DEFAULT_PORT = 8213
@@ -328,7 +330,8 @@ def _validate_daemon_artifact(config: DaemonConfig) -> None:
         # Unit fixtures and direct Python executables are not native artifacts.
         # The production config always points into the complete Wiki.app bundle.
         return
-    if _bundle_team_identifier(bundle_path) is None:
+    team_identifier = _bundle_team_identifier(bundle_path)
+    if team_identifier is None:
         raise DaemonError(
             "cannot install an ad-hoc or unsigned Wiki.app; "
             "provide WIKI_NATIVE_SIGNING_IDENTITY and rebuild the app"
@@ -336,6 +339,14 @@ def _validate_daemon_artifact(config: DaemonConfig) -> None:
     if not _verify_bundle_signature(bundle_path):
         raise DaemonError(
             "cannot install Wiki.app: codesign verification failed"
+        )
+    if not native_trust.verify_designated_requirement(
+        bundle_path,
+        team_identifier,
+        deep=True,
+    ):
+        raise DaemonError(
+            "cannot install Wiki.app: Apple developer signing requirement failed"
         )
 
 
