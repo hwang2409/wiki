@@ -1,3 +1,4 @@
+use std::os::unix::fs::FileTypeExt;
 use std::{
     env,
     fs::File,
@@ -262,7 +263,9 @@ fn daemon_launchd_pid(label: &str) -> Option<u32> {
 
 fn daemon_socket_is_live(runtime_dir: &Path) -> bool {
     let path = daemon_handshake::socket_path(runtime_dir);
-    path.exists() && daemon_handshake::read_secret(runtime_dir).is_ok()
+    std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_socket())
+        .unwrap_or(false)
 }
 
 fn daemon_plist_exists(label: &str) -> bool {

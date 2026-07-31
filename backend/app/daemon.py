@@ -168,10 +168,25 @@ def daemon_settings_path(runtime_dir: Path | str) -> Path:
 def _load_daemon_settings(runtime_dir: Path) -> dict[str, object]:
     path = daemon_settings_path(runtime_dir)
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        contents = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
         return {}
-    return value if isinstance(value, dict) else {}
+    except OSError as exc:
+        raise DaemonError(f"cannot read daemon settings: {path}") from exc
+    try:
+        value = json.loads(contents)
+    except json.JSONDecodeError as exc:
+        raise DaemonError(f"invalid daemon settings: {path}") from exc
+    if not isinstance(value, dict):
+        raise DaemonError(f"invalid daemon settings shape: {path}")
+    label = value.get("label")
+    port = value.get("port")
+    if not isinstance(label, str) or not isinstance(port, int) or isinstance(port, bool):
+        raise DaemonError(f"invalid daemon settings shape: {path}")
+    if not 1 <= port <= 65535:
+        raise DaemonError(f"invalid daemon settings port: {path}")
+    _validate_launchd_label(label)
+    return value
 
 
 def _write_daemon_settings(config: DaemonConfig) -> None:

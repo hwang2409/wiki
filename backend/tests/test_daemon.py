@@ -96,6 +96,34 @@ class LaunchAgentConfigTests(unittest.TestCase):
                     }
                 )
 
+    def test_corrupt_settings_cannot_fall_back_to_default_after_custom_install(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime = root / "runtime"
+            launch_agents = root / "LaunchAgents"
+            runtime.mkdir()
+            custom = daemon.config_from_env(
+                overrides={
+                    "WIKI_AGENT_RUNTIME_DIR": str(runtime),
+                    "WIKI_LAUNCH_AGENTS_DIR": str(launch_agents),
+                    "WIKI_DAEMON_LABEL": "com.example.wiki.custom",
+                    "WIKI_BACKEND_PORT": "19321",
+                }
+            )
+            launch_agents.mkdir()
+            custom.plist_path.write_text("custom plist", encoding="utf-8")
+            daemon.daemon_settings_path(runtime).write_text(
+                "{not valid json\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(daemon.DaemonError, "invalid daemon settings"):
+                daemon.config_from_env(
+                    overrides={
+                        "WIKI_AGENT_RUNTIME_DIR": str(runtime),
+                        "WIKI_LAUNCH_AGENTS_DIR": str(launch_agents),
+                    }
+                )
+            self.assertTrue(custom.plist_path.exists())
+
     def test_service_absence_matches_captured_macos_output(self) -> None:
         config = self._config(Path("/tmp/LaunchAgents"))
         captured = subprocess.CompletedProcess(

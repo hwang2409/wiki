@@ -9,6 +9,7 @@ use std::{
 use sha2::{Digest, Sha256};
 
 pub(crate) const SOCKET_NAME: &str = "wiki-app-secret.sock";
+const MAX_SECRET_BYTES: usize = 256;
 
 pub(crate) struct AuthenticatedSecret {
     pub(crate) secret: String,
@@ -22,16 +23,7 @@ pub(crate) fn socket_path(runtime_dir: &Path) -> PathBuf {
 pub(crate) fn read_secret(runtime_dir: &Path) -> io::Result<String> {
     let mut stream = UnixStream::connect(socket_path(runtime_dir))?;
     stream.set_read_timeout(Some(Duration::from_millis(350)))?;
-    let mut contents = String::new();
-    stream.read_to_string(&mut contents)?;
-    let secret = contents.trim().to_string();
-    if secret.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "daemon app secret handshake was empty",
-        ));
-    }
-    Ok(secret)
+    read_handshake_secret(&mut stream)
 }
 
 pub(crate) fn read_authenticated_secret(
@@ -55,16 +47,79 @@ pub(crate) fn read_authenticated_secret(
             "daemon auth socket peer fingerprint does not match",
         ));
     }
-    let mut contents = String::new();
-    stream.read_to_string(&mut contents)?;
-    let secret = contents.trim().to_string();
+    let secret = read_handshake_secret(&mut stream)?;
+    Ok(AuthenticatedSecret { secret, pid })
+}
+
+fn read_handshake_secret(stream: &mut UnixStream) -> io::Result<String> {
+    let mut bytes = Vec::with_capacity(MAX_SECRET_BYTES);
+    let mut byte = [0_u8; 1];
+    loop {
+        match stream.read(&mut byte)? {
+            0 => break,
+            1 if byte[0] == b'\n' => break,
+            1 => {
+                if bytes.len() >= MAX_SECRET_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "daemon app secret handshake was too long",
+                    ));
+                }
+                bytes.push(byte[0]);
+            }
+            _ => unreachable!("one-byte handshake read returned more than one byte"),
+        }
+    }
+    let secret = String::from_utf8(bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+        .trim()
+        .to_string();
     if secret.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "daemon app secret handshake was empty",
         ));
     }
-    Ok(AuthenticatedSecret { secret, pid })
+
+    match stream.read(&mut byte) {
+        Ok(0) => Ok(secret),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "daemon app secret handshake had extra bytes",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::TimedOut => Ok(secret),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{read_secret, socket_path, MAX_SECRET_BYTES};
+    use std::{fs, io::Write, os::unix::net::UnixListener, path::PathBuf, thread};
+
+    #[test]
+    fn streaming_peer_is_rejected_without_waiting_for_eof() {
+        let runtime = PathBuf::from(format!("/tmp/wiki-secret-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&runtime);
+        fs::create_dir_all(&runtime).unwrap();
+        let listener = UnixListener::bind(socket_path(&runtime)).unwrap();
+        let writer = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            for _ in 0..=MAX_SECRET_BYTES {
+                if stream.write_all(b"x").is_err() {
+                    break;
+                }
+            }
+            let _ = stream.write_all(b"never reaches eof");
+        });
+
+        let error = read_secret(&runtime).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("too long"));
+        writer.join().unwrap();
+        let _ = fs::remove_file(PathBuf::from(socket_path(&runtime)));
+        fs::remove_dir_all(runtime).unwrap();
+    }
 }
 
 fn peer_pid(stream: &UnixStream) -> io::Result<u32> {
