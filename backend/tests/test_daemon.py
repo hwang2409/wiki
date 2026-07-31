@@ -648,9 +648,44 @@ class DaemonArtifactTests(unittest.TestCase):
             )
             with patch.object(
                 daemon, "_bundle_team_identifier", return_value=None
+            ), patch.object(
+                daemon, "_verify_bundle_signature", return_value=True
             ), patch.object(daemon, "_launchctl") as launchctl:
                 with self.assertRaisesRegex(
                     daemon.DaemonError, "ad-hoc or unsigned Wiki.app"
+                ):
+                    daemon.install(config)
+            launchctl.assert_not_called()
+
+    def test_install_rejects_bundle_when_display_metadata_is_tampered(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = (
+                root
+                / "Wiki.app"
+                / "Contents"
+                / "Resources"
+                / "wiki-backend-sidecar"
+                / "wiki-backend"
+            )
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"tampered backend")
+            executable.chmod(0o755)
+            (root / "Wiki.app" / "Contents" / "Info.plist").write_bytes(b"plist")
+            config = daemon.config_from_env(
+                overrides={
+                    "WIKI_APP_PATH": str(root / "Wiki.app"),
+                    "WIKI_AGENT_RUNTIME_DIR": str(root / "runtime"),
+                    "WIKI_LAUNCH_AGENTS_DIR": str(root / "LaunchAgents"),
+                }
+            )
+            with patch.object(
+                daemon, "_bundle_team_identifier", return_value="ABCDE12345"
+            ), patch.object(
+                daemon, "_verify_bundle_signature", return_value=False
+            ), patch.object(daemon, "_launchctl") as launchctl:
+                with self.assertRaisesRegex(
+                    daemon.DaemonError, "codesign verification failed"
                 ):
                     daemon.install(config)
             launchctl.assert_not_called()

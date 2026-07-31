@@ -303,6 +303,23 @@ def _bundle_team_identifier(bundle_path: Path) -> str | None:
     return team
 
 
+def _verify_bundle_signature(bundle_path: Path) -> bool:
+    """Verify the complete app bundle, including sealed nested code."""
+
+    if platform.system() != "Darwin":
+        return False
+    try:
+        result = subprocess.run(
+            ["/usr/bin/codesign", "--verify", "--deep", "--strict", str(bundle_path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return False
+    return result.returncode == 0
+
+
 def _validate_daemon_artifact(config: DaemonConfig) -> None:
     """Reject a complete app bundle without a developer trust anchor."""
 
@@ -315,6 +332,10 @@ def _validate_daemon_artifact(config: DaemonConfig) -> None:
         raise DaemonError(
             "cannot install an ad-hoc or unsigned Wiki.app; "
             "provide WIKI_NATIVE_SIGNING_IDENTITY and rebuild the app"
+        )
+    if not _verify_bundle_signature(bundle_path):
+        raise DaemonError(
+            "cannot install Wiki.app: codesign verification failed"
         )
 
 
