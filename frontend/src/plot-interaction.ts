@@ -116,14 +116,40 @@ function paramNameCollision(spec: Record<string, unknown>): boolean {
 }
 
 // Vega-Lite compiles each interval param into a selection store (dataset
-// named `<param>_store`). A user top-level dataset or `data.name` in the
-// reserved namespace would be overwritten by the selection tuple on the
-// first update — the chart source goes empty.
+// named `<param>_store`). Any user data definition in the reserved namespace,
+// including a nested lookup source, would be overwritten by the selection
+// tuple on the first update — the chart source goes empty.
 function datasetNameCollision(spec: Record<string, unknown>): boolean {
   const datasets = asRecord(spec.datasets);
   if (datasets && Object.keys(datasets).some(isReservedName)) return true;
-  const data = asRecord(spec.data);
-  if (data && typeof data.name === "string" && isReservedName(data.name)) return true;
+  return nestedDataNameCollision(spec);
+}
+
+const NESTED_SPEC_KEYS = new Set([
+  "layer", "facet", "concat", "hconcat", "vconcat", "repeat", "spec", "transform",
+]);
+
+function reservedDataDefinition(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(reservedDataDefinition);
+  const record = asRecord(value);
+  return record !== null && typeof record.name === "string" && isReservedName(record.name);
+}
+
+// Lookup transforms keep their source under transform[].from.data. Walk all
+// nested unit and transform containers so a hidden lookup source cannot be
+// overwritten by the injected brush store.
+function nestedDataNameCollision(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(nestedDataNameCollision);
+  const record = asRecord(value);
+  if (!record) return false;
+  for (const [key, child] of Object.entries(record)) {
+    if (key === "data" && reservedDataDefinition(child)) return true;
+    if (key === "from") {
+      const from = asRecord(child);
+      if (from && reservedDataDefinition(from.data)) return true;
+    }
+    if (NESTED_SPEC_KEYS.has(key) && nestedDataNameCollision(child)) return true;
+  }
   return false;
 }
 

@@ -706,6 +706,26 @@ test("runtime: user dataset named wiki_brush_store — guard prevents source rep
   await view.finalize();
 });
 
+test("runtime: lookup source named wiki_brush_store keeps rows present", async () => {
+  const spec: Record<string, unknown> = {
+    mark: "point",
+    data: { values: [{ key: "a", x: 0, y: 0 }] },
+    transform: [{
+      lookup: "key",
+      from: { data: { name: "wiki_brush_store", values: [{ key: "a", extra: 1 }] }, key: "key", fields: ["extra"] },
+    }],
+    encoding: {
+      x: { field: "x", type: "quantitative" },
+      y: { field: "y", type: "quantitative" },
+    },
+  };
+  assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
+  const view = await renderHeadless(transform(spec));
+  const rows = view.data("wiki_brush_store") as unknown[];
+  assert.equal(rows.length, 1, "lookup rows must survive the brush-store collision guard");
+  await view.finalize();
+});
+
 test("compile: legacy top-level `selection` spec — guard prevents dead inject", () => {
   const spec: Record<string, unknown> = {
     mark: "point",

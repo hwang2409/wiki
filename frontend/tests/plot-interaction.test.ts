@@ -212,6 +212,22 @@ test("plotInteractivity: top-level dataset named wiki_brush_store downgrades", (
   assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
 });
 
+test("plotInteractivity: lookup source named wiki_brush_store downgrades", () => {
+  const spec = {
+    mark: "point",
+    data: { values: [{ key: "a", x: 1, y: 2 }] },
+    transform: [{
+      lookup: "key",
+      from: { data: { name: "wiki_brush_store", values: [{ key: "a", extra: 3 }] }, key: "key", fields: ["extra"] },
+    }],
+    encoding: {
+      x: { field: "x", type: "quantitative" },
+      y: { field: "y", type: "quantitative" },
+    },
+  };
+  assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
+});
+
 test("plotInteractivity: data.name matching reserved prefix downgrades", () => {
   const spec = {
     mark: "point",
