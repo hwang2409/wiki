@@ -168,6 +168,27 @@ test("account banners render persisted notices from the agents payload", () => {
   expect(view.queryByText(/They resume when the limit resets/)).toBeNull();
 });
 
+test("claude limit banner explains successful-turn recovery", () => {
+  const view = renderView({
+    data: {
+      ...data,
+      account_notices: [
+        {
+          type: "claude_limit_hit",
+          ticket: "WIKI-10",
+          run_id: "run-claude-10",
+          window: "",
+          ts: "2026-07-31T00:00:00Z",
+        },
+      ],
+    },
+  });
+  expect(view.getByText(/Claude usage limit hit/)).toBeTruthy();
+  expect(view.getByText(/the next successful turn clears this notice/)).toBeTruthy();
+  expect(view.getByText(/replace it with a Codex worker/)).toBeTruthy();
+  expect(view.queryByText(/archive it once the limit resets/)).toBeNull();
+});
+
 test("codex_rotation_failed keeps the raw error behind the details disclosure", async () => {
   const view = renderView({
     data: {

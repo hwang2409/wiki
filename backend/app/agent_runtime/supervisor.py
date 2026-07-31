@@ -962,7 +962,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             if credential_fingerprint is not None:
                 verified_event["credential_fingerprint"] = credential_fingerprint
             await self._publish(verified_event)
-        if schedule_monitor_actions:
+        claude_turn_succeeded = (
+            event.provider is ProviderKind.CLAUDE
+            and event.direction != "stdin"
+            and accounts.claude_turn_succeeded(event.payload)
+        )
+        if schedule_monitor_actions and not claude_turn_succeeded:
             self._schedule_monitor_actions(
                 run_id,
                 adapter,
@@ -970,15 +975,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 prior_state=prior.state,
                 record=record,
             )
-        if (
-            event.provider is ProviderKind.CLAUDE
-            and event.direction != "stdin"
-            and accounts.claude_turn_succeeded(event.payload)
-            and run_id in self.last_limit_alert_at
-        ):
+        if claude_turn_succeeded:
             # A successful Claude result is a provider response from this
             # run. Pane redraws and generic session events are not proof.
-            self.last_limit_alert_at.pop(run_id, None)
+            # Emit a run-scoped clear even after supervisor restart; the
+            # durable notice store owns whether this run has a notice.
             await self._publish(
                 {
                     "type": "claude_limit_cleared",
@@ -1141,6 +1142,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         if (
             event.provider is ProviderKind.CLAUDE
             and event.direction != "stdin"
+            and not accounts.claude_turn_succeeded(event.payload)
             and accounts.detect_claude_limit_payload(event.payload)
         ):
             # Throttle per run_id so a replacement run under the same

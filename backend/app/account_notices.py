@@ -11,14 +11,10 @@ their tickets in, and a recovery event removes only the tickets it proves
 revived. Codex fleet conditions use one notice key per condition, with the
 affected tickets and run identities tracked inside that notice.
 
-Two lifecycle gaps remain, both tracked as WIKI-228 (durable provider-health
-lifecycle in the supervisor): (a) the headless supervisor never emits
-``claude_limit_cleared``, so a Claude usage-limit notice only clears when
-this store reconciles it away against the live registry (replaced/archived
-ticket) — automatic reset detection lives in WIKI-228; (b) failure events
-that fire while the native backend is offline never reach the SSE bridge,
-so events during that window are lost. WIKI-228 will own state in the
-supervisor and replay from a cursor on reconnect. Reconciliation here is
+One lifecycle gap remains, tracked as WIKI-228: failure events that fire
+while the native backend is offline never reach the SSE bridge, so events
+during that window are lost. WIKI-228 will own replay from a cursor on
+reconnect. Reconciliation here is
 the near-term truthful behavior: a notice for a ticket that no longer
 matches a live run is dropped on the next ``/api/agents`` refresh.
 """

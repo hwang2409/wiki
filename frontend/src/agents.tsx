@@ -1068,13 +1068,11 @@ function accountBannerCopy(event: AccountEvent): { impact: string; action: strin
         action: "Sign in to Codex again, then replace these workers.",
       };
     case "claude_limit_hit":
-      // Do not promise auto-resolution: the headless supervisor does not
-      // yet observe Claude limit recovery (WIKI-228), so the banner only
-      // clears when the operator replaces or archives this worker (which
-      // reconciles the notice away). Copy states the truthful next step.
+      // A confirmed successful Claude turn clears this notice for the same
+      // run. Replacement remains the continue-now option.
       return {
         impact: `Claude usage limit hit — ${event.ticket} is paused.`,
-        action: "Replace it with a Codex worker, or archive it once the limit resets.",
+        action: "Retry after the limit resets; the next successful turn clears this notice. To continue now, replace it with a Codex worker.",
       };
   }
 }

@@ -20,6 +20,7 @@ from unittest import mock
 from uuid import uuid4
 
 from backend.app import accounts
+from backend.app.account_notices import AccountNoticeStore
 from backend.app import provider_health
 from backend.app.agent_runtime.client import (
     SupervisorClient,
@@ -4072,8 +4073,9 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second["run_id"], second_record.run_id)
         self.supervisor.unsubscribe(queue)
 
-    async def test_claude_limit_clears_only_after_successful_provider_result(self) -> None:
+    async def test_claude_success_with_limit_warning_only_clears_notice(self) -> None:
         queue = self.supervisor.subscribe()
+        notice_store = AccountNoticeStore(path=self.root / "account-notices.json")
         record = await self.supervisor.start_run(
             agent_id="WIKI-CLAUDE-RECOVERY",
             provider=ProviderKind.CLAUDE,
@@ -4097,7 +4099,8 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 },
             ),
         )
-        await _wait_for_published(queue, "claude_limit_hit")
+        hit = await _wait_for_published(queue, "claude_limit_hit")
+        notice_store.apply_event(hit)
 
         # A failed provider request is not recovery proof.
         await self.supervisor._handle_provider_event(  # noqa: SLF001
@@ -4121,12 +4124,73 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             adapter,
             ProviderEvent(
                 ProviderKind.CLAUDE,
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "result": "Turn completed; approaching usage limit warning shown.",
+                },
+            ),
+        )
+        cleared = await _wait_for_published(queue, "claude_limit_cleared")
+        notice_store.apply_event(cleared)
+        self.assertEqual(cleared["ticket"], "WIKI-CLAUDE-RECOVERY")
+        self.assertEqual(cleared["run_id"], record.run_id)
+        with self.assertRaises(TimeoutError):
+            await _wait_for_published(queue, "claude_limit_hit", timeout=0.1)
+        self.assertEqual(notice_store.snapshot(), [])
+        self.supervisor.unsubscribe(queue)
+
+    async def test_claude_limit_clear_survives_supervisor_restart(self) -> None:
+        notice_store = AccountNoticeStore(path=self.root / "account-notices.json")
+        queue = self.supervisor.subscribe()
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-CLAUDE-RESTART",
+            provider=ProviderKind.CLAUDE,
+            role="review",
+            model="fixture-claude",
+            effort=None,
+            worktree=str(self.worktree),
+            prompt="fixture",
+        )
+        adapter = self.supervisor.adapters[record.run_id]
+        await self.supervisor._handle_provider_event(  # noqa: SLF001
+            record.run_id,
+            adapter,
+            ProviderEvent(
+                ProviderKind.CLAUDE,
+                {
+                    "type": "result",
+                    "subtype": "error",
+                    "is_error": True,
+                    "result": "Claude usage limit reached. Try again at 4pm.",
+                },
+            ),
+        )
+        hit = await _wait_for_published(queue, "claude_limit_hit")
+        notice_store.apply_event(hit)
+        self.supervisor.unsubscribe(queue)
+
+        await self.supervisor.close()
+        self.supervisor = Supervisor(
+            self.store,
+            FixtureAdapterFactory(FIXTURES, pid=os.getpid()),
+        )
+        queue = self.supervisor.subscribe()
+        adapter = FixtureAdapterFactory(FIXTURES, pid=os.getpid())(record)
+        self.supervisor._attach_adapter(record.run_id, adapter)  # noqa: SLF001
+        await self.supervisor._handle_provider_event(  # noqa: SLF001
+            record.run_id,
+            adapter,
+            ProviderEvent(
+                ProviderKind.CLAUDE,
                 {"type": "result", "subtype": "success", "is_error": False},
             ),
         )
         cleared = await _wait_for_published(queue, "claude_limit_cleared")
-        self.assertEqual(cleared["ticket"], "WIKI-CLAUDE-RECOVERY")
+        notice_store.apply_event(cleared)
         self.assertEqual(cleared["run_id"], record.run_id)
+        self.assertEqual(notice_store.snapshot(), [])
         self.supervisor.unsubscribe(queue)
 
     async def test_rotation_failure_restores_auth_and_resumes_quiesced_run(
