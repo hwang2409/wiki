@@ -3518,7 +3518,7 @@ def agent_session(
     ticket: str,
     cursor: int = Query(0, ge=0),
     client_path: str | None = Query(None, alias="path"),
-    archived_at: str | None = Query(None),
+    archived_at: str | None = None,
 ) -> dict[str, object]:
     if not valid_agent_id(ticket):
         raise HTTPException(status_code=400, detail="Bad ticket")

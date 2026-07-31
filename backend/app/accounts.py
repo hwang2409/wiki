@@ -1490,9 +1490,9 @@ class WatchdogInternalState:
     # the banner leaves the pane on a later poll, the watchdog emits
     # claude_limit_cleared — the recovery proof that resolves the notice.
     claude_limited: set[tuple[str, str]] = field(default_factory=set)
-    # Legacy Codex panes have no run_id. Track their ticket/window identity so
-    # a recovered pane can clear its ticket from a durable fleet notice.
-    codex_limited: set[tuple[str, str]] = field(default_factory=set)
+    # Legacy Codex panes have no run_id. Track every ticket named by a fleet
+    # notice, with its current window. Ticket scope survives window changes.
+    codex_limited: dict[str, str] = field(default_factory=dict)
 
 
 AUTH_DEAD_MAX_ATTEMPTS = 3
@@ -1515,12 +1515,13 @@ async def _check_once(
 
     codex_hits: list[tuple[WorkerEntry, str]] = []
     live_codex_workers: list[WorkerEntry] = []
-    live_legacy_codex_identities = {
-        (worker.ticket, worker.window)
+    live_legacy_codex_workers = {
+        worker.ticket: worker.window
         for worker in codex_workers
         if worker.window in live and not worker.run_id
     }
-    watch.codex_limited.intersection_update(live_legacy_codex_identities)
+    for ticket in set(watch.codex_limited) - set(live_legacy_codex_workers):
+        watch.codex_limited.pop(ticket, None)
     codex_recovered: list[WorkerEntry] = []
     auth_dead: list[WorkerEntry] = []
     for worker in codex_workers:
@@ -1528,14 +1529,14 @@ async def _check_once(
             continue
         live_codex_workers.append(worker)
         pane = await asyncio.to_thread(tmux_capture, worker.window, 80)
-        identity = (worker.ticket, worker.window)
         if detect_codex_limit(pane):
             codex_hits.append((worker, pane))
             if not worker.run_id:
-                watch.codex_limited.add(identity)
+                if worker.ticket in watch.codex_limited:
+                    watch.codex_limited[worker.ticket] = worker.window
         else:
-            if not worker.run_id and identity in watch.codex_limited:
-                watch.codex_limited.discard(identity)
+            if not worker.run_id and worker.ticket in watch.codex_limited:
+                watch.codex_limited.pop(worker.ticket, None)
                 codex_recovered.append(worker)
             if detect_codex_auth_dead(pane):
                 auth_dead.append(worker)
@@ -1676,6 +1677,9 @@ async def _check_once(
         # Rotation affects every live legacy Codex worker, not only workers
         # whose panes showed the first limit signature.
         affected_tickets = [worker.ticket for worker in live_codex_workers]
+        for worker in live_codex_workers:
+            if not worker.run_id:
+                watch.codex_limited[worker.ticket] = worker.window
         affected_run_ids = {
             worker.ticket: worker.run_id
             for worker in live_codex_workers
@@ -1695,6 +1699,9 @@ async def _check_once(
     except RotationError as exc:
         # Keep the same fleet scope when the account swap itself fails.
         affected_tickets = [worker.ticket for worker in live_codex_workers]
+        for worker in live_codex_workers:
+            if not worker.run_id:
+                watch.codex_limited[worker.ticket] = worker.window
         affected_run_ids = {
             worker.ticket: worker.run_id
             for worker in live_codex_workers
