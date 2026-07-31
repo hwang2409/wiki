@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
@@ -13,6 +15,43 @@ from .ticket import base_ticket
 
 
 logger = logging.getLogger(__name__)
+
+
+GRAPH_UNAVAILABLE_SPAWN_GRACE_SECONDS = 30.0
+MAX_EVENT_READ_BYTES = 256 * 1024
+MAX_EVENT_ROW_BYTES = 1024 * 1024
+MAX_RAW_DIRECTIONS = 4096
+MAX_UNRESOLVED_NORMALIZED_ROWS = 4096
+MEANINGFUL_EVENT_DIRECTIONS = frozenset({"provider", "server", "stdout"})
+STALL_EVENT_NOISE_KINDS = frozenset(
+    {
+        "thread_started",
+        "thread_archived",
+        "thread_closed",
+        "thread_status_changed",
+        "thread_tokenUsage_updated",
+        "thread_settings_updated",
+        "thread_goal_cleared",
+        "turn_started",
+        "turn_completed",
+        "turn_aborted",
+        "context_compacted",
+        "serverRequest_resolved",
+        "account_rateLimits_updated",
+        "account_chatgptAuthTokens_refresh",
+        "provider_process_exit",
+        "provider_protocol_error",
+        "rpc_response",
+        "unknown",
+        "normalization_error",
+        "claude_user",
+        "codex_user",
+        "claude_status",
+        "claude_session_state_changed",
+        "claude_api_retry",
+        "claude_api_error",
+    }
+)
 
 
 def _workgraph_module():
@@ -124,6 +163,22 @@ class GraphHealthSnapshot:
     iteration_notification_sent: bool = False
 
 
+@dataclass
+class EventFileCursor:
+    offset: int = 0
+    pending: bytes = b""
+    initialized: bool = False
+
+
+@dataclass
+class EventActivityCursor:
+    raw: EventFileCursor = field(default_factory=EventFileCursor)
+    normalized: EventFileCursor = field(default_factory=EventFileCursor)
+    raw_directions: dict[Any, str] = field(default_factory=dict)
+    unresolved_normalized_rows: deque[dict[str, Any]] = field(default_factory=deque)
+    latest_meaningful_activity: float | None = None
+
+
 EmitNotification = Callable[..., Awaitable[Any]]
 
 
@@ -145,32 +200,53 @@ class GraphHealthMonitor:
         self.review_route_suppression = review_route_suppression
         self.send_timeout = send_timeout
         self.snapshots: dict[str, GraphHealthSnapshot] = {}
+        self._event_activity: dict[str, EventActivityCursor] = {}
         self._degraded_tickets: set[str] = set()
 
     async def process(self, views: list[Any], now: float) -> list[Any]:
         """Run the detector once for each normalized ticket represented by views."""
 
         by_ticket: dict[str, Any] = {}
+        views_by_ticket: dict[str, list[Any]] = {}
         for view in views:
             ticket = base_ticket(view.record.agent_id)
+            views_by_ticket.setdefault(ticket, []).append(view)
             prior = by_ticket.get(ticket)
             if prior is None or view.record.agent_id == ticket:
                 by_ticket[ticket] = view
 
         results: list[Any] = []
+        current_run_ids = {view.record.run_id for view in views}
+        self._event_activity = {
+            run_id: cursor
+            for run_id, cursor in self._event_activity.items()
+            if run_id in current_run_ids
+        }
+        activity_by_run = await self._refresh_event_activity(views)
         for ticket, view in by_ticket.items():
+            ticket_views = views_by_ticket[ticket]
             graph = self.load_graph(ticket)
             if graph is None:
-                results.extend(await self._maybe_graph_unavailable(ticket, view, now))
+                results.extend(
+                    await self._maybe_graph_unavailable(
+                        ticket, view, ticket_views, now
+                    )
+                )
                 continue
             state = self.snapshots.setdefault(ticket, GraphHealthSnapshot())
             if ticket in self._degraded_tickets:
-                results.extend(await self._maybe_graph_unavailable(ticket, view, now))
+                results.extend(
+                    await self._maybe_graph_unavailable(
+                        ticket, view, ticket_views, now
+                    )
+                )
             else:
                 state.graph_unavailable_active = False
                 state.last_graph_unavailable_alarm_at = None
             try:
-                result = await self._maybe_graph_health(ticket, view, graph, now)
+                result = await self._maybe_graph_health(
+                    ticket, view, ticket_views, graph, now, activity_by_run
+                )
             except Exception:
                 logger.exception("fleet_monitor: graph health scan failed for %s", ticket)
                 continue
@@ -292,8 +368,267 @@ class GraphHealthMonitor:
             marker = cls._latest_verdict_marker(graph) or "blocking-no-reviewer"
         return cls._episode_digest(f"{condition}:{marker}")
 
+    @staticmethod
+    def _recent(timestamp: float | None, now: float, threshold: float) -> bool:
+        if timestamp is None:
+            return False
+        age = now - timestamp
+        return 0 <= age < threshold
+
+    @classmethod
+    def _newest_spawn_age(cls, views: list[Any], now: float) -> float | None:
+        graph_module = _workgraph_module()
+        newest: float | None = None
+        for view in views:
+            timestamp = graph_module._parse_ts(  # noqa: SLF001
+                getattr(view.record, "created_at", None)
+            )
+            if timestamp is not None and (newest is None or timestamp > newest):
+                newest = timestamp
+        return now - newest if newest is not None else None
+
+    @staticmethod
+    def _read_incremental_event_rows(
+        path: Any,
+        cursor: EventFileCursor,
+        on_rows: Callable[[list[dict[str, Any]]], None] | None = None,
+        on_reset: Callable[[], None] | None = None,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            cursor.initialized = True
+            return [], False
+        reset = not cursor.initialized or size < cursor.offset
+        if reset:
+            cursor.offset = max(0, size - MAX_EVENT_READ_BYTES)
+            cursor.pending = b""
+            cursor.initialized = True
+            if on_reset is not None:
+                on_reset()
+        rows: list[dict[str, Any]] = []
+        scan_boundary = size
+        try:
+            with path.open("rb") as handle:
+                handle.seek(cursor.offset)
+                while cursor.offset < scan_boundary:
+                    chunk = handle.read(MAX_EVENT_READ_BYTES)
+                    if not chunk:
+                        break
+                    cursor.offset += len(chunk)
+                    combined = cursor.pending + chunk
+                    newline = combined.rfind(b"\n")
+                    if newline < 0:
+                        if len(combined) <= MAX_EVENT_ROW_BYTES:
+                            cursor.pending = combined
+                        else:
+                            cursor.pending = b""
+                        continue
+                    complete = combined[: newline + 1]
+                    cursor.pending = combined[newline + 1 :]
+                    if len(cursor.pending) > MAX_EVENT_ROW_BYTES:
+                        cursor.pending = b""
+                    chunk_rows: list[dict[str, Any]] = []
+                    for line in complete.splitlines():
+                        if not line:
+                            continue
+                        try:
+                            row = json.loads(line.decode("utf-8"))
+                        except (UnicodeDecodeError, TypeError, ValueError):
+                            continue
+                        if isinstance(row, dict):
+                            chunk_rows.append(row)
+                    if on_rows is not None:
+                        on_rows(chunk_rows)
+                    else:
+                        rows.extend(chunk_rows)
+        except OSError:
+            return rows, reset
+        return rows, reset
+
+    @classmethod
+    def _meaningful_event_timestamp(
+        cls, view: Any, store: Any, cursor: EventActivityCursor
+    ) -> float | None:
+        def reset_raw() -> None:
+            cursor.raw_directions.clear()
+            cursor.unresolved_normalized_rows.clear()
+            cursor.latest_meaningful_activity = None
+
+        def reset_normalized() -> None:
+            cursor.unresolved_normalized_rows.clear()
+            cursor.latest_meaningful_activity = None
+
+        def consume_raw(rows: list[dict[str, Any]]) -> None:
+            for row in rows:
+                sequence = row.get("seq")
+                direction = row.get("direction")
+                if sequence is None or not isinstance(direction, str):
+                    continue
+                cursor.raw_directions[sequence] = direction
+                while len(cursor.raw_directions) > MAX_RAW_DIRECTIONS:
+                    cursor.raw_directions.pop(next(iter(cursor.raw_directions)))
+
+        def consume_normalized(rows: list[dict[str, Any]]) -> None:
+            graph_module = _workgraph_module()
+            for row in rows:
+                raw_sequence = row.get("raw_seq")
+                direction = cursor.raw_directions.get(raw_sequence)
+                if raw_sequence is not None and direction is None:
+                    if len(cursor.unresolved_normalized_rows) >= (
+                        MAX_UNRESOLVED_NORMALIZED_ROWS
+                    ):
+                        cursor.unresolved_normalized_rows.popleft()
+                    cursor.unresolved_normalized_rows.append(row)
+                    continue
+                if direction not in MEANINGFUL_EVENT_DIRECTIONS:
+                    continue
+                if row.get("disposition") not in {"rendered", "summarized"}:
+                    continue
+                kind = row.get("kind")
+                if not isinstance(kind, str) or cls._is_stall_event_noise(kind):
+                    continue
+                timestamp = graph_module._parse_ts(  # noqa: SLF001
+                    row.get("normalized_at")
+                )
+                if timestamp is not None and (
+                    cursor.latest_meaningful_activity is None
+                    or timestamp > cursor.latest_meaningful_activity
+                ):
+                    cursor.latest_meaningful_activity = timestamp
+
+        raw_rows, raw_reset = cls._read_incremental_event_rows(
+            store.raw_events_path(view.record.run_id),
+            cursor.raw,
+            on_rows=consume_raw,
+            on_reset=reset_raw,
+        )
+        normalized_rows, normalized_reset = cls._read_incremental_event_rows(
+            store.normalized_events_path(view.record.run_id),
+            cursor.normalized,
+            on_rows=consume_normalized,
+            on_reset=reset_normalized,
+        )
+        pending_rows = list(cursor.unresolved_normalized_rows)
+        cursor.unresolved_normalized_rows.clear()
+        consume_normalized(pending_rows)
+        del raw_rows, normalized_rows
+        del raw_reset, normalized_reset
+        return cursor.latest_meaningful_activity
+
+    async def _refresh_event_activity(
+        self, views: list[Any]
+    ) -> dict[str, float | None]:
+        unique_views = {view.record.run_id: view for view in views}
+
+        async def refresh(view: Any) -> tuple[str, float | None]:
+            run_id = view.record.run_id
+            cursor = self._event_activity.setdefault(run_id, EventActivityCursor())
+            timestamp = await asyncio.to_thread(
+                self._meaningful_event_timestamp, view, self.store, cursor
+            )
+            return run_id, timestamp
+
+        pairs = await asyncio.gather(*(refresh(view) for view in unique_views.values()))
+        return dict(pairs)
+
+    @staticmethod
+    def _is_stall_event_noise(kind: str) -> bool:
+        lowered = kind.lower()
+        return (
+            kind in STALL_EVENT_NOISE_KINDS
+            or kind.endswith("_client_message")
+            or kind.endswith("_stderr")
+            or "keep_alive" in lowered
+            or "keepalive" in lowered
+            or "token" in lowered
+            or "rate_limit" in lowered
+            or "ratelimit" in lowered
+            or "api_retry" in lowered
+            or "api_error" in lowered
+            or "lifecycle" in lowered
+        )
+
+    @classmethod
+    def _stall_activity_state(
+        cls,
+        graph: dict[str, Any],
+        views: list[Any],
+        store: Any,
+        now: float,
+        threshold: float,
+        activity_by_run: dict[str, float | None] | None = None,
+    ) -> tuple[bool, str]:
+        graph_module = _workgraph_module()
+        stalled_nodes: list[str] = []
+        for node in graph_module._live_worker_nodes(graph):  # noqa: SLF001
+            node_id = node.get("id") if isinstance(node, dict) else None
+            if not isinstance(node_id, str):
+                continue
+            latest: float | None = None
+            for edge in graph.get("edges", []):
+                if not isinstance(edge, dict) or node_id not in (
+                    edge.get("from"),
+                    edge.get("to"),
+                ):
+                    continue
+                timestamp = graph_module._parse_ts(edge.get("created_at"))  # noqa: SLF001
+                if timestamp is not None and (latest is None or timestamp > latest):
+                    latest = timestamp
+            if latest is not None and now - latest > threshold:
+                stalled_nodes.append(node_id)
+        if not stalled_nodes:
+            return False, "none"
+        views_by_worker: dict[str, list[Any]] = {}
+        for view in views:
+            views_by_worker.setdefault(view.record.agent_id, []).append(view)
+        activity_markers: list[str] = []
+        any_stale = False
+        for node_id in stalled_nodes:
+            matching_views = views_by_worker.get(node_id)
+            # A graph node without a current run is not observable. Treat it
+            # as stale instead of borrowing activity from a sibling worker.
+            if not matching_views:
+                activity_markers.append(f"{node_id}:orphan")
+                any_stale = True
+                continue
+            node_fresh = False
+            node_activity: list[float] = []
+            for view in matching_views:
+                if view.status_mtime is not None:
+                    node_activity.append(view.status_mtime)
+                event_timestamp = (activity_by_run or {}).get(view.record.run_id)
+                if event_timestamp is not None:
+                    node_activity.append(event_timestamp)
+            past_activity = [timestamp for timestamp in node_activity if timestamp <= now]
+            if past_activity:
+                latest_activity = max(past_activity)
+                node_fresh = cls._recent(latest_activity, now, threshold)
+                if not node_fresh:
+                    activity_markers.append(f"{node_id}:{latest_activity:.6f}")
+            else:
+                activity_markers.append(f"{node_id}:none")
+            if not node_fresh:
+                any_stale = True
+        return not any_stale, "|".join(activity_markers) if activity_markers else "none"
+
+    @classmethod
+    def _stall_activity_is_fresh(
+        cls,
+        graph: dict[str, Any],
+        views: list[Any],
+        store: Any,
+        now: float,
+        threshold: float,
+        activity_by_run: dict[str, float | None] | None = None,
+    ) -> bool:
+        fresh, _marker = cls._stall_activity_state(
+            graph, views, store, now, threshold, activity_by_run
+        )
+        return fresh
+
     async def _maybe_graph_unavailable(
-        self, ticket: str, view: Any, now: float
+        self, ticket: str, view: Any, views: list[Any], now: float
     ) -> list[Any]:
         state = self.snapshots.setdefault(ticket, GraphHealthSnapshot())
         if state.last_clock is not None and now < state.last_clock:
@@ -304,6 +639,10 @@ class GraphHealthMonitor:
             state.graph_unavailable_active = True
             state.graph_unavailable_episode += 1
             state.last_graph_unavailable_alarm_at = None
+        spawn_age = self._newest_spawn_age(views, now)
+        if spawn_age is not None and 0 <= spawn_age < GRAPH_UNAVAILABLE_SPAWN_GRACE_SECONDS:
+            state.last_graph_unavailable_alarm_at = None
+            return []
         last = state.last_graph_unavailable_alarm_at
         if last is not None and now - last < self.graph_health_realarm:
             return []
@@ -325,7 +664,13 @@ class GraphHealthMonitor:
         return []
 
     async def _maybe_graph_health(
-        self, ticket: str, view: Any, graph: dict[str, Any], now: float
+        self,
+        ticket: str,
+        view: Any,
+        views: list[Any],
+        graph: dict[str, Any],
+        now: float,
+        activity_by_run: dict[str, float | None],
     ) -> list[Any]:
         graph_module = _workgraph_module()
         state = self.snapshots.setdefault(ticket, GraphHealthSnapshot())
@@ -392,13 +737,33 @@ class GraphHealthMonitor:
             state.stall_notification_sent = False
         else:
             marker = self._episode_marker(graph, "stall", cap)
-            if not state.stall_active or state.stall_episode_marker != marker:
-                state.stall_active = True
-                state.stall_episode_marker = marker
+            stall_activity_fresh, activity_marker = self._stall_activity_state(
+                graph,
+                views,
+                self.store,
+                now,
+                graph_module.STALL_ALARM_SECONDS,
+                activity_by_run,
+            )
+            if stall_activity_fresh:
+                # Fresh worker output closes the current episode. The
+                # activity marker below gives a later stale episode a new
+                # durable request id even when the graph has no new edge.
+                state.stall_active = False
+                state.stall_episode_marker = None
                 state.stall_append_acknowledged = False
                 state.stall_notification_sent = False
+            else:
+                marker = self._episode_digest(
+                    f"stall:{marker}:activity:{activity_marker}"
+                )
+                if not state.stall_active or state.stall_episode_marker != marker:
+                    state.stall_active = True
+                    state.stall_episode_marker = marker
+                    state.stall_append_acknowledged = False
+                    state.stall_notification_sent = False
             stall = health.get("slowest_node_stall_seconds", 0)
-            if not state.stall_append_acknowledged:
+            if not stall_activity_fresh and not state.stall_append_acknowledged:
                 state.stall_append_acknowledged = await self._append_escalation(
                     ticket,
                     view,
@@ -409,7 +774,11 @@ class GraphHealthMonitor:
                     graph=graph,
                     now=now,
                 )
-            if state.stall_append_acknowledged and not state.stall_notification_sent:
+            if (
+                not stall_activity_fresh
+                and state.stall_append_acknowledged
+                and not state.stall_notification_sent
+            ):
                 notif = await self.emit(
                     view,
                     event_type="graph-health-stall",
