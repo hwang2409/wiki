@@ -225,6 +225,39 @@ def provider_process_status_sync(pid: int | None) -> ProviderProcessStatus | Non
         return None
 
 
+def provider_processes_for_run_sync(
+    run_id: str,
+    agent_id: str,
+) -> list[ProviderProcessStatus]:
+    """Find provider processes carrying the exact durable run identity."""
+
+    matches: list[ProviderProcessStatus] = []
+    for process in psutil.process_iter(["pid", "create_time", "exe"]):
+        try:
+            pid = int(process.info["pid"])
+            if pid <= 1:
+                continue
+            environment = process.environ()
+            if (
+                environment.get("WIKI_RUN_ID") != run_id
+                or environment.get("WIKI_AGENT_ID") != agent_id
+            ):
+                continue
+            status = provider_process_status_sync(pid)
+            if status is not None:
+                matches.append(status)
+        except (
+            ProcessLookupError,
+            PermissionError,
+            psutil.Error,
+            OSError,
+            TypeError,
+            ValueError,
+        ):
+            continue
+    return matches
+
+
 def provider_process_group_members_sync(
     process_group_id: int,
 ) -> list[dict[str, int | float | str | None]]:

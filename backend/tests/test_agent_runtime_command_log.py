@@ -55,6 +55,66 @@ class CommandLogTests(unittest.TestCase):
             self.assertEqual(len(log.events(method="run/start")), 2)
             self.assertEqual(len(log.pending()), 0)
 
+    def test_receipt_and_effect_replay_bind_agent_and_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log = CommandLog(Path(tmp) / "command-log.sqlite3")
+            command = AgentCommand.spawn(
+                agent_id="WIKI-A",
+                request_id="spawn-bound",
+                payload={"run_id": "run-a"},
+            )
+            log.append_intent(command, {})
+            log.complete(
+                command,
+                {"run_id": "run-a"},
+                {"WIKI-A": {"current": {"run_id": "run-a"}}},
+            )
+            with self.assertRaises(CommandConflict):
+                log.append_intent(
+                    AgentCommand.spawn(
+                        agent_id="WIKI-B",
+                        request_id="spawn-bound",
+                        payload={"run_id": "run-b"},
+                    ),
+                    {},
+                )
+            with self.assertRaises(CommandConflict):
+                log.append_intent(
+                    AgentCommand.spawn(
+                        agent_id="WIKI-A",
+                        request_id="spawn-bound",
+                        payload={"run_id": "run-other"},
+                    ),
+                    {},
+                )
+
+            effect_command = AgentCommand(
+                "run/archive",
+                "WIKI-A",
+                "archive-bound",
+                {"run_id": "run-a"},
+            )
+            log.complete_effect(effect_command, {"run_id": "run-a"})
+            with self.assertRaises(CommandConflict):
+                log.effect_result(
+                    "run/archive",
+                    "archive-bound",
+                    agent_id="WIKI-B",
+                    command_hash=effect_command.command_hash,
+                )
+            with self.assertRaises(CommandConflict):
+                log.effect_result(
+                    "run/archive",
+                    "archive-bound",
+                    agent_id="WIKI-A",
+                    command_hash=AgentCommand(
+                        "run/archive",
+                        "WIKI-A",
+                        "archive-bound",
+                        {"run_id": "run-other"},
+                    ).command_hash,
+                )
+
     def test_queue_totally_orders_provider_effects(self) -> None:
         async def run() -> list[str]:
             with tempfile.TemporaryDirectory() as tmp:
@@ -208,6 +268,47 @@ class CommandLogTests(unittest.TestCase):
                 return queue_order
 
         self.assertEqual(asyncio.run(run()), ["spawn-a", "spawn-b"])
+
+    def test_failed_recovery_receipt_does_not_block_healthy_recovery(self) -> None:
+        async def run() -> tuple[list[str], list[tuple[str, str]]]:
+            with tempfile.TemporaryDirectory() as tmp:
+                log = CommandLog(Path(tmp) / "command-log.sqlite3")
+                failed = AgentCommand.spawn(
+                    agent_id="WIKI-A",
+                    request_id="spawn-failed",
+                    payload={"run_id": "run-failed"},
+                )
+                healthy = AgentCommand.spawn(
+                    agent_id="WIKI-B",
+                    request_id="spawn-healthy",
+                    payload={"run_id": "run-healthy"},
+                )
+                log.append_intent(failed, {})
+                log.append_intent(healthy, {})
+                completed: list[str] = []
+
+                def factory(command: AgentCommand):
+                    async def effect() -> dict[str, str]:
+                        if command.request_id == failed.request_id:
+                            raise RuntimeError("provider failed during recovery")
+                        completed.append(command.request_id)
+                        return {"run_id": str(command.payload["run_id"])}
+
+                    return effect
+
+                queue = CommandQueue(log, lambda: {}, recovery_factory=factory)
+                await queue.recover_pending()
+                await queue.close()
+                receipt = log.receipt("run/start", failed.request_id)
+                assert receipt is not None
+                return completed, [
+                    (item[0].request_id, str(item[1]))
+                    for item in queue.recovery_failures
+                ]
+
+        completed, failures = asyncio.run(run())
+        self.assertEqual(completed, ["spawn-healthy"])
+        self.assertEqual(failures, [("spawn-failed", "provider failed during recovery")])
 
     def test_steer_outbox_reconciles_delivery_states(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

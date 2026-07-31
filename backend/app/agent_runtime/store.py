@@ -19,6 +19,7 @@ from .. import knowledge
 from .command_log import CommandLog
 from .process import (
     provider_process_group_members_sync,
+    provider_processes_for_run_sync,
     provider_process_status_sync,
     terminate_verified_provider_group,
 )
@@ -616,29 +617,68 @@ class RunStore:
     def archive_ticket_dir(self, agent_id: str) -> Path:
         return self.paths.archive_dir / agent_id
 
+    def _find_archived_run_entry(
+        self, run_id: str
+    ) -> tuple[RunRecord, Path] | None:
+        """Return one archive record and its session directory."""
+
+        for path in self.paths.archive_dir.glob("*/*/archive-complete.json"):
+            try:
+                marker = _read_json(path)
+                if not isinstance(marker, dict) or marker.get("run_id") != run_id:
+                    continue
+                value = _read_json(path.parent / "run.json")
+                if isinstance(value, dict):
+                    return RunRecord.from_dict(value), path.parent
+            except (OSError, StoreError, TypeError, ValueError):
+                continue
+        return None
+
     def find_archived_run(self, run_id: str) -> RunRecord | None:
         """Find one completed archive for a replayed archive effect."""
 
         with self._lock:
-            for path in self.paths.archive_dir.glob("*/*/archive-complete.json"):
-                try:
-                    marker = _read_json(path)
-                    if not isinstance(marker, dict) or marker.get("run_id") != run_id:
-                        continue
-                    value = _read_json(path.parent / "run.json")
-                    if isinstance(value, dict):
-                        return RunRecord.from_dict(value)
-                except (OSError, StoreError, TypeError, ValueError):
-                    continue
-        return None
+            entry = self._find_archived_run_entry(run_id)
+            return entry[0] if entry is not None else None
 
     def finalize_archived_run(self, run_id: str) -> RunRecord | None:
         """Resume archive cleanup and return only after live state is gone."""
 
         with self._lock:
-            archived = self.find_archived_run(run_id)
-            if archived is None:
+            archived_entry = self._find_archived_run_entry(run_id)
+            if archived_entry is None:
                 return None
+            archived, session_dir = archived_entry
+
+            live_path = self.run_path(run_id)
+            if live_path.is_file():
+                try:
+                    live = RunRecord.from_dict(_read_json(live_path))
+                except (OSError, StoreError, TypeError, ValueError) as exc:
+                    raise StoreConflict(
+                        "archive marker has an unreadable live run"
+                    ) from exc
+                if live.created_at != archived.created_at:
+                    raise StoreConflict(
+                        "older archive marker cannot remove a newer live run"
+                    )
+            registry = self._read_registry()
+            entry = registry.get(archived.agent_id)
+            current = entry.get("current") if isinstance(entry, dict) else None
+            if isinstance(current, dict) and current.get("run_id") not in {
+                None,
+                run_id,
+            }:
+                raise StoreConflict("older archive marker cannot remove a live current run")
+
+            if archived.implicit_start_request and archived.start_request_id:
+                # Repair this index before deleting the implicit receipt. A
+                # restart can otherwise reuse the old deterministic run id.
+                self.command_log.archive_start_request(
+                    archived.start_request_id,
+                    archived.run_id,
+                    str(session_dir),
+                )
 
             run_dir = self.run_dir(run_id)
             if run_dir.exists():
@@ -647,9 +687,6 @@ class RunStore:
                 raise StoreConflict("archived run directory remains after cleanup")
             self.command_log.forget_implicit_for_run(run_id)
 
-            registry = self._read_registry()
-            entry = registry.get(archived.agent_id)
-            current = entry.get("current") if isinstance(entry, dict) else None
             if isinstance(current, dict) and current.get("run_id") == run_id:
                 registry.pop(archived.agent_id, None)
                 self._write_registry(registry)
@@ -664,6 +701,43 @@ class RunStore:
             ):
                 raise StoreConflict("archived run remains live after cleanup")
             return archived
+
+    def discover_provider_process(self, run_id: str) -> RunRecord:
+        """Persist a provider found by its exact inherited run identity."""
+
+        with self._lock:
+            record = self.get(run_id)
+            if record.provider_pid is not None:
+                return record
+            candidates = provider_processes_for_run_sync(
+                record.run_id,
+                record.agent_id,
+            )
+            if not candidates:
+                return record
+            candidate_pids = {item.pid for item in candidates}
+            roots = [
+                item for item in candidates if item.parent_pid not in candidate_pids
+            ]
+            identity = min(roots or candidates, key=lambda item: item.pid)
+            record.provider_pid = identity.pid
+            record.provider_pid_started_at = identity.created_at
+            record.provider_executable = identity.executable
+            record.provider_process_group_id = identity.process_group_id
+            record.provider_process_group_members = (
+                provider_process_group_members_sync(identity.process_group_id)
+            )
+            self._write_record(record)
+            registry = self._read_registry()
+            current = (registry.get(record.agent_id) or {}).get("current") or {}
+            if current.get("run_id") == record.run_id:
+                registry[record.agent_id]["current"] = self._registry_current(record)
+                self._write_registry(registry)
+                self.command_log.replace_projection(
+                    record.agent_id,
+                    {record.agent_id: registry[record.agent_id]},
+                )
+            return record
 
     def find_archived_start_request(self, request_id: str) -> RunRecord | None:
         """Find an implicit start that was already archived and is reusable."""
@@ -832,6 +906,8 @@ class RunStore:
                 record = RunRecord.from_dict(value)
                 if not record.start_transaction:
                     continue
+                if record.provider_pid is None:
+                    record = self.discover_provider_process(record.run_id)
                 if not self._terminate_recorded_provider_pid(record):
                     continue
                 self._restore_start_snapshot(record, record.start_transaction)
@@ -1153,11 +1229,31 @@ class RunStore:
         records_by_agent: dict[str, list[RunRecord]] = {}
         for record in self.list_runs():
             records_by_agent.setdefault(record.agent_id, []).append(record)
+        archived_run_ids: set[str] = set()
+        for marker_path in self.paths.archive_dir.glob("*/*/archive-complete.json"):
+            try:
+                marker = _read_json(marker_path)
+            except (OSError, StoreError, TypeError, ValueError):
+                continue
+            if isinstance(marker, dict) and isinstance(marker.get("run_id"), str):
+                archived_run_ids.add(marker["run_id"])
         if not records_by_agent:
             if changed:
                 self._write_registry(registry)
             return
         for agent_id, records in records_by_agent.items():
+            live_records = [
+                record
+                for record in records
+                if record.run_id not in archived_run_ids
+                and record.replaced_by_run_id not in archived_run_ids
+            ]
+            if not live_records:
+                if agent_id in registry:
+                    registry.pop(agent_id, None)
+                    changed = True
+                continue
+            records = live_records
             records.sort(key=lambda item: (item.created_at, item.run_id))
             by_id = {record.run_id: record for record in records}
             child_by_parent = {
@@ -1294,6 +1390,14 @@ class RunStore:
     ) -> tuple[RunRecord, Path]:
         with self._lock:
             record = self.get(run_id)
+            archived_entry = self._find_archived_run_entry(run_id)
+            if (
+                archived_entry is not None
+                and archived_entry[0].created_at != record.created_at
+            ):
+                raise StoreConflict(
+                    "older archive marker cannot remove a newer live run"
+                )
             registry = self._read_registry()
             entry = registry.get(record.agent_id)
             current = entry.get("current") if isinstance(entry, dict) else None
@@ -2500,6 +2604,7 @@ class RunStore:
             current = entry.get("current") or {}
             if current.get("run_id") != replacement_run_id:
                 raise StoreConflict("replacement target is no longer current")
+            replacement = self.discover_provider_process(replacement_run_id)
             if not self._terminate_recorded_provider_pid(
                 replacement,
                 allow_dead_without_identity=False,

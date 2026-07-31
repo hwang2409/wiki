@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, Protocol
 
-from .command_log import AgentCommand, CommandIntent
+from .command_models import AgentCommand, CommandIntent
 
 
 class CommandDecider(Protocol):

@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from .command_log import (
+from .command_models import (
     AgentCommand,
     CommandConflict,
     CommandError,
@@ -24,6 +25,15 @@ class _QueuedCommand:
     command: AgentCommand
     execute: CommandExecutor
     future: asyncio.Future[Any]
+    recovering: bool = False
+
+
+class _RecoveredCommandFailure(Exception):
+    """An ordinary recovered command failure already stored as a receipt."""
+
+    def __init__(self, error: Exception):
+        super().__init__(str(error))
+        self.error = error
 
 
 class CommandQueue:
@@ -49,6 +59,8 @@ class CommandQueue:
         self._inflight: dict[
             tuple[str, str], tuple[AgentCommand, asyncio.Future[Any]]
         ] = {}
+        self._recovery_commands: dict[asyncio.Future[Any], AgentCommand] = {}
+        self.recovery_failures: list[tuple[AgentCommand, Exception]] = []
         self._closed = False
 
     def _start_worker(self) -> None:
@@ -84,10 +96,16 @@ class CommandQueue:
                     continue
                 future: asyncio.Future[Any] = loop.create_future()
                 self._inflight[key] = (command, future)
+                self._recovery_commands[future] = command
                 futures.append(future)
                 assert self.recovery_factory is not None
                 await self._queue.put(
-                    _QueuedCommand(command, self.recovery_factory(command), future)
+                    _QueuedCommand(
+                        command,
+                        self.recovery_factory(command),
+                        future,
+                        recovering=True,
+                    )
                 )
             self._recovered = True
             if pending:
@@ -99,7 +117,27 @@ class CommandQueue:
 
         futures = await self._ensure_recovered()
         if futures:
-            await asyncio.gather(*(asyncio.shield(future) for future in futures))
+            results = await asyncio.gather(
+                *(asyncio.shield(future) for future in futures),
+                return_exceptions=True,
+            )
+            for future, result in zip(futures, results, strict=True):
+                if not isinstance(result, BaseException):
+                    continue
+                if isinstance(result, _RecoveredCommandFailure):
+                    command = self._recovery_commands.get(future)
+                    if command is None:
+                        raise CommandError("recovered command binding was lost")
+                    self.recovery_failures.append((command, result.error))
+                    continue
+                if isinstance(
+                    result,
+                    (asyncio.CancelledError, KeyboardInterrupt, SystemExit),
+                ):
+                    raise result
+                if isinstance(result, sqlite3.DatabaseError):
+                    raise result
+                raise result
 
     async def submit(self, command: AgentCommand, execute: CommandExecutor) -> Any:
         if self._closed:
@@ -158,7 +196,10 @@ class CommandQueue:
                                 self.log.forget, command.method, command.request_id
                             )
                     if not future.done():
-                        future.set_exception(exc)
+                        if item.recovering and isinstance(exc, Exception):
+                            future.set_exception(_RecoveredCommandFailure(exc))
+                        else:
+                            future.set_exception(exc)
                 else:
                     async with self._commit_lock:
                         state = (

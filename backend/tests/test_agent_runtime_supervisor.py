@@ -5247,6 +5247,139 @@ class DaemonProcessTests(unittest.TestCase):
             self.assertFalse(paths.socket_path.exists())
             self.assertFalse(paths.pid_path.exists())
 
+    def test_daemon_subprocess_restart_replays_spawn_steer_replace_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            worktree = root / "worktree"
+            worktree.mkdir()
+            repo_root = Path(__file__).resolve().parents[2]
+            processes: list[subprocess.Popen[str]] = []
+
+            def start_daemon() -> subprocess.Popen[str]:
+                process = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-m",
+                        "backend.app.agent_runtime.daemon",
+                        "--runtime-dir",
+                        str(paths.runtime_dir),
+                        "--socket",
+                        str(paths.socket_path),
+                        "--registry",
+                        str(paths.registry_path),
+                        "--fake-fixture-dir",
+                        str(FIXTURES),
+                    ],
+                    cwd=repo_root,
+                    env={
+                        **os.environ,
+                        "TMUX": "",
+                        "WIKI_AGENT_ARCHIVE_DIR": str(paths.archive_dir),
+                        "WIKI_AGENT_STATUS_DIR": str(paths.status_dir),
+                    },
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                processes.append(process)
+                client = SupervisorClient(paths, timeout=5)
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline:
+                    try:
+                        if client.ping().get("status") == "ok":
+                            return process
+                    except SupervisorUnavailable:
+                        time.sleep(0.05)
+                stderr = process.stderr.read() if process.stderr else ""
+                self.fail(f"daemon did not restart: {stderr}")
+
+            def stop_daemon(process: subprocess.Popen[str]) -> None:
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=8)
+                if process.stderr:
+                    process.stderr.close()
+
+            client = SupervisorClient(paths, timeout=5)
+            process = start_daemon()
+            try:
+                start_params = {
+                    "agent_id": "WIKI-219-SUBPROCESS",
+                    "provider": "codex",
+                    "role": "implement",
+                    "model": "fixture-codex",
+                    "effort": "high",
+                    "worktree": str(worktree),
+                    "prompt": "subprocess restart spawn",
+                    "request_id": "subprocess-spawn",
+                }
+                started = client.request("run/start", start_params)
+                start_run_id = started["run_id"]
+                stop_daemon(process)
+                process = start_daemon()
+                replayed_start = client.request("run/start", start_params)
+                self.assertEqual(replayed_start["run_id"], start_run_id)
+
+                steer_params = {
+                    "agent_id": "WIKI-219-SUBPROCESS",
+                    "run_id": start_run_id,
+                    "text": "subprocess restart steer",
+                    "request_id": "subprocess-steer",
+                }
+                steered = client.request("run/send_now", steer_params)
+                stop_daemon(process)
+                process = start_daemon()
+                replayed_steer = client.request("run/send_now", steer_params)
+                self.assertEqual(replayed_steer, steered)
+
+                replace_params = {
+                    "agent_id": "WIKI-219-SUBPROCESS",
+                    "run_id": start_run_id,
+                    "prompt": "subprocess restart replace",
+                    "request_id": "subprocess-replace",
+                }
+                replaced = client.request("run/replace", replace_params)
+                replacement_run_id = replaced["run_id"]
+                self.assertNotEqual(replacement_run_id, start_run_id)
+                stop_daemon(process)
+                process = start_daemon()
+                replayed_replace = client.request("run/replace", replace_params)
+                self.assertEqual(replayed_replace["run_id"], replacement_run_id)
+
+                archive_params = {
+                    "agent_id": "WIKI-219-SUBPROCESS",
+                    "run_id": replacement_run_id,
+                    "outcome": "subprocess-test",
+                    "request_id": "subprocess-archive",
+                }
+                archived = client.request("run/archive", archive_params)
+                stop_daemon(process)
+                process = start_daemon()
+                replayed_archive = client.request("run/archive", archive_params)
+                self.assertEqual(replayed_archive["run_id"], archived["run_id"])
+                self.assertEqual(
+                    json.loads(paths.registry_path.read_text(encoding="utf-8")),
+                    {},
+                )
+
+                log = RunStore(paths).command_log
+                for method, request_id in (
+                    ("run/start", "subprocess-spawn"),
+                    ("run/send_now", "subprocess-steer"),
+                    ("run/replace", "subprocess-replace"),
+                    ("run/archive", "subprocess-archive"),
+                ):
+                    receipt = log.receipt(method, request_id)
+                    self.assertIsNotNone(receipt)
+                    assert receipt is not None
+                    self.assertTrue(receipt.ok)
+            finally:
+                stop_daemon(process)
+                for item in processes:
+                    self.assertIsNotNone(item.poll())
+
     def test_fingerprint_swap_replaces_live_runs_under_fresh_daemon(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

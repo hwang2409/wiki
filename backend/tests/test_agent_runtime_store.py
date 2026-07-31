@@ -15,6 +15,7 @@ from backend.app import transcripts
 from backend.app.agent_runtime import store as store_module
 from backend.app.agent_runtime.fake import WireFixture
 from backend.app.agent_runtime.normalizer import normalize_provider_event
+from backend.app.agent_runtime.process import ProviderProcessStatus
 from backend.app.agent_runtime.provider import AdapterStatus
 from backend.app.agent_runtime.store import (
     RunStore,
@@ -1737,6 +1738,54 @@ class RunStoreTests(unittest.TestCase):
 
             self.assertEqual(restarted.get(record.run_id).run_id, record.run_id)
 
+    def test_restart_discovers_unrecorded_provider_by_run_identity(self) -> None:
+        for provider in (ProviderKind.CODEX, ProviderKind.CLAUDE):
+            with self.subTest(provider=provider.value), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                paths = _paths(root)
+                store = RunStore(paths)
+                record = _record(root)
+                record.provider = provider
+                record.start_transaction = {"version": 1}
+                store.create(record)
+                store._write_record(record)  # noqa: SLF001 - crash fixture
+                identity = ProviderProcessStatus(
+                    pid=4242,
+                    parent_pid=1,
+                    created_at=1.0,
+                    process_group_id=4242,
+                    executable="/bin/provider",
+                )
+
+                with (
+                    mock.patch.object(
+                        store_module,
+                        "provider_processes_for_run_sync",
+                        return_value=[identity],
+                    ),
+                    mock.patch.object(
+                        store_module,
+                        "provider_process_group_members_sync",
+                        return_value=[
+                            {
+                                "pid": 4242,
+                                "created_at": 1.0,
+                                "executable": "/bin/provider",
+                            }
+                        ],
+                    ),
+                    mock.patch.object(store_module.os, "kill"),
+                    mock.patch.object(
+                        store_module,
+                        "terminate_verified_provider_group",
+                        return_value=True,
+                    ) as terminate,
+                ):
+                    restarted = RunStore(paths)
+
+                self.assertEqual(restarted.list_runs(), [])
+                terminate.assert_called_once()
+
     def test_archive_current_writes_snapshot_and_removes_runtime_entry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1882,6 +1931,47 @@ class RunStoreTests(unittest.TestCase):
                 self.assertIsNotNone(archived)
                 self.assertFalse(store.run_dir(record.run_id).exists())
                 self.assertIsNone(store.current_run_id(record.agent_id))
+
+    def test_archive_recovery_repairs_implicit_index_before_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            record = _record(root)
+            record.start_request_id = "implicit-archive-retry"
+            record.implicit_start_request = True
+            store.create(record)
+            store.transition(record.run_id, LifecycleState.COMPLETED)
+
+            with (
+                mock.patch.object(
+                    store.command_log,
+                    "archive_start_request",
+                    side_effect=OSError("crash before archive index"),
+                ),
+                self.assertRaises(OSError),
+            ):
+                store.archive_current(record.run_id, outcome="merged")
+
+            restarted = RunStore(paths)
+            archived = restarted.finalize_archived_run(record.run_id)
+
+            self.assertIsNotNone(archived)
+            indexed = restarted.command_log.archived_start_request(
+                record.start_request_id
+            )
+            self.assertIsNotNone(indexed)
+            assert indexed is not None
+            self.assertEqual(indexed["run_id"], record.run_id)
+
+            fresh = _record(root)
+            fresh.start_request_id = record.start_request_id
+            fresh.implicit_start_request = True
+            restarted.create(fresh)
+            self.assertEqual(restarted.current_run_id(record.agent_id), fresh.run_id)
+            with self.assertRaisesRegex(StoreConflict, "older archive marker"):
+                restarted.finalize_archived_run(record.run_id)
+            self.assertEqual(restarted.current_run_id(record.agent_id), fresh.run_id)
 
     def test_reconcile_prunes_headless_registry_rows_missing_run_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

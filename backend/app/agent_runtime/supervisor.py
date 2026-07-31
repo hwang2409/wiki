@@ -3416,6 +3416,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         effect_payload,
                     ),
                     _public_run(archived),
+                    command_hash=command_hash,
                 )
             self._forget_implicit_idempotency_for_run(run_id)
             self._clear_adapter_loss(run_id)
@@ -3457,6 +3458,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     effect_payload,
                 ),
                 _public_run(archived),
+                command_hash=command_hash,
             )
         self._forget_implicit_idempotency_for_run(run_id)
         self._clear_adapter_loss(run_id)
@@ -4198,7 +4200,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 raise ValueError("outcome must be a string or null")
             request_id = params.get("request_id")
             if isinstance(request_id, str):
-                effect = self.store.command_log.effect_result(method, request_id)
+                effect = self.store.command_log.effect_result(
+                    method,
+                    request_id,
+                    agent_id=str(params["agent_id"]),
+                    command_hash=command_hash,
+                )
                 if isinstance(effect, dict):
                     return effect
             run_id = self._resolve_run_id(params)
@@ -4222,14 +4229,23 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             provider = params.get("provider")
             replacement_run_id = params.get("replacement_run_id")
             if isinstance(replacement_run_id, str):
+                effect = (
+                    self.store.command_log.replace_effect(
+                        method,
+                        str(params["request_id"]),
+                        agent_id=str(params["agent_id"]),
+                        command_hash=command_hash,
+                    )
+                    if isinstance(params.get("request_id"), str)
+                    else None
+                )
+                if effect is not None and effect["status"] == "completed":
+                    saved = effect.get("result")
+                    if isinstance(saved, dict):
+                        return saved
                 current_id = self.store.current_run_id(str(params["agent_id"]))
                 if current_id == replacement_run_id:
                     current = self.store.get(current_id)
-                    effect = (
-                        self.store.command_log.replace_effect(method, str(params["request_id"]))
-                        if isinstance(params.get("request_id"), str)
-                        else None
-                    )
                     if (
                         current.replaces_run_id == params.get("run_id")
                         and effect is not None
@@ -4286,8 +4302,18 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         and effect is not None
                         and effect["status"] == "provider_started"
                     ):
-                        raise StoreConflict(
-                            "replacement provider effect is uncertain; run retained for inspection"
+                        self.store.abort_replace(
+                            str(params["run_id"]),
+                            replacement_run_id,
+                            reason="recovered before provider replacement effect",
+                            adapter_status=AdapterStatus(
+                                state=LifecycleState.BLOCKED,
+                                session_id=None,
+                                pid=None,
+                                generation=current.provider_generation,
+                                active_turn_id=None,
+                                transcript_path=current.transcript_path,
+                            ),
                         )
             return _public_run(
                 await self.replace(
