@@ -4040,5 +4040,92 @@ class Review32CanonicalEncodingTests(unittest.TestCase):
         self.assertIn(b"\x16\x00\x10\x00\x01\x00\x00\x00", result.data)
 
 
+class Review33VuiSarTests(unittest.TestCase):
+    @staticmethod
+    def _remove_inner_box(real: bytes, box_type: bytes) -> bytes:
+        box_pos = real.find(box_type)
+        assert box_pos > 0
+        box_start = box_pos - 4
+        box_size = struct.unpack(">I", real[box_start:box_pos])[0]
+        payload = bytearray(real)
+        del payload[box_start:box_start + box_size]
+        for parent_type in (b"avc1", b"stsd", b"stbl", b"minf", b"mdia", b"trak", b"moov"):
+            parent_pos = payload.rfind(parent_type, 0, box_start)
+            assert parent_pos > 0
+            parent_size = struct.unpack(">I", payload[parent_pos - 4:parent_pos])[0]
+            payload[parent_pos - 4:parent_pos] = struct.pack(
+                ">I", parent_size - box_size,
+            )
+        stco_pos = payload.find(b"stco")
+        assert stco_pos > 0
+        entry_count = struct.unpack(">I", payload[stco_pos + 8:stco_pos + 12])[0]
+        for index in range(entry_count):
+            value_pos = stco_pos + 12 + index * 4
+            value = struct.unpack(">I", payload[value_pos:value_pos + 4])[0]
+            payload[value_pos:value_pos + 4] = struct.pack(">I", value - box_size)
+        return bytes(payload)
+
+    @classmethod
+    def _vui_sar_mp4(cls) -> bytes:
+        if FFMPEG is None:
+            raise unittest.SkipTest("ffmpeg not installed")
+        source = Path(tempfile.mkdtemp(prefix="wiki33-vui-sar-")) / "source.mp4"
+        generated = subprocess.run(
+            [
+                FFMPEG, "-v", "error", "-y", "-i", str(REAL_MP4),
+                "-vf", "setsar=2/1", "-an", "-c:v", "libx264",
+                "-movflags", "+faststart", str(source),
+            ],
+            capture_output=True,
+            timeout=30,
+        )
+        if generated.returncode != 0:
+            raise AssertionError(generated.stderr.decode(errors="replace"))
+        real = source.read_bytes()
+        assert b"pasp" in real
+        return real
+
+    @unittest.skipIf(FFMPEG is None, "ffmpeg not installed")
+    def test_vui_sar_without_pasp_updates_display_dimensions(self) -> None:
+        payload = bytearray(self._remove_inner_box(self._vui_sar_mp4(), b"pasp"))
+        tkhd_pos = payload.find(b"tkhd")
+        self.assertGreater(tkhd_pos, 0)
+        payload[tkhd_pos + 4 + 76:tkhd_pos + 4 + 84] = struct.pack(
+            ">II", 160 << 16, 120 << 16,
+        )
+        result = media_scrub.scrub_video(bytes(payload), "video/mp4")
+        self.assertEqual((result.width, result.height), (320, 120))
+        if FFPROBE is not None:
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as handle:
+                handle.write(result.data)
+                path = handle.name
+            try:
+                probe = subprocess.run(
+                    [
+                        FFPROBE, "-v", "error", "-select_streams", "v:0",
+                        "-show_entries", "stream=sample_aspect_ratio,display_aspect_ratio",
+                        "-of", "default=nw=1", path,
+                    ],
+                    capture_output=True,
+                    timeout=30,
+                )
+                self.assertEqual(probe.returncode, 0, probe.stderr.decode(errors="replace"))
+                self.assertIn(b"sample_aspect_ratio=2:1", probe.stdout)
+                self.assertIn(b"display_aspect_ratio=8:3", probe.stdout)
+            finally:
+                Path(path).unlink(missing_ok=True)
+
+    @unittest.skipIf(FFMPEG is None, "ffmpeg not installed")
+    def test_pasp_and_vui_sar_conflict_is_rejected(self) -> None:
+        payload = bytearray(self._vui_sar_mp4())
+        pasp_pos = payload.find(b"pasp")
+        self.assertGreater(pasp_pos, 0)
+        payload[pasp_pos + 4:pasp_pos + 12] = struct.pack(">II", 1, 1)
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "pasp and SPS VUI SAR values do not agree"
+        ):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+
 if __name__ == "__main__":
     unittest.main()

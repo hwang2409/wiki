@@ -19,6 +19,8 @@ Scope choices:
 """
 from __future__ import annotations
 
+import math
+
 from .base import MediaScrubError
 
 
@@ -29,6 +31,24 @@ _H264_MAX_DPB_MBS = {
     21: 4752, 22: 8100, 30: 8100, 31: 18000, 32: 20480,
     40: 32768, 41: 32768, 42: 34816, 50: 110400, 51: 184320,
     52: 184320, 60: 696960, 61: 983040, 62: 2073600,
+}
+_H264_ASPECT_RATIOS = {
+    1: (1, 1),
+    2: (12, 11),
+    3: (10, 11),
+    4: (16, 11),
+    5: (40, 33),
+    6: (24, 11),
+    7: (20, 11),
+    8: (32, 11),
+    9: (80, 33),
+    10: (18, 11),
+    11: (15, 11),
+    12: (64, 33),
+    13: (160, 99),
+    14: (4, 3),
+    15: (3, 2),
+    16: (2, 1),
 }
 
 
@@ -248,15 +268,32 @@ def _copy_hrd_parameters(reader: _BitReader, writer: _BitWriter) -> None:
 
 def _copy_vui_parameters(
     reader: _BitReader, writer: _BitWriter, max_dpb_frames: int,
-) -> None:
+) -> tuple[int, int] | None:
     aspect_ratio_info_present_flag = reader.read_u1()
     writer.write_u1(aspect_ratio_info_present_flag)
+    sar: tuple[int, int] | None = None
     if aspect_ratio_info_present_flag:
         aspect_ratio_idc = reader.read_bits(8)
+        if aspect_ratio_idc == 0:
+            sar = None
+        elif aspect_ratio_idc == 255:
+            sar_width = reader.read_bits(16)
+            sar_height = reader.read_bits(16)
+            if sar_width == 0 or sar_height == 0:
+                raise MediaScrubError("h264 VUI extended SAR must be positive")
+            divisor = math.gcd(sar_width, sar_height)
+            sar = (sar_width // divisor, sar_height // divisor)
+        else:
+            sar = _H264_ASPECT_RATIOS.get(aspect_ratio_idc)
+            if sar is None:
+                raise MediaScrubError(
+                    f"h264 VUI aspect_ratio_idc {aspect_ratio_idc} is unsupported"
+                )
         writer.write_bits(aspect_ratio_idc, 8)
-        if aspect_ratio_idc == 255:  # Extended_SAR
-            writer.write_bits(reader.read_bits(16), 16)  # sar_width
-            writer.write_bits(reader.read_bits(16), 16)  # sar_height
+        if aspect_ratio_idc == 255:
+            assert sar is not None
+            writer.write_bits(sar[0], 16)
+            writer.write_bits(sar[1], 16)
 
     overscan_info_present_flag = reader.read_u1()
     writer.write_u1(overscan_info_present_flag)
@@ -320,9 +357,12 @@ def _copy_vui_parameters(
             raise MediaScrubError("h264 VUI decoded-picture-buffer limits are invalid")
         writer.write_ue(max_num_reorder_frames)
         writer.write_ue(max_dec_frame_buffering)
+    return sar
 
 
-def _parse_and_emit_sps_rbsp(rbsp: bytes) -> tuple[bytes, int, tuple[int, int]]:
+def _parse_and_emit_sps_rbsp(
+    rbsp: bytes,
+) -> tuple[bytes, int, tuple[int, int], tuple[int, int] | None]:
     reader = _BitReader(rbsp)
     writer = _BitWriter()
 
@@ -457,18 +497,19 @@ def _parse_and_emit_sps_rbsp(rbsp: bytes) -> tuple[bytes, int, tuple[int, int]]:
 
     vui_present = reader.read_u1()
     writer.write_u1(vui_present)
+    vui_sar: tuple[int, int] | None = None
     if vui_present:
-        _copy_vui_parameters(reader, writer, max_dpb_frames)
+        vui_sar = _copy_vui_parameters(reader, writer, max_dpb_frames)
 
     reader.read_rbsp_trailing_bits()
     writer.write_rbsp_trailing_bits()
-    return writer.to_bytes(), sps_id, (display_width, display_height)
+    return writer.to_bytes(), sps_id, (display_width, display_height), vui_sar
 
 
 def canonicalise_sps_with_dimensions(
     nal_bytes: bytes,
-) -> tuple[bytes, int, tuple[int, int]]:
-    """Canonicalise an SPS and return its identifier and display dimensions."""
+) -> tuple[bytes, int, tuple[int, int], tuple[int, int] | None]:
+    """Canonicalise an SPS and return dimensions plus its VUI SAR."""
     if len(nal_bytes) < 1:
         raise MediaScrubError("h264 NAL too short for header")
     header = nal_bytes[0]
@@ -477,12 +518,13 @@ def canonicalise_sps_with_dimensions(
     rbsp = _rbsp_unescape(nal_bytes[1:])
     if not rbsp:
         raise MediaScrubError("h264 SPS RBSP is empty after unescape")
-    new_rbsp, sps_id, dimensions = _parse_and_emit_sps_rbsp(rbsp)
+    new_rbsp, sps_id, dimensions, vui_sar = _parse_and_emit_sps_rbsp(rbsp)
     nal_ref_idc = (header >> 5) & 0x3
     return (
         bytes([(nal_ref_idc << 5) | 7]) + _rbsp_escape(new_rbsp),
         sps_id,
         dimensions,
+        vui_sar,
     )
 
 
@@ -584,7 +626,7 @@ def canonicalise_nal_with_ids(
         raise MediaScrubError("h264 RBSP is empty after unescape")
 
     if expected_nal_type == 7:
-        new_rbsp, sps_id, _dimensions = _parse_and_emit_sps_rbsp(rbsp)
+        new_rbsp, sps_id, _dimensions, _vui_sar = _parse_and_emit_sps_rbsp(rbsp)
         return (
             bytes([(nal_ref_idc << 5) | nal_type]) + _rbsp_escape(new_rbsp),
             sps_id,

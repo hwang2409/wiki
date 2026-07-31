@@ -153,6 +153,7 @@ _MP4_ROTATION_SWAP_MATRICES: Final = frozenset({
     (0, -0x00010000, 0, 0x00010000, 0, 0, 0, 0, 0x40000000),
 })
 _Mp4TrackDimensions = tuple[int, int, bool]
+_Mp4Sar = tuple[int, int]
 
 
 def _canonical_matrix(box_type: bytes, matrix: bytes) -> bytes:
@@ -224,7 +225,7 @@ def scrub_mp4(data: bytes) -> MediaScrubResult:
                 raise MediaScrubError("mp4 duplicate moov box")
             moov_seen = True
             moov_body = data[atom.body_start:atom.body_end]
-            dims = _tkhd_dims_from_moov(moov_body)
+            dims = _display_dims_from_moov(data, atom)
             rebuilt_body, tr, mv, st, video = _rebuild_moov(
                 data, atom.body_start, atom.body_end,
             )
@@ -623,7 +624,7 @@ def _sample_description_configs(
                 f"{entry_type.decode('ascii', 'replace')} sample entry; "
                 "outside scrubber scope"
             )
-        config, _dimensions = _parse_avc_sample_config_from_entry(entry)
+        config, _dimensions, _vui_sar = _parse_avc_sample_config_from_entry(entry)
         entries.append(config)
         offset += entry_size
     return entries
@@ -631,7 +632,7 @@ def _sample_description_configs(
 
 def _parse_avc_sample_config_from_entry(
     entry: bytes,
-) -> tuple[tuple[int, set[int], bool], tuple[int, int]]:
+) -> tuple[tuple[int, set[int], bool], tuple[int, int], _Mp4Sar | None]:
     avcc_body: bytes | None = None
     seen: set[bytes] = set()
     for box_type, box_body in _iter_sample_entry_inner_boxes(entry, 16 + 70):
@@ -644,19 +645,19 @@ def _parse_avc_sample_config_from_entry(
             avcc_body = box_body
     if avcc_body is None:
         raise MediaScrubError("mp4 avc1 sample entry requires exactly one avcC")
-    config, dimensions = _parse_avc_sample_config(avcc_body, True)
+    config, dimensions, vui_sar = _parse_avc_sample_config(avcc_body, True)
     entry_width = struct.unpack(">H", entry[32:34])[0]
     entry_height = struct.unpack(">H", entry[34:36])[0]
     if dimensions != (entry_width, entry_height):
         raise MediaScrubError(
             "mp4 avc1 sample entry dimensions do not match SPS dimensions"
         )
-    return config, dimensions
+    return config, dimensions, vui_sar
 
 
 def _parse_avc_sample_config(
     body: bytes, require_parameter_sets: bool,
-) -> tuple[tuple[int, set[int], bool], tuple[int, int]]:
+) -> tuple[tuple[int, set[int], bool], tuple[int, int], _Mp4Sar | None]:
     if len(body) < 7 or body[0] != 1:
         raise MediaScrubError("mp4 avcC sample configuration header is invalid")
     length_size_minus_one = body[4] & 0x03
@@ -666,6 +667,7 @@ def _parse_avc_sample_config(
     offset = 6
     sps_ids: set[int] = set()
     sps_dimensions: tuple[int, int] | None = None
+    sps_vui_sar: _Mp4Sar | None = None
     for _ in range(num_sps):
         if offset + 2 > len(body):
             raise MediaScrubError("mp4 avcC SPS length field truncated")
@@ -673,12 +675,15 @@ def _parse_avc_sample_config(
         offset += 2
         if offset + size > len(body):
             raise MediaScrubError("mp4 avcC SPS extends past body")
-        _canonical, sps_id, dimensions = canonicalise_sps_with_dimensions(
+        _canonical, sps_id, dimensions, vui_sar = canonicalise_sps_with_dimensions(
             body[offset:offset + size],
         )
         if sps_dimensions is not None and dimensions != sps_dimensions:
             raise MediaScrubError("mp4 avcC SPS dimensions do not agree")
+        if sps_dimensions is not None and vui_sar != sps_vui_sar:
+            raise MediaScrubError("mp4 avcC SPS VUI SAR values do not agree")
         sps_dimensions = dimensions
+        sps_vui_sar = vui_sar
         sps_ids.add(sps_id)
         offset += size
     if offset >= len(body):
@@ -709,6 +714,7 @@ def _parse_avc_sample_config(
     return (
         (length_size_minus_one + 1, pps_ids, require_parameter_sets),
         sps_dimensions,
+        sps_vui_sar,
     )
 
 
@@ -2062,6 +2068,47 @@ def _rebuild_stsd(
 # fields and walk inner boxes, allowlisting known codec-config types.
 # Anything outside the allowlist rejects the file.
 
+
+def _validate_avc_dimensions(
+    sps_dimensions: tuple[int, int],
+    pasp_ratio: _Mp4Sar | None,
+    vui_sar: _Mp4Sar | None,
+    track_dimensions: _Mp4TrackDimensions,
+) -> tuple[int, int]:
+    """Validate tkhd and return post-matrix display dimensions.
+
+    Coded dimensions come from the SPS and sample entry. The effective SAR
+    comes from pasp, or VUI when pasp is absent. Both sources must agree.
+    With pasp, tkhd stores presentation dimensions. With VUI-only SAR, tkhd
+    stores coded dimensions and the SAR changes only the reported display
+    width. Rotation swaps only the reported display dimensions.
+    """
+    if pasp_ratio is not None and vui_sar is not None and pasp_ratio != vui_sar:
+        raise MediaScrubError("mp4 pasp and SPS VUI SAR values do not agree")
+    effective_sar = pasp_ratio or vui_sar or (1, 1)
+    h_spacing, v_spacing = effective_sar
+    coded_width, coded_height = sps_dimensions
+    tkhd_width, tkhd_height, matrix_swaps_display = track_dimensions
+    if pasp_ratio is None:
+        valid_tkhd = tkhd_width == coded_width and tkhd_height == coded_height
+    else:
+        valid_tkhd = (
+            tkhd_width * v_spacing == coded_width * h_spacing
+            and tkhd_height == coded_height
+        )
+    if not valid_tkhd:
+        raise MediaScrubError(
+            "mp4 avc1 presentation dimensions do not match tkhd after SAR"
+        )
+    display_width_numerator = coded_width * h_spacing
+    if display_width_numerator % v_spacing:
+        raise MediaScrubError("mp4 effective SAR does not produce integer display width")
+    display_width = display_width_numerator // v_spacing
+    display_height = coded_height
+    if matrix_swaps_display:
+        return display_height, display_width
+    return display_width, display_height
+
 def _rebuild_sample_entry(
     entry_type: bytes,
     entry_bytes: bytes,
@@ -2089,7 +2136,7 @@ def _rebuild_sample_entry(
 
     if entry_type == b"avc1":
         pasp_ratio = _sample_entry_pasp_ratio(entry_bytes)
-        _config, sps_dimensions = _parse_avc_sample_config_from_entry(entry_bytes)
+        _config, sps_dimensions, vui_sar = _parse_avc_sample_config_from_entry(entry_bytes)
         sample_dimensions = (
             struct.unpack(">H", entry_bytes[32:34])[0],
             struct.unpack(">H", entry_bytes[34:36])[0],
@@ -2102,23 +2149,9 @@ def _rebuild_sample_entry(
             raise MediaScrubError(
                 "mp4 avc1 SPS dimensions do not match tkhd track dimensions"
             )
-        # Dimension model:
-        #   - coded dimensions come from the SPS and sample entry;
-        #   - presentation dimensions are coded dimensions adjusted by the
-        #     validated pasp ratio using exact integer cross-products;
-        #   - tkhd width and height store those pre-matrix presentation
-        #     dimensions. The matrix never changes what tkhd stores;
-        #   - the 90/270 matrix swap applies only to artifact dimensions
-        #     reported to the frontend after validation.
-        tkhd_width, tkhd_height, _matrix_swaps_display = track_dimensions
-        h_spacing, v_spacing = pasp_ratio or (1, 1)
-        if not (
-            tkhd_width * v_spacing == sps_dimensions[0] * h_spacing
-            and tkhd_height == sps_dimensions[1]
-        ):
-            raise MediaScrubError(
-                "mp4 avc1 presentation dimensions do not match tkhd after pasp"
-            )
+        _validate_avc_dimensions(
+            sps_dimensions, pasp_ratio, vui_sar, track_dimensions,
+        )
 
     inner_payload, inner_types = _walk_sample_entry_inner_boxes(
         entry_bytes,
@@ -2680,59 +2713,51 @@ def _validated_movie_duration(data: bytes, moov: _Mp4Atom) -> int:
     return validated_duration
 
 
-def _tkhd_dims_from_moov(moov_payload: bytes) -> tuple[int, int] | None:
-    view = memoryview(moov_payload)
-    offset = 0
-    end = len(moov_payload)
-    while offset < end:
-        try:
-            _size, atom_type, header_len, atom_end = _read_header(view, offset, end)
-        except MediaScrubError:
-            return None
-        if atom_type == b"trak":
-            dims = _tkhd_dims_from_trak(
-                view, offset + header_len, atom_end, moov_payload,
-            )
-            if dims is not None:
-                return dims
-        offset = atom_end
-    return None
-
-
-def _tkhd_dims_from_trak(
-    view: memoryview,
-    payload_start: int,
-    trak_end: int,
-    source: bytes,
+def _display_dims_from_moov(
+    data: bytes, moov: _Mp4Atom,
 ) -> tuple[int, int] | None:
-    offset = payload_start
-    while offset < trak_end:
-        try:
-            _size, atom_type, header_len, atom_end = _read_header(view, offset, trak_end)
-        except MediaScrubError:
-            return None
-        if atom_type != b"tkhd":
-            offset = atom_end
+    """Return validated display dimensions for the first video track."""
+    moov_children = _parse_container(data, moov.body_start, moov.body_end)
+    for trak in (atom for atom in moov_children if atom.type == b"trak"):
+        trak_children = _parse_container(data, trak.body_start, trak.body_end)
+        tkhd_atoms = [atom for atom in trak_children if atom.type == b"tkhd"]
+        mdia_atoms = [atom for atom in trak_children if atom.type == b"mdia"]
+        if len(tkhd_atoms) != 1 or len(mdia_atoms) != 1:
             continue
-        payload_at = offset + header_len
-        if payload_at + 1 > atom_end:
+        mdia_children = _parse_container(
+            data, mdia_atoms[0].body_start, mdia_atoms[0].body_end,
+        )
+        hdlr_atoms = [atom for atom in mdia_children if atom.type == b"hdlr"]
+        minf_atoms = [atom for atom in mdia_children if atom.type == b"minf"]
+        if len(hdlr_atoms) != 1 or len(minf_atoms) != 1:
+            continue
+        if _handler_type(data, hdlr_atoms[0]) != b"vide":
+            continue
+        minf_children = _parse_container(
+            data, minf_atoms[0].body_start, minf_atoms[0].body_end,
+        )
+        stbl_atoms = [atom for atom in minf_children if atom.type == b"stbl"]
+        if len(stbl_atoms) != 1:
+            continue
+        stbl_children = _parse_container(
+            data, stbl_atoms[0].body_start, stbl_atoms[0].body_end,
+        )
+        stsd_atoms = [atom for atom in stbl_children if atom.type == b"stsd"]
+        if len(stsd_atoms) != 1:
+            continue
+        body = data[stsd_atoms[0].body_start:stsd_atoms[0].body_end]
+        if len(body) < 16:
+            continue
+        entry_size = struct.unpack(">I", body[8:12])[0]
+        if entry_size < 8 or 8 + entry_size > len(body):
+            continue
+        entry = body[8:8 + entry_size]
+        _config, sps_dimensions, vui_sar = _parse_avc_sample_config_from_entry(entry)
+        pasp_ratio = _sample_entry_pasp_ratio(entry)
+        track_dimensions = _tkhd_dimensions_from_atom(data, tkhd_atoms[0])
+        if track_dimensions is None:
             return None
-        version = source[payload_at]
-        pre_matrix = 4 + (28 if version == 0 else 40) + 2 + 2 + 2 + 2
-        matrix = 36
-        dims_at = payload_at + pre_matrix + matrix
-        if dims_at + 8 > atom_end:
-            return None
-        matrix_at = payload_at + pre_matrix
-        if matrix_at + matrix > atom_end:
-            return None
-        matrix_values = struct.unpack(">9i", source[matrix_at:matrix_at + matrix])
-        width_fixed, height_fixed = struct.unpack(">II", source[dims_at:dims_at + 8])
-        width = width_fixed >> 16
-        height = height_fixed >> 16
-        if width > 0 and height > 0:
-            if matrix_values in _MP4_ROTATION_SWAP_MATRICES:
-                return height, width
-            return width, height
-        return None
+        return _validate_avc_dimensions(
+            sps_dimensions, pasp_ratio, vui_sar, track_dimensions,
+        )
     return None
