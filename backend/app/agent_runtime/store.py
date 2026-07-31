@@ -1189,6 +1189,8 @@ class RunStore:
                 if isinstance(legacy_orchestrators, dict)
                 else None
             )
+            # WIKI-219 owns durable snapshots and journal-before-side-effect
+            # recovery across supervisor exits; this PR keeps rollback in memory.
             self._start_registry_snapshots[record.run_id] = {
                 "agent_present": record.agent_id in registry,
                 "agent_entry": deepcopy(registry.get(record.agent_id)),

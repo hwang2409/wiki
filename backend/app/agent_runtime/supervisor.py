@@ -413,6 +413,7 @@ class Supervisor:
             tuple[str, str], tuple[str, Any]
         ] = OrderedDict()
         self.idempotency_tasks: dict[tuple[str, str], asyncio.Task[Any]] = {}
+        # WIKI-219 owns durable implicit-id receipts across supervisor restarts.
         self.implicit_idempotency_keys: set[tuple[str, str]] = set()
         self.implicit_idempotency_runs: dict[tuple[str, str], str] = {}
         self.idempotency_lock = asyncio.Lock()
