@@ -716,7 +716,7 @@ export function SpawnOrchestratorModal({
   onSpawn: (notice: OrchestratorSpawnNotice) => void;
 }) {
   const [id, setId] = useState("");
-  const [projectDir, setProjectDir] = useState("");
+  const [projectDir, setProjectDir] = useState(DEFAULT_WORKDIR);
   const [kind, setKind] = useState<SpawnWorkerKind>("cc");
   const [model, setModel] = useState("");
   const [effort, setEffort] = useState<SpawnWorkerEffort>("high");
@@ -1632,7 +1632,13 @@ export function AgentsView({
     if (deadRun) primary = "archive-dead";
     else if (canInterrupt) primary = "interrupt";
     else if (canResume) primary = "resume";
-    const menuItems: Array<{ key: string; label: string; run: () => void }> = [];
+    const menuItems: Array<{
+      key: string;
+      label: string;
+      disabled?: boolean;
+      title?: string;
+      run: () => void;
+    }> = [];
     if (canInterrupt && primary !== "interrupt") {
       menuItems.push({
         key: "interrupt",
@@ -1668,6 +1674,8 @@ export function AgentsView({
     menuItems.push({
       key: "replace",
       label: "Replace",
+      disabled: replaceDisabled,
+      title: replaceDisabled ? "Registered runtime is not live" : "Stop this run and spawn a replacement",
       run: () => {
         if (replaceDisabled) return;
         setReplaceNotice(null);
@@ -1756,8 +1764,10 @@ export function AgentsView({
                     {menuItems.map((item) => (
                       <button
                         className="agent-card-menu-item"
+                        disabled={item.disabled}
                         key={item.key}
                         role="menuitem"
+                        title={item.title}
                         type="button"
                         onClick={() => {
                           setOpenMenuTicket(null);
@@ -1840,7 +1850,13 @@ export function AgentsView({
     // Menu items = every applicable lifecycle action MINUS whichever action is
     // already surfaced as the card's primary button. Destructive actions
     // (Complete, Stop, Replace) always live in the menu.
-    const menuItems: Array<{ key: string; label: string; run: () => void }> = [];
+    const menuItems: Array<{
+      key: string;
+      label: string;
+      disabled?: boolean;
+      title?: string;
+      run: () => void;
+    }> = [];
     if (canInterrupt && primary !== "interrupt") {
       menuItems.push({
         key: "interrupt",
@@ -1876,6 +1892,8 @@ export function AgentsView({
     menuItems.push({
       key: "replace",
       label: "Replace",
+      disabled: replaceDisabled,
+      title: replaceDisabled ? "Registered runtime is not live" : "Stop this run and spawn a replacement",
       run: () => {
         if (replaceDisabled) return;
         setReplaceNotice(null);
@@ -2041,8 +2059,10 @@ export function AgentsView({
                     {menuItems.map((item) => (
                       <button
                         className="agent-card-menu-item"
+                        disabled={item.disabled}
                         key={item.key}
                         role="menuitem"
+                        title={item.title}
                         type="button"
                         onClick={() => {
                           setOpenMenuTicket(null);

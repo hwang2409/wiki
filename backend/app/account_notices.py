@@ -87,23 +87,48 @@ def _optional_string_map(value: object) -> bool:
     return value is None or _all_string_to_string(value)
 
 
+def _optional_non_empty_string(value: object) -> bool:
+    return value is None or (isinstance(value, str) and bool(value))
+
+
+def _valid_common_fields(payload: dict, *, optional_fields: tuple[str, ...] = ()) -> bool:
+    """Validate fields shared by provider-health notices.
+
+    Older tmux events omit provider metadata, so those fields stay optional.
+    When present, every known field still needs its persisted scalar type.
+    """
+
+    if not isinstance(payload.get("ts"), str) or not payload["ts"]:
+        return False
+    for field in optional_fields:
+        if field in payload and not _optional_non_empty_string(payload[field]):
+            return False
+    if "exhausted" in payload and not isinstance(payload["exhausted"], bool):
+        return False
+    return True
+
+
 def _valid_notice(kind: str, payload: dict) -> bool:
     if kind == "codex_limit_no_eligible":
-        return (
+        return _valid_common_fields(payload, optional_fields=("provider", "failure", "credential_source")) and (
             _all_non_empty_strings(payload.get("tickets"))
             or (
                 # tickets may be [] when the emitter had no live workers yet.
                 isinstance(payload.get("tickets"), list)
                 and len(payload["tickets"]) == 0
             )
-        )
+        ) and ("reset_at" in payload and (payload["reset_at"] is None or _optional_non_empty_string(payload["reset_at"])))
     if kind == "codex_rotation_failed":
         error = payload.get("error")
-        return isinstance(error, str) and bool(error)
+        return _valid_common_fields(payload) and isinstance(error, str) and bool(error)
     if kind == "codex_rotation":
         revived = payload.get("revived")
         failed = payload.get("failed")
         to_value = payload.get("to")
+        if not _valid_common_fields(payload, optional_fields=("provider", "failure", "credential_source")):
+            return False
+        if not isinstance(payload.get("from"), str) or not payload["from"]:
+            return False
         if not isinstance(to_value, str) or not to_value:
             return False
         if not isinstance(revived, list) or not all(isinstance(t, str) and t for t in revived):
@@ -118,6 +143,8 @@ def _valid_notice(kind: str, payload: dict) -> bool:
     if kind == "codex_auth_dead_revival":
         revived = payload.get("revived")
         failed = payload.get("failed")
+        if not _valid_common_fields(payload, optional_fields=("provider", "failure", "credential_source")):
+            return False
         if not isinstance(revived, list) or not all(isinstance(t, str) and t for t in revived):
             return False
         if not isinstance(failed, list) or not all(isinstance(t, str) and t for t in failed):
@@ -128,14 +155,20 @@ def _valid_notice(kind: str, payload: dict) -> bool:
             return False
         return True
     if kind == "codex_auth_dead_exhausted":
+        if not _valid_common_fields(payload, optional_fields=("provider", "failure", "credential_source")):
+            return False
         if not _all_non_empty_strings(payload.get("tickets")):
             return False
         if not _optional_string_map(payload.get("run_ids")):
             return False
         return True
     if kind == "claude_limit_hit":
+        if not _valid_common_fields(payload, optional_fields=("provider",)):
+            return False
         ticket = payload.get("ticket")
         if not isinstance(ticket, str) or not ticket:
+            return False
+        if not isinstance(payload.get("window"), str):
             return False
         run_id = payload.get("run_id")
         if run_id is not None and (not isinstance(run_id, str) or not run_id):

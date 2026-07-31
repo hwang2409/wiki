@@ -453,6 +453,22 @@ test("worker card default hides role, model, and technical actions; menu reveals
   expect(view.getByRole("menuitem", { name: /Review PR/ })).toBeTruthy();
 });
 
+test("Replace stays disabled with a reason when a worker has no live runtime", async () => {
+  const legacyWorker = {
+    ...worker,
+    run_id: null,
+    window: null,
+    window_alive: false,
+  } as unknown as AgentWorker;
+  const view = renderView({ data: { ...data, workers: [legacyWorker] } });
+  fireEvent.click(view.getByRole("button", { name: /More actions for WIKI-1/ }));
+  await waitFor(() => {
+    const replace = view.getByRole("menuitem", { name: /^Replace$/ }) as HTMLButtonElement;
+    expect(replace.disabled).toBe(true);
+    expect(replace.title).toBe("Registered runtime is not live");
+  });
+});
+
 test("primary action tracks runtime_state, not the manual worker state", () => {
   // A Claude worker can keep the manual status file at state=working
   // while its adapter is idle. Keying Interrupt off state would send the
@@ -520,6 +536,30 @@ test("orchestrator row default hides kind/model/cwd; details disclosure reveals 
   });
 });
 
+test("orchestrator Replace stays disabled with a reason without a live runtime", async () => {
+  const orch = {
+    id: "wiki-legacy",
+    window: null,
+    window_alive: false,
+    run_id: null,
+    runtime_state: null,
+    control_attached: false,
+    kind: "cc",
+    model: "opus",
+    effort: null,
+    cwd: "/tmp/projects/legacy",
+  } as unknown as Orchestrator;
+  const view = renderView({
+    data: { workers: [], orchestrators: [orch], archived: [], error: null },
+  });
+  fireEvent.click(view.getByRole("button", { name: /More actions for wiki-legacy/ }));
+  await waitFor(() => {
+    const replace = view.getByRole("menuitem", { name: /^Replace$/ }) as HTMLButtonElement;
+    expect(replace.disabled).toBe(true);
+    expect(replace.title).toBe("Registered runtime is not live");
+  });
+});
+
 // Per-archive selection for a ticket with multiple archives is descoped
 // to WIKI-229 — the backend route currently wins on any live run and
 // consults a ticket-only transcript-path cache before the archived_at
@@ -579,6 +619,38 @@ test("spawn orchestrator dialog leads with name and goal; provider/model live un
   const providerSelect = view.getByLabelText("Provider") as HTMLSelectElement;
   const providerOptions = Array.from(providerSelect.options).map((o) => o.text);
   expect(providerOptions).toEqual(expect.arrayContaining(["Claude", "Codex"]));
+});
+
+test("spawn orchestrator default flow reaches confirmation without opening Advanced", async () => {
+  const onSpawn = vi.fn();
+  const view = render(
+    <SpawnOrchestratorModal
+      models={[
+        ...models,
+        {
+          id: "claude-sonnet",
+          label: "Claude Sonnet",
+          kind: "cc",
+          provider: "claude",
+          supports_reasoning_effort: false,
+          default_worker: false,
+          default_orchestrator: true,
+        },
+      ]}
+      onClose={() => undefined}
+      onSpawn={onSpawn}
+    />,
+  );
+  fireEvent.change(view.getByPlaceholderText("wiki-dev"), { target: { value: "wiki-lead" } });
+  fireEvent.change(view.getByPlaceholderText(/Optional\. Leave empty/), {
+    target: { value: "start the fleet" },
+  });
+  expect(view.queryByText("Project directory is required.")).toBeNull();
+  fireEvent.click(view.getByRole("button", { name: /^Launch$/ }));
+  await waitFor(() => {
+    expect(view.getByRole("button", { name: /Confirm launch/ })).toBeTruthy();
+  });
+  expect(onSpawn).not.toHaveBeenCalled();
 });
 
 test("spawn orchestrator dialog hides goal byte count until it nears 20KB", () => {

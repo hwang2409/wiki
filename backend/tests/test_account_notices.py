@@ -468,6 +468,19 @@ def test_loader_drops_unknown_and_malformed_notice_payloads(tmp_path: Path) -> N
                     "reset_at": None,
                     "ts": "t3",
                 },
+                # Known scalar fields must keep their persisted types.
+                "codex:limit:bad-reset": {
+                    "type": "codex_limit_no_eligible",
+                    "tickets": ["WIKI-BAD-RESET"],
+                    "reset_at": {"at": "18:00"},
+                    "ts": "t3b",
+                },
+                "codex:limit:bad-ts": {
+                    "type": "codex_limit_no_eligible",
+                    "tickets": ["WIKI-BAD-TS"],
+                    "reset_at": None,
+                    "ts": ["t3c"],
+                },
                 # Known type with the wrong shape (revived should be a list).
                 "codex:rotation-revive-failed:bad": {
                     "type": "codex_rotation",
@@ -480,6 +493,19 @@ def test_loader_drops_unknown_and_malformed_notice_payloads(tmp_path: Path) -> N
                     "type": "claude_limit_hit",
                     "ticket": None,
                     "ts": "t5",
+                },
+                "claude:limit:bad-window": {
+                    "type": "claude_limit_hit",
+                    "ticket": "WIKI-BAD-WINDOW",
+                    "window": {"name": "@1"},
+                    "ts": "t5b",
+                },
+                "claude:limit:bad-provider": {
+                    "type": "claude_limit_hit",
+                    "provider": {"name": "claude"},
+                    "ticket": "WIKI-BAD-PROVIDER",
+                    "window": "@1",
+                    "ts": "t5c",
                 },
                 # Non-dict value.
                 "not-a-notice": "hello",
