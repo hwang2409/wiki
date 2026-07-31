@@ -15,6 +15,7 @@ Agent V3** (one ticket per build step, all scoped to Henry).
 
 ## Implementation status
 
+- 2026-07-31: PHO-14963 provider-neutral tool discovery passed final review at `c7dd622e70` on `henry/phoebe-v3-agent-tool-search`; no PR opened.
 - 2026-07-31: PHO-14977 helper bin and eval scaffolding passed final review at `66b3cd5da7` on `henry/phoebe-v3-agent-helpers`; no PR opened.
 
 ## Problem
