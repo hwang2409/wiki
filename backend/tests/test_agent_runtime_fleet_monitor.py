@@ -764,6 +764,53 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
             graph_health.MAX_EVENT_ROW_BYTES,
         )
 
+    async def test_graph_health_event_cursor_retries_normalized_row_after_raw_race(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        worker = await self._spawn("WIKI-930-RACE", role="implement", orch="WIKI-ORCH")
+        raw_path = self.store.raw_events_path(worker.run_id)
+        normalized_path = self.store.normalized_events_path(worker.run_id)
+        for path in (raw_path, normalized_path):
+            path.write_text("")
+        view = next(
+            view
+            for view in self.monitor._collect_views()  # noqa: SLF001
+            if view.record.run_id == worker.run_id
+        )
+        cursor = graph_health.EventActivityCursor()
+        event_timestamp = time.time() + 5
+        original_reader = graph_health.GraphHealthMonitor._read_incremental_event_rows
+        injected = False
+
+        def read_with_race(path, file_cursor, **kwargs):
+            nonlocal injected
+            if path == normalized_path and not injected:
+                _append_event_rows(
+                    self.store,
+                    worker,
+                    direction="server",
+                    disposition="rendered",
+                    kind="item_completed",
+                    timestamp=event_timestamp,
+                )
+                injected = True
+            return original_reader(path, file_cursor, **kwargs)
+
+        with mock.patch.object(
+            graph_health.GraphHealthMonitor,
+            "_read_incremental_event_rows",
+            side_effect=read_with_race,
+        ):
+            first = self.monitor._graph_health._meaningful_event_timestamp(  # noqa: SLF001
+                view, self.store, cursor
+            )
+            second = self.monitor._graph_health._meaningful_event_timestamp(  # noqa: SLF001
+                view, self.store, cursor
+            )
+
+        self.assertTrue(injected)
+        self.assertNotAlmostEqual(first or 0, event_timestamp, places=5)
+        self.assertAlmostEqual(second or 0, event_timestamp, places=5)
+
     async def test_graph_health_stall_fast_forwards_event_cursor_after_edge_clear(self) -> None:
         await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
         worker = await self._spawn("WIKI-930", role="implement", orch="WIKI-ORCH")
@@ -774,7 +821,7 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
             self.store,
             worker.agent_id,
             {"state": "working", "pr": None, "step": "coding", "blocker": None},
-            mtime=stale_edge,
+            mtime=self.clock.now - 10,
         )
         for path in (
             self.store.raw_events_path(worker.run_id),
@@ -801,6 +848,12 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
             graph["edges"] = [
                 self._graph_edge("steer", self.clock.now, to=worker.agent_id)
             ]
+            _write_status(
+                self.store,
+                worker.agent_id,
+                {"state": "working", "pr": None, "step": "coding", "blocker": None},
+                mtime=self.clock.now - 2000,
+            )
             cleared = await self.monitor.tick()
             self.clock.advance(1801)
             padding = b"{}\n" * (graph_health.MAX_EVENT_READ_BYTES * 5 // 3)
@@ -827,10 +880,10 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
             )
 
         first_stalls = [note for note in first if note.event_type == "graph-health-stall"]
-        self.assertEqual(len(first_stalls), 1)
+        self.assertEqual(first_stalls, [])
         self.assertNotIn("graph-health-stall", {note.event_type for note in cleared})
         self.assertNotIn("graph-health-stall", {note.event_type for note in final})
-        self.assertEqual(len(escalations), 1)
+        self.assertEqual(len(escalations), 0)
 
 
     async def test_escalation_append_failure_retries_before_notification(self) -> None:

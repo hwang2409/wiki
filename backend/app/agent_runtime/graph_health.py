@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import logging
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
@@ -20,6 +21,7 @@ GRAPH_UNAVAILABLE_SPAWN_GRACE_SECONDS = 30.0
 MAX_EVENT_READ_BYTES = 256 * 1024
 MAX_EVENT_ROW_BYTES = 1024 * 1024
 MAX_RAW_DIRECTIONS = 4096
+MAX_UNRESOLVED_NORMALIZED_ROWS = 4096
 MEANINGFUL_EVENT_DIRECTIONS = frozenset({"provider", "server", "stdout"})
 STALL_EVENT_NOISE_KINDS = frozenset(
     {
@@ -173,6 +175,7 @@ class EventActivityCursor:
     raw: EventFileCursor = field(default_factory=EventFileCursor)
     normalized: EventFileCursor = field(default_factory=EventFileCursor)
     raw_directions: dict[Any, str] = field(default_factory=dict)
+    unresolved_normalized_rows: deque[dict[str, Any]] = field(default_factory=deque)
     latest_meaningful_activity: float | None = None
 
 
@@ -449,9 +452,11 @@ class GraphHealthMonitor:
     ) -> float | None:
         def reset_raw() -> None:
             cursor.raw_directions.clear()
+            cursor.unresolved_normalized_rows.clear()
             cursor.latest_meaningful_activity = None
 
         def reset_normalized() -> None:
+            cursor.unresolved_normalized_rows.clear()
             cursor.latest_meaningful_activity = None
 
         def consume_raw(rows: list[dict[str, Any]]) -> None:
@@ -467,7 +472,15 @@ class GraphHealthMonitor:
         def consume_normalized(rows: list[dict[str, Any]]) -> None:
             graph_module = _workgraph_module()
             for row in rows:
-                direction = cursor.raw_directions.get(row.get("raw_seq"))
+                raw_sequence = row.get("raw_seq")
+                direction = cursor.raw_directions.get(raw_sequence)
+                if raw_sequence is not None and direction is None:
+                    if len(cursor.unresolved_normalized_rows) >= (
+                        MAX_UNRESOLVED_NORMALIZED_ROWS
+                    ):
+                        cursor.unresolved_normalized_rows.popleft()
+                    cursor.unresolved_normalized_rows.append(row)
+                    continue
                 if direction not in MEANINGFUL_EVENT_DIRECTIONS:
                     continue
                 if row.get("disposition") not in {"rendered", "summarized"}:
@@ -496,6 +509,9 @@ class GraphHealthMonitor:
             on_rows=consume_normalized,
             on_reset=reset_normalized,
         )
+        pending_rows = list(cursor.unresolved_normalized_rows)
+        cursor.unresolved_normalized_rows.clear()
+        consume_normalized(pending_rows)
         del raw_rows, normalized_rows
         del raw_reset, normalized_reset
         return cursor.latest_meaningful_activity
