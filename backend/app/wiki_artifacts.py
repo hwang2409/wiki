@@ -51,7 +51,32 @@ TOOL_DESCRIPTION = (
     "dumping /tmp file paths: the artifact is inspectable, downloadable, and lives "
     "with the transcript. Use table artifacts only for 20+ rows or data the user will "
     "want to sort, export, or inspect. For prose comparisons with at most 6 rows and "
-    "3 columns, use a plain markdown table instead."
+    "3 columns, use a plain markdown table instead. For visual-diff (paired before/after "
+    "screenshots), the payload is {before: {data_base64, mime}, after: {data_base64, mime}}; "
+    "each side accepts image/png, image/jpeg, or image/webp up to 5MB, and both sides must "
+    "have identical dimensions and be single-frame (no APNG/animated WebP)."
+)
+
+# The payload description is agent-facing — the enclosing schema keeps payload
+# as a generic object (validated in-process against the per-kind rules in
+# _validate_text_payload / _write_image / _write_pdf / _write_visual_diff),
+# but LLMs generating tool calls read this description to shape the payload.
+_PAYLOAD_DESCRIPTION = (
+    "Per-kind payload shape. "
+    "mermaid: {source}. "
+    "svg: {source} — must contain <svg> root. "
+    "image: {data_base64, mime} — mime in image/png|jpeg|webp, up to 5MB. "
+    "table: {columns:[{key,label,type}], rows:[[...]]} — type in string|number|date|link. "
+    "plot: {spec_vega_lite: object}. "
+    "code: {language, source, filename?, diff_from?}. "
+    "diff: {source} — unified diff text. "
+    "file-list: {files:[{path, label?, size?, status?}]}. "
+    "json: {json_data}. "
+    "pdf: {data_base64} or {path} — 25MB cap. "
+    "visual-diff: {before: {data_base64, mime}, after: {data_base64, mime}} — each side "
+    "image/png|jpeg|webp up to 5MB; before and after must share dimensions; multi-frame "
+    "sources (APNG, animated WebP) are rejected. "
+    "All text-kind payloads combined must fit in 100KB."
 )
 
 TOOL_SCHEMA: dict[str, Any] = {
@@ -62,7 +87,10 @@ TOOL_SCHEMA: dict[str, Any] = {
         "kind": {"enum": sorted(ARTIFACT_KINDS)},
         "title": {"type": "string", "maxLength": 200},
         "caption": {"type": "string", "maxLength": 500},
-        "payload": {"type": "object"},
+        "payload": {
+            "type": "object",
+            "description": _PAYLOAD_DESCRIPTION,
+        },
     },
 }
 

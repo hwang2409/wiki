@@ -463,6 +463,104 @@ describe("visual-diff pixel-diff at oversized native resolution", () => {
   });
 });
 
+describe("visual-diff pixel-diff cancellation and yield", () => {
+  test("toggling off mid-run cancels the async tiled work before the final overlay lands", async () => {
+    // 2400 x 1200 = 2.88 MP, 6 tiles at NATIVE_DIFF_TILE=1024. The async
+    // work parks between tiles on a setTimeout(0); a toggle-off before that
+    // macrotask fires must abort the remaining tiles and skip the final
+    // putImageData onto the overlay canvas. Without cancellation, the
+    // reviewer-observed ~0.9s of unbroken JS locks up the webview.
+
+    const NATIVE_W = 2400;
+    const NATIVE_H = 1200;
+
+    class LargeImage {
+      onload: (() => void) | null = null;
+      onerror: ((error: unknown) => void) | null = null;
+      crossOrigin: string | null = null;
+      decoding: string | null = null;
+      naturalWidth = NATIVE_W;
+      naturalHeight = NATIVE_H;
+      #src = "";
+      get src(): string { return this.#src; }
+      set src(value: string) {
+        this.#src = value;
+        queueMicrotask(() => this.onload?.());
+      }
+    }
+
+    const originalImage = (globalThis as { Image?: unknown }).Image;
+    (globalThis as { Image?: unknown }).Image = LargeImage;
+
+    const originalGetContext = HTMLCanvasElement.prototype.getContext;
+    let overlayPutCount = 0;
+    HTMLCanvasElement.prototype.getContext = function (kind: string) {
+      if (kind !== "2d") return null;
+      const canvas = this as HTMLCanvasElement;
+      return {
+        get canvas() { return canvas; },
+        set imageSmoothingEnabled(_v: boolean) {},
+        drawImage() {},
+        getImageData(_x: number, _y: number, width: number, height: number) {
+          const data = new Uint8ClampedArray(width * height * 4);
+          for (let i = 3; i < data.length; i += 4) data[i] = 255;
+          return { data, width, height, colorSpace: "srgb" as const };
+        },
+        createImageData(width: number, height: number) {
+          return { data: new Uint8ClampedArray(width * height * 4), width, height, colorSpace: "srgb" as const };
+        },
+        putImageData(imageData: { data: Uint8ClampedArray; width: number; height: number }) {
+          // Only count the final projection onto the overlay canvas (bounded
+          // dims that match the canvas element). Tile scratches don't put.
+          if (imageData.width === canvas.width && imageData.height === canvas.height && canvas.width < NATIVE_W) {
+            overlayPutCount += 1;
+          }
+        },
+        clearRect() {},
+      } as unknown as CanvasRenderingContext2D;
+    } as unknown as HTMLCanvasElement["getContext"];
+
+    try {
+      const event: SessionEvent = {
+        id: 1,
+        kind: "artifact",
+        ts: null,
+        text: "",
+        disposition: "rendered",
+        artifact_id: "cancel",
+        title: "Oversized pair",
+        artifact: {
+          kind: "visual-diff",
+          before: { mime: "image/png", width: NATIVE_W, height: NATIVE_H },
+          after: { mime: "image/png", width: NATIVE_W, height: NATIVE_H },
+        },
+      };
+      render(<VisualDiffRenderer artifact={event.artifact!} event={event} ticket="WIKI-193" />);
+      await screen.findByAltText("Oversized pair");
+      const toggle = screen.getByRole("button", { name: /pixel diff/i });
+
+      // Turn pixel-diff on. The effect kicks off the async tiled diff — one
+      // tile runs synchronously, then the loop parks on setTimeout(0).
+      fireEvent.click(toggle);
+      // Turn pixel-diff off before any macrotask can fire. Cleanup aborts
+      // the controller; the parked tile iterations must return null on wake.
+      fireEvent.click(toggle);
+
+      // Let all pending macrotasks flush. If cancellation is broken, this
+      // is where the remaining 5 tiles would run and a final put would land.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      expect(overlayPutCount).toBe(0);
+      // Percentage readout must not render — that would prove stale stats
+      // reached state after the abort.
+      expect(toggle.textContent ?? "").not.toMatch(/%/);
+    } finally {
+      HTMLCanvasElement.prototype.getContext = originalGetContext;
+      (globalThis as { Image?: unknown }).Image = originalImage;
+    }
+  });
+});
+
 describe("visual-diff renderer id uniqueness", () => {
   test("mounting two renderers for the same artifact produces distinct slider ids and local htmlFor bindings", async () => {
     const event: SessionEvent = {

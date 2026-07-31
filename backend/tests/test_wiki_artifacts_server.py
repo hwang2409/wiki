@@ -552,6 +552,34 @@ class WikiArtifactsTests(unittest.TestCase):
         self.assertIsNotNone(event)
         self.assertEqual(event["artifact"]["kind"], "mermaid")
 
+    def test_tools_list_describes_visual_diff_payload_contract(self) -> None:
+        response = wiki_artifacts._response(  # noqa: SLF001 - MCP contract test
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+        )
+        assert response is not None
+        tools = {tool["name"]: tool for tool in response["result"]["tools"]}
+        render_artifact = tools["render_artifact"]
+        # The kind enum lists visual-diff so agents can discover the mode.
+        self.assertIn("visual-diff", render_artifact["inputSchema"]["properties"]["kind"]["enum"])
+        # The payload description spells out the visual-diff contract — before
+        # and after objects, MIME allowlist, size cap, matching dimensions,
+        # single-frame requirement. Without this, agents can invoke the kind
+        # but not the shape.
+        payload_property = render_artifact["inputSchema"]["properties"]["payload"]
+        description = payload_property.get("description", "")
+        self.assertIn("visual-diff", description)
+        self.assertIn("before", description)
+        self.assertIn("after", description)
+        self.assertIn("data_base64", description)
+        self.assertIn("mime", description)
+        self.assertIn("image/png", description)
+        self.assertIn("5MB", description)
+        self.assertIn("dimensions", description)
+        self.assertRegex(description, r"APNG|animated")
+        # Top-level tool description reiterates the shape so agents that only
+        # read the description (not the schema) still get the contract.
+        self.assertIn("visual-diff", render_artifact["description"])
+
     def test_orchestrator_lists_native_ops_but_worker_does_not(self) -> None:
         worker = wiki_artifacts._response(  # noqa: SLF001 - MCP contract test
             {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}

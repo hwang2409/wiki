@@ -69,20 +69,33 @@ type OverlayResult = {
   scaled: boolean;
 };
 
-function drawPixelDiffOverlay(
+// Async yield helper — parks work on the macrotask queue so React can paint
+// and any pending cancel signal can reach us before the next tile runs. A
+// setTimeout(0) is the widely-supported way to yield on the web; scheduler.
+// yield() is nicer but not yet universal.
+function yieldToEventLoop(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+async function drawPixelDiffOverlay(
   overlayCanvas: HTMLCanvasElement,
   before: LoadedImage,
   after: LoadedImage,
-): OverlayResult | null {
+  signal: AbortSignal,
+): Promise<OverlayResult | null> {
   const nativeWidth = Math.min(before.width, after.width);
   const nativeHeight = Math.min(before.height, after.height);
   if (nativeWidth === 0 || nativeHeight === 0) return null;
-  // Two-tier design (WIKI-193 review round 5): compare in native-resolution
-  // tiles so a localized one-pixel regression on a 40 MP screenshot is not
-  // averaged away by a bilinear downsample. The visible overlay stays at a
-  // bounded resolution (so a 40 MP canvas does not allocate ~500 MB), and
-  // every changed native pixel is projected onto its corresponding bounded
-  // pixel so the highlight remains visible even for pinpoint differences.
+  // Two-tier design (WIKI-193 review round 5+6): compare in
+  // native-resolution tiles so a localized one-pixel regression on a 40 MP
+  // screenshot is not averaged away by a bilinear downsample. The visible
+  // overlay stays at a bounded resolution (so a 40 MP canvas does not
+  // allocate ~500 MB), and every changed native pixel is projected onto
+  // its corresponding bounded pixel so the highlight remains visible even
+  // for pinpoint differences. Between tiles the work yields to the event
+  // loop and checks its abort signal — a full 40 MP pass ran ~0.9 s of
+  // pure JS synchronously before, freezing the webview; now each tile is
+  // ~2 ms, interleaved with paints, and a toggle-off cancels the rest.
   const bounds = boundedDiffDimensions(nativeWidth, nativeHeight);
   if (bounds.width === 0 || bounds.height === 0) return null;
   const context = overlayCanvas.getContext("2d", { willReadFrequently: true });
@@ -99,6 +112,7 @@ function drawPixelDiffOverlay(
 
   for (let tileY = 0; tileY < nativeHeight; tileY += NATIVE_DIFF_TILE) {
     for (let tileX = 0; tileX < nativeWidth; tileX += NATIVE_DIFF_TILE) {
+      if (signal.aborted) return null;
       const tileW = Math.min(NATIVE_DIFF_TILE, nativeWidth - tileX);
       const tileH = Math.min(NATIVE_DIFF_TILE, nativeHeight - tileY);
       scratch.width = tileW;
@@ -140,8 +154,10 @@ function drawPixelDiffOverlay(
         boundedOverlay[boundedIndex + 2] = diff.overlay[i + 2];
         boundedOverlay[boundedIndex + 3] = alpha;
       }
+      await yieldToEventLoop();
     }
   }
+  if (signal.aborted) return null;
 
   context.clearRect(0, 0, bounds.width, bounds.height);
   const overlayData = context.createImageData(bounds.width, bounds.height);
@@ -192,19 +208,28 @@ export function VisualDiffRenderer({
     if (!pixelDiff || state.status !== "ready") return;
     const canvas = overlayRef.current;
     if (!canvas) return;
-    try {
-      const stats = drawPixelDiffOverlay(canvas, state.before, state.after);
-      if (stats) {
-        setDiffStats(stats);
-        setOverlayError(null);
-      } else {
-        setOverlayError("Could not sample images for pixel diff.");
+    const controller = new AbortController();
+    (async () => {
+      try {
+        const stats = await drawPixelDiffOverlay(canvas, state.before, state.after, controller.signal);
+        if (controller.signal.aborted) return;
+        if (stats) {
+          setDiffStats(stats);
+          setOverlayError(null);
+        } else {
+          setOverlayError("Could not sample images for pixel diff.");
+        }
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        setOverlayError(
+          error instanceof Error ? error.message : "Pixel diff failed.",
+        );
       }
-    } catch (error) {
-      setOverlayError(
-        error instanceof Error ? error.message : "Pixel diff failed.",
-      );
-    }
+    })();
+    // Cleanup runs on toggle-off, unmount, or when `state` changes (e.g. a
+    // reload) — any of those should stop stale tile work from landing on
+    // the canvas or reporting numbers for the old image pair.
+    return () => controller.abort();
   }, [pixelDiff, state]);
 
   useEffect(() => {
