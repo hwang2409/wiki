@@ -702,6 +702,30 @@ def _validate_nal_header(
     return nal_ref_idc
 
 
+def canonicalise_aud(nal_bytes: bytes) -> bytes:
+    """Rebuild an access-unit delimiter from its primary_pic_type field."""
+    nal_ref_idc = _validate_nal_header(
+        nal_bytes, 9, require_zero_ref=True,
+    )
+    rbsp = _rbsp_unescape(nal_bytes[1:])
+    reader = _BitReader(rbsp)
+    primary_pic_type = reader.read_bits(3)
+    reader.read_rbsp_trailing_bits()
+    writer = _BitWriter()
+    writer.write_bits(primary_pic_type, 3)
+    writer.write_rbsp_trailing_bits()
+    return bytes([(nal_ref_idc << 5) | 9]) + _rbsp_escape(writer.to_bytes())
+
+
+def canonicalise_filler_nal(nal_bytes: bytes) -> bytes:
+    """Validate and rebuild a filler-data NAL emitted by the scrubber."""
+    _validate_nal_header(nal_bytes, 12, require_zero_ref=True)
+    rbsp = _rbsp_unescape(nal_bytes[1:])
+    if len(rbsp) < 2 or rbsp[-1] != 0x80 or any(byte != 0xFF for byte in rbsp[:-1]):
+        raise MediaScrubError("h264 filler-data NAL is not canonical")
+    return b"\x0c" + b"\xff" * (len(rbsp) - 1) + b"\x80"
+
+
 def canonicalise_nal(nal_bytes: bytes, expected_nal_type: int) -> bytes:
     """Parse a NAL, validate its type, decode + re-encode the RBSP, return
     the canonical NAL byte stream (header byte + escaped RBSP).

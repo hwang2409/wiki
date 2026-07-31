@@ -38,6 +38,12 @@ def scrub_mp3(data: bytes) -> MediaScrubResult:
     if data.startswith(_ID3V2_MAGIC):
         if len(data) < 10:
             raise MediaScrubError("mp3 id3v2 header truncated")
+        version_major, version_revision, flags = data[3:6]
+        if version_major not in (3, 4) or version_revision == 0xFF:
+            raise MediaScrubError("mp3 id3v2 version is unsupported")
+        allowed_flags = 0xE0 if version_major == 3 else 0xF0
+        if flags & ~allowed_flags:
+            raise MediaScrubError("mp3 id3v2 flags contain reserved bits")
         b1, b2, b3, b4 = data[6:10]
         if b1 & 0x80 or b2 & 0x80 or b3 & 0x80 or b4 & 0x80:
             raise MediaScrubError("mp3 id3v2 size not synchsafe")
@@ -45,6 +51,13 @@ def scrub_mp3(data: bytes) -> MediaScrubResult:
         start = 10 + tag_size
         if start > len(data):
             raise MediaScrubError("mp3 id3v2 size larger than payload")
+        if flags & 0x10:
+            if version_major != 4 or start + 10 > len(data):
+                raise MediaScrubError("mp3 id3v2.4 footer is missing")
+            footer = data[start:start + 10]
+            if footer[:3] != b"3DI" or footer[3:] != data[3:10]:
+                raise MediaScrubError("mp3 id3v2.4 footer does not match header")
+            start += 10
     end = len(data)
     # Front-of-file APEv2 (header form). This one variant only appears at
     # the very front so it advances `start`; every other trailing tag is

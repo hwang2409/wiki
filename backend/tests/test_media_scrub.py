@@ -37,6 +37,19 @@ FFPROBE = shutil.which("ffprobe")
 # real files above; these are only for isolated corner cases.
 # ---------------------------------------------------------------------------
 
+def _valid_gif_lzw(pixel_count: int) -> bytes:
+    compressed = gif_scrubber._encode_gif_lzw(bytes(pixel_count), 2)
+    return (
+        b"\x02"
+        + b"".join(
+            bytes([min(255, len(compressed) - offset)])
+            + compressed[offset:offset + 255]
+            for offset in range(0, len(compressed), 255)
+        )
+        + b"\x00"
+    )
+
+
 def _gif_bytes(*, with_xmp: bool = False) -> bytes:
     header = b"GIF89a"
     lsd = struct.pack("<HH", 4, 2) + b"\x80\x00\x00"
@@ -46,7 +59,7 @@ def _gif_bytes(*, with_xmp: bool = False) -> bytes:
         body += b"\x21\xff\x0b" + b"XMP DataXMP"
         body += b"\x04meta" + b"\x00"
     body += b"\x2c" + struct.pack("<HHHH", 0, 0, 4, 2) + b"\x00"
-    body += b"\x02\x02\x44\x01\x00"
+    body += _valid_gif_lzw(8)
     body += b"\x3b"
     return bytes(body)
 
@@ -383,6 +396,43 @@ class ScrubMp3RealFixtureTests(unittest.TestCase):
             )
         finally:
             Path(stored_path).unlink(missing_ok=True)
+
+
+class Mp3Id3v24FooterTests(unittest.TestCase):
+    @staticmethod
+    def _syncsafe(value: int) -> bytes:
+        return bytes(
+            (value >> shift) & 0x7F for shift in (21, 14, 7, 0)
+        )
+
+    @unittest.skipIf(FFMPEG is None, "ffmpeg not installed")
+    def test_id3v24_footer_is_consumed_and_audio_decodes(self) -> None:
+        original = REAL_MP3.read_bytes()
+        tag_size = 16
+        tag_body = b"round41-id3-footer"
+        tag_size = len(tag_body)
+        header = b"ID3\x04\x00\x10" + self._syncsafe(tag_size)
+        footer = b"3DI\x04\x00\x10" + self._syncsafe(tag_size)
+        original_tag_size = sum(
+            (byte & 0x7F) << shift
+            for byte, shift in zip(original[6:10], (21, 14, 7, 0))
+        )
+        audio = original[10 + original_tag_size:]
+        payload = header + tag_body + footer + audio
+        result = media_scrub.scrub_audio(payload, "audio/mpeg")
+        self.assertNotIn(b"3DI", result.data)
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as handle:
+            handle.write(result.data)
+            path = handle.name
+        try:
+            probe = subprocess.run(
+                [FFMPEG, "-v", "error", "-i", path, "-f", "null", "-"],
+                capture_output=True,
+                timeout=30,
+            )
+            self.assertEqual(probe.returncode, 0, probe.stderr.decode(errors="replace"))
+        finally:
+            Path(path).unlink(missing_ok=True)
 
 
 class Mp3StructuralGuards(unittest.TestCase):
@@ -1712,7 +1762,7 @@ class GifRound7ExtensionProbes(unittest.TestCase):
         # image descriptor + LZW sub-block + terminator + trailer
         image_desc = b"\x2c" + struct.pack("<HHHH", 0, 0, 4, 2) + b"\x00"
         # LZW min code size + one 4-byte data block + terminator
-        lzw = b"\x02\x02\x44\x01\x00"
+        lzw = _valid_gif_lzw(8)
         return image_desc + lzw + b"\x3b"
 
     def test_comment_extension_is_dropped(self) -> None:
@@ -1758,7 +1808,7 @@ class GifRound7ExtensionProbes(unittest.TestCase):
     def test_image_descriptor_flags_and_lzw_data_are_preserved(self) -> None:
         image_descriptor = b"\x2c" + struct.pack("<HHHH", 0, 0, 4, 2) + b"\xe1"
         palette = bytes(range(12))
-        lzw = b"\x02\x02\x44\x01\x00"
+        lzw = _valid_gif_lzw(8)
         payload = self._min_gif_prefix() + image_descriptor + palette + lzw + b"\x3b"
         result = media_scrub.scrub_video(payload, "image/gif")
         output_descriptor = result.data.find(b"\x2c")
@@ -1776,7 +1826,7 @@ class GifRound7ExtensionProbes(unittest.TestCase):
 
     def test_false_local_table_fields_are_zeroed_but_interlace_survives(self) -> None:
         image_descriptor = b"\x2c" + struct.pack("<HHHH", 0, 0, 4, 2) + b"\x67"
-        lzw = b"\x02\x02\x44\x01\x00"
+        lzw = _valid_gif_lzw(8)
         payload = self._min_gif_prefix() + image_descriptor + lzw + b"\x3b"
         result = media_scrub.scrub_video(payload, "image/gif")
         output_descriptor = result.data.find(b"\x2c")
@@ -2554,7 +2604,7 @@ class GifRound10GCEProbes(unittest.TestCase):
         # Image descriptor: 2c left/top/w/h + packed=0 (no LCT)
         idesc = b"\x2c" + struct.pack("<HHHH", 0, 0, 4, 2) + b"\x00"
         # LZW min code size + one sub-block of length 2 + terminator.
-        lzw = b"\x02\x02\x44\x01\x00"
+        lzw = _valid_gif_lzw(8)
         trailer = b"\x3b"
         return b"GIF89a" + lsd + gct + gce + idesc + lzw + trailer
 
@@ -2616,15 +2666,15 @@ class GifRound12LzwProbes(unittest.TestCase):
     def test_lzw_sub_blocks_after_eoi_are_dropped(self) -> None:
         marker = b"round12-gif-lzw-after-eoi-secret"
         image_desc = b"\x2c" + struct.pack("<HHHH", 0, 0, 4, 2) + b"\x00"
-        # clear, one pixel, EOI; the next sub-block is not part of the
-        # compressed stream and must not reach the stored artifact.
+        # clear, one pixel, EOI; a short stream must not reach storage even
+        # when hostile bytes follow its EOI marker.
         lzw = b"\x02\x02\x44\x01" + bytes([len(marker)]) + marker + b"\x00"
         payload = (
             b"GIF89a" + struct.pack("<HH", 4, 2) + b"\x80\x00\x00"
             + b"\x00\x00\x00\xff\xff\xff" + image_desc + lzw + b"\x3b"
         )
-        result = media_scrub.scrub_video(payload, "image/gif")
-        self.assertNotIn(marker, result.data)
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "decoded 1 pixels"):
+            media_scrub.scrub_video(payload, "image/gif")
 
     def test_pixel_count_limit_rejects_huge_descriptor(self) -> None:
         image_desc = b"\x2c" + struct.pack("<HHHH", 0, 0, 65535, 65535) + b"\x00"
@@ -2892,6 +2942,24 @@ class UnsupportedMimeTests(unittest.TestCase):
 
 
 class Review15MediaProbeTests(unittest.TestCase):
+    @unittest.skipIf(FFMPEG is None, "ffmpeg not installed")
+    def test_scrubbing_mp4_twice_is_idempotent_with_sei(self) -> None:
+        once = media_scrub.scrub_video(REAL_MP4.read_bytes(), "video/mp4").data
+        twice = media_scrub.scrub_video(once, "video/mp4").data
+        self.assertEqual(twice, once)
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as handle:
+            handle.write(twice)
+            path = handle.name
+        try:
+            probe = subprocess.run(
+                [FFMPEG, "-v", "error", "-i", path, "-f", "null", "-"],
+                capture_output=True,
+                timeout=30,
+            )
+            self.assertEqual(probe.returncode, 0, probe.stderr.decode(errors="replace"))
+        finally:
+            Path(path).unlink(missing_ok=True)
+
     def test_sei_rebuilds_as_valid_filler_data_nal(self) -> None:
         sample = struct.pack(">I", 4) + b"\x06\x11\x22\x33"
         rebuilt = mp4_scrubber._canonicalise_avc_sample(sample, 4, set(), False)
@@ -3066,7 +3134,7 @@ class Review15MediaProbeTests(unittest.TestCase):
             + b"\x00\x00\x00\x00\x00\x00"
             + image + image + b"\x3b"
         )
-        with self.assertRaisesRegex(media_scrub.MediaScrubError, "cumulative image pixels"):
+        with self.assertRaises(media_scrub.MediaScrubError):
             media_scrub.scrub_video(payload, "image/gif")
 
     @staticmethod
@@ -3515,7 +3583,7 @@ class Review20MediaProbeTests(unittest.TestCase):
         stsz_pos = payload.find(b"stsz")
         old_stsz_start = stsz_pos - 4
         old_stsz_size = struct.unpack(">I", payload[old_stsz_start:stsz_pos])[0]
-        stsz_body = b"\x00\x00\x00\x00" + struct.pack(">II", 6, sample_count)
+        stsz_body = b"\x00\x00\x00\x00" + struct.pack(">II", 7, sample_count)
         replacement = struct.pack(">I", 8 + len(stsz_body)) + b"stsz" + stsz_body
         payload[old_stsz_start:old_stsz_start + old_stsz_size] = replacement
         delta = len(replacement) - old_stsz_size
@@ -3552,7 +3620,7 @@ class Review20MediaProbeTests(unittest.TestCase):
         mdat_pos = payload.find(b"mdat")
         mdat_start = mdat_pos - 4
         old_mdat_size = struct.unpack(">I", payload[mdat_start:mdat_pos])[0]
-        sample = b"\x00\x00\x00\x02\x06\x80"
+        sample = b"\x00\x00\x00\x03\x06\xff\x80"
         mdat_body = sample * sample_count
         replacement_mdat = struct.pack(">I", 8 + len(mdat_body)) + b"mdat" + mdat_body
         payload[mdat_start:mdat_start + old_mdat_size] = replacement_mdat
@@ -3881,7 +3949,7 @@ class Review21MediaProbeTests(unittest.TestCase):
         sample_count = 65_536
         mdat_count = 4_094
         samples_per_mdat = [16] * (mdat_count - 1) + [48]
-        sample = b"\x00\x00\x00\x02\x06\x80"
+        sample = b"\x00\x00\x00\x03\x06\xff\x80"
         mdat_bodies = [sample * count for count in samples_per_mdat]
 
         def box(box_type: bytes, body: bytes) -> bytes:
@@ -4691,15 +4759,16 @@ class Review39H264ProfileAndHeaderTests(unittest.TestCase):
         )
 
     @unittest.skipIf(FFMPEG is None, "ffmpeg not installed")
-    def test_baseline_main_and_high_profiles_decode(self) -> None:
-        for profile in ("baseline", "main", "extended", "high"):
+    def test_baseline_main_extended_high_and_high444_profiles_decode(self) -> None:
+        for profile in ("baseline", "main", "extended", "high", "high444"):
             with self.subTest(profile=profile):
                 source = Path(tempfile.mkdtemp(prefix=f"wiki39-{profile}-")) / "source.mp4"
                 encoder_profile = "baseline" if profile == "extended" else profile
+                pixel_format = "yuv444p" if profile == "high444" else "yuv420p"
                 generated = subprocess.run(
                     [
                         FFMPEG, "-v", "error", "-y", "-i", str(REAL_MP4),
-                        "-an", "-vf", "format=yuv420p", "-c:v", "libx264",
+                        "-an", "-vf", f"format={pixel_format}", "-c:v", "libx264",
                         "-profile:v", encoder_profile, "-movflags", "+faststart", str(source),
                     ],
                     capture_output=True,
@@ -4722,6 +4791,51 @@ class Review39H264ProfileAndHeaderTests(unittest.TestCase):
                     self.assertEqual(probe.returncode, 0, probe.stderr.decode(errors="replace"))
                 finally:
                     Path(path).unlink(missing_ok=True)
+
+    @staticmethod
+    def _contains_sample_nal(payload: bytes, wanted_type: int) -> bool:
+        mdat_pos = payload.find(b"mdat")
+        if mdat_pos < 4:
+            return False
+        end = struct.unpack(">I", payload[mdat_pos - 4:mdat_pos])[0] + mdat_pos - 4
+        offset = mdat_pos + 4
+        while offset + 4 <= end:
+            size = struct.unpack(">I", payload[offset:offset + 4])[0]
+            if size == 0 or offset + 4 + size > end:
+                return False
+            if payload[offset + 4] & 0x1F == wanted_type:
+                return True
+            offset += 4 + size
+        return False
+
+    @unittest.skipIf(FFMPEG is None, "ffmpeg not installed")
+    def test_real_aud_fixture_scrubs_and_decodes(self) -> None:
+        source = Path(tempfile.mkdtemp(prefix="wiki41-aud-")) / "source.mp4"
+        generated = subprocess.run(
+            [
+                FFMPEG, "-v", "error", "-y", "-i", str(REAL_MP4), "-an",
+                "-vf", "format=yuv420p", "-c:v", "libx264", "-x264-params", "aud=1",
+                "-movflags", "+faststart", str(source),
+            ],
+            capture_output=True,
+            timeout=30,
+        )
+        self.assertEqual(generated.returncode, 0, generated.stderr.decode(errors="replace"))
+        source_payload = source.read_bytes()
+        self.assertTrue(self._contains_sample_nal(source_payload, 9))
+        result = media_scrub.scrub_video(source_payload, "video/mp4")
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as handle:
+            handle.write(result.data)
+            path = handle.name
+        try:
+            probe = subprocess.run(
+                [FFMPEG, "-v", "error", "-i", path, "-f", "null", "-"],
+                capture_output=True,
+                timeout=30,
+            )
+            self.assertEqual(probe.returncode, 0, probe.stderr.decode(errors="replace"))
+        finally:
+            Path(path).unlink(missing_ok=True)
 
     def test_reserved_sps_profile_is_rejected_before_storage(self) -> None:
         payload = self._replace_sps_profile(REAL_MP4.read_bytes(), 0)

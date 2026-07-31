@@ -350,8 +350,10 @@ def _decode_gif_lzw(
             if next_code == (1 << code_size) and code_size < 12:
                 code_size += 1
         previous = entry
-    # Some legacy GIFs end after a short final row. Preserve those accepted
-    # streams while still rejecting data that would write past the image.
+    if len(pixels) != expected_pixels:
+        raise MediaScrubError(
+            f"gif LZW stream decoded {len(pixels)} pixels, expected {expected_pixels}"
+        )
     return bytes(pixels)
 
 

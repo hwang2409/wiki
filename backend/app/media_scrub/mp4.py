@@ -55,7 +55,10 @@ from typing import Final
 
 from .base import MediaScrubError, MediaScrubResult
 from ._h264 import (
+    _HIGH_PROFILES,
     _validate_nal_header,
+    canonicalise_aud,
+    canonicalise_filler_nal,
     canonicalise_nal_with_ids,
     canonicalise_sps_with_dimensions,
     parse_slice_pps_id,
@@ -115,7 +118,7 @@ _MP4_SAMPLE_ENTRY_REQUIRED_CONFIG: Final = {
     b"avc1": b"avcC",
 }
 _MP4_MAX_SAMPLES: Final = 16_777_216
-_MP4_AVC_SAMPLE_NAL_TYPES: Final = {1, 5, 6}
+_MP4_AVC_SAMPLE_NAL_TYPES: Final = {1, 5, 6, 9, 12}
 _MP4_MAX_BOXES_PER_CONTAINER: Final = 4096
 _MP4_MAX_CHUNKS: Final = 65_536
 _MP4_MAX_TRACK_MDAT_GROUPS: Final = 65_536
@@ -747,17 +750,24 @@ def _canonicalise_avc_sample(
         nal_ref_idc = _validate_nal_header(
             nal, nal_type,
             require_nonzero_ref=nal_type == 5,
-            require_zero_ref=nal_type == 6,
+            require_zero_ref=nal_type in (6, 9, 12),
         )
         if nal_type in (1, 5):
             pps_id = parse_slice_pps_id(nal)
             if require_pps and pps_id not in pps_ids:
                 raise MediaScrubError("mp4 AVC slice references an unknown PPS identifier")
-        if nal_type == 6:
+        if nal_type == 9:
+            canonical = canonicalise_aud(nal)
+            if len(canonical) != len(nal):
+                raise MediaScrubError("mp4 AVC AUD rebuild changed its length")
+            nal = canonical
+        elif nal_type == 12:
+            nal = canonicalise_filler_nal(nal)
+        elif nal_type == 6:
             # Keep the declared NAL length and replace SEI with a valid
             # length-preserving filler-data NAL. Filler data has one or more
             # 0xff bytes followed by rbsp_trailing_bits (0x80).
-            if len(nal) < 2:
+            if len(nal) < 3:
                 raise MediaScrubError(
                     "mp4 AVC SEI is too short for a canonical filler NAL"
                 )
@@ -2528,7 +2538,7 @@ def _rebuild_inner_avcC(
     # bytes remain we require the profile to be a high one AND the
     # extended fields to be well-formed.
     if offset < len(body):
-        if profile not in (100, 110, 122, 144, 44, 83, 86, 118, 128, 138, 139, 134, 135):
+        if profile not in _HIGH_PROFILES:
             raise MediaScrubError(
                 f"mp4 avcC has extended tail but profile {profile} is not a high profile"
             )
