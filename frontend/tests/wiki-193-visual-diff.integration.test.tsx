@@ -172,6 +172,43 @@ describe("visual-diff renderer", () => {
     await waitFor(() => expect(toggle.textContent ?? "").not.toMatch(/%/));
   });
 
+  test("survives an image load failure and exposes the retry control", async () => {
+    // Force onerror across every ImmediateImage instance for this test only.
+    // Removing the onload path proves the component swaps from the loading
+    // hook set to the error hook set without a hook-count mismatch — useId
+    // must be called before the error return, or React throws here.
+    const originalDescriptor = Object.getOwnPropertyDescriptor(ImmediateImage.prototype, "src")!;
+    Object.defineProperty(ImmediateImage.prototype, "src", {
+      configurable: true,
+      set(this: ImmediateImage & { onerror: ((e: unknown) => void) | null }, value: string) {
+        (this as unknown as { _src: string })._src = value;
+        queueMicrotask(() => this.onerror?.(new Error("boom")));
+      },
+      get(this: { _src?: string }) {
+        return this._src ?? "";
+      },
+    });
+    try {
+      render(
+        <VisualDiffRenderer
+          artifact={visualDiffEvent().artifact!}
+          event={visualDiffEvent()}
+          ticket="WIKI-193"
+        />,
+      );
+      // The error state exposes the fallback title + a retry control.
+      const retry = await screen.findByRole("button", { name: /retry|try again/i });
+      expect(retry).toBeTruthy();
+      // Clicking retry re-enters the loading path — no React hook error is
+      // thrown during the state transitions.
+      fireEvent.click(retry);
+      // Post-click, the error UI is still up (loads still fail) — no crash.
+      await screen.findByRole("button", { name: /retry|try again/i });
+    } finally {
+      Object.defineProperty(ImmediateImage.prototype, "src", originalDescriptor);
+    }
+  });
+
   test("readOnly hides the slider and toggle", async () => {
     render(
       <VisualDiffRenderer

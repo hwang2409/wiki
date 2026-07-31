@@ -136,6 +136,12 @@ export function VisualDiffRenderer({
   } | null>(null);
   const [overlayError, setOverlayError] = useState<string | null>(null);
   const aspect = visualDiffAspect(artifact);
+  // useId gives every mounted copy its own value, so an inline + inspector +
+  // panel triple of the same artifact does not collide on DOM ids or bind a
+  // label to the wrong slider. Must live above the conditional error return
+  // so the hook count is stable across load / ready / error transitions.
+  const reactId = useId();
+  const sliderId = `visual-diff-slider-${reactId}`;
 
   useEffect(() => {
     if (!pixelDiff || state.status !== "ready") return;
@@ -179,11 +185,6 @@ export function VisualDiffRenderer({
   }
 
   const opacity = blendOpacity(slider);
-  // useId gives every mounted copy its own value, so an inline + inspector +
-  // panel triple of the same artifact does not collide on DOM ids or bind a
-  // label to the wrong slider.
-  const reactId = useId();
-  const sliderId = `visual-diff-slider-${reactId}`;
   const aspectStyle = aspect ? { aspectRatio: `${aspect}` } : undefined;
   const stageContent = state.status === "ready" ? (
     <>
