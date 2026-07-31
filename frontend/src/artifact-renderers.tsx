@@ -501,8 +501,14 @@ export function PlotRenderer({
             // escapes nested paths inconsistently across Vega versions.
             result.view.addSignalListener(BRUSH_TUPLE_SIGNAL, (_name, value) => buffer.onSignal(value));
           } catch { /* Vega drops listeners if the param is stripped by user spec */ }
-          brushCleanup = () => window.removeEventListener("pointerup", buffer.onPointerUp);
+          // pointercancel clears pending so a later unrelated pointerup
+          // can't fire a stale zoom from an interrupted gesture.
           window.addEventListener("pointerup", buffer.onPointerUp);
+          window.addEventListener("pointercancel", buffer.onCancel);
+          brushCleanup = () => {
+            window.removeEventListener("pointerup", buffer.onPointerUp);
+            window.removeEventListener("pointercancel", buffer.onCancel);
+          };
         }
       } catch (reason) {
         reportPlotFailure(reason);

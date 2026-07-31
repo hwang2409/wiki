@@ -236,10 +236,38 @@ test("runtime: brush tuple resolves array-index `a[0]` field paths", async () =>
   await view.finalize();
 });
 
-test("runtime: same field on both axes yields two distinct channel extents", async () => {
-  // The classic bug: the user-facing `wiki_brush` signal returns `{v: [x-extent]}`,
-  // collapsing y-extent into x-extent. The tuple preserves both because the
-  // channel tag is on the metadata entry, not on the map key.
+test("compile: same-field-both-axes aliasing binds BOTH scales and projects BOTH channels", () => {
+  // The classic Vega-Lite dedup: one interval parameter with `encodings: [x,y]`
+  // and same field on both axes compiles wiki_zoom for x only — y scale gets
+  // no domainRaw and wiki_brush_tuple_fields carries only the x entry. The
+  // aliasing transform in buildInteractiveSpec must produce a spec whose
+  // COMPILED output shows both scales bound and both channels projected.
+  const interactive = transform({
+    mark: "point",
+    data: { values: [{ v: 0 }, { v: 10 }] },
+    encoding: {
+      x: { field: "v", type: "quantitative" },
+      y: { field: "v", type: "quantitative" },
+    },
+  });
+  const compiled = compile(interactive as never).spec;
+
+  const xScale = (compiled.scales ?? []).find((s: Record<string, unknown>) => s.name === "x");
+  const yScale = (compiled.scales ?? []).find((s: Record<string, unknown>) => s.name === "y");
+  assert.ok((xScale as Record<string, unknown>)?.domainRaw, "x scale must have domainRaw");
+  assert.ok((yScale as Record<string, unknown>)?.domainRaw, "y scale must have domainRaw (dedup fix)");
+
+  // Inspect what Vega-Lite ACTUALLY compiled for the brush projection —
+  // don't hand-write the tuple; read the compiled tuple_fields default.
+  const tupleFields = (compiled.signals ?? []).find(
+    (s: Record<string, unknown>) => s.name === `${BRUSH_TUPLE_SIGNAL}_fields`,
+  ) as Record<string, unknown>;
+  const value = tupleFields?.value as Array<Record<string, unknown>>;
+  const channels = value.map((entry) => entry.channel).sort();
+  assert.deepEqual(channels, ["x", "y"], "compiled brush must project both channels");
+});
+
+test("runtime: same-field-both-axes brush yields two channel extents on the compiler-shaped tuple", async () => {
   const interactive = transform({
     mark: "point",
     width: 400,
@@ -250,20 +278,52 @@ test("runtime: same field on both axes yields two distinct channel extents", asy
       y: { field: "v", type: "quantitative" },
     },
   });
-  const view = await renderHeadless(interactive);
-  const tuples: unknown[] = [];
-  view.addSignalListener(BRUSH_TUPLE_SIGNAL, (_n, value) => tuples.push(value));
+  const compiled = compile(interactive as never).spec;
+  const view = new View(parse(compiled), { renderer: "none" as never });
+  await view.runAsync();
+
+  // Read the tuple shape Vega generated — same shape a real brush gesture
+  // would produce. If aliasing is missing, this default has only one entry
+  // and any x/y assumption below breaks.
+  const tupleFields = (compiled.signals ?? []).find(
+    (s: Record<string, unknown>) => s.name === `${BRUSH_TUPLE_SIGNAL}_fields`,
+  ) as Record<string, unknown>;
+  const compiledFields = tupleFields.value as Array<Record<string, unknown>>;
+  assert.equal(compiledFields.length, 2, "aliasing must produce a two-channel tuple template");
+
+  const captured: unknown[] = [];
+  view.addSignalListener(BRUSH_TUPLE_SIGNAL, (_n, value) => captured.push(value));
   view.signal(BRUSH_TUPLE_SIGNAL, {
     unit: "",
-    fields: [
-      { field: "v", channel: "x", type: "R" },
-      { field: "v", channel: "y", type: "R" },
-    ],
+    fields: compiledFields,
     values: [[2, 8], [3, 7]],
   }).run();
-  const domains = tupleDomains(tuples.at(-1), ["x", "y"]);
+  const domains = tupleDomains(captured.at(-1), ["x", "y"]);
   assert.deepEqual(domains, { x: [2, 8], y: [3, 7] });
   await view.finalize();
+});
+
+test("compile: composite marks (boxplot/errorbar/errorband) never enter full mode", () => {
+  for (const mark of ["boxplot", "errorbar", "errorband"] as const) {
+    const spec = {
+      mark,
+      data: { values: [{ x: 1, y: 1 }] },
+      encoding: {
+        x: { field: "x", type: "quantitative" },
+        y: { field: "y", type: "quantitative" },
+      },
+    };
+    assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" }, `${mark} must degrade to tooltip`);
+    // And the resulting tooltip-mode spec still compiles clean — no injected
+    // interval selection means no "Selection not supported for X" warnings
+    // and no dead Reset button in the UI.
+    const interactive = transform(spec);
+    const compiled = compile(interactive as never).spec;
+    const zoomSignals = (compiled.signals ?? []).filter(
+      (s: Record<string, unknown>) => typeof s.name === "string" && (s.name as string).startsWith("wiki_"),
+    );
+    assert.equal(zoomSignals.length, 0, `${mark} spec must not inject any wiki_zoom/wiki_brush signals`);
+  }
 });
 
 test("parse: existing wiki_zoom exact-name collision degrades and parses clean", () => {

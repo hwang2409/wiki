@@ -8,8 +8,8 @@
 //
 // Brush selection extents are read from the compiled `wiki_brush_tuple`
 // signal (channel-tagged) rather than the user-facing `wiki_brush` signal
-// (which keys by field name, so nested paths get escaped inconsistently and
-// same-field-both-axes collapses to a single entry).
+// (field-keyed) because the latter drops distinctness when x and y share a
+// field and escapes nested paths inconsistently across Vega versions.
 
 export type VegaLiteSpec = Record<string, unknown>;
 export type ZoomChannel = "x" | "y";
@@ -29,6 +29,16 @@ export const BRUSH_TUPLE_SIGNAL = `${BRUSH_PARAM}_tuple`;
 // underscore) would collide at parse time with "Duplicate signal name".
 const RESERVED_PARAM_PREFIXES = [ZOOM_PARAM, BRUSH_PARAM] as const;
 
+// Vega-Lite composite marks compile to multiple primitive marks and silently
+// strip interval selections: the classifier previously advertised full mode,
+// the UI enabled Reset and hinted drag/wheel/shift-drag, and nothing worked.
+const COMPOSITE_MARKS = new Set(["boxplot", "errorbar", "errorband"]);
+
+// Synthetic field name added by the aliasing transform so same-field-both-axes
+// specs get two distinct field identifiers on the interval projection (Vega-
+// Lite dedupes identical projections and drops the second channel).
+const Y_ALIAS_FIELD = "__wiki_plot_y_axis__";
+
 const COMPOSITE_KEYS = ["layer", "facet", "concat", "hconcat", "vconcat", "repeat", "spec"];
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -39,6 +49,12 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 
 function isReservedName(name: string): boolean {
   return RESERVED_PARAM_PREFIXES.some((prefix) => name === prefix || name.startsWith(`${prefix}_`));
+}
+
+function markType(spec: Record<string, unknown>): string | null {
+  if (typeof spec.mark === "string") return spec.mark;
+  const rec = asRecord(spec.mark);
+  return typeof rec?.type === "string" ? rec.type : null;
 }
 
 function continuousChannel(encoding: Record<string, unknown>, channel: ZoomChannel): boolean {
@@ -80,16 +96,26 @@ export function plotInteractivity(spec: unknown): PlotInteractivity {
   // A spec that already reserves any wiki_zoom* or wiki_brush* signal name
   // would trip Vega's duplicate-signal check on inject. Degrade to tooltip so
   // the plot still renders — WIKI-194 must not regress previously-working
-  // payloads. (Note the check spans the whole namespace, not just the exact
-  // parameter names, because Vega-Lite compiles a family of derived signals
-  // per interval parameter.)
+  // payloads. (The check spans the whole namespace because Vega-Lite compiles
+  // a family of derived signals per interval parameter.)
   if (paramNameCollision(record)) return { mode: "tooltip" };
+  // Vega-Lite silently strips interval selections from composite marks
+  // (boxplot, errorbar, errorband). Advertising drag/wheel/shift-drag on
+  // those would give a Reset button and hint text with no live wiring.
+  const mark = markType(record);
+  if (mark && COMPOSITE_MARKS.has(mark)) return { mode: "tooltip" };
   return { mode: "full", channels };
 }
 
 // Event streams gated on shift so plain drag pans while shift+drag brushes.
 const PAN_STREAM = "[pointerdown[!event.shiftKey], window:pointerup] > window:pointermove!";
 const BRUSH_STREAM = "[pointerdown[event.shiftKey], window:pointerup] > window:pointermove!";
+
+function encodingField(encoding: Record<string, unknown> | null, channel: ZoomChannel): string | null {
+  if (!encoding) return null;
+  const def = asRecord(encoding[channel]);
+  return typeof def?.field === "string" ? def.field : null;
+}
 
 export function buildInteractiveSpec(
   spec: VegaLiteSpec,
@@ -114,6 +140,37 @@ export function buildInteractiveSpec(
   if (interactivity.mode !== "full") return next;
 
   const encoding = asRecord(next.encoding);
+
+  // Same-field-both-axes: Vega-Lite's interval selection dedupes projections
+  // on identical fields, so a spec with x.field === y.field would compile
+  // wiki_zoom for x only, drop y's domainRaw, and produce a tuple with just
+  // the x extent. Alias the y-channel via a calculate transform so the
+  // selection sees two distinct fields.
+  if (
+    encoding
+    && interactivity.channels.includes("x")
+    && interactivity.channels.includes("y")
+    && encodingField(encoding, "x") === encodingField(encoding, "y")
+  ) {
+    const originalField = encodingField(encoding, "x")!;
+    const priorTransform = Array.isArray(next.transform) ? next.transform : [];
+    next.transform = [
+      ...priorTransform,
+      { calculate: `datum[${JSON.stringify(originalField)}]`, as: Y_ALIAS_FIELD },
+    ];
+    const yDef = asRecord(encoding.y)!;
+    const yAxis = asRecord(yDef.axis);
+    encoding.y = {
+      ...yDef,
+      field: Y_ALIAS_FIELD,
+      // Preserve the visible axis title — without this it would default to
+      // the synthetic alias name and leak the workaround to the user.
+      axis: yAxis && "title" in yAxis
+        ? yAxis
+        : { ...(yAxis ?? {}), title: originalField },
+    };
+  }
+
   if (encoding && domains) {
     for (const channel of interactivity.channels) {
       const domain = domains[channel];
@@ -167,8 +224,7 @@ export function buildInteractiveSpec(
 // Vega-Lite emits `<brush>_tuple` as `{fields: [{field, channel, type}, ...],
 // values: [[low, high], ...]}` with fields and values ordered identically.
 // The channel tag is authoritative — it survives nested field paths (a.b),
-// escaped chars, and the same field appearing on both axes (which the
-// user-facing `wiki_brush` signal would collapse to a single key).
+// escaped chars, and (with the aliasing transform above) same-field-both-axes.
 export function tupleDomains(
   value: unknown,
   channels: readonly ZoomChannel[],
@@ -196,6 +252,17 @@ export function tupleDomains(
   return Object.keys(domains).length > 0 ? domains : null;
 }
 
+// Recognizes a signal payload as a well-formed tuple even if it carries no
+// usable extents (e.g. the user shrank the brush back to a point). A shape-
+// less payload (null, undefined, primitive) is treated as noise and left
+// alone so unrelated signals don't wipe pending state.
+function isWellFormedTuple(value: unknown): boolean {
+  const record = asRecord(value);
+  return record !== null
+    && Array.isArray(record.fields)
+    && Array.isArray(record.values);
+}
+
 // Buffers Vega's brush tuple (which fires on every pointermove during a
 // shift-drag) and only commits the final extent to React once the gesture
 // ends. Without this, the domains state update would re-run the embed effect
@@ -206,18 +273,28 @@ export function makeBrushBuffer(
 ): {
   onSignal: (value: unknown) => void;
   onPointerUp: () => void;
+  onCancel: () => void;
 } {
   let pending: PlotDomains | null = null;
   return {
     onSignal(value: unknown) {
-      const next = tupleDomains(value, channels);
-      if (next) pending = next;
+      if (!isWellFormedTuple(value)) return;
+      // A well-formed tuple that yields no usable extents means the user
+      // shrank the brush to a point (or dragged back to the anchor). Clear
+      // pending so a later pointerup doesn't commit an intermediate extent.
+      pending = tupleDomains(value, channels);
     },
     onPointerUp() {
       if (pending === null) return;
       const domains = pending;
       pending = null;
       commit(domains);
+    },
+    // Called on pointercancel and any other gesture abort. Discards whatever
+    // extent had accumulated so a subsequent unrelated pointerup can't fire
+    // a stale zoom.
+    onCancel() {
+      pending = null;
     },
   };
 }

@@ -358,6 +358,56 @@ test("plotInteractivity: derived-name collision on wiki_brush_tuple downgrades",
   assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
 });
 
+test("plotInteractivity: composite mark boxplot degrades to tooltip", () => {
+  // Vega-Lite strips interval selections from composite marks. Full mode
+  // would enable Reset and hint drag/wheel/shift-drag with no live wiring.
+  const spec = {
+    mark: "boxplot",
+    encoding: {
+      x: { field: "x", type: "quantitative" },
+      y: { field: "y", type: "quantitative" },
+    },
+  };
+  assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
+});
+
+test("plotInteractivity: composite mark errorbar degrades to tooltip", () => {
+  const spec = {
+    mark: { type: "errorbar", extent: "ci" },
+    encoding: {
+      x: { field: "x", type: "quantitative" },
+      y: { field: "y", type: "quantitative" },
+    },
+  };
+  assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
+});
+
+test("plotInteractivity: composite mark errorband degrades to tooltip", () => {
+  const spec = {
+    mark: { type: "errorband" },
+    encoding: {
+      x: { field: "x", type: "quantitative" },
+      y: { field: "y", type: "quantitative" },
+    },
+  };
+  assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
+});
+
+test("plotInteractivity: same-field-both-axes stays in full mode (aliasing handles it)", () => {
+  const spec = {
+    mark: "point",
+    encoding: {
+      x: { field: "v", type: "quantitative" },
+      y: { field: "v", type: "quantitative" },
+    },
+  };
+  const result = plotInteractivity(spec);
+  assert.equal(result.mode, "full");
+  if (result.mode === "full") {
+    assert.deepEqual(result.channels.sort(), ["x", "y"]);
+  }
+});
+
 test("plotInteractivity: unrelated params leave full mode intact", () => {
   const spec = {
     mark: "point",
@@ -410,15 +460,52 @@ test("makeBrushBuffer: multiple gestures each commit once", () => {
   assert.deepEqual(commits, [{ x: [0, 1] }, { x: [4, 8] }]);
 });
 
-test("makeBrushBuffer: signals that don't parse to a domain are ignored", () => {
+test("makeBrushBuffer: shape-less signal noise is ignored", () => {
+  const commits: unknown[] = [];
+  const buffer = makeBrushBuffer(["x"], (d) => commits.push(d));
+  const wrap = (extent: number[]) => ({
+    unit: "",
+    fields: [{ field: "x", channel: "x", type: "R" }],
+    values: [extent],
+  });
+  buffer.onSignal(wrap([2, 8]));
+  buffer.onSignal(null);        // shape-less: ignore, keep pending
+  buffer.onSignal(undefined);   // ditto
+  buffer.onSignal("garbage");   // ditto
+  buffer.onPointerUp();
+  assert.deepEqual(commits, [{ x: [2, 8] }]);
+});
+
+test("makeBrushBuffer: shrink-to-empty clears pending so pointerup commits nothing", () => {
+  // Reviewer case: user shift-drags out to a valid extent, then drags back
+  // to the anchor before releasing. The final signal is a well-formed tuple
+  // with zero-width values, and pointerup MUST NOT commit the earlier
+  // intermediate range.
+  const commits: unknown[] = [];
+  const buffer = makeBrushBuffer(["x"], (d) => commits.push(d));
+  const tupleWith = (values: number[][]) => ({
+    unit: "",
+    fields: [{ field: "x", channel: "x", type: "R" }],
+    values,
+  });
+  buffer.onSignal(tupleWith([[2, 8]]));
+  buffer.onSignal(tupleWith([[2, 5]]));
+  buffer.onSignal(tupleWith([[5, 5]])); // shrunk back to a point
+  buffer.onPointerUp();
+  assert.deepEqual(commits, []);
+});
+
+test("makeBrushBuffer: onCancel clears pending across an aborted gesture", () => {
+  // Reviewer case: pointercancel between drag and release. A later unrelated
+  // pointerup must not commit the stale extent.
   const commits: unknown[] = [];
   const buffer = makeBrushBuffer(["x"], (d) => commits.push(d));
   buffer.onSignal({
     unit: "",
     fields: [{ field: "x", channel: "x", type: "R" }],
-    values: [[5, 5]],
+    values: [[2, 8]],
   });
-  buffer.onSignal(null);
+  buffer.onCancel();
   buffer.onPointerUp();
   assert.deepEqual(commits, []);
 });
