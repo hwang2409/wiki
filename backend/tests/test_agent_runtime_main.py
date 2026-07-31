@@ -18,6 +18,8 @@ from uuid import uuid4
 from fastapi import BackgroundTasks, HTTPException, Request
 
 from backend.app import main
+from backend.app.agent_runtime import next_review as next_review_module
+from backend.app.agent_runtime.autopilot import AutopilotController
 from backend.app.agent_runtime.client import (
     SupervisorClient,
     SupervisorRemoteError,
@@ -27,6 +29,7 @@ from backend.app.agent_runtime.fake import FixtureAdapterFactory
 from backend.app.agent_runtime.protocol import UnixSupervisorServer
 from backend.app.agent_runtime.store import RunStore, RuntimePaths
 from backend.app.agent_runtime.supervisor import Supervisor
+from backend.app.agent_runtime.types import LifecycleState
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "agent_runtime"
@@ -1261,6 +1264,63 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         start = next(params for method, params in self.client.calls if method == "run/start")
         self.assertEqual(start["backend_base_url"], "http://127.0.0.1:43112")
 
+    async def test_http_diversity_review_passes_backend_url_to_each_spawn(self) -> None:
+        request = Request(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/api/agents/next-review",
+                "raw_path": b"/api/agents/next-review",
+                "query_string": b"",
+                "headers": [],
+                "client": ("127.0.0.1", 50000),
+                "server": ("127.0.0.1", 43112),
+            }
+        )
+        calls: list[tuple[main.SpawnWorkerIn, str | None]] = []
+
+        def spawn(request: main.SpawnWorkerIn, *, backend_base_url: str | None = None) -> dict[str, str]:
+            calls.append((request, backend_base_url))
+            return {"run_id": request.ticket}
+
+        with (
+            mock.patch.dict(os.environ, {"WIKI_BACKEND_URL": ""}),
+            mock.patch.object(main, "AGENT_RUNTIME_DIR", self.paths.runtime_dir),
+            mock.patch.object(main, "composer_gate", return_value={"verdict": "pass"}),
+            mock.patch.object(main, "list_archived", return_value=[]),
+            mock.patch.object(main, "_read_agent_registry", return_value={}),
+            mock.patch.object(
+                main,
+                "provision_pinned_worktree",
+                side_effect=lambda _root, workdir, _sha: workdir,
+            ),
+            mock.patch.object(main, "spawn_agent", side_effect=spawn),
+            mock.patch.object(
+                next_review_module,
+                "_resolve_root",
+                return_value=self.root,
+            ),
+        ):
+            result = main.next_review_route(
+                request,
+                main.NextReviewIn(
+                    ticket="WIKI-DIVERSITY-URL",
+                    pr_number=226,
+                    expected_sha="a" * 40,
+                    orch="wiki",
+                    diversity=["correctness", "security"],
+                ),
+            )
+
+        self.assertEqual(result["status"], "spawned")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            {item[1] for item in calls},
+            {"http://127.0.0.1:43112"},
+        )
+
     async def test_spawn_with_new_request_id_keeps_duplicate_guard(self) -> None:
         self._seed_headless()
         status_path = self.status_dir / "WIKI-42.json"
@@ -1283,6 +1343,45 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(blocked.exception.status_code, 409)
         self.assertTrue(status_path.exists())
+        self.assertEqual(
+            [method for method, _ in self.client.calls], ["idempotency/status"]
+        )
+
+    async def test_canonical_reviewer_spawn_reuses_legacy_uppercase_live_row(self) -> None:
+        legacy_id = "WIKI-226-REVIEW1-SECURITY"
+        current = {
+            "ticket": legacy_id,
+            "run_id": RUN_ID,
+            "kind": "cdx",
+            "role": "review",
+            "model": "gpt-5.4",
+            "state": "working",
+            "window": None,
+        }
+        self.registry.write_text(
+            json.dumps({legacy_id: {"history": [], "current": current}}),
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(HTTPException) as blocked:
+            main.spawn_agent(
+                main.SpawnWorkerIn(
+                    ticket="WIKI-226-REVIEW1-security",
+                    kind="cdx",
+                    role="review",
+                    model="gpt-5.4",
+                    effort="high",
+                    workdir=str(self.worktree),
+                    prompt="retry the security review",
+                    request_id="legacy-review-retry",
+                )
+            )
+
+        self.assertEqual(blocked.exception.status_code, 409)
+        self.assertEqual(
+            json.loads(self.registry.read_text(encoding="utf-8")),
+            {legacy_id: {"history": [], "current": current}},
+        )
         self.assertEqual(
             [method for method, _ in self.client.calls], ["idempotency/status"]
         )
@@ -1650,6 +1749,7 @@ class BackendSupervisorEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.patchers = [
             mock.patch.object(main, "AGENT_REGISTRY_PATH", self.paths.registry_path),
             mock.patch.object(main, "AGENT_STATUS_DIR", self.root / "status"),
+            mock.patch.object(main, "AGENT_RUNTIME_DIR", self.paths.runtime_dir),
             mock.patch.object(main, "AGENT_ARCHIVE_DIR", self.root / "archive"),
             mock.patch.object(main, "AGENT_TMP_DIR", self.root / "tmp"),
             mock.patch.object(main, "MSG_QUEUE_PATH", self.root / "legacy-queue.json"),
@@ -1716,6 +1816,62 @@ class BackendSupervisorEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(supervisor["status"], "snapshot")
         self.assertEqual(supervisor["liveness"], "snapshot")
 
+    async def test_failed_legacy_migration_restores_registry_and_status(self) -> None:
+        ticket = "WIKI-LEGACY-MIGRATE"
+        legacy = {
+            "history": [],
+            "current": {
+                "ticket": ticket,
+                "kind": "cc",
+                "role": "implement",
+                "model": "sonnet",
+                "worktree": str(self.worktree),
+                "state": "working",
+                "window": None,
+            },
+        }
+        self.paths.registry_path.write_text(
+            json.dumps({ticket: legacy}),
+            encoding="utf-8",
+        )
+        status_path = self.paths.status_dir / f"{ticket}.json"
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        status_content = '{"state":"working","step":"legacy work"}\n'
+        status_path.write_text(status_content, encoding="utf-8")
+        original_factory = self.supervisor.adapter_factory
+
+        def failing_factory(record):
+            adapter = original_factory(record)
+
+            async def fail_start(request):
+                del request
+                raise RuntimeError("legacy migration fixture failure")
+
+            adapter.start = fail_start  # type: ignore[method-assign]
+            return adapter
+
+        self.supervisor.adapter_factory = failing_factory
+        with self.assertRaises(HTTPException) as failed:
+            await asyncio.to_thread(
+                main.spawn_agent,
+                main.SpawnWorkerIn(
+                    ticket=ticket,
+                    kind="cdx",
+                    role="implement",
+                    model="gpt-5.4",
+                    effort="high",
+                    workdir=str(self.worktree),
+                    prompt="migrate this legacy worker",
+                ),
+            )
+
+        self.assertEqual(failed.exception.status_code, 409)
+        self.assertEqual(
+            json.loads(self.paths.registry_path.read_text()),
+            {ticket: legacy},
+        )
+        self.assertEqual(status_path.read_text(encoding="utf-8"), status_content)
+
     async def test_spawn_replay_preserves_status_and_returns_original_run(self) -> None:
         request = main.SpawnWorkerIn(
             ticket="WIKI-RETRY",
@@ -1747,6 +1903,172 @@ class BackendSupervisorEndToEndTests(unittest.IsolatedAsyncioTestCase):
             ),
             1,
         )
+
+    async def test_context_spawn_retry_keeps_implicit_id_when_context_changes(self) -> None:
+        request = main.SpawnWorkerIn(
+            ticket="WIKI-CONTEXT-RETRY",
+            kind="cdx",
+            role="implement",
+            model="gpt-5.4",
+            effort="high",
+            workdir=str(self.worktree),
+            prompt="Retry-safe context spawn.",
+            context_prelude=True,
+        )
+        with mock.patch.object(
+            main,
+            "_contextual_prompt",
+            side_effect=["context from first attempt", "context after live changes"],
+        ):
+            first = await asyncio.to_thread(main.spawn_agent, request)
+            second = await asyncio.to_thread(main.spawn_agent, request)
+
+        self.assertEqual(second, first)
+        self.assertEqual(second["request_id"], first["request_id"])
+
+    async def test_implicit_next_review_round_uses_new_supervisor_child_id(self) -> None:
+        self.paths.registry_path.write_text(
+            json.dumps({"_orchestrators": {"wiki": {"kind": "cc"}}}),
+            encoding="utf-8",
+        )
+
+        def worktree(**values: object) -> Path:
+            path = self.root / f"review-{values['round_number']}"
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+
+        kwargs = {
+            "ticket": "WIKI-226-ROUND",
+            "pr_number": 226,
+            "expected_sha": "a" * 40,
+            "orch": "wiki",
+            "gate": lambda _pr, _sha: {"verdict": "pass"},
+            "resolve_root": lambda _orch: self.root,
+            "worktree": worktree,
+            "archived": lambda: [],
+            "registry": lambda: main._read_agent_registry(),  # noqa: SLF001
+            "status_reader": lambda _reviewer: None,
+        }
+        first = await asyncio.to_thread(next_review_module.next_review, **kwargs)
+        self.store.transition(first["run_id"], LifecycleState.COMPLETED)
+        second = await asyncio.to_thread(next_review_module.next_review, **kwargs)
+
+        self.assertEqual(first["reviewer"], "WIKI-226-ROUND-REVIEW1")
+        self.assertEqual(second["reviewer"], "WIKI-226-ROUND-REVIEW2")
+        self.assertNotEqual(second["run_id"], first["run_id"])
+        self.assertEqual(
+            self.store.current_run_id("WIKI-226-ROUND-REVIEW2"),
+            second["run_id"],
+        )
+
+    async def test_implicit_diversity_round_uses_new_supervisor_child_ids(self) -> None:
+        self.paths.registry_path.write_text(
+            json.dumps({"_orchestrators": {"wiki": {"kind": "cc"}}}),
+            encoding="utf-8",
+        )
+
+        def worktree(**values: object) -> Path:
+            path = self.root / f"{values['lens']}-{values['round_number']}"
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+
+        kwargs = {
+            "ticket": "WIKI-226-DIVERSE",
+            "pr_number": 226,
+            "expected_sha": "b" * 40,
+            "orch": "wiki",
+            "diversity": ["correctness", "security"],
+            "gate": lambda _pr, _sha: {"verdict": "pass"},
+            "resolve_root": lambda _orch: self.root,
+            "worktree": worktree,
+            "archived": lambda: [],
+            "registry": lambda: main._read_agent_registry(),  # noqa: SLF001
+            "status_reader": lambda _reviewer: None,
+        }
+        first = await asyncio.to_thread(next_review_module.next_review, **kwargs)
+        for reviewer in first["reviewers"]:
+            self.store.transition(reviewer["run_id"], LifecycleState.COMPLETED)
+        second = await asyncio.to_thread(next_review_module.next_review, **kwargs)
+
+        self.assertEqual(
+            {item["reviewer"] for item in second["reviewers"]},
+            {
+                "WIKI-226-DIVERSE-REVIEW2-correctness",
+                "WIKI-226-DIVERSE-REVIEW2-security",
+            },
+        )
+        for reviewer in second["reviewers"]:
+            self.assertEqual(
+                self.store.current_run_id(reviewer["reviewer"]),
+                reviewer["run_id"],
+            )
+
+    async def test_implicit_diversity_active_round_replays_one_batch(self) -> None:
+        self.paths.registry_path.write_text(
+            json.dumps({"_orchestrators": {"wiki": {"kind": "cc"}}}),
+            encoding="utf-8",
+        )
+
+        def worktree(**values: object) -> Path:
+            path = self.root / f"active-{values['lens']}-{values['round_number']}"
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+
+        kwargs = {
+            "ticket": "WIKI-226-ACTIVE",
+            "pr_number": 226,
+            "expected_sha": "c" * 40,
+            "orch": "wiki",
+            "diversity": ["correctness", "security"],
+            "gate": lambda _pr, _sha: {"verdict": "pass"},
+            "resolve_root": lambda _orch: self.root,
+            "worktree": worktree,
+            "archived": lambda: [],
+            "registry": lambda: main._read_agent_registry(),  # noqa: SLF001
+            "status_reader": lambda _reviewer: None,
+        }
+        first = await asyncio.to_thread(next_review_module.next_review, **kwargs)
+        second = await asyncio.to_thread(next_review_module.next_review, **kwargs)
+
+        self.assertEqual(second, first)
+        self.assertEqual(
+            {item["reviewer"] for item in first["reviewers"]},
+            {
+                "WIKI-226-ACTIVE-REVIEW1-correctness",
+                "WIKI-226-ACTIVE-REVIEW1-security",
+            },
+        )
+
+    async def test_autopilot_default_next_review_pins_backend_url(self) -> None:
+        self.paths.registry_path.write_text(
+            json.dumps({"_orchestrators": {"wiki": {"kind": "cc"}}}),
+            encoding="utf-8",
+        )
+
+        def worktree(**values: object) -> Path:
+            path = self.root / f"autopilot-{values['round_number']}"
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+
+        backend_url = "http://127.0.0.1:43123"
+        with mock.patch.dict(os.environ, {"WIKI_BACKEND_URL": backend_url}):
+            result = await asyncio.to_thread(
+                AutopilotController._default_next_review,
+                ticket="WIKI-226-AUTOPILOT",
+                pr_number=226,
+                expected_sha="d" * 40,
+                orch="wiki",
+                gate=lambda _pr, _sha: {"verdict": "pass"},
+                resolve_root=lambda _orch: self.root,
+                worktree=worktree,
+                archived=lambda: [],
+                registry=lambda: main._read_agent_registry(),  # noqa: SLF001
+                status_reader=lambda _reviewer: None,
+            )
+
+        record = self.store.get(result["run_id"])
+        self.assertEqual(record.backend_base_url, backend_url)
+        self.assertIn(f"backend: {backend_url}", record.initial_prompt or "")
 
 
 class DetachedHeadlessAcceptanceTests(unittest.TestCase):

@@ -6,6 +6,7 @@ import shutil
 import stat
 import tempfile
 import threading
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -24,6 +25,9 @@ from .types import (
     utc_now,
     validate_transition,
 )
+
+
+MAX_START_STATUS_BYTES = 64 * 1024
 
 
 class StoreError(RuntimeError):
@@ -445,6 +449,71 @@ def _atomic_write_json(path: Path, value: Any) -> None:
         raise
 
 
+def _atomic_write_bytes(path: Path, value: bytes) -> None:
+    _ensure_parent_dir(path.parent)
+    if path.is_symlink():
+        raise StoreError(f"refusing symlink file: {path}")
+    fd, raw_tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    tmp = Path(raw_tmp)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        path.chmod(0o600)
+        _fsync_directory(path.parent)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _read_start_status(path: Path) -> tuple[bool, bytes | None]:
+    try:
+        initial = os.lstat(path)
+    except FileNotFoundError:
+        return False, None
+    except OSError as exc:
+        raise StoreError(f"could not inspect status file: {path}") from exc
+    if stat.S_ISLNK(initial.st_mode):
+        raise StoreError(f"refusing symlink status file: {path}")
+    if not stat.S_ISREG(initial.st_mode):
+        raise StoreError(f"refusing non-regular status file: {path}")
+    if initial.st_size > MAX_START_STATUS_BYTES:
+        raise StoreError(f"status file exceeds {MAX_START_STATUS_BYTES} bytes: {path}")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return False, None
+    except OSError as exc:
+        raise StoreError(f"could not open status file: {path}") from exc
+    try:
+        opened = os.fstat(fd)
+        if stat.S_ISLNK(opened.st_mode) or not stat.S_ISREG(opened.st_mode):
+            raise StoreError(f"refusing non-regular status file: {path}")
+        if opened.st_size > MAX_START_STATUS_BYTES:
+            raise StoreError(f"status file exceeds {MAX_START_STATUS_BYTES} bytes: {path}")
+        content = bytearray()
+        while len(content) <= MAX_START_STATUS_BYTES:
+            chunk = os.read(fd, MAX_START_STATUS_BYTES + 1 - len(content))
+            if not chunk:
+                break
+            content.extend(chunk)
+        if len(content) > MAX_START_STATUS_BYTES:
+            raise StoreError(f"status file exceeds {MAX_START_STATUS_BYTES} bytes: {path}")
+        return True, bytes(content)
+    finally:
+        os.close(fd)
+
+
 def _append_json_line(path: Path, value: Any) -> None:
     _ensure_parent_dir(path.parent)
     if path.is_symlink():
@@ -506,6 +575,7 @@ class RunStore:
         # Adapter ownership is process-local. A restarted supervisor must
         # project every retained PID as detached until it reattaches control.
         self._control_attached_run_ids: set[str] = set()
+        self._start_registry_snapshots: dict[str, dict[str, Any]] = {}
         _ensure_private_dir(paths.runtime_dir)
         _ensure_private_dir(paths.runs_dir)
         self._reconcile_existing_runs()
@@ -1107,49 +1177,132 @@ class RunStore:
             # A status file belongs to the run that creates it. Clear any
             # orphan from a prior run before this record becomes current; the
             # supervisor calls create() while holding the per-agent lock.
-            self.status_path(record.agent_id).unlink(missing_ok=True)
-            self._create_run_files(record)
-            history = (
-                list((entry or {}).get("history") or [])
-                if isinstance(entry, dict)
-                else []
+            status_path = self.status_path(record.agent_id)
+            _ensure_parent_dir(status_path.parent)
+            status_present, status_content = _read_start_status(status_path)
+            status_path.unlink(missing_ok=True)
+            registry_before = deepcopy(registry)
+            registry_was_present = self.paths.registry_path.exists()
+            legacy_orchestrators = registry.get("_orchestrators")
+            legacy_entry = (
+                legacy_orchestrators.get(record.agent_id)
+                if isinstance(legacy_orchestrators, dict)
+                else None
             )
-            if isinstance(current, dict) and current:
-                # Mixed-fleet migration: the backend refuses a still-live
-                # legacy window before calling create(). A stale tmux-era
-                # current row is archived once, then the supervisor becomes
-                # the sole registry writer for this agent.
-                history.append(
-                    {
-                        **current,
-                        "outcome": current.get("outcome") or "handoff",
-                        "ended_at": current.get("ended_at") or utc_now(),
-                        "migration": "headless-supervisor",
-                    }
+            # WIKI-219 owns durable snapshots and journal-before-side-effect
+            # recovery across supervisor exits; this PR keeps rollback in memory.
+            self._start_registry_snapshots[record.run_id] = {
+                "agent_present": record.agent_id in registry,
+                "agent_entry": deepcopy(registry.get(record.agent_id)),
+                "legacy_present": isinstance(legacy_orchestrators, dict)
+                and record.agent_id in legacy_orchestrators,
+                "legacy_entry": deepcopy(legacy_entry),
+                "status_present": status_present,
+                "status_content": status_content,
+            }
+            run_dir_was_absent = not self.run_dir(record.run_id).exists()
+            try:
+                self._create_run_files(record)
+                history = (
+                    list((entry or {}).get("history") or [])
+                    if isinstance(entry, dict)
+                    else []
                 )
-            if isinstance(legacy_orchestrator, dict):
-                history.append(
-                    {
-                        **legacy_orchestrator,
-                        "ticket": record.agent_id,
-                        "kind": legacy_orchestrator.get("kind") or "cc",
-                        "role": legacy_orchestrator.get("role") or "orchestrator",
-                        "worktree": legacy_orchestrator.get("worktree")
-                        or legacy_orchestrator.get("cwd"),
-                        "outcome": legacy_orchestrator.get("outcome") or "handoff",
-                        "ended_at": legacy_orchestrator.get("ended_at") or utc_now(),
-                        "migration": "headless-supervisor",
-                    }
+                if isinstance(current, dict) and current:
+                    # Mixed-fleet migration: the backend refuses a still-live
+                    # legacy window before calling create(). A stale tmux-era
+                    # current row is archived once, then the supervisor becomes
+                    # the sole registry writer for this agent.
+                    history.append(
+                        {
+                            **current,
+                            "outcome": current.get("outcome") or "handoff",
+                            "ended_at": current.get("ended_at") or utc_now(),
+                            "migration": "headless-supervisor",
+                        }
+                    )
+                if isinstance(legacy_orchestrator, dict):
+                    history.append(
+                        {
+                            **legacy_orchestrator,
+                            "ticket": record.agent_id,
+                            "kind": legacy_orchestrator.get("kind") or "cc",
+                            "role": legacy_orchestrator.get("role") or "orchestrator",
+                            "worktree": legacy_orchestrator.get("worktree")
+                            or legacy_orchestrator.get("cwd"),
+                            "outcome": legacy_orchestrator.get("outcome") or "handoff",
+                            "ended_at": legacy_orchestrator.get("ended_at") or utc_now(),
+                            "migration": "headless-supervisor",
+                        }
+                    )
+                    legacy_orchestrators.pop(record.agent_id)
+                    if not legacy_orchestrators:
+                        registry.pop("_orchestrators", None)
+                registry[record.agent_id] = {
+                    "history": history,
+                    "current": self._registry_current(record),
+                }
+                self._write_registry(registry)
+            except BaseException:
+                self._start_registry_snapshots.pop(record.run_id, None)
+                if run_dir_was_absent:
+                    shutil.rmtree(self.run_dir(record.run_id), ignore_errors=True)
+                if status_present:
+                    _atomic_write_bytes(status_path, status_content)
+                else:
+                    status_path.unlink(missing_ok=True)
+                if registry_was_present:
+                    _atomic_write_json(self.paths.registry_path, registry_before)
+                else:
+                    self.paths.registry_path.unlink(missing_ok=True)
+                raise
+            return record
+
+    def commit_start(self, run_id: str) -> None:
+        """Forget the pre-start registry snapshot after provider launch succeeds."""
+
+        with self._lock:
+            self._start_registry_snapshots.pop(run_id, None)
+
+    def abort_start(self, run_id: str, *, reason: str) -> None:
+        """Remove a failed start and restore the registry before that start."""
+
+        del reason  # The failed run is rolled back instead of persisted.
+        with self._lock:
+            record = self.get(run_id)
+            snapshot = self._start_registry_snapshots.pop(run_id, None)
+            registry = self._read_registry()
+            if snapshot is None:
+                entry = registry.get(record.agent_id)
+                if isinstance(entry, dict) and (
+                    (entry.get("current") or {}).get("run_id") == run_id
+                ):
+                    registry.pop(record.agent_id, None)
+            elif snapshot["agent_present"]:
+                registry[record.agent_id] = deepcopy(snapshot["agent_entry"])
+            else:
+                registry.pop(record.agent_id, None)
+
+            legacy_orchestrators = registry.get("_orchestrators")
+            if snapshot is not None and snapshot["legacy_present"]:
+                if not isinstance(legacy_orchestrators, dict):
+                    legacy_orchestrators = {}
+                    registry["_orchestrators"] = legacy_orchestrators
+                legacy_orchestrators[record.agent_id] = deepcopy(
+                    snapshot["legacy_entry"]
                 )
-                legacy_orchestrators.pop(record.agent_id)
+            elif isinstance(legacy_orchestrators, dict):
+                legacy_orchestrators.pop(record.agent_id, None)
                 if not legacy_orchestrators:
                     registry.pop("_orchestrators", None)
-            registry[record.agent_id] = {
-                "history": history,
-                "current": self._registry_current(record),
-            }
+            status_path = self.status_path(record.agent_id)
+            if snapshot is not None and snapshot["status_present"]:
+                _atomic_write_bytes(status_path, snapshot["status_content"])
+            else:
+                status_path.unlink(missing_ok=True)
+            self._control_attached_run_ids.discard(run_id)
+            shutil.rmtree(self.run_dir(run_id))
             self._write_registry(registry)
-            return record
 
     def get(self, run_id: str) -> RunRecord:
         with self._lock:

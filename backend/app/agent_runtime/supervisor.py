@@ -26,7 +26,13 @@ from .process import (
     terminate_detached_provider_pid,
 )
 from .runtime_card import inject_runtime_card
-from .provider import AdapterStatus, ProviderAdapter, ProviderEvent, StartRequest
+from .provider import (
+    AdapterStatus,
+    ProviderAdapter,
+    ProviderEvent,
+    ProviderProcessError,
+    StartRequest,
+)
 from .store import RunNotFound, RunStore, StoreConflict
 from .types import (
     LifecycleState,
@@ -412,6 +418,9 @@ class Supervisor:
             tuple[str, str], tuple[str, Any]
         ] = OrderedDict()
         self.idempotency_tasks: dict[tuple[str, str], asyncio.Task[Any]] = {}
+        # WIKI-219 owns durable implicit-id receipts across supervisor restarts.
+        self.implicit_idempotency_keys: set[tuple[str, str]] = set()
+        self.implicit_idempotency_runs: dict[tuple[str, str], str] = {}
         self.idempotency_lock = asyncio.Lock()
         self.worker_soft_cap = (
             worker_soft_cap
@@ -1736,6 +1745,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         self,
         record: RunRecord,
         adapter: ProviderAdapter,
+        *,
+        rollback_start: bool = False,
     ) -> None:
         """Abort a cancelled provider start/resume without leaving controlless state."""
 
@@ -1745,6 +1756,19 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             pass
         finally:
             await self._await_cleanup(self._detach_adapter(record.run_id))
+        if rollback_start:
+            try:
+                self.store.abort_start(
+                    record.run_id,
+                    reason="provider launch cancelled",
+                )
+            except BaseException:
+                pass
+            try:
+                await self._publish_agent_change(record.agent_id)
+            except BaseException:
+                pass
+            return
         terminal_status = AdapterStatus(
             state=LifecycleState.DEAD,
             session_id=None,
@@ -1766,6 +1790,31 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             await self._publish_agent_change(current.agent_id)
         except BaseException:
             pass
+
+    async def _cleanup_precommit_adapter(
+        self,
+        run_id: str,
+        adapter: ProviderAdapter,
+    ) -> None:
+        """Close an adapter whose fresh start never committed attachment."""
+
+        try:
+            await adapter.close()
+        except BaseException:
+            pass
+        self._clear_adapter_loss(run_id)
+        task = self.event_tasks.pop(run_id, None)
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        if self.adapters.get(run_id) is adapter:
+            self.adapters.pop(run_id, None)
+        adapter_key = id(adapter)
+        self.event_routes = {
+            key: target
+            for key, target in self.event_routes.items()
+            if key[0] != adapter_key
+        }
 
     async def start_run(
         self,
@@ -1806,14 +1855,41 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     self._assert_codex_fleet_available()
                     async with self._agent_lock(record.agent_id):
                         self.store.create(record, migrate_legacy=migrate_legacy)
-                        return await self._launch_record(record, prompt)
+                        return await self._launch_record(record, prompt, rollback_start=True)
             async with self._agent_lock(record.agent_id):
                 self.store.create(record, migrate_legacy=migrate_legacy)
-                return await self._launch_record(record, prompt)
+                return await self._launch_record(record, prompt, rollback_start=True)
 
-    async def _launch_record(self, record: RunRecord, prompt: str) -> RunRecord:
-        adapter = self.adapter_factory(record)
-        self._attach_adapter(record.run_id, adapter)
+    async def _launch_record(
+        self,
+        record: RunRecord,
+        prompt: str,
+        *,
+        rollback_start: bool = False,
+    ) -> RunRecord:
+        adapter: ProviderAdapter | None = None
+        try:
+            adapter = self.adapter_factory(record)
+            self._attach_adapter(record.run_id, adapter)
+        except asyncio.CancelledError:
+            if adapter is not None:
+                await self._cleanup_precommit_adapter(record.run_id, adapter)
+            if rollback_start:
+                self.store.abort_start(
+                    record.run_id,
+                    reason="provider launch cancelled before attachment",
+                )
+                await self._publish_agent_change(record.agent_id)
+            raise
+        except Exception as exc:
+            if adapter is not None:
+                await self._cleanup_precommit_adapter(record.run_id, adapter)
+            if rollback_start:
+                reason = f"provider attachment failed: {exc}"
+                self.store.abort_start(record.run_id, reason=reason)
+                raise ProviderProcessError(reason) from exc
+            raise
+        assert adapter is not None
         request = StartRequest(
             prompt=prompt,
             model=record.model,
@@ -1827,18 +1903,28 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             record = self.store.update_adapter_status(record.run_id, status)
             self._route_adapter_generation(record.run_id, adapter, status.generation)
         except asyncio.CancelledError:
-            await self._cleanup_cancelled_launch(record, adapter)
+            await self._cleanup_cancelled_launch(
+                record,
+                adapter,
+                rollback_start=rollback_start,
+            )
             raise
         except Exception as exc:
             await self._close_and_drain_adapter(record.run_id, adapter)
-            record = self.store.transition(
-                record.run_id,
-                LifecycleState.DEAD,
-                reason=f"provider start failed: {exc}",
-            )
-            self._clear_auth_dead_recovery_state(record.run_id)
-            await self._publish_agent_change(record.agent_id)
+            reason = f"provider start failed: {exc}"
+            if rollback_start:
+                self.store.abort_start(record.run_id, reason=reason)
+                raise ProviderProcessError(reason) from exc
+            else:
+                record = self.store.transition(
+                    record.run_id,
+                    LifecycleState.DEAD,
+                    reason=reason,
+                )
+                self._clear_auth_dead_recovery_state(record.run_id)
+                await self._publish_agent_change(record.agent_id)
             raise
+        self.store.commit_start(record.run_id)
         await self._publish_agent_change(record.agent_id)
         return record
 
@@ -3206,6 +3292,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     reason="archived",
                 )
             archived, _ = self.store.archive_current(run_id, outcome=outcome)
+            self._forget_implicit_idempotency_for_run(run_id)
             self._clear_adapter_loss(run_id)
             self._clear_auth_dead_recovery_state(run_id)
             await self._publish_agent_change(archived.agent_id)
@@ -3228,6 +3315,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             raise StoreConflict("provider archive returned no status")
         record = self.store.update_adapter_status(run_id, status)
         archived, _ = self.store.archive_current(run_id, outcome=outcome)
+        self._forget_implicit_idempotency_for_run(run_id)
         self._clear_adapter_loss(run_id)
         self._clear_auth_dead_recovery_state(run_id)
         await self._publish_agent_change(archived.agent_id)
@@ -3553,7 +3641,17 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         request_id = _validated_idempotency_request_id(params.get("request_id"))
         if request_id is None:
             return await self._dispatch(method, params)
+        if params.get("implicit_request_id") is True:
+            self.implicit_idempotency_keys.add((method, request_id))
         return await self._dispatch_idempotently(method, request_id, params)
+
+    def _forget_implicit_idempotency_for_run(self, run_id: str) -> None:
+        for key, mapped_run_id in list(self.implicit_idempotency_runs.items()):
+            if mapped_run_id != run_id:
+                continue
+            self.implicit_idempotency_runs.pop(key, None)
+            self.implicit_idempotency_keys.discard(key)
+            self.idempotency_results.pop(key, None)
 
     def _complete_idempotency_task(
         self,
@@ -3570,9 +3668,16 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         try:
             outcome: tuple[str, Any] = ("result", deepcopy(task.result()))
         except Exception as exc:
+            if key in self.implicit_idempotency_keys:
+                self.implicit_idempotency_keys.discard(key)
+                return
             outcome = ("error", (type(exc), exc.args))
         self.idempotency_results[key] = outcome
         self.idempotency_results.move_to_end(key)
+        if key in self.implicit_idempotency_keys:
+            result = outcome[1]
+            if isinstance(result, dict) and isinstance(result.get("run_id"), str):
+                self.implicit_idempotency_runs[key] = result["run_id"]
         while len(self.idempotency_results) > self.idempotency_cache_size:
             self.idempotency_results.popitem(last=False)
 
@@ -3841,5 +3946,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         self.last_no_eligible_alert = 0.0
         self.idempotency_results.clear()
         self.idempotency_tasks.clear()
+        self.implicit_idempotency_keys.clear()
+        self.implicit_idempotency_runs.clear()
         self.detached_at_monotonic.clear()
         self.adapters.clear()

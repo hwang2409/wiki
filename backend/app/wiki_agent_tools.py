@@ -15,6 +15,9 @@ class AgentToolError(RuntimeError):
     pass
 
 
+SLOW_AGENT_OPERATION_TIMEOUT_SECONDS = 120
+
+
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "list_agents",
@@ -258,13 +261,18 @@ def _backend_api(
     configured = os.environ.get("WIKI_BACKEND_URL")
     if not configured:
         raise AgentToolError("WIKI_BACKEND_URL is missing from the runtime")
+    timeout = (
+        SLOW_AGENT_OPERATION_TIMEOUT_SECONDS
+        if path in {"/api/agents/spawn", "/api/agents/next-review"}
+        else 15
+    )
     try:
         return backend_runtime.request_json(
             configured,
             method,
             path,
             payload,
-            timeout=15,
+            timeout=timeout,
         )
     except (backend_runtime.BackendRequestError, ValueError) as exc:
         raise AgentToolError(f"Wiki backend request failed: {exc}") from exc
@@ -333,7 +341,6 @@ def spawn_agent(arguments: Any) -> dict[str, Any]:
         },
     )
     values.setdefault("effort", None)
-    values.setdefault("request_id", str(uuid4()))
     return _backend_api("POST", "/api/agents/spawn", values)
 
 
@@ -424,7 +431,6 @@ def next_review(arguments: Any) -> dict[str, Any]:
         values.setdefault("reviewer_effort", "high")
     else:
         values.pop("reviewer_effort", None)
-    values.setdefault("request_id", str(uuid4()))
     orch = os.environ.get("WIKI_AGENT_ID")
     if not orch:
         raise AgentToolError("WIKI_AGENT_ID is missing from the orchestrator runtime")

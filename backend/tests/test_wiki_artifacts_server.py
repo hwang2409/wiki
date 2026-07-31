@@ -24,13 +24,15 @@ from backend.app.next_review_schema import NextReviewIn, mcp_input_schema
 RUN_ID = "00000000-0000-4000-8000-000000000085"
 
 
-def _fixture_png_bytes() -> bytes:
+def _fixture_png_bytes(color: tuple[int, int, int] = (255, 128, 0), size: tuple[int, int] = (2, 2)) -> bytes:
     buffer = io.BytesIO()
-    Image.new("RGB", (2, 2), color=(255, 128, 0)).save(buffer, format="PNG")
+    Image.new("RGB", size, color=color).save(buffer, format="PNG")
     return buffer.getvalue()
 
 
 FIXTURE_PNG_BYTES = _fixture_png_bytes()
+FIXTURE_PNG_BYTES_ALT = _fixture_png_bytes(color=(0, 128, 255))
+FIXTURE_PNG_BYTES_LARGER = _fixture_png_bytes(color=(0, 128, 255), size=(4, 4))
 
 
 def _payload(kind: str) -> dict:
@@ -88,6 +90,16 @@ def _payload(kind: str) -> dict:
         "pdf": {
             "data_base64": base64.b64encode(b"%PDF-1.4\n%fixture bytes\n").decode(),
         },
+        "visual-diff": {
+            "before": {
+                "data_base64": base64.b64encode(FIXTURE_PNG_BYTES).decode(),
+                "mime": "image/png",
+            },
+            "after": {
+                "data_base64": base64.b64encode(FIXTURE_PNG_BYTES_ALT).decode(),
+                "mime": "image/png",
+            },
+        },
     }[kind]
 
 
@@ -143,6 +155,30 @@ class WikiArtifactsTests(unittest.TestCase):
                         reopened.load()
                         self.assertEqual(reopened.size, (2, 2))
                     self.assertEqual(image.stat().st_mode & 0o777, 0o600)
+                elif kind == "visual-diff":
+                    for variant in ("before", "after"):
+                        self.assertNotIn("data_base64", event["artifact"][variant])
+                        image = (
+                            self.root
+                            / "runtime"
+                            / "runs"
+                            / RUN_ID
+                            / "artifacts"
+                            / f"{event['id']}.{variant}.png"
+                        )
+                        stored = image.read_bytes()
+                        self.assertTrue(stored.startswith(b"\x89PNG\r\n\x1a\n"))
+                        with Image.open(io.BytesIO(stored)) as reopened:
+                            reopened.load()
+                            self.assertEqual(reopened.size, (2, 2))
+                        self.assertEqual(image.stat().st_mode & 0o777, 0o600)
+                        self.assertEqual(event["artifact"][variant]["mime"], "image/png")
+                        self.assertEqual(event["artifact"][variant]["width"], 2)
+                        self.assertEqual(event["artifact"][variant]["height"], 2)
+                        self.assertEqual(
+                            event["artifact"][variant]["ref"],
+                            f"artifact://{event['id']}/{variant}",
+                        )
                 elif kind == "pdf":
                     self.assertNotIn("data_base64", event["artifact"])
                     self.assertNotIn("path", event["artifact"])
@@ -176,6 +212,13 @@ class WikiArtifactsTests(unittest.TestCase):
             "file-list": {"files": [{"label": "missing path"}]},
             "json": {},
             "pdf": {"data_base64": base64.b64encode(b"not a pdf").decode()},
+            "visual-diff": {
+                "before": {
+                    "data_base64": base64.b64encode(FIXTURE_PNG_BYTES).decode(),
+                    "mime": "image/png",
+                },
+                # missing 'after'
+            },
         }
         for kind, payload in malformed.items():
             with self.subTest(kind=kind), self.assertRaises(
@@ -214,6 +257,379 @@ class WikiArtifactsTests(unittest.TestCase):
                 {
                     "kind": "image",
                     "payload": {"data_base64": image, "mime": "image/png"},
+                }
+            )
+
+    def test_visual_diff_rejects_dimension_mismatch(self) -> None:
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError, "identical dimensions"
+        ):
+            wiki_artifacts.render_artifact(
+                {
+                    "kind": "visual-diff",
+                    "payload": {
+                        "before": {
+                            "data_base64": base64.b64encode(FIXTURE_PNG_BYTES).decode(),
+                            "mime": "image/png",
+                        },
+                        "after": {
+                            "data_base64": base64.b64encode(
+                                FIXTURE_PNG_BYTES_LARGER
+                            ).decode(),
+                            "mime": "image/png",
+                        },
+                    },
+                }
+            )
+
+    def test_visual_diff_over_limit_variant_returns_isError_and_server_survives(self) -> None:
+        # A PNG declaring 10000x10000 in its IHDR chunk trips PIL's
+        # decompression-bomb detection (MAX_IMAGE_PIXELS = 40M). Before this
+        # fix, _reject_multi_frame opened the payload with PIL BEFORE any
+        # size cap, so DecompressionBombError (bare Exception, not
+        # ValueError) escaped every except clause on the stack and
+        # terminated the per-run MCP server. Now the pre-cap header probe
+        # bails out before PIL sees the bytes.
+        import struct
+        import zlib
+
+        def _oversized_png() -> bytes:
+            ihdr_payload = struct.pack(
+                ">IIBBBBB", 10000, 10000, 8, 2, 0, 0, 0,
+            )
+            crc = zlib.crc32(b"IHDR" + ihdr_payload).to_bytes(4, "big")
+            return (
+                b"\x89PNG\r\n\x1a\n"
+                + b"\x00\x00\x00\x0d"  # IHDR length
+                + b"IHDR"
+                + ihdr_payload
+                + crc
+            )
+
+        bomb = _oversized_png()
+        requests = [
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"protocolVersion": "2025-06-18"},
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "render_artifact",
+                    "arguments": {
+                        "kind": "visual-diff",
+                        "payload": {
+                            "before": {
+                                "data_base64": base64.b64encode(bomb).decode(),
+                                "mime": "image/png",
+                            },
+                            "after": {
+                                "data_base64": base64.b64encode(bomb).decode(),
+                                "mime": "image/png",
+                            },
+                        },
+                    },
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "render_artifact",
+                    "arguments": {"kind": "mermaid", "payload": _payload("mermaid")},
+                },
+            },
+        ]
+
+        env = os.environ.copy()
+        process = subprocess.run(
+            [sys.executable, "-m", "backend.app.wiki_artifacts"],
+            input="".join(json.dumps(request) + "\n" for request in requests),
+            text=True,
+            capture_output=True,
+            env=env,
+            timeout=10,
+            check=True,
+        )
+        responses = [json.loads(line) for line in process.stdout.splitlines()]
+        # First tool call: isError with the canonical size-cap message.
+        bomb_result = responses[1]["result"]
+        self.assertTrue(bomb_result.get("isError"))
+        self.assertRegex(
+            bomb_result["content"][0]["text"],
+            r"artifact rejected.*(pixel limit|side limit|40MP)",
+        )
+        # Second tool call: the server survived and served the next request.
+        alive_result = responses[2]["result"]
+        self.assertNotIn("isError", alive_result)
+        event = wiki_artifacts.artifact_from_text(alive_result["content"][0]["text"])
+        self.assertIsNotNone(event)
+        self.assertEqual(event["artifact"]["kind"], "mermaid")
+
+    def test_visual_diff_rejects_animated_apng(self) -> None:
+        def _apng_bytes(frames: int = 2) -> bytes:
+            buffer = io.BytesIO()
+            first = Image.new("RGB", (4, 4), color=(255, 0, 0))
+            rest = [Image.new("RGB", (4, 4), color=(0, i * 40 % 255, 0)) for i in range(1, frames)]
+            first.save(
+                buffer,
+                format="PNG",
+                save_all=True,
+                append_images=rest,
+                default_image=False,
+                duration=100,
+                loop=0,
+            )
+            return buffer.getvalue()
+
+        apng = _apng_bytes(3)
+        # Sanity-check the fixture actually became multi-frame.
+        with Image.open(io.BytesIO(apng)) as probe:
+            self.assertGreater(getattr(probe, "n_frames", 1), 1)
+
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError, "multi-frame"
+        ):
+            wiki_artifacts.render_artifact(
+                {
+                    "kind": "visual-diff",
+                    "payload": {
+                        "before": {
+                            "data_base64": base64.b64encode(apng).decode(),
+                            "mime": "image/png",
+                        },
+                        "after": {
+                            "data_base64": base64.b64encode(FIXTURE_PNG_BYTES).decode(),
+                            "mime": "image/png",
+                        },
+                    },
+                }
+            )
+
+    def test_visual_diff_rejects_animated_webp(self) -> None:
+        buffer = io.BytesIO()
+        first = Image.new("RGB", (4, 4), color=(0, 0, 255))
+        rest = [Image.new("RGB", (4, 4), color=(0, 255, 0)) for _ in range(2)]
+        try:
+            first.save(
+                buffer,
+                format="WEBP",
+                save_all=True,
+                append_images=rest,
+                duration=100,
+                loop=0,
+                lossless=True,
+            )
+        except (OSError, ValueError) as exc:
+            self.skipTest(f"Pillow WEBP encoder without animation support: {exc}")
+        animated = buffer.getvalue()
+        try:
+            with Image.open(io.BytesIO(animated)) as probe:
+                if getattr(probe, "n_frames", 1) <= 1:
+                    self.skipTest("Pillow WEBP encoder produced single-frame output")
+        except Exception as exc:  # noqa: BLE001
+            self.skipTest(f"could not probe encoded animated WEBP: {exc}")
+
+        upright_webp = io.BytesIO()
+        Image.new("RGB", (4, 4), color=(0, 0, 0)).save(upright_webp, format="WEBP", lossless=True)
+
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError, "multi-frame"
+        ):
+            wiki_artifacts.render_artifact(
+                {
+                    "kind": "visual-diff",
+                    "payload": {
+                        "before": {
+                            "data_base64": base64.b64encode(animated).decode(),
+                            "mime": "image/webp",
+                        },
+                        "after": {
+                            "data_base64": base64.b64encode(upright_webp.getvalue()).decode(),
+                            "mime": "image/webp",
+                        },
+                    },
+                }
+            )
+
+    def test_visual_diff_rejects_truncated_jpeg_per_side(self) -> None:
+        # PIL's Image.verify() walks JPEG marker structure but does NOT
+        # decompress scan data — a JPEG missing its final EOI bytes passes
+        # verify(), then fails inside _generate_preview's load() where the
+        # exception is silently swallowed. The tool used to report success
+        # while the client received an image the browser could not decode.
+        def _valid_jpeg(size: tuple[int, int] = (16, 16)) -> bytes:
+            buffer = io.BytesIO()
+            Image.new("RGB", size, color=(255, 128, 0)).save(
+                buffer, format="JPEG", quality=95
+            )
+            return buffer.getvalue()
+
+        def _truncated_jpeg() -> bytes:
+            valid = _valid_jpeg()
+            # Drop the closing EOI marker (last 2 bytes) so scan data cannot
+            # be completed by the decoder.
+            return valid[:-2]
+
+        truncated = _truncated_jpeg()
+        upright = _valid_jpeg()
+
+        # Truncation on the before side.
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError, "payload.before rejected"
+        ):
+            wiki_artifacts.render_artifact(
+                {
+                    "kind": "visual-diff",
+                    "payload": {
+                        "before": {
+                            "data_base64": base64.b64encode(truncated).decode(),
+                            "mime": "image/jpeg",
+                        },
+                        "after": {
+                            "data_base64": base64.b64encode(upright).decode(),
+                            "mime": "image/jpeg",
+                        },
+                    },
+                }
+            )
+
+        # Truncation on the after side.
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError, "payload.after rejected"
+        ):
+            wiki_artifacts.render_artifact(
+                {
+                    "kind": "visual-diff",
+                    "payload": {
+                        "before": {
+                            "data_base64": base64.b64encode(upright).decode(),
+                            "mime": "image/jpeg",
+                        },
+                        "after": {
+                            "data_base64": base64.b64encode(truncated).decode(),
+                            "mime": "image/jpeg",
+                        },
+                    },
+                }
+            )
+
+    def test_visual_diff_rejects_valid_header_corrupt_crc_per_side(self) -> None:
+        # PNG structure: 8-byte signature, then chunks each shaped
+        # length(4) + type(4) + data(length) + crc(4). The IHDR chunk sits at
+        # offset 8 with a 13-byte payload and a CRC at bytes 29..33.
+        def _corrupt_ihdr_crc() -> bytes:
+            corrupted = bytearray(FIXTURE_PNG_BYTES)
+            for i in range(29, 33):
+                corrupted[i] ^= 0xFF
+            return bytes(corrupted)
+
+        corrupt = _corrupt_ihdr_crc()
+        upright = FIXTURE_PNG_BYTES
+
+        # Corrupt on the 'before' side.
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError, "payload.before rejected"
+        ):
+            wiki_artifacts.render_artifact(
+                {
+                    "kind": "visual-diff",
+                    "payload": {
+                        "before": {
+                            "data_base64": base64.b64encode(corrupt).decode(),
+                            "mime": "image/png",
+                        },
+                        "after": {
+                            "data_base64": base64.b64encode(upright).decode(),
+                            "mime": "image/png",
+                        },
+                    },
+                }
+            )
+
+        # Corrupt on the 'after' side.
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError, "payload.after rejected"
+        ):
+            wiki_artifacts.render_artifact(
+                {
+                    "kind": "visual-diff",
+                    "payload": {
+                        "before": {
+                            "data_base64": base64.b64encode(upright).decode(),
+                            "mime": "image/png",
+                        },
+                        "after": {
+                            "data_base64": base64.b64encode(corrupt).decode(),
+                            "mime": "image/png",
+                        },
+                    },
+                }
+            )
+
+    def test_visual_diff_rejects_non_image_bytes(self) -> None:
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError, "payload.after rejected"
+        ):
+            wiki_artifacts.render_artifact(
+                {
+                    "kind": "visual-diff",
+                    "payload": {
+                        "before": {
+                            "data_base64": base64.b64encode(FIXTURE_PNG_BYTES).decode(),
+                            "mime": "image/png",
+                        },
+                        "after": {
+                            "data_base64": base64.b64encode(b"not an image").decode(),
+                            "mime": "image/png",
+                        },
+                    },
+                }
+            )
+
+    def test_visual_diff_rejects_unsupported_mime(self) -> None:
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError, "payload.before.mime"
+        ):
+            wiki_artifacts.render_artifact(
+                {
+                    "kind": "visual-diff",
+                    "payload": {
+                        "before": {
+                            "data_base64": base64.b64encode(FIXTURE_PNG_BYTES).decode(),
+                            "mime": "image/gif",
+                        },
+                        "after": {
+                            "data_base64": base64.b64encode(FIXTURE_PNG_BYTES).decode(),
+                            "mime": "image/png",
+                        },
+                    },
+                }
+            )
+
+    def test_visual_diff_enforces_per_variant_size_cap(self) -> None:
+        oversize = base64.b64encode(b"x" * (wiki_artifacts.IMAGE_LIMIT + 1)).decode()
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError, "payload.after exceeds"
+        ):
+            wiki_artifacts.render_artifact(
+                {
+                    "kind": "visual-diff",
+                    "payload": {
+                        "before": {
+                            "data_base64": base64.b64encode(FIXTURE_PNG_BYTES).decode(),
+                            "mime": "image/png",
+                        },
+                        "after": {
+                            "data_base64": oversize,
+                            "mime": "image/png",
+                        },
+                    },
                 }
             )
 
@@ -287,6 +703,34 @@ class WikiArtifactsTests(unittest.TestCase):
         self.assertIsNotNone(event)
         self.assertEqual(event["artifact"]["kind"], "mermaid")
 
+    def test_tools_list_describes_visual_diff_payload_contract(self) -> None:
+        response = wiki_artifacts._response(  # noqa: SLF001 - MCP contract test
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+        )
+        assert response is not None
+        tools = {tool["name"]: tool for tool in response["result"]["tools"]}
+        render_artifact = tools["render_artifact"]
+        # The kind enum lists visual-diff so agents can discover the mode.
+        self.assertIn("visual-diff", render_artifact["inputSchema"]["properties"]["kind"]["enum"])
+        # The payload description spells out the visual-diff contract — before
+        # and after objects, MIME allowlist, size cap, matching dimensions,
+        # single-frame requirement. Without this, agents can invoke the kind
+        # but not the shape.
+        payload_property = render_artifact["inputSchema"]["properties"]["payload"]
+        description = payload_property.get("description", "")
+        self.assertIn("visual-diff", description)
+        self.assertIn("before", description)
+        self.assertIn("after", description)
+        self.assertIn("data_base64", description)
+        self.assertIn("mime", description)
+        self.assertIn("image/png", description)
+        self.assertIn("5MB", description)
+        self.assertIn("dimensions", description)
+        self.assertRegex(description, r"APNG|animated")
+        # Top-level tool description reiterates the shape so agents that only
+        # read the description (not the schema) still get the contract.
+        self.assertIn("visual-diff", render_artifact["description"])
+
     def test_orchestrator_lists_native_ops_but_worker_does_not(self) -> None:
         worker = wiki_artifacts._response(  # noqa: SLF001 - MCP contract test
             {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
@@ -345,6 +789,61 @@ class WikiArtifactsTests(unittest.TestCase):
         self.assertEqual(calls[0][2]["orch"], "wiki")
         self.assertEqual(calls[0][2]["request_id"], "mcp-next-review-1")
         self.assertEqual(calls[0][2]["diversity"], ["correctness", "security"])
+
+    def test_slow_agent_operations_use_extended_backend_timeout(self) -> None:
+        timeouts: list[float] = []
+
+        def request_json(
+            _base_url: str,
+            _method: str,
+            _path: str,
+            _payload: dict | None = None,
+            *,
+            timeout: float,
+        ) -> dict:
+            timeouts.append(timeout)
+            return {"status": "accepted", "run_id": "slow-start"}
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "WIKI_AGENT_ROLE": "orchestrator",
+                    "WIKI_AGENT_ID": "wiki",
+                    "WIKI_BACKEND_URL": "http://127.0.0.1:43112",
+                },
+            ),
+            mock.patch.object(
+                wiki_agent_tools.backend_runtime,
+                "request_json",
+                side_effect=request_json,
+            ),
+        ):
+            wiki_agent_tools.spawn_agent(
+                {
+                    "ticket": "WIKI-SLOW-SPAWN",
+                    "kind": "cdx",
+                    "role": "implement",
+                    "model": "gpt-5.4",
+                    "effort": "high",
+                    "workdir": "/tmp/worktree",
+                    "prompt": "start slowly",
+                    "orch": "wiki",
+                }
+            )
+            wiki_agent_tools.next_review(
+                {
+                    "ticket": "WIKI-SLOW-REVIEW",
+                    "pr_number": 226,
+                    "expected_sha": "a" * 40,
+                }
+            )
+
+        self.assertEqual(
+            timeouts,
+            [wiki_agent_tools.SLOW_AGENT_OPERATION_TIMEOUT_SECONDS] * 2,
+        )
+        self.assertGreater(timeouts[0], 15)
 
     def test_next_review_canonical_handler_routes_combined_verdict(self) -> None:
         runtime_dir = self.root / "runtime"
