@@ -1019,6 +1019,12 @@ class RotationResult:
     failed: list[str]  # ticket ids that couldn't be revived
     reset_at: str | None  # reset time recorded for outgoing account
     failed_reasons: dict[str, str] = field(default_factory=dict)
+    # Ticket -> run_id for the failing run at the moment the rotation
+    # decided the worker could not be revived. The notice store uses this
+    # to reconcile against the live registry: a replaced ticket has a new
+    # run_id and its notice drops on the next refresh. Empty for legacy
+    # tmux workers that have no run_id.
+    failed_run_ids: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -1651,6 +1657,12 @@ async def _check_once(
         "revived": result.revived,
         "failed": result.failed,
         "failed_reasons": result.failed_reasons,
+        # Legacy tmux workers have no run_id, so this map is empty for
+        # this path. The headless supervisor populates it; notices with
+        # no stored run_id fall back to ticket-only reconciliation
+        # (archive clears, replace does not) — legacy replace flows
+        # publish codex_worker_replaced to cover that case.
+        "failed_run_ids": result.failed_run_ids,
         "ts": datetime.now(timezone.utc).isoformat(),
     })
 

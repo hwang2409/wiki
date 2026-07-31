@@ -1916,12 +1916,22 @@ def list_workspaces() -> WorkspaceList:
 def agents() -> dict[str, object]:
     registry: dict = {}
     registry_refreshed_at: str | None = None
+    # Notice reconciliation compares against live registry identity, but the
+    # registry file may be transiently missing (backend/supervisor startup
+    # race), unreadable, or a non-object payload. On any of those failure
+    # shapes we MUST leave the notice store alone — reconciling from {}
+    # would treat every worker-scoped notice as archived and permanently
+    # delete durable operator guidance.
+    registry_loaded = False
     try:
-        registry = json.loads(AGENT_REGISTRY_PATH.read_text(encoding="utf-8"))
-        registry_refreshed_at = datetime.fromtimestamp(
-            AGENT_REGISTRY_PATH.stat().st_mtime,
-            tz=timezone.utc,
-        ).isoformat()
+        loaded = json.loads(AGENT_REGISTRY_PATH.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            registry = loaded
+            registry_loaded = True
+            registry_refreshed_at = datetime.fromtimestamp(
+                AGENT_REGISTRY_PATH.stat().st_mtime,
+                tz=timezone.utc,
+            ).isoformat()
     except (OSError, ValueError):
         pass
 
@@ -2131,12 +2141,16 @@ def agents() -> dict[str, object]:
             }
         )
 
-    # Reconcile worker-scoped notices against the live registry. Replace and
-    # archive flows publish only session/agents events, which the notice
-    # store correctly ignores; without this, banners for removed tickets
-    # would remain forever. WIKI-228 will drive this from durable supervisor
-    # events instead of an ambient snapshot check.
-    ACCOUNT_NOTICES.reconcile_with_live(live_runs)
+    # Reconcile worker-scoped notices against the live registry. Only run
+    # when the registry loaded as a valid object — a missing / unreadable /
+    # non-object registry would otherwise pass {} here and permanently
+    # delete every notice. Replace and archive flows publish only
+    # session/agents events, which the notice store correctly ignores;
+    # without this reconciliation, banners for removed tickets would remain
+    # forever. WIKI-228 will drive this from durable supervisor events
+    # instead of an ambient snapshot check.
+    if registry_loaded:
+        ACCOUNT_NOTICES.reconcile_with_live(live_runs)
 
     return {
         "workers": workers,

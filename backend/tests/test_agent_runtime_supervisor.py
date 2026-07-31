@@ -3315,6 +3315,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 "revived": ["WIKI-CODEX-ROTATE"],
                 "failed": [],
                 "failed_reasons": {},
+                "failed_run_ids": {},
             },
         )
         resumed = self.store.get(codex.run_id)
@@ -3417,6 +3418,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 "revived": ["WIKI-RATE-LIMIT"],
                 "failed": [],
                 "failed_reasons": {},
+                "failed_run_ids": {},
                 "ts": published["ts"],
             },
         )

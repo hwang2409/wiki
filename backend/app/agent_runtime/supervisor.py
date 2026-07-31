@@ -2165,6 +2165,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 "revived": revival["revived"],
                 "failed": revival["failed"],
                 "failed_reasons": revival["failed_reasons"],
+                "failed_run_ids": revival["failed_run_ids"],
             }
             journal.update(
                 {
@@ -2178,6 +2179,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             account_result.revived = list(result["revived"])
             account_result.failed = list(result["failed"])
             account_result.failed_reasons = dict(result["failed_reasons"])
+            account_result.failed_run_ids = dict(result["failed_run_ids"])
             await asyncio.to_thread(accounts.record_rotation_log, account_result)
             await self._publish(
                 {
@@ -2373,6 +2375,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     "revived": revival["revived"],
                     "failed": revival["failed"],
                     "failed_reasons": reasons,
+                    "failed_run_ids": revival["failed_run_ids"],
                 },
                 "error": detail,
             }
@@ -2411,6 +2414,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         revived: list[str] = []
         failed: list[str] = []
         failed_reasons: dict[str, str] = {}
+        failed_run_ids: dict[str, str] = {}
         pending = False
         operation_id = str(journal["operation_id"])
         for row in journal["runs"]:
@@ -2458,12 +2462,17 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     row["failed_reason"] = reason
                     failed.append(agent_id)
                     failed_reasons[agent_id] = reason
+                    failed_run_ids[agent_id] = run_id
                 finally:
                     self._write_rotation_journal(journal)
         return {
             "revived": revived,
             "failed": failed,
             "failed_reasons": failed_reasons,
+            # Per-ticket run_id lets the notice store reconcile a rotation
+            # failure notice against the live registry: a replaced ticket
+            # gets a new run_id and its notice drops on the next refresh.
+            "failed_run_ids": failed_run_ids,
             "pending": pending,
         }
 
@@ -2501,6 +2510,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 "revived": revival["revived"],
                 "failed": revival["failed"],
                 "failed_reasons": revival["failed_reasons"],
+                "failed_run_ids": revival["failed_run_ids"],
             }
             journal.update(
                 {

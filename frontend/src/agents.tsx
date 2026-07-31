@@ -6,6 +6,7 @@ import {
   ChevronDown,
   ExternalLink,
   GitPullRequest,
+  MoreHorizontal,
   Plus,
   RefreshCw,
   ScrollText,
@@ -139,6 +140,35 @@ function healthFlag(worker: AgentWorker): string | null {
   return null;
 }
 
+// Friendly, task-facing provider names. The internal kind codes ("cc", "cdx")
+// stay in the API contract and appear in Technical details, but every
+// operator-facing surface uses the product names.
+function providerLabel(kind: string | null | undefined): string {
+  if (kind === "cc") return "Claude";
+  if (kind === "cdx") return "Codex";
+  return kind ?? "unknown";
+}
+
+// One state-specific primary action per card (WIKI-154 finding 3). Everything
+// else (Replace, other lifecycle controls, output preview) lives in the card
+// overflow menu. Card-body click always opens the session preview, so an
+// implicit "open session" primary is not surfaced as a button.
+type PrimaryActionKind = "archive-dead" | "interrupt" | "resume" | "review" | null;
+
+function primaryActionForWorker(worker: AgentWorker, deadRun: boolean): PrimaryActionKind {
+  if (deadRun) return "archive-dead";
+  const state = worker.state ?? worker.runtime_state;
+  const controlAttached = Boolean(worker.control_attached);
+  if (controlAttached && (state === "starting" || state === "working" || state === "waiting-approval")) {
+    return "interrupt";
+  }
+  if (!controlAttached && (state === "working" || state === "idle" || state === "blocked")) {
+    return "resume";
+  }
+  if (worker.pr && state === "merge-ready") return "review";
+  return null;
+}
+
 function archivedAge(iso: string): string {
   const seconds = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
   if (seconds < 3600) return `${Math.max(1, Math.floor(seconds / 60))}m ago`;
@@ -188,6 +218,7 @@ export function SpawnWorkerModal({
   const [submitting, setSubmitting] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
 
   function requestClose() {
     if (submitting) return;
@@ -377,8 +408,9 @@ export function SpawnWorkerModal({
         </div>
 
         <div className="agent-spawn-fields">
+          {/* Lead: what task, and what the worker should do. */}
           <label className="agent-spawn-field">
-            <span className="agent-spawn-label">Ticket id</span>
+            <span className="agent-spawn-label">Ticket</span>
             <input
               required
               className="dialog-input"
@@ -393,111 +425,11 @@ export function SpawnWorkerModal({
             <span className="agent-spawn-hint">Uppercase letters, numbers, and dashes only.</span>
           </label>
 
-          <div className="agent-spawn-row">
-            <label className="agent-spawn-field">
-              <span className="agent-spawn-label">Kind</span>
-              <select
-                className="agent-spawn-select"
-                value={kind}
-                onChange={(event) => {
-                  resetConfirmation();
-                  setKind(event.target.value as SpawnWorkerKind);
-                }}
-              >
-                <option value="cdx">cdx</option>
-                <option value="cc">cc</option>
-              </select>
-            </label>
-
-            <label className="agent-spawn-field">
-              <span className="agent-spawn-label">Role</span>
-              <select
-                className="agent-spawn-select"
-                value={role}
-                onChange={(event) => {
-                  resetConfirmation();
-                  applyRolePreset(event.target.value as SpawnWorkerRole);
-                }}
-              >
-                <option value="plan">plan</option>
-                <option value="implement">implement</option>
-                <option value="review">review</option>
-              </select>
-              <span className="agent-spawn-hint">
-                Sets the pipeline default kind, model, and effort.
-              </span>
-            </label>
-          </div>
-
-          <div className="agent-spawn-row">
-            <label className="agent-spawn-field">
-              <span className="agent-spawn-label">Model</span>
-              <select
-                className="agent-spawn-select"
-                disabled={allowedModels.length === 0}
-                value={model}
-                onChange={(event) => {
-                  resetConfirmation();
-                  setModel(event.target.value);
-                }}
-              >
-                {allowedModels.length === 0 ? (
-                  <option value="">No models available</option>
-                ) : (
-                  allowedModels.map((option) => (
-                    <option key={option.id} value={option.id}>
-                      {option.label}
-                    </option>
-                  ))
-                )}
-              </select>
-            </label>
-
-            {kind === "cdx" ? (
-              <label className="agent-spawn-field">
-                <span className="agent-spawn-label">Reasoning effort</span>
-                <select
-                  className="agent-spawn-select"
-                  value={effort}
-                  onChange={(event) => {
-                    resetConfirmation();
-                    setEffort(event.target.value as SpawnWorkerEffort);
-                  }}
-                >
-                  {REASONING_EFFORTS.map((option) => (
-                    <option key={option} value={option}>
-                      {option}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            ) : (
-              <div className="agent-spawn-field">
-                <span className="agent-spawn-label">Reasoning effort</span>
-                <div className="agent-spawn-static">Not used for Claude workers.</div>
-              </div>
-            )}
-          </div>
-
           <label className="agent-spawn-field">
-            <span className="agent-spawn-label">Working dir</span>
-            <input
-              required
-              className="dialog-input"
-              value={workdir}
-              onChange={(event) => {
-                resetConfirmation();
-                setWorkdir(event.target.value);
-                invalidatePrelude();
-              }}
-            />
-          </label>
-
-          <label className="agent-spawn-field">
-            <span className="agent-spawn-label">Ticket title</span>
+            <span className="agent-spawn-label">Title</span>
             <input
               className="dialog-input"
-              placeholder="Optional title or short description"
+              placeholder="Short description of the task"
               value={title}
               onChange={(event) => {
                 resetConfirmation();
@@ -505,25 +437,6 @@ export function SpawnWorkerModal({
                 invalidatePrelude();
               }}
             />
-          </label>
-
-          <label className="agent-spawn-field">
-            <span className="agent-spawn-label">Orchestrator id</span>
-            <select
-              className="agent-spawn-select"
-              value={orch}
-              onChange={(event) => {
-                resetConfirmation();
-                setOrch(event.target.value);
-              }}
-            >
-              {orchestrators.map((candidate) => (
-                <option key={candidate.id} value={candidate.id}>
-                  {candidate.id}
-                </option>
-              ))}
-              <option value="">{orchestrators.length > 0 ? "ungrouped" : "none"}</option>
-            </select>
           </label>
 
           <label className="agent-spawn-field">
@@ -540,61 +453,213 @@ export function SpawnWorkerModal({
               }}
             />
             <span className="agent-spawn-hint">
-              {promptTooLarge ? "Prompt must stay under 100KB." : `${promptBytes} bytes`}
+              {promptTooLarge
+                ? "Prompt must stay under 100KB."
+                : promptBytes >= 80_000
+                ? `${promptBytes} bytes · nearing the 100KB limit`
+                : ""}
             </span>
           </label>
 
-          <label className="agent-spawn-field">
-            <span className="agent-spawn-label">
-              <input
-                type="checkbox"
-                checked={contextEnabled}
-                onChange={(event) => {
-                  const enabled = event.target.checked;
-                  resetConfirmation();
-                  setContextEnabled(enabled);
-                  setPreludeReady(false);
-                  setPreludeError(null);
-                  setPreludeLoading(enabled);
-                  if (!enabled) setPrelude("");
-                }}
-              />{" "}
-              Add context prelude
-            </span>
-            <textarea
-              aria-label="Context prelude"
-              className="dialog-input agent-spawn-textarea agent-context-prelude"
-              placeholder="Enter a ticket and working dir to preview local context."
-              value={prelude}
-              disabled={!contextEnabled || preludeLoading}
-              onChange={(event) => {
-                resetConfirmation();
-                setPrelude(event.target.value);
-                setPreludeError(null);
-                setPreludeReady(true);
-              }}
-            />
-            <span className="agent-spawn-hint">
-              {!contextEnabled
-                ? "Optional. Enable to retrieve local context."
-                : preludeLoading
-                ? "Building deterministic local context…"
-                : preludeError ||
-                  (preludeTooLarge
-                    ? "Context prelude must stay within 4096 characters."
-                    : `${prelude.length} / 4096 characters · editable before send`)}
-            </span>
-          </label>
+          {/* Everything else is provider/model/context tuning. Hide by
+              default (WIKI-154 finding 4 — Advanced disclosure). The role
+              preset already applied sensible defaults on open. */}
+          <div className="agent-spawn-advanced">
+            <button
+              aria-controls="spawn-advanced-body"
+              aria-expanded={advancedOpen}
+              className="agent-spawn-advanced-toggle"
+              type="button"
+              onClick={() => setAdvancedOpen((value) => !value)}
+            >
+              <ChevronDown
+                className={`disclosure-chevron${advancedOpen ? "" : " is-collapsed"}`}
+                size={13}
+              />
+              Advanced
+              <span className="agent-spawn-advanced-summary">
+                {role} · {providerLabel(kind)} · {model || "default model"}
+                {kind === "cdx" ? ` · ${effort}` : ""}
+              </span>
+            </button>
+            <DisclosureContent open={advancedOpen}>
+              <div className="agent-spawn-advanced-body" id="spawn-advanced-body">
+                <div className="agent-spawn-row">
+                  <label className="agent-spawn-field">
+                    <span className="agent-spawn-label">Role</span>
+                    <select
+                      aria-label="Role"
+                      className="agent-spawn-select"
+                      value={role}
+                      onChange={(event) => {
+                        resetConfirmation();
+                        applyRolePreset(event.target.value as SpawnWorkerRole);
+                      }}
+                    >
+                      <option value="plan">plan</option>
+                      <option value="implement">implement</option>
+                      <option value="review">review</option>
+                    </select>
+                    <span className="agent-spawn-hint">
+                      Sets the pipeline default provider, model, and effort.
+                    </span>
+                  </label>
+
+                  <label className="agent-spawn-field">
+                    <span className="agent-spawn-label">Provider</span>
+                    <select
+                      aria-label="Provider"
+                      className="agent-spawn-select"
+                      value={kind}
+                      onChange={(event) => {
+                        resetConfirmation();
+                        setKind(event.target.value as SpawnWorkerKind);
+                      }}
+                    >
+                      <option value="cdx">Codex</option>
+                      <option value="cc">Claude</option>
+                    </select>
+                  </label>
+                </div>
+
+                <div className="agent-spawn-row">
+                  <label className="agent-spawn-field">
+                    <span className="agent-spawn-label">Model</span>
+                    <select
+                      aria-label="Model"
+                      className="agent-spawn-select"
+                      disabled={allowedModels.length === 0}
+                      value={model}
+                      onChange={(event) => {
+                        resetConfirmation();
+                        setModel(event.target.value);
+                      }}
+                    >
+                      {allowedModels.length === 0 ? (
+                        <option value="">No models available</option>
+                      ) : (
+                        allowedModels.map((option) => (
+                          <option key={option.id} value={option.id}>
+                            {option.label}
+                          </option>
+                        ))
+                      )}
+                    </select>
+                  </label>
+
+                  {kind === "cdx" ? (
+                    <label className="agent-spawn-field">
+                      <span className="agent-spawn-label">Reasoning effort</span>
+                      <select
+                        aria-label="Reasoning effort"
+                        className="agent-spawn-select"
+                        value={effort}
+                        onChange={(event) => {
+                          resetConfirmation();
+                          setEffort(event.target.value as SpawnWorkerEffort);
+                        }}
+                      >
+                        {REASONING_EFFORTS.map((option) => (
+                          <option key={option} value={option}>
+                            {option}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  ) : null}
+                </div>
+
+                <label className="agent-spawn-field">
+                  <span className="agent-spawn-label">Working dir</span>
+                  <input
+                    required
+                    className="dialog-input"
+                    value={workdir}
+                    onChange={(event) => {
+                      resetConfirmation();
+                      setWorkdir(event.target.value);
+                      invalidatePrelude();
+                    }}
+                  />
+                </label>
+
+                <label className="agent-spawn-field">
+                  <span className="agent-spawn-label">Orchestrator</span>
+                  <select
+                    aria-label="Orchestrator"
+                    className="agent-spawn-select"
+                    value={orch}
+                    onChange={(event) => {
+                      resetConfirmation();
+                      setOrch(event.target.value);
+                    }}
+                  >
+                    {orchestrators.map((candidate) => (
+                      <option key={candidate.id} value={candidate.id}>
+                        {candidate.id}
+                      </option>
+                    ))}
+                    <option value="">{orchestrators.length > 0 ? "ungrouped" : "none"}</option>
+                  </select>
+                </label>
+
+                <label className="agent-spawn-field">
+                  <span className="agent-spawn-label">
+                    <input
+                      type="checkbox"
+                      checked={contextEnabled}
+                      onChange={(event) => {
+                        const enabled = event.target.checked;
+                        resetConfirmation();
+                        setContextEnabled(enabled);
+                        setPreludeReady(false);
+                        setPreludeError(null);
+                        setPreludeLoading(enabled);
+                        if (!enabled) setPrelude("");
+                      }}
+                    />{" "}
+                    Add context prelude
+                  </span>
+                  <textarea
+                    aria-label="Context prelude"
+                    className="dialog-input agent-spawn-textarea agent-context-prelude"
+                    placeholder="Enter a ticket and working dir to preview local context."
+                    value={prelude}
+                    disabled={!contextEnabled || preludeLoading}
+                    onChange={(event) => {
+                      resetConfirmation();
+                      setPrelude(event.target.value);
+                      setPreludeError(null);
+                      setPreludeReady(true);
+                    }}
+                  />
+                  <span className="agent-spawn-hint">
+                    {!contextEnabled
+                      ? "Optional. Enable to retrieve local context."
+                      : preludeLoading
+                      ? "Building deterministic local context…"
+                      : preludeError ||
+                        (preludeTooLarge
+                          ? "Context prelude must stay within 4096 characters."
+                          : prelude.length > 3400
+                          ? `${prelude.length} / 4096 characters · nearing limit`
+                          : "editable before send")}
+                  </span>
+                </label>
+              </div>
+            </DisclosureContent>
+          </div>
         </div>
 
         <div className="agent-spawn-preview">
           <div className="agent-spawn-preview-title">This will create</div>
           <div className="agent-spawn-preview-primary">
-            <code>
-              {kind}:{normalizedTicket || "…"}
-            </code>{" "}
-            · {role} worker · {model || "no model"}
-            {kind === "cdx" ? ` · ${effort} effort` : ""}
+            <code>{normalizedTicket || "…"}</code> · {role} worker on{" "}
+            {providerLabel(kind)}
+          </div>
+          <div className="agent-spawn-preview-line">
+            {model || "default model"}
+            {kind === "cdx" ? ` · ${effort} reasoning effort` : ""}
           </div>
           <div className="agent-spawn-preview-line">
             {orch ? (
@@ -606,10 +671,11 @@ export function SpawnWorkerModal({
             )}{" "}
             · in <code>{workdir.trim() || "…"}</code>
           </div>
-          <div className="agent-spawn-preview-line">
-            kickoff prompt {promptBytes} bytes
-            {contextEnabled ? ` · context prelude ${prelude.length} chars` : ""}
-          </div>
+          {contextEnabled ? (
+            <div className="agent-spawn-preview-line">
+              context prelude enabled ({prelude.length} chars)
+            </div>
+          ) : null}
         </div>
 
         {!ticketValid && normalizedTicket ? (
@@ -1101,6 +1167,25 @@ export function AgentsView({
     readStoredExpandedScreencasts
   );
   const [expandedDetails, setExpandedDetails] = useState<Set<string>>(new Set());
+  const [openMenuTicket, setOpenMenuTicket] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (openMenuTicket === null) return;
+    function onDown(event: MouseEvent) {
+      const target = event.target as HTMLElement | null;
+      if (target && target.closest(`[data-agent-menu-for="${openMenuTicket}"]`)) return;
+      setOpenMenuTicket(null);
+    }
+    function onKey(event: KeyboardEvent) {
+      if (event.key === "Escape") setOpenMenuTicket(null);
+    }
+    window.addEventListener("mousedown", onDown);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", onDown);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [openMenuTicket]);
 
   function toggleDetails(id: string) {
     setExpandedDetails((prev) => {
@@ -1390,13 +1475,139 @@ export function AgentsView({
     const isOpen = openTicket === worker.ticket;
     const previewOpen = expandedScreencasts.has(worker.ticket);
     const detailsOpen = expandedDetails.has(worker.ticket);
+    const menuOpen = openMenuTicket === worker.ticket;
+    const replaceTargetForCard: ReplaceAgentTarget = {
+      id: worker.ticket,
+      kind: worker.kind === "cdx" ? "cdx" : "cc",
+      model: worker.model ?? "",
+      effort: worker.effort,
+      role: worker.role,
+    };
+    const replaceDisabled = !worker.run_id && (!worker.window || !worker.window_alive);
+    const runtimeState = worker.runtime_state ?? worker.state;
+    const controlAttached = Boolean(worker.control_attached);
+    const primary = primaryActionForWorker(worker, deadRun);
+    const canInterrupt =
+      controlAttached &&
+      (runtimeState === "starting" ||
+        runtimeState === "working" ||
+        runtimeState === "waiting-approval");
+    const canResume =
+      !controlAttached &&
+      (runtimeState === "working" || runtimeState === "idle" || runtimeState === "blocked");
+    const canComplete = controlAttached && (runtimeState === "idle" || runtimeState === "interrupted");
+    const terminal = runtimeState === "dead" || runtimeState === "completed";
+    // Menu items = every applicable lifecycle action MINUS whichever action is
+    // already surfaced as the card's primary button. Destructive actions
+    // (Complete, Stop, Replace) always live in the menu.
+    const menuItems: Array<{ key: string; label: string; run: () => void }> = [];
+    if (canInterrupt && primary !== "interrupt") {
+      menuItems.push({
+        key: "interrupt",
+        label: "Interrupt",
+        run: () => void requestControl(worker.ticket, "interrupt", false),
+      });
+    }
+    if (canResume && primary !== "resume") {
+      menuItems.push({
+        key: "resume",
+        label: "Revive",
+        run: () => void requestControl(worker.ticket, "resume", false),
+      });
+    }
+    if (canComplete) {
+      const key = `${worker.ticket}:archive`;
+      const confirming = controlConfirm === key;
+      menuItems.push({
+        key: "complete",
+        label: confirming ? "Confirm complete" : "Complete",
+        run: () => void requestControl(worker.ticket, "archive", true),
+      });
+    }
+    if (!terminal) {
+      const key = `${worker.ticket}:stop`;
+      const confirming = controlConfirm === key;
+      menuItems.push({
+        key: "stop",
+        label: confirming ? "Confirm stop" : "Stop",
+        run: () => void requestControl(worker.ticket, "stop", true),
+      });
+    }
+    menuItems.push({
+      key: "replace",
+      label: "Replace",
+      run: () => {
+        if (replaceDisabled) return;
+        setReplaceNotice(null);
+        setReplaceTarget(replaceTargetForCard);
+      },
+    });
+    if (worker.pr) {
+      menuItems.push({
+        key: "review",
+        label: "Review PR",
+        run: () => onOpenAgent(worker.ticket, "review"),
+      });
+    }
+
+    function renderPrimary(): ReactNode {
+      if (primary === "archive-dead") {
+        return <DeadRunAffordance id={worker.ticket} />;
+      }
+      if (primary === "interrupt") {
+        const key = `${worker.ticket}:interrupt`;
+        const pending = controlPending === key;
+        return (
+          <button
+            className="agent-primary-action"
+            disabled={Boolean(controlPending)}
+            type="button"
+            onClick={() => void requestControl(worker.ticket, "interrupt", false)}
+          >
+            {pending ? "Interrupting…" : "Interrupt"}
+          </button>
+        );
+      }
+      if (primary === "resume") {
+        const key = `${worker.ticket}:resume`;
+        const pending = controlPending === key;
+        return (
+          <button
+            className="agent-primary-action"
+            disabled={Boolean(controlPending)}
+            type="button"
+            onClick={() => void requestControl(worker.ticket, "resume", false)}
+          >
+            {pending ? "Reviving…" : "Revive"}
+          </button>
+        );
+      }
+      if (primary === "review") {
+        return (
+          <button
+            className="agent-primary-action"
+            type="button"
+            onClick={() => onOpenAgent(worker.ticket, "review")}
+          >
+            <GitPullRequest size={12} />
+            Review
+          </button>
+        );
+      }
+      return null;
+    }
+
     return (
       <article
         className={`agent-card${isOpen ? " is-selected" : ""}`}
         key={worker.ticket}
         onClick={(event) => {
           const target = event.target as HTMLElement;
-          if (target.closest("button, a, input, textarea, select, .agent-screencast, .agent-tech"))
+          if (
+            target.closest(
+              "button, a, input, textarea, select, .agent-screencast, .agent-tech, .agent-card-menu"
+            )
+          )
             return;
           onOpenTicket(isOpen ? null : worker.ticket);
         }}
@@ -1409,12 +1620,7 @@ export function AgentsView({
           >
             {worker.ticket}
           </a>
-          {worker.kind ? <StatusBadge compact label={worker.kind} state="neutral" /> : null}
-          {worker.role ? <StatusBadge compact label={worker.role} state="neutral" /> : null}
-          {worker.model ? <StatusBadge compact label={worker.model} state="faint" /> : null}
-          {deadRun ? (
-            <DeadRunAffordance id={worker.ticket} />
-          ) : (
+          {deadRun ? null : (
             <StatusBadge label={state} state={worker.state ?? "unknown"} />
           )}
           <span className="agent-age tabular-nums">{ageLabel(worker.status_age_seconds)}</span>
@@ -1438,48 +1644,8 @@ export function AgentsView({
         ) : null}
 
         <div className="agent-meta">
-          {worker.worktree ? (
-            <BranchPill
-              branch={worker.worktree.split("/").slice(-1)[0] ?? worker.worktree}
-              title={worker.worktree}
-            />
-          ) : null}
-          {worker.pr ? (
-            <a className="agent-pr" href={worker.pr} {...externalLinkProps(worker.pr)}>
-              <ExternalLink size={11} />
-              PR
-            </a>
-          ) : null}
-          {worker.pr ? (
-            <button
-              className="agent-pr"
-              type="button"
-              onClick={() => {
-                onOpenAgent(worker.ticket, "review");
-              }}
-            >
-              <GitPullRequest size={11} />
-              Review
-            </button>
-          ) : null}
           <span className="agent-actions">
-            {worker.run_id && !deadRun ? (
-              <LifecycleControls
-                id={worker.ticket}
-                state={worker.runtime_state ?? worker.state}
-                controlAttached={Boolean(worker.control_attached)}
-              />
-            ) : null}
-            <ReplaceButton
-              target={{
-                id: worker.ticket,
-                kind: worker.kind === "cdx" ? "cdx" : "cc",
-                model: worker.model ?? "",
-                effort: worker.effort,
-                role: worker.role,
-              }}
-              disabled={!worker.run_id && (!worker.window || !worker.window_alive)}
-            />
+            {renderPrimary()}
             <button
               className={`agent-log-toggle${isOpen ? " is-active" : ""}`}
               type="button"
@@ -1514,12 +1680,56 @@ export function AgentsView({
               />
               details
             </button>
+            {menuItems.length > 0 ? (
+              <span className="agent-card-menu" data-agent-menu-for={worker.ticket}>
+                <button
+                  aria-expanded={menuOpen}
+                  aria-haspopup="menu"
+                  aria-label={`More actions for ${worker.ticket}`}
+                  className="agent-log-toggle agent-card-menu-toggle"
+                  type="button"
+                  onClick={() =>
+                    setOpenMenuTicket(menuOpen ? null : worker.ticket)
+                  }
+                >
+                  <MoreHorizontal size={13} />
+                </button>
+                {menuOpen ? (
+                  <div className="agent-card-menu-popover" role="menu">
+                    {menuItems.map((item) => (
+                      <button
+                        className="agent-card-menu-item"
+                        key={item.key}
+                        role="menuitem"
+                        type="button"
+                        onClick={() => {
+                          setOpenMenuTicket(null);
+                          item.run();
+                        }}
+                      >
+                        {item.label}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+              </span>
+            ) : null}
           </span>
         </div>
 
         <DisclosureContent open={detailsOpen}>
           <TechDetails
             rows={[
+              worker.kind ? ["provider", `${providerLabel(worker.kind)} (${worker.kind})`] : null,
+              worker.role ? ["role", worker.role] : null,
+              worker.model ? ["model", worker.model] : null,
+              worker.pr ? ["PR", worker.pr] : null,
+              worker.worktree
+                ? [
+                    "branch",
+                    worker.worktree.split("/").slice(-1)[0] ?? worker.worktree,
+                  ]
+                : null,
               worker.run_id
                 ? [
                     "run",

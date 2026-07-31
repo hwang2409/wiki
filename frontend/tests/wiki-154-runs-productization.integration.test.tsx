@@ -4,6 +4,7 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { useEffect, useState } from "react";
 
 import { AgentsView, SpawnWorkerModal } from "../src/agents";
+import { ReplaceAgentModal } from "../src/replace-agent-modal";
 import { isAgentRefreshEvent } from "../src/agent-events";
 import { getAgents } from "../src/api";
 import type { AgentModelOption, AgentWorker, ArchivedWorker, Orchestrator } from "../src/api";
@@ -334,7 +335,7 @@ test("codex_auth_verified refreshes the agents view and clears the exhausted ban
   expect(vi.mocked(getAgents).mock.calls.length).toBeGreaterThanOrEqual(2);
 });
 
-test("spawn dialog applies role presets and previews what will be created", () => {
+test("spawn dialog leads with ticket and prompt; role/model/effort live under Advanced", async () => {
   const view = render(
     <SpawnWorkerModal
       models={models}
@@ -343,9 +344,24 @@ test("spawn dialog applies role presets and previews what will be created", () =
       onSpawn={() => undefined}
     />
   );
-  const selects = view.container.querySelectorAll("select");
-  const roleSelect = selects[1] as HTMLSelectElement;
-  const modelSelect = selects[2] as HTMLSelectElement;
+  // Default view: ticket + title + prompt. Role/provider/model/effort are hidden.
+  expect(view.queryByLabelText("Role")).toBeNull();
+  expect(view.queryByLabelText("Provider")).toBeNull();
+  expect(view.queryByLabelText("Model")).toBeNull();
+  expect(view.queryByLabelText("Reasoning effort")).toBeNull();
+  // The Advanced summary shows the current preset so users can see defaults
+  // without opening.
+  const advanced = view.getByRole("button", { name: /Advanced/ });
+  expect(advanced.textContent).toMatch(/implement/);
+  expect(advanced.textContent).toMatch(/Codex/);
+
+  // Open Advanced to expose the tuning selects.
+  fireEvent.click(advanced);
+  await waitFor(() => {
+    expect(view.getByLabelText("Role")).toBeTruthy();
+  });
+  const roleSelect = view.getByLabelText("Role") as HTMLSelectElement;
+  const modelSelect = view.getByLabelText("Model") as HTMLSelectElement;
   expect(modelSelect.value).toBe("gpt-5.6-luna");
   fireEvent.change(roleSelect, { target: { value: "review" } });
   expect(modelSelect.value).toBe("gpt-5.6-sol");
@@ -353,5 +369,84 @@ test("spawn dialog applies role presets and previews what will be created", () =
   const preview = view.container.querySelector(".agent-spawn-preview");
   expect(preview?.textContent).toContain("This will create");
   expect(preview?.textContent).toContain("review worker");
+  expect(preview?.textContent).toContain("Codex");
   expect(preview?.textContent).toContain("gpt-5.6-sol");
+});
+
+test("spawn dialog hides kickoff byte count until it nears the 100KB limit", () => {
+  const view = render(
+    <SpawnWorkerModal
+      models={models}
+      orchestrators={[]}
+      onClose={() => undefined}
+      onSpawn={() => undefined}
+    />
+  );
+  const promptField = view.container.querySelector(
+    "textarea.agent-spawn-textarea",
+  ) as HTMLTextAreaElement;
+  fireEvent.change(promptField, { target: { value: "small prompt" } });
+  // Small prompt: no byte-count noise.
+  expect(view.container.textContent).not.toMatch(/\bbytes\b/);
+  // Just under the "nearing" threshold — still quiet.
+  fireEvent.change(promptField, { target: { value: "x".repeat(70_000) } });
+  expect(view.container.textContent).not.toMatch(/nearing the 100KB limit/);
+  // Push past 80KB — the size hint appears.
+  fireEvent.change(promptField, { target: { value: "x".repeat(85_000) } });
+  expect(view.container.textContent).toMatch(/nearing the 100KB limit/);
+});
+
+test("replace dialog leads with change preview; provider/model live under Advanced", async () => {
+  const view = render(
+    <ReplaceAgentModal
+      models={models}
+      onClose={() => undefined}
+      target={{ id: "WIKI-5", kind: "cdx", model: "gpt-5.4", effort: "high", role: "implement" }}
+    />
+  );
+  expect(view.queryByLabelText("Provider")).toBeNull();
+  expect(view.queryByLabelText("Model")).toBeNull();
+  // Change preview always visible and uses friendly labels.
+  const preview = view.container.querySelector(".agent-spawn-preview");
+  expect(preview?.textContent).toContain("Codex");
+  expect(preview?.textContent).not.toContain("cdx ·");
+
+  const advanced = view.getByRole("button", { name: /Advanced/ });
+  fireEvent.click(advanced);
+  await waitFor(() => {
+    expect(view.getByLabelText("Provider")).toBeTruthy();
+    expect(view.getByLabelText("Model")).toBeTruthy();
+  });
+});
+
+test("worker card default hides role, model, and technical actions; menu reveals Replace", async () => {
+  const view = renderView();
+  // Role/model badges no longer render on the default surface.
+  expect(view.queryByText("implement")).toBeNull();
+  expect(view.queryByText("opus")).toBeNull();
+  // Replace button lives inside the overflow menu, not on the default row.
+  expect(view.queryByRole("button", { name: /^Replace$/ })).toBeNull();
+  // A working + control-attached worker gets Interrupt as its ONE primary
+  // action; every other lifecycle control lives in the menu.
+  expect(view.getByRole("button", { name: /^Interrupt$/ })).toBeTruthy();
+  // Open the menu.
+  fireEvent.click(view.getByRole("button", { name: /More actions for WIKI-1/ }));
+  await waitFor(() => {
+    expect(view.getByRole("menuitem", { name: /^Replace$/ })).toBeTruthy();
+  });
+  // Stop and Review are the destructive/secondary actions available for a
+  // working attached worker with an open PR.
+  expect(view.getByRole("menuitem", { name: /^Stop$/ })).toBeTruthy();
+  expect(view.getByRole("menuitem", { name: /Review PR/ })).toBeTruthy();
+});
+
+test("worker card technical details expose provider/role/model when opened", async () => {
+  const view = renderView();
+  expect(view.queryByText(/Claude/)).toBeNull();
+  fireEvent.click(view.getByRole("button", { name: /details/ }));
+  await waitFor(() => {
+    expect(view.getByText(/Claude \(cc\)/)).toBeTruthy();
+    expect(view.getByText("implement")).toBeTruthy();
+    expect(view.getByText("opus")).toBeTruthy();
+  });
 });

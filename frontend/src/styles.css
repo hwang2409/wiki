@@ -5338,6 +5338,108 @@ body.is-resizing-panes .pane-cell {
   opacity: 0.45;
 }
 
+.agent-primary-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 10px;
+  border: 1px solid color-mix(in srgb, var(--accent-primary) 45%, var(--background-modifier-border));
+  border-radius: var(--radius-s);
+  color: var(--accent-primary);
+  font-family: var(--font-monospace);
+  font-weight: var(--fw-semibold);
+  font-size: var(--font-ui-smaller);
+  transition-property: background-color, border-color, color;
+  transition-duration: 100ms;
+  transition-timing-function: ease-out;
+}
+
+.agent-primary-action:hover {
+  background-color: color-mix(in srgb, var(--accent-primary) 10%, transparent);
+}
+
+.agent-primary-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.agent-card-menu {
+  position: relative;
+  display: inline-flex;
+}
+
+.agent-card-menu-toggle {
+  padding: 0 4px;
+}
+
+.agent-card-menu-popover {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  z-index: 50;
+  min-width: 160px;
+  padding: 4px;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.agent-card-menu-item {
+  display: block;
+  text-align: left;
+  padding: 6px 10px;
+  border-radius: var(--radius-s);
+  color: var(--text-normal);
+  font-size: var(--font-ui-smaller);
+  font-family: var(--font-monospace);
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+
+.agent-card-menu-item:hover {
+  background: var(--background-modifier-hover);
+}
+
+.agent-spawn-advanced {
+  margin-top: 4px;
+  border-top: 1px solid var(--background-modifier-border);
+  padding-top: 8px;
+}
+
+.agent-spawn-advanced-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0;
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+
+.agent-spawn-advanced-toggle:hover {
+  color: var(--text-normal);
+}
+
+.agent-spawn-advanced-summary {
+  color: var(--text-faint);
+  margin-left: 6px;
+}
+
+.agent-spawn-advanced-body {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
 .agent-archive-button {
   display: inline-flex;
   align-items: center;

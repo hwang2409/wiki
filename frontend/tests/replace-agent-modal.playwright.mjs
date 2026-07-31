@@ -148,7 +148,10 @@ async function main() {
     await page.locator(".agents-orch-group").getByRole("button", { name: "Replace" }).click();
     const dialog = page.getByRole("dialog", { name: `Replace ${ORCH}` });
     await dialog.waitFor();
-    await dialog.getByRole("button", { name: /cdx Codex/ }).waitFor();
+    // Provider/model/effort now live inside Advanced; open it to interact
+    // with them (WIKI-154 finding 4 redesign).
+    await dialog.getByRole("button", { name: /Advanced/ }).click();
+    await dialog.getByRole("button", { name: "Codex" }).waitFor();
     if ((await dialog.getByLabel("Model").inputValue()) !== "gpt-5.4") {
       throw new Error("Replace modal did not preserve the current model");
     }
@@ -156,7 +159,7 @@ async function main() {
       throw new Error("Replace modal did not preserve the current effort");
     }
 
-    await dialog.getByRole("button", { name: /cc Claude/ }).click();
+    await dialog.getByRole("button", { name: "Claude" }).click();
     await dialog.getByLabel("Reasoning effort").waitFor({ state: "detached" });
     if ((await dialog.getByLabel("Model").inputValue()) !== "opus") {
       throw new Error("Orchestrator kind toggle did not select the Claude default");
@@ -174,7 +177,8 @@ async function main() {
     await page.locator(".agent-session-surface-head").waitFor();
     await page.getByRole("button", { name: "Replace" }).click();
     const sessionDialog = page.getByRole("dialog", { name: `Replace ${ORCH}` });
-    await sessionDialog.getByRole("button", { name: /cdx Codex/ }).click();
+    await sessionDialog.getByRole("button", { name: /Advanced/ }).click();
+    await sessionDialog.getByRole("button", { name: "Codex" }).click();
     await sessionDialog.getByLabel("Reasoning effort").waitFor();
     await sessionDialog.getByLabel("Model").selectOption("gpt-5.4");
     await sessionDialog.getByLabel("Reasoning effort").selectOption("xhigh");

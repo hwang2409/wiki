@@ -795,6 +795,124 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(exhausted), 1)
         self.assertEqual(exhausted[0]["tickets"], ["WIKI-42"])
 
+    async def test_agents_reconciles_rotation_failure_when_ticket_replaced(self) -> None:
+        # Store a codex_rotation failure for WIKI-42 AND WIKI-OTHER at old
+        # run_ids. WIKI-42 gets replaced under a new run_id and provider
+        # (this test's live ticket is claude-provider under RUN_ID);
+        # WIKI-OTHER is not present in the live registry. Both notice
+        # tickets should clear — WIKI-42 by run_id mismatch (replace),
+        # WIKI-OTHER by ticket absence (archive) — but this test
+        # specifically asserts the WIKI-42 replace path clears its own
+        # ticket alone when the second ticket is still live at its
+        # original run_id.
+        self._seed_headless(provider="claude")
+        notices = self._isolate_account_notices()
+        notices.apply_event(
+            {
+                "type": "codex_rotation",
+                "from": "acct-a",
+                "to": "acct-b",
+                "revived": [],
+                "failed": ["WIKI-42", "WIKI-STILL"],
+                "failed_reasons": {
+                    "WIKI-42": "revive raised",
+                    "WIKI-STILL": "revive raised",
+                },
+                "failed_run_ids": {
+                    "WIKI-42": "old-run-id",
+                    "WIKI-STILL": "still-run-id",
+                },
+                "ts": "t1",
+            }
+        )
+        # Register a second live worker under its ORIGINAL run_id so it
+        # is not the target of the replace.
+        self.client._write_current(  # noqa: SLF001 - fixture setup
+            "still-run-id",
+            {
+                "agent_id": "WIKI-STILL",
+                "provider": "codex",
+                "role": "implement",
+                "model": "gpt-5.4",
+                "effort": "high",
+                "worktree": str(self.worktree),
+                "orchestrator_id": None,
+            },
+        )
+
+        payload = main.agents()
+
+        surfaced = cast(list[dict[str, Any]], payload["account_notices"])
+        rotation = [entry for entry in surfaced if entry["type"] == "codex_rotation"]
+        self.assertEqual(len(rotation), 1)
+        # WIKI-42 replaced (new run_id + different provider): dropped.
+        # WIKI-STILL still live at the original run_id: kept.
+        self.assertEqual(rotation[0]["failed"], ["WIKI-STILL"])
+        self.assertEqual(rotation[0]["failed_run_ids"], {"WIKI-STILL": "still-run-id"})
+
+    async def test_agents_does_not_reconcile_when_registry_is_missing(self) -> None:
+        # A missing registry (backend/supervisor startup race) must not
+        # translate into {} and wipe every worker-scoped notice.
+        notices = self._isolate_account_notices()
+        notices.apply_event(
+            {
+                "type": "codex_auth_dead_exhausted",
+                "tickets": ["WIKI-42"],
+                "run_ids": {"WIKI-42": "run-42"},
+                "ts": "t1",
+            }
+        )
+        # Registry file does not exist yet.
+        self.assertFalse(self.registry.exists())
+
+        payload = main.agents()
+
+        surfaced = cast(list[dict[str, Any]], payload["account_notices"])
+        exhausted = [entry for entry in surfaced if entry["type"] == "codex_auth_dead_exhausted"]
+        self.assertEqual(len(exhausted), 1)
+        self.assertEqual(exhausted[0]["tickets"], ["WIKI-42"])
+
+    async def test_agents_does_not_reconcile_when_registry_is_malformed(self) -> None:
+        # Invalid JSON on the registry path must preserve notices.
+        notices = self._isolate_account_notices()
+        notices.apply_event(
+            {
+                "type": "codex_auth_dead_exhausted",
+                "tickets": ["WIKI-42"],
+                "run_ids": {"WIKI-42": "run-42"},
+                "ts": "t1",
+            }
+        )
+        self.registry.write_text("not-json", encoding="utf-8")
+
+        payload = main.agents()
+
+        surfaced = cast(list[dict[str, Any]], payload["account_notices"])
+        exhausted = [entry for entry in surfaced if entry["type"] == "codex_auth_dead_exhausted"]
+        self.assertEqual(len(exhausted), 1)
+        self.assertEqual(exhausted[0]["tickets"], ["WIKI-42"])
+
+    async def test_agents_does_not_reconcile_when_registry_is_not_an_object(self) -> None:
+        # A registry that parses as JSON but is not an object (e.g. a bare
+        # list from a partial write) must preserve notices.
+        notices = self._isolate_account_notices()
+        notices.apply_event(
+            {
+                "type": "codex_auth_dead_exhausted",
+                "tickets": ["WIKI-42"],
+                "run_ids": {"WIKI-42": "run-42"},
+                "ts": "t1",
+            }
+        )
+        self.registry.write_text("[]", encoding="utf-8")
+
+        payload = main.agents()
+
+        surfaced = cast(list[dict[str, Any]], payload["account_notices"])
+        exhausted = [entry for entry in surfaced if entry["type"] == "codex_auth_dead_exhausted"]
+        self.assertEqual(len(exhausted), 1)
+        self.assertEqual(exhausted[0]["tickets"], ["WIKI-42"])
+
     async def test_session_prefers_supervisor_transcript_and_runtime_state(
         self,
     ) -> None:
