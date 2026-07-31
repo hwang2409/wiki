@@ -157,7 +157,7 @@ def _archived_reviewers(ticket: str, archived: list[Mapping[str, Any]]) -> dict[
             continue
         parsed = parse_reviewer_id(value)
         if parsed is not None and parsed.ticket == ticket.upper():
-            result[value.upper()] = parsed.round
+            result[canonical_reviewer_id(parsed.ticket, parsed.round, parsed.lens)] = parsed.round
     return result
 
 
@@ -175,7 +175,7 @@ def _next_round(
     for value in registry:
         parsed = parse_reviewer_id(str(value))
         if parsed is not None and parsed.ticket == ticket.upper():
-            reviewers[str(value).upper()] = parsed.round
+            reviewers[canonical_reviewer_id(parsed.ticket, parsed.round, parsed.lens)] = parsed.round
     return max(reviewers.values(), default=0) + 1
 
 
@@ -193,7 +193,9 @@ def _previous_terminal_reviewer(
         current = entry.get("current")
         if not isinstance(current, Mapping):
             continue
-        candidate_reviewer = str(value).upper()
+        candidate_reviewer = canonical_reviewer_id(
+            parsed.ticket, parsed.round, parsed.lens
+        )
         status = (
             status_reader(candidate_reviewer)
             if status_reader is not None
@@ -222,10 +224,11 @@ def _previous_terminal_reviewers(
 
     candidates: list[tuple[int, str]] = []
     for value, entry in registry.items():
-        reviewer = str(value).upper()
-        parsed_round = _reviewer_round(reviewer)
-        if parsed_round is None or not reviewer.startswith(ticket.upper() + "-REVIEW"):
+        parsed = parse_reviewer_id(str(value))
+        if parsed is None or parsed.ticket != ticket.upper():
             continue
+        reviewer = canonical_reviewer_id(parsed.ticket, parsed.round, parsed.lens)
+        parsed_round = parsed.round
         if parsed_round >= round_number or not isinstance(entry, Mapping):
             continue
         current = entry.get("current")

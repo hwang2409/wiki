@@ -1684,7 +1684,7 @@ class BackendSupervisorEndToEndTests(unittest.IsolatedAsyncioTestCase):
         )
         for reviewer in second["reviewers"]:
             self.assertEqual(
-                self.store.current_run_id(reviewer["reviewer"].upper()),
+                self.store.current_run_id(reviewer["reviewer"]),
                 reviewer["run_id"],
             )
 

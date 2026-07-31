@@ -106,6 +106,7 @@ def collect_diversity_verdict(
     identity = parse_reviewer_id(reviewer)
     if identity is None or identity.lens is None or identity.lens == "synthesis":
         return None
+    reviewer = canonical_reviewer_id(identity.ticket, identity.round, identity.lens)
     path = journal_path(runtime_dir, ticket, identity.round)
     if not path.is_file():
         raise RuntimeError(f"diversity journal is missing: {path}")

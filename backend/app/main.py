@@ -65,7 +65,11 @@ from .agent_runtime import costs
 from .agent_runtime import graph_health
 from .agent_runtime.loop_state import derive_loop_state
 from .agent_runtime.store import RuntimePaths
-from .agent_runtime.ticket import base_ticket, parse_reviewer_id
+from .agent_runtime.ticket import (
+    base_ticket,
+    parse_reviewer_id,
+    reviewer_id as canonical_reviewer_id,
+)
 from .agent_runtime.unknown_kind_telemetry import UnknownKindTelemetry
 from .agent_runtime.version import RUNTIME_FINGERPRINT
 from .frontend_static import mount_frontend_static
@@ -4099,6 +4103,13 @@ def _registry_agent(
         current = entry.get("current")
         if isinstance(current, dict):
             return candidate, entry, current
+    wanted = agent_id.upper()
+    for candidate, entry in registry.items():
+        if str(candidate).upper() != wanted or not isinstance(entry, dict):
+            continue
+        current = entry.get("current")
+        if isinstance(current, dict):
+            return str(candidate), entry, current
     return None
 
 
@@ -4589,7 +4600,15 @@ def spawn_agent(
         and parse_reviewer_id(ticket) is None
     ):
         raise HTTPException(status_code=400, detail="Ticket must be uppercase letters, numbers, or dashes")
-    ticket = ticket.upper()
+    parsed_ticket = parse_reviewer_id(ticket)
+    if parsed_ticket is not None:
+        ticket = canonical_reviewer_id(
+            parsed_ticket.ticket,
+            parsed_ticket.round,
+            parsed_ticket.lens,
+        )
+    else:
+        ticket = ticket.upper()
 
     kind = body.kind.strip()
     if kind not in {"cdx", "cc"}:

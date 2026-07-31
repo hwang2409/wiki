@@ -25,7 +25,7 @@ from urllib.parse import urlparse
 
 from .graph_health import load_validated_graph
 from .loop_state import derive_loop_state
-from .ticket import base_ticket, parse_reviewer_id
+from .ticket import base_ticket, parse_reviewer_id, reviewer_id as canonical_reviewer_id
 from .autopilot_actions import steer_action_id, verdict_edge_id
 from .autopilot_parser import (
     Finding,
@@ -781,16 +781,19 @@ class AutopilotController:
     ) -> Verdict | None:
         if not graph:
             return None
+        wanted_reviewer = reviewer.upper() if reviewer is not None else None
         for edge in reversed(graph.get("edges", [])):
             if (
                 isinstance(edge, Mapping)
                 and edge.get("kind") == "verdict"
                 and isinstance(edge.get("payload"), Mapping)
                 and (
-                    reviewer is None
-                    or edge.get("from") == reviewer
-                    or edge["payload"].get("worker") == reviewer
-                    or edge["payload"].get("reviewer") == reviewer
+                    wanted_reviewer is None
+                    or str(edge.get("from") or "").upper() == wanted_reviewer
+                    or str(edge["payload"].get("worker") or "").upper()
+                    == wanted_reviewer
+                    or str(edge["payload"].get("reviewer") or "").upper()
+                    == wanted_reviewer
                 )
             ):
                 return verdict_from_graph(edge["payload"])
@@ -839,6 +842,11 @@ class AutopilotController:
         *,
         source_sha: str | None = None,
     ) -> Verdict | None:
+        identity = parse_reviewer_id(reviewer)
+        if identity is not None:
+            reviewer = canonical_reviewer_id(
+                identity.ticket, identity.round, identity.lens
+            )
         path = (
             Path(artifact_path)
             if isinstance(artifact_path, str) and artifact_path
