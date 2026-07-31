@@ -3369,6 +3369,7 @@ class Review21MediaProbeTests(unittest.TestCase):
         with self.assertRaisesRegex(media_scrub.MediaScrubError, "DPB"):
             media_scrub.scrub_video(payload, "video/mp4")
 
+
     @staticmethod
     def _near_limit_chunk_mdat_fixture() -> bytes:
         real = REAL_MP4.read_bytes()
@@ -3460,6 +3461,46 @@ class Review21MediaProbeTests(unittest.TestCase):
         elapsed = time.perf_counter() - started
         self.assertEqual(len(result.data), len(payload))
         self.assertLess(elapsed, 8.0, f"scrub took {elapsed:.2f}s")
+
+
+class Review24Mp3ReservoirProbeTests(unittest.TestCase):
+    @staticmethod
+    def _mpeg25_mono_frame(part2_3_length: int = 0, payload_marker: bytes = b"") -> bytes:
+        header = b"\xff\xe3\x20\xc0"
+        frame_length = 104
+        side = bytearray(9)
+        for bit_index in range(12):
+            if part2_3_length & (1 << (11 - bit_index)):
+                position = 9 + bit_index
+                side[position // 8] |= 1 << (7 - position % 8)
+        payload = bytearray(frame_length - 4 - len(side))
+        payload[:len(payload_marker)] = payload_marker
+        return header + bytes(side) + bytes(payload)
+
+    def test_part2_3_range_cannot_reach_future_frame(self) -> None:
+        payload = b"".join(
+            self._mpeg25_mono_frame(
+                4095 if frame_number == 0 else 0,
+                b"GPS-FUTURE-PAYLOAD" if frame_number == 3 else b"",
+            )
+            for frame_number in range(4)
+        )
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "future frame"):
+            media_scrub.scrub_audio(payload, "audio/mpeg")
+
+    def test_many_small_frames_have_linear_scrub_cost(self) -> None:
+        payload = self._mpeg25_mono_frame() * 8_000
+        tracemalloc.start()
+        started = time.perf_counter()
+        try:
+            result = media_scrub.scrub_audio(payload, "audio/mpeg")
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        elapsed = time.perf_counter() - started
+        self.assertEqual(len(result.data), len(payload))
+        self.assertLess(elapsed, 3.0, f"MP3 scrub took {elapsed:.2f}s")
+        self.assertLess(peak, 8 * len(payload), f"peak allocation was {peak} bytes")
 
 
 if __name__ == "__main__":

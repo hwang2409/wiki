@@ -245,6 +245,12 @@ def _mp3_validate_full_frame_stream(data: bytes, start: int, end: int) -> bytes:
             reservoir_start = logical_payload_bytes - main_data_begin
             if reservoir_start < audio_floor_bytes:
                 raise MediaScrubError("mp3 Layer III reservoir reference is impossible")
+            range_end = reservoir_start * 8 + main_data_bits
+            payload_end = (logical_payload_bytes + payload_length) * 8
+            if range_end > payload_end:
+                raise MediaScrubError(
+                    "mp3 Layer III main data extends into a future frame"
+                )
             logical_ranges.append((reservoir_start * 8, reservoir_start * 8 + main_data_bits))
         logical_payload_bytes += payload_length
         offset += frame_len
@@ -265,20 +271,39 @@ def _mp3_map_logical_ranges(
     ranges: list[tuple[int, int]],
 ) -> list[tuple[int, int]]:
     """Map logical reservoir intervals to physical frame-payload intervals."""
+    merged_ranges: list[list[int]] = []
+    for start, end in sorted((start, end) for start, end in ranges if end > start):
+        if merged_ranges and start <= merged_ranges[-1][1]:
+            merged_ranges[-1][1] = max(merged_ranges[-1][1], end)
+        else:
+            merged_ranges.append([start, end])
+
     physical: list[tuple[int, int]] = []
-    for range_start, range_end in ranges:
-        for logical_start, physical_start, length in segments:
+    segment_index = 0
+    for range_start, range_end in merged_ranges:
+        while segment_index < len(segments):
+            logical_start, _physical_start, length = segments[segment_index]
+            if (logical_start + length) * 8 > range_start:
+                break
+            segment_index += 1
+        index = segment_index
+        while index < len(segments):
+            logical_start, physical_start, length = segments[index]
             segment_end = logical_start + length
-            if segment_end * 8 <= range_start:
-                continue
             if logical_start * 8 >= range_end:
                 break
             overlap_start = max(range_start, logical_start * 8)
             overlap_end = min(range_end, segment_end * 8)
-            physical.append((
-                physical_start * 8 + (overlap_start - logical_start * 8),
-                physical_start * 8 + (overlap_end - logical_start * 8),
-            ))
+            if overlap_start < overlap_end:
+                physical.append((
+                    physical_start * 8 + (overlap_start - logical_start * 8),
+                    physical_start * 8 + (overlap_end - logical_start * 8),
+                ))
+            if segment_end * 8 <= range_end:
+                index += 1
+            else:
+                break
+        segment_index = index
     return physical
 
 
