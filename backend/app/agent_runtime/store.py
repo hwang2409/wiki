@@ -1344,6 +1344,56 @@ class RunStore:
             guard_automatic_resume=guard_automatic_resume,
         )
 
+    def finalize_handover_detach(
+        self,
+        run_id: str,
+        *,
+        state: LifecycleState,
+        session_id: str,
+        generation: int,
+        transcript_path: str | None,
+        pending_requests: dict[str, dict[str, Any]],
+    ) -> RunRecord:
+        """Commit the pre-stop recovery intent after provider events drain."""
+
+        if state not in {
+            LifecycleState.WORKING,
+            LifecycleState.WAITING_APPROVAL,
+            LifecycleState.IDLE,
+        }:
+            raise StoreConflict(f"handover state {state.value} is not resumable")
+        if not session_id:
+            raise StoreConflict("handover session id is missing")
+        with self._lock:
+            record = self.get(run_id)
+            if record.replaced_by_run_id or not self.is_current(record):
+                raise StoreConflict("handover target is no longer current")
+            record.state = state
+            record.state_reason = None
+            record.recovery_from_state = None
+            record.provider_session_id = session_id
+            record.provider_pid = None
+            record.provider_generation = generation
+            record.active_turn_id = None
+            record.transcript_path = transcript_path
+            merged_pending_requests = {
+                key: dict(request) for key, request in record.pending_requests.items()
+            }
+            merged_pending_requests.update(
+                {
+                    key: dict(request)
+                    for key, request in pending_requests.items()
+                }
+            )
+            record.pending_requests = merged_pending_requests
+            self._write_record(record)
+            registry = self._read_registry()
+            current = (registry.get(record.agent_id) or {}).get("current") or {}
+            if current.get("run_id") == record.run_id:
+                registry[record.agent_id]["current"] = self._registry_current(record)
+                self._write_registry(registry)
+            return record
+
     def set_desired_model(self, run_id: str, model: str | None) -> RunRecord:
         with self._lock:
             record = self.get(run_id)

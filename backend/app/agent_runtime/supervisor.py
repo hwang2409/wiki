@@ -2506,6 +2506,19 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         raise StoreConflict(
                             f"cannot hand over {record.agent_id}: provider session id is missing"
                         )
+                    captured_state = record.state
+                    if captured_state not in {
+                        LifecycleState.WORKING,
+                        LifecycleState.WAITING_APPROVAL,
+                        LifecycleState.IDLE,
+                    }:
+                        raise StoreConflict(
+                            f"cannot hand over {record.agent_id}: durable state "
+                            f"{captured_state.value} is not resumable"
+                        )
+                    captured_pending_requests = deepcopy(record.pending_requests)
+                    captured_generation = record.provider_generation
+                    captured_transcript_path = record.transcript_path
                     adapter = self.adapters.get(run_id)
                     if adapter is None:
                         raise StoreConflict(
@@ -2513,38 +2526,19 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         )
                     await self._quiesce_adapter_for_replacement(run_id, adapter)
                     await self._flush_handover_events(run_id)
-                    current = self.store.get(run_id)
-                    if (
-                        current.state in TERMINAL_STATES
-                        or current.replaced_by_run_id
-                        or not self.store.is_current(current)
-                        or current.state
-                        not in {
-                            LifecycleState.WORKING,
-                            LifecycleState.WAITING_APPROVAL,
-                            LifecycleState.IDLE,
-                        }
-                    ):
-                        raise StoreConflict(
-                            f"handover target changed during detach: {run_id}"
-                        )
-                    current_session_id = current.provider_session_id or provider_session_id
-                    self.store.update_adapter_status(
+                    current = self.store.finalize_handover_detach(
                         run_id,
-                        AdapterStatus(
-                            state=current.state,
-                            session_id=current_session_id,
-                            pid=None,
-                            generation=current.provider_generation,
-                            active_turn_id=None,
-                            transcript_path=current.transcript_path,
-                        ),
+                        state=captured_state,
+                        session_id=provider_session_id,
+                        generation=captured_generation,
+                        transcript_path=captured_transcript_path,
+                        pending_requests=captured_pending_requests,
                     )
                     handover_run = self._runtime_status(self.store.get(run_id))
                     handover_run.update(
                         {
                             "state": current.state.value,
-                            "provider_session_id": current_session_id,
+                            "provider_session_id": provider_session_id,
                             "provider_pid": None,
                             "active_turn_id": None,
                             "control_attached": False,

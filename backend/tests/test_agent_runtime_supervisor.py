@@ -40,6 +40,7 @@ from backend.app.agent_runtime.process import (
 from backend.app.agent_runtime.protocol import UnixSupervisorServer
 from backend.app.agent_runtime.provider import (
     AdapterStatus,
+    ProviderAdapter,
     ProviderEvent,
     StartRequest,
 )
@@ -129,6 +130,76 @@ class ApprovalRecoveryAdapter(CodexFixtureAdapter):
             )
         )
         return self._status
+
+
+class HandoverStopEventCodexAdapter(CodexFixtureAdapter):
+    """Replay the Codex interrupt completion emitted while handover stops it."""
+
+    async def stop(self) -> AdapterStatus:
+        status = self.snapshot()
+        if status.state in {
+            LifecycleState.WORKING,
+            LifecycleState.WAITING_APPROVAL,
+        }:
+            await self._events.put(  # noqa: SLF001 - stop-event handover fixture
+                ProviderEvent(
+                    ProviderKind.CODEX,
+                    {
+                        "method": "turn/completed",
+                        "params": {
+                            "turn": {
+                                "id": status.active_turn_id or "handover-turn",
+                                "status": "interrupted",
+                            }
+                        },
+                    },
+                    generation=status.generation,
+                )
+            )
+        return await super().stop()
+
+    async def emit_approval(self) -> None:
+        status = self.snapshot()
+        self._status = AdapterStatus(  # noqa: SLF001 - handover fixture state
+            LifecycleState.WAITING_APPROVAL,
+            status.session_id,
+            status.pid,
+            generation=max(1, status.generation),
+            active_turn_id=status.active_turn_id or "approval-turn",
+        )
+        await self._events.put(  # noqa: SLF001 - approval handover fixture
+            ProviderEvent(
+                ProviderKind.CODEX,
+                {
+                    "id": "handover-approval",
+                    "method": "item/tool/requestUserInput",
+                    "params": {
+                        "questions": [
+                            {"id": "surface", "question": "Which surface?"}
+                        ]
+                    },
+                },
+                generation=self._status.generation,  # noqa: SLF001
+            )
+        )
+
+    async def send_now(self, message: str) -> AdapterStatus:
+        if "Recreate the exact approval question" in message:
+            await self.emit_approval()
+            return self.snapshot()
+        return await super().send_now(message)
+
+
+class HandoverCodexFactory(FixtureAdapterFactory):
+    def __call__(self, record: RunRecord) -> ProviderAdapter:
+        if record.provider is ProviderKind.CODEX:
+            return HandoverStopEventCodexAdapter(
+                self.fixture_dir / "codex_app_server_success.jsonl",
+                self.fixture_dir / "codex_app_server_control.jsonl",
+                pid=self.pid,
+                generation=record.provider_generation,
+            )
+        return super().__call__(record)
 
 
 def _paths(root: Path) -> RuntimePaths:
@@ -1825,6 +1896,89 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await replacement.close()
         self.supervisor = Supervisor(self.store, FixtureAdapterFactory(FIXTURES))
+
+    async def test_codex_handover_preserves_intent_through_stop_events(self) -> None:
+        for state in (LifecycleState.WORKING, LifecycleState.WAITING_APPROVAL):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                worktree = root / "worktree"
+                worktree.mkdir()
+                paths = _paths(root)
+                store = RunStore(paths)
+                factory = HandoverCodexFactory(FIXTURES, pid=os.getpid())
+                supervisor = Supervisor(
+                    store,
+                    factory,
+                    pid_alive=lambda _pid: False,
+                )
+                record = await supervisor.start_run(
+                    agent_id=f"WIKI-CODEX-HANDOVER-{state.value}",
+                    provider=ProviderKind.CODEX,
+                    role="implement",
+                    model="fixture-codex",
+                    effort="high",
+                    worktree=str(worktree),
+                    prompt="handover with stop event",
+                )
+                adapter = supervisor.adapters[record.run_id]
+                assert isinstance(adapter, HandoverStopEventCodexAdapter)
+                if state is LifecycleState.WORKING:
+                    status = await adapter.send_now("continue the active turn")
+                    store.update_adapter_status(record.run_id, status)
+                    expected_pending: dict[str, dict[str, Any]] = {}
+                else:
+                    await adapter.emit_approval()
+                    deadline = time.monotonic() + 2
+                    while time.monotonic() < deadline:
+                        current = store.get(record.run_id)
+                        if current.state is state and current.pending_requests:
+                            break
+                        await asyncio.sleep(0.01)
+                    expected_pending = dict(store.get(record.run_id).pending_requests)
+                    self.assertTrue(expected_pending)
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    if store.get(record.run_id).state is state:
+                        break
+                    await asyncio.sleep(0.01)
+                before = store.get(record.run_id)
+                self.assertEqual(before.state, state)
+                session_id = before.provider_session_id
+                self.assertIsNotNone(session_id)
+
+                result = await supervisor.prepare_handover()
+                self.assertEqual(result["drained_run_ids"], [record.run_id])
+                detached = store.get(record.run_id)
+                self.assertEqual(detached.state, state)
+                self.assertIsNone(detached.provider_pid)
+                self.assertEqual(detached.provider_session_id, session_id)
+                self.assertEqual(detached.pending_requests, expected_pending)
+                await supervisor.close()
+
+                replacement = Supervisor(
+                    RunStore(paths),
+                    HandoverCodexFactory(FIXTURES, pid=os.getpid()),
+                    pid_alive=lambda _pid: False,
+                )
+                try:
+                    recovered = await replacement.recover_on_start()
+                    self.assertEqual(recovered[0]["action"], "resume")
+                    deadline = time.monotonic() + 2
+                    while time.monotonic() < deadline:
+                        current = replacement.store.get(record.run_id)
+                        if state is LifecycleState.WORKING:
+                            if current.state is LifecycleState.IDLE:
+                                break
+                        elif current.state is state and current.pending_requests:
+                            break
+                        await asyncio.sleep(0.01)
+                    current = replacement.store.get(record.run_id)
+                    self.assertEqual(current.provider_session_id, session_id)
+                    if state is LifecycleState.WAITING_APPROVAL:
+                        self.assertEqual(current.state, state)
+                        self.assertTrue(current.pending_requests)
+                finally:
+                    await replacement.close()
 
     async def test_handover_barrier_defers_start_until_after_snapshot(self) -> None:
         existing = await self.supervisor.start_run(
