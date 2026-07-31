@@ -505,10 +505,10 @@ class ApeV2BoundaryTests(unittest.TestCase):
             media_scrub.scrub_audio(payload, "audio/mpeg")
 
     def test_ape_footer_with_is_header_flag_at_end_is_rejected(self) -> None:
-        # bit 31 = IS_HEADER; if that shows up in a tail-position preamble
+        # bit 29 = IS_HEADER; if that shows up in a tail-position preamble
         # we refuse to interpret it — silent pass-through is banned.
         payload = self._build_mp3_with_ape_footer(
-            tag_size=32, flags=1 << 31,
+            tag_size=32, flags=1 << 29,
         )
         with self.assertRaisesRegex(
             media_scrub.MediaScrubError, "APEv2 marker at end is a header"
@@ -525,7 +525,7 @@ class ApeV2BoundaryTests(unittest.TestCase):
         header = (
             b"APETAGEX"
             + struct.pack("<III", 2000, 1 << 20, 0)
-            + struct.pack("<I", 1 << 31)  # IS_HEADER
+            + struct.pack("<I", (1 << 29) | (1 << 30))  # IS_HEADER|NO_FOOTER
             + b"\x00" * 8
         )
         with self.assertRaisesRegex(
@@ -540,13 +540,65 @@ class ApeV2BoundaryTests(unittest.TestCase):
         header = (
             b"APETAGEX"
             + struct.pack("<III", 2000, 10**8, 0)
-            + struct.pack("<I", 1 << 31)
+            + struct.pack("<I", (1 << 29) | (1 << 30))
             + b"\x00" * 8
         )
         with self.assertRaisesRegex(
             media_scrub.MediaScrubError, "APEv2 tag_size .* exceeds implausible ceiling"
         ):
             media_scrub.scrub_audio(header + frames, "audio/mpeg")
+
+
+class ApeV2ValidLayoutTests(unittest.TestCase):
+    @staticmethod
+    def _preamble(flags: int) -> bytes:
+        return (
+            b"APETAGEX"
+            + struct.pack("<III", 2000, 32, 0)
+            + struct.pack("<I", flags)
+            + b"\x00" * 8
+        )
+
+    @classmethod
+    def _payload(cls, *, header: bool, footer: bool) -> bytes:
+        base = REAL_MP3.read_bytes()
+        if base.startswith(b"ID3"):
+            tag_size = sum(
+                (byte & 0x7F) << shift
+                for byte, shift in zip(base[6:10], (21, 14, 7, 0))
+            )
+            base = base[10 + tag_size :]
+        parts: list[bytes] = []
+        if header:
+            flags = (1 << 29) | ((1 << 31) if footer else (1 << 30))
+            parts.append(cls._preamble(flags))
+        parts.append(base)
+        if footer:
+            parts.append(cls._preamble(1 << 31 if header else 0))
+        return b"".join(parts)
+
+    @unittest.skipIf(FFMPEG is None, "ffmpeg not installed")
+    def test_footer_header_and_header_without_footer_are_removed(self) -> None:
+        for header, footer in ((False, True), (True, True), (True, False)):
+            with self.subTest(header=header, footer=footer):
+                payload = self._payload(header=header, footer=footer)
+                result = media_scrub.scrub_audio(payload, "audio/mpeg")
+                self.assertNotIn(b"APETAGEX", result.data)
+                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as handle:
+                    handle.write(result.data)
+                    path = handle.name
+                try:
+                    probe = subprocess.run(
+                        [FFMPEG, "-v", "error", "-i", path, "-f", "null", "-"],
+                        capture_output=True,
+                        timeout=30,
+                    )
+                    self.assertEqual(
+                        probe.returncode, 0,
+                        probe.stderr.decode(errors="replace"),
+                    )
+                finally:
+                    Path(path).unlink(missing_ok=True)
 
 
 class Mp4Stbl_stsdStructuralTests(unittest.TestCase):
@@ -2648,6 +2700,19 @@ class UnsupportedMimeTests(unittest.TestCase):
 
 
 class Review15MediaProbeTests(unittest.TestCase):
+    def test_sei_rebuilds_as_valid_filler_data_nal(self) -> None:
+        sample = struct.pack(">I", 4) + b"\x06\x11\x22\x33"
+        rebuilt = mp4_scrubber._canonicalise_avc_sample(sample, 4, set(), False)
+        self.assertEqual(rebuilt[4:], b"\x0c\xff\xff\x80")
+        self.assertNotIn(b"\x00\x00\x00", rebuilt[4:])
+
+    def test_one_byte_sei_is_rejected_before_rebuild(self) -> None:
+        sample = struct.pack(">I", 1) + b"\x06"
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "SEI is too short"
+        ):
+            mp4_scrubber._canonicalise_avc_sample(sample, 4, set(), False)
+
     def test_unknown_avc_nal_with_marker_is_rejected(self) -> None:
         payload = bytearray(REAL_MP4.read_bytes())
         mdat_type = payload.find(b"mdat")

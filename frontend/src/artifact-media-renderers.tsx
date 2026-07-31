@@ -102,7 +102,7 @@ function GifRenderer({
   const [playing, setPlaying] = useState(!reducedMotion);
   useEffect(() => {
     setPlaying(!reducedMotion);
-  }, [reducedMotion]);
+  }, [reducedMotion, source]);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imgRef = useRef<HTMLImageElement>(null);
   useEffect(() => {

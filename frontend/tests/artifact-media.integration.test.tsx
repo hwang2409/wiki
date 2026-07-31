@@ -121,6 +121,34 @@ describe("VideoRenderer", () => {
     expect(screen.queryByRole("button", { name: /Play/i })).toBeNull();
   });
 
+  test("reduced-motion same-kind GIF navigation resets to paused", () => {
+    installMatchMedia(true);
+    const first: SessionArtifact = {
+      kind: "video",
+      mime: "image/gif",
+      ref: "artifact://first-gif",
+      width: 100,
+      height: 80,
+    };
+    const second: SessionArtifact = {
+      kind: "video",
+      mime: "image/gif",
+      ref: "artifact://second-gif",
+      width: 100,
+      height: 80,
+    };
+    const { rerender } = render(
+      <VideoRenderer artifact={first} event={makeEvent(first, "first-gif")} ticket={TICKET} />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /Play Fixture media/i }));
+    expect(screen.queryByRole("button", { name: /Play Fixture media/i })).toBeNull();
+    rerender(
+      <VideoRenderer artifact={second} event={makeEvent(second, "second-gif")} ticket={TICKET} />,
+    );
+    expect(screen.getByRole("button", { name: /Play Fixture media/i })).toBeTruthy();
+    expect(document.querySelector(".artifact-gif-frozen")).not.toBeNull();
+  });
+
   test("unmount removes the video element from the DOM", () => {
     const artifact: SessionArtifact = { kind: "video", mime: "video/mp4", ref: "artifact://abc" };
     const { unmount } = render(

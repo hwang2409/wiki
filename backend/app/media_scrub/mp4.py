@@ -761,9 +761,14 @@ def _canonicalise_avc_sample(
             if require_pps and pps_id not in pps_ids:
                 raise MediaScrubError("mp4 AVC slice references an unknown PPS identifier")
         if nal_type == 6:
-            # Keep the declared NAL length and replace the SEI RBSP with an
-            # empty, canonical payload. This removes user-data metadata.
-            nal = nal[:1] + (b"\x80" + b"\x00" * (len(nal) - 2) if len(nal) >= 2 else b"")
+            # Keep the declared NAL length and replace SEI with a valid
+            # length-preserving filler-data NAL. Filler data has one or more
+            # 0xff bytes followed by rbsp_trailing_bits (0x80).
+            if len(nal) < 2:
+                raise MediaScrubError(
+                    "mp4 AVC SEI is too short for a canonical filler NAL"
+                )
+            nal = b"\x0c" + b"\xff" * (len(nal) - 2) + b"\x80"
         output.extend(nal_size.to_bytes(length_size, "big"))
         output.extend(nal)
         offset += nal_size
