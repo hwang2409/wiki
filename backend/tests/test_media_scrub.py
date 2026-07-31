@@ -3929,5 +3929,116 @@ class Review25Mp3CanonicalizationTests(unittest.TestCase):
                         Path(path).unlink(missing_ok=True)
 
 
+class Review32CanonicalEncodingTests(unittest.TestCase):
+    """Audit parsed fields that media rebuilders emit.
+
+    MP4 emits validated brands, timing values, matrices, track fields,
+    handler tokens, media headers, edit entries, sample tables, sample-entry
+    fixed fields, pixel aspect ratios, colour fields, and AVC configuration.
+    WAV emits validated RIFF sizes, format fields, extensible fields, fact
+    counts, and data bytes. MPEG emits canonical headers and side information.
+    GIF emits validated screen, image, control, palette, and LZW fields.
+    Every emitted value has one fixed-width representation or is derived from
+    a canonical value. These tests target the remaining alternate encodings.
+    """
+
+    def test_equivalent_noncanonical_pasp_is_reduced_in_stored_bytes(self) -> None:
+        payload = bytearray(REAL_MP4.read_bytes())
+        pasp_pos = payload.find(b"pasp")
+        self.assertGreater(pasp_pos, 0)
+        noncanonical = struct.pack(">II", 0x12345678, 0x12345678)
+        payload[pasp_pos + 4:pasp_pos + 12] = noncanonical
+        result = media_scrub.scrub_video(bytes(payload), "video/mp4")
+        self.assertNotIn(noncanonical, result.data)
+        self.assertIn(b"pasp" + struct.pack(">II", 1, 1), result.data)
+
+    def test_tkhd_v0_fractional_dimensions_are_rejected(self) -> None:
+        payload = bytearray(REAL_MP4.read_bytes())
+        tkhd_pos = payload.find(b"tkhd")
+        self.assertGreater(tkhd_pos, 0)
+        payload[tkhd_pos + 4 + 76:tkhd_pos + 4 + 80] = struct.pack(
+            ">I", (160 << 16) | 0xBEEF,
+        )
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "tkhd.*fractional bits"
+        ):
+            media_scrub.scrub_video(bytes(payload), "video/mp4")
+
+    def test_tkhd_v1_fractional_dimensions_are_rejected(self) -> None:
+        real = REAL_MP4.read_bytes()
+        tkhd_pos = real.find(b"tkhd")
+        self.assertGreater(tkhd_pos, 0)
+        body = real[tkhd_pos + 4:tkhd_pos + 4 + 84]
+        body_v1 = (
+            bytes([1]) + body[1:4]
+            + b"\x00" * 16
+            + body[12:16]
+            + b"\x00" * 4
+            + struct.pack(">Q", struct.unpack(">I", body[20:24])[0])
+            + b"\x00" * 8
+            + body[32:38]
+            + b"\x00\x00"
+            + body[40:76]
+            + struct.pack(">II", (160 << 16) | 0xBEEF, 120 << 16)
+        )
+        self.assertEqual(len(body_v1), 96)
+        atom = mp4_scrubber._Mp4Atom(
+            start=0,
+            size=8 + len(body_v1),
+            header_len=8,
+            type=b"tkhd",
+            body_start=8,
+            body_end=8 + len(body_v1),
+        )
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "tkhd.*fractional bits"
+        ):
+            mp4_scrubber._rebuild_tkhd(
+                struct.pack(">I", atom.size) + b"tkhd" + body_v1,
+                atom,
+            )
+
+    @staticmethod
+    def _extensible_wav(channel_mask: int, channels: int = 1) -> bytes:
+        bits = 16
+        block_align = channels * (bits // 8)
+        fmt = (
+            struct.pack(
+                "<HHIIHH", 0xFFFE, channels, 16_000,
+                16_000 * block_align, block_align, bits,
+            )
+            + struct.pack("<HHI", 22, bits, channel_mask)
+            + media_scrub._WAV_KSDATAFORMAT_PCM
+        )
+        data = b"\x00" * block_align
+        body = (
+            b"WAVE" + b"fmt " + struct.pack("<I", len(fmt)) + fmt
+            + b"data" + struct.pack("<I", len(data)) + data
+        )
+        return b"RIFF" + struct.pack("<I", len(body)) + body
+
+    def test_extensible_channel_mask_reserved_bits_are_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "reserved speaker bits"
+        ):
+            media_scrub.scrub_audio(
+                self._extensible_wav(0x80000000), "audio/wav",
+            )
+
+    def test_extensible_channel_mask_must_match_channel_count(self) -> None:
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "does not match channel count"
+        ):
+            media_scrub.scrub_audio(
+                self._extensible_wav(0x3, channels=1), "audio/wav",
+            )
+
+    def test_extensible_channel_mask_emits_validated_value(self) -> None:
+        result = media_scrub.scrub_audio(
+            self._extensible_wav(0x1), "audio/wav",
+        )
+        self.assertIn(b"\x16\x00\x10\x00\x01\x00\x00\x00", result.data)
+
+
 if __name__ == "__main__":
     unittest.main()

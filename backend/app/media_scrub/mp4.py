@@ -48,6 +48,7 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from collections.abc import Iterator
+import math
 import struct
 from dataclasses import dataclass
 from typing import Final
@@ -1119,8 +1120,12 @@ def _rebuild_tkhd(data: bytes, atom: _Mp4Atom) -> bytes:
         alt_group = struct.unpack(">H", body[34:36])[0]
         volume = struct.unpack(">H", body[36:38])[0]
         matrix = _canonical_matrix(b"tkhd", body[40:76])
-        width = struct.unpack(">I", body[76:80])[0]
-        height = struct.unpack(">I", body[80:84])[0]
+        width_fixed = struct.unpack(">I", body[76:80])[0]
+        height_fixed = struct.unpack(">I", body[80:84])[0]
+        if width_fixed & 0xFFFF or height_fixed & 0xFFFF:
+            raise MediaScrubError(
+                "mp4 tkhd v0 dimensions must have zero fractional bits"
+            )
         rebuilt = (
             bytes([0]) + flags
             + struct.pack(">III", 0, 0, track_id)
@@ -1129,7 +1134,7 @@ def _rebuild_tkhd(data: bytes, atom: _Mp4Atom) -> bytes:
             + b"\x00" * 8
             + struct.pack(">HHHH", layer, alt_group, volume, 0)
             + matrix
-            + struct.pack(">II", width, height)
+            + struct.pack(">II", width_fixed, height_fixed)
         )
         return _pack(b"tkhd", rebuilt)
     if version == 1:
@@ -1144,8 +1149,12 @@ def _rebuild_tkhd(data: bytes, atom: _Mp4Atom) -> bytes:
         alt_group = struct.unpack(">H", body[46:48])[0]
         volume = struct.unpack(">H", body[48:50])[0]
         matrix = _canonical_matrix(b"tkhd", body[52:88])
-        width = struct.unpack(">I", body[88:92])[0]
-        height = struct.unpack(">I", body[92:96])[0]
+        width_fixed = struct.unpack(">I", body[88:92])[0]
+        height_fixed = struct.unpack(">I", body[92:96])[0]
+        if width_fixed & 0xFFFF or height_fixed & 0xFFFF:
+            raise MediaScrubError(
+                "mp4 tkhd v1 dimensions must have zero fractional bits"
+            )
         rebuilt = (
             bytes([1]) + flags
             + struct.pack(">QQ", 0, 0)
@@ -1155,7 +1164,7 @@ def _rebuild_tkhd(data: bytes, atom: _Mp4Atom) -> bytes:
             + b"\x00" * 8
             + struct.pack(">HHHH", layer, alt_group, volume, 0)
             + matrix
-            + struct.pack(">II", width, height)
+            + struct.pack(">II", width_fixed, height_fixed)
         )
         return _pack(b"tkhd", rebuilt)
     raise MediaScrubError(f"mp4 tkhd unknown version {version}")
@@ -1177,6 +1186,10 @@ def _tkhd_dimensions_from_atom(
         width_fixed, height_fixed = struct.unpack(">II", body[88:96])
     else:
         raise MediaScrubError("mp4 tkhd dimensions cannot be read")
+    if width_fixed & 0xFFFF or height_fixed & 0xFFFF:
+        raise MediaScrubError(
+            "mp4 tkhd dimensions must have zero fractional bits"
+        )
     width = width_fixed >> 16
     height = height_fixed >> 16
     if width == 0 or height == 0:
@@ -2138,7 +2151,8 @@ def _sample_entry_pasp_ratio(entry_bytes: bytes) -> tuple[int, int] | None:
         h_spacing, v_spacing = struct.unpack(">II", body)
         if h_spacing == 0 or v_spacing == 0:
             raise MediaScrubError("mp4 pasp spacing values must be positive")
-        ratio = (h_spacing, v_spacing)
+        divisor = math.gcd(h_spacing, v_spacing)
+        ratio = (h_spacing // divisor, v_spacing // divisor)
     return ratio
 
 
@@ -2199,7 +2213,11 @@ def _rebuild_inner_pasp(body: bytes) -> bytes:
     v_spacing = struct.unpack(">I", body[4:8])[0]
     if h_spacing == 0 or v_spacing == 0:
         raise MediaScrubError("mp4 pasp spacing values must be positive")
-    return _pack(b"pasp", struct.pack(">II", h_spacing, v_spacing))
+    divisor = math.gcd(h_spacing, v_spacing)
+    return _pack(
+        b"pasp",
+        struct.pack(">II", h_spacing // divisor, v_spacing // divisor),
+    )
 
 
 def _rebuild_inner_colr(body: bytes) -> bytes:

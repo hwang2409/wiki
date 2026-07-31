@@ -33,6 +33,7 @@ _WAV_KSDATAFORMAT_IEEE_FLOAT: Final = (
 # duration of 16000000ms via the len(data) * 1000 / byte_rate formula.
 _WAV_PCM_ALLOWED_BITS: Final = frozenset({8, 16, 24, 32})
 _WAV_FLOAT_ALLOWED_BITS: Final = frozenset({32, 64})
+_WAV_DEFINED_CHANNEL_MASK: Final = (1 << 18) - 1
 
 
 def scrub_wav(data: bytes) -> MediaScrubResult:
@@ -206,6 +207,14 @@ def _wav_rebuild_fmt(payload: bytes) -> tuple[bytes, int, int, int, int, int, in
         if valid_bits == 0 or valid_bits > bits:
             raise MediaScrubError(
                 f"wav extensible valid_bits {valid_bits} out of range for container bits {bits}"
+            )
+        if channel_mask & ~_WAV_DEFINED_CHANNEL_MASK:
+            raise MediaScrubError(
+                "wav extensible channel mask contains reserved speaker bits"
+            )
+        if channel_mask and channel_mask.bit_count() != channels:
+            raise MediaScrubError(
+                "wav extensible channel mask does not match channel count"
             )
         rebuilt = (
             struct.pack("<HHIIHH", format_code, channels, sample_rate, byte_rate, block_align, bits)
