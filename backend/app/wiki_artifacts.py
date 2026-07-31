@@ -11,13 +11,19 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from PIL import Image, UnidentifiedImageError
+from PIL import Image
 from typing import Any, Mapping
 from uuid import UUID, uuid4
 
 from . import knowledge
 from . import wiki_agent_tools
-from .image_scrub import ImageScrubError, scrub_image
+from .image_scrub import (
+    MAX_PIXELS as IMAGE_MAX_PIXELS,
+    MAX_SIDE as IMAGE_MAX_SIDE,
+    ImageScrubError,
+    probe_dimensions,
+    scrub_image,
+)
 from .pathwalk import open_relative_file
 
 
@@ -488,14 +494,35 @@ def _decode_image_payload(payload: dict[str, Any], field: str) -> tuple[bytes, s
     return data, mime
 
 
-def _reject_multi_frame(data: bytes, variant: str) -> None:
+def _reject_multi_frame(data: bytes, mime: str, variant: str) -> None:
     """Reject APNG / animated WebP payloads for visual-diff.
 
     An animated payload survives scrub_image (metadata strippers preserve
     APNG fcTL/fdAT and WebP ANIM/ANMF chunks), and the two <img> tags each
     animate on their own clock, so equal source frames would still report
     phase-difference "changes" during compare. Fail loud at ingest.
+
+    Pillow's Image.open runs decompression-bomb detection on the *declared*
+    dimensions and raises DecompressionBombError (bare Exception, not
+    ValueError) — that used to escape this helper and terminate the whole
+    per-run MCP server on a malformed 10000x10000 declaration. So gate the
+    Pillow call behind header-side and pixel caps, and treat every other
+    probe failure as "defer to scrub_image for the canonical error."
     """
+    try:
+        width, height = probe_dimensions(data, mime)
+    except ImageScrubError:
+        return
+    if (
+        width <= 0
+        or height <= 0
+        or width > IMAGE_MAX_SIDE
+        or height > IMAGE_MAX_SIDE
+        or width * height > IMAGE_MAX_PIXELS
+    ):
+        # Out-of-bounds sizes will surface via scrub_image with its
+        # canonical error message a moment later; do not open with Pillow.
+        return
     try:
         with Image.open(io.BytesIO(data)) as image:
             if getattr(image, "n_frames", 1) > 1:
@@ -505,8 +532,7 @@ def _reject_multi_frame(data: bytes, variant: str) -> None:
                 )
     except ArtifactValidationError:
         raise
-    except (UnidentifiedImageError, OSError, ValueError):
-        # Undecodable payloads get their canonical error from scrub_image next.
+    except Exception:  # noqa: BLE001 — Pillow raises many types; canonical error comes from scrub_image
         return
 
 
@@ -515,7 +541,7 @@ def _write_visual_diff(payload: dict[str, Any], artifact_id: str) -> dict[str, A
     scrubbed: dict[str, Any] = {}
     for variant in VISUAL_DIFF_VARIANTS:
         data, mime = _decode_image_payload(payload[variant], variant)
-        _reject_multi_frame(data, variant)
+        _reject_multi_frame(data, mime, variant)
         try:
             result = scrub_image(data, mime)
         except ImageScrubError as exc:

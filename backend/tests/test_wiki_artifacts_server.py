@@ -282,6 +282,95 @@ class WikiArtifactsTests(unittest.TestCase):
                 }
             )
 
+    def test_visual_diff_over_limit_variant_returns_isError_and_server_survives(self) -> None:
+        # A PNG declaring 10000x10000 in its IHDR chunk trips PIL's
+        # decompression-bomb detection (MAX_IMAGE_PIXELS = 40M). Before this
+        # fix, _reject_multi_frame opened the payload with PIL BEFORE any
+        # size cap, so DecompressionBombError (bare Exception, not
+        # ValueError) escaped every except clause on the stack and
+        # terminated the per-run MCP server. Now the pre-cap header probe
+        # bails out before PIL sees the bytes.
+        import struct
+        import zlib
+
+        def _oversized_png() -> bytes:
+            ihdr_payload = struct.pack(
+                ">IIBBBBB", 10000, 10000, 8, 2, 0, 0, 0,
+            )
+            crc = zlib.crc32(b"IHDR" + ihdr_payload).to_bytes(4, "big")
+            return (
+                b"\x89PNG\r\n\x1a\n"
+                + b"\x00\x00\x00\x0d"  # IHDR length
+                + b"IHDR"
+                + ihdr_payload
+                + crc
+            )
+
+        bomb = _oversized_png()
+        requests = [
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"protocolVersion": "2025-06-18"},
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "render_artifact",
+                    "arguments": {
+                        "kind": "visual-diff",
+                        "payload": {
+                            "before": {
+                                "data_base64": base64.b64encode(bomb).decode(),
+                                "mime": "image/png",
+                            },
+                            "after": {
+                                "data_base64": base64.b64encode(bomb).decode(),
+                                "mime": "image/png",
+                            },
+                        },
+                    },
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "render_artifact",
+                    "arguments": {"kind": "mermaid", "payload": _payload("mermaid")},
+                },
+            },
+        ]
+
+        env = os.environ.copy()
+        process = subprocess.run(
+            [sys.executable, "-m", "backend.app.wiki_artifacts"],
+            input="".join(json.dumps(request) + "\n" for request in requests),
+            text=True,
+            capture_output=True,
+            env=env,
+            timeout=10,
+            check=True,
+        )
+        responses = [json.loads(line) for line in process.stdout.splitlines()]
+        # First tool call: isError with the canonical size-cap message.
+        bomb_result = responses[1]["result"]
+        self.assertTrue(bomb_result.get("isError"))
+        self.assertRegex(
+            bomb_result["content"][0]["text"],
+            r"artifact rejected.*(pixel limit|side limit|40MP)",
+        )
+        # Second tool call: the server survived and served the next request.
+        alive_result = responses[2]["result"]
+        self.assertNotIn("isError", alive_result)
+        event = wiki_artifacts.artifact_from_text(alive_result["content"][0]["text"])
+        self.assertIsNotNone(event)
+        self.assertEqual(event["artifact"]["kind"], "mermaid")
+
     def test_visual_diff_rejects_animated_apng(self) -> None:
         def _apng_bytes(frames: int = 2) -> bytes:
             buffer = io.BytesIO()
