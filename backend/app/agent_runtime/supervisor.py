@@ -12,6 +12,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 from copy import deepcopy
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -46,6 +47,102 @@ DEFAULT_IDEMPOTENCY_CACHE_SIZE = 256
 DEFAULT_WORKER_SOFT_CAP = 5
 _IDEMPOTENT_METHODS = frozenset({"run/start", "run/send_now", "run/send_on_idle"})
 DEFAULT_APPROVAL_RECOVERY_TIMEOUT_SECONDS = 30.0
+
+
+class _HandoverDrainOutcome(str, Enum):
+    SUPERVISOR_INTERRUPTED = "supervisor-interrupted"
+    NATURAL_COMPLETED = "natural-completed"
+    NEW_APPROVAL = "new-approval"
+    CONTROL_CANCEL_REQUEST = "control-cancel-request"
+    USER_RESPONSE = "user-response"
+    NONE = "none"
+
+
+class _HandoverPendingDisposition(str, Enum):
+    PRESERVE_CAPTURED = "preserve-captured"
+    MERGE_CAPTURED_AND_DRAINED = "merge-captured-and-drained"
+    CLEAR = "clear"
+
+
+# This is the complete handover finalization matrix. Keep all 18 cells
+# explicit: provider stop events can be late, reordered, or provider-specific.
+_HANDOVER_FINALIZATION_MATRIX: dict[
+    tuple[LifecycleState, _HandoverDrainOutcome],
+    tuple[LifecycleState, _HandoverPendingDisposition],
+] = {
+    (LifecycleState.WORKING, _HandoverDrainOutcome.SUPERVISOR_INTERRUPTED): (
+        LifecycleState.WORKING,
+        _HandoverPendingDisposition.PRESERVE_CAPTURED,
+    ),
+    (LifecycleState.WORKING, _HandoverDrainOutcome.NATURAL_COMPLETED): (
+        LifecycleState.IDLE,
+        _HandoverPendingDisposition.CLEAR,
+    ),
+    (LifecycleState.WORKING, _HandoverDrainOutcome.NEW_APPROVAL): (
+        LifecycleState.WAITING_APPROVAL,
+        _HandoverPendingDisposition.MERGE_CAPTURED_AND_DRAINED,
+    ),
+    (LifecycleState.WORKING, _HandoverDrainOutcome.CONTROL_CANCEL_REQUEST): (
+        LifecycleState.WORKING,
+        _HandoverPendingDisposition.PRESERVE_CAPTURED,
+    ),
+    (LifecycleState.WORKING, _HandoverDrainOutcome.USER_RESPONSE): (
+        LifecycleState.WORKING,
+        _HandoverPendingDisposition.CLEAR,
+    ),
+    (LifecycleState.WORKING, _HandoverDrainOutcome.NONE): (
+        LifecycleState.WORKING,
+        _HandoverPendingDisposition.PRESERVE_CAPTURED,
+    ),
+    (LifecycleState.WAITING_APPROVAL, _HandoverDrainOutcome.SUPERVISOR_INTERRUPTED): (
+        LifecycleState.WAITING_APPROVAL,
+        _HandoverPendingDisposition.PRESERVE_CAPTURED,
+    ),
+    (LifecycleState.WAITING_APPROVAL, _HandoverDrainOutcome.NATURAL_COMPLETED): (
+        LifecycleState.IDLE,
+        _HandoverPendingDisposition.CLEAR,
+    ),
+    (LifecycleState.WAITING_APPROVAL, _HandoverDrainOutcome.NEW_APPROVAL): (
+        LifecycleState.WAITING_APPROVAL,
+        _HandoverPendingDisposition.MERGE_CAPTURED_AND_DRAINED,
+    ),
+    (LifecycleState.WAITING_APPROVAL, _HandoverDrainOutcome.CONTROL_CANCEL_REQUEST): (
+        LifecycleState.WAITING_APPROVAL,
+        _HandoverPendingDisposition.PRESERVE_CAPTURED,
+    ),
+    (LifecycleState.WAITING_APPROVAL, _HandoverDrainOutcome.USER_RESPONSE): (
+        LifecycleState.WORKING,
+        _HandoverPendingDisposition.CLEAR,
+    ),
+    (LifecycleState.WAITING_APPROVAL, _HandoverDrainOutcome.NONE): (
+        LifecycleState.WAITING_APPROVAL,
+        _HandoverPendingDisposition.PRESERVE_CAPTURED,
+    ),
+    (LifecycleState.IDLE, _HandoverDrainOutcome.SUPERVISOR_INTERRUPTED): (
+        LifecycleState.IDLE,
+        _HandoverPendingDisposition.PRESERVE_CAPTURED,
+    ),
+    (LifecycleState.IDLE, _HandoverDrainOutcome.NATURAL_COMPLETED): (
+        LifecycleState.IDLE,
+        _HandoverPendingDisposition.CLEAR,
+    ),
+    (LifecycleState.IDLE, _HandoverDrainOutcome.NEW_APPROVAL): (
+        LifecycleState.WAITING_APPROVAL,
+        _HandoverPendingDisposition.MERGE_CAPTURED_AND_DRAINED,
+    ),
+    (LifecycleState.IDLE, _HandoverDrainOutcome.CONTROL_CANCEL_REQUEST): (
+        LifecycleState.IDLE,
+        _HandoverPendingDisposition.CLEAR,
+    ),
+    (LifecycleState.IDLE, _HandoverDrainOutcome.USER_RESPONSE): (
+        LifecycleState.IDLE,
+        _HandoverPendingDisposition.CLEAR,
+    ),
+    (LifecycleState.IDLE, _HandoverDrainOutcome.NONE): (
+        LifecycleState.IDLE,
+        _HandoverPendingDisposition.PRESERVE_CAPTURED,
+    ),
+}
 
 
 def _approval_recovery_prompt(record: RunRecord) -> str | None:
@@ -2450,61 +2547,66 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         return run_ids
 
     @staticmethod
-    def _handover_state_after_stop(
+    def _classify_handover_finalization(
         captured_state: LifecycleState,
         events: list[tuple[ProviderAdapter, ProviderEvent]],
-    ) -> tuple[LifecycleState, bool]:
-        """Choose the final intent from lifecycle results emitted during stop."""
+        captured_pending_requests: dict[str, dict[str, Any]],
+        drained_pending_requests: dict[str, dict[str, Any]],
+    ) -> tuple[LifecycleState, dict[str, dict[str, Any]]]:
+        """Apply the complete captured-state and stop-event matrix."""
 
-        state = captured_state
-        approval_seen = False
-        natural_completion_seen = False
+        outcome = _HandoverDrainOutcome.NONE
         for _adapter, event in events:
             normalized = normalize_provider_event(
                 event.provider,
                 event.payload,
                 direction=event.direction,
             )
-            candidate = normalized.lifecycle_state
-            if candidate is None or candidate is LifecycleState.INTERRUPTED:
-                # An interrupted completion is the expected result of the
-                # supervisor's own stop request. It must not replace intent.
+            if normalized.kind in {"approval_response", "approval_resolved"}:
+                outcome = _HandoverDrainOutcome.USER_RESPONSE
                 continue
-            params = event.payload.get("params")
-            turn = params.get("turn") if isinstance(params, dict) else None
-            completed_turn = (
-                event.payload.get("method") == "turn/completed"
-                and isinstance(turn, dict)
-                and turn.get("status") == "completed"
-            )
-            if completed_turn:
-                state = LifecycleState.IDLE
-                natural_completion_seen = True
+            if event.payload.get("type") == "control_response":
+                outcome = _HandoverDrainOutcome.USER_RESPONSE
                 continue
-            if candidate is LifecycleState.COMPLETED:
-                method = event.payload.get("method")
-                if method == "turn/completed":
-                    state = LifecycleState.IDLE
-                    natural_completion_seen = True
-                    continue
-                raise StoreConflict(
-                    "provider completed the run during handover without a resumable result"
-                )
-            if candidate in {
-                LifecycleState.WORKING,
-                LifecycleState.WAITING_APPROVAL,
-                LifecycleState.IDLE,
+            if event.payload.get("type") == "control_cancel_request":
+                outcome = _HandoverDrainOutcome.CONTROL_CANCEL_REQUEST
+                continue
+            if normalized.lifecycle_state is LifecycleState.WAITING_APPROVAL:
+                outcome = _HandoverDrainOutcome.NEW_APPROVAL
+                continue
+            if normalized.lifecycle_state is LifecycleState.INTERRUPTED:
+                outcome = _HandoverDrainOutcome.SUPERVISOR_INTERRUPTED
+                continue
+            if normalized.lifecycle_state is LifecycleState.IDLE:
+                outcome = _HandoverDrainOutcome.NATURAL_COMPLETED
+                continue
+            if normalized.lifecycle_state in {
+                LifecycleState.COMPLETED,
+                LifecycleState.BLOCKED,
             }:
-                if candidate is LifecycleState.WAITING_APPROVAL:
-                    approval_seen = True
-                state = candidate
-                continue
+                raise StoreConflict(
+                    "provider produced non-resumable handover state: "
+                    f"{normalized.lifecycle_state.value}"
+                )
+
+        try:
+            final_state, pending_disposition = _HANDOVER_FINALIZATION_MATRIX[
+                (captured_state, outcome)
+            ]
+        except KeyError as exc:
             raise StoreConflict(
-                f"provider produced non-resumable handover state: {candidate.value}"
-            )
-        if approval_seen:
-            state = LifecycleState.WAITING_APPROVAL
-        return state, natural_completion_seen
+                f"unsupported handover finalization: {captured_state.value}/{outcome.value}"
+            ) from exc
+        if pending_disposition is _HandoverPendingDisposition.CLEAR:
+            pending_requests: dict[str, dict[str, Any]] = {}
+        elif pending_disposition is _HandoverPendingDisposition.MERGE_CAPTURED_AND_DRAINED:
+            pending_requests = {
+                **captured_pending_requests,
+                **drained_pending_requests,
+            }
+        else:
+            pending_requests = dict(captured_pending_requests)
+        return final_state, pending_requests
 
     async def prepare_handover(self, _run_ids: list[str] | None = None) -> dict[str, Any]:
         """Block admission, validate providers, then drain that exact set."""
@@ -2585,20 +2687,15 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     async with self.handover_condition:
                         stop_events = list(self.handover_event_queue.get(run_id, []))
                     await self._flush_handover_events(run_id)
-                    final_state, natural_completion_seen = self._handover_state_after_stop(
-                        captured_state,
-                        stop_events,
-                    )
                     post_stop = self.store.get(run_id)
-                    if final_state is LifecycleState.WAITING_APPROVAL:
-                        final_pending_requests = {
-                            **post_stop.pending_requests,
-                            **captured_pending_requests,
-                        }
-                    elif natural_completion_seen:
-                        final_pending_requests = {}
-                    else:
-                        final_pending_requests = captured_pending_requests
+                    final_state, final_pending_requests = (
+                        self._classify_handover_finalization(
+                            captured_state,
+                            stop_events,
+                            captured_pending_requests,
+                            post_stop.pending_requests,
+                        )
+                    )
                     current = self.store.finalize_handover_detach(
                         run_id,
                         state=final_state,

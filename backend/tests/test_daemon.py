@@ -986,7 +986,7 @@ class DaemonHandshakeTests(unittest.TestCase):
         ), socket.socket() as peer:
             self.assertFalse(native_server.is_trusted_tauri_peer(peer))
 
-    def test_selected_adhoc_bundle_identity_is_accepted(self) -> None:
+    def test_selected_adhoc_bundle_is_rejected_for_daemon_handoff(self) -> None:
         with TemporaryDirectory() as tmp:
             app = Path(tmp) / "Wiki.app"
             selected = app / "Contents" / "MacOS" / "wiki-native"
@@ -1029,7 +1029,7 @@ class DaemonHandshakeTests(unittest.TestCase):
                 )
             ), patch.object(native_server.subprocess, "run", side_effect=fake_run
             ), socket.socket() as peer:
-                self.assertTrue(native_server.is_trusted_tauri_peer(peer))
+                self.assertFalse(native_server.is_trusted_tauri_peer(peer))
 
             with patch.object(native_server, "TAURI_BUNDLE_PATH", app), patch.object(
                 native_server, "_peer_pid", return_value=123
@@ -1055,7 +1055,7 @@ class DaemonHandshakeTests(unittest.TestCase):
             ), socket.socket() as peer:
                 self.assertFalse(native_server.is_trusted_tauri_peer(peer))
 
-    def test_real_adhoc_bundle_ignores_unsigned_nested_launcher(self) -> None:
+    def test_real_adhoc_bundle_is_rejected_for_daemon_handoff(self) -> None:
         source = (
             Path(__file__).resolve().parents[2]
             / "src-tauri"
@@ -1098,7 +1098,7 @@ class DaemonHandshakeTests(unittest.TestCase):
                     ),
                 ),
             ), socket.socket() as peer:
-                self.assertTrue(native_server.is_trusted_tauri_peer(peer))
+                self.assertFalse(native_server.is_trusted_tauri_peer(peer))
 
             with patch.object(native_server, "TAURI_BUNDLE_PATH", app), patch.object(
                 native_server, "_peer_pid", return_value=123

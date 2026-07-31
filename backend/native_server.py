@@ -623,13 +623,9 @@ def is_trusted_tauri_peer(connection: socket.socket) -> bool:
             trusted_team,
             live_identity=live_identity,
         )
-    selected_executable = _bundle_executable(TAURI_BUNDLE_PATH)
-    return selected_executable is not None and _verify_code_identity(
-        executable,
-        selected_executable=selected_executable,
-        selected_bundle=TAURI_BUNDLE_PATH,
-        live_identity=live_identity,
-    )
+    # Ad-hoc signatures have no developer trust anchor. Development bundles
+    # must use sidecar mode, so they never receive the daemon secret.
+    return False
 
 
 def read_sidecar_secret() -> str:
