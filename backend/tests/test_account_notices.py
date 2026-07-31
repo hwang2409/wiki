@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from backend.app.account_notices import AccountNoticeStore
@@ -305,6 +306,107 @@ def test_reconcile_clears_claude_limit_on_archive(tmp_path: Path) -> None:
     assert store.reconcile_with_live({"WIKI-H": None}) is True
     remaining = store.snapshot()
     assert [entry["ticket"] for entry in remaining] == ["WIKI-H"]
+
+
+def test_reconcile_clears_claude_limit_when_ticket_replaced_by_run_id(tmp_path: Path) -> None:
+    # A limit-hit Claude worker gets replaced by a Codex worker under the
+    # same ticket. The stated fix ("replace or archive this worker") must
+    # actually clear the banner. Headless emissions include run_id and
+    # provider so reconciliation can detect the replacement.
+    store = _store(tmp_path)
+    store.apply_event(
+        {
+            "type": "claude_limit_hit",
+            "provider": "claude",
+            "ticket": "WIKI-J",
+            "run_id": "claude-run",
+            "window": "",
+            "ts": "t1",
+        }
+    )
+    # Same ticket, different run_id (Claude-to-Codex replace).
+    assert store.reconcile_with_live({"WIKI-J": "codex-run"}) is True
+    assert store.snapshot() == []
+
+
+def test_reconcile_keeps_claude_limit_when_run_id_matches(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.apply_event(
+        {
+            "type": "claude_limit_hit",
+            "provider": "claude",
+            "ticket": "WIKI-K",
+            "run_id": "claude-run",
+            "window": "",
+            "ts": "t1",
+        }
+    )
+    assert store.reconcile_with_live({"WIKI-K": "claude-run"}) is False
+    assert len(store.snapshot()) == 1
+
+
+def test_reconcile_falls_back_to_ticket_membership_for_legacy_claude_limit(
+    tmp_path: Path,
+) -> None:
+    # Legacy tmux emissions carry no run_id. Same rule as legacy codex
+    # notices: ticket present → kept, ticket absent → dropped.
+    store = _store(tmp_path)
+    store.apply_event({"type": "claude_limit_hit", "ticket": "WIKI-L", "window": "@2", "ts": "t1"})
+    assert store.reconcile_with_live({"WIKI-L": "any-run-id"}) is False
+    assert store.reconcile_with_live({}) is True
+    assert store.snapshot() == []
+
+
+def test_loader_drops_unknown_and_malformed_notice_payloads(tmp_path: Path) -> None:
+    path = tmp_path / "notices.json"
+    # Mix valid + invalid entries and reload.
+    path.write_text(
+        json.dumps(
+            {
+                "claude:limit:WIKI-A": {
+                    "type": "claude_limit_hit",
+                    "ticket": "WIKI-A",
+                    "window": "@1",
+                    "ts": "t1",
+                },
+                # Unknown type — a future/older payload that AccountEventsBanner
+                # cannot render.
+                "future:new-type:WIKI-B": {
+                    "type": "codex_future_recovery",
+                    "ticket": "WIKI-B",
+                    "ts": "t2",
+                },
+                # Known type, but missing the required tickets array.
+                "codex:limit:missing": {
+                    "type": "codex_limit_no_eligible",
+                    "reset_at": None,
+                    "ts": "t3",
+                },
+                # Known type with the wrong shape (revived should be a list).
+                "codex:rotation-revive-failed:bad": {
+                    "type": "codex_rotation",
+                    "revived": None,
+                    "failed": [],
+                    "ts": "t4",
+                },
+                # Known type with a missing ticket.
+                "claude:limit:missing-ticket": {
+                    "type": "claude_limit_hit",
+                    "ticket": None,
+                    "ts": "t5",
+                },
+                # Non-dict value.
+                "not-a-notice": "hello",
+                # Non-string type.
+                "codex:limit:non-string-type": {"type": 7, "tickets": []},
+            }
+        ),
+        encoding="utf-8",
+    )
+    reloaded = AccountNoticeStore(path=path)
+    # Only the well-formed claude_limit_hit for WIKI-A survives the reload.
+    assert [entry["type"] for entry in reloaded.snapshot()] == ["claude_limit_hit"]
+    assert reloaded.snapshot()[0]["ticket"] == "WIKI-A"
 
 
 def test_reconcile_bails_when_revision_advanced_after_snapshot(tmp_path: Path) -> None:

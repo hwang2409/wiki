@@ -1114,7 +1114,13 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 self._publish(
                     {
                         "type": "claude_limit_hit",
+                        "provider": "claude",
                         "ticket": record.agent_id,
+                        # Per-ticket run_id lets the notice store reconcile
+                        # against the live registry: a replaced Claude worker
+                        # gets a new run_id and its stale-limit banner
+                        # drops on the next refresh.
+                        "run_id": record.run_id,
                         "window": "",
                         "ts": datetime.now(timezone.utc).isoformat(),
                     }

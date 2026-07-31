@@ -775,6 +775,33 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
         surfaced = cast(list[dict[str, Any]], payload["account_notices"])
         self.assertEqual(surfaced, [])
 
+    async def test_archive_hint_selects_the_requested_archived_at_not_the_newest(
+        self,
+    ) -> None:
+        # A ticket with two archives — the session endpoint must open the
+        # one whose archived_at was requested, not the newest by default.
+        archive_dir = self.archive_dir / "WIKI-42"
+        older = archive_dir / "20260601-100000"
+        newer = archive_dir / "20260731-100000"
+        older.mkdir(parents=True)
+        newer.mkdir(parents=True)
+        (older / "cdx-old.log").write_text("old", encoding="utf-8")
+        (newer / "cc-new.log").write_text("new", encoding="utf-8")
+
+        newest = main._archive_hint("WIKI-42")
+        self.assertEqual(newest[2], newer)
+        # Match on the exact archived_at emitted by list_archived.
+        entries = main.list_archived(latest_per_ticket=False)
+        wiki_entries = [entry for entry in entries if entry["ticket"] == "WIKI-42"]
+        self.assertEqual(len(wiki_entries), 2)
+        older_at = min(entry["archived_at"] for entry in wiki_entries)
+        selected = main._archive_hint("WIKI-42", archived_at=older_at)
+        self.assertEqual(selected[2], older)
+        # A stale archived_at returns nothing so the endpoint 404s instead
+        # of silently loading the wrong session.
+        missing = main._archive_hint("WIKI-42", archived_at="1999-01-01T00:00:00+00:00")
+        self.assertEqual(missing, (None, None, None))
+
     async def test_agents_reconciles_leaves_matching_run_id_alone(self) -> None:
         # Notice recorded the live run_id; nothing to reconcile away.
         self._seed_headless()

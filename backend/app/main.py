@@ -1743,17 +1743,39 @@ def list_archived(
     return entries[:limit]
 
 
-def _archive_hint(ticket: str) -> tuple[str | None, str | None, Path | None]:
-    """(kind, spawned_at-ish iso, session dir) from the newest archive of a ticket."""
+def _archive_hint(
+    ticket: str,
+    archived_at: str | None = None,
+) -> tuple[str | None, str | None, Path | None]:
+    """(kind, spawned_at iso, session dir) for a ticket's archive.
+
+    Without ``archived_at`` returns the newest archive (unchanged behavior).
+    With ``archived_at`` returns the archive whose iso timestamp matches
+    exactly — this is what history rows pass through so an older row does
+    not open the newest archive's transcript.
+    """
+
     ticket_dir = AGENT_ARCHIVE_DIR / ticket
     if not ticket_dir.is_dir():
         return (None, None, None)
     sessions = _archive_sessions(ticket_dir)
     if not sessions:
         return (None, None, None)
-    archived_at, session_dir = sessions[0]
+    if archived_at is not None:
+        for candidate_at, session_dir in sessions:
+            if candidate_at.isoformat() == archived_at:
+                kind = (
+                    "cdx"
+                    if any(session_dir.glob("cdx-*"))
+                    else "cc"
+                    if any(session_dir.glob("cc-*"))
+                    else None
+                )
+                return (kind, candidate_at.isoformat(), session_dir)
+        return (None, None, None)
+    archived_at_dt, session_dir = sessions[0]
     kind = "cdx" if any(session_dir.glob("cdx-*")) else "cc" if any(session_dir.glob("cc-*")) else None
-    return (kind, archived_at.isoformat(), session_dir)
+    return (kind, archived_at_dt.isoformat(), session_dir)
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:
@@ -3482,6 +3504,7 @@ def agent_session(
     ticket: str,
     cursor: int = Query(0, ge=0),
     client_path: str | None = Query(None, alias="path"),
+    archived_at: str | None = Query(None),
 ) -> dict[str, object]:
     if not valid_agent_id(ticket):
         raise HTTPException(status_code=400, detail="Bad ticket")
@@ -3526,7 +3549,7 @@ def agent_session(
     registry_session_id = current.get("session_id") if isinstance(current.get("session_id"), str) else None
     archive_dir: Path | None = None
     if not current:
-        archive_kind, spawned_at, archive_dir = _archive_hint(ticket)
+        archive_kind, spawned_at, archive_dir = _archive_hint(ticket, archived_at)
         current_kind = current_kind or archive_kind
 
     found = None

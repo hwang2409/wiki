@@ -1208,6 +1208,11 @@ export function AgentsView({
   );
   const [expandedDetails, setExpandedDetails] = useState<Set<string>>(new Set());
   const [openMenuTicket, setOpenMenuTicket] = useState<string | null>(null);
+  // list_archived can return more than one archived session per ticket. The
+  // openTicket string alone can't disambiguate them, so the history row
+  // records which specific archived_at was clicked. openWorker below reads
+  // this to load the exact transcript instead of the newest.
+  const [openArchivedAt, setOpenArchivedAt] = useState<string | null>(null);
 
   useEffect(() => {
     if (openMenuTicket === null) return;
@@ -1320,7 +1325,15 @@ export function AgentsView({
   const openOrch = orchestrators.find((orch) => orch.id === openTicket);
   const liveWorkers = workers ?? [];
   const liveWorker = liveWorkers.find((worker) => worker.ticket === openTicket) ?? null;
-  const archivedWorker = archived.find((entry) => entry.ticket === openTicket) ?? null;
+  // Prefer the specific archived_at the user clicked. Falls back to the
+  // first (newest) row for the ticket only when nothing was recorded —
+  // that path is exercised by legacy deep links, not the redesigned rows.
+  const archivedWorker =
+    (openArchivedAt !== null
+      ? archived.find(
+          (entry) => entry.ticket === openTicket && entry.archived_at === openArchivedAt,
+        )
+      : archived.find((entry) => entry.ticket === openTicket)) ?? null;
   const openWorker: SidebarTarget | null = liveWorker
     ? {
         ticket: liveWorker.ticket,
@@ -1347,6 +1360,7 @@ export function AgentsView({
             model: archivedWorker.model,
             pr: archivedWorker.pr,
             canReview: Boolean(archivedWorker.pr),
+            archivedAt: archivedWorker.archived_at,
           }
         : null;
 
@@ -1513,9 +1527,21 @@ export function AgentsView({
     // round-5 family sweep). Ticket + outcome badge + archived age +
     // "View transcript" are the only default surface. Kind/role/model/step
     // and every technical field live behind the details disclosure.
+    // The (ticket, archived_at) pair is the stable identifier — a ticket
+    // can have multiple archives and clicking an older row must load the
+    // matching transcript, not the newest.
     const key = `${entry.ticket}-${entry.archived_at}`;
-    const isOpen = openTicket === entry.ticket;
+    const isOpen = openTicket === entry.ticket && openArchivedAt === entry.archived_at;
     const detailsOpen = expandedDetails.has(key);
+    function selectThisArchive() {
+      if (isOpen) {
+        setOpenArchivedAt(null);
+        onOpenTicket(null);
+        return;
+      }
+      setOpenArchivedAt(entry.archived_at);
+      onOpenTicket(entry.ticket);
+    }
     return (
       <article
         className={`agent-card is-archived${isOpen ? " is-selected" : ""}`}
@@ -1523,7 +1549,7 @@ export function AgentsView({
         onClick={(event) => {
           const target = event.target as HTMLElement;
           if (target.closest("button, a, .agent-tech")) return;
-          onOpenTicket(isOpen ? null : entry.ticket);
+          selectThisArchive();
         }}
       >
         <header className="agent-card-header">
@@ -1546,7 +1572,7 @@ export function AgentsView({
             <button
               className="agent-primary-action"
               type="button"
-              onClick={() => onOpenTicket(isOpen ? null : entry.ticket)}
+              onClick={selectThisArchive}
             >
               <ScrollText size={13} />
               View transcript

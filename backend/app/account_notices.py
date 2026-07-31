@@ -61,6 +61,32 @@ _REVIVE_FAILED_KEYS = {
 }
 
 
+# Required shape check per notice type. AccountEventsBanner has an unchecked
+# switch on ``type``, so an unknown or malformed payload leaked from the
+# on-disk store would crash the Runs view. On load we drop anything that
+# doesn't match these shapes.
+def _valid_notice(kind: str, payload: dict) -> bool:
+    if kind == "codex_limit_no_eligible":
+        return isinstance(payload.get("tickets"), list)
+    if kind == "codex_rotation_failed":
+        return isinstance(payload.get("error"), str)
+    if kind == "codex_rotation":
+        return (
+            isinstance(payload.get("revived"), list)
+            and isinstance(payload.get("failed"), list)
+        )
+    if kind == "codex_auth_dead_revival":
+        return (
+            isinstance(payload.get("revived"), list)
+            and isinstance(payload.get("failed"), list)
+        )
+    if kind == "codex_auth_dead_exhausted":
+        return isinstance(payload.get("tickets"), list)
+    if kind == "claude_limit_hit":
+        return isinstance(payload.get("ticket"), str) and bool(payload.get("ticket"))
+    return False
+
+
 class AccountNoticeStore:
     """Keyed unresolved notices with recovery-event resolution."""
 
@@ -82,11 +108,20 @@ class AccountNoticeStore:
             return {}
         if not isinstance(data, dict):
             return {}
-        return {
-            key: value
-            for key, value in data.items()
-            if isinstance(key, str) and isinstance(value, dict)
-        }
+        loaded: dict[str, dict] = {}
+        for key, value in data.items():
+            if not isinstance(key, str) or not isinstance(value, dict):
+                continue
+            kind = value.get("type")
+            if not isinstance(kind, str):
+                continue
+            # An unknown or shape-invalid payload would reach the frontend
+            # AccountEventsBanner switch, which is exhaustive on the known
+            # event types and would crash the Runs view for anything else.
+            if not _valid_notice(kind, value):
+                continue
+            loaded[key] = value
+        return loaded
 
     def _persist(self) -> None:
         try:
@@ -366,15 +401,19 @@ class AccountNoticeStore:
                     self._notices[key] = updated
                 else:
                     self._notices.pop(key, None)
-            # Claude limit notices are ticket-only (the tmux watchdog has no
-            # run_id concept; the headless supervisor does not emit these at
-            # all yet — WIKI-228). Reconcile on ticket-membership: archive
-            # clears, replace does not.
+            # Claude limit notices reconcile the same way as codex worker-
+            # scoped notices: absent ticket → dropped (archive), same ticket
+            # with a different live run_id → dropped (replace). The headless
+            # supervisor now emits ``run_id`` on ``claude_limit_hit``; legacy
+            # tmux emissions carry no run_id and reconcile on ticket-only,
+            # matching the codex legacy path.
             for key in list(self._notices.keys()):
                 if not key.startswith("claude:limit:"):
                     continue
                 ticket = key.split(":", 2)[2]
-                if ticket in live_runs:
+                notice = self._notices.get(key) or {}
+                stored_run_id = notice.get("run_id") if isinstance(notice.get("run_id"), str) else None
+                if _ticket_matches_live(ticket, stored_run_id):
                     continue
                 self._notices.pop(key, None)
                 changed = True

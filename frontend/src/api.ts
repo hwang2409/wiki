@@ -253,6 +253,10 @@ export type AccountEvent =
       ticket: string;
       window: string;
       ts: string;
+      // Present when the event is emitted by the headless supervisor;
+      // legacy tmux emissions omit it. See account_notices.reconcile.
+      provider?: string;
+      run_id?: string;
     };
 
 export function getAgents() {
@@ -899,9 +903,18 @@ export function cancelQueuedMessage(ticket: string, index: number) {
   );
 }
 
-export function getAgentSession(ticket: string, after = 0, path?: string) {
+export function getAgentSession(
+  ticket: string,
+  after = 0,
+  path?: string,
+  archivedAt?: string,
+) {
   const params = new URLSearchParams({ cursor: String(after) });
   if (path) params.set("path", path);
+  // History rows carry an explicit archived_at so the backend selects the
+  // right archive when a ticket has more than one. Without it the backend
+  // returns the newest archive, which is wrong for older history rows.
+  if (archivedAt) params.set("archived_at", archivedAt);
   return request<AgentSessionData>(
     `/api/agents/${encodeURIComponent(ticket)}/session?${params.toString()}`
   );

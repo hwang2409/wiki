@@ -21,6 +21,10 @@ const POLL_MS = 2500;
 export type TranscriptTarget = {
   ticket: string;
   subagent?: string;
+  // When set, selects a specific archived session for this ticket. Without
+  // it the backend returns the newest archive — wrong for older history
+  // rows. See getAgentSession + agents.tsx renderHistoryRow.
+  archivedAt?: string;
 };
 
 export type TranscriptSession = {
@@ -171,7 +175,7 @@ export function clearInlineArtifactStates(sessionKey: string) {
 }
 
 function targetKey(target: TranscriptTarget): string {
-  return `${target.ticket}::${target.subagent ?? ""}`;
+  return `${target.ticket}::${target.subagent ?? ""}::${target.archivedAt ?? ""}`;
 }
 
 function createEntry(target: TranscriptTarget): Entry {
@@ -269,7 +273,7 @@ function setPollerState() {
 async function loadTarget(target: TranscriptTarget, cursor: number, path?: string): Promise<AgentSessionData> {
   return target.subagent
     ? getSubagentSession(target.ticket, target.subagent, cursor, path)
-    : getAgentSession(target.ticket, cursor, path);
+    : getAgentSession(target.ticket, cursor, path, target.archivedAt);
 }
 
 export async function loadOlderEvents(ticket: string, before: number, count = 500): Promise<void> {

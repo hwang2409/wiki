@@ -91,6 +91,19 @@ beforeEach(() => {
       )
     )
   );
+  // jsdom does not implement IntersectionObserver; SessionSidebar mounts
+  // SessionTab which uses it via useElementVisible.
+  if (typeof (globalThis as unknown as { IntersectionObserver?: unknown }).IntersectionObserver === "undefined") {
+    class FakeIntersectionObserver {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+      takeRecords(): [] {
+        return [];
+      }
+    }
+    vi.stubGlobal("IntersectionObserver", FakeIntersectionObserver);
+  }
 });
 
 afterEach(() => {
@@ -505,6 +518,72 @@ test("orchestrator row default hides kind/model/cwd; details disclosure reveals 
   await waitFor(() => {
     expect(view.getByRole("menuitem", { name: /^Replace$/ })).toBeTruthy();
   });
+});
+
+test("history rows with two archives per ticket open the specific transcript", () => {
+  // list_archived can return multiple archives per ticket. Each row must
+  // carry a stable identifier so clicking an older row loads that archive
+  // rather than the newest.
+  const older: ArchivedWorker = {
+    ticket: "WIKI-DUP",
+    archived_at: "2026-07-01T10:00:00Z",
+    kind: "cdx",
+    role: "implement",
+    model: "gpt-5.4",
+    outcome: "merged",
+    state: null,
+    pr: null,
+    step: "old attempt",
+  } as unknown as ArchivedWorker;
+  const newer: ArchivedWorker = {
+    ...older,
+    archived_at: "2026-07-30T10:00:00Z",
+    outcome: "abandoned",
+    step: "new attempt",
+  };
+
+  const opened: string[] = [];
+  let currentOpen: string | null = null;
+
+  function Harness() {
+    const [openTicket, setOpenTicket] = useState<string | null>(null);
+    currentOpen = openTicket;
+    return (
+      <AgentsView
+        data={{
+          workers: [],
+          orchestrators: [],
+          archived: [newer, older],
+          error: null,
+        }}
+        onOpenAgent={() => undefined}
+        refreshTick={0}
+        openTicket={openTicket}
+        onOpenTicket={(next) => {
+          opened.push(String(next));
+          setOpenTicket(next);
+        }}
+      />
+    );
+  }
+
+  const view = render(<Harness />);
+  const buttons = view.getAllByRole("button", { name: /View transcript/ });
+  expect(buttons.length).toBe(2);
+
+  // Click the OLDER row (second in the list — history sorts newest-first).
+  fireEvent.click(buttons[1]);
+  expect(currentOpen).toBe("WIKI-DUP");
+  // The `is-selected` marker must move to the older article, not the newer.
+  const articles = view.container.querySelectorAll(".agent-card.is-archived");
+  expect(articles[1].classList.contains("is-selected")).toBe(true);
+  expect(articles[0].classList.contains("is-selected")).toBe(false);
+
+  // Clicking the newer row moves the selection to the newer archive.
+  fireEvent.click(buttons[0]);
+  const articlesAfter = view.container.querySelectorAll(".agent-card.is-archived");
+  expect(articlesAfter[0].classList.contains("is-selected")).toBe(true);
+  expect(articlesAfter[1].classList.contains("is-selected")).toBe(false);
 });
 
 test("history row is a quiet outcome/date summary with View transcript", async () => {

@@ -3614,6 +3614,11 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(first["ticket"], "WIKI-CLAUDE-LIMIT")
         self.assertEqual(first["window"], "")
+        # Round-7: run_id + provider ride along so the notice store can
+        # reconcile a Claude-to-Codex replacement without needing a
+        # ticket-scoped recovery event.
+        self.assertEqual(first["run_id"], record.run_id)
+        self.assertEqual(first["provider"], "claude")
         with self.assertRaises(TimeoutError):
             await _wait_for_published(queue, "claude_limit_hit", timeout=0.1)
         self.supervisor.unsubscribe(queue)
