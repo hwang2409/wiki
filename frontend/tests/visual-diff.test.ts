@@ -101,6 +101,23 @@ test("computePixelDiff detects large single-channel deltas in every channel", ()
   }
 });
 
+test("computePixelDiff ignores RGB differences hidden under near-zero alpha", () => {
+  // Two pixels rendered onto a checkerboard are visually identical when both
+  // alphas are near zero, regardless of their unpremultiplied RGB. The old
+  // implementation compared raw RGB and false-highlighted transparent
+  // screenshot regions (WIKI-193 review 5).
+  const hiddenRedAt5 = pixelBuffer([[255, 0, 0, 5]]);
+  const hiddenGreenAt5 = pixelBuffer([[0, 255, 0, 5]]);
+  const result = computePixelDiff(hiddenRedAt5, hiddenGreenAt5, 1, 1);
+  assert.equal(result.changedPixels, 0, "hidden RGB under low alpha should stay quiet");
+
+  // But a real color swap at full alpha still registers.
+  const solidRed = pixelBuffer([[255, 0, 0, 255]]);
+  const solidGreen = pixelBuffer([[0, 255, 0, 255]]);
+  const visible = computePixelDiff(solidRed, solidGreen, 1, 1);
+  assert.equal(visible.changedPixels, 1, "visible RGB swap must still register");
+});
+
 test("computePixelDiff detects alpha regressions including low-alpha shifts", () => {
   const opaque = pixelBuffer([[100, 100, 100, 255]]);
   const halfAlpha = pixelBuffer([[100, 100, 100, 128]]);

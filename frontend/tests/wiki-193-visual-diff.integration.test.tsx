@@ -330,6 +330,139 @@ describe("visual-diff in ArtifactPanel", () => {
   });
 });
 
+describe("visual-diff pixel-diff at oversized native resolution", () => {
+  test("localized one-pixel regression survives the bounded overlay cap", async () => {
+    // 2400 x 1200 = 2.88 MP — above the 2 MP overlay cap, so the naive
+    // bilinear downsample would have averaged a single-pixel regression
+    // away. This test replaces the canvas mock with a tile-aware one and
+    // asserts (a) native totals are reported, (b) the localized change is
+    // counted, and (c) the bounded overlay contains a highlight at the
+    // corresponding projected pixel.
+
+    const NATIVE_W = 2400;
+    const NATIVE_H = 1200;
+
+    // The one differing pixel — everywhere else, before == after (pure black).
+    const CHANGE_X = 42;
+    const CHANGE_Y = 17;
+
+    class LargeImage {
+      onload: (() => void) | null = null;
+      onerror: ((error: unknown) => void) | null = null;
+      crossOrigin: string | null = null;
+      decoding: string | null = null;
+      naturalWidth = NATIVE_W;
+      naturalHeight = NATIVE_H;
+      isAfter = false;
+      #src = "";
+      get src(): string {
+        return this.#src;
+      }
+      set src(value: string) {
+        this.#src = value;
+        this.isAfter = value.includes("variant=after");
+        queueMicrotask(() => this.onload?.());
+      }
+    }
+
+    const originalImage = (globalThis as { Image?: unknown }).Image;
+    (globalThis as { Image?: unknown }).Image = LargeImage;
+
+    const originalGetContext = HTMLCanvasElement.prototype.getContext;
+    let boundedPut: { width: number; height: number; data: Uint8ClampedArray } | null = null;
+
+    // Tile-aware canvas mock: drawImage carries the (sx, sy, sw, sh) source
+    // rect, and getImageData returns the pixels for that native tile. Every
+    // pixel is black except (CHANGE_X, CHANGE_Y) on the "after" image, which
+    // becomes solid red — a single-pixel regression on a 2.88 MP screenshot.
+    HTMLCanvasElement.prototype.getContext = function (kind: string) {
+      if (kind !== "2d") return null;
+      let currentImage: LargeImage | null = null;
+      let currentSource: { sx: number; sy: number; sw: number; sh: number } | null = null;
+      let canvas = this as HTMLCanvasElement;
+      return {
+        get canvas() { return canvas; },
+        set imageSmoothingEnabled(_v: boolean) {},
+        drawImage(image: object, ...rest: number[]) {
+          currentImage = image as LargeImage;
+          if (rest.length >= 8) {
+            currentSource = { sx: rest[0], sy: rest[1], sw: rest[2], sh: rest[3] };
+          } else {
+            currentSource = { sx: 0, sy: 0, sw: currentImage.naturalWidth, sh: currentImage.naturalHeight };
+          }
+        },
+        getImageData(_x: number, _y: number, width: number, height: number) {
+          const data = new Uint8ClampedArray(width * height * 4);
+          // Solid black by default. Alpha=255 across.
+          for (let i = 3; i < data.length; i += 4) data[i] = 255;
+          if (currentImage?.isAfter && currentSource) {
+            const relX = CHANGE_X - currentSource.sx;
+            const relY = CHANGE_Y - currentSource.sy;
+            if (relX >= 0 && relX < width && relY >= 0 && relY < height) {
+              const idx = (relY * width + relX) * 4;
+              data[idx] = 255;      // red
+              data[idx + 1] = 0;
+              data[idx + 2] = 0;
+              data[idx + 3] = 255;
+            }
+          }
+          return { data, width, height, colorSpace: "srgb" as const };
+        },
+        createImageData(width: number, height: number) {
+          return { data: new Uint8ClampedArray(width * height * 4), width, height, colorSpace: "srgb" as const };
+        },
+        putImageData(imageData: { data: Uint8ClampedArray; width: number; height: number }) {
+          // The bounded overlay canvas has 2-D size < native; record the one
+          // whose dims match the overlay canvas (not the per-tile scratch).
+          if (imageData.width === canvas.width && imageData.height === canvas.height && canvas.width < NATIVE_W) {
+            boundedPut = { width: imageData.width, height: imageData.height, data: new Uint8ClampedArray(imageData.data) };
+          }
+        },
+        clearRect() {},
+      } as unknown as CanvasRenderingContext2D;
+    } as unknown as HTMLCanvasElement["getContext"];
+
+    try {
+      const event: SessionEvent = {
+        id: 1,
+        kind: "artifact",
+        ts: null,
+        text: "",
+        disposition: "rendered",
+        artifact_id: "big",
+        title: "Oversized pair",
+        artifact: {
+          kind: "visual-diff",
+          before: { mime: "image/png", width: NATIVE_W, height: NATIVE_H },
+          after: { mime: "image/png", width: NATIVE_W, height: NATIVE_H },
+        },
+      };
+      render(<VisualDiffRenderer artifact={event.artifact!} event={event} ticket="WIKI-193" />);
+      await screen.findByAltText("Oversized pair");
+      const toggle = screen.getByRole("button", { name: /pixel diff/i });
+      fireEvent.click(toggle);
+
+      // The overlay is composited from many tiles; wait for putImageData to land.
+      await waitFor(() => expect(boundedPut).not.toBeNull());
+
+      // Percentage renders as <0.1% (one native pixel out of 2.88M).
+      await waitFor(() => expect(toggle.textContent ?? "").toMatch(/<0\.1%|0\.0%/));
+
+      // The bounded overlay must contain exactly one painted pixel at the
+      // projected location. Any other count means either the localized
+      // change was averaged away (previous bug) or spuriously duplicated.
+      let painted = 0;
+      for (let i = 3; i < boundedPut!.data.length; i += 4) {
+        if (boundedPut!.data[i] > 0) painted += 1;
+      }
+      expect(painted).toBe(1);
+    } finally {
+      HTMLCanvasElement.prototype.getContext = originalGetContext;
+      (globalThis as { Image?: unknown }).Image = originalImage;
+    }
+  });
+});
+
 describe("visual-diff renderer id uniqueness", () => {
   test("mounting two renderers for the same artifact produces distinct slider ids and local htmlFor bindings", async () => {
     const event: SessionEvent = {

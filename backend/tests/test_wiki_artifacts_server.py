@@ -282,6 +282,92 @@ class WikiArtifactsTests(unittest.TestCase):
                 }
             )
 
+    def test_visual_diff_rejects_animated_apng(self) -> None:
+        def _apng_bytes(frames: int = 2) -> bytes:
+            buffer = io.BytesIO()
+            first = Image.new("RGB", (4, 4), color=(255, 0, 0))
+            rest = [Image.new("RGB", (4, 4), color=(0, i * 40 % 255, 0)) for i in range(1, frames)]
+            first.save(
+                buffer,
+                format="PNG",
+                save_all=True,
+                append_images=rest,
+                default_image=False,
+                duration=100,
+                loop=0,
+            )
+            return buffer.getvalue()
+
+        apng = _apng_bytes(3)
+        # Sanity-check the fixture actually became multi-frame.
+        with Image.open(io.BytesIO(apng)) as probe:
+            self.assertGreater(getattr(probe, "n_frames", 1), 1)
+
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError, "multi-frame"
+        ):
+            wiki_artifacts.render_artifact(
+                {
+                    "kind": "visual-diff",
+                    "payload": {
+                        "before": {
+                            "data_base64": base64.b64encode(apng).decode(),
+                            "mime": "image/png",
+                        },
+                        "after": {
+                            "data_base64": base64.b64encode(FIXTURE_PNG_BYTES).decode(),
+                            "mime": "image/png",
+                        },
+                    },
+                }
+            )
+
+    def test_visual_diff_rejects_animated_webp(self) -> None:
+        buffer = io.BytesIO()
+        first = Image.new("RGB", (4, 4), color=(0, 0, 255))
+        rest = [Image.new("RGB", (4, 4), color=(0, 255, 0)) for _ in range(2)]
+        try:
+            first.save(
+                buffer,
+                format="WEBP",
+                save_all=True,
+                append_images=rest,
+                duration=100,
+                loop=0,
+                lossless=True,
+            )
+        except (OSError, ValueError) as exc:
+            self.skipTest(f"Pillow WEBP encoder without animation support: {exc}")
+        animated = buffer.getvalue()
+        try:
+            with Image.open(io.BytesIO(animated)) as probe:
+                if getattr(probe, "n_frames", 1) <= 1:
+                    self.skipTest("Pillow WEBP encoder produced single-frame output")
+        except Exception as exc:  # noqa: BLE001
+            self.skipTest(f"could not probe encoded animated WEBP: {exc}")
+
+        upright_webp = io.BytesIO()
+        Image.new("RGB", (4, 4), color=(0, 0, 0)).save(upright_webp, format="WEBP", lossless=True)
+
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError, "multi-frame"
+        ):
+            wiki_artifacts.render_artifact(
+                {
+                    "kind": "visual-diff",
+                    "payload": {
+                        "before": {
+                            "data_base64": base64.b64encode(animated).decode(),
+                            "mime": "image/webp",
+                        },
+                        "after": {
+                            "data_base64": base64.b64encode(upright_webp.getvalue()).decode(),
+                            "mime": "image/webp",
+                        },
+                    },
+                }
+            )
+
     def test_visual_diff_rejects_valid_header_corrupt_crc_per_side(self) -> None:
         # PNG structure: 8-byte signature, then chunks each shaped
         # length(4) + type(4) + data(length) + crc(4). The IHDR chunk sits at

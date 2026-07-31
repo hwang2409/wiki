@@ -7,6 +7,7 @@ import {
   boundedDiffDimensions,
   computePixelDiff,
   formatDiffPercent,
+  NATIVE_DIFF_TILE,
   visualDiffAspect,
   visualDiffSources,
 } from "./visual-diff";
@@ -73,38 +74,82 @@ function drawPixelDiffOverlay(
   before: LoadedImage,
   after: LoadedImage,
 ): OverlayResult | null {
-  const naturalWidth = Math.min(before.width, after.width);
-  const naturalHeight = Math.min(before.height, after.height);
-  if (naturalWidth === 0 || naturalHeight === 0) return null;
-  // Cap the working buffers so a 40 MP pair does not allocate ~500 MB and
-  // freeze the main thread. The overlay canvas is stretched by CSS
-  // (object-fit: contain over the stage) so downscaling stays imperceptible.
-  const bounds = boundedDiffDimensions(naturalWidth, naturalHeight);
-  const width = bounds.width;
-  const height = bounds.height;
-  if (width === 0 || height === 0) return null;
+  const nativeWidth = Math.min(before.width, after.width);
+  const nativeHeight = Math.min(before.height, after.height);
+  if (nativeWidth === 0 || nativeHeight === 0) return null;
+  // Two-tier design (WIKI-193 review round 5): compare in native-resolution
+  // tiles so a localized one-pixel regression on a 40 MP screenshot is not
+  // averaged away by a bilinear downsample. The visible overlay stays at a
+  // bounded resolution (so a 40 MP canvas does not allocate ~500 MB), and
+  // every changed native pixel is projected onto its corresponding bounded
+  // pixel so the highlight remains visible even for pinpoint differences.
+  const bounds = boundedDiffDimensions(nativeWidth, nativeHeight);
+  if (bounds.width === 0 || bounds.height === 0) return null;
   const context = overlayCanvas.getContext("2d", { willReadFrequently: true });
   if (!context) return null;
-  overlayCanvas.width = width;
-  overlayCanvas.height = height;
+  overlayCanvas.width = bounds.width;
+  overlayCanvas.height = bounds.height;
   const scratch = document.createElement("canvas");
-  scratch.width = width;
-  scratch.height = height;
   const scratchContext = scratch.getContext("2d", { willReadFrequently: true });
   if (!scratchContext) return null;
-  scratchContext.drawImage(before.element, 0, 0, width, height);
-  const beforeData = scratchContext.getImageData(0, 0, width, height);
-  scratchContext.clearRect(0, 0, width, height);
-  scratchContext.drawImage(after.element, 0, 0, width, height);
-  const afterData = scratchContext.getImageData(0, 0, width, height);
-  const diff = computePixelDiff(beforeData.data, afterData.data, width, height);
-  context.clearRect(0, 0, width, height);
-  const overlayData = context.createImageData(width, height);
-  overlayData.data.set(diff.overlay);
+  const boundedOverlay = new Uint8ClampedArray(bounds.width * bounds.height * 4);
+  const scaleX = bounds.width / nativeWidth;
+  const scaleY = bounds.height / nativeHeight;
+  let changedTotal = 0;
+
+  for (let tileY = 0; tileY < nativeHeight; tileY += NATIVE_DIFF_TILE) {
+    for (let tileX = 0; tileX < nativeWidth; tileX += NATIVE_DIFF_TILE) {
+      const tileW = Math.min(NATIVE_DIFF_TILE, nativeWidth - tileX);
+      const tileH = Math.min(NATIVE_DIFF_TILE, nativeHeight - tileY);
+      scratch.width = tileW;
+      scratch.height = tileH;
+      scratchContext.imageSmoothingEnabled = false;
+      scratchContext.drawImage(
+        before.element,
+        tileX, tileY, tileW, tileH,
+        0, 0, tileW, tileH,
+      );
+      const beforeData = scratchContext.getImageData(0, 0, tileW, tileH);
+      scratchContext.clearRect(0, 0, tileW, tileH);
+      scratchContext.drawImage(
+        after.element,
+        tileX, tileY, tileW, tileH,
+        0, 0, tileW, tileH,
+      );
+      const afterData = scratchContext.getImageData(0, 0, tileW, tileH);
+      const diff = computePixelDiff(beforeData.data, afterData.data, tileW, tileH);
+      changedTotal += diff.changedPixels;
+
+      // Project every changed native pixel onto its bounded overlay pixel.
+      // The tile overlay already carries the highlight color + alpha, so we
+      // simply mark the projected pixel — a native single-pixel change lands
+      // as a single bounded pixel of highlight, visible even at 40x scale.
+      for (let i = 0; i < diff.overlay.length; i += 4) {
+        const alpha = diff.overlay[i + 3];
+        if (alpha === 0) continue;
+        const pixelIndex = i >> 2;
+        const localX = pixelIndex % tileW;
+        const localY = (pixelIndex - localX) / tileW;
+        const nativeX = tileX + localX;
+        const nativeY = tileY + localY;
+        const boundedX = Math.min(bounds.width - 1, Math.floor(nativeX * scaleX));
+        const boundedY = Math.min(bounds.height - 1, Math.floor(nativeY * scaleY));
+        const boundedIndex = (boundedY * bounds.width + boundedX) * 4;
+        boundedOverlay[boundedIndex] = diff.overlay[i];
+        boundedOverlay[boundedIndex + 1] = diff.overlay[i + 1];
+        boundedOverlay[boundedIndex + 2] = diff.overlay[i + 2];
+        boundedOverlay[boundedIndex + 3] = alpha;
+      }
+    }
+  }
+
+  context.clearRect(0, 0, bounds.width, bounds.height);
+  const overlayData = context.createImageData(bounds.width, bounds.height);
+  overlayData.data.set(boundedOverlay);
   context.putImageData(overlayData, 0, 0);
   return {
-    changedPixels: diff.changedPixels,
-    totalPixels: diff.totalPixels,
+    changedPixels: changedTotal,
+    totalPixels: nativeWidth * nativeHeight,
     scaled: bounds.scaled,
   };
 }

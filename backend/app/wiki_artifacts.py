@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import io
 import json
 import os
 import re
@@ -9,6 +10,8 @@ import stat
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+from PIL import Image, UnidentifiedImageError
 from typing import Any, Mapping
 from uuid import UUID, uuid4
 
@@ -457,11 +460,34 @@ def _decode_image_payload(payload: dict[str, Any], field: str) -> tuple[bytes, s
     return data, mime
 
 
+def _reject_multi_frame(data: bytes, variant: str) -> None:
+    """Reject APNG / animated WebP payloads for visual-diff.
+
+    An animated payload survives scrub_image (metadata strippers preserve
+    APNG fcTL/fdAT and WebP ANIM/ANMF chunks), and the two <img> tags each
+    animate on their own clock, so equal source frames would still report
+    phase-difference "changes" during compare. Fail loud at ingest.
+    """
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            if getattr(image, "n_frames", 1) > 1:
+                raise ArtifactValidationError(
+                    f"payload.{variant} rejected: multi-frame images are not"
+                    f" supported for visual-diff"
+                )
+    except ArtifactValidationError:
+        raise
+    except (UnidentifiedImageError, OSError, ValueError):
+        # Undecodable payloads get their canonical error from scrub_image next.
+        return
+
+
 def _write_visual_diff(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
     _require_keys(payload, required={"before", "after"})
     scrubbed: dict[str, Any] = {}
     for variant in VISUAL_DIFF_VARIANTS:
         data, mime = _decode_image_payload(payload[variant], variant)
+        _reject_multi_frame(data, variant)
         try:
             result = scrub_image(data, mime)
         except ImageScrubError as exc:

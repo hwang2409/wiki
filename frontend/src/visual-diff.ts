@@ -53,9 +53,16 @@ function weightedDelta(
   rB: number, gB: number, bB: number, aB: number,
 ): number {
   if (aA === 0 && aB === 0) return 0;
-  const dr = rA - rB;
-  const dg = gA - gB;
-  const db = bA - bB;
+  // Premultiply RGB by alpha — unpremultiplied color channels under low or
+  // zero alpha do not paint pixels on screen. Comparing raw RGB there
+  // reports "hidden" differences as visible regressions and paints false
+  // highlights across transparent screenshot regions. Alpha keeps its own
+  // delta term so opacity flips still register even when RGB is unchanged.
+  const factorA = aA / 255;
+  const factorB = aB / 255;
+  const dr = rA * factorA - rB * factorB;
+  const dg = gA * factorA - gB * factorB;
+  const db = bA * factorA - bB * factorB;
   const da = aA - aB;
   return (
     R_WEIGHT * dr * dr
@@ -117,8 +124,12 @@ export function computePixelDiff(
 
 // Backend allows up to 40 MP; a single naive diff at that resolution
 // allocates ~500 MB across scratch canvases and RGBA buffers and blocks
-// the main thread. Cap the working pixel budget so the overlay stays
-// interactive on even the largest allowed pair.
+// the main thread. The renderer diffs oversized pairs in native-resolution
+// tiles of at most NATIVE_DIFF_TILE per side and composites changed
+// pixels onto a bounded overlay canvas so the visible layer stays cheap
+// while the stats stay accurate. MAX_DIFF_PIXELS remains as the overlay
+// cap only — never the comparison cap.
+export const NATIVE_DIFF_TILE = 1024;
 export const MAX_DIFF_PIXELS = 2_000_000;
 
 export function boundedDiffDimensions(
