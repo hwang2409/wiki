@@ -116,6 +116,23 @@ function hasUserSelection(spec: Record<string, unknown>): boolean {
   });
 }
 
+function hasScaleBinding(value: unknown): boolean {
+  const record = asRecord(value);
+  if (!record) return false;
+  if (record.bind === "scales") return true;
+  const select = asRecord(record.select);
+  return select?.bind === "scales";
+}
+
+export function hasUserScaleBinding(spec: unknown): boolean {
+  const record = asRecord(spec);
+  if (!record) return false;
+  const params = Array.isArray(record.params) ? record.params : [];
+  if (params.some(hasScaleBinding)) return true;
+  const selection = asRecord(record.selection);
+  return selection !== null && Object.values(selection).some(hasScaleBinding);
+}
+
 // Vega-Lite v3-v4 kept selections in a top-level `selection` object. v5+
 // accepts either form, but when both a legacy `selection` and new-style
 // `params` coexist Vega-Lite compiles ONLY the legacy selections and drops

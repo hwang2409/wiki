@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
@@ -7,6 +7,8 @@ type MockView = {
   toImageURL: () => Promise<string>;
   scale: (channel: string) => { domain: () => number[] };
 };
+
+let mockLiveDomain: [number, number] = [0, 10];
 
 vi.mock("../src/artifact-renderers", () => ({
   PlotRenderer: ({
@@ -18,12 +20,14 @@ vi.mock("../src/artifact-renderers", () => ({
     onBrush?: (domains: Record<string, [number, number]>) => void;
     onView?: (view: MockView | null) => void;
   }) => {
+    const [, rerender] = useState(0);
     useEffect(() => {
+      mockLiveDomain = [0, 10];
       const view: MockView = {
         toImageURL: async () => {
           throw new Error("PNG encoder unavailable");
         },
-        scale: (channel) => ({ domain: () => channel === "y" ? [20, 40] : [0, 10] }),
+        scale: (channel) => ({ domain: () => channel === "y" ? [20, 40] : mockLiveDomain }),
       };
       const timer = window.setTimeout(() => onView?.(view), 0);
       return () => {
@@ -37,6 +41,17 @@ vi.mock("../src/artifact-renderers", () => ({
         <button type="button" data-testid="emit-brush" onClick={() => onBrush?.({ x: [2, 4] })}>
           Emit brush
         </button>
+        <button
+          type="button"
+          data-testid="mutate-user-scale"
+          onClick={() => {
+            mockLiveDomain = [2, 8];
+            rerender((value) => value + 1);
+          }}
+        >
+          Mutate user scale
+        </button>
+        <output data-testid="mock-live-domain">{JSON.stringify(mockLiveDomain)}</output>
         <output data-testid="plot-domains">{JSON.stringify(domains ?? null)}</output>
       </>
     );
@@ -75,6 +90,11 @@ const SAME_FIELD_SPEC = {
     x: { field: "value", type: "quantitative" },
     y: { field: "value", type: "quantitative" },
   },
+};
+
+const USER_SCALE_BINDING_SPEC = {
+  ...FULL_SPEC,
+  params: [{ name: "user_pan", select: { type: "interval" }, bind: "scales" }],
 };
 
 afterEach(() => {
@@ -122,5 +142,17 @@ describe("PlotArtifactDetail keyboard controls", () => {
     await waitFor(() => expect((screen.getByRole("button", { name: "Save as PNG" }) as HTMLButtonElement).disabled).toBe(false));
     expect(screen.getByRole("button", { name: "Pan up" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Pan left" })).toBeNull();
+  });
+
+  test("preserved user scale bindings keep Reset zoom available", async () => {
+    render(<PlotArtifactDetail spec={USER_SCALE_BINDING_SPEC} />);
+    await waitFor(() => expect((screen.getByRole("button", { name: "Save as PNG" }) as HTMLButtonElement).disabled).toBe(false));
+    const reset = screen.getByRole("button", { name: "Reset zoom" });
+    expect((reset as HTMLButtonElement).disabled).toBe(false);
+
+    fireEvent.click(screen.getByTestId("mutate-user-scale"));
+    await waitFor(() => expect(screen.getByTestId("mock-live-domain").textContent).toBe("[2,8]"));
+    fireEvent.click(reset);
+    await waitFor(() => expect(screen.getByTestId("mock-live-domain").textContent).toBe("[0,10]"));
   });
 });

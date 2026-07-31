@@ -1,6 +1,6 @@
 import { useCallback, useMemo, useRef, useState } from "react";
 import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Download, Minus, Plus, RotateCcw } from "lucide-react";
-import { plotInteractivity, plotPngFilename, zoomParamName, type PlotDomains, type ZoomChannel } from "../plot-interaction";
+import { hasUserScaleBinding, plotInteractivity, plotPngFilename, zoomParamName, type PlotDomains, type ZoomChannel } from "../plot-interaction";
 import { PlotRenderer, type PlotView } from "../artifact-renderers";
 
 const HINT_BY_MODE: Record<string, string> = {
@@ -95,6 +95,7 @@ export function PlotArtifactDetail({ spec, title }: { spec: Record<string, unkno
   const viewRef = useRef<PlotView | null>(null);
   const interactivity = useMemo(() => plotInteractivity(spec), [spec]);
   const canInteract = interactivity.mode === "full";
+  const canReset = canInteract || hasUserScaleBinding(spec);
 
   const onView = useCallback((view: PlotView | null) => {
     viewRef.current = view;
@@ -112,10 +113,8 @@ export function PlotArtifactDetail({ spec, title }: { spec: Record<string, unkno
     }
     setDomains(merged);
   }, [domains, interactivity]);
-  // Reset is always enabled in full mode: pan / wheel-zoom mutate Vega's
-  // internal scales without touching React state, so `domains === null` is not
-  // proof that the plot is at its default view. Bumping renderKey forces a
-  // re-embed which resets Vega too.
+  // Pan / wheel-zoom mutate Vega's internal scales without touching React
+  // state. Re-embedding also resets preserved user scale bindings.
   const onReset = useCallback(() => {
     setDomains(null);
     setRenderKey((key) => key + 1);
@@ -154,7 +153,7 @@ export function PlotArtifactDetail({ spec, title }: { spec: Record<string, unkno
         <button
           type="button"
           onClick={onReset}
-          disabled={!canInteract}
+          disabled={!canReset}
           aria-label="Reset zoom"
           data-panel-reset-zoom
         >
@@ -199,7 +198,7 @@ export function PlotArtifactDetail({ spec, title }: { spec: Record<string, unkno
       <div
         className="artifact-plot-detail-canvas"
         data-interactive={canInteract ? "true" : undefined}
-        onDoubleClick={canInteract ? onReset : undefined}
+        onDoubleClick={canReset ? onReset : undefined}
       >
         <PlotRenderer
           key={renderKey}
