@@ -319,6 +319,21 @@ class EffectStore:
         assert row is not None
         return self._decode(row)
 
+    def steer_for_pending(
+        self, run_id: str, pending_id: str
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM steer_effects
+                WHERE run_id = ? AND pending_id = ?
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (run_id, pending_id),
+            ).fetchone()
+        return self._decode(row) if row is not None else None
+
     def update_steer(
         self,
         method: str,
@@ -333,7 +348,10 @@ class EffectStore:
                 """
                 UPDATE steer_effects
                 SET status = CASE
-                        WHEN status = 'acknowledged' AND ? <> 'acknowledged'
+                        WHEN status IN ('sent', 'acknowledged')
+                            AND ? <> 'acknowledged'
+                        THEN status
+                        WHEN status = 'sending' AND ? = 'queued'
                         THEN status
                         ELSE ?
                     END,
@@ -341,6 +359,7 @@ class EffectStore:
                 WHERE method = ? AND request_id = ?
                 """,
                 (
+                    status,
                     status,
                     status,
                     self._encode(result) if result is not None else None,
@@ -370,6 +389,19 @@ class EffectStore:
                 """
                 UPDATE steer_effects
                 SET status = 'sent', updated_at = ?
+                WHERE run_id = ? AND pending_id = ?
+                    AND status IN ('queued', 'sending')
+                """,
+                (_now(), run_id, pending_id),
+            )
+            connection.commit()
+
+    def mark_steer_sending(self, run_id: str, pending_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE steer_effects
+                SET status = 'sending', updated_at = ?
                 WHERE run_id = ? AND pending_id = ? AND status = 'queued'
                 """,
                 (_now(), run_id, pending_id),

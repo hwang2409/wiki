@@ -19,7 +19,7 @@ from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from .. import accounts, provider_health
-from .command_log import AgentCommand, CommandConflict, CommandQueue
+from .command_log import AgentCommand, CommandConflict, CommandQueue, CommandRetryable
 from .normalizer import NormalizedProviderEvent, normalize_provider_event
 from .process import (
     ProviderProcessStatus,
@@ -426,6 +426,7 @@ class Supervisor:
             self.store.command_state,
             self.store.command_state_for,
             recovery_factory=self._recovery_executor,
+            failure_state_provider=self.store.authoritative_command_state_for,
         )
         self.worker_soft_cap = (
             worker_soft_cap
@@ -1403,6 +1404,26 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             pending_id = queued.get("pending_id")
             queued_source = queued.get("source")
             if pending_id is not None:
+                effect = self.store.command_log.steer_effect_for_pending(
+                    run_id, pending_id
+                )
+                if effect is not None and effect["status"] in {"sent", "acknowledged"}:
+                    self.store.remove_queued_message_by_pending_id(run_id, pending_id)
+                    return
+                if effect is not None and effect["status"] == "sending":
+                    if self.store.steer_delivery_observed(run_id, pending_id):
+                        result = {"status": "sent", "pending_id": pending_id}
+                        self.store.command_log.update_steer_effect(
+                            str(effect["method"]),
+                            str(effect["request_id"]),
+                            "acknowledged",
+                            result,
+                        )
+                        self.store.remove_queued_message_by_pending_id(
+                            run_id, pending_id
+                        )
+                    return
+            if pending_id is not None:
                 self.store.track_pending_user_message(
                     run_id,
                     pending_id,
@@ -1410,6 +1431,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     source=queued_source if isinstance(queued_source, str) else None,
                 )
             try:
+                if pending_id is not None:
+                    self.store.command_log.mark_steer_sending_for_pending(
+                        run_id, pending_id
+                    )
                 status = await adapter.send_on_idle(queued["text"])
             except Exception as exc:
                 if pending_id is not None:
@@ -2998,6 +3023,27 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 return current
         raise RunNotFound("no current run")
 
+    async def _require_replacement_control(self, run_id: str) -> RunRecord:
+        """Require live replacement state and attached provider control."""
+
+        try:
+            record = self.store.get(run_id)
+        except RunNotFound:
+            raise
+        adapter = self.adapters.get(run_id)
+        if adapter is None or record.state is LifecycleState.BLOCKED:
+            raise CommandRetryable("replacement provider control is not attached")
+        try:
+            status = await adapter.status()
+        except Exception as exc:
+            raise CommandRetryable("replacement provider control is unavailable") from exc
+        if status.state is LifecycleState.BLOCKED:
+            raise CommandRetryable("replacement provider is blocked")
+        record = self.store.update_adapter_status(run_id, status)
+        if record.state is LifecycleState.BLOCKED:
+            raise CommandRetryable("replacement provider state is blocked")
+        return record
+
     async def send_now(
         self,
         run_id: str,
@@ -3007,6 +3053,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         source: str | None = None,
         effect_id: str | None = None,
         command_hash: str | None = None,
+        retryable_if_detached: bool = False,
     ) -> dict[str, Any]:
         async with self._run_mutation_admission():
             async with self._run_lock(run_id):
@@ -3018,6 +3065,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     source,
                     effect_id,
                     command_hash,
+                    retryable_if_detached,
                 )
 
     async def _send_now(
@@ -3029,9 +3077,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         source: str | None = None,
         effect_id: str | None = None,
         command_hash: str | None = None,
+        retryable_if_detached: bool = False,
     ) -> dict[str, Any]:
         adapter = self.adapters.get(run_id)
         if adapter is None:
+            if retryable_if_detached:
+                raise CommandRetryable("provider control is not attached")
             raise StoreConflict("run has no attached provider adapter")
         expose_pending_id = pending_id is not None or source is not None
         status = await adapter.status()
@@ -3151,6 +3202,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         source: str | None = None,
         effect_id: str | None = None,
         command_hash: str | None = None,
+        retryable_if_detached: bool = False,
     ) -> dict[str, Any]:
         async with self._run_mutation_admission():
             async with self._run_lock(run_id):
@@ -3162,6 +3214,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     source,
                     effect_id,
                     command_hash,
+                    retryable_if_detached,
                 )
 
     async def _send_on_idle(
@@ -3173,9 +3226,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         source: str | None = None,
         effect_id: str | None = None,
         command_hash: str | None = None,
+        retryable_if_detached: bool = False,
     ) -> dict[str, Any]:
         adapter = self.adapters.get(run_id)
         if adapter is None:
+            if retryable_if_detached:
+                raise CommandRetryable("provider control is not attached")
             raise StoreConflict("run has no attached provider adapter")
         if effect_id is not None and pending_id is None:
             pending_id = str(uuid4())
@@ -3198,6 +3254,15 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 if isinstance(result, dict):
                     return result
                 return {"status": "sent", "pending_id": pending_id}
+            if steer_effect["status"] == "sending":
+                if self.store.steer_delivery_observed(run_id, pending_id):
+                    result = {"status": "sent", "pending_id": pending_id}
+                    self.store.command_log.update_steer_effect(
+                        "run/send_on_idle", effect_id, "acknowledged", result
+                    )
+                    self.store.remove_queued_message_by_pending_id(run_id, pending_id)
+                    return result
+                return {"status": "uncertain", "pending_id": pending_id}
         if dedupe_key is not None:
             record, claimed = self.store.claim_message_dedupe_key(run_id, dedupe_key)
             if not claimed:
@@ -3870,6 +3935,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         command_params = dict(command.payload)
         command_params["agent_id"] = command.agent_id
         command_params["request_id"] = command.request_id
+        command_params["_recovery_replay"] = True
 
         async def execute() -> Any:
             return await self._dispatch(
@@ -4161,6 +4227,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 _validated_source(params.get("source")),
                 effect_id=params.get("request_id"),
                 command_hash=command_hash,
+                retryable_if_detached=bool(params.get("_recovery_replay")),
             )
         if method == "run/send_on_idle":
             return await self.send_on_idle(
@@ -4171,6 +4238,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 _validated_source(params.get("source")),
                 effect_id=params.get("request_id"),
                 command_hash=command_hash,
+                retryable_if_detached=bool(params.get("_recovery_replay")),
             )
         if method == "run/queue":
             run_id = self._resolve_run_id(params)
@@ -4242,6 +4310,18 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 if effect is not None and effect["status"] == "completed":
                     saved = effect.get("result")
                     if isinstance(saved, dict):
+                        replacement_id = effect.get("replacement_run_id")
+                        if not isinstance(replacement_id, str):
+                            raise CommandRetryable(
+                                "completed replacement has no durable target"
+                            )
+                        try:
+                            await self._require_replacement_control(replacement_id)
+                        except RunNotFound as exc:
+                            if self.store.find_archived_run(replacement_id) is None:
+                                raise CommandRetryable(
+                                    "replacement run is not available"
+                                ) from exc
                         return saved
                 current_id = self.store.current_run_id(str(params["agent_id"]))
                 if current_id == replacement_run_id:
@@ -4251,7 +4331,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         and effect is not None
                         and effect["status"] == "completed"
                     ):
-                        return _public_run(current)
+                        await self._require_replacement_control(replacement_run_id)
+                        saved = effect.get("result")
+                        return saved if isinstance(saved, dict) else _public_run(current)
                     if (
                         current.replaces_run_id == params.get("run_id")
                         and effect is not None
@@ -4289,6 +4371,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                                     detail=saved.get("detail"),
                                 ),
                             )
+                        await self._require_replacement_control(replacement_run_id)
                         result = _public_run(self.store.get(replacement_run_id))
                         self.store.command_log.update_replace_effect(
                             method,

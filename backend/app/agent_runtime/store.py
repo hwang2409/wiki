@@ -818,6 +818,13 @@ class RunStore:
             self.command_log.seed_projection(agent_id, seeded)
             return seeded
 
+    def authoritative_command_state_for(self, agent_id: str) -> dict[str, Any]:
+        """Read one agent from the registry without using the command projection."""
+
+        with self._lock:
+            entry = self._read_registry().get(agent_id)
+            return {agent_id: deepcopy(entry)} if entry is not None else {agent_id: None}
+
     def find_start_request(self, request_id: str) -> RunRecord | None:
         """Find a durable successful start after cache eviction or restart."""
 

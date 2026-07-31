@@ -26,6 +26,7 @@ from backend.app.agent_runtime.client import (
     SupervisorRemoteError,
     SupervisorUnavailable,
 )
+from backend.app.agent_runtime.command_log import AgentCommand, CommandRetryable
 from backend.app.agent_runtime import daemon as agent_daemon
 from backend.app.agent_runtime import supervisor as supervisor_module
 from backend.app.agent_runtime.claude import ClaudeStreamAdapter
@@ -53,6 +54,7 @@ from backend.app.agent_runtime.provider import (
 from backend.app.agent_runtime.store import RunNotFound, RunStore, RuntimePaths, StoreConflict
 from backend.app.agent_runtime.supervisor import Supervisor, resolve_safe_worktree
 from backend.app.agent_runtime.types import (
+    EventDisposition,
     MAX_MESSAGE_DEDUPE_KEYS,
     LifecycleState,
     ProviderKind,
@@ -1066,6 +1068,84 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             pending_id,
         )
 
+    async def test_on_idle_crash_after_provider_acceptance_does_not_resend(self) -> None:
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-ON-IDLE-CRASH",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="on-idle crash boundary",
+        )
+        adapter = self.supervisor.adapters[record.run_id]
+        pending_id = str(uuid4())
+
+        with mock.patch.object(
+            adapter,
+            "send_on_idle",
+            wraps=adapter.send_on_idle,
+        ) as provider_send:
+            with mock.patch.object(
+                self.store.command_log,
+                "mark_steer_sent_for_pending",
+                side_effect=asyncio.CancelledError,
+            ):
+                with self.assertRaises(asyncio.CancelledError):
+                    await self.supervisor.send_on_idle(
+                        record.run_id,
+                        "deliver once",
+                        pending_id=pending_id,
+                        effect_id="on-idle-crash",
+                    )
+
+            self.assertEqual(provider_send.await_count, 1)
+            effect = self.store.command_log.steer_effect_for_pending(
+                record.run_id, pending_id
+            )
+            self.assertIsNotNone(effect)
+            self.assertEqual(effect["status"] if effect else None, "sending")
+
+            # A restart has the queued message and the durable sending marker,
+            # but no provider echo yet. Recovery must wait instead of sending.
+            await self.supervisor._deliver_next_queued_locked(  # noqa: SLF001
+                record.run_id,
+                adapter,
+            )
+            self.assertEqual(provider_send.await_count, 1)
+
+            pending = self.store.get(record.run_id).pending_user_messages[0]
+            raw = self.store.append_raw(
+                record.run_id,
+                provider="codex",
+                direction="server",
+                payload={"method": "item/completed"},
+            )
+            self.store.append_normalized(
+                record.run_id,
+                raw_seq=int(raw["seq"]),
+                disposition=EventDisposition.RENDERED,
+                kind="user_message",
+                payload={
+                    "pending_id": pending_id,
+                    "composer_text": pending["text"],
+                    "composer_sent_at": pending["sent_at"],
+                },
+            )
+            await self.supervisor._deliver_next_queued_locked(  # noqa: SLF001
+                record.run_id,
+                adapter,
+            )
+
+        self.assertEqual(provider_send.await_count, 1)
+        self.assertEqual(self.store.get(record.run_id).queued_messages, [])
+        self.assertEqual(
+            self.store.command_log.steer_effect_for_pending(
+                record.run_id, pending_id
+            )["status"],
+            "acknowledged",
+        )
+
     async def test_delivered_pending_id_survives_replace_until_late_echo(self) -> None:
         record = await self.supervisor.start_run(
             agent_id="WIKI-96-REPLACE",
@@ -1676,6 +1756,69 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         recovery = await self.supervisor.recover_on_start()
         old_result = next(item for item in recovery if item["run_id"] == old.run_id)
         self.assertEqual(old_result["action"], "skip")
+
+    async def test_replace_replay_waits_for_replacement_provider_control(self) -> None:
+        old = await self.supervisor.start_run(
+            agent_id="WIKI-REPLACE-OWNERSHIP",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="original ownership prompt",
+        )
+        replacement_id = str(uuid4())
+        payload = {
+            "run_id": old.run_id,
+            "replacement_run_id": replacement_id,
+            "prompt": "replacement ownership prompt",
+        }
+        command = AgentCommand.replace(
+            agent_id=old.agent_id,
+            request_id="replace-ownership",
+            payload=payload,
+        )
+        replacement = await self.supervisor.replace(
+            old.run_id,
+            payload["prompt"],
+            replacement_run_id=replacement_id,
+            effect_id=command.request_id,
+            command_hash=command.command_hash,
+        )
+        adapter = self.supervisor.adapters[replacement.run_id]
+        await self.supervisor._detach_adapter(replacement.run_id)  # noqa: SLF001
+
+        with self.assertRaises(CommandRetryable):
+            await self.supervisor._dispatch(  # noqa: SLF001
+                "run/replace",
+                {
+                    **payload,
+                    "agent_id": old.agent_id,
+                    "request_id": command.request_id,
+                },
+                command_hash=command.command_hash,
+            )
+
+        self.supervisor._attach_adapter(replacement.run_id, adapter)  # noqa: SLF001
+        replayed = await self.supervisor._dispatch(  # noqa: SLF001
+            "run/replace",
+            {
+                **payload,
+                "agent_id": old.agent_id,
+                "request_id": command.request_id,
+            },
+            command_hash=command.command_hash,
+        )
+        self.assertEqual(replayed["run_id"], replacement.run_id)
+        self.assertEqual(
+            self.store.command_log.replace_effect(
+                "run/replace",
+                command.request_id,
+                agent_id=old.agent_id,
+                command_hash=command.command_hash,
+            )["status"],
+            "completed",
+        )
 
     async def test_replace_cancellation_during_quiesce_terminalizes_old_run(self) -> None:
         old = await self.supervisor.start_run(

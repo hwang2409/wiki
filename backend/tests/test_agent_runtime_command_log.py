@@ -11,10 +11,19 @@ from backend.app.agent_runtime.command_log import (
     CommandConflict,
     CommandLog,
     CommandQueue,
+    CommandRetryable,
     decide,
 )
 from backend.app.agent_runtime.store import RunStore, RuntimePaths
 from backend.app.agent_runtime.types import ProviderKind, RunRecord
+
+
+async def _raise_runtime_error(message: str) -> None:
+    raise RuntimeError(message)
+
+
+async def _return_result(result: dict[str, str]) -> dict[str, str]:
+    return result
 
 
 class CommandLogTests(unittest.TestCase):
@@ -310,6 +319,154 @@ class CommandLogTests(unittest.TestCase):
         self.assertEqual(completed, ["spawn-healthy"])
         self.assertEqual(failures, [("spawn-failed", "provider failed during recovery")])
 
+    def test_failed_start_restores_authoritative_projection_for_corrected_command(
+        self,
+    ) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                log = CommandLog(Path(tmp) / "command-log.sqlite3")
+                queue = CommandQueue(
+                    log,
+                    lambda: log.projection(),
+                    agent_state_provider=log.projection_for,
+                    failure_state_provider=lambda agent_id: {agent_id: None},
+                )
+                failed = AgentCommand.spawn(
+                    agent_id="WIKI-A",
+                    request_id="start-failed",
+                    payload={"run_id": "run-failed"},
+                )
+                with self.assertRaisesRegex(RuntimeError, "before commit"):
+                    await queue.submit(
+                        failed,
+                        lambda: _raise_runtime_error("provider failed before commit"),
+                    )
+                self.assertEqual(log.projection_for("WIKI-A"), {})
+
+                corrected = AgentCommand.spawn(
+                    agent_id="WIKI-A",
+                    request_id="start-corrected",
+                    payload={"run_id": "run-corrected"},
+                )
+                result = await queue.submit(
+                    corrected,
+                    lambda: _return_result({"run_id": "run-corrected"}),
+                )
+                self.assertEqual(result, {"run_id": "run-corrected"})
+                self.assertEqual(
+                    log.projection_for("WIKI-A")["WIKI-A"]["current"]["run_id"],
+                    "run-corrected",
+                )
+                await queue.close()
+
+        asyncio.run(run())
+
+    def test_failed_replace_restores_authoritative_projection_for_corrected_command(
+        self,
+    ) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                log = CommandLog(Path(tmp) / "command-log.sqlite3")
+                old = {
+                    "WIKI-A": {
+                        "current": {"run_id": "run-old", "state": "working"}
+                    }
+                }
+                log.seed_projection("WIKI-A", old)
+                queue = CommandQueue(
+                    log,
+                    lambda: log.projection(),
+                    agent_state_provider=log.projection_for,
+                    failure_state_provider=lambda _agent_id: old,
+                )
+                failed = AgentCommand.replace(
+                    agent_id="WIKI-A",
+                    request_id="replace-failed",
+                    payload={
+                        "run_id": "run-old",
+                        "replacement_run_id": "run-failed",
+                    },
+                )
+                with self.assertRaisesRegex(RuntimeError, "before commit"):
+                    await queue.submit(
+                        failed,
+                        lambda: _raise_runtime_error("provider failed before commit"),
+                    )
+                self.assertEqual(log.projection_for("WIKI-A"), old)
+
+                corrected = AgentCommand.replace(
+                    agent_id="WIKI-A",
+                    request_id="replace-corrected",
+                    payload={
+                        "run_id": "run-old",
+                        "replacement_run_id": "run-corrected",
+                    },
+                )
+                result = await queue.submit(
+                    corrected,
+                    lambda: _return_result({"run_id": "run-corrected"}),
+                )
+                self.assertEqual(result, {"run_id": "run-corrected"})
+                self.assertEqual(
+                    log.projection_for("WIKI-A")["WIKI-A"]["current"]["run_id"],
+                    "run-corrected",
+                )
+                await queue.close()
+
+        asyncio.run(run())
+
+    def test_retryable_recovery_retains_intent_until_provider_control_returns(
+        self,
+    ) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                log = CommandLog(Path(tmp) / "command-log.sqlite3")
+                command = AgentCommand.steer(
+                    agent_id="WIKI-A",
+                    request_id="steer-retryable",
+                    payload={
+                        "method": "run/send_now",
+                        "run_id": "run-a",
+                        "text": "deliver once",
+                    },
+                )
+                log.append_intent(
+                    command,
+                    {"WIKI-A": {"current": {"run_id": "run-a"}}},
+                )
+                available = False
+                calls = 0
+
+                def factory(_command: AgentCommand):
+                    async def effect() -> dict[str, str]:
+                        nonlocal calls
+                        calls += 1
+                        if not available:
+                            raise CommandRetryable("provider control is detached")
+                        return {"status": "sent"}
+
+                    return effect
+
+                queue = CommandQueue(
+                    log,
+                    lambda: {},
+                    recovery_factory=factory,
+                )
+                await queue.recover_pending()
+                self.assertEqual(log.pending(), [command])
+                self.assertIsNone(log.receipt(command.method, command.request_id))
+
+                available = True
+                await queue.recover_pending()
+                self.assertEqual(log.pending(), [])
+                receipt = log.receipt(command.method, command.request_id)
+                self.assertIsNotNone(receipt)
+                self.assertEqual(receipt.result if receipt else None, {"status": "sent"})
+                self.assertEqual(calls, 2)
+                await queue.close()
+
+        asyncio.run(run())
+
     def test_steer_outbox_reconciles_delivery_states(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log = CommandLog(Path(tmp) / "command-log.sqlite3")
@@ -324,6 +481,8 @@ class CommandLogTests(unittest.TestCase):
                 mode="now",
             )
             self.assertEqual(row["status"], "queued")
+            log.mark_steer_sending_for_pending("run-a", "pending-1")
+            log.mark_steer_sent_for_pending("run-a", "pending-1")
             log.update_steer_effect(
                 "run/send_now", "steer-1", "sent", {"status": "sent"}
             )

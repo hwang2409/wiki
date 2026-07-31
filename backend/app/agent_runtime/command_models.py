@@ -22,6 +22,10 @@ class CommandReceiptError(CommandError):
     """A prior command attempt recorded an error receipt."""
 
 
+class CommandRetryable(CommandError):
+    """A command needs provider control before it can run safely."""
+
+
 def _canonical_command_hash(command: "AgentCommand") -> str:
     payload = dict(command.payload)
     identity_payload = payload.get("command_hash_payload")

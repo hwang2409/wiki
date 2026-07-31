@@ -12,6 +12,7 @@ from .command_models import (
     AgentCommand,
     CommandConflict,
     CommandError,
+    CommandRetryable,
 )
 from .command_interfaces import CommandExecutor, CommandPersistence
 
@@ -36,6 +37,14 @@ class _RecoveredCommandFailure(Exception):
         self.error = error
 
 
+class _RecoveredCommandRetry(Exception):
+    """A recovered command stayed pending until provider control returns."""
+
+    def __init__(self, error: CommandRetryable):
+        super().__init__(str(error))
+        self.error = error
+
+
 class CommandQueue:
     """Run durable provider effects in one global FIFO reactor."""
 
@@ -45,11 +54,13 @@ class CommandQueue:
         state_provider: Callable[[], Mapping[str, Any]],
         agent_state_provider: AgentStateProvider | None = None,
         recovery_factory: RecoveryExecutorFactory | None = None,
+        failure_state_provider: AgentStateProvider | None = None,
     ):
         self.log = log
         self.state_provider = state_provider
         self.agent_state_provider = agent_state_provider
         self.recovery_factory = recovery_factory
+        self.failure_state_provider = failure_state_provider
         self._queue: asyncio.Queue[_QueuedCommand] = asyncio.Queue()
         self._worker: asyncio.Task[None] | None = None
         self._append_lock = asyncio.Lock()
@@ -60,7 +71,9 @@ class CommandQueue:
             tuple[str, str], tuple[AgentCommand, asyncio.Future[Any]]
         ] = {}
         self._recovery_commands: dict[asyncio.Future[Any], AgentCommand] = {}
+        self._deferred: dict[tuple[str, str], AgentCommand] = {}
         self.recovery_failures: list[tuple[AgentCommand, Exception]] = []
+        self.recovery_retries: list[tuple[AgentCommand, CommandRetryable]] = []
         self._closed = False
 
     def _start_worker(self) -> None:
@@ -116,6 +129,22 @@ class CommandQueue:
         """Replay all pending intents before startup accepts new mutations."""
 
         futures = await self._ensure_recovered()
+        if self._deferred:
+            if self.recovery_factory is None:
+                raise CommandError("deferred command intents need a recovery executor")
+            loop = asyncio.get_running_loop()
+            for key, command in list(self._deferred.items()):
+                if key in self._inflight:
+                    continue
+                future: asyncio.Future[Any] = loop.create_future()
+                self._inflight[key] = (command, future)
+                self._recovery_commands[future] = command
+                futures.append(future)
+                await self._queue.put(
+                    _QueuedCommand(command, self.recovery_factory(command), future, True)
+                )
+            if futures:
+                self._start_worker()
         if futures:
             results = await asyncio.gather(
                 *(asyncio.shield(future) for future in futures),
@@ -129,6 +158,13 @@ class CommandQueue:
                     if command is None:
                         raise CommandError("recovered command binding was lost")
                     self.recovery_failures.append((command, result.error))
+                    continue
+                if isinstance(result, _RecoveredCommandRetry):
+                    command = self._recovery_commands.get(future)
+                    if command is None:
+                        raise CommandError("recovered command binding was lost")
+                    self._deferred[(command.method, command.request_id)] = command
+                    self.recovery_retries.append((command, result.error))
                     continue
                 if isinstance(
                     result,
@@ -144,6 +180,7 @@ class CommandQueue:
             raise CommandError("command queue is closed")
         await self._ensure_recovered()
         key = (command.method, command.request_id)
+        self._deferred.pop(key, None)
         existing = self._inflight.get(key)
         if existing is not None:
             if not self._same_binding(command, existing[0]):
@@ -179,27 +216,38 @@ class CommandQueue:
         while True:
             item = await self._queue.get()
             command, execute, future = item.command, item.execute, item.future
+            retryable = False
             try:
                 try:
                     await asyncio.to_thread(self.log.begin_effect, command)
                     result = await execute()
                 except BaseException as exc:
-                    async with self._commit_lock:
-                        state = (
-                            self.agent_state_provider(command.agent_id)
-                            if self.agent_state_provider is not None
-                            else self.state_provider()
-                        )
-                        await asyncio.to_thread(self.log.fail, command, exc, state)
-                        if command.payload.get("implicit_request_id") is True:
-                            await asyncio.to_thread(
-                                self.log.forget, command.method, command.request_id
+                    if isinstance(exc, CommandRetryable):
+                        retryable = True
+                        if not future.done():
+                            if item.recovering:
+                                future.set_exception(_RecoveredCommandRetry(exc))
+                            else:
+                                future.set_exception(exc)
+                    else:
+                        async with self._commit_lock:
+                            state = (
+                                self.failure_state_provider(command.agent_id)
+                                if self.failure_state_provider is not None
+                                else self.agent_state_provider(command.agent_id)
+                                if self.agent_state_provider is not None
+                                else self.state_provider()
                             )
-                    if not future.done():
-                        if item.recovering and isinstance(exc, Exception):
-                            future.set_exception(_RecoveredCommandFailure(exc))
-                        else:
-                            future.set_exception(exc)
+                            await asyncio.to_thread(self.log.fail, command, exc, state)
+                            if command.payload.get("implicit_request_id") is True:
+                                await asyncio.to_thread(
+                                    self.log.forget, command.method, command.request_id
+                                )
+                        if not future.done():
+                            if item.recovering and isinstance(exc, Exception):
+                                future.set_exception(_RecoveredCommandFailure(exc))
+                            else:
+                                future.set_exception(exc)
                 else:
                     async with self._commit_lock:
                         state = (
@@ -219,6 +267,8 @@ class CommandQueue:
                 key = (command.method, command.request_id)
                 if self._inflight.get(key, (None, None))[1] is future:
                     self._inflight.pop(key, None)
+                if not retryable:
+                    self._deferred.pop(key, None)
                 self._queue.task_done()
 
     async def close(self) -> None:

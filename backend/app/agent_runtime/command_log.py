@@ -15,6 +15,7 @@ from .command_models import (
     AgentCommand,
     CommandConflict,
     CommandReceipt,
+    CommandRetryable,
     CommandError as _CommandError,
     CommandReceiptError as _CommandReceiptError,
 )
@@ -32,6 +33,7 @@ __all__ = [
     "CommandQueue",
     "CommandReceipt",
     "CommandReceiptError",
+    "CommandRetryable",
     "decide",
 ]
 
@@ -296,11 +298,19 @@ class CommandLog:
     ) -> None:
         self.effects.update_steer(method, request_id, status, result)
 
+    def steer_effect_for_pending(
+        self, run_id: str, pending_id: str
+    ) -> dict[str, Any] | None:
+        return self.effects.steer_for_pending(run_id, pending_id)
+
     def acknowledge_steer_for_pending(self, run_id: str, pending_id: str) -> None:
         self.effects.acknowledge_steer(run_id, pending_id)
 
     def mark_steer_sent_for_pending(self, run_id: str, pending_id: str) -> None:
         self.effects.mark_steer_sent(run_id, pending_id)
+
+    def mark_steer_sending_for_pending(self, run_id: str, pending_id: str) -> None:
+        self.effects.mark_steer_sending(run_id, pending_id)
 
     def complete_effect(
         self,
