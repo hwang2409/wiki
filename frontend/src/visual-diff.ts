@@ -35,29 +35,41 @@ export function blendOpacity(sliderPosition: number): number {
   return Math.min(1, Math.max(0, sliderPosition));
 }
 
-// Perceived-luminance-weighted RGB delta. Alpha is respected so fully
-// transparent pixels never register as "changed". Squared distance keeps the
-// math cheap and avoids sqrt in the hot loop.
-const R_WEIGHT = 0.2126;
-const G_WEIGHT = 0.7152;
-const B_WEIGHT = 0.0722;
+// Perceptual color distance. Weights are applied AFTER squaring — otherwise
+// a heavy blue-channel change (small weight) squares its own weight and
+// disappears (see WIKI-193 review: black -> rgb(0,0,166) reported no change).
+// Alpha delta is compared on a 0..255 scale so a full opacity flip always
+// registers, and fully-transparent pixels never register as "changed" since
+// their color values are not visible.
+const R_WEIGHT = 0.30;
+const G_WEIGHT = 0.59;
+const B_WEIGHT = 0.11;
+// Alpha is disproportionately visible on transparent overlays (a 4% opacity
+// shift is obvious against a checkerboard), so it gets extra weight.
+const ALPHA_WEIGHT = 2.0;
 
 function weightedDelta(
   rA: number, gA: number, bA: number, aA: number,
   rB: number, gB: number, bB: number, aB: number,
 ): number {
   if (aA === 0 && aB === 0) return 0;
-  const dr = (rA - rB) * R_WEIGHT;
-  const dg = (gA - gB) * G_WEIGHT;
-  const db = (bA - bB) * B_WEIGHT;
-  const da = (aA - aB) / 255;
-  return dr * dr + dg * dg + db * db + da * da * 255 * 255;
+  const dr = rA - rB;
+  const dg = gA - gB;
+  const db = bA - bB;
+  const da = aA - aB;
+  return (
+    R_WEIGHT * dr * dr
+    + G_WEIGHT * dg * dg
+    + B_WEIGHT * db * db
+    + ALPHA_WEIGHT * da * da
+  );
 }
 
-// Threshold roughly maps to the JND (just-noticeable difference) on typical
-// UI screenshots. Bumped high enough that JPEG artifacts don't paint the
-// canvas red, low enough that a one-pixel color change registers.
-const DIFF_THRESHOLD_SQUARED = 12 * 12;
+// Threshold is calibrated against the weighted squared-channel metric above.
+// A single channel changing by ~10 units in luminance-dominant green
+// (0.59 * 100 = 59) sits below the threshold; anything larger paints. This
+// keeps JPEG blocking artifacts quiet while catching every visible UI change.
+const DIFF_THRESHOLD_SQUARED = 100;
 
 export type PixelDiffResult = {
   width: number;
@@ -101,6 +113,30 @@ export function computePixelDiff(
     }
   }
   return { width, height, changedPixels, totalPixels, overlay };
+}
+
+// Backend allows up to 40 MP; a single naive diff at that resolution
+// allocates ~500 MB across scratch canvases and RGBA buffers and blocks
+// the main thread. Cap the working pixel budget so the overlay stays
+// interactive on even the largest allowed pair.
+export const MAX_DIFF_PIXELS = 2_000_000;
+
+export function boundedDiffDimensions(
+  width: number,
+  height: number,
+  maxPixels: number = MAX_DIFF_PIXELS,
+): { width: number; height: number; scaled: boolean } {
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    return { width: 0, height: 0, scaled: false };
+  }
+  const pixels = width * height;
+  if (pixels <= maxPixels) {
+    return { width: Math.floor(width), height: Math.floor(height), scaled: false };
+  }
+  const scale = Math.sqrt(maxPixels / pixels);
+  const w = Math.max(1, Math.floor(width * scale));
+  const h = Math.max(1, Math.floor(height * scale));
+  return { width: w, height: h, scaled: true };
 }
 
 export function formatDiffPercent(changed: number, total: number): string {

@@ -21,6 +21,8 @@ Normalized event:
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import os
 import re
@@ -30,8 +32,11 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 
+from .image_scrub import ImageScrubError, probe_dimensions
 from .wiki_artifacts import (
     ArtifactValidationError,
+    IMAGE_TYPES,
+    VISUAL_DIFF_VARIANTS,
     _validate_text_payload,
     artifact_from_codex_mcp_tool_result,
     artifact_from_text,
@@ -674,6 +679,32 @@ def _artifact_from_structured_result(meta: dict, output: str) -> dict | None:
             "ref": f"artifact://{artifact_id}",
             "mime": payload.get("mime"),
         }
+    elif kind == "visual-diff":
+        variants: dict[str, dict[str, object]] = {}
+        for variant in VISUAL_DIFF_VARIANTS:
+            side = payload.get(variant)
+            if not isinstance(side, dict):
+                return None
+            mime = side.get("mime")
+            encoded = side.get("data_base64")
+            if mime not in IMAGE_TYPES or not isinstance(encoded, str):
+                return None
+            try:
+                data = base64.b64decode(encoded, validate=True)
+            except (binascii.Error, ValueError):
+                return None
+            try:
+                width, height = probe_dimensions(data, mime)
+            except ImageScrubError:
+                return None
+            variants[variant] = {
+                "ref": f"artifact://{artifact_id}/{variant}",
+                "mime": mime,
+                "byte_size": len(data),
+                "width": width,
+                "height": height,
+            }
+        artifact = {"kind": "visual-diff", **variants}
     else:
         try:
             validated_payload = _validate_text_payload(kind, payload)

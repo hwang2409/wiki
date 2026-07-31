@@ -4,6 +4,7 @@ import type { SessionArtifact, SessionEvent } from "./api";
 import { ArtifactError, ArtifactPlaceholder } from "./artifact-state";
 import {
   blendOpacity,
+  boundedDiffDimensions,
   computePixelDiff,
   formatDiffPercent,
   visualDiffAspect,
@@ -61,13 +62,26 @@ function useVisualDiffImages(sources: { before: string; after: string }): {
   return { state, reload: () => setNonce((value) => value + 1) };
 }
 
+type OverlayResult = {
+  changedPixels: number;
+  totalPixels: number;
+  scaled: boolean;
+};
+
 function drawPixelDiffOverlay(
   overlayCanvas: HTMLCanvasElement,
   before: LoadedImage,
   after: LoadedImage,
-): { changedPixels: number; totalPixels: number } | null {
-  const width = Math.min(before.width, after.width);
-  const height = Math.min(before.height, after.height);
+): OverlayResult | null {
+  const naturalWidth = Math.min(before.width, after.width);
+  const naturalHeight = Math.min(before.height, after.height);
+  if (naturalWidth === 0 || naturalHeight === 0) return null;
+  // Cap the working buffers so a 40 MP pair does not allocate ~500 MB and
+  // freeze the main thread. The overlay canvas is stretched by CSS
+  // (object-fit: contain over the stage) so downscaling stays imperceptible.
+  const bounds = boundedDiffDimensions(naturalWidth, naturalHeight);
+  const width = bounds.width;
+  const height = bounds.height;
   if (width === 0 || height === 0) return null;
   const context = overlayCanvas.getContext("2d", { willReadFrequently: true });
   if (!context) return null;
@@ -88,13 +102,18 @@ function drawPixelDiffOverlay(
   const overlayData = context.createImageData(width, height);
   overlayData.data.set(diff.overlay);
   context.putImageData(overlayData, 0, 0);
-  return { changedPixels: diff.changedPixels, totalPixels: diff.totalPixels };
+  return {
+    changedPixels: diff.changedPixels,
+    totalPixels: diff.totalPixels,
+    scaled: bounds.scaled,
+  };
 }
 
 export type VisualDiffRendererProps = {
   artifact: SessionArtifact;
   compact?: boolean;
   event: SessionEvent;
+  readOnly?: boolean;
   ticket: string;
 };
 
@@ -102,6 +121,7 @@ export function VisualDiffRenderer({
   artifact,
   compact = false,
   event,
+  readOnly = false,
   ticket,
 }: VisualDiffRendererProps) {
   const sources = useMemo(() => visualDiffSources(ticket, event), [ticket, event]);
@@ -112,6 +132,7 @@ export function VisualDiffRenderer({
   const [diffStats, setDiffStats] = useState<{
     changedPixels: number;
     totalPixels: number;
+    scaled: boolean;
   } | null>(null);
   const [overlayError, setOverlayError] = useState<string | null>(null);
   const aspect = visualDiffAspect(artifact);
@@ -200,7 +221,7 @@ export function VisualDiffRenderer({
       <div className="visual-diff-stage" style={aspectStyle}>
         {stageContent}
       </div>
-      <div className="visual-diff-controls">
+      {readOnly ? null : <div className="visual-diff-controls">
         <label className="visual-diff-slider" htmlFor={sliderId}>
           <span className="visual-diff-slider-label">
             <Columns2 aria-hidden="true" size={12} /> Blend
@@ -237,7 +258,7 @@ export function VisualDiffRenderer({
             <span className="visual-diff-toggle-readout tabular-nums">{diffPercent}</span>
           ) : null}
         </button>
-      </div>
+      </div>}
       {overlayError ? (
         <div className="visual-diff-overlay-error" role="status">{overlayError}</div>
       ) : null}

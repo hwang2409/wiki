@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
 
 import type { SessionEvent } from "../src/api";
+import { ArtifactBlock } from "../src/artifact-block";
 import { VisualDiffRenderer } from "../src/visual-diff-renderer";
 
 class ImmediateImage {
@@ -80,5 +81,50 @@ describe("visual-diff renderer", () => {
 
     fireEvent.click(toggle);
     expect(toggle.getAttribute("aria-pressed")).toBe("false");
+  });
+
+  test("readOnly hides the slider and toggle", async () => {
+    render(
+      <VisualDiffRenderer
+        artifact={visualDiffEvent().artifact!}
+        event={visualDiffEvent()}
+        readOnly
+        ticket="WIKI-193"
+      />,
+    );
+    await screen.findByAltText("Login form");
+    expect(screen.queryByRole("slider")).toBeNull();
+    expect(screen.queryByRole("button", { name: /pixel diff/i })).toBeNull();
+  });
+});
+
+describe("visual-diff compact preview in ArtifactBlock", () => {
+  test("oversized visual-diff renders no live controls and never bubbles to onOpen", async () => {
+    const onOpen = vi.fn();
+    const event: SessionEvent = {
+      id: 1,
+      kind: "artifact",
+      ts: null,
+      text: "",
+      disposition: "rendered",
+      artifact_id: "big",
+      title: "Screenshot pair",
+      artifact: {
+        kind: "visual-diff",
+        // Above the 400px threshold — compact preview kicks in.
+        before: { mime: "image/png", width: 1280, height: 720 },
+        after: { mime: "image/png", width: 1280, height: 720 },
+      },
+    };
+    render(<ArtifactBlock event={event} onOpen={onOpen} ticket="WIKI-193" />);
+    await screen.findByAltText("Screenshot pair");
+
+    // No interactive slider or pixel-diff toggle in the compact preview.
+    expect(screen.queryByRole("slider")).toBeNull();
+    expect(screen.queryByRole("button", { name: /pixel diff/i })).toBeNull();
+
+    // The whole compact body remains a single expand affordance. onOpen fires
+    // only from an explicit body click, never mid-gesture on live controls.
+    expect(onOpen).not.toHaveBeenCalled();
   });
 });

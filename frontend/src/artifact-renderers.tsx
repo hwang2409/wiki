@@ -973,7 +973,7 @@ export function CompactPreview({ artifact, event, onRenderError, ticket }: Artif
     return <PdfCompactRenderer event={event} ticket={ticket} />;
   }
   if (effectiveKind === "visual-diff") {
-    return <VisualDiffRenderer artifact={artifact} compact event={event} ticket={ticket} />;
+    return <VisualDiffRenderer artifact={artifact} compact event={event} readOnly ticket={ticket} />;
   }
   return <ArtifactRenderer artifact={artifact} event={event} ticket={ticket} />;
 }
