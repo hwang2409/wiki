@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shutil
@@ -631,6 +632,39 @@ class RunStore:
                     continue
         return None
 
+    def finalize_archived_run(self, run_id: str) -> RunRecord | None:
+        """Resume archive cleanup and return only after live state is gone."""
+
+        with self._lock:
+            archived = self.find_archived_run(run_id)
+            if archived is None:
+                return None
+
+            run_dir = self.run_dir(run_id)
+            if run_dir.exists():
+                shutil.rmtree(run_dir)
+            if run_dir.exists():
+                raise StoreConflict("archived run directory remains after cleanup")
+            self.command_log.forget_implicit_for_run(run_id)
+
+            registry = self._read_registry()
+            entry = registry.get(archived.agent_id)
+            current = entry.get("current") if isinstance(entry, dict) else None
+            if isinstance(current, dict) and current.get("run_id") == run_id:
+                registry.pop(archived.agent_id, None)
+                self._write_registry(registry)
+                self.command_log.replace_projection(archived.agent_id, {})
+            elif not isinstance(current, dict):
+                self.command_log.replace_projection(archived.agent_id, {})
+
+            entry = self._read_registry().get(archived.agent_id)
+            current = entry.get("current") if isinstance(entry, dict) else None
+            if run_dir.exists() or (
+                isinstance(current, dict) and current.get("run_id") == run_id
+            ):
+                raise StoreConflict("archived run remains live after cleanup")
+            return archived
+
     def find_archived_start_request(self, request_id: str) -> RunRecord | None:
         """Find an implicit start that was already archived and is reusable."""
 
@@ -809,10 +843,27 @@ class RunStore:
                 continue
 
     @staticmethod
-    def _terminate_recorded_provider_pid(record: RunRecord) -> bool:
+    def _terminate_recorded_provider_pid(
+        record: RunRecord,
+        *,
+        allow_dead_without_identity: bool = True,
+    ) -> bool:
         """Verify and stop a provider before deleting its uncommitted run."""
 
         if record.provider_pid is None or record.provider_pid <= 1:
+            return True
+        pid_dead = False
+        try:
+            os.kill(record.provider_pid, 0)
+        except ProcessLookupError:
+            # A dead child needs no identity. This also handles a crash before
+            # process inspection persisted the executable and start time.
+            pid_dead = True
+        except OSError as exc:
+            if exc.errno == errno.ESRCH:
+                pid_dead = True
+            # Permission errors and all other failures are live/uncertain.
+        if pid_dead and allow_dead_without_identity:
             return True
         if (
             record.provider_pid_started_at is None
@@ -2449,6 +2500,13 @@ class RunStore:
             current = entry.get("current") or {}
             if current.get("run_id") != replacement_run_id:
                 raise StoreConflict("replacement target is no longer current")
+            if not self._terminate_recorded_provider_pid(
+                replacement,
+                allow_dead_without_identity=False,
+            ):
+                raise StoreConflict(
+                    "replacement provider identity is uncertain; rollback retained"
+                )
 
             self.status_path(old.agent_id).unlink(missing_ok=True)
             old.replaced_by_run_id = None
@@ -2478,6 +2536,10 @@ class RunStore:
             }
             shutil.rmtree(self.run_dir(replacement_run_id))
             self._write_registry(registry)
+            self.command_log.replace_projection(
+                old.agent_id,
+                {old.agent_id: registry[old.agent_id]},
+            )
             return old
 
     def read_raw_events(

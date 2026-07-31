@@ -4202,7 +4202,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 if isinstance(effect, dict):
                     return effect
             run_id = self._resolve_run_id(params)
-            archived = self.store.find_archived_run(run_id)
+            archived = self.store.finalize_archived_run(run_id)
             if archived is not None:
                 return _public_run(archived)
             return _public_run(

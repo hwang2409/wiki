@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from copy import deepcopy
@@ -1657,6 +1658,85 @@ class RunStoreTests(unittest.TestCase):
             with self.assertRaisesRegex(StoreConflict, "no longer current"):
                 store.replace(old.run_id, _record(root))
 
+    def test_abort_replace_stops_recorded_provider_and_restores_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            old = store.create(_record(root))
+            replacement = _record(root)
+            store.replace(old.run_id, replacement)
+            replacement.provider_pid = 4242
+            replacement.provider_pid_started_at = 1.0
+            replacement.provider_executable = "/bin/provider"
+            replacement.provider_process_group_id = 4242
+            replacement.provider_process_group_members = [
+                {"pid": 4242, "created_at": 1.0, "executable": "/bin/provider"}
+            ]
+            store._write_record(replacement)  # noqa: SLF001 - crash fixture
+
+            with (
+                mock.patch.object(store_module.os, "kill"),
+                mock.patch.object(
+                    store_module,
+                    "terminate_verified_provider_group",
+                    return_value=True,
+                ) as terminate,
+            ):
+                restored = store.abort_replace(
+                    old.run_id,
+                    replacement.run_id,
+                    reason="replacement failed",
+                    adapter_status=AdapterStatus(
+                        LifecycleState.BLOCKED,
+                        None,
+                        None,
+                        generation=old.provider_generation,
+                    ),
+                )
+
+            terminate.assert_called_once()
+            self.assertEqual(restored.run_id, old.run_id)
+            self.assertEqual(store.current_run_id(old.agent_id), old.run_id)
+            self.assertFalse(store.run_dir(replacement.run_id).exists())
+            self.assertEqual(
+                store.command_state_for(old.agent_id)[old.agent_id]["current"]["run_id"],
+                old.run_id,
+            )
+            store.transition(old.run_id, LifecycleState.COMPLETED)
+
+    def test_restart_discards_dead_uncommitted_pid_without_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            record = store.create(_record(root), transactional_start=True)
+            record.provider_pid = 999_999_999
+            record.provider_pid_started_at = None
+            record.provider_executable = None
+            record.provider_process_group_id = None
+            store._write_record(record)  # noqa: SLF001 - crash fixture
+
+            restarted = RunStore(paths)
+
+            self.assertEqual(restarted.list_runs(), [])
+
+    def test_restart_retains_live_unverifiable_uncommitted_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _paths(root)
+            store = RunStore(paths)
+            record = store.create(_record(root), transactional_start=True)
+            record.provider_pid = os.getpid()
+            record.provider_pid_started_at = None
+            record.provider_executable = None
+            record.provider_process_group_id = None
+            store._write_record(record)  # noqa: SLF001 - crash fixture
+
+            restarted = RunStore(paths)
+
+            self.assertEqual(restarted.get(record.run_id).run_id, record.run_id)
+
     def test_archive_current_writes_snapshot_and_removes_runtime_entry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1762,6 +1842,46 @@ class RunStoreTests(unittest.TestCase):
             store.archive_current(record.run_id, outcome="merged")
 
             self.assertFalse(store.run_dir(record.run_id).exists())
+
+    def test_archive_marker_replay_resumes_cleanup_after_each_late_step(self) -> None:
+        for failure in ("rmtree", "implicit", "projection"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                paths = _paths(root)
+                store = RunStore(paths)
+                record = store.create(_record(root))
+                store.transition(record.run_id, LifecycleState.COMPLETED)
+
+                if failure == "rmtree":
+                    original_rmtree = store_module.shutil.rmtree
+
+                    def fail_rmtree(path: Path, *args: Any, **kwargs: Any) -> None:
+                        if path == store.run_dir(record.run_id):
+                            raise OSError("crash after archive marker")
+                        original_rmtree(path, *args, **kwargs)
+
+                    patch = mock.patch.object(store_module.shutil, "rmtree", fail_rmtree)
+                elif failure == "implicit":
+                    patch = mock.patch.object(
+                        store.command_log,
+                        "forget_implicit_for_run",
+                        side_effect=OSError("crash after run removal"),
+                    )
+                else:
+                    patch = mock.patch.object(
+                        store.command_log,
+                        "replace_projection",
+                        side_effect=OSError("crash after registry cleanup"),
+                    )
+
+                with self.assertRaises(OSError), patch:
+                    store.archive_current(record.run_id, outcome="merged")
+
+                archived = store.finalize_archived_run(record.run_id)
+
+                self.assertIsNotNone(archived)
+                self.assertFalse(store.run_dir(record.run_id).exists())
+                self.assertIsNone(store.current_run_id(record.agent_id))
 
     def test_reconcile_prunes_headless_registry_rows_missing_run_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
