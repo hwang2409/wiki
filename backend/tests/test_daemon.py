@@ -623,6 +623,88 @@ class DaemonArtifactTests(unittest.TestCase):
                 frozen_runtime_fingerprint(config.executable),
             )
 
+    def test_install_rejects_complete_adhoc_bundle_before_bootstrap(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = (
+                root
+                / "Wiki.app"
+                / "Contents"
+                / "Resources"
+                / "wiki-backend-sidecar"
+                / "wiki-backend"
+            )
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"ad-hoc backend")
+            executable.chmod(0o755)
+            info = root / "Wiki.app" / "Contents" / "Info.plist"
+            info.write_bytes(b"plist")
+            config = daemon.config_from_env(
+                overrides={
+                    "WIKI_APP_PATH": str(root / "Wiki.app"),
+                    "WIKI_AGENT_RUNTIME_DIR": str(root / "runtime"),
+                    "WIKI_LAUNCH_AGENTS_DIR": str(root / "LaunchAgents"),
+                }
+            )
+            with patch.object(
+                daemon, "_bundle_team_identifier", return_value=None
+            ), patch.object(daemon, "_launchctl") as launchctl:
+                with self.assertRaisesRegex(
+                    daemon.DaemonError, "ad-hoc or unsigned Wiki.app"
+                ):
+                    daemon.install(config)
+            launchctl.assert_not_called()
+
+    def test_signed_built_artifact_install_gate(self) -> None:
+        if sys.platform != "darwin":
+            self.skipTest("requires macOS codesign and launchd")
+        if not os.environ.get("WIKI_NATIVE_SIGNING_IDENTITY"):
+            self.skipTest(
+                "set WIKI_NATIVE_SIGNING_IDENTITY to run the signed native artifact test"
+            )
+        bundle = daemon.SOURCE_WIKI_APP_PATH
+        if not bundle.is_dir():
+            self.skipTest("build a trusted Wiki.app before running the artifact test")
+        team = daemon._bundle_team_identifier(bundle)
+        if team is None:
+            self.skipTest("built Wiki.app has no trusted TeamIdentifier")
+        executable = (
+            bundle / "Contents" / "Resources" / "wiki-backend-sidecar" / "wiki-backend"
+        )
+        if not executable.is_file():
+            self.skipTest("built Wiki.app has no bundled daemon executable")
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = daemon.config_from_env(
+                overrides={
+                    "WIKI_APP_PATH": str(bundle),
+                    "WIKI_AGENT_RUNTIME_DIR": str(root / "runtime"),
+                    "WIKI_LAUNCH_AGENTS_DIR": str(root / "LaunchAgents"),
+                    "WIKI_DAEMON_LOG_PATH": str(root / "daemon.log"),
+                }
+            )
+
+            def fake_launchctl(
+                _config: daemon.DaemonConfig, *arguments: str
+            ) -> subprocess.CompletedProcess[str]:
+                if arguments[0] == "print":
+                    return subprocess.CompletedProcess(
+                        ["launchctl", *arguments],
+                        113,
+                        "",
+                        daemon._service_absent_message(config),
+                    )
+                return subprocess.CompletedProcess(["launchctl", *arguments], 0, "", "")
+
+            with patch.object(daemon, "_launchctl", side_effect=fake_launchctl), patch.object(
+                daemon,
+                "_wait_for_healthy",
+                return_value={"healthy": True, "payload": {"status": "ok"}},
+            ):
+                result = daemon.install(config)
+            self.assertEqual(result["action"], "installed")
+            self.assertEqual(daemon._bundle_team_identifier(bundle), team)
+
     def test_install_fails_if_bootstrapped_backend_is_unhealthy(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

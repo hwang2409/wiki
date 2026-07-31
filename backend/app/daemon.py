@@ -269,6 +269,55 @@ def _bundle_path_for_executable(executable: Path) -> Path | None:
     return None
 
 
+def _bundle_team_identifier(bundle_path: Path) -> str | None:
+    """Return the trusted signing team for a macOS app bundle."""
+
+    if platform.system() != "Darwin":
+        return None
+    try:
+        result = subprocess.run(
+            ["/usr/bin/codesign", "-dvvv", str(bundle_path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    details = (result.stdout + result.stderr).splitlines()
+    if any(line == "Signature=adhoc" for line in details):
+        return None
+    team = next(
+        (
+            line.removeprefix("TeamIdentifier=")
+            for line in details
+            if line.startswith("TeamIdentifier=")
+        ),
+        None,
+    )
+    if not team or team == "not set" or not any(
+        line.startswith("Authority=") for line in details
+    ):
+        return None
+    return team
+
+
+def _validate_daemon_artifact(config: DaemonConfig) -> None:
+    """Reject a complete app bundle without a developer trust anchor."""
+
+    bundle_path = _bundle_path_for_executable(config.executable)
+    if bundle_path is None or not (bundle_path / "Contents" / "Info.plist").is_file():
+        # Unit fixtures and direct Python executables are not native artifacts.
+        # The production config always points into the complete Wiki.app bundle.
+        return
+    if _bundle_team_identifier(bundle_path) is None:
+        raise DaemonError(
+            "cannot install an ad-hoc or unsigned Wiki.app; "
+            "provide WIKI_NATIVE_SIGNING_IDENTITY and rebuild the app"
+        )
+
+
 def plist_payload(config: DaemonConfig) -> dict[str, object]:
     """Return a deterministic user LaunchAgent definition."""
 
@@ -579,6 +628,7 @@ def _install_unlocked(config: DaemonConfig) -> dict[str, object]:
         raise DaemonError(
             f"backend executable is missing or not executable: {config.executable}"
         )
+    _validate_daemon_artifact(config)
     backup = _capture_plist(config.plist_path)
     was_loaded = _service_loaded(config)
     prior = _prior_config(config, backup)

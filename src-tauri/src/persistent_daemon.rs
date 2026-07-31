@@ -58,6 +58,30 @@ pub(crate) fn probe(
         })
 }
 
+pub(crate) fn self_is_adhoc_bundle() -> bool {
+    let Ok(executable) = env::current_exe() else {
+        return false;
+    };
+    let Ok(output) = Command::new("/usr/bin/codesign")
+        .args(["-dvvv"])
+        .arg(executable)
+        .output()
+    else {
+        return false;
+    };
+    let details = [output.stdout, output.stderr].concat();
+    codesign_output_is_adhoc(&details)
+}
+
+fn codesign_output_is_adhoc(output: &[u8]) -> bool {
+    let details = String::from_utf8_lossy(output);
+    details.lines().any(|line| line == "Signature=adhoc")
+        && !details.lines().any(|line| {
+            line.strip_prefix("TeamIdentifier=")
+                .is_some_and(|team| !team.is_empty() && team != "not set")
+        })
+}
+
 pub(crate) fn refresh_secret(
     runtime_dir: &Path,
     daemon_managed: bool,
@@ -361,9 +385,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        daemon_connection_settings, daemon_probe_should_wait, health_matches_authenticated_peer,
-        health_proof_matches, refresh_origin_matches_saved_port, retry_until_ready,
-        DAEMON_SETTINGS_NAME,
+        codesign_output_is_adhoc, daemon_connection_settings, daemon_probe_should_wait,
+        health_matches_authenticated_peer, health_proof_matches, refresh_origin_matches_saved_port,
+        retry_until_ready, DAEMON_SETTINGS_NAME,
     };
 
     #[test]
@@ -482,6 +506,19 @@ mod tests {
         assert!(refresh_origin_matches_saved_port(
             "http://127.0.0.1:9321/",
             9321
+        ));
+    }
+
+    #[test]
+    fn self_fallback_requires_an_explicit_adhoc_signature() {
+        assert!(codesign_output_is_adhoc(
+            b"Identifier=com.hwang2409.wiki\nSignature=adhoc\n"
+        ));
+        assert!(!codesign_output_is_adhoc(
+            b"Identifier=com.hwang2409.wiki\nSignature=adhoc\nTeamIdentifier=ABCDE12345\n"
+        ));
+        assert!(!codesign_output_is_adhoc(
+            b"Identifier=com.hwang2409.wiki\nSignature=CMS\nTeamIdentifier=ABCDE12345\n"
         ));
     }
 }

@@ -383,19 +383,20 @@ fn sidecar_environment_without_secret() -> Vec<(OsString, OsString)> {
 }
 
 fn launch_backend_and_navigate(app: &AppHandle) {
-    let launch_result = if native_dev_mode() {
-        start_sidecar(app, 0)
-    } else {
-        match persistent_daemon::probe(&runtime_dir(), EXPECTED_BACKEND_FINGERPRINT) {
-            Ok(Some((launch_url, secret))) => {
-                set_app_secret(app, secret);
-                set_daemon_managed(app, true);
-                Ok(launch_url)
+    let launch_result =
+        if should_use_sidecar(native_dev_mode(), persistent_daemon::self_is_adhoc_bundle()) {
+            start_sidecar(app, 0)
+        } else {
+            match persistent_daemon::probe(&runtime_dir(), EXPECTED_BACKEND_FINGERPRINT) {
+                Ok(Some((launch_url, secret))) => {
+                    set_app_secret(app, secret);
+                    set_daemon_managed(app, true);
+                    Ok(launch_url)
+                }
+                Ok(None) => start_sidecar(app, 0),
+                Err(error) => Err(io::Error::other(error).into()),
             }
-            Ok(None) => start_sidecar(app, 0),
-            Err(error) => Err(io::Error::other(error).into()),
-        }
-    };
+        };
 
     match launch_result {
         Ok(launch_url) => {
@@ -412,6 +413,10 @@ fn launch_backend_and_navigate(app: &AppHandle) {
             show_error_dialog(app, "Wiki backend failed to start", &format!("{err}"));
         }
     }
+}
+
+fn should_use_sidecar(native_dev: bool, self_is_adhoc: bool) -> bool {
+    native_dev || self_is_adhoc
 }
 
 fn native_dev_mode() -> bool {
@@ -926,6 +931,9 @@ mod tests {
         assert!(super::native_dev_flag(Some("1")));
         assert!(!super::native_dev_flag(Some("0")));
         assert!(!super::native_dev_flag(None));
+        assert!(super::should_use_sidecar(true, false));
+        assert!(super::should_use_sidecar(false, true));
+        assert!(!super::should_use_sidecar(false, false));
     }
 
     #[test]
