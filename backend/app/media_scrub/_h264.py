@@ -736,8 +736,8 @@ def canonicalise_nal(nal_bytes: bytes, expected_nal_type: int) -> bytes:
     return canonical
 
 
-def parse_slice_pps_id(nal_bytes: bytes) -> int:
-    """Read the PPS identifier from a coded-slice NAL header and RBSP."""
+def parse_slice_header(nal_bytes: bytes) -> tuple[int, int]:
+    """Read and validate slice_type and pic_parameter_set_id from a slice."""
     if not nal_bytes:
         raise MediaScrubError("h264 slice NAL is empty")
     nal_type = nal_bytes[0] & 0x1F
@@ -745,6 +745,16 @@ def parse_slice_pps_id(nal_bytes: bytes) -> int:
         raise MediaScrubError("h264 NAL is not a coded slice")
     rbsp = _rbsp_unescape(nal_bytes[1:])
     reader = _BitReader(rbsp)
-    reader.read_ue()  # first_mb_in_slice
-    reader.read_ue()  # slice_type
-    return reader.read_ue()  # pic_parameter_set_id
+    first_mb_in_slice = reader.read_ue()
+    slice_type = reader.read_ue()
+    if slice_type > 9:
+        raise MediaScrubError(f"h264 slice_type {slice_type} is out of range")
+    pic_parameter_set_id = reader.read_ue()
+    del first_mb_in_slice
+    return slice_type, pic_parameter_set_id
+
+
+def parse_slice_pps_id(nal_bytes: bytes) -> int:
+    """Read the PPS identifier from a validated coded-slice NAL."""
+    _slice_type, pic_parameter_set_id = parse_slice_header(nal_bytes)
+    return pic_parameter_set_id

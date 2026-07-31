@@ -477,8 +477,38 @@ class WikiArtifactsTests(unittest.TestCase):
         }
         event = wiki_artifacts.render_artifact({"kind": "video", "payload": payload})
         self.assertIn("poster_base64", event["artifact"])
-        # Poster is the scrubbed image preview (data URL fragment).
-        self.assertTrue(event["artifact"]["poster_base64"].startswith("data:image/"))
+        poster_url = event["artifact"]["poster_base64"]
+        self.assertTrue(poster_url.startswith("data:image/"))
+        _header, _separator, encoded = poster_url.partition(",")
+        with Image.open(io.BytesIO(base64.b64decode(encoded))) as poster:
+            poster.load()
+            self.assertEqual(poster.size, (160, 120))
+
+    def test_transport_cap_covers_video_with_poster(self) -> None:
+        request = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "render_artifact",
+                    "arguments": {
+                        "kind": "video",
+                        "payload": {
+                            "mime": "video/mp4",
+                            "data_base64": "",
+                            "poster_base64": "",
+                            "poster_mime": "image/png",
+                        },
+                    },
+                },
+            },
+            separators=(",", ":"),
+        ).encode()
+        video_encoded_limit = ((wiki_artifacts.VIDEO_LIMIT + 2) // 3) * 4 + 4
+        poster_encoded_limit = ((wiki_artifacts.IMAGE_LIMIT + 2) // 3) * 4 + 4
+        required = len(request) + video_encoded_limit + poster_encoded_limit + 1
+        self.assertGreaterEqual(wiki_artifacts.MAX_REQUEST_BYTES, required)
 
     def test_video_rejects_ogg_and_webm(self) -> None:
         for mime in ("video/webm", "audio/ogg", "audio/webm"):

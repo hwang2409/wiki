@@ -3023,6 +3023,14 @@ class Review15MediaProbeTests(unittest.TestCase):
                 ):
                     media_scrub.scrub_video(payload, "video/mp4")
 
+    def test_reserved_slice_type_is_rejected_in_full_mp4(self) -> None:
+        # first_mb_in_slice=0, slice_type=10, pic_parameter_set_id=0
+        payload = self._replace_first_sample(REAL_MP4.read_bytes(), b"\x41\x8b\x80")
+        with self.assertRaisesRegex(
+            media_scrub.MediaScrubError, "slice_type 10 is out of range"
+        ):
+            media_scrub.scrub_video(payload, "video/mp4")
+
     @unittest.skipIf(FFMPEG is None or FFPROBE is None, "ffmpeg/ffprobe not installed")
     def test_scrubbed_control_decodes_at_least_one_frame(self) -> None:
         result = media_scrub.scrub_video(REAL_MP4.read_bytes(), "video/mp4")

@@ -40,9 +40,11 @@ VIDEO_LIMIT = 40 * 1024 * 1024
 AUDIO_LIMIT = 20 * 1024 * 1024
 PDF_MAGIC = b"%PDF-"
 # Transport-level cap on a single MCP request line. Sized to fit the largest
-# base64-encoded video payload (4/3 inflation) plus JSON envelope headroom, so
-# json.loads never sees an unbounded buffer even when a caller sends garbage.
-MEDIA_TRANSPORT_MAX = max(PDF_LIMIT, VIDEO_LIMIT, AUDIO_LIMIT, IMAGE_LIMIT)
+# valid aggregate binary payload: a video plus its image poster. Base64 adds
+# 4/3 inflation; JSON envelope headroom keeps valid boundary requests intact.
+MEDIA_TRANSPORT_MAX = max(
+    PDF_LIMIT, VIDEO_LIMIT + IMAGE_LIMIT, AUDIO_LIMIT, IMAGE_LIMIT,
+)
 MAX_REQUEST_BYTES = ((MEDIA_TRANSPORT_MAX + 2) // 3) * 4 + 64 * 1024
 SENTINEL_START = "<<wiki-artifact:v1>>"
 SENTINEL_END = "<<end>>"
@@ -624,7 +626,7 @@ def _decode_media_payload(
 
 
 def _scrub_optional_poster(payload: dict[str, Any]) -> tuple[str, int, int] | None:
-    """Route a caller-provided poster through image_scrub. Return preview_base64 + dims."""
+    """Route a caller-provided poster through image_scrub and return full data + dims."""
     poster = payload.get("poster_base64")
     if poster is None:
         return None
@@ -645,10 +647,12 @@ def _scrub_optional_poster(payload: dict[str, Any]) -> tuple[str, int, int] | No
         result = scrub_image(poster_bytes, poster_mime)
     except ImageScrubError as exc:
         raise ArtifactValidationError(f"video poster rejected: {exc}") from exc
-    if not result.preview_base64:
-        # scrub_image always emits a preview for the bounded-side downsample.
-        return None
-    return result.preview_base64, result.width, result.height
+    if len(result.data) > IMAGE_LIMIT:
+        raise ArtifactValidationError("video poster exceeds the 5MB image limit")
+    full_data_url = (
+        f"data:{result.mime};base64,{base64.b64encode(result.data).decode('ascii')}"
+    )
+    return full_data_url, result.width, result.height
 
 
 def _write_video(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
@@ -682,8 +686,8 @@ def _write_video(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
     if result.height is not None:
         normalized["height"] = result.height
     if poster is not None:
-        preview_b64, poster_w, poster_h = poster
-        normalized["poster_base64"] = preview_b64
+        poster_b64, poster_w, poster_h = poster
+        normalized["poster_base64"] = poster_b64
         # Poster dims can be a stable fallback when the container omits its own dims.
         if result.width is None and poster_w:
             normalized["width"] = poster_w
