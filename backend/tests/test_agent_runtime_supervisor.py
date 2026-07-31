@@ -2765,6 +2765,95 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("int:92", current.pending_requests)
         self.assertFalse(self.supervisor.handover_event_queue)
 
+    async def test_handover_preflight_rejects_live_detached_control_before_drain(
+        self,
+    ) -> None:
+        healthy = await self.supervisor.start_run(
+            agent_id="WIKI-HANDOVER-ATTACHED",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="attached handover run",
+        )
+        detached = await self.supervisor.start_run(
+            agent_id="WIKI-HANDOVER-DETACHED",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="detached handover run",
+        )
+        await _wait_for_events(self.store, healthy.run_id, 10)
+        await _wait_for_events(self.store, detached.run_id, 10)
+        healthy_adapter = self.supervisor.adapters[healthy.run_id]
+        await self.supervisor._detach_adapter(  # noqa: SLF001 - live control probe
+            detached.run_id,
+            preserve_event_routes=True,
+        )
+        detached_record = self.store.get(detached.run_id)
+        self.assertFalse(self.supervisor._runtime_status(detached_record)["control_attached"])
+        self.assertTrue(self.supervisor.pid_alive(detached_record.provider_pid))
+
+        with mock.patch.object(
+            healthy_adapter, "stop", wraps=healthy_adapter.stop
+        ) as healthy_stop:
+            with self.assertRaisesRegex(StoreConflict, "live provider control is detached"):
+                await self.supervisor.prepare_handover()
+
+        healthy_stop.assert_not_awaited()
+        self.assertIs(self.supervisor.adapters.get(healthy.run_id), healthy_adapter)
+        self.assertTrue(self.supervisor._runtime_status(self.store.get(healthy.run_id))["control_attached"])
+
+    async def test_failed_handover_retries_queued_delivery_after_barrier(self) -> None:
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-HANDOVER-QUEUE-RETRY",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="queued delivery retry",
+        )
+        await _wait_for_events(self.store, record.run_id, 10)
+        adapter = self.supervisor.adapters[record.run_id]
+        idle = AdapterStatus(
+            LifecycleState.IDLE,
+            adapter.snapshot().session_id,
+            os.getpid(),
+            generation=adapter.snapshot().generation,
+        )
+        adapter._status = idle  # noqa: SLF001 - queue retry fixture
+        self.store.update_adapter_status(record.run_id, idle)
+        await self.supervisor.send_on_idle(record.run_id, "deliver after retry")
+
+        async def fail_preflight_with_delivery_task() -> list[str]:
+            self.supervisor._spawn_monitor_task(  # noqa: SLF001 - barrier race fixture
+                self.supervisor._deliver_next_queued(record.run_id, adapter),
+                name="handover-queued-delivery-retry",
+            )
+            await asyncio.sleep(0)
+            raise StoreConflict("fixture failed handover")
+
+        with mock.patch.object(
+            self.supervisor,
+            "_handover_preflight",
+            new=fail_preflight_with_delivery_task,
+        ):
+            with self.assertRaisesRegex(StoreConflict, "fixture failed handover"):
+                await self.supervisor.prepare_handover()
+
+        for _ in range(100):
+            if not self.store.get(record.run_id).queued_messages:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            self.fail("queued message was not delivered after handover failure")
+        self.assertEqual(adapter._queued, [])  # noqa: SLF001
+        self.assertEqual(adapter.snapshot().state, LifecycleState.WORKING)
+
     async def test_failed_handover_drain_replays_queued_events(self) -> None:
         record = await self.supervisor.start_run(
             agent_id="WIKI-HANDOVER-DRAIN-FAIL",

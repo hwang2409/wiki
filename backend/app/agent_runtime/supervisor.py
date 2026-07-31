@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 import json
+import logging
 import math
 import os
 import re
@@ -47,6 +48,7 @@ DEFAULT_IDEMPOTENCY_CACHE_SIZE = 256
 DEFAULT_WORKER_SOFT_CAP = 5
 _IDEMPOTENT_METHODS = frozenset({"run/start", "run/send_now", "run/send_on_idle"})
 DEFAULT_APPROVAL_RECOVERY_TIMEOUT_SECONDS = 30.0
+logger = logging.getLogger(__name__)
 
 
 class _HandoverDrainOutcome(str, Enum):
@@ -459,7 +461,17 @@ class Supervisor:
     ) -> asyncio.Task[Any]:
         task = asyncio.create_task(coro, name=name)
         self.monitor_tasks.add(task)
-        task.add_done_callback(self.monitor_tasks.discard)
+
+        def observe(completed: asyncio.Task[Any]) -> None:
+            self.monitor_tasks.discard(completed)
+            if completed.cancelled():
+                return
+            try:
+                completed.result()
+            except Exception:
+                logger.exception("background monitor task failed: %s", name)
+
+        task.add_done_callback(observe)
         return task
 
     @staticmethod
@@ -494,15 +506,20 @@ class Supervisor:
         return self._agent_lock(self.store.get(run_id).agent_id)
 
     @asynccontextmanager
-    async def _run_mutation_admission(self):
+    async def _run_mutation_admission(self, *, wait_for_handover: bool = False):
         """Coordinate run mutations with the native handover barrier."""
 
-        async with self.handover_condition:
-            while self.handover_pending:
-                await self.handover_condition.wait()
-            if self.handover_active:
-                raise StoreConflict("supervisor handover is in progress")
-            self.active_run_mutations += 1
+        while True:
+            async with self.handover_condition:
+                while self.handover_pending:
+                    await self.handover_condition.wait()
+                if self.handover_active:
+                    if not wait_for_handover:
+                        raise StoreConflict("supervisor handover is in progress")
+                    await self.handover_condition.wait()
+                    continue
+                self.active_run_mutations += 1
+                break
         try:
             yield
         finally:
@@ -1269,7 +1286,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         )
 
     async def _deliver_next_queued(self, run_id: str, adapter: ProviderAdapter) -> None:
-        async with self._run_mutation_admission():
+        async with self._run_mutation_admission(wait_for_handover=True):
             async with self._run_lock(run_id):
                 await self._deliver_next_queued_locked(run_id, adapter)
 
@@ -2526,6 +2543,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 provider_alive = bool(runtime["provider_alive"]) or self.pid_alive(
                     record.provider_pid
                 )
+                if provider_alive and not runtime["control_attached"]:
+                    raise StoreConflict(
+                        f"cannot hand over {record.agent_id}: "
+                        "live provider control is detached"
+                    )
                 if not runtime["control_attached"] and not provider_alive:
                     continue
                 if runtime.get("state") not in {
@@ -3734,6 +3756,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             await asyncio.gather(*self.event_tasks.values(), return_exceptions=True)
         self.event_tasks.clear()
         if self.monitor_tasks:
+            for task in self.monitor_tasks:
+                task.cancel()
             await asyncio.gather(*self.monitor_tasks, return_exceptions=True)
         self.monitor_tasks.clear()
         self.event_routes.clear()
