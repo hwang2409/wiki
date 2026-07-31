@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import stat
 import tempfile
 import threading
+import time
 import base64
 from copy import deepcopy
 from dataclasses import dataclass
@@ -610,6 +612,38 @@ class RunStore:
     def archive_ticket_dir(self, agent_id: str) -> Path:
         return self.paths.archive_dir / agent_id
 
+    def find_archived_run(self, run_id: str) -> RunRecord | None:
+        """Find one completed archive for a replayed archive effect."""
+
+        with self._lock:
+            for path in self.paths.archive_dir.glob("*/*/archive-complete.json"):
+                try:
+                    marker = _read_json(path)
+                    if not isinstance(marker, dict) or marker.get("run_id") != run_id:
+                        continue
+                    value = _read_json(path.parent / "run.json")
+                    if isinstance(value, dict):
+                        return RunRecord.from_dict(value)
+                except (OSError, StoreError, TypeError, ValueError):
+                    continue
+        return None
+
+    def find_archived_start_request(self, request_id: str) -> RunRecord | None:
+        """Find an implicit start that was already archived and is reusable."""
+
+        with self._lock:
+            indexed = self.command_log.archived_start_request(request_id)
+            if indexed is None:
+                return None
+            try:
+                value = _read_json(Path(indexed["session_path"]) / "run.json")
+            except (OSError, StoreError, TypeError, ValueError):
+                return None
+            if not isinstance(value, dict):
+                return None
+            record = RunRecord.from_dict(value)
+            return record if record.run_id == indexed["run_id"] else None
+
     def status_path(self, agent_id: str) -> Path:
         return self.paths.status_dir / f"{agent_id}.json"
 
@@ -659,17 +693,31 @@ class RunStore:
         with self._lock:
             return deepcopy(self._read_registry())
 
+    def command_state_for(self, agent_id: str) -> dict[str, Any]:
+        """Return one agent projection for a keyed command transaction."""
+
+        with self._lock:
+            projected = self.command_log.projection_for(agent_id)
+            entry = self._read_registry().get(agent_id)
+            if entry is not None or not projected:
+                return {agent_id: deepcopy(entry)}
+            return {agent_id: None}
+
     def find_start_request(self, request_id: str) -> RunRecord | None:
         """Find a durable successful start after cache eviction or restart."""
 
         if not isinstance(request_id, str) or not request_id:
             return None
         with self._lock:
-            for record in self.list_runs():
-                if record.start_request_id != request_id:
-                    continue
-                if self.is_current(record):
-                    return record
+            indexed = self.command_log.start_request(request_id)
+            if indexed is None:
+                return None
+            try:
+                record = self.get(str(indexed["run_id"]))
+            except RunNotFound:
+                return None
+            if record.agent_id == indexed["agent_id"] and self.is_current(record):
+                return record
         return None
 
     def _restore_start_snapshot(
@@ -737,11 +785,55 @@ class RunStore:
                 record = RunRecord.from_dict(value)
                 if not record.start_transaction:
                     continue
+                if not self._terminate_recorded_provider_pid(record.provider_pid):
+                    continue
                 self._restore_start_snapshot(record, record.start_transaction)
+                if record.start_request_id:
+                    self.command_log.remove_start_request(record.start_request_id)
                 shutil.rmtree(self.run_dir(record.run_id), ignore_errors=True)
             except (OSError, StoreError, TypeError, ValueError):
                 # Leave damaged metadata for the normal inspector path.
                 continue
+
+    @staticmethod
+    def _terminate_recorded_provider_pid(pid: int | None) -> bool:
+        """Verify and stop a provider before deleting its uncommitted run."""
+
+        if pid is None or pid <= 1:
+            return True
+
+        def alive() -> bool:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True
+            return True
+
+        if not alive():
+            return True
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        deadline = time.monotonic() + 0.5
+        while alive() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if not alive():
+            return True
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        deadline = time.monotonic() + 1.0
+        while alive() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        return not alive()
 
     def legacy_codex_agent_ids(self) -> list[str]:
         """Return tmux-era Codex currents, failing closed on corrupt entries."""
@@ -853,6 +945,14 @@ class RunStore:
                 if not isinstance(value, dict):
                     continue
                 record = RunRecord.from_dict(value)
+                if record.start_request_id and record.start_transaction is None:
+                    self.command_log.register_start_request(
+                        record.start_request_id,
+                        record.agent_id,
+                        record.run_id,
+                        implicit=record.implicit_start_request,
+                        committed=True,
+                    )
                 raw_path = self.raw_events_path(record.run_id)
                 normalized_path = self.normalized_events_path(record.run_id)
                 _repair_jsonl_tail(raw_path)
@@ -1236,7 +1336,14 @@ class RunStore:
                 {"run_id": run_id, "completed_at": ended_at},
             )
 
+            if record.start_request_id and record.implicit_start_request:
+                self.command_log.archive_start_request(
+                    record.start_request_id,
+                    run_id,
+                    str(session_dir),
+                )
             shutil.rmtree(self.run_dir(run_id))
+            self.command_log.forget_implicit_for_run(run_id)
             registry.pop(record.agent_id, None)
             self._write_registry(registry)
             return record, session_dir
@@ -1325,6 +1432,14 @@ class RunStore:
             run_dir_was_absent = not self.run_dir(record.run_id).exists()
             try:
                 self._create_run_files(record)
+                if record.start_request_id:
+                    self.command_log.register_start_request(
+                        record.start_request_id,
+                        record.agent_id,
+                        record.run_id,
+                        implicit=record.implicit_start_request,
+                        committed=not transactional_start,
+                    )
                 history = (
                     list((entry or {}).get("history") or [])
                     if isinstance(entry, dict)
@@ -1366,6 +1481,8 @@ class RunStore:
                 }
                 self._write_registry(registry)
             except BaseException:
+                if record.start_request_id:
+                    self.command_log.remove_start_request(record.start_request_id)
                 self._start_registry_snapshots.pop(record.run_id, None)
                 if run_dir_was_absent:
                     shutil.rmtree(self.run_dir(record.run_id), ignore_errors=True)
@@ -1389,6 +1506,8 @@ class RunStore:
             if record.start_transaction is not None:
                 record.start_transaction = None
                 self._write_record(record)
+            if record.start_request_id:
+                self.command_log.commit_start_request(record.start_request_id)
 
     def abort_start(self, run_id: str, *, reason: str) -> None:
         """Remove a failed start and restore the registry before that start."""
@@ -1413,6 +1532,8 @@ class RunStore:
                 }
             self._restore_start_snapshot(record, durable_snapshot)
             self._control_attached_run_ids.discard(run_id)
+            if record.start_request_id:
+                self.command_log.remove_start_request(record.start_request_id)
             shutil.rmtree(self.run_dir(run_id))
 
     def get(self, run_id: str) -> RunRecord:

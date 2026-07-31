@@ -4239,6 +4239,32 @@ def _control_headless_agent(
     raw_id = agent_id.strip()
     if not raw_id or not valid_agent_id(raw_id):
         raise HTTPException(status_code=400, detail="Bad agent id")
+
+    if action == "archive" and request_id is not None:
+        status = _supervisor_request(
+            "idempotency/status",
+            {"method": "run/archive", "request_id": request_id},
+        )
+        receipt = status.get("receipt") if isinstance(status, dict) else None
+        prior_result = receipt.get("result") if isinstance(receipt, dict) else None
+        if isinstance(prior_result, dict):
+            prior_agent_id = prior_result.get("agent_id")
+            if not isinstance(prior_agent_id, str):
+                prior_agent_id = prior_result.get("ticket")
+            if not isinstance(prior_agent_id, str):
+                prior_agent_id = raw_id
+            prior_role = prior_result.get("role")
+            prior_orch = prior_result.get("orchestrator_id")
+            if prior_role in WORKER_ROLES:
+                workgraph_service.record_archive(
+                    agent_id=prior_agent_id,
+                    orch=prior_orch if isinstance(prior_orch, str) else None,
+                    outcome=prior_result.get("outcome")
+                    if isinstance(prior_result.get("outcome"), str)
+                    else outcome,
+                    status_dir=AGENT_STATUS_DIR,
+                )
+            return dict(prior_result)
     resolved = _registry_agent(_read_agent_registry(), raw_id)
     if resolved is None:
         raise HTTPException(status_code=404, detail="No registered agent")
@@ -4262,8 +4288,18 @@ def _control_headless_agent(
     if action == "archive" and current.get("role") in WORKER_ROLES:
         workgraph_service.record_archive(
             agent_id=resolved_id,
-            orch=current.get("orch") if isinstance(current.get("orch"), str) else None,
-            outcome=outcome,
+            orch=(
+                result.get("orchestrator_id")
+                if isinstance(result.get("orchestrator_id"), str)
+                else current.get("orch")
+                if isinstance(current.get("orch"), str)
+                else None
+            ),
+            outcome=(
+                result.get("outcome")
+                if isinstance(result.get("outcome"), str)
+                else outcome
+            ),
             status_dir=AGENT_STATUS_DIR,
         )
     return dict(result)
@@ -4715,6 +4751,20 @@ def spawn_agent(
             "migrate_legacy": bool(current) and not current_is_headless,
             "request_id": request_id,
             "implicit_request_id": implicit_request_id,
+            "command_hash_payload": {
+                "agent_id": ticket,
+                "provider": "codex" if kind == "cdx" else "claude",
+                "role": role,
+                "model": model,
+                "effort": effort,
+                "worktree": str(workdir_path),
+                "prompt": body.prompt,
+                "title": body.title,
+                "context_prelude": body.context_prelude,
+                "include_context": body.include_context,
+                "context_prelude_override": body.context_prelude_override,
+                "orchestrator_id": orch or None,
+            },
             "backend_base_url": backend_base_url,
         },
     )
@@ -4955,6 +5005,15 @@ def spawn_orchestrator(
             "migrate_legacy": migrate_legacy,
             "request_id": request_id,
             "implicit_request_id": implicit_request_id,
+            "command_hash_payload": {
+                "agent_id": orch_id,
+                "provider": "codex" if kind == "cdx" else "claude",
+                "role": "orchestrator",
+                "model": model,
+                "effort": body.effort,
+                "worktree": str(workdir_path),
+                "goal": goal,
+            },
             "backend_base_url": backend_base_url,
         },
     )

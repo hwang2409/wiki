@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from .. import accounts, provider_health
 from .command_log import AgentCommand, CommandQueue
@@ -421,7 +421,11 @@ class Supervisor:
         self.implicit_idempotency_keys: set[tuple[str, str]] = set()
         self.implicit_idempotency_runs: dict[tuple[str, str], str] = {}
         self.idempotency_lock = asyncio.Lock()
-        self.command_queue = CommandQueue(self.store.command_log, self.store.command_state)
+        self.command_queue = CommandQueue(
+            self.store.command_log,
+            self.store.command_state,
+            self.store.command_state_for,
+        )
         self.worker_soft_cap = (
             worker_soft_cap
             if worker_soft_cap is not None
@@ -1793,6 +1797,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         backend_base_url: str | None = None,
         request_id: str | None = None,
         run_id: str | None = None,
+        implicit_request_id: bool = False,
     ) -> RunRecord:
         if request_id:
             durable = self.store.find_start_request(request_id)
@@ -1811,6 +1816,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             backend_base_url=backend_base_url,
             run_id=run_id,
             start_request_id=request_id,
+            implicit_start_request=implicit_request_id,
         )
         prompt = inject_runtime_card(
             record,
@@ -2989,11 +2995,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         pending_id: str | None = None,
         dedupe_key: str | None = None,
         source: str | None = None,
+        effect_id: str | None = None,
     ) -> dict[str, Any]:
         async with self._run_mutation_admission():
             async with self._run_lock(run_id):
                 return await self._send_now(
-                    run_id, message, pending_id, dedupe_key, source
+                    run_id, message, pending_id, dedupe_key, source, effect_id
                 )
 
     async def _send_now(
@@ -3003,6 +3010,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         pending_id: str | None = None,
         dedupe_key: str | None = None,
         source: str | None = None,
+        effect_id: str | None = None,
     ) -> dict[str, Any]:
         adapter = self.adapters.get(run_id)
         if adapter is None:
@@ -3020,6 +3028,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             _, claimed = self.store.claim_message_dedupe_key(run_id, dedupe_key)
             if not claimed:
                 return {"status": "deduplicated", "dedupe_key": dedupe_key}
+        command_dedupe_key = f"command:{effect_id}" if effect_id else None
+        if command_dedupe_key is not None:
+            _, claimed = self.store.claim_message_dedupe_key(run_id, command_dedupe_key)
+            if not claimed:
+                return {"status": "deduplicated", "request_id": effect_id}
         if pending_id is None and source is not None:
             # Source metadata is only propagated through pending_user_messages,
             # so mint a durable id for synthetic sources without a composer id.
@@ -3065,11 +3078,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         pending_id: str | None = None,
         dedupe_key: str | None = None,
         source: str | None = None,
+        effect_id: str | None = None,
     ) -> dict[str, Any]:
         async with self._run_mutation_admission():
             async with self._run_lock(run_id):
                 return await self._send_on_idle(
-                    run_id, message, pending_id, dedupe_key, source
+                    run_id, message, pending_id, dedupe_key, source, effect_id
                 )
 
     async def _send_on_idle(
@@ -3079,6 +3093,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         pending_id: str | None = None,
         dedupe_key: str | None = None,
         source: str | None = None,
+        effect_id: str | None = None,
     ) -> dict[str, Any]:
         adapter = self.adapters.get(run_id)
         if adapter is None:
@@ -3091,6 +3106,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     "dedupe_key": dedupe_key,
                     "messages": list(record.queued_messages),
                 }
+        command_dedupe_key = f"command:{effect_id}" if effect_id else None
+        if command_dedupe_key is not None:
+            record, claimed = self.store.claim_message_dedupe_key(run_id, command_dedupe_key)
+            if not claimed:
+                return {"status": "deduplicated", "request_id": effect_id}
         if pending_id is None and source is not None:
             pending_id = str(uuid4())
         try:
@@ -3196,16 +3216,18 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         run_id: str,
         *,
         outcome: str | None = None,
+        effect_id: str | None = None,
     ) -> RunRecord:
         async with self._run_mutation_admission():
             async with self._run_lock(run_id):
-                return await self._archive(run_id, outcome=outcome)
+                return await self._archive(run_id, outcome=outcome, effect_id=effect_id)
 
     async def _archive(
         self,
         run_id: str,
         *,
         outcome: str | None = None,
+        effect_id: str | None = None,
     ) -> RunRecord:
         adapter = self.adapters.get(run_id)
         if adapter is None:
@@ -3255,6 +3277,16 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     reason="archived",
                 )
             archived, _ = self.store.archive_current(run_id, outcome=outcome)
+            if effect_id is not None:
+                self.store.command_log.complete_effect(
+                    AgentCommand(
+                        "run/archive",
+                        archived.agent_id,
+                        effect_id,
+                        {"agent_id": archived.agent_id, "run_id": run_id, "outcome": outcome},
+                    ),
+                    _public_run(archived),
+                )
             self._forget_implicit_idempotency_for_run(run_id)
             self._clear_adapter_loss(run_id)
             await self._publish_agent_change(archived.agent_id)
@@ -3277,6 +3309,16 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             raise StoreConflict("provider archive returned no status")
         record = self.store.update_adapter_status(run_id, status)
         archived, _ = self.store.archive_current(run_id, outcome=outcome)
+        if effect_id is not None:
+            self.store.command_log.complete_effect(
+                AgentCommand(
+                    "run/archive",
+                    archived.agent_id,
+                    effect_id,
+                    {"agent_id": archived.agent_id, "run_id": run_id, "outcome": outcome},
+                ),
+                _public_run(archived),
+            )
         self._forget_implicit_idempotency_for_run(run_id)
         self._clear_adapter_loss(run_id)
         await self._publish_agent_change(archived.agent_id)
@@ -3315,6 +3357,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         provider: ProviderKind | None = None,
         effort: str | None = None,
         backend_base_url: str | None = None,
+        replacement_run_id: str | None = None,
     ) -> RunRecord:
         async with self._run_mutation_admission():
             old = self.store.get(run_id)
@@ -3331,6 +3374,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                             target_provider,
                             effort if provider is not None else old.effort,
                             backend_base_url,
+                            replacement_run_id,
                         )
             else:
                 async with self._run_lock(run_id):
@@ -3341,6 +3385,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         target_provider,
                         effort if provider is not None else old.effort,
                         backend_base_url,
+                        replacement_run_id,
                     )
         if old.model != replacement.model:
             self._append_model_changed_event(
@@ -3376,6 +3421,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         provider: ProviderKind | None = None,
         effort: str | None = None,
         backend_base_url: str | None = None,
+        replacement_run_id: str | None = None,
     ) -> RunRecord:
         """Replace a run after the caller has acquired mutation admission."""
 
@@ -3386,6 +3432,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             provider,
             effort,
             backend_base_url,
+            replacement_run_id,
         )
 
     async def _replace_without_handover(
@@ -3396,6 +3443,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         provider: ProviderKind | None = None,
         effort: str | None = None,
         backend_base_url: str | None = None,
+        replacement_run_id: str | None = None,
     ) -> RunRecord:
         old = self.store.get(run_id)
         if not self.store.is_current(old):
@@ -3415,6 +3463,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             orchestrator_id=old.orchestrator_id,
             replaces_run_id=old.run_id,
             backend_base_url=backend_base_url or old.backend_base_url,
+            run_id=replacement_run_id,
         )
         prompt = inject_runtime_card(
             replacement,
@@ -3612,10 +3661,23 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         raise ValueError("agent_id or run_id is required")
                     agent_id = self.store.get(run_id).agent_id
                     command_params["agent_id"] = agent_id
+                else:
+                    current_run_id = self.store.current_run_id(agent_id)
+                    if current_run_id:
+                        command_params.setdefault("run_id", current_run_id)
             if method == "run/start":
-                command_params.setdefault("run_id", str(uuid4()))
+                command_params.setdefault(
+                    "run_id", str(uuid5(NAMESPACE_URL, f"{method}:{request_id}:run"))
+                )
+                if command_params.get("implicit_request_id") is True:
+                    archived_start = self.store.find_archived_start_request(request_id)
+                    if archived_start is not None:
+                        command_params["run_id"] = str(uuid4())
             elif method == "run/replace":
-                command_params.setdefault("replacement_run_id", str(uuid4()))
+                command_params.setdefault(
+                    "replacement_run_id",
+                    str(uuid5(NAMESPACE_URL, f"{method}:{request_id}:replacement")),
+                )
             command = AgentCommand(
                 method=method,
                 agent_id=agent_id,
@@ -3627,6 +3689,12 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             if method == "run/start":
                 durable = self.store.find_start_request(request_id)
                 if durable is not None:
+                    if self.store.command_log.known(method, request_id):
+                        await asyncio.to_thread(
+                            self.store.command_log.append_intent,
+                            command,
+                            self.store.command_state_for(agent_id),
+                        )
                     result = await self._dispatch(method, command_params)
                     if self.store.command_log.receipt(method, request_id) is None:
                         await asyncio.to_thread(
@@ -3731,27 +3799,38 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             }
         if method == "idempotency/status":
             target_method = params.get("method")
-            if target_method not in _IDEMPOTENT_METHODS:
-                raise ValueError("method must be an idempotent supervisor operation")
+            if target_method not in _COMMAND_METHODS:
+                raise ValueError("method must be a command supervisor operation")
             request_id = _validated_idempotency_request_id(params.get("request_id"))
             if request_id is None:
                 raise ValueError("request_id is required")
             key = (target_method, request_id)
-            return {
+            receipt = self.store.command_log.receipt(target_method, request_id)
+            if receipt is not None and not receipt.ok:
+                self.store.command_log.raise_receipt(target_method, request_id)
+            response: dict[str, Any] = {
                 "known": (
                     key in self.idempotency_results
                     or key in self.idempotency_tasks
                     or self.store.command_log.known(target_method, request_id)
-                    or (
-                        target_method == "run/start"
-                        and self.store.find_start_request(request_id) is not None
-                    )
+                    or self.store.find_start_request(request_id) is not None
                 ),
             }
+            if receipt is not None:
+                response["receipt"] = {
+                    "ok": receipt.ok,
+                    "result": receipt.result,
+                    "error_type": receipt.error_type,
+                }
+            return response
         if method == "run/start":
             migrate_legacy = params.get("migrate_legacy", False)
             if not isinstance(migrate_legacy, bool):
                 raise ValueError("migrate_legacy must be a boolean")
+            requested_run_id = params.get("run_id")
+            current_run_id = self.store.current_run_id(str(params["agent_id"]))
+            if current_run_id == requested_run_id:
+                return _public_run(self.store.get(current_run_id))
             record = await self.start_run(
                 agent_id=str(params["agent_id"]),
                 provider=ProviderKind(params["provider"]),
@@ -3765,6 +3844,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 backend_base_url=params.get("backend_base_url"),
                 request_id=params.get("request_id"),
                 run_id=params.get("run_id"),
+                implicit_request_id=params.get("implicit_request_id") is True,
             )
             result = _public_run(record)
             active_worker_count = self._active_worker_count()
@@ -3801,6 +3881,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 _validated_pending_id(params.get("pending_id")),
                 _validated_dedupe_key(params.get("dedupe_key")),
                 _validated_source(params.get("source")),
+                effect_id=params.get("request_id"),
             )
         if method == "run/send_on_idle":
             return await self.send_on_idle(
@@ -3809,6 +3890,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 _validated_pending_id(params.get("pending_id")),
                 _validated_dedupe_key(params.get("dedupe_key")),
                 _validated_source(params.get("source")),
+                effect_id=params.get("request_id"),
             )
         if method == "run/queue":
             run_id = self._resolve_run_id(params)
@@ -3836,14 +3918,31 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             outcome = params.get("outcome")
             if outcome is not None and not isinstance(outcome, str):
                 raise ValueError("outcome must be a string or null")
+            request_id = params.get("request_id")
+            if isinstance(request_id, str):
+                effect = self.store.command_log.effect_result(method, request_id)
+                if isinstance(effect, dict):
+                    return effect
+            run_id = self._resolve_run_id(params)
+            archived = self.store.find_archived_run(run_id)
+            if archived is not None:
+                return _public_run(archived)
             return _public_run(
                 await self.archive(
-                    self._resolve_run_id(params),
+                    run_id,
                     outcome=outcome,
+                    effect_id=request_id if isinstance(request_id, str) else None,
                 )
             )
         if method == "run/replace":
             provider = params.get("provider")
+            replacement_run_id = params.get("replacement_run_id")
+            if isinstance(replacement_run_id, str):
+                current_id = self.store.current_run_id(str(params["agent_id"]))
+                if current_id == replacement_run_id:
+                    current = self.store.get(current_id)
+                    if current.replaces_run_id == params.get("run_id"):
+                        return _public_run(current)
             return _public_run(
                 await self.replace(
                     self._resolve_run_id(params),
@@ -3852,6 +3951,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     ProviderKind(provider) if provider is not None else None,
                     params.get("effort"),
                     params.get("backend_base_url"),
+                    replacement_run_id,
                 )
             )
         if method == "run/respond":

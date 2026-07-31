@@ -172,6 +172,7 @@ class RunRecord:
     replaced_by_run_id: str | None = None
     outcome: str | None = None
     start_request_id: str | None = None
+    implicit_start_request: bool = False
     # Set before a fresh start is published. It contains the exact registry
     # and status preimage needed to undo a start after a daemon restart.
     start_transaction: dict[str, Any] | None = None
@@ -209,6 +210,7 @@ class RunRecord:
         backend_base_url: str | None = None,
         run_id: str | None = None,
         start_request_id: str | None = None,
+        implicit_start_request: bool = False,
     ) -> RunRecord:
         return cls(
             run_id=run_id or str(uuid4()),
@@ -223,6 +225,7 @@ class RunRecord:
             orchestrator_id=orchestrator_id,
             replaces_run_id=replaces_run_id,
             start_request_id=start_request_id,
+            implicit_start_request=implicit_start_request,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -264,6 +267,7 @@ class RunRecord:
             "replaced_by_run_id": self.replaced_by_run_id,
             "outcome": self.outcome,
             "start_request_id": self.start_request_id,
+            "implicit_start_request": self.implicit_start_request,
             "start_transaction": self.start_transaction,
             "raw_event_count": self.raw_event_count,
             "normalized_event_count": self.normalized_event_count,
@@ -328,6 +332,7 @@ class RunRecord:
             replaced_by_run_id=value.get("replaced_by_run_id"),
             outcome=value.get("outcome"),
             start_request_id=value.get("start_request_id"),
+            implicit_start_request=bool(value.get("implicit_start_request", False)),
             start_transaction=(
                 dict(value["start_transaction"])
                 if isinstance(value.get("start_transaction"), dict)
