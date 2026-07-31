@@ -3994,6 +3994,7 @@ class SpawnWorkerIn(BaseModel):
     include_context: bool = False
     context_prelude_override: str | None = Field(default=None, max_length=5_000)
     request_id: str | None = Field(default=None, min_length=1, max_length=200)
+    implicit_request_id: bool = False
 
     @model_validator(mode="after")
     def validate_model_and_effort(self) -> SpawnWorkerIn:
@@ -4021,6 +4022,7 @@ class SpawnOrchestratorIn(BaseModel):
     effort: str | None = Field(default=None, max_length=16)
     goal: str = Field(default="", max_length=20_000)
     request_id: str | None = Field(default=None, min_length=1, max_length=200)
+    implicit_request_id: bool = False
 
     @model_validator(mode="after")
     def validate_kind_and_effort(self) -> SpawnOrchestratorIn:
@@ -4611,6 +4613,7 @@ def spawn_agent(
     if len(prompt.encode("utf-8")) >= MAX_SPAWN_PROMPT_BYTES:
         raise HTTPException(status_code=400, detail="Kickoff prompt must be smaller than 100KB")
 
+    implicit_request_id = body.implicit_request_id or body.request_id is None
     request_id = body.request_id or _stable_spawn_request_id(
         {
             "agent_id": ticket,
@@ -4681,6 +4684,7 @@ def spawn_agent(
             "orchestrator_id": orch or None,
             "migrate_legacy": bool(current) and not current_is_headless,
             "request_id": request_id,
+            "implicit_request_id": implicit_request_id,
             "backend_base_url": backend_base_url,
         },
     )
@@ -4836,6 +4840,7 @@ def spawn_orchestrator(
         raise HTTPException(status_code=400, detail="Initial goal must stay under 20KB")
 
     workdir_path = resolve_existing_dir(body.workdir, field_name="Project directory")
+    implicit_request_id = body.implicit_request_id or body.request_id is None
     request_id = body.request_id or _stable_spawn_request_id(
         {
             "agent_id": orch_id,
@@ -4919,6 +4924,7 @@ def spawn_orchestrator(
             "orchestrator_id": None,
             "migrate_legacy": migrate_legacy,
             "request_id": request_id,
+            "implicit_request_id": implicit_request_id,
             "backend_base_url": backend_base_url,
         },
     )

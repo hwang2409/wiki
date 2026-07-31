@@ -415,6 +415,7 @@ def next_review(
     }:
         raise ValueError("reviewer_effort is invalid")
     diversity_lenses = _normalize_diversity(diversity)
+    implicit_request_id = request_id is None
     request_id = request_id or _stable_request_id(
         ticket=ticket,
         pr_number=pr_number,
@@ -447,7 +448,9 @@ def next_review(
                 reviewer_effort=reviewer_effort,
                 prompt_template=prompt_template,
                 request_id=request_id,
+                implicit_request_id=implicit_request_id,
                 orch=orch,
+                backend_base_url=backend_base_url,
                 main=main,
                 gate=gate,
                 resolve_root=resolve_root,
@@ -480,6 +483,7 @@ def next_review(
                     prompt=staged["prompt"],
                     orch=staged["orch"],
                     request_id=staged["request_id"],
+                    implicit_request_id=implicit_request_id,
                 )
                 spawn_result = (
                     spawn(spawn_args)
@@ -603,6 +607,7 @@ def next_review(
             prompt=prompt,
             orch=orch,
             request_id=request_id,
+            implicit_request_id=implicit_request_id,
         )
         spawn_result = (
             spawn(spawn_args)

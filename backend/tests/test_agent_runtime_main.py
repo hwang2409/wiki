@@ -18,6 +18,7 @@ from uuid import uuid4
 from fastapi import BackgroundTasks, HTTPException, Request
 
 from backend.app import main
+from backend.app.agent_runtime import next_review as next_review_module
 from backend.app.agent_runtime.client import (
     SupervisorClient,
     SupervisorRemoteError,
@@ -984,6 +985,63 @@ class HeadlessMainRouteTests(unittest.IsolatedAsyncioTestCase):
             )
         start = next(params for method, params in self.client.calls if method == "run/start")
         self.assertEqual(start["backend_base_url"], "http://127.0.0.1:43112")
+
+    async def test_http_diversity_review_passes_backend_url_to_each_spawn(self) -> None:
+        request = Request(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/api/agents/next-review",
+                "raw_path": b"/api/agents/next-review",
+                "query_string": b"",
+                "headers": [],
+                "client": ("127.0.0.1", 50000),
+                "server": ("127.0.0.1", 43112),
+            }
+        )
+        calls: list[tuple[main.SpawnWorkerIn, str | None]] = []
+
+        def spawn(request: main.SpawnWorkerIn, *, backend_base_url: str | None = None) -> dict[str, str]:
+            calls.append((request, backend_base_url))
+            return {"run_id": request.ticket}
+
+        with (
+            mock.patch.dict(os.environ, {"WIKI_BACKEND_URL": ""}),
+            mock.patch.object(main, "AGENT_RUNTIME_DIR", self.paths.runtime_dir),
+            mock.patch.object(main, "composer_gate", return_value={"verdict": "pass"}),
+            mock.patch.object(main, "list_archived", return_value=[]),
+            mock.patch.object(main, "_read_agent_registry", return_value={}),
+            mock.patch.object(
+                main,
+                "provision_pinned_worktree",
+                side_effect=lambda _root, workdir, _sha: workdir,
+            ),
+            mock.patch.object(main, "spawn_agent", side_effect=spawn),
+            mock.patch.object(
+                next_review_module,
+                "_resolve_root",
+                return_value=self.root,
+            ),
+        ):
+            result = main.next_review_route(
+                request,
+                main.NextReviewIn(
+                    ticket="WIKI-DIVERSITY-URL",
+                    pr_number=226,
+                    expected_sha="a" * 40,
+                    orch="wiki",
+                    diversity=["correctness", "security"],
+                ),
+            )
+
+        self.assertEqual(result["status"], "spawned")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            {item[1] for item in calls},
+            {"http://127.0.0.1:43112"},
+        )
 
     async def test_spawn_with_new_request_id_keeps_duplicate_guard(self) -> None:
         self._seed_headless()

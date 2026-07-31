@@ -6,6 +6,7 @@ import shutil
 import stat
 import tempfile
 import threading
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -1109,9 +1110,19 @@ class RunStore:
             # orphan from a prior run before this record becomes current; the
             # supervisor calls create() while holding the per-agent lock.
             self.status_path(record.agent_id).unlink(missing_ok=True)
-            self._start_registry_snapshots[record.run_id] = json.loads(
-                json.dumps(registry)
+            legacy_orchestrators = registry.get("_orchestrators")
+            legacy_entry = (
+                legacy_orchestrators.get(record.agent_id)
+                if isinstance(legacy_orchestrators, dict)
+                else None
             )
+            self._start_registry_snapshots[record.run_id] = {
+                "agent_present": record.agent_id in registry,
+                "agent_entry": deepcopy(registry.get(record.agent_id)),
+                "legacy_present": isinstance(legacy_orchestrators, dict)
+                and record.agent_id in legacy_orchestrators,
+                "legacy_entry": deepcopy(legacy_entry),
+            }
             self._create_run_files(record)
             history = (
                 list((entry or {}).get("history") or [])
@@ -1167,14 +1178,31 @@ class RunStore:
         del reason  # The failed run is rolled back instead of persisted.
         with self._lock:
             record = self.get(run_id)
-            registry = self._start_registry_snapshots.pop(run_id, None)
-            if registry is None:
-                registry = self._read_registry()
+            snapshot = self._start_registry_snapshots.pop(run_id, None)
+            registry = self._read_registry()
+            if snapshot is None:
                 entry = registry.get(record.agent_id)
                 if isinstance(entry, dict) and (
                     (entry.get("current") or {}).get("run_id") == run_id
                 ):
                     registry.pop(record.agent_id, None)
+            elif snapshot["agent_present"]:
+                registry[record.agent_id] = deepcopy(snapshot["agent_entry"])
+            else:
+                registry.pop(record.agent_id, None)
+
+            legacy_orchestrators = registry.get("_orchestrators")
+            if snapshot is not None and snapshot["legacy_present"]:
+                if not isinstance(legacy_orchestrators, dict):
+                    legacy_orchestrators = {}
+                    registry["_orchestrators"] = legacy_orchestrators
+                legacy_orchestrators[record.agent_id] = deepcopy(
+                    snapshot["legacy_entry"]
+                )
+            elif isinstance(legacy_orchestrators, dict):
+                legacy_orchestrators.pop(record.agent_id, None)
+                if not legacy_orchestrators:
+                    registry.pop("_orchestrators", None)
             self._control_attached_run_ids.discard(run_id)
             shutil.rmtree(self.run_dir(run_id))
             self._write_registry(registry)

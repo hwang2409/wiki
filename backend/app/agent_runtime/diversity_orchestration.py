@@ -218,6 +218,8 @@ def run_diverse_review(
     archived: Callable[[], list[Mapping[str, Any]]] | None,
     registry: Callable[[], Mapping[str, Any]] | None,
     status_reader: Callable[[str], Mapping[str, Any] | None] | None,
+    implicit_request_id: bool = False,
+    backend_base_url: str | None = None,
 ) -> dict[str, Any]:
     """Stage, provision, spawn, and archive one complete lens fan-out."""
 
@@ -322,8 +324,13 @@ def run_diverse_review(
             prompt=details["prompt"],
             orch=staged["orch"],
             request_id=f"{staged['request_id']}:{lens}",
+            implicit_request_id=implicit_request_id,
         )
-        result = spawn(spawn_args) if spawn is not None else main.spawn_agent(spawn_args)
+        result = (
+            spawn(spawn_args)
+            if spawn is not None
+            else main.spawn_agent(spawn_args, backend_base_url=backend_base_url)
+        )
         return lens, result
 
     with ThreadPoolExecutor(max_workers=len(pending) or 1) as executor:

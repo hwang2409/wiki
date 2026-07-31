@@ -413,6 +413,8 @@ class Supervisor:
             tuple[str, str], tuple[str, Any]
         ] = OrderedDict()
         self.idempotency_tasks: dict[tuple[str, str], asyncio.Task[Any]] = {}
+        self.implicit_idempotency_keys: set[tuple[str, str]] = set()
+        self.implicit_idempotency_runs: dict[tuple[str, str], str] = {}
         self.idempotency_lock = asyncio.Lock()
         self.worker_soft_cap = (
             worker_soft_cap
@@ -3166,6 +3168,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     reason="archived",
                 )
             archived, _ = self.store.archive_current(run_id, outcome=outcome)
+            self._forget_implicit_idempotency_for_run(run_id)
             self._clear_adapter_loss(run_id)
             await self._publish_agent_change(archived.agent_id)
             return archived
@@ -3187,6 +3190,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             raise StoreConflict("provider archive returned no status")
         record = self.store.update_adapter_status(run_id, status)
         archived, _ = self.store.archive_current(run_id, outcome=outcome)
+        self._forget_implicit_idempotency_for_run(run_id)
         self._clear_adapter_loss(run_id)
         await self._publish_agent_change(archived.agent_id)
         return archived
@@ -3504,7 +3508,17 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         request_id = _validated_idempotency_request_id(params.get("request_id"))
         if request_id is None:
             return await self._dispatch(method, params)
+        if params.get("implicit_request_id") is True:
+            self.implicit_idempotency_keys.add((method, request_id))
         return await self._dispatch_idempotently(method, request_id, params)
+
+    def _forget_implicit_idempotency_for_run(self, run_id: str) -> None:
+        for key, mapped_run_id in list(self.implicit_idempotency_runs.items()):
+            if mapped_run_id != run_id:
+                continue
+            self.implicit_idempotency_runs.pop(key, None)
+            self.implicit_idempotency_keys.discard(key)
+            self.idempotency_results.pop(key, None)
 
     def _complete_idempotency_task(
         self,
@@ -3521,9 +3535,16 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         try:
             outcome: tuple[str, Any] = ("result", deepcopy(task.result()))
         except Exception as exc:
+            if key in self.implicit_idempotency_keys:
+                self.implicit_idempotency_keys.discard(key)
+                return
             outcome = ("error", (type(exc), exc.args))
         self.idempotency_results[key] = outcome
         self.idempotency_results.move_to_end(key)
+        if key in self.implicit_idempotency_keys:
+            result = outcome[1]
+            if isinstance(result, dict) and isinstance(result.get("run_id"), str):
+                self.implicit_idempotency_runs[key] = result["run_id"]
         while len(self.idempotency_results) > self.idempotency_cache_size:
             self.idempotency_results.popitem(last=False)
 
@@ -3792,5 +3813,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         self.last_no_eligible_alert = 0.0
         self.idempotency_results.clear()
         self.idempotency_tasks.clear()
+        self.implicit_idempotency_keys.clear()
+        self.implicit_idempotency_runs.clear()
         self.detached_at_monotonic.clear()
         self.adapters.clear()

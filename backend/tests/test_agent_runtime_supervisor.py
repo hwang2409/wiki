@@ -47,6 +47,7 @@ from backend.app.agent_runtime.provider import (
     AdapterStatus,
     ProviderAdapter,
     ProviderEvent,
+    ProviderProcessError,
     StartRequest,
 )
 from backend.app.agent_runtime.store import RunStore, RuntimePaths, StoreConflict
@@ -693,6 +694,134 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         )
         await asyncio.sleep(0)
         self.assertEqual(self.supervisor.idempotency_tasks, {})
+
+    async def test_implicit_start_id_is_reusable_after_archive(self) -> None:
+        params = {
+            "agent_id": "WIKI-IMPLICIT-ARCHIVE",
+            "provider": "codex",
+            "role": "implement",
+            "model": "fixture-codex",
+            "effort": "high",
+            "worktree": str(self.worktree),
+            "prompt": "Retry this omitted-id spawn after archive.",
+            "request_id": "spawn-implicit-archive",
+            "implicit_request_id": True,
+        }
+        first = await self.supervisor.dispatch("run/start", params)
+        await asyncio.sleep(0)
+        await self.supervisor.dispatch(
+            "run/archive",
+            {"run_id": first["run_id"], "outcome": "closed"},
+        )
+
+        second = await self.supervisor.dispatch("run/start", dict(params))
+
+        self.assertNotEqual(second["run_id"], first["run_id"])
+
+    async def test_implicit_start_failure_does_not_cache_error(self) -> None:
+        await self.supervisor.close()
+        attempts = 0
+
+        def factory(record: RunRecord):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                return StartFailureAdapter(
+                    FIXTURES / "codex_app_server_success.jsonl",
+                    FIXTURES / "codex_app_server_control.jsonl",
+                    pid=987_654,
+                )
+            return CodexFixtureAdapter(
+                FIXTURES / "codex_app_server_success.jsonl",
+                FIXTURES / "codex_app_server_control.jsonl",
+                pid=os.getpid(),
+            )
+
+        self.supervisor = Supervisor(self.store, factory, pid_alive=lambda _pid: False)
+        params = {
+            "agent_id": "WIKI-IMPLICIT-FAILURE",
+            "provider": "codex",
+            "role": "implement",
+            "model": "fixture-codex",
+            "effort": "high",
+            "worktree": str(self.worktree),
+            "prompt": "Retry this omitted-id spawn after failure.",
+            "request_id": "spawn-implicit-failure",
+            "implicit_request_id": True,
+        }
+        with self.assertRaisesRegex(ProviderProcessError, "fixture start failure"):
+            await self.supervisor.dispatch("run/start", params)
+        await asyncio.sleep(0)
+
+        second = await self.supervisor.dispatch("run/start", dict(params))
+
+        self.assertEqual(attempts, 2)
+        self.assertEqual(second["agent_id"], "WIKI-IMPLICIT-FAILURE")
+
+    async def test_aborted_start_preserves_interleaved_committed_registry_entry(self) -> None:
+        first_started = asyncio.Event()
+        second_started = asyncio.Event()
+        allow_first = asyncio.Event()
+        allow_second_failure = asyncio.Event()
+        original_factory = self.supervisor.adapter_factory
+
+        def factory(record: RunRecord):
+            adapter = original_factory(record)
+            if record.agent_id == "WIKI-ROLLBACK-A":
+                assert isinstance(adapter, ClaudeFixtureAdapter)
+
+                async def delayed_start(request: StartRequest) -> AdapterStatus:
+                    first_started.set()
+                    await allow_first.wait()
+                    return await ClaudeFixtureAdapter.start(adapter, request)
+
+                adapter.start = delayed_start  # type: ignore[method-assign]
+            elif record.agent_id == "WIKI-ROLLBACK-B":
+                assert isinstance(adapter, CodexFixtureAdapter)
+
+                async def delayed_failure(request: StartRequest) -> AdapterStatus:
+                    del request
+                    second_started.set()
+                    await allow_second_failure.wait()
+                    raise RuntimeError("interleaved fixture failure")
+
+                adapter.start = delayed_failure  # type: ignore[method-assign]
+            return adapter
+
+        self.supervisor.adapter_factory = factory
+        first_task = asyncio.create_task(
+            self.supervisor.start_run(
+                agent_id="WIKI-ROLLBACK-A",
+                provider=ProviderKind.CLAUDE,
+                role="implement",
+                model="fixture-claude",
+                worktree=str(self.worktree),
+                prompt="committed start must survive a later abort",
+            )
+        )
+        await asyncio.wait_for(first_started.wait(), timeout=2)
+        second_task = asyncio.create_task(
+            self.supervisor.start_run(
+                agent_id="WIKI-ROLLBACK-B",
+                provider=ProviderKind.CODEX,
+                role="implement",
+                model="fixture-codex",
+                effort="high",
+                worktree=str(self.worktree),
+                prompt="this start will abort",
+            )
+        )
+        await asyncio.wait_for(second_started.wait(), timeout=2)
+        allow_first.set()
+        first = await first_task
+        allow_second_failure.set()
+        with self.assertRaisesRegex(ProviderProcessError, "interleaved fixture failure"):
+            await second_task
+
+        self.assertEqual(self.store.current_run_id("WIKI-ROLLBACK-A"), first.run_id)
+        self.assertIsNone(self.store.current_run_id("WIKI-ROLLBACK-B"))
+        registry = json.loads(self.paths.registry_path.read_text(encoding="utf-8"))
+        self.assertEqual(registry["WIKI-ROLLBACK-A"]["current"]["run_id"], first.run_id)
 
     async def test_dispatch_allows_integer_codex_approval_request_id(self) -> None:
         started = await self.supervisor.dispatch(
