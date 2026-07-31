@@ -19,6 +19,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from .. import accounts, provider_health
+from .command_log import AgentCommand, CommandQueue
 from .normalizer import NormalizedProviderEvent, normalize_provider_event
 from .process import (
     ProviderProcessStatus,
@@ -53,6 +54,9 @@ DEFAULT_ADAPTER_DETACH_GRACE_SECONDS = 1.0
 DEFAULT_IDEMPOTENCY_CACHE_SIZE = 256
 DEFAULT_WORKER_SOFT_CAP = 5
 _IDEMPOTENT_METHODS = frozenset({"run/start", "run/send_now", "run/send_on_idle"})
+_COMMAND_METHODS = frozenset(
+    {"run/start", "run/send_now", "run/send_on_idle", "run/archive", "run/replace"}
+)
 DEFAULT_APPROVAL_RECOVERY_TIMEOUT_SECONDS = 30.0
 logger = logging.getLogger(__name__)
 
@@ -417,6 +421,7 @@ class Supervisor:
         self.implicit_idempotency_keys: set[tuple[str, str]] = set()
         self.implicit_idempotency_runs: dict[tuple[str, str], str] = {}
         self.idempotency_lock = asyncio.Lock()
+        self.command_queue = CommandQueue(self.store.command_log, self.store.command_state)
         self.worker_soft_cap = (
             worker_soft_cap
             if worker_soft_cap is not None
@@ -1786,7 +1791,13 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         orchestrator_id: str | None = None,
         migrate_legacy: bool = False,
         backend_base_url: str | None = None,
+        request_id: str | None = None,
+        run_id: str | None = None,
     ) -> RunRecord:
+        if request_id:
+            durable = self.store.find_start_request(request_id)
+            if durable is not None:
+                return durable
         resolved = resolve_safe_worktree(worktree)
         record = RunRecord.new(
             agent_id=agent_id,
@@ -1798,6 +1809,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             effort=effort,
             orchestrator_id=orchestrator_id,
             backend_base_url=backend_base_url,
+            run_id=run_id,
+            start_request_id=request_id,
         )
         prompt = inject_runtime_card(
             record,
@@ -1811,10 +1824,18 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 async with self.codex_fleet_lock:
                     self._assert_codex_fleet_available()
                     async with self._agent_lock(record.agent_id):
-                        self.store.create(record, migrate_legacy=migrate_legacy)
+                        self.store.create(
+                            record,
+                            migrate_legacy=migrate_legacy,
+                            transactional_start=True,
+                        )
                         return await self._launch_record(record, prompt, rollback_start=True)
             async with self._agent_lock(record.agent_id):
-                self.store.create(record, migrate_legacy=migrate_legacy)
+                self.store.create(
+                    record,
+                    migrate_legacy=migrate_legacy,
+                    transactional_start=True,
+                )
                 return await self._launch_record(record, prompt, rollback_start=True)
 
     async def _launch_record(
@@ -3569,6 +3590,61 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         return record
 
     async def dispatch(self, method: str, params: dict[str, Any]) -> Any:
+        if method in _COMMAND_METHODS:
+            command_params = dict(params)
+            request_id = _validated_idempotency_request_id(
+                command_params.get("request_id")
+            )
+            if request_id is None:
+                request_id = f"{method}:{uuid4()}"
+                command_params["request_id"] = request_id
+            if command_params.get("implicit_request_id") is True:
+                self.implicit_idempotency_keys.add((method, request_id))
+            if method == "run/start":
+                agent_id = command_params.get("agent_id")
+                if not isinstance(agent_id, str) or not agent_id:
+                    raise ValueError("agent_id is required")
+            else:
+                agent_id = command_params.get("agent_id")
+                if not isinstance(agent_id, str) or not agent_id:
+                    run_id = command_params.get("run_id")
+                    if not isinstance(run_id, str) or not run_id:
+                        raise ValueError("agent_id or run_id is required")
+                    agent_id = self.store.get(run_id).agent_id
+                    command_params["agent_id"] = agent_id
+            if method == "run/start":
+                command_params.setdefault("run_id", str(uuid4()))
+            elif method == "run/replace":
+                command_params.setdefault("replacement_run_id", str(uuid4()))
+            command = AgentCommand(
+                method=method,
+                agent_id=agent_id,
+                request_id=request_id,
+                payload={**command_params, "method": method},
+            )
+            # A committed start is its own durable receipt. Repair the sqlite
+            # receipt before returning when the daemon died after commit_start.
+            if method == "run/start":
+                durable = self.store.find_start_request(request_id)
+                if durable is not None:
+                    result = await self._dispatch(method, command_params)
+                    if self.store.command_log.receipt(method, request_id) is None:
+                        await asyncio.to_thread(
+                            self.store.command_log.complete,
+                            command,
+                            result,
+                            self.store.command_state(),
+                        )
+                    return result
+            if method in _IDEMPOTENT_METHODS:
+                async def execute() -> Any:
+                    return await self._dispatch_idempotently(
+                        method, request_id, command_params
+                    )
+            else:
+                async def execute() -> Any:
+                    return await self._dispatch(method, command_params)
+            return await self.command_queue.submit(command, execute)
         if method not in _IDEMPOTENT_METHODS:
             return await self._dispatch(method, params)
         request_id = _validated_idempotency_request_id(params.get("request_id"))
@@ -3582,6 +3658,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         for key, mapped_run_id in list(self.implicit_idempotency_runs.items()):
             if mapped_run_id != run_id:
                 continue
+            self.store.command_log.forget(key[0], key[1])
             self.implicit_idempotency_runs.pop(key, None)
             self.implicit_idempotency_keys.discard(key)
             self.idempotency_results.pop(key, None)
@@ -3661,7 +3738,15 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 raise ValueError("request_id is required")
             key = (target_method, request_id)
             return {
-                "known": key in self.idempotency_results or key in self.idempotency_tasks,
+                "known": (
+                    key in self.idempotency_results
+                    or key in self.idempotency_tasks
+                    or self.store.command_log.known(target_method, request_id)
+                    or (
+                        target_method == "run/start"
+                        and self.store.find_start_request(request_id) is not None
+                    )
+                ),
             }
         if method == "run/start":
             migrate_legacy = params.get("migrate_legacy", False)
@@ -3678,6 +3763,8 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 orchestrator_id=params.get("orchestrator_id"),
                 migrate_legacy=migrate_legacy,
                 backend_base_url=params.get("backend_base_url"),
+                request_id=params.get("request_id"),
+                run_id=params.get("run_id"),
             )
             result = _public_run(record)
             active_worker_count = self._active_worker_count()
@@ -3883,3 +3970,4 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         self.implicit_idempotency_runs.clear()
         self.detached_at_monotonic.clear()
         self.adapters.clear()
+        await self.command_queue.close()

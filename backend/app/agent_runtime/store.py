@@ -6,6 +6,7 @@ import shutil
 import stat
 import tempfile
 import threading
+import base64
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -14,6 +15,7 @@ from typing import Any
 from uuid import UUID
 
 from .. import knowledge
+from .command_log import CommandLog
 from .provider import AdapterStatus
 from .types import (
     EventDisposition,
@@ -393,6 +395,10 @@ class RuntimePaths:
     def codex_rotation_journal_path(self) -> Path:
         return self.runtime_dir / "codex-rotation-journal.json"
 
+    @property
+    def command_log_path(self) -> Path:
+        return self.runtime_dir / "command-log.sqlite3"
+
     def run_dir(self, run_id: str) -> Path:
         return self.runs_dir / _validated_run_id(run_id)
 
@@ -578,6 +584,8 @@ class RunStore:
         self._start_registry_snapshots: dict[str, dict[str, Any]] = {}
         _ensure_private_dir(paths.runtime_dir)
         _ensure_private_dir(paths.runs_dir)
+        self.command_log = CommandLog(paths.command_log_path)
+        self._abort_uncommitted_starts()
         self._reconcile_existing_runs()
         self._reconcile_registry_from_runs()
 
@@ -644,6 +652,96 @@ class RunStore:
 
     def _write_registry(self, registry: dict[str, Any]) -> None:
         _atomic_write_json(self.paths.registry_path, registry)
+
+    def command_state(self) -> dict[str, Any]:
+        """Return the registry projection used by the command decider."""
+
+        with self._lock:
+            return deepcopy(self._read_registry())
+
+    def find_start_request(self, request_id: str) -> RunRecord | None:
+        """Find a durable successful start after cache eviction or restart."""
+
+        if not isinstance(request_id, str) or not request_id:
+            return None
+        with self._lock:
+            for record in self.list_runs():
+                if record.start_request_id != request_id:
+                    continue
+                if self.is_current(record):
+                    return record
+        return None
+
+    def _restore_start_snapshot(
+        self,
+        record: RunRecord,
+        snapshot: dict[str, Any] | None,
+    ) -> None:
+        """Restore the pre-start registry and status file from durable data."""
+
+        registry = self._read_registry()
+        current = registry.get(record.agent_id)
+        current_run_id = (
+            current.get("current", {}).get("run_id")
+            if isinstance(current, dict)
+            and isinstance(current.get("current"), dict)
+            else None
+        )
+        if snapshot is None:
+            if current_run_id == record.run_id:
+                registry.pop(record.agent_id, None)
+            self.status_path(record.agent_id).unlink(missing_ok=True)
+            self._write_registry(registry)
+            return
+
+        if bool(snapshot.get("agent_present")):
+            previous = snapshot.get("agent_entry")
+            if isinstance(previous, dict):
+                registry[record.agent_id] = deepcopy(previous)
+        elif current_run_id == record.run_id:
+            registry.pop(record.agent_id, None)
+
+        legacy = registry.get("_orchestrators")
+        if bool(snapshot.get("legacy_present")):
+            previous_legacy = snapshot.get("legacy_entry")
+            if not isinstance(legacy, dict):
+                legacy = {}
+                registry["_orchestrators"] = legacy
+            if isinstance(previous_legacy, dict):
+                legacy[record.agent_id] = deepcopy(previous_legacy)
+        elif isinstance(legacy, dict) and current_run_id == record.run_id:
+            legacy.pop(record.agent_id, None)
+            if not legacy:
+                registry.pop("_orchestrators", None)
+
+        status_path = self.status_path(record.agent_id)
+        if bool(snapshot.get("status_present")):
+            encoded = snapshot.get("status_content")
+            if isinstance(encoded, str):
+                _atomic_write_bytes(status_path, base64.b64decode(encoded))
+        else:
+            status_path.unlink(missing_ok=True)
+        if not snapshot.get("registry_file_present", True) and not registry:
+            self.paths.registry_path.unlink(missing_ok=True)
+        else:
+            self._write_registry(registry)
+
+    def _abort_uncommitted_starts(self) -> None:
+        """Abort fresh starts that were published before provider commit."""
+
+        for path in sorted(self.paths.runs_dir.glob("*/run.json")):
+            try:
+                value = _read_json(path)
+                if not isinstance(value, dict):
+                    continue
+                record = RunRecord.from_dict(value)
+                if not record.start_transaction:
+                    continue
+                self._restore_start_snapshot(record, record.start_transaction)
+                shutil.rmtree(self.run_dir(record.run_id), ignore_errors=True)
+            except (OSError, StoreError, TypeError, ValueError):
+                # Leave damaged metadata for the normal inspector path.
+                continue
 
     def legacy_codex_agent_ids(self) -> list[str]:
         """Return tmux-era Codex currents, failing closed on corrupt entries."""
@@ -712,6 +810,7 @@ class RunStore:
             "window": None,
             "spawned_at": record.created_at,
             "updated_at": record.updated_at,
+            "start_request_id": record.start_request_id,
         }
 
     def _write_record(self, record: RunRecord) -> None:
@@ -1142,7 +1241,13 @@ class RunStore:
             self._write_registry(registry)
             return record, session_dir
 
-    def create(self, record: RunRecord, *, migrate_legacy: bool = False) -> RunRecord:
+    def create(
+        self,
+        record: RunRecord,
+        *,
+        migrate_legacy: bool = False,
+        transactional_start: bool = False,
+    ) -> RunRecord:
         with self._lock:
             registry = self._read_registry()
             entry = registry.get(record.agent_id)
@@ -1190,7 +1295,24 @@ class RunStore:
                 else None
             )
             # WIKI-219 owns durable snapshots and journal-before-side-effect
-            # recovery across supervisor exits; this PR keeps rollback in memory.
+            # recovery across supervisor exits.
+            start_snapshot = {
+                "version": 1,
+                "agent_present": record.agent_id in registry,
+                "agent_entry": deepcopy(registry.get(record.agent_id)),
+                "legacy_present": isinstance(legacy_orchestrators, dict)
+                and record.agent_id in legacy_orchestrators,
+                "legacy_entry": deepcopy(legacy_entry),
+                "status_present": status_present,
+                "status_content": (
+                    base64.b64encode(status_content).decode("ascii")
+                    if status_content is not None
+                    else None
+                ),
+                "registry_file_present": registry_was_present,
+            }
+            if transactional_start:
+                record.start_transaction = start_snapshot
             self._start_registry_snapshots[record.run_id] = {
                 "agent_present": record.agent_id in registry,
                 "agent_entry": deepcopy(registry.get(record.agent_id)),
@@ -1259,10 +1381,14 @@ class RunStore:
             return record
 
     def commit_start(self, run_id: str) -> None:
-        """Forget the pre-start registry snapshot after provider launch succeeds."""
+        """Commit a start and remove its durable pre-start transaction marker."""
 
         with self._lock:
             self._start_registry_snapshots.pop(run_id, None)
+            record = self.get(run_id)
+            if record.start_transaction is not None:
+                record.start_transaction = None
+                self._write_record(record)
 
     def abort_start(self, run_id: str, *, reason: str) -> None:
         """Remove a failed start and restore the registry before that start."""
@@ -1271,38 +1397,23 @@ class RunStore:
         with self._lock:
             record = self.get(run_id)
             snapshot = self._start_registry_snapshots.pop(run_id, None)
-            registry = self._read_registry()
-            if snapshot is None:
-                entry = registry.get(record.agent_id)
-                if isinstance(entry, dict) and (
-                    (entry.get("current") or {}).get("run_id") == run_id
-                ):
-                    registry.pop(record.agent_id, None)
-            elif snapshot["agent_present"]:
-                registry[record.agent_id] = deepcopy(snapshot["agent_entry"])
-            else:
-                registry.pop(record.agent_id, None)
-
-            legacy_orchestrators = registry.get("_orchestrators")
-            if snapshot is not None and snapshot["legacy_present"]:
-                if not isinstance(legacy_orchestrators, dict):
-                    legacy_orchestrators = {}
-                    registry["_orchestrators"] = legacy_orchestrators
-                legacy_orchestrators[record.agent_id] = deepcopy(
-                    snapshot["legacy_entry"]
-                )
-            elif isinstance(legacy_orchestrators, dict):
-                legacy_orchestrators.pop(record.agent_id, None)
-                if not legacy_orchestrators:
-                    registry.pop("_orchestrators", None)
-            status_path = self.status_path(record.agent_id)
-            if snapshot is not None and snapshot["status_present"]:
-                _atomic_write_bytes(status_path, snapshot["status_content"])
-            else:
-                status_path.unlink(missing_ok=True)
+            durable_snapshot = record.start_transaction
+            if durable_snapshot is None and snapshot is not None:
+                durable_snapshot = {
+                    "agent_present": snapshot["agent_present"],
+                    "agent_entry": snapshot["agent_entry"],
+                    "legacy_present": snapshot["legacy_present"],
+                    "legacy_entry": snapshot["legacy_entry"],
+                    "status_present": snapshot["status_present"],
+                    "status_content": (
+                        base64.b64encode(snapshot["status_content"]).decode("ascii")
+                        if snapshot["status_content"] is not None
+                        else None
+                    ),
+                }
+            self._restore_start_snapshot(record, durable_snapshot)
             self._control_attached_run_ids.discard(run_id)
             shutil.rmtree(self.run_dir(run_id))
-            self._write_registry(registry)
 
     def get(self, run_id: str) -> RunRecord:
         with self._lock:

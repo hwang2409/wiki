@@ -6,6 +6,15 @@ next migration phase.
 """
 
 from .client import SupervisorClient
+from .command_log import (
+    AgentCommand,
+    CommandConflict,
+    CommandError,
+    CommandLog,
+    CommandQueue,
+    CommandReceipt,
+    decide,
+)
 from .factory import RealAdapterFactory
 from .provider import AdapterStatus, ProviderAdapter, ProviderEvent, StartRequest
 from .store import RunStore, RuntimePaths
@@ -20,6 +29,12 @@ from .types import (
 
 __all__ = [
     "AdapterStatus",
+    "AgentCommand",
+    "CommandConflict",
+    "CommandError",
+    "CommandLog",
+    "CommandQueue",
+    "CommandReceipt",
     "EventDisposition",
     "LifecycleState",
     "ProviderAdapter",
@@ -33,4 +48,5 @@ __all__ = [
     "StartRequest",
     "SupervisorClient",
     "restart_recovery_decision",
+    "decide",
 ]

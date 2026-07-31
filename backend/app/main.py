@@ -3985,6 +3985,7 @@ class SpawnReplaceIn(BaseModel):
     model: str | None = Field(default=None, max_length=64)
     kind: str | None = Field(default=None, max_length=8)
     effort: str | None = Field(default=None, max_length=16)
+    request_id: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 class SpawnWorkerIn(BaseModel):
@@ -4046,6 +4047,7 @@ class SpawnOrchestratorIn(BaseModel):
 
 class AgentArchiveIn(BaseModel):
     outcome: str = Field(pattern="^(merged|closed|abandoned)$")
+    request_id: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 class AutopilotEnableIn(BaseModel):
@@ -4232,6 +4234,7 @@ def _control_headless_agent(
     action: str,
     *,
     outcome: str | None = None,
+    request_id: str | None = None,
 ) -> dict[str, object]:
     raw_id = agent_id.strip()
     if not raw_id or not valid_agent_id(raw_id):
@@ -4248,6 +4251,8 @@ def _control_headless_agent(
     params: dict[str, object] = {"agent_id": resolved_id}
     if action == "archive":
         params["outcome"] = outcome
+    if request_id is not None:
+        params["request_id"] = request_id
     result = _supervisor_request(f"run/{action}", params)
     if not isinstance(result, dict):
         raise HTTPException(
@@ -4288,6 +4293,7 @@ def archive_agent(
         agent_id,
         "archive",
         outcome=body.outcome if body is not None else None,
+        request_id=body.request_id if body is not None else None,
     )
 
 
@@ -4404,6 +4410,7 @@ def replace_agent(
             "model": model,
             "effort": effort,
             "backend_base_url": backend_base_url,
+            "request_id": body.request_id if body is not None else None,
         },
     )
     if not isinstance(result, dict):
