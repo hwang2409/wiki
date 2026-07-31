@@ -284,9 +284,34 @@ def test_auth_verified_clears_only_matching_codex_fleet_tickets(tmp_path: Path) 
         assert notice["run_ids"] == {"WIKI-B": "run-b"}
 
 
+def test_legacy_codex_limit_cleared_removes_only_matching_ticket(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    assert store.apply_event(
+        {
+            "type": "codex_limit_no_eligible",
+            "tickets": ["WIKI-A", "WIKI-B"],
+            "reset_at": None,
+            "ts": "t1",
+        }
+    )
+    assert store.apply_event(
+        {"type": "codex_limit_cleared", "ticket": "WIKI-A", "ts": "t2"}
+    )
+    notice = _by_type(store, "codex_limit_no_eligible")
+    assert notice["tickets"] == ["WIKI-B"]
+
+
 def test_auth_verified_without_run_id_only_clears_legacy_notice(tmp_path: Path) -> None:
     store = _store(tmp_path)
     store.apply_event({"type": "codex_auth_dead_exhausted", "tickets": ["WIKI-A"], "ts": "t1"})
+    store.apply_event(
+        {
+            "type": "codex_limit_no_eligible",
+            "tickets": ["WIKI-A"],
+            "reset_at": None,
+            "ts": "t1-fleet",
+        }
+    )
     store.apply_event(
         {
             "type": "codex_auth_dead_exhausted",
@@ -306,6 +331,8 @@ def test_auth_verified_without_run_id_only_clears_legacy_notice(tmp_path: Path) 
     )
     notice = _by_type(store, "codex_auth_dead_exhausted")
     assert notice["tickets"] == ["WIKI-B"]
+    fleet_notice = _by_type(store, "codex_limit_no_eligible")
+    assert fleet_notice["tickets"] == ["WIKI-A"]
 
 
 def test_stale_auth_verified_event_keeps_revival_failure(tmp_path: Path) -> None:

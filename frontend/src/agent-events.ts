@@ -10,6 +10,7 @@ export const AGENT_REFRESH_EVENT_TYPES: ReadonlySet<string> = new Set([
   "codex_auth_dead_revival",
   "codex_auth_dead_exhausted",
   "codex_auth_verified",
+  "codex_limit_cleared",
   "claude_limit_hit",
   "claude_limit_cleared",
 ]);

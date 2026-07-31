@@ -399,17 +399,24 @@ class AccountNoticeStore:
                 else:
                     clear(key)
 
-        def remove_codex_fleet_ticket(ticket: str, run_id: str | None) -> None:
+        def remove_codex_fleet_ticket(
+            ticket: str,
+            run_id: str | None,
+            *,
+            allow_legacy: bool = False,
+        ) -> None:
             """Clear a recovered run from Codex fleet notices only."""
 
-            if not run_id:
+            if run_id is None and not allow_legacy:
                 return
             for key in ("codex:limit", "codex:rotation-failed"):
                 notice = self._notices.get(key)
                 if notice is None:
                     continue
                 stored_run_id = _reason_map(notice.get("run_ids")).get(ticket)
-                if stored_run_id != run_id:
+                if run_id is not None and stored_run_id != run_id:
+                    continue
+                if run_id is None and stored_run_id is not None:
                     continue
                 remaining = [
                     current_ticket
@@ -484,6 +491,10 @@ class AccountNoticeStore:
                         ticket,
                         run_id if isinstance(run_id, str) and run_id else None,
                     )
+        elif kind == "codex_limit_cleared":
+            ticket = event.get("ticket")
+            if isinstance(ticket, str) and ticket:
+                remove_codex_fleet_ticket(ticket, None, allow_legacy=True)
         elif kind == "claude_limit_hit":
             ticket = event.get("ticket")
             if isinstance(ticket, str) and ticket:

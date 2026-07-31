@@ -1490,6 +1490,9 @@ class WatchdogInternalState:
     # the banner leaves the pane on a later poll, the watchdog emits
     # claude_limit_cleared — the recovery proof that resolves the notice.
     claude_limited: set[tuple[str, str]] = field(default_factory=set)
+    # Legacy Codex panes have no run_id. Track their ticket/window identity so
+    # a recovered pane can clear its ticket from a durable fleet notice.
+    codex_limited: set[tuple[str, str]] = field(default_factory=set)
 
 
 AUTH_DEAD_MAX_ATTEMPTS = 3
@@ -1512,16 +1515,39 @@ async def _check_once(
 
     codex_hits: list[tuple[WorkerEntry, str]] = []
     live_codex_workers: list[WorkerEntry] = []
+    live_legacy_codex_identities = {
+        (worker.ticket, worker.window)
+        for worker in codex_workers
+        if worker.window in live and not worker.run_id
+    }
+    watch.codex_limited.intersection_update(live_legacy_codex_identities)
+    codex_recovered: list[WorkerEntry] = []
     auth_dead: list[WorkerEntry] = []
     for worker in codex_workers:
         if worker.window not in live:
             continue
         live_codex_workers.append(worker)
         pane = await asyncio.to_thread(tmux_capture, worker.window, 80)
+        identity = (worker.ticket, worker.window)
         if detect_codex_limit(pane):
             codex_hits.append((worker, pane))
-        elif detect_codex_auth_dead(pane):
-            auth_dead.append(worker)
+            if not worker.run_id:
+                watch.codex_limited.add(identity)
+        else:
+            if not worker.run_id and identity in watch.codex_limited:
+                watch.codex_limited.discard(identity)
+                codex_recovered.append(worker)
+            if detect_codex_auth_dead(pane):
+                auth_dead.append(worker)
+
+    for worker in codex_recovered:
+        await emit({
+            "type": "codex_limit_cleared",
+            "provider": "codex",
+            "ticket": worker.ticket,
+            "window": worker.window,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        })
 
     # Auth-dead workers get killed + resumed on the CURRENT auth.json — no
     # account swap, so no debounce interaction with the rotation loop below.

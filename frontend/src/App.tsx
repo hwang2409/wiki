@@ -1406,6 +1406,7 @@ export default function App() {
   const closedTicketsRef = useRef<Set<string>>(new Set());
   const filesRequestTrackerRef = useRef(new WorkspaceRequestTracker());
   const workspaceRefreshVersionRef = useRef(0);
+  const workspaceDiscoveryStartedRef = useRef(false);
 
   function nextPaneId() {
     paneIdRef.current += 1;
@@ -1521,11 +1522,14 @@ export default function App() {
 
   useEffect(() => {
     if (!shouldDiscoverWorkspaces(sidebarTab, switcherOpen, mode === "agents")) {
-      setWorkspaceDiscoveryReady(false);
       return;
     }
     let ignore = false;
-    setWorkspaceDiscoveryReady(false);
+    const backgroundRefresh = workspaceDiscoveryStartedRef.current;
+    workspaceDiscoveryStartedRef.current = true;
+    if (!backgroundRefresh) {
+      setWorkspaceDiscoveryReady(false);
+    }
     listWorkspaces()
       .then((result) => {
         if (ignore) return;
@@ -1533,10 +1537,15 @@ export default function App() {
         filesRequestTrackerRef.current.invalidate();
         setWorkspaces(result.workspaces);
         setWorkspaceDiscoveryError(null);
-        setWorkspaceDiscoveryReady(true);
-        setActiveWorkspace((current) =>
-          reconcileWorkspaceState(result.workspaces, current, {}).activeWorkspace
+        const reconciled = reconcileWorkspaceState(result.workspaces, activeWorkspace, {});
+        const activeWorkspaceIsLive = result.workspaces.some(
+          (workspace) =>
+            workspace.id === reconciled.activeWorkspace &&
+            workspace.live &&
+            Boolean(workspace.root),
         );
+        setWorkspaceDiscoveryReady(activeWorkspaceIsLive);
+        setActiveWorkspace(reconciled.activeWorkspace);
         setFilesByWorkspace((current) =>
           reconcileWorkspaceState(result.workspaces, "wiki", current).cache
         );
@@ -1552,12 +1561,14 @@ export default function App() {
             ? error.message
             : "Could not reach workspace discovery.";
         setWorkspaceDiscoveryError(message);
-        setWorkspaceDiscoveryReady(false);
+        if (!backgroundRefresh) {
+          setWorkspaceDiscoveryReady(false);
+        }
       });
     return () => {
       ignore = true;
     };
-  }, [workspaceDiscoveryNonce, sidebarTab, switcherOpen, mode]);
+  }, [workspaceDiscoveryNonce, sidebarTab, switcherOpen, mode, activeWorkspace]);
 
   useEffect(() => {
     localStorage.setItem(

@@ -16,6 +16,7 @@ from tempfile import TemporaryDirectory
 from unittest import mock
 
 from backend.app import accounts
+from backend.app.account_notices import AccountNoticeStore
 
 
 REAL_LIMIT_STRING = (
@@ -1149,6 +1150,54 @@ class WatchdogLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(emitted[0]["type"], "codex_limit_no_eligible")
             self.assertIn("WIKI-15", emitted[0]["tickets"])
             self.assertEqual(emitted[0]["run_ids"], {"WIKI-15": "run-wiki-15"})
+
+    async def test_legacy_codex_pane_recovery_clears_durable_no_eligible_notice(self) -> None:
+        with _EnvOverride() as paths:
+            (paths["accounts"] / "alpha").mkdir()
+            (paths["accounts"] / "alpha" / "auth.json").write_text("{}")
+            paths["auth"].write_text("{}")
+            worker = accounts.WorkerEntry(
+                ticket="WIKI-15",
+                window="@42",
+                worktree="/tmp/wt-15",
+                log="/tmp/cdx-WIKI-15.log",
+                kind="cdx",
+                role="implement",
+                orch=None,
+            )
+            pane_text = REAL_LIMIT_STRING
+            store = AccountNoticeStore(path=paths["root"] / "notices.json")
+            emitted: list[dict] = []
+
+            async def emit(evt: dict) -> None:
+                emitted.append(evt)
+                store.apply_event(evt)
+
+            def iter_worker_kind(kind: str) -> list[accounts.WorkerEntry]:
+                return [worker] if kind == "cdx" else []
+
+            with mock.patch.object(accounts, "tmux_live_windows", lambda: {"@42"}), \
+                 mock.patch.object(accounts, "iter_workers", iter_worker_kind), \
+                 mock.patch.object(accounts, "tmux_capture", lambda w, lines=60: pane_text), \
+                 mock.patch.object(accounts, "read_state", return_value=accounts.AccountState(active="alpha")), \
+                 mock.patch.object(accounts, "ensure_state_initialized", side_effect=lambda state: state), \
+                 mock.patch.object(
+                     accounts,
+                     "rotate_locked",
+                     side_effect=accounts.NoEligibleAccountError("no eligible account"),
+                 ):
+                watch = accounts.WatchdogInternalState()
+                await accounts._check_once(watch, emit)
+                self.assertEqual(store.snapshot()[0]["tickets"], ["WIKI-15"])
+                pane_text = "> working on the next step"
+                await accounts._check_once(watch, emit)
+
+            self.assertEqual(
+                [event["type"] for event in emitted],
+                ["codex_limit_no_eligible", "codex_limit_cleared"],
+            )
+            self.assertEqual(emitted[1]["ticket"], "WIKI-15")
+            self.assertEqual(store.snapshot(), [])
 
     async def test_no_eligible_lists_every_live_codex_worker(self) -> None:
         workers = [

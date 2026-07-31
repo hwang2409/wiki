@@ -214,6 +214,117 @@ async function runTopologyScenario() {
   await context.close();
 }
 
+async function runTopologyDialogScenario({ failure }) {
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  let workspaceRequests = 0;
+  let releaseRefresh;
+  const refreshReleased = new Promise((resolve) => {
+    releaseRefresh = resolve;
+  });
+
+  await page.route("**/api/workspaces", async (route) => {
+    workspaceRequests += 1;
+    if (workspaceRequests <= 2) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          workspaces: [{ id: "wiki", root: "/tmp/verified-workspace", live: true }],
+        }),
+      });
+      return;
+    }
+    if (failure) {
+      await route.fulfill({
+        status: 503,
+        contentType: "application/json",
+        body: JSON.stringify({ detail: "topology refresh failed" }),
+      });
+      return;
+    }
+    await refreshReleased;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        workspaces: [{ id: "wiki", root: "/tmp/verified-workspace", live: true }],
+      }),
+    });
+  });
+  await page.route("**/api/models", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        models: [{
+          id: "claude-sonnet",
+          label: "Claude Sonnet",
+          kind: "cc",
+          provider: "claude",
+          supports_reasoning_effort: false,
+          default_worker: false,
+          default_orchestrator: true,
+        }],
+      }),
+    });
+  });
+  await page.addInitScript(() => {
+    class TestEventSource {
+      static instance;
+      onmessage = null;
+      constructor() {
+        TestEventSource.instance = this;
+      }
+      close() {}
+    }
+    window.EventSource = TestEventSource;
+    window.__wikiEmitAgentEvent = (payload) => {
+      TestEventSource.instance?.onmessage?.({ data: JSON.stringify(payload) });
+    };
+    localStorage.setItem("wiki-sidebar-visible", "true");
+    localStorage.setItem("wiki-sidebar-tab", "agents");
+    localStorage.removeItem("wiki-window-layout-v2");
+  });
+
+  const initialWorkspaceResponse = page.waitForResponse("**/api/workspaces");
+  await page.goto(`${backend.baseUrl}/`, { waitUntil: "domcontentloaded" });
+  await page.waitForSelector('.sidebar-mode[data-mode="agents"]');
+  await initialWorkspaceResponse;
+  const agentsWorkspaceResponse = page.waitForResponse("**/api/workspaces");
+  await page.getByRole("button", { name: "Agents", exact: true }).click();
+  await agentsWorkspaceResponse;
+  await page.getByRole("button", { name: "Spawn orchestrator", exact: true }).click();
+  await page.getByLabel("Name").fill("wiki-lead");
+  await page.getByRole("button", { name: /Advanced/ }).click();
+
+  const projectDir = page.getByPlaceholder("/tmp/project");
+  const launch = page.getByRole("button", { name: /^Launch$/ });
+  await projectDir.waitFor();
+  if ((await projectDir.inputValue()) !== "/tmp/verified-workspace" || (await launch.isDisabled())) {
+    throw new Error("verified workspace root did not enable the untouched spawn dialog");
+  }
+
+  const refreshRequest = page.waitForRequest("**/api/workspaces");
+  const refreshResponse = page.waitForResponse("**/api/workspaces");
+  await page.evaluate(() => window.__wikiEmitAgentEvent({ type: "agents", tickets: ["WIKI-REFRESH"] }));
+  await refreshRequest;
+  if ((await projectDir.inputValue()) !== "/tmp/verified-workspace" || (await launch.isDisabled())) {
+    throw new Error(`topology ${failure ? "failure" : "delay"} cleared the verified spawn root`);
+  }
+  if (failure) {
+    await refreshResponse;
+  } else {
+    releaseRefresh();
+    await refreshResponse;
+    await page.waitForTimeout(100);
+  }
+  if ((await projectDir.inputValue()) !== "/tmp/verified-workspace" || (await launch.isDisabled())) {
+    throw new Error(`topology ${failure ? "failure" : "delay"} changed spawn readiness`);
+  }
+  await context.close();
+}
+
 try {
   await fs.writeFile(fixtures.registryPath, "{}\n");
   await fs.writeFile(fixtures.queuePath, "{}\n");
@@ -222,6 +333,8 @@ try {
   await runScenario({ failure: false, customPath: "/tmp/custom-delayed-workspace" });
   await runScenario({ failure: true, customPath: "/tmp/custom-failed-workspace" });
   await runTopologyScenario();
+  await runTopologyDialogScenario({ failure: false });
+  await runTopologyDialogScenario({ failure: true });
 } finally {
   if (browser) await browser.close();
   if (backend) await backend.stop();
