@@ -97,6 +97,7 @@ import { createStateKeyWriteBarrier, deletePaneStateEntries } from "./pane-state
 import { Timestamp } from "./timestamp";
 import { StatusBadge } from "./status-badge";
 import { BoundedPreview } from "./transcript-preview";
+import { STREAM_CLAMP_PX, StreamClamp } from "./stream-clamp";
 import { CodexStreamHighlights } from "./codex-stream-renderers";
 import { markerRule } from "./hook-message-registry";
 import type { MarkerSeverity } from "./hook-message-registry";
@@ -1044,13 +1045,15 @@ export function SessionRunDetails({
                   <span>{request.request_kind}</span>
                   <span>raw #{request.raw_seq}</span>
                 </summary>
-                <pre>{JSON.stringify(request.payload, null, 2)}</pre>
+                <StreamClamp>
+                  <pre>{JSON.stringify(request.payload, null, 2)}</pre>
+                </StreamClamp>
               </details>
             ))}
           </div>
         ) : null}
         {inspector ? (
-          <div className="session-provider-events">
+          <div className="session-provider-events" style={{ maxHeight: STREAM_CLAMP_PX }}>
             {inspector.events.length > 0 ? (
               inspector.events
                 .slice()
@@ -1064,7 +1067,9 @@ export function SessionRunDetails({
                       {event.lifecycle_state ? <span>→ {event.lifecycle_state}</span> : null}
                       <span>raw #{event.raw_seq}</span>
                     </summary>
-                    <pre>{JSON.stringify(event.payload, null, 2)}</pre>
+                    <StreamClamp>
+                      <pre>{JSON.stringify(event.payload, null, 2)}</pre>
+                    </StreamClamp>
                   </details>
                 ))
             ) : pendingRequests.length === 0 ? (
@@ -1893,8 +1898,10 @@ function ActivityGroupBase({
               if (!event.text) return null;
               return (
                 <div className="session-thinking" key={groupKey + index}>
-                  {event.encrypted ? <span className="session-thinking-chip">encrypted</span> : null}
-                  {event.text}
+                  <StreamClamp>
+                    {event.encrypted ? <span className="session-thinking-chip">encrypted</span> : null}
+                    {event.text}
+                  </StreamClamp>
                 </div>
               );
             })}

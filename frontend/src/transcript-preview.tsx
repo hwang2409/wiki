@@ -2,8 +2,7 @@ import { useCallback, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 
 import { hasAnsi, renderAnsi } from "./ansi";
-
-const PREVIEW_LINE_LIMIT = 6;
+import { STREAM_CLAMP_LINES } from "./stream-clamp";
 
 function byteLength(text: string): number {
   if (typeof TextEncoder !== "undefined") return new TextEncoder().encode(text).length;
@@ -81,7 +80,7 @@ type BoundedPreviewProps = {
 export function BoundedPreview({
   text,
   label,
-  previewLines = PREVIEW_LINE_LIMIT,
+  previewLines = STREAM_CLAMP_LINES,
   ansi = false,
   showSummary = true,
   className,
