@@ -1266,6 +1266,76 @@ class WatchdogLoopTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(store.snapshot(), [])
 
+    async def test_legacy_codex_recovery_restores_after_restart_and_window_gap(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = AccountNoticeStore(path=Path(tmp) / "notices.json")
+            store.apply_event(
+                {
+                    "type": "codex_limit_no_eligible",
+                    "tickets": ["WIKI-15", "WIKI-16"],
+                    "reset_at": None,
+                    "ts": "t1",
+                }
+            )
+            store.apply_event(
+                {
+                    "type": "codex_rotation_failed",
+                    "error": "rotation failed",
+                    "tickets": ["WIKI-15", "WIKI-16"],
+                    "ts": "t2",
+                }
+            )
+            workers = [
+                accounts.WorkerEntry(
+                    ticket="WIKI-15",
+                    window="@42",
+                    worktree="/tmp/wt-15",
+                    log="/tmp/cdx-WIKI-15.log",
+                    kind="cdx",
+                    role="implement",
+                    orch=None,
+                ),
+                accounts.WorkerEntry(
+                    ticket="WIKI-16",
+                    window="@43",
+                    worktree="/tmp/wt-16",
+                    log="/tmp/cdx-WIKI-16.log",
+                    kind="cdx",
+                    role="implement",
+                    orch=None,
+                ),
+            ]
+            live_windows: set[str] = set()
+            emitted: list[dict] = []
+
+            async def emit(evt: dict) -> None:
+                emitted.append(evt)
+                store.apply_event(evt)
+
+            def iter_worker_kind(kind: str) -> list[accounts.WorkerEntry]:
+                return workers if kind == "cdx" else []
+
+            with mock.patch.object(accounts, "AccountNoticeStore", return_value=store), mock.patch.object(
+                accounts, "tmux_live_windows", lambda: live_windows
+            ), mock.patch.object(accounts, "iter_workers", iter_worker_kind), mock.patch.object(
+                accounts, "tmux_capture", lambda window, lines=60: "> working"
+            ):
+                # A new watchdog state starts while the legacy windows are
+                # temporarily absent. It must retain durable tracking.
+                watch = accounts.WatchdogInternalState()
+                await accounts._check_once(watch, emit)
+                self.assertEqual(emitted, [])
+
+                live_windows.update({"@42", "@43"})
+                await accounts._check_once(watch, emit)
+
+            self.assertEqual(
+                {event["ticket"] for event in emitted},
+                {"WIKI-15", "WIKI-16"},
+            )
+            self.assertEqual(len(emitted), 2)
+            self.assertEqual(store.snapshot(), [])
+
     async def test_no_eligible_lists_every_live_codex_worker(self) -> None:
         workers = [
             accounts.WorkerEntry(

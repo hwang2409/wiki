@@ -24,6 +24,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Awaitable, Callable, Iterator
 
+from .account_notices import AccountNoticeStore
+
 
 # ---------------------------------------------------------------------------
 # Env-overridable paths.
@@ -1495,6 +1497,31 @@ class WatchdogInternalState:
     codex_limited: dict[str, str] = field(default_factory=dict)
 
 
+def _restore_legacy_codex_tickets() -> set[str]:
+    """Restore legacy tickets from unresolved durable fleet notices."""
+
+    try:
+        notices = AccountNoticeStore().snapshot()
+    except Exception:  # noqa: BLE001 — notice storage must not stop watchdogs
+        return set()
+
+    tickets: set[str] = set()
+    for notice in notices:
+        if notice.get("type") not in {"codex_limit_no_eligible", "codex_rotation_failed"}:
+            continue
+        notice_tickets = notice.get("tickets")
+        if not isinstance(notice_tickets, list):
+            continue
+        run_ids = notice.get("run_ids")
+        run_id_map = run_ids if isinstance(run_ids, dict) else {}
+        for ticket in notice_tickets:
+            if not isinstance(ticket, str) or not ticket:
+                continue
+            if not isinstance(run_id_map.get(ticket), str) or not run_id_map.get(ticket):
+                tickets.add(ticket)
+    return tickets
+
+
 AUTH_DEAD_MAX_ATTEMPTS = 3
 AUTH_DEAD_WINDOW_SECONDS = 3600.0
 AUTH_DEAD_COOLDOWN_SECONDS = 300.0
@@ -1515,13 +1542,13 @@ async def _check_once(
 
     codex_hits: list[tuple[WorkerEntry, str]] = []
     live_codex_workers: list[WorkerEntry] = []
+    for ticket in _restore_legacy_codex_tickets():
+        watch.codex_limited.setdefault(ticket, "")
     live_legacy_codex_workers = {
         worker.ticket: worker.window
         for worker in codex_workers
         if worker.window in live and not worker.run_id
     }
-    for ticket in set(watch.codex_limited) - set(live_legacy_codex_workers):
-        watch.codex_limited.pop(ticket, None)
     codex_recovered: list[WorkerEntry] = []
     auth_dead: list[WorkerEntry] = []
     for worker in codex_workers:
