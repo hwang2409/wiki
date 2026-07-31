@@ -23,7 +23,7 @@ Chain:
                                     self-referencing). Any non-canonical
                                     shape → file rejected.
                                     stbl -> stsd + boxes    stsd rebuilt from parsed sample
-                                    entries (avc1/mp4a); other stbl
+                                    entries (avc1); other stbl
                                     boxes header-validated but their
                                     bodies are BOUNDED by the parsed
                                     size (fully parsing every codec
@@ -75,13 +75,7 @@ class _Mp4SampleRange:
     start: int
     end: int
     description_index: int
-    codec_config: tuple[int, set[int], bool] | "_Mp4AacConfig" | None
-
-
-@dataclass(frozen=True)
-class _Mp4AacConfig:
-    sampling_index: int
-    channel_configuration: int
+    codec_config: tuple[int, set[int], bool] | None
 
 
 @dataclass(frozen=True)
@@ -89,7 +83,7 @@ class _Mp4TrackSamplePlan:
     chunks_by_mdat: dict[
         int,
         tuple[tuple[int, int, int, int, int, tuple[int, set[int], bool]
-                    | _Mp4AacConfig | None, int], ...],
+                    | None, int], ...],
     ]
     sample_size: int
     sample_sizes: memoryview | None
@@ -103,10 +97,8 @@ _MP4_TOPLEVEL_PLAYBACK: Final = {
 }
 # Sample-entry types we know how to rebuild field-by-field. Unknown types
 # fall to strict-subset reject.
-# avc1 and AAC-LC mp4a have complete field-level codec and sample scrubbers.
 # avc3 has in-band parameter sets, and other codecs need separate parsers.
 _MP4_VISUAL_ENTRIES: Final = {b"avc1"}
-_MP4_AUDIO_ENTRIES: Final = {b"mp4a"}
 # Inner boxes inside a sample entry that we accept. Each one gets its
 # Every sample-entry inner box in this allowlist has a field-level
 # rebuild via struct.pack — no raw body copy path remains for anything
@@ -115,23 +107,21 @@ _MP4_AUDIO_ENTRIES: Final = {b"mp4a"}
 # and the encryption tree sinf/schm/schi/tenc) are OUT — files using
 # them are rejected under strict-subset acceptance.
 _MP4_SAMPLE_ENTRY_INNER_ALLOWED: Final = {
-    b"avcC", b"btrt", b"pasp", b"colr", b"esds",
+    b"avcC", b"btrt", b"pasp", b"colr",
 }
 _MP4_SAMPLE_ENTRY_REQUIRED_CONFIG: Final = {
     b"avc1": b"avcC",
-    b"mp4a": b"esds",
 }
 _MP4_MAX_SAMPLES: Final = 16_777_216
 _MP4_AVC_SAMPLE_NAL_TYPES: Final = {1, 5, 6}
 _MP4_MAX_BOXES_PER_CONTAINER: Final = 4096
 _MP4_MAX_CHUNKS: Final = 65_536
 _MP4_MAX_TRACK_MDAT_GROUPS: Final = 65_536
-_MP4_AAC_METADATA_TAIL_BYTES: Final = 4096
 # Tables that are rebuilt entry-by-entry are capped separately from sample
 # tables. This keeps their temporary Python object lists bounded.
 _MP4_MAX_TABLE_ENTRIES: Final = 4096
 _MP4_BRAND_ALLOWLIST: Final = frozenset({
-    b"avc1", b"isom", b"iso2", b"iso5", b"iso6", b"mp41", b"mp42", b"mp4a",
+    b"avc1", b"isom", b"iso2", b"iso5", b"iso6", b"mp41", b"mp42",
 })
 _MP4_MAX_COMPATIBLE_BRANDS: Final = 32
 # Additional stbl children beyond stsd. Every allowed type below has a
@@ -261,11 +251,7 @@ def scrub_mp4(data: bytes) -> MediaScrubResult:
                 start = sample_start - atom.body_start
                 end = sample_end - atom.body_start
                 sample = data[sample_start:sample_end]
-                if isinstance(sample_range.codec_config, _Mp4AacConfig):
-                    sample = _canonicalise_aac_sample(
-                        sample, sample_range.codec_config,
-                    )
-                elif sample_range.codec_config is not None:
+                if sample_range.codec_config is not None:
                     sample = _canonicalise_avc_sample(
                         sample, *sample_range.codec_config,
                     )
@@ -343,7 +329,7 @@ def _build_sample_plan(
     track_mdat_groups = 0
     ownership: list[
         tuple[int, int, int, int, int,
-              tuple[int, set[int], bool] | _Mp4AacConfig | None, int]
+              tuple[int, set[int], bool] | None, int]
     ] = []
     mdat_starts = [start for start, _end in mdat_ranges]
     for moov in (atom for atom in top_atoms if atom.type == b"moov"):
@@ -516,7 +502,7 @@ def _build_sample_plan_from_stbl(
     stsc_cursor = 0
     chunks_by_mdat: dict[int, list[tuple[
         int, int, int, int, int,
-        tuple[int, set[int], bool] | _Mp4AacConfig | None, int,
+        tuple[int, set[int], bool] | None, int,
     ]]] = {}
     for chunk_number in range(1, chunk_count + 1):
         stsc_cursor, samples_per_chunk, description_index, _ = stsc_for_chunk(
@@ -593,8 +579,12 @@ def _iter_sample_plan_ranges(
 
 def _sample_description_configs(
     data: bytes, body_start: int, body_end: int, handler_type: bytes,
-) -> list[tuple[int, set[int], bool] | _Mp4AacConfig | None]:
+) -> list[tuple[int, set[int], bool] | None]:
     """Return one codec configuration per stsd sample-description index."""
+    if handler_type != b"vide":
+        raise MediaScrubError(
+            "mp4 audio tracks, including mp4a, are deferred to WIKI-225"
+        )
     stsd_atoms = [
         atom for atom in _parse_container(data, body_start, body_end)
         if atom.type == b"stsd"
@@ -611,7 +601,7 @@ def _sample_description_configs(
         raise MediaScrubError(
             f"mp4 stsd entry count exceeds {_MP4_MAX_TABLE_ENTRIES}"
         )
-    entries: list[tuple[int, set[int], bool] | _Mp4AacConfig | None] = []
+    entries: list[tuple[int, set[int], bool] | None] = []
     offset = 8
     for _ in range(entry_count):
         if offset + 8 > len(body):
@@ -621,18 +611,15 @@ def _sample_description_configs(
         if entry_size < 8 or offset + entry_size > len(body):
             raise MediaScrubError("mp4 stsd entry size out of bounds")
         entry = body[offset:offset + entry_size]
-        expected_entry_type = b"avc1" if handler_type == b"vide" else b"mp4a"
+        expected_entry_type = b"avc1"
         if entry_type != expected_entry_type:
             raise MediaScrubError(
                 f"mp4 {handler_type.decode('ascii')} track cannot use "
                 f"{entry_type.decode('ascii', 'replace')} sample entry; "
                 "outside scrubber scope"
             )
-        if entry_type == b"avc1":
-            config, _dimensions = _parse_avc_sample_config_from_entry(entry)
-            entries.append(config)
-        else:
-            entries.append(_parse_aac_sample_config_from_entry(entry))
+        config, _dimensions = _parse_avc_sample_config_from_entry(entry)
+        entries.append(config)
         offset += entry_size
     return entries
 
@@ -720,48 +707,6 @@ def _parse_avc_sample_config(
     )
 
 
-def _parse_aac_sample_config_from_entry(entry: bytes) -> _Mp4AacConfig:
-    esds_body: bytes | None = None
-    for box_type, box_body in _iter_sample_entry_inner_boxes(entry, 16 + 20):
-        if box_type == b"esds":
-            if esds_body is not None:
-                raise MediaScrubError("mp4 mp4a sample entry has duplicate esds")
-            esds_body = box_body
-    if esds_body is None:
-        raise MediaScrubError("mp4 mp4a sample entry requires exactly one esds")
-    return _parse_aac_config_from_esds(esds_body)
-
-
-def _parse_aac_config_from_esds(body: bytes) -> _Mp4AacConfig:
-    if len(body) < 4:
-        raise MediaScrubError("mp4 esds body too short")
-    _validate_fullbox_flags(b"esds", body[1:4])
-    tag, es_body, offset = _read_mp4_descriptor(body, 4, len(body))
-    if tag != 0x03 or offset != len(body) or len(es_body) < 3:
-        raise MediaScrubError("mp4 esds requires exactly one ES descriptor")
-    if es_body[2] != 0:
-        raise MediaScrubError("mp4 esds optional ES descriptor fields are unsupported")
-    decoder_tag, decoder_body, offset = _read_mp4_descriptor(
-        es_body, 3, len(es_body),
-    )
-    sl_tag, sl_body, offset = _read_mp4_descriptor(es_body, offset, len(es_body))
-    if offset != len(es_body) or decoder_tag != 0x04 or sl_tag != 0x06:
-        raise MediaScrubError("mp4 esds requires decoder and SL descriptors")
-    if sl_body != b"\x02" or len(decoder_body) < 13:
-        raise MediaScrubError("mp4 esds descriptors are not canonical")
-    if decoder_body[0] != 0x40 or decoder_body[1] != 0x15:
-        raise MediaScrubError("mp4 esds decoder descriptor is not AAC audio")
-    config_tag, config_body, config_end = _read_mp4_descriptor(
-        decoder_body, 13, len(decoder_body),
-    )
-    if config_tag != 0x05 or config_end != len(decoder_body):
-        raise MediaScrubError("mp4 esds requires exactly one DecoderSpecificInfo")
-    _canonical, sampling_index, channel_configuration = _canonical_aac_lc_config(
-        config_body,
-    )
-    return _Mp4AacConfig(sampling_index, channel_configuration)
-
-
 def _canonicalise_avc_sample(
     sample: bytes, length_size: int, pps_ids: set[int], require_pps: bool,
 ) -> bytes:
@@ -802,240 +747,6 @@ def _canonicalise_avc_sample(
     if nal_count == 0:
         raise MediaScrubError("mp4 AVC sample has no NAL units")
     return bytes(output)
-
-
-class _AacBitReader:
-    __slots__ = ("data", "bit_pos")
-
-    def __init__(self, data: bytes) -> None:
-        self.data = data
-        self.bit_pos = 0
-
-    def read(self, width: int) -> int:
-        if width < 0 or self.bit_pos + width > len(self.data) * 8:
-            raise MediaScrubError("mp4 AAC raw_data_block is truncated")
-        value = 0
-        for _ in range(width):
-            value = (value << 1) | (
-                (self.data[self.bit_pos // 8] >> (7 - self.bit_pos % 8)) & 1
-            )
-            self.bit_pos += 1
-        return value
-
-    def remaining(self) -> int:
-        return len(self.data) * 8 - self.bit_pos
-
-
-class _AacBitWriter:
-    __slots__ = ("data", "bit_pos")
-
-    def __init__(self) -> None:
-        self.data = bytearray()
-        self.bit_pos = 0
-
-    def write(self, value: int, width: int) -> None:
-        if value < 0 or value >= (1 << width):
-            raise MediaScrubError("mp4 AAC canonical bit value is out of range")
-        for shift in range(width - 1, -1, -1):
-            if self.bit_pos % 8 == 0:
-                self.data.append(0)
-            self.data[-1] |= ((value >> shift) & 1) << (7 - self.bit_pos % 8)
-            self.bit_pos += 1
-
-    def to_bytes(self) -> bytes:
-        return bytes(self.data)
-
-
-def _aac_copy_bits(
-    writer: _AacBitWriter, data: bytes, start_bit: int, end_bit: int,
-) -> None:
-    if writer.bit_pos % 8 == 0:
-        full_bytes = (end_bit - start_bit) // 8
-        if full_bytes:
-            if start_bit % 8 == 0:
-                start_byte = start_bit // 8
-                writer.data.extend(data[start_byte:start_byte + full_bytes])
-            else:
-                start_byte = start_bit // 8
-                shift = start_bit % 8
-                source = int.from_bytes(
-                    data[start_byte:start_byte + full_bytes + 1], "big",
-                )
-                source_bits = (full_bytes + 1) * 8
-                value = (source >> (source_bits - shift - full_bytes * 8))
-                writer.data.extend(
-                    (value & ((1 << (full_bytes * 8)) - 1)).to_bytes(
-                        full_bytes, "big",
-                    )
-                )
-            writer.bit_pos += full_bytes * 8
-            start_bit += full_bytes * 8
-    reader = _AacBitReader(data)
-    reader.bit_pos = start_bit
-    while reader.bit_pos < end_bit:
-        writer.write(reader.read(1), 1)
-
-
-def _aac_parse_ics_header(reader: _AacBitReader) -> tuple[int, int, int]:
-    if reader.read(1) != 0:
-        raise MediaScrubError("mp4 AAC ICS reserved bit is set")
-    window_sequence = reader.read(2)
-    reader.read(1)  # window_shape
-    if window_sequence == 2:  # EIGHT_SHORT_SEQUENCE
-        max_sfb = reader.read(4)
-        grouping = reader.read(7)  # scale_factor_grouping
-        groups = 1 + sum(1 for bit in range(7) if not (grouping & (1 << bit)))
-    else:
-        max_sfb = reader.read(6)
-        reader.read(1)  # predictor_data_present; bounded legacy AAC-LC tolerance
-        groups = 1
-    if max_sfb > 51:
-        raise MediaScrubError("mp4 AAC max_sfb is outside AAC-LC bounds")
-    return window_sequence, max_sfb, groups
-
-
-def _aac_bits(data: bytes, bit_pos: int, width: int) -> int:
-    reader = _AacBitReader(data)
-    reader.bit_pos = bit_pos
-    return reader.read(width)
-
-
-def _aac_zero_padding_after(data: bytes, bit_pos: int) -> bool:
-    return all(_aac_bits(data, pos, 1) == 0 for pos in range(bit_pos, len(data) * 8))
-
-
-def _aac_is_id_end(data: bytes, bit_pos: int) -> bool:
-    return (
-        bit_pos + 3 <= len(data) * 8
-        and _aac_bits(data, bit_pos, 3) == 7
-        and len(data) * 8 - bit_pos - 3 <= 7
-        and _aac_zero_padding_after(data, bit_pos + 3)
-    )
-
-
-def _aac_skip_metadata_element(data: bytes, bit_pos: int) -> int | None:
-    if bit_pos + 7 > len(data) * 8:
-        return None
-    element_type = _aac_bits(data, bit_pos, 3)
-    if element_type not in (4, 6):
-        return None
-    bit_pos += 7
-    if element_type == 4:  # DSE
-        if bit_pos + 1 > len(data) * 8:
-            return None
-        byte_align = _aac_bits(data, bit_pos, 1)
-        bit_pos += 1
-        if byte_align != 1:
-            return None
-        if byte_align:
-            bit_pos = (bit_pos + 7) & ~7
-        if bit_pos + 8 > len(data) * 8:
-            return None
-        count = _aac_bits(data, bit_pos, 8)
-        bit_pos += 8
-        if count == 255:
-            if bit_pos + 8 > len(data) * 8:
-                return None
-            count += _aac_bits(data, bit_pos, 8)
-            bit_pos += 8
-        if count == 0 or count > 64:
-            return None
-        bit_pos += count * 8
-    else:  # FIL
-        count = _aac_bits(data, bit_pos - 4, 4)
-        if count == 15:
-            if bit_pos + 8 > len(data) * 8:
-                return None
-            count += _aac_bits(data, bit_pos, 8) - 1
-            bit_pos += 8
-        if count <= 0:
-            return None
-        if bit_pos + 4 > len(data) * 8 or _aac_bits(data, bit_pos, 4) != 0:
-            return None
-        bit_pos += count * 8
-    if bit_pos > len(data) * 8:
-        return None
-    return bit_pos
-
-
-def _aac_reject_late_metadata(data: bytes, channel_end: int) -> None:
-    """Reject a DSE/FIL element that terminates before raw_data_block end.
-
-    The supported subset has one channel element. A complete DSE/FIL parser
-    is used only for the tail, where its declared byte count must lead to the
-    canonical ID_END marker. This avoids treating spectral bits as metadata.
-    """
-    end_bits = len(data) * 8
-    scan_start = max(channel_end, end_bits - _MP4_AAC_METADATA_TAIL_BYTES * 8)
-    for bit_pos in range(scan_start, end_bits - 7):
-        next_pos = _aac_skip_metadata_element(data, bit_pos)
-        if next_pos is None:
-            continue
-        if _aac_is_id_end(data, next_pos):
-            raise MediaScrubError(
-                "mp4 AAC raw_data_block contains unsupported DSE/FIL metadata"
-            )
-
-
-def _canonicalise_aac_sample(sample: bytes, config: _Mp4AacConfig) -> bytes:
-    """Drop supported AAC fill metadata and validate the channel header.
-
-    The shipped subset accepts one AAC-LC channel element, optional leading
-    EXT_FILL data, and the codec payload that follows its parsed ICS header.
-    The spectral payload is audio data, not a metadata field, and is copied
-    bit-for-bit after the syntax header is validated. The output keeps the
-    original sample length by zero padding after the raw data block.
-    """
-    if not sample or len(sample) > 1_048_576:
-        raise MediaScrubError("mp4 AAC sample size is outside scrubber bounds")
-    reader = _AacBitReader(sample)
-    writer = _AacBitWriter()
-    while True:
-        element_start = reader.bit_pos
-        if reader.remaining() < 7:
-            raise MediaScrubError("mp4 AAC raw_data_block has no channel element")
-        element_type = reader.read(3)
-        element_tag = reader.read(4)
-        if element_type == 6:  # FIL
-            fill_count = element_tag
-            if fill_count == 15:
-                fill_count += reader.read(8) - 1
-            if fill_count <= 0 or fill_count * 8 > reader.remaining():
-                raise MediaScrubError("mp4 AAC fill element length is invalid")
-            extension_type = reader.read(4)
-            if extension_type != 0:  # EXT_FILL only
-                raise MediaScrubError("mp4 AAC fill extension is unsupported")
-            reader.read(13)  # EXT_FILL metadata header
-            reader.read((fill_count * 8) - 17)
-            continue
-        if element_type in (4, 5):  # DSE/PCE
-            raise MediaScrubError("mp4 AAC data and program-config elements are unsupported")
-        if element_type not in (0, 1, 3):  # SCE/CPE/LFE
-            raise MediaScrubError("mp4 AAC raw_data_block element type is unsupported")
-        if config.channel_configuration == 1 and element_type != 0:
-            raise MediaScrubError("mp4 AAC mono configuration requires an SCE")
-        if config.channel_configuration > 1 and element_type == 0:
-            raise MediaScrubError("mp4 AAC multi-channel configuration requires a CPE")
-        reader.read(8)  # global_gain
-        if element_type == 1:
-            common_window = reader.read(1)
-            if common_window:
-                _window_sequence, max_sfb, groups = _aac_parse_ics_header(reader)
-                ms_present = reader.read(2)
-                if ms_present == 1:
-                    reader.read(groups * max_sfb)
-            else:
-                _aac_parse_ics_header(reader)
-                reader.read(8)
-                _aac_parse_ics_header(reader)
-        else:
-            _aac_parse_ics_header(reader)
-        _aac_reject_late_metadata(sample, reader.bit_pos)
-        _aac_copy_bits(writer, sample, element_start, len(sample) * 8)
-        break
-    while writer.bit_pos < len(sample) * 8:
-        writer.write(0, 1)
-    return writer.to_bytes()
 
 
 # ---------------------------------------------------------------------------
@@ -1929,7 +1640,6 @@ _CANONICAL_FULLBOX_FLAGS = b"\x00\x00\x00"
 # For boxes with mask == 0, the return value is always three zero bytes.
 _MP4_FULLBOX_ALLOWED_FLAG_MASK: Final = {
     b"sidx": 0,
-    b"esds": 0,
     b"mvhd": 0,
     b"elst": 0,
     b"tkhd": 0x00000F,  # track_enabled(1) + in_movie(2) + in_preview(4) + size_is_aspect_ratio(8)
@@ -2153,7 +1863,11 @@ def _rebuild_stsd(
         if entry_size < 8 or offset + entry_size > len(payload):
             return None
         entry_bytes = payload[offset:offset + entry_size]
-        expected_entry_type = b"avc1" if handler_type == b"vide" else b"mp4a"
+        if handler_type != b"vide":
+            raise MediaScrubError(
+                "mp4 audio tracks, including mp4a, are deferred to WIKI-225"
+            )
+        expected_entry_type = b"avc1"
         if entry_type != expected_entry_type:
             raise MediaScrubError(
                 f"mp4 {handler_type.decode('ascii')} track cannot use "
@@ -2195,8 +1909,6 @@ def _rebuild_sample_entry(
     if entry_type in _MP4_VISUAL_ENTRIES:
         fixed = _rebuild_visual_sample_entry_fixed(entry_bytes)
         inner_start = 16 + 70
-    elif entry_type in _MP4_AUDIO_ENTRIES:
-        fixed, inner_start = _rebuild_audio_sample_entry_fixed(entry_bytes)
     else:
         raise MediaScrubError(
             f"mp4 sample entry type {entry_type!r} outside allowlist"
@@ -2263,29 +1975,6 @@ def _rebuild_visual_sample_entry_fixed(entry_bytes: bytes) -> bytes:
         + b"\x00" * 32
         + struct.pack(">Hh", depth, pre_defined)
     )
-
-
-def _rebuild_audio_sample_entry_fixed(entry_bytes: bytes) -> tuple[bytes, int]:
-    # 20-byte audio sample entry (v0) portion. Fields:
-    #   reserved (8 bytes: 2 uint32)
-    #   channel_count (2 bytes)
-    #   sample_size (2 bytes)
-    #   pre_defined (2 bytes)
-    #   reserved (2 bytes)
-    #   sample_rate (4 bytes, in 16.16 fixed)
-    if len(entry_bytes) < 16 + 20:
-        raise MediaScrubError("mp4 audio sample entry too short")
-    body = entry_bytes[16:16 + 20]
-    channel_count = struct.unpack(">H", body[8:10])[0]
-    sample_size = struct.unpack(">H", body[10:12])[0]
-    sample_rate_fixed = struct.unpack(">I", body[16:20])[0]
-    fixed = (
-        b"\x00" * 8
-        + struct.pack(">HH", channel_count, sample_size)
-        + b"\x00" * 4
-        + struct.pack(">I", sample_rate_fixed)
-    )
-    return fixed, 16 + 20
 
 
 # All sample-entry inner boxes now get a field-level rebuild — see the
@@ -2364,135 +2053,6 @@ def _rebuild_inner_colr(body: bytes) -> bytes:
     return _pack(b"colr", rebuilt)
 
 
-def _read_mp4_descriptor(
-    data: bytes, offset: int, end: int,
-) -> tuple[int, bytes, int]:
-    if offset >= end:
-        raise MediaScrubError("mp4 esds descriptor tag is truncated")
-    tag = data[offset]
-    offset += 1
-    length = 0
-    for index in range(4):
-        if offset >= end:
-            raise MediaScrubError("mp4 esds descriptor length is truncated")
-        value = data[offset]
-        offset += 1
-        length = (length << 7) | (value & 0x7F)
-        if not value & 0x80:
-            break
-    else:
-        raise MediaScrubError("mp4 esds descriptor length uses more than 4 bytes")
-    descriptor_end = offset + length
-    if descriptor_end > end:
-        raise MediaScrubError("mp4 esds descriptor extends past body")
-    return tag, data[offset:descriptor_end], descriptor_end
-
-
-def _pack_mp4_descriptor(tag: int, body: bytes) -> bytes:
-    if not 0 <= tag <= 0xFF:
-        raise MediaScrubError("mp4 esds descriptor tag is outside one byte")
-    groups = [len(body) & 0x7F]
-    remaining = len(body) >> 7
-    while remaining:
-        groups.append(remaining & 0x7F)
-        remaining >>= 7
-    length = bytes(
-        value | (0x80 if index < len(groups) - 1 else 0)
-        for index, value in enumerate(reversed(groups))
-    )
-    return bytes([tag]) + length + body
-
-
-def _canonical_aac_lc_config(config: bytes) -> tuple[bytes, int, int]:
-    """Validate AAC-LC AudioSpecificConfig and emit its canonical core.
-
-    The optional extension and padding bits are not needed for AAC-LC.
-    Dropping them prevents opaque descriptor slack from reaching output.
-    """
-    if not 2 <= len(config) <= 64:
-        raise MediaScrubError("mp4 mp4a AudioSpecificConfig length is outside 2..64")
-    value = int.from_bytes(config, "big")
-    bit_count = len(config) * 8
-    cursor = bit_count
-
-    def read(width: int) -> int:
-        nonlocal cursor
-        if cursor < width:
-            raise MediaScrubError("mp4 mp4a AudioSpecificConfig is truncated")
-        cursor -= width
-        return (value >> cursor) & ((1 << width) - 1)
-
-    audio_object_type = read(5)
-    if audio_object_type == 31:
-        raise MediaScrubError("mp4 mp4a extended AudioObjectType is unsupported")
-    frequency_index = read(4)
-    if frequency_index == 15:
-        raise MediaScrubError("mp4 mp4a explicit AudioSpecificConfig frequency is unsupported")
-    channel_configuration = read(4)
-    if audio_object_type != 2:
-        raise MediaScrubError(
-            f"mp4 mp4a AudioObjectType {audio_object_type} is not AAC-LC"
-        )
-    if frequency_index > 12 or channel_configuration == 0 or channel_configuration > 6:
-        raise MediaScrubError("mp4 mp4a AudioSpecificConfig fields are unsupported")
-    if read(1) != 0 or read(1) != 0 or read(1) != 0:
-        raise MediaScrubError("mp4 mp4a AAC-LC GASpecificConfig flags are unsupported")
-    canonical = (audio_object_type << 11) | (frequency_index << 7) | (channel_configuration << 3)
-    return struct.pack(">H", canonical), frequency_index, channel_configuration
-
-
-def _rebuild_inner_esds(body: bytes) -> bytes:
-    if len(body) < 4:
-        raise MediaScrubError("mp4 esds body too short")
-    flags = _validate_fullbox_flags(b"esds", body[1:4])
-    tag, es_body, offset = _read_mp4_descriptor(body, 4, len(body))
-    if tag != 0x03 or offset != len(body):
-        raise MediaScrubError("mp4 esds requires exactly one ES descriptor")
-    if len(es_body) < 3:
-        raise MediaScrubError("mp4 esds ES descriptor body too short")
-    es_id = struct.unpack(">H", es_body[:2])[0]
-    es_flags = es_body[2]
-    if es_flags != 0:
-        raise MediaScrubError("mp4 esds optional ES descriptor fields are unsupported")
-    offset = 3
-    decoder_tag, decoder_body, offset = _read_mp4_descriptor(
-        es_body, offset, len(es_body),
-    )
-    sl_tag, sl_body, offset = _read_mp4_descriptor(es_body, offset, len(es_body))
-    if offset != len(es_body) or decoder_tag != 0x04 or sl_tag != 0x06:
-        raise MediaScrubError("mp4 esds requires decoder and SL descriptors")
-    if sl_body != b"\x02":
-        raise MediaScrubError("mp4 esds SLConfigDescriptor is not canonical")
-    if len(decoder_body) < 13:
-        raise MediaScrubError("mp4 esds decoder descriptor body too short")
-    object_type = decoder_body[0]
-    stream_flags = decoder_body[1]
-    if object_type != 0x40 or stream_flags != 0x15:
-        raise MediaScrubError("mp4 esds decoder descriptor is not AAC audio")
-    buffer_size = decoder_body[2:5]
-    max_bitrate = struct.unpack(">I", decoder_body[5:9])[0]
-    avg_bitrate = struct.unpack(">I", decoder_body[9:13])[0]
-    config_tag, config_body, config_end = _read_mp4_descriptor(
-        decoder_body, 13, len(decoder_body),
-    )
-    if config_tag != 0x05 or config_end != len(decoder_body):
-        raise MediaScrubError("mp4 esds requires exactly one DecoderSpecificInfo")
-    canonical_config, _sampling_index, _channel_configuration = _canonical_aac_lc_config(
-        config_body,
-    )
-    canonical_decoder = (
-        b"\x40\x15" + buffer_size
-        + struct.pack(">II", max_bitrate, avg_bitrate)
-        + _pack_mp4_descriptor(0x05, canonical_config)
-    )
-    canonical_es = (
-        struct.pack(">HB", es_id, 0)
-        + _pack_mp4_descriptor(0x04, canonical_decoder)
-        + _pack_mp4_descriptor(0x06, b"\x02")
-    )
-    return _pack(b"esds", flags + _pack_mp4_descriptor(0x03, canonical_es))
-
-
 def _walk_sample_entry_inner_boxes(
     entry_bytes: bytes,
     inner_start: int,
@@ -2526,8 +2086,6 @@ def _walk_sample_entry_inner_boxes(
             out.extend(_rebuild_inner_pasp(body))
         elif box_type == b"colr":
             out.extend(_rebuild_inner_colr(body))
-        elif box_type == b"esds":
-            out.extend(_rebuild_inner_esds(body))
         else:  # pragma: no cover — allowlist above already gated
             raise MediaScrubError(
                 f"mp4 sample entry inner box {box_type!r} missing rebuilder"

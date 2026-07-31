@@ -106,38 +106,11 @@ class ScrubMp4RealFixtureTests(unittest.TestCase):
 
 
 class ScrubMp4MixedAacFixtureTests(unittest.TestCase):
-    """A real mixed avc1+AAC MP4 exercises both supported track types."""
+    """A real mixed avc1+AAC MP4 remains outside this PR's subset."""
 
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls.original = REAL_MIXED_MP4.read_bytes()
-        cls.result = media_scrub.scrub_video(cls.original, "video/mp4")
-
-    def test_avc1_and_mp4a_tracks_survive_rebuild(self) -> None:
-        self.assertIn(b"avc1", self.result.data)
-        self.assertIn(b"mp4a", self.result.data)
-        self.assertIn(b"esds", self.result.data)
-        self.assertEqual(len(self.result.data), len(self.original))
-
-    def test_mixed_stored_bytes_decode_cleanly_through_ffmpeg(self) -> None:
-        if FFMPEG is None:
-            self.skipTest("ffmpeg not installed")
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as handle:
-            handle.write(self.result.data)
-            stored_path = handle.name
-        try:
-            probe = subprocess.run(
-                [FFMPEG, "-v", "error", "-i", stored_path, "-f", "null", "-"],
-                capture_output=True,
-                timeout=30,
-            )
-            self.assertEqual(
-                probe.returncode,
-                0,
-                msg=f"ffmpeg mixed decode failed: {probe.stderr.decode(errors='replace')}",
-            )
-        finally:
-            Path(stored_path).unlink(missing_ok=True)
+    def test_mixed_avc1_aac_fixture_is_rejected(self) -> None:
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "audio tracks.*WIKI-225"):
+            media_scrub.scrub_video(REAL_MIXED_MP4.read_bytes(), "video/mp4")
 
 
 class ScrubMp4StructuralGuards(unittest.TestCase):
@@ -2865,60 +2838,6 @@ class Review17MediaProbeTests(unittest.TestCase):
             })
         return tracks
 
-    @classmethod
-    def _overlap_fixture(cls, *, exact: bool, swapped: bool) -> bytes:
-        payload = bytearray(REAL_MIXED_MP4.read_bytes())
-        tracks = cls._track_info(payload)
-        video = next(track for track in tracks if track["handler"] == b"vide")
-        audio = next(track for track in tracks if track["handler"] == b"soun")
-        video_offset = struct.unpack(">I", payload[int(video["stco_body"]) + 8:int(video["stco_body"]) + 12])[0]
-        audio_stco = int(audio["stco_body"])
-        payload[audio_stco + 8:audio_stco + 12] = struct.pack(">I", video_offset)
-        if exact:
-            video_stsz = int(video["stsz_body"])
-            audio_stsz = int(audio["stsz_body"])
-            video_sample_size = struct.unpack(">I", payload[video_stsz + 12:video_stsz + 16])[0]
-            payload[audio_stsz + 12:audio_stsz + 16] = struct.pack(">I", video_sample_size)
-        if not swapped:
-            return bytes(payload)
-        tracks = cls._track_info(payload)
-        moov = next(child for child in cls._children(payload, 0, len(payload)) if child[0] == b"moov")
-        first, second = sorted(
-            (track for track in tracks), key=lambda track: int(track["trak_start"]),
-        )
-        moov_body = bytes(payload[moov[3]:moov[4]])
-        first_start = int(first["trak_start"]) - moov[3]
-        first_end = int(first["trak_end"]) - moov[3]
-        second_start = int(second["trak_start"]) - moov[3]
-        second_end = int(second["trak_end"]) - moov[3]
-        swapped_body = (
-            moov_body[:first_start]
-            + moov_body[second_start:second_end]
-            + moov_body[first_end:second_start]
-            + moov_body[first_start:first_end]
-            + moov_body[second_end:]
-        )
-        payload[moov[3]:moov[4]] = swapped_body
-        return bytes(payload)
-
-    def test_cross_track_partial_overlap_is_rejected_in_both_orders(self) -> None:
-        for swapped in (False, True):
-            with self.subTest(swapped=swapped):
-                with self.assertRaisesRegex(media_scrub.MediaScrubError, "sample (?:chunks|ranges) overlap"):
-                    media_scrub.scrub_video(
-                        self._overlap_fixture(exact=False, swapped=swapped),
-                        "video/mp4",
-                    )
-
-    def test_cross_track_exact_overlap_is_rejected_in_both_orders(self) -> None:
-        for swapped in (False, True):
-            with self.subTest(swapped=swapped):
-                with self.assertRaisesRegex(media_scrub.MediaScrubError, "sample (?:chunks|ranges) overlap"):
-                    media_scrub.scrub_video(
-                        self._overlap_fixture(exact=True, swapped=swapped),
-                        "video/mp4",
-                    )
-
     def test_video_track_cannot_use_mp4a_sample_entry(self) -> None:
         payload = bytearray(REAL_MIXED_MP4.read_bytes())
         video = next(track for track in self._track_info(payload) if track["handler"] == b"vide")
@@ -2932,7 +2851,7 @@ class Review17MediaProbeTests(unittest.TestCase):
         audio = next(track for track in self._track_info(payload) if track["handler"] == b"soun")
         stsd_entry_type = int(audio["stsd_body"]) + 12
         payload[stsd_entry_type:stsd_entry_type + 4] = b"avc1"
-        with self.assertRaisesRegex(media_scrub.MediaScrubError, "soun track cannot use"):
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "audio tracks.*WIKI-225"):
             media_scrub.scrub_video(bytes(payload), "video/mp4")
 
     def test_sample_entry_child_iterator_is_bounded(self) -> None:
@@ -3014,7 +2933,7 @@ class Review18MediaProbeTests(unittest.TestCase):
             media_scrub.scrub_video(payload, "image/gif")
 
     def test_aac_only_mp4_is_rejected_without_video_track(self) -> None:
-        with self.assertRaisesRegex(media_scrub.MediaScrubError, "vide/avc1"):
+        with self.assertRaisesRegex(media_scrub.MediaScrubError, "audio tracks.*WIKI-225"):
             media_scrub.scrub_video(REAL_AAC_ONLY_MP4.read_bytes(), "video/mp4")
 
     def test_mp4_unknown_compatible_brand_is_rejected(self) -> None:
@@ -3402,81 +3321,6 @@ class Review21MediaProbeTests(unittest.TestCase):
                 Path(path).unlink(missing_ok=True)
 
         self.assertEqual(pcm_md5(scrubbed), pcm_md5(bytes(baseline)))
-
-    def test_aac_sample_marker_is_rejected_before_storage(self) -> None:
-        payload = bytearray(REAL_MIXED_MP4.read_bytes())
-        audio = next(
-            track for track in Review17MediaProbeTests._track_info(payload)
-            if track["handler"] == b"soun"
-        )
-        stsz_body = int(audio["stsz_body"])
-        stco_body = int(audio["stco_body"])
-        first_offset = struct.unpack(">I", payload[stco_body + 8:stco_body + 12])[0]
-        first_size = struct.unpack(">I", payload[stsz_body + 12:stsz_body + 16])[0]
-        marker = b"GPS-AAC-SAMPLE"
-        payload[first_offset:first_offset + first_size] = (
-            marker + b"X" * (first_size - len(marker))
-        )
-        with self.assertRaisesRegex(media_scrub.MediaScrubError, "AAC"):
-            media_scrub.scrub_video(bytes(payload), "video/mp4")
-
-    def test_aac_large_bit_copy_has_bounded_cpu_cost(self) -> None:
-        sample = b"\x5a" * (1_048_576 + 2)
-        writer = mp4_scrubber._AacBitWriter()
-        started = time.perf_counter()
-        mp4_scrubber._aac_copy_bits(writer, sample, 7, 7 + 1_048_576 * 8)
-        elapsed = time.perf_counter() - started
-        self.assertEqual(len(writer.to_bytes()), 1_048_576)
-        self.assertLess(elapsed, 1.0, f"AAC bit copy took {elapsed:.2f}s")
-
-    def test_aac_post_channel_dse_is_rejected(self) -> None:
-        payload = REAL_MIXED_MP4.read_bytes()
-        audio = next(
-            track
-            for track in Review17MediaProbeTests._track_info(payload)
-            if track["handler"] == b"soun"
-        )
-        stco_body = int(audio["stco_body"])
-        stsz_body = int(audio["stsz_body"])
-        offset = struct.unpack(">I", payload[stco_body + 8:stco_body + 12])[0]
-        size = struct.unpack(">I", payload[stsz_body + 12:stsz_body + 16])[0]
-        sample = payload[offset:offset + size]
-        end = next(
-            pos for pos in range(0, len(sample) * 8 - 2)
-            if mp4_scrubber._aac_is_id_end(sample, pos)
-        )
-        reader = mp4_scrubber._AacBitReader(sample)
-        while reader.remaining() >= 7:
-            pos = reader.bit_pos
-            if mp4_scrubber._aac_bits(sample, pos, 3) == 6:
-                tag = mp4_scrubber._aac_bits(sample, pos + 3, 4)
-                if tag == 15:
-                    count = 15 + mp4_scrubber._aac_bits(sample, pos + 7, 8) - 1
-                    reader.bit_pos = pos + 15 + count * 8
-                else:
-                    count = tag
-                    reader.bit_pos = pos + 7 + count * 8
-                if reader.bit_pos <= end:
-                    continue
-            break
-        channel_start = reader.bit_pos
-        writer = mp4_scrubber._AacBitWriter()
-        mp4_scrubber._aac_copy_bits(writer, sample, channel_start, end)
-        writer.write(4, 3)
-        writer.write(0, 4)
-        writer.write(1, 1)
-        while writer.bit_pos % 8:
-            writer.write(0, 1)
-        writer.write(4, 8)
-        writer.write(int.from_bytes(b"GPS!", "big"), 32)
-        writer.write(7, 3)
-        while writer.bit_pos % 8:
-            writer.write(0, 1)
-        mutated = writer.to_bytes()
-        with self.assertRaisesRegex(media_scrub.MediaScrubError, "DSE/FIL"):
-            mp4_scrubber._canonicalise_aac_sample(
-                mutated, mp4_scrubber._Mp4AacConfig(4, 1),
-            )
 
     def test_mvhd_and_tkhd_matrices_reject_marker_bytes(self) -> None:
         for box_type, matrix_offset in ((b"mvhd", 36), (b"tkhd", 40)):
