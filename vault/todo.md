@@ -74,7 +74,7 @@ In Progress:
 - [P1] WIKI-219 event-sourced supervisor command log — adopt t3code engine pattern: all fleet mutations become typed commands through a single-writer queue; pure decider -> events; append + project + durable request_id receipt in one sqlite txn; provider side effects in reactors consuming intent events. Structurally kills the wedge / mass-archive / split-brain / orphan-control-channel class; generalizes WIKI-163 workgraph idempotency backend-wide. Phase P1: agent-op surface (spawn/steer/archive/replace) with current registry as projection; P2 status/liveness; P3 retire snapshot mode. Coordinate with WIKI-217 (tactical fix may land first; must not fight this design). Spec /tmp/WIKI-219-spec.md + [[t3code]]. Slot after in-flight 190/168/157. ACCEPTANCE ADDITIONS from WIKI-226 R10 descope (orch 2026-07-31, /tmp/WIKI-226-REVIEW10-verdict.json): (a) pre-start snapshot + txn marker persisted with the run — restart between create() and commit_start() aborts the uncommitted start and restores prior registry/status; (b) run/start request IDs persisted with RunRecord/registry — restart or cache eviction still replays a durable successful start instead of 409
 - [P1] [PHO-14972](https://linear.app/phoebework/issue/PHO-14972): v3 workspace service and spill middleware — cdx:PHO-14972
 - [P1] [PHO-14975](https://linear.app/phoebework/issue/PHO-14975): plan v3 write registry and diff-first flow — cdx:PHO-14975
-- [P1] [PHO-14973](https://linear.app/phoebework/issue/PHO-14973): plan v3 retrieve registry and first domains — cdx:PHO-14973
+- [P1] [PHO-14973](https://linear.app/phoebework/issue/PHO-14973): implement the reviewed v3 retrieve registry plan after PHO-14972 — plan on `henry/phoebe-v3-agent`
 
 Backlog:
 
