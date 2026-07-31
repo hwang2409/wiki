@@ -2961,15 +2961,88 @@ class Review15MediaProbeTests(unittest.TestCase):
             Path(path).unlink(missing_ok=True)
 
     def test_sei_rebuilds_as_valid_filler_data_nal(self) -> None:
+        vcl = b"\x01\xf0"
         sample = struct.pack(">I", 4) + b"\x06\x11\x22\x33"
+        sample += struct.pack(">I", len(vcl)) + vcl
         rebuilt = mp4_scrubber._canonicalise_avc_sample(sample, 4, set(), False)
-        self.assertEqual(rebuilt[4:], b"\x0c\xff\xff\x80")
-        self.assertNotIn(b"\x00\x00\x00", rebuilt[4:])
+        self.assertEqual(rebuilt[4:8], b"\x0c\xff\xff\x80")
+        self.assertNotIn(b"\x00\x00\x00", rebuilt[4:8])
 
     def test_zero_byte_filler_nal_is_canonical(self) -> None:
+        vcl = b"\x01\xf0"
         sample = struct.pack(">I", 2) + b"\x0c\x80"
+        sample += struct.pack(">I", len(vcl)) + vcl
         rebuilt = mp4_scrubber._canonicalise_avc_sample(sample, 4, set(), False)
         self.assertEqual(rebuilt, sample)
+
+    def test_non_vcl_samples_are_rejected_directly(self) -> None:
+        samples = {
+            "sei": b"\x06\x11\x22",
+            "aud": b"\x09\x10",
+            "filler": b"\x0c\x80",
+        }
+        for name, nal in samples.items():
+            with self.subTest(sample=name):
+                sample = len(nal).to_bytes(4, "big") + nal
+                with self.assertRaisesRegex(
+                    media_scrub.MediaScrubError, "no coded slice"
+                ):
+                    mp4_scrubber._canonicalise_avc_sample(
+                        sample, 4, set(), False,
+                    )
+
+    @staticmethod
+    def _replace_first_sample(real: bytes, nal: bytes) -> bytes:
+        payload = bytearray(real)
+        stsz_pos = payload.find(b"stsz")
+        mdat_pos = payload.find(b"mdat")
+        assert stsz_pos > 0 and mdat_pos > 0
+        first_size_pos = stsz_pos + 16
+        first_size = struct.unpack(">I", payload[first_size_pos:first_size_pos + 4])[0]
+        sample_start = mdat_pos + 4
+        replacement = len(nal).to_bytes(4, "big") + nal
+        delta = len(replacement) - first_size
+        payload[sample_start:sample_start + first_size] = replacement
+        mdat_start = mdat_pos - 4
+        mdat_size = struct.unpack(">I", payload[mdat_start:mdat_pos])[0]
+        payload[mdat_start:mdat_start + 4] = struct.pack(">I", mdat_size + delta)
+        payload[first_size_pos:first_size_pos + 4] = struct.pack(">I", len(replacement))
+        return bytes(payload)
+
+    def test_non_vcl_samples_are_rejected_in_full_mp4(self) -> None:
+        samples = {
+            "sei": b"\x06\x11\x22",
+            "aud": b"\x09\x10",
+            "filler": b"\x0c\x80",
+        }
+        for name, nal in samples.items():
+            with self.subTest(sample=name):
+                payload = self._replace_first_sample(REAL_MP4.read_bytes(), nal)
+                with self.assertRaisesRegex(
+                    media_scrub.MediaScrubError, "no coded slice"
+                ):
+                    media_scrub.scrub_video(payload, "video/mp4")
+
+    @unittest.skipIf(FFMPEG is None or FFPROBE is None, "ffmpeg/ffprobe not installed")
+    def test_scrubbed_control_decodes_at_least_one_frame(self) -> None:
+        result = media_scrub.scrub_video(REAL_MP4.read_bytes(), "video/mp4")
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as handle:
+            handle.write(result.data)
+            path = handle.name
+        try:
+            probe = subprocess.run(
+                [
+                    FFPROBE, "-v", "error", "-count_frames", "-select_streams", "v:0",
+                    "-show_entries", "stream=nb_read_frames", "-of", "default=nw=1:nk=1",
+                    path,
+                ],
+                capture_output=True,
+                timeout=30,
+            )
+            self.assertEqual(probe.returncode, 0, probe.stderr.decode(errors="replace"))
+            self.assertGreater(int(probe.stdout.strip()), 0)
+        finally:
+            Path(path).unlink(missing_ok=True)
 
     @unittest.skipIf(FFMPEG is None, "ffmpeg not installed")
     def test_zero_byte_filler_nal_scrubs_and_decodes_in_mp4(self) -> None:
@@ -3625,7 +3698,7 @@ class Review20MediaProbeTests(unittest.TestCase):
         stsz_pos = payload.find(b"stsz")
         old_stsz_start = stsz_pos - 4
         old_stsz_size = struct.unpack(">I", payload[old_stsz_start:stsz_pos])[0]
-        stsz_body = b"\x00\x00\x00\x00" + struct.pack(">II", 7, sample_count)
+        stsz_body = b"\x00\x00\x00\x00" + struct.pack(">II", 13, sample_count)
         replacement = struct.pack(">I", 8 + len(stsz_body)) + b"stsz" + stsz_body
         payload[old_stsz_start:old_stsz_start + old_stsz_size] = replacement
         delta = len(replacement) - old_stsz_size
@@ -3662,7 +3735,7 @@ class Review20MediaProbeTests(unittest.TestCase):
         mdat_pos = payload.find(b"mdat")
         mdat_start = mdat_pos - 4
         old_mdat_size = struct.unpack(">I", payload[mdat_start:mdat_pos])[0]
-        sample = b"\x00\x00\x00\x03\x06\xff\x80"
+        sample = b"\x00\x00\x00\x03\x06\xff\x80\x00\x00\x00\x02\x01\xf0"
         mdat_body = sample * sample_count
         replacement_mdat = struct.pack(">I", 8 + len(mdat_body)) + b"mdat" + mdat_body
         payload[mdat_start:mdat_start + old_mdat_size] = replacement_mdat
@@ -3991,7 +4064,7 @@ class Review21MediaProbeTests(unittest.TestCase):
         sample_count = 65_536
         mdat_count = 4_094
         samples_per_mdat = [16] * (mdat_count - 1) + [48]
-        sample = b"\x00\x00\x00\x03\x06\xff\x80"
+        sample = b"\x00\x00\x00\x03\x06\xff\x80\x00\x00\x00\x02\x01\xf0"
         mdat_bodies = [sample * count for count in samples_per_mdat]
 
         def box(box_type: bytes, body: bytes) -> bytes:

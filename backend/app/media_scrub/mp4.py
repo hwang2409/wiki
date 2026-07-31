@@ -730,6 +730,7 @@ def _canonicalise_avc_sample(
     output = bytearray()
     offset = 0
     nal_count = 0
+    has_coded_slice = False
     while offset < len(sample):
         if offset + length_size > len(sample):
             raise MediaScrubError("mp4 AVC sample NAL length is truncated")
@@ -753,6 +754,7 @@ def _canonicalise_avc_sample(
             require_zero_ref=nal_type in (6, 9, 12),
         )
         if nal_type in (1, 5):
+            has_coded_slice = True
             pps_id = parse_slice_pps_id(nal)
             if require_pps and pps_id not in pps_ids:
                 raise MediaScrubError("mp4 AVC slice references an unknown PPS identifier")
@@ -778,6 +780,8 @@ def _canonicalise_avc_sample(
         nal_count += 1
     if nal_count == 0:
         raise MediaScrubError("mp4 AVC sample has no NAL units")
+    if not has_coded_slice:
+        raise MediaScrubError("mp4 AVC sample has no coded slice")
     return bytes(output)
 
 
