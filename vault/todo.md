@@ -70,14 +70,17 @@ In Progress:
 - [P2] WIKI-191 audio artifact kind — new `kind: audio` inline w/ waveform preview + scrubber + speed control; transcript overlay if attached. For voice memos, TTS output, transcription evidence
 - [P1] PHO-14864 land agent-bash-recs-proto on main behind feature flag (owner: phoebe orch)
 - [P1] WIKI-154 runs management productization: Agents page/cards/banners/actions/session preview/spawn+replace dialogs — Active/History hierarchy, decision-relevant fields only, IDs/tmux/log-paths in Technical details, provider/auth notices state user impact + next action
-- [P2] WIKI-194 interactive plot upgrade — kind:plot currently static (likely); make it interactive: hover-tooltip, wheel-zoom, drag-to-pan, box-select range, save-as-png. Plotly.js or D3 depending on payload shape
 - [P1] WIKI-219 event-sourced supervisor command log — adopt t3code engine pattern: all fleet mutations become typed commands through a single-writer queue; pure decider -> events; append + project + durable request_id receipt in one sqlite txn; provider side effects in reactors consuming intent events. Structurally kills the wedge / mass-archive / split-brain / orphan-control-channel class; generalizes WIKI-163 workgraph idempotency backend-wide. Phase P1: agent-op surface (spawn/steer/archive/replace) with current registry as projection; P2 status/liveness; P3 retire snapshot mode. Coordinate with WIKI-217 (tactical fix may land first; must not fight this design). Spec /tmp/WIKI-219-spec.md + [[t3code]]. Slot after in-flight 190/168/157. ACCEPTANCE ADDITIONS from WIKI-226 R10 descope (orch 2026-07-31, /tmp/WIKI-226-REVIEW10-verdict.json): (a) pre-start snapshot + txn marker persisted with the run — restart between create() and commit_start() aborts the uncommitted start and restores prior registry/status; (b) run/start request IDs persisted with RunRecord/registry — restart or cache eviction still replays a durable successful start instead of 409
+- [P1] [PHO-14963](https://linear.app/phoebework/issue/PHO-14963): implement provider-neutral v3 tool discovery and Anthropic delivery — cdx:PHO-14963
 - [P1] [PHO-14972](https://linear.app/phoebework/issue/PHO-14972): v3 workspace service and spill middleware — cdx:PHO-14972
-- [P1] [PHO-14975](https://linear.app/phoebework/issue/PHO-14975): plan v3 write registry and diff-first flow — cdx:PHO-14975
-- [P1] [PHO-14973](https://linear.app/phoebework/issue/PHO-14973): implement the reviewed v3 retrieve registry plan after PHO-14972 — plan on `henry/phoebe-v3-agent`
+- [P1] [PHO-14973](https://linear.app/phoebework/issue/PHO-14973): implement v3 retrieve and domain registry — cdx:PHO-14973
+- [P1] [PHO-14975](https://linear.app/phoebework/issue/PHO-14975): implement v3 write registry and diff-first flow — cdx:PHO-14975
+- [P1] [PHO-14977](https://linear.app/phoebework/issue/PHO-14977): implement v3 read-only helpers and eval scaffolding — cdx:PHO-14977
 
 Backlog:
 
+- [PHO-14974](https://linear.app/phoebework/issue/PHO-14974): implement the planned v3 describe catalog after retrieve and write registry interfaces land
+- [PHO-14976](https://linear.app/phoebework/issue/PHO-14976): implement the planned V3 parity batches from the 123-row inventory after registry interfaces stabilize
 - [PHO-11469](https://linear.app/phoebework/issue/PHO-11469): re-triage Slack-thread alert investigation
 - [PHO-12425](https://linear.app/phoebework/issue/PHO-12425), 12426: sandboxed outreach start + e2e dogfood
 - [PHO-11256](https://linear.app/phoebework/issue/PHO-11256)–11260: texQL series
