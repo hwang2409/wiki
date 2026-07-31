@@ -105,6 +105,35 @@ class ScrubMp4RealFixtureTests(unittest.TestCase):
         finally:
             Path(stored_path).unlink(missing_ok=True)
 
+    @unittest.skipIf(FFMPEG is None, "ffmpeg not installed")
+    def test_non_square_pixel_aspect_ratio_scrubs_and_decodes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "sar-source.mp4"
+            output = Path(directory) / "sar-2x1.mp4"
+            generated = subprocess.run(
+                [
+                    FFMPEG, "-v", "error", "-y", "-i", str(REAL_MP4),
+                    "-vf", "setsar=2/1", "-an", "-c:v", "libx264",
+                    "-movflags", "+faststart", str(output),
+                ],
+                capture_output=True,
+                timeout=30,
+            )
+            self.assertEqual(generated.returncode, 0, generated.stderr.decode(errors="replace"))
+            source.write_bytes(output.read_bytes())
+            original = source.read_bytes()
+            self.assertIn(b"pasp", original)
+            result = media_scrub.scrub_video(original, "video/mp4")
+
+            stored = Path(directory) / "scrubbed.mp4"
+            stored.write_bytes(result.data)
+            probe = subprocess.run(
+                [FFMPEG, "-v", "error", "-i", str(stored), "-f", "null", "-"],
+                capture_output=True,
+                timeout=30,
+            )
+            self.assertEqual(probe.returncode, 0, probe.stderr.decode(errors="replace"))
+
 
 class ScrubMp4MixedAacFixtureTests(unittest.TestCase):
     """A real mixed avc1+AAC MP4 remains outside this PR's subset."""

@@ -5,6 +5,7 @@ import asyncio
 import io
 import json
 import os
+import struct
 import subprocess
 import sys
 import tempfile
@@ -14,7 +15,7 @@ from unittest import mock
 
 from PIL import Image
 
-from backend.app import main, wiki_agent_tools, wiki_artifacts
+from backend.app import main, media_scrub, wiki_agent_tools, wiki_artifacts
 from backend.app.agent_runtime import next_review as next_review_runtime
 from backend.app.agent_runtime.autopilot import AutopilotController, AutopilotStore
 from backend.app.agent_runtime.diversity_orchestration import collect_diversity_verdict
@@ -355,6 +356,54 @@ class WikiArtifactsTests(unittest.TestCase):
             wiki_artifacts.render_artifact({"kind": "audio", "payload": payload})
         if artifact_dir.exists():
             self.assertEqual(list(artifact_dir.glob("*.wav")), [])
+
+    def test_video_over_limit_duration_does_not_orphan_media_file(self) -> None:
+        payload = bytearray(FIXTURE_MP4_BYTES)
+        mvhd_pos = payload.find(b"mvhd")
+        self.assertGreater(mvhd_pos, 0)
+        # v0 mvhd: version+flags, creation, modification, timescale, duration.
+        payload[mvhd_pos + 20:mvhd_pos + 24] = struct.pack(">I", 0xFFFFFFFF)
+        artifact_dir = self.root / "runtime" / "runs" / RUN_ID / "artifacts"
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError, "duration_ms is out of bounds"
+        ):
+            wiki_artifacts.render_artifact(
+                {
+                    "kind": "video",
+                    "payload": {
+                        "data_base64": base64.b64encode(payload).decode(),
+                        "mime": "video/mp4",
+                    },
+                }
+            )
+        if artifact_dir.exists():
+            self.assertEqual(list(artifact_dir.iterdir()), [])
+
+    def test_audio_over_limit_duration_does_not_orphan_media_file(self) -> None:
+        scrubbed = media_scrub.MediaScrubResult(
+            data=FIXTURE_WAV_BYTES,
+            mime="audio/wav",
+            width=None,
+            height=None,
+            duration_ms=wiki_artifacts._BINARY_ARTIFACT_MAX_DURATION_MS + 1,
+            peaks=[1],
+        )
+        artifact_dir = self.root / "runtime" / "runs" / RUN_ID / "artifacts"
+        with mock.patch.object(wiki_artifacts, "scrub_audio", return_value=scrubbed):
+            with self.assertRaisesRegex(
+                wiki_artifacts.ArtifactValidationError, "duration_ms is out of bounds"
+            ):
+                wiki_artifacts.render_artifact(
+                    {
+                        "kind": "audio",
+                        "payload": {
+                            "data_base64": base64.b64encode(FIXTURE_WAV_BYTES).decode(),
+                            "mime": "audio/wav",
+                        },
+                    }
+                )
+        if artifact_dir.exists():
+            self.assertEqual(list(artifact_dir.iterdir()), [])
 
     def test_video_accepts_path_payload_alongside_data_base64(self) -> None:
         # Reject "both" and "neither".

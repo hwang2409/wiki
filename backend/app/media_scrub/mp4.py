@@ -2060,6 +2060,7 @@ def _rebuild_sample_entry(
         )
 
     if entry_type == b"avc1":
+        pasp_ratio = _sample_entry_pasp_ratio(entry_bytes)
         _config, sps_dimensions = _parse_avc_sample_config_from_entry(entry_bytes)
         sample_dimensions = (
             struct.unpack(">H", entry_bytes[32:34])[0],
@@ -2069,7 +2070,13 @@ def _rebuild_sample_entry(
             raise MediaScrubError(
                 "mp4 avc1 sample entry dimensions do not match SPS dimensions"
             )
-        if track_dimensions is None or sps_dimensions != track_dimensions:
+        if (
+            track_dimensions is None
+            or (
+                (pasp_ratio is None or pasp_ratio == (1, 1))
+                and sps_dimensions != track_dimensions
+            )
+        ):
             raise MediaScrubError(
                 "mp4 avc1 SPS dimensions do not match tkhd track dimensions"
             )
@@ -2092,6 +2099,21 @@ def _rebuild_sample_entry(
         + inner_payload
     )
     return _pack(entry_type, body)
+
+
+def _sample_entry_pasp_ratio(entry_bytes: bytes) -> tuple[int, int] | None:
+    """Return a validated pixel-aspect ratio from an avc1 entry, if present."""
+    ratio: tuple[int, int] | None = None
+    for box_type, body in _iter_sample_entry_inner_boxes(entry_bytes, 16 + 70):
+        if box_type != b"pasp":
+            continue
+        if len(body) != 8:
+            raise MediaScrubError("mp4 pasp body must contain two uint32 values")
+        h_spacing, v_spacing = struct.unpack(">II", body)
+        if h_spacing == 0 or v_spacing == 0:
+            raise MediaScrubError("mp4 pasp spacing values must be positive")
+        ratio = (h_spacing, v_spacing)
+    return ratio
 
 
 def _rebuild_visual_sample_entry_fixed(entry_bytes: bytes) -> bytes:
@@ -2149,6 +2171,8 @@ def _rebuild_inner_pasp(body: bytes) -> bytes:
         )
     h_spacing = struct.unpack(">I", body[0:4])[0]
     v_spacing = struct.unpack(">I", body[4:8])[0]
+    if h_spacing == 0 or v_spacing == 0:
+        raise MediaScrubError("mp4 pasp spacing values must be positive")
     return _pack(b"pasp", struct.pack(">II", h_spacing, v_spacing))
 
 

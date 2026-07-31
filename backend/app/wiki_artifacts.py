@@ -304,6 +304,15 @@ def _validate_binary_artifact(event: dict[str, Any], artifact: dict[str, Any]) -
             _validate_binary_data_image(artifact[field], f"binary artifact {field}")
 
 
+def _validate_normalized_binary_artifact(
+    kind: str, artifact_id: str, normalized: dict[str, Any],
+) -> None:
+    _validate_binary_artifact(
+        {"id": artifact_id},
+        {"kind": kind, **normalized},
+    )
+
+
 def _artifact_run_dir() -> Path:
     runtime_value = os.environ.get("WIKI_AGENT_RUNTIME_DIR")
     if not runtime_value:
@@ -623,8 +632,6 @@ def _write_video(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
         )
     poster = _scrub_optional_poster(payload)
 
-    artifact_dir = _artifact_run_dir()
-    _write_binary(artifact_dir, artifact_id, VIDEO_MIMES[mime], result.data)
     normalized: dict[str, Any] = {
         "ref": f"artifact://{artifact_id}",
         "mime": result.mime,
@@ -644,6 +651,9 @@ def _write_video(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
             normalized["width"] = poster_w
         if result.height is None and poster_h:
             normalized["height"] = poster_h
+    _validate_normalized_binary_artifact("video", artifact_id, normalized)
+    artifact_dir = _artifact_run_dir()
+    _write_binary(artifact_dir, artifact_id, VIDEO_MIMES[mime], result.data)
     return normalized
 
 
@@ -685,8 +695,6 @@ def _write_audio(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
         )
     transcript = _validate_audio_transcript(payload)
 
-    artifact_dir = _artifact_run_dir()
-    _write_binary(artifact_dir, artifact_id, AUDIO_MIMES[mime], result.data)
     normalized: dict[str, Any] = {
         "ref": f"artifact://{artifact_id}",
         "mime": result.mime,
@@ -698,6 +706,9 @@ def _write_audio(payload: dict[str, Any], artifact_id: str) -> dict[str, Any]:
         normalized["peaks"] = result.peaks
     if transcript is not None:
         normalized["transcript"] = transcript
+    _validate_normalized_binary_artifact("audio", artifact_id, normalized)
+    artifact_dir = _artifact_run_dir()
+    _write_binary(artifact_dir, artifact_id, AUDIO_MIMES[mime], result.data)
     return normalized
 
 
