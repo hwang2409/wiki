@@ -51,6 +51,13 @@ class ArtifactTranscriptTests(unittest.TestCase):
     def setUp(self) -> None:
         transcripts._cache.clear()
 
+    def test_only_wiki_render_artifact_tool_names_are_accepted(self) -> None:
+        self.assertTrue(transcripts._is_artifact_tool("render_artifact"))
+        self.assertTrue(
+            transcripts._is_artifact_tool("mcp__wiki_artifacts__render_artifact")
+        )
+        self.assertFalse(transcripts._is_artifact_tool("other_server__render_artifact"))
+
     def test_codex_and_claude_artifact_tools_emit_specialized_events(self) -> None:
         kinds = ["mermaid", "svg", "image", "table", "plot", "code"]
         with TemporaryDirectory() as tmp:

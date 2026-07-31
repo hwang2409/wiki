@@ -3572,9 +3572,12 @@ class Review26Mp4StructureProbeTests(unittest.TestCase):
             b"\x01\x00\x00\x00" + b"roll"
             + struct.pack(">II", 2, 1) + struct.pack(">h", -1)
         )
+        stsz_pos = real.find(b"stsz")
+        self.assertGreater(stsz_pos, 0)
+        sample_count = struct.unpack(">I", real[stsz_pos + 12:stsz_pos + 16])[0]
         sbgp_body = (
             b"\x00\x00\x00\x00" + b"roll"
-            + struct.pack(">I", 1) + struct.pack(">II", 1, 1)
+            + struct.pack(">I", 1) + struct.pack(">II", sample_count, 1)
         )
         groups = (
             struct.pack(">I", 8 + len(sgpd_body)) + b"sgpd" + sgpd_body

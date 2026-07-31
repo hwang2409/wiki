@@ -550,9 +550,12 @@ def _codex_tool_input(name: str, arguments: object) -> str:
 
 
 def _is_artifact_tool(name: object) -> bool:
-    return isinstance(name, str) and (
-        name == "render_artifact" or name.endswith("__render_artifact")
-    )
+    return isinstance(name, str) and name in {
+        "render_artifact",
+        "wiki_artifacts__render_artifact",
+        "mcp__wiki_artifacts__render_artifact",
+        "mcp__wiki-artifacts__render_artifact",
+    }
 
 
 def _tool_arguments(arguments: object) -> dict | None:
@@ -728,6 +731,8 @@ def _complete_artifact(
     protocol_event = None if failed else artifact_from_text(output)
     if protocol_event is None and not failed:
         protocol_event = _artifact_from_structured_result(meta, output)
+    if protocol_event is not None and not _is_artifact_tool(meta.get("name")):
+        protocol_event = None
     if protocol_event is not None:
         _append_artifact_event(state, protocol_event, ts)
     else:

@@ -1466,8 +1466,10 @@ def _rebuild_dinf(data: bytes, body_start: int, body_end: int) -> bytes:
     if version != 0:
         raise MediaScrubError(f"mp4 dref unknown version {version}")
     entry_count = struct.unpack(">I", dref_body[4:8])[0]
-    if entry_count == 0:
-        raise MediaScrubError("mp4 dref must declare at least one entry")
+    if entry_count != 1:
+        raise MediaScrubError(
+            "mp4 dref must contain exactly one self-contained url entry"
+        )
     if entry_count > 0xFFFF:
         raise MediaScrubError("mp4 dref entry count implausible")
     if entry_count > _MP4_MAX_TABLE_ENTRIES:
@@ -1621,10 +1623,12 @@ def _validate_stbl_sample_tables(data: bytes, atoms: list[_Mp4Atom]) -> None:
     if ctts_atom is not None:
         ctts_body = body_for(ctts_atom, "ctts", versions=(0, 1))
         ctts_count = validate_count_table(ctts_atom, "ctts", 8, versions=(0, 1))
-        total_ctts_samples = sum(
-            struct.unpack(">I", ctts_body[offset:offset + 4])[0]
-            for offset in range(8, 8 + ctts_count * 8, 8)
-        )
+        total_ctts_samples = 0
+        for offset in range(8, 8 + ctts_count * 8, 8):
+            run_count = struct.unpack(">I", ctts_body[offset:offset + 4])[0]
+            if run_count == 0:
+                raise MediaScrubError("mp4 ctts contains a zero-count run")
+            total_ctts_samples += run_count
         if total_ctts_samples != sample_count:
             raise MediaScrubError(
                 f"mp4 ctts sample_count {total_ctts_samples} does not match "
@@ -1639,6 +1643,67 @@ def _validate_stbl_sample_tables(data: bytes, atoms: list[_Mp4Atom]) -> None:
             sample_number = struct.unpack(">I", stss_body[offset:offset + 4])[0]
             if sample_number == 0 or sample_number > sample_count:
                 raise MediaScrubError("mp4 stss sample index is outside stsz")
+
+    for chunk_type in (b"stco", b"co64"):
+        chunk_atom = by_type.get(chunk_type)
+        if chunk_atom is None:
+            continue
+        chunk_body = body_for(chunk_atom, chunk_type.decode("ascii"))
+        chunk_count = struct.unpack(">I", chunk_body[4:8])[0]
+        if chunk_count > _MP4_MAX_CHUNKS:
+            raise MediaScrubError(
+                f"mp4 chunk count {chunk_count} exceeds scrubber limit {_MP4_MAX_CHUNKS}"
+            )
+        expected = 8 + chunk_count * (4 if chunk_type == b"stco" else 8)
+        if len(chunk_body) != expected:
+            raise MediaScrubError(
+                f"mp4 {chunk_type.decode('ascii')} body length {len(chunk_body)} "
+                f"differs from expected {expected}"
+            )
+
+    sgpd_atom = by_type.get(b"sgpd")
+    sbgp_atom = by_type.get(b"sbgp")
+    if (sgpd_atom is None) != (sbgp_atom is None):
+        raise MediaScrubError("mp4 sgpd and sbgp must appear as a pair")
+    if sgpd_atom is not None and sbgp_atom is not None:
+        sgpd_body = body_for(sgpd_atom, "sgpd", versions=(1,))
+        if len(sgpd_body) < 16:
+            raise MediaScrubError("mp4 sgpd body too short")
+        if bytes(sgpd_body[4:8]) != b"roll":
+            raise MediaScrubError("mp4 sgpd supports only roll grouping")
+        default_length = struct.unpack(">I", sgpd_body[8:12])[0]
+        sgpd_count = struct.unpack(">I", sgpd_body[12:16])[0]
+        if default_length != 2 or sgpd_count == 0:
+            raise MediaScrubError("mp4 sgpd requires non-empty 2-byte roll entries")
+        if sgpd_count > _MP4_MAX_TABLE_ENTRIES:
+            raise MediaScrubError("mp4 sgpd entry count exceeds scrubber limit")
+        if len(sgpd_body) != 16 + sgpd_count * 2:
+            raise MediaScrubError("mp4 sgpd body length is invalid")
+
+        sbgp_body = body_for(sbgp_atom, "sbgp")
+        if len(sbgp_body) < 12:
+            raise MediaScrubError("mp4 sbgp body too short")
+        if bytes(sbgp_body[4:8]) != b"roll":
+            raise MediaScrubError("mp4 sbgp supports only roll grouping")
+        sbgp_count = struct.unpack(">I", sbgp_body[8:12])[0]
+        if sbgp_count == 0 or sbgp_count > _MP4_MAX_TABLE_ENTRIES:
+            raise MediaScrubError("mp4 sbgp requires non-empty bounded runs")
+        if len(sbgp_body) != 12 + sbgp_count * 8:
+            raise MediaScrubError("mp4 sbgp body length is invalid")
+        grouped_samples = 0
+        for offset in range(12, 12 + sbgp_count * 8, 8):
+            run_count, description_index = struct.unpack(">II", sbgp_body[offset:offset + 8])
+            if run_count == 0:
+                raise MediaScrubError("mp4 sbgp contains a zero-count run")
+            if description_index > sgpd_count:
+                raise MediaScrubError(
+                    "mp4 sbgp group_description_index is outside sgpd"
+                )
+            grouped_samples += run_count
+        if grouped_samples != sample_count:
+            raise MediaScrubError(
+                "mp4 sbgp sample count does not match stsz sample count"
+            )
 
 
 _CANONICAL_FULLBOX_FLAGS = b"\x00\x00\x00"
@@ -1699,12 +1764,8 @@ def _rebuild_stbl_table(box_type: bytes, data: bytes, atom: _Mp4Atom) -> bytes:
          Fix: require flags == 0, emit canonical zeros; require
          version == 0 (or version in {0,1} for ctts) and preserve the
          version so signed sample offsets remain valid.
-      2. The rebuild decoded each entry to a Python int and re-packed
-         it, so a valid multi-million-entry stsz cost hundreds of MB
-         RSS. Fix: after validating the declared entry_count against the
-         body length, splice the entry payload verbatim as bytes -- the
-         encoding is fixed-size big-endian, and there is no room for
-         non-canonical variation.
+      2. Raw table tails carried ignored bytes through the scrub. Rebuild
+         every supported entry from validated integer fields instead.
     """
     body = memoryview(data)[atom.body_start:atom.body_end]
     if len(body) < 8:
@@ -1743,17 +1804,24 @@ def _rebuild_stbl_table(box_type: bytes, data: bytes, atom: _Mp4Atom) -> bytes:
                 f"mp4 stsz body length {len(body)} differs from expected {expected} "
                 f"(sample_count={sample_count})"
             )
+        if sample_count == 0:
+            raise MediaScrubError("mp4 stsz must contain at least one sample")
+        entries = bytearray(sample_count * 4)
+        for index in range(sample_count):
+            sample_value = struct.unpack(">I", body[12 + index * 4:16 + index * 4])[0]
+            if sample_value == 0:
+                raise MediaScrubError("mp4 stsz variable sample sizes must be non-zero")
+            struct.pack_into(">I", entries, index * 4, sample_value)
         return _pack(
             b"stsz",
             bytes([0]) + _CANONICAL_FULLBOX_FLAGS
             + struct.pack(">II", 0, sample_count)
-            + bytes(body[12:]),
+            + entries,
         )
 
     if box_type == b"ctts":
         # ctts version 0: unsigned uint32 sample_offset. version 1: signed
-        # int32 sample_offset. Both are 8 bytes per entry and canonical
-        # in big-endian; splice verbatim, preserve the version.
+        # int32 sample_offset. Repack every run and preserve the version.
         if version not in (0, 1):
             raise MediaScrubError(f"mp4 ctts unknown version {version}")
         entry_count = struct.unpack(">I", bytes(body[4:8]))[0]
@@ -1766,7 +1834,20 @@ def _rebuild_stbl_table(box_type: bytes, data: bytes, atom: _Mp4Atom) -> bytes:
             raise MediaScrubError(
                 f"mp4 ctts body length {len(body)} differs from expected {expected}"
             )
-        return _pack(b"ctts", _canonical_header(version, entry_count) + bytes(body[8:]))
+        if entry_count == 0:
+            raise MediaScrubError("mp4 ctts must contain at least one run")
+        entries = bytearray(entry_count * 8)
+        for index in range(entry_count):
+            offset = 8 + index * 8
+            run_count = struct.unpack(">I", body[offset:offset + 4])[0]
+            if run_count == 0:
+                raise MediaScrubError("mp4 ctts contains a zero-count run")
+            sample_offset = struct.unpack(
+                ">I" if version == 0 else ">i", body[offset + 4:offset + 8]
+            )[0]
+            struct.pack_into(">I", entries, index * 8, run_count)
+            struct.pack_into(">I" if version == 0 else ">i", entries, index * 8 + 4, sample_offset)
+        return _pack(b"ctts", _canonical_header(version, entry_count) + entries)
 
     if box_type == b"sgpd":
         if version != 1 or len(body) < 16:
@@ -1785,12 +1866,18 @@ def _rebuild_stbl_table(box_type: bytes, data: bytes, atom: _Mp4Atom) -> bytes:
             raise MediaScrubError(
                 f"mp4 sgpd body length {len(body)} differs from expected {expected}"
             )
+        if entry_count == 0:
+            raise MediaScrubError("mp4 sgpd must contain at least one entry")
+        entries = bytearray(entry_count * 2)
+        for index in range(entry_count):
+            value = struct.unpack(">h", body[16 + index * 2:18 + index * 2])[0]
+            struct.pack_into(">h", entries, index * 2, value)
         return _pack(
             b"sgpd",
             bytes([1]) + _CANONICAL_FULLBOX_FLAGS
             + grouping_type
             + struct.pack(">II", default_length, entry_count)
-            + bytes(body[16:]),
+            + entries,
         )
 
     if box_type == b"sbgp":
@@ -1809,17 +1896,30 @@ def _rebuild_stbl_table(box_type: bytes, data: bytes, atom: _Mp4Atom) -> bytes:
             raise MediaScrubError(
                 f"mp4 sbgp body length {len(body)} differs from expected {expected}"
             )
+        if entry_count == 0:
+            raise MediaScrubError("mp4 sbgp must contain at least one run")
+        entries = bytearray(entry_count * 8)
+        for index in range(entry_count):
+            offset = 12 + index * 8
+            run_count, description_index = struct.unpack(">II", body[offset:offset + 8])
+            if run_count == 0:
+                raise MediaScrubError("mp4 sbgp contains a zero-count run")
+            struct.pack_into(">II", entries, index * 8, run_count, description_index)
         return _pack(
             b"sbgp",
             bytes([0]) + _CANONICAL_FULLBOX_FLAGS
             + grouping_type
             + struct.pack(">I", entry_count)
-            + bytes(body[12:]),
+            + entries,
         )
 
     if version != 0:
         raise MediaScrubError(f"mp4 {box_type!r} unknown version {version}")
     entry_count = struct.unpack(">I", bytes(body[4:8]))[0]
+    if box_type in (b"stco", b"co64") and entry_count > _MP4_MAX_CHUNKS:
+        raise MediaScrubError(
+            f"mp4 chunk count {entry_count} exceeds scrubber limit {_MP4_MAX_CHUNKS}"
+        )
     if box_type not in (b"stco", b"co64") and entry_count > _MP4_MAX_TABLE_ENTRIES:
         raise MediaScrubError(
             f"mp4 {box_type.decode('ascii', 'replace')} entry count exceeds "
@@ -1841,7 +1941,37 @@ def _rebuild_stbl_table(box_type: bytes, data: bytes, atom: _Mp4Atom) -> bytes:
             f"mp4 {box_type.decode('ascii', 'replace')} body length {len(body)} "
             f"differs from expected {expected}"
         )
-    return _pack(box_type, _canonical_header(0, entry_count) + bytes(body[8:]))
+    if entry_count == 0:
+        raise MediaScrubError(f"mp4 {box_type!r} must contain at least one entry")
+    entries = bytearray(entry_count * entry_size)
+    for index in range(entry_count):
+        offset = 8 + index * entry_size
+        if box_type == b"stts":
+            run_count, delta = struct.unpack(">II", body[offset:offset + 8])
+            if run_count == 0 or delta == 0:
+                raise MediaScrubError("mp4 stts contains a zero-valued run")
+            struct.pack_into(">II", entries, index * entry_size, run_count, delta)
+        elif box_type == b"stsc":
+            first_chunk, samples_per_chunk, description_index = struct.unpack(">III", body[offset:offset + 12])
+            if first_chunk == 0 or samples_per_chunk == 0 or description_index == 0:
+                raise MediaScrubError("mp4 stsc entries are invalid: zero-valued field")
+            struct.pack_into(">III", entries, index * entry_size, first_chunk, samples_per_chunk, description_index)
+        elif box_type == b"stco":
+            chunk_offset = struct.unpack(">I", body[offset:offset + 4])[0]
+            if chunk_offset == 0:
+                raise MediaScrubError("mp4 stco contains a zero offset")
+            struct.pack_into(">I", entries, index * entry_size, chunk_offset)
+        elif box_type == b"co64":
+            chunk_offset = struct.unpack(">Q", body[offset:offset + 8])[0]
+            if chunk_offset == 0:
+                raise MediaScrubError("mp4 co64 contains a zero offset")
+            struct.pack_into(">Q", entries, index * entry_size, chunk_offset)
+        else:
+            sample_number = struct.unpack(">I", body[offset:offset + 4])[0]
+            if sample_number == 0:
+                raise MediaScrubError("mp4 stss contains a zero sample index")
+            struct.pack_into(">I", entries, index * entry_size, sample_number)
+    return _pack(box_type, _canonical_header(0, entry_count) + entries)
 
 
 def _rebuild_stsd(
@@ -1916,8 +2046,10 @@ def _rebuild_sample_entry(
     if reserved6 != b"\x00" * 6:
         raise MediaScrubError("mp4 sample entry reserved-6 bytes non-zero")
     data_ref_index = struct.unpack(">H", entry_bytes[14:16])[0]
-    if data_ref_index == 0:
-        raise MediaScrubError("mp4 sample entry data_reference_index must be ≥1")
+    if data_ref_index != 1:
+        raise MediaScrubError(
+            "mp4 sample entry data_reference_index must be canonical index 1"
+        )
 
     if entry_type in _MP4_VISUAL_ENTRIES:
         fixed = _rebuild_visual_sample_entry_fixed(entry_bytes)

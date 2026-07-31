@@ -59,6 +59,17 @@ IMAGE_TYPES = {
 }
 PDF_MIME = "application/pdf"
 TABLE_COLUMN_TYPES = {"string", "number", "date", "link"}
+_BINARY_ARTIFACT_MAX_DIMENSION = 100_000
+_BINARY_ARTIFACT_MAX_DURATION_MS = 7 * 24 * 60 * 60 * 1000
+_BINARY_ARTIFACT_KEYS = {
+    "image": {"kind", "ref", "mime", "byte_size", "width", "height", "preview_base64"},
+    "pdf": {"kind", "ref", "mime", "byte_size"},
+    "video": {
+        "kind", "ref", "mime", "byte_size", "duration_ms", "width", "height",
+        "poster_base64",
+    },
+    "audio": {"kind", "ref", "mime", "byte_size", "duration_ms", "peaks", "transcript"},
+}
 
 
 class ArtifactValidationError(ValueError):
@@ -224,6 +235,73 @@ def _validated_run_id(raw: str) -> str:
     if str(parsed) != raw:
         raise ArtifactValidationError("WIKI_RUN_ID must be a canonical UUID")
     return raw
+
+
+def _validate_binary_data_image(value: Any, field: str) -> None:
+    if not isinstance(value, str) or not value.startswith("data:image/"):
+        raise ArtifactValidationError(f"{field} must be a data-image URL")
+    header, separator, encoded = value.partition(",")
+    if separator != "," or not re.fullmatch(
+        r"data:image/(?:png|jpeg|webp);base64", header
+    ):
+        raise ArtifactValidationError(f"{field} must be a base64 data-image URL")
+    if len(encoded) > ((IMAGE_LIMIT + 2) // 3) * 4 + 4:
+        raise ArtifactValidationError(f"{field} exceeds the image limit")
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ArtifactValidationError(f"{field} is not valid base64") from exc
+    if not decoded or len(decoded) > IMAGE_LIMIT:
+        raise ArtifactValidationError(f"{field} exceeds the image limit")
+
+
+def _validate_binary_artifact(event: dict[str, Any], artifact: dict[str, Any]) -> None:
+    kind = artifact.get("kind")
+    if not isinstance(kind, str) or kind not in _BINARY_ARTIFACT_KEYS:
+        raise ArtifactValidationError("unsupported binary artifact kind")
+    if set(artifact) - _BINARY_ARTIFACT_KEYS[kind]:
+        raise ArtifactValidationError("binary artifact contains an unknown field")
+    event_id = _validated_run_id(str(event.get("id") or ""))
+    if artifact.get("ref") != f"artifact://{event_id}":
+        raise ArtifactValidationError("binary artifact ref does not match event id")
+    allowed_mimes = {
+        "image": set(IMAGE_TYPES),
+        "pdf": {PDF_MIME},
+        "video": set(VIDEO_MIMES),
+        "audio": set(AUDIO_MIMES),
+    }[kind]
+    if artifact.get("mime") not in allowed_mimes:
+        raise ArtifactValidationError("binary artifact mime is not allowed")
+
+    for field, limit in (
+        ("byte_size", max(IMAGE_LIMIT, PDF_LIMIT, VIDEO_LIMIT, AUDIO_LIMIT)),
+        ("width", _BINARY_ARTIFACT_MAX_DIMENSION),
+        ("height", _BINARY_ARTIFACT_MAX_DIMENSION),
+        ("duration_ms", _BINARY_ARTIFACT_MAX_DURATION_MS),
+    ):
+        if field not in artifact:
+            continue
+        value = artifact[field]
+        if type(value) is not int or value < 0 or value > limit:
+            raise ArtifactValidationError(f"binary artifact {field} is out of bounds")
+        if field in {"width", "height"} and value == 0:
+            raise ArtifactValidationError(f"binary artifact {field} must be positive")
+
+    peaks = artifact.get("peaks")
+    if peaks is not None:
+        if not isinstance(peaks, list) or len(peaks) > 512:
+            raise ArtifactValidationError("binary artifact peaks must contain at most 512 values")
+        if any(type(peak) is not int or not 0 <= peak <= 255 for peak in peaks):
+            raise ArtifactValidationError("binary artifact peaks must be integers from 0 to 255")
+
+    transcript = artifact.get("transcript")
+    if transcript is not None:
+        if not isinstance(transcript, str) or len(transcript.encode("utf-8")) > TEXT_LIMIT:
+            raise ArtifactValidationError("binary artifact transcript exceeds the text limit")
+
+    for field in ("poster_base64", "preview_base64"):
+        if field in artifact:
+            _validate_binary_data_image(artifact[field], f"binary artifact {field}")
 
 
 def _artifact_run_dir() -> Path:
@@ -700,7 +778,12 @@ def artifact_from_text(value: Any) -> dict[str, Any] | None:
         ):
             return None
     kind = artifact["kind"]
-    if kind not in {"image", "pdf", "video", "audio"}:
+    if kind in _BINARY_ARTIFACT_KEYS:
+        try:
+            _validate_binary_artifact(event, artifact)
+        except ArtifactValidationError:
+            return None
+    else:
         payload = {key: item for key, item in artifact.items() if key != "kind"}
         try:
             _validate_text_payload(kind, payload)

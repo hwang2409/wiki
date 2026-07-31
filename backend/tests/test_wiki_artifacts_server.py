@@ -451,6 +451,43 @@ class WikiArtifactsTests(unittest.TestCase):
 
         self.assertIsNone(wiki_artifacts.artifact_from_text(wiki_artifacts.sentinel_text(event)))
 
+    def test_sentinel_parser_revalidates_binary_artifact_fields(self) -> None:
+        artifact_id = RUN_ID
+        preview = "data:image/png;base64," + base64.b64encode(FIXTURE_PNG_BYTES).decode()
+
+        def event(kind: str, **fields: object) -> dict:
+            artifact = {
+                "kind": kind,
+                "ref": f"artifact://{artifact_id}",
+                "mime": "audio/wav" if kind == "audio" else "video/mp4",
+                **fields,
+            }
+            return {"kind": "artifact", "id": artifact_id, "artifact": artifact}
+
+        invalid_events = (
+            event("audio", peaks="not-an-array"),
+            event("audio", peaks=[256]),
+            event("audio", peaks=[0] * 513),
+            event("audio", transcript="é" * (wiki_artifacts.TEXT_LIMIT // 2 + 1)),
+            event("video", mime="text/html"),
+            event("video", poster_base64="https://attacker.invalid/poster.png"),
+            event("video", width=True),
+            event("audio", ref="artifact://00000000-0000-4000-8000-000000000086"),
+            event("audio", unexpected="marker"),
+        )
+        for invalid in invalid_events:
+            with self.subTest(artifact=invalid["artifact"]):
+                self.assertIsNone(
+                    wiki_artifacts.artifact_from_text(
+                        wiki_artifacts.sentinel_text(invalid)
+                    )
+                )
+
+        valid = event("video", poster_base64=preview, width=2, height=2)
+        self.assertIsNotNone(
+            wiki_artifacts.artifact_from_text(wiki_artifacts.sentinel_text(valid))
+        )
+
     def test_sentinel_parser_rejects_wrong_typed_table_column_types(self) -> None:
         for column_type in ([], {}, None, 42):
             with self.subTest(column_type=column_type):
