@@ -2087,6 +2087,55 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("int:94", current.pending_requests)
         self.assertFalse(self.supervisor.handover_event_queue)
 
+    async def test_handover_flushes_old_generation_route_after_replacement(self) -> None:
+        old = await self.supervisor.start_run(
+            agent_id="WIKI-HANDOVER-OLD-GENERATION",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="old generation handover",
+        )
+        await _wait_for_events(self.store, old.run_id, 10)
+        replacement = await self.supervisor.replace(
+            old.run_id, "replacement generation handover"
+        )
+        await _wait_for_events(self.store, replacement.run_id, 10)
+        old_before = self.store.get(old.run_id)
+        adapter = self.supervisor.adapters[replacement.run_id]
+        original_drain = adapter.drain_events
+        injected = False
+
+        async def inject_old_generation() -> list[ProviderEvent]:
+            nonlocal injected
+            if not injected:
+                injected = True
+                await adapter._events.put(  # noqa: SLF001 - generation route probe
+                    ProviderEvent(
+                        ProviderKind.CODEX,
+                        {
+                            "method": "item/agentMessage/delta",
+                            "params": {"delta": "late old generation output"},
+                        },
+                        generation=old.provider_generation,
+                    )
+                )
+            return await original_drain()
+
+        with mock.patch.object(
+            adapter, "drain_events", new=inject_old_generation
+        ):
+            await self.supervisor.prepare_handover()
+
+        old_after = self.store.get(old.run_id)
+        self.assertEqual(old_after.raw_event_count, old_before.raw_event_count + 1)
+        self.assertEqual(
+            old_after.normalized_event_count,
+            old_before.normalized_event_count + 1,
+        )
+        self.assertFalse(self.supervisor.handover_event_queue)
+
     async def test_failed_handover_preflight_replays_queued_events(self) -> None:
         record = await self.supervisor.start_run(
             agent_id="WIKI-HANDOVER-PREFLIGHT-FAIL",

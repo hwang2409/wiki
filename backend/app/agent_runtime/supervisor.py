@@ -870,8 +870,10 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                         )
                     raise
 
-    async def _flush_all_handover_events(self) -> None:
-        """Replay queued events before failed handover releases admission."""
+    async def _flush_all_handover_events(
+        self, *, schedule_monitor_actions: bool = False
+    ) -> None:
+        """Replay every routed queue before handover continues or releases admission."""
 
         while True:
             async with self.handover_condition:
@@ -881,7 +883,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             for run_id in run_ids:
                 async with self._run_lock(run_id):
                     await self._flush_handover_events(
-                        run_id, schedule_monitor_actions=True
+                        run_id, schedule_monitor_actions=schedule_monitor_actions
                     )
 
     async def _capture_live_handover_events(self) -> None:
@@ -2548,6 +2550,11 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     )
                     runs.append(handover_run)
                     drained.append(run_id)
+            await self._flush_all_handover_events()
+            if self.handover_event_queue:
+                raise StoreConflict(
+                    "handover completed with unpersisted provider events"
+                )
             self.handover_result = {"drained_run_ids": drained, "runs": runs}
             return {
                 "drained_run_ids": list(drained),
@@ -2565,7 +2572,9 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 self.handover_result = None
                 self.handover_condition.notify_all()
             try:
-                await self._flush_all_handover_events()
+                await self._flush_all_handover_events(
+                    schedule_monitor_actions=True
+                )
             except BaseException:
                 raise
             if capture_error is not None:
