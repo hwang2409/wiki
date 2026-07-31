@@ -9941,8 +9941,25 @@ textarea.composer-command-input {
   overflow: auto;
 }
 
+.artifact-plot-detail-canvas[data-interactive="true"] .artifact-plot {
+  cursor: grab;
+}
+
+.artifact-plot-detail-canvas[data-interactive="true"] .artifact-plot:active {
+  cursor: grabbing;
+}
+
 .artifact-plot-detail-canvas .artifact-plot {
   min-height: 100%;
+}
+
+.artifact-plot-hint {
+  margin-left: auto;
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-weight: var(--font-monospace-weight);
+  font-size: var(--fs-2xs);
+  white-space: nowrap;
 }
 
 .artifact-table-toolbar {

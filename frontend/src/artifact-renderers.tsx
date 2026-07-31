@@ -17,9 +17,20 @@ import {
   renderPageToCanvas,
   type LoadedPdf,
 } from "./pdfjs-runtime";
+import {
+  BRUSH_PARAM,
+  buildInteractiveSpec,
+  plotInteractivity,
+  selectionDomains,
+  type PlotDomains,
+} from "./plot-interaction";
 import { ShikiCode, useCurrentTheme } from "./shiki";
 import { StatusBadge, statusToTone } from "./status-badge";
 import { STREAM_CLAMP_PX, STREAM_CLAMP_SLACK_PX } from "./stream-clamp";
+
+export type PlotView = {
+  toImageURL: (type: string, scaleFactor?: number) => Promise<string>;
+};
 
 const IMAGE_EXTENSION_PATTERN = /\.(png|jpe?g|gif|webp|svg)(\?.*)?$/i;
 
@@ -396,12 +407,32 @@ export function ImageRenderer({ artifact, event, onExpand, onImageLoad, ticket }
   );
 }
 
-export function PlotRenderer({ actions = false, spec }: { actions?: boolean; spec: Record<string, unknown> }) {
+export type PlotRendererProps = {
+  actions?: boolean;
+  domains?: PlotDomains;
+  interactive?: boolean;
+  onBrush?: (domains: PlotDomains) => void;
+  onView?: (view: PlotView | null) => void;
+  spec: Record<string, unknown>;
+};
+
+export function PlotRenderer({
+  actions = false,
+  domains,
+  interactive = false,
+  onBrush,
+  onView,
+  spec,
+}: PlotRendererProps) {
   const theme = useCurrentTheme();
   const container = useRef<HTMLDivElement>(null);
   const [error, setError] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
   const [nonce, setNonce] = useState(0);
+  const brushRef = useRef(onBrush);
+  const viewRef = useRef(onView);
+  useEffect(() => { brushRef.current = onBrush; }, [onBrush]);
+  useEffect(() => { viewRef.current = onView; }, [onView]);
   useEffect(() => {
     setReady(false);
     const target = container.current;
@@ -415,14 +446,23 @@ export function PlotRenderer({ actions = false, spec }: { actions?: boolean; spe
     const background = styles.getPropertyValue("--background-primary").trim();
     const accent = styles.getPropertyValue("--accent-primary").trim();
     const font = styles.getPropertyValue("--font-monospace").trim();
+    const interactivity = plotInteractivity(spec);
+    const interactiveSpec = buildInteractiveSpec(spec, {
+      interactivity,
+      armed: interactive,
+      domains,
+      brushColor: accent,
+    });
     const sourceConfig: Record<string, unknown> =
-      typeof spec.config === "object" && spec.config ? spec.config as Record<string, unknown> : {};
+      typeof interactiveSpec.config === "object" && interactiveSpec.config
+        ? interactiveSpec.config as Record<string, unknown>
+        : {};
     const sourceAxis = typeof sourceConfig.axis === "object" && sourceConfig.axis ? sourceConfig.axis : {};
     const sourceLegend = typeof sourceConfig.legend === "object" && sourceConfig.legend ? sourceConfig.legend : {};
     const sourceTitle = typeof sourceConfig.title === "object" && sourceConfig.title ? sourceConfig.title : {};
     const sourceRange = typeof sourceConfig.range === "object" && sourceConfig.range ? sourceConfig.range : {};
     const themedSpec = {
-      ...spec,
+      ...interactiveSpec,
       background,
       config: {
         ...sourceConfig,
@@ -442,9 +482,20 @@ export function PlotRenderer({ actions = false, spec }: { actions?: boolean; spe
       try {
         const result = await embed(target, themedSpec, { actions, renderer: "svg" });
         finalize = result.finalize;
-        if (!finalized) {
-          setError(null);
-          setReady(true);
+        if (finalized) {
+          result.finalize?.();
+          return;
+        }
+        setError(null);
+        setReady(true);
+        viewRef.current?.(result.view as PlotView);
+        if (interactive && interactivity.mode === "full") {
+          try {
+            result.view.addSignalListener(BRUSH_PARAM, (_name, value) => {
+              const next = selectionDomains(value, interactivity.fields);
+              if (next) brushRef.current?.(next);
+            });
+          } catch { /* Vega drops listeners if the param is stripped by user spec */ }
         }
       } catch (reason) {
         reportPlotFailure(reason);
@@ -452,10 +503,11 @@ export function PlotRenderer({ actions = false, spec }: { actions?: boolean; spe
     }).catch(reportPlotFailure);
     return () => {
       finalized = true;
+      viewRef.current?.(null);
       finalize?.();
       target.replaceChildren();
     };
-  }, [actions, nonce, spec, theme]);
+  }, [actions, nonce, spec, theme, interactive, domains]);
   if (error) {
     return (
       <ArtifactError
