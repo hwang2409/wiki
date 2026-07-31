@@ -10,6 +10,7 @@ import { VisualDiffRenderer } from "../src/visual-diff-renderer";
 // Every ImmediateImage src is tagged so the mock canvas can hand back the
 // distinct pixel buffer that corresponds to that variant.
 const IMAGE_PIXELS = new WeakMap<object, Uint8ClampedArray>();
+const IMAGE_VARIANT = new WeakMap<object, "before" | "after">();
 
 function solidPixels(width: number, height: number, rgba: [number, number, number, number]): Uint8ClampedArray {
   const buffer = new Uint8ClampedArray(width * height * 4);
@@ -41,23 +42,51 @@ class ImmediateImage {
   }
   set src(value: string) {
     this.#src = value;
-    if (value.includes("variant=before")) IMAGE_PIXELS.set(this, BEFORE_PIXELS);
-    else if (value.includes("variant=after")) IMAGE_PIXELS.set(this, AFTER_PIXELS);
+    if (value.includes("variant=before")) {
+      IMAGE_PIXELS.set(this, BEFORE_PIXELS);
+      IMAGE_VARIANT.set(this, "before");
+    } else if (value.includes("variant=after")) {
+      IMAGE_PIXELS.set(this, AFTER_PIXELS);
+      IMAGE_VARIANT.set(this, "after");
+    }
     queueMicrotask(() => this.onload?.());
   }
 }
 
 type PutRecord = { width: number; height: number; alphaCount: number };
+type CompositeDraw = { variant: "before" | "after"; globalAlpha: number; composite: string };
 
 const PUT_CALLS: PutRecord[] = [];
+const COMPOSITE_DRAWS: CompositeDraw[] = [];
 
 function installCanvasMock() {
   HTMLCanvasElement.prototype.getContext = function (kind: string) {
     if (kind !== "2d") return null;
+    const canvas = this as HTMLCanvasElement;
     let currentImage: object | null = null;
+    const state = {
+      globalAlpha: 1,
+      globalCompositeOperation: "source-over" as string,
+      imageSmoothingEnabled: true,
+    };
     return {
-      drawImage(image: object, _dx: number, _dy: number, _dw?: number, _dh?: number) {
+      get canvas() { return canvas; },
+      get globalAlpha() { return state.globalAlpha; },
+      set globalAlpha(value: number) { state.globalAlpha = value; },
+      get globalCompositeOperation() { return state.globalCompositeOperation; },
+      set globalCompositeOperation(value: string) { state.globalCompositeOperation = value; },
+      get imageSmoothingEnabled() { return state.imageSmoothingEnabled; },
+      set imageSmoothingEnabled(value: boolean) { state.imageSmoothingEnabled = value; },
+      drawImage(image: object, ..._rest: number[]) {
         currentImage = image;
+        const variant = IMAGE_VARIANT.get(image);
+        if (variant) {
+          COMPOSITE_DRAWS.push({
+            variant,
+            globalAlpha: state.globalAlpha,
+            composite: state.globalCompositeOperation,
+          });
+        }
       },
       getImageData(_x: number, _y: number, width: number, height: number) {
         const src = currentImage && IMAGE_PIXELS.get(currentImage);
@@ -93,6 +122,7 @@ beforeAll(() => {
 afterEach(() => {
   cleanup();
   PUT_CALLS.length = 0;
+  COMPOSITE_DRAWS.length = 0;
 });
 
 function visualDiffEvent(): SessionEvent {
@@ -113,32 +143,46 @@ function visualDiffEvent(): SessionEvent {
 }
 
 describe("visual-diff renderer", () => {
-  test("renders both variants and updates after-image opacity when the slider moves", async () => {
+  test("slider composites the two variants: exact-before at 0, exact-after at 1, blend between", async () => {
     render(<VisualDiffRenderer artifact={visualDiffEvent().artifact!} event={visualDiffEvent()} ticket="WIKI-193" />);
-    const beforeImage = await screen.findByAltText("Login form");
-    const stage = beforeImage.parentElement as HTMLElement;
-    const afterImage = stage.querySelector("img.is-after") as HTMLImageElement;
-    expect(afterImage).toBeTruthy();
-    expect(beforeImage.getAttribute("src")).toBe(
-      "/api/agents/WIKI-193/artifact/abc?variant=before",
-    );
-    expect(afterImage.getAttribute("src")).toBe(
-      "/api/agents/WIKI-193/artifact/abc?variant=after",
-    );
-    // Default opacity is 50%.
-    expect(afterImage.style.opacity).toBe("0.5");
-
+    // Wait for images to load and the initial composite pass to run.
+    await waitFor(() => expect(COMPOSITE_DRAWS.length).toBeGreaterThan(0));
+    // The composite canvas carries an aria-label with the artifact title.
+    expect(screen.getByRole("img", { name: "Login form" })).toBeTruthy();
     const slider = screen.getByRole("slider") as HTMLInputElement;
-    fireEvent.change(slider, { target: { value: "1" } });
-    expect(afterImage.style.opacity).toBe("1");
 
+    // Endpoint at 0: only the before variant is drawn (no after in the batch).
+    COMPOSITE_DRAWS.length = 0;
     fireEvent.change(slider, { target: { value: "0" } });
-    expect(afterImage.style.opacity).toBe("0");
+    await waitFor(() => expect(COMPOSITE_DRAWS.length).toBeGreaterThan(0));
+    expect(COMPOSITE_DRAWS.map((call) => call.variant)).toEqual(["before"]);
+    expect(COMPOSITE_DRAWS[0].globalAlpha).toBe(1);
+
+    // Endpoint at 1: only the after variant is drawn, at full alpha.
+    COMPOSITE_DRAWS.length = 0;
+    fireEvent.change(slider, { target: { value: "1" } });
+    await waitFor(() => expect(COMPOSITE_DRAWS.length).toBeGreaterThan(0));
+    expect(COMPOSITE_DRAWS.map((call) => call.variant)).toEqual(["after"]);
+    expect(COMPOSITE_DRAWS[0].globalAlpha).toBe(1);
+
+    // Intermediate at 0.5: both variants drawn, additive premultiplied blend.
+    // Before at alpha 0.5 (source-over), then after at alpha 0.5 (lighter).
+    COMPOSITE_DRAWS.length = 0;
+    fireEvent.change(slider, { target: { value: "0.5" } });
+    await waitFor(() => expect(COMPOSITE_DRAWS.length).toBeGreaterThanOrEqual(2));
+    const [firstDraw, secondDraw] = COMPOSITE_DRAWS;
+    expect(firstDraw.variant).toBe("before");
+    expect(firstDraw.composite).toBe("source-over");
+    expect(firstDraw.globalAlpha).toBeCloseTo(0.5);
+    expect(secondDraw.variant).toBe("after");
+    expect(secondDraw.composite).toBe("lighter");
+    expect(secondDraw.globalAlpha).toBeCloseTo(0.5);
   });
 
   test("pixel-diff toggle drives the draw / diff / overlay / percentage pipeline", async () => {
     render(<VisualDiffRenderer artifact={visualDiffEvent().artifact!} event={visualDiffEvent()} ticket="WIKI-193" />);
-    await screen.findByAltText("Login form");
+    await screen.findByRole("img", { name: "Login form" });
+    await waitFor(() => expect(COMPOSITE_DRAWS.length).toBeGreaterThan(0));
     const toggle = screen.getByRole("button", { name: /pixel diff/i });
     expect(toggle.getAttribute("aria-pressed")).toBe("false");
     expect(PUT_CALLS.length).toBe(0);
@@ -218,7 +262,8 @@ describe("visual-diff renderer", () => {
         ticket="WIKI-193"
       />,
     );
-    await screen.findByAltText("Login form");
+    await screen.findByRole("img", { name: "Login form" });
+    await waitFor(() => expect(COMPOSITE_DRAWS.length).toBeGreaterThan(0));
     expect(screen.queryByRole("slider")).toBeNull();
     expect(screen.queryByRole("button", { name: /pixel diff/i })).toBeNull();
   });
@@ -243,7 +288,7 @@ describe("visual-diff compact preview in ArtifactBlock", () => {
       },
     };
     render(<ArtifactBlock event={event} onOpen={onOpen} ticket="WIKI-193" />);
-    await screen.findByAltText("Screenshot pair");
+    await screen.findByRole("img", { name: "Screenshot pair" });
 
     // No interactive slider or pixel-diff toggle in the compact preview.
     expect(screen.queryByRole("slider")).toBeNull();
@@ -271,7 +316,7 @@ describe("visual-diff compact preview in ArtifactBlock", () => {
       },
     };
     render(<ArtifactBlock event={event} onOpen={onOpen} ticket="WIKI-193" />);
-    await screen.findByAltText("Screenshot pair");
+    await screen.findByRole("img", { name: "Screenshot pair" });
     const compactBody = document.querySelector('[data-artifact-compact] .artifact-body') as HTMLElement | null;
     expect(compactBody).toBeTruthy();
     fireEvent.click(compactBody!);
@@ -314,14 +359,13 @@ describe("visual-diff in ArtifactPanel", () => {
         width={640}
       />,
     );
-    const before = await screen.findByAltText("Screenshot pair");
-    expect(before.getAttribute("src")).toBe(
-      "/api/agents/WIKI-193/artifact/big?variant=before",
-    );
-    const after = before.parentElement?.querySelector("img.is-after") as HTMLImageElement | null;
-    expect(after?.getAttribute("src")).toBe(
-      "/api/agents/WIKI-193/artifact/big?variant=after",
-    );
+    await screen.findByRole("img", { name: "Screenshot pair" });
+    // Both variants must reach the composite pipeline — at slider=0.5 (the
+    // default), the effect draws before with source-over and after with lighter.
+    await waitFor(() => {
+      const variants = new Set(COMPOSITE_DRAWS.map((call) => call.variant));
+      expect(variants.has("before") && variants.has("after")).toBe(true);
+    });
     // Live controls surface — regression against the "Artifact unavailable"
     // fallback the panel was showing before the visual-diff case was added.
     expect(screen.getByRole("slider")).toBeTruthy();
@@ -438,7 +482,7 @@ describe("visual-diff pixel-diff at oversized native resolution", () => {
         },
       };
       render(<VisualDiffRenderer artifact={event.artifact!} event={event} ticket="WIKI-193" />);
-      await screen.findByAltText("Oversized pair");
+      await screen.findByRole("img", { name: "Oversized pair" });
       const toggle = screen.getByRole("button", { name: /pixel diff/i });
       fireEvent.click(toggle);
 
@@ -536,7 +580,7 @@ describe("visual-diff pixel-diff cancellation and yield", () => {
         },
       };
       render(<VisualDiffRenderer artifact={event.artifact!} event={event} ticket="WIKI-193" />);
-      await screen.findByAltText("Oversized pair");
+      await screen.findByRole("img", { name: "Oversized pair" });
       const toggle = screen.getByRole("button", { name: /pixel diff/i });
 
       // Turn pixel-diff on. The effect kicks off the async tiled diff — one
@@ -583,7 +627,7 @@ describe("visual-diff renderer id uniqueness", () => {
         <VisualDiffRenderer artifact={event.artifact!} event={event} ticket="WIKI-193" />
       </>,
     );
-    await screen.findAllByAltText("Screenshot pair");
+    await screen.findAllByRole("img", { name: "Screenshot pair" });
     const sliders = screen.getAllByRole("slider") as HTMLInputElement[];
     expect(sliders).toHaveLength(2);
     // Ids differ across copies.

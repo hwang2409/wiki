@@ -3,7 +3,6 @@ import { Columns2, ScanSearch } from "lucide-react";
 import type { SessionArtifact, SessionEvent } from "./api";
 import { ArtifactError, ArtifactPlaceholder } from "./artifact-state";
 import {
-  blendOpacity,
   boundedDiffDimensions,
   computePixelDiff,
   formatDiffPercent,
@@ -196,6 +195,7 @@ export function VisualDiffRenderer({
     scaled: boolean;
   } | null>(null);
   const [overlayError, setOverlayError] = useState<string | null>(null);
+  const compositeRef = useRef<HTMLCanvasElement | null>(null);
   const aspect = visualDiffAspect(artifact);
   // useId gives every mounted copy its own value, so an inline + inspector +
   // panel triple of the same artifact does not collide on DOM ids or bind a
@@ -203,6 +203,54 @@ export function VisualDiffRenderer({
   // so the hook count is stable across load / ready / error transitions.
   const reactId = useId();
   const sliderId = `visual-diff-slider-${reactId}`;
+
+  // Composite blend (WIKI-193 review round 8): the old two-<img> stack faded
+  // the after image's opacity over a fully visible before, so transparent
+  // after-pixels always showed the before beneath — the "After" endpoint
+  // was really "before under after with holes", and alpha regressions
+  // hid entirely. Render both variants onto a bounded canvas per slider
+  // change; endpoints skip the wrong side entirely, intermediate frames
+  // use additive premultiplied-alpha blend so the linear mix is exact.
+  useEffect(() => {
+    if (state.status !== "ready") return;
+    const canvas = compositeRef.current;
+    if (!canvas) return;
+    const context = canvas.getContext("2d");
+    if (!context) return;
+    const nativeWidth = Math.min(state.before.width, state.after.width);
+    const nativeHeight = Math.min(state.before.height, state.after.height);
+    if (nativeWidth === 0 || nativeHeight === 0) return;
+    const bounds = boundedDiffDimensions(nativeWidth, nativeHeight);
+    if (bounds.width === 0 || bounds.height === 0) return;
+    if (canvas.width !== bounds.width) canvas.width = bounds.width;
+    if (canvas.height !== bounds.height) canvas.height = bounds.height;
+    context.clearRect(0, 0, bounds.width, bounds.height);
+    context.imageSmoothingEnabled = true;
+    context.globalCompositeOperation = "source-over";
+    // Endpoint fidelity: exact-before at 0, exact-after at 1. Skipping the
+    // other side avoids the composite artifacts that show up at the extremes
+    // (e.g. a fully-transparent after would blend with an already-drawn
+    // before if we did not skip).
+    if (slider <= 0) {
+      context.globalAlpha = 1;
+      context.drawImage(state.before.element, 0, 0, bounds.width, bounds.height);
+    } else if (slider >= 1) {
+      context.globalAlpha = 1;
+      context.drawImage(state.after.element, 0, 0, bounds.width, bounds.height);
+    } else {
+      // Premultiplied-alpha linear blend: draw before scaled by (1-s), then
+      // add after scaled by s using "lighter" (additive) mode. The result is
+      // dst_color = before * (1 - s) + after * s AND
+      // dst_alpha = beforeAlpha * (1 - s) + afterAlpha * s — a true linear
+      // interpolation whose alpha correctly falls to zero where both sides
+      // are transparent.
+      context.globalAlpha = 1 - slider;
+      context.drawImage(state.before.element, 0, 0, bounds.width, bounds.height);
+      context.globalCompositeOperation = "lighter";
+      context.globalAlpha = slider;
+      context.drawImage(state.after.element, 0, 0, bounds.width, bounds.height);
+    }
+  }, [state, slider]);
 
   useEffect(() => {
     if (!pixelDiff || state.status !== "ready") return;
@@ -254,24 +302,21 @@ export function VisualDiffRenderer({
     );
   }
 
-  const opacity = blendOpacity(slider);
   const aspectStyle = aspect ? { aspectRatio: `${aspect}` } : undefined;
-  const stageContent = state.status === "ready" ? (
+  const compositeLabel = event.title || event.caption || "Visual diff";
+  const stageContent = (
     <>
-      <img
-        alt={event.title || event.caption || "Before"}
-        className="visual-diff-image is-before"
-        decoding="async"
-        src={sources.before}
+      <canvas
+        aria-label={compositeLabel}
+        className="visual-diff-composite"
+        data-slider={slider}
+        data-testid="visual-diff-composite"
+        ref={compositeRef}
+        role="img"
       />
-      <img
-        alt="After"
-        aria-hidden="true"
-        className="visual-diff-image is-after"
-        decoding="async"
-        src={sources.after}
-        style={{ opacity }}
-      />
+      {state.status !== "ready" ? (
+        <ArtifactPlaceholder label="Loading images…" shape="image" />
+      ) : null}
       {pixelDiff ? (
         <canvas
           aria-hidden="true"
@@ -280,8 +325,6 @@ export function VisualDiffRenderer({
         />
       ) : null}
     </>
-  ) : (
-    <ArtifactPlaceholder label="Loading images…" shape="image" />
   );
 
   const diffPercent = diffStats
@@ -317,7 +360,7 @@ export function VisualDiffRenderer({
             value={slider}
           />
           <span className="visual-diff-slider-readout tabular-nums">
-            {Math.round(opacity * 100)}%
+            {Math.round(slider * 100)}%
           </span>
         </label>
         <button

@@ -471,20 +471,26 @@ def _generate_preview(scrubbed: bytes, mime: str, width: int, height: int) -> st
 
 def _verify_container_integrity(data: bytes, expected_format: str) -> None:
     """Confirm the payload really is a complete, well-formed container of the
-    declared format. Header probing is O(bytes-of-header) — that is fast, but
-    it accepts a PNG whose signature and IHDR are valid while a later chunk
-    CRC is corrupt, or a JPEG that is truncated after the SOF. verify() walks
-    the chunk / marker structure and CRC-checks PNG chunks; combined with the
-    format cross-check it rejects both classes before we hand the browser
-    bytes it cannot decode. verify() invalidates the Image, so we read .format
-    inside the same context and never touch the object again."""
+    declared format, decodable end-to-end. Header probing is O(bytes-of-header)
+    — fast, but accepts a PNG whose signature and IHDR are valid while a later
+    chunk CRC is corrupt, or a JPEG that is truncated inside its scan data.
+    verify() catches the PNG CRC case but does not decompress JPEG scan data,
+    so a JPEG missing its final EOI bytes slid through verify then died in
+    the preview-generation load() (whose exception is silently swallowed) —
+    the tool reported success while the browser got a broken image.
+
+    Cross-check the declared format, then force a full decode via load() so
+    every truncation / corruption class raises here with a canonical error
+    instead of surviving to fail on the client. Cost is one decode per
+    ingested variant (server-side, once per artifact) — acceptable for the
+    correctness guarantee."""
     try:
         with Image.open(io.BytesIO(data)) as source:
             if source.format != expected_format:
                 raise ImageScrubError(
                     f"payload does not decode as {expected_format} (got {source.format})"
                 )
-            source.verify()
+            source.load()
     except ImageScrubError:
         raise
     except Exception as exc:  # noqa: BLE001 — normalise Pillow's many exceptions

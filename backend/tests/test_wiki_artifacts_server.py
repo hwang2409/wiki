@@ -457,6 +457,68 @@ class WikiArtifactsTests(unittest.TestCase):
                 }
             )
 
+    def test_visual_diff_rejects_truncated_jpeg_per_side(self) -> None:
+        # PIL's Image.verify() walks JPEG marker structure but does NOT
+        # decompress scan data — a JPEG missing its final EOI bytes passes
+        # verify(), then fails inside _generate_preview's load() where the
+        # exception is silently swallowed. The tool used to report success
+        # while the client received an image the browser could not decode.
+        def _valid_jpeg(size: tuple[int, int] = (16, 16)) -> bytes:
+            buffer = io.BytesIO()
+            Image.new("RGB", size, color=(255, 128, 0)).save(
+                buffer, format="JPEG", quality=95
+            )
+            return buffer.getvalue()
+
+        def _truncated_jpeg() -> bytes:
+            valid = _valid_jpeg()
+            # Drop the closing EOI marker (last 2 bytes) so scan data cannot
+            # be completed by the decoder.
+            return valid[:-2]
+
+        truncated = _truncated_jpeg()
+        upright = _valid_jpeg()
+
+        # Truncation on the before side.
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError, "payload.before rejected"
+        ):
+            wiki_artifacts.render_artifact(
+                {
+                    "kind": "visual-diff",
+                    "payload": {
+                        "before": {
+                            "data_base64": base64.b64encode(truncated).decode(),
+                            "mime": "image/jpeg",
+                        },
+                        "after": {
+                            "data_base64": base64.b64encode(upright).decode(),
+                            "mime": "image/jpeg",
+                        },
+                    },
+                }
+            )
+
+        # Truncation on the after side.
+        with self.assertRaisesRegex(
+            wiki_artifacts.ArtifactValidationError, "payload.after rejected"
+        ):
+            wiki_artifacts.render_artifact(
+                {
+                    "kind": "visual-diff",
+                    "payload": {
+                        "before": {
+                            "data_base64": base64.b64encode(upright).decode(),
+                            "mime": "image/jpeg",
+                        },
+                        "after": {
+                            "data_base64": base64.b64encode(truncated).decode(),
+                            "mime": "image/jpeg",
+                        },
+                    },
+                }
+            )
+
     def test_visual_diff_rejects_valid_header_corrupt_crc_per_side(self) -> None:
         # PNG structure: 8-byte signature, then chunks each shaped
         # length(4) + type(4) + data(length) + crc(4). The IHDR chunk sits at
