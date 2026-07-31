@@ -115,6 +115,56 @@ def _set_updated_at(store: RunStore, record, timestamp: float) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
+def _append_event_rows(
+    store: RunStore,
+    record,
+    *,
+    direction: str,
+    disposition: str,
+    kind: str,
+    timestamp: float,
+) -> None:
+    stamp = datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+    raw_path = store.raw_events_path(record.run_id)
+    normalized_path = store.normalized_events_path(record.run_id)
+    raw_rows = [json.loads(line) for line in raw_path.read_text().splitlines() if line]
+    normalized_rows = [
+        json.loads(line) for line in normalized_path.read_text().splitlines() if line
+    ]
+    raw_seq = len(raw_rows) + 1
+    raw_path.write_text(
+        raw_path.read_text()
+        + json.dumps(
+            {
+                "seq": raw_seq,
+                "received_at": stamp,
+                "provider": record.provider.value,
+                "direction": direction,
+                "generation": 1,
+                "payload": {},
+            }
+        )
+        + "\n"
+    )
+    normalized_path.write_text(
+        normalized_path.read_text()
+        + json.dumps(
+            {
+                "seq": len(normalized_rows) + 1,
+                "raw_seq": raw_seq,
+                "normalized_at": stamp,
+                "disposition": disposition,
+                "kind": kind,
+                "payload": {},
+                "lifecycle_state": None,
+            }
+        )
+        + "\n"
+    )
+    os.utime(raw_path, (timestamp, timestamp))
+    os.utime(normalized_path, (timestamp, timestamp))
+
+
 class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -378,7 +428,7 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
         with (
             self._patch_graph(graph),
             mock.patch(
-                "backend.app.agent_runtime.graph_health.GraphHealthMonitor._run_event_mtimes",
+                "backend.app.agent_runtime.graph_health.GraphHealthMonitor._meaningful_event_timestamps",
                 return_value=[self.clock.now - 10],
             ),
             mock.patch(
@@ -524,6 +574,103 @@ class FleetMonitorTests(unittest.IsolatedAsyncioTestCase):
             notes = await self.monitor.tick()
 
         self.assertIn("graph-health-stall", {note.event_type for note in notes})
+
+    async def test_graph_health_stall_filters_noise_and_accepts_worker_output(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        worker = await self._spawn("WIKI-926", role="implement", orch="WIKI-ORCH")
+        stale_activity = self.clock.now - 2000
+        _set_created_at(self.store, worker, stale_activity - 1)
+        _write_status(
+            self.store,
+            worker.agent_id,
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+            mtime=stale_activity,
+        )
+        _append_event_rows(
+            self.store,
+            worker,
+            direction="client",
+            disposition="ignored",
+            kind="codex_client_message",
+            timestamp=self.clock.now - 10,
+        )
+        graph = self._graph(
+            "WIKI-926",
+            edges=[self._graph_edge("spawn", self.clock.now - 1801, to=worker.agent_id)],
+        )
+        ack = Future()
+        ack.set_result(None)
+        with self._patch_graph(graph), mock.patch(
+            "backend.app.workgraph_service.record_escalation",
+            return_value=ack,
+        ):
+            noise_notes = await self.monitor.tick()
+            _append_event_rows(
+                self.store,
+                worker,
+                direction="server",
+                disposition="rendered",
+                kind="item_completed",
+                timestamp=self.clock.now - 10,
+            )
+            output_notes = await self.monitor.tick()
+
+        self.assertIn("graph-health-stall", {note.event_type for note in noise_notes})
+        self.assertNotIn(
+            "graph-health-stall", {note.event_type for note in output_notes}
+        )
+
+    async def test_graph_health_stall_reopens_after_fresh_recovery(self) -> None:
+        await self._spawn("WIKI-ORCH", role="orchestrator", orch=None)
+        worker = await self._spawn("WIKI-927", role="implement", orch="WIKI-ORCH")
+        stale_activity = self.clock.now - 2000
+        _set_created_at(self.store, worker, stale_activity - 1)
+        _write_status(
+            self.store,
+            worker.agent_id,
+            {"state": "working", "pr": None, "step": "coding", "blocker": None},
+            mtime=stale_activity,
+        )
+        graph = self._graph(
+            "WIKI-927",
+            edges=[self._graph_edge("spawn", self.clock.now - 1801, to=worker.agent_id)],
+        )
+        escalations: list[dict] = []
+
+        def record_escalation(**payload):
+            escalations.append(payload)
+            ack = Future()
+            ack.set_result(None)
+            return ack
+
+        with self._patch_graph(graph), mock.patch(
+            "backend.app.workgraph_service.record_escalation",
+            side_effect=record_escalation,
+        ):
+            first = await self.monitor.tick()
+            _write_status(
+                self.store,
+                worker.agent_id,
+                {"state": "working", "pr": None, "step": "coding", "blocker": None},
+                mtime=self.clock.now - 10,
+            )
+            recovered = await self.monitor.tick()
+            self.clock.advance(1801)
+            second = await self.monitor.tick()
+
+        first_stalls = [n for n in first if n.event_type == "graph-health-stall"]
+        recovered_stalls = [
+            n for n in recovered if n.event_type == "graph-health-stall"
+        ]
+        second_stalls = [n for n in second if n.event_type == "graph-health-stall"]
+        self.assertEqual(len(first_stalls), 1)
+        self.assertEqual(recovered_stalls, [])
+        self.assertEqual(len(second_stalls), 1)
+        self.assertEqual(len(escalations), 2)
+        self.assertNotEqual(
+            escalations[0]["request_id"], escalations[1]["request_id"]
+        )
+        self.assertNotEqual(first_stalls[0].dedupe_key, second_stalls[0].dedupe_key)
 
 
     async def test_escalation_append_failure_retries_before_notification(self) -> None:
