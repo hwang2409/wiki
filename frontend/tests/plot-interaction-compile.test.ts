@@ -293,6 +293,41 @@ test("runtime: mixed domainRaw axis stays fixed while the other axis zooms", asy
   await view.finalize();
 });
 
+test("runtime: descending brush domain stays descending after re-embed", async () => {
+  const spec = {
+    mark: "point",
+    width: 400,
+    height: 200,
+    data: { values: [{ x: 1, y: 1 }, { x: 10, y: 10 }] },
+    encoding: {
+      x: { field: "x", type: "quantitative", scale: { domain: [10, 1] } },
+      y: { field: "y", type: "quantitative" },
+    },
+  };
+  const initialView = await renderHeadless(transform(spec));
+  const brushDomains = tupleDomains(
+    {
+      fields: [{ field: "x", channel: "x", type: "R" }],
+      values: [[1, 10]],
+    },
+    ["x"],
+    { x: "descending" },
+  );
+  assert.deepEqual(brushDomains, { x: [10, 1] });
+  await initialView.finalize();
+
+  const reboundSpec = {
+    ...spec,
+    encoding: {
+      ...spec.encoding,
+      x: { ...spec.encoding.x, scale: { domain: brushDomains!.x } },
+    },
+  };
+  const reboundView = await renderHeadless(transform(reboundSpec));
+  assert.deepEqual(reboundView.scale("x").domain(), [10, 1]);
+  await reboundView.finalize();
+});
+
 test("runtime: leftward drag shifts x domain toward lower values", async () => {
   const interactive = transform({
     ...CONTINUOUS,

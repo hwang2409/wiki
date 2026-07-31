@@ -21,6 +21,7 @@
 export type VegaLiteSpec = Record<string, unknown>;
 export type ZoomChannel = "x" | "y";
 export type PlotDomains = Partial<Record<ZoomChannel, [number, number]>>;
+export type PlotDomainDirection = "ascending" | "descending";
 
 export type PlotInteractivity =
   | { mode: "static" }
@@ -257,6 +258,7 @@ export function buildInteractiveSpec(
 export function tupleDomains(
   value: unknown,
   channels: readonly ZoomChannel[],
+  directions: Partial<Record<ZoomChannel, PlotDomainDirection>> = {},
 ): PlotDomains | null {
   const record = asRecord(value);
   if (!record) return null;
@@ -276,7 +278,10 @@ export function tupleDomains(
     const low = Number(extent[0]);
     const high = Number(extent[1]);
     if (!Number.isFinite(low) || !Number.isFinite(high) || low === high) continue;
-    domains[channel] = low < high ? [low, high] : [high, low];
+    const ascending: [number, number] = low < high ? [low, high] : [high, low];
+    domains[channel] = directions[channel] === "descending"
+      ? [ascending[1], ascending[0]]
+      : ascending;
   }
   return Object.keys(domains).length > 0 ? domains : null;
 }
@@ -299,6 +304,7 @@ function isWellFormedTuple(value: unknown): boolean {
 export function makeBrushBuffer(
   channels: readonly ZoomChannel[],
   commit: (domains: PlotDomains) => void,
+  getDomainDirection?: (channel: ZoomChannel) => PlotDomainDirection | undefined,
 ): {
   onSignal: (value: unknown) => void;
   onPointerUp: () => void;
@@ -311,7 +317,12 @@ export function makeBrushBuffer(
       // A well-formed tuple that yields no usable extents means the user
       // shrank the brush to a point. Clear pending so a later pointerup
       // doesn't commit an earlier intermediate extent.
-      pending = tupleDomains(value, channels);
+      const directions: Partial<Record<ZoomChannel, PlotDomainDirection>> = {};
+      for (const channel of channels) {
+        const direction = getDomainDirection?.(channel);
+        if (direction) directions[channel] = direction;
+      }
+      pending = tupleDomains(value, channels, directions);
     },
     onPointerUp() {
       if (pending === null) return;

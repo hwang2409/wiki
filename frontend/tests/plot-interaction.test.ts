@@ -423,7 +423,7 @@ test("buildInteractiveSpec: does not mutate input", () => {
   assert.equal(JSON.stringify(spec), before);
 });
 
-test("tupleDomains: reads channel-tagged extents and sorts them", () => {
+test("tupleDomains: reads channel-tagged extents and normalizes ascending order", () => {
   const domains = tupleDomains(
     {
       unit: "",
@@ -439,6 +439,18 @@ test("tupleDomains: reads channel-tagged extents and sorts them", () => {
     x: [12, 40],
     y: [1_700_000_000_000, 1_710_000_000_000],
   });
+});
+
+test("tupleDomains: preserves a live descending channel direction", () => {
+  const domains = tupleDomains(
+    {
+      fields: [{ field: "price", channel: "x", type: "R" }],
+      values: [[1, 10]],
+    },
+    ["x"],
+    { x: "descending" },
+  );
+  assert.deepEqual(domains, { x: [10, 1] });
 });
 
 test("tupleDomains: rejects zero-width extents and non-finite values", () => {
@@ -490,6 +502,21 @@ test("makeBrushBuffer: commits only on pointerup, always the latest value", () =
   assert.deepEqual(commits, []);
   buffer.onPointerUp();
   assert.deepEqual(commits, [{ x: [0, 12] }]);
+});
+
+test("makeBrushBuffer: preserves the live descending direction", () => {
+  const commits: unknown[] = [];
+  const buffer = makeBrushBuffer(
+    ["x"],
+    (domains) => commits.push(domains),
+    () => "descending",
+  );
+  buffer.onSignal({
+    fields: [{ field: "x", channel: "x", type: "R" }],
+    values: [[1, 10]],
+  });
+  buffer.onPointerUp();
+  assert.deepEqual(commits, [{ x: [10, 1] }]);
 });
 
 test("makeBrushBuffer: pointerup with no signals is a no-op", () => {

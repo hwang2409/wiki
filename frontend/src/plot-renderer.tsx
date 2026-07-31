@@ -6,6 +6,8 @@ import {
   makeBrushBuffer,
   plotInteractivity,
   type PlotDomains,
+  type PlotDomainDirection,
+  type ZoomChannel,
 } from "./plot-interaction";
 import { useCurrentTheme } from "./shiki";
 
@@ -112,9 +114,21 @@ export function PlotRenderer({
         (target as PlotContainerElement).__wikiVegaView = result.view;
         viewRef.current?.(result.view as PlotView);
         if (interactive && interactivity.mode === "full") {
-          const buffer = makeBrushBuffer(interactivity.channels, (domainsFromBrush) => {
-            brushRef.current?.(domainsFromBrush);
-          });
+          const buffer = makeBrushBuffer(
+            interactivity.channels,
+            (domainsFromBrush) => brushRef.current?.(domainsFromBrush),
+            (channel: ZoomChannel): PlotDomainDirection | undefined => {
+              try {
+                const domain = result.view.scale(channel).domain();
+                const first = Number(domain[0]);
+                const second = Number(domain[1]);
+                if (!Number.isFinite(first) || !Number.isFinite(second) || first === second) return undefined;
+                return first > second ? "descending" : "ascending";
+              } catch {
+                return undefined;
+              }
+            },
+          );
           try {
             // Listen to the compiled tuple signal (channel-tagged) so the
             // reader is agnostic to nested field paths / escaped keys /
