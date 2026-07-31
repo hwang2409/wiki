@@ -150,6 +150,70 @@ async function runScenario({ failure, customPath }) {
   await context.close();
 }
 
+async function runTopologyScenario() {
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  let workspaceRequests = 0;
+
+  await page.route("**/api/workspaces", async (route) => {
+    workspaceRequests += 1;
+    const workspaces =
+      workspaceRequests <= 2
+        ? [{ id: "wiki", root: "/tmp/wiki", live: true }]
+        : workspaceRequests === 3
+          ? [
+              { id: "wiki", root: "/tmp/wiki", live: true },
+              { id: "new-orchestrator", root: "/tmp/new-orchestrator", live: true },
+            ]
+          : [{ id: "wiki", root: "/tmp/wiki", live: true }];
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ workspaces }),
+    });
+  });
+  await page.addInitScript(() => {
+    class TestEventSource {
+      static instance;
+      onmessage = null;
+      constructor() {
+        TestEventSource.instance = this;
+      }
+      close() {}
+    }
+    window.EventSource = TestEventSource;
+    window.__wikiEmitAgentEvent = (payload) => {
+      TestEventSource.instance?.onmessage?.({ data: JSON.stringify(payload) });
+    };
+    localStorage.setItem("wiki-sidebar-visible", "true");
+    localStorage.setItem("wiki-sidebar-tab", "agents");
+    localStorage.removeItem("wiki-window-layout-v2");
+  });
+  const initialWorkspaceResponse = page.waitForResponse("**/api/workspaces");
+  await page.goto(`${backend.baseUrl}/`, { waitUntil: "domcontentloaded" });
+  await page.waitForSelector('.sidebar-mode[data-mode="agents"]');
+  await initialWorkspaceResponse;
+  await page.getByRole("button", { name: "Files", exact: true }).click();
+  await page.waitForFunction(() => document.querySelectorAll("#root select[data-testid=workspace-select] option").length === 1);
+
+  const requestsBeforeSession = workspaceRequests;
+  await page.evaluate(() => window.__wikiEmitAgentEvent({ type: "session", ticket: "WIKI-SESSION" }));
+  await page.waitForTimeout(500);
+  if (workspaceRequests !== requestsBeforeSession) {
+    throw new Error("a session event retriggered workspace discovery");
+  }
+
+  await page.evaluate(() => window.__wikiEmitAgentEvent({ type: "agents", tickets: ["WIKI-NEW"] }));
+  await page.waitForFunction(() => document.querySelector('option[value="new-orchestrator"]') !== null);
+
+  await page.evaluate(() => window.__wikiEmitAgentEvent({ type: "agents", tickets: ["WIKI-NEW"] }));
+  await page.waitForFunction(() => document.querySelector('option[value="new-orchestrator"]') === null);
+  if (workspaceRequests !== 4) {
+    throw new Error(`expected one discovery request per topology event, got ${workspaceRequests}`);
+  }
+  await context.close();
+}
+
 try {
   await fs.writeFile(fixtures.registryPath, "{}\n");
   await fs.writeFile(fixtures.queuePath, "{}\n");
@@ -157,6 +221,7 @@ try {
   browser = await chromium.launch({ headless: true });
   await runScenario({ failure: false, customPath: "/tmp/custom-delayed-workspace" });
   await runScenario({ failure: true, customPath: "/tmp/custom-failed-workspace" });
+  await runTopologyScenario();
 } finally {
   if (browser) await browser.close();
   if (backend) await backend.stop();

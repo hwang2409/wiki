@@ -14,6 +14,15 @@ export const AGENT_REFRESH_EVENT_TYPES: ReadonlySet<string> = new Set([
   "claude_limit_cleared",
 ]);
 
+// Registry changes include spawn, replace, and archive transitions. These
+// events also refresh workspace discovery because orchestrators can add or
+// remove workspace roots.
+export const AGENT_TOPOLOGY_EVENT_TYPES: ReadonlySet<string> = new Set(["agents"]);
+
 export function isAgentRefreshEvent(type: string): boolean {
   return AGENT_REFRESH_EVENT_TYPES.has(type);
+}
+
+export function isAgentTopologyEvent(type: string): boolean {
+  return AGENT_TOPOLOGY_EVENT_TYPES.has(type);
 }

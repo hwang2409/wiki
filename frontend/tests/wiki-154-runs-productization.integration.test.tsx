@@ -5,7 +5,7 @@ import { useEffect, useState } from "react";
 
 import { AgentsView, SpawnOrchestratorModal, SpawnWorkerModal } from "../src/agents";
 import { ReplaceAgentModal } from "../src/replace-agent-modal";
-import { isAgentRefreshEvent } from "../src/agent-events";
+import { isAgentRefreshEvent, isAgentTopologyEvent } from "../src/agent-events";
 import { getAgents, spawnAgentOrchestrator } from "../src/api";
 import type { AgentModelOption, AgentWorker, ArchivedWorker, Orchestrator } from "../src/api";
 import { presetWorkerModel } from "../src/role-pipeline";
@@ -368,6 +368,12 @@ test("codex_auth_verified refreshes the agents view and clears the exhausted ban
     expect(view.queryByText(/Sign in to Codex again/)).toBeNull();
   });
   expect(vi.mocked(getAgents).mock.calls.length).toBeGreaterThanOrEqual(2);
+});
+
+test("agent topology events trigger workspace discovery, but session events do not", () => {
+  expect(isAgentTopologyEvent("agents")).toBe(true);
+  expect(isAgentTopologyEvent("session")).toBe(false);
+  expect(isAgentTopologyEvent("codex_auth_verified")).toBe(false);
 });
 
 test("spawn dialog leads with ticket and prompt; role/model/effort live under Advanced", async () => {

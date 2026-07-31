@@ -83,7 +83,7 @@ import {
 import { SettingsModal, applyStoredFonts } from "./settings";
 import { ActivityFeed } from "./activity";
 import { AgentsSidebar, AgentsView, type AccountEvent } from "./agents";
-import { isAgentRefreshEvent } from "./agent-events";
+import { isAgentRefreshEvent, isAgentTopologyEvent } from "./agent-events";
 import {
   AgentSessionView,
   clearSurfacePaneState,
@@ -1470,6 +1470,11 @@ export default function App() {
               setRefreshTick((tick) => tick + 1);
             }, 400);
           }
+          return;
+        }
+        if (isAgentTopologyEvent(payload.type)) {
+          setWorkspaceDiscoveryNonce((nonce) => nonce + 1);
+          setRefreshTick((tick) => tick + 1);
           return;
         }
         // Account events refresh /api/agents; the durable notice list rides

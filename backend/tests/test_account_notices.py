@@ -252,6 +252,38 @@ def test_stale_auth_verified_event_does_not_clear_replacement_failure(tmp_path: 
     assert notice["run_ids"] == {"WIKI-A": "run-new"}
 
 
+def test_auth_verified_clears_only_matching_codex_fleet_tickets(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    for kind in ("codex_limit_no_eligible", "codex_rotation_failed"):
+        event = {
+            "type": kind,
+            "tickets": ["WIKI-A", "WIKI-B"],
+            "run_ids": {"WIKI-A": "run-a", "WIKI-B": "run-b"},
+            "ts": f"{kind}-t1",
+        }
+        if kind == "codex_limit_no_eligible":
+            event["reset_at"] = None
+        else:
+            event["error"] = "rotation failed"
+        assert store.apply_event(event)
+
+    assert store.apply_event(
+        {
+            "type": "codex_auth_verified",
+            "success": True,
+            "credential_source": "current",
+            "ticket": "WIKI-A",
+            "run_id": "run-a",
+            "ts": "t2",
+        }
+    )
+
+    for kind in ("codex_limit_no_eligible", "codex_rotation_failed"):
+        notice = _by_type(store, kind)
+        assert notice["tickets"] == ["WIKI-B"]
+        assert notice["run_ids"] == {"WIKI-B": "run-b"}
+
+
 def test_auth_verified_without_run_id_only_clears_legacy_notice(tmp_path: Path) -> None:
     store = _store(tmp_path)
     store.apply_event({"type": "codex_auth_dead_exhausted", "tickets": ["WIKI-A"], "ts": "t1"})

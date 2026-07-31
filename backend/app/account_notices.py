@@ -399,6 +399,35 @@ class AccountNoticeStore:
                 else:
                     clear(key)
 
+        def remove_codex_fleet_ticket(ticket: str, run_id: str | None) -> None:
+            """Clear a recovered run from Codex fleet notices only."""
+
+            if not run_id:
+                return
+            for key in ("codex:limit", "codex:rotation-failed"):
+                notice = self._notices.get(key)
+                if notice is None:
+                    continue
+                stored_run_id = _reason_map(notice.get("run_ids")).get(ticket)
+                if stored_run_id != run_id:
+                    continue
+                remaining = [
+                    current_ticket
+                    for current_ticket in _ticket_list(notice.get("tickets"))
+                    if current_ticket != ticket
+                ]
+                if remaining:
+                    updated = dict(notice)
+                    updated["tickets"] = remaining
+                    updated["run_ids"] = {
+                        current_ticket: stored_id
+                        for current_ticket, stored_id in _reason_map(notice.get("run_ids")).items()
+                        if current_ticket in remaining
+                    }
+                    set_notice(key, updated)
+                else:
+                    clear(key)
+
         def merge_revive_failures(key: str) -> None:
             failed = _ticket_list(event.get("failed"))
             if not failed:
@@ -450,6 +479,10 @@ class AccountNoticeStore:
                         [ticket],
                         recovery_run_id=run_id if isinstance(run_id, str) and run_id else None,
                         require_run_match=True,
+                    )
+                    remove_codex_fleet_ticket(
+                        ticket,
+                        run_id if isinstance(run_id, str) and run_id else None,
                     )
         elif kind == "claude_limit_hit":
             ticket = event.get("ticket")
