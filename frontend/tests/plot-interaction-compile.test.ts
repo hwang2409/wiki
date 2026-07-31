@@ -202,6 +202,33 @@ test("runtime: wheel on wiki_zoom_x shrinks x domain independently of y", async 
   await view.finalize();
 });
 
+test("runtime: selected brush domains override domainMin, domainMax, and zero", async () => {
+  for (const modifier of ["domainMin", "domainMax", "zero"] as const) {
+    const spec = {
+      mark: "point",
+      width: 400,
+      height: 200,
+      data: { values: [{ x: 0, y: 0 }, { x: 10, y: 10 }] },
+      encoding: {
+        x: {
+          field: "x",
+          type: "quantitative",
+          scale: { [modifier]: modifier === "zero" ? true : 0 },
+        },
+        y: { field: "y", type: "quantitative" },
+      },
+    };
+    const interactive = buildInteractiveSpec(spec, {
+      interactivity: plotInteractivity(spec),
+      armed: true,
+      domains: { x: [2, 8] },
+    }) as Record<string, unknown>;
+    const view = await renderHeadless(interactive);
+    assert.deepEqual(view.scale("x").domain(), [2, 8], `${modifier} must not override the selected domain`);
+    await view.finalize();
+  }
+});
+
 test("runtime: repeated toolbar zoom updates move the domain every time", async () => {
   const interactive = transform({
     ...CONTINUOUS,

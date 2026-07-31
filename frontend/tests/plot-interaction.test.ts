@@ -409,6 +409,29 @@ test("buildInteractiveSpec: applies persistent zoom domains to encoding scales",
   assert.deepEqual((encoding.y.scale as Record<string, unknown>).domain, [0, 5]);
 });
 
+test("buildInteractiveSpec: temporary domains remove conflicting scale modifiers", () => {
+  for (const modifier of ["domainMin", "domainMax", "zero"] as const) {
+    const spec = {
+      mark: "point",
+      encoding: {
+        x: {
+          field: "x",
+          type: "quantitative",
+          scale: { [modifier]: modifier === "zero" ? true : 0 },
+        },
+      },
+    };
+    const out = buildInteractiveSpec(spec, {
+      interactivity: { mode: "full", channels: ["x"] },
+      armed: false,
+      domains: { x: [2, 8] },
+    });
+    const scale = ((out.encoding as Record<string, unknown>).x as Record<string, unknown>).scale as Record<string, unknown>;
+    assert.deepEqual(scale.domain, [2, 8]);
+    assert.equal(modifier in scale, false);
+  }
+});
+
 test("buildInteractiveSpec: does not mutate input", () => {
   const spec = {
     mark: "line",
@@ -536,11 +559,22 @@ test("makeBrushBuffer: shape-less signal noise is ignored", () => {
     values: [extent],
   });
   buffer.onSignal(wrap([2, 8]));
-  buffer.onSignal(null);
   buffer.onSignal(undefined);
   buffer.onSignal("garbage");
   buffer.onPointerUp();
   assert.deepEqual(commits, [{ x: [2, 8] }]);
+});
+
+test("makeBrushBuffer: null tuple clears a stale pending range", () => {
+  const commits: unknown[] = [];
+  const buffer = makeBrushBuffer(["x"], (d) => commits.push(d));
+  buffer.onSignal({
+    fields: [{ field: "x", channel: "x", type: "R" }],
+    values: [[2, 8]],
+  });
+  buffer.onSignal(null);
+  buffer.onPointerUp();
+  assert.deepEqual(commits, []);
 });
 
 test("makeBrushBuffer: shrink-to-empty clears pending", () => {

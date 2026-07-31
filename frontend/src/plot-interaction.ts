@@ -218,7 +218,14 @@ export function buildInteractiveSpec(
       const def = asRecord(encoding[channel]);
       if (!domain || !def) continue;
       const scale = asRecord(def.scale) ?? {};
-      encoding[channel] = { ...def, scale: { ...scale, domain } };
+      // These modifiers override a temporary brush domain during Vega's
+      // scale evaluation. Remove them from the cloned view spec; the
+      // original spec remains untouched and still restores them on Reset.
+      const temporaryScale = { ...scale };
+      delete temporaryScale.domainMin;
+      delete temporaryScale.domainMax;
+      delete temporaryScale.zero;
+      encoding[channel] = { ...def, scale: { ...temporaryScale, domain } };
     }
   }
 
@@ -331,6 +338,10 @@ export function makeBrushBuffer(
   let pending: PlotDomains | null = null;
   return {
     onSignal(value: unknown) {
+      if (value === null) {
+        pending = null;
+        return;
+      }
       if (!isWellFormedTuple(value)) return;
       // A well-formed tuple that yields no usable extents means the user
       // shrank the brush to a point. Clear pending so a later pointerup
