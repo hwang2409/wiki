@@ -835,6 +835,17 @@ def _pack(atom_type: bytes, body: bytes) -> bytes:
     return struct.pack(">I", total) + atom_type + body
 
 
+def _pack_with_header(atom_type: bytes, body: bytes, header_len: int) -> bytes:
+    if header_len == 8:
+        return _pack(atom_type, body)
+    if header_len != 16:
+        raise MediaScrubError("mp4 atom header width is unsupported")
+    total = 16 + len(body)
+    if total > 0xFFFFFFFFFFFFFFFF:  # pragma: no cover
+        raise MediaScrubError("mp4 rebuilt atom size overflows 64 bits")
+    return struct.pack(">I", 1) + atom_type + struct.pack(">Q", total) + body
+
+
 def _free(total_size: int) -> bytes:
     """Emit a `free` box that occupies exactly `total_size` bytes, body zeroed."""
     if total_size < _MP4_FREE_MIN_SIZE:
@@ -977,7 +988,9 @@ def _rebuild_sidx(data: bytes, atom: _Mp4Atom) -> bytes:
             + struct.pack(">QQ", earliest_pt, first_offset)
             + struct.pack(">HH", 0, reference_count)
         )
-    return _pack(b"sidx", header_bytes + b"".join(references))
+    return _pack_with_header(
+        b"sidx", header_bytes + b"".join(references), atom.header_len,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -1463,6 +1463,69 @@ class Mp4Round7SurvivorProbes(unittest.TestCase):
         # sidx bytes appear (rebuilt from fields).
         self.assertIn(b"sidx", result.data)
 
+    def test_extended_sidx_preserves_header_and_first_offset_target(self) -> None:
+        real = REAL_MP4.read_bytes()
+        target_marker = b"segment-target"
+        for version in (0, 1):
+            with self.subTest(version=version):
+                first_offset = 8
+                if version == 0:
+                    body = (
+                        b"\x00\x00\x00\x00"
+                        + struct.pack(">II", 1, 90_000)
+                        + struct.pack(">II", 0, first_offset)
+                    )
+                    first_offset_pos = 16
+                else:
+                    body = (
+                        b"\x01\x00\x00\x00"
+                        + struct.pack(">II", 1, 90_000)
+                        + struct.pack(">QQ", 0, first_offset)
+                    )
+                    first_offset_pos = 20
+                body += struct.pack(">HH", 0, 1)
+                body += struct.pack(">III", len(target_marker), 1, 0)
+                sidx_size = 16 + len(body)
+                sidx_atom = (
+                    struct.pack(">I", 1) + b"sidx"
+                    + struct.pack(">Q", sidx_size) + body
+                )
+                following_mdat = self._wrap(b"mdat", target_marker)
+                payload = real + sidx_atom + following_mdat
+                result = media_scrub.scrub_video(payload, "video/mp4")
+
+                input_sidx_start = payload.rfind(b"sidx") - 4
+                output_sidx_start = result.data.rfind(b"sidx") - 4
+                self.assertEqual(
+                    struct.unpack(">I", result.data[output_sidx_start:output_sidx_start + 4])[0],
+                    1,
+                )
+                output_size = struct.unpack(">Q", result.data[output_sidx_start + 8:output_sidx_start + 16])[0]
+                self.assertEqual(output_size, sidx_size)
+                output_first_offset = struct.unpack(
+                    ">I" if version == 0 else ">Q",
+                    result.data[
+                        output_sidx_start + 16 + first_offset_pos:
+                        output_sidx_start + 16 + first_offset_pos + (4 if version == 0 else 8)
+                    ],
+                )[0]
+                self.assertEqual(output_first_offset, first_offset)
+                self.assertEqual(
+                    output_sidx_start + output_size + output_first_offset,
+                    output_sidx_start + output_size + 8,
+                )
+                input_target = input_sidx_start + sidx_size + first_offset
+                output_target = output_sidx_start + output_size + output_first_offset
+                self.assertEqual(payload[input_target:input_target + len(target_marker)], target_marker)
+                self.assertEqual(
+                    result.data[output_target:output_target + len(target_marker)],
+                    b"\x00" * len(target_marker),
+                )
+                self.assertEqual(
+                    input_target,
+                    output_target,
+                )
+
     def test_btrt_slack_inside_sample_entry_is_rejected(self) -> None:
         # Splice trailing bytes AFTER the 12-byte btrt body inside the
         # avc1 sample entry. Round-7 rebuild rejects. Use rfind for names
@@ -3651,16 +3714,27 @@ class Review21MediaProbeTests(unittest.TestCase):
         return b"\x68" + h264_scrubber._rbsp_escape(writer.to_bytes())
 
     @staticmethod
-    def _pps_with_map_type_6_slice_group_id(slice_group_id: int) -> bytes:
+    def _pps_with_fmo_map_type(map_type: int) -> bytes:
         writer = h264_scrubber._BitWriter()
         writer.write_ue(0)
         writer.write_ue(0)
         writer.write_u1(0)
         writer.write_u1(0)
         writer.write_ue(2)  # num_slice_groups_minus1
-        writer.write_ue(6)  # slice_group_map_type
-        writer.write_ue(0)  # pic_size_in_map_units_minus1
-        writer.write_bits(slice_group_id, 2)
+        writer.write_ue(map_type)
+        if map_type == 0:
+            for _ in range(3):
+                writer.write_ue(0)  # run_length_minus1
+        elif map_type == 2:
+            for _ in range(2):
+                writer.write_ue(0)  # top_left
+                writer.write_ue(0)  # bottom_right
+        elif map_type in (3, 4, 5):
+            writer.write_u1(0)  # slice_group_change_direction_flag
+            writer.write_ue(0)  # slice_group_change_rate_minus1
+        elif map_type == 6:
+            writer.write_ue(0)  # pic_size_in_map_units_minus1
+            writer.write_bits(0, 2)  # slice_group_id
         writer.write_ue(0)
         writer.write_ue(0)
         writer.write_u1(0)
@@ -3717,15 +3791,16 @@ class Review21MediaProbeTests(unittest.TestCase):
         with self.assertRaisesRegex(media_scrub.MediaScrubError, "default reference count"):
             media_scrub.scrub_video(rejected, "video/mp4")
 
-    def test_pps_map_type_6_rejects_out_of_range_slice_group_id(self) -> None:
-        rejected = self._replace_pps(
-            REAL_MP4.read_bytes(),
-            self._pps_with_map_type_6_slice_group_id(3),
-        )
-        with self.assertRaisesRegex(
-            media_scrub.MediaScrubError, "slice_group_id out of range"
-        ):
-            media_scrub.scrub_video(rejected, "video/mp4")
+    def test_pps_fmo_map_types_are_rejected_before_storage(self) -> None:
+        for map_type in (0, 2, 3, 4, 5, 6):
+            with self.subTest(map_type=map_type):
+                rejected = self._replace_pps(
+                    REAL_MP4.read_bytes(), self._pps_with_fmo_map_type(map_type),
+                )
+                with self.assertRaisesRegex(
+                    media_scrub.MediaScrubError, "FMO slice groups"
+                ):
+                    media_scrub.scrub_video(rejected, "video/mp4")
 
 
     @staticmethod
@@ -4392,6 +4467,90 @@ class Review33VuiSarTests(unittest.TestCase):
         real = source.read_bytes()
         assert b"pasp" in real
         return real
+
+    @staticmethod
+    def _sps_with_vui_values(
+        *, video_format: int = 5, chroma_top: int = 5,
+        chroma_bottom: int = 5, num_units_in_tick: int = 1,
+        time_scale: int = 1,
+    ) -> bytes:
+        writer = h264_scrubber._BitWriter()
+        writer.write_bits(100, 8)
+        writer.write_bits(0, 8)
+        writer.write_bits(10, 8)
+        writer.write_ue(0)
+        writer.write_ue(1)
+        writer.write_ue(0)
+        writer.write_ue(0)
+        writer.write_u1(0)
+        writer.write_u1(0)
+        writer.write_ue(0)
+        writer.write_ue(0)
+        writer.write_ue(0)
+        writer.write_ue(0)
+        writer.write_u1(0)
+        writer.write_ue(9)
+        writer.write_ue(7)
+        writer.write_u1(1)
+        writer.write_u1(1)
+        writer.write_u1(1)
+        writer.write_ue(0)
+        writer.write_ue(0)
+        writer.write_ue(0)
+        writer.write_ue(4)
+        writer.write_u1(1)  # vui_parameters_present_flag
+        writer.write_u1(0)  # aspect_ratio_info_present_flag
+        writer.write_u1(0)  # overscan_info_present_flag
+        writer.write_u1(1)  # video_signal_type_present_flag
+        writer.write_bits(video_format, 3)
+        writer.write_u1(0)
+        writer.write_u1(0)
+        writer.write_u1(1)  # chroma_loc_info_present_flag
+        writer.write_ue(chroma_top)
+        writer.write_ue(chroma_bottom)
+        writer.write_u1(1)  # timing_info_present_flag
+        writer.write_bits(num_units_in_tick, 32)
+        writer.write_bits(time_scale, 32)
+        writer.write_u1(0)
+        writer.write_u1(0)  # nal_hrd_parameters_present_flag
+        writer.write_u1(0)  # vcl_hrd_parameters_present_flag
+        writer.write_u1(0)  # pic_struct_present_flag
+        writer.write_u1(0)  # bitstream_restriction_flag
+        writer.write_rbsp_trailing_bits()
+        return b"\x67" + h264_scrubber._rbsp_escape(writer.to_bytes())
+
+    def test_vui_semantic_boundaries_decode_and_reserved_values_reject(self) -> None:
+        accepted = Review20MediaProbeTests._replace_sps(
+            REAL_MP4.read_bytes(), self._sps_with_vui_values(),
+        )
+        result = media_scrub.scrub_video(accepted, "video/mp4")
+        self.assertTrue(result.data)
+        if FFMPEG is not None:
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as handle:
+                handle.write(result.data)
+                path = handle.name
+            try:
+                probe = subprocess.run(
+                    [FFMPEG, "-v", "error", "-i", path, "-f", "null", "-"],
+                    capture_output=True,
+                    timeout=30,
+                )
+                self.assertEqual(probe.returncode, 0, probe.stderr.decode(errors="replace"))
+            finally:
+                Path(path).unlink(missing_ok=True)
+
+        cases = (
+            ("video_format", {"video_format": 6}, "video_format"),
+            ("chroma location", {"chroma_top": 6}, "chroma location"),
+            ("timing", {"num_units_in_tick": 0}, "timing values"),
+        )
+        for name, values, message in cases:
+            with self.subTest(case=name):
+                rejected = Review20MediaProbeTests._replace_sps(
+                    REAL_MP4.read_bytes(), self._sps_with_vui_values(**values),
+                )
+                with self.assertRaisesRegex(media_scrub.MediaScrubError, message):
+                    media_scrub.scrub_video(rejected, "video/mp4")
 
     @unittest.skipIf(FFMPEG is None, "ffmpeg not installed")
     def test_vui_sar_without_pasp_updates_display_dimensions(self) -> None:

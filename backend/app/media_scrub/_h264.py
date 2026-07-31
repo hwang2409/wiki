@@ -303,7 +303,10 @@ def _copy_vui_parameters(
     video_signal_type_present_flag = reader.read_u1()
     writer.write_u1(video_signal_type_present_flag)
     if video_signal_type_present_flag:
-        writer.write_bits(reader.read_bits(3), 3)  # video_format
+        video_format = reader.read_bits(3)
+        if video_format > 5:
+            raise MediaScrubError("h264 VUI video_format out of range")
+        writer.write_bits(video_format, 3)
         writer.write_u1(reader.read_u1())          # video_full_range_flag
         colour_description_present_flag = reader.read_u1()
         writer.write_u1(colour_description_present_flag)
@@ -315,14 +318,22 @@ def _copy_vui_parameters(
     chroma_loc_info_present_flag = reader.read_u1()
     writer.write_u1(chroma_loc_info_present_flag)
     if chroma_loc_info_present_flag:
-        writer.write_ue(reader.read_ue())  # chroma_sample_loc_type_top_field
-        writer.write_ue(reader.read_ue())  # chroma_sample_loc_type_bottom_field
+        chroma_top = reader.read_ue()
+        chroma_bottom = reader.read_ue()
+        if chroma_top > 5 or chroma_bottom > 5:
+            raise MediaScrubError("h264 VUI chroma location out of range")
+        writer.write_ue(chroma_top)
+        writer.write_ue(chroma_bottom)
 
     timing_info_present_flag = reader.read_u1()
     writer.write_u1(timing_info_present_flag)
     if timing_info_present_flag:
-        writer.write_bits(reader.read_bits(32), 32)  # num_units_in_tick
-        writer.write_bits(reader.read_bits(32), 32)  # time_scale
+        num_units_in_tick = reader.read_bits(32)
+        time_scale = reader.read_bits(32)
+        if num_units_in_tick == 0 or time_scale == 0:
+            raise MediaScrubError("h264 VUI timing values must be positive")
+        writer.write_bits(num_units_in_tick, 32)
+        writer.write_bits(time_scale, 32)
         writer.write_u1(reader.read_u1())            # fixed_frame_rate_flag
 
     nal_hrd_present = reader.read_u1()
@@ -344,10 +355,24 @@ def _copy_vui_parameters(
     writer.write_u1(bitstream_restriction_flag)
     if bitstream_restriction_flag:
         writer.write_u1(reader.read_u1())  # motion_vectors_over_pic_boundaries_flag
-        writer.write_ue(reader.read_ue())  # max_bytes_per_pic_denom
-        writer.write_ue(reader.read_ue())  # max_bits_per_mb_denom
-        writer.write_ue(reader.read_ue())  # log2_max_mv_length_horizontal
-        writer.write_ue(reader.read_ue())  # log2_max_mv_length_vertical
+        max_bytes_per_pic_denom = reader.read_ue()
+        max_bits_per_mb_denom = reader.read_ue()
+        max_mv_horizontal = reader.read_ue()
+        max_mv_vertical = reader.read_ue()
+        if any(
+            value > 16
+            for value in (
+                max_bytes_per_pic_denom,
+                max_bits_per_mb_denom,
+                max_mv_horizontal,
+                max_mv_vertical,
+            )
+        ):
+            raise MediaScrubError("h264 VUI bitstream restriction value out of range")
+        writer.write_ue(max_bytes_per_pic_denom)
+        writer.write_ue(max_bits_per_mb_denom)
+        writer.write_ue(max_mv_horizontal)
+        writer.write_ue(max_mv_vertical)
         max_num_reorder_frames = reader.read_ue()
         max_dec_frame_buffering = reader.read_ue()
         if (
@@ -556,35 +581,9 @@ def _parse_and_emit_pps_rbsp(rbsp: bytes) -> tuple[bytes, int, int]:
         raise MediaScrubError("h264 pps num_slice_groups_minus1 out of range")
     writer.write_ue(num_slice_groups_minus1)
     if num_slice_groups_minus1 > 0:
-        slice_group_map_type = reader.read_ue()
-        if slice_group_map_type > 6:
-            raise MediaScrubError("h264 pps slice_group_map_type out of range")
-        writer.write_ue(slice_group_map_type)
-        if slice_group_map_type == 0:
-            for _ in range(num_slice_groups_minus1 + 1):
-                writer.write_ue(reader.read_ue())  # run_length_minus1
-        elif slice_group_map_type == 2:
-            for _ in range(num_slice_groups_minus1):
-                writer.write_ue(reader.read_ue())  # top_left
-                writer.write_ue(reader.read_ue())  # bottom_right
-        elif slice_group_map_type in (3, 4, 5):
-            writer.write_u1(reader.read_u1())  # slice_group_change_direction_flag
-            writer.write_ue(reader.read_ue())  # slice_group_change_rate_minus1
-        elif slice_group_map_type == 6:
-            pic_size_in_map_units_minus1 = reader.read_ue()
-            if pic_size_in_map_units_minus1 > 65535:
-                raise MediaScrubError("h264 pps pic_size_in_map_units_minus1 too large")
-            writer.write_ue(pic_size_in_map_units_minus1)
-            # ceil(log2(num_slice_groups_minus1 + 1)) bits per unit
-            n = num_slice_groups_minus1 + 1
-            bit_width = max(1, (n - 1).bit_length())
-            for _ in range(pic_size_in_map_units_minus1 + 1):
-                slice_group_id = reader.read_bits(bit_width)
-                if slice_group_id >= n:
-                    raise MediaScrubError(
-                        "h264 slice_group_id out of range for map type 6"
-                    )
-                writer.write_bits(slice_group_id, bit_width)
+        raise MediaScrubError(
+            "h264 PPS FMO slice groups are outside the supported subset"
+        )
 
     num_ref_idx_l0_default_active_minus1 = reader.read_ue()
     num_ref_idx_l1_default_active_minus1 = reader.read_ue()
