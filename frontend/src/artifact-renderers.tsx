@@ -18,11 +18,12 @@ import {
   type LoadedPdf,
 } from "./pdfjs-runtime";
 import {
-  BRUSH_TUPLE_SIGNAL,
+  brushParamName,
   buildInteractiveSpec,
   makeBrushBuffer,
   plotInteractivity,
   type PlotDomains,
+  type ZoomChannel,
 } from "./plot-interaction";
 import { ShikiCode, useCurrentTheme } from "./shiki";
 import { StatusBadge, statusToTone } from "./status-badge";
@@ -494,15 +495,19 @@ export function PlotRenderer({
           const buffer = makeBrushBuffer(interactivity.channels, (domains) => {
             brushRef.current?.(domains);
           });
-          try {
-            // Listen to the compiled tuple signal (channel-tagged) rather
-            // than the user-facing `wiki_brush` (field-keyed) — the latter
-            // loses per-channel info when both axes share a field and
-            // escapes nested paths inconsistently across Vega versions.
-            result.view.addSignalListener(BRUSH_TUPLE_SIGNAL, (_name, value) => buffer.onSignal(value));
-          } catch { /* Vega drops listeners if the param is stripped by user spec */ }
-          // pointercancel clears pending so a later unrelated pointerup
-          // can't fire a stale zoom from an interrupted gesture.
+          // Each zoomable channel has its own 1D brush param, whose top-level
+          // signal fires as `{ <compiledFieldName>: [low, high] }` on every
+          // brush update. Independent signals side-step Vega-Lite's dedup of
+          // same-field-both-axes selections and the escape-inconsistency of
+          // field-name keys in the shared user-facing signal.
+          for (const channel of interactivity.channels as ZoomChannel[]) {
+            const signalName = brushParamName(channel);
+            try {
+              result.view.addSignalListener(signalName, (_name, value) => {
+                buffer.onChannelSignal(channel, value);
+              });
+            } catch { /* Vega drops listeners if user spec stripped the param */ }
+          }
           window.addEventListener("pointerup", buffer.onPointerUp);
           window.addEventListener("pointercancel", buffer.onCancel);
           brushCleanup = () => {

@@ -6,10 +6,10 @@
 // continuous positional channels that are directly projectable — quantitative
 // or temporal, not binned, not aggregated, not timeUnit-transformed.
 //
-// Brush selection extents are read from the compiled `wiki_brush_tuple`
-// signal (channel-tagged) rather than the user-facing `wiki_brush` signal
-// (field-keyed) because the latter drops distinctness when x and y share a
-// field and escapes nested paths inconsistently across Vega versions.
+// Design: independent per-channel interval parameters, one pair (zoom +
+// brush) per zoomable channel. Same-field-on-both-axes therefore Just Works
+// without rewriting user data or encodings: each parameter has its own store,
+// its own signals, its own visual mark — Vega-Lite has nothing to dedupe.
 
 export type VegaLiteSpec = Record<string, unknown>;
 export type ZoomChannel = "x" | "y";
@@ -20,24 +20,27 @@ export type PlotInteractivity =
   | { mode: "tooltip" }
   | { mode: "full"; channels: ZoomChannel[] };
 
-export const ZOOM_PARAM = "wiki_zoom";
-export const BRUSH_PARAM = "wiki_brush";
-export const BRUSH_TUPLE_SIGNAL = `${BRUSH_PARAM}_tuple`;
+export const ZOOM_PARAM_PREFIX = "wiki_zoom";
+export const BRUSH_PARAM_PREFIX = "wiki_brush";
 
-// Every Vega signal that our injected wiki_zoom / wiki_brush params generate.
-// Any user param whose name matches one of these (or starts with the prefix +
-// underscore) would collide at parse time with "Duplicate signal name".
-const RESERVED_PARAM_PREFIXES = [ZOOM_PARAM, BRUSH_PARAM] as const;
+export function zoomParamName(channel: ZoomChannel): string {
+  return `${ZOOM_PARAM_PREFIX}_${channel}`;
+}
+
+export function brushParamName(channel: ZoomChannel): string {
+  return `${BRUSH_PARAM_PREFIX}_${channel}`;
+}
+
+// Every Vega signal, param, and store our injected params generate lives in
+// this namespace. A user-provided param, dataset, or data.name matching any
+// prefix would clash with a derived signal (Duplicate signal name) or a
+// selection store (source rows replaced with the selection tuple).
+const RESERVED_PARAM_PREFIXES = [ZOOM_PARAM_PREFIX, BRUSH_PARAM_PREFIX] as const;
 
 // Vega-Lite composite marks compile to multiple primitive marks and silently
-// strip interval selections: the classifier previously advertised full mode,
-// the UI enabled Reset and hinted drag/wheel/shift-drag, and nothing worked.
+// strip interval selections. Advertising full mode on these would enable a
+// Reset button and hint drag/wheel/shift-drag with no live wiring.
 const COMPOSITE_MARKS = new Set(["boxplot", "errorbar", "errorband"]);
-
-// Synthetic field name added by the aliasing transform so same-field-both-axes
-// specs get two distinct field identifiers on the interval projection (Vega-
-// Lite dedupes identical projections and drops the second channel).
-const Y_ALIAS_FIELD = "__wiki_plot_y_axis__";
 
 const COMPOSITE_KEYS = ["layer", "facet", "concat", "hconcat", "vconcat", "repeat", "spec"];
 
@@ -62,14 +65,12 @@ function continuousChannel(encoding: Record<string, unknown>, channel: ZoomChann
   if (!def) return false;
   if (def.type !== "quantitative" && def.type !== "temporal") return false;
   if (def.bin) return false;
-  // Aggregate encodings can't be interval-projected in Vega-Lite; timeUnit
-  // encodings key the tuple off a compiled name (e.g. yearmonth_ts) that
-  // isn't the source field, so downstream domain application would break.
+  // Aggregate encodings can't be interval-projected; timeUnit encodings key
+  // the tuple off a compiled name (yearmonth_ts) that isn't the source field.
   if (def.aggregate) return false;
   if (def.timeUnit) return false;
-  // scale: null suppresses scale compilation for the channel; interval
-  // projection would then have no domainRaw to bind to and Vega-Lite throws
-  // "Cannot read properties of undefined (reading get)".
+  // scale: null suppresses scale compilation; interval projection would then
+  // have no domainRaw to bind to and Vega-Lite throws.
   if ("scale" in def && def.scale === null) return false;
   return typeof def.field === "string" && def.field.length > 0;
 }
@@ -80,6 +81,27 @@ function paramNameCollision(spec: Record<string, unknown>): boolean {
     const record = asRecord(param);
     return typeof record?.name === "string" && isReservedName(record.name);
   });
+}
+
+// Vega-Lite compiles each interval param into a selection store (dataset
+// named `<param>_store`). If a user top-level dataset already uses one of
+// those names, the first selection update replaces its rows with the
+// selection tuple — the chart goes empty. Guard against that too.
+function datasetNameCollision(spec: Record<string, unknown>): boolean {
+  const datasets = asRecord(spec.datasets);
+  if (datasets && Object.keys(datasets).some(isReservedName)) return true;
+  const data = asRecord(spec.data);
+  if (data && typeof data.name === "string" && isReservedName(data.name)) return true;
+  return false;
+}
+
+// Vega-Lite v3-v4 kept selections in a top-level `selection` object. v5+
+// accepts either form, but when both a legacy `selection` and new-style
+// `params` coexist Vega-Lite compiles ONLY the legacy selections and drops
+// every injected param — the inspector would advertise handlers that don't
+// exist. Simpler to degrade than to normalize the legacy form.
+function hasLegacySelection(spec: Record<string, unknown>): boolean {
+  return "selection" in spec;
 }
 
 export function plotInteractivity(spec: unknown): PlotInteractivity {
@@ -93,15 +115,9 @@ export function plotInteractivity(spec: unknown): PlotInteractivity {
     if (continuousChannel(encoding, channel)) channels.push(channel);
   }
   if (channels.length === 0) return { mode: "tooltip" };
-  // A spec that already reserves any wiki_zoom* or wiki_brush* signal name
-  // would trip Vega's duplicate-signal check on inject. Degrade to tooltip so
-  // the plot still renders — WIKI-194 must not regress previously-working
-  // payloads. (The check spans the whole namespace because Vega-Lite compiles
-  // a family of derived signals per interval parameter.)
   if (paramNameCollision(record)) return { mode: "tooltip" };
-  // Vega-Lite silently strips interval selections from composite marks
-  // (boxplot, errorbar, errorband). Advertising drag/wheel/shift-drag on
-  // those would give a Reset button and hint text with no live wiring.
+  if (datasetNameCollision(record)) return { mode: "tooltip" };
+  if (hasLegacySelection(record)) return { mode: "tooltip" };
   const mark = markType(record);
   if (mark && COMPOSITE_MARKS.has(mark)) return { mode: "tooltip" };
   return { mode: "full", channels };
@@ -110,70 +126,6 @@ export function plotInteractivity(spec: unknown): PlotInteractivity {
 // Event streams gated on shift so plain drag pans while shift+drag brushes.
 const PAN_STREAM = "[pointerdown[!event.shiftKey], window:pointerup] > window:pointermove!";
 const BRUSH_STREAM = "[pointerdown[event.shiftKey], window:pointerup] > window:pointermove!";
-
-function encodingField(encoding: Record<string, unknown> | null, channel: ZoomChannel): string | null {
-  if (!encoding) return null;
-  const def = asRecord(encoding[channel]);
-  return typeof def?.field === "string" ? def.field : null;
-}
-
-// Ports Vega-Lite / vega-util's field-path parser: split "a.b" into ["a","b"],
-// "a\\.b" into ["a.b"], "a[0]" into ["a","0"], and "a[0].b" into ["a","0","b"].
-// Inlined so the module stays clear of a runtime vega-util dep (this module is
-// eagerly imported and vega-util would bloat the initial chunk).
-function splitFieldPath(path: string): string[] {
-  const out: string[] = [];
-  const n = path.length;
-  let quote: string | null = null;
-  let bracket = 0;
-  let escaped = "";
-  let i = 0;
-  let j = 0;
-  function push(): void {
-    out.push(escaped + path.substring(i, j));
-    escaped = "";
-    i = j + 1;
-  }
-  for (i = j = 0; j < n; j += 1) {
-    const c = path[j];
-    if (c === "\\") {
-      escaped += path.substring(i, j);
-      j += 1;
-      i = j;
-    } else if (c === quote) {
-      push();
-      quote = null;
-      bracket = -1;
-    } else if (quote) {
-      continue;
-    } else if (i === bracket && (c === '"' || c === "'")) {
-      i = j + 1;
-      quote = c;
-    } else if (c === "." && !bracket) {
-      if (j > i) push();
-      else i = j + 1;
-    } else if (c === "[") {
-      if (j > i) push();
-      bracket = i = j + 1;
-    } else if (c === "]") {
-      if (bracket > 0) push();
-      bracket = 0;
-      i = j + 1;
-    }
-  }
-  if (j > i) {
-    j += 1;
-    push();
-  }
-  return out;
-}
-
-// Builds a Vega expression that reads the given Vega-Lite field path from
-// `datum`. Bracketed with quoted strings so nested (a.b), escaped literal
-// (a\.b), and array-index (a[0]) paths all resolve to the correct value.
-function accessExpression(path: string): string {
-  return "datum" + splitFieldPath(path).map((segment) => `[${JSON.stringify(segment)}]`).join("");
-}
 
 export function buildInteractiveSpec(
   spec: VegaLiteSpec,
@@ -198,49 +150,6 @@ export function buildInteractiveSpec(
   if (interactivity.mode !== "full") return next;
 
   const encoding = asRecord(next.encoding);
-
-  // Same-field-both-axes: Vega-Lite's interval selection dedupes projections
-  // on identical fields, so a spec with x.field === y.field would compile
-  // wiki_zoom for x only, drop y's domainRaw, and produce a tuple with just
-  // the x extent. Alias the y-channel via a calculate transform so the
-  // selection sees two distinct fields.
-  if (
-    encoding
-    && interactivity.channels.includes("x")
-    && interactivity.channels.includes("y")
-    && encodingField(encoding, "x") === encodingField(encoding, "y")
-  ) {
-    const originalField = encodingField(encoding, "x")!;
-    const priorTransform = Array.isArray(next.transform) ? next.transform : [];
-    // accessExpression handles nested (a.b), array-index (a[0]), and
-    // escaped-dot (a\.b) field paths — a literal datum[originalField] would
-    // fail for those, the aliased value would be undefined for every row,
-    // and Vega would drop the data so the plot renders empty.
-    next.transform = [
-      ...priorTransform,
-      { calculate: accessExpression(originalField), as: Y_ALIAS_FIELD },
-    ];
-    const yDef = asRecord(encoding.y)!;
-    if (yDef.axis === null) {
-      // Author explicitly hid the axis (axis:null). Do NOT materialize an
-      // axis object here — that would reveal it and leak the workaround.
-      encoding.y = { ...yDef, field: Y_ALIAS_FIELD };
-    } else {
-      // Title precedence: existing axis.title > encoding-level title > raw
-      // field name. Only add axis.title when neither source already provides
-      // a label; otherwise the alias field name would leak to the user.
-      const yAxis = asRecord(yDef.axis);
-      const hasAxisTitle = yAxis !== null && "title" in yAxis;
-      const hasEncodingTitle = "title" in yDef;
-      const nextAxis = hasAxisTitle || hasEncodingTitle
-        ? (yAxis ?? undefined)
-        : { ...(yAxis ?? {}), title: originalField };
-      encoding.y = nextAxis === undefined
-        ? { ...yDef, field: Y_ALIAS_FIELD }
-        : { ...yDef, field: Y_ALIAS_FIELD, axis: nextAxis };
-    }
-  }
-
   if (encoding && domains) {
     for (const channel of interactivity.channels) {
       const domain = domains[channel];
@@ -253,27 +162,27 @@ export function buildInteractiveSpec(
 
   if (armed) {
     const params = Array.isArray(next.params) ? next.params : [];
-    next.params = [
-      ...params,
-      {
-        name: ZOOM_PARAM,
-        // `bind: "scales"` lives at the parameter level in Vega-Lite v5/v6.
-        // Nested inside `select` it is silently ignored — the compiled scales
-        // get no domainRaw signal, and drag draws a rectangle instead of
-        // panning, wheel resizes the rectangle instead of zooming.
+    const injected: unknown[] = [];
+    for (const channel of interactivity.channels) {
+      injected.push({
+        name: zoomParamName(channel),
+        // `bind: "scales"` at the parameter level (not inside select) makes
+        // Vega-Lite wire domainRaw so drag pans the scale and wheel zooms it.
+        // Nested inside select the bind is silently dropped and the same
+        // events would draw a selection rectangle instead of moving the axis.
         select: {
           type: "interval",
-          encodings: interactivity.channels,
+          encodings: [channel],
           translate: PAN_STREAM,
           zoom: "wheel!",
         },
         bind: "scales",
-      },
-      {
-        name: BRUSH_PARAM,
+      });
+      injected.push({
+        name: brushParamName(channel),
         select: {
           type: "interval",
-          encodings: interactivity.channels,
+          encodings: [channel],
           on: BRUSH_STREAM,
           translate: false,
           zoom: false,
@@ -285,86 +194,88 @@ export function buildInteractiveSpec(
             strokeDash: [4, 3],
           },
         },
-      },
-    ];
+      });
+    }
+    next.params = [...params, ...injected];
   }
   return next;
 }
 
-// Vega-Lite emits `<brush>_tuple` as `{fields: [{field, channel, type}, ...],
-// values: [[low, high], ...]}` with fields and values ordered identically.
-// The channel tag is authoritative — it survives nested field paths (a.b),
-// escaped chars, and (with the aliasing transform above) same-field-both-axes.
-export function tupleDomains(
-  value: unknown,
-  channels: readonly ZoomChannel[],
-): PlotDomains | null {
+// A 1D interval-selection signal is `{ <fieldName>: [low, high] }` when a
+// range is selected and `{}` when it is empty. We take the first value in
+// the object regardless of the key — the key is the compiled field name
+// (which can be an escaped nested path) and we never need to interpret it
+// because each param projects exactly one channel by construction.
+export function extentFromSignal(value: unknown): [number, number] | null {
   const record = asRecord(value);
   if (!record) return null;
-  const fields = Array.isArray(record.fields) ? record.fields : null;
-  const values = Array.isArray(record.values) ? record.values : null;
-  if (!fields || !values || fields.length !== values.length) return null;
-  const allow = new Set(channels);
-  const domains: PlotDomains = {};
-  for (let i = 0; i < fields.length; i += 1) {
-    const meta = asRecord(fields[i]);
-    if (!meta) continue;
-    const channel = meta.channel;
-    if (channel !== "x" && channel !== "y") continue;
-    if (!allow.has(channel)) continue;
-    const extent = values[i];
-    if (!Array.isArray(extent) || extent.length !== 2) continue;
-    const low = Number(extent[0]);
-    const high = Number(extent[1]);
-    if (!Number.isFinite(low) || !Number.isFinite(high) || low === high) continue;
-    domains[channel] = low < high ? [low, high] : [high, low];
-  }
-  return Object.keys(domains).length > 0 ? domains : null;
+  const values = Object.values(record);
+  if (values.length === 0) return null;
+  const extent = values[0];
+  if (!Array.isArray(extent) || extent.length !== 2) return null;
+  const low = Number(extent[0]);
+  const high = Number(extent[1]);
+  if (!Number.isFinite(low) || !Number.isFinite(high) || low === high) return null;
+  return low < high ? [low, high] : [high, low];
 }
 
-// Recognizes a signal payload as a well-formed tuple even if it carries no
-// usable extents (e.g. the user shrank the brush back to a point). A shape-
-// less payload (null, undefined, primitive) is treated as noise and left
+// Recognizes a signal payload as a well-formed selection signal even when it
+// carries no usable extent (the empty `{}` Vega emits when the brush shrinks
+// back to a point). Shape-less noise (null, undefined, primitives) is left
 // alone so unrelated signals don't wipe pending state.
-function isWellFormedTuple(value: unknown): boolean {
-  const record = asRecord(value);
-  return record !== null
-    && Array.isArray(record.fields)
-    && Array.isArray(record.values);
+function isWellFormedSignal(value: unknown): boolean {
+  return asRecord(value) !== null;
 }
 
-// Buffers Vega's brush tuple (which fires on every pointermove during a
-// shift-drag) and only commits the final extent to React once the gesture
-// ends. Without this, the domains state update would re-run the embed effect
-// mid-drag and abort the gesture before the user releases.
+// Buffers Vega's per-channel brush signals (which fire on every pointermove
+// during a shift-drag) and only commits the final extent to React once the
+// gesture ends. Without this, the domains state update would re-run the
+// embed effect mid-drag and abort the gesture before the user releases.
+//
+// Per-channel signals are handled independently: a shift-drag that leaves x
+// selected but shrinks y to empty commits `{x: [...]}` on pointerup — the y
+// channel's pending gets cleared, x's stays.
 export function makeBrushBuffer(
   channels: readonly ZoomChannel[],
   commit: (domains: PlotDomains) => void,
 ): {
-  onSignal: (value: unknown) => void;
+  onChannelSignal: (channel: ZoomChannel, value: unknown) => void;
   onPointerUp: () => void;
   onCancel: () => void;
 } {
-  let pending: PlotDomains | null = null;
+  const pending: PlotDomains = {};
+  const allow = new Set(channels);
   return {
-    onSignal(value: unknown) {
-      if (!isWellFormedTuple(value)) return;
-      // A well-formed tuple that yields no usable extents means the user
-      // shrank the brush to a point (or dragged back to the anchor). Clear
-      // pending so a later pointerup doesn't commit an intermediate extent.
-      pending = tupleDomains(value, channels);
+    onChannelSignal(channel: ZoomChannel, value: unknown) {
+      if (!allow.has(channel)) return;
+      if (!isWellFormedSignal(value)) return;
+      const extent = extentFromSignal(value);
+      if (extent) {
+        pending[channel] = extent;
+      } else {
+        // Well-formed signal but no usable extent — user shrank the brush
+        // back to a point on this channel. Clear its pending so pointerup
+        // doesn't commit an earlier intermediate range.
+        delete pending[channel];
+      }
     },
     onPointerUp() {
-      if (pending === null) return;
-      const domains = pending;
-      pending = null;
+      const keys = Object.keys(pending) as ZoomChannel[];
+      if (keys.length === 0) return;
+      const domains: PlotDomains = {};
+      for (const key of keys) {
+        domains[key] = pending[key];
+        delete pending[key];
+      }
       commit(domains);
     },
-    // Called on pointercancel and any other gesture abort. Discards whatever
-    // extent had accumulated so a subsequent unrelated pointerup can't fire
-    // a stale zoom.
+    // Called on pointercancel and other gesture aborts. Drops whatever
+    // extent accumulated so a later unrelated pointerup can't fire a
+    // stale zoom.
     onCancel() {
-      pending = null;
+      for (const key of Object.keys(pending) as ZoomChannel[]) {
+        delete pending[key];
+      }
     },
   };
 }

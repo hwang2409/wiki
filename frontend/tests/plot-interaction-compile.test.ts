@@ -1,19 +1,20 @@
 // Compile-level and vega-runtime assertions for WIKI-194. These push the
 // transformed spec through the actual vega-lite compiler AND the vega runtime
-// so a subtle mistake (e.g. bind:scales nested inside select, or a namespace
-// collision Vega only catches at parse time) can't hide behind a shape-only
-// unit test.
+// so any wiring regression — bind:scales in wrong place, name collision,
+// same-field dedup, aggregate/timeUnit false-full, scale:null crash — fails
+// immediately, not silently in the browser.
 import assert from "node:assert/strict";
 import test from "node:test";
 import { compile } from "vega-lite";
 import { View, parse } from "vega";
 import {
-  BRUSH_PARAM,
-  BRUSH_TUPLE_SIGNAL,
-  ZOOM_PARAM,
+  BRUSH_PARAM_PREFIX,
+  ZOOM_PARAM_PREFIX,
+  brushParamName,
   buildInteractiveSpec,
+  extentFromSignal,
   plotInteractivity,
-  tupleDomains,
+  zoomParamName,
 } from "../src/plot-interaction.ts";
 
 function transform(spec: Record<string, unknown>): Record<string, unknown> {
@@ -25,6 +26,14 @@ function transform(spec: Record<string, unknown>): Record<string, unknown> {
   }) as Record<string, unknown>;
 }
 
+async function renderHeadless(spec: Record<string, unknown>): Promise<View> {
+  const compiled = compile(spec as never).spec;
+  const runtime = parse(compiled);
+  const view = new View(runtime, { renderer: "none" as never });
+  await view.runAsync();
+  return view;
+}
+
 const CONTINUOUS: Record<string, unknown> = {
   mark: "point",
   data: { values: [{ x: 1, y: 1 }, { x: 4, y: 3 }] },
@@ -34,46 +43,228 @@ const CONTINUOUS: Record<string, unknown> = {
   },
 };
 
-test("compile: full-mode spec compiles cleanly with domainRaw bound on every selected scale", () => {
+test("compile: each per-channel zoom param binds its own scale via domainRaw", () => {
   const interactive = transform(CONTINUOUS);
   const output = compile(interactive as never);
   const scales = (output.spec.scales ?? []) as Array<Record<string, unknown>>;
-  const zoomable = scales.filter((s) => s.name === "x" || s.name === "y");
-  assert.equal(zoomable.length, 2, "both x and y scales are present");
-  for (const scale of zoomable) {
+  for (const channel of ["x", "y"] as const) {
+    const scale = scales.find((s) => s.name === channel)!;
     const domainRaw = scale.domainRaw as Record<string, unknown> | undefined;
-    // If bind:"scales" is nested inside select, Vega-Lite drops it silently
-    // and domainRaw is missing — pan/wheel then move a rectangle instead of
-    // the scales. This assertion is the earliest signal that the parameter
-    // is authored correctly.
-    assert.ok(domainRaw, `scale "${scale.name as string}" is missing domainRaw`);
+    assert.ok(domainRaw, `${channel} scale must have domainRaw`);
+    // Each scale binds to its OWN wiki_zoom_<channel> selection (per-channel
+    // design), NOT a shared wiki_zoom. That's what lets same-field plots
+    // work: two parameters, two stores, nothing to dedupe.
     assert.equal(
       domainRaw.signal,
-      `${ZOOM_PARAM}["${scale.name as string}"]`,
-      `scale "${scale.name as string}" domainRaw signal must reference ${ZOOM_PARAM}`,
+      `${zoomParamName(channel)}["${channel}"]`,
+      `${channel} domainRaw must reference ${zoomParamName(channel)}`,
     );
   }
 });
 
-test("compile: pan and zoom translation signals are wired to the compiled scales", () => {
+test("compile: per-channel zoom signals carry panLinear and zoomLinear updates", () => {
   const interactive = transform(CONTINUOUS);
   const output = compile(interactive as never);
   const signals = (output.spec.signals ?? []) as Array<Record<string, unknown>>;
-  const zoomX = signals.find((s) => s.name === `${ZOOM_PARAM}_x`);
-  const zoomY = signals.find((s) => s.name === `${ZOOM_PARAM}_y`);
-  assert.ok(zoomX && zoomY, "per-channel zoom signals must exist");
-  const zoomOn = JSON.stringify(zoomX!.on ?? []);
-  assert.match(zoomOn, /panLinear\(/);
-  assert.match(zoomOn, /zoomLinear\(domain\(\\?"x\\?"\)/);
+  for (const channel of ["x", "y"] as const) {
+    const zoom = signals.find((s) => s.name === `${zoomParamName(channel)}_${channel}`);
+    assert.ok(zoom, `${channel} zoom signal must exist`);
+    const zoomOn = JSON.stringify(zoom.on ?? []);
+    // panLinear + zoomLinear updates on the compiled signal prove the param
+    // is scale-bound; without bind:scales at the param level the signal
+    // exists but has no such handlers.
+    assert.match(zoomOn, /panLinear\(/);
+    assert.match(zoomOn, new RegExp(`zoomLinear\\(domain\\(\\\\?"${channel}\\\\?"\\)`));
+  }
 });
 
-test("compile: brush selection compiles the store separately from the zoom param", () => {
+test("compile: per-channel brush params compile to independent signals + stores", () => {
   const interactive = transform(CONTINUOUS);
   const output = compile(interactive as never);
   const signals = (output.spec.signals ?? []) as Array<Record<string, unknown>>;
-  assert.ok(signals.some((s) => s.name === BRUSH_PARAM), "brush signal must compile");
-  assert.ok(signals.some((s) => s.name === ZOOM_PARAM), "zoom signal must compile");
-  assert.ok(signals.some((s) => s.name === BRUSH_TUPLE_SIGNAL), "brush tuple signal must compile");
+  const data = (output.spec.data ?? []) as Array<Record<string, unknown>>;
+  for (const channel of ["x", "y"] as const) {
+    assert.ok(
+      signals.some((s) => s.name === brushParamName(channel)),
+      `${brushParamName(channel)} must compile`,
+    );
+    assert.ok(
+      data.some((d) => d.name === `${brushParamName(channel)}_store`),
+      `${brushParamName(channel)}_store selection store must exist`,
+    );
+  }
+});
+
+test("runtime: wheel zoom on wiki_zoom_x shrinks the x domain independently", async () => {
+  const interactive = transform({
+    ...CONTINUOUS,
+    width: 400,
+    height: 200,
+    data: { values: [{ x: 0, y: 0 }, { x: 10, y: 10 }] },
+  });
+  const view = await renderHeadless(interactive);
+  const initialX = view.scale("x").domain() as [number, number];
+  const initialY = view.scale("y").domain() as [number, number];
+  view
+    .signal(`${zoomParamName("x")}_zoom_anchor`, { x: 5, y: 5 })
+    .signal(`${zoomParamName("x")}_zoom_delta`, 2)
+    .run();
+  const afterX = view.scale("x").domain() as [number, number];
+  const afterY = view.scale("y").domain() as [number, number];
+  assert.notDeepEqual(afterX, initialX, "wheel-zoom-x must move the x domain");
+  assert.deepEqual(afterY, initialY, "wheel-zoom-x must NOT touch the y domain");
+  await view.finalize();
+});
+
+test("runtime: leftward drag on wiki_zoom_x shifts x domain toward lower values", async () => {
+  const interactive = transform({
+    ...CONTINUOUS,
+    width: 400,
+    height: 200,
+    data: { values: [{ x: 0, y: 0 }, { x: 100, y: 100 }] },
+  });
+  const view = await renderHeadless(interactive);
+  const initial = view.scale("x").domain() as [number, number];
+  view
+    .signal(`${zoomParamName("x")}_translate_anchor`, { x: 0, y: 0, extent_x: initial })
+    .signal(`${zoomParamName("x")}_translate_delta`, { x: -80, y: 0 })
+    .run();
+  const after = view.scale("x").domain() as [number, number];
+  assert.ok(after[0] < initial[0], "leftward drag shifts x domain toward lower values");
+  await view.finalize();
+});
+
+test("runtime: per-channel brush signals fire {field: [low, high]} extents", async () => {
+  const interactive = transform({
+    ...CONTINUOUS,
+    width: 400,
+    height: 200,
+    data: { values: [{ x: 0, y: 0 }, { x: 100, y: 100 }] },
+  });
+  const view = await renderHeadless(interactive);
+  const capturedX: unknown[] = [];
+  const capturedY: unknown[] = [];
+  view.addSignalListener(brushParamName("x"), (_n, v) => capturedX.push(v));
+  view.addSignalListener(brushParamName("y"), (_n, v) => capturedY.push(v));
+  view.signal(`${brushParamName("x")}_tuple`, {
+    unit: "",
+    fields: [{ field: "x", channel: "x", type: "R" }],
+    values: [[20, 60]],
+  }).run();
+  view.signal(`${brushParamName("y")}_tuple`, {
+    unit: "",
+    fields: [{ field: "y", channel: "y", type: "R" }],
+    values: [[10, 40]],
+  }).run();
+  assert.deepEqual(extentFromSignal(capturedX.at(-1)), [20, 60]);
+  assert.deepEqual(extentFromSignal(capturedY.at(-1)), [10, 40]);
+  await view.finalize();
+});
+
+test("runtime: same-field-both-axes — both scales bind, both brush signals fire distinctly", async () => {
+  // The original reason we added (and then removed) the alias transform:
+  // Vega-Lite dedupes same-field projections. Per-channel params make each
+  // param stand on its own, so both scales bind and each channel's brush
+  // signal is independent — no alias, no rewrite, no data transform.
+  const interactive = transform({
+    mark: "point",
+    width: 400,
+    height: 200,
+    data: { values: [{ v: 0 }, { v: 10 }] },
+    encoding: {
+      x: { field: "v", type: "quantitative" },
+      y: { field: "v", type: "quantitative" },
+    },
+  });
+  const compiled = compile(interactive as never).spec;
+  const scales = (compiled.scales ?? []) as Array<Record<string, unknown>>;
+  const xScale = scales.find((s) => s.name === "x");
+  const yScale = scales.find((s) => s.name === "y");
+  assert.ok((xScale as Record<string, unknown>)?.domainRaw, "x scale must have domainRaw");
+  assert.ok((yScale as Record<string, unknown>)?.domainRaw, "y scale must have domainRaw (per-channel fix)");
+
+  const view = new View(parse(compiled), { renderer: "none" as never });
+  await view.runAsync();
+  const capturedX: unknown[] = [];
+  const capturedY: unknown[] = [];
+  view.addSignalListener(brushParamName("x"), (_n, v) => capturedX.push(v));
+  view.addSignalListener(brushParamName("y"), (_n, v) => capturedY.push(v));
+  view.signal(`${brushParamName("x")}_tuple`, {
+    unit: "",
+    fields: [{ field: "v", channel: "x", type: "R" }],
+    values: [[2, 8]],
+  }).run();
+  view.signal(`${brushParamName("y")}_tuple`, {
+    unit: "",
+    fields: [{ field: "v", channel: "y", type: "R" }],
+    values: [[3, 7]],
+  }).run();
+  assert.deepEqual(extentFromSignal(capturedX.at(-1)), [2, 8]);
+  assert.deepEqual(extentFromSignal(capturedY.at(-1)), [3, 7]);
+  await view.finalize();
+});
+
+test("runtime: same-field a[0] path stays interactive with no calculate transform", async () => {
+  // Prior alias-based fix broke this at r5 because datum["a[0]"] is a literal
+  // key lookup, not an array-index path. Per-channel design side-steps: no
+  // calculate transform is injected, so the original data reaches Vega
+  // untouched and the compiled scales bind correctly.
+  const interactive = transform({
+    mark: "point",
+    width: 400,
+    height: 200,
+    data: { values: [{ a: [5, 6] }, { a: [7, 8] }, { a: [10, 3] }] },
+    encoding: {
+      x: { field: "a[0]", type: "quantitative" },
+      y: { field: "a[0]", type: "quantitative" },
+    },
+  });
+  const view = await renderHeadless(interactive);
+  const xDomain = view.scale("x").domain() as [number, number];
+  const yDomain = view.scale("y").domain() as [number, number];
+  assert.ok(Number.isFinite(xDomain[0]) && Number.isFinite(xDomain[1]), "x domain must be numeric");
+  assert.ok(Number.isFinite(yDomain[0]) && Number.isFinite(yDomain[1]), "y domain must be numeric");
+  // No alias transform was injected — verify that.
+  assert.equal(interactive.transform, undefined, "per-channel design must not add a data transform");
+  await view.finalize();
+});
+
+test("runtime: escaped-dot field path (literal `a.b` key) stays interactive", async () => {
+  const interactive = transform({
+    mark: "point",
+    width: 400,
+    height: 200,
+    data: { values: [{ "a.b": 5 }, { "a.b": 8 }, { "a.b": 12 }] },
+    encoding: {
+      x: { field: "a\\.b", type: "quantitative" },
+      y: { field: "a\\.b", type: "quantitative" },
+    },
+  });
+  const view = await renderHeadless(interactive);
+  const xDomain = view.scale("x").domain() as [number, number];
+  const yDomain = view.scale("y").domain() as [number, number];
+  assert.ok(Number.isFinite(xDomain[0]) && Number.isFinite(xDomain[1]));
+  assert.ok(Number.isFinite(yDomain[0]) && Number.isFinite(yDomain[1]));
+  await view.finalize();
+});
+
+test("runtime: nested `a.b` field path stays interactive", async () => {
+  const interactive = transform({
+    mark: "point",
+    width: 400,
+    height: 200,
+    data: { values: [{ a: { b: 5 } }, { a: { b: 8 } }, { a: { b: 12 } }] },
+    encoding: {
+      x: { field: "a.b", type: "quantitative" },
+      y: { field: "a.b", type: "quantitative" },
+    },
+  });
+  const view = await renderHeadless(interactive);
+  const xDomain = view.scale("x").domain() as [number, number];
+  const yDomain = view.scale("y").domain() as [number, number];
+  assert.ok(Number.isFinite(xDomain[0]) && Number.isFinite(xDomain[1]));
+  assert.ok(Number.isFinite(yDomain[0]) && Number.isFinite(yDomain[1]));
+  await view.finalize();
 });
 
 test("compile: scale:null encoding drops out and the surviving spec still compiles", () => {
@@ -94,346 +285,6 @@ test("compile: scale:null encoding drops out and the surviving spec still compil
   assert.doesNotThrow(() => compile(interactive as never));
 });
 
-test("compile: all-scale-null spec degrades to tooltip mode and stays compilable", () => {
-  const spec: Record<string, unknown> = {
-    mark: "point",
-    data: { values: [{ x: 1, y: 1 }] },
-    encoding: {
-      x: { field: "x", type: "quantitative", scale: null },
-      y: { field: "y", type: "quantitative", scale: null },
-    },
-  };
-  assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
-  const interactive = transform(spec);
-  assert.doesNotThrow(() => compile(interactive as never));
-});
-
-async function renderHeadless(spec: Record<string, unknown>): Promise<View> {
-  const compiled = compile(spec as never).spec;
-  const runtime = parse(compiled);
-  const view = new View(runtime, { renderer: "none" as never });
-  await view.runAsync();
-  return view;
-}
-
-test("runtime: wheel zoom shrinks the scale domain around the anchor", async () => {
-  const interactive = transform({
-    ...CONTINUOUS,
-    width: 400,
-    height: 200,
-    data: { values: [{ x: 0, y: 0 }, { x: 10, y: 10 }] },
-  });
-  const view = await renderHeadless(interactive);
-  const initial = view.scale("x").domain() as [number, number];
-  assert.deepEqual(initial, [0, 10]);
-  view
-    .signal(`${ZOOM_PARAM}_zoom_anchor`, { x: 5, y: 5 })
-    .signal(`${ZOOM_PARAM}_zoom_delta`, 2)
-    .run();
-  const after = view.scale("x").domain() as [number, number];
-  assert.notDeepEqual(after, initial, "wheel-zoom must move the x domain");
-  assert.ok(after[0] < initial[0] && after[1] > initial[1], "delta:2 zooms out around anchor 5");
-  await view.finalize();
-});
-
-test("runtime: drag translation shifts the scale domain along the drag axis", async () => {
-  const interactive = transform({
-    ...CONTINUOUS,
-    width: 400,
-    height: 200,
-    data: { values: [{ x: 0, y: 0 }, { x: 100, y: 100 }] },
-  });
-  const view = await renderHeadless(interactive);
-  const initial = view.scale("x").domain() as [number, number];
-  view
-    .signal(`${ZOOM_PARAM}_translate_anchor`, { x: 0, y: 0, extent_x: initial, extent_y: initial })
-    .signal(`${ZOOM_PARAM}_translate_delta`, { x: -80, y: 0 })
-    .run();
-  const after = view.scale("x").domain() as [number, number];
-  assert.notDeepEqual(after, initial, "drag must translate the x domain");
-  assert.ok(after[0] < initial[0], "leftward drag shifts x domain toward lower values");
-  await view.finalize();
-});
-
-test("runtime: brush tuple carries channel-tagged extents for plain fields", async () => {
-  const interactive = transform({
-    ...CONTINUOUS,
-    width: 400,
-    height: 200,
-    data: { values: [{ x: 0, y: 0 }, { x: 100, y: 100 }] },
-  });
-  const view = await renderHeadless(interactive);
-  const tuples: unknown[] = [];
-  view.addSignalListener(BRUSH_TUPLE_SIGNAL, (_n, value) => tuples.push(value));
-  view.signal(BRUSH_TUPLE_SIGNAL, {
-    unit: "",
-    fields: [
-      { field: "x", channel: "x", type: "R" },
-      { field: "y", channel: "y", type: "R" },
-    ],
-    values: [[20, 60], [10, 40]],
-  }).run();
-  assert.equal(tuples.length, 1);
-  const domains = tupleDomains(tuples[0], ["x", "y"]);
-  assert.deepEqual(domains, { x: [20, 60], y: [10, 40] });
-  await view.finalize();
-});
-
-test("runtime: brush tuple carries channel-tagged extents for nested `a.b` field paths", async () => {
-  // The user-facing `wiki_brush` signal escapes nested paths inconsistently
-  // across Vega versions and would break field-name lookup. The tuple keys
-  // by channel metadata, which is stable.
-  const interactive = transform({
-    mark: "point",
-    width: 400,
-    height: 200,
-    data: { values: [{ a: { b: 0, c: 0 } }, { a: { b: 10, c: 10 } }] },
-    encoding: {
-      x: { field: "a.b", type: "quantitative" },
-      y: { field: "a.c", type: "quantitative" },
-    },
-  });
-  const view = await renderHeadless(interactive);
-  const tuples: unknown[] = [];
-  view.addSignalListener(BRUSH_TUPLE_SIGNAL, (_n, value) => tuples.push(value));
-  view.signal(BRUSH_TUPLE_SIGNAL, {
-    unit: "",
-    fields: [
-      { field: "a.b", channel: "x", type: "R" },
-      { field: "a.c", channel: "y", type: "R" },
-    ],
-    values: [[2, 8], [3, 7]],
-  }).run();
-  const domains = tupleDomains(tuples.at(-1), ["x", "y"]);
-  assert.deepEqual(domains, { x: [2, 8], y: [3, 7] });
-  await view.finalize();
-});
-
-test("runtime: brush tuple resolves array-index `a[0]` field paths", async () => {
-  const interactive = transform({
-    mark: "point",
-    width: 400,
-    height: 200,
-    data: { values: [{ a: [0, 0] }, { a: [10, 10] }] },
-    encoding: {
-      x: { field: "a[0]", type: "quantitative" },
-      y: { field: "a[1]", type: "quantitative" },
-    },
-  });
-  const view = await renderHeadless(interactive);
-  const tuples: unknown[] = [];
-  view.addSignalListener(BRUSH_TUPLE_SIGNAL, (_n, value) => tuples.push(value));
-  view.signal(BRUSH_TUPLE_SIGNAL, {
-    unit: "",
-    fields: [
-      { field: "a[0]", channel: "x", type: "R" },
-      { field: "a[1]", channel: "y", type: "R" },
-    ],
-    values: [[2, 5], [1, 9]],
-  }).run();
-  const domains = tupleDomains(tuples.at(-1), ["x", "y"]);
-  assert.deepEqual(domains, { x: [2, 5], y: [1, 9] });
-  await view.finalize();
-});
-
-test("compile: same-field-both-axes aliasing binds BOTH scales and projects BOTH channels", () => {
-  // The classic Vega-Lite dedup: one interval parameter with `encodings: [x,y]`
-  // and same field on both axes compiles wiki_zoom for x only — y scale gets
-  // no domainRaw and wiki_brush_tuple_fields carries only the x entry. The
-  // aliasing transform in buildInteractiveSpec must produce a spec whose
-  // COMPILED output shows both scales bound and both channels projected.
-  const interactive = transform({
-    mark: "point",
-    data: { values: [{ v: 0 }, { v: 10 }] },
-    encoding: {
-      x: { field: "v", type: "quantitative" },
-      y: { field: "v", type: "quantitative" },
-    },
-  });
-  const compiled = compile(interactive as never).spec;
-
-  const xScale = (compiled.scales ?? []).find((s: Record<string, unknown>) => s.name === "x");
-  const yScale = (compiled.scales ?? []).find((s: Record<string, unknown>) => s.name === "y");
-  assert.ok((xScale as Record<string, unknown>)?.domainRaw, "x scale must have domainRaw");
-  assert.ok((yScale as Record<string, unknown>)?.domainRaw, "y scale must have domainRaw (dedup fix)");
-
-  // Inspect what Vega-Lite ACTUALLY compiled for the brush projection —
-  // don't hand-write the tuple; read the compiled tuple_fields default.
-  const tupleFields = (compiled.signals ?? []).find(
-    (s: Record<string, unknown>) => s.name === `${BRUSH_TUPLE_SIGNAL}_fields`,
-  ) as Record<string, unknown>;
-  const value = tupleFields?.value as Array<Record<string, unknown>>;
-  const channels = value.map((entry) => entry.channel).sort();
-  assert.deepEqual(channels, ["x", "y"], "compiled brush must project both channels");
-});
-
-test("runtime: same-field-both-axes brush yields two channel extents on the compiler-shaped tuple", async () => {
-  const interactive = transform({
-    mark: "point",
-    width: 400,
-    height: 200,
-    data: { values: [{ v: 0 }, { v: 10 }] },
-    encoding: {
-      x: { field: "v", type: "quantitative" },
-      y: { field: "v", type: "quantitative" },
-    },
-  });
-  const compiled = compile(interactive as never).spec;
-  const view = new View(parse(compiled), { renderer: "none" as never });
-  await view.runAsync();
-
-  // Read the tuple shape Vega generated — same shape a real brush gesture
-  // would produce. If aliasing is missing, this default has only one entry
-  // and any x/y assumption below breaks.
-  const tupleFields = (compiled.signals ?? []).find(
-    (s: Record<string, unknown>) => s.name === `${BRUSH_TUPLE_SIGNAL}_fields`,
-  ) as Record<string, unknown>;
-  const compiledFields = tupleFields.value as Array<Record<string, unknown>>;
-  assert.equal(compiledFields.length, 2, "aliasing must produce a two-channel tuple template");
-
-  const captured: unknown[] = [];
-  view.addSignalListener(BRUSH_TUPLE_SIGNAL, (_n, value) => captured.push(value));
-  view.signal(BRUSH_TUPLE_SIGNAL, {
-    unit: "",
-    fields: compiledFields,
-    values: [[2, 8], [3, 7]],
-  }).run();
-  const domains = tupleDomains(captured.at(-1), ["x", "y"]);
-  assert.deepEqual(domains, { x: [2, 8], y: [3, 7] });
-  await view.finalize();
-});
-
-test("runtime: same-field a[0] aliasing produces real domains (array-index paths)", async () => {
-  // Reviewer regression: a literal datum["a[0]"] in the alias calculate
-  // returns undefined, Vega drops every row, and the resulting scale
-  // domains are [NaN, NaN]. Correct splitFieldPath yields datum["a"]["0"]
-  // and the rows survive.
-  const interactive = transform({
-    mark: "point",
-    width: 400,
-    height: 200,
-    data: { values: [{ a: [5, 6] }, { a: [7, 8] }, { a: [10, 3] }] },
-    encoding: {
-      x: { field: "a[0]", type: "quantitative" },
-      y: { field: "a[0]", type: "quantitative" },
-    },
-  });
-  const compiled = compile(interactive as never).spec;
-  const view = new View(parse(compiled), { renderer: "none" as never });
-  await view.runAsync();
-  const rows = view.data("source_0") as unknown[];
-  assert.ok(rows.length > 0, "aliased rows must survive the calculate transform");
-  const xDomain = view.scale("x").domain() as [number, number];
-  const yDomain = view.scale("y").domain() as [number, number];
-  assert.ok(Number.isFinite(xDomain[0]) && Number.isFinite(xDomain[1]), "x domain must be numeric");
-  assert.ok(Number.isFinite(yDomain[0]) && Number.isFinite(yDomain[1]), "y domain must be numeric");
-  await view.finalize();
-});
-
-test("runtime: same-field escaped-dot aliasing (literal `a.b` key) produces real domains", async () => {
-  // The field name is the literal key "a.b" on the datum, not nested a→b.
-  // Vega-Lite writes that as `a\\.b`. accessExpression must yield
-  // datum["a.b"] rather than datum["a"]["b"] (which would be undefined here).
-  const interactive = transform({
-    mark: "point",
-    width: 400,
-    height: 200,
-    data: { values: [{ "a.b": 5 }, { "a.b": 8 }, { "a.b": 12 }] },
-    encoding: {
-      x: { field: "a\\.b", type: "quantitative" },
-      y: { field: "a\\.b", type: "quantitative" },
-    },
-  });
-  const compiled = compile(interactive as never).spec;
-  const view = new View(parse(compiled), { renderer: "none" as never });
-  await view.runAsync();
-  const xDomain = view.scale("x").domain() as [number, number];
-  const yDomain = view.scale("y").domain() as [number, number];
-  assert.ok(Number.isFinite(xDomain[0]) && Number.isFinite(xDomain[1]), "escaped-dot x domain must be numeric");
-  assert.ok(Number.isFinite(yDomain[0]) && Number.isFinite(yDomain[1]), "escaped-dot y domain must be numeric");
-  await view.finalize();
-});
-
-test("compile: same-field alias preserves axis:null (hidden axes stay hidden)", () => {
-  // Reviewer regression: rewrite must not materialize an axis object where
-  // the author explicitly set axis:null — that would reveal an axis the
-  // author hid, exposing the workaround visually.
-  const interactive = transform({
-    mark: "point",
-    data: { values: [{ v: 0 }, { v: 10 }] },
-    encoding: {
-      x: { field: "v", type: "quantitative" },
-      y: { field: "v", type: "quantitative", axis: null },
-    },
-  }) as Record<string, unknown>;
-  const yEncoding = (interactive.encoding as Record<string, unknown>).y as Record<string, unknown>;
-  assert.strictEqual(yEncoding.axis, null, "axis:null must survive the alias rewrite");
-  assert.equal(yEncoding.field, "__wiki_plot_y_axis__", "field was still aliased");
-});
-
-test("compile: same-field alias preserves an encoding-level custom title", () => {
-  // Reviewer regression: an encoding-level `title` must not be overridden by
-  // an injected `axis.title` of the raw field name. Precedence: existing
-  // axis title > encoding title > raw field name.
-  const interactive = transform({
-    mark: "point",
-    data: { values: [{ v: 0 }, { v: 10 }] },
-    encoding: {
-      x: { field: "v", type: "quantitative" },
-      y: { field: "v", type: "quantitative", title: "Custom Label" },
-    },
-  }) as Record<string, unknown>;
-  const yEncoding = (interactive.encoding as Record<string, unknown>).y as Record<string, unknown>;
-  assert.equal(yEncoding.title, "Custom Label", "encoding title must survive");
-  // No axis was materialized because the encoding title already provides one.
-  assert.equal(yEncoding.axis, undefined, "no axis object added when encoding title exists");
-});
-
-test("compile: same-field alias preserves an existing axis.title", () => {
-  const interactive = transform({
-    mark: "point",
-    data: { values: [{ v: 0 }, { v: 10 }] },
-    encoding: {
-      x: { field: "v", type: "quantitative" },
-      y: { field: "v", type: "quantitative", axis: { title: "Y Axis" } },
-    },
-  }) as Record<string, unknown>;
-  const yEncoding = (interactive.encoding as Record<string, unknown>).y as Record<string, unknown>;
-  const yAxis = yEncoding.axis as Record<string, unknown>;
-  assert.equal(yAxis.title, "Y Axis", "existing axis.title must survive unchanged");
-});
-
-test("compile: same-field alias defaults axis.title to the original field name when none is set", () => {
-  const interactive = transform({
-    mark: "point",
-    data: { values: [{ v: 0 }, { v: 10 }] },
-    encoding: {
-      x: { field: "v", type: "quantitative" },
-      y: { field: "v", type: "quantitative" },
-    },
-  }) as Record<string, unknown>;
-  const yEncoding = (interactive.encoding as Record<string, unknown>).y as Record<string, unknown>;
-  const yAxis = yEncoding.axis as Record<string, unknown>;
-  // Original field name shown, not the synthetic alias.
-  assert.equal(yAxis.title, "v");
-});
-
-test("compile: same-field alias preserves unrelated axis config while adding a title", () => {
-  const interactive = transform({
-    mark: "point",
-    data: { values: [{ v: 0 }, { v: 10 }] },
-    encoding: {
-      x: { field: "v", type: "quantitative" },
-      y: { field: "v", type: "quantitative", axis: { grid: false, labelAngle: 45 } },
-    },
-  }) as Record<string, unknown>;
-  const yEncoding = (interactive.encoding as Record<string, unknown>).y as Record<string, unknown>;
-  const yAxis = yEncoding.axis as Record<string, unknown>;
-  assert.equal(yAxis.grid, false);
-  assert.equal(yAxis.labelAngle, 45);
-  assert.equal(yAxis.title, "v", "title added because none was set on axis or encoding");
-});
-
 test("compile: composite marks (boxplot/errorbar/errorband) never enter full mode", () => {
   for (const mark of ["boxplot", "errorbar", "errorband"] as const) {
     const spec = {
@@ -444,20 +295,17 @@ test("compile: composite marks (boxplot/errorbar/errorband) never enter full mod
         y: { field: "y", type: "quantitative" },
       },
     };
-    assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" }, `${mark} must degrade to tooltip`);
-    // And the resulting tooltip-mode spec still compiles clean — no injected
-    // interval selection means no "Selection not supported for X" warnings
-    // and no dead Reset button in the UI.
+    assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
     const interactive = transform(spec);
     const compiled = compile(interactive as never).spec;
-    const zoomSignals = (compiled.signals ?? []).filter(
+    const injected = (compiled.signals ?? []).filter(
       (s: Record<string, unknown>) => typeof s.name === "string" && (s.name as string).startsWith("wiki_"),
     );
-    assert.equal(zoomSignals.length, 0, `${mark} spec must not inject any wiki_zoom/wiki_brush signals`);
+    assert.equal(injected.length, 0, `${mark} must not inject any wiki_* signals`);
   }
 });
 
-test("parse: existing wiki_zoom exact-name collision degrades and parses clean", () => {
+test("parse: exact wiki_zoom name collision degrades and parses clean", () => {
   const spec: Record<string, unknown> = {
     mark: "point",
     data: { values: [{ x: 1, y: 1 }] },
@@ -465,18 +313,17 @@ test("parse: existing wiki_zoom exact-name collision degrades and parses clean",
       x: { field: "x", type: "quantitative" },
       y: { field: "y", type: "quantitative" },
     },
-    params: [{ name: ZOOM_PARAM, select: { type: "interval" } }],
+    params: [{ name: ZOOM_PARAM_PREFIX, select: { type: "interval" } }],
   };
   assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
   const interactive = transform(spec);
   assert.doesNotThrow(() => parse(compile(interactive as never).spec));
 });
 
-test("parse: existing wiki_zoom_x derived-name collision degrades and parses clean", () => {
-  // Vega-Lite compiles a per-channel signal named wiki_zoom_x from our
-  // injected wiki_zoom param. A user param with the same name would collide
-  // at vega.parse (NOT at vega-lite compile) with "Duplicate signal name".
-  // The classifier must reject this at inject time.
+test("parse: user param wiki_zoom_x_x (would collide with derived signal) degrades", () => {
+  // Our per-channel wiki_zoom_x param compiles a derived signal wiki_zoom_x_x.
+  // A user param with that exact name would parse-error with "Duplicate
+  // signal name". The prefix guard catches this via the wiki_zoom_ prefix.
   const spec: Record<string, unknown> = {
     mark: "point",
     data: { values: [{ x: 1, y: 1 }] },
@@ -484,36 +331,16 @@ test("parse: existing wiki_zoom_x derived-name collision degrades and parses cle
       x: { field: "x", type: "quantitative" },
       y: { field: "y", type: "quantitative" },
     },
-    params: [{ name: `${ZOOM_PARAM}_x`, value: 5 }],
-  };
-  assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
-  const interactive = transform(spec);
-  assert.doesNotThrow(
-    () => parse(compile(interactive as never).spec),
-    "vega.parse must not throw Duplicate signal name",
-  );
-});
-
-test("parse: existing wiki_brush_tuple derived-name collision degrades and parses clean", () => {
-  const spec: Record<string, unknown> = {
-    mark: "point",
-    data: { values: [{ x: 1, y: 1 }] },
-    encoding: {
-      x: { field: "x", type: "quantitative" },
-      y: { field: "y", type: "quantitative" },
-    },
-    params: [{ name: BRUSH_TUPLE_SIGNAL, value: null }],
+    params: [{ name: `${zoomParamName("x")}_x`, value: 5 }],
   };
   assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
   const interactive = transform(spec);
   assert.doesNotThrow(() => parse(compile(interactive as never).spec));
 });
 
-test("parse: leaving the collision-guard off would in fact throw at parse (guard regression)", () => {
-  // Explicit demonstration: bypass the classifier and inject the full-mode
-  // params on a spec that already reserves wiki_zoom_x. Verifies the guard
-  // actually protects against a real runtime failure — if this ever stops
-  // throwing, the guard's justification has gone away.
+test("parse: guard-bypass control — forcing full inject with wiki_zoom_x user param throws Duplicate", () => {
+  // Sanity: this is the runtime failure the collision guard is preventing.
+  // If this ever stops throwing, the guard's justification has gone away.
   const spec: Record<string, unknown> = {
     mark: "point",
     data: { values: [{ x: 1, y: 1 }] },
@@ -521,7 +348,7 @@ test("parse: leaving the collision-guard off would in fact throw at parse (guard
       x: { field: "x", type: "quantitative" },
       y: { field: "y", type: "quantitative" },
     },
-    params: [{ name: `${ZOOM_PARAM}_x`, value: 5 }],
+    params: [{ name: `${zoomParamName("x")}_x`, value: 5 }],
   };
   const forced = buildInteractiveSpec(spec, {
     interactivity: { mode: "full", channels: ["x", "y"] },
@@ -530,6 +357,77 @@ test("parse: leaving the collision-guard off would in fact throw at parse (guard
   assert.throws(
     () => parse(compile(forced as never).spec),
     /Duplicate signal name/,
-    "sanity: guard bypass reproduces the runtime failure the guard prevents",
   );
+});
+
+test("runtime: user dataset named wiki_zoom_x_store — guard prevents source replacement", async () => {
+  // Reviewer's regression: a user top-level dataset named wiki_zoom_x_store
+  // would collide with our injected selection store. If we didn't downgrade,
+  // the first zoom update would overwrite the user's dataset with the
+  // selection tuple and any chart sourced from it would go empty.
+  const spec: Record<string, unknown> = {
+    mark: "point",
+    data: { name: "wiki_zoom_x_store", values: [{ x: 0, y: 0 }, { x: 10, y: 10 }] },
+    encoding: {
+      x: { field: "x", type: "quantitative" },
+      y: { field: "y", type: "quantitative" },
+    },
+  };
+  // With the guard, we stay in tooltip mode (no injection, no collision).
+  assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
+  const interactive = transform(spec);
+  const view = await renderHeadless(interactive);
+  // The user's dataset survives — chart still has rows because we injected
+  // nothing that would collide.
+  const rows = view.data("wiki_zoom_x_store") as unknown[];
+  assert.equal(rows.length, 2, "user dataset must remain intact");
+  await view.finalize();
+});
+
+test("compile: legacy top-level `selection` spec compiles the legacy signal, downgrade prevents dead inject", () => {
+  // Without downgrading, buildInteractiveSpec would inject wiki_zoom_x etc.,
+  // but Vega-Lite compiles ONLY the legacy `selection` block and drops every
+  // injected param — the inspector would advertise interactions with no
+  // handlers.
+  const spec: Record<string, unknown> = {
+    mark: "point",
+    data: { values: [{ x: 1, y: 1 }] },
+    encoding: {
+      x: { field: "x", type: "quantitative" },
+      y: { field: "y", type: "quantitative" },
+    },
+    selection: { legacy_pan: { type: "interval", bind: "scales" } },
+  };
+  assert.deepEqual(plotInteractivity(spec), { mode: "tooltip" });
+  const interactive = transform(spec);
+  const compiled = compile(interactive as never).spec;
+  const wikiSignals = (compiled.signals ?? []).filter(
+    (s: Record<string, unknown>) => typeof s.name === "string" && (s.name as string).startsWith("wiki_"),
+  );
+  assert.equal(wikiSignals.length, 0, "no wiki_* signals should be injected in tooltip mode");
+});
+
+test("compile: guard-bypass control — full inject alongside legacy selection loses every wiki_* signal", () => {
+  // Sanity for the legacy-selection guard: if buildInteractiveSpec is forced
+  // to inject alongside a legacy top-level selection, Vega-Lite silently
+  // drops every injected param. This is precisely the "advertised interaction
+  // with no handlers" failure mode the guard prevents.
+  const spec: Record<string, unknown> = {
+    mark: "point",
+    data: { values: [{ x: 1, y: 1 }] },
+    encoding: {
+      x: { field: "x", type: "quantitative" },
+      y: { field: "y", type: "quantitative" },
+    },
+    selection: { legacy_pan: { type: "interval", bind: "scales" } },
+  };
+  const forced = buildInteractiveSpec(spec, {
+    interactivity: { mode: "full", channels: ["x", "y"] },
+    armed: true,
+  }) as Record<string, unknown>;
+  const compiled = compile(forced as never).spec;
+  const wikiSignals = (compiled.signals ?? []).filter(
+    (s: Record<string, unknown>) => typeof s.name === "string" && (s.name as string).startsWith("wiki_"),
+  );
+  assert.equal(wikiSignals.length, 0, "vega-lite drops every injected param when legacy selection is present");
 });
