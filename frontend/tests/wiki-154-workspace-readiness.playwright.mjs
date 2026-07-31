@@ -325,6 +325,96 @@ async function runTopologyDialogScenario({ failure }) {
   await context.close();
 }
 
+async function runProductionNoticeRefreshScenario() {
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  let eventEmitted = false;
+  let agentRequests = 0;
+
+  await page.route("**/api/agents", async (route) => {
+    agentRequests += 1;
+    const accountNotices = eventEmitted
+      ? []
+      : [{
+          type: "codex_auth_dead_exhausted",
+          provider: "codex",
+          failure: "auth",
+          credential_source: "current",
+          exhausted: true,
+          tickets: ["WIKI-9"],
+          run_ids: { "WIKI-9": "run-current" },
+          ts: "2026-07-31T00:00:00Z",
+        }];
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        workers: [],
+        orchestrators: [],
+        archived: [],
+        account_notices: accountNotices,
+      }),
+    });
+  });
+  await page.route("**/api/workspaces", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        workspaces: [{ id: "wiki", root: "/tmp/wiki", live: true }],
+      }),
+    });
+  });
+  await page.route("**/api/models", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ models: [] }),
+    });
+  });
+  await page.addInitScript(() => {
+    class TestEventSource {
+      static instance;
+      onmessage = null;
+      constructor() {
+        TestEventSource.instance = this;
+      }
+      close() {}
+    }
+    window.EventSource = TestEventSource;
+    window.__wikiEmitAgentEvent = (payload) => {
+      TestEventSource.instance?.onmessage?.({ data: JSON.stringify(payload) });
+    };
+    localStorage.setItem("wiki-sidebar-visible", "true");
+    localStorage.setItem("wiki-sidebar-tab", "agents");
+    localStorage.removeItem("wiki-window-layout-v2");
+  });
+
+  await page.goto(`${backend.baseUrl}/`, { waitUntil: "domcontentloaded" });
+  await page.getByRole("button", { name: "Agents", exact: true }).click();
+  await page.getByText(/Sign in to Codex again/).waitFor();
+  const requestsBeforeEvent = agentRequests;
+  eventEmitted = true;
+  const refetch = page.waitForResponse("**/api/agents");
+  await page.evaluate(() =>
+    window.__wikiEmitAgentEvent({
+      type: "codex_auth_verified",
+      provider: "codex",
+      credential_source: "current",
+      success: true,
+      ticket: "WIKI-9",
+      run_id: "run-current",
+      ts: "2026-07-31T00:01:00Z",
+    }),
+  );
+  await refetch;
+  await page.waitForFunction(() => !document.body.textContent?.includes("Sign in to Codex again"));
+  if (agentRequests <= requestsBeforeEvent) {
+    throw new Error("codex auth verification did not refetch agents through App");
+  }
+  await context.close();
+}
+
 try {
   await fs.writeFile(fixtures.registryPath, "{}\n");
   await fs.writeFile(fixtures.queuePath, "{}\n");
@@ -335,6 +425,7 @@ try {
   await runTopologyScenario();
   await runTopologyDialogScenario({ failure: false });
   await runTopologyDialogScenario({ failure: true });
+  await runProductionNoticeRefreshScenario();
 } finally {
   if (browser) await browser.close();
   if (backend) await backend.stop();

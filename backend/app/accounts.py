@@ -1030,6 +1030,7 @@ class RotationResult:
     # run_id and its notice drops on the next refresh. Empty for legacy
     # tmux workers that have no run_id.
     failed_run_ids: dict[str, str] = field(default_factory=dict)
+    revived_run_ids: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -1037,6 +1038,7 @@ class RevivalResult:
     revived: list[str]
     failed: list[str]
     failed_reasons: dict[str, str] = field(default_factory=dict)
+    revived_run_ids: dict[str, str] = field(default_factory=dict)
 
 
 def rotate(
@@ -1095,6 +1097,7 @@ def rotate(
     write_state(state)
 
     revived: list[str] = []
+    revived_run_ids: dict[str, str] = {}
     failed: list[str] = []
     reasons: dict[str, str] = {}
     for snapshot in to_revive:
@@ -1107,6 +1110,8 @@ def rotate(
         new_window, reason = _revive_worker(worker, session_by_window.get(snapshot.window))
         if new_window:
             revived.append(worker.ticket)
+            if snapshot.run_id:
+                revived_run_ids[worker.ticket] = snapshot.run_id
         else:
             failed.append(worker.ticket)
             if reason:
@@ -1120,6 +1125,7 @@ def rotate(
         failed=failed,
         reset_at=outgoing_reset_at,
         failed_reasons=reasons,
+        revived_run_ids=revived_run_ids,
     )
 
 
@@ -1308,6 +1314,7 @@ def revive_auth_dead(workers: list[WorkerEntry]) -> RevivalResult:
     for worker in to_revive:
         tmux_kill_window(worker.window)
     revived: list[str] = []
+    revived_run_ids: dict[str, str] = {}
     failed: list[str] = []
     reasons: dict[str, str] = {}
     for snapshot in to_revive:
@@ -1320,11 +1327,18 @@ def revive_auth_dead(workers: list[WorkerEntry]) -> RevivalResult:
         new_window, reason = _revive_worker(worker, session_by_window.get(snapshot.window))
         if new_window:
             revived.append(worker.ticket)
+            if snapshot.run_id:
+                revived_run_ids[worker.ticket] = snapshot.run_id
         else:
             failed.append(worker.ticket)
             if reason:
                 reasons[worker.ticket] = reason
-    return RevivalResult(revived=revived, failed=failed, failed_reasons=reasons)
+    return RevivalResult(
+        revived=revived,
+        failed=failed,
+        failed_reasons=reasons,
+        revived_run_ids=revived_run_ids,
+    )
 
 
 def _append_rotation_log(outgoing: str | None, incoming: str, revived: list[str], failed: list[str]) -> None:
@@ -1562,7 +1576,15 @@ async def _check_once(
                 if worker.ticket in watch.codex_limited:
                     watch.codex_limited[worker.ticket] = worker.window
         else:
-            if not worker.run_id and worker.ticket in watch.codex_limited:
+            if (
+                not worker.run_id
+                and watch.codex_limited.get(worker.ticket) in {"", worker.window}
+                and await asyncio.to_thread(codex_login_status)
+            ):
+                # A pane redraw is not recovery proof. The current legacy
+                # window must be tracked or follow a temporary window gap.
+                # The provider auth probe must also succeed before clearing
+                # a fleet notice.
                 watch.codex_limited.pop(worker.ticket, None)
                 codex_recovered.append(worker)
             if detect_codex_auth_dead(pane):
@@ -1617,7 +1639,7 @@ async def _check_once(
                 })
         if eligible:
             result = await asyncio.to_thread(revive_auth_dead, eligible)
-            await emit({
+            event = {
                 "type": "codex_auth_dead_revival",
                 "provider": "codex",
                 "failure": "auth",
@@ -1626,7 +1648,10 @@ async def _check_once(
                 "failed": result.failed,
                 "failed_reasons": result.failed_reasons,
                 "ts": datetime.now(timezone.utc).isoformat(),
-            })
+            }
+            if result.revived_run_ids:
+                event["revived_run_ids"] = result.revived_run_ids
+            await emit(event)
 
     live_claude_identities = {
         (worker.ticket, worker.window)
@@ -1743,7 +1768,7 @@ async def _check_once(
         })
         return
 
-    await emit({
+    event = {
         "type": "codex_rotation",
         "from": result.outgoing,
         "to": result.incoming,
@@ -1757,7 +1782,10 @@ async def _check_once(
         # publish codex_worker_replaced to cover that case.
         "failed_run_ids": result.failed_run_ids,
         "ts": datetime.now(timezone.utc).isoformat(),
-    })
+    }
+    if result.revived_run_ids:
+        event["revived_run_ids"] = result.revived_run_ids
+    await emit(event)
 
 
 def _earliest_pending_reset(state: AccountState) -> str | None:

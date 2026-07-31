@@ -166,6 +166,8 @@ def _valid_notice(kind: str, payload: dict) -> bool:
             return False
         if not _optional_string_map(payload.get("failed_run_ids")):
             return False
+        if not _optional_string_map(payload.get("revived_run_ids")):
+            return False
         return True
     if kind == "codex_auth_dead_revival":
         revived = payload.get("revived")
@@ -179,6 +181,8 @@ def _valid_notice(kind: str, payload: dict) -> bool:
         if not _optional_string_map(payload.get("failed_reasons")):
             return False
         if not _optional_string_map(payload.get("failed_run_ids")):
+            return False
+        if not _optional_string_map(payload.get("revived_run_ids")):
             return False
         return True
     if kind == "codex_auth_dead_exhausted":
@@ -245,10 +249,21 @@ class AccountNoticeStore:
 
     def _persist(self) -> None:
         try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self._path.parent.chmod(0o700)
             tmp = self._path.with_name(f"{self._path.name}.{os.getpid()}.tmp")
-            tmp.write_text(json.dumps(self._notices, indent=2), encoding="utf-8")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    fd = -1
+                    handle.write(json.dumps(self._notices, indent=2))
+            finally:
+                if fd >= 0:
+                    os.close(fd)
+            tmp.chmod(0o600)
             tmp.replace(self._path)
+            self._path.chmod(0o600)
         except OSError:
             # Persistence is best-effort; in-memory state stays authoritative.
             pass
@@ -328,27 +343,27 @@ class AccountNoticeStore:
         def remove_revived(
             revived: list[str],
             *,
-            recovery_run_id: str | None = None,
-            require_run_match: bool = False,
+            revived_run_ids: object = None,
         ) -> None:
             """A revived worker is proven running: drop it from every
             worker-scoped failure notice; keep tickets not yet proven.
 
-            Auth verification is run-scoped. It clears legacy notices without
-            a stored run id, or notices whose stored run id matches the
-            verification event. A late event from an old run cannot clear a
-            replacement's failure.
+            Events with ``revived_run_ids`` are run-scoped. Legacy events that
+            omit that map keep the ticket-only fallback for old tmux workers.
             """
 
             if not revived:
                 return
             revived_set = set(revived)
 
+            recovery_ids = _reason_map(revived_run_ids)
+
             def can_clear(ticket: str, stored_run_ids: object) -> bool:
-                if not require_run_match:
+                if revived_run_ids is None:
                     return True
+                recovery_run_id = recovery_ids.get(ticket)
                 stored_run_id = _reason_map(stored_run_ids).get(ticket)
-                return stored_run_id is None or stored_run_id == recovery_run_id
+                return bool(recovery_run_id and stored_run_id == recovery_run_id)
 
             existing = self._notices.get(_EXHAUSTED_KEY)
             if existing is not None:
@@ -435,6 +450,51 @@ class AccountNoticeStore:
                 else:
                     clear(key)
 
+        def remove_codex_fleet_revived(
+            revived: list[str],
+            *,
+            revived_run_ids: object = None,
+        ) -> None:
+            """Clear only fleet tickets proven recovered by this event."""
+
+            if not revived:
+                return
+            revived_set = set(revived)
+            recovery_ids = _reason_map(revived_run_ids)
+            for key in ("codex:limit", "codex:rotation-failed"):
+                notice = self._notices.get(key)
+                if notice is None:
+                    continue
+                if "tickets" not in notice:
+                    clear(key)
+                    continue
+                stored_run_ids = _reason_map(notice.get("run_ids"))
+                remaining = [
+                    ticket
+                    for ticket in _ticket_list(notice.get("tickets"))
+                    if ticket not in revived_set
+                    or (
+                        revived_run_ids is not None
+                        and (
+                            not recovery_ids.get(ticket)
+                            or stored_run_ids.get(ticket) != recovery_ids[ticket]
+                        )
+                    )
+                ]
+                if remaining == _ticket_list(notice.get("tickets")):
+                    continue
+                if remaining:
+                    updated = dict(notice)
+                    updated["tickets"] = remaining
+                    updated["run_ids"] = {
+                        ticket: run_id
+                        for ticket, run_id in stored_run_ids.items()
+                        if ticket in remaining
+                    }
+                    set_notice(key, updated)
+                else:
+                    clear(key)
+
         def merge_revive_failures(key: str) -> None:
             failed = _ticket_list(event.get("failed"))
             if not failed:
@@ -468,10 +528,18 @@ class AccountNoticeStore:
             merge_exhausted(_ticket_list(event.get("tickets")))
         elif kind in ("codex_rotation", "codex_auth_dead_revival"):
             if kind == "codex_rotation":
-                # A completed rotation moved onto an eligible account: the
-                # limit deadlock and any prior rotation failure are resolved.
-                clear("codex:limit", "codex:rotation-failed")
-            remove_revived(_ticket_list(event.get("revived")))
+                remove_codex_fleet_revived(
+                    _ticket_list(event.get("revived")),
+                    revived_run_ids=event.get("revived_run_ids")
+                    if "revived_run_ids" in event
+                    else None,
+                )
+            remove_revived(
+                _ticket_list(event.get("revived")),
+                revived_run_ids=event.get("revived_run_ids")
+                if "revived_run_ids" in event
+                else None,
+            )
             merge_revive_failures(_REVIVE_FAILED_KEYS[kind])
         elif kind == "codex_auth_verified":
             # Per-ticket recovery only: a successful Codex turn proves the run
@@ -484,8 +552,9 @@ class AccountNoticeStore:
                     run_id = event.get("run_id")
                     remove_revived(
                         [ticket],
-                        recovery_run_id=run_id if isinstance(run_id, str) and run_id else None,
-                        require_run_match=True,
+                        revived_run_ids={ticket: run_id}
+                        if isinstance(run_id, str) and run_id
+                        else None,
                     )
                     remove_codex_fleet_ticket(
                         ticket,

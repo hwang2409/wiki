@@ -3536,6 +3536,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 "failed": [],
                 "failed_reasons": {},
                 "failed_run_ids": {},
+                "revived_run_ids": {"WIKI-CODEX-ROTATE": codex.run_id},
             },
         )
         resumed = self.store.get(codex.run_id)
@@ -3639,6 +3640,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 "failed": [],
                 "failed_reasons": {},
                 "failed_run_ids": {},
+                "revived_run_ids": {"WIKI-RATE-LIMIT": codex.run_id},
                 "ts": published["ts"],
             },
         )
@@ -3699,6 +3701,81 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         )
         self.supervisor.unsubscribe(queue)
 
+    async def test_rate_limit_rotation_failures_publish_all_current_codex_run_ids(self) -> None:
+        records = [
+            await self.supervisor.start_run(
+                agent_id=f"WIKI-ROTATION-FAIL-{index}",
+                provider=ProviderKind.CODEX,
+                role="implement",
+                model="fixture-codex",
+                effort="high",
+                worktree=str(self.worktree),
+                prompt="fixture",
+            )
+            for index in (1, 2)
+        ]
+        expected = {record.agent_id: record.run_id for record in records}
+        queue = self.supervisor.subscribe()
+
+        for error in (
+            StoreConflict("fixture store conflict"),
+            accounts.RotationError("fixture rotation error"),
+        ):
+            with mock.patch.object(
+                self.supervisor,
+                "request_codex_rotation",
+                new=mock.AsyncMock(side_effect=error),
+            ):
+                await self.supervisor._handle_codex_rate_limit_event(  # noqa: SLF001
+                    records[0].run_id,
+                    outgoing_reset_at="2099-01-01T00:00:00+00:00",
+                )
+            published = await _wait_for_published(queue, "codex_rotation_failed")
+            self.assertEqual(published["tickets"], sorted(expected))
+            self.assertEqual(published["run_ids"], expected)
+
+        self.supervisor.unsubscribe(queue)
+
+    async def test_auth_dead_exact_session_failure_blocks_and_publishes_run_identity(self) -> None:
+        queue = self.supervisor.subscribe()
+        record = await self.supervisor.start_run(
+            agent_id="WIKI-AUTH-RESUME-FAIL",
+            provider=ProviderKind.CODEX,
+            role="implement",
+            model="fixture-codex",
+            effort="high",
+            worktree=str(self.worktree),
+            prompt="fixture",
+        )
+        adapter = self.supervisor.adapters[record.run_id]
+        failure = RuntimeError("fixture exact-session resume failure")
+
+        with mock.patch.object(
+            self.supervisor,
+            "_resume_run_without_admission",
+            new=mock.AsyncMock(side_effect=failure),
+        ):
+            await self.supervisor._recover_codex_auth_dead(  # noqa: SLF001
+                record.run_id,
+                adapter,
+                prior_state=LifecycleState.WORKING,
+            )
+
+        published = await _wait_for_published(queue, "codex_auth_dead_revival")
+        current = self.store.get(record.run_id)
+        self.assertEqual(current.state, LifecycleState.BLOCKED)
+        self.assertEqual(published["revived"], [])
+        self.assertEqual(published["revived_run_ids"], {})
+        self.assertEqual(published["failed"], [record.agent_id])
+        self.assertEqual(
+            published["failed_reasons"],
+            {record.agent_id: str(failure)},
+        )
+        self.assertEqual(
+            published["failed_run_ids"], {record.agent_id: record.run_id}
+        )
+        self.supervisor.unsubscribe(queue)
+
     async def test_auth_dead_event_resumes_exact_session_without_rotation(
         self,
     ) -> None:
@@ -3753,6 +3830,9 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(old_codex_adapter.closed)
         self.assertEqual(published["revived"], ["WIKI-AUTH-DEAD"])
         self.assertEqual(published["failed"], [])
+        self.assertEqual(
+            published["revived_run_ids"], {"WIKI-AUTH-DEAD": record.run_id}
+        )
         self.supervisor.unsubscribe(queue)
 
     async def test_auth_dead_cap_survives_exact_session_resumes(self) -> None:
@@ -3779,6 +3859,9 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             )
             published = await _wait_for_published(queue, "codex_auth_dead_revival")
             self.assertEqual(published["revived"], [record.agent_id])
+            self.assertEqual(
+                published["revived_run_ids"], {record.agent_id: record.run_id}
+            )
             current = self.store.get(record.run_id)
             self.assertEqual(current.provider_session_id, session_id)
             self.assertEqual(

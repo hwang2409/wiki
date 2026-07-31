@@ -1239,6 +1239,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
 
         operation_id = str(uuid4())
         revived: list[str] = []
+        revived_run_ids: dict[str, str] = {}
         failed: list[str] = []
         failed_reasons: dict[str, str] = {}
         failed_run_ids: dict[str, str] = {}
@@ -1273,6 +1274,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     await self._publish_agent_change(detached.agent_id)
                     await self._resume_run_without_admission(run_id, automatic=False)
                     revived.append(record.agent_id)
+                    revived_run_ids[record.agent_id] = record.run_id
                 except Exception as exc:
                     try:
                         current = self.store.transition(
@@ -1307,6 +1309,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     # run_id and its notice can then be dropped. See
                     # AccountNoticeStore.reconcile_with_live and WIKI-228.
                     "failed_run_ids": failed_run_ids,
+                    "revived_run_ids": revived_run_ids,
                     "ts": datetime.now(timezone.utc).isoformat(),
                 }
             )
@@ -2291,6 +2294,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 "failed": revival["failed"],
                 "failed_reasons": revival["failed_reasons"],
                 "failed_run_ids": revival["failed_run_ids"],
+                "revived_run_ids": revival["revived_run_ids"],
             }
             journal.update(
                 {
@@ -2502,6 +2506,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     "failed": revival["failed"],
                     "failed_reasons": reasons,
                     "failed_run_ids": revival["failed_run_ids"],
+                    "revived_run_ids": revival["revived_run_ids"],
                 },
                 "error": detail,
             }
@@ -2538,6 +2543,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
         journal: dict[str, Any],
     ) -> dict[str, Any]:
         revived: list[str] = []
+        revived_run_ids: dict[str, str] = {}
         failed: list[str] = []
         failed_reasons: dict[str, str] = {}
         failed_run_ids: dict[str, str] = {}
@@ -2547,6 +2553,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             if row.get("resumed") or row.get("skipped"):
                 if row.get("resumed"):
                     revived.append(row["agent_id"])
+                    revived_run_ids[row["agent_id"]] = row["run_id"]
                 continue
             run_id = row["run_id"]
             agent_id = row["agent_id"]
@@ -2575,6 +2582,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                             )
                         row["resumed"] = True
                         revived.append(agent_id)
+                        revived_run_ids[agent_id] = run_id
                         continue
                     if self.pid_alive(record.provider_pid):
                         pending = True
@@ -2583,6 +2591,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                     row["resumed"] = True
                     row["failed_reason"] = None
                     revived.append(agent_id)
+                    revived_run_ids[agent_id] = run_id
                 except Exception as exc:
                     reason = str(exc)
                     row["failed_reason"] = reason
@@ -2599,6 +2608,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
             # failure notice against the live registry: a replaced ticket
             # gets a new run_id and its notice drops on the next refresh.
             "failed_run_ids": failed_run_ids,
+            "revived_run_ids": revived_run_ids,
             "pending": pending,
         }
 
@@ -2637,6 +2647,7 @@ Preserve the same identity, role, worktree, orchestrator grouping, PR gates, and
                 "failed": revival["failed"],
                 "failed_reasons": revival["failed_reasons"],
                 "failed_run_ids": revival["failed_run_ids"],
+                "revived_run_ids": revival["revived_run_ids"],
             }
             journal.update(
                 {

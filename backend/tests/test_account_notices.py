@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import stat
 
 from backend.app.account_notices import AccountNoticeStore
 
@@ -30,6 +32,36 @@ def test_unresolved_notices_survive_reload(tmp_path: Path) -> None:
 
     reloaded = AccountNoticeStore(path=path)
     assert sorted(_types(reloaded)) == ["codex_limit_no_eligible", "codex_rotation_failed"]
+
+
+def test_notice_store_files_are_private_on_create_and_replace(tmp_path: Path) -> None:
+    path = tmp_path / "shared" / "notices.json"
+    previous_umask = os.umask(0)
+    try:
+        store = AccountNoticeStore(path=path)
+        store.apply_event(
+            {
+                "type": "codex_limit_no_eligible",
+                "tickets": ["WIKI-1"],
+                "reset_at": None,
+                "ts": "t1",
+            }
+        )
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+
+        store.apply_event(
+            {
+                "type": "codex_rotation_failed",
+                "tickets": ["WIKI-1"],
+                "error": "rotation failed",
+                "ts": "t2",
+            }
+        )
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+    finally:
+        os.umask(previous_umask)
 
 
 def test_many_notices_are_all_retained(tmp_path: Path) -> None:
@@ -359,6 +391,46 @@ def test_stale_auth_verified_event_keeps_revival_failure(tmp_path: Path) -> None
     notice = _by_type(store, "codex_auth_dead_revival")
     assert notice["failed"] == ["WIKI-A"]
     assert notice["failed_run_ids"] == {"WIKI-A": "run-new"}
+
+
+def test_stale_revived_run_keeps_replacement_failure(tmp_path: Path) -> None:
+    for index, recovery_kind in enumerate(("codex_rotation", "codex_auth_dead_revival")):
+        store = AccountNoticeStore(path=tmp_path / f"stale-{index}.json")
+        store.apply_event(
+            {
+                "type": "codex_auth_dead_revival",
+                "revived": [],
+                "failed": ["WIKI-A"],
+                "failed_reasons": {"WIKI-A": "replacement failed"},
+                "failed_run_ids": {"WIKI-A": "run-new"},
+                "ts": "t1",
+            }
+        )
+        store.apply_event(
+            {
+                "type": "codex_rotation_failed",
+                "tickets": ["WIKI-A"],
+                "run_ids": {"WIKI-A": "run-new"},
+                "error": "replacement failed",
+                "ts": "t1",
+            }
+        )
+        recovery = {
+            "type": recovery_kind,
+            "revived": ["WIKI-A"],
+            "revived_run_ids": {"WIKI-A": "run-old"},
+            "failed": [],
+            "ts": "t2",
+        }
+        if recovery_kind == "codex_rotation":
+            recovery.update({"from": "a", "to": "b"})
+        store.apply_event(recovery)
+        notice = _by_type(store, "codex_auth_dead_revival")
+        assert notice["failed"] == ["WIKI-A"]
+        assert notice["failed_run_ids"] == {"WIKI-A": "run-new"}
+        fleet_notice = _by_type(store, "codex_rotation_failed")
+        assert fleet_notice["tickets"] == ["WIKI-A"]
+        assert fleet_notice["run_ids"] == {"WIKI-A": "run-new"}
 
 
 def test_verified_auth_without_ticket_does_not_clear_others(tmp_path: Path) -> None:
