@@ -18,7 +18,7 @@ import {
   type LoadedPdf,
 } from "./pdfjs-runtime";
 import {
-  BRUSH_PARAM,
+  BRUSH_TUPLE_SIGNAL,
   buildInteractiveSpec,
   makeBrushBuffer,
   plotInteractivity,
@@ -491,11 +491,15 @@ export function PlotRenderer({
         setReady(true);
         viewRef.current?.(result.view as PlotView);
         if (interactive && interactivity.mode === "full") {
-          const buffer = makeBrushBuffer(interactivity.fields, (domains) => {
+          const buffer = makeBrushBuffer(interactivity.channels, (domains) => {
             brushRef.current?.(domains);
           });
           try {
-            result.view.addSignalListener(BRUSH_PARAM, (_name, value) => buffer.onSignal(value));
+            // Listen to the compiled tuple signal (channel-tagged) rather
+            // than the user-facing `wiki_brush` (field-keyed) — the latter
+            // loses per-channel info when both axes share a field and
+            // escapes nested paths inconsistently across Vega versions.
+            result.view.addSignalListener(BRUSH_TUPLE_SIGNAL, (_name, value) => buffer.onSignal(value));
           } catch { /* Vega drops listeners if the param is stripped by user spec */ }
           brushCleanup = () => window.removeEventListener("pointerup", buffer.onPointerUp);
           window.addEventListener("pointerup", buffer.onPointerUp);
